@@ -383,3 +383,50 @@ Use only assigned GPUs and an independent MPS pipe directory. A private MPS
 server does not provide exclusive GPU ownership or MIG isolation. For a
 single-GPU deployment, explicitly place both stages on that GPU; the supplied
 high-concurrency profile places its two stages on different GPUs by default.
+
+## MOSS-TTS Local 1.5 with Model Runner V2
+
+`OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5` can opt into CUDA MRV2 using
+the shared runtime introduced for Qwen3-TTS:
+
+```bash
+vllm serve OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5 --omni \
+  --deploy-config vllm_omni/deploy/moss_tts_local_mrv2.yaml
+```
+
+This profile inherits the batching, codec graph buckets and 1-frame/15-frame
+chunk geometry from `moss_tts_local.yaml`, and selects V2 for both the Local
+Talker and codec stages. The Local depth predictor exposes the MRV2 `mtp`
+capabilities while retaining its V1 `talker_mtp` implementation, sampling
+defaults and explicit request-seed handling. Codec chunks use the native data
+plane; the internal Talker retains its final-only orchestrator output policy.
+
+On CUDA, the profile bounds stage-0 prefill work to 512 tokens per iteration.
+The codec retains its own CUDA Graph capture/replay, including batch buckets
+through 64, but disables Inductor compilation (`compilation_config.mode: 0`)
+of the stateful decoder to avoid lengthy compilation at startup. This is
+independent of `enforce_eager`; the profile keeps `enforce_eager: false`.
+It explicitly selects `cudagraph_mode: FULL`, which works without Inductor;
+the default `FULL_AND_PIECEWISE` would otherwise normalize to `NONE` and clear
+the codec's capture buckets when compilation is disabled.
+
+For sustained C128/C256 serving on a large-memory CUDA GPU, select the
+separate `moss_tts_local_mrv2_high_concurrency.yaml` profile. It uses 256
+stream slots per stage, a 32 GiB Talker KV budget, and the codec's
+`triton_slot` backend with Inductor compilation and codec-owned CUDA graphs.
+The bounded KV budget leaves room for codec state and graphs; it does not
+guarantee that 256 maximum-length prompts fit simultaneously. See the
+[MOSS recipe](../../recipes/OpenMOSS/MOSS-TTS.md#local-15-mrv2-and-slot-attention)
+for activation, backend comparisons, memory requirements and benchmark commands.
+
+Omitting `--deploy-config`, or selecting `moss_tts_local.yaml`, retains V1.
+NPU, XPU, ROCm and MUSA overrides also retain V1. This profile does not enable
+MRV2 for MOSS Delay, Realtime or Nano. Local 1.5 outputs 48 kHz stereo audio;
+set `VLLM_OMNI_BENCH_AUDIO_SAMPLE_RATE=48000` and
+`VLLM_OMNI_BENCH_AUDIO_CHANNELS=2` when benchmarking raw PCM.
+
+Event-driven orchestration remains independently selectable with
+`VLLM_OMNI_EVENT_DRIVEN_ORCH=0` or `1`. Keep the runner and deployment identical
+when comparing these modes. Model-runner selection does not change the
+orchestration default or enable experimental reference encoding, chunk ramps,
+generation-output draining or MPS.

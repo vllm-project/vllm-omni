@@ -97,6 +97,7 @@ MOSS_TTS_LOCAL_PIPELINE = PipelineConfig(
         StagePipelineConfig(
             stage_id=0,
             model_stage="moss_tts_local",
+            supports_native_mrv2_data_plane=True,
             execution_type=StageExecutionType.LLM_AR,
             input_sources=(),
             owns_tokenizer=True,
@@ -114,6 +115,7 @@ MOSS_TTS_LOCAL_PIPELINE = PipelineConfig(
         StagePipelineConfig(
             stage_id=1,
             model_stage="moss_tts_local_codec",
+            supports_native_mrv2_data_plane=True,
             execution_type=StageExecutionType.LLM_GENERATION,
             input_sources=(0,),
             final_output=True,

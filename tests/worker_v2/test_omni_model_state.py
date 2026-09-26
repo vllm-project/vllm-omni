@@ -213,6 +213,61 @@ def test_static_decode_embeddings_refresh_from_input_ids():
     assert OmniModelState._preprocess_result_needs_writeback(original, original.view_as(original)) is True
 
 
+def test_moss_local_decode_runs_depth_predictor_and_routes_eos(mocker):
+    """Exercise MRV2 dispatch through the real Local hook, output and logits."""
+    from vllm.sampling_params import SamplingParams
+    from vllm.v1.worker.gpu.states import RequestState
+
+    from vllm_omni.model_executor.models.moss_tts.modeling_moss_tts_local_depth import MossTTSLocalDepthTransformer
+    from vllm_omni.model_executor.models.moss_tts.modeling_moss_tts_talker import (
+        MossTTSLocalTalkerForGeneration,
+    )
+
+    model = MossTTSLocalTalkerForGeneration.__new__(MossTTSLocalTalkerForGeneration)
+    torch.nn.Module.__init__(model)
+    model.model = torch.nn.Module()
+    model.model.embed_tokens = torch.nn.Embedding(8, 4, _weight=torch.zeros(8, 4))
+    model.hidden_size = 4
+    model.n_vq = 2
+    model.audio_pad_token_id = 8
+    model.audio_assistant_slot_token_id = 2
+    model.im_end_token_id = 3
+    model.text_vocab_size = 8
+    model.talker_mtp_output_key = ("audio_codes", "current")
+    model.talker_mtp_graph_safe = False
+    model.gpu_resident_buffer_keys = set()
+    model.audio_lm_heads = model.audio_embeddings = model.local_text_lm_head = None
+    model._audio_embed = lambda codes: codes[:, :1].expand(-1, 4).float()
+    frame = mocker.Mock(return_value=(torch.tensor([True, False]), torch.tensor([[1, 2], [3, 4]])))
+    model.local_transformer = mocker.Mock(spec=MossTTSLocalDepthTransformer, generate_frame=frame)
+
+    state = _make_state(max_num_reqs=2, has_preprocess=True, have_multimodal_outputs=True)
+    state.model = model
+    for idx in range(2):
+        state.intermediate_buffer.buffers[idx] = {
+            "req_id": f"r{idx}",
+            "audio_state": {"is_stopping": False},
+            "hidden_states": {"last": torch.full((4,), float(idx + 1))},
+        }
+    batch = _DummyInputBatch([1, 0], num_computed_tokens_cpu=[1, 1])
+    inputs = {"input_ids": torch.tensor([2, 2]), "inputs_embeds": torch.zeros(2, 4)}
+    request_state = mocker.Mock(spec=RequestState, prompt_len=np.array([1, 1]), num_computed_tokens=None)
+    state.run_preprocess(batch, inputs, request_state)
+
+    frame.assert_called_once()
+    torch.testing.assert_close(frame.call_args.args[0], torch.tensor([[2.0] * 4, [1.0] * 4]))
+    assert frame.call_args.kwargs["temperature"] == 1.7
+    assert frame.call_args.kwargs["top_k"] == 25
+    assert frame.call_args.kwargs["top_p"] == 0.8
+    torch.testing.assert_close(inputs["inputs_embeds"], torch.tensor([[1.0] * 4, [0.0] * 4]))
+    _, payload = state.postprocess_model_output(torch.zeros(2, 4), batch, request_state)
+    assert [codes.tolist() for codes in payload["codes"]["audio"]] == [[[1, 2]], [[8, 8]]]
+    assert model.compute_logits(torch.zeros(2, 4)).argmax(-1).tolist() == [2, 3]
+    # An explicit local seed must reach the request-owned MRV2 generator.
+    params = SamplingParams(extra_args={"tts_local_seed": 17}, seed=99)
+    assert state._get_mtp_generator("seeded", params, torch.device("cpu")).initial_seed() == 17
+
+
 @pytest.mark.parametrize("owned", [False, True])
 def test_batched_postprocess_gpu_snapshot_writeback(owned):
     # batch=[1, 0]: last-token indices follow the reordered batch, the scalar

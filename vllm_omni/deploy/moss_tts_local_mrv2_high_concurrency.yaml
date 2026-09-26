@@ -1,0 +1,26 @@
+# Opt-in CUDA profile for MOSS-TTS-Local-Transformer-v1.5 on a large-memory GPU.
+# Both stages share GPU 0. Validated with one H200 and Seed-TTS EN1088.
+base_config: moss_tts_local_mrv2.yaml
+
+platforms:
+  cuda:
+    stages:
+      - stage_id: 0
+        max_num_seqs: 256
+        max_num_batched_tokens: 512
+        # Leave room for the codec state pool and its batch-256 CUDA graphs.
+        kv_cache_memory_bytes: 34359738368  # 32 GiB
+      - stage_id: 1
+        max_num_seqs: 256
+        hf_overrides:
+          codec_attention_backend: triton_slot
+        compilation_config:
+          mode: 3
+          backend: inductor
+          # The codec owns capture/replay after Inductor compiles its decoder.
+          cudagraph_mode: FULL
+          cudagraph_capture_sizes: [1, 2, 4, 8, 16, 32, 64, 128, 256]
+          cudagraph_num_of_warmups: 1
+          inductor_compile_config:
+            combo_kernels: false
+            benchmark_combo_kernel: false

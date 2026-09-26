@@ -2913,9 +2913,16 @@ class TestPlatformOverrides:
 
         assert deploy.stages[0].engine_extras["block_size"] == 128
 
-    @pytest.mark.parametrize("platform", ["cuda", "npu"])
-    def test_recommended_native_runner_platform_defaults(self, platform):
-        filename, pipeline_key = "qwen3_tts_mrv2.yaml", "qwen3_tts"
+    @pytest.mark.parametrize(
+        "filename,pipeline_key",
+        [
+            ("qwen3_tts_mrv2.yaml", "qwen3_tts"),
+            ("moss_tts_local_mrv2.yaml", "moss_tts_local"),
+            ("moss_tts_local_mrv2_high_concurrency.yaml", "moss_tts_local"),
+        ],
+    )
+    @pytest.mark.parametrize("platform", ["cuda", "npu", "xpu", "rocm", "musa"])
+    def test_recommended_native_runner_platform_defaults(self, platform, filename, pipeline_key):
         deploy = load_deploy_config(Path(get_deploy_config_path(filename)))
         deploy = _apply_platform_overrides(deploy, platform=platform)
         expect_v2 = platform == "cuda"
@@ -2930,6 +2937,57 @@ class TestPlatformOverrides:
         if expect_v2 and pipeline.stages and deploy.async_chunk:
             # v2 only engages the native plane on stages declaring support.
             assert all(ps.supports_native_mrv2_data_plane for ps in pipeline.stages)
+
+    def test_moss_local_mrv2_preserves_base_profile_and_variant_scope(self):
+        pipeline = resolve_pipeline_config("moss_tts_local")
+        base_path = Path(get_deploy_config_path(pipeline.default_deploy_config_name))
+        candidate_path = Path(get_deploy_config_path("moss_tts_local_mrv2.yaml"))
+        base = load_deploy_config(base_path)
+        candidate = load_deploy_config(candidate_path)
+        assert base.model_runner == "v1"
+        assert candidate.stages == base.stages
+        assert candidate.connectors == base.connectors
+        assert candidate.async_chunk == base.async_chunk
+        cuda = _apply_platform_overrides(candidate, platform="cuda")
+        stages = merge_pipeline_deploy(pipeline, cuda)
+        assert stages[0].yaml_engine_args["max_num_batched_tokens"] == 512
+        codec_args = stages[1].yaml_engine_args
+        assert codec_args["max_num_seqs"] == 64
+        assert codec_args["enforce_eager"] is False
+        assert codec_args["compilation_config"] == {
+            "mode": 0,
+            "cudagraph_mode": "FULL",
+            "cudagraph_capture_sizes": [1, 2, 4, 8, 16, 32, 64],
+            "cudagraph_num_of_warmups": 1,
+        }
+        for platform in ("npu", "xpu", "rocm", "musa"):
+            # Platform resolution mutates the deployment; each server loads
+            # a fresh profile before applying its own platform overrides.
+            fallback = _apply_platform_overrides(load_deploy_config(candidate_path), platform=platform)
+            original = _apply_platform_overrides(load_deploy_config(base_path), platform=platform)
+            assert fallback.stages == original.stages
+        for variant in ("moss_tts_delay", "moss_tts_realtime"):
+            assert not any(stage.supports_native_mrv2_data_plane for stage in resolve_pipeline_config(variant).stages)
+
+    def test_moss_local_high_concurrency_resolves_slot_compile_and_memory_budget(self):
+        pipeline = resolve_pipeline_config("moss_tts_local")
+        path = Path(get_deploy_config_path("moss_tts_local_mrv2_high_concurrency.yaml"))
+        deploy = _apply_platform_overrides(load_deploy_config(path), platform="cuda")
+        talker, codec = merge_pipeline_deploy(pipeline, deploy)
+        assert talker.yaml_engine_args["max_num_seqs"] == codec.yaml_engine_args["max_num_seqs"] == 256
+        assert talker.yaml_engine_args["max_num_batched_tokens"] == 512
+        assert talker.yaml_engine_args["kv_cache_memory_bytes"] == 32 * 1024**3
+        assert codec.yaml_engine_args["hf_overrides"]["codec_attention_backend"] == "triton_slot"
+        compilation = codec.yaml_engine_args["compilation_config"]
+        assert compilation["mode"] == 3 and compilation["backend"] == "inductor"
+        assert compilation["cudagraph_mode"] == "FULL"
+        assert compilation["cudagraph_capture_sizes"] == [1, 2, 4, 8, 16, 32, 64, 128, 256]
+        assert compilation["inductor_compile_config"] == {"combo_kernels": False, "benchmark_combo_kernel": False}
+        base_path = Path(get_deploy_config_path("moss_tts_local.yaml"))
+        for platform in ("npu", "xpu", "rocm", "musa"):
+            actual = _apply_platform_overrides(load_deploy_config(path), platform=platform)
+            expected = _apply_platform_overrides(load_deploy_config(base_path), platform=platform)
+            assert actual.stages == expected.stages
 
     @pytest.mark.parametrize("runner,native", [("v1", False), ("v2", False), ("v2", True)])
     def test_mrv2_undeclared_transport_warns(self, monkeypatch, runner, native):

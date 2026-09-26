@@ -539,11 +539,15 @@ class RingKVCache:
             end_offset = self.end_offset.index_select(0, slots)
             row_cache = self.cache.index_select(1, slots)
 
-            indexes = torch.arange(T, device=end_offset.device, dtype=end_offset.dtype)
+            # Upsampling can make a chunk longer than the ring. Only the last
+            # capacity tokens survive; writing all T tokens gives scatter_
+            # duplicate destinations and nondeterministic cache contents.
+            write_length = min(T, self.capacity)
+            indexes = torch.arange(T - write_length, T, device=end_offset.device, dtype=end_offset.dtype)
             indexes = (indexes + end_offset.view(-1, 1)) % self.capacity
-            scatter_indexes = indexes.view(B, 1, T, 1).expand(-1, H, T, D)
-            row_cache[0].scatter_(2, scatter_indexes, k)
-            row_cache[1].scatter_(2, scatter_indexes, v)
+            scatter_indexes = indexes.view(B, 1, write_length, 1).expand(-1, H, write_length, D)
+            row_cache[0].scatter_(2, scatter_indexes, k[:, :, -write_length:])
+            row_cache[1].scatter_(2, scatter_indexes, v[:, :, -write_length:])
             # Live and graph-padding rows always map to distinct slots. The
             # latter map only to scratch state, so this write cannot corrupt a
             # request even though dense graph operators still execute it.
@@ -791,29 +795,45 @@ class MossAudioTokenizerMultiheadAttention(StreamingModule):
         if self.rope:
             q, k = self.rope(q, k, offset, time_before_heads=False)
 
-        k, v, pos_k = self._complete_kv(k, v, execution_context)
-        pos_k = pos_k[:, None]
-
-        if self.causal:
-            pos_q = offset.view(-1, 1, 1) + torch.arange(T, device=q.device, dtype=torch.long).view(-1, 1)
-            delta = pos_q - pos_k
-            attn_bias = (pos_k >= 0) & (delta >= 0)
-            if self.context is not None:
-                attn_bias = attn_bias & (delta < self.context)
-            attn_bias = attn_bias[:, None]
+        slot_attention = getattr(self, "_slot_attention", None)
+        if slot_attention is not None and state is not None and execution_context is not None and self.causal:
+            # Current streaming batches use one exact T. Padding rows own
+            # scratch slots and must not advance persistent attention state.
+            valid_lengths = execution_context.valid_rows.to(dtype=torch.int32) * T
+            x = slot_attention(
+                q,
+                k,
+                v,
+                state.kv_cache.cache,
+                state.kv_cache.end_offset,
+                execution_context.state_slot_ids,
+                valid_lengths,
+                self.context if self.context is not None else -1,
+            )
         else:
-            attn_bias = None
+            k, v, pos_k = self._complete_kv(k, v, execution_context)
+            pos_k = pos_k[:, None]
 
-        streaming_attention = getattr(self, "_streaming_attention", None)
-        if (
-            streaming_attention is not None
-            and attn_bias is not None
-            and q.dtype == torch.bfloat16
-            and q.shape[-1] == 64
-        ):
-            x = streaming_attention(q, k, v, attn_bias)
-        else:
-            x = F.scaled_dot_product_attention(q, k, v, attn_bias, dropout_p=0.0)
+            if self.causal:
+                pos_q = offset.view(-1, 1, 1) + torch.arange(T, device=q.device, dtype=torch.long).view(-1, 1)
+                delta = pos_q - pos_k
+                attn_bias = (pos_k >= 0) & (delta >= 0)
+                if self.context is not None:
+                    attn_bias = attn_bias & (delta < self.context)
+                attn_bias = attn_bias[:, None]
+            else:
+                attn_bias = None
+
+            streaming_attention = getattr(self, "_streaming_attention", None)
+            if (
+                streaming_attention is not None
+                and attn_bias is not None
+                and q.dtype == torch.bfloat16
+                and q.shape[-1] == 64
+            ):
+                x = streaming_attention(q, k, v, attn_bias)
+            else:
+                x = F.scaled_dot_product_attention(q, k, v, attn_bias, dropout_p=0.0)
         x = x.transpose(1, 2).reshape(B, T, self.embed_dim)
         x = apply_weights_per_step(self.out_projs, self.weights_per_step_schedule, x, offset_cpu)
 

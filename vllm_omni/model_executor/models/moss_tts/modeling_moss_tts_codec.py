@@ -786,15 +786,20 @@ class MossTTSCodecDecoder(nn.Module):
             codec.decoder.to(dtype=torch.bfloat16)
         attention_backend = getattr(self.vllm_config.model_config.hf_config, "codec_attention_backend", "sdpa")
         if attention_backend != "sdpa":
-            if attention_backend != "triton" or device.type != "cuda":
+            if attention_backend not in {"triton", "triton_slot"} or device.type != "cuda":
                 raise ValueError(f"Unsupported codec attention backend/device: {attention_backend}/{device.type}")
             from vllm_omni.model_executor.models.moss_tts.audio_tokenizer_v2 import MossAudioTokenizerMultiheadAttention
             from vllm_omni.model_executor.models.moss_tts.streaming_attention import masked_attention
 
+            if attention_backend == "triton_slot":
+                from vllm_omni.model_executor.models.moss_tts.slot_attention import slot_ring_attention
+
             for module in codec.decoder.modules():
                 if isinstance(module, MossAudioTokenizerMultiheadAttention):
                     module._streaming_attention = masked_attention
-            logger.info("Enabled Triton masked attention for the streaming codec decoder")
+                    if attention_backend == "triton_slot":
+                        module._slot_attention = slot_ring_attention
+            logger.info("Enabled codec attention backend=%s", attention_backend)
         build_decode_lut = getattr(codec.quantizer, "build_decode_lut", None)
         if callable(build_decode_lut):
             lut_dtype = torch.bfloat16 if device.type == "cuda" else torch.float32

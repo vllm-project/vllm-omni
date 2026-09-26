@@ -1,0 +1,30 @@
+# Opt-in CUDA MRV2 for MOSS-TTS-Local-Transformer-v1.5.
+# Keep the base profile's batching, chunk geometry and V1 default.
+base_config: moss_tts_local.yaml
+model_runner: v2
+
+platforms:
+  cuda:
+    stages:
+      - stage_id: 0
+        # Bound prefill work so new prompts do not monopolize streaming decode.
+        max_num_batched_tokens: 512
+      - stage_id: 1
+        compilation_config:
+          # The codec owns CUDA Graph capture/replay. Skip Inductor compilation
+          # of its stateful decoder; plain CUDA graphs remain enabled.
+          mode: 0
+          # FULL works without Inductor; the default FULL_AND_PIECEWISE would
+          # normalize to NONE and erase the codec's capture sizes.
+          cudagraph_mode: FULL
+          # Platform overrides replace compilation_config as a whole.
+          cudagraph_capture_sizes: [1, 2, 4, 8, 16, 32, 64]
+          cudagraph_num_of_warmups: 1
+  npu:
+    model_runner: v1
+  xpu:
+    model_runner: v1
+  rocm:
+    model_runner: v1
+  musa:
+    model_runner: v1
