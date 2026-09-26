@@ -956,6 +956,9 @@ class OmniDiffusionConfig:
     # fuses RMSNorm+SiLU (faster, not bit-exact), ``"off"`` keeps the reference
     # diffusers implementation.
     vae_fast_path: str = "lossless"
+    # Independent encoder fast path for the residual, patchified Wan VAE used
+    # by Cosmos3. Levels have the same numerical contract as the decoder.
+    vae_encode_fast_path: str = "lossless"
 
     # STA (Sliding Tile Attention) parameters
     mask_strategy_file_path: str | None = None
@@ -1199,6 +1202,10 @@ class OmniDiffusionConfig:
         self.stage_output_payload_keys = tuple(self.stage_output_payload_keys)
         if self.vae_fast_path not in VAE_FAST_PATH_LEVELS:
             raise ValueError(f"vae_fast_path must be one of {list(VAE_FAST_PATH_LEVELS)}, got {self.vae_fast_path!r}")
+        if self.vae_encode_fast_path not in VAE_FAST_PATH_LEVELS:
+            raise ValueError(
+                f"vae_encode_fast_path must be one of {list(VAE_FAST_PATH_LEVELS)}, got {self.vae_encode_fast_path!r}"
+            )
         if self.diffusion_compile_granularity not in {"regional", "full"}:
             raise ValueError(
                 "diffusion_compile_granularity must be 'regional' or 'full', "

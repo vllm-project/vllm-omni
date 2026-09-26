@@ -25,6 +25,7 @@ from vllm_omni.diffusion.distributed.autoencoders.wan_vae_fastpath import (
     REPORT_ATTR,
     decode_frames,
     install_wan_vae_fastpath,
+    is_encoder_installed,
     is_installed,
     uninstall_wan_vae_fastpath,
 )
@@ -644,3 +645,37 @@ def test_registry_hook_skips_non_cuda_platform_and_non_wan_vaes(mocker) -> None:
     other = nn.Linear(2, 2)
     registry_module._apply_wan_vae_fastpath_if_enabled(_StubPipeline(other), SimpleNamespace(vae_fast_path="lossless"))
     assert not hasattr(other, REPORT_ATTR)
+
+
+@pytest.mark.parametrize("decode_level", ["off", "lossless", "channels_last"])
+@pytest.mark.parametrize("encode_level", ["off", "lossless", "channels_last"])
+def test_registry_encoder_decoder_settings_are_independent(mocker, decode_level, encode_level) -> None:
+    from tests.diffusion.distributed.test_wan_vae_encoder_fastpath import CONFIG
+
+    vae = AutoencoderKLWan(**CONFIG).eval()
+    platform = mocker.Mock()
+    platform.is_cuda.return_value = True
+    mocker.patch.object(registry_module, "current_omni_platform", platform)
+    registry_module._apply_wan_vae_fastpath_if_enabled(
+        _StubPipeline(vae), SimpleNamespace(vae_fast_path=decode_level, vae_encode_fast_path=encode_level)
+    )
+    assert is_installed(vae) == (decode_level != "off")
+    assert is_encoder_installed(vae) == (encode_level != "off")
+
+
+@pytest.mark.parametrize("failed_component", ["encoder", "decoder"])
+def test_registry_component_failure_does_not_disable_other_component(mocker, failed_component) -> None:
+    from tests.diffusion.distributed.test_wan_vae_encoder_fastpath import CONFIG
+    from vllm_omni.diffusion.distributed.autoencoders import wan_vae_fastpath
+
+    vae = AutoencoderKLWan(**CONFIG).eval()
+    platform = mocker.Mock()
+    platform.is_cuda.return_value = True
+    mocker.patch.object(registry_module, "current_omni_platform", platform)
+    install_name = "install_wan_vae_encoder_fastpath" if failed_component == "encoder" else "install_wan_vae_fastpath"
+    mocker.patch.object(wan_vae_fastpath, install_name, side_effect=RuntimeError("injected failure"))
+    registry_module._apply_wan_vae_fastpath_if_enabled(
+        _StubPipeline(vae), SimpleNamespace(vae_fast_path="lossless", vae_encode_fast_path="lossless")
+    )
+    assert is_encoder_installed(vae) == (failed_component != "encoder")
+    assert is_installed(vae) == (failed_component != "decoder")

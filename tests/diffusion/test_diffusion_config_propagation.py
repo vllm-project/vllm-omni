@@ -226,6 +226,18 @@ def test_invalid_vae_fast_path_is_rejected():
         OmniDiffusionConfig(model="x", vae_fast_path="fast")
 
 
+def test_vae_encode_fast_path_roundtrip():
+    assert _roundtrip_diffusion_config(model="x").vae_encode_fast_path == "lossless"
+    od = _roundtrip_diffusion_config(model="x", vae_fast_path="off", vae_encode_fast_path="channels_last")
+    assert od.vae_fast_path == "off"
+    assert od.vae_encode_fast_path == "channels_last"
+
+
+def test_invalid_vae_encode_fast_path_is_rejected():
+    with pytest.raises(ValueError, match="vae_encode_fast_path"):
+        OmniDiffusionConfig(model="x", vae_encode_fast_path="fast")
+
+
 def test_flux2_klein_sets_generic_multimodal_limit():
     od_config = OmniDiffusionConfig(
         model="black-forest-labs/FLUX.2-klein-9B",

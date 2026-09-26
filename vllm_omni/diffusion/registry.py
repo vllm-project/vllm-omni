@@ -504,14 +504,15 @@ def initialize_model(
 
 
 def _apply_wan_vae_fastpath_if_enabled(model, od_config: OmniDiffusionConfig) -> None:
-    """Install the Wan VAE decoder fast path on every diffusers Wan VAE of the pipeline.
+    """Install independent Wan VAE encoder/decoder fast paths on pipeline VAEs.
 
-    Controlled by ``od_config.vae_fast_path`` (``off`` / ``lossless`` /
-    ``channels_last``). Only CUDA is supported; other platforms keep the
-    reference diffusers decoder. Failures never abort model loading.
+    Controlled by ``vae_fast_path`` and ``vae_encode_fast_path`` (``off`` /
+    ``lossless`` / ``channels_last``). Only CUDA is supported; other platforms
+    keep the reference implementation. Failures never abort model loading.
     """
     level = getattr(od_config, "vae_fast_path", "lossless")
-    if level == "off":
+    encode_level = getattr(od_config, "vae_encode_fast_path", "lossless")
+    if level == "off" and encode_level == "off":
         return
     if not current_omni_platform.is_cuda():
         logger.debug("Wan VAE fast path is only supported on CUDA; skipping")
@@ -519,7 +520,10 @@ def _apply_wan_vae_fastpath_if_enabled(model, od_config: OmniDiffusionConfig) ->
 
     from diffusers.models.autoencoders import AutoencoderKLWan
 
-    from vllm_omni.diffusion.distributed.autoencoders.wan_vae_fastpath import install_wan_vae_fastpath
+    from vllm_omni.diffusion.distributed.autoencoders.wan_vae_fastpath import (
+        install_wan_vae_encoder_fastpath,
+        install_wan_vae_fastpath,
+    )
     from vllm_omni.diffusion.offloader.module_collector import ModuleDiscovery
 
     candidates: list[tuple[str, nn.Module]] = []
@@ -534,15 +538,25 @@ def _apply_wan_vae_fastpath_if_enabled(model, od_config: OmniDiffusionConfig) ->
     for name, vae in candidates:
         if not isinstance(vae, AutoencoderKLWan):
             continue
-        try:
-            report = install_wan_vae_fastpath(vae, level=level)
-        except Exception:
-            logger.warning(
-                "Failed to install the Wan VAE fast path on %s; using the reference decoder", name, exc_info=True
-            )
-            continue
-        if report.installed:
-            logger.info("Wan VAE fast path (%s) active on %s", level, name)
+        for component, component_level, install in (
+            ("decoder", level, install_wan_vae_fastpath),
+            ("encoder", encode_level, install_wan_vae_encoder_fastpath),
+        ):
+            if component_level == "off":
+                continue
+            try:
+                report = install(vae, level=component_level)
+            except Exception:
+                logger.warning(
+                    "Failed to install the Wan VAE %s fast path on %s; using the reference %s",
+                    component,
+                    name,
+                    component,
+                    exc_info=True,
+                )
+                continue
+            if report.installed:
+                logger.info("Wan VAE %s fast path (%s) active on %s", component, component_level, name)
 
 
 def _apply_sequence_parallel_if_enabled(model, od_config: OmniDiffusionConfig) -> None:

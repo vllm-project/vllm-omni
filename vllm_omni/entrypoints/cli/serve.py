@@ -836,6 +836,18 @@ class OmniServeCommand(CLISubcommand):
             ),
         )
 
+        omni_config_group.add_argument(
+            "--vae-encode-fast-path",
+            choices=("off", "lossless", "channels_last"),
+            default="lossless",
+            help=(
+                "Cosmos3/Wan2.2 residual VAE encoder fast path, independent of --vae-fast-path. "
+                "'lossless' (default) preserves reference values; 'channels_last' also switches "
+                "encoder convolution layouts and fuses reductions (not bit-exact); 'off' uses "
+                "the reference encoder."
+            ),
+        )
+
         # Parallel weight loading (faster diffusion startup)
         omni_config_group.add_argument(
             "--disable-multithread-weight-load",

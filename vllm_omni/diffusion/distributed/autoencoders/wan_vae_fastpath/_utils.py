@@ -4,7 +4,14 @@
 
 from __future__ import annotations
 
+import torch
+
 _ROW_BLOCK_WIDTHS = (64, 128, 256)
+
+
+def encoder_nrmse_limit(dtype: torch.dtype) -> float:
+    """Channels-last posterior tolerance; BF16 permits the observed GB200 drift."""
+    return 0.02 if dtype == torch.bfloat16 else 0.01
 
 
 def _pick_block_width(width: int) -> int:

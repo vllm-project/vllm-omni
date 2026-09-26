@@ -81,21 +81,23 @@ def test_serve_parser_accepts_no_async_chunk_and_marks_it_explicit() -> None:
     assert "api_server_count" not in explicit
 
 
-def test_serve_parser_accepts_vae_fast_path() -> None:
+@pytest.mark.parametrize("option", ["vae_fast_path", "vae_encode_fast_path"])
+def test_serve_parser_accepts_vae_fast_path(option: str) -> None:
     parser = TrackingArgumentParser()
     subparsers = parser.add_subparsers(dest="subcommand")
     OmniServeCommand().subparser_init(subparsers)
 
     args = parser.parse_args(["serve", "fake-model", "--omni"])
-    assert args.vae_fast_path == "lossless"
-    assert "vae_fast_path" not in args.get_explicit_kwargs_dict()
+    assert getattr(args, option) == "lossless"
+    assert option not in args.get_explicit_kwargs_dict()
 
-    args = parser.parse_args(["serve", "fake-model", "--omni", "--vae-fast-path", "channels_last"])
-    assert args.vae_fast_path == "channels_last"
-    assert args.get_explicit_kwargs_dict()["vae_fast_path"] == "channels_last"
+    flag = "--" + option.replace("_", "-")
+    args = parser.parse_args(["serve", "fake-model", "--omni", flag, "channels_last"])
+    assert getattr(args, option) == "channels_last"
+    assert args.get_explicit_kwargs_dict()[option] == "channels_last"
 
     with pytest.raises(SystemExit):
-        parser.parse_args(["serve", "fake-model", "--omni", "--vae-fast-path", "fast"])
+        parser.parse_args(["serve", "fake-model", "--omni", flag, "fast"])
 
 
 def _parse_serve_args(argv: list[str]) -> TrackingNamespace:

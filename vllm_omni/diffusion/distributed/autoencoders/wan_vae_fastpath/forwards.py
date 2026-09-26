@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Bit-exact replacement forwards for the diffusers Wan VAE decoder modules.
+"""Replacement forwards shared by the diffusers Wan VAE decoder and encoder.
 
 Each function below is bound per module instance (``types.MethodType``) by
 :mod:`.install`; the diffusers classes themselves are never modified. Every
@@ -14,6 +14,8 @@ differs in how the bytes move:
 * ``WanCausalConv3d`` and every cached call site: the ``clone`` + ``cat`` +
   ``F.pad`` triple becomes one layout-preserving kernel that also writes the
   next cache frames; all-zero paddings skip ``F.pad`` entirely.
+  Eligible encoder norm/SiLU consumers write directly into that temporal input
+  and cache, avoiding a separate normalized activation (:mod:`.triton_norm_cache`).
 * ``WanResidualUpBlock``: ``x + DupUp3D(x)`` becomes one gather + add that
   also applies the bias of the upsampler's ``Conv2d`` (which feeds nothing else).
 * ``WanResample``: the ``upsample3d`` time interleave becomes one strided copy.
@@ -49,6 +51,7 @@ from diffusers.models.autoencoders.autoencoder_kl_wan import (
 from vllm.logger import init_logger
 
 from . import triton_data_movement as dm
+from . import triton_norm_cache as nc
 from . import triton_rms_norm as rn
 from . import triton_rms_norm_cl as cl
 from . import triton_upsample as up
@@ -65,14 +68,16 @@ class FastPathConfig:
 
     fused_silu_dtypes: frozenset[torch.dtype] = frozenset()
     channels_last: bool = False
+    clone_encoder_shortcuts: bool = False
+    fuse_norm_cache: bool = False
 
 
 def is_diffusers_rms_norm(module: Any) -> bool:
     """True for a diffusers ``WanRMS_norm`` instance.
 
-    Identified by name because ``vllm_omni.diffusion.models.wan2_2.patch_diffusers``
-    rebinds the name ``WanRMS_norm`` to ``RMSNormVAE`` in diffusers' own module
-    namespace; instances created before that patch keep the original class.
+    Identified by name because the Wan 2.2 NPU patch rebinds ``WanRMS_norm``
+    to ``RMSNormVAE`` in diffusers' module namespace; instances created before
+    that patch keep the original class.
     ``RMSNormVAE`` has different numerics (eps 1e-6, no fp32 upcast) and is
     deliberately not matched.
     """
@@ -310,6 +315,26 @@ def _layout_tag(x: torch.Tensor) -> str:
     return "channels_last" if x.shape[1] > 1 and x.stride(1) == 1 else "channels_first"
 
 
+def _conv_verdict_key(conv: nn.Module, x: torch.Tensor, cache_frames: int) -> tuple:
+    """Do not reuse numerical probes across devices, autocast or backend settings."""
+    autocast = torch.is_autocast_enabled(x.device.type)
+    return (
+        tuple(x.shape),
+        cache_frames,
+        x.dtype,
+        _layout_tag(x),
+        x.device,
+        conv.weight.dtype,
+        conv.weight.stride(),
+        torch.get_autocast_dtype(x.device.type) if autocast else None,
+        torch.backends.cudnn.allow_tf32,
+        torch.backends.cudnn.enabled,
+        torch.backends.cudnn.deterministic,
+        torch.backends.cudnn.benchmark,
+        torch.are_deterministic_algorithms_enabled(),
+    )
+
+
 def _run_cached_causal_conv(
     conv: nn.Module,
     x: torch.Tensor,
@@ -352,7 +377,7 @@ def _run_cached_causal_conv(
         # Preferred: temporal concat only (aligned plane copies) + cuDNN spatial
         # padding, once verified bitwise for this (conv, shape).
         verdicts = _SPATIAL_PAD_VERDICTS.setdefault(conv, {})
-        key = (tuple(x.shape), 0 if payload is None else payload.shape[2], x.dtype, _layout_tag(x))
+        key = _conv_verdict_key(conv, x, 0 if payload is None else payload.shape[2])
         if verdicts.get(key, True):
             pair = dm.cat_time_5d(x, payload, conv._padding[4], keep_cache_frames=CACHE_T)
             if pair is not None:
@@ -375,6 +400,84 @@ def _run_cached_causal_conv(
     out = conv(x) if payload is None else conv(x, payload)
     cache_list[index] = cache_x
     return (out, None) if return_bias else out
+
+
+def _can_bypass_dropout(module: nn.Module | None) -> bool:
+    """Only skip an unmodified, inactive Dropout, including its hook dispatch."""
+    return module is None or (
+        type(module) is nn.Dropout
+        and (not module.training or module.p == 0)
+        and getattr(module.forward, "__func__", None) is nn.Dropout.forward
+        and not module._forward_pre_hooks
+        and not module._forward_hooks
+        and not nn.modules.module._global_forward_pre_hooks
+        and not nn.modules.module._global_forward_hooks
+    )
+
+
+def _run_norm_act_cached_conv(
+    norm: nn.Module,
+    act: nn.Module,
+    conv: nn.Module,
+    x: torch.Tensor,
+    cache_list: list[Any],
+    index: int,
+    *,
+    pending_bias: torch.Tensor | None = None,
+    return_bias: bool = False,
+    after_norm: nn.Module | None = None,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]:
+    """Encoder norm/SiLU -> temporal assembly, without a normalized temporary.
+
+    Keep the existing math and spatial-padding verifier. A rejected input or
+    non-identity dropout uses the previous norm -> assembly path unchanged.
+    """
+    cfg = getattr(norm, CFG_ATTR, None)
+    if (
+        cfg is not None
+        and cfg.fuse_norm_cache
+        and _kernels_allowed(x)
+        and x.ndim == 5
+        and is_diffusers_rms_norm(norm)
+        and norm.channel_first
+        and isinstance(norm.bias, float)
+        and norm.bias == 0.0
+        and norm.gamma.ndim == 4
+        and type(act) is nn.SiLU
+        and not act.inplace
+        and (x.dtype in cfg.fused_silu_dtypes or cfg.channels_last)
+        and type(conv) is WanCausalConv3d
+        and not any(m._forward_pre_hooks or m._forward_hooks for m in (norm, act, conv))
+        and _can_bypass_dropout(after_norm)
+        and conv._padding[0] == conv._padding[1]
+        and conv._padding[2] == conv._padding[3]
+        and conv._padding[5] == 0
+    ):
+        cache = cache_list[index]
+        payload = cache if isinstance(cache, torch.Tensor) else None
+        if payload is None or payload.ndim == 5:
+            verdicts = _SPATIAL_PAD_VERDICTS.setdefault(conv, {})
+            key = _conv_verdict_key(conv, x, 0 if payload is None else payload.shape[2])
+            if verdicts.get(key, True):
+                pair = nc.norm_act_cat_time(
+                    x,
+                    norm.gamma,
+                    norm.scale,
+                    payload,
+                    conv._padding[4],
+                    channels_last=cfg.channels_last,
+                    silu=True,
+                    bias=pending_bias,
+                )
+                if pair is not None:
+                    assembled, cache_list[index] = pair
+                    out = _conv_with_spatial_padding(conv, assembled, None if return_bias else conv.bias, verdicts, key)
+                    return (out, _deferred_conv_bias(conv, out)) if return_bias else out
+
+    x = _norm_act(norm, act, x, pending_bias=pending_bias)
+    if after_norm is not None:
+        x = after_norm(x)
+    return _run_cached_causal_conv(conv, x, cache_list, index, return_bias=return_bias)
 
 
 def _run_conv_out_channels_last(
@@ -400,7 +503,7 @@ def _run_conv_out_channels_last(
     if payload is not None and (payload.device != x.device or payload.dtype != x.dtype):
         return None
     verdicts = _CONV_OUT_LAYOUT_VERDICTS.setdefault(conv, {})
-    key = (tuple(x.shape), 0 if payload is None else payload.shape[2], x.dtype)
+    key = _conv_verdict_key(conv, x, 0 if payload is None else payload.shape[2])
     if not verdicts.get(key, True):
         return None
     pair = dm.cat_pad_5d(x, payload, conv._padding, keep_cache_frames=CACHE_T, channels_last_output=True)
@@ -608,12 +711,31 @@ def residual_block_forward(
         residual_bias = _deferred_conv_bias(shortcut, residual)
     else:
         residual = shortcut(x)
+    cfg = getattr(self, CFG_ATTR, None)
+    if cfg is not None and cfg.fuse_norm_cache and feat_cache is not None:
+        conv1 = _run_norm_act_cached_conv(
+            self.norm1, self.nonlinearity, self.conv1, x, feat_cache, feat_idx[0], return_bias=cfg.channels_last
+        )
+        x, conv1_bias = conv1 if cfg.channels_last else (conv1, None)
+        feat_idx[0] += 1
+        x, conv2_bias = _run_norm_act_cached_conv(
+            self.norm2,
+            self.nonlinearity,
+            self.conv2,
+            x,
+            feat_cache,
+            feat_idx[0],
+            pending_bias=conv1_bias,
+            return_bias=True,
+            after_norm=self.dropout,
+        )
+        feat_idx[0] += 1
+        return _residual_add(x, conv2_bias, residual, residual_bias)
     x = _norm_act(self.norm1, self.nonlinearity, x)
     # conv1 feeds only norm2. At the channels_last level the single-pass norm
     # kernel adds the conv bias itself (rounded like ATen's ``add_``), so the
     # convolution runs without it; the lossless level keeps the separate add
     # because ``vector_norm`` must see the same bytes as upstream.
-    cfg = getattr(self, CFG_ATTR, None)
     conv1_bias = None
     if feat_cache is not None:
         index = feat_idx[0]
