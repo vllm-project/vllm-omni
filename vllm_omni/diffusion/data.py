@@ -317,6 +317,8 @@ class DiffusionParallelConfig:
 
     - "tile": Patch/tile parallel decode (default). Each rank decodes a subset
       of spatial tiles and the results are stitched on rank 0.
+    - "batch": Decode complete images on different ranks, preserving their
+      batch order. Requires AutoencoderKL/Flux2 and DP/PP/CFG sizes of 1.
     - "spatial_shard_height": Spatially-sharded decode that splits decoder
       feature maps along height and exchanges halo rows around spatial
       convolutions.
@@ -357,10 +359,14 @@ class DiffusionParallelConfig:
         assert self.allgather_degree > 0, "AllGather degree must be > 0"
         assert self.cfg_parallel_size > 0, "CFG parallel size must be > 0"
         assert self.vae_patch_parallel_size > 0, "VAE patch parallel size must be > 0"
-        assert self.vae_parallel_mode in {"tile", "spatial_shard_height", "spatial_shard_width"}, (
-            "vae_parallel_mode must be one of {'tile', 'spatial_shard_height', 'spatial_shard_width'}, "
+        assert self.vae_parallel_mode in {"tile", "batch", "spatial_shard_height", "spatial_shard_width"}, (
+            "vae_parallel_mode must be one of {'tile', 'batch', 'spatial_shard_height', 'spatial_shard_width'}, "
             f"but got {self.vae_parallel_mode!r}."
         )
+        if self.vae_parallel_mode == "batch" and (
+            self.data_parallel_size not in (None, 1) or self.pipeline_parallel_size != 1 or self.cfg_parallel_size != 1
+        ):
+            raise ValueError("VAE batch parallel decode requires DP, PP, and CFG parallel sizes to be 1")
         if self.allgather_degree > 1:
             assert self.ulysses_degree == 1 and self.ring_degree == 1, (
                 "AllGather-KV (allgather_degree>1) is mutually exclusive with Ulysses/Ring in v1. "
@@ -478,6 +484,8 @@ class DiffusionParallelConfig:
         if world_size % non_dp_size != 0:
             raise ValueError(f"WORLD size ({world_size}) must be divisible by non-DP parallel size ({non_dp_size})")
         inferred_data_parallel_size = world_size // non_dp_size
+        if self.vae_parallel_mode == "batch" and inferred_data_parallel_size != 1:
+            raise ValueError("VAE batch parallel decode requires DP, PP, and CFG parallel sizes to be 1")
         if self.data_parallel_size is not None and self.data_parallel_size != inferred_data_parallel_size:
             raise ValueError(
                 f"data_parallel_size ({self.data_parallel_size}) does not match WORLD-derived value "

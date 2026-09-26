@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -179,6 +179,7 @@ class DistributedVaeMixin:
     def is_distributed_enabled(self) -> bool:
         if (
             self.distributed_executor.parallel_size <= 1
+            or self.distributed_executor.parallel_mode == "batch"
             or not dist.is_initialized()
             or not getattr(self, "use_tiling", False)
         ):

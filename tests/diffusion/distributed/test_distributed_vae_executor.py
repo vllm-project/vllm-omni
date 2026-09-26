@@ -1,5 +1,7 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from dataclasses import dataclass
-from types import SimpleNamespace
 
 import pytest
 import torch
@@ -25,7 +27,7 @@ class E2EOperator:
         h_size = z.shape[0]
         w_size = z.shape[1]
 
-        tasks = []
+        tasks: list[TileTask] = []
         for i in range(rows_num):
             for j in range(cols_num):
                 tasks.append(
@@ -67,7 +69,8 @@ class FakeWorldGroup:
 class DummyMixin(DistributedVaeMixin):
     def __init__(self):
         self.use_tiling = True
-        self.distributed_executor = SimpleNamespace(parallel_size=2, group=None)
+        self.distributed_executor = DistributedVaeExecutor()
+        self.distributed_executor.set_parallel_size(2)
 
 
 @pytest.fixture(autouse=True)

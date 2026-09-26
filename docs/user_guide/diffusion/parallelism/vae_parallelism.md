@@ -1,12 +1,12 @@
 # VAE Parallelism Guide
 
-
 ## Table of Content
 
 - [Overview](#overview)
 - [Quick Start](#quick-start)
 - [Example Script](#example-script)
 - [Configuration Parameters](#configuration-parameters)
+- [Batch Parallel Decode](#batch-parallel-decode)
 - [Best Practices](#best-practices)
 - [Troubleshooting](#troubleshooting)
 - [Summary](#summary)
@@ -15,23 +15,22 @@
 
 ## Overview
 
-VAE parallelism distributes VAE (Variational AutoEncoder) decode/encode work across multiple GPUs. This guide covers VAE patch/tile parallelism, which splits latent space into spatial tiles or patches, and Wan spatial-shard decode, which shards decoder feature maps along height or width.
+VAE parallelism distributes VAE (Variational AutoEncoder) decode/encode work across multiple GPUs. This guide covers patch/tile parallelism, batch parallel decode for image VAEs, and Wan spatial-shard decode. Patch/tile parallelism divides images into spatial regions; batch parallel decode assigns complete images to ranks.
 
 This is particularly useful for:
+
 - **High-resolution image generation** where VAE decode can become a memory bottleneck
 - **Memory-constrained environments** where the VAE decode activation peak exceeds available VRAM
 - **Multi-GPU setups** where you want to leverage distributed resources for the VAE stage
 
 See supported models list in [Supported Models](../../diffusion_features.md#supported-models).
 
-
 VAE patch parallelism uses two strategies based on image size:
 
-| Strategy | Use Case | How It Works | Overlap Handling | Output Quality |
-|----------|----------|--------------|------------------|----------------|
-| **Tiled Decode** | Large images (triggers VAE tiling) | Distributes existing VAE tiling computation across ranks. Each rank decodes a subset of overlapping tiles. | Uses VAE's native `blend_v` and `blend_h` functions to seamlessly merge overlapping regions | Bit-identical (same logic as single-GPU tiling) |
-| **Patch Decode** | Small images (no VAE tiling) | Splits latent into spatial patches with halos. Each rank decodes one patch with boundary context. | Halo regions provide edge context; core regions are directly stitched without blending | Near-identical (diff < 0.5%, visually imperceptible) |
-
+| Strategy         | Use Case                           | How It Works                                                                                               | Overlap Handling                                                                            | Output Quality                                       |
+| ---------------- | ---------------------------------- | ---------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------- | ---------------------------------------------------- |
+| **Tiled Decode** | Large images (triggers VAE tiling) | Distributes existing VAE tiling computation across ranks. Each rank decodes a subset of overlapping tiles. | Uses VAE's native `blend_v` and `blend_h` functions to seamlessly merge overlapping regions | Bit-identical (same logic as single-GPU tiling)      |
+| **Patch Decode** | Small images (no VAE tiling)       | Splits latent into spatial patches with halos. Each rank decodes one patch with boundary context.          | Halo regions provide edge context; core regions are directly stitched without blending      | Near-identical (diff < 0.5%, visually imperceptible) |
 
 VAE Patch Parallelism **reuses the DiT process group** (`dit_group`) and does not initialize a separate ProcessGroup. This means:
 
@@ -110,19 +109,72 @@ vllm serve Tongyi-MAI/Z-Image-Turbo --omni --port 8091 \
 
 In `DiffusionParallelConfig`:
 
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `vae_patch_parallel_size` | int | 1 | Number of GPUs for VAE patch/tile parallelism. Set to 2 or higher to enable. Should typically match `tensor_parallel_size` as they share the same process group. |
-| `vae_parallel_mode` | str | `"tile"` | VAE parallel decode strategy: `"tile"` (default tile/patch parallel decode), `"spatial_shard_height"`, or `"spatial_shard_width"` (spatially-sharded decode, Wan only). See [Spatially-Sharded Decode](#spatially-sharded-decode-wan). |
+| Parameter                 | Type   | Default   | Description                                                                                                                                                       |
+| ------------------------- | ------ | --------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `vae_patch_parallel_size` | int    | 1         | Number of ranks requested for VAE parallelism, including batch mode. Set to 2 or higher to enable. Batch mode caps this degree at the existing worker group size. |
+| `vae_parallel_mode`       | str    | `"tile"`  | `"tile"` for tile/patch decode, `"batch"` for complete-image batch decode, or `"spatial_shard_height"` / `"spatial_shard_width"` for Wan spatial-shard decode.    |
 
 Additional requirements:
 
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `vae_use_tiling` | bool | False | Must be set to `True` when using VAE patch parallelism. |
+| Parameter        | Type   | Default   | Description                                             |
+| ---------------- | ------ | --------- | ------------------------------------------------------- |
+| `vae_use_tiling` | bool   | False     | Must be set to `True` when using VAE patch parallelism. |
 
 !!! note "Automatic VAE Tiling"
-    When `vae_patch_parallel_size > 1` and the model has a distributed VAE (`DistributedVaeMixin`), the system automatically sets `vae_use_tiling=True` if not already enabled.
+    When `vae_patch_parallel_size > 1` and the model has a distributed VAE (`DistributedVaeMixin`), tile and spatial-shard modes automatically enable `vae_use_tiling`. Batch mode preserves the requested tiling setting.
+
+---
+
+## Batch Parallel Decode
+
+Set `vae_parallel_mode="batch"` to distribute complete images across ranks during
+VAE decode. This mode supports pipelines that load `DistributedAutoencoderKL`
+or `DistributedAutoencoderKLFlux2`, including FLUX.2-dev and FLUX.2 Klein. Klein
+selects the distributed VAE only for batch mode; its default path is unchanged.
+Selecting this mode for an
+unsupported VAE, including Wan, raises an error at model initialization.
+
+For a pipeline already using two tensor-parallel workers, select batch decode
+with these Python settings:
+
+```python
+parallel_config = DiffusionParallelConfig(
+    tensor_parallel_size=2,
+    vae_patch_parallel_size=2,
+    vae_parallel_mode="batch",
+)
+sampling_params = OmniDiffusionSamplingParams(num_outputs_per_prompt=2)
+```
+
+The corresponding serving flags are `--vae-patch-parallel-size 2
+--vae-parallel-mode batch`. Keep the existing DiT parallelism configuration;
+the VAE degree does not allocate extra workers. Send a request for multiple
+images to use the batch split.
+
+Each rank decodes a contiguous part of the image batch through its native VAE
+decoder. Results are reassembled in the original image order and made available
+on every worker. With two images and four workers, two workers decode one image
+each. With five images and four workers, the assigned batch sizes are 2, 1, 1,
+and 1. Workers without images still participate in the required communication.
+
+**Constraints and behavior:**
+
+- This mode changes decode only; encoding keeps the native path.
+- Batch size one, VAE degree one, or a single worker uses native decode.
+- Data parallelism, pipeline parallelism, and CFG parallelism must each have
+  degree one because this implementation communicates over the worker WORLD
+  group. Tensor and sequence parallelism may supply the shared workers.
+- Batch mode does not force tiling. Explicit native VAE tiling and slicing
+  settings remain in effect within each rank's assigned batch.
+- It does not merge independent serving requests. The VAE must receive a batch
+  containing multiple images, for example through `num_outputs_per_prompt`.
+
+Splitting the batch can reduce per-rank decoder work and activation memory, but
+collecting decoded images adds communication and buffers. Measure complete
+request latency and memory for the intended model, image count, and resolution.
+This feature has no universal speedup or memory-saving guarantee. Changing the
+decoder batch shape can also change floating-point rounding; validate generated
+outputs when selecting a deployment configuration.
 
 ---
 
@@ -194,7 +246,8 @@ python3 benchmarks/diffusion/diffusion_benchmark_serving.py \
 ### Common Issue 1: Model Not Support VAE Patch Parallel
 
 **Symptoms**:
-```
+
+```text
 WARNING: vae_patch_parallel_size=2 is set but VAE patch parallelism is NOT enabled for xxxPipeline; ignoring.
 ```
 
@@ -217,7 +270,6 @@ if vae_pp_size > 1 and not is_distributed_vae:
 
 2. To add support for a new model, implement `DistributedVaeMixin` on its VAE class (contributions are welcome).
 
-
 ### Common Issue 2: `vae_patch_parallel_size` Exceeds DiT Process Group Size
 
 **Symptoms**: Shows warning message, and vae patch parallel size is resized to DiT process group size
@@ -227,6 +279,7 @@ if vae_pp_size > 1 and not is_distributed_vae:
 **Recommendation**: Always set `vae_patch_parallel_size` to be no greater than your DiT process group size.
 
 Note that the size of DiT process group size equals to:
+
 ```text
 dit_parallel_size = data_parallel_size
                   × cfg_parallel_size
@@ -235,7 +288,8 @@ dit_parallel_size = data_parallel_size
                   × tensor_parallel_size
 
 ```
-_sequence_parallel_size = ulysses_degree × ring_degree_
+
+`sequence_parallel_size = ulysses_degree × ring_degree`
 
 ---
 
