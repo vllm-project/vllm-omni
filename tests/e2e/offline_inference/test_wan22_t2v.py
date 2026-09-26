@@ -12,12 +12,23 @@ from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 MODEL = "Wan-AI/Wan2.2-T2V-A14B-Diffusers"
 PROMPT = "Two anthropomorphic cats in boxing gear on a spotlighted stage."
 NEGATIVE_PROMPT = "low quality, blurry, watermark, text"
+# Cold ROCm starts can exceed 30 minutes. Keep the inner deadline five
+# minutes below the merge job's 40-minute process deadline for cleanup.
+WAN22_INIT_TIMEOUT_S = 35 * 60
+WAN22_RUNNER_PARAM = (
+    MODEL,
+    None,
+    {
+        "init_timeout": WAN22_INIT_TIMEOUT_S,
+        "stage_init_timeout": WAN22_INIT_TIMEOUT_S,
+    },
+)
 
 
 @pytest.mark.advanced_model
 @pytest.mark.diffusion
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards={"cuda": 1, "rocm": 1})
-@pytest.mark.parametrize("omni_runner", [(MODEL, None)], indirect=True)
+@pytest.mark.parametrize("omni_runner", [WAN22_RUNNER_PARAM], indirect=True)
 def test_structured_diffusion_config_reaches_runtime(omni_runner) -> None:
     """The default WAN resolver launches the typed diffusion config itself."""
     omni = omni_runner.omni
@@ -44,7 +55,7 @@ def test_structured_diffusion_config_reaches_runtime(omni_runner) -> None:
 @pytest.mark.advanced_model
 @pytest.mark.diffusion
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards={"cuda": 1, "rocm": 1})
-@pytest.mark.parametrize("omni_runner", [(MODEL, None)], indirect=True)
+@pytest.mark.parametrize("omni_runner", [WAN22_RUNNER_PARAM], indirect=True)
 def test_text_to_video_001(offline_client: OfflineOmniClient):
     sampling = OmniDiffusionSamplingParams(
         height=512,

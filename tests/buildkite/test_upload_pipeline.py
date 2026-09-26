@@ -27,6 +27,7 @@ from upload_pipeline import (  # noqa: E402
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 CUDA_BOOTSTRAP_STEPS = Path(".buildkite/cuda/bootstrap-upload-steps.yml")
+AMD_MERGE_YAML = Path(".buildkite/amd/test-amd-merge.yml")
 NIGHTLY_YAML = Path(".buildkite/cuda/test-nightly.yml")
 BOOTSTRAP_STEPS_TEMPLATE = """steps:
   - key: image-build
@@ -471,6 +472,28 @@ def _iter_steps(doc: dict):
             yield from walk(step.get("steps"))
 
     yield from walk(doc.get("steps"))
+
+
+def test_amd_wan22_merge_jobs_have_independent_cold_start_budgets() -> None:
+    doc = yaml.safe_load(AMD_MERGE_YAML.read_text(encoding="utf-8"))
+    jobs = {
+        step["label"]: "\n".join(step.get("commands", []))
+        for step in _iter_steps(doc)
+        if step.get("label", "").startswith("Diffusion · Wan22")
+    }
+
+    assert set(jobs) == {
+        "Diffusion · Wan22 Offline Test",
+        "Diffusion · Wan22 Online Test",
+    }
+    offline = jobs["Diffusion · Wan22 Offline Test"]
+    online = jobs["Diffusion · Wan22 Online Test"]
+    assert "timeout 40m" in offline
+    assert "timeout 40m" in online
+    assert "tests/e2e/offline_inference/test_wan22_t2v.py" in offline
+    assert "tests/e2e/online_serving/test_wan22_t2v.py" not in offline
+    assert "tests/e2e/online_serving/test_wan22_t2v.py" in online
+    assert "tests/e2e/offline_inference/test_wan22_t2v.py" not in online
 
 
 # Synthetic coverage-style job: shared inputs that change what the split measures.
