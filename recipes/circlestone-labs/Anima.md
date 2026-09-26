@@ -24,8 +24,12 @@ such as `text_encoder`, `tokenizer`, `t5_tokenizer`, `vae`, and optionally
 `scheduler` must be supplied through a Diffusers-layout components directory.
 
 Native Anima currently supports baseline single-GPU execution. Cache-DiT,
-TeaCache, CPU offload, layer-wise offload, quantization, TP/SP, CFG parallel,
+TeaCache, CPU offload, layer-wise offload, TP/SP, CFG parallel,
 HSDP, and step execution are not supported by `AnimaPipeline` yet.
+Dynamic online FP8 is supported for transformer attention and feed-forward
+projections using `--quantization fp8` in the offline example, or
+`--diffusion-quantization-config '{"transformer":{"method":"fp8"}}'`
+when serving.
 
 ## References
 
@@ -121,7 +125,7 @@ Check that `/tmp/anima_output.png` exists and contains a generated image.
 - Start with `max-concurrency=1` for correctness and latency validation.
 - Keep requests at the same resolution when comparing runs.
 - Do not enable parallelism, cache acceleration, offload, or quantized
-  checkpoint flags for Anima until support is added to `AnimaPipeline`.
+  checkpoint formats for Anima; use dynamic online FP8 instead.
 
 ## Online Serving
 

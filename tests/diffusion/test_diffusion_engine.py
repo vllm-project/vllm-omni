@@ -227,6 +227,18 @@ class TestRequestBatchCapability:
 
         assert diffusion_engine_module.supports_request_batch(od_config) is True
 
+    def test_supports_request_batch_with_native_component_paths(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        od_config = SimpleNamespace(
+            model_class_name="BatchPipeline", custom_pipeline_args={"components_path": "/tmp/model-components"}
+        )
+        monkeypatch.setattr(
+            diffusion_engine_module.DiffusionModelRegistry,
+            "_try_load_model_cls",
+            lambda model_class_name: _BatchCapablePipeline if model_class_name == "BatchPipeline" else None,
+        )
+
+        assert diffusion_engine_module.supports_request_batch(od_config) is True
+
     def test_engine_rejects_multi_seq_diffusers_using_adapter_capability(
         self,
         monkeypatch: pytest.MonkeyPatch,

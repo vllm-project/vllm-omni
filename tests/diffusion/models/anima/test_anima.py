@@ -54,6 +54,24 @@ def test_native_anima_initializes_without_offload():
     AnimaPipeline(od_config=config, device=torch.device("cpu"))
 
 
+@pytest.mark.parametrize(
+    ("quantization_config", "supported"),
+    [
+        ("fp8", True),
+        ({"transformer": {"method": "fp8"}}, True),
+        ({"transformer": {"method": "fp8", "activation_scheme": "static"}}, False),
+        ({"text_encoder": {"method": "fp8"}}, False),
+    ],
+)
+def test_native_anima_quantization_scope(quantization_config, supported):
+    config = OmniDiffusionConfig(model="anima.safetensors", quantization_config=quantization_config)
+    if supported:
+        AnimaPipeline(od_config=config, device=torch.device("cpu"))
+    else:
+        with pytest.raises(NotImplementedError, match="online FP8"):
+            AnimaPipeline(od_config=config, device=torch.device("cpu"))
+
+
 def test_anima_registration() -> None:
     """The native Anima pipeline is registered and importable."""
     from vllm_omni.diffusion.registry import DiffusionModelRegistry

@@ -17,6 +17,7 @@ from diffusers.utils.torch_utils import randn_tensor
 from safetensors.torch import load_file
 from torch import nn
 from transformers import AutoTokenizer, Qwen3Model, T5TokenizerFast
+from vllm.model_executor.layers.quantization.fp8 import Fp8Config
 
 from vllm_omni.diffusion.config import set_current_diffusion_config
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
@@ -27,11 +28,13 @@ from vllm_omni.diffusion.models.anima.anima_text_conditioner import (
     AnimaTextConditioner,
 )
 from vllm_omni.diffusion.models.anima.anima_transformer import ANIMA_TRANSFORMER_CONFIG, AnimaTransformer3DModel
+from vllm_omni.diffusion.models.anima.quantization import prepare_anima_transformer_fp8
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.offloader.config import OffloadStrategy, resolve_offload_strategy
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.utils.size_utils import normalize_min_aligned_size
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+from vllm_omni.quantization import ComponentQuantizationConfig, resolve_component_quant_config
 
 logger = logging.getLogger(__name__)
 
@@ -169,8 +172,18 @@ class AnimaPipeline(nn.Module, DiffusionPipelineProfilerMixin, ProgressBarMixin)
             raise NotImplementedError("AnimaPipeline does not yet support HSDP. Validate sharding after native load.")
         if self.od_config.cache_backend not in ("none", None):
             raise NotImplementedError("AnimaPipeline does not yet support TeaCache or Cache-DiT.")
-        if self.od_config.quantization_config is not None:
-            raise NotImplementedError("AnimaPipeline does not yet support quantized checkpoints.")
+        quant_config = self.od_config.quantization_config
+        if isinstance(quant_config, ComponentQuantizationConfig) and set(quant_config.component_configs) - {
+            "transformer"
+        }:
+            raise NotImplementedError("AnimaPipeline supports online FP8 for the transformer only.")
+        transformer_quant = resolve_component_quant_config(quant_config, "transformer")
+        if transformer_quant is not None and (
+            not isinstance(transformer_quant, Fp8Config)
+            or transformer_quant.is_checkpoint_fp8_serialized
+            or transformer_quant.activation_scheme != "dynamic"
+        ):
+            raise NotImplementedError("AnimaPipeline supports dynamic online FP8 from an unquantized checkpoint only.")
         if resolve_offload_strategy(self.od_config) is not OffloadStrategy.NONE:
             raise NotImplementedError("AnimaPipeline does not yet support CPU offload.")
 
@@ -327,6 +340,10 @@ class AnimaPipeline(nn.Module, DiffusionPipelineProfilerMixin, ProgressBarMixin)
         self.t5_tokenizer = t5_tokenizer
         self.vae = vae
         self.scheduler = scheduler
+        transformer_quant = resolve_component_quant_config(self.od_config.quantization_config, "transformer")
+        if isinstance(transformer_quant, Fp8Config):
+            replaced = prepare_anima_transformer_fp8(self.transformer, transformer_quant)
+            logger.info("Prepared %d Anima transformer linears for online FP8.", replaced)
         self.vae_scale_factor = _anima_vae_scale_factor_from_vae(self.vae)
         self._setup_profiler()
         return loaded
