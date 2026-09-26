@@ -33,6 +33,7 @@ from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.models.qwen_image.cfg_parallel import (
     QwenImageCFGParallelMixin,
 )
+from vllm_omni.diffusion.models.qwen_image.lora import QwenImageLoRAMixin
 from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import (
     QwenImageTransformer2DModel,
 )
@@ -266,6 +267,7 @@ def apply_rotary_emb_qwen(
 
 class QwenImagePipeline(
     nn.Module,
+    QwenImageLoRAMixin,
     QwenImageCFGParallelMixin,
     DiffusionPipelineProfilerMixin,
     SupportsComponentDiscovery,
