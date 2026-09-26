@@ -132,6 +132,7 @@ def _make_engine_core_request(request_id: str = "req-1") -> EngineCoreRequest:
 def test_build_add_request_message_preserves_additional_information(mocker: MockerFixture):
     engine = object.__new__(AsyncOmniEngine)
     params = SamplingParams(max_tokens=8)
+    engine.num_stages = 1
     engine.default_sampling_params_list = [params]
     engine.stage_metadata = [StageRuntimeInfo(final_output=False, final_output_type=None, stage_type="llm")]
     engine.supported_tasks = ("speech",)
@@ -274,6 +275,7 @@ def test_cfg_companion_suppresses_payload_but_forces_kv_transfer(mocker: MockerF
 def test_build_add_request_message_with_resumable_streaming(mocker: MockerFixture):
     engine = object.__new__(AsyncOmniEngine)
     params = SamplingParams(max_tokens=8)
+    engine.num_stages = 1
     engine.default_sampling_params_list = [params]
     engine.stage_metadata = [StageRuntimeInfo(final_output=False, final_output_type=None, stage_type="llm")]
     engine.supported_tasks = ("generate",)
@@ -345,6 +347,7 @@ def _replica(input_addr: str) -> ReplicaInfo:
 def test_build_add_request_message_scopes_mm_uuids_to_selected_stage0_replica(mocker: MockerFixture):
     engine = object.__new__(AsyncOmniEngine)
     params = SamplingParams(max_tokens=8)
+    engine.num_stages = 1
     engine.model = "test-model"
     engine.default_sampling_params_list = [params]
     engine.stage_metadata = [StageRuntimeInfo(final_output=False, final_output_type=None, stage_type="llm")]
@@ -382,6 +385,7 @@ def test_build_add_request_message_scopes_mm_uuids_to_selected_stage0_replica(mo
 async def test_build_add_request_message_scopes_mm_uuids_to_distributed_stage0_replica(mocker: MockerFixture):
     engine = object.__new__(AsyncOmniEngine)
     params = SamplingParams(max_tokens=8)
+    engine.num_stages = 1
     engine.model = "test-model"
     engine.default_sampling_params_list = [params]
     engine.stage_metadata = [StageRuntimeInfo(final_output=False, final_output_type=None, stage_type="llm")]
@@ -427,6 +431,7 @@ async def test_build_add_request_message_scopes_mm_uuids_to_distributed_stage0_r
 def test_build_add_request_message_skips_distributed_mm_scope_when_no_replica(mocker: MockerFixture):
     engine = object.__new__(AsyncOmniEngine)
     params = SamplingParams(max_tokens=8)
+    engine.num_stages = 1
     engine.model = "test-model"
     engine.default_sampling_params_list = [params]
     engine.stage_metadata = [StageRuntimeInfo(final_output=False, final_output_type=None, stage_type="llm")]
@@ -465,6 +470,84 @@ def test_build_add_request_message_skips_distributed_mm_scope_when_no_replica(mo
     assert stage_pool.get_bound_replica_id("req-no-replica") is None
 
 
+def test_build_add_request_message_rejects_empty_sampling_params():
+    engine = object.__new__(AsyncOmniEngine)
+    engine.num_stages = 1
+    engine.default_sampling_params_list = []
+    with pytest.raises(ValueError, match="Missing sampling params"):
+        engine._build_add_request_message(
+            request_id="req-1",
+            prompt={"prompt_token_ids": [1]},
+            sampling_params_list=[],
+            final_stage_id=0,
+        )
+
+
+def test_build_add_request_message_rejects_negative_final_stage_id():
+    engine = object.__new__(AsyncOmniEngine)
+    engine.num_stages = 1
+    engine.default_sampling_params_list = []
+    params = SamplingParams(max_tokens=8)
+    with pytest.raises(ValueError, match="final_stage_id must be >= 0"):
+        engine._build_add_request_message(
+            request_id="req-1",
+            prompt={"prompt_token_ids": [1]},
+            sampling_params_list=[params],
+            final_stage_id=-1,
+        )
+
+
+def test_build_add_request_message_rejects_final_stage_id_ge_num_stages():
+    engine = object.__new__(AsyncOmniEngine)
+    engine.num_stages = 1
+    engine.default_sampling_params_list = []
+    params = SamplingParams(max_tokens=8)
+    with pytest.raises(ValueError, match="final_stage_id must be < num_stages=1"):
+        engine._build_add_request_message(
+            request_id="req-1",
+            prompt={"prompt_token_ids": [1]},
+            sampling_params_list=[params],
+            final_stage_id=1,
+        )
+
+
+def test_build_add_request_message_rejects_too_short_sampling_params_list():
+    engine = object.__new__(AsyncOmniEngine)
+    engine.num_stages = 2
+    engine.default_sampling_params_list = []
+    params = SamplingParams(max_tokens=8)
+    with pytest.raises(ValueError, match="requires at least 2"):
+        engine._build_add_request_message(
+            request_id="req-1",
+            prompt={"prompt_token_ids": [1]},
+            sampling_params_list=[params],
+            final_stage_id=1,
+        )
+
+
+def test_build_add_request_message_valid_input_does_not_raise(mocker: MockerFixture):
+    engine = object.__new__(AsyncOmniEngine)
+    params = SamplingParams(max_tokens=8)
+    engine.num_stages = 1
+    engine.default_sampling_params_list = [params]
+    engine.stage_metadata = [StageRuntimeInfo(final_output=False, final_output_type=None, stage_type="llm")]
+    engine.supported_tasks = ("generate",)
+
+    input_processor = mocker.Mock()
+    input_processor.process_inputs.return_value = _make_engine_core_request()
+    engine.input_processor = input_processor
+
+    output_processor = mocker.Mock()
+    engine.output_processors = [output_processor]
+
+    engine._build_add_request_message(
+        request_id="req-1",
+        prompt={"prompt_token_ids": [1, 2, 3]},
+        sampling_params_list=[params],
+        final_stage_id=0,
+    )
+
+
 def test_stage_pool_replica_count_falls_back_to_clients():
     class PoolWithoutLiveNumReplicas:
         clients = [object(), None, object()]
@@ -482,6 +565,7 @@ def test_stage_pool_is_distributed_falls_back_to_hub():
 def test_build_add_request_message_releases_preselected_replica_on_preprocess_error(mocker: MockerFixture):
     engine = object.__new__(AsyncOmniEngine)
     params = SamplingParams(max_tokens=8)
+    engine.num_stages = 1
     engine.model = "test-model"
     engine.default_sampling_params_list = [params]
     engine.stage_metadata = [StageRuntimeInfo(final_output=False, final_output_type=None, stage_type="llm")]
