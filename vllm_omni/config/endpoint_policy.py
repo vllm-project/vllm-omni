@@ -25,6 +25,8 @@ class OmniServingCapability(Enum):
 
     COMPLETIONS = RouteTarget("/v1/completions", frozenset({"POST"}))
     IMAGE_EDITS = RouteTarget("/v1/images/edits", frozenset({"POST"}))
+    TOKENIZE = RouteTarget("/tokenize", frozenset({"POST"}))
+    DETOKENIZE = RouteTarget("/detokenize", frozenset({"POST"}))
 
     @property
     def path(self) -> str:
