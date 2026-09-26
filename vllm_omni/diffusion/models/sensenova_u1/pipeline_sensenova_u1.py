@@ -1524,8 +1524,8 @@ class SenseNovaU1Pipeline(
             v_pred = v_pred * (norm_c / (norm_v + 1e-8)).clamp(0, 1.0)
         return v_pred
 
-    def _expand_and_prepare_kv(self, kv, token_hw, batch_size, *, prepare_flash=True):
-        """Expand KV cache for batch and prepare flash attention buffers."""
+    def _expand_and_prepare_kv(self, kv, token_hw, batch_size, *, prepare_flash=False):
+        """Expand prefix KV; optionally allocate dense image buffers eagerly."""
         for layer in kv.layers:
             layer.keys = layer.keys.expand(batch_size, *layer.keys.shape[1:])
             layer.values = layer.values.expand(batch_size, *layer.values.shape[1:])
@@ -1681,7 +1681,7 @@ class SenseNovaU1Pipeline(
             ctx.past_kv_cond, _ = self._t2i_prefix_forward(input_ids_cond, indexes_cond, mask_cond)
         return ctx
 
-    def _t2i_caches(self, p, ns, ctx: SimpleNamespace, *, prepare_flash=True):
+    def _t2i_caches(self, p, ns, ctx: SimpleNamespace, *, prepare_flash=False):
         """Finish the think loop, run the uncond prefix, and assemble the caches."""
         think_text = ""
         indexes_image_cond = ctx.indexes_image_cond
@@ -1790,7 +1790,7 @@ class SenseNovaU1Pipeline(
             )
         return ctx
 
-    def _it2i_caches(self, p, ns, ctx: SimpleNamespace, *, prepare_flash=True):
+    def _it2i_caches(self, p, ns, ctx: SimpleNamespace, *, prepare_flash=False):
         """Finish the think loop, run the remaining prefixes, and assemble the caches."""
         think_text = ""
         if ctx.cursor is not None:

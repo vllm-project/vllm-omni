@@ -67,12 +67,13 @@ def create_block_causal_mask(index: torch.Tensor):
     return torch.where(mask[None, None], 0.0, float("-inf"))
 
 
-def prepare_flash_kv_cache(past_key_values, current_len: int, batch_size: int):
+def prepare_flash_kv_cache(past_key_values, current_len: int, batch_size: int, layer_idx: int | None = None):
     """Convert prefix cache [B,H,S,D] → flash layout [B,S,H,D] and
     preallocate buffers for [prefix + current] tokens."""
     if past_key_values is None:
         return
-    for layer in past_key_values.layers:
+    layers = past_key_values.layers if layer_idx is None else (past_key_values.layers[layer_idx],)
+    for layer in layers:
         past_k, past_v = layer.keys, layer.values
         if past_k is None or past_v is None:
             layer.flash_prefix_len = 0
@@ -602,6 +603,15 @@ class SenseNovaU1Attention(nn.Module):
                     v = value_states.transpose(1, 2).contiguous()
                 else:
                     layer = past_key_values.layers[self.layer_idx]
+                    if not hasattr(layer, "flash_k_cache"):
+                        # A CFG branch may never be used on its own. Allocate
+                        # dense image KV only when this layer actually reads it.
+                        prepare_flash_kv_cache(
+                            past_key_values,
+                            current_len=k_cur.shape[1],
+                            batch_size=q.shape[0],
+                            layer_idx=self.layer_idx,
+                        )
                     if hasattr(layer, "flash_k_cache") and layer.flash_k_cache is not None:
                         prefix_len = layer.flash_prefix_len
                         cur_len = k_cur.shape[1]

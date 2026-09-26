@@ -8,6 +8,12 @@ import pytest
 import torch
 import torch.nn.functional as F
 from transformers.cache_utils import DynamicCache
+from vllm.config import DeviceConfig, VllmConfig, set_current_vllm_config
+from vllm.distributed.parallel_state import (
+    cleanup_dist_env_and_memory,
+    init_distributed_environment,
+    initialize_model_parallel,
+)
 
 from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.attention.backends.flash_attn import FlashAttentionImpl
@@ -16,13 +22,27 @@ from vllm_omni.diffusion.models.sensenova_u1.pipeline_sensenova_u1 import (
     SenseNovaU1Pipeline,
     get_sensenova_u1_pre_process_func,
 )
-from vllm_omni.diffusion.models.sensenova_u1.sensenova_u1_transformer import write_packed_image_kv
+from vllm_omni.diffusion.models.sensenova_u1.sensenova_u1_transformer import (
+    SenseNovaU1Attention,
+    prepare_flash_kv_cache,
+    write_packed_image_kv,
+)
 from vllm_omni.diffusion.output_formatter import format_diffusion_outputs, normalize_diffusion_postprocess_output
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
+
+
+@pytest.fixture
+def single_gpu_model_parallel(monkeypatch):
+    monkeypatch.setenv("MASTER_ADDR", "localhost")
+    monkeypatch.setenv("MASTER_PORT", "29544")
+    init_distributed_environment(world_size=1, rank=0, local_rank=0, distributed_init_method="env://")
+    initialize_model_parallel()
+    yield
+    cleanup_dist_env_and_memory()
 
 
 def _request(name="first", *, count=1, seed=42, extra=None, mode="t2i"):
@@ -165,6 +185,102 @@ def test_packed_flash_attention_matches_independent_ragged_requests(merge_kind):
         out = F.scaled_dot_product_attention(query[row].transpose(0, 1).unsqueeze(0), key, value, enable_gqa=True)
         expected.append(out.squeeze(0).transpose(0, 1))
     torch.testing.assert_close(actual, torch.stack(expected), atol=0.03, rtol=0.03)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for FlashAttention")
+@pytest.mark.cuda
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+def test_packed_sensenova_attention_dispatch_matches_independent_requests(single_gpu_model_parallel):
+    """Exercise the real Attention dispatcher, not FlashAttentionImpl directly."""
+    torch.manual_seed(23)
+    device, dtype = "cuda", torch.bfloat16
+    image_tokens, heads, kv_heads, head_dim = 4, 4, 2, 64
+    config = SimpleNamespace(
+        hidden_size=heads * head_dim,
+        num_attention_heads=heads,
+        num_key_value_heads=kv_heads,
+        head_dim=head_dim,
+        attention_dropout=0.0,
+        attention_bias=False,
+        rms_norm_eps=1e-6,
+    )
+    with set_current_vllm_config(VllmConfig(device_config=DeviceConfig(device=device))):
+        attention = SenseNovaU1Attention(config, layer_idx=0, prefix="test.attn").to(device=device, dtype=dtype)
+    assert attention.attn.attn_backend.supports_multi_doc_packed_varlen()
+    with torch.no_grad():
+        for param in attention.parameters():
+            if param.ndim == 1:
+                param.fill_(1)
+            else:
+                param.normal_(std=0.1)
+
+    prefixes = []
+    for length, sign in ((5, 1), (8, -1)):
+        cache = DynamicCache()
+        keys = torch.zeros(1, kv_heads, length, head_dim, device=device, dtype=dtype)
+        values = torch.full_like(keys, 4 * sign)
+        cache.update(keys, values, 0)
+        prefixes.append({"cond": cache, "idx_cond": torch.zeros(3, image_tokens, device=device)})
+    merged = merge_conditioning(prefixes, [1, 1], image_tokens, packed_varlen=True)["cond"]
+    assert merged.layers[0].sensenova_packed_varlen
+
+    hidden = torch.randn(2, image_tokens, heads * head_dim, device=device, dtype=dtype)
+    cos_t = torch.ones(2, image_tokens, head_dim // 2, device=device, dtype=dtype)
+    sin_t = torch.zeros_like(cos_t)
+    cos_hw = torch.ones(2, image_tokens, head_dim // 4, device=device, dtype=dtype)
+    sin_hw = torch.zeros_like(cos_hw)
+    position_embeddings = ((cos_t, sin_t), (cos_hw, sin_hw), (cos_hw, sin_hw))
+
+    def run(states, cache, rope):
+        return attention.forward(
+            states,
+            image_gen_indicators=torch.ones(states.shape[:2], device=device, dtype=torch.bool),
+            exist_und=False,
+            exist_gen=True,
+            indexes=torch.zeros(3, states.shape[0], image_tokens, device=device),
+            attention_mask=None,
+            past_key_values=cache,
+            update_cache=False,
+            position_embeddings=rope,
+        )
+
+    with torch.inference_mode():
+        actual = run(hidden, merged, position_embeddings)
+        expected = torch.cat(
+            [
+                run(
+                    hidden[row : row + 1],
+                    prefix["cond"],
+                    tuple((cos[row : row + 1], sin[row : row + 1]) for cos, sin in position_embeddings),
+                )
+                for row, prefix in enumerate(prefixes)
+            ]
+        )
+    torch.testing.assert_close(actual, expected, atol=0.05, rtol=0.05)
+    assert not hasattr(merged.layers[0], "flash_k_cache")
+    assert all(prefix["cond"].layers[0].flash_k_cache is not None for prefix in prefixes)
+
+    # A stale SDPA pin leaves attn_backend advertising Flash support while
+    # ignoring the packed sequence boundaries. This control must be distinct.
+    native_impl = attention.attn.attention
+    try:
+        attention.attn.attention = attention.attn.sdpa_fallback
+        with torch.inference_mode():
+            wrong = run(hidden, merged, position_embeddings)
+    finally:
+        attention.attn.attention = native_impl
+    assert (wrong - expected).abs().max().item() > 0.1
+
+
+def test_flash_kv_preparation_can_allocate_only_the_used_layer():
+    cache = DynamicCache()
+    for layer_idx in range(2):
+        cache.update(torch.ones(1, 2, 3, 4), torch.ones(1, 2, 3, 4), layer_idx)
+    _pipeline()._expand_and_prepare_kv(cache, token_hw=2, batch_size=1)
+    assert all(not hasattr(layer, "flash_k_cache") for layer in cache.layers)
+    prepare_flash_kv_cache(cache, current_len=2, batch_size=1, layer_idx=1)
+    assert not hasattr(cache.layers[0], "flash_k_cache")
+    assert cache.layers[1].flash_k_cache.shape == (1, 5, 2, 4)
 
 
 def test_merge_cfg_branches_preserves_branch_rows_and_indexes():
