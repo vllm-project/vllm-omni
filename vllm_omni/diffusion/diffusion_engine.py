@@ -1325,6 +1325,11 @@ class DiffusionEngine:
 
         if num_frames is None:
             num_frames = get_dummy_run_num_frames(model_class_name, supports_audio_input)
+        if model_class_name == "SeedVR2Pipeline":
+            prompt = OmniTextPrompt(prompt="", multi_modal_data={"video": torch.zeros(1, 3, height, width)})
+            num_frames = 1
+            guidance_scale = 1.0
+            num_inference_steps = 1
         if num_frames <= 0:
             return None
         return OmniDiffusionRequest(
