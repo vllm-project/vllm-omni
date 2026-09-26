@@ -1382,3 +1382,12 @@ class ModelChannel:
         if scheduled:
             model_state.continuation_owner_id = owner_id
             model_state.continuation_units = count + 1
+            return
+        if not response_owned and session.active_response_id is not None:
+            # The unit was planned for the model turn, and the answer opened while it
+            # waited: it is stale against its old owner, and the answer's own segment
+            # end only arrives after one more unit is processed. Re-aim the unit at the
+            # answer instead of dropping it, which would leave the answer half spoken
+            # for a client that has stopped sending audio. The re-aimed call re-checks
+            # the session state, so a closed session or a newer epoch still drops it.
+            await self.maybe_continue_response(expected_epoch=expected_epoch)
