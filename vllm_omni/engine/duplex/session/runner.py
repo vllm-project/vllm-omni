@@ -1325,6 +1325,17 @@ class DuplexSessionRunner:
                 return
         had_unbuffered_append = model_state.input_since_commit and not model_state.audio_buffer.has_pending()
         playback_was_active = helpers.assistant_playback_active(self.session)
+        cleared_completed_response = (
+            event_type == "output_audio_buffer.clear" and session.active_response_id is None and playback_was_active
+        )
+        if cleared_completed_response and session.last_response_id is not None:
+            # A delayed ACK must not restore audio the client has discarded.
+            session.truncate_history_item(
+                f"item_{session.last_response_id}",
+                audio_end_ms=session.playback.committed_ms,
+                playback=session.playback_for_response(session.last_response_id),
+                hard=True,
+            )
         if event_type in {"input.cancel", "barge_in"}:
             model_state.audio_buffer.clear()
             session.release_all_input_bytes()
@@ -1418,6 +1429,15 @@ class DuplexSessionRunner:
         if not await self.model.signal_cancel_fence(cancelled_fence):
             return
         self.tasks.active_response_task = None
+        if cleared_completed_response and model_state.deferred_response_create:
+            payload = model_state.committed_audio_payload
+            if payload is not None:
+                precreate_response = model_state.deferred_precreate_response
+                model_state.deferred_response_create = False
+                model_state.deferred_precreate_response = False
+                model_state.input_since_commit = False
+                model_state.speech_since_commit = False
+                self._promote_deferred_overlap_later(payload, precreate_response)
 
     async def _cancel_active_response(
         self,

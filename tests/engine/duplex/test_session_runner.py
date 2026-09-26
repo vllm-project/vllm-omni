@@ -708,6 +708,63 @@ async def test_stale_epoch_output_is_dropped_after_barge_in() -> None:
         await close_harness(h)
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("create_response", [False, True])
+async def test_clear_completed_playback_allows_response_to_retained_audio(create_response: bool) -> None:
+    h = await open_harness(auto_response=False)
+    try:
+        await h.run(append_audio())
+        await h.run(commands.Commit(create_response=True))
+        request_id = h.stage0_request_id()
+        await h.deliver_and_settle(tts_output(request_id, text="hello"))
+        events = await h.deliver_and_settle(tts_output(request_id, text="hello", finished=True))
+        done = find(events, "response.done")
+        assert done.status == "completed"
+        await h.run(commands.AckPlayback(played_ms=400, response_id=done.response_id))
+
+        # A later committed input must survive clearing the old output.
+        await h.run(append_audio(value=0.25))
+        await h.run(commands.Commit(create_response=create_response))
+        assert len(h.port.submissions) == 1
+
+        cleared = await h.run(commands.ClearOutputAudio(response_id=done.response_id))
+        assert find(cleared, "output_audio_buffer.cleared").response_id == done.response_id
+        if create_response:
+            events = cleared
+        else:
+            assert types(cleared) == ["output_audio_buffer.cleared"]
+            events = await h.run(commands.CreateResponse())
+        assert "error" not in types(events)
+        assert "response.created" in types(events)
+        assert len(h.port.submissions) == 2
+        submitted = h.port.submissions[-1].prompt["model_intermediate_buffer"]["duplex"]["payload"]
+        samples = np.frombuffer(base64.b64decode(submitted["audio"]), dtype=np.float32)
+        np.testing.assert_array_equal(samples, np.full(16000, 0.25, dtype=np.float32))
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_completed_playback_clear_does_not_restore_history_on_late_ack() -> None:
+    h = await open_harness(auto_response=False)
+    try:
+        await h.run(append_audio())
+        await h.run(commands.Commit(create_response=True))
+        request_id = h.stage0_request_id()
+        await h.deliver_and_settle(tts_output(request_id, text="hello"))
+        events = await h.deliver_and_settle(tts_output(request_id, text="hello", finished=True))
+        response_id = find(events, "response.done").response_id
+        await h.run(commands.AckPlayback(played_ms=400, response_id=response_id))
+        await h.run(commands.ClearOutputAudio(response_id=response_id))
+
+        events = await h.run(commands.AckPlayback(played_ms=1000, response_id=response_id))
+        assert types(events) == ["playback.acknowledged"]
+        assert [item["content"] for item in h.session.history if item["role"] == "assistant"] == ["he"]
+        assert h.session.playback.sent_ms == 0
+    finally:
+        await close_harness(h)
+
+
 async def test_barge_in_aborts_draining_tts_as_well_as_the_active_request() -> None:
     h = await open_harness()
     try:
