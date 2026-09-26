@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 # Copyright 2025 The HuggingFace Team and SANA-Video Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -37,6 +40,10 @@ from vllm_omni.diffusion.distributed.parallel_state import (
     get_sequence_parallel_rank,
     get_sequence_parallel_world_size,
     get_sp_group,
+)
+from vllm_omni.diffusion.layers.fused_interleaved_rope import (
+    can_use_fused_interleaved_rope,
+    fused_interleaved_rope,
 )
 
 
@@ -98,6 +105,36 @@ def _sp_gather_frames(hidden_states: torch.Tensor, sizes: list[int]) -> torch.Te
         frames = torch.cat([frames, frames.new_zeros((frames.shape[0], pad, *frames.shape[2:]))], dim=1)
     parts = get_sp_group().all_gather(frames, dim=0, separate_tensors=True)
     return torch.cat([part.narrow(1, 0, size) for part, size in zip(parts, sizes)], dim=1).flatten(1, 2)
+
+
+def apply_interleaved_rotary_emb(
+    hidden_states: torch.Tensor,
+    freqs_cos: torch.Tensor,
+    freqs_sin: torch.Tensor,
+) -> torch.Tensor:
+    """Apply Diffusers-compatible interleaved real RoPE to ``[B, N, H, D]``."""
+    x1, x2 = hidden_states.unflatten(-1, (-1, 2)).unbind(-1)
+    cos = freqs_cos[..., 0::2]
+    sin = freqs_sin[..., 1::2]
+    output = torch.empty_like(hidden_states)
+    output[..., 0::2] = x1 * cos - x2 * sin
+    output[..., 1::2] = x1 * sin + x2 * cos
+    return output.type_as(hidden_states)
+
+
+def apply_interleaved_rotary_emb_pair(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    freqs_cos: torch.Tensor,
+    freqs_sin: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply fused paired RoPE when supported, otherwise use eager RoPE."""
+    if can_use_fused_interleaved_rope(query, key, freqs_cos, freqs_sin):
+        return fused_interleaved_rope(query, key, freqs_cos, freqs_sin)
+    return (
+        apply_interleaved_rotary_emb(query, freqs_cos, freqs_sin),
+        apply_interleaved_rotary_emb(key, freqs_cos, freqs_sin),
+    )
 
 
 @dataclass
@@ -660,21 +697,7 @@ class SanaLinearAttention(nn.Module):
         query = torch.relu(query)
         key = torch.relu(key)
 
-        def apply_rotary_emb(
-            hidden_states: torch.Tensor,
-            freqs_cos: torch.Tensor,
-            freqs_sin: torch.Tensor,
-        ):
-            x1, x2 = hidden_states.unflatten(-1, (-1, 2)).unbind(-1)
-            cos = freqs_cos[..., 0::2]
-            sin = freqs_sin[..., 1::2]
-            out = torch.empty_like(hidden_states)
-            out[..., 0::2] = x1 * cos - x2 * sin
-            out[..., 1::2] = x1 * sin + x2 * cos
-            return out.type_as(hidden_states)
-
-        query_rotate = apply_rotary_emb(query, *rotary_emb)
-        key_rotate = apply_rotary_emb(key, *rotary_emb)
+        query_rotate, key_rotate = apply_interleaved_rotary_emb_pair(query, key, *rotary_emb)
 
         # B,H,C,N
         query = query.permute(0, 2, 3, 1)
