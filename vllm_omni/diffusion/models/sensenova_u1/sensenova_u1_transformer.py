@@ -4,7 +4,8 @@
 
 Ported from the sensenova_u1 package with vllm tensor-parallel support:
 - QKVParallelLinear for fused q/k/v projections (both und and gen paths)
-- MergedColumnParallelLinear for fused gate+up projections
+- MergedColumnParallelLinear for fused gate+up projections (dense 8B)
+- FusedMoE for Qwen3-MoE experts (A3B: und 128 experts / gen 32 experts)
 - RowParallelLinear for o_proj and down_proj
 - VocabParallelEmbedding for token embeddings
 """
@@ -12,17 +13,22 @@ Ported from the sensenova_u1 package with vllm tensor-parallel support:
 from __future__ import annotations
 
 import copy
+from contextlib import contextmanager
 from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import vllm.forward_context as vllm_forward_context
 from cache_dit import ForwardPattern
 from transformers.cache_utils import DynamicCache
+from vllm.config import get_current_vllm_config, get_current_vllm_config_or_none
+from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
+    ReplicatedLinear,
     RowParallelLinear,
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
@@ -34,6 +40,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.cache.cachedit import CacheDiTAdapterConfig, SensenovaCachedAdapter
+from vllm_omni.diffusion.layers.fused_moe import FusedMoE
 
 logger = init_logger(__name__)
 
@@ -228,6 +235,112 @@ class SenseNovaU1MLP(nn.Module):
         x = self.act_fn(gate) * up
         x, _ = self.down_proj(x)
         return x
+
+
+def _is_moe(config) -> bool:
+    """Whether ``llm_config`` describes the A3B MoE backbone rather than dense 8B."""
+    num_experts = getattr(config, "num_experts", None)
+    return isinstance(num_experts, int) and num_experts > 1
+
+
+def _is_sparse_und_layer(config, layer_idx: int) -> bool:
+    """Understanding-path sparse MoE, matching upstream Qwen3-MoE layer selection."""
+    if not _is_moe(config):
+        return False
+    mlp_only_layers = list(getattr(config, "mlp_only_layers", None) or [])
+    decoder_sparse_step = int(getattr(config, "decoder_sparse_step", 1) or 1)
+    return layer_idx not in mlp_only_layers and (layer_idx + 1) % decoder_sparse_step == 0
+
+
+class SenseNovaU1SparseMoeBlock(nn.Module):
+    """Top-k softmax-routed MoE using vLLM FusedMoE.
+
+    Parameter names (``gate.weight``, ``experts.routed_experts.w13_weight`` /
+    ``w2_weight``) match the A3B checkpoint after ``load_weights`` remaps
+    ``experts.{i}.gate_proj/up_proj/down_proj``.
+    """
+
+    def __init__(
+        self,
+        config,
+        *,
+        num_experts: int,
+        num_experts_per_tok: int,
+        moe_intermediate_size: int,
+        quant_config=None,
+        prefix: str = "",
+    ):
+        super().__init__()
+        self.tp_size = get_tensor_model_parallel_world_size()
+        if self.tp_size > num_experts:
+            raise ValueError(
+                f"Tensor parallel size {self.tp_size} is greater than the number of experts {num_experts}."
+            )
+
+        self.gate = ReplicatedLinear(
+            config.hidden_size,
+            num_experts,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.gate",
+        )
+        enable_expert_parallel = get_current_vllm_config().parallel_config.enable_expert_parallel
+        self.experts = FusedMoE(
+            num_experts=num_experts,
+            top_k=num_experts_per_tok,
+            hidden_size=config.hidden_size,
+            intermediate_size=moe_intermediate_size,
+            renormalize=config.norm_topk_prob,
+            quant_config=quant_config,
+            prefix=f"{prefix}.experts",
+            enable_eplb=False,
+            num_redundant_experts=0,
+            pcp_size=None if enable_expert_parallel else 1,
+        )
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        orig_shape = hidden_states.shape
+        hidden_dim = hidden_states.shape[-1]
+        hidden_states = hidden_states.view(-1, hidden_dim)
+        router_logits, _ = self.gate(hidden_states)
+        final_hidden_states = self.experts(hidden_states=hidden_states, router_logits=router_logits)
+        return final_hidden_states.view(orig_shape)
+
+
+def _build_mlp(config, layer_idx: int, *, gen_path: bool, quant_config=None, prefix: str = ""):
+    """Dense SwiGLU for the 8B checkpoint, sparse MoE for A3B.
+
+    A3B keeps the generation branch sparse on every layer, while the
+    understanding branch follows the upstream Qwen3-MoE ``mlp_only_layers`` /
+    ``decoder_sparse_step`` selection. The ``gen_*`` knobs are always populated
+    by :class:`SenseNovaU1MoELLMConfig`, defaulting to the understanding-path
+    values when the checkpoint omits them.
+    """
+    if gen_path and _is_moe(config):
+        return SenseNovaU1SparseMoeBlock(
+            config,
+            num_experts=config.gen_num_experts,
+            num_experts_per_tok=config.gen_num_experts_per_tok,
+            moe_intermediate_size=config.gen_moe_intermediate_size,
+            quant_config=quant_config,
+            prefix=prefix,
+        )
+    if not gen_path and _is_sparse_und_layer(config, layer_idx):
+        return SenseNovaU1SparseMoeBlock(
+            config,
+            num_experts=config.num_experts,
+            num_experts_per_tok=config.num_experts_per_tok,
+            moe_intermediate_size=config.moe_intermediate_size,
+            quant_config=quant_config,
+            prefix=prefix,
+        )
+    return SenseNovaU1MLP(
+        config.hidden_size,
+        config.intermediate_size,
+        config.hidden_act,
+        quant_config=quant_config,
+        prefix=prefix,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -557,19 +670,9 @@ class SenseNovaU1DecoderLayer(nn.Module):
         self.self_attn = SenseNovaU1Attention(
             config, layer_idx, quant_config=quant_config, prefix=f"{prefix}.self_attn"
         )
-        self.mlp = SenseNovaU1MLP(
-            config.hidden_size,
-            config.intermediate_size,
-            config.hidden_act,
-            quant_config=quant_config,
-            prefix=f"{prefix}.mlp",
-        )
-        self.mlp_mot_gen = SenseNovaU1MLP(
-            config.hidden_size,
-            config.intermediate_size,
-            config.hidden_act,
-            quant_config=quant_config,
-            prefix=f"{prefix}.mlp_mot_gen",
+        self.mlp = _build_mlp(config, layer_idx, gen_path=False, quant_config=quant_config, prefix=f"{prefix}.mlp")
+        self.mlp_mot_gen = _build_mlp(
+            config, layer_idx, gen_path=True, quant_config=quant_config, prefix=f"{prefix}.mlp_mot_gen"
         )
         self.input_layernorm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.input_layernorm_mot_gen = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -761,6 +864,31 @@ class SenseNovaU1ForCausalLM(nn.Module):
         # LogitsProcessor handles the TP all-gather of vocab-sharded ParallelLMHead
         # outputs so callers see full-vocab logits regardless of tp_size.
         self.logits_processor = LogitsProcessor(config.vocab_size)
+        self.has_moe = any(
+            isinstance(layer.mlp, SenseNovaU1SparseMoeBlock) or isinstance(layer.mlp_mot_gen, SenseNovaU1SparseMoeBlock)
+            for layer in self.model.layers
+        )
+
+    @contextmanager
+    def _vllm_forward_context(self):
+        """Enter vLLM's own forward context for the A3B MoE layers.
+
+        ``moe_forward`` resolves its layer through ``vllm.forward_context``,
+        which the diffusion runner's context does not populate -- that one is
+        ``vllm_omni.diffusion.forward_context``. Dense checkpoints have no
+        FusedMoE and stay on the runner's context alone.
+        """
+        if not self.has_moe or vllm_forward_context.is_forward_context_available():
+            yield
+            return
+        vllm_config = get_current_vllm_config_or_none()
+        if vllm_config is None:
+            # Warmup paths can run outside the runner's context; let the MoE op
+            # raise on its own rather than masking it with a second failure.
+            yield
+            return
+        with vllm_forward_context.set_forward_context(None, vllm_config):
+            yield
 
     def forward(
         self,
@@ -787,15 +915,16 @@ class SenseNovaU1ForCausalLM(nn.Module):
                 inputs_embeds=self.model.embed_tokens(input_ids),
             )
 
-        outputs = self.model(
-            input_ids=input_ids,
-            indexes=indexes,
-            attention_mask=attention_mask,
-            past_key_values=past_key_values,
-            inputs_embeds=inputs_embeds,
-            use_cache=use_cache,
-            **kwargs,
-        )
+        with self._vllm_forward_context():
+            outputs = self.model(
+                input_ids=input_ids,
+                indexes=indexes,
+                attention_mask=attention_mask,
+                past_key_values=past_key_values,
+                inputs_embeds=inputs_embeds,
+                use_cache=use_cache,
+                **kwargs,
+            )
         logits = self.logits_processor(self.lm_head, outputs.last_hidden_state) if compute_logits else None
         return SenseNovaU1CausalLMOutput(
             logits=logits,
