@@ -17,6 +17,7 @@ def test_ming_a6_single_gpu_profile_is_explicitly_colocated():
     stages = merge_pipeline_deploy(resolve_pipeline_config("ming_flash_omni_image"), deploy)
 
     assert [stage.yaml_runtime["devices"] for stage in stages] == ["0", "0"]
+    assert stages[0].yaml_engine_args["max_num_seqs"] == 2
     assert stages[0].yaml_engine_args["tensor_parallel_size"] == 1
     assert stages[1].yaml_engine_args["parallel_config"]["cfg_parallel_size"] == 1
     assert stages[1].yaml_engine_args["inline_diffusion"] is True
@@ -28,4 +29,5 @@ def test_ming_a6_cfg_parallel_profile_assigns_two_diffusion_ranks():
     stages = merge_pipeline_deploy(resolve_pipeline_config("ming_flash_omni_image"), deploy)
 
     assert [stage.yaml_runtime["devices"] for stage in stages] == ["0,1,2,3", "4,5"]
+    assert stages[0].yaml_engine_args["max_num_seqs"] == 2
     assert stages[1].yaml_engine_args["parallel_config"]["cfg_parallel_size"] == 2
