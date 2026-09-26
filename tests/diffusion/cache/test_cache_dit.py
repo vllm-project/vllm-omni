@@ -373,7 +373,7 @@ def test_summary_with_no_transformer_is_nonfatal():
     current_omni_platform.is_rocm(),
     reason="vLLM ROCm custom ops lack CPU fallback",
 )
-def test_mammothmoda2_cache_dit_runs_end_to_end_on_tiny_model(request: pytest.FixtureRequest):
+def test_mammothmoda2_cache_dit_runs_end_to_end_on_tiny_model(init_fake_tp_group, request: pytest.FixtureRequest):
     """A tiny MammothModa2 DiT runs through Cache-DiT with paired CFG forwards.
 
     Exercises the Pattern_3 contract end to end: after enabling the custom
@@ -383,8 +383,11 @@ def test_mammothmoda2_cache_dit_runs_end_to_end_on_tiny_model(request: pytest.Fi
     """
     from cache_dit import BlockAdapter
 
+    from tests.diffusion.models.mammoth_moda2.helpers import initialize_block_weights
     from vllm_omni.diffusion.models.mammoth_moda2.mammothmoda2_dit_model import Transformer2DModel
     from vllm_omni.diffusion.models.mammoth_moda2.rope_real import RotaryPosEmbedReal
+
+    torch.manual_seed(0)
 
     # MammothModa2 attention resolves through the shared Omni attention layer,
     # which picks the platform-default backend at construction time. Pin
@@ -403,6 +406,7 @@ def test_mammothmoda2_cache_dit_runs_end_to_end_on_tiny_model(request: pytest.Fi
             axes_lens=(300, 512, 512),
             text_feat_dim=16,
         )
+    initialize_block_weights(model)
     model.eval()
 
     MammothModa2Pipeline = type("MammothModa2DiTPipeline", (), {})
