@@ -60,9 +60,9 @@ def load_transformer_config(model_path: str, subfolder: str = "transformer", loc
     else:
         # Try to download config from HF Hub
         try:
-            from huggingface_hub import hf_hub_download
+            from vllm_omni.transformers_utils.repo_utils import hf_api
 
-            config_path = hf_hub_download(
+            config_path = hf_api().hf_hub_download(
                 repo_id=model_path,
                 filename=f"{subfolder}/config.json",
             )
