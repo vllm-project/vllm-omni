@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -43,6 +43,26 @@ class AllGatherKVParallelAttention:
     def name(self) -> str:
         return "allgather_kv"
 
+    def _gather_kv(self, key: torch.Tensor, value: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        if self._sp_size == 1:
+            return key, value
+
+        if key.shape == value.shape and key.dtype == value.dtype and key.device == value.device:
+            # Gather sequence-first to avoid reordering rank/batch for B > 1.
+            # Dense attention can consume the resulting strided B/S views
+            # with unit last-dimension stride; flattening B/S may copy.
+            packed = torch.stack((key.transpose(0, 1), value.transpose(0, 1)), dim=2)  # [S, B, 2, Hkv, D]
+            gathered = self._sp_group.all_gather(packed, dim=0, group=self._allgather_group)
+            # separate_tensors=False always returns a Tensor.
+            gathered_key, gathered_value = gathered.unbind(dim=2)  # type: ignore[union-attr]
+            return gathered_key.transpose(0, 1), gathered_value.transpose(0, 1)
+
+        # Some backends support different K/V head dimensions or dtypes.
+        return (
+            self._sp_group.all_gather(key, dim=1, group=self._allgather_group),
+            self._sp_group.all_gather(value, dim=1, group=self._allgather_group),
+        )
+
     def pre_attention(
         self,
         query: torch.Tensor,
@@ -60,8 +80,7 @@ class AllGatherKVParallelAttention:
         if joint_strategy not in {"front", "rear"}:
             raise ValueError(f"Unsupported joint_strategy: {joint_strategy!r}")
 
-        k_img_full = self._sp_group.all_gather(key, dim=1, group=self._allgather_group)
-        v_img_full = self._sp_group.all_gather(value, dim=1, group=self._allgather_group)
+        k_img_full, v_img_full = self._gather_kv(key, value)
 
         if joint_k is not None:
             if joint_k.shape[2] != key.shape[2]:

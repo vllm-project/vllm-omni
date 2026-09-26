@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """Tests for Ulysses + Ring sequence-parallel attention correctness.
 
@@ -175,6 +175,15 @@ class _MockAllGatherSPGroup:
         assert group is self.allgather_group
         self.gathered_input_shapes.append(tuple(input_.shape))
         chunks = self._gather_chunks.pop(0)
+        if input_.ndim == 5:
+            assert dim == 0
+            value_chunks = self._gather_chunks.pop(0)
+            chunks = [
+                torch.stack((key.transpose(0, 1), value.transpose(0, 1)), dim=2)
+                for key, value in zip(chunks, value_chunks, strict=True)
+            ]
+        if input_.device.type != "meta":
+            torch.testing.assert_close(input_, chunks[self.allgather_rank], rtol=0, atol=0)
         return torch.cat(chunks, dim=dim)
 
 
@@ -399,8 +408,7 @@ def test_allgather_kv_keeps_gathered_kv_compressed_for_gqa():
     _, k_full, v_full, _, _ = strategy.pre_attention(query, key_chunks[rank], value_chunks[rank], AttentionMetadata())
 
     assert sp_group.gathered_input_shapes == [
-        (1, img_seq_local, kv_heads, 1),
-        (1, img_seq_local, kv_heads, 1),
+        (img_seq_local, 1, 2, kv_heads, 1),
     ]
     assert k_full.shape == (1, img_seq_local * 2, kv_heads, 1)
     assert v_full.shape == (1, img_seq_local * 2, kv_heads, 1)
@@ -408,6 +416,75 @@ def test_allgather_kv_keeps_gathered_kv_compressed_for_gqa():
     expected_value = torch.cat(value_chunks, dim=1)
     torch.testing.assert_close(k_full, expected_key)
     torch.testing.assert_close(v_full, expected_value)
+
+
+@pytest.mark.parametrize("batch_size", [1, 2])
+@pytest.mark.parametrize("rank", [0, 1])
+@pytest.mark.parametrize("noncontiguous", [False, True])
+def test_allgather_kv_preserves_batch_rank_and_projection_values(batch_size, rank, noncontiguous):
+    seq_local, kv_heads, head_dim = 3, 2, 4
+    shape = (batch_size, seq_local, kv_heads, head_dim, 2)
+    key_chunks = []
+    value_chunks = []
+    for chunk_rank in range(2):
+        elements = batch_size * seq_local * kv_heads * head_dim * 2
+        key = (torch.arange(elements, dtype=torch.float32) + chunk_rank * 1000).reshape(shape)[..., 0]
+        value = (torch.arange(elements, dtype=torch.float32) + chunk_rank * 1000 + 10000).reshape(shape)[..., 1]
+        if not noncontiguous:
+            key, value = key.contiguous(), value.contiguous()
+        assert key.is_contiguous() == (not noncontiguous)
+        assert value.is_contiguous() == (not noncontiguous)
+        key_chunks.append(key)
+        value_chunks.append(value)
+    sp_group = _MockAllGatherSPGroup(rank=rank, gather_chunks=[key_chunks, value_chunks])
+    strategy = AllGatherKVParallelAttention(sp_group)
+    query = torch.zeros((batch_size, seq_local, kv_heads * 2, head_dim))
+
+    q_local, key, value, _, _ = strategy.pre_attention(query, key_chunks[rank], value_chunks[rank], None)
+
+    assert q_local is query
+    assert sp_group.gathered_input_shapes == [(seq_local, batch_size, 2, kv_heads, head_dim)]
+    torch.testing.assert_close(key, torch.cat(key_chunks, dim=1), rtol=0, atol=0)
+    torch.testing.assert_close(value, torch.cat(value_chunks, dim=1), rtol=0, atol=0)
+    for tensor in (key, value):
+        assert tensor.stride(-1) == 1
+
+
+@pytest.mark.parametrize("mismatch", ["shape", "dtype", "device"])
+def test_allgather_kv_falls_back_for_incompatible_key_value(mismatch):
+    key_chunks = [torch.full((2, 3, 2, 4), float(rank)) for rank in range(2)]
+    value_shape = (2, 3, 2, 5 if mismatch == "shape" else 4)
+    value_dtype = torch.float64 if mismatch == "dtype" else torch.float32
+    # Meta tensors exercise the device guard without requiring a GPU.
+    value_device = "meta" if mismatch == "device" else "cpu"
+    value_chunks = [
+        torch.full(value_shape, float(rank + 10), dtype=value_dtype, device=value_device) for rank in range(2)
+    ]
+    sp_group = _MockAllGatherSPGroup(rank=1, gather_chunks=[key_chunks, value_chunks])
+    strategy = AllGatherKVParallelAttention(sp_group)
+
+    key, value = strategy._gather_kv(key_chunks[1], value_chunks[1])
+
+    assert sp_group.gathered_input_shapes == [tuple(key_chunks[1].shape), value_shape]
+    torch.testing.assert_close(key, torch.cat(key_chunks, dim=1), rtol=0, atol=0)
+    assert value.shape == (2, 6, *value_shape[2:])
+    assert value.dtype == value_dtype
+    assert value.device == torch.device(value_device)
+    if value_device == "cpu":
+        torch.testing.assert_close(value, torch.cat(value_chunks, dim=1), rtol=0, atol=0)
+
+
+def test_allgather_kv_single_rank_preserves_original_tensors():
+    key = torch.arange(96, dtype=torch.float32).reshape(2, 3, 2, 8)[..., ::2]
+    value = key + 1000
+    sp_group = _MockAllGatherSPGroup(rank=0, gather_chunks=[[key], [value]])
+    strategy = AllGatherKVParallelAttention(sp_group)
+
+    gathered_key, gathered_value = strategy._gather_kv(key, value)
+
+    assert gathered_key is key
+    assert gathered_value is value
+    assert sp_group.gathered_input_shapes == []
 
 
 @hardware_test(res={"cuda": "L4"}, num_cards=4)
@@ -534,8 +611,8 @@ def test_sequence_parallel(
         # Step 3: Verify input consistency and compare outputs
         print(f"\n{'=' * 80}")
         print("Verifying input data consistency...")
-        with open(input_data_file, "rb") as f:
-            input_data = pickle.load(f)
+        with open(input_data_file, "rb") as input_file:
+            input_data = pickle.load(input_file)
         input_checksum = hash(input_data.tobytes())
         print(f"  Input data shape: {input_data.shape}")
         print(f"  Input data checksum: {input_checksum}")
@@ -543,10 +620,10 @@ def test_sequence_parallel(
 
         print(f"\n{'=' * 80}")
         print("Comparing outputs between baseline and SP...")
-        with open(baseline_output_file, "rb") as f:
-            baseline_output = pickle.load(f)
-        with open(sp_output_file, "rb") as f:
-            sp_output = pickle.load(f)
+        with open(baseline_output_file, "rb") as baseline_file:
+            baseline_output = pickle.load(baseline_file)
+        with open(sp_output_file, "rb") as sp_file:
+            sp_output = pickle.load(sp_file)
 
         # Convert to tensors for comparison
         baseline_tensor = torch.tensor(baseline_output)
@@ -597,9 +674,9 @@ def test_sequence_parallel(
 
     finally:
         # Clean up temporary files
-        for f in [baseline_output_file, sp_output_file, model_state_file, input_data_file]:
-            if os.path.exists(f):
-                os.remove(f)
+        for file_path in [baseline_output_file, sp_output_file, model_state_file, input_data_file]:
+            if os.path.exists(file_path):
+                os.remove(file_path)
 
 
 def ulysses_attention_on_test_model(
