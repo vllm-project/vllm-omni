@@ -494,6 +494,9 @@ class Magi2MultiHeadMoE(nn.Module):
         probabilities, indices = self._route(x_heads)
         gather_ids, sorted_probs, offsets = global_sort_routes(probabilities, indices, self.num_experts)
         if x_heads.is_cuda:
+            # The MUSA Triton backend cannot lower BF16 atomic_add.
+            # Reuse routed-output storage without changing expert arithmetic.
+            non_atomic = current_omni_platform.is_musa() and x_heads.dtype == torch.bfloat16
             return triton_mh_moe_forward(
                 x_heads,
                 gather_ids,
@@ -502,7 +505,7 @@ class Magi2MultiHeadMoE(nn.Module):
                 self.W_gate,
                 self.W_up,
                 self.W_down,
-                deterministic=os.environ.get("MAGI2_DETERMINISTIC", "0") == "1",
+                deterministic=os.environ.get("MAGI2_DETERMINISTIC", "0") == "1" or non_atomic,
             )
         return torch_mh_moe_forward(x_heads, gather_ids, sorted_probs, offsets, self.W_gate, self.W_up, self.W_down)
 
