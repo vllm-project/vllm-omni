@@ -21,6 +21,7 @@ from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.models.sensenova_u1.paged_decode import (
     BLOCK_SIZE,
     BUCKETS,
+    READINESS_DECODE_WARM_BUCKET,
     TAIL_STEP,
     PagedDecodeCache,
     _bucket_for,
@@ -398,6 +399,119 @@ def test_a_whole_decode_loop_matches_the_unpaged_path():
     assert worst < 5e-2, f"largest per-step deviation {worst:.3e}"
 
 
+@cuda_only
+@vllm_flash_attn_only
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"})
+def test_serving_the_512_tier_on_the_pregrown_stash_matches_the_unpaged_path(monkeypatch):
+    """The readiness configuration, which the loop above never runs.
+
+    ``test_a_whole_decode_loop_matches_the_unpaged_path`` grows the allocation
+    as it goes, so the buffer's bucket always tracks the length being served
+    and the 512 tier is only ever exercised on a 512 allocation. Serving after
+    the readiness warm runs it on a stash pre-grown to 2048, and two
+    regressions would be invisible in the other direction: scheduling from the
+    buffer's bucket is numerically correct (``seqused_k`` bounds the read) but
+    pays the top bucket's KV loop on every replay, and reading past ``seqused``
+    is only visible against the unpaged path. So: pre-grow, capture the way
+    readiness does, then replay a short sequence through the real runner and
+    require parity with the ``torch.cat``-grown reference at every step.
+    """
+    import torch.nn.functional as F
+
+    from vllm_omni.diffusion.models.sensenova_u1.paged_decode import DecodeGraphRunner
+
+    heads, kv_heads, dim = 8, 2, 64
+    prefill, steps = 60, 80  # ends at 140: the whole loop stays in the 512 tier
+    dev, dt = torch.device("cuda"), torch.bfloat16
+    scale = dim**-0.5
+    torch.manual_seed(11)
+
+    dyn = _Cache(
+        [
+            _Layer(
+                torch.randn(1, kv_heads, prefill, dim, device=dev, dtype=dt),
+                torch.randn(1, kv_heads, prefill, dim, device=dev, dtype=dt),
+            )
+        ]
+    )
+    paged = PagedDecodeCache.from_dynamic_cache(dyn, 1, dev, dt, min_length=READINESS_DECODE_WARM_BUCKET)
+    assert paged.bucket == READINESS_DECODE_WARM_BUCKET, "the fixture does not start pre-grown"
+    ref_k, ref_v = dyn.layers[0].keys.clone(), dyn.layers[0].values.clone()
+    proj = torch.randn(dim * heads, 128, device=dev, dtype=torch.float32)
+
+    # Every kernel call is recorded, capture and warmup alike -- replay bypasses
+    # Python entirely -- so the schedule each graph was baked with is pinned
+    # where the buffer's own bucket would have masked it. Only the Python int
+    # is recorded: reading the ``seqused`` tensor here would synchronize the
+    # device, which a capture forbids; the length at each call is known from
+    # the loop below.
+    scheduled: list[int] = []
+    real_flash = paged_decode._flash_varlen()
+
+    def recording(*args, **kwargs):
+        scheduled.append(kwargs["max_seqlen_k"])
+        return real_flash(*args, **kwargs)
+
+    monkeypatch.setattr(paged_decode, "_flash_varlen", lambda: recording)
+
+    class _AttendLM(torch.nn.Module):
+        """One attention layer served out of the paged cache, so a captured
+        step's logits are its output. The step's q/k/v live here in buffers the
+        test rewrites between replays, the way the runner's input tensors do."""
+
+        def __init__(self):
+            super().__init__()
+            self.q = torch.zeros(1, heads, 1, dim, device=dev, dtype=dt)
+            self.k = torch.zeros(1, kv_heads, 1, dim, device=dev, dtype=dt)
+            self.v = torch.zeros_like(self.k)
+
+        def forward(self, input_ids, indexes, past_key_values=None, use_cache=False, paged_cache=None):
+            return SimpleNamespace(logits=paged_cache.attend(0, self.q, self.k, self.v, scale))
+
+    lm = _AttendLM()
+    runner = DecodeGraphRunner(lm, paged, dev)
+    # The readiness warm's loop: a capture per bucket the allocation covers,
+    # each taken at a length inside its bucket, and each baking the kernel for
+    # that bucket alone -- not for the 2048 the buffer itself tops out at.
+    for bucket in [b for b in BUCKETS if b <= paged.bucket]:
+        paged.set_length(bucket)
+        calls = len(scheduled)
+        runner.step(0, bucket - 1)
+        assert scheduled[calls:] and set(scheduled[calls:]) == {bucket}, (
+            f"the {bucket} graph was captured with max_seqlen_k {sorted(set(scheduled[calls:]))}"
+        )
+    assert runner.captures == 3, "the warm loop did not capture one graph per bucket"
+    warm_calls = len(scheduled)
+
+    # Serving: the real prefix goes back in, and a sequence that stays under
+    # 512 replays on the 2048 allocation through the runner's own keying.
+    assert paged.load_prefix(dyn) and paged.length == prefill
+    paged_ids, ref_ids, worst = [], [], 0.0
+    for _ in range(steps):
+        lm.q.copy_(torch.randn(1, heads, 1, dim, device=dev, dtype=dt))
+        lm.k.copy_(torch.randn(1, kv_heads, 1, dim, device=dev, dtype=dt))
+        lm.v.copy_(torch.randn(1, kv_heads, 1, dim, device=dev, dtype=dt))
+        paged.set_length(paged.length + 1)
+        got = runner.step(0, paged.length - 1)
+
+        ref_k = torch.cat([ref_k, lm.k], dim=2)
+        ref_v = torch.cat([ref_v, lm.v], dim=2)
+        want = F.scaled_dot_product_attention(lm.q, ref_k, ref_v, enable_gqa=True, scale=scale).transpose(1, 2)
+
+        worst = max(worst, (got.float() - want.float()).abs().max().item())
+        paged_ids.append(int((got.float().reshape(1, -1) @ proj).argmax()))
+        ref_ids.append(int((want.float().reshape(1, -1) @ proj).argmax()))
+
+    assert paged.bucket == READINESS_DECODE_WARM_BUCKET, "a 512-tier sequence grew the stash"
+    assert paged.generation == 0, "a 512-tier sequence reallocated the stash"
+    assert runner.captures == 3, "serving inside the warm bucket captured"
+    assert len(scheduled) == warm_calls, "a serving step ran the kernel outside a replay"
+    assert paged_ids == ref_ids, (
+        f"argmax diverges at step {next(i for i, (a, b) in enumerate(zip(paged_ids, ref_ids)) if a != b)}"
+    )
+    assert worst < 5e-2, f"largest per-step deviation {worst:.3e}"
+
+
 class _StubLM(torch.nn.Module):
     """Just enough CUDA work inside the capture for a pool to be allocated."""
 
@@ -583,6 +697,45 @@ def test_only_q_k_and_v_reach_the_kernel_positionally(monkeypatch):
     }
 
 
+def test_the_kernel_is_scheduled_for_the_length_being_served(monkeypatch):
+    """``max_seqlen_k`` is a Python int baked at capture, and it sizes the KV
+    loop of every launch a graph replays. Passing the buffer's own bucket made
+    each step below the warm bucket walk the whole allocation -- +0.144
+    ms/token measured on an A800, which is what the per-bucket graphs exist to
+    avoid. It has to be the bucket of the length in hand, which ``seqused``
+    never exceeds.
+    """
+    seen: dict[str, object] = {}
+
+    def recorder(*args, **kwargs):
+        seen.clear()
+        seen.update(kwargs)
+        return torch.zeros(1, N_HEADS, HEAD_DIM)
+
+    monkeypatch.setattr(paged_decode, "_flash_varlen", lambda: recorder)
+    cache = PagedDecodeCache(
+        1,
+        KV_HEADS,
+        HEAD_DIM,
+        READINESS_DECODE_WARM_BUCKET,
+        torch.device("cpu"),
+        torch.float32,
+    )
+    assert cache.bucket == READINESS_DECODE_WARM_BUCKET, "the fixture does not start pre-grown"
+
+    for served, want in ((200, BUCKETS[0]), (512, BUCKETS[0]), (513, BUCKETS[1]), (1500, BUCKETS[2])):
+        cache.set_length(served)
+        cache.attend(
+            0,
+            torch.zeros(1, N_HEADS, 1, HEAD_DIM),
+            torch.zeros(1, KV_HEADS, 1, HEAD_DIM),
+            torch.zeros(1, KV_HEADS, 1, HEAD_DIM),
+            1.0,
+        )
+        assert seen["max_seqlen_k"] == want, f"length {served} scheduled the kernel for {seen['max_seqlen_k']}"
+        assert seen["seqused_k"] is cache.seqused, "the valid span stopped coming from the device tensor"
+
+
 def test_the_kill_switch_returns_no_cache(monkeypatch):
     """The recipe documents `VLLM_OMNI_SENSENOVA_PAGED_DECODE=0` as the way back
     to the ordinary cache, so the switch needs a test rather than only prose."""
@@ -690,6 +843,36 @@ def test_no_capture_crosses_a_request_once_lora_wrappers_are_installed(monkeypat
     assert back[0] is not adapted[0], "a later request reused the adapted capture"
     assert back[1] is not adapted[1], "a later request reused the adapted runner"
     assert getattr(host, "_paged_decode", None) is None, "an adapted capture was left on the pipeline"
+
+
+def test_sequential_offload_takes_the_eager_path(monkeypatch):
+    """Model-level CPU offload hooks ``language_model`` as its DiT component,
+    and the hook moves parameters and synchronizes the platform inside every
+    forward -- capture forbids both ("operation not permitted when stream is
+    capturing"), and a replay would skip the swap the hook exists to make. The
+    paged path has to step aside at readiness and at serving, and come back
+    once the hook is removed.
+    """
+    from vllm_omni.diffusion.hooks import HookRegistry
+    from vllm_omni.diffusion.offloader.sequential_backend import SequentialOffloadHook
+
+    pipe_mod, host = _pipeline_host(monkeypatch)
+    monkeypatch.setattr(pipe_mod, "DecodeGraphRunner", _CountingRunner)
+    warm = pipe_mod.SenseNovaU1Pipeline._warm_paged_decode_graphs
+    ctx = pipe_mod.SenseNovaU1Pipeline._decode_context
+
+    HookRegistry.get_or_create(host.language_model).register_hook(
+        SequentialOffloadHook._HOOK_NAME,
+        SequentialOffloadHook(offload_targets=[], device=torch.device("cpu")),
+    )
+    warm(host, _dyn_cache(2))
+    assert getattr(host, "_paged_decode", None) is None, "warm captured under a hook that synchronizes"
+    assert ctx(host, _dyn_cache(10)) is None, "serving reached the capture path under offload"
+
+    host.language_model._hook_registry.remove_hook(SequentialOffloadHook._HOOK_NAME)
+    warm(host, _dyn_cache(2))
+    assert host._paged_decode is not None, "the path stayed down after the hook was removed"
+    assert host._paged_decode[0].bucket == READINESS_DECODE_WARM_BUCKET
 
 
 @cuda_only
@@ -804,3 +987,307 @@ def test_the_dummy_warmup_request_drives_one_decode_step(monkeypatch):
 
 class _StopForwardError(Exception):
     """Stops ``forward`` right after the warmup hook, so the test needs no model."""
+
+
+# ---------------------------------------------------------------------------
+# Readiness capture. The dummy warmup request above is think off, so without
+# this the first think request pays for its own captures: one per bucket
+# boundary it crosses, 0.16-0.17 s of capture out of the ~0.7 s it owes in
+# total (the rest is compile), hidden by medians and carried by its P100.
+# ---------------------------------------------------------------------------
+
+
+class _CountingRunner:
+    """Stands in for ``DecodeGraphRunner``: records steps, counts captures.
+
+    Picks the graph the way the real one does -- by the bucket of the current
+    length, not the buffer's own -- and counts a capture only for a key it has
+    never served, so a step below the warm bucket that switches buckets shows
+    up as a replay, not a capture.
+    """
+
+    def __init__(self, lm, cache, device):
+        self.cache = cache
+        self.captures = 0
+        self.served: set[tuple[int, int]] = set()
+
+    def step(self, token, t_index):
+        key = (_bucket_for(self.cache.length), self.cache.generation)
+        if key not in self.served:
+            self.served.add(key)
+            self.captures += 1
+
+
+def test_readiness_warm_grows_the_stash_to_the_decode_warm_bucket(monkeypatch):
+    """One capture per bucket at startup has to replace the ones the first
+    requests paid.
+
+    The stash the warmup leaves must be the decode warm bucket itself,
+    not the one its two-token prefill rounds up to -- a cache left at 512 would
+    hand the first think request the same grow-and-recapture it was built to
+    avoid -- and it must hold a graph for every bucket below the top: the
+    graphs are keyed by the bucket of the length being served, so a missing
+    one is a serving-time capture.
+    """
+    pipe_mod, host = _pipeline_host(monkeypatch)
+    monkeypatch.setattr(pipe_mod, "DecodeGraphRunner", _CountingRunner)
+
+    pipe_mod.SenseNovaU1Pipeline._warm_paged_decode_graphs(host, _dyn_cache(2))
+
+    cache, runner = host._paged_decode
+    assert cache.bucket == READINESS_DECODE_WARM_BUCKET
+    assert runner.served == {(bucket, 0) for bucket in (512, 1024, 2048)}, (
+        "readiness left a bucket's graph to the first request that fits it"
+    )
+    assert runner.captures == 3, "readiness left the graph to the first request"
+
+
+def test_serving_below_the_warm_bucket_takes_the_stash_without_rebuilding(monkeypatch):
+    """The warm stash is only worth what ``_decode_context`` does with it.
+
+    A request whose own prefix would have demanded a bigger bucket than a
+    lazily-built cache (600 rounds up to 1024, the first request's to 512) must
+    reuse the pre-grown one instead of rebuilding -- rebuilding the cache is
+    what re-captures the graph.
+    """
+    pipe_mod, host = _pipeline_host(monkeypatch)
+    monkeypatch.setattr(pipe_mod, "DecodeGraphRunner", _CountingRunner)
+    pipe_mod.SenseNovaU1Pipeline._warm_paged_decode_graphs(host, _dyn_cache(2))
+    stash = host._paged_decode
+
+    ctx = pipe_mod.SenseNovaU1Pipeline._decode_context
+    served = ctx(host, _dyn_cache(600))
+    assert served[0] is stash[0], "the warm cache was rebuilt for a request that fits it"
+    assert served[1] is stash[1], "the warm runner was rebuilt, so its capture is gone"
+    assert served[0].bucket == READINESS_DECODE_WARM_BUCKET
+    assert stash[1].captures == 3, "reuse must not re-capture"
+
+
+def test_serving_below_the_warm_bucket_switches_buckets_without_capturing(monkeypatch):
+    """Crossing a bucket inside the warm stash must switch graphs, not capture.
+
+    ``max_seqlen_k`` is baked at capture, so the graphs a step replays are
+    keyed by the bucket of the length in hand. A sequence crossing the 512 and
+    1024 boundaries of the pre-grown stash used to stay on one 2048-scheduled
+    capture -- correct, but every step paid the top bucket's KV loop. Driven
+    through ``_ar_step`` so the growth check serving runs decides when the
+    cache reallocates, not a copy of it.
+    """
+    pipe_mod, host = _pipeline_host(monkeypatch)
+    monkeypatch.setattr(pipe_mod, "DecodeGraphRunner", _CountingRunner)
+    pipe_mod.SenseNovaU1Pipeline._warm_paged_decode_graphs(host, _dyn_cache(2))
+    stash = host._paged_decode
+
+    ctx = pipe_mod.SenseNovaU1Pipeline._decode_context
+    cache, runner = ctx(host, _dyn_cache(2))
+    assert cache is stash[0] and runner is stash[1]
+
+    step = pipe_mod.SenseNovaU1Pipeline._ar_step
+    token = torch.tensor(0)
+    while cache.length < READINESS_DECODE_WARM_BUCKET:
+        step(host, token, cache.length - 1, None, decode=stash)
+    assert cache.generation == 0, "a sequence below the warm bucket reallocated"
+    assert runner.captures == 3, "a step below the warm bucket captured instead of switching graphs"
+
+    # One token past the warm bucket: the growth check fires, the generation
+    # moves, and the request owes exactly one lazy capture.
+    generation = cache.generation
+    step(host, token, cache.length - 1, None, decode=stash)
+    assert cache.length == READINESS_DECODE_WARM_BUCKET + 1
+    assert cache.bucket == 4096, "the first step past the warm bucket did not land on the next scheduled bucket"
+    assert cache.generation > generation, "crossing the warm bucket reallocated nothing"
+    assert runner.captures == 4, "the first token past the warm bucket did not capture exactly once"
+
+    step(host, token, cache.length - 1, None, decode=stash)
+    assert runner.captures == 4, "a later step in the new bucket re-captured"
+
+
+def test_warm_leaves_no_stash_when_it_cannot_be_reused(monkeypatch):
+    """Whatever warmup captures has to obey the same rules serving does: the
+    kill switch, the device probe, dynamic LoRA and a missing prefill cache
+    each mean the graph would never be replayed, so none may be left behind."""
+    pipe_mod, host = _pipeline_host(monkeypatch)
+    monkeypatch.setattr(pipe_mod, "DecodeGraphRunner", _CountingRunner)
+    warm = pipe_mod.SenseNovaU1Pipeline._warm_paged_decode_graphs
+
+    monkeypatch.setenv("VLLM_OMNI_SENSENOVA_PAGED_DECODE", "0")
+    warm(host, _dyn_cache(2))
+    assert getattr(host, "_paged_decode", None) is None, "the switch was ignored"
+
+    monkeypatch.setenv("VLLM_OMNI_SENSENOVA_PAGED_DECODE", "1")
+    monkeypatch.setattr(pipe_mod, "paged_decode_supported", lambda dev, head_dim: False)
+    warm(host, _dyn_cache(2))
+    assert getattr(host, "_paged_decode", None) is None, "an unsupported device captured"
+
+    pipe_mod, host = _pipeline_host(monkeypatch)
+    monkeypatch.setattr(pipe_mod, "DecodeGraphRunner", _CountingRunner)
+    warm = pipe_mod.SenseNovaU1Pipeline._warm_paged_decode_graphs
+    host.language_model.add_module("q_proj", _FakeLoRAWrapper())
+    warm(host, _dyn_cache(2))
+    assert getattr(host, "_paged_decode", None) is None, "warm captured across LoRA wrappers"
+
+    # Detach the wrapper first or the LoRA guard shadows the one under test.
+    # Production reaches this guard bare: `_warm_ar_decode` passes None
+    # through whenever the eager warmup above it raises.
+    del host.language_model.q_proj
+    warm(host, None)
+    assert getattr(host, "_paged_decode", None) is None, "warm captured without a prefill cache"
+
+
+def test_a_failed_prefill_warmup_still_tries_the_graphs(monkeypatch):
+    """The eager fallback path and the paged one fail independently, so a warmup
+    prefill that raises must not stop the graph capture from being attempted."""
+    from vllm_omni.diffusion.models.sensenova_u1.pipeline_sensenova_u1 import (
+        SenseNovaU1Pipeline,
+    )
+
+    seen = []
+    # A bare host: the eager warmup raises on the missing language model, which
+    # is the failure under test, so nothing else may be attached to it.
+    host = object.__new__(SenseNovaU1Pipeline)
+    monkeypatch.setattr(SenseNovaU1Pipeline, "_warm_paged_decode_graphs", lambda self, cache: seen.append(cache))
+    SenseNovaU1Pipeline._warm_ar_decode(host)
+    assert seen == [None], "a failed prefill warmup skipped the graph warmup"
+
+
+def test_a_working_prefill_warmup_builds_the_readiness_stash(monkeypatch):
+    """The hand-off from the eager warmup to the graph warm is the one path no
+    other test drives: the dummy-warmup test stubs ``_warm_ar_decode`` out, the
+    failure test above only covers the ``None`` case, and the graph tests call
+    ``_warm_paged_decode_graphs`` directly -- so deleting the ``prefill_cache``
+    hand-off outright stayed green while the readiness capture silently never
+    happened in production. Drive it with a language model whose prefill
+    returns a real cache, and pin that the stash grew out of exactly that
+    prefill.
+    """
+    pipe_mod, host = _pipeline_host(monkeypatch)
+    monkeypatch.setattr(pipe_mod, "DecodeGraphRunner", _CountingRunner)
+    calls: list[bool] = []
+
+    class _HandoffLM(torch.nn.Module):
+        """Prefill returns a cache the graph warm can be handed off from."""
+
+        def forward(self, input_ids, indexes, past_key_values=None, use_cache=False, paged_cache=None):
+            calls.append(past_key_values is None)
+            if past_key_values is None:
+                return SimpleNamespace(past_key_values=_dyn_cache(2))
+            return SimpleNamespace(past_key_values=past_key_values)
+
+    lm = _HandoffLM()
+    lm.model = SimpleNamespace(layers=[SimpleNamespace(self_attn=SimpleNamespace(head_dim=HEAD_DIM))] * LAYERS)
+    host.language_model = lm
+
+    pipe_mod.SenseNovaU1Pipeline._warm_ar_decode(host)
+
+    stash = host._paged_decode
+    assert stash is not None, "a working prefill never built the readiness stash"
+    assert stash[0].bucket == READINESS_DECODE_WARM_BUCKET
+    assert calls == [True, False], "the eager warmup prefill or its decode step did not run"
+    # The stash grew out of the prefill the eager warmup produced, not a bare
+    # allocation: its first rows are that prefill's K, verbatim.
+    torch.testing.assert_close(
+        stash[0].k[0].view(-1, KV_HEADS, HEAD_DIM)[:2],
+        _dyn_cache(2).layers[0].keys[0].transpose(0, 1),
+    )
+
+
+@cuda_only
+@vllm_flash_attn_only
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"})
+def test_serving_below_the_warm_bucket_adds_no_captures(monkeypatch):
+    """The measurable claim of the whole exercise, against a real capture.
+
+    Three requests whose sequences cross the 512 and 1024 boundaries of a
+    lazily-built cache each used to force a grow and a re-capture. From the
+    warm stash they cross those boundaries inside one allocation instead, which
+    now has to switch to the bucket's own warmed graph rather than capture --
+    so the capture count taken at readiness must be the count after the last
+    one.
+    """
+    dev = torch.device("cuda")
+    pipe_mod, host = _pipeline_host(monkeypatch, device="cuda", language_model=_StubLM(dev))
+
+    pipe_mod.SenseNovaU1Pipeline._warm_paged_decode_graphs(host, _dyn_cache(2, dev))
+    stash = host._paged_decode
+    assert stash[1].captures == 3
+
+    ctx = pipe_mod.SenseNovaU1Pipeline._decode_context
+    for prefix, steps in ((300, 1024), (100, 1000), (600, 512)):
+        cache, runner = ctx(host, _dyn_cache(prefix, dev))
+        assert cache is stash[0] and runner is stash[1]
+        target = prefix + steps
+        assert target > BUCKETS[1], "the request never crossed an old bucket boundary"
+        while cache.length < target:
+            if cache.length + 1 > cache.bucket:
+                cache.grow(cache.length + 1)
+            cache.set_length(cache.length + 1)
+            runner.step(0, cache.length - 1)
+        assert runner.captures == 3, f"request with prefix {prefix} captured again"
+
+
+@cuda_only
+@vllm_flash_attn_only
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"})
+def test_a_sequence_ending_exactly_at_the_warm_bucket_adds_no_capture(monkeypatch):
+    """The warm bucket's promise, pinned on the line itself: 2048 still replays.
+
+    A 2047-token prefill plus one decode step ends on 2048 exactly, the closest
+    a request comes to the line while staying on the readiness graph. The reuse
+    check admits that prefix only through its ``prefix + 1``, and the grow
+    branch must stay closed at the last token the bucket holds. Driven through
+    ``_ar_step`` so both are the conditions serving runs, not copies of them.
+    """
+    dev = torch.device("cuda")
+    pipe_mod, host = _pipeline_host(monkeypatch, device="cuda", language_model=_StubLM(dev))
+    pipe_mod.SenseNovaU1Pipeline._warm_paged_decode_graphs(host, _dyn_cache(2, dev))
+    stash = host._paged_decode
+    assert stash[1].captures == 3
+
+    ctx = pipe_mod.SenseNovaU1Pipeline._decode_context
+    cache, runner = ctx(host, _dyn_cache(READINESS_DECODE_WARM_BUCKET - 1, dev))
+    assert cache is stash[0] and runner is stash[1]
+
+    pipe_mod.SenseNovaU1Pipeline._ar_step(host, torch.tensor(0, device=dev), 0, None, decode=stash)
+    assert cache.length == READINESS_DECODE_WARM_BUCKET
+    assert cache.bucket == READINESS_DECODE_WARM_BUCKET, "the boundary grew the stash"
+    assert runner.captures == 3, "the last token the warm bucket holds paid a capture"
+
+
+@cuda_only
+@vllm_flash_attn_only
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"})
+def test_one_step_past_the_warm_bucket_pays_exactly_one_lazy_capture(monkeypatch):
+    """The other side of the line: past 2048 the readiness graph stops serving,
+    and the request owes exactly one lazy capture.
+
+    From a 2047-token prefill the step onto 2048 replays; the one after it
+    grows the stash to the next bucket (4096), which bumps the generation and
+    captures. Grown and stepped through ``_ar_step`` itself: the runner-level
+    tests replay this sequence by hand and would stay green if the serving
+    glue stopped growing the cache, leaving a graph to replay over a ``seqused``
+    the bucket cannot hold.
+    """
+    dev = torch.device("cuda")
+    pipe_mod, host = _pipeline_host(monkeypatch, device="cuda", language_model=_StubLM(dev))
+    pipe_mod.SenseNovaU1Pipeline._warm_paged_decode_graphs(host, _dyn_cache(2, dev))
+    stash = host._paged_decode
+    assert stash[1].captures == 3
+
+    ctx = pipe_mod.SenseNovaU1Pipeline._decode_context
+    cache, runner = ctx(host, _dyn_cache(READINESS_DECODE_WARM_BUCKET - 1, dev))
+    assert cache is stash[0] and runner is stash[1]
+
+    step = pipe_mod.SenseNovaU1Pipeline._ar_step
+    step(host, torch.tensor(0, device=dev), 0, None, decode=stash)
+    assert cache.length == READINESS_DECODE_WARM_BUCKET
+
+    generation = cache.generation
+    outputs = step(host, torch.tensor(0, device=dev), 1, None, decode=stash)
+    assert outputs.logits is not None
+    assert cache.length == READINESS_DECODE_WARM_BUCKET + 1
+    assert cache.generation > generation, "crossing the warm bucket reallocated nothing"
+    assert cache.bucket == 4096, "the first step past the warm bucket did not land on the next scheduled bucket"
+    assert runner.captures == 4, "the first token past the warm bucket did not capture exactly once"
+
+    step(host, torch.tensor(0, device=dev), 2, None, decode=stash)
+    assert runner.captures == 4, "a later step in the new bucket re-captured"

@@ -16,7 +16,7 @@ unmasked one, which is more than the graph saves.
 The way out is a paged cache. ``flash_attn_varlen_func`` takes the used length
 as a *tensor* (``seqused_k``) alongside a ``block_table``, so the buffers stay
 bucket-sized and capturable while the kernel reads only the valid prefix. One
-captured graph then serves every length in the bucket.
+captured graph per bucket then serves every length in it.
 
 Scope, and when to delete this. The cache is model-local on purpose:
 ``DiffusionKVCacheManager`` reserves once per scheduler request, and
@@ -52,6 +52,21 @@ BUCKETS = (512, 1024, 2048, 4096, 8192)
 # bucket instead would also cost at most one, but a 9,100-token request would
 # then reserve 766 MiB it never uses, against 118 MiB here.
 TAIL_STEP = 2048
+
+# The bucket the decode graphs are warmed to at readiness. A cache pre-grown
+# to this bucket serves every request below it by replay, so the bucket ladder
+# below -- and the captures a first think request paid crossing it, 0.16-0.17 s
+# of the ~0.7 s total, the rest being compile -- moves to startup. One graph
+# per bucket, not one for the top: ``max_seqlen_k`` is baked at capture, and a
+# 2048-scheduled kernel replayed on a shorter sequence still walks the whole
+# bucket's blocks, measured +0.144 ms/token on an A800, which spends the saved
+# capture within a few requests. 2048 is chosen to cover the common
+# text-to-image think path: a think prompt prefixes the sequence by a few
+# hundred tokens and decodes at most `max_think_tokens` (1024) steps, which
+# lands inside it, while text decode reaches less. A longer prefix outgrows it
+# -- a long prompt, or an image edit with think, whose image tokens push prefix
+# plus think loop past 2048 -- and still captures lazily on its first request.
+READINESS_DECODE_WARM_BUCKET = 2048
 
 
 # Every argument to the kernel is passed by keyword, so the probe covers all of
@@ -119,6 +134,25 @@ def dynamic_lora_wrappers_present(module) -> bool:
     except ImportError:  # pragma: no cover - depends on the wheel
         return False
     return any(isinstance(m, BaseLayerWithLoRA) for m in module.modules())
+
+
+def sequential_offload_hook_present(module) -> bool:
+    """True once model-level CPU offload has hooked ``module``'s forward.
+
+    ``SequentialOffloadHook.pre_forward`` moves parameters between devices and
+    synchronizes the platform on every call. Neither is legal while a CUDA
+    graph capture runs -- the capture dies with "operation not permitted when
+    stream is capturing" -- and a replay would skip the swap the hook exists
+    to make. The paged decode path therefore stands down entirely, leaving
+    decode on the ordinary cache the hooked forward already serves. The check
+    reads the registry each call, so removing the hook brings the path back.
+    """
+    registry = getattr(module, "_hook_registry", None)
+    if registry is None:
+        return False
+    from vllm_omni.diffusion.offloader.sequential_backend import SequentialOffloadHook
+
+    return registry.get_hook(SequentialOffloadHook._HOOK_NAME) is not None
 
 
 def _bucket_for(length: int) -> int:
@@ -275,13 +309,20 @@ class PagedDecodeCache:
         flat_v.index_copy_(0, self.pos, value_bhsd[0, :, 0].unsqueeze(0))
         heads, head_dim = query_bhsd.shape[1], query_bhsd.shape[3]
         q = query_bhsd[0].transpose(0, 1).reshape(1, heads, head_dim)
+        # ``max_seqlen_k`` sizes the kernel's KV loop and is baked at capture,
+        # so it follows the bucket of the length being served, not the buffer's
+        # own bucket: a graph captured at the warm bucket would schedule every
+        # later step over the whole allocation (measured +0.144 ms/token on an
+        # A800) while ``seqused_k`` already bounds what is actually read. The
+        # graph key matches, so a capture is only replayed inside its bucket,
+        # where this value covers ``seqused``.
         out = _flash_varlen()(
             q,
             self.k[layer_idx],
             self.v[layer_idx],
             max_seqlen_q=1,
             cu_seqlens_q=self.cu_seqlens_q,
-            max_seqlen_k=self.bucket,
+            max_seqlen_k=_bucket_for(self._length),
             seqused_k=self.seqused,
             block_table=self.block_table,
             softmax_scale=softmax_scale,
@@ -310,10 +351,21 @@ class DecodeGraphRunner:
     The whole point of the paged cache is that everything the step reads which
     varies -- the token, its position, and how much of the cache is live -- sits
     in device tensors. So a single capture serves every step in a bucket: fill
-    the tensors, replay, read the logits out of the static output.
+    the tensors, replay, read the logits out of the static output. The one
+    exception is ``max_seqlen_k``, a Python int the kernel bakes in, which is
+    why there is a capture per bucket and the graphs are keyed by the bucket of
+    the length being served rather than by the buffer's allocation: a pre-grown
+    cache holds graphs for every bucket below its own.
 
     A capture is invalidated when the cache reallocates (tracked by
     ``PagedDecodeCache.generation``), which happens once per bucket boundary.
+    The lifecycle is therefore: captured lazily on the first step that needs a
+    (bucket, generation), replayed for every later one, orphaned by a realloc,
+    and all of it dropped by ``release_captured_graphs`` when sleep discards
+    the memory a capture recorded. ``READINESS_DECODE_WARM_BUCKET`` moves the
+    captures a think request would have paid into startup: the pipeline
+    pre-grows the cache and captures one graph per bucket there at readiness,
+    so serving below that bucket replays and never reallocates.
     """
 
     def __init__(self, language_model, cache, device):
@@ -354,7 +406,12 @@ class DecodeGraphRunner:
         with torch.cuda.graph(graph, pool=current_platform.get_global_graph_pool()):
             logits = self._forward()
         self.captures += 1
-        logger.debug("Captured decode graph for bucket=%d generation=%d", self.cache.bucket, self.cache.generation)
+        # DEBUG, not INFO: a capture during serving is not by itself a
+        # regression signal -- requests past the warm bucket, dynamic-LoRA
+        # serving and the sleep-level-2 rebuild all capture lazily by design,
+        # and LoRA traffic would drown INFO. The readiness warm logs its own
+        # INFO line.
+        logger.debug("Captured decode graph for bucket=%d generation=%d", key[0], key[1])
         self._graphs[key] = (graph, logits)
         return self._graphs[key]
 
@@ -362,7 +419,11 @@ class DecodeGraphRunner:
         """Run one decode step. Returns the static logits tensor."""
         self.input_ids[0, 0] = token
         self.indexes[0, 0] = t_index
-        key = (self.cache.bucket, self.cache.generation)
+        # The graph key is the bucket of the length being served -- the one
+        # whose ``max_seqlen_k`` the capture baked -- not the buffer's own, so
+        # a pre-grown cache replays the graph its sequence fits instead of the
+        # one its allocation tops out at.
+        key = (_bucket_for(self.cache.length), self.cache.generation)
         entry = self._graphs.get(key) or self._capture(key)
         entry[0].replay()
         return entry[1]
