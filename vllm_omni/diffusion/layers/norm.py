@@ -93,22 +93,8 @@ class RMSNorm(CustomOp):
         # (returns None) and accesses self.weight.data, which is a DTensor under
         # HSDP. Both patterns confuse inductor's compute_ancestors scheduler.
         # Fall back to forward_native so inductor can fuse the pure-PyTorch ops
-        # itself.
-        if torch.compiler.is_compiling():
-            return self.forward_native(x)
-        try:
-            return self._forward_fused(x)
-        except Exception:
-            return self.forward_native(x)
-
-    def forward_hip(
-        self,
-        x: torch.Tensor,
-        residual: torch.Tensor | None = None,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        if residual is not None:
-            return self.forward_native(x, residual)
-        if torch.compiler.is_compiling():
+        # itself. The fused kernel also cannot launch on an empty tensor.
+        if torch.compiler.is_compiling() or x.numel() == 0:
             return self.forward_native(x)
         try:
             return self._forward_fused(x)

@@ -54,8 +54,9 @@ def test_real_shape_matches_previous_arithmetic_bf16(seq):
 
 def test_empty_text_stream_on_the_default_backend():
     """The recipe's text-to-image request with text_guidance_scale > 1 runs the
-    context refiner on a zero-token unconditional prompt. Before the guard this
-    raised ``RuntimeError: step must be nonzero`` from the FA varlen fallback."""
+    context refiner on a zero-token unconditional prompt. Before the guards this
+    raised ``RuntimeError: step must be nonzero`` from the FA varlen fallback and
+    left a sticky CUDA error from the fused RMSNorm kernel."""
     torch.manual_seed(0)
     block = (
         TransformerBlock(DIM, HEADS, KV_HEADS, multiple_of=256, ffn_dim_multiplier=1.0, norm_eps=1e-5, modulation=False)
@@ -67,13 +68,10 @@ def test_empty_text_stream_on_the_default_backend():
     mask = torch.ones(1, 0, dtype=torch.bool, device="cuda")
     angles = torch.rand(1, 0, block.head_dim, device="cuda")
     with torch.no_grad():
-        out = block.attn(
-            hidden_states=hidden,
-            encoder_hidden_states=hidden,
-            attention_mask=mask,
-            image_rotary_emb=(angles.cos().to(torch.bfloat16), angles.sin().to(torch.bfloat16)),
-        )
+        out = block(hidden, mask, (angles.cos().to(torch.bfloat16), angles.sin().to(torch.bfloat16)))
     assert out.shape == (1, 0, DIM)
+    # A failed kernel launch is reported asynchronously; this device-to-host copy surfaces it.
+    torch.randn(4, device="cuda").cpu()
 
 
 @pytest.mark.parametrize(

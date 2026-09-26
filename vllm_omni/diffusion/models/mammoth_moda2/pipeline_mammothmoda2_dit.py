@@ -11,7 +11,6 @@ from diffusers.image_processor import VaeImageProcessor
 from diffusers.models.autoencoders.autoencoder_kl import AutoencoderKL
 from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
-from transformers.models.qwen2.modeling_qwen2 import Qwen2RMSNorm
 from vllm.logger import init_logger
 from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper
 
@@ -22,6 +21,7 @@ from vllm_omni.diffusion.cache.cachedit import (
 )
 from vllm_omni.diffusion.data import DiffusionCacheConfig, DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
+from vllm_omni.diffusion.layers.norm import RMSNorm
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.request import OmniDiffusionRequest
@@ -465,10 +465,10 @@ class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
 
     def _reinit_caption_embedder(self, in_features: int) -> None:
         # Align with upstream Mammothmoda2Model's `reinit_caption_embedder`:
-        # Use Qwen2RMSNorm(in_features) + Linear(in_features -> out_features).
+        # Use RMSNorm(in_features) + Linear(in_features -> out_features).
         out_features = int(getattr(self.gen_transformer, "hidden_size", 0) or self.gen_transformer.config.hidden_size)
         self.gen_transformer.time_caption_embed.caption_embedder = nn.Sequential(
-            Qwen2RMSNorm(in_features, eps=1e-5),
+            RMSNorm(in_features, eps=1e-5),
             nn.Linear(in_features, out_features, bias=True),
         )
 
