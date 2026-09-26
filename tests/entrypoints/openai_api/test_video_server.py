@@ -2227,6 +2227,29 @@ def test_negative_prompt_and_seed_pass_through(test_client, mocker: MockerFixtur
     assert captured_params.seed == 123
 
 
+def test_generator_device_pass_through(test_client, mocker: MockerFixture):
+    mocker.patch(
+        "vllm_omni.entrypoints.openai.serving_video._encode_video_bytes",
+        return_value=b"fake-video",
+    )
+    response = test_client.post(
+        "/v1/videos",
+        data={
+            "prompt": "snowy mountain",
+            "seed": "123",
+            "generator_device": "cpu",
+        },
+    )
+
+    assert response.status_code == 200
+    video_id = response.json()["id"]
+    _wait_for_status(test_client, video_id, VideoGenerationStatus.COMPLETED.value)
+    engine = test_client.app.state.openai_serving_video._engine_client
+    captured_params = engine.captured_sampling_params_list[0]
+    assert captured_params.seed == 123
+    assert captured_params.generator_device == "cpu"
+
+
 def test_invalid_lora_returns_400(test_client):
     response = test_client.post(
         "/v1/videos",

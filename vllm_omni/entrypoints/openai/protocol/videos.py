@@ -240,6 +240,10 @@ class VideoGenerationRequest(BaseModel):
         description="True CFG scale (model-specific parameter, may be ignored if not supported)",
     )
     seed: int | None = Field(default=None, ge=_INT64_MIN, le=_INT64_MAX, description="Random seed for reproducibility")
+    generator_device: str | None = Field(
+        default=None,
+        description="Device for the seeded torch.Generator (e.g. 'cpu', 'cuda'). Defaults to the runner's device.",
+    )
     generate_sound: bool = Field(
         default=False,
         description="Request model-generated audio for video models that support sound generation.",
