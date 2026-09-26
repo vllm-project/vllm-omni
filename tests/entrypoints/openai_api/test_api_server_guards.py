@@ -821,6 +821,50 @@ def test_speech_without_handler_preserves_not_found_http_error() -> None:
     assert exc_info.value.detail == "The model does not support Speech API"
 
 
+def test_unwired_tokenization_routes_are_rejected_instead_of_crashing() -> None:
+    """Regression (#8139): a None handler must not turn /tokenize into HTTP 500.
+
+    Upstream ``build_app`` mounts both tokenization routes for every serving
+    mode, while pure diffusion and duplex leave the handler unset. The
+    upstream handler then dereferenced None and raised AttributeError.
+    """
+    app = FastAPI()
+
+    @app.post("/tokenize")
+    async def upstream_tokenize():
+        return {"owner": "upstream"}
+
+    @app.post("/detokenize")
+    async def upstream_detokenize():
+        return {"owner": "upstream"}
+
+    app.state.serving_tokenization = None
+    api_server._shutdown_tokenization_routes_if_unwired(app)
+
+    client = TestClient(app)
+    for path in ("/tokenize", "/detokenize"):
+        resp = client.post(path, json={})
+        assert resp.status_code == 400
+        assert resp.json()["error"]["type"] == "BadRequestError"
+        assert "tokenization handler" in resp.json()["error"]["message"].lower()
+
+
+def test_wired_tokenization_routes_are_left_alone() -> None:
+    """Modes that do wire a handler must keep serving the upstream routes."""
+    app = FastAPI()
+
+    @app.post("/tokenize")
+    async def tokenize():
+        return {"owner": "serving"}
+
+    app.state.serving_tokenization = _marker("tokenization")
+    api_server._shutdown_tokenization_routes_if_unwired(app)
+
+    resp = TestClient(app).post("/tokenize", json={})
+    assert resp.status_code == 200
+    assert resp.json() == {"owner": "serving"}
+
+
 @pytest.mark.parametrize(
     ("field", "value", "detail"),
     [

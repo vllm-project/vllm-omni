@@ -27,7 +27,7 @@ from typing import Annotated, Any, Literal
 
 import uvloop
 import vllm.envs as envs
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile, WebSocket
+from fastapi import APIRouter, Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile, WebSocket
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from PIL import Image
 from starlette.datastructures import State
@@ -89,6 +89,8 @@ from vllm.utils.system_utils import decorate_logs, set_process_title
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 
 from vllm_omni.config.endpoint_policy import (
+    EndpointRestriction,
+    OmniServingCapability,
     shutdown_unsupported_routes,
 )
 from vllm_omni.engine.stage_init_utils import set_death_signal
@@ -218,6 +220,29 @@ router = APIRouter()
 VIDEO_ABORT_TIMEOUT_S = ABORT_TIMEOUT_S
 
 profiler_router = APIRouter()
+
+
+# Upstream build_app mounts /tokenize and /detokenize for every serving mode,
+# but only the multi-stage app state wires a tokenization handler. Pure
+# diffusion and duplex leave ``serving_tokenization`` unset, so both routes
+# used to raise AttributeError and answer with HTTP 500 instead of a
+# controlled rejection.
+_UNWIRED_TOKENIZATION_RESTRICTIONS = (
+    EndpointRestriction(
+        OmniServingCapability.TOKENIZE,
+        "Tokenization is unavailable because this deployment does not initialize a tokenization handler.",
+    ),
+    EndpointRestriction(
+        OmniServingCapability.DETOKENIZE,
+        "Detokenization is unavailable because this deployment does not initialize a tokenization handler.",
+    ),
+)
+
+
+def _shutdown_tokenization_routes_if_unwired(app: FastAPI) -> None:
+    """Reject the tokenization routes when no handler is wired in app state."""
+    if getattr(app.state, "serving_tokenization", None) is None:
+        shutdown_unsupported_routes(app, _UNWIRED_TOKENIZATION_RESTRICTIONS)
 
 
 # Server entry points
@@ -353,6 +378,9 @@ async def omni_run_server_worker(
             shutdown_unsupported_routes(app, engine_client.endpoint_restrictions)
         else:
             logger.warning("engine client has no endpoint restrictions attribute")
+
+        # OMNI: upstream routes stay mounted in modes that never wire a handler
+        _shutdown_tokenization_routes_if_unwired(app)
 
         # Start background processes
         await STORAGE_MANAGER.start()
