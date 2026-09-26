@@ -488,7 +488,7 @@ class TestAttentionInitUsesCurrentDiffusionConfig:
         attention._scheduler_paged_kv = True
         attention.paged_kv_cache_role = "primary"
         attention.backend_pref = "FLASH_ATTN"
-        attention.attn_backend = SimpleNamespace(supports_piecewise_spans=True, get_name=lambda: "FLASH_ATTN")
+        attention.attn_backend = SimpleNamespace(supports_piecewise_spans=lambda: True, get_name=lambda: "FLASH_ATTN")
         flash_output = torch.ones(1)
         sdpa_output = torch.zeros(1)
         dense_flash = Mock(return_value=flash_output)
@@ -531,7 +531,7 @@ class TestAttentionInitUsesCurrentDiffusionConfig:
         attention._scheduler_paged_kv = True
         attention.paged_kv_cache_role = "primary"
         attention.backend_pref = "FLASH_ATTN"
-        attention.attn_backend = SimpleNamespace(supports_piecewise_spans=True, get_name=lambda: "FLASH_ATTN")
+        attention.attn_backend = SimpleNamespace(supports_piecewise_spans=lambda: True, get_name=lambda: "FLASH_ATTN")
         flash_output = torch.ones(1)
         sdpa_output = torch.zeros(1)
         dense_flash = Mock(return_value=flash_output)
@@ -574,7 +574,7 @@ class TestAttentionInitUsesCurrentDiffusionConfig:
         attention._scheduler_paged_kv = False
         attention.paged_kv_cache_role = "primary"
         attention.backend_pref = "FLASH_ATTN"
-        attention.attn_backend = SimpleNamespace(supports_piecewise_spans=True, get_name=lambda: "FLASH_ATTN")
+        attention.attn_backend = SimpleNamespace(supports_piecewise_spans=lambda: True, get_name=lambda: "FLASH_ATTN")
         attention.attention = SimpleNamespace(
             forward=Mock(side_effect=ModuleNotFoundError("No module named 'mindiesd'", name="mindiesd"))
         )
@@ -918,6 +918,9 @@ class TestAttentionInitUsesCurrentDiffusionConfig:
                 forward=lambda *args: pytest.fail("unexpected SDPA fallback"),
             ),
             _assert_metadata_compatible=lambda metadata: None,
+            # No metadata here, so no mask can need rerouting; the stub only has to
+            # answer the question ``_run_local_attention`` now asks before dispatch.
+            _mask_needs_sdpa=lambda metadata: False,
             _has_custom_attention=False,
             _scheduler_paged_kv=False,
             paged_kv_cache_role=None,
@@ -976,6 +979,20 @@ class TestOptInFloat32Fallback:
                 return output
 
         class _FlashBackend(FlashAttentionBackend):
+            # The real capability flags are platform-gated, so inheriting them would make
+            # these CPU dispatch assertions depend on the host: the piecewise contract
+            # below expects full_attn_spans to reach the kernel, which only a
+            # span-consuming backend does. Pinned to the CUDA-family answers so the
+            # subject stays metadata plumbing; the gating itself is asserted in
+            # test_mask_capability_flags.py.
+            @classmethod
+            def supports_piecewise_spans(cls) -> bool:
+                return True
+
+            @classmethod
+            def supports_dense_attention_mask(cls) -> bool:
+                return True
+
             @staticmethod
             def get_impl_cls():
                 return _SelectedImpl
