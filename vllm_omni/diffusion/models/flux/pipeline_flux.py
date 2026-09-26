@@ -18,6 +18,7 @@ from diffusers.schedulers.scheduling_flow_match_euler_discrete import (
 from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
 from transformers import AutoConfig, CLIPTextModel, CLIPTokenizer, T5TokenizerFast
+from vllm.model_executor.models.transformers.utils import init_on_device_without_buffers
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
@@ -30,6 +31,7 @@ from vllm_omni.diffusion.models.flux import FluxTransformer2DModel
 from vllm_omni.diffusion.models.flux.flux_pipeline_mixin import FluxPipelineMixin
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.models.t5_encoder import T5EncoderModel
+from vllm_omni.diffusion.models.utils import init_parameters, recursive_replace_linear
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
@@ -94,6 +96,13 @@ class FluxPipeline(
             ),
             DiffusersPipelineLoader.ComponentSource(
                 model_or_path=od_config.model,
+                subfolder="text_encoder",
+                revision=None,
+                prefix="text_encoder.",
+                fall_back_to_pt=True,
+            ),
+            DiffusersPipelineLoader.ComponentSource(
+                model_or_path=od_config.model,
                 subfolder="text_encoder_2",
                 revision=None,
                 prefix="text_encoder_2.",
@@ -109,11 +118,22 @@ class FluxPipeline(
         self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
             model, subfolder="scheduler", local_files_only=local_files_only
         )
-        self.text_encoder = CLIPTextModel.from_pretrained(
-            model, subfolder="text_encoder", local_files_only=local_files_only
-        ).to(self.device)
+
+        # CLIP: meta-init + swap to vLLM linears so quant_config applies; loader
+        # streams weights, so no .to() (same as the DiT).
+        clip_config = AutoConfig.from_pretrained(model, subfolder="text_encoder", local_files_only=local_files_only)
+        with init_on_device_without_buffers("meta"):
+            self.text_encoder = CLIPTextModel._from_config(clip_config)
+        recursive_replace_linear(self.text_encoder, od_config)
+        init_parameters(self.text_encoder, dtype=od_config.dtype, device=self.device)
+
+        # T5 already uses vLLM linears; thread quant_config to quantize its GEMMs.
         t5_config = AutoConfig.from_pretrained(model, subfolder="text_encoder_2", local_files_only=local_files_only)
-        self.text_encoder_2 = T5EncoderModel(t5_config, prefix="text_encoder_2").to(self.device)
+        self.text_encoder_2 = T5EncoderModel(
+            t5_config, prefix="text_encoder_2", quant_config=od_config.quantization_config
+        )
+
+        # VAE is precision-sensitive and kept at full precision.
         self.vae = AutoencoderKL.from_pretrained(model, subfolder="vae", local_files_only=local_files_only).to(
             self.device
         )
@@ -679,7 +699,20 @@ class FluxPipeline(
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights)
+        return loader.load_weights(self._remap_clip_weights(weights))
+
+    @staticmethod
+    def _remap_clip_weights(
+        weights: Iterable[tuple[str, torch.Tensor]],
+    ) -> Iterable[tuple[str, torch.Tensor]]:
+        # transformers>=5 flattened CLIPTextModel (drops the text_model. prefix);
+        # replicate the from_pretrained remap that meta-init bypasses.
+        legacy_prefix = "text_encoder.text_model."
+        new_prefix = "text_encoder."
+        for name, weight in weights:
+            if name.startswith(legacy_prefix):
+                name = new_prefix + name[len(legacy_prefix) :]
+            yield name, weight
 
 
 class FluxDMD2Pipeline(DMD2PipelineMixin, FluxPipeline):
