@@ -9,7 +9,7 @@
 - LoRA: `sensenova/SenseNova-U1.5-8B-MoT-LoRAs` (`SenseNova-U1.5-8B-MoT-LoRA-8step.safetensors`)
 - Task: text2img, img2img, img2text (visual understanding), text2text (chat)
 - Mode: Offline inference, Online serving (OpenAI-compatible API)
-- Maintainer: Community
+- Maintainer: @MrlixiangWE
 
 ## When to use this recipe
 
@@ -90,6 +90,48 @@ python examples/online_serving/sensenova_u1/openai_chat_client.py \
 
 `-s` takes the base URL; the client appends `/v1` itself.
 
+##### Step execution and step-wise batching
+
+Add `--step-execution` to serve the denoise loop one step at a time, driven by
+the scheduler; `--max-num-seqs` sets how many requests may be mid-denoise at
+once, with new requests admitted between steps:
+
+```bash
+vllm serve sensenova/SenseNova-U1.5-8B-MoT --omni --port 8091 \
+    --step-execution --max-num-seqs 4
+```
+
+Image generation (t2i with and without think, and it2i) and text output all
+run on the step path — think and text decode one token per scheduler tick, and
+a text request finishes inside its prepare phase. Waves are conservative — each
+request keeps its own prefix KV caches and CFG branches, so every wave runs one
+transformer forward per request rather than a packed forward. Batching
+therefore interleaves concurrent requests' denoise steps and admits or cancels
+requests at wave boundaries (abort latency is at most one step) without
+changing per-step kernel efficiency. The think/text decode phases serialize on
+the model-local paged cache (one decode in flight; the rest queue), while
+denoise waves batch. Step execution cannot be combined with a diffusion cache
+backend (TeaCache, Cache-DiT). See
+[Diffusion Execution Modes](../../docs/user_guide/diffusion/execution_modes.md#step-execution).
+
+#### Measured step execution (1x A800 80GB, 1024x1024, 25 steps, BF16)
+
+Pixel consistency: for t2i (think off), t2i (think on), and it2i, the step
+path and the complete-request path with the same seed produce bit-identical
+PNG output (matching SHA-256 digests).
+
+| Scenario | Result |
+| --- | --- |
+| Single request, step mode | 5.23 s (vs 5.31 s complete-request) |
+| 4 concurrent requests, `--max-num-seqs 4` | 20.69 s total, 0.193 img/s, all 4 images produced |
+| 4 concurrent requests, `--max-num-seqs 1` (queued) | 20.72 s total, 0.192 img/s |
+| Mid-flight admission (requests staggered 1.5 s) | all 4 requests complete; late arrivals join mid-denoise |
+| Abort mid-denoise (2 peers in flight) | 2 ms client-observed latency; victim aborts without an image; both peers complete |
+
+Batched total time matches queued serial time — each wave still runs one
+forward per request — so keep `--max-num-seqs 1` for pure throughput; raise it
+when you need mid-flight admission or wave-boundary cancellation.
+
 #### Measured latency (1x A800 80GB, 25 steps, median of 3 after a warmup)
 
 | Resolution | Step latency | Total |
@@ -157,3 +199,13 @@ pytest -q tests/diffusion/models/sensenova_u1/
 - Each request captures its own graphs, and a think request captures twice because the sequence
   grows past the 512 bucket, so the capture cost is paid per request rather than once at
   startup.
+- Step execution is supported (`step_execution: true`), including for text output. Think and
+  text decoding run as a resumable prepare phase: the request returns to the scheduler after
+  each token instead of holding the worker for the whole loop. The paged cache above holds one
+  sequence, so the pipeline serializes the decode phases instead of capping
+  `max_num_seqs=1`: at most one think or text loop is live at a time, a request that arrives
+  while another one is decoding keeps its whole prepare phase queued, and requests past their
+  prepare phase batch their denoise steps in shared waves. Moving that cache to the shared
+  manager is what will let two decode loops interleave.
+- Sampled text output (`do_sample: true`) draws from a generator seeded with the request seed,
+  so repeating a request repeats its reply. Before this it drew from the global generator.
