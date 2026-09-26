@@ -18,6 +18,7 @@ import torch
 from PIL import Image
 from pydantic import Field, model_validator
 from typing_extensions import Self
+from vllm.config import KernelConfig
 from vllm.config.utils import config
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.base_config import (
@@ -962,8 +963,9 @@ class OmniDiffusionConfig:
     # STA_mode: STA_Mode = STA_Mode.STA_INFERENCE
     skip_time_steps: int = 15
 
-    # MoE kernel backend selection
+    # Reuse upstream kernel selection; "auto" preserves platform defaults.
     moe_backend: str = "auto"
+    linear_backend: str = "auto"
 
     # Compilation
     enforce_eager: bool = False
@@ -1199,6 +1201,10 @@ class OmniDiffusionConfig:
         self.stage_output_payload_keys = tuple(self.stage_output_payload_keys)
         if self.vae_fast_path not in VAE_FAST_PATH_LEVELS:
             raise ValueError(f"vae_fast_path must be one of {list(VAE_FAST_PATH_LEVELS)}, got {self.vae_fast_path!r}")
+        kernels = KernelConfig(moe_backend=self.moe_backend, linear_backend=self.linear_backend)
+        self.moe_backend = kernels.moe_backend
+        self.linear_backend = kernels.linear_backend
+
         if self.diffusion_compile_granularity not in {"regional", "full"}:
             raise ValueError(
                 "diffusion_compile_granularity must be 'regional' or 'full', "

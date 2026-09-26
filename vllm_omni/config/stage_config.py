@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Literal, NamedTuple
 
 from transformers import PretrainedConfig
+from vllm.config import KernelConfig
 from vllm.logger import init_logger
 from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
 
@@ -420,6 +421,12 @@ class StageDeployConfig:
     max_num_batched_tokens: int | None = None
     max_model_len: int | None = None
 
+    # Upstream AR attention and shared AR/diffusion kernel selection.
+    # None means omitted, so model/platform defaults remain authoritative.
+    attention_backend: str | None = None
+    moe_backend: str | None = None
+    linear_backend: str | None = None
+
     # Generic execution, scheduling, and KV/cache behavior.
     enforce_eager: bool | None = None
     async_scheduling: bool | None = None
@@ -513,6 +520,27 @@ class StageDeployConfig:
     # === Pass-through stage engine fields ===
     # Pass-through stage engine args that are not represented above.
     engine_extras: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        kernels = {
+            name: getattr(self, name) for name in ("moe_backend", "linear_backend") if getattr(self, name) is not None
+        }
+        normalized = KernelConfig(**kernels)
+        for name in kernels:
+            setattr(self, name, getattr(normalized, name))
+        # Only backend selections gain this precedence rule; unrelated extras
+        # keep their existing merge behavior. Never mutate caller-owned input.
+        self.engine_extras = dict(self.engine_extras)
+        for name in ("attention_backend", "moe_backend", "linear_backend"):
+            value = getattr(self, name)
+            if value is not None and name in self.engine_extras:
+                extra = self.engine_extras.pop(name)
+                if value != extra:
+                    warnings.warn(
+                        f"stage {self.stage_id}: {name}={value!r} overrides engine_extras[{name!r}]={extra!r}.",
+                        UserWarning,
+                        stacklevel=2,
+                    )
 
 
 @dataclass(frozen=True)
@@ -905,6 +933,10 @@ def _apply_platform_overrides(
                 base.env = po.env
         for key, val in po.overrides.items():
             if hasattr(base, key):
+                # These fields used to live in extras. A platform override
+                # must replace that legacy value as it did before promotion.
+                if key in ("attention_backend", "moe_backend", "linear_backend"):
+                    base.engine_extras.pop(key, None)
                 # Deep-merge dict-valued fields listed in _DEEP_MERGE_KEYS so
                 # platform overlays don't silently clobber sibling keys (e.g.
                 # setting default_sampling_params={max_tokens: 2048} must not

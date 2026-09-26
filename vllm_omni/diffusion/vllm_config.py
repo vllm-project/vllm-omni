@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from typing import Any, cast
 
 import torch
-from vllm.config import CompilationConfig, DeviceConfig, KVTransferConfig, VllmConfig
+from vllm.config import CompilationConfig, DeviceConfig, KernelConfig, KVTransferConfig, VllmConfig
 from vllm.transformers_utils.config import get_hf_text_config
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
@@ -200,6 +200,7 @@ def create_base_diffusion_vllm_config(
         compilation_config=CompilationConfig(),
         device_config=DeviceConfig(device=device),
         additional_config=od_config.additional_config,
+        kernel_config=KernelConfig(moe_backend=od_config.moe_backend, linear_backend=od_config.linear_backend),
     )
 
 

@@ -950,6 +950,7 @@ def test_sub_config_fields_match_structured_scopes():
         "attention_backend",
         "attention_config",
         "moe_backend",
+        "linear_backend",
         "hf_overrides",
         "limit_mm_per_prompt",
         "interleave_mm_strings",

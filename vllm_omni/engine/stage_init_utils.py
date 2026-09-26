@@ -1108,6 +1108,12 @@ def _project_omni_stage_engine_args(
         "has_sampling_extra_args",
     }
     runtime_excluded_fields = {"devices", "num_replicas", "env", "num_gpus"}
+    if is_diffusion:
+        # Diffusion owns these fields. Model defaults must not overwrite the
+        # explicit diffusion selection copied above. Retain explicit model
+        # inputs for callers using the shared model config representation.
+        model_explicit = getattr(stage_config.model_config, "_omni_explicit_fields", ())
+        model_excluded_fields.update(name for name in ("moe_backend", "linear_backend") if name not in model_explicit)
     if not is_diffusion:
         # These values configure OmniDiffusionConfig or its worker process;
         # OmniEngineArgs has no matching fields for LLM stages.
@@ -1242,6 +1248,19 @@ def _finalize_engine_args_dict(
     sampling_extra_args_keys: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     """Apply representation-independent engine adapter behavior."""
+    from vllm.config import KernelConfig
+
+    # The legacy kwargs path does not pass through the typed config validators.
+    # Validate only present fields so an omitted MoE choice still gets its
+    # established model-specific default below.
+    kernel_values = {
+        name: engine_args_dict[name]
+        for name in ("moe_backend", "linear_backend")
+        if engine_args_dict.get(name) is not None
+    }
+    kernels = KernelConfig(**kernel_values)
+    for name in kernel_values:
+        engine_args_dict[name] = getattr(kernels, name)
     pipeline_model_root = model
     model = engine_args_dict.pop("model", None) or model
     stage_defines_tokenizer = (

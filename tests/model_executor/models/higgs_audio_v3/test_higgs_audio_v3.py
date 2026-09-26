@@ -1535,7 +1535,7 @@ class TestRegistry:
             assert os.path.isfile(yaml_path), f"Deploy YAML not found at {yaml_path}"
             deploy_config = load_deploy_config(yaml_path)
             stage_0 = next(stage for stage in deploy_config.stages if stage.stage_id == 0)
-            assert stage_0.engine_extras["attention_backend"] == "FLASHINFER"
+            assert stage_0.attention_backend == "FLASHINFER"
             assert stage_0.engine_extras["attention_config"] == {"use_trtllm_attention": False}
 
 

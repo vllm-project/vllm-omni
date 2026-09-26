@@ -82,6 +82,60 @@ subprocess on one GPU. `ray` / `external_launcher` are not fully supported yet.
 
 ### Stage fields
 
+#### Operator backends
+
+AR stages accept `attention_backend`, `moe_backend`, and `linear_backend`.
+Diffusion stages share `moe_backend` and `linear_backend`, but use their own
+`diffusion_attention_config` (or the deprecated `diffusion_attention_backend`
+shorthand), not AR's `attention_backend`.
+
+For a pipeline with AR stage 0 and diffusion stage 1, the deploy fragment is:
+
+```yaml
+stages:
+  - stage_id: 0
+    attention_backend: TRITON_ATTN
+    moe_backend: auto
+    linear_backend: torch
+  - stage_id: 1
+    diffusion_attention_config:
+      default: TORCH_SDPA
+    moe_backend: auto
+    linear_backend: torch
+```
+
+The deploy fields default to `null` (no override). Effective MoE/linear
+defaults remain `auto`, and explicit `auto` remains distinct from omission.
+`KernelConfig` supplies validation and case/hyphen normalization. AR attention
+continues to use upstream enum parsing and `auto`/`None` semantics.
+
+CLI/runtime values retain their existing precedence. A first-class backend
+field wins over the same `engine_extras` key, with a warning on conflict;
+extras-only configurations remain supported. Existing backend fallback rules
+are unchanged, and this PR does not claim support for unvalidated platforms.
+In vLLM 0.29, unquantized ROCm GEMM dispatch does not consult `linear_backend`;
+NPU plugin behavior is not validated here. Plain `torch.nn.Linear` layers do
+not consume vLLM's kernel configuration.
+
+An offline CUDA component smoke test runs a tiny, randomly initialized native
+FLUX transformer, checks the actual linear callable and SDPA implementation,
+and executes a forward pass (no weights download or image-quality claim):
+
+```bash
+pytest -s -v tests/diffusion/models/flux/test_backend_selection.py -m 'local_model and cuda'
+```
+
+The CPU config regression suite is collected by the existing L1 job:
+
+```bash
+pytest -s -v tests/config/test_backend_selection.py -m 'core_model and cpu'
+```
+
+Both commands require matching vLLM/vLLM-Omni dependencies. The component smoke
+test additionally needs one CUDA GPU; it is opt-in and not a performance claim.
+
+#### Field reference
+
 Each entry under `stages:` accepts any `StageDeployConfig` field directly (no nested `engine_args:`). Only fields whose value legitimately varies across stages live here; pipeline-wide settings (trust_remote_code, distributed_executor_backend, dtype, quantization, prefix/chunked prefill, DP/PP sizes) are declared at the top level and applied to every stage. Unknown keys fall through to `engine_extras:` and are forwarded to the engine. Frequently used fields are listed below; the source-of-truth schema is `StageDeployConfig` in `vllm_omni/config/stage_config.py`.
 
 | Field | Type | Required | Default | Description |

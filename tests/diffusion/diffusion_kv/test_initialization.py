@@ -47,6 +47,8 @@ def _od_config(**overrides):
         tf_model_config=None,
         enforce_eager=True,
         is_moe=False,
+        moe_backend="auto",
+        linear_backend="auto",
         additional_config={},
         profiler_config=None,
         parallel_config=SimpleNamespace(

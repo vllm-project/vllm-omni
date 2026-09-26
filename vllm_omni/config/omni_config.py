@@ -23,7 +23,7 @@ from pydantic import ConfigDict, Field, field_validator, model_validator
 from typing_extensions import Self
 from vllm.config import CacheConfig as VllmCacheConfig
 from vllm.config import CompilationConfig as VllmCompilationConfig
-from vllm.config import KVTransferConfig
+from vllm.config import KernelConfig, KVTransferConfig
 from vllm.config import LoadConfig as VllmLoadConfig
 from vllm.config import ParallelConfig as VllmParallelConfig
 from vllm.config import ProfilerConfig as VllmProfilerConfig
@@ -118,6 +118,8 @@ class _TrackExplicitConfigFields:
         kwargs = getattr(value, "kwargs", None)
         if kwargs is not None:
             explicit_fields = frozenset(kwargs)
+        elif isinstance(value, Mapping):
+            explicit_fields = frozenset(value)
         elif isinstance(value, cls):
             explicit_fields = getattr(value, "_omni_explicit_fields", frozenset())
         else:
@@ -166,6 +168,7 @@ class _ModelEngineOverrides(TypedDict, total=False):
     attention_backend: Any
     attention_config: Any
     moe_backend: str
+    linear_backend: str
     hf_overrides: Any
     limit_mm_per_prompt: dict[str, Any]
     interleave_mm_strings: bool
@@ -491,6 +494,7 @@ class OmniStageModelConfig(_TrackExplicitConfigFields):
     attention_backend: Any = None
     attention_config: Any = None
     moe_backend: str = "auto"
+    linear_backend: str = "auto"
     hf_overrides: Any = None
     limit_mm_per_prompt: dict[str, Any] | None = None
     # MiniCPM interleaved AV packing and media decode knobs (Daily-Omni).
@@ -536,6 +540,11 @@ class OmniStageModelConfig(_TrackExplicitConfigFields):
     generation_config: str | None = None
     override_generation_config: dict[str, Any] | None = None
     enable_prompt_embeds: bool | None = None
+
+    def __post_init__(self) -> None:
+        kernels = KernelConfig(moe_backend=self.moe_backend, linear_backend=self.linear_backend)
+        self.moe_backend = kernels.moe_backend
+        self.linear_backend = kernels.linear_backend
 
 
 @config(config=ConfigDict(arbitrary_types_allowed=True))
@@ -868,6 +877,7 @@ class _DiffusionConfigProjection:
     diffusion_kv_cache_skip_step_indices: set[int] | None = None
     diffusion_kv_cache_skip_layer_indices: set[int] | None = None
     moe_backend: str = "auto"
+    linear_backend: str = "auto"
     force_cutlass_fp8: bool = False
     enable_diffusion_pipeline_profiler: bool = False
     step_execution: bool = False
@@ -936,6 +946,10 @@ class _DiffusionConfigProjection:
         )
         from vllm_omni.diffusion.diffusion_kv.config import parse_diffusion_kv_cache_mode
         from vllm_omni.quantization import build_quant_config
+
+        kernels = KernelConfig(moe_backend=self.moe_backend, linear_backend=self.linear_backend)
+        self.moe_backend = kernels.moe_backend
+        self.linear_backend = kernels.linear_backend
 
         if self.tf_model_config is None:
             self.tf_model_config = TransformerConfig()
