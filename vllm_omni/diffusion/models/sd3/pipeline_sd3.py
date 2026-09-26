@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import inspect
 import json
 import logging
@@ -25,6 +28,7 @@ from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.models.sd3.sd3_transformer import (
     SD3Transformer2DModel,
 )
+from vllm_omni.diffusion.models.t5_encoder.quantization import prepare_t5_fp8
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch, split_diffusion_output_by_request
 from vllm_omni.model_executor.model_loader.weight_utils import (
@@ -235,6 +239,7 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin, DiffusionPipelinePro
             local_files_only=local_files_only,
             torch_dtype=dtype,
         )
+        prepare_t5_fp8(self.text_encoder_3, od_config.quantization_config, "text_encoder_3")
         self.transformer = SD3Transformer2DModel(od_config=od_config)
 
         self.vae = from_pretrained_with_prefetch(

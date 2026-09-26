@@ -17,19 +17,28 @@ from vllm.model_executor.layers.linear import (
     ReplicatedLinear,
     RowParallelLinear,
 )
+from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.cache.cachedit import CacheDiTAdapterConfig
 from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.quantization.component_config import resolve_component_quant_config
 
 logger = init_logger(__name__)
 
 
 class GELU(nn.Module):
-    def __init__(self, dim_in: int, dim_out: int, approximate: str = "none", bias: bool = True):
+    def __init__(
+        self,
+        dim_in: int,
+        dim_out: int,
+        approximate: str = "none",
+        bias: bool = True,
+        quant_config: QuantizationConfig | None = None,
+    ):
         super().__init__()
-        self.proj = ColumnParallelLinear(dim_in, dim_out, bias=bias)
+        self.proj = ColumnParallelLinear(dim_in, dim_out, bias=bias, quant_config=quant_config)
         self.approximate = approximate
 
     def forward(self, hidden_states):
@@ -49,6 +58,7 @@ class FeedForward(nn.Module):
         final_dropout: bool = False,
         inner_dim=None,
         bias: bool = True,
+        quant_config: QuantizationConfig | None = None,
     ):
         super().__init__()
         if inner_dim is None:
@@ -56,14 +66,14 @@ class FeedForward(nn.Module):
         dim_out = dim_out if dim_out is not None else dim
 
         if activation_fn == "gelu-approximate":
-            act_fn = GELU(dim, inner_dim, approximate="tanh", bias=bias)
+            act_fn = GELU(dim, inner_dim, approximate="tanh", bias=bias, quant_config=quant_config)
         else:
             raise ValueError(f"Unsupported activation function type: {activation_fn}")
 
         self.net = nn.ModuleList([])
         self.net.append(act_fn)
         self.net.append(nn.Dropout(dropout))
-        self.net.append(RowParallelLinear(inner_dim, dim_out, bias=bias))
+        self.net.append(RowParallelLinear(inner_dim, dim_out, bias=bias, quant_config=quant_config))
         if final_dropout:
             self.net.append(nn.Dropout(dropout))
 
@@ -119,6 +129,7 @@ class SD3CrossAttention(nn.Module):
         context_pre_only: bool = False,
         parallel_attention=False,
         out_dim: int = 0,
+        quant_config: QuantizationConfig | None = None,
     ) -> None:
         assert dim % num_heads == 0
         super().__init__()
@@ -133,6 +144,7 @@ class SD3CrossAttention(nn.Module):
             hidden_size=dim,
             head_size=self.head_dim,
             total_num_heads=num_heads,
+            quant_config=quant_config,
         )
         self.norm_q = RMSNorm(head_dim, eps=eps) if qk_norm else nn.Identity()
         self.norm_k = RMSNorm(head_dim, eps=eps) if qk_norm else nn.Identity()
@@ -143,18 +155,19 @@ class SD3CrossAttention(nn.Module):
                 added_kv_proj_dim,
                 head_size=self.inner_kv_dim // self.num_heads,
                 total_num_heads=self.num_heads,
+                quant_config=quant_config,
             )
         else:
             self.add_kv_proj = None
 
         if not context_pre_only:
-            self.to_add_out = RowParallelLinear(self.inner_dim, self.dim, bias=out_bias)
+            self.to_add_out = RowParallelLinear(self.inner_dim, self.dim, bias=out_bias, quant_config=quant_config)
         else:
             self.to_add_out = None
 
         if not pre_only:
             self.to_out = nn.ModuleList([])
-            self.to_out.append(RowParallelLinear(self.inner_dim, self.dim, bias=out_bias))
+            self.to_out.append(RowParallelLinear(self.inner_dim, self.dim, bias=out_bias, quant_config=quant_config))
         else:
             self.to_out = None
 
@@ -265,6 +278,7 @@ class SD3TransformerBlock(nn.Module):
         context_pre_only: bool = False,
         qk_norm: str | None = None,
         use_dual_attention: bool = False,
+        quant_config: QuantizationConfig | None = None,
     ):
         super().__init__()
 
@@ -298,6 +312,7 @@ class SD3TransformerBlock(nn.Module):
             out_dim=dim,
             qk_norm=True if qk_norm == "rms_norm" else False,
             eps=1e-6,
+            quant_config=quant_config,
         )
 
         if use_dual_attention:
@@ -310,16 +325,19 @@ class SD3TransformerBlock(nn.Module):
                 out_dim=dim,
                 qk_norm=True if qk_norm == "rms_norm" else False,
                 eps=1e-6,
+                quant_config=quant_config,
             )
         else:
             self.attn2 = None
 
         self.norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
-        self.ff = FeedForward(dim=dim, dim_out=dim, activation_fn="gelu-approximate")
+        self.ff = FeedForward(dim=dim, dim_out=dim, activation_fn="gelu-approximate", quant_config=quant_config)
 
         if not context_pre_only:
             self.norm2_context = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
-            self.ff_context = FeedForward(dim=dim, dim_out=dim, activation_fn="gelu-approximate")
+            self.ff_context = FeedForward(
+                dim=dim, dim_out=dim, activation_fn="gelu-approximate", quant_config=quant_config
+            )
         else:
             self.norm2_context = None
             self.ff_context = None
@@ -402,6 +420,7 @@ class SD3Transformer2DModel(nn.Module):
         od_config: OmniDiffusionConfig,
     ):
         super().__init__()
+        quant_config = resolve_component_quant_config(od_config.quantization_config, "transformer")
         model_config = od_config.tf_model_config
         self.num_layers = model_config.num_layers
         self.parallel_config = od_config.parallel_config
@@ -433,7 +452,9 @@ class SD3Transformer2DModel(nn.Module):
         self.time_text_embed = CombinedTimestepTextProjEmbeddings(
             embedding_dim=self.inner_dim, pooled_projection_dim=self.pooled_projection_dim
         )
-        self.context_embedder = ReplicatedLinear(self.joint_attention_dim, self.caption_projection_dim)
+        self.context_embedder = ReplicatedLinear(
+            self.joint_attention_dim, self.caption_projection_dim, quant_config=quant_config
+        )
 
         self.transformer_blocks = nn.ModuleList(
             [
@@ -444,6 +465,7 @@ class SD3Transformer2DModel(nn.Module):
                     context_pre_only=i == self.num_layers - 1,
                     qk_norm=self.qk_norm,
                     use_dual_attention=True if i in self.dual_attention_layers else False,
+                    quant_config=quant_config,
                 )
                 for i in range(self.num_layers)
             ]
@@ -451,7 +473,7 @@ class SD3Transformer2DModel(nn.Module):
 
         self.norm_out = AdaLayerNormContinuous(self.inner_dim, self.inner_dim, elementwise_affine=False, eps=1e-6)
         self.proj_out = ReplicatedLinear(
-            self.inner_dim, self.patch_size * self.patch_size * self.out_channels, bias=True
+            self.inner_dim, self.patch_size * self.patch_size * self.out_channels, bias=True, quant_config=quant_config
         )
 
     def forward(

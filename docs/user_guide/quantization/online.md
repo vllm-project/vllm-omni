@@ -85,6 +85,35 @@ config = build_quant_config({
 })
 ```
 
+### SD3 and SD3.5 T5 encoder
+
+Opt in explicitly with a BF16/FP16 checkpoint:
+
+```python
+from vllm_omni import Omni
+
+omni = Omni(
+    model="stabilityai/stable-diffusion-3.5-medium",
+    quantization_config={"text_encoder_3": {"method": "fp8"}},
+)
+```
+
+The shared SD3 pipeline uses this option for SD3 and SD3.5. Both CLIP encoders remain unchanged.
+A global `quantization="fp8"` does not enable this encoder path.
+Only dynamic online FP8 is accepted; serialized FP8 and static activation
+scales are not supported here.
+
+Attention projections and FFN input projections use vLLM FP8 linear layers.
+Embeddings, relative position bias, normalization and FFN `wo` retain their
+original precision. Hugging Face casts activations to `wo.weight.dtype`, so
+quantizing `wo` would introduce an unscaled FP8 activation cast. `ignored_layers`
+uses full prefixes such as `text_encoder_3.encoder.block.0.layer.0.SelfAttention.q`.
+
+The encoder stays replicated, and its original checkpoint is loaded before
+conversion. This does not reduce checkpoint size or guarantee lower peak load
+memory. Validate generated output against the unquantized baseline for your
+model and workload before deployment.
+
 ## Parameters
 
 | Parameter | Methods | Description |
