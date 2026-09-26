@@ -258,6 +258,9 @@ def _image_to_tensor(image: Image.Image) -> torch.Tensor:
 def _frames_to_tensor(frames: Sequence[Any]) -> torch.Tensor:
     if len(frames) == 0:
         raise ValueError("MiniMax H3 reference video must contain frames")
+    if isinstance(frames, np.ndarray) and frames.dtype == np.uint8 and frames.ndim == 4 and frames.shape[-1] == 3:
+        # Keep the existing owned, contiguous output without converting each RGB frame through PIL.
+        return torch.from_numpy(np.array(frames, copy=True, order="C"))
     return torch.stack(
         [
             _image_to_tensor(frame if isinstance(frame, Image.Image) else Image.fromarray(np.asarray(frame)))
