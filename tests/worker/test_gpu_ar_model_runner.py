@@ -1855,6 +1855,7 @@ class TestPreferModelSamplerNoneFallback:
             "higgs_audio_v2",
             "higgs_audio_v3",
             "hunyuan_image3",
+            "kimi_audio",
             "minicpmo_4_5",
             "minimax_music3",
             "nemotron_voicechat",

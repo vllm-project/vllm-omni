@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import fields as dataclass_fields
 from typing import Any
 
 import torch
+from msgspec.structs import replace
 from vllm.logger import init_logger
 from vllm.outputs import CompletionOutput, PoolingRequestOutput, RequestOutput
 from vllm.sampling_params import RequestOutputKind
@@ -688,7 +689,29 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
 
                 mm_output = getattr(eco, "multimodal_output", None)
                 if mm_output is not None:
+                    text_ids = mm_output.get("ids.output") if isinstance(mm_output, Mapping) else None
+                    if text_ids is not None:
+                        # Some dual-stream models schedule control IDs while
+                        # emitting visible text separately(e.g. kimi audio).
+                        # This client-side view must not change the scheduler's
+                        # token history.
+                        if (
+                            not isinstance(text_ids, torch.Tensor)
+                            or text_ids.ndim != 1
+                            or (text_ids.numel() > 0 and text_ids.dtype not in (torch.int32, torch.int64))
+                        ):
+                            raise ValueError("ids.output must be a one-dimensional integer tensor")
+                        if text_ids.numel() == 0:
+                            # The runner tensorizes [] with an inferred float
+                            # dtype. Keep empty deltas from promoting token IDs
+                            # to floats during multimodal accumulation.
+                            mm_output = dict(mm_output)
+                            mm_output["ids.output"] = text_ids.to(dtype=torch.long)
+                        if not getattr(req_state.detokenizer, "include_stop_str_in_output", False):
+                            raise ValueError("ids.output requires detokenization with include_stop_str_in_output=True")
                     req_state.add_multimodal_tensor(mm_output, mm_type)
+                    if text_ids is not None:
+                        eco = replace(eco, new_token_ids=text_ids.tolist())
 
                 # Omni AR stages carry model payloads alongside text tokens in
                 # pooling_output. Preserve the payload, then clear the field so
