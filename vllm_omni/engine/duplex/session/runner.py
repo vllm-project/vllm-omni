@@ -64,6 +64,7 @@ from vllm_omni.engine.duplex.contracts import (
 from vllm_omni.engine.duplex.events import (
     DuplexEvent,
     InputCleared,
+    ResponseDone,
     SessionExpired,
     SessionHeartbeatAck,
 )
@@ -346,6 +347,15 @@ class DuplexSessionRunner:
     def closed_emitted(self) -> bool:
         """Whether ``session.closed`` / ``session.expired`` already left this runner."""
         return self.run.closed_emitted
+
+    def fail_output(self, message: str, *, response_id: str | None, terminal: ResponseDone | None) -> list[DuplexEvent]:
+        """Experimental overflow policy: fail this response and close only its session."""
+        if self.closing:
+            return []
+        events = self.out.fail_output(message, response_id=response_id, terminal=terminal)
+        self._begin_close("output_backpressure")
+        self.manager.close_from_runner(self, "output_backpressure")
+        return events
 
     def mark_closed_emitted(self) -> None:
         """Claim the session's one terminal event for the caller.
@@ -1474,6 +1484,9 @@ class DuplexSessionRunner:
         if older_abort_ids:
             session.release_resources_for_request_ids(older_abort_ids)
         new_epoch, old_playback = helpers.advance_barge_in_epoch(session)
+        self.manager.invalidate_output(session.session_id, old_response_id, through_epoch=old_epoch)
+        for response_id, _, _ in draining_cancels:
+            self.manager.invalidate_output(session.session_id, response_id, through_epoch=old_epoch)
         if old_request_id is not None:
             # Release projector/parser cursors so cancelled epochs do not
             # accumulate until the whole session closes.
