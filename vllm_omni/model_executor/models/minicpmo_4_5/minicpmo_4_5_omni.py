@@ -36,6 +36,7 @@ from vllm.v1.sample.metadata import SamplingMetadata
 
 from vllm_omni.model_executor.duplex_sampling import DuplexSamplingRow
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.policy import MiniCPMO45DuplexPolicy
+from vllm_omni.model_executor.models.minicpmo_4_5.encoder_cudagraph import bind_minicpmo_encoder_cudagraph
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_llm import (
     MiniCPMO45OmniLLMDummyInputsBuilder,
     MiniCPMO45OmniLLMMultiModalProcessor,
@@ -109,6 +110,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             )
             self.model = self.thinker
             self.talker = None
+            bind_minicpmo_encoder_cudagraph(self, self.thinker)
 
         elif self.model_stage == "tts":
             self.thinker = None

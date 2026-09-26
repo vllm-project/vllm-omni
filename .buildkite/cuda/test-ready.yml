@@ -163,11 +163,10 @@ steps:
 
       - label: "Omni · MiniCPM-o 4.5 Offline Test"
         source_file_dependencies: omni_minicpmo_4_5_function
+        timeout_in_minutes: 35
         commands:
-          - |
-            timeout 20m bash -c "
-              pytest -s -v tests/e2e/offline_inference/test_minicpmo_4_5.py -m 'core_model' --run-level 'core_model'
-            "
+          - pytest -s -v tests/e2e/offline_inference/test_minicpmo_4_5_encoder_cudagraph.py -m 'core_model' --run-level 'core_model'
+          - pytest -s -v tests/e2e/offline_inference/test_minicpmo_4_5.py -m 'core_model' --run-level 'core_model'
         mirror_hardwares: h100_1
 
       - label: "Omni · MiniCPM-o 4.5 Online Test"

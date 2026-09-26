@@ -136,6 +136,7 @@ def _encode_tokens(tokenizer: Any, prompt: str) -> list[int]:
 
 from vllm.utils.tensor_schema import TensorSchema, TensorShape
 
+from vllm_omni.model_executor.models.minicpmo_4_5.encoder_cudagraph import MiniCPMO45EncoderCudaGraphMixin
 from vllm_omni.model_executor.models.model_local_kv import (
     ModelLocalKVScope,
     ModelLocalKVSpec,
@@ -1021,15 +1022,18 @@ class SiglipVisionEmbeddings(nn.Module):
         pixel_values: torch.FloatTensor,
         patch_attention_mask: torch.BoolTensor,
         tgt_sizes: torch.IntTensor | None = None,
+        *,
+        position_ids: torch.LongTensor | None = None,
     ) -> torch.Tensor:
         patch_embeds = self.patch_embedding(pixel_values)
         embeddings = patch_embeds.flatten(2).transpose(1, 2)
 
-        position_ids = self._create_position_ids(
-            patch_attention_mask,
-            tgt_sizes,
-            device=self.position_embedding.weight.device,
-        )
+        if position_ids is None:
+            position_ids = self._create_position_ids(
+                patch_attention_mask,
+                tgt_sizes,
+                device=self.position_embedding.weight.device,
+            )
 
         embeddings = embeddings + self.position_embedding(position_ids)
         return embeddings
@@ -1597,6 +1601,9 @@ class SiglipVisionTransformer(SiglipPreTrainedModel):
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         return_dict: bool | None = None,
+        *,
+        position_ids: torch.LongTensor | None = None,
+        encoder_attention_mask: torch.Tensor | None = None,
     ) -> tuple | BaseModelOutputWithPooling:
         r"""
         Returns:
@@ -1620,14 +1627,27 @@ class SiglipVisionTransformer(SiglipPreTrainedModel):
             )
 
         hidden_states = self.embeddings(
-            pixel_values=pixel_values, patch_attention_mask=patch_attention_mask, tgt_sizes=tgt_sizes
+            pixel_values=pixel_values,
+            patch_attention_mask=patch_attention_mask,
+            tgt_sizes=tgt_sizes,
+            position_ids=position_ids,
         )
 
         patch_attention_mask = patch_attention_mask.view(batch_size, -1)
         # The call to `_upad_input` in `_flash_attention_forward` is expensive
         # So when the `patch_attention_mask` is full of 1s (i.e. attending to the whole sequence),
         # avoiding passing the attention_mask, which is equivalent to attending to the full sequence
-        if not torch.any(~patch_attention_mask):
+        if position_ids is not None:
+            # Capture callers prepare position IDs and the attention mask outside
+            # the graph, always as a 4-D mask (the all-valid case included). Both
+            # are required: this branch skips the mask rebuild below, so a caller
+            # that passed position_ids alone would silently attend to every
+            # padded patch instead of the item's own grid.
+            assert encoder_attention_mask is not None, (
+                "position_ids requires encoder_attention_mask; capture callers must prepare both"
+            )
+            attention_mask = encoder_attention_mask
+        elif not torch.any(~patch_attention_mask):
             attention_mask = None
         else:
             attention_mask = (
@@ -1795,13 +1815,9 @@ class Resampler(nn.Module):
             nn.init.constant_(m.bias, 0)
             nn.init.constant_(m.weight, 1.0)
 
-    def forward(self, x, tgt_sizes=None):
-        assert x.shape[0] == tgt_sizes.shape[0]
-        bs = x.shape[0]
-
-        device = x.device
-        dtype = x.dtype
-
+    def prepare_metadata(self, tgt_sizes, *, device, dtype):
+        """Build layout-dependent positions and padding before CUDA capture."""
+        bs = tgt_sizes.shape[0]
         patch_len = tgt_sizes[:, 0] * tgt_sizes[:, 1]
 
         self._adjust_pos_cache(tgt_sizes, device=device)
@@ -1821,6 +1837,14 @@ class Resampler(nn.Module):
         pos_embed = torch.nn.utils.rnn.pad_sequence(pos_embed, batch_first=True, padding_value=0.0).permute(
             1, 0, 2
         )  # BLD => L * B * D
+
+        return pos_embed, key_padding_mask
+
+    def forward(self, x, tgt_sizes=None, *, pos_embed=None, key_padding_mask=None):
+        bs = x.shape[0]
+        if pos_embed is None:
+            assert bs == tgt_sizes.shape[0]
+            pos_embed, key_padding_mask = self.prepare_metadata(tgt_sizes, device=x.device, dtype=x.dtype)
 
         x = self.kv_proj(x)  # B * L * D
         x = self.ln_kv(x).permute(1, 0, 2)  # L * B * D
@@ -3882,7 +3906,9 @@ MiniCPMVImageInputs = MiniCPMVImagePixelInputs | MiniCPMVImageEmbeddingInputs
     info=MiniCPMO45OmniLLMProcessingInfo,
     dummy_inputs=MiniCPMO45OmniLLMDummyInputsBuilder,
 )
-class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP, SupportsMRoPE):
+class MiniCPMO45OmniLLMForConditionalGeneration(
+    nn.Module, MiniCPMO45EncoderCudaGraphMixin, SupportsMultiModal, SupportsPP, SupportsMRoPE
+):
     """MiniCPM-o Thinker model: Image preprocessing + Vision encoder + 3D Resampler + LLM.
 
     This model processes images through:
@@ -3909,6 +3935,7 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
 
         self.config = config
         self.multimodal_config = multimodal_config
+        self.vllm_config = vllm_config
 
         # Initialize image processor
         self.image_processor = MiniCPMVImageProcessor(

@@ -236,7 +236,10 @@ source_file_dependencies:
 
   omni_minicpmo_4_5_function:
     - *minicpmo_4_5
+    - tests/model_executor/models/minicpmo_4_5/test_encoder_cudagraph.py
+    - tests/model_executor/models/minicpmo_4_5/test_encoder_cudagraph_cuda.py
     - tests/e2e/offline_inference/test_minicpmo_4_5.py
+    - tests/e2e/offline_inference/test_minicpmo_4_5_encoder_cudagraph.py
     - tests/e2e/online_serving/test_minicpmo_4_5.py
     - tests/e2e/online_serving/test_minicpmo_4_5_expansion.py
 
