@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Any, ClassVar
 from vllm.logger import init_logger
 
 from vllm_omni.entrypoints.openai.tts_adapters.capabilities import load_codec_frame_rate, load_supported_speakers
+from vllm_omni.model_extras import get_extra_body_params
 
 logger = init_logger(__name__)
 
@@ -368,19 +369,13 @@ class DiffusionTTSAdapter(TTSModelAdapter):
 
     backend: ClassVar[str] = "diffusion"
 
-    #: Backing diffusion pipeline class (for EXTRA_BODY_PARAMS lookup).
-    pipeline_cls: ClassVar[type | None] = None
-
     @classmethod
     def extra_body_params(cls) -> frozenset[str]:
-        """Fallback-safe access to the pipeline's declared body params.
-
-        Returns the pipeline's ``EXTRA_BODY_PARAMS`` if the #3572 contract is
-        present, else an empty frozenset (the adapter then uses its own inline
-        parameter logic).
-        """
-        params = getattr(cls.pipeline_cls, "EXTRA_BODY_PARAMS", None)
-        return frozenset(params) if params is not None else frozenset()
+        """Return body parameters declared for this adapter's model arches."""
+        params: set[str] = set()
+        for model_arch in cls.model_archs:
+            params.update(get_extra_body_params(model_arch))
+        return frozenset(params)
 
 
 # Re-exported here to avoid import cycles at call sites.

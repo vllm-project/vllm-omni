@@ -64,6 +64,7 @@ from vllm_omni.entrypoints.openai.tts_adapters import (
     tts_entry_stage_archs,
 )
 from vllm_omni.entrypoints.utils import coerce_param_message_types
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.metrics.modality import observe_audio_first_packet, observe_audio_streaming_finalize
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.utils.speaker_cache import get_speaker_cache
@@ -364,19 +365,28 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         instance._diffusion_mode = True
         instance._diffusion_engine = diffusion_engine
         instance._diffusion_model_name = model_name
-        instance._diffusion_stage_configs = stage_configs
         instance._allowed_local_media_path = allowed_local_media_path
         instance._media_connector = MediaConnector(
             allowed_local_media_path=allowed_local_media_path,
             allowed_media_domains=allowed_media_domains,
         )
-        instance._tts_model_type = "omnivoice"
-        instance._is_tts = False
-        # Diffusion-only instances don't have a TTS stage; set None so any
-        # ``_is_tts_model()`` / ``_tts_stage`` access doesn't raise AttributeError.
-        instance._tts_stage = None
-        instance._adapter = None
         instance._init_speaker_storage()
+        instance._adapter = None
+        instance._tts_model_type = next(
+            (
+                model_type
+                for stage in stage_configs or ()
+                if (model_type := detect_tts_model_type(*_stage_speech_metadata(stage)[:2])) is not None
+            ),
+            None,
+        )
+        adapter_cls = resolve_adapter(instance._tts_model_type)
+        if adapter_cls is not None:
+            instance._adapter = adapter_cls(SpeechServingContext(server=instance, diffusion_engine=diffusion_engine))
+            instance._adapter.load_capabilities()
+            logger.info("Resolved diffusion TTS serving adapter: %s", adapter_cls.__name__)
+        else:
+            instance._tts_model_type = None
         return instance
 
     def __init__(self, *args, **kwargs):
@@ -436,8 +446,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
     def _get_tts_adapter(self):
         """Return the per-model serving adapter for the current ``_tts_model_type``.
 
-        Pure-diffusion speech uses its dedicated request path and does not
-        resolve adapters for AR-stage TTS models.
+        Pure-diffusion speech returns the adapter resolved from its pipeline
+        stage metadata during :meth:`for_diffusion` construction.
 
         Resolved lazily (rebuilt if ``_tts_model_type`` changed since the cached
         instance was built) so callers that set ``_tts_model_type`` after
@@ -445,7 +455,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         ``_tts_model_type`` is fixed at init, so the cached instance is reused.
         """
         if self._diffusion_mode:
-            return None
+            return self._adapter
 
         adapter_cls = resolve_adapter(self._tts_model_type)
         if adapter_cls is None:
@@ -2331,40 +2341,70 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         from vllm_omni.outputs import OmniRequestOutput
 
         try:
-            if not request.input or not request.input.strip():
-                raise ValueError("Input text cannot be empty")
+            adapter = self._get_tts_adapter()
+            if adapter is None:
+                raise ValueError(f"Model {self._diffusion_model_name!r} does not provide a diffusion TTS adapter.")
 
-            if request.ref_audio is not None:
-                fmt_err = self._validate_ref_audio_format(request.ref_audio)
-                if fmt_err:
-                    return self._diffusion_error_response(fmt_err, status_code=400)
-
-            request.voice = self._get_normalized_voice(request.voice)
+            adapter.normalize(request)
 
             has_inline_ref_audio = request.ref_audio is not None
-            err = self._apply_uploaded_speaker(request)
-            if err:
-                raise ValueError(err)
+            validation_error = adapter.validate(request)
+            if validation_error:
+                raise ValueError(validation_error)
 
             request_id = f"speech-{random_uuid()}"
-            prompt: dict[str, Any] = {"input": request.input}
-            if request.ref_audio:
-                wav, sr, _ = await self._resolve_ref_audio(cast(str, request.ref_audio))
-                prompt["ref_audio"] = (np.asarray(wav, dtype=np.float32), sr)
-            if request.ref_text:
-                prompt["ref_text"] = request.ref_text
-            if request.voice:
-                if request.voice in self.uploaded_speakers and not has_inline_ref_audio:
-                    prompt["voice_name"] = request.voice
-                    prompt["voice_created_at"] = self._voice_created_at(request.voice)
-            if request.language:
-                prompt["lang"] = request.language
-            if request.instructions:
-                prompt["instruct"] = request.instructions
+            sampling_params_list = self._diffusion_engine.default_sampling_params_list
+            if not sampling_params_list or not isinstance(sampling_params_list[0], OmniDiffusionSamplingParams):
+                raise TypeError("Diffusion speech stage 0 requires OmniDiffusionSamplingParams.")
+            if request.extra_params is not None and not isinstance(request.extra_params, dict):
+                raise ValueError("extra_params must be a JSON object/dict.")
+
+            extra = dict(request.extra_params or {})
+            if request.seed is not None:
+                extra["seed"] = request.seed
+
+            if extra:
+                import copy
+
+                sampling_params_list = copy.deepcopy(sampling_params_list)
+                sampling = sampling_params_list[0]
+
+                if "seed" in extra:
+                    try:
+                        sampling.seed = int(extra.pop("seed"))
+                    except (TypeError, ValueError) as exc:
+                        raise ValueError("seed must be an integer") from exc
+
+                # This change allows StepScheduler read total_steps from upper
+                # sampling.num_inference_steps, check diffusion/sched/step_scheduler:_get_total_steps
+                if "num_inference_steps" in extra:
+                    try:
+                        sampling.num_inference_steps = int(extra.pop("num_inference_steps"))
+                    except (TypeError, ValueError) as exc:
+                        raise ValueError("num_inference_steps must be an integer") from exc
+
+                if "guidance_scale" in extra:
+                    try:
+                        sampling.guidance_scale = float(extra.pop("guidance_scale"))
+                    except (TypeError, ValueError) as exc:
+                        raise ValueError("guidance_scale must be a number") from exc
+
+                if sampling.extra_args is None:
+                    sampling.extra_args = {}
+                sampling.extra_args.update(extra)
+
+            sampling_params_list = adapter.apply_sampling_overrides(
+                sampling_params_list,
+                request,
+                request_id=request_id,
+            )
+            prepared = await adapter.build(request, sampling_params_list, has_inline_ref_audio)
+            prompt = prepared.prompt
 
             logger.info(
-                "Diffusion TTS speech request %s: voice_clone=%s",
+                "Diffusion TTS speech request %s: model=%s voice_clone=%s",
                 request_id,
+                prepared.model_type,
                 "ref_audio" in prompt,
             )
             _rl = getattr(self, "request_logger", None)
@@ -2374,40 +2414,6 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 cap = raw_max if isinstance(raw_max, int) else 200
                 text = request.input[: max(cap - base_len, 0)]
                 logger.debug("Diffusion TTS speech request %s: text=%r", request_id, text)
-            if request.extra_params is not None and not isinstance(request.extra_params, dict):
-                raise ValueError("extra_params must be a JSON object/dict.")
-            extra = dict(request.extra_params or {})
-            if request.seed is not None:
-                extra["seed"] = request.seed
-            # Apply extra_params from the request to sampling params
-            sampling_params_list = self._diffusion_engine.default_sampling_params_list
-            if extra:
-                import copy
-
-                sampling_params_list = copy.deepcopy(sampling_params_list)
-                if sampling_params_list[0].extra_args is None:
-                    sampling_params_list[0].extra_args = {}
-                sampling_params_list[0].extra_args.update(extra)
-
-                sampling = sampling_params_list[0]
-
-                # This change allows StepScheduler read total_steps from upper
-                # sampling.num_inference_steps, check diffusion/sched/step_scheduler:_get_total_steps
-                if "num_inference_steps" in extra:
-                    value = extra["num_inference_steps"]
-                    try:
-                        sampling.num_inference_steps = int(value)
-                    except (TypeError, ValueError) as exc:
-                        raise ValueError("num_inference_steps must be an integer") from exc
-
-                if "guidance_scale" in extra:
-                    value = extra["guidance_scale"]
-                    try:
-                        sampling.guidance_scale = float(value)
-                    except (TypeError, ValueError) as exc:
-                        raise ValueError("guidance_scale must be a number") from exc
-
-                logger.info("Applied extra_params to diffusion: %s", extra)
 
             generator = self._diffusion_engine.generate(
                 prompt=prompt,
@@ -2429,7 +2435,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             audio_output = cast(dict, audio_output)
 
             audio_tensor = audio_output[audio_key]
-            sr_raw = audio_output.get("sr", 24000)
+            sr_raw = audio_output.get("audio_sample_rate", audio_output.get("sr", 24000))
             sr_val = sr_raw[-1] if isinstance(sr_raw, list) and sr_raw else sr_raw
             sample_rate = sr_val.item() if hasattr(sr_val, "item") else int(sr_val)
 

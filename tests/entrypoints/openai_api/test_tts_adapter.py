@@ -35,6 +35,7 @@ from vllm_omni.entrypoints.openai.tts_adapters.moss_tts import (
     MossTTSAdapter,
     MossTTSNanoAdapter,
 )
+from vllm_omni.entrypoints.openai.tts_adapters.omnivoice import OmniVoiceAdapter
 from vllm_omni.entrypoints.openai.tts_adapters.qwen3_tts import (
     QWEN3_TTS_EFFECTIVE_MAX_TOKENS_KEY,
     Qwen3TTSAdapter,
@@ -615,10 +616,56 @@ def test_diffusion_adapter_extra_body_params_fallback():
     class _DiffAdapter(DiffusionTTSAdapter):
         name = "diff_probe"
 
-        async def build(self, request, sampling_params_list):  # pragma: no cover
+        async def build(self, request, sampling_params_list, has_inline_ref_audio):  # pragma: no cover
             raise NotImplementedError
 
     assert _DiffAdapter.extra_body_params() == frozenset()
+
+
+@pytest.mark.asyncio
+async def test_omnivoice_diffusion_adapter_request_preparation():
+    server = SimpleNamespace(
+        _apply_uploaded_speaker=lambda request: None,
+        _get_normalized_voice=lambda voice: voice,
+        _validate_ref_audio_format=lambda ref_audio: None,
+        _resolve_ref_audio=None,
+        uploaded_speakers={"alice": {}},
+        _voice_created_at=lambda voice: 123,
+    )
+    adapter = OmniVoiceAdapter(SpeechServingContext(server=server, diffusion_engine=object()))
+    request = OpenAICreateSpeechRequest(
+        input="Hello",
+        voice="alice",
+        language="English",
+        instructions="calm",
+    )
+
+    adapter.normalize(request)
+    assert adapter.validate(request) is None
+    prepared = await adapter.build(request, [], False)
+
+    assert prepared.model_type == "omnivoice"
+    assert prepared.prompt == {
+        "input": "Hello",
+        "voice_name": "alice",
+        "voice_created_at": 123,
+        "lang": "English",
+        "instruct": "calm",
+    }
+
+
+def test_omnivoice_diffusion_adapter_ref_audio_validation():
+    server = SimpleNamespace(
+        _apply_uploaded_speaker=lambda request: None,
+        _get_normalized_voice=lambda voice: voice,
+        _validate_ref_audio_format=lambda ref_audio: "unsupported reference audio",
+    )
+    adapter = OmniVoiceAdapter(SpeechServingContext(server=server, diffusion_engine=object()))
+    request = OpenAICreateSpeechRequest(input="Hello", ref_audio="unsupported")
+
+    adapter.normalize(request)
+
+    assert adapter.validate(request) == "unsupported reference audio"
 
 
 def _higgs_v2_adapter() -> HiggsAudioV2Adapter:
