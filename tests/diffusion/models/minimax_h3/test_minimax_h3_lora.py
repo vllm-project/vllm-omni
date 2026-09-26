@@ -212,19 +212,15 @@ def test_h3_turbo_honours_the_declared_alpha_and_task_family(tmp_path):
         )
 
 
-@pytest.mark.parametrize("partition", ["fl2va", "combined"])
-def test_h3_turbo_ref2v_artifact_needs_a_ref2va_only_server(tmp_path, partition):
-    """A combined server routes ref2va to ``transformers_ref``, which the
-    adapter cannot bind to: the LoRA target pattern only injects into
-    ``transformer``. Admitting it there would run an undistilled DiT on the
-    artifact's few-step schedule with no error anywhere."""
+def test_h3_turbo_ref2v_artifact_requires_a_ref_capable_server(tmp_path):
+    """An FL-only server has no Ref DiT on which to apply Ref weights."""
 
     path = tmp_path / "minimax_h3_ref2v_turbo_8step_v1.0_768p_bf16.safetensors"
     _write_tiny_turbo(path)
 
-    with pytest.raises(ValueError, match="start the server with --task-type ref2va"):
+    with pytest.raises(ValueError, match="requires a Ref2VA-capable server"):
         load_minimax_h3_turbo_lora(
-            partition=partition,
+            partition="fl2va",
             lora_request=_request(path),
             lora_path=path,
             dtype=torch.float32,
@@ -582,3 +578,29 @@ def test_h3_turbo_accepts_four_steps_for_four_nfe():
         ),
         _spec(),
     )
+
+
+@pytest.mark.parametrize("family,component", [("ref2v", "transformers_ref"), ("fl2v", "transformer")])
+def test_combined_turbo_weights_do_not_match_other_dit(tmp_path, family, component):
+    """Manager fallback must not reuse one family's weights on the other DiT.
+
+    This also covers FL activation after Ref layers were already wrapped.
+    A target regex alone cannot isolate activation, which visits all wrappers.
+    """
+    import re
+
+    path = tmp_path / f"minimax_h3_{family}_turbo_8step_v1.0_768p_bf16.safetensors"
+    _write_tiny_turbo(path)
+    model, helper, _ = load_minimax_h3_turbo_lora(
+        partition="combined", lora_request=_request(path), lora_path=path, dtype=torch.float32
+    )
+    other = "transformer" if component == "transformers_ref" else "transformers_ref"
+    manager = object.__new__(DiffusionLoRAManager)
+    assert model.loras
+    for name, weights in model.loras.items():
+        assert name.startswith(component + ".")
+        assert re.fullmatch(helper.target_modules, name)
+        other_name = other + name[len(component) :]
+        assert not re.fullmatch(helper.target_modules, other_name)
+        assert manager._get_lora_weights(model, name) is weights
+        assert manager._get_lora_weights(model, other_name) is None
