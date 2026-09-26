@@ -94,6 +94,33 @@ curl -sS http://127.0.0.1:8091/v1/chat/completions \
 Use the Design-Layer checkpoint and set `INPUT_IMAGE` to a local flattened design image.
 Note that the prompt should better depict each layer to be decomposed, we will refine with more example inputs soon.
 
+The default `ming_image.yaml` uses two GPUs and decodes without tiling. For
+1024x1024 output with six layers, choose one of these VAE configurations:
+
+```bash
+# Two GPUs: Stage 0 on GPU 0, Stage 1 and tiled VAE on GPU 1.
+vllm serve inclusionAI/Ming-Image-0.1-Design-Layer --omni \
+  --deploy-config vllm_omni/deploy/ming_image_layer_tiled.yaml --port 8091
+
+# Three GPUs: Stage 0 on GPU 0, Stage 1 on GPUs 1 and 2;
+# the VAE distributes spatial tiles across the two Stage 1 ranks.
+vllm serve inclusionAI/Ming-Image-0.1-Design-Layer --omni \
+  --deploy-config vllm_omni/deploy/ming_image_layer_tile_parallel.yaml --port 8091
+```
+
+Run one command at a time, then use the request below with the same input
+image, prompt, seed, `num_layers=6`, 1024x1024 dimensions, and 12 steps.
+Warm up the same shape and layer count before timing. Record request latency,
+`vae.decode` stage duration with `enable_diffusion_pipeline_profiler`, and peak
+GPU memory for each configuration. Check all seven returned images in order:
+composite first, then layers 1 through 6. Compare tiled outputs numerically
+between the two deployments; report untiled differences separately because
+tile-boundary blending can change individual pixels. This Qwen VAE uses spatial
+tile parallelism; `vae_patch_parallel_size` is the existing configuration key,
+not a separate Qwen patch-decoding mode. Multi-GPU speedup has not yet been
+measured. Set `enable_diffusion_pipeline_profiler: true` under Stage 1 in a temporary
+copy of each deployment config when collecting decode durations.
+
 ```bash
 MODEL=inclusionAI/Ming-Image-0.1-Design-Layer
 INPUT_IMAGE=/path/to/input.png
