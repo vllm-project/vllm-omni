@@ -523,6 +523,7 @@ class OmniStageModelConfig(_TrackExplicitConfigFields):
     model_subdir: str | None = None
     tokenizer_subdir: str | None = None
     requires_full_payload_input: bool = False
+    scheduling_metadata_adapter: str | None = None
     # Upstream ModelConfig inputs that users pass as global CLI flags.
     served_model_name: str | list[str] | None = None
     allowed_local_media_path: str | None = None
@@ -1975,6 +1976,7 @@ def _build_model_config(
     kwargs = _config_kwargs(engine)
     kwargs["requires_full_payload_input"] = topology.requires_full_payload_input
     kwargs["model"] = _first_defined(kwargs.get("model"), model)
+    kwargs["scheduling_metadata_adapter"] = topology.scheduling_metadata_adapter
     if "model_arch" not in kwargs:
         kwargs["model_arch"] = topology.model_arch or pipeline.model_arch or None
     if "trust_remote_code" not in kwargs and deploy.trust_remote_code is not None:
