@@ -38,6 +38,11 @@ class FullAttentionGroupView:
     def batch_req_ids(self) -> list[str]:
         return list(self._input_batch.req_ids)
 
+    def token_range(self, req_id: str, num_scheduled: int) -> tuple[int, int]:
+        index = self._input_batch.req_id_to_index[req_id]
+        start = int(self._input_batch.num_computed_tokens_cpu[index])
+        return start, start + num_scheduled
+
     def step_slots_cpu(self, req_ids: list[str], num_scheduled: dict[str, int]) -> torch.Tensor:
         """This step's slot mapping, computed on CPU from the block table.
 

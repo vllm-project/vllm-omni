@@ -4,6 +4,7 @@
 import asyncio
 import copy
 import re
+import threading
 from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier
@@ -19,6 +20,8 @@ from vllm.v1.worker import gpu_input_batch
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 
 from vllm_omni.core.prefix_cache import ModelCachePolicy
+from vllm_omni.core.prefix_cache.interface import PrefixCacheRequestProgress, StageCacheOutputs
+from vllm_omni.core.prefix_cache.manager import OmniPrefixCacheManager
 from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
 from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
 from vllm_omni.entrypoints.openai.tts_adapters.base import PreparedRequest
@@ -492,7 +495,19 @@ def _make_async_output_runner(engine_output_type: str = "audio"):
     runner.model_config = model_config
     runner._async_chunk = True
     runner.omni_prefix_cache = None
-    runner.requests = {"r1": object(), "r2": object()}
+    runner.requests = {
+        rid: CachedRequestState(
+            req_id=rid,
+            prompt_token_ids=[1],
+            mm_features=[],
+            sampling_params=None,
+            generator=None,
+            block_ids=([],),
+            num_computed_tokens=0,
+            output_token_ids=[],
+        )
+        for rid in ("r1", "r2")
+    }
     runner.supports_mm_inputs = False
     runner.routed_experts_initialized = False
     runner.model = SimpleNamespace(has_postprocess=False)
@@ -504,9 +519,215 @@ def _make_async_output_runner(engine_output_type: str = "audio"):
     return runner
 
 
-def test_build_omni_output_uses_snapshots_after_accumulation(monkeypatch):
+def _build_prefix_delivery_output(runner, *, staged_hidden=None, multimodal_outputs=None):
+    req_ids = ["r1", "r2"]
+    return GPUARModelRunner._build_omni_model_runner_output_from_snapshot(
+        runner,
+        scheduler_output=SimpleNamespace(total_num_scheduled_tokens=4, num_scheduled_tokens={"r1": 2, "r2": 2}),
+        hidden_states=torch.tensor([[40.0], [50.0], [10.0], [20.0]]),
+        staged_hidden_states_cpu=staged_hidden,
+        multimodal_outputs=multimodal_outputs or {},
+        req_ids_output_copy=req_ids,
+        req_id_to_index_output_copy={"r1": 0, "r2": 1},
+        valid_sampled_token_ids=[[], []],
+        logprobs_lists=None,
+        prompt_logprobs_dict={},
+        num_nans_in_logits=None,
+        kv_connector_output=None,
+        ec_connector_output=None,
+        cudagraph_stats=None,
+        kv_extracted_req_ids=None,
+        num_scheduled_tokens_np=np.array([2, 2], dtype=np.int32),
+        query_start_loc_cpu=torch.tensor([0, 2], dtype=torch.long),
+        prefix_cache_step_id=7,
+    )
+
+
+def _delivery_test_manager():
+    manager = object.__new__(OmniPrefixCacheManager)
+    manager._state_lock = threading.Lock()
+    return manager
+
+
+@pytest.mark.parametrize("downstream", [["r1"], ["r1", "r2"]])
+def test_prefix_delivery_builder_clips_payload_and_acks_downstream_only(monkeypatch, downstream):
+    runner = _make_async_output_runner(engine_output_type="latent")
+    runner._async_chunk = False
+    runner.omni_prefix_cache = _delivery_test_manager()
+    progress = {
+        "r1": PrefixCacheRequestProgress(delivered_upto=5),
+        "r2": PrefixCacheRequestProgress(delivered_upto=2),
+    }
+    raw = StageCacheOutputs(
+        hidden_states={"r1": torch.arange(6).float().unsqueeze(1), "r2": torch.arange(2).float().unsqueeze(1)},
+        mm_outputs={
+            "codes.audio": {"r1": torch.arange(6).float().unsqueeze(1), "r2": torch.arange(2).float().unsqueeze(1)}
+        },
+        token_ranges={"r1": (0, 6), "r2": (0, 2)},
+        scheduled_token_ranges={"r1": (4, 6), "r2": (0, 2)},
+        cached_mm_keys=frozenset({"codes.audio"}),
+        token_mm_keys=frozenset({"codes.audio"}),
+        _progress=progress,
+        delivery_starts={"r1": 5, "r2": 2},
+    )
+    seen = []
+    monkeypatch.setattr(
+        GPUARModelRunner, "_resolve_pooler_payload_req_ids", lambda self, req_ids: ("latent", downstream)
+    )
+    monkeypatch.setattr(
+        GPUARModelRunner, "_prepare_prefix_cache_pooler_payload_sources", lambda self, **kwargs: (None, raw)
+    )
+    monkeypatch.setattr(
+        GPUARModelRunner,
+        "_process_additional_information_updates",
+        lambda self, *args, **kwargs: seen.append((args[4], args[5])),
+    )
+    monkeypatch.setattr(GPUARModelRunner, "_should_accumulate_full_payload_output", lambda self: False)
+    monkeypatch.setattr(GPUARModelRunner, "get_omni_connector_output", lambda self: None)
+
+    output = _build_prefix_delivery_output(runner)
+
+    assert seen == [(raw.hidden_states, raw.mm_outputs)]
+    assert output.inter_stage_outputs[0]["hidden"].flatten().tolist() == [5.0]
+    assert output.inter_stage_outputs[0]["codes.audio"].flatten().tolist() == [5.0]
+    assert output.inter_stage_outputs[1] is None
+    assert progress["r1"].delivered_upto == 6
+    assert progress["r2"].delivered_upto == 2
+
+
+def test_prefix_delivery_builder_acks_only_after_success(monkeypatch):
+    runner = _make_async_output_runner(engine_output_type="latent")
+    runner._async_chunk = False
+    runner.omni_prefix_cache = _delivery_test_manager()
+    progress = PrefixCacheRequestProgress()
+    raw = StageCacheOutputs(
+        hidden_states={"r1": torch.tensor([[1.0], [2.0]]), "r2": torch.tensor([[3.0], [4.0]])},
+        mm_outputs={},
+        token_ranges={"r1": (0, 2), "r2": (0, 2)},
+        scheduled_token_ranges={"r1": (0, 2), "r2": (0, 2)},
+        _progress={"r1": progress, "r2": PrefixCacheRequestProgress()},
+        delivery_starts={"r1": 0, "r2": 0},
+    )
+    monkeypatch.setattr(GPUARModelRunner, "_resolve_pooler_payload_req_ids", lambda self, req_ids: ("latent", ["r1"]))
+    monkeypatch.setattr(
+        GPUARModelRunner, "_prepare_prefix_cache_pooler_payload_sources", lambda self, **kwargs: (None, raw)
+    )
+    monkeypatch.setattr(GPUARModelRunner, "_process_additional_information_updates", lambda *args, **kwargs: None)
+    monkeypatch.setattr(GPUARModelRunner, "_should_accumulate_full_payload_output", lambda self: False)
+    monkeypatch.setattr(
+        GPUARModelRunner,
+        "_build_omni_step_outputs",
+        lambda self, *args, **kwargs: (_ for _ in ()).throw(RuntimeError("output build failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="output build failed"):
+        _build_prefix_delivery_output(runner)
+    assert progress.delivered_upto == 0
+
+
+def test_prefix_delivery_clips_scheduled_hidden_when_cached_hidden_disabled(monkeypatch):
+    runner = _make_async_output_runner(engine_output_type="latent")
+    runner._async_chunk = False
+    runner._omni_cache_policy = ModelCachePolicy(needs_full_hidden_states=False)
+    runner.omni_prefix_cache = _delivery_test_manager()
+    progress = PrefixCacheRequestProgress(delivered_upto=5)
+    raw = StageCacheOutputs(
+        hidden_states=None,
+        mm_outputs={},
+        token_ranges={"r1": (0, 6), "r2": (0, 2)},
+        scheduled_token_ranges={"r1": (4, 6), "r2": (0, 2)},
+        _progress={"r1": progress, "r2": PrefixCacheRequestProgress()},
+        delivery_starts={"r1": 5, "r2": 0},
+    )
+    monkeypatch.setattr(GPUARModelRunner, "_resolve_pooler_payload_req_ids", lambda self, req_ids: ("latent", ["r1"]))
+    monkeypatch.setattr(
+        GPUARModelRunner,
+        "_prepare_prefix_cache_pooler_payload_sources",
+        lambda self, **kwargs: (kwargs["staged_hidden_states_cpu"], raw),
+    )
+    monkeypatch.setattr(GPUARModelRunner, "_process_additional_information_updates", lambda *args, **kwargs: None)
+    monkeypatch.setattr(GPUARModelRunner, "_should_accumulate_full_payload_output", lambda self: False)
+    monkeypatch.setattr(GPUARModelRunner, "get_omni_connector_output", lambda self: None)
+
+    output = _build_prefix_delivery_output(runner, staged_hidden=torch.tensor([[40.0], [50.0], [10.0], [20.0]]))
+
+    assert output.inter_stage_outputs[0]["hidden"].flatten().tolist() == [50.0]
+    assert output.inter_stage_outputs[1] is None
+    assert progress.delivered_upto == 6
+
+
+def test_sparse_list_only_audio_keeps_later_payload_after_empty_step(monkeypatch):
+    runner = _make_async_output_runner(engine_output_type="audio")
+    runner._async_chunk = False
+    runner._pooler_payload_include_hidden_flag = False
+    runner.omni_prefix_cache = _delivery_test_manager()
+    discarded: list[int] = []
+    runner.omni_prefix_cache.discard_step = discarded.append
+    progress = PrefixCacheRequestProgress()
+    raw = StageCacheOutputs(
+        hidden_states=None,
+        mm_outputs={"codes.audio": {"r1": [torch.tensor([9])], "r2": []}},
+        token_ranges={"r1": (5, 6), "r2": (0, 2)},
+        scheduled_token_ranges={"r1": (5, 6), "r2": (0, 2)},
+        _progress={"r1": progress, "r2": PrefixCacheRequestProgress()},
+    )
+    monkeypatch.setattr(GPUARModelRunner, "_resolve_pooler_payload_req_ids", lambda self, req_ids: ("audio", req_ids))
+    monkeypatch.setattr(
+        GPUARModelRunner, "_prepare_prefix_cache_pooler_payload_sources", lambda self, **kwargs: (None, raw)
+    )
+    monkeypatch.setattr(GPUARModelRunner, "_process_additional_information_updates", lambda *args, **kwargs: None)
+    monkeypatch.setattr(GPUARModelRunner, "_should_accumulate_full_payload_output", lambda self: False)
+    monkeypatch.setattr(GPUARModelRunner, "get_omni_connector_output", lambda self: None)
+
+    first = _build_prefix_delivery_output(runner, multimodal_outputs={"meta.req_id": [], "meta.sparse_audio": ["1"]})
+    second = _build_prefix_delivery_output(
+        runner, multimodal_outputs={"meta.req_id": ["r1"], "meta.sparse_audio": ["1"]}
+    )
+
+    assert first.inter_stage_outputs is None
+    assert discarded == [7]
+    assert second.inter_stage_outputs[0]["codes.audio"].tolist() == [9]
+    assert progress.delivered_upto == 0
+
+
+@pytest.mark.parametrize("cache_merge", [False, True])
+def test_build_omni_output_uses_snapshots_after_accumulation(monkeypatch, cache_merge):
     runner = _make_async_output_runner()
     events = []
+    ranges = {}
+    runner.requests["r1"].num_computed_tokens = 10
+    runner.requests["r2"].num_computed_tokens = 20
+
+    if cache_merge:
+        runner.omni_prefix_cache = _delivery_test_manager()
+        runner.omni_prefix_cache.mm_cache_keys = {"foo", "not_emitted"}
+        runner._full_payload_token_ends = {"r1": {}, "r2": {}}
+        combined_hidden = {"r1": torch.tensor([[1.0]]), "r2": torch.tensor([[2.0], [3.0]])}
+        combined_mm = {"foo": combined_hidden, "passthrough": {"r1": 1, "r2": 2}}
+        monkeypatch.setattr(GPUARModelRunner, "_model_needs_full_prefix_hidden_states", lambda self: True)
+        monkeypatch.setattr(
+            GPUARModelRunner,
+            "_prepare_prefix_cache_pooler_payload_sources",
+            lambda *args, **kwargs: (
+                None,
+                StageCacheOutputs(
+                    hidden_states=combined_hidden,
+                    mm_outputs=combined_mm,
+                    token_ranges={"r1": (10, 11), "r2": (20, 22)},
+                    scheduled_token_ranges={"r1": (10, 11), "r2": (20, 22)},
+                    cached_mm_keys=frozenset({"foo"}),
+                    token_mm_keys=frozenset({"foo"}),
+                    _progress={"r1": PrefixCacheRequestProgress(), "r2": PrefixCacheRequestProgress()},
+                ),
+            ),
+        )
+
+    def accumulate(self, rid, payload, request, *, token_range, prefix_cache_keys):
+        assert prefix_cache_keys == (frozenset({"hidden", "foo"}) if cache_merge else frozenset())
+        if cache_merge:
+            self._full_payload_token_ends[rid] = {"hidden": token_range[1]}
+        events.append(f"accumulate:{rid}")
+        ranges[rid] = token_range
 
     monkeypatch.setattr(
         GPUARModelRunner,
@@ -517,7 +738,7 @@ def test_build_omni_output_uses_snapshots_after_accumulation(monkeypatch):
     monkeypatch.setattr(
         GPUARModelRunner,
         "accumulate_full_payload_output",
-        lambda self, rid, payload, request: events.append(f"accumulate:{rid}"),
+        accumulate,
     )
     # The connector drain runs a TP collective and belongs to the caller's thread.
     monkeypatch.setattr(
@@ -549,6 +770,7 @@ def test_build_omni_output_uses_snapshots_after_accumulation(monkeypatch):
         query_start_loc_cpu=torch.tensor([0, 1], dtype=torch.long),
     )
 
+    assert ranges == {"r1": (10, 11), "r2": (20, 22)}
     assert output.req_ids == ["r1", "r2"]
     assert output.inter_stage_outputs is not None
     assert torch.equal(output.inter_stage_outputs[0]["hidden"], torch.tensor([[1.0]]))
@@ -938,7 +1160,7 @@ def test_sample_tokens_tail_only_prefix_cache_uses_staged_cpu_hidden_states(monk
     monkeypatch.setattr(
         GPUARModelRunner,
         "_prepare_prefix_cache_pooler_payload_sources",
-        lambda self, **kwargs: (kwargs["staged_hidden_states_cpu"], None, None),
+        lambda self, **kwargs: (kwargs["staged_hidden_states_cpu"], None),
     )
     monkeypatch.setattr(GPUARModelRunner, "_process_additional_information_updates", lambda *args, **kwargs: None)
     monkeypatch.setattr(GPUARModelRunner, "_should_accumulate_full_payload_output", lambda self: False)
@@ -974,7 +1196,7 @@ def test_build_omni_output_falls_back_to_mm_cpu_without_prefix_merge(monkeypatch
     monkeypatch.setattr(
         GPUARModelRunner,
         "_prepare_prefix_cache_pooler_payload_sources",
-        lambda *args, **kwargs: (None, None, None),
+        lambda *args, **kwargs: (None, None),
     )
     monkeypatch.setattr(GPUARModelRunner, "_process_additional_information_updates", lambda *args, **kwargs: None)
     monkeypatch.setattr(GPUARModelRunner, "_should_accumulate_full_payload_output", lambda self: False)
@@ -1024,7 +1246,7 @@ def test_build_omni_output_never_leaks_internal_pooler_output_on_wire(monkeypatc
     monkeypatch.setattr(
         GPUARModelRunner,
         "accumulate_full_payload_output",
-        lambda self, rid, payload, request: None,
+        lambda self, rid, payload, request, *, token_range, prefix_cache_keys: None,
     )
     monkeypatch.setattr(GPUARModelRunner, "get_omni_connector_output", lambda self: None)
 
@@ -1121,7 +1343,7 @@ def test_build_omni_output_filters_multimodal_by_partial_downstream_batch(monkey
     monkeypatch.setattr(
         GPUARModelRunner,
         "_prepare_prefix_cache_pooler_payload_sources",
-        lambda *args, **kwargs: (None, None, None),
+        lambda *args, **kwargs: (None, None),
     )
     monkeypatch.setattr(GPUARModelRunner, "_process_additional_information_updates", lambda *args, **kwargs: None)
     monkeypatch.setattr(GPUARModelRunner, "_should_accumulate_full_payload_output", lambda self: False)
@@ -1186,6 +1408,15 @@ def test_build_omni_output_uses_combined_prefix_cache_mm_payload_for_partial_dow
         },
         "codes.ref": {"r1": list(ref_codes), "r3": list(ref_codes)},
     }
+    raw = StageCacheOutputs(
+        hidden_states=None,
+        mm_outputs=combined_mm,
+        token_ranges={r: (0, 1) for r in ("r1", "r2", "r3")},
+        scheduled_token_ranges={r: (0, 1) for r in ("r1", "r2", "r3")},
+        _progress={r: PrefixCacheRequestProgress() for r in ("r1", "r2", "r3")},
+        delivery_starts={"r1": 0, "r2": 0, "r3": 0},
+    )
+    runner.omni_prefix_cache = _delivery_test_manager()
 
     monkeypatch.setattr(
         GPUARModelRunner,
@@ -1196,7 +1427,7 @@ def test_build_omni_output_uses_combined_prefix_cache_mm_payload_for_partial_dow
     monkeypatch.setattr(
         GPUARModelRunner,
         "_prepare_prefix_cache_pooler_payload_sources",
-        lambda *args, **kwargs: (None, None, combined_mm),
+        lambda *args, **kwargs: (None, raw),
     )
     monkeypatch.setattr(GPUARModelRunner, "_process_additional_information_updates", lambda *args, **kwargs: None)
     monkeypatch.setattr(GPUARModelRunner, "_should_accumulate_full_payload_output", lambda self: False)
@@ -1872,3 +2103,47 @@ class TestPreferModelSamplerNoneFallback:
             "least tolerates -- that fallback, then add its directory name to "
             "`expected` above. If you REMOVED one, drop its name."
         )
+
+
+@pytest.mark.parametrize("hit,delivered", [(8, 6), (8, 8), (4, 8)])
+def test_full_payload_cache_recovery_uses_per_key_ends_without_double_clipping(monkeypatch, hit, delivered):
+    runner = _make_async_output_runner(engine_output_type="latent")
+    runner._async_chunk = False
+    runner._pending_full_payload_send = {}
+    runner._full_payload_token_ends = {}
+    runner._full_payload_replace_keys_cached = frozenset()
+    runner.omni_prefix_cache = _delivery_test_manager()
+    runner.omni_prefix_cache.mm_cache_keys = {"codes.audio"}
+    runner.accumulate_full_payload_output(
+        "r1", {"hidden": torch.arange(delivered).reshape(-1, 1)}, runner.requests["r1"], token_range=(0, delivered)
+    )
+    runner.accumulate_full_payload_output(
+        "r1",
+        {"codes.audio": torch.arange(delivered - 2).reshape(-1, 1)},
+        runner.requests["r1"],
+        token_range=(0, delivered - 2),
+    )
+    ends = runner._full_payload_token_ends["r1"]
+    progress = PrefixCacheRequestProgress(delivered_upto=min(ends.values()))
+    origin, end = min(hit, delivered - 2), hit + 2
+    raw = StageCacheOutputs(
+        hidden_states={"r1": torch.arange(origin, end).reshape(-1, 1)},
+        mm_outputs={"codes.audio": {"r1": torch.arange(origin, end).reshape(-1, 1)}},
+        token_ranges={"r1": (origin, end)},
+        scheduled_token_ranges={"r1": (hit, end)},
+        cached_mm_keys=frozenset({"codes.audio"}),
+        token_mm_keys=frozenset({"codes.audio"}),
+        _progress={"r1": progress},
+    )
+    runner.requests["r1"].num_computed_tokens = 99
+    monkeypatch.setattr(GPUARModelRunner, "_resolve_pooler_payload_req_ids", lambda self, req_ids: ("latent", ["r1"]))
+    monkeypatch.setattr(
+        GPUARModelRunner, "_prepare_prefix_cache_pooler_payload_sources", lambda self, **kwargs: (None, raw)
+    )
+    monkeypatch.setattr(GPUARModelRunner, "_process_additional_information_updates", lambda *args, **kwargs: None)
+    monkeypatch.setattr(GPUARModelRunner, "_should_accumulate_full_payload_output", lambda self: True)
+    _build_prefix_delivery_output(runner)
+    payload, _ = runner._materialize_full_payload_entry(runner._pending_full_payload_send["r1"])
+    assert payload["hidden"].flatten().tolist() == list(range(max(delivered, end)))
+    assert payload["codes.audio"].flatten().tolist() == list(range(max(delivered - 2, end)))
+    assert progress.delivered_upto == max(delivered - 2, end)

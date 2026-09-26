@@ -517,11 +517,16 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 # domains must consume the old frame before new output passes.
                 request.async_tokens_to_discard = max(0, stale_async_tokens - len(generated_token_ids))
 
-            if output_is_stale or async_output_is_stale:
-                # Output of a step scheduled before the request's in-flight
-                # tokens were discarded (segment stop / session replacement).
-                # num_computed_tokens was rolled back at the discard site, so
-                # this output must not be appended or emitted.
+            if (
+                output_is_stale
+                and (
+                    request.drop_stale_output
+                    or not self.cache_config.enable_prefix_caching
+                    or request.status != RequestStatus.PREEMPTED
+                )
+            ) or async_output_is_stale:
+                # Deliver stale preemption output only for prefix caching;
+                # streaming resets and async discard markers drop their frames.
                 continue
 
             status_before_stop = request.status
@@ -600,7 +605,9 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             # Check for stop and update request status.
             if new_token_ids:
                 num_sampled_tokens = len(new_token_ids)
-                new_token_ids, stopped = self._update_request_with_output(request, new_token_ids)
+                new_token_ids, stopped = self._update_request_with_output(
+                    request, new_token_ids, is_stale=output_is_stale
+                )
                 if new_logprobs is not None and len(new_token_ids) < num_sampled_tokens:
                     # A mid-step stop (e.g. spec-decode tokens sampled past
                     # EOS) trims new_token_ids after the validation slice
@@ -768,6 +775,19 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             if self.chunk_transfer_adapter is not None and (
                 inter_stage_output is not None or is_segment_finished or finished
             ):
+                if output_is_stale:
+                    # Preemption reset the live counter; use this frame's scheduled end.
+                    cached = scheduler_output.scheduled_cached_reqs
+                    if req_id in cached.req_ids:
+                        index = cached.req_ids.index(req_id)
+                        start = cached.num_computed_tokens[index]
+                    else:
+                        start = next(
+                            data.num_computed_tokens
+                            for data in scheduler_output.scheduled_new_reqs
+                            if data.req_id == req_id
+                        )
+                    confirmed_num_computed_tokens = start + num_tokens_scheduled
                 save_kwargs = {
                     "new_token_ids": new_token_ids,
                     "confirmed_num_computed_tokens": confirmed_num_computed_tokens,
@@ -1374,6 +1394,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         self.encoder_cache_manager.free(request)
         request_id = request.request_id
         self.finished_req_ids.add(request_id)
+        self._record_full_payload_discard(request)
         self._new_prompt_len_snapshot.pop(request_id, None)
         if self.finished_req_ids_dict is not None:
             self.finished_req_ids_dict[request.client_index].add(request_id)

@@ -36,6 +36,11 @@ except ModuleNotFoundError:
     sys.modules["vllm"] = _vllm
     sys.modules["vllm.logger"] = _vllm_logger
 
+from vllm_omni.core.prefix_cache.adapter import (
+    PrefixCacheEventKind,
+    PrefixCacheRequestEvent,
+    PrefixCacheSchedulerAdapter,
+)
 from vllm_omni.core.prefix_cache.controller import StagingBufferHolder
 from vllm_omni.core.prefix_cache.group_view import (
     FullAttentionGroupView,
@@ -84,6 +89,10 @@ class FakeView:
     def batch_req_ids(self) -> list[str]:
         return list(self.order)
 
+    def token_range(self, req_id, num_scheduled):
+        start = self.computed.get(req_id, 0)
+        return start, start + num_scheduled
+
     def step_slots_cpu(self, req_ids, num_scheduled) -> torch.Tensor:
         parts = []
         for r in req_ids:
@@ -112,7 +121,7 @@ class FakeSchedOut:
 def make_manager(view=None, policy=None, **cfg_kwargs) -> tuple[OmniPrefixCacheManager, FakeView]:
     view = view or FakeView()
     config = PrefixCacheConfig(num_blocks=NUM_BLOCKS, block_size=BLOCK_SIZE, **cfg_kwargs)
-    mgr = OmniPrefixCacheManager(config, view, eager=True)
+    mgr = OmniPrefixCacheManager(config, eager=True)
     if policy is not None:
         mgr.register_policy(policy)
     return mgr, view
@@ -145,10 +154,15 @@ def run_step(
     view.step_slot_mapping = torch.cat(slot_parts)
     hidden = torch.cat(hidden_parts)
     sched_out = FakeSchedOut(new_reqs=new_reqs, finished=finished, num_scheduled=num_sched)
-    mgr.new_step_starts(sched_out)
+    adapter = getattr(mgr, "_test_adapter", None)
+    if adapter is None:
+        adapter = mgr._test_adapter = PrefixCacheSchedulerAdapter()
+    events = adapter.translate_scheduler_output(sched_out)
+    layout = adapter.build_write_layout(view, num_scheduled_tokens=num_sched)
+    mgr.new_step_starts(events)
     n = int(view.step_slot_mapping.numel())
     padded = n if num_tokens_padded is None else int(num_tokens_padded)
-    return mgr.save_outputs(hidden, mm or {}, num_tokens_unpadded=n, num_tokens_padded=padded)
+    return mgr.save_outputs(hidden, mm or {}, num_tokens_unpadded=n, num_tokens_padded=padded, write_layout=layout)
 
 
 def expected_rows(slots: torch.Tensor) -> torch.Tensor:
@@ -343,6 +357,13 @@ def test_absent_hit_fails_fast():
         assert not mgr._controller._staging_pool._busy[d2h.staging_slot]
 
 
+def test_empty_hit_block_group_fails_at_register():
+    mgr, _ = make_manager()
+    event = PrefixCacheRequestEvent("empty", PrefixCacheEventKind.STARTED, hit_end=4, block_ids=((),))
+    with pytest.raises(OmniPrefixCacheUnmatchError, match="carries no block_ids"):
+        mgr.new_step_starts((event,))
+
+
 def test_hit_not_block_aligned_fails_at_register():
     mgr, view = make_manager()
     s1 = run_step(mgr, view, {"a": ([0, 1], 0, 8)})
@@ -412,7 +433,9 @@ def test_split_step_outputs_routes_immediate_deferred_leftover():
     view.req_blocks["a"] = [0]
     view.computed["a"] = 0
     n = 4
-    mgr.new_step_starts(FakeSchedOut(new_reqs=[FakeNewReq("a")], num_scheduled={"a": n}))
+    sched = FakeSchedOut(new_reqs=[FakeNewReq("a")], num_scheduled={"a": n})
+    adapter = PrefixCacheSchedulerAdapter()
+    mgr.new_step_starts(adapter.translate_scheduler_output(sched))
     hidden = torch.ones(n, HIDDEN)
     mm = {
         "codes.audio": torch.full((n, 2), 5.0),
@@ -983,10 +1006,18 @@ def test_save_slot_mismatch_fails_fast():
     view.order = ["a"]
     view.req_blocks["a"] = [0]
     view.computed["a"] = 0
-    mgr.new_step_starts(FakeSchedOut(new_reqs=[FakeNewReq("a")], num_scheduled={"a": 2}))
+    sched = FakeSchedOut(new_reqs=[FakeNewReq("a")], num_scheduled={"a": 2})
+    adapter = PrefixCacheSchedulerAdapter()
+    mgr.new_step_starts(adapter.translate_scheduler_output(sched))
     hidden = torch.zeros(4, HIDDEN, dtype=DTYPE)
     with pytest.raises(OmniPrefixCacheUnmatchError):
-        mgr.save_outputs(hidden, {}, num_tokens_unpadded=4, num_tokens_padded=4)
+        mgr.save_outputs(
+            hidden,
+            {},
+            num_tokens_unpadded=4,
+            num_tokens_padded=4,
+            write_layout=adapter.build_write_layout(view, num_scheduled_tokens=sched.num_scheduled_tokens),
+        )
 
 
 def test_materialize_rejects_out_of_snapshot_ids():
@@ -1142,7 +1173,7 @@ def test_eager_dispatch_failure_releases_step_and_all_task_owners(monkeypatch, f
         mgr.discard_step(preserved_sid)
         assert all(not holders for holders in ctrl._staging_pool._busy)
         with pytest.raises(OmniPrefixCacheUnmatchError, match="write failed"):
-            mgr.new_step_starts(FakeSchedOut())
+            mgr.new_step_starts(())
     finally:
         mgr.shutdown()
 
@@ -1169,7 +1200,7 @@ def test_eager_escalation_failure_releases_deferred_tasks(monkeypatch):
         assert all(task.done.is_set() and task.host_ready.is_set() for task in tasks)
         assert all(not holders for holders in ctrl._staging_pool._busy)
         with pytest.raises(OmniPrefixCacheUnmatchError, match="write failed"):
-            mgr.new_step_starts(FakeSchedOut())
+            mgr.new_step_starts(())
     finally:
         mgr.shutdown()
 
@@ -1372,12 +1403,14 @@ def test_same_step_hit_refreshes_prefetch_after_write(reuse_blocks, deferred_mm)
         blocks = [0, 1] if reuse_blocks else [8, 9]
         sid = run_step(mgr, view, {"old": (blocks, 0, 8)}, mm={"mm": torch.full((8, 2), 100.0)})
         mgr.materialize(sid, ["old"])
-        mgr.new_step_starts(FakeSchedOut(finished=["old"]))
+        mgr.new_step_starts(PrefixCacheSchedulerAdapter().translate_step(FakeSchedOut(finished=["old"])))
 
         mgr.new_step_starts(
-            FakeSchedOut(
-                new_reqs=[FakeNewReq("a", 0, [[0, 1]]), FakeNewReq("b", 8, [[0, 1, 2]])],
-                num_scheduled={"a": 8, "b": 4},
+            PrefixCacheSchedulerAdapter().translate_step(
+                FakeSchedOut(
+                    new_reqs=[FakeNewReq("a", 0, [[0, 1]]), FakeNewReq("b", 8, [[0, 1, 2]])],
+                    num_scheduled={"a": 8, "b": 4},
+                )
             )
         )
         old_prefetch = dict(mgr._hit_prefetch["b"])
@@ -1390,7 +1423,8 @@ def test_same_step_hit_refreshes_prefetch_after_write(reuse_blocks, deferred_mm)
         view.computed.update(a=0, b=8)
         hidden = torch.cat([torch.full((8, HIDDEN), 20.0), torch.full((4, HIDDEN), 30.0)])
         mm = torch.cat([torch.full((8, 2), 200.0), torch.full((4, 2), 300.0)])
-        sid = mgr.save_outputs(hidden, {"mm": mm}, num_tokens_unpadded=12, num_tokens_padded=12)
+        layout = PrefixCacheSchedulerAdapter().build_write_layout(view, num_scheduled_tokens={"a": 8, "b": 4})
+        sid = mgr.save_outputs(hidden, {"mm": mm}, num_tokens_unpadded=12, num_tokens_padded=12, write_layout=layout)
         outs = mgr.materialize(sid, ["a", "b"])
 
         assert torch.equal(outs.hidden_states["b"][:8], hidden[:8])

@@ -20,13 +20,15 @@ Two layers of protection, both pure CPU:
 """
 
 import ast
+import copy
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
 
-from vllm_omni.core.prefix_cache.interface import PrefixCacheConfig
+from vllm_omni.core.prefix_cache.adapter import PrefixCacheSchedulerAdapter
+from vllm_omni.core.prefix_cache.interface import PrefixCacheConfig, StageCacheOutputs
 from vllm_omni.core.prefix_cache.manager import OmniPrefixCacheManager
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -45,7 +47,11 @@ def _named_tuple_fields(path: Path, class_name: str) -> list[str]:
     tree = ast.parse(path.read_text())
     for node in ast.walk(tree):
         if isinstance(node, ast.ClassDef) and node.name == class_name:
-            return [stmt.target.id for stmt in node.body if isinstance(stmt, ast.AnnAssign)]
+            return [
+                stmt.target.id
+                for stmt in node.body
+                if isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name)
+            ]
     raise AssertionError(f"{class_name} not found in {path}")
 
 
@@ -75,6 +81,52 @@ def test_execute_model_state_keeps_prefix_cache_sid_last():
     assert gpu_fields[-1] == "prefix_cache_step_id"
 
 
+def test_npu_output_builder_views_then_acks_delivery_after_connector():
+    tree = ast.parse(_NPU_RUNNER.read_text())
+    sample = next(node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name == "sample_tokens")
+    calls = {
+        node.func.attr: node.lineno
+        for node in ast.walk(sample)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr in {"delivery_view", "ack_delivery", "get_omni_connector_output"}
+    }
+    assert calls["delivery_view"] < calls["get_omni_connector_output"] < calls["ack_delivery"]
+
+
+def test_npu_partial_downstream_hidden_uses_only_unseen_scheduled_rows():
+    tree = ast.parse(_NPU_RUNNER.read_text())
+    sample = next(node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name == "sample_tokens")
+    per_req_hidden = next(
+        node
+        for node in ast.walk(sample)
+        if isinstance(node, ast.If)
+        and any(
+            isinstance(stmt, ast.Assign)
+            and any(isinstance(target, ast.Name) and target.id == "req_hidden_states" for target in stmt.targets)
+            for stmt in node.body
+        )
+    )
+    branch = ast.fix_missing_locations(ast.Module(body=copy.deepcopy(per_req_hidden.body), type_ignores=[]))
+    scope = {
+        "req_hidden_states_cpu": {"r1": torch.tensor([[40.0], [50.0]])},
+        "delivery": StageCacheOutputs(
+            hidden_states=None,
+            mm_outputs={},
+            token_ranges={"r1": (5, 6)},
+            scheduled_token_ranges={"r1": (4, 6)},
+        ),
+        "rid": "r1",
+        "max": max,
+    }
+    exec(compile(branch, str(_NPU_RUNNER), "exec"), scope)
+    assert scope["req_hidden_states"].flatten().tolist() == [50.0]
+
+    scope["delivery"] = None
+    exec(compile(branch, str(_NPU_RUNNER), "exec"), scope)
+    assert scope["req_hidden_states"].flatten().tolist() == [40.0, 50.0]
+
+
 class _FakeView:
     """Minimal group-view double (mirrors tests/core/test_prefix_cache)."""
 
@@ -94,6 +146,10 @@ class _FakeView:
 
     def batch_req_ids(self) -> list[str]:
         return list(self.order)
+
+    def token_range(self, req_id, count):
+        start = self.computed.get(req_id, 0)
+        return start, start + count
 
     def step_slots_cpu(self, req_ids, num_scheduled) -> torch.Tensor:
         parts = []
@@ -119,8 +175,16 @@ def _run_step(mgr, view, req_id, blocks, start_pos, sched, *, hit=0, finished=()
         finished_req_ids=set(finished),
         num_scheduled_tokens={req_id: sched},
     )
-    mgr.new_step_starts(sched_out)
-    return mgr.save_outputs(hidden, {}, num_tokens_unpadded=sched, num_tokens_padded=sched)
+    adapter = PrefixCacheSchedulerAdapter()
+    mgr.new_step_starts(adapter.translate_scheduler_output(sched_out))
+    layout = adapter.build_write_layout(view, num_scheduled_tokens=sched_out.num_scheduled_tokens)
+    return mgr.save_outputs(
+        hidden,
+        {},
+        num_tokens_unpadded=sched,
+        num_tokens_padded=sched,
+        write_layout=layout,
+    )
 
 
 def _expected_rows(slots: torch.Tensor) -> torch.Tensor:
@@ -134,7 +198,7 @@ def _make_npu_mode_manager(monkeypatch) -> tuple[OmniPrefixCacheManager, _FakeVi
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
     view = _FakeView()
     config = PrefixCacheConfig(num_blocks=NUM_BLOCKS, block_size=BLOCK_SIZE)
-    return OmniPrefixCacheManager(config, view), view
+    return OmniPrefixCacheManager(config), view
 
 
 def test_npu_mode_auto_selects_eager_and_roundtrips(monkeypatch):

@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Regression tests for vllm-project/vllm-omni#5349 (P1): normal completion
 goes through _free_request(), not finish_requests() (the external
 abort/cancel entry point). Without a cleanup_receiver() call there,
@@ -47,6 +50,7 @@ class _FakeFinishedRequest:
 
     def __init__(self, request_id: str) -> None:
         self.request_id = request_id
+        self.status = RequestStatus.FINISHED_STOPPED
 
     def is_finished(self) -> bool:
         return True
