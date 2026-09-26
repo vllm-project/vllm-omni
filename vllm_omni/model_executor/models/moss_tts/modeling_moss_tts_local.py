@@ -23,7 +23,7 @@ previous KV-cache loop -- causal attention, only the last position is read.
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 
 import torch
 import torch.nn as nn
@@ -145,6 +145,7 @@ def _sample_token(
     top_p: float,
     do_sample: bool,
     generator: torch.Generator | None = None,
+    generators: Sequence[torch.Generator | None] | None = None,
 ) -> torch.Tensor:
     """Top-k + top-p sampling for the upstream inference branch.
 
@@ -153,6 +154,10 @@ def _sample_token(
     vocabulary. This preserves the categorical distribution when the top-k
     boundary has no ties, but it is not seed/bit equivalent to multinomial over
     a full-vocabulary tensor because random-number mapping depends on width.
+
+    When ``generators`` is provided (per-row), each row is sampled with its
+    own generator via separate ``multinomial`` calls. This keeps the rest of
+    the forward batched while making seeded requests reproducible per-row.
     """
     if not do_sample or temperature <= 0:
         return logits.argmax(dim=-1)
@@ -181,8 +186,21 @@ def _sample_token(
             logits = torch.full_like(logits, float("-inf")).scatter_(-1, sorted_indices, logits)
 
     probs = F.softmax(logits, dim=-1)
-    flat = probs.reshape(-1, probs.shape[-1])
-    sampled = torch.multinomial(flat, num_samples=1, generator=generator).reshape(probs.shape[:-1])
+
+    if generators is not None and any(g is not None for g in generators):
+        B = probs.shape[0]
+        rows = []
+        for row in range(B):
+            gen = generators[row] if row < len(generators) else None
+            row_probs = probs[row : row + 1]
+            flat = row_probs.reshape(-1, row_probs.shape[-1])
+            sampled = torch.multinomial(flat, num_samples=1, generator=gen)
+            rows.append(sampled)
+        sampled = torch.cat(rows, dim=0).reshape(probs.shape[:-1])
+    else:
+        flat = probs.reshape(-1, probs.shape[-1])
+        sampled = torch.multinomial(flat, num_samples=1, generator=generator).reshape(probs.shape[:-1])
+
     if compact_indices is not None:
         return compact_indices.gather(-1, sampled.unsqueeze(-1)).squeeze(-1)
     return sampled
