@@ -44,6 +44,7 @@ recipes/
 | -------- | ------ | ---------- |
 | [`Baidu/ERNIE-Image.md`](./Baidu/ERNIE-Image.md) | Text-to-image online serving (ERNIE-Image 8B) | 1x or 2x RTX 4090 24GB |
 | [`Bagel/BAGEL-7B-MoT.md`](./Bagel/BAGEL-7B-MoT.md) | Text-to-image with shared online/offline examples | 1x A100 80GB / 2x CUDA GPUs |
+| [`black-forest-labs/FLUX.2-klein-4B.md`](./black-forest-labs/FLUX.2-klein-4B.md) | Offline text-to-image generation with FLUX.2-klein-4B | 1x NVIDIA L40S 48GB |
 | [`black-forest-labs/FLUX.1-schnell.md`](./black-forest-labs/FLUX.1-schnell.md) | Offline text-to-image generation with CPU offload | 1x NVIDIA GeForce RTX 5090 32GB |
 | [`black-forest-labs/FLUX.2-klein.md`](./black-forest-labs/FLUX.2-klein.md) | Offline image editing (FLUX.2-klein-4B) | 1x Intel Arc Pro B70 32GB |
 | [`Boogu/Boogu-Image.md`](./Boogu/Boogu-Image.md) | Text-to-image online serving (Boogu-Image-0.1-Base) | 1x A100/H100 40GB+ |
