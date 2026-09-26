@@ -67,12 +67,13 @@ def create_block_causal_mask(index: torch.Tensor):
     return torch.where(mask[None, None], 0.0, float("-inf"))
 
 
-def prepare_flash_kv_cache(past_key_values, current_len: int, batch_size: int):
+def prepare_flash_kv_cache(past_key_values, current_len: int, batch_size: int, layer_idx: int | None = None):
     """Convert prefix cache [B,H,S,D] → flash layout [B,S,H,D] and
     preallocate buffers for [prefix + current] tokens."""
     if past_key_values is None:
         return
-    for layer in past_key_values.layers:
+    layers = past_key_values.layers if layer_idx is None else (past_key_values.layers[layer_idx],)
+    for layer in layers:
         past_k, past_v = layer.keys, layer.values
         if past_k is None or past_v is None:
             layer.flash_prefix_len = 0
@@ -105,6 +106,19 @@ def clear_flash_kv_cache(past_key_values):
         for attr in ("flash_prefix_len", "flash_total_len", "flash_k_cache", "flash_v_cache"):
             if hasattr(layer, attr):
                 delattr(layer, attr)
+
+
+def write_packed_image_kv(layer, key_bshd: torch.Tensor, value_bshd: torch.Tensor):
+    """Fill the reserved image-token slots in a packed prefix cache."""
+    batch_size, image_tokens = key_bshd.shape[:2]
+    positions = layer.sensenova_image_positions
+    if positions.numel() != batch_size * image_tokens:
+        raise ValueError("SenseNova packed image positions do not match the denoise batch")
+    keys = layer.keys.transpose(1, 2)
+    values = layer.values.transpose(1, 2)
+    keys.index_copy_(1, positions, key_bshd.reshape(1, batch_size * image_tokens, *key_bshd.shape[2:]))
+    values.index_copy_(1, positions, value_bshd.reshape(1, batch_size * image_tokens, *value_bshd.shape[2:]))
+    return keys, values
 
 
 # ---------------------------------------------------------------------------
@@ -326,7 +340,6 @@ class SenseNovaU1Attention(nn.Module):
             num_kv_heads=self.num_kv_heads,
             prefix=f"{prefix}.attn",
         )
-        self.attn.attention = self.attn.sdpa_fallback
 
     @staticmethod
     def _align_mask_dtype(mask: torch.Tensor | None, query: torch.Tensor) -> torch.Tensor | None:
@@ -334,6 +347,71 @@ class SenseNovaU1Attention(nn.Module):
         if mask is None or not mask.is_floating_point() or mask.dtype == query.dtype:
             return mask
         return mask.to(query.dtype)
+
+    @staticmethod
+    def _plain_causal_spans(
+        attention_mask: torch.Tensor | None,
+        query: torch.Tensor,
+        key: torch.Tensor,
+    ) -> list[list[tuple[int, int]]] | None:
+        """Represent an exact additive causal mask with piecewise metadata.
+
+        FlashAttention cannot consume SenseNova's four-dimensional additive
+        mask directly.  An empty full-attention span list is equivalent only
+        when the mask is precisely a lower-triangular causal matrix.  All
+        other masks retain their SDPA path below.
+        """
+        if (
+            attention_mask is None
+            or attention_mask.ndim != 4
+            or query.shape[1] != key.shape[1]
+            or attention_mask.shape[-2:] != (query.shape[1], key.shape[1])
+            or attention_mask.shape[0] not in (1, query.shape[0])
+        ):
+            return None
+        expected = torch.ones(
+            (query.shape[1], key.shape[1]),
+            dtype=torch.bool,
+            device=attention_mask.device,
+        ).tril()
+        allowed = attention_mask.eq(0)
+        additive = (attention_mask == 0) | torch.isneginf(attention_mask)
+        if not bool(additive.all()) or not bool((allowed == expected).all()):
+            return None
+        return [[] for _ in range(query.shape[0])]
+
+    def _attn_metadata(
+        self,
+        attention_mask: torch.Tensor | None,
+        query: torch.Tensor,
+        key: torch.Tensor,
+    ) -> AttentionMetadata | None:
+        if attention_mask is None:
+            return None
+        spans = self._plain_causal_spans(attention_mask, query, key)
+        if spans is not None and self.attn.attn_backend.supports_piecewise_spans:
+            return AttentionMetadata(full_attn_spans=spans)
+        return AttentionMetadata(attn_mask=attention_mask)
+
+    def _native_padding_mask_supported(
+        self,
+        attention_mask: torch.Tensor | None,
+        query: torch.Tensor,
+        key: torch.Tensor,
+    ) -> bool:
+        """Whether the selected backend can consume a key-padding mask.
+
+        A 2-D boolean mask is the shared backend contract for varlen padding.
+        Keep arbitrary additive and structural masks on SenseNova's explicit
+        SDPA fallback; they cannot be reduced to independent ragged rows.
+        """
+        return bool(
+            attention_mask is not None
+            and attention_mask.dtype == torch.bool
+            and attention_mask.ndim == 2
+            and attention_mask.shape == (query.shape[0], key.shape[1])
+            and self.attn.attn_backend.supports_attention_mask(getattr(self.attn, "attn_spec", None))
+        )
 
     def _run_attn(
         self,
@@ -347,7 +425,13 @@ class SenseNovaU1Attention(nn.Module):
         k = key_bhsd.transpose(1, 2).contiguous()
         v = value_bhsd.transpose(1, 2).contiguous()
         attention_mask = self._align_mask_dtype(attention_mask, q)
-        attn_metadata = AttentionMetadata(attn_mask=attention_mask) if attention_mask is not None else None
+        attn_metadata = self._attn_metadata(attention_mask, q, k)
+        if (
+            attn_metadata is not None
+            and attn_metadata.attn_mask is not None
+            and not self._native_padding_mask_supported(attn_metadata.attn_mask, q, k)
+        ):
+            return self.attn.sdpa_fallback.forward(q, k, v, attn_metadata)
         return self.attn(q, k, v, attn_metadata)
 
     def _run_attn_bshd(
@@ -359,7 +443,13 @@ class SenseNovaU1Attention(nn.Module):
     ) -> torch.Tensor:
         """Run unified attention with [B, S, H, D] inputs. Returns [B, S, H, D]."""
         attention_mask = self._align_mask_dtype(attention_mask, query_bshd)
-        attn_metadata = AttentionMetadata(attn_mask=attention_mask) if attention_mask is not None else None
+        attn_metadata = self._attn_metadata(attention_mask, query_bshd, key_bshd)
+        if (
+            attn_metadata is not None
+            and attn_metadata.attn_mask is not None
+            and not self._native_padding_mask_supported(attn_metadata.attn_mask, query_bshd, key_bshd)
+        ):
+            return self.attn.sdpa_fallback.forward(query_bshd, key_bshd, value_bshd, attn_metadata)
         return self.attn(query_bshd, key_bshd, value_bshd, attn_metadata)
 
     def _project_and_rope(self, hidden_states, position_embeddings, qkv_proj, q_norm, k_norm, q_norm_hw, k_norm_hw):
@@ -477,6 +567,29 @@ class SenseNovaU1Attention(nn.Module):
         )
         update_cache = kwargs.get("update_cache", True)
 
+        if past_key_values is not None and not update_cache:
+            layer = past_key_values.layers[self.layer_idx]
+            if getattr(layer, "sensenova_packed_varlen", False):
+                q = query_states.transpose(1, 2).contiguous()
+                k_cur = key_states.transpose(1, 2).contiguous()
+                v_cur = value_states.transpose(1, 2).contiguous()
+                batch_size, query_length = q.shape[:2]
+                k, v = write_packed_image_kv(layer, k_cur, v_cur)
+                packed_metadata = AttentionMetadata(
+                    extra={
+                        "cu_seqlens_q": layer.sensenova_cu_seqlens_q,
+                        "cu_seqlens_k": layer.sensenova_cu_seqlens_k,
+                        "max_seqlen_q": query_length,
+                        "max_seqlen_k": layer.sensenova_max_seqlen_k,
+                    }
+                )
+                q = q.reshape(1, batch_size * query_length, *q.shape[2:])
+                attn_output = self.attn(q, k, v, packed_metadata)
+                attn_output = attn_output.reshape(batch_size, query_length, *attn_output.shape[2:])
+                attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+                attn_output, _ = self.o_proj_mot_gen(attn_output)
+                return attn_output
+
         if attention_mask is None:
             # Bidirectional path: no causal mask, optionally attend to a prefix.
             q = query_states.transpose(1, 2).contiguous()  # [B,S,H,D]
@@ -490,6 +603,15 @@ class SenseNovaU1Attention(nn.Module):
                     v = value_states.transpose(1, 2).contiguous()
                 else:
                     layer = past_key_values.layers[self.layer_idx]
+                    if not hasattr(layer, "flash_k_cache"):
+                        # A CFG branch may never be used on its own. Allocate
+                        # dense image KV only when this layer actually reads it.
+                        prepare_flash_kv_cache(
+                            past_key_values,
+                            current_len=k_cur.shape[1],
+                            batch_size=q.shape[0],
+                            layer_idx=self.layer_idx,
+                        )
                     if hasattr(layer, "flash_k_cache") and layer.flash_k_cache is not None:
                         prefix_len = layer.flash_prefix_len
                         cur_len = k_cur.shape[1]
@@ -716,10 +838,13 @@ class SenseNovaU1Model(nn.Module):
             causal_mask_mapping = attention_mask
 
         hidden_states = inputs_embeds
+        # [3, S] broadcasts one request's positions across its images. A
+        # request batch carries [3, B, S], retaining each prefix's true offset.
+        position_ids = indexes.unsqueeze(1) if indexes.ndim == 2 else indexes
         position_embeddings = (
-            self.rotary_emb(hidden_states, indexes[0].unsqueeze(0)),
-            self.rotary_emb_hw(hidden_states, indexes[1].unsqueeze(0)),
-            self.rotary_emb_hw(hidden_states, indexes[2].unsqueeze(0)),
+            self.rotary_emb(hidden_states, position_ids[0]),
+            self.rotary_emb_hw(hidden_states, position_ids[1]),
+            self.rotary_emb_hw(hidden_states, position_ids[2]),
         )
         for layer in self.layers:
             hidden_states = layer(

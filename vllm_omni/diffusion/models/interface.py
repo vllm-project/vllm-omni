@@ -154,6 +154,52 @@ def supports_step_execution(pipeline: object) -> bool:
 
 
 @runtime_checkable
+class SupportsResumablePrepare(Protocol):
+    """Optional companion to :class:`SupportsStepExecution` for a looping prepare phase.
+
+    ``prepare_encode()`` is one-time request setup, so the runner calls it once
+    and only reaches ``denoise_step()`` after it returns. A unified model whose
+    request starts with autoregressive decode runs that decode inside the
+    prepare phase, and that single call then lasts as long as the decode does
+    while every other scheduled request waits on it.
+
+    A pipeline that implements this protocol keeps the decode loop, and lets the
+    runner leave it between two steps: ``prepare_encode()`` sets the request up
+    and stops at the first step boundary, ``prepare_step()`` advances one step,
+    and ``prepare_steps_remaining()`` reports when there is nothing left to do.
+    Cross-step decode state belongs in ``StepRequestState.extra`` like any other
+    pipeline-private state. What the runner does with the tick it gets back is
+    up to the pipeline's own batching limits: one that admits several requests
+    denoises the others, one restricted to a single request only regains a
+    scheduling boundary between tokens.
+
+    A request may finish inside the prepare phase: a pipeline that produces text
+    leaves ``state.timesteps`` unset, and the runner decodes its output as soon
+    as ``prepare_steps_remaining()`` returns ``None``.
+    """
+
+    supports_resumable_prepare: ClassVar[bool] = True
+
+    def prepare_steps_remaining(self, state: StepRequestState) -> int | None:
+        """Upper bound on remaining prepare steps. ``None`` or ``0`` both mean the phase is done.
+
+        The bound may exceed the number of steps actually taken: a decode loop
+        stops on an end token, which is not known in advance.
+        """
+        ...
+
+    def prepare_step(self, state: StepRequestState) -> None:
+        """Advance the prepare phase of ``state`` by one step."""
+        ...
+
+
+def supports_resumable_prepare(pipeline: object) -> bool:
+    """Return whether `pipeline` implements :class:`SupportsResumablePrepare`."""
+
+    return isinstance(pipeline, SupportsResumablePrepare)
+
+
+@runtime_checkable
 class SupportsInteractionApply(Protocol):
     """Optional protocol for pipelines with unified mid-generation, chunk-boundary hooks."""
 

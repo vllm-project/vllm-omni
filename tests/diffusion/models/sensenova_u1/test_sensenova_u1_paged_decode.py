@@ -10,7 +10,7 @@ eagerly and silently wrong once captured, because capture bakes it in -- which
 is exactly what the last test here pins.
 """
 
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 
 import pytest
 import torch
@@ -713,7 +713,7 @@ def test_a_second_request_replays_the_first_capture(monkeypatch):
 
 
 class _Tok:
-    """The two tokenizer calls ``_generate_text`` makes."""
+    """The two tokenizer calls the text decode loop makes."""
 
     EOS = 7
 
@@ -731,7 +731,7 @@ class _Out:
 
 
 class _TextHost:
-    """Carries only what ``_generate_text`` touches."""
+    """Carries only what the text decode loop touches."""
 
     def __init__(self, context):
         self._context = context
@@ -761,7 +761,11 @@ def test_text_decoding_uses_the_paged_context_too():
     host = _TextHost(context)
     prefix = torch.full((1, 1, 8), -1.0)
     prefix[0, 0, 5] = 1.0  # not EOS, so one step runs
-    SenseNovaU1Pipeline._generate_text(host, prefix, past_key_values=None, t_idx=0)
+    begin = MethodType(SenseNovaU1Pipeline._begin_text, host)
+    step = MethodType(SenseNovaU1Pipeline._text_step, host)
+    cursor = begin(prefix, None, 0)
+    while not cursor.finished:
+        step(cursor)
     assert host.seen == [context], f"text decoding ran with decode={host.seen}"
 
 
