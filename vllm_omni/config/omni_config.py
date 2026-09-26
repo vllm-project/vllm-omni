@@ -1720,6 +1720,10 @@ class BaseVllmOmniStageConfig:
         return self.stage_pipeline_config.requires_multimodal_data
 
     @property
+    def bypass_without_modalities(self) -> tuple[str, ...]:
+        return tuple(self.stage_pipeline_config.bypass_without_modalities)
+
+    @property
     def prompt_expand_func(self) -> str | None:
         return self.stage_pipeline_config.prompt_expand_func
 

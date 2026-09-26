@@ -284,6 +284,10 @@ class StagePipelineConfig:
     # Whether the non-async path waits for a complete upstream payload from
     # the model-runner connector before scheduling this stage.
     requires_full_payload_input: bool = False
+    # Stage 0 only: a chat request carrying none of these input modalities
+    # skips this stage and enters at stage 1 (e.g. Qwen3-ASR runs only for
+    # requests with audio). Empty means every request runs it.
+    bypass_without_modalities: tuple[str, ...] = ()
     extras: dict[str, Any] = field(default_factory=dict)
 
 

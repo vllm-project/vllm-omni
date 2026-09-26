@@ -37,6 +37,7 @@ from vllm.v1.metrics.stats import IterationStats
 from vllm_omni.diffusion.data import is_diffusion_request_started_output
 from vllm_omni.distributed.omni_connectors.utils.config import stage_receives_chunks
 from vllm_omni.engine import OmniEngineCoreRequest
+from vllm_omni.engine.async_engine_utils import apply_omni_final_stage_metadata
 from vllm_omni.engine.cfg_companion_tracker import CfgCompanionTracker
 from vllm_omni.engine.errors import NativeKVHandoffError
 from vllm_omni.engine.membership_controller import MembershipController
@@ -1871,6 +1872,31 @@ class OrchestratorBase:
             additional_information=additional_information,
         )
 
+    def _build_entry_stage_request(
+        self,
+        req_id: str,
+        stage_id: int,
+        prompt: Any,
+        req_state: OrchestratorRequestState,
+    ) -> Any:
+        """Process the raw prompt of a request that bypasses stage 0.
+
+        This stage's input processor also prepares the prompts forwarded to it,
+        so it stays the only multimodal cache sender of the stage's engine core
+        (vLLM mirrors the sender and engine-core caches in submission order).
+        """
+        processor = self._get_stage_input_processor(stage_id)
+        request = processor.process_inputs(
+            request_id=req_id,
+            prompt=prompt,
+            params=req_state.sampling_params_list[stage_id],
+            supported_tasks=("generate",),
+            arrival_time=req_state.request_timestamp,
+        )
+        request = self._upgrade_processed_stage_request(request, prompt)
+        request.external_req_id = req_id
+        return apply_omni_final_stage_metadata(request, req_state.final_stage_id)
+
     def _next_stage_input_is_tokens(self, next_input: Any) -> bool:
         return isinstance(next_input, dict) and "prompt_token_ids" in next_input
 
@@ -2797,7 +2823,7 @@ class Orchestrator(OrchestratorBase):
 
     async def _handle_add_request(self, msg: StageSubmissionMessage) -> None:
         """Handle an add_request message from the main thread."""
-        stage_id = 0
+        stage_id = msg.entry_stage_id
         request_id = msg.request_id
         prompt = msg.prompt
         original_prompt = msg.original_prompt
@@ -2847,6 +2873,17 @@ class Orchestrator(OrchestratorBase):
         preprocess_ms = msg.preprocess_ms
         if preprocess_ms > 0:
             req_state.pipeline_timings["preprocess_ms"] = preprocess_ms
+        if stage_id != 0:
+            _t_preprocess = _time.perf_counter()
+            try:
+                prompt = self._build_entry_stage_request(request_id, stage_id, prompt, req_state)
+            except Exception as exc:
+                # Rejected input (too long, invalid media, ...), which the stage-0
+                # path raises before admission: fail only this request.
+                logger.warning("[Orchestrator] req=%s: stage-%s rejected the prompt: %s", request_id, stage_id, exc)
+                await self._fail_request_client_error(request_id, stage_id, str(exc))
+                return
+            req_state.pipeline_timings["preprocess_ms"] = (_time.perf_counter() - _t_preprocess) * 1000.0
         if not await self._dispatch_or_fail_request(
             lambda: self.stage_pools[stage_id].submit_initial(
                 request_id,

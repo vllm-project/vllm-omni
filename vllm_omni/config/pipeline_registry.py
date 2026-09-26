@@ -74,6 +74,7 @@ from vllm_omni.model_executor.models.indextts2.pipeline import (
     INDEXTTS25_PIPELINE,
 )
 from vllm_omni.model_executor.models.joyai_vl_interaction.pipeline import (
+    JOYAI_VL_INTERACTION_ASR_PIPELINE,
     JOYAI_VL_INTERACTION_PIPELINE,
 )
 from vllm_omni.model_executor.models.lance.pipeline import LANCE_PIPELINE
@@ -134,6 +135,8 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "aura_omni": AURA_OMNI_PIPELINE,
     "breeze": BREEZE_TTS_2_PIPELINE,
     "joyai_vl_interaction": JOYAI_VL_INTERACTION_PIPELINE,
+    # Opt-in audio-input profile (deploy/joyai_vl_interaction_asr.yaml): Qwen3-ASR before JoyAI.
+    "joyai_vl_interaction_asr": JOYAI_VL_INTERACTION_ASR_PIPELINE,
     "qwen2_5_omni": QWEN2_5_OMNI_PIPELINE,
     "qwen2_5_omni_thinker_only": QWEN2_5_OMNI_THINKER_ONLY_PIPELINE,
     "personaplex": PERSONAPLEX_PIPELINE,

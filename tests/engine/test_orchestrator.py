@@ -17,7 +17,7 @@ import janus
 import pytest
 from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.sampling_params import SamplingParams
-from vllm.v1.engine import EngineCoreOutput, EngineCoreOutputs, FinishReason
+from vllm.v1.engine import EngineCoreOutput, EngineCoreOutputs, EngineCoreRequest, FinishReason
 from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.metrics.stats import IterationStats
 
@@ -521,6 +521,7 @@ async def _enqueue_add_request(
     sampling_params_list,
     final_stage_id: int,
     final_output_stage_ids: list[int] | None = None,
+    entry_stage_id: int = 0,
 ) -> None:
     orchestrator_fixture.request_sync_q.put_nowait(
         StageSubmissionMessage(
@@ -535,6 +536,7 @@ async def _enqueue_add_request(
             preprocess_ms=0.0,
             request_timestamp=time.time(),
             enqueue_ts=time.perf_counter(),
+            entry_stage_id=entry_stage_id,
         )
     )
 
@@ -609,6 +611,59 @@ async def test_run_two_stage_llm(orchestrator_factory) -> None:
         assert output_msg.finished is True
         assert output_msg.engine_outputs.request_id == "req-llm"
         assert "req-llm" not in orchestrator_fixture.orchestrator.request_states
+    finally:
+        await _shutdown_orchestrator(orchestrator_fixture)
+
+
+@pytest.mark.asyncio
+async def test_add_request_bypassing_stage0_enters_at_stage1(orchestrator_factory) -> None:
+    """A raw prompt with ``entry_stage_id=1`` is processed by stage 1's input processor
+    (the one that also prepares prompts forwarded to it) and never reaches stage 0."""
+    stage0 = FakeStageClient(stage_type="llm", final_output=False)
+    stage1 = FakeStageClient(stage_type="llm", final_output=True)
+    processors = [
+        FakeOutputProcessor(request_outputs=[]),
+        FakeOutputProcessor(request_outputs=[_build_request_output("req-bypass", token_ids=[10, 11], finished=True)]),
+    ]
+    orchestrator_fixture = orchestrator_factory([stage0, stage1], output_processors=processors)
+    raw_prompt = {"prompt_token_ids": [1, 2, 3], "multi_modal_data": {"image": ["frame-0"]}}
+    processed_prompts: list[Any] = []
+
+    def process_inputs(*, request_id, prompt, params, **kwargs):
+        processed_prompts.append(prompt)
+        return EngineCoreRequest(
+            request_id=request_id,
+            prompt_token_ids=[4, 5, 6],
+            mm_features=None,
+            sampling_params=params,
+            pooling_params=None,
+            arrival_time=0.0,
+            lora_request=None,
+            cache_salt=None,
+            data_parallel_rank=None,
+        )
+
+    orchestrator_fixture.orchestrator._stage_input_processors[1] = SimpleNamespace(process_inputs=process_inputs)
+
+    try:
+        await _enqueue_add_request(
+            orchestrator_fixture,
+            request_id="req-bypass",
+            prompt=raw_prompt,
+            original_prompt=raw_prompt,
+            sampling_params_list=[_sampling_params(), _sampling_params()],
+            final_stage_id=1,
+            entry_stage_id=1,
+        )
+
+        await _wait_for(lambda: len(stage1.add_request_calls) == 1)
+        assert processed_prompts == [raw_prompt]
+        assert stage1.add_request_calls[0][0].prompt_token_ids == [4, 5, 6]
+        stage1.push_engine_core_outputs(_engine_core_outputs("stage1-raw", 1.0))
+
+        output_msg = await _get_output_message(orchestrator_fixture)
+        assert (output_msg.request_id, output_msg.stage_id, output_msg.finished) == ("req-bypass", 1, True)
+        assert stage0.add_request_calls == []
     finally:
         await _shutdown_orchestrator(orchestrator_fixture)
 

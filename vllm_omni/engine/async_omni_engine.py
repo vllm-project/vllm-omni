@@ -261,6 +261,7 @@ class AsyncOmniEngine(OmniEngineBase):
         *,
         resumable: bool = False,
         message_type: Literal["add_request", "streaming_update"] = "add_request",
+        entry_stage_id: int = 0,
     ) -> StageSubmissionMessage:
         """Build an add_request message after stage-0 preprocessing."""
         request_timestamp = float(arrival_time) if arrival_time is not None else time.time()
@@ -291,7 +292,15 @@ class AsyncOmniEngine(OmniEngineBase):
         stage_type = self.stage_metadata[0].stage_type
         output_prompt_text: Any = None
         _preprocess_ms = 0.0
-        if stage_type != "diffusion" and not isinstance(prompt, EngineCoreRequest):
+        if entry_stage_id:
+            # The request bypasses stage 0: its prompt stays raw for the entry
+            # stage's input processor (Orchestrator._build_entry_stage_request).
+            for item in prompt if isinstance(prompt, list) else [prompt]:
+                inject_global_id(item, request_id)
+            output_prompt_text = prompt_text
+            if output_prompt_text is None and isinstance(prompt, dict):
+                output_prompt_text = prompt.get("prompt")
+        elif stage_type != "diffusion" and not isinstance(prompt, EngineCoreRequest):
             # Stage transforms and downstream stages must share the same
             # request identity, including when the transform replaces the
             # prompt object.
@@ -401,6 +410,7 @@ class AsyncOmniEngine(OmniEngineBase):
             request_timestamp=request_timestamp,
             enqueue_ts=time.perf_counter(),
             request_artifact_dirs=request_artifact_dirs or None,
+            entry_stage_id=entry_stage_id,
         )
 
     def _build_cfg_companions(
@@ -519,6 +529,7 @@ class AsyncOmniEngine(OmniEngineBase):
         reasoning_ended: bool | None = None,
         *,
         resumable: bool = False,
+        entry_stage_id: int = 0,
     ) -> None:
         """Process stage-0 input locally, then send to the Orchestrator.
 
@@ -543,6 +554,7 @@ class AsyncOmniEngine(OmniEngineBase):
                 data_parallel_rank=data_parallel_rank,
                 reasoning_ended=reasoning_ended,
                 resumable=resumable,
+                entry_stage_id=entry_stage_id,
             )
         except BaseException:
             if isinstance(prompt, dict):
@@ -600,6 +612,7 @@ class AsyncOmniEngine(OmniEngineBase):
         reasoning_ended: bool | None = None,
         *,
         resumable: bool = False,
+        entry_stage_id: int = 0,
     ) -> None:
         """Async add_request API."""
         self.add_request(
@@ -617,6 +630,7 @@ class AsyncOmniEngine(OmniEngineBase):
             data_parallel_rank=data_parallel_rank,
             reasoning_ended=reasoning_ended,
             resumable=resumable,
+            entry_stage_id=entry_stage_id,
         )
 
     def add_streaming_update(
