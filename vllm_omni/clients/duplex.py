@@ -48,6 +48,7 @@ from uuid import uuid4
 
 import pybase64 as base64
 
+from vllm_omni.clients.duplex_trace import DuplexTrace
 from vllm_omni.clients.utils import (
     _finite_metric_values,
     _finite_number,
@@ -1127,8 +1128,10 @@ class DuplexClient(DuplexClientBase):
         heartbeat_interval_s: float | None = 30.0,
         handshake_timeout_s: float = 30.0,
         connect: ConnectFn | None = None,
+        trace: DuplexTrace | None = None,
     ) -> None:
         super().__init__(model=model, config=config, handshake_timeout_s=handshake_timeout_s)
+        self._trace = trace
         self.url = url
         self.resume_token: str | None = None
         self._reconnect = reconnect
@@ -1154,7 +1157,7 @@ class DuplexClient(DuplexClientBase):
     async def _send_command(self, payload: dict[str, object]) -> None:
         if self._ws is None:
             raise DuplexConnectionError("send failed: transport is not connected")
-        await self._ws.send(json.dumps(payload))
+        await self._send_on(self._ws, payload)
 
     async def _teardown(self) -> None:
         for task in (self._heartbeat_task, self._reader_task):
@@ -1171,6 +1174,11 @@ class DuplexClient(DuplexClientBase):
                 pass
 
     # -- internals ---------------------------------------------------------------
+
+    async def _send_on(self, ws: WebSocketTransport, payload: dict[str, object]) -> None:
+        await ws.send(json.dumps(payload))
+        if self._trace is not None:
+            self._trace.record("send", payload)
 
     def _target_url(self) -> str:
         parts = urlsplit(self.url)
@@ -1223,7 +1231,7 @@ class DuplexClient(DuplexClientBase):
         seq = data.get("server_event_seq")
         if isinstance(seq, int) and not self._closed.is_set() and self._ws is not None:
             try:
-                await self._ws.send(json.dumps({"type": "session.event_ack", "server_event_seq": seq}))
+                await self._send_on(self._ws, {"type": "session.event_ack", "server_event_seq": seq})
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -1241,6 +1249,8 @@ class DuplexClient(DuplexClientBase):
                     except json.JSONDecodeError:
                         continue
                     if isinstance(data, dict):
+                        if self._trace is not None:
+                            self._trace.record("receive", data)
                         await self._dispatch(data)
             except asyncio.CancelledError:
                 raise
@@ -1266,15 +1276,14 @@ class DuplexClient(DuplexClientBase):
             except Exception:
                 continue
             try:
-                await ws.send(
-                    json.dumps(
-                        {
-                            "type": "session.resume",
-                            "session_id": self.session_id,
-                            "resume_token": self.resume_token,
-                            "last_received_server_event_seq": self._last_server_event_seq or 0,
-                        }
-                    )
+                await self._send_on(
+                    ws,
+                    {
+                        "type": "session.resume",
+                        "session_id": self.session_id,
+                        "resume_token": self.resume_token,
+                        "last_received_server_event_seq": self._last_server_event_seq or 0,
+                    },
                 )
                 deadline = time.monotonic() + self._handshake_timeout_s
                 pending: list[dict[str, object]] = []
@@ -1288,6 +1297,8 @@ class DuplexClient(DuplexClientBase):
                     data = json.loads(raw)
                     if not isinstance(data, dict):
                         continue
+                    if self._trace is not None:
+                        self._trace.record("receive", data)
                     event_type = data.get("type")
                     if event_type == "session.resumed":
                         previous = self._ws
