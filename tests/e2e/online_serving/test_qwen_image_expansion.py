@@ -12,6 +12,8 @@ Nightly covers each feature once, alternating models (5× Qwen-Image, 4× Qwen-I
 Ulysses stays on Qwen-Image. See docs/user_guide/diffusion_acceleration.md.
 """
 
+import os
+
 import pytest
 
 from tests.helpers.mark import hardware_marks
@@ -26,6 +28,45 @@ PARALLEL_FEATURE_MARKS = hardware_marks(res={"cuda": ["H100", "B200"]}, num_card
 
 MODEL_IMAGE = "Qwen/Qwen-Image"
 MODEL_2512 = "Qwen/Qwen-Image-2512"
+
+
+def _is_cuda_fp8_supported() -> bool:
+    """Return True if the active CUDA device supports native FP8 (Compute Capability >= 8.9).
+
+    SM80 (e.g. A100) lacks native FP8 tensor core support and Inductor fails to
+    lower auto_functionalized_v2 under torch.compile.
+    FP8 is supported on Ada Lovelace (SM89), Hopper (SM90), and Blackwell (SM100+).
+    """
+    override = os.getenv("VLLM_TEST_ENABLE_FP8")
+    if override is not None:
+        return override.lower() in ("1", "true", "yes")
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return False
+        return torch.cuda.get_device_capability() >= (8, 9)
+    except Exception:
+        return False
+
+
+_vae_patch_parallel_server_args = [
+    "--cache-backend",
+    "cache_dit",
+    "--tensor-parallel-size",
+    "2",
+    "--vae-patch-parallel-size",
+    "2",
+    "--vae-use-tiling",
+]
+if _is_cuda_fp8_supported():
+    _vae_patch_parallel_server_args.extend(
+        [
+            "--diffusion-quantization-config",
+            '{"method":"fp8"}',
+        ]
+    )
+
 
 # One server per feature. Alternate models; keep feature pytest ids unchanged.
 FEATURE_CASES = [
@@ -101,17 +142,7 @@ FEATURE_CASES = [
     pytest.param(
         OmniServerParams(
             model=MODEL_2512,
-            server_args=[
-                "--cache-backend",
-                "cache_dit",
-                "--tensor-parallel-size",
-                "2",
-                "--vae-patch-parallel-size",
-                "2",
-                "--vae-use-tiling",
-                "--diffusion-quantization-config",
-                '{"method":"fp8"}',
-            ],
+            server_args=_vae_patch_parallel_server_args,
         ),
         id="vae_patch_parallel_2",
         marks=PARALLEL_FEATURE_MARKS,
