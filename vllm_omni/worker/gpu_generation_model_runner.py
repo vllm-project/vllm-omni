@@ -13,6 +13,7 @@ import gc
 import logging
 from collections.abc import Mapping
 from dataclasses import replace
+from typing import cast
 
 import numpy as np
 import torch
@@ -503,14 +504,14 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
         to_host.wait()
 
         inter_stage_outputs: list[dict[str, object] | None] | None
+        multimodal_outputs: list[dict[str, object] | None] | None
         if self._async_chunk:
-            inter_stage_outputs, client_outputs = partition_payload_list(per_req_payloads)
-            multimodal_outputs = [payload or {} for payload in client_outputs] if client_outputs else None
+            inter_stage_outputs, multimodal_outputs = partition_payload_list(per_req_payloads)
         else:
             # See gpu_ar_model_runner: non-async-chunk ships the full payload to the next
             # stage; #4527's (None, per_req_payloads) starved the downstream stage. (PR #4792)
-            inter_stage_outputs = list(per_req_payloads)
-            multimodal_outputs = per_req_payloads
+            inter_stage_outputs = cast(list[dict[str, object] | None], per_req_payloads)
+            multimodal_outputs = inter_stage_outputs
 
         # [Omni] Copy req_id mappings to avoid async scheduling mutation.
         req_ids_output_copy = self.input_batch.req_ids.copy()
@@ -531,7 +532,8 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
             logprobs=None,
             prompt_logprobs_dict={},
             pooler_output=None,
-            multimodal_outputs=multimodal_outputs,
+            # Preserve absent per-row client payloads; the scheduler distinguishes None from {}.
+            multimodal_outputs=multimodal_outputs,  # type: ignore[arg-type]
             inter_stage_outputs=inter_stage_outputs,
             kv_connector_output=kv_connector_output,
             num_nans_in_logits={},
