@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING, Any
 import pytest
 
 if TYPE_CHECKING:
-    from tests.helpers.runtime import OmniRunner, OmniServer
+    from tests.helpers.runtime import AsyncOmniRunner, OmniRunner, OmniServer
 
 omni_fixture_lock = threading.Lock()
 
@@ -152,3 +152,36 @@ def offline_client(omni_runner: OmniRunner):
 def omni_runner_handler(offline_client):
     """Historical alias for :func:`offline_client`."""
     return offline_client
+
+
+@pytest.fixture(scope="function")
+def async_omni_runner(
+    request: pytest.FixtureRequest,
+    run_level: str,
+) -> Generator[AsyncOmniRunner, Any, None]:
+    """Function-scoped :class:`~tests.helpers.runtime.AsyncOmniRunner` — the default
+    for live in-process ``AsyncOmni`` tests (RFC #8013).
+
+    One engine per test: no event loop is shared across tests, matching
+    pytest-asyncio's function-scoped default loop.
+    """
+    from tests.helpers.runtime import iter_async_omni
+
+    yield from iter_async_omni(request, run_level, omni_fixture_lock)
+
+
+@pytest.fixture(scope="module")
+def async_omni(
+    request: pytest.FixtureRequest,
+    run_level: str,
+) -> Generator[AsyncOmniRunner, Any, None]:
+    """Module-scoped :class:`~tests.helpers.runtime.AsyncOmniRunner` (cf. :func:`omni_runner`).
+
+    Amortizes multi-stage init across a module. Every consumer must run with
+    ``@pytest.mark.asyncio(loop_scope="module")`` so the engine lives on one
+    event loop; sharing it across different loops can hang on the second
+    ``generate()``.
+    """
+    from tests.helpers.runtime import iter_async_omni
+
+    yield from iter_async_omni(request, run_level, omni_fixture_lock)

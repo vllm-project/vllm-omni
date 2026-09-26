@@ -15,6 +15,8 @@ import os
 import subprocess
 import time
 
+import psutil
+
 from vllm_omni.platforms import current_omni_platform
 
 logger = logging.getLogger(__name__)
@@ -221,6 +223,66 @@ def _print_device_processes() -> None:
         print("\n" + "=" * 80)
         print("WARNING: No supported device platform detected")
         print("=" * 80)
+
+
+LEFTOVER_ENGINE_PROCESS_KEYWORDS: tuple[str, ...] = (
+    "enginecore",
+    "stagediffusionproc",
+    "vllm::worker",
+    "vllm-omni::",
+)
+"""Union of engine child-process markers seen across OmniRunner and the
+sleep-mode teardown: AR engine cores, diffusion stage workers, vLLM workers,
+and vLLM-Omni engine entrypoints."""
+
+
+def reap_leftover_engine_children(
+    keywords: tuple[str, ...] = LEFTOVER_ENGINE_PROCESS_KEYWORDS,
+) -> None:
+    """Terminate leftover engine child processes of THIS test process.
+
+    Scoped to the current process tree: pytest-xdist workers on a shared
+    host own their engines, so a matching process outside our tree must
+    never be touched. Shared by OmniRunner and AsyncOmniRunner so the
+    keyword list stays in one place. Best effort: missing or inaccessible
+    processes are skipped, and survivors of terminate() are killed before
+    giving up.
+    """
+    try:
+        try:
+            candidates = psutil.Process(os.getpid()).children(recursive=True)
+        except psutil.NoSuchProcess:
+            return
+        matched = []
+        for proc in candidates:
+            try:
+                cmdline = " ".join(proc.cmdline()).lower() if proc.cmdline() else ""
+                name = proc.name().lower()
+                if any(k in cmdline for k in keywords) or any(k in name for k in keywords):
+                    print(f"Found leftover engine process: PID={proc.pid}, cmd={cmdline[:100]}")
+                    matched.append(proc)
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+        for proc in matched:
+            try:
+                proc.terminate()
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+        _, still_alive = psutil.wait_procs(matched, timeout=5)
+        for proc in still_alive:
+            try:
+                proc.kill()
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+        _, stubborn = psutil.wait_procs(still_alive, timeout=3)
+        if stubborn:
+            print(f"Warning: failed to kill residual engine pids: {[p.pid for p in stubborn]}")
+        elif still_alive:
+            print(f"Force-killed residual engine pids: {[p.pid for p in still_alive]}")
+        elif matched:
+            print(f"Terminated leftover engine pids: {[p.pid for p in matched]}")
+    except Exception as e:
+        print(f"Error in leftover engine process cleanup: {e}")
 
 
 def cleanup_test_environment(*, shutdown_ray: bool = False) -> None:

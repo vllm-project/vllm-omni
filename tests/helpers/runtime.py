@@ -27,7 +27,7 @@ from filelock import FileLock, Timeout
 from vllm import TextPrompt
 from vllm.logger import init_logger
 
-from tests.helpers.clean import cleanup_test_environment
+from tests.helpers.clean import cleanup_test_environment, reap_leftover_engine_children
 from tests.helpers.media import (
     release_audio_transcriber,
 )
@@ -914,39 +914,7 @@ class OmniRunner:
         return self.omni.stop_profile(stages=stages)
 
     def _cleanup_process(self):
-        try:
-            keywords = ["enginecore"]
-            matched = []
-            for proc in psutil.process_iter(["pid", "name", "cmdline", "username"]):
-                try:
-                    cmdline = " ".join(proc.cmdline()).lower() if proc.cmdline() else ""
-                    name = proc.name().lower()
-                    if any(k in cmdline for k in keywords) or any(k in name for k in keywords):
-                        print(f"Found vllm process: PID={proc.pid}, cmd={cmdline[:100]}")
-                        matched.append(proc)
-                except (psutil.NoSuchProcess, psutil.AccessDenied):
-                    pass
-            for proc in matched:
-                try:
-                    proc.terminate()
-                except (psutil.NoSuchProcess, psutil.AccessDenied):
-                    pass
-            _, still_alive = psutil.wait_procs(matched, timeout=5)
-            for proc in still_alive:
-                try:
-                    proc.kill()
-                except (psutil.NoSuchProcess, psutil.AccessDenied):
-                    pass
-            if still_alive:
-                _, stubborn = psutil.wait_procs(still_alive, timeout=3)
-                if stubborn:
-                    print(f"Warning: failed to kill residual vllm pids: {[p.pid for p in stubborn]}")
-                else:
-                    print(f"Force-killed residual vllm pids: {[p.pid for p in still_alive]}")
-            elif matched:
-                print(f"Terminated vllm pids: {[p.pid for p in matched]}")
-        except Exception as e:
-            print(f"Error in psutil vllm cleanup: {e}")
+        reap_leftover_engine_children()
 
     def __enter__(self):
         return self
@@ -1108,6 +1076,111 @@ def iter_omni_runner(
             print("OmniRunner stopping...")
 
         print("OmniRunner stopped")
+
+
+class AsyncOmniParams(NamedTuple):
+    """Parametrize the async in-process fixtures (``indirect=True``).
+
+    Prefer this NamedTuple over ``omni_runner``'s 2/3-tuple: live
+    ``AsyncOmni`` engines take many kwargs (sleep mode, worker extensions,
+    custom pipelines, admission bounds, timeouts, ...).
+    """
+
+    model: str
+    deploy_config: str | None = None
+    extra_omni_kwargs: dict[str, Any] | None = None
+
+
+class AsyncOmniRunner:
+    """Context-managed in-process ``AsyncOmni`` for tests (RFC #8013 Phase A).
+
+    Mirrors ``OmniRunner``'s lifecycle contract for the async entrypoint:
+    device cleanup before start, constructor-failure rollback, and on exit
+    ``shutdown`` → reap leftover engine children → device cleanup. The engine
+    itself is a plain attribute; anything else is delegated to it.
+    """
+
+    def __init__(
+        self,
+        model_name: str,
+        *,
+        deploy_config: str | None = None,
+        log_stats: bool = False,
+        **kwargs: Any,
+    ) -> None:
+        cleanup_test_environment()
+        self.model_name = model_name
+        self.engine: Any = None
+        try:
+            from vllm_omni.entrypoints.async_omni import AsyncOmni
+
+            self.engine = AsyncOmni(
+                model=model_name,
+                log_stats=log_stats,
+                deploy_config=deploy_config,
+                **kwargs,
+            )
+        except BaseException:
+            # ``with AsyncOmniRunner(...)`` never reaches ``__enter__``/
+            # ``__exit__`` when construction fails after workers started.
+            self.__exit__(None, None, None)
+            raise
+
+    def __getattr__(self, name: str) -> Any:
+        engine = self.__dict__.get("engine")
+        if name == "engine" or engine is None:
+            raise AttributeError(name)
+        return getattr(engine, name)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        engine = self.__dict__.get("engine")
+        try:
+            if engine is not None and hasattr(engine, "shutdown"):
+                engine.shutdown()
+        finally:
+            # A hung/failed shutdown is exactly the case leftover engine
+            # children exist for; reap and device cleanup must still run.
+            reap_leftover_engine_children()
+            cleanup_test_environment()
+
+
+def iter_async_omni(
+    request: Any,
+    run_level: str,
+    omni_fixture_lock: threading.Lock,
+) -> Generator[Any, None, None]:
+    """Yield an :class:`AsyncOmniRunner`; used by ``async_omni_runner`` / ``async_omni`` fixtures."""
+    from tests.helpers.stage_config import stage_config_path_for_run_level
+
+    model_prefix = get_model_prefix()
+    with omni_fixture_lock, _whisper_device_free_around():
+        params: AsyncOmniParams = request.param
+        reserved = {"model", "deploy_config"}
+        overlap = reserved & (params.extra_omni_kwargs or {}).keys()
+        if overlap:
+            # These are rewritten per run level below; an extras entry would
+            # shadow the rewrite with a confusing constructor TypeError.
+            raise ValueError(
+                f"extra_omni_kwargs must not override reserved keys {sorted(overlap)}; "
+                "set AsyncOmniParams.model / .deploy_config instead."
+            )
+        model = model_prefix + params.model
+        deploy_config = stage_config_path_for_run_level(params.deploy_config, run_level)
+        if run_level == "core_model" and request.node.get_closest_marker("diffusion"):
+            model = resolve_tiny_model_path(model)
+        with AsyncOmniRunner(
+            model,
+            deploy_config=deploy_config,
+            **(params.extra_omni_kwargs or {}),
+        ) as runner:
+            print("AsyncOmniRunner started successfully")
+            yield runner
+            print("AsyncOmniRunner stopping...")
+
+        print("AsyncOmniRunner stopped")
 
 
 # ─────────────────────────────────────────────────────────────────────

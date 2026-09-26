@@ -335,6 +335,47 @@ You can refer to Test Examples in the L3 section to see example test cases that 
     `pytest -s -v /tests/e2e/online_serving/test_{model_name}.py`
     `pytest -s -v -m 'core_model and cpu' --run-level=core_model`
 
+#### 1.5 Runtime Engine Fixtures (`omni_server` / `omni_runner` / `async_omni_runner`)
+
+Live-engine tests must not construct engines by hand; pick the fixture that
+matches the runtime entrypoint:
+
+- **HTTP serving** → `omni_server` / `omni_server_function` (module / function scope).
+- **Sync offline `Omni`** → `omni_runner` / `omni_runner_function` (module / function scope).
+- **In-process `AsyncOmni`** → `async_omni_runner` (function scope, the **default**) or
+  `async_omni` (module scope). Both yield an `AsyncOmniRunner` wrapper whose `.engine`
+  is the live engine; other attributes are delegated. The wrapper runs the full teardown
+  contract — `shutdown` → reap leftover engine children → device cleanup — including
+  constructor-failure rollback (RFC [#8013](https://github.com/vllm-project/vllm-omni/issues/8013)).
+
+Parametrize with `AsyncOmniParams(model=..., deploy_config=..., extra_omni_kwargs={...})`
+and `indirect=True`, same as `omni_server`:
+
+```python
+from tests.helpers.runtime import AsyncOmniParams
+
+_PARAMS = [
+    AsyncOmniParams(
+        model="tiny-random/Qwen-Image",
+        extra_omni_kwargs={"enforce_eager": True, "max_num_seqs": 1},
+    )
+]
+
+@pytest.mark.core_model
+@pytest.mark.diffusion
+@pytest.mark.asyncio
+@pytest.mark.parametrize("async_omni_runner", _PARAMS, indirect=True)
+async def test_generate_once(async_omni_runner) -> None:
+    engine = async_omni_runner.engine
+    async for output in engine.generate("a white cat", request_id="req-1"):
+        assert output.request_id == "req-1"
+```
+
+The module-scoped `async_omni` fixture shares one engine across a module; every
+consumer must then use `@pytest.mark.asyncio(loop_scope="module")` so the engine stays
+on a single event loop. Do not share an engine across different event loops — the
+second `generate()` can hang under pytest-asyncio's function-scoped default.
+
 ### L3 Level Testing - Core Integration, Performance, and Accuracy Verification
 
 #### 2.1 Testing Purpose
