@@ -14,6 +14,11 @@ AMD_NIGHTLY_PIPELINE = Path(".buildkite/amd/test-amd-nightly.yml")
 AMD_READY_PIPELINE = Path(".buildkite/amd/test-amd-ready.yml")
 AMD_TEMPLATE = Path(".buildkite/amd/test-template-amd-omni.j2")
 
+MULTI_GPU_MARKER_EXCLUSION = (
+    "core_model and cpu and not (cards_2 or cards_3 or cards_4 or cards_5 or cards_6 or cards_7 or cards_8)"
+)
+ULYSSES_UAA_2D_NODE = "tests/diffusion/attention/test_ulysses_uaa.py::test_ulysses_uaa_2d_mask_layout_matches_baseline"
+
 
 def _find_step(label: str, pipeline_path: Path = AMD_MERGE_PIPELINE) -> dict:
     pipeline = yaml.safe_load(pipeline_path.read_text(encoding="utf-8"))
@@ -65,6 +70,37 @@ def test_ready_diffusion_cpu_suite_is_sharded() -> None:
     assert step["timeout_in_minutes"] == 45
     assert "--num-shards=$$BUILDKITE_PARALLEL_JOB_COUNT" in pytest_command
     assert "--shard-id=$$BUILDKITE_PARALLEL_JOB" in pytest_command
+
+
+@pytest.mark.parametrize("pipeline_path", [AMD_READY_PIPELINE, AMD_MERGE_PIPELINE])
+def test_diffusion_cpu_suite_excludes_multi_gpu_tests(pipeline_path: Path) -> None:
+    step = _find_step("Simple · Diffusion Test · Shard %N/%t", pipeline_path)
+    pytest_command = next(command for command in step["commands"] if "pytest" in command)
+    argv = split(pytest_command)
+
+    marker_index = argv.index("-m")
+    assert argv[marker_index + 1] == MULTI_GPU_MARKER_EXCLUSION
+
+
+@pytest.mark.parametrize(
+    ("pipeline_path", "step_label"),
+    [
+        (AMD_READY_PIPELINE, "Diffusion Sequence Parallelism Test"),
+        (AMD_MERGE_PIPELINE, "Diffusion Tensor Parallelism Test"),
+    ],
+)
+def test_ulysses_uaa_2d_mask_runs_on_two_gpu_lane(
+    pipeline_path: Path,
+    step_label: str,
+) -> None:
+    step = _find_step(step_label, pipeline_path)
+    pytest_command = next(command for command in step["commands"] if ULYSSES_UAA_2D_NODE in command)
+    argv = split(pytest_command)
+
+    assert step["agent_pool"] == "mi300_2"
+    assert ULYSSES_UAA_2D_NODE in argv
+    marker_index = argv.index("-m")
+    assert argv[marker_index + 1] == "core_model and cards_2"
 
 
 def test_cosyvoice_ready_smoke_uses_sdpa() -> None:
