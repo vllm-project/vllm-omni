@@ -116,3 +116,9 @@ def test_session_rejects_a_waveform_count_that_does_not_match_the_batch():
 def test_session_rejects_a_non_positive_batch():
     with pytest.raises(ValueError, match="batch_frames"):
         ChunkedVideoMP4Session(value_range=(0.0, 1.0), fps=24, batch_frames=0)
+
+
+@pytest.mark.parametrize("value", [0, -1, 1.5, True])
+def test_session_rejects_an_invalid_pending_byte_budget(value):
+    with pytest.raises(ValueError, match="max_pending_bytes"):
+        ChunkedVideoMP4Session(value_range=(0.0, 1.0), fps=24, max_pending_bytes=value)

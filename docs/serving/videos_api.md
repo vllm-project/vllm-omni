@@ -335,6 +335,13 @@ window and output frame count stay unchanged. Wan S2V keeps its existing
 per-clip behavior by default. Zero, negative, fractional, boolean, string, and
 null values are rejected when pre-encoding is enabled.
 
+The transfer ring applies backpressure before another D2H copy when both of
+its two slots are occupied or the combined pending uint8 payload would exceed
+256 MiB. This byte bound keeps large resolutions and uneven final chunks from
+turning a fixed item count into unexpectedly large memory growth. A native VAE
+chunk larger than 256 MiB is admitted only when the ring is otherwise empty,
+so supported chunk shapes cannot deadlock.
+
 `preencode_mp4` applies to the complete-MP4 response paths only. The
 `/v1/realtime/video` WebSocket endpoint rejects it, because that path already
 overlaps encoding through its own incremental fragmented-MP4 encoder. Wan also

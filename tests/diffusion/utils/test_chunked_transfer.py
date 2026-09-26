@@ -33,8 +33,8 @@ def _frames(value: int = 7, *, batch: int = 1) -> torch.Tensor:
     return torch.full((batch, 2, 4, 6, 3), value, dtype=torch.uint8)
 
 
-def _cpu_ring(depth: int) -> PinnedChunkRing:
-    return PinnedChunkRing(depth=depth, device=torch.device("cpu"))
+def _cpu_ring(depth: int, *, max_pending_bytes: int | None = None) -> PinnedChunkRing:
+    return PinnedChunkRing(depth=depth, device=torch.device("cpu"), max_pending_bytes=max_pending_bytes)
 
 
 def test_slot_returns_only_after_its_last_reader():
@@ -79,6 +79,44 @@ def test_transfer_waits_for_a_slot_instead_of_growing_the_pool():
     assert not waiter.is_alive()
     assert ring.slots_in_use == 1
     assert ring.stats.slot_wait_seconds > 0
+
+
+def test_transfer_waits_for_byte_budget_even_when_a_slot_is_free():
+    """Variable-sized chunks cannot bypass the memory bound via free slots."""
+    small = _frames()
+    large = _frames(batch=2)
+    large_bytes = large.numel() * large.element_size()
+    ring = _cpu_ring(3, max_pending_bytes=large_bytes)
+    held = ring.transfer(small, readers=1)
+    second: list[ChunkLease] = []
+
+    waiter = threading.Thread(target=lambda: second.append(ring.transfer(large, readers=1)))
+    waiter.start()
+    waiter.join(timeout=0.3)
+    assert waiter.is_alive(), "the byte budget must backpressure a producer even with free slots"
+
+    held.wait()
+    held.release()
+    waiter.join(timeout=5)
+    assert not waiter.is_alive()
+    assert ring.slots_in_use == 1
+    assert ring.pending_bytes == large_bytes
+    second[0].wait()
+    second[0].release()
+
+
+def test_one_oversized_chunk_is_admitted_without_deadlock():
+    """A native VAE chunk larger than the budget must make progress alone."""
+    chunk = _frames()
+    chunk_bytes = chunk.numel() * chunk.element_size()
+    ring = _cpu_ring(2, max_pending_bytes=chunk_bytes - 1)
+
+    lease = ring.transfer(chunk, readers=1)
+
+    assert ring.pending_bytes == chunk_bytes
+    assert ring.stats.peak_pending_bytes == chunk_bytes
+    lease.wait()
+    lease.release()
 
 
 def test_abort_wakes_a_transfer_waiting_for_a_slot():
@@ -178,6 +216,26 @@ def test_session_feeds_chunks_in_producer_order(recording_encoders):
 
     assert session.finish() == [b"mp4"]
     assert recording_encoders[0].pushes == [10, 20, 30, 40]
+
+
+def test_session_drains_oldest_chunk_when_byte_budget_fills(recording_encoders, monkeypatch):
+    """Byte pressure must drain queued D2H work instead of deadlocking it."""
+    monkeypatch.setattr(ChunkLease, "ready", lambda self: False)
+    chunk_bytes = 1 * 1 * 4 * 6 * 3  # one quantized BTHWC chunk from _push_ramp
+    session = ChunkedVideoMP4Session(
+        value_range=(0.0, 1.0),
+        fps=24,
+        transfer_slots=2,
+        max_pending_bytes=chunk_bytes,
+    )
+
+    _push_ramp(session, [10, 20, 30])
+
+    assert session.finish() == [b"mp4"]
+    assert recording_encoders[0].pushes == [10, 20, 30]
+    assert session.ring is not None
+    assert session.ring.stats.peak_slots_in_use == 1
+    assert session.ring.stats.peak_pending_bytes == chunk_bytes
 
 
 def test_session_returns_the_slot_when_an_encoder_rejects_a_chunk(recording_encoders):
