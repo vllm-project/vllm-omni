@@ -227,6 +227,7 @@ class Pi05Pipeline(nn.Module):
     # ------------------------------------------------------------------
     @torch.inference_mode()
     def forward(self, req: OmniDiffusionRequest, **kwargs) -> DiffusionOutput:
+        num_steps = pipeline_helpers.resolve_num_inference_steps(req.sampling_params)
         extra_args = getattr(req.sampling_params, "extra_args", None) or {}
         robot_obs = extra_args.get("robot_obs")
 
@@ -235,7 +236,6 @@ class Pi05Pipeline(nn.Module):
             # doesn't crash. Mirrors DreamZero's dummy-run handling.
             first_prompt = req.prompts[0] if req.prompts else ""
             prompt = first_prompt if isinstance(first_prompt, str) else (first_prompt.get("prompt") or "")
-            num_steps = getattr(req.sampling_params, "num_inference_steps", None)
             if prompt == "dummy run" or num_steps == 1:
                 logger.info("Pi05Pipeline: dummy warmup request without robot_obs — returning zeros.")
                 return DiffusionOutput(
@@ -251,14 +251,6 @@ class Pi05Pipeline(nn.Module):
             )
 
         images, image_masks, lang_tokens, lang_masks = self.processor.build_model_inputs(robot_obs)
-
-        num_steps = getattr(req.sampling_params, "num_inference_steps", None)
-        if num_steps is not None and (
-            isinstance(num_steps, bool) or not isinstance(num_steps, (int, np.integer)) or int(num_steps) < 1
-        ):
-            raise ValueError(f"num_inference_steps must be a positive integer, got {num_steps!r}.")
-        if num_steps is not None:
-            num_steps = int(num_steps)
 
         actions = self.model.sample_actions(
             images=images,

@@ -121,6 +121,12 @@ def test_config_deploy_yaml_override():
     assert c.num_inference_steps == 4
 
 
+@pytest.mark.parametrize("dtype", ["float16", "float64", "auto"])
+def test_config_rejects_unsupported_dtype(dtype):
+    with pytest.raises(ValueError, match="dtype must be one of"):
+        Pi0Config(dtype=dtype)
+
+
 # ----------------------------------------------------------------------------
 # Kernel utilities: sinusoidal timestep embedding
 # ----------------------------------------------------------------------------

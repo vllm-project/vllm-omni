@@ -1103,7 +1103,10 @@ def _spy_request(num_inference_steps, generator=None):
         "robot_obs": {
             "state": np.zeros(32, dtype=np.float32),
             "images": {key: np.zeros((4, 4, 3), dtype=np.uint8) for key in _EXPECTED_CAMERA_ORDER},
-        }
+        },
+        # Legacy Pi0 location: intentionally conflicts with the top-level field
+        # so this test proves both pipelines use the same source of truth.
+        "num_inference_steps": 999,
     }
     params.num_inference_steps = num_inference_steps
     params.generator = generator

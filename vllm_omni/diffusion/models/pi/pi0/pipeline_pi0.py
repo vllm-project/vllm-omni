@@ -24,7 +24,7 @@ from vllm.logger import init_logger
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.models.pi.common import pipeline as pipeline_helpers
-from vllm_omni.diffusion.models.pi.pi0.config import Pi0Config
+from vllm_omni.diffusion.models.pi.pi0.config import SUPPORTED_DTYPE_NAMES, Pi0Config
 from vllm_omni.diffusion.models.pi.pi0.modeling_pi0 import Pi0ForActionPrediction
 from vllm_omni.diffusion.models.pi.pi0.processor_pi0 import build_model_inputs
 from vllm_omni.diffusion.models.pi0_pipeline_config import PI0_PIPELINE as PI0_PIPELINE
@@ -35,11 +35,23 @@ logger = init_logger(__name__)
 # Default tokenizer for the PaliGemma prefix (matches LeRobot Pi0).
 DEFAULT_PI0_TOKENIZER = "google/paligemma-3b-pt-224"
 
+# Pi0 uses a homogeneous model dtype. The denoising state remains float32 and
+# model-bound inputs are cast at their projection/vision boundaries.
+SUPPORTED_DTYPES = (torch.float32, torch.bfloat16)
+assert {str(dtype).split(".")[-1] for dtype in SUPPORTED_DTYPES} == set(SUPPORTED_DTYPE_NAMES)
+
 
 # The registry imports this public name, and the returned module-level function
 # must remain picklable across the orchestrator's multiprocess boundary.
 _pi0_post_process = pipeline_helpers.identity_post_process
 get_pi0_post_process_func = pipeline_helpers.get_identity_post_process_func
+
+
+def _set_inference_dtype(model: Pi0ForActionPrediction, dtype: torch.dtype) -> None:
+    """Apply Pi0's homogeneous FP32 or BF16 inference layout."""
+    if dtype not in SUPPORTED_DTYPES:
+        raise ValueError(f"Unsupported π0 inference dtype: {dtype!r}.")
+    model.to(dtype=dtype)
 
 
 class Pi0Pipeline(nn.Module):
@@ -100,9 +112,13 @@ class Pi0Pipeline(nn.Module):
     @staticmethod
     def _resolve_dtype(od_config: OmniDiffusionConfig) -> torch.dtype:
         dt = od_config.dtype
-        if isinstance(dt, torch.dtype):
-            return dt
-        return getattr(torch, str(dt).split(".")[-1], torch.float32)
+        resolved = dt if isinstance(dt, torch.dtype) else getattr(torch, str(dt).split(".")[-1], None)
+        if resolved not in SUPPORTED_DTYPES:
+            raise ValueError(
+                f"Unsupported π0 dtype: {dt!r}. Supported: "
+                f"{', '.join(sorted(str(dtype).split('.')[-1] for dtype in SUPPORTED_DTYPES))}."
+            )
+        return resolved
 
     def _load_tokenizer(self):
         from transformers import AutoTokenizer
@@ -111,11 +127,12 @@ class Pi0Pipeline(nn.Module):
 
     def _initialize_model(self) -> Pi0ForActionPrediction:
         model = Pi0ForActionPrediction(self.config)
+        _set_inference_dtype(model, self._torch_dtype)
         if pipeline_helpers.has_safetensors_checkpoint(self.model_dir):
             self._load_checkpoint(model)
         else:
             logger.info("Pi0Pipeline: no model.safetensors under %s; using random init.", self.model_dir)
-        model.to(device=self._device, dtype=self._torch_dtype)
+        model.to(device=self._device)
         model.eval()
         return model
 
@@ -145,6 +162,7 @@ class Pi0Pipeline(nn.Module):
     # ------------------------------------------------------------------
     @torch.inference_mode()
     def forward(self, req: OmniDiffusionRequest, **kwargs) -> DiffusionOutput:
+        num_steps = pipeline_helpers.resolve_num_inference_steps(req.sampling_params)
         extra_args = getattr(req.sampling_params, "extra_args", None) or {}
         robot_obs = extra_args.get("robot_obs")
 
@@ -153,7 +171,6 @@ class Pi0Pipeline(nn.Module):
             # doesn't crash. Mirrors DreamZero's dummy-run handling.
             first_prompt = req.prompts[0] if req.prompts else ""
             prompt = first_prompt if isinstance(first_prompt, str) else (first_prompt.get("prompt") or "")
-            num_steps = getattr(req.sampling_params, "num_inference_steps", None)
             if prompt == "dummy run" or num_steps == 1:
                 logger.info("Pi0Pipeline: dummy warmup request without robot_obs — returning zeros.")
                 return DiffusionOutput(
@@ -180,8 +197,6 @@ class Pi0Pipeline(nn.Module):
             noise = torch.as_tensor(noise, dtype=torch.float32, device=self._device)
         elif isinstance(noise, torch.Tensor):
             noise = noise.to(device=self._device, dtype=torch.float32)
-
-        num_steps = extra_args.get("num_inference_steps")
 
         actions = self.model.sample_actions(
             images=images,

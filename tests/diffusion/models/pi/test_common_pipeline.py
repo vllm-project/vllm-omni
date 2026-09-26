@@ -4,12 +4,32 @@
 
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 
 from vllm_omni.diffusion.models.pi.common import pipeline
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+@pytest.mark.parametrize("value,expected", [(None, None), (1, 1), (25, 25), (np.int64(3), 3)])
+def test_resolve_num_inference_steps_accepts_positive_top_level_integers(value, expected):
+    params = SimpleNamespace(num_inference_steps=value, extra_args={"num_inference_steps": 999})
+
+    assert pipeline.resolve_num_inference_steps(params) == expected
+
+
+def test_resolve_num_inference_steps_ignores_extra_args():
+    params = SimpleNamespace(extra_args={"num_inference_steps": 7})
+
+    assert pipeline.resolve_num_inference_steps(params) is None
+
+
+@pytest.mark.parametrize("value", [0, -1, 2.5, True, "4"])
+def test_resolve_num_inference_steps_rejects_invalid_values(value):
+    with pytest.raises(ValueError, match="num_inference_steps must be a positive integer"):
+        pipeline.resolve_num_inference_steps(SimpleNamespace(num_inference_steps=value))
 
 
 def test_identity_post_process_factory_returns_picklable_module_function():

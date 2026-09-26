@@ -96,7 +96,13 @@ def embed_image(paligemma: nn.Module, pixel_values: torch.Tensor) -> torch.Tenso
     Transformers releases. Calling the two stable submodules directly keeps
     Pi0 and Pi0.5 on the same unambiguous path.
     """
-    vision_outputs = paligemma.model.vision_tower(pixel_values)
+    vision_tower = paligemma.model.vision_tower
+    parameters = getattr(vision_tower, "parameters", None)
+    if parameters is not None:
+        target_dtype = next((param.dtype for param in parameters() if param.is_floating_point()), None)
+        if target_dtype is not None:
+            pixel_values = pixel_values.to(dtype=target_dtype)
+    vision_outputs = vision_tower(pixel_values)
     return paligemma.model.multi_modal_projector(vision_outputs.last_hidden_state)
 
 

@@ -173,6 +173,31 @@ def test_embed_image_uses_explicit_vision_tower_then_projector():
     assert torch.equal(backbone.embed_image(paligemma, pixel_values), torch.tensor([[[[9.0]]]]))
 
 
+def test_embed_image_aligns_pixels_to_vision_tower_dtype():
+    class RecordingVisionTower(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.ones((), dtype=torch.bfloat16))
+            self.seen_dtype = None
+
+        def forward(self, pixels):
+            self.seen_dtype = pixels.dtype
+            return SimpleNamespace(last_hidden_state=pixels * self.weight)
+
+    vision_tower = RecordingVisionTower()
+    paligemma = SimpleNamespace(
+        model=SimpleNamespace(
+            vision_tower=vision_tower,
+            multi_modal_projector=lambda features: features,
+        )
+    )
+
+    actual = backbone.embed_image(paligemma, torch.ones(1, 1, 1, 1, dtype=torch.float32))
+
+    assert vision_tower.seen_dtype is torch.bfloat16
+    assert actual.dtype is torch.bfloat16
+
+
 def test_embed_language_tokens_applies_legacy_scale_once():
     embed_tokens = nn.Embedding(4, 4)
     nn.init.ones_(embed_tokens.weight)
