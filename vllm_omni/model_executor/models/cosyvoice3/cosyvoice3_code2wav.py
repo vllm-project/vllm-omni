@@ -80,6 +80,8 @@ class CosyVoice3Code2Wav(nn.Module):
     - HiFiGAN vocoder for mel-to-waveform conversion
     """
 
+    _flow_context_tokens: int = 0
+
     def __init__(self, config: CosyVoice3Config):
         super().__init__()
         self.config = config
@@ -156,6 +158,7 @@ class CosyVoice3Code2Wav(nn.Module):
         # margin; window_len=48 already passes
         # test_incremental_hift_bounded_window_is_close, so 64 has headroom.
         self._hift_window_len = 64
+        self._flow_context_tokens = config.flow_context_tokens
 
     @property
     def input_frame_rate(self) -> int:
@@ -345,6 +348,20 @@ class CosyVoice3Code2Wav(nn.Module):
         Codec tokens may have different lengths; those are padded within the
         group and passed to the flow as per-row token lengths.
         """
+        if self._flow_context_tokens:
+            return [
+                self.forward_streaming(
+                    token=item["token"],
+                    prompt_token=item["prompt_token"],
+                    prompt_feat=item["prompt_feat"],
+                    embedding=item["embedding"],
+                    cache_state=item.get("cache_state"),
+                    n_timesteps=n_timesteps,
+                    token_offset_tokens=int(item.get("token_offset_tokens", 0)),
+                    finalize=bool(item.get("finalize", False)),
+                )
+                for item in items
+            ]
         results: list[tuple[torch.Tensor, dict[str, torch.Tensor] | None] | None] = [None] * len(items)
         groups: dict[tuple[int, int, int, bool], list[tuple[int, StreamingFlowItem]]] = {}
         for index, item in enumerate(items):
@@ -460,14 +477,33 @@ class CosyVoice3Code2Wav(nn.Module):
         token_offset_tokens: int = 0,
         finalize: bool = False,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor] | None]:
-        """Decode streaming audio using cumulative mel + emitted-speech offset.
+        """Decode new speech with incremental HiFT state.
 
-        This mirrors upstream CosyVoice3 streaming semantics more closely than
-        waveform-domain overlap-add: keep a cumulative mel history per request,
-        re-run causal HiFT on the history, and emit only the newly grown speech
-        suffix. That preserves causal look-right handling without double
-        trimming or duplicated overlap at chunk boundaries.
+        Flow uses the cumulative token prefix by default. When a context window
+        is configured, previous generated mel and its matching tokens condition
+        only the new suffix; this changes flow conditioning and is approximate.
         """
+        context_mel = None
+        window = self._flow_context_tokens
+        if window and token_offset_tokens:
+            if cache_state is None or "flow_mel" not in cache_state:
+                raise ValueError("Bounded flow requires the preceding chunk's flow_mel cache.")
+            context_mel = cache_state["flow_mel"]
+            context_tokens = context_mel.shape[-1] // self.token_mel_ratio
+            if context_tokens > token_offset_tokens:
+                raise ValueError("Flow cache exceeds the emitted token prefix.")
+            prompt_token = token[:, token_offset_tokens - context_tokens : token_offset_tokens]
+            prompt_feat = context_mel.transpose(1, 2)
+            token = token[:, token_offset_tokens:]
+            token_offset_tokens = 0
+        elif window:
+            # The initial voice prompt is also bounded.
+            context_tokens = min(window, prompt_token.shape[1], prompt_feat.shape[1] // self.token_mel_ratio)
+            prompt_token = prompt_token[:, -context_tokens:] if context_tokens else prompt_token[:, :0]
+            prompt_feat = (
+                prompt_feat[:, -context_tokens * self.token_mel_ratio :] if context_tokens else prompt_feat[:, :0]
+            )
+
         feat = self._forward_mel(
             token=token,
             prompt_token=prompt_token,
@@ -478,7 +514,11 @@ class CosyVoice3Code2Wav(nn.Module):
             streaming=True,
             finalize=finalize,
         )
-        return self._stream_hift_from_feat(feat, cache_state=cache_state, finalize=finalize)
+        waveform, state = self._stream_hift_from_feat(feat, cache_state=cache_state, finalize=finalize)
+        if window and state is not None:
+            history = feat if context_mel is None else torch.cat([context_mel.to(feat), feat], dim=-1)
+            state["flow_mel"] = history[..., -window * self.token_mel_ratio :].detach().cpu().contiguous()
+        return waveform, state
 
     @torch.inference_mode()
     def forward(

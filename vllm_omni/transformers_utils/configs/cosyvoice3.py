@@ -13,6 +13,9 @@ class CosyVoice3Config(PretrainedConfig):
         # (6561-6760) as stop signals; see stop_token_ids in the YAML configs.
         kwargs.setdefault("eos_token_id", 6562)
         super().__init__(**kwargs)
+        self.flow_context_tokens = int(kwargs.get("flow_context_tokens", 0))
+        if self.flow_context_tokens < 0:
+            raise ValueError("flow_context_tokens must be nonnegative")
         self.sample_rate = 24000
         self.llm_input_size = 896
         self.llm_output_size = 896
