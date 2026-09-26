@@ -44,6 +44,12 @@ from vllm_omni.diffusion.models.interface import (
 )
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.offloader import OffloadPlan, PinnedModuleStager
+from vllm_omni.diffusion.offloader.config import (
+    DIT_COMPONENT,
+    OffloadStrategy,
+    offload_streams_blocks,
+    resolve_offload,
+)
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import (
     DiffusionPipelineProfilerMixin,
 )
@@ -225,7 +231,7 @@ def _resolve_checkpoint_root(model: str, revision: str | None) -> str:
                 "MAGI-2 expects a local checkpoint directory or the official "
                 f"model ID {MAGI2_MODEL_ID!r}; got {model!r}."
             )
-        from vllm.transformers_utils.repo_utils import hf_api
+        from vllm_omni.transformers_utils.repo_utils import hf_api
 
         pinned_revision = revision or MAGI2_MODEL_REVISION
         logger.warning(
@@ -298,18 +304,17 @@ def _validate_native_topology(od_config: OmniDiffusionConfig) -> None:
         raise ValueError(f"MAGI-2 tensor_parallel_size={tp_size} does not divide: " + ", ".join(invalid_tp_dimensions))
 
     configured_world_size = dp_size * cfg_size * tp_size * sp_size
-    cpu_offload = bool(od_config.enable_cpu_offload)
-    layerwise_offload = bool(od_config.enable_layerwise_offload)
-    distributed_offload = bool(od_config.enable_distributed_layerwise_offload)
-    if cpu_offload and not layerwise_offload:
+    resolved_offload = resolve_offload(od_config)
+    strategy = resolved_offload.strategy
+    layerwise_offload = strategy is OffloadStrategy.LAYER_WISE
+    distributed_offload = strategy is OffloadStrategy.DISTRIBUTED_LAYER_WISE
+    if strategy is OffloadStrategy.MODEL_LEVEL:
         raise ValueError(
             "MAGI-2 already stages its auxiliary components from CPU, while "
             "the complete Preview transformer cannot fit on one qualified GPU. "
-            "Combine --enable-cpu-offload with --enable-layerwise-offload, or "
-            "use --enable-layerwise-offload alone."
+            "Use layer offload instead: diffusion_offload_config={'mode': 'layer', "
+            "'components': ['dit']}, or the legacy --enable-layerwise-offload."
         )
-    if layerwise_offload and distributed_offload:
-        raise ValueError("MAGI-2 ordinary and distributed layerwise offload are mutually exclusive")
     if layerwise_offload and configured_world_size != 1:
         raise ValueError(
             "MAGI-2 ordinary layerwise offload is a single-worker path; "
@@ -330,7 +335,6 @@ def _validate_native_topology(od_config: OmniDiffusionConfig) -> None:
             f"expected vae_patch_parallel_size=1 or {configured_world_size}, got {vae_pp_size}."
         )
 
-    dlo_allgather = bool(getattr(od_config, "dlo_use_allgather", True))
     if cfg_size > 1 and dp_size > 1:
         raise ValueError("MAGI-2 CFG parallelism is not yet combined with DLO data parallelism")
     if distributed_offload and getattr(parallel, "use_hsdp", False):
@@ -339,7 +343,7 @@ def _validate_native_topology(od_config: OmniDiffusionConfig) -> None:
         raise ValueError("MAGI-2 data parallelism currently requires distributed layerwise offload")
     if dp_size > 1 and tp_size > 1:
         raise ValueError("MAGI-2 DLO data-parallel replicas currently require tensor_parallel_size=1")
-    if distributed_offload and dlo_allgather:
+    if distributed_offload and resolved_offload.uses_allgather(DIT_COMPONENT):
         if dp_size <= 1:
             raise ValueError(
                 "MAGI-2 DLO AllGather requires data_parallel_size > 1. SP ranks "
@@ -574,9 +578,7 @@ class Magi2Pipeline(
         )
         self._is_output_rank = self._parallel_group.rank == 0
         self._offload_aux_after_use = True
-        self._transformer_is_layerwise_offloaded = bool(
-            od_config.enable_layerwise_offload or od_config.enable_distributed_layerwise_offload
-        )
+        self._transformer_is_layerwise_offloaded = offload_streams_blocks(od_config)
         self._transformer_is_hsdp = bool(getattr(od_config.parallel_config, "use_hsdp", False))
         self._distributed_video_decode = int(od_config.parallel_config.vae_patch_parallel_size) > 1
 
@@ -585,8 +587,10 @@ class Magi2Pipeline(
         from .modeling_magi2 import Magi2PreviewTransformer
 
         MAGI2_PREVIEW_CONFIG.validate()
-        mmap_dlo = bool(
-            od_config.enable_distributed_layerwise_offload and getattr(od_config, "dlo_use_allgather", True)
+        resolved_offload = resolve_offload(od_config)
+        mmap_dlo = (
+            resolved_offload.strategy is OffloadStrategy.DISTRIBUTED_LAYER_WISE
+            and resolved_offload.uses_allgather(DIT_COMPONENT)
         )
         if mmap_dlo:
             # AllGather DLO binds checkpoint tensors as mmap views and copies

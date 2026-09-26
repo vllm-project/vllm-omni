@@ -1,13 +1,37 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-"""Opt-in cleanup fixtures for GPU memory, pipeline registry, and speaker cache."""
+"""Cleanup fixtures for process-global test state.
+
+Torch dtype/device restoration is autouse. GPU memory, the pipeline registry,
+and the speaker cache stay opt-in.
+"""
 
 from __future__ import annotations
 
 import pytest
 
 from vllm_omni.config.pipeline_registry import OMNI_PIPELINES
+
+
+@pytest.fixture(autouse=True)
+def restore_torch_default_dtype_and_device():
+    """Restore process-global dtype and device after every test.
+
+    ``get_default_device()`` reports ``cpu`` both when no default device was
+    set and when ``cpu`` was set explicitly. Writing that value back enables
+    default-device dispatch, so snapshot the active context instead.
+    """
+    import torch
+
+    default_dtype = torch.get_default_dtype()
+    device_context = getattr(torch._GLOBAL_DEVICE_CONTEXT, "device_context", None)
+    default_device = None if device_context is None else torch.get_default_device()
+    try:
+        yield
+    finally:
+        torch.set_default_dtype(default_dtype)
+        torch.set_default_device(default_device)
 
 
 @pytest.fixture

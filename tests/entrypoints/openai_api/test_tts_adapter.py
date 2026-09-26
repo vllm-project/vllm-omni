@@ -22,7 +22,7 @@ from vllm_omni.entrypoints.openai.tts_adapters import (
     detect_tts_model_type,
     resolve_adapter,
 )
-from vllm_omni.entrypoints.openai.tts_adapters.base import resolve_stage_model_path
+from vllm_omni.entrypoints.openai.tts_adapters.base import TTSCapabilities, resolve_stage_model_path
 from vllm_omni.entrypoints.openai.tts_adapters.covo_audio import CovoAudioAdapter
 from vllm_omni.entrypoints.openai.tts_adapters.higgs_audio_v2 import HiggsAudioV2Adapter
 from vllm_omni.entrypoints.openai.tts_adapters.indextts2 import (
@@ -71,7 +71,6 @@ EXPECTED_MODEL_TYPES = {
     "indextts2",
     "indextts2_5",
     "gepard",
-    "dots_tts",
 }
 
 
@@ -373,6 +372,10 @@ def test_qwen3_tts_build_constructs_prepared_request():
     server = SimpleNamespace(_tts_executor=None, _tts_tokenizer=None, uploaded_speakers={})
     engine_client = SimpleNamespace(model_config=SimpleNamespace())
     adapter = Qwen3TTSAdapter(SimpleNamespace(server=server, engine_client=engine_client))
+    adapter.capabilities = TTSCapabilities(
+        supported_speakers=frozenset({"vivian", "alice"}),
+        default_speaker="vivian",
+    )
 
     async def estimate_prompt_len(_tts_params):
         return 3
@@ -385,7 +388,7 @@ def test_qwen3_tts_build_constructs_prepared_request():
     assert prepared.prompt["prompt_token_ids"] == [1, 1, 1]
     assert prepared.prompt["additional_information"] is prepared.tts_params
     assert prepared.tts_params["text"] == ["hello"]
-    assert prepared.tts_params["speaker"] == ["Vivian"]
+    assert prepared.tts_params["speaker"] == ["vivian"]
     assert prepared.model_type == "CustomVoice"
 
 
@@ -669,6 +672,110 @@ def test_higgs_audio_v2_validate_accepts_plain_text_and_paired_clone() -> None:
     assert (
         adapter.validate(_higgs_v2_request(ref_audio="data:audio/wav;base64,AA==", ref_text="some transcript")) is None
     )
+
+
+@pytest.mark.parametrize(
+    "spk_id_config,expected_default,expected_supported",
+    [
+        ({"charlie": 3, "alice": 1, "bob": 2}, "charlie", frozenset({"alice", "bob", "charlie"})),
+        ({"vivian": 1}, "vivian", frozenset({"vivian"})),
+        ({}, None, frozenset()),
+        (None, None, frozenset()),
+    ],
+)
+def test_default_speaker_is_first_in_config(spk_id_config, expected_default, expected_supported):
+    """Default speaker is the first from config order, not alphabetical (PR #5814)."""
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    from vllm_omni.entrypoints.openai.tts_adapters.base import TTSModelAdapter
+
+    mock_ctx = Mock()
+    mock_ctx.engine_client.model_config.hf_config.talker_config = (
+        SimpleNamespace(spk_id=spk_id_config) if spk_id_config is not None else None
+    )
+
+    class TestAdapter(TTSModelAdapter):
+        MODEL_TYPE = "test"
+
+        def validate(self, request):
+            return None
+
+        async def build(self, request, server):
+            pass
+
+    caps = TestAdapter(mock_ctx).load_capabilities()
+    assert caps.default_speaker == expected_default
+    assert caps.supported_speakers == expected_supported
+
+
+@pytest.mark.parametrize(
+    "default_speaker,expected_speaker",
+    [
+        ("alice", ["alice"]),
+        (None, None),
+    ],
+)
+def test_qwen3_custom_voice_uses_default_speaker(default_speaker, expected_speaker):
+    """Qwen3-TTS CustomVoice uses default_speaker, not hardcoded Vivian (PR #5814)."""
+    from unittest.mock import Mock
+
+    from vllm_omni.entrypoints.openai.tts_adapters.base import SpeechServingContext, TTSCapabilities
+    from vllm_omni.entrypoints.openai.tts_adapters.qwen3_tts import Qwen3TTSAdapter
+
+    mock_server = Mock()
+    mock_server.uploaded_speakers = {}
+    ctx = SpeechServingContext(server=mock_server)
+    adapter = Qwen3TTSAdapter(ctx)
+    adapter.capabilities = TTSCapabilities(
+        supported_speakers=frozenset({"alice", "bob"}) if default_speaker else frozenset(),
+        default_speaker=default_speaker,
+    )
+
+    request = SimpleNamespace(
+        input="Hello world",
+        task_type=None,
+        language=None,
+        voice=None,
+        instructions=None,
+        ref_text=None,
+        ref_audio=None,
+        speaker_embedding=None,
+        x_vector_only_mode=None,
+        sample_rate=None,
+        max_new_tokens=None,
+        initial_codec_chunk_frames=None,
+        non_streaming_mode=None,
+    )
+    params = adapter._build_tts_params(request)
+    assert params.get("speaker") == expected_speaker
+
+
+def test_qwen3_validate_rejects_no_voice_no_default_then_accepts():
+    """Omitted voice with no default_speaker is rejected; setting a default accepts."""
+    from unittest.mock import Mock
+
+    mock_server = Mock()
+    mock_server.uploaded_speakers = {"uploaded_voice": {"ref_text": "hi"}}
+    mock_server._get_available_speakers = Mock(return_value={"uploaded_voice"})
+    ctx = SpeechServingContext(server=mock_server)
+    adapter = Qwen3TTSAdapter(ctx)
+    adapter.capabilities = TTSCapabilities(
+        supported_speakers=frozenset(),
+        default_speaker=None,
+    )
+
+    request = OpenAICreateSpeechRequest(input="hello")
+    err = adapter.validate(request)
+    assert err is not None
+    assert "voice" in err.lower()
+
+    adapter.capabilities = TTSCapabilities(
+        supported_speakers=frozenset({"uploaded_voice"}),
+        default_speaker="uploaded_voice",
+    )
+    request2 = OpenAICreateSpeechRequest(input="hello")
+    assert adapter.validate(request2) is None
 
 
 if __name__ == "__main__":

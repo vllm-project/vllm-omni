@@ -170,7 +170,10 @@ class _ModelEngineOverrides(TypedDict, total=False):
     limit_mm_per_prompt: dict[str, Any]
     interleave_mm_strings: bool
     media_io_kwargs: dict[str, Any]
+    final_output: bool
     active_stream_window: int
+    use_v2_model_runner: bool
+    supports_native_mrv2_data_plane: bool
     enable_sleep_mode: bool
     subtalker_sampling_params: dict[str, Any]
     silence_ban_frames: int
@@ -271,6 +274,7 @@ class _ParallelEngineOverrides(_ParallelConfigEngineOverrides, total=False):
 
 class _ConnectorEngineOverrides(TypedDict, total=False):
     omni_kv_config: dict[str, Any]
+    kv_transfer_config: KVTransferConfig | dict[str, Any]
 
 
 @dataclass(frozen=True)
@@ -332,6 +336,8 @@ def _first_defined(*values: Any) -> Any:
 
 def _validate_async_chunk_support(pipeline: PipelineConfig, deploy: DeployConfig) -> None:
     has_inter_stage_edges = any(stage.input_sources for stage in pipeline.stages)
+    if deploy.async_chunk and any(stage.engine_extras.get("kv_transfer_config") for stage in deploy.stages):
+        raise ValueError("Native AR-to-DiT KV transfer requires async_chunk=False.")
     if (
         deploy.async_chunk
         and has_inter_stage_edges
@@ -490,9 +496,12 @@ class OmniStageModelConfig(_TrackExplicitConfigFields):
     # MiniCPM interleaved AV packing and media decode knobs (Daily-Omni).
     interleave_mm_strings: bool | None = None
     media_io_kwargs: dict[str, Any] | None = None
+    final_output: bool = False
     active_stream_window: int = Field(default=0, ge=0)
     session_mode: str = "turn"
     duplex_max_sessions: int = Field(default=1, ge=1)
+    use_v2_model_runner: bool = False
+    supports_native_mrv2_data_plane: bool = False
     enable_sleep_mode: bool = False
     default_sampling_params: dict[str, Any] | None = None
     subtalker_sampling_params: dict[str, Any] | None = None
@@ -605,6 +614,7 @@ class OmniStageConnectorConfig:
 
     async_chunk: bool = False
     omni_kv_config: dict[str, Any] | None = None
+    kv_transfer_config: KVTransferConfig | None = None
     stage_connector: dict[str, Any] = field(
         default_factory=lambda: {
             "name": "SharedMemoryConnector",
@@ -814,6 +824,7 @@ class _DiffusionConfigProjection:
     video_output_transport: object = field(default_factory=dict)
     enable_cache_dit_summary: bool = False
     diffusion_kv_mode: DiffusionKVCacheMode = DiffusionKVCacheMode.DENSE_LEGACY
+    enable_prefix_caching: bool = False
     diffusion_kv_max_rows_per_request: int | None = Field(default=None, ge=1, strict=True)
     enable_prompt_embed_cache: bool = False
     prompt_embed_cache_size: int = Field(default=32, ge=1)
@@ -844,6 +855,7 @@ class _DiffusionConfigProjection:
     fa_deterministic: bool = False
     vae_use_slicing: bool = False
     vae_use_tiling: bool = False
+    vae_fast_path: Literal["off", "lossless", "channels_last"] = "lossless"
     mask_strategy_file_path: str | None = None
     skip_time_steps: int = 15
     VSA_sparsity: float = 0.0
@@ -876,6 +888,9 @@ class _DiffusionConfigProjection:
     custom_pipeline_args: dict[str, Any] | None = None
     additional_config: dict[str, Any] = field(default_factory=dict)
     kv_transfer_config: KVTransferConfig | None = None
+    # Full stage-payload transport, independent of native paged KV transfer.
+    stage_input_payload_keys: tuple[str, ...] = ()
+    stage_output_payload_keys: tuple[str, ...] = ()
     enable_stage_verification: bool = True
     prompt_file_path: str | None = None
     quantization_config: _QuantizationConfigType = None
@@ -989,6 +1004,11 @@ class _DiffusionConfigProjection:
             )
 
         self.diffusion_kv_mode = parse_diffusion_kv_cache_mode(self.diffusion_kv_mode)
+        if self.enable_prefix_caching and self.diffusion_kv_mode is not DiffusionKVCacheMode.PAGED_SCHEDULER:
+            raise ValueError(
+                "enable_prefix_caching=True requires diffusion_kv_mode='paged_scheduler'; "
+                "set diffusion_kv_mode='paged_scheduler' or disable enable_prefix_caching"
+            )
         if (
             self.diffusion_kv_mode is DiffusionKVCacheMode.PAGED_SCHEDULER
             and self.diffusion_kv_max_rows_per_request is None
@@ -1097,6 +1117,7 @@ _DIFFUSION_SHARED_CONFIG_FIELDS = frozenset(
         "dist_timeout",
         "model_config",
         "quantization_config",
+        "enable_prefix_caching",
     }
 )
 _DIFFUSION_RUNTIME_CONFIG_FIELDS = frozenset(
@@ -1386,7 +1407,7 @@ def normalize_and_validate_diffusion_engine_ingress_kwargs(
         | orchestrator_field_names()
         # Coordination fields also live on the typed orchestrator config, not
         # all of them are present on the CLI-only OrchestratorArgs dataclass.
-        | frozenset(config_field.name for config_field in fields(VllmOmniOrchestratorConfig))
+        | frozenset(config_field.name for config_field in fields(cast(Any, VllmOmniOrchestratorConfig)))
     )
     allowed_fields = stage_consumed_fields | externally_consumed_fields
     validate_omni_diffusion_kwargs(normalized, allowed_fields, stage_id=stage_id)
@@ -1884,6 +1905,7 @@ def _build_diffusion_stage_config(
         engine.diffusion,
         model=common_kwargs["model_config"].model,
         quantization_config=common_kwargs["quantization_config"],
+        enable_prefix_caching=bool(common_kwargs["cache_config"].enable_prefix_caching),
     )
     return cast(
         VllmOmniDiffusionStageConfig,
@@ -1961,8 +1983,14 @@ def _build_model_config(
         kwargs["dtype"] = _copy_value(deploy.dtype)
     if "active_stream_window" not in kwargs:
         kwargs["active_stream_window"] = _copy_value(deploy.active_stream_window)
+    kwargs["final_output"] = topology.final_output
     if "custom_voice_dir" not in kwargs and deploy.custom_voice_dir is not None:
         kwargs["custom_voice_dir"] = _copy_value(deploy.custom_voice_dir)
+    kwargs.setdefault("use_v2_model_runner", deploy.model_runner == "v2")
+    kwargs.setdefault(
+        "supports_native_mrv2_data_plane",
+        topology.supports_native_mrv2_data_plane,
+    )
     if "has_sampling_extra_args" not in kwargs:
         kwargs["has_sampling_extra_args"] = bool((default_sampling_params or {}).get("extra_args"))
     if "model_subdir" not in kwargs and topology.model_subdir is not None:
@@ -2078,6 +2106,7 @@ def _build_connector_config(
     return cast(Any, OmniStageConnectorConfig)(
         async_chunk=resolve_stage_async_chunk(deploy, stage_deploy),
         omni_kv_config=_copy_value(engine.get("omni_kv_config")),
+        kv_transfer_config=_copy_value(engine.get("kv_transfer_config")),
         output_connectors=_copy_value(output_connectors) if output_connectors else None,
         input_connectors=_copy_value(input_connectors) if input_connectors else None,
     )
@@ -2138,8 +2167,15 @@ def _build_diffusion_config_projection(
     *,
     model: str | None,
     quantization_config: _QuantizationConfigType,
+    enable_prefix_caching: bool,
 ) -> _DiffusionConfigProjection:
     diffusion_kwargs = engine.to_kwargs()
+    # Mirror the resolved cache setting, including deploy/CLI precedence.
+    diffusion_kwargs["enable_prefix_caching"] = enable_prefix_caching
+    # Match the legacy builder: topology supplies defaults, while explicit
+    # deploy/CLI values (including empty tuples) retain precedence.
+    diffusion_kwargs.setdefault("stage_input_payload_keys", tuple(topology.stage_input_payload_keys))
+    diffusion_kwargs.setdefault("stage_output_payload_keys", tuple(topology.stage_output_payload_keys))
     diffusion_kwargs["stage_id"] = topology.stage_id
     diffusion_kwargs["model_arch"] = _first_defined(
         diffusion_kwargs.get("model_arch"),

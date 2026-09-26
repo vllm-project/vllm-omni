@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""MiniMax H3 text-conditioning contract."""
+"""MiniMax H3 validated text and unified encoder-conditioning contracts."""
 
 from __future__ import annotations
 
@@ -358,6 +358,7 @@ class MiniMaxH3EncoderMediaInput:
     video_audios: tuple[tuple[torch.Tensor, int] | None, ...] = ()
     audios: tuple[tuple[torch.Tensor, int], ...] = ()
     keyframe_frame_indices: tuple[int, ...] = ()
+    audio_mode: str = "native"
     video_edit: torch.Tensor | None = None
     video_edit_mask: torch.Tensor | None = None
     audio_edit: tuple[torch.Tensor, int] | None = None
@@ -468,6 +469,7 @@ class MiniMaxH3EncoderMediaInput:
         if cursor != len(tensors):
             raise ValueError(f"MiniMax H3 encoder media input has {len(tensors) - cursor} trailing tensors")
         return cls(
+            audio_mode=str(metadata.get("audio_mode", "native")),
             task=task,
             height=height,
             width=width,
@@ -541,6 +543,7 @@ class MiniMaxH3EncoderMediaInput:
 
     def to_metadata(self) -> dict[str, Any]:
         metadata = {
+            "audio_mode": self.audio_mode,
             "task": self.task,
             "height": self.height,
             "width": self.width,

@@ -64,3 +64,21 @@ steps:
         commands:
           - export VLLM_ROCM_USE_AITER=1
           - pytest -s -v tests/e2e/online_serving/test_qwen3_omni_expansion.py::test_text_to_text_audio_001 -m "full_model and rocm and MI325 and cards_2" --run-level "full_model"
+
+  - group: ":speaker: CosyVoice3 MI300 Nightly"
+    steps:
+      # Exercise all sync/async and Chinese/English cases with the platform's
+      # default attention backend. On ROCm this retains end-to-end AITER
+      # coverage without putting its cold JIT build on the READY critical path.
+      - label: "CosyVoice3-TTS E2E Test"
+        agent_pool: mi300_1
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 90
+        retry:
+          automatic:
+            - exit_status: 134
+              limit: 1
+        commands:
+          - pytest -s -v tests/e2e/online_serving/test_cosyvoice3_tts_expansion.py -m "slow" --run-level "core_model"

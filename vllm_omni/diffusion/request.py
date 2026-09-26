@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 import random
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniPromptType
@@ -55,6 +55,7 @@ class OmniDiffusionRequest:
     sampling_params: OmniDiffusionSamplingParams
     request_id: str
     kv_sender_info: dict[str, Any] | None = None
+    payload_sender_info: dict[str, Any] | None = None
     # Optional opaque, model-owned input prepared before Scheduler admission.
     # Model code validates its concrete type when consuming it on the Worker.
     prepared_layout: Any | None = None
@@ -70,6 +71,8 @@ class OmniDiffusionRequest:
     # Opaque native vLLM connector parameters. The Orchestrator and Scheduler
     # transport this bag without interpreting local pages or block IDs.
     kv_transfer_params: dict[str, Any] | None = None
+    # Worker-populated scheduler reuse boundaries, available before encoding.
+    kv_computed_tokens: tuple[int, ...] = ()
     # A model preprocessor may keep selected requests on the legacy full-forward
     # path even when the engine is globally configured for step execution.
     use_step_execution: bool = True
@@ -78,6 +81,9 @@ class OmniDiffusionRequest:
     kv_recv_ms: float = 0.0
     # Time spent waiting for initial admission by the diffusion scheduler.
     scheduler_queue_wait_ms: float | None = None
+    # Engine-owned shared-memory signal for cooperative full-forward workers.
+    # Only the engine creates/unlinks it; workers attach readers until return.
+    cancellation_signal: str | None = field(default=None, repr=False)
 
     def __post_init__(self):
         """Initialize dependent fields after dataclass initialization."""

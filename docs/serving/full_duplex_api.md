@@ -72,11 +72,20 @@ does not switch engines. The Python `Omni` / `AsyncOmni` APIs are unchanged.
     `session.created.session.capabilities` is present before treating the
     connection as full duplex.
 
-**MiniCPM-o 4.5** (`vllm_omni/deploy/minicpmo_4_5.yaml`) is the only model
-served over this endpoint today. PersonaPlex and Nemotron VoiceChat still carry
-their pre-framework duplex code: their pipelines declare no `duplex_plugin`, so
-they run turn-based until the follow-up PRs port them to the plugin contract
+**MiniCPM-o 4.5** (`vllm_omni/deploy/minicpmo_4_5.yaml`), **Qwen3-Omni**
+(`vllm_omni/deploy/qwen3_omni_duplex.yaml`), and **Nemotron VoiceChat**
+(`vllm_omni/deploy/nemotron_labs_voicechat_duplex.yaml`) are served
+over this endpoint today. PersonaPlex still carries its pre-framework duplex
+code: its pipeline declares no `duplex_plugin`, so it runs turn-based until the
+follow-up PR ports it to the plugin contract
 (RFC [vllm-omni#7181](https://github.com/vllm-project/vllm-omni/issues/7181)).
+
+For Nemotron VoiceChat Python clients, use
+`vllm_omni.clients.nemotron_voicechat.create_duplex_session_config()` with
+`DuplexClient`. The preset selects 16 kHz float32 input, 22.05 kHz PCM16 output,
+and automatic responses. Append 1,280-sample (80 ms) input frames; when using
+`stream_pcm`, set `chunk_ms=80`. Pass `instructions` and optional `tools` to
+the preset before opening the session.
 
 JoyVL is a separate HTTP interaction orchestrator and does not use these
 WebSocket endpoints. See [Standalone Experimental Servers](standalone_servers.md).

@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable, Mapping
+from dataclasses import dataclass
 from importlib import import_module
 from typing import TYPE_CHECKING
 
@@ -35,6 +36,21 @@ class DuplexRuntimeConfigError(ValueError):
     def __init__(self, message: str, *, code: str = "invalid_duplex_runtime_config") -> None:
         super().__init__(message)
         self.code = code
+
+
+def reject_private_runtime_keys(
+    extra_body: object,
+    private_runtime_config_keys: frozenset[str],
+    *,
+    message: str,
+    error_cls: type[DuplexRuntimeConfigError] = DuplexRuntimeConfigError,
+) -> None:
+    """Reject client overrides while preserving each plugin's error contract."""
+    if not isinstance(extra_body, dict):
+        return
+    private_keys = sorted(private_runtime_config_keys.intersection(extra_body))
+    if private_keys:
+        raise error_cls(message + ", ".join(private_keys))
 
 
 def reject_changed_runtime_value(
@@ -145,6 +161,64 @@ class DuplexModelSessionState(ABC):
     def clear_continuation(self) -> None: ...
 
 
+@dataclass(slots=True)
+class DefaultDuplexModelSessionState(DuplexModelSessionState):
+    """Framework-owned flag anatomy, implemented once.
+
+    The flag set above is the session runner's contract with the model (commit
+    retention, deferred response/creates, silence-continuation bookkeeping); it
+    is identical for every lockstep or frame-locked model, so a plugin only
+    supplies its input packetizer as ``audio_buffer``.
+    """
+
+    audio_buffer: PcmAppendBuffer
+    input_since_commit: bool = False
+    speech_since_commit: bool = False
+    context_locked: bool = False
+    committed_audio_payload: dict[str, object] | None = None
+    committed_audio_operation_id: str | None = None
+    committed_audio_reserved_bytes: int = 0
+    deferred_response_create: bool = False
+    deferred_precreate_response: bool = False
+    continuation_owner_id: str | None = None
+    continuation_units: int = 0
+    pending_silence_task: asyncio.Task[bool] | None = None
+    pending_silence_owner_id: str | None = None
+    # Deadline-aligned silence continuation state: the monotonic submission
+    # time of the most recent native input unit and the next silence
+    # continuation deadline. A real (non-silence) input resets the chain.
+    last_native_submit_monotonic: float | None = None
+    silence_deadline_monotonic: float | None = None
+
+    def retain_committed_audio(
+        self,
+        payload: dict[str, object],
+        *,
+        operation_id: str | None,
+        reserved_bytes: int = 0,
+    ) -> None:
+        self.committed_audio_payload = payload
+        self.committed_audio_operation_id = operation_id
+        self.committed_audio_reserved_bytes += max(0, int(reserved_bytes))
+
+    def clear_committed_audio(self) -> int:
+        reserved_bytes = self.committed_audio_reserved_bytes
+        self.committed_audio_payload = None
+        self.committed_audio_operation_id = None
+        self.committed_audio_reserved_bytes = 0
+        self.deferred_response_create = False
+        self.deferred_precreate_response = False
+        return reserved_bytes
+
+    def clear_continuation(self) -> None:
+        self.continuation_owner_id = None
+        self.continuation_units = 0
+        self.pending_silence_task = None
+        self.pending_silence_owner_id = None
+        self.last_native_submit_monotonic = None
+        self.silence_deadline_monotonic = None
+
+
 class DuplexDataPlane(ABC):
     """Projects raw stage outputs of one model into internal duplex events."""
 
@@ -168,6 +242,25 @@ class DuplexDataPlane(ABC):
 
 
 EncodeAudio = Callable[[object, int, str, float | None], str | None]
+
+
+@dataclass(frozen=True, slots=True)
+class PartialStageForward:
+    """One downstream update the orchestrator should submit.
+
+    ``close_only`` is a final update with no new sentence. ``output`` is the
+    model-built payload; the orchestrator does not interpret its text.
+
+    ``queue_close_after`` means this chunk still has text, but Stage1 has
+    finished and an earlier sentence is already in flight. The text must be
+    submitted resumable. A non-resumable submit is an end sentinel
+    (``StreamingUpdate.from_request`` returns None) and aborts that sentence.
+    """
+
+    output: object
+    is_final_update: bool
+    close_only: bool = False
+    queue_close_after: bool = False
 
 
 class DuplexModelPlugin(ABC):
@@ -237,6 +330,98 @@ class DuplexModelPlugin(ABC):
         output: object,
     ) -> DuplexOutputDecision | None: ...
 
+    def project_intermediate_output(
+        self,
+        *,
+        stage_id: int,
+        output: object,
+        context: object,
+    ) -> bool:
+        """Return True to project this intermediate stage to the client.
+
+        Unlike ``decide_output``, projecting does **not** short-circuit the
+        pipeline: the stage output is still forwarded to the next stage.
+        Default is off. Orthogonal to ``projects_intermediate_outputs``
+        (Qwen3 Stage0); this hook is per-stage.
+        """
+        del stage_id, output, context
+        return False
+
+    def user_transcript(
+        self,
+        *,
+        stage_id: int,
+        output: object,
+        prompt: object,
+        finished: bool,
+    ) -> str | None:
+        """ASR text to show as the user's words, or None.
+
+        Default models do not surface Stage0. AURA uses this for a spoken
+        turn only; vision-follow commits stay off the transcript.
+        """
+        del stage_id, output, prompt, finished
+        return None
+
+    def plan_partial_stage_output(
+        self,
+        orchestrator: object,
+        stage_id: int,
+        replica_id: int,
+        output: object,
+        req_state: object,
+    ) -> PartialStageForward | None:
+        """Return a Talker update the orchestrator should submit, or None.
+
+        Default models do not split Stage1 text. The orchestrator owns the
+        actual ``_forward_to_next_stage`` call.
+        """
+        del orchestrator, stage_id, replica_id, output, req_state
+        return None
+
+    def partial_stage_followup(self, plan: PartialStageForward, req_state: object) -> PartialStageForward | None:
+        """Optional second submit after ``plan`` has already been forwarded.
+
+        Default models have nothing to add. AURA uses this to queue the
+        end sentinel only after the last sentence text is already resumable.
+        """
+        del plan, req_state
+        return None
+
+    def commit_model_context(self, *, session_id: str | None, assistant_text: str) -> None:
+        """Persist model-context history at a turn boundary. Default is a no-op.
+
+        This is not playback-ACK history. A model that keeps its own prompt
+        transcript implements this; the session runner only decides when.
+        """
+        del session_id, assistant_text
+
+    def release_concurrent_turn_requests(
+        self,
+        *,
+        stage_id: int,
+        segment_finished: bool,
+        output: object,
+        context: object,
+    ) -> bool:
+        """Return True when the next user commit may start while prior TTS drains.
+
+        The plugin chooses when that is safe. The runner must not hard-code a
+        stage id. Default off. Unlike barge-in, this path must not cancel the
+        old TTS.
+        """
+        del stage_id, segment_finished, output, context
+        return False
+
+    def draining_stage_ids(self, *, stage_count: int) -> frozenset[int]:
+        """Output stages that may keep running after the next user turn starts.
+
+        Empty means a concurrent turn does not overlap a previous output
+        stage. Shared lifecycle reads this instead of assuming a stage layout.
+        """
+        del stage_count
+        return frozenset()
+
     # ---- session policy (was ServingRuntimeAdapter) ----
 
     @abstractmethod
@@ -283,6 +468,20 @@ class DuplexModelPlugin(ABC):
         item: Mapping[str, object],
     ) -> dict[str, object] | None:
         del config, current, item
+        return None
+
+    def runtime_config_after_model_output(
+        self,
+        current: Mapping[str, object],
+        output_metadata: Mapping[str, object],
+    ) -> dict[str, object] | None:
+        """Return a runtime-config patch after a model output is observed.
+
+        Plugins may use model-owned output metadata to retire server-side
+        runtime state that has been consumed by the worker. The default keeps
+        the framework unaware of model-specific metadata.
+        """
+        del current, output_metadata
         return None
 
 
@@ -336,6 +535,7 @@ def coerce_int(value: object) -> int | None:
 
 
 __all__ = [
+    "DefaultDuplexModelSessionState",
     "DuplexDataPlane",
     "DuplexModelPlugin",
     "DuplexModelSessionState",

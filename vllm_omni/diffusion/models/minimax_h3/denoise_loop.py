@@ -16,6 +16,7 @@ from typing import Any
 import torch
 
 from vllm_omni.diffusion.attention.backends.abstract import VideoTokenLayout, VideoTokenSpan
+from vllm_omni.diffusion.cancellation import check_request_cancellation
 from vllm_omni.diffusion.forward_context import (
     set_forward_context_denoise_step_idx,
     set_forward_context_denoise_timestep,
@@ -87,6 +88,7 @@ class MiniMaxH3DenoiseBranch:
             raise ValueError(f"token_tags length {int(token_tags.view(-1).shape[0])} != seq_len {seq_len}")
         cu = packed["cu_seqlens"].to(torch.int32)
         self.device = device
+        self.locked_audio_rows: torch.Tensor | None = None
         # ``used_len`` is the real (non-padding) document length; step-mode
         # batching concatenates layouts and needs both bounds as Python ints so
         # it can rebuild ``cu_seqlens`` without a device sync per step.
@@ -245,7 +247,7 @@ class MiniMaxH3DenoiseBranch:
                 self.audio_pos_dev,
                 self.audio_update_mask_dev,
                 audio_target_timesteps,
-                t_audio,
+                t_audio if self.locked_audio_rows is None else 1.0,
                 audio_ref_cond_timestep,
             ),
         )
@@ -365,6 +367,7 @@ def minimax_h3_denoise_loop(
 
     num_steps = len(sigmas_video) - 1
     for step in range(num_steps):
+        check_request_cancellation()
         step_cm = step_profiler(step) if step_profiler is not None else nullcontext()
         with step_cm:
             s_v, s_v_next = sigmas_video[step], sigmas_video[step + 1]
@@ -444,11 +447,12 @@ def minimax_h3_denoise_loop(
                 audio_rows[audio_update], x0_audio, sigma_curr=s_a, sigma_next=s_a_next
             )
             audio_rows = audio_rows.clone()
-            audio_rows[audio_update] = new_audio
+            audio_rows[audio_update] = new_audio if positive.locked_audio_rows is None else positive.locked_audio_rows
             if audio_anchor is not None:
                 audio_rows[~audio_update] = audio_anchor  # per-step audio ref reset
             if on_step is not None:
                 on_step(step, video_rows, audio_rows)
+            check_request_cancellation(synchronize=True)
 
     minimax_h3_publish_denoise_progress(None, None, None)
     return video_rows, audio_rows

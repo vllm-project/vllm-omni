@@ -23,8 +23,9 @@ class _FakeDecoder(nn.Module):
     def __init__(self, total_upsample: int = _TOTAL_UPSAMPLE):
         super().__init__()
         self.total_upsample = total_upsample
-        self.decode_calls: list[dict[str, int | tuple[int, ...]]] = []
+        self.decode_calls: list[dict[str, object]] = []
         self.batched_decode_calls: list[dict[str, object]] = []
+        self.batched_decode_codes: list[torch.Tensor] = []
         self.decode_codes: list[torch.Tensor] = []
         self.cudagraph_calls: list[dict[str, int | torch.device]] = []
 
@@ -64,6 +65,7 @@ class _FakeDecoder(nn.Module):
         left_context_size: int = 25,
         max_batch_size: int = 0,
     ) -> list[torch.Tensor]:
+        self.batched_decode_codes.append(codes.detach().cpu().clone())
         self.batched_decode_calls.append(
             {
                 "chunk_size": chunk_size,
@@ -91,8 +93,8 @@ class _FakeDecoder(nn.Module):
         wav_len = frames * self.total_upsample + 6
         wav = torch.arange(wav_len, dtype=torch.float32).view(1, 1, -1)
         offsets = torch.arange(batch, dtype=torch.float32).view(batch, 1, 1) * 1000
-        batched_wav = wav.expand(batch, 1, wav_len) + offsets
-        return [batched_wav[row, :, : lengths[row] * self.total_upsample] for row in range(batch)]
+        batched_outputs = wav.expand(batch, 1, wav_len) + offsets
+        return [batched_outputs[row, :, : lengths[row] * self.total_upsample] for row in range(batch)]
 
     def enable_cudagraph(self, **kwargs):
         self.cudagraph_calls.append(kwargs)
@@ -201,6 +203,26 @@ def test_forward_uses_decoder_audio_contract_without_context():
     audio = out.multimodal_outputs["model_outputs"][0]
     expected = torch.arange(24, dtype=torch.float32)
     torch.testing.assert_close(audio, expected)
+
+
+def test_forward_reads_current_model_intermediate_buffer_for_full_payload():
+    """Full-payload sync mode must decode connector codec ids, not placeholders."""
+    model = _make_model()
+    placeholder_ids = torch.zeros(12, dtype=torch.long)
+    payload_codes = torch.arange(12, dtype=torch.long) + 17
+
+    model.forward(
+        input_ids=placeholder_ids,
+        runtime_additional_information=[],
+        model_intermediate_buffer=[
+            {
+                "codes": {"audio": payload_codes},
+                "meta": {"left_context_size": 0},
+            }
+        ],
+    )
+
+    torch.testing.assert_close(model.decoder.batched_decode_codes[-1], payload_codes.reshape(1, _NUM_QUANTIZERS, 6))
 
 
 @pytest.mark.parametrize("skipped_length", [0, 1], ids=["empty", "malformed"])
@@ -577,6 +599,7 @@ def test_decode_chunking_override_is_passed_to_cudagraph():
     _load_weights_noop(model)
 
     assert model.decoder.cudagraph_calls[-1] == {
+        "capture_modes": ("icl", "xvec"),
         "capture_batch_sizes": None,
         "stateless_capture_sizes": None,
         "device": torch.device("cuda"),
@@ -605,6 +628,13 @@ def test_cudagraph_batch_config_is_preserved():
 
     call = model.decoder.cudagraph_calls[-1]
     assert call["capture_batch_sizes"] == [1, 2, 4, 8]
+
+
+def test_cudagraph_captures_only_modes_used_by_the_model():
+    model = _make_model(async_chunk=True, device=torch.device("cuda"))
+    model.decoder_cudagraph_modes = ("xvec",)
+    _load_weights_noop(model)
+    assert model.decoder.cudagraph_calls[-1]["capture_modes"] == ("xvec",)
 
 
 def test_stateless_cudagraph_capture_sizes_are_passed_from_config():

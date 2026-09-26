@@ -117,6 +117,7 @@ def test_explicit_sender_port_is_not_derived(name):
 
 @pytest.mark.parametrize("need_recv_cache", [False, True])
 @pytest.mark.parametrize("update_before_init", [False, True])
+@pytest.mark.usefixtures("reliable_claim_queries")
 def test_manager_receiver_does_not_bind_shared_producer_port(producer, need_recv_cache, update_before_init):
     """Payload-only and KV receivers must dial, not bind, the incoming edge."""
     from vllm_omni.distributed.omni_connectors.kv_transfer_manager import (
@@ -131,6 +132,7 @@ def test_manager_receiver_does_not_bind_shared_producer_port(producer, need_recv
                 "role": "receiver",
                 "host": "127.0.0.1",
                 "zmq_port": PORT,
+                "metadata_query_timeout_ms": 5000,
                 "backends": ["UCX"],
             },
             from_stage="0",
@@ -164,6 +166,7 @@ def test_manager_receiver_does_not_bind_shared_producer_port(producer, need_recv
 
 
 @pytest.mark.parametrize("need_recv_cache", [False, True])
+@pytest.mark.usefixtures("reliable_claim_queries")
 def test_manager_receiver_preserves_explicit_standalone_sender(producer, need_recv_cache):
     from vllm_omni.distributed.omni_connectors.kv_transfer_manager import (
         OmniKVCacheConfig,
@@ -278,14 +281,15 @@ def test_abandoned_claim_survives_close_and_late_completion(producer, consumer, 
     consumer._notify_transfer_done("abandoned", claimed)
     assert not producer._pending
     assert not producer._agent.registered
-    assert producer._listener_thread.is_alive()
-    producer.close()
+    producer._close_thread.join(timeout=2.0)
+    assert not producer._close_thread.is_alive()
+    assert producer._listener_thread is None
     assert not producer._agent.registered
     assert producer._closed
 
 
 @pytest.fixture
-def copying_native_agent(consumer, monkeypatch):
+def ownership_copying_agent(consumer, monkeypatch):
     """Strict fake descriptors and actual CPU copies; not native NIXL evidence."""
     calls = []
 
@@ -318,7 +322,7 @@ def copying_native_agent(consumer, monkeypatch):
 
 @pytest.mark.parametrize("case", ["empty", "all_empty", "mixed", "scalar", "structured_empty", "structured_mixed"])
 @pytest.mark.usefixtures("reliable_claim_queries")
-def test_zero_byte_leaves_roundtrip_without_native_descriptors(producer, consumer, copying_native_agent, case):
+def test_zero_byte_leaves_complete_source_claim(producer, consumer, ownership_copying_agent, case):
     empty = torch.empty((2, 0, 3), dtype=torch.float64)
     other = torch.empty((0,), dtype=torch.int64)
     scalar = torch.tensor(7)
@@ -343,15 +347,16 @@ def test_zero_byte_leaves_roundtrip_without_native_descriptors(producer, consume
         torch.testing.assert_close(actual, payload, rtol=0, atol=0)
     assert size == received_size
     if case in ("empty", "all_empty"):
-        assert not copying_native_agent
+        assert not ownership_copying_agent
     assert not producer._pending and not producer._agent.registered
     assert not consumer._agent.registered
 
 
 @pytest.mark.parametrize("direct", [False, True])
 @pytest.mark.parametrize("outcome", ["done", "error", "timeout", "unknown"])
+@pytest.mark.usefixtures("reliable_claim_queries")
 def test_read_ownership_through_terminal_and_deferred_paths(
-    producer, consumer, copying_native_agent, monkeypatch, direct, outcome
+    producer, consumer, ownership_copying_agent, monkeypatch, direct, outcome
 ):
     import threading
 
@@ -408,6 +413,7 @@ class _FakeNixlAgent:
         self.registered = []
 
     def get_reg_descs(self, regions, memory_type):
+        assert regions and all(region[0] > 0 and region[1] > 0 for region in regions)
         return ("reg", tuple(regions), memory_type)
 
     def register_memory(self, descs, backends=None):
@@ -473,7 +479,7 @@ def consumer(nixl_connector_cls):
 
 
 @pytest.fixture
-def reliable_claim_queries(producer, consumer, monkeypatch):
+def reliable_claim_queries(producer, nixl_connector_cls, monkeypatch):
     """Ownership probes need exact claims, not claims retained after lost replies.
 
     Exercise the real resolver, wire encoding and producer handler synchronously;
@@ -483,13 +489,13 @@ def reliable_claim_queries(producer, consumer, monkeypatch):
 
     from vllm_omni.distributed.omni_connectors.connectors.nixl_connector import _GET_META_MSG, _META_NOT_FOUND
 
-    def query(key, host, port, *, generation=None):
+    def query(self, key, host, port, *, generation=None):
         assert (host, port) == (producer.host, producer._zmq_port)
         request = {"key": key, "generation": generation, "claim_id": uuid.uuid4().hex}
         reply = producer._handle_handshake_message(_GET_META_MSG + msgspec.msgpack.encode(request))
         return None if reply == _META_NOT_FOUND else msgspec.msgpack.decode(reply)
 
-    monkeypatch.setattr(consumer, "_query_metadata_at", query)
+    monkeypatch.setattr(nixl_connector_cls, "_query_metadata_at", query)
 
 
 def test_put_publishes_its_handshake_endpoint(producer):
@@ -545,21 +551,150 @@ def test_source_endpoint_metadata_overrides_configured_sender(consumer, monkeypa
     assert queried == [("req-tp4-rank3", "10.0.0.3", PORT + 3 * 16)]
 
 
-def test_unknown_key_is_queried_once(producer, consumer, monkeypatch):
+@pytest.mark.parametrize("force_timeout", [False, True], ids=["real-query", "recv-timeout"])
+def test_unknown_key_is_queried_once(producer, consumer, monkeypatch, force_timeout):
     socket = consumer._get_req_socket(f"tcp://127.0.0.1:{PORT}")
     send_count = 0
     original_send = socket.send
 
     def count_send(message):
         nonlocal send_count
+        assert socket.getsockopt(zmq.RCVTIMEO) == 10
+        assert socket.getsockopt(zmq.SNDTIMEO) == 10
         send_count += 1
         return original_send(message)
 
     monkeypatch.setattr(socket, "send", count_send)
+    if force_timeout:
+
+        def timeout_recv():
+            raise zmq.Again()
+
+        monkeypatch.setattr(socket, "recv", timeout_recv)
 
     assert consumer._resolve_metadata("never-published", None) is None
     assert send_count == 1
-    assert socket.getsockopt(zmq.RCVTIMEO) == 10
+    if force_timeout:
+        assert socket.closed
+
+
+@pytest.mark.usefixtures("reliable_claim_queries")
+def test_deadline_get_retains_active_dma_then_releases(producer, consumer, ownership_copying_agent, monkeypatch):
+    producer.put("0", "1", "deadline-read", torch.ones(2))
+    consumer._stop_event.set()
+    consumer._transfer_wakeup.set()
+    consumer._transfer_thread.join(timeout=2)
+    state = ["PROC"]
+    monkeypatch.setattr(consumer._agent, "check_xfer_state", lambda handle: state[0])
+    started = time.monotonic()
+    assert consumer.get_with_deadline("0", "1", "deadline-read", deadline=started + 0.03) is None
+    assert time.monotonic() - started < 0.5
+    assert producer._pending["deadline-read"].claims
+    assert producer._agent.registered
+    assert consumer._agent.registered
+    assert consumer._deferred_transfers
+    state[0] = "DONE"
+    consumer._reap_deferred_transfers()
+    assert not producer._pending
+    assert not producer._agent.registered
+    assert not consumer._agent.registered
+    assert not consumer._deferred_transfers
+
+
+def test_receive_deadline_overrides_dma_timeout(consumer, monkeypatch):
+    monkeypatch.setattr(consumer._agent, "check_xfer_state", lambda handle: "PROC", raising=False)
+    consumer._transfer_timeout_s = 300
+    consumer._req_local.deadline = time.monotonic() + 0.02
+    started = time.monotonic()
+    try:
+        with pytest.raises(TimeoutError):
+            consumer._wait_for_transfer(1, "bounded")
+        assert time.monotonic() - started < 0.5
+    finally:
+        consumer._req_local.deadline = None
+
+
+@pytest.mark.parametrize("closing", [False, True])
+def test_abandoned_metadata_query_recovers_same_claim_without_read(producer, consumer, monkeypatch, closing):
+    from vllm_omni.distributed.omni_connectors.connectors.nixl_connector import _GET_META_MSG
+
+    consumer._stop_event.set()
+    consumer._transfer_wakeup.set()
+    consumer._transfer_thread.join(timeout=2)
+    producer.put("0", "1", "abandoned-query", torch.ones(1))
+    messages = []
+
+    def send(message):
+        messages.append(message)
+
+    def receive():
+        reply = producer._handle_handshake_message(messages[-1])
+        if len(messages) == 1:
+            raise zmq.Again()
+        return reply
+
+    socket = types.SimpleNamespace(send=send, recv=receive)
+    monkeypatch.setattr(consumer, "_get_req_socket", lambda *args: socket)
+    monkeypatch.setattr(consumer, "_invalidate_req_socket", lambda *args: None)
+    assert consumer.get_with_deadline("0", "1", "abandoned-query", deadline=time.monotonic() + 1) is None
+    assert not consumer._abandoned_queries
+    consumer.abandon_get("abandoned-query")
+    claim = next(iter(producer._pending["abandoned-query"].claims))
+    if closing:
+        producer._closing = True
+    consumer._reap_deferred_transfers()
+    assert not consumer._abandoned_queries
+    assert not producer._pending
+    claims = [
+        msgspec.msgpack.decode(message[len(_GET_META_MSG) :])["claim_id"]
+        for message in messages
+        if message.startswith(_GET_META_MSG)
+    ]
+    assert claims == [claim, claim]
+
+
+def test_expired_ack_is_deferred_instead_of_raising(consumer):
+    consumer._req_local.deadline = time.monotonic() - 1
+    try:
+        assert consumer._notify_transfer_done("expired", {"source_host": "127.0.0.1", "source_port": PORT}) is False
+    finally:
+        consumer._req_local.deadline = None
+
+
+@pytest.mark.parametrize("direct", [False, True])
+@pytest.mark.parametrize("lost_replies", [1, 3])
+def test_lost_metadata_reply_retry_releases_source(producer, consumer, monkeypatch, direct, lost_replies):
+    _, _, metadata = producer.put("0", "1", "lost-reply", torch.ones(1))
+    replies = []
+    requests = []
+
+    def send(message):
+        requests.append(message)
+        replies.append(producer._handle_handshake_message(message))
+
+    def recv():
+        reply = replies.pop(0)
+        if len(requests) <= lost_replies:
+            raise zmq.Again()
+        return reply
+
+    socket = types.SimpleNamespace(send=send, recv=recv)
+    monkeypatch.setattr(consumer, "_get_req_socket", lambda *args: socket)
+    forwarded = metadata if direct else None
+    for attempt in range(lost_replies):
+        assert consumer._resolve_metadata("lost-reply", forwarded) is None
+    resolved = consumer._resolve_metadata("lost-reply", forwarded)
+    assert resolved is not None
+    assert producer._pending["lost-reply"].claims == {resolved["claim_id"]}
+    independent = consumer._resolve_metadata("lost-reply", forwarded)
+    assert independent["claim_id"] != resolved["claim_id"]
+    consumer._notify_transfer_done("lost-reply", resolved)
+    consumer._notify_transfer_done("lost-reply", resolved)
+    assert producer._pending["lost-reply"].claims == {independent["claim_id"]}
+    consumer._notify_transfer_done("lost-reply", independent)
+    assert producer._pending == {}
+    assert producer._registered_descs == []
+    assert consumer._req_local.claims == {}
 
 
 @pytest.mark.usefixtures("reliable_claim_queries")
@@ -678,6 +813,77 @@ def test_deferred_transfer_releases_exactly_once_after_done(nixl_connector_cls):
         connector.close()
 
 
+@pytest.mark.parametrize("poll_raises", [False, True], ids=["stuck", "poll-error"])
+def test_close_returns_without_releasing_active_dma(nixl_connector_cls, poll_raises):
+    import threading
+
+    from vllm_omni.distributed.omni_connectors.connectors.nixl_connector import (
+        _RETAINED_PRODUCERS,
+        _DeferredTransfer,
+    )
+
+    connector = nixl_connector_cls({"role": "receiver"})
+    released = []
+
+    def check_state(handle):
+        if poll_raises:
+            raise RuntimeError("device unavailable")
+        return "PROC"
+
+    connector._agent.check_xfer_state = check_state
+    connector._agent.release_xfer_handle = lambda handle: released.append(("handle", handle))
+    connector._agent.release_dlist_handle = lambda handle: released.append(("dlist", handle))
+    connector._agent.remove_remote_agent = lambda agent: released.append(("agent", agent))
+    connector._agent.deregister_memory = lambda descs: released.append(("registration", descs))
+    transfer = _DeferredTransfer(
+        tensors=[torch.zeros(1)],
+        registrations=["registration"],
+        dlists=["local", "remote"],
+        handles=["transfer"],
+        remote_agent="producer",
+    )
+    connector._defer_transfer(transfer)
+    closing = threading.Thread(target=connector.close, daemon=True)
+    try:
+        closing.start()
+        closing.join(timeout=2.0)
+        assert not closing.is_alive(), "close must not wait forever for DMA completion"
+        assert released == []
+        assert transfer in connector._deferred_transfers
+        assert transfer.tensors
+        assert connector._closing
+        assert connector in _RETAINED_PRODUCERS
+        assert connector.health()["status"] == "unhealthy"
+        cleanup_thread = connector._close_thread
+        assert cleanup_thread is not None
+        connector.close()
+        assert connector._close_thread is cleanup_thread
+        connector._agent.check_xfer_state = lambda handle: "DONE"
+        cleanup_thread.join(timeout=2.0)
+        assert not cleanup_thread.is_alive()
+        assert connector._closed
+        assert not connector._deferred_transfers
+        assert not transfer.tensors
+        assert connector not in _RETAINED_PRODUCERS
+    finally:
+        connector._agent.check_xfer_state = lambda handle: "DONE"
+        closing.join(timeout=2.0)
+        connector.close()
+
+    assert released == [
+        ("handle", "transfer"),
+        ("dlist", "local"),
+        ("dlist", "remote"),
+        ("agent", "producer"),
+        ("registration", "registration"),
+    ]
+    assert not connector._deferred_transfers
+    assert not transfer.tensors
+    assert connector not in _RETAINED_PRODUCERS
+    connector.close()
+    assert len(released) == 5
+
+
 def test_active_sibling_transfer_requires_deferred_ownership(nixl_connector_cls):
     connector = nixl_connector_cls({"role": "receiver"})
     connector._agent.check_xfer_state = lambda handle: {"failed": "ERR", "active": "PROC"}[handle]
@@ -688,7 +894,8 @@ def test_active_sibling_transfer_requires_deferred_ownership(nixl_connector_cls)
         connector.close()
 
 
-def test_get_defers_complete_ownership_when_sibling_transfer_is_active(nixl_connector_cls):
+@pytest.mark.parametrize("with_empty", [False, True])
+def test_get_defers_complete_ownership_when_sibling_transfer_is_active(nixl_connector_cls, with_empty):
     connector = nixl_connector_cls({"role": "receiver"})
     connector._agent.add_remote_agent = lambda metadata: "producer"
     connector._agent.get_xfer_descs = lambda regions, memory_type: (regions, memory_type)
@@ -716,6 +923,9 @@ def test_get_defers_complete_ownership_when_sibling_transfer_is_active(nixl_conn
         ],
         "size": 8,
     }
+    if with_empty:
+        metadata["tensor_specs"].insert(1, {"shape": [2, 0, 3], "dtype": "torch.int64", "device": "cpu", "size": 0})
+        metadata["descriptor_groups"][1]["tensor_indices"] = [2]
 
     try:
         assert connector.get("0", "1", "req-active-sibling", metadata) is None
@@ -726,7 +936,9 @@ def test_get_defers_complete_ownership_when_sibling_transfer_is_active(nixl_conn
         assert len(deferred.registrations) == 2
         assert len(deferred.dlists) == 4
         assert deferred.remote_agent == "producer"
-        assert len(deferred.tensors) == 2
+        assert len(deferred.tensors) == 2 + with_empty
+        if with_empty:
+            assert deferred.tensors[1].shape == (2, 0, 3)
     finally:
         connector._agent.check_xfer_state = lambda handle: "DONE"
         connector.close()
@@ -890,3 +1102,198 @@ def test_receive_device_config_wins(nixl_connector_cls):
         assert connector._resolve_receive_device("cuda:3") == torch.device("cpu")
     finally:
         connector.close()
+
+
+@pytest.fixture
+def copying_native_agent(consumer, monkeypatch):
+    """Enforce native nonzero descriptors and copy only the submitted regions."""
+    agent = consumer._agent
+    calls = {"agents": [], "descs": [], "transfers": [], "released": []}
+
+    def add_remote(metadata):
+        calls["agents"].append(metadata)
+        return "producer"
+
+    def descriptors(regions, memory_type):
+        assert regions and all(len(region) == 3 and region[0] > 0 and region[1] > 0 for region in regions)
+        calls["descs"].append((regions, memory_type))
+        return regions
+
+    def prepare(operation, local, local_ids, remote, remote_ids):
+        assert operation == "READ"
+        assert local_ids == remote_ids == list(range(len(local)))
+        assert len(local) == len(remote)
+        pairs = list(zip(local, remote, strict=True))
+        for destination, source in pairs:
+            assert destination[1] == source[1] > 0
+        calls["transfers"].append(pairs)
+        return pairs
+
+    def transfer(pairs):
+        for destination, source in pairs:
+            ctypes.memmove(destination[0], source[0], source[1])
+
+    monkeypatch.setattr(agent, "add_remote_agent", add_remote, raising=False)
+    monkeypatch.setattr(agent, "get_xfer_descs", descriptors, raising=False)
+    monkeypatch.setattr(agent, "prep_xfer_dlist", lambda agent, descs: descs, raising=False)
+    monkeypatch.setattr(agent, "make_prepped_xfer", prepare, raising=False)
+    monkeypatch.setattr(agent, "transfer", transfer, raising=False)
+    monkeypatch.setattr(agent, "check_xfer_state", lambda handle: "DONE", raising=False)
+    for method in ("release_xfer_handle", "release_dlist_handle", "remove_remote_agent"):
+        monkeypatch.setattr(
+            agent, method, lambda handle, method=method: calls["released"].append((method, handle)), raising=False
+        )
+    return calls
+
+
+@pytest.mark.parametrize("case", ["empty", "all_empty", "mixed", "scalar", "structured_empty", "structured_mixed"])
+@pytest.mark.usefixtures("reliable_claim_queries")
+def test_zero_byte_leaves_roundtrip_without_native_descriptors(
+    producer, consumer, copying_native_agent, monkeypatch, case
+):
+    empty = torch.empty((2, 0, 3), dtype=torch.float64)
+    other_empty = torch.empty((0,), dtype=torch.int64)
+    scalar = torch.tensor(7, dtype=torch.int64)
+    vector = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+    payloads = {
+        "empty": empty,
+        "all_empty": [empty, other_empty],
+        "mixed": [empty, scalar, other_empty, vector, empty],
+        "scalar": scalar,
+        "structured_empty": {"leaves": (empty, [other_empty]), "label": "empty slots"},
+        "structured_mixed": {"leaves": (empty, [scalar, other_empty, vector, empty]), "label": "mixed slots"},
+    }
+    payload = payloads[case]
+    # Simulate mixed source memory groups without requiring a GPU in unit tests.
+    monkeypatch.setattr(producer, "_resolve_memory_type", lambda t: "VRAM" if t.dtype == torch.int64 else "DRAM")
+    # Splitting the producer's DRAM group on receipt also exercises local IDs:
+    # IDs are group-relative, whereas spec/skeleton indices remain global.
+    monkeypatch.setattr(consumer, "_resolve_memory_type", lambda t: "VRAM" if t.dtype == torch.float32 else "DRAM")
+    consumer._receive_device = torch.device("cpu")
+    success, size, metadata = producer.put("0", "1", "req-empty-slots", payload)
+    assert success
+    tensors = producer._pending["req-empty-slots"].tensors
+    specs = metadata["tensor_specs"]
+    assert len(specs) == len(tensors)
+    assert size == sum(t.numel() * t.element_size() for t in tensors)
+    for tensor, spec in zip(tensors, specs, strict=True):
+        assert spec["shape"] == list(tensor.shape)
+        assert spec["dtype"] == str(tensor.dtype)
+        assert spec["device"] == str(tensor.device)
+    indices = [i for group in metadata["descriptor_groups"] for i in group["tensor_indices"]]
+    assert sorted(indices) == [i for i, tensor in enumerate(tensors) if tensor.numel()]
+    # Verify receiver override applies to empty specs too, without trusting a
+    # producer's device index. Real CUDA placement is covered by the native suite.
+    for spec in specs:
+        if spec["size"] == 0:
+            spec["device"] = "cuda:7"
+    received = consumer.get("0", "1", "req-empty-slots", metadata)
+    assert received is not None
+    actual, received_size = received
+    assert received_size == size
+    if isinstance(payload, dict):
+        assert actual.keys() == payload.keys()
+        assert actual["label"] == payload["label"]
+        assert isinstance(actual["leaves"], tuple)
+        assert isinstance(actual["leaves"][1], list)
+        torch.testing.assert_close(actual["leaves"], payload["leaves"], rtol=0, atol=0)
+    else:
+        torch.testing.assert_close(actual, payload, rtol=0, atol=0)
+    calls = copying_native_agent
+    assert sum(len(pairs) for pairs in calls["transfers"]) == len(indices)
+    if case in ("empty", "all_empty"):
+        assert metadata["descriptor_groups"] == []
+        assert calls == {"agents": [], "descs": [], "transfers": [], "released": []}
+        assert size == 0
+    else:
+        assert len(calls["agents"]) == 1
+        assert len(calls["released"]) == 3 * len(calls["transfers"]) + 1
+    assert producer._pending == producer._published == {}
+    assert producer._registered_descs == producer._agent.registered == []
+    assert consumer._agent.registered == consumer._remote_agents == consumer._deferred_transfers == []
+
+
+@pytest.mark.parametrize(
+    "defect",
+    [
+        "missing_groups",
+        "missing_nonempty",
+        "duplicate",
+        "empty_index",
+        "zero_region",
+        "wrong_region_size",
+        "null_pointer",
+        "negative_device",
+        "short_region",
+        "bad_region_type",
+        "bool_index",
+        "float_index",
+        "empty_group",
+        "unequal_lengths",
+        "missing_memory_type",
+        "fake_empty_size",
+        "fake_nonempty_size",
+        "negative_shape",
+        "float_shape",
+        "bad_dtype",
+        "bad_spec",
+    ],
+)
+@pytest.mark.usefixtures("reliable_claim_queries")
+def test_invalid_empty_tensor_metadata_rejected_before_native_calls(producer, consumer, copying_native_agent, defect):
+    success, _, metadata = producer.put(
+        "0", "1", "req-invalid-empty", [torch.empty((0, 2)), torch.tensor(3.0), torch.empty((1, 0))]
+    )
+    assert success
+    group = metadata["descriptor_groups"][0]
+    region = group["regions"][0]
+    if defect == "missing_groups":
+        metadata.pop("descriptor_groups")
+    elif defect == "missing_nonempty":
+        metadata["descriptor_groups"] = []
+    elif defect == "duplicate":
+        group["tensor_indices"] *= 2
+        group["regions"] *= 2
+    elif defect == "empty_index":
+        group["tensor_indices"] = [0]
+    elif defect in ("zero_region", "wrong_region_size"):
+        group["regions"] = [(region[0], 0 if defect == "zero_region" else 8, 0, "")]
+    elif defect == "null_pointer":
+        group["regions"] = [(0, 4, 0, "")]
+    elif defect == "negative_device":
+        group["regions"] = [(region[0], 4, -1, "")]
+    elif defect == "short_region":
+        group["regions"] = [(region[0], 4)]
+    elif defect == "bad_region_type":
+        group["regions"] = [None]
+    elif defect in ("bool_index", "float_index"):
+        group["tensor_indices"] = [True if defect == "bool_index" else 1.0]
+    elif defect == "empty_group":
+        metadata["descriptor_groups"].append({"memory_type": "DRAM", "tensor_indices": [], "regions": []})
+    elif defect == "unequal_lengths":
+        group["regions"] = []
+    elif defect == "missing_memory_type":
+        group.pop("memory_type")
+    elif defect == "fake_empty_size":
+        metadata["tensor_specs"][1]["size"] = 0
+        metadata["descriptor_groups"] = []
+    elif defect == "fake_nonempty_size":
+        metadata["tensor_specs"][0]["size"] = 4
+    elif defect == "negative_shape":
+        metadata["tensor_specs"][0]["shape"] = [-1, 0]
+    elif defect == "float_shape":
+        metadata["tensor_specs"][0]["shape"] = [0.0, 2]
+    elif defect == "bad_dtype":
+        metadata["tensor_specs"][0]["dtype"] = "torch.not_a_dtype"
+    elif defect == "bad_spec":
+        metadata["tensor_specs"][0] = None
+    assert consumer.get("0", "1", "req-invalid-empty", metadata) is None
+    assert copying_native_agent == {"agents": [], "descs": [], "transfers": [], "released": []}
+    assert consumer._agent.registered == []
+    # Metadata acquisition now claims the source before validation. With no
+    # submitted DMA, failure safely completes that claim instead of leaking it;
+    # it must still report no successful payload receive.
+    assert producer._pending == producer._published == {}
+    assert producer._registered_descs == producer._agent.registered == []
+    assert consumer._metrics["gets"] == 0
+    assert consumer._metrics["errors"] == 1

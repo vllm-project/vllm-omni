@@ -17,7 +17,7 @@ steps:
         mirror_hardwares: l4_1
 
       - label: "Simple · Diffusion Test"
-        timeout_in_minutes: 20
+        timeout_in_minutes: 30
         commands:
           - "pytest -sv tests/diffusion -m 'core_model and cpu'"
         mirror_hardwares: l4_1
@@ -69,6 +69,7 @@ steps:
         source_file_dependencies: diffusion_distributed_attention
         commands:
           - timeout 20m pytest -sv tests/diffusion/distributed -m 'core_model and cuda and L4 and cards_2' --run-level "core_model"
+          - timeout 10m pytest -sv tests/diffusion/attention/test_ulysses_uaa.py -m 'core_model and cuda and L4 and cards_2' --run-level "core_model"
         mirror_hardwares: l4_2
 
       - label: "Diffusion · Distributed & Attention Test · 4-GPU"
@@ -102,7 +103,7 @@ steps:
     commands:
       - |
         timeout 15m bash -c "
-                  pytest -sv tests/engine/ tests/model_executor/ tests/worker/test_batched_omni_output.py -m 'core_model and cuda' --run-level 'core_model'
+                  pytest -sv tests/engine/ tests/model_executor/ tests/worker/test_batched_omni_output.py tests/worker_v2/ -m 'core_model and cuda' --run-level 'core_model'
         "
     mirror_hardwares: l4_1
 
@@ -117,11 +118,18 @@ steps:
 
   - label: "Entrypoints Test"
     depends_on: upload-ready-pipeline
+    # Workaround https://github.com/vllm-project/vllm-omni/issues/8016: shutdown()
+    # leaves inline UniProc DiffusionWorker VRAM mapped in the pytest parent.
+    # Isolate that leftover case in its own process so the driver drops the
+    # mapping; the rest stays a directory sweep with --deselect. Revert to a
+    # single sweep after the product shutdown fix.
     commands:
       - |
         timeout 30m bash -c "
+          set -eu
           export VLLM_WORKER_MULTIPROC_METHOD=spawn
-          pytest -sv tests/entrypoints/ -m 'core_model and cuda' --run-level 'core_model'
+          pytest -sv tests/entrypoints/test_async_omni.py::test_diffusion_generate_request_id -m 'core_model and cuda' --run-level 'core_model'
+          pytest -sv tests/entrypoints/ -m 'core_model and cuda' --run-level 'core_model' --deselect tests/entrypoints/test_async_omni.py::test_diffusion_generate_request_id
         "
     mirror_hardwares: l4_1
 
@@ -204,7 +212,7 @@ steps:
           - |
             timeout 40m bash -c "
               export VLLM_IMAGE_FETCH_TIMEOUT=60
-              pytest -s -v tests/e2e/online_serving/test_wan22_t2v.py -m 'core_model' --run-level 'core_model'
+              pytest -s -v tests/e2e/online_serving/test_wan22_t2v.py -m 'core_model and cuda' --run-level 'core_model'
             "
         mirror_hardwares: h100_1
 
@@ -246,5 +254,15 @@ steps:
             timeout 40m bash -c "
               export VLLM_IMAGE_FETCH_TIMEOUT=60
               pytest -s -v tests/e2e/online_serving/test_hunyuan_video_15_expansion.py -m 'core_model and diffusion' --run-level 'core_model'
+            "
+        mirror_hardwares: h100_1
+
+      - label: "Diffusion · LingBot-Video Test"
+        source_file_dependencies: diffusion_lingbot_function
+        commands:
+          - |
+            timeout 40m bash -c "
+              export VLLM_IMAGE_FETCH_TIMEOUT=60
+              pytest -s -v tests/e2e/online_serving/test_lingbot_video.py -m 'core_model and cuda' --run-level 'core_model'
             "
         mirror_hardwares: h100_1

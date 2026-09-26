@@ -8,6 +8,7 @@ import sys
 import types
 from dataclasses import fields, replace
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 from pydantic.fields import FieldInfo
@@ -19,6 +20,7 @@ from vllm.config import ParallelConfig as VllmParallelConfig
 from vllm.config import ProfilerConfig as VllmProfilerConfig
 from vllm.config import SchedulerConfig as VllmSchedulerConfig
 from vllm.engine.arg_utils import EngineArgs
+from vllm.model_executor.models.utils import extract_layer_index
 
 from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
 from vllm_omni.config.omni_config import (
@@ -61,9 +63,14 @@ _DEPLOY_DIR = Path(__file__).parents[2] / "vllm_omni" / "deploy"
 def _effective_backend_values(config_cls: type, engine_args: dict) -> dict[str, object]:
     backend_fields = fields(config_cls)
     backend_field_names = {backend_field.name for backend_field in backend_fields}
-    backend_config = config_cls(
-        **{name: copy.deepcopy(value) for name, value in engine_args.items() if name in backend_field_names}
-    )
+    # This is a schema/normalization comparison, not a Hub download test.
+    with (
+        patch("vllm.engine.arg_utils.get_model_path", side_effect=lambda model, *_: model),
+        patch("vllm_omni.diffusion.data.get_model_path", side_effect=lambda model, *_: model),
+    ):
+        backend_config = config_cls(
+            **{name: copy.deepcopy(value) for name, value in engine_args.items() if name in backend_field_names}
+        )
     effective_values: dict[str, object] = {}
     for backend_field in backend_fields:
         value = getattr(backend_config, backend_field.name)
@@ -78,6 +85,9 @@ _DIFFUSION_BACKEND_FIELDS = frozenset(field.name for field in fields(OmniDiffusi
 _TOPOLOGY_ONLY_ENGINE_ARGS = frozenset({"inline_diffusion"})
 _OMNI_ONLY_LLM_STAGE_ENGINE_FIELDS = frozenset(
     {
+        "final_output",
+        "use_v2_model_runner",
+        "supports_native_mrv2_data_plane",
         "active_stream_window",
         "codec_frame_rate_hz",
         "custom_voice_dir",
@@ -395,7 +405,9 @@ def test_mammoth_fp8_kv_deploy_projects_only_ar_stage(monkeypatch):
     )
 
     assert deploy.stages[0].engine_extras["kv_cache_dtype"] == "fp8_e4m3"
+    assert deploy.stages[0].engine_extras["kv_cache_dtype_skip_layers"] == ["0"]
     assert "kv_cache_dtype" not in deploy.stages[1].engine_extras
+    assert "kv_cache_dtype_skip_layers" not in deploy.stages[1].engine_extras
 
     legacy_args = [build_legacy_engine_args_dict(stage, "test-model") for stage in legacy_stages]
     typed_args = [
@@ -411,14 +423,22 @@ def test_mammoth_fp8_kv_deploy_projects_only_ar_stage(monkeypatch):
 
     assert ar_stage.stage_pipeline_config.execution_type == StageExecutionType.LLM_AR
     assert legacy_args[0]["kv_cache_dtype"] == "fp8_e4m3"
+    assert legacy_args[0]["kv_cache_dtype_skip_layers"] == ["0"]
     assert ar_stage.cache_config.cache_dtype == "fp8_e4m3"
+    assert ar_stage.cache_config.kv_cache_dtype_skip_layers == ["0"]
     assert "cache_dtype" in ar_stage.cache_config._omni_explicit_fields
     assert typed_args[0]["kv_cache_dtype"] == "fp8_e4m3"
+    assert typed_args[0]["kv_cache_dtype_skip_layers"] == ["0"]
+    # vLLM matches the list against the index it parses from each attention prefix.
+    assert str(extract_layer_index("ar.language_model.layers.0.self_attn.attn")) == "0"
 
     assert "kv_cache_dtype" not in legacy_args[1]
+    assert "kv_cache_dtype_skip_layers" not in legacy_args[1]
     assert dit_stage.cache_config.cache_dtype == "auto"
+    assert dit_stage.cache_config.kv_cache_dtype_skip_layers == []
     assert "cache_dtype" not in dit_stage.cache_config._omni_explicit_fields
     assert "kv_cache_dtype" not in typed_args[1]
+    assert "kv_cache_dtype_skip_layers" not in typed_args[1]
 
 
 def test_typed_llm_projection_rejects_explicit_fields_owned_by_another_boundary():

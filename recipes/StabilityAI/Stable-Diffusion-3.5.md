@@ -137,3 +137,39 @@ print('saved output.png')
 - Image quality is noticeably better than medium, with sharper details.
 - `negative_prompt` requires `guidance_scale > 1` to take effect; SD3 defaults to 1.0 (no CFG).
 - 2048×2048 fits within 48 GB but leaves little headroom (~45.5 GiB used out of 49 GiB).
+
+## XPU
+
+### 1x Intel Arc Pro B70 (32 GB) — stable-diffusion-3.5-medium
+
+Offline text-to-image at 1024x1024 with BF16 weights fully resident.
+
+#### Environment
+
+- OS: Linux
+- Python: 3.10+
+- torch: 2.13.0+xpu
+- vLLM: 0.29.0 (`98dff2a8`)
+- vLLM-Omni: `main` at `4c7a98c2`
+
+#### Command
+
+```bash
+python examples/offline_inference/text_to_image/text_to_image.py \
+  --model stabilityai/stable-diffusion-3.5-medium \
+  --prompt "a sunset over mountains, photorealistic" \
+  --num-inference-steps 28 \
+  --vae-use-tiling \
+  --output sd35_medium_output.png
+```
+
+#### Verification
+
+Confirm `sd35_medium_output.png` is written and matches the prompt.
+
+#### Notes
+
+- Memory usage: peak 19.5 GiB against 29.8 GiB free.
+- Known limitations: only `stable-diffusion-3.5-medium` offline generation was
+  qualified. `stable-diffusion-3.5-large` and online serving are out of scope
+  for this profile.

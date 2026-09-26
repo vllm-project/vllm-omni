@@ -59,7 +59,11 @@ from vllm_omni.worker.omni_connector_model_runner_mixin import (
 )
 from vllm_omni.worker.output.payload_build import build_omni_mm_payload
 from vllm_omni.worker.runner_assisted_metadata import RunnerAssistedFullAttentionMetadataRequest
-from vllm_omni.worker.sampling_utils import clamp_prompt_ids_to_penalty_padding, sanitize_min_tokens_stop_ids
+from vllm_omni.worker.sampling_utils import (
+    call_model_sampler,
+    clamp_prompt_ids_to_penalty_padding,
+    sanitize_min_tokens_stop_ids,
+)
 from vllm_omni.worker.sparse_audio import resolve_sparse_mm_routing
 
 logger = init_logger(__name__)
@@ -1315,7 +1319,14 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                     )
                 prepared_sampling_metadata = self._sampling_metadata_for_model_sampler(sampling_metadata)
                 self._apply_duplex_sampling(logits, prepared_sampling_metadata)
-                sampler_output = model_sample(logits, prepared_sampling_metadata)
+                sampler_output = call_model_sampler(
+                    self.model,
+                    model_sample,
+                    logits,
+                    prepared_sampling_metadata,
+                    input_batch=self.input_batch,
+                    requests=getattr(self, "requests", None),
+                )
                 if sampler_output is not None:
                     return sampler_output
                 # Contract: None => fall back to the default sampler (see
@@ -1899,8 +1910,6 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                 cudagraph_stats=cudagraph_stats,
             )
             output.kv_extracted_req_ids = kv_extracted_req_ids
-            with record_function_or_nullcontext("omni_output_builder:get_omni_connector_output"):
-                output.omni_connector_output = self.get_omni_connector_output()
             output.routed_experts = routed_experts_lists
         return output
 
@@ -2115,12 +2124,17 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             multimodal_outputs=multimodal_outputs,
         )
 
+        # Runs a TP collective, so it must stay on the main thread: the builder
+        # below runs on the async output thread, which would race execute_model().
+        with record_function_or_nullcontext("omni_async_output:get_omni_connector_output"):
+            omni_connector_output = self.get_omni_connector_output()
+
         def output_builder() -> OmniModelRunnerOutput:
             if output_tensor_snapshot.async_payload is not None:
                 with record_function_or_nullcontext("omni_async_output:wait_cpu_payload"):
                     output_tensor_snapshot.async_payload.wait()
             with record_function_or_nullcontext("omni_output_builder:total"):
-                return self._build_omni_model_runner_output_from_snapshot(
+                output = self._build_omni_model_runner_output_from_snapshot(
                     scheduler_output=scheduler_output_snapshot,
                     hidden_states=output_tensor_snapshot.hidden_states,
                     staged_hidden_states_cpu=output_tensor_snapshot.staged_hidden_states_cpu,
@@ -2140,6 +2154,8 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                     postprocess_already_applied=omni_postprocess_already_applied,
                     prefix_cache_step_id=prefix_cache_step_id,
                 )
+            output.omni_connector_output = omni_connector_output
+            return output
 
         if not use_async_omni_output:
             output = output_builder()

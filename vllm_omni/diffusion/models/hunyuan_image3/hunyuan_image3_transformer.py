@@ -75,7 +75,13 @@ from vllm_omni.diffusion.distributed.sp_plan import (
     SequenceParallelOutput,
 )
 from vllm_omni.diffusion.distributed.utils import get_local_device
-from vllm_omni.diffusion.forward_context import set_forward_context_denoise_step_idx
+from vllm_omni.diffusion.forward_context import (
+    get_forward_context,
+    get_paged_kv_computed_tokens,
+    is_forward_context_available,
+    paged_kv_prefill,
+    set_forward_context_denoise_step_idx,
+)
 from vllm_omni.diffusion.layers.fused_moe import FusedMoE
 from vllm_omni.diffusion.layers.norm import RMSNorm
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
@@ -1097,8 +1103,6 @@ class ImageKVCacheManager(nn.Module):
         layer resolves the actual CUDA or Ascend paged kernel.
         """
 
-        if uncond_cfg_prefill:
-            raise RuntimeError("Hunyuan negative-CFG prefill must run before paged row activation")
         if self._injected_ar_kv is not None:
             raise NotImplementedError("Hunyuan Scheduler-paged KV does not support imported AR KV")
         if not query_lens or len(seq_lens) != len(query_lens):
@@ -1109,7 +1113,6 @@ class ImageKVCacheManager(nn.Module):
         self.clear_legacy_prompt_kv_cache()
         bs = len(query_lens)
         q_len = query_lens[0]
-        seq_len = seq_lens[0]
         assert query.shape[0] == bs * q_len, f"{query.shape[0]} != {bs * q_len}"
 
         head_num_per_rank = query.shape[1]
@@ -1121,22 +1124,19 @@ class ImageKVCacheManager(nn.Module):
         value = value.reshape(bs, q_len, kv_head_num_per_rank, head_dim)
 
         joint_text_query = joint_text_key = joint_text_value = None
-        if self.sp_size > 1 and first_step:
+        if self.sp_size > 1 and uncond_cfg_prefill:
+            joint_text_query, joint_text_key, joint_text_value = query, key, value
+            query, key, value = query[:, :0], key[:, :0], value[:, :0]
+        elif self.sp_size > 1 and first_step:
             if shard_image_size is None or shard_image_size <= 0:
                 raise ValueError("Hunyuan paged Ulysses requires a positive local image shard size")
-            local_prompt_len = seq_len - shard_image_size
             joint_query_len = query.shape[1] - shard_image_size
-            if local_prompt_len != joint_query_len:
-                raise ValueError(
-                    "Hunyuan paged Ulysses prompt layout mismatch: "
-                    f"key_prompt={local_prompt_len}, query_prompt={joint_query_len}"
-                )
             joint_text_query = query[:, :joint_query_len]
-            joint_text_key = key[:, :local_prompt_len]
-            joint_text_value = value[:, :local_prompt_len]
+            joint_text_key = key[:, :joint_query_len]
+            joint_text_value = value[:, :joint_query_len]
             query = query[:, joint_query_len:]
-            key = key[:, local_prompt_len:]
-            value = value[:, local_prompt_len:]
+            key = key[:, joint_query_len:]
+            value = value[:, joint_query_len:]
 
         if joint_text_query is None:
             attn_metadata = AttentionMetadata(full_attn_spans=full_attn_spans)
@@ -1254,6 +1254,8 @@ class ImageKVCacheManager(nn.Module):
     ) -> torch.Tensor:
         self.image_token_len = kwargs.get("num_image_tokens")
         if self.attn.is_paged_kv_active():
+            # A native connector fills the same Scheduler-owned pages as
+            # local prefill. Imported prefixes need no dense reconstruction.
             full_attn_spans = kwargs.get("full_attn_spans")
             if full_attn_spans is None:
                 raise ValueError("Hunyuan Scheduler-paged KV requires full_attn_spans metadata")
@@ -1837,7 +1839,9 @@ class HunYuanAttention(nn.Module):
             num_kv_heads=self.num_kv_heads,
             scaling=self.scaling,
             image_token_len=4097,
-            prefix=f"{prefix}.image_attn",
+            # Native Mooncake pairs this canonical KV layer name with the AR
+            # HunYuanAttention: model.layers.N.self_attn.attn. Keep both in sync.
+            prefix=f"model.{prefix}",
         )
         self.image_rope2d_emb = HunYuanRotary2DEmbedder(
             num_heads=self.num_heads,
@@ -2479,6 +2483,7 @@ class HunyuanImage3Model(nn.Module):
         gen_timestep_scatter_index: torch.Tensor | None = None,
         uncond_cfg_prefill: bool = False,
         ar_kv_reuse_len: int = 0,
+        paged_kv_cached_prefix_len: int = 0,
         full_attn_spans: list[list[tuple[int, int]]] | None = None,
     ) -> tuple | BaseModelOutputWithPast:
         current_omni_platform.reset_diffusion_fused_moe_forward_context()
@@ -2537,7 +2542,9 @@ class HunyuanImage3Model(nn.Module):
             else:
                 shard_padding_size = shard_image_size * sp_world_size - num_image_tokens
             if first_step:
-                seq_lens = [prompt_size + shard_image_size + ar_kv_reuse_len for _ in seq_lens]
+                seq_lens = [
+                    prompt_size + shard_image_size + ar_kv_reuse_len + paged_kv_cached_prefix_len for _ in seq_lens
+                ]
             else:
                 seq_lens = [x - y for x, y in zip(seq_lens, query_lens)]
                 seq_lens = [seq_len + shard_image_size for seq_len in seq_lens]
@@ -2964,7 +2971,10 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
             seq_lens=[prefill_seq_len],
             num_image_tokens=0,
             ar_kv_reuse_len=negative_reuse_len,
-            full_attn_spans=model_kwargs["full_attn_spans"][batch_slice]
+            full_attn_spans=[
+                [(start, min(end, prefill_seq_len)) for start, end in spans if start < prefill_seq_len]
+                for spans in model_kwargs["full_attn_spans"][batch_slice]
+            ]
             if model_kwargs.get("full_attn_spans")
             else None,
         )
@@ -3018,7 +3028,33 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
         cfg_rank,
         device,
     ):
+        if is_forward_context_available() and get_forward_context().paged_kv_cached_prefix_len:
+            # Local hits are sliced after conditional-image embeddings are
+            # prepared in forward_call; the AR path must not truncate them.
+            return input_ids, 0
         ar_kv_data = model_kwargs.pop("ar_kv_data", None)
+        computed_tokens = get_paged_kv_computed_tokens()
+        if computed_tokens and computed_tokens[0] > 0:
+            positive_reuse_len = computed_tokens[0]
+            if (
+                len(computed_tokens) > 1
+                and computed_tokens[1] < positive_reuse_len
+                and (not cfg_parallel_ready or cfg_rank == 1)
+            ):
+                prefill_inputs = self._build_negative_cfg_prefill_inputs(
+                    input_ids,
+                    model_kwargs,
+                    batch_size,
+                    computed_tokens[1],
+                    positive_reuse_len,
+                    cfg_parallel_ready,
+                )
+                with (
+                    paged_kv_prefill(1, positive_reuse_len),
+                    torch.autocast(device_type=device.type, dtype=torch.bfloat16),
+                ):
+                    self.model.forward_call(**prefill_inputs)
+            return self._truncate_reused_prefix(input_ids, model_kwargs, positive_reuse_len), positive_reuse_len
         if ar_kv_data is None:
             logger.debug(
                 "[AR KV Reuse] cfg_rank=%s: no AR KV received, fallback to full recompute (reuse_len=0)",

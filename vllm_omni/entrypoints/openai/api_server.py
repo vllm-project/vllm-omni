@@ -95,7 +95,12 @@ from vllm_omni.engine.stage_init_utils import set_death_signal
 from vllm_omni.engine.stage_runtime import OmniClientConfig
 from vllm_omni.entrypoints.async_omni import ABORT_TIMEOUT_S, AsyncOmni
 from vllm_omni.entrypoints.duplex.serving import OmniDuplexSessionHandler
-from vllm_omni.entrypoints.duplex.warmup import _warmup_duplex_realtime
+from vllm_omni.entrypoints.duplex.warmup import (
+    DUPLEX_WARMUP_CLIENT_WAIT_S,
+    _warmup_duplex_realtime,
+    lookup_duplex_plugin,
+    startup_warmup_kind,
+)
 from vllm_omni.entrypoints.duplex_omni import DuplexOmni
 from vllm_omni.entrypoints.openai import app_state as openai_app_state
 from vllm_omni.entrypoints.openai.app_state import (
@@ -128,6 +133,7 @@ from vllm_omni.entrypoints.openai.images.helpers import (
     _check_max_generated_image_size,
     _choose_output_format,
     _extract_images_from_result,
+    _generated_size_str,
     _get_max_edit_input_images,
     _load_input_images,
     _update_if_not_none,
@@ -406,16 +412,19 @@ async def omni_run_server_worker(
 
                 await self._inner(scope, receive, send)
 
-        # Startup duplex warmup (duplex_session.warmup_frames in the deploy
-        # yaml): real /v1/realtime connections wait on this event so the
-        # first client never pays cold-start costs.
+        # Startup duplex warmup: real /v1/realtime connections wait on this
+        # event. Video-required models (AURA) do this by default — one short
+        # audio chunk plus one frame — even when warmup_frames is 0. That is
+        # not another call to the empty 0.01 s JIT-kernel registry.
         duplex_warmup_frames = 0
+        warmup_kind = None
         if getattr(app.state, "openai_serving_duplex", None) is not None:
             duplex_cfg = getattr(engine_client, "duplex_session_config", None)
             duplex_warmup_frames = int(getattr(duplex_cfg, "warmup_frames", 0) or 0)
-        app.state.duplex_warmup_done = asyncio.Event() if duplex_warmup_frames > 0 else None
+            warmup_kind = startup_warmup_kind(lookup_duplex_plugin(engine_client), duplex_warmup_frames)
+        app.state.duplex_warmup_done = asyncio.Event() if warmup_kind is not None else None
         warmup_task: asyncio.Task | None = None
-        if duplex_warmup_frames > 0:
+        if warmup_kind is not None:
             # Scheduled before serve_http (which may not return until
             # shutdown); the coroutine retries its self-connect until the
             # server socket is accepting.
@@ -1189,6 +1198,22 @@ async def omni_init_app_state(
     state.server_load_metrics = 0
 
 
+def _validate_chat_completion_raw_body(raw_body: dict[str, Any]) -> None:
+    """Reject values that upstream ChatCompletionRequest coerces too broadly."""
+    if "modalities" in raw_body and raw_body["modalities"] is not None:
+        modalities = raw_body["modalities"]
+        if not isinstance(modalities, list) or not all(isinstance(m, str) for m in modalities):
+            raise HTTPException(
+                status_code=HTTPStatus.BAD_REQUEST.value,
+                detail='modalities must be a list of strings, e.g. ["text", "audio", "image"]',
+            )
+    if "logprobs" in raw_body and raw_body["logprobs"] is not None and not isinstance(raw_body["logprobs"], bool):
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST.value,
+            detail="logprobs must be a boolean (true or false)",
+        )
+
+
 @router.post(
     "/v1/chat/completions",
     dependencies=[Depends(validate_json_request)],
@@ -1202,6 +1227,8 @@ async def omni_init_app_state(
 @with_cancellation
 @load_aware_call
 async def create_chat_completion(request: ChatCompletionRequest, raw_request: Request):
+    raw_body = await raw_request.json()
+    _validate_chat_completion_raw_body(raw_body)
     metrics_header_format = raw_request.headers.get(ENDPOINT_LOAD_METRICS_FORMAT_HEADER_LABEL, "")
     handler = Omnichat(raw_request)
     if handler is None:
@@ -1278,6 +1305,8 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
 @with_cancellation
 @load_aware_call
 async def create_batch_chat_completion(request: BatchChatCompletionRequest, raw_request: Request):
+    raw_body = await raw_request.json()
+    _validate_chat_completion_raw_body(raw_body)
     handler = OmniBatchChat(raw_request)
     if handler is None:
         base_server = getattr(raw_request.app.state, "serving_tokenization", None)
@@ -1462,7 +1491,6 @@ async def list_voices(raw_request: Request):
     handler = Omnispeech(raw_request)
     if handler is None:
         return _create_speech_error_json_response(
-            raw_request,
             "The model does not support Speech API",
             err_type="NotFoundError",
             status_code=HTTPStatus.NOT_FOUND,
@@ -1577,7 +1605,6 @@ async def upload_voice(
     handler = Omnispeech(raw_request)
     if handler is None:
         return _create_speech_error_json_response(
-            raw_request,
             "The model does not support Speech API",
             err_type="NotFoundError",
             status_code=HTTPStatus.NOT_FOUND,
@@ -1585,9 +1612,7 @@ async def upload_voice(
 
     try:
         if speaker_embedding is not None and audio_sample is not None:
-            return _create_speech_error_json_response(
-                raw_request, "'audio_sample' and 'speaker_embedding' are mutually exclusive"
-            )
+            return _create_speech_error_json_response("'audio_sample' and 'speaker_embedding' are mutually exclusive")
         if speaker_embedding is not None:
             result = await handler.upload_voice_embedding(speaker_embedding, consent, name)
         elif audio_sample is not None:
@@ -1599,18 +1624,15 @@ async def upload_voice(
                 speaker_description=speaker_description,
             )
         else:
-            return _create_speech_error_json_response(
-                raw_request, "Either 'audio_sample' or 'speaker_embedding' must be provided"
-            )
+            return _create_speech_error_json_response("Either 'audio_sample' or 'speaker_embedding' must be provided")
 
         return JSONResponse(content={"success": True, "voice": result})
 
     except ValueError as e:
-        return _create_speech_error_json_response(raw_request, str(e))
+        return _create_speech_error_json_response(str(e))
     except Exception as e:
         logger.exception(f"Failed to upload voice: {e}")
         return _create_speech_error_json_response(
-            raw_request,
             f"Failed to upload voice: {str(e)}",
             err_type="InternalServerError",
             status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
@@ -1643,7 +1665,6 @@ async def delete_voice(name: str, raw_request: Request):
     handler = Omnispeech(raw_request)
     if handler is None:
         return _create_speech_error_json_response(
-            raw_request,
             "The model does not support Speech API",
             err_type="NotFoundError",
             status_code=HTTPStatus.NOT_FOUND,
@@ -1654,7 +1675,6 @@ async def delete_voice(name: str, raw_request: Request):
         success = await handler.delete_voice(name)
         if not success:
             return _create_speech_error_json_response(
-                raw_request,
                 f"Voice '{name}' not found",
                 err_type="NotFoundError",
                 status_code=HTTPStatus.NOT_FOUND,
@@ -1663,11 +1683,10 @@ async def delete_voice(name: str, raw_request: Request):
         return JSONResponse(content={"success": True, "message": f"Voice '{name}' deleted successfully"})
 
     except ValueError as e:
-        return _create_speech_error_json_response(raw_request, str(e))
+        return _create_speech_error_json_response(str(e))
     except Exception as e:
         logger.exception(f"Failed to delete voice '{name}': {e}")
         return _create_speech_error_json_response(
-            raw_request,
             f"Failed to delete voice: {str(e)}",
             err_type="InternalServerError",
             status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
@@ -1769,9 +1788,12 @@ async def _wait_for_duplex_warmup(websocket: WebSocket) -> None:
     warmup_done = getattr(websocket.app.state, "duplex_warmup_done", None)
     if warmup_done is not None and not warmup_done.is_set() and websocket.query_params.get("vllm_omni_warmup") != "1":
         try:
-            await asyncio.wait_for(warmup_done.wait(), timeout=120)
+            await asyncio.wait_for(warmup_done.wait(), timeout=DUPLEX_WARMUP_CLIENT_WAIT_S)
         except (TimeoutError, asyncio.TimeoutError):
-            logger.warning("Duplex warmup still running after 120 s; admitting the client anyway.")
+            logger.warning(
+                "Duplex warmup still running after %d s; admitting the client anyway.",
+                DUPLEX_WARMUP_CLIENT_WAIT_S,
+            )
 
 
 @router.websocket("/v1/duplex")
@@ -2002,8 +2024,9 @@ def _build_image_generation_response(
             peak_memory_mb=peak_memory_mb,
         ),
     }
-    if request.size is not None:
-        response_kwargs["size"] = request.size
+    size = _generated_size_str(images, request.size)
+    if size is not None:
+        response_kwargs["size"] = size
     response = ImageGenerationResponse(**response_kwargs)
     if request.response_format == ResponseFormat.FILE:
         return response.stream_response()
@@ -2428,6 +2451,8 @@ async def edit_images(
 
         _update_if_not_none(gen_params, "width", width)
         _update_if_not_none(gen_params, "height", height)
+        gen_params.width_not_provided = size_was_auto
+        gen_params.height_not_provided = size_was_auto
 
         # 3.4 Add optional parameters ONLY if provided
         _update_if_not_none(gen_params, "num_inference_steps", num_inference_steps)
@@ -2580,7 +2605,7 @@ async def edit_images(
             created=int(time.time()),
             data=image_data,
             output_format=output_format,
-            size=size_str,
+            size=_generated_size_str(images, size_str),
             cot_output=cot_output,
             metrics=_build_image_response_metrics(
                 response_metrics=response_metrics,

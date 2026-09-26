@@ -13,11 +13,13 @@ Two groups:
    CFG handling, and reshape logic can be verified numerically on CPU.
 """
 
+import os
 from types import SimpleNamespace
 
 import pytest
 import torch
 from torch import nn
+from transformers import Qwen3VLConfig
 
 from vllm_omni.diffusion.data import DiffusionParallelConfig, OmniDiffusionConfig, TransformerConfig
 
@@ -56,9 +58,17 @@ def mock_dependencies(mocker, monkeypatch):
         f"{_MODULE}.FlowMatchEulerDiscreteScheduler.from_pretrained",
         lambda *a, **k: mock_scheduler,
     )
-    monkeypatch.setattr(
+    mllm_loader = mocker.patch(
         f"{_MODULE}.Qwen3VLForConditionalGeneration.from_pretrained",
-        lambda *a, **k: mllm_wrapper,
+        return_value=mllm_wrapper,
+    )
+    mllm_config_loader = mocker.patch(
+        f"{_MODULE}.Qwen3VLConfig.from_pretrained",
+        return_value=Qwen3VLConfig(),
+    )
+    mllm_builder = mocker.patch(
+        f"{_MODULE}.create_transformers_model_with_vllm_linears",
+        return_value=nn.Linear(1, 1),
     )
     monkeypatch.setattr(
         f"{_MODULE}.Qwen3VLProcessor.from_pretrained",
@@ -74,12 +84,17 @@ def mock_dependencies(mocker, monkeypatch):
     mock_transformer_cls.return_value = mock_transformer_instance
     monkeypatch.setattr(f"{_MODULE}.BooguImageTransformer2DModel", mock_transformer_cls)
 
-    # Treat the dummy model id as a local path: skips hub prefetch.
-    mocker.patch("os.path.exists", return_value=True)
+    # Treat only the dummy model id as local. Other filesystem checks (for
+    # example lazy imports in the quantization registry) must remain real.
+    path_exists = os.path.exists
+    mocker.patch("os.path.exists", side_effect=lambda path: str(path).startswith("dummy-boogu") or path_exists(path))
 
     return {
         "inner_encoder": inner_encoder,
         "mllm_wrapper": mllm_wrapper,
+        "mllm_loader": mllm_loader,
+        "mllm_config_loader": mllm_config_loader,
+        "mllm_builder": mllm_builder,
         "processor": mock_processor,
         "vae": mock_vae,
         "scheduler": mock_scheduler,
@@ -128,6 +143,9 @@ def test_constructor_wires_components(boogu_pipeline, mock_dependencies):
     assert boogu_pipeline.vae_scale_factor == 8
     assert boogu_pipeline.default_sample_size == 128
     assert hasattr(boogu_pipeline, "load_weights")
+    assert "quantization_config" not in mock_dependencies["mllm_loader"].call_args.kwargs
+    mock_dependencies["mllm_config_loader"].assert_not_called()
+    mock_dependencies["mllm_builder"].assert_not_called()
 
 
 def test_constructor_strips_mllm_lm_head(boogu_pipeline, mock_dependencies):
@@ -188,7 +206,7 @@ def test_constructor_weights_sources(boogu_pipeline):
     assert source.fall_back_to_pt is True
 
 
-def test_constructor_routes_only_transformer_config(mock_dependencies, mocker):
+def test_constructor_rejects_unsupported_mllm_quantization(mock_dependencies, mocker):
     from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
     from vllm_omni.diffusion.models.boogu_image.pipeline_boogu_image import BooguImagePipeline
@@ -204,18 +222,155 @@ def test_constructor_routes_only_transformer_config(mock_dependencies, mocker):
             {"transformer": transformer_config, "mllm": encoder_config, "vae": None}
         ),
     )
+    with pytest.raises(ValueError, match="Boogu MLLM only supports FP8 quantization"):
+        BooguImagePipeline(od_config=od_config)
+    mock_dependencies["mllm_loader"].assert_not_called()
+    mock_dependencies["mllm_config_loader"].assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("quantization_config", "quantize_mllm"),
+    [
+        pytest.param("fp8", True, id="global-fp8"),
+        pytest.param({"mllm": {"method": "fp8"}, "transformer": {"method": "fp8"}}, True, id="mllm-and-dit-fp8"),
+        pytest.param({"mllm": None, "transformer": "fp8"}, False, id="dit-only-fp8"),
+    ],
+)
+def test_constructor_routes_mllm_quantization(mock_dependencies, quantization_config, quantize_mllm):
+    from transformers import AutoModel
+    from vllm.model_executor.layers.quantization.fp8 import Fp8Config
+    from vllm.model_executor.layers.quantization.online.base import OnlineQuantizationConfig
+    from vllm.model_executor.layers.quantization.utils.quant_utils import kFp8Static128BlockSym
+
+    from vllm_omni.diffusion.models.boogu_image.pipeline_boogu_image import BooguImagePipeline
+
+    od_config = OmniDiffusionConfig(
+        model="dummy-boogu",
+        revision="test-revision",
+        tf_model_config=TransformerConfig(params={}),
+        dtype=torch.bfloat16,
+        quantization_config=quantization_config,
+    )
+    pipeline = BooguImagePipeline(od_config=od_config)
+
+    if quantize_mllm:
+        mock_dependencies["mllm_loader"].assert_not_called()
+        mock_dependencies["mllm_config_loader"].assert_called_once_with(
+            "dummy-boogu", subfolder="mllm", local_files_only=True, revision="test-revision"
+        )
+        builder = mock_dependencies["mllm_builder"]
+        builder.assert_called_once()
+        auto_cls, hf_config, online_quant_config = builder.call_args.args
+        assert auto_cls is AutoModel
+        assert hf_config is mock_dependencies["mllm_config_loader"].return_value
+        assert isinstance(online_quant_config, OnlineQuantizationConfig)
+        assert online_quant_config.args.linear.weight == kFp8Static128BlockSym
+        assert builder.call_args.kwargs == {
+            "dtype": torch.bfloat16,
+            "device": pipeline._execution_device,
+            "prefix": "mllm",
+            "skip_modules": ("mllm.visual",),
+        }
+        assert pipeline.mllm is builder.return_value
+        assert not pipeline.mllm.training
+        assert all(not parameter.requires_grad for parameter in pipeline.mllm.parameters())
+        transformer_source, mllm_source = pipeline.weights_sources
+        assert transformer_source.subfolder == "transformer"
+        assert mllm_source.model_or_path == "dummy-boogu"
+        assert mllm_source.subfolder == "mllm"
+        assert mllm_source.prefix == "mllm."
+        assert mllm_source.revision == "test-revision"
+    else:
+        assert "quantization_config" not in mock_dependencies["mllm_loader"].call_args.kwargs
+        assert pipeline.mllm is mock_dependencies["inner_encoder"]
+        mock_dependencies["mllm_config_loader"].assert_not_called()
+        mock_dependencies["mllm_builder"].assert_not_called()
+        assert [source.subfolder for source in pipeline.weights_sources] == ["transformer"]
+    assert isinstance(mock_dependencies["transformer_cls"].call_args.kwargs["quant_config"], Fp8Config)
+
+
+def test_constructor_preserves_mllm_ignored_layers(mock_dependencies):
+    from vllm.model_executor.layers.quantization.fp8 import Fp8Config
+
+    from vllm_omni.diffusion.models.boogu_image.pipeline_boogu_image import BooguImagePipeline
+
+    quant_config = Fp8Config(
+        ignored_layers=["mllm.language_model.layers.0.self_attn.q_proj", "transformer.blocks.0.attn.to_q"]
+    )
+    od_config = OmniDiffusionConfig(
+        model="dummy-boogu",
+        tf_model_config=TransformerConfig(params={}),
+        dtype=torch.bfloat16,
+        quantization_config=quant_config,
+    )
     BooguImagePipeline(od_config=od_config)
-    kwargs = mock_dependencies["transformer_cls"].call_args.kwargs
-    assert kwargs["quant_config"] is transformer_config
-    assert kwargs["prefix"] == "transformer"
+
+    online_quant_config = mock_dependencies["mllm_builder"].call_args.args[2]
+    assert online_quant_config.ignored_layers == quant_config.ignored_layers
+
+
+def test_constructor_preserves_serialized_mllm_quantization(mock_dependencies):
+    from vllm_omni.diffusion.models.boogu_image.pipeline_boogu_image import BooguImagePipeline
+
+    mock_dependencies["mllm_config_loader"].return_value = Qwen3VLConfig(
+        quantization_config={"quant_method": "fp8", "modules_to_not_convert": ["model.visual"]}
+    )
+    od_config = OmniDiffusionConfig(
+        model="dummy-boogu-fp8",
+        tf_model_config=TransformerConfig(params={}),
+        dtype=torch.bfloat16,
+        quantization_config="fp8",
+    )
+    pipeline = BooguImagePipeline(od_config=od_config)
+
+    # No override: HF reads the serialized checkpoint's scales and skip list.
+    assert "quantization_config" not in mock_dependencies["mllm_loader"].call_args.kwargs
+    assert pipeline.mllm is mock_dependencies["inner_encoder"]
+    mock_dependencies["mllm_builder"].assert_not_called()
+    assert [source.subfolder for source in pipeline.weights_sources] == ["transformer"]
+
+
+def test_load_weights_maps_mllm_and_preserves_transformer():
+    from vllm_omni.diffusion.models.boogu_image.pipeline_boogu_image import BooguImagePipeline
+
+    pipeline = object.__new__(BooguImagePipeline)
+    nn.Module.__init__(pipeline)
+    pipeline.mllm = nn.ModuleDict(
+        {
+            "language_model": nn.Linear(2, 2, bias=False),
+            "visual": nn.Linear(2, 2, bias=False),
+        }
+    )
+    pipeline.transformer = nn.Linear(2, 2, bias=False)
+    language_weight = torch.full((2, 2), 1.0)
+    visual_weight = torch.full((2, 2), 2.0)
+    transformer_weight = torch.full((2, 2), 3.0)
+
+    loaded = pipeline.load_weights(
+        [
+            ("mllm.lm_head.weight", torch.full((2, 2), 9.0)),
+            ("mllm.model.language_model.weight", language_weight),
+            ("mllm.model.visual.weight", visual_weight),
+            ("transformer.weight", transformer_weight),
+        ]
+    )
+
+    assert loaded == {"mllm.language_model.weight", "mllm.visual.weight", "transformer.weight"}
+    torch.testing.assert_close(pipeline.mllm["language_model"].weight, language_weight)
+    torch.testing.assert_close(pipeline.mllm["visual"].weight, visual_weight)
+    torch.testing.assert_close(pipeline.transformer.weight, transformer_weight)
 
 
 @pytest.mark.parametrize(
     ("parallel_config", "cache_backend", "message"),
     [
         (DiffusionParallelConfig(tensor_parallel_size=2), "none", "Tensor parallelism"),
-        (DiffusionParallelConfig(ulysses_degree=2), "none", "Sequence parallelism"),
-        (DiffusionParallelConfig(ring_degree=2), "none", "Sequence parallelism"),
+        (DiffusionParallelConfig(ring_degree=2), "none", "Ulysses only"),
+        (
+            DiffusionParallelConfig(ulysses_degree=2, cfg_parallel_size=2),
+            "none",
+            "CFG parallelism is not validated",
+        ),
         (
             DiffusionParallelConfig(use_hsdp=True, hsdp_shard_size=2),
             "none",
@@ -268,6 +423,96 @@ def test_constructor_accepts_cfg_parallel(mock_dependencies, cfg_parallel_size):
     assert pipeline.od_config.parallel_config.cfg_parallel_size == cfg_parallel_size
     assert hasattr(pipeline, "predict_noise_maybe_with_cfg")
     assert hasattr(pipeline, "predict_noise_with_multi_branch_cfg")
+
+
+def test_constructor_accepts_ulysses_uaa(
+    mock_dependencies,
+    monkeypatch,
+):
+    from vllm_omni.diffusion.models.boogu_image.pipeline_boogu_image import (
+        BooguImagePipeline,
+    )
+
+    monkeypatch.setattr(
+        f"{_MODULE}.current_omni_platform.is_cuda",
+        lambda: True,
+    )
+    od_config = OmniDiffusionConfig(
+        model="dummy-boogu",
+        tf_model_config=TransformerConfig(
+            params={
+                "num_attention_heads": 28,
+                "num_kv_heads": 7,
+            }
+        ),
+        dtype=torch.float32,
+        parallel_config=DiffusionParallelConfig(
+            ulysses_degree=2,
+            ulysses_mode="advanced_uaa",
+        ),
+    )
+
+    pipeline = BooguImagePipeline(od_config=od_config)
+    assert pipeline.transformer is mock_dependencies["transformer"]
+
+
+def test_constructor_requires_uaa_for_boogu_gqa(
+    mock_dependencies,
+    monkeypatch,
+):
+    from vllm_omni.diffusion.models.boogu_image.pipeline_boogu_image import (
+        BooguImagePipeline,
+    )
+
+    monkeypatch.setattr(
+        f"{_MODULE}.current_omni_platform.is_cuda",
+        lambda: True,
+    )
+    od_config = OmniDiffusionConfig(
+        model="dummy-boogu",
+        tf_model_config=TransformerConfig(
+            params={
+                "num_attention_heads": 28,
+                "num_kv_heads": 7,
+            }
+        ),
+        dtype=torch.float32,
+        parallel_config=DiffusionParallelConfig(
+            ulysses_degree=2,
+            ulysses_mode="strict",
+        ),
+    )
+
+    with pytest.raises(ValueError, match="advanced_uaa"):
+        BooguImagePipeline(od_config=od_config)
+
+
+def test_constructor_rejects_non_cuda_sequence_parallelism(
+    mock_dependencies,
+    monkeypatch,
+):
+    from vllm_omni.diffusion.models.boogu_image.pipeline_boogu_image import (
+        BooguImagePipeline,
+    )
+
+    monkeypatch.setattr(
+        f"{_MODULE}.current_omni_platform.is_cuda",
+        lambda: False,
+    )
+    od_config = OmniDiffusionConfig(
+        model="dummy-boogu",
+        tf_model_config=TransformerConfig(params={}),
+        dtype=torch.float32,
+        parallel_config=DiffusionParallelConfig(
+            ulysses_degree=2,
+            ulysses_mode="advanced_uaa",
+        ),
+    )
+
+    with pytest.raises(NotImplementedError, match="requires CUDA"):
+        BooguImagePipeline(od_config=od_config)
+
+    mock_dependencies["mllm_wrapper"].model.to.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

@@ -476,7 +476,7 @@ def _response_created_event(event: Mapping[str, object]) -> ResponseCreated:
 
 
 def _response_speak_metadata(event: Mapping[str, object]) -> dict[str, object]:
-    return {key: event[key] for key in ("session_id", "epoch", "model_speak") if key in event}
+    return {key: event[key] for key in ("session_id", "epoch", "model_speak", "vllm_omni") if key in event}
 
 
 def _realtime_audio_delta_events(
@@ -839,17 +839,19 @@ def _project(state: RealtimeProjectionState, event: dict[str, object]) -> list[D
             _refresh_in_progress_response_item(state, response_id)
         text = event.get("text")
         has_text = isinstance(text, str) and bool(text)
+        has_audio_delta = isinstance(audio, str) and bool(audio)
         if has_text:
             _append_response_transcript(state, response_id, cast("str", text))
             _refresh_in_progress_response_item(state, response_id)
         # Keep the audio.delta + transcript.delta pair invariant even for
         # text-less units so clients that treat the pair as unit-complete work.
-        if has_text or (isinstance(audio, str) and bool(audio)):
+        if has_text or has_audio_delta:
             events.append(
                 TranscriptDelta(
                     response_id=_str_or_none(response_id),
                     item_id=_response_item_id(state, response_id),
                     delta=cast("str", text) if has_text else "",
+                    metadata=_response_speak_metadata(event) if has_text and not has_audio_delta else None,
                 )
             )
         if event.get("end_of_turn") is True:
@@ -894,6 +896,33 @@ def _project(state: RealtimeProjectionState, event: dict[str, object]) -> list[D
             *_realtime_response_terminal_events(
                 state, event, response_id, status=status, status_details=status_details
             ),
+        ]
+    if event_type == "input.transcribed":
+        transcript = event.get("transcript")
+        if not isinstance(transcript, str) or not transcript.strip():
+            return []
+        transcript = transcript.strip()
+        raw_item_id = event.get("realtime_item_id")
+        item_id = raw_item_id if isinstance(raw_item_id, str) and raw_item_id else f"item_{uuid4().hex}"
+        committed_item = state.conversation_items.get(item_id)
+        if isinstance(committed_item, dict):
+            content = committed_item.get("content")
+            if not isinstance(content, list):
+                content = []
+                committed_item["content"] = content
+            updated = False
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "input_audio":
+                    part["transcript"] = transcript
+                    updated = True
+                    break
+            if not updated:
+                content.append({"type": "input_audio", "transcript": transcript})
+        return [
+            InputTranscriptionCompleted(
+                item_id=item_id,
+                transcript=transcript,
+            )
         ]
     if event_type == "input.committed":
         event_item_id = event.get("realtime_item_id")
@@ -946,6 +975,16 @@ def _project(state: RealtimeProjectionState, event: dict[str, object]) -> list[D
         if not isinstance(response_id, str) or not response_id:
             return events
         if response_is_done(state, response_id):
+            # Generation may finish long before the client drains its audio.
+            # A later barge-in still needs to stop that queued playback, but
+            # must not produce a second response.done for the completed turn.
+            playback = event.get("playback")
+            if (
+                not events
+                and isinstance(playback, Mapping)
+                and _int_or(playback.get("sent_ms")) > _int_or(playback.get("committed_ms"))
+            ):
+                events.append(OutputAudioCleared(response_id=response_id))
             return events
         committed_ms = event.get("committed_ms")
         if isinstance(committed_ms, int | float):
@@ -1158,6 +1197,7 @@ def note_input_append(
     payload: dict[str, object],
     *,
     vad_result: TurnDetectionResult | None = None,
+    allows_video_without_audio: bool = False,
 ) -> list[DuplexEvent]:
     """Update the input-buffer projection for one appended chunk; returns typed events.
 
@@ -1170,9 +1210,18 @@ def note_input_append(
     audio = payload.get("audio")
     looks_like_speech = bool(vad_result.is_speech) if vad_result is not None else payload.get("is_speech") is not False
     has_audio = isinstance(audio, str) and bool(audio)
-    state.input_audio_buffer_has_audio = state.input_audio_buffer_has_audio or (looks_like_speech and has_audio)
+    video_frames = payload.get("video_frames")
+    has_video = isinstance(video_frames, list) and any(isinstance(frame, str) and frame for frame in video_frames)
+    # Vision-carrying silent appends are real turn content only when the model
+    # allows video without required audio. Without this gate, turn-mode
+    # camera sessions would treat silent+frames as buffer content and open a response.
+    state.input_audio_buffer_has_audio = (
+        state.input_audio_buffer_has_audio
+        or (looks_like_speech and has_audio)
+        or (has_video and allows_video_without_audio)
+    )
     state.input_audio_buffer_had_non_speech = state.input_audio_buffer_had_non_speech or (
-        not looks_like_speech and has_audio
+        not looks_like_speech and has_audio and not (has_video and allows_video_without_audio)
     )
     events: list[DuplexEvent] = []
     stop_ms: object = payload.get("audio_end_ms", payload.get("audio_ms", 0))
@@ -1320,7 +1369,11 @@ def resolve_cancel_response(state: RealtimeProjectionState, command: CancelRespo
 def resolve_clear_output_audio(state: RealtimeProjectionState, command: ClearOutputAudio) -> ResolvedControl:
     payload: dict[str, object] = {"type": "output_audio_buffer.clear", "reason": "output_audio_buffer.clear"}
     response_id = command.response_id or state.active_response_id or state.last_response_id
-    if response_is_done(state, response_id):
+    # A completed response can still own queued playback. Clear the latest
+    # response in the engine, while keeping late clears away from newer turns.
+    if response_is_done(state, response_id) and (
+        state.active_response_id is not None or response_id != state.last_response_id
+    ):
         return ResolvedControl(payloads=[], events=[OutputAudioCleared(response_id=_str_or_none(response_id))])
     if isinstance(response_id, str) and response_id:
         payload["response_id"] = response_id
