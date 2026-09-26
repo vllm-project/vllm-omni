@@ -71,6 +71,7 @@ from vllm_omni.core.prefix_cache.controller import (
     _WriteChunk,
 )
 from vllm_omni.core.prefix_cache.interface import (
+    HIDDEN_KEY,
     ModelCachePolicy,
     OmniPrefixCacheStagingTimeoutError,
     OmniPrefixCacheUnmatchError,
@@ -471,6 +472,31 @@ class OmniPrefixCacheManager:
         self._step_ctxs: dict[StepId, _StepContext] = {}
 
     # ------------------------------------------------------ public entries
+
+    def memory_stats(self) -> dict[str, object]:
+        """Return tensor-accounted host memory owned by this cache."""
+        with self._state_lock:
+            cache_bytes, pool_pinned_bytes = self._pool.memory_stats()
+            hidden_metadata = self._pool.key_metadata(HIDDEN_KEY)
+        staging_bytes, staging_pinned_bytes = self._controller.staging_memory_stats()
+
+        hidden_states_bytes = cache_bytes.get(HIDDEN_KEY, 0)
+        mm_cache_bytes = {key: size for key, size in cache_bytes.items() if key != HIDDEN_KEY}
+        stats: dict[str, object] = {
+            "enabled": True,
+            "num_blocks": self._config.num_blocks,
+            "block_size": self._config.block_size,
+            "hidden_states_bytes": hidden_states_bytes,
+            "mm_cache_bytes": mm_cache_bytes,
+            "mm_cache_bytes_total": sum(mm_cache_bytes.values()),
+            "static_cache_bytes": sum(cache_bytes.values()),
+            "pending_write_bytes": staging_bytes,
+            "total_cpu_bytes": sum(cache_bytes.values()) + staging_bytes,
+            "pinned_bytes": pool_pinned_bytes + staging_pinned_bytes,
+        }
+        if hidden_metadata is not None:
+            stats["hidden_size"], stats["hidden_dtype"] = hidden_metadata
+        return stats
 
     def register_policy(self, policy: ModelCachePolicy) -> None:
         self._policy = policy
