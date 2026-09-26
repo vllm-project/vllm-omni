@@ -15,6 +15,10 @@ connectors:
       initial_codec_chunk_frames: 1   # 1 frame * 80 ms/frame = 80 ms first audio chunk
       codec_chunk_frames: 15          # 15 frames * 80 ms/frame = 1.2 s steady chunks
       codec_left_context_frames: 0
+      # Chunk ramp (opt-in): gradual chunk-size ladder replacing the
+      # initial_codec_chunk_frames -> codec_chunk_frames cliff. The last
+      # entry should equal codec_chunk_frames (steady state).
+      # codec_chunk_ramp: [2, 4, 8, 15]
 
 stages:
   - stage_id: 0

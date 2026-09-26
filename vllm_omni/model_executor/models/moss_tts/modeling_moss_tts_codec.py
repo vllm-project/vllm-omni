@@ -283,8 +283,11 @@ class MossTTSCodecDecoder(nn.Module):
         self._stream_req_slots: dict[str, int] = {}
         self._async_chunk = bool(getattr(self.vllm_config.model_config, "async_chunk", False))
         self._streaming_graph_batch_sizes = self._streaming_graph_batch_sizes_from_compilation_config()
+        # codec_chunk_ramp sizes join the streaming graph frame-size set so
+        # every ladder (B, T) combination is captured during warmup.
+        _ramp_sizes = self._connector_list("codec_chunk_ramp") or []
         self._streaming_graph_frame_sizes = sorted(
-            {frames for frames in (self._initial_stream_chunk_frames, self._stream_chunk_frames) if frames > 0}
+            {s for s in (self._initial_stream_chunk_frames, self._stream_chunk_frames, *_ramp_sizes) if s > 0}
         )
 
     # ------------------------------------------------------------------
@@ -664,6 +667,20 @@ class MossTTSCodecDecoder(nn.Module):
             extra_cfg = getattr(connector_cfg, "extra", None)
         if isinstance(extra_cfg, dict) and name in extra_cfg:
             return int(extra_cfg[name])
+        return default
+
+    def _connector_list(self, name: str, default: list | None = None) -> list | None:
+        model_cfg = getattr(self.vllm_config, "model_config", None)
+        connector_cfg = getattr(model_cfg, "stage_connector_config", None)
+        if isinstance(connector_cfg, dict):
+            extra_cfg: dict | None = connector_cfg.get("extra", connector_cfg)
+        else:
+            extra_cfg = getattr(connector_cfg, "extra", None)
+        if isinstance(extra_cfg, dict) and name in extra_cfg:
+            raw = extra_cfg[name]
+            if isinstance(raw, str):
+                return [int(x.strip()) for x in raw.split(",")]
+            return [int(x) for x in raw]
         return default
 
     def _streaming_graph_batch_sizes_from_compilation_config(self) -> list[int]:
