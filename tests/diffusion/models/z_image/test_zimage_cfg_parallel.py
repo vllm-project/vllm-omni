@@ -39,6 +39,16 @@ def test_zimage_cfg_normalization_clamps_to_positive_norm():
     torch.testing.assert_close(actual, expected)
 
 
+def test_zimage_cfg_normalization_is_per_sample():
+    pipeline = _pipeline_for_contract_tests()
+    positive = torch.tensor([[[[1.0]]], [[[10.0]]]])
+    negative = torch.zeros_like(positive)
+
+    actual = pipeline.combine_cfg_noise(positive, negative, 3.0, cfg_normalize=1.0)
+
+    torch.testing.assert_close(actual, positive)
+
+
 class _FakeTransformer(nn.Module):
     def forward(self, x, t, cap_feats):
         del t
@@ -94,7 +104,7 @@ def test_zimage_cfg_parallel_dispatches_one_branch_per_rank(monkeypatch):
     torch.testing.assert_close(actual, torch.full_like(actual, 4.0))
 
 
-def test_zimage_diffuse_uses_framework_adapter_and_preserves_sign(monkeypatch):
+def test_zimage_diffuse_uses_framework_adapter_and_preserves_sign():
     pipeline = _pipeline_for_contract_tests()
     pipeline.transformer = _FakeTransformer()
     pipeline.scheduler = _FakeScheduler()

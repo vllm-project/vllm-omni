@@ -436,17 +436,20 @@ class ZImagePipeline(nn.Module, CFGParallelMixin, DiffusionPipelineProfilerMixin
             if len(negative_noise_pred) != 1:
                 raise TypeError("Z-Image CFG expects a single transformer output tensor")
             negative_noise_pred = negative_noise_pred[0]
+        positive_noise_pred = positive_noise_pred.float()
+        negative_noise_pred = negative_noise_pred.float()
         pred = positive_noise_pred + true_cfg_scale * (positive_noise_pred - negative_noise_pred)
         normalize = float(cfg_normalize)
         if normalize > 0.0:
-            positive_norm = torch.linalg.vector_norm(positive_noise_pred)
-            combined_norm = torch.linalg.vector_norm(pred)
+            positive_norm = torch.linalg.vector_norm(positive_noise_pred.flatten(1), dim=1, keepdim=True)
+            combined_norm = torch.linalg.vector_norm(pred.flatten(1), dim=1, keepdim=True)
             max_norm = positive_norm * normalize
+            scale_shape = (pred.shape[0],) + (1,) * (pred.ndim - 1)
             scale = torch.where(
                 combined_norm > max_norm,
                 (max_norm / combined_norm.clamp(min=1e-12)).to(pred.dtype),
                 pred.new_tensor(1.0),
-            )
+            ).reshape(scale_shape)
             pred = pred * scale
         return pred
 
@@ -524,7 +527,8 @@ class ZImagePipeline(nn.Module, CFGParallelMixin, DiffusionPipelineProfilerMixin
             assert latents.dtype == torch.float32
 
             if callback_on_step_end is not None:
-                callback_kwargs = {name: locals()[name] for name in callback_on_step_end_tensor_inputs}
+                step_locals = locals()
+                callback_kwargs = {name: step_locals[name] for name in callback_on_step_end_tensor_inputs}
                 callback_outputs = callback_on_step_end(self, i, t, callback_kwargs)
                 latents = callback_outputs.pop("latents", latents)
                 prompt_embeds = callback_outputs.pop("prompt_embeds", prompt_embeds)
