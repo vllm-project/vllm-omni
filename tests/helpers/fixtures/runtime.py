@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING, Any
 import pytest
 
 if TYPE_CHECKING:
-    from tests.helpers.runtime import OmniRunner, OmniServer
+    from tests.helpers.runtime import AsyncOmniRunner, OmniRunner, OmniServer
 
 omni_fixture_lock = threading.Lock()
 
@@ -125,6 +125,38 @@ def omni_runner(request: pytest.FixtureRequest, run_level: str) -> Generator[Omn
     from tests.helpers.runtime import iter_omni_runner
 
     yield from iter_omni_runner(request, run_level, omni_fixture_lock)
+
+
+@pytest.fixture(scope="function")
+def async_omni_runner_function(
+    request: pytest.FixtureRequest,
+    run_level: str,
+) -> Generator[AsyncOmniRunner, Any, None]:
+    """Function-scoped in-process :class:`~tests.helpers.runtime.AsyncOmniRunner` (cf. :func:`omni_runner_function`).
+
+    The default for live ``AsyncOmni`` tests. Parametrize with
+    :class:`~tests.helpers.runtime.AsyncOmniParams` and ``indirect=True``. One
+    engine per test keeps the engine on that test's event loop: pytest-asyncio
+    defaults to a function-scoped loop, and an engine reused across loops hangs
+    on its second ``generate()``.
+    """
+    from tests.helpers.runtime import iter_async_omni
+
+    yield from iter_async_omni(request, run_level, omni_fixture_lock)
+
+
+@pytest.fixture(scope="module")
+def async_omni_runner(request: pytest.FixtureRequest, run_level: str) -> Generator[AsyncOmniRunner, Any, None]:
+    """Module-scoped :class:`~tests.helpers.runtime.AsyncOmniRunner` (cf. :func:`omni_runner`).
+
+    Only for modules whose every consumer is marked
+    ``@pytest.mark.asyncio(loop_scope="module")`` with the same params: the
+    engine binds to the first event loop that awaits it. Prefer
+    :func:`async_omni_runner_function` otherwise.
+    """
+    from tests.helpers.runtime import iter_async_omni
+
+    yield from iter_async_omni(request, run_level, omni_fixture_lock)
 
 
 @pytest.fixture
