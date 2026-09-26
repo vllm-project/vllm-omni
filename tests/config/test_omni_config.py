@@ -304,6 +304,24 @@ def test_frontend_log_stats_flag_is_not_an_unowned_stage_argument(disabled):
     assert "disable_log_stats" not in engine_args
 
 
+def test_online_quantization_config_selects_online_method(monkeypatch):
+    from vllm_omni.engine import stage_init_utils
+    from vllm_omni.engine.stage_init_utils import build_engine_args_dict_from_omni_stage_config
+
+    monkeypatch.setattr(stage_init_utils, "resolve_worker_cls", lambda engine_args: None)
+    quantization_config = {"linear": "fp8_per_tensor", "ignore": ["re:.*down_proj$"]}
+    stage = _from_pipeline_key(
+        "qwen2_5_omni",
+        cli_overrides={"stage_0_quantization_config": quantization_config, "stage_0_enforce_eager": False},
+    ).stage_by_id(0)
+
+    engine_args = build_engine_args_dict_from_omni_stage_config(stage, model="test-model")
+
+    assert engine_args["quantization"] == "online"
+    assert engine_args["quantization_config"] == quantization_config
+    assert engine_args["enforce_eager"] is False
+
+
 def test_from_pipeline_config_applies_cli_overrides_without_stage_config_runtime_bridge():
     omni_config = _from_pipeline_key(
         "qwen3_tts",

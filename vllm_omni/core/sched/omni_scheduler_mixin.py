@@ -763,11 +763,19 @@ class OmniSchedulerMixin:
 
     def _reject_invalid_grammar_tokens(self, request: Request, new_token_ids: list[int]) -> bool:
         """Mark rejected tokens terminal before callers capture the finish reason."""
-        if not new_token_ids or self.structured_output_manager.accept_tokens(request, new_token_ids):
+        if not new_token_ids or request.structured_output_request is None:
+            return False
+        if not self.structured_output_manager.should_advance(request, new_token_ids=new_token_ids):
+            return False
+        structured_request = request.structured_output_request
+        grammar = structured_request.grammar
+        assert grammar is not None
+        advance_token_ids = self.structured_output_manager.trim_reasoning_for_advance(request, new_token_ids)
+        if not advance_token_ids or grammar.accept_tokens(request.request_id, advance_token_ids):
             return False
         logger.error(
             "Unexpected: grammar rejected tokens %s for request %s. Terminating request.",
-            new_token_ids,
+            advance_token_ids,
             request.request_id,
         )
         request.status = RequestStatus.FINISHED_ERROR

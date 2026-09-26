@@ -2987,6 +2987,13 @@ class TestPlatformOverrides:
         assert deploy.stages[1].enforce_eager is True
         assert deploy.stages[2].enforce_eager is True
 
+    def test_qwen2_5_omni_cuda_compiles_ar_stages(self):
+        deploy_path = Path(get_deploy_config_path("qwen2_5_omni.yaml"))
+
+        deploy = _apply_platform_overrides(load_deploy_config(deploy_path), platform="cuda")
+
+        assert [stage.enforce_eager for stage in deploy.stages] == [False, False, True]
+
     def test_xpu_overrides(self):
         deploy_path = Path(get_deploy_config_path("qwen3_omni_moe.yaml"))
         if not deploy_path.exists():

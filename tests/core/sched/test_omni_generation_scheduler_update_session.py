@@ -177,6 +177,9 @@ def test_resumable_generation_stop_marks_segment_boundary() -> None:
 @pytest.mark.parametrize("prompt_complete", [False, True])
 def test_rejected_grammar_finishes_and_frees_generation_request(prompt_complete: bool) -> None:
     session = _make_request(request_id="req-generation-segment")
+    grammar = MagicMock()
+    grammar.accept_tokens.return_value = False
+    session.structured_output_request = SimpleNamespace(grammar=grammar)
     session.status = RequestStatus.RUNNING
     session.resumable = True
     session.num_computed_tokens = len(session.prompt_token_ids) if prompt_complete else 1
@@ -203,7 +206,8 @@ def test_rejected_grammar_finishes_and_frees_generation_request(prompt_complete:
     )
     sched.waiting = MagicMock()
     sched.skipped_waiting = MagicMock()
-    sched.structured_output_manager.accept_tokens.return_value = False
+    sched.structured_output_manager.should_advance.return_value = True
+    sched.structured_output_manager.trim_reasoning_for_advance.side_effect = lambda _request, tokens: tokens
     sched._pending_finish_reqs = []
     sched.recompute_kv_load_failures = False
     sched.connector = None

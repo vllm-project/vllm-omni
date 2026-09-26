@@ -360,7 +360,7 @@ class Qwen2_5OmniForConditionalGeneration(
                     inputs_embeds=inputs_embeds,
                 )
 
-            if sampling_metadata is not None:
+            if sampling_metadata is not None and sampling_metadata.prompt_token_ids is not None:
                 # the padding token id is set to text model's pad token id,
                 # which do not match with the talker model's word embedding size
                 sampling_metadata.prompt_token_ids[sampling_metadata.prompt_token_ids == 152064] = 8448

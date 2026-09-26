@@ -8,13 +8,8 @@
 # chat-sized prefill comfortably fits; only models with codec prefill
 # (Qwen3-Omni, Qwen3-TTS) need to bump it above 32k.
 #
-# enforce_eager policy across the three deploy YAMLs:
-#   * code2wav / generation stages:  always true (cudagraph incompatible with
-#     the custom generation loop — set explicitly everywhere).
-#   * AR stages (thinker, talker):   model-dependent. Qwen2.5-Omni runs eager
-#     on CUDA (thinker uses custom ops that don't trace cleanly); NPU / XPU
-#     overrides are documented below. Qwen3-Omni / Qwen3-TTS AR stages use the
-#     default (false = cudagraph on).
+# The CUDA override compiles the thinker and talker; code2wav remains eager
+# because its custom generation loop cannot use CUDA graphs.
 async_chunk: false
 
 stages:
@@ -70,10 +65,16 @@ stages:
       repetition_penalty: 1.1
 
 platforms:
+  cuda:
+    stages:
+      - stage_id: 0
+        enforce_eager: false
+      - stage_id: 1
+        enforce_eager: false
+
   npu:
     stages:
-      # NPU has cudagraph support for the thinker, unlike GPU which still
-      # only runs eager.
+      # Keep the existing NPU thinker graph configuration.
       - stage_id: 0
         enforce_eager: false
       - stage_id: 2

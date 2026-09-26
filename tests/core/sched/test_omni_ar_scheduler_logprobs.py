@@ -106,6 +106,7 @@ class _Request:
         self.stop_reason = None
         self.trace_headers = None
         self.num_nans_in_logits = 0
+        self.structured_output_request = None
 
     def is_finished(self) -> bool:
         return RequestStatus.is_finished(self.status)

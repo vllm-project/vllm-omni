@@ -1211,6 +1211,13 @@ def _project_omni_stage_engine_args(
 
     quantization_config = stage_config.quantization_config
     if quantization_config is not None:
+        # vLLM requires the online method selector alongside a linear/MoE spec.
+        if (
+            not is_diffusion
+            and isinstance(quantization_config, Mapping)
+            and ("linear" in quantization_config or "moe" in quantization_config)
+        ):
+            engine_args["quantization"] = "online"
         quantization_key = (
             "quantization" if isinstance(quantization_config, str) and not is_diffusion else "quantization_config"
         )
