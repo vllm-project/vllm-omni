@@ -3,97 +3,99 @@
 
 """End-to-end test for latent-mask editing serialization.
 
-Exercises ``VLLMOmniClient.generate_video`` with a ``latent_edit`` payload
-against a mock ``/v1/videos`` server and asserts the multipart fields the
-client produced. Runs on CPU: the ComfyUI ``comfy_api`` / ``comfy_extras``
-modules are mocked by this directory's ``conftest.py``.
+Exercises ``VLLMOmniClient.generate_video`` with a ``latent_edit`` payload and
+asserts the exact multipart fields the client produces — in particular that the
+masks are uploaded as JSON *file* parts (the server's ``_parse_video_form``
+declares ``video_noise_mask``/``audio_noise_mask`` as ``UploadFile``, so a plain
+string field would be rejected with a 422). Runs on CPU: ``comfy_api`` /
+``comfy_extras`` are mocked by this directory's ``conftest.py``.
 """
 
-import asyncio
 import json
-import os
-import socket
-import subprocess
-import sys
-import time
+from unittest.mock import AsyncMock
 
 import pytest
 import torch
 from comfy_api.input import VideoInput
-from comfyui_vllm_omni.utils.api_client import VLLMOmniClient
+from comfyui_vllm_omni.utils import api_client
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
-_TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
-
-
-def _free_port() -> int:
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
-
 
 @pytest.fixture
-def mock_server(tmp_path):
-    port = _free_port()
-    state_file = tmp_path / "state.json"
-    env = dict(os.environ, MOCK_STATE_FILE=str(state_file))
-    proc = subprocess.Popen(
-        [sys.executable, "-m", "uvicorn", "mock_videos_server:app", "--host", "127.0.0.1", "--port", str(port)],
-        cwd=_TESTS_DIR,
-        env=env,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+def api_calls(monkeypatch):
+    calls = AsyncMock(return_value={"id": "test-video", "status": "completed"})
+    monkeypatch.setattr(api_client, "url_json", calls)
+    monkeypatch.setattr(api_client, "url_bytes", AsyncMock(return_value=b"generated-video"))
+    monkeypatch.setattr(api_client, "bytes_to_video", lambda data: data)
+    return calls
+
+
+def _fields_by_name(calls):
+    fields = calls.call_args_list[0].kwargs["data"]._fields
+    return {options["name"]: (options, headers, value) for options, headers, value in fields}
+
+
+async def _generate(**kwargs):
+    return await api_client.VLLMOmniClient("http://localhost/v1").generate_video(
+        model="MiniMaxAI/MiniMax-H3",
+        prompt="restyle the clip",
+        width=160,
+        height=120,
+        num_frames=22,
+        fps=24,
+        **kwargs,
     )
-    try:
-        deadline = time.time() + 30
-        while time.time() < deadline:
-            try:
-                with socket.create_connection(("127.0.0.1", port), timeout=1):
-                    break
-            except OSError:
-                time.sleep(0.2)
-        yield f"http://127.0.0.1:{port}/v1", state_file
-    finally:
-        proc.terminate()
-        proc.wait(timeout=10)
 
 
-def test_latent_edit_serialization(mock_server):
-    base_url, state_file = mock_server
+async def test_latent_edit_serialization(api_calls):
+    latent_edit = {
+        "source_video": VideoInput(b"mock_source_video"),
+        "video_mask": torch.zeros(1, 120, 160),
+        "audio_mask": 0.5,
+    }
 
-    # A non-trivial video mask requires a source video. The mocked VideoInput
-    # only needs to provide ``save_to`` for the client's multipart upload.
-    source_video = VideoInput(b"mock_source_video")
-    mask = torch.zeros(1, 120, 160)
-    latent_edit = {"source_video": source_video, "video_mask": mask, "audio_mask": 0.5}
+    out = await _generate(latent_edit=latent_edit)
+    assert out == b"generated-video"
 
-    async def run():
-        client = VLLMOmniClient(base_url)
-        return await client.generate_video(
-            model="MiniMaxAI/MiniMax-H3",
-            prompt="restyle the clip",
-            width=160,
-            height=120,
-            num_frames=22,
-            fps=24,
-            latent_edit=latent_edit,
-        )
+    fields = _fields_by_name(api_calls)
 
-    out = asyncio.run(run())
-    assert out is not None
+    source = fields["source_video"]
+    assert source[0]["filename"] == "source.mp4"
+    assert source[1]["Content-Type"] == "video/mp4"
 
-    with open(state_file) as f:
-        fields = json.load(f)
+    # video_noise_mask must be a JSON file part, not a string field. The raw
+    # mask is sent as-is (the server resolves the latent grid).
+    video = fields["video_noise_mask"]
+    assert video[0]["filename"] == "video-mask.json"
+    assert video[1]["Content-Type"] == "application/json"
+    grid = json.loads(video[2].decode())
+    assert len(grid) == 1  # one temporal slice
+    assert len(grid[0]) == 120  # raw height
+    assert len(grid[0][0]) == 160  # raw width
 
-    assert fields["source_video"]["file"] is True
-    assert fields["source_video"]["content_type"] == "video/mp4"
-    for name in ("video_noise_mask", "audio_noise_mask"):
-        assert fields[name]["file"] is True
-        assert fields[name]["content_type"] == "application/json"
-    assert fields["audio_noise_mask"]["json"] == 0.5
+    # A scalar audio_mask is sent as a JSON file part carrying the scalar value.
+    audio = fields["audio_noise_mask"]
+    assert audio[0]["filename"] == "audio-mask.json"
+    assert audio[1]["Content-Type"] == "application/json"
+    assert audio[2].decode() == "0.5"
 
-    video_mask = fields["video_noise_mask"]["json"]
-    assert len(video_mask) == 7  # num_frames=22 aligns to 22 (17n+5) -> Tv = 7
-    assert len(video_mask[0]) == 6  # height 120 floors to 96 (multiple of 32) -> gh 6
-    assert len(video_mask[0][0]) == 10  # width 160 -> gw 10
+
+async def test_latent_edit_serialization_temporal_audio(api_calls):
+    latent_edit = {
+        "source_video": VideoInput(b"mock_source_video"),
+        "video_mask": torch.zeros(1, 120, 160),
+        "audio_temporal_mask": torch.full((178,), 0.5),
+    }
+
+    out = await _generate(latent_edit=latent_edit)
+    assert out == b"generated-video"
+
+    fields = _fields_by_name(api_calls)
+
+    # A temporal audio mask is sent as a raw JSON file part.
+    audio = fields["audio_noise_mask"]
+    assert audio[0]["filename"] == "audio-mask.json"
+    assert audio[1]["Content-Type"] == "application/json"
+    audio_grid = json.loads(audio[2].decode())
+    assert len(audio_grid) == 178  # time steps
