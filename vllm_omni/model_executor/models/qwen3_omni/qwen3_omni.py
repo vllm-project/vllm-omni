@@ -1082,8 +1082,19 @@ class Qwen3OmniMoeForConditionalGeneration(
                 continue
             else:
                 raise AssertionError("Expect role id after <|im_start|> (assistant, user, system)")
-        talker_input_embed = torch.cat([embed.to(input_ids.device) for embed in talker_input_embeds], dim=0)
-        talker_input_id = torch.cat([embed.to(input_ids.device) for embed in talker_input_ids], dim=0)
+        if talker_input_embeds:
+            talker_input_embed = torch.cat([embed.to(input_ids.device) for embed in talker_input_embeds], dim=0)
+            talker_input_id = torch.cat([embed.to(input_ids.device) for embed in talker_input_ids], dim=0)
+        else:
+            # A projected chatml with no user/assistant segments (e.g. system-only
+            # prompt) leaves both lists empty, and torch.cat([]) raises. Return empty
+            # talker inputs shaped consistently with _get_talker_user_parts.
+            talker_input_embed = torch.empty(
+                (0, self.config.talker_config.text_config.hidden_size),
+                device=input_ids.device,
+                dtype=torch.bfloat16,
+            )
+            talker_input_id = torch.empty((0,), dtype=torch.long, device=input_ids.device)
 
         return talker_input_id, talker_input_embed, trailing_text_hidden_all
 
