@@ -430,6 +430,33 @@ class _SlotStatusTable:
                 status.presence[idx] = _Presence.PRESENT
                 status.producers[idx] = 0
 
+    def snapshot(self, slots: torch.Tensor) -> tuple[torch.Tensor, dict, dict]:
+        """Copy only this step's slots; the mirror may be much larger than a batch."""
+        slots = slots.unique()
+        tables = {
+            key: (presence[slots].clone(), self.producers[key][slots].clone(), self.slot_versions[key][slots].clone())
+            for key, presence in self.presence.items()
+        }
+        bindings = {
+            tid: list(entries)
+            for tid, entries in self.task_bindings.items()
+        }
+        return slots, tables, bindings
+
+    def restore(self, snapshot: tuple[torch.Tensor, dict, dict]) -> None:
+        """Restore occupancy after a publish transaction fails before dispatch."""
+        slots, tables, bindings = snapshot
+        for key in tuple(self.presence):
+            if key not in tables:
+                self.presence.pop(key, None)
+                self.producers.pop(key, None)
+                self.slot_versions.pop(key, None)
+        for key, (presence, producers, versions) in tables.items():
+            self.presence[key][slots] = presence
+            self.producers[key][slots] = producers
+            self.slot_versions[key][slots] = versions
+        self.task_bindings = bindings
+
 
 class _RequestTaskTable:
     """Per request: still live, which WriteTasks it opened, deferred task.
@@ -639,11 +666,7 @@ class OmniPrefixCacheManager:
                 raise OmniPrefixCacheUnmatchError("prefix-cache write layout prepared more than once for one step")
             self._commit_drained_writes()
             self._prepared_write_layout = write_layout
-            write_slots = {
-                int(slot)
-                for write in write_layout.writes
-                for slot in write.slots
-            }
+            write_slots = {int(slot) for write in write_layout.writes for slot in write.slots}
             try:
                 if self._hit_spans:
                     self._prefetch_hit_spans(blocked_slots=write_slots)
@@ -787,6 +810,10 @@ class OmniPrefixCacheManager:
                         self._dispose_read_plans(self._hit_plans, self._hit_prefetch)
                         self._clear_hit_infos()
                 self._release_staging_on_failed_save(d2h_claim.staging_slot, step_holder, bound_tids)
+            if not transferred:
+                for ticket in (step_outputs.immediate_budget, step_outputs.deferred_budget):
+                    if ticket is not None:
+                        self._controller.release_unpinned_budget(ticket)
 
     @torch.inference_mode()
     def materialize(self, step_id: int, req_ids: list[str]) -> StageCacheOutputs:
@@ -832,7 +859,6 @@ class OmniPrefixCacheManager:
                     hit_upto, hit_blocks = hit
                     prefetched = ctx.hit_prefetch.get(req_id, {})
                     plans = ctx.hit_plans.get(req_id, {})
-                    slots = self._get_hit_slots(hit_upto, hit_blocks)
                     keys = self._policy.get_hit_keys(cached_keys)
                     for key in keys:
                         fut = prefetched.get(key)
@@ -841,7 +867,10 @@ class OmniPrefixCacheManager:
                             continue
                         plan = plans.get(key)
                         if plan is None:
-                            plan = self._read_plan(slots, key, req_id)
+                            raise OmniPrefixCacheUnmatchError(
+                                f"read plan missing for req {req_id}, key {key}; "
+                                "prefix-cache planning must complete before materialize"
+                            )
                         hit_sources[(req_id, key)] = plan
 
             # ---- unlocked: data movement + merge ----
@@ -1046,7 +1075,6 @@ class OmniPrefixCacheManager:
         if next_step_ids:
             self._controller.join(next_step_ids)
 
-    @_locked
     def _publish_saved_step(
         self,
         *,
@@ -1066,7 +1094,100 @@ class OmniPrefixCacheManager:
         clears them. Returns the queued tasks for the caller to dispatch
         unlocked; device→host, budget flush and the eager copy stay outside.
         """
-        self._commit_drained_writes()
+        with self._state_lock:
+            # Drain completed writes before taking the snapshot. That drain is
+            # a committed lifecycle transition, not part of this publish.
+            self._commit_drained_writes()
+            status_snapshot = self._slot_status.snapshot(
+                slots_cpu if slots_cpu is not None else torch.empty(0, dtype=torch.long)
+            )
+            pool_keys = self._pool.keys()
+            task_ids = self._controller.task_ids()
+            task_snapshots = {}
+            budget_snapshots = {}
+            for tid in task_ids:
+                task = self._controller.get_task(tid)
+                if task is None:
+                    continue
+                task_snapshots[tid] = (
+                    task,
+                    list(task.chunks),
+                    {key: slots.clone() for key, slots in task.reassigned.items()},
+                    task.freeze_event,
+                    task._slot_to_row,
+                )
+                for ticket in task.budget_tickets():
+                    budget_snapshots[id(ticket)] = (ticket, set(ticket.tids))
+            if step_outputs.immediate_budget is not None:
+                ticket = step_outputs.immediate_budget
+                budget_snapshots[id(ticket)] = (ticket, set(ticket.tids))
+            for _, chunk in step_outputs.deferred_chunks:
+                if chunk.budget is not None:
+                    ticket = chunk.budget
+                    budget_snapshots[id(ticket)] = (ticket, set(ticket.tids))
+            task_table_snapshot = (
+                self._request_tasks._next_tid,
+                dict(self._request_tasks.write_n),
+                {req: set(tids) for req, tids in self._request_tasks.tasks.items()},
+                dict(self._request_tasks.deferred),
+                set(self._request_tasks.live_reqs),
+                list(self._join_next_step_tids),
+                set(self._join_finished_tids),
+            )
+            try:
+                return self._publish_saved_step_impl(
+                    req_order=req_order,
+                    query_start=query_start,
+                    num_sched=num_sched,
+                    num_tokens_unpadded=num_tokens_unpadded,
+                    step_outputs=step_outputs,
+                    slots_cpu=slots_cpu,
+                    mm_keys=mm_keys,
+                    freeze_event=freeze_event,
+                    d2h_claim=d2h_claim,
+                    bound_tids=bound_tids,
+                )
+            except BaseException:
+                self._controller.discard_unpublished(self._controller.task_ids() - task_ids)
+                bound_tids.clear()
+                for task, chunks, reassigned, freeze_event, slot_to_row in task_snapshots.values():
+                    with task.lock:
+                        task.chunks = chunks
+                        task.reassigned = reassigned
+                        task.freeze_event = freeze_event
+                        task._slot_to_row = slot_to_row
+                for ticket, tids in budget_snapshots.values():
+                    ticket.tids = tids
+                self._slot_status.restore(status_snapshot)
+                (
+                    self._request_tasks._next_tid,
+                    self._request_tasks.write_n,
+                    self._request_tasks.tasks,
+                    self._request_tasks.deferred,
+                    self._request_tasks.live_reqs,
+                    self._join_next_step_tids,
+                    self._join_finished_tids,
+                ) = task_table_snapshot
+                for key in self._pool.keys() - pool_keys:
+                    self._pool.remove_key(key)
+                self._dispose_read_plans(self._hit_plans, self._hit_prefetch)
+                self._clear_hit_infos()
+                raise
+
+    def _publish_saved_step_impl(
+        self,
+        *,
+        req_order: list[str],
+        query_start: dict[str, int],
+        num_sched: dict[str, int],
+        num_tokens_unpadded: int,
+        step_outputs: _StepOutputs,
+        slots_cpu: torch.Tensor | None,
+        mm_keys: set[str],
+        freeze_event: torch.cuda.Event | None,
+        d2h_claim: StepD2HClaim,
+        bound_tids: list[int],
+    ) -> tuple[StepId, list[WriteTask]]:
         for key, storage in step_outputs.new_key_storage.items():
             self._pool.install_key(key, storage)
             self._slot_status.init_table(key)

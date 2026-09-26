@@ -149,11 +149,9 @@ class PrefixCacheRunnerMixin:
         layout = self._prefix_cache_write_layout
         self._prefix_cache_write_layout = None
         if layout is None:
-            # Compatibility fallback for callers that have not split layout
-            # preparation from output saving yet.
-            layout = self._prefix_cache_adapter.build_write_layout(
-                self._prefix_cache_group_view,
-                num_scheduled_tokens=dict(self._prefix_cache_step.scheduled_tokens),
+            raise RuntimeError(
+                "prefix-cache write layout was not prepared before forward; "
+                "call _prefix_cache_prepare_write_layout() after batch ordering"
             )
         try:
             return self.omni_prefix_cache.save_outputs(

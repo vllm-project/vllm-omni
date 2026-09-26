@@ -183,8 +183,21 @@ def test_save_step_gates_and_passthrough(monkeypatch):
     _patch_pp(monkeypatch, is_last=False)
     assert save() is None  # not the last PP rank
     _patch_pp(monkeypatch, is_last=True)
+    r._prefix_cache_write_layout = PrefixCacheWriteLayout((), 0)
     assert save() == 7
     assert stub.save_calls == [(hidden, {}, 2, 2, PrefixCacheWriteLayout((), 0))]  # empty mm stays {}
+
+
+def test_save_step_rejects_missing_pre_forward_layout(monkeypatch):
+    _patch_pp(monkeypatch, is_last=True)
+    r = _Runner()
+    r.omni_prefix_cache = _CacheStub()
+    r._prefix_cache_adapter = SimpleNamespace()
+    r._prefix_cache_group_view = SimpleNamespace()
+    r._prefix_cache_step = PrefixCacheStep((), ())
+
+    with pytest.raises(RuntimeError, match="write layout was not prepared before forward"):
+        r._prefix_cache_save_step(torch.zeros(1, 2), None, num_tokens_unpadded=1, num_tokens_padded=1)
 
 
 def test_write_layout_is_prepared_once_and_reused_by_save(monkeypatch):
