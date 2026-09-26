@@ -209,6 +209,8 @@ source_file_dependencies:
   omni_qwen3_omni_accuracy:
     - *qwen3_omni
     - tests/e2e/accuracy/qwen3_omni/
+    - tests/e2e/accuracy/test_qwen3_omni_socialomni_expansion.py
+    - benchmarks/socialomni/
 
   omni_qwen3_omni_perf:
     - *qwen3_omni

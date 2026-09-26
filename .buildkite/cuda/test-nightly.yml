@@ -58,7 +58,7 @@ steps:
         commands:
           - export SEED_TTS_WER_EVAL=1
           - export SEED_TTS_EVAL_DEVICE=cuda:1
-          - pytest -s -v tests/e2e/accuracy/qwen3_omni/test_qwen3_omni.py -m "full_model and H100 and B200 and cards_2" --run-level full_model
+          - pytest -s -v tests/e2e/accuracy/qwen3_omni/test_qwen3_omni.py tests/e2e/accuracy/test_qwen3_omni_socialomni_expansion.py -m "full_model and H100 and B200 and cards_2" --run-level full_model
 
       - label: ":full_moon: Omni · MiniCPM-o 4.5 · Accuracy Test"
         source_file_dependencies: omni_minicpmo_4_5_accuracy
