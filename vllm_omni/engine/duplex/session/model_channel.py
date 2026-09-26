@@ -948,6 +948,7 @@ class ModelChannel:
             response_id = session.begin_response(turn_id=model_turn_id)
             response_created = True
         response_request_metrics = session.mark_response_first_outputs(
+            response_id=response_id,
             observed_at_s=session._clock(),
             has_text=has_text,
             has_audio=has_audio,

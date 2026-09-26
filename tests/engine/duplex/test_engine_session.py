@@ -790,6 +790,7 @@ def test_response_timing_binds_latest_request_start_for_model_turn():
     session.begin_response(turn_id=0)
 
     first = session.mark_response_first_outputs(
+        response_id=session.active_response_id,
         observed_at_s=11.2,
         has_text=True,
         has_audio=False,
@@ -802,6 +803,7 @@ def test_response_timing_binds_latest_request_start_for_model_turn():
     # The 12.0 append must not rebind, so TTFP is 12.3-11.0 = 1300 ms, not 300.
     session.mark_model_turn_request_started(0, 12.0)
     audio = session.mark_response_first_outputs(
+        response_id=session.active_response_id,
         observed_at_s=12.3,
         has_text=False,
         has_audio=True,
@@ -815,32 +817,63 @@ def test_response_timing_attaches_metrics_only_when_newly_observed():
     session.mark_model_turn_request_started(0, 10.0)
     session.begin_response(turn_id=0)
 
-    first = session.mark_response_first_outputs(observed_at_s=10.2, has_text=True, has_audio=False)
+    first = session.mark_response_first_outputs(
+        response_id=session.active_response_id, observed_at_s=10.2, has_text=True, has_audio=False
+    )
     assert first["ttft_ms"] == pytest.approx(200.0)
-    assert session.mark_response_first_outputs(observed_at_s=10.3, has_text=True, has_audio=False) == {}
-    audio = session.mark_response_first_outputs(observed_at_s=10.4, has_text=False, has_audio=True)
+    assert (
+        session.mark_response_first_outputs(
+            response_id=session.active_response_id, observed_at_s=10.3, has_text=True, has_audio=False
+        )
+        == {}
+    )
+    audio = session.mark_response_first_outputs(
+        response_id=session.active_response_id, observed_at_s=10.4, has_text=False, has_audio=True
+    )
     assert audio["ttft_ms"] == pytest.approx(200.0)
     assert audio["ttfp_ms"] == pytest.approx(400.0)
-    assert session.mark_response_first_outputs(observed_at_s=10.5, has_text=True, has_audio=True) == {}
+    assert (
+        session.mark_response_first_outputs(
+            response_id=session.active_response_id, observed_at_s=10.5, has_text=True, has_audio=True
+        )
+        == {}
+    )
 
 
 def test_response_timing_is_cleared_on_end_barge_in_and_close():
     session = _session()
     session.mark_model_turn_request_started(0, 10.0)
     session.begin_response(turn_id=0)
-    assert session.mark_response_first_outputs(observed_at_s=10.2, has_text=True, has_audio=False)
+    assert session.mark_response_first_outputs(
+        response_id=session.active_response_id, observed_at_s=10.2, has_text=True, has_audio=False
+    )
     session.end_response()
-    assert session.mark_response_first_outputs(observed_at_s=10.4, has_text=True, has_audio=False) == {}
+    assert (
+        session.mark_response_first_outputs(
+            response_id=session.active_response_id, observed_at_s=10.4, has_text=True, has_audio=False
+        )
+        == {}
+    )
 
     session.mark_model_turn_request_started(0, 11.0)
     session.barge_in()
     session.begin_response(turn_id=0)
-    assert session.mark_response_first_outputs(observed_at_s=11.2, has_text=True, has_audio=False) == {}
+    assert (
+        session.mark_response_first_outputs(
+            response_id=session.active_response_id, observed_at_s=11.2, has_text=True, has_audio=False
+        )
+        == {}
+    )
 
     session.mark_model_turn_request_started(0, 12.0)
     session.close()
     session.begin_response(turn_id=0)
-    assert session.mark_response_first_outputs(observed_at_s=12.2, has_text=True, has_audio=False) == {}
+    assert (
+        session.mark_response_first_outputs(
+            response_id=session.active_response_id, observed_at_s=12.2, has_text=True, has_audio=False
+        )
+        == {}
+    )
 
 
 def test_complete_model_turn_drops_request_starts_for_finished_turns():
@@ -850,13 +883,66 @@ def test_complete_model_turn_drops_request_starts_for_finished_turns():
     session.complete_model_turn(0)
     session.begin_response(turn_id=1)
     assert session.mark_response_first_outputs(
+        response_id=session.active_response_id,
         observed_at_s=11.25,
         has_text=True,
         has_audio=False,
     )["ttft_ms"] == pytest.approx(250.0)
     session.end_response()
     session.begin_response(turn_id=0)
-    assert session.mark_response_first_outputs(observed_at_s=11.5, has_text=True, has_audio=False) == {}
+    assert (
+        session.mark_response_first_outputs(
+            response_id=session.active_response_id, observed_at_s=11.5, has_text=True, has_audio=False
+        )
+        == {}
+    )
+
+
+@pytest.mark.parametrize("terminal", ["drain_done", "drain_failed", "cancel_drains", "barge_in", "close"])
+def test_response_timing_survives_overlap_until_its_own_terminal(terminal):
+    session = _session()
+    session.mark_model_turn_request_started(0, 10.0)
+    first = session.begin_response(turn_id=0)
+    session.bind_draining_request("tts-1", first)
+    session.bind_draining_request("tts-2", first)
+    session.mark_model_turn_request_started(1, 11.0)
+    second = session.begin_response(turn_id=1)
+    session.end_response()
+    assert (
+        session.mark_response_first_outputs(response_id=second, observed_at_s=11.1, has_text=True, has_audio=True) == {}
+    )
+
+    # One finished producer and a newer completed response cannot retire R1.
+    assert session.pop_draining_request("tts-1") == first
+    metrics = session.mark_response_first_outputs(response_id=first, observed_at_s=11.2, has_text=True, has_audio=False)
+    assert metrics["ttft_ms"] == pytest.approx(1200.0)
+    if terminal == "drain_done":
+        assert session.pop_draining_request("tts-2") == first
+    elif terminal == "drain_failed":
+        session.clear_draining_for_response(first)
+    elif terminal == "cancel_drains":
+        session.clear_draining_requests()
+    elif terminal == "barge_in":
+        session.barge_in()
+    else:
+        session.close()
+    assert (
+        session.mark_response_first_outputs(response_id=first, observed_at_s=11.3, has_text=False, has_audio=True) == {}
+    )
+    assert not session._response.request_timing_by_response
+
+
+def test_response_timing_does_not_retain_replaced_responses_without_draining_requests():
+    session = _session()
+    session.mark_model_turn_request_started(0, 10.0)
+    first = session.begin_response(turn_id=0)
+    second = session.begin_response(turn_id=1)
+    assert (
+        session.mark_response_first_outputs(response_id=first, observed_at_s=11.0, has_text=True, has_audio=True) == {}
+    )
+    assert set(session._response.request_timing_by_response) == {second}
+    session.end_response()
+    assert not session._response.request_timing_by_response
 
 
 def test_log_stats_off_does_not_open_a_response_aggregator():
@@ -972,7 +1058,9 @@ def test_logged_e2e_includes_wait_before_first_output(monkeypatch: pytest.Monkey
     mono["t"] = 102.0
     wall["t"] = 1_002.0
     response_id = session.begin_response(turn_id=0)
-    first = session.mark_response_first_outputs(observed_at_s=102.0, has_text=True, has_audio=True)
+    first = session.mark_response_first_outputs(
+        response_id=session.active_response_id, observed_at_s=102.0, has_text=True, has_audio=True
+    )
     assert first["ttft_ms"] == pytest.approx(2000.0)
 
     mono["t"] = 102.1
