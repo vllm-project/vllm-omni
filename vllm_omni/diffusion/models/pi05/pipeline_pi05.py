@@ -139,6 +139,8 @@ class Pi05Pipeline(nn.Module):
 
         self.tokenizer = self._load_tokenizer()
         self.model = self._initialize_model()
+        # OpenPI serving is one observation per call (``max_num_seqs: 1``).
+        self.model.kv_cache = self.model.new_kv_cache(batch_size=1)
         self._install_cuda_graphs(od_config)
 
         self.processor = Pi05Processor(self.config, self.tokenizer, self._device)

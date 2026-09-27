@@ -8,7 +8,9 @@ observations with 1, 2 and 3 real camera views, each at the configured
 denoising-step count and at a per-request override. Every case runs on the
 eager path first, then on the CUDA Graph path (twice, in both case orders, so a
 region replaying stale buffers from the previous case is caught). The saved
-chunks are compared with ``torch.equal`` at the end.
+chunks are compared with ``torch.equal`` at the end. Two more checks hold the
+groundwork for capture: ``sample_actions`` never syncs with the host, and it
+fills the KV cache the pipeline preallocates.
 
 Both paths share one model; only ``model.cuda_graphs`` is swapped. The float32
 checkpoint alone is ~14.5 GB, so a second copy would not fit a 16 GB card.
@@ -83,12 +85,12 @@ def _robot_obs(config, num_views: int, seed: int) -> dict:
     return {"images": images, "state": state, "prompt": PROMPT}
 
 
-def _sample(model, inputs, num_steps: int | None, seed: int) -> torch.Tensor:
+def _sample_on_device(model, inputs, num_steps: int | None, seed: int) -> torch.Tensor:
     images, image_masks, lang_tokens, lang_masks = inputs
     generator = torch.Generator(device=lang_tokens.device).manual_seed(seed)
     # inference_mode, as in Pi05Pipeline.forward.
     with torch.inference_mode():
-        actions = model.sample_actions(
+        return model.sample_actions(
             images=images,
             image_masks=image_masks,
             lang_tokens=lang_tokens,
@@ -96,7 +98,10 @@ def _sample(model, inputs, num_steps: int | None, seed: int) -> torch.Tensor:
             num_steps=num_steps,
             generator=generator,
         )
-    return actions.cpu()
+
+
+def _sample(model, inputs, num_steps: int | None, seed: int) -> torch.Tensor:
+    return _sample_on_device(model, inputs, num_steps, seed).cpu()
 
 
 @pytest.fixture(scope="module", params=DTYPES)
@@ -168,3 +173,32 @@ def test_cases_differ_from_each_other(outputs):
     for i, first in enumerate(chunks):
         for second in chunks[i + 1 :]:
             assert not torch.equal(first, second)
+
+
+def test_sample_actions_never_syncs_with_the_host(pipeline):
+    """A region is replayable as a CUDA Graph only if it is device-only work: a
+    host-device copy or a stream sync inside it fails capture."""
+    model = pipeline.model
+    inputs = pipeline.processor.build_model_inputs(_robot_obs(pipeline.config, 3, seed=0))
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        _sample_on_device(model, inputs, num_steps=None, seed=0)
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
+
+
+def test_sample_actions_writes_the_preallocated_kv_cache(pipeline):
+    """The pipeline allocates the KV cache once at init for the deployed
+    prefix, and ``sample_actions`` fills every slot of it."""
+    model = pipeline.model
+    cache = model.kv_cache
+    inputs = pipeline.processor.build_model_inputs(_robot_obs(pipeline.config, 3, seed=0))
+    with torch.inference_mode():
+        prefix_len = model.embed_prefix(*inputs)[0].shape[1]
+    assert cache is not None and cache.fits(1, prefix_len)
+
+    cache.key.fill_(float("nan"))
+    cache.value.fill_(float("nan"))
+    _sample_on_device(model, inputs, num_steps=None, seed=0)
+    assert model.kv_cache is cache
+    assert torch.isfinite(cache.key).all() and torch.isfinite(cache.value).all()

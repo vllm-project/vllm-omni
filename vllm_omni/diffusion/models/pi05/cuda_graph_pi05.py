@@ -13,6 +13,12 @@ Each region method below has the signature of the eager call it replaces and
 falls back to that call whenever it has no graph to replay. The eager path is
 the baseline: ``Pi05ForActionPrediction.cuda_graphs is None``.
 
+Every region is device-only work: no host-device copy and no stream sync, so
+each one captures as is. Regions 2 and 3 share ``model.kv_cache``, a
+:class:`~vllm_omni.diffusion.models.pi05.modeling_pi05.Pi05KVCache` allocated at
+init: region 2 writes the prefix K/V into it, and each region 3 replay writes
+its suffix K/V behind that and attends over both in place.
+
 No region is captured yet, so every region currently runs eagerly.
 ``tests/diffusion/models/pi05/test_pi05_cuda_graph_parity.py`` pins this path
 bit-exact against the eager baseline on the real checkpoint.
