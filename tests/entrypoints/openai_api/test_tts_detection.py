@@ -182,6 +182,7 @@ _PIPELINE_STAGES = [
     "token2text",
     "token2wav",
     "tts",
+    "vevo2",
 ]
 
 _STAGES = [*_PIPELINE_STAGES, None, "vae", "not_a_real_stage"]

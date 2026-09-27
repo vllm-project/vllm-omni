@@ -13,6 +13,7 @@ import pytest
 from vllm.sampling_params import SamplingParams
 
 from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
+from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
 from vllm_omni.entrypoints.openai.tts_adapters import (
     TTS_ADAPTER_REGISTRY,
     ARTTSAdapter,
@@ -41,6 +42,7 @@ from vllm_omni.entrypoints.openai.tts_adapters.qwen3_tts import (
     Qwen3TTSCodecLimitError,
 )
 from vllm_omni.entrypoints.openai.tts_adapters.step_audio2 import StepAudio2Adapter
+from vllm_omni.entrypoints.openai.tts_adapters.vevo2 import Vevo2Adapter
 from vllm_omni.entrypoints.openai.tts_adapters.voxtral import VoxtralTTSAdapter
 from vllm_omni.model_executor.models.indextts2 import prompt_utils
 from vllm_omni.model_executor.models.indextts2.tokenizer_v2_5 import (
@@ -71,6 +73,7 @@ EXPECTED_MODEL_TYPES = {
     "indextts2",
     "indextts2_5",
     "gepard",
+    "vevo2",
 }
 
 
@@ -780,3 +783,97 @@ def test_qwen3_validate_rejects_no_voice_no_default_then_accepts():
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+# --------------------------------------------------------------------------
+# Vevo2: request sampling must reach the model
+# --------------------------------------------------------------------------
+#
+# Vevo2 samples inside Amphion's ``inference_ar_and_fm``, reading its knobs
+# from ``additional_information``. The ``SamplingParams`` the dummy AR
+# scheduler carries only drive the forced-EOS sampler, so anything the adapter
+# does not copy across cannot influence generation at all.
+
+
+def _vevo2_request(**kwargs):
+    defaults = {"seed": None, "extra_params": None, "voice": None}
+    defaults.update(kwargs)
+    return SimpleNamespace(**defaults)
+
+
+def test_vevo2_forwards_request_seed():
+    tts_params: dict = {}
+    Vevo2Adapter._apply_request_sampling(_vevo2_request(seed=1234), [SimpleNamespace(seed=42)], tts_params)
+    assert tts_params["seed"] == [1234], "an explicit request seed must win over the deploy default"
+
+
+def test_vevo2_falls_back_to_deploy_default_seed():
+    tts_params: dict = {}
+    Vevo2Adapter._apply_request_sampling(_vevo2_request(), [SimpleNamespace(seed=42)], tts_params)
+    assert tts_params["seed"] == [42], "deploy default_sampling_params.seed must not be a dead setting"
+
+
+def test_vevo2_omits_seed_when_none_is_configured():
+    tts_params: dict = {}
+    Vevo2Adapter._apply_request_sampling(_vevo2_request(), [SimpleNamespace(seed=None)], tts_params)
+    assert "seed" not in tts_params
+
+
+def test_vevo2_forwards_sampling_knobs_from_extra_params():
+    tts_params: dict = {}
+    Vevo2Adapter._apply_request_sampling(
+        _vevo2_request(extra_params={"top_k": 7, "top_p": 0.5, "temperature": 0.25, "flow_matching_steps": 8}),
+        [SimpleNamespace(seed=None)],
+        tts_params,
+    )
+    assert tts_params["top_k"] == [7]
+    assert tts_params["top_p"] == [0.5]
+    assert tts_params["temperature"] == [0.25]
+    assert tts_params["flow_matching_steps"] == [8]
+
+
+def test_vevo2_leaves_unset_knobs_to_model_defaults():
+    tts_params: dict = {}
+    Vevo2Adapter._apply_request_sampling(
+        _vevo2_request(extra_params={"top_k": 7}), [SimpleNamespace(seed=None)], tts_params
+    )
+    assert tts_params["top_k"] == [7]
+    for absent in ("top_p", "temperature", "flow_matching_steps"):
+        assert absent not in tts_params
+
+
+# spec= pins the adapter to helpers the real serving class still has, so a
+# call into a removed server method fails here rather than at request time.
+def _vevo2_adapter(mocker):
+    server = mocker.Mock(spec=OmniOpenAIServingSpeech)
+    server.uploaded_speakers = {}
+    server._apply_uploaded_speaker.return_value = None
+    server._validate_ref_audio_format.return_value = None
+    server._resolve_ref_audio = mocker.AsyncMock(return_value=([0.0, 0.5], 16000, "ref-cache-key"))
+    return Vevo2Adapter(SpeechServingContext(server=server))
+
+
+def test_vevo2_validate_requires_text_and_ref_audio(mocker):
+    adapter = _vevo2_adapter(mocker)
+    ref = "https://example.com/ref.wav"
+
+    assert adapter.validate(OpenAICreateSpeechRequest(input="  ", ref_audio=ref)) == "Input text cannot be empty"
+    assert "requires 'ref_audio'" in adapter.validate(OpenAICreateSpeechRequest(input="hello"))
+    assert adapter.validate(OpenAICreateSpeechRequest(input="hello", ref_audio=ref)) is None
+
+
+def test_vevo2_build_accumulates_nonstreaming_delta_chunks(mocker):
+    # Vevo2 yields its waveform as delta chunks with async_chunk=false; without
+    # accumulation the non-streaming response keeps only the last (empty) one.
+    adapter = _vevo2_adapter(mocker)
+    request = OpenAICreateSpeechRequest(input="hello", ref_audio="https://example.com/ref.wav", ref_text="transcript")
+
+    prepared = asyncio.run(adapter.build(request, [SamplingParams(seed=42)], has_inline_ref_audio=True))
+
+    assert prepared.output_policy.accumulate_nonstreaming is True
+    assert prepared.model_type == "vevo2"
+    info = prepared.prompt["additional_information"]
+    assert info["text"] == ["hello"]
+    assert info["ref_text"] == ["transcript"]
+    assert info["prompt_audio_array"] == [[[0.0, 0.5], 16000]]
+    assert info["seed"] == [42]

@@ -891,6 +891,37 @@ parity should be checked against the upstream adapter on your deployment.
 | ------- | ------------- |
 | `BreezeBlue/Breeze-TTS-2` | Two-stage AR TTS (T5Gemma2 + Qwen3 talker with a depth decoder, bundled Qwen3-TTS codec) at 24 kHz. Four modes are selected from the request fields: plain (`input` + speaker tag `voice`, `S0`..`S9`), voice design (`instructions`), voice clone (`ref_audio` + `ref_text`, exactly one clip), and voice direction (reference + `instructions`). Greedy decoding only: `sample_rate` must be `24000`, `speed` must be `1.0`, and `guidance_scale`/`cfg_scale` other than `1.0`, `negative_prompt`, `temperature`/`top_p`/`top_k` overrides, `language`, and `speaker_embedding` are rejected. Streaming returns PCM `speech.audio.delta` events. See [`recipes/BreezeBlue/Breeze-TTS-2.md`](https://github.com/vllm-project/vllm-omni/blob/main/recipes/BreezeBlue/Breeze-TTS-2.md). |
 
+### Vevo2
+
+| Model | Description |
+| ------- | ------------- |
+| `RMSnow/Vevo2` | Unified AR + flow-matching TTS / SVS (24 kHz). Voice cloning via `ref_audio` is required; `ref_text` (transcript of the reference clip) is recommended for prosody. Checkpoint license is **CC BY-NC-ND 4.0** (non-commercial, no-derivatives); the Amphion framework itself is MIT. SVS / voice conversion / editing / streaming are deferred to follow-up PRs (see [#3391](https://github.com/vllm-project/vllm-omni/issues/3391)). See [License Considerations](#license-considerations) before deploying. |
+
+## License Considerations
+
+Most TTS models above are released under permissive licenses (Apache-2.0 / MIT) that allow commercial use. **Vevo2 is the exception** and requires special care before any production or commercial deployment.
+
+### Vevo2 (`RMSnow/Vevo2`)
+
+The `RMSnow/Vevo2` **checkpoint** is published under **[CC BY-NC-ND 4.0](https://creativecommons.org/licenses/by-nc-nd/4.0/)** — Creative Commons Attribution-NonCommercial-NoDerivatives. The Amphion **framework** that runs it is MIT-licensed, so the two licenses apply to different artifacts: you may use and modify the code freely, but the *weights* carry the restrictive terms.
+
+What CC BY-NC-ND 4.0 means in practice:
+
+| Clause | Restriction | Impact on deployment |
+| -------- | ------------- | ---------------------- |
+| **NonCommercial (NC)** | The weights may not be used for commercial purposes. | Research, evaluation, and personal/non-commercial use are fine. **Commercial deployment (any revenue-generating or business use) requires explicit permission from the upstream authors** — contact the [Amphion / Vevo2 maintainers](https://github.com/open-mmlab/Amphion) to negotiate separate licensing. |
+| **NoDerivatives (ND)** | You may not distribute modified versions of the weights. | **The model weights cannot be modified or redistributed.** Fine-tuning the checkpoint and then sharing the result, or re-hosting altered weights, is not permitted. Running inference (which does not create a redistributed derivative) is allowed within the NC limits. |
+| **Attribution (BY)** | Credit must be given. | Retain the upstream attribution and license notice anywhere the model or its outputs are distributed. |
+
+**Migration path for production / commercial use:**
+
+1. **Do not ship Vevo2 weights in a commercial product as-is.** The NC clause prohibits it without a separate agreement.
+2. **For commercial licensing**, contact the upstream Vevo2 / Amphion authors directly (via the [Amphion repo](https://github.com/open-mmlab/Amphion)) to obtain commercial terms.
+3. **If you need a permissively licensed TTS model**, use one of the Apache-2.0 / MIT models listed above (e.g. Qwen3-TTS, Voxtral, MOSS-TTS-Nano) instead — these carry no such restriction.
+4. **Do not redistribute modified weights.** If you fine-tune Vevo2 for internal research, keep the resulting checkpoint private; redistributing a derivative violates the ND clause.
+
+This restriction is surfaced at every entry point — the deploy YAML header (`vllm_omni/deploy/vevo2.yaml`), both example READMEs, the offline `end2end.py` docstring, and the online `run_server.sh` — so operators see it before they download or serve the model.
+
 ## Error Responses
 
 ### 400 Bad Request
