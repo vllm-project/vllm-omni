@@ -941,6 +941,56 @@ def test_sample_actions_routes_each_region_through_cuda_graphs(tiny_model):
     assert torch.equal(optimized, eager)
 
 
+@pytest.mark.slow
+def test_preallocated_kv_cache_is_rewritten_every_call():
+    """``sample_actions`` writes every K/V slot it reads before reading it, so
+    the preallocated cache reproduces a one-off cache bit for bit whatever an
+    earlier call left in it."""
+    model = _tiny_pi05_model().eval()
+    # AdaRMS ``dense`` is zero-initialized, which closes every expert gate and
+    # leaves the chunk independent of the K/V. Open the gates.
+    generator = torch.Generator().manual_seed(0)
+    for module in model.modules():
+        if isinstance(module, Pi05AdaRMSNorm) and module.dense is not None:
+            module.dense.weight.data.normal_(std=0.02, generator=generator)
+    images = [torch.zeros(1, 3, 224, 224) for _ in range(3)]
+    masks = [torch.tensor([True]), torch.tensor([False]), torch.tensor([False])]
+    lang_mask = torch.ones(1, 200, dtype=torch.bool)
+    noise = torch.randn(1, 4, 8, generator=torch.Generator().manual_seed(42))
+
+    def run(lang_tokens):
+        return model.sample_actions(
+            images=images, image_masks=masks, lang_tokens=lang_tokens, lang_masks=lang_mask, noise=noise, num_steps=2
+        )
+
+    prompt = torch.zeros(1, 200, dtype=torch.long)
+    other_prompt = torch.ones(1, 200, dtype=torch.long)
+    with torch.no_grad():
+        one_off = run(prompt)
+        cache = model.new_kv_cache(batch_size=1)
+        assert cache.fits(1, 3 * 256 + 200)
+        cache.key.fill_(float("nan"))
+        cache.value.fill_(float("nan"))
+        model.kv_cache = cache
+        preallocated = run(prompt)
+        other = run(other_prompt)
+        after_other = run(prompt)
+
+    assert torch.isfinite(cache.key).all() and torch.isfinite(cache.value).all()
+    assert torch.equal(preallocated, one_off)
+    assert not torch.equal(other, one_off)
+    assert torch.equal(after_other, one_off)
+
+
+@pytest.mark.slow
+def test_forward_requires_a_kv_cache(tiny_model):
+    backbone = tiny_model.paligemma_with_expert
+    with pytest.raises(TypeError, match="Pi05KVCache"):
+        backbone.forward(inputs_embeds=[torch.zeros(1, 4, tiny_model.vlm_width), None], use_cache=True)
+    with pytest.raises(TypeError, match="Pi05KVCache"):
+        backbone.forward(inputs_embeds=[None, torch.zeros(1, 4, tiny_model.expert_width)], past_key_values=[])
+
+
 # ----------------------------------------------------------------------------
 # Serving dtype
 # ----------------------------------------------------------------------------
