@@ -791,6 +791,17 @@ def test_joyai_code2wav_waits_for_full_payload():
     assert code2wav.model_config.requires_full_payload_input is True
 
 
+def test_joyai_asr_profile_topology():
+    config = _from_pipeline_key("joyai_vl_interaction_asr")
+    asr, joyai, talker, _ = (config.stage_by_id(i) for i in range(4))
+
+    assert [stage.model_stage for stage in config.stage_configs] == ["asr", "joyvl", "qwen3_tts", "code2wav"]
+    assert asr.bypass_without_modalities == ("audio",)
+    assert joyai.model_config.model_arch == "Qwen3VLForConditionalGeneration"
+    assert joyai.custom_process_input_func.endswith("joyai_vl_interaction.asr_to_joyai")
+    assert talker.custom_process_input_func.endswith("joyai_vl_interaction.joyai_action_to_tts")
+
+
 @pytest.mark.parametrize("model_runner", ["v1", "v2"])
 def test_deploy_model_runner_selection_propagates_to_every_stage(tmp_path: Path, model_runner: str):
     deploy_path = tmp_path / "qwen3_tts_runner.yaml"

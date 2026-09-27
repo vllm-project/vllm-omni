@@ -243,7 +243,7 @@ vllm serve jdopensource/JoyAI-VL-Interaction-Preview --omni \
 With `modalities: ["text", "audio"]`, its behavior is:
 
 | JoyAI action | Native output |
-|---|---|
+| --- | --- |
 | `</response> <text>` | action text + speech for `<text>` |
 | `</silence>` | action text + empty audio output (zero samples) |
 | `</response> <note> </delegation> <question>` | action text + speech for `<note>` only |
@@ -257,7 +257,7 @@ This experimental native multi-stage pipeline is request-scoped, stateless, and
 all-sync. It currently does not include:
 
 - continuous frame sessions, persistent standing instructions, or session memory;
-- audio input / ASR, full-duplex interaction, or barge-in;
+- full-duplex interaction or barge-in;
 - background Agent execution for delegated questions;
 - async-chunk support from Talker to Code2Wav;
 - integration with the existing WebUI.
@@ -267,3 +267,63 @@ available, and Code2Wav starts only after the Talker completes. Silence actions 
 TTS stages and return an empty audio output with zero samples. All three stages are placed
 on GPU 0 by the provided
 [`deploy config`](../../vllm_omni/deploy/joyai_vl_interaction.yaml).
+
+### Audio input: opt-in native ASR profile
+
+A second deploy profile takes spoken input natively, without the external ASR bridge, while
+still serving the text/video requests above from the same deployment:
+
+```text
+request with audio (+ image/video, optional standing instruction)
+  -> Qwen3-ASR transcript
+  -> JoyAI complete action text -> Qwen3-TTS Talker -> Code2Wav -> 24 kHz audio
+
+request without audio (text and/or image/video)
+  -> JoyAI complete action text -> Qwen3-TTS Talker -> Code2Wav -> 24 kHz audio
+     (the ASR stage is bypassed: no synthetic audio, no ASR inference)
+```
+
+```bash
+vllm serve jdopensource/JoyAI-VL-Interaction-Preview --omni \
+  --deploy-config vllm_omni/deploy/joyai_vl_interaction_asr.yaml \
+  --port 8092
+```
+
+Send the spoken query as an `input_audio` / `audio_url` part next to the frames or video.
+The frontend routes the audio to Qwen3-ASR and defers the image/video parts to JoyAI, where
+the transcript is presented under the same `[User Query ...]` header the Day-0 controller
+uses, followed by the original visual inputs, so the `silence` / `response` / `delegate`
+semantics and the speech routing above are unchanged:
+
+```bash
+curl -s http://127.0.0.1:8092/v1/chat/completions -H 'content-type: application/json' -d '{
+    "model": "jdopensource/JoyAI-VL-Interaction-Preview",
+    "modalities": ["text", "audio"],
+    "messages": [{"role": "user", "content": [
+      {"type": "input_audio", "input_audio": {"data": "<base64 wav>", "format": "wav"}},
+      {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,..."}}
+    ]}]
+  }'
+```
+
+For a request with audio, JoyAI's default system prompt is used unless
+`additional_information.joyai_system_prompt` replaces it; a `system` message and any text
+parts are consumed by Qwen3-ASR's chat template (as transcription context), not by JoyAI.
+When the transcript is empty, JoyAI only sees the visual inputs. The `voice`, `language`,
+`tts_speaker`, and `tts_language` fields behave as in the text/video profile.
+
+A request without an audio part never reaches the ASR stage: it is rendered with the JoyAI
+chat template exactly as in the text/video profile (system message, text parts, and
+image/video parts included) and submitted to the JoyAI stage directly. The ASR stage
+declares `bypass_without_modalities=("audio",)` in the pipeline definition; the routing
+decision is per request and needs no client-side flag. In both cases the request's sampling
+parameters (`temperature`, `max_tokens`, ...) apply to JoyAI; Qwen3-ASR decodes with its
+deploy-config defaults.
+
+The JoyAI stage's input processor is built lazily on the orchestrator side, so the first
+request that reaches it (with or without audio) pays a one-off ~16–18 s setup cost; send a
+warm-up request after startup.
+
+The existing text/video profile and the Day-0 orchestrator with its external ASR bridge
+remain available. The Day-0 controller, VAD/commit policy, session memory, and delegated
+Agent execution stay outside this request-scoped pipeline.

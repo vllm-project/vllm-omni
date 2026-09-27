@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from __future__ import annotations
 
 from typing import Literal
@@ -28,6 +31,9 @@ class StageSubmissionMessage(EngineQueueMessage, kw_only=True):
     enqueue_ts: float
     final_output_stage_ids: list[int] | None = None
     request_artifact_dirs: list[str] | None = None
+    # Stage the request is submitted to; > 0 bypasses stage 0 (see
+    # ``StagePipelineConfig.bypass_without_modalities``).
+    entry_stage_id: int = 0
 
 
 class AddCompanionRequestMessage(EngineQueueMessage, kw_only=True):

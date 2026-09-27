@@ -6,9 +6,10 @@ import base64
 import json
 import time
 import uuid
-from collections.abc import AsyncGenerator, AsyncIterator, Callable
+from collections.abc import AsyncGenerator, AsyncIterator, Callable, Sequence
 from dataclasses import fields, is_dataclass
 from datetime import datetime, timedelta, timezone
+from functools import partial
 from io import BytesIO
 from typing import Any, Final, cast
 
@@ -102,6 +103,7 @@ from vllm.parser.mistral import MistralToolCall
 from vllm.reasoning import ReasoningParser
 from vllm.renderers import BaseRenderer, merge_kwargs
 from vllm.renderers.inputs import TokPrompt
+from vllm.renderers.params import ChatParams, TokenizeParams
 from vllm.sampling_params import RequestOutputKind, SamplingParams
 from vllm.tokenizers import TokenizerLike
 from vllm.tokenizers import TokenizerLike as AnyTokenizer
@@ -558,7 +560,10 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
             model_name = self.models.model_name(lora_request)
 
-            renderer = self.renderer
+            # A request that bypasses stage 0 is rendered with the tokenizer and
+            # chat template of the stage it enters at.
+            entry_stage_id = self._resolve_entry_stage_id(request.messages)
+            renderer = self.engine_client.get_stage_renderer(entry_stage_id) if entry_stage_id else self.renderer
             tokenizer = renderer.get_tokenizer()
             if tokenizer is None:
                 tokenizer = await self.engine_client.get_tokenizer()
@@ -634,6 +639,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     continue_final_message=request.continue_final_message,
                     documents=getattr(request, "documents", None),
                     add_special_tokens=request.add_special_tokens,
+                    entry_stage_id=entry_stage_id,
                 )
             else:
                 should_include_tools = tool_dicts is not None
@@ -860,6 +866,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     output_modalities=output_modalities,
                     arrival_time=request_timestamp,
                     lora_request=lora_request,
+                    entry_stage_id=entry_stage_id,
                 )
 
                 generators.append(generator)
@@ -914,6 +921,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         continue_final_message: bool = False,
         documents: list[dict[str, str]] | None = None,
         add_special_tokens: bool = False,
+        entry_stage_id: int = 0,
     ) -> tuple[list[ConversationMessage], list[TokPrompt]]:
         if renderer is None:
             renderer = self.renderer
@@ -944,13 +952,14 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         )
 
         deferred_multi_modal_data: dict[str, Any] | None = None
-        if self._needs_multistage_multimodal_split():
+        if entry_stage_id == 0 and self._needs_multistage_multimodal_split():
             messages, deferred_multi_modal_data = await self._prepare_multistage_multimodal_inputs(
                 messages,
                 request,
             )
 
-        (conversation,), (engine_prompt,) = await renderer.render_chat_async(
+        render_chat = partial(self._render_chat_deferred, renderer) if entry_stage_id else renderer.render_chat_async
+        (conversation,), (engine_prompt,) = await render_chat(
             [messages],
             chat_params,
             tok_params,
@@ -1034,6 +1043,38 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             additional_information = {}
             engine_prompt["additional_information"] = additional_information
         return additional_information
+
+    def _resolve_entry_stage_id(self, messages: list[ChatCompletionMessageParam]) -> int:
+        """Return 1 when stage 0 declares ``bypass_without_modalities`` and the
+        request carries none of them (it bypasses stage 0), else 0."""
+        stage_configs = list(getattr(self.engine_client, "stage_configs", []) or [])
+        bypass_without = set(getattr(stage_configs[0], "bypass_without_modalities", ())) if stage_configs else set()
+        if not bypass_without:
+            return 0
+        carried = {
+            self._deferred_multimodal_part(part, bypass_without)[0]
+            for message in messages
+            if isinstance(message, dict) and isinstance(message.get("content"), list)
+            for part in message["content"]
+        }
+        return 0 if carried & bypass_without else 1
+
+    @staticmethod
+    async def _render_chat_deferred(
+        renderer: BaseRenderer,
+        conversations: Sequence[list[ChatCompletionMessageParam]],
+        chat_params: ChatParams,
+        tok_params: TokenizeParams,
+        *,
+        prompt_extras: dict[str, Any],
+    ) -> tuple[list[list[ConversationMessage]], list[TokPrompt]]:
+        """``render_chat_async`` without its multimodal-processing step: a bypassing
+        request keeps its media raw for the orchestrator (``_build_entry_stage_request``)."""
+        rendered = await asyncio.gather(*(renderer.render_messages_async(c, chat_params) for c in conversations))
+        tok_prompts = await renderer.tokenize_prompts_async([prompt for _, prompt in rendered], tok_params)
+        for tok_prompt in tok_prompts:
+            tok_prompt.update(prompt_extras)
+        return [conversation for conversation, _ in rendered], tok_prompts
 
     def _needs_multistage_multimodal_split(self) -> bool:
         return bool(self._deferred_multimodal_modalities())

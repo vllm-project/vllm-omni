@@ -175,6 +175,10 @@ class AsyncOmniBase(OmniBase):
             return None
         return self.input_processor.renderer
 
+    def get_stage_renderer(self, stage_id: int):
+        """Return the renderer for chat requests that bypass stage 0 and enter at ``stage_id``."""
+        return self.engine.get_stage_renderer(stage_id)
+
     @property
     def vllm_config(self):
         """Return the vLLM config for the comprehension stage when present."""

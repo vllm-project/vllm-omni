@@ -497,7 +497,8 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             # first call (memoizing here pinned the request to True forever,
             # never refreshing once the marker landed).
             return True
-        needs_payload = final_stage_id > 0
+        # A stage that is the request's final stage has no downstream consumer.
+        needs_payload = final_stage_id > getattr(self.vllm_config.model_config, "stage_id", 0)
         self._downstream_payload_cache[req_id] = needs_payload
         return needs_payload
 

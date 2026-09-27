@@ -1,17 +1,70 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Tests for JoyAI action-to-TTS conversion."""
+"""Tests for the JoyAI stage input processors."""
 
 from types import SimpleNamespace
 
 import pytest
 
 from vllm_omni.engine.stage_engine_core_client import StageEngineCoreClient
+from vllm_omni.experimental.fullduplex.joyvl.decision.prompts import (
+    DEFAULT_SYSTEM_PROMPT,
+    USER_QUERY_HEADER,
+)
 from vllm_omni.model_executor.stage_input_processors import (
     joyai_vl_interaction as joyai_bridge,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+_IMAGE = "<|vision_start|><|image_pad|><|vision_end|>"
+_VIDEO = "<|vision_start|><|video_pad|><|vision_end|>"
+
+
+def test_asr_to_joyai_combines_transcript_with_deferred_visuals() -> None:
+    """The cleaned transcript becomes JoyAI's user query, followed by the deferred visuals."""
+    client = object.__new__(StageEngineCoreClient)
+    client.custom_process_input_func = joyai_bridge.asr_to_joyai
+    client.requires_multimodal_data = True
+
+    def joyai_prompt(system_prompt: str, user_turn: str) -> str:
+        return (
+            f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
+            f"<|im_start|>user\n{user_turn}<|im_end|>\n<|im_start|>assistant\n"
+        )
+
+    cases = [
+        (
+            SimpleNamespace(text="", cumulative_text="language English<asr_text>Is the stove  still on?"),
+            {
+                "multi_modal_data": {"audio": ("wave", 16000)},
+                "additional_information": {"deferred_multi_modal_data": {"image": ["frame-0", "frame-1"]}},
+            },
+            {
+                "prompt": joyai_prompt(
+                    DEFAULT_SYSTEM_PROMPT, f"{USER_QUERY_HEADER}\nIs the stove still on?{_IMAGE}{_IMAGE}"
+                ),
+                "multi_modal_data": {"image": ["frame-0", "frame-1"]},
+            },
+        ),
+        (
+            SimpleNamespace(text="What is burning?"),
+            {
+                "mm_processor_kwargs": {"fps": 1},
+                "additional_information": {
+                    "deferred_multi_modal_data": {"video": ("frames", {"fps": 1})},
+                    "joyai_system_prompt": ["Watch the feed."],
+                },
+            },
+            {
+                "prompt": joyai_prompt("Watch the feed.", f"{USER_QUERY_HEADER}\nWhat is burning?{_VIDEO}"),
+                "multi_modal_data": {"video": [("frames", {"fps": 1})]},
+                "mm_processor_kwargs": {"fps": 1},
+            },
+        ),
+    ]
+    for completion, prompt, expected in cases:
+        assert client.process_engine_inputs([SimpleNamespace(outputs=[completion])], prompt=prompt) == [expected]
 
 
 def test_joyai_action_to_tts_bridge(monkeypatch: pytest.MonkeyPatch) -> None:

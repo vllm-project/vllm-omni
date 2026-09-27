@@ -196,6 +196,30 @@ def test_needs_multistage_multimodal_split_detects_aura_handoff(serving_chat):
     assert serving_chat._needs_multistage_multimodal_split() is True
 
 
+def test_joyai_asr_profile_bypasses_asr_without_audio(serving_chat):
+    from vllm_omni.model_executor.models.joyai_vl_interaction.pipeline import JOYAI_VL_INTERACTION_ASR_PIPELINE
+
+    serving_chat.engine_client = SimpleNamespace(
+        stage_configs=[
+            SimpleNamespace(
+                model_stage=stage.model_stage,
+                requires_multimodal_data=stage.requires_multimodal_data,
+                bypass_without_modalities=stage.bypass_without_modalities,
+            )
+            for stage in JOYAI_VL_INTERACTION_ASR_PIPELINE.stages
+        ]
+    )
+    image = {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,abc"}}
+    audio = {"type": "input_audio", "input_audio": {"data": "abc", "format": "wav"}}
+
+    # Audio enters at Qwen3-ASR, which defers the image/video parts to JoyAI.
+    assert serving_chat._resolve_entry_stage_id([{"role": "user", "content": [audio, image]}]) == 0
+    assert serving_chat._deferred_multimodal_modalities() == {"image", "video"}
+    # Without audio the request enters at JoyAI directly.
+    assert serving_chat._resolve_entry_stage_id([{"role": "user", "content": [image]}]) == 1
+    assert serving_chat._resolve_entry_stage_id([{"role": "user", "content": "What happened?"}]) == 1
+
+
 def test_build_multistage_generation_inputs_multi_image_emits_n_img_placeholders(serving_chat):
     """N reference images with bot_task set must emit N <img> placeholders.
 
