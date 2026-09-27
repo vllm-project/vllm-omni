@@ -1,6 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import asyncio
+import threading
+import time
+
 import pytest
 import torch
 from pytest_mock import MockerFixture
@@ -10,11 +14,89 @@ from vllm.v1.engine import EngineCoreRequest
 from vllm_omni.distributed.omni_coordinator import ReplicaInfo, ReplicaStatus
 from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine, StageRuntimeInfo
+from vllm_omni.engine.messages import StageSubmissionMessage
 from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.engine.stage_pool import StagePool
 from vllm_omni.model_executor.stage_input_processors.bagel import ExpandedPrompt
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+@pytest.mark.asyncio
+async def test_add_request_async_does_not_block_event_loop(mocker: MockerFixture):
+    engine = object.__new__(AsyncOmniEngine)
+    engine.request_queue = mocker.Mock()
+    engine.prompt_expand_func = None
+    started = threading.Event()
+
+    def slow_build(**kwargs):
+        del kwargs
+        started.set()
+        time.sleep(0.15)
+        return StageSubmissionMessage(
+            type="add_request",
+            request_id="req-async",
+            prompt="prepared",
+            original_prompt="original",
+            sampling_params_list=[],
+            final_stage_id=0,
+        )
+
+    mocker.patch.object(engine, "_build_add_request_message", side_effect=slow_build)
+    request_task = asyncio.create_task(engine.add_request_async("req-async", "prompt"))
+
+    # The request preparation is deliberately slow. The loop must still get a
+    # chance to run while that work is in progress.
+    await asyncio.sleep(0.01)
+    loop_ran = started.is_set() and not request_task.done()
+    await request_task
+
+    assert loop_ran
+    engine.request_queue.sync_q.put.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_add_request_async_never_enqueues_late_result(mocker: MockerFixture):
+    engine = object.__new__(AsyncOmniEngine)
+    engine.request_queue = mocker.Mock()
+    engine.prompt_expand_func = None
+    started = threading.Event()
+    finish_build = threading.Event()
+    discarded = threading.Event()
+
+    def slow_build(**kwargs):
+        del kwargs
+        started.set()
+        finish_build.wait(timeout=2)
+        return StageSubmissionMessage(
+            type="add_request",
+            request_id="req-cancelled",
+            prompt="prepared",
+            original_prompt="original",
+            sampling_params_list=[],
+            final_stage_id=0,
+        )
+
+    mocker.patch.object(engine, "_build_add_request_message", side_effect=slow_build)
+    original_discard = AsyncOmniEngine._discard_prepared_add_request
+
+    def track_discard(request_id, prepared):
+        try:
+            original_discard(engine, request_id, prepared)
+        finally:
+            discarded.set()
+
+    mocker.patch.object(engine, "_discard_prepared_add_request", side_effect=track_discard)
+    request_task = asyncio.create_task(engine.add_request_async("req-cancelled", "prompt"))
+    assert await asyncio.to_thread(started.wait, 1)
+
+    request_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await request_task
+    finish_build.set()
+    assert await asyncio.to_thread(discarded.wait, 1)
+
+    engine.request_queue.sync_q.put.assert_not_called()
 
 
 class _SyntheticSyncQueueShutDownError(Exception):
