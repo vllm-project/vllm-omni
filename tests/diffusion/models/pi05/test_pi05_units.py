@@ -401,11 +401,14 @@ class _GraphTarget:
         (True, "cpu", False),
     ],
 )
-def test_pipeline_installs_cuda_graphs_unless_enforce_eager(enforce_eager, device, installed):
+def test_pipeline_installs_cuda_graphs_unless_enforce_eager(enforce_eager, device, installed, monkeypatch):
     from types import SimpleNamespace
 
     from vllm_omni.diffusion.models.pi05.pipeline_pi05 import Pi05Pipeline
 
+    captured = []
+    # Capture needs a GPU; test_pi05_cuda_graph_parity.py runs the real one.
+    monkeypatch.setattr(Pi05CUDAGraphs, "capture", lambda graphs: captured.append(graphs))
     pipeline = object.__new__(Pi05Pipeline)
     pipeline._device = torch.device(device)
     pipeline.model = _GraphTarget()
@@ -413,6 +416,8 @@ def test_pipeline_installs_cuda_graphs_unless_enforce_eager(enforce_eager, devic
     pipeline._install_cuda_graphs(SimpleNamespace(enforce_eager=enforce_eager))
 
     assert isinstance(pipeline.model.cuda_graphs, Pi05CUDAGraphs) is installed
+    # Captured at init, before the graph path is installed.
+    assert captured == ([pipeline.model.cuda_graphs] if installed else [])
 
 
 def test_load_lerobot_norm_stats_unknown_mode_raises(tmp_path):
@@ -939,6 +944,15 @@ def test_sample_actions_routes_each_region_through_cuda_graphs(tiny_model):
 
     assert graphs.calls == ["embed_prefix", "prefix_forward"] + ["denoise_step"] * 3
     assert torch.equal(optimized, eager)
+
+
+@pytest.mark.slow
+def test_cuda_graph_capture_failure_raises(tiny_model):
+    """``enforce_eager=False`` asks for the graph path: a failed capture must
+    stop startup rather than silently serve eagerly."""
+    assert tiny_model.kv_cache is None
+    with pytest.raises(RuntimeError, match="enforce_eager"):
+        Pi05CUDAGraphs(tiny_model).capture()
 
 
 @pytest.mark.slow
