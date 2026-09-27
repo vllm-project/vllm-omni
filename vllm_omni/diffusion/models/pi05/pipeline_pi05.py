@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from dataclasses import fields as dataclass_fields
 
 import numpy as np
@@ -250,8 +251,8 @@ class Pi05Pipeline(nn.Module):
 
         The stage's ``enforce_eager`` (deploy yaml, or ``--enforce-eager`` on the
         CLI, which takes precedence) keeps the eager baseline. Otherwise the
-        CUDA Graph path is installed, whose regions each fall back to eager
-        while they have no graph to replay.
+        CUDA Graph path is captured here, at init, and installed. A capture
+        failure raises rather than silently serving eagerly.
         """
         if od_config.enforce_eager:
             logger.info("Pi05Pipeline: enforce_eager is set; sample_actions runs eagerly.")
@@ -262,8 +263,14 @@ class Pi05Pipeline(nn.Module):
                 self._device,
             )
             return
-        self.model.cuda_graphs = Pi05CUDAGraphs(self.model)
-        logger.info("Pi05Pipeline: sample_actions runs its CUDA Graph path.")
+        graphs = Pi05CUDAGraphs(self.model)
+        start = time.perf_counter()
+        graphs.capture()
+        self.model.cuda_graphs = graphs
+        logger.info(
+            "Pi05Pipeline: captured the sample_actions CUDA graphs in %.2f s; sample_actions runs its CUDA Graph path.",
+            time.perf_counter() - start,
+        )
 
     def _load_checkpoint(self, model: Pi05ForActionPrediction) -> None:
         import safetensors.torch
