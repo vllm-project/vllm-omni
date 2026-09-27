@@ -49,7 +49,10 @@ from vllm_omni.model_executor.models.bagel.pipeline import (
     BAGEL_THINK_PIPELINE,
 )
 from vllm_omni.model_executor.models.breeze_tts_2.pipeline import BREEZE_TTS_2_PIPELINE
-from vllm_omni.model_executor.models.cosmos3.pipeline import COSMOS3_POLICY_PIPELINE
+from vllm_omni.model_executor.models.cosmos3.pipeline import (
+    COSMOS3_OMNI_DEPLOY_PIPELINE,
+    COSMOS3_POLICY_PIPELINE,
+)
 from vllm_omni.model_executor.models.cosyvoice3.pipeline import COSYVOICE3_PIPELINE
 from vllm_omni.model_executor.models.covo_audio.pipeline import COVO_AUDIO_PIPELINE
 from vllm_omni.model_executor.models.dreamzero.pipeline import DREAMZERO_PIPELINE
@@ -86,6 +89,7 @@ from vllm_omni.model_executor.models.ming_flash_omni.pipeline import (
     MING_FLASH_OMNI_THINKER_ONLY_PIPELINE,
     MING_FLASH_OMNI_TTS_PIPELINE,
 )
+from vllm_omni.model_executor.models.ming_image.pipeline import MING_IMAGE_PIPELINE
 from vllm_omni.model_executor.models.ming_tts.pipeline import (
     MING_TTS_MOE_PIPELINE,
     MING_TTS_PIPELINE,
@@ -153,11 +157,12 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "Gr00tN1d7": GR00T_N1D7_PIPELINE,
     "pi0": PI0_PIPELINE,
     "pi05": PI05_PIPELINE,
-    # Cosmos3 policy checkpoints share HF metadata with the T2I/video Cosmos3
-    # checkpoints (which stay on the single-stage diffusion fallback), so this
-    # entry is only reachable through a deploy yaml's ``pipeline:`` key
-    # (see deploy/cosmos3_policy_droid.yaml).
+    # Cosmos3 policy / omni-deploy topologies share HF metadata with video
+    # Cosmos3 checkpoints (which stay on the single-stage diffusion fallback),
+    # so these entries are only reachable through a deploy yaml's ``pipeline:``
+    # key (see deploy/cosmos3_policy_droid.yaml and deploy/cosmos3_omni.yaml).
     "cosmos3_policy": COSMOS3_POLICY_PIPELINE,
+    "cosmos3_omni_deploy": COSMOS3_OMNI_DEPLOY_PIPELINE,
     "gepard": GEPARD_PIPELINE,
     "glm_image": GLM_IMAGE_PIPELINE,
     "hunyuan_image_3_moe": HUNYUAN_IMAGE3_PIPELINE,
@@ -187,6 +192,7 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "ming_flash_omni_tts": MING_FLASH_OMNI_TTS_PIPELINE,
     "ming_flash_omni_thinker_only": MING_FLASH_OMNI_THINKER_ONLY_PIPELINE,
     "ming_flash_omni_image": MING_FLASH_OMNI_IMAGE_PIPELINE,
+    "ming_image": MING_IMAGE_PIPELINE,
     "moss_tts_nano": MOSS_TTS_NANO_PIPELINE,
     "minimax_h3_disaggregated": MINIMAX_H3_PIPELINE,
     "omnivoice": OMNIVOICE_PIPELINE,

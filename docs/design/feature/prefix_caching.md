@@ -8,6 +8,7 @@
 - [High-Level Approach](#high-level-approach)
 - [Example](#example)
 - [What About Multimodal Inputs?](#what-about-multimodal-inputs)
+- [Diffusion KV Prefix Caching](#diffusion-kv-prefix-caching)
 - [Implementation](#implementation)
 - [Related Files](#related-files)
 
@@ -25,7 +26,7 @@ vLLM implements automatic prefix caching for managing its kv-cache, which is bes
 - Model / stage specific multimodal data
 
 !!! note "Note 1"
-    This document describes vLLM-Omni's mechanism for caching tensor outputs that are meant to be passed between stages, when requests have common prefixes, similar to the way in which vLLM has prefix caching for the kv-cache. This works in conjunction with vLLM's multimodal encoder caching, but is distinct. See the final section for a concrete example for how they tie together in practice.
+    The following sections describe caching tensor outputs passed between AR stages. This is distinct from multimodal encoder caching and from [diffusion KV prefix caching](#diffusion-kv-prefix-caching), which reuses GPU KV pages inside a diffusion stage.
 
 ### High-Level Approach
 
@@ -45,7 +46,7 @@ Host footprint: each cached key costs `num_blocks × block_size × D × dtype_by
 ### Example
 
 !!! note "Note 3"
-    Prefix caching in vLLM-Omni currently is only supported on AutoRegressive stages with one kv-cache group. Configure it with the pipeline-wide `enable_prefix_caching` field in the deploy config.
+    The stage-output tensor cache described here supports AutoRegressive stages with one kv-cache group. Configure it with the pipeline-wide `enable_prefix_caching` field in the deploy config. Diffusion KV caching has the separate requirements below.
 
 The way in which vLLM-Omni ties into vLLM's prefix caching is best understood by example. Say that we have the following:
 
@@ -166,6 +167,65 @@ Because we have multimodal data in a scheduled span that isn't fully precomputed
 When we pass our multimodal tensors to the language model component in the same stage, we'll then expect the same outputs, because the prefix caching behaviors in vLLM-Omni / vLLM match, so the LLM will use vLLM's KV cache manager's prefix caching to correctly handle the attention information for `Block 1` while calculating the outputs for `Block 2`, giving us the correct results for processing `Block 2` with the context of `Block 1`.
 
 Finally, we look up the output hidden states/multimodal tensors corresponding to the prefix cache hit `Block 1` and concatenate it with the forward pass result to get the final result, which is expected to be identical to the full hidden states when prefix caching is disabled.
+
+### Diffusion KV Prefix Caching
+
+HunyuanImage3's standalone DiT pipeline can reuse stable text/reference-image KV
+across requests. Enable it on the diffusion stage in the deploy config:
+
+```yaml
+pipeline: hunyuan_image3_dit
+stages:
+  - stage_id: 0
+    diffusion_kv_mode: paged_scheduler
+    enable_prefix_caching: true
+```
+
+The Scheduler uses vLLM's native `KVCacheManager` to look up and retain complete
+prefix blocks. The Worker owns the GPU pages and block tables. On a hit, the first
+denoise forward computes only the uncached query suffix while attending to both
+cached and new KV. Dynamic target-image KV is never published as a reusable prefix.
+
+Cache identity includes token IDs, reference-image content and VAE random state,
+plus model/layout and LoRA context. The same image with different prompts can
+reuse the common leading blocks; it does not imply that every image span or CFG
+branch is interchangeable. Disabling prefix caching skips cache-identity hashing;
+`dense_legacy` remains the default. Enabling prefix caching with a mode other than
+`paged_scheduler`, without a registered model hook, or together with native
+`kv_transfer_config` raises a configuration error.
+Combining it with `enable_sleep_mode: true` is also rejected: sleep discards KV
+pages without invalidating the Scheduler's prefix-cache index. Disable either
+prefix caching or sleep mode.
+
+The current scope is local DiT reuse, not AR-imported KV or missing-page-only
+cross-stage transfer. Prefix-hit accuracy has been exercised with TP4/SP1 and
+TP2/SP2 (Ulysses), both with EP and CFGP1. Other combinations still require validation. See the
+[diffusion compatibility notes](../../user_guide/diffusion_features.md#diffusion-kv-prefix-caching).
+
+#### Shared-reference benchmark
+
+From the repository root, use the unified `vllm bench serve --omni` test runner:
+
+```bash
+pytest tests/dfx/perf/scripts/run_benchmark.py \
+  --test-config-file tests/dfx/perf/tests/test_hunyuan_image3_prefix_caching.json
+```
+
+Run GPU tests through your environment's GPU scheduler. The suite reuses the
+two-image IT2I accuracy input on a single DiT stage, comparing dense, paged without
+prefix caching, and paged with prefix caching. Each mode runs two ordinary upstream
+warmups followed by eight identical requests at CFG 2.5, 8 denoise steps and seed 42.
+Warmups are excluded from latency and request throughput. This measures full-prefix
+reuse, not the earlier distinct-prompt workload; its results must be reported separately.
+
+`tests/e2e/accuracy/test_hunyuan_image3_prefix_cache_accuracy.py` uses the same input
+at CFG 2.5, 50 steps and seed 42, comparing all modes against the existing official
+Instruct output image and IT2I thresholds (CLIP ≥90, SSIM ≥0.26, PSNR ≥12.5).
+A different prompt warms the cache; the original prompt then exercises partial
+and repeated hits, with reference-image reuse and query slicing verified.
+Only outputs for the original prompt are scored. The golden comes from AR-to-DiT;
+this single-DiT quality check does not establish identical conditioning between
+the pipelines. The existing AR-to-DiT test remains unchanged.
 
 ### Implementation
 

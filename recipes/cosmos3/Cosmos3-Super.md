@@ -57,7 +57,17 @@ vllm serve nvidia/Cosmos3-Super \
 
 Guardrails are on by default (gated `nvidia/Cosmos-1.0-Guardrail` — `pip install
 cosmos-guardrail`, accept the license, set `HF_TOKEN`); add `--no-guardrails` to
-disable. `--enable-layerwise-offload` reduces VRAM on smaller GPUs;
+disable, or pass
+[`vllm_omni/deploy/cosmos3_omni.yaml`](../../vllm_omni/deploy/cosmos3_omni.yaml)
+via `--deploy-config` on either multi-GPU command above (opt-in omni deploy
+overlay, `pipeline: cosmos3_omni_deploy`; without that `pipeline:` key
+`--deploy-config` cannot apply for Cosmos3). Same YAML works for Super / Nano
+(T2I and video); topology `final_output_type` matches the CLI default (`video`).
+`--enable-layerwise-offload` reduces VRAM on smaller GPUs;
+`--vae-fast-path channels_last` speeds up the Wan VAE video decode by switching the
+decoder convolutions to channels-last kernels (output no longer bit-identical to
+diffusers; the default `lossless` fast path is bit-exact, see
+[Wan VAE Decoder Fast Path](../../docs/user_guide/diffusion/vae_fast_path.md));
 `--quantization fp8` (online, no calibration) cuts peak VRAM for 720p video
 generation from ~83 GB to ~55 GB per GPU (2-GPU) with BF16-level quality (T2V
 composition can shift at the same seed).

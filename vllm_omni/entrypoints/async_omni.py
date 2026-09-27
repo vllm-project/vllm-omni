@@ -14,8 +14,9 @@ import asyncio
 import time
 import uuid
 from collections.abc import AsyncGenerator, Iterable, Mapping, Sequence
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
+import anyio
 from vllm import TokensPrompt
 from vllm.engine.protocol import EngineClient, StreamingInput
 from vllm.logger import init_logger
@@ -44,6 +45,8 @@ if TYPE_CHECKING:
     from vllm_omni.inputs.data import OmniInteractionPrompt, OmniPromptType
 
 logger = init_logger(__name__)
+
+CACHE_RESET_TIMEOUT_S = 60.0
 
 
 class AsyncOmni(AsyncOmniBase, EngineClient):
@@ -74,6 +77,8 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         ... ):
         ...     print(output)
     """
+
+    engine: AsyncOmniEngine
 
     def _create_engine(self, **engine_kwargs: Any) -> AsyncOmniEngine:
         return AsyncOmniEngine(**engine_kwargs)
@@ -119,6 +124,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         trace_headers: Mapping[str, str] | None = None,
         priority: int = 0,
         data_parallel_rank: int | None = None,
+        session_id: str | None = None,
         reasoning_ended: bool | None = None,
         reasoning_parser_kwargs: dict[str, Any] | None = None,
         arrival_time: float | None = None,
@@ -128,6 +134,9 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         Coordinates multi-stage pipeline execution. Processes the prompt
         through all stages in the pipeline and yields outputs as they become
         available.
+
+        ``session_id`` is accepted for EngineClient protocol compatibility
+        and is not duplex-session plumbing.
 
         **Diffusion batching:**
         Diffusion stages accept only a single prompt per request.  Passing a
@@ -261,7 +270,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
                 first_chunk_submitted = asyncio.get_running_loop().create_future()
                 input_stream_task = await self._add_streaming_input_request(
                     request_id=request_id,
-                    input_stream=prompt,
+                    input_stream=cast(AsyncGenerator, prompt),
                     sampling_params_list=req_sp_list,
                     final_stage_id=final_stage_id_for_e2e,
                     final_output_stage_ids=final_output_stage_ids,
@@ -281,7 +290,8 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
                     lora_request=lora_request,
                 )
             submit_ts = time.time()
-            req_state.metrics.stage_first_ts[0] = submit_ts
+            stage_first_ts = cast(list[float | None], req_state.metrics.stage_first_ts)
+            stage_first_ts[0] = submit_ts
             req_start_ts[request_id] = submit_ts
             if admitting:
                 await self._release_generate_admission()
@@ -306,7 +316,10 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
 
         except (asyncio.CancelledError, GeneratorExit):
             self._record_request_failure_once(request_id, reason="client_disconnect")
-            await self._abort_internal_requests(request_id, timeout=ABORT_TIMEOUT_S)
+            # ASGI cancellation also affects subsequent awaits. Shield the
+            # bounded engine abort before removing the local request state.
+            with anyio.CancelScope(shield=True):
+                await self._abort_internal_requests(request_id, timeout=ABORT_TIMEOUT_S)
             logger.info(f"[AsyncOmni] Request {request_id} aborted.")
             raise
         except Exception as e:
@@ -355,8 +368,10 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         # only check thinker's sampling params now
         stage0_params = sampling_params_list[0]
         self._validate_streaming_input_sampling_params(stage0_params)
+        stage0_params = cast(SamplingParams, stage0_params)
         req_state = self.request_states[request_id]
         has_submitted_first_chunk = False
+        input_error_reported = False
 
         # NOTE: InputProcessor in vLLM should generally do this too, but for
         # now we do it defensively. TODO (Alex) ensure clones/copying are optimized
@@ -367,6 +382,21 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         def _mark_first_chunk_submitted() -> None:
             if first_chunk_submitted is not None and not first_chunk_submitted.done():
                 first_chunk_submitted.set_result(None)
+
+        async def _report_input_error(error: Exception) -> None:
+            nonlocal input_error_reported
+            if input_error_reported:
+                return
+            input_error_reported = True
+            status_code, error_type = client_error_metadata(error)
+            await req_state.queue.put(
+                ErrorMessage(
+                    request_id=request_id,
+                    error=str(error),
+                    status_code=status_code,
+                    error_type=error_type,
+                )
+            )
 
         async def handle_inputs() -> None:
             nonlocal has_submitted_first_chunk
@@ -413,15 +443,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
             except (asyncio.CancelledError, GeneratorExit):
                 cancelled = True
             except Exception as error:
-                status_code, error_type = client_error_metadata(error)
-                await req_state.queue.put(
-                    ErrorMessage(
-                        request_id=request_id,
-                        error=str(error),
-                        status_code=status_code,
-                        error_type=error_type,
-                    )
-                )
+                await _report_input_error(error)
             finally:
                 try:
                     if not cancelled:
@@ -460,9 +482,11 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
                                 )
                             )
                             has_submitted_first_chunk = True
+                except Exception as error:
+                    await _report_input_error(error)
                 finally:
                     # Unblock generate() even on cancel / empty stream / submit
-                    # failure so it can observe a terminal abort or empty result.
+                    # failure so it can observe the queued terminal result or error.
                     _mark_first_chunk_submitted()
 
         input_stream_task = asyncio.create_task(handle_inputs())
@@ -523,17 +547,15 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
             stage_ids=stage_ids,
         )
 
-        unsupported_stage_ids: list[int] = []
-        effective_stage_ids = stage_ids or list(range(len(results)))
-        for index, result in enumerate(results):
-            if isinstance(result, dict) and result.get("todo"):
-                unsupported_stage_ids.append(effective_stage_ids[index])
-
-        if unsupported_stage_ids:
+        unsupported_results = [
+            index for index, result in enumerate(results) if isinstance(result, dict) and result.get("todo")
+        ]
+        if unsupported_results:
             logger.warning(
-                "[AsyncOmni] collective_rpc(%s) has TODO support on stage(s): %s",
+                "[AsyncOmni] collective_rpc(%s) has TODO support in replica result(s) %s (requested stages: %s)",
                 method,
-                unsupported_stage_ids,
+                unsupported_results,
+                stage_ids,
             )
 
         return results
@@ -545,23 +567,28 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         stage_ids: list[int],
         args: tuple[Any, ...] = (),
         kwargs: dict[str, Any] | None = None,
+        timeout: float | None = None,
     ) -> list[Any]:
-        """Call an engine control helper via collective_rpc (orchestrator loop).
-
-        StagePool resolves ``{method}_async`` on the AR client when present
-        (vLLM AsyncMPClient convention); diffusion stages answer the same
-        method names inside DiffusionEngine. Raises if any replica reports
-        failure.
-        """
+        """Call EngineCore helpers and reject failures from any replica."""
+        timeout_kwargs = {"timeout": timeout} if timeout is not None else {}
         results = await self.collective_rpc(
             method=method,
             args=args,
             kwargs=kwargs,
             stage_ids=stage_ids,
+            **timeout_kwargs,
         )
+
+        def check_result(result: Any) -> None:
+            if isinstance(result, (list, tuple)):
+                for item in result:
+                    check_result(item)
+            elif isinstance(result, dict):
+                if result.get("error") or result.get("todo") or result.get("supported") is False:
+                    raise RuntimeError(f"{method} failed: {result}")
+
         for result in results:
-            if isinstance(result, dict) and result.get("error"):
-                raise RuntimeError(f"{method} failed: {result['error']}")
+            check_result(result)
         return results
 
     @staticmethod
@@ -756,13 +783,8 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
 
         # Frontend / sender-side cache clear (P0). EngineCore.pause_scheduler
         # already clears AR-side caches when clear_cache=True.
-        if clear_cache:
-            await self.reset_prefix_cache(
-                reset_running_requests=not wait_for_inflight_requests,
-                reset_connector=True,
-            )
-            await self.reset_mm_cache()
-            await self.reset_encoder_cache()
+        if clear_cache and 0 in ar_stage_ids:
+            await self._clear_frontend_mm_cache()
 
     async def resume_generation(self, stage_ids: list[int] | None = None) -> None:
         """Resume generation after :meth:`pause_generation`."""
@@ -797,7 +819,8 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         async with self._pause_cond:
             return self._paused
 
-    async def start_profile(
+    # EngineClient exposes async operations; OmniBase implements the sync API.
+    async def start_profile(  # type: ignore[override]
         self,
         profile_prefix: str | None = None,
         stages: list[int] | None = None,
@@ -812,7 +835,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         """
         return await self.collective_rpc(method="profile", args=(True, profile_prefix), stage_ids=stages)
 
-    async def stop_profile(self, stages: list[int] | None = None) -> list[Any]:
+    async def stop_profile(self, stages: list[int] | None = None) -> list[Any]:  # type: ignore[override]
         """Stop profiling specified stages.
 
         Uses vLLM-compatible profile(is_start=False) interface.
@@ -822,34 +845,63 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         """
         return await self.collective_rpc(method="profile", args=(False, None), stage_ids=stages)
 
-    async def reset_mm_cache(self) -> None:
-        """Reset the frontend (P0) multimodal processor cache.
-
-        ``EngineCore.sleep(level>=1)`` already clears the P1 receiver cache.
-        Clearing P0 avoids hash-only follow-up requests after that reset.
-        """
+    async def _clear_frontend_mm_cache(self) -> None:
+        """Clear P0 through the renderer's serialized multimodal executor."""
         renderer = self.renderer
         if renderer is not None:
             await renderer.clear_mm_cache_async()
 
-    async def reset_encoder_cache(self) -> None:
-        """Reset the encoder cache for all stages.
+    async def reset_mm_cache(
+        self, *, stage_ids: list[int] | None = None, timeout: float = CACHE_RESET_TIMEOUT_S
+    ) -> None:
+        """Reset sender and receiver MM caches on selected AR stages.
 
-        TODO: Forward to Orchestrator process via message.
+        By default all AR stages are selected; diffusion stages are skipped.
+        Stage 0's sender is the frontend renderer. Downstream senders are
+        cleared by the orchestrator before resetting their engine cores.
+        Call while generation is paused to avoid racing new inputs.
         """
-        logger.warning("[AsyncOmni] reset_encoder_cache not yet supported with Orchestrator process")
+        ar_stage_ids, _ = self._split_stage_ids_by_type(stage_ids)
+        if 0 in ar_stage_ids:
+            await asyncio.wait_for(self._clear_frontend_mm_cache(), timeout=timeout)
+        if ar_stage_ids:
+            await self._engine_core_rpc("reset_mm_cache", stage_ids=ar_stage_ids, timeout=timeout)
+
+    async def reset_encoder_cache(
+        self, *, stage_ids: list[int] | None = None, timeout: float = CACHE_RESET_TIMEOUT_S
+    ) -> None:
+        """Reset encoder caches on selected AR stages (all by default).
+
+        Diffusion stages are skipped. RPC failures are raised to the caller.
+        """
+        ar_stage_ids, _ = self._split_stage_ids_by_type(stage_ids)
+        if ar_stage_ids:
+            await self._engine_core_rpc("reset_encoder_cache", stage_ids=ar_stage_ids, timeout=timeout)
 
     async def reset_prefix_cache(
         self,
         reset_running_requests: bool = False,
         reset_connector: bool = False,
+        *,
+        stage_ids: list[int] | None = None,
+        timeout: float = CACHE_RESET_TIMEOUT_S,
     ) -> bool:
-        """Reset the prefix cache for all stages.
+        """Reset prefix caches on selected AR stages (all by default).
 
-        TODO: Forward to Orchestrator process via message.
+        Diffusion stages are skipped. Return False if a stage cannot reset
+        its cache; unsupported operations and RPC failures raise instead of
+        silently retaining KV computed under previous model weights.
         """
-        logger.warning("[AsyncOmni] reset_prefix_cache not yet supported with Orchestrator process")
-        return True
+        ar_stage_ids, _ = self._split_stage_ids_by_type(stage_ids)
+        if not ar_stage_ids:
+            return True
+        results = await self._engine_core_rpc(
+            "reset_prefix_cache",
+            stage_ids=ar_stage_ids,
+            args=(reset_running_requests, reset_connector),
+            timeout=timeout,
+        )
+        return all(self._coerce_stage_bool(result) for result in results)
 
     async def sleep(
         self, stage_ids: list[int] | None = None, level: int = 2, mode: PauseMode = "abort"
@@ -882,11 +934,12 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
             self._paused = True
             await self._pause_cond.wait_for(lambda: getattr(self, "_admitting", 0) == 0)
 
-        # P0 sender cache must drop hashes before EngineCore.sleep clears P1.
-        await self.reset_mm_cache()
+        ar_stage_ids, diffusion_stage_ids = self._split_stage_ids_by_type(stage_ids)
+        # EngineCore.sleep resets receiver caches itself; only clear P0 here.
+        if 0 in ar_stage_ids:
+            await self._clear_frontend_mm_cache()
 
         self._final_output_handler()
-        ar_stage_ids, diffusion_stage_ids = self._split_stage_ids_by_type(stage_ids)
         final_acks: list[OmniACK] = []
         if ar_stage_ids:
             self._hold_admission_until_resume = True
@@ -1099,10 +1152,14 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         """Get tokenizer for the comprehension stage."""
         stage_index = self._get_comprehension_stage_index()
         if stage_index is not None:
-            tokenizer = self.engine.output_processors[stage_index].tokenizer
+            processor = self.engine.output_processors[stage_index]
+            assert processor is not None
+            tokenizer = processor.tokenizer
             if tokenizer is not None:
                 return tokenizer
-        return self.input_processor.tokenizer  # type: ignore[return-value]
+        processor = self.input_processor
+        assert processor is not None
+        return processor.tokenizer
 
     async def is_tracing_enabled(self) -> bool:
         """Check if tracing is enabled."""

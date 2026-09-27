@@ -12,10 +12,12 @@ import os
 import struct
 import wave
 from dataclasses import FrozenInstanceError, replace
+from http import HTTPStatus
 from inspect import Signature, signature
 from pathlib import Path
 from types import SimpleNamespace
 
+import anyio
 import numpy as np
 import pytest
 import torch
@@ -1010,6 +1012,44 @@ class TestTTSMethods:
 
         assert speed == 1.25
         resolve_adapter.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_create_speech_cuda_oom_returns_internal_server_error(
+        self,
+        speech_server,
+        mocker: MockerFixture,
+    ):
+        mocker.patch.object(speech_server, "_check_model", new=mocker.AsyncMock(return_value=None))
+        mocker.patch.object(
+            speech_server,
+            "_generate_audio_bytes",
+            new=mocker.AsyncMock(side_effect=torch.OutOfMemoryError("CUDA out of memory")),
+        )
+
+        response = await speech_server.create_speech(OpenAICreateSpeechRequest(input="Hello"))
+
+        assert isinstance(response, ErrorResponse)
+        assert response.error.code == HTTPStatus.INTERNAL_SERVER_ERROR
+        assert response.error.type == "InternalServerError"
+
+    @pytest.mark.asyncio
+    async def test_create_speech_unexpected_failure_returns_internal_server_error(
+        self,
+        speech_server,
+        mocker: MockerFixture,
+    ):
+        mocker.patch.object(speech_server, "_check_model", new=mocker.AsyncMock(return_value=None))
+        mocker.patch.object(
+            speech_server,
+            "_generate_audio_bytes",
+            new=mocker.AsyncMock(side_effect=RuntimeError("codec failed")),
+        )
+
+        response = await speech_server.create_speech(OpenAICreateSpeechRequest(input="Hello"))
+
+        assert isinstance(response, ErrorResponse)
+        assert response.error.code == HTTPStatus.INTERNAL_SERVER_ERROR
+        assert response.error.type == "InternalServerError"
 
     def test_is_tts_detection_no_stage(self, speech_server):
         """Test TTS model detection when no TTS stage exists."""
@@ -2495,7 +2535,7 @@ class TestTTSMethods:
         )
 
         assert speech_server._is_tts is False
-        assert load_supported_speakers(speech_server.engine_client) == set()
+        assert load_supported_speakers(speech_server.engine_client) == []
         warning.assert_not_called()
 
     def test_load_supported_languages_from_config(self, speech_server):
@@ -3924,11 +3964,19 @@ class TestAsyncOmniSupportedTasks:
         assert "generate" in tasks
 
 
-def test_api_server_create_speech_wraps_error_response_status(mocker: MockerFixture):
+@pytest.mark.parametrize(
+    ("status_code", "err_type"),
+    [(HTTPStatus.BAD_REQUEST, "BadRequestError"), (HTTPStatus.INTERNAL_SERVER_ERROR, "InternalServerError")],
+)
+def test_api_server_create_speech_wraps_error_response_status(
+    mocker: MockerFixture,
+    status_code: HTTPStatus,
+    err_type: str,
+):
     handler = mocker.MagicMock()
     handler.create_speech = mocker.AsyncMock(
         return_value=ErrorResponse(
-            error=ErrorInfo(message="bad request", type="BadRequestError", param=None, code=400),
+            error=ErrorInfo(message="speech failed", type=err_type, param=None, code=status_code),
         )
     )
 
@@ -3937,7 +3985,12 @@ def test_api_server_create_speech_wraps_error_response_status(mocker: MockerFixt
 
     response = asyncio.run(api_server_module.create_speech(request, raw_request))
 
-    _assert_openai_error_response(response, status_code=400, message="bad request")
+    _assert_openai_error_response(
+        response,
+        status_code=status_code,
+        message="speech failed",
+        err_type=err_type,
+    )
 
 
 def _make_api_server_request(handler, *, method: str = "POST", path: str = "/v1/audio/voices") -> Request:
@@ -5150,6 +5203,7 @@ class TestTTSAsyncOffloading:
             models=mock_models,
             request_logger=mocker.MagicMock(),
         )
+        server.uploaded_speakers = {}
         yield server
         server.shutdown()
 
@@ -5506,8 +5560,9 @@ class TestTTSAsyncOffloading:
         assert prompt["additional_information"]["non_streaming_mode"] == [True]
         assert "full_utterance_decode" not in prompt["additional_information"]
 
-    def test_qwen3_repeated_ref_audio_hot_path_sends_cache_key_without_waveform(self, qwen3_tts_server):
-        """After a ref artifact is marked ready, repeated requests avoid ref_audio payload IPC."""
+    def test_qwen3_inline_ref_audio_hot_path_does_not_use_named_speaker_cache(self, qwen3_tts_server, mocker):
+        """An OpenAI-compatible voice does not identify an inline voice clone."""
+        ignored_voice_log = mocker.patch("vllm_omni.entrypoints.openai.tts_adapters.qwen3_tts.logger.info")
         wav_list = [0.0] * 48000
         artifact_key = "a" * 40
         ref_audio = "data:audio/wav;base64,same"
@@ -5530,6 +5585,7 @@ class TestTTSAsyncOffloading:
 
         request = OpenAICreateSpeechRequest(
             input="hello",
+            voice="voice-a",
             task_type="Base",
             ref_audio=ref_audio,
             ref_text="reference",
@@ -5539,7 +5595,14 @@ class TestTTSAsyncOffloading:
         )
 
         assert request_id == "req-hot"
+        assert request.voice == "voice-a"
+        ignored_voice_log.assert_called_once_with(
+            "Ignoring voice=%r for Qwen3-TTS Base request because inline ref_audio takes precedence",
+            "voice-a",
+        )
         assert "ref_audio" not in tts_params
+        assert "speaker" not in tts_params
+        assert "voice_created_at" not in tts_params
         assert tts_params["_qwen3_tts_ref_audio_cache_key"] == [artifact_key]
         assert tts_params["ref_code_length"] == [50]
         prompt = qwen3_tts_server.engine_client.generate.call_args.kwargs["prompt"]
@@ -5769,21 +5832,34 @@ class TestTTSAsyncOffloading:
 
     @pytest.mark.asyncio
     async def test_generate_audio_chunks_discards_ref_audio_artifact_warmup_on_close(self, qwen3_tts_server):
+        closed = asyncio.Event()
+
         async def pcm_generator():
-            yield SimpleNamespace(
-                multimodal_output={
-                    "audio": torch.zeros(16, dtype=torch.float32),
-                    "sr": 24000,
-                }
-            )
-            await asyncio.sleep(0)
+            try:
+                yield OmniRequestOutput(
+                    request_id="req-close",
+                    final_output_type="audio",
+                    _multimodal_output={
+                        "audio": torch.zeros(16, dtype=torch.float32),
+                        "sr": 24000,
+                    },
+                )
+            finally:
+                # Engine abort waits for stage acknowledgments. Retain an
+                # actual cancellation checkpoint to cover ASGI cancel scopes.
+                await anyio.sleep(0)
+                closed.set()
 
         qwen3_tts_server._request_ref_audio_artifact_keys["req-close"] = ("artifact-close", False)
 
-        stream = qwen3_tts_server._generate_audio_chunks(pcm_generator(), "req-close")
+        engine_stream = pcm_generator()
+        stream = qwen3_tts_server._generate_audio_chunks(engine_stream, "req-close")
         assert await anext(stream)
-        await stream.aclose()
+        with anyio.CancelScope() as scope:
+            scope.cancel()
+            await stream.aclose()
 
+        assert closed.is_set()
         assert "req-close" not in qwen3_tts_server._request_ref_audio_artifact_keys
         assert ("artifact-close", False) not in qwen3_tts_server._ref_audio_model_artifact_ready
 

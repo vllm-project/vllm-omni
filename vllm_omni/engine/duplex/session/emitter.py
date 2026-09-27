@@ -121,11 +121,18 @@ class SessionEmitter:
     # ------------------------------------------------------------------ #
 
     def auto_responds(self) -> bool:
-        """Whether the session answers committed input without a ``response.create``."""
+        """Whether the session answers committed input without a ``response.create``.
+
+        A model that takes no client commits (``supports_client_commit`` off, a
+        lockstep model) can only auto-respond; for every other model the
+        client opts in through ``extra_body.auto_response``.
+        """
+        if not self._ctx.session.capabilities.supports_client_commit:
+            return True
         extra = getattr(self._ctx.session.config, "extra_body", None)
         if not isinstance(extra, dict):
             return False
-        return extra.get("auto_response") is True or extra.get("full_duplex") is True
+        return extra.get("auto_response") is True
 
     def is_stale_model_output(self, payload: dict[str, object]) -> bool:
         """Whether ``payload`` belongs to a turn the session has already moved past."""

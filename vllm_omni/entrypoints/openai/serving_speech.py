@@ -1807,6 +1807,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         finally:
             if not artifact_ready:
                 self._discard_ref_audio_artifact_warmup(request_id)
+            # Disconnects can arrive while suspended at yield. Closing the
+            # engine iterator must survive the cancelled ASGI scope.
             close = getattr(generator, "aclose", None)
             if close is not None:
                 with anyio.CancelScope(shield=True):
@@ -2724,8 +2726,11 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 total_ms,
                 e,
             )
-            logger.exception("Speech generation failed: %s", e)
-            return self.create_error_response(f"Speech generation failed: {e}")
+            return self.create_error_response(
+                f"Speech generation failed: {e}",
+                err_type="InternalServerError",
+                status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
 
     @staticmethod
     def _merge_batch_item(

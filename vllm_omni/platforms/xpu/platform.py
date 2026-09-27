@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import os
 
@@ -138,6 +138,10 @@ class XPUOmniPlatform(OmniPlatform, XPUPlatform):
         return free, total
 
     @classmethod
+    def memory_reserved(cls, device: torch.device | int | None = None) -> int:
+        return int(torch.xpu.memory_reserved(device))
+
+    @classmethod
     def get_profiler_cls(cls) -> str:
         """Return XPU-specific profiler that handles XPU events."""
         return "vllm_omni.platforms.xpu.profiler.XPUTorchProfilerWrapper"
@@ -155,4 +159,7 @@ class XPUOmniPlatform(OmniPlatform, XPUPlatform):
         using_inductor = cc.backend == "inductor" and cc.mode != CompilationMode.NONE
         default = ["native"] if using_inductor else ["vllm_c", "native"]
 
-        return IrOpPriorityConfig.with_default(default)
+        # Mirrors upstream XPUPlatform defaults: `gelu_and_mul_sparse` has no XPU
+        # provider, so it must not fall back to `default` (which contains
+        # `vllm_c`) via IrOpPriorityConfig.with_default.
+        return IrOpPriorityConfig.with_default(default, gelu_and_mul_sparse=["native"])

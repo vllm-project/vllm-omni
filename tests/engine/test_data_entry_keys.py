@@ -425,3 +425,11 @@ class TestSerializeDeserializePayload:
         restored = deserialize_payload(wire)
 
         assert restored["meta"]["minimax_h3_prepared_reference_videos"] == descriptor
+
+
+def test_first_audio_metadata_round_trips_as_a_tensor():
+    from vllm_omni.data_entry_keys import to_dict, to_struct
+
+    payload = {"meta": {"first_audio": torch.tensor(True)}}
+    restored = to_dict(to_struct(payload))
+    assert restored["meta"]["first_audio"].item() is True

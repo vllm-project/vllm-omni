@@ -82,7 +82,8 @@ class VoxtralTTSAdapter(ARTTSAdapter):
 
         if request.voice is not None:
             request.voice = request.voice.lower()
-            available_speakers = server._get_available_speakers()
+            available_speakers = set(self.capabilities.supported_speakers)
+            available_speakers.update(self.capabilities.precomputed_speakers)
             if available_speakers and request.voice not in available_speakers:
                 return f"Invalid speaker '{request.voice}'. Supported: {', '.join(sorted(available_speakers))}"
 
@@ -107,7 +108,7 @@ class VoxtralTTSAdapter(ARTTSAdapter):
         prompt = await self._build_prompt_async(request)
         return PreparedRequest(prompt=prompt, tts_params={}, model_type="voxtral_tts")
 
-    def _load_supported_speakers(self) -> set[str]:
+    def _load_supported_speakers(self) -> list[str]:
         config = self.ctx.engine_client.model_config.hf_config.audio_config
         return load_supported_speakers(self.ctx.engine_client, config)
 

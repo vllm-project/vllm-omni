@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import copy
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -154,6 +154,7 @@ class DiffusionKVModelRunnerBackend:
 
         if attention_geometry is not None:
             num_heads, num_kv_heads, head_size = attention_geometry
+            assert callable(set_attention_geometry)
             try:
                 set_attention_geometry(
                     num_heads=num_heads,
@@ -260,7 +261,6 @@ class DiffusionKVModelRunnerBackend:
         cp_rank = get_dcp_group().rank_in_group if cp_size > 1 else 0
         cp_interleave = parallel_config.cp_kv_cache_interleave_size
 
-        kv_caches: list[torch.Tensor | list[torch.Tensor]] = []
         previous_adapter_caches = {
             layer_name: adapter.kv_cache for layer_name, adapter in self._kv_cache_layer_adapters.items()
         }
@@ -292,19 +292,20 @@ class DiffusionKVModelRunnerBackend:
                     layers=self._kv_cache_layer_adapters,
                     resolve_row=self._resolve_paged_attention_row,
                 )
-                # vLLM 0.29 reads the resolved physical layout when allocating,
-                # and dropped attn_groups/cache_dtype from the signature.
+                # f2aad6aa70 (#56888): first arg is forward_context; caches
+                # are returned as a dict instead of appended to a runner list.
                 adopt_kv_cache_layout(self.vllm_config, kv_cache_config)
                 for layer_adapter in self._kv_cache_layer_adapters.values():
                     assert_backend_layout_supported(self.vllm_config, getattr(layer_adapter, "attn_backend", None))
-                init_kv_cache(
-                    kv_caches,
+                kv_caches_dict = init_kv_cache(
                     self.vllm_config.compilation_config.static_forward_context,
                     kv_cache_config,
                     self.device,
                     kernel_block_sizes,
                     self.vllm_config,
+                    block_tables=block_tables,
                 )
+                kv_caches = list(kv_caches_dict.values())
         except Exception:
             for layer_name, previous_cache in previous_adapter_caches.items():
                 self._kv_cache_layer_adapters[layer_name].kv_cache = previous_cache
@@ -396,6 +397,15 @@ class DiffusionKVModelRunnerBackend:
         for sequence in metadata.sequences:
             if type(sequence.sequence_id) is not int or sequence.sequence_id < 0:
                 raise ValueError(f"Diffusion KV sequence_id must be a non-negative integer: {sequence.sequence_id!r}")
+            if (
+                type(sequence.cached_prefix_len) is not int
+                or sequence.cached_prefix_len < 0
+                or sequence.cached_prefix_len > sequence.prefix_len
+            ):
+                raise ValueError(
+                    "Diffusion KV cached_prefix_len must lie within the stable prefix: "
+                    f"cached={sequence.cached_prefix_len!r}, prefix={sequence.prefix_len!r}"
+                )
             sequence_identity = (metadata.request_id, sequence.sequence_id, None)
             sequence_install = self._validate_row(
                 identity=sequence_identity,
@@ -410,6 +420,7 @@ class DiffusionKVModelRunnerBackend:
                     sequence.prefix_len,
                     sequence.target_len,
                     sequence.seq_len,
+                    sequence.cached_prefix_len,
                     sequence_install.block_ids,
                     sequence.context_ids,
                 )
@@ -593,7 +604,7 @@ class DiffusionKVModelRunnerBackend:
                     )
         raise RuntimeError(f"Diffusion KV request state is missing logical length for {identity!r}")
 
-    def remove_diffusion_kv_requests(self, request_ids: list[str | tuple[str, int]]) -> int:
+    def remove_diffusion_kv_requests(self, request_ids: Sequence[str | tuple[str, int]]) -> int:
         """Retire Worker rows without logically freeing Scheduler-owned blocks."""
         if (
             not is_scheduler_paged_kv_mode(

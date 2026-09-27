@@ -18,9 +18,14 @@ def default_env():
     keys = ("VLLM_WORKER_MULTIPROC_METHOD", "VLLM_TARGET_DEVICE")
     previous = {key: os.environ.get(key) for key in keys}
     os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = previous["VLLM_WORKER_MULTIPROC_METHOD"] or "spawn"
-    os.environ["VLLM_TARGET_DEVICE"] = previous["VLLM_TARGET_DEVICE"] or (
-        "cuda" if torch.cuda.is_available() and torch.accelerator.device_count() > 0 else "cpu"
-    )
+    if previous["VLLM_TARGET_DEVICE"]:
+        pass  # already set, keep it
+    elif torch.cuda.is_available() and torch.accelerator.device_count() > 0:
+        os.environ["VLLM_TARGET_DEVICE"] = "cuda"
+    elif hasattr(torch, "npu") and torch.npu.is_available():
+        os.environ["VLLM_TARGET_DEVICE"] = "npu"
+    else:
+        os.environ["VLLM_TARGET_DEVICE"] = "cpu"
     yield
     for key, value in previous.items():
         if value is None:
@@ -39,8 +44,12 @@ def default_vllm_config():
     desynchronize vLLM init vs request preprocessing (e.g. renderer state).
     """
     # Use CPU device if no GPU is available (e.g., in CI environments)
-    has_gpu = torch.cuda.is_available() and torch.accelerator.device_count() > 0
-    device = "cuda" if has_gpu else "cpu"
+    if torch.cuda.is_available() and torch.accelerator.device_count() > 0:
+        device = "cuda"
+    elif hasattr(torch, "npu") and torch.npu.is_available():
+        device = "npu"
+    else:
+        device = "cpu"
     device_config = DeviceConfig(device=device)
 
     with set_current_vllm_config(VllmConfig(device_config=device_config)):

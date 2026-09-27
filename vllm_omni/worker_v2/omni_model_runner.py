@@ -186,6 +186,9 @@ class OmniGPUModelRunner(GPUModelRunner):
         super().add_requests(scheduler_output)
 
     def shutdown(self) -> None:
+        sender = getattr(getattr(self, "model_state", None), "_first_audio_sender", None)
+        if sender is not None:
+            sender.close()
         # Every owner must release its resources even if an earlier drain fails.
         try:
             worker = getattr(self, "_native_output_materializer", None)
@@ -208,6 +211,8 @@ class OmniGPUModelRunner(GPUModelRunner):
                 continue
             plane.register_request(request_data)
         plane.register_receivers(list(getattr(scheduler_output, "pending_input_registrations", [])))
+        if not getattr(self.model_config, "async_chunk", False):
+            plane.recv_full_payload_inputs(scheduler_output)
         natural_terminal_req_ids = set(getattr(scheduler_output, "data_plane_terminal_req_ids", set()))
         aborted_req_ids = set(getattr(scheduler_output, "finished_req_ids", set())).difference(natural_terminal_req_ids)
         if natural_terminal_req_ids:
@@ -350,6 +355,9 @@ class OmniGPUModelRunner(GPUModelRunner):
         capture_mtp = getattr(getattr(self, "model_state", None), "capture_mtp_graphs", None)
         if callable(capture_mtp):
             capture_mtp(self._dispatch_mtp_batch_descriptor)
+        capture_first_frame = getattr(self.model, "capture_first_frame_graphs", None)
+        if callable(capture_first_frame):
+            capture_first_frame()
         return result
 
     def _dispatch_mtp_batch_descriptor(self, num_mtp_reqs: int) -> Any:
@@ -402,6 +410,7 @@ class OmniGPUModelRunner(GPUModelRunner):
         skip_attn_for_dummy_run: bool = False,
         is_profile: bool = False,
         context_len: int = 0,
+        valid_dummy_state_slots: bool = False,
     ) -> Any:
         if not dummy_run:
             self._prepare_native_data_plane(scheduler_output)
@@ -478,7 +487,7 @@ class OmniGPUModelRunner(GPUModelRunner):
                 max_query_len=batch_desc.max_query_len,
             )
             if not skip_attn_for_dummy_run:
-                block_tables, slot_mappings = self.prepare_dummy_attn(input_batch)
+                block_tables, slot_mappings = self.prepare_dummy_attn(input_batch, valid_dummy_state_slots)
                 if context_len:
                     set_dummy_context(
                         input_batch,
@@ -608,6 +617,7 @@ class OmniGPUModelRunner(GPUModelRunner):
             dp_sync=dp_sync,
             ec_connector_output=ec_connector_output,
             routed_experts=routed_experts,
+            cudagraph_stats=None,
         )
 
         assert isinstance(hidden_states, torch.Tensor)

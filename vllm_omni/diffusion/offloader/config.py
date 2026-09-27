@@ -356,6 +356,19 @@ def resolve_offload_strategy(config: Any) -> OffloadStrategy:
     return resolve_offload(config).strategy
 
 
+def offload_enabled(config: Any) -> bool:
+    """Return whether any CPU-offload policy is active."""
+    return resolve_offload(config).strategy is not OffloadStrategy.NONE
+
+
+def offload_streams_blocks(config: Any) -> bool:
+    """Return whether an active policy streams weights block by block."""
+    return resolve_offload(config).strategy in (
+        OffloadStrategy.LAYER_WISE,
+        OffloadStrategy.DISTRIBUTED_LAYER_WISE,
+    )
+
+
 def materialize_legacy_offload_flags(config: Any) -> OffloadStrategy:
     """Keep existing strategy readers working after resolving the compact API."""
     resolved = resolve_offload(config)

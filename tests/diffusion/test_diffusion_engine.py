@@ -213,8 +213,11 @@ def test_request_started_output_is_emitted_only_for_opted_in_requests() -> None:
 class TestRequestBatchCapability:
     pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
-    def test_supports_request_batch_uses_registered_model_class(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        od_config = SimpleNamespace(model_class_name="BatchPipeline", custom_pipeline_args=None)
+    @pytest.mark.parametrize("custom_pipeline_args", [None, {}, {"components_path": "/tmp/anima-components"}])
+    def test_supports_request_batch_uses_registered_model_class(
+        self, monkeypatch: pytest.MonkeyPatch, custom_pipeline_args: dict[str, Any] | None
+    ) -> None:
+        od_config = SimpleNamespace(model_class_name="BatchPipeline", custom_pipeline_args=custom_pipeline_args)
 
         monkeypatch.setattr(
             diffusion_engine_module.DiffusionModelRegistry,
@@ -371,14 +374,16 @@ class TestRequestBatchCapability:
             diffusion_engine_module.supports_request_batch(od_config)
         registry_load.assert_not_called()
 
+    @pytest.mark.parametrize("custom_pipeline_args", [None, {}, {"components_path": "/tmp/anima-components"}])
     def test_engine_uses_request_batch_mode_for_single_request_pipeline(
         self,
         monkeypatch: pytest.MonkeyPatch,
         mocker: MockerFixture,
+        custom_pipeline_args: dict[str, Any] | None,
     ) -> None:
         od_config = SimpleNamespace(
             model_class_name="SinglePipeline",
-            custom_pipeline_args=None,
+            custom_pipeline_args=custom_pipeline_args,
             streaming_output=False,
             max_num_seqs=1,
         )

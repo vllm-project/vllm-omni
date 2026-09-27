@@ -126,9 +126,16 @@ speed, but can increase quality loss. Setting `sea_max_consecutive_cached` to
 `0` removes the streak cap.
 
 To run **without** guardrails (you are responsible for license compliance),
-add `--no-guardrails` (no token/`cosmos-guardrail` needed). For extra GPUs use
+add `--no-guardrails` (no token/`cosmos-guardrail` needed), or pass
+[`vllm_omni/deploy/cosmos3_omni.yaml`](../../vllm_omni/deploy/cosmos3_omni.yaml)
+via `--deploy-config` (same opt-in overlay as Super; `pipeline: cosmos3_omni_deploy`).
+For extra GPUs use
 `--ulysses-degree N` (context parallel) or `--tensor-parallel-size N`;
 `--enable-layerwise-offload` reduces VRAM on smaller GPUs;
+`--vae-fast-path channels_last` speeds up the Wan VAE video decode by switching the
+decoder convolutions to channels-last kernels (output no longer bit-identical to
+diffusers; the default `lossless` fast path is bit-exact, see
+[Wan VAE Decoder Fast Path](../../docs/user_guide/diffusion/vae_fast_path.md));
 `--quantization fp8` (online, no calibration) cuts peak VRAM for 720p video
 generation from ~50 GB to ~36 GB with BF16-level quality (T2V composition can
 shift at the same seed). The pipeline
@@ -724,8 +731,10 @@ vllm serve nvidia/Cosmos3-Nano \
 ```
 
 To run **without** guardrails (you are responsible for license compliance),
-add `--no-guardrails` (no token/`cosmos-guardrail` needed). For tensor parallel
-add `--tensor-parallel-size 8`. `--quantization fp8` and
+add `--no-guardrails` (no token/`cosmos-guardrail` needed), or pass
+[`vllm_omni/deploy/cosmos3_omni.yaml`](../../vllm_omni/deploy/cosmos3_omni.yaml)
+via `--deploy-config` (same opt-in overlay as Super; `pipeline: cosmos3_omni_deploy`).
+For tensor parallel add `--tensor-parallel-size 8`. `--quantization fp8` and
 `--enable-layerwise-offload` are not supported on NPU.
 The pipeline auto-resolves from `model_index.json`; pass
 `--model-class-name Cosmos3OmniDiffusersPipeline` to force it explicitly.

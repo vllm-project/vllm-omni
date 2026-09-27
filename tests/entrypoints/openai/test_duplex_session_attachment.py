@@ -552,3 +552,90 @@ async def test_registry_resume_cancelled_mid_delivery_rolls_back_like_a_failure(
         close=close,
     )
     assert recovered.attachment_generation == 3
+
+
+@pytest.mark.asyncio
+async def test_release_hands_back_the_lease_generation_the_dropped_connection_was_serving(mocker) -> None:
+    """The lease generation travels with the attachment, so a detach is fenced on the right lease."""
+    registry = DuplexSessionAttachmentRegistry(replay_ttl_s=60.0, replay_max_bytes_per_session=4096)
+    send = mocker.AsyncMock()
+    created = await registry.create("sid-lease", send=send, close=mocker.AsyncMock(), lease_generation=0)
+
+    # An abandoned takeover hands its generation to the connection still attached.
+    assert await registry.settle_lease_generation("sid-lease", 1) is None
+    assert await registry.settle_lease_generation("sid-lease", 0) is None, "generations only move forward"
+
+    released = await registry.release_attachment("sid-lease", attachment_generation=created.attachment_generation)
+    assert released is not None
+    assert (released.attachment_generation, released.lease_generation) == (1, 1)
+    assert await registry.release_attachment("sid-lease", attachment_generation=None) is None
+    assert await registry.settle_lease_generation("sid-lease", 2) == 2, "nobody is attached: the caller detaches it"
+
+    resumed = await registry.resume(
+        "sid-lease",
+        resume_token=created.resume_token.plaintext,
+        last_received_server_event_seq=0,
+        send=send,
+        close=mocker.AsyncMock(),
+        lease_generation=3,
+    )
+    released = await registry.release_attachment("sid-lease", attachment_generation=resumed.attachment_generation)
+    assert released is not None and released.lease_generation == 3
+
+
+@pytest.mark.asyncio
+async def test_an_orphaned_generation_waits_for_the_resume_that_is_about_to_activate(mocker) -> None:
+    """While a resume is pending, an orphan goes to its activation, not to the socket it will replace."""
+    registry = DuplexSessionAttachmentRegistry(replay_ttl_s=60.0, replay_max_bytes_per_session=4096)
+    send = mocker.AsyncMock()
+    created = await registry.create("sid-pending", send=send, close=mocker.AsyncMock(), lease_generation=0)
+
+    await registry.begin_resume("sid-pending")
+    assert await registry.settle_lease_generation("sid-pending", 2) is None, "parked for the pending activation"
+    released = await registry.release_attachment("sid-pending", attachment_generation=created.attachment_generation)
+    assert released is not None and released.lease_generation == 0, "the replaced socket keeps its own lease"
+
+    resumed = await registry.resume(
+        "sid-pending",
+        resume_token=created.resume_token.plaintext,
+        last_received_server_event_seq=0,
+        send=send,
+        close=mocker.AsyncMock(),
+        lease_generation=1,
+    )
+    assert await registry.end_resume("sid-pending") is None, "the activation absorbed the orphan"
+    released = await registry.release_attachment("sid-pending", attachment_generation=resumed.attachment_generation)
+    assert released is not None and released.lease_generation == 2
+
+    # A pending resume that never activates leaves the orphan to whoever ends the claim.
+    await registry.begin_resume("sid-pending")
+    assert await registry.settle_lease_generation("sid-pending", 3) is None
+    assert await registry.end_resume("sid-pending") == 3
+
+
+@pytest.mark.asyncio
+async def test_a_rolled_back_activation_orphans_the_lease_it_was_handed(mocker) -> None:
+    """A provisional attachment may own a newer generation than its own resume produced."""
+    registry = DuplexSessionAttachmentRegistry(replay_ttl_s=60.0, replay_max_bytes_per_session=4096)
+    created = await registry.create("sid-rollback", send=mocker.AsyncMock(), close=mocker.AsyncMock())
+    await registry.detach("sid-rollback", attachment_generation=created.attachment_generation)
+
+    async def failing_activation(payload):
+        raise RuntimeError("socket closed during replay")
+
+    await registry.begin_resume("sid-rollback")
+    with pytest.raises(RuntimeError):
+        await registry.resume(
+            "sid-rollback",
+            resume_token=created.resume_token.plaintext,
+            last_received_server_event_seq=0,
+            send=failing_activation,
+            close=mocker.AsyncMock(),
+            activation_payload_factory=lambda token, generation: {"type": "session.resumed"},
+            lease_generation=1,
+        )
+    # Meanwhile a resume abandoned mid-RPC handed generation 2 to the provisional attachment.
+    # (Order does not matter: both land in the orphan slot while the claim is open.)
+    assert await registry.settle_lease_generation("sid-rollback", 2) is None
+    assert await registry.settle_lease_generation("sid-rollback", 1) is None
+    assert await registry.end_resume("sid-rollback") == 2, "the newest lease is the one to detach"

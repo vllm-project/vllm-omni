@@ -7,7 +7,7 @@
           "res": {
             "cuda": "H100"
           },
-          "num_cards": 1
+          "num_cards": 2
         }
       },
       "local_model",
@@ -21,6 +21,16 @@
         "--trust-remote-code"
       ]
     },
+    "judge_server_params": {
+      "model": "Qwen/Qwen2.5-7B-Instruct",
+      "use_omni": false,
+      "cuda_visible_devices": "1",
+      "extra_cli_args": [
+        "--served-model-name",
+        "Qwen2.5-7B-Instruct"
+      ]
+    },
+    "omniinteract_aggregate_min_ia_qtf1": 0.2,
     "benchmark_params": [
       {
         "dataset_name": "omniinteract",
@@ -40,6 +50,8 @@
         "omniinteract_ref_audio": "tests/assets/minicpmo_4_5/response_required_16k.wav",
         "omniinteract_output_dir": "tests/dfx/perf/results/omniinteract/1q1a",
         "omniinteract_max_video_duration_s": 600,
+        "omniinteract_evaluate": true,
+        "omniinteract_judge_model": "Qwen2.5-7B-Instruct",
         "percentile-metrics": "ttft,tpot,itl,e2el,audio_ttfp,audio_rtf,audio_duration"
       },
       {
@@ -60,6 +72,8 @@
         "omniinteract_ref_audio": "tests/assets/minicpmo_4_5/response_required_16k.wav",
         "omniinteract_output_dir": "tests/dfx/perf/results/omniinteract/1q1a_math",
         "omniinteract_max_video_duration_s": 600,
+        "omniinteract_evaluate": true,
+        "omniinteract_judge_model": "Qwen2.5-7B-Instruct",
         "percentile-metrics": "ttft,tpot,itl,e2el,audio_ttfp,audio_rtf,audio_duration"
       },
       {
@@ -80,6 +94,8 @@
         "omniinteract_ref_audio": "tests/assets/minicpmo_4_5/response_required_16k.wav",
         "omniinteract_output_dir": "tests/dfx/perf/results/omniinteract/1qna",
         "omniinteract_max_video_duration_s": 600,
+        "omniinteract_evaluate": true,
+        "omniinteract_judge_model": "Qwen2.5-7B-Instruct",
         "percentile-metrics": "ttft,tpot,itl,e2el,audio_ttfp,audio_rtf,audio_duration"
       }
     ]

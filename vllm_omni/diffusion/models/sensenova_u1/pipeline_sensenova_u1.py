@@ -34,6 +34,7 @@ from vllm.logger import init_logger
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
+from vllm_omni.diffusion.layers.fused_moe import FusedMoE
 from vllm_omni.diffusion.lora.loader import (
     LoraLoaderMixin,
     _apply_diffusers_lora_alpha_scaling,
@@ -576,7 +577,14 @@ class SenseNovaU1Pipeline(
         ]
 
         self.setup_diffusion_pipeline_profiler(
-            enable_diffusion_pipeline_profiler=od_config.enable_diffusion_pipeline_profiler
+            profiler_targets=[
+                "_t2i_prefix_forward",
+                "_it2i_prefix_forward",
+                "_generate_think",
+                "_generate_text",
+                "_run_denoising_loop",
+            ],
+            enable_diffusion_pipeline_profiler=od_config.enable_diffusion_pipeline_profiler,
         )
 
     # -----------------------------------------------------------------------
@@ -1650,29 +1658,43 @@ class SenseNovaU1Pipeline(
             applied += 1
         return applied
 
+    def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
+        num_experts = max(
+            getattr(self.llm_cfg, "num_experts", 0) or 0,
+            getattr(self.llm_cfg, "gen_num_experts", 0) or 0,
+        )
+        if num_experts <= 1:
+            return []
+        return FusedMoE.make_expert_params_mapping(
+            self,
+            ckpt_gate_proj_name="gate_proj",
+            ckpt_down_proj_name="down_proj",
+            ckpt_up_proj_name="up_proj",
+            num_experts=num_experts,
+        )
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         stacked_params_mapping = self.stacked_params_mapping
+        expert_params_mapping = self.get_expert_mapping()
 
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
 
         for name, loaded_weight in weights:
-            loaded = False
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in name:
-                    continue
-                stacked_name = name.replace(weight_name, param_name)
-                if stacked_name not in params_dict:
-                    break
-                param = params_dict[stacked_name]
-                weight_loader = getattr(param, "weight_loader", None)
-                if weight_loader is not None:
-                    weight_loader(param, loaded_weight, shard_id)
-                loaded_params.add(stacked_name)
-                loaded = True
-                break
+            # Expert FFN shards must skip the stacked mapping: ``.gate_proj`` is
+            # a substring of ``experts.{i}.gate_proj``, which would fuse them
+            # into a dense gate_up_proj instead of reaching the FusedMoE loader.
+            is_expert_weight = ".experts." in name
 
-            if loaded:
+            if not is_expert_weight and self._load_stacked_weight(
+                name, loaded_weight, params_dict, stacked_params_mapping, loaded_params
+            ):
+                continue
+
+            if is_expert_weight:
+                # A shard that matches no mapping belongs to an expert this rank
+                # does not own, so dropping it here is expected under TP/EP.
+                self._load_expert_weight(name, loaded_weight, params_dict, expert_params_mapping, loaded_params)
                 continue
 
             if name not in params_dict:
@@ -1690,3 +1712,54 @@ class SenseNovaU1Pipeline(
             loaded_params.add(name)
 
         return loaded_params
+
+    @staticmethod
+    def _load_stacked_weight(
+        name: str,
+        loaded_weight: torch.Tensor,
+        params_dict: dict[str, torch.nn.Parameter],
+        stacked_params_mapping: list[tuple[str, str, str | int]],
+        loaded_params: set[str],
+    ) -> bool:
+        for param_name, weight_name, shard_id in stacked_params_mapping:
+            if weight_name not in name:
+                continue
+            stacked_name = name.replace(weight_name, param_name)
+            if stacked_name not in params_dict:
+                return False
+            param = params_dict[stacked_name]
+            weight_loader = getattr(param, "weight_loader", None)
+            if weight_loader is not None:
+                weight_loader(param, loaded_weight, shard_id)
+            loaded_params.add(stacked_name)
+            return True
+        return False
+
+    @staticmethod
+    def _load_expert_weight(
+        name: str,
+        loaded_weight: torch.Tensor,
+        params_dict: dict[str, torch.nn.Parameter],
+        expert_params_mapping: list[tuple[str, str, int, str]],
+        loaded_params: set[str],
+    ) -> bool:
+        for param_name, weight_name, expert_id, shard_id in expert_params_mapping:
+            if weight_name not in name:
+                continue
+            stacked_name = name.replace(weight_name, param_name)
+            param = params_dict.get(stacked_name)
+            weight_loader = getattr(param, "weight_loader", None) if param is not None else None
+            if weight_loader is None:
+                continue
+            success = weight_loader(
+                param,
+                loaded_weight,
+                stacked_name,
+                shard_id=shard_id,
+                expert_id=expert_id,
+                return_success=True,
+            )
+            if success:
+                loaded_params.add(stacked_name)
+                return True
+        return False

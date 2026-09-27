@@ -296,6 +296,7 @@ class Harness:
     clock: FakeClock
     output_sink: asyncio.Queue = field(default_factory=asyncio.Queue)
     result_sink: asyncio.Queue = field(default_factory=asyncio.Queue)
+    _control_seq: int = 0
 
     @classmethod
     def create(
@@ -344,20 +345,30 @@ class Harness:
         )
         return await self.result()
 
-    async def resume(self, session_id: str, *, expected_lease_generation: int) -> DuplexControlResultMessage:
+    async def resume(
+        self, session_id: str, *, expected_lease_generation: int, control_id: str | None = None
+    ) -> DuplexControlResultMessage:
+        # Distinct by default: the engine answers a repeated control id as a
+        # replay of the same resume, which only the replay test wants.
+        self._control_seq += 1
         await self.manager.handle(
             ResumeDuplexSessionMessage(
-                control_id=f"resume-{session_id}-{expected_lease_generation}",
+                control_id=control_id or f"resume-{session_id}-{expected_lease_generation}-{self._control_seq}",
                 session_id=session_id,
                 expected_lease_generation=expected_lease_generation,
             )
         )
         return await self.result()
 
-    async def touch(self, session_id: str, activity: str) -> DuplexControlResultMessage:
+    async def touch(
+        self, session_id: str, activity: str, *, expected_lease_generation: int | None = None
+    ) -> DuplexControlResultMessage:
         await self.manager.handle(
             TouchDuplexSessionMessage(
-                control_id=f"touch-{session_id}-{activity}", session_id=session_id, activity=activity
+                control_id=f"touch-{session_id}-{activity}-{expected_lease_generation}",
+                session_id=session_id,
+                activity=activity,
+                expected_lease_generation=expected_lease_generation,
             )
         )
         return await self.result()
@@ -1281,6 +1292,47 @@ async def test_control_dispatch_is_ordered_per_session_without_blocking_other_se
         assert manager.active_count() == 2
 
 
+@pytest.mark.parametrize("stop", ["shutdown", "predecessor", "tail", "failure"])
+async def test_control_queue_preserves_cancellation(stop: str) -> None:
+    async with Harness.create() as harness:
+        started = asyncio.Event()
+        release = asyncio.Event()
+        ran: list[str] = []
+
+        async def first() -> None:
+            started.set()
+            await release.wait()
+            raise ValueError("control failed")
+
+        async def next_operation() -> None:
+            ran.append("next")
+
+        manager = harness.manager
+        predecessor = manager._run_control("sid", "first", first)
+        await started.wait()
+        tail = manager._run_control("sid", "next", next_operation)
+        # Let the tail enter its await of the predecessor before cancelling.
+        await asyncio.sleep(0)
+        if stop == "shutdown":
+            await asyncio.wait_for(manager.shutdown(), timeout=1.0)
+        elif stop == "predecessor":
+            predecessor.cancel()
+        elif stop == "tail":
+            tail.cancel()
+        else:
+            release.set()
+        await asyncio.wait_for(asyncio.gather(predecessor, tail, return_exceptions=True), timeout=1.0)
+        if stop in {"failure", "predecessor"}:
+            assert ran == ["next"]
+            assert not tail.cancelled()
+            if stop == "predecessor":
+                assert predecessor.cancelled()
+        else:
+            assert predecessor.cancelled()
+            assert tail.cancelled()
+            assert ran == []
+
+
 async def test_shutdown_closes_every_runner_and_stops_dispatch_tasks() -> None:
     harness = Harness.create()
     await harness.open("sid-a")
@@ -1616,6 +1668,168 @@ async def test_reaper_loop_survives_one_cleanup_failure(first_cleanup_delay: flo
 
 
 # --------------------------------------------------------------------------- #
+# Cancelled open (#7636 Issue 1)                                              #
+# --------------------------------------------------------------------------- #
+
+
+class _BlockingResultSink(asyncio.Queue):
+    """A result sink whose ``put`` parks, so an open can be cancelled after it admitted the session."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.entered = asyncio.Event()
+        self.gate = asyncio.Event()
+
+    async def put(self, item: object) -> None:
+        self.entered.set()
+        await self.gate.wait()
+        await super().put(item)
+
+
+async def test_an_open_cancelled_while_awaiting_the_plugin_frees_the_admission_slot() -> None:
+    """``CancelledError`` is not an ``Exception``: the rollback used to be skipped.
+
+    Admission counts ``runners | closing | admitting``, so every open cancelled
+    mid-flight (engine teardown, task cancellation) burned one slot for good;
+    after ``max_sessions`` of them every new session was refused.
+    """
+    async with Harness.create(max_sessions=1) as harness:
+        harness.plugin.blocked_session_ids.add("blocked")
+        config = DuplexSessionConfig(model="fake-model", instructions="blocked")
+        open_task = asyncio.create_task(harness.open("sid-cancelled", config))
+        await asyncio.wait_for(harness.plugin.runtime_config_started.wait(), timeout=1.0)
+
+        open_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await open_task
+
+        assert harness.manager.get("sid-cancelled") is None
+        assert harness.manager.active_count() == 0
+        assert harness.result_sink.empty(), "a cancelled open answers nobody"
+        assert (await harness.open("sid-replacement")).ok is True
+
+
+async def test_an_open_cancelled_after_admission_releases_the_runner_and_its_stage_reservation() -> None:
+    """The worst landing spot for the cancel: the runner is registered and Stage0 is reserved.
+
+    Both have to be undone, or the runner stays in ``runners`` (one slot gone)
+    and the Stage0 request stays reserved in the orchestrator.
+    """
+    async with Harness.create(max_sessions=1) as harness:
+        sink = _BlockingResultSink()
+        original_sink = harness.manager._result_sink
+        harness.manager._result_sink = sink
+        open_task = asyncio.create_task(
+            harness.manager.handle(
+                OpenDuplexSessionMessage(
+                    control_id="open-cancelled",
+                    session_id="sid-cancelled",
+                    session_config=DuplexSessionConfig(model="fake-model"),
+                )
+            )
+        )
+        await asyncio.wait_for(sink.entered.wait(), timeout=1.0)
+        assert "sid-cancelled" in harness.manager.runners
+        assert [context.request_id for context in harness.stage_port.ensure_calls] == [
+            stage0_request_id("sid-cancelled")
+        ]
+
+        open_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await open_task
+        harness.manager._result_sink = original_sink
+
+        assert "sid-cancelled" not in harness.manager.runners
+        assert harness.manager.active_count() == 0
+        assert harness.stage_port.cleanup_calls == [([stage0_request_id("sid-cancelled")], False)]
+        assert stage0_request_id("sid-cancelled") not in harness.manager._request_index
+        assert (await harness.open("sid-replacement")).ok is True
+
+
+async def test_an_open_cancelled_again_during_its_rollback_leaves_the_stage_cleanup_to_the_reaper() -> None:
+    """A second cancellation landing in the rollback's awaits must not orphan the Stage0 request.
+
+    The runner, the reservations and the request index are already gone by
+    then, so nothing would ever clean the orchestrator's request state up.
+    The rollback records the ids as a pending request cleanup before it
+    awaits anything, and the reaper's retry finishes the job.
+    """
+    async with Harness.create(max_sessions=1) as harness:
+        sink = _BlockingResultSink()
+        original_sink = harness.manager._result_sink
+        harness.manager._result_sink = sink
+        open_task = asyncio.create_task(
+            harness.manager.handle(
+                OpenDuplexSessionMessage(
+                    control_id="open-cancelled-twice",
+                    session_id="sid-cancelled",
+                    session_config=DuplexSessionConfig(model="fake-model"),
+                )
+            )
+        )
+        await asyncio.wait_for(sink.entered.wait(), timeout=1.0)
+        runner = harness.manager.runners["sid-cancelled"]
+        shutdown_started = asyncio.Event()
+
+        async def parked_shutdown() -> None:
+            shutdown_started.set()
+            await asyncio.Event().wait()
+
+        runner.shutdown = parked_shutdown  # type: ignore[method-assign]
+
+        open_task.cancel()
+        await asyncio.wait_for(shutdown_started.wait(), timeout=1.0)
+        open_task.cancel()  # lands inside the rollback, before the stage cleanup
+        with pytest.raises(asyncio.CancelledError):
+            await open_task
+        harness.manager._result_sink = original_sink
+
+        assert "sid-cancelled" not in harness.manager.runners
+        assert harness.manager.active_count() == 0
+        assert harness.stage_port.cleanup_calls == [], "the cleanup await was never reached"
+        key = ("sid-cancelled", 0)
+        assert key in harness.manager._pending_request_cleanups
+
+        await harness.manager.reap_expired()
+        assert harness.stage_port.cleanup_calls == [([stage0_request_id("sid-cancelled")], False)]
+        assert key not in harness.manager._pending_request_cleanups
+        assert (await harness.open("sid-replacement")).ok is True
+
+
+# --------------------------------------------------------------------------- #
+# Detach fenced on the lease generation                                       #
+# --------------------------------------------------------------------------- #
+
+
+async def test_detach_is_refused_for_a_lease_the_caller_no_longer_holds() -> None:
+    """A connection giving up its lease must not start the grace for the lease a later resume owns.
+
+    Resume is a CAS on the lease generation; detach is now fenced the same
+    way, so a stale caller (its resume was superseded by another connection's)
+    is refused instead of detaching the winner.
+    """
+    async with Harness.create() as harness:
+        await harness.open("sid-fence")
+        session = harness.session("sid-fence")
+        assert (await harness.resume("sid-fence", expected_lease_generation=0)).ok is True
+        assert session.lease_generation == 1
+
+        stale = await harness.touch("sid-fence", "detach", expected_lease_generation=0)
+        assert stale.ok is False
+        assert stale.error_code == "session_resume_conflict"
+        assert session.lease.detached_at is None, "the current lease is untouched"
+
+        current = await harness.touch("sid-fence", "detach", expected_lease_generation=1)
+        assert current.ok is True
+        assert session.lease.detached_at is not None
+
+        # An unfenced detach keeps its meaning: whatever generation is current.
+        assert (await harness.resume("sid-fence", expected_lease_generation=1)).ok is True
+        assert (await harness.touch("sid-fence", "detach")).ok is True
+        assert session.lease.detached_at is not None
+
+
+# --------------------------------------------------------------------------- #
 # Cancellation waits                                                          #
 # --------------------------------------------------------------------------- #
 
@@ -1644,3 +1858,20 @@ async def test_cancel_append_tasks_absorbs_a_task_that_outlives_the_wait() -> No
     assert await tasks.cancel_append_tasks(timeout_s=0.05) is True
     assert tasks.append_tail is None
     await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), timeout=5.0)
+
+
+async def test_a_resume_replayed_under_its_control_id_reports_the_generation_it_produced() -> None:
+    """The client side of an abandoned resume: it lost the answer and asks again with the same id."""
+    async with Harness.create() as harness:
+        await harness.open("sid-replay")
+        session = harness.session("sid-replay")
+        first = await harness.resume("sid-replay", expected_lease_generation=0, control_id="rpc-a")
+        assert first.ok is True and first.lease_generation == 1
+
+        replay = await harness.resume("sid-replay", expected_lease_generation=0, control_id="rpc-a")
+        assert replay.ok is True
+        assert replay.lease_generation == 1
+        assert session.lease_generation == 1, "a replay does not resume again"
+
+        other = await harness.resume("sid-replay", expected_lease_generation=0, control_id="rpc-b")
+        assert other.ok is False and other.error_code == "session_resume_conflict"

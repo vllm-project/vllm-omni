@@ -290,6 +290,7 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
         skip_attn_for_dummy_run: bool = False,
         is_profile: bool = False,
         context_len: int = 0,
+        valid_dummy_state_slots: bool = False,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
         if not dummy_run:
             self._prepare_native_data_plane(scheduler_output)
@@ -428,6 +429,7 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
             dp_sync=dp_sync,
             ec_connector_output=ec_connector_output,
             routed_experts=None,
+            cudagraph_stats=None,
         )
         return None
 
