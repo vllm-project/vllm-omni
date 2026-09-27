@@ -64,7 +64,7 @@ class _MoveableModule(nn.Module):
         return [True, True, True]
 
 
-def _run_pipeline_init(monkeypatch, *, enable_cpu_offload, loader_device):
+def _run_pipeline_init(monkeypatch, *, enable_cpu_offload, loader_device, diffusion_offload_config=None):
     import vllm_omni.diffusion.models.qwen_image.pipeline_qwen_image as pipe_mod
     from vllm_omni.diffusion.models.qwen_image.pipeline_qwen_image import QwenImagePipeline
 
@@ -110,6 +110,7 @@ def _run_pipeline_init(monkeypatch, *, enable_cpu_offload, loader_device):
         tf_model_config={},
         quantization_config=None,
         enable_cpu_offload=enable_cpu_offload,
+        diffusion_offload_config=diffusion_offload_config,
         enable_diffusion_pipeline_profiler=False,
     )
     return QwenImagePipeline(od_config=od_config)
@@ -129,3 +130,19 @@ def test_pipeline_dit_follows_loader_cpu_without_override(monkeypatch):
     assert pipe.transformer.probe_device_type == "cpu"
     assert pipe.text_encoder.placed_device.type == "cuda"
     assert pipe.vae.placed_device.type == "cuda"
+
+
+@pytest.mark.parametrize(
+    ("mode", "loader_device", "expected_device"),
+    [("module", "cuda", "cpu"), ("layer", "cpu", "cuda")],
+)
+def test_pipeline_compact_offload_places_encoder_vae(monkeypatch, mode, loader_device, expected_device):
+    pipe = _run_pipeline_init(
+        monkeypatch,
+        enable_cpu_offload=False,
+        loader_device=loader_device,
+        diffusion_offload_config={"mode": mode, "components": ["dit"]},
+    )
+    assert pipe.text_encoder.placed_device.type == expected_device
+    assert pipe.vae.placed_device.type == expected_device
+    assert pipe.transformer.probe_device_type == loader_device
