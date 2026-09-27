@@ -7,7 +7,7 @@ from contextlib import contextmanager, nullcontext
 from multiprocessing.reduction import ForkingPickler
 from types import SimpleNamespace
 from typing import Any, TypeVar
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, create_autospec, patch
 
 import numpy as np
 import pytest
@@ -947,12 +947,25 @@ def test_shifted_sigma_schedule_matches_reference_values():
         minimax_h3_time_shift_sigmas,
     )
 
-    sigmas = minimax_h3_time_shift_sigmas(num_steps=5, shift_scale=12.0)
+    sigmas = minimax_h3_time_shift_sigmas(num_steps=4, shift_scale=12.0)
 
     assert sigmas == pytest.approx(
         [1.0, 0.9729729891, 0.9230769277, 0.8000000119, 0.0],
         abs=1e-7,
     )
+
+
+@pytest.mark.parametrize("num_steps", [1, 8, 50])
+@pytest.mark.parametrize("shift_scale", [3.0, 12.0])
+def test_uniform_sigma_schedule_has_one_interval_per_requested_step(num_steps, shift_scale):
+    from vllm_omni.diffusion.models.minimax_h3.time_request import minimax_h3_time_shift_sigmas
+
+    sigmas = minimax_h3_time_shift_sigmas(num_steps=num_steps, shift_scale=shift_scale)
+
+    assert len(sigmas) == num_steps + 1
+    assert sigmas[0] == 1.0
+    assert sigmas[-1] == 0.0
+    assert all(current > following for current, following in zip(sigmas, sigmas[1:]))
 
 
 def test_base_schedule_overrides_the_uniform_sigma_positions():
@@ -1751,12 +1764,14 @@ def test_text_encoder_rejects_serialized_fp8():
 
 def test_text_encoder_linear_delegates_quantization_to_vllm_factory():
     from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+    from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
     import vllm_omni.diffusion.models.minimax_h3.encoder as encoder_module
 
     group = SimpleNamespace(rank_in_group=0, world_size=1)
     method = UnquantizedLinearMethod()
-    quant_config = Mock()
+    quant_config = create_autospec(QuantizationConfig, instance=True)
+    quant_config.online_quantization_config = None
     quant_config.get_quant_method.return_value = method
     # vLLM 0.30: no online quantization for this checkpoint-quantized layer
     quant_config.online_quantization_config = None
@@ -3479,3 +3494,48 @@ def test_long_video_shape_requires_explicit_opt_in(duration):
     assert frames >= duration * 24 and frames % 17 == 5
     assert video_t == (frames - 5) // 17 * 5 + 2
     assert audio_t == round(frames / 24 * 40)
+
+
+@pytest.mark.parametrize("preencode", [False, True])
+@pytest.mark.parametrize("cancel_phase", ["before_prepare", "prepare", "diffuse"])
+def test_request_cancellation_at_prepare_and_decode_boundaries(preencode, cancel_phase, monkeypatch):
+    from vllm_omni.diffusion.cancellation import RequestCancellationRegistry, request_cancellation_scope
+    from vllm_omni.diffusion.data import DiffusionRequestAbortedError
+    from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
+    from vllm_omni.platforms import current_omni_platform
+
+    synchronize = Mock()
+    monkeypatch.setattr(current_omni_platform, "synchronize", synchronize)
+    pipeline = object.__new__(MiniMaxH3Pipeline)
+    torch.nn.Module.__init__(pipeline)
+    registry = RequestCancellationRegistry()
+    signal = registry.create("request")
+
+    def prepare(*args):
+        if cancel_phase == "prepare":
+            registry.cancel(["request"])
+        return {"num_outputs": 1, "seed": 1101, "preencode_mp4": preencode}
+
+    def diffuse(**kwargs):
+        registry.cancel(["request"])
+        return torch.zeros(1), torch.zeros(1)
+
+    pipeline._prepare_request_inputs = Mock(side_effect=prepare)
+    pipeline._denoise_kwargs = Mock(return_value={})
+    pipeline.diffuse = Mock(side_effect=diffuse)
+    pipeline.decode = Mock()
+    pipeline.decode_to_mp4 = Mock()
+    try:
+        if cancel_phase == "before_prepare":
+            registry.cancel(["request"])
+        with request_cancellation_scope([signal]), pytest.raises(DiffusionRequestAbortedError):
+            pipeline.forward(_t2va_batch())
+        synchronize.assert_called_once_with()
+        if cancel_phase == "before_prepare":
+            pipeline._prepare_request_inputs.assert_not_called()
+        if cancel_phase != "diffuse":
+            pipeline.diffuse.assert_not_called()
+        pipeline.decode.assert_not_called()
+        pipeline.decode_to_mp4.assert_not_called()
+    finally:
+        registry.close()

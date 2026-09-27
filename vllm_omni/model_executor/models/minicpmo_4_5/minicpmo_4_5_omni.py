@@ -64,6 +64,8 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
       codec-token deltas for the separate Code2Wav stage.
     """
 
+    requires_raw_input_tokens = True
+
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:
         if modality.startswith("image"):
@@ -92,6 +94,9 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         patch_minicpmo_remote_config(config)
 
         self.model_stage = vllm_config.model_config.model_stage
+        # The Thinker's row ledger needs real token identities even when
+        # embeddings are supplied, including during CUDA graph capture/replay.
+        self.requires_raw_input_tokens = self.model_stage == "llm"
 
         if self.model_stage == "llm":
             # Initialize thinker model (image preprocessing + vision encoder + 3D resampler)
@@ -138,6 +143,16 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         # tts_token_ids/tts_hidden_states handoff into its conditioning
         # embeddings and initializes request-local codec generation state.
         self.has_preprocess = self.model_stage in {"llm", "tts"}
+
+        if self.model_stage == "llm" and getattr(vllm_config.model_config, "session_mode", "turn") == "duplex":
+            # Build the Stage-0 duplex runtime (remote-code processor and
+            # tokenizer) with the model. Built lazily, it costs several seconds
+            # inside the first session's first audio unit, and the session then
+            # runs that far behind the real-time input stream. The loader
+            # constructs the model under the target-device context; the
+            # processor is CPU preprocessing, so keep its tensors on the CPU.
+            with torch.device("cpu"):
+                self._duplex_data_plane_helper()
 
     @cached_property
     def sampler(self):
@@ -562,6 +577,11 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
 
             # Return hidden states with latent in multimodal_outputs for stage_input_processors
             multimodal_outputs = {"latent": text_hidden_states}
+            # Keep per-forward row identities alongside the latent payload.
+            if thinker_input_ids is not None and thinker_positions is not None:
+                multimodal_outputs["latent_input_ids"] = thinker_input_ids.reshape(-1, 1)
+                multimodal_outputs["latent_positions"] = thinker_positions.reshape(-1, 1)
+
             runtime_info = kwargs.get("runtime_additional_information")
             if runtime_info and isinstance(runtime_info, list) and len(runtime_info) > 0:
                 duplex_rows = []
@@ -697,8 +717,21 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         if not native_rows or len(native_rows) != logits.shape[0]:
             return None
 
+        chunk_terminators = self._minicpmo45_chunk_terminator_token_ids(token_ids)
+        output_token_ids = getattr(sampling_metadata, "output_token_ids", None) or []
         sampled_ids: list[int] = []
         for row_idx in range(logits.shape[0]):
+            accepted = output_token_ids[row_idx] if row_idx < len(output_token_ids) else []
+            last_accepted = next((int(t) for t in reversed(accepted) if isinstance(t, int) and t >= 0), None)
+            if last_accepted in chunk_terminators:
+                # Async scheduling runs one lookahead frame after the chunk
+                # terminator was sampled but before the scheduler observes
+                # the segment stop. The scheduler discards this frame's
+                # token, so decide nothing here: re-emit the terminator and
+                # leave the model-owned policy state exactly as the accepted
+                # history left it. The next append re-injects that terminator.
+                sampled_ids.append(last_accepted)
+                continue
             row_logits = logits[row_idx : row_idx + 1].clone()
             sampled = self._sample_minicpmo45_native_duplex_row(
                 row_logits,
@@ -927,7 +960,8 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         segment before the next streaming update, but the official duplex
         format feeds it (terminator + </unit>) into the KV at every unit
         boundary, and the model's listen/speak policy depends on seeing its own
-        past decisions. Non-terminators clear the turn-ended latch."""
+        past decisions. Text clears the turn-ended latch; <|turn_eos|> sets it
+        without becoming pending, because it was forwarded in this unit."""
         state = self._minicpmo45_duplex_state_for_row(row_idx)
         if state is None:
             return
@@ -935,21 +969,31 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         force_listen = isinstance(payload, dict) and payload.get("force_listen") is True
         listen_id = token_ids.get("listen_token_id", -1)
         tts_bos_id = token_ids.get("tts_bos_token_id", -1)
-        chunk_eos_id = token_ids.get("chunk_eos_token_id", -1)
-        chunk_tts_eos_id = token_ids.get("chunk_tts_eos_token_id", -1)
         turn_eos_id = token_ids.get("turn_eos_token_id", -1)
-        terminators = {listen_id, chunk_eos_id, chunk_tts_eos_id, turn_eos_id}
-        if sampled in terminators:
+        if sampled in self._minicpmo45_chunk_terminator_token_ids(token_ids):
             state.pending_terminator_token = int(sampled)
             state.last_terminator_token = int(sampled)
-            if sampled == turn_eos_id or (sampled == listen_id and force_listen):
+            if sampled == listen_id and force_listen:
                 state.current_turn_ended = True
                 with suppress(Exception):
                     state.pending_speech_response_open = False
             return
+        if sampled == turn_eos_id:
+            # Official streaming_generate feeds <|turn_eos|> like text (its
+            # hidden state conditions the Talker) and keeps sampling until a
+            # chunk terminator, so nothing is pending for the next append;
+            # only the turn-ended latch flips.
+            state.pending_terminator_token = None
+            state.last_terminator_token = int(sampled)
+            state.current_turn_ended = True
+            with suppress(Exception):
+                state.pending_speech_response_open = False
+            return
+        # A seeded prefix can open the response before tts_bos is sampled.
+        # Keep its pending input until the first content token in either case.
         if (
             sampled == tts_bos_id
-            and getattr(state, "current_turn_ended", True)
+            and (getattr(state, "current_turn_ended", True) or getattr(state, "pending_speech_response_open", False))
             and getattr(state, "pending_speech_context", False)
         ):
             with suppress(Exception):
@@ -964,6 +1008,23 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         state.pending_terminator_token = None
         state.last_terminator_token = None
         state.current_turn_ended = False
+
+    @staticmethod
+    def _minicpmo45_chunk_terminator_token_ids(token_ids: dict[str, int]) -> set[int]:
+        """Official ``chunk_terminator_token_ids``: the tokens that close a unit.
+
+        <|turn_eos|> is deliberately absent. It ends the turn but not the
+        unit: the model forwards it and keeps sampling until one of these.
+        """
+        return {
+            int(token_id)
+            for token_id in (
+                token_ids.get("listen_token_id", -1),
+                token_ids.get("chunk_eos_token_id", -1),
+                token_ids.get("chunk_tts_eos_token_id", -1),
+            )
+            if token_id is not None and int(token_id) >= 0
+        }
 
     def _minicpmo45_tokenizer(self):
         if hasattr(self, "_minicpmo45_tokenizer_cache"):

@@ -170,10 +170,11 @@ class MiniCPMO45Stage0DuplexRuntime:
         # only present when reference audio is embedded between them. The
         # template is shared with the serving adapter so the first-append
         # scheduler reserve can count these tokens exactly.
+        initial_user_text = (runtime_config or {}).get("initial_user_text")
         prefix, suffix = MiniCPMO45DuplexPolicy.session_context_texts(
             session_config.get("instructions"),
             ref_audio is not None,
-            (runtime_config or {}).get("initial_user_text"),
+            initial_user_text,
         )
         for token_id in self._encode_text(prefix):
             embed = self._embed_token(token_id)
@@ -196,6 +197,16 @@ class MiniCPMO45Stage0DuplexRuntime:
             state.context_token_ids.append(token_id)
             state.context_suffix_embeds.append(embed)
             state.context_suffix_token_ids.append(token_id)
+        if isinstance(initial_user_text, str) and initial_user_text:
+            # Seeded text is pending user content just like a speech append.
+            # Otherwise the turn-ended latch forces its silent input clock to
+            # listen before the model can answer. Generated content clears it.
+            state.pending_speech_context = True
+            # The seeded template already opens the assistant turn. Match
+            # that prefix in the native listen/speak state machine so silence
+            # advances this response until the model emits turn_eos.
+            state.current_turn_ended = False
+            state.pending_speech_response_open = True
 
     def _stage_prefill_embeddings_only(
         self,

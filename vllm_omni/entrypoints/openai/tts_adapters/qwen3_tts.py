@@ -165,6 +165,11 @@ class Qwen3TTSAdapter(ARTTSAdapter):
                 )
             if request.voice is not None and request.voice not in available_speakers:
                 return f"Invalid voice '{request.voice}'. Supported: {', '.join(sorted(available_speakers))}"
+            if request.voice is None and self.capabilities.default_speaker is None:
+                return (
+                    "CustomVoice requires a 'voice' parameter when no default speaker "
+                    "is configured. Supported: " + ", ".join(sorted(available_speakers))
+                )
 
         # Validate speaker_embedding constraints
         if request.speaker_embedding is not None:
@@ -332,7 +337,17 @@ class Qwen3TTSAdapter(ARTTSAdapter):
                 logger.info("Using precomputed Qwen3-TTS custom voice profile: %s (mode=%s)", voice_lower, mode)
 
         elif params["task_type"][0] == "CustomVoice":
-            params["speaker"] = ["Vivian"]  # Default for CustomVoice
+            if self.capabilities.default_speaker is not None:
+                params["speaker"] = [self.capabilities.default_speaker]
+            else:
+                available = sorted(self.capabilities.supported_speakers) if self.capabilities.supported_speakers else []
+                logger.warning(
+                    "CustomVoice task requires a speaker but no default speaker is "
+                    "configured in the model's spk_id config. Available speakers: %s. "
+                    "Request will fail downstream with error from model.",
+                    ", ".join(available) if available else "none",
+                )
+                params["speaker"] = None
 
         # Instructions for style/emotion control
         if request.instructions is not None:

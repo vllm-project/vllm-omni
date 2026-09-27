@@ -54,6 +54,7 @@ from vllm_omni.benchmarks.data_modules.daily_omni_dataset import (
 from vllm_omni.benchmarks.data_modules.omniinteract_dataset import (
     DEFAULT_OMNIINTERACT_REPO,
     OmniInteractDataset,
+    OmniInteractEvaluationOptions,
     OmniInteractPreparedInput,
     OmniInteractSampleRequest,
     OmniInteractSessionOptions,
@@ -92,6 +93,7 @@ from vllm_omni.benchmarks.omniinteract import (
 from vllm_omni.benchmarks.omniinteract import (
     write_batch_artifacts as write_omniinteract_batch_artifacts,
 )
+from vllm_omni.benchmarks.omniinteract_eval import evaluate_batch as evaluate_omniinteract_batch
 from vllm_omni.metrics import definitions as defs
 from vllm_omni.metrics.utils import coerce_bool, coerce_positive_float_scalar, coerce_positive_int_scalar
 
@@ -429,6 +431,39 @@ def _finalize_omniinteract_batch(
     return compact_summary
 
 
+async def _evaluate_omniinteract_batch(
+    input_requests: list[SampleRequest],
+    outputs: list[RequestFuncOutput],
+) -> dict[str, object] | None:
+    rows = [
+        (sample, output)
+        for sample, output in zip(input_requests, outputs, strict=True)
+        if isinstance(sample, OmniInteractSampleRequest)
+    ]
+    if not rows:
+        return None
+    options = rows[0][0].omniinteract_options
+    if not isinstance(options, OmniInteractSessionOptions) or options.evaluation is None:
+        return None
+    cases, results = [], []
+    for sample, output in rows:
+        result = getattr(output, "omniinteract_case_result", None)
+        if sample.omniinteract_case is None or not isinstance(result, OmniInteractCaseResult):
+            raise RuntimeError("OmniInteract benchmark output lost its dataset identity")
+        cases.append(sample.omniinteract_case)
+        results.append(result)
+    try:
+        return await asyncio.to_thread(
+            evaluate_omniinteract_batch,
+            cases,
+            results,
+            options.evaluation,
+        )
+    except Exception as exc:  # noqa: BLE001 - post-hoc accuracy must not fail a finished benchmark
+        logger.exception("OmniInteract evaluation failed")
+        return {"status": "failed", "error": str(exc)}
+
+
 def _prepare_omniinteract_batch(input_requests: list[SampleRequest]) -> None:
     roots: set[Path] = set()
     for sample in input_requests:
@@ -556,14 +591,32 @@ def get_samples(args, tokenizer, **kwargs):
             subsets=tuple(getattr(args, "omniinteract_subsets")),
             random_seed=args.seed,
             disable_shuffle=getattr(args, "disable_shuffle", False),
+            scenario_tags=tuple(getattr(args, "omniinteract_scenario_tags", None) or ()),
+            scenario_focus=bool(getattr(args, "omniinteract_scenario_focus", False)),
+            video_list=getattr(args, "omniinteract_video_list", None),
         )
+        output_root = Path(getattr(args, "omniinteract_output_dir"))
+        evaluation = None
+        if bool(getattr(args, "omniinteract_evaluate", False)):
+            evaluation_output = getattr(args, "omniinteract_eval_output_dir", None)
+            evaluation = OmniInteractEvaluationOptions(
+                judge_base_url=str(getattr(args, "omniinteract_judge_base_url", "http://127.0.0.1:8000")),
+                judge_model=str(getattr(args, "omniinteract_judge_model", "")),
+                judge_api_key=str(getattr(args, "omniinteract_judge_api_key", "EMPTY")),
+                judge_timeout_s=float(getattr(args, "omniinteract_judge_timeout_s", 60.0)),
+                judge_max_tokens=int(getattr(args, "omniinteract_judge_max_tokens", 512)),
+                workers=int(getattr(args, "omniinteract_eval_workers", 8)),
+                output_dir=Path(evaluation_output) if evaluation_output else output_root / "evaluation",
+                skip_existing=bool(getattr(args, "omniinteract_eval_skip_existing", False)),
+            )
         options = OmniInteractSessionOptions(
-            output_root=Path(getattr(args, "omniinteract_output_dir")),
+            output_root=output_root,
             timeout_s=float(getattr(args, "omniinteract_timeout_s")),
             media_timeout_s=float(getattr(args, "omniinteract_media_timeout_s")),
             ref_audio=str(getattr(args, "omniinteract_ref_audio")),
             require_response=bool(getattr(args, "omniinteract_require_response")),
             max_video_duration_s=float(getattr(args, "omniinteract_max_video_duration_s")),
+            evaluation=evaluation,
         )
         requests = dataset.sample(
             tokenizer,
@@ -1148,6 +1201,27 @@ def _update_output_stage_metrics_from_payload(
         if output.stage_metrics is None:
             output.stage_metrics = {}
         output.stage_metrics.update(stage_snapshot)
+
+
+# Per-request stage fields persisted in benchmark results. Full snapshots carry
+# per-token latency lists, which would inflate every chat-omni result file.
+_REQUEST_STAGE_METRIC_FIELDS = (
+    defs.NUM_TOKENS_OUT,
+    "finish_reason",
+    defs.AUDIO_FRAMES,
+    f"{defs.AUDIO_DURATION}_s",
+)
+
+
+def _compact_request_stage_metrics(snapshot: object) -> dict[str, dict] | None:
+    """Keep the stage fields used for workload checks; empty snapshots become None."""
+    if not isinstance(snapshot, dict) or not snapshot:
+        return None
+    return {
+        stage: {field: metrics[field] for field in _REQUEST_STAGE_METRIC_FIELDS if field in metrics}
+        for stage, metrics in snapshot.items()
+        if isinstance(metrics, dict)
+    }
 
 
 def _apply_chat_stage0_token_timings(output: MixRequestFuncOutput) -> bool:
@@ -3478,6 +3552,9 @@ async def benchmark(
     benchmark_duration = time.perf_counter() - benchmark_start_time
 
     omniinteract_summary = _finalize_omniinteract_batch(input_requests, outputs)
+    omniinteract_evaluation = await _evaluate_omniinteract_batch(input_requests, outputs)
+    if omniinteract_summary is not None and omniinteract_evaluation is not None:
+        omniinteract_summary["accuracy"] = omniinteract_evaluation
 
     metrics: Any
     actual_output_lens: list[int] | int
@@ -3579,6 +3656,14 @@ async def benchmark(
             "input_lens": [output.prompt_len for output in outputs],
             "errors": [output.error for output in outputs],
         }
+    # Preserve request order, including missing snapshots, so CI can verify
+    # fixed stage workloads without parsing logs or storing audio payloads.
+    request_stage_metrics = [
+        _compact_request_stage_metrics(getattr(output, "stage_metrics", None)) for output in outputs
+    ]
+    if any(request_stage_metrics):
+        result["request_stage_metrics"] = request_stage_metrics
+
     # Plain-vLLM backends (e.g. the vLLM-text perf config) return upstream
     # RequestFuncOutput objects without the Mix duplex fields; read them
     # tolerantly or the whole benchmark result is discarded ("fallback to

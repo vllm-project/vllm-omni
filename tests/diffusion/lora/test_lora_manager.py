@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from vllm.lora.lora_model import LoRAModel
 from vllm.lora.lora_weights import LoRALayerWeights
 from vllm.lora.utils import get_supported_lora_modules
 
@@ -294,7 +295,9 @@ def test_lora_manager_activates_fused_lora_on_packed_layer():
     assert torch.allclose(torch.cat([b0, b1, b2], dim=0), B * 0.5)
 
 
-def test_lora_manager_activates_packed_lora_from_sublayers():
+@pytest.mark.parametrize("name_prefix", ["transformer.blocks.0.attn.", "blocks.0.attn.", ""])
+@pytest.mark.parametrize("target_modules", [("to_q",), ("to_q", "to_v"), ("to_q", "to_k", "to_v")])
+def test_lora_manager_activates_packed_lora_from_sublayers(name_prefix, target_modules):
     pipeline = torch.nn.Module()
     bound_names = None
 
@@ -322,8 +325,10 @@ def test_lora_manager_activates_packed_lora_from_sublayers():
     rank = 2
     loras: dict[str, LoRALayerWeights] = {}
     for name, out_dim in zip(["to_q", "to_k", "to_v"], [2, 1, 1]):
-        loras[f"transformer.blocks.0.attn.{name}"] = LoRALayerWeights(
-            module_name=f"transformer.blocks.0.attn.{name}",
+        if name not in target_modules:
+            continue
+        loras[f"{name_prefix}{name}"] = LoRALayerWeights(
+            module_name=f"{name_prefix}{name}",
             rank=rank,
             lora_alpha=rank,
             lora_a=torch.ones((rank, 4)) * (1 if name == "to_q" else 2),
@@ -344,9 +349,15 @@ def test_lora_manager_activates_packed_lora_from_sublayers():
     assert len(lora_a_list) == 3
     assert len(lora_b_list) == 3
     # Scale should apply to B only.
-    assert torch.allclose(lora_b_list[0], torch.ones((2, rank)) * 3 * 2.0)
-    assert torch.allclose(lora_b_list[1], torch.ones((1, rank)) * 4 * 2.0)
-    assert torch.allclose(lora_b_list[2], torch.ones((1, rank)) * 4 * 2.0)
+    for index, name in enumerate(("to_q", "to_k", "to_v")):
+        if name in target_modules:
+            weights = loras[f"{name_prefix}{name}"]
+            assert torch.equal(lora_a_list[index], weights.lora_a)
+            assert torch.equal(lora_b_list[index], weights.lora_b * 2.0)
+        else:
+            assert lora_a_list[index] is None
+            assert lora_b_list[index] is None
+    assert manager._active_adapter_id == 1
     assert bound_names == frozenset(loras)
 
 
@@ -423,6 +434,7 @@ def test_lora_manager_rejects_adapter_that_binds_no_layer():
     )
     layer = _DummyLoRALayer(n_slices=1, output_slices=(2,))
     manager._lora_modules = {"transformer.blocks.0.attn.to_q": layer}
+    manager._expected_lora_modules = {"to_q"}
 
     # Adapter-side name the engine does not expose, e.g. a diffusers-style
     # checkpoint against a differently named engine layout.
@@ -445,16 +457,109 @@ def test_lora_manager_rejects_adapter_that_binds_no_layer():
         )()
     }
 
-    with pytest.raises(ValueError, match="applies to no layer") as excinfo:
+    with pytest.raises(ValueError, match="binding is incomplete") as excinfo:
         manager._activate_adapter(3, scale=1.0)
 
     # The message must name what was received so the mismatch is diagnosable.
+    assert "bound=0/1" in str(excinfo.value)
     assert "unet.down_blocks.0.attn.to_q" in str(excinfo.value)
+    assert "expected target modules in ['to_q']" in str(excinfo.value)
 
     # Nothing was bound and the adapter must not be left marked active.
     assert manager._active_adapter_id is None
     assert layer.set_calls == []
     assert layer.reset_calls >= 1
+
+
+def test_lora_manager_rejects_empty_adapter():
+    """An empty adapter must not be considered successfully bound."""
+    manager = DiffusionLoRAManager(
+        pipeline=torch.nn.Module(),
+        device=torch.device("cpu"),
+        dtype=torch.bfloat16,
+        max_cached_adapters=1,
+    )
+    layer = _DummyLoRALayer(n_slices=1, output_slices=(2,))
+    manager._lora_modules = {"transformer.attn.to_q": layer}
+    manager._registered_adapters = {1: LoRAModel(1, rank=2, loras={})}
+
+    with pytest.raises(ValueError, match="bound=0/0"):
+        manager._activate_adapter(1, scale=1.0)
+
+    assert manager._active_adapter_id is None
+    assert manager._suspended_adapter_id is None
+    assert 1 not in manager._adapter_scales
+    assert layer.set_calls == []
+    assert layer.active_slices == ()
+    assert layer.reset_calls >= 1
+
+
+@pytest.mark.parametrize("suspend_previous", [False, True])
+@pytest.mark.parametrize("unbound_name", ["transformer.attn.to_out.0", "transformer.attn.to_qkv"])
+def test_lora_manager_rejects_partial_binding_and_rolls_back(unbound_name, suspend_previous):
+    """A partial bind must clear uploaded weights and invalidate fast paths."""
+    manager = DiffusionLoRAManager(
+        pipeline=torch.nn.Module(),
+        device=torch.device("cpu"),
+        dtype=torch.bfloat16,
+        max_cached_adapters=2,
+    )
+    layer = _DummyLoRALayer(n_slices=1, output_slices=(2,))
+    packed_layer = _DummyLoRALayer(n_slices=3, output_slices=(2, 1, 1))
+    manager._lora_modules = {
+        "transformer.attn.to_out": layer,
+        "transformer.attn.to_qkv": packed_layer,
+    }
+    manager._expected_lora_modules = {"to_out", "to_qkv"}
+
+    def weights(name, value):
+        return LoRALayerWeights(
+            module_name=name,
+            rank=2,
+            lora_alpha=2,
+            lora_a=torch.full((2, 2), value),
+            lora_b=torch.full((2, 2), value),
+        )
+
+    valid_name = "transformer.attn.to_out"
+    previous = LoRAModel(1, rank=2, loras={valid_name: weights(valid_name, 1.0)})
+    # The extra weights either use an unmatched checkpoint name or have a B
+    # shape that cannot be split across the fused layer's four output rows.
+    partial = LoRAModel(
+        2,
+        rank=2,
+        loras={valid_name: weights(valid_name, 2.0), unbound_name: weights(unbound_name, 2.0)},
+    )
+    manager._registered_adapters = {1: previous, 2: partial}
+    manager._activate_adapter(1, scale=0.5)
+    if suspend_previous:
+        manager._deactivate_all_adapters()
+
+    with pytest.raises(ValueError, match="binding is incomplete") as excinfo:
+        manager._activate_adapter(2, scale=1.0)
+
+    assert "LoRA adapter 2" in str(excinfo.value)
+    assert unbound_name in str(excinfo.value)
+    assert valid_name not in str(excinfo.value).replace(unbound_name, "")
+    if unbound_name.endswith("to_qkv"):
+        assert "lora_b.shape[0]=2" in str(excinfo.value)
+        assert "sum(output_slices)=4" in str(excinfo.value)
+        assert "output_slices=(2, 1, 1)" in str(excinfo.value)
+    else:
+        assert "expected target modules in ['to_out', 'to_qkv']" in str(excinfo.value)
+    assert len(layer.set_calls) == 2
+    assert layer.reset_calls == 1
+    assert layer.active_slices == ()
+    assert packed_layer.active_slices == ()
+    assert manager._active_adapter_id is None
+    assert manager._suspended_adapter_id is None
+    assert 2 not in manager._adapter_scales
+
+    manager._activate_adapter(1, scale=0.5)
+    assert len(layer.set_calls) == 3
+    assert layer.resume_calls == 0
+    assert manager._active_adapter_id == 1
+    assert torch.equal(layer.set_calls[-1][1], previous.loras[valid_name].lora_b * 0.5)
 
 
 def _dummy_lora_request(adapter_id: int) -> LoRARequest:
@@ -684,7 +789,7 @@ def test_lora_manager_rejects_hunyuan_image3_qkv_lora_with_unexpected_rows():
         )()
     }
 
-    with pytest.raises(ValueError, match="applies to no layer"):
+    with pytest.raises(ValueError, match="cannot establish HunyuanImage-3 fused-QKV layout"):
         manager._activate_adapter(12, 0.5)
 
     assert packed_layer.set_calls == []
