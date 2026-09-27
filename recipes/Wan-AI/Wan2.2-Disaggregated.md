@@ -6,9 +6,17 @@ image-conditioned TI2V path. They do not add disaggregation to the separate
 
 Select `vllm_omni/deploy/wan2_2_eg.yaml` for two stages, or
 `vllm_omni/deploy/wan2_2_egd.yaml` for three stages, using `--deploy-config`.
-Adjust device placement and connector settings for the deployment. Both configs
-use NIXL; their device defaults are local examples, not a validated cross-node
-deployment recipe. The existing single-stage topology remains available.
+Both configs use shared memory by default for same-host stages that share an IPC
+namespace. For NIXL, explicitly select `vllm_omni/deploy/wan2_2_eg_nixl.yaml` or
+`vllm_omni/deploy/wan2_2_egd_nixl.yaml`. These inherit the corresponding default
+config through `base_config` and override only the connectors, preserving stage
+roles, device placement and sampling settings.
+
+Adjust device placement and connector settings for the deployment. Device defaults
+are local examples, not a validated cross-node deployment recipe. Separate
+containers need access to the same shared-memory namespace for the default
+transport; otherwise select and validate NIXL. The existing single-stage
+`wan2_2.yaml` remains unchanged and is still the default Wan topology.
 
 | Mode | E | G | D |
 | --- | --- | --- | --- |
@@ -57,6 +65,7 @@ stage ownership, CFG, dummy inputs, typed media and non-owner results. These are
 not pretrained-model numerical equivalence or performance measurements.
 
 Before production use, run fixed-seed single-stage/EG/EGD comparisons with the
-target checkpoints and validate NIXL across the intended ranks/nodes, offload,
+target checkpoints and validate the selected transport (shared memory on the same
+host or NIXL across the intended ranks/nodes), offload,
 VAE tiling and decoder ownership. Do not infer support for other Wan variants
 from these tests.

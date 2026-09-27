@@ -12,11 +12,42 @@ from vllm_omni.config.stage_config import (
     StagePipelineConfig,
     load_deploy_config,
     pipeline_cfg_resolver,
+    resolve_deploy_yaml,
     resolve_diffusion_stage_role,
 )
 from vllm_omni.diffusion.models.interface import stage_component_groups
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+@pytest.mark.parametrize("topology,ports", [("eg", [50081]), ("egd", [50091, 50092])])
+@pytest.mark.parametrize("nixl", [False, True], ids=["shared_memory", "nixl"])
+def test_wan_deploy_transport_is_explicit_opt_in(topology, ports, nixl):
+    from vllm_omni.distributed.omni_connectors.utils.initialization import load_omni_transfer_config
+
+    base_path = f"vllm_omni/deploy/wan2_2_{topology}.yaml"
+    deploy_path = base_path.replace(".yaml", "_nixl.yaml") if nixl else base_path
+    base = resolve_deploy_yaml(base_path)
+    config = resolve_deploy_yaml(deploy_path)
+    deploy = load_deploy_config(deploy_path)
+    assert deploy.pipeline == f"wan2_2_{topology}"
+    assert config["stages"] == base["stages"]
+    assert config["async_chunk"] is False
+    transfer = load_omni_transfer_config(config_dict=config)
+    assert transfer is not None
+    assert set(transfer.connectors) == {(str(stage), str(stage + 1)) for stage in range(len(ports))}
+    expected_name = "NixlConnector" if nixl else "SharedMemoryConnector"
+    for stage, port in enumerate(ports):
+        edge = transfer.connectors[(str(stage), str(stage + 1))]
+        assert edge.name == expected_name
+        if nixl:
+            assert edge.extra["host"] == "auto"
+            assert edge.extra["zmq_port"] == port
+            assert edge.extra["backends"] == ["UCX"]
+            assert edge.extra["lease_seconds"] == 300
+            assert edge.extra["transfer_timeout_s"] == 300
+        else:
+            assert not edge.extra
 
 
 def build_fake_pipeline_config(model_type: str) -> PipelineConfig:

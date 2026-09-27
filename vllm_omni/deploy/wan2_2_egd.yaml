@@ -11,21 +11,9 @@ distributed_executor_backend: "mp"
 
 connectors:
   wan_encode_connector:
-    name: NixlConnector
-    extra:
-      host: "auto"
-      zmq_port: 50091
-      backends: ["UCX"]
-      lease_seconds: 300
-      transfer_timeout_s: 300
+    name: SharedMemoryConnector
   wan_latent_connector:
-    name: NixlConnector
-    extra:
-      host: "auto"
-      zmq_port: 50092
-      backends: ["UCX"]
-      lease_seconds: 300
-      transfer_timeout_s: 300
+    name: SharedMemoryConnector
 
 stages:
   - stage_id: 0
