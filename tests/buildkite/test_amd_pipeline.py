@@ -67,6 +67,13 @@ def test_ready_diffusion_cpu_suite_is_sharded() -> None:
     assert "--shard-id=$$BUILDKITE_PARALLEL_JOB" in pytest_command
 
 
+def test_z_image_merge_timeout_covers_cold_aiter_compile() -> None:
+    step = _find_step("Diffusion Model Test")
+    pytest_command = next(command for command in step["commands"] if "test_z_image.py" in command)
+
+    assert split(pytest_command)[:2] == ["timeout", "55m"]
+
+
 def test_cosyvoice_ready_smoke_uses_sdpa() -> None:
     step = _find_step("CosyVoice3-TTS E2E Smoke (SDPA)", AMD_READY_PIPELINE)
 
