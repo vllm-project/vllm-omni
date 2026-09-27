@@ -97,109 +97,356 @@ def _mhc_post_residual_kernel(
     offs_residual_out = offs_row * 16
 
     # Post coefficients: 2 * sigmoid((alpha_post * scale) * x + bias).
-    # sigmoid is div_rn(1, 1 + exp(-z)) — tl.sigmoid is not bit-equal to
-    # torch.sigmoid; libdevice exp with IEEE division is. The add sits
-    # behind the asm barrier so it cannot contract into an FMA.
+    # sigmoid is div_rn(1, 1 + exp(-z)); the add sits behind the asm
+    # barrier so it cannot contract into an FMA. Fixed variables: no
+    # tuple rebinding inside static_range (Triton 3.2 / MUSA).
     ap = tl.load(alpha_post_ptr)
     post_scale = ap * scale
-    post = ()
-    for j in tl.static_range(4):
-        x = tl.load(post_ptr + post_row + j, mask=t_mask, other=0.0)
-        b = tl.load(bias_post_ptr + j)
-        z = _asm_add_rn_f32(post_scale * x, b)
-        post = post + (2.0 * tldevice.div_rn(1.0, 1.0 + tldevice.exp(-z)),)
+    p0 = 2.0 * tldevice.div_rn(
+        1.0,
+        1.0
+        + tldevice.exp(
+            -_asm_add_rn_f32(
+                post_scale * tl.load(post_ptr + post_row + 0, mask=t_mask, other=0.0), tl.load(bias_post_ptr + 0)
+            )
+        ),
+    )
+    p1 = 2.0 * tldevice.div_rn(
+        1.0,
+        1.0
+        + tldevice.exp(
+            -_asm_add_rn_f32(
+                post_scale * tl.load(post_ptr + post_row + 1, mask=t_mask, other=0.0), tl.load(bias_post_ptr + 1)
+            )
+        ),
+    )
+    p2 = 2.0 * tldevice.div_rn(
+        1.0,
+        1.0
+        + tldevice.exp(
+            -_asm_add_rn_f32(
+                post_scale * tl.load(post_ptr + post_row + 2, mask=t_mask, other=0.0), tl.load(bias_post_ptr + 2)
+            )
+        ),
+    )
+    p3 = 2.0 * tldevice.div_rn(
+        1.0,
+        1.0
+        + tldevice.exp(
+            -_asm_add_rn_f32(
+                post_scale * tl.load(post_ptr + post_row + 3, mask=t_mask, other=0.0), tl.load(bias_post_ptr + 3)
+            )
+        ),
+    )
 
-    # Bit-exact Sinkhorn (per #7545): the eager formula's numerical
-    # behaviors are reproduced structurally rather than left to the
-    # compiler —
-    #   * (alpha*scale)*x + bias keeps the eager association order behind
-    #     an inline-asm barrier (the native expression runs the multiply
-    #     and the add as separate kernels and can never fuse them);
-    #   * exp uses the accurate libdevice expf (tl.exp may lower to the
-    #     approximate ex2 path);
-    #   * amax propagates NaN like torch.amax;
-    #   * the strided sum(dim=-2) is a sequential ascending chain and the
-    #     contiguous sum(dim=-1) is eager's interleaved lane pairing
-    #     (x0 + x2) + (x1 + x3);
-    #   * divisions use IEEE div_rn (Triton's / does not guarantee
-    #     round-to-nearest).
-    # m[i][j] holds one [TPB] vector per matrix element; Triton models
-    # Python lists as immutable tuples, so updates rebuild the tuples and
-    # every index is a compile-time constant.
+    # Bit-exact Sinkhorn (per #7545), statically unrolled.
     ar = tl.load(alpha_residual_ptr)
     residual_scale = ar * scale
-    m = ()
-    for i in tl.static_range(4):
-        row = ()
-        for j in tl.static_range(4):
-            x = tl.load(residual_ptr + residual_row + i * 4 + j, mask=t_mask, other=0.0)
-            b = tl.load(bias_residual_ptr + i * 4 + j)
-            row = row + (_asm_add_rn_f32(residual_scale * x, b),)
-        m = m + (row,)
+    m00 = _asm_add_rn_f32(
+        residual_scale * tl.load(residual_ptr + residual_row + 0, mask=t_mask, other=0.0),
+        tl.load(bias_residual_ptr + 0),
+    )
+    m01 = _asm_add_rn_f32(
+        residual_scale * tl.load(residual_ptr + residual_row + 1, mask=t_mask, other=0.0),
+        tl.load(bias_residual_ptr + 1),
+    )
+    m02 = _asm_add_rn_f32(
+        residual_scale * tl.load(residual_ptr + residual_row + 2, mask=t_mask, other=0.0),
+        tl.load(bias_residual_ptr + 2),
+    )
+    m03 = _asm_add_rn_f32(
+        residual_scale * tl.load(residual_ptr + residual_row + 3, mask=t_mask, other=0.0),
+        tl.load(bias_residual_ptr + 3),
+    )
+    m10 = _asm_add_rn_f32(
+        residual_scale * tl.load(residual_ptr + residual_row + 4, mask=t_mask, other=0.0),
+        tl.load(bias_residual_ptr + 4),
+    )
+    m11 = _asm_add_rn_f32(
+        residual_scale * tl.load(residual_ptr + residual_row + 5, mask=t_mask, other=0.0),
+        tl.load(bias_residual_ptr + 5),
+    )
+    m12 = _asm_add_rn_f32(
+        residual_scale * tl.load(residual_ptr + residual_row + 6, mask=t_mask, other=0.0),
+        tl.load(bias_residual_ptr + 6),
+    )
+    m13 = _asm_add_rn_f32(
+        residual_scale * tl.load(residual_ptr + residual_row + 7, mask=t_mask, other=0.0),
+        tl.load(bias_residual_ptr + 7),
+    )
+    m20 = _asm_add_rn_f32(
+        residual_scale * tl.load(residual_ptr + residual_row + 8, mask=t_mask, other=0.0),
+        tl.load(bias_residual_ptr + 8),
+    )
+    m21 = _asm_add_rn_f32(
+        residual_scale * tl.load(residual_ptr + residual_row + 9, mask=t_mask, other=0.0),
+        tl.load(bias_residual_ptr + 9),
+    )
+    m22 = _asm_add_rn_f32(
+        residual_scale * tl.load(residual_ptr + residual_row + 10, mask=t_mask, other=0.0),
+        tl.load(bias_residual_ptr + 10),
+    )
+    m23 = _asm_add_rn_f32(
+        residual_scale * tl.load(residual_ptr + residual_row + 11, mask=t_mask, other=0.0),
+        tl.load(bias_residual_ptr + 11),
+    )
+    m30 = _asm_add_rn_f32(
+        residual_scale * tl.load(residual_ptr + residual_row + 12, mask=t_mask, other=0.0),
+        tl.load(bias_residual_ptr + 12),
+    )
+    m31 = _asm_add_rn_f32(
+        residual_scale * tl.load(residual_ptr + residual_row + 13, mask=t_mask, other=0.0),
+        tl.load(bias_residual_ptr + 13),
+    )
+    m32 = _asm_add_rn_f32(
+        residual_scale * tl.load(residual_ptr + residual_row + 14, mask=t_mask, other=0.0),
+        tl.load(bias_residual_ptr + 14),
+    )
+    m33 = _asm_add_rn_f32(
+        residual_scale * tl.load(residual_ptr + residual_row + 15, mask=t_mask, other=0.0),
+        tl.load(bias_residual_ptr + 15),
+    )
 
-    # NaN-propagating amax over all 16 elements, matching torch.amax.
-    any_nan = m[0][0] != m[0][0]
-    amax = m[0][0]
-    for i in tl.static_range(4):
-        for j in tl.static_range(4):
-            any_nan = any_nan | (m[i][j] != m[i][j])
-            amax = tl.maximum(amax, m[i][j])
+    # NaN-propagating amax over all 16 elements, matching torch.amax
+    # (floating-point max is order-independent; the NaN union is separate).
+    any_nan = (
+        (m00 != m00)
+        | (m01 != m01)
+        | (m02 != m02)
+        | (m03 != m03)
+        | (m10 != m10)
+        | (m11 != m11)
+        | (m12 != m12)
+        | (m13 != m13)
+        | (m20 != m20)
+        | (m21 != m21)
+        | (m22 != m22)
+        | (m23 != m23)
+        | (m30 != m30)
+        | (m31 != m31)
+        | (m32 != m32)
+        | (m33 != m33)
+    )
+    amax = tl.maximum(
+        tl.maximum(
+            tl.maximum(
+                tl.maximum(
+                    tl.maximum(
+                        tl.maximum(
+                            tl.maximum(
+                                tl.maximum(
+                                    tl.maximum(
+                                        tl.maximum(
+                                            tl.maximum(
+                                                tl.maximum(tl.maximum(tl.maximum(tl.maximum(m00, m01), m02), m03), m10),
+                                                m11,
+                                            ),
+                                            m12,
+                                        ),
+                                        m13,
+                                    ),
+                                    m20,
+                                ),
+                                m21,
+                            ),
+                            m22,
+                        ),
+                        m23,
+                    ),
+                    m30,
+                ),
+                m31,
+            ),
+            m32,
+        ),
+        m33,
+    )
     amax = tl.where(any_nan, float("nan"), amax)
 
-    new_m = ()
-    for i in tl.static_range(4):
-        row = ()
-        for j in tl.static_range(4):
-            row = row + (tldevice.exp(m[i][j] - amax),)
-        new_m = new_m + (row,)
-    m = new_m
+    m00 = tldevice.exp(m00 - amax)
+    m01 = tldevice.exp(m01 - amax)
+    m02 = tldevice.exp(m02 - amax)
+    m03 = tldevice.exp(m03 - amax)
+    m10 = tldevice.exp(m10 - amax)
+    m11 = tldevice.exp(m11 - amax)
+    m12 = tldevice.exp(m12 - amax)
+    m13 = tldevice.exp(m13 - amax)
+    m20 = tldevice.exp(m20 - amax)
+    m21 = tldevice.exp(m21 - amax)
+    m22 = tldevice.exp(m22 - amax)
+    m23 = tldevice.exp(m23 - amax)
+    m30 = tldevice.exp(m30 - amax)
+    m31 = tldevice.exp(m31 - amax)
+    m32 = tldevice.exp(m32 - amax)
+    m33 = tldevice.exp(m33 - amax)
 
     for _ in tl.static_range(iterations):
         # matrix / (matrix.sum(dim=-2, keepdim=True) + epsilon):
         # ascending sequential chain over i per column j.
-        col_sum = ()
-        for j in tl.static_range(4):
-            s = m[0][j]
-            for i in tl.static_range(1, 4):
-                s = s + m[i][j]
-            col_sum = col_sum + (s,)
-        new_m = ()
-        for i in tl.static_range(4):
-            row = ()
-            for j in tl.static_range(4):
-                row = row + (tldevice.div_rn(m[i][j], col_sum[j] + epsilon),)
-            new_m = new_m + (row,)
-        m = new_m
+        c0 = m00 + m10 + m20 + m30
+        c1 = m01 + m11 + m21 + m31
+        c2 = m02 + m12 + m22 + m32
+        c3 = m03 + m13 + m23 + m33
+        m00 = tldevice.div_rn(m00, c0 + epsilon)
+        m01 = tldevice.div_rn(m01, c1 + epsilon)
+        m02 = tldevice.div_rn(m02, c2 + epsilon)
+        m03 = tldevice.div_rn(m03, c3 + epsilon)
+        m10 = tldevice.div_rn(m10, c0 + epsilon)
+        m11 = tldevice.div_rn(m11, c1 + epsilon)
+        m12 = tldevice.div_rn(m12, c2 + epsilon)
+        m13 = tldevice.div_rn(m13, c3 + epsilon)
+        m20 = tldevice.div_rn(m20, c0 + epsilon)
+        m21 = tldevice.div_rn(m21, c1 + epsilon)
+        m22 = tldevice.div_rn(m22, c2 + epsilon)
+        m23 = tldevice.div_rn(m23, c3 + epsilon)
+        m30 = tldevice.div_rn(m30, c0 + epsilon)
+        m31 = tldevice.div_rn(m31, c1 + epsilon)
+        m32 = tldevice.div_rn(m32, c2 + epsilon)
+        m33 = tldevice.div_rn(m33, c3 + epsilon)
         # matrix / (matrix.sum(dim=-1, keepdim=True) + epsilon):
         # interleaved lane pairing (x0 + x2) + (x1 + x3).
-        row_sum = ()
-        for i in tl.static_range(4):
-            even = m[i][0] + m[i][2]
-            odd = m[i][1] + m[i][3]
-            row_sum = row_sum + (even + odd,)
-        new_m = ()
-        for i in tl.static_range(4):
-            row = ()
-            for j in tl.static_range(4):
-                row = row + (tldevice.div_rn(m[i][j], row_sum[i] + epsilon),)
-            new_m = new_m + (row,)
-        m = new_m
+        r0 = (m00 + m02) + (m01 + m03)
+        r1 = (m10 + m12) + (m11 + m13)
+        r2 = (m20 + m22) + (m21 + m23)
+        r3 = (m30 + m32) + (m31 + m33)
+        m00 = tldevice.div_rn(m00, r0 + epsilon)
+        m01 = tldevice.div_rn(m01, r0 + epsilon)
+        m02 = tldevice.div_rn(m02, r0 + epsilon)
+        m03 = tldevice.div_rn(m03, r0 + epsilon)
+        m10 = tldevice.div_rn(m10, r1 + epsilon)
+        m11 = tldevice.div_rn(m11, r1 + epsilon)
+        m12 = tldevice.div_rn(m12, r1 + epsilon)
+        m13 = tldevice.div_rn(m13, r1 + epsilon)
+        m20 = tldevice.div_rn(m20, r2 + epsilon)
+        m21 = tldevice.div_rn(m21, r2 + epsilon)
+        m22 = tldevice.div_rn(m22, r2 + epsilon)
+        m23 = tldevice.div_rn(m23, r2 + epsilon)
+        m30 = tldevice.div_rn(m30, r3 + epsilon)
+        m31 = tldevice.div_rn(m31, r3 + epsilon)
+        m32 = tldevice.div_rn(m32, r3 + epsilon)
+        m33 = tldevice.div_rn(m33, r3 + epsilon)
 
-    for j in tl.static_range(4):
-        v = post[j]
-        if out_dtype_code == 1:
-            v = v.to(tl.bfloat16)
-        elif out_dtype_code == 2:
-            v = v.to(tl.float16)
-        tl.store(post_out_ptr + offs_post_out + j, v, mask=t_mask)
-    for i in tl.static_range(4):
-        for j in tl.static_range(4):
-            v = m[i][j]
-            if out_dtype_code == 1:
-                v = v.to(tl.bfloat16)
-            elif out_dtype_code == 2:
-                v = v.to(tl.float16)
-            tl.store(residual_out_ptr + offs_residual_out + i * 4 + j, v, mask=t_mask)
+    # Materialize outputs at the eager out_dtype boundary.
+    v = p0
+    if out_dtype_code == 1:
+        v = v.to(tl.bfloat16)
+    elif out_dtype_code == 2:
+        v = v.to(tl.float16)
+    tl.store(post_out_ptr + offs_post_out + 0, v, mask=t_mask)
+    v = p1
+    if out_dtype_code == 1:
+        v = v.to(tl.bfloat16)
+    elif out_dtype_code == 2:
+        v = v.to(tl.float16)
+    tl.store(post_out_ptr + offs_post_out + 1, v, mask=t_mask)
+    v = p2
+    if out_dtype_code == 1:
+        v = v.to(tl.bfloat16)
+    elif out_dtype_code == 2:
+        v = v.to(tl.float16)
+    tl.store(post_out_ptr + offs_post_out + 2, v, mask=t_mask)
+    v = p3
+    if out_dtype_code == 1:
+        v = v.to(tl.bfloat16)
+    elif out_dtype_code == 2:
+        v = v.to(tl.float16)
+    tl.store(post_out_ptr + offs_post_out + 3, v, mask=t_mask)
+    v = m00
+    if out_dtype_code == 1:
+        v = v.to(tl.bfloat16)
+    elif out_dtype_code == 2:
+        v = v.to(tl.float16)
+    tl.store(residual_out_ptr + offs_residual_out + 0, v, mask=t_mask)
+    v = m01
+    if out_dtype_code == 1:
+        v = v.to(tl.bfloat16)
+    elif out_dtype_code == 2:
+        v = v.to(tl.float16)
+    tl.store(residual_out_ptr + offs_residual_out + 1, v, mask=t_mask)
+    v = m02
+    if out_dtype_code == 1:
+        v = v.to(tl.bfloat16)
+    elif out_dtype_code == 2:
+        v = v.to(tl.float16)
+    tl.store(residual_out_ptr + offs_residual_out + 2, v, mask=t_mask)
+    v = m03
+    if out_dtype_code == 1:
+        v = v.to(tl.bfloat16)
+    elif out_dtype_code == 2:
+        v = v.to(tl.float16)
+    tl.store(residual_out_ptr + offs_residual_out + 3, v, mask=t_mask)
+    v = m10
+    if out_dtype_code == 1:
+        v = v.to(tl.bfloat16)
+    elif out_dtype_code == 2:
+        v = v.to(tl.float16)
+    tl.store(residual_out_ptr + offs_residual_out + 4, v, mask=t_mask)
+    v = m11
+    if out_dtype_code == 1:
+        v = v.to(tl.bfloat16)
+    elif out_dtype_code == 2:
+        v = v.to(tl.float16)
+    tl.store(residual_out_ptr + offs_residual_out + 5, v, mask=t_mask)
+    v = m12
+    if out_dtype_code == 1:
+        v = v.to(tl.bfloat16)
+    elif out_dtype_code == 2:
+        v = v.to(tl.float16)
+    tl.store(residual_out_ptr + offs_residual_out + 6, v, mask=t_mask)
+    v = m13
+    if out_dtype_code == 1:
+        v = v.to(tl.bfloat16)
+    elif out_dtype_code == 2:
+        v = v.to(tl.float16)
+    tl.store(residual_out_ptr + offs_residual_out + 7, v, mask=t_mask)
+    v = m20
+    if out_dtype_code == 1:
+        v = v.to(tl.bfloat16)
+    elif out_dtype_code == 2:
+        v = v.to(tl.float16)
+    tl.store(residual_out_ptr + offs_residual_out + 8, v, mask=t_mask)
+    v = m21
+    if out_dtype_code == 1:
+        v = v.to(tl.bfloat16)
+    elif out_dtype_code == 2:
+        v = v.to(tl.float16)
+    tl.store(residual_out_ptr + offs_residual_out + 9, v, mask=t_mask)
+    v = m22
+    if out_dtype_code == 1:
+        v = v.to(tl.bfloat16)
+    elif out_dtype_code == 2:
+        v = v.to(tl.float16)
+    tl.store(residual_out_ptr + offs_residual_out + 10, v, mask=t_mask)
+    v = m23
+    if out_dtype_code == 1:
+        v = v.to(tl.bfloat16)
+    elif out_dtype_code == 2:
+        v = v.to(tl.float16)
+    tl.store(residual_out_ptr + offs_residual_out + 11, v, mask=t_mask)
+    v = m30
+    if out_dtype_code == 1:
+        v = v.to(tl.bfloat16)
+    elif out_dtype_code == 2:
+        v = v.to(tl.float16)
+    tl.store(residual_out_ptr + offs_residual_out + 12, v, mask=t_mask)
+    v = m31
+    if out_dtype_code == 1:
+        v = v.to(tl.bfloat16)
+    elif out_dtype_code == 2:
+        v = v.to(tl.float16)
+    tl.store(residual_out_ptr + offs_residual_out + 13, v, mask=t_mask)
+    v = m32
+    if out_dtype_code == 1:
+        v = v.to(tl.bfloat16)
+    elif out_dtype_code == 2:
+        v = v.to(tl.float16)
+    tl.store(residual_out_ptr + offs_residual_out + 14, v, mask=t_mask)
+    v = m33
+    if out_dtype_code == 1:
+        v = v.to(tl.bfloat16)
+    elif out_dtype_code == 2:
+        v = v.to(tl.float16)
+    tl.store(residual_out_ptr + offs_residual_out + 15, v, mask=t_mask)
 
 
 @triton.jit
