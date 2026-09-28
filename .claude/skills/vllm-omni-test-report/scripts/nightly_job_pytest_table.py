@@ -19,6 +19,7 @@ Requires: ``BUILDKITE_TOKEN`` / ``BUILDKITE_API_TOKEN`` in the environment for a
 
 from __future__ import annotations
 
+import concurrent.futures
 import http.client
 import json
 import re
@@ -232,14 +233,21 @@ def collect_nightly_job_log_analyses(
     jobs = build.get("jobs") or []
     report_jobs = [j for j in jobs if not should_skip_job(j.get("name") or "")]
     report_jobs.sort(key=lambda x: (x.get("name") or ""))
-    out: list[dict[str, Any]] = []
+
+    # Build the base record for each job (deterministic, no I/O), then fetch +
+    # parse logs concurrently. A nightly build has ~50 reportable jobs, each
+    # downloading a multi-MB raw log via ``http_text_tail`` (timeout=300s).
+    # Doing that serially takes 10+ minutes and routinely exceeds the 15-min
+    # report timeout; the per-job work is independent (no shared mutable
+    # state), so a thread pool cuts wall-clock to roughly the slowest job.
+    base_recs: list[dict[str, Any]] = []
     for j in report_jobs:
         jid = j.get("id") or ""
         name = j.get("name") or ""
         state = j.get("state") or ""
         link = job_anchor(build_no, jid, org=org, pipeline=pipeline)
         raw_url = j.get("raw_log_url") or j.get("log_url")
-        rec: dict[str, Any] = {
+        base_recs.append({
             "name": name,
             "state": state,
             "step_link": link,
@@ -248,17 +256,35 @@ def collect_nightly_job_log_analyses(
             "log_error": None,
             "build_commit_short": build_commit_short,
             "ci_versions": None,
-        }
+        })
+
+    def _fetch_and_parse(rec: dict[str, Any]) -> dict[str, Any]:
+        raw_url = rec.get("raw_url")
         if not raw_url:
-            out.append(rec)
-            continue
+            return rec
         try:
             log = http_text_tail(str(raw_url), token)
             rec["info"] = parse_pytest_log(log)
             rec["ci_versions"] = extract_ci_versions_from_log(log)
         except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, OSError) as e:
             rec["log_error"] = str(e)
-        out.append(rec)
+        return rec
+
+    if not base_recs:
+        return []
+    max_workers = min(16, len(base_recs))
+    out: list[dict[str, Any]] = [None] * len(base_recs)  # type: ignore[list-item]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
+        future_to_idx = {
+            pool.submit(_fetch_and_parse, rec): idx for idx, rec in enumerate(base_recs)
+        }
+        for fut in concurrent.futures.as_completed(future_to_idx):
+            idx = future_to_idx[fut]
+            try:
+                out[idx] = fut.result()
+            except Exception as e:  # defensive: keep base record on unexpected error
+                base_recs[idx]["log_error"] = f"{type(e).__name__}: {e}"
+                out[idx] = base_recs[idx]
     return out
 
 

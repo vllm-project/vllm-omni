@@ -62,7 +62,11 @@ from report_naming import (  # noqa: E402
 # Constants — mirror of nightly_local_log_report.py lines ~1211–1240.
 # ---------------------------------------------------------------------------
 
-_LEGACY_PR_PER_REVIEWER_LIMIT = 20
+# Standalone PR monitor shows every PR for the selected reviewer (the sidebar
+# is the navigation, so a dedicated reviewer panel must not truncate). The
+# nightly's embedded sub-card keeps its own 20-cap; this local copy is lifted
+# so the panel and the sidebar PR-count badge stay consistent.
+_LEGACY_PR_PER_REVIEWER_LIMIT = 10_000
 _LEGACY_PR_DEFAULT_VISIBLE = 2
 _LEGACY_PR_BOT_LOGIN = "vllm-omni-review-bot"
 
@@ -472,7 +476,9 @@ def _compute_top_legacy_prs(
                 "prs": items_sorted[:_LEGACY_PR_PER_REVIEWER_LIMIT],
             }
         )
-    out.sort(key=lambda g: (-g["max_days_open"], g["reviewer"].lower()))
+    # Sidebar order: most PRs first (descending), then alphabetical. The
+    # within-reviewer order above (priority-first, then oldest) is unchanged.
+    out.sort(key=lambda g: (-g["pr_count"], g["reviewer"].lower()))
     return out
 
 
@@ -665,39 +671,88 @@ def _render_legacy_pr_group_html(group: dict[str, Any]) -> str:
 
 
 def _render_top_legacy_pr_section_html(top_prs: list[dict[str, Any]]) -> str:
+    """Left reviewer sidebar + right PR panel split layout.
+
+    Every reviewer's PRs are pre-rendered as their own ``<section
+    class="pr-panel">``; the sidebar buttons only toggle which panel is
+    visible (no DOM construction at click time — instant, offline-safe).
+    Reviewers arrive sorted by PR count descending (see
+    ``_compute_top_legacy_prs``); the first one is active by default.
+    """
     if not top_prs:
         return ""
-    parts = ['<div class="legacy-pr-bucket-grid">']
-    parts.extend(_render_legacy_pr_group_html(g) for g in top_prs)
-    parts.append("</div>")
-    parts.append(_legacy_pr_expand_script())
-    return "\n".join(parts)
+    total_reviewers = len(top_prs)
+    sidebar_items: list[str] = []
+    panels: list[str] = []
+    for idx, group in enumerate(top_prs):
+        reviewer = group["reviewer"]
+        reviewer_disp = html.escape(f"@{reviewer}")
+        avatar_url = html.escape(_github_avatar_url(reviewer, size=40))
+        pr_count = group["pr_count"]
+        max_days = group["max_days_open"]
+        high_priority = sum(1 for pr in group["prs"] if pr.get("priority"))
+        is_first = idx == 0
+        active_cls = " is-active" if is_first else ""
+
+        sidebar_items.append(
+            f'<li><button type="button" class="pr-sidebar-item{active_cls}" '
+            f'data-reviewer="{reviewer_disp}">'
+            f'<img class="pr-sidebar-avatar" loading="lazy" src="{avatar_url}" alt="" '
+            f'onerror="this.onerror=null;this.removeAttribute(&quot;src&quot;);">'
+            f'<span class="pr-sidebar-name">{reviewer_disp}</span>'
+            f'<span class="pr-sidebar-count" title="{pr_count} PR(s) bucketed">{pr_count}</span>'
+            f"</button></li>"
+        )
+
+        meta_bits = [f"{pr_count} PR{'s' if pr_count != 1 else ''}"]
+        if high_priority:
+            meta_bits.append(f"{high_priority} high-priority")
+        meta_bits.append(f"oldest {max_days:.1f}d pending")
+        meta = html.escape(" · ".join(meta_bits))
+
+        pr_cards = "".join(
+            _render_legacy_pr_card_html(pr, collapsed=False) for pr in group["prs"]
+        )
+        hidden_attr = "" if is_first else " hidden"
+        panels.append(
+            f'<section class="pr-panel" data-reviewer="{reviewer_disp}"{hidden_attr}>'
+            f'<header class="pr-panel-head">'
+            f'<h3 class="pr-panel-title">Reviewed by {reviewer_disp}</h3>'
+            f'<p class="pr-panel-meta">{meta}</p>'
+            f"</header>"
+            f'<div class="pr-panel-list">{pr_cards}</div>'
+            f"</section>"
+        )
+
+    return (
+        f'<div class="pr-monitor-layout">'
+        f'<aside class="pr-sidebar" aria-label="Reviewers">'
+        f'<div class="pr-sidebar-head">Reviewers '
+        f'<span class="pr-sidebar-total">{total_reviewers}</span></div>'
+        f'<ul class="pr-sidebar-list" role="list">{"".join(sidebar_items)}</ul>'
+        f"</aside>"
+        f'<div class="pr-panel-stack">{"".join(panels)}</div>'
+        f"</div>"
+        + _pr_sidebar_select_script()
+    )
 
 
-def _legacy_pr_expand_script() -> str:
+def _pr_sidebar_select_script() -> str:
+    """Client-side reviewer switch: clicking a sidebar item reveals only its panel."""
     return """
 <script>
 (function () {
-  function setCollapsed(grid, btn, collapsed) {
-    if (!grid || !btn) return;
-    if (collapsed) {
-      grid.setAttribute('data-collapsed', 'true');
-      btn.textContent = 'Show all ' + btn.getAttribute('data-total-rows');
-    } else {
-      grid.setAttribute('data-collapsed', 'false');
-      btn.textContent = 'Show fewer';
-    }
+  var items = document.querySelectorAll('.pr-sidebar-item');
+  var panels = document.querySelectorAll('.pr-panel');
+  function select(btn) {
+    var rev = btn.getAttribute('data-reviewer');
+    items.forEach(function (i) { i.classList.toggle('is-active', i === btn); });
+    panels.forEach(function (p) { p.hidden = p.getAttribute('data-reviewer') !== rev; });
   }
-  document.querySelectorAll('.legacy-pr-expand-btn').forEach(function (btn) {
-    var body = btn.closest('.report-subcard-body');
-    if (!body) return;
-    var grid = body.querySelector('.legacy-pr-grid');
-    setCollapsed(grid, btn, true);
-    btn.addEventListener('click', function () {
-      var collapsed = grid.getAttribute('data-collapsed') === 'true';
-      setCollapsed(grid, btn, !collapsed);
-    });
+  items.forEach(function (b) {
+    b.addEventListener('click', function () { select(b); });
   });
+  if (items.length) select(items[0]);
 })();
 </script>
 """
@@ -708,153 +763,166 @@ def _legacy_pr_expand_script() -> str:
 # ---------------------------------------------------------------------------
 
 _LEGACY_PR_SECTION_CSS = """
-/* Reviewer bucket avatar + PR-count badge in summary */
-.legacy-pr-reviewer-avatar {
-  width: 22px;
-  height: 22px;
-  border-radius: 50%;
-  vertical-align: middle;
-  margin-left: 0.4rem;
-  border: 1px solid color-mix(in srgb, var(--dashboard-border, #d9e2ec) 70%, transparent);
-  background: var(--dashboard-panel-strong, #f1f5f9);
-  flex: 0 0 auto;
+/* === Reviewer sidebar + PR panel split layout === */
+.pr-monitor-layout {
+  display: grid;
+  grid-template-columns: 260px 1fr;
+  gap: 1rem;
+  align-items: start;
+  margin: 0.8rem 0 0.6rem;
 }
-.legacy-pr-reviewer-count {
-  display: inline-block;
-  margin-left: 0.35rem;
+.pr-sidebar {
+  position: sticky;
+  top: 0.75rem;
+  max-height: calc(100vh - 1.5rem);
+  overflow-y: auto;
+  background: var(--dashboard-panel-bg, #ffffff);
+  border: 1px solid var(--dashboard-border, #d9e2ec);
+  border-radius: var(--radius, 12px);
+  padding: 0.5rem;
+}
+.pr-sidebar-head {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.35rem 0.5rem 0.55rem;
+  font-size: 0.78rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--dashboard-soft-text, #475569);
+}
+.pr-sidebar-total {
+  margin-left: auto;
   padding: 0.05rem 0.45rem;
   background: color-mix(in srgb, var(--dashboard-warning) 14%, transparent);
   color: color-mix(in srgb, var(--dashboard-warning) 80%, #1f2937);
   border-radius: 999px;
-  font-size: 0.78em;
+  font-size: 0.85em;
   font-weight: 600;
   font-variant-numeric: tabular-nums;
+}
+.pr-sidebar-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+}
+.pr-sidebar-item {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  width: 100%;
+  padding: 0.45rem 0.55rem;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm, 8px);
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  text-align: left;
+  font-family: inherit;
+  font-size: 0.9rem;
+}
+.pr-sidebar-item:hover {
+  background: color-mix(in srgb, var(--accent, #3b82f6) 10%, transparent);
+}
+.pr-sidebar-item:focus-visible {
+  outline: 2px solid var(--dashboard-link, #1d4ed8);
+  outline-offset: 1px;
+}
+.pr-sidebar-item.is-active {
+  background: color-mix(in srgb, var(--accent, #3b82f6) 16%, transparent);
+  border-color: color-mix(in srgb, var(--accent, #3b82f6) 55%, transparent);
+  font-weight: 600;
+}
+.pr-sidebar-avatar {
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  flex: 0 0 auto;
+  border: 1px solid color-mix(in srgb, var(--dashboard-border, #d9e2ec) 70%, transparent);
+  background: var(--dashboard-panel-strong, #f1f5f9);
+}
+.pr-sidebar-name {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
   white-space: nowrap;
 }
-/* Reviewer bucket — 3-column PR card grid (the @-reviewer row) */
-.legacy-pr-group { margin: 0.5rem 0 1rem; }
-/* Inside the bucket grid: stack PRs vertically (1 column) so each card spans the narrow tile */
-.legacy-pr-bucket-grid .legacy-pr-grid {
-  grid-template-columns: 1fr;
-  gap: 0.55rem;
+.pr-sidebar-count {
+  flex: 0 0 auto;
+  font-variant-numeric: tabular-nums;
+  font-size: 0.78em;
+  font-weight: 600;
+  padding: 0.05rem 0.4rem;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--dashboard-warning) 14%, transparent);
+  color: color-mix(in srgb, var(--dashboard-warning) 80%, #1f2937);
+  white-space: nowrap;
 }
-/* Reviewer bucket tiles — compact 2-3 per row grid; stays in grid even when opened */
-.legacy-pr-bucket-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
-  row-gap: 0.9rem;
-  column-gap: 0.9rem;
-  margin: 0.8rem 0 0.6rem;
-  padding: 0.15rem;
-}
-.legacy-pr-bucket-grid > details.legacy-pr-group {
+.pr-panel-stack { min-width: 0; }
+.pr-panel { min-height: 200px; }
+.pr-panel-head { margin-bottom: 0.6rem; }
+.pr-panel-title {
   margin: 0;
-  align-self: start;
-  border: 1px solid color-mix(in srgb, var(--dashboard-soft-text, #475569) 35%, var(--dashboard-border, #d9e2ec));
-  border-left: 3px solid var(--dashboard-soft-text, #475569);
+  font-size: 1.05rem;
+  font-weight: 700;
+  color: var(--dashboard-text, #26323f);
 }
-@media (max-width: 480px) {
-  .legacy-pr-bucket-grid { grid-template-columns: 1fr; }
+.pr-panel-meta {
+  margin: 0.15rem 0 0;
+  color: var(--dashboard-soft-text, #475569);
+  font-size: 0.85rem;
 }
-/* Compact summary when the reviewer tile is collapsed inside the bucket grid */
-.legacy-pr-bucket-grid details.legacy-pr-group > summary.report-subcard-summary {
-  padding: 0.55rem 0.7rem;
-  font-size: 0.88rem;
-  gap: 0.45rem;
-  border-radius: var(--radius-sm, 8px);
-  background: linear-gradient(180deg,
-    color-mix(in srgb, var(--dashboard-soft-text, #475569) 14%, var(--dashboard-panel-bg, #ffffff)) 0%,
-    color-mix(in srgb, var(--dashboard-soft-text, #475569) 6%, var(--dashboard-panel-bg, #ffffff)) 100%);
+.pr-panel-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
 }
-/* Inside the bucket grid: each PR card is a horizontal pill — content laid out inline (#number + days + title + badge) */
-.legacy-pr-bucket-grid .legacy-pr-card {
+/* Panel PR card as a horizontal pill row (mirrors the old bucket-grid pill look) */
+.pr-panel-list .legacy-pr-card {
   flex-direction: row;
   align-items: center;
   gap: 0.55rem;
   min-height: 32px;
   min-width: 0;
-  padding: 0.3rem 0.85rem;
   border-radius: 999px;
+  padding: 0.3rem 0.85rem;
   background: color-mix(in srgb, var(--dashboard-panel-strong, #f1f5f9) 60%, var(--dashboard-panel-bg, #ffffff));
   border-color: color-mix(in srgb, var(--dashboard-soft-text, #475569) 25%, var(--dashboard-border, #d9e2ec));
 }
-.legacy-pr-bucket-grid .legacy-pr-card-head {
+.pr-panel-list .legacy-pr-card-head {
   margin-bottom: 0;
   font-size: 0.72rem;
   flex: 0 0 auto;
   gap: 0.35rem;
 }
-.legacy-pr-bucket-grid .legacy-pr-card-title {
+.pr-panel-list .legacy-pr-card-title {
   display: block;
   -webkit-line-clamp: initial;
   -webkit-box-orient: initial;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-  font-size: 0.82rem;
+  font-size: 0.85rem;
   line-height: 1.25;
   flex: 1 1 auto;
   min-width: 0;
 }
-.legacy-pr-bucket-grid .legacy-pr-card-foot {
+.pr-panel-list .legacy-pr-card-foot {
   margin-top: 0;
   margin-left: 0;
   flex: 0 0 auto;
 }
-.legacy-pr-bucket-grid details.legacy-pr-group > summary.report-subcard-summary > .report-subcard-arrow {
-  flex: 0 0 0.8rem;
-  width: 0.8rem;
-  font-size: 0.8em;
-  color: var(--dashboard-soft-text, #475569);
+@media (max-width: 760px) {
+  .pr-monitor-layout { grid-template-columns: 1fr; }
+  .pr-sidebar { position: static; max-height: none; overflow: visible; }
+  .pr-sidebar-list { flex-direction: row; overflow-x: auto; gap: 0.4rem; padding-bottom: 0.3rem; }
+  .pr-sidebar-item { flex: 0 0 auto; }
 }
-.legacy-pr-bucket-grid details.legacy-pr-group > summary.report-subcard-summary > .report-subcard-summary-inner {
-  gap: 0.35rem;
-  flex-wrap: wrap;
-  min-width: 0;
-}
-.legacy-pr-bucket-grid details.legacy-pr-group > summary.report-subcard-summary > .report-subcard-summary-inner > .report-subcard-ico {
-  width: 14px;
-  height: 14px;
-}
-.legacy-pr-bucket-grid details.legacy-pr-group > summary.report-subcard-summary .report-subcard-title {
-  font-size: 0.92rem;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  max-width: 100%;
-  font-weight: 700;
-  color: color-mix(in srgb, var(--dashboard-soft-text, #475569) 80%, var(--dashboard-text, #26323f));
-}
-.legacy-pr-bucket-grid details.legacy-pr-group > summary.report-subcard-summary .legacy-pr-reviewer-avatar {
-  width: 18px;
-  height: 18px;
-  margin-left: 0.25rem;
-}
-.legacy-pr-bucket-grid details.legacy-pr-group > summary.report-subcard-summary .legacy-pr-reviewer-count {
-  font-size: 0.72em;
-  padding: 0.04rem 0.4rem;
-  margin-left: 0.25rem;
-  background: color-mix(in srgb, var(--dashboard-soft-text, #475569) 18%, transparent);
-  color: color-mix(in srgb, var(--dashboard-soft-text, #475569) 90%, #1f2937);
-}
-/* When the bucket is opened, give the inner body breathing room */
-.legacy-pr-bucket-grid details.legacy-pr-group[open] > .report-subcard-body {
-  padding: 0.7rem 0.35rem 0.4rem;
-}
-.legacy-pr-grid {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 0.6rem;
-  margin: 0.1rem 0 0.1rem;
-}
-@media (max-width: 820px) {
-  .legacy-pr-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-}
-@media (max-width: 480px) {
-  .legacy-pr-grid { grid-template-columns: 1fr; }
-}
-/* Default: first 3 cards visible; cards 4+ hidden until "Show all N" toggled */
-.legacy-pr-grid[data-collapsed="true"] .legacy-pr-card--collapsed { display: none; }
 .legacy-pr-card {
   display: flex;
   flex-direction: column;
@@ -959,37 +1027,6 @@ _LEGACY_PR_SECTION_CSS = """
 }
 .legacy-pr-card--high-priority {
   border-left: none;
-}
-.legacy-pr-count {
-  display: inline-block;
-  margin: 0.5rem 0 0;
-  color: var(--dashboard-soft-text, #475569);
-  font-size: 0.85em;
-}
-/* Show all N toggle */
-.legacy-pr-expand-btn {
-  display: inline-block;
-  margin: 0.6rem 0 0;
-  padding: 0.3rem 0.9rem;
-  background: var(--dashboard-soft-text, #475569);
-  color: #fff;
-  border: none;
-  border-radius: 6px;
-  cursor: pointer;
-  font-size: 0.85em;
-  font-family: inherit;
-}
-.legacy-pr-expand-btn:hover { opacity: 0.85; }
-.legacy-pr-expand-btn:focus-visible {
-  outline: 2px solid var(--dashboard-link, #1d4ed8);
-  outline-offset: 2px;
-}
-details.legacy-pr-group { margin-top: 0.6rem; }
-details.legacy-pr-group:first-of-type { margin-top: 0.25rem; }
-details.legacy-pr-group > summary.report-subcard-summary {
-  background: linear-gradient(180deg,
-    color-mix(in srgb, var(--dashboard-warning) 6%, var(--dashboard-panel-strong)) 0%,
-    var(--dashboard-panel-bg) 100%);
 }
 /* Focus card grid */
 .focus-card-grid {
@@ -1189,8 +1226,9 @@ def render_html(
             '<p class="focus-table-sub">Open PRs whose '
             f"<code>{bot_login}</code> comment mentions the "
             "reviewer (the bot posts a cc-style triage comment per PR). "
-            "High-priority PRs surface first; remaining slots are filled "
-            "by the longest-pending PRs.</p>"
+            "Click a reviewer in the left sidebar to view their pending PRs; "
+            "reviewers are sorted by PR count (most first), and within a "
+            "reviewer high-priority PRs surface first, then the longest-pending.</p>"
             + pr_section_html
         )
     else:

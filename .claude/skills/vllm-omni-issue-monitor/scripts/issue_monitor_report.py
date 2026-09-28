@@ -681,6 +681,23 @@ def _di_bugfix_cell_html(linked: list[int]) -> str:
     return '<td class="di-bugfix-cell di-bugfix-cell--none">—</td>'
 
 
+def _di_action_cell_html() -> str:
+    """Per-row Save button — commits this row's Assignee + Maintainer edits.
+
+    Disabled until an editable input in the row is *dirty* (its current value
+    differs from the last committed baseline). The JS in
+    ``_inline_edit_script`` wires the click handler, dirty-tracking, and the
+    transient "Saved ✓" feedback. Edits are staged in the input box only;
+    nothing is written to ``data-*-value`` / ``localStorage`` until Save is
+    clicked (so a Ctrl+S "Save Page As" captures only committed edits).
+    """
+    return (
+        '<td class="di-action-cell">'
+        '<button type="button" class="di-save-btn" disabled>Save</button>'
+        "</td>"
+    )
+
+
 def _render_top_di_table_html(
     per_issue: list[tuple[float, str, float, int, str, str, list[int]]],
 ) -> str:
@@ -712,6 +729,7 @@ def _render_top_di_table_html(
             f"{_di_assignee_cell_html(issue_number, assignee)}"
             f"{_di_maintainer_cell_html(issue_number)}"
             f"{_di_bugfix_cell_html(linked)}"
+            f"{_di_action_cell_html()}"
             "</tr>"
         )
 
@@ -725,6 +743,7 @@ def _render_top_di_table_html(
         "<thead><tr>",
         "<th>#</th><th>Title</th><th>Priority</th><th>Days</th>",
         "<th>DI</th><th>Assignee</th><th>Maintainer</th><th>Bugfix</th>",
+        "<th></th>",
         "</tr></thead>",
         f"<tbody>{main_tbody}</tbody>",
     ]
@@ -831,6 +850,7 @@ def _render_stale_bugs_subcard_html(
             f"{_di_assignee_cell_html(issue_number, assignee)}"
             f"{_di_maintainer_cell_html(issue_number)}"
             f"{_di_bugfix_cell_html(linked)}"
+            f"{_di_action_cell_html()}"
             "</tr>"
         )
 
@@ -841,6 +861,7 @@ def _render_stale_bugs_subcard_html(
         "<thead><tr>"
         "<th>#</th><th>Title</th><th>Priority</th><th>Days</th>"
         "<th>DI</th><th>Assignee</th><th>Maintainer</th><th>Bugfix</th>"
+        "<th></th>"
         "</tr></thead>"
         f"<tbody>{tbody}</tbody>"
         "</table>"
@@ -859,7 +880,21 @@ def _render_stale_bugs_subcard_html(
 
 
 def _inline_edit_script() -> str:
-    """Editable Assignee / Maintainer cells with localStorage persistence."""
+    """Editable Assignee / Maintainer cells with explicit Save-to-commit.
+
+    Edits are staged in the input box only — nothing is written to
+    ``data-*-value`` or ``localStorage`` until the row's **Save** button is
+    clicked. A row's Save button is disabled until one of its inputs is
+    *dirty* (current value differs from the last committed baseline); on
+    click it commits both inputs, clears the dirty state, and shows a
+    transient "Saved ✓" label. Reload reverts any uncommitted edits.
+
+    Persistence mirrors the parent nightly's key namespace
+    (``di-assignee:<key>`` / ``di-maintainer:<key>``) and the
+    ``data-*-value`` attribute semantics (preferred over localStorage on
+    reload so a Ctrl+S "Save Page As" copy retains committed edits across
+    origins).
+    """
     return """
 <script>
 (function () {
@@ -875,9 +910,46 @@ def _inline_edit_script() -> str:
   }
   function aKey(k) { return "di-assignee:" + k; }
   function mKey(k) { return "di-maintainer:" + k; }
+  function kindOf(input) {
+    return input.classList.contains("di-assignee-input") ? "da" : "dm";
+  }
+  function baselineOf(input, kind) {
+    return input.getAttribute("data-" + kind + "-baseline") || "";
+  }
+  function isDirty(input) {
+    var kind = kindOf(input);
+    return (input.value || "") !== baselineOf(input, kind);
+  }
+  function rowInputs(row) {
+    return row.querySelectorAll("input.di-assignee-input, input.di-maintainer-input");
+  }
+  function rowSaveBtn(row) {
+    return row.querySelector("button.di-save-btn");
+  }
+  // Recompute a row's dirty flag + Save-button enabled state from its inputs.
+  function refreshRow(row) {
+    var inputs = rowInputs(row);
+    var anyDirty = false;
+    for (var i = 0; i < inputs.length; i++) {
+      var d = isDirty(inputs[i]);
+      inputs[i].classList.toggle("is-dirty", d);
+      if (d) anyDirty = true;
+    }
+    var btn = rowSaveBtn(row);
+    if (!btn) return;
+    btn.disabled = !anyDirty;
+    btn.classList.toggle("is-ready", anyDirty);
+    // If the user edits again after a save, drop the "Saved ✓" label.
+    if (anyDirty && btn.getAttribute("data-saved") === "1") {
+      btn.removeAttribute("data-saved");
+      btn.textContent = "Save";
+    }
+  }
   function hydrate(input, kind, key) {
+    // Restore the committed value: prefer the data-*-value attribute (so a
+    // Save-Page-As copy wins on reload), fall back to localStorage.
     var attr = input.getAttribute("data-" + kind + "-value");
-    if (attr === null || attr === undefined) {
+    if (attr === null || attr === undefined || attr === "") {
       var ls = lsGet(key);
       if (ls !== null && ls !== undefined && ls !== "") {
         attr = ls;
@@ -887,12 +959,41 @@ def _inline_edit_script() -> str:
       input.value = attr;
     }
     if (input.value) input.setAttribute("data-" + kind + "-persisted", "1");
-    function persist() {
-      input.setAttribute("data-" + kind + "-value", input.value || "");
-      lsSet(key, input.value || "");
+    // Baseline = last committed value; dirty = current !== baseline.
+    input.setAttribute("data-" + kind + "-baseline", input.value || "");
+    input.addEventListener("input", function () {
+      refreshRow(input.closest("tr"));
+    });
+  }
+  // Commit a row: write data-*-value + localStorage + reset baselines.
+  function commitRow(row) {
+    var inputs = rowInputs(row);
+    for (var i = 0; i < inputs.length; i++) {
+      var input = inputs[i];
+      var kind = kindOf(input);
+      var keyAttr = input.getAttribute("data-" + kind + "-key") || "";
+      var key = kind === "da" ? aKey(keyAttr) : mKey(keyAttr);
+      var val = input.value || "";
+      input.setAttribute("data-" + kind + "-value", val);
+      input.setAttribute("data-" + kind + "-baseline", val);
+      if (val) input.setAttribute("data-" + kind + "-persisted", "1");
+      else input.removeAttribute("data-" + kind + "-persisted");
+      lsSet(key, val);
+      input.classList.remove("is-dirty");
     }
-    input.addEventListener("input", persist);
-    input.addEventListener("blur", persist);
+    var btn = rowSaveBtn(row);
+    if (btn) {
+      btn.disabled = true;
+      btn.classList.remove("is-ready");
+      btn.setAttribute("data-saved", "1");
+      btn.textContent = "Saved \\u2713";
+      setTimeout(function () {
+        if (btn.getAttribute("data-saved") === "1") {
+          btn.removeAttribute("data-saved");
+          btn.textContent = "Save";
+        }
+      }, 1800);
+    }
   }
   function initAll() {
     var aInputs = document.querySelectorAll("input.di-assignee-input");
@@ -904,6 +1005,14 @@ def _inline_edit_script() -> str:
     for (var j = 0; j < mInputs.length; j++) {
       var k2 = mInputs[j].getAttribute("data-dm-key") || "";
       hydrate(mInputs[j], "dm", mKey(k2));
+    }
+    var rows = document.querySelectorAll(".focus-top-table table.top-di-table tbody tr");
+    for (var n = 0; n < rows.length; n++) {
+      refreshRow(rows[n]);
+      (function (row) {
+        var btn = rowSaveBtn(row);
+        if (btn) btn.addEventListener("click", function () { commitRow(row); });
+      })(rows[n]);
     }
   }
   if (document.readyState === "loading") {
@@ -1159,8 +1268,48 @@ details.report-subcard--legacy-pr > .report-subcard-body {
   border-color: var(--dashboard-link, #1d4ed8);
   background: var(--dashboard-panel-bg, #ffffff);
 }
+/* Uncommitted edit — amber border signals "type, then click Save". */
+.di-assignee-input.is-dirty,
+.di-maintainer-input.is-dirty {
+  border-style: solid;
+  border-color: var(--dashboard-warn, #d97706);
+  background: var(--dashboard-panel-bg, #ffffff);
+}
 .di-assignee-text {
   font-size: 0.85rem;
+}
+/* Per-row Save button (Action column). Disabled/grey until a row input is dirty. */
+.focus-top-table table.top-di-table td.di-action-cell {
+  text-align: center;
+  white-space: nowrap;
+  width: 4.5rem;
+}
+.di-save-btn {
+  border: 1px solid var(--dashboard-border, #d9e2ec);
+  background: transparent;
+  color: var(--dashboard-soft-text, #94a3b8);
+  padding: 0.3rem 0.6rem;
+  border-radius: 4px;
+  font-family: inherit;
+  font-size: 0.78rem;
+  line-height: 1;
+  cursor: not-allowed;
+  transition: background 0.12s ease, color 0.12s ease, border-color 0.12s ease;
+}
+.di-save-btn:not(:disabled) {
+  border-color: var(--dashboard-link, #1d4ed8);
+  background: var(--dashboard-link, #1d4ed8);
+  color: #ffffff;
+  cursor: pointer;
+}
+.di-save-btn:not(:disabled):hover {
+  filter: brightness(1.08);
+}
+.di-save-btn[data-saved="1"] {
+  border-color: var(--dashboard-ok, #16a34a);
+  background: var(--dashboard-ok, #16a34a);
+  color: #ffffff;
+  cursor: default;
 }
 .panel {
   background: var(--dashboard-panel-bg, #ffffff);

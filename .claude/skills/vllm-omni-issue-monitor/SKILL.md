@@ -96,15 +96,26 @@ Override with `--out`.
 ## Editable cells
 
 Both **Assignee** and **Maintainer** cells are inline editable
-`<input>` fields:
+`<input>` fields. Each table row ends with an **Action** column holding a
+per-row **Save** button — edits are staged in the input box only and are
+**not** persisted until **Save** is clicked (a `Ctrl+S` "Save Page As"
+captures only committed edits, and reload reverts any uncommitted typing).
 
-- Edit on the page → value is mirrored to `data-*-value` attribute
-  (so a `Ctrl+S` "Save Page As" captures the value into the saved HTML)
-  **and** to `localStorage` (reload-same-origin persistence).
+- The **Save** button is **disabled/grey** until a row's input is *dirty*
+  (its value differs from the last committed baseline). A dirty input
+  gets an amber border; the Save button turns blue/active.
+- Click **Save** → commits that row's Assignee **and** Maintainer to the
+  `data-*-value` attribute **and** `localStorage` (reload-same-origin
+  persistence), clears the dirty state, and shows a transient
+  **"Saved ✓"** label before reverting to `Save`.
 - Reload same origin → `data-*-value` is preferred over `localStorage` so
-  a copy-saved-as-file retains edits across origins.
+  a copy-saved-as-file retains committed edits across origins.
 - In-memory fallback (`mem = {}`) covers Chrome `file://` where
   `localStorage` throws.
+- A pre-filled Assignee (sourced from the GitHub API) renders as a
+  read-only `<span>`; the row's Save button still commits its Maintainer
+  input.
+
 
 ## When to Apply
 
