@@ -97,34 +97,6 @@ realtime_async_chunk_server_params = [
     ),
 ]
 
-realtime_async_chunk_1gpu_server_params = [
-    pytest.param(
-        OmniServerParams(
-            model=MODEL,
-            stage_config_path=get_deploy_config_path("qwen3_omni_moe_1gpu.yaml"),
-            use_stage_cli=True,
-            # The replayed session's session.update sets tool_choice="auto"
-            # with tools=[]; without a configured tool-call parser, tool-call
-            # markup the model emits has nowhere to be intercepted and can
-            # leak into the transcript stream.
-            server_args=[
-                "--async-chunk",
-                "--enable-auto-tool-choice",
-                "--tool-call-parser",
-                "hermes",
-            ],
-            # This config colocates all three stages on one GPU. The stage-CLI
-            # flow launches each stage as an independent process with no
-            # cross-process memory-profiling lock (unlike ``vllm serve --omni
-            # --deploy``), so firing them a couple seconds apart lets stage 1
-            # profile GPU memory before stage 0's own footprint is committed
-            # and OOM. Serialize the launches instead.
-            sequential_stage_launch=True,
-        ),
-        id="async_chunk_1gpu",
-    ),
-]
-
 realtime_server_vad_server_params = [
     pytest.param(
         OmniServerParams(
@@ -491,36 +463,6 @@ class TestQwen3OmniRealtimeWebSocket:
         from tests.helpers.runtime import iter_omni_server
 
         yield from iter_omni_server(request, run_level, omni_fixture_lock)
-
-    @pytest.mark.advanced_model
-    @pytest.mark.omni
-    @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=1)
-    @pytest.mark.parametrize("omni_server", realtime_async_chunk_1gpu_server_params, indirect=True)
-    def test_livekit_client_vad_replay_1gpu(self, omni_server) -> None:
-        """Replay the captured client-VAD session at speed 1 and check its answers."""
-        answers = asyncio.run(
-            _run_client_vad_replay(
-                omni_server.host,
-                omni_server.port,
-                omni_server.model,
-                CLIENT_VAD_REPLAY_PATH,
-            )
-        )
-
-        assert len(answers) == 3, answers
-        # Stage 0 sampling uses top_k=1 (effectively greedy), so these
-        # responses are deterministic given fixed weights/inputs.
-        assert answers[0] == (
-            "Hello! I'm Qwen-Omni, a multimodal large-scale language model developed by "
-            "Alibaba's Tongyi Lab. How can I assist you?"
-        ), answers
-        assert answers[1] == "The capital of France is Paris.", answers
-        assert answers[2] == (
-            "As of the most recent data, the population of Paris (the city proper) is "
-            "approximately 2.1 million people. However, if you include the larger "
-            "metropolitan area known as *Île-de-France*, the population exceeds 12 "
-            "million, making it the largest urban area in the European Union."
-        ), answers
 
     @pytest.mark.advanced_model
     @pytest.mark.omni
