@@ -39,6 +39,9 @@ depends_on:
   - error_contracts.md
 validation_paths:
   - tests/inputs/**
+  - tests/entrypoints/openai_api/test_qwen3_tts_websocket.py
+  - tests/entrypoints/openai_api/test_serving_speech_stream.py
+  - tests/model_executor/stage_input_processors/test_streaming_text_commitment.py
   - tests/engine/test_data_entry_keys.py
   - tests/engine/test_omni_request.py
   - tests/engine/test_omni_request_output.py
@@ -102,6 +105,147 @@ streaming updates, cancellation, and errors.
 **Rule:** Producers MUST distinguish partial updates from the terminal update
 for every output modality.
 
+### IO-INV-102: Streaming TTS text commitment is irreversible
+
+**Rule:** A streaming TTS input processor MUST keep a suffix pending while a
+continuation recognized by the selected readiness policy can change its
+reading. Once source text is released to a TTS request, it MUST NOT be revised,
+removed, or released a second time.
+
+The model-independent deterministic policy lives in
+`vllm_omni/model_executor/stage_input_processors/streaming_text_commitment.py`.
+It returns raw source spans and boundary metadata only. It does not accept or
+invoke a text-normalization callback, and it does not claim that a span has
+already been normalized. Each independently submitted TTS request retains
+ownership of model-specific tokenization and normalization.
+
+The M1 policy is `zh_en_special_v1`. It is a finite, conservative recognizer
+for Chinese and English special-text patterns such as ASCII/full-width numbers,
+common units, symbols, and unfinished ASCII words or abbreviations. Its
+invariants are:
+
+- committed source plus the pending suffix is a lossless partition of all
+  source received so far;
+- only a suffix may remain pending, and the committed prefix grows
+  monotonically;
+- committed source is independent of transport packet seams;
+- a consecutive strong-terminator run creates one boundary only after its end
+  is confirmed by following non-terminator input or end-of-input; and
+- a policy boundary ends the raw segment assembled since the preceding
+  boundary so it can be submitted as an independent, immutable request. It is
+  not a general sentence-boundary or prosody prediction.
+
+`zh_en_special_v1` provides readiness for the patterns it recognizes, not
+general semantic correctness. Text outside its finite tables can be committed
+immediately even if a human reader would prefer more context, while a
+recognized prefix can be delayed conservatively. It is not a tokenizer,
+language detector, comprehensive TN system, pronunciation model, or acoustic
+continuity mechanism. Expanding its languages or pattern tables requires a new
+or explicitly versioned policy contract rather than silently changing the
+meaning of `zh_en_special_v1`.
+
+#### Scanner states and recognition rules
+
+The scanner has an explicit transition table, `_SCAN_TRANSITIONS`. Each feed
+starts in `SCAN` on the previous pending suffix plus the new packet. This
+replay is transactional: a failed scan publishes no new spans. Recognizers
+return an end offset and readiness; they do not normalize or submit text.
+
+| State | Event / condition | Next state and action |
+| --- | --- | --- |
+| SCAN | Natural character | NATURAL: scan up to the next atom start |
+| SCAN | ASCII/full-width letter | LEXICAL: recognize a word or dotted atom |
+| SCAN | Digit, leading symbol, or leading decimal | SPECIAL: recognize numeric/symbol/unit text |
+| SCAN | No remaining source | DONE |
+| NATURAL | Confirmed source | SCAN: emit natural spans and maximal terminator boundaries |
+| NATURAL | Trailing terminator run or ambiguous decimal point | HOLD: retain that suffix |
+| LEXICAL / SPECIAL | Atom ends before the frontier, or explicit EOF | READY |
+| LEXICAL / SPECIAL | Atom can continue beyond the packet frontier | HOLD: retain the entire raw atom |
+| READY | Emit candidate once | SCAN: advance to the candidate end |
+
+The finite `zh_en_special_v1` recognizer rules are:
+
+| Class | Continuations recognized | Release / hold rule |
+| --- | --- | --- |
+| Lexical | Alphanumerics, superscripts, internal `.@'_+-`, dotted abbreviations such as `e.g.` | Hold a trailing word or ambiguous connector; a dotted abbreviation's last dot belongs to the atom |
+| Numeric / symbol | Digits, ASCII letters, operators, currency and percentage symbols, keycaps | Hold the complete expression at a packet frontier; VS16 may precede a keycap in another packet |
+| Decimal / separator | `.`, `．`, comma and colon followed by alphanumerics | Hold ambiguous trailing punctuation; a leading decimal remains atomic, except inside an ASCII repeated-dot run |
+| Unit | Explicit `_CJK_UNITS` and `_ASCII_UNITS` token tables, case-insensitive longest-complete matching | Hold a unit prefix at the frontier; backtrack to the last complete match on mismatch |
+| Unit spacing | Spaces or tabs between numeric source and a unit | Hold unresolved lookahead; never cross a newline, including CRLF |
+| Natural boundary | `. ! ? 。 ！ ？ …` and newline | Coalesce adjacent terminators; hold the frontier run until more input or EOF |
+
+The recognizers remain finite rule-based scanners. A future WFST recognizer
+can provide atom-end/readiness decisions at the same boundary, but this FSM
+does not claim weighted normalization or a general TN grammar.
+
+### IO-INV-103: Streaming TTS input completion flushes pending text
+
+**Rule:** End-of-input MUST explicitly close the commitment policy and release
+the remaining raw suffix exactly once, even when no ordinary policy boundary
+was observed. A transport update arriving after completion MUST be rejected.
+If the pending suffix exceeds its configured safety limit, the utterance MUST
+fail instead of releasing text whose reading is still unresolved.
+
+M1 applies backpressure with a bounded queue in front of independent TTS
+requests. An independent segment producer MUST wait when that queue is full,
+while transport reception MUST remain available for control frames. Committed
+segments may be staged ahead of that producer in source order; their memory is
+bounded by the utterance character limit. The producer MUST NOT drop, merge,
+reorder, or speculatively release spans to make space. A segment failure fails
+the current utterance, prevents later queued segments from starting, and
+reports the terminal request error. Client disconnect and `session.close`
+cancel active work and discard unsubmitted text. `session.done` denotes an
+explicit end-of-input boundary, not successful synthesis: it is emitted after
+EOF also for a failed utterance, but not after disconnect or `session.close`
+cancellation.
+
+The transport idle budget MUST NOT cancel queued or in-flight committed
+synthesis. Generation time pauses that budget, and a fresh idle window starts
+when all pre-EOF committed work settles. The idle budget still applies while
+only unresolved text remains, after `session.done`, and whenever no committed
+work is ready or in flight.
+
+The public WebSocket default remains whole-utterance `buffered` mode. M1
+`commitment` mode is limited to Qwen3-TTS with an explicitly configured
+`Chinese` or `English` language. Every ready segment is a new, independent
+one-shot TTS request; model, scheduler, connector, Talker, and Code2Wav state is
+not inherited across segment boundaries.
+
+Adapters declare `TextCommitmentCapabilities`: profile, languages, independent
+segment behavior, context preservation, audio streaming, word timestamps, and
+failed-segment retries. The M1 handler validates the declared contract and
+rejects unsupported combinations. In particular, a stateful adapter cannot be
+silently run through the independent-request path. Word timestamps also require
+the deployment's forced aligner. `split_granularity` must be `none` when using
+commitment; the separate linguistic splitter remains available in buffered mode.
+
+Independent requests repeat prefill and incur per-segment scheduling and cleanup
+costs. They can introduce audible prosody discontinuities; M1 does not promise
+long-form acoustic continuity. Use the default buffered mode without splitting
+when one-request synthesis is preferable. Smaller commitment segments trade
+earlier audio for those costs, and this PR makes no throughput improvement claim.
+
+Future cross-segment inheritance requires a logical stream identity distinct
+from engine request IDs, a monotonic segment sequence shared across stages,
+health validation before accepting inherited state, and terminal/error cleanup
+for the whole stream. Talker history is a separate model-specific contract.
+Those prerequisites must be implemented and measured before an adapter can
+advertise preserved cross-segment context; adding a stream ID alone would not
+provide acoustic continuity.
+
+The following are outside M1: M2 rho/CAPS or capacity-driven hard cuts,
+resumable scheduler requests or dummy end-of-input tokens, connector protocol
+changes, codec ramping, and Talker/Code2Wav state inheritance or other M3
+acoustic-continuity work. Other model families and `Auto` or other languages
+continue to use `buffered` mode.
+
+The CPU unit diagnostics under
+`tests/model_executor/stage_input_processors/test_streaming_text_commitment.py`
+use project-authored, synthetic minimal strings. They verify losslessness,
+monotonic commitment, boundary behavior, packet-seam invariance, end-of-input,
+and limit/failure handling; they are not copied benchmark examples and do not
+establish TTS quality, linguistic coverage, or dataset-level accuracy.
+
 ### IO-INV-300: Internal objects do not leak into public protocols
 
 **Rule:** Entrypoints MUST explicitly translate internal output objects into
@@ -110,10 +254,10 @@ public response types.
 ## Invariant namespace
 
 `IO-INV` reserves `001-099` for schema ownership and dependency direction,
-`100-199` for identity, modality, accumulation, ordering, and completion,
-`200-299` for serialization failure and payload cleanup, and `300-399` for
-upstream extension, deprecation, and compatibility. Numbers become
-append-only after normative promotion.
+`100-199` for identity, modality, accumulation, ordering, commitment, and
+completion, `200-299` for serialization failure and payload cleanup, and
+`300-399` for upstream extension, deprecation, and compatibility. Numbers
+become append-only after normative promotion.
 
 ## Safe-change guide
 
