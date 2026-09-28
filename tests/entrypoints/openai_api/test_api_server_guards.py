@@ -270,7 +270,13 @@ _DIFFUSION_MUST_BE_NONE = {
     "openai_streaming_speech",
     "openai_streaming_video",
 }
-_DIFFUSION_MUST_BE_WIRED = _DIFFUSION_APP_STATE_KEYS - _DIFFUSION_MUST_BE_NONE
+_CAN_BE_NONE = {
+    "openai_serving_speech",
+    "openai_serving_audio_generate",
+    "openai_serving_video",
+    "openai_streaming_video_output",
+}
+_DIFFUSION_MUST_BE_WIRED = _DIFFUSION_APP_STATE_KEYS - _DIFFUSION_MUST_BE_NONE - _CAN_BE_NONE
 _MULTISTAGE_APP_STATE_KEYS = {
     "engine_client",
     "log_stats",
@@ -301,7 +307,7 @@ _MULTISTAGE_MUST_BE_NONE = {
     "openai_serving_realtime_robot",
     "rl_rollout_serving",
 }
-_MULTISTAGE_MUST_BE_WIRED = _MULTISTAGE_APP_STATE_KEYS - _MULTISTAGE_MUST_BE_NONE
+_MULTISTAGE_MUST_BE_WIRED = _MULTISTAGE_APP_STATE_KEYS - _MULTISTAGE_MUST_BE_NONE - _CAN_BE_NONE
 
 
 def _route_entries(routes) -> list[tuple[str, str]]:
@@ -432,9 +438,7 @@ class _FakeSocket:
 class _FakeEngineClient:
     config_path: str | None = None
 
-    def __init__(self, *, stage_configs=None, endpoint_restrictions=None, vllm_config=None) -> None:
-        self.engine = object.__new__(OmniEngineBase)
-        self.engine.tracer_provider = None
+    def __init__(self, *, stage_configs=None, endpoint_restrictions=None, vllm_config=None, supported_tasks=None) -> None:
         self.stage_configs = stage_configs if stage_configs is not None else []
         self.endpoint_restrictions = endpoint_restrictions if endpoint_restrictions is not None else {}
         self.model_config = SimpleNamespace()
@@ -442,12 +446,13 @@ class _FakeEngineClient:
         self.renderer = object()
         self.errored = False
         self.vllm_config = vllm_config
+        self.supported_tasks = supported_tasks if supported_tasks is not None else ("generate",)
 
     async def get_vllm_config(self):
         return self.vllm_config
 
     async def get_supported_tasks(self) -> tuple[str, ...]:
-        return ("generate",)
+        return self.supported_tasks
 
     async def get_tokenizer(self):
         return SimpleNamespace(chat_template="dummy")
@@ -1157,6 +1162,24 @@ def test_speech_without_handler_preserves_not_found_http_error() -> None:
     assert exc_info.value.detail == "The model does not support Speech API"
 
 
+def test_video_without_handler_preserves_unavailable_error() -> None:
+    app = FastAPI()
+    app.include_router(api_server.router)
+    app.state.api_server_count = 1
+    app.state.openai_serving_video = None
+    client = TestClient(app)
+
+    payload = {
+        "model": "demo-model",
+        "prompt": "A cinematic view of a futuristic city at sunset",
+    }
+
+    response = client.post("/v1/videos", data=payload)
+
+    assert response.status_code == 503
+    assert "Video generation handler not initialized." in response.json()["detail"]
+
+
 @pytest.mark.parametrize(
     ("field", "value", "detail"),
     [
@@ -1391,7 +1414,7 @@ async def test_pure_diffusion_app_state_key_snapshot(monkeypatch) -> None:
 @pytest.mark.asyncio
 async def test_pure_diffusion_speech_forwards_media_access_args(monkeypatch, tmp_path) -> None:
     stage = SimpleNamespace(stage_type="diffusion", engine_args={})
-    engine = _FakeEngineClient(stage_configs=[stage])
+    engine = _FakeEngineClient(stage_configs=[stage], supported_tasks=("speech",))
     base = tmp_path / "base.yaml"
     base.write_text("speech_cache:\n  resolve_max_bytes: 1234\n  speaker_max_bytes: 0\n")
     deploy = tmp_path / "deploy.yaml"
