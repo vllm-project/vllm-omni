@@ -26,6 +26,22 @@ FIRST_AUDIO_REQUIRED_KEY = "_omni_first_audio_required"
 REQUEST_ARTIFACT_DIRS_KEY = "_omni_request_artifact_dirs"
 TRANSFORM_OWNED_META_KEYS = frozenset({"minimax_h3_prepared_reference_videos"})
 
+
+class _SkipTransfer:
+    """Type of :data:`SKIP_TRANSFER`."""
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return "SKIP_TRANSFER"
+
+
+# A next-stage input processor returns this to send nothing for a non-terminal
+# chunk, even at a resumable segment boundary where ``None`` would still send a
+# segment marker. Nothing reaches the connector and the chunk key is not used,
+# so the next chunk that is sent takes it. Terminal chunks always go out.
+SKIP_TRANSFER = _SkipTransfer()
+
 if TYPE_CHECKING:
     from vllm_omni.engine import AdditionalInformationEntry, AdditionalInformationPayload
 

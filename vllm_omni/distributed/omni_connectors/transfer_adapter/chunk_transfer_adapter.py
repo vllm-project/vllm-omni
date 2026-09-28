@@ -15,7 +15,7 @@ from vllm.v1.metrics.stats import PrefillStats
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.utils import ConstantList
 
-from vllm_omni.data_entry_keys import MetaStruct, OmniPayloadStruct, unflatten_payload
+from vllm_omni.data_entry_keys import SKIP_TRANSFER, MetaStruct, OmniPayloadStruct, _SkipTransfer, unflatten_payload
 
 from ..adapter import construct_next_stage_streaming_input_prompt
 from ..connectors.shm_connector import SharedMemoryConnector
@@ -178,7 +178,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         super().__init__(model_config)
         self.model_mode = getattr(model_config, "worker_type", None) or "ar"
         # State specific to Chunk management
-        self.custom_process_next_stage_input_func: Callable[..., OmniPayloadStruct | None] | None = None
+        self.custom_process_next_stage_input_func: Callable[..., OmniPayloadStruct | _SkipTransfer | None] | None = None
         custom_process_next_stage_input_func = getattr(model_config, "custom_process_next_stage_input_func", None)
         if custom_process_next_stage_input_func:
             module_path, func_name = custom_process_next_stage_input_func.rsplit(".", 1)
@@ -784,7 +784,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         chunk_id = self.put_req_chunk[external_req_id]
         connector_put_key = f"{external_req_id}_{stage_id}_{chunk_id}"
         # Process payload in save_loop thread
-        payload_data: OmniPayloadStruct | None = None
+        payload_data: OmniPayloadStruct | _SkipTransfer | None = None
         if self.custom_process_next_stage_input_func:
             try:
                 processor = self.custom_process_next_stage_input_func
@@ -808,6 +808,19 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             except Exception as e:
                 logger.error(f"Failed to use custom_process_input_func for payload extraction: {e}")
 
+        if payload_data is SKIP_TRANSFER:
+            if not is_finished:
+                # The processor holds this segment's output back (for example
+                # frames buffered toward a codec chunk) and asks for no segment
+                # marker either. Nothing is put, so the chunk key and the
+                # sender token's put count stay where they are and the next
+                # chunk that is sent takes this key.
+                if is_segment_finished:
+                    self._clear_sender_segment_state(external_req_id)
+                return
+            # The request terminal is the downstream stage's only end-of-stream
+            # signal (#6670), so it is never skipped.
+            payload_data = None
         if payload_data is None:
             if not (is_segment_finished or is_finished):
                 return
@@ -907,13 +920,17 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             self.record_send_failure(request.request_id, "connector.put reported failure")
 
         if is_segment_finished:
-            self.code_prompt_token_ids.pop(external_req_id, None)
-            getattr(self, "_qwen3_tts_emitted_frames", {}).pop(external_req_id, None)
-            self.ramp_chunk_count.pop(external_req_id, None)
-            self._adaptive_states.pop(external_req_id, None)
-            cached_ic = getattr(self, "_cached_ic", None)
-            if cached_ic is not None:
-                cached_ic.pop(external_req_id, None)
+            self._clear_sender_segment_state(external_req_id)
+
+    def _clear_sender_segment_state(self, external_req_id: str) -> None:
+        """Drop the sender's segment-local processor state at a segment boundary."""
+        self.code_prompt_token_ids.pop(external_req_id, None)
+        getattr(self, "_qwen3_tts_emitted_frames", {}).pop(external_req_id, None)
+        self.ramp_chunk_count.pop(external_req_id, None)
+        self._adaptive_states.pop(external_req_id, None)
+        cached_ic = getattr(self, "_cached_ic", None)
+        if cached_ic is not None:
+            cached_ic.pop(external_req_id, None)
 
     def is_done_receiving_chunks(self, request_id: str) -> bool:
         """Return True if the request should stop polling upstream chunks.
