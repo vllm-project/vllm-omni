@@ -55,6 +55,7 @@ class EnvironmentVariableClassification:
 # grandfathers the older public names below.
 _PUBLIC_OMNI = (
     "DIFFUSION_ATTENTION_BACKEND",
+    "DIFFUSION_ATTENTION_QUANT",
     "DIFFUSION_CACHE_ADAPTER",
     "DIFFUSION_CACHE_BACKEND",
     "OMNI_DIFFUSION_PROMPT_EMBED_CACHE",

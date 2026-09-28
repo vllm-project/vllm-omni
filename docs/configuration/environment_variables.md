@@ -64,6 +64,7 @@ The lifecycle labels used below are:
 | Name | Type and default | Applies to and read time | Precedence and invalid values | Lifecycle |
 | --- | --- | --- | --- | --- |
 | `DIFFUSION_ATTENTION_BACKEND` | Backend name or `auto`; default `auto` (platform selection) | Diffusion stages; read when `OmniDiffusionConfig` is constructed | `diffusion_attention_config.default` wins. An unknown backend fails during backend resolution. | Stable fallback |
+| `DIFFUSION_ATTENTION_QUANT` | `<dtype_qk>:<dtype_vo>[:<q_block_size>:<k_block_size>]`; default unset | Diffusion stages; read when `OmniDiffusionConfig` is constructed | Used only when `DIFFUSION_ATTENTION_BACKEND` sets a non-`auto` backend and no explicit attention default exists. Quantization support varies by backend. Malformed fields raise `ValueError`. | Stable fallback |
 | `DIFFUSION_CACHE_BACKEND` | `none`, `cache_dit`, `tea_cache`, `mag_cache`, `step_cache`, `stepcache`, or `step_cache_dit`; default `none` | Diffusion runner startup | Explicit `cache_backend` in config wins. Otherwise this name wins over the deprecated alias. Unsupported values raise `ValueError` during runner setup. | Stable fallback |
 | `DIFFUSION_CACHE_ADAPTER` | Same values as `DIFFUSION_CACHE_BACKEND`; default `none` | Diffusion runner startup | Used only when neither explicit `cache_backend` nor `DIFFUSION_CACHE_BACKEND` is set. Unsupported values raise `ValueError`. | Deprecated; use `DIFFUSION_CACHE_BACKEND` |
 | `OMNI_DIFFUSION_PROMPT_EMBED_CACHE` | Boolean: `1`, `true`, `yes`, `on`, `0`, `false`, `no`, or `off`; default disabled | Each diffusion runner; resolved during model setup | A recognized environment value overrides the explicit enable setting. An unrecognized value is ignored. | Experimental |
@@ -76,6 +77,13 @@ Backend names for `DIFFUSION_ATTENTION_BACKEND` are the members of
 `DiffusionAttentionBackendEnum`, such as `FLASH_ATTN`, `TORCH_SDPA`,
 `SAGE_ATTN`, `FLASHINFER_ATTN`, and `TRTLLM_ATTN`. Platform support still
 depends on the installed kernels and model path.
+
+For `DIFFUSION_ATTENTION_QUANT`, the dtype fields accept `float16`,
+`bfloat16`, `int8`, or `fp8_e4m3`; the selected backend may support only a
+subset. For example, `DIFFUSION_ATTENTION_BACKEND=TRTLLM_ATTN` with
+`DIFFUSION_ATTENTION_QUANT=int8:bfloat16:1:16` selects INT8 Q/K SageAttention.
+Explicit `diffusion_attention_config.default` takes precedence over both
+environment variables.
 
 ### Serving and runtime
 
