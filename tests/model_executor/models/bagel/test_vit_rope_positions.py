@@ -5,10 +5,13 @@ RoPE position and continues the text at the next one (Bagel/modeling/bagel/bagel
 prepare_vit_images); an img2img input is a VAE block, a separator and a ViT block at two positions.
 vLLM's default is one position per token; the Thinker provides its own via get_mrope_input_positions."""
 
+import pytest
 import torch
 from vllm.multimodal.inputs import MultiModalFeatureSpec, PlaceholderRange
 
 from vllm_omni.model_executor.models.bagel.bagel import OmniBagelForConditionalGeneration
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 def feature(modality, offset, length, is_embed=None):

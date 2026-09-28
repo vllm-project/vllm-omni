@@ -24,6 +24,7 @@ from vllm.model_executor.models.qwen2 import Qwen2DecoderLayer, Qwen2MLP
 from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import (
+    MultiModalFeatureSpec,
     MultiModalFieldConfig,
     MultiModalKwargsItems,
 )
@@ -56,10 +57,6 @@ from vllm_omni.diffusion.models.bagel.bagel_transformer import (
 from vllm_omni.diffusion.models.bagel.pipeline_bagel import bagel_image_size, bagel_vit_transform, default_ae_params
 
 logger = init_logger(__name__)
-
-# One img2img image: tokens of its VAE and ViT blocks including the <|vision_start|> / <|vision_end|>
-# markers, and the stride-aligned (H, W) the DiT stage generates at.
-Img2ImgInfo = tuple[int, int, int, int]
 
 
 class OmniBagelProcessor(BagelProcessor):
@@ -548,34 +545,34 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration, SupportsM
     def _resize_to_stride(self, pixel_values: torch.Tensor) -> torch.Tensor:
         """Resize pixel values to stride-aligned dimensions
         (matches DiT's ``_resize_images_to_stride``)."""
-        H, W = pixel_values.shape[2], pixel_values.shape[3]
-        stride = self.latent_downsample
-        max_img_size = int(self.max_latent_size * stride)
-
-        scale = min(max_img_size / max(H, W), 1.0)
-        min_img_size = min(256, max_img_size)
-        scale = max(scale, min_img_size / min(H, W))
-        new_H = max(stride, int(round(H * scale / stride) * stride))
-        new_W = max(stride, int(round(W * scale / stride) * stride))
-        new_H = min(new_H, max_img_size)
-        new_W = min(new_W, max_img_size)
-
+        H, W = pixel_values.shape[2:]
+        new_H, new_W = self._stride_image_size(H, W)
         if new_H != H or new_W != W:
             pixel_values = torch.nn.functional.interpolate(
                 pixel_values, size=(new_H, new_W), mode="bicubic", align_corners=False
             )
         return pixel_values
 
+    def _stride_image_size(self, height: int, width: int) -> tuple[int, int]:
+        """Return the VAE canvas (height, width), aligned to the latent stride."""
+        stride = self.latent_downsample
+        max_img_size = int(self.max_latent_size * stride)
+
+        scale = min(max_img_size / max(height, width), 1.0)
+        min_img_size = min(256, max_img_size)
+        scale = max(scale, min_img_size / min(height, width))
+        new_h = max(stride, int(round(height * scale / stride) * stride))
+        new_w = max(stride, int(round(width * scale / stride) * stride))
+        new_h = min(new_h, max_img_size)
+        new_w = min(new_w, max_img_size)
+
+        return new_h, new_w
+
     def _reset_img2img_state(self) -> None:
         """img2img bookkeeping, see _route_img2img."""
-        # Each img2img image the encoder embedded in the current step, in encoder order.
-        self._pending_img2img_info: list[Img2ImgInfo] = []
-        # The same keyed by (num_vae, num_vit), most recent last, for requests whose image the encoder
-        # cache already held: a CFG companion shares its parent's image, a resumed request its own.
-        self._img2img_info_by_size: dict[tuple[int, int], Img2ImgInfo] = {}
-        # (block start in the prompt, info) per request, so every chunk of a chunked prefill routes
-        # the same tokens through the generation expert.
-        self._img2img_by_req: dict[str, tuple[int, Img2ImgInfo]] = {}
+        # (VAE block start, token count including markers, H, W) for each
+        # request in the current batch, rebuilt from its multimodal features.
+        self._img2img_by_req: dict[str, tuple[int, int, int, int]] = {}
         # (req_id, first row, end row, tokens computed before this step) per request of the batch
         # about to run, recorded by prepare_runner_inputs; None on dummy runs.
         self._batch_layout: list[tuple[str, int, int, int]] | None = None
@@ -598,7 +595,6 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration, SupportsM
         num_computed_tokens: int | None = None,
     ) -> dict[str, Any] | None:
         # NOTE: num_computed_tokens will not include async placeholders
-        self._img2img_by_req.pop(req_id, None)
         meta = self._ropes_metadata.pop(req_id, None)
         if meta is None:
             return None
@@ -613,6 +609,34 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration, SupportsM
                 meta["ropes"] = [num_computed_tokens]
         return meta
 
+    def _prepare_img2img_metadata(self, features_by_req: Mapping[str, Sequence[MultiModalFeatureSpec]]) -> None:
+        """Resolve routing metadata for img2img features in the current batch.
+
+        Text-only requests and img2text features do not create routing state.
+        The supported img2img limit is one image per request, so each request
+        has at most one VAE block. Offsets refer to the full prompt.
+
+        The runner retains these features even on encoder-cache hits. Reading the
+        tensor shape and placeholder ranges avoids guessing image identity from
+        patch counts (a portrait and a landscape can have identical counts), and
+        gives exact boundaries even when prefill resumes inside an image block.
+        Keep only the current batch so finished requests do not accumulate.
+        """
+        self._img2img_by_req.clear()
+        for req_id, features in features_by_req.items():
+            for feature in features:
+                if feature.modality != "img2img":
+                    continue
+                if feature.data is None:
+                    raise ValueError(f"Missing img2img feature data for request {req_id}")
+                pixels = self._image_list(feature.data.get_data()["pixel_values_img2img"])[0]
+                H, W = self._stride_image_size(*pixels.shape[-2:])
+                ranges = feature.mm_position.extract_embeds_range()
+                if len(ranges) != 2:
+                    raise ValueError("BAGEL img2img requires VAE and ViT placeholder ranges")
+                start, vae_end = ranges[0]
+                self._img2img_by_req[req_id] = (start, vae_end - start + 1, H, W)
+
     def prepare_runner_inputs(
         self,
         input_ids: torch.Tensor | None,
@@ -622,10 +646,12 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration, SupportsM
         num_computed_tokens: Sequence[int],
         num_scheduled_tokens: Sequence[int],
         input_ids_buffer: torch.Tensor | None = None,
+        mm_features_by_req: Mapping[str, Sequence[MultiModalFeatureSpec]] | None = None,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         """Restore input_ids (the runner hands a multimodal batch over as embeddings only) so that
         _route_img2img sees the <|fim_middle|> placeholders, and record which rows of the batch
         belong to which request."""
+        self._prepare_img2img_metadata(mm_features_by_req or {})
         if inputs_embeds is not None and input_ids is None and input_ids_buffer is not None:
             input_ids = input_ids_buffer
         layout: list[tuple[str, int, int, int]] = []
@@ -737,6 +763,8 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration, SupportsM
 
     def _process_img2text_input(self, multimodal_input) -> tuple[torch.Tensor, ...]:
         images = self._image_list(multimodal_input["pixel_values"])
+        if not images:
+            raise ValueError("BAGEL img2text received an empty image payload")
         marker_ids = torch.tensor([self._start_of_image_id, self._end_of_image_id], device=images[0].device)
         start, end = self.language_model.model.embed_tokens(marker_ids).split(1)
         return tuple(torch.cat([start.to(e.dtype), e, end.to(e.dtype)]) for e in self._vit_embeddings(images))
@@ -799,20 +827,7 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration, SupportsM
             combined = torch.cat([se, vae_embeds, ee, se, vit_emb, ee], dim=0)
             results.append(combined)
 
-            num_vae = h * w + 2  # +2 for start/end markers
-            num_vit = vit_emb.shape[0] + 2
-            self._register_img2img_info((num_vae, num_vit, int(H), int(W)))
-
         return tuple(results)
-
-    def _register_img2img_info(self, info: Img2ImgInfo) -> None:
-        """Record one encoder run for this step's routing and, by size, for the requests the encoder
-        cache serves later."""
-        self._pending_img2img_info.append(info)
-        key = (info[0], info[1])
-        # most recent last: _match_img2img_info prefers it when several sizes fit a cut block
-        self._img2img_info_by_size.pop(key, None)
-        self._img2img_info_by_size[key] = info
 
     def forward(
         self,
@@ -841,19 +856,12 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration, SupportsM
         self._has_vae_tokens = False
         self._has_non_vae_tokens = True
         is_img2img = None
-        if (
-            layout
-            and input_ids is not None
-            and (self._pending_img2img_info or self._img2img_info_by_size or self._img2img_by_req)
-        ):
+        if layout and input_ids is not None and self._img2img_by_req:
             # Rows past the batch's own are CUDA-graph padding; the buffer still holds earlier tokens there.
             is_img2img = input_ids[: layout[-1][2]] == self._img2img_token_id
             if not bool(is_img2img.any()):
                 is_img2img = None
         if is_img2img is None:
-            # Encoder output no request of this batch consumes (profiling, an aborted request) must
-            # not leak onto a later batch.
-            self._pending_img2img_info.clear()
             return False
         self._prepare_img2img(positions, is_img2img, layout)
         return self._has_vae_tokens
@@ -864,125 +872,39 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration, SupportsM
         is_img2img: torch.Tensor,
         layout: list[tuple[str, int, int, int]],
     ) -> None:
-        """Per request of the batch (``layout``: req_id, first row, end row, tokens computed before
-        this step): mark its VAE patches in ``_vae_token_mask`` and queue the rope the DiT stage
-        continues from. A request is img2img only where *is_img2img* marks its own rows. Its
-        ``(num_vae, num_vit, H, W)`` is this step's encoder output matched on the block layout the
-        rows show -- exact once the block is complete, a lower bound while a chunk cuts it -- or,
-        when the encoder cache served the image, the same size seen before; the block start is kept
-        per request so later chunks of the same prefill mark the right rows."""
-        pending = self._pending_img2img_info
-        self._pending_img2img_info = []
-        num_tokens = layout[-1][2]
-        # Two host copies for the batch instead of a device sync per request.
-        pos_list = positions[:num_tokens].tolist()
+        """Route each request's VAE patches using its full placeholder metadata,
+        clipped to the scheduled chunk, and queue the RoPE/shape for the DiT.
+        """
+        pos_list = positions[: layout[-1][2]].tolist()
         tok_list = is_img2img.tolist()
-
-        # [req_id, first row, end row, computed, (block start, info) | None]
-        slices: list[list[Any]] = []
-        fresh: list[tuple[int, tuple[int, int, bool, int, bool]]] = []
-        for req_id, start, end, computed in layout:
-            state = self._img2img_by_req.get(req_id)
-            if state is not None and computed == 0:
-                # prefilled again from scratch (preemption): the earlier prefill's block is gone
-                del self._img2img_by_req[req_id]
-                state = None
-            slices.append([req_id, start, end, computed, state])
-            if state is None:
-                block = self._visible_img2img_block(tok_list[start:end], pos_list[start:end])
-                if block is not None:
-                    fresh.append((len(slices) - 1, block))
-
-        # Complete blocks match their encoder output exactly and go first; a block a chunk cuts
-        # only bounds its size and takes what is left.
-        for idx, block in sorted(fresh, key=lambda item: not (item[1][2] and item[1][4])):
-            req_id, _, _, computed, _ = slices[idx]
-            info = self._match_img2img_info(block, pending)
-            if info is None:
-                info = self._provisional_img2img_info(block)
-                logger.warning(
-                    "No encoder output matches the img2img block of request %s (visible layout %s); "
-                    "routing its visible VAE rows and leaving the DiT image size to the request",
-                    req_id,
-                    block,
-                )
-            state = (computed + block[0], info)
-            slices[idx][4] = state
-            self._img2img_by_req[req_id] = state
-        if pending:
-            logger.debug("Dropping %d img2img encoder outputs no request of this batch consumed", len(pending))
-
         vae_mask = torch.zeros(positions.shape[0], dtype=torch.bool, device=positions.device)
         num_vae_rows = 0
-        for req_id, start, end, computed, state in slices:
+        for req_id, start, end, computed in layout:
+            state = self._img2img_by_req.get(req_id)
+            # A text/decode slice must not inherit routing from another request.
+            if not any(tok_list[start:end]):
+                state = None
             rope = pos_list[end - 1] + 1
             if state is None:
                 self._ropes_pending.append({"ropes": [rope]})
                 continue
-            block_start, (num_vae, _, img_h, img_w) = state
+            block_start, num_vae, img_h, img_w = state
             # the VAE block without its markers, clipped to this step's chunk of the request
             lo = max(block_start + 1, computed)
             hi = min(block_start + num_vae - 1, computed + end - start)
             if hi > lo:
                 vae_mask[start + lo - computed : start + hi - computed] = True
                 num_vae_rows += hi - lo
-            meta: dict[str, Any] = {"ropes": [rope], "prefill_position_count": computed + end - start}
-            if img_h and img_w:
-                meta["image_shape"] = [img_h, img_w]
+            meta: dict[str, Any] = {
+                "ropes": [rope],
+                "prefill_position_count": computed + end - start,
+                "image_shape": [img_h, img_w],
+            }
             self._ropes_pending.append(meta)
 
         self._has_vae_tokens = num_vae_rows > 0
         self._has_non_vae_tokens = num_vae_rows < positions.shape[0]
         self._vae_token_mask = vae_mask if self._has_vae_tokens else None
-
-    @staticmethod
-    def _visible_img2img_block(tok: list[bool], pos: list[int]) -> tuple[int, int, bool, int, bool] | None:
-        """Layout of the img2img block that starts in these rows, or None: (first row, rows of the VAE
-        group, whether it is complete, rows of the ViT group, whether it is complete). The VAE block
-        and its separator share one RoPE position and the ViT block takes the next
-        (get_mrope_input_positions), which tells the groups apart; a group is complete when the rows
-        continue past it."""
-        if True not in tok:
-            return None
-        first = tok.index(True)
-        n = len(tok)
-        i = first
-        while i < n and tok[i] and pos[i] == pos[first]:
-            i += 1
-        j = i
-        while j < n and tok[j] and pos[j] == pos[first] + 1:
-            j += 1
-        return first, i - first, i < n, j - i, j < n
-
-    def _match_img2img_info(
-        self, block: tuple[int, int, bool, int, bool], pending: list[Img2ImgInfo]
-    ) -> Img2ImgInfo | None:
-        """The encoder output describing *block*: one of this step's, else the same size seen before
-        (the encoder cache serves a CFG companion, which shares its parent's image, and a resumed
-        request without running the encoder again). A complete group must match exactly, a cut one
-        bounds the size."""
-        _, n_vae, vae_done, n_vit, vit_done = block
-
-        def fits(info: Img2ImgInfo) -> bool:
-            vae_rows, vit_rows = info[0] + 1, info[1]  # the VAE group also holds the separator
-            return (vae_rows == n_vae if vae_done else vae_rows >= n_vae) and (
-                vit_rows == n_vit if vit_done else vit_rows >= n_vit
-            )
-
-        for i, info in enumerate(pending):
-            if fits(info):
-                return pending.pop(i)
-        for info in reversed(self._img2img_info_by_size.values()):
-            if fits(info):
-                return info
-        return None
-
-    @staticmethod
-    def _provisional_img2img_info(block: tuple[int, int, bool, int, bool]) -> Img2ImgInfo:
-        """Best guess from the visible rows alone: every VAE-group row after the start marker is a
-        patch, so a cut group is read as ending right after its last visible row; no image size."""
-        _, n_vae, vae_done, n_vit, _ = block
-        return (n_vae - 1 if vae_done else n_vae + 1), n_vit, 0, 0
 
     # ------------------------------------------------------------------
     # MoT (Mixture-of-Transformers) forward path

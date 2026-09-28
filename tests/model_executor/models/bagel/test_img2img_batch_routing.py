@@ -3,9 +3,10 @@
 """Only the request whose own rows hold the <|fim_middle|> placeholder is img2img: its VAE patches go
 through the generation expert, while the text, img2text and decode requests batched with it -- or
 running after it -- keep the understanding expert whatever their length or order. The rows of each
-request come from prepare_runner_inputs; a chunked prefill keeps its block start per request, and a
-request whose image the encoder cache served (a CFG companion, a resumed request) is matched to the
-same size seen before."""
+request come from prepare_runner_inputs; full multimodal features identify each image even on
+encoder-cache hits or when prefill resumes inside an image block."""
+
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -24,6 +25,8 @@ def make_model():
     model._ropes_pending = []
     model._ropes_metadata = {}
     model._reset_img2img_state()
+    model.latent_downsample = 16
+    model.max_latent_size = 64
     return model
 
 
@@ -31,21 +34,22 @@ def mrope(ids, features):
     return OmniBagelForConditionalGeneration.get_mrope_input_positions(None, ids, features)[0][0].tolist()
 
 
-def feature(modality, offset, length, is_embed=None):
+def feature(modality, offset, length, is_embed=None, identifier="x", data=None):
     return MultiModalFeatureSpec(
-        data=None,
+        data=data,
         modality=modality,
-        identifier="x",
+        identifier=identifier,
         mm_position=PlaceholderRange(offset=offset, length=length, is_embed=is_embed),
     )
 
 
 class Req:
     """One request's prompt: token ids, RoPE positions, the prompt rows of its VAE patches and the
-    (num_vae, num_vit, H, W) its encoder run reports."""
+    expected (num_vae, num_vit, H, W) used by the assertions."""
 
-    def __init__(self, req_id, ids, pos, vae_rows=(), info=None):
+    def __init__(self, req_id, ids, pos, vae_rows=(), info=None, features=()):
         self.req_id, self.ids, self.pos, self.vae_rows, self.info = req_id, ids, pos, set(vae_rows), info
+        self.features = features
 
 
 def text_req(req_id, n):
@@ -57,17 +61,19 @@ def img2text_req(req_id, num_patches, pre=1, post=1):
     return Req(req_id, ids, mrope(ids, [feature("image", pre, num_patches + 2)]))
 
 
-def img2img_req(req_id, num_vae=8, num_vit=6, size=(64, 48), pre=0, post=1):
+def img2img_req(req_id, num_vae=8, num_vit=6, size=(256, 384), pre=0, post=1, image_id=None):
     """text, [<VS> VAE patches <VE> | separator | <VS> ViT patches <VE>], text: num_vae / num_vit count
     the markers, as _process_img2img_input reports them."""
     block = num_vae + 1 + num_vit
     ids = [TEXT] * pre + [FIM] * block + [TEXT] * post
     is_embed = torch.tensor([True] * num_vae + [False] + [True] * num_vit)
-    pos = mrope(ids, [feature("img2img", pre, block, is_embed)])
-    return Req(req_id, ids, pos, range(pre + 1, pre + num_vae - 1), (num_vae, num_vit, *size))
+    data = SimpleNamespace(get_data=lambda: {"pixel_values_img2img": torch.empty(3, *size, device="meta")})
+    features = [feature("img2img", pre, block, is_embed, image_id or req_id, data)]
+    pos = mrope(ids, features)
+    return Req(req_id, ids, pos, range(pre + 1, pre + num_vae - 1), (num_vae, num_vit, *size), features)
 
 
-def run_step(model, chunks, pending=(), padding=0):
+def run_step(model, chunks, padding=0):
     """One model step over ``chunks`` = [(req, tokens computed before, tokens scheduled now)], rows in
     that order, plus ``padding`` stale <|fim_middle|> rows past the batch (CUDA-graph padding).
     Returns (MoT used, rows marked as VAE patches, queued rope metadata per request)."""
@@ -78,8 +84,6 @@ def run_step(model, chunks, pending=(), padding=0):
     ids += [FIM] * padding
     pos += [0] * padding
     input_ids, positions = torch.tensor(ids), torch.tensor(pos)
-    for info in pending:
-        model._register_img2img_info(info)  # what _process_img2img_input does per image
     restored, _ = model.prepare_runner_inputs(
         None,
         positions,
@@ -88,6 +92,7 @@ def run_step(model, chunks, pending=(), padding=0):
         num_computed_tokens=[c[1] for c in chunks],
         num_scheduled_tokens=[c[2] for c in chunks],
         input_ids_buffer=input_ids,
+        mm_features_by_req={req.req_id: req.features for req, _, _ in chunks},
     )
     use_mot = model._route_img2img(restored, positions)
     mask = model._vae_token_mask
@@ -118,12 +123,11 @@ def test_long_neighbour_in_the_same_batch_keeps_the_understanding_expert(neighbo
     chunks = [full(img), full(other)] if img2img_first else [full(other), full(img)]
 
     model = make_model()
-    use_mot, rows, metas = run_step(model, chunks, pending=[img.info])
+    use_mot, rows, metas = run_step(model, chunks)
 
     assert use_mot and rows == expected_rows(chunks)
-    assert model._pending_img2img_info == []
     img_meta, other_meta = (metas[0], metas[1]) if img2img_first else (metas[1], metas[0])
-    assert img_meta["image_shape"] == [64, 48] and img_meta["prefill_position_count"] == len(img.ids)
+    assert img_meta["image_shape"] == [256, 384] and img_meta["prefill_position_count"] == len(img.ids)
     assert img_meta["ropes"] == [img.pos[-1] + 1]
     assert other_meta == {"ropes": [other.pos[-1] + 1]}, "a neighbour must not inherit the img2img metadata"
 
@@ -131,7 +135,7 @@ def test_long_neighbour_in_the_same_batch_keeps_the_understanding_expert(neighbo
 def test_requests_after_an_img2img_one_keep_the_understanding_expert():
     model = make_model()
     img = img2img_req("img")
-    assert run_step(model, [full(img)], pending=[img.info])[0]
+    assert run_step(model, [full(img)])[0]
 
     for req in (text_req("t", 80), img2text_req("i", 60)):
         use_mot, rows, metas = run_step(model, [full(req)])
@@ -142,11 +146,11 @@ def test_decode_neighbours_get_their_own_metadata():
     a, b, img = text_req("a", 501), text_req("b", 601), img2img_req("img")
     chunks = [(a, 500, 1), (b, 600, 1), full(img)]
 
-    use_mot, rows, metas = run_step(make_model(), chunks, pending=[img.info])
+    use_mot, rows, metas = run_step(make_model(), chunks)
 
     assert use_mot and rows == expected_rows(chunks)
     assert metas[0] == {"ropes": [501]} and metas[1] == {"ropes": [601]}
-    assert metas[2]["image_shape"] == [64, 48]
+    assert metas[2]["image_shape"] == [256, 384]
 
 
 @pytest.mark.parametrize(
@@ -161,9 +165,7 @@ def test_chunked_prefill_marks_the_same_rows_as_one_chunk(cuts):
         n = end - computed
         neighbour = text_req(f"t{computed}", 30)
         chunk = (img, computed, n)
-        # the encoder runs in the step whose chunk brings in the block's first row
-        pending = [img.info] if computed <= 5 < end else []
-        use_mot, rows, metas = run_step(model, [full(neighbour), chunk], pending=pending)
+        use_mot, rows, metas = run_step(model, [full(neighbour), chunk])
 
         assert rows == expected_rows([full(neighbour), chunk])
         assert use_mot == bool(rows)
@@ -172,7 +174,7 @@ def test_chunked_prefill_marks_the_same_rows_as_one_chunk(cuts):
             assert metas == [], "a chunk without block rows is an ordinary forward"
             continue
         assert metas[0] == {"ropes": [30]}
-        assert metas[1]["image_shape"] == [64, 48] and metas[1]["prefill_position_count"] == end
+        assert metas[1]["image_shape"] == [256, 384] and metas[1]["prefill_position_count"] == end
         assert metas[1]["ropes"] == [img.pos[end - 1] + 1]
     assert seen == img.vae_rows
 
@@ -180,38 +182,38 @@ def test_chunked_prefill_marks_the_same_rows_as_one_chunk(cuts):
 def test_companion_served_by_the_encoder_cache_finds_its_size():
     model = make_model()
     parent = img2img_req("p", pre=3)
-    assert run_step(model, [full(parent)], pending=[parent.info])[0]
+    assert run_step(model, [full(parent)])[0]
 
     # same image, no encoder run: cfg_text keeps the image and drops the text
-    companion = img2img_req("p__cfg_text", pre=0, post=2)
+    companion = img2img_req("p__cfg_text", pre=0, post=2, image_id="p")
     use_mot, rows, metas = run_step(model, [full(companion), full(text_req("t", 50))])
     assert use_mot and rows == expected_rows([full(companion), full(text_req("t", 50))])
-    assert metas[0]["image_shape"] == [64, 48] and metas[1] == {"ropes": [50]}
+    assert metas[0]["image_shape"] == [256, 384] and metas[1] == {"ropes": [50]}
 
 
-def test_encoder_outputs_match_by_size_not_order():
-    small = img2img_req("small", num_vae=8, num_vit=6, size=(64, 48))
-    large = img2img_req("large", num_vae=12, num_vit=10, size=(96, 64))
+def test_requests_with_different_images_keep_their_own_shape():
+    small = img2img_req("small", num_vae=8, num_vit=6, size=(256, 384))
+    large = img2img_req("large", num_vae=12, num_vit=10, size=(512, 384))
     chunks = [full(small), full(large)]
 
-    use_mot, rows, metas = run_step(make_model(), chunks, pending=[large.info, small.info])
+    use_mot, rows, metas = run_step(make_model(), chunks)
 
     assert use_mot and rows == expected_rows(chunks)
-    assert metas[0]["image_shape"] == [64, 48] and metas[1]["image_shape"] == [96, 64]
+    assert metas[0]["image_shape"] == [256, 384] and metas[1]["image_shape"] == [512, 384]
 
 
-def test_stale_encoder_output_does_not_leak_onto_a_text_batch():
+def test_previous_image_metadata_does_not_leak_onto_a_text_batch():
     model = make_model()
     img = img2img_req("img")
-    use_mot, rows, metas = run_step(model, [full(text_req("t", 40))], pending=[img.info])
+    run_step(model, [full(img)])
+    use_mot, rows, metas = run_step(model, [full(text_req("t", 40))])
     assert not use_mot and rows == set() and metas == []
-    assert model._pending_img2img_info == []
 
 
 def test_padding_rows_past_the_batch_are_ignored():
     model = make_model()
     img = img2img_req("img")
-    assert run_step(model, [full(img)], pending=[img.info])[0]
+    assert run_step(model, [full(img)])[0]
 
     use_mot, rows, _ = run_step(model, [full(text_req("t", 40))], padding=6)
     assert not use_mot and rows == set()
@@ -224,7 +226,7 @@ def test_padding_rows_past_the_batch_are_ignored():
 def test_a_request_prefilled_again_starts_over():
     model = make_model()
     img = img2img_req("img", pre=2)
-    use_mot, rows, _ = run_step(model, [(img, 0, 6)], pending=[img.info])  # cut inside the VAE block
+    use_mot, rows, _ = run_step(model, [(img, 0, 6)])  # cut inside the VAE block
     assert use_mot and rows == expected_rows([(img, 0, 6)])
 
     # preempted and resumed from scratch; the encoder cache still holds the image
@@ -238,11 +240,37 @@ def test_dummy_runs_without_a_layout_neither_route_nor_touch_the_inputs():
     or positions there would sync the device inside a graph capture."""
     model = make_model()
     img = img2img_req("img")
-    model._register_img2img_info(img.info)  # the profiling run embeds dummy img2img data
+    model._prepare_img2img_metadata({img.req_id: img.features})
 
     class Untouchable:
         def __getitem__(self, _):
             raise AssertionError("input_ids must not be read on a dummy run")
 
     assert not model._route_img2img(Untouchable(), Untouchable())
-    assert model._pending_img2img_info == [] and model._vae_token_mask is None and model._ropes_pending == []
+    assert model._vae_token_mask is None and model._ropes_pending == []
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_equal_patch_counts_keep_image_identity_for_cache_hits_and_chunks(reverse):
+    portrait = img2img_req("portrait", size=(384, 256))
+    landscape = img2img_req("landscape", size=(256, 384))
+    images = [portrait, landscape]
+    if reverse:
+        images.reverse()
+    model = make_model()
+    # Populate both images, then serve companions in the opposite order without
+    # any encoder calls. Counts alone cannot distinguish these shapes.
+    run_step(model, [full(req) for req in images])
+    companions = [
+        img2img_req(req.req_id + "__cfg_text", size=req.info[2:], image_id=req.req_id) for req in reversed(images)
+    ]
+    for computed, end in [(0, 3), (3, 7), (7, len(portrait.ids))]:
+        chunks = [(req, computed, end - computed) for req in companions]
+        _, rows, metas = run_step(model, chunks)
+        assert rows == expected_rows(chunks)
+        assert [meta["image_shape"] for meta in metas] == [list(req.info[2:]) for req in companions]
+
+
+def test_empty_img2text_images_report_a_clear_error():
+    with pytest.raises(ValueError, match="BAGEL img2text received an empty image payload"):
+        make_model()._process_img2text_input({"pixel_values": []})

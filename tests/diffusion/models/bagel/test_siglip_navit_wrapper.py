@@ -1,12 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import numpy as np
+import pytest
 import torch
 from PIL import Image
 from transformers import SiglipVisionConfig, SiglipVisionModel
 
 from vllm_omni.diffusion.models.bagel.bagel_transformer import patchify
 from vllm_omni.diffusion.models.bagel.pipeline_bagel import SiglipNaViTWrapper, bagel_image_size, bagel_vit_transform
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 def test_wrapper_matches_hf_siglip_forward():
@@ -37,3 +40,22 @@ def test_bagel_vit_transform_resizes_and_normalizes():
     ref = torch.from_numpy(np.array(img.resize((980, 728), Image.BICUBIC))).permute(2, 0, 1)
     assert out.shape == (3, 728, 980)
     torch.testing.assert_close(out, (ref.float() / 255 - 0.5) / 0.5)  # ToTensor + Normalize(0.5, 0.5)
+
+
+def test_load_weights_restores_linear_patch_layout():
+    from vllm_omni.diffusion.models.bagel.pipeline_bagel import BagelPipeline
+
+    pipeline = BagelPipeline.__new__(BagelPipeline)
+    torch.nn.Module.__init__(pipeline)
+    pipeline.embeddings = torch.nn.Module()
+    pipeline.embeddings.patch_embedding = torch.nn.Conv2d(3, 4, kernel_size=2, stride=2, bias=False)
+    # The checkpoint Linear consumes patches flattened in (P, Q, C) order.
+    weight = torch.arange(48, dtype=torch.float32).reshape(4, 12)
+    name = "embeddings.patch_embedding.weight"
+    loaded = pipeline.load_weights([(name, weight)])
+    assert name in loaded
+    image = torch.arange(48, dtype=torch.float32).reshape(1, 3, 4, 4)
+    patches = image.unfold(2, 2, 2).unfold(3, 2, 2).permute(0, 2, 3, 4, 5, 1).reshape(1, 4, 12)
+    expected = torch.nn.functional.linear(patches, weight)
+    actual = pipeline.embeddings.patch_embedding(image).flatten(2).transpose(1, 2)
+    torch.testing.assert_close(actual, expected)

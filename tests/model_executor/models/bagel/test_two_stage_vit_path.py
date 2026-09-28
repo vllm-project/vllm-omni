@@ -23,7 +23,11 @@ from vllm_omni.diffusion.distributed.parallel_state import (
 )
 from vllm_omni.model_executor.models.bagel.bagel import OmniBagelForConditionalGeneration
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="vLLM's SigLIP needs a GPU attention backend")
+pytestmark = [
+    pytest.mark.core_model,
+    pytest.mark.cuda,
+    pytest.mark.skipif(not torch.cuda.is_available(), reason="vLLM's SigLIP needs a GPU attention backend"),
+]
 SIDE = 4  # 4x4 position table -> images up to 56x56 at patch 14
 
 

@@ -533,13 +533,15 @@ class BagelPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProf
                 device_type=self.device.type, enabled=self.device.type != "cpu", dtype=self.od_config.dtype
             )
 
-            def add_text(context, text):
+            def add_text(context, text, *, bos=True, eos=True):
                 text_input, context["kv_lens"], context["ropes"] = self.bagel.prepare_prompts(
                     curr_kvlens=context["kv_lens"],
                     curr_rope=context["ropes"],
                     prompts=[text],
                     tokenizer=self.tokenizer,
                     new_token_ids=self.new_token_ids,
+                    bos=bos,
+                    eos=eos,
                 )
                 max_tid = int(text_input["packed_text_ids"].max().item())
                 emb_n = int(self.language_model.vocab_size)
@@ -555,23 +557,23 @@ class BagelPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProf
                         context["past_key_values"], **to_device(text_input)
                     )
 
-            def add_image(img):
+            def add_image(context, img):
                 """A context image is a clean VAE block followed by a ViT block (BAGEL update_context_image)."""
-                img = _resize_to_stride(img)
-                vae_input, gen_context["kv_lens"], gen_context["ropes"] = self.bagel.prepare_vae_images(
-                    curr_kvlens=gen_context["kv_lens"],
-                    curr_rope=gen_context["ropes"],
-                    images=[img],
+                vae_img = _resize_to_stride(img)
+                vae_input, context["kv_lens"], context["ropes"] = self.bagel.prepare_vae_images(
+                    curr_kvlens=context["kv_lens"],
+                    curr_rope=context["ropes"],
+                    images=[vae_img],
                     transforms=vae_transforms,
                     new_token_ids=self.new_token_ids,
                 )
                 with autocast:
-                    gen_context["past_key_values"] = self.bagel.forward_cache_update_vae(
-                        self.vae, gen_context["past_key_values"], **to_device(vae_input)
+                    context["past_key_values"] = self.bagel.forward_cache_update_vae(
+                        self.vae, context["past_key_values"], **to_device(vae_input)
                     )
-                vit_input, gen_context["kv_lens"], gen_context["ropes"] = self.bagel.prepare_vit_images(
-                    curr_kvlens=gen_context["kv_lens"],
-                    curr_rope=gen_context["ropes"],
+                vit_input, context["kv_lens"], context["ropes"] = self.bagel.prepare_vit_images(
+                    curr_kvlens=context["kv_lens"],
+                    curr_rope=context["ropes"],
                     images=[img],
                     transforms=bagel_vit_transform,
                     new_token_ids=self.new_token_ids,
@@ -579,10 +581,10 @@ class BagelPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProf
                 for k in ("packed_indexes", "packed_key_value_indexes", "key_values_lens"):
                     vit_input.pop(k, None)
                 with autocast:
-                    gen_context["past_key_values"] = self.bagel.forward_cache_update_vit(
-                        gen_context["past_key_values"], **to_device(vit_input)
+                    context["past_key_values"] = self.bagel.forward_cache_update_vit(
+                        context["past_key_values"], **to_device(vit_input)
                     )
-                return img.size[::-1]
+                return vae_img.size[::-1]
 
             # Pack text and images in prompt order (BAGEL interleave_inference): the chat template puts one
             # <|image_pad|> per image; without matching placeholders the images go first, then the prompt.
@@ -598,20 +600,25 @@ class BagelPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProf
                         len(images),
                     )
                 segments = [""] * len(images) + ["".join(segments)]
+            text_indices = [i for i, text in enumerate(segments) if text.strip()]
             for i, text in enumerate(segments):
-                if text.strip():
-                    cfg_text_context = deepcopy(gen_context)
-                    add_text(gen_context, text)
+                if i in text_indices:
+                    add_text(gen_context, text, bos=i == text_indices[0], eos=i == text_indices[-1])
                 if i < len(images):
-                    image_shape = add_image(images[i])
-                    cfg_text_context = deepcopy(gen_context)
+                    shape = add_image(gen_context, images[i])
+                    # Text-unconditional CFG retains images but excludes positive text.
+                    add_image(cfg_text_context, images[i])
+                    # Preserve the first conditioning image as the output canvas.
+                    if i == 0:
+                        image_shape = shape
             prompt_negative = first_prompt.get("negative_prompt") if isinstance(first_prompt, dict) else None
             neg_prompt = prompt_negative if prompt_negative is not None else extra_args.get("negative_prompt", "")
             if neg_prompt:
                 add_text(cfg_text_context, neg_prompt)
-            for text in segments:  # the image-free CFG branch sees the text only
-                if text.strip():
-                    add_text(cfg_img_context, text)
+            # Image-unconditional CFG retains positive text. Tokenize it once
+            # to preserve BPE across span boundaries.
+            if text_indices:
+                add_text(cfg_img_context, "".join(segments))
 
         # ---- Detect output modality and think mode ----
         modalities = first_prompt.get("modalities", []) if isinstance(first_prompt, dict) else []
