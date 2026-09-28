@@ -27,7 +27,7 @@ stages:
       default_fps: 30.0
       clean_commit_mode: batched  # framewise | batched
       # Fresh full-video requests only; Wan decode starts before clean refresh.
-      overlap_vae_decode: false
+      overlap_vae_decode: true
       ar_diffusion_kv_config:
         gpu_memory_fraction: 0.35
         warmup_cudagraph: false

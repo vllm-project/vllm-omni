@@ -225,3 +225,6 @@ Disabled by default. HSDP + CUDA graphs is currently unsupported and rejected.
 
 Clean K/V commits are batched by default. Set `model_config.clean_commit_mode: framewise`
 to disable batching.
+
+Decode overlap is enabled by default for full-video CUDA requests. Set
+`model_config.overlap_vae_decode: false` for serial decode.

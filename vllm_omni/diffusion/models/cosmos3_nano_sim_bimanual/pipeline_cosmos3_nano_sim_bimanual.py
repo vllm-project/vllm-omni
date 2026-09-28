@@ -203,7 +203,7 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
     _ar_diffusion_kv_state = None
     _bound_session_id: str | None = None
     clean_commit_mode: str = "batched"
-    overlap_vae_decode: bool = False
+    overlap_vae_decode: bool = True
     _decode_queue: CausalDecodeQueue | None = None
     _vae_decode_stream: torch.cuda.Stream | None = None
 
@@ -213,7 +213,7 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
         super().__init__(od_config=od_config, prefix=prefix)
         self.manifest = Cosmos3NanoSimBimanualManifest.from_od_config(od_config)
         self.clean_commit_mode = deploy_option(od_config, "clean_commit_mode", "batched")
-        self.overlap_vae_decode = bool(deploy_option(od_config, "overlap_vae_decode", False))
+        self.overlap_vae_decode = bool(deploy_option(od_config, "overlap_vae_decode", True))
         if self.clean_commit_mode not in {"framewise", "batched"}:
             raise ValueError("clean_commit_mode must be 'framewise' or 'batched'")
         self.resolution_policy = _resolution_policy(od_config, self.manifest)
@@ -1322,7 +1322,7 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
         stream_video = not tick and state_was_new and sp.output_type != "latent"
         decoded_chunks: list[torch.Tensor] = []
         overlap_decode = (
-            stream_video and getattr(self, "overlap_vae_decode", False) and torch.device(self.device).type == "cuda"
+            stream_video and getattr(self, "overlap_vae_decode", True) and torch.device(self.device).type == "cuda"
         )
         if overlap_decode:
             # Reuse the stream across requests so library workspaces and warmup
