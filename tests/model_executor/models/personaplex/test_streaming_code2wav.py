@@ -21,14 +21,15 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 class _FakeBatchedMimi(nn.Module):
     """Shared streaming decoder: row ``r``'s ``n``-th decoded frame is 4 samples of ``100 * r + n``."""
 
-    def __init__(self) -> None:
+    def __init__(self, device: str = "cpu") -> None:
         super().__init__()
+        self.device = torch.device(device)
         self.frames: torch.Tensor | None = None
         self.calls: list[tuple[torch.Tensor, torch.Tensor]] = []
         self.reset_rows: list[int] = []
 
     def streaming_init(self, batch_size: int) -> None:
-        self.frames = torch.zeros(batch_size)
+        self.frames = torch.zeros(batch_size, device=self.device)
 
     def decode_frame(self, codes: torch.Tensor, active: torch.Tensor) -> torch.Tensor:
         assert self.frames is not None
@@ -36,7 +37,7 @@ class _FakeBatchedMimi(nn.Module):
         assert active.shape == self.frames.shape
         self.calls.append((codes.clone(), active.clone()))
         self.frames += active
-        rows = torch.arange(self.frames.shape[0], dtype=torch.float32)
+        rows = torch.arange(self.frames.shape[0], dtype=torch.float32, device=self.device)
         return (100 * rows + self.frames)[:, None].expand(-1, 4).clone()
 
     def reset_slot(self, row: int) -> None:
@@ -173,7 +174,12 @@ def test_mimi_full_stream_reset_reuses_all_state_storage_and_clears_offsets() ->
 
 
 def _model(
-    *, max_sessions: int = 1, install: bool = True, cuda_graphs: bool = False, async_chunk: bool = True
+    *,
+    max_sessions: int = 1,
+    install: bool = True,
+    cuda_graphs: bool = False,
+    async_chunk: bool = True,
+    device: str = "cpu",
 ) -> tuple[PersonaPlexCode2Wav, _FakeBatchedMimi]:
     mimi_config = SimpleNamespace(num_codebooks=2, sample_rate=24000, samples_per_frame=4, mimi_name=None)
     config = SimpleNamespace(mimi_config=mimi_config, mimi_name=None, mimi_cuda_graphs=cuda_graphs)
@@ -187,9 +193,9 @@ def _model(
         device_config=SimpleNamespace(device="cpu"),
     )
     model = PersonaPlexCode2Wav(vllm_config=vllm_config)
-    mimi = _FakeBatchedMimi()
+    mimi = _FakeBatchedMimi(device)
     if install:
-        model._install_mimi(mimi, torch.device("cpu"))
+        model._install_mimi(mimi, torch.device(device))
     return model, mimi
 
 
@@ -430,3 +436,67 @@ def test_mixed_frame_counts_route_pcm_and_advance_only_active_rows() -> None:
     assert _actives(mimi) == [[True, True, False], [True, False, False], [True, False, False]]
     assert mimi.calls[0][0][:2].tolist() == [[0, 100], [50, 150]]
     assert mimi.frames is not None and mimi.frames.tolist() == [3.0, 1.0, 0.0]
+
+
+def _step(model, requests: dict[str, int], *, step: int = 0, infos=None):
+    """One runner step: each request's ``frames`` new frames, as the runner lays them out."""
+    ids = torch.cat([_codes(frames, start=10 * step + 1000 * index) for index, frames in enumerate(requests.values())])
+    return model(
+        input_ids=ids,
+        request_ids=list(requests),
+        seq_token_counts=[2 * frames for frames in requests.values()],
+        runtime_additional_information=infos,
+    )
+
+
+def test_a_step_decodes_its_request_spans_exactly_like_one_request_at_a_time(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    batched, batched_mimi = _model(max_sessions=4)
+    per_request, per_request_mimi = _model(max_sessions=4)
+    monkeypatch.setattr(per_request, "_decode_input_id_spans", lambda *args: None)
+    warnings: list[tuple] = []
+    monkeypatch.setattr(personaplex_code2wav.logger, "warning", lambda *args: warnings.append(args))
+    steps = [
+        {"a": 1, "b": 3, "c": 2},
+        {"b": 1, "a": 2},
+        {"c": 3, "d": 1, "a": 1},
+    ]
+    for step, requests in enumerate(steps):
+        outputs = [_audios(_step(model, requests, step=step)) for model in (batched, per_request)]
+        assert outputs[0] == outputs[1]
+        if step == 1:
+            for model in (batched, per_request):
+                model.on_requests_finished(["b"])
+
+    # A profile row and a malformed one decode nothing, on both paths.
+    infos = [{"meta": {"personaplex_dummy_profile": True}}, {}, {}]
+    outputs = [
+        _audios(
+            model(
+                input_ids=torch.cat([_codes(1), torch.arange(3), _codes(2, start=7)]),
+                request_ids=["profile", "malformed", "c"],
+                seq_token_counts=[2, 3, 4],
+                runtime_additional_information=infos,
+            )
+        )
+        for model in (batched, per_request)
+    ]
+    assert outputs[0] == outputs[1]
+    assert outputs[0][:2] == [[], []] and outputs[0][2]
+    assert [codes.tolist() for codes, _ in batched_mimi.calls] == [
+        codes.tolist() for codes, _ in per_request_mimi.calls
+    ]
+    assert _actives(batched_mimi) == _actives(per_request_mimi)
+    assert batched._request_rows == per_request._request_rows
+    assert len(warnings) == 2 and all("not divisible by" in warning[0] for warning in warnings)
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_a_cuda_step_matches_the_cpu_step() -> None:
+    cuda_model, _ = _model(max_sessions=4, device="cuda")
+    cpu_model, _ = _model(max_sessions=4)
+    for step, requests in enumerate([{"a": 1, "b": 3}, {"b": 2, "c": 5, "a": 1}]):
+        cuda_output = _step(cuda_model, requests, step=step)
+        assert _audios(cuda_output) == _audios(_step(cpu_model, requests, step=step))

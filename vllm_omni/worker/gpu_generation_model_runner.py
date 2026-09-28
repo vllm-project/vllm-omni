@@ -69,6 +69,9 @@ class _HostCopyBatch:
         self._pending = False
 
     def copy(self, tensor: torch.Tensor) -> torch.Tensor:
+        # Host outputs (e.g. Code2Wav's one PCM copy per step) pass through with no tensor op.
+        if tensor.device.type == "cpu" and not tensor.requires_grad and tensor.is_contiguous():
+            return tensor
         tensor = tensor.detach()
         if tensor.device.type != "cuda" or not self._pin_memory:
             return tensor.to("cpu").contiguous()

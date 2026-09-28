@@ -157,8 +157,9 @@ class _ArgmaxQuantizer(MimiSplitResidualVectorQuantizer):
                 layer.codebook.embed_sum.normal_()
                 layer.codebook.cluster_usage.uniform_(0.5, 2.0)
 
-    def encode(self, x: torch.Tensor) -> torch.Tensor:
-        return torch.einsum("qcd,bdt->qbtc", self.proj, x).argmax(dim=-1)  # [Q, B, T]
+    def encode(self, x: torch.Tensor, num_quantizers: int | None = None) -> torch.Tensor:
+        codes = torch.einsum("qcd,bdt->qbtc", self.proj, x).argmax(dim=-1)  # [Q, B, T]
+        return codes if num_quantizers is None else codes[:num_quantizers]
 
 
 def _make_small_codec(device: torch.device, batch_size: int) -> PersonaPlexMimiCodec:
