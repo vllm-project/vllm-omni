@@ -110,6 +110,37 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             self.model = self.thinker
             self.talker = None
 
+            if getattr(getattr(vllm_config, "model_config", None), "session_mode", None) == "duplex":
+                from vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_kv import (
+                    DUPLEX_WINDOW_BLOCK_SIZE,
+                    duplex_window_geometry,
+                    install_duplex_window_layers,
+                    validate_duplex_window_install,
+                )
+
+                cache_config = getattr(vllm_config, "cache_config", None)
+                model_config = getattr(vllm_config, "model_config", None)
+                block_size = int(
+                    getattr(cache_config, "block_size", DUPLEX_WINDOW_BLOCK_SIZE) or DUPLEX_WINDOW_BLOCK_SIZE
+                )
+                max_model_len = getattr(model_config, "max_model_len", None) if model_config is not None else None
+                if max_model_len is None:
+                    max_model_len = 8192
+
+                geometry = duplex_window_geometry(
+                    prefix_tokens=96,
+                    window_tokens=6000,
+                    block_size=block_size,
+                    max_model_len=max_model_len,
+                    high_watermark_tokens=8000,
+                )
+                install_duplex_window_layers(self.thinker, geometry=geometry)
+                validate_duplex_window_install(
+                    cache_config,
+                    model_config,
+                    geometry,
+                )
+
         elif self.model_stage == "tts":
             self.thinker = None
             # The Talker is always the runner-owned continuous codec producer.
@@ -144,6 +175,16 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         # embeddings and initializes request-local codec generation state.
         self.has_preprocess = self.model_stage in {"llm", "tts"}
 
+        if self.model_stage == "llm" and getattr(vllm_config.model_config, "session_mode", "turn") == "duplex":
+            # Build the Stage-0 duplex runtime (remote-code processor and
+            # tokenizer) with the model. Built lazily, it costs several seconds
+            # inside the first session's first audio unit, and the session then
+            # runs that far behind the real-time input stream. The loader
+            # constructs the model under the target-device context; the
+            # processor is CPU preprocessing, so keep its tensors on the CPU.
+            with torch.device("cpu"):
+                self._duplex_data_plane_helper()
+
     @cached_property
     def sampler(self):
         if hasattr(self.model, "sampler"):
@@ -151,6 +192,14 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         from vllm.v1.sample.sampler import Sampler
 
         return Sampler()
+
+    def apply_duplex_kv_reanchor(self, runner: Any, scheduler_output: Any = None) -> None:
+        """Apply in-place Stage-0 KV reanchor and rotation on worker before model forward."""
+        from vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_kv import (
+            MiniCPMO45DuplexWorkerHelper,
+        )
+
+        MiniCPMO45DuplexWorkerHelper.maybe_apply_reanchor(runner, scheduler_output=scheduler_output)
 
     def prepare_duplex_sampling(
         self,
@@ -377,6 +426,9 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             is_speech=bool(payload.get("is_speech", False)),
             final=bool(duplex.get("final")),
             stage0_window=(duplex.get("stage0_window") if isinstance(duplex.get("stage0_window"), dict) else None),
+            stage0_reanchor=(
+                duplex.get("stage0_reanchor") if isinstance(duplex.get("stage0_reanchor"), dict) else None
+            ),
         )
         update_result = dict(result)
         if result.get("stage0_window_replaced") is True:
@@ -1041,9 +1093,11 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             with suppress(Exception):
                 state.pending_speech_response_open = False
             return
+        # A seeded prefix can open the response before tts_bos is sampled.
+        # Keep its pending input until the first content token in either case.
         if (
             sampled == tts_bos_id
-            and getattr(state, "current_turn_ended", True)
+            and (getattr(state, "current_turn_ended", True) or getattr(state, "pending_speech_response_open", False))
             and getattr(state, "pending_speech_context", False)
         ):
             with suppress(Exception):

@@ -1048,9 +1048,9 @@ class DiffusionWorker:
             try:
                 offload_backend = getattr(model_runner, "offload_backend", None)
                 if offload_backend is not None:
-                    offload_backend.disable()
+                    offload_backend.shutdown()
             except Exception:
-                logger.exception("Failed to disable diffusion offload backend during shutdown")
+                logger.exception("Failed to shut down diffusion offload backend during shutdown")
             try:
                 if mgr is not None:
                     mgr.close()
