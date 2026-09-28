@@ -27,12 +27,24 @@ from torch import nn
 
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import (
     MiniCPMO45OmniTTSForConditionalGeneration,
+    _codec_int_param,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 _NUM_AUDIO_TOKENS = 6562
 _EOS_ID = _NUM_AUDIO_TOKENS - 1
+
+
+class _FakeStageParams:
+    """Stands in for a real pydantic ``SamplingParams``: like pydantic v2 it
+    records the explicitly-set fields in ``model_fields_set``, which the
+    request merge reads to tell "absent" apart from "explicitly set to 0"."""
+
+    def __init__(self, **kwargs):
+        self.model_fields_set = set(kwargs)
+        for key, value in kwargs.items():
+            setattr(self, key, value)
 
 
 def _make_talker(*, k_step_frames: int, scripted_samples: list[int]):
@@ -647,7 +659,9 @@ def test_request_min_tokens_reaches_codec_state():
     The NPU runner neutralizes vLLM's MinTokensLogitsProcessor, so the
     in-model codec sampler is the only min-length guard left (PR #7929
     review). The engine default 0 means "no extra floor" and must not
-    overwrite the stage-resolved codec minimum.
+    overwrite the stage-resolved codec minimum -- but an explicit
+    request-level 0 disables the floor, matching the single-frame path
+    where MinTokensLogitsProcessor.add_request skips ``min_tokens=0``.
     """
     model = _make_talker(k_step_frames=8, scripted_samples=[42])
     model._codec_min_tokens = 50
@@ -657,16 +671,79 @@ def test_request_min_tokens_reaches_codec_state():
     model._merge_request_codec_params(state, SimpleNamespace(min_tokens=100, **base))
     assert state["min_tokens"] == 100
 
-    # 0 (engine default) is not a floor: the key stays unset so the K-step
-    # loop keeps falling back to the stage-resolved minimum.
+    # 0 without pydantic bookkeeping (the engine default flowing through a
+    # stub) is not a floor: the key stays unset so the K-step loop keeps
+    # falling back to the stage-resolved minimum.
     state_zero = {"step": 0}
     model._merge_request_codec_params(state_zero, SimpleNamespace(min_tokens=0, **base))
     assert "min_tokens" not in state_zero
+
+    # An explicitly set 0 (recorded in model_fields_set, as a real pydantic
+    # SamplingParams would carry after a caller override) pins 0 and turns
+    # the floor off, mirroring the single-frame semantics.
+    state_explicit = {"step": 0}
+    model._merge_request_codec_params(state_explicit, _FakeStageParams(min_tokens=0, **base))
+    assert state_explicit["min_tokens"] == 0
+    assert _codec_int_param(state_explicit, "min_tokens", 50) == 0
 
     # The min_new_tokens alias is honored too.
     state_alias = {"step": 0}
     model._merge_request_codec_params(state_alias, SimpleNamespace(min_new_tokens=7, **base))
     assert state_alias["min_tokens"] == 7
+
+
+def test_control_stop_ids_stay_out_of_codec_censor_set():
+    """The scheduler's control-head ids never join the codec censor set.
+
+    Under multi-frame decode the default NPU K=8 profile merges the request
+    list to [1, 6561]: 1 finishes the request on the two-wide continue/stop
+    control row, 6561 is the codec EOS. Inside the 6562-wide codec
+    vocabulary 1 is an ordinary audio code -- censoring it would skew the
+    below-floor distribution and truncate real speech once sampled. The
+    single-frame path (no stop_token_ids: [1] block) never carries it.
+    """
+    model = _make_talker(k_step_frames=8, scripted_samples=[1, 42, _EOS_ID])
+    model._codec_min_tokens = 50
+
+    # The merge drops the control ids and keeps the codec-side stop ids.
+    state = {"step": 0}
+    model._merge_request_codec_params(state, SimpleNamespace(stop_token_ids=[1, 6561], min_tokens=50))
+    assert state["codec_stop_token_ids"] == [6561]
+
+    # The drop is gated on the multi-frame arm: a non-armed deployment keeps
+    # the legacy verbatim copy (the control-row contract does not apply).
+    model_legacy = _make_talker(k_step_frames=1, scripted_samples=[1])
+    state_legacy = {"step": 0}
+    model_legacy._merge_request_codec_params(state_legacy, SimpleNamespace(stop_token_ids=[1, 6561], min_tokens=50))
+    assert state_legacy["codec_stop_token_ids"] == [1, 6561]
+
+    # End to end across the sampling boundary: a codec 1 sampled past the
+    # floor is emitted as ordinary audio and does not finish the request;
+    # a later codec EOS still terminates it normally.
+    state_stream = {"step": 0}
+    model._request_audio_states["r1"] = state_stream
+    params = SimpleNamespace(stop_token_ids=[1, 6561], min_tokens=50)
+
+    def _frame():
+        return model.make_omni_output(
+            torch.randn(1, 8),
+            model_intermediate_buffer=[{"request_id": "r1"}],
+            request_token_spans=[(0, 1)],
+            request_sample_eligible=[True],
+            request_sampling_params=[params],
+        )
+
+    out0 = _frame()
+    assert out0.multimodal_outputs["codes"]["audio"][0].reshape(-1).tolist() == [1]
+    assert not state_stream.get("finished")
+
+    out1 = _frame()
+    assert out1.multimodal_outputs["codes"]["audio"][0].reshape(-1).tolist() == [42]
+    assert not state_stream.get("finished")
+
+    out2 = _frame()
+    assert out2.multimodal_outputs["codes"]["audio"][0].numel() == 0
+    assert state_stream["finished"] is True
 
 
 def test_top_k_then_top_p_matches_single_frame_order():

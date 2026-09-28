@@ -61,6 +61,13 @@ _CODEC_TOP_P = 0.85
 _CODEC_REPETITION_PENALTY = 1.05
 _CODEC_MIN_TOKENS = 50
 _CODEC_MAX_TOKENS = 2048
+# The Talker's two-wide stop head emits continue/stop control rows under
+# multi-frame decode: 0=continue, 1=stop. Those ids belong to the
+# scheduler's control channel, not the 6562-wide codec stream, where both
+# values are ordinary audio codes. The engine needs the stop id inside the
+# request's stop_token_ids to finish the request on a control row; the
+# codec censor set must not inherit it.
+_SCHEDULER_CONTROL_STOP_IDS = (0, 1)
 # YAML key -> (tts_config attribute, hardcoded fallback, type)
 _CODEC_SAMPLING_SOURCES: tuple[tuple[str, str, Any, Any], ...] = (
     ("seed", "seed", _CODEC_SEED, int),
@@ -1326,7 +1333,22 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         if state.get("codec_stop_token_ids") is None:
             requested_stop_ids = getattr(sampling_params, "stop_token_ids", None)
             if requested_stop_ids:
-                state["codec_stop_token_ids"] = [int(token_id) for token_id in requested_stop_ids]
+                stop_ids = [int(token_id) for token_id in requested_stop_ids]
+                if self._k_step_frames >= 2:
+                    # Under multi-frame decode the merged request list mixes
+                    # two channels: the two-wide control head's stop id (the
+                    # yaml platforms.npu stop_token_ids block, which the
+                    # scheduler needs to finish the request on a control row)
+                    # and ids acting on the codec stream itself (the merged
+                    # codec EOS 6561). In the 6562-wide codec vocabulary the
+                    # control ids are ordinary audio codes, so censoring them
+                    # would skew the below-floor distribution and truncate
+                    # real speech once sampled; single-frame deployments
+                    # never carry them. Drop them from the codec set only --
+                    # the engine-side list stays untouched.
+                    stop_ids = [token_id for token_id in stop_ids if token_id not in _SCHEDULER_CONTROL_STOP_IDS]
+                if stop_ids:
+                    state["codec_stop_token_ids"] = stop_ids
         # repetition_detection is a whole-stream pattern test
         # (v1/core/sched/utils.py:28-59), so its record has to keep every
         # emitted codec id. Started here, appended per frame below.
@@ -1337,15 +1359,26 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 state.setdefault("codec_full_ids", [])
         # The K-step codec sampler is the only min-length guard left (the NPU
         # runner neutralizes vLLM's MinTokensLogitsProcessor), so the request
-        # floor must reach it. Pin only a positive floor: the engine default 0
-        # means "no extra floor" and would otherwise overwrite the stage's
-        # resolved codec minimum.
+        # floor must reach it. The merged stage params always carry the stage
+        # defaults, and the engine's own registration treats a zero min_tokens
+        # as "no floor" (MinTokensLogitsProcessor.add_request: ``if not
+        # min_tokens``), so a 0 in a merged param object can only be an
+        # explicit caller override -- which the single-frame path honours by
+        # disabling the floor. Distinguish "absent" from "explicitly set to
+        # 0" through pydantic's model_fields_set (kept across clone(), a
+        # deepcopy); a positive value needs no marker, and stub objects
+        # without the bookkeeping keep the old positive-only rule.
         if state.get("min_tokens") is None:
+            attr = "min_tokens"
             requested = getattr(sampling_params, "min_tokens", None)
             if requested is None:
+                attr = "min_new_tokens"
                 requested = getattr(sampling_params, "min_new_tokens", None)
-            if requested is not None and int(requested) > 0:
-                state["min_tokens"] = int(requested)
+            if requested is not None:
+                value = int(requested)
+                fields_set = getattr(sampling_params, "model_fields_set", None)
+                if value > 0 or (fields_set is not None and attr in fields_set):
+                    state["min_tokens"] = value
         # The request's remaining output budget caps this segment's frame
         # ceiling: the scheduler truncates the sampled ids at the request limit
         # while the connector concatenates every emitted codec frame, so the
