@@ -3,15 +3,18 @@
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import math
 import time
 from collections.abc import Awaitable, Callable, Mapping
+from concurrent.futures import Future as ConcurrentFuture
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from functools import cached_property
 from http import HTTPStatus
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 import pybase64 as base64
 from fastapi import HTTPException
@@ -51,7 +54,9 @@ from vllm_omni.outputs.output_metadata import (
 
 logger = init_logger(__name__)
 
+_VideoResponseEncodingResult = TypeVar("_VideoResponseEncodingResult")
 _VIDEO_RESPONSE_FRAME_CONVERSION_WORKERS = 8
+_VIDEO_RESPONSE_MAX_ACTIVE_ENCODINGS = 1
 
 
 def _config_value(config: Any, key: str, default: Any = None) -> Any:
@@ -171,6 +176,16 @@ class OmniOpenAIServingVideo:
             "Video response frame conversion pool configured: workers=%d",
             self._video_frame_converter.max_workers,
         )
+        self._video_response_encoding_executor: ThreadPoolExecutor | None = ThreadPoolExecutor(
+            max_workers=_VIDEO_RESPONSE_MAX_ACTIVE_ENCODINGS,
+            thread_name_prefix="video-response-encoding",
+        )
+        self._video_response_encoding_gate = asyncio.Semaphore(_VIDEO_RESPONSE_MAX_ACTIVE_ENCODINGS)
+        logger.info(
+            "Video response encoding configured: execution=dedicated_executor "
+            "scope=non_streaming_mp4 paths=raw_mp4,base64_handler max_active_encodes=%d",
+            _VIDEO_RESPONSE_MAX_ACTIVE_ENCODINGS,
+        )
 
     def _resolve_diffusion_od_config(self) -> OmniDiffusionConfig | SimpleNamespace | None:
         get_od_config = getattr(self._engine_client, "get_diffusion_od_config", None)
@@ -213,6 +228,33 @@ class OmniOpenAIServingVideo:
     def set_stage_configs_if_missing(self, stage_configs: list[Any] | None) -> None:
         if self._stage_configs is None and stage_configs is not None:
             self._stage_configs = stage_configs
+
+    async def _run_video_response_encoding(
+        self,
+        closure: Callable[[], _VideoResponseEncodingResult],
+    ) -> tuple[_VideoResponseEncodingResult, float]:
+        """Run one complete non-streaming response encode off the event loop."""
+        started_at = time.perf_counter()
+        await self._video_response_encoding_gate.acquire()
+        loop = asyncio.get_running_loop()
+        executor = self._video_response_encoding_executor
+        if executor is None:
+            self._video_response_encoding_gate.release()
+            raise RuntimeError("Video response encoding executor has been shut down.")
+        try:
+            native_future = executor.submit(closure)
+        except RuntimeError:
+            self._video_response_encoding_gate.release()
+            raise
+
+        def release_slot(_: ConcurrentFuture[_VideoResponseEncodingResult]) -> None:
+            loop.call_soon_threadsafe(self._video_response_encoding_gate.release)
+
+        native_future.add_done_callback(release_slot)
+        wrapped_future = asyncio.wrap_future(native_future, loop=loop)
+        result = cast(_VideoResponseEncodingResult, await wrapped_future)
+        elapsed_ms = (time.perf_counter() - started_at) * 1000
+        return result, elapsed_ms
 
     @cached_property
     def preserves_reference_image_size(self) -> bool:
@@ -273,6 +315,11 @@ class OmniOpenAIServingVideo:
         )
 
     def shutdown(self) -> None:
+        """Stop new response encodes and join the dedicated encoding thread."""
+        executor = self._video_response_encoding_executor
+        self._video_response_encoding_executor = None
+        if executor is not None:
+            executor.shutdown(wait=True, cancel_futures=True)
         self._video_frame_converter.shutdown()
 
     async def abort_request(self, request_id: str) -> None:
@@ -535,28 +582,59 @@ class OmniOpenAIServingVideo:
             if "video_codec_options" in request.extra_params:
                 video_codec_options = request.extra_params["video_codec_options"]
 
-        def encode_video_result(idx: int, video: Any) -> str:
-            if isinstance(video, bytes):
-                return base64.b64encode(video).decode("utf-8")
-            return encode_video_base64(
-                video,
-                fps=artifacts.output_fps,
-                audio=artifacts.audios[idx],
-                audio_sample_rate=artifacts.audio_sample_rate,
-                video_codec_options=video_codec_options,
-                frame_converter=self._video_frame_converter,
-            )
+        def is_preencoded(video: Any) -> bool:
+            return isinstance(video, (bytes, bytearray, memoryview))
 
-        _t_encode_start = time.perf_counter()
-        video_data = [
-            VideoData(
-                b64_json=encode_video_result(idx, video),
+        def make_preencoded_video_data(idx: int, video: Any) -> VideoData:
+            return VideoData(
+                b64_json=base64.b64encode(bytes(video)).decode("utf-8"),
                 action=artifacts.actions[idx],
             )
-            for idx, video in enumerate(artifacts.videos)
-        ]
-        _t_encode_ms = (time.perf_counter() - _t_encode_start) * 1000
-        logger.info("Video response encoding (MP4+base64): %.2f ms", _t_encode_ms)
+
+        def encode_raw_video(idx: int, video: Any) -> VideoData:
+            if artifacts.audios[idx] is None:
+                b64_json = encode_video_base64(
+                    video,
+                    fps=artifacts.output_fps,
+                    video_codec_options=video_codec_options,
+                    frame_converter=self._video_frame_converter,
+                )
+            else:
+                b64_json = encode_video_base64(
+                    video,
+                    fps=artifacts.output_fps,
+                    audio=artifacts.audios[idx],
+                    audio_sample_rate=artifacts.audio_sample_rate,
+                    video_codec_options=video_codec_options,
+                    frame_converter=self._video_frame_converter,
+                )
+            return VideoData(b64_json=b64_json, action=artifacts.actions[idx])
+
+        raw_items = [(idx, video) for idx, video in enumerate(artifacts.videos) if not is_preencoded(video)]
+        if not raw_items:
+            started_at = time.perf_counter()
+            video_data = [make_preencoded_video_data(idx, video) for idx, video in enumerate(artifacts.videos)]
+            elapsed_ms = (time.perf_counter() - started_at) * 1000
+            logger.info("Video response received pre-encoded MP4 bytes for base64 response: %.2f ms", elapsed_ms)
+        else:
+            encoded_data: list[VideoData | None] = [None] * len(artifacts.videos)
+            for idx, video in enumerate(artifacts.videos):
+                if is_preencoded(video):
+                    encoded_data[idx] = make_preencoded_video_data(idx, video)
+
+            def encode_video_batch() -> list[tuple[int, VideoData]]:
+                return [(idx, encode_raw_video(idx, video)) for idx, video in raw_items]
+
+            encoded_items, encode_ms = await self._run_video_response_encoding(encode_video_batch)
+            for idx, video_data_item in encoded_items:
+                encoded_data[idx] = video_data_item
+            video_data = cast(list[VideoData], encoded_data)
+            logger.info(
+                "Video response encoding (MP4+base64): %.2f ms "
+                "queue_inclusive=true execution=dedicated_executor max_active_encodes=%d",
+                encode_ms,
+                _VIDEO_RESPONSE_MAX_ACTIVE_ENCODINGS,
+            )
         return VideoGenerationResponse(
             created=int(time.time()),
             data=video_data,
@@ -604,11 +682,20 @@ class OmniOpenAIServingVideo:
             logger.info("Action-only video request %s completed; skipping MP4 encoding.", reference_id)
             return b"", artifacts.stage_durations, artifacts.peak_memory_mb, action, video_metadata
 
-        _t_encode_start = time.perf_counter()
-        if isinstance(artifacts.videos[0], bytes):
-            video_bytes = artifacts.videos[0]
-            _t_encode_ms = (time.perf_counter() - _t_encode_start) * 1000
-            logger.info("Video response received pre-encoded MP4 bytes: %.2f ms", _t_encode_ms)
+        def encode_video() -> bytes:
+            return _encode_video_bytes(
+                artifacts.videos[0],
+                fps=artifacts.output_fps,
+                **({"audio": audio, "audio_sample_rate": artifacts.audio_sample_rate} if audio is not None else {}),
+                video_codec_options=video_codec_options,
+                frame_converter=self._video_frame_converter,
+            )
+
+        if isinstance(artifacts.videos[0], (bytes, bytearray, memoryview)):
+            started_at = time.perf_counter()
+            video_bytes = bytes(artifacts.videos[0])
+            elapsed_ms = (time.perf_counter() - started_at) * 1000
+            logger.info("Video response received pre-encoded MP4 bytes: %.2f ms", elapsed_ms)
             return (
                 video_bytes,
                 artifacts.stage_durations,
@@ -616,15 +703,13 @@ class OmniOpenAIServingVideo:
                 artifacts.actions[0],
                 video_metadata,
             )
-        video_bytes = _encode_video_bytes(
-            artifacts.videos[0],
-            fps=artifacts.output_fps,
-            **({"audio": audio, "audio_sample_rate": artifacts.audio_sample_rate} if audio is not None else {}),
-            video_codec_options=video_codec_options,
-            frame_converter=self._video_frame_converter,
+        video_bytes, encode_ms = await self._run_video_response_encoding(encode_video)
+        logger.info(
+            "Video response encoding (MP4 bytes): %.2f ms "
+            "queue_inclusive=true execution=dedicated_executor max_active_encodes=%d",
+            encode_ms,
+            _VIDEO_RESPONSE_MAX_ACTIVE_ENCODINGS,
         )
-        _t_encode_ms = (time.perf_counter() - _t_encode_start) * 1000
-        logger.info("Video response encoding (MP4 bytes): %.2f ms", _t_encode_ms)
         return video_bytes, artifacts.stage_durations, artifacts.peak_memory_mb, artifacts.actions[0], video_metadata
 
     @staticmethod
