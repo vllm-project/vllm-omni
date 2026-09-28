@@ -763,7 +763,27 @@ class OmniSchedulerMixin:
 
     def _reject_invalid_grammar_tokens(self, request: Request, new_token_ids: list[int]) -> bool:
         """Mark rejected tokens terminal before callers capture the finish reason."""
-        if not new_token_ids or self.structured_output_manager.accept_tokens(request, new_token_ids):
+        if not new_token_ids:
+            return False
+        # vllm 0.30 put the whole accept flow on the manager (``accept_tokens``);
+        # on the 0.29 line it still lives inside the scheduler's own
+        # ``update_from_output``, which this class overrides -- so replay that
+        # flow here instead of losing the grammar advance entirely.
+        manager = self.structured_output_manager
+        accept_tokens = getattr(manager, "accept_tokens", None)
+        if accept_tokens is not None:
+            accepted = accept_tokens(request, new_token_ids)
+        else:
+            accepted = True
+            if manager.should_advance(request, new_token_ids=new_token_ids):
+                structured_req = getattr(request, "structured_output_request", None)
+                grammar = getattr(structured_req, "grammar", None)
+                if grammar is not None:
+                    advance_token_ids = manager.trim_reasoning_for_advance(request, new_token_ids)
+                    accepted = not advance_token_ids or bool(
+                        grammar.accept_tokens(request.request_id, advance_token_ids)
+                    )
+        if accepted:
             return False
         logger.error(
             "Unexpected: grammar rejected tokens %s for request %s. Terminating request.",

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import inspect
 from contextlib import AbstractContextManager
 from functools import partial
 from typing import Any
@@ -41,8 +42,15 @@ class OmniNPUModelRunner(OmniGPUModelRunner, NPUModelRunner):
         self, kv_cache_config, kv_cache_allocation_context: AbstractContextManager | None = None
     ) -> None:
         """Stage the omni prefix-cache config (hidden / mm tensors reused on hits)."""
+        # vllm-ascend's override only grew the ``kv_cache_allocation_context``
+        # parameter on the 0.30 line; probe the signature so one omni build
+        # drives both the 0.29 and the 0.30 vllm-ascend.
+        params = inspect.signature(NPUModelRunner.initialize_kv_cache).parameters
+        accepts_ctx = "kv_cache_allocation_context" in params
         NPUModelRunner.initialize_kv_cache(
-            self, kv_cache_config, kv_cache_allocation_context=kv_cache_allocation_context
+            self,
+            kv_cache_config,
+            **({"kv_cache_allocation_context": kv_cache_allocation_context} if accepts_ctx else {}),
         )
         if getattr(self, "_omni_prefix_cache_cfg", None) is None:
             # Same gate as the GPU runner (pooling stage, kv_consumer /
