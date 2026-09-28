@@ -43,10 +43,12 @@ distilled Turbo and Edit-Turbo checkpoints run the four-step DMD path through
 
 ## Hardware Support
 
-This recipe documents supported configurations for CUDA GPU serving. The native
-pipeline supports single-GPU inference and classifier-free-guidance (CFG)
-parallelism. CPU offload, cache acceleration, and other multi-GPU dimensions
-remain unsupported (see Notes).
+This recipe documents supported configurations for CUDA GPU serving and, for
+the distilled Turbo checkpoint only, single-card Ascend NPU (Atlas A2 /
+910B3); see [Ascend NPU](#ascend-npu). The native pipeline supports
+single-GPU inference and classifier-free-guidance (CFG) parallelism. CPU
+offload, cache acceleration, and other multi-GPU dimensions remain
+unsupported (see Notes).
 
 ## GPU
 
@@ -262,6 +264,49 @@ curl -X POST http://localhost:8091/v1/images/edits \
   -F seed=42 \
   | jq -r '.data[0].b64_json' | base64 -d > edited_fp8.png
 ```
+
+## Ascend NPU
+
+### 1 x Atlas 910B3 (Single NPU, 64 GB HBM)
+
+Verified with `quay.io/ascend/vllm-omni:v0.28.0` (vLLM 0.29.0 + vllm-ascend)
+on vLLM-Omni `fa422a3f4`, which contains the Ascend real-valued RoPE for
+Boogu (PR #6571).
+
+#### Command
+
+```bash
+ASCEND_RT_VISIBLE_DEVICES=0 vllm serve Boogu/Boogu-Image-0.1-Turbo --omni --port 8091
+```
+
+#### Verification
+
+Turbo rejects any `guidance_scale` other than `1.0`; do not reuse the Base
+GPU example above. The four-step DMD path serves this `1024x1024` request in
+roughly 2.8 s (client-observed HTTP 200; first request after server startup,
+no warmup):
+
+```bash
+curl -X POST http://localhost:8091/v1/images/generations \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Boogu/Boogu-Image-0.1-Turbo",
+    "prompt": "A mountain lake at sunset, photorealistic, cinematic lighting",
+    "size": "1024x1024",
+    "seed": 42
+  }' | jq -r '.data[0].b64_json' | base64 -d > output-turbo-npu.png
+```
+
+No NPU-specific flags are required: the attention backend resolves to the
+NPU platform default (`FLASH_ATTN`) and `torch.compile` is skipped on NPU
+(expected).
+
+#### Notes
+
+- Verified for the Turbo checkpoint only; Base and Edit share the same
+  transformer code path but their scheduler-driven serving is unvalidated
+  on NPU.
+- CPU offload, Cache-DiT, and multi-GPU parallelism are not validated on NPU.
 
 ## Fast text-to-image (Boogu-Image-0.1-Turbo)
 
