@@ -27,16 +27,22 @@ from vllm_omni.model_executor.models.cosyvoice3.flow_estimator_trt import (
 from vllm_omni.platforms import current_omni_platform
 
 
-def _make_inputs(batch: int, length: int, seed: int, device: torch.device) -> dict[str, torch.Tensor]:
+def _make_inputs(
+    batch: int,
+    length: int,
+    seed: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> dict[str, torch.Tensor]:
     generator = torch.Generator(device=device)
     generator.manual_seed(seed)
     return {
-        "x": 0.1 * torch.randn(batch, 80, length, device=device, dtype=torch.float16, generator=generator),
-        "mask": torch.ones(batch, 1, length, device=device, dtype=torch.float16),
-        "mu": 0.1 * torch.randn(batch, 80, length, device=device, dtype=torch.float16, generator=generator),
-        "t": torch.rand(batch, device=device, dtype=torch.float16, generator=generator),
-        "spks": 0.1 * torch.randn(batch, 80, device=device, dtype=torch.float16, generator=generator),
-        "cond": 0.1 * torch.randn(batch, 80, length, device=device, dtype=torch.float16, generator=generator),
+        "x": 0.1 * torch.randn(batch, 80, length, device=device, dtype=dtype, generator=generator),
+        "mask": torch.ones(batch, 1, length, device=device, dtype=dtype),
+        "mu": 0.1 * torch.randn(batch, 80, length, device=device, dtype=dtype, generator=generator),
+        "t": torch.rand(batch, device=device, dtype=dtype, generator=generator),
+        "spks": 0.1 * torch.randn(batch, 80, device=device, dtype=dtype, generator=generator),
+        "cond": 0.1 * torch.randn(batch, 80, length, device=device, dtype=dtype, generator=generator),
     }
 
 
@@ -46,6 +52,9 @@ def _select_rows(inputs: dict[str, torch.Tensor], rows: list[int]) -> dict[str, 
 
 
 def _run_estimator(wrapper: TrtContextWrapper, inputs: dict[str, torch.Tensor]) -> torch.Tensor:
+    for name, tensor in inputs.items():
+        if tensor.dtype != wrapper.io_dtype:
+            raise TypeError(f"{name} has dtype {tensor.dtype}, but TensorRT engine I/O uses {wrapper.io_dtype}")
     batch_size = int(inputs["x"].shape[0])
     [context, stream], engine = wrapper.acquire_estimator(batch_size)
     caller_stream = torch.cuda.current_stream(inputs["x"].device)
@@ -180,6 +189,7 @@ def run_case(
         length,
         seed=20260918 + requests * 1000 + length,
         device=device,
+        dtype=wrapper.io_dtype,
     )
     # Pre-split the serial baseline before timing. In production the pre-batching
     # baseline already owns separate per-request tensors, so charging index_select
@@ -248,11 +258,17 @@ def run_single_request_regression(
     device: torch.device,
 ) -> dict[str, float | int | bool | list[float]]:
     """Compare dual-profile CFG2 against the legacy fixed-batch engine."""
+    if dynamic_wrapper.io_dtype != static_wrapper.io_dtype:
+        raise ValueError(
+            "dynamic and static TensorRT engines must use the same I/O dtype "
+            f"({dynamic_wrapper.io_dtype} != {static_wrapper.io_dtype})"
+        )
     inputs = _make_inputs(
         2,
         length,
         seed=20260920 + length,
         device=device,
+        dtype=dynamic_wrapper.io_dtype,
     )
 
     def dynamic_call():
@@ -388,6 +404,7 @@ def main() -> None:
         "cuda": torch.version.cuda,
         "tensorrt": trt.__version__,
         "onnx_path": str(args.onnx_path),
+        "io_dtype": str(wrapper.io_dtype),
         "max_cfg_batch": max_cfg_batch,
         "warmup": args.warmup,
         "repeats": args.repeats,

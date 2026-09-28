@@ -8,6 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
+import torch
 
 from vllm_omni.model_executor.models.cosyvoice3 import flow_estimator_trt
 
@@ -381,6 +382,13 @@ def _fake_tensorrt_module(engine):
 
 
 @pytest.mark.parametrize(
+    ("onnx_name", "expected_dtype"),
+    [
+        ("model.fp16.onnx", torch.float16),
+        ("model.onnx", torch.float32),
+    ],
+)
+@pytest.mark.parametrize(
     ("max_cfg_batch", "expected_prefix", "dynamic_profiles"),
     [
         (None, "flow_estimator", False),
@@ -397,6 +405,8 @@ def _fake_tensorrt_module(engine):
 def test_build_flow_estimator_uses_one_mode_specific_plan(
     tmp_path,
     monkeypatch,
+    onnx_name,
+    expected_dtype,
     max_cfg_batch,
     expected_prefix,
     dynamic_profiles,
@@ -416,13 +426,14 @@ def test_build_flow_estimator_uses_one_mode_specific_plan(
     monkeypatch.setattr(flow_estimator_trt.torch.cuda, "Stream", lambda device: object())
 
     wrapper = flow_estimator_trt.build_flow_estimator_trt(
-        str(tmp_path / "model.fp16.onnx"),
+        str(tmp_path / onnx_name),
         device="cuda:0",
         max_cfg_batch=max_cfg_batch,
     )
 
     assert prefixes == [expected_prefix]
     assert wrapper.trt_engine is engine
+    assert wrapper.io_dtype == expected_dtype
     assert wrapper._dynamic_profiles is dynamic_profiles
 
 
