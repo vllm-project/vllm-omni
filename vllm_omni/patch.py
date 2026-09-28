@@ -661,7 +661,10 @@ def release_cumem_allocations_for_shutdown(allocator) -> int:
 def _patch_cumem_free_callback_cuda() -> None:
     try:
         from vllm.device_allocator import cumem as cumem_module
-        from vllm.device_allocator.cumem import CuMemAllocator
+        from vllm.device_allocator.cumem import CuMemAllocator, cumem_available
+
+        if not cumem_available:
+            return
     except ImportError:
         _PATCH_LOGGER.debug("[cumem-cuda] CuMemAllocator not available; skipping patch")
         return
@@ -708,8 +711,43 @@ def _patch_cumem_free_callback_cuda() -> None:
     _PATCH_LOGGER.info("[cumem-cuda] CuMemAllocator free path patched: swept and asleep blocks are released safely.")
 
 
-_patch_cumem_free_callback_cuda()
+def _patch_xpumem_free_callback_xpu() -> None:
+    try:
+        from vllm.device_allocator.xpumem import XpuMemAllocator
+    except ImportError:
+        _PATCH_LOGGER.debug("[xpumem-xpu] XpuMemAllocator not available; skipping patch")
+        return
 
+    _original_free_callback = XpuMemAllocator._python_free_callback
+
+    if getattr(_original_free_callback, "_omni_xpumem_xpu_patched", False):
+        return
+
+    def _patched_free_callback(self, ptr: int) -> tuple:
+        data = self.pointer_to_data.pop(ptr)
+        if data.cpu_backup_tensor is not None:
+            data.cpu_backup_tensor = None
+        if data.is_asleep:
+            device, size, d_mem, _ = data.handle
+            result = (device, size, d_mem, [])
+            _PATCH_LOGGER.debug(
+                "[xpumem-xpu] Free callback: asleep entry %s -> empty handle",
+                ptr,
+            )
+            return result
+        # Drain pending kernels before the C extension's xpuMemUnmap.
+        torch.accelerator.synchronize(data.handle[0])
+        return data.handle
+
+    _patched_free_callback._omni_xpumem_xpu_patched = True
+    XpuMemAllocator._python_free_callback = _patched_free_callback
+    _PATCH_LOGGER.info(
+        "[xpumem-xpu] XpuMemAllocator._python_free_callback patched: asleep guard extended to intel GPU platforms."
+    )
+
+
+_patch_cumem_free_callback_cuda()
+_patch_xpumem_free_callback_xpu()
 
 def _patch_batched_seeded_random_sample() -> None:
     """Draw per-request seeded sampling noise in one launch.
