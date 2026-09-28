@@ -1,0 +1,759 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+"""SenseNova-U1 pipeline autoregressive decode, driven one step at a time.
+
+The think and text loops move onto the runner as a resumable prepare phase, so
+each loop has to produce the same tokens whether it runs to completion in one
+call or is left and resumed between any two steps.
+"""
+
+from __future__ import annotations
+
+from contextlib import contextmanager, nullcontext
+from types import SimpleNamespace
+
+import pytest
+import torch
+
+from tests.helpers.mark import hardware_test
+from vllm_omni.diffusion.models.interface import (
+    supports_resumable_prepare,
+    supports_step_execution,
+)
+from vllm_omni.diffusion.models.sensenova_u1.pipeline_sensenova_u1 import SenseNovaU1Pipeline
+from vllm_omni.diffusion.worker.utils import StepRequestState
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
+
+
+def _nullcontext(*args, **kwargs):
+    del args, kwargs
+    return nullcontext()
+
+
+@contextmanager
+def _noop_forward_context(*args, **kwargs):
+    del args, kwargs
+    yield
+
+
+EOS = 100
+THINK_END = 101
+VOCAB = 128
+APPEND_LEN = 3
+
+
+class _FakeTokenizer:
+    _IDS = {"<|im_end|>": EOS, "</think>": THINK_END}
+
+    def convert_tokens_to_ids(self, token: str) -> int:
+        return self._IDS[token]
+
+    def decode(self, ids, skip_special_tokens: bool = False) -> str:
+        return ",".join(str(int(i)) for i in ids)
+
+    def __call__(self, text, return_tensors=None, add_special_tokens=True):
+        del text, return_tensors, add_special_tokens
+        return {"input_ids": torch.zeros(1, APPEND_LEN, dtype=torch.long)}
+
+
+def _one_hot(token_id: int) -> torch.Tensor:
+    logits = torch.full((1, 1, VOCAB), -10.0)
+    logits[0, 0, token_id] = 10.0
+    return logits
+
+
+def _pipeline(successor: dict[int, int] | None = None, *, flat: bool = False) -> SenseNovaU1Pipeline:
+    """A pipeline whose decode step is a stateless token -> token map.
+
+    Statelessness is the point: two cursors interleaved through the same
+    pipeline must not be able to influence each other through it. With
+    ``flat``, every step returns a uniform distribution instead, so the tokens
+    depend only on the sampler.
+    """
+    # </think> is stepped through before the loop stops, and what that step
+    # returns is discarded, so the map only has to answer.
+    successor = {THINK_END: EOS, **(successor or {})}
+    pipe = object.__new__(SenseNovaU1Pipeline)
+    pipe.tokenizer = _FakeTokenizer()
+    pipe.device = torch.device("cpu")
+    pipe.ar_steps = []
+    pipe.append_calls = []
+
+    def _ar_step(next_token, t_idx, past_key_values, decode=None):
+        del decode
+        token = int(next_token)
+        pipe.ar_steps.append((token, t_idx, past_key_values))
+        logits = torch.zeros(1, 1, VOCAB) if flat else _one_hot(successor[token])
+        return SimpleNamespace(logits=logits, past_key_values=past_key_values)
+
+    def _decode_context(past_key_values):
+        del past_key_values
+        return None
+
+    def _append_text_tokens_to_cache(cache, t_idx, input_ids):
+        pipe.append_calls.append((cache, t_idx, int(input_ids.shape[1])))
+        return t_idx + int(input_ids.shape[1])
+
+    pipe._ar_step = _ar_step
+    pipe._decode_context = _decode_context
+    pipe._append_text_tokens_to_cache = _append_text_tokens_to_cache
+    return pipe
+
+
+def _think_cursor(pipe, first_token: int, cache: str = "kv", t_idx: int = 10, max_think_tokens: int = 1024):
+    prefix = SimpleNamespace(logits=_one_hot(first_token))
+    return pipe._begin_think(prefix, cache, t_idx, max_think_tokens=max_think_tokens)
+
+
+def _run_to_end(pipe, cursor, step) -> None:
+    while not cursor.finished:
+        step(cursor)
+
+
+class TestCapabilityDeclaration:
+    def test_pipeline_declares_both_capabilities(self):
+        pipe = object.__new__(SenseNovaU1Pipeline)
+        assert supports_step_execution(pipe) is True
+        assert supports_resumable_prepare(pipe) is True
+
+
+class TestDecodeOwnership:
+    """The decode buffers hold one sequence, so the decode phases serialize.
+
+    ``max_num_seqs > 1`` is allowed: a request whose prepare phase needs the
+    buffers while another one is mid-decode keeps its whole phase queued, and
+    the requests past their prepare phase batch their denoise waves.
+    """
+
+    def test_the_buffers_are_exclusive_while_a_cursor_is_live(self):
+        pipe = _text_pipeline({1: 2, 2: EOS}, first_token=1)
+        holder = _text_state("req-a")
+        other = _text_state("req-b")
+
+        pipe.prepare_encode(holder)
+        assert pipe._acquire_ar_decode(holder) is True, "the owner re-acquires freely"
+        assert pipe._acquire_ar_decode(other) is False, "a second request must not take the buffers"
+
+    def test_a_second_decode_request_queues_until_the_first_finishes(self):
+        pipe = _text_pipeline({1: 2, 2: EOS}, first_token=1)
+        first = _text_state("req-a")
+        second = _text_state("req-b")
+
+        pipe.prepare_encode(first)
+        pipe.prepare_encode(second)
+        assert pipe.prepare_steps_remaining(first) == 16
+        # Queued: the begin tick plus the whole token budget.
+        assert pipe.prepare_steps_remaining(second) == 1 + 16
+
+        # A queued prepare_step neither begins the request nor decodes.
+        prefill_calls = pipe.language_model.calls
+        pipe.prepare_step(second)
+        assert pipe.language_model.calls == prefill_calls
+        assert pipe.prepare_steps_remaining(second) == 1 + 16
+
+        # The first request finishes and frees the buffers...
+        while pipe.prepare_steps_remaining(first) is not None:
+            pipe.prepare_step(first)
+        assert pipe._acquire_ar_decode(second) is True
+
+        # ...so the next tick begins the queued request (prefill, no token)...
+        pipe.prepare_step(second)
+        assert pipe.language_model.calls == prefill_calls + 1
+        assert pipe.prepare_steps_remaining(second) == 16
+
+        # ...and the request then decodes to the same text as the first.
+        while pipe.prepare_steps_remaining(second) is not None:
+            pipe.prepare_step(second)
+        assert pipe.post_decode(second).output["payload"]["text"] == "1,2"
+
+    def test_the_owner_self_releases_when_its_state_is_dropped(self):
+        """An aborted request frees the buffers without a retirement callback."""
+        import gc
+
+        pipe = _text_pipeline({1: 2, 2: EOS}, first_token=1)
+        aborted = _text_state("req-a")
+
+        pipe.prepare_encode(aborted)
+        pipe.prepare_step(aborted)
+        owner_ref = pipe._ar_decode_owner
+        assert owner_ref is not None and owner_ref() is aborted
+
+        # The runner retires the request by forgetting its state; the weak
+        # reference notices without any callback having to run.
+        del aborted
+        gc.collect()
+        assert pipe._ar_decode_owner() is None
+
+        late = _text_state("req-b")
+        pipe.prepare_encode(late)
+        assert pipe.prepare_steps_remaining(late) == 16, "the late request began at once"
+
+    def test_a_queued_request_reports_the_budget_of_its_own_loop(self):
+        pipe = _text_pipeline({1: 2, 2: EOS}, first_token=1)
+        holder = _text_state("req-a")
+        short = _text_state("req-b")
+        short.sampling.extra_args["max_tokens"] = 5
+
+        pipe.prepare_encode(holder)
+        pipe.prepare_encode(short)
+        assert pipe.prepare_steps_remaining(short) == 1 + 5
+
+    def test_a_queued_think_request_begins_when_the_buffers_free_up(self):
+        pipe = _text_pipeline({1: 2, 2: THINK_END}, first_token=1)
+        schedule = SimpleNamespace(image_prediction=torch.zeros(1, 3, 8, 8), timesteps=torch.linspace(0, 1, 4))
+        pipe._init_noise_and_schedule = lambda p: schedule
+        prefix_calls = []
+
+        def _t2i_prefix(p, ns):
+            prefix_calls.append(p)
+            return SimpleNamespace(cursor=_think_cursor(pipe, first_token=1), past_kv_cond=None)
+
+        pipe._t2i_prefix = _t2i_prefix
+        pipe._t2i_caches = lambda p, ns, ctx: ({"cond": {}}, "thought")
+
+        holder = _text_state("req-a")
+        pipe.prepare_encode(holder)
+        pipe.prepare_step(holder)
+
+        queued = _text_state("req-b")
+        queued.prompt = {"prompt": "draw the sky", "modalities": ["image"]}
+        # Think mode is what makes an image request want the decode buffers.
+        queued.sampling.extra_args["think"] = True
+        pipe.prepare_encode(queued)
+        assert prefix_calls == [], "the queued request must not run its prefix"
+        assert pipe.prepare_steps_remaining(queued) == 1 + 1024
+
+        while pipe.prepare_steps_remaining(holder) is not None:
+            pipe.prepare_step(holder)
+        pipe.prepare_step(queued)
+        assert len(prefix_calls) == 1, "the begin ran the prefix exactly once"
+
+        while pipe.prepare_steps_remaining(queued) is not None:
+            pipe.prepare_step(queued)
+        assert pipe._STEP_KEY in queued.extra
+        assert queued.extra[pipe._STEP_KEY].think_text == "thought"
+
+    def test_requests_without_a_decode_never_queue(self):
+        """A non-thinking image request prepares fully behind a live decode."""
+        pipe = _text_pipeline({1: 2, 2: EOS}, first_token=1)
+        schedule = SimpleNamespace(image_prediction=torch.zeros(1, 3, 8, 8), timesteps=torch.linspace(0, 1, 4))
+        pipe._init_noise_and_schedule = lambda p: schedule
+        pipe._t2i_prefix = lambda p, ns: SimpleNamespace(cursor=None, past_kv_cond="kv")
+        pipe._t2i_caches = lambda p, ns, ctx: ({"cond": {}}, "")
+
+        holder = _text_state("req-a")
+        pipe.prepare_encode(holder)
+        pipe.prepare_step(holder)
+
+        image = _text_state("req-b")
+        image.prompt = {"prompt": "draw the sky", "modalities": ["image"]}
+        pipe.prepare_encode(image)
+
+        assert pipe.prepare_steps_remaining(image) is None, "ready to denoise at once"
+        assert image.extra[pipe._STEP_KEY].caches == {"cond": {}}
+
+
+class TestThinkStopRules:
+    def test_think_end_takes_one_more_step_and_is_emitted(self):
+        pipe = _pipeline({1: 2, 2: THINK_END})
+        cursor = _think_cursor(pipe, first_token=1)
+
+        _run_to_end(pipe, cursor, pipe._think_step)
+
+        assert cursor.tokens == [1, 2, THINK_END]
+        # Three decode steps: the two ordinary tokens and </think> itself.
+        assert [token for token, _, _ in pipe.ar_steps] == [1, 2, THINK_END]
+        assert cursor.t_idx == 13
+
+    def test_eos_stops_without_a_step_and_is_not_emitted(self):
+        pipe = _pipeline({1: 2, 2: EOS})
+        cursor = _think_cursor(pipe, first_token=1)
+
+        _run_to_end(pipe, cursor, pipe._think_step)
+
+        assert cursor.tokens == [1, 2]
+        assert [token for token, _, _ in pipe.ar_steps] == [1, 2]
+        assert cursor.t_idx == 12
+
+    def test_max_think_tokens_caps_a_loop_that_never_stops(self):
+        pipe = _pipeline({1: 1})
+        cursor = _think_cursor(pipe, first_token=1, max_think_tokens=5)
+
+        _run_to_end(pipe, cursor, pipe._think_step)
+
+        assert cursor.tokens == [1] * 5
+        assert cursor.done is False
+        assert cursor.finished is True
+
+    def test_finish_think_appends_the_image_marker_after_the_loop(self):
+        pipe = _pipeline({1: THINK_END})
+        cursor = _think_cursor(pipe, first_token=1, t_idx=10)
+
+        _run_to_end(pipe, cursor, pipe._think_step)
+        cache, t_idx, think_text = pipe._finish_think(cursor)
+
+        assert cache == "kv"
+        assert pipe.append_calls == [("kv", 12, APPEND_LEN)]
+        assert t_idx == 12 + APPEND_LEN
+        assert think_text == f"1,{THINK_END}"
+
+
+class TestInterleaving:
+    def test_two_think_cursors_interleave_to_the_same_tokens(self):
+        successor = {1: 2, 2: 3, 3: THINK_END, 11: 12, 12: EOS}
+        serial_a = _pipeline(successor)
+        cursor_a = _think_cursor(serial_a, first_token=1, cache="a")
+        _run_to_end(serial_a, cursor_a, serial_a._think_step)
+        serial_b = _pipeline(successor)
+        cursor_b = _think_cursor(serial_b, first_token=11, cache="b", t_idx=20)
+        _run_to_end(serial_b, cursor_b, serial_b._think_step)
+        assert cursor_a.tokens and cursor_b.tokens
+
+        shared = _pipeline(successor)
+        first = _think_cursor(shared, first_token=1, cache="a")
+        second = _think_cursor(shared, first_token=11, cache="b", t_idx=20)
+        while not (first.finished and second.finished):
+            if not first.finished:
+                shared._think_step(first)
+            if not second.finished:
+                shared._think_step(second)
+
+        assert first.tokens == cursor_a.tokens
+        assert second.tokens == cursor_b.tokens
+        assert first.t_idx == cursor_a.t_idx
+        assert second.t_idx == cursor_b.t_idx
+
+    def test_interleaved_cursors_keep_their_own_caches(self):
+        shared = _pipeline({1: 2, 2: EOS, 11: 12, 12: EOS})
+        first = _think_cursor(shared, first_token=1, cache="a")
+        second = _think_cursor(shared, first_token=11, cache="b", t_idx=20)
+
+        shared._think_step(first)
+        shared._think_step(second)
+
+        assert [cache for _, _, cache in shared.ar_steps] == ["a", "b"]
+
+
+class TestTextLoop:
+    def test_greedy_text_stops_on_eos_and_drops_it(self):
+        pipe = _pipeline({1: 2, 2: EOS})
+        cursor = pipe._begin_text(_one_hot(1), "kv", 10, max_tokens=64)
+
+        _run_to_end(pipe, cursor, pipe._text_step)
+
+        assert cursor.tokens == [1, 2]
+        assert pipe._finish_text(cursor) == "1,2"
+        assert cursor.t_idx == 12
+
+    def test_sampling_is_reproducible_from_the_request_seed(self):
+        # A flat distribution makes the draw depend only on the generator.
+        pipe = _pipeline(flat=True)
+        flat = torch.zeros(1, 1, VOCAB)
+
+        def _tokens(seed: int) -> list[int]:
+            cursor = pipe._begin_text(
+                flat,
+                "kv",
+                0,
+                max_tokens=4,
+                do_sample=True,
+                temperature=1.0,
+                seed=seed,
+            )
+            _run_to_end(pipe, cursor, pipe._text_step)
+            return list(cursor.tokens)
+
+        assert len(_tokens(7)) > 1
+        assert _tokens(7) == _tokens(7)
+        assert _tokens(7) != _tokens(9)
+
+    @staticmethod
+    def _sampled_tokens(pipe, logits, **kwargs) -> list[int]:
+        cursor = pipe._begin_text(logits, "kv", 0, max_tokens=4, do_sample=True, temperature=1.0, **kwargs)
+        _run_to_end(pipe, cursor, pipe._text_step)
+        return list(cursor.tokens)
+
+    def test_the_request_generator_drives_the_draw_on_the_logits_device(self):
+        pipe = _pipeline(flat=True)
+        flat = torch.zeros(1, 1, VOCAB)
+        from_request = self._sampled_tokens(pipe, flat, request_generator=torch.Generator().manual_seed(7))
+        assert from_request == self._sampled_tokens(pipe, flat, seed=7)
+
+    def test_a_generator_list_falls_back_to_the_request_seed(self):
+        pipe = _pipeline(flat=True)
+        flat = torch.zeros(1, 1, VOCAB)
+        tokens = self._sampled_tokens(pipe, flat, request_generator=[torch.Generator().manual_seed(1)], seed=7)
+        assert tokens == self._sampled_tokens(pipe, flat, seed=7)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+    @pytest.mark.cuda
+    @hardware_test(res={"cuda": "L4"}, num_cards=1)
+    def test_a_generator_on_another_device_is_replaced_by_one_on_the_logits_device(self):
+        # generator_device="cpu" gives the runner's generator a CPU device
+        # while the logits it samples from sit on the GPU.
+        pipe = _pipeline(flat=True)
+        flat = torch.zeros(1, 1, VOCAB, device="cuda")
+        cursor = pipe._begin_text(
+            flat,
+            "kv",
+            0,
+            max_tokens=4,
+            do_sample=True,
+            temperature=1.0,
+            seed=7,
+            request_generator=torch.Generator("cpu").manual_seed(7),
+        )
+        assert cursor.generator.device == flat.device
+        probs = torch.softmax(cursor.logits / cursor.temperature, dim=-1)
+        torch.multinomial(probs, num_samples=1, generator=cursor.generator)
+
+    def test_text_cursor_survives_being_left_between_tokens(self):
+        successor = {1: 2, 2: 3, 3: EOS}
+        serial = _pipeline(successor)
+        serial_cursor = serial._begin_text(_one_hot(1), "kv", 5, max_tokens=64)
+        _run_to_end(serial, serial_cursor, serial._text_step)
+
+        resumed = _pipeline(successor)
+        cursor = resumed._begin_text(_one_hot(1), "kv", 5, max_tokens=64)
+        other = _think_cursor(resumed, first_token=1, cache="other", t_idx=99)
+        while not cursor.finished:
+            resumed._text_step(cursor)
+            if not other.finished:
+                resumed._think_step(other)
+
+        assert cursor.tokens == serial_cursor.tokens
+        assert cursor.t_idx == serial_cursor.t_idx
+
+
+class _StubLanguageModel:
+    """Answers the prefill the text path makes, then the scripted decode."""
+
+    def __init__(self, successor: dict[int, int], first_token: int):
+        self.successor = successor
+        self.first_token = first_token
+        self.calls = 0
+
+    def __call__(self, **kwargs):
+        self.calls += 1
+        return SimpleNamespace(logits=_one_hot(self.first_token), past_key_values="prefill-kv")
+
+
+def _text_pipeline(successor: dict[int, int], first_token: int) -> SenseNovaU1Pipeline:
+    """A pipeline whose only stubs are the model and the paged decode context."""
+    pipe = _pipeline(successor)
+    pipe.language_model = _StubLanguageModel(successor, first_token)
+    pipe.patch_size = 16
+    pipe.merge_size = 2
+    pipe.od_config = SimpleNamespace(step_execution=True, max_num_seqs=1)
+    return pipe
+
+
+def _text_state(request_id: str = "req-1") -> StepRequestState:
+    sampling = OmniDiffusionSamplingParams(num_inference_steps=25, seed=42)
+    sampling.extra_args.update({"max_tokens": 16})
+    return StepRequestState(
+        request_id=request_id,
+        sampling=sampling,
+        prompt={"prompt": "describe the sky", "modalities": ["text"]},
+    )
+
+
+class TestPrepareProtocolOnTheRealPipeline:
+    """The protocol methods themselves, not the cursor they drive."""
+
+    def test_text_request_runs_its_whole_output_inside_prepare(self):
+        pipe = _text_pipeline({1: 2, 2: 3, 3: EOS}, first_token=1)
+        state = _text_state()
+
+        pipe.prepare_encode(state)
+
+        # A text request has no denoise schedule, which is what tells the runner
+        # to decode it as soon as prepare is done.
+        assert state.timesteps is None
+        assert state.total_steps == 0
+
+        steps = 0
+        while pipe.prepare_steps_remaining(state) is not None:
+            pipe.prepare_step(state)
+            steps += 1
+            assert steps <= 16, "prepare_steps_remaining never returned None"
+        # Three emitted tokens and one more step to observe the end token.
+        assert steps == 4
+
+        output = pipe.post_decode(state)
+        assert output.output["payload"]["text"] == "1,2,3"
+        assert pipe._STEP_KEY not in state.extra
+
+    def test_prepare_steps_remaining_falls_to_none_exactly_once(self):
+        pipe = _text_pipeline({1: EOS}, first_token=1)
+        state = _text_state()
+
+        pipe.prepare_encode(state)
+        assert pipe.prepare_steps_remaining(state) == 16
+
+        pipe.prepare_step(state)
+        assert pipe.prepare_steps_remaining(state) == 15
+
+        # The step that sees the end token is the one that ends the phase.
+        pipe.prepare_step(state)
+        assert pipe.prepare_steps_remaining(state) is None
+        # A further call is a no-op rather than an error, so a runner that asks
+        # twice in one tick cannot corrupt the request.
+        pipe.prepare_step(state)
+        assert pipe.prepare_steps_remaining(state) is None
+
+    def test_image_request_is_ready_to_denoise_when_think_is_off(self):
+        pipe = _text_pipeline({1: EOS}, first_token=1)
+        schedule = SimpleNamespace(image_prediction=torch.zeros(1, 3, 8, 8), timesteps=torch.linspace(0, 1, 4))
+        pipe._init_noise_and_schedule = lambda p: schedule
+        pipe._t2i_prefix = lambda p, ns: SimpleNamespace(cursor=None, past_kv_cond="kv")
+        pipe._t2i_caches = lambda p, ns, ctx: ({"cond": {}}, "")
+
+        state = _text_state()
+        state.prompt = {"prompt": "draw the sky", "modalities": ["image"]}
+        pipe.prepare_encode(state)
+
+        assert pipe.prepare_steps_remaining(state) is None
+        assert state.total_steps == 3, "the state carries one entry per denoise interval"
+        assert state.latents is schedule.image_prediction
+        assert state.extra[pipe._STEP_KEY].caches == {"cond": {}}
+
+    def test_image_request_with_think_prepares_before_it_denoises(self):
+        pipe = _text_pipeline({1: 2, 2: THINK_END}, first_token=1)
+        schedule = SimpleNamespace(image_prediction=torch.zeros(1, 3, 8, 8), timesteps=torch.linspace(0, 1, 4))
+        pipe._init_noise_and_schedule = lambda p: schedule
+        cursor = _think_cursor(pipe, first_token=1)
+        pipe._t2i_prefix = lambda p, ns: SimpleNamespace(cursor=cursor, past_kv_cond=None)
+        finished_with = []
+
+        def _caches(p, ns, ctx):
+            finished_with.append(ctx.cursor)
+            return {"cond": {}}, "thought"
+
+        pipe._t2i_caches = _caches
+
+        state = _text_state()
+        state.prompt = {"prompt": "draw the sky", "modalities": ["image"]}
+        pipe.prepare_encode(state)
+
+        assert pipe.prepare_steps_remaining(state) is not None
+        assert finished_with == [], "the caches must not be built before the loop ends"
+        while pipe.prepare_steps_remaining(state) is not None:
+            pipe.prepare_step(state)
+        assert finished_with == [cursor]
+        assert state.extra[pipe._STEP_KEY].think_text == "thought"
+
+
+class TestRequestModeAndStepModeAgree:
+    """The claim the change rests on, at the one boundary a CPU test can reach."""
+
+    @staticmethod
+    def _params(max_tokens: int):
+        sampling = OmniDiffusionSamplingParams(num_inference_steps=25, seed=42)
+        sampling.extra_args.update({"max_tokens": max_tokens})
+        return sampling
+
+    def _request_mode_text(self, pipe, max_tokens: int) -> str:
+        prompt = {"prompt": "describe the sky", "modalities": ["text"]}
+        p = pipe._parse_request(SimpleNamespace(prompts=[prompt], sampling_params=self._params(max_tokens)))
+        return pipe._forward_text(p, None).output["payload"]["text"]
+
+    def _step_mode_text(self, pipe, max_tokens: int) -> str:
+        state = StepRequestState(
+            request_id="req-1",
+            sampling=self._params(max_tokens),
+            prompt={"prompt": "describe the sky", "modalities": ["text"]},
+        )
+        pipe.prepare_encode(state)
+        while pipe.prepare_steps_remaining(state) is not None:
+            pipe.prepare_step(state)
+        return pipe.post_decode(state).output["payload"]["text"]
+
+    @pytest.mark.parametrize("max_tokens", [0, 1, 2, 16])
+    def test_the_two_modes_produce_the_same_text(self, max_tokens):
+        successor = {1: 2, 2: 3, 3: EOS}
+        request_text = self._request_mode_text(_text_pipeline(successor, first_token=1), max_tokens)
+        step_text = self._step_mode_text(_text_pipeline(successor, first_token=1), max_tokens)
+        assert step_text == request_text
+
+    def test_a_zero_token_budget_decodes_nothing_in_either_mode(self):
+        successor = {1: 2, 2: EOS}
+        assert self._request_mode_text(_text_pipeline(successor, first_token=1), 0) == ""
+        assert self._step_mode_text(_text_pipeline(successor, first_token=1), 0) == ""
+
+
+class TestThroughTheRunner:
+    """The pipeline's own methods, driven by the runner that will call them."""
+
+    @staticmethod
+    def _runner(pipeline):
+        import torch as _torch
+
+        from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
+        from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
+
+        runner = object.__new__(DiffusionModelRunner)
+        runner.vllm_config = SimpleNamespace(
+            kernel_config=SimpleNamespace(ir_op_priority=SimpleNamespace(set_priority=_nullcontext)),
+            compilation_config=SimpleNamespace(ir_enable_torch_wrap=True),
+        )
+        runner.od_config = SimpleNamespace(
+            cache_backend=None,
+            diffusion_kv_mode=DiffusionKVCacheMode.DENSE_LEGACY,
+            parallel_config=SimpleNamespace(use_hsdp=False),
+            streaming_output=False,
+        )
+        runner.device = _torch.device("cpu")
+        runner.pipeline = pipeline
+        runner.cache_backend = None
+        runner.offload_backend = None
+        runner.state_cache = {}
+        runner.input_batch = None
+        runner.kv_transfer_manager = SimpleNamespace(
+            receive_multi_kv_cache_distributed=lambda req, cfg_kv_collect_func=None, target_device=None: None
+        )
+        return runner
+
+    @pytest.mark.parametrize("mode", ["t2i", "it2i"])
+    def test_an_image_request_denoises_through_the_runner(self, monkeypatch: pytest.MonkeyPatch, mode):
+        """The three step methods an image request uses, driven by the runner.
+
+        `denoise_step` and `step_scheduler` run for real; only `_denoise_one`,
+        which is the transformer forward, is replaced. The Euler update and the
+        unpatchify in `_advance_latents` are therefore the production ones.
+        """
+        import vllm_omni.diffusion.worker.diffusion_model_runner as runner_module
+        from vllm_omni.diffusion.request import OmniDiffusionRequest
+        from vllm_omni.diffusion.sched.interface import (
+            CachedRequestData,
+            DiffusionSchedulerOutput,
+            NewRequestData,
+        )
+        from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
+
+        monkeypatch.setattr(runner_module, "set_forward_context", _noop_forward_context)
+        pipe = _text_pipeline({1: EOS}, first_token=1)
+        # 32x32 at patch 16 x merge 2 is one patch row and column.
+        pipe.patch_size, pipe.merge_size = 16, 1
+        latents = torch.zeros(1, 4, 16 * 16 * 3)
+        timesteps = torch.tensor([0.0, 0.25, 0.75, 1.0])
+        schedule = SimpleNamespace(image_prediction=latents, timesteps=timesteps)
+        pipe._init_noise_and_schedule = lambda p: schedule
+        pipe._t2i_prefix = lambda p, ns: SimpleNamespace(cursor=None, past_kv_cond="kv")
+        pipe._t2i_caches = lambda p, ns, ctx: ({"cond": {}}, "")
+        # An editing request is routed by its input image; only the prefix and
+        # cache builders that need the vision tower are replaced.
+        pipe._extract_input_images = lambda first_prompt: ["image"] if mode == "it2i" else None
+        pipe._it2i_prefix = lambda p, ns, images: SimpleNamespace(cursor=None, past_kv_cond="kv")
+        pipe._it2i_caches = lambda p, ns, ctx: ({"cond": {}}, "")
+        v_pred = torch.full((1, 4, 16 * 16 * 3), 2.0)
+        seen: list[int] = []
+        edit_flags: list[bool] = []
+
+        def _denoise_one(z, ns, caches, p, step_i, is_edit):
+            # Production re-patchifies the latents each step and returns the
+            # patched tensor alongside the prediction, so the Euler update in
+            # `_advance_latents` operates on the patched layout.
+            seen.append(step_i)
+            edit_flags.append(is_edit)
+            return torch.zeros_like(v_pred), v_pred
+
+        pipe._denoise_one = _denoise_one
+        pipe._to_pil_called = False
+
+        runner = self._runner(pipe)
+        sampling = OmniDiffusionSamplingParams(num_inference_steps=4, seed=42, width=32, height=32)
+        request = OmniDiffusionRequest(
+            prompt={"prompt": "draw the sky", "modalities": ["image"]},
+            request_id="req-img",
+            sampling_params=sampling,
+        )
+        scheduled = DiffusionSchedulerOutput(
+            step_id=0,
+            scheduled_new_reqs=[NewRequestData(request_id="req-img", req=request)],
+            scheduled_cached_reqs=CachedRequestData.make_empty(),
+            finished_req_ids=set(),
+            num_running_reqs=1,
+            num_waiting_reqs=0,
+        )
+        output = DiffusionModelRunner.execute_stepwise(runner, scheduled)
+        request_output = output.get_request_output("req-img")
+
+        for step_id in range(1, 6):
+            if request_output.finished:
+                break
+            cached = DiffusionSchedulerOutput(
+                step_id=step_id,
+                scheduled_new_reqs=[],
+                scheduled_cached_reqs=CachedRequestData(request_ids=["req-img"]),
+                finished_req_ids=set(),
+                num_running_reqs=1,
+                num_waiting_reqs=0,
+            )
+            output = DiffusionModelRunner.execute_stepwise(runner, cached)
+            request_output = output.get_request_output("req-img")
+
+        # One denoise per interval, in order, and the latents carry the Euler
+        # update for each of them: sum((t_next - t) * 2.0) over the schedule.
+        assert seen == [0, 1, 2]
+        assert edit_flags == [mode == "it2i"] * 3
+        assert request_output.finished is True
+        assert request_output.result.output["payload"]["image"] is not None
+        assert "req-img" not in runner.state_cache
+
+    @pytest.mark.parametrize(("max_tokens", "expected"), [(0, ""), (16, "1,2")])
+    def test_a_text_request_finishes_inside_prepare(self, monkeypatch: pytest.MonkeyPatch, max_tokens, expected):
+        import vllm_omni.diffusion.worker.diffusion_model_runner as runner_module
+        from vllm_omni.diffusion.request import OmniDiffusionRequest
+        from vllm_omni.diffusion.sched.interface import (
+            CachedRequestData,
+            DiffusionSchedulerOutput,
+            NewRequestData,
+        )
+        from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
+
+        monkeypatch.setattr(runner_module, "set_forward_context", _noop_forward_context)
+        pipe = _text_pipeline({1: 2, 2: EOS}, first_token=1)
+        runner = self._runner(pipe)
+
+        sampling = OmniDiffusionSamplingParams(num_inference_steps=25, seed=42)
+        sampling.extra_args.update({"max_tokens": max_tokens})
+        request = OmniDiffusionRequest(
+            prompt={"prompt": "describe the sky", "modalities": ["text"]},
+            request_id="req-1",
+            sampling_params=sampling,
+        )
+        scheduled = DiffusionSchedulerOutput(
+            step_id=0,
+            scheduled_new_reqs=[NewRequestData(request_id="req-1", req=request)],
+            scheduled_cached_reqs=CachedRequestData.make_empty(),
+            finished_req_ids=set(),
+            num_running_reqs=1,
+            num_waiting_reqs=0,
+        )
+
+        output = DiffusionModelRunner.execute_stepwise(runner, scheduled)
+        request_output = output.get_request_output("req-1")
+        assert request_output.finished is (max_tokens == 0)
+
+        for step_id in range(1, 6):
+            if request_output.finished:
+                break
+            cached = DiffusionSchedulerOutput(
+                step_id=step_id,
+                scheduled_new_reqs=[],
+                scheduled_cached_reqs=CachedRequestData(request_ids=["req-1"]),
+                finished_req_ids=set(),
+                num_running_reqs=1,
+                num_waiting_reqs=0,
+            )
+            output = DiffusionModelRunner.execute_stepwise(runner, cached)
+            request_output = output.get_request_output("req-1")
+            if request_output.finished:
+                break
+
+        assert request_output.finished is True
+        assert request_output.result.output["payload"]["text"] == expected
+        assert "req-1" not in runner.state_cache

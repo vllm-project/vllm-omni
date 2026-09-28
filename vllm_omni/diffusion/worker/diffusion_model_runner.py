@@ -48,9 +48,12 @@ from vllm_omni.diffusion.interaction.types import InteractionPayload
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.interface import (
     SupportsInteractionApply,
+    SupportsResumablePrepare,
+    SupportsStepExecution,
     adopt_request_scoped_cache_dit,
     is_request_scoped_cache_dit_enabled,
     supports_interaction_apply,
+    supports_resumable_prepare,
     supports_step_execution,
 )
 from vllm_omni.diffusion.offloader import enable_offload_backend
@@ -91,6 +94,17 @@ if TYPE_CHECKING:
     from vllm_omni.inputs.data import OmniInteractionPrompt
 
 logger = init_logger(__name__)
+
+
+def _prepare_phase_done(pipeline: SupportsResumablePrepare, state: StepRequestState) -> bool:
+    """Whether the request has nothing left to advance in its prepare phase.
+
+    ``prepare_steps_remaining`` reports a finished phase with ``None``; a count
+    of ``0`` says the same thing, and treating it as unfinished would call
+    ``prepare_step`` on every tick without the request ever retiring.
+    """
+    remaining = pipeline.prepare_steps_remaining(state)
+    return remaining is None or remaining <= 0
 
 
 def _dit_any_rank_failed(local_failed: bool) -> bool:
@@ -970,6 +984,11 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
             if installed_request:
                 self.remove_diffusion_kv_requests([req.request_id])
 
+    #: Prepare waves the memory profile will drive before giving up. A profile
+    #: request decodes at most a few tokens; anything beyond this is a pipeline
+    #: whose prepare phase never ends.
+    _MAX_PROFILE_PREPARE_WAVES = 2048
+
     def profile_run(self, requests: list[OmniDiffusionRequest]) -> None:
         """Run the maximum per-rank request batch for memory profiling.
 
@@ -1004,6 +1023,33 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                     record_output_peak_memory=False,
                     in_diffusion_kv_memory_profile=True,
                 )
+                # A resumable prepare phase spends that first call decoding, so
+                # the denoise allocations this profile is sizing would never
+                # happen. Keep going until a denoise step has actually run.
+                waves = 0
+                while self.input_batch is None and self.state_cache and waves < self._MAX_PROFILE_PREPARE_WAVES:
+                    waves += 1
+                    runner_output = self._execute_stepwise(
+                        DiffusionSchedulerOutput(
+                            step_id=waves,
+                            scheduled_new_reqs=[],
+                            scheduled_cached_reqs=CachedRequestData(request_ids=list(self.state_cache)),
+                            finished_req_ids=set(),
+                            num_running_reqs=len(self.state_cache),
+                            num_waiting_reqs=0,
+                        ),
+                        validate_kv_metadata=False,
+                        record_output_peak_memory=False,
+                        in_diffusion_kv_memory_profile=True,
+                    )
+                # An emptied state_cache means the profile request finished
+                # inside its prepare phase and never sized a denoise batch,
+                # which is as useless for this profile as running out of waves.
+                if self.input_batch is None:
+                    raise RuntimeError(
+                        "Diffusion memory profiling did not reach a denoise step after "
+                        f"{waves} prepare waves; the profile would understate the budget."
+                    )
             else:
                 runner_output = self._execute_request_list(
                     requests,
@@ -1143,12 +1189,14 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         self,
         states: list[StepRequestState],
         new_request_ids: list[str],
+        *,
+        record_output_peak_memory: bool = False,
     ) -> tuple[list[StepRequestState], InputBatch | None, list[RunnerOutput]]:
         # process new reqs
         pipeline = self.pipeline
         assert pipeline is not None, "Model not loaded. Call load_model() first."
         prepared_states: list[StepRequestState] = []
-        error_outputs: list[RunnerOutput] = []
+        pending_outputs: list[RunnerOutput] = []
         for state in states:
             if state.request_id in new_request_ids:
                 # Everything that requires rank-synchronization must be called
@@ -1157,27 +1205,6 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                 # ``clear_pipeline_stage_durations`` on one rank would skip the
                 # all-reduce here while every peer proceeds into it, and the
                 # peers then hang on the NCCL collective until timeout.
-                def _abort_prep_failure(per_req_exc: BaseException | None) -> None:
-                    self.state_cache.pop(state.request_id, None)
-                    if per_req_exc is None:
-                        per_req_exc = RuntimeError(
-                            f"Stepwise preparation failed on another DiT rank for {state.request_id}"
-                        )
-                    logger.error(
-                        "Stepwise request preparation failed for %s: %s",
-                        state.request_id,
-                        per_req_exc,
-                        exc_info=isinstance(per_req_exc, Exception),
-                    )
-                    error_outputs.append(
-                        RunnerOutput(
-                            request_id=state.request_id,
-                            step_index=state.step_index,
-                            finished=True,
-                            result=DiffusionOutput.from_exception(per_req_exc),
-                        )
-                    )
-
                 per_req_exc: BaseException | None = None
                 try:
                     self._initialize_generator(state.sampling)
@@ -1192,7 +1219,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                 # (or a future pipeline that omits the guard) does not leave
                 # the process group half-way through a new request.
                 if _dit_any_rank_failed(per_req_exc is not None):
-                    _abort_prep_failure(per_req_exc)
+                    pending_outputs.append(self._fail_stepwise_request(state, per_req_exc, "preparation"))
                     continue
                 # If the pipeline supports interaction, the interaction session initialization also needs to call
                 # synchronized_monotonic_time(). Wrap in another try-block to not block on prepare_encode failures.
@@ -1211,18 +1238,137 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                 except Exception as exc:
                     per_req_exc = exc
                 if _dit_any_rank_failed(per_req_exc is not None):
-                    _abort_prep_failure(per_req_exc)
+                    pending_outputs.append(self._fail_stepwise_request(state, per_req_exc, "preparation"))
                     continue
             prepared_states.append(state)
 
+        if supports_resumable_prepare(pipeline):
+            prepared_states, prepare_outputs = self._advance_resumable_prepare(
+                prepared_states,
+                record_output_peak_memory=record_output_peak_memory,
+            )
+            pending_outputs.extend(prepare_outputs)
+
         if not prepared_states:
-            return prepared_states, None, error_outputs
+            # Nothing denoises this tick. The cached batch holds the previous
+            # wave's latents and states, and a prepare phase is long enough that
+            # keeping them alive is not free.
+            self.input_batch = None
+            return prepared_states, None, pending_outputs
         input_batch = InputBatch.make_batch(
             prepared_states,
             cached_batch=getattr(self, "input_batch", None),
         )
         self.input_batch = input_batch
-        return prepared_states, input_batch, error_outputs
+        return prepared_states, input_batch, pending_outputs
+
+    def _fail_stepwise_request(
+        self,
+        state: StepRequestState,
+        per_req_exc: BaseException | None,
+        stage: str,
+    ) -> RunnerOutput:
+        """Drop a request whose prepare phase failed on this or another DiT rank."""
+        self.state_cache.pop(state.request_id, None)
+        if per_req_exc is None:
+            per_req_exc = RuntimeError(f"Stepwise {stage} failed on another DiT rank for {state.request_id}")
+        logger.error(
+            "Stepwise request %s failed for %s: %s",
+            stage,
+            state.request_id,
+            per_req_exc,
+            exc_info=isinstance(per_req_exc, Exception),
+        )
+        return RunnerOutput(
+            request_id=state.request_id,
+            step_index=state.step_index,
+            finished=True,
+            result=DiffusionOutput.from_exception(per_req_exc),
+        )
+
+    def _advance_resumable_prepare(
+        self,
+        states: list[StepRequestState],
+        *,
+        record_output_peak_memory: bool = False,
+    ) -> tuple[list[StepRequestState], list[RunnerOutput]]:
+        """Advance every request still inside its prepare phase by one step.
+
+        Such a request is left out of this invocation's denoise batch, so the
+        requests that are past their prepare phase keep denoising while it runs.
+        It reports progress at its current ``step_index``, which the scheduler
+        records without requiring it to move. A pipeline whose prepare phase
+        produces the whole output leaves ``state.timesteps`` unset, and that
+        request is decoded and finished here instead.
+        """
+        assert self.pipeline is not None, "Model not loaded. Call load_model() first."
+        pipeline = cast(SupportsResumablePrepare, self.pipeline)
+        step_pipeline = cast(SupportsStepExecution, self.pipeline)
+        ready: list[StepRequestState] = []
+        outputs: list[RunnerOutput] = []
+        for state in states:
+            # Same lockstep requirement as prepare_encode() above: every DiT
+            # rank has to reach _dit_any_rank_failed the same number of times.
+            # The loop runs over the scheduler's states rather than over the
+            # ones still preparing, because whether a request is still
+            # preparing is answered from pipeline-private state.
+            per_req_exc: BaseException | None = None
+            result: DiffusionOutput | None = None
+            try:
+                if not _prepare_phase_done(pipeline, state):
+                    clear_pipeline_stage_durations(pipeline)
+                    pipeline.prepare_step(state)
+                    merge_stage_durations(state, consume_pipeline_stage_durations(pipeline))
+                # The phase can also end inside prepare_encode(), so a request
+                # that produces its whole output there reaches this decode
+                # without ever taking a prepare_step().
+                if _prepare_phase_done(pipeline, state) and state.total_steps == 0:
+                    clear_pipeline_stage_durations(pipeline)
+                    result = step_pipeline.post_decode(state)
+                    if result is None:
+                        raise ValueError(
+                            f"Request {state.request_id} has no denoise schedule and its prepare "
+                            "phase produced no output."
+                        )
+            except Exception as exc:
+                per_req_exc = exc
+            if _dit_any_rank_failed(per_req_exc is not None):
+                outputs.append(self._fail_stepwise_request(state, per_req_exc, "prepare step"))
+                continue
+            if result is not None:
+                result = self._prepare_output_for_transport(result, state.sampling)
+                self._attach_stepwise_metadata(state, result)
+                # Same hand-off as a request that finishes after denoising.
+                self._maybe_send_stage_payload([state], [result])
+                # This request never reaches the denoise loop's memory
+                # accounting, so it is sampled here instead.
+                is_primary = not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
+                if record_output_peak_memory and is_primary and current_omni_platform.is_available():
+                    state.peak_memory_mb = max(state.peak_memory_mb, self._sample_peak_memory_mb())
+                    result.peak_memory_mb = max(result.peak_memory_mb, state.peak_memory_mb)
+                self.state_cache.pop(state.request_id, None)
+                outputs.append(
+                    RunnerOutput(
+                        request_id=state.request_id,
+                        step_index=state.step_index,
+                        finished=True,
+                        result=result,
+                    )
+                )
+                continue
+            if _prepare_phase_done(pipeline, state):
+                # The step that ended the prepare phase does not also cost the
+                # request a tick: it joins this tick's denoise batch.
+                ready.append(state)
+                continue
+            outputs.append(
+                RunnerOutput(
+                    request_id=state.request_id,
+                    step_index=state.step_index,
+                    finished=False,
+                )
+            )
+        return ready, outputs
 
     def _update_states_after(
         self,
@@ -1379,7 +1525,11 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                 and current_omni_platform.is_available()
             ):
                 current_omni_platform.reset_peak_memory_stats()
-            states, input_batch, runner_output_list = self._prepare_batch_inputs(states, new_request_ids)
+            states, input_batch, runner_output_list = self._prepare_batch_inputs(
+                states,
+                new_request_ids,
+                record_output_peak_memory=record_output_peak_memory,
+            )
             if input_batch is None:
                 return BatchRunnerOutput.from_list(runner_output_list)
             attn_metadata: dict[str, Any] = {}
