@@ -73,11 +73,17 @@ class DiffusionLoRAManager:
         self.pipeline = pipeline
         self.device = device
         self.dtype = dtype
+        # Imported here: vllm_omni.diffusion.data imports this package while it
+        # is still initializing, and the offloader package imports that module.
+        from vllm_omni.diffusion.offloader.config import OffloadStrategy, resolve_offload_strategy
+
         od_config = getattr(pipeline, "od_config", None)
         # DLO owns the base-weight lifecycle. Keep request-switchable LoRA
         # sidecars resident instead of rebuilding DLO host shards per request.
         self._resident_lora_device = (
-            device if getattr(od_config, "enable_distributed_layerwise_offload", False) is True else None
+            device
+            if od_config is not None and resolve_offload_strategy(od_config) is OffloadStrategy.DISTRIBUTED_LAYER_WISE
+            else None
         )
 
         # Cache supported/expected module suffixes once, before any layer

@@ -312,10 +312,10 @@ class PipelineConfig:
     # ``hf_config_predicate=lambda c: getattr(c, "version", "") == "4.5"``
     # to avoid misrouting 2.6 checkpoints.
     hf_config_predicate: Callable[[Any], bool] | None = None
-    # Diffusers pipeline class name: for models that ship a ``model_index.json``
-    # (no root ``config.json``), the ``_class_name`` field is matched against
-    # this value to auto-detect the pipeline.  Only needed for diffusers-style
-    # multi-component repos (e.g. GLM-Image).  ``None`` = not a diffusers model.
+    # Canonical diffusion runtime class for this registered pipeline.
+    # Serving uses it as a metadata fallback; model_index.json discovery
+    # also matches its _class_name against this value and its aliases.
+    # None delegates class discovery to the checkpoint metadata.
     diffusers_class_name: str | None = None
     diffusers_class_aliases: tuple[str, ...] = ()
     endpoint_restrictions: tuple[EndpointRestriction, ...] = ()
@@ -324,10 +324,10 @@ class PipelineConfig:
     duplex_plugin: str | None = None
     # Preserve legacy turn deployments when adding an optional duplex plugin.
     default_session_mode: str | None = None
-    # Legacy duplex wiring of the models that are not ported to the plugin
-    # framework yet (PersonaPlex, Nemotron VoiceChat). Nothing reads them: a
-    # pipeline that only declares these is served turn-based. Each field goes
-    # away with the follow-up PR that ports its model to ``duplex_plugin``.
+    # Legacy duplex wiring of the model that is not ported to the plugin
+    # framework yet (Nemotron VoiceChat, RFC vllm-omni#7181 PR 4). Nothing
+    # reads them: a pipeline that only declares these is served turn-based.
+    # The fields go away with the PR that ports it to ``duplex_plugin``.
     duplex_runtime_extension: str | None = None
     duplex_serving_adapter: str | None = None
     duplex_control_enabled: bool = False
@@ -582,6 +582,8 @@ class DeployConfig:
     model_runner: Literal["v1", "v2"] = "v1"
     # Stage-1 active stream slots; 0 preserves legacy all-stream cycling.
     active_stream_window: int = 0
+    # Experimental local NVIDIA MPS; disabled unless a deploy explicitly opts in.
+    cuda_mps: bool = False
     duplex_session: DuplexSessionRuntimeConfig = field(default_factory=DuplexSessionRuntimeConfig)
     connectors: dict[str, Any] | None = None
     edges: list[dict[str, Any]] | None = None
@@ -804,7 +806,11 @@ def load_deploy_config(path: str | Path) -> DeployConfig:
     if model_runner not in ("v1", "v2"):
         raise ValueError(f"model_runner must be one of ('v1', 'v2'), got {model_runner!r}")
 
+    if not isinstance(raw_dict.get("cuda_mps", False), bool):
+        raise ValueError("cuda_mps must be a boolean")
+
     kwargs: dict[str, Any] = {
+        "cuda_mps": raw_dict.get("cuda_mps", False),
         "async_chunk": raw_dict.get("async_chunk", True),
         "session_mode": raw_dict.get("session_mode", "turn"),
         "model_runner": model_runner,
@@ -936,7 +942,11 @@ def _resolve_execution_mode(
 
 
 def resolve_stage_async_chunk(deploy: DeployConfig, stage: StageDeployConfig | None) -> bool:
-    return bool(deploy.async_chunk and (stage is None or stage.async_chunk is not False))
+    if not isinstance(deploy.async_chunk, bool):
+        raise ValueError("async_chunk must be a boolean")
+    if stage is not None and stage.async_chunk is not None and not isinstance(stage.async_chunk, bool):
+        raise ValueError(f"Stage {stage.stage_id} async_chunk must be a boolean or null")
+    return deploy.async_chunk and (stage is None or stage.async_chunk is not False)
 
 
 def validate_stage_async_chunk_edges(pipeline: PipelineConfig, deploy: DeployConfig) -> None:
@@ -1178,6 +1188,8 @@ def merge_pipeline_deploy(
             runtime["num_replicas"] = ds.num_replicas
             if ds.env is not None:
                 runtime["env"] = ds.env
+        if deploy.cuda_mps:
+            runtime["cuda_mps"] = True
         runtime["requires_multimodal_data"] = ps.requires_multimodal_data
 
         result.append(

@@ -629,6 +629,8 @@ class OmniStageConnectorConfig:
 class OmniStageRuntimeConfig:
     """Per-stage process placement and backend runtime behavior."""
 
+    cuda_mps: bool = False
+
     # LLM backend extensions; diffusion owns these in its config projection.
     additional_config: dict[str, Any] | None = None
     distributed_executor_backend: Any = None
@@ -2127,6 +2129,7 @@ def _build_runtime_config(
         kwargs["num_replicas"] = stage_deploy.num_replicas
     if "env" not in kwargs and stage_deploy is not None and stage_deploy.env is not None:
         kwargs["env"] = _copy_value(stage_deploy.env)
+    kwargs["cuda_mps"] = deploy.cuda_mps
     kwargs["num_gpus"] = parallel_config.world_size
     return OmniStageRuntimeConfig(**kwargs)
 

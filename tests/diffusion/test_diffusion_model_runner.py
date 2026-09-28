@@ -1411,3 +1411,44 @@ def test_vllm_set_forward_context_implementation(monkeypatch):
             ),
         ),
     ], ERROR_MESSAGE
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+@pytest.mark.parametrize("cancel_all", [False, True])
+def test_execute_model_batch_cancellation_preserves_live_peer(monkeypatch, cancel_all):
+    from vllm_omni.diffusion.cancellation import (
+        RequestCancellationRegistry,
+        check_request_cancellation,
+    )
+    from vllm_omni.platforms import current_omni_platform
+
+    monkeypatch.setattr(current_omni_platform, "synchronize", lambda: None)
+
+    class CancellableBatchPipeline(_BatchPipeline):
+        supports_request_cancellation = True
+
+        def forward(self, batch):
+            check_request_cancellation()
+            return super().forward(batch)
+
+    monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+    monkeypatch.setattr(model_runner_module, "current_omni_platform", _fake_platform_for_peak_memory())
+    pipeline = CancellableBatchPipeline(outputs=[DiffusionOutput(output="a"), DiffusionOutput(output="b")])
+    runner = _make_batch_runner(pipeline)
+    sched = _make_scheduler_output(num_reqs=2)
+    registry = RequestCancellationRegistry()
+    try:
+        for entry in sched.scheduled_new_reqs:
+            entry.req.cancellation_signal = registry.create(entry.request_id)
+        registry.cancel(["req-0", "req-1"] if cancel_all else ["req-0"])
+        result = runner.execute_model_batch(sched, runner.od_config)
+        assert len(result.runner_outputs) == 2
+        assert [output.result.aborted for output in result.runner_outputs] == [cancel_all, cancel_all]
+        if not cancel_all:
+            assert result.runner_outputs[1].request_id == "req-1"
+            assert result.runner_outputs[1].result.output == "b"
+        else:
+            assert pipeline.last_batch is None
+    finally:
+        registry.close()

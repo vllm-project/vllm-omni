@@ -85,7 +85,7 @@ def _run_ltx_vocoder(vocoder: nn.Module, generated_mel: torch.Tensor) -> torch.T
 
         input_dtype = generated_mel.dtype
         module_dtype = next(vocoder.parameters()).dtype
-        if device_type == "mps":
+        if device_type in ("mps", "xpu", "cpu"):
             if module_dtype != torch.float32:
                 vocoder.float()
             try:

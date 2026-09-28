@@ -150,17 +150,22 @@ interchangeably.
 | Robot policy inference | `WS /v1/realtime/robot/openpi` | Send MessagePack observations and receive action arrays | [OpenPI Robot Policy](openpi_api.md) |
 
 All six routes are model- or configuration-dependent. In particular,
-`/v1/realtime` is full duplex when the model is a duplex model (its pipeline
-declares a `duplex_plugin` and the deploy configuration sets
-`session_mode: duplex`); a stock Realtime client needs no vendor query
-parameter, and `duplex=0` is the explicit opt-out. Such a server serves the
-websocket route plus `POST /v1/chat/completions`, and no other turn-based
-HTTP route. On a duplex server that chat route is not the turn-based path:
-each request runs on a short-lived duplex session, so it holds one of
-`duplex_session.max_sessions` for its lifetime and answers at the model's
-real-time pace -- see [Full Duplex](full_duplex_api.md). Clients should
-also verify the duplex capability payload because the query-parameter form
-falls back to the ordinary realtime handler when duplex is unavailable.
+`/v1/realtime` is full duplex when the server is a duplex server: the model's
+pipeline declares a `duplex_plugin` and its deploy configuration sets
+`session_mode: duplex` (with `session_mode: turn` the same model boots the
+ordinary turn-based serving stack instead). On a duplex server a stock
+Realtime client needs no vendor query parameter; `duplex=0` selects the
+turn-based Realtime handler, which a duplex server does not mount, so that
+connection is refused with `Realtime API is not available`. Such a server
+serves the websocket route plus `POST /v1/chat/completions`, `/v1/models`
+and `/health`, and no other turn-based HTTP route. The chat route is the
+ordinary chat service running on the duplex engine: a request is a
+turn-based generation on the same stages, served alongside the live
+websocket sessions; it opens no duplex session and holds no
+`duplex_session.max_sessions` slot -- see [Full Duplex](full_duplex_api.md).
+On a server that is not duplex, an explicit `?duplex=1` is refused rather
+than answered by the turn-based handler, so a client that requested duplex
+never silently gets the other protocol.
 
 ## Related Endpoints
 

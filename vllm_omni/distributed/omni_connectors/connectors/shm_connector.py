@@ -3,7 +3,9 @@
 
 import fcntl
 import os
+import threading
 import time
+from collections import OrderedDict
 from multiprocessing import shared_memory as shm_pkg
 from typing import Any
 
@@ -33,7 +35,8 @@ class SharedMemoryConnector(OmniConnectorBase):
     def __init__(self, config: dict[str, Any]):
         self.config = config
         self.stage_id = config.get("stage_id", -1)
-        self._pending_keys: set[str] = set()
+        self._pending_keys: OrderedDict[str, None] = OrderedDict()
+        self._pending_keys_lock = threading.Lock()
         self._metrics = {
             "puts": 0,
             "gets": 0,
@@ -48,6 +51,7 @@ class SharedMemoryConnector(OmniConnectorBase):
         data: Any,
     ) -> tuple[bool, int, dict[str, Any] | None]:
         try:
+            self.reap_consumed()
             payload = self.serialize_obj(data)
             size = len(payload)
 
@@ -59,7 +63,8 @@ class SharedMemoryConnector(OmniConnectorBase):
 
             # meta contains {'name': ..., 'size': ...}
             metadata = {"shm": meta, "size": size}
-            self._pending_keys.add(put_key)
+            with self._pending_keys_lock:
+                self._pending_keys[put_key] = None
 
             self._metrics["puts"] += 1
             self._metrics["bytes_transferred"] += size
@@ -71,15 +76,15 @@ class SharedMemoryConnector(OmniConnectorBase):
             return False, 0, None
 
     def _get_data_with_lock(self, lock_file: str, shm_handle: dict[str, Any]) -> tuple[Any, int] | None:
-        deserialized = False
+        consumed = False
         try:
             with open(lock_file, "rb+") as lockf:
                 fcntl.flock(lockf, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 data_bytes = shm_read_bytes(shm_handle)
+                consumed = True
                 fcntl.flock(lockf, fcntl.LOCK_UN)
             obj = self.deserialize_obj(data_bytes)
             result = (obj, int(shm_handle.get("size", 0)))
-            deserialized = True
             return result
         except BlockingIOError:
             return None
@@ -87,7 +92,7 @@ class SharedMemoryConnector(OmniConnectorBase):
             logger.error(f"SharedMemoryConnector shm get failed for req : {e}")
             return None
         finally:
-            if deserialized:
+            if consumed:
                 try:
                     os.remove(lock_file)
                 except FileNotFoundError:
@@ -104,7 +109,8 @@ class SharedMemoryConnector(OmniConnectorBase):
             shm_handle = {"name": get_key, "size": shm.size}
             result = self._get_data_with_lock(lock_file, shm_handle)
             if result is not None:
-                self._pending_keys.discard(get_key)
+                with self._pending_keys_lock:
+                    self._pending_keys.pop(get_key, None)
             return result
         except FileNotFoundError:
             return None
@@ -139,7 +145,8 @@ class SharedMemoryConnector(OmniConnectorBase):
                 lock_file = f"/dev/shm/shm_{shm_handle['name']}_lockfile.lock"
                 result = self._get_data_with_lock(lock_file, shm_handle)
                 if result is not None:
-                    self._pending_keys.discard(get_key)
+                    with self._pending_keys_lock:
+                        self._pending_keys.pop(get_key, None)
             else:
                 # Missing or non-SHM metadata falls back to key-based lookup.
                 result = self._get_by_key(get_key)
@@ -151,20 +158,10 @@ class SharedMemoryConnector(OmniConnectorBase):
         return result
 
     def cleanup(self, request_id: str) -> None:
-        """Best-effort cleanup of unconsumed SHM segments for *request_id*.
-
-        Matches pending keys where *request_id* appears as the full key,
-        as a ``_``-delimited prefix, or as a ``_``-delimited suffix.
-        If ``get()`` was never called, we unlink it here so /dev/shm
-        doesn't leak.
-        """
-        stale = [
-            k
-            for k in self._pending_keys
-            if k == request_id or k.startswith(request_id + "_") or k.endswith("_" + request_id)
-        ]
-        for key in stale:
-            self._pending_keys.discard(key)
+        """Unlink the exact key passed to ``put()``, never a request-id prefix."""
+        key = request_id
+        with self._pending_keys_lock:
+            self._pending_keys.pop(key, None)
             try:
                 seg = shm_pkg.SharedMemory(name=key)
                 seg.close()
@@ -183,20 +180,18 @@ class SharedMemoryConnector(OmniConnectorBase):
 
     def close(self) -> None:
         """Unlink all remaining tracked SHM segments."""
-        for key in list(self._pending_keys):
-            try:
-                seg = shm_pkg.SharedMemory(name=key)
-                seg.close()
-                seg.unlink()
-            except Exception:
-                pass
-            lock_file = f"/dev/shm/shm_{key}_lockfile.lock"
-            if os.path.exists(lock_file):
-                try:
-                    os.remove(lock_file)
-                except OSError:
-                    pass
-        self._pending_keys.clear()
+        with self._pending_keys_lock:
+            keys = list(self._pending_keys)
+        for key in keys:
+            self.cleanup(key)
+
+    def reap_consumed(self) -> None:
+        """Bounded round-robin sweep; receivers unlink SHM in another process."""
+        with self._pending_keys_lock:
+            for _ in range(min(64, len(self._pending_keys))):
+                key, _ = self._pending_keys.popitem(last=False)
+                if os.path.exists(f"/dev/shm/{key}"):
+                    self._pending_keys[key] = None
 
     def health(self) -> dict[str, Any]:
         return {"status": "healthy", **self._metrics}

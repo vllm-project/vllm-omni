@@ -9,11 +9,14 @@ steady-state calls share one capture shape; ``_decode_cfm`` trims the output
 back. These tests pin the decision math on CPU, no CUDA required.
 """
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
 from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import (
     _cfm_pad_frames,
+    _zero_padded_cnn_cache,
     _zero_padded_frames,
 )
 
@@ -160,3 +163,67 @@ def test_zero_padded_frames_is_a_noop_without_padding():
     _zero_padded_frames(x, None)
     _zero_padded_frames(x, 32)
     assert torch.all(x == 1.0)
+
+
+def _cnn_cache_estimator(widths):
+    return SimpleNamespace(
+        blocks=[
+            SimpleNamespace(conv=SimpleNamespace(block=[None, SimpleNamespace(causal_padding=(width, 0))]))
+            for width in widths
+        ]
+    )
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("noncontiguous", [False, True])
+@pytest.mark.parametrize(
+    "widths,cache_width,pad_frames,cache_depth",
+    [
+        ((4, 4), 4, 1, 2),
+        ((4, 4), 4, 0, 2),
+        ((4, 4), 4, 7, 2),
+        ((4, 2), 4, 1, 2),
+        ((2, 2), 4, 1, 2),
+        ((6, 6), 4, 1, 2),
+        ((0, 4, -1), 4, 1, 3),
+        ((0, -1), 4, 7, 2),
+        ((4, 4), 4, -1, 2),
+        ((4, 4), 4, 1, 3),
+        ((), 4, 1, 1),
+    ],
+)
+def test_zero_padded_cnn_cache_matches_per_block_writes(
+    dtype, noncontiguous, widths, cache_width, pad_frames, cache_depth
+):
+    # Compare all storage, including the untouched columns of a strided view.
+    storage_width = cache_width * (2 if noncontiguous else 1)
+    original = torch.arange(cache_depth * 2 * 3 * storage_width, dtype=torch.float32)
+    original = (original.reshape(cache_depth, 2, 3, storage_width) + 1).to(dtype)
+    expected_storage = original.clone()
+    actual_storage = original.clone()
+    expected = expected_storage[..., ::2] if noncontiguous else expected_storage
+    actual = actual_storage[..., ::2] if noncontiguous else actual_storage
+    for index, width in enumerate(widths):
+        if width > 0:
+            zero_from = max(0, width - pad_frames)
+            if zero_from < width:
+                expected[index][..., zero_from:] = 0.0
+
+    result = _zero_padded_cnn_cache(actual, _cnn_cache_estimator(widths), pad_frames)
+
+    assert result is None
+    assert torch.equal(actual_storage, expected_storage)
+    assert actual.dtype == dtype
+    assert actual.stride() == expected.stride()
+
+
+def test_zero_padded_cnn_cache_uniform_blocks_use_one_write():
+    cache = torch.ones(16, 2, 3, 4)
+    version = cache._version
+
+    _zero_padded_cnn_cache(cache, _cnn_cache_estimator([4] * 16), 1)
+
+    # CPU mutation count pins the mechanism without making a CUDA timing claim.
+    assert cache._version - version == 1
+    assert torch.equal(cache[..., :3], torch.ones(16, 2, 3, 3))
+    assert torch.count_nonzero(cache[..., 3:]) == 0

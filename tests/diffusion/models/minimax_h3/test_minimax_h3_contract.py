@@ -3494,3 +3494,48 @@ def test_long_video_shape_requires_explicit_opt_in(duration):
     assert frames >= duration * 24 and frames % 17 == 5
     assert video_t == (frames - 5) // 17 * 5 + 2
     assert audio_t == round(frames / 24 * 40)
+
+
+@pytest.mark.parametrize("preencode", [False, True])
+@pytest.mark.parametrize("cancel_phase", ["before_prepare", "prepare", "diffuse"])
+def test_request_cancellation_at_prepare_and_decode_boundaries(preencode, cancel_phase, monkeypatch):
+    from vllm_omni.diffusion.cancellation import RequestCancellationRegistry, request_cancellation_scope
+    from vllm_omni.diffusion.data import DiffusionRequestAbortedError
+    from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
+    from vllm_omni.platforms import current_omni_platform
+
+    synchronize = Mock()
+    monkeypatch.setattr(current_omni_platform, "synchronize", synchronize)
+    pipeline = object.__new__(MiniMaxH3Pipeline)
+    torch.nn.Module.__init__(pipeline)
+    registry = RequestCancellationRegistry()
+    signal = registry.create("request")
+
+    def prepare(*args):
+        if cancel_phase == "prepare":
+            registry.cancel(["request"])
+        return {"num_outputs": 1, "seed": 1101, "preencode_mp4": preencode}
+
+    def diffuse(**kwargs):
+        registry.cancel(["request"])
+        return torch.zeros(1), torch.zeros(1)
+
+    pipeline._prepare_request_inputs = Mock(side_effect=prepare)
+    pipeline._denoise_kwargs = Mock(return_value={})
+    pipeline.diffuse = Mock(side_effect=diffuse)
+    pipeline.decode = Mock()
+    pipeline.decode_to_mp4 = Mock()
+    try:
+        if cancel_phase == "before_prepare":
+            registry.cancel(["request"])
+        with request_cancellation_scope([signal]), pytest.raises(DiffusionRequestAbortedError):
+            pipeline.forward(_t2va_batch())
+        synchronize.assert_called_once_with()
+        if cancel_phase == "before_prepare":
+            pipeline._prepare_request_inputs.assert_not_called()
+        if cancel_phase != "diffuse":
+            pipeline.diffuse.assert_not_called()
+        pipeline.decode.assert_not_called()
+        pipeline.decode_to_mp4.assert_not_called()
+    finally:
+        registry.close()

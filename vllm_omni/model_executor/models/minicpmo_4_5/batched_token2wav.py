@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from collections.abc import Mapping
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -111,6 +112,15 @@ def _zero_padded_cnn_cache(
     Padding is at most ``pad_frames`` wide, so only the trailing positions that
     can come from it are cleared; the valid part of the window is kept.
     """
+    blocks = estimator.blocks
+    if pad_frames > 0 and blocks and len(blocks) == cnn_cache.shape[0]:
+        width = int(cnn_cache.shape[-1])
+        if width > 0 and all(int(block.conv.block[1].causal_padding[0]) == width for block in blocks):
+            # _estimator_buffers packs equal-width blocks into one tensor.
+            # Clear their shared tail with one write instead of one per block.
+            cnn_cache[..., max(0, width - pad_frames) :] = 0.0
+            return
+
     for index, block in enumerate(estimator.blocks):
         width = int(block.conv.block[1].causal_padding[0])
         if width <= 0:
@@ -191,6 +201,7 @@ def state_shape_signature(state: BatchedToken2WavState) -> tuple[Any, ...]:
 
 @dataclass(frozen=True)
 class PromptFeatures:
+    cache_key: tuple[str, str]
     speech_tokens: torch.Tensor
     speaker_embedding: torch.Tensor
     mels: torch.Tensor
@@ -238,8 +249,11 @@ class BatchedToken2Wav(nn.Module):
         hift_graph_config: Mapping[str, Any] | None = None,
         cfm_graph_config: Mapping[str, Any] | None = None,
         bfloat16_attention_cache: bool = False,
+        setup_cache_size: int = 1,
     ):
         super().__init__()
+        if setup_cache_size < 0:
+            raise ValueError("setup_cache_size must be >= 0")
         self._token2wav = token2wav
         # Optional TrtDiTStepper (step_audio2_dit_trt): replaces only the
         # per-timestep DiT estimator call; encoder and HiFT stay on torch.
@@ -335,6 +349,10 @@ class BatchedToken2Wav(nn.Module):
                 self._cfm_graph_bucket_frames,
             )
         self._prompt_features: dict[tuple[str, str], PromptFeatures] = {}
+        self._setup_cache_size = setup_cache_size
+        self._setup_cache: OrderedDict[tuple[tuple[str, str], int, int], tuple[BatchedToken2WavState, ...]] = (
+            OrderedDict()
+        )
 
     def _hift_inference(
         self,
@@ -360,6 +378,7 @@ class BatchedToken2Wav(nn.Module):
             finally:
                 torch.set_default_dtype(previous_dtype)
             cached = PromptFeatures(
+                cache_key=cache_key,
                 speech_tokens=values[0],
                 speaker_embedding=values[2],
                 mels=values[3],
@@ -368,8 +387,12 @@ class BatchedToken2Wav(nn.Module):
         return cached
 
     def evict_prompt(self, prompt_cache_id: str, prompt_wav: str) -> None:
-        """Release request-owned prompt features after stream completion."""
-        self._prompt_features.pop((prompt_cache_id, prompt_wav), None)
+        """Release all cached artifacts associated with one prompt."""
+        prompt_key = (prompt_cache_id, prompt_wav)
+        self._prompt_features.pop(prompt_key, None)
+        for setup_key in list(self._setup_cache):
+            if setup_key[0] == prompt_key:
+                self._setup_cache.pop(setup_key)
 
     @staticmethod
     def _repeat_prompt(features: PromptFeatures, batch_size: int) -> tuple[torch.Tensor, ...]:
@@ -871,7 +894,7 @@ class BatchedToken2Wav(nn.Module):
             "estimator_att_cache": estimator_att,
         }
 
-    def setup_batch(
+    def _create_initial_states(
         self,
         features: PromptFeatures,
         batch_size: int,
@@ -916,6 +939,27 @@ class BatchedToken2Wav(nn.Module):
             )
             for row in split
         ]
+
+    def setup_batch(self, features: PromptFeatures, batch_size: int) -> list[BatchedToken2WavState]:
+        """Reuse read-only prompt conditioning for the same shape and padding."""
+        bucket_frames = (
+            self._cfm_graph_bucket_frames
+            if self._cfm_graph_wrapper is not None and self._cfm_graph_wrapper.enabled
+            else 0
+        )
+        # Capture the policy before setup: graph capture may disable the wrapper
+        # after padding has already been chosen for these initial states.
+        cache_key = (features.cache_key, batch_size, bucket_frames)
+        cached = self._setup_cache.get(cache_key)
+        if cached is not None:
+            self._setup_cache.move_to_end(cache_key)
+            return list(cached)
+        states = self._create_initial_states(features, batch_size)
+        if self._setup_cache_size > 0:
+            self._setup_cache[cache_key] = tuple(states)
+            while len(self._setup_cache) > self._setup_cache_size:
+                self._setup_cache.popitem(last=False)
+        return states
 
     @staticmethod
     def _fade_in_out(
