@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping, Sequence
+
     from transformers import PreTrainedTokenizerBase
 
 
@@ -92,6 +94,33 @@ class MiniCPMO45DuplexPolicy:
     DEFAULT_MAX_SPEAK_CHARS_PER_CHUNK = 28
     DEFAULT_MIN_NEW_SPEAK_TOKENS_BEFORE_CHUNK_BOUNDARY = 8
     REPETITION_HISTORY_SIZE = 512
+
+    @staticmethod
+    def speech_unit_closed_by_listen(token_ids: Sequence[int], special_token_ids: Mapping[str, int]) -> bool:
+        """Whether a unit ending in LISTEN closes speech rather than deciding to listen.
+
+        ``<|turn_eos|>`` ends the turn but not the unit: the model keeps
+        decoding until a unit terminator, and on silent input the policy forces
+        that terminator to be LISTEN. Such a unit still carries the turn's final
+        speech and ``<|turn_eos|>`` for the Talker, so it is not a LISTEN
+        decision. Only the current unit counts: the scan stops at the previous
+        unit terminator.
+        """
+        listen_id = special_token_ids.get("listen_token_id")
+        turn_eos_id = special_token_ids.get("turn_eos_token_id")
+        if listen_id is None or turn_eos_id is None or not token_ids or token_ids[-1] != listen_id:
+            return False
+        unit_terminators = {
+            listen_id,
+            special_token_ids.get("chunk_eos_token_id"),
+            special_token_ids.get("chunk_tts_eos_token_id"),
+        }
+        for token_id in reversed(token_ids[:-1]):
+            if token_id == turn_eos_id:
+                return True
+            if token_id in unit_terminators:
+                return False
+        return False
 
     @classmethod
     def audio_token_count(cls, sample_count: int) -> int:

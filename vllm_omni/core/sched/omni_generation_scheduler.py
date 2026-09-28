@@ -189,7 +189,11 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         Stateful codecs retain lifetime admission until their decoder state is
         released, even when no chunk is currently executing.
         """
-        if not getattr(self, "_native_data_plane", False) or self._retains_state_across_chunks:
+        if (
+            not getattr(self, "_native_data_plane", False)
+            or not self._async_chunk_transport_enabled()
+            or self._retains_state_across_chunks
+        ):
             return
         in_flight: list[Request] = []
         for request in self.running:
@@ -236,7 +240,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         self._drop_aborted_queued_requests()
         self._resync_streaming_input_counter()
         async_chunk_transport = self._async_chunk_transport_enabled()
-        native_chunks = bool(getattr(self, "_native_data_plane", False))
+        native_chunks = bool(getattr(self, "_native_data_plane", False) and async_chunk_transport)
         # Parking releases an execution slot, but stateful codecs retain their
         # request-owned state until completion or abort, in either runner.
         reserved_running_slots = (

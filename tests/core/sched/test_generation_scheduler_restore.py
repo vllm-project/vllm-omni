@@ -133,7 +133,9 @@ def test_chunk_lifecycle_no_resubmit_and_state_survives_requeue(monkeypatch) -> 
     monkeypatch.setattr("vllm_omni.core.sched.omni_generation_scheduler.create_request_queue", create_request_queue)
     scheduler._native_data_plane = True
     scheduler.chunk_transfer_adapter = None
-    scheduler.input_coordinator = SimpleNamespace(finished_requests=set(), restore_queues=lambda *args, **kwargs: None)
+    scheduler.input_coordinator = SimpleNamespace(
+        _async_chunk=True, finished_requests=set(), restore_queues=lambda *args, **kwargs: None
+    )
     scheduler.running = []
     scheduler.waiting = create_request_queue(scheduler.policy)
     scheduler.skipped_waiting = create_request_queue(scheduler.policy)

@@ -75,6 +75,17 @@ from vllm_omni.model_extras.ming_flash_omni import (
 from vllm_omni.model_extras.ming_flash_omni import (
     build_text_to_image_prompt as build_ming_flash_omni_text_to_image_prompt,
 )
+from vllm_omni.model_extras.ming_image import (
+    MING_IMAGE_EXTRA_BODY_PARAMS,
+    MING_IMAGE_EXTRA_OUTPUT_PARAMS,
+    MING_IMAGE_INIT_EXTRA_ARGS_FOR_NON_DIFFUSION_STAGES,
+)
+from vllm_omni.model_extras.ming_image import (
+    build_image_to_image_prompt as build_ming_image_image_to_image_prompt,
+)
+from vllm_omni.model_extras.ming_image import (
+    build_text_to_image_prompt as build_ming_image_text_to_image_prompt,
+)
 from vllm_omni.model_extras.sana_video import SANA_VIDEO_EXTRA_BODY_PARAMS
 from vllm_omni.model_extras.sensenova_u1 import (
     SENSENOVA_U1_EXTRA_BODY_PARAMS,
@@ -299,7 +310,15 @@ _EXTRA_SPECS: dict[str, dict[str, Any]] = {
         "text_to_image_prompt_builder": build_ming_flash_omni_text_to_image_prompt,
         "image_to_image_prompt_builder": build_ming_flash_omni_image_to_image_prompt,
     },
+    "MingImageDiffusionPipeline": {
+        "extra_body_params": MING_IMAGE_EXTRA_BODY_PARAMS,
+        "extra_output_params": MING_IMAGE_EXTRA_OUTPUT_PARAMS,
+        "init_extra_args_for_non_diffusion_stages": MING_IMAGE_INIT_EXTRA_ARGS_FOR_NON_DIFFUSION_STAGES,
+        "text_to_image_prompt_builder": build_ming_image_text_to_image_prompt,
+        "image_to_image_prompt_builder": build_ming_image_image_to_image_prompt,
+    },
 }
+_EXTRA_SPECS["MingImageLayeredDiffusionPipeline"] = _EXTRA_SPECS["MingImageDiffusionPipeline"]
 
 for model_class_name in ("LTX2Pipeline", "LTX2TwoStagePipeline"):
     _EXTRA_SPECS[model_class_name]["transformer_config_subfolder_resolver"] = ltx_transformer_config_subfolder

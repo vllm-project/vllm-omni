@@ -2,9 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """PersonaPlex pipeline: Talker (AR decode -> Mimi codebooks) -> Code2Wav (codebooks -> 24 kHz PCM).
 
-PersonaPlex is a Moshi finetune (full-duplex speech-to-speech). For offline/batch
-runs it is served as a 2-stage vllm-omni audio->audio pipeline, reusing the
-Qwen3-TTS staged topology:
+PersonaPlex is a Moshi finetune (full-duplex speech-to-speech), served as a
+2-stage vllm-omni audio->audio pipeline that reuses the Qwen3-TTS staged
+topology (online: one resumable Stage 0 request per duplex session, see
+``duplex/plugin.py``):
 
 * Stage 0 (``personaplex``) is the AR talker: the Helium temporal transformer
   plus the depformer (both built by the lead). It emits the per-frame audio
@@ -31,13 +32,8 @@ PERSONAPLEX_PIPELINE = PipelineConfig(
     # Pipeline-level default; the code2wav stage overrides per-stage below.
     model_arch="PersonaPlexTalkerForConditionalGeneration",
     default_deploy_config_name="personaplex.yaml",
-    duplex_runtime_extension=(
-        "vllm_omni.model_executor.models.personaplex.duplex.runtime_extension.PersonaPlexDuplexRuntimeExtension"
-    ),
-    duplex_serving_adapter=(
-        "vllm_omni.model_executor.models.personaplex.duplex.serving_adapter.PersonaPlexServingRuntimeAdapter"
-    ),
-    duplex_control_enabled=True,
+    # Served full duplex over /v1/realtime?duplex=1 by the unified framework.
+    duplex_plugin="vllm_omni.model_executor.models.personaplex.duplex.plugin.PersonaPlexDuplexPlugin",
     stages=(
         StagePipelineConfig(
             stage_id=0,

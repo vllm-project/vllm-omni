@@ -1527,7 +1527,9 @@ def test_async_chunk_reserves_parked_slots_during_ar_admission(monkeypatch, nati
     sched.use_v2_model_runner = native
     sched.max_num_running_reqs = 8
     sched.input_coordinator = (
-        SimpleNamespace(_waiting_for_chunk_running=[parked], restore_queues=lambda _w, _r: None) if native else None
+        SimpleNamespace(_async_chunk=True, _waiting_for_chunk_running=[parked], restore_queues=lambda _w, _r: None)
+        if native
+        else None
     )
     sched.chunk_transfer_adapter = (
         None

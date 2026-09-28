@@ -119,6 +119,8 @@ from vllm_omni.entrypoints.openai.diffusion import (
     apply_stage_default_sampling_params,
 )
 from vllm_omni.entrypoints.openai.errors import (
+    InvalidPresetVoiceReferenceError,
+    InvalidVoiceReferenceError,
     _create_speech_error_json_response,
     _error_response_to_json_response,
 )
@@ -1198,6 +1200,22 @@ async def omni_init_app_state(
     state.server_load_metrics = 0
 
 
+def _validate_chat_completion_raw_body(raw_body: dict[str, Any]) -> None:
+    """Reject values that upstream ChatCompletionRequest coerces too broadly."""
+    if "modalities" in raw_body and raw_body["modalities"] is not None:
+        modalities = raw_body["modalities"]
+        if not isinstance(modalities, list) or not all(isinstance(m, str) for m in modalities):
+            raise HTTPException(
+                status_code=HTTPStatus.BAD_REQUEST.value,
+                detail='modalities must be a list of strings, e.g. ["text", "audio", "image"]',
+            )
+    if "logprobs" in raw_body and raw_body["logprobs"] is not None and not isinstance(raw_body["logprobs"], bool):
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST.value,
+            detail="logprobs must be a boolean (true or false)",
+        )
+
+
 @router.post(
     "/v1/chat/completions",
     dependencies=[Depends(validate_json_request)],
@@ -1211,6 +1229,8 @@ async def omni_init_app_state(
 @with_cancellation
 @load_aware_call
 async def create_chat_completion(request: ChatCompletionRequest, raw_request: Request):
+    raw_body = await raw_request.json()
+    _validate_chat_completion_raw_body(raw_body)
     metrics_header_format = raw_request.headers.get(ENDPOINT_LOAD_METRICS_FORMAT_HEADER_LABEL, "")
     handler = Omnichat(raw_request)
     if handler is None:
@@ -1287,6 +1307,8 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
 @with_cancellation
 @load_aware_call
 async def create_batch_chat_completion(request: BatchChatCompletionRequest, raw_request: Request):
+    raw_body = await raw_request.json()
+    _validate_chat_completion_raw_body(raw_body)
     handler = OmniBatchChat(raw_request)
     if handler is None:
         base_server = getattr(raw_request.app.state, "serving_tokenization", None)
@@ -1652,16 +1674,20 @@ async def delete_voice(name: str, raw_request: Request):
 
     try:
         # Delete the voice
-        success = await handler.delete_voice(name)
-        if not success:
-            return _create_speech_error_json_response(
-                f"Voice '{name}' not found",
-                err_type="NotFoundError",
-                status_code=HTTPStatus.NOT_FOUND,
-            )
-
+        await handler.delete_voice(name)
         return JSONResponse(content={"success": True, "message": f"Voice '{name}' deleted successfully"})
-
+    except InvalidPresetVoiceReferenceError as e:
+        return _create_speech_error_json_response(
+            str(e),
+            err_type="ForbiddenError",
+            status_code=HTTPStatus.FORBIDDEN,
+        )
+    except InvalidVoiceReferenceError as e:
+        return _create_speech_error_json_response(
+            str(e),
+            err_type="NotFoundError",
+            status_code=HTTPStatus.NOT_FOUND,
+        )
     except ValueError as e:
         return _create_speech_error_json_response(str(e))
     except Exception as e:

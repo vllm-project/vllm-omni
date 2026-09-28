@@ -26,6 +26,7 @@ def _make_pipeline():
     pipeline.default_image_negative_prompt = "default image negative"
     pipeline.img_prompt_template = "<image>"
     pipeline.od_config = SimpleNamespace(flow_shift=None)
+    pipeline.enable_diffusion_pipeline_profiler = False
     return pipeline
 
 
@@ -572,3 +573,72 @@ def test_load_weights_rejects_external_weight_stream():
     assert pipeline.load_weights([]) == set()
     with pytest.raises(RuntimeError, match="components are loaded directly"):
         pipeline.load_weights([("transformer.weight", torch.zeros(1))])
+
+
+@pytest.mark.parametrize("enabled", [False, True], ids=["disabled", "enabled"])
+def test_pipeline_profiler_records_executed_stages_per_request(monkeypatch, enabled):
+    from vllm_omni.diffusion.models.lingbot_video import pipeline_lingbot_video as module
+    from vllm_omni.diffusion.profiler import diffusion_pipeline_profiler as profiler_module
+    from vllm_omni.diffusion.worker.utils import consume_pipeline_stage_durations
+
+    class TextEncoder(nn.Module):
+        def forward(self):
+            return torch.ones(1, 2, 4), torch.ones(1, 2, dtype=torch.long)
+
+    class VAE(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.anchor = nn.Parameter(torch.zeros(()))
+            self.config = SimpleNamespace(latents_mean=[0.0], latents_std=[1.0])
+
+        def encode(self, value):
+            return value
+
+        def decode(self, latents):
+            return (latents.repeat(1, 3, 1, 1, 1),)
+
+    components = [
+        (module.LingBotVideoTransformer3DModel, _RecordingTransformer()),
+        (module.Qwen3VLForConditionalGeneration, TextEncoder()),
+        (module.Qwen3VLProcessor, SimpleNamespace()),
+        (module.AutoencoderKLWan, VAE()),
+        (module.FlowUniPCMultistepScheduler, _CorruptingScheduler()),
+    ]
+    for component_class, component in components:
+        monkeypatch.setattr(component_class, "from_pretrained", lambda *args, value=component, **kwargs: value)
+    monkeypatch.setattr(module, "get_local_device", lambda: torch.device("cpu"))
+    monkeypatch.setattr(module.LingBotVideoPipeline, "encode_prompt", lambda self, *args, **kwargs: self.text_encoder())
+    monkeypatch.setattr(profiler_module.current_omni_platform, "is_available", lambda: False)
+    ticks = iter(range(100))
+    monkeypatch.setattr(profiler_module.time, "perf_counter", lambda: float(next(ticks)))
+    pipeline = module.LingBotVideoPipeline(
+        od_config=SimpleNamespace(
+            model="unused", dtype=torch.float32, enable_diffusion_pipeline_profiler=enabled, flow_shift=None
+        )
+    )
+    request = _make_request_batch(
+        {"prompt": "a robot", "modalities": ["video"]},
+        height=16,
+        width=16,
+        num_frames=9,
+        num_inference_steps=2,
+        guidance_scale=1.0,
+        seed=42,
+    )
+    prefix = "LingBotVideoPipeline."
+    expected = {prefix + "text_encoder.forward": 1.0, prefix + "transformer.forward": 2.0, prefix + "vae.decode": 1.0}
+    first = pipeline(request)
+    assert first.stage_durations == (expected if enabled else {})
+    assert first.output["video"].shape == (3, 2, 2, 3)
+    # A latent-only request must not inherit the previous request's VAE timing.
+    request.requests[0].sampling_params.output_type = "latent"
+    second = pipeline(request)
+    latent_expected = {key: value for key, value in expected.items() if not key.endswith("vae.decode")}
+    assert second.stage_durations == (latent_expected if enabled else {})
+    assert first.stage_durations == (expected if enabled else {})
+    consumed = consume_pipeline_stage_durations(pipeline)
+    if enabled:
+        assert consumed == {**latent_expected, prefix + "forward": 7.0}
+    else:
+        assert consumed == {}
+    assert consume_pipeline_stage_durations(pipeline) == {}

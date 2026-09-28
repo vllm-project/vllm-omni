@@ -70,6 +70,22 @@ steps:
           - export SEED_TTS_EVAL_DEVICE=cuda:1
           - pytest -s -v tests/e2e/accuracy/minicpmo_4_5/test_minicpmo_4_5.py -m "full_model and H100 and B200 and cuda and (cards_1 or cards_2)" --run-level full_model
 
+      - label: ":full_moon: Omni · Omni-DuplexEval CI Guard"
+        source_file_dependencies: omni_duplex_eval_ci
+        timeout_in_minutes: 240
+        env:
+          VLLM_DUPLEX_EVAL_JUDGE_URL: "http://127.0.0.1:8001"
+        commands:
+          - |
+            set +e
+            pytest -s -v tests/e2e/accuracy/omni_duplex_eval/test_omni_duplex_eval_ci.py \
+              -m "full_model and H100 and B200 and cuda and cards_2" \
+              --run-level full_model \
+              --basetemp /tmp/omni_duplex_ci
+            EXIT=$$?
+            buildkite-agent artifact upload "tests/e2e/accuracy/omni_duplex_eval/results/*.json"
+            exit $$EXIT
+
       - label: ":full_moon: Omni · Perf Test · No Async Chunk"
         source_file_dependencies: omni_qwen3_omni_perf
         key: nightly-omni-performance-no-async-chunk
@@ -115,6 +131,20 @@ steps:
         timeout_in_minutes: 45
         commands:
           - pytest -s -v tests/e2e/online_serving/test_qwen3_omni_multi_replicas.py -m "full_model and H100 and B200 and cards_4" --run-level "core_model"
+
+  - group: ":card_index_dividers: Entrypoints Test"
+    key: nightly-entrypoints-test-group
+    depends_on: upload-nightly-pipeline
+    if: build.env("NIGHTLY") == "1" || build.pull_request.labels includes "nightly-test"
+    steps:
+
+      - label: ":full_moon: Entrypoint Test with H100"
+        source_file_dependencies: entrypoints_function
+        # Merge collects advanced_model (5 duplex interruptions). Nightly
+        # collects full_model (20 interruptions + BAGEL sleep).
+        timeout_in_minutes: 180
+        commands:
+          - pytest -s -v tests/entrypoints/ -m "full_model and cuda and H100 and B200 and cards_2" --run-level "full_model"
 
   - group: ":card_index_dividers: TTS Model Test"
     key: nightly-tts-test-group
@@ -247,7 +277,7 @@ steps:
         commands:
           - export HUNYUAN_IMAGE3_MODEL="tencent/HunyuanImage-3.0-Instruct"
           - export HUNYUAN_IMAGE3_DEVICES="0,1,2,3"
-          - pytest -s -v tests/e2e/accuracy/test_hunyuan_image3_pixel_accuracy.py -m "full_model and H100 and B200 and cards_4" --run-level full_model
+          - pytest -s -v tests/e2e/accuracy/test_hunyuan_image3_pixel_accuracy.py tests/e2e/accuracy/test_hunyuan_image3_lora.py -m "full_model and H100 and B200 and cards_4" --run-level full_model
 
       - label: ":full_moon: Diffusion X2I(&A&T) · Perf Test · Qwen-Image · Single-GPU"
         source_file_dependencies: diffusion_qwen_image_perf

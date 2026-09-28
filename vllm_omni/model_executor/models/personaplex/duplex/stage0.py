@@ -3,17 +3,19 @@
 
 from __future__ import annotations
 
-import base64
-import binascii
 import io
 import tarfile
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 
+from vllm_omni.model_executor.common.audio.pcm import pcm_f32le_samples
+from vllm_omni.model_executor.common.duplex.payload import decode_pcm_f32le_payload
+from vllm_omni.model_executor.models.personaplex.duplex.config import FRAME_SIZE, SAMPLE_RATE
 from vllm_omni.model_executor.models.personaplex.duplex.policy import (
     AUDIO_SILENCE_FRAME_CNT,
     SILENCE_TOKENS,
@@ -22,7 +24,15 @@ from vllm_omni.model_executor.models.personaplex.duplex.policy import (
     wrap_with_system_tags,
 )
 
-_FRAME_SAMPLES = 1920
+_FRAME_SAMPLES = FRAME_SIZE
+
+
+class PersonaPlexStage0CapacityError(RuntimeError):
+    """Every streaming encoder row is leased by a live session."""
+
+
+class PersonaPlexStage0StaleEpochError(RuntimeError):
+    """The append belongs to an epoch that a newer epoch of the same session has superseded."""
 
 
 @dataclass(slots=True)
@@ -37,8 +47,10 @@ class PersonaPlexStage0PreparedAppend:
 
 @dataclass(slots=True)
 class PersonaPlexStage0SessionState:
+    """Lockstep state of one (session, epoch): a new epoch is a new Stage 0 request with fresh KV."""
+
     session_id: str
-    incarnation: int
+    epoch: int
     user_codes: Any | None = None
     last_text_token: Any | None = None
     last_agent_codes: Any | None = None
@@ -48,7 +60,9 @@ class PersonaPlexStage0SessionState:
     prepared: PersonaPlexStage0PreparedAppend | None = None
     last_seq: int = 0
     request_ids: set[str] = field(default_factory=set)
-    codec: Any | None = None
+    slot: int | None = None
+    encoded_identity: tuple[int, int] | None = None
+    encoded_frame: Any | None = None
 
 
 def _tokenizer_path(model_path: str) -> Path:
@@ -94,18 +108,39 @@ def load_personaplex_voice_state(model_path: str, voice: str) -> dict[str, Any]:
     raise FileNotFoundError(f"PersonaPlex bundled voice prompt {voice!r} was not found under {model_path!r}")
 
 
-def personaplex_prefill_slots(model_path: str, voice: str, persona: str) -> int:
+@lru_cache(maxsize=4)
+def _cached_tokenizer(model_path: str):
+    return load_personaplex_tokenizer(model_path)
+
+
+@lru_cache(maxsize=16)
+def _cached_voice_embedding_rows(model_path: str, voice: str) -> int:
     state = load_personaplex_voice_state(model_path, voice)
     embeddings = state.get("embeddings")
     if not hasattr(embeddings, "shape") or len(embeddings.shape) < 1:
         raise ValueError(f"PersonaPlex voice prompt {voice!r} has no embeddings")
-    tokenizer = load_personaplex_tokenizer(model_path)
-    persona_tokens = tokenizer(wrap_with_system_tags(persona)) if persona else []
-    return int(embeddings.shape[0]) + 2 * AUDIO_SILENCE_FRAME_CNT + len(persona_tokens)
+    return int(embeddings.shape[0])
+
+
+def personaplex_prefill_slots(model_path: str, voice: str, persona: str) -> int:
+    """Scheduler slots the first append of a session needs for the voice + persona prefill.
+
+    The voice bundle row count and the tokenizer are cached per model path:
+    they are constant, and this runs on every session open.
+    """
+    voice_rows = _cached_voice_embedding_rows(model_path, voice)
+    persona_tokens = _cached_tokenizer(model_path)(wrap_with_system_tags(persona)) if persona else []
+    return voice_rows + 2 * AUDIO_SILENCE_FRAME_CNT + len(persona_tokens)
 
 
 class PersonaPlexStage0DuplexRuntime:
-    """Own per-session streaming Mimi encoders and first-append prefill."""
+    """Own the shared streaming Mimi encoder and each session's first-append prefill.
+
+    One encoder holds ``max_sessions`` streaming rows; a live ``(session, epoch)``
+    leases one row for its lifetime. ``encode_appends`` encodes every new append
+    of a scheduler step in one batched call (rows without a new append are
+    inactive and keep their state), and ``prepare_append`` consumes the result.
+    """
 
     def __init__(
         self,
@@ -126,14 +161,61 @@ class PersonaPlexStage0DuplexRuntime:
         self.device = device
         self.max_sessions = max_sessions
         self._codec_factory = codec_factory
-        self._free_codecs: list[Any] = []
+        self._codec: Any | None = None
+        self._free_slots: list[int] = list(reversed(range(max_sessions)))
         self._tokenizer = tokenizer
         self._voice_loader = voice_loader
         self.sessions: dict[tuple[str, int], PersonaPlexStage0SessionState] = {}
         self.request_sessions: dict[str, tuple[str, int]] = {}
+        # Requests of a superseded epoch that still reached this step; they are
+        # finished by the engine and must not lease a row or record a sample.
+        self._stale_requests: set[str] = set()
         if codec is not None:
-            codec.streaming_init(1)
-            self._free_codecs.append(codec)
+            codec.streaming_init(max_sessions)
+            self._codec = codec
+
+    def encode_appends(self, appends: list[dict[str, Any]]) -> None:
+        """Encode the new user frame of each append in one batched encoder call.
+
+        Called once per scheduler step before the per-request ``prepare_append``
+        calls. An append whose ``(epoch, seq)`` is already encoded or prepared
+        (a chunked first prefill spans several steps) is skipped, so a row's
+        streaming state advances exactly once per frame. Appends that cannot be
+        admitted are left for ``prepare_append`` to reject.
+        """
+        parsed: list[tuple[str, int, int, dict[str, Any]]] = []
+        for duplex in appends:
+            try:
+                parsed.append((*_append_identity(duplex), duplex))
+            except ValueError:
+                continue
+        # A cancel can put a session's aborted epoch and its restarted epoch in
+        # one step. Only the newest epoch is live: admitting it closes the old
+        # one, so the old append must neither be encoded nor re-leased.
+        newest: dict[str, int] = {}
+        for session_id, epoch, _, _ in parsed:
+            newest[session_id] = max(epoch, newest.get(session_id, epoch))
+        for session_id, epoch in self.sessions:
+            if session_id in newest:
+                newest[session_id] = max(epoch, newest[session_id])
+        rows: list[tuple[PersonaPlexStage0SessionState, tuple[int, int], np.ndarray]] = []
+        for session_id, epoch, seq, duplex in parsed:
+            if epoch != newest[session_id]:
+                continue
+            try:
+                state = self._session_state(session_id, epoch)
+            except PersonaPlexStage0CapacityError:
+                # Left for prepare_append to reject. Any other error (e.g. the
+                # shared codec failing to initialize) propagates immediately.
+                continue
+            identity = (epoch, seq)
+            if identity in (state.prepared_identity, state.encoded_identity) or seq <= state.last_seq:
+                continue
+            if any(row[0] is state for row in rows):
+                continue
+            rows.append((state, identity, self._decode_pcm(duplex.get("payload"))))
+        if rows:
+            self._encode_rows(rows)
 
     def prepare_append(
         self,
@@ -144,25 +226,15 @@ class PersonaPlexStage0DuplexRuntime:
     ) -> PersonaPlexStage0PreparedAppend:
         import torch
 
-        session_id = duplex.get("session_id")
-        if not isinstance(session_id, str) or not session_id:
-            raise ValueError("PersonaPlex duplex append requires session_id")
-        incarnation = _coerce_non_negative_int(duplex.get("incarnation"), "incarnation")
-        epoch = _coerce_non_negative_int(duplex.get("epoch"), "epoch")
-        seq = _coerce_positive_int(duplex.get("seq"), "seq")
+        session_id, epoch, seq = _append_identity(duplex)
         identity = (epoch, seq)
-        key = (session_id, incarnation)
-
-        state = self.sessions.get(key)
-        if state is None:
-            if len(self.sessions) >= self.max_sessions:
-                raise RuntimeError(f"PersonaPlex Stage 0 session capacity {self.max_sessions} is exhausted")
-            state = PersonaPlexStage0SessionState(
-                session_id=session_id,
-                incarnation=incarnation,
-                codec=self._acquire_codec(),
-            )
-            self.sessions[key] = state
+        key = (session_id, epoch)
+        try:
+            state = self._session_state(session_id, epoch)
+        except PersonaPlexStage0StaleEpochError:
+            if request_id:
+                self._stale_requests.add(request_id)
+            raise
         if request_id:
             state.request_ids.add(request_id)
             self.request_sessions[request_id] = key
@@ -171,17 +243,11 @@ class PersonaPlexStage0DuplexRuntime:
         if seq <= state.last_seq:
             raise ValueError(f"PersonaPlex duplex append seq must increase: last={state.last_seq}, got={seq}")
 
-        pcm = self._decode_pcm(duplex.get("payload"))
-        codec = state.codec
-        if codec is None:
-            raise RuntimeError("PersonaPlex Stage 0 session has no streaming encoder")
-        encoded = codec.encode_frame(torch.from_numpy(pcm).reshape(1, _FRAME_SAMPLES))
-        user_frame = encoded.detach().to(dtype=torch.long, device="cpu").reshape(1, -1)
-        if user_frame.shape[1] < 8:
-            raise RuntimeError(
-                f"PersonaPlex Mimi encoder returned {user_frame.shape[1]} codebooks, expected at least 8"
-            )
-        user_frame = user_frame[:, :8].contiguous()
+        if state.encoded_identity != identity:
+            self._encode_rows([(state, identity, self._decode_pcm(duplex.get("payload")))])
+        user_frame = state.encoded_frame
+        state.encoded_identity = None
+        state.encoded_frame = None
         state.user_codes = user_frame if state.user_codes is None else torch.cat([state.user_codes, user_frame], dim=0)
 
         runtime_config = duplex.get("runtime_config")
@@ -291,7 +357,6 @@ class PersonaPlexStage0DuplexRuntime:
                 "stage0_prepared": True,
                 "prefill_applied": first_append,
                 "session_id": session_id,
-                "incarnation": incarnation,
                 "epoch": epoch,
                 "seq": seq,
             },
@@ -319,6 +384,8 @@ class PersonaPlexStage0DuplexRuntime:
         """Commit one sampled temporal frame for the next live append."""
         import torch
 
+        if request_id in self._stale_requests:
+            return
         key = self.request_sessions.get(request_id)
         if key is None:
             raise KeyError(f"PersonaPlex Stage 0 request is not attached to a live session: {request_id}")
@@ -353,6 +420,7 @@ class PersonaPlexStage0DuplexRuntime:
         state.sampled_identity = state.prepared_identity
 
     def close_request(self, request_id: str) -> None:
+        self._stale_requests.discard(request_id)
         key = self.request_sessions.pop(request_id, None)
         if key is None:
             return
@@ -363,35 +431,82 @@ class PersonaPlexStage0DuplexRuntime:
         if not state.request_ids:
             self.close_session(*key)
 
-    def close_session(self, session_id: str, incarnation: int) -> None:
-        key = (session_id, incarnation)
+    def close_session(self, session_id: str, epoch: int) -> None:
+        key = (session_id, epoch)
         state = self.sessions.pop(key, None)
         if state is None:
             return
         for request_id in state.request_ids:
             self.request_sessions.pop(request_id, None)
-        if state.codec is not None:
-            state.codec.reset_streaming()
-            self._free_codecs.append(state.codec)
-            state.codec = None
+        if state.slot is not None:
+            self._shared_codec().reset_slot(state.slot)
+            self._free_slots.append(state.slot)
+            state.slot = None
 
-    def _acquire_codec(self):
-        if self._free_codecs:
-            return self._free_codecs.pop()
+    def _session_state(self, session_id: str, epoch: int) -> PersonaPlexStage0SessionState:
+        key = (session_id, epoch)
+        state = self.sessions.get(key)
+        if state is not None:
+            return state
+        # A newer epoch supersedes the session's earlier lockstep state: the
+        # engine aborted that request, but its finish notification may still
+        # be in flight, so release it here rather than let the two epochs share
+        # the encoder budget.
+        # The reverse also holds: once a newer epoch is live, an append of an
+        # older epoch is a leftover of the aborted request and must not re-lease
+        # a row (at capacity it would fail the whole step).
+        newer = [k[1] for k in self.sessions if k[0] == session_id and k[1] > epoch]
+        if newer:
+            raise PersonaPlexStage0StaleEpochError(
+                f"PersonaPlex Stage 0 epoch {epoch} of session {session_id} is superseded by epoch {max(newer)}"
+            )
+        for stale_key in [k for k in self.sessions if k[0] == session_id and k[1] < epoch]:
+            self.close_session(*stale_key)
+        if len(self.sessions) >= self.max_sessions or not self._free_slots:
+            raise PersonaPlexStage0CapacityError(
+                f"PersonaPlex Stage 0 session capacity {self.max_sessions} is exhausted"
+            )
+        self._shared_codec()
+        state = PersonaPlexStage0SessionState(session_id=session_id, epoch=epoch, slot=self._free_slots.pop())
+        self.sessions[key] = state
+        return state
+
+    def _encode_rows(self, rows: list[tuple[PersonaPlexStage0SessionState, tuple[int, int], np.ndarray]]) -> None:
+        import torch
+
+        codec = self._shared_codec()
+        pcm = torch.zeros((self.max_sessions, _FRAME_SAMPLES), dtype=torch.float32)
+        active = torch.zeros((self.max_sessions,), dtype=torch.bool)
+        for state, _, samples in rows:
+            assert state.slot is not None
+            pcm[state.slot] = torch.from_numpy(samples)
+            active[state.slot] = True
+        encoded = codec.encode_frame(pcm, active)
+        # One device-to-host copy per step, whatever the number of sessions.
+        codes = encoded.detach().to(dtype=torch.long, device="cpu")
+        if codes.shape[-1] < 8:
+            raise RuntimeError(f"PersonaPlex Mimi encoder returned {codes.shape[-1]} codebooks, expected at least 8")
+        for state, identity, _ in rows:
+            state.encoded_frame = codes[state.slot : state.slot + 1, :8].clone()
+            state.encoded_identity = identity
+
+    def _shared_codec(self):
+        if self._codec is not None:
+            return self._codec
         if self._codec_factory is not None:
             codec = self._codec_factory()
-            codec.streaming_init(1)
-            return codec
-        from vllm_omni.model_executor.models.personaplex.personaplex_mimi import (
-            PersonaPlexMimiCodec,
-        )
+        else:
+            from vllm_omni.model_executor.models.personaplex.personaplex_mimi import (
+                PersonaPlexMimiCodec,
+            )
 
-        checkpoint = Path(self.model_path) / "tokenizer-e351c8d8-checkpoint125.safetensors"
-        codec = PersonaPlexMimiCodec(
-            checkpoint=str(checkpoint) if checkpoint.is_file() else None,
-            device=self.device,
-        )
-        codec.streaming_init(1)
+            checkpoint = Path(self.model_path) / "tokenizer-e351c8d8-checkpoint125.safetensors"
+            codec = PersonaPlexMimiCodec(
+                checkpoint=str(checkpoint) if checkpoint.is_file() else None,
+                device=self.device,
+            )
+        codec.streaming_init(self.max_sessions)
+        self._codec = codec
         return codec
 
     def _load_tokenizer(self):
@@ -421,23 +536,22 @@ class PersonaPlexStage0DuplexRuntime:
 
     @staticmethod
     def _decode_pcm(payload: object) -> np.ndarray:
-        if not isinstance(payload, dict):
-            raise ValueError("PersonaPlex duplex payload must be a mapping")
-        if payload.get("format") != "pcm_f32le" or payload.get("sample_rate_hz") != 24000:
-            raise ValueError("PersonaPlex Stage 0 requires 24 kHz pcm_f32le")
-        audio = payload.get("audio")
-        if not isinstance(audio, str):
-            raise ValueError("PersonaPlex Stage 0 requires base64 audio")
-        try:
-            raw = base64.b64decode(audio, validate=True)
-        except (binascii.Error, ValueError) as exc:
-            raise ValueError("PersonaPlex Stage 0 audio is not valid base64") from exc
-        samples = np.frombuffer(raw, dtype="<f4")
-        if samples.size != _FRAME_SAMPLES:
-            raise ValueError(f"PersonaPlex Stage 0 requires {_FRAME_SAMPLES} samples per append")
-        if not np.isfinite(samples).all():
-            raise ValueError("PersonaPlex Stage 0 samples must be finite")
-        return np.ascontiguousarray(samples, dtype=np.float32).copy()
+        raw = decode_pcm_f32le_payload(
+            payload,
+            sample_rate_hz=SAMPLE_RATE,
+            exact_samples=_FRAME_SAMPLES,
+            model="PersonaPlex Stage 0",
+        )
+        return pcm_f32le_samples(raw)
+
+
+def _append_identity(duplex: dict[str, Any]) -> tuple[str, int, int]:
+    session_id = duplex.get("session_id")
+    if not isinstance(session_id, str) or not session_id:
+        raise ValueError("PersonaPlex duplex append requires session_id")
+    epoch = _coerce_non_negative_int(duplex.get("epoch"), "epoch")
+    seq = _coerce_positive_int(duplex.get("seq"), "seq")
+    return session_id, epoch, seq
 
 
 def _coerce_non_negative_int(value: object, name: str) -> int:

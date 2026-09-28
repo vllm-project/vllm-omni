@@ -29,16 +29,7 @@ _SERVER_ENV: dict[str, str] = {"VLLM_OMNI_INPUT_WAIT_TIMEOUT_S": str(SERVER_INPU
 if TOKENIZER:
     _SERVER_ENV["NEMOTRON_VOICECHAT_LLM_PATH"] = TOKENIZER
 
-pytestmark = [
-    pytest.mark.full_model,
-    pytest.mark.omni,
-    # Since #7413 a duplex-capable model is served by the duplex engine only when
-    # its pipeline declares a duplex_plugin. The Nemotron VoiceChat pipeline does
-    # not, so the server starts the turn engine and the /v1/realtime websocket
-    # falls through to vllm's speech-to-text realtime handler, which rejects the
-    # native duplex client's session.update ("Missing required field: model").
-    pytest.mark.skip(reason="Nemotron VoiceChat is not served by the duplex engine yet (no duplex_plugin)"),
-]
+pytestmark = [pytest.mark.full_model, pytest.mark.omni]
 
 
 @hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=1)
@@ -71,6 +62,10 @@ def test_native_duplex_turn_taking_streams_model_audio(omni_server, tmp_path: Pa
     )
     result = asyncio.run(run(args))
     assert result["ok"] is True
-    assert result["input_frames"] == 190
-    assert result["event_counts"]["response.speak"] > 0
-    assert result["audio_bytes"] >= result["input_frames"] * 1764 * 2 // 4
+    input_frames = result["input_frames"]
+    event_counts = result["event_counts"]
+    audio_bytes = result["audio_bytes"]
+    assert isinstance(input_frames, int) and input_frames == 190
+    assert isinstance(event_counts, dict) and int(str(event_counts.get("response.speak", 0))) > 0
+    assert isinstance(audio_bytes, int)
+    assert audio_bytes >= input_frames * 1764 * 2 // 4
