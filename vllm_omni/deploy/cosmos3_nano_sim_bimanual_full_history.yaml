@@ -25,9 +25,7 @@ stages:
       action_dim: 64
       num_embodiment_domains: 32
       default_fps: 30.0
-      # Experimental: batch frame-causal clean K/V refreshes. Keep framewise
-      # until checkpoint-level quality and performance have been validated.
-      clean_commit_mode: framewise  # framewise | batched
+      clean_commit_mode: batched  # framewise | batched
       # Fresh full-video requests only; Wan decode starts before clean refresh.
       overlap_vae_decode: false
       ar_diffusion_kv_config:

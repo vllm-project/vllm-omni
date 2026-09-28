@@ -147,6 +147,7 @@ def fake_pipeline(*, prefix: bool = True) -> tuple[Any, Any]:
         for name, contract in pipe.manifest.require_action_schema().embodiments.items()
     }
     pipe.transformer = SimpleNamespace(latent_channel_size=3)
+    pipe.clean_commit_mode = "framewise"
     pipe.device = "cpu"
     pipe.dtype = torch.float32
     pipe._get_sp_param = lambda sp, key, default=None: sp.extra_args.get(key, getattr(sp, key, default))

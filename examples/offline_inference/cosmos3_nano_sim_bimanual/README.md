@@ -222,3 +222,6 @@ model_config:
 ```
 
 Disabled by default. HSDP + CUDA graphs is currently unsupported and rejected.
+
+Clean K/V commits are batched by default. Set `model_config.clean_commit_mode: framewise`
+to disable batching.

@@ -202,7 +202,7 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
     _SESSION_CAPACITY = 1
     _ar_diffusion_kv_state = None
     _bound_session_id: str | None = None
-    clean_commit_mode: str = "framewise"
+    clean_commit_mode: str = "batched"
     overlap_vae_decode: bool = False
     _decode_queue: CausalDecodeQueue | None = None
     _vae_decode_stream: torch.cuda.Stream | None = None
@@ -212,7 +212,7 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
         validate_sim_parallel_config(od_config)
         super().__init__(od_config=od_config, prefix=prefix)
         self.manifest = Cosmos3NanoSimBimanualManifest.from_od_config(od_config)
-        self.clean_commit_mode = deploy_option(od_config, "clean_commit_mode", "framewise")
+        self.clean_commit_mode = deploy_option(od_config, "clean_commit_mode", "batched")
         self.overlap_vae_decode = bool(deploy_option(od_config, "overlap_vae_decode", False))
         if self.clean_commit_mode not in {"framewise", "batched"}:
             raise ValueError("clean_commit_mode must be 'framewise' or 'batched'")
@@ -1446,7 +1446,7 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
                         terminal_request=terminal_request,
                     )
                 )
-                if getattr(self, "clean_commit_mode", "framewise") == "batched" and commit_frames:
+                if getattr(self, "clean_commit_mode", "batched") == "batched" and commit_frames:
                     # The helper returns a contiguous prefix, excluding only
                     # the global terminal frame when no continuation is needed.
                     count = len(commit_frames)
