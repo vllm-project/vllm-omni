@@ -1035,13 +1035,10 @@ async def omni_init_app_state(
             if "generate" in supported_tasks
             else None
         )
-        state.openai_serving_chat_batch = (
-            OmniOpenAIServingChatBatch.for_diffusion(
-                diffusion_engine=engine_client,  # type: ignore
-                model_name=model_name,
-            )
-            if "generate" in supported_tasks
-            else None
+
+        state.openai_serving_chat_batch = OmniOpenAIServingChatBatch.for_diffusion(
+            diffusion_engine=engine_client,  # type: ignore
+            model_name=model_name,
         )
 
         # audio related
@@ -1398,8 +1395,12 @@ async def omni_init_app_state(
         engine_client, state.openai_serving_models, request_logger=request_logger, model_name=model_name
     )
 
-    state.openai_streaming_speech = OmniStreamingSpeechHandler(
-        speech_service=state.openai_serving_speech,
+    state.openai_streaming_speech = (
+        OmniStreamingSpeechHandler(
+            speech_service=state.openai_serving_speech,
+        )
+        if state.openai_serving_speech is not None
+        else None
     )
     state.openai_streaming_video = (
         create_streaming_video_handler(
