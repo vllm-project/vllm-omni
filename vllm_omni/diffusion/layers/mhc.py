@@ -11,6 +11,7 @@ from vllm.logger import init_logger
 from vllm.triton_utils import HAS_TRITON, tl, tldevice, triton
 
 from vllm_omni.diffusion.layers.custom_op import CustomOp
+from vllm_omni.platforms import current_omni_platform
 
 _FAILED_MHC_KERNELS: set[tuple[str, int, str]] = set()
 _WARNED_MHC_KERNELS: set[tuple[str, int, str]] = set()
@@ -49,23 +50,40 @@ def sinkhorn_knopp(matrix_logits: torch.Tensor, iterations: int, epsilon: float)
     return matrix
 
 
-@triton.jit
-def _asm_add_rn_f32(a, b):
-    """Opaque FP32 add that blocks FMA contraction of ``a * b + c``.
+if current_omni_platform.is_musa():
 
-    The native expression runs the scaled-logits multiply and the bias add
-    as separate kernels, so they can never fuse; an inline-asm add is
-    invisible to the optimizer's contraction and keeps the kernel
-    bit-equal to that boundary.
-    """
-    return tl.inline_asm_elementwise(
-        "add.rn.f32 $0, $1, $2;",
-        "=f,f,f",
-        [a, b],
-        dtype=tl.float32,
-        is_pure=True,
-        pack=1,
-    )
+    @triton.jit
+    def _asm_add_rn_f32(a, b):
+        """Opaque FP32 add that blocks FMA contraction of ``a * b + c``.
+
+        The MUSA assembler cannot allocate the PTX ``=f`` register class
+        for inline asm, so the barrier is expressed as a correctly-rounded
+        fused op instead: ``fma_rn(a, 1.0, b)`` is exactly the
+        correctly-rounded ``a + b`` (``a * 1`` is exact) and is already a
+        single fused multiply-add, so the optimizer cannot contract
+        anything further.
+        """
+        return tldevice.fma_rn(a, 1.0, b)
+
+else:
+
+    @triton.jit
+    def _asm_add_rn_f32(a, b):
+        """Opaque FP32 add that blocks FMA contraction of ``a * b + c``.
+
+        The native expression runs the scaled-logits multiply and the bias
+        add as separate kernels, so they can never fuse; an inline-asm add
+        is invisible to the optimizer's contraction and keeps the kernel
+        bit-equal to that boundary.
+        """
+        return tl.inline_asm_elementwise(
+            "add.rn.f32 $0, $1, $2;",
+            "=f,f,f",
+            [a, b],
+            dtype=tl.float32,
+            is_pure=True,
+            pack=1,
+        )
 
 
 @triton.jit
