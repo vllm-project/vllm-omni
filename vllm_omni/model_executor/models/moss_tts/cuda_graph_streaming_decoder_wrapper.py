@@ -88,7 +88,10 @@ class CUDAGraphStreamingDecoderWrapper:
         self.frame_sizes = sorted({int(size) for size in frame_sizes if int(size) > 0})
         self.num_quantizers = int(num_quantizers)
         self.graphs: dict[tuple[int, int], _CapturedStreamingDecodeGraph] = {}
-        self._pool = None
+        # A Talker-local first decoder runs concurrently with the AR graphs.
+        # Their scratch allocations must never share a replay memory pool.
+        private_pool = getattr(vllm_config.model_config.hf_config, "codec_private_graph_pool", False)
+        self._pool = torch.cuda.graph_pool_handle() if private_pool else None
         self._warmed_up = False
         # vLLM owns Inductor compilation; this wrapper remains the sole owner
         # of CUDA Graph capture/replay because it understands persistent codec

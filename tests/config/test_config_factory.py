@@ -2931,6 +2931,22 @@ class TestPlatformOverrides:
             # v2 only engages the native plane on stages declaring support.
             assert all(ps.supports_native_mrv2_data_plane for ps in pipeline.stages)
 
+    def test_moss_local_full_profile_reaches_both_worker_consumers(self):
+        deploy = load_deploy_config(Path(get_deploy_config_path("moss_tts_local_h200_full.yaml")))
+        pipeline = resolve_pipeline_config("moss_tts_local")
+        stages = merge_pipeline_deploy(pipeline, deploy)
+
+        assert all(stage.yaml_runtime["cuda_mps"] for stage in stages)
+        assert all(stage.yaml_engine_args["use_v2_model_runner"] for stage in stages)
+        assert all(stage.yaml_engine_args["supports_native_mrv2_data_plane"] for stage in stages)
+        assert all(stage.yaml_engine_args["dtype"] == "bfloat16" for stage in stages)
+        assert all(stage.yaml_engine_args.get("quantization") is None for stage in stages)
+        assert stages[0].yaml_engine_args["hf_overrides"]["moss_first_frame_empty_history"]
+        assert stages[0].yaml_engine_args["hf_overrides"]["moss_backbone_fused_kernels"]
+        assert stages[1].yaml_engine_args["hf_overrides"]["codec_async_output"]
+        assert stages[1].yaml_engine_args["hf_overrides"]["codec_batch_pcm_copy"]
+        assert stages[1].yaml_engine_args["retains_state_across_chunks"]
+
     @pytest.mark.parametrize("runner,native", [("v1", False), ("v2", False), ("v2", True)])
     def test_mrv2_undeclared_transport_warns(self, monkeypatch, runner, native):
         from unittest.mock import Mock

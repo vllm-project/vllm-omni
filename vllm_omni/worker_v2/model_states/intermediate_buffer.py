@@ -251,9 +251,14 @@ class OmniIntermediateBuffer:
                 f"actual={owned.shape[0] if owned.ndim else 0}"
             )
 
-        for row, req_index in enumerate(req_indices):
+        # Construct views in one C++ operation rather than issuing a Python
+        # tensor indexing operation for every request. Storage ownership is
+        # unchanged: each view keeps the immutable batch snapshot alive.
+        if num_rows == 0:
+            return
+        rows = owned.split(1, dim=0) if keepdim else owned.unbind(dim=0)
+        for req_index, row_value in zip(req_indices, rows, strict=True):
             existing = self.buffers[req_index]
-            row_value = owned[row : row + 1] if keepdim else owned[row]
             if isinstance(key, tuple) and len(key) == 2:
                 type_key, qualifier = key
                 existing_sub = existing.setdefault(type_key, {})

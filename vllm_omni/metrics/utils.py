@@ -585,20 +585,18 @@ def _format_table(
                 return ", ".join(str(v) for v in value)
         return str(value)
 
-    table = PrettyTable()
+    rows: list[list[str]] = []
 
     # Single-column mode:  data is a dict
     if isinstance(data, dict):
-        table.field_names = ["Field", "Value"]
-        table.align["Field"] = "l"
-        table.align["Value"] = "r"
+        headers = ["Field", "Value"]
         for field in value_fields:
             if field in data:
                 if isinstance(data[field], dict):
                     for sub_key, sub_value in data[field].items():
-                        table.add_row([f"{sub_key}", _format_value(sub_value)])
+                        rows.append([f"{sub_key}", _format_value(sub_value)])
                 else:
-                    table.add_row([field, _format_value(data[field])])
+                    rows.append([field, _format_value(data[field])])
 
     # Multi-column mode: data is a list of dicts
     else:
@@ -616,14 +614,44 @@ def _format_table(
                 seen[h] = n + 1
                 deduped.append(h if n == 0 else f"{h}_{n + 1}")
             col_headers = deduped
-        table.field_names = ["Field"] + col_headers
-        table.align["Field"] = "l"
-        for col in col_headers:
-            table.align[col] = "r"
+        headers = ["Field"] + col_headers
         for field in value_fields:
             row_values = [_format_value(r.get(field, "")) for r in data]
-            table.add_row([field] + row_values)
+            rows.append([field] + row_values)
 
+    # Request statistics are overwhelmingly short ASCII cells. PrettyTable's
+    # general Unicode width, wrapping and style machinery is expensive on the
+    # serving event loop. Render its default layout directly for this subset;
+    # retain PrettyTable for multiline, Unicode and other special content.
+    cells = [headers, *rows]
+    if len(set(headers)) == len(headers) and all(
+        isinstance(cell, str) and cell.isascii() and (not cell or cell.isprintable()) for row in cells for cell in row
+    ):
+        widths = [max(len(row[col]) for row in cells) for col in range(len(headers))]
+        border = "+" + "+".join("-" * (width + 2) for width in widths) + "+"
+
+        def render(row: list[str]) -> str:
+            return (
+                "| "
+                + " | ".join(
+                    cell.ljust(width) if col == 0 else cell.rjust(width)
+                    for col, (cell, width) in enumerate(zip(row, widths, strict=True))
+                )
+                + " |"
+            )
+
+        lines = [f"[{title}]", border, render(headers), border]
+        lines.extend(render(row) for row in rows)
+        lines.append(border)
+        return "\n".join(lines)
+
+    table = PrettyTable()
+    table.field_names = headers
+    table.align["Field"] = "l"
+    for header in headers[1:]:
+        table.align[header] = "r"
+    for row in rows:
+        table.add_row(row)
     return "\n".join([f"[{title}]", table.get_string()])
 
 

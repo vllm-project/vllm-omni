@@ -121,3 +121,37 @@ def test_count_tokens_from_outputs() -> None:
     ]
 
     assert count_tokens_from_outputs(engine_outputs) == 6
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["", "x", "hello world", "中文", "a\nb", "a\rb", "a\tb", "\x1b[31mred\x1b[0m"],
+)
+def test_statistics_table_preserves_prettytable_layout(value):
+    from prettytable import PrettyTable
+
+    from vllm_omni.metrics.utils import _format_table
+
+    table = PrettyTable()
+    table.field_names = ["Field", "Value"]
+    table.align["Field"] = "l"
+    table.align["Value"] = "r"
+    table.add_row(["metric", value])
+    assert _format_table("stats", {"metric": value}, ["metric"]) == "[stats]\n" + table.get_string()
+
+
+@pytest.mark.parametrize("num_rows", [0, 1, 25])
+def test_statistics_stage_table_keeps_duplicate_headers_and_empty_rows(num_rows):
+    from prettytable import PrettyTable
+
+    from vllm_omni.metrics.utils import _format_table
+
+    fields = [f"metric_{i}" for i in range(num_rows)]
+    data = [{"stage_id": 0, **{f: i * 1234 for i, f in enumerate(fields)}} for _ in range(2)]
+    table = PrettyTable()
+    table.field_names = ["Field", "0", "0_2"]
+    table.align["Field"] = "l"
+    table.align["0"] = table.align["0_2"] = "r"
+    for i, field in enumerate(fields):
+        table.add_row([field, f"{i * 1234:,}", f"{i * 1234:,}"])
+    assert _format_table("stages", data, fields, "stage_id") == "[stages]\n" + table.get_string()

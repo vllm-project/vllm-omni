@@ -251,6 +251,7 @@ class MossReferenceEncoder:
         caller salts those requests with ``voice_created_at`` instead).
         """
         voice_name, created_at = _registered_voice(voice_name, voice_created_at)
+        inline_key = None
 
         if voice_name:
             # A named voice has a stable key that does not depend on the
@@ -268,11 +269,22 @@ class MossReferenceEncoder:
             # reference (not the content hash), so concurrent requests for the
             # same ref_str also share the resolve/download, not just the encode.
             flight_key = "ref:" + _sha1(ref_str)
+            if ref_str[:11].lower() == "data:audio/":
+                # Inline bytes are immutable. Keep their compact codes in the
+                # existing byte-bounded LRU independently of the much larger
+                # waveform cache; evicting a waveform need not decode it again.
+                # Files/URLs retain the resolver's invalidation behavior.
+                inline_key = self._make_cache_key("inline:" + flight_key, 0)
+                cached = self._speaker_cache.get(inline_key)
+                if cached is not None:
+                    return _clone_out(cached["codes"]), cached["resolve_key"]
 
         codes, resolve_key = await self._single_flight(
             flight_key,
             lambda: self._resolve_and_encode(ref_str, resolve_ref_audio, get_artifact_key, voice_name, created_at),
         )
+        if inline_key is not None:
+            self._speaker_cache.put(inline_key, {"codes": codes, "resolve_key": resolve_key})
         return _clone_out(codes), resolve_key
 
     async def _single_flight(

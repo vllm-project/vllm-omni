@@ -141,6 +141,36 @@ async def test_same_reference_encodes_once(make_encoder):
     assert int(r1[0, 0]) == 7 and int(r2[0, 0]) == 7
 
 
+async def test_inline_codes_survive_waveform_eviction_and_keep_resolve_identity(make_encoder):
+    proc, audio = _FakeProcessor(), _FakeAudio()
+    ref = "data:audio/wav;base64,AAAA"
+    audio.register(ref, 7)
+    enc = make_encoder(proc)
+    first, key = await enc.encode(ref, resolve_ref_audio=audio.resolve, get_artifact_key=audio.artifact_key)
+    first.fill_(999)
+    audio._wav.clear()
+    audio._artifact.clear()
+    second, second_key = await enc.encode(ref, resolve_ref_audio=audio.resolve, get_artifact_key=audio.artifact_key)
+    assert second_key == key == "rk:" + ref
+    assert int(second[0, 0]) == 7
+    assert len(audio.resolve_calls) == 1
+    assert proc.total_items == 1
+
+
+async def test_inline_code_lru_remains_bounded_and_reloads_after_eviction(make_encoder):
+    cache = SpeakerEmbeddingCache(max_bytes=64)  # one 3x4 int32 artifact
+    proc, audio = _FakeProcessor(), _FakeAudio()
+    a, b = "data:audio/wav;base64,AAAA", "data:audio/wav;base64,BBBB"
+    audio.register(a, 7)
+    audio.register(b, 8)
+    enc = make_encoder(proc, cache=cache)
+    assert int((await _encode(enc, audio, a))[0, 0]) == 7
+    assert int((await _encode(enc, audio, b))[0, 0]) == 8
+    assert int((await _encode(enc, audio, a))[0, 0]) == 7
+    assert cache.memory_bytes() <= 64
+    assert proc.total_items == 3
+
+
 async def test_returned_tensor_does_not_alias_cache(make_encoder):
     proc, audio = _FakeProcessor(), _FakeAudio()
     audio.register("a", 7)

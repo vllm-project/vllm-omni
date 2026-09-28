@@ -21,6 +21,18 @@ class OwnedBatchTensor(NamedTuple):
     tensor: torch.Tensor
 
 
+class RequestBatchTensor(NamedTuple):
+    """Internal multimodal output with an explicit request axis.
+
+    Keep one tensor through GPU snapshot and D2H, then slice rows on the CPU.
+    Unlike the token axis, this axis is independent of prefill token counts.
+    This marks layout, not ownership; the runner still snapshots graph outputs.
+    """
+
+    tensor: torch.Tensor
+    keepdim: bool = True
+
+
 class OmniOutput(NamedTuple):
     """Output from the merged Omni model containing both text and audio."""
 

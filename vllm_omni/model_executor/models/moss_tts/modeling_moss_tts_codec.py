@@ -19,6 +19,7 @@ from vllm.model_executor.model_loader import DefaultModelLoader
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.utils.torch_utils import set_default_torch_dtype
 
+from vllm_omni.data_entry_keys import FIRST_AUDIO_REQUIRED_KEY
 from vllm_omni.model_executor.models.moss_tts.audio_tokenizer import (
     MossAudioTokenizerConfig,
     MossAudioTokenizerModel,
@@ -52,11 +53,13 @@ class _MossCodecStreamSession:
         vllm_config: VllmConfig,
         graph_batch_sizes: list[int] | None = None,
         graph_frame_sizes: list[int] | None = None,
+        return_device_audio: bool = False,
     ) -> None:
         self._codec = codec
         self._state_capacity = int(state_capacity)
         self._n_vq = int(n_vq)
         self._device = next(codec.parameters()).device
+        self._return_device_audio = return_device_audio
         self._free_stream_slots = list(reversed(range(self._state_capacity)))
         self._leased_slots: set[int] = set()
         self._closed = False
@@ -121,6 +124,22 @@ class _MossCodecStreamSession:
         self._leased_slots.remove(slot)
         self._free_stream_slots.append(slot)
 
+    def _device_slot_ids(self, slots: list[int]) -> torch.Tensor:
+        # Adapted from #7409: resident contiguous IDs avoid H2D entirely.
+        n = len(slots)
+        if not n:
+            return self._state_slot_ids[:0]
+        start = slots[0]
+        if all(slot == start + row for row, slot in enumerate(slots)):
+            return self._state_slot_ids[start : start + n]
+        if self._device.type == "cuda":
+            # Each copy owns a fresh pinned allocation. Do not reuse a host
+            # staging buffer before its DMA completes: CUDA stream ordering
+            # alone does not order CPU writes to pinned memory.
+            host = torch.tensor(slots, dtype=torch.long, device="cpu", pin_memory=True)
+            return host.to(self._device, non_blocking=True)
+        return torch.tensor(slots, dtype=torch.long, device=self._device)
+
     def _reset_slot_ids(self, slot_ids: torch.Tensor) -> None:
         reset_streaming_slots = getattr(self._codec, "reset_decoder_state_slots", None)
         if not callable(reset_streaming_slots):
@@ -177,7 +196,7 @@ class _MossCodecStreamSession:
             ],
             dim=1,
         )
-        state_slot_ids = torch.tensor(slots, device=self._device, dtype=torch.long)
+        state_slot_ids = self._device_slot_ids(slots)
 
         graph_output: tuple[torch.Tensor, torch.Tensor, int] | None = None
         if self._cudagraph_wrapper is not None:
@@ -214,10 +233,20 @@ class _MossCodecStreamSession:
 
         if terminal_slots:
             terminal_rows = [row for row, slot in enumerate(slots) if slot in terminal_slots]
-            terminal_slot_ids = state_slot_ids if len(terminal_rows) == len(slots) else state_slot_ids[terminal_rows]
+            terminal_slot_ids = (
+                state_slot_ids
+                if len(terminal_rows) == len(slots)
+                else self._device_slot_ids([slots[row] for row in terminal_rows])
+            )
             self._reset_slot_ids(terminal_slot_ids)
 
-        audio = audio_tensor.detach().to("cpu", torch.float32)
+        if self._return_device_audio:
+            # Captured outputs alias storage reused by the next graph replay.
+            # Own this batch before the runner asynchronously copies its rows
+            # to pinned CPU buffers on the output stream.
+            audio = audio_tensor.detach().to(dtype=torch.float32, copy=True)
+        else:
+            audio = audio_tensor.detach().to("cpu", torch.float32)
         out: dict[int, torch.Tensor] = {}
         for row, slot in enumerate(slots):
             audio_length = int(slot_codes[slot].shape[1]) * self._samples_per_frame
@@ -281,6 +310,8 @@ class MossTTSCodecDecoder(nn.Module):
         self._stream_chunk_frames: int = self._connector_int("codec_chunk_frames", default=0)
         self._stream_max_step_frames: int = self._stream_chunk_frames or 100
         self._stream_req_slots: dict[str, int] = {}
+        self._accept_first_audio = bool(self._connector_int("moss_talker_first_audio", default=0))
+        self._stream_first_audio_requests: set[str] = set()
         self._async_chunk = bool(getattr(self.vllm_config.model_config, "async_chunk", False))
         self._streaming_graph_batch_sizes = self._streaming_graph_batch_sizes_from_compilation_config()
         self._streaming_graph_frame_sizes = sorted(
@@ -337,6 +368,7 @@ class MossTTSCodecDecoder(nn.Module):
         empty = self._empty_audio()
         info_list: list[dict[str, Any]] = list(runtime_additional_information or [{}])
         num_req = max(len(info_list), 1)
+        first_audio_flags = self._first_audio_flags(info_list)
 
         if self._codec is None:
             logger.warning("MossTTSCodecDecoder called before load_weights(); returning silence.")
@@ -365,7 +397,11 @@ class MossTTSCodecDecoder(nn.Module):
         if input_ids is None or input_ids.numel() == 0:
             return OmniOutput(
                 text_hidden_states=None,
-                multimodal_outputs={"model_outputs": audios, "sr": srs},
+                multimodal_outputs={
+                    "model_outputs": audios,
+                    "sr": srs,
+                    **self._first_audio_metadata(first_audio_flags),
+                },
             )
 
         # ``input_ids`` is concatenated across all requests. vLLM-Omni runners
@@ -387,6 +423,9 @@ class MossTTSCodecDecoder(nn.Module):
             )
         if real_token_count < input_token_count:
             ids_flat = ids_flat[:real_token_count]
+        # #7409 batch I/O: transfer and clamp once for the whole execution
+        # batch, instead of launching the same operation for every request.
+        ids_flat = ids_flat.to(device=device).clamp_(0, int(self._codec.config.codebook_size) - 1)
 
         num_req = len(token_counts)
         if len(info_list) < num_req:
@@ -399,6 +438,9 @@ class MossTTSCodecDecoder(nn.Module):
         elif len(audios) > num_req:
             audios = audios[:num_req]
             srs = srs[:num_req]
+
+        first_audio_flags = self._first_audio_flags(info_list)
+        trim_first: set[int] = set()
 
         offsets = [0]
         for n in token_counts:
@@ -426,8 +468,7 @@ class MossTTSCodecDecoder(nn.Module):
             # (= ``codebook_size``) for delay-pattern padding.  The stage input
             # processor de-delays and drops pad rows before forwarding here, but
             # clamp as a defensive guard against any edge-case leakage.
-            codebook_size = self._codec.config.codebook_size
-            codes_nq_t = codes_nq_t.clamp_(0, int(codebook_size) - 1)
+            # The shared input buffer was clamped before splitting requests.
 
             left_ctx = meta.get("left_context_size", 0)
             if isinstance(left_ctx, (list, tuple)):
@@ -439,6 +480,8 @@ class MossTTSCodecDecoder(nn.Module):
             req_key = self._runtime_request_key(info, meta, i)
 
             if streaming_enabled:
+                if first_audio_flags[i] and req_key not in self._stream_req_slots:
+                    trim_first.add(i)
                 streaming_work.append((i, req_key, codes_nq_t, finished))
                 continue
 
@@ -473,12 +516,38 @@ class MossTTSCodecDecoder(nn.Module):
 
         if streaming_work:
             for i, wav in self._decode_streaming_batch(streaming_work).items():
+                if i in trim_first:
+                    # Decode to prime causal state, but do not send PCM twice.
+                    wav = wav[..., int(self._codec.downsample_rate) :]
                 audios[i] = wav.reshape(-1) if wav.ndim == 1 or int(wav.shape[0]) == 1 else wav
 
         return OmniOutput(
             text_hidden_states=None,
-            multimodal_outputs={"model_outputs": audios, "sr": srs},
+            multimodal_outputs={"model_outputs": audios, "sr": srs, **self._first_audio_metadata(first_audio_flags)},
         )
+
+    def _first_audio_flags(self, infos):
+        if not getattr(self, "_accept_first_audio", False):
+            return [False] * len(infos)
+        flags = []
+        for i, info in enumerate(infos):
+            meta = (info.get("meta", {}) if isinstance(info, dict) else {}) or {}
+            req_id = self._runtime_request_key(info, meta, i)
+            first = meta.get("first_audio", False)
+            if isinstance(first, (tuple, list)):
+                first = first[0] if first else False
+            if isinstance(first, torch.Tensor):
+                first = bool(first.numel() and first.reshape(-1)[0].item())
+            if first:
+                self._stream_first_audio_requests.add(req_id)
+            flags.append(req_id in self._stream_first_audio_requests)
+        return flags
+
+    @staticmethod
+    def _first_audio_metadata(flags):
+        if not any(flags):
+            return {}
+        return {FIRST_AUDIO_REQUIRED_KEY: [torch.tensor(flag) for flag in flags]}
 
     @staticmethod
     def _normalize_seq_token_counts(value: Any) -> list[int] | None:
@@ -525,6 +594,7 @@ class MossTTSCodecDecoder(nn.Module):
             vllm_config=self.vllm_config,
             graph_batch_sizes=self._streaming_graph_batch_sizes,
             graph_frame_sizes=self._streaming_graph_frame_sizes,
+            return_device_audio=bool(getattr(self.vllm_config.model_config.hf_config, "codec_async_output", False)),
         )
         return self._stream_session
 
@@ -634,6 +704,7 @@ class MossTTSCodecDecoder(nn.Module):
         if slot is not None:
             session.release(slot, state_already_reset=state_already_reset)
         self._stream_req_slots.pop(request_id, None)
+        getattr(self, "_stream_first_audio_requests", set()).discard(request_id)
 
     def on_requests_finished(self, finished_req_ids: set[str] | list[str]) -> None:
         """Release codec streaming slots when requests finish outside payload flow.
@@ -784,17 +855,44 @@ class MossTTSCodecDecoder(nn.Module):
         # The v1 quantizer emits FP32 tensors, so its decoder must remain FP32.
         if device.type != "cpu" and isinstance(codec, MossAudioTokenizerV2Model):
             codec.decoder.to(dtype=torch.bfloat16)
+        if getattr(self.vllm_config.model_config.hf_config, "codec_fused_gelu", False):
+            from vllm_omni.model_executor.models.moss_tts.audio_tokenizer_v2 import MossAudioTokenizerTransformerLayer
+
+            if device.type != "cuda" or not isinstance(codec, MossAudioTokenizerV2Model):
+                raise ValueError("codec_fused_gelu requires CUDA and MOSS codec v2")
+            for module in codec.decoder.modules():
+                if isinstance(module, MossAudioTokenizerTransformerLayer):
+                    if (
+                        module.gating is not None
+                        or module.activation is not torch.nn.functional.gelu
+                        or module.linear1.bias is not None
+                    ):
+                        raise ValueError("codec_fused_gelu requires bias-free GELU FFN")
+                    module.register_buffer(
+                        "_ffn_zero_bias",
+                        torch.zeros(module.linear1.out_features, device=device, dtype=module.linear1.weight.dtype),
+                        persistent=False,
+                    )
+                    module._fused_ffn_gelu = True
+            logger.info("Enabled fused codec GEMM GELU")
         attention_backend = getattr(self.vllm_config.model_config.hf_config, "codec_attention_backend", "sdpa")
         if attention_backend != "sdpa":
-            if attention_backend != "triton" or device.type != "cuda":
+            if attention_backend not in {"triton", "triton_slot"} or device.type != "cuda":
                 raise ValueError(f"Unsupported codec attention backend/device: {attention_backend}/{device.type}")
             from vllm_omni.model_executor.models.moss_tts.audio_tokenizer_v2 import MossAudioTokenizerMultiheadAttention
             from vllm_omni.model_executor.models.moss_tts.streaming_attention import masked_attention
 
+            if attention_backend == "triton_slot":
+                from vllm_omni.model_executor.models.moss_tts.codec_attention import (
+                    selective_slot as slot_ring_attention,
+                )
+
             for module in codec.decoder.modules():
                 if isinstance(module, MossAudioTokenizerMultiheadAttention):
                     module._streaming_attention = masked_attention
-            logger.info("Enabled Triton masked attention for the streaming codec decoder")
+                    if attention_backend == "triton_slot":
+                        module._slot_attention = slot_ring_attention
+            logger.info("Enabled codec attention backend=%s", attention_backend)
         build_decode_lut = getattr(codec.quantizer, "build_decode_lut", None)
         if callable(build_decode_lut):
             lut_dtype = torch.bfloat16 if device.type == "cuda" else torch.float32

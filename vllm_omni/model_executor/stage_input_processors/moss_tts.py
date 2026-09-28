@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 # Copyright 2026 OpenMOSS and the vLLM-Omni team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License").
@@ -245,20 +248,39 @@ def talker2codec_raw_async_chunk(
     if not hasattr(transfer_manager, "put_req_chunk"):
         transfer_manager.put_req_chunk = defaultdict(int)
 
+    # Persist the delivery promise through metadata-only terminal callbacks.
+    saved = transfer_manager.request_payload.get(req_id)
+    direct_first = isinstance(saved, dict) and bool(saved.get("first_audio", False))
+    if not direct_first:
+        source_meta = multimodal_output.get("meta", {}) if isinstance(multimodal_output, Mapping) else {}
+        direct_first = source_meta.get("first_audio", False)
+        if isinstance(direct_first, torch.Tensor):
+            direct_first = bool(direct_first.numel() and direct_first.reshape(-1)[-1].item())
+        direct_first = bool(direct_first)
+        if direct_first:
+            transfer_manager.request_payload[req_id] = {"first_audio": True}
+
     pending_frames = transfer_manager.code_prompt_token_ids[req_id]
 
     if isinstance(multimodal_output, Mapping):
         codes_dict = multimodal_output.get("codes", {}) or {}
         new_frames = codes_dict.get("audio")
         if isinstance(new_frames, torch.Tensor) and new_frames.numel() > 0:
-            frames_cpu = new_frames.detach().to("cpu", torch.long).contiguous()
+            # tolist() below takes ownership and supports strided CPU inputs.
+            # The usual batched D2H output already has the required dtype.
+            frames_cpu = new_frames
+            if frames_cpu.device.type != "cpu" or frames_cpu.dtype != torch.long:
+                frames_cpu = frames_cpu.detach().to("cpu", torch.long)
             if frames_cpu.ndim == 1:
                 frames_cpu = frames_cpu.reshape(1, -1)
             if frames_cpu.ndim != 2:
                 raise ValueError(f"MOSS raw codec frames must be 2-D, got {tuple(frames_cpu.shape)}")
-            valid_rows = frames_cpu.ne(_MOSS_AUDIO_PAD_CODE).any(dim=1)
-            for frame in frames_cpu[valid_rows]:
-                pending_frames.append(frame.clone())
+            # Codes are already on the host after the batched D2H snapshot.
+            # Own the integer rows once instead of issuing tiny CPU tensor
+            # kernels and cloning a tensor for every frame of every request.
+            pending_frames.extend(
+                row for row in frames_cpu.tolist() if any(code != _MOSS_AUDIO_PAD_CODE for code in row)
+            )
         # Raw/local streaming should mirror the non-streaming path: the codec
         # decodes only generated audio rows. Reference audio conditions the
         # talker, but feeding its codes into the codec streaming state adds a
@@ -286,6 +308,11 @@ def talker2codec_raw_async_chunk(
     pending = len(pending_frames)
     emitted_any = int(transfer_manager.put_req_chunk.get(req_id, 0)) > 0
     threshold = initial_chunk_frames if initial_chunk_frames > 0 and not emitted_any else chunk_frames
+    # The direct sender already owns the first PCM packet. Prime the normal
+    # codec with the first full chunk instead of issuing a duplicate T=1
+    # execution; its existing trim removes the one already delivered frame.
+    if direct_first and not emitted_any and cfg.get("moss_defer_codec_prime", False):
+        threshold = chunk_frames
     if pending <= 0:
         if is_finished:
             transfer_manager.code_prompt_token_ids.pop(req_id, None)
@@ -293,6 +320,7 @@ def talker2codec_raw_async_chunk(
             return OmniPayloadStruct(
                 meta=MetaStruct(
                     req_id=[req_id],
+                    first_audio=torch.tensor(True, dtype=torch.bool) if direct_first else None,
                     left_context_size=0,
                     codec_chunk_frames=0,
                     codec_left_context_frames=0,
@@ -308,10 +336,7 @@ def talker2codec_raw_async_chunk(
     emit_frames = pending if is_finished else threshold
     chunk_rows = pending_frames[:emit_frames]
     del pending_frames[:emit_frames]
-    chunk_codes = torch.stack(
-        [row.to(torch.long).cpu() for row in chunk_rows],
-        dim=0,
-    ).contiguous()
+    chunk_codes = torch.tensor(chunk_rows, dtype=torch.long)
     finished = bool(is_finished and len(pending_frames) == 0)
 
     codec_flat = chunk_codes.transpose(0, 1).contiguous().reshape(-1).to(torch.long)
@@ -324,6 +349,7 @@ def talker2codec_raw_async_chunk(
         codes=CodesStruct(audio=codec_flat),
         meta=MetaStruct(
             req_id=[req_id],
+            first_audio=torch.tensor(True, dtype=torch.bool) if direct_first else None,
             left_context_size=0,
             codec_chunk_frames=int(chunk_codes.shape[0]),
             codec_left_context_frames=0,

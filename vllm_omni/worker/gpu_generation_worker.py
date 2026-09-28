@@ -8,8 +8,9 @@ import torch
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.tracing import instrument
+from vllm.utils.gc_utils import freeze_gc_heap
 from vllm.utils.mem_utils import MemorySnapshot, format_gib
-from vllm.utils.torch_utils import set_random_seed
+from vllm.utils.torch_utils import set_random_seed, set_torch_threads_for_runtime
 from vllm.v1.utils import report_usage_stats
 from vllm.v1.worker.gpu_worker import (
     CompilationTimes,
@@ -126,4 +127,9 @@ class GPUGenerationWorker(OmniWorkerMixin, OmniGPUWorkerBase):
 
         start = time.perf_counter()
         self.model_runner.profile_run()
+        freeze_gc_heap()
+        # Skipping sampler warmup must not skip the upstream serving-time
+        # thread policy. Small codec CPU copies otherwise spin up the loading
+        # thread pool and contend with scheduling and output delivery.
+        set_torch_threads_for_runtime()
         return CompilationTimes(language_model=time.perf_counter() - start, encoder=0.0)

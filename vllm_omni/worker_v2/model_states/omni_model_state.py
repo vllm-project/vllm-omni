@@ -195,8 +195,15 @@ class OmniModelState(DefaultModelState):
             model.eager_frames_active = True
             logger.info("Eager Talker-MTP frames enabled")
 
+        factory = getattr(model, "create_first_audio_state", None)
+        self._early_first_audio = factory(self) if callable(factory) else None
+
     def set_first_audio_sink(self, sink: Any) -> None:
-        self._eager_state.set_first_audio_sink(sink)
+        early = getattr(self, "_early_first_audio", None)
+        if early is not None:
+            early.set_sink(sink)
+        else:
+            self._eager_state.set_first_audio_sink(sink)
 
     def run_eager_mtp(
         self,
@@ -394,6 +401,9 @@ class OmniModelState(DefaultModelState):
         if req_id is not None:
             getattr(self, "_mtp_generators", {}).pop(req_id, None)
             getattr(self, "_first_audio_requests", set()).discard(req_id)
+            early = getattr(self, "_early_first_audio", None)
+            if early is not None:
+                early.remove(req_id)
         getattr(self, "_eager_ready", {}).pop(req_index, None)
         getattr(self, "_eager_settled", {}).pop(req_index, None)
         self.intermediate_buffer.remove_request(req_index)
@@ -639,6 +649,10 @@ class OmniModelState(DefaultModelState):
                 else n_tok > 1
             )
             preprocess_entries.append((i, req_idx, start, n_tok, info, is_prefill))
+
+        early = getattr(self, "_early_first_audio", None)
+        if early is not None:
+            early.record_prefills(input_batch, preprocess_entries)
 
         if self._eager_mtp:
             # Rows whose sample is kept this step: decode, or the final prefill chunk.
@@ -893,6 +907,7 @@ class OmniModelState(DefaultModelState):
         Uses pre-allocated static buffers to avoid per-step torch.cat
         memory allocations.
         """
+        early = getattr(self, "_early_first_audio", None)
         bsz = len(mtp_batches)
         batch_offsets = self._mtp_batch_offsets(
             mtp_batches,
@@ -917,7 +932,19 @@ class OmniModelState(DefaultModelState):
             mtp_batch_descriptor_dispatcher,
         )
 
+        publish_first = getattr(early, "after_mtp", None)
+        if codes is not None and callable(publish_first):
+            publish_first(
+                [str(self.intermediate_buffer.buffers[idx]["req_id"]) for idx in req_indices],
+                codes[:bsz],
+                batch_ids[:bsz],
+            )
         embeds.index_copy_(0, batch_offsets, new_emb[:bsz].reshape(bsz, -1))
+        consume_batch = getattr(self.model, "consume_mtp_batch_mrv2", None)
+        if codes is not None and callable(consume_batch):
+            req_ids = [str(self.intermediate_buffer.buffers[idx]["req_id"]) for idx in req_indices]
+            if consume_batch(req_ids=req_ids, codes=codes[:bsz]) is True:
+                return
         audio_key = getattr(self.model, "mtp_output_key", None)
         validity_key = getattr(self.model, "mtp_validity_key", None)
         valid_rows = None

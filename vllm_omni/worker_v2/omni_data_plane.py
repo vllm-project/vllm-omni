@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import math
 import threading
 import time
 from collections import defaultdict
@@ -84,6 +85,31 @@ class OmniRunnerDataPlane(OmniConnectorModelRunnerMixin):
         self._native_outputs_in_flight: dict[str, int] = defaultdict(int)
         self._native_terminal_pending: set[str] = set()
         self.init_omni_connectors(model_config=model_config)
+        config = getattr(getattr(self, "_omni_connector", None), "config", None)
+        # ConnectorFactory passes spec.extra directly to the constructor.
+        extra = config.get("extra", config) if isinstance(config, dict) else {}
+        self._generation_batch_wait_s = float(extra.get("generation_batch_wait_ms", 0)) / 1000
+        self._generation_batch_min_size = int(extra.get("generation_batch_min_size", 1))
+        self._generation_batch_hold_terminal_audio = bool(extra.get("generation_batch_hold_terminal_audio", False))
+        self._generation_batch_hold_first_audio = bool(extra.get("generation_batch_hold_first_audio", False))
+        self._generation_batch_deadline: float | None = None
+        if (
+            not math.isfinite(self._generation_batch_wait_s)
+            or self._generation_batch_wait_s < 0
+            or self._generation_batch_min_size < 1
+        ):
+            raise ValueError("generation batch wait must be nonnegative and minimum batch size positive")
+        if (
+            self._model_mode != "generation"
+            or getattr(getattr(vllm_config, "parallel_config", None), "tensor_parallel_size", 1) != 1
+        ):
+            self._generation_batch_wait_s = 0
+        if self._generation_batch_wait_s > 0:
+            logger.info(
+                "Generation input coalescing: wait <= %.1f ms, target batch %d",
+                self._generation_batch_wait_s * 1000,
+                self._generation_batch_min_size,
+            )
         self._delivery_manager = OmniDeliveryManager(
             delivery_timeout_s=self._connector_delivery_timeout(),
             shutdown_timeout_s=_DEFAULT_SHUTDOWN_TIMEOUT_S,
@@ -94,6 +120,47 @@ class OmniRunnerDataPlane(OmniConnectorModelRunnerMixin):
             else should_accumulate_full_payload_output(model_config, self._custom_process_func)
         )
         self._start_output_worker(max_pending_batches=_NATIVE_OUTPUT_QUEUE_DEPTH)
+
+    def _hold_ready_requests_locked(self, ready: set[str]) -> set[str]:
+        """Select steady chunks to retain; caller holds the receiver lock.
+
+        First chunks bypass by default; optionally give them the same bounded
+        deadline. Finish-only notifications always bypass. Consumable terminal
+        tails can also join the batch instead of launching tiny graphs.
+        """
+        if getattr(self, "_generation_batch_wait_s", 0) <= 0:
+            return set()
+        steady = {
+            req_id
+            for req_id in ready
+            if (
+                self._get_req_chunk.get(req_id, 0) > 1
+                or (
+                    getattr(self, "_generation_batch_hold_first_audio", False)
+                    and self._local_request_metadata.get(req_id, {}).get("next_stage_prompt_len", 0) > 0
+                )
+            )
+            and (
+                req_id not in self._chunk_finished_req_ids
+                or (
+                    getattr(self, "_generation_batch_hold_terminal_audio", False)
+                    and self._local_request_metadata.get(req_id, {}).get("next_stage_prompt_len", 0) > 0
+                )
+            )
+        }
+        if not steady or len(steady) >= self._generation_batch_min_size:
+            if steady and not getattr(self, "_generation_batch_target_logged", False):
+                logger.info("Generation coalescing reached target: releasing %d steady requests", len(steady))
+                self._generation_batch_target_logged = True
+            self._generation_batch_deadline = None
+            return set()
+        now = time.monotonic()
+        if self._generation_batch_deadline is None:
+            self._generation_batch_deadline = now + self._generation_batch_wait_s
+        if now >= self._generation_batch_deadline:
+            self._generation_batch_deadline = None
+            return set()
+        return steady
 
     def _connector_delivery_timeout(self) -> float:
         config = getattr(getattr(self, "_omni_connector", None), "config", None)

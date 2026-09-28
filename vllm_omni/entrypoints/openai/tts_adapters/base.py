@@ -73,7 +73,23 @@ def conditioning_cache_salt(request: "OpenAICreateSpeechRequest", tts_params: di
     the same voice and same-path local audio rewrites without hashing decoded
     waveform arrays.
     """
-    h = hashlib.sha256()
+    h = hashlib.sha256(b"omni-tts-conditioning-v2")
+
+    def update(part: Any) -> None:
+        # Avoid repr() scanning/escaping multi-megabyte base64 audio strings
+        # under the GIL. Type and byte-length delimiters retain unambiguous
+        # boundaries even for strings containing NUL or arbitrary Unicode.
+        if part is None:
+            h.update(b"n")
+            return
+        if isinstance(part, str):
+            tag, value = b"s", part.encode("utf-8")
+        else:
+            tag, value = b"r", repr(part).encode("utf-8")
+        h.update(tag)
+        h.update(len(value).to_bytes(8, "big"))
+        h.update(value)
+
     for part in (
         request.input,
         request.task_type,
@@ -85,9 +101,7 @@ def conditioning_cache_salt(request: "OpenAICreateSpeechRequest", tts_params: di
         request.x_vector_only_mode,
         request.speaker_embedding,
     ):
-        h.update(b"\x00")
-        if part is not None:
-            h.update(repr(part).encode("utf-8"))
+        update(part)
     # Fold conditioning derived by adapters and absent from the raw request.
     for key in (
         "voice_created_at",
@@ -98,10 +112,8 @@ def conditioning_cache_salt(request: "OpenAICreateSpeechRequest", tts_params: di
         "ref_audio_cache_key",
         "ref_audio_2_cache_key",
     ):
-        h.update(b"\x00")
         value = tts_params.get(key) if tts_params is not None else None
-        if value is not None:
-            h.update(repr(value).encode("utf-8"))
+        update(value)
     return h.hexdigest()[:32]
 
 

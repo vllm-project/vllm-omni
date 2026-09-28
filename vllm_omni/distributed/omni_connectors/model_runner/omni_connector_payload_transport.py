@@ -1441,6 +1441,7 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
         return cast(OmniPayload, dict(merged))
 
     def _drain_omni_connector_output(self) -> OmniConnectorOutput:
+        held_ready: set[str] = set()
         tp_group = self._get_local_tp_group()
         if self._async_chunk and tp_group is not None and getattr(tp_group, "world_size", 1) > 1:
             if self.is_data_transfer_rank():
@@ -1461,12 +1462,24 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
                 request_metadata = dict(fanout_packet["request_metadata"])
         else:
             with self._lock:
-                newly_finished = set(self._finished_load_reqs)
-                self._finished_load_reqs.clear()
-                chunk_finished = set(self._chunk_finished_req_ids)
-                self._chunk_finished_req_ids.clear()
-                request_metadata = dict(self._local_request_metadata)
-                self._local_request_metadata.clear()
+                hold_ready = getattr(self, "_hold_ready_requests_locked", None)
+                if callable(hold_ready):
+                    held_ready = hold_ready(self._finished_load_reqs | self._chunk_ready_req_ids)
+                if held_ready:
+                    newly_finished = self._finished_load_reqs - held_ready
+                    self._finished_load_reqs.difference_update(newly_finished)
+                    request_metadata = {
+                        req_id: self._local_request_metadata.pop(req_id)
+                        for req_id in list(self._local_request_metadata)
+                        if req_id not in held_ready
+                    }
+                else:
+                    newly_finished = set(self._finished_load_reqs)
+                    self._finished_load_reqs.clear()
+                    request_metadata = dict(self._local_request_metadata)
+                    self._local_request_metadata.clear()
+                chunk_finished = self._chunk_finished_req_ids - held_ready
+                self._chunk_finished_req_ids.difference_update(chunk_finished)
                 # _send_side_request_payload is the async accumulation buffer for
                 # future recv chunks. Clearing it on every consumable wake-up drops
                 # intermediate
@@ -1482,12 +1495,12 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
         self._chunk_ready_req_ids.update(newly_finished)
 
         output = OmniConnectorOutput(
-            chunk_ready_req_ids=set(self._chunk_ready_req_ids),
+            chunk_ready_req_ids=self._chunk_ready_req_ids - held_ready,
             chunk_finished_req_ids=chunk_finished,
             request_metadata=request_metadata,
             kv_sent_req_ids=list(self._kv_sent_req_ids),
             stage_recv_req_ids=set(self._stage_recv_req_ids),
-            has_pending_kv_work=self.has_pending_kv_work(),
+            has_pending_kv_work=bool(held_ready) or self.has_pending_kv_work(),
         )
         if output.stage_recv_req_ids or chunk_finished or newly_finished:
             logger.debug(
@@ -1497,7 +1510,10 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
                 chunk_finished,
                 output.chunk_ready_req_ids,
             )
-        self._chunk_ready_req_ids.clear()
+        if held_ready:
+            self._chunk_ready_req_ids.difference_update(output.chunk_ready_req_ids)
+        else:
+            self._chunk_ready_req_ids.clear()
         self._kv_sent_req_ids.clear()
         self._stage_recv_req_ids.clear()
         return output

@@ -152,3 +152,67 @@ curl -X POST http://localhost:8091/v1/audio/speech \
 - No `ref_audio` required or accepted for MOSS-SoundEffect.
 - Input field maps to the `ambient_sound` parameter in the upstream processor.
 - Rate: ~12.5 tokens per second; longer descriptions produce longer audio.
+
+## MOSS Local v1.5 full BF16 pipeline on H200
+
+The opt-in [`moss_tts_local_h200_full.yaml`](../../vllm_omni/deploy/moss_tts_local_h200_full.yaml)
+combines native MRV2, FULL backbone graphs, CUDA MPS, Local QKV lookup and
+fused sampling, slot codec attention, asynchronous PCM output and early first-audio
+delivery. It requires one large-memory NVIDIA H200, TP/PP=1, CUDA/Triton and the
+MOSS Audio Tokenizer v2 checkpoint. It uses BF16 without quantization and disables
+prefix caching. Keep the standard Local profile for other deployment targets.
+
+The Talker owns a private first-frame codec and publishes its PCM through the
+existing first-audio sender. The regular codec receives the same first code to
+establish streaming state, primes at 15 frames, and removes the already-delivered
+PCM frame. Clients receive chunks of 1, 14, 15, ... frames; shorter terminal chunks
+are flushed. This does not share persistent codec state across processes.
+
+```bash
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=0 OMP_NUM_THREADS=1 \
+  vllm serve OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5 \
+  --omni --host 0.0.0.0 --port 8124 --trust-remote-code \
+  --deploy-config vllm_omni/deploy/moss_tts_local_h200_full.yaml \
+  --api-server-count 1 --init-timeout 3600 --stage-init-timeout 3600 \
+  --allowed-local-media-path /path/to/workspace
+```
+
+The YAML explicitly enables `cuda_mps: true`; stage-specific priorities alone do
+not start MPS. Cold compilation and graph capture can take several minutes.
+The early decoder adds a second decoder copy and private graph buffers in the
+Talker process, so this preset is not a memory sizing recommendation for smaller
+GPUs. Backbone tile64 attention is installed only on eligible MOSS model
+instances, without replacing an upstream global operator. Other attention
+configurations retain the upstream implementation.
+
+Reproduce the original client workload with the existing benchmark:
+
+```bash
+VLLM_OMNI_BENCH_AUDIO_SAMPLE_RATE=48000 VLLM_OMNI_BENCH_AUDIO_CHANNELS=2 \
+  python benchmarks/tts/bench_tts.py --host 127.0.0.1 --port 8124 \
+  --model OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5 \
+  --task voice_clone --locale en --dataset-path /path/to/workspace/seedtts_testset \
+  --num-prompts 1088 --concurrency 64 64 128 64 128 --output-len 256 \
+  --output-dir /path/to/results/moss-local-full
+```
+
+Historical retained-source results on one H200 (September 27, 2026), not a new
+measurement of the submitted integration:
+
+| Concurrency | Audio seconds / wall second | Client mean TTFP (ms) |
+| --- | ---: | ---: |
+| 64 | 422.5 | 87.7 |
+| 128 | 521.1 | 201.7 |
+
+Each of five rounds completed 1088 requests without errors. The first C64 round
+is treated as cold and excluded. Throughput pools audio seconds and wall time
+across the two remaining rounds per concurrency; TTFP is a request-weighted mean,
+not P50 or an unloaded single-request latency. A later same-configuration H200
+rerun measured 418.2 / 86.2 ms at C64 and 517.6 / 198.2 ms at C128.
+
+These measurements cover the whole combination and cannot be assigned to one
+kernel or added to other PR speedups. The Local sampler changes the RNG mapping
+relative to `torch.multinomial`; identical speech at a fixed seed is not claimed.
+The empty-history first decoder is experimental: inherited cross-service waveform
+differences remain, and protocol checks do not establish speech-quality equivalence.
+No new WER, SIM or UTMOS evaluation is included in this integration.

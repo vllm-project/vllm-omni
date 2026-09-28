@@ -34,8 +34,9 @@ from vllm_omni.model_executor.models.moss_tts.modeling_moss_tts_local import (
 from vllm_omni.model_executor.models.moss_tts.modeling_moss_tts_local_depth import (
     MossTTSLocalDepthTransformer,
 )
-from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.model_executor.models.output_templates import OmniOutput, OwnedBatchTensor, RequestBatchTensor
 from vllm_omni.platforms import current_omni_platform
+from vllm_omni.worker.sampling_utils import get_tts_local_seed
 
 logger = init_logger(__name__)
 
@@ -1304,6 +1305,7 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
         self.vllm_config = vllm_config
+        self.first_frame_decoder = None
         self.config: MossTTSLocalConfig = vllm_config.model_config.hf_config
 
         qwen3_cfg = self.config.qwen3_config
@@ -1368,6 +1370,7 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
         self._batch_should_continue: torch.Tensor | None = None
 
         self.gpu_resident_buffer_keys: set[tuple[str, str]] = {
+            ("codes", "ref"),
             ("audio_codes", "current"),
             ("audio_codes", "accumulated"),
             ("hidden_states", "last"),
@@ -1393,6 +1396,17 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
             positions=positions,
             intermediate_tensors=intermediate_tensors,
             inputs_embeds=inputs_embeds,
+        )
+
+    def get_forced_token_ids_mrv2(self, num_rows: int) -> torch.Tensor | None:
+        """Owning text token IDs for the native one-row-per-request path."""
+        mask = self._batch_should_continue
+        if not isinstance(mask, torch.Tensor) or mask.numel() != num_rows:
+            return None
+        return torch.where(
+            mask.reshape(-1).to(dtype=torch.bool),
+            self.audio_assistant_slot_token_id,
+            self.im_end_token_id,
         )
 
     def compute_logits(
@@ -1480,6 +1494,10 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
         (outside the valid embedding range). Returns the ``(T, H)`` additive
         audio embedding, masking out pad positions per codebook.
         """
+        if self._stacked_audio_emb_w is not None and codes.device.type == "cuda":
+            from vllm_omni.model_executor.models.moss_tts.audio_embed_kernel import audio_embed
+
+            return audio_embed(codes, self._stacked_audio_emb_w, self.audio_pad_token_id)
         device = codes.device
         valid_mask = codes.ne(self.audio_pad_token_id)  # (T, n_vq)
         safe_codes = codes.masked_fill(~valid_mask, 0).clamp(0, self.audio_vocab_size - 1)
@@ -1514,7 +1532,7 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
         is_prefill = bool(info_dict.get("_omni_is_prefill", False))
 
         if span_len > 1 or is_first_call or is_prefill:
-            embeds = self.model.embed_tokens(input_ids)
+            embeds = input_embeds if input_embeds is not None else self.model.embed_tokens(input_ids)
 
             ref_codes = (info_dict.get("codes", {}) or {}).get("ref")
             ref_offset = int(info_dict.get("ref_offset", 0))
@@ -1556,6 +1574,7 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
         *,
         input_ids: torch.Tensor,
         req_infos: list[dict[str, Any]],
+        input_embeds: torch.Tensor | None = None,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor,
@@ -1571,31 +1590,34 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
                 f"MOSS-TTS Local decode preprocess received {input_ids.numel()} token ids for {batch_size} requests"
             )
 
-        text_embeds = self.model.embed_tokens(input_ids)
+        text_embeds = input_embeds if input_embeds is not None else self.model.embed_tokens(input_ids)
         hidden_rows: list[torch.Tensor] = []
         active_rows: list[bool] = []
         for info in req_infos:
             last_hidden = (info.get("hidden_states", {}) or {}).get("last")
             if isinstance(last_hidden, torch.Tensor) and last_hidden.numel() > 0:
-                hidden_rows.append(
-                    last_hidden.to(
-                        device=text_embeds.device,
-                        dtype=text_embeds.dtype,
-                    ).reshape(1, -1)
-                )
+                if last_hidden.device != text_embeds.device or last_hidden.dtype != text_embeds.dtype:
+                    last_hidden = last_hidden.to(device=text_embeds.device, dtype=text_embeds.dtype)
+                hidden_rows.append(last_hidden if last_hidden.ndim == 1 else last_hidden.reshape(-1))
             else:
-                hidden_rows.append(text_embeds.new_zeros((1, self.hidden_size)))
+                hidden_rows.append(text_embeds.new_zeros((self.hidden_size,)))
 
             state = info.get("audio_state", {}) or {}
             active_rows.append(isinstance(state, dict) and not bool(state.get("is_stopping")))
 
-        last_talker_hidden = torch.cat(hidden_rows, dim=0)
+        last_talker_hidden = torch.stack(hidden_rows, dim=0)
         text_step = torch.zeros_like(last_talker_hidden)
-        text_step[:, 0] = torch.tensor(
-            active_rows,
-            device=text_step.device,
-            dtype=text_step.dtype,
-        )
+        if all(active_rows):
+            text_step[:, 0].fill_(1)
+        elif any(active_rows):
+            if text_step.device.type == "cuda":
+                # A pageable torch.tensor(..., device="cuda") synchronizes
+                # the decode stream. Own the pinned source for this copy;
+                # the caching allocator retains it until the DMA completes.
+                controls = torch.tensor(active_rows, dtype=text_step.dtype, device="cpu", pin_memory=True)
+                text_step[:, 0].copy_(controls.to(text_step.device, non_blocking=True))
+            else:
+                text_step[:, 0] = torch.tensor(active_rows, device=text_step.device, dtype=text_step.dtype)
         return (
             input_ids,
             text_embeds,
@@ -1667,8 +1689,86 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
         return input_embeds_out, output_codes
 
     # ------------------------------------------------------------------
+    def postprocess_batch_mrv2(
+        self,
+        *,
+        hidden_states: torch.Tensor,
+        last_token_indices: torch.Tensor,
+    ) -> tuple[tuple[str, str], OwnedBatchTensor]:
+        # Reuse the native batched hook already used by Qwen3-TTS. One owning
+        # gather replaces a separate graph-output snapshot for each request.
+        return (
+            ("hidden_states", "last"),
+            OwnedBatchTensor(hidden_states.index_select(0, last_token_indices)),
+        )
+
+    # MRV2 reads model-owned capabilities; retain the V1 hook and platform
+    # graph-safety setting as the canonical implementation.
+    mtp = talker_mtp
+    get_mtp_seed = staticmethod(get_tts_local_seed)
+    batched_gpu_staging_keys = {("codes", "ref")}
+
+    @property
+    def mtp_output_key(self) -> tuple[str, str]:
+        """Return the request-buffer destination for one local audio frame."""
+        return self.talker_mtp_output_key
+
+    @property
+    def mtp_graph_safe(self) -> bool:
+        """Honor the same platform graph-safety override as the V1 runner."""
+        return self.talker_mtp_graph_safe
+
     # Package runner-generated audio frames
     # ------------------------------------------------------------------
+
+    def capture_first_frame_graphs(self):
+        if self.first_frame_decoder is not None:
+            self.first_frame_decoder.warmup()
+
+    def create_first_audio_state(self, owner):
+        if self.first_frame_decoder is None:
+            return None
+        from .first_audio_state import MossEarlyFirstAudioState
+
+        return MossEarlyFirstAudioState(owner, self.first_frame_decoder)
+
+    def consume_mtp_batch_mrv2(self, *, req_ids: list[str], codes: torch.Tensor) -> bool:
+        # One owning snapshot keeps graph storage alive until output packing.
+        if codes.shape != (len(req_ids), self.n_vq):
+            raise ValueError("MOSS MTP output must contain one code frame per request")
+        previous = getattr(self, "_mrv2_mtp_output", None)
+        if getattr(self, "first_frame_decoder", None) is not None and previous is not None:
+            # Early first frames and regular decode rows may share one step.
+            req_ids = [*previous[0], *req_ids]
+            codes = torch.cat((previous[1], codes), dim=0)
+        self._mrv2_mtp_output = (tuple(req_ids), codes.detach().clone())
+        return True
+
+    def _make_batched_mtp_output(self, hidden, info_dicts, batch) -> OmniOutput:
+        produced_ids, codes = batch
+        req_ids = tuple(str(info["req_id"]) for info in info_dicts)
+        active = codes.ne(self.audio_pad_token_id).any(dim=-1)
+        if produced_ids == req_ids:
+            batch_codes = codes
+            should_continue = active
+        else:
+            positions = {req_id: i for i, req_id in enumerate(req_ids)}
+            row_indices = [positions[req_id] for req_id in produced_ids]
+            indices = torch.tensor(row_indices, dtype=torch.long, device="cpu", pin_memory=hidden.is_cuda).to(
+                device=hidden.device, non_blocking=True
+            )
+            batch_codes = codes.new_full((len(req_ids), self.n_vq), self.audio_pad_token_id)
+            batch_codes.index_copy_(0, indices, codes)
+            # Prefill rows have no audio frame and must keep generating text.
+            should_continue = torch.ones(len(req_ids), device=hidden.device, dtype=torch.bool)
+            should_continue.index_copy_(0, indices, active)
+        self._batch_state = []
+        self._batch_state_spans = None
+        self._batch_should_continue = should_continue
+        return OmniOutput(
+            text_hidden_states=hidden,
+            multimodal_outputs={"codes": {"audio": RequestBatchTensor(batch_codes)}},
+        )
 
     def make_omni_output(
         self,
@@ -1685,6 +1785,11 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
         info_dicts: list[dict[str, Any]] = (
             kwargs.get("model_intermediate_buffer") or kwargs.get("runtime_additional_information") or []
         )
+
+        batch_output = getattr(self, "_mrv2_mtp_output", None)
+        self._mrv2_mtp_output = None
+        if batch_output is not None:
+            return self._make_batched_mtp_output(hidden, info_dicts, batch_output)
 
         for info in info_dicts:
             if isinstance(info, dict) and not isinstance(info.get("audio_state"), dict):
@@ -1786,6 +1891,18 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
             [e.weight.detach() for e in self.audio_embeddings], dim=0
         )  # (n_vq, audio_vocab_size, hidden_size)
 
+        if current_omni_platform.is_cuda() and bool(getattr(self.config, "moss_backbone_fused_kernels", False)):
+            from .backbone_attention import install as install_attention
+            from .residual_norm import install as install_norm
+
+            logger.info("MOSS backbone tile64 attention: %d layers", install_attention(self.model))
+            logger.info("MOSS fused residual norm: %d layers", install_norm(self.model))
+
+        if current_omni_platform.is_cuda() and self.local_transformer.ln_f.weight.dtype in (
+            torch.bfloat16,
+            torch.float16,
+        ):
+            self.local_transformer.prepare_qkv_lookup(self.audio_embeddings, self.n_vq)
         if not self.vllm_config.model_config.enforce_eager:
             self.local_transformer.setup_compile()
 
@@ -1799,6 +1916,12 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
         not_loaded = [n for n in params_dict if n not in loaded]
         if not_loaded:
             logger.warning("[MossTTSLocal] %d params NOT loaded (first 5: %s)", len(not_loaded), not_loaded[:5])
+        from .first_frame_decoder import MossFirstFrameDecoder, first_audio_enabled
+
+        if first_audio_enabled(self.vllm_config):
+            self.first_frame_decoder = MossFirstFrameDecoder(self.vllm_config)
+            first_loaded = self.first_frame_decoder.load()
+            loaded.update("first_frame_decoder." + name for name in first_loaded)
         return loaded
 
 

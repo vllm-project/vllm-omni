@@ -106,6 +106,7 @@ class OmniGenerationAsyncOutput(AsyncModelRunnerOutput):
         copy_stream: torch.cuda.Stream,
         finalize_output: Any | None = None,
         check_ep_fault: bool = False,
+        batch_pcm_copy: bool = False,
     ) -> None:
         self.model_runner_output = model_runner_output
         self.num_reqs = num_reqs
@@ -115,12 +116,33 @@ class OmniGenerationAsyncOutput(AsyncModelRunnerOutput):
 
         with torch.cuda.stream(copy_stream):
             copy_stream.wait_stream(main_stream)
-            self.multimodal_outputs_cpu = _async_copy_mm(
-                multimodal_outputs,
-                total_tokens=0,
-                copy_stream=copy_stream,
-                pin_memory=PIN_MEMORY,
-            )
+            if batch_pcm_copy and isinstance(multimodal_outputs, dict):
+                from vllm_omni.worker_v2.shared_pcm_copy import copy_shared_pcm_views
+
+                pcm = multimodal_outputs.get("model_outputs")
+                if isinstance(pcm, list):
+                    from vllm_omni.worker_v2.omni_ar_model_runner import _async_copy_tensor
+
+                    copied_pcm = copy_shared_pcm_views(
+                        pcm,
+                        lambda value: _async_copy_tensor(value, copy_stream=copy_stream, pin_memory=PIN_MEMORY),
+                    )
+                    other_outputs = {key: value for key, value in multimodal_outputs.items() if key != "model_outputs"}
+                    self.multimodal_outputs_cpu = _async_copy_mm(
+                        other_outputs, total_tokens=0, copy_stream=copy_stream, pin_memory=PIN_MEMORY
+                    )
+                    self.multimodal_outputs_cpu["model_outputs"] = copied_pcm
+                else:
+                    batch_pcm_copy = False
+            else:
+                batch_pcm_copy = False
+            if not batch_pcm_copy:
+                self.multimodal_outputs_cpu = _async_copy_mm(
+                    multimodal_outputs,
+                    total_tokens=0,
+                    copy_stream=copy_stream,
+                    pin_memory=PIN_MEMORY,
+                )
             if check_ep_fault:
                 has_fault = get_ep_all2all_manager().query_fault()
                 self._has_fault = has_fault.to("cpu", non_blocking=True)
@@ -505,6 +527,7 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
                 copy_stream=self.output_copy_stream,
                 finalize_output=self._finalize_native_data_plane_output,
                 check_ep_fault=self.check_ep_fault,
+                batch_pcm_copy=bool(getattr(self.model_config.hf_config, "codec_batch_pcm_copy", False)),
             )
             self._reserve_native_data_plane_outputs(list(req_ids))
             self._release_generation_slots(input_batch)

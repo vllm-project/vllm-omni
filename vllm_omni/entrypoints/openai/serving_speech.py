@@ -1173,6 +1173,10 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         """Validate ref_audio is a supported URI format. Returns error or None."""
         if not isinstance(ref_audio, str):
             return "ref_audio must be a URL (http/https), base64 data URL (data:...), or file URI (file://...)"
+        if ref_audio[:11].lower() == "data:audio/":
+            # The decoder validates data URI contents. Parsing its potentially
+            # multi-megabyte payload cannot change this already known scheme.
+            return None
         scheme = (urlparse(ref_audio).scheme or "").lower()
         if scheme not in {"http", "https", "data", "file"}:
             return "ref_audio must be a URL (http/https), base64 data URL (data:...), or file URI (file://...)"
@@ -1187,6 +1191,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         Remote ``http`` / ``https`` / ``data`` locators, including ``HTTP://``,
         return ``None`` and stay string-keyed.
         """
+        if ref_audio_str[:11].lower() == "data:audio/":
+            return None
         parsed = urlparse(ref_audio_str)
         scheme = (parsed.scheme or "").lower()
         if scheme in _REMOTE_REF_AUDIO_SCHEMES:

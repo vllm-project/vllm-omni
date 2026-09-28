@@ -1,0 +1,145 @@
+# Retained MOSS Local BF16 full pipeline on one H200.
+# First PCM: 1 frame; codec priming: 15 frames; subsequent PCM: 14, 15, ...
+# See recipes/OpenMOSS/MOSS-TTS.md for prerequisites and measurement limits.
+dtype: bfloat16
+async_chunk: true
+connectors:
+  shm:
+    extra:
+      codec_chunk_frames: 15
+      codec_left_context_frames: 0
+      connector_get_max_wait: 300
+      connector_get_max_wait_first_chunk: 1000
+      connector_get_sleep_s: 0.005
+      generation_batch_hold_first_audio: false
+      generation_batch_hold_terminal_audio: true
+      generation_batch_min_size: 8
+      generation_batch_wait_ms: 10
+      initial_codec_chunk_frames: 1
+      moss_talker_first_audio: true
+      moss_defer_codec_prime: true
+    name: SharedMemoryConnector
+model_runner: v2
+stages:
+- async_scheduling: true
+  compilation_config:
+    cudagraph_capture_sizes:
+    - 1
+    - 2
+    - 4
+    - 8
+    - 16
+    - 24
+    - 32
+    - 40
+    - 48
+    - 56
+    - 64
+    - 72
+    - 80
+    - 88
+    - 96
+    - 104
+    - 112
+    - 120
+    - 128
+    - 160
+    - 192
+    - 224
+    - 256
+    - 320
+    - 384
+    - 448
+    - 512
+    - 768
+    - 1024
+    - 1280
+    - 1536
+    - 1792
+    - 2048
+    - 2560
+    - 3072
+    - 3584
+    - 4096
+    cudagraph_mode: FULL
+    max_cudagraph_capture_size: 4096
+  default_sampling_params:
+    max_tokens: 4096
+    repetition_penalty: 1.0
+    seed: 42
+    temperature: 1.7
+    top_k: 25
+    top_p: 0.8
+  devices: '0'
+  enable_prefix_caching: false
+  gpu_memory_utilization: 0.6
+  kv_cache_memory_bytes: 34359738368
+  max_model_len: 4096
+  max_num_batched_tokens: 4096
+  max_num_seqs: 256
+  output_connectors:
+    to_stage_1: shm
+  stage_id: 0
+  attention_config:
+    backend: TRITON_ATTN
+  hf_overrides:
+    moss_first_frame_empty_history: true
+    moss_backbone_fused_kernels: true
+- async_scheduling: true
+  compilation_config:
+    cudagraph_capture_sizes:
+    - 1
+    - 2
+    - 3
+    - 4
+    - 5
+    - 6
+    - 7
+    - 8
+    - 9
+    - 10
+    - 11
+    - 12
+    - 13
+    - 14
+    - 15
+    - 16
+    - 20
+    - 24
+    - 28
+    - 32
+    - 40
+    - 48
+    - 56
+    - 64
+    - 80
+    - 96
+    - 112
+    - 128
+    - 160
+    - 192
+    - 256
+    cudagraph_num_of_warmups: 1
+  default_sampling_params:
+    max_tokens: 65536
+    repetition_penalty: 1.0
+    seed: 42
+    temperature: 0.0
+    top_k: -1
+    top_p: 1.0
+  devices: '0'
+  enable_prefix_caching: false
+  enforce_eager: false
+  gpu_memory_utilization: 0.3
+  hf_overrides:
+    codec_async_output: true
+    codec_attention_backend: triton_slot
+    codec_fused_gelu: true
+    codec_batch_pcm_copy: true
+  input_connectors:
+    from_stage_0: shm
+  max_model_len: 65536
+  max_num_batched_tokens: 65536
+  max_num_seqs: 256
+  stage_id: 1
+cuda_mps: true
