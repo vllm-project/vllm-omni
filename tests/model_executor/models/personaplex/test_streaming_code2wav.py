@@ -173,7 +173,7 @@ def test_mimi_full_stream_reset_reuses_all_state_storage_and_clears_offsets() ->
 
 
 def _model(
-    *, max_sessions: int = 1, install: bool = True, cuda_graphs: bool = False
+    *, max_sessions: int = 1, install: bool = True, cuda_graphs: bool = False, async_chunk: bool = True
 ) -> tuple[PersonaPlexCode2Wav, _FakeBatchedMimi]:
     mimi_config = SimpleNamespace(num_codebooks=2, sample_rate=24000, samples_per_frame=4, mimi_name=None)
     config = SimpleNamespace(mimi_config=mimi_config, mimi_name=None, mimi_cuda_graphs=cuda_graphs)
@@ -182,6 +182,7 @@ def _model(
             model="/unused",
             hf_config=config,
             duplex_max_sessions=max_sessions,
+            async_chunk=async_chunk,
         ),
         device_config=SimpleNamespace(device="cpu"),
     )
@@ -244,16 +245,67 @@ def test_load_weights_builds_one_shared_decoder_with_a_row_per_session(
     assert built[0].captured_rows == ([4] if cuda_graphs else [])
 
 
-@pytest.mark.parametrize("second_codes", [_codes(3), _codes(1, start=100)])
-def test_resumable_codes_emit_only_new_pcm(second_codes: torch.Tensor) -> None:
+def test_delta_codes_skip_cpu_history(mocker) -> None:
+    model, _ = _model()
+    decode = mocker.patch.object(model, "_decode_pending", return_value=[])
+    cat = mocker.spy(personaplex_code2wav.torch, "cat")
+    equal = mocker.spy(personaplex_code2wav.torch, "equal")
+
+    for frame in range(1000):
+        model(input_ids=_codes(1, start=frame), request_ids=["req"])
+
+    assert decode.call_count == 1000
+    assert all([codes.shape for _, _, codes in call.args[0]] == [(2, 1)] for call in decode.call_args_list)
+    assert cat.call_count == 0
+    assert equal.call_count == 0
+
+
+def test_resumable_delta_codes_emit_only_new_pcm() -> None:
     model, mimi = _model()
 
     first = model(input_ids=_codes(2), request_ids=["req"])
-    second = model(input_ids=second_codes, request_ids=["req"])
+    second = model(input_ids=_codes(1, start=100), request_ids=["req"])
 
     assert _audio(first).tolist() == _pcm(1, 2)
     assert _audio(second).tolist() == _pcm(3)
     assert len(mimi.calls) == 3
+
+
+def test_identical_consecutive_delta_frames_are_both_decoded() -> None:
+    model, mimi = _model()
+    chunk = _codes(1)
+
+    first = model(input_ids=chunk, request_ids=["req"])
+    second = model(input_ids=chunk, request_ids=["req"])
+
+    assert _audio(first).tolist() == _pcm(1)
+    assert _audio(second).tolist() == _pcm(2)
+    assert len(mimi.calls) == 2
+
+
+def test_full_payload_is_consumed_once_across_forwards() -> None:
+    model, mimi = _model(async_chunk=False)
+    runtime_info = [{"codes": {"audio": _codes(2)}}]
+
+    def forward():
+        return model(
+            input_ids=torch.zeros(2, dtype=torch.long),
+            request_ids=["req"],
+            runtime_additional_information=runtime_info,
+        )
+
+    first = forward()
+    second = forward()
+
+    assert _audio(first).tolist() == _pcm(1, 2)
+    assert _audio(second).numel() == 0
+    assert len(mimi.calls) == 2
+
+    model.on_requests_finished({"req"})
+    reused = forward()
+
+    assert _audio(reused).tolist() == _pcm(1, 2)
+    assert len(mimi.calls) == 4
 
 
 @pytest.mark.parametrize("frames", [5, 12])
@@ -304,9 +356,10 @@ def test_request_id_falls_back_to_runtime_information() -> None:
     info = [{"request_id": "runtime-req"}]
 
     model(input_ids=_codes(2), runtime_additional_information=info)
-    second = model(input_ids=_codes(3), runtime_additional_information=info)
+    second = model(input_ids=_codes(1, start=100), runtime_additional_information=info)
 
     assert _audio(second).tolist() == _pcm(3)
+    assert model._request_rows == {"runtime-req": 0}
 
 
 def test_rows_are_leased_per_request_isolated_and_recycled() -> None:
@@ -331,7 +384,6 @@ def test_rows_are_leased_per_request_isolated_and_recycled() -> None:
 
     model.on_requests_finished(["first"])
     assert mimi.reset_rows == [0]
-    assert "first" not in model._request_codes
 
     replacement = model(
         input_ids=torch.cat([_codes(1), _codes(1, start=30)]),
