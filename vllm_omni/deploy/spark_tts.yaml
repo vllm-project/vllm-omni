@@ -1,0 +1,46 @@
+# Spark-TTS-0.5B: non-streaming Qwen2 AR -> BiCodec, one GPU.
+pipeline: spark_tts
+model_runner: v1
+async_chunk: false
+
+connectors:
+  connector_of_shared_memory:
+    name: SharedMemoryConnector
+    extra:
+      connector_get_sleep_s: 0.01
+      connector_get_max_wait_first_chunk: 300
+      connector_get_max_wait: 300
+
+stages:
+  - stage_id: 0
+    devices: "0"
+    max_num_seqs: 4
+    max_model_len: 4096
+    max_num_batched_tokens: 4096
+    gpu_memory_utilization: 0.2
+    dtype: bfloat16
+    enforce_eager: true
+    async_scheduling: false
+    output_connectors:
+      to_stage_1: connector_of_shared_memory
+    default_sampling_params:
+      temperature: 0.8
+      top_k: 50
+      top_p: 0.95
+      max_tokens: 1024
+      seed: 0
+
+  - stage_id: 1
+    devices: "0"
+    max_num_seqs: 4
+    max_model_len: 4096
+    max_num_batched_tokens: 4096
+    gpu_memory_utilization: 0.1
+    dtype: float32
+    enforce_eager: true
+    enable_prefix_caching: false
+    input_connectors:
+      from_stage_0: connector_of_shared_memory
+    default_sampling_params:
+      temperature: 0.0
+      max_tokens: 4096

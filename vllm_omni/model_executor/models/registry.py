@@ -10,6 +10,8 @@ from vllm.model_executor.models.registry import (
 
 _OMNI_MODELS = {
     "Alpamayo2SuperPolicy": ("alpamayo2_super", "alpamayo2_super", "Alpamayo2SuperPolicyForConditionalGeneration"),
+    "SparkQwen2ForCausalLM": ("spark_tts", "llm", "SparkQwen2ForCausalLM"),
+    "SparkBiCodecDecoder": ("spark_tts", "bicodec", "SparkBiCodecDecoder"),
     "BreezeForConditionalGeneration": ("breeze_tts_2", "modeling_breeze", "BreezeForConditionalGeneration"),
     "BreezeCode2Wav": ("breeze_tts_2", "code2wav", "BreezeCode2Wav"),
     "Qwen2_5OmniForConditionalGeneration": (
