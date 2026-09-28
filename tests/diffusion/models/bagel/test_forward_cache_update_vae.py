@@ -167,3 +167,29 @@ class TestForwardCacheUpdateVae:
         assert int(vae_idx.max()) < packed.shape[0]
         assert int(text_idx.min()) >= 0
         assert int(vae_idx.min()) >= 0
+
+    def test_cfg_branches_reuse_sampled_latent_with_separate_caches(self, bagel_and_vae_input):
+        ctx = bagel_and_vae_input
+        ctx.vae_model.encode = MagicMock(wraps=ctx.vae_model.encode)
+        latent = ctx.vae_model.encode(ctx.gen_input["padded_images"])
+        original_latent = latent.clone()
+        caches = [NaiveCache(NUM_LAYERS), NaiveCache(NUM_LAYERS)]
+
+        for offset, cache in zip((5, 0), caches):
+            inputs = dict(ctx.gen_input)
+            inputs["packed_position_ids"] = inputs["packed_position_ids"] + offset
+            returned_cache = ctx.bagel.forward_cache_update_vae(ctx.vae_model, cache, **inputs, padded_latent=latent)
+            assert returned_cache is cache
+
+        assert ctx.vae_model.encode.call_count == 1
+        torch.testing.assert_close(latent, original_latent)
+        updates = [c for c in ctx.language_model._calls if not c.get("return_embeddings_only")]
+        assert len(updates) == 2
+        assert updates[0]["past_key_values"] is caches[0]
+        assert updates[1]["past_key_values"] is caches[1]
+        vae_idx = ctx.gen_input["packed_vae_token_indexes"]
+        torch.testing.assert_close(
+            updates[0]["packed_query_sequence"][vae_idx],
+            updates[1]["packed_query_sequence"][vae_idx],
+        )
+        torch.testing.assert_close(updates[0]["packed_query_position_ids"], updates[1]["packed_query_position_ids"] + 5)

@@ -27,6 +27,7 @@ class PackingCompleteError(Exception):
             ["user\n", "\nDescribe it.<|im_end|>\n<|im_start|>assistant\n"],
         ),
         ("make it blue <|image_pad|>", ["make it blue ", ""]),
+        ("first<|image_pad|>second<|image_pad|>", ["first", "second", ""]),
     ],
 )
 def test_interleaved_spans_share_one_wrap_and_cfg_tokenizes_joined_text(mocker, prompt, spans):
@@ -41,6 +42,7 @@ def test_interleaved_spans_share_one_wrap_and_cfg_tokenizes_joined_text(mocker, 
     pipeline.language_model = mocker.Mock(vocab_size=10)
     pipeline.image_processor = mocker.Mock()
     pipeline.vae = mocker.Mock()
+    pipeline.vae.encode.side_effect = lambda _: torch.randn(1, 4, 8, 8)
     bagel = mocker.MagicMock()
     bagel.max_latent_size = 32
     bagel.latent_downsample = 8
@@ -64,7 +66,11 @@ def test_interleaved_spans_share_one_wrap_and_cfg_tokenizes_joined_text(mocker, 
     def prepare_image(**kwargs):
         events.append("image")
         assert max(kwargs["images"][0].size) <= 256
-        return {}, [kwargs["curr_kvlens"][0] + 3], [kwargs["curr_rope"][0] + 1]
+        return (
+            {"padded_images": torch.zeros(1, 3, 32, 32)},
+            [kwargs["curr_kvlens"][0] + 3],
+            [kwargs["curr_rope"][0] + 1],
+        )
 
     bagel.prepare_prompts.side_effect = prepare_prompts
     bagel.prepare_vae_images.side_effect = prepare_image
@@ -103,3 +109,12 @@ def test_interleaved_spans_share_one_wrap_and_cfg_tokenizes_joined_text(mocker, 
         if i < len(spans) - 1:
             expected.extend(["image", "image"])
     assert events == expected + ["negative", "text"]
+
+    assert pipeline.vae.encode.call_count == len(spans) - 1
+    updates = bagel.forward_cache_update_vae.call_args_list
+    assert len(updates) == 2 * (len(spans) - 1)
+    for gen, cfg in zip(updates[::2], updates[1::2]):
+        assert gen.kwargs["padded_latent"] is cfg.kwargs["padded_latent"]
+        assert gen.args[1] is not cfg.args[1]
+    if len(spans) > 2:
+        assert updates[0].kwargs["padded_latent"] is not updates[2].kwargs["padded_latent"]

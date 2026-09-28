@@ -56,7 +56,9 @@ def navit_reference(hf, img):
     return core.post_layernorm(core.encoder(inputs_embeds=x).last_hidden_state)[0]
 
 
-def test_two_stage_vit_path_matches_hf_navit():
+def test_two_stage_vit_path_matches_hf_navit(monkeypatch):
+    monkeypatch.setattr(torch.backends.cudnn, "allow_tf32", False)
+    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
     torch.manual_seed(0)
     cfg = SiglipVisionConfig(
         hidden_size=64, intermediate_size=128, num_hidden_layers=2, num_attention_heads=4, image_size=56, patch_size=14

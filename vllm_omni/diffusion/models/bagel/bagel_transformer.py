@@ -1504,8 +1504,11 @@ class Bagel(CFGParallelMixin, nn.Module):
         packed_text_indexes: torch.LongTensor,
         packed_position_ids: torch.LongTensor,
         packed_seqlens: torch.IntTensor,
+        padded_latent: torch.Tensor | None = None,
     ):
-        padded_latent = vae_model.encode(padded_images)
+        # CFG branches share one sampled image latent but have separate caches.
+        if padded_latent is None:
+            padded_latent = vae_model.encode(padded_images)
 
         p = self.latent_patch_size
         packed_latent = list()

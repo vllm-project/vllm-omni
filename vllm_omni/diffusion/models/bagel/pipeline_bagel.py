@@ -557,7 +557,7 @@ class BagelPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProf
                         context["past_key_values"], **to_device(text_input)
                     )
 
-            def add_image(context, img):
+            def add_image(context, img, padded_latent=None):
                 """A context image is a clean VAE block followed by a ViT block (BAGEL update_context_image)."""
                 vae_img = _resize_to_stride(img)
                 vae_input, context["kv_lens"], context["ropes"] = self.bagel.prepare_vae_images(
@@ -567,9 +567,12 @@ class BagelPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProf
                     transforms=vae_transforms,
                     new_token_ids=self.new_token_ids,
                 )
+                vae_input = to_device(vae_input)
                 with autocast:
+                    if padded_latent is None:
+                        padded_latent = self.vae.encode(vae_input["padded_images"])
                     context["past_key_values"] = self.bagel.forward_cache_update_vae(
-                        self.vae, context["past_key_values"], **to_device(vae_input)
+                        self.vae, context["past_key_values"], **vae_input, padded_latent=padded_latent
                     )
                 vit_input, context["kv_lens"], context["ropes"] = self.bagel.prepare_vit_images(
                     curr_kvlens=context["kv_lens"],
@@ -584,7 +587,7 @@ class BagelPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProf
                     context["past_key_values"] = self.bagel.forward_cache_update_vit(
                         context["past_key_values"], **to_device(vit_input)
                     )
-                return vae_img.size[::-1]
+                return vae_img.size[::-1], padded_latent
 
             # Pack text and images in prompt order (BAGEL interleave_inference): the chat template puts one
             # <|image_pad|> per image; without matching placeholders the images go first, then the prompt.
@@ -605,9 +608,9 @@ class BagelPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProf
                 if i in text_indices:
                     add_text(gen_context, text, bos=i == text_indices[0], eos=i == text_indices[-1])
                 if i < len(images):
-                    shape = add_image(gen_context, images[i])
-                    # Text-unconditional CFG retains images but excludes positive text.
-                    add_image(cfg_text_context, images[i])
+                    shape, padded_latent = add_image(gen_context, images[i])
+                    # Exclude positive text while retaining the same sampled image latent.
+                    add_image(cfg_text_context, images[i], padded_latent=padded_latent)
                     # Preserve the first conditioning image as the output canvas.
                     if i == 0:
                         image_shape = shape
