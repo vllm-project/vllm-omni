@@ -146,6 +146,53 @@ def prepare_stage_config_inputs(
     )
 
 
+def extract_standalone_stage_config(
+    stage_configs: list,
+    stage_id: int,
+) -> list:
+    """Extract a single stage from a multi-stage config list for standalone operation.
+
+    Adjusts the stage for independent execution: renumbers to stage_id 0,
+    marks as final output, clears input_sources, KV-transfer config, and
+    strips next-stage transform references.
+    """
+    target = None
+    for cfg in stage_configs:
+        if int(cfg.stage_id) == stage_id:
+            target = cfg
+            break
+    if target is None:
+        available = [int(c.stage_id) for c in stage_configs]
+        raise ValueError(f"stage_id {stage_id} not found (available: {available})")
+
+    from dataclasses import replace
+
+    spc = target.stage_pipeline_config
+    final_output_type = spc.final_output_type
+    if not final_output_type:
+        eot = spc.engine_output_type or ""
+        if eot in ("audio", "latent"):
+            final_output_type = eot
+        elif eot:
+            raise ValueError(f"Unsupported engine_output_type {eot!r} for standalone stage. Supported: audio, latent.")
+    target.stage_pipeline_config = replace(
+        spc,
+        stage_id=0,
+        final_output=True,
+        final_output_type=final_output_type,
+        input_sources=(),
+        custom_process_next_stage_input_func=None,
+        async_chunk_process_next_stage_input_func=None,
+        # No peer exists in standalone mode, so drop KV-transfer config
+        # rather than attempting cross-stage transfer with no destination.
+        omni_kv_config=None,
+    )
+    target.connector_config.input_connectors = None
+    target.connector_config.output_connectors = None
+    target.connector_config.async_chunk = False
+    return [target]
+
+
 def get_final_stage_id_for_e2e(
     output_modalities: list[str] | None, default_modalities: list[str], stage_list: list
 ) -> int:

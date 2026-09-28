@@ -18,6 +18,7 @@ import random
 import signal
 import socket
 import time
+import uuid as _uuid
 from argparse import Namespace
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -91,6 +92,7 @@ from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 from vllm_omni.config.endpoint_policy import (
     shutdown_unsupported_routes,
 )
+from vllm_omni.engine.omni_engine_base import OmniEngineBase
 from vllm_omni.engine.stage_init_utils import set_death_signal
 from vllm_omni.engine.stage_runtime import OmniClientConfig
 from vllm_omni.entrypoints.async_omni import ABORT_TIMEOUT_S, AsyncOmni
@@ -173,6 +175,7 @@ from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
 from vllm_omni.entrypoints.openai.serving_rl_rollout import ServingRLRollout
 from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
 from vllm_omni.entrypoints.openai.serving_speech_stream import OmniStreamingSpeechHandler
+from vllm_omni.entrypoints.openai.serving_stage import run_downstream_audio, run_entry_speech
 from vllm_omni.entrypoints.openai.serving_video import (
     LatentEditInput,
     OmniOpenAIServingVideo,
@@ -3038,6 +3041,70 @@ async def omni_wakeup(request: OmniWakeupRequest, raw_request: Request):
         "status": "SUCCESS",
         "acks": [dataclasses.asdict(a) if dataclasses.is_dataclass(a) and not isinstance(a, type) else a for a in acks],
     }
+
+
+@router.post("/v1/stage/run", dependencies=[Depends(validate_json_request)])
+@with_cancellation
+async def stage_run(raw_request: Request):
+    """Run a standalone stage.
+
+    Without stage_output: runs speech generation, returns raw
+    multimodal_output. With stage_output: accepts upstream codec tokens,
+    returns audio.
+    """
+    engine_client = raw_request.app.state.engine_client
+    if isinstance(engine_client, AsyncOmni):
+        engine = engine_client.engine
+    else:
+        engine = engine_client
+    if not isinstance(engine, OmniEngineBase) or not engine._standalone:
+        return JSONResponse(
+            {"error": "This endpoint is only available in standalone mode"},
+            status_code=HTTPStatus.NOT_FOUND.value,
+        )
+
+    try:
+        body = await raw_request.json()
+    except Exception:
+        return JSONResponse(
+            {"error": "Invalid JSON body"},
+            status_code=HTTPStatus.BAD_REQUEST.value,
+        )
+    if not isinstance(body, dict):
+        return JSONResponse(
+            {"error": "Request body must be a JSON object"},
+            status_code=HTTPStatus.BAD_REQUEST.value,
+        )
+
+    request_id = body.get("request_id") or f"stage-{_uuid.uuid4().hex[:8]}"
+    if not isinstance(request_id, str):
+        return JSONResponse(
+            {"error": "'request_id' must be a string"},
+            status_code=HTTPStatus.BAD_REQUEST.value,
+        )
+
+    try:
+        if body.get("stage_output") is not None:
+            return await run_downstream_audio(raw_request, body, request_id)
+
+        handler = Omnispeech(raw_request)
+        if handler is None:
+            return JSONResponse(
+                {"error": "No handler available for this stage type"},
+                status_code=HTTPStatus.NOT_FOUND.value,
+            )
+        return await run_entry_speech(raw_request, handler, body, request_id)
+
+    except ValueError as e:
+        return JSONResponse(
+            {"error": str(e), "request_id": request_id},
+            status_code=HTTPStatus.BAD_REQUEST.value,
+        )
+    except Exception as e:
+        return JSONResponse(
+            {"error": str(e), "request_id": request_id},
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value,
+        )
 
 
 if __name__ == "__main__":
