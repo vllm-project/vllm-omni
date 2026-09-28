@@ -209,3 +209,16 @@ Include `[1, 4, 4, ...]` latent chunks, terminal partial chunks of 1, 2, and 3,
 cache resets between requests, and each supported VAE execution configuration.
 Check chunk boundaries explicitly. The mocked CPU decoders do not establish
 pixel equivalence; this GPU/checkpoint acceptance remains outstanding.
+
+### Native blockwise CUDA graphs
+
+Enable regional `torch.compile(mode="reduce-overhead")` in the stage configuration:
+
+```yaml
+enforce_eager: false
+diffusion_compile_granularity: regional
+model_config:
+  use_cuda_graphs: true
+```
+
+Disabled by default. HSDP + CUDA graphs is currently unsupported and rejected.

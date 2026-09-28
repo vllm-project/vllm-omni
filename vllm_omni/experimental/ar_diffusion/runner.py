@@ -278,6 +278,7 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
             if cleanup_errors:
                 raise cleanup_errors[0]
 
+            self.release_captured_graphs()
             old_cache = self.kv_cache
             self.kv_cache = None
             self._ar_diffusion_kv_cache_spec = None

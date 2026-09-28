@@ -14,6 +14,7 @@ from typing import Any, ClassVar
 import torch
 from vllm.logger import init_logger
 
+from vllm_omni.diffusion.compile import regionally_compile
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.media import (
     DiffusionMediaOutput,
@@ -30,7 +31,12 @@ from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import (
     get_cosmos3_pre_process_func,
 )
 from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.action_inputs import prepare_action_values
-from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.config import Cosmos3NanoSimBimanualManifest, deploy_option
+from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.config import (
+    Cosmos3NanoSimBimanualManifest,
+    deploy_option,
+    resolve_ar_compile_mode,
+    validate_sim_parallel_config,
+)
 from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.decode_overlap import CausalDecodeQueue
 from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.geometry import (
     Cosmos3NanoSimBimanualGeometry,
@@ -202,6 +208,8 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
     _vae_decode_stream: torch.cuda.Stream | None = None
 
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = "") -> None:
+        self._ar_compile_mode = resolve_ar_compile_mode(od_config)
+        validate_sim_parallel_config(od_config)
         super().__init__(od_config=od_config, prefix=prefix)
         self.manifest = Cosmos3NanoSimBimanualManifest.from_od_config(od_config)
         self.clean_commit_mode = deploy_option(od_config, "clean_commit_mode", "framewise")
@@ -457,6 +465,24 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
     def reset_ar_diffusion_session(self, session_id: str) -> None:
         self._drop_session(session_id)
 
+    def setup_compile(self) -> None:
+        """Use the runner's existing compilation hook and shared regional compiler."""
+        options = dict(dynamic=self.od_config.diffusion_compile_dynamic, mode=self._ar_compile_mode)
+        if self.od_config.diffusion_compile_granularity == "full":
+            self.transformer.compile(**options)
+        else:
+            regionally_compile(self.transformer, **options)
+        self.transformer._inductor_cudagraphs = self._ar_compile_mode == "reduce-overhead"
+
+    def release_captured_graphs(self) -> None:
+        """Retire native trees before replacing pools or releasing sleep-level-2 weights.
+
+        Each diffusion worker owns one pipeline. Dynamo reset also resets its
+        Inductor backend's graph trees; the next call recompiles from cache.
+        """
+        if getattr(self.transformer, "_inductor_cudagraphs", False):
+            torch._dynamo.reset()
+
     def close_ar_diffusion_session(self, session_id: str) -> None:
         self._drop_session(session_id)
 
@@ -693,6 +719,11 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
         if paged_state is not None:
             paged_state.commit_paged_context(self._MAIN_BRANCH)
         elif commit_current:
+            if dense_history is None and getattr(self.transformer, "_inductor_cudagraphs", False):
+                # The first dense commit retains its inputs with detach(), which
+                # aliases graph-owned storage. Later commits use cat() and own
+                # their storage; denoising does not retain current K/V at all.
+                output.current_kv = [(key.clone(), value.clone()) for key, value in output.current_kv]
             if frame_causal:
                 for start in range(0, seq_len, tokens_per_frame):
                     self._append_dense_kv(

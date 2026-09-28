@@ -30,6 +30,39 @@ HAS_FLASH_ATTN = fa.HAS_FLASH_ATTN
 flash_attn_func = fa.flash_attn_func  # noqa: N813
 
 
+@pytest.mark.cpu
+def test_fa4_dense_dispatch_is_opaque_to_compile(monkeypatch):
+    calls = []
+
+    def kernel(query, key, value, **kwargs):
+        calls.append(kwargs)
+        return query + value.mean()
+
+    kernel.__module__ = "flash_attn.cute.interface"
+    monkeypatch.setattr(fa, "flash_attn_func", kernel)
+    impl = FlashAttentionImpl(2, 16, softmax_scale=0.25, causal=True)
+    impl.fa_deterministic = True
+    query = torch.randn(1, 5, 2, 16)
+    key, value = torch.randn(1, 7, 2, 16), torch.randn(1, 7, 2, 16)
+    expected = impl.forward_cuda(query, key, value)
+    compiled = torch.compile(impl.forward_cuda, backend="eager", fullgraph=True, dynamic=True)
+    torch.testing.assert_close(compiled(query, key, value), expected, rtol=0, atol=0)
+    assert calls == [dict(softmax_scale=0.25, causal=True, deterministic=True)] * 2
+
+
+@pytest.mark.cpu
+def test_fa4_dense_fake_preserves_value_head_dimension():
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    with FakeTensorMode():
+        query = torch.empty(1, 5, 4, 16)
+        key = torch.empty(1, 7, 2, 16)
+        value = torch.empty(1, 7, 2, 32)
+        output = torch.ops.vllm_omni.fa4_dense(query, key, value, 0.25, False, False)
+        assert output.shape == (1, 5, 4, 32)
+        assert output.dtype == query.dtype and output.device == query.device
+
+
 @pytest.mark.parametrize(
     ("device_major", "requested", "supported", "expected"),
     [

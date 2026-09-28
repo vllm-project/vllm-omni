@@ -204,6 +204,8 @@ class Cosmos3NanoSimBimanualGenDecoderLayer(Cosmos3GenDecoderLayer):
 class Cosmos3NanoSimBimanualTransformer(Cosmos3VFMTransformer):
     """Cosmos3 MoT generator with persistent causal GEN K/V history."""
 
+    _hsdp_forward_methods = ("encode_und_kv",)
+    _inductor_cudagraphs = False
     _gen_layer_cls = Cosmos3NanoSimBimanualGenDecoderLayer
     _repeated_blocks = ["Cosmos3NanoSimBimanualGenDecoderLayer"]
 
@@ -371,6 +373,10 @@ class Cosmos3NanoSimBimanualTransformer(Cosmos3VFMTransformer):
         ``paged_kv`` is non-committing during denoise. Clean refreshes commit
         one frame or a frame-causal batch. Dense history is the numerical oracle.
         """
+        if self._inductor_cudagraphs:
+            # Regional block calls belong to one invocation. Without this,
+            # Inductor may invalidate the previous block's still-live output.
+            torch.compiler.cudagraph_mark_step_begin()
         if frame_causal and not condition_vision:
             raise ValueError("Frame-causal batching is only supported for clean conditioning forwards")
         if hidden_states.ndim != 5 or hidden_states.shape[0] != 1:

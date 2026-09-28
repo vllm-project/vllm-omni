@@ -125,7 +125,7 @@ def test_runner_batch_status_and_camera_poses(
         ],
     )
     if use_overrides:
-        sys.argv.extend(["--deploy-config", str(ROOT / "vllm_omni/deploy/cosmos3_nano_sim_bimanual_i4.yaml")])
+        sys.argv.extend(["--deploy-config", str(ROOT / "vllm_omni/deploy/cosmos3_nano_sim_bimanual_full_history.yaml")])
     calls = []
     engines = []
 
