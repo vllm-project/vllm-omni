@@ -26,12 +26,12 @@ import uuid
 from contextlib import ExitStack
 
 import pytest
-import torch
 
 from tests.helpers.mark import hardware_test
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
+from vllm_omni.platforms import current_omni_platform
 
 MODEL = "tiny-random/Qwen-Image"
 CUSTOM_PIPELINE_CLASS = "tests.e2e.features.helpers.custom_pipeline.QwenImagePipelineWithLogProbForTest"
@@ -183,8 +183,8 @@ async def test_sleep_memory_reclaimed_custom_pipeline():
 
         # Measure global VRAM before sleep (driver view; includes inline worker
         # thread since inline mode runs in the same process).
-        torch.accelerator.synchronize()
-        free_before, total = torch.cuda.mem_get_info()
+        current_omni_platform.synchronize()
+        free_before, total = current_omni_platform.get_device_memory()
         used_before_gib = (total - free_before) / 1024**3
 
         # Measure CuMemAllocator-tracked usage before sleep.  In inline / uni
@@ -194,9 +194,9 @@ async def test_sleep_memory_reclaimed_custom_pipeline():
         tracked_before = 0
         tracked_ptrs: set[int] = set()
         try:
-            from vllm.device_allocator.cumem import CuMemAllocator
+            from vllm.device_allocator import get_mem_allocator_instance
 
-            allocator = CuMemAllocator.get_instance()
+            allocator = get_mem_allocator_instance()
             tracked_ptrs = {ptr for ptr, data in allocator.pointer_to_data.items() if not data.is_asleep}
             tracked_before = sum(allocator.pointer_to_data[ptr].handle[1] for ptr in tracked_ptrs)
         except Exception:
@@ -209,10 +209,10 @@ async def test_sleep_memory_reclaimed_custom_pipeline():
             acks = await engine.sleep(level=1)
             slept = True
             await asyncio.sleep(0.5)  # allow the CUDA driver to settle
-            torch.accelerator.synchronize()
+            current_omni_platform.synchronize()
 
             # Measure after sleep.
-            free_after, _ = torch.cuda.mem_get_info()
+            free_after, _ = current_omni_platform.get_device_memory()
             used_after_gib = (total - free_after) / 1024**3
             drop_gib = used_before_gib - used_after_gib
 
