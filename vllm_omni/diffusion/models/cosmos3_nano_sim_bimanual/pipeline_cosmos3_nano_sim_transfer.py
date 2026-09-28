@@ -366,10 +366,6 @@ class Cosmos3NanoSimTransferPipeline(Cosmos3NanoSimBimanualPipeline):
         contract = self.manifest.require_control_video_conditioning()
         if self.manifest.chunk_size != 1 and (self.manifest.sink_frames != 0 or not contract.no_eviction):
             raise ValueError("Cosmos3-Nano-Sim-Transfer sliding history requires chunk_size=1.")
-        if not bool(getattr(od_config, "enforce_eager", False)):
-            raise ValueError(
-                "Cosmos3-Nano-Sim-Transfer requires enforce_eager=True; compiled execution is unsupported."
-            )
         kv_cache_dtype = getattr(od_config, "diffusion_kv_cache_dtype", None)
         if kv_cache_dtype not in (None, "auto"):
             raise ValueError("Cosmos3-Nano-Sim-Transfer does not support a quantized diffusion KV cache.")

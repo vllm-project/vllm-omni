@@ -126,9 +126,10 @@ def params(frames: int = 121, **extra) -> SimpleNamespace:
 
 
 @pytest.mark.parametrize("frames", [1, 5, 121, 593])
-def test_chunk1_admission(frames: int) -> None:
+@pytest.mark.parametrize("enforce_eager", [True, False])
+def test_chunk1_admission(frames: int, enforce_eager: bool) -> None:
     p = pipeline()
-    p._init_conditioning(SimpleNamespace(enforce_eager=True))
+    p._init_conditioning(SimpleNamespace(enforce_eager=enforce_eager))
     request = p._validate_conditioning_request(
         params(frames, kv_cache_inference_size=30, attention_sink_size=3, emphasize_control_in_prompt=False),
         None,

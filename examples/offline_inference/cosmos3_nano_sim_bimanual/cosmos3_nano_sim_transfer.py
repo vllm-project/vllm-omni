@@ -206,7 +206,6 @@ def main() -> None:
         model=args.model,
         model_class_name="Cosmos3NanoSimTransferPipeline",
         deploy_config=args.deploy_config,
-        enforce_eager=True,
     )
     sampling_params = OmniDiffusionSamplingParams(
         height=None,

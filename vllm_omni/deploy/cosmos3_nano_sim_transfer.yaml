@@ -18,3 +18,5 @@ stages:
     model_config:
       action_gen: false
       default_fps: 15.0
+      # Fresh full-video requests can overlap Wan decode with generation.
+      overlap_vae_decode: false
