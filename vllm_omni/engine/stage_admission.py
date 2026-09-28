@@ -17,6 +17,15 @@ If it does not hold, fail fast (``StageAdmissionError``) rather than OOM at
 runtime. Because the budgets are proven to fit before anyone allocates, any
 profile/allocate interleaving is safe.
 
+``OmniGPUWorkerBase.determine_available_memory`` reserves the profiled CUDA graph
+pool out of each stage's own budget while ``VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS``
+is on, so with that default ``capacity(g)·utilization(s)`` already covers the graphs
+the runner captures through ``cudagraph_dispatcher`` and the term below over-reserves
+for them. It remains the only cover for graphs captured after that profiling — the
+talker MTP graphs in ``GPUARModelRunner.capture_model`` — and for every graph when the
+estimate is disabled. It is an upper bound for those as long as post-profiling capture
+stays under ``_DEFAULT_GRAPH_RESERVE_BYTES``.
+
 The arithmetic (``evaluate``) is pure and unit-testable. Plan-walking
 (``check_admission``) takes injectable callables for device resolution and total
 memory so it can also be exercised without a GPU.
