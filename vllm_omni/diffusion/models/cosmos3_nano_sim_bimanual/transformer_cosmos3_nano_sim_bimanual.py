@@ -208,6 +208,8 @@ class Cosmos3NanoSimBimanualGenDecoderLayer(Cosmos3GenDecoderLayer):
 class Cosmos3NanoSimBimanualTransformer(Cosmos3VFMTransformer):
     """Cosmos3 MoT generator with persistent causal GEN K/V history."""
 
+    _hsdp_forward_methods = ("encode_und_kv",)
+    _inductor_cudagraphs = False
     _gen_layer_cls = Cosmos3NanoSimBimanualGenDecoderLayer
     _repeated_blocks = ["Cosmos3NanoSimBimanualGenDecoderLayer"]
 
@@ -443,12 +445,17 @@ class Cosmos3NanoSimBimanualTransformer(Cosmos3VFMTransformer):
         condition_vision: bool = False,
         null_action_frame_indexes: tuple[int, ...] = (),
         frame_causal: bool = False,
+        history_window: tuple[int, int] | None = None,
     ) -> Cosmos3NanoSimBimanualTransformerOutput:
         """Denoise or clean-commit one current chunk.
 
         ``paged_kv`` is non-committing during denoise. Clean refreshes commit
         one frame or a frame-causal batch. Dense history is the numerical oracle.
         """
+        if self._inductor_cudagraphs:
+            # Regional block calls belong to one invocation. Without this,
+            # Inductor may invalidate the previous block's still-live output.
+            torch.compiler.cudagraph_mark_step_begin()
         if frame_causal and not condition_vision:
             raise ValueError("Frame-causal batching is only supported for clean conditioning forwards")
         if hidden_states.ndim != 5 or hidden_states.shape[0] != 1:
@@ -555,7 +562,7 @@ class Cosmos3NanoSimBimanualTransformer(Cosmos3VFMTransformer):
                     tokens_per_frame=actual_tokens_per_frame,
                     action_tokens_per_frame=conditioning_count or None,
                     null_action_frame_indexes=null_action_frame_indexes,
-                    clean_history_window=(self.manifest.sink_frames, self.manifest.window_frames)
+                    clean_history_window=history_window or (self.manifest.sink_frames, self.manifest.window_frames)
                     if frame_causal
                     else None,
                 )

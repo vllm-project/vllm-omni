@@ -37,6 +37,9 @@ from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.geometry import (
     Cosmos3NanoSimBimanualResolutionPolicy,
     resolve_cosmos3_nano_sim_bimanual_geometry,
 )
+from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.inference_config import (
+    Cosmos3NanoSimBimanualInferenceConfig,
+)
 from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.normalizer import ActionAffineNormalizer
 from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.state_cosmos3_nano_sim_bimanual import (
     Cosmos3NanoSimBimanualSessionFingerprint,
@@ -139,6 +142,7 @@ def fake_pipeline(*, prefix: bool = True) -> tuple[Any, Any]:
 
     pipe = pipeline_methods()()
     pipe.manifest = manifest()
+    pipe.inference_config = Cosmos3NanoSimBimanualInferenceConfig.from_od_config(SimpleNamespace(), pipe.manifest)
     pipe._states = {}
     pipe._bound_session_id = None
     pipe._ar_diffusion_kv_state = None
@@ -155,6 +159,7 @@ def fake_pipeline(*, prefix: bool = True) -> tuple[Any, Any]:
         for name, contract in pipe.manifest.require_action_schema().embodiments.items()
     }
     pipe.transformer = SimpleNamespace(latent_channel_size=3)
+    pipe.clean_commit_mode = "framewise"
     pipe.device = "cpu"
     pipe.dtype = torch.float32
     pipe._get_sp_param = lambda sp, key, default=None: sp.extra_args.get(key, getattr(sp, key, default))

@@ -83,6 +83,42 @@ def deploy_option(config: Any, key: str, default: Any = None) -> Any:
     return default
 
 
+def resolve_ar_compile_mode(config: Any) -> str:
+    """Native Inductor capture is opt-in and keeps the existing regional compiler."""
+    if deploy_option(config, "ar_compile_mode") is not None:
+        raise ValueError("ar_compile_mode has been replaced by the boolean use_cuda_graphs option")
+    enabled = deploy_option(config, "use_cuda_graphs", False)
+    if not isinstance(enabled, bool):
+        raise ValueError("use_cuda_graphs must be a boolean")
+    if enabled and getattr(config, "enforce_eager", False):
+        raise ValueError("use_cuda_graphs=True requires enforce_eager=False")
+    if enabled and getattr(config, "diffusion_compile_granularity", "regional") != "regional":
+        raise ValueError("Native Sim CUDA graphs require regional compilation")
+    if enabled and getattr(getattr(config, "parallel_config", None), "use_hsdp", False):
+        raise ValueError(
+            "Cosmos Sim HSDP is currently incompatible with CUDA graphs due to repeated graph capture. "
+            "Set use_cuda_graphs=False or disable HSDP."
+        )
+    return "reduce-overhead" if enabled else "default"
+
+
+def validate_sim_parallel_config(config: Any) -> None:
+    """Reject unsupported model paths instead of silently replicating their work."""
+    parallel = getattr(config, "parallel_config", None)
+    unsupported = {
+        "sequence_parallel_size": "causal attention does not shard queries or exchange cached K/V",
+        "pipeline_parallel_size": "the Sim decoder executes all layers without pipeline send/receive",
+        "data_parallel_size": "use stage num_replicas for independent Sim workers",
+        "text_encoder_tp_size": "the integrated Cosmos reasoner uses the model TP group",
+        "vae_patch_parallel_size": "streaming decode bypasses stateless distributed VAE execution",
+    }
+    for field, reason in unsupported.items():
+        if (getattr(parallel, field, 1) or 1) > 1:
+            raise ValueError(f"Cosmos Sim does not support {field}>1: {reason}")
+    if getattr(parallel, "enable_expert_parallel", False):
+        raise ValueError("Cosmos Sim uses dense MLP blocks; there are no experts to distribute")
+
+
 def _exported_artifact_source(config: Any) -> dict[str, Any]:
     """Return the sole supported artifact source in transformer configuration."""
 

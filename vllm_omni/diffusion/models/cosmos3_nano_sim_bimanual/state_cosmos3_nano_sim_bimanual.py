@@ -128,6 +128,7 @@ class Cosmos3NanoSimBimanualSessionFingerprint:
     manifest_id: str
     sampler_id: str
     action_space: str = "raw"
+    inference_id: str = ""
 
     def __post_init__(self) -> None:
         if not self.prompt_hash:

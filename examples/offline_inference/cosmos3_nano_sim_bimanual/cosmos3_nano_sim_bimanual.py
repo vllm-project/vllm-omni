@@ -13,6 +13,7 @@ from typing import Any
 
 import numpy as np
 import torch
+import yaml
 from PIL import Image, UnidentifiedImageError
 
 
@@ -209,6 +210,7 @@ def main() -> None:
     from vllm_omni.platforms import current_omni_platform
 
     manifest = None
+    inference_config = None
     if args.input_format == "cookbook":
         from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.config import Cosmos3NanoSimBimanualManifest
 
@@ -217,6 +219,14 @@ def main() -> None:
             SimpleNamespace(tf_model_config=json.loads(config_path.read_text(encoding="utf-8")))
         )
         manifest.require_exported_artifact()
+        from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.inference_config import (
+            Cosmos3NanoSimBimanualInferenceConfig,
+        )
+
+        deployment = yaml.safe_load(Path(args.deploy_config).read_text())
+        inference_config = Cosmos3NanoSimBimanualInferenceConfig.from_od_config(
+            SimpleNamespace(model_config=deployment["stages"][0].get("model_config", {})), manifest
+        )
     count = sum(bool(line.strip()) for line in args.jsonl.read_text().splitlines())
     indexes = range(count) if args.all_samples else [args.sample_index]
     if count == 0:
@@ -273,6 +283,16 @@ def main() -> None:
                         "extra_args": prepared.extra_args,
                     }
                     status.update(prepared.metadata)
+                    status.pop("num_steps", None)
+                    status.update(
+                        window_frames=inference_config.window_frames,
+                        sink_frames=inference_config.sink_frames,
+                        history_mode=inference_config.history_mode,
+                        sampler=manifest.sample_type,
+                        frame_sigma_schedules=inference_config.frame_sigma_schedules,
+                        num_steps_by_frame=[len(row) for row in inference_config.frame_sigma_schedules],
+                        inference_id=inference_config.digest,
+                    )
                     if prepared.poses is not None:
                         pose_path = output.with_suffix(".camera_trajectory.json")
                         pose_path.write_text(json.dumps(prepared.poses.tolist()) + "\n", encoding="utf-8")
@@ -288,7 +308,6 @@ def main() -> None:
                             "seed": params["seed"],
                             "num_frames": params["num_frames"],
                             "fps": params["frame_rate"],
-                            "num_steps": 4,
                             "guidance_scale": 1.0,
                         }
                     )
@@ -302,7 +321,7 @@ def main() -> None:
                     )
                 sampling_params = OmniDiffusionSamplingParams(
                     **params,
-                    num_inference_steps=4,
+                    num_inference_steps=None,
                     guidance_scale=1.0,
                     output_type="latent" if args.output_type == "latent" else None,
                     generator=torch.Generator(device=current_omni_platform.device_type).manual_seed(params["seed"]),
