@@ -7,6 +7,7 @@ from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
 import torch
+import torch.distributed as dist
 
 from vllm_omni.diffusion.attention.backends.abstract import QueryRange
 from vllm_omni.diffusion.attention.parallel.base import ParallelAttentionContext
@@ -16,6 +17,69 @@ from vllm_omni.diffusion.distributed.group_coordinator import (
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
+
+
+# Models that all-gather K/V themselves (to overlap the collective with later
+# projections) set this key in ``AttentionMetadata.extra`` so the strategy does
+# not gather a second time. The joint handling and query-range slicing still run.
+ALLGATHER_KV_PRE_GATHERED = "allgather_kv_gathered"
+
+
+@dataclass(slots=True)
+class AsyncSequenceAllGather:
+    """An in-flight all-gather whose result is concatenated on the sequence dim."""
+
+    output: torch.Tensor
+    work: dist.Work
+    batch_size: int
+    local_seq_len: int
+
+    def wait(self) -> torch.Tensor:
+        """Block on the collective and return the ``(B, world * S_local, ...)`` tensor."""
+        self.work.wait()
+        world_size = self.output.shape[0] // self.batch_size
+        return (
+            self.output.view(
+                world_size,
+                self.batch_size,
+                self.local_seq_len,
+                *self.output.shape[2:],
+            )
+            .permute(1, 0, 2, *range(3, self.output.ndim + 1))
+            .reshape(
+                self.batch_size,
+                world_size * self.local_seq_len,
+                *self.output.shape[2:],
+            )
+            .contiguous()
+        )
+
+
+def async_all_gather_sequence(
+    tensor: torch.Tensor,
+    group: dist.ProcessGroup,
+) -> AsyncSequenceAllGather:
+    """Start an equal-shape all-gather for a ``(B, S_local, ...)`` tensor.
+
+    The result matches ``SequenceParallelGroupCoordinator.all_gather(tensor, dim=1)``
+    but returns immediately; call :meth:`AsyncSequenceAllGather.wait` to collect.
+    """
+    if tensor.ndim < 2:
+        raise ValueError(f"AllGather-KV async all-gather expects at least 2 dimensions, got {tensor.shape}.")
+    tensor = tensor.contiguous()
+    world_size = dist.get_world_size(group)
+    output = torch.empty(
+        (world_size * tensor.shape[0], *tensor.shape[1:]),
+        dtype=tensor.dtype,
+        device=tensor.device,
+    )
+    work = dist.all_gather_into_tensor(output, tensor, group=group, async_op=True)
+    return AsyncSequenceAllGather(
+        output=output,
+        work=work,
+        batch_size=int(tensor.shape[0]),
+        local_seq_len=int(tensor.shape[1]),
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,8 +124,18 @@ class AllGatherKVParallelAttention:
         if joint_strategy not in {"front", "rear"}:
             raise ValueError(f"Unsupported joint_strategy: {joint_strategy!r}")
 
-        k_img_full = self._sp_group.all_gather(key, dim=1, group=self._allgather_group)
-        v_img_full = self._sp_group.all_gather(value, dim=1, group=self._allgather_group)
+        extra = attn_metadata.extra if attn_metadata is not None else {}
+        if extra.get(ALLGATHER_KV_PRE_GATHERED, False):
+            # The model already holds the full K/V (e.g. BAGEL's overlapped
+            # K -> V -> Q projection path); only the joint cat and query-range
+            # slicing remain. The flag is ours, so it does not reach the kernel.
+            k_img_full, v_img_full = key, value
+            attn_metadata = replace(
+                attn_metadata, extra={k: v for k, v in extra.items() if k != ALLGATHER_KV_PRE_GATHERED}
+            )
+        else:
+            k_img_full = self._sp_group.all_gather(key, dim=1, group=self._allgather_group)
+            v_img_full = self._sp_group.all_gather(value, dim=1, group=self._allgather_group)
 
         if joint_k is not None:
             if joint_k.shape[2] != key.shape[2]:
