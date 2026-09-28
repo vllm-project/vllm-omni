@@ -272,9 +272,10 @@ and `diffusion_compile_granularity: regional`. Ordinary compilation is the
 default; add `model_config.use_cuda_graphs: true` for native blockwise CUDA
 graphs, as shown above. The example honors the deployment configuration.
 
-The Transfer deployment selects serial decode. With chunk size 1, clean commits
-remain framewise. Control hints are VAE-encoded up front, then consumed in
-chunks sized by the checkpoint configuration.
+Decode overlap is enabled by default for full-video CUDA requests; set
+`model_config.overlap_vae_decode: false` for serial decode. With chunk size 1,
+clean commits remain framewise. Control hints are VAE-encoded up front, then
+consumed in chunks sized by the checkpoint configuration.
 
 Export Transfer through the two conversion stages described in the
 [Bimanual recipe](../../../recipes/cosmos3/Cosmos3-Nano-Sim-Bimanual.md), using
