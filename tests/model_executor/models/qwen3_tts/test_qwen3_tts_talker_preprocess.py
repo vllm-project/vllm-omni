@@ -389,6 +389,38 @@ def test_decode_batch_preprocess_matches_decode_state_updates(mrv2):
     assert updates[1]["hidden_states"]["trailing_text"].numel() == 0
 
 
+def test_decode_batch_zero_fills_missing_last_hidden(monkeypatch):
+    tts_pad = torch.full((1, 4), -1.0, dtype=torch.bfloat16)
+    model = _make_minimal_talker(tts_pad_embed=tts_pad)
+
+    def fake_embed_input_ids(input_ids):
+        return input_ids.to(torch.float32).reshape(-1, 1, 1).expand(-1, 1, 4)
+
+    model.embed_input_ids = fake_embed_input_ids
+    warnings: list[tuple[object, ...]] = []
+    monkeypatch.setattr(
+        "vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_talker.logger.warning_once",
+        lambda *args, **kwargs: warnings.append(args),
+    )
+    trailing = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+
+    _, _, past_hidden, _, _ = model.preprocess_decode_batch(
+        input_ids=torch.tensor([101], dtype=torch.long),
+        req_infos=[
+            {
+                "text": ["hello"],
+                "task_type": ["CustomVoice"],
+                "hidden_states": {"trailing_text": trailing},
+                "meta": {"talker_text_offset": 0},
+            }
+        ],
+    )
+
+    assert torch.equal(past_hidden.cpu(), torch.zeros((1, 4), dtype=torch.bfloat16))
+    assert len(warnings) == 1
+    assert "zero-filling" in str(warnings[0][0])
+
+
 def _stub_text_embedding(device_param: torch.nn.Parameter):
     """Build a lambda that emulates ``nn.Embedding`` for the ``_device()`` helper.
 

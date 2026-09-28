@@ -117,6 +117,7 @@ class OmniARModelRunner(OmniGPUModelRunner):
         skip_attn_for_dummy_run: bool = False,
         is_profile: bool = False,
         context_len: int = 0,
+        valid_dummy_state_slots: bool = False,
     ) -> Any:
         if not dummy_run:
             self._handle_kv_transfer_pre(scheduler_output)
@@ -127,6 +128,7 @@ class OmniARModelRunner(OmniGPUModelRunner):
             skip_attn_for_dummy_run=skip_attn_for_dummy_run,
             is_profile=is_profile,
             context_len=context_len,
+            valid_dummy_state_slots=valid_dummy_state_slots,
         )
 
     # ------------------------------------------------------------------
@@ -189,6 +191,15 @@ class OmniARModelRunner(OmniGPUModelRunner):
                 text_hidden,
                 input_batch,
                 grammar_output,
+            )
+        run_eager_mtp = getattr(self.model_state, "run_eager_mtp", None)
+        if multimodal_outputs and run_eager_mtp is not None:
+            run_eager_mtp(
+                input_batch,
+                text_hidden,
+                sampler_output.sampled_token_ids,
+                multimodal_outputs,
+                self._dispatch_mtp_batch_descriptor,
             )
         if self.pp_handler is not None:
             self.pp_handler.broadcast(
@@ -318,9 +329,12 @@ class OmniARModelRunner(OmniGPUModelRunner):
         query_start_loc_np: np.ndarray,
         num_scheduled_tokens: np.ndarray,
         num_reqs: int,
+        padded_total_tokens: int | None = None,
     ) -> list[dict[str, Any]]:
-        """Build pooler_output from already-CPU tensors."""
-        total = hidden_cpu.shape[0]
+        """Build per-request payloads, excluding any CUDA Graph padding."""
+        # Graph-padded hidden states and unpadded multimodal outputs can
+        # coexist. Use the scheduled token count to identify the real axis.
+        total = int(num_scheduled_tokens[:num_reqs].sum())
         pooler: list[dict[str, Any]] = []
         for i in range(num_reqs):
             start = int(query_start_loc_np[i])
@@ -333,6 +347,7 @@ class OmniARModelRunner(OmniGPUModelRunner):
                     start=start,
                     end=end,
                     total_tokens=total,
+                    padded_total_tokens=padded_total_tokens,
                 )
             pooler.append(flatten_payload(payload))
         return pooler
@@ -756,7 +771,7 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
             del token_ids[num_tokens:]
         self.model_runner_output.sampled_token_ids = sampled_token_ids
         if self.sampling_mask_tensors is not None:
-            self.model_runner_output.sampling_masks = self.sampling_mask_tensors.tolists(self.num_sampled_tokens_np)
+            self.model_runner_output.sampling_masks = self.sampling_mask_tensors.tolists()
         if self.routed_experts_cpu is not None:
             self.model_runner_output.routed_experts = self.routed_experts_cpu.tolists()
         self.model_runner_output.sampled_token_ids_materialized = True
@@ -805,6 +820,7 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
                 self._query_start_loc_np,
                 self._num_scheduled_tokens,
                 self._num_reqs,
+                self._padded_total_tokens,
             )
             pooler_payload = cast(list[dict[str, Any] | None], pooler_output) if pooler_output else None
             self.model_runner_output.pooler_output = pooler_payload

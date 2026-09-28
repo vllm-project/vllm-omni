@@ -269,7 +269,7 @@ class NPUGenerationModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin
                         self.input_batch,
                         self.requests,
                         self.compilation_config.static_forward_context,
-                        self.model.get_mamba_state_copy_func(),
+                        self._get_mamba_state_copy_funcs(),
                         preprocess_bufs,
                     )
                     # preprocess_mamba resets num_accepted_tokens_cpu to 1
@@ -854,8 +854,6 @@ class NPUGenerationModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin
 
             if self.uses_mrope:
                 positions = self.mrope_positions.gpu[:, :num_tokens_padded]
-            elif self.uses_xdrope_dim > 0:
-                positions = self.xdrope_positions.gpu[:, :num_tokens_padded]
             else:
                 positions = self.positions[:num_tokens_padded]
 

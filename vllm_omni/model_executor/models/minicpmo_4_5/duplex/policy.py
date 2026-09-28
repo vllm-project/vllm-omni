@@ -3,10 +3,63 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping, Sequence
+
     from transformers import PreTrainedTokenizerBase
+
+
+@dataclass(frozen=True, slots=True)
+class MiniCPMO45DuplexWindowConfig:
+    """Stage-0 window settings matching the released checkpoint defaults."""
+
+    sliding_window_mode: str = "off"
+    basic_window_high_tokens: int = 8000
+    basic_window_low_tokens: int = 6000
+    context_previous_max_tokens: int = 500
+    context_max_units: int = 24
+
+    @classmethod
+    def from_mapping(cls, value: object) -> MiniCPMO45DuplexWindowConfig:
+        source = value if isinstance(value, dict) else {}
+
+        def integer(name: str, default: int) -> int:
+            raw = source.get(name, default)
+            if isinstance(raw, bool):
+                raise ValueError(f"{name} must be an integer")
+            try:
+                parsed = int(raw)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"{name} must be an integer") from exc
+            if parsed <= 0:
+                raise ValueError(f"{name} must be greater than zero")
+            return parsed
+
+        mode = source.get("sliding_window_mode", "off")
+        if mode not in {"off", "basic", "context"}:
+            raise ValueError("sliding_window_mode must be one of: off, basic, context")
+        config = cls(
+            sliding_window_mode=str(mode),
+            basic_window_high_tokens=integer("basic_window_high_tokens", 8000),
+            basic_window_low_tokens=integer("basic_window_low_tokens", 6000),
+            context_previous_max_tokens=integer("context_previous_max_tokens", 500),
+            context_max_units=integer("context_max_units", 24),
+        )
+        if config.basic_window_low_tokens >= config.basic_window_high_tokens:
+            raise ValueError("basic_window_low_tokens must be less than basic_window_high_tokens")
+        return config
+
+    def as_dict(self) -> dict[str, int | str]:
+        return {
+            "sliding_window_mode": self.sliding_window_mode,
+            "basic_window_high_tokens": self.basic_window_high_tokens,
+            "basic_window_low_tokens": self.basic_window_low_tokens,
+            "context_previous_max_tokens": self.context_previous_max_tokens,
+            "context_max_units": self.context_max_units,
+        }
 
 
 class MiniCPMO45DuplexPolicy:
@@ -41,6 +94,33 @@ class MiniCPMO45DuplexPolicy:
     DEFAULT_MAX_SPEAK_CHARS_PER_CHUNK = 28
     DEFAULT_MIN_NEW_SPEAK_TOKENS_BEFORE_CHUNK_BOUNDARY = 8
     REPETITION_HISTORY_SIZE = 512
+
+    @staticmethod
+    def speech_unit_closed_by_listen(token_ids: Sequence[int], special_token_ids: Mapping[str, int]) -> bool:
+        """Whether a unit ending in LISTEN closes speech rather than deciding to listen.
+
+        ``<|turn_eos|>`` ends the turn but not the unit: the model keeps
+        decoding until a unit terminator, and on silent input the policy forces
+        that terminator to be LISTEN. Such a unit still carries the turn's final
+        speech and ``<|turn_eos|>`` for the Talker, so it is not a LISTEN
+        decision. Only the current unit counts: the scan stops at the previous
+        unit terminator.
+        """
+        listen_id = special_token_ids.get("listen_token_id")
+        turn_eos_id = special_token_ids.get("turn_eos_token_id")
+        if listen_id is None or turn_eos_id is None or not token_ids or token_ids[-1] != listen_id:
+            return False
+        unit_terminators = {
+            listen_id,
+            special_token_ids.get("chunk_eos_token_id"),
+            special_token_ids.get("chunk_tts_eos_token_id"),
+        }
+        for token_id in reversed(token_ids[:-1]):
+            if token_id == turn_eos_id:
+                return True
+            if token_id in unit_terminators:
+                return False
+        return False
 
     @classmethod
     def audio_token_count(cls, sample_count: int) -> int:

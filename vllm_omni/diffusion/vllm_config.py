@@ -152,6 +152,7 @@ class _DiffusionVllmModelConfig:
         return self._require_attention_geometry()[2]
 
     def get_total_num_kv_heads(self) -> int:
+        assert self.hf_text_config is not None
         return self.hf_text_config.num_key_value_heads
 
     @property
@@ -206,6 +207,7 @@ def configure_diffusion_vllm_config(vllm_config: VllmConfig, od_config: OmniDiff
     """Populate native model, parallel, cache, and Scheduler configuration."""
 
     parallel_config = od_config.parallel_config
+    assert parallel_config.data_parallel_size is not None
     vllm_config.parallel_config.tensor_parallel_size = parallel_config.tensor_parallel_size
     vllm_config.parallel_config.data_parallel_size = parallel_config.data_parallel_size
     if parallel_config.enable_expert_parallel and od_config.is_moe:
@@ -225,8 +227,7 @@ def configure_diffusion_vllm_config(vllm_config: VllmConfig, od_config: OmniDiff
         vllm_config.parallel_config.pipeline_parallel_size = parallel_config.pipeline_parallel_size
         vllm_config.cache_config.gpu_memory_utilization = float(getattr(od_config, "gpu_memory_utilization", 0.9))
         vllm_config.cache_config.kv_cache_memory_bytes = getattr(od_config, "kv_cache_memory_bytes", None)
-        # Prefix hashes/publication are intentionally deferred to the next PR.
-        vllm_config.cache_config.enable_prefix_caching = False
+        vllm_config.cache_config.enable_prefix_caching = bool(getattr(od_config, "enable_prefix_caching", False))
         max_rows_per_request = getattr(od_config, "diffusion_kv_max_rows_per_request", None)
         if type(max_rows_per_request) is not int or max_rows_per_request <= 0:
             raise ValueError("paged_scheduler requires a positive diffusion_kv_max_rows_per_request")

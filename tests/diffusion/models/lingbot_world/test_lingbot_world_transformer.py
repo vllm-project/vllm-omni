@@ -35,6 +35,8 @@ def _tiny_model(
     num_layers: int = 2,
     num_frames_per_block: int = 1,
     sliding_window_num_frames: int = 3,
+    quant_config=None,
+    prefix: str = "",
     attention_head_dim: int = 2,
     rope_max_seq_len: int = 16,
 ):
@@ -55,6 +57,8 @@ def _tiny_model(
         num_frames_per_block=num_frames_per_block,
         sliding_window_num_frames=sliding_window_num_frames,
         local_attn_size=-1,
+        quant_config=quant_config,
+        prefix=prefix,
     )
 
 
@@ -485,11 +489,52 @@ def test_constructor_rejects_non_null_image_embedding_fields(field: str) -> None
 
 
 @pytest.mark.cpu
-def test_constructor_rejects_unsupported_quantization_with_runtime_error() -> None:
+@pytest.mark.parametrize("prefix", ["", "transformer"])
+@pytest.mark.parametrize("quantized", [False, True])
+def test_constructor_propagates_quantization_to_parallel_linears(prefix: str, quantized: bool) -> None:
     module = attention_tests._load_module()
+    quant_config = object() if quantized else None
+    model = _tiny_model(module, num_layers=1, quant_config=quant_config, prefix=prefix)
+    block = model.blocks[0]
+    quantized_linears = [
+        model.c2ws_hidden_states_layer1,
+        model.c2ws_hidden_states_layer2,
+        block.self_attn.qkv,
+        block.self_attn.o,
+        block.cross_attn.q,
+        block.cross_attn.k,
+        block.cross_attn.v,
+        block.cross_attn.o,
+        block.ffn[0],
+        block.ffn[2],
+        block.cam_injector_layer1,
+        block.cam_injector_layer2,
+    ]
 
-    with pytest.raises(RuntimeError, match="quant_config.*not supported"):
-        module.CausalLingBotWorldTransformer3DModel(quant_config=object())
+    assert len(quantized_linears) == 12
+    assert all(layer.quant_config is quant_config for layer in quantized_linears)
+    expected_names = {
+        "c2ws_hidden_states_layer1",
+        "c2ws_hidden_states_layer2",
+        *(
+            f"blocks.0.{name}"
+            for name in (
+                "self_attn.qkv",
+                "self_attn.o",
+                "cross_attn.q",
+                "cross_attn.k",
+                "cross_attn.v",
+                "cross_attn.o",
+                "ffn.0",
+                "ffn.2",
+                "cam_injector_layer1",
+                "cam_injector_layer2",
+            )
+        ),
+    }
+    assert {layer.prefix for layer in quantized_linears} == {
+        f"{prefix}.{name}" if prefix else name for name in expected_names
+    }
 
 
 @pytest.mark.cpu

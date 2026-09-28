@@ -20,8 +20,10 @@ from vllm_omni.diffusion.registry import (
     _DIFFUSION_MODELS,
     _DIFFUSION_POST_PROCESS_FUNCS,
     _DIFFUSION_PRE_PROCESS_FUNCS,
+    _DIFFUSION_PREFIX_CACHE_FUNCS,
     get_diffusion_post_process_func,
     get_diffusion_pre_process_func,
+    get_diffusion_prefix_cache_func,
     register_diffusion_model,
 )
 from vllm_omni.platforms.interface import OmniPlatform, OmniPlatformEnum
@@ -70,6 +72,7 @@ class TestRegisterDiffusionModel:
         original_pre = _DIFFUSION_PRE_PROCESS_FUNCS.copy()
         original_post = _DIFFUSION_POST_PROCESS_FUNCS.copy()
         original_ir_op_priority = _DIFFUSION_IR_OP_PRIORITY_FUNCS.copy()
+        original_prefix_cache = _DIFFUSION_PREFIX_CACHE_FUNCS.copy()
         yield
         _DIFFUSION_MODELS.clear()
         _DIFFUSION_MODELS.update(original_models)
@@ -79,6 +82,8 @@ class TestRegisterDiffusionModel:
         _DIFFUSION_POST_PROCESS_FUNCS.update(original_post)
         _DIFFUSION_IR_OP_PRIORITY_FUNCS.clear()
         _DIFFUSION_IR_OP_PRIORITY_FUNCS.update(original_ir_op_priority)
+        _DIFFUSION_PREFIX_CACHE_FUNCS.clear()
+        _DIFFUSION_PREFIX_CACHE_FUNCS.update(original_prefix_cache)
 
     def test_register_new_model(self):
         """Test registering a new diffusion model with pre/post process functions."""
@@ -89,6 +94,7 @@ class TestRegisterDiffusionModel:
             pre_process_func_name="test_pre_process",
             post_process_func_name="test_post_process",
             ir_op_priority_func_name="test_ir_op_priority",
+            prefix_cache_func_name="test_prefix_cache",
         )
         assert "TestPipeline" in _DIFFUSION_MODELS
         assert _DIFFUSION_MODELS["TestPipeline"] == (
@@ -99,6 +105,29 @@ class TestRegisterDiffusionModel:
         assert _DIFFUSION_PRE_PROCESS_FUNCS["TestPipeline"] == "test_pre_process"
         assert _DIFFUSION_POST_PROCESS_FUNCS["TestPipeline"] == "test_post_process"
         assert _DIFFUSION_IR_OP_PRIORITY_FUNCS["TestPipeline"] == "test_ir_op_priority"
+        assert _DIFFUSION_PREFIX_CACHE_FUNCS["TestPipeline"] == "test_prefix_cache"
+
+    def test_registered_prefix_hook_is_loaded_from_plugin(self):
+        hook = Mock()
+        factory = Mock(return_value=hook)
+        register_diffusion_model(
+            "TestPrefixPipeline", "test_plugin.pipeline", "TestPrefixPipeline", prefix_cache_func_name="prefix_factory"
+        )
+        config = SimpleNamespace(model_class_name="TestPrefixPipeline")
+        with patch(
+            "vllm_omni.diffusion.registry.importlib.import_module", return_value=SimpleNamespace(prefix_factory=factory)
+        ) as load:
+            assert get_diffusion_prefix_cache_func(config) is hook
+        load.assert_called_once_with("test_plugin.pipeline")
+        factory.assert_called_once_with(config)
+
+    def test_builtin_hunyuan_prefix_hook(self):
+        from vllm_omni.diffusion.models.hunyuan_image3.request_layout import prepare_hunyuan_prefix_cache
+
+        assert (
+            get_diffusion_prefix_cache_func(SimpleNamespace(model_class_name="HunyuanImage3ForCausalMM"))
+            is prepare_hunyuan_prefix_cache
+        )
 
     def test_register_model_accepts_deprecated_action_postprocess_keyword(self):
         """Deprecated action hook keyword is accepted but not registered."""

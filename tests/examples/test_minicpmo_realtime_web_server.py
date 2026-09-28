@@ -113,10 +113,21 @@ def test_qwen_config_does_not_inject_reference_voice():
     assert '"profile": "qwen3-turn"' in page
     assert '"adapter": "vad"' in page
     assert '"refAudio": null' in page
-    for name in ("common", "minicpm_native", "qwen3_turn"):
+    for name in ("common", "minicpm_native", "qwen3_turn", "aura_ptt"):
         assert client.get(f"/static/profiles/{name}.js").status_code == 200
     with pytest.raises(ValueError, match="ref-audio"):
         build_app(profile="qwen3-turn", ref_audio="unused.wav")
+
+
+def test_aura_ptt_config_defaults_and_rejects_ref_audio():
+    client = TestClient(build_app(profile="aura-ptt", model="aurateam/AURA"))
+    page = client.get("/").text
+    assert '"profile": "aura-ptt"' in page
+    assert '"refAudio": null' in page
+    assert "aura_ptt.js" in page
+    assert 'id="pttButton"' in page
+    with pytest.raises(ValueError, match="ref-audio"):
+        build_app(profile="aura-ptt", ref_audio="unused.wav")
 
 
 def test_config_cannot_close_its_script_element():

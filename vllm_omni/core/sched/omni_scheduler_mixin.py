@@ -112,6 +112,7 @@ class OmniSchedulerMixin:
     requests: dict[str, Request]
     waiting: RequestQueue
     running: list[Request]
+    _pending_input_timeout_outputs: dict[str, tuple[int, OmniEngineCoreOutput]]
 
     def _init_omni_connector_output_inbox(self) -> None:
         self._omni_connector_output_inbox: queue.SimpleQueue[OmniConnectorOutput] = queue.SimpleQueue()
@@ -149,7 +150,7 @@ class OmniSchedulerMixin:
             else None
         )
         self.input_coordinator: OmniSchedulingCoordinator | None = None
-        if self._native_data_plane:
+        if self._native_data_plane and getattr(model_config, "async_chunk", False):
             self.input_coordinator = OmniSchedulingCoordinator(
                 scheduler_max_num_seqs=self.vllm_config.scheduler_config.max_num_seqs,
                 stage_id=getattr(model_config, "stage_id", 0),
@@ -251,6 +252,7 @@ class OmniSchedulerMixin:
     def _async_chunk_transport_enabled(self) -> bool:
         return getattr(self, "chunk_transfer_adapter", None) is not None or bool(
             getattr(self, "_native_data_plane", False)
+            and getattr(getattr(self, "input_coordinator", None), "_async_chunk", False)
         )
 
     def _get_async_chunk_reserved_running_slots(self) -> int:
@@ -453,7 +455,29 @@ class OmniSchedulerMixin:
             DEFAULT_INPUT_WAIT_TIMEOUT_S,
             sorted(present_ids),
         )
-        self.finish_requests(present_ids, RequestStatus.FINISHED_ERROR)
+        self._finish_input_timeout_requests(present_ids)
+
+    def _finish_input_timeout_requests(self, request_ids: set[str]) -> None:
+        # Upstream finish_requests frees scheduler state, but does not emit
+        # EngineCoreOutput. Keep an explicit ERROR for both AR and generation
+        # callers, including a tick with no scheduled model work.
+        pending = getattr(self, "_pending_input_timeout_outputs", None)
+        if pending is None:
+            pending = self._pending_input_timeout_outputs = {}
+        for request_id in request_ids:
+            request = self.requests[request_id]
+            reason = f"Timed out waiting for connector input after {DEFAULT_INPUT_WAIT_TIMEOUT_S:g}s"
+            request.stop_reason = reason
+            pending[request_id] = (
+                request.client_index,
+                OmniEngineCoreOutput(
+                    request_id=request_id,
+                    new_token_ids=[],
+                    finish_reason=FinishReason.ERROR,
+                    stop_reason=reason,
+                ),
+            )
+        self.finish_requests(request_ids, RequestStatus.FINISHED_ERROR)
 
     def _log_failed_chunk_sends(self) -> None:
         """Surface chunks the sender gave up on (R1.2 of #4855).
@@ -531,7 +555,7 @@ class OmniSchedulerMixin:
             DEFAULT_INPUT_WAIT_TIMEOUT_S,
             sorted(present_ids),
         )
-        self.finish_requests(present_ids, RequestStatus.FINISHED_ERROR)
+        self._finish_input_timeout_requests(present_ids)
 
     def _capture_omni_connector_output(self, model_runner_output: Any) -> None:
         """Stash the model runner's omni_connector_output for next schedule().
@@ -712,6 +736,13 @@ class OmniSchedulerMixin:
         synthesize_abort_outputs: bool,
     ) -> None:
         """Attach finished IDs while keeping AR's synthetic-abort policy explicit."""
+        pending = getattr(self, "_pending_input_timeout_outputs", None)
+        if pending:
+            for client_index, error_output in pending.values():
+                output = engine_core_outputs.setdefault(client_index, EngineCoreOutputs())
+                if not any(item.request_id == error_output.request_id for item in output.outputs):
+                    output.outputs.append(error_output)
+            pending.clear()
         finished_req_ids = self.finished_req_ids_dict
         if not finished_req_ids:
             return
@@ -729,6 +760,38 @@ class OmniSchedulerMixin:
                 )
             output.finished_requests = finished_set
         finished_req_ids.clear()
+
+    def _reject_invalid_grammar_tokens(self, request: Request, new_token_ids: list[int]) -> bool:
+        """Mark rejected tokens terminal before callers capture the finish reason."""
+        if not new_token_ids or self.structured_output_manager.accept_tokens(request, new_token_ids):
+            return False
+        logger.error(
+            "Unexpected: grammar rejected tokens %s for request %s. Terminating request.",
+            new_token_ids,
+            request.request_id,
+        )
+        request.status = RequestStatus.FINISHED_ERROR
+        request.resumable = False
+        return True
+
+    def _finish_error_requests(self, outputs: dict[int, list[EngineCoreOutput]]) -> None:
+        """Drain grammar-compilation and unavailable-encoder errors into terminal outputs."""
+        grammar_error_reqs = getattr(self, "grammar_compile_error_reqs", None)
+        error_req_ids = set(grammar_error_reqs or ())
+        if grammar_error_reqs:
+            grammar_error_reqs.clear()
+        ec_connector = getattr(self, "ec_connector", None)
+        if ec_connector is not None:
+            error_req_ids.update(ec_connector.take_unavailable_requests())
+        if error_req_ids:
+            for request in self.finish_requests(error_req_ids, RequestStatus.FINISHED_ERROR):
+                OmniSchedulerMixin._append_request_output(
+                    self,
+                    outputs,
+                    request,
+                    new_token_ids=[],
+                    finish_reason=request.get_finished_reason(),
+                )
 
     def _remove_stopped_requests_from_queues(
         self,

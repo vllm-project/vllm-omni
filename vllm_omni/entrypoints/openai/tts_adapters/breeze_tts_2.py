@@ -1,262 +1,188 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-"""Breeze-TTS-2 serving adapter for synchronous full-payload generation."""
-
 import asyncio
-import copy
 import math
-from typing import TYPE_CHECKING, Any
 
 import numpy as np
+import pybase64 as base64
+from transformers import AutoTokenizer, PreTrainedTokenizerBase
+from vllm.inputs import TokensPrompt
+from vllm.logger import init_logger
+from vllm.sampling_params import SamplingParams
+from vllm.utils.async_utils import make_async
 
+from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
 from vllm_omni.entrypoints.openai.tts_adapters import register_tts_adapter
 from vllm_omni.entrypoints.openai.tts_adapters.base import (
     ARTTSAdapter,
     PreparedRequest,
+    SpeechServingContext,
     apply_max_new_tokens,
-    conditioning_cache_salt,
 )
-from vllm_omni.model_executor.models.breeze_tts_2.audio_tokenizer import (
-    BreezeReferenceAudioTokenizer,
-)
-from vllm_omni.model_executor.models.breeze_tts_2.prompt_builder import (
-    BreezeTTS2PromptBuilder,
-)
+from vllm_omni.model_executor.models.breeze_tts_2.prompt import DEFAULT_INSTRUCTION, build_breeze_prompt
 
-if TYPE_CHECKING:
-    from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
+logger = init_logger(__name__)
 
 
 @register_tts_adapter
 class BreezeTTS2Adapter(ARTTSAdapter):
-    """Build Breeze prompts before scheduler submission.
-
-    The adapter owns only request-facing concerns. Model workers still own the
-    stage-0 embeddings and stage-1 waveform decode.
-    """
-
-    stage_keys = frozenset({"breeze_tts_2"})
-    model_archs = frozenset({"BreezeForConditionalGeneration"})
     name = "breeze_tts_2"
-    # Breeze's architecture and stage key are unique, so this detector cannot
-    # collide with another adapter. Lower priority runs first; 9 keeps it
-    # ahead of the default-priority (100) detectors.
+    stage_keys = frozenset({"breeze_tts_2", "breeze_tts_2_codec"})
+    model_archs = frozenset({"BreezeForConditionalGeneration"})
     detect_priority = 9
     supported_output_sample_rates = frozenset({24000})
 
-    def _load_supported_speakers(self) -> set[str]:
-        # Breeze accepts arbitrary speaker tags such as S0/S1 in its prompt;
-        # there is no finite checkpoint speaker inventory to advertise.
-        return set()
+    def __init__(self, ctx: SpeechServingContext) -> None:
+        super().__init__(ctx)
+        self.tokenizer: PreTrainedTokenizerBase | None = None
+        self._build_async = make_async(self._build_prompt, executor=ctx.server._tts_executor)
 
-    def _load_codec_frame_rate(self) -> float | None:
-        assert self.ctx.engine_client is not None
-        config = self.ctx.engine_client.model_config.hf_config
-        codec = getattr(config, "codec_config", None)
-        if isinstance(codec, dict):
-            frame_rate = codec.get("_frame_rate")
-            if frame_rate is not None:
-                return float(frame_rate)
-        return 12.5
+    def _load_codec_frame_rate(self) -> float:
+        # Breeze-TTS-2 uses 1,920 waveform samples per frame at 24 kHz.
+        return 24000 / 1920
 
-    def validate(self, request: "OpenAICreateSpeechRequest") -> str | None:
-        if not request.input or not request.input.strip():
-            return "Breeze-TTS-2 input text cannot be empty"
-        if request.ref_text is not None and not request.ref_text.strip():
-            return "Breeze-TTS-2 ref_text cannot be empty"
-        if request.ref_text is not None and request.ref_audio is None:
-            return "Breeze-TTS-2 ref_text requires ref_audio"
-        if request.ref_audio is not None and (request.ref_text is None or not request.ref_text.strip()):
-            return "Breeze-TTS-2 ref_audio requires ref_text"
-        if isinstance(request.ref_audio, list) and len(request.ref_audio) != 1:
-            # The prompt path conditions on exactly one reference waveform;
-            # extra clips would be silently discarded otherwise.
-            return f"Breeze-TTS-2 supports exactly one reference clip, got {len(request.ref_audio)}"
-        if request.task_type == "Base" and request.ref_audio is None:
-            return "Breeze-TTS-2 Base task requires ref_audio and ref_text"
-        if request.task_type == "VoiceDesign":
-            return "Breeze-TTS-2 does not support task_type=VoiceDesign"
+    async def warmup(self) -> None:
+        """Prime text, depth and reference paths through the ordinary runner."""
+        server = self.ctx.server
+        logger.info("Warming Breeze text graphs, CFG branches, reference encoder and streaming codec")
+
+        async def generate(text: str, request_id: str, **kwargs: object) -> bytes:
+            request = OpenAICreateSpeechRequest(
+                input=text, model=server.model_name, response_format="wav", seed=42, max_new_tokens=64, **kwargs
+            )
+            audio, _ = await server._generate_audio_bytes(request, request_id=request_id)
+            return audio
+
+        reference_text = "Welcome to this demonstration of clear and natural speech synthesis."
+        reference = await generate(reference_text, "breeze-warmup-single")
+        await generate(
+            "Hello.",
+            "breeze-warmup-cfg",
+            extra_params={"guidance_scale": 4.0, "temperature": 0.7, "top_k": 100, "top_p": 0.8},
+        )
+        await generate(
+            "Hello again.",
+            "breeze-warmup-reference",
+            ref_audio="data:audio/wav;base64," + base64.b64encode(reference).decode("ascii"),
+            ref_text=reference_text,
+            extra_params={"guidance_scale": 4.0},
+        )
+        await asyncio.gather(
+            generate(reference_text, "breeze-warmup-batch-a"),
+            generate("Thank you for listening to this clear and natural voice demonstration.", "breeze-warmup-batch-b"),
+        )
+        logger.info("Breeze speech warmup complete")
+
+    def validate(self, request: OpenAICreateSpeechRequest) -> str | None:
+        if not request.input.strip():
+            return "Input text cannot be empty"
         if request.speed is not None and request.speed != 1.0:
-            return "Breeze-TTS-2 does not support speed adjustment"
+            return "Breeze does not support speed adjustment"
         if request.language is not None:
-            return "Breeze-TTS-2 does not support 'language'; the prompt language follows the input text"
-        if request.speaker_embedding is not None:
-            return "Breeze-TTS-2 does not support 'speaker_embedding' (voice-cloning helper field)"
+            return "Breeze infers the language from the input text; the language field is not supported"
+        if request.ref_audio_2 is not None or request.speaker_embedding is not None:
+            return "Breeze accepts one reference recording and its transcript"
+        has_reference = request.ref_audio is not None
+        if has_reference:
+            reference = request.ref_audio
+            if isinstance(reference, list):
+                if len(reference) != 1:
+                    return "Breeze supports exactly one reference recording"
+                reference = reference[0]
+            if not isinstance(reference, str) or not isinstance(request.ref_text, str) or not request.ref_text.strip():
+                return "Breeze voice cloning requires one ref_audio URL and a non-empty ref_text transcript"
+            error = self.ctx.server._validate_ref_audio_format(reference)
+            if error:
+                return error
+        elif request.ref_text is not None:
+            return "Breeze ref_text requires ref_audio"
+        expected_task = "Base" if has_reference else "VoiceDesign"
+        if request.task_type not in (None, "CustomVoice", expected_task):
+            return f"Breeze requires task_type='{expected_task}' for this conditioning"
         if request.x_vector_only_mode:
-            return "Breeze-TTS-2 does not support 'x_vector_only_mode' (voice-cloning helper field)"
-        extra_params = request.extra_params or {}
-        guidance_scale = extra_params.get("guidance_scale", extra_params.get("cfg_scale", 1.0))
-        try:
-            unsupported_guidance = guidance_scale is not None and float(guidance_scale) != 1.0
-        except (TypeError, ValueError):
-            return "Breeze-TTS-2 guidance_scale must be a number"
-        if unsupported_guidance:
-            return "Breeze-TTS-2 currently supports only guidance_scale=1.0"
-        if extra_params.get("negative_prompt"):
-            return "Breeze-TTS-2 does not support negative_prompt/CFG yet"
-        # The talker selects codebook 0 by argmax inside make_omni_output and
-        # ignores the scheduler's sampled token, so non-greedy overrides would
-        # not change the audio while still letting the sampler draw an early
-        # EOS. Reject them until the talker consumes the sampled code.
-        greedy_error = _validate_greedy_sampling(extra_params)
-        if greedy_error is not None:
-            return greedy_error
-        repetition_penalty = extra_params.get("repetition_penalty")
-        if repetition_penalty is not None:
-            try:
-                repetition_penalty = float(repetition_penalty)
-            except (TypeError, ValueError):
-                return "Breeze-TTS-2 repetition_penalty must be finite and positive"
-            if not math.isfinite(repetition_penalty) or repetition_penalty <= 0:
-                return "Breeze-TTS-2 repetition_penalty must be finite and positive"
-        if request.max_new_tokens is not None:
-            if request.max_new_tokens < self.max_new_tokens_min:
-                return f"max_new_tokens must be at least {self.max_new_tokens_min}"
-            if request.max_new_tokens > self.max_new_tokens_max:
-                return f"max_new_tokens cannot exceed {self.max_new_tokens_max}"
-        if request.ref_audio is not None:
-            ref_audio = request.ref_audio[0] if isinstance(request.ref_audio, list) else request.ref_audio
-            return self.ctx.server._validate_ref_audio_format(ref_audio)
+            return "Breeze does not support x_vector_only_mode"
+        extra = request.extra_params or {}
+        supported = {"guidance_scale", "cfg_scale", "temperature", "top_k", "top_p", "repetition_penalty"}
+        if unknown := set(extra) - supported:
+            return f"Unsupported Breeze parameters: {sorted(unknown)}"
+        for key, value in extra.items():
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+                return f"Breeze {key} must be a finite number"
+        if extra.get("guidance_scale", extra.get("cfg_scale", 1.0)) <= 0 or extra.get("repetition_penalty", 1.1) <= 0:
+            return "Breeze guidance_scale and repetition_penalty must be positive"
+        if extra.get("temperature", 0.9) < 0 or not 0 < extra.get("top_p", 1.0) <= 1:
+            return "Breeze requires temperature >= 0 and 0 < top_p <= 1"
+        top_k = extra.get("top_k", 50)
+        if not isinstance(top_k, int) or top_k < -1:
+            return "Breeze top_k must be -1, 0, or a positive integer"
         return None
+
+    def _build_prompt(
+        self,
+        request: OpenAICreateSpeechRequest,
+        sampling: SamplingParams,
+        reference: tuple[np.ndarray, int] | None,
+    ) -> TokensPrompt:
+        if self.tokenizer is None:
+            engine_client = self.ctx.engine_client
+            if engine_client is None:
+                raise RuntimeError("Breeze speech serving requires an engine client")
+            model = engine_client.model_config.model
+            self.tokenizer = AutoTokenizer.from_pretrained(model, config=engine_client.model_config.hf_config)
+        extra = request.extra_params or {}
+        return build_breeze_prompt(
+            self.tokenizer,
+            request.input,
+            DEFAULT_INSTRUCTION if request.instructions is None else request.instructions,
+            speaker=request.voice if request.voice and request.voice != "default" else "S0",
+            ref_audio=reference,
+            ref_text=request.ref_text,
+            guidance_scale=float(extra.get("guidance_scale", extra.get("cfg_scale", 1.0))),
+            temperature=float(extra.get("temperature", sampling.temperature)),
+            top_k=max(int(extra.get("top_k", sampling.top_k)), 0),
+            top_p=float(extra.get("top_p", sampling.top_p)),
+            repetition_penalty=float(extra.get("repetition_penalty", sampling.repetition_penalty)),
+        )
 
     async def build(
         self,
-        request: "OpenAICreateSpeechRequest",
-        sampling_params_list: list,
+        request: OpenAICreateSpeechRequest,
+        sampling_params_list: list[SamplingParams],
         has_inline_ref_audio: bool,
     ) -> PreparedRequest:
-        del has_inline_ref_audio
-        server = self.ctx.server
-        builder = await self._get_builder()
-        template = self._resolve_template(request)
-        payload: dict[str, Any] = {
-            "text": request.input,
-            "template": template,
-            "speaker": request.voice or "S0",
-        }
-        if request.instructions:
-            payload["instruction"] = request.instructions
-        if request.ref_text:
-            payload["ref_text"] = request.ref_text
-
+        reference = None
         if request.ref_audio is not None:
-            ref_audio = request.ref_audio[0] if isinstance(request.ref_audio, list) else request.ref_audio
-            wav_list, sr, cache_key = await server._resolve_ref_audio(ref_audio)
-            payload["ref_audio"] = np.asarray(wav_list, dtype=np.float32)
-            payload["ref_audio_sample_rate"] = int(sr)
-        else:
-            cache_key = None
-
-        prompt = await asyncio.to_thread(builder.build, payload, template=template)
-        # The AR scheduler's completion budget is measured in codebook-0
-        # frames for Breeze. Preserve it in the mutable request metadata so
-        # the talker can emit its own EOS before a scheduler length cutoff.
-        max_new_frames = request.max_new_tokens
-        if max_new_frames is None and sampling_params_list:
-            max_new_frames = getattr(sampling_params_list[0], "max_tokens", None)
-        if max_new_frames is not None:
-            prompt["additional_information"]["breeze_max_new_frames"] = int(max_new_frames)
-        tts_params = {
-            "template": [template],
-            "text": [request.input],
-        }
-        if cache_key:
-            tts_params["ref_audio_cache_key"] = cache_key
-        prompt["cache_salt"] = conditioning_cache_salt(request, tts_params)
-        return PreparedRequest(prompt=prompt, tts_params=tts_params, model_type=self.name)
-
-    async def _get_builder(self) -> BreezeTTS2PromptBuilder:
-        server = self.ctx.server
-        cached = getattr(server, "_breeze_tts_2_prompt_builder", None)
-        if cached is not None:
-            return cached
-        # Multiple speech requests can arrive while the first tokenizer load
-        # is still in progress.  Serialize the one-time CPU initialization so
-        # model files are not opened and decoded repeatedly.
-        lock = getattr(server, "_breeze_tts_2_prompt_builder_lock", None)
-        if lock is None:
-            lock = asyncio.Lock()
-            server._breeze_tts_2_prompt_builder_lock = lock
-        async with lock:
-            cached = getattr(server, "_breeze_tts_2_prompt_builder", None)
-            if cached is not None:
-                return cached
-            model_path = server.engine_client.model_config.model
-            config = server.engine_client.model_config.hf_config
-            audio_tokenizer = await asyncio.to_thread(
-                BreezeReferenceAudioTokenizer.from_pretrained,
-                model_path,
-                num_codebooks=int(getattr(config, "num_codebooks", 16)),
-                codebook_size=self._codebook_size(config),
-                device_map="cpu",
-            )
-            builder = await asyncio.to_thread(
-                BreezeTTS2PromptBuilder.from_pretrained,
-                model_path,
-                config,
-                reference_audio_encoder=audio_tokenizer,
-            )
-            server._breeze_tts_2_prompt_builder = builder
-            return builder
-
-    @staticmethod
-    def _codebook_size(config: Any) -> int:
-        codec = getattr(config, "codec_config", None)
-        if isinstance(codec, dict):
-            return int(codec.get("codebook_size", 2048))
-        return int(getattr(codec, "codebook_size", 2048))
-
-    @staticmethod
-    def _resolve_template(request: "OpenAICreateSpeechRequest") -> str:
-        if request.ref_audio is not None:
-            return "ref_edit_tata" if request.instructions else "ref_clone_tata"
-        return "tts_instruction" if request.instructions else "tts_plain"
+            audio = request.ref_audio[0] if isinstance(request.ref_audio, list) else request.ref_audio
+            waveform, sample_rate, _ = await self.ctx.server._resolve_ref_audio(audio)
+            reference = (np.asarray(waveform, dtype=np.float32), sample_rate)
+        prompt = await self._build_async(request, sampling_params_list[0], reference)
+        return PreparedRequest(prompt=prompt, model_type=self.name)
 
     def apply_sampling_overrides(
         self,
-        sampling_params_list: list,
-        request: "OpenAICreateSpeechRequest",
-        prompt: dict[str, Any] | None = None,
+        sampling_params_list: list[SamplingParams],
+        request: OpenAICreateSpeechRequest,
+        prompt: dict | None = None,
         request_id: str | None = None,
-    ) -> list:
-        del prompt, request_id
-        sampling_params_list = apply_max_new_tokens(sampling_params_list, request)
-        repetition_penalty = (request.extra_params or {}).get("repetition_penalty")
-        if repetition_penalty is not None:
-            # The generic speech handler copies extra_params to extra_args;
-            # promote this value so the worker receives sampling metadata.
-            # Only this scalar changes; preserve the caller's params without
-            # copying nested state or the unchanged codec-stage parameters.
-            sampling_params_list = [copy.copy(sampling_params_list[0]), *sampling_params_list[1:]]
-            sampling_params_list[0].repetition_penalty = float(repetition_penalty)
-        return sampling_params_list
-
-
-def _validate_greedy_sampling(extra_params: dict[str, Any]) -> str | None:
-    """Return an error unless the sampling overrides keep decoding greedy."""
-    temperature = extra_params.get("temperature")
-    if temperature is not None:
-        try:
-            if float(temperature) != 0.0:
-                return "Breeze-TTS-2 currently supports only greedy decoding (temperature=0)"
-        except (TypeError, ValueError):
-            return "Breeze-TTS-2 temperature must be a number"
-    top_p = extra_params.get("top_p")
-    if top_p is not None:
-        try:
-            if float(top_p) != 1.0:
-                return "Breeze-TTS-2 currently supports only greedy decoding (top_p=1.0)"
-        except (TypeError, ValueError):
-            return "Breeze-TTS-2 top_p must be a number"
-    top_k = extra_params.get("top_k")
-    if top_k is not None:
-        try:
-            if int(top_k) not in (-1, 0, 1):
-                return "Breeze-TTS-2 currently supports only greedy decoding (top_k=-1)"
-        except (TypeError, ValueError):
-            return "Breeze-TTS-2 top_k must be an integer"
-    return None
-
-
-__all__ = ["BreezeTTS2Adapter"]
+    ) -> list[SamplingParams]:
+        params = apply_max_new_tokens(sampling_params_list, request)
+        params = list(params)
+        params[0] = params[0].clone()
+        if params[0].top_k == 0:
+            params[0].top_k = -1
+        extra = request.extra_params or {}
+        if "repetition_penalty" in extra:
+            params[0].repetition_penalty = extra["repetition_penalty"]
+        if prompt is not None:
+            engine_client = self.ctx.engine_client
+            if engine_client is None:
+                raise RuntimeError("Breeze speech serving requires an engine client")
+            model_config = engine_client.model_config
+            available = model_config.max_model_len - len(prompt["prompt_token_ids"])
+            if available <= 0:
+                raise ValueError("Breeze conditioning fills the model context; shorten the text or reference audio")
+            # Both CFG branches must stop after the same number of frames,
+            # including when the conditioned prompt reaches the context limit.
+            params[0].max_tokens = min(params[0].max_tokens, available)
+        return params

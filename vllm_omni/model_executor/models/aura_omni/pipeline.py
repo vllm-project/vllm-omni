@@ -26,6 +26,7 @@ AURA_OMNI_PIPELINE = PipelineConfig(
     model_type="aura_omni",
     default_deploy_config_name="aura_omni.yaml",
     model_arch="Qwen3ASRForConditionalGeneration",
+    duplex_plugin="vllm_omni.model_executor.models.aura_omni.duplex.plugin.AuraDuplexPlugin",
     stages=(
         StagePipelineConfig(
             stage_id=0,

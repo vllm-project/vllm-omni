@@ -245,7 +245,11 @@ datasets/
 !recipes/cosmos3/negative_prompt.json
 !tests/dfx/perf/tests/*.json
 !apps/ComfyUI-vLLM-Omni/example_workflows/*.json
+# Omni-DuplexEval CI config JSON (e.g. accuracy/omni_duplex_eval)
+!tests/e2e/accuracy/omni_duplex_eval/*.json
 *.jsonl
+# Shared Hunyuan IT2I input for accuracy tests and vllm bench.
+!tests/assets/hunyuan_image3/it2i.jsonl
 *.parquet
 
 # Output files

@@ -180,17 +180,52 @@ cache_dit.enable_cache(
 
 > **Note:** For single transformer with multiple block lists, `refresh_context` works the same as standard models.
 
+### Example 3: Sequential-CFG Diffusion Pipeline (MammothModa2)
+
+MammothModa2's DiT stage runs on the diffusion runner, which enables the
+configured backend at startup and transfers ownership to the pipeline through
+the request-scoped protocol (`adopt_cache_dit_backend` / `is_cache_dit_enabled`);
+`forward()` then reconciles per-request state through
+`RequestScopedCacheDiTRuntime` (MiniMax H3 precedent).
+
+**Key difference:** The enabler caches only the repeated main-layer stack and
+marks the pipeline as requiring paired CFG forwards, because cache-dit's
+separate-CFG accounting distinguishes cond/uncond passes purely by forward
+parity:
+
+```python
+pipeline._cache_dit_requires_paired_cfg = True
+block_adapter = BlockAdapter(
+    transformer=pipeline.gen_transformer,
+    blocks=[pipeline.gen_transformer.layers],  # Refiners stay outside
+    forward_pattern=[ForwardPattern.Pattern_3],
+    has_separate_cfg=True,
+    check_forward_pattern=True,
+)
+```
+
+Per request, the pipeline calls `runtime.prepare(spec)` for CFG requests
+(refreshing the step context) and `runtime.prepare(None)` for `guidance=1.0`
+requests (disabling hooks — their single forward per step cannot be expressed
+by the parity accounting).
+
 ### Registering Custom Implementations
 
-After writing your custom enabler, register it in `CUSTOM_DIT_ENABLERS` in
+After writing your custom enabler, register it in
+`CUSTOM_DIT_ENABLERS` via `register_custom_dit_enablers()` in
 `vllm_omni/diffusion/cache/cachedit/model_specific.py`:
 
 ```python
-CUSTOM_DIT_ENABLERS = {
-    "Wan22Pipeline": enable_cache_for_wan22,
-    "LongCatImagePipeline": enable_cache_for_longcat_image,
-    "YourCustomPipeline": enable_cache_for_your_model,  # Add here
-}
+CUSTOM_DIT_ENABLERS.update(
+    {
+        "Wan22Pipeline": enable_cache_for_wan22,
+        "Cosmos3OmniDiffusersPipeline": enable_cache_for_cosmos3,
+        "Krea2Pipeline": enable_cache_for_krea2,
+        "Magi2Pipeline": enable_cache_for_magi2,
+        "MammothModa2DiTPipeline": enable_cache_for_mammothmoda2,
+        "YourCustomPipeline": enable_cache_for_your_model,  # Add here
+    }
+)
 ```
 
 ---
@@ -274,6 +309,7 @@ Complete examples in the codebase:
 | **Wan2.2** | `cachedit.model_specific::enable_cache_for_wan22` | Single or dual-transformer | Auto-detects mode based on transformer_2 presence |
 | **LongCat** | `cachedit.config::CacheDiTAdapterConfig` | Declarative block adapter | Two block lists in one transformer |
 | **BAGEL** | `cachedit.model_specific::BagelCachedAdapter` | Custom cached adapter | Complex architecture |
+| **MammothModa2** | `cachedit.model_specific::enable_cache_for_mammothmoda2` | Sub-stack + paired CFG | Generation-runner pipeline; lifecycle owned by `pipeline_mammothmoda2_dit.py` |
 
 ---
 

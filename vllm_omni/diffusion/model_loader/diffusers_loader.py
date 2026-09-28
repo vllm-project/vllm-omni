@@ -25,7 +25,6 @@ from vllm.model_executor.model_loader.weight_utils import (
     pt_weights_iterator,
     safetensors_weights_iterator,
 )
-from vllm.transformers_utils.repo_utils import hf_api
 from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.utils.torch_utils import set_default_torch_dtype
 
@@ -54,6 +53,7 @@ from vllm_omni.diffusion.offloader.module_collector import ModuleDiscovery
 from vllm_omni.diffusion.offloader.offload_plan import get_offload_plan
 from vllm_omni.diffusion.registry import initialize_model
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
+from vllm_omni.transformers_utils.repo_utils import hf_api
 
 
 # download_gguf was removed from upstream vLLM (commit 6635279d8).

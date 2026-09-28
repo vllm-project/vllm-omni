@@ -213,6 +213,47 @@ accepts:
   `s`, `d`, `i`, `j`, `k`, and `l`;
 - `lingbot.camera_trajectory.v1` for explicit pose/intrinsics trajectories.
 
+## Online FP8 linear layers (experimental)
+
+Pass `quantization_config={"method": "fp8"}` to the existing `AsyncOmni`
+construction to use vLLM's online FP8 linear implementation. On the tested
+Hopper-class GPU this dispatches to CUTLASS FP8 GEMM with online per-tensor
+activation scaling; no LingBot-specific quantization kernel is introduced.
+
+Only the transformer's existing vLLM parallel linear layers are eligible:
+self-attention, cross-attention, FFN, camera injectors, and C2WS projections.
+The ordinary PyTorch linear layers (including the output head and
+time/text embeddings), normalization, convolutions, VAE, text encoder, and
+AR KV cache are not converted to FP8 by this option.
+
+Quality-sensitive projections can remain BF16 through fully qualified
+`ignored_layers` names. For example, the following configuration tests
+retaining the camera/C2WS path in BF16:
+
+```python
+quantization_config = {
+    "method": "fp8",
+    "ignored_layers": [
+        f"transformer.blocks.{i}.cam_injector_layer{j}"
+        for i in range(40)
+        for j in (1, 2)
+    ]
+    + [
+        "transformer.c2ws_hidden_states_layer1",
+        "transformer.c2ws_hidden_states_layer2",
+    ],
+}
+```
+
+Use `transformer.blocks.<i>.self_attn.qkv` to exclude the fused Q/K/V
+projection as a unit. The example exclusion list is an ablation, not a
+universal quality guarantee or a default. Validate the intended scene, seed,
+camera trajectory, and session length against BF16 before selecting a policy.
+An FP8 kernel speedup alone is not an end-to-end performance claim.
+The long-session E8 quality gate in
+[#7074](https://github.com/vllm-project/vllm-omni/issues/7074) remains required
+for Tier-2 acceptance.
+
 ## Validation
 
 Real-checkpoint validation uses 480x832 output, four DMD steps, and seed 42.
@@ -246,7 +287,7 @@ tested commit.
   AR blocks in one request. `max_num_seqs` must be one in both cases.
 - Stateful streaming VAE decode is not implemented; the realtime example emits
   latent chunks.
-- SP/USP, pipeline/CFG parallelism, HSDP, VAE parallelism, quantization,
+- SP/USP, pipeline/CFG parallelism, HSDP, VAE parallelism, quantization methods other than online FP8,
   Cache-DiT, TeaCache, causal-pretrain, and the 1.3B checkpoint are not claimed.
 - No AMD GPU, Ascend NPU, or Intel GPU support is claimed.
 

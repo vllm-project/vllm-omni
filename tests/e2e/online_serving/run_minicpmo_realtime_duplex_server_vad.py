@@ -22,8 +22,7 @@ def _events(events: list[dict[str, object]], response_id: str, kind: str) -> lis
 async def run_server_vad_interrupt(args) -> dict[str, object]:
     initial = read_pcm16_wav(Path(args.input_wav))
     interrupt = read_pcm16_wav(Path(args.interrupt_wav))[: PCM16_SAMPLE_RATE * PCM16_BYTES_PER_SAMPLE * 47 // 10]
-    session_id = f"server-vad-hard-interrupt-{id(args)}"
-    client = RealtimeDuplexClient(build_realtime_url(args.url, args.model, autostart=False, session_id=session_id))
+    client = RealtimeDuplexClient(build_realtime_url(args.url, args.model, autostart=False))
 
     async def until(predicate, label: str) -> None:
         await wait_for(predicate, timeout_s=args.timeout_s, label=label)
@@ -33,7 +32,6 @@ async def run_server_vad_interrupt(args) -> dict[str, object]:
         await client.configure(
             args.model,
             ref_audio="data:audio/wav;base64," + base64.b64encode(Path(args.ref_audio).read_bytes()).decode(),
-            session_id=session_id,
             turn_detection={"type": "server_vad", "interrupt_response": True},
             timeout_s=args.timeout_s,
         )

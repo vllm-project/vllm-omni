@@ -12,7 +12,9 @@ import torch
 
 from vllm_omni.model_executor.models.moss_tts.reference_encoder import (
     MossReferenceEncoder,
+    _prep_wav_sync,
     _RefEncodeBatcher,
+    _reference_resampler,
     build_reference_encoder,
     encode_request_references,
 )
@@ -581,3 +583,18 @@ async def test_idle_batcher_releases_all_completed_waveforms():
         assert batcher._drainer is not None and not batcher._drainer.done()
     finally:
         await batcher.aclose()
+
+
+def test_reference_resampler_is_cached_and_matches_functional_resample():
+    import torchaudio
+
+    _reference_resampler.cache_clear()
+    try:
+        waveform = torch.rand((1, 4800), generator=torch.Generator().manual_seed(123))
+        expected = torchaudio.functional.resample(waveform, 48000, _SR)
+        torch.testing.assert_close(_prep_wav_sync(waveform.numpy(), 48000, _SR), expected, rtol=0, atol=0)
+        torch.testing.assert_close(_prep_wav_sync(waveform.numpy(), 48000, _SR), expected, rtol=0, atol=0)
+        info = _reference_resampler.cache_info()
+        assert info.misses == 1 and info.hits == 1
+    finally:
+        _reference_resampler.cache_clear()

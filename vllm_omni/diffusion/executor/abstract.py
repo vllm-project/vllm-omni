@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import Callable
+from concurrent.futures import Future
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
@@ -12,7 +13,7 @@ from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 from vllm.v1.outputs import KVConnectorOutput
 
-from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.sched.interface import CachedRequestData
 
 if TYPE_CHECKING:
@@ -132,6 +133,20 @@ class DiffusionExecutor(ABC):
         """
         return None
 
+    def wait_output_ready(self, async_output_id: str) -> Future[DiffusionOutput]:
+        """Resolve deferred output; only asynchronous executors implement this."""
+        raise NotImplementedError(f"{type(self).__name__} does not support asynchronous output")
+
+    def drop_output(self, async_output_id: str) -> None:
+        """Reclaim an async output that will never be waited on (e.g. an
+        aborted request).
+
+        Only executors with an async output path (result pump) cache outputs
+        that a consumer must later claim; executors without one have nothing to
+        reclaim and can keep the default no-op implementation.
+        """
+        return None
+
     def get_kv_cache_specs(self) -> list[dict[str, KVCacheSpec]]:
         """Collect rank-local native specs after every Worker loads its model."""
 
@@ -177,8 +192,32 @@ class DiffusionExecutor(ABC):
         )
 
     def prepare_kv_for_forward(self, scheduler_output: DiffusionSchedulerOutput) -> KVConnectorOutput | None:
-        if scheduler_output.kv_connector_metadata is None:
-            return
+        if scheduler_output.kv_prefetch_connector_metadata is not None:
+            current = replace(
+                scheduler_output,
+                kv_transfer_request_ids=scheduler_output.kv_transfer_request_ids
+                - scheduler_output.kv_prefetch_request_ids,
+                kv_prefetch_connector_metadata=None,
+                kv_prefetch_request_ids=set(),
+            )
+            # First complete the current request on every rank. Only then
+            # submit B, preventing Mooncake from coalescing its bytes with A.
+            self.prepare_kv_for_forward(current)
+            return self.prepare_kv_for_forward(
+                replace(
+                    current,
+                    kv_connector_metadata=scheduler_output.kv_prefetch_connector_metadata,
+                    kv_transfer_request_ids=scheduler_output.kv_prefetch_request_ids,
+                    kv_required_request_ids=set(),
+                    kv_finished_request_ids=set(),
+                )
+            )
+        if (
+            scheduler_output.kv_connector_metadata is None
+            and not scheduler_output.kv_required_request_ids
+            and not scheduler_output.kv_poll_only
+        ):
+            return None
         transfer_output = replace(
             scheduler_output,
             scheduled_new_reqs=[],
@@ -194,6 +233,14 @@ class DiffusionExecutor(ABC):
         if len(outputs) != self.od_config.num_gpus or any(output.invalid_block_ids for output in outputs):
             # Missing ranks / invalid pages cannot establish safe ownership.
             raise RuntimeError("Diffusion KV receive failed on one or more ranks")
+        if scheduler_output.kv_required_request_ids is not None:
+            # Prefetch workers retain completion events until retirement.
+            # Their cumulative snapshots can be intersected directly.
+            finished = set.intersection(*(set(output.finished_recving or ()) for output in outputs))
+            if not scheduler_output.kv_required_request_ids.issubset(finished):
+                raise RuntimeError("Required diffusion KV receive did not complete on every rank")
+            outputs[0].finished_recving = finished
+            return outputs[0]
         completed = getattr(self, "_kv_receive_completed_ranks", {})
         for rank, output in enumerate(outputs):
             for request_id in output.finished_recving or ():

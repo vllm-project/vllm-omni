@@ -10,7 +10,8 @@ This module contains the code2wav (token-to-waveform) stage which uses:
 """
 
 from collections import Counter
-from typing import TypedDict, cast
+from collections.abc import Mapping
+from typing import Any, TypedDict, cast
 
 import numpy as np
 import torch
@@ -18,6 +19,8 @@ import torch.nn as nn
 from omegaconf import DictConfig
 from vllm.logger import init_logger
 
+from vllm_omni.diffusion.config import get_current_diffusion_config_or_none, set_current_diffusion_config
+from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.models.cosyvoice3_audio.cosyvoice3_dit import DiT
 from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.cfm import (
     CausalConditionalCFM,
@@ -35,6 +38,23 @@ from vllm_omni.model_executor.models.cosyvoice3.runtime import (
 from vllm_omni.transformers_utils.configs.cosyvoice3 import CosyVoice3Config
 
 logger = init_logger(__name__)
+
+
+def _build_dit_estimator(estimator_config: Mapping[str, Any]) -> DiT:
+    """Build CosyVoice's embedded DiT with diffusion backend configuration.
+
+    The code2wav model runs inside an LLM-generation worker, so it does not go
+    through the diffusion model loader that normally installs an
+    ``OmniDiffusionConfig`` during model construction. Install a local default
+    config when needed so ``DIFFUSION_ATTENTION_BACKEND`` and the platform
+    default are resolved by the same path as standalone diffusion models.
+    """
+    if get_current_diffusion_config_or_none() is not None:
+        return DiT(**estimator_config)
+
+    diffusion_config = OmniDiffusionConfig()
+    with set_current_diffusion_config(diffusion_config):
+        return DiT(**estimator_config)
 
 
 class StreamingFlowItem(TypedDict, total=False):
@@ -71,7 +91,7 @@ class CosyVoice3Code2Wav(nn.Module):
         cfm_params = DictConfig(decoder_cfg["cfm_params"])
 
         # DiT estimator using diffusion attention (Flash/Sage/SDPA backends)
-        estimator = DiT(**decoder_cfg["estimator"])
+        estimator = _build_dit_estimator(decoder_cfg["estimator"])
 
         decoder = CausalConditionalCFM(
             in_channels=decoder_cfg["in_channels"],

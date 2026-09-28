@@ -21,7 +21,7 @@ import time as _time
 from collections.abc import Awaitable, Callable, Coroutine
 from dataclasses import dataclass, field
 from http import HTTPStatus
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import janus
 import torch
@@ -34,6 +34,7 @@ from vllm.v1.engine import EngineCoreOutputs, FinishReason
 from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.metrics.stats import IterationStats
 
+from vllm_omni.data_entry_keys import FIRST_AUDIO_KEY, FIRST_AUDIO_REQUIRED_KEY
 from vllm_omni.diffusion.data import is_diffusion_request_started_output
 from vllm_omni.distributed.omni_connectors.utils.config import stage_receives_chunks
 from vllm_omni.engine import OmniEngineCoreRequest
@@ -66,6 +67,9 @@ from vllm_omni.metrics.stat_logger import OmniPrometheusStatLogger
 from vllm_omni.metrics.utils import DIFFUSION_METRICS_ONLY_REQUEST_ID
 from vllm_omni.outputs import OmniRequestOutput
 
+if TYPE_CHECKING:
+    from vllm_omni.engine import OmniEngineCoreOutput
+
 logger = init_logger(__name__)
 
 
@@ -79,7 +83,7 @@ def cleanup_request_artifact_dirs(artifact_dirs: set[str] | list[str]) -> None:
 # 1 ms poll cadence to event-driven wakeups: one reader task per live LLM stage
 # replica awaits `client.get_output_async()` directly — the same pattern vLLM's
 # own AsyncLLM output handler uses — and feeds a single serial dispatch queue.
-# Default off; the legacy poll loop remains the fallback.
+# Default is off except for pipelines with an explicit validated default.
 _EVENT_DRIVEN_ORCH_ENV = "VLLM_OMNI_EVENT_DRIVEN_ORCH"
 
 # How often the event-driven loop reconciles its reader-task set against
@@ -87,8 +91,16 @@ _EVENT_DRIVEN_ORCH_ENV = "VLLM_OMNI_EVENT_DRIVEN_ORCH"
 _ORCH_READER_RECONCILE_INTERVAL_S = 0.5
 
 
-def _event_driven_orch_enabled() -> bool:
-    return os.environ.get(_EVENT_DRIVEN_ORCH_ENV, "0").strip().lower() in ("1", "true", "yes", "on")
+def _event_driven_orch_enabled(*, default: bool = False) -> bool:
+    value = os.environ.get(_EVENT_DRIVEN_ORCH_ENV)
+    if value is None:
+        return default
+    return value.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _event_driven_orch_default_for_pipeline(pipeline_model_type: str | None) -> bool:
+    """Return whether a pipeline has a validated event-driven default."""
+    return pipeline_model_type == "qwen3_tts"
 
 
 def _build_terminal_empty_output(
@@ -212,9 +224,16 @@ class OrchestratorRequestState:
     # its own ``finished`` flag: no synthetic terminal, no client emission of
     # stage-0 segment ends, no terminal re-forward, no cleanup on finish.
     session_owned: bool = False
+    # Duplex sentence TTS already submitted this output. Do not also run the
+    # legacy full-text handoff for the same stage result.
+    skip_legacy_stage_forward: bool = False
     running_counter_registered: bool = False
     request_artifact_dirs: set[str] = field(default_factory=set)
     native_kv_transfer_id: str | None = None
+    # First-frame delivery and final-stage outputs use different channels.
+    upstream_first_audio: bool = False
+    pending_upstream_first_audio: tuple[int, OmniEngineCoreOutput] | None = None
+    pending_first_audio_outputs: list[tuple[int, int, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -261,7 +280,7 @@ class StreamingInputState:
 
         Fresh rather than shared: ``output_metadata`` is handed out by reference.
         """
-        segment = self.segments.get(stage_id)
+        segment = self.segments.get(stage_id) if stage_id is not None else None
         return segment if segment is not None else StreamingSegmentState()
 
 
@@ -298,6 +317,7 @@ class OrchestratorBase:
         prom_metrics: Any = None,
         log_stats: bool = False,
         enable_orch_monitor: bool = False,
+        event_driven_orch_default: bool = False,
     ) -> None:
         self.request_async_queue = request_async_queue
         self.output_async_queue = output_async_queue
@@ -340,7 +360,7 @@ class OrchestratorBase:
 
         self._shutdown_event = asyncio.Event()
         self._stages_shutdown = False
-        self._event_driven_orch = _event_driven_orch_enabled()
+        self._event_driven_orch = _event_driven_orch_enabled(default=event_driven_orch_default)
 
         # Distributed membership (optional, injected by DistStageRuntime)
         self._membership = membership_controller
@@ -428,9 +448,13 @@ class OrchestratorBase:
         # Start membership watcher if distributed mode is active.
         membership_watcher: asyncio.Task[None] | None = None
         if self._membership is not None:
+
+            async def cleanup_member_requests(ids: list[str]) -> None:
+                await self._cleanup_request_ids(ids, abort=True)
+
             self._membership.install_unregister_handlers(
                 output_queue=self.output_async_queue,
-                cleanup_callback=lambda ids: self._cleanup_request_ids(ids, abort=True),
+                cleanup_callback=cleanup_member_requests,
                 replica_removed_callback=self._remove_stage_replica_waiting,
             )
             membership_watcher = self._membership.start()
@@ -516,7 +540,7 @@ class OrchestratorBase:
                 # process exit as EngineDeadError during teardown.
                 for pool in self.stage_pools:
                     for client in pool.clients:
-                        if hasattr(client, "_shutting_down"):
+                        if client is not None and hasattr(client, "_shutting_down"):
                             client._shutting_down = True
                 # Stage teardown runs once in run()'s finally after the
                 # orchestration loop observes _shutdown_event and exits.
@@ -692,14 +716,38 @@ class OrchestratorBase:
         results: list[Any] = []
         stage_ids: list[int] = []
         for pool in target_pools:
+            clear_sender = pool.stage_type != "diffusion" and (
+                method in ("reset_mm_cache", "sleep")
+                or (method == "pause_scheduler" and kwargs.get("clear_cache", args[1] if len(args) > 1 else True))
+            )
             for replica_id in pool.live_replica_ids():
-                stage_result = await pool.collective_rpc(
-                    replica_id=replica_id,
-                    method=method,
-                    timeout=timeout,
-                    args=args,
-                    kwargs=kwargs,
-                )
+                try:
+                    if clear_sender:
+                        processor = self._stage_input_processors.get(pool.stage_id)
+                        if processor is not None:
+                            clear = processor.renderer.clear_mm_cache_async()
+                            if timeout is None:
+                                await clear
+                            else:
+                                await asyncio.wait_for(clear, timeout=timeout)
+                        clear_sender = False
+                    stage_result = await pool.collective_rpc(
+                        replica_id=replica_id,
+                        method=method,
+                        timeout=timeout,
+                        args=args,
+                        kwargs=kwargs,
+                    )
+                except Exception as exc:
+                    if (
+                        method not in ("pause_scheduler", "resume_scheduler")
+                        and method not in StagePool._CACHE_RESET_METHODS
+                    ):
+                        raise
+                    # Administrative failures must reach the caller without
+                    # terminating unrelated stages. _engine_core_rpc raises
+                    # on this result; remaining replicas still receive the RPC.
+                    stage_result = {"supported": False, "error": f"{type(exc).__name__}: {exc}"}
                 stage_ids.append(pool.stage_id)
                 results.append(stage_result)
 
@@ -750,6 +798,7 @@ class OrchestratorBase:
         ``_finish_raw_terminal_requests`` once routing is done.
         """
         pool = self.stage_pools[stage_id]
+        await self._route_upstream_first_audio(stage_id, replica_id, raw_outputs)
         await self._handle_kv_ready_raw_outputs(stage_id, raw_outputs)
         for eco in raw_outputs.outputs:
             # Emit kv_wait_s before _handle_kv_ready_raw_outputs'
@@ -764,8 +813,21 @@ class OrchestratorBase:
                     kv_params.get("connector_type") or "unknown",
                     float(kv_wait_s),
                 )
-            req_state = self.request_states.get(getattr(eco, "request_id", None))
+            request_id = getattr(eco, "request_id", None)
+            req_state = self.request_states.get(request_id) if request_id is not None else None
             if req_state is None:
+                continue
+            if (
+                getattr(eco, "finish_reason", None) == FinishReason.ERROR
+                and not getattr(eco, "is_segment_finished", False)
+                and not req_state.session_owned
+            ):
+                reason = getattr(eco, "stop_reason", None)
+                await self._handle_stage_error(
+                    stage_id,
+                    eco,
+                    error=reason if isinstance(reason, str) and reason else "Stage request failed",
+                )
                 continue
             if req_state.streaming.enabled:
                 segment_finished = bool(getattr(eco, "is_segment_finished", False))
@@ -812,6 +874,97 @@ class OrchestratorBase:
                 int(_sched_stats.num_waiting_reqs),
             )
         return processed
+
+    async def _route_upstream_first_audio(self, stage_id: int, replica_id: int, raw_outputs: Any) -> None:
+        """Order explicitly marked first audio ahead of a codec that skipped it.
+
+        The sender and codec run independently. Keep overtaking codec outputs,
+        including terminal outputs, on the request until its first PCM arrives.
+        Cancellation and stage errors use ordinary request cleanup.
+        """
+        kept = []
+        final_output = self.stage_pools[stage_id].final_output
+        for eco in raw_outputs.outputs:
+            mm = getattr(eco, "multimodal_output", None)
+            is_first = isinstance(mm, dict) and bool(mm.pop(FIRST_AUDIO_KEY, False))
+            requires_first = isinstance(mm, dict) and bool(mm.pop(FIRST_AUDIO_REQUIRED_KEY, False))
+            request_id = getattr(eco, "request_id", None)
+            req_state = self.request_states.get(request_id) if request_id is not None else None
+            if is_first:
+                assert isinstance(mm, dict)
+                # Only the dedicated first-frame channel is intercepted.
+                if (
+                    req_state is None
+                    or req_state.upstream_first_audio
+                    or req_state.pending_upstream_first_audio is not None
+                    or stage_id + 1 > req_state.final_stage_id
+                ):
+                    continue
+                audio = mm.get("model_outputs")
+                if not isinstance(audio, torch.Tensor) or audio.numel() == 0:
+                    await self._handle_stage_error(stage_id, eco, error="Invalid or empty first-audio payload")
+                    continue
+                req_state.pending_upstream_first_audio = (stage_id, eco)
+                await self._flush_upstream_first_audio(req_state)
+                continue
+            if (
+                req_state is not None
+                and final_output
+                and not req_state.upstream_first_audio
+                and (requires_first or req_state.pending_first_audio_outputs)
+                and getattr(eco, "finish_reason", None) != FinishReason.ERROR
+            ):
+                req_state.pending_first_audio_outputs.append((stage_id, replica_id, eco))
+                continue
+            kept.append(eco)
+        raw_outputs.outputs = kept
+
+    async def _flush_upstream_first_audio(self, req_state: OrchestratorRequestState) -> None:
+        """Feed upstream PCM through the codec's normal output-kind contract.
+
+        The source can finish its first frame while downstream prewarm is
+        still selecting/registering a replica. Retain that frame until the
+        codec owns an output-processor state, then accumulate it before any
+        codec output that omitted it. This preserves FINAL_ONLY/CUMULATIVE
+        waveforms and downstream consumers such as forced alignment.
+        """
+        from vllm_omni.engine import OmniEngineCoreOutputs
+
+        pending = req_state.pending_upstream_first_audio
+        if pending is None or self.request_states.get(req_state.request_id) is not req_state:
+            return
+        source_stage, first_output = pending
+        codec_stage = source_stage + 1
+        pool = self.stage_pools[codec_stage]
+        replica_id = pool.get_bound_replica_id(req_state.request_id)
+        if replica_id is None or req_state.request_id not in pool.output_processor.request_states:
+            return
+        req_state.pending_upstream_first_audio = None
+        req_state.upstream_first_audio = True
+        try:
+            processed = await pool.process_llm_raw_outputs(replica_id, OmniEngineCoreOutputs(outputs=[first_output]))
+            await self._handle_processed_outputs(codec_stage, replica_id, processed)
+        except EngineDeadError as error:
+            await self._handle_dead_replica(codec_stage, replica_id, error)
+            return
+        except Exception as error:
+            # A promised first frame must either enter the codec accumulator
+            # or fail its request; leaving it pending would stall completion.
+            logger.exception("First-audio output processing failed for %s", req_state.request_id)
+            await self._handle_stage_error(codec_stage, first_output, error=str(error))
+            return
+        if self.request_states.get(req_state.request_id) is not req_state:
+            return
+        ready, req_state.pending_first_audio_outputs = req_state.pending_first_audio_outputs, []
+        for pending_stage, pending_replica, output in ready:
+            if self.request_states.get(req_state.request_id) is not req_state:
+                break
+            terminal: set[str] = set()
+            processed = await self._process_llm_stage_outputs(
+                pending_stage, pending_replica, OmniEngineCoreOutputs(outputs=[output]), terminal
+            )
+            await self._handle_processed_outputs(pending_stage, pending_replica, processed)
+            await self._finish_raw_terminal_requests(pending_stage, pending_replica, terminal)
 
     def _absorb_diffusion_metrics(self, stage_id: int, replica_id: int, diffusion_output: Any) -> bool:
         """Drain a diffusion output's piggybacked metrics.
@@ -890,7 +1043,8 @@ class OrchestratorBase:
     async def _orchestration_loop_event_driven(self) -> None:
         """Event-driven variant of ``_orchestration_loop``.
 
-        Selected by ``VLLM_OMNI_EVENT_DRIVEN_ORCH=1``. One reader task per
+        Selected by the explicit ``VLLM_OMNI_EVENT_DRIVEN_ORCH`` value or the
+        pipeline default computed at engine initialization. One reader task per
         available LLM stage replica awaits ``client.get_output_async()``
         directly — the same pattern vLLM's own ``AsyncLLM`` output handler uses
         — and feeds a single dispatch queue. This coroutine consumes that queue
@@ -923,6 +1077,7 @@ class OrchestratorBase:
                         await asyncio.sleep(0.001)
                         continue
                     await ready_q.put(("llm", stage_id, replica_id, raw_outputs))
+                    self._orch_monitor.set_dispatch_queue_size(ready_q.qsize())
             except asyncio.CancelledError:
                 raise
             except BaseException as e:  # noqa: BLE001 - routed to the dispatcher
@@ -941,6 +1096,7 @@ class OrchestratorBase:
                         if output is None:
                             continue
                         await ready_q.put(("diffusion", stage_id, replica_id, output))
+                        self._orch_monitor.set_dispatch_queue_size(ready_q.qsize())
                         got = True
                     await asyncio.sleep(0 if got else 0.001)
             except asyncio.CancelledError:
@@ -1059,6 +1215,9 @@ class OrchestratorBase:
                     continue
                 kind, stage_id, replica_id, payload = pending_get.result()
                 pending_get = None
+                # Record the queue after dequeue so the gauge reflects work
+                # still waiting for dispatch rather than producer-side depth.
+                self._orch_monitor.set_dispatch_queue_size(ready_q.qsize())
 
                 if kind == "error":
                     # replica_id < 0 means the failure was raised by a poller
@@ -1172,7 +1331,7 @@ class OrchestratorBase:
 
             await self._route_output(stage_id, replica_id, output, req_state, stage_metrics)
 
-    async def _handle_stage_error(self, stage_id: int, output: Any) -> None:
+    async def _handle_stage_error(self, stage_id: int, output: Any, *, error: str | None = None) -> None:
         """Emit a frontend-visible error and clean up request state."""
         if self._cfg_tracker.is_companion(output.request_id):
             parent_id = self._cfg_tracker.get_parent_id(output.request_id) or output.request_id
@@ -1182,7 +1341,7 @@ class OrchestratorBase:
             ErrorMessage(
                 request_id=parent_id,
                 stage_id=stage_id,
-                error=output.error,
+                error=error if error is not None else output.error,
                 status_code=getattr(output, "error_status_code", None),
                 error_type=getattr(output, "error_type", None),
             )
@@ -1489,7 +1648,7 @@ class OrchestratorBase:
             self._pd_kv_params.pop(request_id, None)
             req_state = self.request_states.pop(request_id, None)
             if req_state is not None:
-                cleanup_request_artifact_dirs(getattr(req_state, "request_artifact_dirs", ()))
+                cleanup_request_artifact_dirs(getattr(req_state, "request_artifact_dirs", set()))
             if req_state is not None and req_state.running_counter_registered and self._running_counter is not None:
                 self._running_counter.decrement()
                 req_state.running_counter_registered = False
@@ -1722,6 +1881,7 @@ class OrchestratorBase:
         if (
             (finished or segment_finished)
             and stage_id < req_state.final_stage_id
+            and not req_state.skip_legacy_stage_forward
             and (not self.async_chunk or not self._stage_receives_async_chunks(stage_id + 1))
             and (not self._next_stage_already_submitted(stage_id, req_state) or req_state.streaming.enabled)
         ):
@@ -2146,7 +2306,7 @@ class OrchestratorBase:
                 )
                 return
             diffusion_source_outputs = [output, *companion_outputs]
-            if next_client.custom_process_input_func is not None:
+            if next_client is not None and next_client.custom_process_input_func is not None:
                 _t_ar2d = _time.perf_counter()
                 _fn = next_client.custom_process_input_func
                 _extra_kwargs: dict[str, Any] = {}
@@ -2229,20 +2389,20 @@ class OrchestratorBase:
             else:
                 diffusion_prompt = req_state.prompt
 
+            submit_kwargs = self._diffusion_submit_kwargs(req_id, src_stage_id, next_client, req_state, output)
+            payload_sender_info = self._build_payload_sender_info(src_stage_id, request_id=req_id)
+            if payload_sender_info is not None:
+                submit_kwargs["payload_sender_info"] = payload_sender_info
             if already_submitted:
-                replica_id = await next_pool.submit_update(req_id, req_state, diffusion_prompt)
+                replica_id = await next_pool.submit_update(
+                    req_id, req_state, diffusion_prompt, submit_kwargs=submit_kwargs
+                )
             else:
                 replica_id = await next_pool.submit_initial(
                     req_id,
                     req_state,
                     diffusion_prompt,
-                    submit_kwargs=self._diffusion_submit_kwargs(
-                        req_id,
-                        src_stage_id,
-                        next_client,
-                        req_state,
-                        output,
-                    ),
+                    submit_kwargs=submit_kwargs,
                     params_override=self._maybe_clone_diffusion_params_for_cfg(req_id, params),
                 )
             self._on_stage_submitted(
@@ -2331,7 +2491,9 @@ class OrchestratorBase:
             req_state.streaming.source_token_decoder = decode
 
         try:
-            next_inputs = next_client.process_engine_inputs(
+            assert next_client is not None
+            process_inputs = getattr(next_client, "process_engine_inputs")
+            next_inputs = process_inputs(
                 source_outputs,
                 req_state.prompt,
                 streaming_context=req_state.streaming,
@@ -2581,6 +2743,11 @@ class OrchestratorBase:
                 bound_replica_id if bound_replica_id is not None else 0,
                 req_state,
             )
+
+            if req_state.pending_upstream_first_audio is not None or req_state.upstream_first_audio:
+                await self._flush_upstream_first_audio(req_state)
+                if self.request_states.get(request_id) is not req_state:
+                    return False
 
             # async_chunk pre-submit fires per stage edge (N-1 -> N). Source
             # replica is stage 0's bound replica (single-replica thinker in

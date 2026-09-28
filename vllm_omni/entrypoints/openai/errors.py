@@ -9,10 +9,9 @@ shapes. Server-level exception handling belongs in
 
 from http import HTTPStatus
 
-from fastapi import Request
 from fastapi.responses import JSONResponse
+from vllm.entrypoints.serve import create_error_response
 from vllm.entrypoints.serve.engine.protocol import ErrorResponse
-from vllm.entrypoints.serve.instrumentator.basic import base
 
 
 class InvalidInputReferenceError(ValueError):
@@ -39,13 +38,12 @@ def _error_response_to_json_response(
 
 # TODO(#5227, P1.1): Relocate to audio/speech helpers when speech routes move out of api_server.py.
 def _create_speech_error_json_response(
-    raw_request: Request,
     message: str,
     *,
     err_type: str = "BadRequestError",
     status_code: HTTPStatus = HTTPStatus.BAD_REQUEST,
 ) -> JSONResponse:
-    err = base(raw_request).create_error_response(
+    err = create_error_response(
         message=message,
         err_type=err_type,
         status_code=status_code,

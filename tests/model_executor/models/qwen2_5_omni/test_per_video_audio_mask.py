@@ -619,6 +619,39 @@ def test_derive_audio_from_video_placeholders_only_pairs_true_videos():
     assert result["video"][1].is_embed.tolist() == [True, True]
 
 
+def _interleaved_video_placeholder() -> PlaceholderFeaturesInfo:
+    return PlaceholderFeaturesInfo(
+        modality="video",
+        item_idx=0,
+        start_idx=1,
+        tokens=[AUDIO_BOS_TOKEN_ID, VIDEO_TOKEN_ID, AUDIO_TOKEN_ID, AUDIO_EOS_TOKEN_ID],
+        is_embed=torch.tensor([False, True, False, False]),
+    )
+
+
+def test_reject_audio_tokens_outside_videos_accepts_interleaved_audio():
+    prompt_ids = [0, AUDIO_BOS_TOKEN_ID, VIDEO_TOKEN_ID, AUDIO_TOKEN_ID, AUDIO_EOS_TOKEN_ID, 0]
+
+    Qwen2_5OmniThinkerMultiModalProcessor._reject_audio_tokens_outside_videos(
+        _fake_qwen2_prompt_processor(),
+        prompt_ids,
+        {"video": [_interleaved_video_placeholder()]},
+    )
+
+
+def test_reject_audio_tokens_outside_videos_rejects_standalone_audio_placeholder():
+    # A separate <|AUDIO|> after the video is left unexpanded when
+    # use_audio_in_video=True and has no audio features behind it.
+    prompt_ids = [0, AUDIO_BOS_TOKEN_ID, VIDEO_TOKEN_ID, AUDIO_TOKEN_ID, AUDIO_EOS_TOKEN_ID, AUDIO_TOKEN_ID, 0]
+
+    with pytest.raises(ValueError, match="remove the separate <\\|AUDIO\\|> placeholder"):
+        Qwen2_5OmniThinkerMultiModalProcessor._reject_audio_tokens_outside_videos(
+            _fake_qwen2_prompt_processor(),
+            prompt_ids,
+            {"video": [_interleaved_video_placeholder()]},
+        )
+
+
 def test_qwen3_processor_inherits_vllm_omni_per_video_helpers():
     from vllm.model_executor.models.qwen3_omni_moe_thinker import (
         Qwen3OmniMoeThinkerMultiModalProcessor as UpstreamQwen3Processor,

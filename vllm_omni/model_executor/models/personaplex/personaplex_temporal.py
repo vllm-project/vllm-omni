@@ -92,6 +92,12 @@ class _RingKV:
         # first visible entry. (LM sacrifice-tick +1 is applied by the caller.)
         self.start_offset[b] = self.end_offset[b]
 
+    def reset_row(self, b: int) -> None:
+        # Restart row b at position 0. Every cached entry of the row sits at or
+        # past the new end offset, so all of them are masked until overwritten.
+        self.end_offset[b] = 0
+        self.start_offset[b] = 0
+
     def bump_slot_start(self, b: int) -> None:
         self.start_offset[b] += 1
 

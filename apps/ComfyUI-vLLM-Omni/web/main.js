@@ -52,6 +52,7 @@ const FAMILY_BY_OUTPUT = {
     REMOTE_LORA: "deployment",
     FASTH3_DEPLOYMENT: "deployment",
     VIDEO_REFERENCES: "media",
+    LATENT_MASK_EDITING: "media",
 };
 
 function familyOf(nodeData) {

@@ -737,6 +737,99 @@ def test_component_discovery_uses_official_checkpoint_contract() -> None:
     assert module._loader_state.prefetch_calls == [("checkpoint", ("tokenizer", "text_encoder", "vae"), False)]
 
 
+def _ulysses_config(size: int):
+    parallel_config = _od_config().parallel_config
+    parallel_config.sequence_parallel_size = size
+    parallel_config.ulysses_degree = size
+    return _od_config(parallel_config=parallel_config)
+
+
+def _record_shard_install(monkeypatch, module, *, world_size: int):
+    """Stand in for the Ulysses group and the decoder patch; return what the install was asked for."""
+    installs: list[dict] = []
+    group = object()
+
+    def install(vae, group_arg, split_dim, *, dst):
+        installs.append({"vae": vae, "group": group_arg, "split_dim": split_dim, "dst": dst})
+
+    monkeypatch.setattr(module, "install_wan_spatial_shard_decode", install)
+    monkeypatch.setattr(module.LingBotWorldCausalDMDPipeline, "_vae_shard_group", lambda self: (group, world_size))
+    return installs, group
+
+
+def test_a_multi_rank_deployment_shards_the_decoder_across_the_ulysses_ranks(monkeypatch) -> None:
+    """Multi-rank deployments shard decode by default."""
+    module = _load_pipeline_module()
+    installs, group = _record_shard_install(monkeypatch, module, world_size=2)
+
+    pipeline = module.LingBotWorldCausalDMDPipeline(od_config=_ulysses_config(2))
+
+    # Along the width, and assembled on every rank: each rank's post_decode consumes the frame.
+    assert installs == [{"vae": pipeline.vae, "group": group, "split_dim": "width", "dst": None}]
+    assert pipeline._vae_shard_split_dim == "width"
+
+
+def test_a_single_rank_deployment_leaves_the_decoder_alone(monkeypatch) -> None:
+    module = _load_pipeline_module()
+    installs, _ = _record_shard_install(monkeypatch, module, world_size=1)
+
+    pipeline = module.LingBotWorldCausalDMDPipeline(od_config=_ulysses_config(1))
+
+    assert installs == [] and pipeline._vae_shard_split_dim is None
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+@pytest.mark.parametrize("width, local_width", [(832, 208), (840, 216)])
+def test_streaming_decode_reservation_uses_padded_shards(monkeypatch, enabled, width, local_width):
+    module = _load_pipeline_module()
+    installs, _ = _record_shard_install(monkeypatch, module, world_size=4)
+    config = _ulysses_config(4)
+    config.model_config.update(lingbot_vae_spatial_sharding=enabled, ar_diffusion_height=480, ar_diffusion_width=width)
+    pipeline = module.LingBotWorldCausalDMDPipeline(od_config=config)
+    from vllm_omni.experimental.ar_diffusion.streaming_decode import WanStreamingDecoder
+
+    # Exercise the real byte estimator without constructing a checkpoint VAE.
+    decoder = object.__new__(WanStreamingDecoder)
+    decoder._bytes_per_pixel_fp32 = 16.0
+    monkeypatch.setattr(pipeline, "_streaming_decoder", lambda: decoder)
+    expected_width = local_width if enabled else width
+    assert pipeline._streaming_decode_bytes_per_session() == 16 * 480 * expected_width
+    assert len(installs) == int(enabled)
+    assert pipeline._vae_shard_world_size == (4 if enabled else 1)
+    assert config.parallel_config.sequence_parallel_size == config.parallel_config.ulysses_degree == 4
+
+
+def test_disabling_vae_sharding_does_not_require_a_shard_group(monkeypatch):
+    module = _load_pipeline_module()
+    config = _ulysses_config(4)
+    config.model_config["lingbot_vae_spatial_sharding"] = False
+
+    def unexpected_group(self):
+        pytest.fail("disabled VAE sharding must not access its process group")
+
+    monkeypatch.setattr(module.LingBotWorldCausalDMDPipeline, "_vae_shard_group", unexpected_group)
+    pipeline = module.LingBotWorldCausalDMDPipeline(od_config=config)
+    assert pipeline._vae_shard_split_dim is None
+
+
+@pytest.mark.parametrize("value", ["false", 0, None])
+def test_vae_sharding_switch_requires_a_boolean(value):
+    module = _load_pipeline_module()
+    config = _ulysses_config(4)
+    config.model_config["lingbot_vae_spatial_sharding"] = value
+    with pytest.raises(ValueError, match="lingbot_vae_spatial_sharding must be a boolean"):
+        module.LingBotWorldCausalDMDPipeline(od_config=config)
+
+
+def test_vae_shard_refuses_a_group_of_the_wrong_size(monkeypatch) -> None:
+    module = _load_pipeline_module()
+    installs, _ = _record_shard_install(monkeypatch, module, world_size=4)
+
+    with pytest.raises(RuntimeError, match="sequence_parallel_size=2 but the Ulysses group has 4 ranks"):
+        module.LingBotWorldCausalDMDPipeline(od_config=_ulysses_config(2))
+    assert installs == []
+
+
 @pytest.mark.parametrize(
     ("field", "value", "feature"),
     [
@@ -758,8 +851,9 @@ def test_unsupported_parallel_modes_fail_before_component_loading(field: str, va
     assert module._loader_state.prefetch_calls == []
 
 
-def test_pure_ulysses_parallel_config_is_supported() -> None:
+def test_pure_ulysses_parallel_config_is_supported(monkeypatch) -> None:
     module = _load_pipeline_module()
+    _record_shard_install(monkeypatch, module, world_size=2)
     parallel_config = _od_config().parallel_config
     parallel_config.sequence_parallel_size = 2
     parallel_config.ulysses_degree = 2
@@ -795,13 +889,14 @@ def test_unsupported_sp_config_fails_before_component_loading(overrides):
     assert module._loader_state.prefetch_calls == []
 
 
-def test_unsupported_quantization_fails_before_component_loading() -> None:
+def test_quantization_reaches_transformer_factory() -> None:
     module = _load_pipeline_module()
+    quant_config = object()
 
-    with pytest.raises(NotImplementedError, match="quantization"):
-        module.LingBotWorldCausalDMDPipeline(od_config=_od_config(quantization_config=object()))
+    pipeline = module.LingBotWorldCausalDMDPipeline(od_config=_od_config(quantization_config=quant_config))
 
-    assert module._loader_state.prefetch_calls == []
+    assert pipeline.transformer is not None
+    assert _FakeTransformerFactory.last_call[1:] == (quant_config, "transformer")
 
 
 def test_official_scheduler_config_matches_fixed_dmd_contract() -> None:

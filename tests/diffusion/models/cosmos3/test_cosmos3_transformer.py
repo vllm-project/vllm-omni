@@ -75,6 +75,248 @@ def _tiny_cosmos3_edge_config(**overrides):
     return config
 
 
+@pytest.mark.parametrize(
+    ("config_kind", "expected_language", "expected_gen"),
+    [
+        ("flat", "transformer", "transformer"),
+        ("transformer", "transformer", "transformer"),
+        ("other_component", None, None),
+        ("language_model", "language", None),
+        ("gen_layers", None, "gen"),
+        ("transformer_language_override", "language", "transformer"),
+        ("transformer_gen_disabled", "transformer", None),
+        ("independent_subcomponents", "language", "gen"),
+    ],
+)
+def test_transformer_resolves_global_and_subcomponent_quant_configs(
+    monkeypatch: pytest.MonkeyPatch,
+    config_kind: str,
+    expected_language: str | None,
+    expected_gen: str | None,
+) -> None:
+    """Resolve pipeline-level defaults and Cosmos3 subcomponent overrides."""
+    from vllm_omni.diffusion.models.cosmos3 import transformer_cosmos3
+    from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3 import Cosmos3VFMTransformer
+    from vllm_omni.quantization.component_config import ComponentQuantizationConfig
+
+    received: list[tuple[str, object]] = []
+    configs = {
+        "transformer": object(),
+        "language": object(),
+        "gen": object(),
+    }
+
+    class _StubLanguageModel(nn.Module):
+        def __init__(self, *, quant_config, **kwargs) -> None:
+            del kwargs
+            super().__init__()
+            received.append(("language_model", quant_config))
+            self.layers = nn.ModuleList()
+
+    class _StubGenDecoderLayer(nn.Module):
+        def __init__(self, *, quant_config, **kwargs) -> None:
+            del kwargs
+            super().__init__()
+            received.append(("gen_layers", quant_config))
+
+    monkeypatch.setattr(Cosmos3VFMTransformer, "_language_model_cls", _StubLanguageModel)
+    monkeypatch.setattr(transformer_cosmos3, "Cosmos3GenDecoderLayer", _StubGenDecoderLayer)
+
+    if config_kind == "flat":
+        top_level_config = configs["transformer"]
+    elif config_kind == "transformer":
+        top_level_config = ComponentQuantizationConfig({"transformer": configs["transformer"]})
+    elif config_kind == "other_component":
+        top_level_config = ComponentQuantizationConfig({"vae": configs["transformer"]})
+    elif config_kind == "language_model":
+        top_level_config = ComponentQuantizationConfig({"language_model": configs["language"]})
+    elif config_kind == "gen_layers":
+        top_level_config = ComponentQuantizationConfig({"gen_layers": configs["gen"]})
+    elif config_kind == "transformer_language_override":
+        top_level_config = ComponentQuantizationConfig(
+            {"transformer": configs["transformer"], "language_model": configs["language"]}
+        )
+    elif config_kind == "transformer_gen_disabled":
+        top_level_config = ComponentQuantizationConfig({"transformer": configs["transformer"], "gen_layers": None})
+    else:
+        top_level_config = ComponentQuantizationConfig(
+            {"language_model": configs["language"], "gen_layers": configs["gen"]}
+        )
+
+    Cosmos3VFMTransformer(
+        SimpleNamespace(
+            tf_model_config=_tiny_cosmos3_config(num_hidden_layers=1),
+            dtype=torch.float32,
+            quantization_config=top_level_config,
+            custom_pipeline_args={},
+            model_config={},
+        )
+    )
+
+    assert received == [
+        ("language_model", None if expected_language is None else configs[expected_language]),
+        ("gen_layers", None if expected_gen is None else configs[expected_gen]),
+    ]
+
+
+def test_transformer_component_quant_reaches_real_linear(monkeypatch: pytest.MonkeyPatch) -> None:
+    """#7323 regression: unwrap ComponentQuantizationConfig before ColumnParallelLinear.
+
+    Passing the router through unchanged makes ``resolve(language_model.*)`` miss
+    a ``transformer``-only map and raise ``ValueError: All linear layers should
+    support quant method``. A leaf config must reach the real linear path after
+    resolution. Attention backends are stubbed so this stays CPU-safe; MLP and
+    QKV linears remain real ``ColumnParallelLinear`` instances.
+    """
+    from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+    from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+
+    from vllm_omni.diffusion.models.cosmos3 import transformer_cosmos3
+    from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3 import (
+        Cosmos3GatedMLP,
+        Cosmos3VFMTransformer,
+        _resolve_cosmos3_quant_configs,
+    )
+    from vllm_omni.quantization.component_config import ComponentQuantizationConfig
+
+    class _LeafQuantConfig(QuantizationConfig):
+        def get_name(self) -> str:
+            return "test_leaf"
+
+        def get_quant_method(self, layer, prefix):  # noqa: ANN001
+            del layer, prefix
+            return UnquantizedLinearMethod()
+
+        @classmethod
+        def get_supported_act_dtypes(cls):
+            return [torch.float32]
+
+        def get_min_capability(self) -> int:
+            return 0
+
+        @classmethod
+        def from_config(cls, config):  # noqa: ANN001
+            raise NotImplementedError
+
+        def get_config_filenames(self) -> list[str]:
+            return []
+
+    class _StubFrameworkAttention(nn.Module):
+        def __init__(self, *args, **kwargs) -> None:
+            del args, kwargs
+            super().__init__()
+
+    monkeypatch.setattr(transformer_cosmos3, "FrameworkAttention", _StubFrameworkAttention)
+
+    leaf = _LeafQuantConfig()
+    router = ComponentQuantizationConfig({"transformer": leaf})
+
+    with pytest.raises(ValueError, match="All linear layers should support quant method"):
+        Cosmos3GatedMLP(
+            hidden_size=8,
+            intermediate_size=16,
+            quant_config=router,
+            prefix="language_model.layers.0.mlp",
+        )
+
+    language_qc, gen_qc = _resolve_cosmos3_quant_configs(router)
+    assert language_qc is leaf
+    assert gen_qc is leaf
+
+    model = Cosmos3VFMTransformer(
+        SimpleNamespace(
+            tf_model_config=_tiny_cosmos3_config(num_hidden_layers=1),
+            dtype=torch.float32,
+            quantization_config=router,
+            custom_pipeline_args={},
+            model_config={},
+        )
+    )
+    mlp = model.language_model.layers[0].mlp
+    assert isinstance(mlp.gate_proj.quant_method, UnquantizedLinearMethod)
+    assert isinstance(model.gen_layers[0].mlp.gate_proj.quant_method, UnquantizedLinearMethod)
+    assert isinstance(
+        model.language_model.layers[0].self_attn.to_q.quant_method,
+        UnquantizedLinearMethod,
+    )
+
+
+def test_transformer_pathway_default_keeps_nested_layer_override() -> None:
+    """Pathway leaf plus a more-specific key must still longest-prefix match."""
+    from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+    from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+
+    from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3 import (
+        Cosmos3GatedMLP,
+        _resolve_cosmos3_quant_configs,
+    )
+    from vllm_omni.quantization.component_config import ComponentQuantizationConfig
+
+    class _TaggedLinearMethod(UnquantizedLinearMethod):
+        def __init__(self, tag: str) -> None:
+            super().__init__()
+            self.tag = tag
+
+    class _TaggedQuantConfig(QuantizationConfig):
+        def __init__(self, tag: str) -> None:
+            super().__init__()
+            self.tag = tag
+
+        def get_name(self) -> str:
+            return self.tag
+
+        def get_quant_method(self, layer, prefix):  # noqa: ANN001
+            del layer, prefix
+            return _TaggedLinearMethod(self.tag)
+
+        @classmethod
+        def get_supported_act_dtypes(cls):
+            return [torch.float32]
+
+        def get_min_capability(self) -> int:
+            return 0
+
+        @classmethod
+        def from_config(cls, config):  # noqa: ANN001
+            raise NotImplementedError
+
+        def get_config_filenames(self) -> list[str]:
+            return []
+
+    pathway = _TaggedQuantConfig("pathway")
+    mlp_override = _TaggedQuantConfig("mlp")
+    language_qc, gen_qc = _resolve_cosmos3_quant_configs(
+        ComponentQuantizationConfig(
+            {
+                "language_model": pathway,
+                "gen_layers": pathway,
+                "language_model.layers.0.mlp": mlp_override,
+            }
+        )
+    )
+
+    assert isinstance(language_qc, ComponentQuantizationConfig)
+    assert language_qc.resolve("language_model.layers.0.mlp.gate_proj") is mlp_override
+    assert language_qc.resolve("language_model.layers.0.self_attn.to_q") is pathway
+    assert language_qc.resolve("language_model.layers.1.mlp.gate_proj") is pathway
+    assert gen_qc is pathway
+
+    mlp0 = Cosmos3GatedMLP(
+        hidden_size=8,
+        intermediate_size=16,
+        quant_config=language_qc,
+        prefix="language_model.layers.0.mlp",
+    )
+    mlp1 = Cosmos3GatedMLP(
+        hidden_size=8,
+        intermediate_size=16,
+        quant_config=language_qc,
+        prefix="language_model.layers.1.mlp",
+    )
+    assert mlp0.gate_proj.quant_method.tag == "mlp"
+    assert mlp1.gate_proj.quant_method.tag == "pathway"
+
+
 def test_mrope_position_ids_cover_text_video_sound_and_action() -> None:
     from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3 import (
         compute_mrope_position_ids_action,

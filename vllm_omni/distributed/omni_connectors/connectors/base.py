@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from abc import ABC, abstractmethod
 from typing import Any
@@ -59,6 +59,24 @@ class OmniConnectorBase(ABC):
     def cleanup(self, request_id: str) -> None:
         """Clean up resources for a request."""
         pass
+
+    def get_with_deadline(
+        self,
+        from_stage: str,
+        to_stage: str,
+        get_key: str,
+        metadata: dict[str, Any] | None = None,
+        *,
+        deadline: float,
+    ) -> tuple[Any, int] | None:
+        """Receive with a monotonic deadline; blocking backends must override this."""
+        raise NotImplementedError(f"{type(self).__name__} does not support deadline-aware receive")
+
+    def abandon_get(self, get_key: str) -> None:
+        """Retire unresolved discovery attempts; never cancel an active DMA READ."""
+
+    def reap_consumed(self) -> None:
+        """Release producer bookkeeping for payloads consumed by another process."""
 
     @abstractmethod
     def health(self) -> dict[str, Any]:

@@ -289,6 +289,19 @@ Upload a new voice sample for voice cloning in Base task TTS requests.
 
 Fields `ref_text` and `speaker_description` are omitted when not provided at upload time.
 
+**Naming rules:**
+
+- Names that collide with one of the model's built-in or precomputed voices are rejected (400). Voice
+  files already on disk under such a name are ignored at startup with a warning, so an upload can never
+  shadow a built-in voice.
+- Re-uploading an existing uploaded name overwrites it in place (the previous audio file is
+  deleted). Set `VLLM_OMNI_SPEAKER_REGISTRATION_POLICY=immutable` on the server to reject duplicates instead,
+  requiring an explicit `DELETE /v1/audio/voices/{name}` before re-registering — useful when the
+  endpoint is reachable by multiple writers and silent overwrites are a risk.
+- The voice registry has no per-user ownership: any client that can reach the endpoint can
+  overwrite (default policy) or delete any uploaded voice. For multi-tenant deployments, add
+  authentication at a proxy and namespace voice names per user (e.g. `{user}.{name}`).
+
 **Usage Example:**
 
 ```bash
@@ -577,6 +590,7 @@ by `GET /v1/audio/voices`. Valid precomputed voices can be used in
 | ---------- | --------- | ------------- |
 | `SPEAKER_SAMPLES_DIR` | `~/.cache/vllm-omni/speakers` | Directory for persisted uploaded speakers (`.safetensors` files). |
 | `SPEAKER_MAX_UPLOADED` | `1000` | Maximum number of uploaded speakers kept on disk. Upload requests past the cap return 400. |
+| `VLLM_OMNI_SPEAKER_REGISTRATION_POLICY` | `overwrite` | `immutable` rejects re-uploading an existing uploaded name (400) until it is deleted; any other value fails startup. |
 
 The in-memory LRU has a fixed 512 MiB byte budget.
 
@@ -957,22 +971,24 @@ Use `/v1/audio/voices` to list available voices for the loaded model.
 ## Orchestration Loop (experimental)
 
 Multi-stage omni deployments route stage outputs through a single orchestrator
-loop. By default that loop polls every stage replica on a 1 ms cadence. An
-opt-in event-driven mode replaces the poll with one reader task per live stage
+loop. The legacy loop polls every stage replica on a 1 ms cadence. The
+event-driven mode replaces the poll with one reader task per live stage
 replica awaiting its client directly, and switches the serving-side
-final-output drain to a condition-variable wakeup at the same time.
+final-output drain to a condition-variable wakeup at the same time. Qwen3-TTS
+uses this mode by default; other pipelines keep the legacy poll unless enabled.
 
 **Configuration (environment variables):**
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `VLLM_OMNI_EVENT_DRIVEN_ORCH` | `0` (off) | Switches the orchestration loop and the final-output drain from the legacy 1 ms poll to event-driven wakeups. Enabled by `1`, `true`, `yes`, or `on`, matched case-insensitively after surrounding whitespace is stripped; any other value leaves it off. |
+| `VLLM_OMNI_EVENT_DRIVEN_ORCH` | On for Qwen3-TTS; off for other pipelines | Switches the orchestration loop and the final-output drain from the legacy 1 ms poll to event-driven wakeups. An explicit value wins; otherwise the pipeline default computed at engine initialization is used. The override is resolved at orchestrator construction and separately when the final-output drain starts. `1`, `true`, `yes`, or `on` enables it, ignoring case and surrounding whitespace; other values select the legacy poll loop. |
 
-Set it on the process that runs the orchestrator (stage 0 of an omni
-deployment) before starting the server:
+Set it on the process that runs the orchestrator (stage 0 of an omni deployment)
+before starting the server when overriding the pipeline default. For example,
+explicitly disable event-driven orchestration for Qwen3-TTS:
 
 ```bash
-export VLLM_OMNI_EVENT_DRIVEN_ORCH=1
+VLLM_OMNI_EVENT_DRIVEN_ORCH=0 \
 vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-Base \
     --omni \
     --port 8091
@@ -982,8 +998,9 @@ The server logs the selected loop mode and its reader/poller counts once at
 startup, so you can confirm which loop is live.
 
 Routing, output ordering, and terminal-state behavior are identical on both
-loops; only the poll cadence changes. Leaving the variable unset keeps the
-legacy poll loop, which is the supported default.
+loops; only the poll cadence changes. Leaving the variable unset selects the
+pipeline default: event-driven for Qwen3-TTS, and legacy polling for other
+pipelines, including Qwen3-Omni.
 
 **Known limitations:**
 

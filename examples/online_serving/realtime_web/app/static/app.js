@@ -5,6 +5,7 @@
   const profile = window.OmniRealtimeProfiles[config.profile || 'minicpm-native'](config);
   const callButton = document.getElementById('callButton');
   const sendTurnButton = document.getElementById('sendTurnButton');
+  const pttButton = document.getElementById('pttButton');
   const muteButton = document.getElementById('muteButton');
   const cameraButton = document.getElementById('cameraButton');
   const cameraPreview = document.getElementById('cameraPreview');
@@ -28,6 +29,7 @@
   const ECHO_GUARD_MS = 300;
   const INITIAL_PLAYBACK_BUFFER_MS = 400;
   const SESSION_CLOSE_TIMEOUT_MS = 1000;
+  const SILENT_PCM_SAMPLES = 160;
 
   const PROMPT_PRESETS = profile.presets;
   document.title = profile.title;
@@ -36,7 +38,21 @@
   document.getElementById('profileDescription').textContent = profile.description;
   document.getElementById('policyLabel').textContent = profile.policy;
   cameraButton.hidden = !profile.camera;
+  if (profile.cameraPreviewLarge) {
+    cameraPreview.classList.add('camera-preview-large');
+    // Inline, so a cached stylesheet cannot leave the 96×72 HTML default.
+    cameraPreview.style.width = '100%';
+    cameraPreview.style.height = 'auto';
+    cameraPreview.style.maxHeight = '480px';
+    cameraPreview.style.flex = '0 0 100%';
+    const cameraActions = cameraPreview.closest('.call-actions');
+    if (cameraActions) {
+      cameraActions.style.flexWrap = 'wrap';
+      cameraActions.style.gridColumn = '1 / -1';
+    }
+  }
   sendTurnButton.hidden = !profile.clientCommit;
+  pttButton.hidden = !profile.pushToTalk;
   promptPreset.replaceChildren();
   for (const name of [...Object.keys(PROMPT_PRESETS), 'custom']) {
     const option = document.createElement('option');
@@ -64,6 +80,12 @@
   let cameraStream = null;
   let cameraTimer = null;
   let cameraPendingFrame = null;
+  let cameraLastFrame = null;
+  // AURA vision clock only. Other profiles leave this empty and never read it.
+  let visionFollowQueue = [];
+  let visionTurnLocked = false;
+  let suppressedPlaybackId = null;
+  let pttHeld = false;
   const cameraCanvas = document.createElement('canvas');
   let playbackRate = OUTPUT_RATE;
   let pendingCapture = [];
@@ -87,6 +109,8 @@
   const interruptedResponses = new Set();
   const pendingEvents = new Set();
   let assistantTextChannel = null;
+  const assistantRowByResponse = new Map();
+  let lastClosedAssistantText = '';
   let connectionReady = false;
   let turnCounter = 0;
   let stopping = null;
@@ -134,7 +158,7 @@
       assistantTextChannel = null;
       if (profile.halfDuplex) pendingCapture = [];
       sendTurnButton.disabled = !profile.clientCommit;
-      setModel(profile.waiting);
+      if (!pttHeld) setModel(profile.waiting);
     }, ECHO_GUARD_MS);
   }
 
@@ -240,6 +264,7 @@
       current.value = finalText;
       current.text.textContent = finalText;
     }
+    if (role === 'assistant' && current.value) lastClosedAssistantText = current.value;
     current.row.classList.remove('turn-live');
     if (role === 'user') liveUserTurn = null;
     else liveAssistantTurn = null;
@@ -317,11 +342,67 @@
   }
 
   function microphoneUploadEnabled() {
-    return running && connectionReady && !muted && (!profile.halfDuplex || !assistantActive);
+    if (!running || !connectionReady || muted) return false;
+    if (profile.pushToTalk) return pttHeld;
+    return !profile.halfDuplex || !assistantActive;
+  }
+
+  function queueVisionFrame(frame) {
+    visionFollowQueue.push(frame);
+    if (visionFollowQueue.length > 2) visionFollowQueue.shift();
+  }
+
+  function commitVisionFollow() {
+    // Two frames still gate the turn (client commit). Both frames are one clip;
+    // the server packs them as a single <|video_pad|>, same as Native.
+    const frames = visionFollowQueue.slice();
+    visionFollowQueue = [];
+    const silent = new Int16Array(SILENT_PCM_SAMPLES);
+    const event = profile.append(int16ToBase64(silent), frames, { isSpeech: false });
+    socket.send(JSON.stringify(event));
+    for (const message of profile.commitMessages()) socket.send(JSON.stringify(message));
+  }
+
+  function releaseVisionTurn(responseId) {
+    if (!profile.visionFollowWhileSpeaking || !visionTurnLocked) return;
+    if (responseId && currentResponseId && responseId !== currentResponseId) return;
+    visionTurnLocked = false;
+  }
+
+  function suppressLocalPlayback() {
+    // Hold-to-talk cuts the speaker only. The in-flight response stays on the server.
+    if (currentResponseId) suppressedPlaybackId = currentResponseId;
+    if (playbackNode) playbackNode.port.postMessage({ type: 'clear' });
+    playbackComplete = true;
+    responseHasAudio = false;
+    setPlayback('Idle');
+  }
+
+  function playbackSuppressed(responseId) {
+    return Boolean(suppressedPlaybackId) && responseId === suppressedPlaybackId;
   }
 
   function flushCapture() {
-    if (!socket || socket.readyState !== WebSocket.OPEN || pendingCapture.length === 0) return;
+    if (!socket || socket.readyState !== WebSocket.OPEN) return;
+
+    // AURA: capture stays 2 fps, but a turn opens only every 2 frames, and
+    // not until the previous response's text is done (or it listened).
+    // Playback still running is not the lock. PTT speech is not batched here.
+    if (profile.pushToTalk && profile.visionFollowWhileSpeaking && !pttHeld) {
+      if (cameraPendingFrame) {
+        queueVisionFrame(cameraPendingFrame);
+        cameraPendingFrame = null;
+      }
+      if (!visionTurnLocked && visionFollowQueue.length >= 2) commitVisionFollow();
+      return;
+    }
+
+    if (profile.pushToTalk && !pttHeld) {
+      pendingCapture = [];
+      return;
+    }
+
+    if (pendingCapture.length === 0) return;
     if (!microphoneUploadEnabled()) {
       pendingCapture = [];
       return;
@@ -335,9 +416,42 @@
     }
     pendingCapture = [];
     const pcm = resampleInt16(merged, captureRate, profile.inputSampleRate || INPUT_RATE);
-    const appendEvent = profile.append(int16ToBase64(pcm), cameraPendingFrame);
+    const frame = cameraPendingFrame || (profile.stickyCamera ? cameraLastFrame : null);
     cameraPendingFrame = null;
+    const appendEvent = profile.pushToTalk
+      ? profile.append(int16ToBase64(pcm), frame, { isSpeech: true })
+      : profile.append(int16ToBase64(pcm), frame);
     socket.send(JSON.stringify(appendEvent));
+  }
+
+  function setPttHeld(held) {
+    if (!profile.pushToTalk || !running || pttHeld === held) return;
+    if (held) {
+      pttHeld = true;
+      suppressLocalPlayback();
+      pttButton.classList.toggle('is-active', true);
+      pttButton.textContent = 'Release to send';
+      setModel('Talking');
+      appendLog('PTT down');
+      return;
+    }
+    // Flush remaining speech while still held, then commit.
+    flushCapture();
+    if (socket && socket.readyState === WebSocket.OPEN) {
+      for (const event of profile.commitMessages()) socket.send(JSON.stringify(event));
+    }
+    // Lock vision before clearing pttHeld. Stage0/1 are max_num_seqs=1: a
+    // vision-follow commit in the gap before response.begin aborts the speech
+    // turn (server sees a new ephemeral and kills the prior ASR request).
+    if (profile.visionFollowWhileSpeaking) {
+      visionTurnLocked = true;
+      visionFollowQueue = [];
+    }
+    pttHeld = false;
+    pttButton.classList.toggle('is-active', false);
+    pttButton.textContent = 'Hold to talk';
+    setModel(profile.waiting);
+    appendLog('PTT up · commit');
   }
 
   function beginAssistant(responseId) {
@@ -351,6 +465,7 @@
   }
 
   function feedPlayback(decoded, responseId) {
+    if (playbackSuppressed(responseId || currentResponseId)) return;
     if (!decoded || !decoded.pcm || decoded.pcm.length === 0 || !playbackNode) return;
     const pcm = resampleInt16(decoded.pcm, decoded.sourceRate, playbackRate);
     responseHasAudio = true;
@@ -392,13 +507,18 @@
   }
 
   async function handleAudioEvent(action) {
+    const responseId = action.responseId || currentResponseId || `turn-${turnCounter}`;
+    if (playbackSuppressed(responseId)) return;
     markBusy();
-    currentResponseId = action.responseId || currentResponseId || `turn-${turnCounter}`;
+    currentResponseId = responseId;
     setModel('Speaking');
     const generation = sessionGeneration;
-    const responseId = currentResponseId;
     const decoded = await decodeAudioDelta(action.event);
-    if (generation === sessionGeneration && !interruptedResponses.has(responseId)) feedPlayback(decoded, responseId);
+    if (
+      generation === sessionGeneration
+      && !interruptedResponses.has(responseId)
+      && !playbackSuppressed(responseId)
+    ) feedPlayback(decoded, responseId);
   }
 
   function handleTranscriptEvent(action) {
@@ -408,12 +528,43 @@
       if (profile.deduplicateTranscript && assistantTextChannel && action.channel !== assistantTextChannel) return;
       if (action.text) assistantTextChannel = action.channel || assistantTextChannel;
     }
-    if (action.kind === 'text') addTranscript(action.role, action.text);
-    else if (profile.deduplicateTranscript && action.role === 'assistant') {
+    const responseId = action.responseId || null;
+    const existing = responseId && action.role === 'assistant' ? assistantRowByResponse.get(responseId) : null;
+    if (existing) {
+      if (action.kind === 'text') {
+        if (!action.text) return;
+        existing.value += action.text;
+      } else if (action.text) {
+        existing.value = action.text;
+      }
+      existing.text.textContent = existing.value;
+      liveAssistantTurn = existing;
+      return;
+    }
+    if (
+      action.role === 'assistant'
+      && !liveAssistantTurn
+      && action.text
+      && action.text === lastClosedAssistantText
+    ) {
+      // response.done already closed this sentence. A later full transcript,
+      // including one stamped with a newer vision-follow response id, must
+      // not open a second bubble with the same words.
+      return;
+    }
+    if (action.kind === 'text') {
+      addTranscript(action.role, action.text);
+      if (action.role === 'assistant' && responseId && liveAssistantTurn) {
+        assistantRowByResponse.set(responseId, liveAssistantTurn);
+      }
+      return;
+    }
+    if (profile.deduplicateTranscript && action.role === 'assistant') {
       if (action.text) {
         const turn = ensureTurn('assistant');
         turn.value = action.text;
         turn.text.textContent = action.text;
+        if (responseId) assistantRowByResponse.set(responseId, turn);
       }
     } else finishTranscript(action.role, action.text);
   }
@@ -459,12 +610,14 @@
       }
       case 'listen':
         assistantActive = false;
+        releaseVisionTurn(responseId);
         setModel(profile.waiting);
         break;
       case 'begin':
         if (profile.halfDuplex) armTurnTimeout();
         if (echoTimer !== null) { clearTimeout(echoTimer); echoTimer = null; }
         beginAssistant(responseId);
+        if (profile.visionFollowWhileSpeaking) visionTurnLocked = true;
         break;
       case 'audio':
         await handleAudioEvent(action);
@@ -474,11 +627,13 @@
         break;
       case 'text': case 'text-final':
         handleTranscriptEvent(action);
+        if (action.kind === 'text-final' && action.role === 'assistant') releaseVisionTurn(responseId);
         break;
       case 'done':
         clearTimeout(turnTimeout);
         responseComplete = true;
         finishTranscript('assistant');
+        releaseVisionTurn(responseId);
         requestPlaybackDrain(responseId);
         finishResponseIfReady();
         break;
@@ -671,7 +826,11 @@
       await openSocket();
       running = true;
       muted = false;
+      pttHeld = false;
       assistantActive = false;
+      visionFollowQueue = [];
+      visionTurnLocked = false;
+      suppressedPlaybackId = null;
       sendTimer = window.setInterval(flushCapture, profile.sendIntervalMs || SEND_INTERVAL_MS);
       startClock();
       callButton.textContent = 'End session';
@@ -679,6 +838,7 @@
       muteButton.disabled = false;
       cameraButton.disabled = !profile.camera;
       sendTurnButton.disabled = !profile.clientCommit;
+      pttButton.disabled = !profile.pushToTalk;
       setConnection('Connected', 'online');
       setModel(profile.waiting);
       appendLog('session started');
@@ -698,8 +858,9 @@
     cameraPreview.srcObject = cameraStream;
     cameraPreview.style.display = '';
     await cameraPreview.play().catch(() => {});
-    // Official omni-duplex cadence: one JPEG (quality 0.7) per ~1 s chunk,
-    // no client-side resize (the server normalizes at scale_resolution=448).
+    // JPEG quality 0.7; no client-side resize (server scale_resolution=448).
+    // Interval is per-profile: AURA 2 fps, MiniCPM/Qwen stay at 1 s.
+    const cameraIntervalMs = profile.cameraIntervalMs || 1000;
     const captureCameraFrame = () => {
       if (!cameraStream || cameraPreview.videoWidth === 0) return;
       const scale = profile.cameraMaxDimension
@@ -712,14 +873,17 @@
         if (connectionReady && socket?.readyState === WebSocket.OPEN) {
           for (const event of profile.imageMessages(frame)) socket.send(JSON.stringify(event));
         }
-      } else cameraPendingFrame = frame;
+      } else {
+        cameraPendingFrame = frame;
+        if (profile.stickyCamera) cameraLastFrame = frame;
+      }
     };
     // Do not make the first spoken turn race a one-second timer.
     captureCameraFrame();
-    cameraTimer = window.setInterval(captureCameraFrame, 1000);
+    cameraTimer = window.setInterval(captureCameraFrame, cameraIntervalMs);
     cameraButton.textContent = 'Camera off';
     cameraButton.classList.add('is-active');
-    appendLog('camera on (1 fps omni frames)');
+    appendLog(`camera on (${(1000 / cameraIntervalMs).toFixed(0)} fps omni frames)`);
   }
 
   function stopCamera() {
@@ -730,6 +894,7 @@
     }
     cameraStream = null;
     cameraPendingFrame = null;
+    cameraLastFrame = null;
     cameraPreview.srcObject = null;
     cameraPreview.style.display = 'none';
     cameraButton.textContent = 'Camera';
@@ -778,9 +943,18 @@
     playbackComplete = true;
     turnSubmitted = false;
     assistantTextChannel = null;
+    assistantRowByResponse.clear();
+    lastClosedAssistantText = '';
     sendTurnButton.disabled = true;
+    pttHeld = false;
+    pttButton.disabled = true;
+    pttButton.classList.remove('is-active');
+    pttButton.textContent = 'Hold to talk';
     running = false;
     assistantActive = false;
+    visionFollowQueue = [];
+    visionTurnLocked = false;
+    suppressedPlaybackId = null;
     pendingCapture = [];
     if (sendTimer !== null) clearInterval(sendTimer);
     if (clockTimer !== null) clearInterval(clockTimer);
@@ -853,6 +1027,23 @@
     sendTurnButton.disabled = true;
     setModel('Thinking');
     appendLog('turn submitted');
+  });
+  const pttDown = (event) => {
+    event.preventDefault();
+    setPttHeld(true);
+  };
+  const pttUp = (event) => {
+    event.preventDefault();
+    setPttHeld(false);
+  };
+  pttButton.addEventListener('pointerdown', pttDown);
+  pttButton.addEventListener('pointerup', pttUp);
+  pttButton.addEventListener('pointercancel', pttUp);
+  pttButton.addEventListener('pointerleave', () => {
+    if (pttHeld) setPttHeld(false);
+  });
+  window.addEventListener('pointerup', () => {
+    if (pttHeld) setPttHeld(false);
   });
   muteButton.addEventListener('click', toggleMute);
   clearLogButton.addEventListener('click', () => {

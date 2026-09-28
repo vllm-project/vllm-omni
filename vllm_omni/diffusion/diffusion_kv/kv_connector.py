@@ -8,6 +8,7 @@ import math
 import time
 from collections import Counter
 from collections.abc import Mapping
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from vllm.config import KVTransferConfig, VllmConfig
@@ -33,6 +34,96 @@ logger = init_logger(__name__)
 
 class KVTransferRegistrationError(ValueError):
     """A failed handoff whose destination pages have not been dispatched."""
+
+
+def native_prefetch_enabled(od_config: OmniDiffusionConfig) -> bool:
+    """Validate the opt-in GPU consumer implementation before allocating pages."""
+    config = getattr(od_config, "kv_transfer_config", None)
+    if not isinstance(config, KVTransferConfig):
+        return False
+    extra = config.kv_connector_extra_config or {}
+    enabled = extra.get("enable_kv_async_prefetch", False)
+    if not isinstance(enabled, bool):
+        raise ValueError("enable_kv_async_prefetch must be a boolean")
+    if not enabled:
+        return False
+    from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
+    from vllm_omni.platforms import current_omni_platform
+
+    if (
+        not current_omni_platform.is_cuda()
+        or config.kv_connector != "MooncakeConnector"
+        or config.kv_role != "kv_consumer"
+        or extra.get("mooncake_protocol", "rdma") != "tcp"
+        or od_config.diffusion_kv_mode is not DiffusionKVCacheMode.PAGED_SCHEDULER
+        or od_config.max_num_seqs != 1
+        or getattr(od_config, "cfg_kv_collect_func", None) is not None
+    ):
+        raise ValueError(
+            "Native KV prefetch requires CUDA, MooncakeConnector TCP consumer, "
+            "paged_scheduler, max_num_seqs=1 and no CFG companion collector"
+        )
+    return True
+
+
+@dataclass
+class KVReceiveProgress:
+    """Rank-local state survives consumption of Mooncake completion events."""
+
+    submitted: set[str] = field(default_factory=set)
+    received: set[str] = field(default_factory=set)
+    sent: set[str] = field(default_factory=set)
+    deadlines: dict[str, float] = field(default_factory=dict)
+
+    def prepare(
+        self, active_connector: ActiveKVConnector, output: DiffusionSchedulerOutput, timeout: float
+    ) -> KVConnectorOutput:
+        new_ids = output.kv_transfer_request_ids
+        if new_ids & self.submitted:
+            raise RuntimeError("Duplicate native KV receive submission")
+        required = output.kv_required_request_ids or set()
+        if not required.issubset(self.submitted | new_ids):
+            raise RuntimeError("Required native KV receive was never submitted")
+        if output.kv_connector_metadata is not None:
+            active_connector.pre_forward(output)
+        elif new_ids:
+            raise RuntimeError("Native KV submission requires connector metadata")
+        self.submitted.update(new_ids)
+        self.deadlines.update(dict.fromkeys(new_ids, time.monotonic() + timeout))
+
+        while True:
+            # post_forward also consumes get_finished(); always retain its
+            # events, including completions for a request not required yet.
+            result = active_connector.post_forward(output.kv_finished_request_ids)
+            # Cancelling a request before admission can send a zero-page
+            # notification to release its producer. Its late acknowledgement
+            # has no receive reservation and must not become a leaked record.
+            self.received.update(self.submitted.intersection(result.finished_recving or ()))
+            self.sent.update(self.submitted.intersection(result.finished_sending or ()))
+            if result.invalid_block_ids:
+                raise RuntimeError("Diffusion KV connector reported invalid remote pages")
+            expired = {
+                rid
+                for rid, deadline in self.deadlines.items()
+                if rid not in self.received and time.monotonic() >= deadline
+            }
+            if expired:
+                raise TimeoutError(f"Timed out receiving diffusion KV for {sorted(expired)}")
+            if required.issubset(self.received):
+                break
+            time.sleep(0.001)
+
+        retired = output.kv_finished_request_ids
+        if (retired & self.submitted) - self.received:
+            raise RuntimeError("Cannot retire an unfinished native KV receive")
+        self.submitted.difference_update(retired)
+        self.received.difference_update(retired)
+        self.sent.difference_update(retired)
+        for rid in retired:
+            self.deadlines.pop(rid, None)
+        result.finished_recving = set(self.received)
+        result.finished_sending = set(self.sent)
+        return result
 
 
 def mint_transfer_id(request_id: str) -> str:
@@ -235,6 +326,21 @@ def install_mooncake_cfg_fanout(connector: KVConnectorBase_V1) -> None:
     setattr(worker, "_omni_cfg_fanout_installed", True)
 
 
+def validate_kv_transfer_boundaries(requests: tuple[DiffusionKVRequest, ...], matched_tokens: list[int]) -> None:
+    """Validate every CFG row before reserving or registering destination pages."""
+    for request, num_tokens in zip(requests, matched_tokens, strict=True):
+        params = request.kv_transfer_params
+        if num_tokens <= 0 or params is None:
+            continue
+        transfer_tokens = params.get("num_transfer_tokens")
+        if type(transfer_tokens) is not int or not num_tokens <= transfer_tokens <= request.num_tokens:
+            raise KVTransferRegistrationError(
+                "Diffusion KV transfer boundary must cover the reusable prefix "
+                f"without exceeding the allocated sequence: reusable={num_tokens}, "
+                f"transfer={transfer_tokens!r}, allocated={request.num_tokens}"
+            )
+
+
 def commit_kv_load(
     connector: KVConnectorBase_V1,
     manager: KVCacheManager,
@@ -246,6 +352,7 @@ def commit_kv_load(
     # All rows sharing a transfer_id must reach the same connector metadata:
     # the producer uses this complete per-rank row set for fan-out accounting.
     # Validate every CFG row before mutating any connector state.
+    validate_kv_transfer_boundaries(requests, matched_tokens)
     for request, num_tokens in zip(requests, matched_tokens, strict=True):
         blocks = manager.get_blocks(request.request_id)
         # Mooncake's producer advertises complete physical blocks. Keep every
@@ -256,12 +363,6 @@ def commit_kv_load(
         transfer_tokens = num_tokens
         if num_tokens > 0 and request.kv_transfer_params is not None:
             transfer_tokens = request.kv_transfer_params["num_transfer_tokens"]
-            if type(transfer_tokens) is not int or not num_tokens <= transfer_tokens <= request.num_tokens:
-                raise KVTransferRegistrationError(
-                    "Diffusion KV transfer boundary must cover the reusable prefix "
-                    f"without exceeding the allocated sequence: reusable={num_tokens}, "
-                    f"transfer={transfer_tokens!r}, allocated={request.num_tokens}"
-                )
         prefix_blocks = KVCacheBlocks(
             tuple(
                 group[: (transfer_tokens + spec.kv_cache_spec.block_size - 1) // spec.kv_cache_spec.block_size]
