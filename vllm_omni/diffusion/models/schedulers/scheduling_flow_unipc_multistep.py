@@ -14,7 +14,7 @@ providing faster convergence than simple Euler methods while maintaining quality
 from __future__ import annotations
 
 import math
-from typing import Any
+from typing import Any, ClassVar
 
 import numpy as np
 import torch
@@ -22,11 +22,12 @@ from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.schedulers.scheduling_utils import KarrasDiffusionSchedulers, SchedulerMixin, SchedulerOutput
 from diffusers.utils import deprecate
 
+from vllm_omni.diffusion.distributed.pipefusion.pipefusion_scheduler import PipeFusionSchedulerMixin
 from vllm_omni.diffusion.models.schedulers.base import BaseScheduler
 from vllm_omni.diffusion.utils.flow_matching import safe_linalg_solve
 
 
-class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
+class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin, PipeFusionSchedulerMixin, BaseScheduler):
     """
     `FlowUniPCMultistepScheduler` is a training-free framework designed for the fast sampling of
     flow-matching diffusion models.
@@ -67,6 +68,11 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
             The final `sigma` value for the noise schedule. Either `"zero"` or `"sigma_min"`.
     """
 
+    # PipeFusion: declare which attributes need per-patch caching
+    _pipefusion_patch_cache_spec: ClassVar[list[tuple[str, str]]] = [
+        ("model_outputs", "list"),
+        ("last_sample", "tensor"),
+    ]
     _compatibles = [e.name for e in KarrasDiffusionSchedulers]
     order = 1
 

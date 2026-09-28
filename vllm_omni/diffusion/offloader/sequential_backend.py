@@ -101,7 +101,7 @@ class SequentialOffloadHook(ModelHook):
                 moved = True
         return moved
 
-    def _to_cpu(self, module: nn.Module) -> None:
+    def _to_cpu(self, module: nn.Module) -> bool:
         # XPU's allocator doesn't respect stream dependencies in empty_cache,
         # so non-blocking copies can race with cache eviction. Use blocking
         # copies on XPU to avoid NULL pointer errors during DMA.
@@ -114,18 +114,26 @@ class SequentialOffloadHook(ModelHook):
         )
         if moved:
             current_omni_platform.empty_cache()
+        return moved
 
-    def _to_gpu(self, module: nn.Module) -> None:
-        self._move_params(module, self.device, non_blocking=False)
+    def _to_gpu(self, module: nn.Module) -> bool:
+        return self._move_params(module, self.device, non_blocking=False)
 
     def pre_forward(self, module: nn.Module, *args, **kwargs) -> tuple[tuple, dict]:
         # Offload target modules to CPU
+        moved = False
         for target in self.offload_targets:
-            self._to_cpu(target)
+            if self._to_cpu(target):
+                moved = True
 
         # Load current module to GPU
-        self._to_gpu(module)
-        current_omni_platform.synchronize()
+        if self._to_gpu(module):
+            moved = True
+        # A device-wide sync waits for every in-flight NCCL op on the device,
+        # so only pay for it when weights actually moved; otherwise this turns
+        # each forward into a global barrier (kills pipeline overlap).
+        if moved:
+            current_omni_platform.synchronize()
 
         logger.debug(
             "Swapped: %s -> CPU, %s -> %s, free memory: %.4f GB",
