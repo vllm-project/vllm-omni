@@ -4,13 +4,13 @@
 from __future__ import annotations
 
 import os
-import socket
 import tempfile
 
 import numpy as np
 import pytest
 import torch
 from vllm.config import DeviceConfig, VllmConfig, set_current_vllm_config
+from vllm.utils.network_utils import get_file_store_init_method
 
 from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.config import set_current_diffusion_config
@@ -39,20 +39,12 @@ pytestmark = [
 ]
 
 
-def _find_free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
-
-
-def _set_dist_env(rank: int, world_size: int, port: int) -> None:
+def _set_dist_env(rank: int, world_size: int) -> None:
     os.environ.update(
         {
             "RANK": str(rank),
             "LOCAL_RANK": str(rank),
             "WORLD_SIZE": str(world_size),
-            "MASTER_ADDR": "127.0.0.1",
-            "MASTER_PORT": str(port),
             "DIFFUSION_ATTENTION_BACKEND": "TORCH_SDPA",
         }
     )
@@ -137,13 +129,13 @@ def _random_checkpoint(model: torch.nn.Module) -> list[tuple[str, torch.Tensor]]
 def _worker(
     rank: int,
     world_size: int,
-    port: int,
+    init_method: str,
     output_file: str,
 ) -> None:
     device = torch.device(f"{current_omni_platform.device_type}:{rank}")
     current_omni_platform.set_device(device)
-    _set_dist_env(rank, world_size, port)
-    init_distributed_environment(world_size=world_size, rank=rank)
+    _set_dist_env(rank, world_size)
+    init_distributed_environment(world_size=world_size, rank=rank, distributed_init_method=init_method)
     initialize_model_parallel(
         data_parallel_size=1,
         cfg_parallel_size=1,
@@ -283,12 +275,12 @@ def test_boogu_sp_matches_single_gpu() -> None:
 
         torch.multiprocessing.spawn(
             _worker,
-            args=(1, _find_free_port(), output_files[0]),
+            args=(1, get_file_store_init_method(), output_files[0]),
             nprocs=1,
         )
         torch.multiprocessing.spawn(
             _worker,
-            args=(2, _find_free_port(), output_files[1]),
+            args=(2, get_file_store_init_method(), output_files[1]),
             nprocs=2,
         )
 

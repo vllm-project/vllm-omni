@@ -3,7 +3,6 @@
 
 """Unit tests for the independent LTX audio-only Transformer."""
 
-import os
 from types import SimpleNamespace
 
 import pytest
@@ -31,6 +30,7 @@ def _init_tensor_parallel() -> None:
         init_distributed_environment,
         initialize_model_parallel,
     )
+    from vllm.utils.network_utils import get_file_store_init_method
 
     cpu_config = OmniDiffusionConfig.from_kwargs(
         model="ltx2-audio-transformer-unit-test",
@@ -38,13 +38,11 @@ def _init_tensor_parallel() -> None:
         diffusion_attention_backend="TORCH_SDPA",
     )
     with set_current_diffusion_config(cpu_config):
-        os.environ.setdefault("MASTER_ADDR", "localhost")
-        os.environ.setdefault("MASTER_PORT", "29513")
         init_distributed_environment(
             world_size=1,
             rank=0,
             local_rank=0,
-            distributed_init_method="env://",
+            distributed_init_method=get_file_store_init_method(),
             backend="gloo",
         )
         initialize_model_parallel(backend="gloo")

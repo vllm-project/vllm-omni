@@ -17,7 +17,7 @@ from vllm.model_executor.kernels.linear.mxfp4.marlin import MarlinMxFp4LinearKer
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.quantization.utils.marlin_utils_fp4 import is_fp4_marlin_supported
 from vllm.model_executor.layers.quantization.utils.quant_utils import kMxfp4Dynamic
-from vllm.utils.network_utils import get_open_port
+from vllm.utils.network_utils import get_file_store_init_method
 from vllm.utils.torch_utils import set_default_torch_dtype
 
 import vllm_omni.quantization.svdquant_config as svdquant
@@ -44,7 +44,7 @@ def test_mxfp4_replicated_linear_loads_with_forced_marlin(mocker):
             world_size=1,
             rank=0,
             local_rank=0,
-            distributed_init_method=f"tcp://127.0.0.1:{get_open_port()}",
+            distributed_init_method=get_file_store_init_method(),
             backend="nccl",
         )
         with set_current_vllm_config(vllm_config), set_default_torch_dtype(torch.bfloat16), torch.device("cuda:0"):

@@ -8,9 +8,9 @@ import os
 import pytest
 import torch
 import torch.distributed as dist
+from vllm.utils.network_utils import get_file_store_init_method
 
 from tests.helpers.mark import hardware_test
-from tests.helpers.runtime import get_open_port
 from vllm_omni.diffusion.attention.backends.ring.ring_selector import AttnType
 from vllm_omni.diffusion.attention.backends.ring_flash_attn import ring_flash_attn_forward
 from vllm_omni.diffusion.attention.backends.utils import fa
@@ -19,17 +19,15 @@ from vllm_omni.platforms import current_omni_platform
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
 
 
-def _run_vllm_ring_parity(local_rank: int, world_size: int, master_port: int) -> None:
+def _run_vllm_ring_parity(local_rank: int, world_size: int, init_method: str) -> None:
     device = torch.device("cuda", local_rank)
     current_omni_platform.set_device(device)
     os.environ.update(
         RANK=str(local_rank),
         LOCAL_RANK=str(local_rank),
         WORLD_SIZE=str(world_size),
-        MASTER_ADDR="127.0.0.1",
-        MASTER_PORT=str(master_port),
     )
-    dist.init_process_group("nccl", rank=local_rank, world_size=world_size)
+    dist.init_process_group("nccl", init_method=init_method, rank=local_rank, world_size=world_size)
     try:
         dtype = torch.bfloat16
         batch_size, local_seqlen, num_heads, head_dim = 1, 19, 4, 64
@@ -88,7 +86,7 @@ def test_vllm_flash_attention_ring_cuda_matches_full_attention():
         pytest.skip(f"test requires {world_size} CUDA devices")
     torch.multiprocessing.spawn(
         _run_vllm_ring_parity,
-        args=(world_size, get_open_port()),
+        args=(world_size, get_file_store_init_method()),
         nprocs=world_size,
         join=True,
     )

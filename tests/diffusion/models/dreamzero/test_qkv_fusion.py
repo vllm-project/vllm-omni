@@ -15,8 +15,6 @@ the GEMM dispatcher is forced to the default (CPU-compatible) path, following
 tests/diffusion/layers/test_adalayernorm.py.
 """
 
-import os
-
 import pytest
 import torch
 
@@ -31,14 +29,13 @@ def _init_distributed():
         init_distributed_environment,
         initialize_model_parallel,
     )
+    from vllm.utils.network_utils import get_file_store_init_method
 
-    os.environ.setdefault("MASTER_ADDR", "localhost")
-    os.environ.setdefault("MASTER_PORT", "29507")
     init_distributed_environment(
         world_size=1,
         rank=0,
         local_rank=0,
-        distributed_init_method="env://",
+        distributed_init_method=get_file_store_init_method(),
     )
     initialize_model_parallel()
     yield

@@ -270,7 +270,7 @@ Workers are **independent processes** that execute the actual model inference. E
 
 ```python
 class WorkerProc:
-    def __init__(self, od_config, gpu_id, broadcast_handle):
+    def __init__(self, od_config, gpu_id, broadcast_handle, *, distributed_init_method):
         # Initialize ZMQ context for IPC
         self.context = zmq.Context(io_threads=2)
 
@@ -282,7 +282,9 @@ class WorkerProc:
             self.result_mq = MessageQueue(n_reader=1, ...)
 
         # Initialize GPU worker
-        self.worker = self._create_worker(gpu_id, od_config, ...)
+        self.worker = self._create_worker(
+            gpu_id, od_config, distributed_init_method=distributed_init_method
+        )
 ```
 
 **Initialization Steps**:
@@ -305,7 +307,7 @@ class WorkerProc:
 
 ```python
 class DiffusionWorker:
-    def init_device(self):
+    def init_device(self, *, distributed_init_method: str):
         # Set distributed environment variables
         os.environ["RANK"] = str(rank)
         os.environ["WORLD_SIZE"] = str(world_size)
@@ -316,7 +318,7 @@ class DiffusionWorker:
         self.vllm_config = _create_diffusion_worker_vllm_config(
             self.device, self.od_config
         )
-        init_distributed_environment(world_size, rank)
+        init_distributed_environment(world_size, rank, distributed_init_method="env://")
         parallel_config = self.od_config.parallel_config
         initialize_model_parallel(
             data_parallel_size=parallel_config.data_parallel_size,

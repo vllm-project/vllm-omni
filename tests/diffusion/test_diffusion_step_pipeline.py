@@ -14,6 +14,7 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 from pytest_mock import MockerFixture
+from vllm.utils.network_utils import get_file_store_init_method
 
 import vllm_omni.diffusion.worker.diffusion_model_runner as model_runner_module
 from tests.helpers.mark import hardware_test
@@ -611,7 +612,7 @@ def _expected_output_for_mode(mode: str) -> torch.Tensor:
     return torch.tensor([[2.0]])
 
 
-def _distributed_step_worker(local_rank: int, world_size: int, mode: str, master_port: str):
+def _distributed_step_worker(local_rank: int, world_size: int, mode: str, init_method: str):
     device = torch.device(f"{current_omni_platform.device_type}:{local_rank}")
     current_omni_platform.set_device(device)
     _update_environment_variables(
@@ -619,14 +620,12 @@ def _distributed_step_worker(local_rank: int, world_size: int, mode: str, master
             "RANK": str(local_rank),
             "LOCAL_RANK": str(local_rank),
             "WORLD_SIZE": str(world_size),
-            "MASTER_ADDR": "localhost",
-            "MASTER_PORT": master_port,
         }
     )
     model_runner_module.set_forward_context = _noop_forward_context
 
     try:
-        init_distributed_environment()
+        init_distributed_environment(world_size=world_size, rank=local_rank, distributed_init_method=init_method)
         if mode == "ulysses":
             initialize_model_parallel(ulysses_degree=world_size)
         elif mode == "ring":
@@ -1865,7 +1864,7 @@ def test_execute_stepwise_with_ulysses_parallel():
 
     torch.multiprocessing.spawn(
         _distributed_step_worker,
-        args=(world_size, "ulysses", "29540"),
+        args=(world_size, "ulysses", get_file_store_init_method()),
         nprocs=world_size,
     )
 
@@ -1881,7 +1880,7 @@ def test_execute_stepwise_with_ring_parallel():
 
     torch.multiprocessing.spawn(
         _distributed_step_worker,
-        args=(world_size, "ring", "29541"),
+        args=(world_size, "ring", get_file_store_init_method()),
         nprocs=world_size,
     )
 
@@ -1897,6 +1896,6 @@ def test_execute_stepwise_with_cfg_parallel():
 
     torch.multiprocessing.spawn(
         _distributed_step_worker,
-        args=(world_size, "cfg", "29542"),
+        args=(world_size, "cfg", get_file_store_init_method()),
         nprocs=world_size,
     )

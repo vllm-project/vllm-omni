@@ -107,6 +107,8 @@ def _print_latent_metrics(metrics: dict[str, float]) -> None:
 
 
 def _ensure_diffusion_distributed_initialized() -> None:
+    from vllm.utils.network_utils import get_file_store_init_method
+
     from vllm_omni.diffusion.distributed.parallel_state import (
         init_distributed_environment,
         initialize_model_parallel,
@@ -114,12 +116,15 @@ def _ensure_diffusion_distributed_initialized() -> None:
     )
 
     if not torch.distributed.is_initialized():
-        os.environ.setdefault("MASTER_ADDR", "localhost")
-        os.environ.setdefault("MASTER_PORT", "29513")
         os.environ.setdefault("RANK", "0")
         os.environ.setdefault("LOCAL_RANK", "0")
         os.environ.setdefault("WORLD_SIZE", "1")
-        init_distributed_environment(world_size=1, rank=0, local_rank=0)
+        init_distributed_environment(
+            world_size=1,
+            rank=0,
+            local_rank=0,
+            distributed_init_method=get_file_store_init_method(),
+        )
     if not model_parallel_is_initialized():
         initialize_model_parallel()
 

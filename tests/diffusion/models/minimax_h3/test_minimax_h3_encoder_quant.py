@@ -11,7 +11,6 @@ import torch
 import torch.nn as nn
 from transformers import Qwen3VLConfig, Qwen3VLTextConfig, Qwen3VLVisionConfig
 from vllm.model_executor.layers.linear import UnquantizedLinearMethod
-from vllm.utils.network_utils import get_open_port
 
 from vllm_omni.diffusion.models.minimax_h3 import encoder as encoder_module
 from vllm_omni.diffusion.models.minimax_h3.encoder import MiniMaxH3Qwen3VLEncoder
@@ -20,7 +19,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
 
 @pytest.fixture(autouse=True)
-def _init_distributed(monkeypatch: pytest.MonkeyPatch):
+def _init_distributed():
     """Minimal world_size=1 TP group required by vLLM weight parameters."""
     from vllm.distributed.parallel_state import (
         destroy_distributed_environment,
@@ -28,15 +27,14 @@ def _init_distributed(monkeypatch: pytest.MonkeyPatch):
         init_distributed_environment,
         initialize_model_parallel,
     )
+    from vllm.utils.network_utils import get_file_store_init_method
 
-    monkeypatch.setenv("MASTER_ADDR", "127.0.0.1")
-    monkeypatch.setenv("MASTER_PORT", str(get_open_port()))
     try:
         init_distributed_environment(
             world_size=1,
             rank=0,
             local_rank=0,
-            distributed_init_method="env://",
+            distributed_init_method=get_file_store_init_method(),
             backend="gloo",
         )
         initialize_model_parallel()

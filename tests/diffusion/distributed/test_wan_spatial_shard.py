@@ -8,6 +8,7 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+from vllm.utils.network_utils import get_file_store_init_method
 
 from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.distributed.autoencoders import wan_spatial_shard
@@ -638,21 +639,25 @@ _SPATIAL_SHARD_LATENT_WIDTH = 104
 _SPATIAL_SHARD_TOLERANCE = 3e-2
 
 
-def _spatial_shard_decode_worker(rank: int, split_dim: str, return_dict, master_port: str) -> None:
+def _spatial_shard_decode_worker(rank: int, split_dim: str, return_dict, init_method: str) -> None:
     from vllm_omni.diffusion.distributed.parallel_state import (
         destroy_model_parallel,
         init_distributed_environment,
         initialize_model_parallel,
     )
 
-    os.environ["MASTER_ADDR"] = "127.0.0.1"
-    os.environ["MASTER_PORT"] = master_port
     device = current_omni_platform.get_torch_device(rank)
     current_omni_platform.set_device(device)
     dtype = torch.float32
 
     backend = current_omni_platform.dist_backend
-    init_distributed_environment(world_size=_SPATIAL_SHARD_WORLD_SIZE, rank=rank, local_rank=rank, backend=backend)
+    init_distributed_environment(
+        world_size=_SPATIAL_SHARD_WORLD_SIZE,
+        rank=rank,
+        local_rank=rank,
+        backend=backend,
+        distributed_init_method=init_method,
+    )
     initialize_model_parallel(
         sequence_parallel_size=_SPATIAL_SHARD_WORLD_SIZE, ulysses_degree=_SPATIAL_SHARD_WORLD_SIZE, backend=backend
     )
@@ -707,7 +712,7 @@ def _spatial_shard_decode_worker(rank: int, split_dim: str, return_dict, master_
 _STREAMING_SHARD_CHUNKS = 3
 
 
-def _streaming_shard_worker(rank: int, return_dict, master_port: str) -> None:
+def _streaming_shard_worker(rank: int, return_dict, init_method: str) -> None:
     """Sharded streaming decode with every rank keeping the frame, against an unsharded streaming reference.
 
     Two sessions are interleaved chunk by chunk, so the per-session temporal cache
@@ -722,13 +727,17 @@ def _streaming_shard_worker(rank: int, return_dict, master_port: str) -> None:
     )
     from vllm_omni.experimental.ar_diffusion.streaming_decode import WanStreamingDecoder
 
-    os.environ["MASTER_ADDR"] = "127.0.0.1"
-    os.environ["MASTER_PORT"] = master_port
     device = current_omni_platform.get_torch_device(rank)
     current_omni_platform.set_device(device)
     dtype = torch.float32
     backend = current_omni_platform.dist_backend
-    init_distributed_environment(world_size=_SPATIAL_SHARD_WORLD_SIZE, rank=rank, local_rank=rank, backend=backend)
+    init_distributed_environment(
+        world_size=_SPATIAL_SHARD_WORLD_SIZE,
+        rank=rank,
+        local_rank=rank,
+        backend=backend,
+        distributed_init_method=init_method,
+    )
     initialize_model_parallel(
         sequence_parallel_size=_SPATIAL_SHARD_WORLD_SIZE, ulysses_degree=_SPATIAL_SHARD_WORLD_SIZE, backend=backend
     )
@@ -792,7 +801,12 @@ def _streaming_shard_worker(rank: int, return_dict, master_port: str) -> None:
 def test_streaming_shard_decode_matches_unsharded_streaming_on_every_rank():
     manager = mp.get_context("spawn").Manager()
     return_dict = manager.dict()
-    mp.spawn(_streaming_shard_worker, args=(return_dict, "29510"), nprocs=_SPATIAL_SHARD_WORLD_SIZE, join=True)
+    mp.spawn(
+        _streaming_shard_worker,
+        args=(return_dict, get_file_store_init_method()),
+        nprocs=_SPATIAL_SHARD_WORLD_SIZE,
+        join=True,
+    )
 
     for rank in range(_SPATIAL_SHARD_WORLD_SIZE):
         assert f"max_abs_diff_rank{rank}" in return_dict, f"rank {rank} did not report"
@@ -811,12 +825,10 @@ def test_streaming_shard_decode_matches_unsharded_streaming_on_every_rank():
 def test_spatial_shard_decode_matches_reference(split_dim: str):
     manager = mp.get_context("spawn").Manager()
     return_dict = manager.dict()
-    # Use a per-split-dim port to avoid collisions across parametrized runs.
-    master_port = str(29500 + (1 if split_dim == "width" else 0))
 
     mp.spawn(
         _spatial_shard_decode_worker,
-        args=(split_dim, return_dict, master_port),
+        args=(split_dim, return_dict, get_file_store_init_method()),
         nprocs=_SPATIAL_SHARD_WORLD_SIZE,
         join=True,
     )

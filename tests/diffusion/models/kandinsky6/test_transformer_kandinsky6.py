@@ -20,15 +20,15 @@ def _init_distributed(monkeypatch):
         initialize_model_parallel,
     )
     from vllm.model_executor.layers.utils import default_unquantized_gemm
-
-    from tests.helpers.runtime import assign_ephemeral_master_port
+    from vllm.utils.network_utils import get_file_store_init_method
 
     monkeypatch.setattr(
         "vllm.model_executor.layers.linear.dispatch_unquantized_gemm",
         lambda *_args, **_kwargs: default_unquantized_gemm,
     )
-    assign_ephemeral_master_port()
-    init_distributed_environment(world_size=1, rank=0, local_rank=0, distributed_init_method="env://")
+    init_distributed_environment(
+        world_size=1, rank=0, local_rank=0, distributed_init_method=get_file_store_init_method()
+    )
     initialize_model_parallel()
     yield
     cleanup_dist_env_and_memory()

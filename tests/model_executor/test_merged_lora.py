@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-import socket
 
 import pytest
 import torch
@@ -9,6 +8,7 @@ from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.model_executor import parameter
 from vllm.model_executor.layers import linear
 from vllm.model_executor.models.utils import WeightsMapper
+from vllm.utils.network_utils import get_file_store_init_method
 
 from vllm_omni.lora.manager import LoRAManager
 from vllm_omni.lora.merged_manager import ARMergedLoRAManager
@@ -18,7 +18,7 @@ from vllm_omni.lora.request import TensorLoRARequest
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-def _manager_prepare_failure_rank(rank: int, port: int) -> None:
+def _manager_prepare_failure_rank(rank: int, init_method: str) -> None:
     from vllm.config import VllmConfig, set_current_vllm_config
     from vllm.model_executor import parameter
     from vllm.model_executor.layers import linear
@@ -27,7 +27,7 @@ def _manager_prepare_failure_rank(rank: int, port: int) -> None:
     from vllm_omni.lora.merged_manager import ARMergedLoRAManager
     from vllm_omni.lora.request import TensorLoRARequest
 
-    torch.distributed.init_process_group("gloo", init_method=f"tcp://127.0.0.1:{port}", rank=rank, world_size=2)
+    torch.distributed.init_process_group("gloo", init_method=init_method, rank=rank, world_size=2)
     try:
         # Keep this CPU integration check independent of a vLLM TP group.
         for module in (linear, parameter):
@@ -78,10 +78,7 @@ def _manager_prepare_failure_rank(rank: int, port: int) -> None:
 
 
 def test_manager_prepare_failure_aborts_both_ranks_without_mutating_policy():
-    with socket.socket() as listener:
-        listener.bind(("127.0.0.1", 0))
-        port = listener.getsockname()[1]
-    torch.multiprocessing.spawn(_manager_prepare_failure_rank, args=(port,), nprocs=2)
+    torch.multiprocessing.spawn(_manager_prepare_failure_rank, args=(get_file_store_init_method(),), nprocs=2)
 
 
 @pytest.mark.parametrize("tp_size,tp_rank", [(1, 0), (2, 0), (2, 1), (4, 0), (4, 3)])

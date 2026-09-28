@@ -14,7 +14,7 @@ from vllm.distributed import (
 )
 from vllm.model_executor.layers.linear import ReplicatedLinear, UnquantizedLinearMethod
 from vllm.model_executor.layers.quantization.online.fp8 import Fp8PerTensorOnlineLinearMethod
-from vllm.utils.network_utils import get_open_port
+from vllm.utils.network_utils import get_file_store_init_method
 from vllm.utils.torch_utils import set_default_torch_dtype
 
 from tests.helpers.mark import hardware_test
@@ -38,7 +38,7 @@ def test_online_fp8_loads_bf16_weights_and_runs_native_kernel(method):
             world_size=1,
             rank=0,
             local_rank=0,
-            distributed_init_method=f"tcp://127.0.0.1:{get_open_port()}",
+            distributed_init_method=get_file_store_init_method(),
             backend="nccl",
         )
         with set_current_vllm_config(vllm_config), set_default_torch_dtype(torch.bfloat16), torch.device("cuda:0"):
@@ -86,7 +86,7 @@ def test_bagel_generation_expert_online_fp8_loading(projection):
             world_size=1,
             rank=0,
             local_rank=0,
-            distributed_init_method=f"tcp://127.0.0.1:{get_open_port()}",
+            distributed_init_method=get_file_store_init_method(),
             backend="nccl",
         )
         with set_current_vllm_config(vllm_config), set_default_torch_dtype(torch.bfloat16), torch.device("cuda:0"):

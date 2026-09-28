@@ -14,6 +14,7 @@ import os
 
 import pytest
 import torch
+from vllm.utils.network_utils import get_file_store_init_method
 
 from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.config import set_current_diffusion_config
@@ -100,7 +101,7 @@ def _inputs(device: torch.device) -> dict[str, torch.Tensor | int | bool]:
     }
 
 
-def _run_transformer_parity(rank: int, world_size: int, master_port: int) -> None:
+def _run_transformer_parity(rank: int, world_size: int, init_method: str) -> None:
     device = torch.device(f"{current_omni_platform.device_type}:{rank}")
     current_omni_platform.set_device(device)
     os.environ.update(
@@ -108,13 +109,11 @@ def _run_transformer_parity(rank: int, world_size: int, master_port: int) -> Non
             "RANK": str(rank),
             "LOCAL_RANK": str(rank),
             "WORLD_SIZE": str(world_size),
-            "MASTER_ADDR": "localhost",
-            "MASTER_PORT": str(master_port),
         }
     )
 
     try:
-        init_distributed_environment()
+        init_distributed_environment(world_size=world_size, rank=rank, distributed_init_method=init_method)
         initialize_model_parallel(sequence_parallel_size=world_size, ulysses_degree=world_size)
 
         sp_config = _omni_config(world_size)
@@ -157,7 +156,7 @@ def _run_transformer_parity(rank: int, world_size: int, master_port: int) -> Non
 
 @pytest.mark.full_model
 @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=2)
-def test_ltx_ulysses_transformer_matches_sp1(unused_tcp_port) -> None:
+def test_ltx_ulysses_transformer_matches_sp1() -> None:
     """Exercise real plan hooks, RoPE/timestep sharding, and attention routing."""
     world_size = 2
     device_count = current_omni_platform.device_count()
@@ -166,6 +165,6 @@ def test_ltx_ulysses_transformer_matches_sp1(unused_tcp_port) -> None:
     )
     torch.multiprocessing.spawn(
         _run_transformer_parity,
-        args=(world_size, unused_tcp_port),
+        args=(world_size, get_file_store_init_method()),
         nprocs=world_size,
     )

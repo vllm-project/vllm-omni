@@ -34,6 +34,7 @@ from vllm.model_executor.layers.linear import (
     QKVParallelLinear,
     RowParallelLinear,
 )
+from vllm.utils.network_utils import get_file_store_init_method
 
 from tests.helpers.mark import hardware_marks
 from vllm_omni.diffusion.distributed.parallel_state import (
@@ -72,11 +73,14 @@ def _init_single_rank_tp_env():
     os.environ.setdefault("RANK", "0")
     os.environ.setdefault("LOCAL_RANK", "0")
     os.environ.setdefault("WORLD_SIZE", "1")
-    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
-    os.environ.setdefault("MASTER_PORT", "29501")
 
     if not torch.distributed.is_initialized():
-        init_distributed_environment(world_size=1, rank=0, local_rank=0)
+        init_distributed_environment(
+            world_size=1,
+            rank=0,
+            local_rank=0,
+            distributed_init_method=get_file_store_init_method(),
+        )
 
     if not model_parallel_is_initialized():
         initialize_model_parallel(

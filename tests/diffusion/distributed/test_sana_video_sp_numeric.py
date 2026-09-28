@@ -15,6 +15,7 @@ import tempfile
 
 import pytest
 import torch
+from vllm.utils.network_utils import get_file_store_init_method
 
 from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.config import set_current_diffusion_config
@@ -104,7 +105,7 @@ def _worker(
     task: str,
     num_frames: int,
     weights_path: str,
-    port: int,
+    init_method: str,
     result_queue,
 ):
     device = torch.device(f"{current_omni_platform.device_type}:{local_rank}")
@@ -114,12 +115,10 @@ def _worker(
             "RANK": str(local_rank),
             "LOCAL_RANK": str(local_rank),
             "WORLD_SIZE": str(world_size),
-            "MASTER_ADDR": "localhost",
-            "MASTER_PORT": str(port),
         }
     )
 
-    init_distributed_environment()
+    init_distributed_environment(world_size=world_size, rank=local_rank, distributed_init_method=init_method)
     initialize_model_parallel(
         cfg_parallel_size=cfg_size,
         sequence_parallel_size=sp_size,
@@ -191,7 +190,7 @@ def _run_sp_parity(
                     num_frames,
                     _INPUT_SEED + cfg_rank,
                     weights_path if cfg_rank == 0 else "",
-                    29531,
+                    get_file_store_init_method(),
                     queue,
                 ),
                 nprocs=1,
@@ -201,7 +200,19 @@ def _run_sp_parity(
         queue = manager.Queue()
         world_size = sp_size * cfg_size * tp_size
         results = _spawn(
-            (world_size, sp_size, cfg_size, tp_size, dtype, task, num_frames, weights_path, 29532), world_size, queue
+            (
+                world_size,
+                sp_size,
+                cfg_size,
+                tp_size,
+                dtype,
+                task,
+                num_frames,
+                weights_path,
+                get_file_store_init_method(),
+            ),
+            world_size,
+            queue,
         )
 
     worst = 0.0
@@ -232,7 +243,7 @@ def _baseline_worker(
     num_frames: int,
     input_seed: int,
     weights_path: str,
-    port: int,
+    init_method: str,
     result_queue,
 ):
     device = torch.device(f"{current_omni_platform.device_type}:{local_rank}")
@@ -242,12 +253,10 @@ def _baseline_worker(
             "RANK": "0",
             "LOCAL_RANK": "0",
             "WORLD_SIZE": "1",
-            "MASTER_ADDR": "localhost",
-            "MASTER_PORT": str(port),
         }
     )
 
-    init_distributed_environment()
+    init_distributed_environment(world_size=1, rank=0, distributed_init_method=init_method)
     initialize_model_parallel()
 
     od_config = _make_omni_config(1, 1, dtype)

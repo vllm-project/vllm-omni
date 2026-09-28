@@ -957,7 +957,13 @@ def _worker(rank, world_size, sp_size, tp_size, mode, dtype, batch, rendezvous):
     torch.distributed.init_process_group(
         "nccl", init_method=f"file://{rendezvous}", world_size=world_size, rank=rank, timeout=timedelta(seconds=90)
     )
-    init_distributed_environment(world_size=world_size, rank=rank, local_rank=rank, backend="nccl")
+    init_distributed_environment(
+        world_size=world_size,
+        rank=rank,
+        local_rank=rank,
+        backend="nccl",
+        distributed_init_method=f"file://{rendezvous}",
+    )
     try:
         with torch.inference_mode(), set_current_vllm_config(VllmConfig()):
             for baseline in (True, False):

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Benchmark Cosmos3's Wan encoder against the reference on H100/GB200.
 
 Examples::
@@ -178,7 +178,7 @@ def distributed_setup(args):
 
     rank, local_rank = int(os.environ["RANK"]), int(os.environ["LOCAL_RANK"])
     current_omni_platform.set_device(current_omni_platform.get_torch_device(local_rank))
-    init_distributed_environment(world_size=world, rank=rank, local_rank=local_rank)
+    init_distributed_environment(world_size=world, rank=rank, local_rank=local_rank, distributed_init_method="env://")
     initialize_model_parallel(sequence_parallel_size=world, ulysses_degree=world)
     return rank
 

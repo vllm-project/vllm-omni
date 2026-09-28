@@ -10,6 +10,7 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+from vllm.utils.network_utils import get_file_store_init_method
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.models.ltx2.ltx2_sequence_parallel import (
@@ -19,10 +20,10 @@ from vllm_omni.diffusion.models.ltx2.ltx2_sequence_parallel import (
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
 
-def _run_video_to_audio_parity(rank: int, world_size: int, master_port: int) -> None:
+def _run_video_to_audio_parity(rank: int, world_size: int, init_method: str) -> None:
     dist.init_process_group(
         "gloo",
-        init_method=f"tcp://127.0.0.1:{master_port}",
+        init_method=init_method,
         rank=rank,
         world_size=world_size,
         timeout=timedelta(seconds=60),
@@ -85,10 +86,10 @@ def _run_video_to_audio_parity(rank: int, world_size: int, master_port: int) -> 
 
 
 @pytest.mark.parametrize("world_size", [2, 4], ids=["world", "subgroups"])
-def test_ltx_video_to_audio_sp_matches_replicated_attention(unused_tcp_port, world_size):
+def test_ltx_video_to_audio_sp_matches_replicated_attention(world_size):
     torch.multiprocessing.spawn(
         _run_video_to_audio_parity,
-        args=(world_size, unused_tcp_port),
+        args=(world_size, get_file_store_init_method()),
         nprocs=world_size,
     )
 
