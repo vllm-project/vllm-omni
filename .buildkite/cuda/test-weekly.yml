@@ -152,11 +152,6 @@ steps:
             --run-level "full_model"
         mirror_hardwares: h100_4
 
-      # The shared L4 sweep ran every slow TTS file in one step and exceeded
-      # 120 minutes. Each step still starts one pytest process per file so
-      # weights are released between models. Gepard stays on its own step
-      # below (the image has no NanoCodec). New slow+L4+tts files need to be
-      # added to one of these lists.
       - label: "TTS · Moss · L4"
         timeout_in_minutes: 90
         commands:
