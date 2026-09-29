@@ -725,6 +725,9 @@ curl -sS -X POST "${API_URL}" \
 ### 3. Ref2VA: image-only, image/audio, or mixed references
 
 Run these requests against the combined service or a Ref2VA-only service.
+Reference images keep their original resolution, with dimensions aligned to
+32 pixels. No additional request or server setting is needed.
+
 Image-only Ref2VA omits `audio_reference`; adding one or more audio references
 is optional. The typed fields accept one object or an ordered JSON list.
 `audio_reference` accepts an HTTP(S) URL or a `data:` URL. In one terminal,
@@ -782,6 +785,9 @@ Run this request against the combined service. Repeat the
 `input_references` multipart field once per source video. H3 consumes the
 videos in form order and preserves their original soundtracks during
 conditioning.
+Small reference videos retain their original size; larger videos are scaled
+down to the reference canvas. Dimensions are aligned to 32 pixels. No
+additional request or server setting is needed.
 
 ```bash
 export SUBJECT_VIDEO=/path/to/green_screen_subject.mp4

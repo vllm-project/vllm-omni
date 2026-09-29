@@ -388,8 +388,13 @@ def isolated_video_backends(tmp_path, monkeypatch):
     return store, tasks, storage
 
 
+@pytest.mark.parametrize("model_class_name", [None, "SeedVR2Pipeline", "auto"])
 @pytest.mark.asyncio
-async def test_server_worker_keeps_engine_alive_until_http_shutdown(monkeypatch):
+async def test_server_worker_keeps_engine_alive_until_http_shutdown(monkeypatch, model_class_name):
+    # Resolve imports outside the timed server-lifecycle assertions.
+    from vllm_omni.diffusion.models.seedvr2 import long_video  # noqa: F401
+
+    app = FastAPI()
     events: list[str] = []
     serve_started = asyncio.Event()
     http_shutdown = asyncio.Event()
@@ -398,6 +403,11 @@ async def test_server_worker_keeps_engine_alive_until_http_shutdown(monkeypatch)
 
     class FakeEngine:
         stage_configs = []
+
+        def get_diffusion_od_config(self):
+            if model_class_name == "auto":
+                return SimpleNamespace(model_class_name="SeedVR2Pipeline")
+            return None
 
         async def get_supported_tasks(self):
             return ("generate",)
@@ -435,7 +445,7 @@ async def test_server_worker_keeps_engine_alive_until_http_shutdown(monkeypatch)
         events.append("init_app_state")
 
     monkeypatch.setattr(api_server, "build_async_omni", fake_build_async_omni)
-    monkeypatch.setattr(api_server, "build_openai_app", lambda args, supported_tasks: FastAPI())
+    monkeypatch.setattr(api_server, "build_openai_app", lambda args, supported_tasks: app)
     monkeypatch.setattr(api_server, "serve_http", fake_serve_http)
     monkeypatch.setattr(api_server.STORAGE_MANAGER, "start", fake_storage_start)
     monkeypatch.setattr(api_server.openai_app_state, "_get_vllm_config", fake_get_vllm_config)
@@ -461,9 +471,16 @@ async def test_server_worker_keeps_engine_alive_until_http_shutdown(monkeypatch)
         h11_max_header_count=None,
     )
 
+    if model_class_name != "auto" and model_class_name is not None:
+        args.model_class_name = model_class_name
+
     worker_task = asyncio.create_task(api_server.omni_run_server_worker("127.0.0.1:0", sock, args))
     await asyncio.wait_for(serve_started.wait(), timeout=2)
 
+    route_paths = app.openapi()["paths"]
+    assert ("/v1/seedvr2/restore-long" in route_paths) == (model_class_name is not None)
+    if model_class_name is not None:
+        assert app.state.seedvr2_long_port == args.port
     assert not engine_context_exited.is_set()
 
     http_shutdown.set()
@@ -2646,6 +2663,7 @@ def test_extra_params_merged_into_extra_args(test_client, mocker: MockerFixture)
         "pyramid_num_stages": 3,
         "pyramid_num_inference_steps_list": [1, 1, 1],
         "use_cfg_zero_star": True,
+        "color_correction_method": "wavelet",
     }
     response = test_client.post(
         "/v1/videos",
@@ -2664,6 +2682,7 @@ def test_extra_params_merged_into_extra_args(test_client, mocker: MockerFixture)
     assert captured.extra_args["pyramid_num_stages"] == 3
     assert captured.extra_args["pyramid_num_inference_steps_list"] == [1, 1, 1]
     assert captured.extra_args["use_cfg_zero_star"] is True
+    assert captured.extra_args["color_correction_method"] == "wavelet"
 
 
 def test_extra_params_none_by_default(test_client, mocker: MockerFixture):

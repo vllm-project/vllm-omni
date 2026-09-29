@@ -940,6 +940,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
             await self._clear_frontend_mm_cache()
 
         self._final_output_handler()
+        sleep_tags = [CuMemTag.WEIGHTS.value, CuMemTag.KV_CACHE.value]
         final_acks: list[OmniACK] = []
         if ar_stage_ids:
             self._hold_admission_until_resume = True
@@ -968,16 +969,23 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
                 )
                 for sid in ar_stage_ids
             )
+            self._record_stage_sleep(ar_stage_ids, sleep_tags)
+            if level == 2:
+                self._level2_sleeping = True
 
         if diffusion_stage_ids:
-            final_acks.extend(await self._sleep_diffusion(diffusion_stage_ids, level))
+            acks: list[OmniACK] = []
+            try:
+                acks = await self._sleep_diffusion(diffusion_stage_ids, level)
+            finally:
+                # A failed sleep may have released part of a stage, so wake_up must still reach it.
+                self._record_stage_sleep(diffusion_stage_ids, sleep_tags)
+                # Level 2 has discarded weights only where a replica finished its sleep.
+                if level == 2 and any(self._diffusion_ack_error(ack) is None for ack in acks):
+                    self._level2_sleeping = True
+            self._raise_on_diffusion_errors("handle_sleep_task", acks)
+            final_acks.extend(acks)
 
-        self._record_stage_sleep(
-            ar_stage_ids + diffusion_stage_ids,
-            [CuMemTag.WEIGHTS.value, CuMemTag.KV_CACHE.value],
-        )
-        if level == 2:
-            self._level2_sleeping = True
         return final_acks
 
     async def _sleep_diffusion(self, stage_ids: list[int], level: int) -> list[OmniACK]:
@@ -989,14 +997,44 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         logger.info("[%s] Sleep (diffusion) initiated (Task: %s).", self._name, task_id)
         task = OmniSleepTask(level=level, task_id=task_id)
         rpc_results = await self.collective_rpc(method="handle_sleep_task", args=(task,), stage_ids=stage_ids)
+        return await self._resolve_diffusion_acks(rpc_results)
+
+    async def _resolve_diffusion_acks(self, rpc_results: list[Any]) -> list[OmniACK]:
+        """Resolve the ACKs of a diffusion worker RPC."""
         final_acks: list[OmniACK] = []
         for stage_res in rpc_results:
             worker_acks = stage_res if isinstance(stage_res, list) else [stage_res]
             for ack in worker_acks:
-                if ack is not None:
+                if ack is None:
+                    continue
+                # StagePool's result for a failed RPC has no task_id to resolve.
+                if not isinstance(ack, dict) or "task_id" in ack:
                     await self.event_resolver.resolve(ack)
-                    final_acks.append(ack)
+                final_acks.append(ack)
         return final_acks
+
+    @classmethod
+    def _raise_on_diffusion_errors(cls, method: str, acks: list[OmniACK]) -> None:
+        errors = [error for ack in acks if (error := cls._diffusion_ack_error(ack))]
+        if errors:
+            raise RuntimeError(f"{method} failed: {'; '.join(errors)}")
+
+    @staticmethod
+    def _diffusion_ack_error(ack: OmniACK | dict[str, Any]) -> str | None:
+        # In-process stages return OmniACK, subprocess stages return its dict form,
+        # and StagePool returns {"supported": False, "error": ...} when the RPC failed.
+        if isinstance(ack, dict):
+            status, error_msg, rpc_error = ack.get("status"), ack.get("error_msg"), ack.get("error")
+            # A subprocess RPC error arrives as {"error": True, "reason": ...}.
+            if rpc_error is True:
+                rpc_error = ack.get("reason") or "RPC failed"
+            if not rpc_error and (ack.get("todo") or ack.get("supported") is False):
+                rpc_error = str(ack)
+        else:
+            status, error_msg, rpc_error = getattr(ack, "status", None), getattr(ack, "error_msg", None), None
+        if status == "ERROR":
+            return error_msg or "worker reported ERROR"
+        return rpc_error
 
     async def wake_up(self, stage_ids: list[int] | None = None, tags: list[str] | None = None) -> list[OmniACK]:
         """Wake stages after sleep.
@@ -1052,11 +1090,14 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
                 )
                 for sid in ar_stage_ids
             )
+            self._clear_stage_sleep(ar_stage_ids, requested_tags)
 
+        for sid in diffusion_stage_ids:
+            final_acks.extend(await self._wake_diffusion([sid], requested_tags))
+            self._clear_stage_sleep([sid], requested_tags)
         if diffusion_stage_ids:
-            final_acks.extend(await self._wake_diffusion(diffusion_stage_ids, requested_tags))
+            await asyncio.sleep(0.1)
 
-        self._clear_stage_sleep(target_stage_ids, requested_tags)
         # Only clear the level-2 flag once all tags are warm, in case partial
         # wake support (e.g. tags=["kv_cache"] only) is added in the future.
         if not getattr(self, "_sleeping_tags", None):
@@ -1083,22 +1124,19 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         logger.info("[%s] Wake-up (diffusion) initiated (Task: %s).", self._name, task_id)
         task = OmniWakeTask(tags=requested_tags, task_id=task_id)
         rpc_results = await self.collective_rpc(method="handle_wake_task", args=(task,), stage_ids=stage_ids)
-        final_acks: list[OmniACK] = []
-        for stage_res in rpc_results:
-            worker_acks = stage_res if isinstance(stage_res, list) else [stage_res]
-            for ack in worker_acks:
-                if ack is not None:
-                    await self.event_resolver.resolve(ack)
-                    final_acks.append(ack)
-        await asyncio.sleep(0.1)
-        return final_acks
+        acks = await self._resolve_diffusion_acks(rpc_results)
+        self._raise_on_diffusion_errors("handle_wake_task", acks)
+        return acks
 
-    async def is_sleeping(self) -> bool:
-        """Return whether all stages are sleeping.
+    async def is_sleeping(self, stage_ids: list[int] | None = None) -> bool:
+        """Return whether all stages are sleeping, or with ``stage_ids``,
+        whether any of those stages is recorded as sleeping.
 
         TODO(AsyncOmni): query the orchestrator once all stage backends expose
         a real sleeping-state RPC. For now we track the requested state locally.
         """
+        if stage_ids is not None:
+            return bool(self._sleeping_tags_for_stages(stage_ids))
         return bool(getattr(self, "_sleeping_tags", None))
 
     async def add_lora(self, lora_request: LoRARequest) -> bool:

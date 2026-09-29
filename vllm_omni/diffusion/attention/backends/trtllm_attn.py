@@ -1,13 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-import functools
-import inspect
 import math
 from dataclasses import dataclass, replace
 from typing import NamedTuple, cast
 
 import torch
+from packaging.version import InvalidVersion, Version
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.attention.backends.abstract import (
@@ -44,10 +43,10 @@ class SkipSoftmaxConfig:
         return cls(
             threshold=_validate_control(bk.get("skip_softmax_threshold"), "skip_softmax_threshold", 0.0, None),
             target_sparsity=_validate_control(bk.get("target_sparsity"), "target_sparsity", 0.0, 1.0),
-            disabled_until_timestep=cast(
-                float,
-                _validate_control(bk.get("disabled_until_timestep", 0.0), "disabled_until_timestep", 0.0, 1.0),
-            ),
+            disabled_until_timestep=_validate_control(
+                bk.get("disabled_until_timestep", 0.0), "disabled_until_timestep", 0.0, 1.0
+            )
+            or 0.0,
         )
 
     @property
@@ -77,6 +76,7 @@ class SkipSoftmaxConfig:
 
 
 try:
+    import flashinfer
     from flashinfer.prefill import trtllm_ragged_attention_deepseek
 
     HAS_FLASHINFER = True
@@ -86,26 +86,6 @@ except Exception as e:  # pragma: no cover - import guard
         "FlashInfer is unavailable; TRTLLM_ATTN backend will not work. Reason: %s",
         e,
     )
-
-
-@functools.lru_cache(maxsize=1)
-def _sage_kernel_available() -> bool:
-    if not HAS_FLASHINFER:
-        return False
-    try:
-        return "sage_attn_sfs" in inspect.signature(trtllm_ragged_attention_deepseek).parameters
-    except (TypeError, ValueError):
-        return False
-
-
-@functools.lru_cache(maxsize=1)
-def _sage_quantize_fn():
-    try:
-        from flashinfer import trtllm_sage_attention_quantize
-
-        return trtllm_sage_attention_quantize
-    except Exception:  # pragma: no cover
-        return None
 
 
 _QK_QUANT_DTYPES = {
@@ -133,15 +113,26 @@ class QuantConfig:
     def enabled(self) -> bool:
         return self.dtype_qk is not None
 
-    def quantize(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, quantize_fn):
+    def quantize(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        quantize_fn,
+        cu_seq_lens_q: torch.Tensor,
+        cu_seq_lens_kv: torch.Tensor,
+    ):
         qk_quant_dtype = _QK_QUANT_DTYPES[cast(str, self.dtype_qk)]
-        q_q, k_q, v_q, q_sfs, k_sfs, v_sfs = quantize_fn(
+        q_q, k_q, v_q, q_sfs, k_sfs, v_sfs, _ = quantize_fn(
             q,
             k,
             v,
             q_block_size=self.q_block_size,
             k_block_size=self.k_block_size,
             qk_quant_dtype=qk_quant_dtype,
+            smooth_k=True,
+            cum_seq_lens_q=cu_seq_lens_q,
+            cum_seq_lens_kv=cu_seq_lens_kv,
         )
         sage_attn_sfs = (q_sfs, k_sfs, None, v_sfs)
         num_elts_per_sage_attn_blk = (self.q_block_size, self.k_block_size, 0, 1)
@@ -157,7 +148,6 @@ class _PackedLayout(NamedTuple):
     cu_seqlens_kv: torch.Tensor
     batch_size: int
     seq_lens: torch.Tensor
-    known_min_kv_length: int | None = None
 
 
 def _workspace_bytes() -> int:
@@ -216,9 +206,13 @@ class TrtllmAttentionImpl(AttentionImpl):
         self.skip = SkipSoftmaxConfig.from_backend_kwargs(backend_kwargs)
         self._warned_missing_timestep = False
 
-        self.quant = QuantConfig.from_backend_kwargs(backend_kwargs)
-        # Resolve the SAGE quantize fn once at init so the compiled forward path never calls the
-        # lru_cache-wrapped getter (which triggers a Dynamo graph break every step).
+        # Override: SageAttention does not support causal attention
+        if causal:
+            self.quant = QuantConfig(dtype_qk=None, q_block_size=0, k_block_size=0)
+        else:
+            self.quant = QuantConfig.from_backend_kwargs(backend_kwargs)
+        # Resolve the SAGE quantize fn once at init so the compiled forward path
+        # does not import it every step.
         self._sage_quantize_fn = None
         if self.quant.enabled:
             if self.quant.dtype_qk not in _QK_QUANT_DTYPES:
@@ -226,19 +220,16 @@ class TrtllmAttentionImpl(AttentionImpl):
                     f"TRTLLM_ATTN quant (SAGE) supports dtype_qk in {sorted(_QK_QUANT_DTYPES)}, got "
                     f"{self.quant.dtype_qk!r}. FLASHINFER_ATTN dtypes (float16/bfloat16) are not SAGE."
                 )
-            if not _sage_kernel_available():
+            try:
+                flashinfer_version = Version(flashinfer.__version__)
+            except (AttributeError, InvalidVersion):
+                flashinfer_version = None
+            if flashinfer_version is not None and flashinfer_version < Version("0.6.18rc10"):
                 raise RuntimeError(
-                    "TRTLLM_ATTN quant (SAGE) was requested but this FlashInfer build does not "
-                    "expose the trtllm-gen sage_attn_sfs kernel path. Install a FlashInfer build "
-                    "that provides it, or remove the quant config."
+                    f"FlashInfer {flashinfer_version} is too old for TRTLLM_ATTN quant (SAGE); "
+                    "install flashinfer >= 0.6.18rc10."
                 )
-            self._sage_quantize_fn = _sage_quantize_fn()
-            if self._sage_quantize_fn is None:
-                raise RuntimeError(
-                    "TRTLLM_ATTN quant (SAGE) was requested but this FlashInfer build lacks "
-                    "trtllm_sage_attention_quantize (added in flashinfer >= 0.6.16rc1). Upgrade "
-                    "FlashInfer, or remove the quant config."
-                )
+            self._sage_quantize_fn = flashinfer.trtllm_sage_attention_quantize
 
     def set_layer_calibration(self, a: float, b: float) -> None:
         self.skip = replace(self.skip, a=a, b=b)
@@ -330,7 +321,6 @@ class TrtllmAttentionImpl(AttentionImpl):
             # Canonical packed-padding metadata is [0, valid_kv_tokens], so this slice
             # is the one-element sequence-length view expected by the kernel.
             seq_lens=cu_seq_lens_kv[1:],
-            known_min_kv_length=valid_kv_tokens,
         )
 
     @staticmethod
@@ -407,7 +397,6 @@ class TrtllmAttentionImpl(AttentionImpl):
         v = value.reshape(physical_batch * kv_len, num_kv_heads, head_dim).contiguous()
         output_tokens = q.shape[0]
 
-        known_min_kv_length: int | None = kv_len
         if has_packed_metadata:
             cu_seq_lens_q = extra["cu_seqlens_q"]
             cu_seq_lens_kv = extra["cu_seqlens_k"]
@@ -444,7 +433,6 @@ class TrtllmAttentionImpl(AttentionImpl):
             cu_seq_lens_kv = packed_layout.cu_seqlens_kv
             batch = packed_layout.batch_size
             seq_lens = packed_layout.seq_lens
-            known_min_kv_length = packed_layout.known_min_kv_length
             max_q_len = int(extra["max_seqlen_q"])
             max_kv_len = int(extra["max_seqlen_k"])
         else:
@@ -465,24 +453,15 @@ class TrtllmAttentionImpl(AttentionImpl):
         # SAGE quant is active (which already requires the kernel, checked at init) so the dense
         # path stays compatible with older builds that lack these parameters.
         sage_kwargs: dict = {}
-        # The SAGE kernel requires every KV sequence to contain at least one full
-        # quantization block. Small auxiliary attention sites use the dense kernel.
-        use_sage = False
         if self.quant.enabled:
-            if known_min_kv_length is not None:
-                sage_lengths_supported = known_min_kv_length >= self.quant.k_block_size
-            else:
-                sage_lengths_supported = bool(torch.all(seq_lens >= self.quant.k_block_size).item())
-            use_sage = sage_lengths_supported
-        if self.quant.enabled and not use_sage:
-            message = (
-                f"TRTLLM_ATTN SAGE quantization is configured for attention role {self.role!r}, but at least one "
-                f"KV sequence is shorter than k_block_size={self.quant.k_block_size}. Falling back to dense "
-                "attention for this input."
+            q, k, v, sage_attn_sfs, sage_block_sizes = self.quant.quantize(
+                q,
+                k,
+                v,
+                self._sage_quantize_fn,
+                cu_seq_lens_q,
+                cu_seq_lens_kv,
             )
-            logger.warning_once(message)
-        if use_sage:
-            q, k, v, sage_attn_sfs, sage_block_sizes = self.quant.quantize(q, k, v, self._sage_quantize_fn)
             sage_kwargs["sage_attn_sfs"] = sage_attn_sfs
             sage_kwargs["num_elts_per_sage_attn_blk"] = sage_block_sizes
 
@@ -505,6 +484,7 @@ class TrtllmAttentionImpl(AttentionImpl):
             is_causal=self.causal,
             return_lse=False,
             skip_softmax_threshold_scale_factor=_skip_factor,
+            skip_all_rows_active_check=True,
             **sage_kwargs,
         )
         if out.shape[0] != output_tokens:
