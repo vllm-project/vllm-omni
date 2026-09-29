@@ -14,6 +14,7 @@ import contextlib
 import math
 import os
 import signal
+import threading
 from typing import Any
 
 import vllm.v1.engine.core as _vllm_engine_core_module
@@ -80,6 +81,55 @@ def _install_phase_locks(kwargs: dict[str, Any], local_dp_rank: int) -> None:
 def _signal_exit_code(signum: int) -> int:
     """Return the conventional process exit code for signal-driven exits."""
     return _SIGNAL_EXIT_BASE + signum
+
+
+class _SignalQueueWakeup:
+    """Wake an idle EngineCore when a signal reaches a non-main thread.
+
+    Python runs signal handlers on the main thread, but SIGTERM may be delivered
+    to another thread while the main thread waits in ``input_queue.get()``.
+    The low-level wakeup fd receives the signal byte immediately; its reader
+    enqueues vLLM's WAKEUP request so the main thread can run the handler.
+    """
+
+    def __init__(self, input_queue: Any) -> None:
+        self._input_queue = input_queue
+        self._stopped = threading.Event()
+        self._read_fd, self._write_fd = os.pipe()
+        os.set_blocking(self._write_fd, False)
+        try:
+            self._previous_fd = signal.set_wakeup_fd(self._write_fd)
+        except BaseException:
+            os.close(self._read_fd)
+            os.close(self._write_fd)
+            raise
+        self._thread = threading.Thread(target=self._read_signals, name="stage-signal-wakeup", daemon=True)
+        try:
+            self._thread.start()
+        except BaseException:
+            signal.set_wakeup_fd(self._previous_fd)
+            os.close(self._read_fd)
+            os.close(self._write_fd)
+            raise
+
+    def _read_signals(self) -> None:
+        while not self._stopped.is_set():
+            try:
+                data = os.read(self._read_fd, 128)
+            except OSError:
+                return
+            if not data or self._stopped.is_set():
+                return
+            self._input_queue.put_nowait((EngineCoreRequestType.WAKEUP, None))
+
+    def close(self) -> None:
+        signal.set_wakeup_fd(self._previous_fd)
+        self._stopped.set()
+        with contextlib.suppress(OSError):
+            os.write(self._write_fd, b"\0")
+        self._thread.join(timeout=1.0)
+        os.close(self._read_fd)
+        os.close(self._write_fd)
 
 
 def _bind_first_audio_sink(model_executor: Any, output_queue: Any, scheduler: Any) -> bool:
@@ -224,6 +274,7 @@ class StageEngineCoreProc(EngineCoreProc):
             exceed vLLM's fixed 5-minute wait.
         """
         signal_callback: SignalCallback | None = None
+        signal_wakeup: _SignalQueueWakeup | None = None
         vllm_config: VllmConfig = kwargs["vllm_config"]
         if logging_config := getattr(vllm_config, "logging_config", None):
             configure_logging(logging_config)
@@ -335,6 +386,8 @@ class StageEngineCoreProc(EngineCoreProc):
 
             signal.signal(signal.SIGTERM, signal_handler)
             signal.signal(signal.SIGINT, signal_handler)
+            if os.name == "posix":
+                signal_wakeup = _SignalQueueWakeup(engine_core.input_queue)
 
             engine_core.run_busy_loop()
 
@@ -351,6 +404,8 @@ class StageEngineCoreProc(EngineCoreProc):
         finally:
             signal.signal(signal.SIGTERM, signal.SIG_DFL)
             signal.signal(signal.SIGINT, signal.SIG_DFL)
+            if signal_wakeup is not None:
+                signal_wakeup.close()
             if signal_callback is not None:
                 signal_callback.stop()
             if coord_client is not None:
