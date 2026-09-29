@@ -104,6 +104,44 @@ _DUPLEX_CODEC_FRAMES_PER_CHUNK = MINICPMO45_DUPLEX_CODEC_TOKENS_PER_CHUNK - 1
 _DUPLEX_TURN_END_BOUNDARY_MASK_STEPS = 5
 
 
+def _native_duplex_row_metadata(info_dict: dict) -> tuple[bool, int, int, str, bool]:
+    """Extract one row's native-duplex metadata.
+
+    Shared by forward and make_omni_output so the two extraction sites cannot
+    drift apart. Returns ``(native_duplex, epoch, turn_id, segment_text,
+    turn_end)``; ``turn_end`` is already gated on ``native_duplex``.
+    """
+    native_duplex = info_dict.get("native_duplex") is True
+    duplex_info = info_dict.get("duplex")
+    if not isinstance(duplex_info, dict):
+        duplex_info = {}
+    epoch = duplex_info.get("epoch", -1)
+    turn_id = duplex_info.get("turn_id", -1)
+    if native_duplex and not all(
+        isinstance(value, int) and not isinstance(value, bool) and value >= 0 for value in (epoch, turn_id)
+    ):
+        raise RuntimeError(
+            "MiniCPM-o native duplex Talker requires non-negative integer "
+            f"epoch and turn_id, got epoch={epoch!r}, turn_id={turn_id!r}"
+        )
+    meta_info = info_dict.get("meta")
+    if not isinstance(meta_info, dict):
+        meta_info = {}
+    segment_text = meta_info.get("native_duplex_segment_text", "") if native_duplex else ""
+    if not isinstance(segment_text, str):
+        segment_text = ""
+    turn_eos_id = meta_info.get("turn_eos_token_id")
+    ids_info = info_dict.get("ids")
+    tts_ids = ids_info.get("tts") if native_duplex and isinstance(ids_info, dict) else None
+    if isinstance(tts_ids, torch.Tensor):
+        contains_turn_eos = isinstance(turn_eos_id, int) and bool(torch.any(tts_ids.reshape(-1) == turn_eos_id).item())
+    elif isinstance(tts_ids, (list, tuple)):
+        contains_turn_eos = isinstance(turn_eos_id, int) and turn_eos_id in tts_ids
+    else:
+        contains_turn_eos = False
+    return native_duplex, epoch, turn_id, segment_text, (native_duplex and contains_turn_eos)
+
+
 def _native_duplex_chunk_budget(meta: Mapping[str, Any] | None) -> tuple[int, int]:
     """Return ``(max_tokens, min_tokens)`` for one native-duplex Talker request."""
     turn_start = isinstance(meta, Mapping) and bool(meta.get("turn_start"))
@@ -861,32 +899,6 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             }
             if retained_codes:
                 state["recent_codes"] = retained_codes
-                # Rebuild the device-side penalty window once per chunk from the
-                # carried-over ids; the per-frame path below then appends on
-                # device without touching the host again.
-                retained = [int(code_id) for code_id in retained_codes][-_CODEC_PENALTY_WINDOW:]
-                if retained:
-                    penalty_windows = getattr(self, "_penalty_windows_dev", None)
-                    if not isinstance(penalty_windows, dict):
-                        penalty_windows = {}
-                        self._penalty_windows_dev = penalty_windows
-                    penalty_windows[request_id] = torch.tensor(retained, dtype=torch.long, device=embeds.device)
-                    pf_freq = torch.zeros(
-                        int(getattr(self, "_num_audio_tokens", 0) or 0),
-                        device=embeds.device,
-                        dtype=torch.float32,
-                    )
-                    if pf_freq.numel() > 0:
-                        pf_freq.index_add_(
-                            0,
-                            penalty_windows[request_id],
-                            torch.ones(len(retained), device=embeds.device, dtype=torch.float32),
-                        )
-                        pf_dict = getattr(self, "_penalty_freqs_dev", None)
-                        if not isinstance(pf_dict, dict):
-                            pf_dict = {}
-                            self._penalty_freqs_dev = pf_dict
-                        pf_dict[request_id] = pf_freq
             request_states = getattr(self, "_request_audio_states", None)
             if request_states is None:
                 request_states = {}
@@ -942,10 +954,13 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 dtype=torch.long,
                 device=self.emb_code[0].weight.device,
             )
+            # k_last is already the host int this tensor was built from;
+            # .item() would only sync it right back.
+            code_id = k_last
         else:
             code = input_ids.to(device=self.emb_code[0].weight.device, dtype=torch.long).reshape(-1)[-1:]
+            code_id = int(code.item())
         embeds = self.emb_code[0](code)
-        code_id = int(code.item())
         if code_id == int(self._codec_eos_id):
             if isinstance(state, dict):
                 state["finished"] = True
@@ -1013,37 +1028,8 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         row_continue, row_stop, flag_false, flag_true, empty_delta = self._step_constants(hidden)
         for index, info in enumerate(infos):
             info_dict = info if isinstance(info, dict) else {}
-            native_duplex = info_dict.get("native_duplex") is True
             if emit_duplex_metadata:
-                duplex_info = info_dict.get("duplex")
-                if not isinstance(duplex_info, dict):
-                    duplex_info = {}
-                epoch = duplex_info.get("epoch", -1)
-                turn_id = duplex_info.get("turn_id", -1)
-                if native_duplex and not all(
-                    isinstance(value, int) and not isinstance(value, bool) and value >= 0 for value in (epoch, turn_id)
-                ):
-                    raise RuntimeError(
-                        "MiniCPM-o native duplex Talker requires non-negative integer "
-                        f"epoch and turn_id, got epoch={epoch!r}, turn_id={turn_id!r}"
-                    )
-                meta_info = info_dict.get("meta")
-                if not isinstance(meta_info, dict):
-                    meta_info = {}
-                segment_text = meta_info.get("native_duplex_segment_text", "") if native_duplex else ""
-                if not isinstance(segment_text, str):
-                    segment_text = ""
-                turn_eos_id = meta_info.get("turn_eos_token_id")
-                ids_info = info_dict.get("ids")
-                tts_ids = ids_info.get("tts") if native_duplex and isinstance(ids_info, dict) else None
-                if isinstance(tts_ids, torch.Tensor):
-                    contains_turn_eos = isinstance(turn_eos_id, int) and bool(
-                        torch.any(tts_ids.reshape(-1) == turn_eos_id).item()
-                    )
-                elif isinstance(tts_ids, (list, tuple)):
-                    contains_turn_eos = isinstance(turn_eos_id, int) and turn_eos_id in tts_ids
-                else:
-                    contains_turn_eos = False
+                native_duplex, epoch, turn_id, segment_text, turn_end = _native_duplex_row_metadata(info_dict)
                 native_duplex_flags.append(torch.tensor(native_duplex, dtype=torch.bool))
                 duplex_epochs.append(torch.tensor(epoch if isinstance(epoch, int) else -1, dtype=torch.long))
                 duplex_turn_ids.append(torch.tensor(turn_id if isinstance(turn_id, int) else -1, dtype=torch.long))
@@ -1053,7 +1039,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                         dtype=torch.uint8,
                     )
                 )
-                turn_end_flags.append(torch.tensor(native_duplex and contains_turn_eos, dtype=torch.bool))
+                turn_end_flags.append(torch.tensor(turn_end, dtype=torch.bool))
 
             if not isinstance(info, dict):
                 stop_rows.append(row_continue)
@@ -1435,8 +1421,12 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             # Refresh in place: swapping the tensor would re-capture the
             # per-request sampling graph.
             budget = _codec_int_param(request_state, "max_tokens", self._codec_max_tokens)
-            if int(device_state.max_tokens.item()) != budget:
-                device_state.max_tokens.fill_(budget)
+            # Refresh in place, unconditionally: fill_ is a no-op when the
+            # budget did not move, and the .item() compare would sync every
+            # request every frame just to decide whether to write a value we
+            # can write regardless. Swapping the tensor would re-capture the
+            # per-request sampling graph.
+            device_state.max_tokens.fill_(budget)
         device_inputs_by_request = getattr(self, "_request_codec_device_inputs", None)
         if device_inputs_by_request is None:
             device_inputs_by_request = {}
@@ -1528,11 +1518,12 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 full_bins=_codec_full_bins_input(request_state, hidden_state.device),
             )
             device_states[request_id] = device_state
-        elif int(device_state.max_tokens.item()) != int(max_tokens):
+        else:
             # Same refresh as _sample_audio_code: the caller passes the host
             # state's current frame ceiling, which the request's remaining
             # output budget may have tightened after this device state was
-            # built. Refreshing in place keeps the per-request sampling graph.
+            # built. Refreshing in place keeps the per-request sampling graph,
+            # and fill_ is a no-op when the value already matches.
             device_state.max_tokens.fill_(int(max_tokens))
 
         device_inputs_by_request = getattr(self, "_request_codec_device_inputs", None)
@@ -1641,8 +1632,6 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         """
         request_audio_states = getattr(self, "_request_audio_states", {})
         request_condition_states = getattr(self, "_request_condition_states", {})
-        penalty_windows = getattr(self, "_penalty_windows_dev", None)
-        penalty_freqs = getattr(self, "_penalty_freqs_dev", None)
         codec_device_states = getattr(self, "_request_codec_device_states", None)
         codec_device_inputs = getattr(self, "_request_codec_device_inputs", None)
         codec_histories = getattr(self, "_request_codec_history", None)
@@ -1650,10 +1639,6 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         for request_id in self._deferred_cleanup_ids:
             request_audio_states.pop(request_id, None)
             request_condition_states.pop(request_id, None)
-            if isinstance(penalty_windows, dict):
-                penalty_windows.pop(request_id, None)
-            if isinstance(penalty_freqs, dict):
-                penalty_freqs.pop(request_id, None)
             if isinstance(codec_device_states, dict):
                 codec_device_states.pop(request_id, None)
             if isinstance(codec_device_inputs, dict):
@@ -1734,37 +1719,8 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         penalty_histories = [empty_history for _ in infos]
         for index, info in enumerate(infos):
             info_dict = info if isinstance(info, dict) else {}
-            native_duplex = info_dict.get("native_duplex") is True
             if emit_duplex_metadata:
-                duplex_info = info_dict.get("duplex")
-                if not isinstance(duplex_info, dict):
-                    duplex_info = {}
-                epoch = duplex_info.get("epoch", -1)
-                turn_id = duplex_info.get("turn_id", -1)
-                if native_duplex and not all(
-                    isinstance(value, int) and not isinstance(value, bool) and value >= 0 for value in (epoch, turn_id)
-                ):
-                    raise RuntimeError(
-                        "MiniCPM-o native duplex Talker requires non-negative integer "
-                        f"epoch and turn_id, got epoch={epoch!r}, turn_id={turn_id!r}"
-                    )
-                meta_info = info_dict.get("meta")
-                if not isinstance(meta_info, dict):
-                    meta_info = {}
-                segment_text = meta_info.get("native_duplex_segment_text", "") if native_duplex else ""
-                if not isinstance(segment_text, str):
-                    segment_text = ""
-                turn_eos_id = meta_info.get("turn_eos_token_id")
-                ids_info = info_dict.get("ids")
-                tts_ids = ids_info.get("tts") if native_duplex and isinstance(ids_info, dict) else None
-                if isinstance(tts_ids, torch.Tensor):
-                    contains_turn_eos = isinstance(turn_eos_id, int) and bool(
-                        torch.any(tts_ids.reshape(-1) == turn_eos_id).item()
-                    )
-                elif isinstance(tts_ids, (list, tuple)):
-                    contains_turn_eos = isinstance(turn_eos_id, int) and turn_eos_id in tts_ids
-                else:
-                    contains_turn_eos = False
+                native_duplex, epoch, turn_id, segment_text, turn_end = _native_duplex_row_metadata(info_dict)
                 native_duplex_flags.append(torch.tensor(native_duplex, dtype=torch.bool))
                 duplex_epochs.append(torch.tensor(epoch if isinstance(epoch, int) else -1, dtype=torch.long))
                 duplex_turn_ids.append(torch.tensor(turn_id if isinstance(turn_id, int) else -1, dtype=torch.long))
@@ -1774,7 +1730,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                         dtype=torch.uint8,
                     )
                 )
-                turn_end_flags.append(torch.tensor(native_duplex and contains_turn_eos, dtype=torch.bool))
+                turn_end_flags.append(torch.tensor(turn_end, dtype=torch.bool))
 
             if not isinstance(info, dict):
                 continue
@@ -1969,28 +1925,11 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             or not isinstance(penalties, torch.Tensor)
             or getattr(sampling_metadata, "no_penalties", False)
         ):
-            self._penalty_freq_rows = None
             return logits, sampling_metadata
-        freq_rows = getattr(self, "_penalty_freq_rows", None)
-        self._penalty_freq_rows = None
-        if (
-            isinstance(freq_rows, list)
-            and len(freq_rows) == logits.shape[0]
-            and all(
-                isinstance(f, torch.Tensor) and f.device == logits.device and f.numel() == logits.shape[-1]
-                for f in freq_rows
-            )
-            and bool((penalties.reshape(-1) != 1.0).any())
-        ):
-            # Incremental histogram: freq rows are maintained on device by
-            # make_omni_output (+1 append / -1 evict), identical to a full
-            # scatter_add rebuild of the sliding window.
-            freqs = torch.stack([f.to(dtype=torch.float32) for f in freq_rows], dim=0)
-            alpha = torch.pow(penalties.to(device=logits.device, dtype=torch.float32).reshape(-1, 1), freqs).to(
-                dtype=logits.dtype
-            )
-            logits = torch.where(logits < 0, logits * alpha, logits / alpha)
-            return logits, replace(sampling_metadata, repetition_penalties=torch.ones_like(penalties))
+        # The incremental-histogram branch (_penalty_freq_rows) was removed:
+        # that attribute was only ever assigned None, so the branch was
+        # unreachable -- frequency/presence penalties use full_bins and the
+        # sliding repetition window lives on device_state.history.
         logits = _apply_batched_repetition_penalty(
             logits,
             histories,

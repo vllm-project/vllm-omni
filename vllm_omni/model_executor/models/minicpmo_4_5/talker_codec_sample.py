@@ -369,28 +369,13 @@ def greedy_codec_sample(
     penalized = _repetition_penalty_scaling(penalized, state, repetition_penalty)
     penalized = _apply_stream_penalties(penalized, state, frequency_penalty, presence_penalty)
     sampled = torch.argmax(penalized, dim=-1).to(torch.int32)
-
-    active = ~state.finished
-    next_step = torch.where(active, state.step + 1, state.step)
-    if ignore_eos:
-        # Same rule as advance_codec_device_state: ``ignore_eos`` disables the
-        # engine's EOS stop, so it disables this one too.
-        is_eos = torch.zeros_like(state.finished)
-    else:
-        is_eos = sampled.to(torch.int64) == int(eos_token_id)
-    reached_limit = active & (next_step >= state.max_tokens)
-    finished = state.finished | is_eos | reached_limit
-    emit = active & (~is_eos) & (~reached_limit)
-
-    shifted = torch.cat([state.history[:, 1:], sampled.to(torch.int32).unsqueeze(1)], dim=1)
-    append_at = state.history_len.clamp(min=0, max=HISTORY_WINDOW - 1).to(torch.long).unsqueeze(1)
-    appended = state.history.scatter(1, append_at, sampled.to(torch.int32).unsqueeze(1))
-    candidate = torch.where((state.history_len >= HISTORY_WINDOW).unsqueeze(1), shifted, appended)
-    history = torch.where(emit.unsqueeze(1), candidate, state.history)
-    history_len = torch.clamp(state.history_len + emit.to(torch.int32), max=HISTORY_WINDOW)
-    _advance_full_bins(state, sampled, emit)
-    return TalkerCodecSampleResult(
-        sampled_token=sampled,
-        state=TalkerCodecDeviceState(history, history_len, next_step, state.max_tokens, finished, state.full_bins),
-        emit=emit,
+    # The state advance / emit / finished transition lives in exactly one
+    # place: codec_sample_result. The sampled id is already in [0, vocab), so
+    # the random and greedy paths share it verbatim (RNG untouched: the
+    # multinomial call lives in the caller, not here).
+    return codec_sample_result(
+        state,
+        sampled,
+        eos_token_id=eos_token_id,
+        ignore_eos=ignore_eos,
     )

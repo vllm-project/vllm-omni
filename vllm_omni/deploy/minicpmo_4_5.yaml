@@ -136,7 +136,8 @@ platforms:
         max_num_seqs: 8
         max_num_batched_tokens: 8192
         # Moved here from the platform-shared block; see the base stage note.
-        enable_prefix_caching: true
+        # Duplex KV window (window_kv.py) requires prefix caching disabled.
+        enable_prefix_caching: false
         compilation_config:
           # A full decode-step graph keeps in-graph sampling and multi-frame
           # expansion. The static-shape builder gates its runtime buckets on
