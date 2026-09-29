@@ -57,6 +57,8 @@ from vllm_omni.config.stage_config import (
     normalize_pipeline_cli_overrides,
     reconcile_diffusion_attention_overrides,
     resolve_stage_async_chunk,
+    resolve_stage_model_runner,
+    validate_native_mrv2_session,
     validate_stage_async_chunk_edges,
 )
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
@@ -1988,7 +1990,9 @@ def _build_model_config(
     kwargs["final_output"] = topology.final_output
     if "custom_voice_dir" not in kwargs and deploy.custom_voice_dir is not None:
         kwargs["custom_voice_dir"] = _copy_value(deploy.custom_voice_dir)
-    kwargs.setdefault("use_v2_model_runner", deploy.model_runner == "v2")
+    stage_runner = resolve_stage_model_runner(deploy, stage_deploy)
+    validate_native_mrv2_session(deploy, topology, stage_runner)
+    kwargs.setdefault("use_v2_model_runner", stage_runner == "v2")
     kwargs.setdefault(
         "supports_native_mrv2_data_plane",
         topology.supports_native_mrv2_data_plane,

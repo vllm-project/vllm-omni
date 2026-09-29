@@ -175,7 +175,7 @@ def test_finished_request_attachment_keeps_ar_abort_policy_explicit(
 ):
     scheduler = _Scheduler()
     scheduler.finished_req_ids_dict = defaultdict(set, {2: {"req-finished"}})
-    outputs = {}
+    outputs: dict = {}
 
     scheduler._attach_finished_request_sets(
         outputs,
@@ -207,3 +207,26 @@ def test_output_helper_preserves_required_nan_counter_default():
     output = scheduler._make_omni_engine_output(request, new_token_ids=[])
 
     assert output.num_nans_in_logits == 0
+
+
+@pytest.mark.parametrize(("role", "coordinated"), [("sender", False), ("receiver", True), (None, True)])
+def test_native_downstream_sender_stage_does_not_wait_for_chunks(role, coordinated):
+    """An orchestrator-fed downstream stage (MiniCPM-o's Talker) owns only an
+    outgoing connector; the native plane must not park it for input chunks."""
+    scheduler = _Scheduler()
+    model_config = object.__new__(OmniModelConfig)
+    model_config.stage_id = 1
+    model_config.async_chunk = True
+    model_config.requires_full_payload_input = False
+    model_config.supports_native_mrv2_data_plane = True
+    model_config.use_v2_model_runner = True
+    model_config.stage_connector_config = {"name": "SharedMemoryConnector", "extra": {"role": role} if role else {}}
+    scheduler.vllm_config = object.__new__(VllmConfig)
+    scheduler.vllm_config.model_config = model_config
+    scheduler.vllm_config.scheduler_config = object.__new__(SchedulerConfig)
+    scheduler.vllm_config.scheduler_config.max_num_seqs = 1
+    scheduler._init_omni_io_scheduling_state()
+
+    assert scheduler._native_data_plane
+    assert (scheduler.input_coordinator is not None) is coordinated
+    assert scheduler._async_chunk_transport_enabled() is coordinated
