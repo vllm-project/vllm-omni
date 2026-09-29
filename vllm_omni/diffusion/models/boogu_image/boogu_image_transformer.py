@@ -643,6 +643,7 @@ class BooguImageSelfAttention(nn.Module):
             softmax_scale=self.head_dim**-0.5,
             causal=False,
             num_kv_heads=self.num_local_kv_heads,
+            qkv_layout="BSND",
         )
 
     def forward(
@@ -749,6 +750,7 @@ class BooguImageJointAttention(nn.Module):
             softmax_scale=self.head_dim**-0.5,
             causal=False,
             num_kv_heads=self.num_local_kv_heads,
+            qkv_layout="BSND",
         )
 
     def forward(
