@@ -5328,7 +5328,8 @@ class TestTTSAsyncOffloading:
         default_params = voxtral_server.engine_client.default_sampling_params_list[0]
         default_params.seed = None
         default_params.extra_args = None
-        voxtral_server._build_voxtral_prompt_async = mocker.AsyncMock(
+        voxtral_server.engine_client.collective_rpc = mocker.AsyncMock(return_value=[False])
+        voxtral_server._adapter._build_prompt_async = mocker.AsyncMock(
             return_value={
                 "prompt_token_ids": [1, 2, 3],
                 "additional_information": {"voice": ["test"]},
