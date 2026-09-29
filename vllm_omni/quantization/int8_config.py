@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """INT8 quantization config for diffusion transformers.
 
 Supports both online (dynamic) and offline (checkpoint) INT8 quantization
@@ -7,6 +7,8 @@ on CUDA and NPU platforms.
 """
 
 from collections.abc import Callable
+from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import TYPE_CHECKING, Any, Optional
 
 import torch
@@ -26,9 +28,11 @@ from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
-from vllm.model_executor.layers.quantization.fp8 import CopyNumelCounter
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     is_layer_skipped,
+)
+from vllm.model_executor.model_loader.reload.meta import (
+    CopyCounter as CopyNumelCounter,
 )
 from vllm.model_executor.model_loader.weight_utils import initialize_single_dummy_weight
 from vllm.model_executor.parameter import (
@@ -60,6 +64,32 @@ NPU_QUANT_MATMUL_MAX_OUT_FEATURES = 65535
 
 logger = init_logger(__name__)
 
+# Set by the diffusion loader while it constructs a model whose weights will be
+# offloaded back to host memory after online quantization (DLO). Over-wide
+# layers that npu_quant_matmul cannot run then load straight into host memory
+# instead of being built on the accelerator and moved off at the end of
+# loading — on MiniMax H3 the 50 fallback adaln layers are ~24 GiB of bf16,
+# which is the dominant startup memory peak.
+_LOAD_UNQUANTIZABLE_FALLBACK_ON_CPU: ContextVar[bool] = ContextVar(
+    "int8_load_unquantizable_fallback_on_cpu", default=False
+)
+
+
+@contextmanager
+def load_unquantizable_fallback_on_cpu():
+    """Create npu_quant_matmul-incompatible fallback weights on meta and load
+    them straight into host memory.
+
+    Only valid when the whole model returns to the host after loading (the
+    loader's offload-after-quant path); otherwise the fallback weights would
+    stay on CPU while the rest of the model runs on the accelerator.
+    """
+    token = _LOAD_UNQUANTIZABLE_FALLBACK_ON_CPU.set(True)
+    try:
+        yield
+    finally:
+        _LOAD_UNQUANTIZABLE_FALLBACK_ON_CPU.reset(token)
+
 
 def _fell_back_to_unquantized_npu(
     layer: torch.nn.Module,
@@ -88,7 +118,15 @@ def _fell_back_to_unquantized_npu(
         output_size_per_partition,
         NPU_QUANT_MATMUL_MAX_OUT_FEATURES,
     )
-    fallback = UnquantizedLinearMethod()
+    if _LOAD_UNQUANTIZABLE_FALLBACK_ON_CPU.get():
+        logger.info_once(
+            "Loading over-wide unquantized fallback weights straight into host memory "
+            "(offload-after-quant is active); they only reach the accelerator via "
+            "the offload backend's runtime prefetch."
+        )
+        fallback: LinearMethodBase = UnquantizedHostLinearMethod()
+    else:
+        fallback = UnquantizedLinearMethod()
     layer.quant_method = fallback
     fallback.create_weights(
         layer,
@@ -295,6 +333,14 @@ class LazyWeightMixin:
         """
         self._offload_after_quant = True
 
+    def _lazy_load_device(self) -> torch.device:
+        """Device the meta weight materializes on at first load.
+
+        Subclasses that never want the accelerator involved (e.g. the
+        over-wide host fallback) override this to return host memory.
+        """
+        return torch.get_default_device()
+
     def create_weights(
         self,
         layer: torch.nn.Module,
@@ -345,7 +391,7 @@ class LazyWeightMixin:
             # process_weights_after_loading
             target_loaded_numel = layer.weight.numel()
             if layer._loaded_numel == target_loaded_numel:
-                self.process_weights_after_loading(layer)
+                self.process_weights_after_loading(layer)  # type: ignore[attr-defined]
 
                 # Prevent the usual `process_weights_after_loading` call from doing
                 # anything
@@ -376,8 +422,44 @@ class LazyWeightMixin:
             weight_loader=patched_weight_loader,
         )
         # stash the correct device for `patched_weight_loader`
-        layer._load_device = torch.get_default_device()
+        layer._load_device = self._lazy_load_device()
         layer.register_parameter("weight", weight)
+
+
+class UnquantizedHostLinearMethod(LazyWeightMixin, UnquantizedLinearMethod):
+    """Unquantized linear method whose weight loads straight into host memory.
+
+    Layers wider than ``NPU_QUANT_MATMUL_MAX_OUT_FEATURES`` cannot be quantized,
+    so under the ordinary path their bf16 weights materialize on the accelerator
+    at construction time and stay there until the whole model is moved off after
+    loading. When the loader has entered ``load_unquantizable_fallback_on_cpu()``
+    (offload-after-quant, i.e. DLO), that round trip is pure startup peak — the
+    weights end up pinned on the host either way and only visit the accelerator
+    through the offload backend's runtime prefetch.
+
+    This method reuses ``LazyWeightMixin``'s meta + just-in-time materialization
+    wholesale (the weight really is deferred on meta until loading, like the
+    online quant methods, so the loader's meta-aware bookkeeping treats the
+    layer correctly) and only overrides the materialization target to host
+    memory: checkpoint chunks are CPU tensors, so loading stays CPU->CPU with
+    no accelerator round trip.
+    """
+
+    # Offload-after-quant marking is deliberately not advertised even though
+    # the mixin provides the hook: the weight never visits the accelerator,
+    # so there is nothing to return to host.
+    supports_offload_after_quant: bool = False
+
+    def _lazy_load_device(self) -> torch.device:
+        return torch.device("cpu")
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        """Unquantized weights need no post-load transform.
+
+        The mixin calls this when the weight is fully loaded, right before it
+        flags the layer — and the flag is what keeps the loader's post-load
+        sweep from bouncing the host tensor to the accelerator and back.
+        """
 
 
 class Int8LinearMethod(BaseInt8LinearMethod):

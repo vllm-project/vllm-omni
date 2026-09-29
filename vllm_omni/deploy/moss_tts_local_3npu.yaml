@@ -1,0 +1,9 @@
+# MOSS-TTS-Local-Transformer-v1.5 3-NPU deploy: Stage0 talker on NPU 0, Stage1 codec x2 replicas on NPU 1,2.
+# Splits AR (talker+depth) and codec across 3 devices, with 2 codec replicas for doubled codec throughput.
+# Launch: vllm-omni serve ... --deploy-config moss_tts_local_3npu.yaml
+base_config: moss_tts_local_2npu.yaml
+
+stages:
+  - stage_id: 1
+    devices: "1,2"
+    num_replicas: 2

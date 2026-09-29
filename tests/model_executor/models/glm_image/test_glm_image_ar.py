@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Unit tests for GLM-Image AR model: DataParser, processor, and M-RoPE."""
 
 import importlib.util
@@ -89,6 +89,41 @@ GlmImageForConditionalGeneration = _ar_mod.GlmImageForConditionalGeneration
 GlmImageRotaryEmbedding = _ar_mod.GlmImageRotaryEmbedding
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+@pytest.mark.parametrize("num_images", [0, 1, 2])
+@pytest.mark.parametrize("preformatted", [False, True])
+def test_generation_prompt_ids_preserve_hf_target_scaffold(num_images, preformatted):
+    from types import SimpleNamespace
+
+    from vllm.multimodal.parse import MultiModalDataItems
+    from vllm.multimodal.processing import BaseMultiModalProcessor, ProcessorInputs
+
+    processor = object.__new__(GlmImageMultiModalProcessor)
+    # Only the public token attributes of GlmImageProcessor are needed; the
+    # expected suffix below is what HF's own formatter produces for 512x768.
+    hf_processor = SimpleNamespace(grid_bos_token="<sop>", grid_eos_token="<eop>", bos_token="<image_start>")
+    tokenizer = SimpleNamespace(encode=lambda text, **kwargs: list(text.encode()))
+    processor.info = SimpleNamespace(
+        get_tokenizer=lambda: tokenizer,
+        get_hf_processor=lambda: hf_processor,
+        get_hf_config=lambda: _make_hf_config(),
+    )
+    items = MagicMock(spec=MultiModalDataItems)
+    items.get_all_counts.return_value = {"image": num_images}
+    suffix = "<sop>16 24<eop>" + ("<sop>13 19<eop>" if not num_images else "") + "<image_start>"
+    text_ids = list(b"a red bird")
+    expected = [167855] * num_images + text_ids + list(suffix.encode())
+    inputs = ProcessorInputs(
+        prompt=expected if preformatted else text_ids,
+        mm_data_items=items,
+        hf_processor_mm_kwargs={"target_h": 512, "target_w": 768},
+    )
+    with patch.object(BaseMultiModalProcessor, "apply", side_effect=lambda inputs, timing: inputs) as upstream:
+        result = processor.apply(inputs, MagicMock())
+    assert result.prompt == expected
+    assert inputs.prompt == (expected if preformatted else text_ids)
+    upstream.assert_called_once()
 
 
 def test_glm_image_ar_omits_hidden_pooler_payload():

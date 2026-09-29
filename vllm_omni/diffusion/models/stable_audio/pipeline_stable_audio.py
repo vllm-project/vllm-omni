@@ -81,8 +81,7 @@ class StableAudioPipeline(nn.Module, SupportAudioOutput, SupportsComponentDiscov
 
     # Picked up by ``supports_audio_output`` in the diffusion engine so the
     # default stage metadata reports ``final_output_type="audio"`` and the
-    # ``multimodal_output`` payload includes the sample rate (mirrors the
-    # contract introduced for AudioX in #2077).
+    # ``multimodal_output`` payload includes the sample rate.
     support_audio_output: ClassVar[bool] = True
     audio_sample_rate: ClassVar[int] = 44100
 

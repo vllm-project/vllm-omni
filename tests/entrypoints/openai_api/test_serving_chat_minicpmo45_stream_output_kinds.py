@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Regression tests for MiniCPM-o 4.5 audio-streaming output-kind coercion.
 
 Chat ``stream=true`` coerces every AR stage to DELTA. For MiniCPM-o 4.5 that
@@ -33,6 +34,13 @@ def _stage(model_arch: str, model_stage: str) -> SimpleNamespace:
     return SimpleNamespace(engine_args=SimpleNamespace(model_arch=model_arch, model_stage=model_stage))
 
 
+def _typed_stage(model_arch: str, model_stage: str) -> SimpleNamespace:
+    return SimpleNamespace(
+        model_config=SimpleNamespace(model_arch=model_arch),
+        model_stage=model_stage,
+    )
+
+
 def _minicpmo45_stages():
     return [_stage(MINICPMO45_ARCH, "llm"), _stage(MINICPMO45_ARCH, "tts")]
 
@@ -43,6 +51,20 @@ def _delta_params(n: int = 2):
 
 def test_thinker_forced_final_only_talker_stays_delta(serving_chat):
     serving_chat.engine_client = SimpleNamespace(stage_configs=_minicpmo45_stages())
+
+    out = serving_chat._fix_minicpmo45_audio_stream_output_kinds(_delta_params(), ["text", "audio"])
+
+    assert out[0].output_kind is RequestOutputKind.FINAL_ONLY
+    assert out[1].output_kind is RequestOutputKind.DELTA
+
+
+def test_typed_stages_force_thinker_final_only(serving_chat):
+    serving_chat.engine_client = SimpleNamespace(
+        stage_configs=[
+            _typed_stage(MINICPMO45_ARCH, "llm"),
+            _typed_stage(MINICPMO45_ARCH, "tts"),
+        ]
+    )
 
     out = serving_chat._fix_minicpmo45_audio_stream_output_kinds(_delta_params(), ["text", "audio"])
 

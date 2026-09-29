@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 #
 # Extract steps from .buildkite/cuda/test-merge.yml that contain pytest, synthesize
 # small bash wrappers (exports + pytest), run them, and tee output to logs named

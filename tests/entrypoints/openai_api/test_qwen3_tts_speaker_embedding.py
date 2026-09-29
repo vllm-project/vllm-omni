@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
 E2E tests for speaker_embedding API parameter.
 
@@ -34,9 +34,7 @@ DUMMY_EMBEDDING_2048 = [0.1] * 2048
 
 SYN_TEXT = "Hello."
 MIN_AUDIO_BYTES = 2000
-# Limit generation to keep tests fast (dummy embeddings produce nonsensical
-# output that may never hit a natural stop token).
-MAX_NEW_TOKENS = 256
+_CODEC_EOS_MISS = "did not emit codec EOS"
 
 
 base_server_params = [
@@ -75,6 +73,33 @@ def assert_not_silence(pcm_bytes: bytes):
     assert len(unique) > 1, f"All-silence detected: {len(samples)} samples, unique values: {unique}"
 
 
+def _is_codec_eos_miss(response: httpx.Response) -> bool:
+    return response.status_code == 500 and _CODEC_EOS_MISS in response.text
+
+
+def post_audio_speech(url: str, payload: dict, *, extra_retries: int = 0) -> httpx.Response:
+    """POST /v1/audio/speech, optionally retrying the whole request on miss-EOS.
+
+    Non-streaming Base serving already discards an incomplete generation and
+    retries once when the caller omits ``max_new_tokens``. Raw PCM streams
+    cannot retry inside serving, so CI uses ``extra_retries=1`` on that path.
+    """
+    last_response: httpx.Response | None = None
+    for attempt in range(extra_retries + 1):
+        try:
+            with httpx.Client(timeout=120.0) as client:
+                last_response = client.post(url, json=payload)
+        except httpx.RemoteProtocolError:
+            if attempt >= extra_retries:
+                raise
+            continue
+        if attempt < extra_retries and _is_codec_eos_miss(last_response):
+            continue
+        return last_response
+    assert last_response is not None
+    return last_response
+
+
 # ── 0.6B-Base model tests ──
 
 
@@ -95,10 +120,8 @@ class TestSpeakerEmbeddingBase:
             "speaker_embedding": DUMMY_EMBEDDING_1024,
             "x_vector_only_mode": True,
             "response_format": "wav",
-            "max_new_tokens": MAX_NEW_TOKENS,
         }
-        with httpx.Client(timeout=120.0) as client:
-            response = client.post(url, json=payload)
+        response = post_audio_speech(url, payload)
 
         assert response.status_code == 200, f"Request failed: {response.text}"
         assert response.headers.get("content-type") == "audio/wav"
@@ -118,10 +141,8 @@ class TestSpeakerEmbeddingBase:
             "speaker_embedding": DUMMY_EMBEDDING_1024,
             "x_vector_only_mode": True,
             "response_format": "pcm",
-            "max_new_tokens": MAX_NEW_TOKENS,
         }
-        with httpx.Client(timeout=120.0) as client:
-            response = client.post(url, json=payload)
+        response = post_audio_speech(url, payload)
 
         assert response.status_code == 200, f"Request failed: {response.text}"
         assert len(response.content) > MIN_AUDIO_BYTES
@@ -142,10 +163,9 @@ class TestSpeakerEmbeddingBase:
             "response_format": "pcm",
             "stream": True,
             "stream_format": "audio",
-            "max_new_tokens": MAX_NEW_TOKENS,
         }
-        with httpx.Client(timeout=120.0) as client:
-            response = client.post(url, json=payload)
+        # Raw PCM streams cannot retry inside serving; retry the whole request once.
+        response = post_audio_speech(url, payload, extra_retries=1)
 
         assert response.status_code == 200, f"Request failed: {response.text}"
         assert "audio/pcm" in response.headers.get("content-type", "")
@@ -173,12 +193,75 @@ class TestSpeakerEmbedding1_7B:
             "speaker_embedding": DUMMY_EMBEDDING_2048,
             "x_vector_only_mode": True,
             "response_format": "wav",
-            "max_new_tokens": MAX_NEW_TOKENS,
         }
-        with httpx.Client(timeout=120.0) as client:
-            response = client.post(url, json=payload)
+        response = post_audio_speech(url, payload)
 
         assert response.status_code == 200, f"Request failed: {response.text}"
         assert response.headers.get("content-type") == "audio/wav"
         assert verify_wav_audio(response.content), "Response is not valid WAV"
         assert len(response.content) > MIN_AUDIO_BYTES, f"Audio too small: {len(response.content)} bytes"
+
+
+class _FakeSpeechResponse:
+    def __init__(self, status_code: int, text: str = "") -> None:
+        self.status_code = status_code
+        self.text = text
+
+
+def _patch_speech_client(mocker, *, side_effect=None, return_value=None):
+    client = mocker.MagicMock()
+    client.__enter__.return_value = client
+    client.__exit__.return_value = False
+    if side_effect is not None:
+        client.post.side_effect = side_effect
+    else:
+        client.post.return_value = return_value
+    mocker.patch("httpx.Client", return_value=client)
+    return client
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_post_audio_speech_retries_remote_protocol_error(mocker) -> None:
+    ok = _FakeSpeechResponse(200)
+    client = _patch_speech_client(mocker, side_effect=[httpx.RemoteProtocolError("incomplete chunked read"), ok])
+
+    response = post_audio_speech("http://example/v1/audio/speech", {}, extra_retries=1)
+
+    assert response is ok
+    assert client.post.call_count == 2
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_post_audio_speech_retries_codec_eos_http_500(mocker) -> None:
+    miss = _FakeSpeechResponse(500, "Qwen3-TTS Base did not emit codec EOS before its token budget")
+    ok = _FakeSpeechResponse(200)
+    client = _patch_speech_client(mocker, side_effect=[miss, ok])
+
+    response = post_audio_speech("http://example/v1/audio/speech", {}, extra_retries=1)
+
+    assert response is ok
+    assert client.post.call_count == 2
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_post_audio_speech_does_not_retry_unrelated_http_500(mocker) -> None:
+    boom = _FakeSpeechResponse(500, "engine dead")
+    client = _patch_speech_client(mocker, return_value=boom)
+
+    response = post_audio_speech("http://example/v1/audio/speech", {}, extra_retries=1)
+
+    assert response is boom
+    assert client.post.call_count == 1
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_post_audio_speech_without_extra_retries_raises(mocker) -> None:
+    client = _patch_speech_client(mocker, side_effect=httpx.RemoteProtocolError("incomplete chunked read"))
+
+    with pytest.raises(httpx.RemoteProtocolError):
+        post_audio_speech("http://example/v1/audio/speech", {}, extra_retries=0)
+    assert client.post.call_count == 1

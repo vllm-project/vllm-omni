@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Tests for Daily-Omni ``--daily-omni-pack-mode`` packing recipes.
 
 The ``minicpm-interleave`` mode is an accuracy-critical protocol: MiniCPM-o only reaches
@@ -27,6 +30,8 @@ _MODULE_NAME = "vllm_omni.benchmarks.data_modules.daily_omni_dataset"
 
 if _MODULE_NAME not in sys.modules:
     _spec = importlib.util.spec_from_file_location(_MODULE_NAME, _MODULE_PATH)
+    if _spec is None or _spec.loader is None:
+        raise ImportError(f"Cannot load {_MODULE_NAME} from {_MODULE_PATH}")
     _mod = importlib.util.module_from_spec(_spec)
     sys.modules[_MODULE_NAME] = _mod
     _spec.loader.exec_module(_mod)
@@ -87,7 +92,9 @@ def _stub_extract(monkeypatch, dataset: DailyOmniDataset, counter: list[int]) ->
     def fake_extract(video_path, *, audio_path, include_audio, **_kw):
         counter.append(1)
         frames = [Image.new("RGB", (16, 16), color=(i, i, i)) for i in range(_NUM_FRAMES)]
-        segments = [np.zeros(1600, dtype=np.float32) for _ in range(_NUM_FRAMES)] if include_audio else []
+        segments: list[np.ndarray] = (
+            [np.zeros(1600, dtype=np.float32) for _ in range(_NUM_FRAMES)] if include_audio else []
+        )
         return frames, segments
 
     monkeypatch.setattr(dataset, "_extract_minicpm_frame_audio_segments", fake_extract)

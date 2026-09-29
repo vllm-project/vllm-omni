@@ -9,6 +9,8 @@ import torch
 import torch.distributed as dist
 from vllm.logger import init_logger
 
+from vllm_omni.diffusion.distributed.parallel_state import get_world_group
+
 logger = init_logger(__name__)
 
 
@@ -43,10 +45,10 @@ class DistributedVaeExecutor:
     """
 
     def __init__(self):
-        # VAE tiles are scheduled across the complete worker WORLD.
-        self.group = None
-        self.world_size = dist.get_world_size()
-        self.rank = dist.get_rank()
+        # Use a dedicated process group spanning the complete worker WORLD.
+        self.group = get_world_group().device_group
+        self.world_size = dist.get_world_size(self.group)
+        self.rank = dist.get_rank(self.group)
         self.parallel_size = 1
         self.parallel_mode = "tile"
 

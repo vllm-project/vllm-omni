@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """Investigation tests for the num_stale_output_tokens drain (59b9e719).
 
@@ -89,7 +89,7 @@ def _make_drain_sched(session: Request) -> MagicMock:
     sched = MagicMock()
     sched.requests = {session.request_id: session}
     sched.perf_metrics = None
-    sched.structured_output_manager.should_advance.return_value = False
+    sched.structured_output_manager.accept_tokens.return_value = True
     sched._update_request_with_output.return_value = ([42], False)
     sched._process_kv_transfer_trigger.return_value = False
     sched.chunk_transfer_adapter = MagicMock()
@@ -100,6 +100,7 @@ def _make_drain_sched(session: Request) -> MagicMock:
     sched.pending_stop_after_extraction = set()
     sched.connector = None
     sched.kv_cache_manager.take_events.return_value = None
+    sched.kv_cache_manager.estimate_cached_tokens.return_value = 0
     sched.finished_req_ids_dict = {}
     sched.make_stats.return_value = None
     return sched
@@ -141,13 +142,16 @@ def test_exact_drain_delivers_new_segment_frame() -> None:
     session.num_computed_tokens = 6
     session.num_output_placeholders = 1
     session.num_in_flight_tokens = 1
+    session.async_tokens_to_discard = 1
 
     _replace_streaming_session(session)
     assert session.num_stale_output_tokens == 1
+    assert session.async_tokens_to_discard == 1
 
     sched = _make_drain_sched(session)
     assert _run_step(sched, session, num_scheduled=1, token=42) is False  # late frame dropped
     assert session.num_stale_output_tokens == 0
+    assert session.async_tokens_to_discard == 0
     assert _run_step(sched, session, num_scheduled=1, token=43) is True  # new segment survives
 
 

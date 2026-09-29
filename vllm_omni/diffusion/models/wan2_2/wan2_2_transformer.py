@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import math
 from collections.abc import Iterable
@@ -18,7 +18,7 @@ from vllm.distributed import (
 )
 from vllm.logger import init_logger
 from vllm.model_executor.layers.conv import Conv3dLayer
-from vllm.model_executor.layers.linear import ColumnParallelLinear, QKVParallelLinear, RowParallelLinear
+from vllm.model_executor.layers.linear import ColumnParallelLinear, LinearBase, QKVParallelLinear, RowParallelLinear
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.utils import (
@@ -29,7 +29,7 @@ from vllm.model_executor.models.utils import (
 )
 from vllm.sequence import IntermediateTensors
 
-from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
+from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata, VideoTokenLayout
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.distributed.parallel_state import (
     get_pipeline_parallel_world_size,
@@ -45,6 +45,7 @@ from vllm_omni.diffusion.layers.adalayernorm import AdaLayerNorm
 from vllm_omni.diffusion.layers.norm import LayerNorm, RMSNorm
 from vllm_omni.diffusion.layers.rope import RotaryEmbeddingWan
 from vllm_omni.platforms import current_omni_platform
+from vllm_omni.quantization.mxfp4_config import NPUMxfp4LinearMethod
 
 logger = init_logger(__name__)
 
@@ -416,8 +417,27 @@ class WanSelfAttention(nn.Module):
             softmax_scale=1.0 / (head_dim**0.5),
             causal=False,
             role="self",
+            qkv_layout="BSND",
             prefix=prefix,
         )
+
+        # FastVideo VSA checkpoints may add a learned projection that gates
+        # the compressed global branch. Zero initialization makes checkpoints
+        # without these weights sparse-only, with no user-facing mode switch.
+        self.to_gate_compress: ColumnParallelLinear | None = None
+        if self.attn.attn_backend.get_name() == "FASTVIDEO_VSA":
+            self.to_gate_compress = ColumnParallelLinear(
+                dim,
+                self.inner_dim,
+                bias=True,
+                gather_output=False,
+                return_bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.to_gate_compress" if prefix else "to_gate_compress",
+            )
+            nn.init.zeros_(self.to_gate_compress.weight)
+            if self.to_gate_compress.bias is not None:
+                nn.init.zeros_(self.to_gate_compress.bias)
 
     def forward(
         self,
@@ -440,6 +460,15 @@ class WanSelfAttention(nn.Module):
         query = query.unflatten(2, (self.num_heads, self.head_dim))
         key = key.unflatten(2, (self.num_kv_heads, self.head_dim))
         value = value.unflatten(2, (self.num_kv_heads, self.head_dim))
+
+        if self.to_gate_compress is not None:
+            gate_result = self.to_gate_compress(hidden_states)
+            gate_compress = gate_result[0] if isinstance(gate_result, tuple) else gate_result
+            gate_compress = gate_compress.unflatten(2, (self.num_heads, self.head_dim))
+            if attn_metadata is None:
+                attn_metadata = AttentionMetadata(extra={"gate_compress": gate_compress})
+            else:
+                attn_metadata.extra["gate_compress"] = gate_compress
 
         # Apply rotary embeddings
         if rotary_emb is not None:
@@ -581,8 +610,8 @@ class WanCrossAttention(nn.Module):
             qkv_layout="BSND",
             prefix=prefix,
             skip_sequence_parallel=True,
-            # Wan2.2 cross-attn operates on short text-encoder sequences; per-block
-            # FP8 quant offers no perf win and degrades quality. Opt out until a
+            # Wan2.2 cross-attn operates on short text-encoder sequences; runtime
+            # Q/K/V quantization offers no perf win and degrades quality. Opt out until a
             # dedicated quant backend handles this case.
             disable_kv_quant=True,
         )
@@ -709,6 +738,8 @@ class WanTransformerBlock(nn.Module):
         temb: torch.Tensor,
         rotary_emb: tuple[torch.Tensor, torch.Tensor],
         hidden_states_mask: torch.Tensor | None = None,
+        vsa_dit_seq_shape: tuple[int, int, int] | None = None,
+        preserve_vsa_all_blocks: bool = False,
     ) -> torch.Tensor:
         if temb.ndim == 4:
             # temb: batch_size, seq_len, 6, inner_dim (wan2.2 ti2v)
@@ -729,7 +760,20 @@ class WanTransformerBlock(nn.Module):
 
         # 1. Self-attention
         norm_hidden_states = self.norm1(hidden_states, scale_msa, shift_msa).type_as(hidden_states)
-        self_attn_metadata = AttentionMetadata(attn_mask=hidden_states_mask)
+        self_attn_extra = {}
+        if vsa_dit_seq_shape is not None:
+            self_attn_extra["vsa_dit_seq_shape"] = vsa_dit_seq_shape
+        if preserve_vsa_all_blocks:
+            self_attn_extra["preserve_vsa_all_blocks"] = True
+        video_layout = None
+        if vsa_dit_seq_shape is not None:
+            grid = tuple(int(dim) for dim in vsa_dit_seq_shape)
+            # Publish geometry independently of backend selection. Do not add
+            # partial cu_seqlens/max_seqlen metadata to dense CUDA attention.
+            video_layout = VideoTokenLayout(prefix_len=0, latent_grid=grid, used_len=math.prod(grid))
+        self_attn_metadata = AttentionMetadata(
+            attn_mask=hidden_states_mask, extra=self_attn_extra, video_layout=video_layout
+        )
         attn_output = self.attn1(norm_hidden_states, rotary_emb, self_attn_metadata)
         hidden_states = (hidden_states + attn_output * gate_msa).type_as(hidden_states)
 
@@ -910,6 +954,9 @@ class WanTransformer3DModel(nn.Module):
             pos_embed_seq_len=pos_embed_seq_len,
         )
 
+        # DMD/FastVideo checkpoints retain VSA semantics when top-k selects every block.
+        self.preserve_vsa_all_blocks = False
+
         # 3. Transformer blocks — partitioned across PP stages via vLLM's `make_layers`.
         # It computes the [start_layer, end_layer) slice for this rank and fills the remaining slots
         # with PPMissingLayer so that weight names stay globally consistent.
@@ -948,6 +995,68 @@ class WanTransformer3DModel(nn.Module):
         # ROPE helper
         self._cached_rope_emb = None
         self._cached_rope_resolution = None
+        self._validate_w4a8_fallback_layers(quant_config)
+
+    def _validate_w4a8_fallback_layers(self, quant_config: QuantizationConfig | None) -> None:
+        """Reject checkpoint aliases/typos before loading weights or running inference."""
+        requested = tuple(getattr(quant_config, "w4a8_fallback_layers", []))
+        self._w4a8_fallback_layers = requested
+        self._local_w4a8_fallback_layers: tuple[str, ...] = ()
+        if not requested:
+            return
+        modules = dict(self.named_modules())
+        missing_pp_prefixes = [name for name, module in modules.items() if isinstance(module, PPMissingLayer)]
+        local_layers = [
+            name for name in requested if not any(name.startswith(prefix + ".") for prefix in missing_pp_prefixes)
+        ]
+        self._local_w4a8_fallback_layers = tuple(local_layers)
+        invalid = [name for name in local_layers if not isinstance(modules.get(name), LinearBase)]
+        if invalid:
+            raise ValueError(
+                "w4a8_fallback_layers requires exact runtime Linear paths relative to each Wan transformer; "
+                f"unknown/non-Linear paths: {invalid}. Use attn1.to_qkv for fused self-attention, "
+                "not checkpoint attn1.to_q/to_k/to_v names."
+            )
+
+    def _log_w4a8_fallback_load_summary(self, component_name: str) -> None:
+        """Log post-load transforms/cache readiness, not numerical acceptance."""
+        requested = self._w4a8_fallback_layers
+        if not requested:
+            return
+        modules = dict(self.named_modules())
+        local_layers = self._local_w4a8_fallback_layers
+        selected_layers = [
+            name for name in local_layers if getattr(modules[name].quant_method, "is_w4a8_fallback_layer", False)
+        ]
+        bf16_overrides = [name for name in local_layers if name not in selected_layers]
+        processed = [
+            name
+            for name in selected_layers
+            if getattr(modules[name], "_already_called_process_weights_after_loading", False)
+        ]
+        if not selected_layers:
+            processing_state = "not-required"
+        elif len(processed) == len(selected_layers):
+            processing_state = "ready"
+        else:
+            processing_state = "not-ready"
+
+        def qualified(names: Iterable[str]) -> list[str]:
+            return [f"{component_name}.{name}" for name in names]
+
+        logger.info(
+            "Wan W4A8 post-load summary: component=%s; selected=%d %s; BF16 overrides=%d %s; "
+            "weight/A8 processing state=%s (%d/%d selected layers processed); other PP ranks=%d",
+            component_name,
+            len(selected_layers),
+            qualified(selected_layers),
+            len(bf16_overrides),
+            qualified(bf16_overrides),
+            processing_state,
+            len(processed),
+            len(selected_layers),
+            len(requested) - len(local_layers),
+        )
 
     @property
     def dtype(self) -> torch.dtype:
@@ -1044,8 +1153,19 @@ class WanTransformer3DModel(nn.Module):
             )
 
         # Transformer blocks
+        # Preserve the post-patch (T, H, W) grid so VSA can partition
+        # the flattened DiT sequence into spatiotemporal blocks.
+        vsa_dit_seq_shape = (post_patch_num_frames, post_patch_height, post_patch_width)
         for block in self.blocks[self.start_layer : self.end_layer]:
-            hidden_states = block(hidden_states, encoder_hidden_states, timestep_proj, rotary_emb, hidden_states_mask)
+            hidden_states = block(
+                hidden_states,
+                encoder_hidden_states,
+                timestep_proj,
+                rotary_emb,
+                hidden_states_mask,
+                vsa_dit_seq_shape,
+                self.preserve_vsa_all_blocks,
+            )
 
         if not is_pipeline_last_stage():
             # Non-last PP stage: hand the token sequence to the caller via IntermediateTensors.
@@ -1107,7 +1227,22 @@ class WanTransformer3DModel(nn.Module):
         }
 
         params_dict = dict(self.named_parameters())
+        single_scale_prefixes = {
+            name
+            for name, module in self.named_modules()
+            if isinstance(getattr(module, "quant_method", None), NPUMxfp4LinearMethod)
+        }
+
+        def reject_dualscale_tensor(name: str) -> None:
+            if name.endswith(".weight_dual_scale") and name.rsplit(".", 1)[0] in single_scale_prefixes:
+                raise ValueError(
+                    f"Single-scale mxfp4 cannot load DualScale tensor {name}; "
+                    "changing quant_method does not convert a checkpoint."
+                )
+
         loaded_params: set[str] = set()
+        loaded_qkv_shards: dict[str, set[str]] = {}
+        qkv_smooth_scales: dict[str, torch.Tensor] = {}
 
         for name, loaded_weight in weights:
             name = weight_name_remapping.get(name, name)
@@ -1118,15 +1253,32 @@ class WanTransformer3DModel(nn.Module):
             # Pre-fused to_qkv tensors (from offline MXFP8 merged checkpoint) fall
             # through to the else branch and are loaded directly.
             for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in original_name:
+                if f"{weight_name}." not in original_name:
                     continue
-                lookup_name = original_name.replace(weight_name, param_name)
+                lookup_name = original_name.replace(f"{weight_name}.", f"{param_name}.", 1)
+                reject_dualscale_tensor(lookup_name)
                 # Skip weights that belong to PP stages other than this one
                 if is_pp_missing_parameter(lookup_name, self) or lookup_name not in params_dict:
                     break
                 param = params_dict[lookup_name]
+                if lookup_name.endswith(".mul_scale"):
+                    previous_scale = qkv_smooth_scales.get(lookup_name)
+                    if previous_scale is not None and not torch.equal(previous_scale, loaded_weight):
+                        raise ValueError(f"Fused Q/K/V must share the same Smooth tensor: {lookup_name}")
+                    if previous_scale is None:
+                        qkv_smooth_scales[lookup_name] = loaded_weight.clone()
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
+                loaded_params.add(original_name)
+                if getattr(param, "output_dim", None) is None and not getattr(param, "needs_scalar_to_array", False):
+                    # Shared input-channel Smooth is a complete tensor even
+                    # when supplied under a single Q/K/V source name.
+                    loaded_params.add(lookup_name)
+                else:
+                    shards = loaded_qkv_shards.setdefault(lookup_name, set())
+                    shards.add(shard_id)
+                    if shards == {"q", "k", "v"}:
+                        loaded_params.add(lookup_name)
                 break
             else:
                 # diffusers: ffn.net.0.proj.weight -> our: ffn.net_0.proj.weight
@@ -1150,6 +1302,7 @@ class WanTransformer3DModel(nn.Module):
                 if is_pp_missing_parameter(lookup_name, self):
                     continue
 
+                reject_dualscale_tensor(lookup_name)
                 if lookup_name not in params_dict:
                     logger.warning(f"Skipping weight {original_name} -> {lookup_name}")
                     continue
@@ -1174,8 +1327,6 @@ class WanTransformer3DModel(nn.Module):
 
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
-
-            loaded_params.add(original_name)
-            loaded_params.add(lookup_name)
+                loaded_params.update((original_name, lookup_name))
 
         return loaded_params

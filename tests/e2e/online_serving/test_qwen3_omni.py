@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """
 E2E Online tests for Qwen3-Omni model with video input and audio output.
 """
@@ -21,27 +24,38 @@ _MODEL = "Qwen/Qwen3-Omni-30B-A3B-Instruct"
 _CI_DEPLOY = get_deploy_config_path("ci/qwen3_omni_moe.yaml")
 
 
-# For prefix caching checks against we enable it on the thinker and talker via CLI override
-# and enable prompt token details so that we can determine if any tokens were cached.
-# We also explicitly set block size so that we can make sure the cached token counts are a
-# multiple of the block size.
+# Prefix cache is opt-in on the deploy YAML. CI overlay also pins
+# ``async_chunk: False``; the existing server keeps ``--no-async-chunk``.
+# Production Qwen YAML is ``async_chunk: true``, so a sibling server boots
+# with ``--async-chunk`` and the same cache overrides (async output builder).
 BLOCK_SIZE = 16
+_PREFIX_CACHE_SERVER_ARGS = [
+    "--block-size",
+    str(BLOCK_SIZE),
+    "--stage-overrides",
+    '{"0": {"enable_prefix_caching": true}, "1": {"enable_prefix_caching": true}}',
+    "--enable-prompt-tokens-details",
+]
 test_params = [
     pytest.param(
         OmniServerParams(
             model=_MODEL,
             stage_config_path=_CI_DEPLOY,
             use_stage_cli=True,
-            server_args=[
-                "--no-async-chunk",
-                "--block-size",
-                str(BLOCK_SIZE),
-                "--stage-overrides",
-                '{"0": {"enable_prefix_caching": true}, "1": {"enable_prefix_caching": true}}',
-                "--enable-prompt-tokens-details",
-            ],
+            server_args=["--no-async-chunk", *_PREFIX_CACHE_SERVER_ARGS],
         ),
         id="default",
+    )
+]
+prefix_cache_async_chunk_params = [
+    pytest.param(
+        OmniServerParams(
+            model=_MODEL,
+            stage_config_path=_CI_DEPLOY,
+            use_stage_cli=True,
+            server_args=["--async-chunk", *_PREFIX_CACHE_SERVER_ARGS],
+        ),
+        id="prefix_cache_async_chunk",
     )
 ]
 
@@ -80,9 +94,16 @@ def get_max_batch_size(size_type="few"):
 @pytest.mark.core_model
 @pytest.mark.omni
 @pytest.mark.skipif(_USE_PD, reason="Temporarily skip PD mode in this test module.")
-@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=3 if _USE_PD else 2)
+@hardware_test(
+    res={"cuda": "H100", "rocm": "MI325", "npu": "A3"},
+    num_cards={
+        "cuda": 3 if _USE_PD else 2,
+        "rocm": 3 if _USE_PD else 2,
+        "npu": 3,
+    },
+)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
-def test_mix_to_text_audio_001(omni_server, openai_client) -> None:
+def test_mix_to_text_audio_001(omni_server, online_client) -> None:
     """
     Test multi-modal input processing and text/audio output generation via OpenAI API.
     Deploy Setting: default yaml
@@ -113,16 +134,23 @@ def test_mix_to_text_audio_001(omni_server, openai_client) -> None:
     }
 
     # Test single completion
-    openai_client.send_omni_request(request_config, request_num=get_max_batch_size())
+    online_client.send_omni_request(request_config, request_num=get_max_batch_size())
 
 
 @pytest.mark.advanced_model
 @pytest.mark.core_model
 @pytest.mark.omni
 @pytest.mark.skipif(_USE_PD, reason="Temporarily skip PD mode in this test module.")
-@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=3 if _USE_PD else 2)
+@hardware_test(
+    res={"cuda": "H100", "rocm": "MI325", "npu": "A3"},
+    num_cards={
+        "cuda": 3 if _USE_PD else 2,
+        "rocm": 3 if _USE_PD else 2,
+        "npu": 3,
+    },
+)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
-def test_text_to_text_001(omni_server, openai_client) -> None:
+def test_text_to_text_001(omni_server, online_client) -> None:
     """
     Test text input processing and text/audio output generation via OpenAI API.
     Deploy Setting: default yaml
@@ -140,18 +168,27 @@ def test_text_to_text_001(omni_server, openai_client) -> None:
         "key_words": {"text": ["beijing"]},
     }
 
-    openai_client.send_omni_request(request_config, request_num=get_max_batch_size())
+    online_client.send_omni_request(request_config, request_num=get_max_batch_size())
 
 
-def _run_prefix_cache_check(openai_client, request_config: dict):
+def _run_prefix_cache_check(online_client, request_config: dict):
     """Make two requests given a request config, and validate that:
     1. The second request actually had cached tokens
     2. The number of cached tokens is divisible by the block size used in
     test_params, because currently upstream vLLM does not cache partial
     blocks.
+    3. The first request also reports prompt token details; details must be
+    present whenever --enable-prompt-tokens-details is on, even when zero
+    tokens are cached. (An exact cached_tokens == 0 check would be
+    order-dependent here: the module-scoped server may have already cached
+    the shared system-prompt blocks from earlier tests.)
+
+    Returns the (first, second) responses for additional per-test assertions.
     """
-    openai_client.send_omni_request(request_config, request_num=1)[0]
-    cached_response = openai_client.send_omni_request(request_config, request_num=1)[0]
+    first_response = online_client.send_omni_request(request_config, request_num=1)[0]
+    cached_response = online_client.send_omni_request(request_config, request_num=1)[0]
+
+    assert first_response.cached_tokens is not None
 
     # Ensure that we have a prefix cache hit on the second request and that only the last
     # partial block is uncached (since currently we don't cache partial blocks).
@@ -163,13 +200,15 @@ def _run_prefix_cache_check(openai_client, request_config: dict):
     assert num_cached_tokens % BLOCK_SIZE == 0
     assert (num_cached_tokens + num_uncached_tokens) == num_prompt_tokens
 
+    return first_response, cached_response
+
 
 @pytest.mark.advanced_model
 @pytest.mark.core_model
 @pytest.mark.omni
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
-def test_thinker_prefix_caching_text_output(omni_server, openai_client) -> None:
+def test_thinker_prefix_caching_text_output(omni_server, online_client) -> None:
     """
     Test thinker prefix caching by sending identical requests with an image (i.e.,
     a large shared prefix) and verifying that the second request uses cached tokens
@@ -195,7 +234,10 @@ def test_thinker_prefix_caching_text_output(omni_server, openai_client) -> None:
         "stream": False,
         "modalities": ["text"],
     }
-    _run_prefix_cache_check(openai_client, request_config)
+    first_response, _ = _run_prefix_cache_check(online_client, request_config)
+
+    assert first_response.multimodal_tokens is not None
+    assert first_response.multimodal_tokens.get("image", 0) > 0
 
 
 @pytest.mark.advanced_model
@@ -203,7 +245,7 @@ def test_thinker_prefix_caching_text_output(omni_server, openai_client) -> None:
 @pytest.mark.omni
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
-def test_thinker_prefix_caching_audio_output(omni_server, openai_client) -> None:
+def test_thinker_prefix_caching_audio_output(omni_server, online_client) -> None:
     """
     Verify that thinker prefix caching does not hang when the request
     produces audio output (text + audio modalities).  Sends two identical
@@ -225,21 +267,101 @@ def test_thinker_prefix_caching_audio_output(omni_server, openai_client) -> None
         },
     }
 
-    _run_prefix_cache_check(openai_client, request_config)
+    _run_prefix_cache_check(online_client, request_config)
+
+
+def _assert_omni_payload_complete(resp) -> None:
+    """Async-chunk + prefix-cache must still deliver a full downstream payload."""
+    assert resp.success
+    assert resp.text_content
+    has_audio = bool(resp.audio_bytes) or bool(resp.audio_data)
+    assert has_audio
 
 
 @pytest.mark.advanced_model
 @pytest.mark.core_model
 @pytest.mark.omni
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+@pytest.mark.parametrize("omni_server", prefix_cache_async_chunk_params, indirect=True)
+def test_thinker_prefix_caching_async_chunk_identical(omni_server, online_client) -> None:
+    """Production path: ``async_chunk: true`` plus thinker/talker prefix cache.
+
+    Two identical streaming requests. The second must report a block-aligned
+    cache hit and still produce text + audio (async output builder).
+    """
+    messages = dummy_messages_from_mix_data(
+        system_prompt=get_system_prompt(),
+        content_text=get_prompt(),
+    )
+    request_config = {
+        "model": omni_server.model,
+        "messages": messages,
+        "stream": True,
+        "stream_options": {"include_usage": True},
+    }
+    first_response, cached_response = _run_prefix_cache_check(online_client, request_config)
+    _assert_omni_payload_complete(first_response)
+    _assert_omni_payload_complete(cached_response)
+
+
+@pytest.mark.advanced_model
+@pytest.mark.core_model
+@pytest.mark.omni
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+@pytest.mark.parametrize("omni_server", prefix_cache_async_chunk_params, indirect=True)
+def test_thinker_prefix_caching_async_chunk_shared_image_prefix(omni_server, online_client) -> None:
+    """Shared image / system prefix, different user text — not a full-prompt replay.
+
+    The second request must still hit cached tokens (block-aligned, less than
+    its prompt). A merge that only works when ``hit_upto == prompt_len`` would
+    fail this.
+    """
+    image_data_url = f"data:image/jpeg;base64,{generate_synthetic_image(224, 224)['base64']}"
+    first_messages = dummy_messages_from_mix_data(
+        system_prompt=get_system_prompt(),
+        image_data_url=image_data_url,
+        content_text=get_prompt("text_image"),
+    )
+    second_messages = dummy_messages_from_mix_data(
+        system_prompt=get_system_prompt(),
+        image_data_url=image_data_url,
+        content_text="How many squares are in this image? Answer in 20 words.",
+    )
+    first_cfg = {
+        "model": omni_server.model,
+        "messages": first_messages,
+        "stream": True,
+        "stream_options": {"include_usage": True},
+        "modalities": ["text"],
+    }
+    second_cfg = {**first_cfg, "messages": second_messages}
+    first_response = online_client.send_omni_request(first_cfg, request_num=1)[0]
+    cached_response = online_client.send_omni_request(second_cfg, request_num=1)[0]
+    assert first_response.success and cached_response.success
+    assert first_response.text_content and cached_response.text_content
+    num_cached = cached_response.cached_tokens
+    num_prompt = cached_response.prompt_tokens
+    assert num_cached is not None and num_prompt is not None
+    assert num_cached > 0
+    assert num_cached % BLOCK_SIZE == 0
+    assert num_cached < num_prompt
+
+
+@pytest.mark.advanced_model
+@pytest.mark.core_model
+@pytest.mark.omni
+@hardware_test(
+    res={"cuda": "H100", "rocm": "MI325", "npu": "A3"},
+    num_cards={"cuda": 2, "rocm": 2, "npu": 3},
+)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
-def test_completions_rejected_for_thinker_talker(omni_server, openai_client) -> None:
+def test_completions_rejected_for_thinker_talker(omni_server, online_client) -> None:
     """Ensure Thinker-talker models reject /v1/completions; we do this because the
     thinker-talker handoff implementations currently use ChatML <|im_start|> and
     <|im_end|> markers to segment the input sequence; when we don't have them,
     the talker does not get any embeddings, which breaks the server.
     """
-    responses = openai_client.send_completions_http_request(
+    responses = online_client.send_completions_http_request(
         {
             "json": {
                 "model": omni_server.model,
@@ -255,7 +377,10 @@ def test_completions_rejected_for_thinker_talker(omni_server, openai_client) -> 
 @pytest.mark.advanced_model
 @pytest.mark.core_model
 @pytest.mark.omni
-@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+@hardware_test(
+    res={"cuda": "H100", "rocm": "MI325", "npu": "A3"},
+    num_cards={"cuda": 2, "rocm": 2, "npu": 3},
+)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_batched_completions_text(omni_server, openai_client) -> None:
     """Ensure that we can make a batch chat completions request (text only)."""
@@ -285,7 +410,10 @@ def test_batched_completions_text(omni_server, openai_client) -> None:
 @pytest.mark.advanced_model
 @pytest.mark.core_model
 @pytest.mark.omni
-@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+@hardware_test(
+    res={"cuda": "H100", "rocm": "MI325", "npu": "A3"},
+    num_cards={"cuda": 2, "rocm": 2, "npu": 3},
+)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_batched_completions_audio_out(omni_server, openai_client) -> None:
     """Ensure that we can make a batch chat completions request (audio + text)."""
@@ -320,7 +448,10 @@ def test_batched_completions_audio_out(omni_server, openai_client) -> None:
 @pytest.mark.advanced_model
 @pytest.mark.core_model
 @pytest.mark.omni
-@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+@hardware_test(
+    res={"cuda": "H100", "rocm": "MI325", "npu": "A3"},
+    num_cards={"cuda": 2, "rocm": 2, "npu": 3},
+)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 @pytest.mark.parametrize(
     "sad_opts",

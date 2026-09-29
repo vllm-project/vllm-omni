@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from collections.abc import Iterable
 from functools import cached_property
 
@@ -139,11 +142,11 @@ class Qwen2_5OmniTalkerForConditionalGeneration(
         return self.language_model.sample(logits, sampling_metadata)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(
-            self,
-            skip_prefixes=["thinker.", "token2wav."],
+        loader = AutoWeightsLoader(self)
+        loaded = loader.load_weights(
+            weights,
+            mapper=(self.hf_to_vllm_mapper) | WeightsMapper(orig_to_new_prefix={"thinker.": None, "token2wav.": None}),
         )
-        loaded = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
         # Log load summary
         try:
             total_bytes = 0

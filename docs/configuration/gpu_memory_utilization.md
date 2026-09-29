@@ -80,19 +80,15 @@ When multiple stages share the same GPU, you must ensure the sum of their `gpu_m
 
 **Example: Two stages on GPU 0**
 ```yaml
-stage_args:
+stages:
   - stage_id: 0
-    runtime:
-      devices: "0"
-    engine_args:
-      gpu_memory_utilization: 0.6  # Uses 60% of GPU 0
+    devices: "0"
+    gpu_memory_utilization: 0.6  # Uses 60% of GPU 0
 
   - stage_id: 1
-    runtime:
-      devices: "0"
-    engine_args:
-      gpu_memory_utilization: 0.3  # Uses 30% of GPU 0
-      # Total: 90% of GPU 0 (safe, leaves 10% buffer)
+    devices: "0"
+    gpu_memory_utilization: 0.3  # Uses 30% of GPU 0
+    # Total: 90% of GPU 0 (safe, leaves 10% buffer)
 ```
 
 **Important:** If stages run on different GPUs, each can use up to 1.0 independently.
@@ -103,14 +99,12 @@ When using `tensor_parallel_size > 1`, the model is split across multiple GPUs, 
 
 **Example: 2-way tensor parallelism**
 ```yaml
-stage_args:
+stages:
   - stage_id: 0
-    runtime:
-      devices: "0,1"  # Uses both GPUs
-    engine_args:
-      tensor_parallel_size: 2
-      gpu_memory_utilization: 0.6  # 60% per GPU
-      # Model is split, so each GPU uses ~30% of model memory
+    devices: "0,1"  # Uses both GPUs
+    tensor_parallel_size: 2
+    gpu_memory_utilization: 0.6  # 60% per GPU
+    # Model is split, so each GPU uses ~30% of model memory
 ```
 
 ## Examples
@@ -118,27 +112,25 @@ stage_args:
 ### Qwen3-Omni-MoE on 2x H100-80GB
 
 ```yaml
-stage_args:
+base_config: /path/to/vllm_omni/deploy/qwen3_omni_moe.yaml
+
+stages:
   - stage_id: 0  # Thinker stage with TP=2
-    runtime:
-      devices: "0,1"
-    engine_args:
-      tensor_parallel_size: 2
-      gpu_memory_utilization: 0.6  # 48GB per GPU
+    devices: "0,1"
+    tensor_parallel_size: 2
+    gpu_memory_utilization: 0.6  # 48GB per GPU
 
   - stage_id: 1  # Talker stage
-    runtime:
-      devices: "1"
-    engine_args:
-      gpu_memory_utilization: 0.3  # 24GB on GPU 1
+    devices: "1"
+    gpu_memory_utilization: 0.3  # 24GB on GPU 1
 
   - stage_id: 2  # Code2Wav stage
-    runtime:
-      devices: "0"
-    engine_args:
-      gpu_memory_utilization: 0.1  # 8GB on GPU 0
+    devices: "0"
+    gpu_memory_utilization: 0.1  # 8GB on GPU 0
 ```
-**Note:** In this configuration, stages 0 and 2 share GPU 0, but they run at different times in the pipeline, so their memory usage doesn't overlap.
+**Note:** Stage 0 uses GPUs 0 and 1, so the combined utilization is `0.7` on
+GPU 0 and `0.9` on GPU 1. Keep the sum of all resident stages below `1.0` on
+each device.
 
 ## Troubleshooting
 

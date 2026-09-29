@@ -15,7 +15,6 @@ import imageio
 import numpy as np
 import torch
 
-from vllm_omni.diffusion.data import DiffusionParallelConfig
 from vllm_omni.diffusion.models.longcat_video.pipeline_longcat_video_avatar import (
     prepare_longcat_video_avatar_model_for_omni,
 )
@@ -236,14 +235,6 @@ def main():
         dtype="bfloat16",
         enforce_eager=args.enforce_eager,
         additional_config=additional_config,
-        parallel_config=DiffusionParallelConfig(
-            ulysses_degree=1,
-            ring_degree=1,
-            cfg_parallel_size=1,
-            tensor_parallel_size=1,
-            vae_patch_parallel_size=1,
-            pipeline_parallel_size=1,
-        ),
     )
 
     audio_input: str | dict[str, str] | None = args.audio

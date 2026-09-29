@@ -386,8 +386,8 @@ async def run_all(args):
         # argparse defaults do not silently override deploy YAML values.
         async_omni = AsyncOmni.from_cli_args(args, model=args.model)
 
-        # Use default sampling params from stage config (they are pre-configured
-        # in the YAML for each stage).
+        # Use default sampling params from the resolved pipeline and deploy
+        # config.
         #
         # NOTE: Since we do not set the sampling params directly, .generate in
         # will automatically set the output kind to delta, since this is what

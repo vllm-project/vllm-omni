@@ -1,14 +1,671 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-"""Unit tests for LTX-2.3 VAE tiling and distributed decode behavior."""
+"""Unit tests for LTX video VAE tiling and distributed decode behavior."""
 
+from collections.abc import Callable
+from dataclasses import dataclass
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 import torch
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+@pytest.mark.parametrize("initial_deterministic", [False, True])
+@pytest.mark.parametrize("fail", [False, True])
+def test_ltx_vocoder_deterministic_context(monkeypatch, initial_deterministic, fail):
+    from vllm_omni.diffusion.models.ltx2.ltx2_runtime import _deterministic_ltx_vocoder
+
+    monkeypatch.setattr(torch.backends.cudnn, "deterministic", initial_deterministic)
+    if torch.backends.cudnn.is_available():
+        monkeypatch.setattr(torch.backends.cudnn, "benchmark_limit", 17)
+    settings = {
+        name: getattr(torch.backends.cudnn, name) for name in ("enabled", "benchmark", "benchmark_limit", "allow_tf32")
+    }
+    try:
+        with _deterministic_ltx_vocoder():
+            assert torch.backends.cudnn.deterministic
+            assert {name: getattr(torch.backends.cudnn, name) for name in settings} == settings
+            if fail:
+                raise RuntimeError("injected failure")
+    except RuntimeError as exc:
+        assert fail and str(exc) == "injected failure"
+    assert torch.backends.cudnn.deterministic == initial_deterministic
+    assert {name: getattr(torch.backends.cudnn, name) for name in settings} == settings
+
+
+@dataclass(frozen=True)
+class _OperatorSetProbe:
+    fna: Callable[..., torch.Tensor] | None
+
+
+@dataclass
+class _AttentionProbe:
+    kernel_size: tuple[int, int, int]
+    head_dim: int
+    to_out: tuple[torch.nn.Module, ...]
+    projected: torch.Tensor
+
+    def project_qkv(self, _hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return self.projected, self.projected, self.projected
+
+
+def test_ltx_base_vocoder_keeps_native_dtype(monkeypatch):
+    import vllm_omni.diffusion.models.ltx2.ltx2_runtime as ltx_runtime
+
+    class FakeBaseVocoder(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.input_dtype = None
+
+        def forward(self, value):
+            self.input_dtype = value.dtype
+            return value
+
+    monkeypatch.setattr(
+        ltx_runtime.torch,
+        "autocast",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("base vocoder must not use autocast")),
+    )
+    vocoder = FakeBaseVocoder()
+
+    output = ltx_runtime._run_ltx_vocoder(vocoder, torch.ones(1, dtype=torch.bfloat16))
+
+    assert vocoder.input_dtype == torch.bfloat16
+    assert output.dtype == torch.bfloat16
+
+
+class TestLTXDiffusionDecoder:
+    def test_diffusion_decoder_reuses_diffusers_with_scoped_overrides(self, monkeypatch):
+        from diffusers.models.autoencoders.ltx2_diffusion_decoder import (
+            LTX2VideoDiffusionDecoderModel as DiffusersModel,
+        )
+
+        from vllm_omni.diffusion.models.ltx2.vae.decoder import (
+            LTX2VideoDiffusionDecoderModel,
+            LTX2VideoVaeDiffusionNABlock,
+            LTX2VideoVaeNeighborhoodAttention,
+            LTX2VideoVaeSwiGLU,
+        )
+
+        original_init = DiffusersModel.__init__
+        original_parameters = {}
+
+        def capture_parameters(self, *args, **kwargs):
+            original_init(self, *args, **kwargs)
+            original_parameters.update(self.named_parameters())
+
+        with torch.device("meta"):
+            reference = DiffusersModel()
+            monkeypatch.setattr(DiffusersModel, "__init__", capture_parameters)
+            model = LTX2VideoDiffusionDecoderModel()
+        assert isinstance(model, DiffusersModel)
+        assert all(parameter is original_parameters[name] for name, parameter in model.named_parameters())
+        assert {name: tensor.shape for name, tensor in model.state_dict().items()} == {
+            name: tensor.shape for name, tensor in reference.state_dict().items()
+        }
+
+        modules = tuple(model.decoder.modules())
+        expected_blocks = sum(model.config.decoder_stage_depths)
+        assert sum(isinstance(module, LTX2VideoVaeNeighborhoodAttention) for module in modules) == expected_blocks
+        assert sum(isinstance(module, LTX2VideoVaeSwiGLU) for module in modules) == expected_blocks
+        assert (
+            sum(isinstance(module, LTX2VideoVaeDiffusionNABlock) for module in modules)
+            == model.config.decoder_stage_depths[-1]
+        )
+
+        assert type(model.decoder).__module__.startswith("vllm_omni.")
+        assert model.tiled_decode.__func__ is DiffusersModel.tiled_decode
+        assert type(reference.decoder) is type(model.decoder).__bases__[0]
+
+    def test_natten_processor_routes_stage5_through_tilelang_fna(self, monkeypatch):
+        from vllm_omni.diffusion.models.ltx2.vae import decoder as diffvae_modules
+
+        processor = object.__new__(diffvae_modules.LTX2VideoVaeNeighborhoodNattenProcessor)
+        processor.backend = None
+        fallback_calls = []
+        processor._na3d = lambda *args, **kwargs: fallback_calls.append((args, kwargs))
+
+        hidden_states = torch.randn(1, 11, 11, 11, 256, dtype=torch.bfloat16)
+        projected = hidden_states.view(1, 11, 11, 11, 4, 64)
+
+        class FakeAttention:
+            kernel_size = (11, 11, 11)
+            head_dim = 64
+            to_out = (torch.nn.Identity(),)
+
+            @staticmethod
+            def project_qkv(_hidden_states):
+                return projected, projected, projected
+
+        def token_permute(value, _tile, *, flip_tiled_dims):
+            assert flip_tiled_dims
+            return value, value.shape, None
+
+        def token_unpermute(value, *, token_layout_shape, tile_shape, flip_tiled_dims):
+            assert token_layout_shape == projected.shape
+            assert tile_shape == (4, 4, 4)
+            assert flip_tiled_dims
+            return value
+
+        fast_path_calls = []
+
+        def fast_path(query, key, value, *, shape, window):
+            fast_path_calls.append((query, key, value, shape, window))
+            return query
+
+        monkeypatch.setattr(diffvae_modules, "is_ltx2_fna_eligible", lambda _tensor: True)
+        monkeypatch.setattr(
+            diffvae_modules, "resolve_ltx2_vae_operators", lambda _device: _OperatorSetProbe(fna=fast_path)
+        )
+        monkeypatch.setattr(
+            diffvae_modules,
+            "_load_natten_token_permutation",
+            lambda: (token_permute, token_unpermute),
+        )
+
+        output = processor(FakeAttention(), hidden_states)
+
+        assert torch.equal(output, hidden_states)
+        assert len(fast_path_calls) == 1
+        assert fast_path_calls[0][3:] == ((11, 11, 11), (11, 11, 11))
+        assert not fallback_calls
+
+    @pytest.mark.parametrize("reason", ["device", "head_dim", "channels", "dtype", "tilelang_missing", "kernel"])
+    def test_natten_processor_keeps_natten_when_fast_path_does_not_apply(self, monkeypatch, reason):
+        from vllm_omni.diffusion.models.ltx2.vae import decoder as ops
+
+        processor = object.__new__(ops.LTX2VideoVaeNeighborhoodNattenProcessor)
+        processor.backend = None
+        channels = 128 if reason == "channels" else 256
+        head_dim = 32 if reason == "head_dim" else 64
+        x = torch.zeros(1, 11, 11, 11, channels, dtype=torch.float32 if reason == "dtype" else torch.bfloat16)
+        projected = x.view(1, 11, 11, 11, channels // head_dim, head_dim)
+        attn = _AttentionProbe(
+            kernel_size=(3, 5, 5) if reason == "kernel" else (11, 11, 11),
+            head_dim=head_dim,
+            to_out=(torch.nn.Identity(),),
+            projected=projected,
+        )
+        calls = []
+
+        def natten(q, k, v, **kwargs):
+            calls.append(kwargs)
+            return q
+
+        def unexpected_native_load(*_args, **_kwargs):
+            raise AssertionError("Native FNA must not be loaded for an unsupported configuration")
+
+        processor._na3d = natten
+        monkeypatch.setattr(ops, "is_ltx2_fna_eligible", lambda _tensor: reason != "device")
+        monkeypatch.setattr(
+            ops,
+            "resolve_ltx2_vae_operators",
+            lambda _device: _OperatorSetProbe(fna=None if reason == "tilelang_missing" else unexpected_native_load),
+        )
+        assert torch.equal(processor(attn, x), x)
+        assert calls == [{"kernel_size": attn.kernel_size, "scale": 1.0, "backend": None}]
+
+    def test_diffusion_decoder_noneligible_block_uses_diffusers_forward(self, monkeypatch):
+        from vllm_omni.diffusion.models.ltx2.vae import decoder as diffvae_modules
+
+        block = object.__new__(diffvae_modules.LTX2VideoVaeDiffusionNABlock)
+        torch.nn.Module.__init__(block)
+        expected = torch.randn(1, 1, 1, 1, 1)
+        calls = []
+
+        def upstream_forward(_self, hidden_states, latent_context, modulation, block_mask):
+            assert block_mask is None
+            calls.append((hidden_states, latent_context, modulation))
+            return expected
+
+        monkeypatch.setattr(
+            diffvae_modules.diffusers_decoder.LTX2VideoVaeDiffusionNABlock,
+            "forward",
+            upstream_forward,
+        )
+        hidden_states = torch.randn(1, 1, 1, 1, 1)
+        latent_context = torch.randn_like(hidden_states)
+        modulation = (torch.randn_like(hidden_states),)
+
+        assert block.forward(hidden_states, latent_context, modulation) is expected
+        assert calls == [(hidden_states, latent_context, modulation)]
+
+    @pytest.mark.parametrize("mode", ["spatial_shard_height", "spatial_shard_width"])
+    def test_distributed_diffusion_decoder_rejects_non_tile_parallel_modes(self, mode):
+        from vllm_omni.diffusion.models.ltx2.vae.distributed import (
+            DistributedLTX2VideoDiffusionDecoderModel,
+        )
+
+        model = object.__new__(DistributedLTX2VideoDiffusionDecoderModel)
+        torch.nn.Module.__init__(model)
+        model.distributed_executor = SimpleNamespace(set_parallel_size=lambda *_args, **_kwargs: None)
+
+        with pytest.raises(ValueError, match="only supports vae_parallel_mode='tile'"):
+            model.set_parallel_size(2, mode=mode)
+
+    def test_distributed_diffusion_decoder_accepts_tile_parallel_mode(self):
+        from vllm_omni.diffusion.models.ltx2.vae.distributed import (
+            DistributedLTX2VideoDiffusionDecoderModel,
+        )
+
+        calls = []
+        model = object.__new__(DistributedLTX2VideoDiffusionDecoderModel)
+        torch.nn.Module.__init__(model)
+        model.distributed_executor = SimpleNamespace(
+            set_parallel_size=lambda parallel_size, mode: calls.append((parallel_size, mode))
+        )
+
+        model.set_parallel_size(4, mode="tile")
+
+        assert calls == [(4, "tile")]
+
+    def test_short_clip_keeps_stage5_temporal_context_then_crops_output(self):
+        from vllm_omni.diffusion.models.ltx2.vae.decoder import (
+            LTX2VideoDiffusionDecoder3d,
+            LTX2VideoDiffusionDecoderModel,
+        )
+
+        class IdentityAttention:
+            def build_block_mask(self, _hidden_states):
+                return None
+
+        class IdentityBlock(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.attn = IdentityAttention()
+
+            def forward(self, hidden_states, _block_mask):
+                return hidden_states
+
+        class IdentityUpsample(torch.nn.Module):
+            def forward(self, hidden_states, *, drop_leading_frame):
+                assert drop_leading_frame
+                return hidden_states
+
+        decoder = object.__new__(LTX2VideoDiffusionDecoder3d)
+        torch.nn.Module.__init__(decoder)
+        decoder.det_stages = torch.nn.ModuleList([torch.nn.ModuleList([IdentityBlock()])])
+        decoder.upsamples = torch.nn.ModuleList([IdentityUpsample()])
+        decoder.trailing_pad_latent_frames = 2
+        decoder.temporal_compression_ratio = 8
+        decoder.stage5_kernel = (11, 3, 3)
+
+        # 17 frames contain one real frame followed by 16 propagated ghost
+        # frames. The reference keeps 11 for stage-5 NATTEN instead of
+        # cropping the tensor immediately back to one.
+        context = decoder.forward_stage_4(torch.zeros(1, 17, 3, 3, 4))
+        assert context.shape == (1, 11, 3, 3, 4)
+
+        class FakeDecoder(torch.nn.Module):
+            def forward(self, z, *, generator, num_inference_steps):
+                assert generator is None
+                assert num_inference_steps is None
+                return torch.zeros(z.shape[0], 3, 11, z.shape[3] * 2, z.shape[4] * 2)
+
+        model = object.__new__(LTX2VideoDiffusionDecoderModel)
+        torch.nn.Module.__init__(model)
+        model.decoder = FakeDecoder()
+        model.use_tiling = False
+        model.tile_sample_min_num_frames = 80
+        model.tile_sample_min_height = 768
+        model.tile_sample_min_width = 768
+        model.temporal_compression_ratio = 8
+        model.spatial_compression_ratio = 2
+
+        output = model.decode(torch.zeros(1, 4, 1, 2, 3), generator=None, return_dict=False)[0]
+        assert output.shape == (1, 3, 1, 4, 6)
+
+    @pytest.mark.parametrize(
+        ("model_version", "extras", "expected"),
+        [
+            ("2.5", {}, True),
+            ("2.5", {"ltx2_use_conv_vae": True}, False),
+            ("2.3", {}, False),
+        ],
+    )
+    def test_ltx25_diffusion_decoder_is_default_with_conv_vae_opt_in(self, model_version, extras, expected):
+        from vllm_omni.diffusion.models.ltx2.ltx2_components import _ltx2_use_diffusion_decoder
+
+        assert _ltx2_use_diffusion_decoder(SimpleNamespace(extras=extras), model_version) is expected
+
+    def test_conv_vae_opt_in_rejects_non_boolean_model_extra(self):
+        from vllm_omni.diffusion.models.ltx2.ltx2_components import _ltx2_use_diffusion_decoder
+
+        with pytest.raises(TypeError, match="ltx2_use_conv_vae"):
+            _ltx2_use_diffusion_decoder(SimpleNamespace(extras={"ltx2_use_conv_vae": "true"}), "2.5")
+
+    def test_native_diffusion_decoder_conversion_splits_qkv_and_folds_gates(self):
+        from vllm_omni.diffusion.models.ltx2.vae.decoder import (
+            convert_ltx25_native_diffusion_decoder_state_dict,
+        )
+
+        qkv_weight = torch.arange(24, dtype=torch.float32).reshape(6, 4)
+        qkv_bias = torch.arange(6, dtype=torch.float32)
+        projection_weight = torch.arange(4, dtype=torch.float32).reshape(2, 2)
+        projection_bias = torch.ones(2)
+        gate = torch.tensor([2.0, 3.0])
+        mean = torch.tensor([0.1, 0.2])
+        std = torch.tensor([0.3, 0.4])
+        native = {
+            "encoder.ignored": torch.ones(1),
+            "per_channel_statistics.mean-of-means": mean,
+            "vae.per_channel_statistics.std-of-means": std,
+            "decoder.type_emb": torch.ones(2),
+            "decoder.coarse_head.weight": torch.ones(1),
+            "decoder.det_stages.0.0.attn.qkv.weight": qkv_weight,
+            "decoder.det_stages.0.0.attn.qkv.bias": qkv_bias,
+            "decoder.det_stages.0.0.attn.q_norm.weight": torch.tensor([5.0, 6.0]),
+            "decoder.det_stages.0.0.attn.k_norm.weight": torch.tensor([7.0, 8.0]),
+            "decoder.diff_blocks.0.attn.proj.weight": projection_weight,
+            "decoder.diff_blocks.0.attn.proj.bias": projection_bias,
+            "decoder.diff_blocks.0.gate_msa": gate,
+            "vae.decoder.t_embedder.mlp.0.weight": torch.ones(2, 2),
+        }
+
+        converted = convert_ltx25_native_diffusion_decoder_state_dict(native)
+
+        torch.testing.assert_close(converted["latents_mean"], mean)
+        torch.testing.assert_close(converted["latents_std"], std)
+        torch.testing.assert_close(converted["decoder.det_stages.0.0.attn.to_q.weight"], qkv_weight[:2])
+        torch.testing.assert_close(converted["decoder.det_stages.0.0.attn.to_k.weight"], qkv_weight[2:4])
+        torch.testing.assert_close(converted["decoder.det_stages.0.0.attn.to_v.weight"], qkv_weight[4:])
+        torch.testing.assert_close(converted["decoder.det_stages.0.0.attn.to_q.bias"], qkv_bias[:2])
+        torch.testing.assert_close(converted["decoder.det_stages.0.0.attn.to_k.bias"], qkv_bias[2:4])
+        torch.testing.assert_close(converted["decoder.det_stages.0.0.attn.to_v.bias"], qkv_bias[4:])
+        torch.testing.assert_close(converted["decoder.det_stages.0.0.attn.norm_q.weight"], torch.tensor([5.0, 6.0]))
+        torch.testing.assert_close(converted["decoder.det_stages.0.0.attn.norm_k.weight"], torch.tensor([7.0, 8.0]))
+        torch.testing.assert_close(
+            converted["decoder.diff_blocks.0.attn.to_out.0.weight"], gate.unsqueeze(1) * projection_weight
+        )
+        torch.testing.assert_close(converted["decoder.diff_blocks.0.attn.to_out.0.bias"], gate * projection_bias)
+        assert "decoder.t_embedder.timestep_embedder.linear_1.weight" in converted
+        assert not any("type_emb" in key or "coarse" in key or "gate_msa" in key for key in converted)
+
+    def test_native_diffusion_decoder_conversion_rejects_invalid_fused_qkv(self):
+        from vllm_omni.diffusion.models.ltx2.vae.decoder import (
+            convert_ltx25_native_diffusion_decoder_state_dict,
+        )
+
+        with pytest.raises(ValueError, match="not divisible by 3"):
+            convert_ltx25_native_diffusion_decoder_state_dict(
+                {"decoder.det_stages.0.0.attn.qkv.weight": torch.ones(5, 2)}
+            )
+
+    def test_decode_uses_diffusion_decoder_without_conv_vae_conditioning(self):
+        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2 import LTX2Pipeline
+
+        seen = {}
+
+        class ConvVae:
+            dtype = torch.float32
+            config = SimpleNamespace(timestep_conditioning=True)
+
+            def decode(self, *_args, **_kwargs):
+                raise AssertionError("the convolutional VAE decoder must not run")
+
+        class DiffusionDecoder:
+            dtype = torch.float32
+
+            def decode(self, latents, *, generator, return_dict):
+                seen["latents"] = latents
+                seen["generator"] = generator
+                seen["return_dict"] = return_dict
+                return (latents + 1,)
+
+        class AudioVae:
+            dtype = torch.float32
+
+            def decode(self, audio_latents, *, return_dict):
+                assert return_dict is False
+                return (audio_latents + 2,)
+
+        class VideoProcessor:
+            def postprocess_video(self, video, *, output_type):
+                seen["output_type"] = output_type
+                return video
+
+        pipe = object.__new__(LTX2Pipeline)
+        torch.nn.Module.__init__(pipe)
+        pipe.use_diffusion_decoder = True
+        pipe.vae = ConvVae()
+        pipe.diffusion_decoder = DiffusionDecoder()
+        pipe.audio_vae = AudioVae()
+        pipe.vocoder = torch.nn.Identity()
+        pipe.video_processor = VideoProcessor()
+
+        generator = torch.Generator().manual_seed(123)
+        latents = torch.ones(1, 1)
+        output = pipe._decode_output(
+            latents=latents,
+            audio_latents=torch.ones(1, 1),
+            output_type="pt",
+            connector_prompt_embeds=torch.ones(1, 1),
+            generator=generator,
+            device=torch.device("cpu"),
+            decode_timestep=0.7,
+            decode_noise_scale=0.5,
+            prompt_batch_size=1,
+        )
+
+        torch.testing.assert_close(seen["latents"], latents)
+        assert seen["generator"] is generator
+        assert seen["return_dict"] is False
+        assert seen["output_type"] == "pt"
+        torch.testing.assert_close(output.output[0], latents + 1)
+        torch.testing.assert_close(output.output[1], torch.full((1, 1), 3.0))
+
+    def test_diffusion_decode_denormalizes_with_decoder_statistics(self):
+        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2 import LTX2Pipeline
+
+        pipe = object.__new__(LTX2Pipeline)
+        torch.nn.Module.__init__(pipe)
+        pipe.use_diffusion_decoder = True
+        pipe.transformer_spatial_patch_size = 1
+        pipe.transformer_temporal_patch_size = 1
+        pipe.vae = SimpleNamespace(
+            latents_mean=torch.full((2,), 100.0),
+            latents_std=torch.full((2,), 10.0),
+            config=SimpleNamespace(scaling_factor=1.0),
+        )
+        pipe.diffusion_decoder = SimpleNamespace(
+            latents_mean=torch.tensor([10.0, 20.0]),
+            latents_std=torch.tensor([2.0, 4.0]),
+            config=SimpleNamespace(scaling_factor=2.0),
+        )
+        pipe.audio_vae = SimpleNamespace(
+            latents_mean=torch.tensor(0.0),
+            latents_std=torch.tensor(1.0),
+        )
+        forward_ctx = SimpleNamespace(
+            latent_num_frames=1,
+            latent_height=1,
+            latent_width=1,
+            original_audio_num_frames=1,
+            latent_mel_bins=2,
+        )
+
+        video, audio = pipe._unpack_and_denormalize_stage(
+            forward_ctx,
+            torch.tensor([[[1.0, 2.0]]]),
+            torch.zeros(1, 1, 2),
+        )
+
+        torch.testing.assert_close(video.flatten(), torch.tensor([11.0, 24.0]))
+        torch.testing.assert_close(audio, torch.zeros(1, 1, 1, 2))
+
+    def test_non_output_rank_does_not_enter_diffusion_decoder(self, monkeypatch):
+        import vllm_omni.diffusion.models.ltx2.ltx2_runtime as ltx_runtime
+        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2 import LTX2Pipeline
+
+        class ConvVae:
+            config = SimpleNamespace(timestep_conditioning=False)
+
+            def is_distributed_enabled(self):
+                raise AssertionError("DiffVAE decode must not inspect ConvVAE collectives")
+
+        class DiffusionDecoder:
+            dtype = torch.float32
+
+            def decode(self, *_args, **_kwargs):
+                raise AssertionError("only the output rank may run DiffVAE decode")
+
+        monkeypatch.setattr(ltx_runtime.torch.distributed, "is_initialized", lambda: True)
+        monkeypatch.setattr(ltx_runtime.torch.distributed, "get_rank", lambda: 1)
+        pipe = object.__new__(LTX2Pipeline)
+        torch.nn.Module.__init__(pipe)
+        pipe.use_diffusion_decoder = True
+        pipe.vae = ConvVae()
+        pipe.diffusion_decoder = DiffusionDecoder()
+
+        output = pipe._decode_output(
+            latents=torch.ones(1, 1),
+            audio_latents=torch.ones(1, 1),
+            output_type="pt",
+            connector_prompt_embeds=torch.ones(1, 1),
+            generator=None,
+            device=torch.device("cpu"),
+            decode_timestep=0.0,
+            decode_noise_scale=None,
+            prompt_batch_size=1,
+        )
+
+        assert output.output[0].numel() == 0
+        assert output.output[1].numel() == 0
+
+    def test_non_output_rank_enters_distributed_diffusion_decoder(self, monkeypatch):
+        import vllm_omni.diffusion.models.ltx2.ltx2_runtime as ltx_runtime
+        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2 import LTX2Pipeline
+
+        class ConvVae:
+            config = SimpleNamespace(timestep_conditioning=False)
+
+            def is_distributed_enabled(self):
+                raise AssertionError("DiffVAE decode must query the active decoder")
+
+        class DiffusionDecoder:
+            dtype = torch.float32
+
+            def __init__(self):
+                self.decode_calls = 0
+
+            def is_distributed_enabled(self):
+                return True
+
+            def decode(self, *_args, **_kwargs):
+                self.decode_calls += 1
+                return (torch.empty(0, 3, 0, 0, 0),)
+
+        monkeypatch.setattr(ltx_runtime.torch.distributed, "is_initialized", lambda: True)
+        monkeypatch.setattr(ltx_runtime.torch.distributed, "get_rank", lambda: 1)
+        pipe = object.__new__(LTX2Pipeline)
+        torch.nn.Module.__init__(pipe)
+        pipe.use_diffusion_decoder = True
+        pipe.vae = ConvVae()
+        pipe.diffusion_decoder = DiffusionDecoder()
+
+        output = pipe._decode_output(
+            latents=torch.ones(1, 1),
+            audio_latents=torch.ones(1, 1),
+            output_type="pt",
+            connector_prompt_embeds=torch.ones(1, 1),
+            generator=None,
+            device=torch.device("cpu"),
+            decode_timestep=0.0,
+            decode_noise_scale=None,
+            prompt_batch_size=1,
+        )
+
+        assert pipe.diffusion_decoder.decode_calls == 1
+        assert output.output[0].numel() == 0
+        assert output.output[1].numel() == 0
+
+    def test_diffusion_decoder_patch_parallel_size_one_uses_native_tiling(self, monkeypatch):
+        from vllm_omni.diffusion.models.ltx2.vae.decoder import LTX2VideoDiffusionDecoderModel
+        from vllm_omni.diffusion.models.ltx2.vae.distributed import (
+            DistributedLTX2VideoDiffusionDecoderModel,
+        )
+
+        expected = torch.ones(1, 3, 1, 2, 2)
+        seen = {}
+
+        def native_tiled_decode(self, z, generator=None, num_inference_steps=None):
+            seen["z"] = z
+            seen["generator"] = generator
+            seen["num_inference_steps"] = num_inference_steps
+            return expected
+
+        monkeypatch.setattr(LTX2VideoDiffusionDecoderModel, "tiled_decode", native_tiled_decode)
+        model = object.__new__(DistributedLTX2VideoDiffusionDecoderModel)
+        torch.nn.Module.__init__(model)
+        model.is_distributed_enabled = lambda: False
+        generator = torch.Generator().manual_seed(17)
+        z = torch.zeros(1, 1, 1, 1, 1)
+
+        result = DistributedLTX2VideoDiffusionDecoderModel.tiled_decode(
+            model,
+            z,
+            generator=generator,
+            num_inference_steps=1,
+        )
+
+        assert result is expected
+        assert seen["z"] is z
+        assert seen["generator"] is generator
+        assert seen["num_inference_steps"] == 1
+
+    def test_distributed_diffusion_tiles_preserve_serial_noise_order(self, monkeypatch):
+        from diffusers.utils.torch_utils import randn_tensor
+
+        from vllm_omni.diffusion.models.ltx2.vae.distributed import (
+            DistributedLTX2VideoDiffusionDecoderModel,
+        )
+
+        model = DistributedLTX2VideoDiffusionDecoderModel(
+            out_channels=1,
+            latent_channels=1,
+            patch_size=1,
+            decoder_head_dim=8,
+            decoder_stage_channels=(8, 8, 8, 8, 8),
+            decoder_stage_depths=(1, 1, 1, 1, 1),
+            decoder_stage_kernels=((1, 1, 1),) * 4,
+            decoder_upsample_strides=((1, 1, 1),) * 4,
+            decoder_upsample_channel_reductions=(1, 1, 1, 1),
+            decoder_stage5_kernel=(1, 1, 1),
+            spatial_compression_ratio=1,
+            temporal_compression_ratio=1,
+        )
+        model.tile_sample_min_num_frames = 2
+        model.tile_sample_stride_num_frames = 1
+        model.tile_sample_min_height = 2
+        model.tile_sample_stride_height = 1
+        model.tile_sample_min_width = 2
+        model.tile_sample_stride_width = 1
+        model.distributed_executor = SimpleNamespace(group=None)
+        model.decoder.forward_stages_1_to_3 = lambda z: z.permute(0, 2, 3, 4, 1)
+        monkeypatch.setattr(torch.distributed, "broadcast", lambda *_args, **_kwargs: None)
+
+        z = torch.zeros(1, 1, 2, 3, 3)
+        distributed_generator = torch.Generator().manual_seed(123)
+        reference_generator = torch.Generator().manual_seed(123)
+        tasks, grid_spec = model._distributed_tile_split(z, distributed_generator, num_inference_steps=1)
+
+        assert grid_spec.grid_shape == (1, 3, 3)
+        assert grid_spec.split_dims == (2, 3, 4)
+        for task in tasks:
+            tile_shape = model._tiled_pixel_shape_from_features(
+                task.tensor,
+                drop_leading_frame=task.drop_leading_frame,
+                crop_trailing_ghost=task.crop_trailing_ghost,
+            )
+            expected = randn_tensor(tile_shape, generator=reference_generator, device=z.device, dtype=z.dtype)
+            actual = randn_tensor(tile_shape, generator=task.noise_generator, device=z.device, dtype=z.dtype)
+            torch.testing.assert_close(actual, expected)
+
+        assert torch.equal(distributed_generator.get_state(), reference_generator.get_state())
 
 
 class TestLTXOutputRank:
@@ -113,7 +770,7 @@ class TestLTX23VaeDistributedDecode:
             },
             output_dtype=torch.float32,
         )
-        seen = {}
+        seen: dict[str, Any] = {}
 
         def exec_tile(task):
             return torch.full(tile_output_shapes[task.tile_id], float(task.tile_id + 1))

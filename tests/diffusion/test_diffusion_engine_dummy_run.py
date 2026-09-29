@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -7,6 +7,7 @@ from unittest.mock import Mock
 import pytest
 
 from vllm_omni.diffusion import io_support
+from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine, DiffusionExecutionMode
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.diffusion_kv.request import DiffusionKVRequest
@@ -14,6 +15,75 @@ from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
+
+
+@pytest.mark.parametrize("model_class_name", ["DreamZeroPipeline", "LingBotWorldCausalDMDPipeline"])
+def test_observation_conditioned_startup_skips_generic_warmup(model_class_name: str) -> None:
+    """Observation-conditioned pipelines must not receive generic text requests."""
+    engine = DiffusionEngine.__new__(DiffusionEngine)
+    engine.od_config = OmniDiffusionConfig.__new__(OmniDiffusionConfig)
+    engine.od_config.model_class_name = model_class_name
+    engine.od_config.diffusion_load_format = "default"
+    engine.add_req_and_wait_for_response = Mock(side_effect=AssertionError("generic text warmup submitted"))
+    engine.close = Mock()
+
+    engine.run_startup_warmup()
+
+    engine.add_req_and_wait_for_response.assert_not_called()
+    engine.close.assert_not_called()
+
+
+@pytest.mark.parametrize("step_execution", [False, True])
+def test_dummy_run_uses_enough_steps_for_execution_mode(
+    monkeypatch: pytest.MonkeyPatch,
+    step_execution: bool,
+) -> None:
+    engine = DiffusionEngine.__new__(DiffusionEngine)
+    engine.od_config = type(
+        "Config",
+        (),
+        {"model_class_name": "mock_model", "diffusion_load_format": "default"},
+    )()
+    engine.step_execution = step_execution
+    engine.pre_process_func = None
+    captured_requests = []
+
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.diffusion_engine.supports_multimodal_input",
+        lambda od_config: (False, False),
+    )
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.diffusion_engine.get_dummy_run_num_frames",
+        lambda model_class_name, supports_audio_input: 1,
+    )
+
+    def run_request(request):
+        captured_requests.append(request)
+        return type("Output", (), {"error": None})()
+
+    engine.add_req_and_wait_for_response = run_request
+
+    engine._dummy_run()
+
+    assert len(captured_requests) == 1
+    assert captured_requests[0].sampling_params.num_inference_steps == 2
+
+
+def test_allgather_startup_runs_broadcast_dummy_request() -> None:
+    engine = object.__new__(DiffusionEngine)
+    engine.od_config = SimpleNamespace(
+        diffusion_offload_config={
+            "mode": "layer",
+            "components": ["dit"],
+            "layer_options": {"dit": {"weight_transfer": "allgather"}},
+        },
+        parallel_config=SimpleNamespace(data_parallel_size=2, sequence_parallel_size=1),
+    )
+    engine._dummy_run = Mock()
+
+    engine.run_startup_warmup()
+
+    engine._dummy_run.assert_called_once_with()
 
 
 def test_dummy_run_num_frames_uses_explicit_model_setting(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -77,6 +147,24 @@ def test_dense_mode_does_not_build_kv_profile_request() -> None:
 
     assert engine._prepare_diffusion_kv_profile_requests() is None
     engine._make_dummy_request.assert_not_called()
+
+
+def test_explicit_profile_frames_preserve_warmup_skip(monkeypatch):
+    engine = object.__new__(DiffusionEngine)
+    engine.od_config = OmniDiffusionConfig.__new__(OmniDiffusionConfig)
+    engine.od_config.model_class_name = "HunyuanImage3ForCausalMM"
+    monkeypatch.setattr("vllm_omni.diffusion.diffusion_engine.supports_multimodal_input", lambda _: (True, False))
+    monkeypatch.setattr("vllm_omni.diffusion.diffusion_engine.image_color_format", lambda _: "RGB")
+    monkeypatch.setattr("vllm_omni.diffusion.diffusion_engine.get_dummy_run_num_frames", lambda *_: 0)
+    kwargs = dict(height=1024, width=1024, guidance_scale=5.0, num_image_inputs=3)
+
+    assert engine._make_dummy_request(**kwargs) is None
+    request = engine._make_dummy_request(**kwargs, num_frames=1)
+
+    assert request is not None
+    assert request.sampling_params.num_frames == 1
+    assert request.sampling_params.num_inference_steps == 1
+    assert len(request.prompt["multi_modal_data"]["image"]) == 3
 
 
 @pytest.mark.parametrize(
@@ -150,6 +238,7 @@ def test_paged_kv_profile_requests_match_per_rank_batch(
         width=1024,
         guidance_scale=5.0,
         num_image_inputs=3,
+        num_frames=1,
     )
     engine._prepare_request_for_admission.assert_called_once_with(request)
 

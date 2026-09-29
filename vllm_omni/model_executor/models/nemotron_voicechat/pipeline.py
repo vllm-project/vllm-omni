@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """NemotronVoiceChat pipeline: thinker (speech -> frame-locked text) -> talker
 (text timeline -> 31-quantizer RVQ code stacks) -> code2wav (codes -> 22.05 kHz PCM).
 
@@ -31,6 +31,11 @@ _PROC = "vllm_omni.model_executor.stage_input_processors.nemotron_voicechat"
 NEMOTRON_VOICECHAT_PIPELINE = PipelineConfig(
     model_type="nemotron_voicechat",
     model_arch="NemotronVoiceChatThinkerForConditionalGeneration",
+    duplex_plugin=("vllm_omni.model_executor.models.nemotron_voicechat.duplex.plugin.NemotronVoiceChatDuplexPlugin"),
+    # Duplex is opt-in per deployment (``nemotron_labs_voicechat_duplex.yaml``
+    # declares ``session_mode: duplex``); the bare/streaming deploys stay
+    # turn-based.
+    default_session_mode="turn",
     # Named after the alias key so the deploy-yaml stem substring-matches the
     # checkpoint directory name (NVIDIA-NemotronLabs-VoiceChat-11B) during
     # bare-path auto-detection.
@@ -80,6 +85,7 @@ NEMOTRON_VOICECHAT_PIPELINE = PipelineConfig(
             engine_output_type="audio",
             sync_process_input_func=f"{_PROC}.talker2code2wav_token_only",
             sampling_constraints={"detokenize": False},
+            requires_full_payload_input=True,
         ),
     ),
 )

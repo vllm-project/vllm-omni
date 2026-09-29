@@ -164,6 +164,7 @@ Diffusion models live under `vllm_omni/diffusion/`. In addition to the New Model
 - [ ] **PR body matches diff:** description doesn't claim changes not in the diff
 - [ ] **Branch is rebased:** `git merge-base HEAD origin/main` is recent, no merge conflicts
 - [ ] **CI gates passing:** DCO, pre-commit, build — check `gh pr view --json statusCheckRollup` if a PR already exists
+- [ ] **Local pre-commit gates:** full list in [Linting](../../../../docs/contributing/README.md#linting). Blocking when the diff introduces: stale `vLLM project` SPDX; stdlib `re`/`base64` or pickle in library code; new `torch.cuda` call sites; `tests/**/test_*.py` without level+hardware marks; new `_tts_model_type` branches in `serving_speech.py`; invalid `.buildkite` YAML. macOS/Windows need a native `shellcheck`. ✗ for growing `CHECK_IMPORTS[*].allowed_files`, `ALLOWED_FILES`, or `MAX_MODEL_TYPE_BRANCHES` without review.
 
 ### Full (adds)
 

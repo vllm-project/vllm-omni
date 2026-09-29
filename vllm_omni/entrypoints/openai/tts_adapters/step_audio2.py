@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Step-Audio2 serving adapter."""
 
 from typing import TYPE_CHECKING
@@ -30,5 +31,17 @@ class StepAudio2Adapter(ARTTSAdapter):
     async def build(
         self, request: "OpenAICreateSpeechRequest", sampling_params_list: list, has_inline_ref_audio: bool
     ) -> PreparedRequest:
-        prompt = self.ctx.server._build_step_audio2_prompt(request)
+        """Build a chat prompt ending at ``<tts_start>``.
+
+        The assistant turn deliberately omits ``<|im_end|>`` so the thinker
+        continues by generating audio tokens.
+        """
+        system_prompt = request.instructions or "You are a voice assistant. Read the text aloud."
+        prompt = {
+            "prompt": (
+                f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
+                f"<|im_start|>user\n{request.input}<|im_end|>\n"
+                "<|im_start|>assistant\n<tts_start>"
+            )
+        }
         return PreparedRequest(prompt=prompt, tts_params={}, model_type="step_audio2")

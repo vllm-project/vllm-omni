@@ -97,6 +97,14 @@ def bagel_and_args(
 class TestTrajectoryRecording:
     """Tests for trajectory latent/timestep recording in generate_image."""
 
+    def test_complete_request_rejects_one_step_schedule(self, bagel_and_args):
+        """The non-step image path must not decode untouched initial noise."""
+        bagel, args = bagel_and_args
+        args["num_timesteps"] = 1
+
+        with pytest.raises(ValueError, match="num_inference_steps >= 2"):
+            bagel.generate_image(**args)
+
     def test_trajectory_disabled_returns_none(self, bagel_and_args):
         bagel, args = bagel_and_args
 

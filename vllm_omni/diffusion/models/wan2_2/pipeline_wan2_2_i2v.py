@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -16,7 +16,6 @@ import torchvision.transforms.functional as TF
 from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
 from transformers import AutoTokenizer, CLIPImageProcessor, CLIPVisionModel, UMT5EncoderModel
-from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm.sequence import IntermediateTensors
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
@@ -32,10 +31,19 @@ from vllm_omni.diffusion.models.dmd2 import DMD2PipelineMixin
 from vllm_omni.diffusion.models.interface import SupportImageInput, SupportsComponentDiscovery
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin, _is_rank_zero
 from vllm_omni.diffusion.models.utils import _load_json
+from vllm_omni.diffusion.models.wan2_2.chunked_mp4 import (
+    resolve_wan_output_fps,
+    resolve_wan_preencode_batch_frames,
+    resolve_wan_preencode_mp4,
+    resolve_wan_video_codec_options,
+    wan_preencoded_mp4_payload,
+)
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import (
+    _WAN_TEXT_ENCODER_OFFLOAD_PLAN,
     build_wan_scheduler,
     create_transformer_from_config,
     load_transformer_config,
+    load_wan_weights_with_optional_gate,
     resolve_wan_flow_shift,
     resolve_wan_guidance_scales,
     resolve_wan_sample_solver,
@@ -45,6 +53,7 @@ from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import WanTransformer3
 from vllm_omni.diffusion.postprocess import interpolate_video_tensor
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.utils.chunked_video import decode_to_mp4
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch, split_diffusion_output_by_request
 from vllm_omni.inputs.data import OmniTextPrompt
 from vllm_omni.platforms import current_omni_platform
@@ -69,6 +78,9 @@ def get_wan22_i2v_post_process_func(
             output_type = sampling_params.output_type
         if output_type == "latent":
             return video
+        encoded = wan_preencoded_mp4_payload(video)
+        if encoded is not None:
+            return encoded
         video_metadata = {}
         if sampling_params is not None and getattr(sampling_params, "enable_frame_interpolation", False):
             video, multiplier = interpolate_video_tensor(
@@ -192,6 +204,7 @@ class Wan22I2VPipeline(
     _dit_modules: ClassVar[list[str]] = ["transformer", "transformer_2"]
     _encoder_modules: ClassVar[list[str]] = ["text_encoder", "image_encoder"]
     _vae_modules: ClassVar[list[str]] = ["vae"]
+    _offload_plan = _WAN_TEXT_ENCODER_OFFLOAD_PLAN
 
     def __init__(
         self,
@@ -302,25 +315,10 @@ class Wan22I2VPipeline(
         # Transformers (weights loaded via load_weights)
         # Load config from model directory or HF Hub to get correct in_channels for I2V models
         transformer_config = load_transformer_config(model, "transformer", local_files_only)
-        self.transformer = create_transformer_from_config(
-            transformer_config,
-            quant_config=od_config.quantization_config,
-        )
+        self.transformer = self._create_transformer(transformer_config, component="transformer")
         if self.has_transformer_2:
             transformer_2_config = load_transformer_config(model, "transformer_2", local_files_only)
-            t2_quant = transformer_2_config.get("quantization_config")
-            if isinstance(t2_quant, dict) and "quant_method" in t2_quant:
-                from vllm_omni.quantization.factory import build_quant_config
-
-                method = t2_quant["quant_method"]
-                kwargs = {k: v for k, v in t2_quant.items() if k != "quant_method"}
-                t2_quant = build_quant_config(method, **kwargs)
-            else:
-                t2_quant = None
-            self.transformer_2 = create_transformer_from_config(
-                transformer_2_config,
-                quant_config=t2_quant,
-            )
+            self.transformer_2 = self._create_transformer(transformer_2_config, component="transformer_2")
         else:
             self.transformer_2 = None
 
@@ -460,10 +458,13 @@ class Wan22I2VPipeline(
         image_embeds = self.image_encoder(pixel_values, output_hidden_states=True)
         return image_embeds.hidden_states[-2]
 
-    def _create_transformer(self, config: dict) -> WanTransformer3DModel:
+    def _create_transformer(self, config: dict, component: str = "transformer") -> WanTransformer3DModel:
         """Create a transformer from a config dict. Respects od_config.quantization_config."""
         quant_config = getattr(self.od_config, "quantization_config", None)
-        return create_transformer_from_config(config, quant_config=quant_config)
+        # Startup metadata describes the first expert, not a user policy for both.
+        if getattr(self.od_config, "quantization_config_is_auto_detected", False):
+            quant_config = None
+        return create_transformer_from_config(config, quant_config=quant_config, component=component)
 
     def forward(self, req: DiffusionRequestBatch) -> list[DiffusionOutput]:
         sampling_params_list = req.sampling_params_list
@@ -517,6 +518,8 @@ class Wan22I2VPipeline(
         num_steps = 40 if common.num_inference_steps is None else common.num_inference_steps
 
         output_type = common.output_type or "np"
+        preencode_mp4 = resolve_wan_preencode_mp4(common, output_type=output_type)
+        preencode_batch_frames = resolve_wan_preencode_batch_frames(common) if preencode_mp4 else 17
         num_outputs_per_prompt = common.num_outputs_per_prompt or 1
         attention_kwargs: dict | None = None
 
@@ -627,7 +630,10 @@ class Wan22I2VPipeline(
             self._flow_shift = flow_shift
 
         # Timesteps
-        self.scheduler.set_timesteps(num_steps, device=device)
+        if sample_solver == "unipc":
+            self.scheduler.set_timesteps(num_steps, device=device, shift=flow_shift)
+        else:
+            self.scheduler.set_timesteps(num_steps, device=device)
         timesteps = self.scheduler.timesteps
         self._num_timesteps = len(timesteps)
 
@@ -743,7 +749,16 @@ class Wan22I2VPipeline(
                 latents.device, latents.dtype
             )
             latents = latents / latents_std + latents_mean
-            output = self.vae.decode(latents, return_dict=False)[0]
+            if preencode_mp4:
+                output = decode_to_mp4(
+                    self.vae,
+                    latents,
+                    fps=resolve_wan_output_fps(common),
+                    batch_frames=preencode_batch_frames,
+                    video_codec_options=resolve_wan_video_codec_options(common),
+                )
+            else:
+                output = self.vae.decode(latents, return_dict=False)[0]
 
         if DEBUG_PERF:
             current_omni_platform.synchronize()
@@ -1014,9 +1029,7 @@ class Wan22I2VPipeline(
             raise ValueError("`guidance_scale_2` is only supported when `boundary_ratio` is set.")
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        """Load weights using AutoWeightsLoader for vLLM integration."""
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights)
+        return load_wan_weights_with_optional_gate(self, weights)
 
 
 # ---------------------------------------------------------------------------

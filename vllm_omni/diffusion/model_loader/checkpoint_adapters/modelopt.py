@@ -17,10 +17,17 @@ MODEL_OPT_SCALE_SUFFIXES = (
     ".weight_scale_2",
     ".weight_scale_inv",
 )
+# Fused projections following the generic diffusers Attention naming
+# convention. ``to_q``/``to_k``/``to_v`` and the joint-attention
+# ``add_q_proj``/``add_k_proj``/``add_v_proj`` shard names are fused into
+# ``to_qkv``/``add_kv_proj`` by most vllm-omni DiT implementations, many of
+# which do not declare their own ``packed_modules_mapping``; keeping these
+# two entries here avoids repeating them in every such model. Model-specific
+# fusions (e.g. Z-Image's ``w13``) must be declared on the model class via
+# ``packed_modules_mapping``, which is merged on top of these defaults.
 DEFAULT_PACKED_MODULES_MAPPING = {
     "to_qkv": ("to_q", "to_k", "to_v"),
     "add_kv_proj": ("add_q_proj", "add_k_proj", "add_v_proj"),
-    "w13": ("w1", "w3"),
 }
 FP8_DTYPES = tuple(
     dtype

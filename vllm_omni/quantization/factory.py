@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Factory for building quantization configs.
 
 build_quant_config() delegates to vLLM's quantization registry.
@@ -55,12 +55,12 @@ def _register_humming_stubs() -> None:
         registry[name] = mod
 
     # wire parent references
-    registry["humming"].config = registry["humming.config"]
-    registry["humming"].dtypes = registry["humming.dtypes"]
-    registry["humming"].layer = registry["humming.layer"]
-    registry["humming"].schema = registry["humming.schema"]
-    registry["humming"].utils = registry["humming.utils"]
-    registry["humming.utils"].weight = registry["humming.utils.weight"]
+    setattr(registry["humming"], "config", registry["humming.config"])
+    setattr(registry["humming"], "dtypes", registry["humming.dtypes"])
+    setattr(registry["humming"], "layer", registry["humming.layer"])
+    setattr(registry["humming"], "schema", registry["humming.schema"])
+    setattr(registry["humming"], "utils", registry["humming.utils"])
+    setattr(registry["humming.utils"], "weight", registry["humming.utils.weight"])
 
     for name, mod in registry.items():
         sys.modules[name] = mod
@@ -125,6 +125,13 @@ def _build_mxfp4_dualscale(**kw: Any) -> QuantizationConfig:
     return DiffusionMXFP4DualScaleMixedConfig(**kw)
 
 
+def _build_svdquant(**kw: Any) -> QuantizationConfig:
+    """Build the serialized SVDQuant diffusion checkpoint loader."""
+    from .svdquant_config import DiffusionSVDQuantConfig
+
+    return DiffusionSVDQuantConfig.from_config(kw)
+
+
 def _build_inc(**kw: Any) -> QuantizationConfig:
     """Lazy import for INC/AutoRound config with checkpoint kwarg normalization."""
     from .inc_config import OmniINCConfig
@@ -139,15 +146,39 @@ def _build_inc(**kw: Any) -> QuantizationConfig:
     return OmniINCConfig(**filtered)
 
 
+def _build_torchao(**kw: Any) -> QuantizationConfig:
+    """Build a TorchAO runtime or serialized-checkpoint config."""
+    from vllm.model_executor.layers.quantization.torchao import TorchAOConfig
+
+    if "quant_type" in kw:
+        return TorchAOConfig.from_config({**kw, "quant_method": "torchao"})
+    return TorchAOConfig(**kw)
+
+
+def _build_torchao_float8_weight_only(**kw: Any) -> QuantizationConfig:
+    """Build the serialized TorchAO FP8 weight-only checkpoint config."""
+    from torchao.quantization import Float8WeightOnlyConfig
+
+    return _build_torchao(
+        torchao_config=Float8WeightOnlyConfig(
+            set_inductor_config=False,
+        ),
+        is_checkpoint_torchao_serialized=True,
+    )
+
+
 _OVERRIDES: dict[str, Callable[..., QuantizationConfig]] = {
     "int8": _build_int8,
     "bitsandbytes": _build_bitsandbytes,
     "mxfp8": _build_mxfp8,
     "mxfp4": _build_mxfp4,
     "mxfp4_dualscale": _build_mxfp4_dualscale,
+    "svdquant": _build_svdquant,
     "inc": _build_inc,
     "auto-round": _build_inc,
     "auto_round": _build_inc,
+    "torchao": _build_torchao,
+    "torchao_float8_weight_only": _build_torchao_float8_weight_only,
 }
 
 
@@ -415,6 +446,33 @@ def _disk_marks_serialized(qc_kwargs: dict[str, Any], quant_config: object) -> b
     return False
 
 
+_MXFP4_SERIALIZED_FLAGS = {
+    "mxfp4": "is_checkpoint_mxfp4_serialized",
+    "mxfp4_dualscale": "is_checkpoint_serialized",
+}
+
+
+def _normalize_serialized_mxfp4_layer_policy(qc_method: str, qc_kwargs: dict[str, Any]) -> None:
+    """Canonicalize the BF16 layer policy owned by serialized MXFP4 metadata.
+
+    A serialized checkpoint config is a complete storage contract: an omitted
+    layer list means no explicit BF16 layers. Method-only online metadata does
+    not carry that contract and must leave caller-provided layer policy intact.
+    """
+    method = _normalize_quant_method_alias(qc_method)
+    if method is None:
+        return
+    serialized_flag = _MXFP4_SERIALIZED_FLAGS.get(method)
+    if serialized_flag is None or not qc_kwargs.get(serialized_flag):
+        return
+
+    ignored_layers = qc_kwargs.get("ignored_layers")
+    if not ignored_layers:
+        ignored_layers = qc_kwargs.get("modules_to_not_convert")
+    qc_kwargs["ignored_layers"] = ignored_layers or []
+    qc_kwargs.pop("modules_to_not_convert", None)
+
+
 def resolve_quant_config_from_disk(
     quant_config: QuantizationConfig | None,
     disk_qc: dict[str, Any] | str | None,
@@ -429,22 +487,24 @@ def resolve_quant_config_from_disk(
       - quant_config is None: auto-detect from disk_qc (full build).
       - Methods mismatch: raise ValueError — prevents silent weight corruption.
       - Disk marks serialized but quant_config is online: rebuild from disk.
-      - ignored_layers differ: rebuild from disk (per-transformer BF16 routing).
+      - Serialized MXFP4 metadata owns the complete BF16 layer policy; omitted
+        ignored_layers means the checkpoint default (no explicit BF16 layers).
+      - Method-only metadata carries no storage policy and preserves caller
+        ignored_layers and runtime fallback policies.
     """
     if disk_qc is None:
         return quant_config
 
     if isinstance(disk_qc, str):
-        if quant_config is None:
-            logger.info("Auto-detected quantization from config.json: method=%s", disk_qc)
-            return build_quant_config(disk_qc)
-        return quant_config
+        qc_method = disk_qc
+        qc_kwargs: dict[str, Any] = {}
+    else:
+        if not isinstance(disk_qc, Mapping) or "quant_method" not in disk_qc:
+            return quant_config
+        qc_method = disk_qc["quant_method"]
+        qc_kwargs = {k: v for k, v in disk_qc.items() if k != "quant_method"}
 
-    if not isinstance(disk_qc, Mapping) or "quant_method" not in disk_qc:
-        return quant_config
-
-    qc_method: str = disk_qc["quant_method"]
-    qc_kwargs: dict[str, Any] = {k: v for k, v in disk_qc.items() if k != "quant_method"}
+    _normalize_serialized_mxfp4_layer_policy(qc_method, qc_kwargs)
 
     if quant_config is None:
         logger.info(
@@ -463,6 +523,26 @@ def resolve_quant_config_from_disk(
             "Pass a matching --quantization flag or omit it for auto-detection."
         )
 
+    if isinstance(disk_qc, str):
+        return quant_config
+
+    # Serialized checkpoint metadata owns storage and BF16 layer routing. The
+    # active config owns runtime step/layer policies, including explicit empty
+    # lists. Preserve them when each cascade transformer rebuilds from disk.
+    for policy in ("w4a8_fallback_steps", "w4a8_fallback_layers"):
+        if hasattr(quant_config, policy):
+            qc_kwargs[policy] = list(getattr(quant_config, policy))
+    if hasattr(quant_config, "mxfp4_scale_alg"):
+        # Runtime activation policy is independent of how offline W4 was made.
+        qc_kwargs["mxfp4_scale_alg"] = quant_config.mxfp4_scale_alg
+    if hasattr(quant_config, "require_smooth_scale"):
+        disk_requires_smooth = qc_kwargs.get("require_smooth_scale", False)
+        if not isinstance(disk_requires_smooth, bool):
+            raise ValueError("require_smooth_scale must be a boolean")
+        # Either a calibrated checkpoint or an explicit caller can require
+        # Smooth. Per-expert rebuilds must never weaken that requirement.
+        qc_kwargs["require_smooth_scale"] = quant_config.require_smooth_scale or disk_requires_smooth
+
     if _disk_marks_serialized(qc_kwargs, quant_config):
         logger.info(
             "config.json marks checkpoint as serialized; switching to offline %s mode.",
@@ -470,10 +550,22 @@ def resolve_quant_config_from_disk(
         )
         return build_quant_config(qc_method, **qc_kwargs)
 
-    # AutoRound MXFP8 checkpoints use data_type="mx_fp" instead of
-    # is_checkpoint_*_serialized; rebuild so the offline path is selected.
+    if (
+        "require_smooth_scale" in qc_kwargs
+        and hasattr(quant_config, "require_smooth_scale")
+        and qc_kwargs["require_smooth_scale"] != quant_config.require_smooth_scale
+    ):
+        logger.info("config.json Smooth requirement differs from active config; rebuilding quant_config.")
+        return build_quant_config(qc_method, **qc_kwargs)
+
+    # AutoRound MXFP checkpoints use data_type="mx_fp" instead of
+    # is_checkpoint_*_serialized; rebuild so the offline MXFP4/MXFP8 path is
+    # selected according to the checkpoint's bit width.
     if qc_kwargs.get("data_type") == "mx_fp":
-        logger.info("config.json declares data_type='mx_fp'; rebuilding as offline AutoRound MXFP8.")
+        logger.info(
+            "config.json declares data_type='mx_fp'; rebuilding as offline AutoRound MXFP%d.",
+            qc_kwargs.get("bits", getattr(quant_config, "weight_bits", 0)),
+        )
         return build_quant_config(qc_method, **qc_kwargs)
 
     if (

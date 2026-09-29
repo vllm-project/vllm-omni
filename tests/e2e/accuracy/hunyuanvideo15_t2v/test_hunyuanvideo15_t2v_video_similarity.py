@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from __future__ import annotations
 
 import os
@@ -115,7 +118,7 @@ def _generate_offline_video() -> Path:
     return offline_path
 
 
-def _generate_online_video(*, omni_server, openai_client, timeout_seconds: int) -> Path:
+def _generate_online_video(*, omni_server, online_client, timeout_seconds: int) -> Path:
     online_path, _ = _artifact_paths()
     request_config = {
         "model": omni_server.model,
@@ -132,7 +135,7 @@ def _generate_online_video(*, omni_server, openai_client, timeout_seconds: int) 
         },
     }
     online_video_bytes = send_video_request_with_timeout(
-        openai_client,
+        online_client,
         request_config,
         timeout_seconds=timeout_seconds,
     )
@@ -141,7 +144,7 @@ def _generate_online_video(*, omni_server, openai_client, timeout_seconds: int) 
 
 
 @pytest.mark.benchmark
-@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=1)
 def test_hunyuanvideo15_t2v_diffusers_offline_generates_video() -> None:
     if not torch.cuda.is_available():
         pytest.skip("HunyuanVideo-1.5 T2V offline accuracy test requires CUDA.")
@@ -157,11 +160,11 @@ def test_hunyuanvideo15_t2v_diffusers_offline_generates_video() -> None:
 
 
 @pytest.mark.benchmark
-@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=1)
 @pytest.mark.parametrize("omni_server", SERVER_CASES, indirect=True)
 def test_hunyuanvideo15_t2v_online_serving_generates_video(
     omni_server,
-    openai_client,
+    online_client,
     hunyuanvideo15_online_timeout_seconds: int,
 ) -> None:
     if not torch.cuda.is_available():
@@ -170,7 +173,7 @@ def test_hunyuanvideo15_t2v_online_serving_generates_video(
     probe_binary("ffprobe")
     online_path = _generate_online_video(
         omni_server=omni_server,
-        openai_client=openai_client,
+        online_client=online_client,
         timeout_seconds=hunyuanvideo15_online_timeout_seconds,
     )
     assert online_path.exists(), f"Expected online video artifact at {online_path}"
@@ -179,7 +182,7 @@ def test_hunyuanvideo15_t2v_online_serving_generates_video(
 
 
 @pytest.mark.benchmark
-@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=1)
 def test_hunyuanvideo15_t2v_serving_matches_offline_video_similarity() -> None:
     if not torch.cuda.is_available():
         pytest.skip("HunyuanVideo-1.5 T2V video similarity test requires CUDA.")

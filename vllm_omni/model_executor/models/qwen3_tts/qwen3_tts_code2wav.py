@@ -1,8 +1,12 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from __future__ import annotations
 
 import os
 from collections import Counter
 from collections.abc import Iterable
+from contextlib import nullcontext
 from typing import Any
 
 import torch
@@ -11,8 +15,9 @@ from vllm.config import VllmConfig
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader import DefaultModelLoader
-from vllm.model_executor.models.utils import AutoWeightsLoader
+from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper
 
+from vllm_omni.data_entry_keys import FIRST_AUDIO_REQUIRED_KEY
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.model_executor.stage_input_processors.chunk_size_utils import parse_chunk_ramp
 
@@ -43,9 +48,9 @@ def _codec_ids_from_payload_or_input(
         if isinstance(codes, dict):
             audio = codes.get("audio")
             if isinstance(audio, torch.Tensor) and audio.numel() > 0:
-                return audio.reshape(-1).to(device=input_ids.device, dtype=torch.long)
+                return audio.reshape(-1).to(dtype=torch.long)
             if isinstance(audio, (list, tuple)) and audio:
-                return torch.as_tensor(audio, device=input_ids.device, dtype=torch.long).reshape(-1)
+                return torch.as_tensor(audio, dtype=torch.long).reshape(-1)
     return input_ids.reshape(-1).to(dtype=torch.long)
 
 
@@ -55,11 +60,17 @@ class Qwen3TTSCode2Wav(nn.Module):
     via the SpeechTokenizer decoder directly (bypassing HF wrapper overhead)."""
 
     input_modalities = "audio"
+    tokenizer_subfolder = "speech_tokenizer"
+    decoder_cudagraph_modes: tuple[str, ...] = ("icl", "xvec")
 
     # Ask the model runner for the scheduler-side request IDs. Stateful
     # decoder caches must use the same IDs delivered by on_requests_finished;
     # payload metadata carries an external ID which may differ.
     requires_request_ids = True
+    # A nonempty native codes.audio payload is authoritative; token IDs may
+    # serve only as per-request control slots for the generation scheduler.
+    supports_native_payload_input = True
+    batched_gpu_staging_keys = {("codes", "audio")}
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
@@ -98,11 +109,12 @@ class Qwen3TTSCode2Wav(nn.Module):
         # load_weights().
         tok_config = Qwen3TTSTokenizerV2Config.from_pretrained(
             self.model_path,
-            subfolder="speech_tokenizer",
+            subfolder=self.tokenizer_subfolder,
         )
         dec_config = tok_config.decoder_config
         self.decoder = Qwen3TTSTokenizerV2Decoder._from_config(dec_config)
         self.decoder.eval()
+
         self._num_quantizers = int(dec_config.num_quantizers)
         self._output_sample_rate = int(tok_config.output_sample_rate)
         self._total_upsample = int(self.decoder.total_upsample)
@@ -187,6 +199,7 @@ class Qwen3TTSCode2Wav(nn.Module):
             )
 
         self.decoder.enable_cudagraph(
+            capture_modes=self.decoder_cudagraph_modes,
             capture_batch_sizes=decode_cudagraph_batch_sizes,
             stateless_capture_sizes=decode_cudagraph_capture_sizes,
             device=device,
@@ -250,6 +263,7 @@ class Qwen3TTSCode2Wav(nn.Module):
         intermediate_tensors: Any = None,
         inputs_embeds: torch.Tensor | None = None,
         runtime_additional_information: list[dict[str, Any]] | None = None,
+        model_intermediate_buffer: list[dict[str, Any]] | None = None,
         **kwargs: Any,
     ) -> OmniOutput:
         """Decode codec codes into audio waveform.
@@ -275,6 +289,13 @@ class Qwen3TTSCode2Wav(nn.Module):
                 multimodal_outputs={"model_outputs": [empty], "sr": [sr_tensor]},
             )
 
+        # vLLM's runner renamed this per-request side channel to
+        # ``model_intermediate_buffer``.  Keep accepting the old explicit
+        # argument for older runners, and use the new name when it is empty.
+        # Without this fallback, the non-async-chunk/full-payload path decodes
+        # placeholder input_ids instead of the codec payload from Stage 0.
+        if not runtime_additional_information:
+            runtime_additional_information = model_intermediate_buffer
         runtime_infos = runtime_additional_information or []
         ids = input_ids.reshape(-1).to(dtype=torch.long)
         request_ids_list = self._split_request_ids(ids, kwargs.get("seq_token_counts"))
@@ -284,6 +305,7 @@ class Qwen3TTSCode2Wav(nn.Module):
         valid_indices: list[int] = []
         left_context_size = [0] * len(request_ids_list)
         ref_context_size = [0] * len(request_ids_list)
+        first_audio_flags = [False] * len(request_ids_list)
         segment_finished_flags = [False] * len(request_ids_list)
         request_state_ids: list[str | None] = [None] * len(request_ids_list)
         ref_context_request_ids: list[str | None] = [None] * len(request_ids_list)
@@ -318,6 +340,7 @@ class Qwen3TTSCode2Wav(nn.Module):
                 if not isinstance(info, dict):
                     continue
                 meta = info.get("meta", {})
+                first_audio_flags[i] = _meta_bool(meta.get("first_audio", False))
                 if "is_segment_finished" in meta:
                     segment_finished_flags[i] = _meta_bool(meta["is_segment_finished"])
                 if "left_context_size" in meta:
@@ -386,6 +409,7 @@ class Qwen3TTSCode2Wav(nn.Module):
                         )
                     state = {}
                     self._decoder_state_cache[state_req_id] = state
+                state.setdefault("skip_first_audio", first_audio_flags[i])
                 state.setdefault("prefix_frames", 0)
                 if state_req_id.startswith(_DUMMY_REQUEST_ID):
                     state["_is_dummy_run"] = True
@@ -424,12 +448,9 @@ class Qwen3TTSCode2Wav(nn.Module):
             try:
                 _, c = valid_codes_qf[0]
                 logger.info(
-                    "Code2Wav codec: frames=%d q=%d uniq=%d range=[%d,%d] batch=%d",
+                    "Code2Wav codec: frames=%d q=%d batch=%d",
                     c.shape[1],
                     q,
-                    int(torch.unique(c).numel()),
-                    int(c.min().item()),
-                    int(c.max().item()),
                     len(valid_codes_qf),
                 )
             except Exception:
@@ -451,9 +472,22 @@ class Qwen3TTSCode2Wav(nn.Module):
 
         request_lengths = [int(codes_qf.shape[-1]) for _, codes_qf in valid_codes_qf]
         max_request_length = max(request_lengths)
-        request_codes = valid_codes_qf[0][1].new_zeros((len(valid_codes_qf), q, max_request_length))
-        for row, (_, codes_qf) in enumerate(valid_codes_qf):
-            request_codes[row, :, : codes_qf.shape[-1]].copy_(codes_qf)
+        request_codes_shape = (len(valid_codes_qf), q, max_request_length)
+        target_device = ids.device
+        if target_device.type == "cuda" and all(codes_qf.device.type == "cpu" for _, codes_qf in valid_codes_qf):
+            staged_codes = torch.zeros(
+                request_codes_shape,
+                dtype=torch.long,
+                device="cpu",
+                pin_memory=True,
+            )
+            for row, (_, codes_qf) in enumerate(valid_codes_qf):
+                staged_codes[row, :, : codes_qf.shape[-1]].copy_(codes_qf)
+            request_codes = staged_codes.to(device=target_device, non_blocking=True)
+        else:
+            request_codes = torch.zeros(request_codes_shape, dtype=torch.long, device=target_device)
+            for row, (_, codes_qf) in enumerate(valid_codes_qf):
+                request_codes[row, :, : codes_qf.shape[-1]].copy_(codes_qf)
 
         self._record_decode_batch_stats(
             group_size=len(valid_codes_qf),
@@ -487,6 +521,10 @@ class Qwen3TTSCode2Wav(nn.Module):
         if self._batch_stats_log_every > 0 and self._batch_stats_forwards % self._batch_stats_log_every == 0:
             self.log_decode_batch_stats()
 
+        first_audio_required = [torch.tensor(False)] * num_req
+        if request_states is not None:
+            for row, idx in enumerate(valid_indices):
+                first_audio_required[idx] = torch.tensor(bool(request_states[row].get("skip_first_audio", False)))
         audios: list[torch.Tensor] = [empty] * num_req
         srs = [sr_tensor] * num_req
 
@@ -496,7 +534,7 @@ class Qwen3TTSCode2Wav(nn.Module):
             if wav.numel() == 0:
                 continue
             if wav.shape[0] > 0:
-                # Decoder already runs in fp32, so the .to(float32) is a redundant dispatch.
+                # Return FP32 audio regardless of the decoder compute dtype.
                 audios[idx] = (wav if wav.dtype == torch.float32 else wav.to(torch.float32)).reshape(-1)
 
         for req_id, finished, segment_finished in zip(
@@ -510,7 +548,7 @@ class Qwen3TTSCode2Wav(nn.Module):
 
         return OmniOutput(
             text_hidden_states=None,
-            multimodal_outputs={"model_outputs": audios, "sr": srs},
+            multimodal_outputs={"model_outputs": audios, "sr": srs, FIRST_AUDIO_REQUIRED_KEY: first_audio_required},
         )
 
     def make_omni_output(self, model_outputs: torch.Tensor | OmniOutput | tuple, **kwargs: Any) -> OmniOutput:
@@ -549,16 +587,15 @@ class Qwen3TTSCode2Wav(nn.Module):
         source = DefaultModelLoader.Source(
             model_or_path=self.model_path,
             revision=self.vllm_config.model_config.revision,
-            subfolder="speech_tokenizer",
+            subfolder=self.tokenizer_subfolder,
         )
         subfolder_weights = model_loader._get_weights_iterator(source)
-        loaded = AutoWeightsLoader(
-            self,
-            skip_prefixes=["encoder."],
-        ).load_weights(subfolder_weights)
+        loaded = AutoWeightsLoader(self).load_weights(
+            subfolder_weights, mapper=WeightsMapper(orig_to_new_prefix={"encoder.": None})
+        )
 
         device = self.vllm_config.device_config.device
-        self.decoder.to(device=device, dtype=torch.float32)
+        self.decoder.to(device=device, dtype=self.vllm_config.model_config.dtype)
 
         # Precompute SnakeBeta exp caches (benefits both Triton and eager paths)
         if hasattr(self.decoder, "precompute_snake_caches"):
@@ -687,6 +724,11 @@ class Qwen3TTSCode2Wav(nn.Module):
                 raise ValueError(f"Invalid Qwen3-TTS Code2Wav config decode_batch_max_size={decode_batch_max_size}")
             self._decode_batch_max_size = decode_batch_max_size
             decode_enable_tf32 = _get_bool_config("decode_enable_tf32", False)
+            decode_time_major_conv = _get_bool_config("decode_time_major_conv", False)
+            self.decoder.capture_first_audio_state_only = self._async_chunk and _get_bool_config(
+                "talker_first_audio", False
+            )
+            decode_cudnn_benchmark = _get_bool_config("decode_cudnn_benchmark", False)
         else:
             codec_chunk_frames = 0
             codec_left_context_frames = 0
@@ -695,6 +737,8 @@ class Qwen3TTSCode2Wav(nn.Module):
             decode_cudagraph_batch_sizes = None
             decode_cudagraph_capture_sizes = None
             decode_enable_tf32 = False
+            decode_cudnn_benchmark = False
+            decode_time_major_conv = False
 
         if decode_enable_tf32 and device.type == "cuda":
             # PyTorch exposes TF32 controls as process-wide CUDA backend
@@ -711,21 +755,39 @@ class Qwen3TTSCode2Wav(nn.Module):
                 torch.get_float32_matmul_precision(),
             )
 
+        if decode_time_major_conv and device.type == "cuda":
+            self.decoder.enable_time_major_conv()
+
         self.decoder._initial_codec_chunk_frames = initial_codec_chunk_frames
         self.decoder._incremental_chunk_frames = codec_chunk_frames or 25
         self.decoder._incremental_chunk_ramp = list(codec_chunk_ramp or ())
 
         if hasattr(self.decoder, "enable_cudagraph") and device.type == "cuda":
             try:
-                self._maybe_enable_decoder_cudagraph(
-                    device=device,
-                    codec_chunk_frames=codec_chunk_frames,
-                    codec_left_context_frames=codec_left_context_frames,
-                    initial_codec_chunk_frames=initial_codec_chunk_frames,
-                    codec_chunk_ramp=codec_chunk_ramp,
-                    decode_cudagraph_batch_sizes=decode_cudagraph_batch_sizes,
-                    decode_cudagraph_capture_sizes=decode_cudagraph_capture_sizes,
+                # Autotune only during warmup/capture, then restore the process
+                # flags. The captured convolution algorithms remain in the
+                # graphs without changing later models' cuDNN policy.
+                autotune = (
+                    torch.backends.cudnn.flags(
+                        enabled=torch.backends.cudnn.enabled,
+                        benchmark=True,
+                        benchmark_limit=10,
+                        deterministic=torch.backends.cudnn.deterministic,
+                        allow_tf32=torch.backends.cudnn.allow_tf32,
+                    )
+                    if decode_cudnn_benchmark
+                    else nullcontext()
                 )
+                with autotune:
+                    self._maybe_enable_decoder_cudagraph(
+                        device=device,
+                        codec_chunk_frames=codec_chunk_frames,
+                        codec_left_context_frames=codec_left_context_frames,
+                        initial_codec_chunk_frames=initial_codec_chunk_frames,
+                        codec_chunk_ramp=codec_chunk_ramp,
+                        decode_cudagraph_batch_sizes=decode_cudagraph_batch_sizes,
+                        decode_cudagraph_capture_sizes=decode_cudagraph_capture_sizes,
+                    )
             except Exception:
                 logger.warning(
                     "Failed to enable CUDA Graph for Code2Wav decoder",

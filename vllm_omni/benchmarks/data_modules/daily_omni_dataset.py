@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Daily-Omni Dataset loader for benchmark.
 
 Daily-Omni is an audio-visual reasoning benchmark with 684 videos
@@ -167,7 +170,7 @@ def ensure_daily_omni_hub_videos_dir(repo_id: str) -> Path:
         raise ValueError("repo_id is required to download Daily-Omni Videos.tar")
 
     try:
-        from huggingface_hub import hf_hub_download
+        from vllm_omni.transformers_utils.repo_utils import hf_api
     except ImportError as e:
         raise ImportError(
             "Daily-Omni Hub media download requires huggingface_hub. "
@@ -177,7 +180,7 @@ def ensure_daily_omni_hub_videos_dir(repo_id: str) -> Path:
     tar_path: Path | None = None
     for fname in ("Videos.tar", "videos.tar"):
         try:
-            tar_path = Path(hf_hub_download(repo_id=rid, filename=fname, repo_type="dataset"))
+            tar_path = Path(hf_api().hf_hub_download(repo_id=rid, filename=fname, repo_type="dataset"))
             break
         except Exception:
             continue
@@ -234,14 +237,14 @@ def ensure_daily_omni_hub_root(repo_id: str) -> Path:
         raise ValueError("repo_id is required to download Daily-Omni from Hugging Face")
 
     try:
-        from huggingface_hub import snapshot_download
+        from vllm_omni.transformers_utils.repo_utils import hf_api
     except ImportError as e:
         raise ImportError(
             "Install huggingface_hub to load Daily-Omni from the Hub, or pass a local "
             "--daily-omni-qa-json / --daily-omni-video-dir mirror."
         ) from e
 
-    cache = snapshot_download(
+    cache = hf_api().snapshot_download(
         repo_id=rid,
         repo_type="dataset",
         allow_patterns=_DAILY_OMNI_QA_ALLOW_PATTERNS,
@@ -627,10 +630,13 @@ class DailyOmniDataset(BenchmarkDataset):
 
     def _load_from_local_json(self) -> None:
         """Load QA data from local JSON file."""
-        if not self.qa_json_path.exists():
-            raise FileNotFoundError(f"QA JSON file not found: {self.qa_json_path}")
+        qa_json_path = self.qa_json_path
+        if qa_json_path is None:
+            raise RuntimeError("qa_json_path is required for local JSON loading")
+        if not qa_json_path.exists():
+            raise FileNotFoundError(f"QA JSON file not found: {qa_json_path}")
 
-        with open(self.qa_json_path, encoding="utf-8") as f:
+        with open(qa_json_path, encoding="utf-8") as f:
             data = json.load(f)
 
         # Support both list format and dict with "train"/"test" splits
@@ -682,8 +688,11 @@ class DailyOmniDataset(BenchmarkDataset):
         one ``sample()`` / request-building implementation for both.
         """
         snapshot_error: Exception | None = None
+        dataset_path = self.dataset_path
+        if dataset_path is None:
+            raise ValueError("dataset_path is required for HuggingFace loading")
         try:
-            root = ensure_daily_omni_hub_root(self.dataset_path)
+            root = ensure_daily_omni_hub_root(dataset_path)
         except Exception as e:  # noqa: BLE001 - any failure just falls through to `datasets`
             snapshot_error = e
         else:
@@ -1256,7 +1265,7 @@ class DailyOmniDataset(BenchmarkDataset):
         num_video_frames, avg_fps = _probe_video_frames_and_fps(video_path)
         duration = num_video_frames / avg_fps
         num_seconds = max(1, int(math.ceil(duration)))
-        second_timestamps = list(range(num_seconds))
+        second_timestamps = [float(i) for i in range(num_seconds)]
 
         if duration > max_num_frames:
             timestamps = [round(i * 0.1, 1) for i in range(int(duration / 0.1))]

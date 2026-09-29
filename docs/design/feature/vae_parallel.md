@@ -22,59 +22,60 @@ We use **Qwen-Image** as the reference implementation for decode parallel, and *
 
 **VAE Patch Parallelism** is an acceleration technique for both **encoding** and **decoding**. Instead of processing the entire tensor at once, the tensor is:
 
-+ Split into multiple spatial tiles
+- Split into multiple spatial tiles
 
-+ Distributed across multiple ranks
+- Distributed across multiple ranks
 
-+ Encoded/Decoded in parallel
+- Encoded/Decoded in parallel
 
-+ Merged to reconstruct the final output
+- Merged to reconstruct the final output
 
 This approach:
 
-+ Distributes computation across multiple devices
+- Distributes computation across multiple devices
 
-+ Reduces peak memory usage per device
+- Reduces peak memory usage per device
 
-+ Accelerates encoding/decoding latency
+- Accelerates encoding/decoding latency
 
 ### When to Use Encode vs Decode Parallel
 
-| Operation | Use Case | Example |
-|-----------|----------|---------|
-| **Decode Parallel** | Text-to-Image, Text-to-Video | Latent → Image/Video |
-| **Encode Parallel** | Image-to-Video (I2V) | Image → Latent (for conditioning) |
+| Operation           | Use Case                     | Example                           |
+| ------------------- | ---------------------------- | --------------------------------- |
+| **Decode Parallel** | Text-to-Image, Text-to-Video | Latent → Image/Video              |
+| **Encode Parallel** | Image-to-Video (I2V)         | Image → Latent (for conditioning) |
 
 ### Architecture
+
 We introduce **DistributedVaeExecutor** as the core component responsible for distributed VAE encoding/decoding.
 
 The executor is model-agnostic and accepts three function parameters:
 
-+ split – Partition the latent into tiles
+- split – Partition the latent into tiles
 
-+ exec – Decode a single tile
+- exec – Decode a single tile
 
-+ merge – Combine decoded tiles into the final output
+- merge – Combine decoded tiles into the final output
 
 #### Execution Flow
 
-+ Call split(z) to generate a list of TileTask and a GridSpec
+- Call split(z) to generate a list of TileTask and a GridSpec
 
-+ Dispatch tasks across ranks using workload-based balancing
+- Dispatch tasks across ranks using workload-based balancing
 
-+ Each rank executes exec(task) on its assigned tiles
+- Each rank executes exec(task) on its assigned tiles
 
-+ Gather decoded tile results to rank 0
+- Gather decoded tile results to rank 0
 
-+ Rank 0 performs merge(...)
+- Rank 0 performs merge(...)
 
-+ (Optional) Broadcast final result to all ranks
+- (Optional) Broadcast final result to all ranks
 
 This design separates:
 
-+ Distributed execution logic
+- Distributed execution logic
 
-+ Model-specific tiling and merging logic
+- Model-specific tiling and merging logic
 
 #### Why split / exec / merge is necessary?
 
@@ -82,23 +83,23 @@ The latent tensor cannot be arbitrarily partitioned.
 
 During decoding:
 
-+ Each output pixel may depend on neighboring pixels
+- Each output pixel may depend on neighboring pixels
 
-+ The receptive field is model-dependent
+- The receptive field is model-dependent
 
 Therefore:
 
-+ Tiles must include overlap
+- Tiles must include overlap
 
-+ Merge must perform blending to avoid seams
+- Merge must perform blending to avoid seams
 
 ## Step-by-Step Implementation (Decode)
 
 ### Step 1: Implement DistributedAutoencoderKLQwenImage
+
 `QwenImagePipeline` use `AutoencoderKLQwenImage` for vae, so implement a distributed version:
 
-
-```
+```python
 class DistributedAutoencoderKLQwenImage(AutoencoderKLQwenImage, DistributedVaeMixin):
     @classmethod
     def from_pretrained(cls, *args: Any, **kwargs: Any):
@@ -106,28 +107,35 @@ class DistributedAutoencoderKLQwenImage(AutoencoderKLQwenImage, DistributedVaeMi
         model.init_distributed()
         return model
 ```
+
 **Key points**:
-+ Inherit both AutoencoderKLQwenImage and DistributedVaeMixin
-+ Call init_distributed() after loading weights
+
+- Inherit both AutoencoderKLQwenImage and DistributedVaeMixin
+- Call init_distributed() after loading weights
 
 ### Step 2: Implement split/exec/merge
+
 Reuse `AutoencoderKLQwenImage.tiled_decode` logic and divide it into three stages. And we need return tiles with `GridSpec` and `TileTask`:
-```
+
+```python
 class GridSpec:
     split_dims: tuple[int, ...]  # Tensor dimensions being split (e.g., (2, 3) for (B, C, H, W))
     grid_shape: tuple[int, ...]  # Tile grid layout (num_rows, num_cols)
     tile_spec: dict = field(default_factory=dict) # Metadata required for merging
     output_dtype: torch.dtype | None = None # Final output dtype
 ```
-```
+
+```python
 class TileTask:
     tile_id: int # task id
     grid_coord: tuple[int, ...]  # Tile position in grid
     tensor: torch.Tensor | list[torch.Tensor]  # The tile tensor
     workload: int | float = 1 # Used for load balancing (e.g., tile area)
 ```
+
 And tiled base split/exec/merge as follow:
-```
+
+```python
 def tile_split(self, z: torch.Tensor) -> tuple[list[TileTask], GridSpec]:
     # mostly copy from AutoencoderKL
     _, _, num_frames, height, width = z.shape
@@ -210,11 +218,14 @@ def tile_merge(self, coord_tensor_map: dict[tuple[int, ...], torch.Tensor], grid
 ```
 
 ### Step 3: Override tiled_decode
+
 We need to override tiled_decode, the main logic is:
-+ check distributed is enabled
-+ select split/exec/merge
-+ Invoke self.distributed_executor.execute to decode
-```
+
+- check distributed is enabled
+- select split/exec/merge
+- Invoke self.distributed_executor.execute to decode
+
+```python
 def tiled_decode(self, z: torch.Tensor, return_dict: bool = True):
     if not self.is_distributed_enabled():
         return super().tiled_decode(z, return_dict=return_dict)
@@ -230,11 +241,14 @@ def tiled_decode(self, z: torch.Tensor, return_dict: bool = True):
 
     return DecoderOutput(sample=result)
 ```
+
 `broadcast_result` is set to True or False depending on the model; when enabled, the result will be used even on ranks other than 0.
 
 ### Step 4: Modify Pipeline
+
 Change vae model from AutoencoderKLQwenImage to DistributedAutoencoderKLQwenImage
-```
+
+```diff
 class YourModelPipeline(nn.Module):
     def __init__(
         self,
@@ -259,8 +273,8 @@ For models that require VAE encoding (e.g., Image-to-Video), you can also parall
 
 Similar to decode, split the input tensor into tiles. Key considerations:
 
-+ **Patchify handling**: If the model uses `patch_size`, scale tile parameters accordingly
-+ **Temporal chunking**: Video VAEs may have temporal compression (e.g., 4x)
+- **Patchify handling**: If the model uses `patch_size`, scale tile parameters accordingly
+- **Temporal chunking**: Video VAEs may have temporal compression (e.g., 4x)
 
 ```python
 def encode_tile_split(self, x: torch.Tensor) -> tuple[list[TileTask], GridSpec]:
@@ -406,23 +420,28 @@ def tiled_encode(self, x: torch.Tensor) -> torch.Tensor:
 **Key differences from decode parallel:**
 
 | Aspect | Decode Parallel | Encode Parallel |
-|--------|-----------------|-----------------|
+| -------- | ----------------- | ----------------- |
 | `broadcast_result` | Often `False` (only rank 0 needs output) | `True` (all ranks need latents for diffusion) |
 | Patchify | Applied in merge (unpatchify) | Handled by parent `_encode()` before `tiled_encode()` |
 | Temporal chunking | Frame-by-frame | Chunk-based (e.g., 1 + 4n frames) |
 
 ## Testing
-Verify numerical consistency between:
-+ vae_patch_parallel_size = 1
 
-+ vae_patch_parallel_size = N
+Verify numerical consistency between:
+
+- vae_patch_parallel_size = 1
+- vae_patch_parallel_size = N
 
 Example:
+
+```python
 torch.allclose(output_1, output_n, atol=1e-5)
+```
 
 Testing requirements:
-+ Fix random seed
-+ Use identical tiling strategy
+
+- Fix random seed
+- Use identical tiling strategy
 
 ```python
 m = Omni(
@@ -434,6 +453,7 @@ m = Omni(
         ),
     )
 ```
+
 When vae_patch_parallel_size is larger than the DiT world size, it will automatically fall back to using the DiT world size instead.
 
 ## Reference Implementations
@@ -441,7 +461,7 @@ When vae_patch_parallel_size is larger than the DiT world size, it will automati
 Complete examples in the codebase:
 
 | Model | Path | Decode Parallel | Encode Parallel |
-|-------|------|-----------------|-----------------|
+| ------- | ------ | ----------------- | ----------------- |
 | **Z-Image** | `vllm_omni/diffusion/distributed/autoencoders/autoencoder_kl.py` | ✅ | ❌ |
 | **Wan2.2** | `vllm_omni/diffusion/distributed/autoencoders/autoencoder_kl_wan.py` | ✅ | ✅ |
 | **Qwen-Image** | `vllm_omni/diffusion/distributed/autoencoders/autoencoder_kl_qwenimage.py` | ✅ | ❌ |
@@ -456,7 +476,7 @@ The tile-parallel executor above assigns independent spatial **tiles** to ranks.
 ### How it differs from tile parallel
 
 | Aspect | Tile parallel (`"tile"`) | Spatially-sharded (`"spatial_shard_height"`/`"spatial_shard_width"`) |
-|--------|--------------------------|-----------------------------------------------|
+| -------- | -------------------------- | ----------------------------------------------- |
 | Unit of work | Independent overlapping tiles | A single global feature map sharded along H or W |
 | Cross-rank communication | Gather tiles to rank 0, stitch + blend | Per-conv **halo exchange** of boundary rows/cols (P2P) |
 | Output assembly | Blend overlapping tiles | All-gather shards on rank 0, trim padding (matches `broadcast_result=False`) |
@@ -481,7 +501,7 @@ serve.py (--vae-parallel-mode) / OmniEngineArgs
 ### Notes
 
 - The decoder is patched **in place** the first time spatial-shard decode runs and is bound to a single split dimension for the lifetime of the VAE instance.
-- Numerical correctness vs. single-GPU decode is covered by `tests/diffusion/distributed/test_wan_spatial_shard.py::test_spatial_shard_decode_matches_reference` (multi-GPU, nightly `full_model` + `distributed_cuda`).
+- Numerical correctness vs. single-GPU decode is covered by `tests/diffusion/distributed/test_wan_spatial_shard.py::test_spatial_shard_decode_matches_reference` (multi-GPU, nightly `full_model` + `cards_2`).
 
 ---
 

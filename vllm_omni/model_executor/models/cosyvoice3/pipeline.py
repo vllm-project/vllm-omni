@@ -48,6 +48,7 @@ COSYVOICE3_PIPELINE = PipelineConfig(
             final_output_type="audio",
             engine_output_type="latent",
             sync_process_input_func=f"{_PROC}.text2flow_token_only",
+            requires_full_payload_input=True,
         ),
     ),
 )

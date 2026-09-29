@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -8,7 +8,9 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
+from vllm.multimodal.inputs import MultiModalFeatureSpec, PlaceholderRange
 
+from vllm_omni.diffusion.diffusion_kv.kv_cache_utils import get_cache_namespace, hash_prefix_cache_value
 from vllm_omni.diffusion.diffusion_kv.request import DiffusionKVRequest
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 
@@ -50,6 +52,7 @@ def _image_info_to_payload(image_info: ImageInfo) -> dict[str, Any]:
         "ratio_index": _to_python_scalar(image_info.ratio_index),
         "add_timestep_token": image_info.add_timestep_token,
         "add_guidance_token": image_info.add_guidance_token,
+        "add_timestep_r_token": image_info.add_timestep_r_token,
         "use_front_boi_token": image_info.use_front_boi_token,
         "add_image_shape_token": image_info.add_image_shape_token,
     }
@@ -68,6 +71,7 @@ def _image_info_from_payload(payload: dict[str, Any]) -> ImageInfo:
         ratio_index=payload.get("ratio_index"),
         add_timestep_token=payload.get("add_timestep_token", True),
         add_guidance_token=payload.get("add_guidance_token", False),
+        add_timestep_r_token=payload.get("add_timestep_r_token", False),
         use_front_boi_token=payload.get("use_front_boi_token", True),
         add_image_shape_token=payload.get("add_image_shape_token", True),
     )
@@ -197,7 +201,21 @@ def resolve_hunyuan_guidance_scale(sampling: Any, default_scale: float = 5.0) ->
 def hunyuan_num_image_tokens(image_info: ImageInfo) -> int:
     """Return the generated-image span overwritten on every denoise step."""
 
-    return int(image_info.image_token_length) + int(image_info.add_timestep_token) + int(image_info.add_guidance_token)
+    return int(image_info.image_token_length) + hunyuan_num_special_tokens(image_info)
+
+
+def hunyuan_num_special_tokens(image_info: ImageInfo) -> int:
+    """Return the generated-image prefix tokens emitted before latent tokens."""
+
+    return (
+        int(image_info.add_timestep_token) + int(image_info.add_guidance_token) + int(image_info.add_timestep_r_token)
+    )
+
+
+def hunyuan_cfg_factor(image_info: ImageInfo, guidance_scale: float) -> int:
+    """Return the execution branch count for standard or embedded CFG."""
+
+    return 1 if image_info.add_guidance_token else 1 + int(guidance_scale > 1.0)
 
 
 def build_hunyuan_batch_rope_image_info(
@@ -242,6 +260,8 @@ def prepare_hunyuan_layout(
     image_processor: HunyuanImage3ImageProcessor,
     generation_config: GenerationConfig,
     image_base_size: int,
+    cfg_distilled: bool = False,
+    use_meanflow: bool = False,
 ) -> HunyuanPreparedLayout:
     """Build the CPU token/image layout reused by Scheduler and Worker."""
 
@@ -261,7 +281,12 @@ def prepare_hunyuan_layout(
     height = sampling.height or 1024
     width = sampling.width or 1024
     guidance_scale = resolve_hunyuan_guidance_scale(sampling)
-    generated_image_info = image_processor.build_image_info((height, width))
+    image_info_kwargs: dict[str, bool] = {}
+    if cfg_distilled:
+        image_info_kwargs["add_guidance_token"] = True
+    if use_meanflow:
+        image_info_kwargs["add_timestep_r_token"] = True
+    generated_image_info = image_processor.build_image_info((height, width), **image_info_kwargs)
     result = tokenizer_wrapper.apply_chat_template(
         batch_prompt=prompt,
         mode="gen_image",
@@ -273,7 +298,7 @@ def prepare_hunyuan_layout(
         bot_task=tokenizer_bot_task,
         image_base_size=image_base_size,
         sequence_template=getattr(generation_config, "sequence_template", "pretrain"),
-        cfg_factor=1 + int(guidance_scale > 1.0),
+        cfg_factor=hunyuan_cfg_factor(generated_image_info, guidance_scale),
         drop_think=getattr(generation_config, "drop_think", False),
     )
     tokenizer_output = result["output"]
@@ -334,10 +359,13 @@ def build_hunyuan_diffusion_kv_requests(
     request: OmniDiffusionRequest,
     prepared_layout: HunyuanPreparedLayout,
 ) -> tuple[DiffusionKVRequest, ...]:
-    """Build one persistent Scheduler KV request per Hunyuan execution row."""
+    """Build allocation-only KV requests, even when prefix caching is disabled."""
 
     tokenizer_output = prepared_layout.tokenizer_output
-    cfg_factor = 1 + int(resolve_hunyuan_guidance_scale(request.sampling_params) > 1.0)
+    cfg_factor = hunyuan_cfg_factor(
+        prepared_layout.generated_image_info,
+        resolve_hunyuan_guidance_scale(request.sampling_params),
+    )
     if prepared_layout.num_branches != cfg_factor:
         raise ValueError(
             "Hunyuan tokenizer sequence count does not match CFG execution: "
@@ -347,7 +375,32 @@ def build_hunyuan_diffusion_kv_requests(
     real_pos = tokenizer_output.real_pos
     assert prefix_positions is not None and real_pos is not None
 
+    def boundary_rows(field_name: str) -> list[int | None]:
+        positions = getattr(tokenizer_output, field_name)
+        if positions is None:
+            return [None] * cfg_factor
+        if not isinstance(positions, list) or not positions:
+            raise ValueError(f"Hunyuan {field_name} must be a non-empty boundary list")
+        # Batched tokenizer output contains a separate boundary for each CFG
+        # row. Never broadcast a conditional boundary into a negative row.
+        if cfg_factor == 1 and len(positions) == 1 and (positions[0] is None or type(positions[0]) is int):
+            return positions
+        if len(positions) == cfg_factor and all(
+            isinstance(row, list) and len(row) == 1 and (row[0] is None or type(row[0]) is int) for row in positions
+        ):
+            return [row[0] for row in positions]
+        raise ValueError(f"Hunyuan {field_name} must contain one boundary per CFG row")
+
+    think_boundaries = boundary_rows("think_recaption_end_pos")
+    uncond_boundaries = boundary_rows("uncond_cfg_start_pos")
+
     target_len = hunyuan_num_image_tokens(prepared_layout.generated_image_info)
+    reusable_lens = [0] * cfg_factor
+    if think_boundaries[0] is not None:
+        reusable_lens[0] = think_boundaries[0] or 0
+    if any(boundary is not None for boundary in uncond_boundaries):
+        for sequence_id in range(1, cfg_factor):
+            reusable_lens[sequence_id] = min(reusable_lens[0], uncond_boundaries[sequence_id] or 0)
     return tuple(
         DiffusionKVRequest(
             f"{request.request_id}/diffusion-kv/{sequence_id}",
@@ -357,6 +410,15 @@ def build_hunyuan_diffusion_kv_requests(
             prefix_len=int(prefix_row[-1].item()),
             target_len=target_len,
             seq_len=int(valid_row[-1].item()),
+            # Native AR -> DiT transfer needs token IDs to describe the
+            # transferred prefix.  Local paged prefix caching does not: its
+            # identity is attached later by ``prepare_hunyuan_prefix_cache``.
+            # Keep this conversion out of the disabled/local-only path.
+            prompt_token_ids=(
+                tokenizer_output.tokens[sequence_id, : reusable_lens[sequence_id]].tolist()
+                if request.kv_transfer_params is not None
+                else None
+            ),
             # Prompt and reference-image tokens are already embedded in this
             # row's primary self-attention sequence. Hunyuan therefore has no
             # independently projected cross/joint-attention KV context.
@@ -364,6 +426,93 @@ def build_hunyuan_diffusion_kv_requests(
         )
         for sequence_id, (prefix_row, valid_row) in enumerate(zip(prefix_positions, real_pos))
     )
+
+
+def prepare_hunyuan_prefix_cache(request: OmniDiffusionRequest) -> None:
+    """Attach native MM identities / positions when Engine enables caching.
+
+    This is model input adaptation, not a hashing framework. All reference
+    inputs are hashed once, then reused by VAE/ViT subspans and CFG rows. The
+    native block hasher consumes these ranges directly, without token extras.
+    """
+
+    layout = get_hunyuan_prepared_layout(request)
+    if layout is None or not request.diffusion_kv_requests:
+        raise ValueError("Hunyuan prefix caching requires prepared layout and KV requests")
+    sampling = request.sampling_params
+    _, _, _, images, _ = extract_hunyuan_prompt_inputs(
+        [request.prompt], sampling.extra_args or {}, request_id=request.request_id, allow_cond_image=True
+    )
+    reference_digest = None
+    if images:
+        # Match Worker: an explicitly supplied generator overrides the seed.
+        # Conditional VAE samples latents, so image bytes alone are not enough.
+        if sampling.generator is not None:
+            generators = sampling.generator if isinstance(sampling.generator, list) else [sampling.generator]
+            random_state: object = (
+                "generator-state",
+                tuple((str(generator.device), generator.get_state()) for generator in generators),
+            )
+        elif sampling.seed is not None:
+            random_state = ("seed", int(sampling.seed), str(sampling.generator_device or "worker-default"))
+        else:
+            random_state = ("request-local-random-state", request.request_id)
+        # Preserve the conservative whole-reference-set policy. Splitting
+        # independent image identities also needs the VAE RNG sequence modeled.
+        reference_digest = hash_prefix_cache_value(
+            (
+                "hunyuan-reference-v1",
+                [[joint_image_info_to_payload(image) for image in row] for row in images],
+                random_state,
+            )
+        )
+
+    namespace = get_cache_namespace("hunyuan-image3-primary-v4", sampling)
+    output = layout.tokenizer_output
+    joint_rows = output.joint_image_slices or [[] for _ in range(layout.num_branches)]
+    prepared = []
+    for row in request.diffusion_kv_requests:
+        if row.block_hashes or row.num_computed_tokens:
+            raise ValueError("Hunyuan cache inputs must be prepared before KV execution")
+        joint_spans = [(int(span.start or 0), int(span.stop or 0)) for span in joint_rows[row.sequence_id]]
+        features = []
+        for image_slice, (height, width) in layout.rope_image_info[row.sequence_id]:
+            start = int(image_slice.start or 0)
+            end = int(image_slice.stop or output.tokens.shape[1])
+            if start >= row.prefix_len or end <= 0:
+                continue
+            # Joint spans enclose VAE + separator + ViT; RoPE lists subspans.
+            is_reference = any(joint_start <= start and end <= joint_end for joint_start, joint_end in joint_spans)
+            if is_reference and reference_digest is None:
+                raise ValueError("Hunyuan reference-image prefix is missing its canonical inputs")
+            identifier = hash_prefix_cache_value(
+                (
+                    "hunyuan-image-span-v2",
+                    start,
+                    end,
+                    int(height),
+                    int(width),
+                    is_reference,
+                    reference_digest if is_reference else None,
+                )
+            ).hex()
+            features.append(
+                MultiModalFeatureSpec(
+                    data=None,
+                    modality="image",
+                    identifier=identifier,
+                    mm_position=PlaceholderRange(offset=start, length=end - start),
+                )
+            )
+        # Raw model inputs remain in request.prompt/prepared_layout; data=None
+        # here does not imply an encoder hit. These are Scheduler-only KV keys.
+        tokens = tuple(output.tokens[row.sequence_id, : row.prefix_len].tolist())
+        prepared.append((row, tokens, sorted(features, key=lambda feature: feature.mm_position.offset)))
+
+    for row, tokens, features in prepared:
+        row.cache_token_ids = tokens
+        row.mm_features = features
+        row.cache_namespace = namespace
 
 
 def get_hunyuan_prepared_layout(source: Any) -> HunyuanPreparedLayout | None:
@@ -375,3 +524,14 @@ def get_hunyuan_prepared_layout(source: Any) -> HunyuanPreparedLayout | None:
             f"HunyuanImage3 expected prepared_layout to be HunyuanPreparedLayout, got {type(prepared_layout).__name__}"
         )
     return prepared_layout
+
+
+def native_kv_covers_cond_images(output: TokenizerEncodeOutput, computed_tokens: tuple[int, ...]) -> bool:
+    """Skip image encoding only when every CFG row already contains its image KV."""
+    image_slices = output.joint_image_slices
+    if not image_slices or len(image_slices) != len(computed_tokens):
+        return False
+    return all(
+        slices and all(image_slice.stop <= computed for image_slice in slices)
+        for slices, computed in zip(image_slices, computed_tokens, strict=True)
+    )

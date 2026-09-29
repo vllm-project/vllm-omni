@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """
 Unit tests for cache backends (cache-dit and teacache).
@@ -164,7 +164,10 @@ class TestCacheDiTBackend:
             num_inference_steps=20,
             verbose=True,
         )
-        mock_cache_dit.summary.assert_called_once_with(transformer, details=True)
+        mock_cache_dit.summary.assert_called_once_with(
+            mock_block_adapter.return_value,
+            details=True,
+        )
 
     @patch("vllm_omni.diffusion.cache.cachedit.backend.logger")
     @patch("vllm_omni.diffusion.cache.cachedit.backend.cache_dit")
@@ -365,13 +368,10 @@ class TestCacheDiTBackend:
 
     @patch("vllm_omni.diffusion.cache.cachedit.backend.BlockAdapter")
     @patch("vllm_omni.diffusion.cache.cachedit.backend.cache_dit")
-    def test_enable_dreamid_pipeline_uses_fused_blocks(self, mock_cache_dit, mock_block_adapter):
-        """Test DreamID uses pipeline.transformer for cache enable/refresh.
-
-        NOTE: DreamID no longer has a custom enabler, so this tests against the generic path.
-        """
+    def test_enable_pipeline_uses_fused_blocks(self, mock_cache_dit, mock_block_adapter):
+        """Generic cache path should pick up ``transformer.fused_blocks``."""
         mock_pipeline = Mock()
-        mock_pipeline.__class__.__name__ = "DreamIDOmniPipeline"
+        mock_pipeline.__class__.__name__ = "FakeFusedBlocksPipeline"
         mock_pipeline.transformer = Mock()
         mock_pipeline.transformer.fused_blocks = Mock()
         mock_pipeline.transformer._cache_dit_adapter_config = CacheDiTAdapterConfig(

@@ -37,3 +37,8 @@ def parse_diffusion_kv_cache_mode(value: object) -> DiffusionKVCacheMode:
             "use 'dense_legacy' or 'paged_scheduler'"
         )
     return mode
+
+
+def is_scheduler_paged_kv_mode(mode: DiffusionKVCacheMode) -> bool:
+    """Return whether a parsed cache mode uses Scheduler-owned paging."""
+    return mode is DiffusionKVCacheMode.PAGED_SCHEDULER

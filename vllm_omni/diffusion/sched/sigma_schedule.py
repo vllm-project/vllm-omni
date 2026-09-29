@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -37,8 +37,11 @@ class DMD2SigmaSchedule:
         # have to be rejected before the monotonicity check rather than after it.
         if any(not math.isfinite(value) for value in values):
             raise ValueError("DMD2 base_schedule entries must be finite")
-        if values[0] != 1.0 or values[-1] != 0.0:
-            raise ValueError("DMD2 base_schedule must start at 1.0 and end at 0.0")
+        # A student whose training capped the noise level (``max_timestep_ratio``)
+        # starts just below 1.0 rather than at it, so the opening position is
+        # bounded rather than pinned; the terminal one is always clean latents.
+        if not 0.0 < values[0] <= 1.0 or values[-1] != 0.0:
+            raise ValueError("DMD2 base_schedule must start in (0.0, 1.0] and end at 0.0")
         if any(curr <= nxt for curr, nxt in zip(values, values[1:], strict=False)):
             raise ValueError("DMD2 base_schedule must be strictly decreasing")
 

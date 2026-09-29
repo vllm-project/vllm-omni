@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Regression tests for the Qwen3-Omni thinker forward return contract.
 
 Background
@@ -41,6 +41,7 @@ from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni import (
     Qwen3OmniMoeForConditionalGeneration,
 )
 from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker import (
+    Qwen3MoeLLMModel,
     Qwen3OmniMoeThinkerForConditionalGeneration,
 )
 
@@ -52,6 +53,52 @@ _TOKENS = 4
 
 def _hidden_states() -> torch.Tensor:
     return torch.zeros(_TOKENS, _HIDDEN)
+
+
+def test_single_rank_intermediate_capture_includes_deferred_residual(mocker):
+    """Capture the Talker state on the default single-PP-rank path."""
+    import vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker as module
+
+    pp_group = mocker.Mock(is_first_rank=True, is_last_rank=True)
+    mocker.patch.object(module, "get_pp_group", return_value=pp_group)
+
+    class SplitStateLayer(nn.Module):
+        def forward(self, positions, hidden_states, residual):
+            next_residual = hidden_states if residual is None else hidden_states + residual
+            return hidden_states * 2, next_residual
+
+    class Combine(nn.Module):
+        def forward(self, hidden_states, residual):
+            return hidden_states + residual, None
+
+    model = object.__new__(Qwen3MoeLLMModel)
+    nn.Module.__init__(model)
+    model.layers = nn.ModuleList([SplitStateLayer(), SplitStateLayer()])
+    model.start_layer = 0
+    model.end_layer = 2
+    model.norm = Combine()
+    inputs = torch.ones(_TOKENS, _HIDDEN)
+
+    output_without_capture, _ = Qwen3MoeLLMModel.forward(
+        model,
+        input_ids=None,
+        positions=torch.arange(_TOKENS),
+        inputs_embeds=inputs,
+    )
+    output_with_capture, captured = Qwen3MoeLLMModel.forward(
+        model,
+        input_ids=None,
+        positions=torch.arange(_TOKENS),
+        inputs_embeds=inputs,
+        capture_layer_indices=[0, 1],
+        return_hidden_states=True,
+    )
+
+    layers = captured["hidden_states"]["layers"]
+    torch.testing.assert_close(layers[0], inputs)
+    torch.testing.assert_close(layers[1], torch.full_like(inputs, 3))
+    torch.testing.assert_close(output_with_capture, output_without_capture)
+    torch.testing.assert_close(output_with_capture, torch.full_like(inputs, 7))
 
 
 class _InnerModelStub:
@@ -169,7 +216,7 @@ def test_make_omni_output_accepts_bare_tensor():
 
 def test_make_omni_output_accepts_capture_tuple():
     model = _make_combined(is_staged_run=True)
-    captured = {"hidden_states": {"layers": {}}}
+    captured: dict[str, dict[str, dict[int, torch.Tensor]]] = {"hidden_states": {"layers": {}}}
     out = model.make_omni_output((_hidden_states(), captured))
     assert isinstance(out, OmniOutput)
     assert out.multimodal_outputs == captured

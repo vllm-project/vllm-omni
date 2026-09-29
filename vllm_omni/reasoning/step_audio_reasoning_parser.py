@@ -5,7 +5,7 @@ from collections.abc import Iterable, Sequence
 from itertools import islice
 from typing import TYPE_CHECKING
 
-from vllm.entrypoints.openai.engine.protocol import DeltaMessage
+from vllm.entrypoints.generate.base.protocol import DeltaMessage
 from vllm.logger import init_logger
 from vllm.reasoning import ReasoningParser
 from vllm.tokenizers import TokenizerLike

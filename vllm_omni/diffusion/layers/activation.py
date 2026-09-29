@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Custom activation functions for diffusion models."""
 
 import torch
@@ -22,7 +23,7 @@ class SiluAndMul(CustomOp):
         return F.silu(x[..., :d]) * x[..., d:]
 
     def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
-        if x.device.type != "cuda":
+        if x.device.type == "cpu":
             return self.forward_native(x)
         d = x.shape[-1] // 2
         output_shape = x.shape[:-1] + (d,)
@@ -31,7 +32,6 @@ class SiluAndMul(CustomOp):
         return out
 
     def forward_npu(self, x: torch.Tensor) -> torch.Tensor:
-        return self.forward_native(x)
+        import torch_npu
 
-    def forward_xpu(self, x: torch.Tensor) -> torch.Tensor:
-        return self.forward_native(x)
+        return torch_npu.npu_swiglu(x, dim=-1)

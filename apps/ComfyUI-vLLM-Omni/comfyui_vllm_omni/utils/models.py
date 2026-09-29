@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import json
 import re
 from typing import Any
@@ -34,10 +37,28 @@ def _qwen25_payload_preprocessor(payload: dict) -> dict:
     return payload
 
 
+MINIMAX_H3_ASPECT_RATIOS = {
+    "21:9": 21.0 / 9.0,
+    "16:9": 16.0 / 9.0,
+    "4:3": 4.0 / 3.0,
+    "1:1": 1.0,
+    "3:4": 3.0 / 4.0,
+    "9:16": 9.0 / 16.0,
+}
+
+
+def _nearest_minimaxh3_aspect_ratio(width: int, height: int) -> str:
+    """Pick the supported named ratio closest to the requested frame size."""
+    target = float(width) / float(height)
+    return min(MINIMAX_H3_ASPECT_RATIOS, key=lambda name: abs(MINIMAX_H3_ASPECT_RATIOS[name] - target))
+
+
 def _minimaxh3_params_builder(
     model_params: dict[str, Any],
     *,
     extra_params: dict[str, Any],
+    width: int | None = None,
+    height: int | None = None,
 ) -> dict[str, Any]:
     """Build multipart form fields for MiniMax-H3 from model_params + routed task."""
     params = dict(model_params)
@@ -52,6 +73,12 @@ def _minimaxh3_params_builder(
             merged_extra_params[key] = params.pop(key)
     if params:
         logger.warning("Unused MiniMax-H3 model params ignored: %s", sorted(params))
+
+    # H3 refuses t2va without a named aspect ratio, and the Generate Video node
+    # carries width/height rather than a ratio. fl2va takes its ratio from the
+    # input image and ref2va defaults server-side, so only t2va needs this.
+    if merged_extra_params.get("task") == "t2va" and "aspect_ratio" not in merged_extra_params and width and height:
+        merged_extra_params["aspect_ratio"] = _nearest_minimaxh3_aspect_ratio(width, height)
 
     if merged_extra_params:
         form_fields["extra_params"] = json.dumps(merged_extra_params, ensure_ascii=False)

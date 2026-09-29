@@ -1,47 +1,54 @@
 # PersonaPlex full-duplex online serving
 
 Serve [`nvidia/personaplex-7b-v1`](https://huggingface.co/nvidia/personaplex-7b-v1)
-(a Moshi-based full-duplex speech-to-speech model) with the native vLLM-Omni engine.
+(a Moshi-based full-duplex speech-to-speech model) with the native vLLM-Omni engine
+through the unified full-duplex framework (`/v1/realtime?duplex=1`, alias `/v1/duplex`).
 
-The server hosts the **official PersonaPlex web client** at `/` (auto-downloaded from
-the model repo) and implements its WebSocket protocol at `/api/chat`, so you talk to the
-model live in the browser — mic in, agent speech + inner-monologue text out.
-
-> Experimental. Requires a GPU and Hugging Face access to the gated repo
+> Requires a GPU and Hugging Face access to the gated repo
 > (`HF_TOKEN` with access to `nvidia/personaplex-7b-v1`).
 
 ## Start the server
 
+The default `vllm_omni/deploy/personaplex.yaml` is a duplex deployment
+(`session_mode: duplex`, two sessions per replica):
+
 ```bash
-HF_TOKEN=... CUDA_VISIBLE_DEVICES=0 bash run_server.sh
-# or directly:
-HF_TOKEN=... CUDA_VISIBLE_DEVICES=0 python -m \
-    vllm_omni.experimental.fullduplex.personaplex.serving.server --port 8124
+HF_TOKEN=... CUDA_VISIBLE_DEVICES=0 python -m vllm_omni.entrypoints.cli.main serve \
+  /path/to/personaplex-7b-v1 \
+  --omni \
+  --deploy-config vllm_omni/deploy/personaplex.yaml
 ```
+
+This exposes `WS /v1/realtime?duplex=1` (alias `WS /v1/duplex`): the OpenAI
+Realtime session protocol projected onto vLLM-Omni duplex sessions (client API and
+wire protocol: [`docs/serving/realtime_duplex_api.md`](../../../docs/serving/realtime_duplex_api.md)).
+There is no `/v1/chat/completions` route: PersonaPlex answers speech only.
+
+PersonaPlex is a pure-lockstep model: every session is native duplex, audio flows
+continuously in both directions in 80 ms frames, the model decides when to speak,
+and there are no client commits or external turn signals
+(`supports_client_commit=false`, `supports_external_turn_signal=false`). A session
+therefore auto-responds without any vendor flag.
 
 ## Talk to it
 
-- **Browser (recommended):** open `http://localhost:8124/` and allow the microphone.
-  Use headphones so the agent does not hear itself.
-- **Headless:** stream a 24 kHz mono WAV and save the reply:
+With the client library and the PersonaPlex preset (24 kHz `pcm_f32le` in, bundled
+voice prompt, persona text):
 
-  ```bash
-  python duplex_client.py --url ws://localhost:8124/api/chat --input user.wav --out reply.wav
-  ```
+```python
+from vllm_omni.clients.duplex import DuplexClient
+from vllm_omni.clients.personaplex import create_duplex_session_config
 
-## Unified Realtime API
-
-The default `vllm_omni/deploy/personaplex.yaml` also enables main's engine-owned
-full-duplex control plane:
-
-```bash
-CUDA_VISIBLE_DEVICES=0 python -m vllm_omni.entrypoints.cli.main serve \
-  /path/to/personaplex-7b-v1 \
-  --omni \
-  --stage-configs-path vllm_omni/deploy/personaplex.yaml
+cfg = create_duplex_session_config(voice="NATF2.pt", persona="You are a concise assistant.")
+async with DuplexClient("ws://127.0.0.1:8000/v1/realtime?duplex=1", model="/path/to/personaplex-7b-v1", config=cfg) as c:
+    await c.stream_pcm(pcm_f32le_24k)          # keep streaming; the model speaks while it listens
 ```
 
-Validate the actual `/v1/realtime?duplex=1` scheduler path with paced 24 kHz
+Voice and persona are fixed for the session (`session.update` cannot change them).
+
+## Validate the serving path
+
+Validate the `/v1/realtime?duplex=1` scheduler path with paced 24 kHz
 PCM, two concurrent sessions, overflow admission, per-session slot recycling,
 and non-silent output:
 
@@ -52,33 +59,21 @@ python tests/e2e/online_serving/personaplex_realtime_duplex.py \
   --output-dir /tmp/personaplex-realtime-duplex
 ```
 
-This is distinct from the standalone `/api/chat` compatibility server above.
-The unified endpoint advertises `supports_barge_in=false`: overlapping speech
-is native model behavior, but destructive output interruption and model-state
-rewind have not been validated for PersonaPlex.
-
-## Protocol (`/api/chat`)
-
-Binary WebSocket messages, first byte is a tag (identical to `moshi.server`):
-
-| Direction | Tag | Payload |
-| --- | --- | --- |
-| server → client | `\x00` | ready handshake (after the system-prompt prefill) |
-| client → server | `\x01` | Opus-encoded mic audio (24 kHz) |
-| server → client | `\x01` | Opus-encoded agent audio |
-| server → client | `\x02` | UTF-8 inner-monologue text |
-
-Connect with query params `text_prompt` (persona) and `voice_prompt` (voice file).
-A raw-PCM endpoint (`/v1/audio/duplex`, JSON `open` + float32 frames) is also available
-for clients that do not want an Opus dependency.
+The endpoint advertises `supports_barge_in=false`: overlapping speech is native
+model behaviour, but destructive output interruption and model-state rewind have
+not been validated for PersonaPlex. `response.cancel` and
+`output_audio_buffer.clear` restart the model's conversation context (a fresh
+Stage 0 request replays the voice/persona prefill).
 
 ## Notes
 
-- **Run the client near the server.** Real-time 80 ms audio is sensitive to network
-  latency/jitter; over a high-latency remote link playback can stutter regardless of
-  engine speed. On localhost it is smooth.
-- Greedy decoding by default. One conversation per server by default (a second
-  concurrent connection is rejected with WS close 1013 until the first ends);
-  pass `--batch-size N` to host N concurrent conversations on one engine
-  (elastic batching; connections beyond N are rejected until a slot frees).
+- **Run the client near the server.** Real-time 80 ms frame audio is sensitive to
+  network latency/jitter; over a high-latency remote link playback can stutter
+  regardless of engine speed. On localhost it is smooth.
+- The earlier standalone Moshi-web compatibility server (browser client at `/`,
+  binary WS protocol at `/api/chat`, raw-PCM `/v1/audio/duplex`) was demo-only
+  and has been removed; use the unified endpoint above.
+- The model plugin, worker-side lockstep runtime and input framing live in
+  `vllm_omni/model_executor/models/personaplex/duplex/`; design notes in
+  [`docs/design/fullduplex-personaplex.md`](../../../docs/design/fullduplex-personaplex.md).
 - Full runbook: [`recipes/NVIDIA/PersonaPlex.md`](../../../recipes/NVIDIA/PersonaPlex.md).

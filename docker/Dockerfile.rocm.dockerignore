@@ -1,0 +1,35 @@
+# Keep the linked source layer small and deterministic.
+.git
+.venv
+/build
+dist
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+.mypy_cache
+
+# Distribution / packaging
+.Python
+/build/
+cmake-build-*/
+CMakeUserPresets.json
+develop-eggs/
+/dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+rust/target/

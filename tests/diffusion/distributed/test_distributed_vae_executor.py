@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 from types import SimpleNamespace
 
 import pytest
@@ -58,6 +59,11 @@ class E2EOperator:
         return torch.cat(tiles, dim=0)
 
 
+@dataclass
+class FakeWorldGroup:
+    device_group: object
+
+
 class DummyMixin(DistributedVaeMixin):
     def __init__(self):
         self.use_tiling = True
@@ -75,6 +81,16 @@ def mock_dist(monkeypatch: pytest.MonkeyPatch):
 
 
 @pytest.fixture(autouse=True)
+def mock_world_group(monkeypatch: pytest.MonkeyPatch):
+    group = object()
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor.get_world_group",
+        lambda: FakeWorldGroup(device_group=group),
+    )
+    return group
+
+
+@pytest.fixture(autouse=True)
 def mock_dist_vae_executor(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(DistributedVaeExecutor, "gather_tensors", lambda self, x: [x])
     monkeypatch.setattr(DistributedVaeExecutor, "broadcast_tensor", lambda self, x: x)
@@ -83,6 +99,11 @@ def mock_dist_vae_executor(monkeypatch: pytest.MonkeyPatch):
 # ============================
 # Unitest
 # ============================
+
+
+def test_uses_dedicated_world_device_group(mock_world_group):
+    executor = DistributedVaeExecutor()
+    assert executor.group is mock_world_group
 
 
 def test_balance_tasks():

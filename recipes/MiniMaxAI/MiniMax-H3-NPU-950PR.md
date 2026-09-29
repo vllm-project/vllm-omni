@@ -1,195 +1,224 @@
-# MiniMax-H3 on a single NPU 950PR
+# MiniMax H3 on Ascend 950PR / 950DT
 
-This recipe runs MiniMax-H3 with online INT8 quantization on one NPU 950PR
-NPU (128 GB HiBL 1.0 HBM). It covers the single-card T2VA configuration at
-1024x576. For the eight-card Atlas 800I A3 BF16 route at 768P, see
-[MiniMax-H3-NPU.md](MiniMax-H3-NPU.md).
+> Joint video and audio generation — Ascend NPU deployment guide for the
+> four-card Ascend 950PR / 950DT route
 
-## Capacity requirements
+## Summary
 
-| Resource | Requirement |
-| --- | ---: |
-| NPU | 1x NPU 950PR |
-| NPU HBM | 128 GiB (131,072 MiB reported by `npu-smi`) |
-| Observed HBM high-water mark | 118,442 MiB (90.4% of capacity) |
-| Checkpoint storage | 135 GiB per partition, local disk strongly preferred |
-| Container shared memory | 8 GiB, or a writable local filesystem for spill |
+- Vendor: MiniMaxAI
+- Model: [`MiniMaxAI/MiniMax-H3`](https://huggingface.co/MiniMaxAI/MiniMax-H3)
+- Tasks: T2VA, FL2VA, and Ref2VA
+- Mode: OpenAI-compatible `/v1/videos` HTTP serving
+- Hardware: Ascend 950PR / Ascend 950DT, 4x NPU (128 GB HBM per device)
+- Maintainer: Community
 
-The observed high-water mark leaves about 12.3 GiB of headroom, so this card is
-sized for exactly one resident task partition at 1024x576. Do not expect a
-larger output shape or concurrency greater than one to fit.
-
-Because a single 950PR holds the whole partition in HBM, this route does not
-need layerwise offload, and the 200 GiB system-RAM floor carried by the 72 GiB
-GPU recipes does not apply. The validated run completed inside a container
-limited to 32 GiB of RAM. Passing `--enable-layerwise-offload` on this card is
-actively harmful: it stages weights in non-reclaimable host memory and the
-container's OOM killer terminates the server with exit code -9.
-
+This recipe covers the four-card 950PR / 950DT configuration at 1344x768.
+For the eight-card Atlas 800I A2 / A3 route, see
+[MiniMax-H3-NPU.md](MiniMax-H3-NPU.md); checkpoint layout, container
+preparation, MindIE-SD installation, and the ffmpeg/decord dependencies are
+described there and apply unchanged.
 
 ## Environment
 
-- Host architecture: x86_64
--  driver: 25.7.rc1.6 (hal 7.35.23)
--  firmware: 9.0.0.105.229
-- CANN toolkit: 9.1.0 (`/usr/local//cann-9.1.0`)
-- npu-smi: 25.7.rc1.6
-- Python: 3.12.13
-- PyTorch: 2.10.0+cpu
-- torch_npu: 2.10.0.post2
-- vLLM: 0.26.0
-- vLLM-Omni: 0.26.1.dev103+g584d78c67.npu (commit `584d78c6`)
-
-Install vLLM-Omni from a checkout with MiniMax-H3 support:
+Use the A5 variant of the official vLLM-Omni NPU images (see
+[NPU installation](../../docs/getting_started/installation/npu.md)):
 
 ```bash
-uv venv
-source .venv/bin/activate
-uv pip install -e .
+export IMAGE=quay.io/ascend/vllm-omni:v0.29.0-a5
 ```
+
+Check the [tag list](https://quay.io/repository/ascend/vllm-omni?tab=tags)
+for newer releases. Inside the container, install MindIE-SD and the optional
+Ref2VA media dependencies as described in
+[MiniMax-H3-NPU.md § Environment](MiniMax-H3-NPU.md#environment).
 
 ## Start a server
 
+Task selection follows the eight-card recipe: pass `--task-type fl2va` or
+`--task-type ref2va` to pick the task partition. The configurations below use
+4-card USP, 4-card text-encoder TP, and VAE `tile` parallelism.
+
+The two recommended configurations differ in how they fit memory: the
+lossless configuration enables distributed layerwise offload (DLO) to avoid
+activation OOM at longer durations, while the lossy configuration fits the
+maximum supported MiniMax-H3 workload shape without OOM, so DLO is omitted
+for performance.
+
+### Recommended lossless configuration (Ascend 950PR / 950DT)
+
 ```bash
-export MODEL=/path/to/MiniMax-H3/FL2VA
-export PORT=8000
+export PORT=9098
+export MODEL=/path/to/MiniMax-H3
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
-export VLLM_OMNI_VIDEO_SYNC_TIMEOUT=14400
+export VLLM_OMNI_VIDEO_SYNC_TIMEOUT=4000
+export PYTHONDONTWRITEBYTECODE=1
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export HCCL_NPU_SOCKET_PORT_RANGE="auto"
 
 vllm serve "${MODEL}" \
   --omni \
   --host 0.0.0.0 \
   --port "${PORT}" \
   --trust-remote-code \
-  --num-gpus 1 \
-  --tensor-parallel-size 1 \
-  --usp 1 \
+  --task-type fl2va \
+  --num-gpus 4 \
+  --usp 4 \
   --ring 1 \
-  --text-encoder-tp-size 1 \
-  --vae-patch-parallel-size 1 \
+  --text-encoder-tp-size 4 \
   --vae-parallel-mode tile \
   --vae-use-tiling \
-  --init-timeout 14400 \
-  --stage-init-timeout 14400 \
-  --quantization int8
+  --vae-patch-parallel-size 4 \
+  --enable-diffusion-pipeline-profiler \
+  --enable-distributed-layerwise-offload \
+  --diffusion-attention-backend FLASH_ATTN
 ```
 
-Do not pass `--diffusion-attention-backend CUDNN_ATTN`. cuDNN attention has no
-NPU implementation and fails at the first denoise step. Leave the backend
-unset: it resolves to `TORCH_SDPA`, or to `FLASH_ATTN` when MindIE-SD is
-installed (see [MiniMax-H3-NPU.md § Environment](MiniMax-H3-NPU.md#environment)).
+H3 is CFG-distilled, so `--cfg-parallel-size` must remain 1. The first
+request includes regional compilation; warm the server once before measuring
+steady-state latency.
 
-H3 is CFG-distilled, so `--cfg-parallel-size` must remain 1.
+### Recommended lossy configuration (Ascend 950PR / 950DT)
 
-## Validated evidence
-
-Measured on one NPU 950PR with the server command above plus
-`--enable-diffusion-pipeline-profiler`, generating a 5 s 1024x576 T2VA clip from
-the request in [§ T2VA request example](#t2va-request-example). MiniMax-H3
-requested 60 denoise steps and executed 59 denoise updates, so per-step latency
-is `denoise / 59`. `ffprobe` confirms every returned MP4 is 1024x576, 24 fps,
-124 video frames, 5.175 s, with a 32 kHz audio track of 165,600 samples.
-
-Five requests were issued back to back with no idle time between them. The card
-is measurably faster on the first request than in steady state, so both regimes
-are reported.
-
-| Stage | First request, cold card | Thermal steady state |
-| --- | ---: | ---: |
-| End-to-end request | 462.13 s | 506.38 s |
-| Text encode | 0.55 s | 0.05 s |
-| Denoise (59 updates) | 429.29 s | 471.74 s |
-| Per denoise update | 7,276 ms | 7,996 ms |
-| VAE decode | 8.43 s | 8.14 s |
-| Worker-to-server handoff | 24 s | 27 s |
-| MP4 muxing | 0.57 s | 0.50 s |
-| Server-reported `denoise_step_latency_ms` | 7,702 ms | 8,440 ms |
-| Peak HBM (`npu-smi`) | 118,442 MiB | 118,442 MiB |
-| Average NPU power | 566.9 W | 556.9 W |
-| Peak NPU temperature | 104 C | 104 C |
-
-Sample counts differ per row. The cold column is a single request. In the steady
-column, text encode, denoise and VAE decode are means over the four subsequent
-requests — denoise spanned 470.37 to 473.21 s, a 0.60% spread — while
-end-to-end, handoff and muxing are means over the two of those four that
-survived the handoff timeout described above.
-
-**Report the steady-state column.** The cold card completes denoise 9.9% faster
-while drawing only 1.8% more average power, and both regimes reach the same
-104 C ceiling, so the first request is buying a short window of higher clocks
-before the die saturates. Any benchmark that issues a single request against an
-idle card will overstate throughput by about 10%.
-
-**Do not read `denoise_step_latency_ms` as a per-step time.** The server divides
-the entire stage wall time by the 60 *requested* steps, so it absorbs text
-encoding, VAE decode and the 837 MiB handoff. All three successful requests
-satisfy `denoise_step_latency_ms == e2e_stage_wall_time_ms / 60` exactly. The
-per-update figure in the table is `diffuse / 59` from the pipeline profiler.
-
-Denoise accounts for 93% of the steady-state request and the handoff accounts
-for 5.3%, so keeping the transfer in shared memory should bring end-to-end down
-to roughly 480 s.
-
-Peak HBM is sampled externally with `npu-smi` at a 3 s interval. It is a
-reserved high-water mark rather than live allocation: it reads 111,272 MiB after
-weight loading and before the first request, and does not fall back after
-requests complete. Re-measure for longer outputs, a different output shape, or
-concurrency greater than one.
-
-### Startup
-
-Weight loading took **31 min 50 s** on the validated host (first log line
-08:04:59, `Application startup complete` 08:36:49), with the checkpoint on a
-shared GlusterFS network mount. This is why the server command sets
-`--init-timeout 14400` and `--stage-init-timeout 14400`; the stock 600 s and
-1800 s timeouts both abort mid-load with `TimeoutError` and exit code 143.
-Reduce both timeouts when the partition is staged on local disk.
-
-## T2VA request example
+Adds EQBSA sparse attention (block-sparse with Q/K INT8 + V FP8 mixed
+precision) and MXFP8 online quantization, and drops DLO:
 
 ```bash
-export API_URL="http://127.0.0.1:${PORT}/v1/videos/sync"
+export PORT=9098
+export MODEL=/path/to/MiniMax-H3
+export VLLM_WORKER_MULTIPROC_METHOD=spawn
+export VLLM_OMNI_VIDEO_SYNC_TIMEOUT=4000
+export PYTHONDONTWRITEBYTECODE=1
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export HCCL_NPU_SOCKET_PORT_RANGE="auto"
 
-curl -sS --max-time 1800 -X POST "${API_URL}" \
-  -F 'prompt=At night, three cats march into a bedroom playing tiny brass instruments, then abruptly file out, with synchronized room ambience.' \
-  -F 'width=1024' \
-  -F 'height=576' \
-  -F 'aspect_ratio=16:9' \
-  -F 'fps=24' \
-  -F 'num_inference_steps=60' \
-  -F 'flow_shift=12' \
-  -F 'seed=1101' \
-  -F 'extra_params={"task":"t2va","duration":5,"audio_flow_shift":3.0}' \
-  -o t2va.mp4
+vllm serve "${MODEL}" \
+  --omni \
+  --host 0.0.0.0 \
+  --port "${PORT}" \
+  --trust-remote-code \
+  --task-type fl2va \
+  --num-gpus 4 \
+  --usp 4 \
+  --ring 1 \
+  --text-encoder-tp-size 4 \
+  --vae-parallel-mode tile \
+  --vae-use-tiling \
+  --vae-patch-parallel-size 4 \
+  --enable-diffusion-pipeline-profiler \
+  --diffusion-attention-config '{"default":{"backend":"RAINFUSION_ATTN","block_sparse":{"sparsity":0.8,"precision":"mix","start_step":8,"end_step":12}}}' \
+  --diffusion-quantization-config '{"transformer":{"method":"mxfp8"}}'
 ```
+
+The recommended lossy configuration uses a **start=8 / end=12** dense-fallback
+window; see below for more aggressive settings.
+
+### Optional optimizations
+
+The following sections list only the **increment or replacement** relative to
+the recommended lossless configuration; environment variables and the
+remaining flags stay unchanged.
+
+#### Tuning the EQBSA dense-fallback window
+
+`start_step` and `end_step` are the numbers of leading/trailing steps that
+fall back to dense attention — not step indices. `precision` defaults to
+`bf16`; EQBSA requires setting it to `mix` explicitly. For 1344x768, 50-step
+T2VA:
+
+| Configuration | `start_step` | `end_step` | Notes |
+| --- | ---: | ---: | --- |
+| Quality first (recommended) | 8 | 13 | General and complex-motion scenes |
+| Balanced | 0 | 13 | Balanced |
+| Speed first | 0 | 0 | Simple, low-motion scenes |
+
+When frames look discontinuous or details unstable, increase `end_step`
+first, then `start_step`; do not compensate by lowering `sparsity` alone.
+These pairings were validated at 1344x768 / 50 steps only; re-evaluate for
+other resolutions or step counts.
+
+#### Cache-DiT
+
+Append to enable DiT block caching with TaylorSeer extrapolation — see the
+[Cache-DiT guide](../../docs/user_guide/diffusion/cache_acceleration/cache_dit.md):
+
+```bash
+  --cache-backend cache_dit \
+  --enable-cache-dit-summary \
+  --cache-config '{"Fn_compute_blocks":2,"Bn_compute_blocks":1,"max_warmup_steps":4,"residual_diff_threshold":0.4,"max_continuous_cached_steps":4,"enable_taylorseer":true,"taylorseer_order":2}'
+```
+
+#### MXFP4 online quantization
+
+Append to switch the DiT to MXFP4 online quantization:
+
+```bash
+  --diffusion-quantization-config '{"transformer":{"method":"mxfp4"}}'
+```
+
+and remove `--enable-distributed-layerwise-offload`.
+
+## Request examples
+
+Identical to the eight-card recipe; see
+[MiniMax-H3-NPU.md § HTTP API examples](MiniMax-H3-NPU.md#http-api-examples)
+and the GPU recipe's full parameter table.
+
+## Benchmarks (Ascend 950PR)
+
+Measured with `--enable-diffusion-pipeline-profiler` on vLLM-Omni 0.28.0:
+lossless rows use the recommended lossless configuration (with DLO), lossy
+rows the recommended lossy configuration (EQBSA + MXFP8, without DLO). Memory
+figures are per device.
+
+| Task | Resolution | Frames | Duration (s) | Config | E2E (s) | DiT total (s) | DiT per-step (s) | DiT steps | Text encode (s) | Ref video encode (s) | Ref audio encode (s) | VAE decode (s) | Ref preprocess (s) | Post-process (s) | CPU MP4 (s) | Resident weights (GB) | Peak memory (GB) |
+| ---- | ---- | ---- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| t2va | 1344x768 | 124 | 5 | lossless | 203.95 | 198.10 | 4.04 | 49 | 0.57 | NA | NA | 5.05 | NA | 0.001 | 0.23 | 3.97 | 22.2 |
+| t2va | 1344x768 | 362 | 15 | lossless | 1489.17 | 1474.35 | 30.08 | 49 | 0.69 | NA | NA | 13.45 | NA | 0.001 | 0.82 | 3.97 | 32.14 |
+| t2va | 1344x768 | 124 | 5 | lossy | 113.86 | 109.81 | 2.24 | 49 | 0.03 | NA | NA | 3.82 | NA | 0.001 | 0.21 | 56.99 | 64.38 |
+| t2va | 1344x768 | 362 | 15 | lossy | 762.17 | 749.40 | 15.29 | 49 | 0.03 | NA | NA | 12.19 | NA | 0.001 | 0.61 | 56.99 | 74.26 |
+| ref2va | 1344x768 | 124 | 5 | lossless | 745.43 | 730.22 | 14.9 | 49 | 1.16 | 8.15 | 0.13 | 5.12 | 0.41 | 0.001 | 0.28 | 3.97 | 23.82 |
+| ref2va | 1344x768 | 362 | 15 | lossless | 5887.24 | 5847.57 | 119.33 | 49 | 2.54 | 22.07 | 0.23 | 13.34 | 0.81 | 0.001 | 0.70 | 3.97 | 32.53 |
+| ref2va | 1344x768 | 124 | 5 | lossy | 400.40 | 387.82 | 7.91 | 49 | 0.95 | 7.05 | 0.09 | 3.91 | 0.41 | 0.001 | 0.21 | 56.6 | 66.03 |
+| ref2va | 1344x768 | 362 | 15 | lossy | 3037.84 | 3001.31 | 61.24 | 49 | 2.28 | 20.64 | 0.15 | 12.1 | 0.81 | 0.001 | 0.70 | 56.6 | 74.76 |
+
+The resident-weight figures reflect the DLO strategy difference: with DLO
+(lossless rows) DiT weights live in host memory and only the active layer
+stays on the device, while without DLO (lossy rows) the quantized weights are
+resident in HBM. Peak memory stays well inside the 128 GB per-device capacity
+in both cases. These numbers describe the validated shapes rather than a
+general throughput guarantee.
 
 ## Known limitations
 
-- INT8 online quantization is validated for T2VA on this card. Use BF16 for
-  FL2VA and Ref2VA, or re-measure before relying on it.
-- Single-card serving loads one task partition at a time. For Ref2VA, stop the
-  server and restart it against the `Ref2VA` directory.
-- Sustained load drives the die to 104 C and costs about 10% of denoise
-  throughput relative to a cold card. Warm the server with at least one full
-  request before measuring, and treat steady state as the reportable number.
-- Requests can fail during result handoff on hosts where the IPC spill path is
-  slow. See [§ Result handoff and shared
-  memory](#result-handoff-and-shared-memory).
-- Loading the checkpoint from a network mount takes over 30 minutes and forces
-  very large init timeouts. Stage the partition on local disk when possible.
-- The configuration measured here is 1024x576 at 60 steps, which differs from
-  the 1344x768 at 50 steps used by the GPU recipes in this directory. Denoise
-  cost scales superlinearly with token count, so the numbers are not directly
-  comparable across recipes.
-- The image ships a `triton` package whose  backend is not built
-  (`No module named 'triton._C.libtriton.'`). vLLM logs this as an error
-  at startup and disables Triton; the diffusion path does not need it and the
-  run completes normally.
+- Task serving is partitioned by `--task-type`: T2VA/FL2VA and Ref2VA load
+  different DiTs, so switching between them requires a restart with the other
+  partition.
+- H3 currently executes one generation request per diffusion batch.
+- The first regional-compile request is a warmup and should not be included
+  in steady-state performance measurements.
+- VAE patch parallelism requires size 1 or the full DiT group size and
+  supports the H3 native `tile` mode only.
+- The lossy configuration (EQBSA + MXFP8) is validated for T2VA and Ref2VA;
+  use the lossless configuration for FL2VA or re-validate first.
+- The lossless configuration trades throughput for activation headroom via
+  DLO; if your workload never approaches the maximum duration, dropping
+  `--enable-distributed-layerwise-offload` may improve latency at the risk of
+  OOM on longer durations.
 
 ## Additional resources
 
 - [MiniMax-H3.md](MiniMax-H3.md) — full GPU guide
-- [MiniMax-H3-NPU.md](MiniMax-H3-NPU.md) — eight-card Atlas 800I A3 BF16 guide
-- [Int8 quantization](../../docs/user_guide/quantization/int8.md)
+- [MiniMax-H3-NPU.md](MiniMax-H3-NPU.md) — eight-card Atlas 800I A2 / A3
+  guide (checkpoint, container, and dependency details)
+- [NPU installation](../../docs/getting_started/installation/npu.md)
+- [RainFusion attention](../../docs/user_guide/diffusion/attention_backends/rainfusion.md)
+  — block-sparse knobs and tuning
+- [Online quantization](../../docs/user_guide/quantization/online.md)
+  — INT8 / MXFP8 / MXFP4
+- [Cache-DiT guide](../../docs/user_guide/diffusion/cache_acceleration/cache_dit.md)
 - [Supported models](../../docs/models/supported_models.md)
 - [Video API](../../docs/serving/videos_api.md)

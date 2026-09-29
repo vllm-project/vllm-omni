@@ -46,20 +46,20 @@ More failure modes (for example, network jitter and network interruption) will b
 ## Fault Injection Scenario Matrix
 
 | Scenario | Fault Type | System Behavior | Current Status |
-|------|----------------------------|----------|----------|
-| No load | Send `SIGKILL` to Worker | Worker process is killed immediately; main service detects child-process loss and turns unavailable; API enters stable 5xx |  |
-| No load | Send `SIGTERM` to Worker | Worker exits after receiving termination signal; main service is marked unavailable; API enters stable 5xx |  |
+| ------ | ---------------------------- | ---------- | ---------- |
+| No load | Send `SIGKILL` to Worker | Worker process is killed immediately; main service detects child-process loss and turns unavailable; API enters stable 5xx | |
+| No load | Send `SIGTERM` to Worker | Worker exits after receiving termination signal; main service is marked unavailable; API enters stable 5xx | |
 | No load | Send `SIGKILL` to serve main process | serve main process exits instantly; request connections are interrupted; related child processes are cleaned up with no residue; GPU memory is released quickly | [#3725](https://github.com/vllm-project/vllm-omni/issues/3725) <br>[#43060](https://github.com/vllm-project/vllm/issues/43060) |
-| No load | Send `SIGTERM` to serve main process | serve enters graceful shutdown and stops serving; then exits and completes cleanup; GPU memory is released |  |
-| No load | Send `SIGINT` to serve main process (equivalent to `Ctrl+C`) | Triggers serve shutdown path; service stops responding and becomes unavailable; related child processes exit and resources are released |  |
-| No load | Send `SIGKILL` to all related processes | All related processes terminate immediately; service becomes unavailable at once; no residual processes remain; GPU memory is released quickly |  |
-| No load | Send `SIGTERM` to all related processes | All processes enter exit flow and complete shutdown; service becomes unavailable; resource release is completed |  |
+| No load | Send `SIGTERM` to serve main process | serve enters graceful shutdown and stops serving; then exits and completes cleanup; GPU memory is released | |
+| No load | Send `SIGINT` to serve main process (equivalent to `Ctrl+C`) | Triggers serve shutdown path; service stops responding and becomes unavailable; related child processes exit and resources are released | |
+| No load | Send `SIGKILL` to all related processes | All related processes terminate immediately; service becomes unavailable at once; no residual processes remain; GPU memory is released quickly | |
+| No load | Send `SIGTERM` to all related processes | All processes enter exit flow and complete shutdown; service becomes unavailable; resource release is completed | |
 | Under load | Send `SIGKILL` to Worker | In-flight requests are hard interrupted (5xx/connection drop); main service becomes unavailable | [#3683](https://github.com/vllm-project/vllm-omni/issues/3683) |
-| Under load | Send `SIGTERM` to Worker | In-flight requests are canceled or fail fast; main service becomes unavailable |  |
+| Under load | Send `SIGTERM` to Worker | In-flight requests are canceled or fail fast; main service becomes unavailable | |
 | Under load | Send `SIGKILL` to serve main process | serve is hard-killed and current connections are interrupted; in-flight requests fail; after cleanup there are no residual processes and GPU memory is released | [#3683](https://github.com/vllm-project/vllm-omni/issues/3683) |
 | Under load | Send `SIGTERM` to serve main process | serve stops accepting new requests and executes shutdown flow; in-flight requests fail; no residue remains and GPU memory is released | [#3683](https://github.com/vllm-project/vllm-omni/issues/3683) |
 | Under load | Send `SIGINT` to serve main process (equivalent to `Ctrl+C`) | `Ctrl+C`-style serve shutdown; in-flight requests fail (5xx/connection interruption); service unavailable; after exit there is no residue and GPU memory is released | [#3683](https://github.com/vllm-project/vllm-omni/issues/3683) |
-| Under load | Send `SIGKILL` to all related processes | All processes terminate instantly; all in-flight requests fail; service becomes unavailable immediately; GPU memory is released quickly |  |
+| Under load | Send `SIGKILL` to all related processes | All processes terminate instantly; all in-flight requests fail; service becomes unavailable immediately; GPU memory is released quickly | |
 | Under load | Send `SIGTERM` to all related processes | All processes exit gracefully; in-flight requests fail; service unavailable; GPU memory is released | [#3683](https://github.com/vllm-project/vllm-omni/issues/3683) |
 | OOM | Occupy all free GPU memory via an extra process | After OOM injection process starts, GPU memory is continuously saturated; service enters unavailable/degraded state and health check drops to 503; different request types (chat/speech, etc.) fail fast within a fixed time and return 500 (no hanging) | [#4285](https://github.com/vllm-project/vllm-omni/issues/4285) |
 

@@ -199,11 +199,20 @@ curl -X POST http://localhost:8091/v1/videos \
 | `boundary_ratio`      | float  | None    | Boundary split ratio for low/high DiT (Wan2.2)   |
 | `flow_shift`          | float  | None    | Scheduler flow shift (Wan2.2)                    |
 | `seed`                | int    | None    | Random seed (reproducible)                       |
+| `num_outputs_per_prompt` | int  | 1       | Number of videos to generate (1-10, MiniMax H3); only the first is returned, see below |
 | `lora`                | object | None    | LoRA configuration                               |
 | `enable_frame_interpolation` | bool | false | Enable RIFE frame interpolation before MP4 encoding |
 | `frame_interpolation_exp` | int | 1 | Interpolation exponent; 1=2x temporal resolution, 2=4x |
 | `frame_interpolation_scale` | float | 1.0 | RIFE inference scale; use 0.5 for high-resolution inputs |
 | `frame_interpolation_model_path` | str | None | Local directory or Hugging Face repo ID with `flownet.pkl`; defaults to `elfgum/RIFE-4.22.lite` |
+
+!!! note "Only the first output is returned"
+    `num_outputs_per_prompt` is forwarded to the pipeline, so the model does
+    generate that many videos and you pay the generation cost for all of them.
+    `/v1/videos` and `/v1/videos/sync` then return only the **first** one,
+    because an async video job stores a single file per video id. The server
+    logs a warning when it discards the extra outputs. Keep this at `1`
+    unless you have a specific reason to generate videos you will not receive.
 
 ## Frame Interpolation
 

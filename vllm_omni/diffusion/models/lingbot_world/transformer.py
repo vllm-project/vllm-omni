@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Checkpoint-compatible causal DiT for the LingBot World v2 model package."""
 
 from __future__ import annotations
@@ -8,7 +8,7 @@ import math
 from collections.abc import Iterable
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Any, Self, cast
+from typing import TYPE_CHECKING, Any, Self, cast
 
 import torch
 import torch.nn as nn
@@ -24,6 +24,9 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.utils import set_weight_attrs
 
 from vllm_omni.diffusion.attention.layer import Attention
+from vllm_omni.diffusion.distributed.comm import SeqAllToAll4D, all_to_all_5D
+from vllm_omni.diffusion.distributed.parallel_state import get_sp_group
+from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelInput, SequenceParallelOutput
 from vllm_omni.diffusion.layers.norm import LayerNorm
 from vllm_omni.diffusion.layers.rope import RotaryEmbeddingWan
 from vllm_omni.experimental.ar_diffusion.kv_cache.paged_attention import (
@@ -32,6 +35,9 @@ from vllm_omni.experimental.ar_diffusion.kv_cache.paged_attention import (
     ar_diffusion_paged_attention,
     paged_write_attn,
 )
+
+if TYPE_CHECKING:
+    from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
 
 @dataclass
@@ -127,6 +133,37 @@ def _projection_prefix(prefix: str, name: str) -> str:
     return f"{prefix}.{name}" if prefix else name
 
 
+def _ulysses_state() -> tuple[int, int, torch.distributed.ProcessGroup | None]:
+    coordinator = get_sp_group()
+    return (
+        int(coordinator.ulysses_world_size),
+        int(coordinator.ulysses_rank),
+        coordinator.ulysses_group,
+    )
+
+
+class _LingBotSPPrepare(nn.Module):
+    """Expand frame conditioning only when Ulysses shards the token sequence."""
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        camera_hidden_states: torch.Tensor,
+        timestep_projection: torch.Tensor,
+        rotary_emb: tuple[torch.Tensor, torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        num_frames = timestep_projection.shape[1]
+        if hidden_states.shape[1] % num_frames:
+            raise ValueError("LingBot token count must be divisible by the latent frame count.")
+        tokens_per_frame = hidden_states.shape[1] // num_frames
+        if get_sp_group().ulysses_world_size > 1:
+            timestep_projection = (
+                timestep_projection.unsqueeze(2).expand(-1, -1, tokens_per_frame, -1, -1).flatten(1, 2)
+            )
+        cosine, sine = rotary_emb
+        return hidden_states, camera_hidden_states, timestep_projection, cosine, sine
+
+
 class LingBotSelfAttention(nn.Module):
     """Block-causal self-attention over retained history and one full chunk."""
 
@@ -136,6 +173,7 @@ class LingBotSelfAttention(nn.Module):
         num_heads: int,
         *,
         eps: float = 1e-6,
+        quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -154,9 +192,17 @@ class LingBotSelfAttention(nn.Module):
             head_size=self.head_dim,
             total_num_heads=num_heads,
             bias=True,
+            quant_config=quant_config,
             prefix=_projection_prefix(prefix, "qkv"),
         )
         self.num_local_heads = self.qkv.num_heads
+        self.ulysses_world_size, self.ulysses_rank, self.ulysses_group = _ulysses_state()
+        if self.num_local_heads % self.ulysses_world_size:
+            raise ValueError(
+                "LingBot local attention heads must be divisible by the Ulysses degree: "
+                f"heads={self.num_local_heads}, ulysses={self.ulysses_world_size}."
+            )
+        self.num_sp_heads = self.num_local_heads // self.ulysses_world_size
         self.tp_inner_dim = self.num_local_heads * self.head_dim
         self.o = RowParallelLinear(
             dim,
@@ -164,15 +210,16 @@ class LingBotSelfAttention(nn.Module):
             bias=True,
             input_is_parallel=True,
             return_bias=False,
+            quant_config=quant_config,
             prefix=_projection_prefix(prefix, "o"),
         )
         self.norm_q = _LingBotRMSNorm(self.tp_inner_dim, eps)
         self.norm_k = _LingBotRMSNorm(self.tp_inner_dim, eps)
         self.rotary_embedding = RotaryEmbeddingWan(is_neox_style=False, half_head_dim=True)
         self.attn = Attention(
-            num_heads=self.num_local_heads,
+            num_heads=self.num_sp_heads,
             head_size=self.head_dim,
-            num_kv_heads=self.num_local_heads,
+            num_kv_heads=self.num_sp_heads,
             softmax_scale=self.head_dim**-0.5,
             causal=False,
             role="self",
@@ -287,6 +334,20 @@ class LingBotSelfAttention(nn.Module):
             query = self.rotary_embedding(query, cos, sin)
             key = self.rotary_embedding(key, cos, sin)
 
+        if self.ulysses_world_size > 1:
+            # One fused sequence->head all-to-all for q/k/v instead of three:
+            # (B, S/N, 3, H, D) -> (B, S, 3, H/N, D). Same head-group assignment
+            # as the per-tensor 4D exchange (rank r receives head group r), so
+            # the result is a pure permutation of the three-call version, with a
+            # 3x larger message and one third of the latency-bound collectives.
+            qkv = all_to_all_5D(
+                torch.stack((query, key, value), dim=2),
+                scatter_idx=3,
+                gather_idx=1,
+                group=self.ulysses_group,
+            )
+            query, key, value = qkv.unbind(2)
+
         if isinstance(cache, ARDiffusionPagedLayerInputs):
             if query.shape[0] != 1:
                 raise RuntimeError("LingBot AR-Diffusion paged attention requires batch_size=1.")
@@ -347,6 +408,8 @@ class LingBotSelfAttention(nn.Module):
                 )
             else:
                 output = self.attn(query, visible_key, visible_value)
+        if self.ulysses_world_size > 1:
+            output = SeqAllToAll4D.apply(self.ulysses_group, output, 1, 2, False)
         return self.o(output.flatten(2, 3))
 
 
@@ -359,6 +422,7 @@ class LingBotCrossAttention(nn.Module):
         num_heads: int,
         *,
         eps: float = 1e-6,
+        quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -373,6 +437,11 @@ class LingBotCrossAttention(nn.Module):
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
         self.num_local_heads = num_heads // tp_size
+        # Cross-attention keeps every local head on every Ulysses rank and attends the rank's own sequence
+        # shard. Each query token attends the whole text sequence independently of the others, so there is
+        # nothing to exchange: the sequence split Ulysses already gives us is the only split needed, and both
+        # all-to-all collectives -- one for the query, one for the output -- disappear. The cost is that the text K/V is
+        # replicated per rank instead of head-sharded; ar_diffusion_kv_cache_spec sizes the pool for it.
         self.tp_inner_dim = self.num_local_heads * self.head_dim
 
         self.q = ColumnParallelLinear(
@@ -381,6 +450,7 @@ class LingBotCrossAttention(nn.Module):
             bias=True,
             gather_output=False,
             return_bias=False,
+            quant_config=quant_config,
             prefix=_projection_prefix(prefix, "q"),
         )
         self.k = ColumnParallelLinear(
@@ -389,6 +459,7 @@ class LingBotCrossAttention(nn.Module):
             bias=True,
             gather_output=False,
             return_bias=False,
+            quant_config=quant_config,
             prefix=_projection_prefix(prefix, "k"),
         )
         self.v = ColumnParallelLinear(
@@ -397,6 +468,7 @@ class LingBotCrossAttention(nn.Module):
             bias=True,
             gather_output=False,
             return_bias=False,
+            quant_config=quant_config,
             prefix=_projection_prefix(prefix, "v"),
         )
         self.o = RowParallelLinear(
@@ -405,6 +477,7 @@ class LingBotCrossAttention(nn.Module):
             bias=True,
             input_is_parallel=True,
             return_bias=False,
+            quant_config=quant_config,
             prefix=_projection_prefix(prefix, "o"),
         )
         self.norm_q = _LingBotRMSNorm(self.tp_inner_dim, eps)
@@ -466,6 +539,7 @@ class LingBotAttentionBlock(nn.Module):
         ffn_dim: int | None = None,
         cross_attn_norm: bool = True,
         eps: float = 1e-6,
+        quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -476,12 +550,14 @@ class LingBotAttentionBlock(nn.Module):
             dim,
             num_heads,
             eps=eps,
+            quant_config=quant_config,
             prefix=_projection_prefix(prefix, "self_attn"),
         )
         self.cross_attn = LingBotCrossAttention(
             dim,
             num_heads,
             eps=eps,
+            quant_config=quant_config,
             prefix=_projection_prefix(prefix, "cross_attn"),
         )
         self.norm2 = LayerNorm(dim, eps=eps, elementwise_affine=False)
@@ -493,6 +569,7 @@ class LingBotAttentionBlock(nn.Module):
                 bias=True,
                 gather_output=False,
                 return_bias=False,
+                quant_config=quant_config,
                 prefix=_projection_prefix(prefix, "ffn.0"),
             ),
             nn.GELU(approximate="tanh"),
@@ -502,6 +579,7 @@ class LingBotAttentionBlock(nn.Module):
                 bias=True,
                 input_is_parallel=True,
                 return_bias=False,
+                quant_config=quant_config,
                 prefix=_projection_prefix(prefix, "ffn.2"),
             ),
         )
@@ -512,6 +590,7 @@ class LingBotAttentionBlock(nn.Module):
             bias=True,
             gather_output=False,
             return_bias=False,
+            quant_config=quant_config,
             prefix=_projection_prefix(prefix, "cam_injector_layer1"),
         )
         self.cam_injector_layer2 = RowParallelLinear(
@@ -520,10 +599,21 @@ class LingBotAttentionBlock(nn.Module):
             bias=True,
             input_is_parallel=True,
             return_bias=False,
+            quant_config=quant_config,
             prefix=_projection_prefix(prefix, "cam_injector_layer2"),
         )
         self.cam_scale_layer = nn.Linear(dim, dim)
         self.cam_shift_layer = nn.Linear(dim, dim)
+
+    def camera_modulation(self, camera_hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Build this block's camera scale and shift from the patchified camera tokens.
+
+        Depends only on ``camera_hidden_states``, so a caller holding the camera trajectory fixed -- every
+        denoise forward of one AR chunk does -- can build this once and pass it back through ``forward``.
+        """
+        camera_features = self.cam_injector_layer2(F.silu(self.cam_injector_layer1(camera_hidden_states)))
+        camera_features = camera_features + camera_hidden_states
+        return self.cam_scale_layer(camera_features), self.cam_shift_layer(camera_features)
 
     def forward(
         self,
@@ -538,9 +628,21 @@ class LingBotAttentionBlock(nn.Module):
         sink_tokens: int,
         update_cache: bool,
         rotary_emb: tuple[torch.Tensor, torch.Tensor],
+        camera_modulation: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, LingBotAttentionCache]:
         batch_size, token_count, dim = hidden_states.shape
+        if (
+            timestep_projection.ndim != 4
+            or timestep_projection.shape[0] != batch_size
+            or timestep_projection.shape[2:] != (6, dim)
+        ):
+            raise ValueError("LingBot timestep projection must have shape (batch, frames or tokens, 6, dim).")
         num_frames = timestep_projection.shape[1]
+        if num_frames == 0 or token_count % num_frames:
+            raise ValueError("LingBot timestep projection must align with hidden tokens.")
+        if self.self_attn.ulysses_world_size > 1 and num_frames != token_count:
+            raise ValueError("LingBot Ulysses requires one timestep projection per local token.")
+        # Without SP, broadcast per frame. With SP, each entry represents one token.
         tokens_per_frame = token_count // num_frames
         # Timestep, camera, and text remain separate conditioning paths.
         modulation = self.modulation.unsqueeze(1) + timestep_projection.float()
@@ -560,10 +662,9 @@ class LingBotAttentionBlock(nn.Module):
         hidden_grid = hidden_grid + attention_output.unflatten(1, (num_frames, tokens_per_frame)) * gate_msa
         hidden_states = hidden_grid.flatten(1, 2).to(hidden_states.dtype)
 
-        camera_features = self.cam_injector_layer2(F.silu(self.cam_injector_layer1(camera_hidden_states)))
-        camera_features = camera_features + camera_hidden_states
-        camera_scale = self.cam_scale_layer(camera_features)
-        camera_shift = self.cam_shift_layer(camera_features)
+        camera_scale, camera_shift = (
+            self.camera_modulation(camera_hidden_states) if camera_modulation is None else camera_modulation
+        )
         hidden_states = ((1 + camera_scale) * hidden_states + camera_shift).to(hidden_states.dtype)
 
         attention_output, cross_cache = self.cross_attn(
@@ -635,13 +736,26 @@ class _LingBotHead(nn.Module):
         self,
         hidden_states: torch.Tensor,
         timestep_embedding: torch.Tensor,
+        *,
+        tokens_per_frame: int | None = None,
+        token_offset: int = 0,
     ) -> torch.Tensor:
         num_frames = timestep_embedding.shape[1]
-        tokens_per_frame = hidden_states.shape[1] // num_frames
         modulation = self.modulation.unsqueeze(1) + timestep_embedding.unsqueeze(2).float()
         shift, scale = modulation.chunk(2, dim=2)
-        normalized = self.norm(hidden_states.float()).unflatten(1, (num_frames, tokens_per_frame))
-        normalized = (normalized * (1 + scale) + shift).flatten(1, 2).to(hidden_states.dtype)
+        normalized = self.norm(hidden_states.float())
+        if tokens_per_frame is None:
+            normalized = normalized.unflatten(1, (num_frames, -1))
+            normalized = (normalized * (1 + scale) + shift).flatten(1, 2)
+        else:
+            # A sequence shard can begin/end inside a frame.
+            frames = (
+                torch.arange(hidden_states.shape[1], device=hidden_states.device) + token_offset
+            ) // tokens_per_frame
+            scale = scale.squeeze(2).index_select(1, frames)
+            shift = shift.squeeze(2).index_select(1, frames)
+            normalized = normalized * (1 + scale) + shift
+        normalized = normalized.to(hidden_states.dtype)
         return self.head(normalized)
 
 
@@ -658,7 +772,7 @@ def _sinusoidal_embedding(dim: int, timestep: torch.Tensor) -> torch.Tensor:
     return torch.cat((phase.cos(), phase.sin()), dim=1)
 
 
-def _rope_axis(max_seq_len: int, dim: int) -> tuple[torch.Tensor, torch.Tensor]:
+def _rope_axis(max_seq_len: int, dim: int, *, start: int = 0) -> tuple[torch.Tensor, torch.Tensor]:
     if dim == 0:
         empty = torch.empty(max_seq_len, 0, dtype=torch.float32)
         return empty, empty.clone()
@@ -668,8 +782,24 @@ def _rope_axis(max_seq_len: int, dim: int) -> tuple[torch.Tensor, torch.Tensor]:
         10000,
         torch.arange(0, dim, 2, dtype=torch.float64) / dim,
     )
-    phase = torch.outer(torch.arange(max_seq_len, dtype=torch.float64), frequencies)
+    phase = torch.outer(torch.arange(start, start + max_seq_len, dtype=torch.float64), frequencies)
     return phase.cos().float(), phase.sin().float()
+
+
+class CameraModulationCache:
+    """Per-block camera scale and shift, held by the caller across the forwards of one AR block.
+
+    The camera injector is four projections and a SiLU per block and reads only the camera tokens, which do
+    not change between the denoise steps and the clean commit of one block. The caller that owns that
+    invariant creates one of these per block and passes it to every forward of the block; ``forward`` fills a
+    block's entry on first use and reads it after. Its lifetime is the caller's: the AR runner keeps one per
+    block, ``generate_block`` one per loop, and nothing here checks the camera tensor for change.
+    """
+
+    __slots__ = ("entries",)
+
+    def __init__(self) -> None:
+        self.entries: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
 
 
 class CausalLingBotWorldTransformer3DModel(nn.Module):
@@ -678,6 +808,16 @@ class CausalLingBotWorldTransformer3DModel(nn.Module):
     _repeated_blocks = ["LingBotAttentionBlock"]
     packed_modules_mapping = {"qkv": ["q", "k", "v"]}
     _layerwise_offload_blocks_attrs = ["blocks"]
+    _sp_plan = {
+        "sp_prepare": {
+            0: SequenceParallelInput(split_dim=1, expected_dims=3, split_output=True),
+            1: SequenceParallelInput(split_dim=1, expected_dims=3, split_output=True),
+            2: SequenceParallelInput(split_dim=1, expected_dims=4, split_output=True),
+            3: SequenceParallelInput(split_dim=0, expected_dims=2, split_output=True),
+            4: SequenceParallelInput(split_dim=0, expected_dims=2, split_output=True),
+        },
+        "sp_output_gather": SequenceParallelOutput(gather_dim=1, expected_dims=3),
+    }
 
     def __init__(
         self,
@@ -701,7 +841,7 @@ class CausalLingBotWorldTransformer3DModel(nn.Module):
         num_frames_per_block: int = 3,
         sliding_window_num_frames: int = 18,
         local_attn_size: int = -1,
-        quant_config: object | None = None,
+        quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -731,11 +871,6 @@ class CausalLingBotWorldTransformer3DModel(nn.Module):
         ):
             if field_value is not None:
                 raise ValueError(f"{field_name} must be None because LingBot World v2 has no image embedding path.")
-        if quant_config is not None:
-            raise RuntimeError(
-                "quant_config is not supported by the LingBot World transformer; construct the unquantized model."
-            )
-
         dim = num_attention_heads * attention_head_dim
         self.dim = dim
         self.config = SimpleNamespace(
@@ -768,12 +903,15 @@ class CausalLingBotWorldTransformer3DModel(nn.Module):
             stride=patch_size,
         )
         self.patch_embedding_wancamctrl = _LingBotCameraPatchEmbedding(6 * 8 * 8, dim, patch_size)
+        self.sp_prepare = _LingBotSPPrepare()
+        self.sp_output_gather = nn.Identity()
         self.c2ws_hidden_states_layer1 = ColumnParallelLinear(
             dim,
             dim,
             bias=True,
             gather_output=False,
             return_bias=False,
+            quant_config=quant_config,
             prefix=_projection_prefix(prefix, "c2ws_hidden_states_layer1"),
         )
         self.c2ws_hidden_states_layer2 = RowParallelLinear(
@@ -782,6 +920,7 @@ class CausalLingBotWorldTransformer3DModel(nn.Module):
             bias=True,
             input_is_parallel=True,
             return_bias=False,
+            quant_config=quant_config,
             prefix=_projection_prefix(prefix, "c2ws_hidden_states_layer2"),
         )
         self.text_embedding = nn.Sequential(
@@ -806,6 +945,7 @@ class CausalLingBotWorldTransformer3DModel(nn.Module):
                     ffn_dim=ffn_dim,
                     cross_attn_norm=cross_attn_norm,
                     eps=eps,
+                    quant_config=quant_config,
                     prefix=_projection_prefix(prefix, f"blocks.{index}"),
                 )
                 for index in range(num_layers)
@@ -819,6 +959,27 @@ class CausalLingBotWorldTransformer3DModel(nn.Module):
             cosine, sine = _rope_axis(rope_max_seq_len, axis_dim)
             self.register_buffer(f"_rope_{axis}_cosine", cosine, persistent=False)
             self.register_buffer(f"_rope_{axis}_sine", sine, persistent=False)
+        # One static-address buffer per shape for the per-token timestep
+        # projection; see _stage_timestep_projection.
+        self._timestep_projection_buffers: dict[tuple[tuple[int, ...], torch.dtype, torch.device], torch.Tensor] = {}
+
+    def _stage_timestep_projection(self, projection: torch.Tensor) -> torch.Tensor:
+        """Hand the blocks the timestep projection from a buffer whose address never changes.
+
+        Every regional block graph takes the projection as an input. Under CUDA-graph replay an input that
+        arrives in a fresh tensor each forward is copied into the graph's placeholder on every replay: at
+        480x832 with four Ulysses ranks that is a 72 MB copy per block, forty times per forward, two hundred
+        times per AR chunk. Copying the projection once per forward into a buffer marked static lets every
+        replay read it in place. The values the blocks see are the same; only where they live changes.
+        """
+        key = (tuple(projection.shape), projection.dtype, projection.device)
+        buffer = self._timestep_projection_buffers.get(key)
+        if buffer is None:
+            buffer = torch.empty(projection.shape, dtype=projection.dtype, device=projection.device)
+            torch._dynamo.mark_static_address(buffer)
+            self._timestep_projection_buffers[key] = buffer
+        buffer.copy_(projection)
+        return buffer
 
     @property
     def dtype(self) -> torch.dtype:
@@ -831,7 +992,7 @@ class CausalLingBotWorldTransformer3DModel(nn.Module):
         cls,
         config: dict[str, Any],
         *,
-        quant_config: Any | None = None,
+        quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> Self:
         checkpoint_contract = {
@@ -904,8 +1065,7 @@ class CausalLingBotWorldTransformer3DModel(nn.Module):
             self.config.local_attn_size if self.config.local_attn_size != -1 else self.config.sliding_window_num_frames
         )
         max_tokens = int(window_frames * post_patch_height * post_patch_width)
-        tp_size = get_tensor_model_parallel_world_size()
-        num_local_heads = self.config.num_attention_heads // tp_size
+        num_local_heads = self.blocks[0].self_attn.num_sp_heads
         return allocate_lingbot_cache(
             batch_size=batch_size,
             num_layers=self.config.num_layers,
@@ -926,23 +1086,29 @@ class CausalLingBotWorldTransformer3DModel(nn.Module):
         dtype: torch.dtype,
         device: torch.device,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if start_frame + frames > self.config.rope_max_seq_len:
-            raise ValueError("Temporal RoPE positions exceed rope_max_seq_len.")
         if height > self.config.rope_max_seq_len or width > self.config.rope_max_seq_len:
             raise ValueError("Spatial RoPE positions exceed rope_max_seq_len.")
+        if start_frame + frames <= self._rope_temporal_cosine.shape[0]:
+            temporal_cosine = self._rope_temporal_cosine[start_frame : start_frame + frames]
+            temporal_sine = self._rope_temporal_sine[start_frame : start_frame + frames]
+        else:
+            # Keep absolute positions and checkpoint frequencies, computing only
+            # this block instead of growing a table for the whole session.
+            temporal_dim = self._rope_temporal_cosine.shape[1] * 2
+            temporal_cosine, temporal_sine = _rope_axis(frames, temporal_dim, start=start_frame)
+            temporal_cosine = temporal_cosine.to(self._rope_temporal_cosine)
+            temporal_sine = temporal_sine.to(self._rope_temporal_sine)
 
         def expand_axis(table: torch.Tensor, axis: str) -> torch.Tensor:
             if axis == "temporal":
-                return (
-                    table[start_frame : start_frame + frames].view(frames, 1, 1, -1).expand(frames, height, width, -1)
-                )
+                return table.view(frames, 1, 1, -1).expand(frames, height, width, -1)
             if axis == "height":
                 return table[:height].view(1, height, 1, -1).expand(frames, height, width, -1)
             return table[:width].view(1, 1, width, -1).expand(frames, height, width, -1)
 
         cosine = torch.cat(
             (
-                expand_axis(self._rope_temporal_cosine, "temporal"),
+                expand_axis(temporal_cosine, "temporal"),
                 expand_axis(self._rope_height_cosine, "height"),
                 expand_axis(self._rope_width_cosine, "width"),
             ),
@@ -950,7 +1116,7 @@ class CausalLingBotWorldTransformer3DModel(nn.Module):
         )
         sine = torch.cat(
             (
-                expand_axis(self._rope_temporal_sine, "temporal"),
+                expand_axis(temporal_sine, "temporal"),
                 expand_axis(self._rope_height_sine, "height"),
                 expand_axis(self._rope_width_sine, "width"),
             ),
@@ -1070,6 +1236,7 @@ class CausalLingBotWorldTransformer3DModel(nn.Module):
         cache: LingBotTransformerCache,
         start_frame: int,
         update_cache: bool,
+        camera_modulation_cache: CameraModulationCache | None = None,
     ) -> torch.Tensor:
         if not isinstance(update_cache, bool):
             raise ValueError("update_cache must be a boolean.")
@@ -1138,15 +1305,51 @@ class CausalLingBotWorldTransformer3DModel(nn.Module):
                 query_len=hidden_states.shape[1],
             )
             cache.self_attention = [layer_context.to_layer_inputs() for layer_context in cache.self_attention]
+        sp_size = self.blocks[0].self_attn.ulysses_world_size
+        global_tokens = patched_frames * tokens_per_frame
+        hidden_dim = hidden_states.shape[-1]
+        rope_dim = rotary_emb[0].shape[-1]
+        if global_tokens % sp_size:
+            raise ValueError("LingBot Ulysses requires the token count to be divisible by its degree.")
+        hidden_states, camera_hidden_states, timestep_projection, cosine, sine = self.sp_prepare(
+            hidden_states,
+            camera_hidden_states,
+            timestep_projection,
+            rotary_emb,
+        )
+        if sp_size > 1:
+            local_tokens = global_tokens // sp_size
+            expected_hidden = (batch_size, local_tokens, hidden_dim)
+            if (
+                hidden_states.shape != expected_hidden
+                or camera_hidden_states.shape != expected_hidden
+                or timestep_projection.shape != (batch_size, local_tokens, 6, hidden_dim)
+                or cosine.shape != (local_tokens, rope_dim)
+                or sine.shape != (local_tokens, rope_dim)
+            ):
+                raise RuntimeError(
+                    "LingBot SP input hooks did not shard all conditioning tensors consistently; "
+                    f"expected {local_tokens} tokens per rank. Check SP hook registration and input dimensions."
+                )
+        timestep_projection = self._stage_timestep_projection(timestep_projection)
+        rotary_emb = (cosine, sine)
         # Phase 3: each layer receives its own cache entry. Text K/V is passed
         # only when absent; the returned cache is stored for subsequent DMD
-        # steps and causal blocks in this request.
+        # steps and causal blocks in this request. A caller-held camera cache
+        # gives every block its modulation once per AR block.
         for index, block in enumerate(self.blocks):
+            camera_modulation = None
+            if camera_modulation_cache is not None:
+                camera_modulation = camera_modulation_cache.entries.get(index)
+                if camera_modulation is None:
+                    camera_modulation = block.camera_modulation(camera_hidden_states)
+                    camera_modulation_cache.entries[index] = camera_modulation
             hidden_states, cross_cache = block(
                 hidden_states,
                 projected_text if cache.cross_attention[index] is None else None,
                 timestep_projection,
                 camera_hidden_states,
+                camera_modulation=camera_modulation,
                 self_cache=cache.self_attention[index],
                 cross_cache=cache.cross_attention[index],
                 current_start=current_start,
@@ -1156,9 +1359,17 @@ class CausalLingBotWorldTransformer3DModel(nn.Module):
             )
             cache.cross_attention[index] = cross_cache
 
-        # Phase 4: map tokens to per-patch 16-channel flow values and restore
-        # [B, C, F, H, W] for the Pipeline's sampler update.
-        hidden_states = self.head(hidden_states, timestep_embedding)
+        # Phase 4: project local tokens before gathering the much narrower flow values.
+        hidden_states = self.head(
+            hidden_states,
+            timestep_embedding,
+            tokens_per_frame=tokens_per_frame if sp_size > 1 else None,
+            token_offset=get_sp_group().ulysses_rank * (global_tokens // sp_size) if sp_size > 1 else 0,
+        )
+        hidden_states = self.sp_output_gather(hidden_states)
+        projected_dim = self.config.out_channels * math.prod(self.config.patch_size)
+        if sp_size > 1 and hidden_states.shape != (batch_size, global_tokens, projected_dim):
+            raise RuntimeError("LingBot SP output hook did not gather the full projected token sequence.")
         return self._unpatchify(
             hidden_states,
             batch_size=batch_size,

@@ -11,3 +11,5 @@ stages:
     trust_remote_code: true
     distributed_executor_backend: "mp"
     dtype: "float32"
+    max_num_seqs: 8
+    request_batch_max_wait_ms: 10

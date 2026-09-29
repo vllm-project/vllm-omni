@@ -51,7 +51,7 @@ code2wav_sampling_params='{
   "detokenize": true,
   "repetition_penalty": 1.1
 }'
-# Above is optional, it has a default setting in stage_configs of the corresponding model.
+# The block above is optional; defaults come from the resolved pipeline and deploy config.
 
 # Define URLs for assets
 MARY_HAD_LAMB_AUDIO_URL="https://vllm-public-assets.s3.us-west-2.amazonaws.com/multimodal_asset/mary_had_lamb.ogg"

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from types import SimpleNamespace
 
@@ -129,6 +129,88 @@ def test_validate_code_stack_negatives() -> None:
     bad[1, 5] = 1024
     with pytest.raises(ValueError, match="out-of-range"):
         validate_code_stack(bad, 31, 1024)
+
+
+def test_scalar_bool_normalizes_tensor_metadata() -> None:
+    from vllm_omni.model_executor.models.nemotron_voicechat.runtime_info import scalar_bool
+
+    assert scalar_bool(True)
+    assert scalar_bool(torch.tensor(True))
+    assert scalar_bool(torch.tensor([True]))
+    assert not scalar_bool(torch.empty(0, dtype=torch.bool))
+    with pytest.raises(ValueError, match="scalar boolean metadata"):
+        scalar_bool(torch.tensor([True, False]))
+
+
+def _bare_code2wav(use_codec_cache: bool):
+    from torch import nn
+
+    from vllm_omni.model_executor.models.nemotron_voicechat.nemotron_voicechat_code2wav import (
+        NemotronVoiceChatCode2Wav,
+    )
+
+    class _FakeCodec(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.dummy = nn.Parameter(torch.zeros(1))
+            self.calls: list[tuple[int, bool]] = []
+
+        def decode(self, codes, lens, cache=None, flush=False):
+            frames = int(codes.shape[1])
+            self.calls.append((frames, cache is not None))
+            wav = torch.zeros(1, 1, frames * 4, dtype=torch.float32)
+            return wav, lens * 4
+
+    model = NemotronVoiceChatCode2Wav.__new__(NemotronVoiceChatCode2Wav)
+    nn.Module.__init__(model)
+    model._num_quantizers = 31
+    model._codebook_size = 1024
+    model._sample_rate = 22050
+    model._wav_per_frame = 4
+    model._use_codec_cache = use_codec_cache
+    model.requires_request_ids = use_codec_cache
+    model._stream_caches = {}
+    model.audio_codec = _FakeCodec()
+    return model
+
+
+def test_code2wav_incremental_cache_decodes_only_new_frames() -> None:
+    model = _bare_code2wav(use_codec_cache=True)
+    q = 31
+
+    def chunk_info(frames: int, left: int) -> dict:
+        return {
+            "codes": {"audio": torch.zeros((frames, q), dtype=torch.long)},
+            "meta": {"left_context_size": left},
+        }
+
+    # Chunk 0: 13 cumulative frames, none emitted yet -> decode 13 with a cache.
+    out = model.forward(runtime_additional_information=[chunk_info(13, 0)], request_ids=["r0"])
+    assert model.audio_codec.calls == [(13, True)]
+    assert out.multimodal_outputs["model_outputs"][0].numel() == 13 * 4
+    assert "r0" in model._stream_caches
+    # Chunk 1: 20 cumulative, 13 emitted -> decode only the 7 NEW frames, same cache.
+    cache = model._stream_caches["r0"]
+    out = model.forward(runtime_additional_information=[chunk_info(20, 13)], request_ids=["r0"])
+    assert model.audio_codec.calls[-1] == (7, True)
+    assert model._stream_caches["r0"] is cache
+    assert out.multimodal_outputs["model_outputs"][0].numel() == 7 * 4
+    # Request end drops the per-request cache.
+    model.on_requests_finished(["r0"])
+    assert "r0" not in model._stream_caches
+
+
+def test_code2wav_prefix_redecode_unchanged_without_cache_flag() -> None:
+    model = _bare_code2wav(use_codec_cache=False)
+    q = 31
+    info = {
+        "codes": {"audio": torch.zeros((20, q), dtype=torch.long)},
+        "meta": {"left_context_size": 13},
+    }
+    out = model.forward(runtime_additional_information=[info], request_ids=["r0"])
+    # Full cumulative decode (no cache), then slice off the emitted prefix.
+    assert model.audio_codec.calls == [(20, False)]
+    assert out.multimodal_outputs["model_outputs"][0].numel() == (20 - 13) * 4
 
 
 def test_tokenizer_resolution_failure_is_actionable(monkeypatch) -> None:
@@ -285,9 +367,46 @@ def test_talker2code2wav_async_chunk_requires_prompt_len() -> None:
         talker2code2wav_async_chunk(tm, {"codes": {"audio": torch.zeros(5, 31, dtype=torch.long)}}, req)
 
 
-# =========================
-# Talker drain-per-wake (async scheduling review P1/P2)
-# =========================
+def test_talker2code2wav_duplex_keeps_cumulative_history_across_wakes() -> None:
+    from vllm_omni.model_executor.stage_input_processors.nemotron_voicechat import (
+        talker2code2wav_async_chunk,
+    )
+
+    tm = _fake_transfer_manager(codec_chunk_frames=2)
+    prompt_len = 3
+    req = _streaming_request(
+        prompt_len=prompt_len,
+        generated=[],
+        info={"meta": {"codec_streaming": torch.tensor([True])}, "nvc_logical_prompt_len": prompt_len},
+    )
+    prompt_rows = torch.zeros((prompt_len - 1, 31), dtype=torch.long)
+    first = torch.full((1, 31), 101, dtype=torch.long)
+    second = torch.full((1, 31), 202, dtype=torch.long)
+
+    for rows, finished in ((prompt_rows, False), (torch.cat([prompt_rows, first]), False)):
+        payload = talker2code2wav_async_chunk(
+            tm,
+            {"codes": {"audio": rows}, "meta": {"codec_streaming": torch.tensor([True])}},
+            req,
+            is_finished=finished,
+        )
+        assert payload is not None and not bool(payload.meta.finished)
+
+    payload = talker2code2wav_async_chunk(
+        tm,
+        {
+            "codes": {"audio": torch.cat([prompt_rows, first, second])},
+            "meta": {"codec_streaming": torch.tensor([True])},
+        },
+        req,
+        is_finished=True,
+    )
+
+    assert payload is not None
+    assert not bool(payload.meta.finished)
+    assert not bool(payload.meta.is_segment_finished)
+    assert torch.equal(payload.codes.audio, torch.cat([first, second]))
+    assert tm.request_payload["req-0"]["nvc_frames_seen"] == 2
 
 
 class _FakeTTSModelOutput:
@@ -338,11 +457,20 @@ def _bare_talker():
     talker._hidden = 8
     talker._dtype = torch.float32
     talker._speaker_name = "Aria"
+    talker._step_graph = None
+    talker._use_native_backbone = False
     talker.config = SimpleNamespace(tts_cfg={"inference_guidance_enabled": False})
     return talker
 
 
-def _async_info(timeline: list[int], prompt_len: int, finished: bool, request_id: str = "req-0") -> dict:
+def _async_info(
+    timeline: list[int],
+    prompt_len: int,
+    finished: bool,
+    request_id: str = "req-0",
+    *,
+    codec_streaming: bool = False,
+) -> dict:
     return {
         "request_id": request_id,
         "additional_information": {
@@ -351,9 +479,116 @@ def _async_info(timeline: list[int], prompt_len: int, finished: bool, request_id
                 "num_processed_tokens": prompt_len,
                 "finished": torch.tensor(finished),
                 "request_id": request_id,
+                "codec_streaming": codec_streaming,
             },
         },
     }
+
+
+def test_talker_output_keeps_streaming_codec_mode_on_wire() -> None:
+    talker = _bare_talker()
+    output = talker.make_omni_output(
+        torch.zeros((1, talker._hidden)),
+        model_intermediate_buffer=[
+            {
+                "codes": {"audio": torch.zeros((1, 31), dtype=torch.long)},
+                "meta": {
+                    "nvc_logical_prompt_len": 3,
+                    "codec_streaming": torch.tensor(True),
+                    "request_id": "req-duplex",
+                },
+            }
+        ],
+    )
+
+    meta = output.multimodal_outputs["meta"]
+    assert meta["nvc_logical_prompt_len"].item() == 3
+    assert meta["codec_streaming"].item() is True
+
+
+def test_code2wav_accepts_tensor_streaming_flag() -> None:
+    from torch import nn
+
+    from vllm_omni.model_executor.models.nemotron_voicechat.nemotron_voicechat_code2wav import (
+        NemotronVoiceChatCode2Wav,
+    )
+
+    class _FakeCodec(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.anchor = nn.Parameter(torch.zeros(1))
+            self.cache = None
+
+        def decode(self, codes, lens, cache=None):
+            del codes, lens
+            self.cache = cache
+            return torch.zeros((1, 4)), torch.tensor([4])
+
+    model = NemotronVoiceChatCode2Wav.__new__(NemotronVoiceChatCode2Wav)
+    nn.Module.__init__(model)
+    model._sample_rate = 22050
+    model._num_quantizers = 31
+    model._codebook_size = 1024
+    model._wav_per_frame = 1764
+    model._use_codec_cache = False
+    model._stream_caches = {}
+    model.audio_codec = _FakeCodec()
+
+    output = model.forward(
+        runtime_additional_information=[
+            {
+                "codes": {"audio": torch.zeros((1, 31), dtype=torch.long)},
+                "meta": {"codec_streaming": torch.tensor([True]), "request_id": "req-codec"},
+            }
+        ]
+    )
+
+    assert "req-codec" in model._stream_caches
+    assert model.audio_codec.cache is model._stream_caches["req-codec"]
+    assert output.multimodal_outputs["model_outputs"][0].shape == (4,)
+
+
+def test_talker_duplex_drains_each_wake_and_keeps_cumulative_code_history() -> None:
+    """P2: chunk 0's PAD prompt region must not cost one upstream chunk per step,
+    and P1: a coalesced chunk (2+ new positions, 1 wake) must be fully drained."""
+    talker = _bare_talker()
+    pad, prompt_len = 12, 4
+    ids = torch.zeros(1, dtype=torch.long)
+
+    # Prefill wake: chunk 0 carries only the PAD prompt region.
+    info = _async_info([pad] * prompt_len, prompt_len, finished=False)
+    info["additional_information"]["meta"]["codec_streaming"] = torch.tensor([True])
+    talker.preprocess(ids, None, _omni_is_prefill=True, **info)
+    session = talker._sessions["req-0"]
+    assert session["step"] == 1 and not session["sync_mode"]
+
+    # First decode wake: drains ALL prompt-region steps (t=1..P-1) at once.
+    _, embeds, update = talker.preprocess(ids, None, _omni_is_prefill=False, **info)
+    assert session["step"] == prompt_len  # t advanced 1 -> P in one wake
+    assert update["codes"]["audio"].shape == (prompt_len - 1, 31)
+    assert float(embeds[0, 0]) == 1.0  # current scheduler segment is drained
+
+    # Coalesced chunk: TWO new frame tokens arrive in ONE wake (delayed save
+    # thread merged two thinker steps). Both must be consumed by this wake.
+    info2 = _async_info([pad] * prompt_len + [7, 8], prompt_len, finished=False)
+    _, embeds, update = talker.preprocess(ids, None, _omni_is_prefill=False, **info2)
+    assert session["step"] == prompt_len + 2
+    assert update["codes"]["audio"].shape == (prompt_len + 1, 31)
+    assert float(embeds[0, 0]) == 1.0
+
+    # Zero-progress wake: never fabricate frames. The stop flag parks this
+    # resumable scheduler request until another connector chunk arrives.
+    _, embeds, update = talker.preprocess(ids, None, _omni_is_prefill=False, **info2)
+    assert session["step"] == prompt_len + 2
+    assert update == {}
+    assert float(embeds[0, 0]) == 1.0
+
+    # Final chunk: one more token + finished marker -> drain + stop flag.
+    info3 = _async_info([pad] * prompt_len + [7, 8, 9], prompt_len, finished=True)
+    _, embeds, update = talker.preprocess(ids, None, _omni_is_prefill=False, **info3)
+    assert session["step"] == prompt_len + 3
+    assert update["codes"]["audio"].shape == (prompt_len + 2, 31)
+    assert float(embeds[0, 0]) == 1.0  # stop
 
 
 def test_talker_drains_all_received_positions_per_wake() -> None:
@@ -369,11 +604,13 @@ def test_talker_drains_all_received_positions_per_wake() -> None:
     session = talker._sessions["req-0"]
     assert session["step"] == 1 and not session["sync_mode"]
 
-    # First decode wake: drains ALL prompt-region steps (t=1..P-1) at once.
-    _, embeds, update = talker.preprocess(ids, None, _omni_is_prefill=False, **info)
+    # First resumed wake: drains ALL prompt-region steps (t=1..P-1) at once.
+    # vLLM 0.28 reports each resumed one-token segment as prefill; the model
+    # session must still advance instead of restarting its EAR-TTS warmup.
+    _, embeds, update = talker.preprocess(ids, None, _omni_is_prefill=True, **info)
     assert session["step"] == prompt_len  # t advanced 1 -> P in one wake
     assert update["codes"]["audio"].shape == (prompt_len - 1, 31)
-    assert float(embeds[0, 0]) == 0.0  # not finished
+    assert float(embeds[0, 0]) == 0.0  # offline stream waits for upstream terminal
 
     # Coalesced chunk: TWO new frame tokens arrive in ONE wake (delayed save
     # thread merged two thinker steps). Both must be consumed by this wake.
@@ -383,14 +620,13 @@ def test_talker_drains_all_received_positions_per_wake() -> None:
     assert update["codes"]["audio"].shape == (prompt_len + 1, 31)
     assert float(embeds[0, 0]) == 0.0
 
-    # Zero-progress wake (no new positions, not finished): plain CONTINUE, no
-    # fabricated frames, no codes update.
+    # Zero-progress wake: never fabricate frames or end the offline stream
+    # before the thinker sends its terminal marker.
     _, embeds, update = talker.preprocess(ids, None, _omni_is_prefill=False, **info2)
     assert session["step"] == prompt_len + 2
     assert update == {}
     assert float(embeds[0, 0]) == 0.0
 
-    # Final chunk: one more token + finished marker -> drain + stop flag.
     info3 = _async_info([pad] * prompt_len + [7, 8, 9], prompt_len, finished=True)
     _, embeds, update = talker.preprocess(ids, None, _omni_is_prefill=False, **info3)
     assert session["step"] == prompt_len + 3
@@ -398,8 +634,22 @@ def test_talker_drains_all_received_positions_per_wake() -> None:
     assert float(embeds[0, 0]) == 1.0  # stop
 
 
-def test_talker_sync_mode_steps_once_per_wake() -> None:
-    """The verified sync parity path keeps its one-TTS-step-per-engine-step cadence."""
+def test_talker_native_codec_stream_ends_each_received_segment() -> None:
+    talker = _bare_talker()
+    ids = torch.zeros(1, dtype=torch.long)
+    info = _async_info([12, 12, 7], 2, finished=False, codec_streaming=True)
+    talker.preprocess(ids, None, _omni_is_prefill=True, **info)
+
+    _, embeds, update = talker.preprocess(ids, None, _omni_is_prefill=False, **info)
+
+    assert update["codes"]["audio"].shape == (2, 31)
+    assert float(embeds[0, 0]) == 1.0
+
+
+def test_talker_sync_mode_drains_whole_timeline_in_one_wake() -> None:
+    """Sync mode ships the whole timeline up front: the first decode wake runs
+    every TTS step back-to-back (no per-frame engine round trip) and emits the
+    stop flag with the full cumulative code stack."""
     talker = _bare_talker()
     pad, prompt_len = 12, 3
     ids = torch.zeros(1, dtype=torch.long)
@@ -413,10 +663,7 @@ def test_talker_sync_mode_steps_once_per_wake() -> None:
     talker.preprocess(ids, None, _omni_is_prefill=True, **info)
     session = talker._sessions["req-1"]
     assert session["sync_mode"] and session["upstream_finished"]
-    for expected_step in (2, 3, 4):
-        _, embeds, _ = talker.preprocess(ids, None, _omni_is_prefill=False, **info)
-        assert session["step"] == expected_step
-    # Last position -> stop flag on the final step.
-    _, embeds, _ = talker.preprocess(ids, None, _omni_is_prefill=False, **info)
-    assert session["step"] == 5
-    assert float(embeds[0, 0]) == 1.0
+    _, embeds, update = talker.preprocess(ids, None, _omni_is_prefill=False, **info)
+    assert session["step"] == 5  # t advanced 1 -> T in one wake
+    assert update["codes"]["audio"].shape == (4, 31)
+    assert float(embeds[0, 0]) == 1.0  # stop flag on the same wake

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -22,6 +22,7 @@ class _Executor:
         self.specs = [{"layer0": object()}, {"layer0": object()}]
         self.memory = [1024, 1024]
         self.configs = None
+        self.resolved_max_model_len = None
         self.profile_requests = None
 
     def get_kv_cache_specs(self):
@@ -31,8 +32,9 @@ class _Executor:
         self.profile_requests = profile_requests
         return self.memory
 
-    def set_kv_cache_configs(self, configs) -> None:
+    def set_kv_cache_configs(self, configs, resolved_max_model_len) -> None:
         self.configs = configs
+        self.resolved_max_model_len = resolved_max_model_len
 
 
 def _od_config(**overrides):
@@ -55,6 +57,8 @@ def _od_config(**overrides):
         ),
         gpu_memory_utilization=0.9,
         kv_cache_memory_bytes=None,
+        max_num_seqs=1,
+        diffusion_kv_max_rows_per_request=1,
         max_num_batched_tokens=64,
         num_gpus=1,
     )
@@ -64,9 +68,9 @@ def _od_config(**overrides):
 
 def test_control_plane_builds_worker_and_scheduler_configs(monkeypatch) -> None:
     executor = _Executor()
-    od_config = _od_config(num_gpus=2)
+    od_config = _od_config(num_gpus=2, max_model_len=-1)
     vllm_config = SimpleNamespace(
-        model_config=SimpleNamespace(max_model_len=4096),
+        model_config=SimpleNamespace(max_model_len=256),
         max_in_flight_tokens=128,
     )
     worker_configs = [object(), object()]
@@ -91,6 +95,7 @@ def test_control_plane_builds_worker_and_scheduler_configs(monkeypatch) -> None:
     build.assert_called_once_with(vllm_config, executor.specs, executor.memory)
     assert result == (scheduler_kv_cache_config, 16, 16, vllm_config)
     assert executor.configs == worker_configs
+    assert executor.resolved_max_model_len == vllm_config.model_config.max_model_len
     assert executor.profile_requests is profile_requests
 
 
@@ -220,6 +225,22 @@ def test_paged_config_forwards_gpu_memory_utilization_to_native_cache_config() -
     assert vllm_config.cache_config.gpu_memory_utilization == 0.42
 
 
+@pytest.mark.parametrize("enable_prefix_caching", [False, True])
+@pytest.mark.parametrize("requests,rows", [(1, 2), (2, 3)])
+def test_native_config_counts_cfg_rows_once(enable_prefix_caching, requests, rows) -> None:
+    od_config = _od_config(
+        max_num_seqs=requests,
+        diffusion_kv_max_rows_per_request=rows,
+        enable_prefix_caching=enable_prefix_caching,
+    )
+    config = diffusion_vllm_config.create_diffusion_vllm_config(torch.device("cpu"), od_config)
+    # Engine and Worker must see the same row capacity, including on reconfiguration.
+    diffusion_vllm_config.configure_diffusion_vllm_config(config, od_config)
+    assert config.scheduler_config.max_num_seqs == requests * rows
+    assert od_config.max_num_seqs == requests
+    assert config.cache_config.enable_prefix_caching is enable_prefix_caching
+
+
 def test_diffusion_vllm_model_config_supplies_dtype_for_quant_methods() -> None:
     quantization_config = build_quant_config(
         {
@@ -286,6 +307,7 @@ def test_minus_one_max_model_len_is_auto_fitted_by_native_cache_sizing() -> None
         dtype=torch.bfloat16,
         non_causal=True,
     )
+    model_limit = vllm_config.model_config.max_model_len
 
     initialization.build_native_kv_cache_configs(
         vllm_config,
@@ -294,4 +316,10 @@ def test_minus_one_max_model_len_is_auto_fitted_by_native_cache_sizing() -> None
     )
 
     assert vllm_config.model_config.original_max_model_len == -1
-    assert vllm_config.model_config.max_model_len == 256
+    # Sixteen physical pages provide ``(16 - 1) * block_size`` tokens: vLLM 0.29
+    # subtracts the null block that BlockPool permanently holds back before
+    # sizing (check_enough_kv_cache_memory), so only 15 pages are usable.  The
+    # native backend chooses the block geometry, so keep this assertion backend
+    # independent instead of assuming the generic 16-token block size.
+    expected_max_model_len = min(model_limit, spec.block_size * (16 - 1))
+    assert vllm_config.model_config.max_model_len == expected_max_model_len

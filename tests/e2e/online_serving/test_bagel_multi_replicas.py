@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Weekly e2e coverage for BAGEL diffusion multi-replica serving.
 
 This test needs 4 H100 GPUs; keep it out of generic test_bagel_* jobs.
@@ -33,7 +36,7 @@ test_params = [
 
 @hardware_test(res={"cuda": "H100"}, num_cards=4)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
-def test_multi_stage_diffusion_uses_multi_replica_dit_stage(omni_server, openai_client) -> None:
+def test_multi_stage_diffusion_uses_multi_replica_dit_stage(omni_server, online_client) -> None:
     request_config = {
         "model": omni_server.model,
         "messages": dummy_messages_from_mix_data(
@@ -49,7 +52,7 @@ def test_multi_stage_diffusion_uses_multi_replica_dit_stage(omni_server, openai_
         },
     }
 
-    responses = openai_client.send_diffusion_request(request_config, request_num=ROUTE_STRESS_REQUESTS)
+    responses = online_client.send_diffusion_request(request_config, request_num=ROUTE_STRESS_REQUESTS)
 
     assert len(responses) == ROUTE_STRESS_REQUESTS
     assert all(response.success for response in responses)

@@ -22,6 +22,13 @@ CATEGORIES = {
         "name": "Entry Points",
         "description": "Main entry points for vLLM-Omni inference and serving.",
     },
+    "clients": {
+        "name": "Clients",
+        "description": (
+            "Client libraries for full-duplex sessions: the Realtime WebSocket client, "
+            "the in-process client over `DuplexOmni`, and the per-model session presets."
+        ),
+    },
     "inputs": {
         "name": "Inputs",
         "description": "Input data structures for multi-modal inputs.",

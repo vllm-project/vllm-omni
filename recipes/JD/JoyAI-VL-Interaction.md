@@ -219,3 +219,51 @@ the audio-track caveat.
   5 chunks, `key_frames=0` = summarize all chunk frames) are aligned to the JoyVL
   reference adapter so per-tick behavior matches the released model; the framework only
   supplies the serving structure.
+
+## Native multi-stage pipeline (experimental)
+
+An experimental native speech path is available alongside the existing Day-0 serving path:
+
+```text
+one request with image/video and text
+  -> JoyAI complete action text
+  -> Qwen3-TTS Talker
+  -> Code2Wav
+  -> 24 kHz audio
+```
+
+It runs behind one `vllm serve --omni` endpoint:
+
+```bash
+vllm serve jdopensource/JoyAI-VL-Interaction-Preview --omni \
+  --deploy-config vllm_omni/deploy/joyai_vl_interaction.yaml \
+  --port 8091
+```
+
+With `modalities: ["text", "audio"]`, its behavior is:
+
+| JoyAI action | Native output |
+|---|---|
+| `</response> <text>` | action text + speech for `<text>` |
+| `</silence>` | action text + empty audio output (zero samples) |
+| `</response> <note> </delegation> <question>` | action text + speech for `<note>` only |
+
+Native speech supports the Qwen3-TTS `CustomVoice` task. The request-level `voice` and
+`language` fields select the speaker and language; when omitted, they default to
+`Vivian` and `Auto`. Values supplied as `tts_speaker` and `tts_language` inside
+`additional_information` take priority.
+
+This experimental native multi-stage pipeline is request-scoped, stateless, and
+all-sync. It currently does not include:
+
+- continuous frame sessions, persistent standing instructions, or session memory;
+- audio input / ASR, full-duplex interaction, or barge-in;
+- background Agent execution for delegated questions;
+- async-chunk support from Talker to Code2Wav;
+- integration with the existing WebUI.
+
+For actions with spoken text, the Talker starts only after the complete JoyAI action is
+available, and Code2Wav starts only after the Talker completes. Silence actions skip both
+TTS stages and return an empty audio output with zero samples. All three stages are placed
+on GPU 0 by the provided
+[`deploy config`](../../vllm_omni/deploy/joyai_vl_interaction.yaml).

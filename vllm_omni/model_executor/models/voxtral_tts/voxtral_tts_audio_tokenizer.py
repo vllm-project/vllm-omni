@@ -900,6 +900,10 @@ class VoxtralTTSAudioTokenizer(nn.Module):
         """List of size of each codebook"""
         return self.quantizer.codebook_sizes
 
+    @property
+    def encoder_loaded(self) -> bool:
+        return self._encoder_loaded
+
     def load_weight(self, weight: tuple[str, torch.Tensor]) -> str:
         params_dict = dict(self.named_parameters())
         name, loaded_weight = weight
@@ -985,7 +989,7 @@ class VoxtralTTSAudioTokenizer(nn.Module):
 
     def encode_waveforms(self, x: list[torch.Tensor]) -> list[torch.Tensor]:
         if not self._encoder_loaded:
-            raise RuntimeError(
+            raise ValueError(
                 "encode_waveforms requires encoder weights which are not available in the open-source checkpoint."
             )
         audio_codes = []

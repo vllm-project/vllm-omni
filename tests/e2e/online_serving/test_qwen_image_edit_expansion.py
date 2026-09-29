@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """
 Comprehensive tests of diffusion features that are available in online serving mode
 and are supported by Qwen-Image-Edit-2511 (single image input and two image inputs).
@@ -7,7 +10,7 @@ import pytest
 
 from tests.helpers.mark import hardware_marks
 from tests.helpers.media import generate_synthetic_image
-from tests.helpers.runtime import OmniServer, OmniServerParams, OpenAIClientHandler, dummy_messages_from_mix_data
+from tests.helpers.runtime import OmniServer, OmniServerParams, OnlineOmniClient, dummy_messages_from_mix_data
 
 pytestmark = [pytest.mark.diffusion, pytest.mark.slow]
 
@@ -122,7 +125,7 @@ def _get_diffusion_feature_cases(model: str = MODEL):
     _get_diffusion_feature_cases(),
     indirect=True,
 )
-def test_qwen_image_edit_2511_single_image(omni_server: OmniServer, openai_client: OpenAIClientHandler):
+def test_qwen_image_edit_2511_single_image(omni_server: OmniServer, online_client: OnlineOmniClient):
     """Test Qwen-Image-Edit-2511 with a single image input.
 
     Regression: with tea_cache enabled and zero_cond_t=True, the TeaCache
@@ -149,7 +152,7 @@ def test_qwen_image_edit_2511_single_image(omni_server: OmniServer, openai_clien
         },
     }
 
-    openai_client.send_diffusion_request(request_config)
+    online_client.send_diffusion_request(request_config)
 
 
 @pytest.mark.parametrize(
@@ -157,7 +160,7 @@ def test_qwen_image_edit_2511_single_image(omni_server: OmniServer, openai_clien
     _get_diffusion_feature_cases(),
     indirect=True,
 )
-def test_qwen_image_edit_2511_two_images(omni_server: OmniServer, openai_client: OpenAIClientHandler):
+def test_qwen_image_edit_2511_two_images(omni_server: OmniServer, online_client: OnlineOmniClient):
     """Test Qwen-Image-Edit-2511 with two image inputs."""
     image_data_url_1 = f"data:image/jpeg;base64,{generate_synthetic_image(512, 512)['base64']}"
     image_data_url_2 = f"data:image/jpeg;base64,{generate_synthetic_image(512, 512)['base64']}"
@@ -180,4 +183,4 @@ def test_qwen_image_edit_2511_two_images(omni_server: OmniServer, openai_client:
         },
     }
 
-    openai_client.send_diffusion_request(request_config)
+    online_client.send_diffusion_request(request_config)

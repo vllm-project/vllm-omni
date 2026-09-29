@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import math
+
 import torch
-import torch.nn.functional as F
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.attention.backends.abstract import (
@@ -65,8 +66,6 @@ class SageAttention3Backend(AttentionBackend):
 
 
 class SageAttention3Impl(AttentionImpl):
-    _warned_gqa_fallback_global: bool = False
-
     def __init__(
         self,
         num_heads: int,
@@ -80,6 +79,12 @@ class SageAttention3Impl(AttentionImpl):
         self.causal = causal
         self.softmax_scale = softmax_scale
         self.dropout = extra_impl_args.get("dropout_p", 0.0)
+        expected_scale = head_size**-0.5
+        if not math.isclose(softmax_scale, expected_scale, rel_tol=1e-6):
+            raise ValueError(
+                "SAGE_ATTN_3 does not expose a custom softmax scale; "
+                f"expected {expected_scale} for head_size={head_size}, got {softmax_scale}."
+            )
 
     def forward_cuda(
         self,
@@ -88,6 +93,8 @@ class SageAttention3Impl(AttentionImpl):
         value: torch.Tensor,
         attn_metadata: AttentionMetadata | None = None,
     ) -> torch.Tensor:
+        if attn_metadata is not None and attn_metadata.attn_mask is not None:
+            raise ValueError("SAGE_ATTN_3 does not support attn_mask. Select a mask-capable backend.")
         query = query.transpose(1, 2).contiguous()
         key = key.transpose(1, 2).contiguous()
         value = value.transpose(1, 2).contiguous()
@@ -98,19 +105,11 @@ class SageAttention3Impl(AttentionImpl):
                     "GQA/MQA requires query heads to be a multiple of KV heads, "
                     f"got q_heads={query.shape[1]} and kv_heads={key.shape[1]}"
                 )
-            if not type(self)._warned_gqa_fallback_global:
-                logger.warning("SageAttention3 does not support GQA/MQA (Hq != Hkv); falling back to torch SDPA.")
-                type(self)._warned_gqa_fallback_global = True
-            output = F.scaled_dot_product_attention(
-                query,
-                key,
-                value,
-                is_causal=self.causal,
-                dropout_p=self.dropout,
-                scale=self.softmax_scale,
-                enable_gqa=True,
+            raise NotImplementedError(
+                "SAGE_ATTN_3 was explicitly selected but does not support GQA/MQA "
+                f"(q_heads={query.shape[1]}, kv_heads={key.shape[1]}). Select a GQA-capable backend."
             )
-        else:
-            output = _sageattn3_blackwell_op(query, key, value, self.causal)
+
+        output = _sageattn3_blackwell_op(query, key, value, self.causal)
 
         return output.transpose(1, 2).contiguous()

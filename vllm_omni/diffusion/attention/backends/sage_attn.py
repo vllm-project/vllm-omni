@@ -47,7 +47,7 @@ else:
             "SageAttentionBackend is not available. You may install sage-attention"
             " by pip install git+https://github.com/thu-ml/SageAttention.git"
         )
-        raise ImportError
+        sageattn = None
 
 # TODO add sage3 attention backend
 
@@ -92,6 +92,13 @@ class SageAttentionImpl(AttentionImpl):
         value: torch.Tensor,
         attn_metadata: AttentionMetadata = None,
     ) -> torch.Tensor:
+        if attn_metadata is not None and attn_metadata.attn_mask is not None:
+            raise ValueError("SAGE_ATTN does not support attn_mask. Select a mask-capable backend.")
+        if sageattn is None:
+            raise ImportError(
+                "SAGE_ATTN requires sageattention. Install with: "
+                "pip install git+https://github.com/thu-ml/SageAttention.git"
+            )
         output = sageattn(
             query,
             key,

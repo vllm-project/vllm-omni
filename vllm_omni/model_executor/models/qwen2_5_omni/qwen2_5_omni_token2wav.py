@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 ############################
 #      Start Token2Wav     #
 ############################
@@ -1509,19 +1512,19 @@ class Qwen2_5OmniToken2WavForConditionalGenerationVLLM(nn.Module, SupportsPP):
         return loaded
 
     def find_all_registers(self):
-        """
-        Find all registered buffers in a PyTorch model.
-
-        Args:
-        Returns:
-            dict: Dictionary with buffer names as keys and their properties as values
-        """
+        """Find all persistent registered buffers in the model."""
         registers = {}
 
-        # Get all named buffers
-        for name, buf in self.named_buffers():
-            if name in self.state_dict():
-                registers[name] = {"name": name, "buffer": buf}
+        # Match state_dict() by excluding non-persistent buffers.
+        non_persistent_names = set()
+        for module_name, module in self.named_modules():
+            for buffer_name in getattr(module, "_non_persistent_buffers_set", set()):
+                name = f"{module_name}.{buffer_name}" if module_name else buffer_name
+                non_persistent_names.add(name)
+
+        for name, buffer in self.named_buffers():
+            if name not in non_persistent_names:
+                registers[name] = {"name": name, "buffer": buffer}
         return registers
 
     # remove buffers from the weights and reload them after loading weights

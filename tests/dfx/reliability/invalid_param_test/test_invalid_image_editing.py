@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """``POST /v1/images/edits`` multipart validation (live ``Qwen/Qwen-Image-Edit``)."""
 
 from __future__ import annotations
@@ -9,7 +9,7 @@ from typing import Any
 import pytest
 
 from tests.helpers.mark import hardware_marks
-from tests.helpers.runtime import OmniServer, OmniServerParams, OpenAIClientHandler
+from tests.helpers.runtime import OmniServer, OmniServerParams, OnlineOmniClient
 
 pytestmark = [pytest.mark.slow, pytest.mark.diffusion]
 
@@ -72,7 +72,7 @@ def _finalize_edits_form_data(template: dict[str, Any], server_model: str) -> di
 @pytest.mark.parametrize("omni_server", _PARAMS, indirect=True)
 def test_images_edits_invalid_requests(
     omni_server: OmniServer,
-    openai_client: OpenAIClientHandler,
+    online_client: OnlineOmniClient,
     tiny_png_bytes: bytes,
     include_image: bool,
     data_template: dict[str, Any],
@@ -87,4 +87,4 @@ def test_images_edits_invalid_requests(
     }
     if include_image:
         cfg["files"] = {"image": ("x.png", tiny_png_bytes, "image/png")}
-    openai_client.send_images_edits_http_request(cfg)
+    online_client.send_images_edits_http_request(cfg)

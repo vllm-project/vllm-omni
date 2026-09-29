@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """Generate raw LTX video and audio outputs with the official or Omni runtime."""
 
@@ -114,6 +114,29 @@ def _insert_official_paths(official_root: Path) -> None:
             sys.path.insert(0, path)
 
 
+def _configure_official_vocoder_determinism() -> None:
+    """Make the pinned official LTX-2.5 vocoder a stable reference."""
+    from ltx_core.model.audio_vae.vocoder import VocoderWithBWE
+
+    original_forward = VocoderWithBWE.forward
+    if getattr(original_forward, "_vllm_omni_deterministic", False):
+        return
+
+    def deterministic_forward(self: Any, mel_spec: torch.Tensor) -> torch.Tensor:
+        device_type = mel_spec.device.type
+        if device_type != "cuda":
+            return original_forward(self, mel_spec)
+        previous = torch.backends.cudnn.deterministic
+        try:
+            torch.backends.cudnn.deterministic = True
+            return original_forward(self, mel_spec)
+        finally:
+            torch.backends.cudnn.deterministic = previous
+
+    setattr(deterministic_forward, "_vllm_omni_deterministic", True)
+    setattr(VocoderWithBWE, "forward", deterministic_forward)
+
+
 def _configure_official_sdpa(pipeline: Any) -> None:
     """Pin official connector and denoiser attention to cuDNN, with MATH fallback."""
     from ltx_core.loader.attention_ops import set_attention_module_op
@@ -187,6 +210,7 @@ def _run_official(args: argparse.Namespace, request: dict[str, Any]) -> None:
     if args.official_root is None:
         raise ValueError("Official backend requires --official-root")
     _insert_official_paths(args.official_root)
+    _configure_official_vocoder_determinism()
     # Keep Gemma on the same SDPA path in both subprocesses. DiT attention is
     # still pinned independently to the explicit cuDNN backend below.
     torch.backends.cuda.enable_cudnn_sdp(False)

@@ -130,7 +130,6 @@ def _validate_audio_metadata(metadata: DiffusionMetadataMapping | None) -> None:
     if metadata is None:
         return
     _check_optional_int(metadata, "sample_rate", group="audio", min_value=1)
-    _check_optional_non_empty_str(metadata, "audiox_task", group="audio")
 
 
 def _validate_actions_metadata(metadata: DiffusionMetadataMapping | None) -> None:

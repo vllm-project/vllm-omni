@@ -1,10 +1,19 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import pytest
+from vllm.pooling_params import PoolingParams
 
 import vllm_omni.config.pipeline_registry  # noqa: F401  (populate registry)
+from vllm_omni.config.omni_config import VllmOmniConfig
 from vllm_omni.config.pipeline_registry import OMNI_PIPELINES as _PIPELINE_REGISTRY
 from vllm_omni.config.stage_config import (
     DeployConfig,
     StageExecutionType,
+)
+from vllm_omni.engine.stage_init_utils import (
+    build_engine_args_dict_from_omni_stage_config,
+    extract_stage_metadata_from_omni_stage_config,
 )
 from vllm_omni.model_executor.stage_input_processors.forced_aligner import (
     POOLING_OUTPUT_DECODER_PATH,
@@ -69,3 +78,55 @@ def test_inject_noop_without_forced_aligner():
 
     assert ext_pipeline is pipeline
     assert len(ext_deploy.stages) == 0
+
+
+@pytest.mark.parametrize("async_chunk", [True, False])
+@pytest.mark.parametrize("cli_async_chunk", [None, True, False])
+def test_aligner_uses_completed_audio_without_disabling_upstream_chunks(async_chunk, cli_async_chunk):
+    from vllm_omni.config.config_factory import StageConfigFactory
+
+    pipeline = _PIPELINE_REGISTRY["qwen3_tts"]
+    deploy = DeployConfig(async_chunk=async_chunk)
+    resolution = StageConfigFactory._resolve_legacy_from_registry(
+        pipeline,
+        {"forced_aligner": "/models/Qwen3-ForcedAligner-0.6B", "async_chunk": cli_async_chunk},
+        user_deploy_config=deploy,
+    )
+    stages = [stage.to_omegaconf() for stage in resolution.stage_configs]
+    expected_async = async_chunk if cli_async_chunk is None else cli_async_chunk
+    assert len(stages) == 3
+    assert [stage.engine_args.async_chunk for stage in stages] == [expected_async, expected_async, False]
+    assert stages[2].custom_process_input_func.endswith("code2wav2aligner")
+    assert stages[2].engine_args.runner == "pooling"
+    assert len(pipeline.stages) == 2
+    assert deploy.stages == []
+
+
+def test_injected_aligner_survives_typed_config_and_runtime_projections():
+    pipeline, deploy = inject_forced_aligner_stage(
+        _PIPELINE_REGISTRY["qwen3_tts"],
+        DeployConfig(),
+        {"forced_aligner": "/models/Qwen3-ForcedAligner-0.6B"},
+    )
+    config = VllmOmniConfig.from_pipeline_config(
+        pipeline,
+        user_deploy_config=deploy,
+        cli_overrides={"model": "/models/Qwen3-TTS"},
+    )
+    stage = config.stage_configs[-1]
+
+    assert stage.pooling_config.runner == "pooling"
+    assert stage.pooling_config.pooling_output_decoder == POOLING_OUTPUT_DECODER_PATH
+    assert isinstance(stage.pooling_config.default_pooling_params, PoolingParams)
+    assert stage.pooling_config.default_pooling_params.task == deploy.stages[-1].default_pooling_params["task"]
+
+    metadata = extract_stage_metadata_from_omni_stage_config(stage)
+    assert isinstance(metadata.default_sampling_params, PoolingParams)
+    assert metadata.default_sampling_params.task == deploy.stages[-1].default_pooling_params["task"]
+
+    engine_args = build_engine_args_dict_from_omni_stage_config(
+        stage,
+        stage.model_config.model or "/models/Qwen3-ForcedAligner-0.6B",
+    )
+    assert engine_args["runner"] == "pooling"
+    assert engine_args["pooling_output_decoder"] == POOLING_OUTPUT_DECODER_PATH

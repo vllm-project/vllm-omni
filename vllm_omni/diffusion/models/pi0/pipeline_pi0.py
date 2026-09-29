@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """π0 (Pi-Zero) VLA pipeline for vllm-omni.
 
 Entry point for ``DiffusionEngine.step() → pipeline.forward(req)``. Mirrors the
@@ -94,9 +94,9 @@ class Pi0Pipeline(nn.Module):
             return None
         if os.path.isdir(model):
             return model
-        from huggingface_hub import snapshot_download
+        from vllm_omni.transformers_utils.repo_utils import hf_api
 
-        return snapshot_download(
+        return hf_api().snapshot_download(
             repo_id=model,
             allow_patterns=["*.json", "*.safetensors", "*.model", "tokenizer*"],
         )
