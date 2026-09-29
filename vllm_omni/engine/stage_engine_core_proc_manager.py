@@ -59,6 +59,15 @@ class StageEngineCoreProcManager(CoreEngineProcManager):
       added to every subprocess's kwargs.
     """
 
+    _DEFAULT_SHUTDOWN_GRACE_S = 15.0
+
+    def shutdown(self, timeout: float | None = None) -> None:
+        # Stage codecs can spend several seconds in interpreter GC after
+        # EngineCore has released its CUDA resources. Preserve any caller's
+        # explicit deadline, but give the normal exit more time than vLLM's
+        # generic five-second process-manager default.
+        super().shutdown(timeout=self._DEFAULT_SHUTDOWN_GRACE_S if timeout is None else timeout)
+
     def __init__(
         self,
         local_engine_count: int,
