@@ -115,6 +115,7 @@ def _patched_estimator_step(
     attn_mask=None,
     valid_lengths=None,
     valid_frames=None,
+    time_embedding=None,
 ):
     assert _original_estimator_step is not None
     graph_runner = _backend_graph_runners.get(self)
@@ -140,6 +141,7 @@ def _patched_estimator_step(
             attn_mask=attn_mask,
             valid_lengths=valid_lengths,
             valid_frames=valid_frames,
+            time_embedding=time_embedding,
         )
     if (cnn_cache is None) != (att_cache is None):
         raise ValueError("estimator CNN and attention caches must both be present or absent")
@@ -151,7 +153,8 @@ def _patched_estimator_step(
 
     # The upstream embedder creates a frequency tensor on the host. Keep it
     # outside capture while retaining the tensor-only estimator body in graph.
-    time_embedding = estimator.t_embedder(time).unsqueeze(1)
+    if time_embedding is None:
+        time_embedding = estimator.t_embedder(time).unsqueeze(1)
     # A bucketing mask travels as a graph input: the capture key only covers
     # shapes, so replaying an existing graph must copy the current mask in.
     # Like `valid_frames`, it is forwarded only when present, so graphable

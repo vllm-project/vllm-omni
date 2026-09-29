@@ -1408,12 +1408,12 @@ class TestDeployConfigLoading:
     @pytest.mark.parametrize(
         ("filename", "max_sessions"),
         [
-            ("minicpmo_4_5.yaml", 4),
+            ("minicpmo_4_5.yaml", 16),
             ("minicpmo_4_5_2gpu.yaml", 4),
             ("minicpmo_4_5_3gpu.yaml", 4),
             ("minicpmo_4_5_8x4090.yaml", 1),
-            ("minicpmo_4_5_3gpu_stage1_replicas.yaml", 4),
-            ("minicpmo_4_5_4gpu_stage1_replicas.yaml", 4),
+            ("minicpmo_4_5_3gpu_stage1_replicas.yaml", 16),
+            ("minicpmo_4_5_4gpu_stage1_replicas.yaml", 16),
             ("minicpmo_4_5_8x4090_stage1_replicas.yaml", 1),
         ],
     )
@@ -2938,7 +2938,7 @@ class TestPlatformOverrides:
 
         cuda = _apply_platform_overrides(load_deploy_config(deploy_path), platform="cuda")
         cuda_stages = merge_pipeline_deploy(pipeline, cuda)
-        assert cuda_stages[1].yaml_engine_args["kv_cache_memory_bytes"] == 2 * 1024**3
+        assert cuda_stages[1].yaml_engine_args["kv_cache_memory_bytes"] == 4 * 1024**3
 
         # The CUDA memory budget must not leak into the existing NPU profile.
         npu = _apply_platform_overrides(load_deploy_config(deploy_path), platform="npu")
@@ -2955,7 +2955,7 @@ class TestPlatformOverrides:
                 load_deploy_config(Path(get_deploy_config_path(filename))), platform="cuda"
             )
             replica_stages = merge_pipeline_deploy(pipeline, replica)
-            # Explicit null clears the inherited single-GPU 2 GiB CUDA cap.
+            # Explicit null clears the inherited single-GPU 4 GiB CUDA cap.
             assert replica_stages[1].yaml_engine_args.get("kv_cache_memory_bytes") is None
 
     def test_fish_speech_npu_uses_ascend_kv_block_size(self):

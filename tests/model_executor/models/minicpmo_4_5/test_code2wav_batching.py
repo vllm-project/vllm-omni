@@ -172,6 +172,19 @@ def _config(minimum: int = 1, initial: int = 0, *, runtime_prompt_cache_size: in
     )
 
 
+@pytest.mark.parametrize(
+    ("extra", "max_num_seqs", "micro"), [({}, 6, 6), ({}, 64, 16), ({"micro_batch_size": 2}, 6, 2)]
+)
+def test_whole_euler_micro_batch_defaults_to_stage_concurrency(extra, max_num_seqs, micro):
+    config = _config()
+    config.model_config.stage_connector_config["extra"].update(extra)
+    config.scheduler_config = SimpleNamespace(max_num_seqs=max_num_seqs)
+
+    model = MiniCPMO45Code2Wav(vllm_config=config)
+
+    assert model._cfm_graph_config["micro_batch_size"] == micro
+
+
 def _model(initial: int = 0, minimum: int = 1, *, runtime_prompt_cache_size: int = 4, setup_cache_size: int = 1):
     token2wav = _FakeToken2Wav()
     backend = BatchedToken2Wav(token2wav, setup_cache_size=setup_cache_size)
@@ -213,17 +226,43 @@ def test_setup_cache_reuses_read_only_state_for_the_same_exact_batch():
         torch.testing.assert_close(cache[name], expected)
 
 
-def test_setup_cache_keys_batch_size_and_evicts_least_recent_entry():
+def test_setup_solves_the_prompt_once_for_every_batch_size():
     token2wav = _FakeToken2Wav()
     adapter = BatchedToken2Wav(token2wav, setup_cache_size=1)
     prompt = adapter.prepare_prompt("shared", "/fake/prompt.wav")
 
-    adapter.setup_batch(prompt, 1)
-    adapter.setup_batch(prompt, 2)
-    adapter.setup_batch(prompt, 1)
+    single = adapter.setup_batch(prompt, 1)
+    pair = adapter.setup_batch(prompt, 2)
 
-    assert token2wav.flow.encoder.calls == [1, 2, 1]
-    assert list(adapter._setup_cache) == [(prompt.cache_key, 1, 0)]
+    assert token2wav.flow.encoder.calls == [1]
+    assert pair == [single[0], single[0]]
+    assert list(adapter._setup_cache) == [(prompt.cache_key, 0)]
+
+
+def test_setup_cache_evicts_least_recent_prompt():
+    token2wav = _FakeToken2Wav()
+    adapter = BatchedToken2Wav(token2wav, setup_cache_size=1)
+    first = adapter.prepare_prompt("first", "/fake/first.wav")
+    second = adapter.prepare_prompt("second", "/fake/second.wav")
+
+    adapter.setup_batch(first, 1)
+    adapter.setup_batch(second, 2)
+    adapter.setup_batch(first, 1)
+
+    assert token2wav.flow.encoder.calls == [1, 1, 1]
+    assert list(adapter._setup_cache) == [(first.cache_key, 0)]
+
+
+def test_setup_without_cache_still_solves_one_shared_row():
+    token2wav = _FakeToken2Wav()
+    adapter = BatchedToken2Wav(token2wav, setup_cache_size=0)
+    prompt = adapter.prepare_prompt("shared", "/fake/prompt.wav")
+
+    states = adapter.setup_batch(prompt, 3)
+
+    assert token2wav.flow.encoder.calls == [1]
+    assert states[0] is states[1] is states[2]
+    assert not adapter._setup_cache
 
 
 def test_evict_prompt_clears_features_and_setup_state():
@@ -481,9 +520,12 @@ def test_adapter_runs_true_batch_cfg_and_splits_request_caches():
     )
 
     assert token2wav.prompt_calls == 1
-    assert token2wav.flow.encoder.calls == [2, 2]
-    assert token2wav.flow.decoder.estimator.cfg_batches == [4, 4, 4, 4]
-    assert all(order == [1.0, 1.0, 0.0, 0.0] for order in token2wav.flow.decoder.estimator.speaker_order)
+    # Setup solves the shared prompt once; the chunk runs both requests together.
+    assert token2wav.flow.encoder.calls == [1, 2]
+    assert token2wav.flow.decoder.estimator.cfg_batches == [2, 2, 4, 4]
+    speaker_order = token2wav.flow.decoder.estimator.speaker_order
+    assert all(order == [1.0, 0.0] for order in speaker_order[:2])
+    assert all(order == [1.0, 1.0, 0.0, 0.0] for order in speaker_order[2:])
     assert token2wav.hift.calls == [2]
     assert len(audios) == 2
     cache0 = states[0].flow_cache["estimator_cnn_cache"]
@@ -704,6 +746,40 @@ def test_decode_cfm_enters_platform_sdpa_context(monkeypatch):
     )
 
     assert entered == ["enter", "exit"]
+
+
+def test_eager_cfm_reads_the_step_sizes_to_the_host_once(monkeypatch):
+    """The eager Euler loop must not sync the stream for ``dt`` on every decode."""
+    adapter = BatchedToken2Wav(_FakeToken2Wav())
+    reads: list[str] = []
+
+    def recording(name):
+        original = getattr(torch.Tensor, name)
+
+        def read(self, *args, **kwargs):
+            # The fake estimator records its inputs with ``tolist``; skip those.
+            if sys._getframe(1).f_code.co_filename != __file__:
+                reads.append(name)
+            return original(self, *args, **kwargs)
+
+        return read
+
+    for name in ("item", "tolist"):
+        monkeypatch.setattr(torch.Tensor, name, recording(name))
+
+    def decode():
+        adapter._decode_cfm(
+            torch.ones((1, 1, 2)),
+            torch.ones((1, 1)),
+            torch.zeros((1, 1, 2)),
+            cnn_cache=None,
+            att_cache=None,
+        )
+
+    decode()
+    assert reads == ["tolist"]
+    decode()
+    assert reads == ["tolist"]
 
 
 def test_ragged_decode_bypasses_exact_shape_accelerators():
@@ -963,6 +1039,44 @@ def test_estimator_cache_stack_split_round_trip_preserves_cfg_rows():
         )
 
 
+@pytest.mark.parametrize("attention_dtype", [torch.float32, torch.bfloat16])
+def test_split_flow_cache_trims_each_request_like_the_batch_trim(attention_dtype):
+    """Trimming per request while splitting equals trimming the stacked batch first."""
+    adapter = BatchedToken2Wav(_FakeToken2Wav(), bfloat16_attention_cache=attention_dtype == torch.bfloat16)
+    batch_size, prompt_len, frames = 3, 5, 12
+    torch.manual_seed(0)
+    stacked = {
+        "conformer_cnn_cache": torch.randn(batch_size, 2, 3),
+        "conformer_att_cache": torch.randn(2, batch_size, 2, 4, 6),
+        "estimator_cnn_cache": torch.randn(4, 2, 2 * batch_size, 3, 2),
+        "estimator_att_cache": torch.randn(4, 2, 2 * batch_size, 2, frames, 6),
+    }
+
+    restored = adapter._split_flow_cache(stacked, batch_size, estimator_att_keep=(prompt_len, 4))
+
+    att = stacked["estimator_att_cache"]
+    trimmed = torch.cat((att[..., :prompt_len, :], att[..., -4:, :]), dim=4)
+    for row, request in enumerate(restored):
+        expected = torch.cat(
+            (trimmed[:, :, row : row + 1], trimmed[:, :, batch_size + row : batch_size + row + 1]),
+            dim=2,
+        ).to(attention_dtype)
+        assert request["estimator_att_cache"].dtype == attention_dtype
+        torch.testing.assert_close(request["estimator_att_cache"], expected)
+        torch.testing.assert_close(
+            request["estimator_cnn_cache"],
+            torch.cat(
+                (
+                    stacked["estimator_cnn_cache"][:, :, row : row + 1],
+                    stacked["estimator_cnn_cache"][:, :, batch_size + row : batch_size + row + 1],
+                ),
+                dim=2,
+            ),
+        )
+    untrimmed = adapter._split_flow_cache(stacked, batch_size, estimator_att_keep=(frames, 4))
+    assert untrimmed[0]["estimator_att_cache"].shape[4] == frames
+
+
 def test_bfloat16_estimator_attention_cache_materializes_only_current_timestep():
     token2wav = _FakeToken2Wav()
     adapter = BatchedToken2Wav(token2wav, bfloat16_attention_cache=True)
@@ -970,9 +1084,8 @@ def test_bfloat16_estimator_attention_cache_materializes_only_current_timestep()
     states = adapter.setup_batch(prompt, 2)
 
     assert all(state.flow_cache["estimator_att_cache"].dtype == torch.bfloat16 for state in states)
-    assert (
-        states[0].flow_cache["estimator_att_cache"].data_ptr() != states[1].flow_cache["estimator_att_cache"].data_ptr()
-    )
+    # Both requests start from the one shared prompt state.
+    assert states[0] is states[1]
 
     stacked = adapter._stack_flow_cache(states)
     assert stacked["estimator_att_cache"].dtype == torch.bfloat16
@@ -991,6 +1104,10 @@ def test_bfloat16_estimator_attention_cache_materializes_only_current_timestep()
         last_chunk=False,
     )
     assert all(state.flow_cache["estimator_att_cache"].dtype == torch.bfloat16 for state in next_states)
+    assert (
+        next_states[0].flow_cache["estimator_att_cache"].data_ptr()
+        != next_states[1].flow_cache["estimator_att_cache"].data_ptr()
+    )
     assert token2wav.flow.decoder.estimator.attention_cache_dtypes[-2:] == [torch.float32, torch.float32]
 
 
@@ -1117,9 +1234,17 @@ def test_initial_empty_segment_marker_initializes_stream_without_audio():
     assert "duplex" in model._states
 
 
-@pytest.mark.parametrize("setup_cache_size,expected_calls", [(0, [2, 2, 1]), (1, [2, 1])])
+@pytest.mark.parametrize("setup_cache_size,expected_calls", [(0, [1, 1, 1]), (1, [1])])
 def test_initial_empty_segment_markers_respect_initial_batch_limit(setup_cache_size, expected_calls):
     model, token2wav = _model(initial=2, setup_cache_size=setup_cache_size)
+    setup_batches: list[int] = []
+    setup_batch = model.backend.setup_batch
+
+    def record_setup(features, batch_size):
+        setup_batches.append(batch_size)
+        return setup_batch(features, batch_size)
+
+    model.backend.setup_batch = record_setup
     names = ["a", "b", "c", "d", "e"]
     boundaries = []
     for name in names:
@@ -1135,6 +1260,8 @@ def test_initial_empty_segment_markers_respect_initial_batch_limit(setup_cache_s
 
     output = _forward(model, boundaries)
 
+    assert setup_batches == [2, 2, 1]
+    # One shared prompt solve per setup, or one in all with the setup cache.
     assert token2wav.flow.encoder.calls == expected_calls
     assert [audio.numel() for audio in output.multimodal_outputs["model_outputs"]] == [0] * len(names)
     assert set(model._states) == set(names)
@@ -1631,8 +1758,8 @@ def test_setup_cache_misses_when_cfm_graph_padding_is_disabled(monkeypatch, disa
     assert unpadded[0] is not padded[0]
     assert reused[0] is unpadded[0]
     assert adapter.flow.encoder.calls == [1, 1]
-    assert padded_keys == [(prompt.cache_key, 1, 16)]
-    assert list(adapter._setup_cache) == [(prompt.cache_key, 1, 0)]
+    assert padded_keys == [(prompt.cache_key, 16)]
+    assert list(adapter._setup_cache) == [(prompt.cache_key, 0)]
 
 
 def test_padded_chunk_keeps_the_cross_chunk_caches_on_the_valid_boundary():

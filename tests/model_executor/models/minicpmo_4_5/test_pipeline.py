@@ -184,8 +184,8 @@ class TestDeployTopology:
         assert "hf_overrides" not in stages[1].yaml_engine_args
         if filename == "minicpmo_4_5.yaml":
             # The NPU overlay caps all three stages at 8 so the top tier is not
-            # gated by a single stage; every other platform keeps the base 4.
-            expected_seqs = 8 if (current_omni_platform.device_name or "").lower() == "npu" else 4
+            # gated by a single stage; every other platform keeps the base 16.
+            expected_seqs = 8 if (current_omni_platform.device_name or "").lower() == "npu" else 16
             assert [stage.yaml_engine_args["max_num_seqs"] for stage in stages] == [expected_seqs] * 3
             memory_utilizations = [stage.yaml_engine_args["gpu_memory_utilization"] for stage in stages]
             assert memory_utilizations == [
