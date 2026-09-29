@@ -870,13 +870,14 @@ def render_development_report_markdown_preview(
     )
 
     # 2) Failure Analysis: top-level section, one collapsible sub-section per
-    #    local GPU. H100 is dropped for the development variant.
+    #    local GPU. H100 and B200 are dropped for the development variant.
     failure_analysis = render_failure_analysis_section(
         log_h200=None,
         log_h800=None,
         log_a100=None,
         log_a3=None,
         include_h100=False,
+        include_b200=False,
     )
 
     # 3) Skip Test Case Monitoring: hardcoded preview rows (no git pull, no
@@ -1550,6 +1551,52 @@ def _render_buildkite_step_failure_section(
     return "\n".join(chunks)
 
 
+def _render_b200_step_failure_section(
+    *,
+    build_no: int | None,
+    build_url: str | None,
+    failed_steps: list[tuple[str, str, str]],
+) -> str:
+    """Render a compact B200 (Buildkite scheduled release) failed-step block for the Failure Analysis section.
+
+    Mirrors :func:`_render_buildkite_step_failure_section` (H100). ``failed_steps``
+    is a list of ``(name, state, step_link)`` tuples — only Buildkite steps in
+    ``failed`` state (``broken`` is intentionally excluded; it's a transient
+    pipeline-execution state, not a real test failure). Emits the
+    ``failure-analysis-b200`` anchor so the *Failed* cell in the Test Result
+    Overall summary table's B200 row jumps here. Step log parsing is left to
+    the dedicated nightly Buildkite pipeline (read-only against cached build
+    metadata, matching the H100 precedent).
+    """
+    if not failed_steps:
+        return (
+            '<a id="failure-analysis-b200"></a>\n'
+            "#### B200 (CI — Buildkite scheduled release) failures\n\n"
+            "*No failed Buildkite steps in the latest scheduled release B200 build.*\n"
+        )
+    chunks: list[str] = [
+        '<a id="failure-analysis-b200"></a>',
+        "#### B200 (CI — Buildkite scheduled release) failures",
+        "",
+    ]
+    if build_no is not None and build_url:
+        chunks.append(f"- Latest scheduled release B200 build: [{build_no}]({build_url}).")
+        chunks.append("")
+    chunks.append(f"{len(failed_steps)} failed step(s):")
+    chunks.append("")
+    rows: list[list[str]] = []
+    for name, state, link in failed_steps:
+        rows.append([name, state, f"[open]({link})" if link else "—", "—", "Filed / Not an issue"])
+    chunks.append(
+        render_markdown_table(
+            ["Step / Job", "State", "Step link", "Submit Issue", "Status"],
+            rows,
+        )
+    )
+    chunks.append("")
+    return "\n".join(chunks)
+
+
 def render_failure_summary_md(
     *,
     log_h200: Path | None,
@@ -1602,6 +1649,10 @@ def _render_failure_summary_blocks(
     h100_build_url=None,
     h100_failed_steps=None,
     include_h100: bool = True,
+    b200_build_no=None,
+    b200_build_url=None,
+    b200_failed_steps=None,
+    include_b200: bool = True,
 ) -> str:
     """Per-GPU failure detail blocks (no top-level heading).
 
@@ -1609,6 +1660,9 @@ def _render_failure_summary_blocks(
     *Failed* column links in the Overall test execution summary table land
     on a real target. ``include_h100=False`` skips the Buildkite H100 block
     (used by the development variant, which has no H100 data).
+    ``include_b200=True`` (default; release path) renders the B200 (Buildkite
+    scheduled release) failed-steps block; ``include_b200=False`` (development
+    variant) skips B200 entirely.
     """
     local_pairs = [
         ("H200", log_h200),
@@ -1628,6 +1682,14 @@ def _render_failure_summary_blocks(
                 build_no=h100_build_no,
                 build_url=h100_build_url,
                 failed_steps=h100_failed_steps or [],
+            )
+        )
+    if include_b200:
+        gpu_blocks.append(
+            _render_b200_step_failure_section(
+                build_no=b200_build_no,
+                build_url=b200_build_url,
+                failed_steps=b200_failed_steps or [],
             )
         )
     return "\n".join(gpu_blocks)
@@ -1765,14 +1827,14 @@ def build_b200_ci_markdown_body(
     passed: int,
     failed: int,
     broken: int,
-    failed_steps: list[tuple[str, str, str]],
 ) -> str:
     """Render the B200 (CI — Buildkite scheduled release) chapter body.
 
-    Lightweight: build metadata + reportable-job summary + a failed-step table
-    with Buildkite links. No per-job log download (matches the H100 chapter
-    precedent). The failed-step detail lives here (not in a separate Failure
-    Analysis subsection), so the Summary and Failed-jobs blocks are kept.
+    Lightweight: build metadata + reportable-job summary. No per-job log
+    download (matches the H100 chapter precedent). The failed-step detail
+    lives in the **Failure Analysis** section (``_render_b200_step_failure_section``),
+    not in this Test Result chapter — so only the Build + Summary blocks are
+    emitted here.
     """
     short = commit[:7] if len(commit) >= 7 else commit
     build_link = f"https://buildkite.com/{ORG}/{PIPELINE}/builds/{build_no}"
@@ -1801,24 +1863,6 @@ def build_b200_ci_markdown_body(
         f"#### Build\n\n{build_table}\n",
         f"#### Summary (reportable jobs)\n\n{summary_table}\n",
     ]
-    if failed_steps:
-        # Mirror the H100 failure-analysis column set so the markdown→HTML
-        # post-processors (``_upgrade_submit_issue_cells_in_failure_tables``
-        # + ``_upgrade_status_cells_in_failure_tables`` in release_md_to_html)
-        # upgrade these cells into an interactive "Submit issue" button and a
-        # "Filed / Not an issue" Status cell (the Filed flow prompts for a
-        # GitHub issue number, persisted in localStorage per row-id). The
-        # heading chain ``Test Result → B200 (…) → Failed test jobs`` keeps
-        # each B200 job's row-id unique. See ``build_h100_failure_analysis_block``
-        # for the precedent.
-        rows = [
-            [name, st, f"[open]({link})" if link else "—", "—", "Filed / Not an issue"]
-            for (name, st, link) in failed_steps
-        ]
-        parts.append(
-            f"#### Failed test jobs\n\n"
-            f"{render_markdown_table(['Job', 'State', 'Step link', 'Submit Issue', 'Status'], rows)}\n"
-        )
     return "\n".join(parts)
 
 
@@ -2003,14 +2047,13 @@ def render_test_result_section(
     if dev_perf_a3:
         chunks.extend(["", dev_perf_a3.rstrip(), ""])
     # B200 (CI — Buildkite scheduled release). Only emit the panel when the caller
-    # passes a non-empty `b200_ci_markdown` body (release path). The
-    # ``failure-analysis-b200`` anchor is emitted at the chapter so the B200
-    # Failed cell in the Overall summary table links here — B200 has no separate
-    # Failure Analysis subsection in v1 (the failed-step table lives in this
-    # chapter).
+    # passes a non-empty `b200_ci_markdown` body (release path). The B200 chapter
+    # emits Build + Summary only; the failed-step detail and the
+    # ``failure-analysis-b200`` anchor live in the **Failure Analysis** section
+    # (``_render_b200_step_failure_section``) so the B200 Failed cell in the
+    # Overall summary table links there.
     if b200_ci_markdown:
-        chunks.extend(["", '<a id="failure-analysis-b200"></a>', ""])
-        chunks.extend(["### B200 (CI — Buildkite scheduled release)", ""])
+        chunks.extend(["", "### B200 (CI — Buildkite scheduled release)", ""])
         chunks.append(b200_ci_markdown.rstrip())
         chunks.append("")
     # H100 (CI — Buildkite scheduled nightly). Only emit the panel when the caller
@@ -2034,13 +2077,19 @@ def render_failure_analysis_section(
     h100_build_url=None,
     h100_failed_steps=None,
     include_h100: bool = True,
+    b200_build_no=None,
+    b200_build_url=None,
+    b200_failed_steps=None,
+    include_b200: bool = True,
 ) -> str:
     """Emit a top-level ## Failure Analysis section.
 
     Each local GPU (H200/H800/A100/A3) gets its own collapsible sub-section.
     ``include_h100=True`` (default; release path) also renders the H100
     Buildkite failed-steps block; ``include_h100=False`` (development
-    variant) skips H100 entirely.
+    variant) skips H100 entirely. ``include_b200=True`` (default; release
+    path) renders the B200 (Buildkite scheduled release) failed-steps block;
+    ``include_b200=False`` (development variant) skips B200 entirely.
 
     Anchors named ``failure-analysis-hXXX`` (always emitted, even for
     placeholders) so the *Failed* cells in the
@@ -2061,6 +2110,10 @@ def render_failure_analysis_section(
         h100_build_url=h100_build_url,
         h100_failed_steps=h100_failed_steps,
         include_h100=include_h100,
+        b200_build_no=b200_build_no,
+        b200_build_url=b200_build_url,
+        b200_failed_steps=b200_failed_steps,
+        include_b200=include_b200,
     )
 
 
@@ -2195,7 +2248,7 @@ def restructure_metrics_to_two_columns(ci_md: str) -> str:
 
     * ``bugs (first response, ...)`` → Bug avg first response (last column)
     * ``**CI issue detection rate**`` → percentage cell
-    * ``**Device-Hours / Build (7-day avg)**`` → marker (later upgraded by
+    * ``**Device-Hours / Build**`` → marker (later upgraded by
       ``release_md_to_html``)
 
     Separator rows are normalised to a 2-column dash row. Rows that already
@@ -2467,7 +2520,7 @@ DEVICE_HOURS_PER_BUILD_MARKER = "@@DEVICE_HOURS_PER_BUILD_CELL@@"
 
 
 def _append_device_hours_build_row(ci_row: str) -> str:
-    """Append the manual **Device-Hours / Build (7-day avg)** row beneath ``ci_row``.
+    """Append the manual **Device-Hours / Build** row beneath ``ci_row``.
 
     The release Metrics overview terminates with the CI issue detection rate
     row. Operators track compute burn via a separate spreadsheet; rather than
@@ -2480,7 +2533,7 @@ def _append_device_hours_build_row(ci_row: str) -> str:
     return (
         ci_row
         + "\n"
-        + "| **Device-Hours / Build (7-day avg)** | "
+        + "| **Device-Hours / Build** | "
         + DEVICE_HOURS_PER_BUILD_MARKER
         + " | - | - | - |"
     )
@@ -2522,7 +2575,7 @@ def preview_report_markdown(
                     "-",
                 ],
                 [
-                    "**Device-Hours / Build (7-day avg)**",
+                    "**Device-Hours / Build**",
                     DEVICE_HOURS_PER_BUILD_MARKER,
                     "-",
                     "-",
@@ -2585,7 +2638,8 @@ def preview_report_markdown(
 
     # B200 (CI — Buildkite scheduled release) preview body. Sample counts
     # mirror the latest real B200 build (#15964, failed) so the preview renders
-    # the chapter without a Buildkite call.
+    # the chapter without a Buildkite call. Build + Summary only (failed-step
+    # detail lives in the Failure Analysis preview block below).
     b200_body = build_b200_ci_markdown_body(
         build_no=build_no,
         branch=BRANCH,
@@ -2595,11 +2649,11 @@ def preview_report_markdown(
         passed=42,
         failed=9,
         broken=0,
-        failed_steps=[
-            ("Omni · Function Test with H100 · 2-GPU", "failed", demo_link_a),
-            ("TTS · Function Test with L4", "failed", demo_link_b),
-        ],
     )
+    b200_failed_steps = [
+        ("Omni · Function Test with H100 · 2-GPU", "failed", demo_link_a),
+        ("TTS · Function Test with L4", "failed", demo_link_b),
+    ]
 
     test_result = render_test_result_section(
         skill_dir,
@@ -2629,6 +2683,10 @@ def preview_report_markdown(
         h100_build_url=f"https://buildkite.com/{ORG}/{PIPELINE}/builds/{build_no}",
         h100_failed_steps=h100_failed_steps_preview,
         include_h100=True,
+        b200_build_no=build_no,
+        b200_build_url=f"https://buildkite.com/{ORG}/{PIPELINE}/builds/{build_no}",
+        b200_failed_steps=b200_failed_steps,
+        include_b200=True,
     )
 
     open_issues_block = (
@@ -3041,13 +3099,14 @@ def main() -> None:
         )
 
         # Failure Analysis: top-level section, one collapsible subsection per
-        # local GPU. H100 is dropped for the development variant.
+        # local GPU. H100 and B200 are dropped for the development variant.
         failure_analysis = render_failure_analysis_section(
             log_h200=args.log_dir_h200,
             log_h800=args.log_dir_h800,
             log_a100=args.log_dir_a100,
             log_a3=args.log_dir_a3,
             include_h100=False,
+            include_b200=False,
         )
 
         dev_metrics_md, combined_n, critical_n, di_per_issue, _alerts = render_development_metrics_overview(
@@ -3180,7 +3239,7 @@ def main() -> None:
     # share of bugs created in the stats window that also carry the
     # ``ci-failure`` label, which measures how well the CI pipeline catches
     # user-reported issues. ``append_ci_issue_detection_rate_row`` also
-    # bundles the operator-editable **Device-Hours / Build (7-day avg)**
+    # bundles the operator-editable **Device-Hours / Build**
     # row beneath it via ``_append_device_hours_build_row``; the cell
     # carries a ``@@DEVICE_HOURS_PER_BUILD_CELL@@`` marker that
     # ``release_md_to_html`` converts to an inline editable input backed
@@ -3214,11 +3273,17 @@ def main() -> None:
     b200_passed: int | None = None
     b200_failed: int | None = None
     b200_broken: int | None = None
+    b200_build_no: int | None = None
+    b200_build_url: str | None = None
+    b200_failed_steps: list[tuple[str, str, str]] | None = None
     try:
         b200 = fetch_b200_build_summary(token, build_no=args.b200_build)
         b200_passed = b200["passed"]
         b200_failed = b200["failed"]
         b200_broken = b200["broken"]
+        b200_build_no = b200["build_no"]
+        b200_build_url = f"https://buildkite.com/{ORG}/{PIPELINE}/builds/{b200_build_no}"
+        b200_failed_steps = b200["failed_steps"]
         b200_body = build_b200_ci_markdown_body(
             build_no=b200["build_no"],
             branch=b200["branch"],
@@ -3228,7 +3293,6 @@ def main() -> None:
             passed=b200["passed"],
             failed=b200["failed"],
             broken=b200["broken"],
-            failed_steps=b200["failed_steps"],
         )
         print(
             f"B200: build #{b200['build_no']} [{b200['state']}] "
@@ -3264,7 +3328,9 @@ def main() -> None:
 
     # Failure Analysis: top-level section, one collapsible subsection per
     # local GPU (H200/H800/A100 from local logs). H100 (Buildkite) is
-    # intentionally omitted from the release report.
+    # intentionally omitted from the release report. B200 (Buildkite scheduled
+    # release) failed steps are rendered here (the Test Result B200 chapter
+    # carries only Build + Summary).
     failure_analysis = render_failure_analysis_section(
         log_h200=args.log_dir_h200,
         log_h800=args.log_dir_h800,
@@ -3274,6 +3340,10 @@ def main() -> None:
         h100_build_url=None,
         h100_failed_steps=None,
         include_h100=False,
+        b200_build_no=b200_build_no,
+        b200_build_url=b200_build_url,
+        b200_failed_steps=b200_failed_steps,
+        include_b200=True,
     )
 
     # Issue tracking section is intentionally omitted from the release

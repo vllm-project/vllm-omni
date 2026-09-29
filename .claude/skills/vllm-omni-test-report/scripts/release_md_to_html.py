@@ -1673,7 +1673,7 @@ def _upgrade_next_steps_outstanding_cells(html_fragment: str) -> str:
     return TABLE_RE.sub(lambda m: _upgrade_table(m.group(0)), html_fragment)
 
 
-# ── Device-Hours / Build (7-day avg) — manual metric row ────────────────
+# ── Device-Hours / Build — manual metric row ────────────────
 # Operator-editable metric appended to the release Metrics overview table
 # by ``compose_full_report._append_device_hours_build_row``. The row ships
 # with a marker placeholder ``@@DEVICE_HOURS_PER_BUILD_CELL@@`` in the
@@ -2258,16 +2258,30 @@ _QUALITY_DEFENSE_MODEL_KEYWORDS: dict[str, tuple[str, ...]] = {
 def _qd_repo_root() -> Path | None:
     """Resolve the vllm-omni repo root for the coverage scan.
 
-    Resolution order (matches the skill's REPO_ROOT convention):
-    explicit ``$REPO_ROOT`` → default ``~/vllm-omni`` if it exists → ``None``.
-    Returns ``None`` when no repo is reachable so callers fall back to all-off.
+    Resolution order: explicit ``$REPO_ROOT`` → a known laptop clone location
+    if it exists → ``None``. Returns ``None`` when no repo is reachable so
+    callers fall back to all-off (all-gray radar).
+
+    The coverage scan reads ``.buildkite/cuda/{test-nightly,test-merge,
+    test-ready}.yml`` + ``.buildkite/npu/test-npu-{nightly,ready}.yml`` +
+    ``tests/{examples,e2e/accuracy,dfx/reliability}/``, so the resolver prefers
+    a clone with the conventional ``.buildkite/cuda/`` + ``.buildkite/npu/``
+    lane layout (a flat-``.buildkite/test-*.yml`` clone lights nothing).
     """
     env = os.environ.get("REPO_ROOT")
     if env:
         root = Path(env).expanduser()
         return root if root.is_dir() else None
-    default = Path.home() / "vllm-omni"
-    return default if default.is_dir() else None
+    # Fall back through known laptop clone locations. Order matters: prefer a
+    # path with the lane-split .buildkite layout the scan actually reads.
+    for cand in (
+        Path.home() / "vllm-omni",       # canonical REPO_ROOT default
+        Path("/home/wy/vllm-omni"),      # lane-split .buildkite (lights ~103)
+        Path("/home/wy/vllm-omni-yn"),   # flat .buildkite (lights ~0) — last resort
+    ):
+        if cand.is_dir():
+            return cand
+    return None
 
 
 def _qd_read_yamls(repo_root: Path, files: list[str]) -> str:

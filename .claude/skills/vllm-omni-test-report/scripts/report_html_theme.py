@@ -2625,7 +2625,7 @@ td.ns-assignee-cell {
   font-weight: 500;
 }
 
-/* Device-Hours / Build (7-day avg) — manual metric row. Mirrors the   */
+/* Device-Hours / Build — manual metric row. Mirrors the   */
 /* di-top10-assignee / -maintainer input pattern so the cell visually  */
 /* matches the rest of the editable cells in the Metrics overview.    */
 .release-doc .dhpb-input {
