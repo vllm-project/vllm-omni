@@ -538,5 +538,20 @@ class CosyVoice3Code2Wav(nn.Module):
             k.replace("generator.", ""): v for k, v in torch.load(hift_path, map_location=device).items()
         }
         self.hift.load_state_dict(hift_state_dict, strict=True)
-        self.hift.to(device).eval()
+        self.hift.to(device)
+        # Fold after loading and device placement to avoid recomputing weights
+        # for every chunk. Folding changes state_dict keys, so reloading the
+        # original checkpoint into this instance is unsupported.
+        folded = self.hift.remove_weight_norm()
+        logger.info("Folded %d weight-norm layers in HiFT generator", folded)
+        if folded == 0:
+            logger.warning("HiFT generator had no weight-norm layers to fold; check config drift")
+        # F0 inference runs on CPU for causal precision. Materialize its
+        # normalized weights there in FP32, not on the generator's device.
+        self.hift.f0_predictor.to(device="cpu", dtype=torch.float32)
+        f0_folded = self.hift.f0_predictor.remove_weight_norm()
+        logger.info("Folded %d weight-norm layers in HiFT F0 predictor", f0_folded)
+        if f0_folded == 0:
+            logger.warning("HiFT F0 predictor had no weight-norm layers to fold; check config drift")
+        self.hift.eval()
         logger.info(f"Loaded hift weights from {hift_path}")
