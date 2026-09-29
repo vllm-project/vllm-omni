@@ -119,3 +119,4 @@ class OmniSchedulerOutput(SchedulerOutput):
     pending_input_registrations: list[OmniChunkRecvHandle] = field(default_factory=list)
     data_plane_terminal_req_ids: set[str] = field(default_factory=set)
     input_terminal_req_ids: set[str] = field(default_factory=set)
+    discarded_req_ids: set[str] = field(default_factory=set)

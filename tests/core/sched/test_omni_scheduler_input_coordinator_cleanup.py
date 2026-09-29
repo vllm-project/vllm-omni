@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from __future__ import annotations
 
 from types import SimpleNamespace
@@ -23,6 +26,7 @@ class FakeInputCoordinator:
 
 class DummyRequest:
     request_id = "req-free"
+    status = RequestStatus.FINISHED_STOPPED
     client_index = 0
     additional_information = None
 

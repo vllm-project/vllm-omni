@@ -182,7 +182,7 @@ def _bind_request_lifecycle(
         # Current vLLM contract: (kv_xfer_params, ec_xfer_params)
         return None, None
 
-    def update_with_history(request, token_ids):
+    def update_with_history(request, token_ids, *, is_stale=False):
         accepted, stopped = update_request(request, token_ids)
         request.output_token_ids.extend(accepted)
         return accepted, stopped

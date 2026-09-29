@@ -264,7 +264,10 @@ Which stages may set `enable_prefix_caching: true`:
 | Codec decoder / Code2Wav stages (Qwen3-Omni stage 2, Qwen3-TTS stage 1) | keep `false` | Nothing downstream consumes their hidden states; the cache would only add device→host copies. Not validated. |
 | Diffusion stages | n/a | No vLLM KV cache to mirror. |
 
-Hit spans come from `scheduled_new_reqs` only, as in the pre-refactor cache:
+The adapter snapshots lifecycle events before the runner updates requests, then
+snapshots the write layout after batch ordering. The layout keeps request-local
+token positions separate from packed batch row offsets and physical cache slots.
+The manager consumes these snapshots without reading scheduler or batch state:
 
 - A new request with a (partial) prefix hit is the normal path: the hit
   blocks are read from the pool, the rest is this step's rows, and the
@@ -282,25 +285,43 @@ Hit spans come from `scheduled_new_reqs` only, as in the pre-refactor cache:
   ref before it overwrites the pool, so a delayed fetch serves the original
   tenant. A version mismatch with no preserved copy raises for live and
   finished alike (the pool rows are a newer tenant's). Production defaults
-  stay opt-in until preempt/resume hit spans are reconstructed.
-- `async_chunk` continuation: when the next upstream chunk arrives, the same
-  request id re-enters `scheduled_new_reqs` with `num_computed_tokens` equal
-  to what it already computed itself. Ids already in `live_reqs` are skipped
-  for hit marking: those rows were delivered in earlier steps and re-emitting
-  them would duplicate output. A `delivered_upto` span for this case is
-  Phase 2.
-- Preemption + reschedule: vLLM resets `num_computed_tokens` to 0 on
-  preemption and re-runs prefix matching on resume, so the resumed request
-  can come back with a fresh hit. With the V1 model runner it arrives
-  through `scheduled_cached_reqs` (id in `resumed_req_ids`, `new_block_ids`
-  replaces the table); with the V2 runner it re-enters `scheduled_new_reqs`
-  while still in `live_reqs`. Neither path marks an omni hit span: the
-  resumed request gets only the rows it recomputes, and its still-open
-  deferred write keeps appending (a slot written twice keeps the later
-  chunk). Cache integrity holds either way — the hit blocks already have
-  rows, from this request or the one it hit. Stages that need full prompt
-  hidden states should be sized so preemption does not occur while prefix
-  caching is on. Same as before this refactor; tracked for Phase 2.
+  stay opt-in.
+- `async_chunk` continuation arrives as an `EXTENDED` event. It retains the
+  request's delivery progress and does not replay earlier output.
+- On preemption, vLLM resets `num_computed_tokens` and looks up the prefix
+  again when resuming. The V1 runner's `RESUMED` event carries the new hit
+  boundary and replacement block table. The manager recovers the hit portion
+  not yet delivered. If the new hit ends before the delivery boundary, the
+  runner still saves every recomputed row, but the outgoing payload excludes
+  positions already handed off. With prefix caching enabled, the in-flight
+  step output during preemption is delivered and acknowledged; recovery starts
+  after that output. V2 resume and prompt-content replacement are separate
+  lifecycle contracts and are not covered by this path.
+
+Each request keeps one `delivered_upto` boundary for successful local handoff.
+Execution positions come from the saved step ranges; cache write completion and
+readability remain owned by the controller and slot state.
+
+`materialize` restores raw step outputs for postprocess. A delivery view clips
+replayed rows using the delivery start captured when the step was saved. Adjacent
+background builders may finish out of order without clipping each other's rows.
+Acknowledgement advances the request boundary monotonically only after successful
+payload construction. A replay-only step produces no outgoing payload.
+
+The executor joins an asynchronous output builder before returning its result to
+the scheduler. A preempted request cannot resume in the same scheduling step, so
+its earlier output is acknowledged before recovery. Delivery starts are captured
+on the engine thread; output builders do not need an additional ordering chain.
+
+Saved step outputs retain their original request progress object. A terminal
+event removes the live entry without changing a pending output; reusing the same
+request ID starts independent progress. Discarding a step does not acknowledge
+delivery. Full-payload accumulation receives raw materialized rows and the
+cache-merged field names, then clips replay independently for each field.
+Prefix recovery uses a snapshot of the smallest emitted end; replacement fields
+retain their existing policy. These boundaries describe local handoff, not
+connector or client receipt. Sparse list-only audio bypasses token clipping
+because its emission does not follow scheduler token ranges.
 
 Two write paths, split by `ModelCachePolicy.deferred_keys`:
 
@@ -339,9 +360,15 @@ does not write the pool or carry abort/preempt occupancy.
 
 ```python
 cache.register_policy(ModelCachePolicy.from_model(model))   # load_model
-cache.new_step_starts(scheduler_output)   # before _update_states
+adapter = PrefixCacheSchedulerAdapter()
+step = adapter.translate_step(scheduler_output)
+cache.new_step_starts(step)   # before _update_states
+layout = adapter.build_write_layout(
+    prefix_cache_group_view,
+    num_scheduled_tokens=dict(step.scheduled_tokens),
+)
 sid = cache.save_outputs(hidden, mm_outputs, num_tokens_unpadded=n,
-                         num_tokens_padded=n_pad)
+                         num_tokens_padded=n_pad, write_layout=layout)
 outs = cache.materialize(sid, req_ids)    # or discard_step(sid)
 ```
 

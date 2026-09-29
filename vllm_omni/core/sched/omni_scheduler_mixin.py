@@ -163,6 +163,7 @@ class OmniSchedulerMixin:
         self._latest_omni_connector_output: OmniConnectorOutput | None = None
         self._init_omni_connector_output_inbox()
         self._pending_data_plane_terminal_req_ids: set[str] = set()
+        self._discarded_req_ids: set[str] = set()
         # Optional per-stage pooling-output decoder hook (dotted path in
         # model_config); applied worker-side before IPC.
         self._pooling_output_decoder = None
@@ -186,6 +187,15 @@ class OmniSchedulerMixin:
             request,
             self.vllm_config.model_config.hf_config,
         )
+
+    def _record_full_payload_discard(self, request: Request) -> None:
+        if request.status in (
+            RequestStatus.FINISHED_ABORTED,
+            RequestStatus.FINISHED_ERROR,
+            RequestStatus.FINISHED_IGNORED,
+        ):
+            self._discarded_req_ids = getattr(self, "_discarded_req_ids", set())
+            self._discarded_req_ids.add(request.request_id)
 
     def _free_input_coordinator_request(self, request_id: str) -> None:
         """Prune full-payload coordinator state for a completed request."""
@@ -612,8 +622,12 @@ class OmniSchedulerMixin:
                     scheduled_terminal_req_ids,
                 )
             input_coordinator.postprocess_scheduler_output(base)
+        discarded_req_ids: set[str] = getattr(self, "_discarded_req_ids", set())
+        finished_discarded_req_ids = discarded_req_ids & base.finished_req_ids
+        discarded_req_ids.difference_update(finished_discarded_req_ids)
         return OmniSchedulerOutput(
             **base_data,
+            discarded_req_ids=finished_discarded_req_ids,
             finished_requests_needing_kv_transfer=finished_requests_needing_kv_transfer or {},
             pending_input_registrations=pending_input_registrations,
             data_plane_terminal_req_ids=data_plane_terminal_req_ids,

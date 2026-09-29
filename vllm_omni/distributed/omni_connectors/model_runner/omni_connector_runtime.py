@@ -137,6 +137,7 @@ class _OmniConnectorRuntimeMixin:
     _local_request_metadata: dict[str, dict[str, Any]]
     _chunk_stream_completed: set[str]
     _pending_full_payload_send: dict[str, tuple[Any, ...]]
+    _full_payload_token_ends: dict[str, dict[str, int]]
     _kv_sent_req_ids: list[str]
     _kv_pending_transfers: dict[str, dict[str, Any]]
     _kv_active_transfers: set[str]
@@ -295,6 +296,7 @@ class _OmniConnectorRuntimeMixin:
         # -- full_payload_mode: accumulate latest pooler_output per request,
         #    send only when the request finishes (next-cycle flush) --
         self._pending_full_payload_send: dict[str, tuple[Any, ...]] = {}
+        self._full_payload_token_ends = {}
 
         # -- KV sent accumulator --
         self._kv_sent_req_ids: list[str] = []
@@ -353,7 +355,7 @@ class _OmniConnectorRuntimeMixin:
             except Exception:
                 pass
 
-    def cleanup_finished_request(self, req_id: str) -> None:
+    def cleanup_finished_request(self, req_id: str, *, discard_payload: bool = False) -> None:
         """Clean up per-request state after a request is fully finished.
 
         Call this when a request is freed from the model runner to prevent
@@ -368,15 +370,9 @@ class _OmniConnectorRuntimeMixin:
         saves is added to ``_deferred_send_cleanup`` so the bg save's
         decrement path drains it without leaving orphans.
         """
-        # Force-flush any pending full-payload accumulator entry before
-        # cleanup proceeds.  Without this, finished requests with no
-        # downstream consumer (e.g. text-only on multi-modal arch) leave
-        # the entry orphaned in _pending_full_payload_send across requests,
-        # which empirically destabilises subsequent thinker forwards by
-        # making prefix-cache reuse observe stale accumulator state.  The
-        # flush is idempotent when the entry has already been flushed by the
-        # scheduler-driven path, but this cleanup path runs for every request,
-        # so skip it entirely when the request never accumulated a payload.
+        # Failed requests must never publish partial payloads as completed output.
+        if discard_payload:
+            self._pending_full_payload_send.pop(req_id, None)
         if req_id in self._pending_full_payload_send:
             try:
                 self.flush_full_payload_outputs({req_id})
@@ -392,6 +388,7 @@ class _OmniConnectorRuntimeMixin:
                     exc_info=True,
                 )
 
+        self._full_payload_token_ends.pop(req_id, None)
         ext_id = self._request_ids_mapping.pop(req_id, None)
         keys_to_clean: list[str] = [req_id]
         if ext_id is not None and ext_id != req_id:

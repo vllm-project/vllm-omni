@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
+import torch
 
 # Imports must run in this order: vllm_omni applies patches to vllm.v1.request before
 # Request / StreamingUpdate are bound in this module. Ruff isort would reorder them.
@@ -152,7 +153,7 @@ def _run_resumable_segment_stop(
     sched.perf_metrics = None
     sched.structured_output_manager.accept_tokens.return_value = True
 
-    def stop_request(request: Request, _token_ids: list[int]):
+    def stop_request(request: Request, _token_ids: list[int], *, is_stale: bool = False):
         request.status = RequestStatus.FINISHED_STOPPED
         return [42], True
 
@@ -365,6 +366,7 @@ def test_queued_streaming_update_on_async_stop_fences_in_flight_once() -> None:
     # Exactly the one unreported decode, so the drain reaches zero before the
     # new segment's first frame arrives.
     assert session.num_stale_output_tokens == session.num_in_flight_tokens == 1
+    assert session.drop_stale_output is False
 
 
 def test_stale_async_frame_is_dropped_before_output_processing() -> None:
@@ -383,7 +385,9 @@ def test_stale_async_frame_is_dropped_before_output_processing() -> None:
     sched.perf_metrics = None
     sched.structured_output_manager.accept_tokens.return_value = True
 
-    def discard_stale_output(request: Request, token_ids: list[int]) -> tuple[list[int], bool]:
+    def discard_stale_output(
+        request: Request, token_ids: list[int], *, is_stale: bool = False
+    ) -> tuple[list[int], bool]:
         request.async_tokens_to_discard = 0
         return token_ids, False
 
@@ -443,6 +447,158 @@ def test_stale_async_frame_is_dropped_before_output_processing() -> None:
         new_token_ids=[43],
         confirmed_num_computed_tokens=None,
     )
+
+
+@pytest.mark.parametrize("schedule_kind", ["new", "cached"])
+@pytest.mark.parametrize("enable_prefix_caching", [False, True])
+@pytest.mark.parametrize("request_status", [RequestStatus.PREEMPTED, RequestStatus.WAITING])
+def test_stale_prefill_delivery_respects_cache_mode_and_request_status(
+    schedule_kind: str, enable_prefix_caching: bool, request_status: RequestStatus
+) -> None:
+    request = Request(
+        request_id="req-preempted-prefill",
+        prompt_token_ids=list(range(256)),
+        sampling_params=SamplingParams(max_tokens=8),
+        pooling_params=None,
+        arrival_time=100.0,
+        block_hasher=None,
+    )
+    request.status = request_status
+    request.num_in_flight_tokens = 128
+    request.num_stale_output_tokens = 128
+    request.drop_stale_output = False
+    payload = {"hidden_states.layer_0": torch.arange(128).unsqueeze(1)}
+
+    sched = MagicMock()
+    sched.requests = {request.request_id: request}
+    sched.perf_metrics = None
+    sched.cache_config = SimpleNamespace(enable_prefix_caching=enable_prefix_caching)
+    sched.chunk_transfer_adapter = MagicMock()
+    sched._process_kv_transfer_trigger.return_value = False
+    sched.running = []
+    sched.waiting_for_transfer_free = set()
+    sched.transfer_triggered_requests = set()
+    sched.active_kv_transfers = set()
+    sched.pending_stop_after_extraction = set()
+    sched.connector = None
+    sched.kv_cache_manager.take_events.return_value = None
+    sched.kv_cache_manager.estimate_cached_tokens.return_value = 0
+    sched.finished_req_ids_dict = {}
+    sched.make_stats.return_value = None
+
+    scheduler_output = MagicMock(spec=SchedulerOutput)
+    scheduler_output.num_scheduled_tokens = {request.request_id: 128}
+    scheduler_output.scheduled_cached_reqs = SimpleNamespace(
+        req_ids=[request.request_id] if schedule_kind == "cached" else [],
+        num_computed_tokens=[128] if schedule_kind == "cached" else [],
+    )
+    scheduler_output.scheduled_new_reqs = (
+        [SimpleNamespace(req_id=request.request_id, num_computed_tokens=128)] if schedule_kind == "new" else []
+    )
+    scheduler_output.scheduled_spec_decode_tokens = {}
+    scheduler_output.num_invalid_spec_tokens = 0
+
+    model_runner_output = MagicMock(spec=ModelRunnerOutput)
+    model_runner_output.sampled_token_ids = []
+    model_runner_output.logprobs = None
+    model_runner_output.prompt_logprobs_dict = {}
+    model_runner_output.pooler_output = None
+    model_runner_output.multimodal_outputs = None
+    model_runner_output.inter_stage_outputs = [payload]
+    model_runner_output.num_nans_in_logits = None
+    model_runner_output.kv_connector_output = None
+    model_runner_output.cudagraph_stats = None
+    model_runner_output.req_id_to_index = {request.request_id: 0}
+    model_runner_output.routed_experts = None
+
+    OmniARScheduler.update_from_output(sched, scheduler_output, model_runner_output)
+
+    assert request.num_in_flight_tokens == 0
+    assert request.num_stale_output_tokens == 0
+    if enable_prefix_caching and request_status == RequestStatus.PREEMPTED:
+        sched.chunk_transfer_adapter.save_async.assert_called_once_with(
+            payload,
+            request,
+            False,
+            new_token_ids=[],
+            confirmed_num_computed_tokens=256,
+        )
+    else:
+        sched.chunk_transfer_adapter.save_async.assert_not_called()
+
+
+@pytest.mark.parametrize("enable_prefix_caching", [False, True])
+def test_preempted_in_flight_decode_respects_cache_mode_without_placeholder_underflow(
+    enable_prefix_caching: bool,
+) -> None:
+    request = _make_request()
+    request.status = RequestStatus.PREEMPTED
+    request.num_in_flight_tokens = 1
+    request.num_stale_output_tokens = 1
+    request.num_output_placeholders = 0
+    request.drop_stale_output = False
+    payload = {"hidden_states.layer_0": torch.ones(1, 1)}
+
+    async_sched = OmniARAsyncScheduler.__new__(OmniARAsyncScheduler)
+    async_sched.max_model_len = 32
+    async_sched.kv_cache_manager = MagicMock()
+    sched = MagicMock()
+    sched.requests = {request.request_id: request}
+    sched.perf_metrics = None
+    sched.cache_config = SimpleNamespace(enable_prefix_caching=enable_prefix_caching)
+    sched.vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(use_v2_model_runner=True, async_chunk=True, final_output=False)
+    )
+    sched._update_request_with_output.side_effect = (
+        lambda req, ids, **kwargs: OmniARAsyncScheduler._update_request_with_output(async_sched, req, ids, **kwargs)
+    )
+    sched.chunk_transfer_adapter = MagicMock()
+    sched._process_kv_transfer_trigger.return_value = False
+    sched.running = []
+    sched.waiting_for_transfer_free = set()
+    sched.transfer_triggered_requests = set()
+    sched.active_kv_transfers = set()
+    sched.pending_stop_after_extraction = set()
+    sched.connector = None
+    sched.kv_cache_manager.take_events.return_value = None
+    sched.kv_cache_manager.estimate_cached_tokens.return_value = 0
+    sched.finished_req_ids_dict = {}
+    sched.make_stats.return_value = None
+
+    scheduler_output = MagicMock(spec=SchedulerOutput)
+    scheduler_output.num_scheduled_tokens = {request.request_id: 1}
+    scheduler_output.scheduled_cached_reqs = SimpleNamespace(req_ids=[request.request_id], num_computed_tokens=[3])
+    scheduler_output.scheduled_spec_decode_tokens = {}
+    scheduler_output.num_invalid_spec_tokens = 0
+
+    model_runner_output = MagicMock(spec=ModelRunnerOutput)
+    model_runner_output.sampled_token_ids = [[42]]
+    model_runner_output.logprobs = None
+    model_runner_output.prompt_logprobs_dict = {}
+    model_runner_output.pooler_output = None
+    model_runner_output.multimodal_outputs = None
+    model_runner_output.inter_stage_outputs = [payload]
+    model_runner_output.num_nans_in_logits = None
+    model_runner_output.kv_connector_output = None
+    model_runner_output.cudagraph_stats = None
+    model_runner_output.req_id_to_index = {request.request_id: 0}
+    model_runner_output.routed_experts = None
+
+    OmniARScheduler.update_from_output(sched, scheduler_output, model_runner_output)
+
+    assert list(request.output_token_ids) == ([42] if enable_prefix_caching else [])
+    assert request.num_output_placeholders == 0
+    async_sched.kv_cache_manager.cache_blocks.assert_not_called()
+    if enable_prefix_caching:
+        sched.chunk_transfer_adapter.save_async.assert_called_once_with(
+            payload,
+            request,
+            False,
+            new_token_ids=[42],
+            confirmed_num_computed_tokens=4,
+        )
+    else:
+        sched.chunk_transfer_adapter.save_async.assert_not_called()
 
 
 def test_legacy_stale_async_marker_bypasses_real_placeholder_accounting() -> None:
@@ -508,11 +664,14 @@ def test_stage0_streaming_update_discards_outstanding_async_placeholder_token() 
     session.append_output_token_ids([7, 8, 9])
     session.num_computed_tokens = 6
     session.num_output_placeholders = 1
+    session.num_in_flight_tokens = 1
     session.spec_token_ids = [-1]
 
     sched._update_request_as_session(session, _make_update([10, 20]))
 
     assert session.async_tokens_to_discard == 1
+    assert session.num_stale_output_tokens == 1
+    assert session.drop_stale_output is False
     assert session.num_output_placeholders == 0
     assert session.spec_token_ids == []
     # The async placeholder makes token 9 unconfirmed, so only 7 and 8 are
@@ -826,6 +985,7 @@ def test_explicit_model_intermediate_prompt_replacement_releases_cache_and_water
     assert session.num_prompt_tokens == 10
     assert session.num_computed_tokens == 0
     assert session.num_stale_output_tokens == 2
+    assert session.drop_stale_output is False
     assert session.additional_information is None
     assert session.model_intermediate_buffer == update.model_intermediate_buffer
     assert session.status == RequestStatus.WAITING
@@ -1141,6 +1301,7 @@ def test_ready_async_chunk_prompt_replacement_releases_stale_kv_once() -> None:
     sched.encoder_cache_manager.free.assert_called_once_with(session)
     assert session not in sched._inflight_prefills
     assert session.num_stale_output_tokens == 2
+    assert session.drop_stale_output is False
     assert session.num_output_placeholders == 0
     assert session.spec_token_ids == []
     assert sched.chunk_transfer_adapter.replaced_streaming_prompt_ids == set()
