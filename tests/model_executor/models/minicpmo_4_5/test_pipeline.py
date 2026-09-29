@@ -223,11 +223,13 @@ class TestDeployTopology:
 
         deploy = _apply_platform_overrides(deploy, platform="npu")
         stages = merge_pipeline_deploy(OMNI_PIPELINES[deploy.pipeline], deploy)
-        # The single-card deploy captures a full decode graph, which keeps
-        # in-graph sampling and multi-frame expansion; multi-card variants keep
-        # the base mode.
+        # vLLM 0.30.0 cannot run FULL_DECODE_ONLY on the NPU stage-0 engine,
+        # so every variant pins PIECEWISE there. The single-card deploy keeps
+        # the Talker (stage 1) on a full decode graph, which preserves
+        # in-graph sampling and multi-frame expansion; multi-card variants
+        # keep the base mode.
+        assert stages[0].yaml_engine_args["compilation_config"]["cudagraph_mode"] == "PIECEWISE"
         expected_graph_mode = "FULL_DECODE_ONLY" if filename == "minicpmo_4_5.yaml" else "PIECEWISE"
-        assert stages[0].yaml_engine_args["compilation_config"]["cudagraph_mode"] == expected_graph_mode
         assert stages[1].yaml_engine_args["compilation_config"]["cudagraph_mode"] == expected_graph_mode
         assert stages[2].yaml_engine_args["enforce_eager"] is True
         # Only the single-card deploy raises the Code2Wav graph pool; the
