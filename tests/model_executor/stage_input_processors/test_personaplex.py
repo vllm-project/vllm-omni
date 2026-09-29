@@ -12,6 +12,7 @@ from vllm_omni.model_executor.models.personaplex.personaplex_talker import (
 )
 from vllm_omni.model_executor.stage_input_processors.personaplex import (
     talker2code2wav_async_chunk,
+    talker2code2wav_async_chunk_batch,
     talker2code2wav_full_payload,
 )
 
@@ -162,3 +163,57 @@ def test_post_sample_talker_mtp_uses_current_temporal_state() -> None:
     assert torch.equal(received["audio_provided"], (torch.arange(16) > 0).reshape(1, 16))
     assert [(row[0], row[1].item()) for row in recorded] == [("r1", 101)]
     assert torch.equal(recorded[0][2], codes[0])
+
+
+def _chunk_manager(initial: int = 1, chunk: int = 5) -> SimpleNamespace:
+    return SimpleNamespace(
+        connector=SimpleNamespace(
+            config={"extra": {"initial_codec_chunk_frames": initial, "codec_chunk_frames": chunk}},
+        )
+    )
+
+
+def _frame_row(request_id: str, frame: torch.Tensor | None, *, resumable: bool = True) -> dict:
+    return {
+        "multimodal_output": None if frame is None else {"codes.audio": frame},
+        "request": SimpleNamespace(
+            request_id=request_id,
+            external_req_id=request_id,
+            resumable=resumable,
+            additional_information=None,
+        ),
+        # Every duplex frame ends a resumable segment.
+        "is_finished": True,
+    }
+
+
+def test_async_chunk_batch_matches_the_one_row_processor_row_by_row() -> None:
+    generator = torch.Generator().manual_seed(0)
+    batched, one_row = _chunk_manager(), _chunk_manager()
+    sessions = [f"s{index}" for index in range(6)]
+    for step in range(13):
+        rows = []
+        for index, session in enumerate(sessions):
+            frame = torch.randint(0, 2048, (1, 16), generator=generator)
+            if index == 2 and step == 4:
+                frame[0, 3] = -1  # a frame the de-delay drops
+            if index == 1 and step < 5:
+                frame = None  # joins late: its first chunk is due with the others' second
+            # Session 4 ends at the last step and flushes its tail.
+            rows.append(_frame_row(session, frame, resumable=not (index == 4 and step == 12)))
+
+        expected = [talker2code2wav_async_chunk(one_row, **row) for row in rows]
+        results = talker2code2wav_async_chunk_batch(batched, rows)
+
+        assert len(results) == len(rows)
+        for got, want in zip(results, expected, strict=True):
+            if want is SKIP_TRANSFER:
+                assert got is SKIP_TRANSFER
+            else:
+                assert torch.equal(got.codes.audio, want.codes.audio)
+                assert bool(got.meta.finished) == bool(want.meta.finished)
+    assert batched.request_payload.keys() == one_row.request_payload.keys()
+    for session, state in one_row.request_payload.items():
+        frames = batched.request_payload[session]["personaplex_frames"]
+        assert len(frames) == len(state["personaplex_frames"])
+        assert all(torch.equal(a, b) for a, b in zip(frames, state["personaplex_frames"], strict=True))

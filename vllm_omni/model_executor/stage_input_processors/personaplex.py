@@ -16,6 +16,7 @@ slice instead of Qwen3-TTS's residual layout.
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 import torch
@@ -119,13 +120,6 @@ def talker2code2wav_full_payload(
     """
     del transfer_manager, is_finished
 
-    def _codes_from(src: Any) -> torch.Tensor | None:
-        if not isinstance(src, dict):
-            return None
-        nested = src.get("codes")
-        audio = nested.get("audio") if isinstance(nested, dict) else None
-        return audio if audio is not None else src.get("codes.audio")
-
     audio = None
     for source in (
         getattr(request, "additional_information", None),
@@ -163,37 +157,29 @@ def talker2code2wav_async_chunk(
     chunk's worth is ready (or the request finishes), then flushed; a frame that
     only buffers sends nothing.
     """
-    request_id = getattr(request, "external_req_id", getattr(request, "request_id", "?"))
-    # The adapter passes ``is_finished=True`` for both a resumable segment
-    # boundary and the terminal request boundary. PersonaPlex must preserve the
-    # delayed cb1..7 tail across the former; only a non-resumable stop flushes
-    # the stream.
-    finished = bool(is_finished and not getattr(request, "resumable", False))
+    (result,) = talker2code2wav_async_chunk_batch(
+        transfer_manager,
+        [{"multimodal_output": multimodal_output, "request": request, "is_finished": is_finished}],
+    )
+    return result
+
+
+def talker2code2wav_async_chunk_batch(
+    transfer_manager: Any,
+    items: Sequence[Mapping[str, Any]],
+) -> list[OmniPayloadStruct | _SkipTransfer]:
+    """:func:`talker2code2wav_async_chunk` for a run of queued rows at once.
+
+    ``items`` holds each row's ``multimodal_output``, ``request`` and
+    ``is_finished``, in queue order, and the results are what calling the
+    one-row processor on each row in that order returns. The tensor work does
+    not grow with the rows: their latest frames are gathered to the host in
+    one concatenation, and every chunk that is due is de-delayed in one go.
+    """
     request_payload = getattr(transfer_manager, "request_payload", None)
     if not isinstance(request_payload, dict):
         request_payload = {}
         transfer_manager.request_payload = request_payload
-    state = request_payload.setdefault(request_id, {})
-    frames = state.setdefault("personaplex_frames", [])
-
-    # Codes live in the server-side request's additional_information under
-    # ("codes","audio") (talker_mtp_output_key), not in multimodal_output (latent).
-    def _codes_from(src: Any) -> torch.Tensor | None:
-        if isinstance(src, dict):
-            nested = src.get("codes")
-            a = nested.get("audio") if isinstance(nested, dict) else None
-            return a if a is not None else src.get("codes.audio")
-        return None
-
-    # Explicit None fallback: `a or b` would evaluate bool(a) on a multi-element
-    # Tensor and raise "Boolean value of Tensor ... is ambiguous".
-    audio = _codes_from(getattr(request, "additional_information", None))
-    if audio is None:
-        audio = _codes_from(multimodal_output)
-    if isinstance(audio, torch.Tensor) and audio.numel() > 0:
-        a = audio if audio.ndim == 2 else audio.reshape(1, -1)
-        frames.append(a[-1].to(torch.long).cpu())  # latest frame's codes
-
     connector = getattr(transfer_manager, "connector", None)
     raw_cfg = getattr(connector, "config", {}) or {}
     cfg = raw_cfg.get("extra", raw_cfg) if isinstance(raw_cfg, dict) else {}
@@ -204,41 +190,158 @@ def talker2code2wav_async_chunk(
             "PersonaPlex codec chunk sizes must be positive/non-negative: "
             f"codec_chunk_frames={chunk}, initial_codec_chunk_frames={initial_chunk}"
         )
-    target_frames = initial_chunk if not state.get("personaplex_emitted") and initial_chunk > 0 else chunk
 
-    # De-delay needs one successor raw frame: N output acoustic frames require
-    # N + 1 raw depformer rows.
-    available_frames = max(0, len(frames) - 1)
-    if available_frames < target_frames and not finished:
-        # Each full-duplex input frame is a resumable stage-0 segment. None
-        # would make the generic chunk adapter synthesize a segment-finished
-        # marker, wake Code2Wav with its one-token placeholder, and discard the
-        # buffered de-delay tail; send nothing until enough frames exist.
-        return SKIP_TRANSFER
-    emit_frames = available_frames if finished else target_frames
-    if emit_frames <= 0:
+    latest = _latest_frames([_codes_of(item) for item in items])
+    results: list[OmniPayloadStruct | _SkipTransfer | None] = [None] * len(items)
+    due: list[tuple[int, list[torch.Tensor], bool]] = []
+    for index, item in enumerate(items):
+        request = item["request"]
+        request_id = getattr(request, "external_req_id", getattr(request, "request_id", "?"))
+        # The adapter passes ``is_finished=True`` for both a resumable segment
+        # boundary and the terminal request boundary. PersonaPlex must preserve
+        # the delayed cb1..7 tail across the former; only a non-resumable stop
+        # flushes the stream.
+        finished = bool(item.get("is_finished") and not getattr(request, "resumable", False))
+        state = request_payload.setdefault(request_id, {})
+        frames = state.setdefault("personaplex_frames", [])
+        frame = latest[index]
+        if frame is not None:
+            frames.append(frame)  # latest frame's codes
+        target_frames = initial_chunk if not state.get("personaplex_emitted") and initial_chunk > 0 else chunk
+
+        # De-delay needs one successor raw frame: N output acoustic frames require
+        # N + 1 raw depformer rows.
+        available_frames = max(0, len(frames) - 1)
+        if available_frames < target_frames and not finished:
+            # Each full-duplex input frame is a resumable stage-0 segment. None
+            # would make the generic chunk adapter synthesize a segment-finished
+            # marker, wake Code2Wav with its one-token placeholder, and discard the
+            # buffered de-delay tail; send nothing until enough frames exist.
+            results[index] = SKIP_TRANSFER
+            continue
+        emit_frames = available_frames if finished else target_frames
+        if emit_frames <= 0:
+            if finished:
+                request_payload.pop(request_id, None)
+                results[index] = _empty_finished_payload()
+            else:
+                results[index] = SKIP_TRANSFER
+            continue
+
+        due.append((index, frames[: emit_frames + 1], finished))
         if finished:
             request_payload.pop(request_id, None)
-            return _empty_finished_payload()
-        return SKIP_TRANSFER
+        else:
+            # Row ``emit_frames`` is the successor used by the last emitted frame
+            # and the cb0 source for the next frame.
+            state["personaplex_frames"] = frames[emit_frames:]
+            state["personaplex_emitted"] = True
 
-    stacked = torch.stack(frames[: emit_frames + 1], dim=0)  # [F+1, dep_q]
-    flat = _agent_codes_to_codebook_major(stacked)
-    if finished:
-        request_payload.pop(request_id, None)
-    else:
-        # Row ``emit_frames`` is the successor used by the last emitted frame
-        # and the cb0 source for the next frame.
-        state["personaplex_frames"] = frames[emit_frames:]
-        state["personaplex_emitted"] = True
-    return OmniPayloadStruct(
-        codes=CodesStruct(audio=flat),
-        meta=MetaStruct(finished=torch.tensor(bool(finished), dtype=torch.bool)),
-    )
+    # The chunks never modify ``meta.finished``, so they can share its flags.
+    finished_flags: dict[bool, torch.Tensor] = {}
+    flats = _codebook_major_chunks([frames for _, frames, _ in due])
+    for (index, _, finished), flat in zip(due, flats, strict=True):
+        flag = finished_flags.get(finished)
+        if flag is None:
+            flag = finished_flags[finished] = torch.tensor(finished, dtype=torch.bool)
+        results[index] = OmniPayloadStruct(codes=CodesStruct(audio=flat), meta=MetaStruct(finished=flag))
+    return results  # type: ignore[return-value]
+
+
+def _codes_from(src: Any) -> torch.Tensor | None:
+    """``src["codes"]["audio"]``, else its flat ``"codes.audio"`` key; None off a dict."""
+    if not isinstance(src, dict):
+        return None
+    nested = src.get("codes")
+    audio = nested.get("audio") if isinstance(nested, dict) else None
+    return audio if audio is not None else src.get("codes.audio")
+
+
+def _codes_of(item: Mapping[str, Any]) -> Any:
+    """A row's ``("codes","audio")``: the request's own first, else the stage output."""
+    # Codes live in the server-side request's additional_information under
+    # ("codes","audio") (talker_mtp_output_key), not in multimodal_output (latent).
+    # Explicit None fallback: `a or b` would evaluate bool(a) on a multi-element
+    # Tensor and raise "Boolean value of Tensor ... is ambiguous".
+    audio = _codes_from(getattr(item["request"], "additional_information", None))
+    if audio is None:
+        audio = _codes_from(item.get("multimodal_output"))
+    return audio
+
+
+def _latest_frames(audios: Sequence[Any]) -> list[torch.Tensor | None]:
+    """Each row's latest ``[dep_q]`` frame as host int64, gathered in one copy.
+
+    ``None`` for a row without codes. The frames are views of one new tensor,
+    so they do not alias the producer's buffers.
+    """
+    frames: list[torch.Tensor | None] = [None] * len(audios)
+    rows = [index for index, audio in enumerate(audios) if isinstance(audio, torch.Tensor) and audio.numel() > 0]
+    if not rows:
+        return frames
+    views = []
+    for index in rows:
+        audio = audios[index]
+        a = audio if audio.ndim == 2 else audio.reshape(1, -1)
+        # The talker emits one [1, dep_q] frame per row: that is its own view.
+        views.append(a if a.shape[0] == 1 else a[-1:])
+    try:
+        latest = torch.cat(views).to(torch.long).cpu().unbind(0)
+    except RuntimeError:
+        # Rows that cannot share a tensor (codebook counts or devices differ).
+        latest = tuple(view[0].to(torch.long).cpu() for view in views)
+    for index, frame in zip(rows, latest, strict=True):
+        frames[index] = frame
+    return frames
+
+
+def _codebook_major_chunks(chunks: Sequence[Sequence[torch.Tensor]]) -> list[torch.Tensor]:
+    """:func:`_agent_codes_to_codebook_major` of each chunk's stacked frames.
+
+    Chunks with the same frame count and width are stacked and, when none of
+    their frames is dropped for a negative code, de-delayed together.
+    """
+    out: list[torch.Tensor | None] = [None] * len(chunks)
+    groups: dict[tuple[int, int], list[int]] = {}
+    for index, frames in enumerate(chunks):
+        groups.setdefault((len(frames), int(frames[0].shape[-1])), []).append(index)
+    for (num_frames, width), indices in groups.items():
+        try:
+            stacked = torch.stack([frame for index in indices for frame in chunks[index]])
+            stacked = stacked.view(len(indices), num_frames, width).to(torch.long)
+        except RuntimeError:
+            for index in indices:
+                out[index] = _agent_codes_to_codebook_major(torch.stack(list(chunks[index]), dim=0))
+            continue
+        k = min(_NUM_ACTIVE_CODEBOOKS, width)
+        agent = stacked[:, :, :k]
+        if num_frames >= 2 and bool((agent >= 0).all()):
+            # De-delay: cb0 from frame t, cb1..7 from frame t+1 (drop the last
+            # frame), then codebook-major per chunk -- exactly the per-chunk
+            # path, since no chunk drops a frame.
+            dd = torch.cat([agent[:, :-1, 0:1], agent[:, 1:, 1:k]], dim=2)  # [chunks, F-1, k]
+            flats = dd.transpose(1, 2).reshape(len(indices), -1).unbind(0)
+        else:
+            flats = tuple(_agent_codes_to_codebook_major(chunk_codes) for chunk_codes in stacked.unbind(0))
+        for index, flat in zip(indices, flats, strict=True):
+            out[index] = flat
+    return out  # type: ignore[return-value]
+
+
+# ``process_batch`` lets the chunk sender hand a run of queued rows to one call.
+talker2code2wav_async_chunk.process_batch = talker2code2wav_async_chunk_batch  # type: ignore[attr-defined]
+# The request fields read above, so the chunk sender snapshots only these
+# instead of the whole request and its token lists on every frame. On the
+# duplex path the codes come only from the stage output (``multimodal_output``):
+# the scheduler-side ``additional_information`` never carries them, which is
+# what lets a retired segment's save read it after it already holds the next
+# frame's input.
+talker2code2wav_async_chunk.request_fields = ("resumable", "additional_information")  # type: ignore[attr-defined]
 
 
 __all__ = [
     "talker2code2wav_token_only",
     "talker2code2wav_full_payload",
     "talker2code2wav_async_chunk",
+    "talker2code2wav_async_chunk_batch",
 ]

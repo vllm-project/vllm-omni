@@ -11,6 +11,7 @@ import threading
 import time
 import uuid
 from collections import OrderedDict
+from collections.abc import Sequence
 from multiprocessing import shared_memory as shm_pkg
 from typing import Any
 
@@ -20,6 +21,8 @@ from ..utils.logging import get_connector_logger
 from .base import OmniConnectorBase
 
 logger = get_connector_logger(__name__)
+
+_POSIX_SHM_DIR = "/dev/shm" if os.path.isdir("/dev/shm") else None
 
 
 def _wakeup_enabled() -> bool:
@@ -199,8 +202,25 @@ class SharedMemoryConnector(OmniConnectorBase):
         put_key: str,
         data: Any,
     ) -> tuple[bool, int, dict[str, Any] | None]:
+        return self._put(to_stage, put_key, data, reap=True)
+
+    def put_batch(
+        self,
+        from_stage: str,
+        to_stage: str,
+        items: Sequence[tuple[str, Any]],
+    ) -> list[tuple[bool, int, dict[str, Any] | None]]:
+        """``put`` each ``(put_key, data)`` in order, sweeping consumed keys once.
+
+        Each ``put`` first sweeps up to 64 pending keys for consumption (one
+        stat each); a batch sweeps once for all of its keys.
+        """
+        return [self._put(to_stage, put_key, data, reap=index == 0) for index, (put_key, data) in enumerate(items)]
+
+    def _put(self, to_stage: str, put_key: str, data: Any, *, reap: bool) -> tuple[bool, int, dict[str, Any] | None]:
         try:
-            self.reap_consumed()
+            if reap:
+                self.reap_consumed()
             payload = self.serialize_obj(data)
             size = len(payload)
 
@@ -278,6 +298,24 @@ class SharedMemoryConnector(OmniConnectorBase):
         finally:
             if shm:
                 shm.close()
+
+    @staticmethod
+    def present_keys() -> set[str] | None:
+        """The keys whose segments exist now, from one directory listing.
+
+        One listing answers a whole pass of key polls, instead of one
+        existence probe per key. A segment created after the listing is seen
+        by the next one, as a probe's miss is. None where segments cannot be
+        listed.
+        """
+        if os.environ.get("VLLM_OMNI_ENABLE_SHM_LISTDIR", "0") != "1":
+            return None
+        if _POSIX_SHM_DIR is None:
+            return None
+        try:
+            return set(os.listdir(_POSIX_SHM_DIR))
+        except OSError:
+            return None
 
     def get(
         self,
