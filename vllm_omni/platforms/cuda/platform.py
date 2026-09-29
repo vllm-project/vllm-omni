@@ -456,9 +456,37 @@ class CudaOmniPlatform(OmniPlatform, CudaPlatformBase):
         # Mirrors upstream CudaPlatformBase defaults: `gelu_and_mul_sparse` is
         # implemented by `triton` and `native` only, so it must not fall back to
         # `default` (which contains `vllm_c`) via IrOpPriorityConfig.with_default.
+        # Providers not registered on this device (e.g. `vllm_c` is absent on
+        # sm70) are dropped per op, see `_registered_only`.
         return IrOpPriorityConfig.with_default(
             default,
-            rms_norm=rms_norm,
-            fused_add_rms_norm=rms_norm,
-            gelu_and_mul_sparse=["triton", "native"],
+            rms_norm=cls._registered_only(rms_norm, "rms_norm"),
+            fused_add_rms_norm=cls._registered_only(rms_norm, "fused_add_rms_norm"),
+            gelu_and_mul_sparse=cls._registered_only(["triton", "native"], "gelu_and_mul_sparse"),
         )
+
+    @staticmethod
+    def _registered_only(providers: list[str], op_name: str) -> list[str]:
+        """Keep only providers registered for ``op_name`` on this device.
+
+        The ``vllm_c`` IR kernels are only registered on newer GPU
+        architectures; e.g. on sm70 (V100) they are absent. Since
+        ``IrOp._filter_priority_impls`` asserts that every provider named in
+        a priority list is a registered implementation, an unfiltered list
+        crashes diffusion worker startup with "All providers in priority
+        must be registered implementations."
+        """
+        from vllm.ir.op import IrOp
+        from vllm.platforms import current_platform
+
+        # Import the platform IR kernels first (mirroring
+        # IrOpPriorityConfig._iter_op_priorities) so the registry is complete.
+        current_platform.import_ir_kernels()
+        op = IrOp.registry.get(op_name)
+        if op is None:
+            return list(providers)
+        registered = [p for p in providers if p in op.impls]
+        if not registered:
+            # `native` is always registered; it is the dispatch fallback.
+            registered = ["native"]
+        return registered
