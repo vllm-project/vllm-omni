@@ -94,6 +94,8 @@ class UpdateSession(DuplexCommand, _duplex_wire.UpdateSession):
 @dataclass(frozen=True, slots=True, kw_only=True)
 class AppendAudio(DuplexCommand, _duplex_wire.AppendAudio):
     type: ClassVar[str] = "input_audio_buffer.append"
+    #: Empty ``audio`` with ``video_frames`` is legal when capabilities allow video without audio.
+    audio: bytes = b""
 
     def payload(self) -> dict[str, object]:
         data = DuplexCommand.payload(self)
@@ -108,7 +110,10 @@ class AppendAudio(DuplexCommand, _duplex_wire.AppendAudio):
             merged: dict[str, object] = dict(hints)
             merged.update(data)
             data = merged
-        data["audio"] = base64.b64encode(self.audio).decode("ascii")
+        if self.audio:
+            data["audio"] = base64.b64encode(self.audio).decode("ascii")
+        else:
+            data.pop("audio", None)
         if not data.get("video_frames"):
             data.pop("video_frames", None)
         return data

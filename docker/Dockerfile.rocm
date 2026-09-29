@@ -1,7 +1,7 @@
 # Keep the ROCm runtime aligned with the vLLM release targeted by
 # docker/Dockerfile.ci. A stale base image can build successfully while failing
 # at runtime when vLLM-Omni imports APIs added by the newer vLLM release.
-ARG BASE_IMAGE=vllm/vllm-openai-rocm:v0.29.0
+ARG BASE_IMAGE=vllm/vllm-openai-rocm:v0.30.0
 
 # Keep the dependency-heavy portion independent from the source tree. The
 # registry cache is keyed on these inputs, while the final source copy can be
@@ -16,7 +16,7 @@ FROM ${BASE_IMAGE} AS deps
 # intentional custom source pin must update that regression in the same change,
 # and should return to the stable release as soon as one is available.
 ARG USE_NIGHTLY_BUILD=0
-ARG VLLM_VERSION_OR_COMMIT_HASH=v0.29.0
+ARG VLLM_VERSION_OR_COMMIT_HASH=v0.30.0
 ARG ARG_PYTORCH_ROCM_ARCH
 ENV PYTORCH_ROCM_ARCH=${ARG_PYTORCH_ROCM_ARCH:-${PYTORCH_ROCM_ARCH}}
 

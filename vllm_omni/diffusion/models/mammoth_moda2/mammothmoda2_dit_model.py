@@ -9,10 +9,10 @@ from diffusers.models.embeddings import TimestepEmbedding, Timesteps
 from diffusers.models.modeling_utils import ModelMixin
 from einops import rearrange
 from torch import nn
-from transformers.models.qwen2.modeling_qwen2 import Qwen2RMSNorm
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention as OmniAttention
+from vllm_omni.diffusion.layers.norm import RMSNorm
 
 from .rope_real import RotaryPosEmbedReal, apply_real_rotary_emb
 
@@ -39,7 +39,7 @@ class LuminaRMSNormZero(nn.Module):
             bias=True,
         )
 
-        self.norm = Qwen2RMSNorm(embedding_dim, eps=norm_eps)
+        self.norm = RMSNorm(embedding_dim, eps=norm_eps)
 
     def forward(
         self,
@@ -115,7 +115,7 @@ class LuminaLayerNormContinuous(nn.Module):
         if norm_type == "layer_norm":
             self.norm = nn.LayerNorm(embedding_dim, eps, elementwise_affine, bias)
         elif norm_type == "rms_norm":
-            self.norm = Qwen2RMSNorm(embedding_dim, eps=eps)
+            self.norm = RMSNorm(embedding_dim, eps=eps)
         else:
             raise ValueError(f"unknown norm_type {norm_type}")
 
@@ -157,7 +157,7 @@ class Lumina2CombinedTimestepCaptionEmbedding(nn.Module):
         )
 
         self.caption_embedder = nn.Sequential(
-            Qwen2RMSNorm(text_feat_dim, eps=norm_eps),
+            RMSNorm(text_feat_dim, eps=norm_eps),
             nn.Linear(text_feat_dim, hidden_size, bias=True),
         )
 
@@ -194,7 +194,7 @@ class SimpleQFormerImageRefiner(nn.Module):
             num_heads = max(1, hidden_size // 128)
         self.num_heads = self._choose_valid_num_heads(hidden_size, num_heads)
         self.input_proj = nn.Sequential(
-            Qwen2RMSNorm(input_hidden_size, eps=norm_eps),
+            RMSNorm(input_hidden_size, eps=norm_eps),
             nn.Linear(input_hidden_size, hidden_size, bias=True),
         )
 
@@ -208,15 +208,15 @@ class SimpleQFormerImageRefiner(nn.Module):
             self.layers.append(
                 nn.ModuleDict(
                     dict(
-                        ln_q1=Qwen2RMSNorm(hidden_size, eps=norm_eps),
+                        ln_q1=RMSNorm(hidden_size, eps=norm_eps),
                         self_attn=nn.MultiheadAttention(
                             embed_dim=hidden_size, num_heads=self.num_heads, dropout=dropout, batch_first=True
                         ),
-                        ln_q2=Qwen2RMSNorm(hidden_size, eps=norm_eps),
+                        ln_q2=RMSNorm(hidden_size, eps=norm_eps),
                         cross_attn=nn.MultiheadAttention(
                             embed_dim=hidden_size, num_heads=self.num_heads, dropout=dropout, batch_first=True
                         ),
-                        ln_ffn=Qwen2RMSNorm(hidden_size, eps=norm_eps),
+                        ln_ffn=RMSNorm(hidden_size, eps=norm_eps),
                         ffn=LuminaFeedForward(dim=hidden_size, inner_dim=4 * hidden_size),
                     )
                 )
@@ -368,9 +368,9 @@ class TransformerBlock(nn.Module):
             out_bias=False,
             processor=processor,
         )
-        # 显式使用 transformers 的 Qwen2RMSNorm，避免依赖 diffusers 内部创建的 `RMSNorm` 再做递归替换。
-        self.attn.norm_q = Qwen2RMSNorm(self.head_dim, eps=1e-5)
-        self.attn.norm_k = Qwen2RMSNorm(self.head_dim, eps=1e-5)
+        # Set the QK norms here instead of letting diffusers build its own RMSNorm via qk_norm.
+        self.attn.norm_q = RMSNorm(self.head_dim, eps=1e-5)
+        self.attn.norm_k = RMSNorm(self.head_dim, eps=1e-5)
         # The kernel itself runs through the shared Omni attention layer: backend
         # selection, padding-mask handling and native grouped-query heads live
         # there. It owns no parameters, so checkpoint keys are unchanged. The
@@ -393,11 +393,11 @@ class TransformerBlock(nn.Module):
         if modulation:
             self.norm1 = LuminaRMSNormZero(embedding_dim=dim, norm_eps=norm_eps, norm_elementwise_affine=True)
         else:
-            self.norm1 = Qwen2RMSNorm(dim, eps=norm_eps)
+            self.norm1 = RMSNorm(dim, eps=norm_eps)
 
-        self.ffn_norm1 = Qwen2RMSNorm(dim, eps=norm_eps)
-        self.norm2 = Qwen2RMSNorm(dim, eps=norm_eps)
-        self.ffn_norm2 = Qwen2RMSNorm(dim, eps=norm_eps)
+        self.ffn_norm1 = RMSNorm(dim, eps=norm_eps)
+        self.norm2 = RMSNorm(dim, eps=norm_eps)
+        self.ffn_norm2 = RMSNorm(dim, eps=norm_eps)
 
     def forward(
         self,
@@ -631,8 +631,33 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
                 dtype=torch.bool,
                 device=image_hidden_states.device,
             )
-            text_hidden_states = torch.cat([text_hidden_states, image_hidden_states], dim=1)
-            text_attention_mask = torch.cat([text_attention_mask, image_attention_mask], dim=1)
+            # When batch requests have unequal text lengths, right-padded text_hidden_states
+            # followed by concatenated image_hidden_states places padding in the middle of
+            # the row: [valid text, pad, valid image]. Since downstream rope_embedder and
+            # joint_hidden_states prefix-pack using encoder_seq_lengths (sum of valid mask),
+            # middle padding causes image queries to be truncated.
+            # Compact each row so valid tokens are placed contiguously at the start.
+            if batch_size > 1 and not text_attention_mask.all():
+                text_lens = text_attention_mask.sum(dim=-1).tolist()
+                img_lens = image_attention_mask.sum(dim=-1).tolist()
+                max_valid_len = max(t + img for t, img in zip(text_lens, img_lens))
+                compact_hidden_states = text_hidden_states.new_zeros(
+                    batch_size, max_valid_len, text_hidden_states.shape[-1]
+                )
+                compact_attention_mask = torch.zeros((batch_size, max_valid_len), dtype=torch.bool, device=device)
+                for i in range(batch_size):
+                    t_len = text_lens[i]
+                    i_len = img_lens[i]
+                    if t_len > 0:
+                        compact_hidden_states[i, :t_len] = text_hidden_states[i, :t_len]
+                    if i_len > 0:
+                        compact_hidden_states[i, t_len : t_len + i_len] = image_hidden_states[i, :i_len]
+                    compact_attention_mask[i, : t_len + i_len] = True
+                text_hidden_states = compact_hidden_states
+                text_attention_mask = compact_attention_mask
+            else:
+                text_hidden_states = torch.cat([text_hidden_states, image_hidden_states], dim=1)
+                text_attention_mask = torch.cat([text_attention_mask, image_attention_mask], dim=1)
 
         img_tokens = rearrange(hidden_states, "b c (h p1) (w p2) -> b (h w) (p1 p2 c)", p1=p, p2=p)
         img_tokens = self.x_embedder(img_tokens)
@@ -695,8 +720,16 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
         return text_hidden_states, img_tokens
 
     def _apply_transformer_layers(self, hidden_states, attention_mask, rotary_emb, temb):
+        # Call blocks with keyword arguments: Cache-DiT's Pattern_3 wrapper
+        # re-invokes blocks as block(hidden_states, **kwargs), so the cached
+        # and uncached paths share this exact calling convention.
         for layer in self.layers:
-            hidden_states = layer(hidden_states, attention_mask, rotary_emb, temb)
+            hidden_states = layer(
+                hidden_states,
+                attention_mask=attention_mask,
+                image_rotary_emb=rotary_emb,
+                temb=temb,
+            )
         return hidden_states
 
     def forward(

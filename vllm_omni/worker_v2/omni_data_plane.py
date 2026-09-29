@@ -15,9 +15,10 @@ from typing import Any, cast
 import torch
 from vllm.logger import init_logger
 
-from vllm_omni.data_entry_keys import OmniPayload, unflatten_payload
+from vllm_omni.data_entry_keys import OmniPayload, flatten_payload, unflatten_payload
 from vllm_omni.worker.omni_connector_model_runner_mixin import (
     OmniConnectorModelRunnerMixin,
+    should_accumulate_full_payload_output,
 )
 from vllm_omni.worker.payload_span import get_tensor_span, merge_tensor_spans
 from vllm_omni.worker_v2.delivery import (
@@ -50,6 +51,7 @@ class _NativeRequestState:
             output_token_ids=output,
             all_token_ids=prompt + output,
             output_token_count=len(self.output_token_ids),
+            last_output_token_id=self.output_token_ids[-1] if self.output_token_ids else None,
             additional_information=self.additional_information,
             sampling_params=self.sampling_params,
             num_computed_tokens=self.num_computed_tokens,
@@ -82,12 +84,21 @@ class OmniRunnerDataPlane(OmniConnectorModelRunnerMixin):
         self._native_send_lock = threading.Lock()
         self._native_outputs_in_flight: dict[str, int] = defaultdict(int)
         self._native_terminal_pending: set[str] = set()
+        # Stage payload builders read the stage config through
+        # ``_get_model_config()`` (e.g. Qwen3-Omni's Thinker reads
+        # ``hf_config.talker_config.accept_hidden_layer``).
+        self.vllm_config = vllm_config
+        self.model_config = model_config
         self.init_omni_connectors(model_config=model_config)
         self._delivery_manager = OmniDeliveryManager(
             delivery_timeout_s=self._connector_delivery_timeout(),
             shutdown_timeout_s=_DEFAULT_SHUTDOWN_TIMEOUT_S,
         )
-        self._can_send = self._custom_process_func is not None
+        self._can_send = (
+            self._custom_process_func is not None
+            if self._async_chunk
+            else should_accumulate_full_payload_output(model_config, self._custom_process_func)
+        )
         self._start_output_worker(max_pending_batches=_NATIVE_OUTPUT_QUEUE_DEPTH)
 
     def _connector_delivery_timeout(self) -> float:
@@ -294,6 +305,8 @@ class OmniRunnerDataPlane(OmniConnectorModelRunnerMixin):
             for req_id in active_req_ids:
                 self._native_outputs_in_flight.pop(req_id, None)
                 self._native_terminal_pending.discard(req_id)
+                # Cancellation must not flush a partially accumulated utterance.
+                self._pending_full_payload_send.pop(req_id, None)
             return self.emit_chunks(
                 req_ids=[],
                 inter_stage_outputs=None,
@@ -387,7 +400,9 @@ class OmniRunnerDataPlane(OmniConnectorModelRunnerMixin):
                 for qual, qval in value.items():
                     if qual in span_handled:
                         continue
-                    if key == "meta" and qual == "finished":
+                    if key == "meta":
+                        # Per-chunk state (``finished``, the V1 sender's
+                        # ``is_segment_finished`` flag, ...), not rows.
                         merged_sub[qual] = qval
                         continue
                     if (key, qual) in override_keys:
@@ -494,11 +509,23 @@ class OmniRunnerDataPlane(OmniConnectorModelRunnerMixin):
             state.output_token_ids.extend(int(token_id) for token_id in sampled_by_req.get(req_id, []))
             state.finished = req_id in terminal_req_ids
             payload = payload_by_req.get(req_id)
-            if isinstance(payload, dict):
+            if not self._async_chunk:
+                # Full-payload consumers execute once, after the producer has
+                # finished. Reuse V1's concat/replace contract for flat outputs
+                # and retain the final token history for codec-row cropping.
+                if isinstance(payload, dict):
+                    self.accumulate_full_payload_output(req_id, flatten_payload(payload), state)
+                if not state.finished:
+                    continue
+                accumulated = self._pending_full_payload_send.pop(req_id, None)
+                payload = self._materialize_full_payload_entry(accumulated)[0] if accumulated is not None else None
+            if self._async_chunk and isinstance(payload, dict):
                 payload = unflatten_payload(payload)
             if payload is None and not state.finished:
                 continue
-            include_token_history = bool(state.resumable or self._put_req_chunk.get(state.external_req_id, 0) == 0)
+            include_token_history = bool(
+                not self._async_chunk or state.resumable or self._put_req_chunk.get(state.external_req_id, 0) == 0
+            )
             entries.append(
                 (
                     state.snapshot(include_token_history=include_token_history),
@@ -544,6 +571,7 @@ class OmniRunnerDataPlane(OmniConnectorModelRunnerMixin):
         self._delivery_manager.shutdown(RuntimeError("MRv2 connector shutdown"))
         self._stop_event.set()
         self._work_available.set()
+        self._save_work_available.set()
 
         close_errors: list[BaseException] = []
         connector = getattr(self, "_omni_connector", None)

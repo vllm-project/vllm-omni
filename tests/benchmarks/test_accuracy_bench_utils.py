@@ -9,6 +9,7 @@ import sys
 from pathlib import Path
 
 import pytest
+import requests
 from PIL import Image
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
@@ -311,7 +312,8 @@ def test_trajectory_judge_payload_collapses_six_frames_into_single_storyboard():
     assert judge_images[0].size == (24, 12)
 
 
-def test_image_edit_client_uses_openai_image_edit_endpoint(monkeypatch):
+@pytest.mark.parametrize("num_images", [1, 2])
+def test_image_edit_client_uses_openai_image_edit_endpoint(monkeypatch, num_images):
     captured = {}
 
     class FakeResponse:
@@ -344,16 +346,46 @@ def test_image_edit_client_uses_openai_image_edit_endpoint(monkeypatch):
     output = client.generate_image_edit(
         model="Qwen/Qwen-Image-Edit",
         prompt="edit this image",
-        images=image,
+        images=image if num_images == 1 else [image] * num_images,
         width=512,
         height=512,
+        guidance_scale=2.5,
+        seed=42,
+        bot_task="think_recaption",
+        sys_type="en_unified",
     )
 
     assert output.size == (1, 1)
     assert captured["url"] == "http://127.0.0.1:8093/v1/images/edits"
     assert captured["data"]["prompt"] == "edit this image"
     assert captured["data"]["size"] == "512x512"
-    assert captured["files"][0][0] == "image"
+    assert len(captured["files"]) == num_images
+    assert all(field == ("image" if num_images == 1 else "image[]") for field, _ in captured["files"])
+    assert captured["data"]["guidance_scale"] == "2.5"
+    assert captured["data"]["seed"] == "42"
+    assert captured["data"]["bot_task"] == "think_recaption"
+    assert captured["data"]["sys_type"] == "en_unified"
+
+
+@pytest.mark.parametrize("status_code", [400, 500])
+def test_image_edit_client_preserves_server_error_detail(mocker, status_code):
+    response = requests.Response()
+    response.status_code = status_code
+    response._content = b'{"error": "image input limit exceeded"}'
+    post = mocker.patch("benchmarks.accuracy.common.requests.post", return_value=response)
+    client = VllmOmniImageClient(base_url="http://127.0.0.1:8093")
+
+    with pytest.raises(requests.HTTPError, match="image input limit exceeded") as exc:
+        client.generate_image_edit(
+            model="test-model",
+            prompt="edit this image",
+            images=Image.new("RGB", (2, 2)),
+            width=512,
+            height=512,
+        )
+
+    assert exc.value.response is response
+    post.assert_called_once()
 
 
 def test_text_to_image_client_forwards_output_compression(monkeypatch):

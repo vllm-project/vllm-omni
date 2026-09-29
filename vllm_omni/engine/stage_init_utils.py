@@ -1041,14 +1041,17 @@ def stage_runtime_env(stage_id: int, runtime_cfg: Any) -> Generator[None, None, 
             return
 
     previous_env: dict[str, str | None] = {}
-    for key, value in runtime_env.items():
-        env_key = str(key)
-        previous_env[env_key] = os.environ.get(env_key)
-        os.environ[env_key] = str(value)
-
-    if previous_env:
-        logger.info("[stage_init] Stage-%s applied runtime env keys: %s", stage_id, sorted(previous_env))
     try:
+        for key, value in runtime_env.items():
+            env_key = str(key)
+            old_value = os.environ.get(env_key)
+            os.environ[env_key] = str(value)
+            # Track only successful writes, preserving the original value
+            # if distinct keys normalize to the same environment name.
+            previous_env.setdefault(env_key, old_value)
+
+        if previous_env:
+            logger.info("[stage_init] Stage-%s applied runtime env keys: %s", stage_id, sorted(previous_env))
         yield
     finally:
         for key, old_value in previous_env.items():
@@ -1107,7 +1110,7 @@ def _project_omni_stage_engine_args(
         "default_sampling_params",
         "has_sampling_extra_args",
     }
-    runtime_excluded_fields = {"devices", "num_replicas", "env", "num_gpus"}
+    runtime_excluded_fields = {"devices", "num_replicas", "env", "num_gpus", "cuda_mps"}
     if not is_diffusion:
         # These values configure OmniDiffusionConfig or its worker process;
         # OmniEngineArgs has no matching fields for LLM stages.
@@ -1755,9 +1758,13 @@ def acquire_device_locks(
     engine_args_dict: dict[str, Any],
     stage_init_timeout: int,
     locked_devices: set[int] | None = None,
+    *,
+    visible_devices: str | None = None,
 ) -> list[int]:
     """Acquire exclusive file locks on devices needed by this stage.
 
+    Pass resolved physical ``visible_devices`` to avoid changing the process
+    environment while waiting. When omitted, use the device-control environment.
     Returns list of lock file descriptors that must be released after init.
     """
     lock_fds: list[int] = []
@@ -1790,7 +1797,7 @@ def acquire_device_locks(
 
         # Get physical device IDs
         device_control_env = current_omni_platform.device_control_env_var
-        visible_devices_str = os.environ.get(device_control_env)
+        visible_devices_str = visible_devices if visible_devices is not None else os.environ.get(device_control_env)
         physical_devices: list[int] = []
 
         if visible_devices_str:
