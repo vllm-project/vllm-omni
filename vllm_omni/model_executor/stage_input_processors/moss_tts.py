@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import time
 from collections import defaultdict
 from collections.abc import Mapping
 from typing import Any
@@ -14,6 +15,13 @@ from vllm.inputs import TokensPrompt as OmniTokensPrompt
 from vllm.logger import init_logger
 
 from vllm_omni.data_entry_keys import CodesStruct, MetaStruct, OmniPayloadStruct
+from vllm_omni.model_executor.stage_input_processors.chunk_size_utils import (
+    AdaptiveChunkController,
+    compute_adaptive_emit,
+    compute_ramp_emit,
+    parse_adaptive_config,
+    parse_chunk_ramp,
+)
 
 logger = init_logger(__name__)
 
@@ -283,42 +291,201 @@ def talker2codec_raw_async_chunk(
         )
         initial_chunk_frames = chunk_frames
 
-    pending = len(pending_frames)
-    emitted_any = int(transfer_manager.put_req_chunk.get(req_id, 0)) > 0
-    threshold = initial_chunk_frames if initial_chunk_frames > 0 and not emitted_any else chunk_frames
-    if pending <= 0:
-        if is_finished:
-            transfer_manager.code_prompt_token_ids.pop(req_id, None)
-            transfer_manager.request_payload.pop(req_id, None)
-            return OmniPayloadStruct(
-                meta=MetaStruct(
-                    req_id=[req_id],
-                    left_context_size=0,
-                    codec_chunk_frames=0,
-                    codec_left_context_frames=0,
-                    stream_finished=torch.tensor(True, dtype=torch.bool),
-                    finished=torch.tensor(True, dtype=torch.bool),
-                ),
-                request_id=req_id,
-            )
-        return None
-    if not is_finished and pending < threshold:
-        return None
+    # Parse ramp / adaptive config once per transfer_manager.
+    if not hasattr(transfer_manager, "_ramp_parsed"):
+        transfer_manager._ramp_parsed = parse_chunk_ramp(cfg, steady=chunk_frames)
+    ramp = transfer_manager._ramp_parsed
 
-    emit_frames = pending if is_finished else threshold
-    chunk_rows = pending_frames[:emit_frames]
-    del pending_frames[:emit_frames]
-    chunk_codes = torch.stack(
-        [row.to(torch.long).cpu() for row in chunk_rows],
-        dim=0,
-    ).contiguous()
-    finished = bool(is_finished and len(pending_frames) == 0)
+    if not hasattr(transfer_manager, "_adaptive_parsed"):
+        transfer_manager._adaptive_parsed = parse_adaptive_config(cfg)
+    (
+        adaptive_enabled,
+        adaptive_min,
+        adaptive_margin,
+        adaptive_divisor,
+        adaptive_delta_min,
+    ) = transfer_manager._adaptive_parsed
+
+    pending = len(pending_frames)
+
+    # --- Ramp / adaptive chunk-size decision ---
+    # When ramp or adaptive is active, the emit decision is delegated to
+    # compute_ramp_emit / compute_adaptive_emit. Otherwise the original
+    # IC/steady threshold logic is used.
+    #
+    # Unlike Qwen3-TTS (which accumulates ALL frames in code_prompt_token_ids
+    # and slices windows), MOSS-TTS deletes emitted frames from pending_frames.
+    # So we track a cumulative total (_ramp_total_emitted) for ramp threshold
+    # math. The ramp_chunk_count counter is owned by the adapter
+    # (chunk_transfer_adapter), not this processor — we only read it.
+    if ramp is not None or adaptive_enabled:
+        if not hasattr(transfer_manager, "_ramp_total_emitted"):
+            transfer_manager._ramp_total_emitted = defaultdict(int)
+
+        chunk_index = transfer_manager.ramp_chunk_count.get(req_id, 0)
+        total_emitted = transfer_manager._ramp_total_emitted[req_id]
+        cumulative_length = total_emitted + pending
+
+        if adaptive_enabled:
+            _adaptive_states = getattr(transfer_manager, "_adaptive_states", None)
+            if _adaptive_states is None:
+                _adaptive_states = {}
+                transfer_manager._adaptive_states = _adaptive_states
+
+            ctrl = _adaptive_states.get(req_id)
+
+            if ctrl is None or chunk_index == 0:
+                # Chunk 0: use IC/steady threshold (same as original logic).
+                emitted_any = int(transfer_manager.put_req_chunk.get(req_id, 0)) > 0
+                threshold = initial_chunk_frames if initial_chunk_frames > 0 and not emitted_any else chunk_frames
+                if pending <= 0:
+                    if is_finished:
+                        transfer_manager.code_prompt_token_ids.pop(req_id, None)
+                        transfer_manager.request_payload.pop(req_id, None)
+                        transfer_manager._ramp_total_emitted.pop(req_id, 0)
+                        return OmniPayloadStruct(
+                            meta=MetaStruct(
+                                req_id=[req_id],
+                                left_context_size=0,
+                                codec_chunk_frames=0,
+                                codec_left_context_frames=0,
+                                stream_finished=torch.tensor(True, dtype=torch.bool),
+                                finished=torch.tensor(True, dtype=torch.bool),
+                            ),
+                            request_id=req_id,
+                        )
+                    return None
+                if not is_finished and pending < threshold:
+                    return None
+                emit_frames = pending if is_finished else threshold
+                target_size = emit_frames
+
+                now = time.monotonic()
+                ctrl = AdaptiveChunkController(
+                    first_emit_time=now,
+                    last_emit_time=now,
+                    ramp_divisor=adaptive_divisor,
+                    ramp_delta_min=adaptive_delta_min,
+                )
+                _adaptive_states[req_id] = ctrl
+            else:
+                now = time.monotonic()
+                target_size = ctrl.compute_next_chunk_size(
+                    now,
+                    adaptive_min,
+                    chunk_frames,
+                    adaptive_margin,
+                )
+                emit, emit_frames = compute_adaptive_emit(
+                    pending,
+                    0,
+                    target_size,
+                    is_finished,
+                )
+                if not emit:
+                    return None
+                if emit_frames == 0:
+                    ctrl.log_summary(req_id)
+                    transfer_manager.code_prompt_token_ids.pop(req_id, None)
+                    transfer_manager.request_payload.pop(req_id, None)
+                    transfer_manager._ramp_total_emitted.pop(req_id, 0)
+                    return OmniPayloadStruct(
+                        meta=MetaStruct(
+                            req_id=[req_id],
+                            left_context_size=0,
+                            codec_chunk_frames=0,
+                            codec_left_context_frames=0,
+                            stream_finished=torch.tensor(True, dtype=torch.bool),
+                            finished=torch.tensor(True, dtype=torch.bool),
+                        ),
+                        request_id=req_id,
+                    )
+
+        elif ramp is not None:
+            emit, emit_frames = compute_ramp_emit(cumulative_length, chunk_index, ramp, chunk_frames, is_finished)
+            if not emit:
+                return None
+            if emit_frames == 0:
+                transfer_manager.code_prompt_token_ids.pop(req_id, None)
+                transfer_manager.request_payload.pop(req_id, None)
+                transfer_manager._ramp_total_emitted.pop(req_id, 0)
+                return OmniPayloadStruct(
+                    meta=MetaStruct(
+                        req_id=[req_id],
+                        left_context_size=0,
+                        codec_chunk_frames=0,
+                        codec_left_context_frames=0,
+                        stream_finished=torch.tensor(True, dtype=torch.bool),
+                        finished=torch.tensor(True, dtype=torch.bool),
+                    ),
+                    request_id=req_id,
+                )
+
+        # Common emit path for ramp / adaptive.
+        # Clamp emit_frames to actual pending to handle async overshoot:
+        # compute_ramp_emit returns a window from the cumulative boundary,
+        # but pending may be less if frames arrive one-by-one.
+        actual_emit = min(emit_frames, pending)
+        chunk_rows = pending_frames[:actual_emit]
+        del pending_frames[:actual_emit]
+        chunk_codes = torch.stack(
+            [row.to(torch.long).cpu() for row in chunk_rows],
+            dim=0,
+        ).contiguous()
+        finished = bool(is_finished and len(pending_frames) == 0)
+
+        # Advance cumulative counter by actual emitted count, not the
+        # ramp window size. This keeps cumulative_length in sync with
+        # real frames even under async overshoot.
+        transfer_manager._ramp_total_emitted[req_id] += actual_emit
+
+        if adaptive_enabled:
+            ctrl = transfer_manager._adaptive_states.get(req_id)
+            if ctrl is not None:
+                ctrl.record_emit(time.monotonic(), actual_emit, pending, target_size)
+                if finished:
+                    ctrl.log_summary(req_id)
+                    transfer_manager._adaptive_states.pop(req_id, None)
+
+    else:
+        # Original IC/steady threshold logic (no ramp / adaptive).
+        emitted_any = int(transfer_manager.put_req_chunk.get(req_id, 0)) > 0
+        threshold = initial_chunk_frames if initial_chunk_frames > 0 and not emitted_any else chunk_frames
+        if pending <= 0:
+            if is_finished:
+                transfer_manager.code_prompt_token_ids.pop(req_id, None)
+                transfer_manager.request_payload.pop(req_id, None)
+                return OmniPayloadStruct(
+                    meta=MetaStruct(
+                        req_id=[req_id],
+                        left_context_size=0,
+                        codec_chunk_frames=0,
+                        codec_left_context_frames=0,
+                        stream_finished=torch.tensor(True, dtype=torch.bool),
+                        finished=torch.tensor(True, dtype=torch.bool),
+                    ),
+                    request_id=req_id,
+                )
+            return None
+        if not is_finished and pending < threshold:
+            return None
+
+        emit_frames = pending if is_finished else threshold
+        chunk_rows = pending_frames[:emit_frames]
+        del pending_frames[:emit_frames]
+        chunk_codes = torch.stack(
+            [row.to(torch.long).cpu() for row in chunk_rows],
+            dim=0,
+        ).contiguous()
+        finished = bool(is_finished and len(pending_frames) == 0)
 
     codec_flat = chunk_codes.transpose(0, 1).contiguous().reshape(-1).to(torch.long)
 
     if finished:
         transfer_manager.code_prompt_token_ids.pop(req_id, None)
         transfer_manager.request_payload.pop(req_id, None)
+        if hasattr(transfer_manager, "_ramp_total_emitted"):
+            transfer_manager._ramp_total_emitted.pop(req_id, 0)
 
     return OmniPayloadStruct(
         codes=CodesStruct(audio=codec_flat),

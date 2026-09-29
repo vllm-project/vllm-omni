@@ -15,6 +15,13 @@ connectors:
       initial_codec_chunk_frames: 1   # 1 frame * 80 ms/frame = 80 ms first audio chunk
       codec_chunk_frames: 15          # 15 frames * 80 ms/frame = 1.2 s steady chunks
       codec_left_context_frames: 0
+      # codec_chunk_ramp: [4, 4, 8, 15]   # Optional: gradual chunk-size ramp to
+      #                                  # eliminate the 1→15 cliff. Each entry is
+      #                                  # the target size for that chunk index.
+      # codec_chunk_adaptive: true       # Optional: adaptive buffer-feedback
+      #                                  # controller (auto-tunes ramp across
+      #                                  # hardware). Takes precedence over
+      #                                  # codec_chunk_ramp when both are set.
 
 stages:
   - stage_id: 0
