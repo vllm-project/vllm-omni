@@ -154,7 +154,7 @@ platforms:
           # verified on 910B1) but K's RTF win is FULL-only there. Measured
           # on 910B1: PIECEWISE without K is +75% RTF at 32/1 versus
           # FULL_DECODE_ONLY with K=8.
-          cudagraph_mode: FULL_DECODE_ONLY
+          cudagraph_mode: PIECEWISE
       - stage_id: 1
         # Concurrency cap raised from 4 to 8; the override block only covered
         # stages 0 and 2, so stage 1 kept the base value of 4.
@@ -178,7 +178,7 @@ platforms:
         # two stage-2 replicas on this card.
         kv_cache_memory_bytes: 2684354560
         compilation_config:
-          cudagraph_mode: FULL_DECODE_ONLY
+          cudagraph_mode: PIECEWISE
       - stage_id: 2
         max_num_seqs: 8
         # Stage 2 stays outer-eager and captures only exact-shape CFM DiT
