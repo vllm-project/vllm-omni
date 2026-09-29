@@ -58,7 +58,9 @@ def _split_wan22_inference_steps(pipeline, num_inference_steps: int) -> tuple[in
 
     # Set timesteps to calculate the split
     device = next(pipeline.transformer.parameters()).device
-    pipeline.scheduler.set_timesteps(num_inference_steps, device=device)
+    # The Wan UniPC scheduler is built with shift=1.0 and takes the flow shift
+    # here; the Euler scheduler ignores it and keeps its built-in shift.
+    pipeline.scheduler.set_timesteps(num_inference_steps, device=device, shift=pipeline._flow_shift)
 
     timesteps = pipeline.scheduler.timesteps
     num_high_noise_steps = 0  # high-noise steps for transformer

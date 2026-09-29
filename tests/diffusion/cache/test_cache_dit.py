@@ -257,6 +257,29 @@ def test_wan22_custom_enabler_passes_taylorseer_calibrator(
         assert modifier._context_kwargs["calibrator_config"] is calibrator_config
 
 
+@pytest.mark.parametrize(
+    ("flow_shift", "expected_split"),
+    [(5.0, (17, 23)), (1.0, (5, 35))],
+)
+def test_wan22_step_split_applies_unipc_flow_shift(flow_shift, expected_split):
+    """The cache-dit split must count the same shifted schedule the pipeline denoises with."""
+    from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import build_wan_scheduler
+
+    pipeline = SimpleNamespace(
+        transformer=torch.nn.Linear(1, 1),
+        scheduler=build_wan_scheduler("unipc", flow_shift),
+        boundary_ratio=0.875,
+        _flow_shift=flow_shift,
+    )
+
+    assert cd_model_specific._split_wan22_inference_steps(pipeline, 40) == expected_split
+
+    pipeline.scheduler.set_timesteps(40, device="cpu", shift=flow_shift)
+    boundary_timestep = pipeline.boundary_ratio * pipeline.scheduler.config.num_train_timesteps
+    num_high_noise_steps = int((pipeline.scheduler.timesteps >= boundary_timestep).sum())
+    assert (num_high_noise_steps, 40 - num_high_noise_steps) == expected_split
+
+
 @patch("vllm_omni.diffusion.cache.cachedit.backend.BlockAdapter")
 @patch("vllm_omni.diffusion.cache.cachedit.backend.cache_dit")
 def test_cosmos3_cache_dit_wraps_gen_layers(mock_cache_dit, mock_block_adapter):
