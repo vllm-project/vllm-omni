@@ -11,6 +11,8 @@ import numpy as np
 import onnxruntime
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+import vllm.envs as envs
 from scipy.signal import resample_poly
 from transformers import Qwen2Config
 from transformers.feature_extraction_utils import BatchFeature
@@ -19,6 +21,7 @@ from vllm.config.multimodal import BaseDummyOptions
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.inputs import MultiModalDataDict
 from vllm.logger import init_logger
+from vllm.model_executor.layers.vocab_parallel_embedding import pad_vocab_size
 from vllm.model_executor.models.interfaces import SupportsMultiModal
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import MultiModalFieldConfig, MultiModalKwargsItems
@@ -518,6 +521,8 @@ class CosyVoice3Model(
             # KV cache is now managed externally by vLLM's PagedAttention
             # No need for self.llm_cache
             self.model = self.talker
+            self._padded_head_weight: torch.Tensor | None = None
+            self._padded_head_bias: torch.Tensor | None = None
         elif self.model_stage == "cosyvoice3_code2wav":
             # Initialize code2wav stage (flow matching + vocoder)
             from vllm_omni.model_executor.models.cosyvoice3.cosyvoice3_code2wav import CosyVoice3Code2Wav
@@ -759,11 +764,37 @@ class CosyVoice3Model(
         sampled = torch.tensor(sampled_ids, device=logits.device, dtype=torch.int32)
         return SamplerOutput(sampled_token_ids=sampled.unsqueeze(-1), logprobs_tensors=None)
 
+    def _pad_speech_head_for_batch_invariance(self) -> None:
+        """Build an 8-aligned copy of ``llm_decoder`` when ``VLLM_BATCH_INVARIANT`` is set.
+
+        That mode pins every matmul to cuBLASLt, which rejects fp16/bf16 GEMMs
+        whose output dimension is not a multiple of 8, so the talker head
+        (``speech_token_size + 200`` outputs) could not run. This is the same
+        padding vLLM applies to its vocab heads (``pad_vocab_size``). The
+        default path keeps the unpadded head so its output stays bit-identical.
+        """
+        self._padded_head_weight = None
+        self._padded_head_bias = None
+        decoder = self.model.llm_decoder
+        pad = pad_vocab_size(decoder.out_features, 8) - decoder.out_features
+        if not envs.VLLM_BATCH_INVARIANT or pad == 0:
+            return
+        self._padded_head_weight = F.pad(decoder.weight.detach(), (0, 0, 0, pad))
+        if decoder.bias is not None:
+            self._padded_head_bias = F.pad(decoder.bias.detach(), (0, pad))
+
+    def _decode_speech_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        decoder = self.model.llm_decoder
+        if self._padded_head_weight is None:
+            return decoder(hidden_states)
+        logits = F.linear(hidden_states, self._padded_head_weight, self._padded_head_bias)
+        return logits[..., : decoder.out_features]
+
     def compute_logits(self, hidden_states: torch.Tensor | OmniOutput) -> torch.Tensor | None:
         if isinstance(hidden_states, OmniOutput):
             hidden_states = hidden_states.text_hidden_states
         if self.model_stage == "cosyvoice3_talker":
-            logits = self.model.llm_decoder(hidden_states)
+            logits = self._decode_speech_logits(hidden_states)
             # The decoder outputs speech_token_size + 200 logits.  The official
             # CosyVoice3 treats ALL tokens >= speech_token_size (the last 200)
             # as stop signals.  Merge their probabilities into a single EOS
@@ -1278,6 +1309,7 @@ class CosyVoice3Model(
             self.model.llm_decoder.load_state_dict(llm_decoder_state)
 
             self.model.to(device).eval()
+            self._pad_speech_head_for_batch_invariance()
         elif self.model_stage == "cosyvoice3_code2wav":
             # Load weights for code2wav stage (flow + hift)
             device = next(self.parameters()).device

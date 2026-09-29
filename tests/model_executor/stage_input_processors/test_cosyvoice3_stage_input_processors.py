@@ -2,12 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from collections import defaultdict
+from dataclasses import dataclass, field
 from types import SimpleNamespace
 
 import pytest
 import torch
 
-from vllm_omni.data_entry_keys import serialize_payload
+from vllm_omni.data_entry_keys import OmniPayloadStruct, serialize_payload
 from vllm_omni.model_executor.stage_input_processors.cosyvoice3 import (
     talker2code2wav_async_chunk,
     text2flow_full_payload,
@@ -15,6 +16,18 @@ from vllm_omni.model_executor.stage_input_processors.cosyvoice3 import (
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+@dataclass
+class _Connector:
+    config: dict[str, dict[str, int]]
+
+
+@dataclass
+class _TransferManager:
+    connector: _Connector
+    code_prompt_token_ids: defaultdict[str, list[int]] = field(default_factory=lambda: defaultdict(list))
+    request_payload: dict[str, dict[str, object]] = field(default_factory=dict)
 
 
 def _source_output(request_id: str, prompt_ids: list[int], out_ids: list[int], mm: dict, finished: bool = True):
@@ -32,24 +45,20 @@ def _transfer_manager(
     pre_lookahead_frames: int = 0,
     stream_scale_factor: int = 1,
     max_chunk_frames: int | None = None,
+    left_context_frames: int | None = None,
 ):
     if max_chunk_frames is None:
         max_chunk_frames = chunk_frames
-    return SimpleNamespace(
-        code_prompt_token_ids=defaultdict(list),
-        request_payload={},
-        connector=SimpleNamespace(
-            config={
-                "extra": {
-                    "codec_chunk_frames": chunk_frames,
-                    "codec_pre_lookahead_frames": pre_lookahead_frames,
-                    "codec_max_chunk_frames": max_chunk_frames,
-                    "codec_stream_scale_factor": stream_scale_factor,
-                    "codec_vocab_size": 6561,
-                }
-            }
-        ),
-    )
+    extra = {
+        "codec_chunk_frames": chunk_frames,
+        "codec_pre_lookahead_frames": pre_lookahead_frames,
+        "codec_max_chunk_frames": max_chunk_frames,
+        "codec_stream_scale_factor": stream_scale_factor,
+        "codec_vocab_size": 6561,
+    }
+    if left_context_frames is not None:
+        extra["codec_left_context_frames"] = left_context_frames
+    return _TransferManager(connector=_Connector(config={"extra": extra}))
 
 
 def test_text2flow_token_only_supports_batched_source_outputs():
@@ -325,6 +334,74 @@ def test_talker2code2wav_async_chunk_respects_prompt_token_pad_on_first_chunk():
     assert payload_ready is not None
     assert payload_ready.codes.audio.tolist() == [8, 9, 10, 11]
     assert payload_ready.meta.left_context_size == 0
+
+
+@dataclass
+class _ChunkRequest:
+    external_req_id: str
+    output_token_ids: list[int] = field(default_factory=list)
+    additional_information: dict[str, object] = field(default_factory=dict)
+
+    def is_finished(self) -> bool:
+        return False
+
+
+def _feed_chunks(
+    transfer_manager: _TransferManager,
+    req_id: str,
+    emitted_counts: list[int],
+    *,
+    finish_last: bool = False,
+) -> list[OmniPayloadStruct | None]:
+    """Drive one request through chunks whose talker output grows to each count."""
+    request = _ChunkRequest(external_req_id=req_id)
+    payloads: list[OmniPayloadStruct | None] = []
+    last = len(emitted_counts) - 1
+    for i, count in enumerate(emitted_counts):
+        request.output_token_ids = list(range(1, count + 1))
+        payloads.append(
+            talker2code2wav_async_chunk(
+                transfer_manager=transfer_manager,
+                multimodal_output=None,
+                request=request,
+                is_finished=finish_last and i == last,
+            )
+        )
+    return payloads
+
+
+@pytest.mark.parametrize(
+    ("left_context_frames", "third_codes", "third_left_context"),
+    [
+        (3, [2, 3, 4, 5, 6], 3),  # emitted=4 > cap=3: the window slides, dropping token index 0
+        (0, [1, 2, 3, 4, 5, 6], 4),  # disabled: the whole prefix is resent
+    ],
+)
+def test_talker2code2wav_async_chunk_flow_window(left_context_frames, third_codes, third_left_context):
+    transfer_manager = _transfer_manager(left_context_frames=left_context_frames)
+    payload1, payload2, payload3 = _feed_chunks(transfer_manager, "rid-window", [2, 4, 6])
+
+    assert payload1 is not None
+    assert payload2 is not None
+    assert payload3 is not None
+    # Before the cap engages the full prefix is sent.
+    assert payload1.codes.audio.tolist() == [1, 2]
+    assert payload1.meta.left_context_size == 0
+    assert payload2.codes.audio.tolist() == [1, 2, 3, 4]
+    assert payload2.meta.left_context_size == 2
+    assert payload3.codes.audio.tolist() == third_codes
+    assert payload3.meta.left_context_size == third_left_context
+
+
+def test_talker2code2wav_async_chunk_final_flush_respects_flow_window():
+    transfer_manager = _transfer_manager(left_context_frames=3)
+    payload_final = _feed_chunks(transfer_manager, "rid-window-final", [2, 4, 6, 7], finish_last=True)[-1]
+
+    assert payload_final is not None
+    # emitted=6, cap=3: final flush sends 3 context tokens + the new tail.
+    assert payload_final.meta.finished.item() is True
+    assert payload_final.codes.audio.tolist() == [4, 5, 6, 7]
+    assert payload_final.meta.left_context_size == 3
 
 
 def test_talker2code2wav_async_chunk_emits_terminal_eof_without_duplicate_audio():

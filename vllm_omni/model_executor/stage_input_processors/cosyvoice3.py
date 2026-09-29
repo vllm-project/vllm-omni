@@ -112,6 +112,10 @@ def talker2code2wav_async_chunk(
         pre_lookahead_len = int(cfg.get("codec_pre_lookahead_frames", 3))
         max_chunk_size = int(cfg.get("codec_max_chunk_frames", 4 * chunk_size))
         stream_scale_factor = int(cfg.get("codec_stream_scale_factor", 2))
+        # Limit the emitted tokens resent as flow context. Nonpositive values
+        # retain the full prefix. A shorter context also changes the new mel
+        # frames because the DiT attends to the whole window.
+        flow_left_context = int(cfg.get("codec_left_context_frames", 25))
         if chunk_size <= 0 or pre_lookahead_len < 0 or max_chunk_size <= 0 or stream_scale_factor <= 0:
             raise ValueError(
                 f"Invalid codec chunk config: codec_chunk_frames={chunk_size}, "
@@ -175,6 +179,7 @@ def talker2code2wav_async_chunk(
                     "pre_lookahead_len": pre_lookahead_len,
                     "token_max_hop_len": max(chunk_size, max_chunk_size),
                     "stream_scale_factor": stream_scale_factor,
+                    "flow_left_context_len": flow_left_context,
                     "terminal_sent": False,
                     "prompt_payload": prompt_payload,
                 }
@@ -246,8 +251,13 @@ def talker2code2wav_async_chunk(
                 prefix_len = length
                 token_offset = emitted_token_len
 
+            flow_left_context_len = int(state.get("flow_left_context_len", flow_left_context))
+            window_start = 0
+            if flow_left_context_len > 0:
+                window_start = max(0, token_offset - flow_left_context_len)
+
         with nullcontext():
-            code_predictor_codes = [int(frame[0]) for frame in token_frames[:prefix_len]]
+            code_predictor_codes = [int(frame[0]) for frame in token_frames[window_start:prefix_len]]
 
         embed_struct = None
         if not state.get("sent_prompt", False):
@@ -260,7 +270,7 @@ def talker2code2wav_async_chunk(
                 finished=torch.tensor(finished, dtype=torch.bool),
                 stream_finished=torch.tensor(finished, dtype=torch.bool),
                 req_id=[request_id],
-                left_context_size=token_offset,
+                left_context_size=token_offset - window_start,
             ),
             embed=embed_struct,
         )
