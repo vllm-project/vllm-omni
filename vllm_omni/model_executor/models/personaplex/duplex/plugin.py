@@ -94,6 +94,8 @@ class PersonaPlexDuplexPlugin(DuplexModelPlugin):
     #: One codec frame: the runner keeps a model turn clocked with these when the client pauses.
     silence_continuation_samples = FRAME_SIZE
     silence_continuation_sample_rate_hz = SAMPLE_RATE
+    # Every live session appends one 80 ms frame per tick.
+    coalesces_resumable_updates = True
 
     def __init__(self, encode_audio: EncodeAudio) -> None:
         super().__init__(encode_audio)
