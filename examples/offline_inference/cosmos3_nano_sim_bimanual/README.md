@@ -272,6 +272,18 @@ and `diffusion_compile_granularity: regional`. Ordinary compilation is the
 default; add `model_config.use_cuda_graphs: true` for native blockwise CUDA
 graphs, as shown above. The example honors the deployment configuration.
 
+Select
+`--deploy-config vllm_omni/deploy/cosmos3_nano_sim_transfer_paged.yaml`
+to use managed paged K/V. It supports the same compilation and decode settings,
+window/sink overrides, and prompt-token limit as the dense path. The window is
+in temporal frames, including sinks and the current frame; each retained past
+frame contains control and clean latents. Chunk1 paging evicts complete pairs and preserves
+their absolute temporal positions. Larger chunks use their checkpoint's existing
+full-history contract, with scratch sized for the complete control/denoising span.
+Resolution, window/sink, or text-capacity
+changes between fresh full-clip requests can rebuild pools and recapture graphs.
+Incremental tick transport remains unsupported; control hints are supplied as complete clips.
+
 Decode overlap is enabled by default for full-video CUDA requests; set
 `model_config.overlap_vae_decode: false` for serial decode. With chunk size 1,
 clean commits remain framewise. Control hints are VAE-encoded up front, then

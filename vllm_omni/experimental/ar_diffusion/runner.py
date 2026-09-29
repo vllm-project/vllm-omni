@@ -70,6 +70,7 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
     def __init__(self, vllm_config: object, od_config: OmniDiffusionConfig, device: torch.device) -> None:
         super().__init__(vllm_config, od_config, device)
         self.ar_diffusion_kv_config = resolve_ar_diffusion_kv_config(od_config)
+        self._ar_diffusion_kv_overrides = self.ar_diffusion_kv_config
         self.kv_cache: ARDiffusionKVCache | None = None
         self._ar_diffusion_capability: SupportsARDiffusionPipeline | None = None
         self._ar_diffusion_kv_cache_spec: ARDiffusionKVCacheSpec | None = None
@@ -124,12 +125,13 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
     ) -> tuple[ARDiffusionKVCacheSpec, ARDiffusionKVConfig]:
         """Apply runner overrides and validate the resulting structural contract."""
 
+        overrides = getattr(self, "_ar_diffusion_kv_overrides", self.ar_diffusion_kv_config)
         config = dataclasses.replace(
-            self.ar_diffusion_kv_config,
+            overrides,
             chunk_size=spec.tokens_per_frame,
-            window_chunks=self.ar_diffusion_kv_config.window_chunks or spec.window_frames,
-            sink_chunks=self.ar_diffusion_kv_config.sink_chunks or spec.sink_frames,
-            reset_at_boundary=self.ar_diffusion_kv_config.reset_at_boundary or spec.reset_at_boundary,
+            window_chunks=overrides.window_chunks or spec.window_frames,
+            sink_chunks=overrides.sink_chunks or spec.sink_frames,
+            reset_at_boundary=overrides.reset_at_boundary or spec.reset_at_boundary,
         )
         effective = dataclasses.replace(
             spec,
@@ -234,6 +236,7 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
             max_scratch_frames_per_branch=spec.max_scratch_frames_per_branch,
             max_scratch_tokens_per_branch=spec.max_scratch_tokens_per_branch,
             model_owned_state_bytes_per_session=spec.model_owned_state_bytes_per_session,
+            eviction_group_frames=spec.eviction_group_frames,
             device=self.device,
         )
         self._session_capacity = self.kv_cache.session_capacity
@@ -417,7 +420,20 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
                 raise ARDiffusionRequestRejectedError(str(exc)) from exc
             request_spec = self._require_request_spec(request_spec, "ar_diffusion_request_spec()")
             geometry_key = request_spec.geometry_key
-            requested_spec, _ = self._effective_spec(capability, request_spec.kv_spec)
+            requested_spec, requested_config = self._effective_spec(capability, request_spec.kv_spec)
+            budget = getattr(self, "_available_memory_budget", None)
+            if requested_spec != self._ar_diffusion_kv_cache_spec and budget is not None:
+                estimate = estimate_ar_diffusion_kv_cache_memory(
+                    requested_config,
+                    requested_spec,
+                    self.od_config.dtype,
+                    scratch_blocks_override=ar_diffusion_scratch_blocks_override(),
+                )
+                if estimate.required_bytes > budget:
+                    raise ARDiffusionRequestRejectedError(
+                        "AR-Diffusion request KV capacity exceeds available memory: "
+                        f"required={estimate.required_bytes}, available={budget}."
+                    )
 
             geometry_keys = getattr(self, "_session_geometry_keys", {})
             if session_id in self._sessions and geometry_keys.get(session_id) != geometry_key and not reset:

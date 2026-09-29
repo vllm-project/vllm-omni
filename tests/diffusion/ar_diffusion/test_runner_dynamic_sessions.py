@@ -13,6 +13,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
+import torch
 
 from vllm_omni.experimental.ar_diffusion import runner as runner_module
 from vllm_omni.experimental.ar_diffusion.capability import (
@@ -88,6 +89,32 @@ def runner(monkeypatch):
     monkeypatch.setattr(runner_module, "supports_step_execution", lambda pipeline: True)
     monkeypatch.setattr(runner_module, "current_omni_platform", SimpleNamespace(synchronize=Mock(), empty_cache=Mock()))
     return value
+
+
+def test_dynamic_window_does_not_become_a_deployment_override(runner):
+    runner._ar_diffusion_kv_overrides = runner.ar_diffusion_kv_config
+    first = replace(runner.pipeline.spec, window_frames=53, sink_frames=6)
+    effective, config = runner._effective_spec(runner.pipeline, first)
+    assert effective.window_frames == 53
+    runner.ar_diffusion_kv_config = config
+    second = replace(first, window_frames=1, sink_frames=0)
+    effective, _ = runner._effective_spec(runner.pipeline, second)
+    assert effective.window_frames == 1
+    assert effective.sink_frames == 0
+
+
+def test_oversized_request_preserves_pool_and_session_before_reset(runner):
+    old_state = runner._get_or_create_session("s1", "small")
+    old_cache = runner.kv_cache
+    runner._available_memory_budget = 1
+    runner.od_config = SimpleNamespace(dtype=torch.float32)
+    req = request(runner, geometry="large", tokens=2, reset=True)
+    with pytest.raises(ARDiffusionRequestRejectedError, match="capacity exceeds"):
+        runner._prepare_ar_request(req, "s1", reset=True)
+    assert runner.kv_cache is old_cache
+    assert runner._sessions["s1"] is old_state
+    old_state.close.assert_not_called()
+    assert not runner.pipeline.reset and not runner.pipeline.closed
 
 
 def request(runner, *, geometry="small", tokens=1, reset=False):

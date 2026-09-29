@@ -1,0 +1,22 @@
+# Sim-Transfer/Depth with managed control/clean-latent paged history.
+pipeline: cosmos3_nano_sim_transfer
+async_chunk: false
+distributed_executor_backend: mp
+dtype: bfloat16
+default_resolution: [480, 832]
+max_pixels: 921600
+
+stages:
+  - stage_id: 0
+    devices: "0"
+    max_num_seqs: 1
+    enforce_eager: true
+    model_class_name: Cosmos3NanoSimTransferPipeline
+    engine_backend: vllm_omni.experimental.ar_diffusion.engine.ARDiffusionEngine
+    model_config:
+      action_gen: false
+      default_fps: 30.0
+      overlap_vae_decode: true
+      ar_diffusion_kv_config:
+        gpu_memory_fraction: 0.1
+        warmup_cudagraph: false

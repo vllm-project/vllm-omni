@@ -1,6 +1,6 @@
 # Cosmos3-Nano-Sim-Transfer offline dense-oracle deployment. The checkpoint path
 # and immutable schema-v1 conditioning contract come from transformer/config.json.
-# Paged cache serving remains a Phase T2 follow-up.
+# Use cosmos3_nano_sim_transfer_paged.yaml for managed K/V pools.
 
 pipeline: cosmos3_nano_sim_transfer
 async_chunk: false

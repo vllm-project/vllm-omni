@@ -294,6 +294,11 @@ class ARDiffusionKVCache:
     Build once per loaded model (dimensions known); then per request:
     ``begin_request`` → per chunk (``allocate_chunk`` → ``chunk_write_slots`` →
     [model writes K/V] → ``commit_chunk``) → ``end_request``.
+
+    ``eviction_group_frames`` counts consecutive KV frame blocks that must be
+    evicted together, independently of the forward's commit span. The default
+    is 1. See :class:`ARDiffusionKVCacheSpec` for the grouping policy and a
+    model-specific example.
     """
 
     def __init__(
@@ -316,6 +321,7 @@ class ARDiffusionKVCache:
         max_scratch_frames_per_branch: int | None = None,
         max_scratch_tokens_per_branch: int = 0,
         model_owned_state_bytes_per_session: int = 0,
+        eviction_group_frames: int = 1,
     ) -> None:
         if not config.enable:
             raise ValueError("ARDiffusionKVCache built with a disabled ARDiffusionKVConfig")
@@ -397,6 +403,7 @@ class ARDiffusionKVCache:
             window_chunks=config.window_chunks,
             sink_chunks=config.sink_chunks,
             reset_at_boundary=config.reset_at_boundary,
+            eviction_group_frames=eviction_group_frames,
         )
 
         override_blocks = ar_diffusion_scratch_blocks_override()
@@ -410,6 +417,7 @@ class ARDiffusionKVCache:
             window_frames=config.window_chunks,
             sink_frames=config.sink_chunks,
             reset_at_boundary=config.reset_at_boundary,
+            eviction_group_frames=eviction_group_frames,
             kv_branches=kv_branches,
             session_capacity=session_capacity,
             cross_attention=tuple(
