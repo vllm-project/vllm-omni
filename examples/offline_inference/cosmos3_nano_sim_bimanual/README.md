@@ -247,7 +247,7 @@ are validated by the same Cosmos3-Nano-Sim-Bimanual policy used during model exe
 
 ```bash
 python examples/offline_inference/cosmos3_nano_sim_bimanual/cosmos3_nano_sim_transfer.py \
-  --model nvidia/Cosmos3-Nano-Sim-Depth \
+  --model nvidia/Cosmos3-Nano-Sim-Transfer \
   --input-json /data/sim_transfer_depth.json \
   --resolution 480 \
   --num-frames 121 \
