@@ -54,7 +54,7 @@ vllm-omni serve openbmb/MiniCPM-o-4_5 \
 ```
 
 `vllm_omni/deploy/minicpmo_4_5.yaml` declares `session_mode: duplex` and
-`duplex_session.max_sessions: 4`. Because the MiniCPM-o 4.5 pipeline declares a
+`duplex_session.max_sessions: 16`. Because the MiniCPM-o 4.5 pipeline declares a
 `duplex_plugin`, `vllm-omni serve` runs it through `DuplexOmni`: the server
 mounts `ws://<host>:8099/v1/realtime?duplex=1` (this page; `ws://<host>:8099/v1/duplex`
 is an alias of the same route), `POST /v1/chat/completions`, `/v1/models` and

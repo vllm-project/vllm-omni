@@ -639,6 +639,14 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
         token_ids = _completion_token_ids(completion) or list(segment_token_ids)
         if _coerce_int(stop_reason) != listen_id and (not token_ids or token_ids[-1] != listen_id):
             return None
+        unit_ids = max(
+            (token_ids, _coerce_int_list(getattr(completion, "cumulative_token_ids", None)), list(segment_token_ids)),
+            key=len,
+        )
+        if MiniCPMO45DuplexPolicy.speech_unit_closed_by_listen(unit_ids, special_token_ids):
+            # The unit's final speech and <|turn_eos|> must reach the Talker,
+            # or the response never ends.
+            return None
 
         metadata = dict(output_metadata)
         for key, value in special_token_ids.items():
