@@ -379,7 +379,7 @@ class _FakeEngineClient:
         return self.vllm_config
 
     async def get_supported_tasks(self) -> tuple[str, ...]:
-        return ("generate",)
+        return getattr(self, "supported_tasks", ("generate",))
 
     async def get_tokenizer(self):
         return SimpleNamespace(chat_template="dummy")
@@ -959,6 +959,7 @@ async def test_pure_diffusion_app_state_key_snapshot(monkeypatch) -> None:
     """
     stage = SimpleNamespace(stage_type="diffusion", engine_args={})
     engine = _FakeEngineClient(stage_configs=[stage])
+    engine.supported_tasks = ("generate", "speech")
 
     def _for_diffusion_factory(label: str):
         def _factory(cls, *args, **kwargs):
@@ -996,6 +997,45 @@ async def test_pure_diffusion_app_state_key_snapshot(monkeypatch) -> None:
         must_be_none=_DIFFUSION_MUST_BE_NONE,
     )
     assert state.diffusion_engine is engine
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("supported_tasks", [("generate",), ("speech",), ("generate", "speech")])
+async def test_pure_diffusion_speech_handler_matches_supported_tasks(monkeypatch, supported_tasks) -> None:
+    """Pure diffusion should expose speech only when the engine supports it."""
+    stage = SimpleNamespace(stage_type="diffusion", engine_args={})
+    engine = _FakeEngineClient(stage_configs=[stage])
+    engine.supported_tasks = supported_tasks
+
+    def _for_diffusion_factory(label: str):
+        def _factory(cls, *args, **kwargs):
+            return _marker(label)
+
+        return classmethod(_factory)
+
+    monkeypatch.setattr(api_server.OmniOpenAIServingChat, "for_diffusion", _for_diffusion_factory("chat"))
+    monkeypatch.setattr(api_server.OmniOpenAIServingChatBatch, "for_diffusion", _for_diffusion_factory("chat_batch"))
+    monkeypatch.setattr(
+        api_server.OmniOpenAIServingAudioGenerate,
+        "for_diffusion",
+        _for_diffusion_factory("audio_generate"),
+    )
+    monkeypatch.setattr(api_server.OmniOpenAIServingVideo, "for_diffusion", _for_diffusion_factory("video"))
+    monkeypatch.setattr(api_server.OmniStreamingVideoOutputHandler, "__init__", lambda self, *a, **k: None)
+    monkeypatch.setattr(api_server.OmniOpenAIServingSpeech, "for_diffusion", _for_diffusion_factory("speech"))
+    monkeypatch.setattr(
+        api_server.ServingRealtimeRobotOpenPI,
+        "create_policy_server",
+        classmethod(lambda cls, *a, **k: None),
+    )
+
+    state = State()
+    await api_server.omni_init_app_state(engine, state, _minimal_args())
+
+    if "speech" in supported_tasks:
+        assert state.openai_serving_speech.name == "speech"
+    else:
+        assert state.openai_serving_speech is None
 
 
 @pytest.mark.asyncio
