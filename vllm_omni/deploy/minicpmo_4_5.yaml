@@ -172,7 +172,7 @@ platforms:
           # The Talker's stop head emits this id to finish a request.
           stop_token_ids: [1]
         compilation_config:
-          cudagraph_mode: PIECEWISE
+          cudagraph_mode: FULL_DECODE_ONLY
       - stage_id: 2
         max_num_seqs: 8
         # Stage 2 stays outer-eager and captures only exact-shape CFM DiT
