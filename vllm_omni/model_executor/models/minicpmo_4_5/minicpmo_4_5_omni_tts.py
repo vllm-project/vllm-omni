@@ -1748,11 +1748,11 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 # ``audio`` is the id sampled last step, i.e. exactly the
                 # history the logits computed below are scored against.
                 recent = state.get("recent_codes")
-                recent = (recent if isinstance(recent, list) else []) + codec_deltas[index].reshape(-1).tolist()
+                recent = (recent if isinstance(recent, list) else []) + codec_deltas[index].cpu().reshape(-1).tolist()
                 state["recent_codes"] = recent[-_CODEC_PENALTY_WINDOW:]
             recent_codes = state.get("recent_codes")
             if recent_codes:
-                penalty_histories[index] = torch.tensor(recent_codes, dtype=torch.long, device=hidden.device)
+                penalty_histories[index] = torch.tensor(recent_codes, dtype=torch.long, device="cpu")
             max_tokens = state.get("max_tokens")
             min_tokens = state.get("min_tokens")
             step = int(state.get("step", 0))
@@ -1792,10 +1792,14 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                     "turn_end": turn_end_flags,
                 }
             )
+        # Cross-stage codec transport must stay on CPU: these deltas are
+        # serialized to the next stage and read back by host-side
+        # bookkeeping; penalty histories stay on CPU as well -- the batched
+        # penalty step packs them host-side and uploads one buffer per step.
         return OmniOutput(
             text_hidden_states=hidden,
             multimodal_outputs={
-                "codes": {"audio": codec_deltas},
+                "codes": {"audio": [delta.to("cpu") for delta in codec_deltas]},
                 "meta": meta_outputs,
             },
         )
