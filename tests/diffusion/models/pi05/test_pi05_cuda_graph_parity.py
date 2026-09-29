@@ -1,23 +1,36 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""π0.5 CUDA Graph path against the eager baseline, bit-exact.
+"""π0.5's optimized path (fused Triton kernels under CUDA graphs) against the eager baseline.
 
 Loads the real checkpoint once per serving dtype through ``Pi05Pipeline`` with
-``enforce_eager=False``, which captures the CUDA graphs at init, and runs
-``sample_actions`` on simulated robot observations with 1, 2 and 3 real camera
-views, each at the configured
+``enforce_eager=False``, which enables the fused kernels and captures the CUDA
+graphs over them at init, and runs ``sample_actions`` on simulated robot
+observations with 1, 2 and 3 real camera views, each at the configured
 denoising-step count and at a per-request override. Every case runs on the
-eager path first, then on the CUDA Graph path (twice, in both case orders, so a
-region replaying stale buffers from the previous case is caught). The saved
-chunks are compared with ``torch.equal`` at the end, and every region must
-have replayed its graph rather than fallen back to eager. Further checks: a
-region falling back to eager mixes bit-exactly with replayed ones, no graph
-replays under a default dtype other than the float32 it was captured under,
-``sample_actions`` never syncs with the host, and it fills the KV cache the
-pipeline preallocates.
+eager baseline, then with the fused kernels outside the graphs, then on the
+optimized path (twice, in both case orders, so a region replaying stale
+buffers from the previous case is caught).
 
-Both paths share one model; only ``model.cuda_graphs`` is swapped. The float32
-checkpoint alone is ~14.5 GB, so a second copy would not fit a 16 GB card.
+Two expectations follow from what changes the computation:
+
+* Graph capture and replay change nothing: the optimized path is bit-exact
+  with the same fused kernels run eagerly, and every region must have replayed
+  its graph rather than fallen back to eager.
+* The fused kernels reorder reductions (GEMM accumulation, RMS variance,
+  softmax sums) but keep eager's operations and rounding points
+  (``test_pi05_fused_kernels.py``), so the optimized path is held to eager by
+  a tolerance. float32 drifts by reduction-order noise; bfloat16 by the
+  rounding flips that noise sets off, which is the same size as the drift
+  between eager bfloat16 and eager float32.
+
+Further checks: a region falling back to eager mixes bit-exactly with
+replayed ones, no graph replays under a default dtype other than the float32
+it was captured under, ``sample_actions`` never syncs with the host, and it
+fills the KV cache the pipeline preallocates.
+
+All paths share one model; only ``model.cuda_graphs`` and the backbone's
+``fused_kernels`` switch are swapped. The float32 checkpoint alone is
+~14.5 GB, so a second copy would not fit a 16 GB card.
 
 Needs a CUDA GPU and the real checkpoint::
 
@@ -32,7 +45,9 @@ from __future__ import annotations
 
 import gc
 import os
+from contextlib import contextmanager
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -59,6 +74,17 @@ NUM_VIEWS = (1, 2, 3)
 NUM_STEPS = (None, 4)
 CASES = [(views, steps) for views in NUM_VIEWS for steps in NUM_STEPS]
 PROMPT = "pick up the red block and place it in the bin"
+
+# How far the optimized path may move a chunk from the eager baseline, per
+# serving dtype: (relative L2, largest absolute difference).
+# * float32: reduction-order noise, measured at most 1.5e-6 and 3.3e-6 on these
+#   cases; the bound leaves room for other GPUs' cuBLAS kernel choices and is
+#   still far below any real error.
+# * bfloat16: no further than the bfloat16 layout itself moves a chunk from
+#   float32, which eager bfloat16 does by up to 2.4% and 0.049 on these cases.
+#   Measured: at most 1.4% and 0.021, and fused bfloat16 is as close to eager
+#   float32 as eager bfloat16 is.
+TOLERANCE = {torch.float32: (1e-4, 1e-4), torch.bfloat16: (2.5e-2, 5e-2)}
 
 
 def _resolve_checkpoint_dir() -> str:
@@ -130,25 +156,39 @@ def pipeline(request):
     torch.accelerator.empty_cache()
 
 
+@contextmanager
+def _path(model, *, graphs, fused_kernels: bool):
+    """Run ``model`` on the given execution path; restore the optimized one after."""
+    optimized = model.cuda_graphs
+    model.cuda_graphs = graphs
+    model.paligemma_with_expert.fused_kernels = fused_kernels
+    try:
+        yield
+    finally:
+        model.cuda_graphs = optimized
+        model.paligemma_with_expert.fused_kernels = True
+
+
 @pytest.fixture(scope="module")
 def outputs(pipeline):
-    """Run every case eagerly, then on the CUDA Graph path; compare later."""
+    """Run every case eagerly, with the fused kernels eagerly, then on the optimized path."""
     model = pipeline.model
     graphs = model.cuda_graphs
     assert graphs is not None, "enforce_eager=False on a CUDA device must install the CUDA Graph path."
+    assert model.paligemma_with_expert.fused_kernels, "enforce_eager=False must enable the fused kernels."
 
     inputs = {
         case: pipeline.processor.build_model_inputs(_robot_obs(pipeline.config, case[0], seed=index))
         for index, case in enumerate(CASES)
     }
 
-    eager: dict = {}
-    model.cuda_graphs = None
-    try:
-        for index, (views, steps) in enumerate(CASES):
-            eager[(views, steps)] = _sample(model, inputs[(views, steps)], steps, seed=index)
-    finally:
-        model.cuda_graphs = graphs
+    def run_all():
+        return {case: _sample(model, inputs[case], case[1], seed=index) for index, case in enumerate(CASES)}
+
+    with _path(model, graphs=None, fused_kernels=False):
+        eager = run_all()
+    with _path(model, graphs=None, fused_kernels=True):
+        fused_eager = run_all()
 
     optimized: dict = {}
     replays_before = graphs.num_replays.copy()
@@ -157,30 +197,49 @@ def outputs(pipeline):
             index = CASES.index((views, steps))
             optimized[(round_index, views, steps)] = _sample(model, inputs[(views, steps)], steps, seed=index)
     replays = graphs.num_replays - replays_before
-    return eager, optimized, replays, inputs
+    return SimpleNamespace(eager=eager, fused_eager=fused_eager, optimized=optimized, replays=replays, inputs=inputs)
 
 
 @pytest.mark.parametrize("num_steps", NUM_STEPS, ids=lambda steps: f"steps={steps or 'default'}")
 @pytest.mark.parametrize("num_views", NUM_VIEWS, ids=lambda views: f"views={views}")
 def test_cuda_graph_path_is_bit_exact(outputs, pipeline, num_views, num_steps):
-    eager, optimized, _, _ = outputs
-    reference = eager[(num_views, num_steps)]
+    """Capture and replay change no computation: the optimized path equals its
+    kernels run eagerly, bit for bit, in both rounds."""
+    reference = outputs.fused_eager[(num_views, num_steps)]
     assert reference.shape == (1, pipeline.config.chunk_size, pipeline.config.max_action_dim)
     assert torch.isfinite(reference).all()
 
     for round_index in (0, 1):
-        actual = optimized[(round_index, num_views, num_steps)]
+        actual = outputs.optimized[(round_index, num_views, num_steps)]
         max_abs_diff = (actual.double() - reference.double()).abs().max().item()
         assert torch.equal(actual, reference), (
-            f"CUDA Graph path differs from eager (round {round_index}): max |diff| = {max_abs_diff:.3e}"
+            f"CUDA Graph path differs from its kernels run eagerly (round {round_index}): "
+            f"max |diff| = {max_abs_diff:.3e}"
         )
+
+
+@pytest.mark.parametrize("num_steps", NUM_STEPS, ids=lambda steps: f"steps={steps or 'default'}")
+@pytest.mark.parametrize("num_views", NUM_VIEWS, ids=lambda views: f"views={views}")
+def test_optimized_path_matches_eager(outputs, pipeline, num_views, num_steps):
+    """The fused kernels reorder reductions only, so the optimized chunk stays
+    within reduction-order drift of the eager baseline (``TOLERANCE``)."""
+    reference = outputs.eager[(num_views, num_steps)].double()
+    actual = outputs.optimized[(0, num_views, num_steps)].double()
+    assert torch.isfinite(reference).all()
+    max_rel, max_abs = TOLERANCE[pipeline._torch_dtype]
+    rel = ((actual - reference).norm() / reference.norm()).item()
+    abs_diff = (actual - reference).abs().max().item()
+    print(f"\n{pipeline._torch_dtype} views={num_views} steps={num_steps}: rel L2 {rel:.3e}, max |diff| {abs_diff:.3e}")
+    assert rel <= max_rel and abs_diff <= max_abs, (
+        f"optimized path moved the chunk by rel L2 {rel:.3e}, max |diff| {abs_diff:.3e}; "
+        f"allowed {max_rel:.1e}, {max_abs:.1e}"
+    )
 
 
 def test_cases_differ_from_each_other(outputs):
     """Guards the parity check itself: identical chunks across cases would let a
     path that ignores its inputs, or replays the previous case, pass."""
-    eager, _, _, _ = outputs
-    chunks = list(eager.values())
+    chunks = list(outputs.eager.values())
     for i, first in enumerate(chunks):
         for second in chunks[i + 1 :]:
             assert not torch.equal(first, second)
@@ -190,7 +249,7 @@ def test_cuda_graph_path_replays_every_region(outputs, pipeline):
     """Guards the parity check itself: a region that silently fell back to eager
     would still be bit-exact. Each call replays regions 1 and 2 once and region
     3 once per step, over two rounds of every case."""
-    _, _, replays, _ = outputs
+    replays = outputs.replays
     calls = 2 * len(CASES)
     steps = 2 * sum(pipeline.config.num_inference_steps if steps is None else steps for _, steps in CASES)
     assert replays == {"embed_prefix": calls, "prefix_forward": calls, "denoise_step": steps}
@@ -198,9 +257,9 @@ def test_cuda_graph_path_replays_every_region(outputs, pipeline):
 
 def test_eager_fallback_mixes_with_replayed_regions(outputs, pipeline):
     """Without the preallocated KV cache, ``sample_actions`` takes a one-off
-    one, so regions 2 and 3 fall back to eager while region 1 still replays and
-    hands them its graph outputs. The chunk must not change."""
-    eager, _, _, inputs = outputs
+    one, so regions 2 and 3 fall back to eager (still through the fused
+    kernels) while region 1 still replays and hands them its graph outputs.
+    The chunk must not change."""
     model = pipeline.model
     graphs = model.cuda_graphs
     case = (3, None)
@@ -210,30 +269,28 @@ def test_eager_fallback_mixes_with_replayed_regions(outputs, pipeline):
     replays_before = graphs.num_replays.copy()
     model.kv_cache = None
     try:
-        actual = _sample(model, inputs[case], case[1], seed=index)
+        actual = _sample(model, outputs.inputs[case], case[1], seed=index)
     finally:
         model.kv_cache = kv_cache
 
     assert graphs.num_replays - replays_before == {"embed_prefix": 1}
-    assert torch.equal(actual, eager[case])
+    assert torch.equal(actual, outputs.fused_eager[case])
 
 
-@pytest.mark.parametrize("path", ["eager", "cuda_graph"])
+@pytest.mark.parametrize("path", ["eager", "fused_eager", "optimized"])
 def test_sample_actions_never_syncs_with_the_host(pipeline, path):
     """Every region is device-only work, the condition for capturing it, and a
     replay adds only device-to-device copies: a host-device copy or a stream
     sync anywhere in ``sample_actions`` fails this."""
     model = pipeline.model
-    graphs = model.cuda_graphs
     inputs = pipeline.processor.build_model_inputs(_robot_obs(pipeline.config, 3, seed=0))
-    if path == "eager":
-        model.cuda_graphs = None
-    torch.cuda.set_sync_debug_mode("error")
-    try:
-        _sample_on_device(model, inputs, num_steps=None, seed=0)
-    finally:
-        torch.cuda.set_sync_debug_mode("default")
-        model.cuda_graphs = graphs
+    graphs = model.cuda_graphs if path == "optimized" else None
+    with _path(model, graphs=graphs, fused_kernels=path != "eager"):
+        torch.cuda.set_sync_debug_mode("error")
+        try:
+            _sample_on_device(model, inputs, num_steps=None, seed=0)
+        finally:
+            torch.cuda.set_sync_debug_mode("default")
 
 
 def test_sample_actions_writes_the_preallocated_kv_cache(pipeline):
