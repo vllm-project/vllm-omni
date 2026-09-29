@@ -386,9 +386,30 @@ def test_pipeline_crops_actions_to_checkpoint_output_schema(monkeypatch):
 
 
 class _GraphTarget:
-    """Stands in for the model: all ``_install_cuda_graphs`` touches is the slot."""
+    """Stands in for the model: all ``_install_cuda_graphs`` touches are the
+    graph slot and the fused-kernel switch, whose calls ``events`` records."""
 
     cuda_graphs = None
+
+    def __init__(self, events: list, fused_kernels_error: Exception | None = None):
+        self.events = events
+        self.fused_kernels_error = fused_kernels_error
+
+    def enable_fused_kernels(self):
+        if self.fused_kernels_error is not None:
+            raise self.fused_kernels_error
+        self.events.append("enable_fused_kernels")
+
+
+def _graph_install_pipeline(device: str, events: list, monkeypatch, fused_kernels_error=None):
+    from vllm_omni.diffusion.models.pi05.pipeline_pi05 import Pi05Pipeline
+
+    # Capture needs a GPU; test_pi05_cuda_graph_parity.py runs the real one.
+    monkeypatch.setattr(Pi05CUDAGraphs, "capture", lambda graphs: events.append("capture"))
+    pipeline = object.__new__(Pi05Pipeline)
+    pipeline._device = torch.device(device)
+    pipeline.model = _GraphTarget(events, fused_kernels_error)
+    return pipeline
 
 
 @pytest.mark.parametrize(
@@ -402,22 +423,33 @@ class _GraphTarget:
     ],
 )
 def test_pipeline_installs_cuda_graphs_unless_enforce_eager(enforce_eager, device, installed, monkeypatch):
+    """The optimized path is the fused kernels with CUDA graphs captured over
+    them: the kernels are enabled first, then the graphs are captured at init
+    and installed. The eager baseline gets neither."""
     from types import SimpleNamespace
 
-    from vllm_omni.diffusion.models.pi05.pipeline_pi05 import Pi05Pipeline
-
-    captured = []
-    # Capture needs a GPU; test_pi05_cuda_graph_parity.py runs the real one.
-    monkeypatch.setattr(Pi05CUDAGraphs, "capture", lambda graphs: captured.append(graphs))
-    pipeline = object.__new__(Pi05Pipeline)
-    pipeline._device = torch.device(device)
-    pipeline.model = _GraphTarget()
+    events: list[str] = []
+    pipeline = _graph_install_pipeline(device, events, monkeypatch)
 
     pipeline._install_cuda_graphs(SimpleNamespace(enforce_eager=enforce_eager))
 
     assert isinstance(pipeline.model.cuda_graphs, Pi05CUDAGraphs) is installed
-    # Captured at init, before the graph path is installed.
-    assert captured == ([pipeline.model.cuda_graphs] if installed else [])
+    assert events == (["enable_fused_kernels", "capture"] if installed else [])
+
+
+def test_pipeline_fails_when_the_fused_kernels_cannot_run(monkeypatch):
+    """``enforce_eager=False`` asks for the optimized path: kernels that cannot
+    run must stop startup rather than silently serve eagerly."""
+    from types import SimpleNamespace
+
+    events: list[str] = []
+    pipeline = _graph_install_pipeline("cuda", events, monkeypatch, fused_kernels_error=RuntimeError("no Triton"))
+
+    with pytest.raises(RuntimeError, match="enforce_eager") as excinfo:
+        pipeline._install_cuda_graphs(SimpleNamespace(enforce_eager=False))
+    assert "no Triton" in str(excinfo.value.__cause__)
+    assert events == []
+    assert pipeline.model.cuda_graphs is None
 
 
 def test_load_lerobot_norm_stats_unknown_mode_raises(tmp_path):
@@ -1003,6 +1035,36 @@ def test_forward_requires_a_kv_cache(tiny_model):
         backbone.forward(inputs_embeds=[torch.zeros(1, 4, tiny_model.vlm_width), None], use_cache=True)
     with pytest.raises(TypeError, match="Pi05KVCache"):
         backbone.forward(inputs_embeds=[None, torch.zeros(1, 4, tiny_model.expert_width)], past_key_values=[])
+
+
+@pytest.mark.slow
+def test_fused_kernels_are_off_until_enabled_and_need_cuda():
+    """The eager baseline never runs the fused kernels; enabling them on a
+    model they cannot serve raises and leaves it on the baseline. The kernels
+    themselves are ``test_pi05_fused_kernels.py``'s (CUDA)."""
+    model = _tiny_pi05_model()
+    assert model.paligemma_with_expert.fused_kernels is False
+    with pytest.raises(RuntimeError, match="not a CUDA device"):
+        model.enable_fused_kernels()
+    assert model.paligemma_with_expert.fused_kernels is False
+
+
+@pytest.mark.slow
+def test_fused_kernels_serve_only_batch_one_on_a_single_head_kv_cache(tiny_model):
+    """Calls the kernels do not cover run eagerly even once they are enabled."""
+    backbone = tiny_model.paligemma_with_expert
+    serve = modeling_pi05._fused_kernels_serve
+    cache = tiny_model.new_kv_cache(batch_size=1)
+    backbone.fused_kernels = True
+    try:
+        assert serve(backbone, cache, batch_size=1)
+        assert not serve(backbone, cache, batch_size=2)
+        assert not serve(backbone, tiny_model.new_kv_cache(batch_size=2), batch_size=2)
+        assert not serve(backbone, [], batch_size=1)
+        backbone.fused_kernels = False
+        assert not serve(backbone, cache, batch_size=1)
+    finally:
+        backbone.fused_kernels = False
 
 
 # ----------------------------------------------------------------------------

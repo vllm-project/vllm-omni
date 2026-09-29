@@ -251,8 +251,9 @@ class Pi05Pipeline(nn.Module):
 
         The stage's ``enforce_eager`` (deploy yaml, or ``--enforce-eager`` on the
         CLI, which takes precedence) keeps the eager baseline. Otherwise the
-        CUDA Graph path is captured here, at init, and installed. A capture
-        failure raises rather than silently serving eagerly.
+        optimized path is set up here, at init: the fused Triton kernels are
+        enabled, and the CUDA graphs are captured over them and installed. A
+        failure of either raises rather than silently serving eagerly.
         """
         if od_config.enforce_eager:
             logger.info("Pi05Pipeline: enforce_eager is set; sample_actions runs eagerly.")
@@ -263,12 +264,20 @@ class Pi05Pipeline(nn.Module):
                 self._device,
             )
             return
+        try:
+            self.model.enable_fused_kernels()
+        except RuntimeError as exc:
+            raise RuntimeError(
+                "π0.5's optimized path needs its fused kernels. Set `enforce_eager: true` in the deploy "
+                "config, or pass --enforce-eager, to serve eagerly."
+            ) from exc
         graphs = Pi05CUDAGraphs(self.model)
         start = time.perf_counter()
         graphs.capture()
         self.model.cuda_graphs = graphs
         logger.info(
-            "Pi05Pipeline: captured the sample_actions CUDA graphs in %.2f s; sample_actions runs its CUDA Graph path.",
+            "Pi05Pipeline: captured the sample_actions CUDA graphs over the fused kernels in %.2f s; "
+            "sample_actions runs its optimized path.",
             time.perf_counter() - start,
         )
 

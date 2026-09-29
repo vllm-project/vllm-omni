@@ -1,4 +1,4 @@
-# π0.5 VLA: one diffusion stage, one GPU, CUDA graphs, bsz 1 (OpenPI policy serving
+# π0.5 VLA: one diffusion stage, one GPU, fused Triton kernels under CUDA graphs, bsz 1 (OpenPI policy serving
 # is one observation -> one action reply). Every key below is documented in
 # recipes/lerobot/Pi05.md.
 
