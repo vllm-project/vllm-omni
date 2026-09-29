@@ -932,6 +932,36 @@ class CosyVoice3Model(
         stl_out = _rows(speech_token_len, 2)
         return st_out, sf_out, emb_out, stl_out
 
+    @staticmethod
+    def _align_conditioning_to_batch(
+        speech_token_list,
+        speech_feat_list,
+        embedding_list,
+        speech_token_len_list,
+        batch_size: int,
+    ):
+        """Pad per-request conditioning lists to the full scheduled batch size.
+
+        ``to_payload_element`` routes each request's payload by its index in
+        the scheduled batch (``element[idx]``). The ``*_list`` inputs are split
+        from the collated mm kwargs, which only contain the requests that
+        carried mm conditioning in this step; when that is a strict subset of
+        the batch, a shorter list silently falls back to element 0 and hands
+        one request's reference voice to the rest (the #4370/#4373/#4870/#4415
+        cross-request corruption class). Padding with ``None`` keeps every
+        ``element[idx]`` in range and lets conditioning-less slots be skipped
+        downstream instead of aliasing request 0. No-op when already aligned.
+        """
+        if len(speech_token_list) >= batch_size:
+            return speech_token_list, speech_feat_list, embedding_list, speech_token_len_list
+        pad = batch_size - len(speech_token_list)
+        return (
+            speech_token_list + [None] * pad,
+            speech_feat_list + [None] * pad,
+            embedding_list + [None] * pad,
+            speech_token_len_list + [None] * pad,
+        )
+
     def _resolve_flow_estimator_onnx(self) -> str | None:
         """Locate the flow-decoder estimator ONNX for the TensorRT engine.
 
@@ -1044,6 +1074,27 @@ class CosyVoice3Model(
                         kwargs.get("embedding"),
                         kwargs.get("speech_token_len"),
                     )
+                )
+                # ``to_payload_element`` routes per-request payloads by the
+                # request's index in the full scheduled batch (``element[idx]``).
+                # The lists above are split from collated mm inputs, which only
+                # contain the requests that carried mm kwargs in this step; when
+                # those are a strict subset of the batch (e.g. a decode-only
+                # request reuses the conditioning emitted in its prefill step),
+                # align them to the full batch so no request aliases element 0.
+                batch_spans = kwargs.get("request_token_spans")
+                batch_size = len(batch_spans) if batch_spans is not None else len(speech_token_list)
+                (
+                    speech_token_list,
+                    speech_feat_list,
+                    embedding_list,
+                    speech_token_len_list,
+                ) = self._align_conditioning_to_batch(
+                    speech_token_list,
+                    speech_feat_list,
+                    embedding_list,
+                    speech_token_len_list,
+                    batch_size,
                 )
                 multimodal_outputs = to_dict(
                     OmniPayloadStruct(
