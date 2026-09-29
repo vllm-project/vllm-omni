@@ -15,6 +15,7 @@ from transformers.dynamic_module_utils import get_class_from_dynamic_module
 from vllm.inputs import tokens_input
 from vllm.logger import init_logger
 
+from vllm_omni.entrypoints.openai.protocol.audio import RegisteredVoiceReference
 from vllm_omni.entrypoints.openai.tts_adapters import register_tts_adapter
 from vllm_omni.entrypoints.openai.tts_adapters.base import (
     ARTTSAdapter,
@@ -103,25 +104,60 @@ class _MossTTSAdapterBase(ARTTSAdapter):
         """
         from vllm_omni.model_executor.models.moss_tts.reference_encoder import encode_request_references
 
-        # Named-voice caching is only valid for uploaded speakers without an
-        # inline ref_audio: ``request.voice`` plus a file/URL would otherwise
-        # key on (name, created_at=0) and skip the content-aware resolve.
-        raw_voice = getattr(request, "voice", None)
-        raw_voice = raw_voice.strip() if isinstance(raw_voice, str) else ""
-        voice_lower = raw_voice.lower()
-        use_named_voice = bool(voice_lower) and voice_lower in self.uploaded_speakers and not has_inline_ref_audio
-        voice = voice_lower if use_named_voice else ""
-        voice_created = self._voice_created_at(voice) if voice else 0
+        snapshot = request._registered_voice_reference if not has_inline_ref_audio else None
+        ref_str = cast(str, request.ref_audio)
+        resolver = self._resolve_ref_audio
+        if snapshot is not None:
+            # This key never enters URI validation. Only a cache miss loads the
+            # immutable generation's file; speaker 2 keeps the ordinary resolver.
+            ref_str = f"registered:{snapshot.name}:{snapshot.created_at}"
 
-        return await encode_request_references(
+            async def resolve_registered(ref_audio: str):
+                if ref_audio == ref_str:
+                    waveform, sr = await asyncio.to_thread(self.ctx.server._load_registered_reference, snapshot)
+                    return waveform, sr, ref_str
+                return await self._resolve_ref_audio(ref_audio)
+
+            resolver = resolve_registered
+
+        references, resolve_keys = await encode_request_references(
             self._get_moss_ref_encoder(),
-            cast(str, request.ref_audio),
+            ref_str,
             request.ref_audio_2 if two_speaker else None,
-            resolve_ref_audio=self._resolve_ref_audio,
+            resolve_ref_audio=resolver,
             get_artifact_key=self._get_resolved_ref_audio_artifact_key,
-            voice_name=voice or None,
-            voice_created_at=voice_created,
+            voice_name=snapshot.name if snapshot is not None else None,
+            voice_created_at=snapshot.created_at if snapshot is not None else 0,
         )
+        if snapshot is not None:
+            # The generation identifies slot 0 on both cold and hot requests.
+            # Do not let a cold-only resolve key change its prefix-cache salt.
+            resolve_keys.pop(0, None)
+        return references, resolve_keys
+
+    def _bind_registered_reference(self, request: "OpenAICreateSpeechRequest") -> str | None:
+        if request._registered_voice_reference is not None:
+            return None
+        voice = (request.voice or "").strip().lower()
+        if not voice:
+            return None
+        info = self.uploaded_speakers.get(voice)
+        if info is None:
+            return None
+        if info.get("embedding_source") != "audio":
+            return f"Uploaded voice '{voice}' must contain reference audio for MOSS-TTS."
+        created_at = int(info.get("created_at", 0))
+        if created_at <= 0:
+            return f"Uploaded voice '{voice}' has no valid generation. Re-upload the voice."
+        request._registered_voice_reference = RegisteredVoiceReference(
+            name=voice,
+            created_at=created_at,
+            file_path=info["file_path"],
+            ref_text=info.get("ref_text"),
+        )
+        if not request.ref_text or not request.ref_text.strip():
+            request.ref_text = request._registered_voice_reference.ref_text
+        return None
 
     def _detect_moss_variant(self) -> str:
         """Sub-classify a ``moss_tts``-stage server into the actual MOSS-TTS
@@ -407,7 +443,12 @@ class _MossTTSAdapterBase(ARTTSAdapter):
             we fall through to the original nano contract (ref_audio only).
         """
         server = self.ctx.server
-        err = server._apply_uploaded_speaker(request)
+        if self._moss_variant is None:
+            err = server._apply_uploaded_speaker(request)
+        elif request.ref_audio is None:
+            err = self._bind_registered_reference(request)
+        else:
+            err = None
         if err:
             return err
 
@@ -418,7 +459,7 @@ class _MossTTSAdapterBase(ARTTSAdapter):
 
         v = self._moss_variant
         if v in (None, "tts", "realtime", "local"):
-            if request.ref_audio is None:
+            if request.ref_audio is None and request._registered_voice_reference is None:
                 label = (
                     "MOSS-TTS-Nano"
                     if v is None
@@ -429,12 +470,12 @@ class _MossTTSAdapterBase(ARTTSAdapter):
                     )
                 )
                 return f"{label} requires 'ref_audio' (reference audio for voice cloning)."
-            return server._validate_ref_audio_format(request.ref_audio)
+            return server._validate_ref_audio_format(request.ref_audio) if request.ref_audio is not None else None
 
         if v == "ttsd":
-            if request.ref_audio is None:
+            if request.ref_audio is None and request._registered_voice_reference is None:
                 return "MOSS-TTSD requires 'ref_audio' (speaker 1 reference)."
-            fmt_err = server._validate_ref_audio_format(request.ref_audio)
+            fmt_err = server._validate_ref_audio_format(request.ref_audio) if request.ref_audio is not None else None
             if fmt_err:
                 return fmt_err
             if request.ref_audio_2 is not None:
@@ -463,12 +504,26 @@ class _MossTTSAdapterBase(ARTTSAdapter):
         self, request: "OpenAICreateSpeechRequest", sampling_params_list: list, has_inline_ref_audio: bool
     ) -> PreparedRequest:
         server = self.ctx.server
+        if self._moss_variant is not None and not has_inline_ref_audio:
+            error = self._bind_registered_reference(request)
+            if error:
+                raise ValueError(error)
+        snapshot = request._registered_voice_reference if not has_inline_ref_audio else None
         tts_params = await self._build_moss_tts_params(request, has_inline_ref_audio=has_inline_ref_audio)
-        if request.voice:
+        registered_voice = None
+        if snapshot is not None:
+            tts_params["voice_name"] = [snapshot.name]
+            tts_params["voice_created_at"] = [snapshot.created_at]
+            registered_voice = (snapshot.name, snapshot.created_at)
+        elif self._moss_variant is None and request.voice and not has_inline_ref_audio:
+            # Nano retains its existing waveform-based uploaded-voice path.
             voice_lower = request.voice.lower()
-            if voice_lower in server.uploaded_speakers and not has_inline_ref_audio:
+            if voice_lower in server.uploaded_speakers:
+                created_at = server._voice_created_at(voice_lower)
                 tts_params["voice_name"] = [voice_lower]
-                tts_params["voice_created_at"] = [server._voice_created_at(voice_lower)]
+                tts_params["voice_created_at"] = [created_at]
+                if created_at > 0:
+                    registered_voice = (voice_lower, created_at)
         # MOSS samples internally from additional_information. build() runs
         # before the shared path applies request.seed to SamplingParams.
         seed = request.seed
@@ -482,7 +537,7 @@ class _MossTTSAdapterBase(ARTTSAdapter):
         else:
             prompt = tokens_input(prompt_token_ids=[1])
         prompt["additional_information"] = tts_params
-        prompt["cache_salt"] = conditioning_cache_salt(request, tts_params)
+        prompt["cache_salt"] = conditioning_cache_salt(request, tts_params, registered_voice=registered_voice)
         return PreparedRequest(
             prompt=prompt,
             tts_params=tts_params,
