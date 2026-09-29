@@ -945,9 +945,7 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
         if kstep_armed is not None and kstep_armed():
             sp = getattr(request, "sampling_params", None)
             unsupported = [
-                name
-                for name in ("logit_bias", "allowed_token_ids")
-                if sp is not None and getattr(sp, name, None)
+                name for name in ("logit_bias", "allowed_token_ids") if sp is not None and getattr(sp, name, None)
             ]
             if unsupported:
                 logger.warning(

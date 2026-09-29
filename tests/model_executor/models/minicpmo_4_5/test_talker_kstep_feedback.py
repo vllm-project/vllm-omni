@@ -17,6 +17,9 @@ Layers pinned down here:
 - The multi-frame gate matrix: non-uniform decode spans stay blocked at
   ``applies()``; the runner raise remains the assertion of last resort for
   a combination the guard makes unschedulable.
+- The draft rule: a stop-truncated row (a request that accepted fewer
+  tokens than the step ran) folds the whole batch to a draft-free step,
+  the same way an empty row already did.
 """
 
 from types import SimpleNamespace
@@ -314,6 +317,43 @@ def test_multiframe_gate_matrix():
     }
     assert talker_multiframe.applies(model, mixed_prefill) == 0
     assert talker_multiframe.is_multi_token_decode(model, mixed_prefill) is True
+
+
+def test_constant_drafts_fold_when_a_stop_truncates_a_row():
+    """A request whose codec stop row fired mid-step accepted fewer tokens
+    than the step ran; its next-step schedule is short the same way, so the
+    batch folds and the whole step takes the single-frame path instead of
+    scheduling a non-uniform span set that ``applies`` would refuse (and
+    ``_model_forward`` would turn into a fatal error)."""
+    from vllm_omni.platforms.npu.worker import talker_multiframe
+
+    # Five staggered codecs, K=6: one stopped at frame 3 (4 tokens), three
+    # at frame 4 (5 tokens), one ran the step out (6 tokens).
+    sampled = [
+        [1, 2, 3, 4],
+        [1, 2, 3, 4, 5],
+        [1, 2, 3, 4, 5],
+        [1, 2, 3, 4, 5],
+        [1, 2, 3, 4, 5, 6],
+    ]
+    assert talker_multiframe.constant_drafts(sampled, frames=6, num_reqs=5) == [[] for _ in range(5)]
+
+
+def test_constant_drafts_fold_when_a_row_samples_nothing():
+    from vllm_omni.platforms.npu.worker import talker_multiframe
+
+    sampled = [[1, 2, 3, 4, 5, 6], [], [1, 2, 3, 4, 5, 6]]
+    assert talker_multiframe.constant_drafts(sampled, frames=6, num_reqs=3) == [[] for _ in range(3)]
+
+
+def test_constant_drafts_keep_drafts_when_every_row_is_full():
+    """No stop anywhere: every request accepted the step's K tokens and the
+    drafts arm the next K-frame step exactly as before the fold rule."""
+    from vllm_omni.platforms.npu.worker import talker_multiframe
+
+    sampled = [[1, 2, 3, 4, 5, 6], [1, 2, 3, 4, 5, 6]]
+    drafts = talker_multiframe.constant_drafts(sampled, frames=6, num_reqs=2)
+    assert drafts == [[talker_multiframe.CONTINUE_TOKEN_ID] * 5 for _ in range(2)]
 
 
 def _vocab_runner(*, supports_multi_frame: bool, vocab_size: int):

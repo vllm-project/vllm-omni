@@ -586,6 +586,12 @@ def constant_drafts(
     into a fatal error rather than let the single-forward path sample one frame
     from the last row of a K-row span.
 
+    A request whose codec stop row fired mid-step is the same refusal by
+    another route: the rejection sampler truncates it to the frames it actually
+    accepted, so its next-step schedule is j+1 wide against the neighbours' K
+    -- non-uniform all the same. The empty check misses it, so the row length
+    is checked too: a short row folds the whole batch.
+
     So: every request drafts, or nobody does. A step with no drafts is an
     ordinary one-frame-per-request decode, and the frames resume on the step
     after it.
@@ -596,6 +602,9 @@ def constant_drafts(
             sampled = valid_sampled_token_ids[index]
         if not sampled:
             _log_block_once("a request in this batch sampled nothing; no drafts this step")
+            return [[] for _ in range(num_reqs)]
+        if isinstance(sampled, list) and len(sampled) < frames:
+            _log_block_once("a request stopped mid-step, short of its drafts; no drafts this step")
             return [[] for _ in range(num_reqs)]
     return [[CONTINUE_TOKEN_ID] * (frames - 1) for _ in range(num_reqs)]
 
