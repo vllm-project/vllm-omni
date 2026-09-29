@@ -240,6 +240,20 @@ class OmniPlatform(Platform):
         return None
 
     @classmethod
+    def init_ar_worker_runtime(
+        cls,
+        vllm_config: VllmConfig,
+        device: torch.device,
+    ) -> None:
+        """Initialize platform-specific runtime state for AR workers.
+
+        Invoked from the AR worker's ``init_device`` after device setup and
+        *before* model loading, so platform patches that swap model-class
+        methods are installed before any instance can call them.
+        """
+        return None
+
+    @classmethod
     def configure_diffusion_vllm_config(
         cls,
         vllm_config: Any,
