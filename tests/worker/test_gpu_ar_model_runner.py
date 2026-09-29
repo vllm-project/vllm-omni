@@ -504,7 +504,7 @@ def _make_async_output_runner(engine_output_type: str = "audio"):
     return runner
 
 
-def test_build_omni_output_uses_snapshots_and_connector_after_accumulation(monkeypatch):
+def test_build_omni_output_uses_snapshots_after_accumulation(monkeypatch):
     runner = _make_async_output_runner()
     events = []
 
@@ -519,10 +519,11 @@ def test_build_omni_output_uses_snapshots_and_connector_after_accumulation(monke
         "accumulate_full_payload_output",
         lambda self, rid, payload, request: events.append(f"accumulate:{rid}"),
     )
+    # The connector drain runs a TP collective and belongs to the caller's thread.
     monkeypatch.setattr(
         GPUARModelRunner,
         "get_omni_connector_output",
-        lambda self: events.append("connector") or "connector-output",
+        lambda self: pytest.fail("builder must not drain the connector"),
     )
 
     output = GPUARModelRunner._build_omni_model_runner_output_from_snapshot(
@@ -554,8 +555,7 @@ def test_build_omni_output_uses_snapshots_and_connector_after_accumulation(monke
     assert torch.equal(output.inter_stage_outputs[1]["hidden"], torch.tensor([[2.0], [3.0]]))
     assert output.multimodal_outputs is None
     assert output.kv_extracted_req_ids == ["r2"]
-    assert output.omni_connector_output == "connector-output"
-    assert events == ["accumulate:r1", "accumulate:r2", "connector"]
+    assert events == ["accumulate:r1", "accumulate:r2"]
 
 
 def test_build_omni_output_copies_hidden_for_partial_downstream_batch(monkeypatch):

@@ -337,6 +337,41 @@ supply `mtp_sampling_params` and `get_mtp_seed(sampling_params)` for model-local
 (with `mtp_sample_steps` and `mtp_sample_vocab_size`) as needed. Qwen3-TTS retains
 its existing `talker_mtp` entry point for V1.
 
+### Qwen3-TTS first-frame delivery and rollback
+
+The standard `qwen3_tts.yaml`, `qwen3_tts_high_concurrency.yaml`,
+`qwen3_tts_mrv2.yaml` and `qwen3_tts_high_concurrency_mrv2.yaml` profiles
+enable the `talker_first_audio` connector option, as does the experimental
+single-GPU profile. This changes the default CUDA MRV2 streaming path:
+residual prediction runs eagerly after the Talker sample, the Talker loads
+an additional first-frame decoder with its weights and CUDA graphs, and the
+orchestrator orders its audio before subsequent Code2Wav chunks.
+
+Code2Wav retains full-audio prefix graphs alongside the optional state-only
+graphs. Each request's delivery marker selects the graph and audio trimming;
+enabling the option alone never suppresses audio or disables prefix batching
+for requests that retain regular codec delivery.
+
+The path requires asynchronous chunks, TP/PP 1, an in-process executor and
+disabled prefix caching. Requests with reference codes and unsupported
+runners or platforms retain regular Code2Wav delivery.
+
+To restore regular codec delivery and avoid loading the Talker's additional
+decoder, use a deploy overlay with the relevant base profile:
+
+```yaml
+base_config: qwen3_tts.yaml
+connectors:
+  connector_of_shared_memory:
+    extra:
+      talker_first_audio: false
+```
+
+First-packet latency measures when PCM starts arriving. Time to first audible
+audio (TTFA) also includes any leading silence in the generated audio. An
+earlier first packet therefore does not necessarily improve TTFA; measure
+both for the intended voice and workload.
+
 ### Included performance work
 
 - Request snapshots have a fast path for immutable scalar leaves, including
@@ -372,14 +407,34 @@ speaker similarity before adopting either batching preset for a production
 workload. Floating-point decoder outputs can differ across batch sizes; this PR
 does not claim bitwise or quality equivalence.
 
-### Optional MPS deployment
+### Experimental MPS deployment
 
-NVIDIA MPS is an optional operator setting for colocated CUDA processes, not a
-YAML option or a library default. This PR does not establish a throughput or
-first-packet latency benefit from MPS. Measure the exact deployment with and
-without MPS before enabling it.
+NVIDIA MPS lets colocated CUDA stage processes share GPU execution resources.
+It is disabled by default. The experimental
+`qwen3_tts_high_concurrency_mrv2_single_gpu.yaml` profile sets `cuda_mps: true`,
+alongside cached residual prediction, fused sampling, time-major codec
+convolutions, first-frame delivery, and larger graph batches.
 
-Use only assigned GPUs and an independent MPS pipe directory. A private MPS
-server does not provide exclusive GPU ownership or MIG isolation. For a
-single-GPU deployment, explicitly place both stages on that GPU; the supplied
-high-concurrency profile places its two stages on different GPUs by default.
+The runtime requires `nvidia-cuda-mps-control` on `PATH` and one explicit CUDA
+GPU per local EngineCore stage, with `parallel_stage_init: false`.
+Use numeric GPU ordinals for stage placement and visibility so initialization
+locks identify the physical GPU before MPS remaps it. It starts a private MPS daemon for each selected
+GPU and stops its own daemon after the stages exit. If
+`CUDA_MPS_PIPE_DIRECTORY` already names an operator-managed daemon, the runtime
+reuses it without stopping it. Diffusion and remote stages are unsupported.
+Set `cuda_mps: false` in a deploy overlay to disable automatic MPS management.
+
+Stage `env.CUDA_MPS_PIPE_DIRECTORY` overrides the parent setting when selecting
+the daemon; an explicit empty string selects a private daemon. Stages sharing
+a GPU reuse the first stage's daemon. Later stages may omit the setting or
+explicitly match that policy; a conflicting explicit setting fails before
+that stage starts. The parent environment is unchanged.
+
+MPS can improve throughput under concurrent load while increasing first-packet
+or first-audible-audio latency, particularly at low request rates. For a
+latency-sensitive workload, compare the same profile with `cuda_mps: false`.
+An inherited operator-managed MPS daemon must also be disabled by its owner
+for that comparison; this switch only controls automatic MPS management.
+
+MPS does not reserve a GPU. Use only assigned GPUs, explicitly place stages on
+the intended GPU, and warm the complete pipeline before measuring performance.

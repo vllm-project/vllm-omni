@@ -256,6 +256,28 @@ def tiny_flux_kontext_builder() -> str:
     )
 
 
+def _shrink_sd3_transformer(config: dict) -> dict:
+    config["num_layers"] = 2
+    config["attention_head_dim"] = 32
+    config["num_attention_heads"] = 4
+    config["caption_projection_dim"] = 128
+    config["dual_attention_layers"] = [0]
+    return config
+
+
+def tiny_sd3_builder() -> str:
+    return build_tiny_from_configs(
+        "StableDiffusion3Pipeline",
+        "stabilityai/stable-diffusion-3.5-medium",
+        transform={
+            "text_encoder": _shrink_flux_clip_text_encoder,
+            "text_encoder_2": _shrink_flux_clip_text_encoder,
+            "text_encoder_3": _shrink_flux_t5_text_encoder,
+            "transformer": _shrink_sd3_transformer,
+        },
+    )
+
+
 def tiny_flux2_builder() -> str:
     def shrink_text_encoder(config: dict) -> dict:
         config["tie_word_embeddings"] = False
@@ -278,5 +300,71 @@ def tiny_flux2_builder() -> str:
         transform={
             "text_encoder": shrink_text_encoder,
             "transformer": partial(_shrink_dit_rope_config, num_single_layers=2, joint_attention_dim=96),
+        },
+    )
+
+
+def _shrink_krea2_text_encoder(config: dict) -> dict:
+    tc = config["text_config"]
+    old_head_dim = tc["head_dim"]
+    tc["num_hidden_layers"] = 3
+    tc["hidden_size"] = 32
+    tc["intermediate_size"] = 64
+    tc["num_attention_heads"] = 2
+    tc["num_key_value_heads"] = 2
+    tc["head_dim"] = 16
+    if "rope_parameters" in tc:
+        rp = tc["rope_parameters"]
+        if "mrope_section" in rp:
+            factor = old_head_dim / 16
+            rp["mrope_section"] = [max(1, round(d / factor)) for d in rp["mrope_section"]]
+    vc = config["vision_config"]
+    vc["depth"] = 2
+    vc["intermediate_size"] = 64
+    vc["num_heads"] = 2
+    vc["out_hidden_size"] = 32
+    if "deepstack_visual_indexes" in vc:
+        vc["deepstack_visual_indexes"] = [0, 1]
+    return config
+
+
+def _shrink_krea2_transformer(config: dict) -> dict:
+    config["num_layers"] = 2
+    config["attention_head_dim"] = 32
+    config["num_attention_heads"] = 4
+    config["num_key_value_heads"] = 2
+    config["intermediate_size"] = 128
+    config["timestep_embed_dim"] = 32
+    config["text_hidden_dim"] = 32
+    config["num_text_layers"] = 3
+    config["text_num_attention_heads"] = 2
+    config["text_num_key_value_heads"] = 2
+    config["text_intermediate_size"] = 64
+    config["num_layerwise_text_blocks"] = 1
+    config["num_refiner_text_blocks"] = 1
+    config["axes_dims_rope"] = [8, 12, 12]
+    return config
+
+
+def _shrink_krea2_vae(config: dict) -> dict:
+    config["base_dim"] = 32
+    return config
+
+
+def _patch_krea2_model_index(config: dict) -> dict:
+    config["text_encoder_select_layers"] = [0, 1, 2]
+    return config
+
+
+def tiny_krea2_builder() -> str:
+    """Build a tiny Krea2 model with random weights using diffusers building blocks."""
+    return build_tiny_from_configs(
+        "Krea2Pipeline",
+        "krea/Krea-2-Turbo",
+        transform={
+            None: _patch_krea2_model_index,
+            "text_encoder": _shrink_krea2_text_encoder,
+            "transformer": _shrink_krea2_transformer,
+            "vae": _shrink_krea2_vae,
         },
     )

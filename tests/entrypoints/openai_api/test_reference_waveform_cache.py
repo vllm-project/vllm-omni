@@ -4,6 +4,7 @@
 import numpy as np
 import pytest
 
+from vllm_omni.config.speech_cache import SpeechCacheConfig
 from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -12,7 +13,9 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 @pytest.fixture
 def server(monkeypatch, tmp_path):
     monkeypatch.setenv("SPEAKER_SAMPLES_DIR", str(tmp_path))
-    return OmniOpenAIServingSpeech.__new__(OmniOpenAIServingSpeech)
+    instance = OmniOpenAIServingSpeech.__new__(OmniOpenAIServingSpeech)
+    instance.speech_cache_config = SpeechCacheConfig()
+    return instance
 
 
 @pytest.mark.parametrize("stereo", [False, True])

@@ -217,6 +217,51 @@ def test_build_async_chunk_outputs_slices_padded_axis_and_splits_channels() -> N
     assert client is None and torch.equal(inter_stage[0]["codes.audio"], req_codes[0])
 
 
+@pytest.mark.parametrize("async_chunk", [False, True])
+@pytest.mark.parametrize(
+    "hidden_padded,codes_padded",
+    [(False, False), (True, False), (False, True), (True, True)],
+    ids=["unpadded", "hidden_padded", "codes_padded", "both_padded"],
+)
+@pytest.mark.parametrize("lengths", [(1, 1, 1), (3, 1, 1)], ids=["decode", "mixed_prefill_decode"])
+def test_async_output_slices_request_payloads_with_graph_padding(
+    monkeypatch, mocker, async_chunk, hidden_padded, codes_padded, lengths
+):
+    """Sync and async transfers must exclude other requests and graph padding."""
+    from vllm.v1.worker.gpu.input_batch import InputBatch
+
+    monkeypatch.setattr(torch.cuda, "set_stream", lambda _stream: None)
+    total = sum(lengths)
+    padded_total = 8 if hidden_padded or codes_padded else total
+    offsets = np.cumsum([0, *lengths])
+    hidden_rows = padded_total if hidden_padded else total
+    code_rows = padded_total if codes_padded else total
+    hidden = torch.arange(hidden_rows * 4, dtype=torch.float32).reshape(hidden_rows, 4)
+    codes = torch.arange(code_rows * 16).reshape(code_rows, 16)
+    # Reference frames are request-local, even if their length matches the
+    # padded token count. They must not be sliced along the batch token axis.
+    refs = [torch.arange(padded_total * 16).reshape(padded_total, 16), torch.empty(0), torch.empty(0)]
+    batch = mocker.Mock(spec=InputBatch)
+    batch.query_start_loc_np = offsets
+    batch.num_scheduled_tokens = np.array(lengths)
+    batch.num_reqs = len(lengths)
+    batch.num_tokens_after_padding = padded_total
+    output = _async_output(
+        req_ids=[f"req-{i}" for i in range(len(lengths))],
+        sampler_output=SamplerOutput(torch.ones(len(lengths), 1, dtype=torch.long), None, None, None),
+        text_hidden=hidden,
+        multimodal_outputs={"codes": {"audio": codes, "ref": refs}},
+        input_batch=batch,
+        async_chunk=async_chunk,
+    ).get_output()
+
+    for i, payload in enumerate(output.inter_stage_outputs):
+        torch.testing.assert_close(payload["codes.audio"], codes[offsets[i] : offsets[i + 1]])
+        torch.testing.assert_close(payload["codes.ref"], refs[i])
+        if not async_chunk:
+            torch.testing.assert_close(payload["hidden"], hidden[offsets[i] : offsets[i + 1]])
+
+
 def test_async_chunk_output_stages_mm_on_copy_stream_before_get_output(monkeypatch) -> None:
     monkeypatch.setattr(torch.cuda, "set_stream", lambda _stream: None)
     calls = []

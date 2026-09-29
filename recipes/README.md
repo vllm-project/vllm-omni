@@ -45,6 +45,7 @@ recipes/
 | [`Baidu/ERNIE-Image.md`](./Baidu/ERNIE-Image.md) | Text-to-image online serving (ERNIE-Image 8B) | 1x or 2x RTX 4090 24GB |
 | [`Bagel/BAGEL-7B-MoT.md`](./Bagel/BAGEL-7B-MoT.md) | Text-to-image with shared online/offline examples | 1x A100 80GB / 2x CUDA GPUs |
 | [`black-forest-labs/FLUX.1-schnell.md`](./black-forest-labs/FLUX.1-schnell.md) | Offline text-to-image generation with CPU offload | 1x NVIDIA GeForce RTX 5090 32GB |
+| [`black-forest-labs/FLUX.2-klein.md`](./black-forest-labs/FLUX.2-klein.md) | Offline image editing (FLUX.2-klein-4B) | 1x Intel Arc Pro B70 32GB |
 | [`Boogu/Boogu-Image.md`](./Boogu/Boogu-Image.md) | Text-to-image online serving (Boogu-Image-0.1-Base) | 1x A100/H100 40GB+ |
 | [`BosonAI/Higgs-Audio-V3-TTS.md`](./BosonAI/Higgs-Audio-V3-TTS.md) | Online + offline multilingual TTS with voice cloning | 1x H100 80GB |
 | [`BreezeBlue/Breeze-TTS-2.md`](./BreezeBlue/Breeze-TTS-2.md) | Online + offline TTS (plain / voice design / voice clone / voice direction, streaming PCM) | 1x NVIDIA L20 48GB |
@@ -62,9 +63,9 @@ recipes/
 | [`MiniMaxAI/MiniMax-H3.md`](./MiniMaxAI/MiniMax-H3.md) | T2VA, FL2VA, image+audio Ref2VA, and multi-video Ref2VA serving | 1x GPU with CPU offload / 4x B300 |
 | [`MiniMaxAI/MiniMax-H3-Spark-GB10.md`](./MiniMaxAI/MiniMax-H3-Spark-GB10.md) | MiniMax H3 T2VA and Ref2VA on DGX Spark | 1x or 2x DGX Spark (GB10) |
 | [`MiniMaxAI/MiniMax-H3-MUSA.md`](./MiniMaxAI/MiniMax-H3-MUSA.md) | MiniMax H3 T2VA, FL2VA, and Ref2VA on MUSA | 4x MTT S5000 (TP4 Ref2VA profile) |
-| [`krea/Krea-2.md`](./krea/Krea-2.md) | Text-to-image (Turbo + Raw), offline + online, with LoRA | 1x H100 80GB |
-| [`LTX/LTX-2.md`](./LTX/LTX-2.md) | LTX-2/LTX-2.3 text-to-video and image-to-video with synchronized audio | H200 141GB / 96GB-class GPU |
-| [`LTX/LTX-2.5.md`](./LTX/LTX-2.5.md) | LTX-2.5-Diffusers: Full/SFT one-stage and distilled two-stage T2V/I2V with synchronized audio | NVIDIA B300; cuDNN-qualified |
+| [`krea/Krea-2.md`](./krea/Krea-2.md) | Text-to-image (Turbo + Raw), offline + online, with LoRA | 1x H100 80GB / 1x Intel Arc Pro B70 32GB |
+| [`LTX/LTX-2.md`](./LTX/LTX-2.md) | LTX-2/LTX-2.3 text-to-video and image-to-video with synchronized audio | H200 141GB / 96GB-class GPU / 1x Intel Arc Pro B70 32GB |
+| [`LTX/LTX-2.5.md`](./LTX/LTX-2.5.md) | LTX-2.5-Diffusers: Full/SFT one-stage and distilled two-stage T2V/I2V with synchronized audio | NVIDIA B300; cuDNN-qualified / 1x Intel Arc Pro B70 32GB |
 | [`MammothModa2/MammothModa2.md`](./MammothModa2/MammothModa2.md) | Preview and Dev text-to-image (AR → DiT); Dev text/image understanding | Preview: 1x L40S 48GB / 1x ≥40GB GPU; Dev: 1x NVIDIA GPU with sufficient cache headroom |
 | [`NVIDIA/SANA-Video-2B.md`](./NVIDIA/SANA-Video-2B.md) | Native and Diffusers-adapter 480p/720p T2V+I2V | 1x RTX 5090 32GB |
 | [`meituan-longcat/LongCat-Video-Avatar-1.5.md`](./meituan-longcat/LongCat-Video-Avatar-1.5.md) | Audio-driven avatar video generation (AT2V / AI2V, single- and multi-speaker, AVC continuation) | 1x H100 80GB |
@@ -82,10 +83,10 @@ recipes/
 | [`NVIDIA/Nemotron-Labs-Audex.md`](./NVIDIA/Nemotron-Labs-Audex.md) | TTS / text-to-audio / audio understanding / cascaded S2S (Audex 2B + 30B-A3B) | 1x H100 80GB |
 | [`NVIDIA/NemotronLabs-VoiceChat.md`](./NVIDIA/NemotronLabs-VoiceChat.md) | Offline speech-to-speech voice chat (11B, frame-locked 12.5 Hz, 3-stage thinker/talker/code2wav) | 1x H100 80GB |
 | [`NVIDIA/SANA-WM.md`](./NVIDIA/SANA-WM.md) | First-frame image-to-video serving with camera control | 1x 24GB+ CUDA GPU; ~40GB disk |
-| [`Qwen/Qwen-Image.md`](./Qwen/Qwen-Image.md) | Text-to-image serving with step-wise continuous batching replay and ModelOpt mixed FP8/NVFP4 | 1x A100 80GB / 2x B200 |
+| [`Qwen/Qwen-Image.md`](./Qwen/Qwen-Image.md) | Text-to-image serving with step-wise continuous batching replay and ModelOpt mixed FP8/NVFP4; offline text-to-image on XPU | 1x A100 80GB / 2x B200 / 1x Intel Arc Pro B70 32GB |
 | [`Qwen/Qwen-Image-2512.md`](./Qwen/Qwen-Image-2512.md) | Text-to-image serving with step-wise continuous batching replay and ModelOpt FP8 / mixed FP8/NVFP4 | 1x A800 80GB / 2x B200 |
 | [`Qwen/Qwen-Image-Edit.md`](./Qwen/Qwen-Image-Edit.md) | Text-guided single-image editing | 1x or 2x H200 141GB |
-| [`Qwen/Qwen3-Omni.md`](./Qwen/Qwen3-Omni.md) | Online serving for multimodal chat | 1x A100 80GB |
+| [`Qwen/Qwen3-Omni.md`](./Qwen/Qwen3-Omni.md) | Online serving for multimodal chat; offline end-to-end text-to-speech on XPU | 1x A100 80GB / 5x Intel Arc Pro B70 32GB |
 | [`Qwen/Qwen3-TTS.md`](./Qwen/Qwen3-TTS.md) | Text-to-speech serving (CustomVoice / VoiceDesign / Base) | 1x H100/A100 80GB / 1x AMD MI300X |
 | [`SenseNova/SenseNova-U1.md`](./SenseNova/SenseNova-U1.md) | Unified image generation and understanding | 1x or 2x H200 / 1x AMD MI300X |
 | [`SenseNova/SenseNova-U1.5.md`](./SenseNova/SenseNova-U1.5.md) | Unified image generation and understanding, with an 8-step distilled LoRA | 1x A800 80GB |
@@ -93,13 +94,15 @@ recipes/
 | [`Tencent/AuK-H100.md`](./Tencent/AuK-H100.md) | Offline instruction-driven TTS, speech editing, enhancement and separation (AuK base and Flash) | 1x H100 80GB |
 | [`Tencent/Covo-Audio-Chat.md`](./Tencent/Covo-Audio-Chat.md) | Online serving for audio chat | 1x A100 80GB |
 | [`Tencent/HunyuanImage-3.0-Instruct.md`](./Tencent/HunyuanImage-3.0-Instruct.md) | DiT-only text-to-image serving and benchmark, including ModelOpt mixed FP8/NVFP4 | 4x H100/H800 80GB / 2x B200 |
-| [`Wan-AI/Wan2.2-T2V.md`](./Wan-AI/Wan2.2-T2V.md) | Text-to-video serving (Wan2.2 14B) with Skip-Softmax sparse attention | 1x datacenter Blackwell (B200/B300) |
+| [`Tencent/HunyuanVideo-1.5.md`](./Tencent/HunyuanVideo-1.5.md) | Offline text-to-video (HunyuanVideo-1.5 Diffusers) | 1x Intel Arc Pro B70 32GB |
+| [`Tongyi-MAI/Z-Image-Turbo.md`](./Tongyi-MAI/Z-Image-Turbo.md) | Offline few-step text-to-image (Z-Image-Turbo) | 1x Intel Arc Pro B70 32GB |
+| [`Wan-AI/Wan2.2-T2V.md`](./Wan-AI/Wan2.2-T2V.md) | Text-to-video serving (Wan2.2 14B) with Skip-Softmax sparse attention | 8x H20/H100/A100 / 1x datacenter Blackwell (B200/B300) / 1x Intel Arc Pro B70 32GB |
 | [`Wan-AI/Wan2.2-TI2V-5B-A100.md`](./Wan-AI/Wan2.2-TI2V-5B-A100.md) | Unified 720p text-to-video and image-to-video serving (Wan2.2 5B) | 1x A100-SXM4-80GB |
 | [`Wan-AI/Wan2.2-I2V.md`](./Wan-AI/Wan2.2-I2V.md) | Image-to-video serving (Wan2.2 14B) | 8x Ascend NPU (A2/A3) |
 | [`Wan-AI/Wan2.2-S2V.md`](./Wan-AI/Wan2.2-S2V.md) | Speech-to-video serving (Wan2.2 14B) | 2x A100/H100 80GB |
 | [`Wan-AI/Wan2.1-VACE.md`](./Wan-AI/Wan2.1-VACE.md) | Unified T2V, I2V, V2LF, FLF2V, inpaint, and R2V | 1x RTX 5090 (1.3B) / 1x L40S 48GB with layerwise offload (14B) |
 | [`XiaomiMiMo/MiMo-Audio.md`](./XiaomiMiMo/MiMo-Audio.md) | Offline + online omni audio (TTS, ASR, dialogue) | 1x RTX 5090 / 5090D 32GB |
-| [`StabilityAI/Stable-Diffusion-3.5.md`](./StabilityAI/Stable-Diffusion-3.5.md) | Text-to-image serving (SD 3.5-medium and SD 3.5-large) | 1x RTX A6000 48GB |
+| [`StabilityAI/Stable-Diffusion-3.5.md`](./StabilityAI/Stable-Diffusion-3.5.md) | Text-to-image serving (SD 3.5-medium and SD 3.5-large) | 1x RTX A6000 48GB / 1x Intel Arc Pro B70 32GB |
 | [`zai-org/GLM-TTS.md`](./zai-org/GLM-TTS.md) | Online serving for Chinese/English zero-shot voice-cloned TTS | 1x A40 48GB / 2x non-standard RTX 4090 48GB (49,140 MiB each) |
 | [`GLM/GLM-Image.md`](./GLM/GLM-Image.md) | Online serving for image generation | 1x A800 80GB / 2x A800 80GB |
 | [`JD/JoyAI-VL-Interaction.md`](./JD/JoyAI-VL-Interaction.md) | Real-time streaming video-language interaction (proactive speak/silence/delegate) | 1x GPU 24GB+ |

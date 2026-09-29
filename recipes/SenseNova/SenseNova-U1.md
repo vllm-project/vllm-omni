@@ -34,6 +34,126 @@ text-to-text chat.
 - HuggingFace model page:
   [SenseNova/SenseNova-U1-8B-MoT](https://huggingface.co/SenseNova/SenseNova-U1-8B-MoT)
 
+## A3B (MoE) variant
+
+[sensenova/SenseNova-U1-A3B-MoT](https://huggingface.co/sensenova/SenseNova-U1-A3B-MoT)
+runs on this same recipe and the same `SenseNovaU1Pipeline` — the checkpoint keeps
+`model_type: neo_chat`, so it resolves without `--model-class-name`. Only the `--model`
+id changes.
+
+The backbone is Qwen3-MoE instead of dense Qwen3, and both MoT branches are sparse:
+`mlp` routes over 128 experts and `mlp_mot_gen` over 32, top-8 each, with per-expert
+width `moe_intermediate_size=768`. `SenseNovaU1Config` picks `SenseNovaU1MoELLMConfig`
+whenever `llm_config` carries `num_experts`, so the dense 8B path is untouched. The
+gen-path knobs (`gen_num_experts`, `gen_num_experts_per_tok`, `gen_moe_intermediate_size`)
+fall back to their understanding-path counterparts when absent.
+
+Experts run through vLLM's `FusedMoE`, whose `moe_forward` op resolves its layer through
+`vllm.forward_context` rather than the diffusion runner's own context, so
+`SenseNovaU1ForCausalLM.forward` enters that context when the model has MoE layers.
+
+### Memory
+
+The weights dominate, and every expert stays resident even though only the top-8 of each
+tower run per token -- the "A3B" in the name is the ~4B activated, not the 38.7B stored.
+Counted from the checkpoint's safetensors headers:
+
+| Component | Params | BF16 |
+| --- | --- | --- |
+| Understanding-path experts (128/layer) | 28.99 B | 54.0 GiB |
+| Generation-path experts (32/layer) | 7.25 B | 13.5 GiB |
+| Attention (dual tower) | 1.81 B | 3.4 GiB |
+| Embedding + LM head | 0.62 B | 1.2 GiB |
+| Routers, norms, vision and flow-matching heads | 0.06 B | 0.1 GiB |
+| Total | 38.74 B | 72.2 GiB |
+
+At 1024x1024 the 72.9 GiB peak is those 72.2 GiB of weights plus about 0.7 GiB of
+activations and workspace. The 2048x2048 edit, the largest activation case below, peaks at
+74.6 GiB, 2.4 GiB above the weights. Text-to-image only routes through the generation tower,
+leaving the 54 GiB of understanding-path experts idle; that tower is reached by the text
+prefix, think mode, `img2text` and `text2text`. One 96 GB card fits TP=1, and TP=2 halves
+the per-GPU footprint.
+
+### Measured (1x H20 96GB, BF16)
+
+Fixed case used for the stage split and the torch.profiler kernel table:
+
+- Prompt: `Close portrait of an elderly woman by a farmhouse window, warm natural light.`
+- 1024x1024, 50 Euler steps, think off, seed 42, `cfg_scale` 4.0, `cfg_norm` none,
+  `timestep_shift` 3.0, `t_eps` 0.02
+- Python 3.12, vLLM 0.30.0, torch 2.13.0+cu130
+- Peak GPU memory is the reserved high-water mark the runner records (`peak_memory_mb`)
+
+| | Time | Memory |
+| --- | --- | --- |
+| Weights after load | ~13 s | 72.2 GiB |
+| Pipeline `forward` | 7.68 s | 72.9 GiB peak |
+
+`--enable-diffusion-pipeline-profiler` on that request:
+
+| Stage | Time | Share |
+| --- | --- | --- |
+| Text prefix (`_t2i_prefix_forward`, understanding tower) | 0.06 s | 0.7% |
+| Denoising loop (`_run_denoising_loop`, generation tower, 50 steps) | 7.56 s | 98.5% |
+| Pipeline `forward` | 7.68 s | 100% |
+
+There is no VAE. The loop ends in unpatchify / denorm / PIL, which is inside the denoise
+row and is a few tens of milliseconds at 1024x1024.
+
+A warm 8-step generate at the same resolution, wrapped in `torch.profiler` after one
+unprofiled warmup request, spent 1.19 s of self-CUDA time as:
+
+| Kernel family | Self CUDA | Share | What it is |
+| --- | --- | --- | --- |
+| `fused_moe_kernel` | 576 ms | 48% | top-8 expert GEMMs on the 32-expert generation tower |
+| FlashAttention `flash_fwd_kernel` | 222 ms | 19% | dual-tower attention |
+| `nvjet` GEMMs | ~233 ms | 20% | `qkv_proj` / `o_proj` (and the small dense leftovers) |
+| `qk_norm_rope_kernel` | 58 ms | 5% | fused RMSNorm + RoPE |
+| MoE routing / `act_and_mul` / elementwise | ~40 ms | 3% | top-k, SwiGLU, residual |
+
+So a denoise step is about half FusedMoE and about two-fifths attention + dense GEMM.
+`--cfg-parallel-size 2` on the same 8-step t2i request (2-branch `cond`+`uncond`)
+is 0.95 s vs 1.48 s on one GPU (~1.56x). Img2img CFG-P=2 also completes for both
+branch counts at 8-step 1024x1024: 2-way (`img_cfg_scale=1`, `cond`+`img_cond`)
+1.09 s; 3-way (`cfg_scale=4`, `img_cfg_scale=2`, `cond`+`img_cond`+`uncond`)
+1.74 s (3 branches on 2 ranks dispatch as `[[0, 2], [1]]`). Cache-DiT and
+layerwise CPU offload do not take effect on A3B; see
+[diffusion features](../../docs/user_guide/diffusion_features.md) note 8.
+
+Other configurations on the same machine (second run, warm kernels):
+
+| Case | Total | Peak GPU memory |
+| --- | --- | --- |
+| text2img 1024x1024, 50 steps, think on | 9.16 s | 73.0 GiB |
+| text2img 1024x1024, 50 steps, think off, TP=2 | 5.64 s | 36.7 GiB per GPU |
+| img2img 2048x2048 output, 25 steps, think off | 20.93 s | 74.6 GiB |
+
+Think-on spends 1.37 s in `_generate_think` (215 tokens). At the same seed TP=2 differs
+from TP=1 only numerically (MAE 2.97/255, identical composition) from the changed
+reduction order.
+
+```bash
+python examples/offline_inference/text_to_image/text_to_image.py \
+    --model sensenova/SenseNova-U1-A3B-MoT \
+    --prompt "Close portrait of an elderly woman by a farmhouse window, warm natural light." \
+    --width 1024 --height 1024 \
+    --seed 42 --num-inference-steps 50 --cfg-scale 4.0 \
+    --extra-body '{"think": false, "cfg_norm": "none", "timestep_shift": 3.0, "t_eps": 0.02}' \
+    --output sensenova_a3b_t2i.png
+```
+
+`img2text` and `text2text` go through the server, as for the dense checkpoint:
+
+```bash
+vllm serve sensenova/SenseNova-U1-A3B-MoT --omni --port 8091
+
+python examples/online_serving/sensenova_u1/openai_chat_client.py \
+    -s http://127.0.0.1:8091 -m img2text -i input.png -p "Describe this image."
+```
+
+All four modalities were verified on A3B: text2img (with and without think), img2img
+editing, img2text and text2text.
+
 ## Hardware Support
 
 ## GPU

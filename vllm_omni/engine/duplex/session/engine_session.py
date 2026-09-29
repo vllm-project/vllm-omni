@@ -280,9 +280,9 @@ class DuplexEngineSession:
         self._validate_fence(self.fence)
         self.lease.detach(self._clock())
 
-    def resume_lease(self, *, expected_lease_generation: int) -> int:
+    def resume_lease(self, *, expected_lease_generation: int, control_id: str | None = None) -> int:
         self._validate_fence(self.fence)
-        return self.lease.resume(self._clock(), expected_generation=expected_lease_generation)
+        return self.lease.resume(self._clock(), expected_generation=expected_lease_generation, control_id=control_id)
 
     def begin_lease_operation(self, fence: DuplexFence, operation_id: str) -> None:
         self._validate_fence(fence)

@@ -7,10 +7,12 @@ from unittest.mock import Mock
 
 import pytest
 import torch
+from vllm.utils.torch_utils import weak_ref_tensors
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
 from vllm.v1.cudagraph_dispatcher import CUDAGraphMode
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
+from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
 from vllm_omni.worker.gpu_model_runner import (
     OmniGPUModelRunner,
@@ -19,6 +21,44 @@ from vllm_omni.worker.gpu_model_runner import (
 from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+def test_model_forward_preserves_omni_payload_after_graph_weak_ref(monkeypatch):
+    hidden = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+    payload = {
+        "latent": hidden,
+        "latent_input_ids": torch.tensor([[21], [22]]),
+        "latent_positions": torch.tensor([[10], [11]]),
+    }
+    original = OmniOutput(text_hidden_states=hidden, multimodal_outputs=payload)
+    # CUDAGraphWrapper weak-references its outputs both at capture and replay.
+    # vLLM converts NamedTuple outputs into plain tuples along this path.
+    # Only the CUDA storage-alias primitive is replaced for this CPU test;
+    # the upstream container conversion is exercised unchanged.
+    monkeypatch.setattr("vllm.utils.torch_utils.weak_ref_tensor", lambda value: value)
+    replay = weak_ref_tensors(original)
+    runner = object.__new__(OmniGPUModelRunner)
+    runner.model = SimpleNamespace(have_multimodal_outputs=True)
+    runner._build_model_kwargs_extra = lambda: {}
+    monkeypatch.setattr(GPUModelRunner, "_model_forward", lambda *_args, **_kwargs: replay)
+
+    output = runner._model_forward()
+    output_hidden, output_payload = runner.extract_multimodal_outputs(output)
+
+    assert isinstance(output, OmniOutput)
+    torch.testing.assert_close(output_hidden, hidden)
+    assert output_payload is payload
+
+
+def test_model_forward_keeps_auxiliary_hidden_tuple(monkeypatch):
+    hidden = torch.ones(2, 4)
+    auxiliary = (hidden, hidden.clone(), None, None)
+    runner = object.__new__(OmniGPUModelRunner)
+    runner.model = SimpleNamespace(have_multimodal_outputs=True)
+    runner._build_model_kwargs_extra = lambda: {}
+    monkeypatch.setattr(GPUModelRunner, "_model_forward", lambda *_args, **_kwargs: auxiliary)
+
+    assert runner._model_forward() is auxiliary
 
 
 def _runner_for_talker_graph_init(

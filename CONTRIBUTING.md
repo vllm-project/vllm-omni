@@ -11,3 +11,5 @@ how to extend allowlists) are documented in the
 section of that guide.
 
 Before submitting a PR, run the [precheck-pr skill](https://github.com/vllm-project/vllm-omni/blob/main/.claude/skills/precheck-pr/SKILL.md) with the code agent for a self-check against project conventions.
+
+vLLM-Omni limits contributors without write access to **5 open PRs**; see the [Pull Request Limit](docs/contributing/README.md#pull-request-limit) section of the contributing guide.

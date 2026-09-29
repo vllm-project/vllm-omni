@@ -60,11 +60,7 @@ steps:
     depends_on: upload-merge-pipeline
     steps:
       - label: "Entrypoint Test with H100"
-        # TEMPORARY 60 -> 90: engine startup/sleep-wake is ~13-15 min slower per
-        # run on the vLLM 0.26 image (model loading ~2x, init ~2x; see builds
-        # 2915 vs 2916), which pushed this suite past 60 min. Revert once the
-        # 0.26 startup regression is understood and fixed.
-        timeout_in_minutes: 90
+        timeout_in_minutes: 60
         commands:
           # Turn-based server VAD over /v1/realtime is deferred to RFC #7181 PR 5
           # (see the P0 thread on #7413); the test stays in the tree and runs again there.
@@ -73,9 +69,24 @@ steps:
 
       - label: "Entrypoint Test with L4"
         timeout_in_minutes: 60
+        # Workaround https://github.com/vllm-project/vllm-omni/issues/8016: shutdown()
+        # leaves inline UniProc DiffusionWorker VRAM mapped in the pytest parent.
+        # This job does not collect the ready leftover
+        # (test_diffusion_generate_request_id, core_model); isolate the
+        # advanced_model DiT handshake instead. Revert to a single sweep after
+        # the product shutdown fix.
         commands:
-          - pytest -s -v tests/entrypoints/ -m "advanced_model and cuda and L4" --run-level "advanced_model"
+          - |
+            set -eu
+            pytest -s -v tests/entrypoints/test_omni_sleep_mode.py::TestOmniDiffusionSleepMode::test_diffusion_sleep_handshake -m "advanced_model and cuda and L4 and cards_1" --run-level "advanced_model"
+            pytest -s -v tests/entrypoints/ -m "advanced_model and cuda and L4 and cards_1" --run-level "advanced_model" --deselect tests/entrypoints/test_omni_sleep_mode.py::TestOmniDiffusionSleepMode::test_diffusion_sleep_handshake
         mirror_hardwares: l4_1
+
+      - label: "Entrypoint Test with L4 · 2-GPU"
+        timeout_in_minutes: 60
+        commands:
+          - pytest -s -v tests/entrypoints/ -m "advanced_model and cuda and L4 and cards_2" --run-level "advanced_model"
+        mirror_hardwares: l4_2
 
   - group: ":card_index_dividers: E2E Test"
     depends_on: upload-merge-pipeline

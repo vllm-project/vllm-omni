@@ -151,3 +151,23 @@ class TestSingleton:
         a = get_speaker_cache()
         b = get_speaker_cache()
         assert a is b
+
+
+class TestSpeakerCacheConfiguration:
+    def test_conflicting_singleton_budget(self, monkeypatch):
+        import vllm_omni.utils.speaker_cache as module
+
+        monkeypatch.setattr(module, "_SINGLETON", None)
+        cache = get_speaker_cache(max_bytes=8)
+        assert get_speaker_cache() is cache
+        assert get_speaker_cache(max_bytes=8) is cache
+        with pytest.raises(
+            ValueError,
+            match=r"speech_cache\.speaker_max_bytes: .*initialized with 8 bytes, .*requested budget is 16 bytes",
+        ):
+            get_speaker_cache(max_bytes=16)
+
+    def test_zero_budget_disables_metadata_storage(self):
+        cache = SpeakerEmbeddingCache(max_bytes=0)
+        cache.put(_k("m", "a"), {"name": "a"})
+        assert cache.get(_k("m", "a")) is None

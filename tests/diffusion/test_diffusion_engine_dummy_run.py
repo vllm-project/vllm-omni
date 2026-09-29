@@ -149,6 +149,24 @@ def test_dense_mode_does_not_build_kv_profile_request() -> None:
     engine._make_dummy_request.assert_not_called()
 
 
+def test_explicit_profile_frames_preserve_warmup_skip(monkeypatch):
+    engine = object.__new__(DiffusionEngine)
+    engine.od_config = OmniDiffusionConfig.__new__(OmniDiffusionConfig)
+    engine.od_config.model_class_name = "HunyuanImage3ForCausalMM"
+    monkeypatch.setattr("vllm_omni.diffusion.diffusion_engine.supports_multimodal_input", lambda _: (True, False))
+    monkeypatch.setattr("vllm_omni.diffusion.diffusion_engine.image_color_format", lambda _: "RGB")
+    monkeypatch.setattr("vllm_omni.diffusion.diffusion_engine.get_dummy_run_num_frames", lambda *_: 0)
+    kwargs = dict(height=1024, width=1024, guidance_scale=5.0, num_image_inputs=3)
+
+    assert engine._make_dummy_request(**kwargs) is None
+    request = engine._make_dummy_request(**kwargs, num_frames=1)
+
+    assert request is not None
+    assert request.sampling_params.num_frames == 1
+    assert request.sampling_params.num_inference_steps == 1
+    assert len(request.prompt["multi_modal_data"]["image"]) == 3
+
+
 @pytest.mark.parametrize(
     ("execution_mode", "uses_dlo_dp", "max_num_seqs", "expected_profile_requests"),
     [

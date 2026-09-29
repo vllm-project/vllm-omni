@@ -920,23 +920,37 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 if self.log_stats:
                     session.record_event(EngineCoreEventType.QUEUED)
                 return
-        if stage_id == 0 and self._prepare_minicpmo45_stage0_window(
-            session,
-            update,
-            segment_output_ids=segment_output_ids,
-            completed_terminator=completed_terminator,
-        ):
-            # The rebuilt prompt is bounded by the client's window settings,
-            # not by the model (a camera unit is hundreds of tokens), so it
-            # needs the same max_model_len check as a plain extension. The
-            # plan replaces the whole prompt, so the replacement length is the
-            # projection, not the session's current prompt plus an extension.
-            plan = update.model_intermediate_buffer["duplex"]["stage0_window"]
-            if self._streaming_update_overflows(session, update, projected_len=plan["replacement_prompt_len"]):
+        if stage_id == 0:
+            from vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_kv import (
+                MiniCPMO45DuplexSchedulerHelper,
+            )
+
+            reanchored = False
+            if MiniCPMO45DuplexSchedulerHelper.find_duplex_window_manager(self) is not None:
+                plan = self._maybe_reanchor_streaming_window(
+                    session,
+                    update,
+                    segment_output_ids=segment_output_ids,
+                    completed_terminator=completed_terminator,
+                )
+                reanchored = plan is not None
+            if not reanchored and self._prepare_minicpmo45_stage0_window(
+                session,
+                update,
+                segment_output_ids=segment_output_ids,
+                completed_terminator=completed_terminator,
+            ):
+                # The rebuilt prompt is bounded by the client's window settings,
+                # not by the model (a camera unit is hundreds of tokens), so it
+                # needs the same max_model_len check as a plain extension. The
+                # plan replaces the whole prompt, so the replacement length is the
+                # projection, not the session's current prompt plus an extension.
+                plan = update.model_intermediate_buffer["duplex"]["stage0_window"]
+                if self._streaming_update_overflows(session, update, projected_len=plan["replacement_prompt_len"]):
+                    return
+                self._release_replaced_streaming_prompt_cache(session)
+                self._replace_streaming_session(session, update)
                 return
-            self._release_replaced_streaming_prompt_cache(session)
-            self._replace_streaming_session(session, update)
-            return
         streaming_prompt_payload = next(
             (
                 info
@@ -1007,6 +1021,43 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         super()._update_request_as_session(session, update)
         if hasattr(update, "model_intermediate_buffer"):
             session.model_intermediate_buffer = update.model_intermediate_buffer
+
+    def _maybe_reanchor_streaming_window(
+        self,
+        session: Request,
+        update: StreamingUpdate,
+        *,
+        segment_output_ids: list[int] | None = None,
+        completed_terminator: int | None = None,
+    ) -> Any:
+        """Lifecycle hook to evaluate and apply duplex streaming window compaction."""
+        from vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_kv import (
+            MiniCPMO45DuplexSchedulerHelper,
+        )
+
+        return MiniCPMO45DuplexSchedulerHelper.apply_session_window(
+            self,
+            session,
+            update,
+            segment_output_ids=segment_output_ids,
+            completed_terminator=completed_terminator,
+        )
+
+    def _maybe_reanchor_minicpmo45_stage0_window(
+        self,
+        session: Request,
+        update: StreamingUpdate,
+        *,
+        segment_output_ids: list[int] | None = None,
+        completed_terminator: int | None = None,
+    ) -> Any:
+        """Backward-compatible alias for _maybe_reanchor_streaming_window."""
+        return self._maybe_reanchor_streaming_window(
+            session,
+            update,
+            segment_output_ids=segment_output_ids,
+            completed_terminator=completed_terminator,
+        )
 
     @staticmethod
     def _prepare_minicpmo45_stage0_window(

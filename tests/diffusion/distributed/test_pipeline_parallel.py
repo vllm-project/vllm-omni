@@ -15,11 +15,11 @@ import pytest
 import torch
 from vllm.model_executor.models.utils import PPMissingLayer, make_empty_intermediate_tensors_factory, make_layers
 from vllm.sequence import IntermediateTensors
+from vllm.utils.network_utils import get_file_store_init_method
 from vllm.v1.worker.gpu_worker import AsyncIntermediateTensors
 
 import vllm_omni.diffusion.distributed.pipeline_parallel as pp_module
 from tests.helpers.mark import hardware_marks
-from tests.helpers.runtime import get_distributed_init_method
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.parallel_state import (
     destroy_distributed_env,
@@ -520,7 +520,7 @@ def _run_isend_irecv(pp_size: int, device_kind: DeviceKind, init_method: str) ->
 @pytest.mark.parametrize("pp_size", [2])
 def test_isend_irecv_tensor_dict(pp_size: int):
     """isend_tensor_dict / irecv_tensor_dict transfer a tensor dict without loss."""
-    _run_isend_irecv(pp_size, device_kind="cpu", init_method=get_distributed_init_method())
+    _run_isend_irecv(pp_size, device_kind="cpu", init_method=get_file_store_init_method())
 
 
 @pytest.mark.full_model
@@ -529,7 +529,7 @@ def test_isend_irecv_tensor_dict(pp_size: int):
 @pytest.mark.parametrize("pp_size", [pytest.param(2, marks=_L4_TWO_GPU)])
 def test_isend_irecv_tensor_dict_parity(pp_size: int):
     """Nightly: isend/irecv on real multi-GPU NCCL."""
-    _run_isend_irecv(pp_size, device_kind="cuda", init_method=get_distributed_init_method())
+    _run_isend_irecv(pp_size, device_kind="cuda", init_method=get_file_store_init_method())
 
 
 # ---------------------------------------------------------------------------
@@ -560,7 +560,7 @@ def compute_single_gpu_baseline(
     if key in _baseline_cache:
         return _baseline_cache[key]
 
-    device = init_dist(0, 1, get_distributed_init_method(), device_kind)
+    device = init_dist(0, 1, get_file_store_init_method(), device_kind)
     try:
         initialize_model_parallel(pipeline_parallel_size=1, backend=_mp_backend(device_kind))
 
@@ -768,7 +768,7 @@ def test_predict_noise(pp_size, cfg_size, do_true_cfg, num_layers, input_seed, r
         rtol=rtol,
         atol=atol,
         device_kind="cpu",
-        init_method=get_distributed_init_method(),
+        init_method=get_file_store_init_method(),
     )
 
 
@@ -791,7 +791,7 @@ def test_predict_noise_parity(pp_size, cfg_size, do_true_cfg, dtype, num_layers,
         rtol=rtol,
         atol=atol,
         device_kind="cuda",
-        init_method=get_distributed_init_method(),
+        init_method=get_file_store_init_method(),
     )
 
 
@@ -806,7 +806,7 @@ def compute_scheduler_step_baseline(
     device_kind: DeviceKind,
 ) -> torch.Tensor:
     """Single-process reference: predict_noise + scheduler_step."""
-    device = init_dist(0, 1, get_distributed_init_method(), device_kind)
+    device = init_dist(0, 1, get_file_store_init_method(), device_kind)
     try:
         initialize_model_parallel(pipeline_parallel_size=1, backend=_mp_backend(device_kind))
 
@@ -939,7 +939,7 @@ def test_scheduler_step(pp_size, cfg_size, do_true_cfg, input_seed):
         do_true_cfg=do_true_cfg,
         input_seed=input_seed,
         device_kind="cpu",
-        init_method=get_distributed_init_method(),
+        init_method=get_file_store_init_method(),
     )
 
 
@@ -961,5 +961,5 @@ def test_scheduler_step_parity(pp_size, cfg_size, do_true_cfg, input_seed):
         do_true_cfg=do_true_cfg,
         input_seed=input_seed,
         device_kind="cuda",
-        init_method=get_distributed_init_method(),
+        init_method=get_file_store_init_method(),
     )

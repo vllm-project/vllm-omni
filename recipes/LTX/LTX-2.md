@@ -165,6 +165,63 @@ curl -X POST http://localhost:8000/v1/videos/sync \
 Use `image_reference` for a URL or JSON-safe image reference. Do not provide it
 together with `input_reference`.
 
+## Hardware Support
+
+## XPU
+
+### 1x Intel Arc Pro B70 (32 GB)
+
+Offline one-stage T2V at 768x512, 17 frames. FP8 with layerwise offload streams
+both the transformer and the Gemma text encoder, which otherwise stays resident
+beside it.
+
+#### Environment
+
+- OS: Linux
+- Python: 3.10+
+- torch: 2.14.0+xpu
+- vLLM: 0.29.0
+- vLLM-Omni: `main` at `d8d162d8`
+
+#### Command
+
+```bash
+python examples/offline_inference/text_to_video/text_to_video.py \
+  --model diffusers/LTX-2.3-Diffusers \
+  --prompt "A serene lakeside sunrise with mist over the water." \
+  --num-frames 17 \
+  --quantization fp8 \
+  --enable-layerwise-offload \
+  --vae-use-tiling \
+  --vae-use-slicing \
+  --enforce-eager \
+  --output ltx23_output.mp4
+```
+
+The same flags cover every one-stage checkpoint; only `--model` changes. The
+distilled checkpoints additionally need their class and an explicit size,
+because their preset defaults to 1536x1024:
+
+```bash
+  --model diffusers/LTX-2.3-Distilled-Diffusers \
+  --model-class-name LTX2DistilledOneStagePipeline \
+  --height 512 --width 768
+```
+
+| Checkpoint | Peak | Time |
+| --- | ---: | ---: |
+| `Lightricks/LTX-2` | 14.8 GiB | 160 s |
+| `diffusers/LTX-2.3-Diffusers` | 16.4 GiB | 167 s |
+| `dg845/LTX-2.3-Diffusers` | 16.4 GiB | 155 s |
+| `diffusers/LTX-2.3-Distilled-Diffusers` | 14.9 GiB | 128 s |
+
+#### Verification
+
+Each command writes its `--output` MP4. Confirm it decodes and that the sampled
+frames match the prompt.
+
+
+
 ## Guidance
 
 One-stage and ordinary Stage 1 support independent video/audio CFG,

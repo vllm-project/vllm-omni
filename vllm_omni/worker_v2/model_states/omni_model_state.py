@@ -32,6 +32,7 @@ from vllm.v1.worker.gpu.states import RequestState
 
 from vllm_omni.model_executor.models.output_templates import OmniOutput, OwnedBatchTensor
 from vllm_omni.platforms import current_omni_platform
+from vllm_omni.worker_v2.model_states.eager_mtp import EagerMTPState
 from vllm_omni.worker_v2.model_states.intermediate_buffer import (
     OmniIntermediateBuffer,
 )
@@ -84,6 +85,14 @@ class OmniModelState(DefaultModelState):
 
     Model-owned preprocess and postprocess hooks supply stage-specific behavior.
     """
+
+    # Eager-frame defaults for states built without __init__ (tests, adapters).
+    _eager_mtp = False
+    _eager_fastpath = False
+    _eager_rows: tuple[InputBatch, list[tuple[int, int, str, bool]], torch.Tensor] | None = None
+    _first_audio_stream: torch.cuda.Stream | None = None
+    # Set by the stage engine process when it can take one-request outputs directly.
+    _first_audio_sender: Any = None
 
     def __init__(
         self,
@@ -167,6 +176,40 @@ class OmniModelState(DefaultModelState):
                     device=device,
                 )
             self._mtp_runner = self._init_mtp_runner(model)
+        # Eager frames: finish MTP in the step that sampled CB0 (see
+        # run_eager_mtp). The next step only adds its text-step embedding.
+        self._eager_mtp = self._mtp_input_ids is not None and bool(getattr(model, "mtp_eager_frames", False))
+        self._eager_rows = None
+        self._eager_state = EagerMTPState(self)
+        self._eager_embeds: torch.Tensor | None = None
+        self._eager_ready: dict[int, str] = {}
+        self._first_audio_requests: set[str] = set()
+        # Slots whose decode preprocess no longer changes state (see
+        # model.eager_decode_settled); they skip the per-row path.
+        self._eager_settled: dict[int, str] = {}
+        self._eager_fastpath = self._eager_mtp
+        if self._eager_mtp:
+            self._eager_embeds = torch.zeros((max_num_reqs, self._embed_dim), dtype=self.dtype, device=device)
+            # The model then leaves frame codes/validity and the decode MTP
+            # inputs to run_eager_mtp instead of building them per row.
+            model.eager_frames_active = True
+            logger.info("Eager Talker-MTP frames enabled")
+
+    def set_first_audio_sink(self, sink: Any) -> None:
+        self._eager_state.set_first_audio_sink(sink)
+
+    def run_eager_mtp(
+        self,
+        input_batch: InputBatch,
+        text_hidden: torch.Tensor,
+        sampled_token_ids: torch.Tensor,
+        multimodal_outputs: dict[str, Any],
+        mtp_batch_descriptor_dispatcher: Callable[[int], Any] | None = None,
+    ) -> None:
+        if self._eager_mtp:
+            self._eager_state.run_eager_mtp(
+                input_batch, text_hidden, sampled_token_ids, multimodal_outputs, mtp_batch_descriptor_dispatcher
+            )
 
     @staticmethod
     def _resolve_decode_preprocess(model: nn.Module) -> Callable | None:
@@ -350,6 +393,9 @@ class OmniModelState(DefaultModelState):
         req_id = self.intermediate_buffer.buffers[req_index].get("req_id")
         if req_id is not None:
             getattr(self, "_mtp_generators", {}).pop(req_id, None)
+            getattr(self, "_first_audio_requests", set()).discard(req_id)
+        getattr(self, "_eager_ready", {}).pop(req_index, None)
+        getattr(self, "_eager_settled", {}).pop(req_index, None)
         self.intermediate_buffer.remove_request(req_index)
 
     # ------------------------------------------------------------------
@@ -555,15 +601,19 @@ class OmniModelState(DefaultModelState):
         self._stage_batched_preprocess_inputs(req_indices, embeds.device)
 
         preprocess_entries: list[tuple[int, int, int, int, dict[str, Any], bool]] = []
+        settled = self._eager_settled if self._eager_fastpath else None
+        settled_rows: list[tuple[int, int, int, str]] = []
         for i, req_idx in enumerate(req_indices):
             buf = self.intermediate_buffer.buffers[req_idx]
             if not buf or "req_id" not in buf:
                 continue
-            if str(buf["req_id"]).startswith("_warmup_"):
-                continue
-
             start = int(input_batch.query_start_loc_np[i])
             n_tok = int(input_batch.num_scheduled_tokens[i])
+            if settled and n_tok == 1 and settled.get(req_idx) == buf["req_id"]:
+                settled_rows.append((i, req_idx, start, buf["req_id"]))
+                continue
+            if str(buf["req_id"]).startswith("_warmup_"):
+                continue
 
             info = {key: value for key, value in buf.items() if isinstance(key, str)}
             prompt_len = None
@@ -589,6 +639,20 @@ class OmniModelState(DefaultModelState):
                 else n_tok > 1
             )
             preprocess_entries.append((i, req_idx, start, n_tok, info, is_prefill))
+
+        if self._eager_mtp:
+            # Rows whose sample is kept this step: decode, or the final prefill chunk.
+            self._eager_rows = (
+                input_batch,
+                [
+                    (i, req_idx, str(info["req_id"]), is_prefill)
+                    for i, req_idx, _start, n_tok, info, is_prefill in preprocess_entries
+                    if not is_prefill
+                    or int(info.get("_omni_num_computed_tokens", 0)) + n_tok >= int(info.get("_omni_prompt_len", 0))
+                ]
+                + [(i, req_idx, str(req_id), False) for i, req_idx, _start, req_id in settled_rows],
+                input_ids,
+            )
 
         preprocess_batch_mrv2 = getattr(self.model, "preprocess_batch_mrv2", None)
         if callable(preprocess_batch_mrv2):
@@ -620,6 +684,7 @@ class OmniModelState(DefaultModelState):
                 batch_embeds = embeds[:batch_size]
                 batch_offsets = None
             else:
+                # A pageable host tensor would block on the stream here.
                 batch_offsets = torch.as_tensor(starts, device=input_ids.device, dtype=torch.long)
                 batch_ids = input_ids.index_select(0, batch_offsets)
                 batch_embeds = embeds.index_select(0, batch_offsets)
@@ -659,13 +724,13 @@ class OmniModelState(DefaultModelState):
             )
             for row, (entry, updates) in enumerate(zip(decode_entries, updates_by_req, strict=True)):
                 i, req_idx, start, _n_tok, _info, _is_prefill = entry
-                mtp_batches.append(
-                    (
-                        i,
-                        start,
-                        (batch_hidden[row : row + 1], batch_text_step[row : row + 1]),
-                    )
+                # Eager frames read the packed text steps; skip per-row views.
+                row_inputs = (
+                    (batch_hidden, batch_text_step)
+                    if self._eager_mtp
+                    else (batch_hidden[row : row + 1], batch_text_step[row : row + 1])
                 )
+                mtp_batches.append((i, start, row_inputs))
                 batched_decode_indices.add(i)
             state_updates = [(entry[1], updates) for entry, updates in zip(decode_entries, updates_by_req, strict=True)]
             for req_idx, updates in state_updates:
@@ -694,7 +759,18 @@ class OmniModelState(DefaultModelState):
 
             self.intermediate_buffer.update(req_idx, updates, gpu_keys)
 
-        if mtp_batches and hasattr(self.model, "mtp"):
+        if self._eager_mtp:
+            settled_check = getattr(self.model, "eager_decode_settled", None)
+            if self._eager_fastpath and callable(settled_check):
+                for _i, req_idx, _start, n_tok, info, is_prefill in preprocess_entries:
+                    buf = self.intermediate_buffer.buffers[req_idx]
+                    if not is_prefill and n_tok == 1 and settled_check(buf):
+                        self._eager_settled[req_idx] = buf["req_id"]
+            if settled_rows:
+                self._eager_state._apply_settled_frames(settled_rows, embeds)
+        if mtp_batches and self._eager_mtp:
+            self._eager_state._apply_eager_frames(mtp_batches, embeds, input_batch, prepacked_mtp_inputs)
+        elif mtp_batches and hasattr(self.model, "mtp"):
             if prepacked_mtp_inputs is None:
                 self._run_batched_mtp(
                     mtp_batches,
@@ -727,9 +803,7 @@ class OmniModelState(DefaultModelState):
         bsz = len(mtp_batches)
         if offsets is None:
             offsets = torch.as_tensor(
-                [start for _i, start, _mtp in mtp_batches],
-                device=input_ids.device,
-                dtype=torch.long,
+                [start for _i, start, _mtp in mtp_batches], device=input_ids.device, dtype=torch.long
             )
         if prepacked_mtp_inputs is None:
             hidden_rows = [past_hidden.reshape(1, -1) for _i, _start, (past_hidden, _step) in mtp_batches]
@@ -802,11 +876,7 @@ class OmniModelState(DefaultModelState):
             offsets.copy_(query_start_loc[:bsz], non_blocking=True)
             return offsets
 
-        return torch.as_tensor(
-            [start for _i, start, _mtp in mtp_batches],
-            device=device,
-            dtype=torch.long,
-        )
+        return torch.as_tensor([start for _i, start, _mtp in mtp_batches], device=device, dtype=torch.long)
 
     def _run_batched_mtp(
         self,
@@ -823,8 +893,6 @@ class OmniModelState(DefaultModelState):
         Uses pre-allocated static buffers to avoid per-step torch.cat
         memory allocations.
         """
-        from vllm.forward_context import set_forward_context
-
         bsz = len(mtp_batches)
         batch_offsets = self._mtp_batch_offsets(
             mtp_batches,
@@ -840,6 +908,72 @@ class OmniModelState(DefaultModelState):
         )
 
         req_indices = [int(input_batch.idx_mapping_np[i]) for i, _start, _mtp in mtp_batches]
+        new_emb, codes = self._mtp_forward(
+            req_indices,
+            batch_ids,
+            batch_emb,
+            batch_hidden,
+            batch_step,
+            mtp_batch_descriptor_dispatcher,
+        )
+
+        embeds.index_copy_(0, batch_offsets, new_emb[:bsz].reshape(bsz, -1))
+        audio_key = getattr(self.model, "mtp_output_key", None)
+        validity_key = getattr(self.model, "mtp_validity_key", None)
+        valid_rows = None
+        if codes is not None and validity_key is not None:
+            valid_rows = torch.ones((bsz,), dtype=torch.bool, device=codes.device)
+        if codes is not None and audio_key in gpu_keys:
+            self.intermediate_buffer.update_gpu_tensor_rows(
+                req_indices,
+                audio_key,
+                codes[:bsz],
+            )
+            if valid_rows is not None:
+                self.intermediate_buffer.update_gpu_tensor_rows(
+                    req_indices,
+                    validity_key,
+                    valid_rows,
+                    keepdim=False,
+                )
+            return
+        for j, (i, _start, _) in enumerate(mtp_batches):
+            if codes is None:
+                continue
+            req_idx = int(input_batch.idx_mapping_np[i])
+            if isinstance(audio_key, tuple) and len(audio_key) == 2:
+                updates = {audio_key[0]: {audio_key[1]: codes[j : j + 1]}}
+            elif isinstance(audio_key, str):
+                updates = {audio_key: codes[j : j + 1]}
+            else:
+                raise TypeError(
+                    f"mtp_output_key must be a string or 2-tuple, got {type(audio_key).__name__}: {audio_key!r}"
+                )
+            if valid_rows is not None:
+                if isinstance(validity_key, tuple) and len(validity_key) == 2:
+                    updates.setdefault(validity_key[0], {})[validity_key[1]] = valid_rows[j]
+                elif isinstance(validity_key, str):
+                    updates[validity_key] = valid_rows[j]
+                else:
+                    raise TypeError(
+                        "mtp_validity_key must be a string or 2-tuple, "
+                        f"got {type(validity_key).__name__}: {validity_key!r}"
+                    )
+            self.intermediate_buffer.update(req_idx, updates, gpu_keys)
+
+    def _mtp_forward(
+        self,
+        req_indices: list[int],
+        batch_ids: torch.Tensor,
+        batch_emb: torch.Tensor,
+        batch_hidden: torch.Tensor,
+        batch_step: torch.Tensor,
+        mtp_batch_descriptor_dispatcher: Callable[[int], Any] | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Run the residual-codebook predictor on packed rows; returns graph-owned outputs."""
+        from vllm.forward_context import set_forward_context
+
+        bsz = len(req_indices)
         buffers = [self.intermediate_buffer.buffers[req_idx] for req_idx in req_indices]
         req_ids = [str(buffer.get("req_id")) for buffer in buffers]
         generators = [
@@ -894,50 +1028,7 @@ class OmniModelState(DefaultModelState):
                 generators=generators,
                 sample_uniforms=sample_uniforms,
             )
-
-        embeds.index_copy_(0, batch_offsets, new_emb[:bsz].reshape(bsz, -1))
-        audio_key = getattr(self.model, "mtp_output_key", None)
-        validity_key = getattr(self.model, "mtp_validity_key", None)
-        valid_rows = None
-        if codes is not None and validity_key is not None:
-            valid_rows = torch.ones((bsz,), dtype=torch.bool, device=codes.device)
-        if codes is not None and audio_key in gpu_keys:
-            self.intermediate_buffer.update_gpu_tensor_rows(
-                req_indices,
-                audio_key,
-                codes[:bsz],
-            )
-            if valid_rows is not None:
-                self.intermediate_buffer.update_gpu_tensor_rows(
-                    req_indices,
-                    validity_key,
-                    valid_rows,
-                    keepdim=False,
-                )
-            return
-        for j, (i, _start, _) in enumerate(mtp_batches):
-            if codes is None:
-                continue
-            req_idx = int(input_batch.idx_mapping_np[i])
-            if isinstance(audio_key, tuple) and len(audio_key) == 2:
-                updates = {audio_key[0]: {audio_key[1]: codes[j : j + 1]}}
-            elif isinstance(audio_key, str):
-                updates = {audio_key: codes[j : j + 1]}
-            else:
-                raise TypeError(
-                    f"mtp_output_key must be a string or 2-tuple, got {type(audio_key).__name__}: {audio_key!r}"
-                )
-            if valid_rows is not None:
-                if isinstance(validity_key, tuple) and len(validity_key) == 2:
-                    updates.setdefault(validity_key[0], {})[validity_key[1]] = valid_rows[j]
-                elif isinstance(validity_key, str):
-                    updates[validity_key] = valid_rows[j]
-                else:
-                    raise TypeError(
-                        "mtp_validity_key must be a string or 2-tuple, "
-                        f"got {type(validity_key).__name__}: {validity_key!r}"
-                    )
-            self.intermediate_buffer.update(req_idx, updates, gpu_keys)
+        return new_emb, codes
 
     def _get_mtp_base_sampling_kwargs(self) -> dict[str, Any]:
         sampling_params = getattr(self.model, "mtp_sampling_params", None)
@@ -1106,6 +1197,9 @@ class OmniModelState(DefaultModelState):
         back to the intermediate buffer (e.g. ``last_talker_hidden``).
         """
         if not self.has_postprocess:
+            return
+        if self._eager_fastpath and not getattr(self.model, "eager_frames_need_postprocess", True):
+            # The last hidden it stores only fed the deferred decode MTP.
             return
         gpu_keys: set[str] = getattr(self.model, "gpu_resident_buffer_keys", set())
         batch_postprocess = getattr(self.model, "postprocess_batch_mrv2", None)

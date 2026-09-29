@@ -301,6 +301,15 @@ class OmniPlatform(Platform):
         raise NotImplementedError
 
     @classmethod
+    def memory_reserved(cls, device: torch.device | int | None = None) -> int:
+        """Bytes reserved by this process's caching allocator on ``device``.
+
+        Device-wide ``get_device_memory`` counts every process; this is the
+        portable equivalent of ``torch.cuda.memory_reserved``.
+        """
+        return 0
+
+    @classmethod
     def create_autocast_context(
         cls,
         *,
@@ -329,7 +338,7 @@ class OmniPlatform(Platform):
     def set_device_control_env_var(cls, devices: str | int | None) -> None:
         import os
 
-        os.environ[cls.device_control_env_var] = devices
+        os.environ[cls.device_control_env_var] = "" if devices is None else str(devices)
 
     @classmethod
     def unset_device_control_env_var(cls) -> None:

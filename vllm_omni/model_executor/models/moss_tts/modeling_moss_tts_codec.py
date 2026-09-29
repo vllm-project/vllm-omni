@@ -36,6 +36,7 @@ from vllm_omni.model_executor.models.moss_tts.moss_codec_cudagraph import (
     MossTTSCUDAGraphCodecWrapper,
 )
 from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.model_executor.stage_input_processors.chunk_size_utils import parse_chunk_ramp
 
 logger = init_logger(__name__)
 
@@ -225,6 +226,22 @@ class _MossCodecStreamSession:
         return out
 
 
+def _resolve_streaming_graph_frame_sizes(
+    initial_frames: int,
+    steady_frames: int,
+    connector_extra_cfg: dict | None,
+) -> list[int]:
+    """Streaming-graph frame sizes to pre-capture: ``{initial, steady}`` + ramp ladder.
+
+    Ladder parsing is delegated to ``parse_chunk_ramp`` so the codec and the
+    stage input processor agree on one validated ``codec_chunk_ramp``:
+    null / malformed / single-entry values disable the ramp on both sides
+    (warn only) and never raise during codec init.
+    """
+    ramp = parse_chunk_ramp(connector_extra_cfg or {}, steady=steady_frames) or []
+    return sorted({s for s in (initial_frames, steady_frames, *ramp) if s > 0})
+
+
 class MossTTSCodecDecoder(nn.Module):
     """Stage-1 decoder for all MOSS-TTS variants.
 
@@ -283,8 +300,12 @@ class MossTTSCodecDecoder(nn.Module):
         self._stream_req_slots: dict[str, int] = {}
         self._async_chunk = bool(getattr(self.vllm_config.model_config, "async_chunk", False))
         self._streaming_graph_batch_sizes = self._streaming_graph_batch_sizes_from_compilation_config()
-        self._streaming_graph_frame_sizes = sorted(
-            {frames for frames in (self._initial_stream_chunk_frames, self._stream_chunk_frames) if frames > 0}
+        # codec_chunk_ramp ladder sizes join the streaming graph frame-size
+        # set so every ladder (B, T) combination is captured during warmup.
+        self._streaming_graph_frame_sizes = _resolve_streaming_graph_frame_sizes(
+            self._initial_stream_chunk_frames,
+            self._stream_chunk_frames,
+            self._connector_extra_cfg(),
         )
 
     # ------------------------------------------------------------------
@@ -665,6 +686,15 @@ class MossTTSCodecDecoder(nn.Module):
         if isinstance(extra_cfg, dict) and name in extra_cfg:
             return int(extra_cfg[name])
         return default
+
+    def _connector_extra_cfg(self) -> dict:
+        model_cfg = getattr(self.vllm_config, "model_config", None)
+        connector_cfg = getattr(model_cfg, "stage_connector_config", None)
+        if isinstance(connector_cfg, dict):
+            extra_cfg: dict | None = connector_cfg.get("extra", connector_cfg)
+        else:
+            extra_cfg = getattr(connector_cfg, "extra", None)
+        return extra_cfg if isinstance(extra_cfg, dict) else {}
 
     def _streaming_graph_batch_sizes_from_compilation_config(self) -> list[int]:
         if getattr(self.vllm_config.model_config, "enforce_eager", True):

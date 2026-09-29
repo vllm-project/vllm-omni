@@ -6,11 +6,13 @@
 
 """HIFI-GAN"""
 
+import math
+import os
+
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from scipy.signal import get_window
 from torch.nn import Conv1d, ConvTranspose1d
 from torch.nn.utils import remove_weight_norm
 
@@ -191,7 +193,7 @@ class SineGen(torch.nn.Module):
         before its own cumsum -- callers must scale both by samples-per-mel.
         """
         f0 = f0.transpose(1, 2)
-        F_mat = torch.zeros((f0.size(0), self.harmonic_num + 1, f0.size(-1))).to(f0.device)
+        F_mat = f0.new_zeros((f0.size(0), self.harmonic_num + 1, f0.size(-1)))
         for i in range(self.harmonic_num + 1):
             F_mat[:, i : i + 1, :] = f0 * (i + 1) / self.sampling_rate
 
@@ -507,9 +509,10 @@ class HiFTGenerator(nn.Module):
         self.num_kernels = len(resblock_kernel_sizes)
         self.num_upsamples = len(upsample_rates)
         # NOTE in CosyVoice2, we use the original SineGen implementation
+        scale = int(math.prod(upsample_rates) * istft_params["hop_len"])
         self.m_source = SourceModuleHnNSF(
             sampling_rate=sampling_rate,
-            upsample_scale=np.prod(upsample_rates) * istft_params["hop_len"],
+            upsample_scale=scale,
             harmonic_num=nb_harmonics,
             sine_amp=nsf_alpha,
             add_noise_std=nsf_sigma,
@@ -517,7 +520,7 @@ class HiFTGenerator(nn.Module):
             sinegen_type="1" if self.sampling_rate == 22050 else "2",
             causal=False,
         )
-        self.f0_upsamp = torch.nn.Upsample(scale_factor=np.prod(upsample_rates) * istft_params["hop_len"])
+        self.f0_upsamp = torch.nn.Upsample(scale_factor=scale)
 
         self.conv_pre = weight_norm(Conv1d(in_channels, base_channels, 7, 1, padding=3))
 
@@ -540,7 +543,11 @@ class HiFTGenerator(nn.Module):
         self.source_downs = nn.ModuleList()
         self.source_resblocks = nn.ModuleList()
         downsample_rates = [1] + upsample_rates[::-1][:-1]
-        downsample_cum_rates = np.cumprod(downsample_rates)
+        downsample_cum_rates = []
+        cur = 1
+        for r in downsample_rates:
+            cur *= r
+            downsample_cum_rates.append(cur)
         for i, (u, k, d) in enumerate(
             zip(downsample_cum_rates[::-1], source_resblock_kernel_sizes, source_resblock_dilation_sizes)
         ):
@@ -565,7 +572,7 @@ class HiFTGenerator(nn.Module):
         self.reflection_pad = nn.ReflectionPad1d((1, 0))
         self.register_buffer(
             "stft_window",
-            torch.from_numpy(get_window("hann", istft_params["n_fft"], fftbins=True).astype(np.float32)),
+            torch.hann_window(istft_params["n_fft"], periodic=True, dtype=torch.float32),
             persistent=False,
         )
         self.f0_predictor = f0_predictor
@@ -770,9 +777,10 @@ class CausalHiFTGenerator(HiFTGenerator):
 
         self.num_kernels = len(resblock_kernel_sizes)
         self.num_upsamples = len(upsample_rates)
+        scale = int(math.prod(upsample_rates) * istft_params["hop_len"])
         self.m_source = SourceModuleHnNSF(
             sampling_rate=sampling_rate,
-            upsample_scale=np.prod(upsample_rates) * istft_params["hop_len"],
+            upsample_scale=scale,
             harmonic_num=nb_harmonics,
             sine_amp=nsf_alpha,
             add_noise_std=nsf_sigma,
@@ -781,7 +789,7 @@ class CausalHiFTGenerator(HiFTGenerator):
             causal=True,
         )
         self.upsample_rates = upsample_rates
-        self.f0_upsamp = torch.nn.Upsample(scale_factor=np.prod(upsample_rates) * istft_params["hop_len"])
+        self.f0_upsamp = torch.nn.Upsample(scale_factor=scale)
 
         self.conv_pre = weight_norm(
             CausalConv1d(in_channels, base_channels, conv_pre_look_right + 1, 1, causal_type="right")
@@ -805,7 +813,11 @@ class CausalHiFTGenerator(HiFTGenerator):
         self.source_downs = nn.ModuleList()
         self.source_resblocks = nn.ModuleList()
         downsample_rates = [1] + upsample_rates[::-1][:-1]
-        downsample_cum_rates = np.cumprod(downsample_rates)
+        downsample_cum_rates = []
+        cur = 1
+        for r in downsample_rates:
+            cur *= r
+            downsample_cum_rates.append(cur)
         for i, (u, k, d) in enumerate(
             zip(downsample_cum_rates[::-1], source_resblock_kernel_sizes, source_resblock_dilation_sizes)
         ):
@@ -832,7 +844,7 @@ class CausalHiFTGenerator(HiFTGenerator):
         self.reflection_pad = nn.ReflectionPad1d((1, 0))
         self.register_buffer(
             "stft_window",
-            torch.from_numpy(get_window("hann", istft_params["n_fft"], fftbins=True).astype(np.float32)),
+            torch.hann_window(istft_params["n_fft"], periodic=True, dtype=torch.float32),
             persistent=False,
         )
         self.conv_pre_look_right = conv_pre_look_right
@@ -844,8 +856,8 @@ class CausalHiFTGenerator(HiFTGenerator):
             x = self.conv_pre(x)
         else:
             x = self.conv_pre(x[:, :, : -self.conv_pre_look_right], x[:, :, -self.conv_pre_look_right :])
-            s_stft_real = s_stft_real[:, :, : -int(np.prod(self.upsample_rates) * self.conv_pre_look_right)]
-            s_stft_imag = s_stft_imag[:, :, : -int(np.prod(self.upsample_rates) * self.conv_pre_look_right)]
+            s_stft_real = s_stft_real[:, :, : -int(math.prod(self.upsample_rates) * self.conv_pre_look_right)]
+            s_stft_imag = s_stft_imag[:, :, : -int(math.prod(self.upsample_rates) * self.conv_pre_look_right)]
         s_stft = torch.cat([s_stft_real, s_stft_imag], dim=1)
 
         for i in range(self.num_upsamples):
@@ -875,7 +887,7 @@ class CausalHiFTGenerator(HiFTGenerator):
 
         x = self._istft(magnitude, phase)
         if finalize is False:
-            x = x[:, : -int(np.prod(self.upsample_rates) * self.istft_params["hop_len"])]
+            x = x[:, : -int(math.prod(self.upsample_rates) * self.istft_params["hop_len"])]
         x = torch.clamp(x, -self.audio_limit, self.audio_limit)
         return x
 
@@ -890,10 +902,30 @@ class CausalHiFTGenerator(HiFTGenerator):
         trim: int = 0,
         f0_margin: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
-        # mel->f0 NOTE f0_predictor precision is crucial for causal inference, move
-        # self.f0_predictor to cpu if necessary
-        self.f0_predictor.to("cpu")
-        f0 = self.f0_predictor(speech_feat.cpu(), finalize=finalize).to(speech_feat)
+        # mel->f0
+        # By default keep f0_predictor on the same device as speech_feat (GPU) in FP32
+        # with TF32 disabled to prevent causal drift while avoiding CPU syncs and transfers.
+        # COSYVOICE3_F0_ON_CPU=1 forces CPU reference execution.
+        f0_on_cpu = os.getenv("COSYVOICE3_F0_ON_CPU", "0") == "1"
+        if speech_feat.device.type == "cuda" and not f0_on_cpu:
+            p = next(self.f0_predictor.parameters(), None)
+            if p is not None and p.device != speech_feat.device:
+                self.f0_predictor.to(device=speech_feat.device, dtype=torch.float32)
+            orig_matmul_tf32 = torch.backends.cuda.matmul.allow_tf32
+            orig_cudnn_tf32 = torch.backends.cudnn.allow_tf32
+            try:
+                torch.backends.cuda.matmul.allow_tf32 = False
+                torch.backends.cudnn.allow_tf32 = False
+                f0 = self.f0_predictor(speech_feat.float(), finalize=finalize).to(dtype=speech_feat.dtype)
+            finally:
+                torch.backends.cuda.matmul.allow_tf32 = orig_matmul_tf32
+                torch.backends.cudnn.allow_tf32 = orig_cudnn_tf32
+        else:
+            p = next(self.f0_predictor.parameters(), None)
+            if p is not None and p.device.type != "cpu":
+                self.f0_predictor.to("cpu")
+            f0 = self.f0_predictor(speech_feat.cpu().float(), finalize=finalize).to(speech_feat)
+
         if f0_margin > 0:
             f0 = f0[:, f0_margin:]
             speech_feat = speech_feat[:, :, f0_margin:]
@@ -1031,10 +1063,10 @@ class CausalConv1d(torch.nn.Conv1d):
         assert causal_type in ["left", "right"]
         self.causal_type = causal_type
 
-    def forward(self, x: torch.Tensor, cache: torch.Tensor = torch.zeros(0, 0, 0)) -> tuple[torch.Tensor]:
+    def forward(self, x: torch.Tensor, cache: torch.Tensor | None = None) -> torch.Tensor:
         input_timestep = x.shape[2]
-        if cache.size(2) == 0:
-            cache = torch.zeros(x.shape[0], x.shape[1], self.causal_padding).to(x)
+        if cache is None or cache.size(2) == 0:
+            cache = x.new_zeros(x.shape[0], x.shape[1], self.causal_padding)
         assert cache.size(2) == self.causal_padding
         if self.causal_type == "left":
             x = torch.concat([cache, x], dim=2)

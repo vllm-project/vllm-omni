@@ -138,7 +138,9 @@ steps:
       mirror_hardwares: [amdproduction]
       grade: Blocking
       commands:
-        - timeout 30m pytest -s -v tests/e2e/offline_inference/test_z_image.py
+        # A cold Z-Image run spends about six minutes loading weights before
+        # the first-request AITER compilation, which can itself exceed 23m.
+        - timeout 55m pytest -s -v tests/e2e/offline_inference/test_z_image.py
 
     - label: "Diffusion GPU Worker Test"
       agent_pool: mi300_2

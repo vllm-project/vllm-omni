@@ -130,27 +130,29 @@ def _apply_batched_repetition_penalty(
         penalties = penalties.expand(batch_size)
     elif penalties.numel() != batch_size:
         raise ValueError(f"expected 1 or {batch_size} codec repetition penalties, got {penalties.numel()}")
-    if not bool((penalties != 1.0).any()):
-        return logits
-
     penalized = logits.clone()
     for start in range(0, batch_size, _REPETITION_PENALTY_CHUNK_SIZE):
         end = min(start + _REPETITION_PENALTY_CHUNK_SIZE, batch_size)
         chunk_logits = logits[start:end]
+        chunk_histories = histories[start:end]
+        # The runner keeps codec history on the CPU. Pack it before uploading
+        # instead of transferring one small tensor per request on every step.
+        history_device = "cpu" if all(history.device.type == "cpu" for history in chunk_histories) else logits.device
         encoded_rows: list[torch.Tensor] = []
-        for local_row, history in enumerate(histories[start:end]):
-            recent = history.reshape(-1)[-window_size:].to(device=logits.device, dtype=torch.long)
+        for local_row, history in enumerate(chunk_histories):
+            recent = history.reshape(-1)[-window_size:].to(device=history_device, dtype=torch.long)
             if recent.numel() > 0:
                 encoded_rows.append(recent + local_row * vocab_size)
         if not encoded_rows:
             continue
 
-        # Bound the int64 bincount workspace independently of request concurrency.
+        # The vocabulary fixes the output size. CUDA bincount still reads the
+        # maximum id back to the host even when minlength is provided.
         encoded = encoded_rows[0] if len(encoded_rows) == 1 else torch.cat(encoded_rows)
-        frequencies = torch.bincount(
-            encoded,
-            minlength=(end - start) * vocab_size,
-        ).reshape(end - start, vocab_size)
+        encoded = encoded.to(device=logits.device)
+        frequencies = torch.zeros((end - start) * vocab_size, dtype=torch.long, device=logits.device)
+        frequencies.scatter_add_(0, encoded, torch.ones_like(encoded))
+        frequencies = frequencies.reshape(end - start, vocab_size)
         alpha = torch.pow(penalties[start:end].unsqueeze(1), frequencies.to(dtype=logits.dtype))
         penalized[start:end] = torch.where(chunk_logits < 0, chunk_logits * alpha, chunk_logits / alpha)
 
@@ -537,7 +539,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 request_states = {}
                 self._request_audio_states = request_states
             request_states[request_id] = state
-            empty_codes = torch.empty(0, dtype=torch.long, device=embeds.device)
+            empty_codes = torch.empty(0, dtype=torch.long, device="cpu")
             return (
                 input_ids,
                 embeds,
@@ -557,7 +559,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             # eligible. The sampler is forced to EOS; any shape-correct
             # embedding is enough for these leftover decode rows.
             weight = self.emb_code[0].weight
-            empty_codes = torch.empty(0, dtype=torch.long, device=weight.device)
+            empty_codes = torch.empty(0, dtype=torch.long, device="cpu")
             return input_ids, weight.new_zeros((span_len, weight.shape[1])), {"codes": {"audio": empty_codes}}
 
         # Decode: vLLM's previous sampled codec id is this step's input.
@@ -571,9 +573,11 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 state["finished"] = True
             elif stored is None:
                 self._request_audio_states[request_id] = {"finished": True, "step": 0}
-            delta = torch.empty(0, dtype=torch.long, device=code.device)
+            delta = torch.empty(0, dtype=torch.long, device="cpu")
         else:
-            delta = code.reshape(1, 1)
+            # The runner and connector consume CPU IDs; reuse the scalar
+            # already read for EOS instead of copying the same token again.
+            delta = torch.tensor([[code_id]], dtype=torch.long, device="cpu")
         return input_ids, embeds, {"codes": {"audio": delta}}
 
     def make_omni_output(
@@ -595,12 +599,12 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         duplex_turn_ids: list[torch.Tensor] = []
         segment_texts_utf8: list[torch.Tensor] = []
         turn_end_flags: list[torch.Tensor] = []
-        empty_delta = hidden.new_empty((0, 1), dtype=torch.long)
+        empty_delta = torch.empty((0, 1), dtype=torch.long, device="cpu")
         codec_deltas = [empty_delta for _ in infos]
         terminal_flags = [torch.tensor(False, dtype=torch.bool) for _ in infos]
         force_eos_rows = [False] * len(infos)
         mask_eos_rows = [False] * len(infos)
-        empty_history = hidden.new_empty((0,), dtype=torch.long)
+        empty_history = torch.empty(0, dtype=torch.long, device="cpu")
         penalty_histories = [empty_history for _ in infos]
         for index, info in enumerate(infos):
             info_dict = info if isinstance(info, dict) else {}
@@ -657,16 +661,17 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             codes = info.get("codes", {})
             audio = codes.get("audio") if isinstance(codes, Mapping) else None
             if isinstance(audio, torch.Tensor) and audio.numel() > 0:
-                codec_deltas[index] = audio.to(device=hidden.device, dtype=torch.long).reshape(-1, 1)
+                audio = audio.to(device="cpu", dtype=torch.long)
+                codec_deltas[index] = audio.reshape(-1, 1)
                 state["step"] = int(state.get("step", 0)) + 1
                 # ``audio`` is the id sampled last step, i.e. exactly upstream's
                 # ``new_tokens[:, 0:t]`` history for the logits computed below.
                 recent = state.get("recent_codes")
-                recent = (recent if isinstance(recent, list) else []) + codec_deltas[index].reshape(-1).tolist()
+                recent = (recent if isinstance(recent, list) else []) + audio.reshape(-1).tolist()
                 state["recent_codes"] = recent[-_CODEC_PENALTY_WINDOW:]
             recent_codes = state.get("recent_codes")
             if recent_codes:
-                penalty_histories[index] = torch.tensor(recent_codes, dtype=torch.long, device=hidden.device)
+                penalty_histories[index] = torch.tensor(recent_codes, dtype=torch.long, device="cpu")
             max_tokens = state.get("max_tokens")
             min_tokens = state.get("min_tokens")
             step = int(state.get("step", 0))

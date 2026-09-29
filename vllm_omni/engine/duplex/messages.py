@@ -65,6 +65,11 @@ class TouchDuplexSessionMessage(EngineQueueMessage, kw_only=True):
     control_id: str
     session_id: str
     activity: str
+    #: For a detach: the lease generation the caller opened or resumed
+    #: against. The manager refuses to detach a newer lease, so a connection
+    #: giving up its own resume can never put the lease a later resume owns
+    #: into disconnect grace. ``None`` detaches whatever generation is current.
+    expected_lease_generation: int | None = None
 
 
 class DuplexSessionCommandMessage(EngineQueueMessage, kw_only=True):

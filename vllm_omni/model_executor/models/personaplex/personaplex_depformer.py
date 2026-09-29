@@ -203,8 +203,9 @@ class PersonaPlexDepformer(nn.Module):
         audio_tokens: torch.Tensor | None = None,
         audio_provided: torch.Tensor | None = None,
         return_logits: bool = False,
+        num_steps: int | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        """Predict the ``dep_q`` audio codes for one frame.
+        """Predict the first ``num_steps`` (default ``dep_q``) audio codes for one frame.
 
         Args:
             text_token: ``[B]`` sampled text token for the frame.
@@ -213,19 +214,26 @@ class PersonaPlexDepformer(nn.Module):
             audio_provided: optional ``[B, dep_q]`` bool mask; where True the
                 corresponding ``audio_tokens`` entry overrides the sampled code as
                 the next-step input (partial teacher forcing, as in Moshi).
-            return_logits: also return the per-step logits ``[B, dep_q, card]``.
+            return_logits: also return the per-step logits ``[B, num_steps, card]``.
+            num_steps: stop after this many inner steps. The loop is causal, so the
+                first ``num_steps`` codes are identical to a full ``dep_q`` run;
+                the trailing steps predict the user's codebooks, which the serving
+                path never consumes.
 
         Returns:
-            ``[B, dep_q]`` long tensor of sampled (greedy) audio codes, plus the
+            ``[B, num_steps]`` long tensor of sampled (greedy) audio codes, plus the
             per-step logits when ``return_logits`` is set.
         """
         if transformer_out.dim() != 3 or transformer_out.shape[1] != 1:
             raise ValueError(f"transformer_out must be [B, 1, H]; got {tuple(transformer_out.shape)}")
+        steps = self.dep_q if num_steps is None else int(num_steps)
+        if not 1 <= steps <= self.dep_q:
+            raise ValueError(f"num_steps must be in [1, {self.dep_q}]; got {num_steps}")
         prev = text_token
         kv = [{"k": None, "v": None} for _ in self.layers]
         codes: list[torch.Tensor] = []
         logits_all: list[torch.Tensor] = []
-        for step in range(self.dep_q):
+        for step in range(steps):
             x = self.depformer_in[step](transformer_out)  # [B, 1, dim]
             if step == 0:
                 cond = self.depformer_text_emb(prev.unsqueeze(1))
@@ -243,9 +251,9 @@ class PersonaPlexDepformer(nn.Module):
                 prev = torch.where(audio_provided[:, step], audio_tokens[:, step], sampled)
             else:
                 prev = sampled
-        stacked = torch.stack(codes, dim=1)  # [B, dep_q]
+        stacked = torch.stack(codes, dim=1)  # [B, steps]
         if return_logits:
-            return stacked, torch.stack(logits_all, dim=1)  # [B, dep_q, card]
+            return stacked, torch.stack(logits_all, dim=1)  # [B, steps, card]
         return stacked
 
     # ------------------------------------------------------------------

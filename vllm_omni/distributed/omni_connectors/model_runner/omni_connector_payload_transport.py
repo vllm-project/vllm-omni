@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import importlib
 import inspect
+import time
 from collections import deque
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, cast
@@ -192,8 +193,7 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
         metadata: dict[str, Any] | None = None,
     ) -> Any:
         """Receive one ordinary non-KV stage payload on the local leader rank only."""
-        tp_group = self._get_local_tp_group()
-        if tp_group is None or getattr(tp_group, "world_size", 1) <= 1:
+        if not self._stage_payload_broadcast_groups():
             if metadata is None:
                 return connector.get(from_stage, to_stage, connector_get_key)
             return connector.get(from_stage, to_stage, connector_get_key, metadata)
@@ -243,13 +243,81 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
             return dict(payload)
         return payload
 
-    def _broadcast_tp_payload_packet(self, packet: Any) -> Any:
-        """Broadcast one ordinary payload packet from TP rank 0 when TP is active."""
+    def _stage_payload_broadcast_groups(self) -> tuple[Any, ...]:
+        """Return ordered orthogonal payload groups; runners may supply TP x SP."""
         tp_group = self._get_local_tp_group()
         if tp_group is None or getattr(tp_group, "world_size", 1) <= 1:
-            return packet
-        leader_packet = packet if self.is_data_transfer_rank() else None
-        return tp_group.broadcast_object(leader_packet, src=0)
+            return ()
+        return (tp_group,)
+
+    def _broadcast_tp_payload_packet(self, packet: Any, *, tensor_payload: bool = False) -> Any:
+        """Fan out in group order, using each group's local leader as source."""
+        for group in self._stage_payload_broadcast_groups():
+            leader_packet = packet if group.rank_in_group == 0 else None
+            if tensor_payload:
+                delivered = group.broadcast_object(
+                    isinstance(packet, dict) if group.rank_in_group == 0 else None, src=0
+                )
+                if delivered:
+                    packet = group.broadcast_tensor_dict(leader_packet, src=0)
+            else:
+                packet = group.broadcast_object(leader_packet, src=0)
+        return packet
+
+    def _stage_payload_connector(self) -> Any | None:
+        try:
+            if getattr(self, "_synchronous_payload_transport", False):
+                return self._kv_transfer_manager.connector
+            return self._omni_connector
+        except Exception as exc:
+            logger.warning("Stage payload connector unavailable: %s", exc)
+            return None
+
+    def recv_stage_payload(
+        self,
+        external_req_id: str,
+        from_stage: str,
+        to_stage: str,
+        *,
+        sender_info: Any = None,
+        handle: dict[str, Any] | None = None,
+        retry_seconds: float = 2.0,
+    ) -> Any:
+        """Synchronously receive one payload, then fan out on the model thread.
+
+        The same monotonic deadline covers discovery and backend transfer waits.
+        This path does not register work with the asynchronous poller.
+        """
+        from_stage, to_stage, get_key, metadata = self._stage_payload_recv_spec(
+            external_req_id, from_stage, to_stage, sender_info=sender_info, handle=handle
+        )
+        if not get_key:
+            return None
+        result = None
+        if self.is_data_transfer_rank():
+            connector = self._stage_payload_connector()
+            if connector is not None:
+                deadline = time.monotonic() + retry_seconds
+                try:
+                    while True:
+                        result = connector.get_with_deadline(from_stage, to_stage, get_key, metadata, deadline=deadline)
+                        if result is not None:
+                            break
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            break
+                        time.sleep(min(0.05, remaining))
+                except Exception as exc:
+                    logger.warning("Stage payload get failed for %s: %s", get_key, exc)
+                finally:
+                    try:
+                        connector.abandon_get(get_key)
+                    except Exception as exc:
+                        logger.warning("Stage payload claim retirement failed for %s: %s", get_key, exc)
+        payload = self._broadcast_tp_payload_packet(result[0] if result else None, tensor_payload=True)
+        if payload is None and self.is_data_transfer_rank():
+            logger.warning("Stage payload %s was not delivered; caller must validate inline fallback", get_key)
+        return payload
 
     def _apply_staged_payloads_locked(self, staged_payloads: dict[str, Any]) -> None:
         for req_id, payload in staged_payloads.items():
@@ -980,6 +1048,31 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
     #  Chunk-level poll / send  (ported from OmniChunkTransferAdapter)
     # ------------------------------------------------------------------ #
 
+    @staticmethod
+    def _stage_payload_recv_spec(
+        external_req_id: str,
+        from_stage: str,
+        to_stage: str,
+        chunk_id: int = 0,
+        sender_info: Any = None,
+        handle: dict[str, Any] | None = None,
+    ) -> tuple[str, str, str | None, dict[str, Any] | None]:
+        """Resolve a connector-independent request key and transfer metadata."""
+        metadata = None
+        if isinstance(sender_info, dict):
+            host = sender_info.get("host")
+            port = sender_info.get("zmq_port")
+            if host and port:
+                metadata = {"source_host": str(host), "source_port": int(port)}
+        if isinstance(handle, dict):
+            return (
+                str(handle.get("from_stage", from_stage)),
+                str(handle.get("to_stage", to_stage)),
+                handle.get("key"),
+                handle.get("metadata") or metadata,
+            )
+        return str(from_stage), str(to_stage), f"{external_req_id}_{from_stage}_{chunk_id}", metadata
+
     def _poll_single_request(self, req_id: str, *, publish_ready: bool = True) -> bool:
         """Poll connector for one chunk of a request (non-blocking)."""
         connector = self._omni_connector
@@ -1002,29 +1095,28 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
         target_stage_id = self._stage_id - 1
         chunk_id = self._get_req_chunk[req_id]
         external_req_id = self._request_ids_mapping.get(req_id, req_id)
-        connector_get_key = f"{external_req_id}_{target_stage_id}_{chunk_id}"
         request = self._pending_load_reqs.get(req_id)
-        sender_info = getattr(request, "payload_sender_info", None)
-        metadata = None
-        if isinstance(sender_info, dict):
-            host = sender_info.get("host")
-            port = sender_info.get("zmq_port")
-            if host and port:
-                metadata = {"source_host": str(host), "source_port": int(port)}
+        from_stage, to_stage, connector_get_key, metadata = self._stage_payload_recv_spec(
+            external_req_id,
+            str(target_stage_id),
+            str(self._stage_id),
+            chunk_id,
+            getattr(request, "payload_sender_info", None),
+        )
 
         if self._async_chunk:
             result = self._recv_async_chunk_result(
                 connector,
-                str(target_stage_id),
-                str(self._stage_id),
+                from_stage,
+                to_stage,
                 connector_get_key,
                 metadata,
             )
         else:
             result = self._recv_full_payload_result(
                 connector,
-                str(target_stage_id),
-                str(self._stage_id),
+                from_stage,
+                to_stage,
                 connector_get_key,
                 metadata,
             )
