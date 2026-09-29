@@ -4,8 +4,8 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Mapping
-from typing import Any
+from collections.abc import Sequence
+from typing import TYPE_CHECKING
 
 from fastapi import WebSocket
 from vllm.logger import init_logger
@@ -15,22 +15,21 @@ from vllm_omni.entrypoints.duplex.warmup import DUPLEX_WARMUP_CLIENT_WAIT_S
 from vllm_omni.entrypoints.openai.realtime.connection import OpenAIFullDuplexConnection
 from vllm_omni.entrypoints.openai.realtime_connection import RealtimeConnection
 
+if TYPE_CHECKING:
+    from vllm_omni.config.omni_config import BaseVllmOmniStageConfig
+
 logger = init_logger(__name__)
 
 _QWEN3_OMNI_REALTIME_ARCH = "Qwen3OmniMoeForConditionalGeneration"
 _QWEN3_OMNI_REALTIME_STAGES = {"thinker", "talker", "code2wav"}
 
 
-def supports_qwen3_omni_realtime(stage_configs: Any) -> bool:
-    def stage_arg(stage: Any, name: str) -> Any:
-        engine_args = getattr(stage, "engine_args", None)
-        return engine_args.get(name) if isinstance(engine_args, Mapping) else getattr(engine_args, name, None)
-
+def supports_qwen3_omni_realtime(stage_configs: Sequence[BaseVllmOmniStageConfig] | None) -> bool:
     stages = stage_configs or ()
     return (
         len(stages) == len(_QWEN3_OMNI_REALTIME_STAGES)
-        and all(stage_arg(stage, "model_arch") == _QWEN3_OMNI_REALTIME_ARCH for stage in stages)
-        and {stage_arg(stage, "model_stage") for stage in stages} == _QWEN3_OMNI_REALTIME_STAGES
+        and all(stage.model_config.model_arch == _QWEN3_OMNI_REALTIME_ARCH for stage in stages)
+        and {stage.model_stage for stage in stages} == _QWEN3_OMNI_REALTIME_STAGES
     )
 
 
