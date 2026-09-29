@@ -809,15 +809,12 @@ def build_assets_perf_summary(
             f"model group). Re-run `sync_buildkite_raw_model_results.py` + "
             f"`generate_charts.py` to refresh `docs/assets/charts/*_history.json`."
         )
-    if stale_skipped:
-        warnings.append(
-            f"Skipped {len(stale_skipped)} stale perf record(s) whose latest run "
-            f"is older than {STALE_PERF_DAYS} day(s) before the freshest record "
-            f"({stale_cutoff}); re-run the corresponding tests or raise "
-            f"STALE_PERF_DAYS (env) to surface them again. Affected: "
-            + ", ".join(sorted(set(stale_skipped))[:20])
-            + (" ..." if len(set(stale_skipped)) > 20 else "")
-        )
+    # The stale-records enumeration ("Skipped N stale perf record(s) ... Affected: …")
+    # is intentionally NOT emitted as a warning. The filtering itself
+    # (`_filter_stale_records`, STALE_PERF_DAYS=14) still drops the stale records
+    # so they don't freeze a last regression in "All major regressions" — only the
+    # verbose per-record "Affected:" list is suppressed (it cluttered the report's
+    # "Source config notes" block with up to 20 model|test|date entries per card).
     # Keep only models that have baseline-backed rows.
     rows = [row for row in rows if row.baseline is not None]
     rows.sort(key=lambda x: (x.model, x.config_key, x.metric))
