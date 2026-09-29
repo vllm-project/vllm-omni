@@ -22,6 +22,10 @@ from laptop_path_defaults import (  # noqa: E402
     DEFAULT_KANBAN_REPO_ROOT_DISPLAY,
     resolve_kanban_repo_root,
 )
+from local_perf_results import (  # noqa: E402
+    normalize_test_key,
+    test_key_from_perf_filename,
+)
 
 DEFAULT_ASSETS_DIR = (
     Path(os.environ.get("KANBAN_ASSETS_DIR", "").strip()).resolve()
@@ -169,10 +173,34 @@ def _history_group_key(
     return config_key or fallback
 
 
+def _extract_primary_metrics(payload: dict[str, Any]) -> list[str]:
+    """The curated set of perf metrics a history file tracks (from
+    ``metric_groups``), excluding the ``baseline_metric_*`` groups whose
+    ``metrics`` list baseline-only names (e.g. ``latency_mean``) that are not
+    record fields. Used as the fallback metric set when a record carries no
+    ``baseline_*`` reference at all, so the test's results still render with
+    ``baseline=0`` instead of being silently dropped.
+    """
+    primary: list[str] = []
+    for group in (payload.get("metric_groups") or []):
+        if not isinstance(group, dict):
+            continue
+        gid = str(group.get("id") or "")
+        if gid.startswith("baseline_metric_"):
+            continue
+        for metric in (group.get("metrics") or []):
+            if isinstance(metric, str) and metric not in primary:
+                primary.append(metric)
+    return primary
+
+
 def _parse_history_payload(path: Path) -> HistoryPayload:
     payload = json.loads(path.read_text(encoding="utf-8"))
+    primary_metrics = _extract_primary_metrics(payload)
     recs = payload.get("records")
     records = [r for r in recs if isinstance(r, dict)] if isinstance(recs, list) else []
+    for rec in records:
+        rec["_kanban_primary_metrics"] = primary_metrics
 
     group_fields_raw = payload.get("group_fields")
     group_fields = [str(v) for v in group_fields_raw] if isinstance(group_fields_raw, list) else []
@@ -192,6 +220,7 @@ def _parse_history_payload(path: Path) -> HistoryPayload:
                     continue
                 normalized = dict(rec)
                 normalized["_kanban_group_key"] = f"{path.name}::{group_key}"
+                normalized["_kanban_primary_metrics"] = primary_metrics
                 if group_key:
                     normalized["config_key"] = group_key
                 group_records.append(normalized)
@@ -333,8 +362,11 @@ def _history_summary(metas: list[dict[str, Any]], used_group_payloads: bool) -> 
     }
 
 
-def _iter_metric_pairs(rec: dict[str, Any]) -> list[tuple[str, float, float]]:
+def _iter_metric_pairs(
+    rec: dict[str, Any], *, is_local: bool = False
+) -> list[tuple[str, float, float]]:
     pairs: list[tuple[str, float, float]] = []
+    seen: set[str] = set()
 
     for key, value in rec.items():
         if not key.startswith("baseline_"):
@@ -345,17 +377,47 @@ def _iter_metric_pairs(rec: dict[str, Any]) -> list[tuple[str, float, float]]:
         if baseline is None or latest is None:
             continue
         pairs.append((metric, latest, baseline))
+        seen.add(metric)
 
     baseline_obj = rec.get("baseline")
     if isinstance(baseline_obj, dict):
         for metric, base_v in baseline_obj.items():
+            metric = str(metric)
             baseline = _as_float(base_v)
             latest = _as_float(rec.get(metric))
             if baseline is None or latest is None:
                 continue
-            if any(metric == existing[0] for existing in pairs):
+            if metric in seen:
                 continue
-            pairs.append((str(metric), latest, baseline))
+            pairs.append((metric, latest, baseline))
+            seen.add(metric)
+
+    # Fallback (local records only): when a local run's record carries perf
+    # metric values but no baseline reference for them (e.g. a local L20X run
+    # whose test harness wrote ``"baseline": {}``), synthesize pairs with
+    # ``baseline=0`` so the test's results still render (status resolves to
+    # "n/a" via the ``abs(baseline) < 1e-12`` branch in ``_build_perf_rows``)
+    # instead of being silently dropped. Gated on ``is_local`` (the record's
+    # ``source_file`` matches a local perf key) so Buildkite-only records that
+    # merely lack baselines don't flood the Buildkite section with n/a rows.
+    # Restricted to the history file's curated primary metrics (``metric_groups``,
+    # excluding ``baseline_metric_*``) so non-metric fields and percentile
+    # variants don't surface as noise.
+    if is_local:
+        primary_metrics = rec.get("_kanban_primary_metrics")
+        if primary_metrics:
+            for metric in primary_metrics:
+                if metric in seen:
+                    continue
+                latest = _as_float(rec.get(metric))
+                # Skip None (metric absent) and 0.0 (uncollected): a 0 latest
+                # against a 0 baseline is meaningless noise (0 / N/A). A real
+                # baseline→0 regression is still shown by the baseline-backed
+                # path above; this only affects the no-baseline fallback.
+                if latest is None or abs(latest) < 1e-12:
+                    continue
+                pairs.append((str(metric), latest, 0.0))
+                seen.add(metric)
     return pairs
 
 
@@ -464,16 +526,27 @@ def _config_view(rec: dict[str, Any], model_type: str) -> str:
     return ", ".join(pairs) if pairs else "-"
 
 
-def _build_perf_rows(records: list[dict[str, Any]]) -> tuple[list[PerfRow], int]:
+def _build_perf_rows(
+    records: list[dict[str, Any]], *, local_keys: frozenset[str] | None = None
+) -> tuple[list[PerfRow], int]:
     """Build perf rows; skip records lacking both ``model_id`` and ``title``.
 
     Returns ``(rows, skipped_unidentified_count)``. The skipped count is
     surfaced as a warning in the rendered report so stale Buildkite perf
     JSONs (all-null fields) no longer pollute the table with a bogus
     ``unknown`` model group.
+
+    ``local_keys`` (when provided) gates the no-baseline fallback in
+    :func:`_iter_metric_pairs` to records whose ``source_file`` matches a local
+    perf key, so only local runs lacking baselines render with ``baseline=0``.
     """
     rows: list[PerfRow] = []
     skipped_unidentified = 0
+    norm_local_keys = (
+        frozenset(normalize_test_key(k) for k in local_keys if k)
+        if local_keys
+        else None
+    )
     for rec in records:
         model_id = rec.get("model_id")
         title = rec.get("title")
@@ -495,7 +568,11 @@ def _build_perf_rows(records: list[dict[str, Any]]) -> tuple[list[PerfRow], int]
         if raw_hw is None:
             raw_hw = rec.get("Hardware")
         hardware = "" if raw_hw is None else str(raw_hw).strip()
-        for metric, latest, baseline in _iter_metric_pairs(rec):
+        is_local = False
+        if norm_local_keys and source_file:
+            sf_key = normalize_test_key(test_key_from_perf_filename(source_file))
+            is_local = bool(sf_key) and sf_key in norm_local_keys
+        for metric, latest, baseline in _iter_metric_pairs(rec, is_local=is_local):
             direction = _metric_direction(metric)
             if abs(baseline) < 1e-12:
                 vs_pct = None
@@ -605,6 +682,7 @@ def build_assets_perf_summary(
     kanban_repo_root: Path | None = None,
     expected_remote: str | None = None,
     expected_branch: str | None = None,
+    local_keys: frozenset[str] | None = None,
 ) -> dict[str, Any]:
     """Return baseline comparison summary using each history file's own latest day.
 
@@ -723,7 +801,7 @@ def build_assets_perf_summary(
             reference_day=stale_cutoff,
             max_age_days=STALE_PERF_DAYS,
         )
-    rows, skipped_unidentified = _build_perf_rows(day_records)
+    rows, skipped_unidentified = _build_perf_rows(day_records, local_keys=local_keys)
     if skipped_unidentified:
         warnings.append(
             f"Skipped {skipped_unidentified} stale perf record(s) lacking both "

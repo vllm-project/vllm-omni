@@ -3173,6 +3173,20 @@ def _perf_pct(v: Any) -> str:
     return "N/A"
 
 
+def _format_update_date(s: Any) -> str:
+    """Date-only prefix of a history record's ``date`` (e.g. '2026-09-27').
+
+    Used by the "All major regressions" perf table's "Updated" column so the
+    reader can see whether a row's latest value is fresh or stale. Returns
+    '—' when the value is empty/blank/not a string.
+    """
+    if isinstance(s, str):
+        text = s.strip()
+        if text:
+            return text[:10]
+    return "—"
+
+
 def _as_num(value: Any) -> float | None:
     if isinstance(value, bool):
         return None
@@ -3379,6 +3393,7 @@ _FOCUS_TABLE_HEADERS = (
     "Test",
     "Metric",
     "latest",
+    "Updated",
     "baseline",
     "vs baseline",
     "Status",
@@ -3745,6 +3760,7 @@ class NightlyFocusItem:
     vs_baseline_pct: Any = None
     status: str = ""
     consec_fail_days: int = 0
+    date: str = ""
 
 
 def _job_kind_counts(kinds: list[str]) -> dict[str, int]:
@@ -3805,6 +3821,7 @@ def _focus_item_from_perf_row(
         baseline=get_value("baseline"),
         vs_baseline_pct=get_value("vs_baseline_pct"),
         status=str(get_value("status", "") or "n/a"),
+        date=str(get_value("date", "") or ""),
     )
     if history_fail_lookup:
         out.consec_fail_days = _focus_item_consec_fail_days(out, history_fail_lookup)
@@ -3952,6 +3969,7 @@ def _render_focus_perf_table_html(items: list[NightlyFocusItem]) -> str:
             item.test,
             item.metric,
             _perf_num(item.latest),
+            _format_update_date(item.date),
             _perf_num(item.baseline),
             _perf_pct(item.vs_baseline_pct),
             item.status,
@@ -3983,7 +4001,6 @@ def _daily_focus_data(
     log_dir: Path,
     gh_token: str | None = None,
     now: datetime | None = None,
-    di_overrides: dict[int, dict[str, str]] | None = None,
 ) -> dict[str, Any]:
     bk_perf_summary, _ = _buildkite_perf_rows(kanban_cfg, log_dir=log_dir, exclude_local_overlap=True)
     local_perf_summary, _ = _buildkite_perf_rows(kanban_cfg, log_dir=log_dir)
@@ -3996,10 +4013,6 @@ def _daily_focus_data(
     local_perf_counts = _perf_counts(local_perf_summary)
     job_fail_count = int(bk_job_counts["fail"]) + int(local_job_counts["fail"])
     perf_fail_count = int(bk_perf_counts["fail"]) + int(local_perf_counts["fail"])
-    # ``_compute_outstanding_di`` lifts inherited Assignee values into the
-    # per-issue tuple so the snapshot card's pre-formatted display stays
-    # consistent with the rendered table below.
-    outstanding_di = _compute_outstanding_di(gh_token, now=now, overrides=di_overrides)
     if job_fail_count or perf_fail_count:
         conclusion = (
             f"Attention needed: {job_fail_count} test failure(s)/anomaly(ies) and "
@@ -4028,8 +4041,6 @@ def _daily_focus_data(
         "local_perf_status": local_perf_summary.get("status", ""),
         "bk_perf_message": bk_perf_summary.get("message", ""),
         "local_perf_message": local_perf_summary.get("message", ""),
-        "outstanding_di": outstanding_di,
-        "di_overrides": di_overrides or {},
     }
 
 
@@ -4105,13 +4116,6 @@ def _render_daily_focus_html(data: dict[str, Any]) -> str:
     local_jobs = data["local_job_counts"]
     bk_perf = data["bk_perf_counts"]
     local_perf = data["local_perf_counts"]
-    di = data.get("outstanding_di") or {}
-    di_value = di.get("value", "—")
-    di_detail = di.get("detail", "")
-    if di_detail:
-        di_detail_full = f"{di.get('n_issues', 0)} open bug(s); {di_detail}"
-    else:
-        di_detail_full = f"{di.get('n_issues', 0)} open bug(s)"
     cards = [
         _render_focus_metric_card(
             "Buildkite jobs",
@@ -4136,12 +4140,6 @@ def _render_daily_focus_html(data: dict[str, Any]) -> str:
             f"{int(local_perf['fail'])} fail",
             f"pass={int(local_perf['pass'])}, normal={int(local_perf['normal'])}, n/a={int(local_perf['n/a'])}",
             "fail" if local_perf["fail"] else "ok",
-        ),
-        _render_focus_metric_card(
-            "Outstanding DI",
-            di_value,
-            di_detail_full,
-            di.get("severity", "ok"),
         ),
     ]
     parts: list[str] = []
@@ -4407,11 +4405,21 @@ def _buildkite_perf_rows(
     log_dir: Path | None = None,
     exclude_local_overlap: bool = False,
 ) -> tuple[dict[str, Any], dict[str, list[list[str]]]]:
+    # Compute local perf test keys up front so build_assets_perf_summary can
+    # gate the no-baseline fallback (baseline=0 rows) to local records only,
+    # keeping Buildkite-only no-baseline records hidden.
+    local_keys: frozenset[str] | None = None
+    if log_dir is not None:
+        resolved_dir = resolve_local_perf_result_dir(log_dir.resolve())
+        local_keys = (
+            collect_local_perf_test_keys(resolved_dir) if resolved_dir else frozenset()
+        )
     summary = build_assets_perf_summary(
         assets_dir=kanban_cfg.assets_dir,
         kanban_repo_root=kanban_cfg.repo_root,
         expected_remote=kanban_cfg.expected_remote,
         expected_branch=kanban_cfg.expected_branch,
+        local_keys=local_keys,
     )
     if kanban_cfg.refresh_note:
         summary.setdefault("warnings", []).append(kanban_cfg.refresh_note)
@@ -4502,6 +4510,9 @@ def _render_buildkite_perf_inner_html(
         warn_html = "".join(f"<li>{html.escape(str(w))}</li>" for w in warnings)
         parts.append(f'<div class="note"><strong>Source config notes:</strong><ul>{warn_html}</ul></div>')
     if summary.get("status") != "ok":
+        msg = summary.get("message") or ""
+        if msg:
+            parts.append(f'<p class="note">{html.escape(str(msg))}</p>')
         return "\n".join(parts)
     parts.append(
         '<p class="hint">'
@@ -5057,15 +5068,8 @@ def emit_report_html(
     # Daily Focus uses the CUDA (canonical) Buildkite data — that is the
     # pipeline that matches the local H200/H800/A100 runs by default.
     cuda_build, cuda_jobs, _ = bk_results.get(CUDA_TARGET, (None, None, None))
-    # Capture one reference instant for all SLO-escalating DI computations in
-    # this run; see the markdown counterpart for rationale.
+    # Capture one reference instant for timestamping in this run.
     report_now = datetime.now(timezone.utc)
-    # Inherit yesterday's operator-entered Assignee / Maintainer values from
-    # the most recently archived nightly report so the operator doesn't have
-    # to re-type the same names every day. ``_parse_previous_nightly_di_overrides``
-    # returns an empty dict when no kanban repo root is configured or when
-    # yesterday's HTML is missing.
-    di_overrides = _parse_previous_nightly_di_overrides(kanban_cfg.repo_root, today=report_now)
     body_parts.append(
         _render_daily_focus_html(
             _daily_focus_data(
@@ -5075,7 +5079,6 @@ def emit_report_html(
                 log_dir=log_dir,
                 gh_token=_resolve_github_token(),
                 now=report_now,
-                di_overrides=di_overrides,
             )
         )
     )
@@ -5213,7 +5216,7 @@ def emit_report_html(
         title,
         css,
         "\n".join(body_parts),
-        tail=_github_issue_submit_script() + "\n" + _di_top10_inline_edit_script(),
+        tail=_github_issue_submit_script(),
     )
     print(doc, file=out_fp)
 

@@ -691,6 +691,42 @@ Apply **PR deduplication** (see above) for READY CI runs.
 - **READY CI**: only PR-introduced failures are silent (PR author fixes); all other attributions → issue + alert
 - **MERGE CI**: all failures → issue + alert (merged-to-main problems must be tracked)
 
+### ⛔ Scheduled-task automation write ban (applies to ALL cron-triggered runs)
+
+When this skill runs on a **cron schedule** (any `Scheduled Task` row above,
+including future ones not yet listed), the run must **never perform any
+automatic write operation against GitHub**. Specifically:
+
+- ❌ **Do NOT run `gh issue create`** (or any other command that creates
+  issues, PRs, or commits on GitHub). The "File issue" entries in the table
+  above describe *what the human should do*, not what the cron run does.
+- ❌ **Do NOT run `gh issue comment` / `gh pr comment`** (or any command
+  that posts comments, reviews, or reactions to GitHub).
+- ❌ **Do NOT call the GitHub REST/GraphQL mutation endpoints** that create
+  issues, comments, labels, or any other writeable resource.
+- ✅ **DO keep the `File issue` button / clickable link in the summary
+  table and per-job rows** — this is the human's manual entry point. The
+  cron run generates the fully-formed `https://github.com/.../issues/new?...`
+  URL (with URL-encoded title / env / code-version / bug-description params)
+  so the human can click to file the issue themselves.
+- ✅ Forward the summary table + per-job analysis to the alert group as usual.
+- ✅ CSV append + Buildkite log fetch are unaffected (those are not GitHub writes).
+
+**One-line rule:** the cron run *renders* the File-issue link for a human to
+click; it never *executes* the filing itself. All GitHub issue/comment
+creation is manual, human-initiated, via the button.
+
+**Repo-specific button targeting** (so the link points at the right repo):
+- **vllm-omni** tasks (READY / NPU READY / MERGE): button URL targets
+  `vllm-project/vllm-omni` with template `400-bug-report.yml` (skill default).
+- **afd-plugin** tasks (AFD READY / AFD MERGE): button URL targets
+  `vllm-project/afd-plugin` with template `500-ci-failure.yml` — **not** the
+  vllm-omni `400-bug-report.yml` (the skill default is wrong for this repo).
+
+> If a prompt explicitly re-enables auto-filing for a specific one-off run
+> (rare, human-requested), that prompt wins for that run only. The default
+> for every scheduled task is the ban above.
+
 ### Issue Template
 
 > **Reuse vllm-omni-test-report's Submit-issue format.** The constants and
@@ -708,16 +744,45 @@ Apply **PR deduplication** (see above) for READY CI runs.
 `nightly_local_log_report.py:1927-1933`):
 
 ```
-[Bug]: Nightly / CI failed - <test node id> - <first error keyword summary>
+[Bug]: <CI type> CI failed - <test node id> - <first error keyword summary>
 ```
 
-NPU context swaps the prefix to `[Bug][NPU]:` — same rule as the
+The `<CI type>` segment is **NOT fixed** — it is filled from the
+**source CI type** that produced the failure, so the title says which CI
+caught the bug:
+
+| Source CI type | `<CI type>` segment | Example full title |
+|----------------|---------------------|--------------------|
+| Ready CI (vllm-omni pipeline, non-main branch) | `READY` | `[Bug]: READY CI failed - tests/...::test_xxx - assert 1 == 0` |
+| Ready CI (vllm-omni-npu-ci pipeline, NPU) | `NPU READY` | `[Bug]: NPU READY CI failed - tests/...::test_xxx - ...` |
+| Merge CI (vllm-omni pipeline, main branch) | `MERGE` | `[Bug]: MERGE CI failed - tests/...::test_xxx - ...` |
+| AFD Ready CI (afd-plugin pipeline, non-main branch) | `AFD READY` | `[Bug]: AFD READY CI failed - tests/...::test_xxx - ...` |
+| AFD Merge CI (afd-plugin pipeline, main branch) | `AFD MERGE` | `[Bug]: AFD MERGE CI failed - tests/...::test_xxx - ...` |
+| Nightly build (legacy / generic) | `Nightly` | `[Bug]: Nightly CI failed - tests/...::test_xxx - ...` |
+
+Rules for the `<CI type>` segment:
+- Determine it from the **Buildkite pipeline + branch + CI type** the
+  current triage run is analyzing (the cron prompt always states the CI
+  type, e.g. "只分析 merge CI" → `MERGE`; "只分析 ready CI" on
+  `vllm-omni-npu-ci` → `NPU READY`; "只分析 ready CI" on `afd-plugin`
+  → `AFD READY`).
+- Uppercase, no `Nightly /` slash — the old `Nightly / CI failed` literal
+  is replaced by `<CI type> CI failed` (e.g. `READY CI failed`,
+  `MERGE CI failed`).
+- Keep the `[Bug]:` prefix and the `- <test node id> - <first error
+  keyword summary>` suffix unchanged.
+
+NPU context additionally swaps the `[Bug]:` prefix to `[Bug][NPU]:`
+(overrides the `[Bug]:` shown in the table above) — same rule as the
 test-report script (the `data-report-context` attribute contains
-`npu` ⇒ NPU prefix).
+`npu` ⇒ NPU prefix). So an NPU READY CI failure title is:
+`[Bug][NPU]: NPU READY CI failed - <test node id> - <first error summary>`.
 
 Examples:
-- `[Bug]: Nightly / CI failed - tests/tools/test_check_tts_adapter.py::test_gate_passes_on_current_tree - assert 1 == 0`
-- `[Bug]: Nightly / CI failed - tests/config/test_omni_config.py::test_diffusion_config_field_classification_covers_current_fields - AssertionError: Extra items: fa_deterministic`
+- `[Bug]: READY CI failed - tests/tools/test_check_tts_adapter.py::test_gate_passes_on_current_tree - assert 1 == 0`
+- `[Bug]: MERGE CI failed - tests/config/test_omni_config.py::test_diffusion_config_field_classification_covers_current_fields - AssertionError: Extra items: fa_deterministic`
+- `[Bug][NPU]: NPU READY CI failed - tests/...::test_npu_stage0 - RuntimeError: NPU out of memory`
+- `[Bug]: AFD MERGE CI failed - tests/...::test_afd_attn - AssertionError: ...`
 
 **Labels** (always all three — same as `VLLM_OMNI_BUG_ISSUE_LABELS_CI`):
 `bug`, `ci-failure`, `high priority`.

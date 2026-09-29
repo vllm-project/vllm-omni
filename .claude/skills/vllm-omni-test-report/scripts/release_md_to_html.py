@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import html
 import math
+import os
 import re
 import sys
 from datetime import datetime, timezone
@@ -535,7 +536,7 @@ def _wrap_release_report_h2_sections(html_fragment: str) -> str:
 
 
 def _test_result_h3_is_gpu_card(h3_block: str) -> bool:
-    """True if the block opens with an ``h3`` for H100 / H200 / H800 / A100 / A3 (not Common stack)."""
+    """True if the block opens with an ``h3`` for H100 / H200 / H800 / A100 / A3 / B200 (not Common stack)."""
     m = re.match(r"\s*<h3>([\s\S]*?)</h3>", h3_block.strip())
     if not m:
         return False
@@ -555,7 +556,11 @@ def _test_result_h3_is_gpu_card(h3_block: str) -> bool:
     # Allow optional whitespace between ``H100`` and the opening paren so that the
     # Buildkite-side heading ``H100 (CI — Buildkite scheduled nightly)`` is still
     # treated as a GPU card and folded.
-    return bool(re.match(r"H100(?:\s*[（(]|\Z)", inner_text, re.IGNORECASE))
+    if re.match(r"H100(?:\s*[（(]|\Z)", inner_text, re.IGNORECASE):
+        return True
+    # ``### B200``, ``### B200 (CI — Buildkite scheduled release)`` — same paren-suffix rule
+    # as H100 so the B200 Buildkite-side chapter folds into a collapsible card too.
+    return bool(re.match(r"B200(?:\s*[（(]|\Z)", inner_text, re.IGNORECASE))
 
 
 def _balanced_outer_section_end(html: str, section_open_lt: int) -> int | None:
@@ -787,7 +792,29 @@ def _upgrade_status_cells_in_failure_tables(html_fragment: str) -> str:
     STATUS_CELL_RE = re.compile(r"<td>Filed\s*/\s*Not an issue</td>")
     TABLE_RE = re.compile(r"<table[^>]*>.*?</table>", re.DOTALL | re.IGNORECASE)
     SECTION_HEADING_RE = re.compile(r"<h([2-5])[^>]*>(.*?)</h\1>", re.DOTALL | re.IGNORECASE)
+    # Folded-card summary titles. ``_fold_test_result_gpu_sections`` replaces the
+    # gpu-card ``<h3>`` with ``<summary><span class="release-gpu-details-title">``,
+    # and ``_wrap_failure_analysis_h4_in_details`` / the h4/h5 subcard folders
+    # replace ``<h4>``/``<h5>`` with ``<summary><span class="report-subcard-title">``
+    # inside ``<details class="...release-hN-fold">``. SECTION_HEADING_RE (h2-h5)
+    # can't see these, so a Status table nested inside a folded card (e.g. the
+    # B200 "Failed test jobs" table) would fall back to the nearest unfolded
+    # heading ("Overall test execution summary") and produce a wrong, collision-
+    # prone row-id. Treat the gpu-card title as level 3 (gpu cards always replace
+    # an h3 — see ``_test_result_h3_is_gpu_card``) and the subcard title as the
+    # level encoded in its ``release-hN-fold`` class so the chain resolves
+    # correctly (``Test Result::B200::Failed test jobs::row-N``).
     _heading_text_re = re.compile(r"<[^>]+>")
+    GPU_FOLD_TITLE_RE = re.compile(
+        r'<details class="[^"]*release-gpu-details[^"]*">.*?'
+        r'<span class="release-gpu-details-title">(.*?)</span>',
+        re.DOTALL | re.IGNORECASE,
+    )
+    SUBCARD_FOLD_TITLE_RE = re.compile(
+        r'<details class="[^"]*release-h(\d)-fold[^"]*">.*?'
+        r'<span class="report-subcard-title">(.*?)</span>',
+        re.DOTALL | re.IGNORECASE,
+    )
 
     def _table_replace(table_html: str, ctx_chain: list[str]) -> str:
         if STATUS_HEADER not in table_html:
@@ -802,17 +829,34 @@ def _upgrade_status_cells_in_failure_tables(html_fragment: str) -> str:
 
         return STATUS_CELL_RE.sub(_cell_sub, table_html)
 
-    # Pre-compute (position, level, text) tuples for h2-h5 headings so we can
-    # rebuild the heading chain (in source order, descending level) that
-    # precedes each table without re-scanning.
-    headings = [
-        (
-            m.start(),
-            int(m.group(1)),
-            _heading_text_re.sub("", m.group(2)).strip()[:80] or "report",
+    # Pre-compute (position, level, text) tuples for h2-h5 headings AND folded
+    # summary titles so we can rebuild the heading chain (in source order,
+    # descending level) that precedes each table without re-scanning. Folded
+    # titles are merged in by position; their level is 3 for gpu cards and the
+    # ``release-hN-fold`` digit for subcards.
+    raw_headings: list[tuple[int, int, str]] = []
+    for m in SECTION_HEADING_RE.finditer(html_fragment):
+        raw_headings.append(
+            (
+                m.start(),
+                int(m.group(1)),
+                _heading_text_re.sub("", m.group(2)).strip()[:80] or "report",
+            )
         )
-        for m in SECTION_HEADING_RE.finditer(html_fragment)
-    ]
+    for m in GPU_FOLD_TITLE_RE.finditer(html_fragment):
+        raw_headings.append(
+            (m.start(), 3, _heading_text_re.sub("", m.group(1)).strip()[:80] or "gpu")
+        )
+    for m in SUBCARD_FOLD_TITLE_RE.finditer(html_fragment):
+        raw_headings.append(
+            (
+                m.start(),
+                int(m.group(1)),
+                _heading_text_re.sub("", m.group(2)).strip()[:80] or "subsection",
+            )
+        )
+    raw_headings.sort(key=lambda h: h[0])
+    headings = raw_headings
 
     rebuilt: list[str] = []
     pos = 0
@@ -2118,82 +2162,303 @@ def _upgrade_resource_usage_block(html_fragment: str) -> str:
 
 
 # ── Quality Defense Radar ──────────────────────────────────────────────
-# Per-model 5-axis coverage radar. Nine flagship models are rendered as a
-# 3×3 grid of small pentagon SVGs; each radar carries 8 clickable segments
-# (5 axes, of which Functionality / Performance / Stability are split into
-# GPU + NPU halves that share one circle, while Documentation / Reliability
-# are single circles). Click any segment to toggle gray ↔ green; state is
-# mirrored to a ``data-quality-on`` attribute on the ``<g class="qd-segment">``
-# (so a Save-Page-As download preserves the toggled state) **and** to
-# ``localStorage["quality-defense:<model>:<axis>"]`` for reload persistence.
+# Per-model N-axis coverage radar. Ten flagship models are rendered as a
+# 3-column grid of small N-gon SVGs. Each radar carries up to 13 clickable
+# segments across 7 axes (Functionality / Performance / Documentation /
+# Precision / Stability / Reliability / Gate). Six axes are split into GPU
+# + NPU halves that share one circle (GPU half turns green, NPU half turns
+# blue); the Reliability axis is a single circle (green). Models without a
+# Reliability axis render a 6-axis hexagon; Cosmos renders all axes as
+# single circles (GPU-only, no split). Click any segment to toggle gray ↔
+# green/blue; state is mirrored to a ``data-quality-on`` attribute on the
+# ``<g class="qd-segment">`` (so a Save-Page-As download preserves the
+# toggled state) **and** to ``localStorage["quality-defense:<model>:<axis>"]``
+# for reload persistence.
 #
-# The geometry below is hand-precomputed from a regular pentagon:
+# Segments are pre-lit (``data-quality-on="1"`` baked at render time) from
+# the vllm-omni repo code via :func:`_compute_quality_defense_coverage`; the
+# click-toggle JS reads this attribute first, so the baked state is the
+# initial render and clicks still override it within a session.
+#
+# Geometry is computed from a regular N-gon (N = axis count for the model):
 #   * ViewBox 300×300, centre at (150, 150).
-#   * Outer pentagon radius 105, inner pentagon radius 50.
-#   * Split-axis midpoints sit at radius 75 (between inner and outer).
+#   * Outer polygon radius 105, inner polygon radius 50.
+#   * Segment midpoints sit at radius 75 (between inner and outer).
 #   * Half-circle radius 18 for split segments; full-circle radius 18 for
-#     single segments.
-#   * Pentagon vertex angles (degrees, SVG Y-down, clockwise from top):
-#       Functionality  -90°   (top)
-#       Performance   -18°   (top-right)
-#       Documentation  54°   (bottom-right)
-#       Stability     126°   (bottom-left)
-#       Reliability   198°  (top-left)
+#     single segments. Axis labels sit at radius 117 (pure radial).
+#   * Axis k is at angle  -90 + k * (360 / N)  degrees (SVG Y-down).
 _QUALITY_DEFENSE_MODELS = (
-    ("qwen-omni",   "Qwen3-Omni"),
-    ("minicpm",     "MiniCPM"),
-    ("qwen-tts",    "Qwen-TTS"),
-    ("qwen-image",  "Qwen-Image"),
+    ("qwen-omni",     "Qwen3-Omni"),
+    ("minicpm",       "MiniCPM"),
+    ("qwen-tts",      "Qwen-TTS"),
+    ("qwen-image",    "Qwen-Image"),
     ("HunyuanImage",  "HunyuanImage"),
     ("HunyuanVideo",  "HunyuanVideo"),
-    ("Wan",         "Wan"),
-    ("MinimaxH3",   "MinimaxH3"),
-    ("Cosmos",      "Cosmos"),
+    ("Wan",           "Wan"),
+    ("MinimaxH3",     "MinimaxH3"),
+    ("Cosmos",        "Cosmos"),
+    ("lingbot",       "LingBot"),
 )
 
-_QUALITY_DEFENSE_AXIS_KEYS = ("func", "perf", "doc", "stab", "rel")
+# Cyclic axis order. ``rel`` is conditionally present (see
+# ``_QUALITY_DEFENSE_HAS_REL``); the other six are always present.
+_QUALITY_DEFENSE_AXIS_ORDER = ("func", "perf", "doc", "prec", "stab", "rel", "gate")
 _QUALITY_DEFENSE_AXIS_LABELS = {
     "func": "Functionality",
     "perf": "Performance",
     "doc":  "Documentation",
+    "prec": "Precision",
     "stab": "Stability",
     "rel":  "Reliability",
+    "gate": "Gate",
 }
-_QUALITY_DEFENSE_AXIS_ANGLES = {
-    "func": -90,
-    "perf": -18,
-    "doc":  54,
-    "stab": 126,
-    "rel":  198,
+
+# Models that include the Reliability axis (7-axis heptagon). All other
+# models render a 6-axis hexagon (no Reliability).
+_QUALITY_DEFENSE_HAS_REL = frozenset({"qwen-omni", "minicpm", "HunyuanImage", "Wan"})
+
+# Models that render every axis as a single circle (no GPU/NPU split).
+# Cosmos is GPU-only and uses single-circle axes.
+_QUALITY_DEFENSE_SINGLE_MODE = frozenset({"Cosmos"})
+
+
+def _qd_axes_for(model_id: str) -> list[str]:
+    """Ordered axis list for ``model_id`` (drops ``rel`` when absent)."""
+    if model_id in _QUALITY_DEFENSE_HAS_REL:
+        return list(_QUALITY_DEFENSE_AXIS_ORDER)
+    return [a for a in _QUALITY_DEFENSE_AXIS_ORDER if a != "rel"]
+
+
+def _qd_axis_angles(axes: list[str]) -> dict[str, float]:
+    """Regular N-gon vertex angles (degrees) for the given axis list."""
+    n = len(axes)
+    return {a: -90 + k * (360.0 / n) for k, a in enumerate(axes)}
+
+# Substring keywords used to detect each radar model's tests/docs in the
+# vllm-omni repo. Order matches ``_QUALITY_DEFENSE_MODELS``. Multiple keywords
+# per model are OR-matched against CI yaml text, test paths, and examples.
+# Both the specific form (e.g. ``minicpmo_4_5``) and a broader family form
+# (e.g. ``minicpmo``) are included so the ``tests/examples`` check — whose
+# files use shorter names like ``test_minicpmo_realtime_*`` / ``Wan2`` — still
+# matches, while the CI-lane yaml check keeps its precise match.
+_QUALITY_DEFENSE_MODEL_KEYWORDS: dict[str, tuple[str, ...]] = {
+    "qwen-omni":    ("qwen3_omni",),
+    "minicpm":      ("minicpmo_4_5", "minicpmo", "minicpm"),
+    "qwen-tts":     ("qwen3_tts",),
+    "qwen-image":   ("qwen_image",),
+    "HunyuanImage": ("hunyuan_image3", "hunyuan_image", "hunyuanimage"),
+    "HunyuanVideo": ("hunyuanvideo15", "hunyuanvideo", "hunyuan_video"),
+    "Wan":          ("wan22", "wan2_2", "wan2"),
+    "MinimaxH3":    ("minimax_h3", "minimax"),
+    "Cosmos":       ("cosmos3", "cosmos"),
+    "lingbot":      ("lingbot",),
 }
-# Visual offset (in SVG units) from the outer pentagon vertex where the
-# axis label is drawn. Keys map the axis name to (dx, dy).
-_QUALITY_DEFENSE_LABEL_OFFSETS = {
-    "func": (0, -10),
-    "perf": (10, -4),
-    "doc":  (0, 16),
-    "stab": (0, 16),
-    "rel":  (-10, -4),
-}
+
+
+def _qd_repo_root() -> Path | None:
+    """Resolve the vllm-omni repo root for the coverage scan.
+
+    Resolution order (matches the skill's REPO_ROOT convention):
+    explicit ``$REPO_ROOT`` → default ``~/vllm-omni`` if it exists → ``None``.
+    Returns ``None`` when no repo is reachable so callers fall back to all-off.
+    """
+    env = os.environ.get("REPO_ROOT")
+    if env:
+        root = Path(env).expanduser()
+        return root if root.is_dir() else None
+    default = Path.home() / "vllm-omni"
+    return default if default.is_dir() else None
+
+
+def _qd_read_yamls(repo_root: Path, files: list[str]) -> str:
+    """Concatenate the text of the given ``.buildkite`` YAML files."""
+    out: list[str] = []
+    for rel in files:
+        path = repo_root / rel
+        if path.is_file():
+            try:
+                out.append(path.read_text(errors="ignore"))
+            except OSError:
+                pass
+    return "\n".join(out)
+
+
+def _qd_lane_yaml(repo_root: Path, lane: str) -> str:
+    """Nightly test YAML text for a CI lane (``cuda`` or ``npu``).
+
+    Used for ``func`` / ``perf`` / ``stab`` coverage. Returns ``""`` when the
+    lane dir / files are absent.
+    """
+    if lane == "cuda":
+        return _qd_read_yamls(repo_root, [".buildkite/cuda/test-nightly.yml"])
+    return _qd_read_yamls(
+        repo_root,
+        [".buildkite/npu/test-npu-nightly.yml", ".buildkite/npu/test-npu-ready.yml"],
+    )
+
+
+def _qd_gate_yaml(repo_root: Path, lane: str) -> str:
+    """Merge/ready gate YAML text for a CI lane (``cuda`` or ``npu``).
+
+    Used for the ``gate`` axis (model is in the merge/ready CI gate).
+    """
+    if lane == "cuda":
+        return _qd_read_yamls(
+            repo_root, [".buildkite/cuda/test-merge.yml", ".buildkite/cuda/test-ready.yml"]
+        )
+    return _qd_read_yamls(repo_root, [".buildkite/npu/test-npu-ready.yml"])
+
+
+def _compute_quality_defense_coverage(
+    repo_root: Path | None,
+) -> dict[str, dict]:
+    """Decide which radar segments are pre-lit, from the vllm-omni repo.
+
+    Returns ``{model_id: {"gpu": set[axis], "npu": set[axis], "rel": bool}}``
+    where ``axis`` is one of ``func|perf|doc|prec|stab|gate`` (the six split
+    axes; ``rel`` is reported separately because it is always a single
+    circle).
+
+    Evidence per axis (lane-gated for the split axes):
+
+    - ``func`` / ``stab`` — the model has a nightly test step in the lane's
+      nightly YAML. ``stab`` tracks ``func`` per lane ("this lane exercises
+      the model nightly").
+    - ``perf`` — the same lane YAML references a ``bench`` / ``throughput`` /
+      ``perf`` step near the model keyword.
+    - ``doc`` — ``tests/examples/`` has a usage example for the model (a
+      runnable example serves as "documentation" for driving it), gated by
+      lane presence (lights only on lanes where ``func`` is lit).
+    - ``prec`` — ``tests/e2e/accuracy/`` has an accuracy test for the model
+      (numerical precision), gated by lane presence.
+    - ``gate`` — the model appears in the lane's merge/ready gate YAML
+      (``test-merge.yml`` / ``test-ready.yml`` for cuda; ``test-npu-ready.yml``
+      for npu).
+    - ``rel`` — ``tests/dfx/reliability/`` has a reliability test for the
+      model (single axis; only ``_QUALITY_DEFENSE_HAS_REL`` models render a
+      Reliability segment, but the flag is computed for all models).
+
+    When ``repo_root`` is ``None`` or unreachable, every model returns empty
+    sets (the radar renders all-gray, i.e. the pre-change behavior).
+    """
+    empty = {mid: {"gpu": set(), "npu": set(), "rel": False} for mid, _ in _QUALITY_DEFENSE_MODELS}
+    if repo_root is None or not repo_root.is_dir():
+        return empty
+
+    cuda_nightly = _qd_lane_yaml(repo_root, "cuda")
+    npu_nightly = _qd_lane_yaml(repo_root, "npu")
+    cuda_gate = _qd_gate_yaml(repo_root, "cuda")
+    npu_gate = _qd_gate_yaml(repo_root, "npu")
+
+    def _grep_dir(dirpath: Path, suffixes: tuple[str, ...]) -> bool:
+        if not dirpath.is_dir():
+            return False
+        for path in dirpath.rglob("*"):
+            if not path.is_file() or path.suffix not in (".md", ".py"):
+                continue
+            try:
+                hay = (path.name + "\n" + path.read_text(errors="ignore")).lower()
+            except OSError:
+                continue
+            if any(kw in hay for kw in suffixes):
+                return True
+        return False
+
+    out: dict[str, dict] = {}
+    for model_id, _ in _QUALITY_DEFENSE_MODELS:
+        kws = _QUALITY_DEFENSE_MODEL_KEYWORDS.get(model_id, ())
+        kws_lower = tuple(k.lower() for k in kws)
+
+        def _lane_has(text: str, *, perf: bool = False) -> bool:
+            if not text:
+                return False
+            low = text.lower()
+            for kw in kws_lower:
+                # Find each keyword occurrence and check the surrounding window
+                # for a perf-collection signal (bench / throughput / perf).
+                # For func/stab/gate, a plain keyword hit suffices.
+                idx = low.find(kw)
+                while idx != -1:
+                    if perf:
+                        window = low[max(0, idx - 120): idx + len(kw) + 200]
+                        if any(p in window for p in ("bench", "throughput", "perf")):
+                            return True
+                    else:
+                        return True
+                    idx = low.find(kw, idx + len(kw))
+            return False
+
+        gpu: set[str] = set()
+        npu: set[str] = set()
+
+        # func / stab / perf per lane (nightly YAML).
+        if _lane_has(cuda_nightly):
+            gpu.update({"func", "stab"})
+        if _lane_has(cuda_nightly, perf=True):
+            gpu.add("perf")
+        if _lane_has(npu_nightly):
+            npu.update({"func", "stab"})
+        if _lane_has(npu_nightly, perf=True):
+            npu.add("perf")
+
+        # gate per lane (merge/ready YAML).
+        if _lane_has(cuda_gate):
+            gpu.add("gate")
+        if _lane_has(npu_gate):
+            npu.add("gate")
+
+        # doc / prec — repo-wide evidence, gated by lane presence (func lit).
+        has_doc = _grep_dir(repo_root / "tests" / "examples", kws_lower)
+        if has_doc and "func" in gpu:
+            gpu.add("doc")
+        if has_doc and "func" in npu:
+            npu.add("doc")
+        has_prec = _grep_dir(repo_root / "tests" / "e2e" / "accuracy", kws_lower)
+        if has_prec and "func" in gpu:
+            gpu.add("prec")
+        if has_prec and "func" in npu:
+            npu.add("prec")
+
+        # rel — reliability suite (single axis).
+        rel = _grep_dir(repo_root / "tests" / "dfx" / "reliability", kws_lower)
+
+        out[model_id] = {"gpu": gpu, "npu": npu, "rel": rel}
+
+    return out
 
 
 def _qd_pentagon_point(angle_deg: float, radius: float) -> tuple[float, float]:
-    """Regular pentagon vertex at the given angle and radius from (150,150)."""
+    """Polar-to-cartesian: point at ``angle_deg`` / ``radius`` from (150,150)."""
     rad = math.radians(angle_deg)
     return (150 + radius * math.cos(rad), 150 + radius * math.sin(rad))
 
 
-def _qd_model_radar_svg(model_id: str) -> str:
-    """Inline SVG for a single model's 5-axis coverage radar."""
-    # Pentagon rings (outer and inner) — drawn once as decoration.
-    outer_pts = [
-        _qd_pentagon_point(_QUALITY_DEFENSE_AXIS_ANGLES[k], 105)
-        for k in _QUALITY_DEFENSE_AXIS_KEYS
-    ]
-    inner_pts = [
-        _qd_pentagon_point(_QUALITY_DEFENSE_AXIS_ANGLES[k], 50)
-        for k in _QUALITY_DEFENSE_AXIS_KEYS
-    ]
+def _qd_model_radar_svg(model_id: str, lit: dict | None = None) -> str:
+    """Inline SVG for a single model's N-axis coverage radar.
+
+    ``lit`` is ``{"gpu": set[axis], "npu": set[axis], "rel": bool}`` (from
+    :func:`_compute_quality_defense_coverage`). Each lit segment gets
+    ``data-quality-on="1"`` baked into its ``<g>`` tag; the click-toggle JS
+    reads this attribute first (before localStorage) so the baked state is the
+    initial render, and clicks still toggle it within a session.
+
+    Axis layout is a regular N-gon (N = 6 for models without Reliability, 7
+    with). Six axes are split into GPU + NPU halves of one circle (GPU half
+    sweep=0, NPU half sweep=1); Reliability is a single circle. In
+    ``_QUALITY_DEFENSE_SINGLE_MODE`` (Cosmos) every axis renders as a single
+    circle and lights when either lane has evidence.
+    """
+    lit = lit or {"gpu": set(), "npu": set(), "rel": False}
+    gpu_axes = lit.get("gpu", set())
+    npu_axes = lit.get("npu", set())
+    rel_on = bool(lit.get("rel", False))
+    single_mode = model_id in _QUALITY_DEFENSE_SINGLE_MODE
+
+    axes = _qd_axes_for(model_id)
+    angles = _qd_axis_angles(axes)
+
+    outer_pts = [_qd_pentagon_point(angles[a], 105) for a in axes]
+    inner_pts = [_qd_pentagon_point(angles[a], 50) for a in axes]
     outer_str = " ".join(f"{p[0]:.1f},{p[1]:.1f}" for p in outer_pts)
     inner_str = " ".join(f"{p[0]:.1f},{p[1]:.1f}" for p in inner_pts)
 
@@ -2202,65 +2467,56 @@ def _qd_model_radar_svg(model_id: str) -> str:
         for p in outer_pts
     )
 
-    axis_label_xml = "\n      ".join(
-        f'<text class="qd-axis-label" x="{outer_pts[i][0] + _QUALITY_DEFENSE_LABEL_OFFSETS[k][0]:.1f}" '
-        f'y="{outer_pts[i][1] + _QUALITY_DEFENSE_LABEL_OFFSETS[k][1]:.1f}" '
-        f'text-anchor="middle">{_QUALITY_DEFENSE_AXIS_LABELS[k]}</text>'
-        for i, k in enumerate(_QUALITY_DEFENSE_AXIS_KEYS)
-    )
-
-    # Split axes (Functionality / Performance / Stability) — two halves of
-    # one circle each. Each half is rendered inside a `<g transform="…">` so
-    # the canonical vertical-diameter half-circles get rotated to align with
-    # the axis direction. The canonical LEFT half (sweep=0, bulges to −X)
-    # labels "GPU"; the canonical RIGHT half (sweep=1, bulges to +X) labels
-    # "NPU". After rotation the GPU half always bulges opposite to the axis
-    # direction (closer to centre); NPU bulges along the axis (further out).
-    #
-    # GPU vs NPU are visually distinguished two ways (so reviewers can tell
-    # them apart at a glance):
-    #   1. ``data-qd-side="gpu"|"npu"`` attribute drives CSS colour rules
-    #      (GPU on = light green; NPU on = light blue — see the radar CSS).
-    #   2. The NPU halves also carry ``stroke-dasharray`` in the default
-    #      state so even before clicking, the two halves read as "solid
-    #      outline" vs "dashed outline".
-    split_xml_parts: list[str] = []
-    for axis_key in ("func", "perf", "stab"):
-        angle = _QUALITY_DEFENSE_AXIS_ANGLES[axis_key]
+    # Segments: split (gpu/npu halves) or single circle, per axis / model mode.
+    segment_parts: list[str] = []
+    for a in axes:
+        angle = angles[a]
         mx, my = _qd_pentagon_point(angle, 75)
-        axis_label = _QUALITY_DEFENSE_AXIS_LABELS[axis_key]
-        split_xml_parts.append(
-            f'<g class="qd-segment" data-quality-key="{model_id}:{axis_key}-gpu" '
-            f'data-qd-side="gpu" tabindex="0" role="button" '
-            f'aria-label="{model_id} {axis_label} GPU" aria-pressed="false">'
-            f'<g transform="translate({mx:.1f} {my:.1f}) rotate({angle})">'
+        ax_label = _QUALITY_DEFENSE_AXIS_LABELS[a]
+
+        if single_mode or a == "rel":
+            on = (rel_on if a == "rel" else (a in gpu_axes or a in npu_axes))
+            on_attr = ' data-quality-on="1"' if on else ""
+            pressed = "true" if on else "false"
+            segment_parts.append(
+                f'<g class="qd-segment" data-quality-key="{model_id}:{a}"{on_attr} '
+                f'tabindex="0" role="button" '
+                f'aria-label="{model_id} {ax_label}" aria-pressed="{pressed}">'
+                f'<circle class="qd-circle" cx="{mx:.1f}" cy="{my:.1f}" r="18"/>'
+                f"</g>"
+            )
+            continue
+
+        # Split axis: GPU half (sweep=0) then NPU half (sweep=1).
+        gpu_on = a in gpu_axes
+        npu_on = a in npu_axes
+        gpu_attr = ' data-quality-on="1"' if gpu_on else ""
+        npu_attr = ' data-quality-on="1"' if npu_on else ""
+        segment_parts.append(
+            f'<g class="qd-segment" data-quality-key="{model_id}:{a}-gpu" '
+            f'data-qd-side="gpu"{gpu_attr} tabindex="0" role="button" '
+            f'aria-label="{model_id} {ax_label} GPU" aria-pressed="{"true" if gpu_on else "false"}">'
+            f'<g transform="translate({mx:.1f} {my:.1f}) rotate({angle:.4f})">'
             f'<path class="qd-half qd-half--gpu" d="M 0 18 A 18 18 0 0 0 0 -18 Z"/>'
             f"</g></g>"
         )
-        split_xml_parts.append(
-            f'<g class="qd-segment" data-quality-key="{model_id}:{axis_key}-npu" '
-            f'data-qd-side="npu" tabindex="0" role="button" '
-            f'aria-label="{model_id} {axis_label} NPU" aria-pressed="false">'
-            f'<g transform="translate({mx:.1f} {my:.1f}) rotate({angle})">'
+        segment_parts.append(
+            f'<g class="qd-segment" data-quality-key="{model_id}:{a}-npu" '
+            f'data-qd-side="npu"{npu_attr} tabindex="0" role="button" '
+            f'aria-label="{model_id} {ax_label} NPU" aria-pressed="{"true" if npu_on else "false"}">'
+            f'<g transform="translate({mx:.1f} {my:.1f}) rotate({angle:.4f})">'
             f'<path class="qd-half qd-half--npu" d="M 0 18 A 18 18 0 0 1 0 -18 Z"/>'
             f"</g></g>"
         )
-    split_xml = "\n      ".join(split_xml_parts)
+    segment_xml = "\n      ".join(segment_parts)
 
-    # Single axes (Documentation / Reliability) — one circle each.
-    single_xml_parts: list[str] = []
-    for axis_key in ("doc", "rel"):
-        angle = _QUALITY_DEFENSE_AXIS_ANGLES[axis_key]
-        mx, my = _qd_pentagon_point(angle, 75)
-        axis_label = _QUALITY_DEFENSE_AXIS_LABELS[axis_key]
-        single_xml_parts.append(
-            f'<g class="qd-segment" data-quality-key="{model_id}:{axis_key}" '
-            f'tabindex="0" role="button" '
-            f'aria-label="{model_id} {axis_label}" aria-pressed="false">'
-            f'<circle class="qd-circle" cx="{mx:.1f}" cy="{my:.1f}" r="18"/>'
-            f"</g>"
-        )
-    single_xml = "\n      ".join(single_xml_parts)
+    # Axis labels at radius 117 (pure radial, just outside the outer polygon).
+    axis_label_xml = "\n      ".join(
+        f'<text class="qd-axis-label" x="{_qd_pentagon_point(angles[a], 117)[0]:.1f}" '
+        f'y="{_qd_pentagon_point(angles[a], 117)[1]:.1f}" '
+        f'text-anchor="middle">{_QUALITY_DEFENSE_AXIS_LABELS[a]}</text>'
+        for a in axes
+    )
 
     return f"""<svg class="qd-radar" viewBox="0 0 300 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="{model_id} quality defense radar">
       <g class="qd-grid" aria-hidden="true">
@@ -2268,48 +2524,82 @@ def _qd_model_radar_svg(model_id: str) -> str:
         <polygon class="qd-pentagon-inner" points="{inner_str}"/>
         {axis_lines}
       </g>
-      {single_xml}
-      {split_xml}
+      {segment_xml}
       {axis_label_xml}
     </svg>"""
 
 
-def _quality_defense_block_html() -> str:
-    """Assemble the full Quality Defense Radar block — intro + 3×3 grid + legend.
+def _qd_segment_count(model_id: str) -> int:
+    """Total clickable segments for ``model_id``'s radar."""
+    axes = _qd_axes_for(model_id)
+    if model_id in _QUALITY_DEFENSE_SINGLE_MODE:
+        return len(axes)
+    rel = 1 if "rel" in axes else 0
+    return (len(axes) - rel) * 2 + rel
 
-    The grid is rendered as nine ``<div class="qd-cell">`` cards; each card
-    carries its own ``<svg class="qd-radar">`` so click handlers remain
-    isolated per model (and per segment). The ``data-quality-key`` namespace
-    is ``<model-id>:<axis>[-gpu|-npu]`` so 72 unique localStorage entries are
-    produced for the full grid.
+
+def _qd_lit_count(model_id: str, cov: dict) -> int:
+    """Lit segment count for ``model_id`` given a coverage dict ``cov``."""
+    if model_id in _QUALITY_DEFENSE_SINGLE_MODE:
+        return len(set(cov.get("gpu", set())) | set(cov.get("npu", set())))
+    # Reliability only renders (and counts) for HAS_REL models.
+    rel_lit = 1 if (cov.get("rel") and model_id in _QUALITY_DEFENSE_HAS_REL) else 0
+    return len(cov.get("gpu", set())) + len(cov.get("npu", set())) + rel_lit
+
+
+def _quality_defense_block_html() -> str:
+    """Assemble the full Quality Defense Radar block — intro + grid + legend.
+
+    The grid is rendered as ten ``<div class="qd-cell">`` cards in a 3-column
+    grid; each card carries its own ``<svg class="qd-radar">`` so click
+    handlers remain isolated per model (and per segment). The
+    ``data-quality-key`` namespace is ``<model-id>:<axis>[-gpu|-npu]`` (or
+    ``<model-id>:<axis>`` for single-circle segments), producing 118 unique
+    localStorage entries for the full grid.
     """
+    coverage = _compute_quality_defense_coverage(_qd_repo_root())
     cells: list[str] = []
     for model_id, display_name in _QUALITY_DEFENSE_MODELS:
         cells.append(
             f'<div class="qd-cell" data-qd-model="{model_id}">'
             f'<h3 class="qd-cell-title">{display_name}</h3>'
-            f"{_qd_model_radar_svg(model_id)}"
+            f"{_qd_model_radar_svg(model_id, lit=coverage.get(model_id))}"
             f"</div>"
         )
     cells_xml = "\n      ".join(cells)
+    total_segments = sum(_qd_segment_count(mid) for mid, _ in _QUALITY_DEFENSE_MODELS)
+    lit_total = sum(
+        _qd_lit_count(mid, coverage[mid]) for mid, _ in _QUALITY_DEFENSE_MODELS
+    )
+    lit_note = (
+        f'Segments are pre-lit from the current vllm-omni repo code '
+        f'({lit_total}/{total_segments} lit) and remain click-to-override. '
+        if coverage and lit_total
+        else ""
+    )
     return (
         '<div class="qd-radar-wrap">'
-        '<p class="qd-intro">Per-model 5-axis coverage radar across '
-        '<strong>9 flagship models</strong> (Functionality / Performance / '
-        'Documentation / Stability / Reliability). Click any segment to mark '
-        'it as confirmed. The three split axes (Functionality / Performance / '
-        'Stability) expose <strong>GPU</strong> and <strong>NPU</strong> '
-        'halves of a single circle independently: GPU halves turn '
+        '<p class="qd-intro">Per-model 7-axis coverage radar across '
+        '<strong>10 flagship models</strong> (Functionality / Performance / '
+        'Documentation / Precision / Stability / Reliability / Gate). Click '
+        'any segment to mark it as confirmed. Six axes (Functionality / '
+        'Performance / Documentation / Precision / Stability / Gate) expose '
+        '<strong>GPU</strong> and <strong>NPU</strong> halves of a single '
+        'circle independently: GPU halves turn '
         '<strong style="color:#16a34a">green</strong> on click, NPU halves '
         'turn <strong style="color:#0284c7">blue</strong>; NPU halves also '
         'carry a dashed outline so the two sides are distinguishable even '
-        'before clicking. State is persisted in <code>localStorage</code>.</p>'
+        'before clicking. The Reliability axis is a single circle (green). '
+        'Models without a Reliability axis render a 6-axis hexagon; '
+        '<strong>Cosmos</strong> renders all axes as single circles '
+        '(GPU-only). ' + lit_note +
+        'State is persisted in <code>localStorage</code>.</p>'
         f'<div class="qd-grid">\n      {cells_xml}\n    </div>'
-        '<p class="qd-legend">Click a module: gray → '
-        '<strong style="color:#16a34a">green</strong> (GPU, confirmed) or '
-        '<strong style="color:#0284c7">blue</strong> (NPU, confirmed); '
-        'click again to revert. GPU halves carry a solid outline, NPU halves '
-        'carry a dashed outline. State saved in localStorage.</p>'
+        '<p class="qd-legend">Click a segment: gray → '
+        '<strong style="color:#16a34a">green</strong> (GPU / single, '
+        'confirmed) or <strong style="color:#0284c7">blue</strong> (NPU, '
+        'confirmed); click again to revert. GPU halves carry a solid outline, '
+        'NPU halves carry a dashed outline. State saved in localStorage.</p>'
         '</div>'
     )
 
@@ -2796,25 +3086,33 @@ def _gpu_details_extra_classes(title: str) -> str:
         return " release-gpu-details--a3"
     if re.match(r"H100", t, re.IGNORECASE):
         return " release-gpu-details--h100"
+    if re.match(r"B200", t, re.IGNORECASE):
+        return " release-gpu-details--b200"
     return ""
 
 
 def _gpu_summary_icon_markup(title: str) -> str:
     t = (title or "").strip()
-    paths = _RELEASE_SVG_CLOUD if re.match(r"H100", t, re.IGNORECASE) else _RELEASE_SVG_SERVER
+    # Buildkite-side CI chapters (H100 scheduled nightly, B200 scheduled release)
+    # use the cloud icon; local-GPU chapters use the server icon.
+    if re.match(r"H100", t, re.IGNORECASE) or re.match(r"B200", t, re.IGNORECASE):
+        paths = _RELEASE_SVG_CLOUD
+    else:
+        paths = _RELEASE_SVG_SERVER
     return _release_inline_svg(paths, size=20, extra_class="release-gpu-summary-ico")
 
 
 def _gpu_short_title(title: str) -> str:
-    """Reduce GPU h3 title to its short token (H100 / H200 / H800 / A100 / A3).
+    """Reduce GPU h3 title to its short token (H100 / H200 / H800 / A100 / A3 / B200).
 
-    ``### H100 (CI — Buildkite scheduled nightly)`` should still display as ``H100`` in the
+    ``### H100 (CI — Buildkite scheduled nightly)`` and ``### B200 (CI — Buildkite
+    scheduled release)`` should still display as ``H100`` / ``B200`` in the
     collapsible summary. Falls back to the original title when no token is found.
     """
     t = (title or "").strip()
     if not t:
         return t
-    m = re.match(r"\s*(H100|H200|H800|A100|A3)\b", t, re.IGNORECASE)
+    m = re.match(r"\s*(H100|H200|H800|A100|A3|B200)\b", t, re.IGNORECASE)
     return m.group(1).upper() if m else t
 
 

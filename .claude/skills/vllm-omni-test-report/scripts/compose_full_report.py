@@ -106,6 +106,20 @@ _NON_REPORTABLE_BK_JOB_NAMES: frozenset[str] = frozenset(
     }
 )
 
+# Buildkite job-name prefixes that are pure orchestration / infra (image build,
+# skip-ci resolve, pipeline upload, report collection). The B200 "Scheduled
+# Release" build runs these on ``cpu_queue_premerge``; they must not count as
+# B200 test jobs. Stricter than the legacy H100 filter (which only drops
+# ``Upload * Pipeline``) so the B200 Total / Passed / Failed reflect the real
+# ``b200-k8s`` test matrix.
+_BK_ORCHESTRATION_PREFIXES: tuple[str, ...] = (
+    ":pipeline:",
+    ":docker:",
+    ":buildkit:",
+    ":github:",
+    ":email:",
+)
+
 # Default build number used by ``preview_report_markdown`` / ``render_development_report_markdown_preview``
 # when no Buildkite call is made. Defined early so development-preview can use it as a kwarg default.
 PREVIEW_BUILD_NO = 12880
@@ -572,24 +586,18 @@ def render_next_steps_section(
 
 
 def render_quality_defense_section() -> str:
-    """Markdown for ``## Quality Defense Radar`` — per-model 5-axis coverage.
+    """Markdown for ``## Quality Defense Radar`` — per-model 7-axis coverage.
 
     Emits the H2 plus a single placeholder marker
     (``@@QUALITY_DEFENSE_INSERTION_POINT@@``) that
     :func:`release_md_to_html._upgrade_quality_defense_block` replaces with the
-    full 3×3 grid of inline SVGs (nine flagship models, each with 8 clickable
-    segments). **Release variant only** — the development and nightly variants
-    intentionally omit it.
+    full 3-column grid of inline SVGs (ten flagship models, each with up to 13
+    clickable segments across 7 axes). The SVG block carries its own
+    descriptive intro paragraph, so no preamble is emitted here. **Release
+    variant only** — the development and nightly variants intentionally omit it.
     """
     return (
         "## Quality Defense Radar\n\n"
-        "Per-model 5-axis coverage radar across 9 flagship models "
-        "(Qwen3-Omni, MiniCPM, Qwen-TTS, Qwen-Image, HunyuanImage, "
-        "HunyuanVideo, Wan, MinimaxH3, Cosmos). Click any segment to mark it "
-        "as confirmed. The three split axes (Functionality / Performance / "
-        "Stability) expose GPU and NPU halves of a single circle independently: "
-        "GPU halves turn green on click, NPU halves turn blue (with a dashed "
-        "outline in the default state).\n\n"
         "@@QUALITY_DEFENSE_INSERTION_POINT@@\n"
     )
 
@@ -1654,6 +1662,166 @@ def build_h100_ci_markdown_body(
     return f"#### Build\n\n{build_table_md}\n"
 
 
+# Max pages to scan when resolving the B200 release build (100 builds/page).
+# The B200 "Scheduled Release" build runs ~monthly, so a 75-day (15-page) window
+# comfortably covers one cadence gap; the resolver stops at the first match.
+_B200_MAX_PAGES = 15
+
+
+def _b200_is_reportable_job(name: str) -> bool:
+    """True iff a Buildkite job is a real B200 test job (not orchestration/infra).
+
+    Stricter than the legacy H100 filter (which only drops ``Upload * Pipeline``):
+    also excludes the ``:pipeline:`` / ``:docker:`` / ``:buildkit:`` / ``:github:``
+    / ``:email:`` orchestration steps that run on ``cpu_queue_premerge``, so the
+    B200 Total / Passed / Failed reflect the real ``b200-k8s`` test matrix.
+    """
+    n = (name or "").strip()
+    if not n:
+        return False
+    if UPLOAD_PIPELINE_RE.match(n):
+        return False
+    low = n.lower()
+    if low in _NON_REPORTABLE_BK_JOB_NAMES:
+        return False
+    if any(low.startswith(p) for p in _BK_ORCHESTRATION_PREFIXES):
+        return False
+    return True
+
+
+def latest_scheduled_release_b200_number(token: str) -> int:
+    """Return the latest ``Scheduled Release B200 build`` number on ``main``.
+
+    The B200 release build runs infrequently (~monthly), so a single
+    ``per_page=50`` page (as :func:`latest_scheduled_nightly_number` uses) is
+    not enough — page through up to :data:`_B200_MAX_PAGES` pages of 100 builds
+    (~75-day window) and return the first build whose message matches
+    ``scheduled release b200``.
+    """
+    pattern = re.compile(r"scheduled\s+release\s+b200", re.I)
+    for page in range(1, _B200_MAX_PAGES + 1):
+        url = (
+            f"https://api.buildkite.com/v2/organizations/{ORG}/pipelines/{PIPELINE}"
+            f"/builds?branch={BRANCH}&per_page=100&page={page}"
+        )
+        builds = http_json(url, token)
+        assert isinstance(builds, list)
+        if not builds:
+            break
+        for b in builds:
+            if pattern.search((b.get("message") or "")):
+                return int(b["number"])
+    raise RuntimeError(
+        "No 'Scheduled Release B200 build' found on main within "
+        f"{_B200_MAX_PAGES * 100} recent builds. Pin one explicitly with --b200-build."
+    )
+
+
+def fetch_b200_build_summary(token: str, build_no: int | None = None) -> dict:
+    """Fetch the latest (or pinned) Scheduled Release B200 build + reportable-job summary.
+
+    Single Buildkite API call (``GET .../builds/{n}`` with jobs embedded).
+    Returns a dict: ``build_no``, ``branch``, ``commit``, ``state``,
+    ``created_at``, ``passed``, ``failed``, ``broken``, ``failed_steps``
+    (list of ``(name, state, link)``). ``broken`` is counted separately and
+    excluded from ``failed`` (matches the H100 rule at the dev-path walk).
+    """
+    no = build_no if build_no else latest_scheduled_release_b200_number(token)
+    url = f"https://api.buildkite.com/v2/organizations/{ORG}/pipelines/{PIPELINE}/builds/{no}"
+    build = http_json(url, token)
+    assert isinstance(build, dict)
+    jobs = build.get("jobs") or []
+    reportable = [j for j in jobs if _b200_is_reportable_job((j.get("name") or ""))]
+    passed = sum(1 for j in reportable if (j.get("state") or "").lower() == "passed")
+    failed = sum(1 for j in reportable if (j.get("state") or "").lower() == "failed")
+    broken = sum(1 for j in reportable if (j.get("state") or "").lower() == "broken")
+    failed_steps: list[tuple[str, str, str]] = []
+    for j in reportable:
+        if (j.get("state") or "").lower() == "failed":
+            name = (j.get("name") or "").replace("|", "/")
+            jid = j.get("id") or ""
+            link = f"https://buildkite.com/{ORG}/{PIPELINE}/builds/{no}#{jid}"
+            failed_steps.append((name, (j.get("state") or "").lower(), link))
+    return {
+        "build_no": int(no),
+        "branch": build.get("branch") or BRANCH,
+        "commit": build.get("commit") or "",
+        "state": (build.get("state") or "").lower(),
+        "created_at": build.get("created_at") or "",
+        "passed": passed,
+        "failed": failed,
+        "broken": broken,
+        "failed_steps": failed_steps,
+    }
+
+
+def build_b200_ci_markdown_body(
+    *,
+    build_no: int,
+    branch: str,
+    commit: str,
+    state: str,
+    created_at: str,
+    passed: int,
+    failed: int,
+    broken: int,
+    failed_steps: list[tuple[str, str, str]],
+) -> str:
+    """Render the B200 (CI — Buildkite scheduled release) chapter body.
+
+    Lightweight: build metadata + reportable-job summary + a failed-step table
+    with Buildkite links. No per-job log download (matches the H100 chapter
+    precedent). The failed-step detail lives here (not in a separate Failure
+    Analysis subsection), so the Summary and Failed-jobs blocks are kept.
+    """
+    short = commit[:7] if len(commit) >= 7 else commit
+    build_link = f"https://buildkite.com/{ORG}/{PIPELINE}/builds/{build_no}"
+    created_short = (created_at or "").replace("T", " ")[:19] or "—"
+    total = passed + failed + broken
+    commit_cell = (
+        f"`{short}` ([full](https://github.com/vllm-project/vllm-omni/commit/{commit}))"
+        if commit
+        else "—"
+    )
+    build_table = render_markdown_table(
+        ["Field", "Value"],
+        [
+            ["**Build**", f"[{build_no}]({build_link})"],
+            ["**Branch**", branch],
+            ["**Commit**", commit_cell],
+            ["**State**", state or "—"],
+            ["**Created (UTC)**", created_short],
+        ],
+    )
+    summary_table = render_markdown_table(
+        ["Total", "Passed", "Failed", "Broken"],
+        [[str(total), str(passed), str(failed), str(broken)]],
+    )
+    parts = [
+        f"#### Build\n\n{build_table}\n",
+        f"#### Summary (reportable jobs)\n\n{summary_table}\n",
+    ]
+    if failed_steps:
+        # Mirror the H100 failure-analysis column set so the markdown→HTML
+        # post-processors (``_upgrade_submit_issue_cells_in_failure_tables``
+        # + ``_upgrade_status_cells_in_failure_tables`` in release_md_to_html)
+        # upgrade these cells into an interactive "Submit issue" button and a
+        # "Filed / Not an issue" Status cell (the Filed flow prompts for a
+        # GitHub issue number, persisted in localStorage per row-id). The
+        # heading chain ``Test Result → B200 (…) → Failed test jobs`` keeps
+        # each B200 job's row-id unique. See ``build_h100_failure_analysis_block``
+        # for the precedent.
+        rows = [
+            [name, st, f"[open]({link})" if link else "—", "—", "Filed / Not an issue"]
+            for (name, st, link) in failed_steps
+        ]
+        parts.append(
+            f"#### Failed test jobs\n\n"
+            f"{render_markdown_table(['Job', 'State', 'Step link', 'Submit Issue', 'Status'], rows)}\n"
+        )
+    return "\n".join(parts)
+
+
 def render_overall_test_execution_summary_table(
     *,
     log_h200,
@@ -1663,14 +1831,19 @@ def render_overall_test_execution_summary_table(
     h100_passed: int | None = None,
     h100_failed: int | None = None,
     h100_skipped: int | None = None,
+    b200_passed: int | None = None,
+    b200_failed: int | None = None,
+    b200_broken: int | None = None,
 ) -> str:
     """Emit the combined Total / Passed / Failed table at the top of Test Result.
 
-    Includes one row per local GPU (H200, H800, A100, A3) plus an H100 row when
-    ``h100_passed`` / ``h100_failed`` are supplied (Buildkite scheduled
-    nightly counts; ``broken`` steps are excluded so the totals stay aligned
-    with the per-GPU failure detail). H100 totals stay blank in the
-    development variant — see ``buildkite_build_stats.py`` for the same rule.
+    Includes one row per local GPU (H200, H800, A100, A3) plus a B200 row when
+    ``b200_passed`` / ``b200_failed`` are supplied (Buildkite scheduled release
+    counts) and an H100 row when ``h100_passed`` / ``h100_failed`` are supplied
+    (Buildkite scheduled nightly counts; ``broken`` steps are excluded so the
+    totals stay aligned with the per-GPU failure detail). H100 totals stay
+    blank in the development variant — see ``buildkite_build_stats.py`` for the
+    same rule.
 
     The *Failed* column links to ``#failure-analysis-hXXX`` (the matching
     subsection inside the top-level Failure Analysis section).
@@ -1693,6 +1866,16 @@ def render_overall_test_execution_summary_table(
         _row("A100", log_a100),
         _row("A3", log_a3),
     ]
+    if b200_passed is not None or b200_failed is not None:
+        total = (b200_passed or 0) + (b200_failed or 0) + (b200_broken or 0)
+        rows.append(
+            [
+                "B200",
+                str(total),
+                str(b200_passed or 0),
+                f"[{b200_failed or 0}](#failure-analysis-b200)",
+            ]
+        )
     if h100_passed is not None or h100_failed is not None:
         total = (h100_passed or 0) + (h100_failed or 0) + (h100_skipped or 0)
         rows.append(
@@ -1720,6 +1903,10 @@ def render_test_result_section(
     h100_passed=None,
     h100_failed=None,
     h100_skipped=None,
+    b200_ci_markdown: str = "",
+    b200_passed=None,
+    b200_failed=None,
+    b200_broken=None,
     dev_perf_h200=None,
     dev_perf_h800=None,
     dev_perf_a100=None,
@@ -1760,6 +1947,9 @@ def render_test_result_section(
             h100_passed=h100_passed,
             h100_failed=h100_failed,
             h100_skipped=h100_skipped,
+            b200_passed=b200_passed,
+            b200_failed=b200_failed,
+            b200_broken=b200_broken,
         )
 
     chunks: list[str] = [
@@ -1769,13 +1959,14 @@ def render_test_result_section(
         "",
         "Combined Total / Passed / Failed across the local machine types "
         "(H200 / H800 / A100 / A3)"
+        + (" **and the B200 Buildkite scheduled release build**" if b200_ci_markdown else "")
+        + (" **and the H100 Buildkite scheduled nightly build**" if h100_ci_markdown else "")
         + (
-            " **and the H100 Buildkite scheduled nightly build**. "
-            "H100 counts come from the latest scheduled nightly build fetched via "
-            "the Buildkite API; `Upload * Pipeline` and orchestration-only steps "
-            "like `Nightly Collection&Email` are excluded from both Total and "
-            "Failed."
-            if h100_ci_markdown
+            ". Buildkite-sourced counts exclude `Upload * Pipeline` and "
+            "orchestration-only steps (e.g. `Nightly Collection&Email`) from "
+            "both Total and Failed; the B200/H100 Failed cell links to the "
+            "matching chapter below."
+            if (b200_ci_markdown or h100_ci_markdown)
             else ". The Failed cell links to the matching subsection under the next Failure Analysis section."
         ),
         "",
@@ -1811,6 +2002,17 @@ def render_test_result_section(
     chunks.append(markdown_local_summary_from_log_dir(log_a3) if log_a3 else _gpu_log_placeholder("--log-dir-a3"))
     if dev_perf_a3:
         chunks.extend(["", dev_perf_a3.rstrip(), ""])
+    # B200 (CI — Buildkite scheduled release). Only emit the panel when the caller
+    # passes a non-empty `b200_ci_markdown` body (release path). The
+    # ``failure-analysis-b200`` anchor is emitted at the chapter so the B200
+    # Failed cell in the Overall summary table links here — B200 has no separate
+    # Failure Analysis subsection in v1 (the failed-step table lives in this
+    # chapter).
+    if b200_ci_markdown:
+        chunks.extend(["", '<a id="failure-analysis-b200"></a>', ""])
+        chunks.extend(["### B200 (CI — Buildkite scheduled release)", ""])
+        chunks.append(b200_ci_markdown.rstrip())
+        chunks.append("")
     # H100 (CI — Buildkite scheduled nightly). Only emit the panel when the caller
     # actually passes a non-empty `h100_ci_markdown` body (release path). The
     # development path passes ``""`` so the entire H100 chapter is dropped from
@@ -2381,6 +2583,24 @@ def preview_report_markdown(
         failed_section=failed_section,
     )
 
+    # B200 (CI — Buildkite scheduled release) preview body. Sample counts
+    # mirror the latest real B200 build (#15964, failed) so the preview renders
+    # the chapter without a Buildkite call.
+    b200_body = build_b200_ci_markdown_body(
+        build_no=build_no,
+        branch=BRANCH,
+        commit="c0ffee1deadbeefcafe000000000000000000001",
+        state="failed",
+        created_at="2026-09-23T09:53:27Z",
+        passed=42,
+        failed=9,
+        broken=0,
+        failed_steps=[
+            ("Omni · Function Test with H100 · 2-GPU", "failed", demo_link_a),
+            ("TTS · Function Test with L4", "failed", demo_link_b),
+        ],
+    )
+
     test_result = render_test_result_section(
         skill_dir,
         log_h200=None,
@@ -2388,6 +2608,10 @@ def preview_report_markdown(
         log_a100=None,
         log_a3=None,
         h100_ci_markdown=h100_body,
+        b200_ci_markdown=b200_body,
+        b200_passed=42,
+        b200_failed=9,
+        b200_broken=0,
     )
 
     # Failure Analysis (preview): per-GPU placeholder blocks + H100 preview.
@@ -2458,11 +2682,11 @@ def preview_report_markdown(
 
     next_steps_block = render_next_steps_section()
 
-    # Quality Defense Radar: per-model 5-axis coverage across 9 flagship
+    # Quality Defense Radar: per-model 7-axis coverage across 10 flagship
     # models (Qwen3-Omni, MiniCPM, Qwen-TTS, Qwen-Image, HunyuanImage,
-    # HunyuanVideo, Wan, MinimaxH3, Cosmos), 8 clickable segments per model.
-    # Release variant only — the preview also emits it so the layout matches
-    # the live report HTML exactly.
+    # HunyuanVideo, Wan, MinimaxH3, Cosmos, LingBot), up to 13 clickable
+    # segments per model. Release variant only — the preview also emits it
+    # so the layout matches the live report HTML exactly.
     quality_defense_block = render_quality_defense_section()
 
     return f"""# vLLM-Omni Test Report - Scheduled Nightly
@@ -2488,10 +2712,11 @@ def preview_report_markdown(
   rows are dropped.
 - **Next Steps (Outstanding Items):** manual-entry action table — see H2 between Open issues and Data
   source. HTML upgrade adds **Add Item** button and `localStorage`-backed editing (same as Development).
-- **Quality Defense Radar:** per-model 5-axis coverage radar across 9 flagship models
+- **Quality Defense Radar:** per-model 7-axis coverage radar across 10 flagship models
   (Qwen3-Omni, MiniCPM, Qwen-TTS, Qwen-Image, HunyuanImage, HunyuanVideo, Wan, MinimaxH3,
-  Cosmos). Each model has 8 clickable segments (2 single + 3 axes split into GPU/NPU halves
-  of the same circle). Default gray; click to mark green. State kept in `localStorage`
+  Cosmos, LingBot). Six axes split into GPU/NPU halves of one circle; Reliability is a
+  single circle (4 models); Cosmos renders all axes as single circles. Segments pre-lit
+  from the vllm-omni repo code; click to override. State kept in `localStorage`
   (`quality-defense:<model>:<segment-id>`) and mirrored to a `data-quality-on` attribute.
   No token required.
 - Live report: `buildkite_build_stats.py`, GitHub REST/Search
@@ -2525,7 +2750,7 @@ def main() -> None:
             "ready/merge/nightly/weekly/ut rows are dropped) + "
             "Failure Analysis (per-GPU with interactive Status column) + "
             "Open issues (stats window) + Next Steps (Outstanding Items) + "
-            "Quality Defense Radar (per-model 5-axis coverage across 9 flagship models). "
+            "Quality Defense Radar (per-model 7-axis coverage across 10 flagship models). "
             "``development`` — same Test Result layout as release, but **Test conclusion** and "
             "**Open issues** sections are omitted and **Metrics overview** is replaced with "
             "a Development-flavored 2-row snapshot (Outstanding DI · Open Critical Issue). "
@@ -2601,6 +2826,19 @@ def main() -> None:
         type=Path,
         default=None,
         help="Optional. Log root for **Test Result → A3** (same layout as --log-dir-h200).",
+    )
+    parser.add_argument(
+        "--b200-build",
+        type=int,
+        default=None,
+        help=(
+            "Optional. Pin a specific **Scheduled Release B200 build** number for "
+            "the Test Result → B200 (CI — Buildkite scheduled release) chapter "
+            "(release variant only). When omitted, the latest 'Scheduled Release "
+            "B200 build' on main is resolved automatically by paging recent "
+            "builds. Useful when the B200 cadence stretches beyond the resolver's "
+            "~75-day scan window."
+        ),
     )
     parser.add_argument(
         "--kanban-repo-root",
@@ -2966,14 +3204,48 @@ def main() -> None:
     # — only local-machine test execution (H200/H800/A100/A3) remains. The
     # Buildkite API call + reportable-job walk (previously used to populate
     # the H100 chapter + the H100 failed-step block) is therefore skipped.
+    #
+    # B200 (Buildkite scheduled release) is the one Buildkite CI chapter kept in
+    # the release Test Result. Fetch the latest "Scheduled Release B200 build"
+    # (or a pinned --b200-build), walk its reportable jobs, and build a
+    # lightweight metadata + summary + failed-step body. Failures degrade
+    # gracefully (empty body) so a Buildkite hiccup never aborts the report.
+    b200_body = ""
+    b200_passed: int | None = None
+    b200_failed: int | None = None
+    b200_broken: int | None = None
+    try:
+        b200 = fetch_b200_build_summary(token, build_no=args.b200_build)
+        b200_passed = b200["passed"]
+        b200_failed = b200["failed"]
+        b200_broken = b200["broken"]
+        b200_body = build_b200_ci_markdown_body(
+            build_no=b200["build_no"],
+            branch=b200["branch"],
+            commit=b200["commit"],
+            state=b200["state"],
+            created_at=b200["created_at"],
+            passed=b200["passed"],
+            failed=b200["failed"],
+            broken=b200["broken"],
+            failed_steps=b200["failed_steps"],
+        )
+        print(
+            f"B200: build #{b200['build_no']} [{b200['state']}] "
+            f"({(b200['created_at'] or '')[:10]}) — "
+            f"{b200['passed']} passed / {b200['failed']} failed / {b200['broken']} broken",
+            file=sys.stderr,
+        )
+    except Exception as e:  # noqa: BLE001 — graceful degradation
+        print(f"B200: fetch failed — {e}; chapter omitted", file=sys.stderr)
 
     conclusion = render_test_conclusion_section()
     # H100 (Buildkite scheduled nightly) chapter is intentionally omitted from
-    # the release Test Result — the operator requested dropping all Buildkite
-    # CI roll-up content; only local-machine execution (H200/H800/A100/A3)
-    # remains. ``h100_ci_markdown=""`` suppresses the chapter and the H100 row
-    # in the Overall summary table; ``h100_passed/failed/skipped=None``
-    # similarly suppresses any H100 totals.
+    # the release Test Result — the operator requested dropping that Buildkite
+    # CI roll-up; only local-machine execution (H200/H800/A100/A3) plus the
+    # **B200 Buildkite scheduled release** chapter remain. ``h100_ci_markdown=""``
+    # suppresses the H100 chapter and H100 row in the Overall summary table;
+    # ``b200_*`` carries the fetched B200 build's body + counts.
     test_result = render_test_result_section(
         skill_dir,
         log_h200=args.log_dir_h200,
@@ -2984,6 +3256,10 @@ def main() -> None:
         h100_passed=None,
         h100_failed=None,
         h100_skipped=None,
+        b200_ci_markdown=b200_body,
+        b200_passed=b200_passed,
+        b200_failed=b200_failed,
+        b200_broken=b200_broken,
     )
 
     # Failure Analysis: top-level section, one collapsible subsection per
@@ -3032,10 +3308,11 @@ def main() -> None:
     # sufficient — no upgrade-script changes required.
     next_steps_block = render_next_steps_section()
 
-    # Quality Defense Radar: per-model 5-axis coverage across 9 flagship
+    # Quality Defense Radar: per-model 7-axis coverage across 10 flagship
     # models (Qwen3-Omni, MiniCPM, Qwen-TTS, Qwen-Image, HunyuanImage,
-    # HunyuanVideo, Wan, MinimaxH3, Cosmos), 8 clickable segments per model
-    # (3 axes split into GPU/NPU halves). Release variant only — the
+    # HunyuanVideo, Wan, MinimaxH3, Cosmos, LingBot), up to 13 clickable
+    # segments per model (6 axes split into GPU/NPU halves + Reliability
+    # single). Release variant only — the
     # post-processor replaces the marker with the inline SVG via
     # ``_upgrade_quality_defense_block`` and wires the click-toggle script
     # via ``_QUALITY_DEFENSE_SCRIPT``; state persists via localStorage
@@ -3097,14 +3374,15 @@ def main() -> None:
   Status) with ``Add Item`` button; cells editable in HTML, persisted via
   `localStorage` (same implementation as the Development variant). H2 appears between
   Open issues and Data source.
-- **Quality Defense Radar:** per-model 5-axis coverage radar across 9 flagship models
+- **Quality Defense Radar:** per-model 7-axis coverage radar across 10 flagship models
   (Qwen3-Omni, MiniCPM, Qwen-TTS, Qwen-Image, HunyuanImage, HunyuanVideo, Wan,
-  MinimaxH3, Cosmos). Each model gets 8 clickable segments (2 single + 3 axes split
-  into GPU/NPU halves of the same circle). Default gray; click any segment to mark
-  it green (click again to revert). State persisted via `localStorage`
-  (key `quality-defense:<model-id>:<segment-id>`) and mirrored to a `data-quality-on`
-  attribute on each `<g>` so `Ctrl+S` Save-Page-As preserves state across origins.
-  Release variant only — no token required.
+  MinimaxH3, Cosmos, LingBot). Six axes (Functionality / Performance / Documentation /
+  Precision / Stability / Gate) split into GPU/NPU halves of one circle; Reliability is
+  a single circle (4 models); Cosmos renders all axes as single circles. Segments are
+  pre-lit from the vllm-omni repo code and remain click-to-override. State persisted via
+  `localStorage` (key `quality-defense:<model-id>:<segment-id>`) and mirrored to a
+  `data-quality-on` attribute on each `<g>` so `Ctrl+S` Save-Page-As preserves state
+  across origins. Release variant only — no token required.
 - Buildkite API: `{ORG}/{PIPELINE}` branch `main`
 - `scripts/buildkite_build_stats.py --from {stats_from} --to {stats_to} --markdown` (**bugs (first response, …)** =
   GitHub `label:bug` issues with `created_at` UTC date in the same `--from`..`--to` window)

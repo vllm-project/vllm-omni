@@ -1251,66 +1251,51 @@ td.fail-status-cell[data-status="not-issue"] {
   font-size: 1rem;
 }
 table.focus-table {
-  table-layout: fixed;
+  table-layout: auto;
   font-size: 0.86rem;
   min-width: 1180px;
 }
 table.focus-table th,
 table.focus-table td {
-  padding: 0.48rem 0.55rem;
-  overflow-wrap: anywhere;
-  white-space: normal;
+  padding: 0.48rem 0.6rem;
+  white-space: nowrap;
+  text-align: left;
   line-height: 1.35;
 }
-table.focus-table th:nth-child(1),
-table.focus-table td:nth-child(1) {
-  width: 5.8rem;
-}
+/* Long text columns wrap instead of stretching the table; everything else
+   hugs its content so column widths track the actual data (auto layout). */
 table.focus-table th:nth-child(2),
-table.focus-table td:nth-child(2) {
-  width: 13rem;
+table.focus-table td:nth-child(2),
+table.focus-table th:nth-child(5),
+table.focus-table td:nth-child(5),
+table.focus-table th:nth-child(6),
+table.focus-table td:nth-child(6),
+table.focus-table th:nth-child(7),
+table.focus-table td:nth-child(7) {
+  white-space: normal;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 table.focus-table th:nth-child(3),
 table.focus-table td:nth-child(3) {
-  width: 5.4rem;
   text-align: center;
-  white-space: nowrap;
-}
-table.focus-table th:nth-child(4),
-table.focus-table td:nth-child(4) {
-  width: 6.8rem;
-}
-table.focus-table th:nth-child(5),
-table.focus-table td:nth-child(5) {
-  width: 12rem;
-}
-table.focus-table th:nth-child(6),
-table.focus-table td:nth-child(6) {
-  width: 12rem;
-}
-table.focus-table th:nth-child(7),
-table.focus-table td:nth-child(7) {
-  width: 8rem;
 }
 table.focus-table th:nth-child(8),
 table.focus-table td:nth-child(8),
 table.focus-table th:nth-child(9),
 table.focus-table td:nth-child(9),
 table.focus-table th:nth-child(10),
-table.focus-table td:nth-child(10) {
-  width: 6.4rem;
-  text-align: right;
-  white-space: nowrap;
-}
+table.focus-table td:nth-child(10),
 table.focus-table th:nth-child(11),
 table.focus-table td:nth-child(11) {
-  width: 5rem;
-  white-space: nowrap;
+  text-align: right;
 }
 table.focus-table th:nth-child(12),
 table.focus-table td:nth-child(12) {
-  width: 6.5rem;
-  white-space: nowrap;
+  text-align: center;
+}
+table.focus-table th:nth-child(13),
+table.focus-table td:nth-child(13) {
   text-align: center;
 }
 .focus-filter-scope .table-scroll {
@@ -1767,7 +1752,7 @@ RELEASE_MARKDOWN_DOC_CSS = """
   color: var(--section-ico-color);
 }
 
-/* Quality Defense Radar — per-model 5-axis coverage; green-leaning accent
+/* Quality Defense Radar — per-model 7-axis coverage; green-leaning accent
    so the section card prefigures the click-to-green segment fill. The
    per-segment green is owned by
    `.qd-segment[data-quality-on="1"] .qd-half` / `.qd-circle { fill: #4ade80; }`
@@ -1948,6 +1933,11 @@ RELEASE_MARKDOWN_DOC_CSS = """
 }
 .release-doc details.panel.test-result-gpu-card.release-gpu-details.release-gpu-details--h100 {
   --release-gpu-ico: var(--ci);
+}
+.release-doc details.panel.test-result-gpu-card.release-gpu-details.release-gpu-details--b200 {
+  /* B200 (Blackwell) — Buildkite scheduled release. Teal to distinguish from
+     H100's CI-purple and H200's local-GPU violet. */
+  --release-gpu-ico: #0ea5e9;
 }
 .release-doc details.panel.test-result-gpu-card.release-gpu-details:last-child {
   margin-bottom: 0;
