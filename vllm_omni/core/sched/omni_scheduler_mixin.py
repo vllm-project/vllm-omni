@@ -921,6 +921,34 @@ class OmniSchedulerMixin:
         the end of the last segment. Emit the terminal chunk here so the
         downstream stage terminates on the payload path either way.
         """
+        # Review P2-1 reject gate: the K-step in-model codec sampler has no
+        # reader for logit_bias / allowed_token_ids (the talker_codec_sample
+        # filter implements censoring/penalties/temperature/min-p/top-k/top-p
+        # only). The engine applies both fields to the 6562-wide codec logits
+        # on a single-frame stage, so a request setting either would decode
+        # differently than the same request on a single-frame deployment,
+        # silently. Honoring them needs a LogitBiasState-style per-request
+        # machine the codec path does not have; finish the request as
+        # FINISHED_ERROR instead of letting it diverge unnoticed.
+        kstep_armed = getattr(self, "_talker_kstep_armed", None)
+        if kstep_armed is not None and kstep_armed():
+            sp = getattr(request, "sampling_params", None)
+            unsupported = [
+                name
+                for name in ("logit_bias", "allowed_token_ids")
+                if sp is not None and getattr(sp, name, None)
+            ]
+            if unsupported:
+                logger.warning(
+                    "Rejecting request %s: %s not supported by the K-step codec "
+                    "sampler (no reader in the in-model filter); the request "
+                    "would decode differently than on a single-frame stage.",
+                    request.request_id,
+                    ", ".join(unsupported),
+                )
+                super().add_request(request)
+                self.finish_requests([request.request_id], RequestStatus.FINISHED_ERROR)
+                return
         existing = self.requests.get(request.request_id)
         if existing is not None and existing.status == RequestStatus.WAITING_FOR_STREAMING_REQ:
             adapter = None if getattr(request, "resumable", False) else self._adapter_owing_terminal(existing)

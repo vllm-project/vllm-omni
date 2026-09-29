@@ -4,11 +4,15 @@
 """Framework boundaries for Talker codec sampling.
 
 Production stochastic sampling uses a logits-filter boundary implemented in
-graph-capturable tensor ops: stop-token censoring, whitelist censoring,
-per-id bias, repetition penalty, frequency/presence penalties, temperature,
-min-p, top-k, then top-p over the top-k-filtered distribution keeping at least
-one candidate, while native NPU operators keep softmax and ``torch.multinomial``
-semantics (including Generator state) unchanged.
+graph-capturable tensor ops: stop-token censoring, repetition penalty,
+frequency/presence penalties, temperature, min-p, top-k, then top-p over the
+top-k-filtered distribution keeping at least one candidate, while native NPU
+operators keep softmax and ``torch.multinomial`` semantics (including
+Generator state) unchanged. ``logit_bias`` and ``allowed_token_ids`` are NOT
+implemented here -- this filter has no reader for them -- so when the K-step
+stream is armed the scheduler rejects requests that set either field
+(finished as FINISHED_ERROR at admission) instead of silently sampling a
+different codec distribution than a single-frame deployment would.
 
 Order and defaults follow the engine's single-frame path so that enabling the
 multi-frame (K-step) decode does not change the sampling semantics:
@@ -44,6 +48,11 @@ class TalkerCodecDeviceState:
     # than re-allocated because a fresh VOCAB_SIZE-wide tensor per frame would
     # be an allocation per decode step.
     full_bins: torch.Tensor | None = None
+    # Per-frame scratch for the repetition-penalty histogram over the history
+    # window, (1, VOCAB_SIZE) float32, allocated once per request/segment and
+    # zeroed in place each frame -- same rationale as full_bins: a fresh
+    # VOCAB_SIZE-wide tensor per frame would be an allocation per decode step.
+    rep_counts: torch.Tensor | None = None
 
 
 @dataclass(frozen=True)
@@ -73,6 +82,7 @@ def make_device_state(
         max_tokens=torch.tensor([max_tokens], dtype=torch.int32, device=codes.device),
         finished=torch.tensor([finished], dtype=torch.bool, device=codes.device),
         full_bins=full_bins,
+        rep_counts=torch.zeros((1, VOCAB_SIZE), dtype=torch.float32, device=codes.device),
     )
 
 
@@ -153,7 +163,13 @@ def _repetition_penalty_scaling(
     positions = torch.arange(HISTORY_WINDOW, dtype=torch.int32, device=logits.device).reshape(1, -1)
     valid = positions < state.history_len.reshape(1, 1)
     safe_tokens = torch.where(valid, state.history, torch.zeros_like(state.history)).to(torch.long)
-    counts = torch.zeros((1, VOCAB_SIZE), dtype=torch.float32, device=logits.device)
+    if state.rep_counts is not None:
+        # Review P3-6: reuse the per-request histogram buffer instead of
+        # allocating a VOCAB_SIZE-wide tensor every frame. zero_() re-runs
+        # under graph replay, so no stale count survives a replay.
+        counts = state.rep_counts.zero_()
+    else:
+        counts = torch.zeros((1, VOCAB_SIZE), dtype=torch.float32, device=logits.device)
     counts.scatter_add_(1, safe_tokens, valid.to(torch.float32))
     alpha = torch.pow(repetition_penalty.reshape(1, 1), counts)
     return torch.where(logits < 0, logits * alpha, logits / alpha)
@@ -292,8 +308,26 @@ def advance_codec_device_state(
     are baked into the per-request sampling graph.
     """
     sampled = sampled_token.reshape(1).to(torch.int32)
-    active = ~state.finished
-    next_step = torch.where(active, state.step + 1, state.step)
+    is_eos, is_stop = _classify_stop(
+        sampled,
+        state,
+        eos_token_id=eos_token_id,
+        ignore_eos=ignore_eos,
+        stop_token_ids=stop_token_ids,
+    )
+    next_state, _emit, _finished = _advance_classified(state, sampled, is_eos, is_stop)
+    return next_state
+
+
+def _classify_stop(
+    sampled: torch.Tensor,
+    state: TalkerCodecDeviceState,
+    *,
+    eos_token_id: int,
+    ignore_eos: bool,
+    stop_token_ids: tuple[int, ...],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The eos / stop-id masks shared by every advance entry point."""
     if ignore_eos:
         # ``ignore_eos`` blanks the engine's ``_eos_token_id``
         # (vllm/sampling_params.py:670-671), so a sampled codec EOS is just
@@ -304,6 +338,25 @@ def advance_codec_device_state(
     is_stop = torch.zeros_like(state.finished)
     for token_id in stop_token_ids:
         is_stop = is_stop | (sampled == int(token_id))
+    return is_eos, is_stop
+
+
+def _advance_classified(
+    state: TalkerCodecDeviceState,
+    sampled: torch.Tensor,
+    is_eos: torch.Tensor,
+    is_stop: torch.Tensor,
+) -> tuple[TalkerCodecDeviceState, torch.Tensor, torch.Tensor]:
+    """Single transition source: next state plus the emit/finished decision.
+
+    Both entry points (``advance_codec_device_state`` and
+    ``codec_sample_result``) route through here, so the eos/stop/limit
+    transition and its emit mask are computed exactly once per frame
+    (review P3-6: they used to be computed twice -- once in
+    ``codec_sample_result`` and again inside ``advance_codec_device_state``).
+    """
+    active = ~state.finished
+    next_step = torch.where(active, state.step + 1, state.step)
     reached_limit = active & (next_step >= state.max_tokens)
     finished = state.finished | is_eos | is_stop | reached_limit
     emit = active & (~is_eos) & (~is_stop) & (~reached_limit)
@@ -314,7 +367,10 @@ def advance_codec_device_state(
     history = torch.where(emit.reshape(1, 1), candidate, state.history)
     history_len = torch.clamp(state.history_len + emit.to(torch.int32), max=HISTORY_WINDOW)
     _advance_full_bins(state, sampled, emit)
-    return TalkerCodecDeviceState(history, history_len, next_step, state.max_tokens, finished, state.full_bins)
+    next_state = TalkerCodecDeviceState(
+        history, history_len, next_step, state.max_tokens, finished, state.full_bins, state.rep_counts
+    )
+    return next_state, emit, finished
 
 
 def codec_sample_result(
@@ -327,23 +383,19 @@ def codec_sample_result(
 ) -> TalkerCodecSampleResult:
     """Advance device state and retain the device-side emit decision."""
     sampled = sampled_token.reshape(1).to(torch.int32)
-    active = ~state.finished
-    next_step = torch.where(active, state.step + 1, state.step)
-    if ignore_eos:
-        is_eos = torch.zeros_like(state.finished)
-    else:
-        is_eos = sampled == int(eos_token_id)
-    is_stop = torch.zeros_like(state.finished)
-    for token_id in stop_token_ids:
-        is_stop = is_stop | (sampled == int(token_id))
-    emit = active & (~is_eos) & (~is_stop) & (next_step < state.max_tokens)
-    next_state = advance_codec_device_state(
-        state,
+    is_eos, is_stop = _classify_stop(
         sampled,
+        state,
         eos_token_id=eos_token_id,
         ignore_eos=ignore_eos,
         stop_token_ids=stop_token_ids,
     )
+    # One transition for state + emit (review P3-6): the emit mask here used
+    # to be recomputed independently of the one inside
+    # ``advance_codec_device_state``. Semantics unchanged: for an active
+    # request ``~reached_limit`` == ``next_step < max_tokens``, and for an
+    # already-finished one both forms emit False.
+    next_state, emit, _finished = _advance_classified(state, sampled, is_eos, is_stop)
     return TalkerCodecSampleResult(sampled_token=sampled, state=next_state, emit=emit)
 
 

@@ -1136,7 +1136,23 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 # The kernel ABI is int32, while the existing connector/audio-code
                 # payload is int64.  Keep the compatibility cast outside the fused op.
                 sampled = sample_result.sampled_token.to(torch.long).reshape(())
-            sampled_id = int(sampled.item())
+                # Review P2-3: the host needs sampled_id plus the device
+                # finished/emit decision every frame; pack the three scalars
+                # into one D2H transfer so a K-frame step costs one device
+                # sync per frame instead of three.
+                packed = torch.stack(
+                    (
+                        sampled,
+                        sample_result.state.finished.reshape(()).to(torch.long),
+                        sample_result.emit.reshape(()).to(torch.long),
+                    )
+                )
+                packed_host = packed.cpu().tolist()
+                sampled_id = int(packed_host[0])
+                device_finished = bool(packed_host[1])
+                device_emit = bool(packed_host[2])
+            else:
+                sampled_id = int(sampled.item())
             full_ids = state.get("codec_full_ids")
             if isinstance(full_ids, list):
                 full_ids.append(sampled_id)
@@ -1150,8 +1166,8 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 # stream; this mirrors it over codec_full_ids exactly as the
                 # engine does over its tokens (v1/core/sched/utils.py:125-133).
                 repetition_stop = _codec_repetition_detected(state)
-                finished = bool(sample_result.state.finished.item()) or repetition_stop
-                emit_frame = bool(sample_result.emit.item())
+                finished = device_finished or repetition_stop
+                emit_frame = device_emit
             else:
                 # Stub fallback: no device state behind the scripted sample.
                 if _codec_bool_param(state, "codec_ignore_eos", False):

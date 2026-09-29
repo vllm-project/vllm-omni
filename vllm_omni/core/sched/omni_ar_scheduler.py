@@ -680,7 +680,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                     num_invalid_spec_tokens=scheduler_output.num_invalid_spec_tokens,
                     request_id=req_id,
                 )
-            elif scheduled_spec_token_ids and sampled_token_ids:
+            elif self._talker_kstep_armed() and scheduled_spec_token_ids and sampled_token_ids:
                 # This request had drafts scheduled but its row
                 # came back with no generated tokens while the step itself
                 # sampled (a logprob-contract failure emptied the row above,
@@ -692,7 +692,10 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 # it from `.get(req_id)` and a request with no drafts this
                 # step gets None -- an empty row without drafts is normal
                 # (a non-final prefill chunk produces no tokens) and upstream
-                # skips it; the guard above keeps that path intact.
+                # skips it; the guard above keeps that path intact. The
+                # rollback semantics are verified for the Talker K-step loop
+                # only, hence the armed gate: a non-K-step spec-decode stage
+                # keeps upstream's own handling of the empty-row case.
                 # A prefill-chunk row is different: the chunk's prompt tokens
                 # did land in the KV cache, so only the D drafts roll back
                 # (the base token stays advanced).

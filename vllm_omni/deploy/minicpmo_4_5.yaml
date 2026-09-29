@@ -147,10 +147,12 @@ platforms:
         compilation_config:
           # A full decode-step graph keeps in-graph sampling and multi-frame
           # expansion. The static-shape builder gates its runtime buckets on
-          # the decode graph mode, so PIECEWISE also runs (K included,
-          # verified on 910B1) but K's RTF win is FULL-only there. Measured
-          # on 910B1: PIECEWISE without K is +75% RTF at 32/1 versus
-          # FULL_DECODE_ONLY with K=8.
+          # the decode graph mode, so PIECEWISE also runs here (K included,
+          # verified on 910B1). This is stage 0 and it ships PIECEWISE; the
+          # K-step's measured RTF win is FULL-only on stage 1, which ships
+          # FULL_DECODE_ONLY below. Stage-0 data point for scale (910B1):
+          # PIECEWISE without K is +75% RTF at 32/1 versus FULL_DECODE_ONLY
+          # with K=8.
           cudagraph_mode: PIECEWISE
       - stage_id: 1
         # Concurrency cap raised from 4 to 8; the override block only covered

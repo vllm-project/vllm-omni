@@ -51,9 +51,17 @@ def restore_native_rejection_sampler() -> None:
     global _RESTORED
     if _RESTORED:
         return
-    _RESTORED = True  # probe once; a non-target SoC never retries
     if not _target_soc():
+        # Latch only on a confirmed non-target SoC: "probe once" describes a
+        # real part. An empty probe result is "unknown", not "non-target" --
+        # leaving _RESTORED False here lets the next call retry instead of
+        # skipping the restore for the whole process lifetime. The probe is
+        # an env/name lookup and this function runs once per worker init, so
+        # the retry costs nothing.
+        if _probe_soc_name().strip():
+            _RESTORED = True
         return
+    _RESTORED = True
     try:
         import vllm.v1.sample.rejection_sampler as rs
     except ImportError:  # pragma: no cover - vllm core moved the module
