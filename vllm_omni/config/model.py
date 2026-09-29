@@ -126,6 +126,8 @@ class OmniModelConfig(ModelConfig):
     stage_id: int = 0
     async_chunk: bool = False
     session_mode: str = "turn"
+    # Resolved per-stage runner-owned model-local CUDA Graph configuration.
+    model_local_cudagraph: dict[str, Any] | None = None
     retains_state_across_chunks: bool = False
     use_v2_model_runner: bool = False
     supports_native_mrv2_data_plane: bool = False

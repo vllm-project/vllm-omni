@@ -197,6 +197,8 @@ class OmniEngineArgs(EngineArgs):
     silence_ban_frames: int = 0
     async_chunk: bool = False
     session_mode: str = "turn"
+    # Public deploy YAML and the resolved model config use the same key.
+    model_local_cudagraph: dict[str, Any] | None = None
     retains_state_across_chunks: bool = False
     use_v2_model_runner: bool = False
     supports_native_mrv2_data_plane: bool = False
@@ -314,6 +316,12 @@ class OmniEngineArgs(EngineArgs):
         Returns:
             OmniModelConfig instance with all configuration fields set
         """
+        if self.model_local_cudagraph is not None and self.worker_type != "generation":
+            raise ValueError(
+                "model_local_cudagraph is supported only for LLM_GENERATION stages; "
+                f"got worker_type={self.worker_type!r}"
+            )
+
         # register omni models to avoid model not found error
         self._ensure_omni_models_registered()
 
@@ -429,6 +437,7 @@ class OmniEngineArgs(EngineArgs):
             stage_id=self.stage_id,
             async_chunk=self.async_chunk,
             session_mode=self.session_mode,
+            model_local_cudagraph=self.model_local_cudagraph,
             retains_state_across_chunks=self.retains_state_across_chunks,
             use_v2_model_runner=self.use_v2_model_runner,
             supports_native_mrv2_data_plane=self.supports_native_mrv2_data_plane,

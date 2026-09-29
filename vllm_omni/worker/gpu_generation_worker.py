@@ -35,6 +35,19 @@ class GPUGenerationWorker(OmniWorkerMixin, OmniGPUWorkerBase):
 
     model_runner_cls = GPUGenerationModelRunner
 
+    def determine_available_memory(self) -> int:
+        available = super().determine_available_memory()
+        if (
+            self.cache_config.kv_cache_memory_bytes
+            or getattr(self.model_runner, "model_local_cudagraph_manager", None) is None
+        ):
+            return available
+
+        estimate = self.model_runner.profile_cudagraph_memory()
+        self.cudagraph_memory_estimate = estimate
+        self.available_kv_cache_memory_bytes = max(0, available - estimate)
+        return self.available_kv_cache_memory_bytes
+
     @instrument(span_name="Init device")
     def init_device(self):
         if self.device_config.device_type in ("cuda", "musa"):
@@ -126,4 +139,10 @@ class GPUGenerationWorker(OmniWorkerMixin, OmniGPUWorkerBase):
 
         start = time.perf_counter()
         self.model_runner.profile_run()
+        if (
+            not self.model_config.enforce_eager
+            and getattr(self.model_runner, "model_local_cudagraph_manager", None) is not None
+        ):
+            with self._get_cudagraph_capture_context():
+                self.model_runner.capture_model()
         return CompilationTimes(language_model=time.perf_counter() - start, encoder=0.0)

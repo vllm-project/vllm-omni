@@ -12,15 +12,18 @@ buffer and lifecycle hooks.
 from __future__ import annotations
 
 from dataclasses import replace
-from typing import Any
+from typing import Any, cast
 
 import torch
+from vllm.compilation.monitor import set_cudagraph_capturing_enabled
 from vllm.config.compilation import CUDAGraphMode
+from vllm.distributed.parallel_state import graph_capture
 from vllm.forward_context import set_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.all2all_utils import (
     get_ep_all2all_manager,
 )
+from vllm.utils.gc_utils import freeze_gc_for_cudagraph_capture
 from vllm.utils.torch_utils import PIN_MEMORY
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
@@ -29,11 +32,17 @@ from vllm.v1.worker.gpu.model_runner import (
     ExecuteModelState,
     IntermediateTensors,
 )
+from vllm.v1.worker.workspace import lock_workspace
 
 from vllm_omni.core.sched.output import OmniCachedRequestData, OmniNewRequestData
 from vllm_omni.data_entry_keys import flatten_payload
+from vllm_omni.model_executor.models.interfaces.model_local_cudagraph import (
+    SupportsModelLocalCUDAGraph,
+    supports_model_local_cudagraph,
+)
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.outputs import OmniModelRunnerOutput
+from vllm_omni.worker.model_local_cudagraph_manager import ModelLocalCUDAGraphManager
 from vllm_omni.worker_v2.omni_ar_model_runner import (
     _async_copy_mm,
     _ensure_tensor_values,
@@ -156,11 +165,79 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
+        self.model_local_cudagraph_manager: ModelLocalCUDAGraphManager | None = None
         self._gen_model_output: Any = None
         self._gen_input_batch: Any = None
         # Placeholder for ExecuteModelState.hidden_states — allocated
         # once and reused every step to avoid per-forward allocation.
         self._dummy_hidden = torch.zeros(1, dtype=self.dtype, device=self.device)
+
+    def load_model(self, *args: Any, **kwargs: Any) -> None:
+        super().load_model(*args, **kwargs)
+        if (
+            self.model_config.enforce_eager
+            or self.compilation_config.cudagraph_mode == CUDAGraphMode.NONE
+            or not getattr(self.model_config, "model_local_cudagraph", None)
+            or not supports_model_local_cudagraph(self.get_model())
+        ):
+            return
+
+        manager = ModelLocalCUDAGraphManager(vllm_config=self.vllm_config, device=self.device)
+        manager.prepare(cast(SupportsModelLocalCUDAGraph, self.get_model()))
+        self.model_local_cudagraph_manager = manager
+        logger.info("Initialized runner-owned model-local CUDA Graph manager for MRV2 generation")
+
+    @torch.inference_mode()
+    def profile_cudagraph_memory(self) -> int:
+        manager = self.model_local_cudagraph_manager
+        if manager is None:
+            return super().profile_cudagraph_memory()
+
+        set_cudagraph_capturing_enabled(True)
+        try:
+            with freeze_gc_for_cudagraph_capture(), graph_capture(device=self.device):
+                torch.accelerator.synchronize()
+                torch.accelerator.empty_cache()
+                return manager.profile_memory()
+        finally:
+            set_cudagraph_capturing_enabled(False)
+
+    def needs_cudagraph_capture(self) -> bool:
+        if self.model_local_cudagraph_manager is not None:
+            return True
+        return super().needs_cudagraph_capture()
+
+    @torch.inference_mode()
+    def capture_model(self) -> int:
+        manager = self.model_local_cudagraph_manager
+        if manager is None:
+            return super().capture_model()
+
+        set_cudagraph_capturing_enabled(True)
+        try:
+            with freeze_gc_for_cudagraph_capture(), graph_capture(device=self.device):
+                torch.accelerator.synchronize()
+                torch.accelerator.empty_cache()
+                free_before = torch.accelerator.get_memory_info()[0]
+                manager.capture_and_bind()
+                torch.accelerator.synchronize()
+                free_after = torch.accelerator.get_memory_info()[0]
+        finally:
+            set_cudagraph_capturing_enabled(False)
+
+        torch.accelerator.synchronize()
+        torch.accelerator.empty_cache()
+        lock_workspace()
+        captured_bytes = max(0, free_before - free_after)
+        logger.info("MRV2 model-local CUDA Graph capture finished (%.2f MiB)", captured_bytes / (1 << 20))
+        return captured_bytes
+
+    def shutdown(self) -> None:
+        manager = self.model_local_cudagraph_manager
+        if manager is not None:
+            manager.clear()
+            self.model_local_cudagraph_manager = None
+        super().shutdown()
 
     # ------------------------------------------------------------------
     # Async-chunk support: replace prompt_token_ids for cached requests

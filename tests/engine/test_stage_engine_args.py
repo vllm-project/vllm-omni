@@ -111,6 +111,7 @@ _OMNI_ONLY_LLM_STAGE_ENGINE_FIELDS = frozenset(
         "subtalker_sampling_params",
         "task_type",
         "tokenizer_subdir",
+        "model_local_cudagraph",
     }
 )
 
@@ -884,3 +885,18 @@ def test_typed_engine_args_match_current_registry_backend_semantics(model_type, 
         assert typed_effective_args == legacy_effective_args, (
             f"{model_type} stage {stage_id} changed effective backend arguments"
         )
+
+
+@pytest.mark.parametrize("config", [None, {"decode": {}}])
+def test_create_model_config_projects_model_local_cudagraph(monkeypatch, config):
+    from vllm_omni.config.model import OmniModelConfig
+
+    monkeypatch.setattr(OmniEngineArgs, "_ensure_omni_models_registered", lambda self: None)
+    monkeypatch.setattr(EngineArgs, "create_model_config", lambda self: types.SimpleNamespace(hf_config=None))
+    monkeypatch.setattr(OmniModelConfig, "_maybe_override_text_config", lambda self: None)
+    args = OmniEngineArgs(
+        model="unused", tokenizer="unused", worker_type="generation", worker_cls="unused", model_local_cudagraph=config
+    )
+    result = args.create_model_config()
+    assert isinstance(result, OmniModelConfig)
+    assert result.model_local_cudagraph == config
