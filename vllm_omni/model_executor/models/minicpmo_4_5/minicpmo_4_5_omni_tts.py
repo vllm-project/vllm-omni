@@ -1104,8 +1104,14 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             eos_window_masked = bool(state.get("turn_end_drain")) and _turn_end_boundary_eos_masked(step)
             # A request pinning temperature to 0 (override or stage default)
             # takes the deterministic boundary sampler, same as single-frame.
+            # Both boundary samplers return the full sample result; the device
+            # state inside it owns the eos/stop-id/limit transition (single
+            # source). CPU unit tests historically stub these methods with the
+            # sampled tensor itself -- a bare tensor means no device state, and
+            # the stop routing falls back to the host recomputation below.
+            sample_result = None
             if _codec_float_param(state, "codec_temperature", self._codec_temperature) == 0.0:
-                sampled = self._sample_audio_code_greedy(
+                greedy_result = self._sample_audio_code_greedy(
                     hidden[end - 1 : end],
                     codes,
                     request_id,
@@ -1114,43 +1120,63 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                     max_tokens,
                     eos_window_masked,
                 )
+                if isinstance(greedy_result, TalkerCodecSampleResult):
+                    sample_result = greedy_result
+                else:
+                    sampled = greedy_result.reshape(()).to(torch.long)
             else:
                 stochastic_result = self._sample_audio_code(
                     hidden[end - 1 : end], codes, request_id, step, eos_window_masked
                 )
                 if isinstance(stochastic_result, TalkerCodecSampleResult):
-                    sampled = stochastic_result.sampled_token.reshape(()).to(torch.long)
+                    sample_result = stochastic_result
                 else:
-                    # CPU unit tests and downstream subclasses historically
-                    # stub this method with the sampled tensor itself.
                     sampled = stochastic_result.reshape(()).to(torch.long)
+            if sample_result is not None:
+                # The kernel ABI is int32, while the existing connector/audio-code
+                # payload is int64.  Keep the compatibility cast outside the fused op.
+                sampled = sample_result.sampled_token.to(torch.long).reshape(())
             sampled_id = int(sampled.item())
             full_ids = state.get("codec_full_ids")
             if isinstance(full_ids, list):
                 full_ids.append(sampled_id)
-            if _codec_bool_param(state, "codec_ignore_eos", False):
-                # ignore_eos blanks the engine's _eos_token_id
-                # (vllm/sampling_params.py:670-671), so a sampled codec EOS is
-                # just another frame and the request runs to its length budget.
-                is_eos = False
-            else:
-                is_eos = sampled_id == self._codec_eos_id
-            # stop_token_ids: the engine ends the request on any of these ids
-            # (v1/core/sched/utils.py:105); the codec stream ends it on the codec
-            # EOS, so both stop conditions apply here.
-            if not is_eos and sampled_id in _codec_stop_ids(state):
-                is_eos = True
             state["step"] = _codec_int_param(state, "step", 0) + 1
-            reached_limit = int(state["step"]) >= _codec_int_param(state, "max_tokens", self._codec_max_tokens)
-            # The engine stops the request when check_stop sees the pattern
-            # (v1/core/sched/utils.py:125-133); the K-step path owns the
-            # codec ids, so it has to make that call itself.
-            repetition_stop = _codec_repetition_detected(state)
-            finished = is_eos or reached_limit or repetition_stop
+            if sample_result is not None:
+                # Single-source stop routing: the device state owns the
+                # eos/stop-id/limit transition (codec_sample_result), so the
+                # host only consumes its finished/emit decision. Repetition
+                # detection stays host-side -- the scheduler never sees codec
+                # ids, so the engine's check_stop cannot police the codec
+                # stream; this mirrors it over codec_full_ids exactly as the
+                # engine does over its tokens (v1/core/sched/utils.py:125-133).
+                repetition_stop = _codec_repetition_detected(state)
+                finished = bool(sample_result.state.finished.item()) or repetition_stop
+                emit_frame = bool(sample_result.emit.item())
+            else:
+                # Stub fallback: no device state behind the scripted sample.
+                if _codec_bool_param(state, "codec_ignore_eos", False):
+                    # ignore_eos blanks the engine's _eos_token_id
+                    # (vllm/sampling_params.py:670-671), so a sampled codec EOS is
+                    # just another frame and the request runs to its length budget.
+                    is_eos = False
+                else:
+                    is_eos = sampled_id == self._codec_eos_id
+                # stop_token_ids: the engine ends the request on any of these ids
+                # (v1/core/sched/utils.py:105); the codec stream ends it on the codec
+                # EOS, so both stop conditions apply here.
+                if not is_eos and sampled_id in _codec_stop_ids(state):
+                    is_eos = True
+                reached_limit = int(state["step"]) >= _codec_int_param(state, "max_tokens", self._codec_max_tokens)
+                # The engine stops the request when check_stop sees the pattern
+                # (v1/core/sched/utils.py:125-133); the K-step path owns the
+                # codec ids, so it has to make that call itself.
+                repetition_stop = _codec_repetition_detected(state)
+                finished = is_eos or reached_limit or repetition_stop
+                emit_frame = not is_eos and not reached_limit
             state["finished"] = finished
             # MiniCPMTTS.generate_chunk consumes the boundary sample but
             # returns only codes that were fed into the retained KV state.
-            if not is_eos and not reached_limit:
+            if emit_frame:
                 codes = torch.cat([codes[-(_REPETITION_WINDOW - 1) :], sampled.reshape(1)])
                 delta = sampled.reshape(1, 1)
                 if self._k_step_frames > 0:
@@ -1484,6 +1510,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             sampled,
             eos_token_id=eos_id,
             ignore_eos=_codec_bool_param(request_state, "codec_ignore_eos", False),
+            stop_token_ids=_codec_stop_ids(request_state),
         )
         device_states[request_id] = result.state
         return result
@@ -1497,10 +1524,12 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         min_tokens: int,
         max_tokens: int,
         eos_window_masked: bool = False,
-    ) -> torch.Tensor:
+    ) -> TalkerCodecSampleResult:
         """Run the greedy codec boundary while keeping sampler state on device.
 
-        Host stop routing still consumes ``sampled.item()`` below; removing that
+        Returns the full sample result so the host stop routing consumes the
+        device-side finished/emit decision instead of recomputing it. The host
+        still reads ``sampled.item()`` for the connector payload; removing that
         sync requires a runner/connector state refactor and is not hidden here.
         """
         device_states = getattr(self, "_request_codec_device_states", None)
@@ -1554,11 +1583,10 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             presence_penalty=_codec_float_param(request_state, "codec_presence_penalty", 0.0),
             ignore_eos=_codec_bool_param(request_state, "codec_ignore_eos", False),
             eos_window_masked=eos_window_masked,
+            stop_token_ids=_codec_stop_ids(request_state),
         )
         device_states[request_id] = result.state
-        # The kernel ABI is int32, while the existing connector/audio-code
-        # payload is int64.  Keep the compatibility cast outside the fused op.
-        return result.sampled_token.to(torch.long).reshape(())
+        return result
 
     def _step_constants(self, hidden: torch.Tensor):
         """Constant per-step tensors, cached per (device, dtype).

@@ -281,8 +281,16 @@ def advance_codec_device_state(
     *,
     eos_token_id: int,
     ignore_eos: bool = False,
+    stop_token_ids: tuple[int, ...] = (),
 ) -> TalkerCodecDeviceState:
-    """Advance persistent stochastic state with graph-capturable tensor ops."""
+    """Advance persistent stochastic state with graph-capturable tensor ops.
+
+    ``stop_token_ids`` are the request's extra codec stop ids -- the
+    ``stop_token_ids`` analogue for the self-sampled codec stream. They are
+    request-level constants, so the Python loop unrolls into a fixed set of
+    comparisons at capture time, the same way the pinned top-k/top-p values
+    are baked into the per-request sampling graph.
+    """
     sampled = sampled_token.reshape(1).to(torch.int32)
     active = ~state.finished
     next_step = torch.where(active, state.step + 1, state.step)
@@ -293,9 +301,12 @@ def advance_codec_device_state(
         is_eos = torch.zeros_like(state.finished)
     else:
         is_eos = sampled == int(eos_token_id)
+    is_stop = torch.zeros_like(state.finished)
+    for token_id in stop_token_ids:
+        is_stop = is_stop | (sampled == int(token_id))
     reached_limit = active & (next_step >= state.max_tokens)
-    finished = state.finished | is_eos | reached_limit
-    emit = active & (~is_eos) & (~reached_limit)
+    finished = state.finished | is_eos | is_stop | reached_limit
+    emit = active & (~is_eos) & (~is_stop) & (~reached_limit)
     shifted = torch.cat([state.history[:, 1:], sampled.reshape(1, 1)], dim=1)
     append_at = state.history_len.clamp(min=0, max=HISTORY_WINDOW - 1).to(torch.long).reshape(1, 1)
     appended = state.history.scatter(1, append_at, sampled.reshape(1, 1))
@@ -312,6 +323,7 @@ def codec_sample_result(
     *,
     eos_token_id: int,
     ignore_eos: bool = False,
+    stop_token_ids: tuple[int, ...] = (),
 ) -> TalkerCodecSampleResult:
     """Advance device state and retain the device-side emit decision."""
     sampled = sampled_token.reshape(1).to(torch.int32)
@@ -321,12 +333,16 @@ def codec_sample_result(
         is_eos = torch.zeros_like(state.finished)
     else:
         is_eos = sampled == int(eos_token_id)
-    emit = active & (~is_eos) & (next_step < state.max_tokens)
+    is_stop = torch.zeros_like(state.finished)
+    for token_id in stop_token_ids:
+        is_stop = is_stop | (sampled == int(token_id))
+    emit = active & (~is_eos) & (~is_stop) & (next_step < state.max_tokens)
     next_state = advance_codec_device_state(
         state,
         sampled,
         eos_token_id=eos_token_id,
         ignore_eos=ignore_eos,
+        stop_token_ids=stop_token_ids,
     )
     return TalkerCodecSampleResult(sampled_token=sampled, state=next_state, emit=emit)
 
@@ -343,6 +359,7 @@ def greedy_codec_sample(
     presence_penalty: float = 0.0,
     ignore_eos: bool = False,
     eos_window_masked: bool = False,
+    stop_token_ids: tuple[int, ...] = (),
 ) -> TalkerCodecSampleResult:
     """Greedy codec sample in graph-capturable tensor ops.
 
@@ -378,4 +395,5 @@ def greedy_codec_sample(
         sampled,
         eos_token_id=eos_token_id,
         ignore_eos=ignore_eos,
+        stop_token_ids=stop_token_ids,
     )

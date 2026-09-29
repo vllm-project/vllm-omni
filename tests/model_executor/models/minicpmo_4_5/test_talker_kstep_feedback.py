@@ -820,3 +820,128 @@ def test_eos_window_mask_hides_codec_eos():
     # Drain window: EOS is forced out even though the step allows it.
     masked = prepare_codec_logits(logits.clone(), eos_window_masked=True, **kwargs)
     assert masked[0, _EOS_ID] == float("-inf")
+
+
+_STOP_ID = 6561  # in-vocabulary for the codec head, not the codec EOS
+
+
+def _real_boundary_talker(temperature: float):
+    """A talker on the real (non-stub) greedy or stochastic boundary."""
+    model = _make_talker(k_step_frames=8, scripted_samples=[])
+    model._codec_temperature = temperature
+    model._codec_repetition_penalty = 1.05
+    model.head_code = nn.ModuleList([nn.Linear(8, _NUM_AUDIO_TOKENS, bias=False)])
+    if temperature == 0.0:
+        real_greedy = type(model)._sample_audio_code_greedy
+        model._sample_audio_code_greedy = real_greedy.__get__(model, type(model))
+    else:
+        model._codec_top_k = 0
+        model._codec_top_p = 1.0
+        model._codec_seed = 42
+        real_sample = type(model)._sample_audio_code
+        model._sample_audio_code = real_sample.__get__(model, type(model))
+    return model
+
+
+def _bias_head_to(model, token_id: int):
+    """Make the head's argmax land exactly on ``token_id``."""
+    with torch.no_grad():
+        model.head_code[0].weight.zero_()
+        model.head_code[0].weight[token_id] = 1.0
+
+
+def test_stop_id_finishes_request_through_device_state_greedy():
+    """A codec stop id finishes the request via the device state alone.
+
+    Review follow-up (PR #7929): make_omni_output used to recompute the
+    eos/stop-id/limit transition host-side while codec_sample_result ran the
+    same transition on the device. The device state is now the single source,
+    so a stop-id frame finishes the request and drops out of the audio stream
+    without the host ever recomputing the stop set.
+    """
+    model = _real_boundary_talker(0.0)
+    state = {
+        "step": 0,
+        "max_tokens": 4032,
+        "codes": torch.tensor([10, 11]),
+        "codec_stop_token_ids": [_STOP_ID],
+    }
+    model._request_audio_states["r1"] = state
+    _bias_head_to(model, _STOP_ID)
+
+    out = _frame_call(model, torch.ones(1, 8))
+
+    assert state["finished"] is True
+    # The stop frame itself must not join the emitted audio stream.
+    assert out.multimodal_outputs["codes"]["audio"][0].numel() == 0
+    # K-step bookkeeping: a terminating frame records no confirmed codec id.
+    assert "last_code" not in state
+    assert model._request_codec_history.get("r1", []) == []
+    # The device state is what decided this.
+    assert bool(model._request_codec_device_states["r1"].finished.item()) is True
+
+
+def test_normal_frame_then_stop_id_frame_device_routing():
+    """A normal frame emits and records; the following stop frame terminates."""
+    model = _real_boundary_talker(0.0)
+    state = {
+        "step": 0,
+        "max_tokens": 4032,
+        "codes": torch.tensor([10, 11]),
+        "codec_stop_token_ids": [_STOP_ID],
+    }
+    model._request_audio_states["r1"] = state
+    _bias_head_to(model, 42)
+    out0 = _frame_call(model, torch.ones(1, 8))
+    assert state["last_code"] == 42
+    assert state["finished"] is False
+    assert out0.multimodal_outputs["codes"]["audio"][0].reshape(-1).tolist() == [42]
+
+    _bias_head_to(model, _STOP_ID)
+    out1 = _frame_call(model, torch.ones(1, 8))
+    assert state["finished"] is True
+    assert out1.multimodal_outputs["codes"]["audio"][0].numel() == 0
+    # Only confirmed frames reach the history: the stop frame does not.
+    assert model._request_codec_history["r1"] == [42]
+
+
+def test_stop_id_finishes_request_stochastic_path():
+    """The stochastic boundary routes stop ids through the same device state."""
+    model = _real_boundary_talker(0.8)
+    state = {
+        "step": 0,
+        "max_tokens": 4032,
+        "codes": torch.tensor([10, 11]),
+        "codec_stop_token_ids": [_STOP_ID],
+    }
+    model._request_audio_states["r1"] = state
+    _bias_head_to(model, _STOP_ID)
+
+    _frame_call(model, torch.ones(1, 8))
+
+    assert state["finished"] is True
+    assert bool(model._request_codec_device_states["r1"].finished.item()) is True
+
+
+def test_ignore_eos_does_not_ignore_stop_ids():
+    """``ignore_eos`` blanks the EOS id, not the request's stop ids.
+
+    The engine treats the two independently (a sampled stop id finishes the
+    request even when ``ignore_eos`` is set), and the device-side transition
+    keeps that split: only the EOS comparison is blanked.
+    """
+    model = _real_boundary_talker(0.0)
+    state = {
+        "step": 0,
+        "max_tokens": 4032,
+        "codes": torch.tensor([10, 11]),
+        "codec_stop_token_ids": [_STOP_ID],
+        "codec_ignore_eos": True,
+    }
+    model._request_audio_states["r1"] = state
+    _bias_head_to(model, _STOP_ID)
+
+    _frame_call(model, torch.ones(1, 8))
+
+    assert state["finished"] is True
+    assert bool(model._request_codec_device_states["r1"].finished.item()) is True
