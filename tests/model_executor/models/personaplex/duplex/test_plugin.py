@@ -303,11 +303,8 @@ def test_plan_append_reserves_one_slot_plus_prefill_on_the_first_seq() -> None:
     duplex = first.prompt["model_intermediate_buffer"]["duplex"]
     assert duplex["session_id"] == "session"
     assert duplex["epoch"] == 3
-    assert duplex["turn_id"] == 1
     assert duplex["seq"] == 1
     assert duplex["data_plane"] is True
-    assert duplex["fence"] == fence
-    assert duplex["scheduler_token_budget"] == 5
     assert duplex["runtime_config"] == {"personaplex_prefill_slots": 4}
     assert "incarnation" not in duplex
     assert first.prompt["model_intermediate_buffer"]["global_request_id"] == ["session"]

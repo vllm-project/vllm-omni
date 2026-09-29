@@ -23,6 +23,9 @@ logger = init_logger(__name__)
 __all__ = ["PersonaPlexDepformerGraphs", "depformer_graph_buckets"]
 
 _GRAPH_WARMUP_ITERS = 2
+# Pinned slot-upload buffers in rotation, so the host may run this many steps
+# ahead of the device (async scheduling) without a wait.
+_HOST_SLOT_BUFFERS = 3
 
 
 def depformer_graph_buckets(capture_sizes: list[int] | None, max_num_seqs: int) -> list[int]:
@@ -64,7 +67,15 @@ class PersonaPlexDepformerGraphs:
         self._hidden = torch.zeros(max_rows, 1, hidden_size, dtype=dtype, device=self.device)
         # [read; write] slots of every row; padding rows stay on the scratch row.
         self._slots = torch.full((2, max_rows), scratch, dtype=torch.long, device=self.device)
-        self._host_slots = torch.full((2, max_rows), scratch, dtype=torch.long, pin_memory=self._on_cuda)
+        self._host_slots = [
+            torch.full((2, max_rows), scratch, dtype=torch.long, pin_memory=self._on_cuda)
+            for _ in range(_HOST_SLOT_BUFFERS)
+        ]
+        # Each buffer's last upload; an event never recorded queries as complete.
+        self._host_slot_events: list[torch.cuda.Event | None] = (
+            [torch.cuda.Event() for _ in range(_HOST_SLOT_BUFFERS)] if self._on_cuda else [None] * _HOST_SLOT_BUFFERS
+        )
+        self._next_host_slots = 0
         self._graphs: dict[int, torch.cuda.CUDAGraph] = {}
         self._outputs: dict[int, torch.Tensor] = {}
 
@@ -74,43 +85,50 @@ class PersonaPlexDepformerGraphs:
 
     @torch.inference_mode()
     def run(self, request_ids: list[str], text_tokens: torch.Tensor, hidden: torch.Tensor) -> torch.Tensor:
-        """Run one post-sample step and return its ``[rows, num_steps]`` codes on the host.
+        """Run one post-sample step and return its ``[rows, num_steps]`` codes on the device.
 
         ``text_tokens`` is ``[rows]`` and ``hidden`` ``[rows, 1, hidden_size]``,
-        row ``i`` belonging to ``request_ids[i]``.
+        row ``i`` belonging to ``request_ids[i]``. The codes are the caller's
+        own tensor (not the graph's output buffer), and nothing here waits for
+        the device.
         """
         rows = len(request_ids)
         if rows == 0:
-            return torch.empty((0, self.num_steps), dtype=torch.long)
+            return torch.empty((0, self.num_steps), dtype=torch.long, device=self.device)
         read, write = self.runtime.depformer_rows(request_ids)
         padded = next((bucket for bucket in self.buckets if bucket >= rows), None)
         if padded is None:
-            slots = torch.tensor([read, write], dtype=torch.long).to(self.device)
-            codes = self._step(
+            slots = torch.tensor([read, write], dtype=torch.long, pin_memory=self._on_cuda)
+            slots = slots.to(self.device, non_blocking=True)
+            return self._step(
                 text_tokens.to(self.device, torch.long),
                 hidden.to(self.device, self._hidden.dtype),
                 slots[0],
                 slots[1],
             )
-            return codes.cpu()
 
-        host = self._host_slots
-        # The previous step ended with a device-to-host copy, so its upload from
-        # this pinned buffer has completed. The whole (small, contiguous) buffer
-        # goes up, padding rows on the scratch row.
+        # The whole (small, contiguous) buffer goes up, padding rows on the
+        # scratch row, once that buffer's previous upload has completed.
+        index = self._next_host_slots
+        self._next_host_slots = (index + 1) % _HOST_SLOT_BUFFERS
+        host, event = self._host_slots[index], self._host_slot_events[index]
+        if event is not None and not event.query():
+            event.synchronize()
         host[0, :rows] = torch.tensor(read, dtype=torch.long)
         host[1, :rows] = torch.tensor(write, dtype=torch.long)
         host[:, rows:] = self.runtime.scratch_slot
         self._slots.copy_(host, non_blocking=True)
+        if event is not None:
+            event.record()
         self._text[:rows].copy_(text_tokens.reshape(rows))
         self._hidden[:rows].copy_(hidden.reshape(rows, 1, -1))
         graph = self._graphs.get(padded)
         if graph is not None and not torch.cuda.is_current_stream_capturing():
             graph.replay()
-            codes = self._outputs[padded]
-        else:
-            codes = self._step(*self._static_args(padded))
-        return codes[:rows].cpu()
+            # The next replay overwrites the output buffer: hand out a copy,
+            # made on this stream before that replay can run.
+            return self._outputs[padded][:rows].clone()
+        return self._step(*self._static_args(padded))[:rows]
 
     def _static_args(self, rows: int) -> tuple[torch.Tensor, ...]:
         return self._text[:rows], self._hidden[:rows], self._slots[0, :rows], self._slots[1, :rows]

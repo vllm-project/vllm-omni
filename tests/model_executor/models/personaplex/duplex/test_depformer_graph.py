@@ -40,7 +40,8 @@ class _FakeCodec:
             if is_active:
                 self.frames[row] += 1
                 codes[row] = 100 + 7 * self.frames[row] + row
-        return codes
+        # Like the real codec, the codes come back on the device of its input.
+        return codes.to(pcm.device)
 
     def reset_slot(self, row: int) -> None:
         self.frames[row] = 0
@@ -249,7 +250,8 @@ def test_graph_replay_matches_padded_eager() -> None:
     assert sorted(graphs._graphs) == buckets
     sessions = [f"s{i}" for i in range(rows)]
 
-    for seq in (1, 2, 3):
+    # Four steps wrap the ring of pinned slot-upload buffers.
+    for seq in (1, 2, 3, 4):
         _prepare(graph_runtime, sessions, seq)
         _prepare(eager_runtime, sessions, seq)
         # Padding rows hold garbage: NaN hidden and arbitrary token ids.
@@ -257,6 +259,7 @@ def test_graph_replay_matches_padded_eager() -> None:
         graphs._text.fill_(97)
         text, hidden = _step_inputs(rows, device, dtype, seed=seq)
         codes = graphs.run(sessions, text, hidden)
+        assert codes.device.type == "cuda"
         assert torch.equal(codes, eager.run(sessions, text, hidden))
         _assert_same_state(graph_runtime, eager_runtime)
 
@@ -276,5 +279,8 @@ def test_graph_rows_above_the_largest_bucket_match_the_unpadded_path() -> None:
         _prepare(reference, sessions, seq)
         text, hidden = _step_inputs(3, device, dtype, seed=seq)
         codes = graphs.run(sessions, text, hidden)
-        assert torch.equal(codes, _reference_step(reference, depformer, sessions, text, hidden))
+        # Rows above the largest bucket run eagerly, and like a replay they
+        # hand back device codes; the reference is already on the host.
+        assert codes.device.type == "cuda"
+        assert torch.equal(codes.cpu(), _reference_step(reference, depformer, sessions, text, hidden))
         _assert_same_state(graph_runtime, reference)

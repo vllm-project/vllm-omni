@@ -130,8 +130,9 @@ class _StreamConv1d:
         self._fresh = torch.ones(batch_size, dtype=torch.bool, device=device)
 
     def reset_slot(self, b: int) -> None:
+        # In-place fills: assigning a Python scalar would sync the host.
         self.prev[b].zero_()
-        self._fresh[b] = True
+        self._fresh[b].fill_(True)
 
     def reset_all_slots(self) -> None:
         self.prev.zero_()
@@ -172,7 +173,7 @@ class _StreamConvTr1d:
 
     def reset_slot(self, b: int) -> None:
         self.partial[b].zero_()
-        self._fresh[b] = True
+        self._fresh[b].fill_(True)
 
     def reset_all_slots(self) -> None:
         self.partial.zero_()
@@ -267,7 +268,7 @@ class _MimiStreamingTransformer(nn.Module):
         # instead of carrying its predecessor's absolute RoPE positions.
         for kv in self._kv:
             kv.reset_row(b)
-        self._offset[b] = 0
+        self._offset[b].zero_()
 
     def step(self, x: torch.Tensor, active: torch.Tensor) -> torch.Tensor:
         """``x`` is ``[B, T, dim]`` (T = positions this frame, typically 2)."""

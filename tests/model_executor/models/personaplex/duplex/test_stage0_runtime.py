@@ -277,12 +277,6 @@ def test_next_append_uses_prior_sample_and_causally_delayed_user_frame() -> None
     assert torch.equal(third_call["user_d1"], torch.full((1, 8), 1, dtype=torch.long))
 
 
-def test_decoded_pcm_is_writable_for_torch_zero_copy() -> None:
-    pcm = PersonaPlexStage0DuplexRuntime._decode_pcm(_duplex_info(seq=1)["payload"])
-
-    assert pcm.flags.writeable
-
-
 def _prepare_two_sessions(
     runtime: PersonaPlexStage0DuplexRuntime,
 ) -> tuple[

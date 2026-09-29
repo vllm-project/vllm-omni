@@ -60,6 +60,7 @@ from vllm_omni.model_executor.models.personaplex.personaplex_depformer_graph imp
 from vllm_omni.model_executor.models.personaplex.personaplex_embeddings import (
     PersonaPlexInputEmbeddings,
 )
+from vllm_omni.utils.device_copy import index_to_device
 
 __all__ = ["PersonaPlexTalkerForConditionalGeneration", "serving_depformer_config"]
 
@@ -131,7 +132,20 @@ class PersonaPlexTalkerForConditionalGeneration(nn.Module):
         # Omni AR runner contract.
         self.have_multimodal_outputs = True
         self.has_preprocess = True
-        self.has_postprocess = True  # capture each frame's hidden for the next depformer step
+        # preprocess_batch writes the live duplex rows itself (one indexed copy).
+        self.preprocess_batch_fills_rows = True
+        # Capture each frame's hidden for the next decode step's depformer. A
+        # duplex frame runs its depformer post-sample from the current hidden
+        # (post_sample_talker_mtp) and never reads the captured one.
+        self.has_postprocess = session_mode != "duplex"
+        # Code2Wav only reads the codes: no per-step host copy of the hidden.
+        self.omni_pooler_payload_include_hidden = False
+        # The post-sample depformer rows are the non-discarded rows, known
+        # before the sampled values: launch it ahead of the bookkeeping sync.
+        self.post_sample_talker_mtp_before_bookkeeping = True
+        # A duplex session's prompt only grows by one frame slot per step:
+        # resume its batch row in place instead of re-copying the prompt.
+        self.resume_streaming_rows_in_place = session_mode == "duplex"
         self.requires_full_prefix_cached_hidden_states = False
         # Keep the per-frame "last" hidden on GPU (avoids a CPU round-trip each step).
         self.gpu_resident_buffer_keys: set[tuple[str, str]] = {("hidden_states", "last")}
@@ -517,11 +531,25 @@ class PersonaPlexTalkerForConditionalGeneration(nn.Module):
         req_ids: list[str],
         model_intermediate_buffer: dict[str, dict[str, Any]],
         device: torch.device,
-    ) -> None:
-        """Encode every live duplex append of this step in one shared-encoder call."""
+        input_ids: torch.Tensor | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        token_offsets: list[int] | None = None,
+        num_scheduled_tokens: list[int] | None = None,
+        num_computed_tokens: list[int] | None = None,
+        prompt_lens: list[int | None] | None = None,
+    ) -> set[str]:
+        """Encode every live duplex append of this step in one shared-encoder call.
+
+        With the step's buffers (``preprocess_batch_fills_rows``), the live
+        one-frame appends are also prepared here and their rows written with
+        one indexed copy; the returned request ids skip the per-request
+        ``preprocess``. First appends (the prefill), stale epochs and anything
+        unusual still go through ``preprocess``.
+        """
         del device
         appends: list[dict[str, Any]] = []
-        for req_id in req_ids:
+        live: list[tuple[int, str, dict[str, Any]]] = []
+        for index, req_id in enumerate(req_ids):
             info = model_intermediate_buffer.get(req_id)
             if not isinstance(info, dict):
                 continue
@@ -531,8 +559,42 @@ class PersonaPlexTalkerForConditionalGeneration(nn.Module):
                 duplex = additional.get("duplex") if isinstance(additional, dict) else None
             if isinstance(duplex, dict) and duplex.get("data_plane") is True:
                 appends.append(duplex)
-        if appends:
-            self._duplex_stage0_runtime().encode_appends(appends)
+                live.append((index, req_id, duplex))
+        if not appends:
+            return set()
+        runtime = self._duplex_stage0_runtime()
+        runtime.encode_appends(appends)
+        if (
+            input_ids is None
+            or inputs_embeds is None
+            or token_offsets is None
+            or num_scheduled_tokens is None
+            or num_computed_tokens is None
+            or prompt_lens is None
+        ):
+            return set()
+        # A live append schedules exactly its one new prompt slot.
+        candidates = [
+            (index, req_id, duplex)
+            for index, req_id, duplex in live
+            if num_scheduled_tokens[index] == 1
+            and prompt_lens[index] is not None
+            and num_computed_tokens[index] == prompt_lens[index] - 1
+        ]
+        if not candidates:
+            return set()
+        handled, embeds = runtime.prepare_live_appends(
+            [(req_id, duplex, int(prompt_lens[index])) for index, req_id, duplex in candidates]
+        )
+        if not handled:
+            return set()
+        rows = [token_offsets[candidates[position][0]] for position in handled]
+        dst = index_to_device(rows, inputs_embeds.device)
+        # The same casts as the per-request path: the model dtype, then the buffer's.
+        inputs_embeds.index_copy_(0, dst, embeds.to(dtype=self._dtype).to(dtype=inputs_embeds.dtype))
+        # The per-request path copies the prepared zero placeholder ids.
+        input_ids.index_fill_(0, dst, 0)
+        return {candidates[position][1] for position in handled}
 
     def on_requests_finished(self, finished_req_ids: set[str] | list[str]) -> None:
         runtime = getattr(self, "_personaplex_duplex_stage0_runtime", None)
@@ -603,7 +665,7 @@ class PersonaPlexTalkerForConditionalGeneration(nn.Module):
         graphs = getattr(self, "_depformer_graphs", None)
         if graphs is not None:
             # Teacher-forcing gather, depformer and frame-state commit in one
-            # replay; the codes come back on the host.
+            # replay.
             return graphs.run(req_ids, text_token, hidden)
         runtime = self._duplex_stage0_runtime()
         audio_tokens, audio_provided = runtime.depformer_teacher_forcing(req_ids)
@@ -615,10 +677,10 @@ class PersonaPlexTalkerForConditionalGeneration(nn.Module):
             num_steps=self.num_active_codebooks,
         ).to(torch.long)
         runtime.record_samples(request_ids=req_ids, text_tokens=text_token, agent_codes=codes)
-        # Every consumer moves the codes to host (the runner's request-state
-        # store, the output payload and the stage 1 input processor), so move
-        # the whole batch once here instead of once per request downstream.
-        return codes.cpu()
+        # The codes stay on the device: the runner moves the whole batch to the
+        # host with one non-blocking copy and waits for it only where it reads
+        # them.
+        return codes
 
     # ------------------------------------------------------------------
     # Weight loading
