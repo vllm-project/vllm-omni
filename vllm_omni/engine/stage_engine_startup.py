@@ -1588,6 +1588,8 @@ def launch_diffusion_stage_replica(
     replica_id: int = 0,
     omni_master_server: OmniMasterServer | None = None,
     omni_coordinator_address: str | None = None,
+    stage_visible_devices: str | None = None,
+    spawn_device_lock: threading.Lock | None = None,
 ) -> tuple[Any, StageReplicaResources]:
     """Launch a local diffusion stage replica.
 
@@ -1596,20 +1598,22 @@ def launch_diffusion_stage_replica(
     ``StageDiffusionProc`` that heartbeats to ``OmniCoordinator``.
     """
     if omni_master_server is None:
-        client = initialize_diffusion_stage(
-            metadata.stage_id,
-            model,
-            stage_config,
-            metadata,
-            stage_init_timeout=stage_init_timeout,
-            use_inline=use_inline,
-        )
+        with scoped_spawn_device_env(stage_visible_devices, spawn_device_lock):
+            client = initialize_diffusion_stage(
+                metadata.stage_id,
+                model,
+                stage_config,
+                metadata,
+                stage_init_timeout=stage_init_timeout,
+                use_inline=use_inline,
+            )
         return client, StageReplicaResources()
 
     from vllm_omni.diffusion import stage_diffusion_proc
     from vllm_omni.diffusion.stage_diffusion_client import StageDiffusionClient
 
-    od_config = build_diffusion_config(model, stage_config, metadata)
+    with scoped_spawn_device_env(stage_visible_devices, spawn_device_lock):
+        od_config = build_diffusion_config(model, stage_config, metadata)
     parallel_config = getattr(od_config, "parallel_config", None)
     world_size = getattr(parallel_config, "world_size", 1)
     try:
@@ -1620,6 +1624,7 @@ def launch_diffusion_stage_replica(
         metadata.stage_id,
         {"tensor_parallel_size": world_size},
         stage_init_timeout,
+        visible_devices=stage_visible_devices,
     )
     proc_manager = None
     try:
@@ -1636,19 +1641,20 @@ def launch_diffusion_stage_replica(
             handshake=True,
             data=False,
         )
-        proc_manager = stage_diffusion_proc.StageDiffusionProcManager(
-            model=model,
-            od_config=od_config,
-            stage_init_timeout=stage_init_timeout,
-            handshake_address=registration.handshake_address,
-            addresses=EngineZmqAddresses(
-                inputs=[registration.input_address],
-                outputs=[registration.output_address],
-            ),
-            omni_coordinator_address=omni_coordinator_address,
-            omni_stage_id=metadata.stage_id,
-            omni_replica_id=replica_id,
-        )
+        with scoped_spawn_device_env(stage_visible_devices, spawn_device_lock):
+            proc_manager = stage_diffusion_proc.StageDiffusionProcManager(
+                model=model,
+                od_config=od_config,
+                stage_init_timeout=stage_init_timeout,
+                handshake_address=registration.handshake_address,
+                addresses=EngineZmqAddresses(
+                    inputs=[registration.input_address],
+                    outputs=[registration.output_address],
+                ),
+                omni_coordinator_address=omni_coordinator_address,
+                omni_stage_id=metadata.stage_id,
+                omni_replica_id=replica_id,
+            )
         omni_master_server.release_route_port_reservations(
             metadata.stage_id,
             replica_id,

@@ -444,6 +444,7 @@ def extract_zimage_context(
         cap_pos_ids,
         x_inner_pad_mask,
         cap_inner_pad_mask,
+        _cap_feats_2,
     ) = module.patchify_and_embed(x, cap_feats, patch_size, f_patch_size)
 
     # Process image patches through embedder and noise refiner

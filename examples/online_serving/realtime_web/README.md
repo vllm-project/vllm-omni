@@ -9,6 +9,7 @@ This implements [RFC #7222](https://github.com/vllm-project/vllm-omni/issues/722
 | `minicpm-native` | Model-controlled listen/speak, continuous audio input | Frames accompany audio | Yes |
 | `qwen3-turn --stt` (default) | User presses **Send turn** | No | No |
 | `qwen3-turn --vad` | Server detects trailing silence; speech interrupts replies | Sampled frames with each spoken turn | Yes |
+| `aura-ptt` | Hold **Hold to talk**; release commits. Hold also stops local playback | Sticky frames with speech; vision-follow every 2 frames only while unlocked (locked from PTT release until text-final / listen) | Yes |
 
 Qwen3 VAD uses an engine-owned duplex plugin: microphone upload continues
 while replies stream, and speech can interrupt generation and playback. The
@@ -29,6 +30,38 @@ The compatibility wrapper serves the shared assets with `minicpm-native`.
 The current native query, `extra_body`, reference voice, continuous microphone
 upload, camera frames and playback acknowledgements are retained.
 
+## AURA: push-to-talk duplex
+
+AURA has no client VAD. Start the duplex serve, then the thin wrapper:
+
+```bash
+bash examples/online_serving/aura_omni/run_duplex_smoke_serve.sh
+
+python -m examples.online_serving.aura_omni.realtime_web \
+    --ws-backend ws://127.0.0.1:8099 --model aurateam/AURA --port 7862
+```
+
+Or select the profile on the shared host:
+
+```bash
+python -m examples.online_serving.realtime_web --profile aura-ptt \
+    --ws-backend ws://127.0.0.1:8099 --model aurateam/AURA --port 7862
+```
+
+Open the UI, start a session, optionally enable **Camera**, then **hold**
+**Hold to talk** to stream `is_speech=true` PCM (with sticky camera frames).
+**Release** to `input_audio_buffer.commit`. Holding the button stops playback
+in the browser only; the in-flight response is not cancelled on the server.
+With the camera on, frames are still captured at 2 fps. While the button is
+up they are committed once per two frames (`is_speech=false` + silent PCM).
+Both frames of that commit are sent and packed as one video (`<|video_pad|>`).
+Turns still open from this client commit, not from a server-side auto trigger.
+but only after the prior spoken turn unlocks (text-final or `response.listen`).
+Release itself locks vision immediately so a follow-up frame cannot abort the
+just-committed speech turn on Stage0/1 (`max_num_seqs=1`). Audio still playing
+does not hold the next vision turn once text is done.
+MiniCPM / Qwen profiles do not set `pushToTalk`, so the PTT control stays hidden.
+
 ## Qwen3: explicit-turn STT adapter
 
 Start the backend, then the UI in a second terminal:
@@ -48,6 +81,7 @@ accepts only model selection, so system-prompt controls are hidden in this mode.
 
 The adapter follows the shipped `qwen3_omni/openai_realtime_client.py` and
 `vllm_omni/entrypoints/openai/realtime_connection.py`:
+
 
 1. Explicit `duplex=0` selects the legacy STT handler on a turn deployment.
    It does not enable STT on a duplex deployment.
@@ -181,7 +215,7 @@ conversation API. This demo does not add WebRTC, semantic VAD, or tool calling.
 
 ## Shared host options
 
-The shared entry point can select either profile explicitly:
+The shared entry point can select a profile explicitly:
 
 ```bash
 python -m examples.online_serving.realtime_web --profile qwen3-turn \
@@ -193,7 +227,7 @@ python -m examples.online_serving.realtime_web --profile qwen3-turn \
 - `--public-realtime-url`: optional browser-visible WebSocket URL; otherwise the
   static host proxies `/v1/realtime` on the same origin.
 - `--host`, `--port`: UI bind address and port (default port 7862).
-- `--ref-audio`: required for MiniCPM; rejected for Qwen3.
+- `--ref-audio`: required for MiniCPM; rejected for Qwen3 and AURA.
 
 Microphone and camera access require `localhost` or HTTPS. For a remote backend,
 use an SSH tunnel to the UI host or an HTTPS reverse proxy with WebSocket support.

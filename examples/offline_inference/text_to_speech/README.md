@@ -563,7 +563,7 @@ Single-stage native AR TTS at 48 kHz. Pipeline: `feat_encoder → MiniCPM4 → F
 ```bash
 pip install voxcpm
 # or, for a local source checkout:
-export VLLM_OMNI_VOXCPM_CODE_PATH=/path/to/voxcpm
+pip install -e /path/to/voxcpm
 ```
 
 ### Quick start

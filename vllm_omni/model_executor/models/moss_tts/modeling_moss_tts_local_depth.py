@@ -21,6 +21,8 @@ checkpoint 1:1 so ``load_weights()`` needs no remapping.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -236,6 +238,7 @@ class MossTTSLocalDepthTransformer(nn.Module):
         top_p: float,
         do_sample: bool,
         generator: torch.Generator | None,
+        generators: Sequence[torch.Generator | None] | None = None,
     ) -> torch.Tensor:
         """Compute channel logits, apply repetition penalty, sample, store."""
         channel_logits = audio_lm_heads[channel_index](local_hidden).float()
@@ -254,6 +257,7 @@ class MossTTSLocalDepthTransformer(nn.Module):
             top_p,
             do_sample,
             generator=generator,
+            generators=generators,
         )
         codes[:, channel_index] = channel_token
         return channel_token
@@ -277,6 +281,7 @@ class MossTTSLocalDepthTransformer(nn.Module):
         repetition_penalty: float = 1.0,
         history_per_codebook: list[list[int]] | None = None,
         generator: torch.Generator | None = None,
+        generators: Sequence[torch.Generator | None] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Generate one audio frame for batch B.
 
@@ -319,6 +324,7 @@ class MossTTSLocalDepthTransformer(nn.Module):
             text_top_p,
             do_sample,
             generator=generator,
+            generators=generators,
         )
         should_continue = binary_choice.eq(0)
         import os as _os
@@ -344,6 +350,7 @@ class MossTTSLocalDepthTransformer(nn.Module):
                 top_p=top_p,
                 do_sample=do_sample,
                 generator=generator,
+                generators=generators,
             )
 
             if channel_index + 1 < n_vq:

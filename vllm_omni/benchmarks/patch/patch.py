@@ -19,6 +19,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
+from urllib.parse import urlparse
 
 import aiohttp
 import numpy as np
@@ -53,6 +54,7 @@ from vllm_omni.benchmarks.data_modules.daily_omni_dataset import (
 from vllm_omni.benchmarks.data_modules.omniinteract_dataset import (
     DEFAULT_OMNIINTERACT_REPO,
     OmniInteractDataset,
+    OmniInteractEvaluationOptions,
     OmniInteractPreparedInput,
     OmniInteractSampleRequest,
     OmniInteractSessionOptions,
@@ -91,6 +93,7 @@ from vllm_omni.benchmarks.omniinteract import (
 from vllm_omni.benchmarks.omniinteract import (
     write_batch_artifacts as write_omniinteract_batch_artifacts,
 )
+from vllm_omni.benchmarks.omniinteract_eval import evaluate_batch as evaluate_omniinteract_batch
 from vllm_omni.metrics import definitions as defs
 from vllm_omni.metrics.utils import coerce_bool, coerce_positive_float_scalar, coerce_positive_int_scalar
 
@@ -428,6 +431,39 @@ def _finalize_omniinteract_batch(
     return compact_summary
 
 
+async def _evaluate_omniinteract_batch(
+    input_requests: list[SampleRequest],
+    outputs: list[RequestFuncOutput],
+) -> dict[str, object] | None:
+    rows = [
+        (sample, output)
+        for sample, output in zip(input_requests, outputs, strict=True)
+        if isinstance(sample, OmniInteractSampleRequest)
+    ]
+    if not rows:
+        return None
+    options = rows[0][0].omniinteract_options
+    if not isinstance(options, OmniInteractSessionOptions) or options.evaluation is None:
+        return None
+    cases, results = [], []
+    for sample, output in rows:
+        result = getattr(output, "omniinteract_case_result", None)
+        if sample.omniinteract_case is None or not isinstance(result, OmniInteractCaseResult):
+            raise RuntimeError("OmniInteract benchmark output lost its dataset identity")
+        cases.append(sample.omniinteract_case)
+        results.append(result)
+    try:
+        return await asyncio.to_thread(
+            evaluate_omniinteract_batch,
+            cases,
+            results,
+            options.evaluation,
+        )
+    except Exception as exc:  # noqa: BLE001 - post-hoc accuracy must not fail a finished benchmark
+        logger.exception("OmniInteract evaluation failed")
+        return {"status": "failed", "error": str(exc)}
+
+
 def _prepare_omniinteract_batch(input_requests: list[SampleRequest]) -> None:
     roots: set[Path] = set()
     for sample in input_requests:
@@ -502,7 +538,14 @@ def _videomme_repo_from_args(args, *, explicit: bool = False) -> str | None:
     return None
 
 
-def get_samples(args, tokenizer):
+def get_samples(args, tokenizer, **kwargs):
+    """Omni override of ``vllm.benchmarks.datasets.get_samples``.
+
+    ``**kwargs`` mirrors upstream's keyword-only arguments (today
+    ``multimodal_backends``, passed by ``vllm/benchmarks/throughput.py``) so that
+    any upstream caller reaching this patched replacement keeps working; they are
+    forwarded to the original implementation on every delegate path.
+    """
     # Daily-Omni: explicit dataset name, or hf + matching path/hf-name
     is_daily_omni = args.dataset_name == "daily-omni" or (
         args.dataset_name == "hf" and _daily_omni_repo_from_args(args) is not None
@@ -530,7 +573,7 @@ def get_samples(args, tokenizer):
 
     if not is_omni_backend and not is_omni_dataset:
         # Not an omni-related request, delegate to original implementation
-        return get_samples_old(args, tokenizer)
+        return get_samples_old(args, tokenizer, **kwargs)
 
     if is_omniinteract:
         dataset_path = getattr(args, "dataset_path", None)
@@ -548,14 +591,32 @@ def get_samples(args, tokenizer):
             subsets=tuple(getattr(args, "omniinteract_subsets")),
             random_seed=args.seed,
             disable_shuffle=getattr(args, "disable_shuffle", False),
+            scenario_tags=tuple(getattr(args, "omniinteract_scenario_tags", None) or ()),
+            scenario_focus=bool(getattr(args, "omniinteract_scenario_focus", False)),
+            video_list=getattr(args, "omniinteract_video_list", None),
         )
+        output_root = Path(getattr(args, "omniinteract_output_dir"))
+        evaluation = None
+        if bool(getattr(args, "omniinteract_evaluate", False)):
+            evaluation_output = getattr(args, "omniinteract_eval_output_dir", None)
+            evaluation = OmniInteractEvaluationOptions(
+                judge_base_url=str(getattr(args, "omniinteract_judge_base_url", "http://127.0.0.1:8000")),
+                judge_model=str(getattr(args, "omniinteract_judge_model", "")),
+                judge_api_key=str(getattr(args, "omniinteract_judge_api_key", "EMPTY")),
+                judge_timeout_s=float(getattr(args, "omniinteract_judge_timeout_s", 60.0)),
+                judge_max_tokens=int(getattr(args, "omniinteract_judge_max_tokens", 512)),
+                workers=int(getattr(args, "omniinteract_eval_workers", 8)),
+                output_dir=Path(evaluation_output) if evaluation_output else output_root / "evaluation",
+                skip_existing=bool(getattr(args, "omniinteract_eval_skip_existing", False)),
+            )
         options = OmniInteractSessionOptions(
-            output_root=Path(getattr(args, "omniinteract_output_dir")),
+            output_root=output_root,
             timeout_s=float(getattr(args, "omniinteract_timeout_s")),
             media_timeout_s=float(getattr(args, "omniinteract_media_timeout_s")),
             ref_audio=str(getattr(args, "omniinteract_ref_audio")),
             require_response=bool(getattr(args, "omniinteract_require_response")),
             max_video_duration_s=float(getattr(args, "omniinteract_max_video_duration_s")),
+            evaluation=evaluation,
         )
         requests = dataset.sample(
             tokenizer,
@@ -829,7 +890,7 @@ def get_samples(args, tokenizer):
         )
         return input_requests
     else:
-        return get_samples_old(args, tokenizer)
+        return get_samples_old(args, tokenizer, **kwargs)
 
 
 datasets.get_samples = get_samples
@@ -873,6 +934,9 @@ class MixRequestFuncOutput(RequestFuncOutput):
     tts_turn_pcm_bytes: list[bytes] | None = None
     #: Per-stage snapshot from orchestrator ``metrics["stage_metrics"]`` (merged across SSE chunks).
     stage_metrics: dict[str, dict] | None = None
+    #: Diffusion pipeline profiler timings from response ``stage_durations``
+    #: (e.g. diffuse / text_encoder.forward / vae.decode), when present.
+    stage_durations: dict[str, float] | None = None
     stage_id: int | None = None
     final_output_type: str | None = None
     duplex_request_metrics: list[dict[str, object]] | None = None
@@ -883,6 +947,7 @@ _IMAGE_EDITS_EXTRA_BODY_FORM_FIELDS = (
     "negative_prompt",
     "num_inference_steps",
     "guidance_scale",
+    "guidance_scale_2",
     "strength",
     "true_cfg_scale",
     "seed",
@@ -902,15 +967,51 @@ def _guess_mime_type(path: str) -> str:
     return mime or "application/octet-stream"
 
 
-def _iter_image_edit_inputs(value: Any) -> Iterable[Any]:
-    """Yield image references from benchmark multimodal content."""
+_IMAGE_REFERENCE_SUFFIXES = frozenset({".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".heic", ".heif"})
+_VIDEO_REFERENCE_SUFFIXES = frozenset({".mp4", ".mov", ".webm", ".mkv", ".m4v"})
+
+
+def _string_reference_kind(reference: str) -> str | None:
+    """Classify a bare reference string as image, video, or file.
+
+    ``data:image`` / ``data:video`` carry their type in the URL. Bare http(s)
+    URLs use the path extension. An existing local path is a file upload, not
+    an image or a video URL.
+    """
+    if reference.startswith("data:image"):
+        return "image"
+    if reference.startswith("data:video"):
+        return "video"
+    if reference.startswith(("http://", "https://")):
+        suffix = Path(urlparse(reference).path).suffix.lower()
+        if suffix in _VIDEO_REFERENCE_SUFFIXES:
+            return "video"
+        if suffix in _IMAGE_REFERENCE_SUFFIXES:
+            return "image"
+        return None
+    local_path = reference.removeprefix("file://")
+    if local_path and os.path.exists(local_path):
+        return "file"
+    return None
+
+
+def _iter_image_reference_inputs(value: Any) -> Iterable[Any]:
+    """Yield image references from benchmark multimodal content.
+
+    ``random-mm`` image buckets arrive as OpenAI chat parts
+    ``{"type": "image_url", "image_url": {"url": ...}}``. Yield
+    ``{"image_url": url}`` so the form helper keeps an explicit image type.
+    Bare video strings are left for ``_iter_video_reference_inputs``.
+    """
     if value is None:
         return
     if isinstance(value, list):
         for item in value:
-            yield from _iter_image_edit_inputs(item)
+            yield from _iter_image_reference_inputs(item)
         return
     if not isinstance(value, dict):
+        if isinstance(value, str) and _string_reference_kind(value) == "video":
+            return
         yield value
         return
 
@@ -919,15 +1020,49 @@ def _iter_image_edit_inputs(value: Any) -> Iterable[Any]:
         image_url = value.get("image_url")
         if isinstance(image_url, dict):
             url = image_url.get("url")
-            if url:
-                yield url
-        elif image_url:
-            yield image_url
+            if isinstance(url, str) and url:
+                yield {"image_url": url}
+        elif isinstance(image_url, str) and image_url:
+            yield {"image_url": image_url}
         return
 
     for key in ("image", "images"):
         if key in value:
-            yield from _iter_image_edit_inputs(value[key])
+            yield from _iter_image_reference_inputs(value[key])
+
+
+def _iter_video_reference_inputs(value: Any) -> Iterable[dict[str, str]]:
+    """Yield structured video references from benchmark multimodal content.
+
+    ``random-mm`` video buckets arrive as OpenAI chat parts
+    ``{"type": "video_url", "video_url": {"url": ...}}``, or as a bare
+    ``data:video`` / video http(s) string. Yield ``{"video_url": url}`` so the
+    form helper keeps the video branch.
+    """
+    if value is None:
+        return
+    if isinstance(value, list):
+        for item in value:
+            yield from _iter_video_reference_inputs(item)
+        return
+    if not isinstance(value, dict):
+        if isinstance(value, str) and _string_reference_kind(value) == "video":
+            yield {"video_url": value}
+        return
+
+    if value.get("type") == "video_url":
+        video_url = value.get("video_url")
+        if isinstance(video_url, dict):
+            url = video_url.get("url")
+            if isinstance(url, str) and url:
+                yield {"video_url": url}
+        elif isinstance(video_url, str) and video_url:
+            yield {"video_url": video_url}
+        return
+
+    for key in ("video", "videos"):
+        if key in value:
+            yield from _iter_video_reference_inputs(value[key])
 
 
 def _add_image_edit_input_to_form(form: aiohttp.FormData, image_input: Any) -> None:
@@ -939,6 +1074,12 @@ def _add_image_edit_input_to_form(form: aiohttp.FormData, image_input: Any) -> N
             content_type="image/png",
         )
         return
+
+    if isinstance(image_input, Mapping) and _is_structured_image_reference(image_input):
+        image_url = image_input.get("image_url")
+        if isinstance(image_url, str) and image_url:
+            _add_image_edit_input_to_form(form, image_url)
+            return
 
     if isinstance(image_input, str):
         if image_input.startswith(("data:image", "http://", "https://")):
@@ -1062,6 +1203,27 @@ def _update_output_stage_metrics_from_payload(
         output.stage_metrics.update(stage_snapshot)
 
 
+# Per-request stage fields persisted in benchmark results. Full snapshots carry
+# per-token latency lists, which would inflate every chat-omni result file.
+_REQUEST_STAGE_METRIC_FIELDS = (
+    defs.NUM_TOKENS_OUT,
+    "finish_reason",
+    defs.AUDIO_FRAMES,
+    f"{defs.AUDIO_DURATION}_s",
+)
+
+
+def _compact_request_stage_metrics(snapshot: object) -> dict[str, dict] | None:
+    """Keep the stage fields used for workload checks; empty snapshots become None."""
+    if not isinstance(snapshot, dict) or not snapshot:
+        return None
+    return {
+        stage: {field: metrics[field] for field in _REQUEST_STAGE_METRIC_FIELDS if field in metrics}
+        for stage, metrics in snapshot.items()
+        if isinstance(metrics, dict)
+    }
+
+
 def _apply_chat_stage0_token_timings(output: MixRequestFuncOutput) -> bool:
     """Apply native Stage 0 timings from a chat response snapshot."""
     stage_metrics = output.stage_metrics
@@ -1137,6 +1299,68 @@ def _update_output_peak_memory_from_payload(output: MixRequestFuncOutput, data: 
         output.peak_memory_mb = peak_memory_mb
 
 
+def _coerce_stage_durations_dict(raw: object) -> dict[str, float] | None:
+    """Normalize a stage_durations mapping to ``dict[str, float]``."""
+    if not isinstance(raw, dict) or not raw:
+        return None
+    coerced: dict[str, float] = {}
+    for key, value in raw.items():
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not np.isfinite(value):
+            continue
+        coerced[str(key)] = float(value)
+    return coerced or None
+
+
+def _extract_stage_durations_from_payload(data: Mapping[str, object]) -> dict[str, float] | None:
+    """Pull pipeline profiler timings from video/image/chat response shapes."""
+    found = _coerce_stage_durations_dict(data.get("stage_durations"))
+    if found:
+        return found
+
+    metrics = data.get("metrics")
+    if isinstance(metrics, dict):
+        found = _coerce_stage_durations_dict(metrics.get("stage_durations"))
+        if found:
+            return found
+
+    response_data = data.get("data")
+    if isinstance(response_data, list):
+        for item in response_data:
+            if isinstance(item, dict):
+                found = _coerce_stage_durations_dict(item.get("stage_durations"))
+                if found:
+                    return found
+
+    choices = data.get("choices")
+    if isinstance(choices, list):
+        for choice in choices:
+            if not isinstance(choice, dict):
+                continue
+            for message_key in ("message", "delta"):
+                message = choice.get(message_key)
+                if not isinstance(message, dict):
+                    continue
+                content = message.get("content")
+                if isinstance(content, list):
+                    for item in content:
+                        if isinstance(item, dict):
+                            found = _coerce_stage_durations_dict(item.get("stage_durations"))
+                            if found:
+                                return found
+                elif isinstance(content, dict):
+                    found = _coerce_stage_durations_dict(content.get("stage_durations"))
+                    if found:
+                        return found
+    return None
+
+
+def _update_output_stage_durations_from_payload(output: MixRequestFuncOutput, data: Mapping[str, object]) -> None:
+    """Persist the full profiler ``stage_durations`` map when the response has one."""
+    found = _extract_stage_durations_from_payload(data)
+    if found:
+        output.stage_durations = found
+
+
 def _image_metrics_from_stage_metrics(metrics: object) -> tuple[int, float, int, float]:
     if not isinstance(metrics, dict):
         return 0, 0.0, 0, 0.0
@@ -1209,6 +1433,7 @@ def _apply_image_metrics_from_payload(output: MixRequestFuncOutput, data: Mappin
     """Populate image benchmark fields from an OpenAI-compatible image payload."""
     _update_output_stage_metrics_from_payload(output, data, update_output_tokens=False)
     _update_output_peak_memory_from_payload(output, data)
+    _update_output_stage_durations_from_payload(output, data)
 
     payload_image_count = 0
     response_data = data.get("data")
@@ -1321,15 +1546,129 @@ def _video_frames_from_payload(data: Mapping[str, object], request_body: Mapping
 
 
 def _is_structured_image_reference(reference: Mapping[str, object]) -> bool:
-    """True for API image_reference objects ({image_url}/{file_id})."""
+    """True for API image_reference objects ({"image_url": "..."})."""
     image_url = reference.get("image_url")
-    file_id = reference.get("file_id")
-    has_url = isinstance(image_url, str) and bool(image_url)
-    has_file_id = isinstance(file_id, str) and bool(file_id)
-    return has_url or has_file_id
+    return isinstance(image_url, str) and bool(image_url)
 
 
-def _add_video_reference_to_form(form: aiohttp.FormData, reference: object) -> bool:
+def _is_structured_video_reference(reference: Mapping[str, object]) -> bool:
+    """True for API video_reference objects ({"video_url": "..."})."""
+    video_url = reference.get("video_url")
+    return isinstance(video_url, str) and bool(video_url)
+
+
+_VIDEO_REFERENCE_JSON_MAX_BYTES = 1024 * 1024
+
+
+def _data_video_json_exceeds_text_limit(video_url: str) -> bool:
+    """True when a data:video URL would exceed the ~1MB multipart text-part limit."""
+    if not video_url.startswith("data:video"):
+        return False
+    encoded = json.dumps({"video_url": video_url}).encode("utf-8")
+    return len(encoded) > _VIDEO_REFERENCE_JSON_MAX_BYTES
+
+
+def _add_data_video_upload(form: aiohttp.FormData, video_url: str) -> bool:
+    """Upload one inline video as ``input_references`` instead of a JSON text part."""
+    header, _, payload = video_url.partition(",")
+    if not payload:
+        raise ValueError(f"Unsupported video data URL: {video_url[:64]!r}")
+    try:
+        video_bytes = base64.b64decode(payload)
+    except (ValueError, TypeError) as exc:
+        raise ValueError("video data URL is not valid base64") from exc
+    mime = header[len("data:") :].split(";", 1)[0] or "video/mp4"
+    suffix = ".mp4" if mime.endswith("mp4") else ".bin"
+    form.add_field(
+        "input_references",
+        video_bytes,
+        filename=f"benchmark-reference{suffix}",
+        content_type=mime,
+    )
+    return True
+
+
+def _file_bytes_as_data_url(raw: bytes, mime: str) -> str:
+    encoded = base64.b64encode(raw).decode("ascii")
+    return f"data:{mime};base64,{encoded}"
+
+
+def _image_reference_json_value(reference: object) -> object:
+    """Turn an image file into a JSON ``image_reference`` when it must share a form.
+
+    ``input_reference`` cannot be combined with ``video_reference``. Image URLs
+    stay URLs. Upload bytes and local image files become ``data:image`` URLs.
+    """
+    if isinstance(reference, Mapping) and "bytes" in reference and not _is_structured_image_reference(reference):
+        raw = reference["bytes"]
+        if not isinstance(raw, (bytes, bytearray)):
+            raise ValueError(f"image reference bytes must be bytes (got {type(raw).__name__}).")
+        content_type = reference.get("content_type", "image/png")
+        if not isinstance(content_type, str) or not content_type.startswith("image/"):
+            content_type = "image/png"
+        return {"image_url": _file_bytes_as_data_url(bytes(raw), content_type.split(";", 1)[0])}
+    if isinstance(reference, str):
+        kind = _string_reference_kind(reference)
+        if kind == "image":
+            return {"image_url": reference}
+        if kind == "file":
+            local_path = reference.removeprefix("file://")
+            mime = _guess_mime_type(local_path)
+            if not mime.startswith("image/"):
+                mime = "image/png"
+            with open(local_path, "rb") as handle:
+                return {"image_url": _file_bytes_as_data_url(handle.read(), mime)}
+    return reference
+
+
+def _video_reference_json_value(reference: object) -> object:
+    """Turn a video file into a JSON ``video_reference`` when it must share a form.
+
+    ``input_reference`` cannot be combined with ``image_reference``. Video URLs
+    stay URLs. Local video files become ``data:video`` URLs.
+    """
+    if isinstance(reference, Mapping) and "bytes" in reference and not _is_structured_video_reference(reference):
+        raw = reference["bytes"]
+        if not isinstance(raw, (bytes, bytearray)):
+            raise ValueError(f"video reference bytes must be bytes (got {type(raw).__name__}).")
+        content_type = reference.get("content_type", "video/mp4")
+        if not isinstance(content_type, str) or not content_type.startswith("video/"):
+            content_type = "video/mp4"
+        return {"video_url": _file_bytes_as_data_url(bytes(raw), content_type.split(";", 1)[0])}
+    if isinstance(reference, str):
+        kind = _string_reference_kind(reference)
+        if kind == "video":
+            return {"video_url": reference}
+        if kind == "file":
+            local_path = reference.removeprefix("file://")
+            mime = _guess_mime_type(local_path)
+            if not mime.startswith("video/"):
+                mime = "video/mp4"
+            with open(local_path, "rb") as handle:
+                return {"video_url": _file_bytes_as_data_url(handle.read(), mime)}
+    return reference
+
+
+def _add_video_reference_to_form(
+    form: aiohttp.FormData,
+    reference: object,
+    *,
+    upload_inline_video: bool = True,
+) -> bool:
+    """Encode one reference: image URL, video URL, or file upload.
+
+    Image URLs use ``image_reference``. Video URLs use ``video_reference``.
+    A lone ``data:video`` whose JSON text exceeds 1MB is uploaded as
+    ``input_references``. Local paths and raw bytes use ``input_reference``.
+    ``upload_inline_video`` must be false when an image is on the same form:
+    ``input_references`` cannot be combined with ``image_reference``.
+    """
+    candidates = reference if isinstance(reference, list) else [reference]
+    for item in candidates:
+        if isinstance(item, Mapping):
+            file_id = item.get("file_id")
+            if isinstance(file_id, str) and file_id:
+                raise ValueError("file_id is not supported yet")
     if isinstance(reference, dict) and "bytes" in reference:
         form.add_field(
             "input_reference",
@@ -1343,23 +1682,39 @@ def _add_video_reference_to_form(form: aiohttp.FormData, reference: object) -> b
         form.add_field("image_reference", json.dumps(dict(reference)))
         return True
 
+    if isinstance(reference, Mapping) and _is_structured_video_reference(reference):
+        video_url = reference.get("video_url")
+        if upload_inline_video and isinstance(video_url, str) and _data_video_json_exceeds_text_limit(video_url):
+            return _add_data_video_upload(form, video_url)
+        form.add_field("video_reference", json.dumps(dict(reference)))
+        return True
+
     if isinstance(reference, list):
         if reference and all(isinstance(item, Mapping) and _is_structured_image_reference(item) for item in reference):
             form.add_field("image_reference", json.dumps([dict(item) for item in reference]))
             return True
+        if reference and all(isinstance(item, Mapping) and _is_structured_video_reference(item) for item in reference):
+            form.add_field("video_reference", json.dumps([dict(item) for item in reference]))
+            return True
         raise ValueError(
-            "Unsupported image_reference list; expected non-empty list of "
-            '{"image_url": "..."} and/or {"file_id": "..."} objects.'
+            "Unsupported reference list; expected non-empty list of "
+            '{"image_url": "..."} or {"video_url": "..."} objects.'
         )
 
     if isinstance(reference, str):
-        if reference.startswith(("data:image", "http://", "https://")):
+        kind = _string_reference_kind(reference)
+        if kind == "image":
             form.add_field("image_reference", json.dumps({"image_url": reference}))
             return True
-        local_path = reference.removeprefix("file://")
-        if os.path.exists(local_path):
-            with open(local_path, "rb") as f:
-                reference_bytes = f.read()
+        if kind == "video":
+            if upload_inline_video and _data_video_json_exceeds_text_limit(reference):
+                return _add_data_video_upload(form, reference)
+            form.add_field("video_reference", json.dumps({"video_url": reference}))
+            return True
+        if kind == "file":
+            local_path = reference.removeprefix("file://")
+            with open(local_path, "rb") as handle:
+                reference_bytes = handle.read()
             form.add_field(
                 "input_reference",
                 reference_bytes,
@@ -1367,13 +1722,62 @@ def _add_video_reference_to_form(form: aiohttp.FormData, reference: object) -> b
                 content_type=_guess_mime_type(local_path),
             )
             return True
-        raise ValueError(f"Unsupported image_reference path or URL: {reference!r}")
+        if reference.startswith(("http://", "https://")):
+            raise ValueError(
+                "Bare http(s) reference needs an image or video extension "
+                f"({', '.join(sorted(_IMAGE_REFERENCE_SUFFIXES | _VIDEO_REFERENCE_SUFFIXES))}); "
+                f"got {reference!r}."
+            )
+        raise ValueError(f"Unsupported reference path or URL: {reference!r}")
 
     raise ValueError(
-        "Unsupported image_reference; expected upload bytes, local path/URL string, "
-        'or {"image_url": "..."} / {"file_id": "..."} object '
+        "Unsupported reference; expected image URL, video URL, upload bytes, or a local file "
         f"(got {type(reference).__name__})."
     )
+
+
+def _add_combined_video_form_references(
+    form: aiohttp.FormData,
+    multi_modal_content: Any,
+    extra_body: Mapping[str, Any] | None = None,
+) -> None:
+    """Serialize image and video refs using a server-accepted field pair.
+
+    Alone, each reference uses its own field: image URL → ``image_reference``,
+    video URL → ``video_reference``, file → ``input_reference``. A lone inline
+    video whose JSON text exceeds 1MB is uploaded as ``input_references``.
+    Together, that upload cannot be combined with ``image_reference``, so both
+    sides stay on the JSON fields. A file paired with the other media is rewritten
+    as a data URL of the matching type.
+    """
+    extra_body = extra_body or {}
+    image_refs = list(_iter_image_reference_inputs(multi_modal_content))
+    video_refs = list(_iter_video_reference_inputs(multi_modal_content))
+    if not image_refs and extra_body.get("image_reference") is not None:
+        image_refs = [extra_body["image_reference"]]
+    if not video_refs and extra_body.get("video_reference") is not None:
+        video_refs = [extra_body["video_reference"]]
+
+    if image_refs and video_refs:
+        for raw in (image_refs[0], video_refs[0]):
+            candidates = raw if isinstance(raw, list) else [raw]
+            for item in candidates:
+                if isinstance(item, Mapping):
+                    file_id = item.get("file_id")
+                    if isinstance(file_id, str) and file_id:
+                        raise ValueError("file_id is not supported yet")
+        _add_video_reference_to_form(form, _image_reference_json_value(image_refs[0]))
+        _add_video_reference_to_form(
+            form,
+            _video_reference_json_value(video_refs[0]),
+            upload_inline_video=False,
+        )
+        return
+
+    if image_refs:
+        _add_video_reference_to_form(form, image_refs[0])
+    if video_refs:
+        _add_video_reference_to_form(form, video_refs[0])
 
 
 def _add_video_extra_body_to_form(
@@ -1398,9 +1802,11 @@ def _add_video_extra_body_to_form(
         "height",
         "poll_interval_s",
         "poll_timeout_s",
-        # Handled only by _add_video_reference_to_form (upload / JSON image_url).
+        # Handled only by _add_video_reference_to_form (upload / JSON image_url / video_url).
         "image_reference",
+        "video_reference",
         "input_reference",
+        "input_references",
         *_VIDEO_FORM_FIELDS,
     }
     for key, value in extra_body.items():
@@ -1421,8 +1827,9 @@ def _apply_video_metrics_from_payload(
     output.video_frames = _video_frames_from_payload(data, request_body)
     _update_output_stage_metrics_from_payload(output, data, update_output_tokens=False)
     _update_output_peak_memory_from_payload(output, data)
+    _update_output_stage_durations_from_payload(output, data)
 
-    stage_durations = data.get("stage_durations")
+    stage_durations = output.stage_durations if output.stage_durations is not None else data.get("stage_durations")
     stage_gen_ms = _video_generation_ms_from_stage_durations(stage_durations)
     if stage_gen_ms <= 0:
         inference_time_s = coerce_positive_float_scalar(data.get("inference_time_s"))
@@ -1534,7 +1941,9 @@ async def async_request_openai_chat_omni_completions(
         output.image_pixels = 0
         output.denoise_step_latency_ms = 0.0
         output.peak_memory_mb = 0.0
+        output.stage_durations = None
         completion_tokens_seen = 0
+        streaming_error_received = False
         try:
             async with session.post(url=api_url, json=payload, headers=headers) as response:
                 if response.status == 200:
@@ -1562,8 +1971,16 @@ async def async_request_openai_chat_omni_completions(
                             if chunk != "[DONE]":
                                 timestamp = time.perf_counter()
                                 data = json.loads(chunk)
+                                if (streaming_error := data.get("error")) is not None:
+                                    streaming_error_received = True
+                                    if isinstance(streaming_error, dict):
+                                        output.error = str(streaming_error.get("message") or streaming_error)
+                                    else:
+                                        output.error = str(streaming_error)
+                                    continue
                                 _update_output_stage_metrics_from_payload(output, data)
                                 _update_output_peak_memory_from_payload(output, data)
+                                _update_output_stage_durations_from_payload(output, data)
                                 usage = data.get("usage")
                                 completion_tokens = None
                                 if isinstance(usage, dict):
@@ -1745,7 +2162,7 @@ async def async_request_openai_chat_omni_completions(
                                     output.tts_output_pcm_bytes = (waveform * 32767).astype(np.int16).tobytes()
                             except Exception as ex:
                                 logger.warning("seed_tts WER PCM export failed: %s", ex)
-                    output.success = True
+                    output.success = not streaming_error_received
                 else:
                     output.error = response.reason or ""
                     output.success = False
@@ -1926,15 +2343,7 @@ async def async_request_openai_videos_omni(
         form.add_field("size", str(request_body["size"]))
     _add_video_extra_body_to_form(form, extra_body, request_body)
 
-    reference_added = False
-    for reference in _iter_image_edit_inputs(request_func_input.multi_modal_content):
-        if _add_video_reference_to_form(form, reference):
-            reference_added = True
-            break
-    if not reference_added:
-        image_reference = extra_body.get("image_reference")
-        if image_reference is not None:
-            _add_video_reference_to_form(form, image_reference)
+    _add_combined_video_form_references(form, request_func_input.multi_modal_content, extra_body)
 
     headers = {
         "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}",
@@ -2044,7 +2453,7 @@ async def async_request_openai_image_edits_omni(
     _add_image_edit_extra_body_to_form(form, extra_body)
 
     try:
-        image_inputs = list(_iter_image_edit_inputs(request_func_input.multi_modal_content))
+        image_inputs = list(_iter_image_reference_inputs(request_func_input.multi_modal_content))
         if not image_inputs:
             raise ValueError(
                 "openai-image-edits-omni requires image multimodal content. "
@@ -2081,6 +2490,7 @@ async def async_request_openai_image_edits_omni(
                 timestamp = st
                 most_recent_text_timestamp = st
                 generated_text = ""
+                streaming_error_received = False
                 handler = StreamedResponseHandler()
                 async for chunk_bytes in response.content.iter_any():
                     if not chunk_bytes:
@@ -2096,12 +2506,20 @@ async def async_request_openai_image_edits_omni(
 
                         timestamp = time.perf_counter()
                         data = json.loads(chunk)
+                        if (streaming_error := data.get("error")) is not None:
+                            streaming_error_received = True
+                            if isinstance(streaming_error, dict):
+                                output.error = str(streaming_error.get("message") or streaming_error)
+                            else:
+                                output.error = str(streaming_error)
+                            continue
                         _update_output_stage_metrics_from_payload(
                             output,
                             data,
                             update_output_tokens=(data.get("type") == "ar_delta"),
                         )
                         _update_output_peak_memory_from_payload(output, data)
+                        _update_output_stage_durations_from_payload(output, data)
 
                         chunk_type = data.get("type")
                         if chunk_type == "ar_delta":
@@ -2135,7 +2553,7 @@ async def async_request_openai_image_edits_omni(
                             output.denoise_step_latency_ms = metrics_denoise_step_ms
                 output.latency = timestamp - st
                 output.generated_text = generated_text
-                output.success = True
+                output.success = not streaming_error_received
             else:
                 data = await response.json()
                 _finalize_image_json_http_response(
@@ -3134,6 +3552,9 @@ async def benchmark(
     benchmark_duration = time.perf_counter() - benchmark_start_time
 
     omniinteract_summary = _finalize_omniinteract_batch(input_requests, outputs)
+    omniinteract_evaluation = await _evaluate_omniinteract_batch(input_requests, outputs)
+    if omniinteract_summary is not None and omniinteract_evaluation is not None:
+        omniinteract_summary["accuracy"] = omniinteract_evaluation
 
     metrics: Any
     actual_output_lens: list[int] | int
@@ -3201,6 +3622,9 @@ async def benchmark(
             defs.MEAN_PEAK_MEMORY_MB: getattr(mm_metrics, defs.MEAN_PEAK_MEMORY_MB),
             defs.MEDIAN_PEAK_MEMORY_MB: getattr(mm_metrics, defs.MEDIAN_PEAK_MEMORY_MB),
             defs.PERCENTILES_PEAK_MEMORY_MB: getattr(mm_metrics, defs.PERCENTILES_PEAK_MEMORY_MB),
+            defs.STAGE_DURATIONS_MEAN: getattr(mm_metrics, defs.STAGE_DURATIONS_MEAN) or {},
+            defs.STAGE_DURATIONS_P50: getattr(mm_metrics, defs.STAGE_DURATIONS_P50) or {},
+            defs.STAGE_DURATIONS_P99: getattr(mm_metrics, defs.STAGE_DURATIONS_P99) or {},
             "input_lens": [output.prompt_len for output in outputs],
             "start_times": [output.start_time for output in outputs],
             "output_lens": actual_output_lens,
@@ -3232,6 +3656,14 @@ async def benchmark(
             "input_lens": [output.prompt_len for output in outputs],
             "errors": [output.error for output in outputs],
         }
+    # Preserve request order, including missing snapshots, so CI can verify
+    # fixed stage workloads without parsing logs or storing audio payloads.
+    request_stage_metrics = [
+        _compact_request_stage_metrics(getattr(output, "stage_metrics", None)) for output in outputs
+    ]
+    if any(request_stage_metrics):
+        result["request_stage_metrics"] = request_stage_metrics
+
     # Plain-vLLM backends (e.g. the vLLM-text perf config) return upstream
     # RequestFuncOutput objects without the Mix duplex fields; read them
     # tolerantly or the whole benchmark result is discarded ("fallback to

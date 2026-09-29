@@ -56,6 +56,23 @@ def _contains_cuda_tensor(value: Any) -> bool:
     return False
 
 
+def check_exact_input_shape(model: Any, input_ids: torch.Tensor | None, num_tokens: int) -> None:
+    """Enforce ``requires_exact_input_shape`` (#6712).
+
+    Such models split the flat ``input_ids`` by per-request
+    ``seq_token_counts``, so padding rows would misalign every request. V1
+    trims cudagraph padding for them (``maybe_unpad_input_ids``); this runner
+    dispatches eagerly and must already hand over the exact batch.
+    """
+    if input_ids is None or not getattr(model, "requires_exact_input_shape", False):
+        return
+    if int(input_ids.shape[0]) != int(num_tokens):
+        raise RuntimeError(
+            f"{type(model).__name__} requires an exact input shape: got {int(input_ids.shape[0])} "
+            f"input ids for {int(num_tokens)} scheduled tokens"
+        )
+
+
 def _materialize_generation_value(
     value: Any,
     req_index: int,
@@ -290,6 +307,7 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
         skip_attn_for_dummy_run: bool = False,
         is_profile: bool = False,
         context_len: int = 0,
+        valid_dummy_state_slots: bool = False,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
         if not dummy_run:
             self._prepare_native_data_plane(scheduler_output)
@@ -367,6 +385,8 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
             input_batch,
             dummy_run=dummy_run,
         )
+        if not dummy_run:
+            check_exact_input_shape(self.model, input_ids, input_batch.num_tokens)
 
         model_inputs = {
             "input_ids": input_ids,
@@ -375,6 +395,10 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
             "intermediate_tensors": intermediate_tensors,
             **self.model_state.prepare_inputs(input_batch, self.req_states),
         }
+        if getattr(self.model, "requires_request_ids", False):
+            # Request-owned model state (e.g. MiniCPM-o's vocoder caches) is
+            # keyed by the scheduler request id, in batch order.
+            model_inputs["request_ids"] = list(input_batch.req_ids)
         self._add_legacy_forward_inputs(model_inputs, input_batch)
 
         eplb = getattr(self, "eplb", None)
@@ -428,6 +452,7 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
             dp_sync=dp_sync,
             ec_connector_output=ec_connector_output,
             routed_experts=None,
+            cudagraph_stats=None,
         )
         return None
 

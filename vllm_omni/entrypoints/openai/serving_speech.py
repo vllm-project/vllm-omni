@@ -36,14 +36,17 @@ from vllm.sampling_params import RequestOutputKind, SamplingParams
 from vllm.utils import random_uuid
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 
+from vllm_omni.config.speech_cache import SpeechCacheConfig
 from vllm_omni.config.stage_config import StagePipelineConfig
 from vllm_omni.entrypoints.openai.audio_utils_mixin import AudioMixin, StreamingAudioResampler
+from vllm_omni.entrypoints.openai.errors import InvalidPresetVoiceReferenceError, InvalidVoiceReferenceError
 from vllm_omni.entrypoints.openai.protocol.audio import (
     AudioResponse,
     BatchSpeechRequest,
     BatchSpeechResponse,
     CreateAudio,
     OpenAICreateSpeechRequest,
+    RegisteredVoiceReference,
     SpeechBatchItem,
     SpeechBatchItemResult,
     SpeechInputTokenDetails,
@@ -110,8 +113,6 @@ _REF_AUDIO_MIN_DURATION = 1.0  # seconds
 _REF_AUDIO_MAX_DURATION = 30.0  # seconds
 _REF_AUDIO_METADATA_FETCH_ATTEMPTS = 3
 _REMOTE_REF_AUDIO_SCHEMES = frozenset({"http", "https", "data"})
-_REF_AUDIO_RESOLVE_CACHE_MAX_ENTRIES = 1024
-_REF_AUDIO_RESOLVE_CACHE_MAX_BYTES = 512 * 1024 * 1024
 _TTS_MAX_INSTRUCTIONS_LENGTH = 500
 _DEFAULT_VOICE_NAME = "default"
 
@@ -246,18 +247,26 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         except ValueError:
             logger.warning("Invalid SPEAKER_MAX_UPLOADED=%r; using default 1000", _raw_cap)
             self._max_uploaded_speakers = 1000
+        _policy = os.environ.get("VLLM_OMNI_SPEAKER_REGISTRATION_POLICY", "overwrite").lower()
+        if _policy not in ("overwrite", "immutable"):
+            raise ValueError(
+                f"Invalid VLLM_OMNI_SPEAKER_REGISTRATION_POLICY={_policy!r}; expected 'overwrite' or 'immutable'."
+            )
+        self._registration_policy = _policy
         self.uploaded_speakers: dict[str, dict[str, Any]] = {}
         self._ref_audio_data_url_cache: dict[str, str] = {}
         self._ref_audio_resolve_cache: OrderedDict[str, tuple[np.ndarray, int, int, str]] = OrderedDict()
         self._ref_audio_resolve_cache_bytes = 0
-        self._ref_audio_resolve_cache_max_entries = _REF_AUDIO_RESOLVE_CACHE_MAX_ENTRIES
-        self._ref_audio_resolve_cache_max_bytes = _REF_AUDIO_RESOLVE_CACHE_MAX_BYTES
+        config = self.speech_cache_config
+        self._ref_audio_resolve_cache_max_entries = config.resolve_max_entries
+        self._ref_audio_resolve_cache_max_bytes = config.resolve_max_bytes
+        logger.info("Speech cache configuration: %s", config)
         # Readiness is keyed by (artifact_key, x_vector_only). An x-vector-only
         # request caches a speaker embedding but no ref_code, so its artifact
         # must not satisfy a later ICL request that needs ref_code (#5049).
         self._ref_audio_model_artifact_ready: set[tuple[str, bool]] = set()
         self._request_ref_audio_artifact_keys: dict[str, tuple[str, bool]] = {}
-        self._speaker_cache = get_speaker_cache()
+        self._speaker_cache = get_speaker_cache(max_bytes=config.speaker_max_bytes)
         self._last_upload_ts = 0
         self._upload_lock = asyncio.Lock()
         self._restore_uploaded_speakers()
@@ -348,6 +357,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         stage_configs: "list[Any] | None" = None,
         allowed_local_media_path: str = "",
         allowed_media_domains: list[str] | None = None,
+        speech_cache_config: SpeechCacheConfig | None = None,
     ) -> "OmniOpenAIServingSpeech":
         """Create a speech serving instance for pure diffusion TTS models.
 
@@ -355,6 +365,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         engine client that pure diffusion engines don't provide.
         """
         instance = cls.__new__(cls)
+        instance.speech_cache_config = speech_cache_config or SpeechCacheConfig()
         instance._diffusion_mode = True
         instance._diffusion_engine = diffusion_engine
         instance._diffusion_model_name = model_name
@@ -377,6 +388,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         self._media_connector = None
         self._allowed_local_media_path = ""
         self.model_name = kwargs.pop("model_name", None)
+        self.speech_cache_config = kwargs.pop("speech_cache_config", None) or SpeechCacheConfig()
         # True when the server was launched with --forced-aligner (a pooling
         # aligner stage is appended to the pipeline). Gates word_timestamps.
         self.forced_aligner_enabled: bool = bool(kwargs.pop("forced_aligner_enabled", False))
@@ -410,6 +422,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         adapter = self._adapter
         if adapter is not None:
             adapter.load_capabilities()
+            self._drop_shadowing_uploads()
         available_speakers = self._get_available_speakers()
         logger.info("Loaded %d supported speakers: %s", len(available_speakers), sorted(available_speakers))
 
@@ -448,6 +461,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             ctx = SpeechServingContext(server=self, engine_client=self.engine_client)
             self._adapter = adapter_cls(ctx)
             self._adapter.load_capabilities()
+            self._drop_shadowing_uploads()
         return self._adapter
 
     def _uses_native_speed_control(self) -> bool:
@@ -683,6 +697,33 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             return None
         return samples, sr
 
+    def _load_registered_reference(self, reference: RegisteredVoiceReference) -> tuple[np.ndarray, int]:
+        """Load one captured generation without retaining a data URI or waveform.
+
+        Keep the legacy WAV conversion on cache misses to preserve PCM16
+        quantization. A missing/deleted generation fails instead of substituting
+        a newer upload with the same name. Called off the event loop.
+        """
+        from safetensors import safe_open
+
+        path = Path(reference.file_path)
+        if not _validate_path_within_directory(path, self.uploaded_speakers_dir):
+            raise ValueError("Invalid registered reference path")
+        with safe_open(str(path), framework="pt") as f:
+            metadata = f.metadata() or {}
+            if int(metadata.get("created_at", 0)) != reference.created_at:
+                raise ValueError("Registered reference generation changed")
+            samples = f.get_tensor("audio").numpy()
+            sr = int(metadata["sample_rate"])
+        # Match _get_uploaded_audio_data's WAV subtype and the resolver's float32
+        # channel mixing, without base64 serialization or any persistent copy.
+        buf = io.BytesIO()
+        sf.write(buf, samples, sr, format="WAV")
+        buf.seek(0)
+        waveform, sr = sf.read(buf, dtype="float32")
+        waveform, sr, _, _ = self._finalize_fetched_ref_audio(waveform, sr)
+        return waveform, sr
+
     def _get_uploaded_audio_data(self, voice_name: str) -> str | None:
         """Return a base64-encoded WAV data URL for an uploaded voice.
 
@@ -803,6 +844,39 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 f"the cap via SPEAKER_MAX_UPLOADED."
             )
 
+    def _drop_shadowing_uploads(self) -> None:
+        """Uploads are restored from disk before the adapter exists, so a name
+        registered under a built-in speaker before the collision guard would
+        keep shadowing it across restarts. Drop such entries from the registry;
+        the file stays on disk for the operator to remove."""
+        caps = self._adapter.capabilities if self._adapter is not None else None
+        if caps is None:
+            return
+        for voice_name_lower in list(self.uploaded_speakers):
+            if voice_name_lower in caps.supported_speakers or voice_name_lower in caps.precomputed_speakers:
+                info = self.uploaded_speakers.pop(voice_name_lower)
+                logger.warning(
+                    "Uploaded voice %r shadows a built-in speaker and is ignored; remove %s to clear this warning.",
+                    voice_name_lower,
+                    info.get("file_path"),
+                )
+
+    def _check_registration_allowed(self, voice_name_lower: str, name: str) -> None:
+        """Reject names that would shadow a built-in voice or, under the
+        immutable policy, silently overwrite an existing upload."""
+        caps = self._adapter.capabilities if self._adapter is not None else None
+        if caps is not None and (
+            voice_name_lower in caps.supported_speakers or voice_name_lower in caps.precomputed_speakers
+        ):
+            raise ValueError(
+                f"Voice name '{name}' is reserved by a built-in speaker of this model; choose a different name."
+            )
+        if self._registration_policy == "immutable" and voice_name_lower in self.uploaded_speakers:
+            raise ValueError(
+                f"Voice '{name}' already exists and VLLM_OMNI_SPEAKER_REGISTRATION_POLICY is 'immutable'; "
+                f"delete it first via DELETE /v1/audio/voices/{name}."
+            )
+
     def _evict_existing_upload(self, voice_name_lower: str, name: str) -> None:
         """Drop an existing upload with this name so the caller can re-register it."""
         if voice_name_lower not in self.uploaded_speakers:
@@ -885,6 +959,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         async with self._upload_lock:
             voice_name_lower = name.lower()
+            self._check_registration_allowed(voice_name_lower, name)
             self._evict_existing_upload(voice_name_lower, name)
             self._check_upload_cap()
 
@@ -1005,6 +1080,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         async with self._upload_lock:
             voice_name_lower = name.lower()
+            self._check_registration_allowed(voice_name_lower, name)
             self._evict_existing_upload(voice_name_lower, name)
             self._check_upload_cap()
 
@@ -1052,22 +1128,24 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             "embedding_dim": emb_dim,
         }
 
-    async def delete_voice(self, name: str) -> bool:
+    async def delete_voice(self, name: str):
         """
         Delete an uploaded voice.
 
         Args:
             name: Voice name to delete
-
-        Returns:
-            bool: True if successful, False if voice doesn't exist
         """
         async with self._upload_lock:
             voice_name_lower = name.lower()
+            built_in_speakers = self._get_available_voices() - set(self.uploaded_speakers)
+
+            if voice_name_lower in built_in_speakers:
+                err = f"Cannot delete built-in voice '{name}'"
+                raise InvalidPresetVoiceReferenceError(err)
 
             if voice_name_lower not in self.uploaded_speakers:
-                logger.warning("Voice '%s' not found", name)
-                return False
+                err = f"Voice '{name}' not found"
+                raise InvalidVoiceReferenceError(err)
 
             speaker_info = self.uploaded_speakers.pop(voice_name_lower)
             self._ref_audio_data_url_cache.pop(voice_name_lower, None)
@@ -1082,7 +1160,6 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             self._speaker_cache.clear(voice_name_lower)
 
         logger.info("Deleted voice '%s'", name)
-        return True
 
     def _is_tts_model(self) -> bool:
         """Check if the current model is a supported TTS model."""
@@ -1764,6 +1841,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         finally:
             if not artifact_ready:
                 self._discard_ref_audio_artifact_warmup(request_id)
+            # Disconnects can arrive while suspended at yield. Closing the
+            # engine iterator must survive the cancelled ASGI scope.
             close = getattr(generator, "aclose", None)
             if close is not None:
                 with anyio.CancelScope(shield=True):
@@ -2681,8 +2760,11 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 total_ms,
                 e,
             )
-            logger.exception("Speech generation failed: %s", e)
-            return self.create_error_response(f"Speech generation failed: {e}")
+            return self.create_error_response(
+                f"Speech generation failed: {e}",
+                err_type="InternalServerError",
+                status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
 
     @staticmethod
     def _merge_batch_item(

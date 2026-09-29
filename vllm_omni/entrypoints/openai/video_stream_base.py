@@ -693,8 +693,8 @@ class OmniStreamingVideoHandler:
         text_parts: list[str] = []
         text_done_sent = False
         audio_chunk_count = 0
-        # Number of per-step tensors in OmniRequestOutput.audio_data already
-        # drained. Used by the fast path to skip already-emitted history.
+        # Count emitted tensors only to identify the first audio emission.
+        # Default and explicit sampling parameters use DELTA audio outputs.
         audio_chunks_drained = 0
         previous_text = ""
         interrupted = False
@@ -784,9 +784,9 @@ class OmniStreamingVideoHandler:
                         audio_data = self._get_audio_data(output)
                         if audio_data is not None:
                             if isinstance(audio_data, list):
-                                audio_tail_tensors = list(audio_data)
+                                audio_tail_tensors.extend(audio_data)
                             else:
-                                audio_tail_tensors = [audio_data]
+                                audio_tail_tensors.append(audio_data)
                 else:
                     delta_text, previous_text = self._extract_text_delta(
                         output,
@@ -874,16 +874,12 @@ class OmniStreamingVideoHandler:
     ) -> tuple[str | None, int]:
         """Return (base64 WAV of new samples, updated chunks_drained).
 
-        `chunks_drained` is the number of per-step tensors in
-        ``audio_data`` that have already been emitted. Each engine step appends
-        one tensor, so new samples are ``audio_data[chunks_drained:]`` — no
-        matter how many steps accumulated between reads (handles backpressure
-        cleanly, unlike a simple ``audio_data[-1]``).
-
-        Two paths, selected at runtime by ``VLLM_VIDEO_AUDIO_DELTA_MODE``:
-          * fast — only D2H the new tail. Per-call cost ∝ new chunks.
-          * slow — full cat + D2H each call. Per-call cost ∝ total history.
-                   Retained for A/B; remove once downstream callers confirm.
+        Explicit sampling parameters are coerced to DELTA above, and AsyncOmni
+        applies the same coercion to defaults. The output processor drains audio
+        after each result, so every tensor in the current payload is new.
+        `chunks_drained` only identifies the first emission for the existing
+        leading-artifact trim.
+        The legacy slow setting remains accepted as an equivalent alias.
         """
         audio_data = cls._get_audio_data(result)
         if audio_data is None:
@@ -913,23 +909,20 @@ class OmniStreamingVideoHandler:
         audio_data,
         chunks_drained: int,
     ) -> tuple[str | None, int]:
-        """Emit only tensors appended since the last call."""
-        # Single tensor: output_processor hands us one tensor before it becomes a
-        # list (see output_processor.py:89). Treat it as chunk #0.
-        if not isinstance(audio_data, list):
-            if chunks_drained >= 1:
-                return None, chunks_drained
-            tail_np = cls._tensor_to_1d_np(audio_data)
-            return cls._encode_tail(tail_np, chunks_drained, new_drained=1, is_first=True)
-
-        n = len(audio_data)
-        if n <= chunks_drained:
+        """Encode every fresh tensor in this DELTA payload."""
+        new_chunks = audio_data if isinstance(audio_data, list) else [audio_data]
+        if not new_chunks:
             return None, chunks_drained
-
-        new_chunks = audio_data[chunks_drained:]
         tail = new_chunks[0] if len(new_chunks) == 1 else torch.cat(new_chunks, dim=-1)
         tail_np = cls._tensor_to_1d_np(tail)
-        return cls._encode_tail(tail_np, chunks_drained, new_drained=n, is_first=(chunks_drained == 0))
+        if tail_np is None or len(tail_np) == 0:
+            return None, chunks_drained
+        return cls._encode_tail(
+            tail_np,
+            chunks_drained,
+            new_drained=chunks_drained + len(new_chunks),
+            is_first=(chunks_drained == 0),
+        )
 
     @classmethod
     def _delta_slow(
@@ -937,36 +930,8 @@ class OmniStreamingVideoHandler:
         audio_data,
         chunks_drained: int,
     ) -> tuple[str | None, int]:
-        """Pre-fix behaviour: concat everything each call and slice on CPU."""
-        if isinstance(audio_data, list):
-            if not audio_data:
-                return None, chunks_drained
-            audio_tensor = torch.cat(audio_data, dim=-1)
-            new_drained = len(audio_data)
-        else:
-            audio_tensor = audio_data
-            new_drained = 1
-
-        full_np = cls._tensor_to_1d_np(audio_tensor)
-        if full_np is None:
-            return None, chunks_drained
-        # chunks_drained doesn't map directly to sample offset without tracking
-        # per-chunk lengths, so we re-derive: replay the tail that corresponds
-        # to chunks appended since last call by slicing off the part produced
-        # by the already-drained prefix. For slow path this is intentionally
-        # wasteful — the point is to reproduce the pre-fix hot loop.
-        if chunks_drained == 0:
-            tail_np = full_np
-        else:
-            # Recover prefix length by re-concatenating the already-drained
-            # prefix tensors (cost intentionally identical to the baseline
-            # implementation this was lifted from).
-            if isinstance(audio_data, list) and chunks_drained < len(audio_data):
-                prefix_len = sum(int(t.shape[-1]) for t in audio_data[:chunks_drained])
-                tail_np = full_np[prefix_len:]
-            else:
-                tail_np = full_np[0:0]
-        return cls._encode_tail(tail_np, chunks_drained, new_drained=new_drained, is_first=(chunks_drained == 0))
+        """Compatibility alias for the DELTA payload contract."""
+        return cls._delta_fast(audio_data, chunks_drained)
 
     @classmethod
     def _encode_tail(

@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 import torch
+from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import (
     MiniCPMO45OmniForConditionalGeneration,
@@ -14,6 +16,49 @@ from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_llm import (
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+def test_multimodal_runner_preserves_forwarded_token_identities(monkeypatch):
+    stage_model = torch.nn.Module()
+    stage_model.make_empty_intermediate_tensors = lambda: None
+    monkeypatch.setattr(
+        "vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni.init_vllm_registered_model",
+        lambda **kwargs: stage_model,
+    )
+    monkeypatch.setattr(
+        "vllm_omni.model_executor.models.minicpmo_4_5.duplex.compat.patch_minicpmo_remote_config",
+        lambda config: None,
+    )
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(hf_config=SimpleNamespace(), multimodal_config=None, model_stage="llm")
+    )
+    wrapper = MiniCPMO45OmniForConditionalGeneration(vllm_config=config)
+    hidden = torch.randn(2, 4)
+    wrapper.thinker.forward = MagicMock(return_value=hidden)
+    token_buffer = torch.tensor([99692, 3837, 0, 0])
+    embed_buffer = torch.randn(4, 4)
+    runner = SimpleNamespace(
+        model=wrapper,
+        input_ids=SimpleNamespace(gpu=token_buffer),
+        inputs_embeds=SimpleNamespace(gpu=embed_buffer),
+    )
+
+    # This same upstream path prepares normal multimodal forwards and graph
+    # capture inputs. Embeddings must not replace the real token identities.
+    input_ids, inputs_embeds = GPUModelRunner._prepare_mm_inputs(runner, 2)
+    out = wrapper.forward(input_ids=input_ids, positions=torch.tensor([10, 11]), inputs_embeds=inputs_embeds)
+
+    torch.testing.assert_close(out.multimodal_outputs["latent_input_ids"], token_buffer[:2, None])
+    torch.testing.assert_close(out.multimodal_outputs["latent_positions"], torch.tensor([[10], [11]]))
+    torch.testing.assert_close(wrapper.thinker.forward.call_args.kwargs["inputs_embeds"], embed_buffer[:2])
+
+    # The codec Talker has no text vocabulary for randomized raw-token
+    # profiling. It must retain the existing embeddings-only input path.
+    config.model_config.model_stage = "tts"
+    runner.model = MiniCPMO45OmniForConditionalGeneration(vllm_config=config)
+    talker_ids, talker_embeds = GPUModelRunner._prepare_mm_inputs(runner, 2)
+    assert talker_ids is None
+    torch.testing.assert_close(talker_embeds, embed_buffer[:2])
 
 
 def test_thinker_forward_returns_bare_hidden_states():

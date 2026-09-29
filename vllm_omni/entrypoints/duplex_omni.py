@@ -26,7 +26,7 @@ Example::
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Mapping, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextlib import suppress
 from typing import Any
 from uuid import uuid4
@@ -286,8 +286,13 @@ class DuplexOmni(AsyncOmni):
         return DuplexOmniEngine(duplex_audio_encoder=encode_audio, **engine_kwargs)
 
     def __init__(self, model: str = "", *args: Any, **kwargs: Any) -> None:
-        super().__init__(*args, model=model, **kwargs)
+        super().__init__(model, *args, **kwargs)
         self._handles: dict[str, DuplexSessionHandle] = {}
+        #: Rollbacks of resumes whose caller was cancelled mid-RPC (see ``resume_session``).
+        self._resume_compensations: set[asyncio.Task[None]] = set()
+        #: Initial and maximum delay between replays of an abandoned resume
+        #: whose answers keep timing out.
+        self._resume_replay_backoff_s: tuple[float, float] = (0.5, 5.0)
 
     # ---- deployment facts ----
 
@@ -377,32 +382,166 @@ class DuplexOmni(AsyncOmni):
         *,
         expected_lease_generation: int,
         timeout: float | None = _DEFAULT_CONTROL_TIMEOUT_S,
+        on_abandoned: Callable[[int], Awaitable[None]] | None = None,
     ) -> DuplexSessionHandle:
-        """Engine lease resume (CAS on the lease generation); returns the existing handle."""
+        """Engine lease resume (CAS on the lease generation); returns the existing handle.
+
+        The RPC runs to completion in an executor thread whatever happens to
+        this waiter, so a caller cancelled while it is in flight does not stop
+        the engine from applying the resume (lease generation bumped,
+        disconnect grace cleared) for a connection that will never serve it.
+        The outcome is then observed off the cancelled task. If the RPC times
+        out before answering, the outcome is unknown, so the same resume is
+        replayed under its control id: the engine answers a replay with the
+        generation the resume produced instead of resuming again. A resume
+        that landed is adopted into the handle (a later reconnect resumes
+        against the real generation) and settled through ``on_abandoned`` with
+        that generation; without a callback it is detached again, fenced on
+        the generation, so a resume that came after it is never touched.
+
+        ``on_abandoned`` is for callers that own an attachment concept: they
+        decide whether the generation now belongs to a connection that is
+        still serving (a takeover that never activated leaves the previous
+        socket attached) or whether the lease goes back into disconnect grace.
+        """
         handle = self._require_handle(session_id)
-        result = await self.engine.resume_session_async(
-            session_id,
-            expected_lease_generation=expected_lease_generation,
-            timeout=timeout,
+        control_id = uuid4().hex
+        rpc = asyncio.ensure_future(
+            self.engine.resume_session_async(
+                session_id,
+                expected_lease_generation=expected_lease_generation,
+                control_id=control_id,
+                timeout=timeout,
+            )
         )
+        try:
+            result = await asyncio.shield(rpc)
+        except asyncio.CancelledError:
+            self._compensate_abandoned_resume(
+                handle,
+                rpc,
+                control_id=control_id,
+                expected_lease_generation=expected_lease_generation,
+                timeout=timeout,
+                on_abandoned=on_abandoned,
+            )
+            raise
         # The result carries the engine's current public session (state,
         # epoch, turn ...), which a resumed client must see, not the open-time snapshot.
         handle._adopt(result)
         return handle
+
+    def _compensate_abandoned_resume(
+        self,
+        handle: DuplexSessionHandle,
+        rpc: asyncio.Future[DuplexControlResultMessage],
+        *,
+        control_id: str,
+        expected_lease_generation: int,
+        timeout: float | None,
+        on_abandoned: Callable[[int], Awaitable[None]] | None,
+    ) -> None:
+        session_id = handle.session_id
+
+        async def observe() -> DuplexControlResultMessage | None:
+            # The first attempt is the RPC the caller abandoned. A timeout
+            # means its answer was dropped and the outcome is unknown: the
+            # engine may have applied the resume after the waiter gave up.
+            # Replaying under the same control id makes the engine answer with
+            # the generation that resume produced, whether it lands now or
+            # already did, and refuse if a newer resume won. A replay can time
+            # out too, so this keeps replaying, with backoff, until the engine
+            # answers one way or the other or the session is gone: giving up
+            # on a timeout would be exactly the lost-answer window again.
+            attempt: Awaitable[DuplexControlResultMessage] = rpc
+            delay, ceiling = self._resume_replay_backoff_s
+            while True:
+                try:
+                    return await attempt
+                except DuplexSessionError as exc:
+                    if exc.code != "timeout":
+                        # Refused (conflict, unknown session, engine gone):
+                        # the resume did not land, nothing to give back.
+                        logger.debug("abandoned duplex resume of %s did not land: %s", session_id, exc)
+                        return None
+                except Exception as exc:
+                    logger.debug("abandoned duplex resume of %s did not land: %s", session_id, exc)
+                    return None
+                if handle.closed:
+                    return None
+                logger.warning(
+                    "abandoned duplex resume of %s lost its answer to a timeout; replaying in %.1fs", session_id, delay
+                )
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, ceiling)
+                attempt = self.engine.resume_session_async(
+                    session_id,
+                    expected_lease_generation=expected_lease_generation,
+                    control_id=control_id,
+                    timeout=timeout,
+                )
+
+        async def compensate() -> None:
+            result = await observe()
+            if result is None:
+                return
+            handle._adopt(result)
+            lease_generation = result.lease_generation
+            if lease_generation is None:
+                return
+            try:
+                if on_abandoned is not None:
+                    await on_abandoned(lease_generation)
+                else:
+                    await self.engine.touch_session_async(
+                        session_id,
+                        activity="detach",
+                        expected_lease_generation=lease_generation,
+                        timeout=timeout,
+                    )
+            except Exception as exc:
+                logger.warning("abandoned duplex resume of %s could not be settled: %s", session_id, exc)
+
+        task = asyncio.create_task(compensate(), name=f"duplex-resume-compensation-{session_id}")
+        self._resume_compensations.add(task)
+        task.add_done_callback(self._resume_compensations.discard)
 
     async def touch_session(
         self,
         session_id: str,
         *,
         activity: str = "heartbeat",
+        expected_lease_generation: int | None = None,
         timeout: float | None = _DEFAULT_CONTROL_TIMEOUT_S,
     ) -> None:
         self._require_handle(session_id)
-        await self.engine.touch_session_async(session_id, activity=activity, timeout=timeout)
+        await self.engine.touch_session_async(
+            session_id,
+            activity=activity,
+            expected_lease_generation=expected_lease_generation,
+            timeout=timeout,
+        )
 
-    async def detach_session(self, session_id: str, *, timeout: float | None = _DEFAULT_CONTROL_TIMEOUT_S) -> None:
-        """Start the engine-owned disconnect grace; expiry arrives as ``session.expired``."""
-        await self.touch_session(session_id, activity="detach", timeout=timeout)
+    async def detach_session(
+        self,
+        session_id: str,
+        *,
+        expected_lease_generation: int | None = None,
+        timeout: float | None = _DEFAULT_CONTROL_TIMEOUT_S,
+    ) -> None:
+        """Start the engine-owned disconnect grace; expiry arrives as ``session.expired``.
+
+        ``expected_lease_generation`` names the lease the caller opened or
+        resumed against; the engine refuses to detach a newer one, so a
+        connection giving up its lease cannot start the grace for the lease a
+        later resume owns.
+        """
+        await self.touch_session(
+            session_id,
+            activity="detach",
+            expected_lease_generation=expected_lease_generation,
+            timeout=timeout,
+        )
 
     async def close_session(
         self,
@@ -470,6 +609,8 @@ class DuplexOmni(AsyncOmni):
         for handle in list(self._handles.values()):
             handle._mark_closed("shutdown")
         self._handles.clear()
+        for compensation in list(self._resume_compensations):
+            compensation.cancel()
         super().shutdown(timeout)
 
 

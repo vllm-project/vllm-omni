@@ -117,6 +117,7 @@ class OmniARModelRunner(OmniGPUModelRunner):
         skip_attn_for_dummy_run: bool = False,
         is_profile: bool = False,
         context_len: int = 0,
+        valid_dummy_state_slots: bool = False,
     ) -> Any:
         if not dummy_run:
             self._handle_kv_transfer_pre(scheduler_output)
@@ -127,6 +128,7 @@ class OmniARModelRunner(OmniGPUModelRunner):
             skip_attn_for_dummy_run=skip_attn_for_dummy_run,
             is_profile=is_profile,
             context_len=context_len,
+            valid_dummy_state_slots=valid_dummy_state_slots,
         )
 
     # ------------------------------------------------------------------
@@ -190,6 +192,26 @@ class OmniARModelRunner(OmniGPUModelRunner):
                 input_batch,
                 grammar_output,
             )
+        run_eager_mtp = getattr(self.model_state, "run_eager_mtp", None)
+        if multimodal_outputs and run_eager_mtp is not None:
+            run_eager_mtp(
+                input_batch,
+                text_hidden,
+                sampler_output.sampled_token_ids,
+                multimodal_outputs,
+                self._dispatch_mtp_batch_descriptor,
+            )
+        publish_sampled = getattr(self.model_state, "publish_sampled_embeddings", None)
+        extra_outputs = (
+            publish_sampled(input_batch, sampler_output.sampled_token_ids)
+            if (
+                multimodal_outputs
+                and callable(publish_sampled)
+                and bool(getattr(self.model_config, "async_chunk", False))
+                and getattr(self.model_config, "engine_output_type", "text") != "text"
+            )
+            else None
+        )
         if self.pp_handler is not None:
             self.pp_handler.broadcast(
                 sampler_output.sampled_token_ids,
@@ -240,6 +262,7 @@ class OmniARModelRunner(OmniGPUModelRunner):
             finalize_output=(None if materialize_native else self._finalize_native_data_plane_output),
             check_ep_fault=self.check_ep_fault,
             routed_experts=routed_experts,
+            extra_multimodal_outputs=extra_outputs,
         )
         self._release_multimodal_snapshot(snapshot_slot, async_output.copy_event)
         _guard_graph_replay_for_pooler_copy(
@@ -318,9 +341,12 @@ class OmniARModelRunner(OmniGPUModelRunner):
         query_start_loc_np: np.ndarray,
         num_scheduled_tokens: np.ndarray,
         num_reqs: int,
+        padded_total_tokens: int | None = None,
     ) -> list[dict[str, Any]]:
-        """Build pooler_output from already-CPU tensors."""
-        total = hidden_cpu.shape[0]
+        """Build per-request payloads, excluding any CUDA Graph padding."""
+        # Graph-padded hidden states and unpadded multimodal outputs can
+        # coexist. Use the scheduled token count to identify the real axis.
+        total = int(num_scheduled_tokens[:num_reqs].sum())
         pooler: list[dict[str, Any]] = []
         for i in range(num_reqs):
             start = int(query_start_loc_np[i])
@@ -333,6 +359,7 @@ class OmniARModelRunner(OmniGPUModelRunner):
                     start=start,
                     end=end,
                     total_tokens=total,
+                    padded_total_tokens=padded_total_tokens,
                 )
             pooler.append(flatten_payload(payload))
         return pooler
@@ -528,6 +555,18 @@ def _async_copy_mm(
     }
 
 
+def _merge_payload_trees(base: dict[str, Any], extra: dict[str, Any]) -> dict[str, Any]:
+    """``base`` with ``extra`` merged in; nested mappings merge key by key."""
+    merged = dict(base)
+    for key, value in extra.items():
+        current = merged.get(key)
+        if isinstance(current, dict) and isinstance(value, dict):
+            merged[key] = _merge_payload_trees(current, value)
+        else:
+            merged[key] = value
+    return merged
+
+
 def _slice_pooler_value(
     value: Any,
     *,
@@ -634,6 +673,7 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
         finalize_output: Any | None = None,
         check_ep_fault: bool = False,
         routed_experts: RoutedExpertsTensors | None = None,
+        extra_multimodal_outputs: tuple[dict[str, Any], torch.cuda.Event] | None = None,
     ):
         self.model_runner_output = model_runner_output
         self.sampler_output = sampler_output
@@ -730,6 +770,20 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
                     copy_stream=copy_stream,
                     pin_memory=pin_memory,
                 )
+                if extra_multimodal_outputs:
+                    # Produced after sampling on the producer stream; copy only
+                    # once its completion event has been observed.
+                    extra_outputs, extra_ready = extra_multimodal_outputs
+                    copy_stream.wait_event(extra_ready)
+                    self._mm_snapshot = _merge_payload_trees(
+                        self._mm_snapshot,
+                        _async_copy_mm(
+                            extra_outputs,
+                            self._total_tokens,
+                            copy_stream=copy_stream,
+                            pin_memory=pin_memory,
+                        ),
+                    )
             elif self._need_pooler and text_hidden is not None:
                 self._hidden_cpu = _async_copy_tensor(
                     text_hidden,
@@ -756,7 +810,7 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
             del token_ids[num_tokens:]
         self.model_runner_output.sampled_token_ids = sampled_token_ids
         if self.sampling_mask_tensors is not None:
-            self.model_runner_output.sampling_masks = self.sampling_mask_tensors.tolists(self.num_sampled_tokens_np)
+            self.model_runner_output.sampling_masks = self.sampling_mask_tensors.tolists()
         if self.routed_experts_cpu is not None:
             self.model_runner_output.routed_experts = self.routed_experts_cpu.tolists()
         self.model_runner_output.sampled_token_ids_materialized = True
@@ -805,6 +859,7 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
                 self._query_start_loc_np,
                 self._num_scheduled_tokens,
                 self._num_reqs,
+                self._padded_total_tokens,
             )
             pooler_payload = cast(list[dict[str, Any] | None], pooler_output) if pooler_output else None
             self.model_runner_output.pooler_output = pooler_payload

@@ -3,6 +3,7 @@
 
 """MRV2 admission, capture, dispatch and request lifecycle contracts."""
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -14,6 +15,7 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 from vllm.v1.worker.gpu.sample.sampler import Sampler
 
+from vllm_omni.config.model import OmniModelConfig
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.worker_v2.model_states import init_omni_model_state
 from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState
@@ -52,6 +54,8 @@ def test_add_requests_empty_admission_and_stop_id_sanitization():
 
 def test_prepare_native_data_plane_terminal_abort_split_and_warmup_skip():
     runner = _make_runner()
+    runner.model_config = object.__new__(OmniModelConfig)
+    runner.model_config.async_chunk = True
     plane = SimpleNamespace(
         register_request=MagicMock(),
         register_receivers=MagicMock(),
@@ -75,6 +79,19 @@ def test_prepare_native_data_plane_terminal_abort_split_and_warmup_skip():
     plane.register_receivers.assert_called_once_with([handle])
     plane.request_terminal.assert_called_once_with({"r0"})
     plane.abort_requests.assert_called_once_with({"aborted"})
+
+
+def test_full_payload_receive_is_polled_without_scheduled_tokens(mocker):
+    runner = object.__new__(OmniGPUModelRunner)
+    runner.model_config = object.__new__(OmniModelConfig)
+    runner.model_config.async_chunk = False
+    plane = mocker.Mock()
+    runner._omni_data_plane = plane
+    scheduler_output = SchedulerOutput.make_empty()
+
+    runner._prepare_native_data_plane(scheduler_output)
+
+    plane.recv_full_payload_inputs.assert_called_once_with(scheduler_output)
 
 
 @pytest.mark.parametrize("output_form", ["tuple", "omni"])
@@ -164,3 +181,146 @@ def test_capture_contract_uses_model_declaration(stage, declared):
     runner._configure_cudagraph_output_contract()
     assert runner._model_returns_tuple is declared
     assert runner._exclude_full_graph is declared
+    assert runner._full_graph_aux_outputs is False
+
+
+def _aux_output(num_tokens):
+    hidden = torch.arange(num_tokens * 2, dtype=torch.float32).reshape(num_tokens, 2)
+    return hidden, {"hidden_states": {"layers": {0: hidden + 1, 24: hidden + 2}}}
+
+
+def test_full_graph_aux_contract_keeps_full_and_round_trips_leaves():
+    runner = object.__new__(OmniGPUModelRunner)
+    runner.model = SimpleNamespace(_returns_tuple=True, supports_mrv2_full_graph_aux_outputs=True)
+    runner._configure_cudagraph_output_contract()
+    assert runner._full_graph_aux_outputs and not runner._exclude_full_graph
+
+    calls = []
+
+    def forward(num_tokens=3):
+        calls.append(num_tokens)
+        return _aux_output(num_tokens)
+
+    runner.model.forward = forward
+    original_forward = runner.model.forward
+    runner.use_aux_hidden_state_outputs = False
+    full = SimpleNamespace(cg_mode=CUDAGraphMode.FULL)
+    runner.cudagraph_manager = SimpleNamespace(_capture_descs={CUDAGraphMode.FULL: [full]}, _candidates={})
+    runner.model_state = SimpleNamespace()
+    captured = {}
+
+    def capture(_self):
+        # The graph manager stores (hidden, leaves) in its aux buffers.
+        assert runner.use_aux_hidden_state_outputs is True
+        hidden, leaves = runner.model.forward(4)
+        captured["hidden"], captured["leaves"] = hidden, leaves
+        assert [tuple(leaf.shape) for leaf in leaves] == [(4, 2), (4, 2)]
+        runner.model.forward(2)  # smaller capture, same structure
+        return 1
+
+    with patch.object(GPUModelRunner, "capture_model", capture):
+        assert runner.capture_model() == 1
+    assert runner.model.forward is original_forward and runner.use_aux_hidden_state_outputs is False
+    assert runner.cudagraph_manager._capture_descs == {CUDAGraphMode.FULL: [full]}  # FULL kept
+
+    hidden, aux = runner._split_fullgraph_output((captured["hidden"], captured["leaves"]))
+    reference_hidden, reference_aux = _aux_output(4)
+    assert torch.equal(hidden, reference_hidden)
+    assert set(aux["hidden_states"]["layers"]) == {0, 24}
+    assert torch.equal(aux["hidden_states"]["layers"][24], reference_aux["hidden_states"]["layers"][24])
+
+
+@pytest.mark.parametrize(
+    "aux",
+    [
+        {},  # no leaves
+        {"layers": {0: torch.zeros(5, 2)}},  # leaf not on the token axis
+        {"layers": {0: 1.0}},  # non-tensor leaf
+    ],
+)
+def test_full_graph_aux_contract_rejects_invalid_outputs(aux):
+    runner = object.__new__(OmniGPUModelRunner)
+    runner.model = SimpleNamespace(_returns_tuple=True, supports_mrv2_full_graph_aux_outputs=True)
+    runner._configure_cudagraph_output_contract()
+    with pytest.raises(RuntimeError, match="supports_mrv2_full_graph_aux_outputs"):
+        runner._flatten_capture_aux_output((torch.zeros(3, 2), aux))
+
+
+def test_full_graph_aux_contract_rejects_structure_change():
+    runner = object.__new__(OmniGPUModelRunner)
+    runner.model = SimpleNamespace(_returns_tuple=True, supports_mrv2_full_graph_aux_outputs=True)
+    runner._configure_cudagraph_output_contract()
+    runner._flatten_capture_aux_output((torch.zeros(3, 2), {"layers": {0: torch.zeros(3, 2)}}))
+    with pytest.raises(RuntimeError, match="structure changed"):
+        runner._flatten_capture_aux_output((torch.zeros(3, 2), {"layers": {1: torch.zeros(3, 2)}}))
+
+
+def test_full_graph_output_without_contract_is_hidden_only():
+    runner = object.__new__(OmniGPUModelRunner)
+    hidden = torch.ones(2, 2)
+    assert runner._split_fullgraph_output(hidden) == (hidden, None)
+
+
+@pytest.mark.parametrize("runner_kind", ["gpu", "ar", "generation"])
+def test_dummy_forward_uses_upstream_execution_state(runner_kind, monkeypatch):
+    from vllm.v1.worker.gpu.input_batch import InputBatch
+    from vllm.v1.worker.gpu.model_runner import ExecuteModelState
+
+    from vllm_omni.worker_v2.omni_ar_model_runner import OmniARModelRunner
+    from vllm_omni.worker_v2.omni_generation_model_runner import OmniGenerationModelRunner
+
+    runner_cls = {"gpu": OmniGPUModelRunner, "ar": OmniARModelRunner, "generation": OmniGenerationModelRunner}[
+        runner_kind
+    ]
+    runner = object.__new__(runner_cls)
+    hidden = torch.ones(1, 2)
+    runner.model = MagicMock(
+        return_value=OmniOutput(text_hidden_states=hidden, multimodal_outputs={})
+        if runner_kind == "generation"
+        else hidden
+    )
+    runner._dummy_hidden = hidden
+    runner.model.requires_request_ids = False
+    runner.model_config = SimpleNamespace()
+    runner.vllm_config = SimpleNamespace()
+    runner.req_states = SimpleNamespace()
+    runner.model_state = MagicMock()
+    runner.model_state.prepare_inputs.return_value = {}
+    runner._omni_data_plane = object()
+    runner.supports_mm_inputs = False
+    runner.lora_config = None
+    runner.is_encoder_decoder = False
+    runner.eplb = MagicMock()
+    runner.kv_connector = MagicMock()
+    runner.input_buffers = object()
+    runner.kv_cache_config = object()
+    runner.attn_groups = []
+    input_batch = SimpleNamespace(
+        input_ids=torch.tensor([1]),
+        positions=torch.tensor([0]),
+        num_tokens=1,
+        num_tokens_after_padding=1,
+        is_padding=None,
+    )
+    runner.prepare_dummy_attn = MagicMock(return_value=((), torch.empty(0)))
+    runner.gather_batch_req_state = MagicMock(return_value=(None, 1))
+    batch_desc = SimpleNamespace(
+        cg_mode=CUDAGraphMode.NONE, num_reqs=1, num_tokens=1, num_active_loras=0, max_query_len=1
+    )
+    runner._dispatch_batch_descriptor = MagicMock(return_value=(batch_desc, None))
+    monkeypatch.setattr(InputBatch, "make_dummy", lambda *args, **kwargs: input_batch)
+    monkeypatch.setattr("vllm_omni.worker_v2.omni_model_runner.build_slot_mappings_by_layer", lambda *args: {})
+    for module in ("omni_model_runner", "omni_generation_model_runner"):
+        monkeypatch.setattr(f"vllm_omni.worker_v2.{module}.set_forward_context", lambda *args, **kwargs: nullcontext())
+    scheduled = SchedulerOutput.make_empty()
+    scheduled.num_scheduled_tokens = {"_dummy_req_0": 1}
+    scheduled.total_num_scheduled_tokens = 1
+
+    # Upstream _dummy_run always supplies valid_dummy_state_slots, and the
+    # result must use the real upstream constructor rather than a mocked state.
+    assert runner.execute_model(scheduled, dummy_run=True, valid_dummy_state_slots=True) is None
+    assert isinstance(runner.execute_model_state, ExecuteModelState)
+    assert runner.execute_model_state.input_batch is input_batch
+    assert runner.execute_model_state.cudagraph_stats is None
+    if runner_kind != "generation":
+        runner.prepare_dummy_attn.assert_called_once_with(input_batch, True)

@@ -55,7 +55,6 @@ from vllm_omni.protocol.realtime.events import (
     SpeechStopped,
     TextDelta,
     TextDone,
-    TranscriptDelta,
     TranscriptDone,
     new_event_id,
     wire_value,
@@ -113,6 +112,14 @@ class AudioDelta(realtime_events.AudioDelta):
     optional_wire_fields = frozenset({"sample_rate_hz", "metadata"})
     format: str = "pcm16"
     sample_rate_hz: int | None = None
+    metadata: Mapping[str, object] | None = None
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class TranscriptDelta(realtime_events.TranscriptDelta):
+    """Tier 2: OpenAI's ``TranscriptDelta`` plus duplex request-start metrics on text-only units."""
+
+    optional_wire_fields = frozenset({"metadata"})
     metadata: Mapping[str, object] | None = None
 
 
@@ -358,8 +365,8 @@ def error_event(
     )
 
 
-#: The complete event vocabulary a duplex client may receive: 22 Tier 1
-#: classes re-exported unchanged, the 8 Tier 2 ones defined above, and 12
+#: The complete event vocabulary a duplex client may receive: 21 Tier 1
+#: classes re-exported unchanged, the 9 Tier 2 ones defined above, and 12
 #: Tier 3 ones. A duplex consumer imports from here and never reaches past
 #: this module into ``vllm_omni.protocol.realtime``.
 __all__ = [
@@ -384,7 +391,6 @@ __all__ = [
     "SpeechStopped",
     "TextDelta",
     "TextDone",
-    "TranscriptDelta",
     "TranscriptDone",
     # Tier 2 --- an OpenAI event plus duplex-only fields.
     "AudioDelta",
@@ -395,6 +401,7 @@ __all__ = [
     "ResponseCreated",
     "ResponseDone",
     "SessionCreated",
+    "TranscriptDelta",
     # Tier 3 --- vLLM-Omni only.
     "DuplexRawEvent",
     "Listen",

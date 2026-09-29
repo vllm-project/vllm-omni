@@ -111,6 +111,21 @@ def decide(
 
     policy = session.config.overlap_policy
     if not is_speech:
+        frames = payload.get("video_frames")
+        has_vision = isinstance(frames, list) and any(isinstance(frame, str) and frame for frame in frames)
+        if has_vision and session.capabilities.allows_video_without_audio():
+            # Same exception as the idle turn-mode path: video without speech is
+            # is_speech=False + a frame. Dropping it while TTS is still playing
+            # leaves Stage0 unsubmitted (empty llm).
+            return {
+                "action": "listen",
+                "reason": "vision_follow",
+                "duration_ms": duration_ms,
+                "overlap_speech_ms": session.overlap_speech_ms,
+                "buffer_audio": True,
+                "defer_runtime_append": False,
+                "force_listen": False,
+            }
         if session.overlap_speech_ms <= 0:
             session.reset_overlap_speech()
         return {

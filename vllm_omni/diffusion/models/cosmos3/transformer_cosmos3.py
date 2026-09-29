@@ -38,7 +38,15 @@ from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelInput, SequenceParallelOutput
 from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
 from vllm_omni.diffusion.layers.norm import RMSNorm as _VllmRMSNorm
+from vllm_omni.diffusion.offloader.config import (
+    OffloadStrategy,
+    resolve_offload_strategy,
+)
 from vllm_omni.platforms import current_omni_platform
+from vllm_omni.quantization.component_config import (
+    ComponentQuantizationConfig,
+    resolve_component_quant_config,
+)
 
 from .mixed_precision import (
     Cosmos3MixedPrecisionConfig,
@@ -50,6 +58,53 @@ if TYPE_CHECKING:
     from vllm_omni.diffusion.offloader.sequential_backend import SequentialOffloadHook
 
 logger = init_logger(__name__)
+
+
+def _pathway_quant_config(
+    components: dict[str, QuantizationConfig | None],
+    pathway: str,
+    fallback: QuantizationConfig | None,
+) -> QuantizationConfig | None:
+    """Leaf overlay, or a scoped router when nested keys exist under ``pathway``.
+
+    Linear layers announce prefixes such as ``language_model.layers.0.mlp``.
+    Passing a single pathway leaf would drop more-specific keys the factory
+    still accepts (for example ``language_model.layers.0.mlp``). Nested keys
+    keep a ``ComponentQuantizationConfig`` so longest-prefix matching still
+    selects them; unmatched prefixes use the pathway root or ``fallback``.
+    """
+    nested = {key: value for key, value in components.items() if key.startswith(f"{pathway}.")}
+    has_root = pathway in components
+    root = components[pathway] if has_root else fallback
+    if not nested:
+        return root
+    scoped = dict(nested)
+    if has_root:
+        scoped[pathway] = root
+    return ComponentQuantizationConfig(scoped, default_config=root)
+
+
+def _resolve_cosmos3_quant_configs(
+    quant_config: QuantizationConfig | None,
+) -> tuple[QuantizationConfig | None, QuantizationConfig | None]:
+    """Resolve the Cosmos3 reasoner and generator quantization configs.
+
+    A pipeline-level ``transformer`` entry is the default for both internal
+    pathways (same leaf-unwrapping pattern as Flux2 / MiniMax / Boogu). The
+    historical ``language_model`` and ``gen_layers`` scopes remain supported as
+    exact-key overlays, including explicit ``None`` entries that leave one
+    pathway unquantized. Nested keys under those roots keep longest-prefix
+    routing via a pathway-scoped ``ComponentQuantizationConfig``.
+    """
+    if not isinstance(quant_config, ComponentQuantizationConfig):
+        return quant_config, quant_config
+
+    transformer_config = resolve_component_quant_config(quant_config, "transformer")
+    components = quant_config.component_configs
+    return (
+        _pathway_quant_config(components, "language_model", transformer_config),
+        _pathway_quant_config(components, "gen_layers", transformer_config),
+    )
 
 
 class RMSNorm(_VllmRMSNorm):
@@ -152,7 +207,7 @@ def _validate_mixed_precision_runtime(
         raise ValueError("Cosmos3 mixed precision currently supports tensor parallel size 1 only")
     if int(getattr(od_config, "max_num_seqs", 1)) != 1:
         raise ValueError("Cosmos3 mixed precision currently supports one active request per worker")
-    if bool(getattr(od_config, "enable_distributed_layerwise_offload", False)):
+    if resolve_offload_strategy(od_config) is OffloadStrategy.DISTRIBUTED_LAYER_WISE:
         raise ValueError(
             "Cosmos3 mixed precision does not support distributed layer-wise offload "
             "because its direct loader bypasses ModelOpt post-load transformations"
@@ -1288,7 +1343,9 @@ class Cosmos3VFMTransformer(nn.Module):
         self.use_und_k_norm_for_gen = _tf_config_get(model_config, "use_und_k_norm_for_gen", None)
 
         dtype = od_config.dtype
-        quant_config = getattr(od_config, "quantization_config", None) if od_config else None
+        language_model_quant_config, gen_layers_quant_config = _resolve_cosmos3_quant_configs(
+            getattr(od_config, "quantization_config", None)
+        )
         mixed_precision_config, mixed_precision_source = resolve_mixed_precision_config(od_config)
         if mixed_precision_config is None:
             if mixed_precision_source == "additional_config_disabled":
@@ -1314,7 +1371,7 @@ class Cosmos3VFMTransformer(nn.Module):
             rms_norm_eps=self.rms_norm_eps,
             rope_theta=self.rope_theta,
             mrope_section=self.mrope_section,
-            quant_config=quant_config,
+            quant_config=language_model_quant_config,
             prefix="language_model",
             **self._language_model_kwargs(),
         )
@@ -1352,7 +1409,7 @@ class Cosmos3VFMTransformer(nn.Module):
                     num_key_value_heads=self.num_key_value_heads,
                     head_dim=self.head_dim,
                     rms_norm_eps=self.rms_norm_eps,
-                    quant_config=quant_config,
+                    quant_config=gen_layers_quant_config,
                     mlp_cls=self._gen_mlp_cls,
                     qk_norm=self.qk_norm_for_diffusion,
                     prefix=f"gen_layers.{i}",

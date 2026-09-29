@@ -11,6 +11,7 @@ which a re-implementation cannot satisfy.
 
 from __future__ import annotations
 
+import base64
 import dataclasses
 
 import pytest
@@ -78,7 +79,9 @@ def test_a_duplex_command_error_is_a_realtime_protocol_error() -> None:
 
 def test_the_duplex_append_command_is_built_from_the_shared_decoder() -> None:
     defaults = protocol.RealtimeInputDefaults()
-    event = {"event_id": "event_1", "audio": "", "format": "pcm16", "duration_ms": 40}
+    # Empty ``audio`` is rejected (need bytes and/or video_frames); use silence.
+    silence = base64.b64encode(b"\x00\x00").decode("ascii")
+    event = {"event_id": "event_1", "audio": silence, "format": "pcm16", "duration_ms": 40}
 
     decoded = protocol.decode_audio_append(event, defaults=defaults)
     command = duplex_codec.build_append_audio(event, defaults=defaults)

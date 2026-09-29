@@ -282,8 +282,14 @@ def test_thinker2talker_full_payload_packs_complete_tensors() -> None:
         "hidden_states.layer_24": torch.full((3, 2), 2.0),
         "embed.tts_bos": torch.zeros(1, 2),
     }
+    # Mock transfer_manager with model config
+    transfer_manager = SimpleNamespace(
+        _get_model_config=lambda: SimpleNamespace(
+            hf_config=SimpleNamespace(talker_config=SimpleNamespace(accept_hidden_layer=24))
+        )
+    )
 
-    payload = q3.thinker2talker_full_payload(None, pooling_output, request)
+    payload = q3.thinker2talker_full_payload(transfer_manager, pooling_output, request)
 
     assert payload is not None
     assert payload["ids"]["all"] == [151644, 872, 3]
@@ -291,6 +297,36 @@ def test_thinker2talker_full_payload_packs_complete_tensors() -> None:
     assert payload["hidden_states"]["output"].device.type == "cpu"
     assert payload["embed"]["prefill"].shape[0] == 2
     assert payload["hidden_states"]["output"].shape[0] == 2
+
+
+def test_thinker2talker_full_payload_uses_config_hidden_layer() -> None:
+    """accept_hidden_layer=6 picks up layer_6, not the old hardcoded 24."""
+    request = SimpleNamespace(
+        request_id="thinker",
+        prompt_token_ids=[151644, 872],
+        output_token_ids=[3],
+        all_token_ids=[151644, 872, 3],
+    )
+    layer_6_data = torch.full((3, 2), 6.0)
+    layer_24_data = torch.full((3, 2), 24.0)
+    pooling_output = {
+        "hidden_states.layer_0": torch.ones(3, 2),
+        "hidden_states.layer_6": layer_6_data,
+        "hidden_states.layer_24": layer_24_data,
+        "embed.tts_bos": torch.zeros(1, 2),
+    }
+    transfer_manager = SimpleNamespace(
+        _get_model_config=lambda: SimpleNamespace(
+            hf_config=SimpleNamespace(talker_config=SimpleNamespace(accept_hidden_layer=6))
+        )
+    )
+
+    payload = q3.thinker2talker_full_payload(transfer_manager, pooling_output, request)
+
+    assert payload is not None
+    # Should use layer 6 (value 6.0), not layer 24 (value 24.0)
+    assert payload["hidden_states"]["output"].shape[0] == 2
+    assert torch.allclose(payload["hidden_states"]["output"], layer_6_data[:-1])
 
 
 def test_thinker2talker_token_only_preserves_voice_metadata() -> None:

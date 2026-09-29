@@ -260,6 +260,37 @@ class TestDiTAttention:
         assert attention.to_k.out_features == 512
         assert attention.to_v.out_features == 512
 
+    def test_embedded_dit_honors_diffusion_attention_backend(self, monkeypatch):
+        """The LLM-hosted code2wav DiT must consume the diffusion env override."""
+        from vllm_omni.diffusion.config import get_current_diffusion_config_or_none
+        from vllm_omni.model_executor.models.cosyvoice3.cosyvoice3_code2wav import _build_dit_estimator
+
+        monkeypatch.setenv("DIFFUSION_ATTENTION_BACKEND", "TORCH_SDPA")
+
+        estimator = _build_dit_estimator(
+            {
+                "dim": 32,
+                "depth": 1,
+                "heads": 2,
+                "dim_head": 16,
+                "dropout": 0.0,
+                "ff_mult": 2,
+                "mel_dim": 8,
+                "mu_dim": 8,
+                "spk_dim": 4,
+                "out_channels": 8,
+                "static_chunk_size": 4,
+                "num_decoding_left_chunks": 1,
+            }
+        )
+
+        attention = estimator.transformer_blocks[0].attn.attn
+        assert attention.backend_pref == "TORCH_SDPA"
+        assert attention.backend_explicit is True
+        assert attention.attn_backend is not None
+        assert attention.attn_backend.get_name() == "SDPA"
+        assert get_current_diffusion_config_or_none() is None
+
     @pytest.mark.core_model
     @pytest.mark.cpu
     def test_forward_passes_2d_mask_without_casting_qkv(self):
