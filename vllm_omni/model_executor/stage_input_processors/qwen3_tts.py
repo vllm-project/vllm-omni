@@ -407,6 +407,12 @@ def talker2code2wav_async_chunk(
         left_context_size=left_context_size,
         finished=torch.tensor(finished, dtype=torch.bool),
     )
+    source_meta = multimodal_output.get("meta", {}) if isinstance(multimodal_output, Mapping) else {}
+    first_audio = source_meta.get("first_audio", False)
+    if isinstance(first_audio, torch.Tensor):
+        first_audio = bool(first_audio.numel() and first_audio.reshape(-1)[-1].item())
+    if first_audio:
+        meta.first_audio = torch.tensor(True, dtype=torch.bool)
     if ref_context_size > 0 and ref_context_request_id is not None:
         meta.ref_context_size = ref_context_size
         meta.ref_context_request_id = ref_context_request_id
@@ -494,11 +500,13 @@ def talker2code2wav_async_chunk_batch(
             request_payload[request_id] = value.contiguous()
 
     payloads: list[OmniPayloadStruct | None] = []
-    for request, finished in zip(requests, is_finished):
+    for request, finished, pooling_output in zip(requests, is_finished, pooling_outputs):
         payloads.append(
             talker2code2wav_async_chunk(
                 transfer_manager=transfer_manager,
-                multimodal_output={},
+                multimodal_output={"meta": pooling_output.get("meta", {})}
+                if isinstance(pooling_output, Mapping)
+                else {},
                 request=request,
                 is_finished=finished,
             )

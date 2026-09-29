@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 import inspect
 import json
 import logging
@@ -34,6 +34,10 @@ from vllm_omni.diffusion.models.flux2 import Flux2Transformer2DModel
 from vllm_omni.diffusion.models.interface import SupportImageInput, SupportsComponentDiscovery
 from vllm_omni.diffusion.models.mistral_encoder import MistralEncoderModel
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
+from vllm_omni.diffusion.offloader.config import (
+    OffloadStrategy,
+    resolve_offload_strategy,
+)
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
@@ -1160,7 +1164,7 @@ class Flux2Pipeline(
         text_encoder_quant_config = _resolve_component_quant_config(self.od_config.quantization_config, "text_encoder")
         transformer_quant_config = _resolve_component_quant_config(self.od_config.quantization_config, "transformer")
         if (
-            self.od_config.enable_cpu_offload
+            resolve_offload_strategy(self.od_config) is OffloadStrategy.MODEL_LEVEL
             and text_encoder_quant_config is not None
             and transformer_quant_config is None
         ):

@@ -76,7 +76,9 @@ from vllm_omni.diffusion.distributed.sp_plan import (
 )
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.forward_context import (
+    get_forward_context,
     get_paged_kv_computed_tokens,
+    is_forward_context_available,
     paged_kv_prefill,
     set_forward_context_denoise_step_idx,
 )
@@ -2481,6 +2483,7 @@ class HunyuanImage3Model(nn.Module):
         gen_timestep_scatter_index: torch.Tensor | None = None,
         uncond_cfg_prefill: bool = False,
         ar_kv_reuse_len: int = 0,
+        paged_kv_cached_prefix_len: int = 0,
         full_attn_spans: list[list[tuple[int, int]]] | None = None,
     ) -> tuple | BaseModelOutputWithPast:
         current_omni_platform.reset_diffusion_fused_moe_forward_context()
@@ -2539,7 +2542,9 @@ class HunyuanImage3Model(nn.Module):
             else:
                 shard_padding_size = shard_image_size * sp_world_size - num_image_tokens
             if first_step:
-                seq_lens = [prompt_size + shard_image_size + ar_kv_reuse_len for _ in seq_lens]
+                seq_lens = [
+                    prompt_size + shard_image_size + ar_kv_reuse_len + paged_kv_cached_prefix_len for _ in seq_lens
+                ]
             else:
                 seq_lens = [x - y for x, y in zip(seq_lens, query_lens)]
                 seq_lens = [seq_len + shard_image_size for seq_len in seq_lens]
@@ -3023,6 +3028,10 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
         cfg_rank,
         device,
     ):
+        if is_forward_context_available() and get_forward_context().paged_kv_cached_prefix_len:
+            # Local hits are sliced after conditional-image embeddings are
+            # prepared in forward_call; the AR path must not truncate them.
+            return input_ids, 0
         ar_kv_data = model_kwargs.pop("ar_kv_data", None)
         computed_tokens = get_paged_kv_computed_tokens()
         if computed_tokens and computed_tokens[0] > 0:

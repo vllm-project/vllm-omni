@@ -1,6 +1,7 @@
 [
   {
     "test_name": "test_qwen3_omni",
+    "description": "random row: fixed workload (Thinker 900 / Talker 1536 tokens, min_tokens == max_tokens) for comparable audio RTF; H100 baseline pending recalibration, see #8100",
     "mark": [
       {
         "hardware_marks": {
@@ -43,17 +44,28 @@
         "random_output_len": 900,
         "ignore_eos": true,
         "percentile-metrics": "ttft,tpot,itl,e2el,audio_rtf,audio_ttfp,audio_duration",
-        "baseline": {
-          "H100": {
-            "mean_audio_rtf": [
-              0.169,
-              0.2041,
-              0.2382,
-              0.3177,
-              0.4595
-            ]
-          }
-        }
+        "seed": 0,
+        "random_range_ratio": 0.0,
+        "extra_body": {
+          "return_stage_metrics": true,
+          "sampling_params_list": [
+            {
+              "temperature": 0.0,
+              "min_tokens": 900,
+              "max_tokens": 900,
+              "ignore_eos": true
+            },
+            {
+              "temperature": 0.9,
+              "top_k": 50,
+              "repetition_penalty": 1.05,
+              "seed": 0,
+              "min_tokens": 1536,
+              "max_tokens": 1536
+            }
+          ]
+        },
+        "baseline": {}
       },
       {
         "dataset_name": "random-mm",

@@ -25,6 +25,7 @@ from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.kv_cache_interface import KVCacheConfig
 
+from vllm_omni.diffusion.cancellation import RequestCancellationRegistry
 from vllm_omni.diffusion.data import (
     DIFFUSION_REQUEST_LIFECYCLE_KEY,
     DIFFUSION_REQUEST_STARTED,
@@ -43,7 +44,11 @@ from vllm_omni.diffusion.io_support import (
     supports_audio_output,
     supports_multimodal_input,
 )
-from vllm_omni.diffusion.offloader.config import any_selected_component_uses_allgather
+from vllm_omni.diffusion.offloader.config import (
+    OffloadStrategy,
+    any_selected_component_uses_allgather,
+    resolve_offload_strategy,
+)
 from vllm_omni.diffusion.output_formatter import (
     format_diffusion_outputs,
     format_empty_diffusion_outputs,
@@ -54,6 +59,7 @@ from vllm_omni.diffusion.registry import (
     DiffusionModelRegistry,
     get_diffusion_post_process_func,
     get_diffusion_pre_process_func,
+    get_diffusion_prefix_cache_func,
 )
 from vllm_omni.diffusion.request import DUMMY_DIFFUSION_REQUEST_ID, OmniDiffusionRequest
 from vllm_omni.diffusion.sched import BaseScheduler, RequestScheduler, StepScheduler
@@ -130,7 +136,7 @@ __all__ = [
 
 
 def _func_accepts_parameter(func: object | None, parameter_name: str) -> bool:
-    if func is None:
+    if not callable(func):
         return False
     parameters = inspect.signature(func).parameters
     return parameter_name in parameters or any(
@@ -139,13 +145,10 @@ def _func_accepts_parameter(func: object | None, parameter_name: str) -> bool:
 
 
 def _resolve_custom_pipeline_cls(custom_pipeline_args: dict[str, Any] | None) -> type | None:
-    if custom_pipeline_args is None:
+    if not custom_pipeline_args or "pipeline_class" not in custom_pipeline_args:
         return None
 
-    try:
-        pipeline_cls = custom_pipeline_args["pipeline_class"]
-    except KeyError as exc:
-        raise ValueError("custom_pipeline_args must include 'pipeline_class'.") from exc
+    pipeline_cls = custom_pipeline_args["pipeline_class"]
 
     if isinstance(pipeline_cls, type):
         return pipeline_cls
@@ -180,6 +183,19 @@ def _max_num_seqs(od_config: OmniDiffusionConfig) -> int:
         return max(1, int(getattr(od_config, "max_num_seqs", 1)))
     except (TypeError, ValueError):
         return 1
+
+
+def supports_request_cancellation(od_config: OmniDiffusionConfig) -> bool:
+    """Whether the local pipeline checks cooperative cancellation boundaries."""
+    model_cls = _resolve_custom_pipeline_cls(getattr(od_config, "custom_pipeline_args", None))
+    if model_cls is None:
+        name = (
+            "DiffusersAdapterPipeline"
+            if uses_diffusers_adapter(od_config)
+            else getattr(od_config, "model_class_name", None)
+        )
+        model_cls = DiffusionModelRegistry._try_load_model_cls(name)
+    return getattr(model_cls, "supports_request_cancellation", False) is True
 
 
 def _uses_dlo_dp_concurrency(od_config: OmniDiffusionConfig) -> bool:
@@ -232,6 +248,8 @@ class DiffusionEngine:
     # don't hit AttributeError when _busy_loop accesses them.
     dp_concurrent: bool = False
     _scheduling_paused: bool = False
+    # Disabled until runtime initialization resolves the pipeline capability.
+    _request_cancellations: RequestCancellationRegistry | None = None
 
     def __init__(
         self,
@@ -300,6 +318,13 @@ class DiffusionEngine:
     def _init_process_hooks(self, od_config: OmniDiffusionConfig) -> None:
         self.post_process_func = get_diffusion_post_process_func(od_config)
         self.pre_process_func = get_diffusion_pre_process_func(od_config)
+        self.prefix_cache_func = get_diffusion_prefix_cache_func(od_config) if self._prefix_cache_enabled() else None
+        if self._prefix_cache_enabled() and self.prefix_cache_func is None:
+            raise ValueError(
+                "enable_prefix_caching=True requires a registered prefix-cache hook for "
+                f"{od_config.model_class_name!r}; "
+                "disable enable_prefix_caching or use a supported native pipeline such as HunyuanImage3ForCausalMM"
+            )
         # Cache whether the model-specific postprocess accepts request-level
         # sampling params so step() can support both legacy and extended hooks.
         self._post_process_accepts_sampling_params = _func_accepts_parameter(self.post_process_func, "sampling_params")
@@ -388,6 +413,9 @@ class DiffusionEngine:
         self._shutting_down = False
         self._shutdown_complete = False
         self.abort_queue: queue.Queue[str] = queue.Queue()
+        self._request_cancellations = (
+            RequestCancellationRegistry() if supports_request_cancellation(self.od_config) else None
+        )
         self._rpc_queue: queue.Queue[_RpcTask] = queue.Queue()
         # pause_scheduler(mode="keep"): no new batch is scheduled while set.
         self._scheduling_paused = False
@@ -549,7 +577,8 @@ class DiffusionEngine:
         if output.media is not None:
             if output.output is not None:
                 raise ValueError("DiffusionOutput cannot contain both media and legacy output")
-            media = output.media.to_cpu() if self.od_config.enable_cpu_offload else output.media
+            model_level = resolve_offload_strategy(self.od_config) is OffloadStrategy.MODEL_LEVEL
+            media = output.media.to_cpu() if model_level else output.media
             output_data = media.video.tensor
             outputs = finalize_diffusion_media(media, sampling_params=request.sampling_params)
         else:
@@ -561,7 +590,7 @@ class DiffusionEngine:
             # post-processing to avoid device OOM — model weights may still
             # reside on the device and leave no headroom for intermediates.
             output_data = output.output
-            if self.od_config.enable_cpu_offload:
+            if resolve_offload_strategy(self.od_config) is OffloadStrategy.MODEL_LEVEL:
                 output_data = _move_tensor_tree_to_cpu(output_data)
 
             if self.post_process_func is not None:
@@ -585,6 +614,7 @@ class DiffusionEngine:
         )
 
     def _busy_loop(self):
+        assert self.stop_event is not None
         while not self.stop_event.is_set():
             self._process_aborts_queue()
             self._process_rpc_queue()
@@ -696,6 +726,7 @@ class DiffusionEngine:
 
         Caller must hold ``self._cv``.
         """
+        assert self.stop_event is not None
         start = time.monotonic()
         decision = self.scheduler.get_admission_wait_decision(
             now=start,
@@ -906,6 +937,8 @@ class DiffusionEngine:
             # path, and repeating executor.shutdown() is unsafe.
             self._shutting_down = True
             self._closed = True
+            if self._request_cancellations is not None:
+                self._request_cancellations.cancel_all()
             if self.stop_event is not None:
                 self.stop_event.set()
             streams = list(self._out_streams.values())
@@ -918,7 +951,13 @@ class DiffusionEngine:
         # If Worker shutdown fails, retain the Scheduler reservations. A
         # remote producer may still be writing into those allocations.
         self.executor.shutdown()
-        self.scheduler.close()
+        try:
+            self.scheduler.close()
+        finally:
+            # Workers are down, so readers cannot attach or use the signals.
+            # Release them even if scheduler cleanup itself fails.
+            if self._request_cancellations is not None:
+                self._request_cancellations.close()
         self._shutdown_complete = True
 
     def _emit_finished_outputs(
@@ -1045,6 +1084,12 @@ class DiffusionEngine:
         engine.run_startup_warmup()
         return engine
 
+    def _prefix_cache_enabled(self) -> bool:
+        config = getattr(self, "od_config", None)
+        return getattr(config, "diffusion_kv_mode", None) is DiffusionKVCacheMode.PAGED_SCHEDULER and bool(
+            getattr(config, "enable_prefix_caching", False)
+        )
+
     def _prepare_request_for_admission(self, request: OmniDiffusionRequest) -> OmniDiffusionRequest:
         """Run model-owned preprocessing once, before entering Engine locks."""
 
@@ -1052,6 +1097,12 @@ class DiffusionEngine:
         if pre_process_func is not None:
             request = pre_process_func(request)
         self._validate_diffusion_kv_profile_limits(request)
+        # Gate cache-input preparation itself: disabled caching must not inspect
+        # tensors / RNG state or copy token IDs just to discard their hashes.
+        # Both dependency hashing and preprocessing stay outside Engine locks.
+        prefix_cache_func = getattr(self, "prefix_cache_func", None)
+        if self._prefix_cache_enabled() and prefix_cache_func is not None and request.diffusion_kv_requests:
+            prefix_cache_func(request)
         return request
 
     def _validate_diffusion_kv_profile_limits(self, request: OmniDiffusionRequest) -> None:
@@ -1087,7 +1138,15 @@ class DiffusionEngine:
             if self._closed:
                 raise RuntimeError("DiffusionEngine is closed.")
             queue: asyncio.Queue[DiffusionOutput] = asyncio.Queue()
-            request_id = self.scheduler.add_request(request)
+            if self._request_cancellations is not None:
+                request.cancellation_signal = self._request_cancellations.create(request.request_id)
+            try:
+                request_id = self.scheduler.add_request(request)
+            except BaseException:
+                if self._request_cancellations is not None:
+                    self._request_cancellations.finish(request.request_id)
+                    request.cancellation_signal = None
+                raise
             self._out_streams[request_id] = queue
             self._cv.notify_all()
 
@@ -1192,7 +1251,7 @@ class DiffusionEngine:
                 # sync func should receive one result
                 if (
                     sched_output.scheduled_request_ids
-                    and not isinstance(runner_output, RunnerOutput)
+                    and isinstance(runner_output, BatchRunnerOutput)
                     and len(runner_output) != 1
                 ):
                     raise ValueError("Sync func should receive one result at one time")
@@ -1249,7 +1308,7 @@ class DiffusionEngine:
         num_inference_steps: int = 1,
         num_frames: int | None = None,
     ) -> OmniDiffusionRequest | None:
-        """Build a minimal model request for startup profiling or warmup."""
+        """Build a startup request; explicit frame counts bypass the warmup policy."""
         prompt = OmniTextPrompt(prompt="dummy run")
         model_class_name = self.od_config.model_class_name
         if model_class_name is None:
@@ -1498,6 +1557,8 @@ class DiffusionEngine:
                 return
             if not self._closed:
                 self._closed = True
+                if self._request_cancellations is not None:
+                    self._request_cancellations.cancel_all()
                 if self.stop_event is not None:
                     self.stop_event.set()
                 pending_streams = list(self._out_streams.values())
@@ -1513,6 +1574,9 @@ class DiffusionEngine:
             if worker_thread.is_alive():
                 worker_thread.join(timeout=10)
             if worker_thread.is_alive():
+                # Keep cancellation names available: an in-flight worker may
+                # not have attached its readers yet. A later close releases
+                # them after execution and executor shutdown have completed.
                 logger.warning(
                     "Worker thread did not terminate within 10s; scheduler and executor shutdown will be deferred."
                 )
@@ -1531,6 +1595,8 @@ class DiffusionEngine:
         else:
             self.scheduler.close()
             self.executor.shutdown()
+        if self._request_cancellations is not None:
+            self._request_cancellations.close()
         self._shutdown_complete = True
 
     def abort(self, request_id: str | Iterable[str]) -> None:
@@ -1539,6 +1605,10 @@ class DiffusionEngine:
         with self._cv:
             if self._closed:
                 return
+            if self._request_cancellations is not None:
+                # Do not queue this behind the full-forward executor call.
+                # Scheduler state is still mutated only by the busy loop.
+                self._request_cancellations.cancel(request_ids)
             for req_id in request_ids:
                 self.abort_queue.put(req_id)
             self._cv.notify_all()
@@ -1582,11 +1652,18 @@ class DiffusionEngine:
         state = self.scheduler.get_request_state(request_id)
         popped_state = self.scheduler.pop_request_state(request_id)
         state = state or popped_state
+        if self._request_cancellations is not None:
+            self._request_cancellations.finish(request_id)
 
         if state is None:
             raise RuntimeError(f"Diffusion scheduler lost state for request {request_id}.")
 
         if state.status == DiffusionRequestStatus.FINISHED_ABORTED:
+            # An aborted request is never waited on, so a pending async output
+            # would be cached forever by the executor result pump (issue #6413).
+            # Tell the executor to drop it before returning the aborted result.
+            if runner_output is not None and runner_output.async_output_id is not None:
+                self.executor.drop_output(runner_output.async_output_id)
             # Preserve runner-provided abort details when available.
             if runner_output is not None and runner_output.result is not None and runner_output.result.aborted:
                 return runner_output.result

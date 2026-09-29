@@ -5,7 +5,7 @@
 # --8<-- [end:requirements]
 # --8<-- [start:set-up-using-python]
 
-vLLM-Omni depends on the matching major/minor release of vLLM. The 0.30 development line uses vLLM 0.30.x. Published 0.28.0 wheels and images use vLLM 0.28.x.
+vLLM-Omni depends on the matching major/minor release of vLLM. The vLLM-Omni 0.30.x release line uses vLLM 0.30.x.
 
 !!! note
     PyTorch installed via `conda` will statically link `NCCL` library, which can cause issues when vLLM tries to use `NCCL`. See <gh-issue:8420> for more details.
@@ -18,22 +18,22 @@ Therefore, it is recommended to install vLLM and vLLM-Omni with a **fresh new** 
 
 #### Installation of vLLM
 
-These pre-built wheel instructions install the published vLLM-Omni 0.28.0 release. For the 0.30 development line, use the source-install instructions below.
+These pre-built wheel instructions install the published vLLM-Omni 0.30.0 release.
 
 vLLM-Omni is built based on vLLM. Please install it with command below.
 ```bash
-uv pip install vllm==0.28.0 --torch-backend=auto
+uv pip install vllm==0.30.0 --torch-backend=auto
 ```
 
 #### Installation of vLLM-Omni
 
 ```bash
-uv pip install vllm-omni==0.28.0
+uv pip install vllm-omni==0.30.0
 ```
 
 To run Gradio demos, also install the optional extras:
 ```bash
-uv pip install 'vllm-omni[demo]==0.28.0'
+uv pip install 'vllm-omni[demo]==0.30.0'
 ```
 
 # --8<-- [end:pre-built-wheels]
@@ -111,7 +111,7 @@ docker run --runtime nvidia --gpus 2 \
     --env "HF_TOKEN=$HF_TOKEN" \
     -p 8091:8091 \
     --ipc=host \
-    vllm/vllm-omni:v0.28.0 \
+    vllm/vllm-omni:v0.30.0 \
     vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091
 ```
 

@@ -710,6 +710,8 @@ def test_lora_manager_activates_native_packed_qkv(tmp_path):
     assert isinstance(packed, PackedLoRALayerWeights)
     assert len(packed.lora_b) == 3
     assert all(b.shape[0] == _TINY_QKV_SLICE for b in packed.lora_b)
+    # This fixture only exposes one layer, so activate only its LoRA weights.
+    lora_model.loras = {"blocks.0.attn.qkv_proj": packed}
 
     class _DummyLoRALayer:
         def __init__(self):

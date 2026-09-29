@@ -1363,6 +1363,43 @@ def test_same_step_hit_prefetch_starts_at_save(caplog):
     assert torch.equal(outs.hidden_states["b"][:8], expected_rows(view.slots_for("b", 0, 8)))
 
 
+@pytest.mark.parametrize("reuse_blocks", [False, True], ids=["fresh", "reused"])
+@pytest.mark.parametrize("deferred_mm", [False, True], ids=["immediate", "deferred"])
+def test_same_step_hit_refreshes_prefetch_after_write(reuse_blocks, deferred_mm):
+    policy = ModelCachePolicy(deferred_keys=frozenset({"mm"}) if deferred_mm else frozenset())
+    mgr, view = make_manager(policy=policy)
+    try:
+        blocks = [0, 1] if reuse_blocks else [8, 9]
+        sid = run_step(mgr, view, {"old": (blocks, 0, 8)}, mm={"mm": torch.full((8, 2), 100.0)})
+        mgr.materialize(sid, ["old"])
+        mgr.new_step_starts(FakeSchedOut(finished=["old"]))
+
+        mgr.new_step_starts(
+            FakeSchedOut(
+                new_reqs=[FakeNewReq("a", 0, [[0, 1]]), FakeNewReq("b", 8, [[0, 1, 2]])],
+                num_scheduled={"a": 8, "b": 4},
+            )
+        )
+        old_prefetch = dict(mgr._hit_prefetch["b"])
+        # Complete the early reads before A publishes the prefix B actually hits.
+        for future in old_prefetch.values():
+            future.result(timeout=5)
+
+        view.order = ["a", "b"]
+        view.req_blocks.update(a=[0, 1], b=[0, 1, 2])
+        view.computed.update(a=0, b=8)
+        hidden = torch.cat([torch.full((8, HIDDEN), 20.0), torch.full((4, HIDDEN), 30.0)])
+        mm = torch.cat([torch.full((8, 2), 200.0), torch.full((4, 2), 300.0)])
+        sid = mgr.save_outputs(hidden, {"mm": mm}, num_tokens_unpadded=12, num_tokens_padded=12)
+        outs = mgr.materialize(sid, ["a", "b"])
+
+        assert torch.equal(outs.hidden_states["b"][:8], hidden[:8])
+        assert torch.equal(outs.hidden_states["b"][8:], hidden[8:])
+        assert torch.equal(outs.mm_outputs["mm"]["b"], mm)
+    finally:
+        mgr.shutdown()
+
+
 def test_delayed_read_of_reassigned_hit_raises():
     """A version check with no COW copy still raises for live and finished.
     The production path registers the ref first so remap preserves the rows

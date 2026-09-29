@@ -18,6 +18,7 @@ from vllm.logger import init_logger
 from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
 
 from vllm_omni.config.endpoint_policy import EndpointRestriction
+from vllm_omni.config.speech_cache import SpeechCacheConfig
 from vllm_omni.config.yaml_util import create_config, load_yaml_config, to_dict
 from vllm_omni.core.sched.omni_ar_scheduler import OmniARAsyncScheduler, OmniARScheduler
 from vllm_omni.core.sched.omni_generation_scheduler import OmniGenerationScheduler
@@ -257,6 +258,15 @@ class StagePipelineConfig:
     prompt_transform_func: str | None = None
     prompt_expand_func: str | None = None
     cfg_kv_collect_func: str | None = None
+    # Payload keys this stage expects to receive from its upstream stage over
+    # the omni connector instead of through the orchestrator IPC hop. Declaring
+    # them is what enables the worker-side connector receive path, so an empty
+    # tuple leaves existing deployments untouched.
+    stage_input_payload_keys: tuple[str, ...] = ()
+    # Mirror of the above on the producing side: keys this stage hands to the
+    # next stage over the connector. Only diffusion producers need this; AR
+    # stages already send through ``send_full_payload_outputs``.
+    stage_output_payload_keys: tuple[str, ...] = ()
     omni_kv_config: dict[str, Any] | None = None
     scheduler_cls: str | None = None
     # Model subdirectory indirections: for multi-component HF repos where the
@@ -303,10 +313,10 @@ class PipelineConfig:
     # ``hf_config_predicate=lambda c: getattr(c, "version", "") == "4.5"``
     # to avoid misrouting 2.6 checkpoints.
     hf_config_predicate: Callable[[Any], bool] | None = None
-    # Diffusers pipeline class name: for models that ship a ``model_index.json``
-    # (no root ``config.json``), the ``_class_name`` field is matched against
-    # this value to auto-detect the pipeline.  Only needed for diffusers-style
-    # multi-component repos (e.g. GLM-Image).  ``None`` = not a diffusers model.
+    # Canonical diffusion runtime class for this registered pipeline.
+    # Serving uses it as a metadata fallback; model_index.json discovery
+    # also matches its _class_name against this value and its aliases.
+    # None delegates class discovery to the checkpoint metadata.
     diffusers_class_name: str | None = None
     diffusers_class_aliases: tuple[str, ...] = ()
     endpoint_restrictions: tuple[EndpointRestriction, ...] = ()
@@ -315,10 +325,10 @@ class PipelineConfig:
     duplex_plugin: str | None = None
     # Preserve legacy turn deployments when adding an optional duplex plugin.
     default_session_mode: str | None = None
-    # Legacy duplex wiring of the models that are not ported to the plugin
-    # framework yet (PersonaPlex, Nemotron VoiceChat). Nothing reads them: a
-    # pipeline that only declares these is served turn-based. Each field goes
-    # away with the follow-up PR that ports its model to ``duplex_plugin``.
+    # Legacy duplex wiring of the model that is not ported to the plugin
+    # framework yet (Nemotron VoiceChat, RFC vllm-omni#7181 PR 4). Nothing
+    # reads them: a pipeline that only declares these is served turn-based.
+    # The fields go away with the PR that ports it to ``duplex_plugin``.
     duplex_runtime_extension: str | None = None
     duplex_serving_adapter: str | None = None
     duplex_control_enabled: bool = False
@@ -573,7 +583,10 @@ class DeployConfig:
     model_runner: Literal["v1", "v2"] = "v1"
     # Stage-1 active stream slots; 0 preserves legacy all-stream cycling.
     active_stream_window: int = 0
+    # Experimental local NVIDIA MPS; disabled unless a deploy explicitly opts in.
+    cuda_mps: bool = False
     duplex_session: DuplexSessionRuntimeConfig = field(default_factory=DuplexSessionRuntimeConfig)
+    speech_cache: SpeechCacheConfig = field(default_factory=SpeechCacheConfig)
     connectors: dict[str, Any] | None = None
     edges: list[dict[str, Any]] | None = None
     stages: list[StageDeployConfig] = field(default_factory=list)
@@ -676,16 +689,20 @@ _DEEP_MERGE_KEYS = frozenset(
 )
 
 
+_DEPLOY_DEEP_MERGE_KEYS = frozenset({"speech_cache"})
+
+
+def _merge_config_fields(base: dict, overlay: dict, *, deep_merge_keys: frozenset[str]) -> dict:
+    """Recursively merge selected fields; overlay replaces all other fields."""
+    base_nested = {k: v for k, v in base.items() if k in deep_merge_keys}
+    overlay_nested = {k: v for k, v in overlay.items() if k in deep_merge_keys}
+    merged_nested = _get_recursively_merged_dict(original=base_nested, update=overlay_nested)
+    return {**base, **overlay, **merged_nested}
+
+
 def _deep_merge_stage(base: dict, overlay: dict) -> dict:
     """Deep-merge ``_DEEP_MERGE_KEYS`` so thin overlays don't drop base keys."""
-    # Deep merge _DEEP_MERGE_KEYS recursively
-    base_merge_dict = {k: v for k, v in base.items() if k in _DEEP_MERGE_KEYS}
-    overlay_merge_dict = {k: v for k, v in overlay.items() if k in _DEEP_MERGE_KEYS}
-
-    # Get the merge dict; priority is base < overlay < merged sub
-    merged_subdict = _get_recursively_merged_dict(original=base_merge_dict, update=overlay_merge_dict)
-    merged_dict = {**base, **overlay, **merged_subdict}
-    return merged_dict
+    return _merge_config_fields(base, overlay, deep_merge_keys=_DEEP_MERGE_KEYS)
 
 
 def _get_recursively_merged_dict(original: dict, update: dict) -> dict:
@@ -767,10 +784,11 @@ def resolve_deploy_yaml(path: str | Path) -> dict[str, Any]:
 
     # Merge top-level scalars: overlay wins. Structured sections are merged
     # below so a thin overlay does not discard inherited runtime contracts.
-    merged = {
-        **base_dict,
-        **{k: v for k, v in raw_dict.items() if k not in ("connectors", "stages", "platforms")},
-    }
+    merged = _merge_config_fields(
+        base_dict,
+        {k: v for k, v in raw_dict.items() if k not in ("connectors", "stages", "platforms")},
+        deep_merge_keys=_DEPLOY_DEEP_MERGE_KEYS,
+    )
     merged_connectors = _merge_connectors(base_dict.get("connectors"), raw_dict.get("connectors"))
     if merged_connectors is not None:
         merged["connectors"] = merged_connectors
@@ -791,13 +809,21 @@ def load_deploy_config(path: str | Path) -> DeployConfig:
             "define topology in PipelineConfig and deployment overrides under `stages`."
         )
 
+    speech_cache = raw_dict.get("speech_cache", {})
+    if not isinstance(speech_cache, dict):
+        raise ValueError("speech_cache must be a mapping")
     stages = [_parse_stage_deploy(s) for s in raw_dict.get("stages", [])]
 
     model_runner = raw_dict.get("model_runner", "v1")
     if model_runner not in ("v1", "v2"):
         raise ValueError(f"model_runner must be one of ('v1', 'v2'), got {model_runner!r}")
 
+    if not isinstance(raw_dict.get("cuda_mps", False), bool):
+        raise ValueError("cuda_mps must be a boolean")
+
     kwargs: dict[str, Any] = {
+        "speech_cache": SpeechCacheConfig(**speech_cache),
+        "cuda_mps": raw_dict.get("cuda_mps", False),
         "async_chunk": raw_dict.get("async_chunk", True),
         "session_mode": raw_dict.get("session_mode", "turn"),
         "model_runner": model_runner,
@@ -931,7 +957,11 @@ def _resolve_execution_mode(
 
 
 def resolve_stage_async_chunk(deploy: DeployConfig, stage: StageDeployConfig | None) -> bool:
-    return bool(deploy.async_chunk and (stage is None or stage.async_chunk is not False))
+    if not isinstance(deploy.async_chunk, bool):
+        raise ValueError("async_chunk must be a boolean")
+    if stage is not None and stage.async_chunk is not None and not isinstance(stage.async_chunk, bool):
+        raise ValueError(f"Stage {stage.stage_id} async_chunk must be a boolean or null")
+    return deploy.async_chunk and (stage is None or stage.async_chunk is not False)
 
 
 def validate_stage_async_chunk_edges(pipeline: PipelineConfig, deploy: DeployConfig) -> None:
@@ -1016,6 +1046,10 @@ def _build_engine_args(
     if ps.model_path_resolver:
         engine_args["model_path_resolver"] = ps.model_path_resolver
     engine_args["inline_diffusion"] = ps.inline_diffusion
+    if ps.stage_input_payload_keys:
+        engine_args["stage_input_payload_keys"] = tuple(ps.stage_input_payload_keys)
+    if ps.stage_output_payload_keys:
+        engine_args["stage_output_payload_keys"] = tuple(ps.stage_output_payload_keys)
 
     # Pipeline-wide top-level DeployConfig settings, applied to every stage.
     for name in _PIPELINE_WIDE_ENGINE_FIELDS:
@@ -1171,6 +1205,8 @@ def merge_pipeline_deploy(
             runtime["num_replicas"] = ds.num_replicas
             if ds.env is not None:
                 runtime["env"] = ds.env
+        if deploy.cuda_mps:
+            runtime["cuda_mps"] = True
         runtime["requires_multimodal_data"] = ps.requires_multimodal_data
 
         result.append(

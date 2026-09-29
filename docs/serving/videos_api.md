@@ -120,7 +120,18 @@ request for execution.
 `DELETE /v1/videos/{video_id}` issues a bounded engine abort
 (`VLLM_OMNI_ABORT_TIMEOUT`, default 2s), then cancels the frontend
 task. Cancellation cleanup is also bounded and best-effort: it confirms
-the abort was queued, and the current request batch may still drain.
+the abort was submitted. In request execution mode, MiniMax-H3 checks
+cancellation at model boundaries,
+including before and after input preparation, after each denoising step, and
+before decode, and skips the remaining generation when cancelled. Input
+preparation or decoding already in progress may finish before the next boundary.
+Successful steps do not force device synchronization for cancellation.
+Parallel ranks agree before stopping; independent requests sharing a distributed
+AllGather offload wave can stop that wave early only when all its requests are
+cancelled, so a cancelled request cannot strand its live peers in a collective.
+In step execution mode, cancellation is handled by the scheduler between steps;
+the request-mode component-boundary checks do not apply within an active step.
+Other pipelines may still drain their current request batch.
 The job is then re-read so a completed save is not orphaned.
 
 ### Synchronous Response
@@ -323,6 +334,13 @@ but retain more frames on the accelerator and delay encoding. The VAE decode
 window and output frame count stay unchanged. Wan S2V keeps its existing
 per-clip behavior by default. Zero, negative, fractional, boolean, string, and
 null values are rejected when pre-encoding is enabled.
+
+The transfer ring applies backpressure before another D2H copy when both of
+its two slots are occupied or the combined pending uint8 payload would exceed
+256 MiB. This byte bound keeps large resolutions and uneven final chunks from
+turning a fixed item count into unexpectedly large memory growth. A native VAE
+chunk larger than 256 MiB is admitted only when the ring is otherwise empty,
+so supported chunk shapes cannot deadlock.
 
 `preencode_mp4` applies to the complete-MP4 response paths only. The
 `/v1/realtime/video` WebSocket endpoint rejects it, because that path already

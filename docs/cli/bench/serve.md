@@ -302,6 +302,21 @@ vllm bench serve --omni \
 selects all and oversize values use all available cases. Reference audio is required, and OmniInteract uses the
 `/v1/realtime` endpoint.
 
+To replay an existing sample set (for example `sampled_cases.jsonl` from a prior run), pass
+`--omniinteract-video-list` instead of discovering cases. List order is preserved; `--num-prompts` takes the prefix of
+the list (`0` or a value larger than the list length runs every row). Do not combine video-list mode with `--seed`,
+`--dataset-path`, `--omniinteract-scenario-tags`, or `--omniinteract-scenario-focus`.
+
+Use `--omniinteract-scenario-tags` to steer small runs toward paper-table scenarios (`realtime`, `proactive`,
+`nested`, `interrupted`, `1qna`). By default the sampler covers each requested tag with at least one matching case
+(when available under `--omniinteract-subsets`), then fills the remaining `--num-prompts` budget from other cases.
+Add `--omniinteract-scenario-focus` to run only cases that match those tags. Example smoke coverage:
+
+```bash
+  --num-prompts 5 \
+  --omniinteract-scenario-tags realtime proactive nested interrupted 1qna
+```
+
 Audio is replayed as 16 kHz PCM16 in 200 ms chunks and video at 1 FPS with real-time pacing. All selected media is decoded
 before timing and remains in client memory for the run, so `--max-concurrency` does not limit media preparation memory; use
 explicit `--num-prompts 0` only when the client has enough RAM for the full dataset. Media commands are bounded by
@@ -309,7 +324,9 @@ explicit `--num-prompts 0` only when the client has enough RAM for the full data
 options apply. Use `--omniinteract-require-response` only for functional E2E cases; LISTEN is a valid benchmark result.
 
 Each completed case writes `output.wav`, `wav_transcript.json`, `events.json`, `result.json`, and a final `.done` marker under
-`--omniinteract-output-dir`. The root also contains `batch_summary.json` and `official_eval_manifest.jsonl`; failed cases write
+`--omniinteract-output-dir`. The root also contains `batch_summary.json`, `official_eval_manifest.jsonl` (eligible cases only),
+and `sampled_cases.jsonl` (every sampled case as absolute `video_path` / official `output_name` / `subset` rows for Lucky-Lance
+OmniInteract `batch_inference_minicpmo.py --video_list`); failed cases write
 `.failed.json`. Runs sharing one output root are serialized. Completion validates transport, response lifecycle, and artifacts,
 not answer accuracy. Transcript timestamps are serialized playback-queue times. Playback ACKs report cumulative progress
 incrementally along that serialized clock, like a live listener; the first ack for a response goes out as soon as its audio
@@ -318,6 +335,48 @@ arrives, checkpointing the response's history position so a later committed user
 outputs are ineligible and omitted from the official manifest; `audio_clipped_bytes` records output beyond the rounded video
 horizon.
 
+Accuracy evaluation is opt-in and requires an already-running text judge with an OpenAI-compatible Chat Completions API. The
+benchmark does not launch or stop the judge server. Add the following options to the command above:
+
+```bash
+vllm serve Qwen/Qwen2.5-7B-Instruct \
+  --served-model-name Qwen2.5-7B-Instruct \
+  --port 8001
+```
+
+Then add to the benchmark command:
+
+```bash
+  --omniinteract-evaluate \
+  --omniinteract-judge-base-url http://127.0.0.1:8001 \
+  --omniinteract-judge-model Qwen2.5-7B-Instruct
+```
+
+`--omniinteract-judge-model` must match that judge process's `--served-model-name` (or its `--model`
+string if `--served-model-name` is omitted). It is not a checkpoint path to load, and it is not the
+Omni DUT `--served-model-name`. Point `--omniinteract-judge-base-url` at the judge, not at the Omni
+realtime endpoint.
+
+The early / core / interrupted-partial judge prompts follow the official English
+templates in [Lucky-Lance/OmniInteract](https://github.com/Lucky-Lance/OmniInteract)
+`eval/evaluation/llm_judge.py` (commit `de304cef35fd9a50a5caadb5090c34cfbf0dd868`).
+They correspond to the OmniInteract paper appendix
+([arXiv:2605.26485](https://arxiv.org/abs/2605.26485)) Listing A.1 (early-stage),
+Listing A.2 (interrupted partial quality), and Listing A.3 (core-stage).
+A local OpenAI-compatible judge is not the paper's GPT-4o judge, so reported
+IA-QTF1 numbers are protocol-compatible rather than official paper-table scores.
+
+After artifact publication, the evaluator builds `[start, t_a, end)` slots, judges early and core response text, writes
+per-case details plus `evaluation/unified_eval_summary.json`, and prints IA-QTF1 columns
+(1Q1A realtime / proactive / nested / Global, 1QnA, All Global), interruption diagnostics (NOR / PAQ / CSM), and nested
+metrics (NCCS, inner / outer IA-QTF1, missed outer). Slices and sections with no slots in the evaluated sample are
+omitted from the terminal report. The header lists how many evaluated cases carry each scenario tag
+(`realtime`, `proactive`, `nested`, `interrupted`, `1qna`). Realtime and proactive
+exclude nested inner/outer slots; 1Q1A Global recomputes F1 from those three TP/FP/FN aggregates; All Global includes every
+scored slot plus unmatched-chunk false positives. Plain `wav_transcript.json` timestamps provide chunk-level approximate
+timing. If transcript chunks include `aligned_words`, the evaluator splits boundary-crossing chunks and derives trigger
+timing from word alignment.
+
 Per-response TTFT and TTFP start when the server begins executing the native model-turn request that owns the response. RTF
 continues to use client receipt of `response.created` through the last audio packet, divided by emitted audio duration. Global
 TTFT, TTFP, and RTF cover the complete input-stream window. TPOT/ITL use engine stage-0 timing; ITL is emitted only when every
@@ -325,9 +384,12 @@ token interval is present within a continuous generation segment. Model-unit pac
 excluded from TPOT/ITL. Raw request metrics retain `response_created_to_first_text_ms` and
 `response_created_to_first_audio_ms` as client-envelope diagnostics.
 
-The checked-in local performance configuration measures four deterministic cases from each OmniInteract subset (12 videos
-total), with no benchmark warmups and a maximum concurrency of two. Each subset also sends one readiness request before its
-measured cases. Run it from the repository root with:
+The checked-in local performance configuration measures four deterministic cases from `1q1a`, `1q1a_math`, and
+`1qna` (12 videos total), with no benchmark warmups and a maximum concurrency of two. Each subset also sends one readiness request before its
+measured cases. The runner starts MiniCPM-o 4.5 on the first visible GPU and a text judge
+(`Qwen/Qwen2.5-7B-Instruct`) on the second (`CUDA_VISIBLE_DEVICES=1` relative to the process). After artifacts land it
+scores All Global IA-QTF1 through that local judge. This is protocol-compatible with the paper metric, not a GPT-4o
+paper-table score. Run it from the repository root with two visible GPUs:
 
 ```bash
 export HF_HOME=/path/to/persistent/huggingface-cache
@@ -338,12 +400,14 @@ bash tools/nightly/run_nightly_jobs.sh \
   --label-substr minicpmo_4_5_omniinteract
 ```
 
-The first run downloads the pinned OmniInteract archive into `HF_HOME`; later runs reuse that cache.
+The first run downloads the pinned OmniInteract archive and the judge weights into `HF_HOME`; later runs reuse that cache.
 
 It requires every case to commit its input, complete any emitted response lifecycles, and publish the expected WAV,
 transcript, event, and result artifacts without errors. A valid LISTEN-only case may have no response audio or transcript
 chunks. Official-manifest eligibility is reported separately because clipped or cancelled output is a benchmark-quality
-signal, not a transport failure. This local performance test does not score answer accuracy.
+signal, not a transport failure. Accuracy must finish with `status=ok` on every subset. After all three subsets finish,
+All Global IA-QTF1 is recomputed from pooled `Global_TP` / `Global_FP` / `Global_FN` and must be at or above
+`omniinteract_aggregate_min_ia_qtf1` (checked in as `0.2`).
 
 ### Video-MME Benchmark
 

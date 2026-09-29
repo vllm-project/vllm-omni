@@ -6,6 +6,7 @@ import multiprocessing as mp
 import queue
 import threading
 import time
+from collections import OrderedDict
 from multiprocessing import shared_memory
 from multiprocessing.connection import Connection
 
@@ -108,6 +109,7 @@ def test_per_worker_result_queues_release_nested_numpy_shm_and_processes() -> No
         executor._rpc_futures = {}
         executor._output_futures = {}
         executor._completed_outputs = {}
+        executor._dropped_output_ids = OrderedDict()
         executor._batch_split_map = {}
         executor._start_result_pump()
 

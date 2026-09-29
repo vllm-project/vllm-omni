@@ -15,6 +15,21 @@ from vllm_omni.diffusion.models.minimax_h3.temporal_chunks import decode_tempora
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
 
+@pytest.mark.parametrize("chunked", [False, True])
+def test_encode_only_video_vae_rejects_full_and_chunked_decode(chunked):
+    from vllm_omni.diffusion.models.minimax_h3.vae import MiniMaxH3VideoVAE
+
+    vae = object.__new__(MiniMaxH3VideoVAE)
+    torch.nn.Module.__init__(vae)
+    vae.encode_only = True
+    latent = torch.empty(1, 1, 1, 1, 1)
+    with pytest.raises(RuntimeError, match="encode-only video VAE cannot decode"):
+        if chunked:
+            vae.decode_with_chunks(latent, on_chunk=lambda frames: None)
+        else:
+            vae.decode_latent(latent)
+
+
 @pytest.fixture(scope="module")
 def cpu_process_group():
     if dist.is_initialized():

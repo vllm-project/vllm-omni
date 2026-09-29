@@ -13,6 +13,21 @@ class _OffloadAbort(BaseException):
     pass
 
 
+def _legacy_distributed_offload_config() -> SimpleNamespace:
+    return SimpleNamespace(
+        diffusion_offload_config=None,
+        enable_cpu_offload=False,
+        enable_layerwise_offload=False,
+        enable_distributed_layerwise_offload=True,
+        dlo_use_allgather=True,
+        dlo_resident_layers=0,
+        dlo_host_registration_limit_gib=0.0,
+        host_weight_runtime_mode="disabled",
+        pin_cpu_memory=True,
+        parallel_config=SimpleNamespace(data_parallel_size=1),
+    )
+
+
 def test_no_allgather_example_selects_distributed_backend():
     from examples.offline_inference.minimax_h3.dlo_lifecycle import engine_kwargs
     from vllm_omni.diffusion.offloader.base import OffloadConfig
@@ -100,10 +115,7 @@ def test_manual_component_failure_forces_retained_cache_release(mocker):
 
     pipeline = object.__new__(MiniMaxH3Pipeline)
     torch.nn.Module.__init__(pipeline)
-    pipeline.od_config = mocker.Mock()
-    pipeline.od_config.diffusion_offload_config = None
-    pipeline.od_config.enable_layerwise_offload = False
-    pipeline.od_config.enable_distributed_layerwise_offload = True
+    pipeline.od_config = _legacy_distributed_offload_config()
     pipeline._model_cpu_offload_modules = []
     pipeline._dlo_component_cache = mocker.Mock()
     component = mocker.Mock()
@@ -123,10 +135,7 @@ def test_manual_component_offload_failure_forces_retained_cache_release(mocker):
 
     pipeline = object.__new__(MiniMaxH3Pipeline)
     torch.nn.Module.__init__(pipeline)
-    pipeline.od_config = mocker.Mock()
-    pipeline.od_config.diffusion_offload_config = None
-    pipeline.od_config.enable_layerwise_offload = False
-    pipeline.od_config.enable_distributed_layerwise_offload = True
+    pipeline.od_config = _legacy_distributed_offload_config()
     pipeline._model_cpu_offload_modules = []
     pipeline._dlo_component_cache = mocker.Mock()
     component = mocker.Mock()

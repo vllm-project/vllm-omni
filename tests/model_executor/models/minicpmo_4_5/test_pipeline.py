@@ -170,7 +170,7 @@ class TestDeployTopology:
         assert stages[1].yaml_engine_args["custom_process_next_stage_input_func"].endswith(expected_processor)
         assert "hf_overrides" not in stages[1].yaml_engine_args
         if filename == "minicpmo_4_5.yaml":
-            assert [stage.yaml_engine_args["max_num_seqs"] for stage in stages] == [4, 4, 4]
+            assert [stage.yaml_engine_args["max_num_seqs"] for stage in stages] == [16, 16, 16]
             memory_utilizations = [stage.yaml_engine_args["gpu_memory_utilization"] for stage in stages]
             assert memory_utilizations == [
                 0.55,

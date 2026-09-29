@@ -5,6 +5,7 @@
 Regression tests for https://github.com/vllm-project/vllm-omni/issues/1862
 """
 
+import json
 from collections.abc import Mapping
 
 import pytest
@@ -264,6 +265,21 @@ def test_architecture_name_resolves_via_pipeline_class_fallback():
 
     assert hunyuan_od_config.supports_multimodal_inputs is True
     assert hunyuan_od_config.max_multimodal_image_inputs == HUNYUAN_IMAGE3_MAX_INPUT_IMAGES
+
+
+def test_architecture_only_checkpoint_propagates_multimodal_limit(tmp_path):
+    """A config.json-only checkpoint must expose its image-input capability."""
+    (tmp_path / "config.json").write_text(
+        json.dumps({"architectures": ["HunyuanImage3ForCausalMM"]}),
+        encoding="utf-8",
+    )
+
+    od_config = OmniDiffusionConfig(model=str(tmp_path))
+    od_config.enrich_config()
+
+    assert od_config.model_class_name == "HunyuanImage3ForCausalMM"
+    assert od_config.supports_multimodal_inputs is True
+    assert od_config.max_multimodal_image_inputs == HUNYUAN_IMAGE3_MAX_INPUT_IMAGES
 
 
 def test_additional_config_roundtrip():

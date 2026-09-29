@@ -8,7 +8,7 @@ import copy
 from collections.abc import Mapping, Sequence
 from typing import Any
 
-from vllm_omni.data_entry_keys import unflatten_payload
+from vllm_omni.data_entry_keys import OmniPayloadStruct, to_dict, unflatten_payload
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.model_executor.models.minimax_h3.conditioning import (
     MINIMAX_H3_CONDITION_LABELS_KEY,
@@ -92,6 +92,34 @@ def _global_request_id(prompt: Mapping[str, Any]) -> str | None:
     return str(value) if value is not None else None
 
 
+def _encoder_conditioning(payload: Any) -> MiniMaxH3EncoderConditioning:
+    if isinstance(payload, OmniPayloadStruct):
+        payload = to_dict(payload)
+    if not isinstance(payload, Mapping):
+        raise RuntimeError("MiniMax H3 encoder returned no conditioning payload")
+    try:
+        return MiniMaxH3EncoderConditioning.from_omni_payload(unflatten_payload(dict(payload)))
+    except ValueError as exc:
+        raise RuntimeError(str(exc)) from exc
+
+
+def encoder2diffusion_full_payload(
+    *,
+    pooling_output: Any = None,
+    **kwargs: Any,
+) -> dict[str, Any] | None:
+    """Pack all three encoder components for direct worker-to-worker transfer.
+
+    Returning the diffusion-ready structure here keeps the DiT worker free of
+    any H3-specific unpacking: the generic receive path merges this dict into
+    the request's ``additional_information``.
+    """
+    del kwargs
+    if pooling_output is None:
+        return None
+    return {"encoder_output": _encoder_conditioning(pooling_output).to_omni_payload()}
+
+
 def encoder2diffusion(
     source_outputs: list[Any],
     prompt: Any = None,
@@ -126,22 +154,25 @@ def encoder2diffusion(
         output_count = len(outputs) if isinstance(outputs, list) else 0
         raise RuntimeError(f"MiniMax H3 encoder must return exactly one completion, got {output_count}")
     payload = getattr(outputs[0], "multimodal_output", None)
-    if not isinstance(payload, Mapping):
-        raise RuntimeError("MiniMax H3 encoder returned no conditioning payload")
-    try:
-        conditioning = MiniMaxH3EncoderConditioning.from_omni_payload(unflatten_payload(dict(payload)))
-    except ValueError as exc:
-        raise RuntimeError(str(exc)) from exc
+    # Successful connector sends omit the inline payload. The diffusion runner
+    # merges encoder_output before forward; original media still needs cleanup.
+    conditioning = _encoder_conditioning(payload) if payload is not None else None
 
     additional_information = dict(diffusion_prompt.get("additional_information") or {})
-    additional_information.pop("hidden_states", None)
+    hidden_states = dict(additional_information.get("hidden_states") or {})
+    hidden_states.pop("layers", None)
+    if hidden_states:
+        additional_information["hidden_states"] = hidden_states
+    else:
+        additional_information.pop("hidden_states", None)
     meta = dict(additional_information.get("meta") or {})
     meta.pop(MINIMAX_H3_ENCODER_REQUEST_KEY, None)
     if meta:
         additional_information["meta"] = meta
     else:
         additional_information.pop("meta", None)
-    additional_information["encoder_output"] = conditioning.to_omni_payload()
+    if conditioning is not None:
+        additional_information["encoder_output"] = conditioning.to_omni_payload()
     diffusion_prompt["additional_information"] = additional_information
     diffusion_prompt["multi_modal_data"] = None
     diffusion_prompt.pop("model_intermediate_buffer", None)

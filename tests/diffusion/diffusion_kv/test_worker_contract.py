@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -69,7 +69,7 @@ def make_executor() -> tuple[MultiprocDiffusionExecutor, list[tuple]]:
     executor._ensure_open = lambda: None
     calls: list[tuple] = []
 
-    def collective_rpc(method, *, args, unique_reply_rank, exec_all_ranks):
+    def collective_rpc(method, *, args, unique_reply_rank, exec_all_ranks, timeout=None):
         calls.append((method, args, unique_reply_rank, exec_all_ranks))
         return DiffusionOutput(output=None)
 
@@ -109,6 +109,29 @@ def test_runner_builds_prefill_and_denoise_rows_from_scheduler_metadata() -> Non
         (row.request_id, row.sequence_id, row.kv_start_pos, row.query_len, row.seq_len)
         for row in attn_metadata.denoise_rows
     ] == [("req-0", 0, 4, 2, 6), ("req-0", 1, 5, 2, 7)]
+
+
+def test_runner_builds_suffix_prefill_row_for_a_prefix_hit() -> None:
+    runner = make_runner(DiffusionKVCacheMode.PAGED_SCHEDULER)
+    metadata = DiffusionKVMetadata(
+        request_id="req-0",
+        allocation_generation=1,
+        sequences=(
+            DiffusionKVSequenceMetadata(
+                sequence_id=0,
+                prefix_len=8,
+                target_len=4,
+                seq_len=12,
+                block_ids=([1, 2, 3],),
+                cached_prefix_len=4,
+            ),
+        ),
+    )
+
+    attn_metadata = runner._build_paged_attention_metadata([metadata])
+
+    row = attn_metadata.prefill_rows[0]
+    assert (row.kv_start_pos, row.query_len, row.seq_len) == (4, 8, 12)
 
 
 def test_runner_selects_only_local_cfg_parallel_row(monkeypatch: pytest.MonkeyPatch) -> None:

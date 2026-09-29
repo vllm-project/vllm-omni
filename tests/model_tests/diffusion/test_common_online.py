@@ -31,8 +31,8 @@ from tests.model_tests.diffusion.task_runners import (
 )
 from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
 
-# NOTE : Hardware marks are added dynamically based on test requirements
-pytestmark = [pytest.mark.diffusion, pytest.mark.xdist]
+# NOTE: Hardware and model type marks are added dynamically based on test requirements and model type
+pytestmark = [pytest.mark.xdist]
 
 
 @pytest.fixture(autouse=True)

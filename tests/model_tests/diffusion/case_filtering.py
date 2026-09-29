@@ -20,7 +20,12 @@ import itertools
 import pytest
 
 from tests.helpers.mark import hardware_marks
-from tests.model_tests.diffusion.config_types import DiffusionAccs, DiffusionModelTestOpts, get_required_device_count
+from tests.model_tests.diffusion.config_types import (
+    DiffusionAccs,
+    DiffusionModelTestOpts,
+    ModelTypeMarker,
+    get_required_device_count,
+)
 from vllm_omni.platforms import current_omni_platform
 
 # These tests are intended to run on L4 GPUs since they test parallelism (i.e., need GPUs),
@@ -32,7 +37,12 @@ from vllm_omni.platforms import current_omni_platform
 MAX_CI_DEVICES = 4
 
 
-def get_test_group_marks(model_name: str, test_group: list[DiffusionAccs] | None, model_marks: list | None) -> list:
+def get_test_group_marks(
+    model_name: str,
+    test_group: list[DiffusionAccs] | None,
+    model_marks: list | None,
+    model_type_marker: ModelTypeMarker,
+) -> list:
     """Build the full set of pytest marks for a test group.
 
     For now, single device groups default to core model, and multi device groups
@@ -40,6 +50,7 @@ def get_test_group_marks(model_name: str, test_group: list[DiffusionAccs] | None
     the max number of GPUs for the CI to prevent accidentally adding configurations that
     would be skipped in the CI."""
     marks = list(model_marks) if model_marks is not None else []
+    marks.append(getattr(pytest.mark, model_type_marker.value))
 
     required_devices = get_required_device_count(test_group)
     if required_devices > MAX_CI_DEVICES:
@@ -83,7 +94,12 @@ def get_model_parametrization(model_name: str, test_info: DiffusionModelTestOpts
             # The divergence check compares generated outputs, which only the offline test does.
             *([] if online else [test_info.check_i2v_t2v_divergence]),
             id=f"{model_name}[{'+'.join(test_group)}]" if test_group else model_name,
-            marks=get_test_group_marks(model_name, test_group, test_info.marks),
+            marks=get_test_group_marks(
+                model_name,
+                test_group,
+                test_info.marks,
+                model_type_marker=test_info.model_type_marker,
+            ),
         )
         for test_group in test_groups
     ]

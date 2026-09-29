@@ -186,6 +186,9 @@ class OmniGPUModelRunner(GPUModelRunner):
         super().add_requests(scheduler_output)
 
     def shutdown(self) -> None:
+        sender = getattr(getattr(self, "model_state", None), "_first_audio_sender", None)
+        if sender is not None:
+            sender.close()
         # Every owner must release its resources even if an earlier drain fails.
         try:
             worker = getattr(self, "_native_output_materializer", None)
@@ -352,6 +355,9 @@ class OmniGPUModelRunner(GPUModelRunner):
         capture_mtp = getattr(getattr(self, "model_state", None), "capture_mtp_graphs", None)
         if callable(capture_mtp):
             capture_mtp(self._dispatch_mtp_batch_descriptor)
+        capture_first_frame = getattr(self.model, "capture_first_frame_graphs", None)
+        if callable(capture_first_frame):
+            capture_first_frame()
         return result
 
     def _dispatch_mtp_batch_descriptor(self, num_mtp_reqs: int) -> Any:

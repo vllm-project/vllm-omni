@@ -48,6 +48,7 @@ from vllm_omni.diffusion.layers.adalayernorm import AdaLayerNorm
 from vllm_omni.diffusion.layers.fused_qk_norm_rope import (
     _fused_cuda_supported,
     fused_qk_norm_rope,
+    fused_qk_norm_rope_min_tokens,
 )
 from vllm_omni.diffusion.layers.qwen_select01_modulation import (
     can_use_qwen_select01_triton,
@@ -58,6 +59,10 @@ from vllm_omni.diffusion.layers.qwen_select01_modulation import (
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 
 logger = init_logger(__name__)
+
+# Fuse only when B*S >= this; below it host launch overhead dominates (#7780).
+# Override: VLLM_OMNI_FUSED_QK_NORM_ROPE_MIN_TOKENS (0 = always fuse).
+_FUSED_MIN_TOKENS = 2048
 
 
 def _qwen_image_qk_norm_rope(
@@ -73,14 +78,19 @@ def _qwen_image_qk_norm_rope(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     head_dim = q.shape[-1]
     rotary_dim = freqs.shape[-1] * 2
-    if use_fused and _fused_cuda_supported(q, k, head_dim, rotary_dim, interleaved=True):
-        batch, seq_len, num_heads, _ = q.shape
+    batch, seq_len, num_heads, _ = q.shape
+    tokens = batch * seq_len
+    if (
+        use_fused
+        and tokens >= fused_qk_norm_rope_min_tokens(_FUSED_MIN_TOKENS)
+        and _fused_cuda_supported(q, k, head_dim, rotary_dim, interleaved=True)
+    ):
         num_kv_heads = k.shape[2]
         rope_table = torch.cat((freqs.real, freqs.imag), dim=-1)
-        rope_table = rope_table.unsqueeze(0).expand(batch, -1, -1).reshape(batch * seq_len, rotary_dim)
+        rope_table = rope_table.unsqueeze(0).expand(batch, -1, -1).reshape(tokens, rotary_dim)
         fused_q, fused_k = fused_qk_norm_rope(
-            q.reshape(batch * seq_len, num_heads, head_dim),
-            k.reshape(batch * seq_len, num_kv_heads, head_dim),
+            q.reshape(tokens, num_heads, head_dim),
+            k.reshape(tokens, num_kv_heads, head_dim),
             norm_q.weight,
             norm_k.weight,
             rope_table,

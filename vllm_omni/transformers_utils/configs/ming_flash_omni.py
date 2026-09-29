@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # Copyright 2025 The vLLM-Omni team.
 # Copyright 2024 ANT Group and the HuggingFace Inc. team. All rights reserved.
 #
@@ -19,7 +20,13 @@
 import os
 from typing import Any, ClassVar
 
-from transformers import AutoConfig, AutoTokenizer, PretrainedConfig, PreTrainedTokenizerFast
+from transformers import (
+    AutoConfig,
+    AutoTokenizer,
+    PretrainedConfig,
+    PreTrainedTokenizerFast,
+    Qwen2_5_VLVisionConfig,
+)
 from transformers.utils import logging
 
 logger = logging.get_logger(__name__)
@@ -251,9 +258,19 @@ class BailingMM2Config(PretrainedConfig):
         **kwargs,
     ):
         self.audio_config = WhisperEncoderConfig(**audio_config) if isinstance(audio_config, dict) else audio_config
-        self.vision_config = (
-            Qwen3VLMoeVisionConfig(**vision_config) if isinstance(vision_config, dict) else vision_config
-        )
+        if isinstance(vision_config, dict):
+            vision_config = dict(vision_config)
+            vision_model_type = vision_config.get("model_type")
+            if vision_model_type in {"qwen2_5_vit", "qwen2_5_vl"}:
+                # 1) Ming-Image uses the Qwen2.5-VL vision tower while
+                # 2) Ming-flash-omni-2.0 uses Qwen3-VL. Keep the composition config shared
+                # and select the concrete tower from ckpt metadata.
+                vision_config.pop("model_type", None)
+                self.vision_config = Qwen2_5_VLVisionConfig(**vision_config)
+            else:
+                self.vision_config = Qwen3VLMoeVisionConfig(**vision_config)
+        else:
+            self.vision_config = vision_config
         self.llm_config = BailingMoeV2Config(**llm_config) if isinstance(llm_config, dict) else llm_config
         self.mlp_depth = mlp_depth
         super().__init__(**kwargs)

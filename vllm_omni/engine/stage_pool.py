@@ -101,12 +101,16 @@ class StagePool:
     DISPATCH_RETRY_INTERVAL_S: float = 0.1
     # Only these EngineCore helpers may skip collective_rpc_async. A generic
     # ``{method}_async`` on AsyncMPClient must not silently drop timeout.
+    _CACHE_RESET_METHODS = frozenset({"reset_prefix_cache", "reset_encoder_cache", "reset_mm_cache"})
     _ENGINE_CORE_CONTROL_ASYNC_METHODS = frozenset(
         {
             "pause_scheduler",
             "resume_scheduler",
             "sleep",
             "wake_up",
+            "reset_prefix_cache",
+            "reset_encoder_cache",
+            "reset_mm_cache",
         }
     )
 
@@ -998,6 +1002,9 @@ class StagePool:
                     "Diffusion list-prompt batch requests are no longer supported. "
                     "Submit multiple independent requests to use scheduler batching."
                 )
+            payload_sender_info = getattr(request, "payload_sender_info", None)
+            if payload_sender_info is not None:
+                submit_kwargs.setdefault("payload_sender_info", payload_sender_info)
             replica_id = await self._pick_or_select(
                 request_id,
                 affinity_request_id=affinity_request_id,
@@ -1050,8 +1057,10 @@ class StagePool:
         request: Any,
         *,
         prompt_text: Any = None,
+        submit_kwargs: dict[str, Any] | None = None,
     ) -> int:
         """Submit a streaming update to an already admitted request."""
+        submit_kwargs = submit_kwargs or {}
         params = req_state.sampling_params_list[self.stage_id]
         if self.stage_type == "diffusion":
             params = OmniDiffusionSamplingParams.from_params(params)
@@ -1069,7 +1078,7 @@ class StagePool:
                     "Diffusion list-prompt batch requests are no longer supported. "
                     "Submit multiple independent requests to use scheduler batching."
                 )
-            await self._diffusion_client(replica_id).add_request_async(request_id, request, params)
+            await self._diffusion_client(replica_id).add_request_async(request_id, request, params, **submit_kwargs)
         else:
             # Refresh the shared output-processor state before yielding to the
             # stage client so streaming segments are merged against the latest
@@ -1082,7 +1091,7 @@ class StagePool:
                     request_index=0,
                     queue=None,
                 )
-                await self._llm_client(replica_id).add_request_async(request)
+                await self._llm_client(replica_id).add_request_async(request, **submit_kwargs)
             except Exception:
                 rollback = getattr(self.output_processor, "remove_request", None)
                 if callable(rollback):
@@ -1325,6 +1334,8 @@ class StagePool:
                     if timeout is not None:
                         return await asyncio.wait_for(result, timeout=timeout)
                     return await result
+                if method in self._CACHE_RESET_METHODS:
+                    return {"supported": False, "error": f"EngineCore helper {method}_async is unavailable"}
 
             return await client.collective_rpc_async(
                 method=method,
@@ -1339,7 +1350,7 @@ class StagePool:
                 replica_id,
                 method,
             )
-            if method in self._ENGINE_CORE_CONTROL_ASYNC_METHODS:
+            if method in self._ENGINE_CORE_CONTROL_ASYNC_METHODS and method not in self._CACHE_RESET_METHODS:
                 raise
             if isinstance(exc, TimeoutError):
                 error = f"{type(exc).__name__}: {method} timed out after {timeout}s"

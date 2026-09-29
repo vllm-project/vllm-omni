@@ -6,17 +6,16 @@ import asyncio
 import base64
 import json
 import math
-import uuid
 import wave
 from collections.abc import Sequence
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import numpy as np
 from scipy.signal import resample_poly
 
-from vllm_omni.experimental.fullduplex.client import RealtimeDuplexClient, wait_for, write_pcm16_wav
+from vllm_omni.clients.duplex import DuplexClient, EventCollector, wait_for_condition, write_pcm16_wav
+from vllm_omni.clients.nemotron_voicechat import create_duplex_session_config
 
 INPUT_SAMPLE_RATE_HZ = 16_000
 OUTPUT_SAMPLE_RATE_HZ = 22_050
@@ -45,13 +44,6 @@ DEFAULT_FUNCTION_INSTRUCTIONS = (
 )
 
 
-def _url(base_url: str, model: str, session_id: str) -> str:
-    parts = urlsplit(base_url)
-    query = dict(parse_qsl(parts.query, keep_blank_values=True))
-    query.update(duplex="1", model=model, autostart="0", session_id=session_id)
-    return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
-
-
 def _read_wav(path: Path, *, input_channel: int = 0) -> np.ndarray:
     with wave.open(str(path), "rb") as wav_file:
         channels = wav_file.getnchannels()
@@ -73,50 +65,42 @@ def _read_wav(path: Path, *, input_channel: int = 0) -> np.ndarray:
     return np.ascontiguousarray(pcm, dtype="<f4")
 
 
-async def _stream(client: RealtimeDuplexClient, pcm: np.ndarray, *, max_frames: int | None, realtime: bool) -> int:
+async def _stream(client: DuplexClient, pcm: np.ndarray, *, max_frames: int | None, realtime: bool) -> int:
     count = math.ceil(pcm.size / FRAME_SAMPLES)
     if max_frames is not None:
         count = min(count, max_frames)
     for seq in range(count):
         frame = pcm[seq * FRAME_SAMPLES : (seq + 1) * FRAME_SAMPLES]
         frame = np.pad(frame, (0, FRAME_SAMPLES - frame.size)).astype("<f4")
-        await client.send(
-            {
-                "type": "input_audio_buffer.append",
-                "audio": base64.b64encode(frame).decode("ascii"),
-                "format": "pcm_f32le",
-                "sample_rate_hz": INPUT_SAMPLE_RATE_HZ,
-                "duration_ms": 80,
-                "audio_end_ms": (seq + 1) * 80,
-            }
-        )
+        await client.append_audio(frame.tobytes())
         if realtime:
             await asyncio.sleep(FRAME_PERIOD_S)
     return count
 
 
-def _events(client: RealtimeDuplexClient, event_type: str) -> list[dict[str, object]]:
-    return [event for event in client.events.events if event.get("type") == event_type]
+def _events(collector: EventCollector, event_type: str) -> list[dict[str, object]]:
+    return [event for event in collector.events if event.get("type") == event_type]
 
 
 async def _return_function_output_when_ready(
-    client: RealtimeDuplexClient,
+    client: DuplexClient,
+    collector: EventCollector,
     *,
     output: str,
     timeout_s: float,
 ) -> tuple[str, int]:
-    await wait_for(
-        lambda: bool(client.events.errors()) or client.events.count("response.function_call_arguments.done") > 0,
+    await wait_for_condition(
+        lambda: bool(collector.errors()) or collector.count("response.function_call_arguments.done") > 0,
         timeout_s=timeout_s,
         label="function call to execute",
     )
-    if client.events.errors():
-        raise AssertionError(f"function call failed before tool execution: {client.events.errors()}")
-    function_done = _events(client, "response.function_call_arguments.done")[-1]
+    if collector.errors():
+        raise AssertionError(f"function call failed before tool execution: {collector.errors()}")
+    function_done = _events(collector, "response.function_call_arguments.done")[-1]
     call_id = function_done.get("call_id")
     if not isinstance(call_id, str) or not call_id:
         raise AssertionError(f"completed function call has no call_id: {function_done}")
-    event_count_before_output = len(client.events.events)
+    event_count_before_output = len(collector.events)
     await client.send(
         {
             "type": "conversation.item.create",
@@ -130,22 +114,26 @@ async def _return_function_output_when_ready(
     return call_id, event_count_before_output
 
 
-def _write_events(path: Path, client: RealtimeDuplexClient) -> None:
+def _write_events(path: Path, collector: EventCollector) -> None:
     path.write_text(
-        "".join(json.dumps(event, ensure_ascii=False) + "\n" for event in client.events.events),
+        "".join(json.dumps(event, ensure_ascii=False) + "\n" for event in collector.events),
         encoding="utf-8",
     )
 
 
 @asynccontextmanager
-async def _managed_client(client: RealtimeDuplexClient, *, timeout_s: float):
-    async with client:
-        try:
+async def _managed_client(client: DuplexClient, collector: EventCollector):
+    consume_task = asyncio.create_task(collector.consume(client))
+    # Subscribe before the handshake so the collector sees session.created.
+    await asyncio.sleep(0)
+    try:
+        async with client:
             yield
-        finally:
-            if client.events.count("session.created") and not client.events.count("session.closed"):
-                with suppress(Exception):
-                    await client.close_session(timeout_s=min(timeout_s, 30.0))
+        await consume_task
+    finally:
+        consume_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await consume_task
 
 
 async def run(args: argparse.Namespace) -> dict[str, object]:
@@ -156,33 +144,22 @@ async def run(args: argparse.Namespace) -> dict[str, object]:
     else:
         instructions = args.instructions
     tools = DEFAULT_FUNCTION_TOOLS if args.expect_function_call else None
-    session_id = f"nemotron-voicechat-{uuid.uuid4().hex}"
-    client = RealtimeDuplexClient(_url(args.url, args.model, session_id))
-    async with _managed_client(client, timeout_s=args.timeout_s):
-        session_payload: dict[str, object] = {
-            "session_id": session_id,
-            "model": args.model,
-            "modalities": ["audio", "text"],
-            "input_audio_format": "pcm_f32le",
-            "output_audio_format": "pcm16",
-            "instructions": instructions,
-            "idle_timeout_s": args.timeout_s,
-            "turn_detection": None,
-            "extra_body": {"auto_response": True},
-        }
-        if tools is not None:
-            session_payload["tools"] = tools
-        await client.send({"type": "session.update", "session": session_payload})
-        await wait_for(
-            lambda: client.events.count("session.created") > 0 or bool(client.events.errors()),
-            timeout_s=args.timeout_s,
-            label="session.created",
-        )
-        if client.events.errors():
-            raise AssertionError(f"session setup failed: {client.events.errors()}")
-        created = _events(client, "session.created")[-1]
-        session = created.get("session")
-        capabilities = session.get("capabilities") if isinstance(session, dict) else None
+    collector = EventCollector()
+    client = DuplexClient(
+        args.url,
+        model=args.model,
+        config=create_duplex_session_config(
+            instructions=instructions,
+            tools=tools,
+            idle_timeout_s=args.timeout_s,
+        ),
+        handshake_timeout_s=args.timeout_s,
+        reconnect=None,
+        heartbeat_interval_s=None,
+    )
+    async with _managed_client(client, collector):
+        session_id = client.session_id
+        capabilities = client.session_info.get("capabilities")
         expected = dict(
             implementation_level="model_native_duplex",
             chunk_period_ms=80,
@@ -197,6 +174,7 @@ async def run(args: argparse.Namespace) -> dict[str, object]:
             asyncio.create_task(
                 _return_function_output_when_ready(
                     client,
+                    collector,
                     output=args.function_output,
                     timeout_s=args.timeout_s,
                 )
@@ -206,19 +184,19 @@ async def run(args: argparse.Namespace) -> dict[str, object]:
         )
         pcm = _read_wav(Path(args.input_wav), input_channel=args.input_channel)
         frame_count = await _stream(client, pcm, max_frames=args.max_frames, realtime=not args.no_realtime)
-        completed_responses_at_commit = client.events.count("response.done")
-        await client.send({"type": "input_audio_buffer.commit", "final": True})
-        await wait_for(
+        completed_responses_at_commit = collector.count("response.done")
+        await client.commit()
+        await wait_for_condition(
             lambda: (
-                bool(client.events.errors())
+                bool(collector.errors())
                 or (
-                    client.events.count("response.function_call_arguments.done") > 0
+                    collector.count("response.function_call_arguments.done") > 0
                     if args.expect_function_call
                     else (
-                        client.events.count("response.output_audio.delta") >= args.minimum_audio_chunks
+                        collector.count("response.output_audio.delta") >= args.minimum_audio_chunks
                         and (
                             args.allow_incomplete_response
-                            or client.events.count("response.done") > completed_responses_at_commit
+                            or collector.count("response.done") > completed_responses_at_commit
                         )
                     )
                 )
@@ -227,9 +205,9 @@ async def run(args: argparse.Namespace) -> dict[str, object]:
             label="model output",
         )
         await asyncio.sleep(args.drain_s)
-        if client.events.errors():
-            raise AssertionError(f"Realtime session emitted errors: {client.events.errors()}")
-        done_events = _events(client, "response.done")
+        if collector.errors():
+            raise AssertionError(f"Realtime session emitted errors: {collector.errors()}")
+        done_events = _events(collector, "response.done")
         if not args.expect_function_call and not args.allow_incomplete_response:
             response = done_events[-1].get("response") if done_events else None
             status = response.get("status") if isinstance(response, dict) else None
@@ -237,24 +215,22 @@ async def run(args: argparse.Namespace) -> dict[str, object]:
                 raise AssertionError(f"response did not complete successfully: {done_events[-1:]}")
 
         function_events = [
-            event for event in client.events.events if str(event.get("type", "")).startswith("response.function_call")
+            event for event in collector.events if str(event.get("type", "")).startswith("response.function_call")
         ]
         function_items = [
-            event
-            for event in _events(client, "response.output_item.done")
-            if isinstance(event.get("item"), dict) and event["item"].get("type") == "function_call"
+            item
+            for event in _events(collector, "response.output_item.done")
+            if isinstance((item := event.get("item")), dict) and item.get("type") == "function_call"
         ]
         if args.expect_function_call and not any(
             event.get("type") == "response.function_call_arguments.done" for event in function_events
         ):
             raise AssertionError(f"no completed function call: {function_events}")
         if args.expect_function_call:
-            matching_items = [
-                event for event in function_items if event["item"].get("name") == args.expected_function_name
-            ]
+            matching_items = [item for item in function_items if item.get("name") == args.expected_function_name]
             if not matching_items:
                 raise AssertionError(f"expected {args.expected_function_name!r}, got {function_items}")
-            function_item = matching_items[-1]["item"]
+            function_item: dict[str, object] = matching_items[-1]
             try:
                 function_arguments = json.loads(str(function_item.get("arguments", "")))
             except json.JSONDecodeError as exc:
@@ -275,7 +251,7 @@ async def run(args: argparse.Namespace) -> dict[str, object]:
                 assert returned_call_id == call_id
 
                 def tool_result_completed() -> bool:
-                    later = client.events.events[event_count_before_output:]
+                    later = collector.events[event_count_before_output:]
                     transcript = "".join(
                         str(event.get("delta", ""))
                         for event in later
@@ -287,23 +263,23 @@ async def run(args: argparse.Namespace) -> dict[str, object]:
                         and (args.expected_post_tool_text is None or args.expected_post_tool_text.lower() in transcript)
                     )
 
-                await wait_for(
-                    lambda: bool(client.events.errors()) or tool_result_completed(),
+                await wait_for_condition(
+                    lambda: bool(collector.errors()) or tool_result_completed(),
                     timeout_s=args.timeout_s,
                     label="completed response after function output",
                 )
-                if client.events.errors():
-                    raise AssertionError(f"function output failed: {client.events.errors()}")
+                if collector.errors():
+                    raise AssertionError(f"function output failed: {collector.errors()}")
                 await asyncio.sleep(args.drain_s)
 
-        audio = client.events.audio_bytes()
-        audio_events = _events(client, "response.output_audio.delta")
+        audio = collector.audio_bytes()
+        audio_events = _events(collector, "response.output_audio.delta")
         rates = {event.get("sample_rate_hz") for event in audio_events}
         if not args.expect_function_call and audio and rates != {OUTPUT_SAMPLE_RATE_HZ}:
             raise AssertionError(f"unexpected output sample rates: {rates}")
         if not args.expect_function_call and args.minimum_audio_chunks and not audio:
             raise AssertionError("model produced no audio")
-        expected_bytes = 2 * OUTPUT_SAMPLE_RATE_HZ * expected["chunk_period_ms"] // 1000
+        expected_bytes = 2 * OUTPUT_SAMPLE_RATE_HZ * int(str(expected["chunk_period_ms"])) // 1000
         packet_sizes = [len(base64.b64decode(str(event.get("delta", "")), validate=True)) for event in audio_events]
         if not args.expect_function_call and any(size != expected_bytes for size in packet_sizes):
             raise AssertionError(f"audio deltas are not fixed 80 ms PCM16 packets: {packet_sizes}")
@@ -314,17 +290,17 @@ async def run(args: argparse.Namespace) -> dict[str, object]:
                 f"model output RMS {audio_rms:.6f} is below {args.minimum_audio_rms:.6f}; "
                 "received packets contain only silence"
             )
-    _write_events(output_dir / "events.jsonl", client)
+    _write_events(output_dir / "events.jsonl", collector)
     if audio:
         write_pcm16_wav(output_dir / "output.wav", audio, sample_rate_hz=OUTPUT_SAMPLE_RATE_HZ)
-    result = {
+    result: dict[str, object] = {
         "ok": True,
-        "session_id": session_id,
+        "session_id": session_id if isinstance(session_id, str) else None,
         "input_frames": frame_count,
         "capabilities": capabilities,
         "event_counts": {
-            event_type: client.events.count(event_type)
-            for event_type in sorted({str(event.get("type")) for event in client.events.events})
+            event_type: collector.count(event_type)
+            for event_type in sorted({str(event.get("type")) for event in collector.events})
         },
         "audio_bytes": len(audio),
         "audio_rms": audio_rms,
