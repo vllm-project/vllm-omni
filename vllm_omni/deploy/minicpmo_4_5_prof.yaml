@@ -178,7 +178,7 @@ platforms:
         # two stage-2 replicas on this card.
         kv_cache_memory_bytes: 2684354560
         compilation_config:
-          cudagraph_mode: PIECEWISE
+          cudagraph_mode: FULL_DECODE_ONLY
       - stage_id: 2
         max_num_seqs: 8
         # Stage 2 stays outer-eager and captures only exact-shape CFM DiT
