@@ -1941,26 +1941,6 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
         decode_batch_size = len(decode_req_ids)
         if decode_batch_size == 0:
             return
-        _cudagraph_mode, batch_desc, _, _, _ = self._determine_batch_execution_and_padding(
-            num_tokens=decode_batch_size,
-            num_reqs=decode_batch_size,
-            num_scheduled_tokens_np=np.ones(decode_batch_size, dtype=np.int32),
-            max_num_scheduled_tokens=1,
-            use_cascade_attn=False,
-        )
-        # Force eager for unwrapped code predictors (AR loops / multinomial).
-        # When talker_mtp is not wrapped by the platform's full-graph wrapper,
-        # it manages its own device graphs internally (code_predictor has its
-        # own bucket sizes).
-        if not isinstance(self.talker_mtp, current_omni_platform.get_graph_wrapper_cls()):
-            _cudagraph_mode = CUDAGraphMode.NONE
-            num_tokens_padded = decode_batch_size
-        else:
-            num_tokens_padded = batch_desc.num_tokens
-        req_input_ids = self.talker_mtp_input_ids.gpu[:num_tokens_padded]
-        req_embeds = self.talker_mtp_inputs_embeds.gpu[:num_tokens_padded]
-        last_talker_hidden = self.last_talker_hidden.gpu[:num_tokens_padded]
-        text_step = self.text_step.gpu[:num_tokens_padded]
         subtalker_params = getattr(self.vllm_config.model_config, "subtalker_sampling_params", None)
         if not isinstance(subtalker_params, dict):
             subtalker_params = {}
@@ -1973,6 +1953,8 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
                 seed = extra_args.get("tts_local_seed")
             return int(seed) if seed is not None else None
 
+        buffer_device = self.talker_mtp_input_ids.gpu.device
+
         def _row_generator(req_id: str) -> torch.Generator | None:
             seed = _explicit_talker_seed(req_id)
             if seed is None:
@@ -1982,8 +1964,8 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
                 cache = {}
                 self._talker_mtp_generators = cache
             generator = cache.get(req_id)
-            if generator is None or generator.device != req_input_ids.device:
-                generator = torch.Generator(device=req_input_ids.device)
+            if generator is None or generator.device != buffer_device:
+                generator = torch.Generator(device=buffer_device)
                 generator.manual_seed(seed)
                 cache[req_id] = generator
             return generator
@@ -1994,6 +1976,32 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
             # Generators live as long as their request; drop finished ones.
             for stale_id in [rid for rid in cache if rid not in self.requests]:
                 del cache[stale_id]
+
+        _cudagraph_mode, batch_desc, _, _, _ = self._determine_batch_execution_and_padding(
+            num_tokens=decode_batch_size,
+            num_reqs=decode_batch_size,
+            num_scheduled_tokens_np=np.ones(decode_batch_size, dtype=np.int32),
+            max_num_scheduled_tokens=1,
+            use_cascade_attn=False,
+        )
+        # Force eager for unwrapped code predictors (AR loops / multinomial).
+        # When talker_mtp is not wrapped by the platform's full-graph wrapper,
+        # it manages its own device graphs internally (code_predictor has its
+        # own bucket sizes). Any batch that carries explicit per-row seeds
+        # (generators) must also run eagerly: a graph wrapper only replays a
+        # previously captured device graph and never re-executes the Python
+        # talker_mtp, so the per-row generators would be silently ignored.
+        if not isinstance(self.talker_mtp, current_omni_platform.get_graph_wrapper_cls()) or any(
+            generator is not None for generator in row_generators
+        ):
+            _cudagraph_mode = CUDAGraphMode.NONE
+            num_tokens_padded = decode_batch_size
+        else:
+            num_tokens_padded = batch_desc.num_tokens
+        req_input_ids = self.talker_mtp_input_ids.gpu[:num_tokens_padded]
+        req_embeds = self.talker_mtp_inputs_embeds.gpu[:num_tokens_padded]
+        last_talker_hidden = self.last_talker_hidden.gpu[:num_tokens_padded]
+        text_step = self.text_step.gpu[:num_tokens_padded]
 
         if (
             decode_batch_size > 1

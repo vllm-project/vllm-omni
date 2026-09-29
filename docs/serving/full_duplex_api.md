@@ -5,7 +5,7 @@ continue receiving speech while producing speech. It adds persistent session
 state, model-specific turn policy, overlap handling, playback acknowledgement,
 and optional session resume.
 
-Full duplex is distinct from the turn-based [Realtime Audio API](realtime_api.md).
+Full duplex is distinct from the turn-based [Realtime Audio API](realtime_openai_duplex_api.md).
 
 This page is the endpoint overview. For the complete wire contract, the
 `vllm_omni.clients.duplex.DuplexClient` Python library, and the per-model
