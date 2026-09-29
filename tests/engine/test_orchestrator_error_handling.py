@@ -519,6 +519,40 @@ async def test_async_chunk_prewarm_without_prompt_token_ids_fails_only_that_requ
             orchestrator_fixture.thread.join(timeout=5)
 
 
+@pytest.mark.asyncio
+async def test_streaming_input_to_mrv2_downstream_stage_fails_with_client_error(orchestrator_factory) -> None:
+    """A downstream MRv2 native-data-plane stage supports turn-based requests
+    only: a resumable (realtime) request must fail up front, not hang."""
+    stage0 = FakeStageClient(stage_type="llm", final_output=False)
+    stage1 = FakeStageClient(stage_type="llm", final_output=True)
+    v1 = SimpleNamespace(model_config=SimpleNamespace(max_model_len=64))
+    mrv2 = SimpleNamespace(
+        model_config=SimpleNamespace(max_model_len=64, use_v2_model_runner=True, supports_native_mrv2_data_plane=True)
+    )
+    fixture = orchestrator_factory([stage0, stage1], stage_vllm_configs=[v1, mrv2], async_chunk=True)
+
+    try:
+        await _enqueue_add_request(
+            fixture,
+            request_id="req-stream",
+            prompt=SimpleNamespace(request_id="req-stream", prompt_token_ids=[1, 2], resumable=True),
+            original_prompt={"prompt": "stream"},
+            sampling_params_list=[_sampling_params(), _sampling_params()],
+            final_stage_id=1,
+        )
+
+        error_msg = await _wait_for_error_message(fixture, request_id="req-stream")
+        assert error_msg.fatal is False
+        assert error_msg.status_code == 400
+        assert "stage 1 runs on model_runner v2" in error_msg.error
+        assert stage0.add_request_calls == [] and stage1.add_request_calls == []
+        assert fixture.thread.is_alive()
+    finally:
+        if fixture.thread.is_alive():
+            fixture.request_sync_q.put_nowait(ShutdownRequestMessage())
+            fixture.thread.join(timeout=5)
+
+
 # ───────── Direct unit tests for the fault-isolation helpers ─────────
 
 

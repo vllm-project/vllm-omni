@@ -41,6 +41,7 @@ from vllm_omni.model_executor.layers.rotary_embedding.mrope import OmniMRotaryEm
 from vllm_omni.model_executor.models.model_local_kv import collect_model_local_kv_specs
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.platforms import current_omni_platform
+from vllm_omni.utils.device_copy import index_to_device
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
@@ -210,6 +211,32 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
         self._init_talker_mtp()
         self._prewarm_attention_capture_workspaces()
         self._report_model_local_kv()
+        self._warn_unexposed_stage_hooks(model)
+
+    # Read on the model this runner holds. A multi-stage wrapper that builds its
+    # stage module as a child must re-export them, or the runner silently takes
+    # the per-row, host-synchronizing default paths.
+    _STAGE_HOOKS = ("gpu_resident_buffer_keys", "preprocess_decode_batch", "use_async_omni_output")
+
+    @classmethod
+    def _warn_unexposed_stage_hooks(cls, model: Any) -> None:
+        if model is None or not hasattr(model, "named_children"):
+            return
+        for child_name, child in model.named_children():
+            missing = [
+                hook
+                for hook in cls._STAGE_HOOKS
+                if getattr(child, hook, None) not in (None, False) and getattr(model, hook, None) in (None, False)
+            ]
+            if missing:
+                logger.warning(
+                    "%s.%s defines %s but %s does not expose them; the runner reads these on %s.",
+                    type(model).__name__,
+                    child_name,
+                    ", ".join(missing),
+                    type(model).__name__,
+                    type(model).__name__,
+                )
 
     def _report_model_local_kv(self) -> None:
         """Log attention KV this model holds outside the paged manager.
@@ -1653,6 +1680,21 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
             device=device,
         )
 
+    def _embed_multimodal_input_ids(self, num_scheduled_tokens, mm_embeds, is_mm_embed):
+        embedding_kwargs = {}
+        if mm_embeds and getattr(self.model, "supports_embed_input_ids_query_start_loc", False):
+            # The batch has already been reordered. Read host-owned boundaries
+            # so model prompt rearrangement does not assume a request order or
+            # introduce a GPU-to-host transfer on every decode step.
+            num_reqs = self.input_batch.num_reqs
+            embedding_kwargs["query_start_loc"] = self.query_start_loc.cpu[: num_reqs + 1].tolist()
+        return self.model.embed_input_ids(
+            self.input_ids.gpu[:num_scheduled_tokens],
+            multimodal_embeddings=mm_embeds,
+            is_multimodal=is_mm_embed,
+            **embedding_kwargs,
+        )
+
     def _preprocess(
         self,
         scheduler_output: "SchedulerOutput",
@@ -1689,11 +1731,7 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
             # NOTE(woosuk): To unify token ids and soft tokens (vision
             # embeddings), we always use embeddings (rather than token ids)
             # as input to the multimodal model, even when the input is text.
-            inputs_embeds_scheduled = self.model.embed_input_ids(
-                self.input_ids.gpu[:num_scheduled_tokens],
-                multimodal_embeddings=mm_embeds,
-                is_multimodal=is_mm_embed,
-            )
+            inputs_embeds_scheduled = self._embed_multimodal_input_ids(num_scheduled_tokens, mm_embeds, is_mm_embed)
 
             # TODO(woosuk): Avoid the copy. Optimize.
             self.inputs_embeds.gpu[:num_scheduled_tokens].copy_(inputs_embeds_scheduled)
@@ -1866,7 +1904,8 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
                         dtype=req_embeds.dtype,
                     )
 
-                offsets_t = torch.tensor(start_offsets_b, device=req_embeds.device, dtype=torch.long)
+                # A pageable H2D here would sync the host every decode step.
+                offsets_t = index_to_device(start_offsets_b, req_embeds.device)
                 inputs_embeds.index_copy_(0, offsets_t, req_embeds)
                 preprocess_input_ids.index_copy_(
                     0,

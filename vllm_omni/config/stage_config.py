@@ -18,6 +18,7 @@ from vllm.logger import init_logger
 from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
 
 from vllm_omni.config.endpoint_policy import EndpointRestriction
+from vllm_omni.config.speech_cache import SpeechCacheConfig
 from vllm_omni.config.yaml_util import create_config, load_yaml_config, to_dict
 from vllm_omni.core.sched.omni_ar_scheduler import OmniARAsyncScheduler, OmniARScheduler
 from vllm_omni.core.sched.omni_generation_scheduler import OmniGenerationScheduler
@@ -402,6 +403,9 @@ class StageDeployConfig:
 
     # False opts this stage out of pipeline-wide async chunking.
     async_chunk: bool | None = None
+    # Overrides the deploy-level ``model_runner`` for this stage, so a pipeline
+    # can run e.g. its LLM stage on v1 and its codec stages on MRv2.
+    model_runner: Literal["v1", "v2"] | None = None
 
     # Inter-stage connector wiring and request defaults.
     output_connectors: dict[str, str] | None = None
@@ -585,6 +589,7 @@ class DeployConfig:
     # Experimental local NVIDIA MPS; disabled unless a deploy explicitly opts in.
     cuda_mps: bool = False
     duplex_session: DuplexSessionRuntimeConfig = field(default_factory=DuplexSessionRuntimeConfig)
+    speech_cache: SpeechCacheConfig = field(default_factory=SpeechCacheConfig)
     connectors: dict[str, Any] | None = None
     edges: list[dict[str, Any]] | None = None
     stages: list[StageDeployConfig] = field(default_factory=list)
@@ -607,6 +612,7 @@ class DeployConfig:
 _STAGE_RESERVED_KEYS = frozenset(
     {
         "async_chunk",
+        "model_runner",
         "stage_id",
         "devices",
         "num_replicas",
@@ -655,6 +661,9 @@ def _parse_stage_deploy(stage_data: dict[str, Any]) -> StageDeployConfig:
             else:
                 flat_args[k] = v
 
+    stage_runner = stage_data.get("model_runner")
+    if stage_runner is not None and stage_runner not in ("v1", "v2"):
+        raise ValueError(f"stage {stage_data['stage_id']}: model_runner must be 'v1' or 'v2', got {stage_runner!r}")
     kwargs: dict[str, Any] = {
         "stage_id": stage_data["stage_id"],
         "devices": devices,
@@ -666,6 +675,7 @@ def _parse_stage_deploy(stage_data: dict[str, Any]) -> StageDeployConfig:
             kwargs[name] = flat_args.pop(name)
 
     kwargs["async_chunk"] = stage_data.get("async_chunk")
+    kwargs["model_runner"] = stage_runner
     kwargs["output_connectors"] = stage_data.get("output_connectors")
     kwargs["input_connectors"] = stage_data.get("input_connectors")
     kwargs["default_sampling_params"] = stage_data.get("default_sampling_params")
@@ -685,16 +695,20 @@ _DEEP_MERGE_KEYS = frozenset(
 )
 
 
+_DEPLOY_DEEP_MERGE_KEYS = frozenset({"speech_cache"})
+
+
+def _merge_config_fields(base: dict, overlay: dict, *, deep_merge_keys: frozenset[str]) -> dict:
+    """Recursively merge selected fields; overlay replaces all other fields."""
+    base_nested = {k: v for k, v in base.items() if k in deep_merge_keys}
+    overlay_nested = {k: v for k, v in overlay.items() if k in deep_merge_keys}
+    merged_nested = _get_recursively_merged_dict(original=base_nested, update=overlay_nested)
+    return {**base, **overlay, **merged_nested}
+
+
 def _deep_merge_stage(base: dict, overlay: dict) -> dict:
     """Deep-merge ``_DEEP_MERGE_KEYS`` so thin overlays don't drop base keys."""
-    # Deep merge _DEEP_MERGE_KEYS recursively
-    base_merge_dict = {k: v for k, v in base.items() if k in _DEEP_MERGE_KEYS}
-    overlay_merge_dict = {k: v for k, v in overlay.items() if k in _DEEP_MERGE_KEYS}
-
-    # Get the merge dict; priority is base < overlay < merged sub
-    merged_subdict = _get_recursively_merged_dict(original=base_merge_dict, update=overlay_merge_dict)
-    merged_dict = {**base, **overlay, **merged_subdict}
-    return merged_dict
+    return _merge_config_fields(base, overlay, deep_merge_keys=_DEEP_MERGE_KEYS)
 
 
 def _get_recursively_merged_dict(original: dict, update: dict) -> dict:
@@ -776,10 +790,11 @@ def resolve_deploy_yaml(path: str | Path) -> dict[str, Any]:
 
     # Merge top-level scalars: overlay wins. Structured sections are merged
     # below so a thin overlay does not discard inherited runtime contracts.
-    merged = {
-        **base_dict,
-        **{k: v for k, v in raw_dict.items() if k not in ("connectors", "stages", "platforms")},
-    }
+    merged = _merge_config_fields(
+        base_dict,
+        {k: v for k, v in raw_dict.items() if k not in ("connectors", "stages", "platforms")},
+        deep_merge_keys=_DEPLOY_DEEP_MERGE_KEYS,
+    )
     merged_connectors = _merge_connectors(base_dict.get("connectors"), raw_dict.get("connectors"))
     if merged_connectors is not None:
         merged["connectors"] = merged_connectors
@@ -850,6 +865,9 @@ def load_deploy_config(path: str | Path) -> DeployConfig:
             "define topology in PipelineConfig and deployment overrides under `stages`."
         )
 
+    speech_cache = raw_dict.get("speech_cache", {})
+    if not isinstance(speech_cache, dict):
+        raise ValueError("speech_cache must be a mapping")
     stages = [_parse_stage_deploy(s) for s in raw_dict.get("stages", [])]
     _record_talker_frames(stages, raw_dict.get("platforms"))
 
@@ -861,6 +879,7 @@ def load_deploy_config(path: str | Path) -> DeployConfig:
         raise ValueError("cuda_mps must be a boolean")
 
     kwargs: dict[str, Any] = {
+        "speech_cache": SpeechCacheConfig(**speech_cache),
         "cuda_mps": raw_dict.get("cuda_mps", False),
         "async_chunk": raw_dict.get("async_chunk", True),
         "session_mode": raw_dict.get("session_mode", "turn"),
@@ -929,17 +948,12 @@ def _apply_platform_overrides(
         if model_runner not in ("v1", "v2"):
             raise ValueError(f"platform model_runner must be one of ('v1', 'v2'), got {model_runner!r}")
         deploy.model_runner = model_runner
-    if deploy.model_runner == "v2" and platform in {"npu", "xpu"}:
-        raise NotImplementedError(
-            f"Model Runner V2 is not supported on {platform.upper()}: "
-            "the platform worker still uses the legacy chunk-transfer data plane."
-        )
-    if platform is None or deploy.platforms is None:
-        return deploy
-    if platform_section is None:
-        return deploy
-
-    platform_stages = platform_section.get("stages", [])
+        if model_runner == "v1":
+            # A platform's V1 fallback also covers stages that opt into V2.
+            for stage in deploy.stages:
+                if stage.model_runner == "v2":
+                    stage.model_runner = None
+    platform_stages = platform_section.get("stages", []) if platform_section else []
     base_by_id = {s.stage_id: s for s in deploy.stages}
 
     for ps in platform_stages:
@@ -975,6 +989,18 @@ def _apply_platform_overrides(
             else:
                 base.engine_extras[key] = val
 
+    # Validate the final values, including stage entries from the platform
+    # overlay. A global V2 default may still apply to omitted pipeline stages.
+    for stage in deploy.stages:
+        if stage.model_runner is not None and stage.model_runner not in ("v1", "v2"):
+            raise ValueError(f"stage {stage.stage_id}: model_runner must be 'v1' or 'v2', got {stage.model_runner!r}")
+    uses_v2 = deploy.model_runner == "v2" or any(stage.model_runner == "v2" for stage in deploy.stages)
+    if uses_v2 and platform in {"npu", "xpu"}:
+        raise NotImplementedError(
+            f"Model Runner V2 is not supported on {platform.upper()}: "
+            "the platform worker still uses the legacy chunk-transfer data plane."
+        )
+
     return deploy
 
 
@@ -990,6 +1016,28 @@ def _resolve_execution_mode(
 ) -> tuple[StageType, str | None]:
     """Map ``execution_type`` → ``(stage_type, worker_type)`` legacy tuple."""
     return _EXECUTION_TYPE_TO_STAGE_WORKER.get(execution_type, (StageType.LLM, None))
+
+
+def resolve_stage_model_runner(deploy: DeployConfig, stage: StageDeployConfig | None) -> str:
+    """The stage's own ``model_runner`` if set, else the deploy-level one."""
+    runner = getattr(stage, "model_runner", None) if stage is not None else None
+    return runner or deploy.model_runner
+
+
+def validate_native_mrv2_session(deploy: DeployConfig, ps: StagePipelineConfig, stage_runner: str) -> None:
+    """Reject session modes a downstream MRv2 native-data-plane stage lacks.
+
+    Streaming-session prompt replacement exists only in the V1 chunk adapter,
+    so a stage that receives from an upstream stage on MRv2 supports
+    turn-based sessions only.
+    """
+    if stage_runner != "v2" or not ps.supports_native_mrv2_data_plane or not ps.input_sources:
+        return
+    if deploy.session_mode != "turn":
+        raise ValueError(
+            f"stage {ps.stage_id}: model_runner v2 supports session_mode 'turn' only, got "
+            f"{deploy.session_mode!r}; run this stage with model_runner: v1 for streaming sessions."
+        )
 
 
 def resolve_stage_async_chunk(deploy: DeployConfig, stage: StageDeployConfig | None) -> bool:
@@ -1116,9 +1164,11 @@ def _build_engine_args(
                     "it is derived from the deploy-level `model_runner` field and the "
                     "pipeline's `supports_native_mrv2_data_plane` declaration."
                 )
-    engine_args["use_v2_model_runner"] = deploy.model_runner == "v2"
+    stage_runner = resolve_stage_model_runner(deploy, ds)
+    validate_native_mrv2_session(deploy, ps, stage_runner)
+    engine_args["use_v2_model_runner"] = stage_runner == "v2"
     engine_args["supports_native_mrv2_data_plane"] = bool(ps.supports_native_mrv2_data_plane)
-    if deploy.model_runner == "v2" and not ps.supports_native_mrv2_data_plane:
+    if stage_runner == "v2" and not ps.supports_native_mrv2_data_plane:
         logger.warning(
             "Stage %s (%s) selects model_runner=v2 without declaring "
             "supports_native_mrv2_data_plane. It will use the legacy transport path; "

@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 import math
+from dataclasses import dataclass
 from typing import Annotated, Any, Literal
 
 import numpy as np
-from pydantic import AliasChoices, BaseModel, Field, field_validator, model_validator
+from pydantic import AliasChoices, BaseModel, Field, PrivateAttr, field_validator, model_validator
 
 # Bound int request fields to avoid overflow issues.
 _INT64_MIN = -(2**63)
@@ -55,7 +56,19 @@ def _normalize_speaker_embedding_value(value):
     return [float(x) for x in value]
 
 
+@dataclass(frozen=True)
+class RegisteredVoiceReference:
+    """Server-only snapshot of an uploaded audio generation."""
+
+    name: str
+    created_at: int
+    file_path: str
+    ref_text: str | None
+
+
 class OpenAICreateSpeechRequest(BaseModel):
+    _registered_voice_reference: RegisteredVoiceReference | None = PrivateAttr(default=None)
+
     input: str
     model: str | None = None
     # Accept both "voice" (OpenAI convention) and "speaker" (model/internal
