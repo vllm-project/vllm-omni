@@ -156,9 +156,13 @@ def release_conclusion_widget_html(
     """Interactive table + verdict (Go / Rejected) for ``.release-doc`` HTML.
 
     Automatic rows (non-clickable when ``*_row_ok`` is not ``None``):
-    **Latest GPU CI(L1-L5)**, **Remaining DI**, **critical issues**.
+    **Latest GPU CI(L1-L5)**, **critical issues**.
     The **Latest NPU CI(L1-L4)** row is **manual** (always user-selectable,
-    per the "用例自己选择结果" rule).
+    per the "用例自己选择结果" rule). The **Remaining DI < 30** row is also
+    **manual** in the release variant (the release ``main()`` passes
+    ``di_row_ok=None`` so the operator judges DI against the open-bug list
+    rather than having an auto-judgement override the selection); the
+    development/preview paths still pass a demo ``di_row_ok`` value.
     Rows whose index is in :data:`RELEASE_CONCLUSION_GUIDE_ROW_INDICES` render
     in the table and stay user-selectable, but the final Go / Rejected verdict
     ignores them.

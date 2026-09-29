@@ -30,21 +30,29 @@
 
 ## Summary read order: timing_summary first, failed-job log second
 
-The **Test Result** per-GPU pillar×dim Summary tables are built in two tiers —
+The **Test Result** per-GPU pillar×dim Summary tables are **manifest-driven** —
 this is the rule the update follows (先读 `timing_summary.log` 获得summary信息，失败的job再去读对应的日志):
 
-1. **Summary table — read `timing_summary.log` first.** Each run's
-   `timing_summary.log` is a rollup that lists **every job** with an
-   OK / FAILED status and a wall-clock duration. It is the source of truth
-   for the **job list** and the **pass/fail status**, which is why a run
-   whose per-job `.log`s were cleaned up still shows all its jobs — they
-   surface as **`(manifest only)`** rows via
-   `_augment_groups_with_manifest_only`. The manifest is discovered by
-   `discover_stability_manifests` (`scripts/stability_log_manifest.py`),
-   which globs `**/timing_summary.log` under subdirs named with the
-   nightly prefix (`nightly_stability_jobs_*` / `nightly_jobs_local_*` /
-   `nightly_jobs_*`); per-job logs are discovered by `discover_job_logs`
-   (`scripts/nightly_job_log_discovery.py`).
+1. **Summary table — the job list/count comes from `timing_summary.log`.**
+   Each run's `timing_summary.log` is a rollup that lists **every job** with
+   an OK / FAILED status and a wall-clock duration. It is the **authoritative
+   source of truth** for the job list, the per-job status, and therefore the
+   total job count. `_manifest_driven_groups` (`scripts/nightly_local_log_report.py`)
+   builds the per-GPU job list by deduping manifest entries across every
+   `timing_summary.log` discovered under `log_dir`, then attaches each job's
+   `.log` path (when present) from the `discover_job_logs` stem→path map.
+   Manifests are discovered by `discover_manifests`
+   (`scripts/stability_log_manifest.py`), which globs `**/timing_summary.log`
+   and accepts either (a) a rollup sitting **directly under `log_dir`**
+   (depth-0 — covers a nightly run dir whose manifest lives at
+   `<rundir>/timing_summary.log` **and** a flat-merge release root whose name
+   matches no nightly prefix, e.g. `release_a100_flat`), or (b) a rollup
+   whose parent subdir starts with the nightly prefix
+   (`nightly_stability_jobs_*` / `nightly_jobs_local_*` / `nightly_jobs_*`).
+   **Non-manifest `.log` files are dropped** — the manifest is authoritative,
+   so a stray `.log` not listed in `timing_summary.log` does not appear in the
+   summary or the count. When **no** manifest is discoverable, the builder
+   falls back to `discover_job_logs`-only enumeration (pure-`.log` dirs).
 
 2. **FAILED jobs — then read the per-job `.log`.** Only **FAILED** jobs
    have their per-job `.log` parsed by `parse_pytest_log` to fill the
@@ -59,6 +67,15 @@ this is the rule the update follows (先读 `timing_summary.log` 获得summary�
    `timing_summary.log` + the FAILED jobs' `.log`s (not every OK job's
    log): the manifest already covers the OK job list and status, so the
    OK `.log`s would be pulled for nothing.
+
+> **Excerpt safety:** excerpts are multi-line tracebacks stored inside a
+> hidden `<pre>` in the Failure-Analysis cell. `_excerpt_cell_html` flattens
+> newlines to `&#10;`/`&#13;` *after* `html.escape` so the emitted cell HTML
+> stays single-line — a literal `\n` inside the `<pre>` would break the
+> markdown table row and spill the traceback as top-level `<p>`/`<h1>`. The
+> release/development shim additionally caps the stored excerpt at 20000
+> chars so a pathological mp.spawn child dump can't dominate the modal; the
+> browser still renders the entities as line breaks inside the `<pre>`.
 
 ## Perf JSON (under same `LOG_DIR`)
 

@@ -2371,7 +2371,11 @@ def _github_issue_submit_script() -> str:
 
 
 def _md_cell(s: str) -> str:
-    return (s or "").replace("|", "/").replace("\n", " ")
+    # Flatten every line break (incl. lone CR) to a space and swap pipe
+    # chars so a multi-line cell can never break the enclosing markdown
+    # table row. Defense-in-depth alongside _excerpt_cell_html's entity
+    # flattening for the <pre>-backed excerpt cells.
+    return (s or "").replace("|", "/").replace("\r", " ").replace("\n", " ")
 
 
 def render_markdown_table(headers: list[str], rows: list[list[str]]) -> str:
@@ -2635,7 +2639,6 @@ def _local_job_rows_with_info(
                     # for the same job are unlikely but keep deterministic
                     # precedence by keeping the first).
                     manifest_lookup.setdefault(entry.job_name, entry)
-                    manifest_lookup.setdefault(entry.job_name + " (manifest only)", entry)
         except Exception:
             # Manifest parsing is best-effort — failures here must not
             # abort report generation. Fall back to the .log-only path.
@@ -2643,39 +2646,24 @@ def _local_job_rows_with_info(
 
     out: list[tuple[str, list[Path], dict[str, Any]]] = []
     for job_name, paths in groups:
-        # Synthetic row from a ``timing_summary.log`` whose actual log
-        # was deliberately not pulled (selective-pull optimization).
-        if not paths and job_name.endswith(" (manifest only)"):
-            entry = manifest_lookup.get(job_name)
-            if entry is not None:
-                out.append(
-                    (
-                        job_name,
-                        paths,
-                        _synth_manifest_info(entry.status, entry.duration, entry.raw_status),
-                    )
-                )
-            else:
-                out.append((job_name, paths, _synth_manifest_info("ok", "?", "OK (manifest only)")))
-            continue
-
         # If the manifest says the whole job exited OK, trust it — even if
         # the .log body has stale pytest output that ``parse_pytest_log``
-        # would otherwise classify as failed.
+        # would otherwise classify as failed. This covers both jobs with a
+        # real ``.log`` on disk (we honour the rollup instead of re-parsing)
+        # and manifest-backed jobs whose ``.log`` was not pulled (no paths).
         entry = manifest_lookup.get(job_name)
         if entry is not None and entry.status == "ok":
             duration = entry.duration or "?"
             ok_info = _synth_manifest_info("ok", duration, entry.raw_status)
-            # Override the "manifest only" marker since this row *does*
-            # have a real .log on disk; we just chose to honour the
-            # rollup instead of re-parsing pytest output. The summary
-            # keeps ``passed`` in it so ``_summary_row_kind``'s regex
-            # (``\d+\s+passed``) classifies the row as ``ok`` rather
-            # than ``unknown`` — the row renders green and counts as a
-            # clean pass in the Summary table.
-            ok_info["summary"] = (
-                f"1 passed in {duration} (manifest OK; .log pytest output ignored)"
-            )
+            # The summary keeps ``passed`` so ``_summary_row_kind``'s regex
+            # (``\d+\s+passed``) classifies the row as ``ok`` rather than
+            # ``unknown`` — the row renders green and counts as a clean pass.
+            if paths:
+                ok_info["summary"] = (
+                    f"1 passed in {duration} (manifest OK; .log pytest output ignored)"
+                )
+            else:
+                ok_info["summary"] = f"1 passed in {duration} (manifest OK)"
             out.append((job_name, paths, ok_info))
             continue
 
@@ -2733,7 +2721,7 @@ def _synth_manifest_info(manifest_status: str, duration: str, raw_status: str) -
         # Include a real pytest-shaped summary so the row classifies as
         # ``ok`` (the ``re.search(r"\d+\s+passed", summ, re.I)`` branch in
         # ``_summary_row_kind`` needs the magic token).
-        summary = f"1 passed in {duration or '?'} (manifest only — log not pulled, status: OK)"
+        summary = f"1 passed in {duration or '?'} (manifest OK)"
         return {
             "summary": summary,
             "passed_nodes": [],
@@ -2755,7 +2743,7 @@ def _synth_manifest_info(manifest_status: str, duration: str, raw_status: str) -
             "_manifest_raw_status": raw_status,
         }
     # fail
-    summary = f"Manifest only — log not pulled (status: {raw_status}, {duration})"
+    summary = f"Manifest status: {raw_status} ({duration})"
     return {
         "summary": summary,
         "passed_nodes": [],
@@ -2781,6 +2769,45 @@ def _synth_manifest_info(manifest_status: str, duration: str, raw_status: str) -
         "_manifest_only": True,
         "_manifest_raw_status": raw_status,
     }
+
+
+def _manifest_driven_groups(
+    log_dir: Path,
+    discovered_groups: list[tuple[str, list[Path]]],
+) -> list[tuple[str, list[Path]]] | None:
+    """Build ``(job_name, paths)`` groups from ``timing_summary.log`` manifests.
+
+    The manifest is the source of truth for the job list + status (per the
+    "先读 ``timing_summary.log`` 获得 summary 信息" rule): each manifest entry
+    becomes one group, and the ``.log`` path (looked up from
+    ``discovered_groups``) is attached when present so FAILED jobs can still be
+    parsed by ``parse_pytest_log`` for pytest counts/excerpts. ``.log`` files
+    with **no** manifest entry are dropped — the manifest is authoritative, so
+    a stray/extra ``.log`` that the nightly wrapper did not roll up is not
+    counted (this is what keeps the A100 release count at the manifest's 49
+    regular + 2 stability = 51 instead of the 52 ``.log`` files on disk).
+
+    Returns ``None`` when no manifest is found under ``log_dir`` so the caller
+    can fall back to ``discovered_groups`` (pure-``.log`` dirs with no
+    ``timing_summary.log``). Deduplicates by job name across manifests (first
+    occurrence wins).
+    """
+    try:
+        manifests = discover_stability_manifests(log_dir)
+    except Exception:
+        manifests = []
+    if not manifests:
+        return None
+    log_map: dict[str, list[Path]] = {name: paths for name, paths in discovered_groups}
+    seen: set[str] = set()
+    groups: list[tuple[str, list[Path]]] = []
+    for manifest in manifests:
+        for entry in manifest.entries:
+            if entry.job_name in seen:
+                continue
+            seen.add(entry.job_name)
+            groups.append((entry.job_name, log_map.get(entry.job_name, [])))
+    return groups
 
 
 def _augment_groups_with_manifest_only(
@@ -3052,21 +3079,19 @@ def markdown_local_summary_from_log_dir(log_dir: Path) -> str:
     Used by ``compose_full_report.py`` for **Test Result → H200 / H800 / A100** when
     ``--log-dir-h*`` points at a ``nightly_jobs``-style tree.
 
-    Augments the discovered groups with ``_augment_groups_with_manifest_only``
-    so that stability runs whose per-job ``.log`` files were cleaned up — but
-    whose ``timing_summary.log`` still records an OK status — surface as a
-    synthetic ``(manifest only)`` row instead of disappearing entirely. The
-    nightly main flow (``emit_report_html``) already does this; without the
-    augmentation here, ``compose_full_report.py`` would report "No parseable
-    job logs found" for H800-style clusters whose logs were pruned to the
-    summary.
+    The job list + status come from ``timing_summary.log`` manifests via
+    :func:`_manifest_driven_groups` (manifest is the source of truth); ``.log``
+    files are only parsed for FAILED jobs' pytest counts/excerpts. Falls back
+    to plain ``discover_job_logs`` when no manifest is present (pure-``.log``
+    dir). No ``Log root:`` line is emitted and no ``(manifest only)`` rows are
+    synthesized — manifest-backed jobs without a ``.log`` render as normal
+    rows carrying their manifest status.
     """
-    groups = discover_job_logs(log_dir)
-    groups, _manifest_summary = _augment_groups_with_manifest_only(groups, log_dir)
+    discovered = discover_job_logs(log_dir)
+    groups = _manifest_driven_groups(log_dir, discovered)
+    if groups is None:
+        groups = discovered
     lines: list[str] = [
-        f"*Log root:* `{log_dir}` (layout: "
-        f"[references/nightly-local-log-layout.md](references/nightly-local-log-layout.md)).",
-        "",
         "Same grouping as local **Summary** in nightly HTML/Markdown reports "
         "(Omni / TTS / Diffusion × Perf / Acc / …):",
         "",
@@ -4574,6 +4599,11 @@ def _excerpt_md_cell(excerpt: str, *, node: str = "", row_index: int = 0,
         excerpt,
         storage_id=storage_id,
         title=node or "Excerpt",
+        # Cap so a pathological mp.spawn child traceback (100+ lines, repeated
+        # frames) can't dominate the stored <pre> in the release/development
+        # failure tables. Normal failures are well under this; the cap only
+        # bites on concatenated multi-process child dumps.
+        max_chars=20000,
     )
 
 
@@ -4592,6 +4622,13 @@ def _excerpt_cell_html(
     pytest output). Set ``max_chars`` to a non-zero value if a downstream caller
     really needs to cap the size — left at ``0`` for the failure tables so
     users no longer hit the legacy ``... [truncated]`` cutoff when triaging.
+
+    The escaped text is emitted **single-line** (``\\n`` → ``&#10;``,
+    ``\\r`` → ``&#13;``) AFTER ``html.escape``. A literal newline inside the
+    ``<pre>`` would break the markdown table row that wraps this cell (a
+    multi-line mp.spawn child traceback spilled as top-level ``<p>``/``<h1>``).
+    The numeric character references still render as line breaks inside the
+    ``<pre>`` in the modal, so the failure context stays intact visually.
     """
     t = (excerpt or "").strip()
     if not t:
@@ -4601,13 +4638,16 @@ def _excerpt_cell_html(
     safe_id = html.escape(storage_id)
     safe_title = html.escape(title, quote=True)
     safe_label = html.escape(button_label)
+    # Flatten newlines AFTER escaping so the emitted cell HTML stays on a
+    # single line; &#10;/&#13; still render as line breaks inside the <pre>.
+    safe_text = html.escape(t).replace("\n", "&#10;").replace("\r", "&#13;")
     return (
         '<div class="excerpt-cell-inner">'
         f'<button type="button" class="btn-view-log-excerpt" '
         f'data-modal-target="{safe_id}" data-log-title="{safe_title}">'
         f"{safe_label}</button>"
         f'<pre id="{safe_id}" class="log-excerpt log-excerpt--stored" hidden>'
-        f"{html.escape(t)}</pre>"
+        f"{safe_text}</pre>"
         "</div>"
     )
 
@@ -4973,13 +5013,16 @@ def emit_report_html(
     bk_results: dict[BkTarget, tuple[dict[str, Any] | None, list[dict[str, Any]] | None, str | None]] | None = None,
     kanban_cfg: KanbanAssetsConfig | None = None,
 ) -> None:
-    groups = discover_job_logs(log_dir)
-    # Inject synthetic "manifest only" rows for stability jobs whose ``.log``
-    # was deliberately not pulled by ``selective_stability_pull.py`` — the
-    # ``timing_summary.log`` still records the result so the report can
-    # surface the OK status without fetching the full log.
-    groups, manifest_summary = _augment_groups_with_manifest_only(groups, log_dir)
-    manifest_only_total = manifest_summary.get("manifest_only_jobs", 0)
+    # Manifest-driven job list: ``timing_summary.log`` is the source of truth
+    # for the job list + status; ``.log`` files are only parsed for FAILED
+    # jobs' pytest counts/excerpts. Fall back to plain ``discover_job_logs``
+    # when no manifest is present. No ``(manifest only)`` rows are synthesized
+    # — manifest-backed jobs without a ``.log`` render as normal rows.
+    discovered = discover_job_logs(log_dir)
+    groups = _manifest_driven_groups(log_dir, discovered)
+    if groups is None:
+        groups = discovered
+    manifest_only_total = 0
     if kanban_cfg is None:
         kanban_cfg = KanbanAssetsConfig(
             assets_dir=DEFAULT_KANBAN_ASSETS_DIR,
@@ -5127,10 +5170,6 @@ def emit_report_html(
         )
     else:
         summary_body = _render_local_summary_grouped_html(job_rows)
-    if manifest_only_total:
-        manifest_note = _render_manifest_only_note_html(manifest_summary)
-        if manifest_note:
-            summary_body = manifest_note + summary_body
     local_chunks.append(
         _details_subcard(
             "Summary",

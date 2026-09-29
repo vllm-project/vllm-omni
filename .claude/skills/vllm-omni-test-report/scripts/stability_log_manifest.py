@@ -229,10 +229,20 @@ def discover_manifests(log_dir: Path) -> list[StabilityManifest]:
         "nightly_jobs_",
     )
 
+    log_root = log_dir.resolve()
     for summary in sorted(log_dir.glob("**/timing_summary.log")):
         run_dir = summary.parent
+        # A ``timing_summary.log`` sitting directly under ``log_dir``
+        # (depth-0) is always accepted — it is the run's authoritative
+        # rollup regardless of ``log_dir``'s own name. This covers both a
+        # nightly run dir whose manifest lives at ``<rundir>/timing_summary.log``
+        # and a flat-merge release root named e.g. ``release_a100_flat``
+        # (whose name matches no nightly prefix). Without this, the flat
+        # root's regular-run manifest is skipped and every job falls through
+        # to ``.log``-file parsing — wrong counts + stale-excerpt garbage.
+        is_top_level = run_dir.resolve() == log_root
         base = run_dir.name
-        if not any(base.startswith(p) for p in accepted_prefixes):
+        if not is_top_level and not any(base.startswith(p) for p in accepted_prefixes):
             # Skip nested rollups that don't live directly under a nightly
             # run directory (e.g. under ``logs/`` nohup folders).
             continue

@@ -1200,10 +1200,10 @@ def _render_local_gpu_failure_section(
     """
     try:
         from nightly_local_log_report import (  # local import: keep top-level deps lean
-            _augment_groups_with_manifest_only,
             _excerpt_md_cell,
             _job_is_clean,
             _local_job_rows_with_info,
+            _manifest_driven_groups,
             _md_cell,
             discover_job_logs,
             render_markdown_table,
@@ -1215,12 +1215,13 @@ def _render_local_gpu_failure_section(
             "Run from the skill directory so `nightly_local_log_report.py` is importable.*\n"
         )
 
-    groups = discover_job_logs(log_dir)
-    # Augment so stability clusters whose per-job `.log` files were cleaned up
-    # but whose `timing_summary.log` still records an OK status surface as a
-    # synthetic `(manifest only)` row (clean → nothing to show here, but the
-    # summary table elsewhere stays truthful).
-    groups, _manifest_summary = _augment_groups_with_manifest_only(groups, log_dir)
+    # Manifest-driven job list: timing_summary.log is the source of truth;
+    # .log files are only parsed for FAILED jobs' pytest counts/excerpts. Fall
+    # back to plain discover_job_logs when no manifest is present.
+    discovered = discover_job_logs(log_dir)
+    groups = _manifest_driven_groups(log_dir, discovered)
+    if groups is None:
+        groups = discovered
     if not groups:
         return (
             f'<a id="failure-analysis-{gpu.lower()}"></a>\n'
@@ -1244,8 +1245,6 @@ def _render_local_gpu_failure_section(
     chunks: list[str] = [
         f'<a id="failure-analysis-{gpu.lower()}"></a>',
         f"#### {gpu} failures",
-        "",
-        f"Log root: `{log_dir}` — {len(failed_rows)} failed/errored job(s) out of {len(job_rows)} total.",
         "",
     ]
     for job_name, paths, info in failed_rows:
@@ -1313,21 +1312,19 @@ def _render_local_gpu_job_counts(log_dir) -> tuple:
         return 0, 0
     try:
         from nightly_local_log_report import (
-            _augment_groups_with_manifest_only,
             _job_is_clean,
             _local_job_rows_with_info,
+            _manifest_driven_groups,
             discover_job_logs,
         )
     except Exception:
         return 0, 0
-    groups = discover_job_logs(Path(log_dir))
-    # Augment so stability clusters whose per-job `.log` files were cleaned up
-    # but whose `timing_summary.log` still records an OK status surface as a
-    # synthetic `(manifest only)` row. Without this, a H800-style cluster with
-    # only `timing_summary.log` would count as 0 jobs here even though the
-    # per-GPU nightly summary section (which already augments) shows 1
-    # OK row. See `_render_local_gpu_failure_section` for the matching fix.
-    groups, _manifest_summary = _augment_groups_with_manifest_only(groups, Path(log_dir))
+    # Manifest-driven job list (timing_summary.log is the source of truth);
+    # fall back to plain discover_job_logs when no manifest is present.
+    discovered = discover_job_logs(Path(log_dir))
+    groups = _manifest_driven_groups(Path(log_dir), discovered)
+    if groups is None:
+        groups = discovered
     if not groups:
         return 0, 0
     # ``log_dir`` is forwarded so ``_local_job_rows_with_info`` can read the
@@ -3389,23 +3386,16 @@ def main() -> None:
     # + ``data-quality-on`` attribute (mirrors the existing pattern used by
     # ``oi-followup`` / ``ns-outstanding`` / ``fail-status``).
     quality_defense_block = render_quality_defense_section()
-    di_total_tenths, di_detail = slo_open_bug_di_total(gh_token, stats_to=stats_to, now=report_now)
-    # Threshold rule: cumulative Outstanding DI ≤ 30 ⇒ Pass, > 30 ⇒ Fail.
-    # ``BUG_DI_THRESHOLD_TENTHS`` is the tenths representation of 30 (300),
-    # so the comparison is ``total_tenths <= 300`` (= DI ≤ 30.0). On GitHub
-    # fetch failure we conservatively mark the row as Fail (we can't verify
-    # the threshold); never as ``None`` so the row stays auto/non-clickable
-    # and the operator can't override the auto-judgement. (This is the
-    # **release** behaviour — the Development variant's snapshot row
-    # defaults to no-alert on fetch failure so it doesn't pollute the dev
-    # dashboard with a red that the operator can't act on; both are
-    # intentional and are documented separately.)
-    if di_total_tenths is None:
-        di_row_ok = False
-        di_row_detail = f"{di_detail or 'Unable to fetch open bugs'} (auto-judge defaulted to Fail on fetch error)"
-    else:
-        di_row_ok = di_total_tenths <= BUG_DI_THRESHOLD_TENTHS
-        di_row_detail = di_detail
+    # "Remaining DI < 30" is a **manual** user-selectable Pass/Fail row (like
+    # the NPU row) — the operator judges it against the SLO-escalating
+    # Outstanding DI (sum of per-issue SLO DI across open `label:bug` whose
+    # `created_at` ≤ stats_to; threshold ≤ 30). Passing ``di_row_ok=None``
+    # renders the row as a clickable toggle (see ``release_conclusion_widget_html``:
+    # ``is_auto = auto_ok is not None``) and never overrides the operator's
+    # selection with an auto-judgement. The Open issues section below still
+    # lists the bugs the operator would judge against
+    # (``render_open_issues_section`` is unchanged) — only the conclusion-row
+    # auto-judgement is dropped.
 
     md = f"""# vLLM-Omni Test Report - Scheduled Nightly
 
@@ -3422,12 +3412,15 @@ def main() -> None:
 
 - **Test conclusion (auto):** (1) Buildkite **ready** (non-main) and **merge** (main non-nightly/weekly)
   each latest **finished** build has no `failed`/`broken` job (Upload * Pipeline steps
-  excluded); (2) self-calculated **Outstanding DI** = sum of per-issue SLO DI
+  excluded); (2) **Remaining DI < 30** is a **manual** user-selectable Pass/Fail row (like
+  the NPU row) — the operator judges it against the SLO-escalating Outstanding DI = sum of
+  per-issue SLO DI
   (`DI = base × ⌈days_open / slo_days⌉` with `critical=10/slo=1d`, `high priority=3/slo=5d`,
   `medium priority=1/slo=10d`, `low priority=0.1/slo=14d`, `invalid=0`) across open
   `label:bug` whose `created_at` ≤ `{stats_to}` (start date unbounded; issues created
   after the stats window are excluded); threshold ≤ 30 (Pass when total ≤ 30,
-  Fail when > 30); (3) no open
+  Fail when > 30). No longer auto-calculated — the operator's selection is authoritative;
+  (3) no open
   `label:bug` + `label:critical`; (4) `UT coverage meets this iteration requirement
   (Guide), Performance regression < 10% (Guide)` is a manual user-selectable
   row that does **not** influence the final Go / Rejected verdict.
@@ -3462,8 +3455,10 @@ def main() -> None:
             md,
             l2_l3_row_ok=l2_l3_row_ok,
             l2_l3_row_detail=l2_l3_row_detail,
-            di_row_ok=di_row_ok,
-            di_row_detail=di_row_detail,
+            # di_row_ok=None ⇒ the "Remaining DI < 30" conclusion row renders as a
+            # manual Pass/Fail toggle (operator-selectable), not an auto-judgement.
+            di_row_ok=None,
+            di_row_detail="",
             critical_row_ok=critical_row_ok,
             critical_row_detail=critical_row_detail,
         ),
