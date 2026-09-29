@@ -101,6 +101,8 @@ def test_personaplex_deploy_is_duplex_and_propagates_capacity_to_all_model_stage
     assert deploy.session_mode == "duplex"
     assert deploy.duplex_session.max_sessions == 2
     assert [stage.yaml_engine_args.get("duplex_max_sessions") for stage in stages] == [2, 2]
+    # Lockstep frames of all sessions must share a step (see the deploy comment).
+    assert stages[0].yaml_engine_args.get("async_scheduling") is False
     assert "personaplex_codec_max_sessions" not in deploy.connectors["connector_of_shared_memory"]["extra"]
 
 

@@ -168,3 +168,8 @@ def test_wan_egd_topology_and_deploy_wiring():
     assert deploy.stages[1].input_connectors == {"from_stage_0": "wan_encode_connector"}
     assert deploy.stages[1].output_connectors == {"to_stage_2": "wan_latent_connector"}
     assert deploy.stages[2].input_connectors == {"from_stage_1": "wan_latent_connector"}
+
+
+def test_omni_pipelines_sorted_alphabetically():
+    """OMNI_PIPELINES keys must stay sorted (case-insensitive) by model_type."""
+    assert list(OMNI_PIPELINES) == sorted(OMNI_PIPELINES, key=str.lower)

@@ -60,6 +60,7 @@ ISSUE_6474_SYNTH_PHRASE_TEXT = (
 
 # Simulate realtime upload pacing (``openai_realtime_client.py --send-delay-ms``).
 SEND_DELAY_MS = 200
+CLIENT_VAD_REPLAY_PATH = Path(__file__).resolve().parents[2] / "assets" / "livekit" / "client_vad_replay.jsonl"
 
 # CI overlay bakes in async_chunk: False and covers CUDA/ROCm/XPU via ``platforms:``.
 default_stage_config = get_deploy_config_path("ci/qwen3_omni_moe.yaml")
@@ -283,6 +284,93 @@ async def _run_server_vad_audio_roundtrips(
     return turn_events
 
 
+def _output_text(response: dict) -> str:
+    parts: list[str] = []
+    for item in response.get("output", []):
+        for content in item.get("content", []):
+            text = content.get("transcript") or content.get("text")
+            if text:
+                parts.append(text)
+    return "".join(parts)
+
+
+async def _run_client_vad_replay(
+    host: str,
+    port: int,
+    model: str,
+    replay_path: Path,
+    *,
+    wait_s: float = 10.0,
+) -> list[str]:
+    """Replay a captured LiveKit client-VAD session at its original speed."""
+    with replay_path.open() as replay_file:
+        records = [json.loads(line) for line in replay_file]
+    assert records
+
+    answers_by_response_id: dict[str, str] = {}
+    response_order: list[str] = []
+    completed_answers: dict[str, str] = {}
+    errors: list[dict] = []
+
+    async with websockets.connect(
+        f"ws://{host}:{port}/v1/realtime?model={model}",
+        max_size=64 * 1024 * 1024,
+    ) as ws:
+
+        async def receive_responses() -> None:
+            async for message in ws:
+                if isinstance(message, bytes):
+                    continue
+                event = json.loads(message)
+                event_type = event.get("type")
+                if event_type == "error":
+                    errors.append(event)
+                elif event_type == "response.created":
+                    response_id = event["response"]["id"]
+                    response_order.append(response_id)
+                    answers_by_response_id[response_id] = ""
+                elif event_type in {
+                    "response.audio_transcript.delta",
+                    "response.output_audio_transcript.delta",
+                    "response.output_text.delta",
+                    "transcription.delta",
+                }:
+                    response_id = event.get("response_id")
+                    if response_id in answers_by_response_id:
+                        answers_by_response_id[response_id] += event.get("delta", "")
+                elif event_type == "response.done":
+                    response = event["response"]
+                    response_id = response["id"]
+                    text = answers_by_response_id.get(response_id, "")
+                    completed_answers[response_id] = text or _output_text(response)
+
+        receiver = asyncio.create_task(receive_responses())
+        capture_start = records[0]["ts"]
+        replay_start = asyncio.get_running_loop().time()
+
+        try:
+            for record in records:
+                target = replay_start + (record["ts"] - capture_start)
+                delay = target - asyncio.get_running_loop().time()
+                if delay > 0:
+                    await asyncio.sleep(delay)
+
+                message = record["data"]
+                # The capture's reference-voice update is only valid when the
+                # replay client uploads its optional reference-audio asset.
+                if "__VOICE__" in json.dumps(message):
+                    continue
+                await ws.send(json.dumps(message))
+
+            await asyncio.sleep(wait_s)
+        finally:
+            receiver.cancel()
+            await asyncio.gather(receiver, return_exceptions=True)
+
+    assert not [error for error in errors if error.get("error", {}).get("type") == "server_error"]
+    return [completed_answers[response_id] for response_id in response_order if response_id in completed_answers]
+
+
 @pytest.fixture(scope="class")
 def cached_silero_vad_artifact() -> str:
     """Prepare the pinned artifact before the serving subprocess starts."""
@@ -375,6 +463,26 @@ class TestQwen3OmniRealtimeWebSocket:
         from tests.helpers.runtime import iter_omni_server
 
         yield from iter_omni_server(request, run_level, omni_fixture_lock)
+
+    @pytest.mark.advanced_model
+    @pytest.mark.omni
+    @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+    @pytest.mark.parametrize("omni_server", realtime_async_chunk_server_params, indirect=True)
+    def test_livekit_client_vad_replay(self, omni_server) -> None:
+        """Replay the captured client-VAD session at speed 1 and check its answers."""
+        answers = asyncio.run(
+            _run_client_vad_replay(
+                omni_server.host,
+                omni_server.port,
+                omni_server.model,
+                CLIENT_VAD_REPLAY_PATH,
+            )
+        )
+
+        assert len(answers) == 3, answers
+        assert "assistant" in answers[0].lower(), answers
+        assert "paris" in answers[1].lower(), answers
+        assert "paris" in answers[2].lower(), answers
 
     @pytest.mark.advanced_model
     @pytest.mark.omni

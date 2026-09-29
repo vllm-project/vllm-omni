@@ -35,6 +35,7 @@ _CLASS_TO_MODULE: dict[str, str] = {
     "WhisperEncoderConfig": "vllm_omni.transformers_utils.configs.ming_flash_omni",
     "AuKConfig": "vllm_omni.transformers_utils.configs.auk",
     "SenseNovaU1Config": "vllm_omni.transformers_utils.configs.sensenova_u1",
+    "SenseNovaU1MoELLMConfig": "vllm_omni.transformers_utils.configs.sensenova_u1",
 }
 
 __all__ = [
@@ -63,6 +64,7 @@ __all__ = [
     "Qwen3VLMoeVisionConfig",
     "WhisperEncoderConfig",
     "SenseNovaU1Config",
+    "SenseNovaU1MoELLMConfig",
 ]
 
 

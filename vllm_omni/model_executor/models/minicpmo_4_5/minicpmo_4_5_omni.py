@@ -110,6 +110,37 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             self.model = self.thinker
             self.talker = None
 
+            if getattr(getattr(vllm_config, "model_config", None), "session_mode", None) == "duplex":
+                from vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_kv import (
+                    DUPLEX_WINDOW_BLOCK_SIZE,
+                    duplex_window_geometry,
+                    install_duplex_window_layers,
+                    validate_duplex_window_install,
+                )
+
+                cache_config = getattr(vllm_config, "cache_config", None)
+                model_config = getattr(vllm_config, "model_config", None)
+                block_size = int(
+                    getattr(cache_config, "block_size", DUPLEX_WINDOW_BLOCK_SIZE) or DUPLEX_WINDOW_BLOCK_SIZE
+                )
+                max_model_len = getattr(model_config, "max_model_len", None) if model_config is not None else None
+                if max_model_len is None:
+                    max_model_len = 8192
+
+                geometry = duplex_window_geometry(
+                    prefix_tokens=96,
+                    window_tokens=6000,
+                    block_size=block_size,
+                    max_model_len=max_model_len,
+                    high_watermark_tokens=8000,
+                )
+                install_duplex_window_layers(self.thinker, geometry=geometry)
+                validate_duplex_window_install(
+                    cache_config,
+                    model_config,
+                    geometry,
+                )
+
         elif self.model_stage == "tts":
             self.thinker = None
             # The Talker is always the runner-owned continuous codec producer.
@@ -161,6 +192,14 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         from vllm.v1.sample.sampler import Sampler
 
         return Sampler()
+
+    def apply_duplex_kv_reanchor(self, runner: Any, scheduler_output: Any = None) -> None:
+        """Apply in-place Stage-0 KV reanchor and rotation on worker before model forward."""
+        from vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_kv import (
+            MiniCPMO45DuplexWorkerHelper,
+        )
+
+        MiniCPMO45DuplexWorkerHelper.maybe_apply_reanchor(runner, scheduler_output=scheduler_output)
 
     def prepare_duplex_sampling(
         self,
@@ -387,6 +426,9 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             is_speech=bool(payload.get("is_speech", False)),
             final=bool(duplex.get("final")),
             stage0_window=(duplex.get("stage0_window") if isinstance(duplex.get("stage0_window"), dict) else None),
+            stage0_reanchor=(
+                duplex.get("stage0_reanchor") if isinstance(duplex.get("stage0_reanchor"), dict) else None
+            ),
         )
         update_result = dict(result)
         if result.get("stage0_window_replaced") is True:
