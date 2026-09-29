@@ -323,6 +323,7 @@ class QwenImagePipeline(
             subfolder="text_encoder",
             prefetch_list=qwen_subfolders,
             local_files_only=local_files_only,
+            dtype=self.od_config.dtype,
         )
         # Qwen2.5-VL ships a vision tower that text-to-image does not use.
         # Drop it while the model is still on CPU, before moving to GPU, so

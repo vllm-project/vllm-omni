@@ -238,6 +238,7 @@ class QwenImageEditPlusPipeline(
             subfolder="text_encoder",
             prefetch_list=qwen_subfolders,
             local_files_only=local_files_only,
+            dtype=self.od_config.dtype,
         ).to(self.device)
 
         self.vae = from_pretrained_with_prefetch(
