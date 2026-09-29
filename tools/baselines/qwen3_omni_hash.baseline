@@ -1,48 +1,48 @@
 {
   "model": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
-  "commit": "24eb4ab89cc2ad3f8cdd83f57b66ce7786a0d65c",
+  "commit": "e51fe6ec1b9a9a0e14bb1fdb296d61b6593b93c6",
   "env": {
     "driver": "570.133.20",
     "cuda": "13.0",
-    "torch": "2.11.0+cu130",
+    "torch": "2.13.0+cu130",
     "gpu": "NVIDIA L20X"
   },
   "results": [
     {
       "prompt_id": 0,
       "async_mode": false,
-      "text_sha": "e4bf6ed906c0dada879874a9cc09f9ba3a4399149262a831a01fd53e6a8fd043",
-      "wav_sha": "20a203a149005f948afd485bbea780fa06c109f3689ebb6b3110f51b3237bd35"
+      "text_sha": "5991a4f55d24f92072b4d99edcbf681c92a0aba23d340b80cee52166d7065489",
+      "wav_sha": "0d4953375bf70262a50fb28453a48bf68b3ffc31e63a89ef8a9ed9309b81dfa9"
     },
     {
       "prompt_id": 1,
       "async_mode": false,
       "text_sha": "2e8a6b141a9747bd68aadc2931f278b89712ad7ad7ae12b25b39e193b241bf68",
-      "wav_sha": "1839a759bb5d8671b6352b2e3110dab5edfa718e38ff073d379176201f1eac8c"
+      "wav_sha": "859cff83509513756cf0b7272959f6b5ff2e5cd1f718d755a666c3a1222ab57e"
     },
     {
       "prompt_id": 2,
       "async_mode": false,
-      "text_sha": "e0aa5a513a5162024f35afee3830aeb67f2e378381726adb9d3a66b984aa652d",
-      "wav_sha": "74338df3e8357bc9d0c05bf141b63c45251b12807de34495097edb07fc7b19f8"
+      "text_sha": "8707212c7f6de46b74456228b7b5b25f47ac0759a5e97c0eac148b73b16d2912",
+      "wav_sha": "70de5b440e7f6d90f0a0ebde5f1bb49fda9d6d4f7a250c8ab0cce7ff23b412b3"
     },
     {
       "prompt_id": 0,
       "async_mode": true,
-      "text_sha": "e4bf6ed906c0dada879874a9cc09f9ba3a4399149262a831a01fd53e6a8fd043",
-      "wav_sha": "e09f862f54b553cc7c64e1631b821a768167768812b3f2cd3d0c69d0da991ee7"
+      "text_sha": "5991a4f55d24f92072b4d99edcbf681c92a0aba23d340b80cee52166d7065489",
+      "wav_sha": "fd1888ce72bd07979fbf0e9d351b9edab5340362473a587b2e8c9e37497346c4"
     },
     {
       "prompt_id": 1,
       "async_mode": true,
       "text_sha": "2e8a6b141a9747bd68aadc2931f278b89712ad7ad7ae12b25b39e193b241bf68",
-      "wav_sha": "9115d481f62a4b771c4c3d8b89d5c5a01149f002096289ab1da3f034fa388a2b"
+      "wav_sha": "ffe851d9553a169765ccdb9641e20bf68e6b46f3a61bc7d589845ab1d44e53c9"
     },
     {
       "prompt_id": 2,
       "async_mode": true,
-      "text_sha": "e0aa5a513a5162024f35afee3830aeb67f2e378381726adb9d3a66b984aa652d",
-      "wav_sha": "6a5985c9d4ca1596518c291228cd29239e76fcaf310c1cdb5921276b7efce801"
+      "text_sha": "8707212c7f6de46b74456228b7b5b25f47ac0759a5e97c0eac148b73b16d2912",
+      "wav_sha": "1b0dcf7a9a07c3c71b7a3c63df9d11a65b1da895d61b602b1f24456c367320a0"
     }
   ]
 }

@@ -5,14 +5,14 @@ from __future__ import annotations
 
 from typing import Any
 
+from vllm_omni.plugins import load_omni_general_plugins
+
 
 class OmniWorkerMixin:
     """Shared Omni plugin and native KV connector setup for workers."""
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
-        from vllm_omni.plugins import load_omni_general_plugins
-
         load_omni_general_plugins()
 
     def initialize_from_config(self, kv_cache_config) -> None:
