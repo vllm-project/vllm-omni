@@ -154,19 +154,16 @@ class ConditionalCFM(BASECFM):
 
         return sol[-1].float()
 
-    def forward_estimator(self, x, mask, mu, t, spks, cond):
-        if isinstance(self.estimator, torch.nn.Module):
-            return self.estimator(x, mask, mu, t, spks, cond)
-        else:
-            # TensorRT estimator: bind raw device pointers. The flow runs in
-            # fp32 but the engine may have fp16 I/O (strongly-typed fp16 engine),
-            # so cast inputs/output to the engine's dtype at the boundary. Keep
-            # references to the cast buffers alive until execute completes (a bare
-            # ``.contiguous().data_ptr()`` could free the temp -> dangling ptr).
-            io_dtype = getattr(self.estimator, "io_dtype", x.dtype)
-            [estimator, stream], trt_engine = self.estimator.acquire_estimator()
-            caller_stream = torch.cuda.current_stream(x.device)
-            stream.wait_stream(caller_stream)
+    def _forward_estimator_trt_once(self, x, mask, mu, t, spks, cond):
+        """Execute one TensorRT estimator call for a profile-supported shape."""
+        io_dtype = getattr(self.estimator, "io_dtype", x.dtype)
+        [estimator, stream], trt_engine = self.estimator.acquire_estimator(
+            int(x.shape[0]),
+            int(x.shape[2]),
+        )
+        caller_stream = torch.cuda.current_stream(x.device)
+        stream.wait_stream(caller_stream)
+        try:
             with torch.cuda.stream(stream):
                 x_e = x.to(io_dtype).contiguous()
                 mask_e = mask.to(io_dtype).contiguous()
@@ -192,7 +189,6 @@ class ConditionalCFM(BASECFM):
                 ]
                 for i, j in enumerate(data_ptrs):
                     estimator.set_tensor_address(trt_engine.get_tensor_name(i), j)
-                # run trt engine
                 assert estimator.execute_async_v3(stream.cuda_stream) is True
                 for tensor in (x_e, mask_e, mu_e, t_e, spks_e, cond_e, out_e):
                     if tensor.is_cuda:
@@ -200,8 +196,52 @@ class ConditionalCFM(BASECFM):
             caller_stream.wait_stream(stream)
             if out_e.is_cuda:
                 out_e.record_stream(caller_stream)
-            self.estimator.release_estimator(estimator, stream)
             return out_e.to(x.dtype)
+        finally:
+            self.estimator.release_estimator(estimator, stream)
+
+    def forward_estimator(self, x, mask, mu, t, spks, cond):
+        if isinstance(self.estimator, torch.nn.Module):
+            return self.estimator(x, mask, mu, t, spks, cond)
+
+        batch_size = int(x.shape[0])
+        sequence_length = int(x.shape[2])
+        supports_shape = getattr(self.estimator, "supports_estimator_shape", None)
+        if batch_size > 2 and supports_shape is not None and not supports_shape(batch_size, sequence_length):
+            if batch_size % 2 != 0:
+                raise RuntimeError(f"TensorRT CFG estimator batch must be even, got {batch_size}")
+
+            # Dynamic profile 1 intentionally covers the common batched-flow
+            # window only. If a long cumulative stream (or an unusually large
+            # request batch) falls outside that profile, preserve TensorRT and
+            # exact CFG semantics by serializing request pairs through profile 0.
+            # CFG layout is [B conditioned rows | B unconditional rows].
+            requests = batch_size // 2
+            conditioned = []
+            unconditional = []
+            for index in range(requests):
+                pair = (
+                    slice(index, index + 1),
+                    slice(index + requests, index + requests + 1),
+                )
+
+                def pair_rows(tensor):
+                    return torch.cat((tensor[pair[0]], tensor[pair[1]]), dim=0)
+
+                pair_out = self._forward_estimator_trt_once(
+                    pair_rows(x),
+                    pair_rows(mask),
+                    pair_rows(mu),
+                    pair_rows(t),
+                    pair_rows(spks),
+                    pair_rows(cond),
+                )
+                conditioned.append(pair_out[:1])
+                unconditional.append(pair_out[1:])
+
+            return torch.cat((*conditioned, *unconditional), dim=0)
+
+        return self._forward_estimator_trt_once(x, mask, mu, t, spks, cond)
 
 
 class CausalConditionalCFM(ConditionalCFM):
