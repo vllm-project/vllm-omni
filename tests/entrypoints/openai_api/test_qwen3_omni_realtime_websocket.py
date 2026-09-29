@@ -480,7 +480,7 @@ class TestQwen3OmniRealtimeWebSocket:
         )
 
         assert len(answers) == 3, answers
-        assert "assistant" in answers[0].lower(), answers
+        assert "qwen" in answers[0].lower(), answers
         assert "paris" in answers[1].lower(), answers
         assert "paris" in answers[2].lower(), answers
 
