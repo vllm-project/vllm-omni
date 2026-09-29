@@ -327,6 +327,11 @@ def default_ae_params() -> AutoEncoderParams:
     )
 
 
+def linear_patch_embedding_to_conv(weight: torch.Tensor, conv_shape: tuple[int, ...]) -> torch.Tensor:
+    out_channels, in_channels, patch_h, patch_w = conv_shape
+    return weight.reshape(out_channels, patch_h, patch_w, in_channels).permute(0, 3, 1, 2).contiguous()
+
+
 class SiglipNaViTWrapper(nn.Module):
     def __init__(self, vision_model):
         super().__init__()
@@ -352,7 +357,7 @@ class SiglipNaViTWrapper(nn.Module):
             mask[..., start:end, start:end] = 0.0
 
         outputs = self.vision_model.encoder(inputs_embeds=hidden_states, attention_mask=mask)
-        return outputs.last_hidden_state.squeeze(0)
+        return self.vision_model.post_layernorm(outputs.last_hidden_state).squeeze(0)
 
 
 class BagelPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProfilerMixin):
@@ -1576,8 +1581,7 @@ class BagelPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProf
                                 if shapes.get(cand) is not None:
                                     target_shape = shapes[cand]
                                     if tensor.numel() == torch.prod(torch.tensor(target_shape)):
-                                        # Reshape tensor to match target
-                                        tensor = tensor.view(target_shape)
+                                        tensor = linear_patch_embedding_to_conv(tensor, target_shape)
                                         picked = cand
                                         break
 
