@@ -20,6 +20,37 @@ from vllm_omni.platforms import current_omni_platform
 logger = init_logger(__name__)
 
 
+# CuTe's Python dispatcher inspects FakeTensor mode and JIT-compiles kernels.
+# Keep it opaque to Dynamo while letting Inductor capture the actual CUDA work.
+# TODO: Replace this boundary with upstream FA4 compile support, or align with
+# vLLM-Omni's shared implementation, once either resolves this issue in our
+# supported dependency versions. Revalidate compilation, CUDA graph replay,
+# and output parity before removing this workaround.
+# FA4: https://github.com/Dao-AILab/flash-attention/pull/2164
+# vLLM-Omni: https://github.com/vllm-project/vllm-omni/pull/7220
+if not hasattr(torch.ops.vllm_omni, "fa4_dense"):
+
+    @torch.library.custom_op("vllm_omni::fa4_dense", mutates_args=())
+    def _fa4_dense(
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        softmax_scale: float,
+        causal: bool,
+        deterministic: bool,
+    ) -> torch.Tensor:
+        from vllm_omni.diffusion.attention.backends.utils.fa import flash_attn_func
+
+        result = flash_attn_func(
+            query, key, value, softmax_scale=softmax_scale, causal=causal, deterministic=deterministic
+        )
+        return result[0] if isinstance(result, tuple) else result
+
+    @_fa4_dense.register_fake
+    def _(query, key, value, softmax_scale, causal, deterministic):
+        return query.new_empty((*query.shape[:-1], value.shape[-1]))
+
+
 @cache
 def _get_npu_compressed_causal_mask(device: torch.device) -> torch.Tensor:
     """Return the shared block mask used by NPU right-down causal attention."""
@@ -470,6 +501,12 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
             )
 
         if flash_attn_func is not None:
+            if torch.compiler.is_compiling() and getattr(flash_attn_func, "__module__", "").startswith(
+                "flash_attn.cute"
+            ):
+                return torch.ops.vllm_omni.fa4_dense(
+                    query, key, value, self.softmax_scale, self.causal, self.fa_deterministic
+                )
             fa_kwargs = {
                 "causal": self.causal,
                 "softmax_scale": self.softmax_scale,

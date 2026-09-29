@@ -1,0 +1,70 @@
+{
+  "schema_version": 1,
+  "cases": [
+    {
+      "name": "stone_w",
+      "trajectory": "w-61"
+    },
+    {
+      "name": "stone_s",
+      "trajectory": "s-61"
+    },
+    {
+      "name": "stone_up",
+      "trajectory": "up-61"
+    },
+    {
+      "name": "stone_left",
+      "trajectory": "left-61"
+    }
+  ],
+  "parameters": {
+    "num_frames": 61,
+    "pose_convention": "backward_chunk_anchored_16f",
+    "rotation_format": "rot6d_columns",
+    "translation_scale": 1.0,
+    "rotation_scale": 1.0,
+    "action_normalization": "global_asinh",
+    "raw_action_dim": 9,
+    "domain_id": 2,
+    "forward_speed": 0.1,
+    "rotation_speed_degrees": 0.5
+  },
+  "environment": {
+    "python": "3.12.11",
+    "numpy": "2.5.2",
+    "scipy": "1.18.1",
+    "torch": "2.13.0",
+    "loguru": "0.7.3",
+    "device": "cpu"
+  },
+  "archive_sha256": "f9dfd5f4be0cac86e56f7ff5c8d9585bfd8e265fb8038c9ce6d21a1550ed0d85",
+  "arrays": {
+    "poses": {
+      "shape": [
+        4,
+        61,
+        4,
+        4
+      ],
+      "dtype": "float64"
+    },
+    "raw_actions": {
+      "shape": [
+        4,
+        60,
+        9
+      ],
+      "dtype": "float32"
+    },
+    "normalized_actions": {
+      "shape": [
+        4,
+        60,
+        9
+      ],
+      "dtype": "float32"
+    }
+  },
+  "statistics_sha256": "ae695e2c643a5626b3c3564f00705aa3a83ab0da7640549c7340db71172594b0"
+}

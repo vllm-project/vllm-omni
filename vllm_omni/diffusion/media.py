@@ -3,9 +3,10 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from enum import Enum
-from typing import Literal
+from typing import Any, Literal
 
 import torch
 
@@ -124,12 +125,22 @@ class DiffusionMediaOutput:
     video: VideoMediaOutput
     # Only the model runner may set this before worker output packing.
     prepared_for_transport: bool = False
+    # Public envelope metadata, shared by the samples in this output. Pipelines
+    # with request-specific metadata must emit one output per request.
+    # Only transport-safe scalars/containers belong here, never tensor payloads
+    # or private state that needs a model-specific postprocessor.
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     def validate(self) -> None:
         if not isinstance(self.video, VideoMediaOutput):
             raise TypeError(f"Diffusion media video must be a VideoMediaOutput, got {type(self.video).__name__}")
         if not isinstance(self.prepared_for_transport, bool):
             raise TypeError("prepared_for_transport must be a bool")
+        if not isinstance(self.metadata, dict):
+            raise TypeError("Diffusion media metadata must be a dict")
+        if "internal" in self.metadata:
+            raise ValueError("Diffusion media cannot carry internal metadata")
+        _validate_media_metadata(self.metadata)
         self.video.validate()
         if not self.prepared_for_transport:
             return
@@ -146,6 +157,20 @@ class DiffusionMediaOutput:
         moved = self.with_video(self.video.to_cpu())
         moved.validate()
         return moved
+
+
+def _validate_media_metadata(value: object) -> None:
+    if value is None or isinstance(value, str | bool | int | float):
+        return
+    if isinstance(value, dict) and all(isinstance(key, str) for key in value):
+        for item in value.values():
+            _validate_media_metadata(item)
+        return
+    if isinstance(value, list | tuple):
+        for item in value:
+            _validate_media_metadata(item)
+        return
+    raise TypeError("Diffusion media metadata must contain only scalars, lists, tuples, and string-keyed dicts")
 
 
 def _owns_compact_storage(tensor: torch.Tensor) -> bool:
@@ -182,6 +207,11 @@ def slice_diffusion_media_output(
     media.validate()
     source = media.video.tensor
     tensor = source if start == 0 and stop == source.shape[0] else source[start:stop]
-    sliced = replace(media, video=media.video.with_tensor(tensor), prepared_for_transport=False)
+    sliced = replace(
+        media,
+        video=media.video.with_tensor(tensor),
+        prepared_for_transport=False,
+        metadata=deepcopy(media.metadata),
+    )
     sliced.validate()
     return sliced
