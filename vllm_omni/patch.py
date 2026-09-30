@@ -673,6 +673,7 @@ def _patch_xpumem_free_callback_xpu() -> None:
 _patch_cumem_free_callback_cuda()
 _patch_xpumem_free_callback_xpu()
 
+
 def _patch_batched_seeded_random_sample() -> None:
     """Draw per-request seeded sampling noise in one launch.
 
