@@ -46,6 +46,16 @@ stages:
     input_connectors:
       from_stage_0: connector_of_shared_memory
     default_sampling_params:
+      # The talker is the only stochastic stage (the thinker and code2wav both
+      # decode greedily at temperature 0). Without a seed, every request draws
+      # fresh codec tokens, and a small fraction of draws derail into fluent
+      # nonsense part-way through an utterance while the thinker text stays
+      # correct -- the audio-vs-text nightly failures in #6090. This seed was
+      # present from the original deploy schema and was dropped as collateral
+      # in #4986; keep it so Qwen3-Omni speech is reproducible for a given
+      # request. It bounds sampling only: it does not make the talker immune
+      # to the underlying degeneration, which is tracked separately.
+      seed: 42
       temperature: 0.9
       top_k: 50
       max_tokens: 4096

@@ -57,7 +57,7 @@ class _MockRequest:
 
 @pytest.fixture(autouse=True)
 def _mock_cuda_graph_platform(monkeypatch) -> None:
-    monkeypatch.setattr(voxcpm2_scheduler_mod.current_omni_platform, "is_cuda", lambda: True)
+    monkeypatch.setattr(voxcpm2_scheduler_mod.omni_platform.current_omni_platform, "is_cuda", lambda: True)
 
 
 def _make_scheduler(
@@ -134,7 +134,7 @@ def test_voxcpm2_unified_decode_graph_does_not_defer_with_deterministic_noise() 
 
 
 def test_voxcpm2_unified_decode_graph_does_not_defer_without_cuda_graph(monkeypatch) -> None:
-    monkeypatch.setattr(voxcpm2_scheduler_mod.current_omni_platform, "is_cuda", lambda: False)
+    monkeypatch.setattr(voxcpm2_scheduler_mod.omni_platform.current_omni_platform, "is_cuda", lambda: False)
     scheduler = _make_scheduler()
     scheduler.running = [_MockRequest("decode")]
     scheduler.waiting = _MockQueue([_MockRequest("prefill", status=RequestStatus.WAITING)])

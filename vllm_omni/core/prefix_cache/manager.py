@@ -789,6 +789,19 @@ class OmniPrefixCacheManager:
         self._hit_spans.clear()
         self._hit_prefetch.clear()
 
+    def _invalidate_overwritten_prefetches(self) -> None:
+        """Caller holds ``_state_lock``. Refresh this step's hits whose
+        intended producer registered a write after the early prefetch."""
+        for future, src in self._prefetch_queue:
+            futs = self._hit_prefetch.get(src.req_id)
+            if futs is None or futs.get(src.key) is not future:
+                continue
+            versions = self._slot_status.get_slot_status(src.key).slot_version[src.slots]
+            if src.reserved_version is None or not torch.equal(versions, src.reserved_version):
+                # Let the old fetch finish and unregister its pending read.
+                # COW may have preserved the prior tenant, which this hit must not use.
+                del futs[src.key]
+
     def _prefetch_hit_spans(self) -> None:
         """Caller holds ``_state_lock``. Plan each hit span not yet planned
         and gather it on the prefetch thread.
@@ -917,6 +930,7 @@ class OmniPrefixCacheManager:
         if self._hit_spans:
             # Same-step hits: their rows are registered now (IN_TRANSIT on
             # this step's tasks); start the gather before the next step.
+            self._invalidate_overwritten_prefetches()
             self._prefetch_hit_spans()
         step_id = self._next_step_id
         self._next_step_id += 1

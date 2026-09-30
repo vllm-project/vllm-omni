@@ -115,3 +115,5 @@ The design contracts separate selection mechanics from backend algorithms:
 The pre-#5137 pages are preserved in the
 [legacy module archive](module/archive/README.md) for historical reference and
 are not active design contracts.
+
+- [MiniCPM-o 4.5 turn-mode MRv2 performance](minicpm_o45_mrv2_performance.md)

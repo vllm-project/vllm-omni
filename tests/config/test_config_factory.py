@@ -694,6 +694,105 @@ class TestCosmos3PolicyPipeline:
         assert stage.engine_args.model_config.policy_server_config.action_space == "joint_position"
 
 
+class TestCosmos3OmniDeployPipeline:
+    """Omni deploy yaml selects an opt-in topology so --deploy-config applies (#6874)."""
+
+    def test_registered_without_auto_capturing_cosmos3_omni(self):
+        assert "cosmos3_omni_deploy" in OMNI_PIPELINES
+        # Same shared HF metadata as policy: must not register cosmos3_omni for
+        # auto-detect, or T2I/video/policy would collide.
+        assert "cosmos3_omni" not in OMNI_PIPELINES
+        pipeline = OMNI_PIPELINES["cosmos3_omni_deploy"]
+        assert pipeline.hf_architectures == ()
+        assert pipeline.diffusers_class_name is None
+        # Align with CLI Cosmos3OmniDiffusersPipeline default (video), not T2I-only.
+        assert pipeline.stages[0].final_output_type == "video"
+
+    def test_deploy_yaml_applies_guardrails_false(self):
+        deploy = load_deploy_config(get_deploy_config_path("cosmos3_omni.yaml"))
+        assert deploy.pipeline == "cosmos3_omni_deploy"
+        assert deploy.stages[0].devices is None
+
+        stages = merge_pipeline_deploy(OMNI_PIPELINES["cosmos3_omni_deploy"], deploy)
+        assert len(stages) == 1
+        stage = stages[0].to_omegaconf()
+
+        assert stage.stage_type == "diffusion"
+        assert stage.final_output_type == "video"
+        assert stage.engine_args.model_class_name == "Cosmos3OmniDiffusersPipeline"
+        assert stage.engine_args.model_config.guardrails is False
+        assert "devices" not in stage.runtime
+
+    def test_deploy_yaml_accepts_documented_multi_gpu_cli(self):
+        from vllm_omni.engine.stage_init_utils import _check_stage_device_layout
+
+        deploy = load_deploy_config(get_deploy_config_path("cosmos3_omni.yaml"))
+        stages, _ = StageConfigFactory._create_legacy_from_registry(
+            OMNI_PIPELINES["cosmos3_omni_deploy"],
+            {
+                "cfg_parallel_size": 2,
+                "use_hsdp": True,
+                "hsdp_shard_size": 2,
+            },
+            user_deploy_config=deploy,
+        )
+        assert len(stages) == 1
+        omega = stages[0].to_omegaconf()
+        assert omega.engine_args.model_config.guardrails is False
+        assert omega.engine_args.parallel_config.cfg_parallel_size == 2
+        assert omega.engine_args.parallel_config.use_hsdp is True
+        assert omega.engine_args.parallel_config.hsdp_shard_size == 2
+        assert "devices" not in omega.runtime
+        _check_stage_device_layout(omega, dict(omega.engine_args))
+
+    def test_get_pipeline_config_honours_deploy_yaml_pipeline_key(self):
+        deploy_path = get_deploy_config_path("cosmos3_omni.yaml")
+        # No HF download: explicit pipeline: key is highest priority.
+        pipeline = StageConfigFactory.get_pipeline_config(
+            model="nvidia/Cosmos3-Super-Text2Image",
+            trust_remote_code=True,
+            deploy_config_path=deploy_path,
+        )
+        assert pipeline is not None
+        assert pipeline.model_type == "cosmos3_omni_deploy"
+
+    def test_without_deploy_yaml_stays_on_unregistered_fallback(self):
+        # Shared HF metadata must not auto-select a pipeline; only the deploy
+        # yaml ``pipeline:`` key selects cosmos3_omni_deploy and merges guardrails.
+        assert "cosmos3_omni" not in OMNI_PIPELINES
+
+        class FakeCosmos3Config(PretrainedConfig):
+            model_type = "cosmos3_omni"
+
+        fake_config = FakeCosmos3Config()
+        fake_config.architectures = ["Cosmos3OmniDiffusersPipeline"]
+        model = "nvidia/Cosmos3-Super-Text2Image"
+        deploy_path = get_deploy_config_path("cosmos3_omni.yaml")
+
+        StageConfigFactory.get_hf_config.cache_clear()
+        StageConfigFactory.try_infer_model_type.cache_clear()
+        with patch("vllm_omni.config.config_factory.get_config", return_value=fake_config):
+            assert (
+                StageConfigFactory.get_pipeline_config(
+                    model=model,
+                    trust_remote_code=True,
+                    deploy_config_path=None,
+                )
+                is None
+            )
+
+            pipeline = StageConfigFactory.get_pipeline_config(
+                model=model,
+                trust_remote_code=True,
+                deploy_config_path=deploy_path,
+            )
+        assert pipeline is not None
+        assert pipeline.model_type == "cosmos3_omni_deploy"
+
+        stages = merge_pipeline_deploy(pipeline, load_deploy_config(deploy_path))
+        assert stages[0].to_omegaconf().engine_args.model_config.guardrails is False
+
+
 class TestStagePipelineConfig:
     def test_frozen(self):
         s = StagePipelineConfig(stage_id=0, model_stage="a")
@@ -1307,14 +1406,29 @@ class TestDeployConfigLoading:
             load_deploy_config(deploy_path)
 
     @pytest.mark.parametrize(
+        ("yaml_val", "expected"),
+        [
+            ('"2"', 2),
+            ('""', 0),
+            ("null", 0),
+        ],
+    )
+    def test_coerces_active_stream_window_to_int(self, tmp_path, yaml_val, expected):
+        """Ensure active stream window coerces str to int."""
+        deploy_path = tmp_path / "deploy.yaml"
+        deploy_path.write_text(f"active_stream_window: {yaml_val}\n", encoding="utf-8")
+        deploy = load_deploy_config(deploy_path)
+        assert deploy.active_stream_window == expected
+
+    @pytest.mark.parametrize(
         ("filename", "max_sessions"),
         [
-            ("minicpmo_4_5.yaml", 4),
+            ("minicpmo_4_5.yaml", 16),
             ("minicpmo_4_5_2gpu.yaml", 4),
             ("minicpmo_4_5_3gpu.yaml", 4),
             ("minicpmo_4_5_8x4090.yaml", 1),
-            ("minicpmo_4_5_3gpu_stage1_replicas.yaml", 4),
-            ("minicpmo_4_5_4gpu_stage1_replicas.yaml", 4),
+            ("minicpmo_4_5_3gpu_stage1_replicas.yaml", 16),
+            ("minicpmo_4_5_4gpu_stage1_replicas.yaml", 16),
             ("minicpmo_4_5_8x4090_stage1_replicas.yaml", 1),
         ],
     )
@@ -2758,6 +2872,28 @@ class TestPlatformOverrides:
             config = deploy.stages[0].compilation_config or {}
             assert "+rotary_embedding" not in config.get("custom_ops", [])
 
+    def test_qwen3_omni_talker_sampling_is_seeded(self):
+        """The only stochastic Qwen3-Omni stage must stay reproducible.
+
+        Dropping this seed (as #4986 did) leaves the talker sampling codec
+        tokens unseeded at temperature 0.9, which reopened the audio-vs-text
+        nightly failures in #6090. Pin it so a cleanup cannot remove it again
+        without failing here.
+        """
+        deploy_path = Path(get_deploy_config_path("qwen3_omni_moe.yaml"))
+        pipeline = resolve_pipeline_config(
+            "qwen3_omni_moe",
+            Q3_OMNI_ALL_STAGES_HF_CONFIG,
+        )
+        assert isinstance(pipeline, PipelineConfig)
+
+        for platform in ("cpu", "cuda", "musa", "npu", "rocm", "xpu"):
+            deploy = _apply_platform_overrides(load_deploy_config(deploy_path), platform=platform)
+            stages = merge_pipeline_deploy(pipeline, deploy)
+            talker_sampling = stages[1].yaml_extras["default_sampling_params"]
+            assert talker_sampling["temperature"] > 0.0, "talker is expected to sample, not decode greedily"
+            assert talker_sampling.get("seed") == 42, f"talker sampling lost its seed on {platform}"
+
     def test_minicpmo_4_5_cuda_caps_talker_kv_cache(self):
         pipeline = resolve_pipeline_config("minicpmo_4_5")
         assert isinstance(pipeline, PipelineConfig)
@@ -2765,7 +2901,7 @@ class TestPlatformOverrides:
 
         cuda = _apply_platform_overrides(load_deploy_config(deploy_path), platform="cuda")
         cuda_stages = merge_pipeline_deploy(pipeline, cuda)
-        assert cuda_stages[1].yaml_engine_args["kv_cache_memory_bytes"] == 2 * 1024**3
+        assert cuda_stages[1].yaml_engine_args["kv_cache_memory_bytes"] == 4 * 1024**3
 
         # The CUDA memory budget must not leak into the existing NPU profile.
         npu = _apply_platform_overrides(load_deploy_config(deploy_path), platform="npu")
@@ -2782,7 +2918,7 @@ class TestPlatformOverrides:
                 load_deploy_config(Path(get_deploy_config_path(filename))), platform="cuda"
             )
             replica_stages = merge_pipeline_deploy(pipeline, replica)
-            # Explicit null clears the inherited single-GPU 2 GiB CUDA cap.
+            # Explicit null clears the inherited single-GPU 4 GiB CUDA cap.
             assert replica_stages[1].yaml_engine_args.get("kv_cache_memory_bytes") is None
 
     def test_fish_speech_npu_uses_ascend_kv_block_size(self):
@@ -3390,14 +3526,10 @@ class TestSentinelDefaultPrecedence:
         assert stage1.sync_process_input_func is not None
         assert stage1.sync_process_input_func.endswith("thinker2talker_token_only")
 
-        # async_chunk=True must now be rejected: removing the fake hook means
-        # there is no next-stage input processor for the validator to accept.
-        # (Positive consequence -- users can't accidentally enable async_chunk
-        # on an arch that doesn't actually support it.)
-        import pytest as _pytest
-
-        with _pytest.raises(ValueError, match="async_chunk=True"):
-            merge_pipeline_deploy(pipeline, DeployConfig(async_chunk=True))
+        # ensure merging the pipeline deploy with async chunk set to True disables it,
+        # since currently it is not supported for this pipeline.
+        stage_configs = merge_pipeline_deploy(pipeline, DeployConfig(async_chunk=True))
+        assert all([not stg_cfg.yaml_engine_args["async_chunk"] for stg_cfg in stage_configs])
 
         # async_chunk=False merges cleanly and stage-0 yaml_engine_args carries
         # no spurious full-payload hook.
@@ -3566,3 +3698,71 @@ class TestObjectStorageConfigResolution:
 
         matching = "s3://any-bucket/my-cosyvoice3-model"
         assert StageConfigFactory.try_infer_model_type(model=matching, trust_remote_code=False) == "cosyvoice3"
+
+
+class TestAsyncChunkDefaults:
+    def test_async_chunk_auto_disabled_without_processor(self):
+        """Ensure a multi-stage model that doesn't support async chunk turns it off by default."""
+        pipeline = PipelineConfig(
+            model_type="test_no_async",
+            model_arch="TestNoAsync",
+            stages=(
+                StagePipelineConfig(
+                    stage_id=0,
+                    model_stage="ar",
+                    execution_type=StageExecutionType.LLM_AR,
+                    final_output=True,
+                ),
+                StagePipelineConfig(
+                    stage_id=1,
+                    model_stage="generation",
+                    execution_type=StageExecutionType.LLM_GENERATION,
+                    input_sources=(0,),
+                ),
+            ),
+        )
+
+        deploy = DeployConfig()
+        # async chunk should not try to default to True in this case,
+        # since doing so will just raise a ValueError in validation.
+        merge_pipeline_deploy(pipeline, deploy)
+        assert not deploy.async_chunk
+
+    def test_async_chunk_auto_disabled_when_yaml_omits_key(self, tmp_path):
+        """Ensure a multi-stage model that doesn't support async chunk turns it off by default
+        when a deploy config is provided that doesn't explicitly set it."""
+
+        deploy_path = tmp_path / "no_async_chunk.yaml"
+        deploy_path.write_text(
+            """
+stages:
+  - stage_id: 0
+    devices: "0"
+  - stage_id: 1
+    devices: "0"
+""",
+            encoding="utf-8",
+        )
+        deploy = load_deploy_config(deploy_path)
+
+        pipeline = PipelineConfig(
+            model_type="test_no_async",
+            model_arch="TestNoAsync",
+            stages=(
+                StagePipelineConfig(
+                    stage_id=0,
+                    model_stage="ar",
+                    execution_type=StageExecutionType.LLM_AR,
+                    final_output=True,
+                ),
+                StagePipelineConfig(
+                    stage_id=1,
+                    model_stage="generation",
+                    execution_type=StageExecutionType.LLM_GENERATION,
+                    input_sources=(0,),
+                ),
+            ),
+        )
+
+        merge_pipeline_deploy(pipeline, deploy)
+        assert not deploy.async_chunk

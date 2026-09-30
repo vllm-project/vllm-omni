@@ -9,8 +9,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 import vllm.distributed.parallel_state as vllm_parallel_state
+from vllm.utils.network_utils import get_file_store_init_method
 
-from tests.helpers.runtime import get_distributed_init_method
 from vllm_omni.diffusion.distributed import parallel_state as omni_parallel_state
 from vllm_omni.diffusion.distributed.parallel_state import RankGenerator, set_seq_parallel_pg
 
@@ -47,7 +47,7 @@ def test_omni_manages_vllm_distributed_state(monkeypatch):
         world_size=1,
         rank=0,
         local_rank=0,
-        distributed_init_method=get_distributed_init_method(),
+        distributed_init_method=get_file_store_init_method(),
         backend="gloo",
     )
     try:

@@ -101,12 +101,16 @@ class StagePool:
     DISPATCH_RETRY_INTERVAL_S: float = 0.1
     # Only these EngineCore helpers may skip collective_rpc_async. A generic
     # ``{method}_async`` on AsyncMPClient must not silently drop timeout.
+    _CACHE_RESET_METHODS = frozenset({"reset_prefix_cache", "reset_encoder_cache", "reset_mm_cache"})
     _ENGINE_CORE_CONTROL_ASYNC_METHODS = frozenset(
         {
             "pause_scheduler",
             "resume_scheduler",
             "sleep",
             "wake_up",
+            "reset_prefix_cache",
+            "reset_encoder_cache",
+            "reset_mm_cache",
         }
     )
 
@@ -1330,6 +1334,8 @@ class StagePool:
                     if timeout is not None:
                         return await asyncio.wait_for(result, timeout=timeout)
                     return await result
+                if method in self._CACHE_RESET_METHODS:
+                    return {"supported": False, "error": f"EngineCore helper {method}_async is unavailable"}
 
             return await client.collective_rpc_async(
                 method=method,
@@ -1344,7 +1350,7 @@ class StagePool:
                 replica_id,
                 method,
             )
-            if method in self._ENGINE_CORE_CONTROL_ASYNC_METHODS:
+            if method in self._ENGINE_CORE_CONTROL_ASYNC_METHODS and method not in self._CACHE_RESET_METHODS:
                 raise
             if isinstance(exc, TimeoutError):
                 error = f"{type(exc).__name__}: {method} timed out after {timeout}s"

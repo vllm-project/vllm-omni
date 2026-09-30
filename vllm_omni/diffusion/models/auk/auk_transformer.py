@@ -28,13 +28,13 @@ Deliberate differences from the reference, all inference-only:
 """
 
 import math
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 
-__all__ = ["AuKTransformer", "dit_state_dict", "sample_latents"]
+__all__ = ["AuKTransformer", "build_time_grid", "dit_state_dict", "sample_latents"]
 
 
 def _sdpa(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, mask: torch.Tensor | None) -> torch.Tensor:
@@ -86,14 +86,17 @@ class Rotary(nn.Module):
         exponents = torch.arange(0, self.dim, 2, device=device, dtype=torch.float32) / self.dim
         return 1.0 / (self.base**exponents)
 
-    def forward(self, seq_len: int) -> torch.Tensor:
-        """Return frequencies ``[1, 1, seq_len, dim]`` for positions ``0..seq_len-1``."""
+    def forward(self, seq_len: int, mask: torch.Tensor | None = None) -> torch.Tensor:
+        """Return rotary frequencies, compressing positions across padding."""
         inv_freq = self.inv_freq
         if inv_freq.dtype != torch.float32:
             inv_freq = self._frequencies(inv_freq.device)
-        pos = torch.arange(seq_len, device=inv_freq.device, dtype=torch.float32)
-        freqs = torch.outer(pos, inv_freq)
-        return torch.stack((freqs, freqs), dim=-1).flatten(-2)[None, None]
+        if mask is None:
+            pos = torch.arange(seq_len, device=inv_freq.device, dtype=torch.float32)[None]
+        else:
+            pos = (mask.to(torch.int32).cumsum(dim=1) - 1).clamp_min(0).to(torch.float32)
+        freqs = pos.unsqueeze(-1) * inv_freq
+        return torch.stack((freqs, freqs), dim=-1).flatten(-2).unsqueeze(1)
 
 
 class TimeEmbedding(nn.Module):
@@ -541,15 +544,15 @@ class AuKTransformer(nn.Module):
 
         seq_len = x.shape[1]
         text_len = c.shape[1]
-        rope_audio = self.rotary_embed(seq_len)
-        rope_text = self.rotary_embed(text_len)
+        rope_audio = self.rotary_embed(seq_len, audio_mask)
+        rope_text = self.rotary_embed(text_len, c_mask)
 
         for block in self.transformer_blocks:
             c, x = block(x, c, t, mask=audio_mask, rope=rope_audio, c_rope=rope_text, c_mask=c_mask)
 
         x = torch.cat([c, x], dim=1)
-        rope = self.rotary_embed(text_len + seq_len)
         single_mask = None if audio_mask is None else torch.cat([c_mask, audio_mask], dim=1)
+        rope = self.rotary_embed(text_len + seq_len, single_mask)
 
         for block in self.single_transformer_blocks:
             x = block(x, t, mask=single_mask, rope=rope)
@@ -571,6 +574,31 @@ def dit_state_dict(
     return {name[len(prefix) :]: tensor for name, tensor in items if name.startswith(prefix)}
 
 
+def build_time_grid(
+    *,
+    nfe: int,
+    sway_sampling_coef: float | None,
+    t_grid: list[float] | None,
+    device: torch.device | str,
+) -> torch.Tensor:
+    """Build and validate the Euler schedule before a graph replay."""
+    if t_grid is not None:
+        timesteps = torch.tensor(t_grid, device="cpu", dtype=torch.float32)
+    else:
+        timesteps = torch.linspace(0, 1, nfe + 1, device="cpu", dtype=torch.float32)
+        if sway_sampling_coef is not None:
+            timesteps = timesteps + sway_sampling_coef * (torch.cos(math.pi / 2 * timesteps) - 1 + timesteps)
+    if (
+        timesteps.ndim != 1
+        or timesteps.numel() < 2
+        or not bool(torch.isfinite(timesteps).all() & torch.all(timesteps[1:] > timesteps[:-1]))
+    ):
+        raise ValueError(
+            f"AuK sampling needs a strictly increasing time grid with at least two points; got {timesteps.tolist()}"
+        )
+    return timesteps.to(device)
+
+
 @torch.no_grad()
 def sample_latents(
     dit: AuKTransformer,
@@ -589,6 +617,7 @@ def sample_latents(
     latent_dim: int | None = None,
     device: torch.device | str | None = None,
     dtype: torch.dtype | None = None,
+    sampler: Callable[..., torch.Tensor] | None = None,
 ) -> torch.Tensor:
     """Integrate the flow from noise to audio latents with explicit Euler steps.
 
@@ -640,25 +669,61 @@ def sample_latents(
             .unsqueeze(0)
         )
 
-    if t_grid is not None:
-        t = torch.tensor(t_grid, device=device, dtype=torch.float32)
-    else:
-        t = torch.linspace(0, 1, nfe + 1, device=device, dtype=torch.float32)
-        if sway_sampling_coef is not None:
-            t = t + sway_sampling_coef * (torch.cos(math.pi / 2 * t) - 1 + t)
+    t = build_time_grid(
+        nfe=nfe,
+        sway_sampling_coef=sway_sampling_coef,
+        t_grid=t_grid,
+        device=device,
+    )
+    if sampler is not None:
+        try:
+            for i in range(t.shape[0] - 1):
+                velocity = sampler(
+                    x=x,
+                    text=text,
+                    c_mask=c_mask,
+                    ref=ref,
+                    ref_mask=ref_mask,
+                    timestep=t[i],
+                    cfg_strength=cfg_strength,
+                )
+                x = x + (t[i + 1] - t[i]) * velocity
+        finally:
+            dit.clear_cache()
+        return x
+    return _sample_latents(
+        dit,
+        initial_latents=x,
+        text=text,
+        c_mask=c_mask,
+        ref=ref,
+        ref_mask=ref_mask,
+        timesteps=t,
+        cfg_strength=cfg_strength,
+    )
 
+
+def _sample_latents(
+    dit: AuKTransformer,
+    *,
+    initial_latents: torch.Tensor,
+    text: torch.Tensor,
+    c_mask: torch.Tensor | None,
+    ref: torch.Tensor,
+    ref_mask: torch.Tensor | None,
+    timesteps: torch.Tensor,
+    cfg_strength: float,
+) -> torch.Tensor:
+    """Euler integration shared by eager sampling and CUDA graph capture."""
+    x = initial_latents
     guided = cfg_strength >= 1e-5
-    if t.numel() < 2 or not bool(torch.all(t[1:] > t[:-1])):
-        raise ValueError(
-            f"AuK sampling needs a strictly increasing time grid with at least two points; got {t.tolist()}"
-        )
     try:
-        for i in range(t.shape[0] - 1):
+        for i in range(timesteps.shape[0] - 1):
             if guided:
                 pred = dit(
                     x,
                     text,
-                    t[i],
+                    timesteps[i],
                     c_mask=c_mask,
                     ref=ref,
                     ref_mask=ref_mask,
@@ -668,8 +733,8 @@ def sample_latents(
                 v_cond, v_uncond = pred.chunk(2, dim=0)
                 v = v_cond + (v_cond - v_uncond) * cfg_strength
             else:
-                v = dit(x, text, t[i], c_mask=c_mask, ref=ref, ref_mask=ref_mask)
-            x = x + (t[i + 1] - t[i]) * v
+                v = dit(x, text, timesteps[i], c_mask=c_mask, ref=ref, ref_mask=ref_mask)
+            x = x + (timesteps[i + 1] - timesteps[i]) * v
     finally:
         # The cached text projections belong to this request only; a failed
         # step must not leak them into the next one.

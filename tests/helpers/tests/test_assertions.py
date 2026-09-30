@@ -1,8 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import io
+import wave
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
 from tests.helpers import assertions
@@ -149,6 +152,173 @@ def test_escalated_transcript_keeps_declared_language(monkeypatch):
     assert captured["language"] == "en"
 
 
+def _pcm_sine(*, sample_rate: int = 24_000, frequency_hz: float = 220.0, duration_s: float = 0.5) -> bytes:
+    samples = np.arange(round(sample_rate * duration_s), dtype=np.float32) / sample_rate
+    waveform = 0.35 * np.sin(2 * np.pi * frequency_hz * samples)
+    return np.rint(waveform * np.iinfo(np.int16).max).astype("<i2").tobytes()
+
+
+def _assert_wav_wraps_pcm(wav_bytes: bytes, pcm_bytes: bytes, sample_rate: int) -> None:
+    with wave.open(io.BytesIO(wav_bytes), "rb") as wav_file:
+        assert wav_file.getnchannels() == 1
+        assert wav_file.getsampwidth() == 2
+        assert wav_file.getframerate() == sample_rate
+        assert wav_file.readframes(wav_file.getnframes()) == pcm_bytes
+
+
+@pytest.mark.parametrize("run_level", ["advanced_model", "full_model"])
+@pytest.mark.parametrize("sample_rate", [16_000, 24_000])
+def test_pcm_transcript_opt_in_wraps_raw_int16_as_declared_rate_wav(monkeypatch, capsys, run_level, sample_rate):
+    pcm_bytes = _pcm_sine(sample_rate=sample_rate)
+    transcriptions: list[tuple[bytes, str, str | None]] = []
+
+    def transcribe(audio_bytes, model_size="small", language=None):
+        transcriptions.append((audio_bytes, model_size, language))
+        return "hello from raw pcm"
+
+    monkeypatch.setattr(assertions, "convert_audio_bytes_to_text", transcribe)
+
+    assert_audio_speech_response(
+        OmniResponse(success=True, audio_bytes=pcm_bytes, audio_format="audio/pcm"),
+        {
+            "input": "hello from raw pcm",
+            "response_format": "pcm",
+            "transcript_pcm_sample_rate": sample_rate,
+        },
+        run_level,
+    )
+
+    assert len(transcriptions) == 1
+    wav_bytes, model_size, language = transcriptions[0]
+    assert model_size == "small"
+    assert language is None
+    _assert_wav_wraps_pcm(wav_bytes, pcm_bytes, sample_rate)
+    assert f"sr={sample_rate}" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    ("run_level", "request_config"),
+    [
+        ("core_model", {"input": "hello", "response_format": "pcm", "transcript_pcm_sample_rate": 24_000}),
+        ("advanced_model", {"input": "hello", "response_format": "pcm"}),
+        ("full_model", {"input": "hello", "response_format": "pcm"}),
+    ],
+)
+def test_pcm_asr_remains_disabled_without_opt_in_or_at_core_level(monkeypatch, run_level, request_config):
+    monkeypatch.setattr(
+        assertions,
+        "convert_audio_bytes_to_text",
+        lambda *_args, **_kwargs: pytest.fail("PCM ASR should not run for this request"),
+    )
+
+    assert_audio_speech_response(
+        OmniResponse(success=True, audio_bytes=_pcm_sine(), audio_format="audio/pcm"),
+        request_config,
+        run_level,
+    )
+
+
+def test_pcm_transcript_escalation_uses_same_valid_wav_and_rejects_two_wrong_transcripts(monkeypatch):
+    pcm_bytes = _pcm_sine()
+    transcriptions: list[tuple[bytes, str, str | None]] = []
+
+    def transcribe(audio_bytes, model_size="small", language=None):
+        transcriptions.append((audio_bytes, model_size, language))
+        return "this is unrelated speech"
+
+    monkeypatch.setattr(assertions, "convert_audio_bytes_to_text", transcribe)
+
+    with pytest.raises(AssertionError, match="after ASR escalation"):
+        assert_audio_speech_response(
+            OmniResponse(success=True, audio_bytes=pcm_bytes, audio_format="audio/pcm"),
+            {
+                "input": "please transcribe this requested sentence",
+                "response_format": "pcm",
+                "transcript_pcm_sample_rate": 24_000,
+                "transcript_escalation_model": "large-v3",
+                "transcript_language": "en",
+            },
+            "full_model",
+        )
+
+    assert [(model_size, language) for _, model_size, language in transcriptions] == [
+        ("small", "en"),
+        ("large-v3", "en"),
+    ]
+    for wav_bytes, _, _ in transcriptions:
+        _assert_wav_wraps_pcm(wav_bytes, pcm_bytes, 24_000)
+
+
+@pytest.mark.parametrize(
+    "pcm_bytes",
+    [
+        pytest.param(b"\x00\x00" * 12_000, id="silence"),
+        pytest.param(np.full(12_000, 3_000, dtype="<i2").tobytes(), id="constant_signal"),
+    ],
+)
+@pytest.mark.parametrize("min_hnr_db", [0, -1, -5])
+def test_pcm_unvoiced_audio_fails_even_when_the_hnr_floor_is_lowered(pcm_bytes, min_hnr_db):
+    with pytest.raises(AssertionError, match="HNR"):
+        assert_audio_speech_response(
+            OmniResponse(success=True, audio_bytes=pcm_bytes, audio_format="audio/pcm"),
+            {"response_format": "pcm", "min_hnr_db": min_hnr_db},
+            "advanced_model",
+        )
+
+
+@pytest.mark.parametrize("min_hnr_db", [1.0, -1.0])
+def test_pcm_white_noise_fails_the_speech_hnr_gate(min_hnr_db):
+    rng = np.random.default_rng(0)
+    noise = rng.integers(np.iinfo(np.int16).min, np.iinfo(np.int16).max, 24_000, dtype=np.int16).astype("<i2")
+
+    with pytest.raises(AssertionError, match="HNR"):
+        assert_audio_speech_response(
+            OmniResponse(success=True, audio_bytes=noise.tobytes(), audio_format="audio/pcm"),
+            {"response_format": "pcm", "min_hnr_db": min_hnr_db},
+            "advanced_model",
+        )
+
+
+def test_pcm_voiced_signal_passes_the_default_speech_hnr_gate():
+    assert_audio_speech_response(
+        OmniResponse(success=True, audio_bytes=_pcm_sine(), audio_format="audio/pcm"),
+        {"response_format": "pcm"},
+        "advanced_model",
+    )
+
+
+@pytest.mark.parametrize("sample_rate", [None, 0, -1, True, 24000.5, "not-a-rate"])
+def test_pcm_transcript_opt_in_rejects_invalid_declared_sample_rate(sample_rate):
+    with pytest.raises(AssertionError, match="transcript_pcm_sample_rate"):
+        assert_audio_speech_response(
+            OmniResponse(success=True, audio_bytes=_pcm_sine(), audio_format="audio/pcm"),
+            {
+                "input": "hello",
+                "response_format": "pcm",
+                "transcript_pcm_sample_rate": sample_rate,
+            },
+            "advanced_model",
+        )
+
+
+def test_pcm_transcript_and_hnr_rates_must_agree():
+    with pytest.raises(AssertionError, match="transcript_pcm_sample_rate must match expected_sample_rate"):
+        assert_audio_speech_response(
+            OmniResponse(success=True, audio_bytes=_pcm_sine(), audio_format="audio/pcm"),
+            {"response_format": "pcm", "transcript_pcm_sample_rate": 24_000, "expected_sample_rate": 16_000},
+            "full_model",
+        )
+
+
+def test_pcm_rejects_odd_length_int16_payload():
+    with pytest.raises(AssertionError, match="aligned to int16"):
+        assert_audio_speech_response(
+            OmniResponse(success=True, audio_bytes=b"\x00\x01\x02", audio_format="audio/pcm"),
+            {"response_format": "pcm"},
+            "advanced_model",
+        )
+
+
 def test_bounded_tail_after_complete_answer_passes():
     # The exact shape from the #6815 nightly failure: the full answer is spoken
     # verbatim, then a two-word unrelated tail trips the cosine gate.
@@ -156,6 +326,21 @@ def test_bounded_tail_after_complete_answer_passes():
         "The squares in this image are black. nack shit.",
         "The squares in this image are black.",
     )
+
+
+def test_minicpmo_mix_runaway_repetition_still_fails():
+    # #7630, Buildkite 15299 lines 1472-1475: 49 copies in the answer,
+    # 112 in the transcript. This is not a bounded noise tail and must not
+    # be hidden by relaxing the shared audio/text similarity gate.
+    prefix = "A black background with some colorful patterns appears, accompanied by a voice saying "
+    expected = prefix + '"' + " ".join(["test"] * 49)
+    transcript = prefix + ", ".join(["test"] * 112)
+    response = OmniResponse(success=True, text_content=expected, audio_content=transcript)
+
+    assert assertions.cosine_similarity_text(transcript, expected) == pytest.approx(0.675451892050252)
+    assert not assertions._transcript_has_bounded_tail(transcript, expected)
+    with pytest.raises(AssertionError, match=assertions.AUDIO_MISMATCH_MESSAGE):
+        assertions.assert_omni_response(response, {"modalities": ["text", "audio"]}, "advanced_model")
 
 
 def test_bounded_tail_exact_match_passes():

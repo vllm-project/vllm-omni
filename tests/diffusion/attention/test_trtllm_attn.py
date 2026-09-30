@@ -7,6 +7,7 @@ from unittest.mock import Mock
 import pytest
 import torch
 import torch.nn.functional as F
+from packaging.version import Version
 
 from vllm_omni.diffusion.attention.backends import trtllm_attn as tg
 from vllm_omni.diffusion.attention.backends.abstract import (
@@ -76,27 +77,51 @@ def test_quant_rejects_non_sage_dtype():
         _impl(quant={"dtype_qk": "bfloat16"})
 
 
-def test_quant_quantize_requires_flashinfer_routine(monkeypatch):
-    import vllm_omni.diffusion.attention.backends.trtllm_attn as mod
-
-    monkeypatch.setattr(mod, "_sage_kernel_available", lambda: True)
-    monkeypatch.setattr(mod, "_sage_quantize_fn", lambda: None)
-    with pytest.raises(RuntimeError, match="trtllm_sage_attention_quantize"):
-        _impl(quant={"dtype_qk": "int8"})
-
-
 def test_quant_quantize_calls_routine_and_shapes_sfs():
     from vllm_omni.diffusion.attention.backends.trtllm_attn import QuantConfig
 
     captured: dict[str, object] = {}
 
-    def fake_quantize(q, k, v, q_block_size, k_block_size, qk_quant_dtype):
-        captured.update(q_block_size=q_block_size, k_block_size=k_block_size, qk_quant_dtype=qk_quant_dtype)
-        return "qq", "kq", "vq", "qsfs", "ksfs", "vsfs"
+    def fake_quantize(
+        q,
+        k,
+        v,
+        q_block_size,
+        k_block_size,
+        qk_quant_dtype,
+        smooth_k,
+        cum_seq_lens_q,
+        cum_seq_lens_kv,
+    ):
+        captured.update(
+            q_block_size=q_block_size,
+            k_block_size=k_block_size,
+            qk_quant_dtype=qk_quant_dtype,
+            smooth_k=smooth_k,
+            cum_seq_lens_q=cum_seq_lens_q,
+            cum_seq_lens_kv=cum_seq_lens_kv,
+        )
+        return "qq", "kq", "vq", "qsfs", "ksfs", "vsfs", "k_mean"
 
-    q_q, k_q, v_q, sfs, blk = QuantConfig(dtype_qk="int8").quantize(object(), object(), object(), fake_quantize)
+    cu_seq_lens_q = object()
+    cu_seq_lens_kv = object()
+    q_q, k_q, v_q, sfs, blk = QuantConfig(dtype_qk="int8").quantize(
+        object(),
+        object(),
+        object(),
+        fake_quantize,
+        cu_seq_lens_q,
+        cu_seq_lens_kv,
+    )
     assert (q_q, k_q, v_q, sfs, blk) == ("qq", "kq", "vq", ("qsfs", "ksfs", None, "vsfs"), (1, 16, 0, 1))
-    assert captured == {"q_block_size": 1, "k_block_size": 16, "qk_quant_dtype": torch.int8}
+    assert captured == {
+        "q_block_size": 1,
+        "k_block_size": 16,
+        "qk_quant_dtype": torch.int8,
+        "smooth_k": True,
+        "cum_seq_lens_q": cu_seq_lens_q,
+        "cum_seq_lens_kv": cu_seq_lens_kv,
+    }
 
 
 def test_skip_factor_none_without_curve():
@@ -442,8 +467,8 @@ def test_bf16_packed_padding_matches_sdpa():
 
 
 requires_sage = pytest.mark.skipif(
-    not (_has_trtllm_attn() and tg._sage_quantize_fn() is not None),
-    reason="requires Blackwell SM100+ GPU with flashinfer >= 0.6.16rc1 (trtllm_sage_attention_quantize)",
+    not _has_trtllm_attn() or Version(tg.flashinfer.__version__) < Version("0.6.18rc10"),
+    reason="requires Blackwell SM100+ GPU with flashinfer >= 0.6.18rc10",
 )
 
 
@@ -491,22 +516,6 @@ def test_sage_packed_non_aligned_length_matches_sdpa():
     rel = (out[:, :used].float() - ref).abs().mean() / ref.abs().mean()
     assert rel < 0.2, f"SAGE packed valid-token rel err {rel:.4f} too high"
     assert torch.count_nonzero(out[:, used:]) == 0
-
-
-@requires_sage
-def test_sage_short_sequence_uses_dense_kernel():
-    torch.manual_seed(0)
-    b, s, h, d = 1, 14, 8, 128
-    scale = 1.0 / math.sqrt(d)
-    q, k, v = (torch.randn(b, s, h, d, device="cuda", dtype=torch.bfloat16) for _ in range(3))
-
-    impl = _impl(quant={"dtype_qk": "fp8_e4m3", "q_block_size": 1, "k_block_size": 16})
-    impl._sage_quantize_fn = lambda *args, **kwargs: pytest.fail("short sequence must not use SAGE")
-    out = impl.forward_cuda(q, k, v)
-    ref = _sdpa_ref(q, k, v, scale)
-    rel = (out.float() - ref).abs().mean() / ref.abs().mean()
-    assert torch.isfinite(out).all()
-    assert rel < 0.01, f"SAGE short-sequence dense fallback rel err {rel:.4f} too high"
 
 
 @requires_trtllm_attn

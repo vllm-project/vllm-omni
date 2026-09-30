@@ -112,6 +112,7 @@ def test_last_pp_rank_orchestration_and_kv_resolver(monkeypatch, needs_history) 
 
     runner.model = SimpleNamespace(compute_logits=None, logitsprocs_need_output_token_ids=needs_history)
     runner.model.mrv2_sampling_context = sampling_context
+    runner.sampler = None
     runner.sample = MagicMock(return_value=sampler_out)
     runner.sample.side_effect = lambda *_: sampler_out if sampling_active is needs_history else pytest.fail()
     logprobs_mock = MagicMock(side_effect=lambda *_: pytest.fail("inside ctx") if sampling_active else {})
@@ -217,6 +218,51 @@ def test_build_async_chunk_outputs_slices_padded_axis_and_splits_channels() -> N
     assert client is None and torch.equal(inter_stage[0]["codes.audio"], req_codes[0])
 
 
+@pytest.mark.parametrize("async_chunk", [False, True])
+@pytest.mark.parametrize(
+    "hidden_padded,codes_padded",
+    [(False, False), (True, False), (False, True), (True, True)],
+    ids=["unpadded", "hidden_padded", "codes_padded", "both_padded"],
+)
+@pytest.mark.parametrize("lengths", [(1, 1, 1), (3, 1, 1)], ids=["decode", "mixed_prefill_decode"])
+def test_async_output_slices_request_payloads_with_graph_padding(
+    monkeypatch, mocker, async_chunk, hidden_padded, codes_padded, lengths
+):
+    """Sync and async transfers must exclude other requests and graph padding."""
+    from vllm.v1.worker.gpu.input_batch import InputBatch
+
+    monkeypatch.setattr(torch.cuda, "set_stream", lambda _stream: None)
+    total = sum(lengths)
+    padded_total = 8 if hidden_padded or codes_padded else total
+    offsets = np.cumsum([0, *lengths])
+    hidden_rows = padded_total if hidden_padded else total
+    code_rows = padded_total if codes_padded else total
+    hidden = torch.arange(hidden_rows * 4, dtype=torch.float32).reshape(hidden_rows, 4)
+    codes = torch.arange(code_rows * 16).reshape(code_rows, 16)
+    # Reference frames are request-local, even if their length matches the
+    # padded token count. They must not be sliced along the batch token axis.
+    refs = [torch.arange(padded_total * 16).reshape(padded_total, 16), torch.empty(0), torch.empty(0)]
+    batch = mocker.Mock(spec=InputBatch)
+    batch.query_start_loc_np = offsets
+    batch.num_scheduled_tokens = np.array(lengths)
+    batch.num_reqs = len(lengths)
+    batch.num_tokens_after_padding = padded_total
+    output = _async_output(
+        req_ids=[f"req-{i}" for i in range(len(lengths))],
+        sampler_output=SamplerOutput(torch.ones(len(lengths), 1, dtype=torch.long), None, None, None),
+        text_hidden=hidden,
+        multimodal_outputs={"codes": {"audio": codes, "ref": refs}},
+        input_batch=batch,
+        async_chunk=async_chunk,
+    ).get_output()
+
+    for i, payload in enumerate(output.inter_stage_outputs):
+        torch.testing.assert_close(payload["codes.audio"], codes[offsets[i] : offsets[i + 1]])
+        torch.testing.assert_close(payload["codes.ref"], refs[i])
+        if not async_chunk:
+            torch.testing.assert_close(payload["hidden"], hidden[offsets[i] : offsets[i + 1]])
+
+
 def test_async_chunk_output_stages_mm_on_copy_stream_before_get_output(monkeypatch) -> None:
     monkeypatch.setattr(torch.cuda, "set_stream", lambda _stream: None)
     calls = []
@@ -259,3 +305,72 @@ def test_request_reference_codes_preserve_local_axis(prefill_first, padded):
     assert outputs[index]["codes.ref"].data_ptr() != ref.data_ptr()
     for i in range(2):
         assert torch.equal(outputs[i]["codes.audio"], codes[offsets[i] : offsets[i + 1]])
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+def test_model_owned_audio_finalizer_runs_after_copy_without_hidden(monkeypatch, streaming):
+    monkeypatch.setattr(torch.cuda, "set_stream", lambda _stream: None)
+    batch = SimpleNamespace(
+        num_reqs=2,
+        query_start_loc_np=np.array([0, 1, 4]),
+        num_scheduled_tokens=np.array([1, 3]),
+        num_tokens_after_padding=4,
+    )
+    snapshot = torch.tensor([[10, 11], [20, 21]])
+    seen = []
+
+    def finalize(payload, counts):
+        seen.append(counts)
+        return {"codes": {"audio": [payload["snapshot"][0:1].clone(), torch.empty(0, dtype=torch.long)]}}
+
+    result = _async_output(
+        req_ids=["audio", "partial"],
+        sampler_output=SamplerOutput(torch.tensor([[99], [100]]), None, None, None),
+        num_sampled_tokens=torch.tensor([1, 0]),
+        multimodal_outputs={"snapshot": snapshot},
+        input_batch=batch,
+        async_chunk=streaming,
+        finalize_multimodal=finalize,
+    ).get_output()
+    snapshot.zero_()
+    assert seen == [[1, 0]]
+    assert result.sampled_token_ids == [[99], []]
+    assert result.inter_stage_outputs[0]["codes.audio"].tolist() == [[10, 11]]
+    assert result.inter_stage_outputs[1]["codes.audio"].numel() == 0
+    assert (result.pooler_output is None) == streaming
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+def test_request_owned_snapshot_skips_generic_partition(monkeypatch, streaming):
+    from vllm_omni.worker_v2.output_snapshot import RequestOutputSnapshot
+
+    monkeypatch.setattr(torch.cuda, "set_stream", lambda _stream: None)
+    monkeypatch.setattr(
+        OmniARModelRunner,
+        "_build_async_chunk_outputs_from_mm",
+        lambda *args: pytest.fail("already partitioned payload was repartitioned"),
+    )
+    batch = SimpleNamespace(
+        num_reqs=2,
+        query_start_loc_np=np.array([0, 1, 4]),
+        num_scheduled_tokens=np.array([1, 3]),
+        num_tokens_after_padding=4,
+    )
+    snapshot = torch.tensor([[10, 11], [20, 21]])
+
+    def finalize(payload, counts):
+        return RequestOutputSnapshot([{"codes.audio": payload["snapshot"][0:1].clone()}, None])
+
+    result = _async_output(
+        req_ids=["audio", "partial"],
+        sampler_output=SamplerOutput(torch.tensor([[99], [100]]), None, None, None),
+        num_sampled_tokens=torch.tensor([1, 0]),
+        multimodal_outputs={"snapshot": snapshot},
+        input_batch=batch,
+        async_chunk=streaming,
+        finalize_multimodal=finalize,
+    ).get_output()
+    snapshot.zero_()
+    assert result.inter_stage_outputs[0]["codes.audio"].tolist() == [[10, 11]]
+    assert result.inter_stage_outputs[1] is None
+    assert (result.pooler_output is None) == streaming

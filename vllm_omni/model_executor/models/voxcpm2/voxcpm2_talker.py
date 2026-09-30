@@ -36,8 +36,8 @@ from vllm.multimodal.audio import AudioResampler
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 
+import vllm_omni.platforms as omni_platform
 from vllm_omni.model_executor.models.output_templates import OmniOutput
-from vllm_omni.platforms import current_omni_platform
 from vllm_omni.utils.speaker_cache import (
     get_speaker_cache,
     iter_custom_voice_profiles,
@@ -377,7 +377,7 @@ class _PerfTimer:
         self._enabled = enabled
         self._device_module = None
         if enabled:
-            device_module = torch.get_device_module(current_omni_platform.get_torch_device())
+            device_module = torch.get_device_module(omni_platform.current_omni_platform.get_torch_device())
             if not hasattr(device_module, "Event"):
                 logger.warning_once(
                     "VoxCPM2 profiler disabled: the current device does not provide accelerator timing events"
@@ -904,7 +904,7 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         # the checkpoint download/read cost at construction time; DummyModelLoader
         # will then randomize the just-loaded _tts params — this is intended.
         model_path = vllm_config.model_config.model
-        self._device = current_omni_platform.get_torch_device()
+        self._device = omni_platform.current_omni_platform.get_torch_device()
         VoxCPM = import_voxcpm2_core()
         native = VoxCPM.from_pretrained(model_path, load_denoiser=False, optimize=False)
         self._tts: nn.Module = native.tts_model.to(self._device)
@@ -929,8 +929,8 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         # for sliding-window streaming decode. 12 matches the nanovllm reference
         # implementation and covers the longest VAE decoder receptive field.
         self._n_decode_pad_frames = 12
-        use_cuda_graph = current_omni_platform.is_cuda()
-        self._enable_torch_compile = current_omni_platform.supports_torch_inductor()
+        use_cuda_graph = omni_platform.current_omni_platform.is_cuda()
+        self._enable_torch_compile = omni_platform.current_omni_platform.supports_torch_inductor()
         self._compile_vae = self._enable_torch_compile
         self._max_decode_steps = 2000
         self._max_batch_size = getattr(vllm_config.scheduler_config, "max_num_seqs", 4)
@@ -1579,7 +1579,7 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         return sr_cond
 
     def _run_vae_decode(self, feat: torch.Tensor) -> torch.Tensor:
-        if feat.device.type != current_omni_platform.device_type:
+        if feat.device.type != omni_platform.current_omni_platform.device_type:
             return self.tts.audio_vae.decode(feat)
 
         sr_cond = self._get_vae_decode_sr_cond(feat.device)
@@ -2355,7 +2355,7 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
     def _run_cfm(self, dit_h: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
         with _NvtxRange("voxcpm2.cfm"):
             if self._cfm_buffers is not None:
-                if self._enable_cfm_cuda_graph and dit_h.device.type == current_omni_platform.device_type:
+                if self._enable_cfm_cuda_graph and dit_h.device.type == omni_platform.current_omni_platform.device_type:
                     return self._run_cfm_cuda_graph(dit_h, cond).transpose(1, 2)
                 return _optimized_solve_euler(
                     self.tts.feat_decoder,
@@ -2379,7 +2379,7 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
     def _run_cfm_for_state(self, state: _RequestState, dit_h: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
         with _NvtxRange("voxcpm2.cfm"):
             if self._cfm_buffers is not None:
-                if self._enable_cfm_cuda_graph and dit_h.device.type == current_omni_platform.device_type:
+                if self._enable_cfm_cuda_graph and dit_h.device.type == omni_platform.current_omni_platform.device_type:
                     if self._has_deterministic_cfm_noise(state) and not self._enable_cfm_prealloc_output:
                         graph = self._get_cfm_cuda_graph(dit_h, cond)
                         with _NvtxRange("voxcpm2.cfm.graph_copy_mu"):
@@ -2715,7 +2715,7 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
 
     def _enqueue_delayed_audio_copy(self, state: _RequestState, audio: torch.Tensor) -> None:
         src = audio.detach().contiguous()
-        if src.device.type != current_omni_platform.device_type:
+        if src.device.type != omni_platform.current_omni_platform.device_type:
             state.pending_audio_copies.append(_PendingAudioCopy(host=src.cpu().contiguous()))
             return
 
@@ -2803,7 +2803,7 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
             if state.is_stopping or state.precomputed_is_stopping is not None:
                 continue
             stop_logits = state.precomputed_stop_logits
-            if stop_logits is None or stop_logits.device.type != current_omni_platform.device_type:
+            if stop_logits is None or stop_logits.device.type != omni_platform.current_omni_platform.device_type:
                 continue
             pending.append((state, stop_logits))
         if not pending:
@@ -3085,7 +3085,7 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
                     ready_req_ids = list(audio_by_req)
                     chunks = [audio_by_req[req_id].reshape(-1) for req_id in ready_req_ids]
                     if self._coalesce_audio_d2h and any(
-                        chunk.device.type == current_omni_platform.device_type for chunk in chunks
+                        chunk.device.type == omni_platform.current_omni_platform.device_type for chunk in chunks
                     ):
                         sizes = [int(chunk.numel()) for chunk in chunks]
                         merged = torch.cat(chunks, dim=0) if len(chunks) > 1 else chunks[0]
@@ -3096,7 +3096,8 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
                     mm["sr"] = [sr for _ in ready_req_ids]
                     mm["meta"] = {"req_id": ready_req_ids, "sparse_audio": ["1"]}
                 elif self._coalesce_audio_d2h and any(
-                    audio.device.type == current_omni_platform.device_type for audio in audio_by_req.values()
+                    audio.device.type == omni_platform.current_omni_platform.device_type
+                    for audio in audio_by_req.values()
                 ):
                     ready_req_ids = list(audio_by_req)
                     chunks = [audio_by_req[req_id].reshape(-1) for req_id in ready_req_ids]

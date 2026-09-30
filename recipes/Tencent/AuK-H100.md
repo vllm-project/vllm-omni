@@ -132,15 +132,23 @@ transcripts, speaker similarity to the upstream output 0.993 to 0.999, log-mel
 L1 0.11 to 0.47 (the upstream VAE-resampling noise floor is 0.39). Flash:
 0.989 to 0.999 and 0.24 to 0.51. Wall per request on the second call: base
 1.0 to 2.0 s for 3.5 to 10.9 s of audio, Flash 0.17 to 0.30 s; engine start
-about 47 s with a warm page cache.
+about 47 s with a warm page cache, plus the codec decode compile on the
+diffusion stage (about a minute on a cold Inductor cache, ~30 s warm).
 
 ## Notes
 
 - Memory usage: about 25 GB peak on the device for a 12 s generation with
   both stages resident (deploy defaults: encoder 0.45, diffusion stage 0.35
-  of device memory).
-- Key flags: `enforce_eager` on both stages (the encoder walks the decoder
-  layers itself for the layer fusion). `enable_prefix_caching` must stay off
+  of device memory), plus about 1 GB of CUDA graph pools for the compiled
+  codec decode buckets.
+- Key flags: `enforce_eager` on the encoder stage (it walks the decoder
+  layers itself for the layer fusion); the diffusion stage runs with
+  `enforce_eager: false` so the codec decode is compiled into bucketed CUDA
+  graphs at startup (128/256/512 latent frames, i.e. up to 10.24 s; longer
+  clips are decoded in overlapping 512-frame tiles of the same graph;
+  override with `model_config.auk_vae_compile_shapes` and
+  `auk_vae_tile_frames`). The DiT itself stays eager unless
+  `diffusion_compile_granularity: full`. `enable_prefix_caching` must stay off
   for the encoder: a cache hit skips prompt positions that the fused
   condition needs. `enable_chunked_prefill` is off by default: forcing it
   (128-token chunks, so two to three chunks per prompt) reproduces the

@@ -19,6 +19,8 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 class _DummyInputBatch:
+    is_prefilling_np: np.ndarray
+
     input_ids: SimpleNamespace
     query_start_loc: torch.Tensor
 
@@ -391,3 +393,259 @@ def test_mtp_requires_model_declared_output_key(output_key):
     model = SimpleNamespace(mtp=lambda: None, mtp_output_key=output_key)
     with pytest.raises(TypeError, match="must declare mtp_output_key"):
         state._init_mtp_runner(model)
+
+
+_EAGER_DIM = 3
+_CODEBOOK = 2048
+_EOS = 2150
+
+
+class _EagerBatch(_DummyInputBatch):
+    def __init__(self, spans, indices=None):
+        indices = list(range(len(spans))) if indices is None else indices
+        super().__init__(indices)
+        starts = [0]
+        for n_tok in spans:
+            starts.append(starts[-1] + n_tok)
+        self.num_scheduled_tokens = list(spans)
+        self.query_start_loc_np = starts[:-1]
+        self.query_start_loc = torch.tensor(starts, dtype=torch.int32)
+
+
+def _make_eager_state(max_num_reqs=4):
+    state = _make_state(max_num_reqs=max_num_reqs, has_preprocess=True)
+    _init_static(state, max_num_reqs, dim=_EAGER_DIM)
+    from vllm_omni.worker_v2.model_states.eager_mtp import EagerMTPState
+
+    state._eager_state = EagerMTPState(state)
+    state._first_audio_requests = set()
+    state._eager_mtp = True
+    state._eager_fastpath = False
+    state._eager_rows = None
+    state._eager_ready = {}
+    state._eager_settled = {}
+    state._eager_embeds = torch.zeros((max_num_reqs, _EAGER_DIM))
+    state._decode_preprocess = None
+    state._mtp_sample_uniforms = None
+    state.vllm_config.cache_config = SimpleNamespace(enable_prefix_caching=False)
+    model = state.model
+    model.first_frame_decoder = None
+    model.mtp_frame_valid = lambda layer0: (layer0 >= 0) & (layer0 < _CODEBOOK)
+    model.embed_input_ids = lambda ids: ids.float().reshape(-1, 1, 1).expand(-1, 1, _EAGER_DIM)
+    model.mtp_calls = []
+
+    def mtp(input_ids, input_embeds, last_hidden, text_step, **kwargs):
+        model.mtp_calls.append((input_ids.clone(), last_hidden.clone(), text_step.clone()))
+        codes = torch.stack([input_ids, input_ids + 1, input_ids + 2], dim=1)
+        # Frame embedding sum plus the text step, like the Qwen3 talkers.
+        return input_embeds + 100 + text_step, codes
+
+    model.mtp = mtp
+    return state
+
+
+def _eager_outputs(num_tokens):
+    return {
+        "codes": {"audio": torch.zeros((num_tokens, 3), dtype=torch.long)},
+        "meta": {"codec_frame_valid": torch.zeros((num_tokens,), dtype=torch.int8)},
+    }
+
+
+def test_eager_mtp_publishes_frames_in_the_step_that_sampled_cb0():
+    state = _make_eager_state()
+    _fill_buffers(state, "prefill", "decode", "ended")
+    # prefill: final 3-token chunk; decode: input CB0 42; ended: input CB0 was
+    # EOS (async scheduling ran the finished request once more).
+    batch = _EagerBatch([3, 1, 1])
+    input_ids = torch.tensor([0, 0, 0, 42, _EOS])
+    state._eager_rows = (batch, [(0, 0, "prefill", True), (1, 1, "decode", False), (2, 2, "ended", False)], input_ids)
+    text_hidden = torch.arange(5 * _EAGER_DIM, dtype=torch.float32).reshape(5, _EAGER_DIM)
+    sampled = torch.tensor([[7], [_EOS], [9]])
+    outputs = _eager_outputs(5)
+
+    state.run_eager_mtp(batch, text_hidden, sampled, outputs)
+
+    ids, hidden, text_step = state.model.mtp_calls[0]
+    assert ids.tolist() == [7, _EOS, 9]
+    # The frame's hidden is this step's last-token hidden of each span.
+    assert torch.equal(hidden, text_hidden[[2, 3, 4]])
+    # The next step adds its own text step.
+    assert not text_step.any()
+    codes = outputs["codes"]["audio"]
+    assert codes[2].tolist() == [7, 8, 9]
+    assert codes[3].tolist() == [_EOS, _EOS + 1, _EOS + 2]
+    assert codes[4].tolist() == [9, 10, 11]
+    assert not codes[:2].any()
+    # Valid only when both the sampled and (for decode) the input CB0 are codec ids.
+    assert outputs["meta"]["codec_frame_valid"].tolist() == [0, 0, 1, 0, 0]
+    assert state._eager_ready == {0: "prefill", 1: "decode", 2: "ended"}
+    assert torch.equal(state._eager_embeds[0], torch.full((_EAGER_DIM,), 107.0))
+    assert state._eager_rows is None
+
+
+def test_eager_mtp_ignores_rows_recorded_for_another_batch():
+    state = _make_eager_state()
+    _fill_buffers(state, "r0")
+    state._eager_rows = (_EagerBatch([1]), [(0, 0, "r0", False)], torch.tensor([5]))
+    outputs = _eager_outputs(1)
+    state.run_eager_mtp(_EagerBatch([1]), torch.zeros(1, _EAGER_DIM), torch.tensor([[3]]), outputs)
+    assert state.model.mtp_calls == []
+    assert not outputs["codes"]["audio"].any()
+
+
+def test_eager_mtp_requires_retained_frame_outputs():
+    state = _make_eager_state()
+    _fill_buffers(state, "r0")
+    batch = _EagerBatch([1])
+    state._eager_rows = (batch, [(0, 0, "r0", False)], torch.tensor([5]))
+    with pytest.raises(RuntimeError, match="requires retained codes.audio"):
+        state.run_eager_mtp(batch, torch.zeros(1, _EAGER_DIM), torch.tensor([[3]]), {"codes": {"audio": None}})
+
+
+def test_eager_decode_input_is_previous_frame_plus_text_step():
+    state = _make_eager_state()
+    _fill_buffers(state, "r0", "r1")
+    state._eager_ready = {0: "r0", 1: "r1"}
+    state._eager_embeds[0] = 5.0
+    state._eager_embeds[1] = 7.0
+    embeds = torch.zeros((2, _EAGER_DIM))
+    batches = [
+        (0, 0, (torch.zeros(_EAGER_DIM), torch.full((_EAGER_DIM,), 2.0))),
+        (1, 1, (None, torch.ones(_EAGER_DIM))),
+    ]
+    state._eager_state._apply_eager_frames(batches, embeds, _EagerBatch([1, 1]), None)
+    assert embeds.tolist() == [[7.0] * _EAGER_DIM, [8.0] * _EAGER_DIM]
+    # The deferred MTP must not run for an eager decode row.
+    assert state.model.mtp_calls == []
+
+
+def test_eager_decode_without_a_frame_fails_loudly():
+    state = _make_eager_state()
+    _fill_buffers(state, "r0")
+    batches = [(0, 0, (torch.zeros(_EAGER_DIM), torch.zeros(_EAGER_DIM)))]
+    with pytest.raises(RuntimeError, match="frame missing"):
+        state._eager_state._apply_eager_frames(batches, torch.zeros((1, _EAGER_DIM)), _EagerBatch([1]), None)
+
+
+def test_run_preprocess_records_rows_that_keep_a_sample():
+    state = _make_eager_state()
+    _fill_buffers(state, "chunk", "final", "decode")
+    state._eager_ready = {2: "decode"}
+    state._eager_embeds[2] = 4.0
+    text_step = torch.ones(_EAGER_DIM)
+
+    def preprocess(input_ids, input_embeds, **info):
+        updates = {"mtp_inputs": (torch.zeros(_EAGER_DIM), text_step)} if input_ids.shape[0] == 1 else {}
+        return input_ids, input_embeds, updates
+
+    state.model.preprocess = preprocess
+    batch = _EagerBatch([3, 3, 1])
+    model_inputs = {"input_ids": torch.zeros(7, dtype=torch.long), "inputs_embeds": torch.zeros((7, _EAGER_DIM))}
+    req_states = SimpleNamespace(
+        prompt_len=np.array([10, 10, 10], dtype=np.int32),
+        num_computed_tokens=np.array([0, 7, 10], dtype=np.int32),
+    )
+    state.run_preprocess(batch, model_inputs, req_states)
+
+    recorded_batch, entries, _ids = state._eager_rows
+    assert recorded_batch is batch
+    # A non-final prefill chunk samples nothing that is kept.
+    assert entries == [(1, 1, "final", True), (2, 2, "decode", False)]
+    assert model_inputs["inputs_embeds"][6].tolist() == [5.0] * _EAGER_DIM
+    assert state.model.mtp_calls == []
+
+
+@pytest.mark.parametrize("first_was_valid", [False, True])
+def test_first_audio_requirement_survives_eos_only_if_audio_was_queued(first_was_valid):
+    state = _make_eager_state()
+    _fill_buffers(state, "r0")
+    state._first_audio_requests.add("r0")
+    state._eager_state._first_audio_valid = torch.tensor([first_was_valid, False, False, False])
+    batch = _EagerBatch([1])
+    state._eager_rows = (batch, [(0, 0, "r0", False)], torch.tensor([5]))
+    outputs = _eager_outputs(1)
+    outputs["meta"]["first_audio"] = torch.zeros(1, dtype=torch.bool)
+    state.run_eager_mtp(batch, torch.zeros(1, _EAGER_DIM), torch.tensor([[_EOS]]), outputs)
+    assert outputs["meta"]["first_audio"].tolist() == [first_was_valid]
+
+
+@pytest.mark.parametrize("accepted", [[], ["r1"], ["r0", "r1"]])
+def test_first_audio_marker_requires_accepted_delivery(monkeypatch, accepted):
+    from contextlib import nullcontext
+
+    state = _make_eager_state()
+    _fill_buffers(state, "r0", "r1")
+    state.model.first_frame_decoder = SimpleNamespace(
+        sample_rate=24000, decode=lambda codes: torch.ones(codes.shape[0], 2)
+    )
+    state._first_audio_stream = SimpleNamespace(wait_stream=lambda stream: None)
+    state._first_audio_sender = SimpleNamespace(submit=lambda ids, pcm, sr, valid: accepted)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda device: None)
+    monkeypatch.setattr(torch.cuda, "stream", lambda stream: nullcontext())
+    monkeypatch.setattr(torch.Tensor, "record_stream", lambda tensor, stream: None)
+    batch = _EagerBatch([1, 1])
+    state._eager_rows = (batch, [(0, 0, "r0", True), (1, 1, "r1", True)], torch.zeros(2, dtype=torch.long))
+    outputs = _eager_outputs(2)
+    outputs["meta"]["first_audio"] = torch.zeros(2, dtype=torch.bool)
+
+    state.run_eager_mtp(batch, torch.zeros(2, _EAGER_DIM), torch.tensor([[7], [8]]), outputs)
+
+    assert state._first_audio_requests == set(accepted)
+    # A missing route must leave the normal codec path responsible for frame 0;
+    # otherwise it skips the frame and the orchestrator waits forever for it.
+    assert outputs["meta"]["first_audio"].tolist() == ["r0" in accepted, "r1" in accepted]
+
+
+class _FakeEvent:
+    def record(self, stream=None) -> None:
+        self.stream = stream
+
+
+def test_publish_sampled_embeddings_for_rows_whose_sample_is_kept(monkeypatch) -> None:
+    monkeypatch.setattr(torch.cuda, "Event", _FakeEvent)
+    state = _make_state()
+    state.model.publishes_sampled_embeddings = True
+    state.model.embed_input_ids = lambda ids: ids.to(torch.float32).reshape(-1, 1).repeat(1, 3)
+    # Rows: final prefill chunk, decode, non-final prefill chunk, one-chunk prefill.
+    batch = SimpleNamespace(
+        num_reqs=4,
+        num_scheduled_tokens=[4, 1, 2, 6],
+        num_computed_prefill_tokens_np=np.array([2, 9, 0, 0], dtype=np.int32),
+        prefill_len_np=np.array([6, 9, 5, 6], dtype=np.int32),
+        is_prefilling_np=np.array([True, False, True, True]),
+    )
+    extra, _done = state.publish_sampled_embeddings(batch, torch.tensor([[11], [12], [13], [14]]))
+    sampled = extra["embed"]["sampled"]
+    # A non-final prefill chunk's sample is discarded, so it publishes nothing.
+    assert [tuple(row.shape) for row in sampled] == [(1, 3), (1, 3), (0,), (1, 3)]
+    assert [row.tolist() for row in sampled if row.numel()] == [[[v] * 3] for v in (11.0, 12.0, 14.0)]
+
+    # Speculative steps sample several tokens per row: not published.
+    assert state.publish_sampled_embeddings(batch, torch.tensor([[11, 1], [12, 1], [13, 1], [14, 1]])) is None
+
+
+def test_publish_sampled_embeddings_is_opt_in() -> None:
+    state = _make_state()
+    state.model.publishes_sampled_embeddings = False
+    assert state.publish_sampled_embeddings(SimpleNamespace(num_reqs=1), torch.tensor([[1]])) is None
+
+
+@pytest.mark.parametrize("prefilling", [False, True])
+def test_identity_preprocess_skips_only_decode_rows(prefilling):
+    state = _make_state(has_preprocess=True)
+    state._decode_preprocess_is_identity = True
+    state._decode_preprocess = None
+    state.intermediate_buffer.buffers[0] = {"req_id": "r1"}
+    seen = []
+
+    def preprocess(input_ids, input_embeds, **info):
+        seen.append(info["req_id"])
+        return input_ids, input_embeds, {}
+
+    state.model.preprocess = preprocess
+    batch = _DummyInputBatch([0])
+    batch.is_prefilling_np = np.array([prefilling])
+    embeds = torch.ones(1, 4)
+    state.run_preprocess(batch, {"input_ids": torch.tensor([1]), "inputs_embeds": embeds})
+    assert seen == (["r1"] if prefilling else [])
+    assert torch.equal(embeds, torch.ones(1, 4))
