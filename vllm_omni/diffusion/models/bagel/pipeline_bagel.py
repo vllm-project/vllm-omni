@@ -14,7 +14,6 @@ from dataclasses import dataclass
 from math import isqrt
 from typing import TYPE_CHECKING, Any, ClassVar
 
-import numpy as np
 import torch
 import torch.nn.functional as F
 from PIL import Image
@@ -44,6 +43,7 @@ from vllm_omni.model_executor.model_loader.weight_utils import download_weights_
 
 from .autoencoder import AutoEncoder, AutoEncoderParams, DistributedAutoEncoder
 from .bagel_transformer import Bagel, NaiveCache, Qwen2MoTConfig, Qwen2MoTForCausalLM
+from .image_transforms import resize_for_vae, resize_for_vit, to_tensor, vae_size
 
 logger = init_logger(__name__)
 
@@ -169,24 +169,8 @@ def _bagel_effective_image_size(
     max_latent_size: int,
 ) -> tuple[int, int]:
     """Match BAGEL's img2img resize and return ``(height, width)``."""
-
-    width, height = image_size
-    if width <= 0 or height <= 0:
-        raise ValueError(f"BAGEL img2img input must have positive dimensions, got {width}x{height}.")
-
-    max_image_size = int(max_latent_size * latent_downsample)
-    scale = min(max_image_size / max(width, height), 1.0)
-    min_image_size = min(256, max_image_size)
-    scale = max(scale, min_image_size / min(width, height))
-    resized_width = max(
-        latent_downsample,
-        int(round(width * scale / latent_downsample) * latent_downsample),
-    )
-    resized_height = max(
-        latent_downsample,
-        int(round(height * scale / latent_downsample) * latent_downsample),
-    )
-    return min(resized_height, max_image_size), min(resized_width, max_image_size)
+    width, height = vae_size(*image_size, max_size=int(max_latent_size * latent_downsample), stride=latent_downsample)
+    return height, width
 
 
 def _bagel_canvas_requested(sampling: OmniDiffusionSamplingParams) -> bool:
@@ -719,32 +703,15 @@ class BagelPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProf
             if image_input:
                 # If we have an image, we prefill with it
                 if self.image_processor and self.vae:
-
-                    def vit_transforms(img):
-                        return self.image_processor(images=img, return_tensors="pt").pixel_values[0]
-
                     stride = self.bagel.latent_downsample
                     max_img_size = int(self.bagel.max_latent_size * stride)
+                    vit_stride = self.bagel.vit_patch_size
+                    vit_max_size = int(self.bagel.vit_max_num_patch_per_side * vit_stride)
 
-                    def _resize_to_stride(img):
-                        if img.mode != "RGB":
-                            img = img.convert("RGB")
-                        w, h = img.size
-                        # Scale down if longest edge exceeds max
-                        scale = min(max_img_size / max(w, h), 1.0)
-                        # Scale up if shortest edge is too small (min 256)
-                        min_img_size = min(256, max_img_size)
-                        scale = max(scale, min_img_size / min(w, h))
-                        new_w = max(stride, int(round(w * scale / stride) * stride))
-                        new_h = max(stride, int(round(h * scale / stride) * stride))
-                        # Clamp to max
-                        new_w = min(new_w, max_img_size)
-                        new_h = min(new_h, max_img_size)
-                        if new_w != w or new_h != h:
-                            img = img.resize((new_w, new_h), Image.BICUBIC)
-                        return img
+                    def vit_transforms(img):
+                        return to_tensor(resize_for_vit(img, max_size=vit_max_size, stride=vit_stride))
 
-                    image_input = [_resize_to_stride(img) for img in image_input]
+                    image_input = [resize_for_vae(img, max_size=max_img_size, stride=stride) for img in image_input]
 
                     resized_w, resized_h = image_input[0].size
                     if not image_shape_requested:
@@ -757,20 +724,13 @@ class BagelPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProf
                         image_shape[0],
                     )
 
-                    def vae_transforms(img):
-                        if img.mode != "RGB":
-                            img = img.convert("RGB")
-                        # Convert to [-1, 1] tensor (H, W, C) -> (C, H, W)
-                        arr = torch.from_numpy(np.array(img)).float() / 127.5 - 1.0
-                        return arr.permute(2, 0, 1)
-
                     # Update gen_context with image (VAE + ViT)
                     if not understanding:
                         gen_input_vae, newlens_vae, new_rope_vae = self.bagel.prepare_vae_images(
                             curr_kvlens=gen_context["kv_lens"],
                             curr_rope=gen_context["ropes"],
                             images=image_input,
-                            transforms=vae_transforms,
+                            transforms=to_tensor,
                             new_token_ids=self.new_token_ids,
                         )
                         for k, v in gen_input_vae.items():
