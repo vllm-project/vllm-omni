@@ -227,8 +227,11 @@ def test_checkpoint_calibration_preserves_block_sparse_spec():
 
 
 @pytest.mark.cpu
-def test_provider_neutral_config_and_missing_adapter():
+def test_provider_neutral_config_and_missing_adapter(monkeypatch):
+    from vllm_omni.diffusion.attention.backends.flashinfer_attn import FlashInferAttentionBackend
     from vllm_omni.diffusion.attention.selector import get_attn_backend_for_role
+
+    monkeypatch.setattr(FlashInferAttentionBackend, "get_block_sparse_adapter", classmethod(lambda cls: None))
 
     cfg = AttentionConfig(
         default={

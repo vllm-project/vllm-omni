@@ -20,7 +20,7 @@ pytestmark = [
 ]
 
 
-@pytest.fixture(params=["FLASH_ATTN"])
+@pytest.fixture(params=["FLASH_ATTN", "FLASHINFER_ATTN"])
 def sparse_adapter(request):
     # Add a provider here and its dependency/device setup below to run the same contract.
     if not torch.cuda.is_available():
@@ -29,6 +29,8 @@ def sparse_adapter(request):
         if torch.cuda.get_device_capability() not in ((9, 0), (10, 0), (10, 3)):
             pytest.skip("Requires Hopper or datacenter Blackwell")
         pytest.importorskip("flash_attn.cute")
+    else:
+        pytest.importorskip("flashinfer.sparse")
     adapter_cls = DiffusionAttentionBackendEnum[request.param].get_class().get_block_sparse_adapter()
     assert adapter_cls is not None
     torch.compiler.reset()
@@ -45,6 +47,7 @@ def sparse_adapter(request):
         (2, torch.bfloat16, "per_row", True),
         (4, torch.float16, "per_row", False),
         (4, torch.bfloat16, "full", False),
+        (4, torch.bfloat16, "per_row", True),
     ],
 )
 @pytest.mark.parametrize("value_size", [64, 128])
@@ -52,8 +55,12 @@ def sparse_adapter(request):
 def test_selected_attention_contract(sparse_adapter, kv_heads, dtype, pattern, compile_case, value_size):
     # FA4 b33 adapts tiles to 64x64 on Hopper. Blackwell defaults to
     # tile_n=128 and two 128-row Q stages for these sequence lengths.
-    blackwell = torch.cuda.get_device_capability()[0] == 10
+    blackwell = sparse_adapter.provider == "FLASH_ATTN" and torch.cuda.get_device_capability()[0] == 10
     block_size = (256, 128) if blackwell else (64, 64)
+    if sparse_adapter.provider == "FLASHINFER_ATTN" and kv_heads != 4:
+        with pytest.raises(ValueError, match="requires MHA"):
+            sparse_adapter.prepare("auto", 128, 4, kv_heads, torch.device("cuda"), block_size)
+        return
     q, k, v = make_attention_inputs(
         kv_heads=kv_heads,
         q_len=513 if blackwell else 129,
@@ -61,6 +68,10 @@ def test_selected_attention_contract(sparse_adapter, kv_heads, dtype, pattern, c
         value_size=value_size,
         dtype=dtype,
     )
+    if sparse_adapter.provider == "FLASHINFER_ATTN" and value_size != 128:
+        with pytest.raises(ValueError, match="equal Q/K/V head dimensions"):
+            sparse_adapter.validate_inputs(q, k, v)
+        return
     q, k, v = (torch.stack((t, t), dim=-1)[..., 0] for t in (q, k, v))
     scale = q.shape[-1] ** -0.5
     rows = (q.shape[0], q.shape[2], math.ceil(q.shape[1] / block_size[0]))
@@ -97,6 +108,16 @@ def test_selected_attention_contract(sparse_adapter, kv_heads, dtype, pattern, c
     torch.testing.assert_close(
         run(q, k, v, updated, scale, block_size).float(), updated_expected, atol=0.004, rtol=0.02
     )
+    if pattern == "per_row":
+        # Same geometry and counts, different selected keys: no cached plan may
+        # reuse old routes. Distinct heads and batch entries change independently.
+        changed_indices = indices.clone()
+        changed_indices[..., 0] = 1 - indices[..., 0]
+        changed = BlockSelection(changed_indices, counts)
+        expected_changed = selected_attention_reference(q, k, v, changed, scale, block_size)
+        torch.testing.assert_close(
+            run(q, k, v, changed, scale, block_size).float(), expected_changed, atol=0.004, rtol=0.02
+        )
     torch.testing.assert_close(result, saved_result, atol=0, rtol=0)
     for original, snapshot in zip(tensors, snapshots):
         torch.testing.assert_close(original, snapshot, atol=0, rtol=0)
