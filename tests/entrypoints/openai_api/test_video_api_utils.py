@@ -3,6 +3,7 @@
 """Unit tests for OpenAI-compatible video API encoding helpers."""
 
 import base64
+import shutil
 import threading
 from io import BytesIO
 from typing import Any
@@ -27,6 +28,19 @@ def _png_bytes(size: tuple[int, int] = (2, 1)) -> bytes:
     buffer = BytesIO()
     Image.new("RGB", size, color=(12, 34, 56)).save(buffer, format="PNG")
     return buffer.getvalue()
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg is not installed")
+def test_encode_video_bytes_selects_portable_ffmpeg_default() -> None:
+    encoded = video_api_utils._encode_video_bytes(
+        np.zeros((2, 16, 16, 3), dtype=np.uint8),
+        fps=12,
+        backend="ffmpeg",
+        video_codec_options={"preset": "ultrafast", "threads": "1"},
+    )
+
+    with av.open(BytesIO(encoded)) as container:
+        assert len(list(container.decode(video=0))) == 2
 
 
 def _install_http_transport(monkeypatch, handler, client_kwargs):
@@ -169,7 +183,7 @@ async def test_decode_input_reference_preserves_image_pixel_limit_error(monkeypa
 
 
 def _install_fake_video_mux(monkeypatch, mux_calls):
-    def _fake_mux_video_audio_bytes(frames, audio, fps, audio_sample_rate, video_codec_options=None):
+    def _fake_mux_video_audio_bytes(frames, audio, fps, audio_sample_rate, video_codec_options=None, backend="pyav"):
         mux_calls.append(
             {
                 "frames": frames,
@@ -177,6 +191,7 @@ def _install_fake_video_mux(monkeypatch, mux_calls):
                 "fps": fps,
                 "audio_sample_rate": audio_sample_rate,
                 "video_codec_options": video_codec_options,
+                "backend": backend,
             }
         )
         return b"fake-video"
@@ -202,6 +217,7 @@ def test_encode_video_bytes_exports_frames_without_interpolation(monkeypatch):
     assert mux_calls[0]["frames"].dtype == np.uint8
     assert mux_calls[0]["fps"] == 8.0
     assert mux_calls[0]["audio"] is None
+    assert mux_calls[0]["backend"] == "pyav"
 
 
 def test_float_frames_are_converted_without_stacking_full_video(monkeypatch):
