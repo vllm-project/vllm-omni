@@ -1491,7 +1491,7 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
                         (
                             max(
                                 min(
-                                    int(req.sampling_params.max_tokens) - int(req.num_output_tokens),
+                                    int(req.sampling_params.max_tokens) - len(req.output_token_ids),
                                     context_budget[index],
                                 ),
                                 0,
