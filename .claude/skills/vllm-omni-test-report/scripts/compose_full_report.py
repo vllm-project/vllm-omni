@@ -606,7 +606,7 @@ METRIC_ANALYSIS_INSERTION_MARKER = "@@METRIC_ANALYSIS_INSERTION_POINT@@"
 
 
 def render_metric_analysis_section() -> str:
-    """Markdown for ``## 指标分析(英文)`` — an editable rich-text analysis box.
+    """Markdown for ``## Metric analysis`` — an editable rich-text analysis box.
 
     Emits the H2 plus a single placeholder marker
     (``@@METRIC_ANALYSIS_INSERTION_POINT@@``) that
@@ -620,7 +620,7 @@ def render_metric_analysis_section() -> str:
     interprets.
     """
     return (
-        "## 指标分析(英文)\n\n"
+        "## Metric analysis\n\n"
         f"{METRIC_ANALYSIS_INSERTION_MARKER}\n"
     )
 

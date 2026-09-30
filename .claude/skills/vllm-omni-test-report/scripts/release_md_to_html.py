@@ -125,7 +125,7 @@ def _release_section_theme(title_plain: str) -> tuple[str, str]:
         return "conclusion", _RELEASE_SVG_CHECK
     if "metrics" in low:
         return "metrics", _RELEASE_SVG_CHART
-    if "指标分析" in t or "metric analysis" in low:
+    if "metric analysis" in low:
         return "metric-analysis", _RELEASE_SVG_CHART
     if "failure analysis" in low:
         return "failure", _RELEASE_SVG_ALERT
@@ -1755,7 +1755,7 @@ _DEVICE_HOURS_BUILD_SCRIPT = """<script>
   }
 
   function initAll() {
-    var inputs = document.querySelectorAll("input.dhpb-input[data-dhpb-marker=\"1\"]");
+    var inputs = document.querySelectorAll('input.dhpb-input[data-dhpb-marker="1"]');
     for (var i = 0; i < inputs.length; i++) { hydrate(inputs[i]); }
   }
 
@@ -1801,7 +1801,7 @@ def _upgrade_metric_analysis_block(html_fragment: str) -> str:
     """Swap the ``@@METRIC_ANALYSIS_INSERTION_POINT@@`` marker for the rich-text editor.
 
     The marker is emitted by ``compose_full_report.render_metric_analysis_section``
-    inside the ``## 指标分析(英文)`` section body. The marker string is unique, so a
+    inside the ``## Metric analysis`` section body. The marker string is unique, so a
     literal ``str.replace`` is safe (mirrors ``_upgrade_device_hours_cell``). The
     JS handler lives in :data:`_METRIC_ANALYSIS_SCRIPT`.
     """
@@ -1884,7 +1884,7 @@ _METRIC_ANALYSIS_SCRIPT = """<script>
   }
 
   function initAll() {
-    var editors = document.querySelectorAll(".metric-analysis-editor[data-ma-marker=\"1\"]");
+    var editors = document.querySelectorAll('.metric-analysis-editor[data-ma-marker="1"]');
     for (var i = 0; i < editors.length; i++) { hydrate(editors[i]); }
     initToolbar();
   }
