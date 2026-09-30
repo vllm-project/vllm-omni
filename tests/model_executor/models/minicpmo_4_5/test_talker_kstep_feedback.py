@@ -317,7 +317,9 @@ def test_constant_drafts_fold_when_a_stop_truncates_a_row():
     from vllm_omni.platforms.npu.worker import talker_multiframe
 
     # Five staggered codecs, K=6: one stopped at frame 3 (4 tokens), three
-    # at frame 4 (5 tokens), one ran the step out (6 tokens).
+    # at frame 4 (5 tokens), one ran the step out (6 tokens). Every request
+    # ran on a drafted step (5 drafts each), so the short rows are real
+    # truncations.
     sampled = [
         [1, 2, 3, 4],
         [1, 2, 3, 4, 5],
@@ -325,14 +327,22 @@ def test_constant_drafts_fold_when_a_stop_truncates_a_row():
         [1, 2, 3, 4, 5],
         [1, 2, 3, 4, 5, 6],
     ]
-    assert talker_multiframe.constant_drafts(sampled, frames=6, num_reqs=5) == [[] for _ in range(5)]
+    scheduled = [5, 5, 5, 5, 5]
+    assert (
+        talker_multiframe.constant_drafts(sampled, frames=6, num_reqs=5, scheduled_draft_counts=scheduled)
+        == [[] for _ in range(5)]
+    )
 
 
 def test_constant_drafts_fold_when_a_row_samples_nothing():
     from vllm_omni.platforms.npu.worker import talker_multiframe
 
     sampled = [[1, 2, 3, 4, 5, 6], [], [1, 2, 3, 4, 5, 6]]
-    assert talker_multiframe.constant_drafts(sampled, frames=6, num_reqs=3) == [[] for _ in range(3)]
+    scheduled = [5, 5, 5]
+    assert (
+        talker_multiframe.constant_drafts(sampled, frames=6, num_reqs=3, scheduled_draft_counts=scheduled)
+        == [[] for _ in range(3)]
+    )
 
 
 def test_constant_drafts_keep_drafts_when_every_row_is_full():
@@ -341,8 +351,45 @@ def test_constant_drafts_keep_drafts_when_every_row_is_full():
     from vllm_omni.platforms.npu.worker import talker_multiframe
 
     sampled = [[1, 2, 3, 4, 5, 6], [1, 2, 3, 4, 5, 6]]
-    drafts = talker_multiframe.constant_drafts(sampled, frames=6, num_reqs=2)
+    scheduled = [5, 5]
+    drafts = talker_multiframe.constant_drafts(sampled, frames=6, num_reqs=2, scheduled_draft_counts=scheduled)
     assert drafts == [[talker_multiframe.CONTINUE_TOKEN_ID] * 5 for _ in range(2)]
+
+
+def test_constant_drafts_start_kstep_after_a_draftless_step():
+    """A one-token row on a step the scheduler ran without drafts is the
+    expected shape of a prefill result or of an ordinary single-frame step --
+    not a truncation. These are exactly where the K-step span starts or
+    resumes: the drafts must be emitted, or the loop never engages (the
+    next step schedules one token again, produces another one-token row,
+    and no drafts ever appear). Regression for the three-tier bench stall
+    where 31/32 requests hung on this exact shape.
+    """
+    from vllm_omni.platforms.npu.worker import talker_multiframe
+
+    # Prefill just completed for both requests: one token each, zero drafts.
+    sampled = [[42], [43]]
+    scheduled = [0, 0]
+    drafts = talker_multiframe.constant_drafts(sampled, frames=8, num_reqs=2, scheduled_draft_counts=scheduled)
+    assert drafts == [[talker_multiframe.CONTINUE_TOKEN_ID] * 7 for _ in range(2)]
+
+    # Same shape after an intentional single-frame fallback step: the span
+    # must resume on the next step.
+    sampled = [[7]]
+    drafts = talker_multiframe.constant_drafts(sampled, frames=8, num_reqs=1, scheduled_draft_counts=[0])
+    assert drafts == [[talker_multiframe.CONTINUE_TOKEN_ID] * 7]
+
+
+def test_constant_drafts_fold_a_mixed_drafted_and_undrafted_batch():
+    """Some requests ran the K-step span while others sat out on a
+    single-frame step: the rows cannot share one span (``applies`` refuses
+    non-uniform schedules), so the batch folds rather than guess."""
+    from vllm_omni.platforms.npu.worker import talker_multiframe
+
+    sampled = [[1, 2, 3, 4, 5, 6, 7, 8], [9]]
+    scheduled = [7, 0]
+    drafts = talker_multiframe.constant_drafts(sampled, frames=8, num_reqs=2, scheduled_draft_counts=scheduled)
+    assert drafts == [[], []]
 
 
 def _vocab_runner(*, supports_multi_frame: bool, vocab_size: int):

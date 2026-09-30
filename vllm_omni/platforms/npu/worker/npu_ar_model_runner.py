@@ -235,6 +235,16 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
 
         frames = talker_multiframe.drafts_this_step(self)
         if frames > 1:
+            # How many draft positions each request actually ran with in this
+            # step -- the scheduler's own account, and the only reliable way to
+            # tell a truncated K-frame row apart from an ordinary one-token
+            # result (prefill, or a step the loop intentionally sat out). The
+            # vllm-ascend call site passes (sampling_metadata, scheduler_output,
+            # spec_decode_metadata, ...) positionally after the sampled ids.
+            scheduler_output = next((a for a in args if hasattr(a, "scheduled_spec_decode_tokens")), None)
+            scheduled = getattr(scheduler_output, "scheduled_spec_decode_tokens", None) or {}
+            req_ids = list(getattr(self.input_batch, "req_ids", []) or [])
+            scheduled_draft_counts = [len(scheduled.get(req_id, ())) for req_id in req_ids[: self.input_batch.num_reqs]]
             if not isinstance(valid_sampled_token_ids, list):
                 # The padded-drafter branch passes the verify output tensor;
                 # `constant_drafts` can only read list rows, so if we ever
@@ -253,7 +263,10 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                     else None,
                 )
             drafts = talker_multiframe.constant_drafts(
-                valid_sampled_token_ids, frames, self.input_batch.num_reqs
+                valid_sampled_token_ids,
+                frames,
+                self.input_batch.num_reqs,
+                scheduled_draft_counts,
             )
             if not any(drafts):
                 # Dump the rows as they were seen. An all-empty batch here is
@@ -267,6 +280,7 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                         f"rows={len(rows)}"
                         f" types={[type(r).__name__ for r in rows[:8]]}"
                         f" lens={[len(r) for r in rows[:8] if isinstance(r, list)]}"
+                        f" scheduled={scheduled_draft_counts[:8]}"
                         f" head={repr(rows)[:400]}"
                     )
                 else:

@@ -573,29 +573,41 @@ def constant_drafts(
     valid_sampled_token_ids: Any,
     frames: int,
     num_reqs: int,
+    scheduled_draft_counts: list[int] | None = None,
 ) -> list[list[int]]:
     """`continue` repeated -- for the whole batch, or for none of it.
 
     The drafts are how the next step gets K query positions per request, and
     the multi-frame loop can only run a step whose requests all have the *same*
     span: it replays one captured uniform-decode graph and samples one codec
-    frame per position. So drafting per request is not an option. A request
-    that sampled nothing this step (discarded, or finished on this step's stop
-    token) would be scheduled one token while its neighbours got K, and
-    `applies` would refuse the resulting step -- which `_model_forward` turns
-    into a fatal error rather than let the single-forward path sample one frame
-    from the last row of a K-row span.
+    frame per position. So drafting per request is not an option.
 
-    A request whose codec stop row fired mid-step is the same refusal by
-    another route: the rejection sampler truncates it to the frames it actually
-    accepted, so its next-step schedule is j+1 wide against the neighbours' K
-    -- non-uniform all the same. The empty check misses it, so the row length
-    is checked too: a short row folds the whole batch.
+    ``scheduled_draft_counts[i]`` is how many draft positions the scheduler
+    actually gave request *i* in the step that produced row *i* -- the
+    authoritative split between the two one-token shapes that must not be
+    confused:
 
-    So: every request drafts, or nobody does. A step with no drafts is an
-    ordinary one-frame-per-request decode, and the frames resume on the step
-    after it.
+    * a row of length < ``frames`` on a step that *did* carry drafts is a
+      stop row firing mid-span: the rejection sampler truncated it to the
+      frames it accepted, so its next-step schedule is j+1 wide against the
+      neighbours' K -- non-uniform, fold the batch;
+    * a row of length 1 on a step that carried *no* drafts is the expected
+      shape of a prefill result or of an ordinary one-frame step (an
+      intentional single-frame fallback, or the step right after such a
+      fallback). Folding here would starve the K-step loop forever: the next
+      step schedules one token again, produces another one-token row, and no
+      drafts are ever emitted (Buildkite three-tier bench: 31/32 requests
+      failed on exactly this stall). A draftless step is precisely where the
+      K-step span starts or resumes, so those rows draft.
+
+    Mixed batches -- some requests drafted, some not -- cannot share a span
+    and fold. So: every request drafts, or nobody does.
+
+    When ``scheduled_draft_counts`` is None the caller predates the scheduler
+    split and every row is assumed to sit on a drafted step.
     """
+    saw_drafted = False
+    saw_undrafted = False
     for index in range(num_reqs):
         sampled = None
         if isinstance(valid_sampled_token_ids, list) and index < len(valid_sampled_token_ids):
@@ -603,9 +615,17 @@ def constant_drafts(
         if not sampled:
             _log_block_once("a request in this batch sampled nothing; no drafts this step")
             return [[] for _ in range(num_reqs)]
-        if isinstance(sampled, list) and len(sampled) < frames:
-            _log_block_once("a request stopped mid-step, short of its drafts; no drafts this step")
-            return [[] for _ in range(num_reqs)]
+        scheduled = scheduled_draft_counts[index] if scheduled_draft_counts is not None else frames - 1
+        if scheduled > 0:
+            if isinstance(sampled, list) and len(sampled) < frames:
+                _log_block_once("a request stopped mid-step, short of its drafts; no drafts this step")
+                return [[] for _ in range(num_reqs)]
+            saw_drafted = True
+        else:
+            saw_undrafted = True
+    if scheduled_draft_counts is not None and saw_drafted and saw_undrafted:
+        _log_block_once("a batch mixed drafted and undrafted requests; no drafts this step")
+        return [[] for _ in range(num_reqs)]
     return [[CONTINUE_TOKEN_ID] * (frames - 1) for _ in range(num_reqs)]
 
 
