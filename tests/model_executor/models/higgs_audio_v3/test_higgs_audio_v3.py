@@ -1452,9 +1452,9 @@ class TestStageInputProcessor:
         assert len(result) == 1
         assert result[0]["prompt_token_ids"] == []
 
-    def test_filter_real_code_frames(self):
+    def test_valid_code_prefix(self):
         from vllm_omni.model_executor.stage_input_processors.higgs_audio_v3 import (
-            _filter_real_code_frames,
+            _valid_code_prefix,
         )
 
         # 8 codebooks, 4 frames
@@ -1470,12 +1470,11 @@ class TestStageInputProcessor:
                 [107, 207, 1024, 307],
             ]
         )
-        result = _filter_real_code_frames(codes)
-        # Frame 2 (column 2) has BOC in all codebooks -> filtered out
-        assert result.shape == (8, 3)
+        result = _valid_code_prefix(codes)
+        # Stop at the first invalid frame; do not compact the timeline.
+        assert result.shape == (8, 2)
         assert result[0, 0].item() == 100
         assert result[0, 1].item() == 200
-        assert result[0, 2].item() == 300
 
     def test_async_chunk_accepts_multimodal_output_keyword(self):
         from vllm_omni.model_executor.stage_input_processors.higgs_audio_v3 import (
