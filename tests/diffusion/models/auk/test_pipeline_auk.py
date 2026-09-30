@@ -424,24 +424,56 @@ class TestRequestParsing:
     def test_setup_compile_warms_the_decode_buckets_on_the_pipeline_device(self, build_pipeline, mocker):
         pipeline, _ = build_pipeline()
         warmup = mocker.patch.object(pipeline.vae_decode, "warmup")
-        compile_dit = mocker.patch.object(pipeline.dit, "compile")
+        regional = mocker.patch.object(pipeline_auk, "regionally_compile")
+        mocker.patch.object(pipeline, "_warmup_dit")
 
         pipeline.setup_compile()
 
         warmup.assert_called_once_with(pipeline.device)
-        # Regional is the default and a no-op for the DiT, which has no repeated blocks.
-        compile_dit.assert_not_called()
+        # Regional is the default: the DiT's repeated blocks are compiled.
+        regional.assert_called_once_with(pipeline.dit, dynamic=pipeline.od_config.diffusion_compile_dynamic)
 
     def test_setup_compile_honours_full_dit_granularity(self, build_pipeline, mocker):
         pipeline, _ = build_pipeline()
         pipeline.od_config.diffusion_compile_granularity = "full"
         pipeline.od_config.diffusion_compile_dynamic = False
         mocker.patch.object(pipeline.vae_decode, "warmup")
-        compile_dit = mocker.patch.object(pipeline.dit, "compile")
+        mocker.patch.object(pipeline, "_warmup_dit")
+        step = mocker.Mock()
+        pipeline.dit.step = step
+        compile_fn = mocker.patch.object(pipeline_auk.torch, "compile", side_effect=lambda fn, **_: fn)
 
         pipeline.setup_compile()
 
-        compile_dit.assert_called_once_with(dynamic=False)
+        # The samplers call step() directly, so that is what gets compiled.
+        compile_fn.assert_called_once_with(step, dynamic=False)
+
+    @pytest.mark.parametrize("variant, cfg", [("base", 2.0), ("flash", 0.0)])
+    def test_setup_compile_warms_the_dit_graph_buckets(self, build_pipeline, mocker, variant, cfg):
+        pipeline, _ = build_pipeline(variant)
+        mocker.patch.object(pipeline.vae_decode, "warmup")
+        mocker.patch.object(pipeline_auk, "regionally_compile")
+        wrapper = mocker.Mock(enabled=True)
+        pipeline.cudagraph_wrapper = wrapper
+
+        pipeline.setup_compile()
+
+        shapes = [(call.kwargs["x"].shape[1], call.kwargs["ref"].shape[1]) for call in wrapper.call_args_list]
+        assert shapes == [(150, 0), (300, 0), (600, 0), (150, 150), (300, 150), (600, 150)]
+        for call in wrapper.call_args_list:
+            assert call.kwargs["cfg_strength"] == cfg
+            assert call.kwargs["new_request"] is True
+            assert call.kwargs["text"].shape == (1, 96, TEXT_HIDDEN_DIM)
+
+    @pytest.mark.parametrize("model_config, enabled", [({"auk_dit_warmup_frames": []}, True), ({}, False)])
+    def test_dit_warmup_can_be_skipped(self, build_pipeline, mocker, model_config, enabled):
+        pipeline, _ = build_pipeline(model_config=model_config)
+        wrapper = mocker.Mock(enabled=enabled)
+        pipeline.cudagraph_wrapper = wrapper
+
+        pipeline._warmup_dit()
+
+        wrapper.assert_not_called()
 
     def test_latent_output_type_skips_the_decoder(self, build_pipeline):
         pipeline, _ = build_pipeline()

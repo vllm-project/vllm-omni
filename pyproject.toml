@@ -56,7 +56,9 @@ dev = [
     # 0.3.12 includes acknowledged TCP writes (Mooncake #2850): completion
     # must mean the receive buffer is ready before zero-copy consumers read it.
     "mooncake-transfer-engine-cuda13==0.3.12.post1",
-    "av==18.0.0", # for ComfyUI tests
+    "av==18.0.0; python_version >= '3.11'", # for ComfyUI tests
+    "av==17.1.0; python_version < '3.11'", # last av release that supports Python 3.10
+    "tomli==2.4.1; python_version < '3.11'", # tomllib backport used by tests/helpers/mark.py
     "openpyxl==3.1.5", # for nightly CI
     "pyttsx3==2.99",
     "opencc==1.4.1",

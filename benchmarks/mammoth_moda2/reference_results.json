@@ -1,0 +1,39 @@
+{
+  "date": "2026-09-10",
+  "runtime_commit": "34aa1d2afa59547945fc59f88ab6f4f25f52a777",
+  "environment": {"torch": "2.13.0+cu129", "cuda": "12.9", "python": "3.12.14", "vllm": "0.28.0", "vllm_omni": "0.28.1.dev81+g34aa1d2af.d20260908", "gpu": "NVIDIA A800-SXM4-80GB, 580.126.09, 81920 MiB"},
+  "method": "One excluded warm-up/canary; warm page cache; three rounds of the 2x2 eager configurations with rotated order; fresh process for every run; memory polling disabled.",
+  "request": {"height": 512, "width": 512, "seed": 42, "steps": 8, "guidance": 4.0, "prompt": "A stylish woman riding a motorcycle in NYC, movie poster style"},
+  "gpu_memory_utilization": [0.5, 0.3],
+  "cpu_quota": 16,
+  "startup_columns": ["configuration", "round", "engine_init_s", "imports_s", "first_request_s", "time_to_first_image_s", "image_md5"],
+  "startup_runs": [
+    ["default-serial", 1, 60.022, 10.158, 20.827, 91.089, "60c1fe4d464fba8c6ffd1b752fbbd40c"],
+    ["default-serial", 2, 60.015, 10.082, 20.766, 90.909, "60c1fe4d464fba8c6ffd1b752fbbd40c"],
+    ["default-serial", 3, 60.34, 9.911, 21.089, 91.381, "60c1fe4d464fba8c6ffd1b752fbbd40c"],
+    ["omp-serial", 1, 55.45, 9.965, 20.711, 86.169, "60c1fe4d464fba8c6ffd1b752fbbd40c"],
+    ["omp-serial", 2, 57.01, 9.667, 20.697, 87.418, "60c1fe4d464fba8c6ffd1b752fbbd40c"],
+    ["omp-serial", 3, 57.044, 9.707, 20.415, 87.211, "60c1fe4d464fba8c6ffd1b752fbbd40c"],
+    ["default-parallel", 1, 40.258, 10.112, 20.392, 70.829, "60c1fe4d464fba8c6ffd1b752fbbd40c"],
+    ["default-parallel", 2, 42.177, 10.135, 20.692, 73.093, "60c1fe4d464fba8c6ffd1b752fbbd40c"],
+    ["default-parallel", 3, 40.848, 9.997, 20.995, 71.887, "60c1fe4d464fba8c6ffd1b752fbbd40c"],
+    ["omp-parallel", 1, 36.88, 9.666, 20.319, 66.932, "60c1fe4d464fba8c6ffd1b752fbbd40c"],
+    ["omp-parallel", 2, 36.534, 9.6, 20.314, 66.517, "60c1fe4d464fba8c6ffd1b752fbbd40c"],
+    ["omp-parallel", 3, 36.689, 9.582, 20.467, 66.802, "60c1fe4d464fba8c6ffd1b752fbbd40c"]
+  ],
+  "raw_loading_columns": ["configuration", "round", "torch_threads", "n_tensors", "materialize_s", "cast_s", "h2d_s", "total_s"],
+  "raw_loading_runs": [
+    ["cpu64", 1, 64, 620, 3.174, 2.309, 1.217, 7.796],
+    ["cpu64", 2, 64, 620, 2.957, 2.443, 1.433, 7.846],
+    ["cpu64", 3, 64, 620, 2.916, 2.613, 1.067, 7.942],
+    ["cpu16", 1, 16, 620, 0.857, 1.137, 0.713, 3.643],
+    ["cpu16", 2, 16, 620, 0.871, 1.174, 0.746, 3.608],
+    ["cpu16", 3, 16, 620, 0.814, 1.142, 0.724, 3.487],
+    ["gpu16", 1, 16, 620, 0.938, 0.028, 1.41, 3.74],
+    ["gpu16", 2, 16, 620, 0.926, 0.029, 1.467, 3.83],
+    ["gpu16", 3, 16, 620, 0.87, 0.029, 1.395, 3.661]
+  ],
+  "raw_loading_workload": {"shards": [6, 7, 8], "source_dtype": "float32", "tensor_gib": 13.3, "warmup": "CUDA context, copy, cast and synchronize before timer", "order_per_round": ["cpu64", "cpu16", "gpu16"]},
+  "executed_script_sha256": {"parse_startup_log.py": "aa260de2cfcaec2fc4a678b245bb7c16fa464543aaec72b947fd4f769d547011", "raw_load_bench.py": "1f70f6b3c205402b2c2c7c52b224e1be3c04a12d12d11044a86f1b9b6c7a1d0f", "bench_startup.py": "04b1e8b9398b4d9885fbb6fe341e8a9ee98792d0be200c15c57e1fc5183c6ff0", "__init__.py": "b1d617f45f34dbe6f5f58d792d90c84af8d8d0a7e7def77c48170ca93495ca0d"},
+  "notes": ["Standard deviations use ddof=1.", "Only first-request ONGs are compared.", "Raw materialization includes CPU allocation/copy; H2D includes GPU allocation; not engine-loader timings."]
+}

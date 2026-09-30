@@ -151,6 +151,48 @@ def test_raw_and_base64_encoders_receive_persistent_converter(mocker: MockerFixt
     handler.shutdown()
 
 
+@pytest.mark.parametrize("typed_stage", [False, True], ids=["legacy", "typed"])
+def test_remote_diffusion_stage_enables_borrowed_frames_for_both_video_responses(
+    mocker: MockerFixture, typed_stage: bool
+):
+    from vllm_omni.config.config_factory import StageConfigFactory
+
+    options = {
+        "model_class_name": "MiniMaxH3Pipeline",
+        "video_output_transport": {"enable_borrowed_frames": True},
+    }
+    stage = (
+        StageConfigFactory.create_typed_default_diffusion("test-model", options).stage_configs[0]
+        if typed_stage
+        else StageConfigFactory.create_default_diffusion(options)[0]
+    )
+    # Like StageDiffusionClient, this frontend engine exposes metadata but no
+    # worker od_config. The effective setting is available in stage_configs.
+    engine = FakeAsyncOmni()
+    engine.stage_configs = [stage]
+    handler = OmniOpenAIServingVideo.for_diffusion(engine, model_name="test-model", stage_configs=engine.stage_configs)
+    raw_encoder = mocker.patch(
+        "vllm_omni.entrypoints.openai.serving_video._encode_video_bytes",
+        return_value=b"encoded-video",
+    )
+    base64_encoder = mocker.patch(
+        "vllm_omni.entrypoints.openai.serving_video.encode_video_base64",
+        return_value="encoded-video",
+    )
+    try:
+
+        async def generate_both():
+            request = VideoGenerationRequest(prompt="test prompt")
+            await handler.generate_video_bytes(request, "raw-request")
+            await handler.generate_videos(request, "base64-request")
+
+        asyncio.run(generate_both())
+        assert raw_encoder.call_args.kwargs["enable_borrowed_frames"] is True
+        assert base64_encoder.call_args.kwargs["enable_borrowed_frames"] is True
+    finally:
+        handler.shutdown()
+
+
 @pytest.mark.parametrize("batch_frames", [0, -1, True, 1.5, "17", None])
 def test_preencode_rejects_invalid_batch_frames_before_generation(batch_frames):
     engine = FakeAsyncOmni()

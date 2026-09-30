@@ -9,8 +9,12 @@ import types
 from pathlib import Path
 
 import pytest
-import tomllib
 from packaging.requirements import Requirement
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python < 3.11
+    import tomli as tomllib  # type: ignore[no-redef]
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 

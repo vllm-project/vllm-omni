@@ -12,7 +12,7 @@ import torch.nn.functional as F
 from vllm.logger import init_logger
 from vllm.utils.math_utils import round_up
 
-from vllm_omni.diffusion.models.auk.auk_transformer import AuKTransformer
+from vllm_omni.diffusion.models.auk.auk_transformer import AuKStepContext, AuKTransformer
 
 logger = init_logger(__name__)
 
@@ -21,11 +21,7 @@ logger = init_logger(__name__)
 class _GraphEntry:
     graph: torch.cuda.CUDAGraph
     static_x: torch.Tensor
-    static_x_mask: torch.Tensor
-    static_text: torch.Tensor
-    static_c_mask: torch.Tensor
-    static_ref: torch.Tensor
-    static_ref_mask: torch.Tensor
+    static_ctx: AuKStepContext
     static_timestep: torch.Tensor
     static_cfg: torch.Tensor | None
     static_out: torch.Tensor
@@ -38,10 +34,15 @@ class AuKCUDAGraphWrapper:
     whether the CFG branch is enabled. Timestep and the CFG strength are
     mutable scalar buffers, so all Euler steps and CFG values within one path
     reuse one graph.
+
+    Only :meth:`AuKTransformer.step` is captured. The per-request context
+    (text projection, reference embedding, padding biases, rotary tables) is
+    built by :meth:`AuKTransformer.prepare` on the first step of a request and
+    copied into the graph's static context, so the replayed steps skip it.
     """
 
-    _TARGET_ALIGNMENT = 64
-    _TEXT_ALIGNMENT = 64
+    _TARGET_ALIGNMENT = 32
+    _TEXT_ALIGNMENT = 32
     _REF_ALIGNMENT = 50
 
     def __init__(self, dit: AuKTransformer, *, enabled: bool = True, max_graphs: int = 32) -> None:
@@ -50,6 +51,10 @@ class AuKCUDAGraphWrapper:
         self.max_graphs = max(1, int(max_graphs))
         self._cache: OrderedDict[tuple, _GraphEntry] = OrderedDict()
         self._pool_handle: int | None = None
+        # Key whose static context holds the current request, and the context
+        # the eager fallback reuses across the steps of one request.
+        self._active_key: tuple | None = None
+        self._eager_ctx: AuKStepContext | None = None
         logger.info("Initialized AuK DiT lazy CUDA graph cache: enabled=%s slots=%d", self.enabled, self.max_graphs)
 
     @classmethod
@@ -87,6 +92,41 @@ class AuKCUDAGraphWrapper:
         """Retire all graphs together so none outlive shared workspaces."""
         if len(self._cache) >= self.max_graphs:
             self._cache.clear()
+            self._active_key = None
+
+    def _prepare(
+        self,
+        x: torch.Tensor,
+        x_mask: torch.Tensor | None,
+        text: torch.Tensor,
+        c_mask: torch.Tensor,
+        ref: torch.Tensor,
+        ref_mask: torch.Tensor,
+        uses_cfg: bool,
+    ) -> AuKStepContext:
+        return self.dit.prepare(
+            text,
+            target_len=x.shape[1],
+            mask=x_mask,
+            c_mask=c_mask,
+            ref=ref,
+            ref_mask=ref_mask,
+            cfg_infer=uses_cfg,
+        )
+
+    def _step(
+        self,
+        x: torch.Tensor,
+        timestep: torch.Tensor,
+        ctx: AuKStepContext,
+        cfg_strength: torch.Tensor | float,
+    ) -> torch.Tensor:
+        """One guided (or unguided) velocity; the CFG combine is part of the graph."""
+        velocity = self.dit.step(x, timestep, ctx)
+        if ctx.branches == 1:
+            return velocity
+        conditional, unconditional = velocity.chunk(2, dim=0)
+        return conditional + (conditional - unconditional) * cfg_strength
 
     @torch.no_grad()
     def __call__(
@@ -99,25 +139,37 @@ class AuKCUDAGraphWrapper:
         ref_mask: torch.Tensor,
         timestep: torch.Tensor,
         cfg_strength: float,
+        new_request: bool = True,
     ) -> torch.Tensor:
+        """Velocity of ``x`` at ``timestep``.
+
+        ``new_request`` marks the first step of a request, whose conditioning
+        (``text``, ``c_mask``, ``ref``, ``ref_mask``) is then prepared anew; the
+        later steps of the request pass ``False`` and reuse it. The default
+        prepares on every call, which is always correct.
+        """
         uses_cfg = cfg_strength >= 1e-5
         if not self.enabled or x.device.type != "cuda" or torch.cuda.is_current_stream_capturing():
-            if uses_cfg:
-                return self._run_cfg(x, None, text, c_mask, ref, ref_mask, timestep, cfg_strength=cfg_strength)
-            return self._run(x, None, text, c_mask, ref, ref_mask, timestep)
+            if new_request or self._eager_ctx is None:
+                self._eager_ctx = self._prepare(x, None, text, c_mask, ref, ref_mask, uses_cfg)
+            return self._step(x, timestep, self._eager_ctx, cfg_strength)
 
         target_frames = x.shape[1]
         x, x_mask, text, c_mask, ref, ref_mask = self._bucket_inputs(x, text, c_mask, ref, ref_mask)
-        inputs = (x, x_mask, text, c_mask, ref, ref_mask, timestep)
         key = self._key(x, text, ref, uses_cfg)
         entry = self._cache.get(key)
+        ctx = None
+        if entry is None or new_request or key != self._active_key:
+            ctx = self._prepare(x, x_mask, text, c_mask, ref, ref_mask, uses_cfg)
         if entry is None:
             # Same Retirement as #6587, details discussed in #7469
             self._retire_graph_generation_if_full()
             try:
-                entry = self._capture(*inputs, cfg_strength=cfg_strength, uses_cfg=uses_cfg)
+                assert ctx is not None
+                entry = self._capture(x, ctx, timestep, cfg_strength=cfg_strength)
             except Exception:
                 self._cache.clear()
+                self._active_key = None
                 self.enabled = False
                 logger.exception(
                     "Disabling AuK DiT CUDA graphs after capture failure for key=%s; "
@@ -128,112 +180,55 @@ class AuKCUDAGraphWrapper:
             self._cache[key] = entry
         else:
             self._cache.move_to_end(key)
+            if ctx is not None:
+                entry.static_ctx.copy_(ctx)
+        self._active_key = key
 
         entry.static_x.copy_(x)
-        entry.static_x_mask.copy_(x_mask)
-        entry.static_text.copy_(text)
-        entry.static_c_mask.copy_(c_mask)
-        entry.static_ref.copy_(ref)
-        entry.static_ref_mask.copy_(ref_mask)
         entry.static_timestep.copy_(timestep)
         if entry.static_cfg is not None:
             entry.static_cfg.fill_(cfg_strength)
         entry.graph.replay()
         return entry.static_out[:, :target_frames].clone()
 
-    def _run(
-        self,
-        x: torch.Tensor,
-        x_mask: torch.Tensor | None,
-        text: torch.Tensor,
-        c_mask: torch.Tensor,
-        ref: torch.Tensor,
-        ref_mask: torch.Tensor,
-        timestep: torch.Tensor,
-    ) -> torch.Tensor:
-        return self.dit(x, text, timestep, mask=x_mask, c_mask=c_mask, ref=ref, ref_mask=ref_mask)
-
-    def _run_cfg(
-        self,
-        x: torch.Tensor,
-        x_mask: torch.Tensor | None,
-        text: torch.Tensor,
-        c_mask: torch.Tensor,
-        ref: torch.Tensor,
-        ref_mask: torch.Tensor,
-        timestep: torch.Tensor,
-        *,
-        cfg_strength: torch.Tensor | float,
-    ) -> torch.Tensor:
-        pred = self.dit(
-            x,
-            text,
-            timestep,
-            mask=x_mask,
-            c_mask=c_mask,
-            ref=ref,
-            ref_mask=ref_mask,
-            cfg_infer=True,
-            cache=True,
-        )
-        conditional, unconditional = pred.chunk(2, dim=0)
-        return conditional + (conditional - unconditional) * cfg_strength
-
     def _capture(
         self,
-        *inputs: torch.Tensor,
+        x: torch.Tensor,
+        ctx: AuKStepContext,
+        timestep: torch.Tensor,
+        *,
         cfg_strength: float,
-        uses_cfg: bool,
     ) -> _GraphEntry:
-        static_inputs = tuple(value.clone() for value in inputs)
+        static_x = x.clone()
+        static_ctx = ctx.clone()
+        static_timestep = timestep.clone()
         static_cfg = None
-        if uses_cfg:
-            static_cfg = torch.empty((), device=static_inputs[0].device, dtype=torch.float32)
+        if ctx.branches == 2:
+            static_cfg = torch.empty((), device=static_x.device, dtype=torch.float32)
             static_cfg.fill_(cfg_strength)
-        try:
-            for _ in range(3):
-                if uses_cfg:
-                    assert static_cfg is not None
-                    self._run_cfg(*static_inputs, cfg_strength=static_cfg)
-                else:
-                    self._run(*static_inputs)
-            # CFG warm-up populates AuKTransformer's Python-side projected-text
-            # cache. Clear it before capture so the graph includes
-            # project_text(static_text), rather than closing over the first
-            # request's projection and ignoring later static_text updates.
-            self.dit.clear_cache()
-            if static_cfg is not None:
-                static_cfg.fill_(cfg_strength)
-            if self._pool_handle is None:
-                self._pool_handle = torch.cuda.graph_pool_handle()
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph, pool=self._pool_handle):
-                # Capture the actual CFG path. The scalar value remains a
-                # mutable buffer, so cfg=2 and cfg=3 share this graph.
-                if uses_cfg:
-                    assert static_cfg is not None
-                    static_out = self._run_cfg(*static_inputs, cfg_strength=static_cfg)
-                else:
-                    static_out = self._run(*static_inputs)
-        finally:
-            self.dit.clear_cache()
+        scale = static_cfg if static_cfg is not None else cfg_strength
+        # Warm-up runs any lazy torch.compile outside the capture.
+        for _ in range(3):
+            self._step(static_x, static_timestep, static_ctx, scale)
+        if self._pool_handle is None:
+            self._pool_handle = torch.cuda.graph_pool_handle()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, pool=self._pool_handle):
+            # The CFG scalar stays a mutable buffer, so cfg=2 and cfg=3 share this graph.
+            static_out = self._step(static_x, static_timestep, static_ctx, scale)
 
         logger.info(
             "Captured AuK DiT single-step CUDA graph: target_frames=%d text_tokens=%d ref_frames=%d cfg=%s",
-            inputs[0].shape[1],
-            inputs[2].shape[1],
-            inputs[4].shape[1],
+            x.shape[1],
+            ctx.c.shape[1],
+            0 if ctx.prompt is None else ctx.prompt.shape[1],
             cfg_strength,
         )
         return _GraphEntry(
             graph=graph,
-            static_x=static_inputs[0],
-            static_x_mask=static_inputs[1],
-            static_text=static_inputs[2],
-            static_c_mask=static_inputs[3],
-            static_ref=static_inputs[4],
-            static_ref_mask=static_inputs[5],
-            static_timestep=static_inputs[6],
+            static_x=static_x,
+            static_ctx=static_ctx,
+            static_timestep=static_timestep,
             static_cfg=static_cfg,
             static_out=static_out,
         )

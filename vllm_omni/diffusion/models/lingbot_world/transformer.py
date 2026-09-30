@@ -8,11 +8,12 @@ import math
 from collections.abc import Iterable
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any, Self, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from typing_extensions import Self
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
