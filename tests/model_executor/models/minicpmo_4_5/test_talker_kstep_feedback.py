@@ -39,17 +39,6 @@ _NUM_AUDIO_TOKENS = 6562
 _EOS_ID = _NUM_AUDIO_TOKENS - 1
 
 
-class _FakeStageParams:
-    """Stands in for a real pydantic ``SamplingParams``: like pydantic v2 it
-    records the explicitly-set fields in ``model_fields_set``, which the
-    request merge reads to tell "absent" apart from "explicitly set to 0"."""
-
-    def __init__(self, **kwargs):
-        self.model_fields_set = set(kwargs)
-        for key, value in kwargs.items():
-            setattr(self, key, value)
-
-
 def _make_talker(*, k_step_frames: int, scripted_samples: list[int]):
     """Bare talker instance: no config, no weights, deterministic sampler.
 
@@ -694,39 +683,61 @@ def test_default_sampling_params_feed_codec_resolution():
 
 
 def test_request_min_tokens_reaches_codec_state():
-    """A positive request ``min_tokens`` floor reaches the K-step state.
+    """The resolved request ``min_tokens`` reaches the K-step state, zero included.
 
     The NPU runner neutralizes vLLM's MinTokensLogitsProcessor, so the
     in-model codec sampler is the only min-length guard left (PR #7929
-    review). The engine default 0 means "no extra floor" and must not
-    overwrite the stage-resolved codec minimum -- but an explicit
-    request-level 0 disables the floor, matching the single-frame path
-    where MinTokensLogitsProcessor.add_request skips ``min_tokens=0``.
+    review). The value merged here is the *resolved* request parameter:
+    both entrypoints fold the deploy defaults in before the engine sees
+    it (``serving_chat._apply_request_overrides`` and
+    ``omni_base.resolve_sampling_params_list``), so the deployment
+    minimum arrives as a positive 50, and an explicit caller 0 arrives
+    as 0 -- floor disabled. vLLM 0.30.0's SamplingParams is a plain
+    ``omit_defaults`` msgspec.Struct without ``model_fields_set``, so no
+    provenance check survives here; tests use the real class.
     """
+    from vllm import SamplingParams
+
     model = _make_talker(k_step_frames=8, scripted_samples=[42])
     model._codec_min_tokens = 50
 
-    base = dict(temperature=0.8, top_k=25, top_p=0.85, repetition_penalty=1.05, seed=None)
+    # The real class validates min_tokens <= max_tokens; the engine default
+    # max_tokens is 16, so carry a realistic budget.
+    base = dict(
+        temperature=0.8,
+        top_k=25,
+        top_p=0.85,
+        repetition_penalty=1.05,
+        seed=None,
+        max_tokens=2048,
+    )
+
+    # A positive request floor overrides the stage-resolved minimum.
     state = {"step": 0}
-    model._merge_request_codec_params(state, SimpleNamespace(min_tokens=100, **base))
+    model._merge_request_codec_params(state, SamplingParams(min_tokens=100, **base))
     assert state["min_tokens"] == 100
 
-    # 0 without pydantic bookkeeping (the engine default flowing through a
-    # stub) is not a floor: the key stays unset so the K-step loop keeps
-    # falling back to the stage-resolved minimum.
+    # An explicit 0 pins 0 and turns the floor off, mirroring the
+    # single-frame semantics (MinTokensLogitsProcessor skips 0).
     state_zero = {"step": 0}
-    model._merge_request_codec_params(state_zero, SimpleNamespace(min_tokens=0, **base))
-    assert "min_tokens" not in state_zero
+    model._merge_request_codec_params(state_zero, SamplingParams(min_tokens=0, **base))
+    assert state_zero["min_tokens"] == 0
+    assert _codec_int_param(state_zero, "min_tokens", 50) == 0
 
-    # An explicitly set 0 (recorded in model_fields_set, as a real pydantic
-    # SamplingParams would carry after a caller override) pins 0 and turns
-    # the floor off, mirroring the single-frame semantics.
-    state_explicit = {"step": 0}
-    model._merge_request_codec_params(state_explicit, _FakeStageParams(min_tokens=0, **base))
-    assert state_explicit["min_tokens"] == 0
-    assert _codec_int_param(state_explicit, "min_tokens", 50) == 0
+    # Resolved deploy defaults keep the floor: this is what a request
+    # that never mentions min_tokens resolves to online, and what the
+    # offline entrypoint substitutes when the caller passes no params.
+    state_default = {"step": 0}
+    model._merge_request_codec_params(state_default, SamplingParams(min_tokens=50, **base))
+    assert state_default["min_tokens"] == 50
 
-    # The min_new_tokens alias is honored too.
+    # No request params at all: the state stays unset and the K-step
+    # loop keeps falling back to ``self._codec_min_tokens``.
+    state_none = {"step": 0}
+    model._merge_request_codec_params(state_none, None)
+    assert "min_tokens" not in state_none
+
+    # The min_new_tokens alias is honored too (older stubs may only set it).
     state_alias = {"step": 0}
     model._merge_request_codec_params(state_alias, SimpleNamespace(min_new_tokens=7, **base))
     assert state_alias["min_tokens"] == 7

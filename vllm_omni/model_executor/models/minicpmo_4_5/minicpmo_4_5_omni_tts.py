@@ -85,6 +85,10 @@ _CODEC_SAMPLING_SOURCES: tuple[tuple[str, str, Any, Any], ...] = (
 
 
 _REPETITION_PENALTY_CHUNK_SIZE = 16
+# Same TND ceiling as stage 0: at most 16 query positions per sequence. Hard
+# cap on the K-step frame count accepted from the deploy YAML (see
+# _parse_k_step_frames).
+_MINICPMO_TALKER_FRAMES_MAX = 16
 # ``past_window`` of MiniCPMTTS's codec repetition penalty: both generate() and
 # generate_chunk() build it through gen_logits(), which hardcodes
 # CustomRepetitionPenaltyLogitsProcessorRepeat(penalty, num_code, 16).
@@ -730,8 +734,6 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         mismatch either arms the loop with no drafts to consume, or leaves it
         off while the scheduler reserves K positions per request.
         """
-        from vllm_omni.config.stage_config import _MINICPMO_TALKER_FRAMES_MAX
-
         model_cfg = getattr(vllm_config, "model_config", None)
         if getattr(model_cfg, "model_stage", None) != "tts":
             return 0
@@ -1758,26 +1760,27 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 state.setdefault("codec_full_ids", [])
         # The K-step codec sampler is the only min-length guard left (the NPU
         # runner neutralizes vLLM's MinTokensLogitsProcessor), so the request
-        # floor must reach it. The merged stage params always carry the stage
-        # defaults, and the engine's own registration treats a zero min_tokens
-        # as "no floor" (MinTokensLogitsProcessor.add_request: ``if not
-        # min_tokens``), so a 0 in a merged param object can only be an
-        # explicit caller override -- which the single-frame path honours by
-        # disabling the floor. Distinguish "absent" from "explicitly set to
-        # 0" through pydantic's model_fields_set (kept across clone(), a
-        # deepcopy); a positive value needs no marker, and stub objects
-        # without the bookkeeping keep the old positive-only rule.
-        if state.get("min_tokens") is None:
-            attr = "min_tokens"
+        # floor must reach it. What is read here is the *resolved* request
+        # parameter, not the raw caller object: the serving layer merges the
+        # deploy defaults into it first (serving_chat._apply_request_overrides)
+        # and the offline entrypoint substitutes the stage defaults when the
+        # caller passes no params at all (omni_base.resolve_sampling_params_list),
+        # so the deployment minimum arrives as a positive ``min_tokens``.
+        # vLLM 0.30.0's SamplingParams is an ``omit_defaults`` msgspec.Struct
+        # with no ``model_fields_set`` -- the earlier pydantic-only provenance
+        # check was dead code on this line -- so a resolved 0 is accepted as
+        # what it resolves to: an explicit caller override that disables the
+        # floor, mirroring the single-frame semantics where
+        # MinTokensLogitsProcessor.add_request skips ``min_tokens=0``.
+        # NOTE: an offline caller passing a partially-filled SamplingParams
+        # (no min_tokens field set) also resolves to 0 and disables the
+        # floor; pass the stage default explicitly when a floor is wanted.
+        if state.get("min_tokens") is None and sampling_params is not None:
             requested = getattr(sampling_params, "min_tokens", None)
             if requested is None:
-                attr = "min_new_tokens"
                 requested = getattr(sampling_params, "min_new_tokens", None)
             if requested is not None:
-                value = int(requested)
-                fields_set = getattr(sampling_params, "model_fields_set", None)
-                if value > 0 or (fields_set is not None and attr in fields_set):
-                    state["min_tokens"] = value
+                state["min_tokens"] = int(requested)
         # The request's remaining output budget caps this segment's frame
         # ceiling: the scheduler truncates the sampled ids at the request limit
         # while the connector concatenates every emitted codec frame, so the
