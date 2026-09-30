@@ -22,15 +22,17 @@ See ``images/README.md`` (utils vs helpers, no overlap).
 """
 
 import io
+from collections.abc import Sequence
 from http import HTTPStatus
 from numbers import Integral
-from typing import Any
+from typing import Any, cast
 
 import httpx
 import numpy as np
 import pybase64 as base64
 from fastapi import HTTPException, Request
 from PIL import Image
+from starlette.datastructures import UploadFile
 from vllm.logger import init_logger
 
 from vllm_omni.entrypoints.openai.app_state import _get_diffusion_od_config
@@ -133,6 +135,10 @@ def _normalize_image(image: Any) -> Any:
     if isinstance(image, np.ndarray):
         while image.ndim > 3:
             image = image[0]
+        if np.issubdtype(image.dtype, np.integer):
+            # Integer arrays already contain byte-scale pixels, not [0, 1]
+            # floats. Scaling them again saturates every nonzero channel.
+            return Image.fromarray(np.clip(image, 0, 255).astype(np.uint8))
         if image.min() < 0:
             if image.min() < -1.01 or image.max() > 1.01:
                 logger.warning(
@@ -178,7 +184,7 @@ def _generated_size_str(images: list[Any], fallback: str | None) -> str | None:
 
 
 async def _load_input_images(
-    inputs: list[str],
+    inputs: str | Sequence[str | UploadFile],
     *,
     normalize_rgb: bool = True,
 ) -> list[Image.Image]:
@@ -215,7 +221,7 @@ async def _load_input_images(
         # 3. UploadFile
         elif hasattr(inp, "file"):
             try:
-                img_data = await inp.read()
+                img_data = await cast(UploadFile, inp).read()
                 img = Image.open(io.BytesIO(img_data))
                 images.append(img)
             except Exception as e:

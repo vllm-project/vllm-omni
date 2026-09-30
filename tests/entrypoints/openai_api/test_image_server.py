@@ -2196,6 +2196,78 @@ def test_normalize_image():
     assert result.size == (64, 64)
 
 
+@pytest.mark.parametrize(
+    "channels,batched",
+    [(None, False), (3, False), (4, False), (3, True), (4, True)],
+    ids=["grayscale", "rgb", "rgba", "batched-rgb", "batched-rgba"],
+)
+def test_normalize_image_preserves_byte_pixels(channels, batched):
+    import numpy as np
+
+    from vllm_omni.entrypoints.openai.images.helpers import _normalize_image
+
+    pixels = np.array([[0, 1, 32], [64, 128, 255]], dtype=np.uint8)
+    if channels is not None:
+        pixels = np.repeat(pixels[..., None], channels, axis=-1)
+    image = pixels[None, None] if batched else pixels
+
+    result = _normalize_image(image)
+
+    np.testing.assert_array_equal(np.asarray(result), pixels)
+
+
+def test_normalize_image_clips_integer_pixels():
+    import numpy as np
+
+    from vllm_omni.entrypoints.openai.images.helpers import _normalize_image
+
+    pixels = np.array([[[-10, 128, 300]]], dtype=np.int16)
+
+    result = _normalize_image(pixels)
+
+    np.testing.assert_array_equal(np.asarray(result), np.array([[[0, 128, 255]]], dtype=np.uint8))
+
+
+@pytest.mark.parametrize("signed", [False, True], ids=["zero-to-one", "minus-one-to-one"])
+def test_normalize_image_preserves_float_scaling(signed):
+    import numpy as np
+
+    from vllm_omni.entrypoints.openai.images.helpers import _normalize_image
+
+    pixels = np.array([[[0.0, 0.5, 1.0]]], dtype=np.float32)
+    image = pixels * 2 - 1 if signed else pixels
+
+    result = _normalize_image(image)
+
+    np.testing.assert_array_equal(np.asarray(result), np.array([[[0, 127, 255]]], dtype=np.uint8))
+
+
+def test_image_generation_preserves_byte_pixels(test_client):
+    import numpy as np
+
+    pixels = np.array([[[0, 64, 128], [1, 32, 255]]], dtype=np.uint8)
+
+    async def generate(**kwargs):
+        yield MockGenerationResult([pixels])
+
+    test_client.app.state.engine_client.generate = generate
+
+    response = test_client.post(
+        "/v1/images/generations",
+        json={
+            "model": "Qwen/Qwen-Image",
+            "prompt": "A color palette",
+            "response_format": "b64_json",
+            "output_format": "png",
+        },
+    )
+
+    assert response.status_code == 200
+    encoded = response.json()["data"][0]["b64_json"]
+    with Image.open(io.BytesIO(base64.b64decode(encoded))) as image:
+        np.testing.assert_array_equal(np.asarray(image), pixels)
+
+
 def test_extract_images_from_result():
     """Test _extract_images_from_result with various result formats"""
     import numpy as np
@@ -2206,8 +2278,7 @@ def test_extract_images_from_result():
     class EmptyResult:
         pass
 
-    result = EmptyResult()
-    images = _extract_images_from_result(result)
+    images = _extract_images_from_result(EmptyResult())
     assert images == []
 
     # Test nested batch: [np.array(shape=(3, 64, 64, 3))]
@@ -2217,8 +2288,7 @@ def test_extract_images_from_result():
         def __init__(self):
             self.images = [batch]
 
-    result = BatchResult()
-    images = _extract_images_from_result(result)
+    images = _extract_images_from_result(BatchResult())
     assert len(images) == 3
     assert all(isinstance(img, Image.Image) for img in images)
     assert all(img.size == (64, 64) for img in images)
@@ -2228,8 +2298,7 @@ def test_extract_images_from_result():
         def __init__(self):
             self.images = [np.random.randint(0, 255, (64, 64, 3), dtype=np.uint8)]
 
-    result = DictRequestOutput()
-    images = _extract_images_from_result(result)
+    images = _extract_images_from_result(DictRequestOutput())
     assert len(images) == 1
     assert isinstance(images[0], Image.Image)
 
@@ -2238,8 +2307,7 @@ def test_extract_images_from_result():
         def __init__(self):
             self.images = [np.random.randint(0, 255, (32, 32, 3), dtype=np.uint8)]
 
-    result = AttrRequestOutput()
-    images = _extract_images_from_result(result)
+    images = _extract_images_from_result(AttrRequestOutput())
     assert len(images) == 1
     assert isinstance(images[0], Image.Image)
     assert images[0].size == (32, 32)
