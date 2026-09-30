@@ -7,6 +7,11 @@
 # transformers_keys_to_ignore_compat in model_executor/models/utils.py.
 transformers >= 5.13.0, < 5.15
 av>=14.0.0
+# typing_extensions.Concatenate accepts a trailing `...` on 3.10 only from
+# 4.13 (older 4.12.x re-export typing.Concatenate, which rejects it). The
+# Nemotron VoiceChat codec annotates `Concatenate[int, ...]`, so pin the
+# floor instead of relying on the version vLLM/torch pull transitively.
+typing_extensions>=4.13
 omegaconf>=2.3.0
 diffusers==0.40.0
 # Hub kernels, including LTX-2.5 NATTEN. 0.16+ resolves torch-stable-abi*

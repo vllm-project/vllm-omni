@@ -2686,6 +2686,7 @@ class MiniMaxH3Pipeline(
             audio = audios[0] if len(audios) == 1 else torch.cat(audios, dim=0)
         return DiffusionOutput(
             output=(video, audio),
+            video_output_index=0 if isinstance(video, torch.Tensor) else None,
             post_process_func=get_minimax_h3_post_process_func(self.od_config),
             stage_durations=(self.stage_durations if hasattr(self, "_stage_durations") else {}),
         )
@@ -3049,6 +3050,7 @@ class MiniMaxH3Pipeline(
             self._release_stage_cache()
         return DiffusionOutput(
             output=(video, audio),
+            video_output_index=0 if isinstance(video, torch.Tensor) else None,
             post_process_func=get_minimax_h3_post_process_func(self.od_config),
             stage_durations=(self.stage_durations if hasattr(self, "_stage_durations") else {}),
         )

@@ -8,11 +8,8 @@ from collections import OrderedDict
 import numpy as np
 import pytest
 
-from vllm_omni.entrypoints.openai.serving_speech import (
-    _REF_AUDIO_RESOLVE_CACHE_MAX_BYTES,
-    _REF_AUDIO_RESOLVE_CACHE_MAX_ENTRIES,
-    OmniOpenAIServingSpeech,
-)
+from vllm_omni.config.speech_cache import SpeechCacheConfig
+from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -24,8 +21,9 @@ def cache():
     server.model_config = None
     server._ref_audio_resolve_cache = OrderedDict()
     server._ref_audio_resolve_cache_bytes = 0
-    server._ref_audio_resolve_cache_max_entries = _REF_AUDIO_RESOLVE_CACHE_MAX_ENTRIES
-    server._ref_audio_resolve_cache_max_bytes = _REF_AUDIO_RESOLVE_CACHE_MAX_BYTES
+    config = SpeechCacheConfig()
+    server._ref_audio_resolve_cache_max_entries = config.resolve_max_entries
+    server._ref_audio_resolve_cache_max_bytes = config.resolve_max_bytes
     server._ref_audio_model_artifact_ready = set()
     server._request_ref_audio_artifact_keys = {}
     return server
@@ -36,8 +34,8 @@ def _put(cache, key, samples, artifact=None):
 
 
 def test_compact_storage_and_default_capacity(cache):
-    assert cache._ref_audio_resolve_cache_max_entries == 1024
-    assert cache._ref_audio_resolve_cache_max_bytes == 512 * 1024 * 1024
+    assert cache._ref_audio_resolve_cache_max_entries == 2048
+    assert cache._ref_audio_resolve_cache_max_bytes == 4 * 1024**3
     _put(cache, "a", [0.0, 0.25, -0.5, 1.0])
     value = cache._ref_audio_resolve_cache["a"]
     assert value[0].dtype == np.float32

@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """Utilities for OmniConnector configuration and validation."""
 
 import json
 import os
+import uuid
 import warnings
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
@@ -195,7 +196,9 @@ def create_connectors_from_config(
                 replica_id = max(int(os.environ.get("VLLM_OMNI_REPLICA_ID", "0")), 0)
                 resolved_spec = resolve_connector_spec(
                     ConnectorSpec(name=connector_spec.name, extra=extra),
-                    stage_id=int(caller_stage_id) if str(caller_stage_id).isdigit() else from_stage_id,
+                    stage_id=int(caller_stage_id)
+                    if caller_stage_id is not None and str(caller_stage_id).isdigit()
+                    else from_stage_id,
                     role=role,
                     purpose=resolved_purpose,
                     local_rank=local_rank,
@@ -308,7 +311,7 @@ def load_omni_transfer_config(
         config_dict = normalized
 
     # Parse connectors
-    connectors = {}
+    connectors: dict[tuple[str, str], ConnectorSpec] = {}
     runtime_config = config_dict.get("runtime", {})
 
     # Parse global connectors (from runtime.connectors)
@@ -429,6 +432,12 @@ def load_omni_transfer_config(
             f"{missing_str}. Define connectors or allow auto SHM creation for these edges."
         )
 
+    # Resolve once in the launcher; serialized connector extras carry the same
+    # namespace through EngineCore and multiprocess/TP workers.
+    wakeup_scope = uuid.uuid4().hex
+    for spec in connectors.values():
+        if spec.name == "SharedMemoryConnector":
+            spec.extra.setdefault("wakeup_scope", wakeup_scope)
     config = OmniTransferConfig(connectors=connectors)
 
     logger.info(f"Loaded OmniTransferConfig with {len(connectors)} connector configurations")

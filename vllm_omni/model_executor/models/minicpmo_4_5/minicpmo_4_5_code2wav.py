@@ -22,6 +22,7 @@ from vllm.config import VllmConfig
 from vllm.logger import init_logger
 
 from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.utils.device_copy import to_device_nonblocking
 
 from .batched_token2wav import (
     BatchedToken2Wav,
@@ -146,10 +147,12 @@ def _normalize_reference(
 
 
 def _codec_tensor(value: Any, fallback: torch.Tensor) -> torch.Tensor:
+    # Codec ids arrive from the connector as host data. A pageable host copy
+    # would block the host once per request per step; stage them pinned.
     if isinstance(value, torch.Tensor):
-        return value.reshape(-1).to(device=fallback.device, dtype=torch.long)
+        return to_device_nonblocking(value.reshape(-1).to(dtype=torch.long), fallback.device)
     if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
-        return torch.as_tensor(value, device=fallback.device, dtype=torch.long).reshape(-1)
+        return to_device_nonblocking(torch.as_tensor(value, dtype=torch.long).reshape(-1), fallback.device)
     return fallback.reshape(-1).to(dtype=torch.long)
 
 
@@ -268,14 +271,34 @@ class MiniCPMO45Code2Wav(nn.Module):
             raise ValueError(f"Invalid MiniCPM-o connector chunk configuration: {self._connector_config}")
         raw_capture_batch_sizes = extra.get("hift_graph_capture_batch_sizes")
         capture_batch_sizes = [1] if raw_capture_batch_sizes is None else raw_capture_batch_sizes
+        max_serial_batch = extra.get("max_serial_batch")
+        max_serial_batch = 4 if max_serial_batch is None else int(max_serial_batch)
         self._hift_graph_config = {
             "enabled": bool(extra.get("enable_hift_graph", False)),
             "capture_batch_sizes": capture_batch_sizes,
+            "max_serial_batch": max_serial_batch,
         }
+        enable_whole_euler = extra.get("enable_whole_euler")
+        max_graph_batch_raw = extra.get("max_graph_batch")
+        max_graph_batch = int(max_graph_batch_raw) if max_graph_batch_raw is not None else None
+        micro_batch_size_raw = extra.get("micro_batch_size")
+        if micro_batch_size_raw is not None:
+            micro_batch_size = int(micro_batch_size_raw)
+        else:
+            # The Whole-Euler arena reserves one attention cache per micro-batch
+            # row, so size it for the most requests this stage ever batches.
+            max_num_seqs = getattr(getattr(vllm_config, "scheduler_config", None), "max_num_seqs", None)
+            micro_batch_size = min(int(max_num_seqs), max_graph_batch or 16) if max_num_seqs else None
         self._cfm_graph_config = {
             "enabled": bool(extra.get("enable_cfm_graph", False)),
             "max_graphs": int(extra.get("cfm_max_graphs", 32)),
             "bucket_frames": int(extra.get("cfm_graph_bucket_frames", 0)),
+            "capture_frames": extra.get("cfm_graph_capture_frames"),
+            "enable_whole_euler": enable_whole_euler is None or bool(enable_whole_euler),
+            "max_serial_batch": max_serial_batch,
+            "max_graph_batch": max_graph_batch,
+            "micro_batch_size": micro_batch_size,
+            "pad_max_rows": extra.get("whole_euler_pad_max_rows"),
         }
         self._ref_max_seconds = float(extra.get("ref_audio_max_seconds", _REF_MAX_SECONDS))
         if self._ref_max_seconds <= 0:
@@ -703,6 +726,33 @@ class MiniCPMO45Code2Wav(nn.Module):
 
     @torch.inference_mode()
     def forward(
+        self,
+        input_ids: torch.Tensor | None = None,
+        positions: torch.Tensor | None = None,
+        intermediate_tensors: Any = None,
+        inputs_embeds: torch.Tensor | None = None,
+        runtime_additional_information: list[dict[str, Any]] | None = None,
+        **kwargs: Any,
+    ) -> OmniOutput:
+        # This stage owns the vocoder process. Restore its previous matmul
+        # policy after eager execution/capture; cuDNN's policy is independent.
+        previous_tf32 = torch.backends.cuda.matmul.allow_tf32
+        try:
+            if self._extra_config().get("token2wav_allow_tf32", False):
+                torch.backends.cuda.matmul.allow_tf32 = True
+            return self._forward_impl(
+                input_ids,
+                positions,
+                intermediate_tensors,
+                inputs_embeds,
+                runtime_additional_information,
+                **kwargs,
+            )
+        finally:
+            torch.backends.cuda.matmul.allow_tf32 = previous_tf32
+
+    @torch.inference_mode()
+    def _forward_impl(
         self,
         input_ids: torch.Tensor | None = None,
         positions: torch.Tensor | None = None,

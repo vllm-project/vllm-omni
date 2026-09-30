@@ -470,9 +470,15 @@ class TestPipelineStreamingOutputToEntrypoint:
         fixture: OrchestratorFixture,
         inline_client: InlineStageDiffusionClient,
     ) -> None:
-        if omni.final_output_task is not None:
-            omni.final_output_task.cancel()
-            await asyncio.gather(omni.final_output_task, return_exceptions=True)
+        task = omni.final_output_task
+        omni.final_output_task = None
+        # The session ran inside ``TestClient``, whose loop is closed by the
+        # time the ``with`` block exits and the task with it already cancelled.
+        # Only a still-running task is worth cancelling and awaiting; gathering
+        # a finished one touches its closed loop on Python 3.10.
+        if task is not None and not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
         inline_client.shutdown()
         fixture.request_sync_q.put_nowait(ShutdownRequestMessage())
         await asyncio.to_thread(fixture.thread.join, 5)

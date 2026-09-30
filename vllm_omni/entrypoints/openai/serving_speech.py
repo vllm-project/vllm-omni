@@ -36,14 +36,17 @@ from vllm.sampling_params import RequestOutputKind, SamplingParams
 from vllm.utils import random_uuid
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 
+from vllm_omni.config.speech_cache import SpeechCacheConfig
 from vllm_omni.config.stage_config import StagePipelineConfig
 from vllm_omni.entrypoints.openai.audio_utils_mixin import AudioMixin, StreamingAudioResampler
+from vllm_omni.entrypoints.openai.errors import InvalidPresetVoiceReferenceError, InvalidVoiceReferenceError
 from vllm_omni.entrypoints.openai.protocol.audio import (
     AudioResponse,
     BatchSpeechRequest,
     BatchSpeechResponse,
     CreateAudio,
     OpenAICreateSpeechRequest,
+    RegisteredVoiceReference,
     SpeechBatchItem,
     SpeechBatchItemResult,
     SpeechInputTokenDetails,
@@ -110,8 +113,6 @@ _REF_AUDIO_MIN_DURATION = 1.0  # seconds
 _REF_AUDIO_MAX_DURATION = 30.0  # seconds
 _REF_AUDIO_METADATA_FETCH_ATTEMPTS = 3
 _REMOTE_REF_AUDIO_SCHEMES = frozenset({"http", "https", "data"})
-_REF_AUDIO_RESOLVE_CACHE_MAX_ENTRIES = 1024
-_REF_AUDIO_RESOLVE_CACHE_MAX_BYTES = 512 * 1024 * 1024
 _TTS_MAX_INSTRUCTIONS_LENGTH = 500
 _DEFAULT_VOICE_NAME = "default"
 
@@ -256,14 +257,16 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         self._ref_audio_data_url_cache: dict[str, str] = {}
         self._ref_audio_resolve_cache: OrderedDict[str, tuple[np.ndarray, int, int, str]] = OrderedDict()
         self._ref_audio_resolve_cache_bytes = 0
-        self._ref_audio_resolve_cache_max_entries = _REF_AUDIO_RESOLVE_CACHE_MAX_ENTRIES
-        self._ref_audio_resolve_cache_max_bytes = _REF_AUDIO_RESOLVE_CACHE_MAX_BYTES
+        config = self.speech_cache_config
+        self._ref_audio_resolve_cache_max_entries = config.resolve_max_entries
+        self._ref_audio_resolve_cache_max_bytes = config.resolve_max_bytes
+        logger.info("Speech cache configuration: %s", config)
         # Readiness is keyed by (artifact_key, x_vector_only). An x-vector-only
         # request caches a speaker embedding but no ref_code, so its artifact
         # must not satisfy a later ICL request that needs ref_code (#5049).
         self._ref_audio_model_artifact_ready: set[tuple[str, bool]] = set()
         self._request_ref_audio_artifact_keys: dict[str, tuple[str, bool]] = {}
-        self._speaker_cache = get_speaker_cache()
+        self._speaker_cache = get_speaker_cache(max_bytes=config.speaker_max_bytes)
         self._last_upload_ts = 0
         self._upload_lock = asyncio.Lock()
         self._restore_uploaded_speakers()
@@ -354,6 +357,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         stage_configs: "list[Any] | None" = None,
         allowed_local_media_path: str = "",
         allowed_media_domains: list[str] | None = None,
+        speech_cache_config: SpeechCacheConfig | None = None,
     ) -> "OmniOpenAIServingSpeech":
         """Create a speech serving instance for pure diffusion TTS models.
 
@@ -361,6 +365,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         engine client that pure diffusion engines don't provide.
         """
         instance = cls.__new__(cls)
+        instance.speech_cache_config = speech_cache_config or SpeechCacheConfig()
         instance._diffusion_mode = True
         instance._diffusion_engine = diffusion_engine
         instance._diffusion_model_name = model_name
@@ -383,6 +388,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         self._media_connector = None
         self._allowed_local_media_path = ""
         self.model_name = kwargs.pop("model_name", None)
+        self.speech_cache_config = kwargs.pop("speech_cache_config", None) or SpeechCacheConfig()
         # True when the server was launched with --forced-aligner (a pooling
         # aligner stage is appended to the pipeline). Gates word_timestamps.
         self.forced_aligner_enabled: bool = bool(kwargs.pop("forced_aligner_enabled", False))
@@ -690,6 +696,33 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         if sr <= 0:
             return None
         return samples, sr
+
+    def _load_registered_reference(self, reference: RegisteredVoiceReference) -> tuple[np.ndarray, int]:
+        """Load one captured generation without retaining a data URI or waveform.
+
+        Keep the legacy WAV conversion on cache misses to preserve PCM16
+        quantization. A missing/deleted generation fails instead of substituting
+        a newer upload with the same name. Called off the event loop.
+        """
+        from safetensors import safe_open
+
+        path = Path(reference.file_path)
+        if not _validate_path_within_directory(path, self.uploaded_speakers_dir):
+            raise ValueError("Invalid registered reference path")
+        with safe_open(str(path), framework="pt") as f:
+            metadata = f.metadata() or {}
+            if int(metadata.get("created_at", 0)) != reference.created_at:
+                raise ValueError("Registered reference generation changed")
+            samples = f.get_tensor("audio").numpy()
+            sr = int(metadata["sample_rate"])
+        # Match _get_uploaded_audio_data's WAV subtype and the resolver's float32
+        # channel mixing, without base64 serialization or any persistent copy.
+        buf = io.BytesIO()
+        sf.write(buf, samples, sr, format="WAV")
+        buf.seek(0)
+        waveform, sr = sf.read(buf, dtype="float32")
+        waveform, sr, _, _ = self._finalize_fetched_ref_audio(waveform, sr)
+        return waveform, sr
 
     def _get_uploaded_audio_data(self, voice_name: str) -> str | None:
         """Return a base64-encoded WAV data URL for an uploaded voice.
@@ -1095,22 +1128,24 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             "embedding_dim": emb_dim,
         }
 
-    async def delete_voice(self, name: str) -> bool:
+    async def delete_voice(self, name: str):
         """
         Delete an uploaded voice.
 
         Args:
             name: Voice name to delete
-
-        Returns:
-            bool: True if successful, False if voice doesn't exist
         """
         async with self._upload_lock:
             voice_name_lower = name.lower()
+            built_in_speakers = self._get_available_voices() - set(self.uploaded_speakers)
+
+            if voice_name_lower in built_in_speakers:
+                err = f"Cannot delete built-in voice '{name}'"
+                raise InvalidPresetVoiceReferenceError(err)
 
             if voice_name_lower not in self.uploaded_speakers:
-                logger.warning("Voice '%s' not found", name)
-                return False
+                err = f"Voice '{name}' not found"
+                raise InvalidVoiceReferenceError(err)
 
             speaker_info = self.uploaded_speakers.pop(voice_name_lower)
             self._ref_audio_data_url_cache.pop(voice_name_lower, None)
@@ -1125,7 +1160,6 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             self._speaker_cache.clear(voice_name_lower)
 
         logger.info("Deleted voice '%s'", name)
-        return True
 
     def _is_tts_model(self) -> bool:
         """Check if the current model is a supported TTS model."""
@@ -1139,6 +1173,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         adapter = self._get_tts_adapter()
         if adapter is not None:
+            adapter.normalize(request)
             return adapter.validate(request)
 
         adapter_cls = resolve_adapter("qwen3_tts")
@@ -1149,7 +1184,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             server=self,
             engine_client=self.engine_client,
         )
-        return adapter_cls(ctx).validate(request)
+        adapter = adapter_cls(ctx)
+        adapter.normalize(request)
+        return adapter.validate(request)
 
     def _validate_speech_sample_rate(self, request: OpenAICreateSpeechRequest) -> str | None:
         if request.sample_rate is None:
@@ -1966,6 +2003,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         model_type: str | None = None
         has_inline_ref_audio = (request.ref_audio is not None) if has_inline_ref_audio is None else has_inline_ref_audio
         if (adapter := self._get_tts_adapter()) is not None:
+            adapter.normalize(request)
             validation_error = adapter.validate(request)
             if validation_error:
                 raise ValueError(validation_error)

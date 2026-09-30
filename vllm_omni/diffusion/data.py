@@ -807,10 +807,16 @@ def uses_diffusers_adapter(od_config: object) -> bool:
 @dataclass
 class VideoOutputTransportConfig:
     enable_device_postprocess: bool = False
+    enable_registered_shm: bool = False
+    enable_borrowed_frames: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.enable_device_postprocess, bool):
             raise TypeError("enable_device_postprocess must be a bool")
+        if not isinstance(self.enable_registered_shm, bool):
+            raise TypeError("enable_registered_shm must be a bool")
+        if not isinstance(self.enable_borrowed_frames, bool):
+            raise TypeError("enable_borrowed_frames must be a bool")
 
 
 @dataclass
@@ -1826,10 +1832,15 @@ class DiffusionOutput:
     # Internal control-plane event emitted on first scheduler admission.
     request_started: bool = False
 
-    # Typed video-media contract. Declared last so the pre-existing positional
+    # Typed video-media contract. Appended so the pre-existing positional
     # constructor order (output, trajectory_timesteps, ...) that out-of-tree
     # pipelines rely on is preserved. Mutually exclusive with ``output``.
     media: DiffusionMediaOutput | None = None
+
+    # Compatibility adapter for joint (video, audio) outputs that have not
+    # migrated to typed media. Only this tuple entry is eligible for video
+    # transport optimizations; unmarked legacy outputs retain their old path.
+    video_output_index: int | None = None
 
     def __post_init__(self) -> None:
         if self.media is not None and not isinstance(self.media, DiffusionMediaOutput):
@@ -2261,7 +2272,7 @@ def build_attention_config(
 
     Called exactly once in ``OmniDiffusionConfig.__post_init__``.
     Handles type-conversion **and** env-var fallback
-    (``DIFFUSION_ATTENTION_BACKEND``).
+    (``DIFFUSION_ATTENTION_BACKEND`` and ``DIFFUSION_ATTENTION_QUANT``).
     """
     normalized = parse_attention_config(attention_config)
 
@@ -2275,7 +2286,30 @@ def build_attention_config(
     if env_attention_backend.lower() == "auto":
         return normalized
 
-    normalized.default = AttentionSpec(backend=env_attention_backend)
+    # If config file doesn't explicitly setup quantization specs, optionally set
+    # from the env-var.
+    quant = None
+    env_attention_quant = os.environ.get("DIFFUSION_ATTENTION_QUANT")
+    if env_attention_quant is not None:
+        fields = [field.strip() for field in env_attention_quant.split(":")]
+        if len(fields) not in (2, 4) or not all(fields):
+            raise ValueError(
+                "DIFFUSION_ATTENTION_QUANT must have the format <dtype_qk>:<dtype_vo>[:<q_block_size>:<k_block_size>]."
+            )
+        quant_kwargs: dict[str, Any] = {
+            "dtype_qk": fields[0],
+            "dtype_vo": fields[1],
+        }
+        if len(fields) == 4:
+            q_block_size, k_block_size = int(fields[2]), int(fields[3])
+            if (q_block_size, k_block_size) != (0, 0):
+                quant_kwargs.update(
+                    q_block_size=q_block_size,
+                    k_block_size=k_block_size,
+                )
+        quant = AttnQuantSpec(**quant_kwargs)
+
+    normalized.default = AttentionSpec(backend=env_attention_backend, quant=quant)
     logger.info(
         "Parsed attention config from DIFFUSION_ATTENTION_BACKEND '%s': default=%s, per_role=%s",
         env_attention_backend,
