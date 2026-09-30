@@ -130,6 +130,17 @@ def video_to_base64_data_url(path: str) -> str:
     return f"data:{mime};base64,{b64}"
 
 
+def _pcm_to_float32(wav: np.ndarray) -> np.ndarray:
+    """Convert PCM samples to normalized float32.
+
+    Integer PCM uses the full dtype range as full scale (pydub pads 24-bit
+    uploads to int32); float input is already normalized.
+    """
+    if np.issubdtype(wav.dtype, np.integer):
+        return wav.astype(np.float32) / (1 << (np.iinfo(wav.dtype).bits - 1))
+    return wav.astype(np.float32)
+
+
 def process_audio_input(audio_input: Any | None) -> tuple[np.ndarray, int] | None:
     """Normalize Gradio audio input to (np.ndarray mono float32, sample_rate).
 
@@ -171,7 +182,7 @@ def process_audio_input(audio_input: Any | None) -> tuple[np.ndarray, int] | Non
         return None
     if audio_np.ndim > 1:
         audio_np = audio_np[:, 0]
-    return audio_np.astype(np.float32), sr
+    return _pcm_to_float32(audio_np), sr
 
 
 # ---------------------------------------------------------------------------
