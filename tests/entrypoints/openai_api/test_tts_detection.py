@@ -182,6 +182,7 @@ _PIPELINE_STAGES = [
     "token2text",
     "token2wav",
     "tts",
+    "encoder",
 ]
 
 _STAGES = [*_PIPELINE_STAGES, None, "vae", "not_a_real_stage"]
@@ -283,14 +284,22 @@ def test_pipeline_stage_list_is_complete():
     assert not missing, f"stage keys claimed by adapters but absent from _PIPELINE_STAGES: {sorted(missing)}"
 
 
-def test_entry_stage_archs_is_ming_only():
-    """Only Ming dense identifies its entry stage by architecture.
+def test_entry_stage_archs_are_explicit():
+    """Only Ming dense and AuK identify their entry stage by architecture.
 
-    Widening this set would change which stage ``_find_tts_stage`` selects in
-    mixed deployments — notably VoxCPM2, which declares ``model_archs`` but is
-    found by its ``latent_generator`` stage key.
+    Both use a generic ``model_stage`` (``llm`` and ``encoder``) that other
+    pipelines share. Widening this set would change which stage
+    ``_find_tts_stage`` selects in mixed deployments — notably VoxCPM2, which
+    declares ``model_archs`` but is found by its ``latent_generator`` stage key.
     """
-    assert tts_entry_stage_archs() == frozenset({"MingTTSForConditionalGeneration"})
+    assert tts_entry_stage_archs() == frozenset({"MingTTSForConditionalGeneration", "AuKForConditionalGeneration"})
+
+
+def test_minimax_h3_encoder_is_not_a_tts_stage():
+    """MiniMax H3 shares AuK's ``encoder`` stage key but is not a speech model."""
+    assert "encoder" not in all_tts_stage_keys()
+    assert detect_tts_model_type("encoder", "MiniMaxH3Encoder") is None
+    assert detect_tts_model_type("encoder", "AuKForConditionalGeneration") == "auk"
 
 
 def test_every_detected_type_is_adapter_backed():

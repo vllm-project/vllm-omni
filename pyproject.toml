@@ -325,6 +325,8 @@ skip_covered = true
 
 [tool.typos.default]
 extend-ignore-identifiers-re = [
+    # Canonical PyTorch CUDA device property.
+    "^shared_memory_per_block_optin$",
     ".*_thw",
     ".*thw",
     "ein",

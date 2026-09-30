@@ -112,6 +112,7 @@ def test_last_pp_rank_orchestration_and_kv_resolver(monkeypatch, needs_history) 
 
     runner.model = SimpleNamespace(compute_logits=None, logitsprocs_need_output_token_ids=needs_history)
     runner.model.mrv2_sampling_context = sampling_context
+    runner.sampler = None
     runner.sample = MagicMock(return_value=sampler_out)
     runner.sample.side_effect = lambda *_: sampler_out if sampling_active is needs_history else pytest.fail()
     logprobs_mock = MagicMock(side_effect=lambda *_: pytest.fail("inside ctx") if sampling_active else {})
@@ -304,3 +305,72 @@ def test_request_reference_codes_preserve_local_axis(prefill_first, padded):
     assert outputs[index]["codes.ref"].data_ptr() != ref.data_ptr()
     for i in range(2):
         assert torch.equal(outputs[i]["codes.audio"], codes[offsets[i] : offsets[i + 1]])
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+def test_model_owned_audio_finalizer_runs_after_copy_without_hidden(monkeypatch, streaming):
+    monkeypatch.setattr(torch.cuda, "set_stream", lambda _stream: None)
+    batch = SimpleNamespace(
+        num_reqs=2,
+        query_start_loc_np=np.array([0, 1, 4]),
+        num_scheduled_tokens=np.array([1, 3]),
+        num_tokens_after_padding=4,
+    )
+    snapshot = torch.tensor([[10, 11], [20, 21]])
+    seen = []
+
+    def finalize(payload, counts):
+        seen.append(counts)
+        return {"codes": {"audio": [payload["snapshot"][0:1].clone(), torch.empty(0, dtype=torch.long)]}}
+
+    result = _async_output(
+        req_ids=["audio", "partial"],
+        sampler_output=SamplerOutput(torch.tensor([[99], [100]]), None, None, None),
+        num_sampled_tokens=torch.tensor([1, 0]),
+        multimodal_outputs={"snapshot": snapshot},
+        input_batch=batch,
+        async_chunk=streaming,
+        finalize_multimodal=finalize,
+    ).get_output()
+    snapshot.zero_()
+    assert seen == [[1, 0]]
+    assert result.sampled_token_ids == [[99], []]
+    assert result.inter_stage_outputs[0]["codes.audio"].tolist() == [[10, 11]]
+    assert result.inter_stage_outputs[1]["codes.audio"].numel() == 0
+    assert (result.pooler_output is None) == streaming
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+def test_request_owned_snapshot_skips_generic_partition(monkeypatch, streaming):
+    from vllm_omni.worker_v2.output_snapshot import RequestOutputSnapshot
+
+    monkeypatch.setattr(torch.cuda, "set_stream", lambda _stream: None)
+    monkeypatch.setattr(
+        OmniARModelRunner,
+        "_build_async_chunk_outputs_from_mm",
+        lambda *args: pytest.fail("already partitioned payload was repartitioned"),
+    )
+    batch = SimpleNamespace(
+        num_reqs=2,
+        query_start_loc_np=np.array([0, 1, 4]),
+        num_scheduled_tokens=np.array([1, 3]),
+        num_tokens_after_padding=4,
+    )
+    snapshot = torch.tensor([[10, 11], [20, 21]])
+
+    def finalize(payload, counts):
+        return RequestOutputSnapshot([{"codes.audio": payload["snapshot"][0:1].clone()}, None])
+
+    result = _async_output(
+        req_ids=["audio", "partial"],
+        sampler_output=SamplerOutput(torch.tensor([[99], [100]]), None, None, None),
+        num_sampled_tokens=torch.tensor([1, 0]),
+        multimodal_outputs={"snapshot": snapshot},
+        input_batch=batch,
+        async_chunk=streaming,
+        finalize_multimodal=finalize,
+    ).get_output()
+    snapshot.zero_()
+    assert result.inter_stage_outputs[0]["codes.audio"].tolist() == [[10, 11]]
+    assert result.inter_stage_outputs[1] is None
+    assert (result.pooler_output is None) == streaming

@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import logging
 import warnings
 from dataclasses import fields, replace
 from inspect import Parameter, signature
@@ -54,6 +55,7 @@ from vllm_omni.config.stage_config import (
     load_deploy_config,
     merge_pipeline_deploy,
     resolve_deploy_yaml,
+    update_deploy_config_async_chunk_enabled,
 )
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.engine.stage_engine_startup import _serialize_stage_config
@@ -64,22 +66,27 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 _DEPLOY_DIR = Path(__file__).parents[2] / "vllm_omni" / "deploy"
 
 
-@pytest.mark.parametrize("async_chunk", [False, True])
-def test_native_kv_transfer_requires_completed_ar_stage(async_chunk):
-    from types import SimpleNamespace
-
-    pipeline = SimpleNamespace(stages=(), model_type="test")
+@pytest.mark.parametrize("async_chunk", [None, False, True])
+def test_native_kv_transfer_disables_async_chunk(async_chunk):
+    """Ensure that a multistage pipeline that supports async chunk disables it if we have a kv transfer config."""
+    pipeline = PipelineConfig(
+        model_type="test",
+        stages=(
+            # async_chunk_process_next_stage_input_func doesn't matter, it just needs to exist for this test.
+            StagePipelineConfig(stage_id=0, model_stage="ar", async_chunk_process_next_stage_input_func="foo.bar"),
+            StagePipelineConfig(stage_id=1, model_stage="dit", input_sources=(0,), final_output=True),
+        ),
+    )
+    kv_transfer_config = {"kv_connector": "MooncakeConnector"}
     deploy = DeployConfig(
         async_chunk=async_chunk,
         stages=[
-            StageDeployConfig(stage_id=0, engine_extras={"kv_transfer_config": {"kv_connector": "MooncakeConnector"}})
+            StageDeployConfig(stage_id=0, engine_extras={"kv_transfer_config": kv_transfer_config}),
+            StageDeployConfig(stage_id=1, engine_extras={"kv_transfer_config": kv_transfer_config}),
         ],
     )
-    if async_chunk:
-        with pytest.raises(ValueError, match="requires async_chunk=False"):
-            omni_config_module._validate_async_chunk_support(pipeline, deploy)
-    else:
-        omni_config_module._validate_async_chunk_support(pipeline, deploy)
+    update_deploy_config_async_chunk_enabled(pipeline, deploy)
+    assert not deploy.async_chunk
 
 
 @pytest.fixture(autouse=True)
@@ -778,6 +785,33 @@ def test_from_pipeline_config_dispatches_async_chunk_processors_without_mutating
 
     assert pipeline.get_stage(0).custom_process_next_stage_input_func.endswith("talker2code2wav_full_payload")
     assert pipeline.get_stage(1).custom_process_input_func is None
+
+
+def test_from_pipeline_config_async_chunk_none_preserves_yaml_default():
+    """Ensure passing None for async chunk in when creating from pipeline keeps yaml defaults."""
+    config = _from_pipeline_key("qwen3_tts", cli_overrides={"async_chunk": None})
+    talker_cfg = config.stage_by_id(0)
+    custom_proc = talker_cfg.custom_process_next_stage_input_func
+    assert custom_proc is not None
+    assert custom_proc.endswith("talker2code2wav_async_chunk")
+
+
+def test_from_pipeline_config_warns_when_single_stage_async_chunk_enabled(caplog: pytest.LogCaptureFixture):
+    """Ensure that we get a warning indicating async chunk is disabled if requested for single stage models."""
+    pipeline = PipelineConfig(
+        model_type="single_stage",
+        stages=(StagePipelineConfig(stage_id=0, model_stage="stage", final_output=True),),
+    )
+
+    with caplog.at_level(logging.WARNING, logger="vllm_omni.config.stage_config"):
+        config = VllmOmniConfig.from_pipeline_config(pipeline, cli_overrides={"async_chunk": True})
+
+    assert config.stage_by_id(0).connector_config.async_chunk is False
+    assert any(
+        record.levelno == logging.WARNING
+        and "async chunk is inapplicable to single stage models" in record.getMessage()
+        for record in caplog.records
+    )
 
 
 def test_joyai_code2wav_waits_for_full_payload():
@@ -2285,3 +2319,31 @@ def test_platform_stage_overlay_rejects_invalid_model_runner():
     )
     with pytest.raises(ValueError, match="model_runner must be 'v1' or 'v2'"):
         _apply_platform_overrides(deploy, platform="cuda")
+
+
+def test_async_chunk_auto_disabled_without_processor():
+    """Ensure a multi-stage model that doesn't support async chunk turns it off by default."""
+    pipeline = PipelineConfig(
+        model_type="test_no_async",
+        model_arch="TestNoAsync",
+        stages=(
+            StagePipelineConfig(
+                stage_id=0,
+                model_stage="ar",
+                execution_type=StageExecutionType.LLM_AR,
+                final_output=True,
+            ),
+            StagePipelineConfig(
+                stage_id=1,
+                model_stage="generation",
+                execution_type=StageExecutionType.LLM_GENERATION,
+                input_sources=(0,),
+            ),
+        ),
+    )
+
+    deploy = DeployConfig()
+    # async chunk should not try to default to True in this case,
+    # since doing so will just raise a ValueError in validation.
+    merge_pipeline_deploy(pipeline, deploy)
+    assert not deploy.async_chunk

@@ -19,6 +19,8 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 class _StageModel(torch.nn.Module):
+    logits_vocab_size = 6562
+
     def make_empty_intermediate_tensors(self):
         return None
 

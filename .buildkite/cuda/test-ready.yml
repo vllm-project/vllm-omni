@@ -16,6 +16,15 @@ steps:
           - "pytest -sv tests/model_executor -m 'core_model and cpu'"
         mirror_hardwares: l4_1
 
+      - label: "Simple · CosyVoice3 Packed Flow Test"
+        timeout_in_minutes: 15
+        source_file_dependencies:
+          - tests/model_executor/models/cosyvoice3/test_cosyvoice3_full_batch.py
+          - vllm_omni/model_executor/models/cosyvoice3/
+        commands:
+          - "pytest -sv tests/model_executor/models/cosyvoice3/test_cosyvoice3_full_batch.py -k packed -m 'core_model and cuda' --run-level=core_model"
+        mirror_hardwares: h100_1
+
       - label: "Simple · Diffusion Test"
         timeout_in_minutes: 30
         commands:

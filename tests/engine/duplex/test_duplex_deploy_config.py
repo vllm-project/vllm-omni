@@ -97,6 +97,7 @@ def test_duplex_session_runtime_rejects_non_positive_values(tmp_path, name: str,
     ("deploy_yaml", "expected"),
     [
         ("minicpmo_4_5.yaml", 16),
+        ("minicpmo_4_5_duplex_h200.yaml", 16),
         ("minicpmo_4_5_8x4090.yaml", 1),
         ("minicpmo_4_5_3gpu_stage1_replicas.yaml", 16),
     ],

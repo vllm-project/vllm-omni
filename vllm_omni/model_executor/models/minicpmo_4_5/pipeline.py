@@ -65,6 +65,7 @@ MINICPMO_4_5_PIPELINE = PipelineConfig(
             owns_tokenizer=True,
             requires_multimodal_data=True,
             engine_output_type="latent",
+            supports_native_mrv2_data_plane=True,
             sampling_constraints={
                 "detokenize": True,
                 # The llm2tts bridge discards this boundary and every row
@@ -83,6 +84,9 @@ MINICPMO_4_5_PIPELINE = PipelineConfig(
             custom_process_input_func=f"{_PROC}.llm2tts",
             custom_process_next_stage_input_func=f"{_PROC}.tts2code2wav_full_payload",
             async_chunk_process_next_stage_input_func=f"{_PROC}.tts2code2wav_async_chunk",
+            # Takes effect only when the deploy selects model_runner v2 for
+            # this stage (turn sessions only; duplex stays on V1).
+            supports_native_mrv2_data_plane=True,
             sampling_constraints={
                 "detokenize": False,
                 # The stop id has to be one the vLLM-level head can actually
@@ -100,6 +104,7 @@ MINICPMO_4_5_PIPELINE = PipelineConfig(
             final_output_type="audio",
             engine_output_type="audio",
             model_arch="MiniCPMO45Code2Wav",
+            supports_native_mrv2_data_plane=True,
             sync_process_input_func=f"{_PROC}.tts2code2wav_token_only",
             sampling_constraints={"detokenize": True},
             requires_full_payload_input=True,

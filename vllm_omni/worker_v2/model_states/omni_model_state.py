@@ -413,6 +413,32 @@ class OmniModelState(DefaultModelState):
     # Input preparation
     # ------------------------------------------------------------------
 
+    def prepare_inputs_embeds(
+        self,
+        scheduled_encoder_inputs: dict[str, list[int]],
+        input_batch: InputBatch,
+        req_states: RequestState,
+    ) -> torch.Tensor:
+        # Models that rearrange multimodal prompts per request (CosyVoice3)
+        # need the request boundaries the V1 runner passes as query_start_loc.
+        if (
+            not self.supports_mm_inputs
+            or self.mm_pruner is not None
+            or not getattr(self.model, "supports_embed_input_ids_query_start_loc", False)
+        ):
+            return super().prepare_inputs_embeds(scheduled_encoder_inputs, input_batch, req_states)
+        self.execute_mm_encoder(scheduled_encoder_inputs)
+        mm_embeds, is_mm_embed = self.gather_mm_embeddings(input_batch)
+        kwargs: dict[str, Any] = {"multimodal_embeddings": mm_embeds, "is_multimodal": is_mm_embed}
+        if mm_embeds:
+            kwargs["query_start_loc"] = input_batch.query_start_loc_np.tolist()
+        embeds = self.model.embed_input_ids(input_batch.input_ids[: input_batch.num_tokens], **kwargs)
+        inputs_embeds = self.encoder_runner.inputs_embeds
+        inputs_embeds[: embeds.shape[0]] = embeds
+        if self.prompt_embeds_state is not None:
+            self.prompt_embeds_state.apply(input_batch, req_states.num_computed_tokens.gpu, inputs_embeds)
+        return inputs_embeds[: input_batch.num_tokens_after_padding]
+
     def prepare_inputs(self, input_batch: InputBatch, req_states: RequestState) -> dict[str, Any]:
         # Forward-only stages have no preprocess hook. Honor their declared
         # GPU inputs before gathering the model's runtime view, so payload

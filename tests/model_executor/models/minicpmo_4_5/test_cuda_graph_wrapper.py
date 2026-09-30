@@ -1969,7 +1969,10 @@ def test_whole_euler_query_bucket_keeps_current_first_cache_layout(monkeypatch: 
         (_whole_euler_chunk(1, 8), 6, 2),  # narrow padded chunk: capture pads 8 -> 16
         (_whole_euler_chunk(1, 16), 16, 0),  # consumes the narrow chunk's cache
     ]
-    caches = {"exact": (None, None), "bucketed": (None, None)}
+    caches: dict[str, tuple[torch.Tensor | None, torch.Tensor | None]] = {
+        "exact": (None, None),
+        "bucketed": (None, None),
+    }
     for chunk, mel_frames, pad_frames in chunks:
         chunk["x"][:, :, mel_frames:] = 0.0
         results = {}
@@ -2319,3 +2322,24 @@ def test_whole_euler_groups_are_acquired_again_after_a_flush(monkeypatch: pytest
     assert calls == [16, 1, 16, 1]
     flush_always = True
     assert wrapper._group_entries(groups, fills) is None
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_vocoder_restores_tf32_policy(fail):
+    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_code2wav import MiniCPMO45Code2Wav
+
+    previous = torch.backends.cuda.matmul.allow_tf32
+
+    def forward(*args, **kwargs):
+        assert torch.backends.cuda.matmul.allow_tf32
+        if fail:
+            raise RuntimeError("injected")
+        return "ok"
+
+    model = SimpleNamespace(_extra_config=lambda: {"token2wav_allow_tf32": True}, _forward_impl=forward)
+    if fail:
+        with pytest.raises(RuntimeError, match="injected"):
+            MiniCPMO45Code2Wav.forward(model)
+    else:
+        assert MiniCPMO45Code2Wav.forward(model) == "ok"
+    assert torch.backends.cuda.matmul.allow_tf32 == previous
