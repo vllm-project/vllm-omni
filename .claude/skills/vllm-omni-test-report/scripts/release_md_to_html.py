@@ -125,6 +125,8 @@ def _release_section_theme(title_plain: str) -> tuple[str, str]:
         return "conclusion", _RELEASE_SVG_CHECK
     if "metrics" in low:
         return "metrics", _RELEASE_SVG_CHART
+    if "指标分析" in t or "metric analysis" in low:
+        return "metric-analysis", _RELEASE_SVG_CHART
     if "failure analysis" in low:
         return "failure", _RELEASE_SVG_ALERT
     if "test result" in low:
@@ -1755,6 +1757,136 @@ _DEVICE_HOURS_BUILD_SCRIPT = """<script>
   function initAll() {
     var inputs = document.querySelectorAll("input.dhpb-input[data-dhpb-marker=\"1\"]");
     for (var i = 0; i < inputs.length; i++) { hydrate(inputs[i]); }
+  }
+
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", initAll);
+  } else {
+    initAll();
+  }
+})();
+</script>"""
+
+
+# ── "指标分析(英文)" editable rich-text section ──────────────────────────────
+# First contenteditable rich-text control in the codebase. The operator authors
+# an English metric analysis directly in the generated release HTML; the toolbar
+# drives ``document.execCommand`` (deprecated but universally supported and the
+# only no-dependency way to do selection-based bold/formatBlock). Persistence
+# follows the canonical shape used by every other editable feature: a
+# ``localStorage`` key + a ``data-ma-value`` DOM mirror attribute (DOM-first
+# hydrate, write-both-on-edit), so a Ctrl+S Save-Page-As snapshot retains the
+# authored HTML and a saved copy opened on another origin still displays it.
+METRIC_ANALYSIS_INSERTION_MARKER = "@@METRIC_ANALYSIS_INSERTION_POINT@@"
+
+METRIC_ANALYSIS_BLOCK_HTML = (
+    '<div class="metric-analysis-block" data-ma-value="" data-ma-state="empty">'
+    '<div class="metric-analysis-toolbar" role="toolbar" aria-label="Formatting">'
+    '<button type="button" class="ma-btn" data-ma-cmd="bold" title="Bold (Ctrl+B)"><b>B</b></button>'
+    '<button type="button" class="ma-btn" data-ma-cmd="italic" title="Italic (Ctrl+I)"><i>I</i></button>'
+    '<button type="button" class="ma-btn" data-ma-cmd="formatBlock" data-ma-value="h3" title="Sub-heading">H3</button>'
+    '<button type="button" class="ma-btn" data-ma-cmd="formatBlock" data-ma-value="h4" title="Sub-sub-heading">H4</button>'
+    '<button type="button" class="ma-btn" data-ma-cmd="insertUnorderedList" title="Bullet list">• List</button>'
+    '<button type="button" class="ma-btn" data-ma-cmd="insertOrderedList" title="Numbered list">1. List</button>'
+    '<button type="button" class="ma-btn" data-ma-cmd="removeFormat" title="Clear formatting">Clear</button>'
+    '</div>'
+    '<div class="metric-analysis-editor" contenteditable="true" '
+    'data-ma-persist="1" data-ma-marker="1" spellcheck="false" '
+    'data-placeholder="Click to write your metric analysis (English)…"></div>'
+    '</div>'
+)
+
+
+def _upgrade_metric_analysis_block(html_fragment: str) -> str:
+    """Swap the ``@@METRIC_ANALYSIS_INSERTION_POINT@@`` marker for the rich-text editor.
+
+    The marker is emitted by ``compose_full_report.render_metric_analysis_section``
+    inside the ``## 指标分析(英文)`` section body. The marker string is unique, so a
+    literal ``str.replace`` is safe (mirrors ``_upgrade_device_hours_cell``). The
+    JS handler lives in :data:`_METRIC_ANALYSIS_SCRIPT`.
+    """
+    if METRIC_ANALYSIS_INSERTION_MARKER not in html_fragment:
+        return html_fragment
+    return html_fragment.replace(METRIC_ANALYSIS_INSERTION_MARKER, METRIC_ANALYSIS_BLOCK_HTML)
+
+
+_METRIC_ANALYSIS_SCRIPT = """<script>
+(function () {
+  "use strict";
+
+  // In-memory fallback when localStorage throws (e.g. Chrome file://).
+  var mem = {};
+  function lsGet(k) {
+    try { return localStorage.getItem(k); } catch (e) { return mem.hasOwnProperty(k) ? mem[k] : null; }
+  }
+  function lsSet(k, v) {
+    try { v ? localStorage.setItem(k, v) : localStorage.removeItem(k); }
+    catch (e) { if (v) mem[k] = v; else delete mem[k]; }
+  }
+
+  var STORAGE_KEY = "metric-analysis:release";
+
+  function syncState(editor) {
+    var raw = editor.innerHTML || "";
+    // contenteditable browsers insert "<br>" for an empty line; treat as empty.
+    var has = !!(raw && raw.trim() && raw.trim() !== "<br>");
+    var block = editor.closest(".metric-analysis-block");
+    if (block) {
+      block.setAttribute("data-ma-state", has ? "saved" : "empty");
+      block.setAttribute("data-ma-value", raw);
+    }
+  }
+
+  function persist(editor) {
+    var v = editor.innerHTML || "";
+    editor.setAttribute("data-ma-value", v);
+    lsSet(STORAGE_KEY, v);
+    syncState(editor);
+  }
+
+  function hydrate(editor) {
+    // Prefer the DOM attribute first (captured by "Save Page As"),
+    // fall back to localStorage (reload on the same origin).
+    var attr = editor.getAttribute("data-ma-value");
+    var saved = null;
+    if (attr === null || attr === undefined) {
+      saved = lsGet(STORAGE_KEY);
+    } else if (attr) {
+      saved = attr;
+    }
+    if (saved !== null && saved !== undefined && saved !== "") {
+      editor.innerHTML = saved;
+    }
+    syncState(editor);
+    editor.addEventListener("input", function () { persist(editor); });
+    editor.addEventListener("blur", function () { persist(editor); });
+  }
+
+  function initToolbar() {
+    var btns = document.querySelectorAll(".metric-analysis-block .ma-btn");
+    for (var i = 0; i < btns.length; i++) {
+      // mousedown (not click) + preventDefault keeps the editor's text
+      // selection alive so execCommand acts on the selection rather than
+      // collapsing it when the toolbar button receives focus.
+      btns[i].addEventListener("mousedown", function (e) {
+        e.preventDefault();
+        var block = this.closest(".metric-analysis-block");
+        if (!block) return;
+        var editor = block.querySelector(".metric-analysis-editor");
+        if (!editor) return;
+        editor.focus();
+        var cmd = this.getAttribute("data-ma-cmd");
+        var val = this.getAttribute("data-ma-value") || null;
+        try { document.execCommand(cmd, false, val); } catch (err) { /* ignore */ }
+        persist(editor);
+      });
+    }
+  }
+
+  function initAll() {
+    var editors = document.querySelectorAll(".metric-analysis-editor[data-ma-marker=\"1\"]");
+    for (var i = 0; i < editors.length; i++) { hydrate(editors[i]); }
+    initToolbar();
   }
 
   if (document.readyState === "loading") {
@@ -3409,6 +3541,7 @@ def wrap_html_document(
 {_QUALITY_DEFENSE_SCRIPT}
 {_RESOURCE_USAGE_SCRIPT}
 {_DEVICE_HOURS_BUILD_SCRIPT}
+{_METRIC_ANALYSIS_SCRIPT}
 </body>
 </html>
 """
@@ -3474,6 +3607,7 @@ def convert_release_report_markdown(
     body = _upgrade_next_steps_outstanding_cells(body)
     body = _upgrade_quality_defense_block(body)
     body = _upgrade_resource_usage_block(body)
+    body = _upgrade_metric_analysis_block(body)
     body = _wrap_summary_section_in_details(body)
     body = _wrap_failure_analysis_h4_in_details(body)
     body = _wrap_pdc_h4_in_details(body)

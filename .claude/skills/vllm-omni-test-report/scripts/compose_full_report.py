@@ -602,6 +602,29 @@ def render_quality_defense_section() -> str:
     )
 
 
+METRIC_ANALYSIS_INSERTION_MARKER = "@@METRIC_ANALYSIS_INSERTION_POINT@@"
+
+
+def render_metric_analysis_section() -> str:
+    """Markdown for ``## 指标分析(英文)`` — an editable rich-text analysis box.
+
+    Emits the H2 plus a single placeholder marker
+    (``@@METRIC_ANALYSIS_INSERTION_POINT@@``) that
+    :func:`release_md_to_html._upgrade_metric_analysis_block` replaces with a
+    ``contenteditable`` rich-text editor (bold / italic / sub-heading / list
+    toolbar) whose content persists in
+    ``localStorage['metric-analysis:release']`` and mirrors to a
+    ``data-ma-value`` attribute for Save-Page-As persistence. **Release variant
+    only** — the section sits immediately below the Metrics overview so the
+    operator can author an English metric analysis next to the numbers it
+    interprets.
+    """
+    return (
+        "## 指标分析(英文)\n\n"
+        f"{METRIC_ANALYSIS_INSERTION_MARKER}\n"
+    )
+
+
 RESOURCE_USAGE_INSERTION_MARKER = "@@RESOURCE_USAGE_INSERTION_POINT@@"
 
 
@@ -2744,9 +2767,13 @@ def preview_report_markdown(
     # so the layout matches the live report HTML exactly.
     quality_defense_block = render_quality_defense_section()
 
+    metric_analysis_section = render_metric_analysis_section()
+
     return f"""# vLLM-Omni Test Report - Scheduled Nightly
 
 {conclusion}{ci_md}
+
+{metric_analysis_section}
 
 {quality_defense_block}
 
@@ -3386,6 +3413,7 @@ def main() -> None:
     # + ``data-quality-on`` attribute (mirrors the existing pattern used by
     # ``oi-followup`` / ``ns-outstanding`` / ``fail-status``).
     quality_defense_block = render_quality_defense_section()
+    metric_analysis_section = render_metric_analysis_section()
     # "Remaining DI < 30" is a **manual** user-selectable Pass/Fail row (like
     # the NPU row) — the operator judges it against the SLO-escalating
     # Outstanding DI (sum of per-issue SLO DI across open `label:bug` whose
@@ -3400,6 +3428,8 @@ def main() -> None:
     md = f"""# vLLM-Omni Test Report - Scheduled Nightly
 
 {conclusion}{ci_md}
+
+{metric_analysis_section}
 
 {quality_defense_block}
 

@@ -3254,6 +3254,104 @@ td.oi-followup-cell[data-oi-state="set"] .oi-followup-select {
   font-weight: 400;
 }
 
+/* ── Metric analysis (editable rich-text box) ───────────────────── */
+.release-doc .metric-analysis-block {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  margin: 0.4rem 0 0.2rem;
+}
+.release-doc .metric-analysis-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  flex-wrap: wrap;
+  padding-bottom: 0.3rem;
+  border-bottom: 1px dashed color-mix(in srgb, var(--accent) 35%, transparent);
+}
+.release-doc .metric-analysis-status {
+  font-size: 0.78rem;
+  color: var(--dashboard-muted);
+  margin-left: auto;
+}
+.release-doc .metric-analysis-status[data-ma-state="saved"] {
+  color: var(--dashboard-healthy, #22c55e);
+}
+.release-doc .ma-btn {
+  font: inherit;
+  font-size: 0.8rem;
+  font-weight: 600;
+  min-width: 1.8rem;
+  padding: 0.22rem 0.55rem;
+  border-radius: 6px;
+  border: 1px solid color-mix(in srgb, var(--accent) 35%, transparent);
+  background: color-mix(in srgb, var(--accent) 6%, transparent);
+  color: var(--dashboard-text);
+  cursor: pointer;
+  line-height: 1.3;
+}
+.release-doc .ma-btn:hover {
+  background: color-mix(in srgb, var(--accent) 16%, transparent);
+  border-color: var(--accent);
+}
+.release-doc .ma-btn:active {
+  background: color-mix(in srgb, var(--accent) 26%, transparent);
+}
+.release-doc .metric-analysis-editor {
+  font: inherit;
+  font-size: 0.95rem;
+  line-height: 1.6;
+  min-height: 160px;
+  padding: 0.6rem 0.8rem;
+  border: 1px solid color-mix(in srgb, var(--accent) 35%, transparent);
+  border-radius: 6px;
+  background: var(--dashboard-panel-bg);
+  color: var(--dashboard-text);
+  box-sizing: border-box;
+  overflow-y: auto;
+  /* contenteditable has no native placeholder; show hint via :empty:before */
+}
+.release-doc .metric-analysis-editor:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 22%, transparent);
+}
+.release-doc .metric-analysis-editor:empty:before {
+  content: attr(data-placeholder);
+  color: color-mix(in srgb, var(--dashboard-muted) 80%, transparent);
+  font-style: italic;
+}
+.release-doc .metric-analysis-editor h3 {
+  font-size: 1.02rem;
+  font-weight: 700;
+  margin: 0.6rem 0 0.3rem;
+  line-height: 1.35;
+}
+.release-doc .metric-analysis-editor h4 {
+  font-size: 0.95rem;
+  font-weight: 600;
+  margin: 0.5rem 0 0.25rem;
+  line-height: 1.35;
+  color: color-mix(in srgb, var(--dashboard-text) 90%, transparent);
+}
+.release-doc .metric-analysis-editor p {
+  margin: 0.3rem 0;
+}
+.release-doc .metric-analysis-editor ul,
+.release-doc .metric-analysis-editor ol {
+  margin: 0.3rem 0;
+  padding-left: 1.5rem;
+}
+.release-doc .metric-analysis-editor ul {
+  list-style: disc;
+}
+.release-doc .metric-analysis-editor ol {
+  list-style: decimal;
+}
+.release-doc .metric-analysis-editor li {
+  margin: 0.15rem 0;
+}
+
 /* ── Quality Defense Radar — 9 models × 5 axes ──────────────────── */
 .release-doc .qd-radar-wrap {
   display: flex;
