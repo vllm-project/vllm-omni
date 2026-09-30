@@ -346,6 +346,29 @@ def inline_md_to_html(s: str) -> str:
 
     carved = _anchor_re.sub(_stash_anchor, s)
 
+    # Preserve <div class="excerpt-cell-inner">…</div> blocks (the release/
+    # development failure-table Excerpt cells emitted by _excerpt_cell_html via
+    # _excerpt_md_cell). Without this carve-out the helpers below html.escape
+    # the angle brackets (&lt;div&gt;…) AND double-escape the &#10;/&#124;
+    # numeric character references inside the <pre> store (→ &amp;#10; rendered
+    # as literal "&#10;" text in the modal). The block is already fully escaped
+    # by _excerpt_cell_html, so it must pass through inline_md_to_html verbatim;
+    # _upgrade_excerpt_cells_in_failure_tables then tags the <td> and leaves the
+    # inner HTML intact.
+    excerpt_blocks: list[str] = []
+
+    def _stash_excerpt_block(m: re.Match[str]) -> str:
+        idx = len(excerpt_blocks)
+        excerpt_blocks.append(m.group(0))
+        return f"\x00EXCERPT_BLOCK_{idx}\x00"
+
+    carved = re.sub(
+        r'<div class="excerpt-cell-inner">.*?</div>',
+        _stash_excerpt_block,
+        carved,
+        flags=re.DOTALL,
+    )
+
     # Preserve <span class="dev-snapshot-alert">…</span> as raw HTML so the
     # Development Metrics overview's red-alert rows render correctly (without
     # this carve-out the helper would html.escape the angle brackets, turning
@@ -404,6 +427,9 @@ def inline_md_to_html(s: str) -> str:
     if spans:
         for idx, span_html in spans:
             rendered = rendered.replace(f"\x00DEV_SNAPSHOT_SPAN_{idx}\x00", span_html)
+    if excerpt_blocks:
+        for idx, block_html in enumerate(excerpt_blocks):
+            rendered = rendered.replace(f"\x00EXCERPT_BLOCK_{idx}\x00", block_html)
     if anchors:
         for idx, anchor_html in enumerate(anchors):
             rendered = rendered.replace(f"\x00ANCHOR_{idx}\x00", anchor_html)
@@ -946,6 +972,21 @@ def _upgrade_excerpt_cells_in_failure_tables(html_fragment: str) -> str:
             if not excerpt_text or excerpt_text == "&mdash;" or excerpt_text == "—":
                 rebuilt_rows.append(rm.group(0))
                 continue
+            # Release/nightly path: cell 3 is ALREADY _excerpt_cell_html output
+            # (a <div class="excerpt-cell-inner"> with <button class="btn-view-
+            # log-excerpt"> + <pre>). Re-processing strips the tags, decodes
+            # entities, and re-calls _excerpt_cell_html — double-escaping
+            # &#10;/&#124; into &amp;#10;/&amp;#124; (rendered as literal
+            # "&amp;#10;" text) and nesting a second excerpt cell inside the
+            # first. Keep the inner HTML intact; just tag the <td> with the
+            # excerpt-cell class so the column-width CSS still applies.
+            if "excerpt-cell-inner" in excerpt_text or "btn-view-log-excerpt" in excerpt_text:
+                new_cell = f'<td class="excerpt-cell">{excerpt_match.group(1)}</td>'
+                before = rm.group(1)[: excerpt_match.start()]
+                after = rm.group(1)[excerpt_match.end() :]
+                new_row_inner = before + new_cell + after
+                rebuilt_rows.append(rm.group(0).replace(rm.group(1), new_row_inner, 1))
+                continue
             # Decode simple HTML entities to plain text for the excerpt storage.
             plain = re.sub(r"<[^>]+>", "", excerpt_text)
             plain = (
@@ -995,6 +1036,55 @@ def _upgrade_excerpt_cells_in_failure_tables(html_fragment: str) -> str:
         pos = tm.end()
     rebuilt.append(html_fragment[pos:])
     return "".join(rebuilt)
+
+
+def _tag_failure_table_columns(html_fragment: str) -> str:
+    """Tag the Test node column (col 0) of release failure tables with a
+    ``test-node`` class so the column-width CSS can constrain it.
+
+    The release composer emits Markdown tables (``render_markdown_table``)
+    that convert to plain ``<td>`` tags with no classes, unlike the nightly
+    composer which emits ``<table class="fail-table">`` with per-column
+    classes directly. Long pytest node IDs (e.g.
+    ``tests/examples/.../test_text_to_image.py::test_text_to_image[overview_001]``)
+    have no breakable spaces, so without a width constraint + word-wrap the
+    Test node column forces the whole table wide. This tags col 0 so
+    ``td.test-node { max-width; overflow-wrap }`` can shrink it. Identifies
+    failure tables by the ``Test node`` header; header rows (``<th>``) are
+    skipped because ``<td>`` doesn't match them.
+    """
+    TABLE_RE = re.compile(r"<table[^>]*>.*?</table>", re.DOTALL | re.IGNORECASE)
+    ROW_RE = re.compile(r"<tr[^>]*>.*?</tr>", re.DOTALL | re.IGNORECASE)
+    TD_OPEN_RE = re.compile(r"<td([^>]*)>", re.IGNORECASE)
+    CLASS_RE = re.compile(r'class\s*="([^"]*)"', re.IGNORECASE)
+
+    def _tag_first_td(row_html: str) -> str:
+        m = TD_OPEN_RE.search(row_html)
+        if not m:
+            return row_html  # header row (no <td>) or empty
+        attrs = m.group(1)
+        if "test-node" in attrs:
+            return row_html  # already tagged
+        cm = CLASS_RE.search(attrs)
+        if cm:
+            new_attrs = attrs[: cm.start()] + f'class="{cm.group(1)} test-node"' + attrs[cm.end():]
+        else:
+            new_attrs = attrs + ' class="test-node"'
+        return row_html[: m.start()] + "<td" + new_attrs + ">" + row_html[m.end():]
+
+    def _table_tag(table_html: str) -> str:
+        if "Test node" not in table_html:
+            return table_html
+        out: list[str] = []
+        pos = 0
+        for rm in ROW_RE.finditer(table_html):
+            out.append(table_html[pos:rm.start()])
+            out.append(_tag_first_td(rm.group(0)))
+            pos = rm.end()
+        out.append(table_html[pos:])
+        return "".join(out)
+
+    return TABLE_RE.sub(lambda m: _table_tag(m.group(0)), html_fragment)
 
 
 def _upgrade_submit_issue_cells_in_failure_tables(html_fragment: str) -> str:
@@ -3600,6 +3690,7 @@ def convert_release_report_markdown(
     body = _upgrade_excerpt_cells_in_failure_tables(body)
     body = _upgrade_submit_issue_cells_in_failure_tables(body)
     body = _upgrade_status_cells_in_failure_tables(body)
+    body = _tag_failure_table_columns(body)
     body = _group_skip_monitor_table_by_issue(body)
     body = _upgrade_open_issue_action_cells(body)
     body = _upgrade_di_top10_input_cells(body)

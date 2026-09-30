@@ -4624,11 +4624,16 @@ def _excerpt_cell_html(
     users no longer hit the legacy ``... [truncated]`` cutoff when triaging.
 
     The escaped text is emitted **single-line** (``\\n`` → ``&#10;``,
-    ``\\r`` → ``&#13;``) AFTER ``html.escape``. A literal newline inside the
-    ``<pre>`` would break the markdown table row that wraps this cell (a
-    multi-line mp.spawn child traceback spilled as top-level ``<p>``/``<h1>``).
-    The numeric character references still render as line breaks inside the
-    ``<pre>`` in the modal, so the failure context stays intact visually.
+    ``\\r`` → ``&#13;``, ``|`` → ``&#124;``) AFTER ``html.escape``. A literal
+    newline inside the ``<pre>`` would break the markdown table row that
+    wraps this cell (a multi-line mp.spawn child traceback spilled as
+    top-level ``<p>``/``<h1>``). A literal ``|`` would break the markdown
+    table column count — tracebacks carry Python type annotations like
+    ``dict[str, str] | None`` whose ``|`` the markdown table parser treats
+    as a column separator, spilling the cell into neighbouring Submit
+    Issue / Status columns. The numeric character references still render
+    as line breaks / pipe inside the ``<pre>`` in the modal, so the
+    failure context stays intact visually.
     """
     t = (excerpt or "").strip()
     if not t:
@@ -4638,9 +4643,15 @@ def _excerpt_cell_html(
     safe_id = html.escape(storage_id)
     safe_title = html.escape(title, quote=True)
     safe_label = html.escape(button_label)
-    # Flatten newlines AFTER escaping so the emitted cell HTML stays on a
-    # single line; &#10;/&#13; still render as line breaks inside the <pre>.
-    safe_text = html.escape(t).replace("\n", "&#10;").replace("\r", "&#13;")
+    # Flatten newlines + escape pipe AFTER html.escape so the emitted cell
+    # HTML stays on a single line and doesn't split the markdown table;
+    # &#10;/&#13;/&#124; still render as newline / pipe inside the <pre>.
+    safe_text = (
+        html.escape(t)
+        .replace("\n", "&#10;")
+        .replace("\r", "&#13;")
+        .replace("|", "&#124;")
+    )
     return (
         '<div class="excerpt-cell-inner">'
         f'<button type="button" class="btn-view-log-excerpt" '

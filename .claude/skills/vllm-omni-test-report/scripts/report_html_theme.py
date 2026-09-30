@@ -700,6 +700,15 @@ td.mono {
   font-size: 0.84rem;
   word-break: break-all;
 }
+/* Release-path Test node column (nightly uses td.mono above). The release
+   composer emits Markdown tables that convert to plain <td> tags with no
+   classes; _tag_failure_table_columns tags col 0 with `test-node` so a
+   max-width + overflow-wrap can shrink it — long pytest node IDs have no
+   breakable spaces and otherwise force the whole table wide. */
+td.test-node {
+  max-width: 22rem;
+  overflow-wrap: anywhere;
+}
 td.reason {
   color: var(--dashboard-text);
 }
