@@ -715,6 +715,7 @@ class BagelPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProf
             if image_input:
                 image_input = [Image.open(image) if isinstance(image, str) else image for image in image_input]
 
+            understanding = not isinstance(first_prompt, str) and "text" in (first_prompt.get("modalities") or [])
             if image_input:
                 # If we have an image, we prefill with it
                 if self.image_processor and self.vae:
@@ -764,26 +765,27 @@ class BagelPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProf
                         return arr.permute(2, 0, 1)
 
                     # Update gen_context with image (VAE + ViT)
-                    gen_input_vae, newlens_vae, new_rope_vae = self.bagel.prepare_vae_images(
-                        curr_kvlens=gen_context["kv_lens"],
-                        curr_rope=gen_context["ropes"],
-                        images=image_input,
-                        transforms=vae_transforms,
-                        new_token_ids=self.new_token_ids,
-                    )
-                    for k, v in gen_input_vae.items():
-                        if torch.is_tensor(v):
-                            gen_input_vae[k] = v.to(self.device)
-                    with torch.autocast(
-                        device_type=self.device.type,
-                        enabled=self.device.type != "cpu",
-                        dtype=self.od_config.dtype,
-                    ):
-                        gen_context["past_key_values"] = self.bagel.forward_cache_update_vae(
-                            self.vae, gen_context["past_key_values"], **gen_input_vae
+                    if not understanding:
+                        gen_input_vae, newlens_vae, new_rope_vae = self.bagel.prepare_vae_images(
+                            curr_kvlens=gen_context["kv_lens"],
+                            curr_rope=gen_context["ropes"],
+                            images=image_input,
+                            transforms=vae_transforms,
+                            new_token_ids=self.new_token_ids,
                         )
-                    gen_context["kv_lens"] = newlens_vae
-                    gen_context["ropes"] = new_rope_vae
+                        for k, v in gen_input_vae.items():
+                            if torch.is_tensor(v):
+                                gen_input_vae[k] = v.to(self.device)
+                        with torch.autocast(
+                            device_type=self.device.type,
+                            enabled=self.device.type != "cpu",
+                            dtype=self.od_config.dtype,
+                        ):
+                            gen_context["past_key_values"] = self.bagel.forward_cache_update_vae(
+                                self.vae, gen_context["past_key_values"], **gen_input_vae
+                            )
+                        gen_context["kv_lens"] = newlens_vae
+                        gen_context["ropes"] = new_rope_vae
 
                     gen_input_img, newlens_img, new_rope_img = self.bagel.prepare_vit_images(
                         curr_kvlens=gen_context["kv_lens"],
