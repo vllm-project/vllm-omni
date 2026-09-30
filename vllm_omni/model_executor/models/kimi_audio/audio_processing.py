@@ -1,0 +1,150 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+"""Kimi-Audio prompt preparation and processor-side Whisper preprocessing.
+
+Waveforms arrive as mono 16 kHz audio from the framework's media input path.
+The multimodal processor supplies the feature extractor; encoder weights and
+execution stay in the model worker. GLM consumes the original waveform.
+"""
+
+from collections.abc import Mapping, Sequence
+from dataclasses import asdict, dataclass
+from typing import TYPE_CHECKING, Literal
+
+import msgspec
+import numpy as np
+import torch
+from transformers import WhisperFeatureExtractor
+
+from .prompt import KimiAudioEncodedAudio, KimiAudioPromptBuilder
+
+if TYPE_CHECKING:
+    from vllm_omni.inputs.data import OmniTokensPrompt
+
+SAMPLE_RATE = 16000
+CHUNK_SAMPLES = 30 * SAMPLE_RATE
+SAMPLES_PER_TOKEN = 1280
+
+
+@dataclass(frozen=True)
+class KimiAudioWhisperInputs:
+    input_features: torch.Tensor
+    token_lengths: tuple[int, ...]
+
+
+def prepare_whisper_inputs(
+    waveform: np.ndarray,
+    feature_extractor: WhisperFeatureExtractor,
+    *,
+    sampling_rate: int,
+) -> KimiAudioWhisperInputs:
+    """Split at 30 seconds, pad each segment, and keep its real 12.5 Hz length.
+
+    Passing the full recording to Whisper's usual truncating processor would
+    lose later segments. Padding is for Whisper only and must not affect GLM.
+    """
+    if sampling_rate != SAMPLE_RATE:
+        raise ValueError("Kimi-Audio expects audio resampled to 16000 Hz by the input layer")
+    if waveform.ndim != 1 or waveform.size == 0 or not np.issubdtype(waveform.dtype, np.floating):
+        raise ValueError("Expected a nonempty mono floating point waveform")
+    if not np.isfinite(waveform).all():
+        raise ValueError("Audio waveform must contain finite samples")
+    if (
+        feature_extractor.sampling_rate != SAMPLE_RATE
+        or feature_extractor.hop_length != 160
+        or feature_extractor.n_fft != 400
+        or feature_extractor.feature_size != 128
+        or feature_extractor.n_samples != CHUNK_SAMPLES
+    ):
+        raise ValueError("Expected the Kimi-Audio Whisper-large-v3 feature extractor configuration")
+    chunks = [waveform[start : start + CHUNK_SAMPLES] for start in range(0, len(waveform), CHUNK_SAMPLES)]
+    token_lengths = tuple((len(chunk) - 1) // SAMPLES_PER_TOKEN + 1 for chunk in chunks)
+    features = feature_extractor(
+        chunks,
+        sampling_rate=SAMPLE_RATE,
+        padding="max_length",
+        max_length=CHUNK_SAMPLES,
+        truncation=False,
+        do_normalize=False,
+        return_tensors="pt",
+    )["input_features"]
+    return KimiAudioWhisperInputs(features, token_lengths)
+
+
+def prepare_kimi_audio_inputs(
+    messages: Sequence[Mapping[str, object]],
+    prompt_builder: KimiAudioPromptBuilder,
+    *,
+    audio_inputs: Mapping[int, np.ndarray] | None = None,
+    sampling_rate: int = SAMPLE_RATE,
+    output_type: Literal["text", "both"] = "text",
+    add_assistant_start_msg: bool = True,
+) -> "OmniTokensPrompt":
+    """Prepare one engine request from messages and framework-resolved audio.
+
+    This is the shared model-side input path for offline and serving callers.
+    Audio is keyed by ORIGINAL message index and must already be mono 16 kHz.
+    The CPU builder reserves the exact number of GLM slots from duration.
+    It sends waveforms and their encoding mode to the multimodal processor,
+    which extracts Whisper features within the framework's processor cache.
+    Encoders run in the worker; AR ``preprocess`` adds the aligned text stream.
+    Resource URLs/paths are never sent to the worker.
+    """
+    from vllm_omni.data_entry_keys import serialize_payload
+
+    audio_inputs = {} if audio_inputs is None else audio_inputs
+    expected = {i for i, message in enumerate(messages) if message.get("message_type") in ("audio", "audio-text")}
+    if set(audio_inputs) != expected:
+        raise ValueError("audio_inputs must contain exactly the audio/audio-text message indices")
+    if sampling_rate != SAMPLE_RATE:
+        raise ValueError("Kimi-Audio expects audio resampled to 16000 Hz by the input layer")
+    placeholders = {}
+    mm_audio = []
+    payload = {
+        "meta": {
+            "output_type": output_type,
+            "special_tokens": asdict(prompt_builder.tokens),
+            "audio_token_offset": prompt_builder.audio_token_offset,
+            "audio_vocab_size": prompt_builder.audio_vocab_size,
+        }
+    }
+    for index in sorted(audio_inputs):
+        waveform = audio_inputs[index]
+        if waveform.ndim != 1 or waveform.size == 0 or not np.issubdtype(waveform.dtype, np.floating):
+            raise ValueError("Expected a nonempty mono floating point waveform")
+        if not np.isfinite(waveform).all():
+            raise ValueError("Audio waveform must contain finite samples")
+        # Own the samples before entering the native multimodal processor/cache.
+        item = {
+            "waveform": torch.from_numpy(np.array(waveform, dtype=np.float32, copy=True)),
+            "use_whisper": messages[index]["message_type"] == "audio",
+        }
+        num_codes = (waveform.size - 1) // SAMPLES_PER_TOKEN + 1
+        features = None
+        if item["use_whisper"]:
+            # Only the shape is needed to apply the existing message rules.
+            # These meta features never enter the request or model execution.
+            features = torch.empty(num_codes, prompt_builder.continuous_feature_size, device="meta")
+        placeholders[index] = KimiAudioEncodedAudio([0] * num_codes, features)
+        mm_audio.append(item)
+
+    layout = prompt_builder.build(
+        messages,
+        audio_inputs=placeholders,
+        output_type=output_type,
+        add_assistant_start_msg=add_assistant_start_msg,
+    )
+    payload.update(
+        text_token_ids=layout.text_token_ids,
+        audio_token_ids=layout.audio_token_ids,
+        audio_spans=[[index, start, end] for index, (start, end) in layout.audio_spans.items()],
+    )
+    # Only the dual-stream layout crosses Omni's request-buffer boundary.
+    # Waveforms and encoding modes enter native MM processing and caching.
+    wire = msgspec.to_builtins(serialize_payload(payload))
+    return {
+        "prompt_token_ids": layout.audio_token_ids,
+        **({"multi_modal_data": {"audio": mm_audio}} if mm_audio else {}),
+        "modalities": ["text", "audio"] if output_type == "both" else ["text"],
+        "model_intermediate_buffer": {"kimi_audio_input": wire},
+    }

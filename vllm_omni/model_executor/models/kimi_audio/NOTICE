@@ -1,0 +1,42 @@
+Kimi-Audio acoustic decoder attribution
+=====================================
+
+The code under detokenizer/ is adapted from Moonshot AI's Kimi-Audio:
+https://github.com/MoonshotAI/Kimi-Audio/tree/349251e1d8f4f98d58fda59246381faecd7392e0/kimia_infer/models/detokenizer
+
+The upstream README's License section and pyproject.toml identify this
+non-Qwen code as MIT-licensed. At the revision above, the adapted Kimi files
+do not contain an explicit copyright notice; no inferred copyright-holder
+line is supplied here. Their original source references are retained.
+
+TimestepEmbedder.timestep_embedding in detokenizer/flow_matching/model.py
+also retains an upstream reference to OpenAI's GLIDE implementation:
+https://github.com/openai/glide-text2im/blob/main/glide_text2im/nn.py
+https://github.com/openai/glide-text2im/blob/main/LICENSE
+Its copyright notice is:
+
+Copyright (c) 2021 OpenAI
+
+The existing vLLM-Omni BigVGAN and common activation modules are imported,
+not copied from Kimi-Audio. Their existing notices and licenses are unchanged;
+this notice does not reclassify those modules or Qwen-derived AR code.
+
+MIT License (for the Kimi portions and the GLIDE-derived function above)
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
