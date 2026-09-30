@@ -95,7 +95,7 @@ def _kstep_armed() -> bool:
         num_spec = getattr(spec, "num_speculative_tokens", 0) or 0
         return method == "ngram" and num_spec > 0
     try:
-        from vllm_omni.config.stage_config import talker_frames_per_step
+        from vllm_omni.config.deploy_runtime_state import talker_frames_per_step
 
         return talker_frames_per_step() > 1
     except Exception:
