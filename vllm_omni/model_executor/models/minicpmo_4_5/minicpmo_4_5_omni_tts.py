@@ -693,7 +693,6 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         # recompute swaps its confirmed-token slice for these real ids.
         self._request_codec_history: dict[str, list[int]] = {}
 
-
         self._init_native_talker(prefix)
         # Model Runner V2 keeps the sampled id, codec history and EOS state on
         # the GPU (see make_omni_output_mrv2 and mrv2_custom_sampler).
@@ -2375,7 +2374,6 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         rows = index_to_device(force_eos, sampled.device, dtype=torch.bool)
         sampled.masked_fill_(rows.view(-1, *([1] * (sampled.ndim - 1))), int(self._codec_eos_id))
         return output
-
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         return self._load_native_weights(weights)
