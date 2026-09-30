@@ -706,7 +706,7 @@ td.mono {
    max-width + overflow-wrap can shrink it — long pytest node IDs have no
    breakable spaces and otherwise force the whole table wide. */
 td.test-node {
-  max-width: 22rem;
+  max-width: 30rem;
   overflow-wrap: anywhere;
 }
 td.reason {
@@ -1705,6 +1705,24 @@ RELEASE_MARKDOWN_DOC_CSS = """
     color-mix(in srgb, var(--dashboard-healthy-bg) 52%, var(--dashboard-panel-bg)) 0%,
     var(--dashboard-panel-bg) 46%
   );
+}
+/* Metric analysis — operator-editable rich-text analysis box. Blue accent
+   (distinct from the green Metrics overview chart section directly above) +
+   a pencil icon signal "write your analysis here". Mirrors the themed-accent
+   + ico-color pattern of --quality-defense / --stability. */
+.release-doc .release-section-card--metric-analysis {
+  --section-accent: #2563eb;
+  --section-ico-bg: rgba(37, 99, 235, 0.13);
+  --section-ico-color: #2563eb;
+  border-top: 4px solid var(--section-accent);
+  background: linear-gradient(
+    180deg,
+    color-mix(in srgb, var(--section-ico-bg) 75%, var(--dashboard-panel-bg)) 0%,
+    var(--dashboard-panel-bg) 46%
+  );
+}
+.release-doc .release-section-card--metric-analysis .release-section-h2-ico svg {
+  color: var(--section-ico-color);
 }
 .release-doc .release-section-card--failure {
   --section-accent: var(--dashboard-warning);

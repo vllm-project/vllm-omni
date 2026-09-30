@@ -1282,7 +1282,6 @@ def _render_local_gpu_failure_section(
                 [
                     _md_cell(node),
                     _md_cell(info["failed_reasons"].get(node, "")),
-                    _md_cell(info["failure_analyses"].get(node, "")),
                     _excerpt_md_cell(
                         info["failure_excerpts"].get(node, ""),
                         node=node,
@@ -1298,7 +1297,6 @@ def _render_local_gpu_failure_section(
                 [
                     _md_cell(node) + " (ERROR)",
                     _md_cell(info["error_reasons"].get(node, "")),
-                    _md_cell(info["error_analyses"].get(node, "")),
                     _excerpt_md_cell(
                         info["error_excerpts"].get(node, ""),
                         node=node,
@@ -1313,7 +1311,7 @@ def _render_local_gpu_failure_section(
         chunks.append("")
         chunks.append(
             render_markdown_table(
-                ["Test node", "Log reason", "Analysis", "Excerpt (truncated)", "Submit Issue", "Status"],
+                ["Test node", "Log reason", "Excerpt (truncated)", "Submit Issue", "Status"],
                 fail_rows,
             )
         )

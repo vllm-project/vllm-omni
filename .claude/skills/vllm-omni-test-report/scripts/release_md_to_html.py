@@ -61,6 +61,9 @@ _RELEASE_SVG_CHECK = '<path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline po
 _RELEASE_SVG_CHART = (
     '<line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/>'
 )
+_RELEASE_SVG_EDIT = (
+    '<path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/>'
+)
 _RELEASE_SVG_LIST = (
     '<line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/>'
     '<line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/>'
@@ -126,7 +129,7 @@ def _release_section_theme(title_plain: str) -> tuple[str, str]:
     if "metrics" in low:
         return "metrics", _RELEASE_SVG_CHART
     if "metric analysis" in low:
-        return "metric-analysis", _RELEASE_SVG_CHART
+        return "metric-analysis", _RELEASE_SVG_EDIT
     if "failure analysis" in low:
         return "failure", _RELEASE_SVG_ALERT
     if "test result" in low:
@@ -940,6 +943,7 @@ def _upgrade_excerpt_cells_in_failure_tables(html_fragment: str) -> str:
     _heading_text_re = re.compile(r"<[^>]+>")
     ROW_RE = re.compile(r"<tr[^>]*>(.*?)</tr>", re.DOTALL | re.IGNORECASE)
     TD_RE = re.compile(r"<td[^>]*>(.*?)</td>", re.DOTALL | re.IGNORECASE)
+    HEAD_RE = re.compile(r"<th[^>]*>(.*?)</th>", re.DOTALL | re.IGNORECASE)
 
     headings = [
         (
@@ -960,21 +964,32 @@ def _upgrade_excerpt_cells_in_failure_tables(html_fragment: str) -> str:
         if not rows:
             return table_html
 
+        # Identify the Excerpt column by header index so the function is
+        # robust to column reordering (e.g. the Analysis column was dropped,
+        # moving Excerpt from index 3 to 2). Mirrors the submit-issue
+        # upgrade's header-based lookup. rows[0] is the <thead> header row.
+        head_cells = list(HEAD_RE.finditer(rows[0].group(1)))
+        excerpt_col = -1
+        for hi, hm in enumerate(head_cells):
+            if "Excerpt" in hm.group(1):
+                excerpt_col = hi
+                break
+
         rebuilt_rows: list[str] = []
         rebuilt_rows.append(table_html[: rows[0].start()])
         for ri, rm in enumerate(rows):
             cells = list(TD_RE.finditer(rm.group(1)))
-            if len(cells) < 4:
+            if excerpt_col < 0 or len(cells) <= excerpt_col:
                 rebuilt_rows.append(rm.group(0))
                 continue
-            excerpt_match = cells[3]
+            excerpt_match = cells[excerpt_col]
             excerpt_text = excerpt_match.group(1).strip()
             if not excerpt_text or excerpt_text == "&mdash;" or excerpt_text == "—":
                 rebuilt_rows.append(rm.group(0))
                 continue
-            # Release/nightly path: cell 3 is ALREADY _excerpt_cell_html output
-            # (a <div class="excerpt-cell-inner"> with <button class="btn-view-
-            # log-excerpt"> + <pre>). Re-processing strips the tags, decodes
+            # Release/nightly path: the Excerpt cell is ALREADY _excerpt_cell_html
+            # output (a <div class="excerpt-cell-inner"> with <button class="btn-
+            # view-log-excerpt"> + <pre>). Re-processing strips the tags, decodes
             # entities, and re-calls _excerpt_cell_html — double-escaping
             # &#10;/&#124; into &amp;#10;/&amp;#124; (rendered as literal
             # "&amp;#10;" text) and nesting a second excerpt cell inside the
