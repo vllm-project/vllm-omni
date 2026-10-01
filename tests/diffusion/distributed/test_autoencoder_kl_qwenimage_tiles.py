@@ -25,8 +25,7 @@ def test_qwen_tiles_reassemble_seven_rgba_images_with_partial_edges():
     assert grid.grid_shape == (3, 5)
     assert tasks[-1].tensor[0].shape == (7, 4, 1, 1, 1)
     decoded = {
-        task.grid_coord: task.tensor[0].repeat_interleave(2, dim=3).repeat_interleave(2, dim=4)
-        for task in tasks
+        task.grid_coord: task.tensor[0].repeat_interleave(2, dim=3).repeat_interleave(2, dim=4) for task in tasks
     }
 
     result = vae.tile_merge(decoded, grid)
