@@ -711,7 +711,6 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration, SupportsM
         vit = self.vit_model.vision_model
         patch, side = self.config.vit_config.patch_size, self.config.vit_max_num_patch_per_side
         out = []
-        assert len(images) > 0
         for img in images:
             ids = self.get_flattened_position_ids(img.shape[-2], img.shape[-1], patch, side).to(img.device)
             x = vit.embeddings.patch_embedding(img[None].to(vit.embeddings.patch_embedding.weight.dtype))
@@ -818,7 +817,7 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration, SupportsM
                 timestep_embeds = self.time_embedder(packed_timesteps.to(padded_latent))
             vae_embeds = self.vae2llm(latent) + timestep_embeds + pos_embed
 
-            vit_emb = vit_embeddings_tuple[i] if i < len(vit_embeddings_tuple) else vit_embeddings_tuple[0]
+            vit_emb = vit_embeddings_tuple[i]
 
             se = start_embed.to(vae_embeds.dtype)
             ee = end_embed.to(vae_embeds.dtype)

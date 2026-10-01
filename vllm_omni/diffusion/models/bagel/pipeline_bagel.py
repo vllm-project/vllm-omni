@@ -830,7 +830,7 @@ class BagelPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProf
                         len(images),
                     )
                 segments = [""] * len(images) + ["".join(segments)]
-            text_indices = [i for i, text in enumerate(segments) if text.strip()]
+            text_indices = [i for i, text in enumerate(segments) if text]
             for i, text in enumerate(segments):
                 if i in text_indices:
                     add_text(gen_context, text, bos=i == text_indices[0], eos=i == text_indices[-1])
