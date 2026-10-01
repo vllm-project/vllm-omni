@@ -171,13 +171,14 @@ def test_layer_forward_returns_decode_duration_only_when_profiled(monkeypatch, p
 
 
 @pytest.mark.parametrize(
-    ("filename", "devices", "ulysses", "vae_parallel"),
+    ("filename", "devices", "ulysses", "vae_parallel", "mode"),
     [
-        ("ming_image_layer_tiled.yaml", "1", None, None),
-        ("ming_image_layer_tile_parallel.yaml", "1,2", 2, 2),
+        ("ming_image_layer_tiled.yaml", "1", None, None, None),
+        ("ming_image_layer_tile_parallel.yaml", "1,2", 2, 2, "tile"),
+        ("ming_image_layer_spatial_shard.yaml", "1,2", 2, 2, "spatial_shard_height"),
     ],
 )
-def test_layer_vae_deploy_topology(filename, devices, ulysses, vae_parallel):
+def test_layer_vae_deploy_topology(filename, devices, ulysses, vae_parallel, mode):
     path = Path(__file__).resolve().parents[4] / "vllm_omni" / "deploy" / filename
     config = yaml.safe_load(path.read_text())
     load_deploy_config(path)
@@ -191,7 +192,8 @@ def test_layer_vae_deploy_topology(filename, devices, ulysses, vae_parallel):
     assert parallel.get("vae_patch_parallel_size") == vae_parallel
     if vae_parallel:
         assert parallel["tensor_parallel_size"] == 1
-        assert parallel["vae_parallel_mode"] == "tile"
+        assert parallel["vae_parallel_mode"] == mode
+        assert len(stage["devices"].split(",")) == parallel["tensor_parallel_size"] * ulysses == vae_parallel
 
 
 def test_layer_pipeline_allows_missing_reference_only_for_dummy_run():
