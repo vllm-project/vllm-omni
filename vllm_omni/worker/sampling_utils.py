@@ -97,13 +97,18 @@ def call_model_sampler(
     The opt-in keeps the existing two-argument sampler contract unchanged for
     every other model while allowing custom samplers to make row-local choices.
     """
-    if not getattr(model, "model_sampler_wants_extra_args", False):
-        return model_sample(logits, sampling_metadata)
-    return model_sample(
-        logits,
-        sampling_metadata,
-        per_req_extra_args=build_model_sampler_extra_args(input_batch, requests),
-    )
+    kwargs: dict[str, Any] = {}
+    if getattr(model, "model_sampler_wants_extra_args", False):
+        kwargs["per_req_extra_args"] = build_model_sampler_extra_args(input_batch, requests)
+    if getattr(model, "model_sampler_wants_penalty_flags", False):
+        # These CPU sets track active requests; never inspect the GPU penalty
+        # tensors here. Unknown runner implementations keep the generic path.
+        presence = getattr(input_batch, "presence_penalties_reqs", None)
+        frequency = getattr(input_batch, "frequency_penalties_reqs", None)
+        kwargs["skip_standard_penalties"] = (
+            isinstance(presence, set) and isinstance(frequency, set) and not presence and not frequency
+        )
+    return model_sample(logits, sampling_metadata, **kwargs)
 
 
 def clamp_prompt_ids_to_penalty_padding(prompt_token_ids: torch.Tensor, logits_vocab: int) -> torch.Tensor:

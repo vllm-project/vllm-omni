@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Golden characterization of ``_build_model_sampler_output_token_ids``.
 
 The base runner (``OmniGPUModelRunner``) and the AR runner
@@ -140,3 +140,31 @@ def test_ar_crops_placeholder_when_request_absent_from_prev_step():
     # No backfill occurred, but the AR crop pass still truncates at the -1.
     out = _build(GPUARModelRunner, **_ABSENT_FROM_PREV_CASE)
     assert out == [[10]]
+
+
+# --------------------------------------------------------------------------- #
+# Host copy of the previous sampled id for decode preprocess                  #
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize(
+    "sampled_token_ids_cpu,prev_req_id_to_index,expected",
+    [
+        ([[5], [42]], {"r0": 1}, 42),
+        ([[5], [-1]], {"r0": 1}, None),
+        ([[5]], {"other": 0}, None),
+        ([[5]], {}, None),
+        (None, {"r0": 0}, None),
+    ],
+)
+def test_host_prev_sampled_token_id(sampled_token_ids_cpu, prev_req_id_to_index, expected):
+    waited = []
+    runner = _runner(
+        OmniGPUModelRunner,
+        req_ids=["r0"],
+        req_output_token_ids=[[]],
+        sampled_token_ids_cpu=sampled_token_ids_cpu,
+        prev_req_id_to_index=prev_req_id_to_index,
+    )
+    runner.input_batch.async_copy_ready_event = SimpleNamespace(synchronize=lambda: waited.append(True))
+
+    assert runner._host_prev_sampled_token_id("r0") == expected
+    assert waited == ([True] if sampled_token_ids_cpu is not None and "r0" in prev_req_id_to_index else [])

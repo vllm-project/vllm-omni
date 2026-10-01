@@ -89,3 +89,26 @@ def test_non_opted_in_sampler_keeps_two_argument_contract(mocker):
 
     assert result == "sampled"
     model_sample.assert_called_once_with(logits, metadata)
+
+
+@pytest.mark.parametrize(
+    ("presence", "frequency", "expected"),
+    [(set(), set(), True), ({"r0"}, set(), False), (set(), {"r1"}, False), (None, set(), False)],
+)
+def test_penalty_fast_path_requires_known_empty_cpu_sets(mocker, presence, frequency, expected):
+    model = SimpleNamespace(model_sampler_wants_penalty_flags=True)
+    sample = mocker.Mock()
+    logits, metadata = torch.zeros(2, 8), SimpleNamespace()
+    batch = SimpleNamespace(presence_penalties_reqs=presence, frequency_penalties_reqs=frequency)
+    call_model_sampler(model, sample, logits, metadata, input_batch=batch, requests={})
+    sample.assert_called_once_with(logits, metadata, skip_standard_penalties=expected)
+
+
+def test_penalty_flags_follow_batch_changes(mocker):
+    model = SimpleNamespace(model_sampler_wants_penalty_flags=True, model_sampler_wants_extra_args=True)
+    sample = mocker.Mock()
+    batch = SimpleNamespace(req_ids=["r"], presence_penalties_reqs=set(), frequency_penalties_reqs=set())
+    for enabled in (False, True, False):
+        batch.frequency_penalties_reqs = {"r"} if enabled else set()
+        call_model_sampler(model, sample, None, None, input_batch=batch, requests={})
+        sample.assert_called_with(None, None, per_req_extra_args=[None], skip_standard_penalties=not enabled)

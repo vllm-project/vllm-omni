@@ -14,6 +14,7 @@ Pipeline:
 
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import replace
+from functools import cached_property
 from types import SimpleNamespace
 from typing import Any
 
@@ -27,6 +28,12 @@ from vllm.logger import init_logger
 from vllm.model_executor.models.interfaces import SupportsPP
 from vllm.model_executor.models.llama import LlamaModel
 from vllm.model_executor.models.utils import maybe_prefix
+from vllm.utils.platform_utils import is_pin_memory_available
+from vllm.v1.sample.ops.topk_topp_sampler import (
+    TopKTopPSampler,
+    apply_top_k_top_p_pytorch,
+    random_sample,
+)
 from vllm.v1.sample.sampler import Sampler
 
 from vllm_omni.engine.duplex.intermediate import get_tts_handoff
@@ -41,7 +48,6 @@ from vllm_omni.worker_v2.omni_sampler import OmniSampler
 
 logger = init_logger(__name__)
 
-_REPETITION_PENALTY_CHUNK_SIZE = 16
 # ``past_window`` of MiniCPMTTS's codec repetition penalty: both generate() and
 # generate_chunk() build it through gen_logits(), which hardcodes
 # CustomRepetitionPenaltyLogitsProcessorRepeat(penalty, num_code, 16).
@@ -63,6 +69,12 @@ _DUPLEX_CODEC_FRAMES_PER_CHUNK = MINICPMO45_DUPLEX_CODEC_TOKENS_PER_CHUNK - 1
 #: its text is spoken, while a genuine end of text shows up as an EOS anywhere
 #: else in the window.
 _DUPLEX_TURN_END_BOUNDARY_MASK_STEPS = 5
+
+# Buffer keys ``preprocess`` writes that must stay on the accelerator: the
+# same-step codes travel through make_omni_output from the previous sampled id
+# (decode preprocess embeds that id via emb_code), so a host round-trip here
+# would sit on the decode path.
+_GPU_RESIDENT_BUFFER_KEYS: frozenset[tuple[str, str]] = frozenset({("codes", "audio")})
 
 
 def _native_duplex_chunk_budget(meta: Mapping[str, Any] | None) -> tuple[int, int]:
@@ -141,9 +153,46 @@ class _HostCodecIds:
         return self._values
 
 
+def _row_mask_on(flags: Sequence[bool], device: torch.device) -> torch.Tensor:
+    """Upload a host row mask; a pageable upload would wait on the stream."""
+    pin = device.type != "cpu" and is_pin_memory_available()
+    return torch.tensor(flags, dtype=torch.bool, device="cpu", pin_memory=pin).to(device, non_blocking=pin)
+
+
+def _encode_codec_histories(
+    histories: Sequence[torch.Tensor | Sequence[int]],
+    *,
+    vocab_size: int,
+    window_size: int,
+    device: torch.device,
+) -> torch.Tensor | None:
+    """Flatten per-row codec windows into ``row * vocab_size + code`` ids on ``device``.
+
+    Host lists are packed into one pinned buffer and uploaded without blocking:
+    a pageable upload waits for every kernel already queued on the stream.
+    """
+    if all(not isinstance(history, torch.Tensor) for history in histories):
+        flat = [
+            row * vocab_size + code for row, history in enumerate(histories) for code in list(history)[-window_size:]
+        ]
+        if not flat:
+            return None
+        pin = device.type != "cpu" and is_pin_memory_available()
+        return torch.tensor(flat, dtype=torch.long, device="cpu", pin_memory=pin).to(device, non_blocking=pin)
+
+    encoded_rows: list[torch.Tensor] = []
+    for row, history in enumerate(histories):
+        recent = torch.as_tensor(history).reshape(-1)[-window_size:].to(dtype=torch.long)
+        if recent.numel() > 0:
+            encoded_rows.append(recent.to(device=device) + row * vocab_size)
+    if not encoded_rows:
+        return None
+    return encoded_rows[0] if len(encoded_rows) == 1 else torch.cat(encoded_rows)
+
+
 def _apply_batched_repetition_penalty(
     logits: torch.Tensor,
-    histories: Sequence[torch.Tensor],
+    histories: Sequence[torch.Tensor | Sequence[int]],
     *,
     penalty: float | torch.Tensor,
     window_size: int,
@@ -151,7 +200,8 @@ def _apply_batched_repetition_penalty(
     """Apply request-local frequency penalties to a batch of codec logits.
 
     ``penalty`` may be a scalar or one value per row, mirroring upstream's
-    per-request ``sampling_params.repetition_penalty``.
+    per-request ``sampling_params.repetition_penalty``. ``histories`` holds
+    one codec history per row, as a host list or a tensor.
     """
     if logits.ndim != 2:
         raise ValueError(f"batched codec logits must be 2D, got shape {tuple(logits.shape)}")
@@ -166,34 +216,44 @@ def _apply_batched_repetition_penalty(
         penalties = penalties.expand(batch_size)
     elif penalties.numel() != batch_size:
         raise ValueError(f"expected 1 or {batch_size} codec repetition penalties, got {penalties.numel()}")
-    penalized = logits.clone()
-    for start in range(0, batch_size, _REPETITION_PENALTY_CHUNK_SIZE):
-        end = min(start + _REPETITION_PENALTY_CHUNK_SIZE, batch_size)
-        chunk_logits = logits[start:end]
-        chunk_histories = histories[start:end]
-        # The runner keeps codec history on the CPU. Pack it before uploading
-        # instead of transferring one small tensor per request on every step.
-        history_device = "cpu" if all(history.device.type == "cpu" for history in chunk_histories) else logits.device
-        encoded_rows: list[torch.Tensor] = []
-        for local_row, history in enumerate(chunk_histories):
-            recent = history.reshape(-1)[-window_size:].to(device=history_device, dtype=torch.long)
-            if recent.numel() > 0:
-                encoded_rows.append(recent + local_row * vocab_size)
-        if not encoded_rows:
-            continue
+    # ``penalty == 1`` is a no-op (``1 ** freq == 1``). Do not read the
+    # values back to host: ``.any()`` is a compute-stream sync on every
+    # sample. The empty-history skip only inspects host lengths/shapes.
+    encoded = _encode_codec_histories(histories, vocab_size=vocab_size, window_size=window_size, device=logits.device)
+    if encoded is None:
+        return logits
 
-        # The vocabulary fixes the output size. CUDA bincount still reads the
-        # maximum id back to the host even when minlength is provided.
-        encoded = encoded_rows[0] if len(encoded_rows) == 1 else torch.cat(encoded_rows)
-        # Pinned, non-blocking: a pageable H2D would wait for queued GPU work.
-        encoded = to_device_nonblocking(encoded, logits.device)
-        frequencies = torch.zeros((end - start) * vocab_size, dtype=torch.long, device=logits.device)
-        frequencies.scatter_add_(0, encoded, torch.ones_like(encoded))
-        frequencies = frequencies.reshape(end - start, vocab_size)
-        alpha = torch.pow(penalties[start:end].unsqueeze(1), frequencies.to(dtype=logits.dtype))
-        penalized[start:end] = torch.where(chunk_logits < 0, chunk_logits * alpha, chunk_logits / alpha)
+    # The vocabulary fixes the output size. CUDA bincount still reads the
+    # maximum id back to the host even when minlength is provided.
+    frequencies = torch.zeros(batch_size * vocab_size, dtype=logits.dtype, device=logits.device)
+    frequencies.scatter_add_(0, encoded, torch.ones_like(encoded, dtype=logits.dtype))
+    alpha = torch.pow(penalties.unsqueeze(1), frequencies.reshape(batch_size, vocab_size))
+    return torch.where(logits < 0, logits * alpha, logits / alpha)
 
-    return penalized
+
+class _CodecTopKTopPSampler(TopKTopPSampler):
+    """Top-k/top-p over the codec vocabulary with vLLM's sort-based masks.
+
+    vLLM's Triton top-p runs a multi-pass search whose host-side launches
+    cost ~0.6 ms per step; a single sort of the 6.5k-entry codec vocabulary
+    applies the same masks in a handful of kernels.
+    """
+
+    def forward_native(
+        self,
+        logits: torch.Tensor,
+        generators: dict[int, torch.Generator],
+        k: torch.Tensor | None,
+        p: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        logits = apply_top_k_top_p_pytorch(logits, k, p)
+        logits_to_return = None
+        if self.logprobs_mode == "processed_logits":
+            logits_to_return = logits
+        elif self.logprobs_mode == "processed_logprobs":
+            logits_to_return = logits.log_softmax(dim=-1, dtype=torch.float32)
+        probs = logits.softmax(dim=-1, dtype=torch.float32)
+        return random_sample(probs, generators, self.use_fp64_gumbel), logits_to_return
 
 
 def _apply_codec_window_penalty_gpu(
@@ -395,9 +455,14 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
 
         self.has_preprocess = True
         self.has_postprocess = False
-        # Same-step codes travel through make_omni_output from the previous
-        # sampled id (decode preprocess embeds that id via emb_code). They are
-        # CPU transport deltas, so no buffer key is GPU-resident.
+        # Codec sampling mutates request-local state inside make_omni_output,
+        # which runs on the execute_model path before the async snapshot.
+        self.use_async_omni_output = True
+        self.omni_pooler_payload_include_hidden = False
+        # Decode preprocess reads the previous codec id on the host (EOS check,
+        # Code2Wav delta); the runner supplies it from the async sampled copy.
+        self.omni_preprocess_uses_prev_sampled_token_id = True
+        self.gpu_resident_buffer_keys: set[tuple[str, str]] = set(_GPU_RESIDENT_BUFFER_KEYS)
         self._init_native_talker(prefix)
         # Model Runner V2 keeps the sampled id, codec history and EOS state on
         # the GPU (see make_omni_output_mrv2 and mrv2_custom_sampler).
@@ -758,7 +823,10 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         # which defers this ``.item()`` EOS check to make_omni_output.
         code = input_ids.to(device=self.emb_code[0].weight.device, dtype=torch.long).reshape(-1)[-1:]
         embeds = self.emb_code[0](code)
-        code_id = int(code.item())
+        # The runner's host copy of that sampled id only waits for its own D2H
+        # event; ``code.item()`` would also drain this step's queued kernels.
+        host_code_id = info_dict.get("_omni_prev_sampled_token_id")
+        code_id = host_code_id if isinstance(host_code_id, int) else int(code.item())
         if code_id == int(self._codec_eos_id):
             if isinstance(state, dict):
                 state["finished"] = True
@@ -974,8 +1042,9 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         terminal_flags = [torch.tensor(False, dtype=torch.bool) for _ in infos]
         force_eos_rows = [False] * len(infos)
         mask_eos_rows = [False] * len(infos)
-        empty_history = torch.empty(0, dtype=torch.long, device="cpu")
-        penalty_histories = [empty_history for _ in infos]
+        penalty_histories: list[Sequence[int]] = [() for _ in infos]
+        # Batched decode queues the host id copy in preprocess_decode_batch.
+        # This is where that copy is read; dropping the map NameErrors every step.
         pending_codec_ids = self._decode_codec_id_map()
         codec_eos_id = int(self._codec_eos_id)
         for index, info in enumerate(infos):
@@ -1049,12 +1118,15 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 state["step"] = int(state.get("step", 0)) + 1
                 # ``audio`` is the id sampled last step, i.e. exactly upstream's
                 # ``new_tokens[:, 0:t]`` history for the logits computed below.
+                # It is already a CPU delta, so ``tolist`` does not sync the
+                # device; the penalty packs every row into one upload.
                 recent = state.get("recent_codes")
                 recent = (recent if isinstance(recent, list) else []) + audio.reshape(-1).tolist()
                 state["recent_codes"] = recent[-_CODEC_PENALTY_WINDOW:]
             recent_codes = state.get("recent_codes")
             if recent_codes:
-                penalty_histories[index] = torch.tensor(recent_codes, dtype=torch.long, device="cpu")
+                # ``recent_codes`` is replaced, never mutated, so sharing it is safe.
+                penalty_histories[index] = recent_codes
             max_tokens = state.get("max_tokens")
             min_tokens = state.get("min_tokens")
             step = int(state.get("step", 0))
@@ -1179,34 +1251,48 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         if need_force or need_mask:
             logits = logits.clone()
             eos_id = int(self._codec_eos_id)
+            # masked_fill, not boolean-index assignment: the latter runs
+            # nonzero() and reads the row count back to the host.
             if need_force:
                 assert force_eos is not None
-                forced = index_to_device(force_eos, logits.device, dtype=torch.bool)
-                eos_only = torch.full_like(logits[:1], float("-inf"))
-                eos_only[:, eos_id] = 0.0
-                logits = torch.where(forced.unsqueeze(1), eos_only, logits)
+                forced = _row_mask_on(force_eos, logits.device)
+                logits.masked_fill_(forced.unsqueeze(1), float("-inf"))
+                logits[:, eos_id].masked_fill_(forced, 0.0)
             if need_mask:
                 assert mask_eos is not None
-                masked = index_to_device(mask_eos, logits.device, dtype=torch.bool)
-                logits[:, eos_id].masked_fill_(masked, float("-inf"))
+                logits[:, eos_id].masked_fill_(_row_mask_on(mask_eos, logits.device), float("-inf"))
         return logits
 
-    def sample(self, logits, sampling_metadata):
+    @cached_property
+    def _codec_sampler(self):
+        sampler = Sampler()
+        topk_topp = getattr(sampler, "topk_topp_sampler", None)
+        if isinstance(topk_topp, TopKTopPSampler):
+            sampler.topk_topp_sampler = _CodecTopKTopPSampler(topk_topp.logprobs_mode, topk_topp.use_fp64_gumbel)
+        return sampler
+
+    def sample(self, logits, sampling_metadata, *, skip_standard_penalties: bool = False):
+        logits, sampling_metadata = self._apply_codec_repetition_penalty(
+            logits, sampling_metadata, skip_standard_penalties=skip_standard_penalties
+        )
         prompt_ids = getattr(sampling_metadata, "prompt_token_ids", None)
-        if isinstance(logits, torch.Tensor) and isinstance(prompt_ids, torch.Tensor):
+        if (
+            not getattr(sampling_metadata, "no_penalties", False)
+            and isinstance(logits, torch.Tensor)
+            and isinstance(prompt_ids, torch.Tensor)
+        ):
             # Copy rather than mutate: the runner may hand us the input batch's
             # own persistent SamplingMetadata.
             sampling_metadata = replace(
                 sampling_metadata,
                 prompt_token_ids=blank_scheduler_prompt_for_penalties(prompt_ids, logits.shape[-1]),
             )
-        logits, sampling_metadata = self._apply_codec_repetition_penalty(logits, sampling_metadata)
         force_eos = self._pending_force_eos_rows
         self._pending_force_eos_rows = None
-        output = Sampler()(logits, sampling_metadata)
+        output = self._codec_sampler(logits, sampling_metadata)
         return self._force_eos_on_sampled_ids(output, force_eos)
 
-    def _apply_codec_repetition_penalty(self, logits, sampling_metadata):
+    def _apply_codec_repetition_penalty(self, logits, sampling_metadata, *, skip_standard_penalties: bool = False):
         """Score MiniCPMTTS.generate's windowed codec penalty, not vLLM's.
 
         Upstream taxes a code by ``penalty ** frequency`` over the last
@@ -1238,6 +1324,11 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             penalty=penalties.to(device=logits.device, dtype=logits.dtype),
             window_size=_CODEC_PENALTY_WINDOW,
         )
+        # Only bypass the whole generic pass after applying the codec penalty,
+        # and when the runner confirms no presence/frequency penalties exist.
+        # Copy metadata: it belongs to the runner and survives this step.
+        if skip_standard_penalties:
+            return logits, replace(sampling_metadata, no_penalties=True)
         # Neutralize the sampler's own pass so the penalty is scored once.
         return logits, replace(sampling_metadata, repetition_penalties=torch.ones_like(penalties))
 
@@ -1255,8 +1346,8 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         sampled = getattr(output, "sampled_token_ids", None)
         if not isinstance(sampled, torch.Tensor) or sampled.shape[0] != len(force_eos):
             return output
-        rows = index_to_device(force_eos, sampled.device, dtype=torch.bool)
-        sampled.masked_fill_(rows.view(-1, *([1] * (sampled.ndim - 1))), int(self._codec_eos_id))
+        rows = _row_mask_on(force_eos, sampled.device).reshape(-1, *([1] * (sampled.ndim - 1)))
+        sampled.masked_fill_(rows, int(self._codec_eos_id))
         return output
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):

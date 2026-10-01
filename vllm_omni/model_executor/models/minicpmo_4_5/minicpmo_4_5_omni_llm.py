@@ -1076,6 +1076,18 @@ class SiglipAttention(nn.Module):
         key_states = key_states.view(batch_size, q_len, self.num_heads, self.head_dim).transpose(1, 2)
         value_states = value_states.view(batch_size, q_len, self.num_heads, self.head_dim).transpose(1, 2)
 
+        if not output_attentions:
+            attn_output = F.scaled_dot_product_attention(
+                query_states,
+                key_states,
+                value_states,
+                attn_mask=attention_mask,
+                dropout_p=self.dropout if self.training else 0.0,
+                scale=self.scale,
+            )
+            attn_output = attn_output.transpose(1, 2).reshape(batch_size, q_len, self.embed_dim)
+            return self.out_proj(attn_output), None
+
         k_v_seq_len = key_states.shape[-2]
         attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) * self.scale
 
@@ -3234,6 +3246,29 @@ class MiniCPMO45OmniLLMProcessingInfo(BaseProcessingInfo):
         num_frame_tokens = self.get_max_video_frame_tokens()
         num_frames = max_tokens // num_frame_tokens
         return num_frames
+
+    def get_mm_max_tokens_per_item(
+        self,
+        seq_len: int,
+        mm_counts: Mapping[str, int],
+    ) -> Mapping[str, int]:
+        """Return closed-form per-item token budgets.
+
+        The default ``None`` path builds dummy 448x4032 images plus up to 64
+        video frames and runs them through MiniCPMOProcessor. That sits on the
+        Stage-0 runner ``__init__`` path after the HF processor is created; a
+        native abort there kills the engine core with no Python traceback
+        (``Failed core proc(s): {}``).
+        """
+        mm_counts = mm_counts or {}
+        tokens: dict[str, int] = {}
+        if mm_counts.get("image", 0) > 0:
+            tokens["image"] = self.get_max_image_tokens()
+        if mm_counts.get("audio", 0) > 0:
+            tokens["audio"] = self.get_max_audio_tokens()
+        if mm_counts.get("video", 0) > 0:
+            tokens["video"] = self.get_max_video_tokens(seq_len, mm_counts)
+        return tokens
 
 
 class MiniCPMO45OmniLLMDummyInputsBuilder(BaseDummyInputsBuilder[MiniCPMO45OmniLLMProcessingInfo]):

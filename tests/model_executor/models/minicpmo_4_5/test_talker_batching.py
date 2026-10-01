@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from contextlib import nullcontext
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -23,10 +24,11 @@ from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import (
     _CODEC_PENALTY_WINDOW,
     _DUPLEX_CODEC_TOKENS_PER_CHUNK,
     _DUPLEX_TURN_END_CODEC_TOKENS,
+    _GPU_RESIDENT_BUFFER_KEYS,
     _OFFLINE_CODEC_MAX_NEW_TOKENS,
-    _REPETITION_PENALTY_CHUNK_SIZE,
     MiniCPMO45OmniTTSForConditionalGeneration,
     _apply_batched_repetition_penalty,
+    _CodecTopKTopPSampler,
     _native_duplex_chunk_budget,
     _restore_weight_norm_weight,
     _turn_end_boundary_eos_masked,
@@ -35,6 +37,42 @@ from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import (
 from vllm_omni.utils.mm_outputs import to_payload_element
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+@pytest.mark.parametrize(
+    "consumer",
+    ["none", "bad_words", "processor", "thinking", "presence", "frequency", "missing_history", "llm"],
+)
+def test_async_history_deferred_only_without_cpu_consumers(consumer):
+    model = SimpleNamespace(model_stage="tts", model=SimpleNamespace(_penalty_histories=[torch.tensor([1])]))
+    metadata = SimpleNamespace(
+        no_penalties=False,
+        repetition_penalties=torch.tensor([1.05]),
+        bad_words_token_ids={},
+        thinking_budget_state_holder=None,
+    )
+    batch = SimpleNamespace(
+        logitsprocs_need_output_token_ids=False,
+        presence_penalties_reqs=set(),
+        frequency_penalties_reqs=set(),
+    )
+    if consumer == "bad_words":
+        metadata.bad_words_token_ids = {0: [[1, 2]]}
+    elif consumer == "processor":
+        batch.logitsprocs_need_output_token_ids = True
+    elif consumer == "thinking":
+        metadata.thinking_budget_state_holder = SimpleNamespace(has_tracked_requests=lambda: True)
+    elif consumer == "presence":
+        batch.presence_penalties_reqs = {"r"}
+    elif consumer == "frequency":
+        batch.frequency_penalties_reqs = {"r"}
+    elif consumer == "missing_history":
+        model.model._penalty_histories = None
+    elif consumer == "llm":
+        model.model_stage = "llm"
+    assert MiniCPMO45OmniForConditionalGeneration.can_defer_async_token_history(
+        model, torch.zeros(1, 4), metadata, batch
+    ) is (consumer == "none")
 
 
 @dataclass
@@ -113,6 +151,68 @@ def _make_talker() -> MiniCPMO45OmniTTSForConditionalGeneration:
     with torch.no_grad():
         talker.head_code[0].weight.copy_(torch.eye(8, 2))
     return talker
+
+
+def test_talker_keeps_the_buffer_keys_its_decode_step_writes_on_device() -> None:
+    """``gpu_resident_buffer_keys`` must name the keys ``preprocess`` writes.
+
+    The runner only skips the per-step D2H copy for declared
+    ``(type_key, qualifier)`` pairs, so a key that does not match the emitted
+    payload silently reintroduces a copy of the codec codes on the decode path.
+    """
+    talker = _make_talker()
+    talker.emb_code = nn.ModuleList([nn.Embedding(8, 2)])
+
+    _, _, update = talker.preprocess(
+        torch.tensor([3], dtype=torch.long),
+        None,
+        audio_state={"finished": False, "step": 1},
+        request_id="req",
+    )
+
+    emitted = {(key, qualifier) for key, value in update.items() if isinstance(value, dict) for qualifier in value}
+    assert ("codes", "audio") in emitted
+    assert _GPU_RESIDENT_BUFFER_KEYS <= emitted
+
+
+def test_stage_wrapper_republishes_the_talker_omni_output_contracts() -> None:
+    """The runner reads the Omni contracts off the wrapper, not off the Talker.
+
+    Stage 1 loads ``MiniCPMO45OmniForConditionalGeneration``; the Talker is one
+    of its submodules, so flags declared only on the Talker would silently be
+    invisible to the runner (re-adding a per-step D2H of the codec codes and
+    the hidden-state copy the async payload is meant to skip).
+    """
+    talker = _make_talker()
+    talker.use_async_omni_output = True
+    talker.omni_pooler_payload_include_hidden = False
+    talker.omni_preprocess_uses_prev_sampled_token_id = True
+    talker.gpu_resident_buffer_keys = set(_GPU_RESIDENT_BUFFER_KEYS)
+
+    wrapper = MiniCPMO45OmniForConditionalGeneration.__new__(MiniCPMO45OmniForConditionalGeneration)
+    nn.Module.__init__(wrapper)
+    wrapper.model_stage = "tts"
+    wrapper.model = talker
+    wrapper._publish_omni_output_contracts()
+
+    assert wrapper.use_async_omni_output is True
+    assert wrapper.omni_pooler_payload_include_hidden is False
+    assert wrapper.omni_preprocess_uses_prev_sampled_token_id is True
+    assert wrapper.gpu_resident_buffer_keys == set(_GPU_RESIDENT_BUFFER_KEYS)
+
+
+def test_stage_wrapper_defaults_to_hidden_payload_without_talker_overrides() -> None:
+    """A stage model that declares nothing keeps the Thinker's defaults."""
+    wrapper = MiniCPMO45OmniForConditionalGeneration.__new__(MiniCPMO45OmniForConditionalGeneration)
+    nn.Module.__init__(wrapper)
+    wrapper.model_stage = "llm"
+    wrapper.model = nn.Linear(2, 2)
+    wrapper._publish_omni_output_contracts()
+
+    assert wrapper.use_async_omni_output is True
+    assert wrapper.omni_pooler_payload_include_hidden is True
+    assert wrapper.omni_preprocess_uses_prev_sampled_token_id is False
+    assert not hasattr(wrapper, "gpu_resident_buffer_keys")
 
 
 def _routed(output, index: int):
@@ -194,8 +294,9 @@ def test_batched_repetition_penalty_matches_request_local_rows() -> None:
     assert torch.equal(actual, expected)
 
 
-def test_batched_repetition_penalty_matches_rows_across_chunks(mocker) -> None:
-    batch_size = 2 * _REPETITION_PENALTY_CHUNK_SIZE + 1
+@pytest.mark.parametrize("as_lists", [False, True])
+def test_batched_repetition_penalty_scores_the_whole_batch_in_one_pass(mocker, as_lists) -> None:
+    batch_size = 33
     vocab_size = 11
     logits = torch.arange(batch_size * vocab_size, dtype=torch.float32).reshape(batch_size, vocab_size) - 100
     histories = [
@@ -218,17 +319,35 @@ def test_batched_repetition_penalty_matches_rows_across_chunks(mocker) -> None:
     zeros = mocker.spy(torch, "zeros")
     actual = _apply_batched_repetition_penalty(
         logits,
-        histories,
+        [history.tolist() for history in histories] if as_lists else histories,
         penalty=1.2,
         window_size=5,
     )
 
     assert torch.equal(actual, expected)
-    assert [call.args[0] for call in zeros.call_args_list] == [
-        _REPETITION_PENALTY_CHUNK_SIZE * vocab_size,
-        _REPETITION_PENALTY_CHUNK_SIZE * vocab_size,
-        vocab_size,
-    ]
+    assert [call.args[0] for call in zeros.call_args_list] == [batch_size * vocab_size]
+
+
+def test_host_list_histories_need_no_tensor_readback() -> None:
+    logits = torch.tensor([[-2.0, -1.0, 1.0, 2.0], [4.0, -3.0, 2.0, 1.0]])
+    histories = [[0, 3, 3], []]
+    expected = torch.cat(
+        [
+            _reference_repetition_penalty(logits[:1], torch.tensor([0, 3, 3]), penalty=1.2, window_size=2),
+            logits[1:],
+        ]
+    )
+
+    with _NoHostRead():
+        actual = _apply_batched_repetition_penalty(logits, histories, penalty=1.2, window_size=2)
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_empty_host_histories_leave_logits_untouched() -> None:
+    logits = torch.tensor([[-2.0, 1.0, 3.0]])
+
+    assert _apply_batched_repetition_penalty(logits, [()], penalty=1.2, window_size=3) is logits
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
@@ -401,6 +520,16 @@ def test_codec_penalty_forgets_codes_older_than_the_upstream_window(mocker) -> N
 
     assert talker._request_audio_states["req-window"]["recent_codes"] == [0] * _CODEC_PENALTY_WINDOW
     torch.testing.assert_close(scored[0, 1], raw[0, 1])
+
+
+def test_identity_repetition_penalty_does_not_need_a_host_sync() -> None:
+    logits = torch.tensor([[-2.0, 1.0, 3.0]])
+    histories = [torch.tensor([1, 1, 2])]
+
+    actual = _apply_batched_repetition_penalty(logits, histories, penalty=1.0, window_size=3)
+
+    torch.testing.assert_close(actual, logits)
+    assert actual is not logits
 
 
 def test_sample_honours_a_request_that_disabled_penalties(mocker) -> None:
@@ -715,7 +844,6 @@ def test_make_omni_output_reads_history_from_runner_cpu_buffer(device, default_d
     )
     assert updates["codes"]["audio"].device.type == "cpu"
     assert updates["codes"]["audio"].dtype == torch.long
-    # The real outer model does not expose its Talker's GPU-resident keys.
     runner._update_intermediate_buffer("req", updates)
     infos = runner._gather_runtime_additional_information()
     source = infos[0]["codes"]["audio"]
@@ -750,7 +878,7 @@ def test_make_omni_output_reads_history_from_runner_cpu_buffer(device, default_d
     assert state["step"] == 17
     assert state["recent_codes"] == expected_codes
     expected_history = torch.tensor(expected_codes, dtype=torch.long, device=device)
-    torch.testing.assert_close(talker._penalty_histories[0], expected_history.cpu())
+    assert talker._penalty_histories[0] == expected_codes
     logits = torch.arange(-4, 4, dtype=torch.float32, device=device).reshape(1, 8)
     actual, _ = talker._apply_codec_repetition_penalty(
         logits.clone(), _CodecSamplingMetadata(repetition_penalties=torch.tensor([1.05], device=device))
@@ -826,6 +954,30 @@ def test_decode_preprocess_embeds_the_sampled_codec_id() -> None:
     assert updates["codes"]["audio"].tolist() == [[3]]
 
 
+@pytest.mark.parametrize("host_code_id", [3, 7])
+def test_decode_preprocess_uses_the_runner_host_code_without_reading_the_device(monkeypatch, host_code_id) -> None:
+    talker = _make_talker()
+    talker.emb_code = nn.ModuleList([nn.Embedding(8, 4)])
+    state = {"finished": False}
+    ids = torch.tensor([host_code_id])
+
+    def disallow_item(self):
+        raise AssertionError("decode preprocess must use the runner's host code id")
+
+    monkeypatch.setattr(torch.Tensor, "item", disallow_item)
+    _, embeds, updates = talker.preprocess(
+        ids,
+        None,
+        request_id="req-host",
+        audio_state=state,
+        _omni_prev_sampled_token_id=host_code_id,
+    )
+
+    torch.testing.assert_close(embeds, talker.emb_code[0](ids))
+    assert updates["codes"]["audio"].tolist() == ([] if host_code_id == 7 else [[host_code_id]])
+    assert state["finished"] is (host_code_id == 7)
+
+
 def test_decode_preprocess_drops_codec_eos() -> None:
     talker = _make_talker()
     talker.emb_code = nn.ModuleList([nn.Embedding(8, 4)])
@@ -872,7 +1024,8 @@ def test_cpu_codec_transport_routes_owned_payloads_with_hidden(monkeypatch, use_
 
     from tests.worker.test_gpu_ar_model_runner import _make_async_output_runner
     from vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni import _extract_codec_delta
-    from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner, _snapshot_tensor_payload_to_cpu_async
+    from vllm_omni.worker.async_omni_output import _snapshot_tensor_payload_to_cpu_async
+    from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
 
     talker = _make_talker()
     req_ids = ["r2", "r1", "r3"]
@@ -965,7 +1118,7 @@ def test_cpu_codec_transport_accepts_direct_device_source(device) -> None:
     assert delta.tolist() == [[0]]
     assert talker._request_audio_states["req"]["recent_codes"] == [0]
     assert talker._request_audio_states["req"]["step"] == 1
-    assert talker._penalty_histories[0].tolist() == [0]
+    assert list(talker._penalty_histories[0]) == [0]
     assert not output.multimodal_outputs["meta"]["finished"][0].item()
 
 
@@ -1226,6 +1379,33 @@ def test_native_duplex_condition_advance_without_rollover_updates_window_state(m
     assert rollover_state["base_recent_codes"] == (1, 2, 3, 4, 5)
 
 
+def test_native_duplex_condition_advance_freezes_history_written_by_make_omni_output(mocker) -> None:
+    talker = _make_talker()
+    talker.emb_text = nn.Embedding(1, 2)
+    talker.emb_code = nn.ModuleList([nn.Embedding(8, 2)])
+    mocker.patch.object(talker, "_build_condition_embeddings", return_value=torch.ones(2, 2))
+    common = {
+        "_omni_is_prefill": True,
+        "_omni_prompt_len": 2,
+        "request_id": "req-live",
+        "native_duplex": True,
+        "tts_token_ids": torch.tensor([1]),
+        "tts_hidden_states": torch.ones(1, 2),
+    }
+    talker.preprocess(torch.zeros(2, dtype=torch.long), None, meta={"streaming_condition_seq": 0}, **common)
+    for code in (4, 5):
+        talker.make_omni_output(
+            torch.ones(1, 2),
+            model_intermediate_buffer=[{"request_id": "req-live", "codes": {"audio": torch.tensor([[code]])}}],
+            request_token_spans=[(0, 1)],
+        )
+
+    talker.preprocess(torch.zeros(2, dtype=torch.long), None, meta={"streaming_condition_seq": 1}, **common)
+
+    assert talker._request_condition_states["req-live"]["base_recent_codes"] == (4, 5)
+    assert talker._request_audio_states["req-live"]["recent_codes"] == [4, 5]
+
+
 def test_native_duplex_sliding_condition_advance_requires_recompute_marker(mocker) -> None:
     talker = _make_talker()
     talker._tts_config.attention_type = "sliding_recompute"
@@ -1372,3 +1552,184 @@ def test_turn_end_drain_masks_only_the_cadence_eos() -> None:
     )
     logits = talker.compute_logits(output.text_hidden_states)
     assert torch.isfinite(logits[0, 7])
+
+
+class _NoHostRead(TorchFunctionMode):
+    def __torch_function__(self, func, types, args=(), kwargs=None):
+        if func.__name__ in {"item", "tolist", "__bool__", "is_nonzero", "numpy", "cpu"}:
+            raise AssertionError(f"Unexpected host read: {func.__name__}")
+        return func(*args, **(kwargs or {}))
+
+
+@pytest.mark.parametrize("skip_standard", [False, True])
+def test_codec_sampler_reuse_and_penalty_fast_path(mocker, skip_standard):
+    talker = _make_talker()
+    captured = _capture_sampler_logits(mocker)
+    from vllm_omni.model_executor.models.minicpmo_4_5 import minicpmo_4_5_omni_tts as module
+
+    metadata = _CodecSamplingMetadata(
+        repetition_penalties=torch.tensor([1.05]), prompt_token_ids=torch.tensor([[0, 1]])
+    )
+    assert metadata.prompt_token_ids is not None
+    original_prompt = metadata.prompt_token_ids.clone()
+    logits = torch.tensor([[2.0, -3.0, 4.0, 0.0, 1.0, 2.0, 3.0, 4.0]])
+    for history in (torch.tensor([1, 1, 2]), torch.tensor([0, 2, 2])):
+        talker._penalty_histories = [history]
+        with _NoHostRead():
+            talker.sample(logits.clone(), metadata, skip_standard_penalties=skip_standard)
+        expected = _reference_repetition_penalty(logits, history, penalty=1.05, window_size=16)
+        torch.testing.assert_close(captured["logits"], expected)
+        assert captured["metadata"].no_penalties is skip_standard
+        assert talker._penalty_histories is None
+    module.Sampler.assert_called_once()
+    assert metadata.no_penalties is False
+    torch.testing.assert_close(metadata.repetition_penalties, torch.tensor([1.05]))
+    torch.testing.assert_close(metadata.prompt_token_ids, original_prompt)
+    if skip_standard:
+        assert captured["metadata"].prompt_token_ids is metadata.prompt_token_ids
+    else:
+        assert captured["metadata"].prompt_token_ids.tolist() == [[8, 8]]
+        assert captured["metadata"].repetition_penalties.tolist() == [1.0]
+
+
+def test_missing_codec_history_retains_generic_penalties(mocker):
+    talker = _make_talker()
+    captured = _capture_sampler_logits(mocker)
+    metadata = _CodecSamplingMetadata(repetition_penalties=torch.tensor([1.05]))
+    talker.sample(torch.zeros(1, 8), metadata, skip_standard_penalties=True)
+    assert captured["metadata"].no_penalties is False
+    torch.testing.assert_close(captured["metadata"].repetition_penalties, torch.tensor([1.05]))
+
+
+@pytest.mark.parametrize("presence,frequency", [(0.0, 0.0), (0.4, 0.0), (0.0, 0.3)])
+def test_penalty_fast_path_matches_generic_logits_and_seeded_tokens(mocker, presence, frequency):
+    from vllm.model_executor.layers.utils import apply_penalties
+
+    from vllm_omni.worker.sampling_utils import call_model_sampler
+
+    @dataclass
+    class Metadata(_CodecSamplingMetadata):
+        presence_penalties: torch.Tensor | None = None
+        frequency_penalties: torch.Tensor | None = None
+
+    talker = _make_talker()
+    talker.model_sampler_wants_penalty_flags = True
+    scored = []
+    history = torch.tensor([1, 1, 2, 4])
+    output_history = torch.tensor([[0, 0, 1, 1, 2, 4]])
+
+    def sample(logits, metadata):
+        if not metadata.no_penalties:
+            logits = apply_penalties(
+                logits,
+                metadata.prompt_token_ids,
+                output_history,
+                metadata.presence_penalties,
+                metadata.frequency_penalties,
+                metadata.repetition_penalties,
+            )
+        scored.append(logits.clone())
+        generator = torch.Generator().manual_seed(42)
+        return _SamplerOutput(torch.multinomial(logits.softmax(-1), 1, generator=generator))
+
+    mocker.patch("vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts.Sampler", return_value=sample)
+    metadata = Metadata(
+        repetition_penalties=torch.tensor([1.05]),
+        prompt_token_ids=torch.tensor([[0, 1, 0]]),
+        presence_penalties=torch.tensor([presence]),
+        frequency_penalties=torch.tensor([frequency]),
+    )
+    logits = torch.tensor([[2.0, -3.0, 4.0, 0.0, 1.0, 2.0, 3.0, 4.0]])
+    talker._penalty_histories = [history]
+    reference = talker.sample(logits.clone(), metadata)
+    from types import SimpleNamespace
+
+    batch = SimpleNamespace(
+        presence_penalties_reqs={"r"} if presence else set(),
+        frequency_penalties_reqs={"r"} if frequency else set(),
+    )
+    talker._penalty_histories = [history]
+    actual = call_model_sampler(talker, talker.sample, logits.clone(), metadata, input_batch=batch, requests={})
+    torch.testing.assert_close(scored[0], scored[1], rtol=0, atol=0)
+    torch.testing.assert_close(reference.sampled_token_ids, actual.sampled_token_ids)
+    assert metadata.no_penalties is False
+
+
+def test_codec_sampler_swaps_in_the_sort_based_top_k_top_p(mocker) -> None:
+    from vllm.v1.sample.sampler import Sampler
+
+    mocker.patch("vllm.v1.sample.ops.topk_topp_sampler.flashinfer_sampler_supported", return_value=False)
+    talker = _make_talker()
+    sampler = talker._codec_sampler
+
+    assert isinstance(sampler, Sampler)
+    assert isinstance(sampler.topk_topp_sampler, _CodecTopKTopPSampler)
+    assert talker._codec_sampler is sampler
+
+
+def test_codec_top_k_top_p_honours_per_request_generators(mocker) -> None:
+    from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p_pytorch
+
+    mocker.patch("vllm.v1.sample.ops.topk_topp_sampler.flashinfer_sampler_supported", return_value=False)
+    torch.manual_seed(0)
+    logits = torch.randn(3, 64)
+    k = torch.tensor([5, 64, 10])
+    p = torch.tensor([0.9, 0.5, 1.0])
+    sampler = _CodecTopKTopPSampler()
+
+    def run():
+        return sampler.forward_native(logits.clone(), {1: torch.Generator().manual_seed(123)}, k, p)[0]
+
+    torch.manual_seed(7)
+    first = run()
+    torch.manual_seed(7)
+    second = run()
+
+    assert torch.equal(first, second)
+    kept = torch.isfinite(apply_top_k_top_p_pytorch(logits.clone(), k, p))
+    assert all(kept[row, token] for row, token in enumerate(first.tolist()))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="compares against vLLM's CUDA Triton top-k/top-p")
+def test_codec_top_k_top_p_keeps_the_same_tokens_as_the_triton_path() -> None:
+    from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p, apply_top_k_top_p_pytorch
+
+    generator = torch.Generator(device="cuda").manual_seed(0)
+    logits = torch.randn(16, 6562, device="cuda", generator=generator)
+    k = torch.full((16,), 25, device="cuda", dtype=torch.int32)
+    p = torch.full((16,), 0.85, device="cuda", dtype=torch.float32)
+
+    triton_kept = torch.isfinite(apply_top_k_top_p(logits.clone(), k, p))
+    sort_kept = torch.isfinite(apply_top_k_top_p_pytorch(logits.clone(), k, p))
+
+    assert torch.equal(triton_kept, sort_kept)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="checks CUDA host synchronization")
+def test_talker_decode_sampling_path_never_synchronizes_the_stream() -> None:
+    from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p_pytorch
+
+    talker = _make_talker().cuda()
+    hidden = torch.randn(3, 2, device="cuda")
+    penalties = torch.full((3,), 1.05, device="cuda")
+    k = torch.full((3,), 4, device="cuda", dtype=torch.int32)
+    p = torch.full((3,), 0.85, device="cuda")
+    sampled = torch.zeros(3, 1, dtype=torch.long, device="cuda")
+    torch.accelerator.synchronize()
+
+    previous = torch.cuda.get_sync_debug_mode()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        with torch.inference_mode():
+            talker._force_eos_rows = [True, False, False]
+            talker._mask_eos_rows = [False, True, False]
+            logits = talker.compute_logits(hidden)
+            logits = _apply_batched_repetition_penalty(logits, [[1, 1, 2], [], [3]], penalty=penalties, window_size=16)
+            apply_top_k_top_p_pytorch(logits.clone(), k, p)
+            talker._force_eos_on_sampled_ids(_SamplerOutput(sampled), [True, False, True])
+    finally:
+        torch.cuda.set_sync_debug_mode(previous)
+
+    assert logits[0].isinf().sum().item() == 7 and logits[0, 7].item() == 0.0
+    assert logits[1, 7].item() == float("-inf")
+    assert sampled.reshape(-1).tolist() == [7, 0, 7]

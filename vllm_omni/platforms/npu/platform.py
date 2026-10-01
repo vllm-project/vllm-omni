@@ -77,6 +77,14 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
 
     @classmethod
     def set_device(cls, device: torch.device) -> None:
+        # Importing VoxCPM2 from NPUOmniPlatform.__init__ cycles while the
+        # package is still loading. The patch only needs to be in place
+        # before a worker builds the model.
+        from vllm_omni.platforms.npu.models.voxcpm2_talker import (
+            apply_voxcpm2_talker_patch,
+        )
+
+        apply_voxcpm2_talker_patch()
         super().set_device(device)
 
         # The model's dependencies resolve current_omni_platform, so importing
