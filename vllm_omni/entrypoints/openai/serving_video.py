@@ -295,17 +295,13 @@ class OmniOpenAIServingVideo:
         for stage in stages or []:
             if get_stage_type(stage) != "diffusion":
                 continue
-            get = stage.get if isinstance(stage, Mapping) else lambda key: getattr(stage, key, None)
-            projection = get("diffusion_config")
+            projection = _config_value(stage, "diffusion_config")
             if projection is None:
-                projection = get("engine_args") or {}
-            project_get = (
-                projection.get if isinstance(projection, Mapping) else lambda key: getattr(projection, key, None)
-            )
-            architecture = project_get("model_class_name") or get("model_arch")
+                projection = _config_value(stage, "engine_args") or {}
+            architecture = _config_value(projection, "model_class_name") or _config_value(stage, "model_arch")
             if architecture not in {"MiniMaxH3Pipeline", "MiniMaxH3ModularPipeline"}:
                 continue
-            if project_get("controlnet_model_path"):
+            if _config_value(projection, "controlnet_model_path"):
                 return True
         return False
 

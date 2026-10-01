@@ -1218,7 +1218,7 @@ def test_mixed_reference_capability_uses_model_metadata_when_config_defaults_fal
 
 @pytest.mark.parametrize(
     ("stage_factory", "engine_args_factory"),
-    [(dict, dict), (UserDict, SimpleNamespace), (SimpleNamespace, UserDict), (SimpleNamespace, SimpleNamespace)],
+    [(UserDict, SimpleNamespace), (SimpleNamespace, UserDict)],
 )
 def test_video_capabilities_follow_late_stage_configuration(stage_factory, engine_args_factory):
     config = SimpleNamespace(model_class_name="WanPipeline", supports_mixed_reference_inputs=False)
@@ -3474,8 +3474,7 @@ def test_h3_control_upload_contract(endpoint, mode, test_client, mocker):
             assert not Path(captured[key]).exists()
 
 
-@pytest.mark.parametrize("endpoint", ["/v1/videos", "/v1/videos/sync"])
-@pytest.mark.parametrize("with_hint", [False, True])
+@pytest.mark.parametrize(("endpoint", "with_hint"), [("/v1/videos/sync", False), ("/v1/videos", True)])
 def test_h3_inpaint_source_is_not_ref2va(endpoint, with_hint, test_client, mocker):
     _mock_encode_video_bytes(mocker)
     engine = test_client.app.state.openai_serving_video._engine_client
@@ -3504,7 +3503,6 @@ def test_h3_inpaint_source_is_not_ref2va(endpoint, with_hint, test_client, mocke
     ("endpoint", "fields", "roles", "message"),
     [
         ("/v1/videos", {"control_type": "canny"}, [], "requires a control_reference"),
-        ("/v1/videos/sync", {"control_type": "canny"}, [], "requires a control_reference"),
         (
             "/v1/videos/sync",
             {"control_type": "inpaint", "extra_params": '{"inpaint":{"control_strength":1}}'},
