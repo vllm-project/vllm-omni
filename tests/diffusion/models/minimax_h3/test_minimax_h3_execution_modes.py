@@ -278,3 +278,41 @@ def test_mixed_reference_conditioning_matches_stage_zero_handoff(pipeline, monke
         call.args[0].shape[-1] == round(107 / 24 * 32000)
         for call in pipeline.audio_vae.encode_waveform.call_args_list[1::2]
     )
+
+
+@pytest.mark.parametrize("scale", [0.0, 0.7])
+def test_single_stage_control_reaches_denoise_after_local_encoding(pipeline, mocker, scale):
+    from vllm_omni.diffusion.models.minimax_h3.time_request import MINIMAX_H3_SHAPE_PLANNER
+
+    pipeline.od_config.controlnet_model_path = "control.safetensors"
+    request = _request("t2va")
+    request.sampling_params.extra_args["canny"] = {
+        "control_path": "hint.mp4",
+        "control_context_scale": scale,
+    }
+    load_pixels = mocker.patch(
+        "vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3.load_control_pixels",
+        side_effect=lambda _path, *, height, width, num_frames, mask: torch.zeros(1, 3, num_frames, height, width),
+    )
+    pipeline.video_vae.encode_control_latents.side_effect = lambda pixels: torch.ones(
+        1,
+        24,
+        MINIMAX_H3_SHAPE_PLANNER.video_latent_t(pixels.shape[2]),
+        pixels.shape[3] // 16,
+        pixels.shape[4] // 16,
+    )
+
+    pipeline.forward(request)
+
+    kwargs = pipeline.diffuse.call_args.kwargs
+    assert kwargs["control_context_scale"] == scale
+    if scale == 0:
+        assert kwargs["control_rows"] is None
+        load_pixels.assert_not_called()
+        pipeline.video_vae.encode_control_latents.assert_not_called()
+    else:
+        rows = kwargs["control_rows"]
+        assert rows.shape == (kwargs["latent_t"] * (kwargs["latent_h"] // 2) * (kwargs["latent_w"] // 2), 196)
+        torch.testing.assert_close(rows[:, :96], torch.ones_like(rows[:, :96]))
+        torch.testing.assert_close(rows[:, 96:], torch.zeros_like(rows[:, 96:]))
+        load_pixels.assert_called_once_with("hint.mp4", height=32, width=32, num_frames=107, mask=False)

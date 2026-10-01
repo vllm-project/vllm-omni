@@ -933,6 +933,43 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         ).float()
         return rows, shape
 
+    @torch.inference_mode()
+    def encode_control_latents(self, pixels: torch.Tensor) -> torch.Tensor:
+        """Deterministic Fun conditioning: normalized posterior mode, not a sample.
+
+        The native temporal encoder returns the same moments as VideoX-Fun's
+        VAE._encode: per-clip spatial tiling, final-frame padding, token_drop.
+        Its first 24 channels are the diagonal Gaussian mean.
+        Match VideoX-Fun control/inpaint encoding: normalize on-device in FP32,
+        then encode under FP16 autocast rather than the keyframe sampling path.
+        """
+        parameter = next(self.parameters())
+        pixels = pixels.to(device=parameter.device, dtype=torch.float32)
+        mean = pixels.new_tensor((0.485, 0.456, 0.406)).view(1, 3, 1, 1, 1)
+        std = pixels.new_tensor((0.229, 0.224, 0.225)).view(1, 3, 1, 1, 1)
+        previous_parallel = self.model.parallel_tiling
+        if int(getattr(self, "parallel_size", 1)) <= 1:
+            self.model.parallel_tiling = False
+        try:
+            with (
+                self._encoder_tiling_context(int(pixels.shape[-2]), int(pixels.shape[-1])),
+                current_omni_platform.create_autocast_context(
+                    device_type=parameter.device.type,
+                    dtype=torch.float16,
+                    enabled=parameter.device.type != "cpu",
+                ),
+            ):
+                moments = self.model.encode_temporal((pixels - mean) / std)
+        finally:
+            self.model.parallel_tiling = previous_parallel
+        channels = int(self.config_dict["latent_channels"])
+        if moments.shape[1] != 2 * channels:
+            raise ValueError("H3 control encoder must return mean and log-variance channels")
+        latent = moments[:, :channels].float()
+        mean = latent.new_tensor(self.config_dict["latents_mean"]).view(1, channels, 1, 1, 1)
+        std = latent.new_tensor(self.config_dict["latents_std"]).view(1, channels, 1, 1, 1)
+        return (latent - mean) / std
+
     def _decode_tiling_context(self, latent: torch.Tensor) -> AbstractContextManager:
         """Pick the tiling mode a decode of ``latent`` can safely use.
 

@@ -6,7 +6,7 @@ import re
 from typing import Any
 
 from .logger import get_logger
-from .types import Modality, ModelMode, Spec
+from .types import Modality, ModelMode, ParamsBuilder, Spec
 
 logger = get_logger(__name__)
 
@@ -157,6 +157,14 @@ def lookup_model_spec(model: str) -> tuple[Spec | None, str | None]:
         if pattern.search(lookup_key):
             return spec, pattern.pattern
     return None, None
+
+
+def lookup_params_builder(model: str, model_params_type: str | None = None) -> ParamsBuilder | None:
+    """Resolve request serialization independently from the served model name."""
+    if model_params_type == "minimax_h3":
+        return _minimaxh3_params_builder
+    spec, _ = lookup_model_spec(model)
+    return spec.get("params_builder") if spec else None
 
 
 # ============== DEMONSTRATION ==============
