@@ -17,6 +17,7 @@ from vllm_omni.model_executor.models.breeze_tts_2.text_encoder_graph import (
 )
 
 pytestmark = [pytest.mark.core_model]
+CAPTURE_RNG_SUPPORTED = current_platform.is_cuda() and hasattr(torch.cuda.CUDAGraph, "register_generator_state")
 
 
 @pytest.fixture
@@ -223,11 +224,18 @@ def test_depth_graph_survives_interleaved_batches_and_workspace_allocations(full
         torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @torch.inference_mode()
 def test_depth_graph_buckets_bound_shapes_and_preserve_requests(full_precision_matmul, monkeypatch) -> None:
     def reject_eager_noise(*args, **kwargs):
         raise AssertionError("Sampled depth replay must not issue eager RNG draws")
+
+    exponential = torch.Tensor.exponential_
+    observed_generators = []
+
+    def record_eager_noise(tensor, *args, **kwargs):
+        observed_generators.append(kwargs.get("generator"))
+        return exponential(tensor, *args, **kwargs)
 
     torch.manual_seed(17)
     # Match the checkpoint's multinomial draw size, including reserved IDs.
@@ -313,11 +321,14 @@ def test_depth_graph_buckets_bound_shapes_and_preserve_requests(full_precision_m
             request_bucket = 1 << (batch - 1).bit_length()
             branches = 2 if guidance_scale != 1 else 1
             graph_key = (request_bucket * branches, branches, temperature == 0)
+            observed_generators.clear()
             with monkeypatch.context() as rng_guard:
-                if temperature > 0 and graph_key in depth._graphs:
+                if CAPTURE_RNG_SUPPORTED and temperature > 0 and graph_key in depth._graphs:
                     # A warmed replay must generate noise within the CUDA
                     # graph, without dispatching new RNG kernels from Python.
                     rng_guard.setattr(torch.Tensor, "exponential_", reject_eager_noise)
+                elif not CAPTURE_RNG_SUPPORTED:
+                    rng_guard.setattr(torch.Tensor, "exponential_", record_eager_noise)
                 actual = depth.generate_frames(
                     batch_hidden,
                     torch.cat(first_codes),
@@ -327,6 +338,13 @@ def test_depth_graph_buckets_bound_shapes_and_preserve_requests(full_precision_m
                     generators=[generators[row] for row in rows],
                     guidance_scale=guidance_scale,
                 )
+            if not CAPTURE_RNG_SUPPORTED:
+                # ROCm fills noise eagerly for live requests only, in the same
+                # per-codebook order as independent scalar sampling.
+                expected_draws = (
+                    [generators[row] for row in rows for _ in range(depth.num_codebooks - 1)] if temperature > 0 else []
+                )
+                assert observed_generators == expected_draws
             expected_frames = torch.cat(expected)
             torch.testing.assert_close(actual, expected_frames, atol=0, rtol=0)
             retained.append((actual, expected_frames.clone()))
@@ -349,7 +367,7 @@ def test_depth_graph_buckets_bound_shapes_and_preserve_requests(full_precision_m
     expected_keys.update((batch, 2, greedy) for batch in (2, 8, 16, 32) for greedy in (False, True))
     assert set(depth._graphs) == expected_keys
     for (batch_bucket, branches, greedy), entry in depth._graphs.items():
-        if greedy:
+        if greedy or not CAPTURE_RNG_SUPPORTED:
             assert entry.noise_generators is None
         else:
             assert entry.noise_generators is not None
