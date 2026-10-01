@@ -148,7 +148,7 @@ You can configure per-stage sampling parameters for multi-stage models.
 >
 > Do not combine `frame` with `first_frame` or `last_frame`, and do not combine any frame input with
 > `references`. Task routing is automatic from which inputs you connect.
-
+>
 > For MiniMax-H3 Fun ControlNet Union, connect a **MiniMax-H3 Control** node. It cannot be combined with `frame`, `first_frame`/`last_frame`, `references`, or `latent_edit` either.
 
 #### MiniMax-H3 Fun ControlNet Union
