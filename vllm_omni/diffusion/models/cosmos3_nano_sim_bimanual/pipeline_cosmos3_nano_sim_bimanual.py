@@ -30,7 +30,11 @@ from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import (
     get_cosmos3_post_process_func,
     get_cosmos3_pre_process_func,
 )
-from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.action_inputs import prepare_action_values
+from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.action_inputs import (
+    domains_for_frames,
+    prepare_action_values,
+    prepare_domain_ids,
+)
 from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.config import (
     Cosmos3NanoSimBimanualManifest,
     deploy_option,
@@ -42,9 +46,6 @@ from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.geometry import (
     Cosmos3NanoSimBimanualGeometry,
     Cosmos3NanoSimBimanualResolutionPolicy,
     resolve_cosmos3_nano_sim_bimanual_geometry,
-)
-from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.inference_config import (
-    Cosmos3NanoSimBimanualInferenceConfig,
 )
 from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.normalizer import ActionAffineNormalizer
 from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.state_cosmos3_nano_sim_bimanual import (
@@ -241,9 +242,7 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
                 "different training timestep counts: "
                 f"scheduler={scheduler_train_timesteps}, transformer={self.manifest.num_train_timesteps}."
             )
-        self.inference_config = Cosmos3NanoSimBimanualInferenceConfig.from_od_config(od_config, self.manifest)
-        self._distilled_num_steps = self.inference_config.num_steps
-        logger.info("Cosmos3-Nano-Sim-Bimanual effective inference settings: %s", self.inference_config)
+        self._distilled_num_steps = len(self.manifest.t_list)
         if od_config.parallel_config.sequence_parallel_size > 1:
             raise ValueError(
                 "Cosmos3-Nano-Sim-Bimanual supports tensor parallelism but not sequence parallelism; "
@@ -308,15 +307,17 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
 
     # -- AR-Diffusion pipeline capability ---------------------------------
 
-    def _kv_spec_for_geometry(self, geometry: Cosmos3NanoSimBimanualGeometry) -> ARDiffusionKVCacheSpec:
+    def _kv_spec_for_geometry(
+        self, geometry: Cosmos3NanoSimBimanualGeometry, full_history_frames: int = 1
+    ) -> ARDiffusionKVCacheSpec:
         return ARDiffusionKVCacheSpec(
             num_layers=self.transformer.num_hidden_layers,
             num_kv_heads=self.transformer.num_kv_heads_local,
             head_size=self.transformer.head_dim,
             tokens_per_frame=geometry.tokens_per_frame(self.manifest.conditioning_tokens_per_frame),
             frames_per_block=1,
-            window_frames=self.inference_config.window_frames,
-            sink_frames=self.inference_config.sink_frames,
+            window_frames=self.manifest.window_frames or full_history_frames,
+            sink_frames=self.manifest.sink_frames,
             kv_branches=(ARDiffusionKVBranchSpec(self._MAIN_BRANCH, 0),),
             session_capacity=self._SESSION_CAPACITY,
             cross_attention=(ARDiffusionCrossAttentionKVSpec("text", self.manifest.text_cache_max_len),),
@@ -330,10 +331,14 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
         geometry = self.resolution_policy.resolve(*self.resolution_policy.default_resolution)
         return self._kv_spec_for_geometry(geometry)
 
-    def _request_kv_spec(self, geometry: Cosmos3NanoSimBimanualGeometry) -> ARDiffusionRequestKVSpec:
+    def _request_kv_spec(
+        self, geometry: Cosmos3NanoSimBimanualGeometry, full_history_frames: int = 1
+    ) -> ARDiffusionRequestKVSpec:
         return ARDiffusionRequestKVSpec(
-            kv_spec=self._kv_spec_for_geometry(geometry),
-            geometry_key=geometry.session_key,
+            kv_spec=self._kv_spec_for_geometry(geometry, full_history_frames),
+            geometry_key=(geometry.session_key, full_history_frames)
+            if self.manifest.window_frames is None
+            else geometry.session_key,
         )
 
     def ar_diffusion_default_request_spec(self) -> ARDiffusionRequestKVSpec:
@@ -342,7 +347,16 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
 
     def ar_diffusion_request_spec(self, request: Any) -> ARDiffusionRequestKVSpec:
         geometry = resolve_cosmos3_nano_sim_bimanual_geometry(request.sampling_params, None, self.resolution_policy)
-        return self._request_kv_spec(geometry)
+        frames = 1
+        if self.manifest.window_frames is None:
+            # The physical allocation covers the complete admitted rollout.
+            # Streaming requests must declare that total length on every tick.
+            pixels = _admission_int(request.sampling_params.num_frames, "num_frames")
+            factor = self.manifest.temporal_compression_factor
+            if pixels <= 0 or (pixels - 1) % factor:
+                raise ValueError(f"Full history requires num_frames = 1 + {factor} * N")
+            frames = (pixels - 1) // factor + 1
+        return self._request_kv_spec(geometry, frames)
 
     def ar_diffusion_worst_case_request_specs(self) -> Iterable[ARDiffusionRequestKVSpec]:
         """Yield the largest admitted request after enumerating the policy space."""
@@ -376,6 +390,7 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
         mismatches = {
             name: (getattr(expected, name), getattr(spec, name))
             for name in fields
+            if not (name == "window_frames" and self.manifest.window_frames is None)
             if getattr(expected, name) != getattr(spec, name)
         }
         if mismatches:
@@ -420,8 +435,8 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
             "frames_per_block": 1,
             "max_scratch_frames_per_branch": int(self.manifest.chunk_size),
             "max_scratch_tokens_per_branch": int(self.manifest.text_cache_max_len),
-            "window_frames": int(self.inference_config.window_frames),
-            "sink_frames": int(self.inference_config.sink_frames),
+            "window_frames": self.manifest.window_frames or actual["window_frames"],
+            "sink_frames": int(self.manifest.sink_frames),
             "reset_at_boundary": False,
             "text_cache_max_len": int(self.manifest.text_cache_max_len),
             "max_model_len": int(expected_spec.max_model_len),
@@ -538,7 +553,9 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
         """Read one request's controls from whichever transport supplied them."""
 
         action_space = self._get_sp_param(sp, "action_space", "raw")
-        if action_space not in ("raw", "model") or (typed_tick is not None and action_space != "raw"):
+        if action_space not in ("raw", "model", "normalized_unified_v1") or (
+            typed_tick is not None and action_space != "raw"
+        ):
             raise ARDiffusionRequestRejectedError(
                 "action_space must be 'raw' or 'model'; typed ticks require raw actions."
             )
@@ -644,7 +661,7 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
             checkpoint_id=self.checkpoint_id,
             manifest_id=self.manifest.digest,
             sampler_id=self.manifest.sampler_id,
-            inference_id=self.inference_config.digest,
+            inference_id=self.manifest.digest,
             action_space=action_space,
         )
 
@@ -661,8 +678,8 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
             history,
             current_kv,
             tokens_per_frame=geometry.tokens_per_frame(self.manifest.conditioning_tokens_per_frame),
-            sink_frames=self.inference_config.sink_frames,
-            window_frames=self.inference_config.window_frames,
+            sink_frames=self.manifest.sink_frames,
+            window_frames=self.manifest.window_frames,
         )
 
     def _transformer_forward(
@@ -714,7 +731,7 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
             condition_vision=condition_vision,
             null_action_frame_indexes=null_action_frame_indexes,
             frame_causal=frame_causal,
-            history_window=(self.inference_config.sink_frames, self.inference_config.window_frames),
+            history_window=(self.manifest.sink_frames, self.manifest.window_frames),
         )
         if paged_state is not None:
             paged_state.commit_paged_context(self._MAIN_BRANCH)
@@ -750,12 +767,17 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
         if action_value is None:
             return None
         expected_raw_action_dim = self.manifest.raw_action_dim_for(embodiment)
+        unified = self.manifest.require_action_schema().schema_version == 5
+        if unified != (action_space == "normalized_unified_v1"):
+            raise ValueError(
+                "Schema 5 requires normalized_unified_v1 actions; native schemas require raw/model actions"
+            )
         action = prepare_action_values(
             action_value,
             width=expected_raw_action_dim,
             model_width=self.manifest.max_action_dim,
-            action_space=action_space,
-            normalizer=self.action_normalizers[embodiment],
+            action_space="model" if unified else action_space,
+            normalizer=self.action_normalizers.get(embodiment),
         )
         return action.to(device=self.device, dtype=self.dtype)
 
@@ -902,7 +924,7 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
         # it explicitly for both the initial conditioning frame and generated
         # frames; neither should depend on a preceding forward's precision.
         try:
-            num_steps = len(self.inference_config.sigmas_for_frame(frame_idx))
+            num_steps = len(self.manifest.t_list)
             self._set_mixed_precision_step(num_steps - 1, num_steps)
             self._transformer_forward(
                 state,
@@ -938,7 +960,7 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
     ) -> None:
         """Refresh a clean prefix in one frame-causal transformer forward."""
         try:
-            num_steps = len(self.inference_config.sigmas_for_frame(frame_start))
+            num_steps = len(self.manifest.t_list)
             self._set_mixed_precision_step(num_steps - 1, num_steps)
             self._transformer_forward(
                 state,
@@ -1031,12 +1053,11 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
         initial_noise: torch.Tensor,
         *,
         generator: torch.Generator,
-        chunk_start: int,
     ) -> torch.Tensor:
-        """Run the checkpoint or explicitly overridden schedule for this chunk."""
+        """Run the checkpoint's fixed schedule for this chunk."""
         try:
             self.scheduler.set_timesteps(
-                sigmas=list(self.inference_config.sigmas_for_frame(chunk_start)),
+                sigmas=list(self.manifest.t_list),
                 device=initial_noise.device,
             )
             latents = initial_noise.float()
@@ -1164,6 +1185,15 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
             raise ARDiffusionRequestRejectedError(f"Cosmos3-Nano-Sim-Bimanual FPS must be positive, got {fps}.")
         domain_name = controls.domain_name
         domain_value = controls.domain_id
+        if isinstance(domain_value, (list, tuple)) and len(domain_value) == 1:
+            domain_value = domain_value[0]
+        elif isinstance(domain_value, torch.Tensor) and domain_value.numel() == 1:
+            domain_value = domain_value.item()
+        per_row_domains = isinstance(domain_value, (list, tuple, torch.Tensor))
+        if per_row_domains:
+            if self.manifest.require_action_schema().schema_version != 5:
+                raise ARDiffusionRequestRejectedError("Per-row domains require unified actions")
+            domain_value = self.manifest.resolve_domain_name(domain_name) if domain_name else self.default_domain_id
         if domain_value is None and domain_name is None:
             domain_value = self.default_domain_id
         if domain_value is not None:
@@ -1244,6 +1274,23 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
             )
         except (OSError, TypeError, ValueError) as exc:
             raise ARDiffusionRequestRejectedError(str(exc)) from exc
+        prepared_domains = None
+        if self.manifest.require_action_schema().schema_version == 5:
+            if raw_action is None:
+                raise ARDiffusionRequestRejectedError("Unified forward dynamics requires prepared actions")
+            try:
+                prepared_domains = prepare_domain_ids(
+                    controls.domain_id if per_row_domains else domain_id,
+                    rows=raw_action.shape[0],
+                    allowed=set(self.manifest.require_action_schema().embodiment_to_domain.values()),
+                )
+                camera_rows = prepared_domains.eq(2)
+                if camera_rows.numel() == 1:
+                    camera_rows = camera_rows.expand(raw_action.shape[0])
+                if torch.count_nonzero(raw_action[camera_rows.to(raw_action.device), 9:59]):
+                    raise ValueError("Camera rows must have zero non-camera action slots")
+            except ValueError as exc:
+                raise ARDiffusionRequestRejectedError(str(exc)) from exc
         if tick:
             tick_frames = _admission_int(
                 _first_not_none(controls.num_latent_frames, self.manifest.chunk_size),
@@ -1281,10 +1328,13 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
                     "Cosmos3-Nano-Sim-Bimanual full rollout target precedes existing "
                     "session state; session reset required."
                 )
-        try:
-            self.inference_config.validate_target(target_frame)
-        except ValueError as exc:
-            raise ARDiffusionRequestRejectedError(str(exc)) from exc
+        if self.manifest.window_frames is None and self._ar_diffusion_kv_state is not None:
+            capacity = self._ar_diffusion_kv_state.kv_cache.spec.window_chunks
+            if target_frame > capacity:
+                raise ARDiffusionRequestRejectedError(
+                    f"Full-history rollout needs {target_frame} latent frames; allocated capacity is {capacity}. "
+                    "Set num_frames to the complete session length before starting the rollout."
+                )
         try:
             initial_latent = self._initial_condition_latent(prompt_data, sp, geometry)
         except (TypeError, ValueError) as exc:
@@ -1311,7 +1361,20 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
             state.initialize(fingerprint)
         if tick and state.tick_output_type is None:
             state.tick_output_type = tick_output_type
-        domain_ids = torch.tensor([domain_id], device=self.device, dtype=torch.long)
+        routing = prepared_domains if prepared_domains is not None else torch.tensor([domain_id])
+
+        def frame_domains(begin: int, end: int) -> torch.Tensor:
+            return domains_for_frames(
+                routing,
+                layout=action_layout,
+                request_start_frame=start_frame,
+                frame_start=begin,
+                frame_end=end,
+                action_count=self.manifest.action_tokens_per_frame,
+                device=self.device,
+            )
+
+        domain_ids = frame_domains(0, 1)
         text_kv = self._ensure_text_kv(state, text_ids, text_mask)
 
         terminal_request = close_session or not tick
@@ -1386,6 +1449,7 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
                 frame_start=chunk_start,
                 frame_end=chunk_end,
             )
+            domain_ids = frame_domains(chunk_start, chunk_end)
             noise_generator = torch.Generator(device=self.device).manual_seed(seed + chunk_start)
             initial_noise = torch.randn(
                 1,
@@ -1427,7 +1491,6 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
                     velocity_fn,
                     initial_noise,
                     generator=noise_generator,
-                    chunk_start=chunk_start,
                 ).to(self.dtype)
 
             if overlap_decode:
@@ -1459,7 +1522,7 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
                         real_text_kv_len=real_text_kv_len,
                         fps=fps,
                         action=action_chunk[:, : count * action_count],
-                        domain_ids=domain_ids,
+                        domain_ids=frame_domains(chunk_start, chunk_start + count),
                         null_action_frame_indexes=tuple(i for i in null_action_indexes if i < count),
                     )
                 else:
@@ -1475,7 +1538,7 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
                             real_text_kv_len=real_text_kv_len,
                             fps=fps,
                             action=action_frame,
-                            domain_ids=domain_ids,
+                            domain_ids=frame_domains(frame_idx, frame_idx + 1),
                             null_action=local_idx in null_action_indexes,
                         )
             state.append_chunk(clean_chunk, frame_start=chunk_start, retain_latent=not tick and not stream_video)

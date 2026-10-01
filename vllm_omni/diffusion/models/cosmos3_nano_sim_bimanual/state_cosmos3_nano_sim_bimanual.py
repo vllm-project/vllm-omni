@@ -15,7 +15,7 @@ def append_dense_kv_history(
     *,
     tokens_per_frame: int,
     sink_frames: int,
-    window_frames: int,
+    window_frames: int | None,
 ) -> list[tuple[torch.Tensor, torch.Tensor]]:
     """Append a dense oracle block while retaining only one rebuilt layer."""
 
@@ -25,14 +25,16 @@ def append_dense_kv_history(
         isinstance(sink_frames, bool)
         or not isinstance(sink_frames, int)
         or sink_frames < 0
-        or isinstance(window_frames, bool)
-        or not isinstance(window_frames, int)
-        or window_frames <= 0
+        or (
+            window_frames is not None
+            and (isinstance(window_frames, bool) or not isinstance(window_frames, int) or window_frames <= 0)
+        )
+        or (window_frames is None and sink_frames != 0)
     ):
         raise ValueError("sink_frames must be non-negative and window_frames must be positive.")
     sink_tokens = sink_frames * tokens_per_frame
-    tail_tokens = window_frames * tokens_per_frame
-    max_tokens = sink_tokens + tail_tokens
+    tail_tokens = window_frames * tokens_per_frame if window_frames is not None else 0
+    max_tokens = sink_tokens + tail_tokens if window_frames is not None else None
     if not current_kv:
         raise ValueError("Cosmos3-Nano-Sim-Bimanual dense K/V update must contain at least one layer.")
 
@@ -57,7 +59,7 @@ def append_dense_kv_history(
         # The transformer output already owns exactly the first committed
         # block. Retain its detached storage directly instead of copying it
         # through a concatenation with zero-length views.
-        if any(key.shape[1] > max_tokens for key, _ in current_kv):
+        if max_tokens is not None and any(key.shape[1] > max_tokens for key, _ in current_kv):
             raise ValueError(
                 "The initial Cosmos3-Nano-Sim-Bimanual dense K/V block exceeds the configured history window."
             )
@@ -100,7 +102,7 @@ def append_dense_kv_history(
         return parts
 
     def append_bounded(old: torch.Tensor, new: torch.Tensor) -> torch.Tensor:
-        if old.shape[1] + new.shape[1] <= max_tokens:
+        if max_tokens is None or old.shape[1] + new.shape[1] <= max_tokens:
             return torch.cat([old, new], dim=1)
         # Build the final sink+tail tensor directly. Appending the full history
         # and trimming it afterward creates another layer-sized transient at
