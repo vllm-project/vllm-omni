@@ -41,7 +41,22 @@ steps:
         - export VLLM_ROCM_USE_AITER=0
         # ignore test_teacache_extractors.py because it use rocm gemm kernel from vLLM
         # that is not supported on CPU
-        - "pytest -sv tests/diffusion -m 'core_model and cpu' --ignore=tests/diffusion/cache/test_teacache_extractors.py --num-shards=$$BUILDKITE_PARALLEL_JOB_COUNT --shard-id=$$BUILDKITE_PARALLEL_JOB"
+        # Keep multi-GPU tests out of this one-GPU pool even when their module
+        # also carries the cpu marker for unit tests.
+        - "pytest -sv tests/diffusion -m 'core_model and cpu and not (cards_2 or cards_3 or cards_4 or cards_5 or cards_6 or cards_7 or cards_8)' --ignore=tests/diffusion/cache/test_teacache_extractors.py --num-shards=$$BUILDKITE_PARALLEL_JOB_COUNT --shard-id=$$BUILDKITE_PARALLEL_JOB"
+
+    - label: "Diffusion · AuK VAE GPU Test"
+      agent_pool: mi300_1
+      depends_on: amd-build
+      mirror_hardwares: [amdproduction]
+      grade: Blocking
+      timeout_in_minutes: 40
+      commands:
+        - export VLLM_ROCM_USE_AITER=0
+        - >-
+          timeout --signal=TERM --kill-after=2m 35m
+          pytest -sv tests/diffusion/models/auk/test_auk_vae_fastpath.py
+          -m 'core_model and rocm and cards_1' --run-level core_model
 
     - label: "Simple · Engine&Entrypoints Test"
       agent_pool: mi300_1
@@ -143,6 +158,11 @@ steps:
         - timeout 20m pytest -s -v tests/diffusion/distributed/test_sequence_parallel.py -m core_model
         - >-
           timeout 20m pytest -s -v
+          tests/diffusion/attention/test_ulysses_uaa.py::test_ulysses_uaa_2d_mask_layout_matches_baseline
+          -m 'core_model and cards_2'
+          --run-level "core_model"
+        - >-
+          timeout 20m pytest -s -v
           tests/diffusion/models/ltx2/test_ltx2_transformer_ulysses.py
           -m 'core_model and rocm and cards_2'
           --run-level "core_model"
@@ -165,6 +185,7 @@ steps:
         # registered multi-GPU marker from this one-GPU job.
         - >-
           timeout 15m pytest -sv tests/diffusion/models/
+          --ignore=tests/diffusion/models/auk/test_auk_vae_fastpath.py
           -m 'core_model and cuda and not
           (cards_2 or cards_3 or cards_4 or cards_5 or cards_6 or cards_7 or cards_8)'
           --run-level "core_model"

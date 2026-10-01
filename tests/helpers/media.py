@@ -781,12 +781,20 @@ def _whisper_process_reserved_gib() -> float:
 
 
 def _whisper_transcribe_in_current_process(
-    output_path: str, model_size: str = "small", language: str | None = None
+    output_path: str, model_size: str = "small", language: str | None = None, temperature_fallback: bool = False
 ) -> tuple[str, str, float]:
     model = _get_whisper_model(model_size)
+    if temperature_fallback:
+        import torch
+
+        # This runs in the isolated ASR worker. Fix fallback sampling without
+        # changing the model server's generator or the pytest process RNG.
+        torch.manual_seed(0)
     text = model.transcribe(
         output_path,
-        temperature=0.0,
+        # Whisper retries only segments rejected by its repetition/logprob
+        # checks. A scalar temperature supplies no additional attempt.
+        temperature=(0.0, 0.2, 0.4, 0.6, 0.8, 1.0) if temperature_fallback else 0.0,
         word_timestamps=True,
         condition_on_previous_text=False,
         # None keeps whisper's auto-detection. Do not default this to a
@@ -910,7 +918,13 @@ def _unpack_transcribe_worker_result(result: object) -> tuple[str, str, float]:
     return str(text), str(device), reserved
 
 
-def convert_audio_file_to_text(output_path: str, model_size: str = "small", language: str | None = None) -> str:
+def convert_audio_file_to_text(
+    output_path: str,
+    model_size: str = "small",
+    language: str | None = None,
+    *,
+    temperature_fallback: bool = False,
+) -> str:
     """Convert an audio file to text in a reused, isolated subprocess.
 
     The worker outlives the call so its Whisper model is loaded once rather than
@@ -933,7 +947,9 @@ def convert_audio_file_to_text(output_path: str, model_size: str = "small", lang
             executor = _get_transcriber()
             try:
                 text, device, reserved_gib = _unpack_transcribe_worker_result(
-                    executor.submit(_whisper_transcribe_in_current_process, output_path, model_size, language).result()
+                    executor.submit(
+                        _whisper_transcribe_in_current_process, output_path, model_size, language, temperature_fallback
+                    ).result()
                 )
                 with _TRANSCRIBER_LOCK:
                     _TRANSCRIBER_DEVICE = device

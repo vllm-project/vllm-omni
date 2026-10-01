@@ -14,6 +14,11 @@ AMD_NIGHTLY_PIPELINE = Path(".buildkite/amd/test-amd-nightly.yml")
 AMD_READY_PIPELINE = Path(".buildkite/amd/test-amd-ready.yml")
 AMD_TEMPLATE = Path(".buildkite/amd/test-template-amd-omni.j2")
 
+MULTI_GPU_MARKER_EXCLUSION = (
+    "core_model and cpu and not (cards_2 or cards_3 or cards_4 or cards_5 or cards_6 or cards_7 or cards_8)"
+)
+ULYSSES_UAA_2D_NODE = "tests/diffusion/attention/test_ulysses_uaa.py::test_ulysses_uaa_2d_mask_layout_matches_baseline"
+
 
 def _find_step(label: str, pipeline_path: Path = AMD_MERGE_PIPELINE) -> dict:
     pipeline = yaml.safe_load(pipeline_path.read_text(encoding="utf-8"))
@@ -54,7 +59,10 @@ def test_qwen3_accuracy_defers_artifact_path_expansion() -> None:
     assert '"$$PWD"' in staging_command
     assert '"$${BUILDKITE_BUILD_CHECKOUT_PATH:?}"' in staging_command
     assert '"$$artifact_dir"' in staging_command
-    assert step["artifact_paths"] == ["tests/e2e/accuracy/qwen3_omni/results/qwen_omni_acc/*.json"]
+    assert step["artifact_paths"] == [
+        "tests/e2e/accuracy/qwen3_omni/results/qwen_omni_acc/*.json",
+        "artifacts/rocm-qwen3-omni-accuracy/**/*",
+    ]
 
 
 def test_ready_diffusion_cpu_suite_is_sharded() -> None:
@@ -72,6 +80,37 @@ def test_z_image_merge_timeout_covers_cold_aiter_compile() -> None:
     pytest_command = next(command for command in step["commands"] if "test_z_image.py" in command)
 
     assert split(pytest_command)[:2] == ["timeout", "55m"]
+
+
+@pytest.mark.parametrize("pipeline_path", [AMD_READY_PIPELINE, AMD_MERGE_PIPELINE])
+def test_diffusion_cpu_suite_excludes_multi_gpu_tests(pipeline_path: Path) -> None:
+    step = _find_step("Simple · Diffusion Test · Shard %N/%t", pipeline_path)
+    pytest_command = next(command for command in step["commands"] if "pytest" in command)
+    argv = split(pytest_command)
+
+    marker_index = argv.index("-m")
+    assert argv[marker_index + 1] == MULTI_GPU_MARKER_EXCLUSION
+
+
+@pytest.mark.parametrize(
+    ("pipeline_path", "step_label"),
+    [
+        (AMD_READY_PIPELINE, "Diffusion Sequence Parallelism Test"),
+        (AMD_MERGE_PIPELINE, "Diffusion Tensor Parallelism Test"),
+    ],
+)
+def test_ulysses_uaa_2d_mask_runs_on_two_gpu_lane(
+    pipeline_path: Path,
+    step_label: str,
+) -> None:
+    step = _find_step(step_label, pipeline_path)
+    pytest_command = next(command for command in step["commands"] if ULYSSES_UAA_2D_NODE in command)
+    argv = split(pytest_command)
+
+    assert step["agent_pool"] == "mi300_2"
+    assert ULYSSES_UAA_2D_NODE in argv
+    marker_index = argv.index("-m")
+    assert argv[marker_index + 1] == "core_model and cards_2"
 
 
 def test_cosyvoice_ready_smoke_uses_sdpa() -> None:

@@ -11,10 +11,28 @@ eager off CUDA) and the tiled decode of long clips.
 import pytest
 import torch
 
+from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.models.auk.auk_vae import AuKVAE, LowPass, SnakeBeta, Upsample
 from vllm_omni.diffusion.models.auk.vae_cudagraph import AuKVAEDecodeGraph, plan_tiles
+from vllm_omni.platforms import current_omni_platform
 
-pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+pytestmark = [pytest.mark.core_model]
+
+
+@pytest.fixture(autouse=True)
+def _bound_cpu_decode_threads(request):
+    if request.node.get_closest_marker("cpu") is None:
+        yield
+        return
+    # These narrow convolutions run in shared CI pods. A host-sized Torch
+    # pool spends more time coordinating workers than decoding small clips.
+    previous_threads = torch.get_num_threads()
+    torch.set_num_threads(1)
+    print(f"AuK CPU decode threads: {previous_threads} -> {torch.get_num_threads()}")
+    try:
+        yield
+    finally:
+        torch.set_num_threads(previous_threads)
 
 
 def _small_vae() -> AuKVAE:
@@ -45,6 +63,23 @@ def _reference_snake(module: SnakeBeta, x: torch.Tensor) -> torch.Tensor:
     return x + (1.0 / (beta + 1e-9)) * torch.sin(x * alpha).pow(2)
 
 
+def _assert_plain_graph_matches_eager(replay: torch.Tensor, eager: torch.Tensor) -> None:
+    assert replay.shape == eager.shape and replay.dtype == eager.dtype
+    assert torch.isfinite(replay).all() and torch.isfinite(eager).all()
+    error = (replay - eager).abs()
+    rms = error.square().mean().sqrt().item()
+    print(f"AuK plain graph: max_abs={error.max().item():.9g}, rms={rms:.9g}")
+    if current_omni_platform.is_rocm():
+        # MI300 build 13040 measured max_abs <= 1.64e-7 and RMS <= 4.13e-8.
+        # Bound both peak and aggregate FP32 error; near-zero samples must
+        # not hide behind a relative tolerance. NVIDIA retains bit parity.
+        torch.testing.assert_close(replay, eager, atol=1e-6, rtol=0.0)
+        assert rms <= 1e-7, rms
+    else:
+        assert torch.equal(replay, eager)
+
+
+@pytest.mark.cpu
 @torch.inference_mode()
 def test_window_padding_decodes_to_raw_zero() -> None:
     """Bucket padding is the normalized latent whose denormalized value is zero."""
@@ -57,6 +92,7 @@ def test_window_padding_decodes_to_raw_zero() -> None:
     torch.testing.assert_close(raw, torch.zeros_like(raw), atol=1e-6, rtol=0.0)
 
 
+@pytest.mark.cpu
 @torch.inference_mode()
 def test_eager_snake_matches_the_reference_formula() -> None:
     module = SnakeBeta(6, alpha_logscale=True)
@@ -69,6 +105,7 @@ def test_eager_snake_matches_the_reference_formula() -> None:
     assert torch.equal(module(x), _reference_snake(module, x))
 
 
+@pytest.mark.cpu
 @torch.inference_mode()
 def test_filter_cache_leaves_the_filters_and_output_unchanged() -> None:
     lowpass = LowPass(cutoff=0.25, half_width=0.3, stride=2, kernel_size=12, causal=True)
@@ -88,6 +125,7 @@ def test_filter_cache_leaves_the_filters_and_output_unchanged() -> None:
         assert module._expanded.shape == (3, 1, 12)
 
 
+@pytest.mark.cpu
 @torch.inference_mode()
 def test_decode_fast_paths_reproduce_the_plain_decode() -> None:
     vae = _small_vae()
@@ -103,6 +141,7 @@ def test_decode_fast_paths_reproduce_the_plain_decode() -> None:
     assert all(module._cached for module in vae.modules() if isinstance(module, SnakeBeta))
 
 
+@pytest.mark.cpu
 @torch.inference_mode()
 def test_graph_wrapper_falls_back_to_eager_off_cuda(mocker) -> None:
     vae = _small_vae()
@@ -119,6 +158,7 @@ def test_graph_wrapper_falls_back_to_eager_off_cuda(mocker) -> None:
     assert not wrapper._cache and not wrapper._compiled
 
 
+@pytest.mark.cpu
 def test_compiled_bucket_is_the_smallest_captured_one_that_fits() -> None:
     wrapper = AuKVAEDecodeGraph(_small_vae(), compile_shapes=(16, 8, 8))
     assert wrapper.compile_shapes == [8, 16]
@@ -131,6 +171,7 @@ def test_compiled_bucket_is_the_smallest_captured_one_that_fits() -> None:
     assert wrapper.compiled_bucket(6) == 16
 
 
+@pytest.mark.cpu
 def test_plan_tiles_covers_the_clip_once_with_full_context() -> None:
     assert plan_tiles(40, 64, 10, 3) == [(0, 40, 0, 40)]
     windows = plan_tiles(1000, 512, 53, 9)
@@ -149,10 +190,16 @@ def test_plan_tiles_covers_the_clip_once_with_full_context() -> None:
     # 512 and a 256 window instead of two 512s.
     assert plan_tiles(600, 512, 53, 9, sizes=(128, 256, 512)) == [(0, 512, 0, 503), (344, 256, 503, 600)]
     assert plan_tiles(1000, 512, 53, 9, sizes=(128, 256, 512))[-1] == (872, 128, 953, 1000)
+    narrow = plan_tiles(200, 64, 53, 9)
+    assert len(narrow) == 69
+    assert [emit for _, _, emit, _ in narrow[:3]] == [0, 55, 57]
+    assert all(a[3] == b[2] for a, b in zip(narrow, narrow[1:]))
+    assert narrow[-1][3] == 200
     with pytest.raises(ValueError, match="must exceed"):
         plan_tiles(100, 60, 53, 9)
 
 
+@pytest.mark.cpu
 @torch.inference_mode()
 def test_decode_context_bounds_the_measured_receptive_field() -> None:
     vae = _small_vae()
@@ -170,25 +217,26 @@ def test_decode_context_bounds_the_measured_receptive_field() -> None:
     assert differing and all(index < left or end - start - index <= right for index in differing)
 
 
+@pytest.mark.cpu
 @torch.inference_mode()
 def test_tiled_decode_matches_the_whole_decode() -> None:
     vae = _small_vae()
     # Off the accelerator every window decodes eagerly, so this isolates the stitching.
-    wrapper = AuKVAEDecodeGraph(vae, compile_shapes=(64,), tile_frames=64)
-    assert wrapper.tile_frames == 64 and wrapper.context_frames == (53, 9)
-    for frames in (64, 65, 200, 331):
+    wrapper = AuKVAEDecodeGraph(vae, compile_shapes=(128,), tile_frames=128)
+    assert wrapper.tile_frames == 128 and wrapper.context_frames == (53, 9)
+    for frames in (128, 129, 200, 331):
         latents = torch.randn(1, frames, vae.latent_dim)
         whole = vae.decode(latents)
         tiled = wrapper(latents)
         assert tiled.shape == whole.shape
         torch.testing.assert_close(tiled, whole, atol=1e-5, rtol=0.0)
-        assert wrapper.last_mode == ("eager" if frames == 64 else "tiled")
+        assert wrapper.last_mode == ("eager" if frames == 128 else "tiled")
     # The streaming form yields the same audio in order.
     latents = torch.randn(1, 200, vae.latent_dim)
     pieces = [(start, chunk.clone()) for start, chunk in wrapper.decode_tiles(latents)]
-    # With a 64-frame tile and a 62-frame halo each interior tile adds two frames.
-    assert [start for start, _ in pieces] == [emit for _, _, emit, _ in plan_tiles(200, 64, 53, 9)]
-    assert [start for start, _ in pieces][:3] == [0, 55, 57]
+    # A 128-frame tile avoids repeatedly decoding the same 62-frame halo.
+    assert [start for start, _ in pieces] == [emit for _, _, emit, _ in plan_tiles(200, 128, 53, 9)]
+    assert [start for start, _ in pieces][:3] == [0, 119, 185]
     torch.testing.assert_close(
         torch.cat([chunk for _, chunk in pieces], dim=1), vae.decode(latents), atol=1e-5, rtol=0.0
     )
@@ -198,20 +246,24 @@ def test_tiled_decode_matches_the_whole_decode() -> None:
         AuKVAEDecodeGraph(vae, tile_frames=60)
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graph replay requires CUDA")
 @torch.inference_mode()
 def test_graph_replay_matches_eager_per_length() -> None:
     vae = _small_vae().to("cuda")
     wrapper = AuKVAEDecodeGraph(vae, max_graphs=2)
     pools = []
+    saved_outputs: list[tuple[torch.Tensor, torch.Tensor]] = []
     for frames in (6, 9, 6, 12, 6):
         latents = torch.randn(1, frames, vae.latent_dim, device="cuda")
         eager = vae.decode(latents)
         replay = wrapper(latents)
-        # Exact-length graphs replay the very same kernels: bit-identical,
-        # including after the generation was retired.
-        assert torch.equal(replay, eager), frames
+        _assert_plain_graph_matches_eager(replay, eager)
+        # Returned waveforms own their storage and survive later replays
+        # and retirement of the generation that produced them.
+        for previous, snapshot in saved_outputs:
+            assert torch.equal(previous, snapshot)
+        saved_outputs.append((replay, replay.clone()))
         pools.append(wrapper._plain_pool)
     # The third distinct length found the cache full, so the whole generation
     # (6 and 9) was retired together with its pool rather than one graph at a
@@ -220,7 +272,7 @@ def test_graph_replay_matches_eager_per_length() -> None:
     assert pools[0] is pools[2] and pools[3] is pools[4] and pools[2] is not pools[3]
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graph replay requires CUDA")
 @torch.inference_mode()
 def test_bucketed_graph_only_disturbs_the_tail() -> None:
@@ -240,7 +292,7 @@ def test_bucketed_graph_only_disturbs_the_tail() -> None:
     torch.testing.assert_close(replay, eager, atol=0.1, rtol=0.0)
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="torch.compile + CUDA graph capture requires CUDA")
 @torch.inference_mode()
 def test_compiled_buckets_replay_within_fusion_tolerance_and_leave_longer_clips_to_plain_graphs() -> None:
@@ -266,11 +318,12 @@ def test_compiled_buckets_replay_within_fusion_tolerance_and_leave_longer_clips_
     # a longer clip gets its own plain graph.
     assert wrapper.tile_frames == 0
     long = torch.randn(1, 12, vae.latent_dim, device="cuda")
-    assert torch.equal(wrapper(long), vae.decode(long))
+    replay, eager = wrapper(long), vae.decode(long)
+    _assert_plain_graph_matches_eager(replay, eager)
     assert wrapper.last_mode == "graph" and list(wrapper._cache) == [12]
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="torch.compile + CUDA graph capture requires CUDA")
 @torch.inference_mode()
 def test_tiles_replay_the_compiled_bucket_for_long_clips() -> None:

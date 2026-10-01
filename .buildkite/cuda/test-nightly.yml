@@ -48,6 +48,8 @@ steps:
       - label: ":full_moon: Omni · Doc Test with H100 · 2-GPU"
         source_file_dependencies: omni_qwen3_omni_doc
         timeout_in_minutes: 90
+        artifact_paths:
+          - qwen3-omni-doc-artifacts/**/*
         commands:
           - pytest -s -v tests/examples/ -m "full_model and omni and H100 and B200 and cards_2" --run-level "full_model"
 

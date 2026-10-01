@@ -928,4 +928,51 @@ def test_talker_output_contract(monkeypatch, mrv2, packed):
         model._sampling_eps = 1e-6
         model.mrv2_custom_sampler(SimpleNamespace(penalties_state=None))
     output = model.forward(torch.ones(2, dtype=torch.long), torch.arange(2), inputs_embeds=hidden)
-    assert output is (hidden if mrv2 or packed else sentinel)
+    assert output is hidden
+
+
+def test_request_conditioning_normalizes_singletons_without_changing_schema():
+    from vllm_omni.data_entry_keys import to_struct
+    from vllm_omni.model_executor.models.cosyvoice3.cosyvoice3 import _normalize_request_conditioning
+
+    token = torch.tensor([[7, 8]], dtype=torch.int32)
+    feat = torch.randn(1, 4, 80)
+    speaker = torch.randn(1, 192)
+    length = torch.tensor([[2]], dtype=torch.int32)
+    raw = {"embed": {"speech_token": token, "speech_feat": feat, "embedding": speaker, "speech_token_len": [length]}}
+    result = to_struct(_normalize_request_conditioning(raw))
+    assert result.embed.speech_token is token
+    assert result.embed.speech_feat is feat
+    assert result.embed.embedding is speaker
+    assert result.embed.speech_token_len is length
+    assert raw["embed"]["speech_token_len"] == [length]
+
+
+def test_request_conditioning_rejects_unsplit_voices():
+    from vllm_omni.model_executor.models.cosyvoice3.cosyvoice3 import _normalize_request_conditioning
+
+    with pytest.raises(ValueError, match="unsplit batch"):
+        _normalize_request_conditioning({"embed": {"embedding": [torch.ones(1, 192), torch.zeros(1, 192)]}})
+
+
+def test_request_conditioning_reaches_code2wav_with_true_prompt_length():
+    model = _make_code2wav_model()
+    output = model.forward(
+        torch.tensor([1, 2]),
+        torch.arange(2),
+        model_intermediate_buffer=[
+            {
+                "embed": {
+                    "speech_token": torch.tensor([[3, 2, 0, 0]], dtype=torch.int32),
+                    "speech_feat": torch.randn(1, 8, 80),
+                    "embedding": torch.randn(1, 192),
+                    "speech_token_len": [torch.tensor([[2]], dtype=torch.int32)],
+                },
+                "meta": {"req_id": ["voice"]},
+            }
+        ],
+    )
+    call = model.code2wav.forward_calls[0]
+    assert call["prompt_token"].shape == (1, 2)
+    assert call["prompt_feat"].shape == (1, 4, 80)
+    assert output.multimodal_outputs
