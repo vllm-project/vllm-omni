@@ -21,6 +21,11 @@ from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_qwenimage import (
     DistributedAutoencoderKLQwenImage,
 )
+from vllm_omni.diffusion.distributed.parallel_state import (
+    destroy_model_parallel,
+    init_distributed_environment,
+    initialize_model_parallel,
+)
 from vllm_omni.platforms import current_omni_platform
 
 _QWEN_VAE_MODEL = "inclusionAI/Ming-Image-0.1-Design-Layer"
@@ -68,12 +73,6 @@ def _load_qwen_vae(model: str, dtype: torch.dtype) -> DistributedAutoencoderKLQw
 
 
 def _worker(rank: int, split_dim: str, return_dict: dict, master_port: str) -> None:
-    from vllm_omni.diffusion.distributed.parallel_state import (
-        destroy_model_parallel,
-        init_distributed_environment,
-        initialize_model_parallel,
-    )
-
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = master_port
     device = current_omni_platform.get_torch_device(rank)

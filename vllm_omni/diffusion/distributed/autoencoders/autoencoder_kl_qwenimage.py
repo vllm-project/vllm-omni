@@ -16,14 +16,14 @@ from vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor impor
     GridSpec,
     TileTask,
 )
+from vllm_omni.diffusion.distributed.autoencoders.qwen_spatial_shard import install_qwen_spatial_shard_decode
+from vllm_omni.diffusion.distributed.autoencoders.wan_spatial_shard import WanDistCausalConv3d
 
 logger = init_logger(__name__)
 
 
 class DistributedAutoencoderKLQwenImage(AutoencoderKLQwenImage, DistributedVaeMixin):
     def clear_cache(self):
-        from vllm_omni.diffusion.distributed.autoencoders.wan_spatial_shard import WanDistCausalConv3d
-
         def _count_cached_conv3d(model) -> int:
             return sum(isinstance(module, (QwenImageCausalConv3d, WanDistCausalConv3d)) for module in model.modules())
 
@@ -47,8 +47,6 @@ class DistributedAutoencoderKLQwenImage(AutoencoderKLQwenImage, DistributedVaeMi
         return mode in ("spatial_shard_height", "spatial_shard_width")
 
     def _spatial_decode(self, z: torch.Tensor, return_dict: bool):
-        from vllm_omni.diffusion.distributed.autoencoders.qwen_spatial_shard import install_qwen_spatial_shard_decode
-
         executor = self.distributed_executor
         size = executor.parallel_size
         if size < 1:
