@@ -176,6 +176,7 @@ def test_layer_forward_returns_decode_duration_only_when_profiled(monkeypatch, p
         ("ming_image_layer_tiled.yaml", "1", None, None, None),
         ("ming_image_layer_tile_parallel.yaml", "1,2", 2, 2, "tile"),
         ("ming_image_layer_spatial_shard.yaml", "1,2", 2, 2, "spatial_shard_height"),
+        ("ming_image_layer_spatial_shard_width.yaml", "1,2", 2, 2, "spatial_shard_width"),
     ],
 )
 def test_layer_vae_deploy_topology(filename, devices, ulysses, vae_parallel, mode):

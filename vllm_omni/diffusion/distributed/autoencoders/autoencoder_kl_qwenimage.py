@@ -6,6 +6,7 @@ from typing import Any
 import torch
 import torch.distributed as dist
 from diffusers.models.autoencoders import AutoencoderKLQwenImage
+from diffusers.models.autoencoders.autoencoder_kl_qwenimage import QwenImageCausalConv3d
 from diffusers.models.autoencoders.vae import DecoderOutput
 from vllm.logger import init_logger
 
@@ -21,9 +22,17 @@ logger = init_logger(__name__)
 
 class DistributedAutoencoderKLQwenImage(AutoencoderKLQwenImage, DistributedVaeMixin):
     def clear_cache(self):
-        if getattr(self, "_qwen_spatial_shard_config", None) is not None:
-            raise NotImplementedError("Cache clearing for Qwen spatial-shard decode is not implemented.")
-        super().clear_cache()
+        from vllm_omni.diffusion.distributed.autoencoders.wan_spatial_shard import WanDistCausalConv3d
+
+        def _count_cached_conv3d(model) -> int:
+            return sum(isinstance(module, (QwenImageCausalConv3d, WanDistCausalConv3d)) for module in model.modules())
+
+        self._conv_num = _count_cached_conv3d(self.decoder)
+        self._conv_idx = [0]
+        self._feat_map = [None] * self._conv_num
+        self._enc_conv_num = _count_cached_conv3d(self.encoder)
+        self._enc_conv_idx = [0]
+        self._enc_feat_map = [None] * self._enc_conv_num
 
     def _spatial_decode_requested(self) -> bool:
         executor = getattr(self, "distributed_executor", None)
