@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Stand-alone builder for Qwen3-TTS AR talker prompt embeddings.
 
 Factors the prompt-construction logic out of
@@ -195,10 +198,6 @@ def mel_spectrogram(
     hann_window: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Mel spectrogram via torch STFT and a (cached) mel filterbank."""
-    if torch.min(y) < -1.0:
-        logger.warning("Min value of input waveform signal is %s", torch.min(y))
-    if torch.max(y) > 1.0:
-        logger.warning("Max value of input waveform signal is %s", torch.max(y))
     device = y.device
     if mel_basis is None:
         mel_basis = _cached_mel_filter_bank(sampling_rate, n_fft, num_mels, fmin, fmax).to(device)
@@ -347,7 +346,7 @@ class Qwen3TTSPromptEmbedsBuilder:
         tts_pad_embed: torch.Tensor,
         encode_ref_audio_batch: Callable[..., list[torch.Tensor]],
         speaker_cache: Any | None = None,
-        ref_audio_artifact_cache_max_entries: int = 256,
+        ref_audio_artifact_cache_max_entries: int = 1024,
     ):
         self._config = config
         self._talker_config = talker_config
@@ -363,9 +362,14 @@ class Qwen3TTSPromptEmbedsBuilder:
         self._embedding_dtype = torch.bfloat16
 
         self._text_tokenizer: Any | None = None
+        # Projected special-token embeddings are immutable model constants.
+        # Reusing them avoids launching the embedding/projection pair once per
+        # request during prompt construction.
+        self._projected_token_cache: dict[tuple[str, tuple[int, ...]], torch.Tensor] = {}
 
         self._ref_audio_artifact_cache_max_entries = int(ref_audio_artifact_cache_max_entries)
         self._ref_audio_artifact_cache: OrderedDict[str, dict[str, torch.Tensor | bool]] = OrderedDict()
+        self._long_tensor_cache: dict[tuple[str, tuple[int, ...]], torch.Tensor] = {}
 
         # Bounded LRU; caller-supplied orig_sr can otherwise grow this without limit.
         self._resampler_cache: OrderedDict[tuple[int, int], AudioResampler] = OrderedDict()
@@ -380,6 +384,29 @@ class Qwen3TTSPromptEmbedsBuilder:
     def _pad_embed(self, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
         """Return the pad-token embedding on the requested device/dtype, shape ``[1, 1, H]``."""
         return self._tts_pad_embed_buffer.to(device=device, dtype=dtype).reshape(1, 1, -1)
+
+    def _long_tensor(self, values: Sequence[int], device: torch.device) -> torch.Tensor:
+        device = torch.device(device)
+        if device.type == "cuda" and device.index is None:
+            device = torch.device("cuda", torch.accelerator.current_device_index())
+        key = (str(device), tuple(int(v) for v in values))
+        cache = getattr(self, "_long_tensor_cache", None)
+        if cache is None:
+            cache = self._long_tensor_cache = {}
+        cached = cache.get(key)
+        if cached is None or cached.device != device:
+            cached = torch.tensor([list(key[1])], device=device, dtype=torch.long)
+            cache[key] = cached
+        return cached
+
+    def _projected_tokens(self, values: Sequence[int], device: torch.device) -> torch.Tensor:
+        device = torch.device(device)
+        key = (str(device), tuple(int(v) for v in values))
+        cached = self._projected_token_cache.get(key)
+        if cached is None:
+            cached = self._text_projection(self._text_embedding(self._long_tensor(values, device)))
+            self._projected_token_cache[key] = cached
+        return cached
 
     def _get_resampler(self, orig_sr: int, target_sr: int) -> AudioResampler:
         key = (int(orig_sr), int(target_sr))
@@ -628,9 +655,9 @@ class Qwen3TTSPromptEmbedsBuilder:
         if entry is None:
             entry = {}
         if isinstance(ref_code, torch.Tensor):
-            entry["ref_code"] = ref_code.detach().to("cpu", dtype=torch.long).contiguous()
+            entry["ref_code"] = ref_code.detach().to(dtype=torch.long).contiguous()
         if isinstance(ref_spk_embedding, torch.Tensor):
-            entry["ref_spk_embedding"] = ref_spk_embedding.detach().to("cpu", dtype=self._embedding_dtype).reshape(-1)
+            entry["ref_spk_embedding"] = ref_spk_embedding.detach().to(dtype=self._embedding_dtype).reshape(-1)
         if not entry:
             return
         self._ref_audio_artifact_cache[cache_key] = entry
@@ -639,6 +666,10 @@ class Qwen3TTSPromptEmbedsBuilder:
             self._ref_audio_artifact_cache.popitem(last=False)
 
     # -------------------- speaker encoder / codec encoder --------------------
+
+    # Some NPUs (310P, Ascend 950) do not support torch.stft; builders on
+    # such devices set this flag to compute the mel spectrogram on CPU.
+    _mel_spectrogram_on_cpu: bool = False
 
     def extract_speaker_embedding(self, wav: np.ndarray, sr: int) -> torch.Tensor:
         # vLLM workers do not automatically move arbitrary torch.nn.Modules to
@@ -652,7 +683,6 @@ class Qwen3TTSPromptEmbedsBuilder:
                 self._speaker_encoder.to(device=dev, dtype=dtype)
         except StopIteration:
             pass
-
         # Resample to 24kHz for speaker encoder.
         target_sr = int(getattr(self._config.speaker_encoder_config, "sample_rate", 24000))
         if sr != target_sr:
@@ -663,7 +693,9 @@ class Qwen3TTSPromptEmbedsBuilder:
         # Follow official implementation: mel_spectrogram expects 24kHz. Move
         # the waveform first so STFT/mel computation stays on the model device
         # instead of materializing a CPU mel tensor and copying it per request.
-        wav_tensor = torch.from_numpy(wav).to(device=dev, dtype=torch.float32).unsqueeze(0)
+        # Devices without torch.stft set _mel_spectrogram_on_cpu instead.
+        mel_device = torch.device("cpu") if self._mel_spectrogram_on_cpu else dev
+        wav_tensor = torch.from_numpy(wav).to(device=mel_device, dtype=torch.float32).unsqueeze(0)
         mels = mel_spectrogram(
             wav_tensor,
             n_fft=1024,
@@ -674,7 +706,7 @@ class Qwen3TTSPromptEmbedsBuilder:
             fmin=0,
             fmax=12000,
         ).transpose(1, 2)
-        spk = self._speaker_encoder(mels.to(dtype=dtype))[0]
+        spk = self._speaker_encoder(mels.to(device=dev, dtype=dtype))[0]
         return spk.to(dtype=dtype)
 
     def encode_ref_audio_batch(
@@ -753,6 +785,23 @@ class Qwen3TTSPromptEmbedsBuilder:
         model_intermediate_buffer: dict[str, dict[str, Any]],
         device: torch.device,
     ) -> None:
+        """MRv1 adapter for the request-info batch implementation."""
+        self.preprocess_infos_batch(
+            req_infos=[
+                info_dict
+                for req_id in req_ids
+                if isinstance((info_dict := model_intermediate_buffer.get(req_id)), dict)
+            ],
+            device=device,
+        )
+
+    @torch.inference_mode()
+    def preprocess_infos_batch(
+        self,
+        *,
+        req_infos: list[dict[str, Any]],
+        device: torch.device,
+    ) -> None:
         """Batch Base voice-clone ref-audio codec extraction for current prefill requests.
 
         Tokenizes assistant / ref text and runs the talker-supplied
@@ -766,11 +815,7 @@ class Qwen3TTSPromptEmbedsBuilder:
         pending_text: list[tuple[dict[str, Any], str]] = []
         pending_ref_text: list[tuple[dict[str, Any], str]] = []
         groups: dict[int, list[tuple[dict[str, Any], np.ndarray, int]]] = {}
-        for req_id in req_ids:
-            info_dict = model_intermediate_buffer.get(req_id)
-            if not isinstance(info_dict, dict):
-                continue
-
+        for info_dict in req_infos:
             if (
                 self._needs_initial_prompt_preprocess(info_dict)
                 and first_value(info_dict.get("task_type"), "CustomVoice") == "Base"
@@ -828,17 +873,31 @@ class Qwen3TTSPromptEmbedsBuilder:
                 except Exception as exc:
                     logger.debug("Qwen3-TTS batched text tokenization failed; falling back to serial path: %s", exc)
                     continue
-                input_ids = tokenized.get("input_ids") if isinstance(tokenized, dict) else None
+                input_ids = tokenized.get("input_ids") if isinstance(tokenized, Mapping) else None
                 if not isinstance(input_ids, list) or len(input_ids) != len(items):
                     continue
+                valid_items: list[tuple[dict[str, Any], int]] = []
+                flat_ids: list[int] = []
                 for (info_dict, _), ids in zip(items, input_ids, strict=True):
-                    if isinstance(ids, list) and ids:
-                        info_dict[key] = torch.tensor(ids, dtype=torch.long)
+                    if not (
+                        isinstance(ids, list)
+                        and ids
+                        and all(isinstance(token_id, (int, np.integer)) for token_id in ids)
+                    ):
+                        continue
+                    valid_items.append((info_dict, len(ids)))
+                    flat_ids.extend(int(token_id) for token_id in ids)
+                if not valid_items:
+                    continue
+                use_async_h2d = device.type == "cuda"
+                packed_ids_cpu = torch.tensor(flat_ids, dtype=torch.long, pin_memory=use_async_h2d)
+                packed_ids = packed_ids_cpu.to(device=device, non_blocking=use_async_h2d)
+                offset = 0
+                for info_dict, num_ids in valid_items:
+                    info_dict[key] = packed_ids.narrow(0, offset, num_ids)
+                    offset += num_ids
 
         groups = {sr: items for sr, items in groups.items() if len(items) >= 2}
-        if not groups:
-            return
-
         for sr, items in groups.items():
             wavs = [wav for _, wav, _ in items]
             try:
@@ -883,9 +942,7 @@ class Qwen3TTSPromptEmbedsBuilder:
         codec_embed_sum = torch.cat(codec_embed, dim=1).sum(1).unsqueeze(0)  # [1,T,H]
         codec_embed_sum = torch.cat(
             [
-                self._codec_embed(
-                    torch.tensor([[self._talker_config.codec_bos_id]], device=codec_embed_sum.device, dtype=torch.long)
-                ),
+                self._codec_embed(self._long_tensor([self._talker_config.codec_bos_id], codec_embed_sum.device)),
                 codec_embed_sum,
             ],
             dim=1,
@@ -981,12 +1038,8 @@ class Qwen3TTSPromptEmbedsBuilder:
         # tts special token embeds (projected into talker hidden).
         # ``tts_pad_embed`` is precomputed (request-independent), so we only
         # need bos/eos here.
-        tts_tokens = torch.tensor(
-            [[config.tts_bos_token_id, config.tts_eos_token_id]],
-            device=input_ids.device,
-            dtype=input_ids.dtype,
-        )
-        tts_bos_embed, tts_eos_embed = text_projection(text_embedding(tts_tokens)).chunk(2, dim=1)
+        projected_tts = self._projected_tokens([config.tts_bos_token_id, config.tts_eos_token_id], input_ids.device)
+        tts_bos_embed, tts_eos_embed = projected_tts.chunk(2, dim=1)
         tts_pad_embed = self._pad_embed(input_ids.device, tts_bos_embed.dtype)
 
         # Codec prefill tags.
@@ -1023,9 +1076,9 @@ class Qwen3TTSPromptEmbedsBuilder:
                 ]
             ]
 
-        codec_input_0 = codec_embed(torch.tensor(codec_prefill_list, device=input_ids.device, dtype=torch.long))
+        codec_input_0 = codec_embed(self._long_tensor(codec_prefill_list[0], input_ids.device))
         codec_input_1 = codec_embed(
-            torch.tensor([[talker_config.codec_pad_id, talker_config.codec_bos_id]], device=input_ids.device)
+            self._long_tensor([talker_config.codec_pad_id, talker_config.codec_bos_id], input_ids.device)
         )
 
         # Speaker embedding/token (task-dependent)
@@ -1240,6 +1293,15 @@ class Qwen3TTSPromptEmbedsBuilder:
                 wav_np, sr = _get_ref_audio()
                 speaker_embed = self.extract_speaker_embedding(wav_np, sr).view(1, 1, -1)
 
+            expected_speaker_dim = int(self._talker_config.hidden_size)
+            actual_speaker_dim = int(speaker_embed.shape[-1])
+            if actual_speaker_dim != expected_speaker_dim:
+                raise ValueError(
+                    "Qwen3-TTS speaker embedding dimension mismatch: "
+                    f"got {actual_speaker_dim}, but the talker requires {expected_speaker_dim}. "
+                    "Use a matching Base checkpoint or a compatible precomputed speaker embedding."
+                )
+
             # Cache miss: store extraction result in the speaker cache.
             if _speaker_cache_key is not None and speaker_embed is not None and self._speaker_cache is not None:
                 self._speaker_cache.put(
@@ -1321,7 +1383,7 @@ class Qwen3TTSPromptEmbedsBuilder:
                             talker_prompt,
                             text_all + codec_embed(pad_ids),
                             tts_pad_embed
-                            + codec_embed(torch.tensor([[talker_config.codec_bos_id]], device=input_ids.device)),
+                            + codec_embed(self._long_tensor([talker_config.codec_bos_id], input_ids.device)),
                         ],
                         dim=1,
                     )
@@ -1374,8 +1436,7 @@ class Qwen3TTSPromptEmbedsBuilder:
                     [
                         talker_prompt,
                         text_all + codec_embed(pad_ids),
-                        tts_pad_embed
-                        + codec_embed(torch.tensor([[talker_config.codec_bos_id]], device=input_ids.device)),
+                        tts_pad_embed + codec_embed(self._long_tensor([talker_config.codec_bos_id], input_ids.device)),
                     ],
                     dim=1,
                 )
@@ -1413,8 +1474,7 @@ class Qwen3TTSPromptEmbedsBuilder:
                     [
                         talker_prompt,
                         text_all + codec_embed(pad_ids),
-                        tts_pad_embed
-                        + codec_embed(torch.tensor([[talker_config.codec_bos_id]], device=input_ids.device)),
+                        tts_pad_embed + codec_embed(self._long_tensor([talker_config.codec_bos_id], input_ids.device)),
                     ],
                     dim=1,
                 )

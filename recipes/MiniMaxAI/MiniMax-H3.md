@@ -23,6 +23,12 @@ One vLLM-Omni diffusion stage can load both DiTs while instantiating the
 tokenizer, processor, Qwen3-VL text encoder, video VAE, and audio VAE only
 once. Requests select the DiT with `extra_params.task`.
 
+This single-stage recipe uses the default `model_loaded.text_encoder: true` and
+`model_loaded.vae_encoder: true`. Precomputed text conditioning can replace the
+local Qwen call. Setting `model_loaded.text_encoder: false` while leaving
+`model_loaded.vae_encoder: true` requires precomputed text conditioning;
+reference media is still encoded locally.
+
 The generated MP4 contains H.264 video and synchronized stereo audio.
 
 ## Prerequisites
@@ -35,7 +41,7 @@ hf auth login
 export MODEL=MiniMaxAI/MiniMax-H3
 ```
 
-The vLLM-Omni pipeline downloads `FL2VA/**`, `Ref2VA/model_index.json`, and
+By default, the pipeline downloads `FL2VA/**`, `Ref2VA/model_index.json`, and
 `Ref2VA/transformer/**`. It does not download or load the diffusers-format
 `transformer`, `transformer_ref`, or `vae` weights at the repository root, nor
 duplicate Ref2VA copies of shared components.
@@ -69,11 +75,12 @@ reference-video preparation and MP4 output.
 
 For CUDA and ROCm deployments, non-streaming MP4 responses are encoded on the
 host CPU through PyAV/libx264 after generation. The response encoder selects the
-path automatically at runtime: inputs with a supported frame shape, common dtype,
-and RGB per-channel contiguous layout use direct planar frames; other inputs
-fall back to the legacy path before the PyAV container is opened. No CLI flag,
-model declaration, or user configuration is required. Streaming fMP4 output is
-unchanged.
+path automatically at runtime. The server-owned parallel converter accepts
+supported frame shapes and dtypes with either per-channel-contiguous or strided
+RGB planes, including interleaved arrays materialized by output transport.
+Standalone callers without a parallel converter retain the legacy fallback for
+strided planes. No CLI flag, model declaration, or user configuration is
+required. Streaming fMP4 output is unchanged.
 
 A community benchmark on 2x Xeon 8480C reported the following comparison
 between the legacy and direct planar paths
@@ -116,11 +123,12 @@ same time on a host sized for this minimum.
 The consumer-GPU profiles below are HBM budgets only. They still require the
 host-RAM budget above.
 
-### Single GPU: accuracy and memory first
+### Single GPU: blockwise capacity path
 
-The single-GPU configuration uses model-level CPU offload.
-This matches the accuracy-qualified reference path and prevents the Qwen3-VL
-encoder and DiT from being resident on the GPU at the same time.
+Use ordinary layerwise offload when one GPU cannot keep the Qwen3-VL encoder
+and DiT resident together. The component list below streams the active DiT,
+the Qwen vision blocks, and the first 50 Qwen text layers. Encoder blocks stay
+rank-local; the video/audio VAEs remain resident.
 
 ```bash
 export MODEL=MiniMaxAI/MiniMax-H3
@@ -128,20 +136,37 @@ export PORT=8091
 
 CUDA_VISIBLE_DEVICES=0 \
 VLLM_WORKER_MULTIPROC_METHOD=spawn \
-VLLM_OMNI_VIDEO_SYNC_TIMEOUT=1800 \
+VLLM_OMNI_VIDEO_SYNC_TIMEOUT=14400 \
 vllm serve "${MODEL}" \
   --omni \
   --host 0.0.0.0 \
   --port "${PORT}" \
   --trust-remote-code \
+  --task-type fl2va \
   --num-gpus 1 \
-  --enable-cpu-offload \
+  --diffusion-offload-config \
+  '{"mode":"layer","components":["dit","text_encoder"]}' \
+  --enforce-eager \
   --diffusion-attention-backend FLASH_ATTN
 ```
 
-Use a GPU with enough memory for the active H3 component and enough system RAM
-for both offloaded DiTs plus the shared components. Model-level offload keeps
-the two DiTs mutually exclusive on GPU, but adds PCIe/NVLink transfer latency.
+This is a capacity profile, not a latency profile: every denoising step streams
+DiT blocks over the host link, while encoder blocks are streamed only during
+the short conditioning phase. It requires host memory for the complete
+checkpoint plus pinned transfer buffers. Re-measure peak HBM on the target
+shape; this command does not claim a particular GPU model as validated.
+
+A one-B300 correctness smoke selected only `text_encoder` (keeping the DiT and
+VAEs resident) and completed a 384x672, 5-second T2VA request with two denoise
+steps. It installed 77 encoder hooks across the vision and text stacks, used a
+77,728 MiB worker peak, and measured 2.803 seconds encode, 2.706 seconds
+denoise, and 4.503 seconds decode. These reduced-step numbers validate the
+execution path; they are not a quality or production-latency benchmark.
+
+To use whole-component behavior, change the config to
+`{"mode":"module","components":["dit","text_encoder"]}`. Module
+offload swaps the complete encoder and DiT and therefore has a higher
+encode-phase peak than encoder blockwise offload.
 
 ### Two 24/32 GB GPUs: TP2 distributed layerwise offload
 
@@ -277,7 +302,7 @@ steady-state latency. H3 is CFG-distilled, so `--cfg-parallel-size` must remain
 
 ### Attention Backends
 
-On datacenter Blackwell GPUs, MiniMax H3 defaults to dense BF16
+On supported datacenter Blackwell systems, MiniMax H3 defaults to dense BF16
 `TRTLLM_ATTN`; no attention backend flag is required. To select it explicitly,
 use:
 
@@ -297,17 +322,33 @@ FA4 remains available by explicitly selecting the `FLASH_ATTN` backend:
 --diffusion-attention-backend FLASH_ATTN
 ```
 
-On Blackwell, `FLASH_ATTN` selects FA4. Confirm the server log contains
-`Using CuTe FlashAttention-4 on Blackwell` before recording FA4 measurements.
+With the optional `[fa4]` dependency installed, `FLASH_ATTN` prefers FA4 on
+Blackwell. Confirm the server log contains `Using CuTe FlashAttention-4 on
+Blackwell` before recording FA4 measurements.
 
-`TRTLLM_ATTN` additionally supports two **lossy** optimizations for the long main
-DiT attention sequence: SAGE attention quantization and Skip-Softmax Sparse
-Attention. SAGE quantizes Q/K to the configured dtype and V to FP8. This example uses
-`fp8_e4m3` for Q/K; B200 also supports `int8` Q/K. The TRTLLM SAGE path fixes V
-to FP8, so vLLM-Omni only exposes the Q/K dtype. The token refiner is a short
-attention path, so the `per_role` override leaves SAGE and Skip-Softmax disabled
-for it. The example enables the calibration-free Skip-Softmax path with
-`threshold=0.05`, after the normalized timestep reaches `0.97`:
+`TRTLLM_ATTN` additionally offers two **lossy** optimizations for the long main
+DiT attention sequence: SAGE attention quantization and Skip-Softmax sparse
+attention. Both work under the pure Ulysses parallelism of the profile above
+(`--usp 4 --ring 1`). The example below enables both:
+
+- SAGE with `fp8_e4m3` Q/K; P and V are always FP8 in this kernel. B200
+  additionally supports `int8` Q/K, which preserves accuracy better than FP8.
+- Skip-Softmax with a direct `threshold=0.05` (the calibrated
+  `target_sparsity` control needs ModelOpt metadata that the official H3
+  checkpoint does not include). Together with the cutoff below this is a
+  **conservative** setting: a low threshold skips only clearly negligible tiles,
+  and a cutoff close to `1.0` leaves a substantial dense prefix. Raise
+  `threshold` or lower `disabled_until_timestep` for more speedup once quality
+  is verified.
+- `disabled_until_timestep=0.97` keeps the early high-noise steps dense. The
+  gate compares against the video sigma, which H3's default flow shift of 12
+  keeps high for much of the run: at 50 steps, `0.99`, `0.97`, and `0.95`
+  leave the first 6, 14, and 19 of 49 denoiser forwards dense. See the
+  [Skip-Softmax design](https://github.com/vllm-project/vllm-omni/blob/main/docs/design/feature/skip_softmax.md#timestep-gating)
+  for how the cutoff maps to steps.
+- A `per_role` entry that keeps the token refiner, a short attention path,
+  dense. A per-role spec does not inherit `quant` or `skip_softmax` from
+  `default`.
 
 ```bash
 --diffusion-attention-config '{
@@ -331,10 +372,13 @@ for it. The example enables the calibration-free Skip-Softmax path with
 }'
 ```
 
-For configuration details, see
-[TRTLLM_ATTN Backend and Skip-Softmax](https://github.com/vllm-project/vllm-omni/blob/main/docs/user_guide/diffusion/attention_backends.md#trtllm_attn-backend-and-skip-softmax)
+Both optimizations trade fidelity for speed and their effects compound.
+Compare against dense output on the same prompt and seed before adopting them.
+For the full key reference, see
+[Skip-Softmax](https://github.com/vllm-project/vllm-omni/blob/main/docs/user_guide/diffusion/attention_backends/trtllm.md#skip-softmax)
 and
-[TRTLLM_ATTN SAGE Quantization](https://github.com/vllm-project/vllm-omni/blob/main/docs/user_guide/diffusion/attention_backends.md#trtllm_attn-sage-quantization).
+[SAGE quantization](https://github.com/vllm-project/vllm-omni/blob/main/docs/user_guide/diffusion/attention_backends/trtllm.md#sage-quantization)
+in the TRTLLM attention guide.
 
 ### Text encoder tensor parallelism
 
@@ -463,10 +507,9 @@ Add this option to an existing H3 server command:
 
 Use the FL2VA-only partition for this capacity test. Loading the combined
 service would also load the Ref2VA DiT and would test a different memory
-budget. A no-offload capacity check should contain none of
-`--enable-cpu-offload`, `--enable-layerwise-offload`, or
-`--enable-distributed-layerwise-offload`. VAE tiling changes decode placement
-but does not offload model weights to the CPU.
+budget. A no-offload capacity check should omit
+`--diffusion-offload-config` and all legacy `--enable-*-offload` aliases. VAE
+tiling changes decode placement but does not offload model weights to the CPU.
 
 The run passes the capacity check when the server initializes, the request
 finishes without CUDA OOM or Xid errors, `peak_used_mib` remains below the
@@ -498,10 +541,11 @@ For example, keep the first main block's attention projections in BF16 with:
 ```
 
 The structured option replaces `--quantization fp8`. Online FP8 can be used
-with H3 layerwise offload and with both DLO transfer paths. The default
-AllGather path uses the ordinary loader to finalize FP8 weights and scales
-before sharding them across ranks. `--dlo-no-use-allgather` instead retains
-complete rank-local tensors and avoids the synchronized request-wave contract.
+with H3 layerwise offload and with either DiT DLO transfer. DiT `allgather`
+uses the ordinary loader to finalize FP8 weights and scales before sharding
+them across ranks. DiT `rank-local` instead retains complete loader-produced
+tensors and avoids the synchronized request-wave contract. H3's TP-sharded
+text encoder uses `rank-local`.
 
 ## AMD ROCm (gfx942 / gfx950)
 
@@ -546,6 +590,13 @@ vllm serve "${MODEL}" \
   --num-gpus 1 --enable-cpu-offload \
   --diffusion-attention-backend FLASH_ATTN
 ```
+
+This validated ROCm capacity recipe intentionally retains the compatibility
+full-topology alias because MiniMax-H3 also stages its VAEs on that path. The
+compact API in this release selects only `dit` and `text_encoder`, so replacing
+the flag would change residency rather than perform a mechanical migration.
+No removal deadline is assigned until the compact API offers equivalent
+component coverage.
 
 ### ROCm four GPUs
 
@@ -674,6 +725,9 @@ curl -sS -X POST "${API_URL}" \
 ### 3. Ref2VA: image-only, image/audio, or mixed references
 
 Run these requests against the combined service or a Ref2VA-only service.
+Reference images keep their original resolution, with dimensions aligned to
+32 pixels. No additional request or server setting is needed.
+
 Image-only Ref2VA omits `audio_reference`; adding one or more audio references
 is optional. The typed fields accept one object or an ordered JSON list.
 `audio_reference` accepts an HTTP(S) URL or a `data:` URL. In one terminal,
@@ -731,6 +785,9 @@ Run this request against the combined service. Repeat the
 `input_references` multipart field once per source video. H3 consumes the
 videos in form order and preserves their original soundtracks during
 conditioning.
+Small reference videos retain their original size; larger videos are scaled
+down to the reference canvas. Dimensions are aligned to 32 pixels. No
+additional request or server setting is needed.
 
 ```bash
 export SUBJECT_VIDEO=/path/to/green_screen_subject.mp4
@@ -774,7 +831,7 @@ at most 15 seconds combined.
 | FL2VA | first image, last image, or ordered first+last images | at most 2 images; `frame_indices` is `[0]`, `[-1]`, or `[0,-1]` |
 | Ref2VA | image-only, image+image, image+video, video+audio, and mixed image/video/audio | images ≤9, videos ≤3, audios ≤3, total references ≤12; audio requires a visual reference |
 
-The H3 output contract is 4–15 seconds at 24 FPS, stereo 32 kHz audio, and a
+The default H3 output contract is 4–15 seconds at 24 FPS, stereo 32 kHz audio, and a
 32-pixel canvas multiple. T2VA requires one named output ratio from `21:9`,
 `16:9`, `4:3`, `1:1`, `3:4`, or `9:16`. FL2VA always follows the first input
 image's ratio and ignores a generic `aspect_ratio` override. Ref2VA defaults to
@@ -784,6 +841,152 @@ default. `short_edge` controls the 768-pixel canvas and must be `768`.
 `seed + output_index`. The asynchronous endpoint returns all
 outputs; the synchronous raw-MP4 endpoint returns the first output when more
 than one is requested.
+
+## Long video and driving audio
+
+Set `extra_params.long_video=true` to opt into durations above 15 seconds.
+Ref2VA long-video requests now default to latent continuation with global
+temporal RoPE positions (A+B), described below. Set `long_video_mode=full`
+explicitly to sample the entire target latent at once for comparison. Both modes
+retain the native `17n+5` video-frame grid, `5n+2` video-latent grid, and 40 Hz
+audio latents. A request for 75 seconds becomes 1,807 frames (75.292 seconds at
+24 FPS). In full mode, attention cost and activation memory grow with the full
+sequence length. Reference-video and reference-audio limits remain unchanged.
+Other task types retain full-mode behavior. Requests are limited to 30 seconds
+in full mode and 300 seconds in continuation mode; without `long_video=true`,
+the limit remains 15 seconds. The limits cover duration aliases and explicit
+`num_frames`, and externally encoded requests are checked again before diffusion.
+Native frame-grid alignment can round the output slightly above the requested
+limit. These are request sanity bounds, not a guarantee that a given resolution
+fits GPU memory. Full mode still allocates the whole sequence, and continuation
+retains cumulative latents and reference inputs.
+
+Use `audio_mode=lock_source` with one `audio_reference` to drive generation
+with a soundtrack, rather than treating it as a short reference. The encoder
+places that waveform in the target audio latent, crops or zero-pads its two
+channels independently to the output duration, and keeps those rows clean
+(timestep 1) throughout sampling. This mode does not insert an `<Audio 1>`
+reference tag. It supports request and step execution; the default `native`
+mode continues generating audio normally. Returned audio is the audio VAE's
+reconstruction, not a byte-for-byte copy of the input recording.
+
+Against a Ref2VA server, using the same asset-server setup as above:
+
+```bash
+curl --fail-with-body -sS -X POST "${API_URL}" \
+  -F 'prompt=<prompt.txt' \
+  -F 'width=960' -F 'height=544' -F 'fps=24' \
+  -F 'num_inference_steps=50' -F 'flow_shift=12' -F 'seed=19960422' \
+  -F 'extra_params={"task":"ref2va","duration":75,"long_video":true,"audio_mode":"lock_source","audio_flow_shift":3,"preencode_mp4":true,"preencode_batch_frames":17}' \
+  -F "input_reference=@${REF_IMAGE};type=image/png" \
+  -F "audio_reference={\"audio_url\":\"${AUDIO_URL}\"}" \
+  -o long-video.mp4
+```
+
+`preencode_mp4` decodes and muxes temporal chunks on the worker, avoiding a
+full decoded long video in the API process. It does not reduce the denoiser's
+sequence length. For Turbo adapters, use the matching adapter's step count
+and flow shift from the Turbo table below.
+
+The [RunningHub workflow](https://www.runninghub.cn/post/2100530217365364737/)
+uses T8's `MiniMaxH3AudioConditioningT8`, a full-length latent, and
+`MiniMaxH3DualClockSamplerT8`; its `remix_source` strength is zero, equivalent
+to source locking. This differs from rolling-overlap continuation nodes.
+See [T8 conditioning](https://github.com/T8mars/comfyui-minimax-h3-audio-T8)
+and [ComfyUI H3 masking](https://github.com/Comfy-Org/ComfyUI/blob/master/comfy/ldm/minimax/model.py).
+The workflow's custom Dasiwa weights, Sol attention, and T8-specific LoRA are
+not supplied by this feature.
+
+### Latent-tail continuation with global temporal positions (A+B)
+
+`long_video=true` selects this mode by default for Ref2VA. It can also be selected
+explicitly with `long_video_mode=continuation`. This experimental mode supports
+Ref2VA request execution with uncached denoising (`quality=lossless`); step
+execution is rejected. Use `long_video_mode=full` explicitly for whole-target
+sampling, including requests up to 30 seconds that require step execution.
+Continuation currently rejects latent-mask editing (`video_noise_mask` or
+`audio_noise_mask` with retained source regions). Full mode supports editing;
+`audio_mode=lock_source` cannot be combined with audio latent-mask editing.
+
+```json
+{
+  "task": "ref2va",
+  "duration": 75,
+  "long_video": true,
+  "long_video_mode": "continuation",
+  "continuation_window_frames": 277,
+  "continuation_overlap_frames": 22,
+  "audio_mode": "lock_source",
+  "audio_flow_shift": 3,
+  "preencode_mp4": true,
+  "preencode_batch_frames": 17
+}
+```
+
+These defaults sample seven windows for a 1,807-frame output. Each continuation
+uses the preceding AV latent tail as fixed condition rows at the new target's
+time origin, samples a fresh unmasked target, discards its hidden overlap, and
+appends only the new suffix. The reference image and full prompt remain present
+in every window. Both window and overlap use the `17n+5` frame grid; the window
+must be 107..345 frames and larger than the overlap. A final window may be shorter.
+Audio boundaries are rounded on the cumulative 24 FPS / 40 Hz timeline to avoid
+drift; a locked driving track is sliced separately for each stereo channel.
+
+Before RoPE evaluation, every window adds `start_frame * 40 / 24` to the temporal
+position IDs of its target audio/video, reference audio/video, and latent-tail
+guides. The start includes the overlap (not just the newly appended frames).
+Text, static image references, spatial coordinates, and padding remain unchanged.
+Offsets retain fractional precision independently of rounded audio slice indices.
+For the default windows starting at frames 0, 255, 510, the added positions are
+0, 425, 850. This follows the media-only global-offset convention in
+[LongMedia temporal positioning](https://github.com/vizart-vj/ComfyUI-MiniMax-H3-LongMedia/blob/main/temporal_positioning.py).
+The shifted layout is constructed once per window and then used by all denoising
+steps and sequence-parallel ranks; no RoPE-frequency scaling is applied.
+
+For a narrative with different scenes, pass `continuation_prompts` as a JSON
+list containing exactly one non-empty prompt string per planned window (seven
+strings for the default 75-second request). These prompts are independently
+encoded with the same reference assets and selected in window order. Shot times
+inside each prompt describe that local window, including its hidden overlap.
+This option requires a local text encoder; external-encoder stage execution is
+not supported. Media positions use one shared origin after the longest encoded
+text prefix, so different prompt lengths do not shift the global AV clock.
+Without this list, the request's single prompt is reused as before.
+
+The cumulative latent is decoded once after all windows. Denoising memory is
+bounded by the window, while cumulative latent storage still grows with duration.
+This follows the [ComfyUI latent-tail continuation algorithm](https://github.com/ttulttul/ComfyUI-Minimax-H3-Continuation).
+Global positions can still exceed the model's trained temporal range. This
+mode does not guarantee seamless cuts or adherence to absolute shot timestamps in
+a repeated prompt. For comparison, keep the model, seed, prompt, source media,
+steps, shifts, and output size fixed, changing only `long_video_mode`.
+
+For a reproducible approximately 20-second comparison, use a request-mode
+Ref2VA server with caching disabled and the same `prompt.txt` and `REF_IMAGE`
+for both requests. Use a single prompt without `continuation_prompts` so that
+both modes receive identical text. The commands below generate native audio:
+
+```bash
+for mode in full continuation; do
+  curl --fail-with-body -sS --max-time 14400 "${API_URL}" \
+    -F 'prompt=<prompt.txt' \
+    -F "input_reference=@${REF_IMAGE};type=image/png" \
+    -F 'width=960' -F 'height=544' -F 'fps=24' \
+    -F 'num_inference_steps=50' -F 'flow_shift=12' -F 'seed=19960422' \
+    -F 'quality=lossless' \
+    -F "extra_params={\"task\":\"ref2va\",\"duration\":20,\"long_video\":true,\"long_video_mode\":\"${mode}\",\"audio_flow_shift\":3,\"preencode_mp4\":true}" \
+    -o "h3-20s-${mode}.mp4" || break
+done
+```
+
+Both outputs should contain 481 frames (20.042 seconds at 24 FPS).
+Continuation uses windows `[0,277)` and `[255,481)`; inspect frames 276/277
+(about 11.54 seconds) for visual and audio discontinuities. Compare the complete
+clips for motion, identity, prompt adherence, and sound, not just frame similarity:
+the trajectories differ by design. Report the tested commit, checkpoint, hardware,
+settings, and both videos with any comparison; the command alone is not quality
+evidence. A matching seed does not imply matching noise over differently sized
+full and windowed latents.
 
 ## Request-scoped quality
 
@@ -820,17 +1023,133 @@ balanced switch order.
 > workload. The values above apply to this deployment and are not universal
 > guarantees. `lossless` remains the exact reference path.
 
+## Exact AdaLN reuse
+
+H3 enables exact AdaLN projection reuse by default, independently of the task,
+hardware, sampling schedule, quantization setting, and request `quality`.
+This applies to both original H3 (including its default 50-point schedule) and
+FastH3; no distilled adapter or explicit few-step ladder is required.
+The first occurrence of an input runs the existing projection; later identical
+time embeddings reuse its output only while the projection weights and numerical
+settings remain unchanged. This does not approximate neighboring timesteps or
+change attention, precision, sampling, or the generated audio/video contract.
+
+Each DiT keeps at most 256 MiB of runtime projection outputs. If a long schedule
+exceeds that budget, it retains a reusable subset and computes other entries
+normally, avoiding cyclic eviction on repeated original-H3 requests. All original weights
+remain loaded so new schedules and adapters can compute normally. Adapter changes,
+weight reloads, and model device moves invalidate the cache; parameter versions
+also guard individual entries. TP ranks coordinate hits before skipping a
+projection collective. Gradient-enabled execution, compilation, custom linear
+hooks, and tensors without weight version counters use the original computation.
+Offload paths that replace weight storage can therefore reduce the hit rate.
+
+The runtime cache uses the shared `ExactProjectionCache` implementation; H3 keeps
+only its optional sidecar adaptation. Other models can integrate the same
+[projection cache interface](../../docs/design/module/diffusion/diffusion_model_integration.md#exact-conditioning-projection-reuse).
+This cache retains projection outputs, not offloaded weights, and does not skip
+block weight prefetch.
+
+For an A/B comparison, disable only this reuse at server startup:
+
+```bash
+--cache-config '{"minimax_h3_adaln_cache": false}'
+```
+
+### Optional offline sidecar
+
+An offline sidecar can seed the first projection results; it is not required to
+enable the default cache. Sidecars require `--enforce-eager`, native BF16 TP1
+math, and the same numerical environment as the builder. With the default
+compiled execution, sidecars are rejected before reading their payloads: compiled
+H3 blocks bypass cached projections, so retaining those payloads would waste GPU
+memory. This applies to both the main and Ref2VA sidecars. Other serving
+configurations retain the default runtime-cache behavior described above.
+From the repository root, for a fixed FastH3 adapter and its own four-step schedule:
+
+```bash
+PYTHONPATH=. python tools/minimax_h3/build_adaln_cache.py \
+  --transformer-path "${MODEL_ROOT}/FL2VA/transformer" \
+  --model-variant fl2va --mode t2va \
+  --fasth3-adapter "${FASTH3_ADAPTER}" \
+  --num-inference-steps 4 --flow-shift 12 --audio-flow-shift 3 \
+  --device cuda --output /path/to/h3-adaln.safetensors
+```
+
+Omit `--fasth3-adapter` for base weights and use the serving step count and shifts.
+The builder accepts a native transformer directory with `config.json` and indexed
+or single-file safetensors. It streams the required inputs and refuses to overwrite
+an existing output. It does not instantiate the full DiT.
+
+Pass the resulting local artifact at eager server startup:
+
+```bash
+--enforce-eager \
+--cache-config '{"minimax_h3_adaln_cache_path": "/path/to/h3-adaln.safetensors"}'
+```
+
+Combined servers can also use `minimax_h3_ref_adaln_cache_path` for their Ref2VA
+transformer. Each artifact binds the model architecture, task, schedule, shifts,
+fixed adapter file, effective time-embedding/AdaLN weights, payload checksums, and
+numerical environment. A missing, corrupt, incompatible, or outdated sidecar is
+rejected with a warning; the model still loads every weight and computes through
+the runtime path. A request with different settings similarly falls back.
+Build sidecars from trusted local inputs: checksums verify identity and integrity,
+not the correctness of an untrusted generator.
+
+This implementation saves repeated projection work. It does not remove AdaLN
+weights or claim a GPU memory reduction. End-to-end gains depend on the workload,
+offload behavior, embedding fingerprint cost, and TP coordination overhead.
+
 ## LoRA
 
 ### Turbo LoRA
 
-Only the native Diffusers 4-step FL2VA/T2VA v1.0 artifact is supported:
+The eight Diffusers-layout LightX2V Turbo artifacts are supported. The
+filename records the contract, so the server reads the step count, task family
+and flow shift from it and validates each request against the artifact that is
+loaded. It does not rewrite request or deploy-config sampling values: the
+request must carry that artifact's own settings, listed here, or it is
+rejected.
 
-```text
-lightx2v/Minimax-h3-Turbo/minimax_h3_fl2v_turbo_4step_v1.0_768p_bf16.safetensors
-```
+| Artifact | Task | Forwards | `num_inference_steps` | `flow_shift` | declared `alpha` |
+| --- | --- | ---: | ---: | ---: | ---: |
+| `minimax_h3_fl2v_turbo_4step_v0.1.safetensors` | T2VA / FL2VA | 4 | 5 | 12 | none -> 8 |
+| `minimax_h3_fl2v_turbo_4step_v1.0_768p_bf16.safetensors` | T2VA / FL2VA | 4 | 5 | 6 | 128 |
+| `minimax_h3_fl2v_turbo_4step_v1.1_768p_bf16.safetensors` | T2VA / FL2VA | 4 | 5 | 6 | 128 |
+| `minimax_h3_fl2v_turbo_4step_v1.2_768p_bf16.safetensors` | T2VA / FL2VA | 4 | 5 | 6 | 8 |
+| `minimax_h3_fl2v_turbo_8step_v1.0_bf16.safetensors` | T2VA / FL2VA | 8 | 9 | 12 | 8 |
+| `minimax_h3_fl2v_turbo_8step_v1.0_768p_bf16.safetensors` | T2VA / FL2VA | 8 | 9 | 6 | 8 |
+| `minimax_h3_ref2v_turbo_4step_v0.1_bf16.safetensors` | Ref2VA | 4 | 5 | 12 | 8 |
+| `minimax_h3_ref2v_turbo_8step_v1.0_768p_bf16.safetensors` | Ref2VA | 8 | 9 | 6 | 8 |
 
-Download only that file:
+`audio_flow_shift` is `3.0` across the family. Each row is the complete
+published filename; use it verbatim as `TURBO_FILE` below.
+
+Alpha needs no manual compensation: the server reads it from the artifact's
+metadata, falling back to 8 with a warning for
+`minimax_h3_fl2v_turbo_4step_v0.1`, the one artifact that declares none. The
+request-level `scale` is a further multiplier on top of it.
+
+> [!NOTE]
+> Every artifact is rank 128 and the delta is applied at `scale * alpha /
+> rank`, so the `alpha=8` rows drive at 1/16 the strength of the `alpha=128`
+> rows. 8 is the default of LightX2V's reference script, which never reads the
+> metadata; its documented `v0.1` command does not override that default.
+
+Every artifact except `minimax_h3_fl2v_turbo_4step_v0.1` also ships a
+`_comfyui_` export of the same weights. Those fuse Q/K/V into one projection
+and are **not** supported; downloading one is refused by name. Take the
+Diffusers file. The filename is the contract, so do not rename an artifact
+either -- a renamed file is rejected rather than served on a guess.
+
+FL2VA artifacts serve `t2va` and `fl2va` on any FL2VA or combined server.
+Ref2VA artifacts require
+`--task-type ref2va`: a combined server serves `ref2va` from a second DiT that
+the adapter cannot bind to, so loading one there is refused rather than silently
+running an undistilled model on the few-step schedule.
+
+Download the artifact you want:
 
 ```bash
 export TURBO_DIR=/path/to/minimax-h3-turbo
@@ -839,10 +1158,19 @@ hf download lightx2v/Minimax-h3-Turbo "${TURBO_FILE}" --local-dir "${TURBO_DIR}"
 export TURBO_LORA="${TURBO_DIR}/${TURBO_FILE}"
 ```
 
+`--lora-path` accepts one artifact, or a directory holding exactly one.
+
+> [!IMPORTANT]
+> This changes earlier behaviour. `--lora-path /path/to/minimax-h3-turbo`
+> pointing at a full clone of the Turbo repository used to select the v1.0 768p
+> file implicitly; a directory holding several recognized artifacts is now
+> rejected as ambiguous. Name the artifact instead:
+> `--lora-path /path/to/minimax-h3-turbo/minimax_h3_fl2v_turbo_4step_v1.0_768p_bf16.safetensors`.
+
 Start from a non-offloaded or DLO FL2VA server command and add
 `--task-type fl2va --lora-backend peft --lora-path "${TURBO_LORA}"`.
-`--lora-path` preloads the adapter; each request still activates it and uses
-the published sampling settings:
+`--lora-path` preloads the adapter; each request still activates it and must
+carry that artifact's sampling settings:
 
 ```bash
 -F 'num_inference_steps=5' \
@@ -851,14 +1179,224 @@ the published sampling settings:
 -F "lora={\"name\":\"h3-turbo-v1.0\",\"path\":\"${TURBO_LORA}\",\"scale\":1.0}"
 ```
 
-For FL2VA, change `task` and add `input_reference` as shown above. The 8-step,
-ComfyUI, Ref2VA, and v1.1 artifacts are not supported. This integration is
-dynamic-only and does not support prefusion or LoRA composition. DLO is
+Switching to another FL2VA artifact means repointing `TURBO_FILE`, which moves
+both `--lora-path` and the request's `lora.path`, and carrying that row's
+`num_inference_steps` and `flow_shift`: `9` and `6` for `8step_v1.0_768p`, `9`
+and `12` for the 544p `8step_v1.0`. A request that does not match the loaded
+artifact is rejected, so a mismatch cannot silently degrade output.
+
+The two `ref2v` rows are not served by this FL2VA command. Start a
+`--task-type ref2va` server, take a request from
+[Ref2VA](#3-ref2va-image-only-imageaudio-or-mixed-references) and override
+`num_inference_steps` and `flow_shift` with that row's values; those examples
+already send `audio_flow_shift=3.0`.
+
+For FL2VA, change `task` and add `input_reference` as shown above. This
+integration is dynamic-only and does not support prefusion or LoRA composition. DLO is
 supported by keeping the request-switchable LoRA A/B buffers resident on the
 accelerator while DLO streams only the base blocks; budget for this additional
 fixed HBM usage. Model-level and standard layerwise offload remain unsupported.
-The five requested sigma points produce the four denoiser evaluations expected
-by the Turbo artifact.
+The requested sigma points always number one more than the artifact's denoiser
+evaluations.
+
+### FlashGen native LoRA
+
+The FlashGen 4-step T2VA artifact uses the native MiniMax-H3 module layout and
+declares its distilled sigma schedule in safetensors metadata. It is published on
+[ModelScope](https://modelscope.cn/models/FlashGen/Minimax-H3-4step-lora-flashgen):
+
+```text
+FlashGen/Minimax-H3-4step-lora-flashgen/minimax_h3_t2va_flashgen_4step_v1.0_768p_bf16.safetensors
+```
+
+Download only that file:
+
+```bash
+python -m pip install modelscope
+export FLASHGEN_DIR=/path/to/minimax-h3-flashgen-lora
+export FLASHGEN_FILE=minimax_h3_t2va_flashgen_4step_v1.0_768p_bf16.safetensors
+modelscope download FlashGen/Minimax-H3-4step-lora-flashgen \
+  --local_dir "${FLASHGEN_DIR}" \
+  --include "${FLASHGEN_FILE}"
+export FLASHGEN_LORA="${FLASHGEN_DIR}/${FLASHGEN_FILE}"
+```
+
+Start from a non-offloaded or DLO FL2VA server command and add
+`--task-type fl2va --lora-backend peft --lora-path "${FLASHGEN_LORA}"`.
+Each request must use T2VA and the distilled interval-count contract:
+
+```bash
+-F 'num_inference_steps=4' \
+-F 'extra_params={"task":"t2va","duration":5.2}' \
+-F "lora={\"name\":\"h3-flashgen-v1.0\",\"path\":\"${FLASHGEN_LORA}\",\"scale\":1.0}"
+```
+
+This path rejects Ref2VA and checkpoints that already pin `base_schedule` in
+`model_index.json`. The adapter metadata carries
+`base_schedule=1.0,0.7,0.4,0.15,0.0`, so `num_inference_steps=4` means four
+denoiser evaluations, not five sigma points. Request-mode generation may omit
+the field and take the count from the adapter schedule; `--step-execution`
+requires it explicitly, because the step scheduler reads the total step count
+off the request at admission, before the adapter schedule is known.
+
+DLO is supported in request-mode generation on the same terms as the Turbo
+adapter: the request-switchable LoRA A/B buffers stay resident on the
+accelerator while DLO streams only the base blocks, so budget for that
+additional fixed HBM usage. The native artifact is rank 64 over 259 target
+modules, and its packed `qkv_proj` and `fc1` layers reuse the full-input A
+tensor per slice while B carries slice-local output rows, so the resident
+footprint exceeds the on-disk payload; measure it for your parallel layout
+rather than assuming the checkpoint size. Pure Ulysses replicates the adapter
+on every rank, while DiT tensor parallelism shards the B buffers. Model-level
+and standard layerwise offload remain unsupported, and `--step-execution`
+cannot be combined with `--enable-distributed-layerwise-offload`.
+
+To validate a deployment, post the same fixed-seed T2VA request twice with the
+adapter and twice without it, then compare the four output digests. The adapter
+is bound and deterministic when each pair matches internally and the two pairs
+differ from each other.
+
+### FastH3 adapter
+
+[FastH3](https://haoailab.com/blogs/fasth3-preview/) is FastVideo's four-step
+DMD2 student of H3-Base. It reuses H3's text encoder, VAEs, tokenizers, and
+schedulers unchanged, replacing 49 denoiser evaluations with four. It is fused
+into the checkpoint at load time rather than switched per request, because it
+carries full-rank deltas that no LoRA layer can express.
+
+The bundle publishes four variants, so download one and point `--lora-path` at
+it; the repository root is refused rather than guessed at:
+
+```bash
+export FASTH3_DIR=/path/to/fasth3
+hf download FastVideo/FastVideo-FastH3-4-step-Preview-v1-LoRA \
+  dense-datafree/adapter_model.safetensors --local-dir "${FASTH3_DIR}"
+export FASTH3_LORA="${FASTH3_DIR}/dense-datafree/adapter_model.safetensors"
+```
+
+Add `--task-type fl2va --lora-path "${FASTH3_LORA}"` to a non-offloaded server
+command. T2VA is served by the FL2VA partition, so `--task-type fl2va` is
+correct even though FastH3 preview v1 distills T2VA only. Because the adapter is
+fused, `--lora-backend` does not apply and a request carrying a `lora=` field is
+rejected rather than served without the adapter it asked for.
+
+```bash
+-F 'num_inference_steps=4' \
+-F 'extra_params={"task":"t2va","duration":4.4}'
+```
+
+Requests must ask for `num_inference_steps=4` and `task=t2va`: the release's five
+sigma points bound four denoiser evaluations, and that count is what the step
+scheduler admits a request on. The server denoises on the release's own ladder,
+keeping H3's per-modality shifts at the checkpoint values, so a request that
+overrides `flow_shift` or `audio_flow_shift` is rejected - it would sample the
+student at noise levels it was never distilled at.
+
+Only a release that identifies itself as FastH3 is fused; any other
+`fastvideo-lora-v2` adapter stays on the dynamic LoRA route. A claimed artifact
+is then held to its own metadata: one that misdeclares its tensor counts or
+leaves a transformer block unedited is refused at startup instead of serving
+mostly base H3 weights on a four-step schedule. Offload is refused for the same
+reason - `--enable-cpu-offload`, `--enable-layerwise-offload` and
+`--enable-distributed-layerwise-offload` all bypass the fusion, so they fail fast.
+
+The VSA variants are supported through FastVideo's external kernel. Install a
+`fastvideo-kernel` build that provides the `fastvideo_kernel` Python module,
+then add the following flags to the same command:
+
+```bash
+--diffusion-attention-backend FASTVIDEO_VSA \
+--fastvideo-vsa-topk 64
+```
+
+FastH3 VSA applies its learned `.set_weight` compression gates to the complete
+packed `[text | cond | audio | video]` document using the official H3 geometry:
+text/condition/audio prefix tiles never cross segment boundaries, and target
+video rows use `(4, 4, 4)` 3-D tiles (64 tokens). Prefix queries remain dense;
+video queries select all prefix tiles plus the configured top-k video tiles.
+Pure Ulysses sequence parallelism is supported: the learned gate follows the
+same sequence-to-head all-to-all as Q/K/V before VSA runs. Ring and all-gather
+SP remain unsupported because they do not present a complete packed sequence
+to each block-sparse kernel rank.
+
+The Dense / Data-Free variant does not require `fastvideo-kernel` and should be
+served with a dense attention backend.
+
+Measured on 8x NVIDIA B300 with USP8, VAE patch-parallel 8, `TRTLLM_ATTN`, at
+1344x768, 4.4 s, seed 1101, one warmup excluded and two runs recorded:
+
+| Adapter | Steps | End-to-end | Diffusion engine |
+| --- | ---: | ---: | ---: |
+| none (base H3) | 50 | 25.8 / 26.4 s | 16.22 / 16.28 s |
+| FastH3 Dense | 4 (5 sigma points) | 11.7 / 11.8 s | 2.37 / 2.36 s |
+
+The denoising speedup is 6.9x. End-to-end is 2.2x because text encoding, VAE
+decoding and muxing are a fixed cost that dominates a clip this short; longer
+generations move the end-to-end figure toward the denoising one. Fusing the
+adapter does not measurably change startup: weight loading took 77.3 s with it
+against 85.8 s without.
+
+### FastH3 8-Step V2 full checkpoint
+
+[FastH3 8-Step V2](https://huggingface.co/FastVideo/FastVideo-FastH3-8-Step-V2)
+ships a full Diffusers-format transformer, including learned VSA compression
+gates. Serve the Hugging Face model ID or a downloaded snapshot directly:
+
+```bash
+export FASTH3_V2_MODEL=FastVideo/FastVideo-FastH3-8-Step-V2
+```
+
+Use a Hugging Face account with access to the release, and pin `--revision`
+when reproducing a result. The existing component loader reads its safetensors
+shards; the H3 weight loader maps names and loads Q/K/V and MLP projections into
+native parameters in memory. No conversion command or second transformer
+checkpoint is needed.
+
+The transformer and text components come from the V2 release. To retain Omni's
+native tiled and parallel VAE execution, the loader fetches only the video/audio
+VAEs from the `MiniMaxAI/MiniMax-H3` revision pinned in V2's `provenance.json`.
+Those components use the normal Hugging Face cache. No separate base-model
+argument or full base-transformer download is required. Download time is a
+preparation cost, separate from warmup and request latency.
+
+Install the optional `fastvideo-kernel` build required by the
+`FASTVIDEO_VSA` backend, including its H3 block-map entry point. A four-GPU
+configuration is:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 vllm serve "${FASTH3_V2_MODEL}" --omni \
+  --host 127.0.0.1 --port 8095 --trust-remote-code --task-type fl2va \
+  --served-model-name FastH3-V2 \
+  --num-gpus 4 --usp 4 --ring 1 \
+  --vae-patch-parallel-size 4 --vae-parallel-mode tile --vae-use-tiling \
+  --diffusion-attention-backend FASTVIDEO_VSA
+
+curl --fail-with-body -sS http://127.0.0.1:8095/v1/videos/sync \
+  -F 'model=FastH3-V2' \
+  -F 'prompt=A red fox runs through fresh snow at dawn, with fast pawsteps, winter wind and distant birds.' \
+  -F 'width=1344' -F 'height=768' -F 'aspect_ratio=16:9' -F 'fps=24' \
+  -F 'num_inference_steps=8' -F 'guidance_scale=1' -F 'flow_shift=10' \
+  -F 'seed=1101' \
+  -F 'extra_params={"task":"t2va","duration":4.4,"audio_flow_shift":3.0}' \
+  -o fasth3_v2.mp4
+```
+
+V2 pins video/audio shifts **10/3**, guidance **1**, and the unshifted ladder
+`[0.999, 0.874, 0.749, 0.624, 0.5, 0.375, 0.25, 0.125, 0.0]`.
+Use **`num_inference_steps=8`** in Omni: these nine nodes bound eight model
+evaluations. FastVideo's `--steps 9` counts nodes instead. The existing H3 ODE
+update is reused without stochastic re-noising.
+
+The trained attention policy is **80% sparsity with 64-token video tiles**.
+Omni derives the number of selected video tiles from each request's geometry;
+do not supply a fixed `--fastvideo-vsa-topk`. Text/condition/audio prefix keys
+remain available to every query, and prefix queries remain dense. Missing VSA
+geometry or a failed H3 kernel raises an error instead of serving the student
+with dense attention.
+
+This release supports T2VA only, with local or pure Ulysses attention. Additional
+LoRA adapters, Ref2VA and FL2VA conditioning are unsupported. The legacy
+four-step adapter keeps its original sampling and fixed-top-k behavior.
 
 ## Key parameters
 
@@ -977,9 +1515,184 @@ vllm serve "${MODEL_ROOT}/FL2VA" \
   --cache-config '{"rel_l1_thresh":0.17}'
 ```
 
+## Latent super-resolution
+
+H3's video VAE is a ~5B-parameter model, so the usual way to raise output
+resolution -- decode, upscale in pixel space, re-encode -- pays for that VAE
+twice. The community
+[Minimax H3 latent upscaler](https://huggingface.co/LBH-123-AI/Minimax_h3_latent_Upscaler)
+is a learned 3D-convolutional resizer trained on H3's 24-channel latents: it
+runs between the denoise loop and the VAE, so the clip is decoded once, at the
+larger size. Unlike bilinear or bicubic interpolation of a latent, it does not
+introduce ghosting or double-image artifacts.
+
+The network runs one normalization below the pipeline latent: an H3 latent in
+vLLM-Omni is already normalized, and the upscaler was trained on that tensor
+normalized again by the VAE's `latents_mean` / `latents_std`. The stage applies
+and undoes that itself, so nothing about a request changes -- but a port that
+skips it inflates the latent about 5x and decodes as a magenta grid at one tile
+per latent cell.
+
+The checkpoint is optional and is not part of the H3 release. Download one file
+from that repository (`minimax_h3_latent_upscaler_3d_bf16.safetensors`, 691 MB)
+and name it at startup:
+
+```bash
+vllm serve "${MODEL_ROOT}/FL2VA" \
+  --omni \
+  --trust-remote-code \
+  --additional-config '{"latent_upscaler_path":"/models/minimax_h3_latent_upscaler_3d_bf16.safetensors"}'
+```
+
+A request then asks for a size. The three modes are mutually exclusive and all
+resolve to the same 16-pixel latent grid, so the three requests below are the
+same 960x544 -> 1920x1088 upscale:
+
+```bash
+curl -sS -X POST "${API_URL}" \
+  -F 'prompt=...' \
+  -F 'width=960' -F 'height=544' -F 'fps=24' \
+  -F 'extra_params={"task":"t2va","duration":8.7,"latent_upscale":2.0}' \
+  -o t2va_1080p.mp4
+
+# or name the output size in pixels
+#   "latent_upscale":{"width":1920,"height":1088}
+# or name a pixel budget and keep the aspect ratio
+#   "latent_upscale":{"megapixels":2.0}
+```
+
+Over HTTP the field is `extra_params`: the videos request model declares that
+name and nothing else, so an `extra_args` form field is dropped without an
+error and the request silently returns the un-upscaled size. Offline, the same
+value goes in `extra_args`:
+
+```python
+omni = Omni(
+    model=os.path.join(os.environ["MODEL_ROOT"], "FL2VA"),
+    trust_remote_code=True,
+    additional_config={"latent_upscaler_path": "/models/minimax_h3_latent_upscaler_3d_bf16.safetensors"},
+)
+outputs = omni.generate(
+    "A quiet cinematic night scene with matching ambient sound.",
+    OmniDiffusionSamplingParams(
+        height=544,
+        width=960,
+        fps=24,
+        num_inference_steps=50,
+        seed=42,
+        extra_args={"task": "t2va", "duration": 8.7, "latent_upscale": 2.0},
+    ),
+)
+```
+
+### The hi-res route: generate small, refine large
+
+Upscaling alone decodes the enlarged latent directly, which is fast but can
+only interpolate detail the first pass never generated. Adding `latent_refine`
+resumes the denoise schedule at the new size, so the DiT puts real detail back:
+
+1. generate at a cheap size -- far fewer DiT tokens,
+2. upscale the latent,
+3. re-noise it and run the tail of the schedule at the target size.
+
+```bash
+curl -sS -X POST "${API_URL}" \
+  -F 'prompt=...' \
+  -F 'width=960' -F 'height=544' -F 'fps=24' \
+  -F 'num_inference_steps=50' \
+  -F 'extra_params={"task":"t2va","duration":8.7,"latent_upscale":2.0,"latent_refine":0.4}' \
+  -o t2va_1080p.mp4
+```
+
+`latent_refine` is the fraction of the request's steps the second pass re-runs,
+the img2img convention, so it sets both how much the pass may change and what
+it costs: `0.4` of `num_inference_steps=50` is 50 cheap steps followed by 20
+expensive ones. Low values stay close to the first pass and mostly sharpen;
+high values re-generate and may drift from it. `1.0` re-runs the whole schedule
+from noise, which discards the first pass entirely.
+
+Detail does not keep climbing with strength. Measured on a 15s 2688x1536 clip,
+six frames apart, against the same seed and prompt: 0.5 returned 0.98x the
+high-frequency energy of 0.35 and 0.65 returned 0.92x, while the mean per-pixel
+drift from the 0.35 result rose from 6.3 to 12.6 (0-255). What caps detail is
+what the DiT can resolve at the target size, not how noisy a start it is given;
+past that, a higher strength only erases more of the first pass and re-imagines
+it from less. On this checkpoint 0.35 was the best of the three -- treat higher
+values as "re-generate", not as "sharpen".
+
+Why this is faster than generating at the target size: the DiT cost follows the
+video token count, which is quadratic in the latent area for attention. The
+example above is 31,620 video tokens at 960x544 against 126,480 at 1920x1088 --
+4x the tokens, so roughly 4x the linear cost and up to 16x the attention cost
+per step. Paying that on 20 steps instead of 50 is where the saving comes from.
+The gain therefore depends on the resolutions, the strength, and how
+attention-bound the shape is; measure it on your own workload.
+
+Audio is re-noised and refined alongside the video at the same schedule
+position. The two modalities are shifted apart (`flow_shift` 12.0 against
+`audio_flow_shift` 3.0), so each resumes at its own sigma for that position --
+the state the first pass actually passed through, which is what keeps the pass
+in distribution.
+
+`latent_refine` works without `latent_upscale` too, as a plain detail pass at
+the generated size. For FL2VA, the keyframe condition is pinned to the output
+latent size, so a refine after an upscale re-encodes the keyframes from the
+originals at the new size; REF2VA references carry their own shapes and are
+reused as they are.
+
+### Options
+
+| `--additional-config` key | Default | Meaning |
+| --- | --- | --- |
+| `latent_upscaler_path` | unset | Checkpoint file, or a directory holding exactly one. Unset disables the stage and loads no extra weights. |
+| `latent_upscaler_dtype` | the engine dtype | `bf16`, `fp16` or `fp32`. |
+| `latent_upscaler_chunk_frames` | `0` | `0` runs the whole clip in one pass; a positive value bounds activation memory with approximate temporal chunking. |
+| `latent_upscaler_resident` | `false` | Keep the ~700 MB of weights on the GPU between requests instead of in host memory. |
+| `latent_refine_max_tokens_per_rank` | `65536` | Reject larger refine layouts before denoising. Set `0` only after validating a larger deployment. |
+| `latent_upscale` | unset | A default target applied to every request, in the request's own format. A request overrides it, and `false` opts out. |
+| `latent_refine` | unset | A default refine strength applied to every request. A request overrides it, and `false` opts out. |
+
+The `latent_upscale` request value is a multiplier (`2.0`), `false`, or an
+object naming one mode: `{"scale": 2.0}`, `{"width": …, "height": …}` or
+`{"megapixels": …}`, each accepting an `align` (default `32` pixels). The
+checkpoint was trained between 1.0x and 4.0x and only upscales; a smaller
+target is rejected, and `scale` 1.0 is a no-op that skips the stage. The
+`latent_refine` value is a strength in `(0, 1]`, `false`, or
+`{"strength": 0.4}`; it needs no checkpoint of its own.
+
+When `latent_refine` is enabled, both resolved output dimensions must be
+divisible by 32 pixels for the DiT's spatial patches. A custom `align` that
+produces an incompatible target is rejected before denoising; upscale-only
+requests can still use the VAE's 16-pixel grid. Numeric upscale fields must be
+positive and finite, and `width`, `height`, and `align` must be integers.
+
+Temporal chunking can bound activation memory on long clips -- a 15-second clip is
+102 latent frames, more than three 32-frame chunks. It is an approximation rather than a
+partition: the network's GroupNorms pool statistics over whatever clip they are
+handed, so a chunked pass can differ from a single pass across the whole output
+and not only at the chunk seams. How much that costs in practice was not
+measured here; the default single pass buys the exact result for the
+memory a full-length activation volume takes (10.1 GiB against 5.6 GiB at
+2688x1536 for 15 seconds, measured on one B300). Set
+`latent_upscaler_chunk_frames: 32` explicitly if that memory cost is too high.
+
 ## Known limitations
 
 - TeaCache is calibrated for FL2VA only; Ref2VA requests run uncached.
+- The latent upscaler is a community checkpoint, not part of the H3 release,
+  and is unavailable unless `latent_upscaler_path` names one. It runs
+  replicated on every DiT rank rather than sharded.
+- `latent_refine` is request-mode only. It is a second denoise loop with its
+  own resolution and its own truncated schedule, and the step contract carries
+  one schedule per request, so step execution rejects it. `latent_upscale`
+  without `latent_refine` works in both modes.
+- Large refine layouts can abort workers with `CUDA error: an illegal memory
+  access was encountered`. On B300, observed video token counts of 54,144 per
+  rank complete while 108,288 and 109,360 abort. The preflight limit of 65,536
+  counts the full padded layout, including text, audio, and visual references,
+  per Ulysses rank. It rejects the observed failing sizes before the base pass.
+  This is an empirical B300 guard, not a proven kernel limit on every device;
+  deployments with different hardware can adjust the limit after validation.
 - Combined serving requires sibling `FL2VA` and `Ref2VA` directories, loads
   both task-specific DiTs, and loads shared components once from `FL2VA`.
 - Request mode executes one generation request per diffusion batch. Use
@@ -990,25 +1703,21 @@ vllm serve "${MODEL_ROOT}/FL2VA" \
   mode does not support `cache_backend`.
 - The first regional-compile request is a warmup and should not be included in
   steady-state performance measurements.
-- The serving path accepts fewer references than the model supports. H3 documents up
-  to 9 images, 3 video clips, and 3 audio clips (12 files) per Omni Reference
-  request; the current vLLM-Omni path takes exactly one image plus one audio
-  reference, or one or more videos with no separate `audio_reference` (it uses the
-  source soundtracks).
+- Ref2VA accepts up to 9 images, 3 video clips, and 3 audio clips, with at most
+  12 references in total. At least one image or video is required; audio-only
+  requests are rejected.
 - The 768 px short-edge mode is available for T2VA and FL2VA; 1344x768 is the
   documented 16:9 request shape.
 - `--cfg-parallel-size > 1` is rejected by design (CFG-distilled, no negative branch).
 - VAE patch parallelism requires size 1 or the full DiT group size and supports the
   H3 native `tile` mode only.
-- A U2 x Ring2 hybrid currently fails with an attention-mask length mismatch; use
-  pure Ulysses.
+- Ulysses x Ring hybrid attention supports H3's single-request contiguous suffix
+  padding. Arbitrary attention masks and multi-request packed batches remain
+  unsupported on the Ring path.
 - Online FP8 with DLO AllGather temporarily materializes the complete FP8 model
   in host memory on every rank during startup before retaining only each rank's
   shard. Size startup host memory for that transient peak.
 - TeaCache and Cache-DiT cannot be enabled on the same server.
-- Image+audio Ref2VA accepts exactly one image and one audio reference.
-- Video Ref2VA accepts one or more video files, but not an additional standalone
-  audio reference.
 - Pure Ulysses still replicates the full DiT on every rank, so smaller-memory GPUs
   cannot use `--usp N --tp 1` as a resident capacity path. Use DiT tensor parallelism
   or model-level CPU offload; text-encoder TP alone is not sufficient.

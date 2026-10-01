@@ -1,4 +1,8 @@
-"""Top-level package for comfyui_vllm_omni."""  # noqa: N999  # This is not a python library intended to be imported
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+# ruff: noqa: N999
+
+"""Top-level package for comfyui_vllm_omni."""  # This is not a Python library intended to be imported.
 
 __all__ = [
     "NODE_CLASS_MAPPINGS",
@@ -13,9 +17,13 @@ __version__ = "0.0.1"
 from .comfyui_vllm_omni.nodes import (
     VLLMOmniARSampling,
     VLLMOmniDiffusionSampling,
+    VLLMOmniFastH3Deployment,
     VLLMOmniGenerateImage,
+    VLLMOmniGenerateMusic,
     VLLMOmniGenerateVideo,
+    VLLMOmniLatentMaskEditing,
     VLLMOmniMiniMaxH3Params,
+    VLLMOmniMiniMaxH3TemporalMask,
     VLLMOmniQwenTTSParams,
     VLLMOmniRemoteLoRA,
     VLLMOmniSamplingParamsList,
@@ -28,18 +36,22 @@ from .comfyui_vllm_omni.nodes import (
 
 # A dictionary that contains all nodes you want to export with their names
 NODE_CLASS_MAPPINGS = {
+    "VLLMOmniMiniMaxH3TemporalMask": VLLMOmniMiniMaxH3TemporalMask,
     # === Generation ===
     "VLLMOmniGenerateImage": VLLMOmniGenerateImage,
     "VLLMOmniGenerateVideo": VLLMOmniGenerateVideo,
     "VLLMOmniUnderstanding": VLLMOmniUnderstanding,
     "VLLMOmniTTS": VLLMOmniTTS,
+    "VLLMOmniGenerateMusic": VLLMOmniGenerateMusic,
     "VLLMOmniVoiceClone": VLLMOmniVoiceClone,
     "VLLMOmniVideoReferences": VLLMOmniVideoReferences,
+    "VLLMOmniLatentMaskEditing": VLLMOmniLatentMaskEditing,
     # === Params ===
     "VLLMOmniARSampling": VLLMOmniARSampling,
     "VLLMOmniDiffusionSampling": VLLMOmniDiffusionSampling,
     "VLLMOmniSamplingParamsList": VLLMOmniSamplingParamsList,
     "VLLMOmniRemoteLoRA": VLLMOmniRemoteLoRA,
+    "VLLMOmniFastH3Deployment": VLLMOmniFastH3Deployment,
     "VLLMOmniQwenTTSParams": VLLMOmniQwenTTSParams,
     "VLLMOmniWanParams": VLLMOmniWanParams,
     "VLLMOmniMiniMaxH3Params": VLLMOmniMiniMaxH3Params,
@@ -47,18 +59,22 @@ NODE_CLASS_MAPPINGS = {
 
 # A dictionary that contains the friendly/humanly readable titles for the nodes
 NODE_DISPLAY_NAME_MAPPINGS = {
+    "VLLMOmniMiniMaxH3TemporalMask": "MiniMax-H3 Temporal Mask",
     # === Generation ===
     "VLLMOmniGenerateImage": "Generate Image",
     "VLLMOmniGenerateVideo": "Generate Video",
     "VLLMOmniUnderstanding": "Multimodality Understanding",
     "VLLMOmniTTS": "TTS (Text to Speech)",
+    "VLLMOmniGenerateMusic": "Generate Music",
     "VLLMOmniVoiceClone": "TTS Voice Cloning",
     "VLLMOmniVideoReferences": "Video References",
+    "VLLMOmniLatentMaskEditing": "Latent Mask Editing",
     # === Params ===
     "VLLMOmniARSampling": "AR Sampling Params",
     "VLLMOmniDiffusionSampling": "Diffusion Sampling Params",
     "VLLMOmniSamplingParamsList": "Multi-Stage Sampling Params List",
     "VLLMOmniRemoteLoRA": "LoRA",
+    "VLLMOmniFastH3Deployment": "FastH3 Deployment",
     "VLLMOmniQwenTTSParams": "Qwen TTS Params",
     "VLLMOmniWanParams": "Wan Video Params",
     "VLLMOmniMiniMaxH3Params": "MiniMax-H3 Video Params",

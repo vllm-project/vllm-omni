@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Unit tests for the MiniCPM-o 4.5 stage 0 -> stage 1 bridge.
 
 Covers ``vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni.llm2tts``:
@@ -9,7 +9,7 @@ Covers ``vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni.llm2t
   - both inputs missing -> raises
   - structured model_intermediate_buffer carries the thinker ids and text
   - scheduler prompt tokens follow the selected TTS region or output tokens
-  - MiniCPM-o 4.5 TTS region detection on 151703 / 151704 tokens
+  - MiniCPM-o 4.5 TTS region detection on 151703 / 151704 / 151645 tokens
   - plain chat without TTS markers conditions on the generated assistant span
   - prompt arg is normalized to a list and ``multi_modal_data`` is gated by
     ``requires_multimodal_data``
@@ -25,6 +25,7 @@ import torch
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import (
     MiniCPMO45OmniForConditionalGeneration,
 )
+from vllm_omni.model_executor.models.minicpmo_4_5.pipeline import MINICPMO45_REFERENCE_AUDIO_KEY
 from vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni import llm2tts
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -259,13 +260,14 @@ class TestTtsRegionDetection:
         )
         return result[0]["model_intermediate_buffer"], hidden
 
-    def test_4_5_markers_detected(self) -> None:
+    @pytest.mark.parametrize("tts_end_id", [151704, 151645])
+    def test_4_5_markers_detected(self, tts_end_id: int) -> None:
         # prompt:        [10, 11]
-        # output:        [151703, 30, 31, 151704, 40]
-        # full sequence: [10, 11, 151703, 30, 31, 151704, 40]
+        # output:        [151703, 30, 31, end, 40]
+        # full sequence: [10, 11, 151703, 30, 31, end, 40]
         #                  0   1     2    3   4     5     6
-        # 4.5 BOS at idx 2 -> slice starts at 3; EOS at idx 5 -> slice ends at 5.
-        buffer, hidden = self._run([10, 11], [151703, 30, 31, 151704, 40])
+        # 4.5 BOS at idx 2 -> slice starts at 3; end at idx 5 -> slice ends at 5.
+        buffer, hidden = self._run([10, 11], [151703, 30, 31, tts_end_id, 40])
         assert buffer["ids"]["tts"] == [30, 31]
         assert torch.equal(torch.tensor(buffer["hidden_states"]["tts"]), hidden[3:5])
 
@@ -312,6 +314,44 @@ class TestPromptAndMultiModal:
             requires_multimodal_data=True,
         )
         assert out[0]["multi_modal_data"] == mm
+
+    def test_reference_audio_is_added_to_stage_handoff(self) -> None:
+        hidden_states = torch.zeros((2, _HIDDEN_DIM))
+        waveform = torch.tensor([0.25, -0.5], dtype=torch.float32)
+
+        stage_outputs = llm2tts(
+            [_make_thinker_output(prompt_token_ids=[10], output_token_ids=[20], hidden_states=hidden_states)],
+            prompt={"multi_modal_data": {"audio": (waveform, 16000)}},
+        )
+
+        intermediate_buffer = stage_outputs[0]["model_intermediate_buffer"]
+        assert intermediate_buffer["codes"]["ref"] == [0.25, -0.5]
+        assert intermediate_buffer["meta"]["ref_audio_sr"] == 16000
+
+    def test_serving_reference_audio_is_added_to_stage_handoff(self) -> None:
+        hidden_states = torch.zeros((2, _HIDDEN_DIM))
+        waveform = torch.tensor([0.125, -0.25], dtype=torch.float32)
+
+        stage_outputs = llm2tts(
+            [_make_thinker_output(prompt_token_ids=[10], output_token_ids=[20], hidden_states=hidden_states)],
+            prompt={MINICPMO45_REFERENCE_AUDIO_KEY: (waveform, 24000)},
+        )
+
+        intermediate_buffer = stage_outputs[0]["model_intermediate_buffer"]
+        assert intermediate_buffer["codes"]["ref"] == [0.125, -0.25]
+        assert intermediate_buffer["meta"]["ref_audio_sr"] == 24000
+
+    def test_missing_reference_audio_does_not_add_stage_handoff_fields(self) -> None:
+        hidden_states = torch.zeros((2, _HIDDEN_DIM))
+
+        stage_outputs = llm2tts(
+            [_make_thinker_output(prompt_token_ids=[10], output_token_ids=[20], hidden_states=hidden_states)],
+            prompt={"multi_modal_data": {}},
+        )
+
+        intermediate_buffer = stage_outputs[0]["model_intermediate_buffer"]
+        assert "codes" not in intermediate_buffer
+        assert "ref_audio_sr" not in intermediate_buffer.get("meta", {})
 
     def test_internal_streaming_context_is_accepted(self) -> None:
         hidden = torch.zeros((2, _HIDDEN_DIM))

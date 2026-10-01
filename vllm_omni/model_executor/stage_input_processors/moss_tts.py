@@ -14,6 +14,10 @@ from vllm.inputs import TokensPrompt as OmniTokensPrompt
 from vllm.logger import init_logger
 
 from vllm_omni.data_entry_keys import CodesStruct, MetaStruct, OmniPayloadStruct
+from vllm_omni.model_executor.stage_input_processors.chunk_size_utils import (
+    parse_chunk_ramp,
+    ramp_chunk_size,
+)
 
 logger = init_logger(__name__)
 
@@ -284,8 +288,21 @@ def talker2codec_raw_async_chunk(
         initial_chunk_frames = chunk_frames
 
     pending = len(pending_frames)
-    emitted_any = int(transfer_manager.put_req_chunk.get(req_id, 0)) > 0
-    threshold = initial_chunk_frames if initial_chunk_frames > 0 and not emitted_any else chunk_frames
+    # codec_chunk_ramp (opt-in): static ladder of chunk sizes replacing the
+    # initial_codec_chunk_frames -> codec_chunk_frames cliff. The chunk index
+    # is maintained by the connector (ramp_chunk_count, incremented per
+    # emitted chunk); past the ladder, ramp_chunk_size falls back to steady.
+    if not hasattr(transfer_manager, "_moss_ramp_parsed"):
+        transfer_manager._moss_ramp_parsed = parse_chunk_ramp(cfg, steady=chunk_frames)
+    _ramp = transfer_manager._moss_ramp_parsed
+    if _ramp is not None:
+        if not hasattr(transfer_manager, "ramp_chunk_count"):
+            transfer_manager.ramp_chunk_count = defaultdict(int)
+        _chunk_idx = int(transfer_manager.ramp_chunk_count.get(req_id, 0))
+        threshold = ramp_chunk_size(_chunk_idx, _ramp, chunk_frames)
+    else:
+        emitted_any = int(transfer_manager.put_req_chunk.get(req_id, 0)) > 0
+        threshold = initial_chunk_frames if initial_chunk_frames > 0 and not emitted_any else chunk_frames
     if pending <= 0:
         if is_finished:
             transfer_manager.code_prompt_token_ids.pop(req_id, None)

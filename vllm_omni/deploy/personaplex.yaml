@@ -12,6 +12,10 @@
 #     8 active codebooks (cb 0..7) -> 1920 PCM samples @ 24 kHz / 12.5 Hz.
 #   * Stage 0 runs cudagraph by default; Stage 1 (Mimi) is eager because the
 #     external decoder performs host-to-device copies that cannot be captured.
+#   * Each live session holds one 3000-frame KV window (~1.5 GiB) on Stage 0.
+#     To serve more sessions, raise duplex_session.max_sessions and both stages'
+#     max_num_seqs together, and size Stage 0 gpu_memory_utilization for the KV;
+#     on a 141 GB card, 16 sessions at Stage 0 utilization 0.75 stay realtime.
 pipeline: personaplex
 session_mode: duplex
 duplex_session:
@@ -23,14 +27,9 @@ connectors:
   connector_of_shared_memory:
     name: SharedMemoryConnector
     extra:
-      shm_threshold_bytes: 65536
       codec_streaming: true
-      connector_get_sleep_s: 0.01
-      connector_get_max_wait_first_chunk: 3000
-      connector_get_max_wait: 300
       # Mimi runs at 12.5 Hz (80 ms / frame). Stream a few frames per chunk.
       codec_chunk_frames: 5
-      codec_left_context_frames: 10
       # Emit only the first audio chunk early, then return to codec_chunk_frames.
       initial_codec_chunk_frames: 1
 
@@ -43,7 +42,12 @@ stages:
     # Prompt IDs are placeholders; voice/persona/audio semantics live in
     # request-specific embeddings, so token-ID prefix caching is invalid.
     enable_prefix_caching: false
-    async_scheduling: true
+    # Every live session appends one frame per 80 ms tick as a one-token
+    # resumable request. With async scheduling the next step is scheduled
+    # before a session's previous frame is parked, so a session can join only
+    # every other step and concurrent sessions split into alternating batches.
+    # Synchronous scheduling puts every waiting frame in one step.
+    async_scheduling: false
     max_num_batched_tokens: 512
     # Temporal transformer sliding_window is 3000 frames; keep model len within.
     max_model_len: 3000

@@ -5,7 +5,7 @@
       {
         "hardware_marks": {
           "res": {
-            "cuda": "H100",
+            "cuda": ["H100", "B200"],
             "npu": "A3"
           },
           "num_cards": 2
@@ -46,11 +46,13 @@
         "percentile-metrics": "ttft,tpot,itl,e2el,audio_rtf,audio_ttfp,audio_duration",
         "baseline": {
           "H100": {
-            "mean_e2el_ms": [
-              3646.797
-            ],
             "mean_audio_rtf": [
               0.1098
+            ]
+          },
+          "A3": {
+            "mean_audio_rtf": [
+              0.7014
             ]
           }
         }
@@ -82,11 +84,13 @@
         "percentile-metrics": "ttft,tpot,itl,e2el,audio_rtf,audio_ttfp,audio_duration",
         "baseline": {
           "H100": {
-            "mean_e2el_ms": [
-              4059.0878
-            ],
             "mean_audio_rtf": [
               0.1335
+            ]
+          },
+          "A3": {
+            "mean_audio_rtf": [
+              1.2352
             ]
           }
         }
@@ -120,11 +124,13 @@
         "percentile-metrics": "ttft,tpot,itl,e2el,audio_rtf,audio_ttfp,audio_duration",
         "baseline": {
           "H100": {
-            "mean_e2el_ms": [
-              5639.5769
-            ],
             "mean_audio_rtf": [
               0.1798
+            ]
+          },
+          "A3": {
+            "mean_audio_rtf": [
+              2.5023
             ]
           }
         }
@@ -161,6 +167,11 @@
           "H100": {
             "mean_e2el_ms": [
               756.8415
+            ]
+          },
+          "A3": {
+            "mean_e2el_ms": [
+              2436.1048
             ]
           }
         }
@@ -199,6 +210,11 @@
           "H100": {
             "mean_e2el_ms": [
               694.9777
+            ]
+          },
+          "A3": {
+            "mean_e2el_ms": [
+              2534.4575
             ]
           }
         }
@@ -240,6 +256,11 @@
             "mean_e2el_ms": [
               1006.1663
             ]
+          },
+          "A3": {
+            "mean_e2el_ms": [
+              3460.0385
+            ]
           }
         }
       }
@@ -251,7 +272,7 @@
       {
         "hardware_marks": {
           "res": {
-            "cuda": "H100"
+            "cuda": ["H100", "B200"]
           },
           "num_cards": 2
         }

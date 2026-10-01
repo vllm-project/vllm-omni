@@ -1,0 +1,560 @@
+{
+  "last_node_id": 9,
+  "last_link_id": 7,
+  "nodes": [
+    {
+      "id": 2,
+      "type": "LoadVideo",
+      "pos": [
+        40,
+        100
+      ],
+      "size": [
+        420,
+        120
+      ],
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "file",
+          "type": "STRING",
+          "widget": {
+            "name": "file"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "name": "video",
+          "type": "VIDEO",
+          "links": [
+            1
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "LoadVideo"
+      },
+      "widgets_values": [
+        ""
+      ]
+    },
+    {
+      "id": 3,
+      "type": "SolidMask",
+      "pos": [
+        40,
+        300
+      ],
+      "size": [
+        420,
+        160
+      ],
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "value",
+          "type": "FLOAT",
+          "widget": {
+            "name": "value"
+          },
+          "link": null
+        },
+        {
+          "name": "width",
+          "type": "INT",
+          "widget": {
+            "name": "width"
+          },
+          "link": null
+        },
+        {
+          "name": "height",
+          "type": "INT",
+          "widget": {
+            "name": "height"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "name": "mask",
+          "type": "MASK",
+          "links": [
+            2
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "SolidMask"
+      },
+      "widgets_values": [
+        0.0,
+        160,
+        120
+      ]
+    },
+    {
+      "id": 4,
+      "type": "SolidMask",
+      "pos": [
+        40,
+        500
+      ],
+      "size": [
+        420,
+        160
+      ],
+      "flags": {},
+      "order": 3,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "value",
+          "type": "FLOAT",
+          "widget": {
+            "name": "value"
+          },
+          "link": null
+        },
+        {
+          "name": "width",
+          "type": "INT",
+          "widget": {
+            "name": "width"
+          },
+          "link": null
+        },
+        {
+          "name": "height",
+          "type": "INT",
+          "widget": {
+            "name": "height"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "name": "mask",
+          "type": "MASK",
+          "links": [
+            3
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "SolidMask"
+      },
+      "widgets_values": [
+        1.0,
+        160,
+        120
+      ]
+    },
+    {
+      "id": 5,
+      "type": "BatchMasksNode",
+      "pos": [
+        250,
+        380
+      ],
+      "size": [
+        200,
+        100
+      ],
+      "flags": {},
+      "order": 4,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "masks.mask0",
+          "type": "MASK",
+          "link": 2,
+          "slot_index": 0
+        },
+        {
+          "name": "masks.mask1",
+          "type": "MASK",
+          "link": 3,
+          "slot_index": 1
+        }
+      ],
+      "outputs": [
+        {
+          "name": "MASK",
+          "type": "MASK",
+          "links": [
+            4
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "BatchMasksNode"
+      },
+      "widgets_values": []
+    },
+    {
+      "id": 6,
+      "type": "VLLMOmniLatentMaskEditing",
+      "pos": [
+        450,
+        180
+      ],
+      "size": [
+        400,
+        120
+      ],
+      "flags": {},
+      "order": 5,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "source_video",
+          "type": "VIDEO",
+          "link": 1
+        },
+        {
+          "name": "source_audio",
+          "type": "AUDIO",
+          "link": null
+        },
+        {
+          "name": "video_mask",
+          "type": "MASK",
+          "link": 4
+        },
+        {
+          "name": "audio_mask",
+          "type": "FLOAT",
+          "widget": {
+            "name": "audio_mask"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "name": "latent_edit",
+          "type": "LATENT_MASK_EDITING",
+          "links": [
+            5
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "VLLMOmniLatentMaskEditing"
+      },
+      "widgets_values": [
+        -1.0
+      ]
+    },
+    {
+      "id": 7,
+      "type": "VLLMOmniMiniMaxH3Params",
+      "pos": [
+        40,
+        700
+      ],
+      "size": [
+        420,
+        160
+      ],
+      "flags": {},
+      "order": 6,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "audio_flow_shift",
+          "type": "FLOAT",
+          "widget": {
+            "name": "audio_flow_shift"
+          },
+          "link": null
+        },
+        {
+          "name": "flow_shift",
+          "type": "FLOAT",
+          "widget": {
+            "name": "flow_shift"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "name": "video params",
+          "type": "VIDEO_PARAMS",
+          "links": [
+            6
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "VLLMOmniMiniMaxH3Params"
+      },
+      "widgets_values": [
+        3.0,
+        12.0
+      ]
+    },
+    {
+      "id": 8,
+      "type": "VLLMOmniGenerateVideo",
+      "pos": [
+        700,
+        180
+      ],
+      "size": [
+        450,
+        380
+      ],
+      "flags": {},
+      "order": 7,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "frame",
+          "type": "IMAGE",
+          "link": null
+        },
+        {
+          "name": "references",
+          "type": "VIDEO_REFERENCES",
+          "link": null
+        },
+        {
+          "name": "sampling_params",
+          "type": "SAMPLING_PARAMS",
+          "link": null
+        },
+        {
+          "name": "lora",
+          "type": "LORA",
+          "link": null
+        },
+        {
+          "name": "model_params",
+          "type": "VIDEO_PARAMS",
+          "link": 6
+        },
+        {
+          "name": "fast_h3",
+          "type": "FAST_H3",
+          "link": null
+        },
+        {
+          "name": "latent_edit",
+          "type": "LATENT_MASK_EDITING",
+          "link": 5
+        },
+        {
+          "name": "url",
+          "type": "STRING",
+          "widget": {
+            "name": "url"
+          },
+          "link": null
+        },
+        {
+          "name": "model",
+          "type": "STRING",
+          "widget": {
+            "name": "model"
+          },
+          "link": null
+        },
+        {
+          "name": "prompt",
+          "type": "STRING",
+          "widget": {
+            "name": "prompt"
+          },
+          "link": null
+        },
+        {
+          "name": "negative_prompt",
+          "type": "STRING",
+          "widget": {
+            "name": "negative_prompt"
+          },
+          "link": null
+        },
+        {
+          "name": "width",
+          "type": "INT",
+          "widget": {
+            "name": "width"
+          },
+          "link": null
+        },
+        {
+          "name": "height",
+          "type": "INT",
+          "widget": {
+            "name": "height"
+          },
+          "link": null
+        },
+        {
+          "name": "fps",
+          "type": "INT",
+          "widget": {
+            "name": "fps"
+          },
+          "link": null
+        },
+        {
+          "name": "duration",
+          "type": "FLOAT",
+          "widget": {
+            "name": "duration"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "name": "video",
+          "type": "VIDEO",
+          "links": [
+            7
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "VLLMOmniGenerateVideo"
+      },
+      "widgets_values": [
+        "http://127.0.0.1:8000/v1",
+        "MiniMaxAI/MiniMax-H3",
+        "temporal mask: regenerate the ending",
+        "",
+        160,
+        120,
+        24,
+        4.458
+      ]
+    },
+    {
+      "id": 9,
+      "type": "SaveVideo",
+      "pos": [
+        900,
+        180
+      ],
+      "size": [
+        420,
+        200
+      ],
+      "flags": {},
+      "order": 8,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "video",
+          "type": "VIDEO",
+          "link": 7
+        },
+        {
+          "name": "filename_prefix",
+          "type": "STRING",
+          "widget": {
+            "name": "filename_prefix"
+          },
+          "link": null
+        },
+        {
+          "name": "format",
+          "type": "STRING",
+          "widget": {
+            "name": "format"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "name": "video",
+          "type": "VIDEO",
+          "links": []
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "SaveVideo"
+      },
+      "widgets_values": [
+        "temporal_mask",
+        "mp4"
+      ]
+    }
+  ],
+  "links": [
+    [
+      1,
+      2,
+      0,
+      6,
+      0,
+      "VIDEO"
+    ],
+    [
+      2,
+      3,
+      0,
+      5,
+      0,
+      "MASK"
+    ],
+    [
+      3,
+      4,
+      0,
+      5,
+      1,
+      "MASK"
+    ],
+    [
+      4,
+      5,
+      0,
+      6,
+      2,
+      "MASK"
+    ],
+    [
+      5,
+      6,
+      0,
+      8,
+      6,
+      "LATENT_MASK_EDITING"
+    ],
+    [
+      6,
+      7,
+      0,
+      8,
+      4,
+      "VIDEO_PARAMS"
+    ],
+    [
+      7,
+      8,
+      0,
+      9,
+      0,
+      "VIDEO"
+    ]
+  ],
+  "groups": [],
+  "config": {},
+  "extra": {},
+  "version": 0.4
+}

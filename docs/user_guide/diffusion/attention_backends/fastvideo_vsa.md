@@ -1,17 +1,33 @@
 # FastVideo VSA
 
-FastVideo Variable Sparse Attention (VSA) accelerates the `FastVideo/FastWan2.2-TI2V-5B-Diffusers` model's
-self-attention by partitioning the post-patch latent grid into spatiotemporal
+FastVideo Variable Sparse Attention (VSA) partitions the post-patch latent grid into spatiotemporal
 blocks. For every query block, VSA scores the key/value blocks and computes
 attention only against the selected top-k blocks.
 
-The supported checkpoint provides both text-to-video and image-to-video modes through `Wan22Pipeline`; the separate Wan I2V-14B, S2V, and VACE pipelines are outside this backend's supported scope.
+## Supported models
 
-VSA is a CUDA-only, explicitly selected backend. It requires the
-`fastvideo-kernel` package and currently supports non-causal self-attention
-with equal query and key/value sequence lengths. Unsupported shapes, masks,
-dtypes, sequence-parallel execution, or kernel failures fall back to
-`TORCH_SDPA` and emit a warning with the reason.
+| Model / checkpoint | Required adapter | Tasks | Sequence parallelism |
+| --- | --- | --- | --- |
+| `FastVideo/FastWan2.2-TI2V-5B-Diffusers` | None | T2V, I2V through `Wan22Pipeline` | Disabled |
+| `MiniMaxAI/MiniMax-H3` | [FastH3 VSA (recipe)](https://github.com/vllm-project/vllm-omni/blob/main/recipes/MiniMaxAI/MiniMax-H3.md#fasth3-adapter) | T2VA | Disabled or pure Ulysses |
+| Wan I2V-14B, S2V, VACE | — | Unsupported | — |
+
+## Installation
+
+Install vLLM-Omni from this checkout with the `vsa` extra:
+
+```bash
+uv pip install -e '.[vsa]'
+```
+
+The extra installs the tested kernel dependency automatically. Prebuilt kernels require
+Linux, Python 3.12, and glibc 2.34 or newer (x86-64 or aarch64). The full
+FastVideo framework and provider environment variables are not required.
+
+`FASTVIDEO_VSA` selects the attention algorithm. On SM120, the H3 integration
+currently executes FastVideo's 64-token Triton block-sparse kernel; it does not
+dispatch to FlashInfer. The `vsa` extra installs `fastvideo-kernel==0.3.4` for
+this execution path.
 
 ## Enable the backend
 
@@ -20,24 +36,18 @@ flag. Use `--fastvideo-vsa-topk` to set the number of key/value blocks retained
 for every query block:
 
 ```bash
-vllm-omni serve <model> \
+vllm serve <model> --omni \
   --diffusion-attention-backend FASTVIDEO_VSA \
   --fastvideo-vsa-topk 64
 ```
 
-The backwards-compatible environment variable selects the backend with the
-default `topk=64`:
+<details markdown="1">
+<summary>Alternative configuration formats</summary>
+
+Equivalent structured configuration:
 
 ```bash
-export DIFFUSION_ATTENTION_BACKEND=FASTVIDEO_VSA
-vllm-omni serve <model>
-```
-
-To tune top-k, pass the CLI backend and top-k flags together as shown above,
-or use the equivalent structured configuration:
-
-```bash
-vllm-omni serve <model> \
+vllm serve <model> --omni \
   --diffusion-attention-config \
   '{"default":{"backend":"FASTVIDEO_VSA","fastvideo_vsa_topk":64}}'
 ```
@@ -66,7 +76,14 @@ stages:
         fastvideo_vsa_topk: 64
 ```
 
+</details>
+
 ## Choose top-k
+
+H3 uses 64-token video blocks and keeps
+all prefix blocks; see the [FastH3 VSA recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/MiniMaxAI/MiniMax-H3.md#fasth3-adapter).
+
+### Wan top-k behavior
 
 At runtime the backend logs the sequence shape and derived block count:
 
@@ -110,8 +127,16 @@ selecting VSA does not turn a native checkpoint into a distilled model.
 
 ## Verify routing and fallback
 
-Check the startup and first-forward logs instead of assuming that selecting
-the backend guarantees sparse execution:
+VSA is a CUDA-only, explicitly selected backend. It requires the
+`fastvideo-kernel` package and currently supports non-causal self-attention
+with equal query and key/value sequence lengths. Unsupported shapes, masks,
+dtypes, sequence-parallel execution, or kernel failures fall back to
+`TORCH_SDPA` and emit a warning with the reason. On the Wan route, an active
+sequence-parallel context is one of those fallbacks; the H3 route supports pure
+Ulysses and rejects ring or all-gather sequence parallelism at startup.
+H3 accelerator faults propagate instead of attempting dense recovery.
+
+On the Wan route, check the startup and first-forward logs:
 
 - `route=VSA` means top-k block selection is active.
 - `route=VSA_ALL_BLOCKS` means the FastVideo DMD checkpoint retained all
@@ -119,7 +144,12 @@ the backend guarantees sparse execution:
 - `route=SDPA` or `FASTVIDEO_VSA falling back to SDPA: ...` means dense SDPA
   executed; the warning includes the reason.
 
-The current kernel requires CUDA tensors in FP16 or BF16, 256-token blocks,
+For H3, check `FastH3 adapter active` at startup and
+`FASTVIDEO_VSA H3 routing` during DiT execution, as described in the
+[model recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/MiniMaxAI/MiniMax-H3.md#fasth3-adapter).
+
+The Wan route requires CUDA tensors in FP16 or BF16, 256-token blocks,
 standard `head_size**-0.5` scaling, equal Q/K/V head counts, no attention mask,
-and no active sequence-parallel context. NPU and XPU paths do not execute the
-FastVideo VSA CUDA kernel.
+and no active sequence-parallel context. The MiniMax-H3 route uses 64-token
+`(4, 4, 4)` blocks and supports pure Ulysses. NPU and XPU paths do not execute
+the FastVideo VSA CUDA kernel.

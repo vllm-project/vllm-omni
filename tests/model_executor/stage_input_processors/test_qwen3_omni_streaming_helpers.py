@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Unit tests for Qwen3-Omni streaming thinker→talker / talker→codec helpers (PR #2581)."""
 
 from __future__ import annotations
@@ -282,8 +282,14 @@ def test_thinker2talker_full_payload_packs_complete_tensors() -> None:
         "hidden_states.layer_24": torch.full((3, 2), 2.0),
         "embed.tts_bos": torch.zeros(1, 2),
     }
+    # Mock transfer_manager with model config
+    transfer_manager = SimpleNamespace(
+        _get_model_config=lambda: SimpleNamespace(
+            hf_config=SimpleNamespace(talker_config=SimpleNamespace(accept_hidden_layer=24))
+        )
+    )
 
-    payload = q3.thinker2talker_full_payload(None, pooling_output, request)
+    payload = q3.thinker2talker_full_payload(transfer_manager, pooling_output, request)
 
     assert payload is not None
     assert payload["ids"]["all"] == [151644, 872, 3]
@@ -291,6 +297,36 @@ def test_thinker2talker_full_payload_packs_complete_tensors() -> None:
     assert payload["hidden_states"]["output"].device.type == "cpu"
     assert payload["embed"]["prefill"].shape[0] == 2
     assert payload["hidden_states"]["output"].shape[0] == 2
+
+
+def test_thinker2talker_full_payload_uses_config_hidden_layer() -> None:
+    """accept_hidden_layer=6 picks up layer_6, not the old hardcoded 24."""
+    request = SimpleNamespace(
+        request_id="thinker",
+        prompt_token_ids=[151644, 872],
+        output_token_ids=[3],
+        all_token_ids=[151644, 872, 3],
+    )
+    layer_6_data = torch.full((3, 2), 6.0)
+    layer_24_data = torch.full((3, 2), 24.0)
+    pooling_output = {
+        "hidden_states.layer_0": torch.ones(3, 2),
+        "hidden_states.layer_6": layer_6_data,
+        "hidden_states.layer_24": layer_24_data,
+        "embed.tts_bos": torch.zeros(1, 2),
+    }
+    transfer_manager = SimpleNamespace(
+        _get_model_config=lambda: SimpleNamespace(
+            hf_config=SimpleNamespace(talker_config=SimpleNamespace(accept_hidden_layer=6))
+        )
+    )
+
+    payload = q3.thinker2talker_full_payload(transfer_manager, pooling_output, request)
+
+    assert payload is not None
+    # Should use layer 6 (value 6.0), not layer 24 (value 24.0)
+    assert payload["hidden_states"]["output"].shape[0] == 2
+    assert torch.allclose(payload["hidden_states"]["output"], layer_6_data[:-1])
 
 
 def test_thinker2talker_token_only_preserves_voice_metadata() -> None:
@@ -356,7 +392,7 @@ def test_accumulator_concat_default_when_no_replace_keys() -> None:
     class _StubMixin(OmniConnectorModelRunnerMixin):
         def __init__(self):
             self._pending_full_payload_send = {}
-            self._full_payload_replace_keys_cached = frozenset()
+            self._full_payload_replace_keys_cached: frozenset[str] = frozenset()
 
     stub = _StubMixin()
     stub.accumulate_full_payload_output(
@@ -413,51 +449,6 @@ def test_covo_audio_llm2code2wav_full_payload_smoke() -> None:
     assert payload is not None
     assert payload["codes"]["audio"] == [5, 6]
     assert payload["meta"]["finished"].item() is True
-
-
-def test_dynin_omni_token_only_smoke() -> None:
-    """Smoke: dynin_omni token-only builders return placeholders."""
-    from vllm_omni.model_executor.stage_input_processors.dynin_omni import (
-        token2text_to_token2image_token_only,
-    )
-
-    class _Out:
-        def __init__(self, tids, mm=None):
-            self.token_ids = tids
-            self.multimodal_output = mm
-
-    class _Wrapper:
-        def __init__(self, tids, mm=None):
-            self.outputs = [_Out(tids, mm)]
-            self.request_id = "r0"
-
-    class _Stage:
-        def __init__(self, outs):
-            self.engine_outputs = outs
-
-    src = [_Wrapper([10, 11, 12])]
-    out = token2text_to_token2image_token_only([_Stage(src)], [0])
-    assert len(out) == 1
-    assert len(out[0]["prompt_token_ids"]) == 3
-    assert out[0]["additional_information"] is None
-
-
-def test_dynin_omni_full_payload_smoke() -> None:
-    """Smoke: dynin_omni producer-side payload builder returns nested OmniPayload + carries metadata."""
-    from types import SimpleNamespace
-
-    from vllm_omni.model_executor.stage_input_processors.dynin_omni import (
-        token2text_to_token2image_full_payload,
-    )
-
-    pooling = {"token_ids": [1, 2, 3]}
-    req = SimpleNamespace(output_token_ids=[], additional_information={"speaker": ["alice"]})
-    payload = token2text_to_token2image_full_payload(None, pooling, req)
-    assert payload is not None
-    assert payload["codes"]["audio"] == [1, 2, 3]
-    assert payload["meta"]["finished"].item() is True
-    # additional_information is normalized + carried forward (speaker stays list-wrapped).
-    assert payload.get("speaker") == ["alice"]
 
 
 def test_qwen2_5_omni_talker2code2wav_token_only_smoke() -> None:

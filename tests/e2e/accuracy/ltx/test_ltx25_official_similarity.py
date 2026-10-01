@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """E2E accuracy guards against pinned official Lightricks LTX references.
 
@@ -32,7 +32,6 @@ from huggingface_hub import hf_hub_download, snapshot_download
 from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
 
 from tests.e2e.accuracy.helpers import reset_artifact_dir
-from tests.helpers import skip_if_gated_repo_inaccessible
 from tests.helpers.mark import hardware_test
 
 OFFICIAL_REPOSITORY = "https://github.com/Lightricks/LTX-2.git"
@@ -43,7 +42,7 @@ LTX25_OFFICIAL_MODEL_ID = "Lightricks/LTX-2.5"
 LTX25_OFFICIAL_MODEL_REVISION = "8a4ff96f581e72bedc1b44367581c49d544a05f1"
 LTX25_OFFICIAL_COMMON_FILES = {
     "text_encoder": "text_encoders/gemma4-12b-with-proj-ltx-2.5-bf16.safetensors",
-    "video_vae": "vae/ltx-2.5-video-vae-conv-bf16.safetensors",
+    "video_vae": "vae/ltx-2.5-video-vae-bf16.safetensors",
     "audio_vae": "vae/ltx-2.5-audio-vae-bf16.safetensors",
 }
 LTX25_OFFICIAL_VARIANT_FILES = {
@@ -208,6 +207,9 @@ def _resolve_ltx25_omni_model(*, transformer_subfolder: str = "transformer") -> 
         model = Path(configured_model).resolve()
         snapshot_revision = model.name if model.parent.name == "snapshots" else None
         assert (model / transformer_subfolder).is_dir(), f"LTX-2.5 component not found: {model / transformer_subfolder}"
+        assert (model / "diffusion_decoder" / "config.json").is_file(), (
+            f"LTX-2.5 DiffVAE config not found: {model / 'diffusion_decoder' / 'config.json'}"
+        )
         return model, configured_model, configured_revision or snapshot_revision
     model_id = configured_model or LTX25_OMNI_MODEL_ID
     revision = configured_revision
@@ -223,6 +225,7 @@ def _resolve_ltx25_omni_model(*, transformer_subfolder: str = "transformer") -> 
                 "connectors/config.json",
                 "connectors/diffusion_pytorch_model.safetensors.index.json",
                 "connectors/diffusion_pytorch_model-*.safetensors",
+                "diffusion_decoder/config.json",
                 "scheduler/*",
                 "text_encoder/config.json",
                 "text_encoder/generation_config.json",
@@ -297,32 +300,6 @@ def _resolve_ltx25_image() -> Path:
             revision=LTX25_I2V_IMAGE_REVISION,
         )
     )
-
-
-def _require_ltx25_model_access() -> None:
-    configured_omni_model = os.environ.get("VLLM_TEST_LTX25_MODEL")
-    if not (configured_omni_model and Path(configured_omni_model).exists()):
-        omni_model = configured_omni_model or LTX25_OMNI_MODEL_ID
-        omni_revision = os.environ.get("VLLM_TEST_LTX25_MODEL_REVISION")
-        if omni_revision is None and omni_model == LTX25_OMNI_MODEL_ID:
-            omni_revision = LTX25_OMNI_MODEL_REVISION
-        skip_if_gated_repo_inaccessible(
-            omni_model,
-            revision=omni_revision,
-            filename="model_index.json",
-        )
-
-    configured_official_model = os.environ.get("VLLM_TEST_LTX25_OFFICIAL_MODEL")
-    if not (configured_official_model and Path(configured_official_model).exists()):
-        official_model = configured_official_model or LTX25_OFFICIAL_MODEL_ID
-        official_revision = os.environ.get("VLLM_TEST_LTX25_OFFICIAL_MODEL_REVISION")
-        if official_revision is None and official_model == LTX25_OFFICIAL_MODEL_ID:
-            official_revision = LTX25_OFFICIAL_MODEL_REVISION
-        skip_if_gated_repo_inaccessible(
-            official_model,
-            revision=official_revision,
-            filename=LTX25_OFFICIAL_COMMON_FILES["text_encoder"],
-        )
 
 
 def _ltx25_request(image: Path | None = None) -> dict[str, object]:
@@ -470,8 +447,7 @@ def _assert_strict_similarity(
 @hardware_test(res={"cuda": "H100"}, num_cards=1)
 @pytest.mark.parametrize("task", ["t2v", "i2v"])
 def test_ltx25_distilled_two_stage_matches_official(accuracy_artifact_root: Path, task: str) -> None:
-    """Compare Omni with the official runtime using the same checkpoint connector weights."""
-    _require_ltx25_model_access()
+    """Compare Omni with official canonical DiffVAE and matching connector weights."""
     artifact_parent = accuracy_artifact_root / "ltx_official"
     output_root = reset_artifact_dir(artifact_parent / f"ltx2_5_distilled_{task}")
     official_root, official_revision = _ltx25_official_source(artifact_parent)
@@ -545,6 +521,7 @@ def test_ltx25_distilled_two_stage_matches_official(accuracy_artifact_root: Path
     omni_metadata = json.loads((omni_output / "metadata.json").read_text())
     assert official_metadata["official_revision"] == official_revision
     assert official_metadata["pipeline"] == "DistilledPipeline"
+    assert official_metadata["video_vae_path"] == str(official_artifacts["video_vae"])
     assert official_metadata["attention_backend"] == ATTENTION_BACKEND
     assert official_metadata["connector_model"] == str(omni_model)
     assert omni_metadata["model_class_name"] == "LTX2DistilledTwoStagePipeline"
@@ -594,8 +571,7 @@ def test_ltx25_distilled_two_stage_matches_official(accuracy_artifact_root: Path
 @pytest.mark.parametrize("task", ["t2v", "i2v"])
 @pytest.mark.parametrize("pipeline_mode", ["full_one_stage", "full_two_stage"])
 def test_ltx25_full_matches_official(accuracy_artifact_root: Path, task: str, pipeline_mode: str) -> None:
-    """Compare raw official Full/SFT weights with Omni's converted Full pipeline."""
-    _require_ltx25_model_access()
+    """Compare raw official Full/SFT and DiffVAE weights with Omni."""
     artifact_parent = accuracy_artifact_root / "ltx_official"
     output_root = reset_artifact_dir(artifact_parent / f"ltx2_5_{pipeline_mode}_{task}")
     model_class_name = {
@@ -697,6 +673,7 @@ def test_ltx25_full_matches_official(accuracy_artifact_root: Path, task: str, pi
             "full_two_stage": "TI2VidTwoStagesPipeline",
         }[pipeline_mode]
     )
+    assert official_metadata["video_vae_path"] == str(official_artifacts["video_vae"])
     assert official_metadata["attention_backend"] == ATTENTION_BACKEND
     assert official_metadata["connector_model"] == str(omni_model)
     assert omni_metadata["model_class_name"] == model_class_name

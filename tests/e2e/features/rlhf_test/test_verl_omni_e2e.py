@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """E2E test that follows the EXACT same flow as
 ``verl-omni/tests/workers/rollout/rollout_vllm/test_vllm_omni_generate.py``
@@ -35,7 +35,6 @@ from uuid import uuid4
 import pytest
 import ray
 import torch
-from huggingface_hub import snapshot_download
 from omegaconf import OmegaConf
 from transformers import AutoTokenizer
 
@@ -46,6 +45,7 @@ from tests.e2e.features.helpers.verl_omni_server import (
     vLLMOmniHttpServerLocal,
 )
 from tests.helpers.mark import hardware_test
+from vllm_omni.transformers_utils.repo_utils import hf_api
 
 MODEL = "tiny-random/Qwen-Image"
 TOKENIZER_MODEL = "Qwen/Qwen2-1.5B-Instruct"
@@ -55,7 +55,7 @@ _MIN_PROMPT_TOKENS = 35
 def _resolve_model_path(repo_id: str) -> str:
     if os.path.isdir(repo_id):
         return repo_id
-    return snapshot_download(repo_id=repo_id)
+    return hf_api().snapshot_download(repo_id=repo_id)
 
 
 @lru_cache(maxsize=1)

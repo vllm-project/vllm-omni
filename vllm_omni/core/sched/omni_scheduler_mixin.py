@@ -1,18 +1,24 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from __future__ import annotations
 
 import math
 import os
+import queue
 import time
 from collections.abc import Iterable, Iterator
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 from vllm.compilation.cuda_graph import CUDAGraphStat
+from vllm.config import VllmConfig
 from vllm.distributed.kv_events import KVEventBatch
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
 from vllm.logger import init_logger
 from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.core.sched.request_queue import RequestQueue
 from vllm.v1.core.sched.utils import remove_all
 from vllm.v1.engine import (
     EngineCoreEventType,
@@ -28,6 +34,7 @@ from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm_omni.core.sched.omni_scheduling_coordinator import (
     OmniSchedulingCoordinator,
     uses_full_payload_input_coordinator,
+    uses_native_mrv2_data_plane,
 )
 from vllm_omni.core.sched.output import (
     OmniChunkRecvHandle,
@@ -37,7 +44,10 @@ from vllm_omni.core.sched.output import (
 from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter import (
     OmniChunkTransferAdapter,
 )
+from vllm_omni.distributed.omni_connectors.utils.config import stage_receives_chunks
 from vllm_omni.engine import OmniEngineCoreOutput
+from vllm_omni.engine.serialization import serialize_additional_information
+from vllm_omni.outputs import OmniConnectorOutput
 
 logger = init_logger(__name__)
 
@@ -95,8 +105,28 @@ elif DEFAULT_INPUT_WAIT_TIMEOUT_S == 0:
     )
 
 
-class OmniSchedulerMixin:
+if TYPE_CHECKING:
+    from vllm.v1.core.sched.scheduler import Scheduler as _SchedulerMixinBase
+else:
+    _SchedulerMixinBase = object
+
+
+class OmniSchedulerMixin(_SchedulerMixinBase):
     """Shared scheduler helpers for omni-specific request handling."""
+
+    # Provided by the concrete vLLM scheduler.
+    vllm_config: VllmConfig
+    requests: dict[str, Request]
+    waiting: RequestQueue
+    running: list[Request]
+    _pending_input_timeout_outputs: dict[str, tuple[int, OmniEngineCoreOutput]]
+
+    def _init_omni_connector_output_inbox(self) -> None:
+        self._omni_connector_output_inbox: queue.SimpleQueue[OmniConnectorOutput] = queue.SimpleQueue()
+
+    def enqueue_omni_connector_output(self, output: OmniConnectorOutput) -> None:
+        """Accept a lightweight readiness event from the local runner thread."""
+        self._omni_connector_output_inbox.put(output)
 
     # ------------------------------------------------------------------ #
     #  Shared scheduler/output helpers (lift the AR / generation duplicates)
@@ -104,16 +134,44 @@ class OmniSchedulerMixin:
 
     def _init_omni_io_scheduling_state(self) -> None:
         """Initialize scheduler state shared by AR and generation stages."""
+        # The scheduler must agree with the stage's worker about which runner
+        # consumes its SchedulerOutput: vLLM's own default (v2 since 0.29) would
+        # take the v2 fast path, which omits resumed-request token ids, while a
+        # v1 omni runner still reads them (``KeyError: <req_id>`` in
+        # ``_update_states``). The stage's model config carries the choice
+        # (deploy ``model_runner``, optionally per stage).
         model_config = self.vllm_config.model_config
-        self.chunk_transfer_adapter = (
-            OmniChunkTransferAdapter(self.vllm_config) if getattr(model_config, "async_chunk", False) else None
+        self.use_v2_model_runner = bool(getattr(model_config, "use_v2_model_runner", False))
+        self._native_data_plane = uses_native_mrv2_data_plane(
+            model_config,
+            use_v2_model_runner=self.use_v2_model_runner,
         )
-        self.input_coordinator = (
-            OmniSchedulingCoordinator(stage_id=getattr(model_config, "stage_id", 0))
-            if uses_full_payload_input_coordinator(model_config)
+        self.chunk_transfer_adapter = (
+            OmniChunkTransferAdapter(self.vllm_config)
+            if getattr(model_config, "async_chunk", False) and not self._native_data_plane
             else None
         )
-        self._latest_omni_connector_output = None
+        self.input_coordinator: OmniSchedulingCoordinator | None = None
+        if (
+            self._native_data_plane
+            and getattr(model_config, "async_chunk", False)
+            # A downstream sender-only stage (e.g. MiniCPM-o's Talker, fed by
+            # the orchestrator) has no connector input to wait for; parking
+            # its requests for chunks would never release them.
+            and (getattr(model_config, "stage_id", 0) == 0 or stage_receives_chunks(model_config))
+        ):
+            self.input_coordinator = OmniSchedulingCoordinator(
+                scheduler_max_num_seqs=self.vllm_config.scheduler_config.max_num_seqs,
+                stage_id=getattr(model_config, "stage_id", 0),
+                async_chunk=True,
+            )
+        elif uses_full_payload_input_coordinator(model_config):
+            self.input_coordinator = OmniSchedulingCoordinator(
+                stage_id=getattr(model_config, "stage_id", 0),
+            )
+        self._latest_omni_connector_output: OmniConnectorOutput | None = None
+        self._init_omni_connector_output_inbox()
+        self._pending_data_plane_terminal_req_ids: set[str] = set()
         # Optional per-stage pooling-output decoder hook (dotted path in
         # model_config); applied worker-side before IPC.
         self._pooling_output_decoder = None
@@ -144,16 +202,15 @@ class OmniSchedulerMixin:
         if input_coordinator is not None:
             input_coordinator.free_finished_request(request_id)
 
-    def _replace_streaming_session(self, session: Request, update: StreamingUpdate) -> None:
-        """Replace a downstream stage's placeholder with its next payload."""
+    def _reset_streaming_session_replacement_state(self, session: Request) -> None:
+        """Fence transport and async state that belongs to an old prompt."""
+        session._omni_segment_generation = int(getattr(session, "_omni_segment_generation", 0) or 0) + 1
         adapter = getattr(self, "chunk_transfer_adapter", None)
         if adapter is not None:
             adapter.segment_finished_requests.discard(session.request_id)
             watermark = getattr(adapter, "requests_num_chunks_sent", None)
             if watermark is not None:
                 watermark.pop(session.external_req_id, None)
-        session._output_token_ids.clear()
-        session._all_token_ids.clear()
         # In-flight outputs from the previous segment were optimistically
         # scheduled (async lookahead). Mark them stale so update_from_output
         # drops them instead of underflowing num_output_placeholders
@@ -168,18 +225,15 @@ class OmniSchedulerMixin:
         session.num_stale_output_tokens = int(getattr(session, "num_in_flight_tokens", 0) or 0)
         session.num_output_placeholders = 0
         session.spec_token_ids = []
-        new_prompt = update.prompt_token_ids or ()
-        session._all_token_ids.extend(new_prompt)
-        session.num_computed_tokens = 0
-        session.prompt_token_ids = new_prompt
+
+    def _finish_streaming_session_update(self, session: Request, update: StreamingUpdate) -> None:
+        """Install payload metadata and send an updated session to admission."""
         session.additional_information = update.additional_information or None
         session.model_intermediate_buffer = getattr(
             update,
             "model_intermediate_buffer",
             None,
         )
-        session.update_block_hashes()
-        session.num_prompt_tokens = len(new_prompt)
         session.arrival_time = update.arrival_time
         session.sampling_params = update.sampling_params
         if session.status == RequestStatus.WAITING_FOR_STREAMING_REQ:
@@ -191,6 +245,49 @@ class OmniSchedulerMixin:
         if self.log_stats:
             session.record_event(EngineCoreEventType.QUEUED)
 
+    def _replace_streaming_session(self, session: Request, update: StreamingUpdate) -> None:
+        """Replace a downstream stage's placeholder with its next payload."""
+        self._reset_streaming_session_replacement_state(session)
+        session._output_token_ids.clear()
+        session._all_token_ids.clear()
+        new_prompt = update.prompt_token_ids or ()
+        session._all_token_ids.extend(new_prompt)
+        session.num_computed_tokens = 0
+        session.prompt_token_ids = new_prompt
+        session.update_block_hashes()
+        session.num_prompt_tokens = len(new_prompt)
+        self._finish_streaming_session_update(session, update)
+
+    def _async_chunk_transport_enabled(self) -> bool:
+        return getattr(self, "chunk_transfer_adapter", None) is not None or bool(
+            getattr(self, "_native_data_plane", False)
+            and getattr(getattr(self, "input_coordinator", None), "_async_chunk", False)
+        )
+
+    def _get_async_chunk_reserved_running_slots(self) -> int:
+        adapter = getattr(self, "chunk_transfer_adapter", None)
+        live_requests = self.requests
+        reserved_ids: set[str] = set()
+        if adapter is not None:
+            parked = getattr(adapter, "waiting_for_chunk_running_requests", ())
+            held = getattr(adapter, "_held_non_active", ())
+        else:
+            coordinator = getattr(self, "input_coordinator", None)
+            parked = getattr(coordinator, "_waiting_for_chunk_running", ())
+            held = ()
+        for request in parked:
+            req_id = getattr(request, "request_id", None)
+            if req_id is not None and req_id in live_requests:
+                reserved_ids.add(req_id)
+        for request in held:
+            req_id = getattr(request, "request_id", None)
+            if req_id is not None and req_id in live_requests:
+                reserved_ids.add(req_id)
+        return len(reserved_ids)
+
+    # ------------------------------------------------------------------ #
+    #  Shared scheduler/output helpers (lift the AR / generation duplicates)
+    # ------------------------------------------------------------------ #
     def _release_replaced_streaming_prompt_cache(self, session: Request) -> None:
         """Discard cache state that belongs to a replaced prompt."""
         # A prompt replacement is not a normal streaming extension: none of
@@ -236,19 +333,55 @@ class OmniSchedulerMixin:
         AR and generation schedulers except for the ``model_mode`` argument
         forwarded to ``update_request_metadata``.
         """
+        connector_outputs: list[OmniConnectorOutput] = []
+        inbox = getattr(self, "_omni_connector_output_inbox", None)
+        if inbox is not None:
+            while True:
+                try:
+                    connector_outputs.append(inbox.get_nowait())
+                except queue.Empty:
+                    break
         connector_output = getattr(self, "_latest_omni_connector_output", None)
         self._latest_omni_connector_output = None
+        if connector_output is not None:
+            connector_outputs.append(connector_output)
         input_coordinator = getattr(self, "input_coordinator", None)
         if input_coordinator is None:
             return
-        if connector_output and connector_output.request_metadata:
+        request_metadata: dict[str, dict[str, Any]] = {}
+        chunk_ready_req_ids: set[str] = set()
+        chunk_finished_req_ids: set[str] = set()
+        stage_recv_req_ids: set[str] = set()
+        for output in connector_outputs:
+            request_metadata.update(output.request_metadata)
+            chunk_ready_req_ids.update(output.chunk_ready_req_ids)
+            chunk_finished_req_ids.update(output.chunk_finished_req_ids)
+            stage_recv_req_ids.update(output.stage_recv_req_ids)
+        live_request_ids = self.requests.keys()
+        request_metadata = {
+            req_id: metadata for req_id, metadata in request_metadata.items() if req_id in live_request_ids
+        }
+        chunk_ready_req_ids.intersection_update(live_request_ids)
+        chunk_finished_req_ids.intersection_update(live_request_ids)
+        stage_recv_req_ids.intersection_update(live_request_ids)
+        if request_metadata:
             input_coordinator.update_request_metadata(
-                self.requests, connector_output.request_metadata, model_mode=model_mode
+                self.requests,
+                request_metadata,
+                model_mode=model_mode,
             )
-        input_coordinator.process_pending_full_payload_inputs(
-            self.waiting,
-            connector_output.stage_recv_req_ids if connector_output else set(),
-        )
+        if input_coordinator._async_chunk:
+            input_coordinator.process_pending_chunks(
+                self.waiting,
+                self.running,
+                chunk_ready_req_ids,
+                chunk_finished_req_ids,
+            )
+        else:
+            input_coordinator.process_pending_full_payload_inputs(
+                self.waiting,
+                stage_recv_req_ids,
+            )
 
     def _process_pending_omni_inputs(self, model_mode: str) -> None:
         """Apply pending connector inputs, timeouts, and async chunks."""
@@ -260,9 +393,29 @@ class OmniSchedulerMixin:
                 self.running,
                 scheduler_requests=self.requests,
             )
+            # Prompt-window contracts are finalized on this scheduler thread
+            # and may surface a permanent receive failure.
+            self._process_chunk_receive_failures()
             self._reset_ready_async_chunk_replacements()
             self._process_pending_chunk_timeouts()
             self._log_failed_chunk_sends()
+
+    def _process_chunk_receive_failures(self) -> None:
+        """Fail requests whose consumed streaming input violated its contract."""
+        adapter = getattr(self, "chunk_transfer_adapter", None)
+        collector = getattr(adapter, "collect_failed_receive_request_ids", None)
+        if collector is None:
+            return
+        failures = collector()
+        present_ids = {request_id for request_id in failures if request_id in self.requests}
+        if not present_ids:
+            return
+        logger.error(
+            "Marking %d request(s) as FINISHED_ERROR after invalid streaming input: %s",
+            len(present_ids),
+            {request_id: failures[request_id] for request_id in sorted(present_ids)},
+        )
+        self.finish_requests(present_ids, RequestStatus.FINISHED_ERROR)
 
     def _restore_omni_wait_queues(self) -> None:
         """Restore requests temporarily parked by Omni input gates."""
@@ -273,7 +426,7 @@ class OmniSchedulerMixin:
                 scheduler_requests=self.requests,
             )
         if self.input_coordinator:
-            self.input_coordinator.restore_queues(self.waiting)
+            self.input_coordinator.restore_queues(self.waiting, self.running)
 
     def _process_pending_input_timeouts(self) -> None:
         """Force-fail requests waiting on the full-payload coordinator too long.
@@ -311,7 +464,29 @@ class OmniSchedulerMixin:
             DEFAULT_INPUT_WAIT_TIMEOUT_S,
             sorted(present_ids),
         )
-        self.finish_requests(present_ids, RequestStatus.FINISHED_ERROR)
+        self._finish_input_timeout_requests(present_ids)
+
+    def _finish_input_timeout_requests(self, request_ids: set[str]) -> None:
+        # Upstream finish_requests frees scheduler state, but does not emit
+        # EngineCoreOutput. Keep an explicit ERROR for both AR and generation
+        # callers, including a tick with no scheduled model work.
+        pending = getattr(self, "_pending_input_timeout_outputs", None)
+        if pending is None:
+            pending = self._pending_input_timeout_outputs = {}
+        for request_id in request_ids:
+            request = self.requests[request_id]
+            reason = f"Timed out waiting for connector input after {DEFAULT_INPUT_WAIT_TIMEOUT_S:g}s"
+            request.stop_reason = reason
+            pending[request_id] = (
+                request.client_index,
+                OmniEngineCoreOutput(
+                    request_id=request_id,
+                    new_token_ids=[],
+                    finish_reason=FinishReason.ERROR,
+                    stop_reason=reason,
+                ),
+            )
+        self.finish_requests(request_ids, RequestStatus.FINISHED_ERROR)
 
     def _log_failed_chunk_sends(self) -> None:
         """Surface chunks the sender gave up on (R1.2 of #4855).
@@ -389,7 +564,7 @@ class OmniSchedulerMixin:
             DEFAULT_INPUT_WAIT_TIMEOUT_S,
             sorted(present_ids),
         )
-        self.finish_requests(present_ids, RequestStatus.FINISHED_ERROR)
+        self._finish_input_timeout_requests(present_ids)
 
     def _capture_omni_connector_output(self, model_runner_output: Any) -> None:
         """Stash the model runner's omni_connector_output for next schedule().
@@ -415,6 +590,8 @@ class OmniSchedulerMixin:
         *,
         finished_requests_needing_kv_transfer: dict | None = None,
         pending_input_registrations: list[OmniChunkRecvHandle] | None = None,
+        data_plane_terminal_req_ids: set[str] | None = None,
+        input_terminal_req_ids: set[str] | None = None,
     ) -> OmniSchedulerOutput:
         """Wrap a base ``SchedulerOutput`` in ``OmniSchedulerOutput``.
 
@@ -425,11 +602,31 @@ class OmniSchedulerMixin:
         base_data = {name: getattr(base, name) for name in SchedulerOutput.__dataclass_fields__}
         input_coordinator = getattr(self, "input_coordinator", None)
         if pending_input_registrations is None:
-            pending_input_registrations = input_coordinator.pending_input_registrations if input_coordinator else []
+            if input_coordinator is None:
+                pending_input_registrations = []
+            elif input_coordinator._async_chunk:
+                pending_input_registrations = input_coordinator.pending_chunk_registrations
+            else:
+                pending_input_registrations = input_coordinator.pending_input_registrations
+        if data_plane_terminal_req_ids is None:
+            pending_terminal: set[str] = getattr(self, "_pending_data_plane_terminal_req_ids", set())
+            data_plane_terminal_req_ids = set(pending_terminal)
+            pending_terminal.clear()
+        if input_coordinator is not None:
+            scheduled_terminal_req_ids = input_coordinator.get_scheduled_input_terminal_req_ids(base)
+            if input_terminal_req_ids is None:
+                input_terminal_req_ids = scheduled_terminal_req_ids
+            else:
+                input_terminal_req_ids = set(input_terminal_req_ids).union(
+                    scheduled_terminal_req_ids,
+                )
+            input_coordinator.postprocess_scheduler_output(base)
         return OmniSchedulerOutput(
             **base_data,
             finished_requests_needing_kv_transfer=finished_requests_needing_kv_transfer or {},
             pending_input_registrations=pending_input_registrations,
+            data_plane_terminal_req_ids=data_plane_terminal_req_ids,
+            input_terminal_req_ids=input_terminal_req_ids or set(),
         )
 
     def _rewrap_scheduled_new_reqs(self, scheduler_output: SchedulerOutput) -> None:
@@ -477,8 +674,14 @@ class OmniSchedulerMixin:
         num_nans_in_logits: int = 0,
         is_segment_finished: bool | None = False,
         new_prompt_len_snapshot: int | None = None,
+        num_generation_tokens: int | None = None,
     ) -> OmniEngineCoreOutput:
         """Build the common request-output envelope used by LLM schedulers."""
+        pooling_output_payload = None
+        if isinstance(pooling_output, dict):
+            pooling_output_payload = serialize_additional_information(pooling_output)
+            pooling_output = None
+
         return OmniEngineCoreOutput(
             request_id=request.request_id,
             new_token_ids=new_token_ids,
@@ -486,6 +689,7 @@ class OmniSchedulerMixin:
             new_logprobs=new_logprobs,
             new_prompt_logprobs_tensors=new_prompt_logprobs_tensors,
             pooling_output=pooling_output,
+            pooling_output_payload=pooling_output_payload,
             multimodal_output=multimodal_output,
             stop_reason=stop_reason,
             events=request.take_events(),
@@ -497,6 +701,7 @@ class OmniSchedulerMixin:
             num_nans_in_logits=num_nans_in_logits,
             is_segment_finished=is_segment_finished,
             new_prompt_len_snapshot=new_prompt_len_snapshot,
+            num_generation_tokens=num_generation_tokens,
         )
 
     def _append_request_output(
@@ -540,6 +745,13 @@ class OmniSchedulerMixin:
         synthesize_abort_outputs: bool,
     ) -> None:
         """Attach finished IDs while keeping AR's synthetic-abort policy explicit."""
+        pending = getattr(self, "_pending_input_timeout_outputs", None)
+        if pending:
+            for client_index, error_output in pending.values():
+                output = engine_core_outputs.setdefault(client_index, EngineCoreOutputs())
+                if not any(item.request_id == error_output.request_id for item in output.outputs):
+                    output.outputs.append(error_output)
+            pending.clear()
         finished_req_ids = self.finished_req_ids_dict
         if not finished_req_ids:
             return
@@ -557,6 +769,38 @@ class OmniSchedulerMixin:
                 )
             output.finished_requests = finished_set
         finished_req_ids.clear()
+
+    def _reject_invalid_grammar_tokens(self, request: Request, new_token_ids: list[int]) -> bool:
+        """Mark rejected tokens terminal before callers capture the finish reason."""
+        if not new_token_ids or self.structured_output_manager.accept_tokens(request, new_token_ids):
+            return False
+        logger.error(
+            "Unexpected: grammar rejected tokens %s for request %s. Terminating request.",
+            new_token_ids,
+            request.request_id,
+        )
+        request.status = RequestStatus.FINISHED_ERROR
+        request.resumable = False
+        return True
+
+    def _finish_error_requests(self, outputs: dict[int, list[EngineCoreOutput]]) -> None:
+        """Drain grammar-compilation and unavailable-encoder errors into terminal outputs."""
+        grammar_error_reqs = getattr(self, "grammar_compile_error_reqs", None)
+        error_req_ids = set(grammar_error_reqs or ())
+        if grammar_error_reqs:
+            grammar_error_reqs.clear()
+        ec_connector = getattr(self, "ec_connector", None)
+        if ec_connector is not None:
+            error_req_ids.update(ec_connector.take_unavailable_requests())
+        if error_req_ids:
+            for request in self.finish_requests(error_req_ids, RequestStatus.FINISHED_ERROR):
+                OmniSchedulerMixin._append_request_output(
+                    self,
+                    outputs,
+                    request,
+                    new_token_ids=[],
+                    finish_reason=request.get_finished_reason(),
+                )
 
     def _remove_stopped_requests_from_queues(
         self,
@@ -588,10 +832,16 @@ class OmniSchedulerMixin:
             self.skipped_waiting.remove_requests(removable)
 
     def _resume_downstream_chunk_receiver(self, request: Request) -> None:
-        """Resume connector polling without waiting for an external update."""
+        """Resume duplex connector polling without an external update."""
         adapter = self.chunk_transfer_adapter
+        if adapter is None:
+            return
         adapter.segment_finished_requests.discard(request.request_id)
-        if request.status != RequestStatus.WAITING_FOR_STREAMING_REQ:
+        if (
+            not adapter.receives_chunks
+            or getattr(self.vllm_config.model_config, "session_mode", "turn") != "duplex"
+            or request.status != RequestStatus.WAITING_FOR_STREAMING_REQ
+        ):
             return
         self.num_waiting_for_streaming_input -= 1
         request.status = RequestStatus.WAITING
@@ -641,6 +891,68 @@ class OmniSchedulerMixin:
             engine_core_outputs[0] = output = EngineCoreOutputs()
         output.scheduler_stats = stats
 
+    def add_request(self, request: Request) -> None:
+        """Route a terminal streaming update that lands on a parked session.
+
+        Upstream ``Scheduler.add_request`` turns "final update (``resumable``
+        is False) arrives while the session sits in
+        ``WAITING_FOR_STREAMING_REQ``" into a local
+        ``finish_requests(FINISHED_ABORTED)``. That is fine for a stage whose
+        output the orchestrator forwards, but an async-chunk *sender* also
+        owes its downstream stage a terminal chunk: the receiver learns that a
+        stream ended only from a connector payload carrying ``finished``, and
+        an abort emits none. The downstream stage then parks in
+        ``WAITING_FOR_CHUNK`` until ``VLLM_OMNI_INPUT_WAIT_TIMEOUT_S`` (600s by
+        default), long after the client's own deadline -- the realtime
+        async-chunk hang in vllm-project/vllm-omni#6670.
+
+        Whether this races is timing, not configuration: the stage parks only
+        when its own stop beats both the upstream terminal chunk and the
+        orchestrator's terminal update, a window of tens of milliseconds at
+        the end of the last segment. Emit the terminal chunk here so the
+        downstream stage terminates on the payload path either way.
+        """
+        existing = self.requests.get(request.request_id)
+        if existing is not None and existing.status == RequestStatus.WAITING_FOR_STREAMING_REQ:
+            adapter = None if getattr(request, "resumable", False) else self._adapter_owing_terminal(existing)
+            if adapter is not None:
+                self._finish_parked_streaming_session(existing, adapter)
+                return
+        super().add_request(request)
+
+    def _adapter_owing_terminal(self, request: Request) -> OmniChunkTransferAdapter | None:
+        """The adapter that owes *request*'s downstream stage a terminal chunk.
+
+        Sender ownership starts when the first chunk is queued, before the
+        background thread initializes its chunk counter. A prewarmed receiver
+        needs a terminal even if that first chunk has not been sent yet.
+        Final stages never queue sends, so they never match.
+        """
+        adapter = getattr(self, "chunk_transfer_adapter", None)
+        if adapter is None:
+            return None
+        external_req_id = getattr(request, "external_req_id", None) or request.request_id
+        return adapter if adapter.has_active_sender(external_req_id) else None
+
+    def _finish_parked_streaming_session(self, request: Request, adapter: OmniChunkTransferAdapter) -> None:
+        """End a parked async-chunk session with a downstream terminal chunk."""
+        request.resumable = False
+        # A segment stop already advanced the adapter's dedup watermark to
+        # ``generation + 1`` for the segment that never arrived. Claim that
+        # generation, exactly as ``_update_request_as_session`` would have,
+        # or ``save_async`` drops this chunk as a late duplicate.
+        request._omni_segment_generation = int(getattr(request, "_omni_segment_generation", 0) or 0) + 1
+        # ``force_request_finished``: the terminal must be enqueued *before*
+        # ``finish_requests``, which skips requests that already report
+        # ``is_finished()``.
+        adapter.save_async(
+            None,
+            request,
+            is_segment_finished=False,
+            force_request_finished=True,
+        )
+        self.finish_requests(request.request_id, RequestStatus.FINISHED_STOPPED)
+
     def finish_requests(
         self,
         request_ids: str | Iterable[str] | None,
@@ -676,6 +988,7 @@ class OmniSchedulerMixin:
         )
         finished = super().finish_requests(request_ids, finished_status)
         self._purge_finished_from_running(target_request_ids)
+        self._resync_streaming_input_counter()
 
         for request in finished:
             self._free_input_coordinator_request(request.request_id)
@@ -841,3 +1154,25 @@ class OmniSchedulerMixin:
             return resumable_segment_stop and req.request_id not in target_request_ids
 
         self.running[:] = [req for req in self.running if keep_running(req)]
+
+    def _drop_aborted_queued_requests(self) -> None:
+        for request_queue in (self.waiting, self.skipped_waiting):
+            aborted = [req for req in request_queue if req.status == RequestStatus.FINISHED_ABORTED]
+            if aborted:
+                request_queue.remove_requests(aborted)
+        self.running[:] = [req for req in self.running if req.status != RequestStatus.FINISHED_ABORTED]
+
+    def _resync_streaming_input_counter(self) -> None:
+        counter = getattr(self, "num_waiting_for_streaming_input", None)
+        if counter is None:
+            return
+        parked = sum(
+            1
+            for queue in (getattr(self, "waiting", None), getattr(self, "skipped_waiting", None))
+            if queue
+            for request in queue
+            if request.status == RequestStatus.WAITING_FOR_STREAMING_REQ
+        )
+        if parked != counter:
+            logger.debug("[Omni] resynced streaming-input counter %s -> %s", counter, parked)
+            self.num_waiting_for_streaming_input = parked

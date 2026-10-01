@@ -10,14 +10,22 @@ checkpoint for T2V and first-frame I2V. Every output includes synchronized
 48 kHz stereo audio.
 
 The raw [`Lightricks/LTX-2.5`](https://huggingface.co/Lightricks/LTX-2.5)
-repository is not directly loadable with `--model`. It supplies the official
-upsampler and LoRA sidecars used by the Full/SFT two-stage pipeline, so accept
-both model licenses and authenticate before first use.
+repository is not directly loadable with `--model`. It supplies the canonical
+Diffusion VAE checkpoint and the official upsampler and LoRA sidecars used by
+the Full/SFT two-stage pipeline, so accept both model licenses and authenticate
+before first use.
+
+The vLLM-Omni integration code is provided under the project's
+[Apache-2.0 license](../../LICENSE). The LTX-2.5 model weights are separate
+artifacts covered by the
+[LTX-2.x Community License](https://github.com/Lightricks/LTX-2/blob/main/LICENSE.md),
+not the vLLM-Omni license. Users are responsible for reviewing and complying
+with the model license before downloading or using the weights.
 
 ## Choose a pipeline
 
 | Pipeline | Mode | Default size | Schedule |
-|---|---|---:|---:|
+| --- | --- | ---: | ---: |
 | `LTX2Pipeline` | Full/SFT one-stage | 960x544 | 30 steps |
 | `LTX2TwoStagePipeline` | Full/SFT two-stage | 1920x1088 | 30 + 3 steps |
 | `LTX2DistilledOneStagePipeline` | Distilled one-stage | 960x544 | 8 steps |
@@ -27,6 +35,40 @@ Both two-stage pipelines generate at half resolution, apply the official x2
 latent upsampler, and run a three-step refinement stage. Select the class with
 `--model-class-name`; no `--task-type` flag is required. Supplying one initial
 image selects I2V, while omitting it selects T2V.
+
+## Video decoder
+
+LTX-2.5 uses the canonical Native Diffusion VAE decoder by default. To opt in
+to the legacy convolutional VAE, set the startup-only stage-0 model extra
+`ltx2_use_conv_vae: true`. The choice applies to all requests and all four
+pipeline classes above. DiffVAE loads its NATTEN kernel from Hugging Face Hub
+during startup. `decode_timestep` and `decode_noise_scale` condition only the
+legacy ConvVAE and have no effect when DiffVAE is selected.
+
+For offline Python usage:
+
+```python
+omni = Omni(
+    model="Lightricks/LTX-2.5-Diffusers",
+    model_class_name="LTX2Pipeline",
+    stage_overrides='{"0":{"extras":{"ltx2_use_conv_vae":true}}}',
+)
+```
+
+For online serving:
+
+```bash
+vllm serve Lightricks/LTX-2.5-Diffusers \
+  --omni \
+  --model-class-name LTX2Pipeline \
+  --stage-overrides '{"0":{"extras":{"ltx2_use_conv_vae":true}}}'
+```
+
+Both decoders are untiled by default. Set `vae_use_tiling` for memory-saving
+serial tiling; DiffVAE tiles only above 80 frames or 768 pixels in either spatial
+dimension. DiffVAE also supports distributed VAE decode; see the
+[VAE Parallelism Guide](../../docs/user_guide/diffusion/parallelism/vae_parallelism.md).
+DiffVAE is decoder-only, so I2V still uses the convolutional VAE encoder.
 
 ## Prerequisites
 
@@ -42,11 +84,12 @@ Install matching vLLM and vLLM-Omni versions, and ensure `ffmpeg` and
 ## Hardware
 
 | GPU | Status | Recommended scope |
-|---|---|---|
+| --- | --- | --- |
 | NVIDIA B300 | Verified | All four canonical pipelines |
 | NVIDIA B200 or H200 | Capacity-based recommendation; not yet verified | All four canonical pipelines |
 | NVIDIA GB200 or GB300 | Capacity-based recommendation; not yet verified | All four canonical pipelines |
 | NVIDIA H100 80 GB | FP8 recipe | Distilled one-stage at 960x544 |
+| Intel Arc Pro B70 32 GB | Verified | Offline Full/SFT one-stage T2V at 768x512 |
 
 The 1920x1088 two-stage examples require about 114 GB of peak GPU memory.
 80 GB GPUs do not have enough safety margin for the canonical two-stage
@@ -67,6 +110,56 @@ vllm serve Lightricks/LTX-2.5-Diffusers \
 ```
 
 Use the T2V or I2V request below after the server is ready.
+
+### Multi-GPU low-latency path
+
+For low-latency 1920x1088 distilled two-stage serving, match the Ulysses and
+VAE patch-parallel degrees to the GPU count. For example, on four GPUs:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 \
+vllm serve Lightricks/LTX-2.5-Diffusers \
+  --omni \
+  --model-class-name LTX2DistilledTwoStagePipeline \
+  --usp 4 \
+  --vae-patch-parallel-size 4 \
+  --vae-use-tiling \
+  --host 0.0.0.0 \
+  --port 8000 \
+  --stage-init-timeout 900
+```
+
+Strict Ulysses only: `((F - 1) / 8 + 1) * (H / 32) * (W / 32)` and TP-local
+SP attention head counts must be divisible by `ulysses_degree`. Use each
+phase's `H, W` (half/full resolution for two-stage); non-divisible shapes fail.
+Each GPU must still fit the resident weights. Warm up with the production shape.
+
+### 1x Intel Arc Pro B70 32 GB (XPU)
+
+Offline Full/SFT one-stage T2V at 768x512, 17 frames. Select the legacy
+convolutional VAE with `ltx2_use_conv_vae`; the default DiffVAE decoder loads a
+NATTEN kernel, which has no XPU build. FP8 with layerwise offload streams both
+the transformer and the Gemma-4 text encoder.
+
+Environment: torch 2.14.0+xpu, vLLM 0.29.0, vLLM-Omni `main` at `d8d162d8`.
+
+```bash
+python examples/offline_inference/text_to_video/text_to_video.py \
+  --model Lightricks/LTX-2.5-Diffusers \
+  --model-class-name LTX2Pipeline \
+  --stage-overrides '{"0":{"extras":{"ltx2_use_conv_vae":true}}}' \
+  --prompt "A serene lakeside sunrise with mist over the water." \
+  --num-frames 17 \
+  --quantization fp8 \
+  --enable-layerwise-offload \
+  --vae-use-tiling \
+  --vae-use-slicing \
+  --enforce-eager \
+  --output ltx25_output.mp4
+```
+
+Peaks at 16.3 GiB in 163 s. Two-stage, distilled, and I2V paths were not
+exercised on this hardware.
 
 ## Offline inference
 

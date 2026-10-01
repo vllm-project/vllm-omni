@@ -52,8 +52,8 @@ Always attach markers deliberately:
   - `tts` — speech synthesis / TTS-only models (`/v1/audio/speech`, voice clone, etc.)
   - `diffusion` — generative diffusion models (image / audio / text / video from noise)
 - **Cross-cutting area** (when relevant): `parallel`, `cache`, `example`, `benchmark`
-- **Hardware**: `cpu`, `gpu`, `cuda`, `rocm`, `npu`, `L4`, `H100`, `distributed_cuda`, …
-- Optional: `slow`, distributed markers when multi-card is required
+- **Hardware**: `cpu`, `gpu`, `cuda`, `rocm`, `npu`, …; SKU (`H100`, `L4`, …) and `cards_{n}` via `@hardware_test(...)` / `hardware_marks(...)` only — never `pytest.mark.H100` (`check-mark` rejects it)
+- Optional: `slow`. Multi-card: `num_cards=N` on the helper (filter with `cards_N` / `not cards_1`)
 
 **Baseline smoke (L2 + L3):** The simplest e2e case per model — default deploy, minimal request — should usually carry **both** `@pytest.mark.core_model` and `@pytest.mark.advanced_model` on the **same** test function so `test-ready.yml` and `test-merge.yml` share one test. `send_*_request` picks validation depth from `--run-level`. References: `test_voxcpm2_tts.py::test_text_to_audio_001`, `test_qwen3_tts_customvoice.py::test_text_to_audio_001`. Heavier scenarios use **`advanced_model` only**; L4 expansion uses **`full_model`**.
 
@@ -274,7 +274,7 @@ def test_text_to_video_001(omni_server, online_client) -> None:
 
 **3. Cross-cutting rules**
 
-- New `.py` files need the Omni SPDX header (`Copyright contributors to the vLLM-Omni project`, not `vLLM project`). `tests/` may keep stdlib `re`/`base64`; pickle is still banned unless the file is already on the pickle allowlist. Every collected `tests/**/test_*.py` needs a CI **level** mark and a **hardware** mark/helper (`check-test-ci-coverage` runs locally; GHA skips it). Do not grow `allowed_files` to land a test. Policy: [docs/contributing/README.md](../../../docs/contributing/README.md#linting).
+- New `.py` files need the Omni SPDX header (`Copyright contributors to the vLLM-Omni project`, not `vLLM project`). `tests/` may keep stdlib `re`/`base64`; pickle is still banned unless the file is already on the pickle allowlist. Every collected `tests/**/test_*.py` needs a CI **level** mark and a **hardware** platform mark/helper (`check-mark` runs locally; GHA skips it). Do not write `pytest.mark.H100` / `pytest.mark.L4`; use the helpers so `cards_{n}` is attached. Do not grow `allowed_files` to land a test. Policy: [docs/contributing/README.md](../../../docs/contributing/README.md#linting).
 - Reuse existing fixtures for the chosen scenario; do not mix “online client” assumptions into offline `OmniRunner` tests without a clear reason.
 - Avoid external network dependency in assertions unless the scenario is explicitly “online serving” or doc examples that require a model hub (then align with CI secrets/cache).
 - Keep **one test function = one intent** (one modality combo, one endpoint contract, or one acceleration combo).
@@ -468,10 +468,10 @@ When the user asks for **invalid parameter validation**, **invalid request bodie
 | **Invalid parameters Test · H100** | `pytest -s -v tests/dfx/reliability/invalid_param_test/ -m "slow and H100"` | Diffusion / omni / video invalid-param tests with `H100` hardware mark |
 | **Invalid parameters Test · L4** | `pytest -s -v tests/dfx/reliability/invalid_param_test/ -m "slow and L4"` | TTS / lighter models marked `L4` |
 
-- **Trigger:** `build.env("WEEKLY") == "1"` or PR label `weekly-test`.
+- **Trigger:** `build.env("WEEKLY") == "1"` (all weekly jobs) or PR label `weekly-test` (Reliability / Perf, then filtered by `source_file_dependencies`).
 - **Default:** extending an existing `invalid_param_test` script needs **no YAML edit** — the weekly steps already sweep the whole directory.
 - **Edit YAML only** when adding a **new hardware queue**, a **new top-level script** that must run in isolation, or a **model-specific weekly shard** (mirror neighboring reliability steps).
-- Weekly steps **do not** use `source_file_dependencies`.
+- Weekly Reliability / Perf jobs declare `source_file_dependencies`. Filtering applies only on the `weekly-test` label; `WEEKLY=1` on `main` keeps every job in those groups. CPU coverage (`WEEKLY=1` only) and the E2E Tests group (`NON_CRITICAL=1` only) do **not** use this field.
 
 **Example — append to `test_invalid_image_generation.py`:**
 
@@ -644,7 +644,7 @@ If the test is not already collected by an existing pipeline command (for exampl
 | **L2** | `test-ready.yml` with `core_model` + `source_file_dependencies` | merge / nightly pipelines |
 | **Invalid param** | `test-weekly.yml` — **Invalid parameters Test** group (`-m "slow and H100"` / `-m "slow and L4"`). Usually **no YAML edit** when appending cases to existing `invalid_param_test` scripts | `test-ready.yml`, `test-merge.yml`, `test-nightly.yml` |
 
-`test-nightly.yml` shards use **explicit pytest file paths** in `commands` (and PR labels like `diffusion-x2iat-test`); they generally **do not** use `source_file_dependencies`. Only suggest merge/ready YAML when the requested level is L3/L2 (or the user explicitly asks for multi-level CI).
+`test-nightly.yml` shards use **explicit pytest file paths** in `commands` plus `source_file_dependencies`; PR trigger is `nightly-test` (path filter), or `NIGHTLY=1` on `main` (all jobs). Only suggest merge/ready YAML when the requested level is L3/L2 (or the user explicitly asks for multi-level CI).
 
 **`test-nightly.yml` top-level groups** (each uses `full_model` + type marker in pytest `-m`):
 
@@ -653,7 +653,7 @@ If the test is not already collected by an existing pipeline command (for exampl
 | **Omni Model Test** | `omni` | Function / doc / accuracy / **perf** for Qwen-Omni family |
 | **TTS Model Test** | `tts` | `-m "full_model and L4 and tts"` (and H100 variants when enabled); **Perf Test** uses `run_benchmark.py` + `test_tts.json` |
 | **Diffusion X2I(&A&T) Model Test** | `diffusion` | Image/audio/text diffusion; explicit file shards for **Function**; **Perf Test · &lt;Model&gt;** uses `run_diffusion_benchmark.py` + JSON config |
-| **Diffusion X2V Model Test** | `diffusion` | Video-only (Wan, HunyuanVideo, …); PR label `diffusion-x2v-test`; separate **Perf** steps when in-tree |
+| **Diffusion X2V Model Test** | `diffusion` | Video-only (Wan, HunyuanVideo, …); separate **Perf** steps when in-tree |
 
 Guidelines when editing YAML:
 

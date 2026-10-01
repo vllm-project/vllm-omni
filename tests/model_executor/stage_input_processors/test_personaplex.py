@@ -93,15 +93,18 @@ def test_post_sample_talker_mtp_uses_current_temporal_state() -> None:
         *,
         audio_tokens: torch.Tensor | None = None,
         audio_provided: torch.Tensor | None = None,
+        num_steps: int | None = None,
     ) -> torch.Tensor:
         received["text_token"] = text_token
         received["hidden"] = hidden
         received["audio_tokens"] = audio_tokens
         received["audio_provided"] = audio_provided
-        return torch.arange(16, dtype=torch.long).reshape(1, 16)
+        received["num_steps"] = num_steps
+        return torch.arange(num_steps or 16, dtype=torch.long).reshape(1, -1)
 
     model = SimpleNamespace(
         _dtype=torch.float32,
+        num_active_codebooks=8,
         depformer=depformer,
         _duplex_stage0_runtime=lambda: SimpleNamespace(
             record_sample=lambda *, request_id, text_token, agent_codes: recorded.append(
@@ -126,7 +129,9 @@ def test_post_sample_talker_mtp_uses_current_temporal_state() -> None:
         ],
     )
 
-    assert codes.shape == (1, 16)
+    # Only the vocoded agent codebooks are drawn on the duplex path.
+    assert received["num_steps"] == 8
+    assert codes.shape == (1, 8)
     assert received["text_token"].tolist() == [101]
     assert received["hidden"].shape == (1, 1, 4)
     assert torch.equal(received["audio_tokens"], torch.arange(16).reshape(1, 16))

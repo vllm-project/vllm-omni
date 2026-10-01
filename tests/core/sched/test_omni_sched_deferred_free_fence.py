@@ -123,6 +123,9 @@ def _make_fast_path_sched(*, defer_block_free: bool) -> tuple[MagicMock, Request
 
     sched = MagicMock()
     sched.max_num_scheduled_tokens = 8
+    sched.max_num_running_reqs = 8
+    sched._native_data_plane = False
+    sched._retains_state_across_chunks = False
     sched._pause_state = PauseState.UNPAUSED
     sched.requests = {request.request_id: request}
     sched.running = [request]
@@ -166,3 +169,15 @@ def test_fast_path_schedule_defer_disabled_leaves_fence() -> None:
     OmniGenerationScheduler.schedule(sched)
 
     assert sched.sched_step_seq == 0
+
+
+def test_generation_schedule_sweeps_and_resyncs_around_pending_inputs() -> None:
+    sched, request = _make_fast_path_sched(defer_block_free=False)
+    calls: list[str] = []
+    sched._drop_aborted_queued_requests.side_effect = lambda: calls.append("sweep")
+    sched._process_pending_omni_inputs.side_effect = lambda model_mode: calls.append(model_mode)
+    sched._resync_streaming_input_counter.side_effect = lambda: calls.append("resync")
+
+    OmniGenerationScheduler.schedule(sched)
+
+    assert calls == ["sweep", "generation", "sweep", "resync"]

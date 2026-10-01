@@ -11,6 +11,8 @@ from typing import Any
 
 import yaml
 
+from vllm_omni.config.stage_config import load_deploy_config
+
 
 def modify_stage_config(
     yaml_path: str,
@@ -379,6 +381,40 @@ _CI_OVERLAYS: dict[str, dict[str, Any]] = {
             },
         },
     },
+    "qwen3_omni_moe_colocate_async": {
+        "base_config": "qwen3_omni_moe_thinking.yaml",
+        "stages": [
+            {
+                "stage_id": 0,
+                "enable_sleep_mode": True,
+                "enforce_eager": True,
+                "trust_remote_code": True,
+                "tensor_parallel_size": 1,
+                "devices": "0",
+                "max_num_seqs": 1,
+                "max_model_len": 8192,
+                "max_num_batched_tokens": 8192,
+                "enable_prefix_caching": False,
+                "skip_mm_profiling": True,
+            },
+        ],
+        "platforms": {
+            "rocm": {
+                "stages": [
+                    {
+                        "stage_id": 0,
+                        # This control-plane test needs only 8K tokens. On MI300,
+                        # percentage sizing attempted a ~125 GiB KV allocation
+                        # after the 64.5 GiB model load and then failed while
+                        # allocating the cache. Keep CUDA's existing sizing and
+                        # give only ROCm a bounded cache with ample headroom.
+                        "gpu_memory_utilization": None,
+                        "kv_cache_memory_bytes": 2 * 1024**3,
+                    },
+                ],
+            },
+        },
+    },
     "qwen3_omni_moe_multi_replicas_4gpu": {
         "base_config": "qwen3_omni_moe.yaml",
         "async_chunk": True,
@@ -669,6 +705,16 @@ def get_deploy_config_stage(rel_path: str, stage_id: int) -> dict[str, Any]:
     raise KeyError(f"No stage_id={stage_id} in deploy config {rel_path!r}")
 
 
+def get_deploy_duplex_max_sessions(rel_path: str) -> int:
+    """Return the duplex session capacity a deploy yaml admits.
+
+    Loads through ``load_deploy_config`` so ``base_config`` merging and
+    ``DuplexSessionRuntimeConfig`` defaults stay in lockstep with the server
+    instead of being re-implemented here.
+    """
+    return load_deploy_config(get_deploy_config_path(rel_path)).duplex_session.max_sessions
+
+
 def _stage_ids_from_deploy_yaml(stage_config_path: str) -> list[int]:
     """Return ``stage_id`` values from a new-schema deploy YAML (``stages``)."""
     with open(stage_config_path, encoding="utf-8") as f:
@@ -734,6 +780,7 @@ def stage_config_path_for_run_level(stage_config_path: str | None, run_level: st
 __all__ = [
     "get_deploy_config_path",
     "get_deploy_config_stage",
+    "get_deploy_duplex_max_sessions",
     "get_stage_entries",
     "load_stage_ids",
     "load_stage_replica_counts",

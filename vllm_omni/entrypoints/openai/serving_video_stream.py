@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Qwen-Omni streaming video WebSocket handler.
 
 Accepts video frames incrementally via WebSocket, buffers them, and
@@ -18,20 +18,21 @@ Protocol:
         {"type": "response.start"}
         {"type": "response.text.delta", "delta": "..."}
         {"type": "response.text.done", "text": "..."}
-        {"type": "response.audio.delta", "data": "...", "format": "wav"}
-        {"type": "response.audio.done"}
+        {"type": "response.output_audio.delta", "data": "...", "format": "wav"}
+        {"type": "response.output_audio.done"}
         {"type": "session.done"}
         {"type": "error", "message": "..."}
 """
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any
 
 from vllm_omni.entrypoints.openai.video_stream_base import (
-    _BAD_FRAME,
     _DEFAULT_CONFIG_TIMEOUT,
     _DEFAULT_IDLE_TIMEOUT,
+    PrewarmedFrame,
     StreamingVideoSessionConfig,
     VideoStreamTurnTrigger,
 )
@@ -59,23 +60,20 @@ class QwenOmniStreamingVideoHandler(OmniStreamingVideoHandlerBase):
         audio_buffer: bytearray,
         message_history: list[dict[str, Any]],
         query_text: str,
-        prewarmed_frames: dict[str, tuple[Any, str]],
+        prewarmed_frames: Mapping[str, PrewarmedFrame],
+        *,
+        frame_indices: list[int] | None = None,
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-        n_buf = len(frame_buffer)
-        if n_buf <= config.num_frames:
-            frames = list(frame_buffer)
-        else:
-            stride = max(1, n_buf // config.num_frames)
-            idx = [i * stride for i in range(config.num_frames - 1)] + [n_buf - 1]
-            frames = [frame_buffer[i] for i in idx]
-
         prewarmed = prewarmed_frames or {}
+        if frame_indices is None:
+            frame_indices = self._sample_frame_indices(frame_buffer, config.num_frames, prewarmed)
         user_content: list[dict] = []
-        for frame_b64 in frames:
+        for index in frame_indices:
+            frame_b64 = frame_buffer[index]
             cached = prewarmed.get(frame_b64)
-            if cached is _BAD_FRAME:
-                continue
             if cached is not None:
+                # The shared selector excludes failed decodes before this point.
+                assert isinstance(cached, tuple)
                 pil, pil_uuid = cached
                 user_content.append(
                     {

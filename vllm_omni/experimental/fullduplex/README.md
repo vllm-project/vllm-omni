@@ -1,43 +1,45 @@
-# Experimental Full-Duplex Runtime
+# Experimental Full-Duplex (JoyVL)
 
-This package contains three experimental integrations:
+This package now contains the JoyVL framework and its example integration,
+plus two client-side helpers kept for the benchmark and e2e drivers:
 
-- the existing JoyVL framework and example integration;
-- the MiniCPM-o 4.5 native audio path used by `/v1/duplex` and
-  `/v1/realtime?duplex=1`;
-- the PersonaPlex lockstep speech-to-speech path (browser demo + batched
-  serving, see `recipes/NVIDIA/PersonaPlex.md`).
-
-For the MiniCPM active runtime path, lifecycle invariants, capability boundary,
-Realtime response contract, and validation scope, see [`DESIGN.md`](DESIGN.md).
+```text
+core/              generic duplex scaffold used by the JoyVL adapter
+joyvl/             JoyVL model-specific integration
+client.py          legacy Realtime probe client (RealtimeDuplexClient) used by
+                   the omniinteract / omni-duplex-eval benchmarks and the
+                   server-VAD and Nemotron e2e drivers; applications should use
+                   vllm_omni.clients.duplex.DuplexClient instead
+video_stacking.py  camera-frame tiling for omni duplex video input
+```
 
 To run JoyVL, see
 [`recipes/JD/JoyAI-VL-Interaction.md`](../../../recipes/JD/JoyAI-VL-Interaction.md).
 
-## Package boundaries
+The native full-duplex runtimes graduated out of this package. They now live
+in the stable tree, where sessions are engine-resident (RFC
+[vllm-omni#7181](https://github.com/vllm-project/vllm-omni/issues/7181)):
 
 ```text
-core/        model-agnostic duplex contracts (adapter, session, turn runtime)
-engine/      AsyncOmni/orchestrator scheduler data-plane adapter
-openai/      WebSocket transport, Realtime projection, and audio codecs
-minicpmo45/  MiniCPM input framing, policy, compatibility, and Stage0 state
-joyvl/       JoyVL model-specific integration
-personaplex/ PersonaPlex lockstep engine, model-owned runtime, and serving
+vllm_omni/engine/duplex/                       sessions, manager, runner, leases, typed contract
+vllm_omni/engine/duplex_omni_engine.py         DuplexOmniEngine (session message surface)
+vllm_omni/engine/duplex_orchestrator.py        DuplexOrchestrator (hosts the session manager)
+vllm_omni/entrypoints/duplex_omni.py           DuplexOmni + DuplexSessionHandle (Python API)
+vllm_omni/entrypoints/duplex/                  WebSocket transport (attachments, resume, replay)
+vllm_omni/clients/duplex.py                    DuplexClient / DuplexClientBase
+vllm_omni/model_executor/models/minicpmo_4_5/duplex/  MiniCPM-o 4.5 DuplexModelPlugin
+vllm_omni/model_executor/models/personaplex/duplex/   PersonaPlex (pre-framework, not ported yet)
+vllm_omni/model_executor/models/nemotron_voicechat/duplex/  Nemotron VoiceChat (pre-framework, not ported yet)
+vllm_omni/model_executor/duplex_sampling.py    AR-runner sampling hook helper
+vllm_omni/outputs/duplex.py                    typed output decision envelope
 ```
 
-MiniCPM does not run through the experimental `core.DuplexRuntime`
-facade. Its active path uses the `openai` session controller, the experimental
-engine contracts, the standard scheduler/model runners, and an injected
-MiniCPM-specific runtime extension from `minicpmo45/runtime.py`.
-
-`personaplex/` is a Moshi-class, pure-lockstep speech-to-speech model on the
-`core/` contracts. It keeps `core/` untouched: the lockstep lifecycle (ONE
-eternal, frame-clocked response that drains on close, instead of the turn-style
-start/cancel-per-trigger one) is model policy and lives in the model package as
-`PersonaPlexDuplexRuntime`, mirroring the model-owned runtime shape of the
-MiniCPM-o duplex work. Its runnable serving path is `personaplex/serving/`
-(single-session lease or `--batch-size` elastic slots) over
-`personaplex/session.py` (lockstep driver).
+For their architecture and validation scope, see
+[`docs/design/fullduplex.md`](../../../docs/design/fullduplex.md) and
+[`docs/design/fullduplex-personaplex.md`](../../../docs/design/fullduplex-personaplex.md).
+PersonaPlex's single-process demo tier (browser client, standalone Moshi-web
+server, `core/`-scaffold adapter) was demo-only and was removed rather than
+graduated; the production path serves through the generic `/v1/duplex` stack.
 
 ## Adding a full-duplex model on the core contracts
 
@@ -49,7 +51,13 @@ only model policy.
    model-specific code there and do not touch `core/`.
 2. Implement one `DuplexAdapter` (`capabilities` / `on_input` / `respond`; the
    rest have defaults). Turn-based models run through `core.DuplexRuntime`
-   unchanged; a model needing a different lifecycle carries its own runtime in
-   its package (see `personaplex/adapter.py::PersonaPlexDuplexRuntime`).
+   unchanged.
 3. Promote a helper from a model package up into `core/` only once a second
    model actually needs it.
+
+For production serving, prefer the stable plugin seam instead: implement one
+`vllm_omni.engine.duplex.plugin.DuplexModelPlugin` and name it in the model's
+`pipeline.py` as `duplex_plugin`, as MiniCPM-o 4.5 does. PersonaPlex and
+Nemotron VoiceChat still carry their pre-framework duplex code and are ported
+to the plugin contract in follow-up PRs. The contract is documented in
+[`docs/design/fullduplex.md`](../../../docs/design/fullduplex.md).
