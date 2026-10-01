@@ -27,6 +27,7 @@ from vllm.model_executor.models.utils import (
     make_empty_intermediate_tensors_factory,
     make_layers,
 )
+from vllm.distributed.utils import get_pp_indices
 from vllm.sequence import IntermediateTensors
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata, VideoTokenLayout
@@ -898,6 +899,8 @@ class WanTransformer3DModel(nn.Module):
         rope_max_seq_len: int = 1024,
         pos_embed_seq_len: int | None = None,
         quant_config: QuantizationConfig | None = None,
+        layer_pp_rank: int | None = None,
+        layer_pp_world: int | None = None,
     ):
         super().__init__()
         # Store config for compatibility
@@ -926,15 +929,31 @@ class WanTransformer3DModel(nn.Module):
         inner_dim = num_attention_heads * attention_head_dim
         out_channels = out_channels or in_channels
 
-        if get_pipeline_parallel_world_size() == 0 and not is_pipeline_first_stage():
-            raise RuntimeError(
-                "`initialize_model_parallel()` must be called before constructing `WanTransformer3DModel`"
-            )
+        # Optional WaveServe-style layer PP: split by (rank, world) without mocking
+        # Omni's S·G process group. When unset, use the live pipeline-parallel group.
+        if layer_pp_world is not None:
+            if layer_pp_world < 1:
+                raise ValueError(f"layer_pp_world must be positive, got {layer_pp_world}")
+            pp_rank = 0 if layer_pp_rank is None else int(layer_pp_rank)
+            if not 0 <= pp_rank < layer_pp_world:
+                raise ValueError(f"layer_pp_rank {pp_rank} out of range for world {layer_pp_world}")
+            pp_world = int(layer_pp_world)
+            is_first = pp_rank == 0
+            is_last = pp_rank == pp_world - 1
+        else:
+            if get_pipeline_parallel_world_size() == 0 and not is_pipeline_first_stage():
+                raise RuntimeError(
+                    "`initialize_model_parallel()` must be called before constructing `WanTransformer3DModel`"
+                )
+            pp_rank = None
+            pp_world = None
+            is_first = is_pipeline_first_stage()
+            is_last = is_pipeline_last_stage()
 
         # 1. Patch & position embedding
         self.rope = WanRotaryPosEmbed(attention_head_dim, patch_size, rope_max_seq_len)
         # Patch embedding only on first PP stage; other stages receive hidden_states via P2P
-        if is_pipeline_first_stage():
+        if is_first:
             self.patch_embedding = Conv3dLayer(
                 in_channels=in_channels,
                 out_channels=inner_dim,
@@ -957,12 +976,9 @@ class WanTransformer3DModel(nn.Module):
         # DMD/FastVideo checkpoints retain VSA semantics when top-k selects every block.
         self.preserve_vsa_all_blocks = False
 
-        # 3. Transformer blocks — partitioned across PP stages via vLLM's `make_layers`.
-        # It computes the [start_layer, end_layer) slice for this rank and fills the remaining slots
-        # with PPMissingLayer so that weight names stay globally consistent.
-        self.start_layer, self.end_layer, self.blocks = make_layers(
-            num_layers,
-            lambda prefix: WanTransformerBlock(
+        # 3. Transformer blocks — partitioned across PP stages.
+        def _make_block(prefix: str) -> WanTransformerBlock:
+            return WanTransformerBlock(
                 inner_dim,
                 ffn_dim,
                 num_attention_heads,
@@ -971,12 +987,30 @@ class WanTransformer3DModel(nn.Module):
                 cross_attn_norm,
                 quant_config=quant_config,
                 prefix=prefix,
-            ),
-            prefix="blocks",
-        )
+            )
+
+        if pp_world is not None:
+            # Explicit (rank, world) slice — used by WaveServe Noisy PP layer groups.
+            start_layer, end_layer = get_pp_indices(num_layers, pp_rank, pp_world)
+            blocks: list[nn.Module] = []
+            for idx in range(num_layers):
+                if start_layer <= idx < end_layer:
+                    blocks.append(_make_block(f"blocks.{idx}"))
+                else:
+                    blocks.append(PPMissingLayer())
+            self.start_layer = start_layer
+            self.end_layer = end_layer
+            self.blocks = nn.ModuleList(blocks)
+        else:
+            # Production Omni PP: make_layers follows the live PP group.
+            self.start_layer, self.end_layer, self.blocks = make_layers(
+                num_layers,
+                _make_block,
+                prefix="blocks",
+            )
 
         # 4. Output norm & projection — only on the last PP stage
-        if is_pipeline_last_stage():
+        if is_last:
             self.norm_out = AdaLayerNorm(inner_dim, elementwise_affine=False, eps=eps)
             self.proj_out = nn.Linear(inner_dim, out_channels * math.prod(patch_size))
         else:
@@ -985,7 +1019,7 @@ class WanTransformer3DModel(nn.Module):
         # SP helper modules
         self.timestep_proj_prepare = TimestepProjPrepare()
         self._sp_shard_point = nn.Identity()
-        if is_pipeline_last_stage():
+        if is_last:
             self.output_scale_shift_prepare = OutputScaleShiftPrepare(inner_dim)
         else:
             self.output_scale_shift_prepare = PPMissingLayer()

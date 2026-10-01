@@ -453,12 +453,19 @@ class CudaOmniPlatform(OmniPlatform, CudaPlatformBase):
         if envs.VLLM_USE_OINK_OPS:
             rms_norm = ["oink"] + default
 
-        # Mirrors upstream CudaPlatformBase defaults: `gelu_and_mul_sparse` is
-        # implemented by `triton` and `native` only, so it must not fall back to
-        # `default` (which contains `vllm_c`) via IrOpPriorityConfig.with_default.
-        return IrOpPriorityConfig.with_default(
-            default,
-            rms_norm=rms_norm,
-            fused_add_rms_norm=rms_norm,
-            gelu_and_mul_sparse=["triton", "native"],
-        )
+        # Mirrors upstream CudaPlatformBase defaults when the installed vLLM
+        # IrOpPriorityConfig knows the field. Older vLLM (e.g. 0.29) only has
+        # rms_norm / fused_add_rms_norm — skip unknown kwargs to stay bootable.
+        kwargs: dict[str, list[str]] = {
+            "rms_norm": rms_norm,
+            "fused_add_rms_norm": rms_norm,
+            "gelu_and_mul_sparse": ["triton", "native"],
+        }
+        fields = getattr(IrOpPriorityConfig, "model_fields", None)
+        if fields is not None:
+            kwargs = {k: v for k, v in kwargs.items() if k in fields}
+        else:
+            annotations = getattr(IrOpPriorityConfig, "__annotations__", {})
+            if annotations:
+                kwargs = {k: v for k, v in kwargs.items() if k in annotations}
+        return IrOpPriorityConfig.with_default(default, **kwargs)

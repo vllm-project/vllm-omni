@@ -125,6 +125,7 @@ from vllm_omni.model_executor.models.step_audio2.pipeline import (
 from vllm_omni.model_executor.models.voxcpm2.pipeline import VOXCPM2_PIPELINE
 from vllm_omni.model_executor.models.voxtral_tts.pipeline import VOXTRAL_TTS_PIPELINE
 from vllm_omni.model_executor.models.wan2_2.pipeline import WAN2_2_TI2V_PIPELINE
+from vllm_omni.model_executor.models.waveserve_wan.pipeline import WAVESERVE_WAN_PIPELINE
 
 logger = init_logger(__name__)
 
@@ -208,6 +209,7 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "voxcpm2": VOXCPM2_PIPELINE,
     "voxtral_tts": VOXTRAL_TTS_PIPELINE,
     "wan2_2_ti2v": WAN2_2_TI2V_PIPELINE,
+    "waveserve_wan": WAVESERVE_WAN_PIPELINE,
 }
 
 
