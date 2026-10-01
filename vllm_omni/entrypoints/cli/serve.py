@@ -793,8 +793,10 @@ class OmniServeCommand(CLISubcommand):
             help=(
                 "JSON object configuring video output transport: enable_device_postprocess enables GPU preparation; "
                 "enable_registered_shm enables experimental CUDA-registered SHM for supported video outputs. "
-                "enable_borrowed_frames enables borrowed RGB frames in MP4 response encoding. "
-                "All default to false."
+                "enable_borrowed_frames enables borrowed RGB frames in response encoding. "
+                "These flags default to false. For example "
+                '\'{"enable_device_postprocess": true, "transport_mode": "bytes", '
+                '"output_format": "mp4"}\'.'
             ),
         )
         omni_config_group.add_argument(

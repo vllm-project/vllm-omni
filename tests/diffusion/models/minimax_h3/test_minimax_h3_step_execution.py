@@ -438,6 +438,8 @@ def test_prepare_encode_seeds_runner_visible_state(monkeypatch, batch_frames):
         "width": 64,
         "preencode_mp4": True,
         "preencode_batch_frames": batch_frames,
+        "video_codec": "libx264",
+        "video_codec_options": {"crf": "0"},
         "latent_t": 2,
         "latent_h": 4,
         "latent_w": 6,
@@ -504,6 +506,8 @@ def test_prepare_encode_seeds_runner_visible_state(monkeypatch, batch_frames):
     monkeypatch.setattr(pipeline, "decode_to_mp4", decode_to_mp4)
     assert pipeline.post_decode(state).output == (b"mp4", None)
     assert calls[0]["batch_frames"] == batch_frames
+    assert calls[0]["video_codec"] == "libx264"
+    assert calls[0]["video_codec_options"] == {"crf": "0"}
 
 
 def test_prepare_encode_rejects_request_mode_only_features():

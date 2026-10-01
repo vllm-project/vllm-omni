@@ -69,7 +69,8 @@ same typed media contract without bypassing model-specific float consumers such
 as safety checks or audio/video packaging.
 
 See [RFC #6541](https://github.com/vllm-project/vllm-omni/issues/6541) for the
-contract, lifecycle, batching rules, and migration plan.
+contract, lifecycle, batching rules, and migration plan. Container encoding and
+client delivery are configured separately in [Video output transport](video_output_transport.md).
 
 ## Experimental registered-SHM video transport
 
@@ -80,7 +81,7 @@ intermediate pinned-to-SHM and SHM-to-consumer host copies. The D2H transfer sti
 occurs.
 
 `video_output_transport.enable_borrowed_frames` independently enables borrowed
-RGB AVFrames in the Videos API MP4 response encoder, removing the third host
+RGB AVFrames in the Videos API response encoder, removing the third host
 copy into PyAV frame buffers. It also defaults to false. Eligible uint8 RGB
 frames are wrapped with `VideoFrame.from_numpy_buffer`; other dtypes/layouts use
 the existing encoder path. Color conversion, compression and muxing still occur.

@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import asyncio
 import contextlib
 import os
@@ -33,6 +36,12 @@ class FileStorageHandle(BaseStorageHandle):
     kind: Literal["path"] = field(default="path", init=False)
 
 
+@dataclass(frozen=True)
+class UrlStorageHandle(BaseStorageHandle):
+    url: str
+    kind: Literal["url"] = field(default="url", init=False)
+
+
 K = TypeVar("K", bound=BaseStorageHandle, covariant=True)
 
 
@@ -55,18 +64,39 @@ class StorageBaseManager(Generic[K], ABC):
     async def open(self, storage_key: str) -> K | None:
         pass
 
+    @property
+    def has_expiration_policy(self) -> bool:
+        return False
 
-class LocalStorageManager(StorageBaseManager[FileStorageHandle]):
-    def __init__(self, storage_path: str, max_concurrency: int = 4):
+    def public_url(self, storage_key: str) -> str | None:
+        return None
+
+
+class LocalStorageManager(StorageBaseManager[FileStorageHandle | UrlStorageHandle]):
+    def __init__(
+        self,
+        storage_path: str,
+        max_concurrency: int = 4,
+        public_base_url: str | None = None,
+    ):
         self.storage_path = os.path.realpath(storage_path)
         os.makedirs(self.storage_path, exist_ok=True)
-
+        self.public_base_url = public_base_url.rstrip("/") if public_base_url else None
         self._io_semaphore = asyncio.Semaphore(max(1, max_concurrency))
 
-    async def open(self, storage_key: str) -> FileStorageHandle | None:
+    def public_url(self, storage_key: str) -> str | None:
+        if self.public_base_url is None:
+            return None
+        self.get_full_file_path(storage_key)
+        return f"{self.public_base_url}/{storage_key}"
+
+    async def open(self, storage_key: str) -> FileStorageHandle | UrlStorageHandle | None:
         local_file = self.get_full_file_path(storage_key)
         if not os.path.exists(local_file):
             return None
+        public_url = self.public_url(storage_key)
+        if public_url is not None:
+            return UrlStorageHandle(url=public_url)
         return FileStorageHandle(path=local_file)
 
     def _save_sync(self, data: bytes, file_name: str) -> SaveContext:
@@ -118,6 +148,10 @@ class LocalStorageManager(StorageBaseManager[FileStorageHandle]):
 
 
 class LocalStorageTTLManager(LocalStorageManager):
+    @property
+    def has_expiration_policy(self) -> bool:
+        return True
+
     def __init__(self, ttl_seconds: int, sweep_interval_seconds: int, *args, **kwargs):
         if ttl_seconds <= 0:
             raise ValueError("`ttl_seconds` must be greater than or equal to 1.")
@@ -188,23 +222,22 @@ class LocalStorageTTLManager(LocalStorageManager):
         self._sweeper_task = None
 
 
-def get_storage_manager(storage_config: FileBackend) -> StorageBaseManager[FileStorageHandle]:
-    if isinstance(storage_config, FileBackend):
-        if storage_config.file_ttl is not None and storage_config.ttl_sweep_interval is not None:
-            manager = LocalStorageTTLManager(
-                storage_path=storage_config.path,
-                max_concurrency=storage_config.file_concurrency,
-                ttl_seconds=storage_config.file_ttl,
-                sweep_interval_seconds=storage_config.ttl_sweep_interval,
-            )
-        else:
-            manager = LocalStorageManager(
-                storage_path=storage_config.path, max_concurrency=storage_config.file_concurrency
-            )
-    else:
-        raise ValueError("No supported storage managers")
-
-    return manager
+def get_storage_manager(storage_config: FileBackend) -> StorageBaseManager[BaseStorageHandle]:
+    if not isinstance(storage_config, FileBackend):
+        raise TypeError("file storage requires FileBackend configuration")
+    if storage_config.file_ttl is not None and storage_config.ttl_sweep_interval is not None:
+        return LocalStorageTTLManager(
+            storage_path=storage_config.path,
+            max_concurrency=storage_config.file_concurrency,
+            ttl_seconds=storage_config.file_ttl,
+            sweep_interval_seconds=storage_config.ttl_sweep_interval,
+            public_base_url=storage_config.public_base_url,
+        )
+    return LocalStorageManager(
+        storage_path=storage_config.path,
+        max_concurrency=storage_config.file_concurrency,
+        public_base_url=storage_config.public_base_url,
+    )
 
 
 STORAGE_MANAGER = get_storage_manager(SERVER_SETTINGS_CONFIG.storage)

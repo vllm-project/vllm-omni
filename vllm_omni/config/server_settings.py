@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import os
 import warnings
 from typing import Literal
@@ -29,6 +32,10 @@ class FileBackend(BaseModel):
     )
     ttl_sweep_interval: int | None = Field(
         default=None, description="Optional frequency (in seconds) to enforce file TTLs."
+    )
+    public_base_url: str | None = Field(
+        default=None,
+        description="Optional static-server or CDN base URL for stored artifacts.",
     )
 
     @field_validator("path", mode="before")
