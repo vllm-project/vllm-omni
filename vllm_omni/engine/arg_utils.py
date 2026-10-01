@@ -596,6 +596,7 @@ class OrchestratorArgs:
     enable_layerwise_offload: bool = False
     enable_distributed_layerwise_offload: bool = False
     dlo_use_allgather: bool = True
+    dlo_chunk_size_mb: int = 64
     dlo_resident_layers: int = 0
     host_weight_runtime_mode: str = "disabled"
     host_weight_runtime_root: str | None = None

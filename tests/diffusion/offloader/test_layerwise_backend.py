@@ -617,6 +617,7 @@ def _offload_od_config(**overrides):
         "enable_layerwise_offload": False,
         "enable_distributed_layerwise_offload": False,
         "dlo_use_allgather": True,
+        "dlo_chunk_size_mb": 64,
         "dlo_resident_layers": 0,
         "pin_cpu_memory": True,
         "parallel_config": None,
