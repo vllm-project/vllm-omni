@@ -422,6 +422,7 @@ def _construct_quantized_pipeline(pipeline_kind, active, disk_quant_config, tmp_
         monkeypatch.setattr(module, "prefetch_subfolders", lambda *args, **kwargs: None)
         monkeypatch.setattr(module, "from_pretrained_with_prefetch", lambda *args, **kwargs: FakeComponent())
     monkeypatch.setattr(wan22_module, "WanTransformer3DModel", FakeTransformer)
+    monkeypatch.setattr(wan22_module, "load_wan_vae_scale_factors", lambda *args: (4, 8))
     monkeypatch.setattr(vace_module, "WanVACETransformer3DModel", FakeTransformer)
     pipeline_cls = {
         "t2v": wan22_module.Wan22Pipeline,

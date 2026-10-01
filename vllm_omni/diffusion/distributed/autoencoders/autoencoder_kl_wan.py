@@ -196,6 +196,24 @@ class DistributedAutoencoderKLWan(OmniAutoencoderKLWan, DistributedVaeMixin):
         model.init_distributed()
         return model
 
+    def retain_stage_components(self, *, encode: bool) -> None:
+        """Prune the unused Wan half before device placement/offload discovery.
+
+        Diffusers 0.40 caches encoder/decoder convolution counts separately;
+        both encode and decode call clear_cache, but neither executes the other
+        half. Keep the public attributes and zero only the removed cache count.
+        This reduces resident weights, NOT from_pretrained's peak host memory:
+        the ordinary checkpoint loader still loads both halves first.
+        """
+        removed = "decoder" if encode else "encoder"
+        projection = "post_quant_conv" if encode else "quant_conv"
+        if not isinstance(getattr(self, "_cached_conv_counts", None), dict):
+            raise RuntimeError("Wan stage VAE pruning requires Diffusers' cached encoder/decoder conv counts.")
+        setattr(self, removed, None)
+        setattr(self, projection, None)
+        self._cached_conv_counts[removed] = 0
+        self.clear_cache()
+
     def tile_split(self, z: torch.Tensor) -> tuple[list[TileTask], GridSpec]:
         _, _, num_frames, height, width = z.shape
         sample_height = height * self.spatial_compression_ratio

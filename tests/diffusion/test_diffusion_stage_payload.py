@@ -192,6 +192,30 @@ def test_key_convention_fetch_merges_into_additional_information():
     assert req.prompt["additional_information"]["text_encoder_output"]["hidden_states"].shape == (4, 8)
 
 
+@pytest.mark.parametrize("with_metadata", [False, True])
+@pytest.mark.parametrize("with_embeddings", [False, True])
+def test_wan_transport_requires_embeddings_but_defers_conditioning_validation(with_metadata, with_embeddings):
+    from vllm_omni.model_executor.models.wan2_2.pipeline import WAN2_2_EG_PIPELINE
+
+    payload = {}
+    if with_embeddings:
+        payload["prompt_embeds"] = torch.zeros(4, 8)
+    if with_metadata:
+        payload["wan_conditioning_metadata"] = {"has_image": False}
+    connector = _FakeConnector(payload)
+    runner = _make_runner(connector, payload_keys=WAN2_2_EG_PIPELINE.stages[1].stage_input_payload_keys)
+    req = _make_request({"prompt": "a cat"})
+
+    if not with_embeddings:
+        with pytest.raises(RuntimeError, match="prompt_embeds"):
+            runner._maybe_recv_stage_payload(req)
+    else:
+        runner._maybe_recv_stage_payload(req)
+        additional = req.prompt["additional_information"]
+        torch.testing.assert_close(additional["prompt_embeds"], payload["prompt_embeds"])
+        assert ("wan_conditioning_metadata" in additional) is with_metadata
+
+
 def test_handle_path_uses_its_own_key_and_metadata():
     connector = _FakeConnector(_conditioning())
     runner = _make_runner(connector, payload_keys=())
@@ -653,6 +677,37 @@ def test_send_key_matches_the_receive_key_convention():
     receiver._maybe_recv_stage_payload(_make_request({"prompt": "a cat"}))
 
     assert sender_connector.put_calls[0][2] == recv_connector.calls[0][2]
+
+
+@pytest.mark.parametrize("has_image", [False, True])
+def test_wan_conditioning_and_metadata_share_connector_lifecycle(has_image):
+    from vllm_omni.model_executor.models.wan2_2.pipeline import WAN2_2_EGD_PIPELINE
+
+    keys = WAN2_2_EGD_PIPELINE.stages[0].stage_output_payload_keys
+    payload = {
+        "prompt_embeds": torch.zeros(2, 8),
+        "wan_conditioning_metadata": {"version": 1, "has_image": has_image},
+    }
+    if has_image:
+        payload["wan_image_condition"] = torch.ones(1, 4, 1, 2, 4)
+    sender_connector = _FakeConnector()
+    sender = _make_sender(sender_connector, payload_keys=keys)
+    output = _make_output(**payload)
+    sender._maybe_send_stage_payload([_make_request({"prompt": "a cat"})], [output])
+
+    sent = sender_connector.put_calls[0][3]
+    assert isinstance(sent, dict)
+    assert set(sent) == set(payload)
+    assert set(output.custom_output) == {HANDLE_KEY}
+    receiver = _make_runner(_FakeConnector(sent), payload_keys=keys)
+    request = _make_request({"prompt": "a cat", HANDLE_KEY: output.custom_output[HANDLE_KEY]})
+    receiver._maybe_recv_stage_payload(request)
+    received = request.prompt["additional_information"]
+    assert set(received) == set(payload)
+    assert received["wan_conditioning_metadata"] == payload["wan_conditioning_metadata"]
+    if has_image:
+        torch.testing.assert_close(received["wan_image_condition"], payload["wan_image_condition"])
+    assert HANDLE_KEY not in request.prompt
 
 
 def test_stage_without_declared_output_keys_never_puts():

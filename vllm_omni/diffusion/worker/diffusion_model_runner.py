@@ -862,7 +862,11 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                 with record_function(record_name):
                     try:
                         check_request_cancellation()
-                        raw_outputs = self.pipeline.forward(batch)
+                        run_stage = getattr(self.pipeline, "run_stage", None)
+                        if callable(run_stage):
+                            raw_outputs = run_stage(batch)
+                        else:
+                            raw_outputs = self.pipeline.forward(batch)
                         outputs = _normalize_pipeline_outputs(
                             raw_outputs,
                             expected_count=len(reqs),
