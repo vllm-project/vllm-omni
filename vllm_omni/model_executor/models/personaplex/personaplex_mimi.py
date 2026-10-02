@@ -48,6 +48,27 @@ DEFAULT_HF_REPO = "kyutai/mimi"
 FRAME_SIZE = 1920
 CODEBOOKS = 8
 _GRAPH_WARMUP_ITERS = 2
+_GRAPH_STREAMS: dict[int, torch.cuda.Stream] = {}
+
+
+def graph_stream() -> torch.cuda.Stream:
+    """The one side stream every PersonaPlex CUDA graph of the current device warms up and is captured on.
+
+    The caching allocator reuses a freed block only for the stream that allocated it, and cuBLAS keeps a
+    workspace (32 MiB on sm90) for every stream that ran a matmul, for the life of the process. A new
+    stream per capture left each warmup's temporaries in segments that no later allocation could reuse,
+    and a workspace allocated among them kept ``empty_cache`` from releasing them. On one stream the
+    warmups reuse the same segments, and its workspace is created here, before any temporary, in a
+    segment of its own; the captured graphs replay with it.
+    """
+    device = torch.accelerator.current_device_index()
+    stream = _GRAPH_STREAMS.get(device)
+    if stream is None:
+        stream = torch.cuda.Stream()
+        with torch.cuda.stream(stream):
+            torch.cuda.current_blas_handle()  # allocates the stream's cuBLAS workspace
+        _GRAPH_STREAMS[device] = stream
+    return stream
 
 
 def _normalize_active(active: torch.Tensor | None, all_active: torch.Tensor) -> torch.Tensor:
@@ -388,7 +409,12 @@ class PersonaPlexMimiCodec(nn.Module):
                 "tokenizer-e351c8d8-checkpoint125.safetensors",
             )
         sd = load_file(checkpoint, device=str(self.device))
-        self.model = MimiModel(MimiConfig())
+        orig_default_dtype = torch.get_default_dtype()
+        try:
+            torch.set_default_dtype(torch.float32)
+            self.model = MimiModel(MimiConfig())
+        finally:
+            torch.set_default_dtype(orig_default_dtype)
         codec_state = _map_moshi_codec_weights(sd)
         incompatible = self.model.load_state_dict(codec_state, strict=False)
         expected_missing = {
@@ -501,7 +527,6 @@ class PersonaPlexMimiCodec(nn.Module):
             out = out + _residual_decode(quantizer.acoustic_residual_vector_quantizer, codes[:, semantic:])
         return out
 
-
     # -- CUDA graphs ------------------------------------------------------------
 
     @torch.no_grad()
@@ -525,7 +550,7 @@ class PersonaPlexMimiCodec(nn.Module):
         inputs = torch.zeros(self._batch_size, *shape, device=self.device, dtype=dtype)
         active = torch.ones_like(self._all_active)
         try:
-            stream = torch.cuda.Stream()
+            stream = graph_stream()
             stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(stream):
                 for _ in range(_GRAPH_WARMUP_ITERS):
@@ -537,6 +562,7 @@ class PersonaPlexMimiCodec(nn.Module):
             with torch.cuda.graph(
                 graph,
                 pool=torch.cuda.graph_pool_handle(),
+                stream=stream,
                 capture_error_mode="thread_local",
             ):
                 output = run(inputs, active)
@@ -561,7 +587,6 @@ class PersonaPlexMimiCodec(nn.Module):
         if self._decode_graph is None:
             self._decode_graph = self._capture("decoder", self._decode_frame, (CODEBOOKS,), torch.long)
         return self._decode_graph is not None
-
 
     # -- per-frame codec -------------------------------------------------------
 
@@ -599,7 +624,6 @@ class PersonaPlexMimiCodec(nn.Module):
         emb = self.decoder_transformer.step(emb.transpose(1, 2), active).transpose(1, 2)
         x = self._run_stages(emb, self._dec_stages, active)
         return x[:, 0, :]
-
 
     def decode_frames(self, codes: torch.Tensor, active: torch.Tensor | None = None) -> torch.Tensor:
         """``[B, 8, F]`` codes -> ``[B, F * frame_size]`` float PCM."""

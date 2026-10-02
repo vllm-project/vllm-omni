@@ -518,15 +518,18 @@ class PersonaPlexCode2Wav(nn.Module):
             pass
 
         device = self.vllm_config.device_config.device
+        from vllm.utils.torch_utils import set_default_torch_dtype
+
         from vllm_omni.model_executor.models.personaplex.personaplex_mimi import (
             PersonaPlexMimiCodec,
         )
 
         checkpoint = Path(self.model_path) / (self._mimi_name or "tokenizer-e351c8d8-checkpoint125.safetensors")
-        codec = PersonaPlexMimiCodec(
-            checkpoint=str(checkpoint) if checkpoint.is_file() else None,
-            device=str(device),
-        ).eval()
+        with set_default_torch_dtype(torch.float32):
+            codec = PersonaPlexMimiCodec(
+                checkpoint=str(checkpoint) if checkpoint.is_file() else None,
+                device=str(device),
+            ).eval()
         # Allocate the streaming state and the decode graph's pool here, not on
         # the first request, so vLLM's memory profiling sees them.
         self._install_mimi(codec, torch.device(str(device)))

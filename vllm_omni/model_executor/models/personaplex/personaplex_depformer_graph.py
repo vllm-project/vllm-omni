@@ -18,6 +18,8 @@ from typing import Any
 import torch
 from vllm.logger import init_logger
 
+from vllm_omni.model_executor.models.personaplex.personaplex_mimi import graph_stream
+
 logger = init_logger(__name__)
 
 __all__ = ["PersonaPlexDepformerGraphs", "depformer_graph_buckets"]
@@ -171,14 +173,15 @@ class PersonaPlexDepformerGraphs:
                 continue
             args = self._static_args(rows)
             try:
-                stream = torch.cuda.Stream()
+                # The Mimi codec's graph stream: every bucket's warmup reuses its segments and cuBLAS workspace.
+                stream = graph_stream()
                 stream.wait_stream(torch.cuda.current_stream())
                 with torch.cuda.stream(stream):
                     for _ in range(_GRAPH_WARMUP_ITERS):
                         self._step(*args)
                 torch.cuda.current_stream().wait_stream(stream)
                 graph = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(graph, pool=pool, capture_error_mode="thread_local"):
+                with torch.cuda.graph(graph, pool=pool, stream=stream, capture_error_mode="thread_local"):
                     output = self._step(*args)
             except Exception:
                 logger.warning(

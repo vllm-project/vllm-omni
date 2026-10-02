@@ -280,10 +280,6 @@ def _row_bytes(codec: PersonaPlexMimiCodec, batch_size: int) -> int:
 def test_one_sided_codec_allocates_only_its_half(half: str) -> None:
     full = _make_small_codec(torch.device("cpu"), batch_size=3)
     codec = _one_sided_codec(half, batch_size=3)
-    if half == "decode":
-        # Stage 1's chunk decode re-runs streaming_init: the codec stays decoder-only.
-        for decoder in (full, codec):
-            decoder.configure_decoder(hoist_frame=True, chunk_frames=3)
 
     assert [t.shape for t in _half_tensors(codec, half)] == [t.shape for t in _half_tensors(full, half)]
     assert _half_tensors(codec, _other(half)) == []
@@ -332,9 +328,7 @@ def test_one_sided_codec_rejects_the_other_direction() -> None:
         "decode": [
             lambda: encoder.decode_frame(codes[..., 0]),
             lambda: encoder.decode_frames(codes),
-            lambda: encoder.decode_chunk(codes),
             encoder.capture_decode_graph,
-            lambda: encoder.capture_decode_chunk_graphs(2),
         ],
         "encode": [lambda: decoder.encode_frame(torch.zeros(3, FRAME_SIZE)), decoder.capture_encode_graph],
     }
