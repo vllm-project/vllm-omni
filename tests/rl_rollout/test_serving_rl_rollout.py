@@ -8,6 +8,7 @@ semantics, committed_step_id invariants, and error paths without a GPU.
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -100,6 +101,49 @@ async def test_close_session(serving):
     assert status.committed_step_id == -1
     serving._openpi.drop_session.assert_any_call(resp.session_id)
     serving._openpi.drop_session.assert_any_call(f"{resp.session_id}:stateless")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("use_session_context", [True, False])
+async def test_queued_step_rechecks_closed_session(serving, use_session_context):
+    created = await serving.create_session(CreateSessionRequest(model="dreamzero", mode="world_model_env"))
+    session = await serving._store.get(created.session_id)
+    close_started = asyncio.Event()
+    step_started = asyncio.Event()
+
+    async def close():
+        close_started.set()
+        await serving.close_session(session.session_id)
+
+    async def step():
+        step_started.set()
+        return await serving.step(
+            session.session_id,
+            RolloutStepRequest(
+                step_id=0,
+                observation=Observation(),
+                action=Action(),
+                use_session_context=use_session_context,
+            ),
+        )
+
+    # Both calls reach the held lock before it is released. asyncio locks
+    # are fair, so close completes before the queued step gets the lock.
+    async with session.lock:
+        close_task = asyncio.create_task(close())
+        await asyncio.wait_for(close_started.wait(), timeout=5)
+        step_task = asyncio.create_task(step())
+        await asyncio.wait_for(step_started.wait(), timeout=5)
+
+    await asyncio.wait_for(close_task, timeout=5)
+    response = await asyncio.wait_for(step_task, timeout=5)
+
+    assert response.error is not None
+    assert response.error.code == "session_closed"
+    assert session.closed
+    assert session.committed_step_id == -1
+    assert session.context_length == 0
+    serving._openpi.build_request.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
