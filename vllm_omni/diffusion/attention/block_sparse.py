@@ -27,6 +27,7 @@ from vllm_omni.diffusion.attention.capabilities import (
     PackingMode,
     ParallelStrategy,
 )
+from vllm_omni.diffusion.attention.contracts import MethodCapabilities
 from vllm_omni.diffusion.config import get_current_diffusion_config_or_none
 from vllm_omni.diffusion.data import BlockSparseAttentionSpec
 
@@ -82,6 +83,8 @@ class BlockSparseBackend(AttentionBackend):
     AttentionBackend's conservative False defaults. The bound execution adapter
     remains on BlockSparseAttention and establishes actual request support.
     """
+
+    strategy_capabilities = MethodCapabilities(local_execution=True)
 
     @staticmethod
     def get_name() -> str:

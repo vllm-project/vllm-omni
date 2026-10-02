@@ -1,0 +1,71 @@
+{
+  "presets": {
+    "fa3_dense": {
+      "backend": "FLASH_ATTN"
+    },
+    "fa4_subblock": {
+      "name": "block_sparse",
+      "config": {
+        "block_size": [
+          64,
+          64
+        ],
+        "selection": {
+          "name": "block_topk",
+          "config": {
+            "target_sparsity": 0.75
+          }
+        },
+        "backend": {
+          "require": "FLASH_ATTN",
+          "implementation": "auto"
+        }
+      }
+    }
+  },
+  "layouts": {
+    "dense": {
+      "default": "fa3_dense"
+    },
+    "mixed": {
+      "default": "fa4_subblock",
+      "overrides": [
+        {
+          "attention_role": "cosmos3.und",
+          "use": "fa3_dense"
+        },
+        {
+          "attention_role": "cosmos3.gen_multi_control",
+          "use": "fa3_dense"
+        },
+        {
+          "layers": [
+            1,
+            2,
+            15,
+            30,
+            31,
+            32,
+            33,
+            34
+          ],
+          "attention_role": "cosmos3.gen",
+          "use": "fa3_dense"
+        }
+      ]
+    }
+  },
+  "schedule": {
+    "coordinate": "step_index",
+    "phases": [
+      {
+        "until": 10,
+        "layout": "dense"
+      },
+      {
+        "until": null,
+        "layout": "mixed"
+      }
+    ]
+  }
+}
