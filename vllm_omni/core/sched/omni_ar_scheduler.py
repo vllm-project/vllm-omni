@@ -101,6 +101,23 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
     max_num_running_reqs: int
 
+    def reset_prefix_cache(self, reset_running_requests: bool = False, reset_connector: bool = False) -> bool:
+        model_config = self.vllm_config.model_config
+        if (
+            reset_running_requests
+            and self.running
+            and not getattr(model_config, "supports_running_prefix_cache_reset", True)
+        ):
+            # Reset preempts and resumes in the same step while discarding
+            # in-flight tokens. The stateful codec and queued PCM have already
+            # consumed those frames and cannot roll back to that boundary.
+            logger.warning(
+                "This stage cannot reset running requests; wait for "
+                "completion or abort them before resetting the prefix cache."
+            )
+            return False
+        return super().reset_prefix_cache(reset_running_requests, reset_connector)
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         # Track requests that need KV cache transfer when finished
@@ -517,7 +534,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 # domains must consume the old frame before new output passes.
                 request.async_tokens_to_discard = max(0, stale_async_tokens - len(generated_token_ids))
 
-            if output_is_stale or async_output_is_stale:
+            if async_output_is_stale or (output_is_stale and request.drop_stale_output):
                 # Output of a step scheduled before the request's in-flight
                 # tokens were discarded (segment stop / session replacement).
                 # num_computed_tokens was rolled back at the discard site, so
@@ -556,12 +573,13 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 # tokens and rejections. If some tokens are rejected,
                 # num_computed_tokens is decreased by the number of rejected
                 # tokens.
-                if request.num_computed_tokens > 0:
-                    request.num_computed_tokens -= num_rejected
-                # If async scheduling, num_output_placeholders also includes
-                # the scheduled spec tokens count and so is similarly adjusted.
-                if request.num_output_placeholders > 0:
-                    request.num_output_placeholders -= num_rejected
+                if not output_is_stale:
+                    if request.num_computed_tokens > 0:
+                        request.num_computed_tokens -= num_rejected
+                    # If async scheduling, num_output_placeholders also includes
+                    # the scheduled spec tokens count and so is similarly adjusted.
+                    if request.num_output_placeholders > 0:
+                        request.num_output_placeholders -= num_rejected
                 spec_decoding_stats = self.make_spec_decoding_stats(
                     spec_decoding_stats,
                     num_draft_tokens=num_draft_tokens,
@@ -600,7 +618,10 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             # Check for stop and update request status.
             if new_token_ids:
                 num_sampled_tokens = len(new_token_ids)
-                new_token_ids, stopped = self._update_request_with_output(request, new_token_ids)
+                if output_is_stale:
+                    new_token_ids, stopped = self._update_request_with_output(request, new_token_ids, is_stale=True)
+                else:
+                    new_token_ids, stopped = self._update_request_with_output(request, new_token_ids)
                 if new_logprobs is not None and len(new_token_ids) < num_sampled_tokens:
                     # A mid-step stop (e.g. spec-decode tokens sampled past
                     # EOS) trims new_token_ids after the validation slice
@@ -704,6 +725,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                     # a queued streaming update, and adding twice swallows the
                     # next duplex unit's listen/speak under async scheduling.
                     if request.num_in_flight_tokens > 0:
+                        request.drop_stale_output = True
                         request.num_stale_output_tokens = request.num_in_flight_tokens
                     if outstanding_async_tokens > 0:
                         # Discard only outputs that are already in flight and
@@ -884,6 +906,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         # a resumable stop applies a queued update through this helper.
         in_flight_tokens = int(getattr(session, "num_in_flight_tokens", 0) or 0)
         if in_flight_tokens > 0:
+            session.drop_stale_output = True
             session.num_stale_output_tokens = in_flight_tokens
         if outstanding_async_tokens > 0:
             # Async scheduling may already have sampled the previous
@@ -1405,6 +1428,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             if status is not None:
                 request.status = status
         if native_transfer and connector_delay_free_blocks:
+            assert transfer_params is not None
             kv_xfer_params = {
                 **(kv_xfer_params or {}),
                 "transfer_id": transfer_params["transfer_id"],

@@ -15,6 +15,8 @@ import numpy as np
 import pytest
 import torch
 from vllm.sampling_params import SamplingParams
+from vllm.v1.sample.metadata import SamplingMetadata
+from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker import gpu_input_batch
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 
@@ -103,6 +105,8 @@ def test_post_sample_talker_mtp_uses_current_sample_and_hidden() -> None:
     )
 
     assert received["req_ids"] == ["ready"]
+    assert isinstance(received["input_ids"], torch.Tensor)
+    assert isinstance(received["hidden_states"], torch.Tensor)
     assert received["input_ids"].tolist() == [101]
     assert received["hidden_states"].tolist() == [[1.0, 2.0]]
     assert received["req_infos"] == [{"duplex": {"data_plane": True}}]
@@ -139,6 +143,8 @@ def test_post_sample_talker_mtp_uses_gpu_token_with_async_scheduling() -> None:
     )
 
     assert received["req_ids"] == ["ready"]
+    assert isinstance(received["input_ids"], torch.Tensor)
+    assert isinstance(received["hidden_states"], torch.Tensor)
     assert received["input_ids"].tolist() == [101]
     assert received["hidden_states"].tolist() == [[1.0, 2.0]]
     assert received["req_infos"] == [{"duplex": {"data_plane": True}}]
@@ -214,6 +220,9 @@ def test_speech_extra_params_reach_model_sampler_as_sampling_metadata(monkeypatc
     )
 
     class Adapter:
+        def normalize(self, request):
+            return
+
         def validate(self, request):
             return None
 
@@ -272,7 +281,12 @@ def test_speech_extra_params_reach_model_sampler_as_sampling_metadata(monkeypatc
     )
     input_batch.sampling_metadata = input_batch._make_sampling_metadata()
 
-    received = []
+    received: list[SamplingMetadata] = []
+
+    def sample(logits: torch.Tensor, metadata: SamplingMetadata) -> str:
+        received.append(metadata)
+        return "model-sampler"
+
     runner = object.__new__(GPUARModelRunner)
     runner._omni_cache_policy = ModelCachePolicy(needs_full_hidden_states=True)
     runner._pooler_payload_include_hidden_flag = True
@@ -280,7 +294,7 @@ def test_speech_extra_params_reach_model_sampler_as_sampling_metadata(monkeypatc
     runner.model = SimpleNamespace(
         prefer_model_sampler=True,
         skips_model_sampler_output_token_history=True,
-        sample=lambda logits, metadata: received.append(metadata) or "model-sampler",
+        sample=sample,
     )
     runner.sampler = SimpleNamespace()
     logits = torch.zeros((1, 4))
@@ -1667,7 +1681,6 @@ class TestMergeModelKvTransferMetadata:
         # ...while the engine-shared originals are untouched.
         assert original["r1"]["custom_metadata"] is original_meta
         assert original_meta == {"a": 1}
-        assert "talker_codes" not in original["r1"]["custom_metadata"]
 
     def test_merge_without_model_meta_passes_entry_through(self):
         class _Model:
@@ -1710,7 +1723,7 @@ class TestDownstreamPayloadMemoization:
         return runner
 
     def test_missing_marker_defaults_true_without_memoizing(self):
-        stages = {"r1": None}
+        stages: dict[str, int | None] = {"r1": None}
         runner = self._runner(stages)
 
         assert runner._request_needs_downstream_stage_payload("r1") is True
@@ -1858,6 +1871,7 @@ class TestPreferModelSamplerNoneFallback:
             "minicpmo_4_5",
             "minimax_music3",
             "nemotron_voicechat",
+            "yue2",  # Always supplies SamplerOutput, including empty/prefill steps.
         }
         assert declarers == expected, (
             "The set of models declaring `prefer_model_sampler` changed:\n"
@@ -1872,3 +1886,63 @@ class TestPreferModelSamplerNoneFallback:
             "least tolerates -- that fallback, then add its directory name to "
             "`expected` above. If you REMOVED one, drop its name."
         )
+
+
+@pytest.mark.parametrize("accepts_extra_args", [False, True])
+def test_prepare_hook_keeps_legacy_signature_and_orders_opt_in_metadata(accepts_extra_args: bool) -> None:
+    runner = object.__new__(GPUARModelRunner)
+    runner.model = torch.nn.Module()
+    runner.model.accepts_runner_sampling_extra_args = accepts_extra_args
+    runner.requests = {
+        rid: CachedRequestState(
+            req_id=rid,
+            prompt_token_ids=[1],
+            mm_features=[],
+            sampling_params=params,
+            generator=None,
+            block_ids=([],),
+            num_computed_tokens=0,
+            output_token_ids=[],
+        )
+        for rid, params in (
+            ("a", SamplingParams(extra_args={"seed": 7})),
+            ("b", None),
+            ("unused", SamplingParams(extra_args={"seed": 9})),
+        )
+    }
+    runner.discard_request_mask = CpuGpuBuffer(3, dtype=torch.bool, device=torch.device("cpu"), pin_memory=False)
+    runner.discard_request_mask.np[:] = [True, False, True]
+    ids, positions = torch.tensor([3, 4]), torch.tensor([0, 1])
+    step_inputs = dict(
+        input_ids=ids,
+        positions=positions,
+        inputs_embeds=None,
+        num_computed_tokens=np.array([0, 1]),
+        num_scheduled_tokens=np.array([1, 1]),
+        input_ids_buffer=ids,
+    )
+    seen = {}
+
+    def legacy_hook(
+        *, input_ids, positions, inputs_embeds, req_ids, num_computed_tokens, num_scheduled_tokens, input_ids_buffer
+    ):
+        seen["req_ids"] = req_ids
+        return input_ids, positions
+
+    def opt_in_hook(*, sampling_extra_args, discard_mask, **kwargs):
+        seen["extra_args"] = sampling_extra_args
+        seen["discard"] = discard_mask.tolist()
+        return legacy_hook(**kwargs)
+
+    out = runner._call_prepare_runner_inputs(
+        opt_in_hook if accepts_extra_args else legacy_hook,
+        req_ids=["b", "a"],
+        **step_inputs,
+    )
+    assert out[0] is ids and out[1] is positions
+    assert seen["req_ids"] == ["b", "a"]
+    if accepts_extra_args:
+        assert seen["extra_args"] == [{}, {"seed": 7}]
+        assert seen["discard"] == [True, False]
+    else:
+        assert set(seen) == {"req_ids"}

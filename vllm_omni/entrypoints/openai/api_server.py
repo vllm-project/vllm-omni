@@ -249,6 +249,33 @@ async def omni_run_server(args, **uvicorn_kwargs) -> None:
     await omni_run_server_worker(listen_address, sock, args, **uvicorn_kwargs)
 
 
+def _own_reuseport_socket(sock: socket.socket, client_count: int) -> socket.socket:
+    """Give this API server its own SO_REUSEPORT listener on the shared address.
+
+    All API servers accepting from the one inherited socket lets whichever
+    wakes first take a whole burst of connections (the event loop accepts
+    in a loop), and keep-alive then pins that imbalance for the connections'
+    lifetime. Separate reuseport listeners let the kernel spread connections
+    by hash. The inherited socket is bound but never listened on, so it
+    receives nothing.
+    """
+    if client_count <= 1:
+        return sock
+    if sock.family not in (socket.AF_INET, socket.AF_INET6):
+        return sock
+    try:
+        if not sock.getsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT):
+            return sock
+        own = socket.socket(family=sock.family, type=socket.SOCK_STREAM)
+        own.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        own.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+        own.bind(sock.getsockname()[:2])
+    except OSError as e:
+        logger.warning("Per-server reuseport listener unavailable (%s); sharing the inherited socket", e)
+        return sock
+    return own
+
+
 def run_omni_api_server_worker_proc(
     listen_address: str,
     sock: socket.socket,
@@ -278,6 +305,7 @@ def run_omni_api_server_worker_proc(
 
     set_process_title("APIServer", str(client_index))
     decorate_logs("APIServer", skip_if_decorated=True)
+    sock = _own_reuseport_socket(sock, int(omni_client_config["client_count"]))
     uvloop.run(
         omni_run_server_worker(
             listen_address,
@@ -345,6 +373,13 @@ async def omni_run_server_worker(
         remove_route_from_app(app, "/v1/models", {"GET"})  # Remove upstream /v1/models to use omni's handler
         remove_route_from_app(app, "/health", {"GET"})
         app.include_router(router)
+        get_od_config = getattr(engine_client, "get_diffusion_od_config", None)
+        od_config = get_od_config() if callable(get_od_config) else None
+        model_class_name = getattr(od_config, "model_class_name", None) or getattr(args, "model_class_name", None)
+        if model_class_name == "SeedVR2Pipeline":
+            from vllm_omni.diffusion.models.seedvr2.long_video import register_routes
+
+            register_routes(app, args.port)
 
         # OMNI: Override upstream exception handlers with Omni-aware versions
         # that understand the multi-stage orchestrator lifecycle.
@@ -505,7 +540,7 @@ async def build_async_omni(
     # Ensures everything is shutdown and cleaned up on error/exit
     async with build_async_omni_from_stage_config(
         args,
-        disable_frontend_multiprocessing=disable_frontend_multiprocessing,
+        disable_frontend_multiprocessing=bool(disable_frontend_multiprocessing),
         client_config=client_config,
     ) as async_omni:
         yield async_omni

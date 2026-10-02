@@ -42,6 +42,7 @@ from vllm.logger import init_logger
 from vllm.multimodal.audio import AudioResampler
 
 from vllm_omni.utils.audio import mel_filter_bank
+from vllm_omni.utils.device_copy import index_to_device, to_device_nonblocking
 
 if TYPE_CHECKING:
     from .configuration_qwen3_tts import Qwen3TTSConfig, Qwen3TTSTalkerConfig
@@ -160,7 +161,7 @@ def coerce_token_ids(value: object, *, device: torch.device) -> torch.Tensor | N
         ids = ids.unsqueeze(0)
     if ids.ndim != 2 or ids.numel() == 0:
         return None
-    return ids.to(device=device, dtype=torch.long).contiguous()
+    return to_device_nonblocking(ids.to(dtype=torch.long).contiguous(), device)
 
 
 # ---------------------------------------------------------------------------
@@ -366,6 +367,9 @@ class Qwen3TTSPromptEmbedsBuilder:
         # Reusing them avoids launching the embedding/projection pair once per
         # request during prompt construction.
         self._projected_token_cache: dict[tuple[str, tuple[int, ...]], torch.Tensor] = {}
+        # CustomVoice prompt pieces that do not depend on the text, per
+        # (device, speaker, language): bounded by the model's voices.
+        self._custom_voice_prompt_cache: dict[tuple, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
 
         self._ref_audio_artifact_cache_max_entries = int(ref_audio_artifact_cache_max_entries)
         self._ref_audio_artifact_cache: OrderedDict[str, dict[str, torch.Tensor | bool]] = OrderedDict()
@@ -1024,7 +1028,9 @@ class Qwen3TTSPromptEmbedsBuilder:
         dev = self._device()
         input_ids = coerce_token_ids(info_dict.pop(PRECOMPUTED_TEXT_IDS_KEY, None), device=dev)
         if input_ids is None:
-            input_ids = tok(build_assistant_text(text), return_tensors="pt", padding=False)["input_ids"].to(device=dev)
+            input_ids = to_device_nonblocking(
+                tok(build_assistant_text(text), return_tensors="pt", padding=False)["input_ids"], dev
+            )
 
         # Optional instruct prefix.
         instruct = (info_dict.get("instruct") or [""])[0]
@@ -1411,35 +1417,44 @@ class Qwen3TTSPromptEmbedsBuilder:
                 raise ValueError(f"Unsupported speaker: {speaker}")
             spk_id = spk_id_map[speaker]
             # Keep it at least 1D; embedding on a 0-d tensor can return 1D.
-            spk_tensor = torch.tensor([spk_id], device=input_ids.device, dtype=torch.long)
+            spk_tensor = index_to_device([spk_id], input_ids.device)
             spk_embed = codec_embed(spk_tensor)
             if spk_embed.ndim in (1, 2):
                 spk_embed = spk_embed.view(1, 1, -1)
             speaker_embed = spk_embed
             codec_input = torch.cat([codec_input_0, speaker_embed, codec_input_1], dim=1)
 
-            role_embed = text_projection(text_embedding(input_ids[:, :3]))
-            codec_prefix = torch.cat((tts_pad_embed.expand(-1, codec_input.shape[1] - 2, -1), tts_bos_embed), dim=1)
-            codec_prefix = codec_prefix + codec_input[:, :-1]
-            talker_prompt = torch.cat((role_embed, codec_prefix), dim=1)
+            # The role tokens, speaker/language codec prefix, codec pad row and
+            # closing row do not depend on the text: cache them per speaker and
+            # language so a request only embeds and projects its own text.
+            # A text starting with whitespace could merge with the template's
+            # newline token, so it keeps the per-request role embedding.
+            cache_key = None
+            if non_streaming_mode and instruct_embed is None and not text[:1].isspace():
+                cache_key = (
+                    str(input_ids.device),
+                    int(spk_id),
+                    codec_prefill_list[0][2] if len(codec_prefill_list[0]) == 4 else None,
+                )
+            cv_cache = self._custom_voice_prompt_cache
+            cached = cv_cache.get(cache_key) if cache_key is not None else None
+            if cached is None:
+                role_embed = text_projection(text_embedding(input_ids[:, :3]))
+                codec_prefix = torch.cat((tts_pad_embed.expand(-1, codec_input.shape[1] - 2, -1), tts_bos_embed), dim=1)
+                codec_prefix = codec_prefix + codec_input[:, :-1]
+                prefix = torch.cat((role_embed, codec_prefix), dim=1)
+                pad_row = codec_embed(self._long_tensor([talker_config.codec_pad_id], input_ids.device)).view(1, 1, -1)
+                tail = tts_pad_embed + codec_embed(self._long_tensor([talker_config.codec_bos_id], input_ids.device))
+                if cache_key is not None:
+                    cv_cache[cache_key] = (prefix, pad_row, tail)
+            else:
+                prefix, pad_row, tail = cached
+            talker_prompt = prefix
 
             if non_streaming_mode:
                 text_all = text_projection(text_embedding(input_ids[:, 3:-5]))
                 text_all = torch.cat([text_all, tts_eos_embed], dim=1)
-                pad_ids = torch.full(
-                    (1, int(text_all.shape[1])),
-                    int(talker_config.codec_pad_id),
-                    device=input_ids.device,
-                    dtype=torch.long,
-                )
-                talker_prompt = torch.cat(
-                    [
-                        talker_prompt,
-                        text_all + codec_embed(pad_ids),
-                        tts_pad_embed + codec_embed(self._long_tensor([talker_config.codec_bos_id], input_ids.device)),
-                    ],
-                    dim=1,
-                )
+                talker_prompt = torch.cat([talker_prompt, text_all + pad_row, tail], dim=1)
                 trailing_text_hidden = tts_pad_embed
             else:
                 first_text = text_projection(text_embedding(input_ids[:, 3:4])) + codec_input[:, -1:]

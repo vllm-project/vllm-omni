@@ -198,6 +198,7 @@ class OmniEngineArgs(EngineArgs):
     async_chunk: bool = False
     session_mode: str = "turn"
     retains_state_across_chunks: bool = False
+    supports_running_prefix_cache_reset: bool = True
     use_v2_model_runner: bool = False
     supports_native_mrv2_data_plane: bool = False
     # WS-A: Stage-1 active stream slots. 0 = legacy preempt-everything.
@@ -430,6 +431,7 @@ class OmniEngineArgs(EngineArgs):
             async_chunk=self.async_chunk,
             session_mode=self.session_mode,
             retains_state_across_chunks=self.retains_state_across_chunks,
+            supports_running_prefix_cache_reset=self.supports_running_prefix_cache_reset,
             use_v2_model_runner=self.use_v2_model_runner,
             supports_native_mrv2_data_plane=self.supports_native_mrv2_data_plane,
             active_stream_window=self.active_stream_window,
@@ -558,6 +560,7 @@ class OrchestratorArgs:
     # === Diffusion model config ===
     num_gpus: int | None = None
     model_class_name: str | None = None
+    hsdp_weight_load_strategy: str | None = None
     diffusion_load_format: str | None = None
     lora_path: list[str] | None = None
     lora_backend: str | None = None

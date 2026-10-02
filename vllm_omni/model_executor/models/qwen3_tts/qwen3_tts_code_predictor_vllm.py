@@ -55,6 +55,9 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(CodePredictorWrapp
             talker_hidden_size=int(talker_config.hidden_size),
             prefix=prefix,
         )
+        # TTS owns its frame-local cache and overrides _predict_step_logits.
+        # Do not also activate the shared wrapper's Omni incremental loop.
+        self._kv_cache_enabled = False
         # Store talker_config for backward compat (accessed by some callers)
         self.talker_config = talker_config
         self._vllm_config = vllm_config
@@ -62,6 +65,8 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(CodePredictorWrapp
         self._kv_requested = self._parse_bool_config(extra.get("code_predictor_kv_cache"))
         self._fused_sampling = self._parse_bool_config(extra.get("code_predictor_fused_sampling"))
         self._frame_cache: FrameLocalKVCache | None = None
+        self._fused_requested = self._parse_bool_config(extra.get("code_predictor_fused"))
+        self._fused = None
 
     def _setup_compile(self) -> None:
         if self._compiled_model_fwd is not None:
@@ -97,10 +102,72 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(CodePredictorWrapp
                         cache(self._proj_buf, batch, step)
         self._synchronize_warmup(weight.device)
         self._frame_cache = cache
+        if self._fused_requested:
+            from .fused_code_predictor import FusedCodePredictor
+
+            self._fused = FusedCodePredictor(self, max_batch)
+            # Compile every kernel variant outside any graph capture.
+            hidden = int(self.talker_config.hidden_size)
+            for batch in range(1, min(2, max_batch) + 1):
+                zeros = torch.zeros(batch, 1, hidden, device=weight.device, dtype=weight.dtype)
+                uniforms = torch.full(
+                    (batch, self._num_groups - 1, int(self.config.vocab_size)), 0.5, device=weight.device
+                )
+                codes = torch.zeros(batch, 1, device=weight.device, dtype=torch.long)
+                self._fused(codes, zeros, zeros, 1.0, 50, uniforms)
+            self._synchronize_warmup(weight.device)
+            logger.info("Qwen3-TTS fused code predictor enabled (capacity %d)", max_batch)
         # Preserve the shared wrapper's initialization sentinel. Its full
         # re-prefill callable is unused while _frame_cache is active.
         self._compiled_model_fwd = self.model.forward
         logger.info("Qwen3-TTS frame-local KV warmed for batches %s", self._bucket_sizes)
+
+    @torch.inference_mode()
+    def forward(
+        self,
+        layer0_code: torch.Tensor,
+        layer0_embed: torch.Tensor,
+        last_talker_hidden: torch.Tensor,
+        do_sample: bool = True,
+        temperature: float = 0.9,
+        top_k: int = 50,
+        top_p: float = 1.0,
+        generator: torch.Generator | None = None,
+        generators: Sequence[torch.Generator | None] | None = None,
+        sample_uniforms: torch.Tensor | None = None,
+    ):
+        self._validate_sampling_inputs(int(layer0_code.shape[0]), generators, sample_uniforms)
+        if self._fused_requested:
+            self._setup_compile()
+        if (
+            self._fused is not None
+            and do_sample
+            and temperature > 0
+            and top_p == 1.0
+            and sample_uniforms is not None
+            and sample_uniforms.dtype == torch.float32
+            and sample_uniforms.is_contiguous()
+        ):
+            return self._fused(
+                layer0_code,
+                layer0_embed,
+                last_talker_hidden,
+                1.0 / temperature,
+                int(top_k),
+                sample_uniforms,
+            )
+        return super().forward(
+            layer0_code,
+            layer0_embed,
+            last_talker_hidden,
+            do_sample=do_sample,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            generator=generator,
+            generators=generators,
+            sample_uniforms=sample_uniforms,
+        )
 
     def _predict_step_logits(
         self,

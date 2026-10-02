@@ -72,3 +72,33 @@ QWEN3_TTS_PIPELINE = PipelineConfig(
         ),
     ),
 )
+
+
+# Single-stage variant: the Talker decodes each frame with the stateful
+# streaming codec decoder and emits PCM as the final output (enable with the
+# ``talker_stream_decode`` model option). No Code2Wav stage, no connector.
+QWEN3_TTS_FUSED_PIPELINE = PipelineConfig(
+    model_type="qwen3_tts_fused",
+    default_deploy_config_name="qwen3_tts_fused_single_gpu.yaml",
+    single_stage_async_chunk=True,
+    model_arch="Qwen3TTSTalkerForConditionalGeneration",
+    stages=(
+        StagePipelineConfig(
+            stage_id=0,
+            model_stage="qwen3_tts",
+            execution_type=StageExecutionType.LLM_AR,
+            input_sources=(),
+            owns_tokenizer=True,
+            final_output=True,
+            final_output_type="audio",
+            # The API output processor tags ``model_outputs`` by this modality.
+            engine_output_type="audio",
+            supports_running_prefix_cache_reset=False,
+            supports_native_mrv2_data_plane=True,
+            sampling_constraints={
+                "detokenize": False,
+                "stop_token_ids": [2150],
+            },
+        ),
+    ),
+)

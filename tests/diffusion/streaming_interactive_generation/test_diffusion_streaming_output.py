@@ -77,6 +77,7 @@ class _PipelineBackedEngine:
     def __init__(self, pipeline: _StepStreamingPipeline | _FailingStreamingPipeline) -> None:
         self.pipeline = pipeline
         self.executor = SimpleNamespace(
+            is_dead=False,
             register_failure_callback=MagicMock(),
             check_health=MagicMock(),
         )
@@ -127,9 +128,9 @@ def _streaming_diffusion_output(
 
 def _streaming_payload_and_metadata(output: DiffusionOutput) -> tuple[dict, dict]:
     envelope = output.output if isinstance(output.output, dict) else {}
-    payload = envelope.get("payload") if isinstance(envelope.get("payload"), dict) else {}
-    metadata = envelope.get("metadata") if isinstance(envelope.get("metadata"), dict) else {}
-    return payload, metadata
+    payload = envelope.get("payload")
+    metadata = envelope.get("metadata")
+    return payload if isinstance(payload, dict) else {}, metadata if isinstance(metadata, dict) else {}
 
 
 class TestPipelineStreamingOutputToStageDiffusionClient:
@@ -230,7 +231,7 @@ class TestPipelineStreamingOutputToStageDiffusionClient:
         client._response_socket.bind(response_address)
         client._encoder = OmniMsgpackEncoder()
         client._decoder = OmniMsgpackDecoder()
-        client._output_queue: asyncio.Queue[OmniRequestOutput] = asyncio.Queue()
+        client._output_queue = asyncio.Queue[OmniRequestOutput]()
         client._rpc_results = {}
         client._pending_rpcs = set()
         client._tasks = {}
@@ -470,9 +471,15 @@ class TestPipelineStreamingOutputToEntrypoint:
         fixture: OrchestratorFixture,
         inline_client: InlineStageDiffusionClient,
     ) -> None:
-        if omni.final_output_task is not None:
-            omni.final_output_task.cancel()
-            await asyncio.gather(omni.final_output_task, return_exceptions=True)
+        task = omni.final_output_task
+        omni.final_output_task = None
+        # The session ran inside ``TestClient``, whose loop is closed by the
+        # time the ``with`` block exits and the task with it already cancelled.
+        # Only a still-running task is worth cancelling and awaiting; gathering
+        # a finished one touches its closed loop on Python 3.10.
+        if task is not None and not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
         inline_client.shutdown()
         fixture.request_sync_q.put_nowait(ShutdownRequestMessage())
         await asyncio.to_thread(fixture.thread.join, 5)

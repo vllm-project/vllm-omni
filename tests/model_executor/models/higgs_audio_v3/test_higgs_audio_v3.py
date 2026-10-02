@@ -24,6 +24,27 @@ from vllm_omni.entrypoints.openai.tts_adapters.higgs_audio_v3 import HiggsAudioV
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
+def test_external_decode_enters_backbone_compile_boundary():
+    from vllm_omni.model_executor.models.higgs_audio_v3.higgs_audio_v3_talker import (
+        HiggsAudioV3TalkerForConditionalGeneration,
+    )
+
+    class Backbone(torch.nn.Module):
+        def forward(self, input_ids, positions, inputs_embeds):
+            assert input_ids is None
+            return inputs_embeds + positions[:, None]
+
+        @property
+        def layers(self):
+            pytest.fail("External decode bypassed the Qwen3Model compilation boundary")
+
+    talker = SimpleNamespace(_use_external_decode_cudagraph=True, model=Backbone())
+    hidden = torch.randn(2, 4)
+    positions = torch.tensor([11, 27])
+    actual = HiggsAudioV3TalkerForConditionalGeneration._run_qwen3_layers_eager(talker, positions, hidden)
+    torch.testing.assert_close(actual, hidden + positions[:, None])
+
+
 # ---- AC-1: Configuration ----
 
 
@@ -284,7 +305,7 @@ class TestSamplerMethods:
         """Create a minimal talker-like object with sampler/masking methods."""
         from vllm_omni.model_executor.models.higgs_audio_v3 import higgs_audio_v3_talker as mod
 
-        class FakeTalker:
+        class FakeTalker(SimpleNamespace):
             num_codebooks = 8
             codebook_size = 1026
 
@@ -297,9 +318,10 @@ class TestSamplerMethods:
         """Create a fake talker with GPU-resident sampler state helpers."""
         from vllm_omni.model_executor.models.higgs_audio_v3 import higgs_audio_v3_talker as mod
 
-        class FakeTalker:
+        class FakeTalker(SimpleNamespace):
             num_codebooks = 8
             codebook_size = 1026
+            config = type("Config", (), {"audio_full_sample_graph": False})()
 
         t = FakeTalker()
         t._decode_last_codes = torch.arange(num_rows * t.num_codebooks, dtype=torch.long).view(
@@ -337,6 +359,7 @@ class TestSamplerMethods:
             "_get_audio_host_staging_buffer",
             "_apply_delay_pattern_masking_batched",
             "_update_delay_state_batched",
+            "_finish_audio_staging",
             "_prefill_row_mask",
             "_audio_seed_mask_from_step_input",
         ):
@@ -426,9 +449,12 @@ class TestSamplerMethods:
     def test_sampling_metadata_invalid_temperature_is_sanitized(self, monkeypatch):
         t = self._make_minimal_talker()
         seen = []
-        monkeypatch.setattr(
-            torch, "multinomial", lambda probs, num_samples: seen.append(probs) or probs.argmax(-1, True)
-        )
+
+        def sample(probs, num_samples):
+            seen.append(probs)
+            return probs.argmax(-1, True)
+
+        monkeypatch.setattr(torch, "multinomial", sample)
         logits = torch.tensor([[0.0, 2.0], [3.0, 0.0]])
 
         result = t._sample_audio_codes(
@@ -444,9 +470,12 @@ class TestSamplerMethods:
     def test_sampling_metadata_is_expanded_per_request_and_vq(self, monkeypatch):
         t = self._make_minimal_talker()
         seen = []
-        monkeypatch.setattr(
-            torch, "multinomial", lambda probs, num_samples: seen.append(probs) or probs.argmax(-1, True)
-        )
+
+        def sample(probs, num_samples):
+            seen.append(probs)
+            return probs.argmax(-1, True)
+
+        monkeypatch.setattr(torch, "multinomial", sample)
         cb_logits = torch.tensor([[[4.0, 3.0, 2.0, 1.0]] * 2] * 2)  # [2 requests, 2 VQs, 4 vocab]
         logits = cb_logits.reshape(-1, cb_logits.shape[-1])
         metadata = self._sampling_metadata(
@@ -840,7 +869,7 @@ class TestFeedbackMethods:
         """postprocess() should return codes from _last_audio_codes."""
         from vllm_omni.model_executor.models.higgs_audio_v3 import higgs_audio_v3_talker as mod
 
-        class FakeTalker:
+        class FakeTalker(SimpleNamespace):
             _last_audio_codes = torch.tensor([[100, 200, 300, 400, 500, 600, 700, 800]])
             _last_audio_code_valid = [True]
             _last_audio_host_staging = None
@@ -859,7 +888,7 @@ class TestFeedbackMethods:
         """postprocess() should skip rows with -1 (no audio)."""
         from vllm_omni.model_executor.models.higgs_audio_v3 import higgs_audio_v3_talker as mod
 
-        class FakeTalker:
+        class FakeTalker(SimpleNamespace):
             _last_audio_codes = torch.tensor([[-1, -1, -1, -1, -1, -1, -1, -1]])
             _last_audio_code_valid = [False]
             _last_audio_host_staging = None
@@ -876,7 +905,7 @@ class TestFeedbackMethods:
         """postprocess() should advance cursor by 1 per call."""
         from vllm_omni.model_executor.models.higgs_audio_v3 import higgs_audio_v3_talker as mod
 
-        class FakeTalker:
+        class FakeTalker(SimpleNamespace):
             _last_audio_codes = torch.tensor(
                 [[100, 200, 300, 400, 500, 600, 700, 800], [-1, -1, -1, -1, -1, -1, -1, -1]]
             )
@@ -901,7 +930,7 @@ class TestReferenceAudioSubstitution:
     def _make_talker(self, query_start_loc):
         from vllm_omni.model_executor.models.higgs_audio_v3 import higgs_audio_v3_talker as mod
 
-        class FakeTalker:
+        class FakeTalker(SimpleNamespace):
             _last_step_query_start_loc = query_start_loc
             _apply_ref_audio_substitution = mod.HiggsAudioV3TalkerForConditionalGeneration._apply_ref_audio_substitution
 
@@ -981,7 +1010,7 @@ class TestAudioFeedback:
         embed = mod.HiggsFusedMultiTextEmbedding(num_codebooks=8, vocab_size=1026, hidden_size=16)
         torch.nn.init.ones_(embed.weight)
 
-        class FakeTalker:
+        class FakeTalker(SimpleNamespace):
             num_codebooks = 8
             codebook_size = 1026
             _audio_continuation_id = 99999  # fake audio token

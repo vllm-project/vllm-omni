@@ -31,6 +31,9 @@ def init_omni_model_state(
     capabilities; otherwise
     delegates to the upstream v2 factory.
     """
+    factory = getattr(model, "create_omni_model_state", None)
+    if factory is not None:
+        return factory(vllm_config, encoder_cache, device)
     uses_omni_lifecycle = any(
         getattr(model, flag, False) is True for flag in ("has_preprocess", "has_postprocess", "have_multimodal_outputs")
     )

@@ -80,6 +80,19 @@ Note: for the diffusion path, an omitted `distributed_executor_backend` selects
 segments) and `mp` when `num_gpus > 1`. Set `mp` explicitly to keep a worker
 subprocess on one GPU. `ray` / `external_launcher` are not fully supported yet.
 
+### Stage-level runner selection
+
+`model_runner: v1` or `v2` at the deploy level sets the default runner.
+A `model_runner` on an individual stage overrides that default, allowing
+one stage to migrate or roll back independently. This does not change
+`PipelineConfig` topology, input adapters, or the connector payload contract.
+An omitted stage override preserves the deploy-level selection.
+
+MRv2 native downstream receivers currently support turn-based requests only;
+streaming sessions and resumable input require the V1 prompt-replacement path.
+Selecting a runner does not add the session capabilities it lacks. Platform
+fallbacks and stage overrides are validated after configuration resolution.
+
 ### Stage fields
 
 Each entry under `stages:` accepts any `StageDeployConfig` field directly (no nested `engine_args:`). Only fields whose value legitimately varies across stages live here; pipeline-wide settings (trust_remote_code, distributed_executor_backend, dtype, quantization, prefix/chunked prefill, DP/PP sizes) are declared at the top level and applied to every stage. Unknown keys fall through to `engine_extras:` and are forwarded to the engine. Frequently used fields are listed below; the source-of-truth schema is `StageDeployConfig` in `vllm_omni/config/stage_config.py`.
@@ -306,7 +319,9 @@ ROCm and MUSA. Select one of these deployment profiles:
 | `qwen3_tts_mrv2.yaml` | V2 | B1 | Explicit MRV2 profile (same runner selection as the default) |
 | `qwen3_tts_high_concurrency_mrv2.yaml` | V2 | B1, B2 | Opt-in throughput tuning |
 | `qwen3_tts_high_concurrency_mrv2_b4.yaml` | V2 | B1, B2, B3, B4 | Experimental throughput / buffered playback |
+| `qwen3_tts_high_concurrency_mrv2_single_gpu.yaml` | V2 | B1–B8 | Experimental two-stage deployment on one GPU, with MPS |
 | `qwen3_tts_high_concurrency.yaml` | V1 | Existing defaults | V1 high-concurrency control |
+| `qwen3_tts_fused_single_gpu.yaml` | V2 | N/A (in-Talker decoder) | Opt-in single-stage CUDA pipeline on one GPU |
 
 ```bash
 # MRV2 is the default; pass a copy with `model_runner: v1` to force V1.
@@ -337,12 +352,73 @@ supply `mtp_sampling_params` and `get_mtp_seed(sampling_params)` for model-local
 (with `mtp_sample_steps` and `mtp_sample_vocab_size`) as needed. Qwen3-TTS retains
 its existing `talker_mtp` entry point for V1.
 
+### Selecting one or two Qwen3-TTS stages
+
+Choose the deployment profile explicitly with `--deploy-config`. The default
+`qwen3_tts` pipeline retains two stages: the Talker publishes codec chunks to
+Code2Wav, which produces audio. Its stage devices can be placed on the same
+GPU or on separate GPUs. `qwen3_tts_fused` is a separate, opt-in pipeline for
+one CUDA GPU: the Talker owns the stateful codec decoder and emits PCM directly,
+without a Code2Wav engine or stage connector.
+
+```bash
+# Two stages on one GPU; the two-stage pipeline remains independently selectable.
+vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice --omni \
+  --deploy-config vllm_omni/deploy/qwen3_tts_high_concurrency_mrv2_single_gpu.yaml
+
+# One stage on one GPU; no inter-stage transport or Code2Wav scheduling.
+vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice --omni \
+  --deploy-config vllm_omni/deploy/qwen3_tts_fused_single_gpu.yaml
+```
+
+The single-stage profile requires CUDA, V2, asynchronous chunks, TP=PP=1,
+an in-process worker and disabled prefix caching. Select the full profile;
+adding `talker_stream_decode: true` to a two-stage Talker is rejected because
+its latent output belongs to the Code2Wav input contract. Single-stage options
+live in `stages[].additional_config`; two-stage transport and first-frame
+options live in `connectors.*.extra`.
+
+The single-stage profile defaults `talker_stream_first_audio` to `false` for
+throughput. To opt into a separate first-frame delivery queue, save this
+overlay beside the bundled deployment files and pass its path to
+`--deploy-config`:
+
+```yaml
+base_config: qwen3_tts_fused_single_gpu.yaml
+stages:
+  - stage_id: 0
+    additional_config:
+      talker_stream_decode: true
+      talker_stream_first_audio: true
+      ref_code_context_frames: 72
+      code_predictor_kv_cache: true
+      code_predictor_fused_sampling: true
+      code_predictor_fused: true
+```
+
+This queue uses PCM from the single-stage decoder. The two-stage
+`talker_first_audio` option below uses its own first-frame decoder and does
+not require single-stage execution. The two options cannot be enabled
+together. Single-stage prefix-cache reset with
+`reset_running_requests=True` returns `False` while requests are active;
+wait for completion or abort them before retrying.
+
+Reference-cloning context is selected independently by each profile. The
+single-stage profile explicitly uses 72 reference frames, matching the
+`qwen3_tts.yaml` context boundary. A shorter
+`additional_config.ref_code_context_frames` (for example 25) can change
+timbre continuity even when WER is similar;
+the throughput measurements for CustomVoice do not qualify Base voice
+cloning quality. Reference layout, grouping and priming are model hooks;
+the shared worker does not select Qwen's context length or codebook layout.
+
 ### Qwen3-TTS first-frame delivery and rollback
 
 The standard `qwen3_tts.yaml`, `qwen3_tts_high_concurrency.yaml`,
 `qwen3_tts_mrv2.yaml` and `qwen3_tts_high_concurrency_mrv2.yaml` profiles
 enable the `talker_first_audio` connector option, as does the experimental
-single-GPU profile. This changes the default CUDA MRV2 streaming path:
+two-stage `qwen3_tts_high_concurrency_mrv2_single_gpu.yaml` profile.
+This changes the default CUDA MRV2 streaming path:
 residual prediction runs eagerly after the Talker sample, the Talker loads
 an additional first-frame decoder with its weights and CUDA graphs, and the
 orchestrator orders its audio before subsequent Code2Wav chunks.

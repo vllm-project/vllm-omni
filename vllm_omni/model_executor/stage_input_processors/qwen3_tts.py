@@ -390,16 +390,17 @@ def talker2code2wav_async_chunk(
         if ref_context_size > 0:
             if emitted_chunks <= 0:
                 ref_context_request_id = request_id
-                ref_frames = ref_context.tolist()
+                ref_frames = list(ref_context.to(device="cpu").unbind(0))
                 window_frames = ref_frames + window_frames
                 ref_context_included = True
                 left_context_size = ref_context_size
 
-    num_quantizers = len(window_frames[0])
-    num_frames = len(window_frames)
-    code_predictor_codes = torch.tensor(
-        [window_frames[f][q] for q in range(num_quantizers) for f in range(num_frames)],
-        dtype=torch.long,
+    # Keep the codebook-major CPU wire format without extracting every
+    # tensor element as a Python scalar. Legacy buffered frames can be lists.
+    code_predictor_codes = (
+        torch.stack([torch.as_tensor(frame, dtype=torch.long, device="cpu") for frame in window_frames])
+        .transpose(0, 1)
+        .reshape(-1)
     )
 
     meta = MetaStruct(

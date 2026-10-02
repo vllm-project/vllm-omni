@@ -1475,6 +1475,7 @@ class OnlineOmniClient:
             "max_new_tokens",
             "seed",
             "instructions",
+            "duration_seconds",
             "speed",
             "sample_rate",
             "extra_params",

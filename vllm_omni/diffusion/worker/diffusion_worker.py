@@ -1267,6 +1267,9 @@ class WorkerProc:
         """
         device = torch.device(torch.accelerator.current_accelerator().type, self.gpu_id)
         d2h_stream = torch.Stream(device=device)
+        transport_options = {}
+        if self.od_config.video_output_transport.enable_registered_shm is True:
+            transport_options["enable_registered_shm"] = True
         while True:
             item = self._async_output_queue.get()
             if item is None:
@@ -1277,7 +1280,7 @@ class WorkerProc:
                 # writing the output tensors before the side stream reads.
                 if gpu_event is not None:
                     d2h_stream.wait_event(gpu_event)
-                pack_diffusion_output_shm(output, d2h_stream=d2h_stream)
+                pack_diffusion_output_shm(output, d2h_stream=d2h_stream, **transport_options)
                 d2h_stream.synchronize()
 
                 self._enqueue_result(

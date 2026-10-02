@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """Declarative request-scoped Cache-DiT lifecycle."""
 
@@ -86,6 +86,12 @@ class RequestScopedCacheDiTRuntime:
         finally:
             self._backend = None
             self._installation_key = None
+
+    def refresh(self, num_inference_steps: int) -> None:
+        """Start an independent denoise pass with the installed profile."""
+        if self.is_enabled:
+            assert self._backend is not None
+            self._backend.refresh(self._pipeline, num_inference_steps=num_inference_steps)
 
 
 __all__ = [

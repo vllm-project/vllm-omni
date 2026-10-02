@@ -268,6 +268,9 @@ class BatchedToken2Wav(nn.Module):
         self._trt_stepper = trt_stepper
         self.flow = token2wav.flow
         self.hift = token2wav.hift
+        enable_cached_istft = getattr(self.hift, "enable_cached_istft", None)
+        if callable(enable_cached_istft):
+            enable_cached_istft()
         encoder = getattr(self.flow, "encoder", None)
         if encoder is not None:
             _undecorate_dynamo(encoder, "forward_chunk")

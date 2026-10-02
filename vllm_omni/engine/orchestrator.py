@@ -34,6 +34,7 @@ from vllm.v1.engine import EngineCoreOutputs, FinishReason
 from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.metrics.stats import IterationStats
 
+from vllm_omni.core.sched.omni_scheduling_coordinator import uses_native_mrv2_data_plane
 from vllm_omni.data_entry_keys import FIRST_AUDIO_KEY, FIRST_AUDIO_REQUIRED_KEY
 from vllm_omni.diffusion.data import is_diffusion_request_started_output
 from vllm_omni.distributed.omni_connectors.utils.config import stage_receives_chunks
@@ -897,7 +898,7 @@ class OrchestratorBase:
                     req_state is None
                     or req_state.upstream_first_audio
                     or req_state.pending_upstream_first_audio is not None
-                    or stage_id + 1 > req_state.final_stage_id
+                    or (stage_id if final_output else stage_id + 1) > req_state.final_stage_id
                 ):
                     continue
                 audio = mm.get("model_outputs")
@@ -934,7 +935,7 @@ class OrchestratorBase:
         if pending is None or self.request_states.get(req_state.request_id) is not req_state:
             return
         source_stage, first_output = pending
-        codec_stage = source_stage + 1
+        codec_stage = source_stage if self.stage_pools[source_stage].final_output else source_stage + 1
         pool = self.stage_pools[codec_stage]
         replica_id = pool.get_bound_replica_id(req_state.request_id)
         if replica_id is None or req_state.request_id not in pool.output_processor.request_states:
@@ -2907,6 +2908,18 @@ class Orchestrator(OrchestratorBase):
             return False
         return True
 
+    def _native_mrv2_receiver_stage(self, final_stage_id: int) -> int | None:
+        """First downstream stage up to ``final_stage_id`` that receives on MRv2's native data plane."""
+        for stage_id in range(1, min(final_stage_id, len(self.stage_pools) - 1) + 1):
+            vllm_config = getattr(self.stage_pools[stage_id], "stage_vllm_config", None)
+            model_config = getattr(vllm_config, "model_config", None)
+            if uses_native_mrv2_data_plane(
+                model_config,
+                use_v2_model_runner=bool(getattr(model_config, "use_v2_model_runner", False)),
+            ):
+                return stage_id
+        return None
+
     async def _handle_add_request(self, msg: StageSubmissionMessage) -> None:
         """Handle an add_request message from the main thread."""
         stage_id = 0
@@ -2925,6 +2938,20 @@ class Orchestrator(OrchestratorBase):
             # so the helper's cleanup is a no-op here.
             await self._fail_request_dead_stage(request_id, stage_id)
             return
+
+        if getattr(prompt, "resumable", False):
+            mrv2_stage_id = self._native_mrv2_receiver_stage(final_stage_id)
+            if mrv2_stage_id is not None:
+                # Streaming-input sessions replace downstream prompts through
+                # the V1 chunk adapter, which MRv2's native data plane lacks.
+                await self._fail_request_client_error(
+                    request_id,
+                    stage_id,
+                    f"streaming (resumable) input is not supported: stage {mrv2_stage_id} runs on "
+                    "model_runner v2, which supports turn-based requests only; use model_runner: v1 "
+                    "for that stage",
+                )
+                return
 
         logger.debug(
             "[Orchestrator] _handle_add_request: stage=%s req=%s "

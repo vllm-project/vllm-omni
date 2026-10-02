@@ -109,14 +109,14 @@ realtime_server_vad_server_params = [
 ]
 
 
-def _pcm16_mono_16k_from_wav_bytes(wav_bytes: bytes) -> bytes:
+def _pcm16_mono_from_wav_bytes(wav_bytes: bytes, sample_rate_hz: int = 16000) -> bytes:
     with wave.open(io.BytesIO(wav_bytes), "rb") as wf:
         if wf.getnchannels() != 1:
             raise ValueError(f"Expected mono WAV, got {wf.getnchannels()} channels")
         if wf.getsampwidth() != 2:
             raise ValueError(f"Expected 16-bit PCM, sampwidth={wf.getsampwidth()}")
-        if wf.getframerate() != 16000:
-            raise ValueError(f"Expected 16 kHz input for /v1/realtime, got {wf.getframerate()} Hz")
+        if wf.getframerate() != sample_rate_hz:
+            raise ValueError(f"Expected {sample_rate_hz} Hz input for /v1/realtime, got {wf.getframerate()} Hz")
         if wf.getcomptype() != "NONE":
             raise ValueError(f"Expected uncompressed PCM, comptype={wf.getcomptype()!r}")
         return wf.readframes(wf.getnframes())
@@ -148,13 +148,13 @@ async def _run_realtime_audio_roundtrip(
     text_chunks: list[str] = []
     final_text = ""
     delta_events = 0
+    audio_done = False
 
-    bytes_per_ms = 16000 * 2 // 1000
+    bytes_per_ms = 24000 * 2 // 1000
     chunk_bytes = max(bytes_per_ms * chunk_ms, 2)
 
     async with websockets.connect(uri, max_size=64 * 1024 * 1024) as ws:
-        await ws.send(json.dumps({"type": "session.update", "model": model}))
-        await ws.send(json.dumps({"type": "input_audio_buffer.commit", "final": False}))
+        await ws.send(json.dumps({"type": "session.update", "session": {"type": "realtime", "model": model}}))
 
         for i in range(0, len(pcm16), chunk_bytes):
             chunk = pcm16[i : i + chunk_bytes]
@@ -169,7 +169,8 @@ async def _run_realtime_audio_roundtrip(
             if send_delay_ms > 0:
                 await asyncio.sleep(send_delay_ms / 1000.0)
 
-        await ws.send(json.dumps({"type": "input_audio_buffer.commit", "final": True}))
+        await ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
+        await ws.send(json.dumps({"type": "response.create"}))
 
         while True:
             message = await asyncio.wait_for(ws.recv(), timeout=completion_timeout_s)
@@ -179,7 +180,19 @@ async def _run_realtime_audio_roundtrip(
             event = json.loads(message)
             event_type = event.get("type")
 
-            if event_type == "session.created":
+            if event_type in {
+                "session.created",
+                "conversation.created",
+                "session.updated",
+                "input_audio_buffer.committed",
+                "conversation.item.added",
+                "conversation.item.done",
+                "response.created",
+                "response.output_item.added",
+                "response.content_part.added",
+                "response.content_part.done",
+                "response.output_item.done",
+            }:
                 continue
 
             if event_type == "response.output_audio.delta":
@@ -187,22 +200,26 @@ async def _run_realtime_audio_roundtrip(
                 sr = event.get("sample_rate_hz")
                 if isinstance(sr, int) and sr > 0:
                     output_sr = sr
-                audio_b64 = event.get("audio", "")
+                audio_b64 = event.get("delta", "")
                 if audio_b64:
                     incremental.append(base64.b64decode(audio_b64))
                 continue
 
-            if event_type == "transcription.delta":
+            if event_type == "response.output_audio_transcript.delta":
                 d = event.get("delta", "")
                 if d:
                     text_chunks.append(d)
                 continue
 
-            if event_type == "transcription.done":
-                final_text = event.get("text", "") or "".join(text_chunks)
+            if event_type == "response.output_audio_transcript.done":
+                final_text = event.get("transcript") or "".join(text_chunks)
                 continue
 
             if event_type == "response.output_audio.done":
+                audio_done = True
+                continue
+
+            if event_type == "response.done":
                 break
 
             if event_type == "error":
@@ -214,8 +231,9 @@ async def _run_realtime_audio_roundtrip(
     return {
         "output_pcm": out_pcm,
         "output_sample_rate": output_sr,
-        "transcription_text": final_text if final_text else "".join(text_chunks),
+        "transcription_text": final_text or "".join(text_chunks),
         "delta_events": delta_events,
+        "audio_done": audio_done,
     }
 
 
@@ -263,6 +281,7 @@ async def _run_server_vad_audio_roundtrips(
                 {
                     "type": "session.update",
                     "session": {
+                        "type": "realtime",
                         "model": model,
                         "audio": {
                             "input": {
@@ -394,20 +413,21 @@ def _synthetic_pcm16_input(
     syn = generate_synthetic_audio(
         duration_s,
         1,
-        sample_rate=16000,
+        sample_rate=24000,
         phrase_text=phrase_text,
     )
     wav_bytes = base64.b64decode(syn["base64"])
-    return _pcm16_mono_16k_from_wav_bytes(wav_bytes)
+    return _pcm16_mono_from_wav_bytes(wav_bytes, sample_rate_hz=24000)
 
 
 def _server_vad_pcm16_input() -> bytes:
     """Load the fixed single-turn speech fixture used by the Server VAD E2E."""
-    return _pcm16_mono_16k_from_wav_bytes(validated_input_wav().read_bytes())
+    return _pcm16_mono_from_wav_bytes(validated_input_wav().read_bytes())
 
 
 def _assert_realtime_smoke(result: dict) -> None:
     out_pcm = result["output_pcm"]
+    assert result["audio_done"], "No response.output_audio.done event"
     assert result["delta_events"] >= 1
     assert out_pcm, "No output PCM from response.output_audio.delta"
     assert len(out_pcm) % 2 == 0
@@ -480,7 +500,7 @@ class TestQwen3OmniRealtimeWebSocket:
         )
 
         assert len(answers) == 3, answers
-        assert "assistant" in answers[0].lower(), answers
+        assert "qwen" in answers[0].lower(), answers
         assert "paris" in answers[1].lower(), answers
         assert "paris" in answers[2].lower(), answers
 
@@ -690,7 +710,7 @@ def qwen_duplex_server(tmp_path_factory, cached_silero_vad_artifact, run_level):
 
 def _duplex_fixture_pcm(path: Path, *, duration_s: float | None = None) -> bytes:
     """Replay checked-in speech at the web client's negotiated 24 kHz PCM16 rate."""
-    pcm = np.frombuffer(_pcm16_mono_16k_from_wav_bytes(path.read_bytes()), dtype="<i2")
+    pcm = np.frombuffer(_pcm16_mono_from_wav_bytes(path.read_bytes()), dtype="<i2")
     if duration_s is not None:
         pcm = pcm[: int(duration_s * 16000)]
     positions = np.arange(len(pcm) * 3 // 2) * (2.0 / 3.0)
@@ -775,6 +795,7 @@ async def _duplex_recorded_session(runtime, log_path: Path, *, instructions: str
                     {
                         "type": "session.update",
                         "session": {
+                            "type": "realtime",
                             "model": server.model,
                             "instructions": instructions,
                             "temperature": 0,

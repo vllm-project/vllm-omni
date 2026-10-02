@@ -25,8 +25,8 @@ class FakeAdapter:
     """Minimal mock of OmniChunkTransferAdapter tracking restore calls."""
 
     def __init__(self):
-        self.waiting_for_chunk_waiting_requests = deque()
-        self.waiting_for_chunk_running_requests = deque()
+        self.waiting_for_chunk_waiting_requests: deque = deque()
+        self.waiting_for_chunk_running_requests: deque = deque()
         self.restore_called = False
         self.done_request_ids = set()
 
@@ -249,3 +249,103 @@ class TestRestoreQueuesOnError:
 
         assert adapter.restore_called is True
         assert "req-B" in running
+
+
+def test_first_chunk_express_slack_guard_tracks_emitted_audio(monkeypatch):
+    """Express steps wait while a ready later chunk's stream is close to underrun."""
+    import vllm_omni.core.sched.omni_generation_scheduler as module
+
+    scheduler = OmniGenerationScheduler.__new__(OmniGenerationScheduler)
+    scheduler._first_chunk_express = True
+    scheduler._express_min_slack_s = 0.5
+    scheduler._express_skipped_for_slack = 0
+    scheduler._stream_audio = {}
+    scheduler._chunk_started = {"started", "idle"}
+    ready = SimpleNamespace(
+        request_id="started", num_in_flight_tokens=0, prompt_token_ids=[0] * 28, num_computed_tokens=0
+    )
+    # Started, but no chunk to decode now: never blocks an express step.
+    idle = SimpleNamespace(request_id="idle", num_in_flight_tokens=0, prompt_token_ids=[0] * 28, num_computed_tokens=28)
+    scheduler.running = [ready, idle]
+    scheduler.waiting = []
+    clock = [100.0]
+    monkeypatch.setattr(module.time, "monotonic", lambda: clock[0])
+
+    # No measured audio credit: do not delay the ready stream.
+    assert not scheduler._continuations_have_slack()
+    # 1 s of audio at t=100; at t=100.2 it holds 0.8 s, at t=100.7 only 0.3 s.
+    scheduler._record_stream_audio("started", {"model_outputs": torch.zeros(24000), "sr": torch.tensor(24000)})
+    scheduler._record_stream_audio("started", {"model_outputs": torch.zeros(0), "sr": torch.tensor(24000)})
+    clock[0] = 100.2
+    assert scheduler._continuations_have_slack()
+    clock[0] = 100.7
+    assert not scheduler._continuations_have_slack()
+    # Another second emitted: slack is back to 1.3 s.
+    scheduler._record_stream_audio("started", {"model_outputs": torch.zeros(24000), "sr": torch.tensor(24000)})
+    assert scheduler._continuations_have_slack()
+    assert scheduler._stream_audio["started"] == [100.0, 2.0]
+
+
+def _express_scheduler():
+    continuation = Request("continuation", [1, 2], SamplingParams(max_tokens=4), pooling_params=None)
+    first = Request("first", [1], SamplingParams(max_tokens=4), pooling_params=None)
+    scheduler = _make_generation_scheduler(continuation, use_v2_model_runner=True)
+    scheduler.waiting.add_request(first)
+    scheduler.requests[first.request_id] = first
+    scheduler.max_num_running_reqs = 4
+    scheduler._native_data_plane = True
+    scheduler.chunk_transfer_adapter = None
+    scheduler.input_coordinator = SimpleNamespace(
+        _async_chunk=True, finished_requests=set(), restore_queues=lambda *args, **kwargs: None
+    )
+    scheduler._first_chunk_express = True
+    scheduler._last_step_express = False
+    scheduler._chunk_started = {"continuation"}
+    scheduler._express_min_slack_s = 0
+    scheduler._stream_audio = {}
+    return scheduler, continuation, first
+
+
+def test_express_schedules_only_first_chunks_then_allows_continuations():
+    scheduler, continuation, first = _express_scheduler()
+    output = scheduler.schedule()
+    assert output.num_scheduled_tokens == {"first": 1}
+    assert scheduler._last_step_express
+    assert continuation in list(scheduler.waiting)
+    # Another first chunk arrives before the continuation runs.
+    first.num_computed_tokens = len(first.prompt_token_ids)
+    second = Request("second", [1], SamplingParams(max_tokens=4), pooling_params=None)
+    scheduler.waiting.add_request(second)
+    scheduler.requests[second.request_id] = second
+    output = scheduler.schedule()
+    assert not scheduler._last_step_express
+    assert "continuation" in output.num_scheduled_tokens
+
+
+def test_express_does_not_delay_continuation_for_unready_first_chunk():
+    scheduler, continuation, first = _express_scheduler()
+    first.num_in_flight_tokens = 1
+    output = scheduler.schedule()
+    assert not scheduler._last_step_express
+    assert output.num_scheduled_tokens == {"continuation": 2}
+
+
+def test_express_slack_guard_is_used_by_schedule():
+    scheduler, continuation, first = _express_scheduler()
+    scheduler._express_min_slack_s = 0.5
+    scheduler._express_skipped_for_slack = 0
+    output = scheduler.schedule()
+    assert not scheduler._last_step_express
+    assert "continuation" in output.num_scheduled_tokens
+
+
+def test_express_cancel_cleans_playback_state(monkeypatch):
+    from vllm.v1.core.sched.scheduler import Scheduler
+
+    scheduler, continuation, _ = _express_scheduler()
+    scheduler.input_coordinator = None
+    scheduler._stream_audio["continuation"] = [1.0, 2.0]
+    monkeypatch.setattr(Scheduler, "_free_request", lambda *args: (None, None))
+    scheduler._free_request(continuation)
+    assert "continuation" not in scheduler._chunk_started
+    assert "continuation" not in scheduler._stream_audio

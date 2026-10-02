@@ -1,0 +1,50 @@
+# Opt-in CUDA Model Runner V2 profile for Qwen3-Omni-MoE: the Thinker (stage 0),
+# Talker (stage 1) and Code2Wav (stage 2) run on MRv2 with its native data
+# plane. The base profile keeps every stage on V1.
+#
+# On MRv2 the Thinker hands each generated token's embedding to the Talker with
+# the step that sampled it (one Thinker step earlier than its next forward would
+# capture the same embedding) and replays decode in FULL CUDA graphs together
+# with the layers it captures for the Talker.
+#
+# When the stages share one GPU, run them under NVIDIA MPS (see
+# docs/configuration/stage_configs.md); startup warns when no MPS server is found.
+#
+# MRv2 downstream stages support turn-based sessions only: realtime (resumable)
+# requests and duplex sessions need the V1 chunk adapter.
+base_config: qwen3_omni_moe.yaml
+
+connectors:
+  connector_of_shared_memory:
+    extra:
+      # First Code2Wav chunk is the stream's first frame alone, then chunks
+      # double up to the steady codec_chunk_frames (replaces the 4-frame
+      # initial chunk). Code2Wav re-decodes up to codec_left_context_frames
+      # before each chunk, so windows are 1, 3, 7, 15, 31, then 50 frames.
+      # A one-frame first chunk is also what lets the Talker deliver it
+      # itself. Opt in explicitly; VLLM_OMNI_TALKER_FIRST_AUDIO=0 disables it.
+      talker_first_audio: true
+      codec_chunk_ramp: [1, 2, 4, 8, 16, 25]
+      # Code2Wav decodes a streaming step as a few length groups on multi-row
+      # CUDA graphs instead of one eager call padded to its longest window
+      # (with the ramp, over half of those padded frames were waste).
+      codec_graph_batch_sizes: [2, 3, 4, 6, 8, 12, 16]
+      codec_fused_snake: true
+
+stages:
+  - stage_id: 0
+    model_runner: v2
+  - stage_id: 1
+    model_runner: v2
+  - stage_id: 2
+    model_runner: v2
+
+platforms:
+  npu:
+    model_runner: v1
+  xpu:
+    model_runner: v1
+  rocm:
+    model_runner: v1
+  musa:
+    model_runner: v1

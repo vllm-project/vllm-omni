@@ -46,6 +46,15 @@ except ImportError:
 logger = init_logger(__name__)
 
 
+def _float32_to_pcm16_bytes(audio: np.ndarray) -> bytes:
+    """PCM_16 bytes of float32 samples, bit-identical to libsndfile's RAW writer.
+
+    libsndfile (1.2) converts with ``floor(x * 0x8000)`` clipped to int16.
+    """
+    scaled = np.floor(audio.astype(np.float64) * 32768.0)
+    return np.clip(scaled, -32768, 32767).astype("<i2").tobytes()
+
+
 class AudioMixin:
     """Mixin class to add audio-related utilities."""
 
@@ -93,9 +102,15 @@ class AudioMixin:
 
         soundfile_format, media_type, kwargs = supported_formats[response_format]
 
-        with BytesIO() as buffer:
-            soundfile.write(buffer, audio_tensor, sample_rate, format=soundfile_format, **kwargs)
-            audio_data = buffer.getvalue()
+        audio_data: bytes | str
+        if response_format == "pcm" and isinstance(audio_tensor, np.ndarray) and audio_tensor.dtype == np.float32:
+            # Through BytesIO, soundfile makes a Python callback per block;
+            # streamed chunks made that the API workers' largest cost.
+            audio_data = _float32_to_pcm16_bytes(audio_tensor)
+        else:
+            with BytesIO() as buffer:
+                soundfile.write(buffer, audio_tensor, sample_rate, format=soundfile_format, **kwargs)
+                audio_data = buffer.getvalue()
 
         if base64_encode:
             import base64

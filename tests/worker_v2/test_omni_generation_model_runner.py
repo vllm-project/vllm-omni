@@ -13,7 +13,7 @@ import torch
 
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.outputs import OmniModelRunnerOutput
-from vllm_omni.worker_v2.omni_generation_model_runner import OmniGenerationModelRunner
+from vllm_omni.worker_v2.omni_generation_model_runner import OmniGenerationModelRunner, check_exact_input_shape
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -182,3 +182,16 @@ def test_sample_tokens_uses_async_output_for_cuda_and_snapshots_req_ids(monkeypa
     output_req_ids = captured["model_runner_output"].req_ids
     input_batch.req_ids[0] = "reused"  # snapshot must insulate the published output
     assert output_req_ids == ["req-0"]
+
+
+@pytest.mark.parametrize("exact", [True, False])
+def test_exact_input_shape_models_reject_padded_batches(exact):
+    # Qwen3-Omni Code2Wav splits input_ids by seq_token_counts (#6712).
+    model = SimpleNamespace(requires_exact_input_shape=exact)
+    check_exact_input_shape(model, torch.zeros(32, dtype=torch.long), 32)
+    check_exact_input_shape(model, None, 16)
+    if exact:
+        with pytest.raises(RuntimeError, match="exact input shape"):
+            check_exact_input_shape(model, torch.zeros(48, dtype=torch.long), 32)
+    else:
+        check_exact_input_shape(model, torch.zeros(48, dtype=torch.long), 32)
