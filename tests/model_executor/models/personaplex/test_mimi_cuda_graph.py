@@ -162,7 +162,7 @@ class _ArgmaxQuantizer(MimiSplitResidualVectorQuantizer):
         return codes if num_quantizers is None else codes[:num_quantizers]
 
 
-def _make_small_codec(device: torch.device, batch_size: int) -> PersonaPlexMimiCodec:
+def _make_small_codec(device: torch.device, batch_size: int, **halves: bool) -> PersonaPlexMimiCodec:
     """A PersonaPlexMimiCodec over the real streaming stages, small enough for a unit test.
 
     The encoder maps a 1920-sample frame to one code frame with the same stride
@@ -209,7 +209,7 @@ def _make_small_codec(device: torch.device, batch_size: int) -> PersonaPlexMimiC
         nn.init.normal_(parameter, std=0.1)
     codec.model = nn.Module()
     codec.model.quantizer = _ArgmaxQuantizer(DIM).to(device)
-    codec.streaming_init(batch_size)
+    codec.streaming_init(batch_size, **halves)
     return codec
 
 
@@ -244,13 +244,116 @@ def test_dequantize_matches_transformers_decode() -> None:
     assert torch.equal(got, want)
 
 
+# Per-row streaming-state bytes of each half of the small codec (fp32): its ring KV (layers x K/V x 8 slots x DIM),
+# the int64 ring and position offsets (layers x 2 + 1), the conv carries (sum of channels x (kernel - stride):
+# 278 encoder side, 276 decoder side) and one fresh flag per conv (8 and 9).
+HALF_ROW_BYTES = {
+    "encode": 2 * 2 * 8 * DIM * 4 + (2 * 2 + 1) * 8 + 278 * 4 + 8,
+    "decode": 1 * 2 * 8 * DIM * 4 + (1 * 2 + 1) * 8 + 276 * 4 + 9,
+}
+
+
+def _other(half: str) -> str:
+    return "decode" if half == "encode" else "encode"
+
+
+def _one_sided_codec(half: str, batch_size: int) -> PersonaPlexMimiCodec:
+    return _make_small_codec(torch.device("cpu"), batch_size, **{_other(half): False})
+
+
+def _half_tensors(codec: PersonaPlexMimiCodec, half: str) -> list[torch.Tensor]:
+    """Every streaming-state tensor of ``half``: conv carries and fresh flags, ring KV and offsets."""
+    convs, transformer = codec._half_state(half)
+    holders = [*convs, transformer, *(transformer._kv or ())]
+    return [value for holder in holders for value in vars(holder).values() if isinstance(value, torch.Tensor)]
+
+
+def _row_bytes(codec: PersonaPlexMimiCodec, batch_size: int) -> int:
+    tensors = [codec._all_active, *_half_tensors(codec, "encode"), *_half_tensors(codec, "decode")]
+    total = sum(tensor.numel() * tensor.element_size() for tensor in tensors)
+    assert total % batch_size == 0
+    return total // batch_size
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("half", ["encode", "decode"])
+def test_one_sided_codec_allocates_only_its_half(half: str) -> None:
+    full = _make_small_codec(torch.device("cpu"), batch_size=3)
+    codec = _one_sided_codec(half, batch_size=3)
+    if half == "decode":
+        # Stage 1's chunk decode re-runs streaming_init: the codec stays decoder-only.
+        for decoder in (full, codec):
+            decoder.configure_decoder(hoist_frame=True, chunk_frames=3)
+
+    assert [t.shape for t in _half_tensors(codec, half)] == [t.shape for t in _half_tensors(full, half)]
+    assert _half_tensors(codec, _other(half)) == []
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("half", ["encode", "decode"])
+def test_one_sided_codec_drops_the_other_half_row_bytes(half: str) -> None:
+    full = _make_small_codec(torch.device("cpu"), batch_size=3)
+
+    assert _row_bytes(full, 3) == 1 + HALF_ROW_BYTES["encode"] + HALF_ROW_BYTES["decode"]
+    assert _row_bytes(full, 3) - _row_bytes(_one_sided_codec(half, batch_size=3), 3) == HALF_ROW_BYTES[_other(half)]
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("half", ["encode", "decode"])
+def test_one_sided_codec_output_matches_the_full_codec_bitwise(half: str) -> None:
+    batch_size = 3
+    full = _make_small_codec(torch.device("cpu"), batch_size)
+    codec = _one_sided_codec(half, batch_size)
+    generator = torch.Generator().manual_seed(SEED)
+
+    # 12 frames of 2 positions wrap the 8-slot rings; a recycled row and a full reset restart streams.
+    for step, rows in enumerate(ACTIVE_SCHEDULE * 2):
+        if step == 5:
+            full.reset_slot(1)
+            codec.reset_slot(1)
+        elif step == 9:
+            full.reset_streaming()
+            codec.reset_streaming()
+        if half == "encode":
+            x = torch.randn(batch_size, FRAME_SIZE, generator=generator)
+        else:
+            x = torch.randint(0, CARD, (batch_size, 8), generator=generator)
+        want = getattr(full, f"{half}_frame")(x, _mask(rows))
+        assert want.any()
+        assert torch.equal(getattr(codec, f"{half}_frame")(x, _mask(rows)), want)
+
+
+@pytest.mark.cpu
+def test_one_sided_codec_rejects_the_other_direction() -> None:
+    encoder = _one_sided_codec("encode", batch_size=3)
+    decoder = _one_sided_codec("decode", batch_size=3)
+    codes = torch.zeros(3, 8, 2, dtype=torch.long)
+    calls = {
+        "decode": [
+            lambda: encoder.decode_frame(codes[..., 0]),
+            lambda: encoder.decode_frames(codes),
+            lambda: encoder.decode_chunk(codes),
+            encoder.capture_decode_graph,
+            lambda: encoder.capture_decode_chunk_graphs(2),
+        ],
+        "encode": [lambda: decoder.encode_frame(torch.zeros(3, FRAME_SIZE)), decoder.capture_encode_graph],
+    }
+
+    for half, wrong in calls.items():
+        for call in wrong:
+            with pytest.raises(RuntimeError, match=f"no {half} streaming state"):
+                call()
+    with pytest.raises(ValueError, match="streaming_init needs"):
+        encoder.streaming_init(3, encode=False, decode=False)
+
+
 class _GraphCodec:
     def __init__(self) -> None:
-        self.batch_sizes: list[int] = []
+        self.inits: list[tuple[int, bool]] = []
         self.captures = 0
 
-    def streaming_init(self, batch_size: int) -> None:
-        self.batch_sizes.append(batch_size)
+    def streaming_init(self, batch_size: int, *, decode: bool = True) -> None:
+        self.inits.append((batch_size, decode))
 
     def capture_encode_graph(self) -> bool:
         self.captures += 1
@@ -276,7 +379,8 @@ def test_load_encoder_builds_the_shared_encoder_once(cuda_graph: bool) -> None:
     runtime.load_encoder(cuda_graph=cuda_graph)
 
     assert len(codecs) == 1
-    assert codecs[0].batch_sizes == [4]
+    # Four rows of the encoder half only: Stage 0 never decodes.
+    assert codecs[0].inits == [(4, False)]
     assert codecs[0].captures == int(cuda_graph)
 
 

@@ -324,6 +324,17 @@ def _walk_seanet(layers) -> list[tuple[str, object]]:
     return stages
 
 
+def _seanet_conv_states(stages) -> list[_StreamConv1d | _StreamConvTr1d]:
+    """The streaming conv states of a ``_walk_seanet`` stage list."""
+    states = []
+    for _, stage in stages:
+        if isinstance(stage, (_StreamConv1d, _StreamConvTr1d)):
+            states.append(stage)
+        elif isinstance(stage, tuple):
+            states += [stage[1], stage[3]]
+    return states
+
+
 def _residual_decode(rvq: nn.Module, codes: torch.Tensor) -> torch.Tensor:
     """``MimiResidualVectorQuantizer.decode`` of ``[B, K, T]`` codes, summed from the first codebook.
 
@@ -410,45 +421,64 @@ class PersonaPlexMimiCodec(nn.Module):
         self._upsample = _StreamConvTr1d(m.upsample.conv)
         self._dec_stages = _walk_seanet(m.decoder.layers)
         self._batch_size: int | None = None
+        # The halves streaming_init allocated rows for: Stage 0 only encodes, Stage 1 only decodes.
+        self._halves = {"encode": False, "decode": False}
         self._all_active: torch.Tensor
         self._encode_graph: _CodecGraph | None = None
         self._decode_graph: _CodecGraph | None = None
 
     # -- streaming state ------------------------------------------------------
 
-    def _conv_states(self):
-        for _, stage in (*self._enc_stages, *self._dec_stages):
-            if isinstance(stage, (_StreamConv1d, _StreamConvTr1d)):
-                yield stage
-            elif isinstance(stage, tuple):
-                yield stage[1]
-                yield stage[3]
-        yield self._downsample
-        yield self._upsample
+    def _half_state(self, half: str) -> tuple[list, _MimiStreamingTransformer]:
+        """The conv states and the transformer that carry the ``"encode"`` or ``"decode"`` half's stream."""
+        if half == "encode":
+            return [*_seanet_conv_states(self._enc_stages), self._downsample], self.encoder_transformer
+        return [self._upsample, *_seanet_conv_states(self._dec_stages)], self.decoder_transformer
 
-    def streaming_init(self, batch_size: int) -> None:
+    def _allocated_halves(self) -> list[tuple[list, _MimiStreamingTransformer]]:
+        return [self._half_state(half) for half, allocated in self._halves.items() if allocated]
+
+    def _conv_states(self):
+        for convs, _ in self._allocated_halves():
+            yield from convs
+
+    def _require(self, half: str) -> None:
+        if not self._halves[half]:
+            raise RuntimeError(
+                f"PersonaPlex Mimi has no {half} streaming state; call streaming_init(batch_size, {half}=True) first"
+            )
+
+    def streaming_init(self, batch_size: int, *, encode: bool = True, decode: bool = True) -> None:
+        """Allocate ``batch_size`` streaming rows of the encoder half, the decoder half, or both.
+
+        A half left out (Stage 0 never decodes, Stage 1 never encodes) gets no conv carries and no
+        transformer ring KV, and calling into it raises.
+        """
+        if not (encode or decode):
+            raise ValueError("PersonaPlex Mimi streaming_init needs encode=True, decode=True or both")
         # New state buffers invalidate a graph captured over the old ones.
         self._encode_graph = None
         self._decode_graph = None
         self._batch_size = batch_size
+        self._halves = {"encode": encode, "decode": decode}
         self._all_active = torch.ones(batch_size, dtype=torch.bool, device=self.device)
-        for s in self._conv_states():
-            s.reset(batch_size, self.device, self.dtype)
-        self.encoder_transformer.streaming_init(batch_size)
-        self.decoder_transformer.streaming_init(batch_size)
+        for convs, transformer in self._allocated_halves():
+            for state in convs:
+                state.reset(batch_size, self.device, self.dtype)
+            transformer.streaming_init(batch_size)
 
     def reset_streaming(self) -> None:
         assert self._batch_size is not None
-        for state in self._conv_states():
-            state.reset_all_slots()
-        self.encoder_transformer.reset_streaming()
-        self.decoder_transformer.reset_streaming()
+        for convs, transformer in self._allocated_halves():
+            for state in convs:
+                state.reset_all_slots()
+            transformer.reset_streaming()
 
     def reset_slot(self, b: int) -> None:
-        for s in self._conv_states():
-            s.reset_slot(b)
-        self.encoder_transformer.reset_slot(b)
-        self.decoder_transformer.reset_slot(b)
+        for convs, transformer in self._allocated_halves():
+            for state in convs:
+                state.reset_slot(b)
+            transformer.reset_slot(b)
 
     # -- per-frame codec -------------------------------------------------------
 
@@ -470,6 +500,7 @@ class PersonaPlexMimiCodec(nn.Module):
         if codes.shape[1] > semantic:
             out = out + _residual_decode(quantizer.acoustic_residual_vector_quantizer, codes[:, semantic:])
         return out
+
 
     # -- CUDA graphs ------------------------------------------------------------
 
@@ -519,21 +550,25 @@ class PersonaPlexMimiCodec(nn.Module):
 
     def capture_encode_graph(self) -> bool:
         """Replay full-batch ``encode_frame`` calls from a CUDA graph; returns whether one is in use."""
+        self._require("encode")
         if self._encode_graph is None:
             self._encode_graph = self._capture("encoder", self._encode_frame, (FRAME_SIZE,), self.dtype)
         return self._encode_graph is not None
 
     def capture_decode_graph(self) -> bool:
         """Replay full-batch ``decode_frame`` calls (not ``decode_frames``) from a CUDA graph."""
+        self._require("decode")
         if self._decode_graph is None:
             self._decode_graph = self._capture("decoder", self._decode_frame, (CODEBOOKS,), torch.long)
         return self._decode_graph is not None
+
 
     # -- per-frame codec -------------------------------------------------------
 
     @torch.no_grad()
     def encode_frame(self, pcm: torch.Tensor, active: torch.Tensor | None = None) -> torch.Tensor:
         """``[B, frame_size]`` float PCM -> ``[B, 8]`` codes."""
+        self._require("encode")
         active = _normalize_active(active, self._all_active)
         graph = self._encode_graph
         if graph is not None and pcm.shape[0] == self._batch_size and not torch.cuda.is_current_stream_capturing():
@@ -551,6 +586,7 @@ class PersonaPlexMimiCodec(nn.Module):
     @torch.no_grad()
     def decode_frame(self, codes: torch.Tensor, active: torch.Tensor | None = None) -> torch.Tensor:
         """``[B, 8]`` codes -> ``[B, frame_size]`` float PCM."""
+        self._require("decode")
         active = _normalize_active(active, self._all_active)
         graph = self._decode_graph
         if graph is not None and codes.shape[0] == self._batch_size and not torch.cuda.is_current_stream_capturing():
@@ -564,9 +600,10 @@ class PersonaPlexMimiCodec(nn.Module):
         x = self._run_stages(emb, self._dec_stages, active)
         return x[:, 0, :]
 
-    @torch.no_grad()
+
     def decode_frames(self, codes: torch.Tensor, active: torch.Tensor | None = None) -> torch.Tensor:
         """``[B, 8, F]`` codes -> ``[B, F * frame_size]`` float PCM."""
+        self._require("decode")
         emb = self._dequantize(codes.to(self.device))
         active = _normalize_active(active, self._all_active)
         emb = self._upsample(emb, active)

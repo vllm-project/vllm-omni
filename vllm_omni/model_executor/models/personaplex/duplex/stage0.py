@@ -270,7 +270,7 @@ class PersonaPlexStage0DuplexRuntime:
         # The [rows, hidden] embeds of the last _build_live_rows batch.
         self._live_embeds: Any | None = None
         if codec is not None:
-            codec.streaming_init(max_sessions)
+            codec.streaming_init(max_sessions, decode=False)
             self._codec = codec
 
     def encode_appends(self, appends: list[dict[str, Any]]) -> None:
@@ -810,7 +810,8 @@ class PersonaPlexStage0DuplexRuntime:
                     checkpoint=str(checkpoint) if checkpoint.is_file() else None,
                     device=self.device,
                 )
-        codec.streaming_init(self.max_sessions)
+        # Stage 0 only encodes: no decoder rows (half of the codec's per-row state).
+        codec.streaming_init(self.max_sessions, decode=False)
         self._codec = codec
         return codec
 

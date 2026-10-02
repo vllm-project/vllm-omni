@@ -29,7 +29,7 @@ _PERSONA = "Be concise."
 
 
 class _FakeCodec:
-    def streaming_init(self, batch_size: int) -> None:
+    def streaming_init(self, batch_size: int, *, decode: bool = True) -> None:
         self.batch_size = batch_size
 
     def encode_frame(self, pcm: torch.Tensor, active: torch.Tensor) -> torch.Tensor:

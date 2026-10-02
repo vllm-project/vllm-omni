@@ -27,9 +27,11 @@ class _FakeBatchedMimi(nn.Module):
         self.frames: torch.Tensor | None = None
         self.calls: list[tuple[torch.Tensor, torch.Tensor]] = []
         self.reset_rows: list[int] = []
+        self.encodes: bool | None = None
 
-    def streaming_init(self, batch_size: int) -> None:
+    def streaming_init(self, batch_size: int, *, encode: bool = True) -> None:
         self.frames = torch.zeros(batch_size, device=self.device)
+        self.encodes = encode
 
     def decode_frame(self, codes: torch.Tensor, active: torch.Tensor) -> torch.Tensor:
         assert self.frames is not None
@@ -245,8 +247,9 @@ def test_load_weights_builds_one_shared_decoder_with_a_row_per_session(
 
     model.load_weights(iter([("unused.weight", torch.zeros(1))]))
 
-    # Three session rows plus the scratch row, allocated before the first request.
+    # Three session rows plus the scratch row of the decoder half only, allocated before the first request.
     assert built[0].frames is not None and built[0].frames.shape == (4,)
+    assert built[0].encodes is False
     # Only mimi_cuda_graphs decides the decode graph; Stage 1 stays enforce_eager.
     assert built[0].captured_rows == ([4] if cuda_graphs else [])
 

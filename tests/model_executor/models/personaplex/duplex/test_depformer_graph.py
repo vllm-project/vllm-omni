@@ -31,7 +31,7 @@ class _FakeCodec:
     def __init__(self) -> None:
         self.frames: list[int] = []
 
-    def streaming_init(self, batch_size: int) -> None:
+    def streaming_init(self, batch_size: int, *, decode: bool = True) -> None:
         self.frames = [0] * batch_size
 
     def encode_frame(self, pcm: torch.Tensor, active: torch.Tensor) -> torch.Tensor:

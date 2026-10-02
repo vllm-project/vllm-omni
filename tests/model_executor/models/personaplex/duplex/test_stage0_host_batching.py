@@ -29,7 +29,7 @@ class _BatchCodec:
     def __init__(self) -> None:
         self.frames: torch.Tensor | None = None
 
-    def streaming_init(self, batch_size: int) -> None:
+    def streaming_init(self, batch_size: int, *, decode: bool = True) -> None:
         self.frames = torch.zeros(batch_size, dtype=torch.long)
 
     def encode_frame(self, pcm: torch.Tensor, active: torch.Tensor) -> torch.Tensor:

@@ -469,8 +469,8 @@ class PersonaPlexCode2Wav(nn.Module):
         return row
 
     def _install_mimi(self, codec: nn.Module, device: torch.device) -> None:
-        """Share ``codec`` across sessions: one streaming row per session plus the scratch row."""
-        codec.streaming_init(self._num_codec_rows)
+        """Share ``codec`` across sessions: one streaming row per session plus the scratch row (decoder half only)."""
+        codec.streaming_init(self._num_codec_rows, encode=False)
         self.mimi = codec
         self._mimi_device = device
         self._request_rows.clear()
