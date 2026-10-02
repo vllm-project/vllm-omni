@@ -11,6 +11,7 @@ import time
 import types
 from dataclasses import dataclass, field
 from subprocess import CompletedProcess
+from unittest.mock import MagicMock
 
 import pytest
 from omegaconf import OmegaConf
@@ -18,6 +19,7 @@ from vllm.v1.engine.utils import EngineZmqAddresses
 
 from tests.helpers.mock import patch_hf_snapshot_download
 from vllm_omni.config.omni_config import OmniStageRuntimeConfig
+from vllm_omni.config.watermarking import WatermarkConfig
 from vllm_omni.diffusion.data import AttentionConfig
 from vllm_omni.engine import omni_engine_base as async_omni_engine_module
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
@@ -30,6 +32,7 @@ from vllm_omni.engine.stage_init_utils import (
     split_devices_for_replicas,
     stage_runtime_env,
 )
+from vllm_omni.engine.stage_pool import StagePool
 from vllm_omni.engine.stage_runtime import StageRuntime
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -112,6 +115,43 @@ def test_stage_runtime_env_restores_first_value_for_normalized_keys(monkeypatch)
         assert os.environ["123"] == "second"
 
     assert os.environ["123"] == "original"
+
+
+@pytest.mark.parametrize("stage_type", ["llm", "diffusion"])
+def test_stage_runtime_initializes_configured_audio_watermarker(monkeypatch, stage_type: str):
+    """Ensure runtime initialization constructs the configured stage watermarker."""
+    watermarker = object()
+    constructor = MagicMock(return_value=watermarker)
+    monkeypatch.setitem(StagePool._watermarker_registry["audio"], "audioseal", constructor)
+    runtime = StageRuntime(
+        stage_configs=[],
+        model="dummy-model",
+        config_path="dummy-config",
+        stage_init_timeout=1,
+        async_chunk=False,
+        watermark_config=WatermarkConfig({"audio": {"algorithm": "audioseal"}}, strict=True),
+    )
+    if stage_type == "llm":
+        config = types.SimpleNamespace(model_config=types.SimpleNamespace(skip_tokenizer_init=True))
+        plan = _make_llm_plan(0, stage_id=0, vllm_config=config, final_output=True, final_output_type="audio")
+    else:
+        plan = _make_diffusion_plan(0, stage_id=0, final_output_type="audio")
+    client = types.SimpleNamespace(
+        stage_type=stage_type,
+        final_output=True,
+        final_output_type="audio",
+        is_comprehension=False,
+        default_sampling_params=types.SimpleNamespace(),
+    )
+    monkeypatch.setattr(runtime, "_prepare_stage_plans", lambda: [plan])
+    monkeypatch.setattr(runtime, "_initialize_replica", lambda *_args: client)
+
+    runtime.initialize()
+
+    assert len(runtime.stage_pools) == 1
+    constructor.assert_called_once_with()
+    assert runtime.stage_pools[0]._watermarkers == {"audio": watermarker}
+    assert runtime.stage_pools[0]._strict_watermarking
 
 
 def test_orchestrator_startup_timeout_warns_how_to_raise_limits(monkeypatch):
@@ -227,6 +267,7 @@ def _make_diffusion_plan(
     *,
     stage_id: int,
     num_replicas: int = 1,
+    final_output_type: str = "image",
 ):
     replicas: list[ReplicaInitPlan] = []
     for replica_id in range(num_replicas):
@@ -242,7 +283,11 @@ def _make_diffusion_plan(
                 num_replicas=num_replicas,
                 launch_mode="local",
                 stage_cfg=stage_cfg,
-                metadata=_make_diffusion_metadata(stage_id, replica_id=replica_id),
+                metadata=_make_diffusion_metadata(
+                    stage_id,
+                    replica_id=replica_id,
+                    final_output_type=final_output_type,
+                ),
                 stage_connector_spec={},
                 omni_kv_connector=(None, None, None),
             )
@@ -294,6 +339,7 @@ def test_async_omni_engine_initialize_stages_passes_log_stats_and_client_config_
     engine.request_queue = types.SimpleNamespace()
     engine._log_stats = True
     engine._client_config = engine_mod.OmniClientConfig(client_count=2, client_index=1, stage_addresses={})
+    engine._watermark_config = WatermarkConfig({"audio": {"algorithm": "audioseal"}})
     engine._parallel_stage_init = False
 
     captured: dict[str, object] = {}
@@ -310,6 +356,7 @@ def test_async_omni_engine_initialize_stages_passes_log_stats_and_client_config_
     assert captured["stage_init_timeout"] == 7
     assert captured["log_stats"] is True
     assert captured["client_config"] is engine._client_config
+    assert captured["watermark_config"] is engine._watermark_config
 
 
 def test_async_omni_engine_initialize_stages_retains_stage0_prompt_transform(monkeypatch):

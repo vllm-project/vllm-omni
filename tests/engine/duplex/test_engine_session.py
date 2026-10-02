@@ -574,6 +574,7 @@ def test_as_public_dict_exposes_identity_capabilities_and_playback():
     assert payload["id"] == "duplex-public"
     assert payload["model"] == "m"
     assert payload["voice"] == "alloy"
+    assert payload["watermarking"] is True
     assert payload["state"] == "open"
     assert payload["turn_state"] == "assistant_playing"
     assert payload["epoch"] == 0
@@ -656,6 +657,20 @@ def test_from_realtime_uses_served_model_when_payload_has_none():
     assert config.model == "served-model"
     assert config.response_format == "pcm"
     assert config.idle_timeout_s == 300.0
+
+
+def test_realtime_session_watermarking_opt_out():
+    config = DuplexSessionConfig.from_realtime({"watermarking": False})
+    assert config.watermarking is False
+    assert config.normalized().watermarking is False
+
+    # Watermarking is fixed at open; updates may repeat or omit it, but not change it
+    config.apply_realtime_update({})
+    config.apply_realtime_update({"watermarking": False})
+    assert config.watermarking is False
+    with pytest.raises(DuplexConfigError, match="cannot change watermarking") as exc_info:
+        config.apply_realtime_update({"watermarking": True})
+    assert exc_info.value.code == "watermarking_update_unsupported"
 
 
 def test_from_realtime_ignores_client_chosen_session_ids():

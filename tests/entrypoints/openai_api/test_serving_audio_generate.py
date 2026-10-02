@@ -248,6 +248,13 @@ class TestParameterWiring:
         assert call_kwargs["output_modalities"] == ["audio"]
 
     @pytest.mark.asyncio
+    async def test_watermarking_opt_out_wiring(self, server_and_engine):
+        server, engine = server_and_engine
+        await server.create_audio_generate(OpenAICreateAudioGenerateRequest(input="rain", watermarking=False))
+
+        assert engine.generate.call_args[1]["watermarking"] is False
+
+    @pytest.mark.asyncio
     async def test_negative_prompt_wiring(self, server_and_engine):
         server, engine = server_and_engine
         req = OpenAICreateAudioGenerateRequest(input="a calm ocean", negative_prompt="noise distortion")

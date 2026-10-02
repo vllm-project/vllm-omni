@@ -3,8 +3,9 @@
 
 import copy
 import pprint
+from collections.abc import Sequence
 from dataclasses import asdict, dataclass, field
-from typing import Any, TypeAlias
+from typing import Any, TypeAlias, TypeVar, cast
 
 import torch
 from typing_extensions import NotRequired, TypedDict
@@ -210,6 +211,9 @@ class OmniDiffusionSamplingParams:
     to manage numerous individual parameters.
     """
 
+    # Whether final outputs should be watermarked (when configured)
+    watermarking: bool = True
+
     # Additional text-related parameters
     max_sequence_length: int | None = None
     prompt_template: dict[str, Any] | None = None
@@ -412,6 +416,7 @@ class OmniDiffusionSamplingParams:
             seed = getattr(params, "seed", None)
             if seed is not None:
                 mapped.setdefault("seed", seed)
+            mapped["watermarking"] = params.watermarking
             return cls(**mapped)
         raise TypeError(
             "Diffusion stage requires OmniDiffusionSamplingParams or vllm.SamplingParams, "
@@ -420,3 +425,19 @@ class OmniDiffusionSamplingParams:
 
 
 OmniSamplingParams: TypeAlias = SamplingParams | OmniDiffusionSamplingParams
+
+StageParamsT = TypeVar("StageParamsT")
+
+
+def disable_watermarking(params_list: Sequence[StageParamsT]) -> list[StageParamsT]:
+    """Copy each stage's sampling params with watermarking disabled."""
+    disabled_params_list: list[StageParamsT] = []
+    for params in params_list:
+        if isinstance(params, OmniSamplingParams):
+            disabled = copy.copy(params)
+            disabled.watermarking = False
+            # copy.copy preserves the concrete type, which mypy loses through the isinstance narrowing
+            disabled_params_list.append(cast(StageParamsT, disabled))
+        else:
+            disabled_params_list.append(params)
+    return disabled_params_list

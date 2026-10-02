@@ -281,6 +281,7 @@ class DuplexSessionConfig:
     overlap_barge_in_ms: int = 1200
     overlap_silence_rms: float = 0.003
     playback_commit_policy: str = DuplexPlaybackCommitPolicy.COMMIT_ALL_ON_DONE.value
+    watermarking: bool = True
     extra_body: dict[str, object] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, object]:
@@ -302,6 +303,7 @@ class DuplexSessionConfig:
             "overlap_barge_in_ms": self.overlap_barge_in_ms,
             "overlap_silence_rms": self.overlap_silence_rms,
             "playback_commit_policy": self.playback_commit_policy,
+            "watermarking": self.watermarking,
             "extra_body": dict(self.extra_body),
         }
 
@@ -350,6 +352,8 @@ class DuplexSessionConfig:
             config.overlap_silence_rms = max(0.0, float(source["overlap_silence_rms"]))
         if isinstance(source.get("playback_commit_policy"), str):
             config.playback_commit_policy = cls._normalize_playback_commit_policy(source["playback_commit_policy"])
+        if isinstance(source.get("watermarking"), bool):
+            config.watermarking = source["watermarking"]
         if isinstance(source.get("modalities"), list) and all(isinstance(x, str) for x in source["modalities"]):
             config.modalities = list(source["modalities"])
         if isinstance(source.get("extra_body"), dict):
@@ -477,6 +481,7 @@ class DuplexSessionConfig:
             ),
             "speed": speed,
             "idle_timeout_s": payload.get("idle_timeout_s") or 300.0,
+            "watermarking": payload.get("watermarking"),
             **realtime_overlap_fields(payload),
             "extra_body": extra_body,
         }
@@ -492,7 +497,8 @@ class DuplexSessionConfig:
         """Apply a Realtime ``session.update`` patch in place.
 
         Raises :class:`DuplexConfigError` (``code`` in ``model_update_unsupported``,
-        ``voice_update_after_audio_unsupported``, ``ref_audio_update_unsupported``)
+        ``voice_update_after_audio_unsupported``, ``ref_audio_update_unsupported``,
+        ``watermarking_update_unsupported``)
         when the patch changes something a live session cannot change.
         ``audio_started`` is ``playback.generated_ms > 0 or playback.sent_ms > 0``.
         """
@@ -526,6 +532,13 @@ class DuplexSessionConfig:
             raise DuplexConfigError(
                 "session.update cannot change voice after audio output has started",
                 code="voice_update_after_audio_unsupported",
+            )
+        # Async-chunk stages are submitted once per epoch, so watermarking is fixed when the session opens
+        watermarking = payload.get("watermarking")
+        if isinstance(watermarking, bool) and watermarking != self.watermarking:
+            raise DuplexConfigError(
+                "session.update cannot change watermarking after the session is open",
+                code="watermarking_update_unsupported",
             )
         if isinstance(payload.get("ref_audio"), str):
             raise DuplexConfigError(

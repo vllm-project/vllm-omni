@@ -962,12 +962,12 @@ class TestWebSocketSentenceSplitting:
         voices = [call.args[0].voice for call in speech_service._generate_audio_bytes.await_args_list]
         assert voices == ["Vivian", "Vivian", "Serena"]
 
-    def test_seed_is_forwarded_to_speech_request(self, mocker: MockerFixture):
+    def test_session_options_are_forwarded_to_speech_request(self, mocker: MockerFixture):
         app, speech_service = _build_test_app(mocker=mocker)
 
         with TestClient(app) as client:
             with client.websocket_connect("/v1/audio/speech/stream") as ws:
-                ws.send_json({"type": "session.config", "voice": "Vivian", "seed": 42})
+                ws.send_json({"type": "session.config", "voice": "Vivian", "seed": 42, "watermarking": False})
                 ws.send_json({"type": "input.text", "text": "Hello."})
                 ws.send_json({"type": "input.done"})
                 ws.receive_json()
@@ -975,7 +975,9 @@ class TestWebSocketSentenceSplitting:
                 ws.receive_json()
                 ws.receive_json()
 
-        assert speech_service._generate_audio_bytes.await_args_list[0].args[0].seed == 42
+        speech_request = speech_service._generate_audio_bytes.await_args_list[0].args[0]
+        assert speech_request.seed == 42
+        assert speech_request.watermarking is False
 
 
 class TestGeneratePcmChunksContract:

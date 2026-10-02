@@ -9,6 +9,8 @@ import base64
 import numpy as np
 import pytest
 import torch
+from pytest_mock import MockerFixture
+from vllm.entrypoints.speech_to_text.realtime.connection import RealtimeConnection as VllmRealtimeConnection
 from vllm.sampling_params import RequestOutputKind, SamplingParams
 
 from vllm_omni.entrypoints.async_omni import AsyncOmni
@@ -84,3 +86,27 @@ class TestAsyncOmniStreamingParamsValidation:
         p = SamplingParams(n=1, stop=["\n"], output_kind=RequestOutputKind.DELTA)
         with pytest.raises(ValueError, match="Input streaming"):
             AsyncOmni._validate_streaming_input_sampling_params(p)
+
+
+class TestRealtimeWatermarking:
+    @pytest.fixture
+    def connection(self, realtime_conn: RealtimeConnection, mocker: MockerFixture) -> RealtimeConnection:
+        mocker.patch.object(VllmRealtimeConnection, "handle_event", mocker.AsyncMock())
+        return realtime_conn
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("updates", "expected"),
+        [
+            ([{"watermarking": False}], False),
+            # Each session.update replaces the session state, so omitting the field resets it
+            ([{"watermarking": False}, {}], True),
+        ],
+    )
+    async def test_session_update_sets_watermarking(
+        self, connection: RealtimeConnection, updates: list[dict[str, bool]], expected: bool
+    ) -> None:
+        for update in updates:
+            await connection.handle_event({"type": "session.update", "model": "m", **update})
+
+        assert connection._watermarking is expected

@@ -33,6 +33,17 @@ class RealtimeConnection(VllmRealtimeConnection):
         super().__init__(*args, **kwargs)
         self.engine = cast(AsyncOmni, self.serving.engine_client)
         self._realtime_audio_ref: np.ndarray | None = None
+        self._watermarking = True
+
+    async def handle_event(self, event: dict):
+        # For now, we handle the session state for watermarking on session.update
+        if event.get("type") == "session.update":
+            watermarking = event.get("watermarking", True)
+            if not isinstance(watermarking, bool):
+                await self.send_error("watermarking must be a boolean", "invalid_event")
+                return
+            self._watermarking = watermarking
+        await super().handle_event(event)
 
     async def start_generation(self):
         await super().start_generation()
@@ -147,6 +158,7 @@ class RealtimeConnection(VllmRealtimeConnection):
                 prompt=streaming_input_gen,
                 request_id=request_id,
                 sampling_params_list=sampling_params_list,
+                watermarking=self._watermarking,
             )
 
             async for output in result_gen:

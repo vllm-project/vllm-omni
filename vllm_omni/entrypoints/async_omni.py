@@ -33,7 +33,7 @@ from vllm_omni.engine.messages import ErrorMessage
 from vllm_omni.entrypoints.async_omni_base import ABORT_TIMEOUT_S, AsyncOmniBase
 from vllm_omni.entrypoints.client_request_state import ClientRequestState
 from vllm_omni.errors import client_error_metadata
-from vllm_omni.inputs.data import OmniSamplingParams
+from vllm_omni.inputs.data import OmniSamplingParams, disable_watermarking
 from vllm_omni.metrics.stats import OrchestratorAggregator as OrchestratorMetrics
 from vllm_omni.outputs import OmniRequestOutput
 
@@ -128,6 +128,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         reasoning_ended: bool | None = None,
         reasoning_parser_kwargs: dict[str, Any] | None = None,
         arrival_time: float | None = None,
+        watermarking: bool = True,
     ) -> AsyncGenerator[OmniRequestOutput, None]:
         """Generate outputs for the given prompt(s) asynchronously.
 
@@ -154,6 +155,8 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
                 Must have the same length as the number of stages.
                 If *None*, uses default sampling params for each stage.
             output_modalities: Optional list of output modalities.
+            watermarking: Whether configured watermarking applies to this request;
+                False disables it on every stage.
 
         Yields:
             OmniRequestOutput objects as they are produced by each stage.
@@ -228,6 +231,8 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
                 sampling_params_list,
                 allow_delta_coercion=True,
             )
+            if not watermarking:
+                sampling_params_list = disable_watermarking(sampling_params_list)
 
             # Track per-request metrics
             wall_start_ts = float(arrival_time) if arrival_time is not None else time.time()

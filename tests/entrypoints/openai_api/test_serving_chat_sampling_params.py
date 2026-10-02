@@ -376,6 +376,7 @@ def test_text_only_request_reaches_engine_with_comprehension_task_mode(mock_engi
         model="test",
         messages=[{"role": "user", "content": "describe this image"}],
         modalities=["text"],
+        watermarking=False,
     )
 
     assert asyncio.run(serving_chat._create_chat_completion(request)) == "done"
@@ -384,6 +385,7 @@ def test_text_only_request_reaches_engine_with_comprehension_task_mode(mock_engi
     assert sampling_params_list[0].extra_args == {"ar_task_mode": "comprehension"}
     assert sampling_params_list[1].extra_args == {}
     assert captured["output_modalities"] == ["text"]
+    assert captured["watermarking"] is False
 
 
 @pytest.fixture
