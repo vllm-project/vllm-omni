@@ -1,0 +1,6 @@
+# H100 single-GPU "all lossless switches on" lane profile (opt/mcpo-int measurement only).
+# Pair with: MPS daemon, VLLM_OMNI_DUPLEX_STATIC_CONFIG=1, VLLM_OMNI_TALKER_KSTEP_WAITING_SAFE=1,
+# VLLM_OMNI_CODEC_ONSET_MERGE=1, VLLM_OMNI_DUPLEX_GC=1 and the H7 Stage-2 connector extras.
+base_config: minicpmo_4_5_kstep.yaml
+duplex_session:
+  max_sessions: 16

@@ -1195,6 +1195,27 @@ def test_background_send_uses_enqueued_request_snapshot(build_adapter):
     ]
 
 
+@pytest.mark.parametrize("prompt_token_ids", [list(range(4096)), (1, 2, 3), None])
+def test_snapshot_freezes_prompt_ids_exactly_like_the_elementwise_walk(prompt_token_ids):
+    request = SimpleNamespace(
+        prompt_token_ids=prompt_token_ids,
+        additional_information={"ids": {"prompt": [5, 6]}, "meta": {"segment": "old"}},
+        _all_token_ids=[1, 2],
+        _output_token_ids=[2],
+    )
+
+    snapshot = OmniChunkTransferAdapter._snapshot_processor_request(request)
+
+    assert snapshot.prompt_token_ids == prompt_token_ids
+    assert type(snapshot.prompt_token_ids) is type(prompt_token_ids)
+    if isinstance(prompt_token_ids, list):
+        assert snapshot.prompt_token_ids is not prompt_token_ids
+        prompt_token_ids.append(-1)
+        assert snapshot.prompt_token_ids[-1] == 4095
+    assert snapshot.additional_information == request.additional_information
+    assert snapshot.additional_information["ids"]["prompt"] is not request.additional_information["ids"]["prompt"]
+
+
 def test_save_without_custom_processor_does_not_snapshot_request(build_adapter, mocker):
     adapter, _ = build_adapter(stage_id=1)
     request = _req("req-direct", RequestStatus.RUNNING, external_req_id="ext-direct")
@@ -3685,3 +3706,85 @@ def test_save_async_boundary_holds_generation_without_request_counter(build_adap
 
     assert len(adapter._pending_save_reqs) == queued_before + 1
     assert adapter._pending_save_reqs[-1]["request"] is follow_up
+
+
+# --- event-driven receive (VLLM_OMNI_STAGE_IDLE_WAIT_S) ---------------------------------------
+
+
+class _WakeConnector:
+    """Connector double with arrival wakeups: ``get`` misses until ``deliver``."""
+
+    def __init__(self, stage_id: int, payload) -> None:
+        self.stage_id = stage_id
+        self.config = {"extra": {}}
+        self.payload = payload
+        self.ready = False
+        self.generation = 0
+        self.waits: list[tuple[int, float]] = []
+        self.wakes = 0
+
+    def get(self, *args, **kwargs):
+        return (self.payload, 16) if self.ready else None
+
+    def get_wakeup_generation(self) -> int:
+        return self.generation
+
+    def wait_for_change(self, generation: int, *, timeout: float) -> bool:
+        self.waits.append((generation, timeout))
+        self.ready = True  # the producer's put lands while the receiver waits
+        self.generation += 1
+        return True
+
+    def wake_self(self) -> None:
+        self.wakes += 1
+
+
+def _generation_payload():
+    return {
+        "codes": {"audio": [1, 2, 3]},
+        "meta": {"finished": torch.tensor(False, dtype=torch.bool)},
+    }
+
+
+def test_recv_loop_waits_on_connector_wakeup_and_signals_chunk_ready(build_adapter):
+    adapter, _ = build_adapter(stage_id=2, model_mode="generation")
+    connector = _WakeConnector(2, _generation_payload())
+    adapter.connector = connector
+    adapter._recv_fifo_wait_s = 0.25
+    ready = []
+
+    def on_ready():
+        # The commit is visible before the wakeup: a woken schedule() sees it.
+        ready.append(set(adapter._finished_load_reqs))
+        adapter.stop_event.set()
+
+    adapter.set_chunk_ready_callback(on_ready)
+    request = _req("gen-1", RequestStatus.WAITING_FOR_CHUNK)
+    adapter.load_async(request)
+    assert connector.wakes == 1  # registration interrupts a blocked wait
+    adapter.recv_loop()
+    # One miss, one bounded wait taken with the pre-pass generation, then the hit.
+    assert connector.waits == [(0, 0.25)]
+    assert ready == [{"gen-1"}]
+
+
+def test_recv_loop_keeps_the_1ms_poll_without_the_switch(build_adapter):
+    adapter, connector = build_adapter(stage_id=2, model_mode="generation")
+    adapter.load_async(_req("gen-2", RequestStatus.WAITING_FOR_CHUNK))
+    timeouts = []
+
+    def wait(timeout):
+        timeouts.append(timeout)
+        adapter.stop_event.set()
+
+    adapter._recv_cond.wait = lambda timeout: wait(timeout)
+    adapter.recv_loop()
+    assert timeouts == [0.001]
+    connector.wait_for_change.assert_not_called()
+    connector.wake_self.assert_not_called()
+
+
+def test_chunk_ready_callback_failure_is_swallowed(build_adapter):
+    adapter, _ = build_adapter(stage_id=2, model_mode="generation")
+    adapter.set_chunk_ready_callback(Mock(side_effect=RuntimeError("queue closed")))
+    adapter._notify_chunk_ready()  # a lost hint only costs the fallback bound

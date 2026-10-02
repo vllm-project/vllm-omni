@@ -436,7 +436,8 @@ async def test_commands_for_a_closed_session_are_answered_with_unknown_session()
 
 
 @pytest.mark.asyncio
-async def test_append_plans_and_submits_one_model_unit_in_wire_order() -> None:
+async def test_append_plans_and_submits_one_model_unit_in_wire_order(monkeypatch) -> None:
+    monkeypatch.setenv("VLLM_OMNI_DUPLEX_STATIC_CONFIG", "1")
     h = await open_harness()
     try:
         events = await h.run(append_audio())
@@ -459,7 +460,10 @@ async def test_append_plans_and_submits_one_model_unit_in_wire_order() -> None:
         await h.run(append_audio())
         second = h.port.submissions[1]
         assert second.already_submitted is True
-        assert second.prompt["model_intermediate_buffer"]["duplex"]["seq"] == 2
+        second_duplex = second.prompt["model_intermediate_buffer"]["duplex"]
+        assert second_duplex["seq"] == 2
+        assert "session_config" not in second_duplex
+        assert "runtime_config" not in second_duplex
         assert h.session.input_seq == 2
     finally:
         await close_harness(h)
@@ -844,6 +848,168 @@ async def test_listen_decision_is_consumed_and_never_forwarded_to_tts() -> None:
         assert events[0].details["model_listen"] is True
         assert events[0].to_realtime()["response"]["status"] == "listening"
         assert h.session.active_response_id is None
+        assert h.port.aborts == []
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_model_listen_abort_is_opt_in_and_advances_epoch() -> None:
+    """Route-M listen can cut queued TTS without changing the default path."""
+    h = await open_harness(runtime_config=DuplexSessionRuntimeConfig(abort_on_model_listen=True))
+    try:
+        await h.run(append_audio())
+        request_id = h.stage0_request_id()
+        spoken = await h.deliver_and_settle(tts_output(request_id, samples=24000, text="hello"))
+        response_created = find(spoken, "response.created")
+        assert response_created.response_id is not None
+        assert h.session.active_response_id == response_created.response_id
+
+        events = await h.deliver_and_settle(
+            listen_output(request_id),
+            stage_id=0,
+            segment_finished=True,
+            segment_token_ids=[11, 12, LISTEN_TOKEN_ID],
+            segment_output_metadata={"meta.listen_token_id": LISTEN_TOKEN_ID},
+        )
+
+        cancelled = find(events, "response.done")
+        assert cancelled.status == "cancelled"
+        assert cancelled.response["status_details"]["reason"] == "model_listen"
+        assert find(events, "response.listen").epoch == 1
+        assert h.port.aborts == [[request_id]]
+        assert h.port.cleanups == [([request_id], True)]
+        assert h.session.epoch == 1
+        assert h.session.active_response_id is None
+
+        # A late Stage2 delta from the cancelled epoch must not reach the
+        # client after the cancellation event.
+        late = await h.deliver_and_settle(tts_output(request_id, samples=24000, text="stale"), epoch=0)
+        assert "response.output_audio.delta" not in types(late)
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_model_listen_after_tts_segment_end_does_not_abort() -> None:
+    """A resident Stage-0 listen after a completed TTS segment is harmless."""
+    h = await open_harness(runtime_config=DuplexSessionRuntimeConfig(abort_on_model_listen=True))
+    try:
+        await h.run(append_audio())
+        request_id = h.stage0_request_id()
+        spoken = await h.deliver_and_settle(tts_output(request_id, samples=24000, text="hello", tts_is_last_chunk=True))
+        response_created = find(spoken, "response.created")
+        response_id = response_created.response_id
+
+        await h.deliver_and_settle(
+            listen_output(request_id),
+            stage_id=0,
+            segment_finished=True,
+            segment_token_ids=[11, 12, LISTEN_TOKEN_ID],
+            segment_output_metadata={"meta.listen_token_id": LISTEN_TOKEN_ID},
+        )
+
+        assert h.port.aborts == []
+        assert h.session.epoch == 0
+        assert h.session.active_response_id == response_id
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_model_listen_without_response_does_not_abort_resident_stage0() -> None:
+    """Pure listening has a resident request but no assistant response to cut."""
+    h = await open_harness(runtime_config=DuplexSessionRuntimeConfig(abort_on_model_listen=True))
+    try:
+        await h.run(append_audio())
+        request_id = h.stage0_request_id()
+        await h.deliver_and_settle(
+            listen_output(request_id),
+            stage_id=0,
+            segment_finished=True,
+            segment_token_ids=[11, 12, LISTEN_TOKEN_ID],
+            segment_output_metadata={"meta.listen_token_id": LISTEN_TOKEN_ID},
+        )
+        assert h.port.aborts == []
+        assert h.session.epoch == 0
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_natural_stage0_end_does_not_abort_tts_tail() -> None:
+    """S0 turn-eos protects S2 tail audio that is still draining."""
+    h = await open_harness(runtime_config=DuplexSessionRuntimeConfig(abort_on_model_listen=True))
+    try:
+        await h.run(append_audio())
+        request_id = h.stage0_request_id()
+        spoken = await h.deliver_and_settle(tts_output(request_id, samples=24000, text="hello"))
+        response_id = find(spoken, "response.created").response_id
+
+        natural = SimpleNamespace(
+            request_id=request_id,
+            finished=True,
+            outputs=[SimpleNamespace(text="hello", token_ids=[], multimodal_output={})],
+            multimodal_output={"meta.turn_eos_token_id": 9},
+        )
+        h.deliver(
+            natural,
+            stage_id=0,
+            segment_finished=True,
+            segment_token_ids=[9, 10],
+            segment_output_metadata={"meta.turn_eos_token_id": 9},
+        )
+        await h.settle()
+
+        await h.deliver_and_settle(
+            listen_output(request_id),
+            stage_id=0,
+            segment_finished=True,
+            segment_token_ids=[11, 12, LISTEN_TOKEN_ID],
+            segment_output_metadata={"meta.listen_token_id": LISTEN_TOKEN_ID},
+        )
+        assert h.port.aborts == []
+        assert h.session.epoch == 0
+        assert h.session.active_response_id == response_id
+
+        tail = await h.deliver_and_settle(tts_output(request_id, samples=24000, text="tail"))
+        assert "response.output_audio.delta" in types(tail)
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_model_listen_before_first_audio_aborts_handoff() -> None:
+    """A spoken S0 handoff can be aborted before Talker emits its first audio."""
+    h = await open_harness(runtime_config=DuplexSessionRuntimeConfig(abort_on_model_listen=True))
+    try:
+        await h.run(append_audio())
+        request_id = h.stage0_request_id()
+        handoff = SimpleNamespace(
+            request_id=request_id,
+            finished=True,
+            outputs=[SimpleNamespace(text="hello", token_ids=[8], multimodal_output={})],
+            multimodal_output={"meta.speak_token_id": 8},
+        )
+        h.deliver(
+            handoff,
+            stage_id=0,
+            segment_finished=True,
+            segment_token_ids=[8],
+            segment_output_metadata={"meta.speak_token_id": 8},
+        )
+        await h.settle()
+        assert h.session.active_response_id is None
+
+        await h.deliver_and_settle(
+            listen_output(request_id),
+            stage_id=0,
+            segment_finished=True,
+            segment_token_ids=[11, 12, LISTEN_TOKEN_ID],
+            segment_output_metadata={"meta.listen_token_id": LISTEN_TOKEN_ID},
+        )
+        assert h.port.aborts == [[request_id]]
+        assert h.session.epoch == 1
     finally:
         await close_harness(h)
 

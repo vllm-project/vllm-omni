@@ -98,6 +98,7 @@ from vllm_omni.engine.duplex.session.emitter import SessionEmitter
 from vllm_omni.engine.duplex.session.engine_session import DuplexEngineSession
 from vllm_omni.engine.duplex.session.lease import DuplexLeaseActivity
 from vllm_omni.engine.duplex.session.model_channel import ModelChannel
+from vllm_omni.engine.duplex.session.pacing import SessionPacing, continue_on_stop_token, unit_continuation_depth
 from vllm_omni.engine.duplex.turn_detection import (
     TurnDetectionResult,
 )
@@ -124,6 +125,10 @@ class _Internal:
 
 
 _CANCEL_EVENTS = frozenset({"input.cancel", "response.cancel", "barge_in", "output_audio_buffer.clear"})
+
+#: How long the stop-token continuation trigger waits for its unit's response
+#: to open before continuing under the model-turn owner instead.
+_STOP_TOKEN_RESPONSE_WAIT_S = 2.0
 
 
 def compute_silence_continuation_deadline(
@@ -203,6 +208,7 @@ class DuplexSessionRunner:
             close_from_runtime=self._close_from_runtime,
             schedule_silence_continuation=self._schedule_silence_continuation,
             abort_request=self._abort_request_background,
+            cancel_model_response=self._cancel_model_response,
         )
         self.control = SessionControl(
             self.ctx,
@@ -229,6 +235,12 @@ class DuplexSessionRunner:
         # Every client speaks the Realtime protocol now; the old runner forced
         # the ACK-only playback ledger for that path.
         session.config.playback_commit_policy = DuplexPlaybackCommitPolicy.ACK_ONLY.value
+        runtime_config = getattr(self.manager, "runtime_config", None)
+        if (
+            getattr(getattr(runtime_config, "pacing", None), "enabled", False) is True
+            or getattr(runtime_config, "barge_cut_on_model_yield", False) is True
+        ):
+            self.run.pace = SessionPacing(runtime_config, session)
         self.control.init_turn_detection()
         self._worker = self._loop.create_task(self._run(), name=f"duplex-session-{session.session_id}")
         self.emit({"type": "session.created", "session": session.as_public_dict()})
@@ -248,6 +260,22 @@ class DuplexSessionRunner:
         """Accept one stage output (orchestrator loop); return True when it must not be forwarded."""
         decision: DuplexOutputDecision | None = None
         project = False
+        pace = self.run.pace
+        if (
+            stage_id == 0
+            and pace is not None
+            and pace.armed
+            and self.plugin.stage0_naturally_ended(
+                segment_finished=context.segment_finished,
+                segment_token_ids=context.segment_token_ids,
+                segment_output_metadata=context.segment_output_metadata,
+                output=output,
+            )
+        ):
+            # The model ended its turn after the user started a new utterance
+            # over its audio: cut the tail (on the mailbox, ordered with this
+            # segment's own outputs).
+            self._mailbox.put_nowait(_Internal("model_yield_cut"))
         if stage_id < context.final_stage_id:
             decision = self.model.decide_output(stage_id, output, context)
             # Optional mid-pipeline projection: client sees this stage; TTS still runs.
@@ -259,6 +287,10 @@ class DuplexSessionRunner:
             self.run.concurrent_turn_requests_released = True
         consume = decision is not None or stage_id >= context.final_stage_id
         project_intermediate = self.plugin.projects_intermediate_outputs and stage_id == 0
+        if stage_id == 0 and decision is None and context.segment_finished and continue_on_stop_token(self.manager):
+            # unit_continuation.continue_on: stop_token; before the early return
+            # below so forwarded (not consumed) segments are covered too.
+            self._continue_response_on_stop_token(context)
         if not consume and not project and not project_intermediate:
             # Stage0 text without a direct decision feeds the TTS stage as before.
             # Its metrics still have to reach the client: before sessions moved
@@ -520,6 +552,10 @@ class DuplexSessionRunner:
         if item.kind == "commit":
             await self._on_commit(dict(item.payload))
             return
+        if item.kind == "model_yield_cut":
+            if not self.run.closing and self.session.state == DuplexSessionState.OPEN:
+                await self.model.cut_on_model_yield()
+            return
         if item.kind == "run_payload":
             await self._run_internal_payload(dict(item.payload))
             return
@@ -755,7 +791,7 @@ class DuplexSessionRunner:
             old_response_id = session.active_response_id
             committed_ms = session.playback.committed_ms
             helpers.commit_played_response_history(session, old_response_id, committed_ms)
-            new_epoch, old_playback = helpers.advance_barge_in_epoch(session)
+            new_epoch, old_playback = helpers.advance_barge_in_epoch(session, pace=self.run.pace)
             self.emit(
                 {
                     "type": "audio.cancelled",
@@ -773,7 +809,7 @@ class DuplexSessionRunner:
             old_epoch = session.epoch
             committed_ms = session.playback.committed_ms
             helpers.commit_played_response_history(session, session.last_response_id, committed_ms)
-            new_epoch, old_playback = helpers.advance_barge_in_epoch(session)
+            new_epoch, old_playback = helpers.advance_barge_in_epoch(session, pace=self.run.pace)
             self.emit(
                 {
                     "type": "audio.cancelled",
@@ -893,6 +929,12 @@ class DuplexSessionRunner:
         payload["is_speech"] = (
             False if video_only else overlap_policy.input_looks_like_speech(self.session, event, payload)
         )
+        if self.run.pace is not None:
+            self.run.pace.on_client_append(
+                time.monotonic(),
+                is_speech=payload["is_speech"] is True,
+                duration_s=overlap_policy.input_audio_duration_ms(event, payload) / 1000.0,
+            )
         auto_responds = self._session_auto_responds()
         defer_append = False
         buffer_overlap_audio = True
@@ -1001,6 +1043,8 @@ class DuplexSessionRunner:
         if append_payload is None:
             self._maybe_schedule_vad_commit(vad_result)
             return
+        if self.run.pace is not None:
+            self.run.pace.on_input_unit(append_payload)
         await self._start_append(append_payload, final=False, pcm_reservation=pcm_reservation)
         self._maybe_schedule_vad_commit(vad_result)
 
@@ -1030,6 +1074,72 @@ class DuplexSessionRunner:
         if task is not None and task.done():
             self.model_state.pending_silence_task = None
             self.model_state.pending_silence_owner_id = None
+        pending = self.model_state.pending_silence_tasks
+        if pending:
+            self.model_state.pending_silence_tasks = tuple(t for t in pending if not t.done())
+
+    def _silence_in_flight(self) -> tuple[asyncio.Task[bool], ...]:
+        """Prune finished continuations; return those still scheduled or submitting (depth > 1)."""
+        self._clear_completed_pending_silence()
+        return self.model_state.pending_silence_tasks
+
+    def _continue_response_on_stop_token(self, context: DuplexOutputContext) -> None:
+        """Plan the next unit when Stage 0 finishes a spoken segment (stop-token mode).
+
+        The audio-emit trigger holds each session to one unit in flight; here
+        only the planning moves earlier. The anchor cadence still paces
+        submissions and client emission still follows stage-output arrival.
+        """
+        session = self.session
+        if (
+            self.run.closing
+            or session.state != DuplexSessionState.OPEN
+            or session.lease.terminal_reason is not None
+            or not session.capabilities.supports_core_resumable_request
+            or not self.out.auto_responds()
+        ):
+            return
+        expected_epoch = context.identity.fence.epoch
+        self.spawn(
+            self._continue_response_on_stop_token_task(expected_epoch),
+            name="duplex-continue-stop-token",
+        )
+
+    async def _continue_response_on_stop_token_task(self, expected_epoch: int) -> None:
+        """Schedule the next silence unit for a segment that just finished.
+
+        The unit's response opens with its first Stage 1/2 output; wait briefly
+        for it so the continuation is response-owned like the audio-emit
+        trigger's, else continue under the model-turn owner.
+        """
+        session = self.session
+        model_state = self.model_state
+        waited_since: float | None = None
+        pace = self.run.pace
+        while (
+            session.active_response_id is None
+            and session.state == DuplexSessionState.OPEN
+            and not self.run.closing
+            and session.epoch == expected_epoch
+            and session.lease.terminal_reason is None
+            and session.active_request_id is not None
+        ):
+            if pace is not None and pace.skip_response_wait(time.monotonic()):
+                # Paced onset (client quiet since its commit): continue unit 2
+                # under the model-turn owner now instead of waiting for its response.
+                break
+            if waited_since is None:
+                waited_since = time.monotonic()
+            elif time.monotonic() - waited_since > _STOP_TOKEN_RESPONSE_WAIT_S:
+                break
+            await asyncio.sleep(0.02)
+        if session.state == DuplexSessionState.CLOSED or self.run.closing:
+            model_state.clear_continuation()
+            return
+        await self.model.maybe_continue_response(
+            expected_epoch=expected_epoch,
+            expected_model_turn_id=None if session.active_response_id is not None else session.turn_id,
+        )
 
     def _mark_pending_silence_superseded(self) -> None:
         task = self.model_state.pending_silence_task
@@ -1066,9 +1176,13 @@ class DuplexSessionRunner:
                 # A real (non-silence) input re-anchors the silence pacing
                 # chain: its submission becomes the anchor and the stored
                 # deadline is cleared until the next continuation sets one.
+                multi_unit = unit_continuation_depth(self.manager) > 1
+
                 def _reanchor_chain(submit_time: float) -> None:
                     model_state.last_native_submit_monotonic = submit_time
                     model_state.silence_deadline_monotonic = None
+                    if multi_unit:
+                        model_state.native_input_generation += 1
 
                 on_append_accepted = _reanchor_chain
         append_epoch = session.epoch
@@ -1133,6 +1247,8 @@ class DuplexSessionRunner:
         )
         if silence_continuation:
             model_state.pending_silence_task = task
+            if unit_continuation_depth(self.manager) > 1:
+                model_state.pending_silence_tasks = (*model_state.pending_silence_tasks, task)
             task.add_done_callback(attempt.clear_pending_silence)
         # Let this wire-order effect start before the next mailbox item can cancel it.
         await asyncio.sleep(0)
@@ -1166,12 +1282,22 @@ class DuplexSessionRunner:
         response_owned: bool,
         expected_epoch: int | None,
         expected_model_turn_id: int | None,
+        pace_kind: str = "speech",
     ) -> bool:
         session = self.session
         model_state = self.model_state
-        self._clear_completed_pending_silence()
-        pending_silence = model_state.pending_silence_task
-        if pending_silence is not None and not pending_silence.done():
+        # unit_continuation.depth > 1: submissions beyond the first wait in the
+        # engine's per-session streaming-update queue instead of the runner.
+        depth = unit_continuation_depth(self.manager)
+        if depth > 1:
+            pending_window = self._silence_in_flight()
+            pending_silence = pending_window[0] if len(pending_window) >= depth else None
+        else:
+            self._clear_completed_pending_silence()
+            pending_silence = model_state.pending_silence_task
+            if pending_silence is not None and pending_silence.done():
+                pending_silence = None
+        if pending_silence is not None:
             if pending_silence is asyncio.current_task():
                 return False
             try:
@@ -1183,10 +1309,14 @@ class DuplexSessionRunner:
                 return False
             except Exception:
                 return False
-            self._clear_completed_pending_silence()
-            pending_silence = model_state.pending_silence_task
-            if pending_silence is not None and not pending_silence.done():
-                return False
+            if depth > 1:
+                if len(self._silence_in_flight()) >= depth:
+                    return False
+            else:
+                self._clear_completed_pending_silence()
+                pending_silence = model_state.pending_silence_task
+                if pending_silence is not None and not pending_silence.done():
+                    return False
         append_tail = self.tasks.append_tail
         if (append_tail is None or append_tail.done()) and self._real_input_waiting():
             return False
@@ -1195,6 +1325,11 @@ class DuplexSessionRunner:
         # accepted between the snapshot and this continuation's submission
         # re-anchors the chain; _still_valid() then skips the stale unit.
         anchor = model_state.last_native_submit_monotonic
+        # At depth > 1 the anchor also moves with sibling silence submissions;
+        # generation and silence sequence tell the two moves apart: a real
+        # append invalidates the plan, siblings only fill the depth window.
+        generation = model_state.native_input_generation
+        planned_silence_seq = model_state.silence_append_seq
         # Align the next silence unit to submission_time_N + chunk_period and
         # sleep only the remaining budget. The deadline is stored by the
         # acceptance callback when the append actually submits, so skipped or
@@ -1205,7 +1340,11 @@ class DuplexSessionRunner:
             last_submit=anchor,
             current_deadline=model_state.silence_deadline_monotonic,
         )
-        if delay_s > 0:
+        pace = self.run.pace
+        if pace is not None and pace.paces_continuations and pace.quiet_since_commit and self.out.auto_responds():
+            # Only a client quiet since its commit can lead; everyone else keeps the plain sleep.
+            await self._paced_continuation_wait(pace, delay_s, pace_kind)
+        elif delay_s > 0:
             await asyncio.sleep(delay_s)
         if (
             self.tasks.append_tail is not append_tail
@@ -1221,10 +1360,19 @@ class DuplexSessionRunner:
             return False
 
         def _still_valid() -> bool:
-            return (
+            if depth > 1:
+                # A real append since planning (generation), or a full window of
+                # sibling silence submissions, makes this unit outdated.
+                chain_current = (
+                    model_state.native_input_generation == generation
+                    and model_state.silence_append_seq - planned_silence_seq < depth
+                )
+            else:
                 # The anchor changed (a real append was accepted) after this
                 # continuation was planned; the unit is outdated.
-                model_state.last_native_submit_monotonic == anchor
+                chain_current = model_state.last_native_submit_monotonic == anchor
+            return (
+                chain_current
                 and not self._real_input_waiting()
                 and not self.model.silence_continuation_is_stale(
                     request_id=request_id,
@@ -1242,6 +1390,8 @@ class DuplexSessionRunner:
             # submission. Small delays keep the planned cadence so ordinary
             # jitter does not accumulate as drift.
             model_state.last_native_submit_monotonic = submit_time
+            if depth > 1:
+                model_state.silence_append_seq += 1
             model_state.silence_deadline_monotonic = (
                 submit_time + chunk_period_s if submit_time > next_silence_deadline else next_silence_deadline
             )
@@ -1255,6 +1405,37 @@ class DuplexSessionRunner:
             before_append=_still_valid,
         )
         return task is not None
+
+    @staticmethod
+    async def _paced_continuation_wait(pace: SessionPacing, delay_s: float, pace_kind: str) -> None:
+        """Sleep until a paced continuation of a quiet client may submit (``duplex_session.pacing``).
+
+        ``nominal`` is the unchanged cadence deadline. A speech continuation
+        fires up to the lead earlier; the lead is re-read while waiting (d1
+        arrives, input resumes, the quiet guard passes, CRITICAL), so a unit
+        never fires earlier than the lead allowed when it fired. A fire-grid
+        point is chosen once and kept while the session stays paced and quiet.
+        """
+        nominal = time.monotonic() + delay_s
+        grid_point: float | None = None
+        first = True
+        while True:
+            now = time.monotonic()
+            if pace_kind == "idle":
+                target = pace.idle_fire_at(nominal, now)
+            else:
+                target = pace.speech_fire_at(nominal, now)
+                if first:
+                    snapped = pace.snap(target, nominal, now)
+                    grid_point = snapped if snapped != target else None
+                if grid_point is not None and pace.snap_holds(now):
+                    target = grid_point
+                else:
+                    grid_point = None
+            first = False
+            if now >= target:
+                return
+            await asyncio.sleep(min(target - now, pace.recheck_in(now)))
 
     # ------------------------------------------------------------------ #
     # Runtime-initiated close                                             #
@@ -1344,7 +1525,7 @@ class DuplexSessionRunner:
             old_response_id = session.active_response_id
             committed_ms = session.playback.committed_ms
             helpers.commit_played_response_history(session, old_response_id, committed_ms)
-            new_epoch, old_playback = helpers.advance_barge_in_epoch(session)
+            new_epoch, old_playback = helpers.advance_barge_in_epoch(session, pace=self.run.pace)
             self.emit(
                 {
                     "type": "audio.cancelled",
@@ -1362,7 +1543,7 @@ class DuplexSessionRunner:
             old_epoch = session.epoch
             committed_ms = session.playback.committed_ms
             helpers.commit_played_response_history(session, session.last_response_id, committed_ms)
-            new_epoch, old_playback = helpers.advance_barge_in_epoch(session)
+            new_epoch, old_playback = helpers.advance_barge_in_epoch(session, pace=self.run.pace)
             self.emit(
                 {
                     "type": "audio.cancelled",
@@ -1381,7 +1562,7 @@ class DuplexSessionRunner:
             old_response_id = session.active_response_id
             committed_ms = session.playback.committed_ms
             helpers.commit_played_response_history(session, old_response_id, committed_ms)
-            new_epoch, old_playback = helpers.advance_barge_in_epoch(session)
+            new_epoch, old_playback = helpers.advance_barge_in_epoch(session, pace=self.run.pace)
             self.emit(
                 {
                     "type": "audio.cancelled",
@@ -1425,6 +1606,7 @@ class DuplexSessionRunner:
         *,
         reason: str,
         notify: bool = True,
+        finalize_fence: bool = False,
     ) -> bool:
         session = self.session
         has_running_task = active_task is not None and not active_task.done()
@@ -1435,6 +1617,7 @@ class DuplexSessionRunner:
         if not has_running_task and old_request_id is None and session.active_response_id is None and not draining_ids:
             return False
 
+        cancelled_fence = session.fence
         old_epoch = session.epoch
         old_response_id = session.active_response_id
         committed_ms = session.playback.committed_ms
@@ -1473,7 +1656,7 @@ class DuplexSessionRunner:
         older_abort_ids = [request_id for request_id in abort_ids if request_id not in cancelled_ids]
         if older_abort_ids:
             session.release_resources_for_request_ids(older_abort_ids)
-        new_epoch, old_playback = helpers.advance_barge_in_epoch(session)
+        new_epoch, old_playback = helpers.advance_barge_in_epoch(session, pace=self.run.pace)
         if old_request_id is not None:
             # Release projector/parser cursors so cancelled epochs do not
             # accumulate until the whole session closes.
@@ -1490,6 +1673,12 @@ class DuplexSessionRunner:
             # asyncio.TimeoutError is not the builtin TimeoutError before Python 3.11.
             except (TimeoutError, asyncio.TimeoutError):
                 pass
+        if finalize_fence:
+            # Explicit cancel commands signal the fence in ``_on_cancel``
+            # after this method returns.  A model-owned listen has no outer
+            # command, so finalize it here or the old request state would stay
+            # registered after the stage abort.
+            await self.model.signal_cancel_fence(cancelled_fence)
         if notify:
             self.emit(
                 {
@@ -1518,6 +1707,27 @@ class DuplexSessionRunner:
                 )
         return True
 
+    async def _cancel_model_response(self, reason: str) -> bool:
+        """A model-owned cancel (route-M listen abort, playback cut) of the active response.
+
+        Stage 0 drops a session's context with its aborted request, so the
+        user utterance it heard in the old epoch is gone. With
+        ``barge_cut_on_model_yield`` the units of that utterance are replayed,
+        in order, as the new epoch's first appends.
+        """
+        pace = self.run.pace
+        replay = pace.take_replay() if pace is not None else []
+        cancelled = await self._cancel_active_response(None, reason=reason, finalize_fence=True)
+        if cancelled and self.session.state == DuplexSessionState.OPEN and not self.run.closing:
+            if replay:
+                # The new epoch has no reply whose continuations keep Stage 0
+                # moving if the client went quiet; its listens get silence
+                # until the client appends again (``ModelChannel._on_model_listen``).
+                pace.on_replay(self.session.epoch)
+            for payload in replay:
+                await self._start_append(payload, final=False)
+        return cancelled
+
     async def _abort_request_background(self, request_ids: list[str], *, notify: bool) -> None:
         try:
             await self.stage_port.abort_requests(request_ids)
@@ -1531,7 +1741,7 @@ class DuplexSessionRunner:
     def _cancel_pending_input(self, *, reason: str) -> None:
         session = self.session
         cancelled = session.cancel_pending_input()
-        helpers.advance_barge_in_epoch(session)
+        helpers.advance_barge_in_epoch(session, pace=self.run.pace)
         self.emit(
             {
                 "type": "input.cancelled",
@@ -1820,6 +2030,11 @@ class DuplexSessionRunner:
             chunk_period_ms=session.capabilities.chunk_period_ms or 1000,
         )
         final_payload = commit_reservation.payload
+        if self.run.pace is not None and final_payload is not None:
+            # The commit flushes the utterance's last (zero-padded) unit; a
+            # playback cut after it aborts the epoch Stage 0 heard it in, so the
+            # cut replays it too (as a plain unit: ``final`` only padded it).
+            self.run.pace.on_input_unit({key: value for key, value in final_payload.items() if key != "final"})
         if model_state.committed_audio_payload is not None:
             if final_payload is not None:
                 final_payload = overlap_policy.merge_audio_payloads(model_state.committed_audio_payload, final_payload)
@@ -1835,6 +2050,8 @@ class DuplexSessionRunner:
         model_state.deferred_response_create = False
         model_state.input_since_commit = False
         model_state.speech_since_commit = False
+        if self.run.pace is not None:
+            self.run.pace.on_commit(time.monotonic())
         data_plane_turn_id = session.turn_id
         committed = helpers.commit_audio_input(
             session,

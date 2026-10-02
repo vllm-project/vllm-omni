@@ -296,6 +296,38 @@ def test_consumed_bad_payload_removes_lock_file(connector, monkeypatch):
     assert key not in connector._pending_keys
 
 
+def test_poll_miss_does_not_attach_shared_memory(connector, monkeypatch):
+    """A miss is answered by the existence probe, without a raising shm_open."""
+    from vllm_omni.distributed.omni_connectors.connectors import shm_connector as module
+
+    if module._POSIX_SHM_DIR is None:
+        pytest.skip("no /dev/shm on this host")
+
+    def unexpected_attach(*args, **kwargs):
+        raise AssertionError("missing segment must not be attached")
+
+    monkeypatch.setattr(module.shm_pkg, "SharedMemory", unexpected_attach)
+    assert connector.get("0", "1", f"missing_{uuid.uuid4().hex}") is None
+
+
+@pytest.mark.parametrize("probe", [True, False])
+def test_key_read_is_unchanged_with_or_without_the_probe(connector, monkeypatch, probe):
+    from vllm_omni.distributed.omni_connectors.connectors import shm_connector as module
+
+    if not probe:
+        monkeypatch.setattr(module, "_POSIX_SHM_DIR", None)
+    key = f"probe_{probe}_{uuid.uuid4().hex}"
+    assert connector.get("0", "1", key) is None
+    payload = {"codes": torch.arange(28, dtype=torch.long), "meta": {"chunk_seq": 3}}
+    assert connector.put("0", "1", key, payload)[0]
+
+    obj, _ = connector.get("0", "1", key)
+
+    assert torch.equal(obj["codes"], payload["codes"]) and obj["meta"] == {"chunk_seq": 3}
+    assert connector.get("0", "1", key) is None
+    assert not os.path.exists(f"/dev/shm/{key}")
+
+
 # ── Arrival wakeups ───────────────────────────────────────────────────
 
 
@@ -403,6 +435,22 @@ def test_wakeups_can_be_disabled_and_close_unlinks_fifo(monkeypatch):
     finally:
         sender.close()
         receiver.close()
+
+
+def test_wake_self_interrupts_own_wait_and_drains():
+    receiver = _stage_connector(74)
+    try:
+        generation = receiver.get_wakeup_generation()
+        assert generation is not None
+        receiver.wake_self()
+        start = time.monotonic()
+        assert receiver.wait_for_change(generation, timeout=5) is True
+        assert time.monotonic() - start < 0.5
+        # Drained: the next wait blocks for its timeout again.
+        assert receiver.wait_for_change(receiver.get_wakeup_generation(), timeout=0.02) is False
+    finally:
+        receiver.close()
+    receiver.wake_self()  # closed: a no-op, never raises
 
 
 def _sibling_receiver(stage_id, ready, result):

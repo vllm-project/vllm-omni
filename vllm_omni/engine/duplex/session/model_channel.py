@@ -42,6 +42,7 @@ from vllm_omni.engine.duplex.contracts import (
     duplex_same_turn_request_ids,
     duplex_session_id_from_request_id,
 )
+from vllm_omni.engine.duplex.intermediate import drop_static_append_configs
 from vllm_omni.engine.duplex.plugin import (
     DuplexRuntimeConfigError,
     coerce_int,
@@ -52,12 +53,15 @@ from vllm_omni.engine.duplex.session.context import DuplexSessionContext, StageO
 from vllm_omni.engine.duplex.session.emitter import SessionEmitter
 from vllm_omni.engine.duplex.session.engine_session import DuplexEngineSession, DuplexFenceMismatchError
 from vllm_omni.engine.duplex.session.lease import DuplexLeaseActivity
+from vllm_omni.engine.duplex.session.pacing import continue_on_stop_token, same_turn_response_keeps_continuation
 from vllm_omni.metrics.stats import OrchestratorAggregator, StageRequestStats
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.outputs.duplex import attach_duplex_output_decision
 
 if TYPE_CHECKING:
     from vllm.outputs import RequestOutput
+
+    from vllm_omni.engine.duplex.session.pacing import SessionPacing
 
 logger = init_logger(__name__)
 
@@ -75,6 +79,7 @@ class SilenceContinuationScheduler(Protocol):
         response_owned: bool,
         expected_epoch: int | None,
         expected_model_turn_id: int | None,
+        pace_kind: str = "speech",
     ) -> bool: ...
 
 
@@ -93,12 +98,18 @@ class ModelChannel:
         close_from_runtime: Callable[[str], Awaitable[None]],
         schedule_silence_continuation: SilenceContinuationScheduler,
         abort_request: Callable[..., Awaitable[None]],
+        cancel_model_response: Callable[[str], Awaitable[bool]] | None = None,
     ) -> None:
         self._ctx = ctx
         self._out = out
         self._close_from_runtime = close_from_runtime
         self._schedule_silence_continuation = schedule_silence_continuation
         self._abort_request = abort_request
+        self._cancel_model_response = cancel_model_response
+        # Config snapshots are needed by a session-static plugin only when a
+        # request starts or the session config generation changes.  Keep the
+        # last successful submission so a failed append retries the snapshot.
+        self._last_append_config_key: tuple[str, int] | None = None
 
     def _draining_stage_ids(self) -> frozenset[int]:
         """Stages the plugin keeps across a concurrent turn. Empty if undeclared."""
@@ -107,6 +118,34 @@ class ModelChannel:
             return frozenset()
         stage_count = int(getattr(self._ctx.stage_port, "stage_count", 0) or 0)
         return frozenset(int(stage_id) for stage_id in declare(stage_count=stage_count))
+
+    def _pace(self) -> SessionPacing | None:
+        """The session's pacing state; None when pacing and the playback cut are off."""
+        return getattr(getattr(self._ctx, "run", None), "pace", None)
+
+    def _barge_cut_ready(self) -> bool:
+        pace = self._pace()
+        return pace is not None and pace.cut_ready(time.monotonic())
+
+    def _barge_cut_enabled(self) -> bool:
+        pace = self._pace()
+        return pace is not None and pace.barge_enabled
+
+    async def cut_on_model_yield(self) -> bool:
+        """``barge_cut_on_model_yield``: Stage 0 ended its turn after a new user utterance; cut the tail.
+
+        Same cancellation as an explicit barge-in (the old epoch's stage
+        requests aborted, ``audio.cancelled``, the next append opens epoch+1);
+        a no-op when the reply already finished or the client has nearly
+        played it out.
+        """
+        pace = self._pace()
+        if not self._out.auto_responds() or self._cancel_model_response is None or not self._barge_cut_ready():
+            return False
+        pace.note_cut(time.monotonic(), "model_yield")
+        await self._cancel_model_response("model_yield")
+        self._ctx.model_state.clear_continuation()
+        return True
 
     @staticmethod
     def should_commit_response_to_history(session: DuplexEngineSession, response_id: str | None) -> bool:
@@ -184,6 +223,18 @@ class ModelChannel:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
+            if (
+                isinstance(exc, DuplexFenceMismatchError)
+                and expected_epoch is not None
+                and session.epoch != expected_epoch
+                and self._barge_cut_enabled()
+            ):
+                # The epoch moved while this append was in flight (a barge cut
+                # or another cancel): drop it like the check above drops a
+                # queued one. Failing it would roll its PCM back and stop the
+                # append chain, abandoning every append behind it -- the cut's
+                # replay, which also carries this unit.
+                return True, False
             logger.exception("Failed to append duplex runtime input: %s", exc)
             self.send_runtime_error("runtime_append_failed", exc)
             return False, False
@@ -319,6 +370,13 @@ class ModelChannel:
                 raise DuplexFenceMismatchError(session.fence, fence)
             if not isinstance(append_plan, DuplexAppendPlan):
                 raise TypeError("duplex plugin plan_append() must return DuplexAppendPlan")
+            append_config_key = (request_id, request_context.config_generation)
+            plugin = self._ctx.plugin
+            if (
+                getattr(plugin, "append_configs_are_session_static", False) is True
+                and self._last_append_config_key == append_config_key
+            ):
+                drop_static_append_configs(append_plan.prompt)
             submission = DuplexStageSubmission(
                 context=request_context,
                 prompt=append_plan.prompt,
@@ -333,6 +391,7 @@ class ModelChannel:
                     raise DuplexFenceMismatchError(session.fence, fence)
                 update = session.commit_append(reservation)
                 session.bind_stage_request(stage_id, request_id, fence=fence)
+                self._last_append_config_key = append_config_key
             except BaseException:
                 try:
                     await self._ctx.stage_port.cleanup([request_id])
@@ -733,6 +792,16 @@ class ModelChannel:
         auto_response = self._out.auto_responds()
         close_reason: str | None = None
         emitted_response = False
+        pace = self._pace()
+        # barge_cut_on_model_yield: the model listens to a new user utterance
+        # while the client still plays the reply (its TTS may be done already).
+        if auto_response and self._cancel_model_response is not None and self._barge_cut_ready():
+            pace.note_cut(time.monotonic(), "model_listen")
+            # The old Stage-1/2 requests may still be synthesizing queued
+            # audio: cancel like an explicit barge-in, so they are aborted,
+            # their unplayed output is discarded and the next append gets epoch+1.
+            await self._cancel_model_response("model_listen")
+            self._ctx.model_state.clear_continuation()
         self._end_active_response_before_future_model_turn(model_turn_id=model_turn_id)
         if (
             session.active_response_id is not None
@@ -753,9 +822,32 @@ class ModelChannel:
         )
         if non_terminal_auto_listen:
             self._ctx.services.spawn(
-                self.maybe_continue_response(expected_epoch=expected_epoch), name="duplex-continue"
+                self.maybe_continue_response(expected_epoch=expected_epoch, pace_kind="idle"),
+                name="duplex-continue",
             )
             return close_reason, emitted_response
+        if (
+            auto_response
+            and active_response_id is None
+            and session.active_request_id is not None
+            and model_result.get("end_of_turn") is not True
+            and expected_epoch is not None
+            and pace is not None
+            and pace.drives_replay(expected_epoch)
+        ):
+            # barge_cut_on_model_yield: a cut replayed the interrupted user's
+            # utterance into this epoch, where no reply is open. The cut reply's
+            # continuations would have kept Stage 0 of a client that went quiet
+            # moving; offer the same silence under the model-turn owner. Real
+            # input supersedes it, and any client append or a new reply ends it.
+            self._ctx.services.spawn(
+                self.maybe_continue_response(
+                    expected_epoch=expected_epoch,
+                    expected_model_turn_id=session.turn_id,
+                    pace_kind="idle",
+                ),
+                name="duplex-continue",
+            )
         if not auto_response and data_plane_request_id == session.active_request_id:
             session.clear_request()
         model_listen = model_result.get("model_listen")
@@ -897,7 +989,9 @@ class ModelChannel:
                 tts_segment_ended
                 and auto_response
                 and (model_turn_id is not None or session.active_response_id is not None)
+                and not continue_on_stop_token(self._ctx.manager)
             ):
+                # Stop-token mode: the runner's Stage-0 hook already planned it.
                 self._ctx.services.spawn(
                     self.maybe_continue_response(expected_epoch=expected_epoch, expected_model_turn_id=model_turn_id),
                     name="duplex-continue",
@@ -1042,6 +1136,13 @@ class ModelChannel:
                 {"text_chars": max(0, int(mark_text_chars)), "audio_end_ms": max(0, int(mark_duration_ms))}
             ]
         payload["playback"] = session.playback_for_response(target_id).as_dict()
+        pace = self._pace()
+        if pace is not None and has_audio and mark_duration_ms is not None:
+            pace.on_audio_emit(
+                time.monotonic(),
+                max(0, mark_duration_ms - previous_sent_ms) / 1000.0,
+                draining=target_id is not None,
+            )
         sample_rate_hz = model_result.get("sample_rate_hz") or model_result.get("audio_sample_rate_hz")
         if isinstance(sample_rate_hz, int | float) and int(sample_rate_hz) > 0:
             payload["sample_rate_hz"] = int(sample_rate_hz)
@@ -1057,7 +1158,10 @@ class ModelChannel:
             and model_result.get("stage_role") == "tts"
             and model_result.get("abort_data_plane_request") is True
             and auto_response
+            and not continue_on_stop_token(self._ctx.manager)
         ):
+            # Audio-emit trigger (default); in stop-token mode the runner plans
+            # the next unit when Stage 0 finishes the segment instead.
             self._ctx.services.spawn(
                 self.maybe_continue_response(expected_epoch=expected_epoch), name="duplex-continue"
             )
@@ -1285,6 +1389,15 @@ class ModelChannel:
         stale_model_turn_owner = not response_owned and (
             session.active_response_id is not None or session.turn_id != expected_model_turn_id
         )
+        if (
+            stale_model_turn_owner
+            and session.turn_id == expected_model_turn_id
+            and session.active_response_turn_id == expected_model_turn_id
+            and same_turn_response_keeps_continuation(self._pace())
+        ):
+            # Paced onset: unit 2 was planned before its own turn's response
+            # opened; that response opening is not a newer owner.
+            stale_model_turn_owner = False
         return stale_common_owner or stale_response_owner or stale_model_turn_owner
 
     async def maybe_continue_response(
@@ -1292,6 +1405,7 @@ class ModelChannel:
         *,
         expected_epoch: int | None,
         expected_model_turn_id: int | None = None,
+        pace_kind: str = "speech",
     ) -> None:
         session = self._ctx.session
         model_state = self._ctx.model_state
@@ -1366,6 +1480,7 @@ class ModelChannel:
                 response_owned=response_owned,
                 expected_epoch=expected_epoch,
                 expected_model_turn_id=expected_model_turn_id,
+                pace_kind=pace_kind,
             )
         except asyncio.CancelledError:
             raise

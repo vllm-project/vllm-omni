@@ -526,6 +526,68 @@ class StageDeployConfig:
 
 
 @dataclass(frozen=True)
+class DuplexPacingConfig:
+    """Opt-in duplex output pacing (``duplex_session.pacing``); every field off by default.
+
+    A client that went quiet after its commit may have the silence
+    continuations of its reply submitted up to ``onset_lead_max_s`` ahead of
+    the nominal 1 s cadence (``onset_lead_target_s`` minus the reply's first
+    chunk length once that is known), so a short first audio chunk no longer
+    turns into a structural stall at the second unit.
+    ``onset_skip_response_wait`` lets that second unit go before its response
+    opens; a stall above ``critical_stall_s`` raises the lead to its maximum
+    until two clean chunks. ``fire_grid_ms`` snaps paced continuations onto a
+    shared grid so units of different sessions reach Stage 0 together;
+    ``idle_grid`` rounds the continuations after a non-terminal listen up to it.
+    """
+
+    enabled: bool = False
+    onset_lead_max_s: float = 0.0
+    onset_lead_target_s: float = 1.1
+    onset_skip_response_wait: bool = False
+    critical_stall_s: float = 0.05
+    fire_grid_ms: int = 0
+    idle_grid: bool = False
+
+    def __post_init__(self) -> None:
+        for name in ("enabled", "onset_skip_response_wait", "idle_grid"):
+            if not isinstance(getattr(self, name), bool):
+                raise ValueError(f"duplex_session.pacing.{name} must be a boolean")
+        for name in ("onset_lead_max_s", "onset_lead_target_s", "critical_stall_s"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int | float) or value < 0:
+                raise ValueError(f"duplex_session.pacing.{name} must be a non-negative number")
+        # The lead must stay below one model unit: unit_continuation.depth 2 then
+        # bounds the synthesized silence ahead of the wall clock to a single unit.
+        if self.onset_lead_max_s >= 1.0:
+            raise ValueError("duplex_session.pacing.onset_lead_max_s must be < 1.0 (one model unit)")
+        grid = self.fire_grid_ms
+        if isinstance(grid, bool) or not isinstance(grid, int) or grid < 0 or (grid and 1000 % grid):
+            raise ValueError("duplex_session.pacing.fire_grid_ms must be 0 or a positive divisor of 1000")
+
+
+@dataclass(frozen=True)
+class DuplexUnitContinuationConfig:
+    """When a duplex session plans its next silence unit (``duplex_session.unit_continuation``).
+
+    ``continue_on: audio`` (default) plans it after the previous unit's audio is
+    emitted; ``stop_token`` plans it as soon as Stage 0 finishes the segment, so
+    Stage 0's next unit overlaps Stage 1/2 of the previous one. ``depth`` is how
+    many continuations of one session may be scheduled or submitting at once
+    (1 = single flight, the default). Cadence and emission order are unchanged.
+    """
+
+    continue_on: str = "audio"
+    depth: int = 1
+
+    def __post_init__(self) -> None:
+        if self.continue_on not in ("audio", "stop_token"):
+            raise ValueError("duplex_session.unit_continuation.continue_on must be 'audio' or 'stop_token'")
+        if isinstance(self.depth, bool) or not isinstance(self.depth, int) or not 1 <= self.depth <= 8:
+            raise ValueError("duplex_session.unit_continuation.depth must be an integer in [1, 8]")
+
+
+@dataclass(frozen=True)
 class DuplexSessionRuntimeConfig:
     """Server-owned lifecycle and per-session buffering limits."""
 
@@ -552,8 +614,51 @@ class DuplexSessionRuntimeConfig:
     # compile their real shapes. The empty per-stage JIT registry does not.
     # A negative value disables every startup warmup.
     warmup_frames: int = 0
+    # Opt-in playback cut: a new user utterance over audible assistant audio
+    # (``barge_arm_min_silence_s`` of non-speech appends, then at least
+    # ``barge_arm_min_speech_s`` of speech, starting at least
+    # ``barge_arm_min_playback_s`` after the reply's first audio) cancels the
+    # reply once the model yields (listens or ends its turn) while the client
+    # still holds ``barge_cut_min_unplayed_s`` of unplayed audio. The speech
+    # floor keeps short backchannels ("mm") from cutting the reply.
+    barge_cut_on_model_yield: bool = False
+    barge_arm_min_silence_s: float = 0.6
+    barge_arm_min_speech_s: float = 0.4
+    barge_arm_min_playback_s: float = 1.0
+    barge_cut_min_unplayed_s: float = 0.15
+    # Mapping in YAML; coerced to ``DuplexPacingConfig`` (all off by default).
+    pacing: DuplexPacingConfig = field(default_factory=DuplexPacingConfig)
+    # Mapping in YAML; coerced to ``DuplexUnitContinuationConfig``.
+    unit_continuation: DuplexUnitContinuationConfig = field(default_factory=DuplexUnitContinuationConfig)
 
     def __post_init__(self) -> None:
+        pacing = self.pacing
+        if pacing is None:
+            pacing = DuplexPacingConfig()
+        elif isinstance(pacing, Mapping):
+            pacing = DuplexPacingConfig(**pacing)
+        elif not isinstance(pacing, DuplexPacingConfig):
+            raise ValueError("duplex_session.pacing must be a mapping")
+        object.__setattr__(self, "pacing", pacing)
+        continuation = self.unit_continuation
+        if continuation is None:
+            continuation = DuplexUnitContinuationConfig()
+        elif isinstance(continuation, Mapping):
+            continuation = DuplexUnitContinuationConfig(**continuation)
+        elif not isinstance(continuation, DuplexUnitContinuationConfig):
+            raise ValueError("duplex_session.unit_continuation must be a mapping")
+        object.__setattr__(self, "unit_continuation", continuation)
+        if not isinstance(self.barge_cut_on_model_yield, bool):
+            raise ValueError("duplex_session.barge_cut_on_model_yield must be a boolean")
+        for name in (
+            "barge_arm_min_silence_s",
+            "barge_arm_min_speech_s",
+            "barge_arm_min_playback_s",
+            "barge_cut_min_unplayed_s",
+        ):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int | float) or value < 0:
+                raise ValueError(f"duplex_session.{name} must be a non-negative number")
         positive = {
             "disconnect_grace_s": self.disconnect_grace_s,
             "reaper_interval_s": self.reaper_interval_s,
@@ -829,6 +934,56 @@ def resolve_deploy_yaml(path: str | Path) -> dict[str, Any]:
     return merged
 
 
+# Same TND ceiling as stage 0: at most 16 query positions per sequence.
+# Consumed by minicpmo_4_5_omni_tts._parse_k_step_frames as the hard cap on
+# the K-step frame count accepted from the deploy YAML.
+_MINICPMO_TALKER_FRAMES_MAX = 16
+
+# Stage 1's multi-frame decode is configured through its ``speculative_config``
+# in the deploy YAML. The parse records whether it is armed here, because the
+# reader (``ascend_warmup_patch._kstep_armed``) can run in a spawned stage
+# worker that has no vllm_config to read it from. It only answers "armed or
+# not" -- 1 means not armed.
+_resolved_talker_frames: int = 1
+
+
+def talker_frames_per_step() -> int:
+    """Codec frames one stage-1 step produces; 1 when the deploy layer asked for none."""
+    return _resolved_talker_frames
+
+
+def _record_talker_frames(
+    stages: list[StageDeployConfig],
+    platforms: dict[str, Any] | None = None,
+) -> None:
+    """Record stage 1's frame count (its n-gram ``num_speculative_tokens`` is K - 1).
+
+    The K block sits under ``platforms.npu`` -- the loop is NPU-only -- so the
+    NPU overlay is merged here. This runs at load time, before the per-platform
+    merge, and its reader (``ascend_warmup_patch._kstep_armed``) runs in a
+    spawned stage worker that may have no vllm_config to read it from.
+    """
+    global _resolved_talker_frames
+    npu_overlay: dict[int, dict[str, Any]] = {}
+    for stage_override in ((platforms or {}).get("npu") or {}).get("stages") or []:
+        if isinstance(stage_override, dict) and "stage_id" in stage_override:
+            npu_overlay[stage_override["stage_id"]] = stage_override
+    for stage in stages:
+        if stage.stage_id != 1:
+            continue
+        spec = (stage.engine_extras or {}).get("speculative_config")
+        if spec is None:
+            # Platform overrides follow _extract_platform_overrides: every key
+            # but stage_id/devices/env is an engine or stage override.
+            spec = (npu_overlay.get(1) or {}).get("speculative_config")
+        frames = 1
+        if isinstance(spec, dict) and spec.get("method") == "ngram":
+            num_spec = spec.get("num_speculative_tokens", 0) or 0
+            if num_spec > 0:
+                frames = int(num_spec) + 1
+        _resolved_talker_frames = frames
+
+
 def load_deploy_config(path: str | Path) -> DeployConfig:
     """Load a deploy YAML (with optional base_config inheritance)."""
     raw_dict = resolve_deploy_yaml(path)
@@ -842,6 +997,7 @@ def load_deploy_config(path: str | Path) -> DeployConfig:
     if not isinstance(speech_cache, dict):
         raise ValueError("speech_cache must be a mapping")
     stages = [_parse_stage_deploy(s) for s in raw_dict.get("stages", [])]
+    _record_talker_frames(stages, raw_dict.get("platforms"))
 
     model_runner = raw_dict.get("model_runner", "v1")
     if model_runner not in ("v1", "v2"):

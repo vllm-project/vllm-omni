@@ -535,6 +535,11 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
     """MiniCPM-owned sampling policy, append planning, session state and output projection."""
 
     plugin_id = "minicpmo45"
+    # Stage 0 builds the session context once and keeps it in its per-session
+    # state.  Re-sending the conversation and reference-audio base64 on every
+    # one-second unit only adds host/IPC work; ModelChannel resends it when a
+    # request starts or the session config generation changes.
+    append_configs_are_session_static = True
     private_runtime_config_keys = PRIVATE_RUNTIME_CONFIG_KEYS
     silence_continuation_samples = 16000
 
@@ -662,6 +667,38 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
         return DuplexOutputDecision(
             action=DuplexOutputAction.DIRECT_RESPONSE,
             metadata=metadata,
+        )
+
+    def stage0_naturally_ended(
+        self,
+        *,
+        segment_finished: bool,
+        segment_token_ids: tuple[int, ...],
+        segment_output_metadata: Mapping[str, object],
+        output: object,
+    ) -> bool:
+        if not segment_finished:
+            return False
+        completion = _first_completion(output)
+        output_metadata = _multimodal_output(output, completion)
+        special_token_ids = _special_token_ids(segment_output_metadata)
+        special_token_ids.update(_special_token_ids(output_metadata))
+        token_ids = set(segment_token_ids)
+        token_ids.update(_completion_token_ids(completion))
+        natural_end_ids = {
+            special_token_ids.get("turn_eos_token_id", -1),
+            special_token_ids.get("tts_eos_token_id", -1),
+        }
+        if token_ids.intersection(natural_end_ids):
+            return True
+        return any(
+            _coerce_int(value) == 1
+            for value in (
+                output_metadata.get("turn_end"),
+                output_metadata.get("end_of_turn"),
+                output_metadata.get("meta.turn_end"),
+                output_metadata.get("meta.end_of_turn"),
+            )
         )
 
     # ---- session policy ----

@@ -392,7 +392,7 @@ def test_plain_model_hook_resolution_does_not_allocate_duplex_tracking():
     assert not hasattr(runner, "_duplex_sampling_helper")
 
 
-def test_minicpmo_non_duplex_sample_skips_duplex_row_scan():
+def test_minicpmo_non_duplex_step_publishes_empty_rows_without_scanning():
     from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
 
     calls = []
@@ -415,7 +415,9 @@ def test_minicpmo_non_duplex_sample_skips_duplex_row_scan():
     )
 
     assert runner._sample(torch.zeros((1, 4)), spec_decode_metadata=None) == "model-sampler"
-    assert calls == []
+    # The empty row set is published every step so the model's sample() can
+    # take its no-duplex fast path without scanning prompt tokens.
+    assert calls == ["prepare"]
 
 
 def test_minicpmo_duplex_sample_clears_stale_rows_once_without_scanning():
@@ -442,7 +444,7 @@ def test_minicpmo_duplex_sample_clears_stale_rows_once_without_scanning():
 
     assert runner._sample(torch.zeros((1, 4)), spec_decode_metadata=None) == "model-sampler"
     assert runner._sample(torch.zeros((1, 4)), spec_decode_metadata=None) == "model-sampler"
-    assert calls == [()]
+    assert calls == [(), ()]
 
 
 def test_generic_ar_runner_has_no_minicpmo_sampler_state_or_typeerror_probe():
@@ -2890,6 +2892,9 @@ def test_minicpmo_stage0_native_sampler_forced_listen_yields_floor():
     )
 
     sampled = model.sample(logits, sampling_metadata)
+    # The sampler decides on the device; the runner's next step commits the
+    # session latches once the token is on the host.
+    model._commit_minicpmo45_duplex_pending_samples()
 
     assert sampled is not None
     assert sampled.sampled_token_ids.tolist() == [[151705]]
@@ -3155,6 +3160,7 @@ def test_minicpmo_stage0_turn_eos_is_forwarded_not_pending():
     logits[0, 151717] = 30.0
 
     sampled = model.sample(logits, _native_duplex_sampling_metadata([151706, 200, 201]))
+    model._commit_minicpmo45_duplex_pending_samples()
 
     assert sampled.sampled_token_ids.tolist() == [[151717]]
     assert state.pending_terminator_token is None
@@ -3166,6 +3172,7 @@ def test_minicpmo_stage0_turn_eos_is_forwarded_not_pending():
     logits = torch.full((1, 151723), -100.0)
     logits[0, 151718] = 30.0
     sampled = model.sample(logits, _native_duplex_sampling_metadata([151706, 200, 201, 151717]))
+    model._commit_minicpmo45_duplex_pending_samples()
 
     assert sampled.sampled_token_ids.tolist() == [[151718]]
     assert state.pending_terminator_token == 151718

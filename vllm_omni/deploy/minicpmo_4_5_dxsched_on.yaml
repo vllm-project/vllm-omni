@@ -1,0 +1,50 @@
+# dxsched recommended profile: minicpmo_4_5_dxsched.yaml with the measured switches on.
+#
+# Same merge semantics as the base profile: duplex_session is replaced, so every
+# field is restated; stage hf_overrides are replaced per key; connectors and
+# engine_extras are deep-merged. Diagnostics (pacing/codec_deadline stats,
+# fbank and bucket stats) stay off; lanes turn them on.
+base_config: minicpmo_4_5_dxsched.yaml
+duplex_session:
+  max_sessions: 16
+  barge_cut_on_model_yield: true
+  barge_arm_min_silence_s: 0.6
+  barge_arm_min_speech_s: 0.4
+  barge_arm_min_playback_s: 1.0
+  barge_cut_min_unplayed_s: 0.15
+  pacing:
+    enabled: true
+    onset_lead_max_s: 0.9
+    onset_lead_target_s: 1.1
+    onset_skip_response_wait: true
+    critical_stall_s: 0.05
+    fire_grid_ms: 250
+    idle_grid: true
+
+connectors:
+  connector_of_shared_memory:
+    extra:
+      cfm_row_offset_merge: true            # second chunk + steady rows in one slot-pool replay
+      cfm_drop_upstream_att_buffer: true    # upstream chunk buffers the batched backend never reads
+      cfm_precapture_empty_cache: true      # return startup allocator cache after precapture
+      token2wav_s3tokenizer_device: cpu     # only used when a new reference voice is registered
+
+stages:
+  - stage_id: 0
+    hf_overrides:
+      duplex_audio_encoder_pinned_h2d: true
+      duplex_fbank_stats: false
+      duplex_incremental_fbank: true
+      # Audio-encoder graph grid follows duplex max_sessions (powers of two
+      # below it plus the cap); the batch-32 graph is never captured.
+      duplex_audio_encoder_cuda_graph_batch_sizes_from_sessions: true
+      # Sessions' streaming caches live in the graph's slot pool (>= max_sessions).
+      duplex_audio_encoder_resident_slots: 20
+      vision_fused_layers: true
+      vision_cuda_graph: true
+
+  - stage_id: 2
+    engine_extras:
+      additional_config:
+        codec_deadline:
+          enabled: true

@@ -128,9 +128,10 @@ def test_flag_parsing(monkeypatch) -> None:
         assert _event_driven_orch_enabled() is False
 
 
-def test_only_qwen3_tts_has_a_pipeline_default() -> None:
-    assert _event_driven_orch_default_for_pipeline("qwen3_tts") is True
-    for model_type in (None, "qwen3_omni_moe", "minicpmo_4_5", "moss_tts_delay"):
+def test_event_driven_pipeline_default() -> None:
+    for model_type in ("qwen3_tts", "minicpmo_4_5"):
+        assert _event_driven_orch_default_for_pipeline(model_type) is True
+    for model_type in (None, "qwen3_omni_moe", "moss_tts_delay"):
         assert _event_driven_orch_default_for_pipeline(model_type) is False
 
 

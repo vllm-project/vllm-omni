@@ -95,6 +95,33 @@ class _ConvRNNF0Predictor(nn.Module):
         return self.classifier(self.condnet(x).transpose(1, 2)).squeeze(-1).abs()
 
 
+# Upstream cosyvoice2 registers these non-persistent fp32 buffers for its own
+# chunked streaming (``CausalConditionalCFM.solve_euler_chunk`` and
+# ``DiT.forward_chunk``): (16, 16, 2, 8, 1000, 128) on the decoder (2,000 MiB)
+# and (16, 2, 8, 1000, 128) on the estimator (125 MiB). Only
+# ``flow.setup_cache`` / ``flow.inference_chunk`` reach them.
+_UPSTREAM_CHUNK_ATT_BUFFER = "att_cache_buffer"
+
+
+def drop_upstream_chunk_att_buffers(flow: nn.Module) -> int:
+    """Remove the upstream chunk-streaming attention buffers from ``flow``.
+
+    Returns the bytes released. The attributes are gone afterwards, so any
+    upstream chunk path that still reaches them fails with an AttributeError
+    instead of computing on a stand-in.
+    """
+    released = 0
+    decoder = getattr(flow, "decoder", None)
+    for module in (decoder, getattr(decoder, "estimator", None)):
+        if not isinstance(module, nn.Module):
+            continue
+        buffer = module._buffers.get(_UPSTREAM_CHUNK_ATT_BUFFER)
+        if isinstance(buffer, torch.Tensor):
+            released += buffer.numel() * buffer.element_size()
+            del module._buffers[_UPSTREAM_CHUNK_ATT_BUFFER]
+    return released
+
+
 def _build_hift() -> HiFTGenerator:
     return HiFTGenerator(
         sampling_rate=24000,
@@ -115,12 +142,22 @@ class StepAudio2Token2WavCore(nn.Module):
         float16: bool = False,
         device: str = "cuda",
         n_timesteps: int = DEFAULT_TOKEN2WAV_CONFIG.n_timesteps,
+        drop_upstream_chunk_att_buffers: bool = False,
+        audio_tokenizer_device: str | None = None,
     ):
         super().__init__()
         self.model_path = model_path
+        # A backend that never runs ``flow.setup_cache`` / ``flow.inference_chunk``
+        # (MiniCPM-o's ``BatchedToken2Wav``) can drop their 2.1 GiB of buffers.
+        self._drop_chunk_att_buffers = bool(drop_upstream_chunk_att_buffers)
+        self._chunk_att_buffers_dropped = False
         self.float16 = float16
         self.device = torch.device(device)
         self.n_timesteps = n_timesteps
+        # S3Tokenizer only runs in ``_prepare_prompt`` (once per new reference
+        # voice). ``None`` keeps it on ``device``; "cpu" keeps its fp32 weights
+        # (~472 MiB) off the accelerator at the cost of a CPU quantize.
+        self.audio_tokenizer_device = torch.device(audio_tokenizer_device) if audio_tokenizer_device else self.device
 
         self._models_loaded = False
         self._audio_tokenizer = None
@@ -163,7 +200,9 @@ class StepAudio2Token2WavCore(nn.Module):
         logger.info(f"Loading Token2Wav models from: {self.model_path}")
 
         self._audio_tokenizer = (
-            s3tokenizer.load_model(f"{self.model_path}/speech_tokenizer_v2_25hz.onnx").to(self.device).eval()
+            s3tokenizer.load_model(f"{self.model_path}/speech_tokenizer_v2_25hz.onnx")
+            .to(self.audio_tokenizer_device)
+            .eval()
         )
 
         option = onnxruntime.SessionOptions()
@@ -176,6 +215,11 @@ class StepAudio2Token2WavCore(nn.Module):
         with open(f"{self.model_path}/flow.yaml") as f:
             configs = load_hyperpyyaml(f)
         self._flow = configs["flow"]
+        if self._drop_chunk_att_buffers:
+            # Before ``.to(self.device)``: the buffers never reach the device.
+            released = drop_upstream_chunk_att_buffers(self._flow)
+            self._chunk_att_buffers_dropped = True
+            logger.info("Dropped the upstream flow chunk attention buffers (%.1f MiB)", released / 2**20)
         if self.float16:
             self._flow.half()
         self._flow.load_state_dict(
@@ -251,8 +295,11 @@ class StepAudio2Token2WavCore(nn.Module):
         mels = s3tokenizer.log_mel_spectrogram(audio)
         mels, mels_lens = s3tokenizer.padding([mels])
         prompt_speech_tokens, prompt_speech_tokens_lens = self.audio_tokenizer.quantize(
-            mels.to(self.device), mels_lens.to(self.device)
+            mels.to(self.audio_tokenizer_device), mels_lens.to(self.audio_tokenizer_device)
         )
+        if self.audio_tokenizer_device != self.device:
+            prompt_speech_tokens = prompt_speech_tokens.to(self.device)
+            prompt_speech_tokens_lens = prompt_speech_tokens_lens.to(self.device)
 
         spk_feat = kaldi.fbank(audio.unsqueeze(0), num_mel_bins=80, dither=0, sample_frequency=16000)
         spk_feat = spk_feat - spk_feat.mean(dim=0, keepdim=True)
@@ -333,10 +380,18 @@ class StepAudio2Token2WavCore(nn.Module):
 
     # ------------------------------------------------------------------
     # Per-request streaming (does NOT mutate self – uses external state)
+    def _require_chunk_att_buffers(self) -> None:
+        if self._chunk_att_buffers_dropped:
+            raise RuntimeError(
+                "Token2Wav chunk streaming needs the upstream flow attention buffers, "
+                "which drop_upstream_chunk_att_buffers removed"
+            )
+
     # ------------------------------------------------------------------
 
     def setup_stream_for(self, prompt_wav: str, state: _StreamState) -> None:
         """Initialise flow + HiFT caches into *state* (no self mutation)."""
+        self._require_chunk_att_buffers()
         if prompt_wav not in self.cache:
             self.cache[prompt_wav] = self._prepare_prompt(prompt_wav)
         prompt_speech_tokens, _, spk_emb, prompt_mels, _ = self.cache[prompt_wav]
@@ -371,6 +426,7 @@ class StepAudio2Token2WavCore(nn.Module):
         state: _StreamState,
     ) -> torch.Tensor:
         """Process one chunk using *state* (no self mutation except speech_window)."""
+        self._require_chunk_att_buffers()
         if state.stream_cache is None:
             raise ValueError("stream_cache not initialised – call setup_stream_for() first")
 

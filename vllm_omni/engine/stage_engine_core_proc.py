@@ -12,7 +12,9 @@ from __future__ import annotations
 
 import contextlib
 import os
+import queue
 import signal
+import time
 from typing import Any
 
 import vllm.v1.engine.core as _vllm_engine_core_module
@@ -43,6 +45,30 @@ logger = init_logger(__name__)
 
 
 _SIGNAL_EXIT_BASE = 128
+
+#: Floor of a park bounded by a held chunk's release time (deadline batching).
+_MIN_RELEASE_WAIT_S = 5e-4
+
+
+def _scheduler_next_release_in(scheduler: object) -> float | None:
+    """Seconds until the scheduler releases a held request, if it holds any (else None)."""
+    next_release_in = getattr(scheduler, "next_release_in", None)
+    if not callable(next_release_in):
+        return None
+    value = next_release_in()
+    return value if type(value) is float else None
+
+
+def _has_step_output(outputs: dict[int, Any] | None) -> bool:
+    """Whether a step returned anything but the scheduler stats ``log_stats`` attaches to every step."""
+    for output in (outputs or {}).values():
+        if (
+            getattr(output, "outputs", True)
+            or getattr(output, "finished_requests", None)
+            or getattr(output, "utility_output", None) is not None
+        ):
+            return True
+    return False
 
 
 def _install_phase_locks(kwargs: dict[str, Any], local_dp_rank: int) -> None:
@@ -130,6 +156,79 @@ class StageEngineCoreProc(EngineCoreProc):
         _bind_first_audio_sink(self.model_executor, self.output_queue, self.scheduler)
         if _bind_native_data_plane_ready_sink(self.model_executor, self.scheduler):
             logger.info("Bound native MRv2 connector readiness directly to the scheduler inbox.")
+        self._init_idle_wait()
+
+    # ------------------------------------------------------------------ #
+    #  Event-driven idle wait (additional_config.chunk_idle_wait_s > 0)   #
+    # ------------------------------------------------------------------ #
+    # vLLM's loop never blocks while ``scheduler.has_requests()``; a stage whose
+    # resident requests only wait for upstream chunks (Code2Wav in duplex:
+    # WAITING_FOR_CHUNK still counts as unfinished) then spins schedule ->
+    # zero-token execute -> sleep(1 ms) ~300 times per second. With the switch
+    # on, a step that executed nothing and produced no output parks the loop on
+    # the input queue until a client request, a chunk-ready WAKEUP from the
+    # receive thread, or the fallback bound -- only the waiting changes, never
+    # what a step does.
+
+    def _init_idle_wait(self) -> None:
+        from vllm_omni.distributed.omni_connectors.transfer_adapter.base import stage_idle_wait_s
+
+        self._idle_wait_s = stage_idle_wait_s(
+            getattr(getattr(self.scheduler, "vllm_config", None), "additional_config", None)
+        )
+        self._last_step_idle = False
+        if self._idle_wait_s <= 0:
+            return
+        adapter = getattr(self.scheduler, "chunk_transfer_adapter", None)
+        set_callback = getattr(adapter, "set_chunk_ready_callback", None)
+        if not callable(set_callback):
+            # Without the receive thread's WAKEUP every chunk would wait for the
+            # fallback bound (e.g. the native MRv2 data plane): keep vLLM's loop.
+            logger.warning("[StageEngineCoreProc] event-driven idle wait off: this stage has no chunk-ready wakeup")
+            self._idle_wait_s = 0.0
+            return
+        set_callback(self._post_idle_wakeup)
+        logger.info("[StageEngineCoreProc] event-driven idle wait: fallback %.3f s", self._idle_wait_s)
+
+    def _post_idle_wakeup(self) -> None:
+        """Wake a parked loop (called from the chunk receive thread)."""
+        self.input_queue.put_nowait((EngineCoreRequestType.WAKEUP, None))
+
+    def _process_input_queue(self) -> None:
+        if (
+            getattr(self, "_last_step_idle", False)
+            and not self.batch_queue
+            and self.input_queue.empty()
+            and self.is_running()
+        ):
+            self._last_step_idle = False
+            timeout = self._idle_wait_s
+            release_in = _scheduler_next_release_in(self.scheduler)
+            if release_in is not None:
+                # A held chunk must be re-planned by its release time, not the fallback bound.
+                timeout = min(timeout, max(_MIN_RELEASE_WAIT_S, release_in))
+            try:
+                req = self.input_queue.get(timeout=timeout)
+            except queue.Empty:
+                pass  # fallback bound: step once (deadlines, missed hints), then park again
+            else:
+                self._handle_client_request(*req)
+        super()._process_input_queue()
+
+    def _process_engine_step(self) -> bool:
+        if getattr(self, "_idle_wait_s", 0.0) <= 0:
+            return super()._process_engine_step()
+        # Same as vLLM's EngineCoreProc._process_engine_step, except that an
+        # idle step parks in _process_input_queue instead of sleeping 1 ms.
+        outputs, model_executed = self.step_fn()
+        for output in outputs.items() if outputs else ():
+            self.output_queue.put_nowait(output)
+        self.post_step(model_executed)
+        has_requests = self.scheduler.has_requests()
+        self._last_step_idle = not model_executed and not _has_step_output(outputs) and has_requests
+        if not model_executed and not self._last_step_idle and has_requests:
+            time.sleep(0.001)
+        return model_executed
 
     def preprocess_add_request(self, request: OmniEngineCoreRequest) -> tuple[Any, int]:
         """Preserve omni payloads when vLLM builds its scheduler request."""

@@ -6,8 +6,12 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, TypedDict
 
+import torch
+
 if TYPE_CHECKING:
     from vllm_omni.engine.duplex.contracts import DuplexFence
+
+_TRANSPORT_TENSOR_MARKER = "__tensor__"
 
 
 class DuplexIntermediateBuffer(TypedDict, total=False):
@@ -79,6 +83,22 @@ def build_duplex_append_prompt(
     }
 
 
+def drop_static_append_configs(prompt: dict[str, object]) -> dict[str, object]:
+    """Remove the session-sized config snapshots from a later append.
+
+    The model-intermediate buffer is deliberately mutable while a submission
+    is being prepared.  Keeping this helper at the transport seam makes the
+    optimization explicit and leaves the prompt/token calculation (which may
+    need the full config) in the model plugin unchanged.
+    """
+    intermediate = prompt.get("model_intermediate_buffer")
+    duplex = intermediate.get("duplex") if isinstance(intermediate, dict) else None
+    if isinstance(duplex, dict):
+        duplex.pop("session_config", None)
+        duplex.pop("runtime_config", None)
+    return prompt
+
+
 def build_duplex_intermediate_buffer(
     *,
     request_id: str,
@@ -109,8 +129,39 @@ def build_duplex_intermediate_buffer(
     return buffer
 
 
+def pack_transport_tensor(value: object) -> object:
+    """Pack a tensor as raw bytes so it survives ``model_intermediate_buffer`` transport.
+
+    The buffer is ``dict[str, Any]``, so a raw tensor would decode as vLLM's
+    ``(dtype, shape, aux-index)`` tuple, and a ``tolist()`` round trip costs
+    ~100x a memcpy on the orchestrator thread. Non-tensors pass through.
+    """
+    if not isinstance(value, torch.Tensor):
+        return value
+    tensor = value.detach().to("cpu").contiguous()
+    return {
+        _TRANSPORT_TENSOR_MARKER: True,
+        "dtype": str(tensor.dtype).removeprefix("torch."),
+        "shape": list(tensor.shape),
+        "data": tensor.reshape(-1).view(torch.uint8).numpy().tobytes(),
+    }
+
+
+def unpack_transport_tensor(value: object) -> object:
+    """Inverse of :func:`pack_transport_tensor`; other values pass through."""
+    if not isinstance(value, Mapping) or value.get(_TRANSPORT_TENSOR_MARKER) is not True:
+        return value
+    dtype = getattr(torch, str(value["dtype"]))
+    shape = [int(dim) for dim in value["shape"]]
+    data = value["data"]
+    if not data:
+        return torch.empty(shape, dtype=dtype)
+    # Copy into a writable buffer: msgpack hands back immutable bytes.
+    return torch.frombuffer(bytearray(data), dtype=dtype).reshape(shape)
+
+
 def set_ref_audio(buffer: DuplexIntermediateBuffer, waveform: object, sample_rate_hz: int) -> None:
-    buffer.setdefault("codes", {})["ref"] = waveform
+    buffer.setdefault("codes", {})["ref"] = pack_transport_tensor(waveform)
     buffer.setdefault("meta", {})["ref_audio_sr"] = int(sample_rate_hz)
 
 
@@ -119,7 +170,7 @@ def set_tts_handoff(buffer: DuplexIntermediateBuffer, token_ids: object | None, 
     if token_ids is not None:
         buffer.setdefault("ids", {})["tts"] = token_ids
     if hidden_states is not None:
-        buffer.setdefault("hidden_states", {})["tts"] = hidden_states
+        buffer.setdefault("hidden_states", {})["tts"] = pack_transport_tensor(hidden_states)
 
 
 def get_tts_handoff(info: dict[str, object]) -> tuple[object | None, object | None]:
@@ -130,7 +181,7 @@ def get_tts_handoff(info: dict[str, object]) -> tuple[object | None, object | No
     hidden_states = hidden_info.get("tts") if isinstance(hidden_info, dict) else None
     return (
         info.get("tts_token_ids") if token_ids is None else token_ids,
-        info.get("tts_hidden_states") if hidden_states is None else hidden_states,
+        unpack_transport_tensor(info.get("tts_hidden_states") if hidden_states is None else hidden_states),
     )
 
 

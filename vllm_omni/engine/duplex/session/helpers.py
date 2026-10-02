@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import binascii
+import time
 from typing import TYPE_CHECKING
 
 import pybase64 as base64
@@ -29,6 +30,7 @@ if TYPE_CHECKING:
 
     from vllm_omni.engine.duplex.session.context import DuplexSessionTasks
     from vllm_omni.engine.duplex.session.engine_session import DuplexCommittedInput, DuplexEngineSession
+    from vllm_omni.engine.duplex.session.pacing import SessionPacing
 
 
 def task_is_cancelling(task: asyncio.Task[object] | None) -> bool:
@@ -130,11 +132,15 @@ def audio_payload_size_bytes(payload: Mapping[str, object]) -> int:
 # --------------------------------------------------------------------------- #
 
 
-def advance_barge_in_epoch(session: DuplexEngineSession) -> tuple[int, dict[str, int]]:
+def advance_barge_in_epoch(
+    session: DuplexEngineSession, *, pace: SessionPacing | None = None
+) -> tuple[int, dict[str, int]]:
     """Start a new epoch for a barge-in, returning it with the playback it cut off."""
     old_playback = session.playback.as_dict()
     new_epoch = session.barge_in()
     session.clear_playback_cursor()
+    if pace is not None:
+        pace.on_epoch_advance(time.monotonic())
     return new_epoch, old_playback
 
 

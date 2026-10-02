@@ -260,12 +260,16 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             return value
 
         snapshot = copy.copy(request)
-        for name in (
-            "additional_information",
-            "prompt_token_ids",
-        ):
-            if hasattr(request, name):
-                setattr(snapshot, name, snapshot_container(getattr(request, name)))
+        if hasattr(request, "additional_information"):
+            snapshot.additional_information = snapshot_container(request.additional_information)
+        if hasattr(request, "prompt_token_ids"):
+            prompt_token_ids = request.prompt_token_ids
+            # Token ids are immutable ints, so a C-level shallow copy freezes the
+            # list exactly like the element-wise walk, which costs O(prompt)
+            # Python work per request on every sender step.
+            snapshot.prompt_token_ids = (
+                prompt_token_ids.copy() if type(prompt_token_ids) is list else snapshot_container(prompt_token_ids)
+            )
 
         for private_name, public_name in (
             ("_all_token_ids", "all_token_ids"),
@@ -339,6 +343,9 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             self._pending_load_reqs.append(entry)
         with self._recv_cond:
             self._recv_cond.notify()
+        # A receive thread blocked on the connector wakeup must poll the new
+        # key too: its chunk may have been put before this registration.
+        self._wake_recv_wait()
 
     def _accepts_new_token_ids(self, processor: Callable[..., Any]) -> bool:
         cached = self._processor_accepts_step_tokens.get(processor)

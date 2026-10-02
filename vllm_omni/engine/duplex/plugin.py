@@ -147,6 +147,14 @@ class DuplexModelSessionState(ABC):
     # continuation deadline. A real (non-silence) input resets the chain.
     last_native_submit_monotonic: float | None
     silence_deadline_monotonic: float | None
+    # Multi-unit continuation chain, read and written only when
+    # ``duplex_session.unit_continuation.depth`` > 1. The class defaults serve
+    # every state at depth 1. In-flight continuations, oldest first:
+    pending_silence_tasks: tuple[asyncio.Task[bool], ...] = ()
+    # Bumped per accepted real append and per clear: older plans are stale.
+    native_input_generation: int = 0
+    # Accepted silence appends: bounds the sibling submissions a plan may see.
+    silence_append_seq: int = 0
 
     @abstractmethod
     def retain_committed_audio(
@@ -220,6 +228,9 @@ class DefaultDuplexModelSessionState(DuplexModelSessionState):
         self.pending_silence_owner_id = None
         self.last_native_submit_monotonic = None
         self.silence_deadline_monotonic = None
+        # Read only at unit_continuation.depth > 1: plans made before the clear are stale.
+        self.pending_silence_tasks = ()
+        self.native_input_generation += 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -292,6 +303,11 @@ class DuplexModelPlugin(ABC):
     projects_intermediate_outputs: bool = False
     plugin_id: str = ""
     private_runtime_config_keys: frozenset[str] = frozenset()
+    #: If true, the model consumes session/runtime append configuration on the
+    #: first append of a request and keeps it in its own session state.  The
+    #: engine still sends the snapshots when the config generation changes.
+    #: Plugins that inspect configuration on every append leave this false.
+    append_configs_are_session_static: bool = False
     #: Samples per silence unit the runner appends to keep a model turn going.
     silence_continuation_samples: int = 16000
     #: Sample rate of that unit: the runner submits it through ``plan_append``
@@ -363,6 +379,22 @@ class DuplexModelPlugin(ABC):
         segment_output_metadata: dict[str, object],
         output: object,
     ) -> DuplexOutputDecision | None: ...
+
+    def stage0_naturally_ended(
+        self,
+        *,
+        segment_finished: bool,
+        segment_token_ids: tuple[int, ...],
+        segment_output_metadata: Mapping[str, object],
+        output: object,
+    ) -> bool:
+        """Whether Stage 0 emitted the model's natural response-end marker.
+
+        Read only while the session paces its output or may cut playback
+        (``duplex_session.pacing`` / ``barge_cut_on_model_yield``).
+        """
+        del segment_finished, segment_token_ids, segment_output_metadata, output
+        return False
 
     def project_intermediate_output(
         self,

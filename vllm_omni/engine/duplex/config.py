@@ -200,6 +200,11 @@ class DuplexCapabilities:
         return None
 
 
+#: Audio a duplex client buffers before it plays the first chunk of a session,
+#: then playing each chunk on arrival. Duplex pacing models that client with it.
+DUPLEX_CLIENT_PREBUFFER_S = 0.5
+
+
 @dataclass
 class DuplexPlaybackCursor:
     generated_ms: int = 0

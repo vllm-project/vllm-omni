@@ -965,6 +965,7 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
         return hidden_states, None
 
     def profile_run(self) -> None:
+        self._run_omni_post_load()
         # Profile with multimodal encoder & encoder cache.
         if self.supports_mm_inputs:
             mm_config = self.model_config.multimodal_config

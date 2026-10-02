@@ -18,6 +18,7 @@ from vllm_omni.config.stage_config import (
 
 _PROC = "vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni"
 MINICPMO45_REFERENCE_AUDIO_KEY = "_minicpmo45_reference_audio"
+_CODEC_EOS_TOKEN_ID = 6561  # tts_config.num_audio_tokens - 1
 
 
 MINICPMO_4_5_PIPELINE = PipelineConfig(
@@ -71,9 +72,10 @@ MINICPMO_4_5_PIPELINE = PipelineConfig(
             supports_native_mrv2_data_plane=True,
             sampling_constraints={
                 "detokenize": False,
-                # MiniCPM-o 4.5 codec EOS is tts_config.num_audio_tokens - 1.
-                # Same pattern as Qwen3 talker's stop_token_ids: [2150].
-                "stop_token_ids": [6561],
+                # The one-frame head's codec EOS. A multi-frame deploy config
+                # adds its stop marker (1) via default_sampling_params; keeping
+                # it here would end every one-frame request on codec id 1.
+                "stop_token_ids": [_CODEC_EOS_TOKEN_ID],
             },
         ),
         StagePipelineConfig(

@@ -3,11 +3,27 @@
 
 import threading
 from collections import deque
+from collections.abc import Callable, Mapping
 from typing import Any
 
 from ..utils.logging import get_connector_logger
 
 logger = get_connector_logger(__name__)
+
+
+def stage_idle_wait_s(additional_config: object) -> float:
+    """Fallback bound (s) of a chunk-fed stage's event-driven wakeups; ``0`` keeps polling.
+
+    ``additional_config.chunk_idle_wait_s`` > 0 lets the chunk receive thread
+    block on the connector's arrival wakeup instead of re-polling every
+    millisecond, and lets the stage engine loop block between steps while every
+    request only waits for an upstream chunk. Wakeups are hints: the value
+    bounds how long a missed one can delay a chunk.
+    """
+    value = additional_config.get("chunk_idle_wait_s") if isinstance(additional_config, Mapping) else None
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return 0.0
+    return float(value) if value > 0 else 0.0
 
 
 class OmniTransferAdapterBase:
@@ -38,6 +54,14 @@ class OmniTransferAdapterBase:
         self._send_failure_lock = threading.Lock()
         self._receive_failures: dict[str, str] = {}
         self._receive_failure_lock = threading.Lock()
+        # Event-driven receive (off unless ``chunk_idle_wait_s`` > 0 and the
+        # connector exposes arrival wakeups): decided before the thread starts.
+        self._recv_fifo_wait_s = (
+            stage_idle_wait_s(getattr(config, "additional_config", None))
+            if callable(getattr(self.connector, "wait_for_change", None))
+            else 0.0
+        )
+        self._chunk_ready_callback: Callable[[], None] | None = None
 
         self.recv_thread = threading.Thread(target=self.recv_loop, daemon=True)
         self.recv_thread.start()
@@ -49,14 +73,50 @@ class OmniTransferAdapterBase:
     def create_connector(cls, model_config: Any):
         raise NotImplementedError
 
+    def set_chunk_ready_callback(self, callback: Callable[[], None] | None) -> None:
+        """Call ``callback`` from the receive thread after a pass that committed data.
+
+        The stage engine uses it to wake its loop; it runs after the commit is
+        visible to the scheduler (``_finished_load_reqs``), so a woken
+        ``schedule()`` always sees the chunk.
+        """
+        self._chunk_ready_callback = callback
+
+    def _notify_chunk_ready(self) -> None:
+        callback = getattr(self, "_chunk_ready_callback", None)
+        if callback is None:
+            return
+        try:
+            callback()
+        except Exception:  # noqa: BLE001 - a lost hint only costs the fallback bound
+            logger.debug("chunk-ready callback failed", exc_info=True)
+
+    def _wake_recv_wait(self) -> None:
+        """Interrupt a receive thread blocked on the connector wakeup (new work to poll)."""
+        if getattr(self, "_recv_fifo_wait_s", 0.0) <= 0:
+            return
+        wake = getattr(self.connector, "wake_self", None)
+        if callable(wake):
+            wake()
+
     def recv_loop(self):
         """Loop to poll for incoming data.
 
         Process each pending request exactly once per pass.  When no request
         made progress, back off 1 ms instead of tight-spinning on failed
         shm_open syscalls (which can burn a full CPU core).
+
+        With ``additional_config.chunk_idle_wait_s`` > 0 and a connector that exposes
+        arrival wakeups, a pass without progress blocks until the next ``put``
+        to this stage (or a local ``wake_self``) instead, bounded by that value.
+        The generation is taken before the pass, so a ``put`` that lands while
+        the pass runs makes the wait return at once.
         """
+        fifo_wait_s = getattr(self, "_recv_fifo_wait_s", 0.0)
+        snapshot = getattr(self.connector, "get_wakeup_generation", None) if fifo_wait_s > 0 else None
+        wait_for_change = getattr(self.connector, "wait_for_change", None) if callable(snapshot) else None
         while not self.stop_event.is_set():
+            generation = snapshot() if wait_for_change is not None else None
             n = len(self._pending_load_reqs)
             any_success = False
             for _ in range(n):
@@ -74,12 +134,20 @@ class OmniTransferAdapterBase:
                     self._pending_load_reqs.append(request)
                     logger.warning(f"Error receiving data for {request_id}: {e}")
 
+            if any_success:
+                self._notify_chunk_ready()
+
             # Timeout is the fallback for lock-free append/notify races.
             with self._recv_cond:
                 if not self._pending_load_reqs and not self.stop_event.is_set():
                     self._recv_cond.wait(timeout=0.1)
-                elif not any_success and not self.stop_event.is_set():
+                    continue
+                if any_success or self.stop_event.is_set():
+                    continue
+                if generation is None:
                     self._recv_cond.wait(timeout=0.001)
+                    continue
+            wait_for_change(generation, timeout=fifo_wait_s)
 
     def record_send_failure(self, request_id: str | None, reason: str) -> None:
         """Note that a chunk for *request_id* will never be delivered.

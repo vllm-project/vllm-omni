@@ -14,6 +14,7 @@ from vllm_omni.engine.duplex.intermediate import (
     build_duplex_intermediate_buffer,
     set_ref_audio,
     set_tts_handoff,
+    unpack_transport_tensor,
 )
 from vllm_omni.inputs.data import OmniTokensPrompt
 from vllm_omni.model_executor.models.minicpmo_4_5 import (
@@ -25,6 +26,7 @@ from vllm_omni.model_executor.models.minicpmo_4_5.pipeline import MINICPMO45_REF
 logger = logging.getLogger(__name__)
 _MINICPMO45_ASYNC_STATE = "_minicpmo45_async_codec_state"
 _MINICPMO45_STREAM_RECORD = "_minicpmo45_async_stream_record"
+_MINICPMO45_REF_AUDIO_CACHE = "minicpmo45_ref_audio"
 _MINICPMO45_SILENCE_CODE = 4218
 _MINICPMO45_MIN_STREAM_BODY_FRAMES = 5
 
@@ -92,19 +94,40 @@ def _extract_prompt_reference_audio(
     return _extract_first_audio_ref({"audio": serving_reference_audio})
 
 
-def _extract_native_runtime_ref_audio(data_plane_metadata):
+def _extract_native_runtime_ref_audio(data_plane_metadata, streaming_context=None):
     if not isinstance(data_plane_metadata, dict):
-        return None
+        data_plane_metadata = {}
     runtime_config = data_plane_metadata.get("runtime_config")
     if not isinstance(runtime_config, dict):
+        bridge_states = getattr(streaming_context, "bridge_states", None)
+        duplex_state = bridge_states.get("duplex") if isinstance(bridge_states, dict) else None
+        runtime_config = duplex_state.get("runtime_config") if isinstance(duplex_state, dict) else None
+    if not isinstance(runtime_config, dict):
         return None
+    # Every handoff of a session carries the same base64 reference voice.
+    # Decode it once per distinct config instead of once per ~1 s unit on the
+    # orchestrator thread; the key holds every input the decode reads.
+    cache_key = (
+        runtime_config.get("ref_audio_data"),
+        runtime_config.get("ref_audio_format"),
+        runtime_config.get("ref_audio_sample_rate_hz"),
+        any(key in runtime_config for key in ("ref_audio_path", "tts_ref_audio_path")),
+    )
+    bridge_states = getattr(streaming_context, "bridge_states", None)
+    cached = bridge_states.get(_MINICPMO45_REF_AUDIO_CACHE) if isinstance(bridge_states, dict) else None
+    if isinstance(cached, tuple) and cached[0] == cache_key:
+        return cached[1]
     from vllm_omni.model_executor.models.minicpmo_4_5.duplex.input import decode_native_ref_audio_from_config
 
     waveform = decode_native_ref_audio_from_config({"extra_body": runtime_config})
     if waveform is None:
-        return None
-    sample_rate = runtime_config.get("ref_audio_sample_rate_hz") or 16000
-    return torch.as_tensor(waveform, dtype=torch.float32).reshape(-1).cpu(), int(sample_rate)
+        ref_audio = None
+    else:
+        sample_rate = runtime_config.get("ref_audio_sample_rate_hz") or 16000
+        ref_audio = torch.as_tensor(waveform, dtype=torch.float32).reshape(-1).cpu(), int(sample_rate)
+    if isinstance(bridge_states, dict):
+        bridge_states[_MINICPMO45_REF_AUDIO_CACHE] = (cache_key, ref_audio)
+    return ref_audio
 
 
 def _coerce_token_id_list(value):
@@ -127,14 +150,6 @@ def _coerce_token_id_list(value):
     return out
 
 
-def _to_transport_list(value):
-    if hasattr(value, "detach"):
-        value = value.detach().cpu()
-    if isinstance(value, torch.Tensor):
-        return value.tolist()
-    return value
-
-
 def _coerce_int(value):
     if hasattr(value, "detach"):
         flat = value.detach().cpu().reshape(-1)
@@ -147,13 +162,20 @@ def _coerce_int(value):
         return None
 
 
-def _codec_config(transfer_manager: Any) -> tuple[int, int]:
+def _connector_extra(transfer_manager: Any) -> dict:
     connector = getattr(transfer_manager, "connector", None)
     raw_config = getattr(connector, "config", {}) or {}
     config = raw_config.get("extra", raw_config) if isinstance(raw_config, dict) else {}
-    config = config if isinstance(config, dict) else {}
+    return config if isinstance(config, dict) else {}
+
+
+def _codec_config(transfer_manager: Any) -> tuple[int, int]:
+    config = _connector_extra(transfer_manager)
     chunk_frames = int(config.get("codec_chunk_frames", 25))
     left_context_frames = int(config.get("codec_left_context_frames", 3))
+    initial = int(config.get("initial_codec_chunk_frames", 0))
+    if initial and not _MINICPMO45_MIN_STREAM_BODY_FRAMES <= initial <= chunk_frames:
+        raise ValueError("MiniCPM-o initial_codec_chunk_frames must be 0 or between 5 and codec_chunk_frames")
     if chunk_frames <= 0 or left_context_frames < 0:
         raise ValueError(
             "Invalid MiniCPM-o codec chunk config: "
@@ -161,6 +183,11 @@ def _codec_config(transfer_manager: Any) -> tuple[int, int]:
             f"codec_left_context_frames={left_context_frames}"
         )
     return chunk_frames, left_context_frames
+
+
+def _initial_chunk_frames(transfer_manager: Any, chunk_frames: int) -> int:
+    """First-payload window: ``initial_codec_chunk_frames`` (validated by ``_codec_config``; 0 = off)."""
+    return int(_connector_extra(transfer_manager).get("initial_codec_chunk_frames", 0) or 0) or chunk_frames
 
 
 def _request_intermediate_section(request: object, section: str) -> dict[str, object]:
@@ -340,15 +367,22 @@ def tts2code2wav_async_chunk(
     request_finished = getattr(request, "is_finished", None)
     finished = bool(is_finished or (callable(request_finished) and request_finished()))
     chunk_frames, left_context_frames = _codec_config(transfer_manager)
+    # Only a turn-mode stream's first payload uses initial_codec_chunk_frames;
+    # native duplex keeps its own short-unit threshold (hold_short_unit below).
+    first_window = (
+        _initial_chunk_frames(transfer_manager, chunk_frames)
+        if not native_duplex and int(record["chunk_seq"]) == 0
+        else chunk_frames
+    )
     flush_pending = finished
     last_chunk = bool(flush_pending and (not native_duplex or turn_end))
-    if not flush_pending and len(pending) < chunk_frames:
+    if not flush_pending and len(pending) < first_window:
         return None
 
     hold_short_unit = (
         native_duplex and flush_pending and not last_chunk and 0 < len(pending) < _MINICPMO45_MIN_STREAM_BODY_FRAMES
     )
-    new_token_count = 0 if hold_short_unit else (len(pending) if flush_pending else chunk_frames)
+    new_token_count = 0 if hold_short_unit else (len(pending) if flush_pending else first_window)
     new_codes = pending[:new_token_count]
     del pending[:new_token_count]
     codec_start = int(state["codec_end"])
@@ -392,7 +426,7 @@ def tts2code2wav_async_chunk(
     if int(record["cache_epoch"]) == 0 and chunk_seq == 0:
         codes_info = _request_intermediate_section(request, "codes")
         meta_info = _request_intermediate_section(request, "meta")
-        raw_ref_audio = codes_info.get("ref")
+        raw_ref_audio = unpack_transport_tensor(codes_info.get("ref"))
         raw_ref_audio_sr = meta_info.get("ref_audio_sr")
         ref_audio_sr = _coerce_int(raw_ref_audio_sr)
         if raw_ref_audio is not None:
@@ -452,7 +486,7 @@ def tts2code2wav_full_payload(
     meta_info = _request_intermediate_section(request, "meta")
     duplex_info = _request_intermediate_section(request, "duplex")
 
-    ref_audio = codes_info.get("ref")
+    ref_audio = unpack_transport_tensor(codes_info.get("ref"))
     finished = torch.tensor(True, dtype=torch.bool)
     return OmniPayloadStruct(
         codes=CodesStruct(
@@ -759,6 +793,80 @@ def _native_duplex_forwarded_hidden_rows(
     )
 
 
+def _native_duplex_ledger_row_ids(mm_output: Mapping[str, object]) -> tuple[list[int], list[int]] | None:
+    """Flatten the handoff's row ledger to ``(ids, positions)`` lists."""
+    row_ids = mm_output.get("latent_input_ids")
+    row_positions = mm_output.get("latent_positions")
+    if not isinstance(row_ids, torch.Tensor) or not isinstance(row_positions, torch.Tensor):
+        return None
+    ids = [int(token_id) for token_id in row_ids.reshape(-1).tolist()]
+    positions = [int(position) for position in row_positions.reshape(-1).tolist()]
+    if len(ids) != len(positions):
+        return None
+    return ids, positions
+
+
+def _native_duplex_block_base(ids: list[int], positions: list[int], block: list[int]) -> int | None:
+    """Latest contiguous, position-monotonic occurrence of ``block`` in the ledger."""
+    width = len(block)
+    if width == 0:
+        return None
+    for base in range(len(ids) - width, -1, -1):
+        if ids[base : base + width] != block:
+            continue
+        first = positions[base]
+        if all(positions[base + offset] == first + offset for offset in range(width)):
+            return base
+    return None
+
+
+def _native_duplex_trim_unbacked_decisions(
+    out_ids: list[int],
+    mm_output: Mapping[str, object],
+    special_token_ids: dict[str, int],
+    *,
+    request_id: str,
+) -> list[int]:
+    """Drop leading decision tokens whose hidden rows are no longer in the ledger.
+
+    A segment consumed without a Talker handoff (a listen, or a speak whose
+    turn ended empty) still advances the cumulative output, but the next
+    streaming update folds it into the rewritten prompt and the hidden ledger
+    restarts, so the next handoff would fail with ``missing own-token hidden
+    states``. Only control decision tokens are dropped, and only while the rest
+    is still a block the ledger backs; otherwise the input is returned unchanged
+    so the explicit error still fires.
+    """
+    ledger = _native_duplex_ledger_row_ids(mm_output)
+    if ledger is None:
+        return out_ids
+    ids, positions = ledger
+    control_ids = {token_id for token_id in special_token_ids.values() if isinstance(token_id, int) and token_id >= 0}
+
+    def backed(segment: list[int]) -> bool:
+        for candidate in (segment, segment[:-1]):
+            if candidate and _native_duplex_block_base(ids, positions, candidate) is not None:
+                return True
+        return False
+
+    if backed(out_ids):
+        return out_ids
+    for trim in range(1, len(out_ids)):
+        if out_ids[trim - 1] not in control_ids:
+            break
+        if backed(out_ids[trim:]):
+            logger.warning(
+                "MiniCPM-o native duplex: skipped %d stale leading decision token(s) without "
+                "hidden rows in the current ledger for request_id=%s (unit=%s, ledger tail=%s)",
+                trim,
+                request_id,
+                out_ids,
+                ids[-32:],
+            )
+            return out_ids[trim:]
+    return out_ids
+
+
 def _native_duplex_data_plane_metadata(streaming_context) -> dict[str, object] | None:
     bridge_states = getattr(streaming_context, "bridge_states", None)
     if not isinstance(bridge_states, dict):
@@ -777,12 +885,20 @@ def _native_duplex_data_plane_metadata(streaming_context) -> dict[str, object] |
     turn_id = duplex_state.get("model_turn_id", duplex_state.get("turn_id"))
     if isinstance(turn_id, int):
         metadata["turn_id"] = turn_id
-    session_config = duplex_state.get("session_config")
-    if isinstance(session_config, dict):
-        metadata["session_config"] = dict(session_config)
-    runtime_config = duplex_state.get("runtime_config")
-    if isinstance(runtime_config, dict):
-        metadata["runtime_config"] = dict(runtime_config)
+    # MiniCPM Stage 0 and the native Talker keep session configuration in
+    # request-local state.  Send the snapshot once per config generation so a
+    # large reference-audio base64 value does not cross the Stage0→Stage1
+    # boundary for every one-second unit.
+    config_generation = duplex_state.get("config_generation")
+    sent_generation = duplex_state.get("_native_config_generation")
+    if sent_generation != config_generation:
+        session_config = duplex_state.get("session_config")
+        if isinstance(session_config, dict):
+            metadata["session_config"] = dict(session_config)
+        runtime_config = duplex_state.get("runtime_config")
+        if isinstance(runtime_config, dict):
+            metadata["runtime_config"] = dict(runtime_config)
+        duplex_state["_native_config_generation"] = config_generation
     return metadata
 
 
@@ -955,6 +1071,12 @@ def llm2tts(
             out_ids = llm_output_ids
             listen_id = special_token_ids.get("listen_token_id")
             turn_eos_id = special_token_ids.get("turn_eos_token_id")
+            out_ids = _native_duplex_trim_unbacked_decisions(
+                out_ids,
+                mm_output,
+                special_token_ids,
+                request_id=str(llm_output.request_id),
+            )
             unit_start = 0
             while unit_start < len(out_ids) and out_ids[unit_start] == listen_id:
                 unit_start += 1
@@ -1030,30 +1152,34 @@ def llm2tts(
             meta["turn_start"] = native_turn_start
             if native_segment_end:
                 meta["segment_end"] = True
-        ref_audio = reference_audio_by_request_id.get(llm_output.request_id)
-        if ref_audio is None:
-            ref_audio = _extract_native_runtime_ref_audio(
-                model_intermediate_buffer.get("duplex"),
-            )
-        if ref_audio is not None:
-            ref_waveform, ref_sr = ref_audio
-            set_ref_audio(model_intermediate_buffer, _to_transport_list(ref_waveform), ref_sr)
-        handoff_hidden = _to_transport_list(tts_hidden_slice) if tts_hidden_slice is not None else None
         native_turn_end_handoff = False
         if is_native_duplex_handoff:
             turn_eos_id = special_token_ids.get("turn_eos_token_id")
             native_turn_end_handoff = turn_eos_id is not None and handoff_ids is not None and turn_eos_id in handoff_ids
             if not handoff_ids:
                 continue
-        set_tts_handoff(model_intermediate_buffer, handoff_ids, handoff_hidden)
+        # Resolve the reference voice only for a handoff that is submitted;
+        # listen-only units drop this buffer above.
+        ref_audio = reference_audio_by_request_id.get(llm_output.request_id)
+        if ref_audio is None:
+            ref_audio = _extract_native_runtime_ref_audio(
+                model_intermediate_buffer.get("duplex"),
+                _streaming_context,
+            )
+        if ref_audio is not None:
+            ref_waveform, ref_sr = ref_audio
+            set_ref_audio(model_intermediate_buffer, ref_waveform, ref_sr)
+        # Tensors are packed as raw bytes (bit-identical) instead of Python
+        # lists: see pack_transport_tensor.
+        set_tts_handoff(model_intermediate_buffer, handoff_ids, tts_hidden_slice)
         if native_turn_end_handoff:
             model_intermediate_buffer.setdefault("meta", {})["turn_end"] = True
 
         condition_sequence_state = None
         condition_sequence_value = None
-        if handoff_ids is not None and handoff_hidden is not None:
+        if handoff_ids is not None and tts_hidden_slice is not None:
             condition_suffix_length = 1 if is_native_duplex_handoff else 2
-            condition_length = max(len(handoff_ids), len(handoff_hidden)) + condition_suffix_length
+            condition_length = max(len(handoff_ids), len(tts_hidden_slice)) + condition_suffix_length
             # Dummy ids only reserve scheduler slots; prefill overwrites the
             # embeddings. Talker.sample() blanks the whole prompt out of the
             # repetition penalty, so codec id 0 is not taxed from step one.

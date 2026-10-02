@@ -373,3 +373,62 @@ def test_code2wav_platform_wraps_flow_execution_context(monkeypatch):
         last_chunk=True,
     ) == ("decode", True, False)
     assert entered == [(torch.device("cpu"), True), (torch.device("cpu"), True)]
+
+
+def test_code2wav_pad_mask_replays_as_a_graph_input(monkeypatch):
+    """A bucketing pad mask is shape-stable, so it replays inside the graph."""
+    calls = []
+    seen = []
+
+    class _Backend:
+        _trt_stepper = None
+        _cfm_graph_wrapper = None
+
+    class _Runner:
+        def run(self, operation, inputs, constants, compute):
+            calls.append((operation, inputs, constants))
+            return compute(*inputs)
+
+    backend = _Backend()
+    code2wav_patch._backend_graph_runners[backend] = _Runner()
+
+    def graphable_estimator_step(
+        instance,
+        estimator,
+        *,
+        x,
+        mu,
+        time_embedding,
+        speakers,
+        cond,
+        cnn_cache,
+        att_cache,
+        attn_mask=None,
+    ):
+        del instance, estimator, time_embedding, speakers, cond, cnn_cache, att_cache
+        seen.append(attn_mask)
+        return x + mu, x.clone(), x.clone()
+
+    monkeypatch.setattr(code2wav_patch, "_original_estimator_step", lambda *args, **kwargs: None)
+    monkeypatch.setattr(code2wav_patch, "_graphable_estimator_step", graphable_estimator_step)
+    value = torch.tensor([2.0])
+    mask = torch.tensor([1.0, 0.0])
+    estimator = SimpleNamespace(t_embedder=lambda time: time + 1)
+
+    code2wav_patch._patched_estimator_step(
+        backend,
+        estimator,
+        x=value,
+        mu=value,
+        time=value,
+        speakers=value,
+        cond=value,
+        attn_mask=mask,
+        cnn_cache=None,
+        att_cache=None,
+    )
+
+    assert calls[0][0] == "cfm_estimator"
+    assert calls[0][2] == (False, True)
+    assert any(item is mask for item in calls[0][1])
+    assert seen[0] is mask

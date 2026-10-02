@@ -1,0 +1,70 @@
+# dxsched measurement profile: pipe (R2) + OpenMP caps + every dxsched switch present and off.
+#
+# Merge semantics this file depends on (resolve_deploy_yaml):
+# - duplex_session is replaced, not merged: restate every inherited field here.
+# - Stage env / hf_overrides are replaced per key: restate the pipe values next
+#   to the new entries. engine_extras and connectors are deep-merged.
+# Lanes copy this file and flip only the switch lines they test.
+base_config: minicpmo_4_5_pipe.yaml
+duplex_session:
+  max_sessions: 16                 # restated from minicpmo_4_5.yaml
+  barge_cut_on_model_yield: false
+  barge_arm_min_silence_s: 0.6
+  barge_arm_min_speech_s: 0.4      # backchannel floor
+  barge_arm_min_playback_s: 1.0
+  barge_cut_min_unplayed_s: 0.15
+  pacing:
+    enabled: false
+    onset_lead_max_s: 0.0          # 0.9 when on
+    onset_lead_target_s: 1.1
+    onset_skip_response_wait: false
+    critical_stall_s: 0.05
+    fire_grid_ms: 0                # 250 when on
+    idle_grid: false
+
+connectors:
+  connector_of_shared_memory:
+    extra:
+      hift_graph_codec_chunk_frames: [25, 75]  # HiFT graphs for duplex unit continuations
+      code2wav_bucket_stats: false
+      cfm_cross_turn_buckets: false
+      cfm_row_offset_merge: false              # second chunk + steady rows in one slot-pool replay
+
+stages:
+  - stage_id: 0
+    hf_overrides:
+      duplex_audio_encoder_pinned_h2d: true    # restated from pipe
+      duplex_fbank_stats: false
+      duplex_incremental_fbank: false
+    env:
+      OMP_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
+      OMP_WAIT_POLICY: PASSIVE
+
+  - stage_id: 1
+    env:
+      OMP_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
+      OMP_WAIT_POLICY: PASSIVE
+
+  - stage_id: 2
+    env:
+      VLLM_OMNI_STAGE_IDLE_WAIT_S: "0.05"      # restated from pipe; codec_deadline needs it
+      OMP_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
+      OMP_WAIT_POLICY: PASSIVE
+    # engine_extras is deep-merged; the scheduler reads additional_config.codec_deadline.
+    engine_extras:
+      additional_config:
+        codec_deadline:
+          enabled: false
+          margin_s: 0.1
+          rtf_cap: 1.1
+          max_hold_s: 0.35
+          max_rows: 8
+          eager_rows: 4
+          step_alpha: 0.1
+          gap_reanchor_s: 1.0
+          breaker_window: 50
+          breaker_late_frac: 0.1
+          breaker_cooloff_s: 10.0

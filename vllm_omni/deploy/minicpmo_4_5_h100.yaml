@@ -1,0 +1,97 @@
+# H100 single-GPU duplex profile for MiniCPM-o 4.5.
+#
+# Consolidated high-concurrency full-duplex deployment profile:
+# - Stage 0: Fused vision layers + vision CUDA graph for multi-modal image/video,
+#   streaming audio encoder CUDA graphs with resident cache slots, incremental fbank.
+# - Stage 1: Talker K-step multi-frame decode with per-frame tail CUDA graph.
+# - Stage 2: Code2Wav Whole-Euler slot pool + fused DiT body, exact-shape HiFT graphs,
+#   and codec deadline batching policy.
+# - Duplex Session: Pacing and barge-in cut on model yield.
+# - Private MPS daemon enabled for serialized GPU initialization and overlapped execution.
+base_config: minicpmo_4_5_kstep.yaml
+cuda_mps: true
+
+duplex_session:
+  max_sessions: 20
+  barge_cut_on_model_yield: true
+  barge_arm_min_silence_s: 0.6
+  barge_arm_min_speech_s: 0.4
+  barge_arm_min_playback_s: 1.0
+  barge_cut_min_unplayed_s: 0.15
+  pacing:
+    enabled: true
+    onset_lead_max_s: 0.9
+    onset_lead_target_s: 1.1
+    onset_skip_response_wait: true
+    critical_stall_s: 0.05
+    fire_grid_ms: 250
+    idle_grid: true
+
+connectors:
+  connector_of_shared_memory:
+    extra:
+      cfm_max_graphs: 128
+      cfm_graph_capture_frames: [50, 56, 150, 156]
+      cfm_fused_body: true
+      cfm_slot_pool: true
+      cfm_row_offset_merge: true
+      cfm_drop_upstream_att_buffer: true
+      cfm_precapture_empty_cache: true
+      hift_graph_codec_chunk_frames: [25, 75]
+
+stages:
+  - stage_id: 0
+    max_num_seqs: 20
+    env:
+      OMP_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
+      OMP_WAIT_POLICY: PASSIVE
+    hf_overrides:
+      duplex_audio_encoder_pinned_h2d: true
+      duplex_fbank_stats: false
+      duplex_incremental_fbank: true
+      duplex_audio_encoder_cuda_graph_batch_sizes_from_sessions: true
+      duplex_audio_encoder_resident_slots: 20
+      vision_fused_layers: true
+      vision_cuda_graph: true
+
+  - stage_id: 1
+    max_num_seqs: 20
+    env:
+      OMP_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
+      OMP_WAIT_POLICY: PASSIVE
+
+  - stage_id: 2
+    max_num_seqs: 20
+    async_scheduling: false
+    env:
+      OMP_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
+      OMP_WAIT_POLICY: PASSIVE
+      MINICPMO_CODE2WAV_TF32: "flow"
+      VLLM_OMNI_CFM_GRAPH_GRID: "1,4,8,16,20"
+    engine_extras:
+      additional_config:
+        chunk_idle_wait_s: 0.05
+        step_release_policy: vllm_omni.model_executor.models.minicpmo_4_5.codec_deadline.build_codec_deadline_policy
+        codec_deadline:
+          enabled: true
+          margin_s: 0.1
+          rtf_cap: 1.1
+          max_hold_s: 0.35
+          max_rows: 8
+          eager_rows: 4
+          step_alpha: 0.1
+          gap_reanchor_s: 1.0
+          breaker_window: 50
+          breaker_late_frac: 0.1
+          breaker_cooloff_s: 10.0
+
+platforms:
+  cuda:
+    stages:
+      - stage_id: 0
+        kv_cache_memory_bytes: 17179869184  # 16 GiB
+      - stage_id: 1
+        kv_cache_memory_bytes: 8589934592  # 8 GiB

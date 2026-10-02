@@ -109,6 +109,7 @@ def _make_talker() -> MiniCPMO45OmniTTSForConditionalGeneration:
     talker._request_condition_states = {}
     talker._deferred_cleanup_ids = set()
     talker._tts_config = ConditionalChatTTSConfig()
+    talker._k_step_frames = 0
     talker.head_code = nn.ModuleList([nn.Linear(2, 8, bias=False)])
     with torch.no_grad():
         talker.head_code[0].weight.copy_(torch.eye(8, 2))

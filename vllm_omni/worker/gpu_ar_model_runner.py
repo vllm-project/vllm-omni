@@ -402,6 +402,11 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
     def load_model(self, *args, **kwargs) -> None:
         super().load_model(*args, **kwargs)
         self._resolve_duplex_sampling_hook(force=True)
+        multi_frame = getattr(self, "_multi_frame_decode", None)
+        if multi_frame is not None:
+            # Before the serving InputBatch is built (e.g. the MiniCPM-o Talker's
+            # stage config has no vocab_size, so vLLM would report 0).
+            multi_frame.ensure_codec_vocab(self)
 
     def _make_buffer(self, *size, dtype, numpy=True):
         # Prevent ray from pinning the buffer due to large size
@@ -1431,7 +1436,23 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                 sampling_metadata=sampling_metadata,
             )
 
+        multi_frame = getattr(self, "_multi_frame_decode", None)
+        if multi_frame is not None:
+            # A multi-frame step sampled its frames in _model_forward; hand over
+            # that rejection-sampler-shaped output instead of verifying.
+            frames_output = multi_frame.take_sampler_output(self)
+            if frames_output is not None:
+                return frames_output
         return super()._sample(logits, spec_decode_metadata)
+
+    def propose_draft_token_ids(self, scheduler_output, sampled_token_ids, *args, **kwargs):
+        multi_frame = getattr(self, "_multi_frame_decode", None)
+        if multi_frame is not None:
+            # The multi-frame loop's drafts (e.g. the Talker repeats its last codec id).
+            drafts = multi_frame.propose_drafts(self, sampled_token_ids)
+            if drafts is not None:
+                return drafts
+        return super().propose_draft_token_ids(scheduler_output, sampled_token_ids, *args, **kwargs)
 
     @staticmethod
     def _resolve_req_hidden_states(

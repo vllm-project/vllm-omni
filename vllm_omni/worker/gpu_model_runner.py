@@ -95,6 +95,10 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
         self.omni_prefix_cache = None
         self._omni_prefix_cache_cfg = None
         self._sampled_token_ids_cpu_override = None
+        # Model hooks resolved in load_model: a setup run once at the start of
+        # profile_run, and a multi-frame decode loop driven per step.
+        self._omni_post_load = None
+        self._multi_frame_decode = None
         self._omni_query_start_loc_model_kwarg = False
         # Output-payload constant snapshotted once in load_model; the cache
         # policy counterpart lives on PrefixCacheRunnerMixin.
@@ -212,6 +216,29 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
         self._prewarm_attention_capture_workspaces()
         self._report_model_local_kv()
         self._warn_unexposed_stage_hooks(model)
+        # Model-owned setup that needs loaded weights in eval mode (e.g. the
+        # MiniCPM-o duplex streaming audio encoder's CUDA graphs). Deferred to
+        # profile_run: vLLM's Worker.load_model scopes max_split_size_mb=20
+        # around this method, and a CUDA graph pool captured under it cannot
+        # reuse its blocks across captures (MiniCPM-o S0 audio graphs: ~5 GiB
+        # of private pool instead of ~0.4 GiB). In profile_run the profiler
+        # also counts the memory in the stage's budget.
+        post_load = getattr(model, "omni_post_load", None)
+        self._omni_post_load = post_load if callable(post_load) else None
+        # A model that runs several decode frames per step (the MiniCPM-o
+        # Talker K-step on CUDA) hands the runner its loop; None otherwise.
+        self._multi_frame_decode = getattr(model, "multi_frame_decode_hook", None)
+
+    def _run_omni_post_load(self) -> None:
+        """Run the model's ``omni_post_load`` once (see ``load_model``)."""
+        post_load = getattr(self, "_omni_post_load", None)
+        self._omni_post_load = None
+        if post_load is not None:
+            post_load()
+
+    def profile_run(self) -> None:
+        self._run_omni_post_load()
+        super().profile_run()
 
     # Read on the model this runner holds. A multi-stage wrapper that builds its
     # stage module as a child must re-export them, or the runner silently takes
@@ -1459,6 +1486,51 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
                         )
                         for req_index, req_id in enumerate(self.input_batch.req_ids)
                     ]
+                    # Effective per-request sampling params (stage defaults
+                    # merged with request overrides) for in-model sampling
+                    # paths, so the K-step codec sampler keeps the
+                    # single-frame configuration contract. Same order as
+                    # request_sample_eligible / request_token_spans.
+                    model_kwargs_extra["request_sampling_params"] = [
+                        req.sampling_params if (req := self.requests.get(req_id)) is not None else None
+                        for req_id in self.input_batch.req_ids
+                    ]
+                    # Remaining request output budget per request, so the
+                    # in-model K-step codec loop stops emitting frames where the
+                    # engine stops accepting tokens: the scheduler truncates the
+                    # sampled ids at the request limit, but the connector still
+                    # concatenates every emitted codec frame (PR #7929 review).
+                    # Both of the engine's length stops are folded in
+                    # (v1/core/sched/utils.py:111-117): the request's
+                    # max_tokens - num_output_tokens, and the context's
+                    # max_model_len - num_tokens. None means the request carries
+                    # no max_tokens, which leaves the stage-resolved codec budget
+                    # in charge. Same order as request_sampling_params.
+                    context_budget = [
+                        (
+                            self.max_model_len - int(req.num_tokens)
+                            if (req := self.requests.get(req_id)) is not None
+                            else None
+                        )
+                        for req_id in self.input_batch.req_ids
+                    ]
+                    model_kwargs_extra["request_max_tokens_remaining"] = [
+                        (
+                            max(
+                                min(
+                                    int(req.sampling_params.max_tokens) - len(req.output_token_ids),
+                                    context_budget[index],
+                                ),
+                                0,
+                            )
+                            if (req := self.requests.get(req_id)) is not None
+                            and req.sampling_params is not None
+                            and req.sampling_params.max_tokens is not None
+                            and context_budget[index] is not None
+                            else None
+                        )
+                        for index, req_id in enumerate(self.input_batch.req_ids)
+                    ]
             except Exception as e:
                 # Visible on purpose: the fallback is the equal rows-per-request
                 # split, which can re-introduce the cross-request corruption this
@@ -2168,8 +2240,8 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
                 req_ids=self.input_batch.req_ids,
             )
 
-        try:
-            model_output = super()._model_forward(
+        def run_model():
+            return super(OmniGPUModelRunner, self)._model_forward(
                 input_ids=input_ids,
                 positions=positions,
                 intermediate_tensors=intermediate_tensors,
@@ -2177,6 +2249,9 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
                 **model_kwargs,
                 **model_kwargs_extra,
             )
+
+        try:
+            model_output = run_model()
         finally:
             finish_decode_step = getattr(self.model, "finish_decode_step_forward", None)
             if callable(finish_decode_step):
@@ -2193,6 +2268,17 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
             model_output = OmniOutput(*model_output)
         if not isinstance(model_output, (OmniOutput, IntermediateTensors)) and hasattr(self.model, "make_omni_output"):
             model_output = self.model.make_omni_output(model_output, **model_kwargs, **model_kwargs_extra)
+        multi_frame = getattr(self, "_multi_frame_decode", None)
+        if multi_frame is not None:
+            # Model-owned multi-frame step (a no-op for every other step):
+            # replays the forward once per extra frame and stashes the sampled ids.
+            model_output = multi_frame.maybe_run(
+                self,
+                model_output,
+                run_model=run_model,
+                inputs_embeds=inputs_embeds,
+                model_kwargs_extra=model_kwargs_extra,
+            )
         # Cache model output so later sample_tokens can consume multimodal results.
         self._omni_last_model_output = model_output
         return model_output

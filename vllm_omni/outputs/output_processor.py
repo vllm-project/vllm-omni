@@ -109,6 +109,9 @@ class OmniRequestState(RequestState):
         # types (e.g. dict[str, str]) for future multi-output models.
         self.mm_type: str | None = None
         self.mm_accumulated: MultimodalPayload = MultimodalPayload()
+        # Spare-capacity buffers behind keys that CUMULATIVE outputs
+        # re-consolidate on every step (see MultimodalPayload.consolidate_tensors).
+        self._mm_growth: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
 
     def apply_streaming_update(self, update) -> None:
         super().apply_streaming_update(update)
@@ -151,8 +154,11 @@ class OmniRequestState(RequestState):
         except (ValueError, KeyError):
             modality = OutputModality.TEXT
 
+        # Only a CUMULATIVE stream consolidates the same growing keys again on
+        # the next step; DELTA drains them and FINAL_ONLY consolidates once.
+        growth = self._mm_growth if self.output_kind == RequestOutputKind.CUMULATIVE else None
         try:
-            self.mm_accumulated.consolidate_tensors(modality)
+            self.mm_accumulated.consolidate_tensors(modality, growth=growth)
             self.mm_accumulated.consolidate_metadata()
         except (RuntimeError, TypeError, KeyError):
             logger.exception("Error consolidating multimodal tensors")

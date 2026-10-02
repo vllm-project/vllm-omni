@@ -19,6 +19,7 @@ from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import Batch
 from vllm_omni.model_executor.models.minicpmo_4_5.cuda_graph_wrapper import (
     CFMGraphWrapper,
     HiFTGraphWrapper,
+    SharedPromptAttCache,
     WholeEulerCFMGraphWrapper,
 )
 
@@ -103,6 +104,7 @@ def _fake_wrapper(monkeypatch: pytest.MonkeyPatch) -> HiFTGraphWrapper:
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     wrapper = object.__new__(HiFTGraphWrapper)
     wrapper.capture_batch_sizes = [1]
+    wrapper._legit_shapes = {(7, 0), (9, 0)}
     wrapper.graph = {}
     wrapper.static_speech_inputs = {}
     wrapper.static_cache_source_inputs = {}
@@ -164,6 +166,65 @@ def test_multibatch_serial_replay_with_batch1_graph(monkeypatch: pytest.MonkeyPa
     assert speech.shape == (3, 1, 7)
     assert source.shape == (3, 1, 7)
     wrapper.decode_fn.assert_not_called()
+
+
+def test_shape_outside_capture_buckets_never_captures(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An arbitrary duplex first-chunk width must never trigger a capture.
+
+    Such a width is seen once and never reused, so capturing it would stall
+    every stream on the device for a graph that pays for itself once. It must
+    run eagerly over the whole batch instead, even though the lazy budget has
+    room and the batch would otherwise qualify for serial fallback.
+    """
+    wrapper = _fake_wrapper(monkeypatch)
+    speech_feat = torch.randn(3, 80, 14)  # 14 frames is not in {7, 9}
+    cache_source = torch.zeros(3, 1, 0)
+
+    result = wrapper.replay(speech_feat, cache_source)
+
+    wrapper._capture.assert_not_called()
+    assert wrapper.lazy_graph_count == 0
+    wrapper.decode_fn.assert_called_once_with(speech_feat, cache_source)
+    assert result is wrapper.decode_fn.return_value
+
+
+def test_shape_outside_capture_buckets_ignores_lazy_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Budget headroom must not matter: only bucket membership does."""
+    wrapper = _fake_wrapper(monkeypatch)
+    wrapper.max_lazy_graphs = 100
+    speech_feat = torch.randn(1, 80, 14)
+    cache_source = torch.zeros(1, 1, 0)
+
+    wrapper.replay(speech_feat, cache_source)
+
+    wrapper._capture.assert_not_called()
+    wrapper.decode_fn.assert_called_once_with(speech_feat, cache_source)
+
+
+def _bucket_wrapper(extra_codec_chunk_frames: list[int]) -> HiFTGraphWrapper:
+    wrapper = object.__new__(HiFTGraphWrapper)
+    wrapper.codec_chunk_frames = 75
+    wrapper.initial_codec_chunk_frames = 25
+    wrapper.codec_left_context_frames = 3
+    wrapper.pre_lookahead_len = 3
+    wrapper.flow_upsample_rate = 2
+    wrapper.mel_cache_len = 8
+    wrapper.source_cache_len = 3840
+    wrapper.extra_codec_chunk_frames = extra_codec_chunk_frames
+    return wrapper
+
+
+def test_hift_buckets_default_cover_turn_chunks_and_first_chunk() -> None:
+    frames, cache = _bucket_wrapper([]).derive_capture_bucket_size()
+
+    assert list(zip(frames, cache, strict=True)) == [(150, 0), (158, 3840), (50, 0)]
+
+
+def test_hift_buckets_cover_duplex_unit_continuations() -> None:
+    """A 25-token duplex unit after the first one carries the mel and source caches."""
+    frames, cache = _bucket_wrapper([25, 75]).derive_capture_bucket_size()
+
+    assert list(zip(frames, cache, strict=True)) == [(150, 0), (158, 3840), (50, 0), (58, 3840)]
 
 
 # ---------------------------------------------------------------------------
@@ -1007,13 +1068,38 @@ def test_whole_euler_arena_cleaned_when_first_capture_fails(
                 16: [(8, 8), (8, 8)],
             },
         ),
+        # A pinned 12 tier absorbs staggered remainders as one padded replay.
+        (
+            16,
+            3,
+            {
+                9: [(12, 9)],
+                11: [(12, 11)],
+                13: [(16, 13)],
+                17: [(16, 16), (1, 1)],
+                21: [(16, 16), (8, 5)],
+            },
+        ),
+        # The pinned grid stops at micro_batch_size (a batch-4 graph could never replay).
+        (
+            2,
+            0,
+            {
+                1: [(1, 1)],
+                2: [(2, 2)],
+                3: [(2, 2), (1, 1)],
+                5: [(2, 2), (2, 2), (1, 1)],
+            },
+        ),
     ],
 )
 def test_whole_euler_plan_groups_uses_power_of_two_graph_batches(
     micro: int,
     pad_max_rows: int,
     plans: dict[int, list[tuple[int, int]]],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv("VLLM_OMNI_CFM_GRAPH_GRID", "1,2,4,8,12,16")
     wrapper = WholeEulerCFMGraphWrapper(
         estimator=_WholeEulerDiT(),
         n_timesteps=10,
@@ -1025,6 +1111,81 @@ def test_whole_euler_plan_groups_uses_power_of_two_graph_batches(
     for batch_size, plan in plans.items():
         assert wrapper._plan_groups(batch_size) == plan
         assert sum(rows for _, rows in plan) == batch_size
+
+
+@pytest.mark.parametrize(
+    ("micro", "grid", "sizes"),
+    [
+        # The powers of two below micro, and micro: never a tier above it (a
+        # batch that large splits into micro-batches), even for micro 2 or 3.
+        (1, None, [1]),
+        (2, None, [1, 2]),
+        (3, None, [1, 2, 3]),
+        (16, None, [1, 2, 4, 8, 16]),
+        (20, None, [1, 2, 4, 8, 16, 20]),
+        # A pinned grid (the H7 and G2 lanes) drops the sizes above micro.
+        (20, "1,4,8,16,20", [1, 4, 8, 16, 20]),
+        (16, "1,4,8,16,20", [1, 4, 8, 16]),
+        (16, "1,4,8,16", [1, 4, 8, 16]),
+        (2, "4,8", [2]),
+    ],
+)
+def test_whole_euler_graph_batches_default_and_pinned_grid(
+    micro: int, grid: str | None, sizes: list[int], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    if grid is None:
+        monkeypatch.delenv("VLLM_OMNI_CFM_GRAPH_GRID", raising=False)
+    else:
+        monkeypatch.setenv("VLLM_OMNI_CFM_GRAPH_GRID", grid)
+    wrapper = WholeEulerCFMGraphWrapper(
+        estimator=_WholeEulerDiT(), n_timesteps=10, max_graphs=8, micro_batch_size=micro
+    )
+    assert wrapper._graph_batches() == sizes
+
+
+def test_whole_euler_arena_rows_can_follow_pinned_graph_grid(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("VLLM_OMNI_CFM_GRAPH_GRID", "1,4,8,16")
+    wrapper = WholeEulerCFMGraphWrapper(
+        estimator=_WholeEulerDiT(),
+        n_timesteps=10,
+        max_graphs=8,
+        max_graph_batch=20,
+        micro_batch_size=20,
+        arena_rows_from_graph_grid=True,
+    )
+    assert wrapper._arena_rows == 16
+    assert wrapper._plan_groups(20) == [(16, 16), (4, 4)]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for graph capture")
+def test_whole_euler_shared_prompt_cache_is_bit_exact(monkeypatch: pytest.MonkeyPatch) -> None:
+    pool = torch.cuda.graph_pool_handle()
+    monkeypatch.setattr(current_platform, "get_global_graph_pool", lambda: pool)
+    torch.manual_seed(17)
+    estimator = _WholeEulerDiT().eval().cuda()
+    prompt = torch.randn(10, 2, 2, 2, 12, 8, device="cuda")
+    shared = SharedPromptAttCache(prompt[..., :8, :], prompt[..., 8:, :])
+    inputs = _whole_euler_chunk(1, 4)
+
+    def run(att_cache):
+        wrapper = WholeEulerCFMGraphWrapper(
+            estimator=estimator,
+            n_timesteps=10,
+            max_graphs=4,
+            query_bucket_frames=16,
+        )
+        result = wrapper.replay(**inputs, cnn_cache=None, att_cache=[att_cache], att_keep=(12, 4))
+        assert result is not None
+        return (
+            result[0],
+            result[1],
+            result[2][0].materialize() if isinstance(result[2][0], SharedPromptAttCache) else result[2][0],
+        )
+
+    tensor_result = run(prompt)
+    shared_result = run(shared)
+    for actual, expected in zip(shared_result, tensor_result, strict=True):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for graph capture")
@@ -2013,6 +2174,132 @@ def test_whole_euler_query_bucket_keeps_current_first_cache_layout(monkeypatch: 
     bucketed._flush()
 
 
+def _run_stream(wrapper, widths, *, att_keep):
+    """Replay one stream's chunks (full-width, unpadded) and return every chunk's outputs."""
+    torch.manual_seed(11)
+    chunks = [_whole_euler_chunk(1, width) for width in widths]
+    cnn = att = None
+    outputs = []
+    for chunk in chunks:
+        result = wrapper.replay(
+            **{key: value.clone() for key, value in chunk.items()},
+            cnn_cache=cnn,
+            att_cache=att,
+            att_keep=att_keep,
+        )
+        assert result is not None
+        assert all(torch.isfinite(t).all() for t in result)
+        outputs.append(result)
+        cnn, att = result[1], result[2]
+    return outputs
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for graph capture")
+def test_whole_euler_offset_grid_matches_exact_offsets(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Caches padded onto the offset grid solve like exact ones, on fewer graphs.
+
+    The stream's first chunks leave cache lengths 16, 24 and 40 on the way to
+    the steady 64; on a 16-frame grid anchored at 64 those run as 16, 32 and
+    48 with the padding masked out, and every output, cache included, matches.
+    """
+    pool = torch.cuda.graph_pool_handle()
+    monkeypatch.setattr(current_platform, "get_global_graph_pool", lambda: pool)
+
+    # The shipped DiT with the ragged body, as in serving: padded query frames
+    # then leave the CNN cache the unpadded solve would.
+    dit = _tiny_upstream_dit()
+    ragged = BatchedToken2Wav._blocks_forward_chunk_ragged
+    exact = WholeEulerCFMGraphWrapper(
+        estimator=dit, n_timesteps=10, max_graphs=16, query_bucket_frames=16, ragged_body=ragged
+    )
+    gridded = WholeEulerCFMGraphWrapper(
+        estimator=dit,
+        n_timesteps=10,
+        max_graphs=16,
+        query_bucket_frames=16,
+        offset_bucket_frames=16,
+        ragged_body=ragged,
+    )
+    widths = (16, 8, 16, 16, 16)
+    reference = _run_stream(exact, widths, att_keep=(16, 48))
+    results = _run_stream(gridded, widths, att_keep=(16, 48))
+    for ref_chunk, chunk in zip(reference, results, strict=True):
+        for ref_value, value in zip(ref_chunk, chunk, strict=True):
+            torch.testing.assert_close(value, ref_value, rtol=1e-4, atol=1e-5)
+    assert sorted({key[3] for key in exact._cache}) == [0, 16, 24, 40, 56]
+    assert sorted({key[3] for key in gridded._cache}) == [0, 16, 32, 48, 64]
+    exact._flush()
+    gridded._flush()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for graph capture")
+def test_whole_euler_query_width_tuple_matches_one_wide_width(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A narrow chunk on its own narrow graph solves like it does padded onto the wide one."""
+    pool = torch.cuda.graph_pool_handle()
+    monkeypatch.setattr(current_platform, "get_global_graph_pool", lambda: pool)
+
+    # The shipped DiT with the ragged body, as in serving: padded query frames
+    # then leave the CNN cache the unpadded solve would.
+    dit = _tiny_upstream_dit()
+    ragged = BatchedToken2Wav._blocks_forward_chunk_ragged
+    wide = WholeEulerCFMGraphWrapper(
+        estimator=dit, n_timesteps=10, max_graphs=16, query_bucket_frames=32, ragged_body=ragged
+    )
+    tiered = WholeEulerCFMGraphWrapper(
+        estimator=dit, n_timesteps=10, max_graphs=16, query_bucket_frames=(8, 32), ragged_body=ragged
+    )
+    widths = (32, 8, 8, 32)
+    reference = _run_stream(wide, widths, att_keep=(32, 64))
+    results = _run_stream(tiered, widths, att_keep=(32, 64))
+    for ref_chunk, chunk in zip(reference, results, strict=True):
+        for ref_value, value in zip(ref_chunk, chunk, strict=True):
+            torch.testing.assert_close(value, ref_value, rtol=1e-4, atol=1e-5)
+    assert {key[2] for key in wide._cache} == {32}
+    assert {key[2] for key in tiered._cache} == {8, 32}
+    wide._flush()
+    tiered._flush()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for graph capture")
+def test_whole_euler_precapture_leaves_nothing_to_capture_while_serving(monkeypatch: pytest.MonkeyPatch) -> None:
+    pool = torch.cuda.graph_pool_handle()
+    monkeypatch.setattr(current_platform, "get_global_graph_pool", lambda: pool)
+
+    # The shipped DiT with the ragged body, as in serving: padded query frames
+    # then leave the CNN cache the unpadded solve would.
+    dit = _tiny_upstream_dit()
+    ragged = BatchedToken2Wav._blocks_forward_chunk_ragged
+    wrapper = WholeEulerCFMGraphWrapper(
+        estimator=dit,
+        n_timesteps=10,
+        max_graphs=32,
+        micro_batch_size=2,
+        query_bucket_frames=(8, 16),
+        offset_bucket_frames=16,
+        ragged_body=ragged,
+    )
+    chunk = _whole_euler_chunk(1, 8)
+    captured = wrapper.precapture(
+        offsets=range(16, 65),
+        steady=64,
+        channels=int(chunk["x"].shape[1]),
+        spk_dim=int(chunk["speakers_cfg"].shape[1]),
+    )
+    # Graph batches 1 and 2, widths 8 and 16, offsets 16/32/48/64.
+    assert captured == 2 * 2 * 4
+    storage = wrapper.arena._att
+    before = wrapper.stats_snapshot()
+    # The stream's first chunk (offset 0) is the prompt solve, captured on
+    # first use like the prompt features themselves; everything after replays.
+    widths = (16, 8, 16, 8, 16)
+    _run_stream(wrapper, widths, att_keep=(16, 48))
+    after = wrapper.stats_snapshot()
+    assert after["captures"] - before["captures"] == 1
+    assert after["flushes"] == before["flushes"] == 0
+    assert wrapper.arena._att is storage
+    wrapper._flush()
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for graph capture")
 def test_whole_euler_skipped_when_trt_stepper_configured() -> None:
     from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import (
@@ -2218,6 +2505,49 @@ def test_whole_euler_ragged_rows_match_per_row_exact_solves(monkeypatch: pytest.
     wrapper._flush()
 
 
+def test_whole_euler_padded_rows_do_not_keep_a_wider_graphs_lengths() -> None:
+    """A padded ragged replay gets in-range lengths on its padded rows.
+
+    Every query width of one graph batch shares the lengths buffer. The ragged
+    body gathers each row's causal cache at ``length + arange(width)``, so a 56
+    left by a 64-frame graph reads past a 32-frame graph's conv history (a
+    device-side assert in serving).
+    """
+    graph_batch, rows, channels, query_cap = 4, 3, 2, 32
+
+    def zeros(*shape: int) -> torch.Tensor:
+        return torch.zeros(shape)
+
+    statics = wrapper_module._WholeEulerStatics(
+        x=zeros(graph_batch, channels, query_cap),
+        mu_cfg=zeros(2 * graph_batch, channels, query_cap),
+        speakers_cfg=zeros(2 * graph_batch, 3),
+        cond_cfg=zeros(2 * graph_batch, channels, query_cap),
+        cnn_cache=zeros(1, 1, 2 * graph_batch, 1, 1),
+        att_cache=None,
+        attn_mask=torch.ones((2 * graph_batch, query_cap, query_cap), dtype=torch.bool),
+        time_embeddings=None,
+        lengths=torch.full((2 * graph_batch,), 56, dtype=torch.long),
+    )
+    WholeEulerCFMGraphWrapper._fill_static_inputs(
+        statics,
+        graph_batch=graph_batch,
+        start=0,
+        stop=rows,
+        x=zeros(rows, channels, query_cap),
+        mu_cfg=zeros(2 * rows, channels, query_cap),
+        speakers_cfg=zeros(2 * rows, 3),
+        cond_cfg=zeros(2 * rows, channels, query_cap),
+        attn_mask=torch.ones((2 * rows, query_cap, query_cap), dtype=torch.bool),
+        cnn_cache=None,
+        att_cache=None,
+        att_rows=None,
+        offset=0,
+        lengths=torch.tensor((30, 20, 10, 30, 20, 10)),
+    )
+    assert statics.lengths.tolist() == [30, 20, 10, 0, 30, 20, 10, 0]
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for graph capture")
 def test_whole_euler_padded_ragged_replay_after_a_wider_replay(monkeypatch: pytest.MonkeyPatch) -> None:
     """A padded ragged replay is exact after a wider replay of the same graph batch.
@@ -2315,7 +2645,7 @@ def test_whole_euler_request_caches_grow_and_update_in_place(monkeypatch: pytest
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_whole_euler_groups_are_acquired_again_after_a_flush(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_whole_euler_groups_are_acquired_again_after_a_flush() -> None:
     """Capturing a later group can retire an earlier one; no group replays until all are held at once."""
     wrapper = WholeEulerCFMGraphWrapper(estimator=_tiny_upstream_dit(), n_timesteps=10, max_graphs=8)
     calls: list[int] = []
@@ -2326,13 +2656,12 @@ def test_whole_euler_groups_are_acquired_again_after_a_flush(monkeypatch: pytest
             wrapper._stats["flushes"] += 1
         return ("entry", graph_batch, len(calls))
 
-    monkeypatch.setattr(wrapper, "_entry", entry)
     flush_always = False
     groups, fills = [(16, 16), (1, 1)], [None, None]
-    assert wrapper._group_entries(groups, fills) == [("entry", 16, 3), ("entry", 1, 4)]
+    assert wrapper._group_entries(entry, groups, fills) == [("entry", 16, 3), ("entry", 1, 4)]
     assert calls == [16, 1, 16, 1]
     flush_always = True
-    assert wrapper._group_entries(groups, fills) is None
+    assert wrapper._group_entries(entry, groups, fills) is None
 
 
 @pytest.mark.parametrize("fail", [False, True])

@@ -21,6 +21,10 @@ from .base import OmniConnectorBase
 
 logger = get_connector_logger(__name__)
 
+# Where glibc places POSIX shared-memory objects (the lock files live there
+# too). None disables the existence probe on hosts without it.
+_POSIX_SHM_DIR = "/dev/shm" if os.path.isdir("/dev/shm") else None
+
 
 def _wakeup_enabled() -> bool:
     return os.environ.get("VLLM_OMNI_SHM_WAKEUP", "1") == "1"
@@ -147,6 +151,22 @@ class SharedMemoryConnector(OmniConnectorBase):
                 self._wake_generation += 1
         return self._wake_generation != generation
 
+    def wake_self(self) -> None:
+        """Interrupt this receiver's own ``wait_for_change`` (e.g. a new key to poll).
+
+        Writes one byte through the receiver's own write end, so the next (or a
+        blocked) ``wait_for_change`` returns as if a ``put`` had arrived. A full
+        FIFO already holds a pending wakeup, so ``EAGAIN`` is ignored.
+        """
+        with self._wake_lock:
+            fd = self._wake_hold_fd
+            if self._wake_closed or fd is None:
+                return
+            try:
+                os.write(fd, b"\0")
+            except OSError:
+                pass
+
     def _wake_receiver(self, to_stage: Any) -> None:
         if not _wakeup_enabled():
             return
@@ -250,6 +270,13 @@ class SharedMemoryConnector(OmniConnectorBase):
 
     def _get_by_key(self, get_key: str) -> tuple[Any, int] | None:
         """Read a SHM segment addressed purely by *get_key*."""
+        # Receivers poll every pending request about once per millisecond and
+        # nearly every poll misses. os.access reports a missing segment without
+        # building a FileNotFoundError, which is most of the miss cost under
+        # the GIL. A segment that appears after the probe is read next poll,
+        # exactly as a miss inside shm_open is.
+        if _POSIX_SHM_DIR is not None and not os.access(f"{_POSIX_SHM_DIR}/{get_key}", os.F_OK):
+            return None
         shm = None
         try:
             shm = shm_pkg.SharedMemory(name=get_key)

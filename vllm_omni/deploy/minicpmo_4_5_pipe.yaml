@@ -1,0 +1,22 @@
+# Opt-in pipeline hand-off profile (opt/mcpo-pipe measurement). Lossless:
+# none of these switches changes what a step computes, only when stages wait.
+#
+# - Stage 0: stage the streaming audio encoder's host log-mel through pinned
+#   memory, so a prefill step no longer blocks on the previous step's forward.
+# - Stage 2: synchronous scheduling. Code2Wav finishes its GPU work inside the
+#   step (one host copy batch), so vLLM's auto-enabled async batch queue only
+#   held each step's audio until the *next* step had executed.
+# - Stage 2: event-driven idle wait. The chunk receive thread blocks on the
+#   SHM arrival wakeup and the engine loop parks between steps while every
+#   request only waits for a chunk; the value is the fallback bound in seconds.
+base_config: minicpmo_4_5_kstep_best.yaml
+
+stages:
+  - stage_id: 0
+    hf_overrides:
+      duplex_audio_encoder_pinned_h2d: true
+
+  - stage_id: 2
+    async_scheduling: false
+    env:
+      VLLM_OMNI_STAGE_IDLE_WAIT_S: "0.05"

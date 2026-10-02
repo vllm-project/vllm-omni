@@ -1,0 +1,18 @@
+# dxsched_on + Stage-1 K-step frame graphs (opt/mcpo-dx3 measurement overlay).
+#
+# The CUDA K-step Talker decode (worker/gpu_talker_multiframe.py) replays the
+# talker's FULL graph once per frame; with this switch the per-frame tail
+# between those replays (codec head, EOS/penalty/min_tokens shaping, vLLM's
+# sampler, stop/emit bookkeeping, next-frame embedding) also replays as a
+# captured CUDA graph, one set per step shape, captured on its first step
+# (models/minicpmo_4_5/talker_kstep_graph.py). Lossless: seeded rows sample
+# from Philox slot generators that take over the request generators' state,
+# so the codec ids are bit-identical to the eager tail.
+#
+# Stage hf_overrides are replaced per key, so this adds the one key to stage 1.
+base_config: minicpmo_4_5_dxsched_on.yaml
+
+stages:
+  - stage_id: 1
+    hf_overrides:
+      talker_kstep_graph_sampling: true

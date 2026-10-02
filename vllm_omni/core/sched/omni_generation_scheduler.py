@@ -6,11 +6,13 @@ from __future__ import annotations
 import os
 import time
 from collections import defaultdict
+from collections.abc import Container, Iterable
 from typing import TYPE_CHECKING, Any
 
 import torch
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.logger import init_logger
+from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.sched.interface import PauseState
 from vllm.v1.core.sched.output import KVConnectorBlockState, SchedulerOutput
@@ -49,6 +51,51 @@ def _has_async_chunk_payload_to_run(request: Request) -> bool:
     return bool(audio)
 
 
+class StepReleasePolicy:
+    """Opt-in hold/release of ready chunks across steps (``additional_config.step_release_policy``).
+
+    The key is a ``module.path.factory`` name; the factory is called once with
+    the scheduler and returns a policy, or None to stay off. A held request
+    stays queued with its chunk ready and is offered again next step. The base
+    class holds nothing.
+    """
+
+    def held_requests(self, scheduler: OmniGenerationScheduler, now: float) -> Container[str]:
+        return ()
+
+    def on_scheduled(self, request_ids: Iterable[str], now: float) -> None:
+        pass
+
+    def on_output(self, request_id: str, mm_output: Any, now: float) -> None:
+        pass
+
+    def observe_step(self, rows: int, now: float) -> None:
+        pass
+
+    def forget(self, request_id: str) -> None:
+        pass
+
+    def next_release_in(self, now: float) -> float | None:
+        """Seconds until a held chunk is due (None: nothing held)."""
+        return None
+
+
+def _release_policy(scheduler: object) -> StepReleasePolicy | None:
+    policy = getattr(scheduler, "_step_release_policy", None)
+    return policy if isinstance(policy, StepReleasePolicy) else None
+
+
+def _build_release_policy(scheduler: OmniGenerationScheduler) -> StepReleasePolicy | None:
+    additional_config = getattr(scheduler.vllm_config, "additional_config", None)
+    name = additional_config.get("step_release_policy") if isinstance(additional_config, dict) else None
+    if not name:
+        return None
+    policy = resolve_obj_by_qualname(name)(scheduler)
+    if policy is not None and not isinstance(policy, StepReleasePolicy):
+        raise TypeError(f"additional_config.step_release_policy {name!r} must return a StepReleasePolicy or None")
+    return policy
+
+
 class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
     waiting: RequestQueue
 
@@ -75,6 +122,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                 "Generation scheduler decodes first chunks in express steps (min continuation slack %.2f s)",
                 self._express_min_slack_s,
             )
+        self._step_release_policy = _build_release_policy(self)
 
     def _build_generation_scheduler_output(
         self,
@@ -258,6 +306,8 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         self._process_pending_omni_inputs(model_mode="generation")
         self._drop_aborted_queued_requests()
         self._resync_streaming_input_counter()
+        release_policy = _release_policy(self)
+        held = release_policy.held_requests(self, scheduled_timestamp) if release_policy is not None else ()
         async_chunk_transport = self._async_chunk_transport_enabled()
         native_chunks = bool(getattr(self, "_native_data_plane", False) and async_chunk_transport)
         # Parking releases an execution slot, but stateful codecs retain their
@@ -300,6 +350,11 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                 self.chunk_transfer_adapter is None and request.status == RequestStatus.FINISHED_STOPPED
             ):
                 already_finished_reqs.add(request)
+                req_index += 1
+                continue
+
+            if held and request.request_id in held:
+                # The release policy lets this stream wait for a fuller step.
                 req_index += 1
                 continue
 
@@ -371,6 +426,10 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         ):
             request = self.waiting.peek_request()
             if express and request.request_id in self._chunk_started:
+                self.waiting.pop_request()
+                skipped_waiting_requests.add_request(request)
+                continue
+            if held and request.request_id in held:
                 self.waiting.pop_request()
                 skipped_waiting_requests.add_request(request)
                 continue
@@ -447,6 +506,8 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
 
         if first_chunk_express:
             self._chunk_started.update(num_scheduled_tokens)
+        if release_policy is not None:
+            release_policy.on_scheduled(num_scheduled_tokens, scheduled_timestamp)
 
         # Return skipped waiting requests
         if skipped_waiting_requests:
@@ -543,6 +604,11 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
 
         return self._wrap_omni_scheduler_output(scheduler_output)
 
+    def next_release_in(self) -> float | None:
+        """Seconds until the release policy's earliest held chunk is due (None: nothing held)."""
+        release_policy = _release_policy(self)
+        return None if release_policy is None else release_policy.next_release_in(time.monotonic())
+
     def _continuations_have_slack(self) -> bool:
         """Whether every started stream with a chunk ready to decode can wait one express step."""
         now = time.monotonic()
@@ -589,6 +655,9 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         if getattr(self, "_first_chunk_express", False):
             self._chunk_started.discard(request.request_id)
             getattr(self, "_stream_audio", {}).pop(request.request_id, None)
+        release_policy = _release_policy(self)
+        if release_policy is not None:
+            release_policy.forget(request.request_id)
         if self.input_coordinator is None:
             return super()._free_request(request, delay_free_blocks)
 
@@ -614,6 +683,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         ec_connector_output = getattr(model_runner_output, "ec_connector_output", None)
 
         cudagraph_stats: CUDAGraphStat | None = model_runner_output.cudagraph_stats
+        release_policy = _release_policy(self)
 
         # Every GPU write enqueued by this and earlier steps has completed, so
         # it is safe to return deferred-free blocks to the pool. This is the
@@ -736,6 +806,8 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             mm_output = mm_outputs[req_index] if mm_outputs else None
             if getattr(self, "_express_min_slack_s", 0) > 0 and self._first_chunk_express:
                 self._record_stream_audio(req_id, mm_output)
+            if release_policy is not None:
+                release_policy.on_output(req_id, mm_output, time.monotonic())
             status_before_stop = request.status
             finish_reason = None
             is_segment_finished = False
@@ -929,6 +1001,9 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         )
 
         self._capture_omni_connector_output(model_runner_output)
+
+        if release_policy is not None:
+            release_policy.observe_step(len(num_scheduled_tokens), time.monotonic())
 
         return engine_core_outputs
 

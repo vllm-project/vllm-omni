@@ -86,3 +86,36 @@ def test_default_prompt_wav_follows_resolved_model_path(monkeypatch, tmp_path):
     model = MiniCPMO45Code2Wav(vllm_config=config)
     model.model_path = "/resolved/snapshot"
     assert model._default_prompt_wav == "/resolved/snapshot/assets/HT_ref_audio.wav"
+
+
+def _config_with_extra(extra: dict, *, max_num_seqs=None):
+    scheduler_config = SimpleNamespace(max_num_seqs=max_num_seqs) if max_num_seqs is not None else None
+    return SimpleNamespace(
+        model_config=SimpleNamespace(
+            model="/fake/model",
+            stage_connector_config={"extra": extra},
+        ),
+        scheduler_config=scheduler_config,
+    )
+
+
+@pytest.mark.parametrize(
+    ("extra", "max_num_seqs", "sizes"),
+    [
+        ({}, None, [1, 2, 4, 8, 16, 32]),
+        ({}, 6, [1, 2, 4, 6]),
+        ({"hift_graph_capture_batch_sizes": [1, 3]}, None, [1, 3]),
+    ],
+)
+def test_hift_capture_batch_sizes(monkeypatch, tmp_path, extra, max_num_seqs, sizes):
+    """By default every vocoder batch up to min(max_num_seqs, 32) rounds up to a captured size."""
+    _no_hub(monkeypatch, tmp_path)
+    config = _config_with_extra({"enable_hift_graph": True, **extra}, max_num_seqs=max_num_seqs)
+    assert MiniCPMO45Code2Wav(vllm_config=config)._hift_graph_config["capture_batch_sizes"] == sizes
+
+
+@pytest.mark.parametrize(("extra", "frames"), [({}, []), ({"hift_graph_codec_chunk_frames": [25, 75]}, [25, 75])])
+def test_hift_graph_codec_chunk_frames_reach_the_connector_config(monkeypatch, tmp_path, extra, frames):
+    _no_hub(monkeypatch, tmp_path)
+    config = _config_with_extra({"enable_hift_graph": True, **extra})
+    assert MiniCPMO45Code2Wav(vllm_config=config)._connector_config["hift_graph_codec_chunk_frames"] == frames

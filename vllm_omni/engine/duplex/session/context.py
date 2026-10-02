@@ -33,6 +33,7 @@ if TYPE_CHECKING:
     from vllm_omni.engine.duplex.plugin import DuplexModelPlugin, DuplexModelSessionState
     from vllm_omni.engine.duplex.session.engine_session import DuplexEngineSession
     from vllm_omni.engine.duplex.session.manager import DuplexSessionManager
+    from vllm_omni.engine.duplex.session.pacing import SessionPacing
     from vllm_omni.metrics.stats import StageRequestStats
 
 _OffloadT = TypeVar("_OffloadT")
@@ -62,6 +63,9 @@ class DuplexRunState:
     #: assistant audio is still draining. Cleared on barge-in/cancel, or when
     #: the next ephemeral turn begins. Orthogonal to barge-in (which aborts).
     concurrent_turn_requests_released: bool = False
+    #: Output pacing / playback-cut state (``duplex_session.pacing`` or
+    #: ``barge_cut_on_model_yield``); None keeps every historical path.
+    pace: SessionPacing | None = None
 
 
 class RunnerServices(Protocol):

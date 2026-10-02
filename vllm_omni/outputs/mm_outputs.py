@@ -70,6 +70,75 @@ def _consolidate_tensor_list(
         return torch.cat([chunk.reshape(-1) for chunk in tensor_list], dim=0)
 
 
+# Spare capacity reserved when a growth buffer is (re)allocated: each sample is
+# copied about 1 / (factor - 1) times amortized instead of once per
+# consolidation, and at most 25% of the stream is slack.
+_GROWTH_FACTOR = 1.25
+
+
+def _append_into_growth_buffer(
+    key: str,
+    tensor_list: list[torch.Tensor],
+    growth: dict[str, tuple[torch.Tensor, torch.Tensor]],
+    *,
+    along_dim0: bool = False,
+) -> torch.Tensor | None:
+    """Concatenate chunks in place, or return ``None`` to use ``torch.cat``.
+
+    A CUMULATIVE stream consolidates ``[everything so far, new chunk]`` on
+    every step, so ``torch.cat`` recopies the whole stream per chunk (O(T^2)
+    over a long duplex epoch). When the head is the view this function
+    returned last time, the new chunks are written into the storage behind it
+    and a longer prefix view is returned. Earlier views are never written, so
+    outputs already handed out keep their values.
+
+    Chunks must share dtype and device. They must be 1-D, or, when
+    ``along_dim0`` (the strategy concatenates along dim 0), any rank with
+    the same trailing shape -- e.g. the Thinker's ``[T, hidden]`` latent rows.
+    The view then equals ``torch.cat(tensor_list, dim=0)`` element for element.
+    """
+    head = tensor_list[0]
+    dtype = head.dtype
+    device = head.device
+    trailing = tuple(head.shape[1:]) if isinstance(head, torch.Tensor) else ()
+    for tensor in tensor_list:
+        if (
+            not isinstance(tensor, torch.Tensor)
+            or tensor.ndim == 0
+            or (tensor.ndim != 1 and not along_dim0)
+            or tuple(tensor.shape[1:]) != trailing
+            or tensor.dtype != dtype
+            or tensor.device != device
+            or tensor.requires_grad
+        ):
+            growth.pop(key, None)
+            return None
+    state = growth.get(key)
+    if state is not None and state[1] is head:
+        storage, _ = state
+        start = head.shape[0]
+        chunks = tensor_list[1:]
+    else:
+        storage = None
+        start = 0
+        chunks = tensor_list
+    needed = start + sum(chunk.shape[0] for chunk in chunks)
+    if storage is None or needed > storage.shape[0]:
+        rows = max(needed, int(needed * _GROWTH_FACTOR))
+        grown = torch.empty((rows, *trailing), dtype=dtype, device=device)
+        if start:
+            grown[:start].copy_(storage[:start])
+        storage = grown
+    offset = start
+    for chunk in chunks:
+        length = chunk.shape[0]
+        storage[offset : offset + length].copy_(chunk)
+        offset += length
+    view = storage[:needed]
+    growth[key] = (storage, view)
+    return view
+
+
 def _append_entries(store: dict[str, Any], incoming: dict[str, Any]) -> None:
     """Append *incoming* entries into *store*.
 
@@ -174,7 +243,11 @@ class MultimodalPayload(Mapping):
             self.metadata[key] = value
         return self
 
-    def consolidate_tensors(self, modality: OutputModality) -> None:
+    def consolidate_tensors(
+        self,
+        modality: OutputModality,
+        growth: dict[str, tuple[torch.Tensor, torch.Tensor]] | None = None,
+    ) -> None:
         """Concatenate deferred tensor lists into single tensors.
 
         Tensors are generated content accumulated as chunks, so each key's
@@ -185,6 +258,9 @@ class MultimodalPayload(Mapping):
         key can be registered for a different strategy -- e.g. a codec-frame
         matrix that grows along dim 0 rather than the waveform-tuned default
         for its modality -- via ``register_key_accumulation_strategy``.
+
+        *growth* is caller-owned state for a stream consolidated repeatedly
+        (see ``_append_into_growth_buffer``); results are value-identical.
         """
         # Relocate scalar metadata tensors (e.g. sample rate) that from_dict
         # routed into .tensors, so they take the REPLACE path via .metadata
@@ -198,7 +274,17 @@ class MultimodalPayload(Mapping):
         for key, value in list(self.tensors.items()):
             if _is_tensor_list(value):
                 strategy = get_accumulation_strategy(modality, key)
-                self.tensors[key] = _consolidate_tensor_list(key, value, strategy)
+                # 1-D chunks concatenate identically along dim 0 and -1, so any
+                # concatenating strategy may reuse the caller's growth buffers;
+                # higher-rank chunks only when the strategy grows dim 0.
+                grown = (
+                    _append_into_growth_buffer(
+                        key, value, growth, along_dim0=strategy is not TensorAccumulationStrategy.CONCAT_LAST
+                    )
+                    if growth is not None and strategy is not TensorAccumulationStrategy.REPLACE
+                    else None
+                )
+                self.tensors[key] = grown if grown is not None else _consolidate_tensor_list(key, value, strategy)
 
     def consolidate_metadata(self) -> None:
         """Resolve deferred tensor lists in metadata by keeping the latest value.

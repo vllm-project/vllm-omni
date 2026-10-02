@@ -13,14 +13,20 @@ import torch
 import torch.nn as nn
 
 import vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav as batched_token2wav_module
+import vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_code2wav as code2wav_module
 from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import (
     BatchedToken2Wav,
+    BatchedToken2WavState,
     _token2wav_sdpa_context,
     plan_token2wav_encode_slices,
     relpos_encode_token_budget,
+    row_offset_signature,
+    state_shape_signature,
 )
+from vllm_omni.model_executor.models.minicpmo_4_5.cuda_graph_wrapper import AttSlotPool
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_code2wav import (
     MiniCPMO45Code2Wav,
+    _BucketStats,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -173,7 +179,7 @@ def _config(minimum: int = 1, initial: int = 0, *, runtime_prompt_cache_size: in
 
 
 @pytest.mark.parametrize(
-    ("extra", "max_num_seqs", "micro"), [({}, 6, 6), ({}, 64, 16), ({"micro_batch_size": 2}, 6, 2)]
+    ("extra", "max_num_seqs", "micro"), [({}, 6, 6), ({}, 64, 64), ({"micro_batch_size": 2}, 6, 6)]
 )
 def test_whole_euler_micro_batch_defaults_to_stage_concurrency(extra, max_num_seqs, micro):
     config = _config()
@@ -183,6 +189,47 @@ def test_whole_euler_micro_batch_defaults_to_stage_concurrency(extra, max_num_se
     model = MiniCPMO45Code2Wav(vllm_config=config)
 
     assert model._cfm_graph_config["micro_batch_size"] == micro
+    assert model._cfm_graph_config["max_graph_batch"] == micro
+
+
+def test_stage2_memory_switches_are_opt_in():
+    config = _config()
+    config.model_config.stage_connector_config["extra"].update(
+        {
+            "cfm_prompt_att_sharing": True,
+            "cfm_arena_rows_from_graph_grid": True,
+        }
+    )
+    model = MiniCPMO45Code2Wav(vllm_config=config)
+    assert model._cfm_graph_config["prompt_att_sharing"] is True
+    assert model._cfm_graph_config["arena_rows_from_graph_grid"] is True
+
+    default = MiniCPMO45Code2Wav(vllm_config=_config())
+    assert default._cfm_graph_config["prompt_att_sharing"] is False
+    assert default._cfm_graph_config["arena_rows_from_graph_grid"] is False
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_precapture_empty_cache_is_opt_in_and_runs_once_after_precapture(enabled, monkeypatch):
+    config = _config()
+    if enabled:
+        config.model_config.stage_connector_config["extra"]["cfm_precapture_empty_cache"] = True
+    model = MiniCPMO45Code2Wav(vllm_config=config)
+    assert model._precapture_empty_cache is enabled
+    assert MiniCPMO45Code2Wav(vllm_config=_config())._precapture_empty_cache is False
+    calls = []
+    model.backend = SimpleNamespace()
+    model._precapture_pending = True
+
+    def precapture():
+        calls.append("precapture")
+        model._precapture_pending = False
+
+    monkeypatch.setattr(model, "_precapture_default_prompt", precapture)
+    monkeypatch.setattr(model, "_release_precapture_cache", lambda: calls.append("release"))
+    model.forward(input_ids=torch.empty(0, dtype=torch.long))
+    model.forward(input_ids=torch.empty(0, dtype=torch.long))
+    assert calls == (["precapture", "release"] if enabled else ["precapture"])
 
 
 def _model(initial: int = 0, minimum: int = 1, *, runtime_prompt_cache_size: int = 4, setup_cache_size: int = 1):
@@ -1809,3 +1856,223 @@ def test_padding_does_not_change_the_valid_frames():
 
     assert int(padded_x.shape[2]) == int(exact_x.shape[2]) == mel_frames
     assert torch.allclose(padded_x, exact_x, atol=1e-5)
+
+
+@pytest.mark.parametrize(
+    ("config", "env", "mode"),
+    [
+        ({}, None, "off"),
+        ({"code2wav_allow_tf32": True}, None, "all"),
+        ({"code2wav_allow_tf32": "flow"}, None, "flow"),
+        ({"code2wav_allow_tf32": True}, "0", "off"),
+        ({}, "flow", "flow"),
+        ({}, "1", "all"),
+        ({"token2wav_allow_tf32": True}, None, "all"),
+        ({"token2wav_allow_tf32": True}, "0", "all"),
+    ],
+)
+def test_code2wav_tf32_mode(monkeypatch, config, env, mode):
+    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_code2wav import _tf32_mode
+
+    if env is None:
+        monkeypatch.delenv("MINICPMO_CODE2WAV_TF32", raising=False)
+    else:
+        monkeypatch.setenv("MINICPMO_CODE2WAV_TF32", env)
+    assert _tf32_mode(config) == mode
+
+
+def test_precapture_scopes_flow_tf32_to_whole_euler_graphs_only():
+    # A graph replays the kernels it was captured with, so the flow TF32 scope
+    # must cover the Whole-Euler precapture (otherwise every serving replay
+    # runs fp32 SGEMM) and must not leak into the HiFT capture.
+    backend = BatchedToken2Wav(_FakeToken2Wav(), cfm_tf32=True)
+    seen = {}
+
+    class _Wrapper:
+        enabled = True
+        device = torch.device("cpu")
+        graph: dict = {}
+
+        def precapture(self, **kwargs):
+            seen["whole_euler"] = torch.backends.cuda.matmul.allow_tf32
+            return 1
+
+        def capture(self):
+            seen["hift"] = torch.backends.cuda.matmul.allow_tf32
+
+    backend._whole_euler_graph_wrapper = _Wrapper()
+    backend.hift_graph_wrapper = _Wrapper()
+    backend.flow.spk_embed_affine_layer = nn.Linear(1, 3)
+    before = torch.backends.cuda.matmul.allow_tf32
+    try:
+        torch.backends.cuda.matmul.allow_tf32 = False
+        assert backend.precapture_whole_euler(SimpleNamespace(mels=torch.zeros(1, 4, 2))) == 1
+        backend.precapture_hift()
+        assert torch.backends.cuda.matmul.allow_tf32 is False
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = before
+    assert seen == {"whole_euler": True, "hift": False}
+
+
+def _att_pool(slots: int = 4) -> AttSlotPool:
+    return AttSlotPool(
+        n_timesteps=1,
+        depth=1,
+        heads=1,
+        width=2,
+        slots=slots,
+        frames=16,
+        suffix=2,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+
+
+def _resident_state(pool: AttSlotPool | None, frames: int, *, mel_cache: int = 1) -> BatchedToken2WavState:
+    """A continuation state whose estimator cache is resident in ``pool`` (a tensor when ``pool`` is None)."""
+    estimator_att = torch.zeros(1, 1, 2, 1, frames, 2)
+    return BatchedToken2WavState(
+        flow_cache={
+            "conformer_cnn_cache": torch.zeros(1, 1, 1),
+            "conformer_att_cache": torch.zeros(1, 1, 1, frames, 1),
+            "estimator_cnn_cache": torch.zeros(1, 1, 2, 1, 1),
+            "estimator_att_cache": estimator_att if pool is None else pool.adopt(estimator_att),
+        },
+        hift_cache={"mel": torch.zeros(1, 1, mel_cache), "source": torch.zeros(1, 1, 2), "speech": torch.zeros(1, 2)},
+    )
+
+
+def _continuation(state: BatchedToken2WavState | None) -> SimpleNamespace:
+    previous = None if state is None else SimpleNamespace(token2wav=state)
+    return SimpleNamespace(previous=previous, prompt_cache_id="p", prompt_wav="w", cache_epoch=0)
+
+
+def test_row_offset_merge_is_opt_in_and_drops_only_slot_cache_lengths_from_the_key():
+    model = MiniCPMO45Code2Wav(vllm_config=_config())
+    assert model._row_offset_merge is False
+    assert model._cfm_graph_config["row_offset_merge"] is False
+    assert BatchedToken2Wav(_FakeToken2Wav())._row_offset_merge is False
+    config = _config()
+    config.model_config.stage_connector_config["extra"]["cfm_row_offset_merge"] = True
+    assert MiniCPMO45Code2Wav(vllm_config=config)._cfm_graph_config["row_offset_merge"] is True
+    assert BatchedToken2Wav(_FakeToken2Wav(), cfm_graph_config={"row_offset_merge": True})._row_offset_merge is True
+
+    pool = _att_pool()
+    second, steady = _continuation(_resident_state(pool, 5)), _continuation(_resident_state(pool, 7))
+    key = MiniCPMO45Code2Wav._bucket_key
+    # Off: the historical key, which holds each cache length.
+    assert key(second) == ("p", "w", state_shape_signature(second.previous.token2wav), 0)
+    assert key(second) != key(steady)
+    assert key(second, row_offsets=True) == key(steady, row_offsets=True)
+    signature = row_offset_signature(steady.previous.token2wav)
+    assert key(steady, row_offsets=True) == ("p", "w", ("row_offsets", signature), 0)
+    assert key(steady, cross_turn=True, row_offsets=True) == ("p", "w", ("row_offsets", signature))
+    flow = dict(signature[0])
+    assert flow["estimator_att_cache"][0] == (1, 1, 2, 1, -1, 2)
+    assert flow["conformer_att_cache"][0] == (1, 1, 1, -1, 1)
+    assert flow["estimator_cnn_cache"][0] == (1, 1, 2, 1, 1)
+    # Every other cache shape stays in the key.
+    assert key(_continuation(_resident_state(pool, 7, mel_cache=2)), row_offsets=True) != key(steady, row_offsets=True)
+    # Fresh streams and tensor caches (the arena path) keep their keys.
+    fresh = _continuation(None)
+    assert key(fresh, row_offsets=True) == key(fresh)
+    tensor_row = _continuation(_resident_state(None, 5))
+    assert key(tensor_row, row_offsets=True) == key(tensor_row)
+
+
+def test_row_offset_merge_needs_resident_rows_of_one_slot_pool():
+    pool = _att_pool()
+    states = [_resident_state(pool, 5), _resident_state(pool, 7)]
+    backend = BatchedToken2Wav(_FakeToken2Wav(), cfm_graph_config={"row_offset_merge": True})
+    # No ragged Whole-Euler graphs, no merge.
+    assert backend.can_merge_row_offsets(states, [2, 2]) is False
+    backend._whole_euler_graph_wrapper = SimpleNamespace(enabled=True, ragged_body=object(), slot_pool=pool)
+    assert backend.can_merge_row_offsets(states, [2, 2]) is True
+    assert backend.can_merge_row_offsets(states[:1], [2]) is False
+    assert backend.can_merge_row_offsets([states[0], _resident_state(None, 7)], [2, 2]) is False
+    assert backend.can_merge_row_offsets([states[0], _resident_state(_att_pool(), 7)], [2, 2]) is False
+    backend._row_offset_merge = False
+    assert backend.can_merge_row_offsets(states, [2, 2]) is False
+
+
+def _second_chunk_next_to_steady(model):
+    """Streams ``a`` and ``b`` on their third chunk next to ``c``'s second: the last forward's output."""
+    _forward(model, [_info("a", 0, [1, 2]), _info("b", 0, [3, 4])])
+    _forward(model, [_info("a", 1, [5, 6]), _info("b", 1, [7, 8])])
+    _forward(model, [_info("c", 0, [9, 10])])
+    return _forward(model, [_info("a", 2, [11, 12]), _info("b", 2, [13, 14]), _info("c", 1, [15, 16])])
+
+
+def _row_offset_model(monkeypatch, *, mergeable: bool):
+    """A fake-backend model with ``cfm_row_offset_merge`` on; continuation rows count as slot-pool rows."""
+    model, token2wav = _model()
+    model._row_offset_merge = True
+    model.backend._row_offset_merge = True
+    model._bucket_stats = _BucketStats(every=1000)
+    monkeypatch.setattr(code2wav_module, "_slot_resident", lambda item: item.previous is not None)
+    if mergeable:
+        monkeypatch.setattr(model.backend, "can_merge_row_offsets", lambda states, counts: True)
+    return model, token2wav
+
+
+def test_row_offset_merge_decodes_a_second_chunk_with_steady_rows(monkeypatch):
+    split_model, split_t2w = _model()
+    split = _second_chunk_next_to_steady(split_model)
+    # Off: the second chunk (cache 4 + 1 frames) and the steady rows (4 + 2) are two buckets.
+    assert split_t2w.hift.calls[-2:] == [2, 1]
+    assert [state.token2wav.flow_cache["estimator_att_cache"].shape[4] for state in split_model._states.values()] == [
+        7,
+        7,
+        6,
+    ]
+
+    merged_model, merged_t2w = _row_offset_model(monkeypatch, mergeable=True)
+    merged = _second_chunk_next_to_steady(merged_model)
+    # On: one decode and one vocoder call; the encoder still runs once per conformer cache length.
+    assert merged_t2w.hift.calls[-1:] == [3]
+    assert merged_t2w.flow.encoder.calls[-2:] == [2, 1]
+    stats = merged_model._bucket_stats
+    assert (stats.forwards, stats.decodes, stats.decoded_rows, stats.reasons) == (4, 4, 8, {})
+    for got, want in zip(
+        merged.multimodal_outputs["model_outputs"], split.multimodal_outputs["model_outputs"], strict=True
+    ):
+        torch.testing.assert_close(got, want, rtol=0, atol=1e-6)
+    for request_id, state in split_model._states.items():
+        merged_state = merged_model._states[request_id]
+        for name, expected in {**state.token2wav.flow_cache, **state.token2wav.hift_cache}.items():
+            actual = {**merged_state.token2wav.flow_cache, **merged_state.token2wav.hift_cache}[name]
+            torch.testing.assert_close(actual, expected, rtol=0, atol=1e-6, msg=f"{request_id} {name}")
+
+
+def test_row_offset_bucket_the_backend_refuses_splits_back_into_signature_buckets(monkeypatch):
+    split_model, _ = _model()
+    split = _second_chunk_next_to_steady(split_model)
+
+    model, token2wav = _row_offset_model(monkeypatch, mergeable=False)
+    output = _second_chunk_next_to_steady(model)
+    assert token2wav.hift.calls[-2:] == [2, 1]
+    assert model._bucket_stats.reasons == {"row_offset_merge_rejected": 1}
+    for got, want in zip(
+        output.multimodal_outputs["model_outputs"], split.multimodal_outputs["model_outputs"], strict=True
+    ):
+        torch.testing.assert_close(got, want, rtol=0, atol=0)
+
+
+def test_projected_speaker_does_not_depend_on_the_batch_size():
+    torch.manual_seed(0)
+    layer = nn.Linear(6, 4)
+    rows_seen: list[int] = []
+    layer.register_forward_pre_hook(lambda _module, args: rows_seen.append(int(args[0].shape[0])))
+    backend = SimpleNamespace(flow=SimpleNamespace(spk_embed_affine_layer=layer))
+    speaker = torch.randn(1, 6)
+
+    with torch.no_grad():
+        single = BatchedToken2Wav._project_speakers(backend, speaker.expand(1, -1))
+        batched = BatchedToken2Wav._project_speakers(backend, speaker.expand(5, -1))
+        distinct = BatchedToken2Wav._project_speakers(backend, torch.randn(3, 6))
+
+    # One prompt speaker expanded over the batch projects as a single row.
+    assert rows_seen == [1, 1, 3]
+    assert batched.shape == (5, 4) and batched.is_contiguous()
+    assert torch.equal(batched, single.expand(5, -1))
+    assert distinct.shape == (3, 4)

@@ -310,6 +310,7 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
                 "fence": context.fence,
                 "epoch": context.fence.epoch,
                 "turn_id": context.fence.turn_id,
+                "config_generation": context.config_generation,
                 "session_config": dict(context.session_config),
                 "runtime_config": dict(context.runtime_config),
             }
