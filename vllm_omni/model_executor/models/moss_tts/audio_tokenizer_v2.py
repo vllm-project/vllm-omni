@@ -700,6 +700,8 @@ class MossAudioTokenizerMultiheadAttention(StreamingModule):
 
         self._register_load_state_dict_pre_hook(self._load_hook, with_module=True)
 
+        self._cached_attn_bias: torch.Tensor | None = None
+
     @staticmethod
     def _load_hook(module, state_dict, prefix, *_):
         mappings = {
@@ -767,6 +769,7 @@ class MossAudioTokenizerMultiheadAttention(StreamingModule):
         key: torch.Tensor,
         value: torch.Tensor,
         execution_context: StreamingExecutionContext | None = None,
+        attn_bias: torch.Tensor | None = None,
     ):
         state = cast(MHAState | None, self._streaming_state)
         B, T = query.shape[:2]
@@ -792,17 +795,19 @@ class MossAudioTokenizerMultiheadAttention(StreamingModule):
             q, k = self.rope(q, k, offset, time_before_heads=False)
 
         k, v, pos_k = self._complete_kv(k, v, execution_context)
-        pos_k = pos_k[:, None]
 
-        if self.causal:
-            pos_q = offset.view(-1, 1, 1) + torch.arange(T, device=q.device, dtype=torch.long).view(-1, 1)
-            delta = pos_q - pos_k
-            attn_bias = (pos_k >= 0) & (delta >= 0)
-            if self.context is not None:
-                attn_bias = attn_bias & (delta < self.context)
-            attn_bias = attn_bias[:, None]
-        else:
-            attn_bias = None
+        if attn_bias is None:
+            pos_k = pos_k[:, None]
+            if self.causal:
+                pos_q = offset.view(-1, 1, 1) + torch.arange(T, device=q.device, dtype=torch.long).view(-1, 1)
+                delta = pos_q - pos_k
+                attn_bias = (pos_k >= 0) & (delta >= 0)
+                if self.context is not None:
+                    attn_bias = attn_bias & (delta < self.context)
+                attn_bias = attn_bias[:, None]
+            else:
+                attn_bias = None
+            self._cached_attn_bias = attn_bias
 
         streaming_attention = getattr(self, "_streaming_attention", None)
         if (
@@ -943,24 +948,30 @@ class MossAudioTokenizerTransformerLayer(StreamingModule):
                 update = apply_weights_per_step(self.gating, self.weights_per_step_schedule, x, offset)
             else:
                 update = self.gating(x)
+        if isinstance(self.layer_scale_2, MossAudioTokenizerLayerScale):
+            return torch.addcmul(x_orig.to(update), update, self.layer_scale_2.scale)
         return x_orig.to(update) + self.layer_scale_2(update)
 
     def _sa_block(
         self,
         x: torch.Tensor,
         execution_context: StreamingExecutionContext | None = None,
+        attn_bias: torch.Tensor | None = None,
     ):
         x_orig = x
         x = self.norm1(x)
-        update = self.self_attn(x, x, x, execution_context=execution_context)
+        update = self.self_attn(x, x, x, execution_context=execution_context, attn_bias=attn_bias)
+        if isinstance(self.layer_scale_1, MossAudioTokenizerLayerScale):
+            return torch.addcmul(x_orig.to(update), update, self.layer_scale_1.scale)
         return x_orig.to(update) + self.layer_scale_1(update)
 
     def forward(
         self,
         x: torch.Tensor,
         execution_context: StreamingExecutionContext | None = None,
+        attn_bias: torch.Tensor | None = None,
     ):
-        x = self._sa_block(x, execution_context)
+        x = self._sa_block(x, execution_context, attn_bias)
         x = self._ff_block(x, execution_context)
         state = self._streaming_state
         if state is not None and execution_context is None:
@@ -1063,8 +1074,13 @@ class MossAudioTokenizerTransformer(StreamingModule):
             pos_emb = create_sin_embedding(positions, C, max_period=self.max_period, dtype=x.dtype)
             x = x + self.positional_scale * pos_emb
 
-        for layer in self.layers:
-            x = layer(x, *args, **kwargs)
+        shared_attn_bias: torch.Tensor | None = None
+        for i, layer in enumerate(self.layers):
+            if i == 0:
+                x = layer(x, *args, attn_bias=None, **kwargs)
+                shared_attn_bias = layer.self_attn._cached_attn_bias
+            else:
+                x = layer(x, *args, attn_bias=shared_attn_bias, **kwargs)
 
         if state is not None:
             assert isinstance(state, TransformerState)
