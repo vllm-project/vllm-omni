@@ -26,6 +26,9 @@ self-check.
 
 - [`add-diffusion-model`](add-diffusion-model/SKILL.md): guides integration of
   a new diffusion model into `vllm-omni`
+- [`add-recipe`](add-recipe/SKILL.md): creates or updates in-repository model
+  recipes with verified task/input/output contracts, concrete hardware,
+  shared feature-guide links, exact commands, and qualification evidence
 - [`add-tts-model`](add-tts-model/SKILL.md): covers integration of new TTS
   models and related serving workflows
 - [`diffusion-perf-opt`](diffusion-perf-opt/SKILL.md): guides diffusion model
@@ -56,6 +59,14 @@ self-check.
   wiring (`test-ready.yml`, `test-merge.yml`, `test-nightly.yml`,
   `test-weekly.yml`), and copy-paste local plus CI-like `pytest` commands; see
   `references/test-routing.md` for level-to-command mapping
+
+## MiniMax H3 Creative Skills
+
+The [portable H3 collection](../../.agents/skills/README.md) contains the prompt
+writing skill and eight creative workflows for product ads, 3D shorts, paper art,
+brand promos, music videos, co-op intros, and hand-drawn/live-action fusion.
+Same-named directories here link to the canonical `.agents/skills/` copies, so
+Claude Code and Codex use the same instructions and templates.
 
 ## Maintenance Guidelines
 

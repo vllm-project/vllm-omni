@@ -9,6 +9,7 @@ import pytest
 
 import vllm_omni.diffusion.stage_diffusion_proc as stage_diffusion_proc
 import vllm_omni.plugins as omni_plugins
+from vllm_omni.diffusion.data import DIFFUSION_REQUEST_LIFECYCLE_KEY, DIFFUSION_REQUEST_STARTED
 from vllm_omni.diffusion.stage_diffusion_proc import StageDiffusionProc
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
@@ -101,6 +102,49 @@ async def test_proc_streaming_request_yields_each_engine_chunk():
     assert [output.request_id for output in outputs] == ["req-stream", "req-stream"]
     assert [output.finished for output in outputs] == [False, True]
     assert captured["request"].kv_sender_info == {0: {"host": "127.0.0.1"}}
+
+
+@pytest.mark.asyncio
+async def test_proc_non_streaming_forwards_lifecycle_before_final_output():
+    lifecycle = OmniRequestOutput.from_diffusion(
+        request_id="",
+        images=[],
+        custom_output={DIFFUSION_REQUEST_LIFECYCLE_KEY: DIFFUSION_REQUEST_STARTED},
+        finished=False,
+    )
+    intermediate = OmniRequestOutput.from_diffusion(
+        request_id="",
+        images=[],
+        custom_output={"chunk": 0},
+        finished=False,
+    )
+    final = OmniRequestOutput.from_diffusion(request_id="", images=[], finished=True)
+
+    class _LifecycleEngine:
+        async def step_streaming(self, request):
+            del request
+            yield [lifecycle]
+            yield [intermediate]
+            yield [final]
+
+    stage_proc = object.__new__(StageDiffusionProc)
+    stage_proc._engine = _LifecycleEngine()
+    intermediate_outputs = []
+
+    async def _capture(output):
+        intermediate_outputs.append(output)
+
+    result = await stage_proc._process_request(
+        request_id="req-lifecycle",
+        prompt="prompt",
+        sampling_params_dict=asdict(OmniDiffusionSamplingParams()),
+        on_request_started=_capture,
+    )
+
+    assert intermediate_outputs == [lifecycle]
+    assert lifecycle.request_id == "req-lifecycle"
+    assert result is final
+    assert result.request_id == "req-lifecycle"
 
 
 @pytest.mark.asyncio

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """E2E accuracy guard against a pinned Lightricks LTX pipeline revision.
 
@@ -22,11 +22,11 @@ from typing import Literal
 import numpy as np
 import pytest
 import torch
-from huggingface_hub import hf_hub_download, snapshot_download
 from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
 
 from tests.e2e.accuracy.helpers import reset_artifact_dir
 from tests.helpers.mark import hardware_test
+from vllm_omni.transformers_utils.repo_utils import hf_api
 
 OFFICIAL_REPOSITORY = "https://github.com/Lightricks/LTX-2.git"
 OFFICIAL_REVISION = "9377758131b1ffde4b7f766804590a6617bf2ab9"
@@ -326,7 +326,7 @@ def _resolve_model(case: LTXAccuracyCase) -> Path:
     if revision is None and model_id == case.model_id:
         revision = case.model_revision
     return Path(
-        snapshot_download(
+        hf_api().snapshot_download(
             repo_id=model_id,
             revision=revision,
             allow_patterns=[
@@ -359,7 +359,7 @@ def _resolve_gemma_root(case: LTXAccuracyCase, model: Path) -> Path:
         if configured_model and Path(configured_model).is_dir():
             return Path(configured_model)
         return Path(
-            snapshot_download(
+            hf_api().snapshot_download(
                 repo_id=case.gemma_model_id,
                 revision=case.gemma_model_revision,
                 allow_patterns=[
@@ -383,7 +383,7 @@ def _resolve_artifact(artifact: LTXArtifact, model: Path | None = None) -> Path:
         if model_path.is_file():
             return model_path
     return Path(
-        hf_hub_download(
+        hf_api().hf_hub_download(
             repo_id=artifact.repo_id,
             repo_type=None if artifact.repo_type == "model" else artifact.repo_type,
             filename=artifact.filename,

@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Shared stage-client typing for vLLM-Omni runtime surfaces."""
 
 from __future__ import annotations
@@ -94,6 +97,8 @@ class StagePoolLLMClient(StagePoolClient, Protocol):
         kv_transfer_port_offset: int = ...,
     ) -> dict[str, Any] | None: ...
 
+    def get_payload_sender_info(self) -> dict[str, Any] | None: ...
+
 
 class StagePoolDiffusionClient(StagePoolClient, Protocol):
     """Pool-facing API for diffusion stages."""
@@ -104,6 +109,7 @@ class StagePoolDiffusionClient(StagePoolClient, Protocol):
         prompt: OmniPromptType,
         sampling_params: OmniDiffusionSamplingParams,
         kv_sender_info: dict[int, dict[str, Any]] | None = None,
+        kv_transfer_params: dict[str, Any] | None = None,
     ) -> None: ...
 
     def get_diffusion_output_nowait(self) -> OmniRequestOutput | None: ...

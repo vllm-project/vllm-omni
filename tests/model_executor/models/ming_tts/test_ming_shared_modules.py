@@ -1,12 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from types import SimpleNamespace
 
 import pytest
 import torch
 
-from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
+from vllm_omni.entrypoints.openai.tts_adapters.base import SpeechServingContext
+from vllm_omni.entrypoints.openai.tts_adapters.ming_tts import (
+    MingTTSAdapter,
+    parse_ming_instruction_fields,
+)
 from vllm_omni.model_executor.models.common.ming.aggregator import Aggregator
 from vllm_omni.model_executor.models.common.ming.audio_vae import AudioVAEConfig
 from vllm_omni.model_executor.models.common.ming.cfm_cudagraph import CFMGraphExecutor, CFMSampler
@@ -174,19 +178,19 @@ def test_ming_dense_validation_rejects_semantic_audio_vae_config():
 
 def test_ming_instruction_parser_preserves_dense_and_flash_defaults():
     """Ming dense and Ming flash keep distinct instruction defaults."""
-    serving = object.__new__(OmniOpenAIServingSpeech)
-    serving.uploaded_speakers = {"uploaded": {}}
+    serving = SimpleNamespace(uploaded_speakers={"uploaded": {}})
+    adapter = MingTTSAdapter(SpeechServingContext(server=serving))
 
-    dense_plain = serving._parse_ming_instruction(SimpleNamespace(instructions="calm", language=None, voice=None))
+    dense_plain = adapter._parse_ming_instruction(SimpleNamespace(instructions="calm", language=None, voice=None))
     assert dense_plain == "calm"
 
-    dense_with_fields = serving._parse_ming_instruction(
+    dense_with_fields = adapter._parse_ming_instruction(
         SimpleNamespace(instructions="calm", language="Auto", voice="灵小甄")
     )
     assert dense_with_fields == {"IP": "灵小甄", "风格": "calm"}
 
-    flash_fields = serving._parse_ming_instruction_fields(
-        SimpleNamespace(instructions="calm", language="粤语", voice="灵小甄")
+    flash_fields = parse_ming_instruction_fields(
+        serving, SimpleNamespace(instructions="calm", language="粤语", voice="灵小甄")
     )
     assert flash_fields == {"风格": "calm"}
 

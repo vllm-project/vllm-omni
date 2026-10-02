@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # Adapted from LingBot-Video (https://github.com/Robbyant/lingbot-video).
 
 from __future__ import annotations
@@ -36,6 +36,7 @@ from vllm_omni.diffusion.models.lingbot_video.request_utils import (
 )
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.models.schedulers import FlowUniPCMultistepScheduler
+from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.errors import OmniClientError
@@ -306,6 +307,7 @@ class LingBotVideoPipeline(
     SupportImageInput,
     ProgressBarMixin,
     SupportsComponentDiscovery,
+    DiffusionPipelineProfilerMixin,
 ):
     """Native vLLM-Omni entry for LingBot-Video checkpoints.
 
@@ -382,6 +384,10 @@ class LingBotVideoPipeline(
         self.set_progress_bar_config(disable=bool(model_config.get("quiet_progress", True)))
         self.default_negative_prompt = DEFAULT_NEGATIVE_PROMPT
         self.default_image_negative_prompt = DEFAULT_NEGATIVE_PROMPT_IMAGE
+        self.setup_diffusion_pipeline_profiler(
+            profiler_targets=["text_encoder.forward", "transformer.forward", "vae.encode", "vae.decode"],
+            enable_diffusion_pipeline_profiler=od_config.enable_diffusion_pipeline_profiler,
+        )
 
     def to(self, *args, **kwargs):
         device, dtype, non_blocking, _ = torch._C._nn._parse_to(*args, **kwargs)
@@ -871,4 +877,7 @@ class LingBotVideoPipeline(
             ),
         )
         output_key = "image" if request_config.mode is LingBotGenerationMode.T2I else "video"
-        return DiffusionOutput(output={output_key: frames})
+        return DiffusionOutput(
+            output={output_key: frames},
+            stage_durations=self.stage_durations if self.enable_diffusion_pipeline_profiler else {},
+        )

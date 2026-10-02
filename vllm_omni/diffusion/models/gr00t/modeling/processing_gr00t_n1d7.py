@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import json
 import os
 import re
 import warnings
+from collections.abc import Callable
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
@@ -46,20 +47,119 @@ class LetterBoxTransform:
         return transforms.functional.pad(img, padding=[pad_left, pad_top, pad_right, pad_bottom], fill=0)
 
 
+def _smallest_edge_resize(image: np.ndarray, max_size: int) -> np.ndarray:
+    """albumentations 1.4.18 ``SmallestMaxSize(max_size, interpolation=cv2.INTER_AREA)``.
+
+    Scale off the shortest edge, skip entirely at scale 1.0, round each dimension
+    independently; ``cv2.resize`` takes ``dsize`` as ``(width, height)``.
+    """
+    import cv2
+
+    height, width = image.shape[:2]
+    scale = max_size / float(min(height, width))
+    if scale == 1.0:
+        return image
+    new_height, new_width = (round(dim * scale) for dim in (height, width))
+    if (new_height, new_width) == (height, width):
+        return image
+    return cv2.resize(image, dsize=(new_width, new_height), interpolation=cv2.INTER_AREA)
+
+
+def _fractional_center_crop(image: np.ndarray, fraction: float) -> np.ndarray:
+    """Isaac-GR00T ``FractionalCenterCrop``: ``int()`` truncation (not rounding), floor 1, centred."""
+    height, width = image.shape[:2]
+    crop_height = max(1, int(height * fraction))
+    crop_width = max(1, int(width * fraction))
+    y_min = (height - crop_height) // 2
+    x_min = (width - crop_width) // 2
+    return image[y_min : y_min + crop_height, x_min : x_min + crop_width]
+
+
+def _letter_box_pad(image: np.ndarray) -> np.ndarray:
+    """Isaac-GR00T ``LetterBoxPad``: zero-pad to square, centred, remainder on the far side."""
+    import cv2
+
+    height, width = image.shape[:2]
+    if height == width:
+        return image
+    longest = max(height, width)
+    pad_h, pad_w = longest - height, longest - width
+    top, left = pad_h // 2, pad_w // 2
+    return cv2.copyMakeBorder(image, top, pad_h - top, left, pad_w - left, cv2.BORDER_CONSTANT, value=0)
+
+
+class AlbumentationsEvalImageTransform:
+    """Eval transform of the Isaac-GR00T ``use_albumentations=True`` recipe, without albumentations.
+
+    ``[LetterBoxPad] -> SmallestMaxSize(INTER_AREA) -> FractionalCenterCrop -> SmallestMaxSize(INTER_AREA)``,
+    transcribed from the eval branch of Isaac-GR00T ``build_image_transformations_albumentations`` and
+    albumentations 1.4.18, so a checkpoint trained with that recipe sees the same pixels at inference.
+    Per frame: HWC uint8 RGB array in, ``(C, H, W)`` uint8 tensor out (the ``_get_vlm_inputs`` contract).
+    """
+
+    def __init__(self, max_size: int, fraction: float, letter_box_transform: bool):
+        self.max_size = int(max_size)
+        self.fraction = float(fraction)
+        self.letter_box_transform = letter_box_transform
+
+    def __call__(self, image: np.ndarray) -> torch.Tensor:
+        array = np.asarray(image)
+        if array.dtype != np.uint8 or array.ndim != 3 or array.shape[2] != 3:
+            raise ValueError(
+                "GR00T eval image transform expects an HWC uint8 RGB frame, "
+                f"got shape={tuple(array.shape)} dtype={array.dtype}"
+            )
+        if self.letter_box_transform:
+            array = _letter_box_pad(array)
+        array = _smallest_edge_resize(array, self.max_size)
+        array = _fractional_center_crop(array, self.fraction)
+        array = _smallest_edge_resize(array, self.max_size)
+        # The crop is a non-contiguous view; the caller stacks frames right after this.
+        return torch.from_numpy(np.ascontiguousarray(array)).permute(2, 0, 1)
+
+
 def _build_eval_image_transform(
     image_target_size: list[int],
     image_crop_size: list[int],
-) -> transforms.Compose:
-    """Deterministic eval/inference image transform (letterbox → resize → centercrop → resize)."""
-    return transforms.Compose(
+    *,
+    shortest_image_edge: int | None = None,
+    crop_fraction: float | None = None,
+    use_albumentations: bool = False,
+    letter_box_transform: bool = False,
+) -> Callable[[np.ndarray], torch.Tensor]:
+    """Deterministic eval/inference image transform, selected the way Isaac-GR00T's processor does.
+
+    ``use_albumentations=True``: ``[letterbox] -> resize (shortest edge) -> fractional centre crop -> resize``
+    (:class:`AlbumentationsEvalImageTransform`). Otherwise the torchvision recipe
+    ``[letterbox] -> resize -> centre crop -> resize``. Letterboxing is gated by ``letter_box_transform``
+    on both paths.
+    """
+    if use_albumentations:
+        if crop_fraction is None:
+            if image_crop_size is None or image_target_size is None:
+                raise ValueError("image_crop_size and image_target_size are required when crop_fraction is None")
+            fraction = image_crop_size[0] / image_target_size[0]
+        else:
+            fraction = crop_fraction
+        if shortest_image_edge is None:
+            if image_target_size is None:
+                raise ValueError("image_target_size is required when shortest_image_edge is None")
+            max_size = image_target_size[0]
+        else:
+            max_size = shortest_image_edge
+        return AlbumentationsEvalImageTransform(max_size, fraction, letter_box_transform)
+
+    steps: list[Callable[..., torch.Tensor]] = [transforms.ToImage()]
+    if letter_box_transform:
+        steps.append(LetterBoxTransform())
+    steps.extend(
         [
-            transforms.ToImage(),
-            LetterBoxTransform(),
             transforms.Resize(size=image_target_size),
             transforms.CenterCrop(size=image_crop_size),
             transforms.Resize(size=image_target_size),
         ]
     )
+    return transforms.Compose(steps)
 
 
 logger = init_logger(__name__)
@@ -191,6 +291,9 @@ class Gr00tN1d7Processor(ProcessorMixin):
         exclude_state: bool = False,
         # Normalization
         use_mean_std: bool = False,
+        # Image pipeline selection; must match the recipe the checkpoint was trained with
+        use_albumentations: bool = False,
+        letter_box_transform: bool = False,
         **kwargs,  # absorb deprecated training-only keys from saved processor_config.json
     ):
         if transformers_loading_kwargs is None:
@@ -237,6 +340,8 @@ class Gr00tN1d7Processor(ProcessorMixin):
                 self.embodiment_id_mapping[k] = v
         self.shortest_image_edge = shortest_image_edge
         self.crop_fraction = crop_fraction
+        self.use_albumentations = use_albumentations
+        self.letter_box_transform = letter_box_transform
 
         self.statistics: dict[str, dict[str, dict[str, dict[str, list[float]]]]] = {}
 
@@ -244,6 +349,10 @@ class Gr00tN1d7Processor(ProcessorMixin):
         self.eval_image_transform = _build_eval_image_transform(
             image_target_size,
             image_crop_size,
+            shortest_image_edge=shortest_image_edge,
+            crop_fraction=crop_fraction,
+            use_albumentations=use_albumentations,
+            letter_box_transform=letter_box_transform,
         )
         self._collator = self.data_collator_class(
             model_name=model_name,
@@ -428,7 +537,7 @@ class Gr00tN1d7Processor(ProcessorMixin):
         image_keys: list[str],
         images: list[Image.Image],
         masks: dict[str, list[np.ndarray]] | None,
-        image_transform: transforms.Compose,
+        image_transform: Callable[[np.ndarray], torch.Tensor],
         language: str,
     ):
         temporal_stacked_images = {}
@@ -470,6 +579,8 @@ class Gr00tN1d7Processor(ProcessorMixin):
                 "color_jitter_params": self.color_jitter_params,
                 "shortest_image_edge": self.shortest_image_edge,
                 "crop_fraction": self.crop_fraction,
+                "use_albumentations": self.use_albumentations,
+                "letter_box_transform": self.letter_box_transform,
                 "model_name": self.model_name,
                 "model_type": self.model_type,
                 "formalize_language": self.formalize_language,

@@ -33,6 +33,10 @@ from vllm_omni.diffusion.models.diffusers_adapter.quantization_utils import (
     convert_diffusers_quantization_config,
     ensure_supported_diffusers_quantization,
 )
+from vllm_omni.diffusion.offloader.config import (
+    OffloadStrategy,
+    resolve_offload_strategy,
+)
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.inputs.data import OmniPromptType, OmniTextPrompt
@@ -148,9 +152,10 @@ class DiffusersAdapterPipeline(nn.Module, DiffusionPipelineProfilerMixin):
         self._accept_call_kwargs = set(inspect.signature(self._pipeline.__call__).parameters.keys())
 
         # CPU offloading
-        if self.od_config.enable_layerwise_offload:
+        strategy = resolve_offload_strategy(self.od_config)
+        if strategy is OffloadStrategy.LAYER_WISE:
             self._pipeline.enable_sequential_cpu_offload()
-        elif self.od_config.enable_cpu_offload:
+        elif strategy is OffloadStrategy.MODEL_LEVEL:
             self._pipeline.enable_model_cpu_offload()
 
         # VAE slicing and tiling: try-catch because not all models have VAE
@@ -237,6 +242,13 @@ class DiffusersAdapterPipeline(nn.Module, DiffusionPipelineProfilerMixin):
 
     def _raise_unsupported_features(self) -> None:
         """Raise an error for incompatible feature switches."""
+        if self.od_config.diffusion_offload_config is not None:
+            raise NotImplementedError(
+                "diffusion_offload_config is not supported with the diffusers backend. "
+                "Its component selectors cannot be represented by Diffusers' pipeline-wide "
+                "CPU-offload hooks. Use the legacy enable_cpu_offload or "
+                "enable_layerwise_offload option, or use a native pipeline."
+            )
         pc = self.od_config.parallel_config
         if pc.tensor_parallel_size > 1:
             raise NotImplementedError(

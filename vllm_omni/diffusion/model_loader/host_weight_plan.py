@@ -270,13 +270,46 @@ def _validate_source_metadata(
                 source = handle.get_slice(binding.checkpoint_key)
                 source_shape = tuple(source.get_shape())
                 source_dtype = _SAFETENSORS_DTYPES.get(source.get_dtype())
-                if source_shape != tuple(target.shape):
-                    raise _PlanIncompatibleError(
-                        f"shape mismatch for {runtime_name!r}: checkpoint={source_shape}, runtime={tuple(target.shape)}"
-                    )
-                if source_dtype is None or source_dtype != target.dtype:
+                if source_dtype is None:
                     raise _PlanIncompatibleError(
                         f"dtype mismatch for {runtime_name!r}: checkpoint={source.get_dtype()}, runtime={target.dtype}"
+                    )
+
+                runtime_shape = source_shape
+                runtime_dtype = source_dtype
+                if binding.transform is not None:
+                    # Adapter transforms can map full checkpoint tensors to a
+                    # rank-local runtime shape. Validate that contract without
+                    # materializing the source tensor during preflight.
+                    try:
+                        transformed = binding.transform(
+                            torch.empty(
+                                source_shape,
+                                dtype=source_dtype,
+                                device="meta",
+                            )
+                        )
+                    except (NotImplementedError, RuntimeError, TypeError, ValueError) as exc:
+                        raise _PlanIncompatibleError(
+                            f"checkpoint transform for {runtime_name!r} cannot be validated on tensor metadata: {exc}"
+                        ) from exc
+                    if not isinstance(transformed, torch.Tensor):
+                        raise _PlanIncompatibleError(
+                            f"checkpoint transform for {runtime_name!r} returned {type(transformed).__name__}, "
+                            "expected torch.Tensor"
+                        )
+                    runtime_shape = tuple(transformed.shape)
+                    runtime_dtype = transformed.dtype
+
+                if runtime_shape != tuple(target.shape):
+                    raise _PlanIncompatibleError(
+                        f"shape mismatch for {runtime_name!r}: checkpoint={source_shape}, "
+                        f"transformed={runtime_shape}, runtime={tuple(target.shape)}"
+                    )
+                if runtime_dtype != target.dtype:
+                    raise _PlanIncompatibleError(
+                        f"dtype mismatch for {runtime_name!r}: checkpoint={source.get_dtype()}, "
+                        f"transformed={runtime_dtype}, runtime={target.dtype}"
                     )
 
 
@@ -289,6 +322,7 @@ def build_checkpoint_mmap_plan(
     tensor_parallel_size: int,
     use_hsdp: bool,
     online_quantization: bool,
+    has_distilled_lora: bool = False,
 ) -> HostWeightPlanResult:
     """Build a complete direct-checkpoint plan or return a fallback reason."""
     if tensor_parallel_size != 1:
@@ -297,6 +331,8 @@ def build_checkpoint_mmap_plan(
         return HostWeightPlanResult(None, "HSDP requires the ordinary loader")
     if online_quantization:
         return HostWeightPlanResult(None, "online quantization requires the ordinary loader")
+    if has_distilled_lora:
+        return HostWeightPlanResult(None, "distilled LoRA requires the ordinary loader")
 
     remap_fn = getattr(type(pipeline), "_remap_ckpt_key", None)
     if not callable(remap_fn):

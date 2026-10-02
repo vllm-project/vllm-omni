@@ -52,26 +52,40 @@ try:
 except ImportError as exc:  # pragma: no cover - demo dependency.
     raise SystemExit("Install websockets first: pip install websockets") from exc
 
-from vllm_omni.experimental.fullduplex.client import (  # noqa: E402
+from vllm_omni.clients.duplex import (  # noqa: E402
     PCM16_BYTES_PER_SAMPLE,
     PCM16_SAMPLE_RATE,
-    RealtimeEventCollector,
+    EventCollector,
     build_realtime_url,
     duplex_unit_boundary_ms,
     read_pcm16_wav,
     summarize_session_request_metrics,
 )
-from vllm_omni.experimental.fullduplex.client import (  # noqa: E402
+from vllm_omni.clients.duplex import (  # noqa: E402
     reference_audio_data_url as _ref_audio_data_url,
 )
 from vllm_omni.experimental.fullduplex.video_stacking import (  # noqa: E402
     concat_frames_b64,
     unit_subframe_offsets,
 )
+from vllm_omni.metrics.definitions import compute_audio_rtf  # noqa: E402
 
-_url_with_model = build_realtime_url
+
+def _url_with_model(url, model, *, autostart=None):
+    return build_realtime_url(url, model, autostart=autostart)
+
+
 _read_wav_pcm16 = read_pcm16_wav
 DemoArgs = argparse.Namespace | SimpleNamespace
+
+
+def _audio_rtf_from_raw_metric(raw_metric: dict[str, object]) -> float | None:
+    """Derive audio RTF from the raw timings reported by the client."""
+    generation_ms = raw_metric.get("audio_generation_ms")
+    duration_ms = raw_metric.get("audio_duration_ms")
+    if not isinstance(generation_ms, int | float) or not isinstance(duration_ms, int | float) or duration_ms <= 0:
+        return None
+    return round(compute_audio_rtf(float(generation_ms) / 1000.0, float(duration_ms) / 1000.0), 6)
 
 
 def _video_frames_from_file(
@@ -156,7 +170,7 @@ def _resolve_video_frames(args: DemoArgs) -> tuple[list[str], list[str | None]]:
 @dataclass
 class DemoState:
     events: list[dict[str, object]] = field(default_factory=list)
-    timing_events: RealtimeEventCollector = field(default_factory=RealtimeEventCollector)
+    timing_events: EventCollector = field(default_factory=EventCollector)
     audio_deltas: list[bytes] = field(default_factory=list)
     response_audio_deltas: dict[str, list[bytes]] = field(default_factory=dict)
     response_ids: list[str] = field(default_factory=list)
@@ -192,7 +206,7 @@ class DemoState:
                 item_id = item.get("id")
                 if isinstance(item_id, str) and item_id not in self.assistant_item_ids:
                     self.assistant_item_ids.append(item_id)
-        elif event_type == "response.audio.delta":
+        elif event_type == "response.output_audio.delta":
             delta = event.get("delta") or event.get("audio")
             if isinstance(delta, str) and delta:
                 try:
@@ -273,6 +287,11 @@ class DemoState:
                 after_s=created_at_s,
                 input_committed_at_s=input_committed_at_s,
                 response_id=response_id,
+                measurement_origin={
+                    "ttft": "input_audio_buffer.commit client send to first non-empty text delta",
+                    "ttfp": "input_audio_buffer.commit client send to first audio packet",
+                    "rtf": "commit-to-last-audio receive time divided by emitted audio duration",
+                },
             )
             timing["measurement_origin"] = {
                 "response": "response.created client receive",
@@ -292,14 +311,14 @@ class DemoState:
             metrics = timing.get("request_metrics")
             if not isinstance(metrics, dict):
                 continue
-            requests.append(
-                {
-                    "session_id": session_id,
-                    "request_index": request_index,
-                    "response_id": response_id,
-                    **metrics,
-                }
-            )
+            request_metrics = {
+                "session_id": session_id,
+                "request_index": request_index,
+                "response_id": response_id,
+                **metrics,
+                "rtf": _audio_rtf_from_raw_metric(metrics),
+            }
+            requests.append(request_metrics)
         return requests
 
     def session_metric_summary(
@@ -360,8 +379,8 @@ class DemoState:
             "response.output_item.added",
             "response.content_part.added",
             "response.speak",
-            "response.audio.delta",
-            "response.audio.done",
+            "response.output_audio.delta",
+            "response.output_audio.done",
             "response.content_part.done",
             "response.output_item.done",
             "response.done",
@@ -376,8 +395,8 @@ class DemoState:
             )
             if index is None and event_type not in {
                 "response.speak",
-                "response.audio.delta",
-                "response.audio.done",
+                "response.output_audio.delta",
+                "response.output_audio.done",
             }:
                 return {}
             if index is not None:
@@ -425,13 +444,13 @@ class DemoState:
             "response.output_item.added",
             "response.content_part.added",
             "response.speak",
-            "response.audio.delta",
-            "response.audio.done",
+            "response.output_audio.delta",
+            "response.output_audio.done",
             "response.content_part.done",
             "response.output_item.done",
             "response.done",
         ]
-        if "response.audio.delta" not in indices_by_type:
+        if "response.output_audio.delta" not in indices_by_type:
             listen_index = self.first_index(
                 "response.listen",
                 lambda event: (
@@ -489,7 +508,7 @@ class DemoState:
 
     def model_speak_before_audio_ok(self) -> bool:
         speak_index = self.first_index("response.speak")
-        audio_index = self.first_index("response.audio.delta")
+        audio_index = self.first_index("response.output_audio.delta")
         return speak_index is not None and audio_index is not None and speak_index < audio_index
 
     def response_done(self, response_id: str | None) -> bool:
@@ -506,7 +525,7 @@ class DemoState:
         return sum(
             1
             for event in self.events
-            if event.get("type") == "response.audio.delta" and self._event_response_id(event) == response_id
+            if event.get("type") == "response.output_audio.delta" and self._event_response_id(event) == response_id
         )
 
     def response_playback_sent_ms(self, response_id: str | None) -> int:
@@ -539,14 +558,16 @@ class DemoState:
         return "".join(
             str(event.get("delta", ""))
             for event in self.events
-            if event.get("type") == "response.audio_transcript.delta" and self._event_response_id(event) == response_id
+            if event.get("type") == "response.output_audio_transcript.delta"
+            and self._event_response_id(event) == response_id
         )
 
     def response_transcript_done(self, response_id: str) -> list[str]:
         return [
             str(event.get("transcript", ""))
             for event in self.events
-            if event.get("type") == "response.audio_transcript.done" and self._event_response_id(event) == response_id
+            if event.get("type") == "response.output_audio_transcript.done"
+            and self._event_response_id(event) == response_id
         ]
 
     def completed_response_ids(self) -> list[str]:
@@ -577,7 +598,7 @@ class DemoState:
             return 0
         stale = 0
         for index, event in enumerate(self.events):
-            if event.get("type") != "response.audio.delta":
+            if event.get("type") != "response.output_audio.delta":
                 continue
             metadata = event.get("metadata")
             if not isinstance(metadata, dict):
@@ -602,7 +623,6 @@ def _session_update_event(args: DemoArgs) -> dict[str, object]:
         "playback_commit_policy": "ack_only",
         "extra_body": {
             "auto_response": True,
-            "minicpmo45_native_duplex": True,
             "force_listen_count": 0,
         },
     }
@@ -618,9 +638,6 @@ def _session_update_event(args: DemoArgs) -> dict[str, object]:
         "type": "session.update",
         "session": session_payload,
     }
-    session_id = getattr(args, "session_id", None)
-    if session_id:
-        session_payload["session_id"] = session_id
     return event
 
 
@@ -1100,7 +1117,7 @@ async def _send_clean_turn(
             state,
             lambda: state.response_audio_delta_count(response_id) > 0,
             timeout_s=timeout_s,
-            label=f"{transcript} response.audio.delta",
+            label=f"{transcript} response.output_audio.delta",
         )
     await _wait_for(
         state,
@@ -1315,7 +1332,7 @@ async def _send_listen_only_overlap_pair(
         state,
         lambda: state.response_audio_delta_count(first_response_id) > 0,
         timeout_s=timeout_s,
-        label=f"{transcripts[0]} response.audio.delta",
+        label=f"{transcripts[0]} response.output_audio.delta",
     )
     if state.response_done(first_response_id):
         raise RuntimeError("first response completed before overlap input could start")
@@ -1434,7 +1451,6 @@ async def run_demo(args: DemoArgs) -> dict[str, object]:
         args.url,
         args.model,
         autostart=False if getattr(args, "ref_audio", None) else None,
-        session_id=getattr(args, "session_id", None),
     )
     state = DemoState()
     stop = asyncio.Event()
@@ -1574,7 +1590,9 @@ async def run_demo(args: DemoArgs) -> dict[str, object]:
         transcript_hints_enabled=transcript_hints_enabled and not continuous_input,
     )
     model_speak_event_ok = state.model_speak_before_audio_ok()
-    realtime_audio_lifecycle_ok = state.count("response.audio.delta") > 0 and state.count("response.audio.done") > 0
+    realtime_audio_lifecycle_ok = (
+        state.count("response.output_audio.delta") > 0 and state.count("response.output_audio.done") > 0
+    )
     completed_response_ids = state.completed_response_ids()
     observed_turn_response_ids = [response_id for response_id in turn_response_ids if isinstance(response_id, str)]
     expected_empty_response_ids = {
@@ -1599,7 +1617,7 @@ async def run_demo(args: DemoArgs) -> dict[str, object]:
         state.count("response.created") == state.count("response.done")
         and len(state.response_ids) == len(completed_response_ids)
         and len(completed_response_ids) == len(set(completed_response_ids))
-        and state.count("response.audio.done") <= state.count("response.done")
+        and state.count("response.output_audio.done") <= state.count("response.done")
         and _response_cardinality_ok(
             completed_response_ids,
             expected_turns=expected_turns,
@@ -1644,6 +1662,10 @@ async def run_demo(args: DemoArgs) -> dict[str, object]:
     )
     unexpected_error_events = _unexpected_error_events(state)
     continuous_input_ok = not continuous_input or state.count("input_audio_buffer.committed") == 0
+    # The server allocates every session id; label metrics with the one it announced.
+    created = state.events[0] if state.events else {}
+    created_session = created.get("session") if isinstance(created, dict) else None
+    server_session_id = created_session.get("id") if isinstance(created_session, dict) else None
     result = {
         "ok": terminal_activity_ok
         and state.count("session.closed") > 0
@@ -1681,8 +1703,8 @@ async def run_demo(args: DemoArgs) -> dict[str, object]:
         "input_transcription_ok": input_transcription_ok,
         "completed_response_ids": completed_response_ids,
         "response_timings": state.response_timing_summaries(),
-        "request_metrics": state.session_request_metrics(session_id=args.session_id),
-        "session_metrics": state.session_metric_summary(session_id=args.session_id),
+        "request_metrics": state.session_request_metrics(session_id=server_session_id),
+        "session_metrics": state.session_metric_summary(session_id=server_session_id),
         "lifecycle_counts_ok": lifecycle_counts_ok,
         "validation_mode": validation_mode,
         "scenario": scenario,
@@ -1743,7 +1765,6 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--url", default="ws://localhost:8099/v1/realtime?duplex=1")
     parser.add_argument("--model", default="openbmb/MiniCPM-o-4_5")
-    parser.add_argument("--session-id", help="Use an explicit public session ID, including for close/reopen tests.")
     parser.add_argument("--input-wav", required=True)
     parser.add_argument("--ref-audio", help="Optional WAV used as the MiniCPM-o voice prompt.")
     parser.add_argument(

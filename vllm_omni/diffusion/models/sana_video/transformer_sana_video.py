@@ -18,6 +18,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass, fields
 
 import torch
+import torch.distributed as dist
 from cache_dit import ForwardPattern
 from torch import nn
 from vllm.distributed import (
@@ -32,6 +33,11 @@ from vllm.model_executor.utils import set_weight_attrs
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention as OmniAttention
 from vllm_omni.diffusion.cache.cachedit import CacheDiTAdapterConfig
+from vllm_omni.diffusion.distributed.parallel_state import (
+    get_sequence_parallel_rank,
+    get_sequence_parallel_world_size,
+    get_sp_group,
+)
 
 
 def validate_sana_video_parallel_config(parallel_config) -> None:
@@ -46,13 +52,18 @@ def validate_sana_video_parallel_config(parallel_config) -> None:
         raise NotImplementedError(
             f"SANA-Video supports cfg_parallel_size 1 or 2, got {cfg_size}. Set --cfg-parallel-size to 1 or 2."
         )
-    sp_size = parallel_config.sequence_parallel_size
-    if sp_size is not None and sp_size > 1:
+    sp_size = parallel_config.sequence_parallel_size or 1
+    if sp_size not in (1, 2, 4):
         raise NotImplementedError(
-            "Sequence parallel is not supported for SANA-Video: its linear attention and "
-            "GLUMB temporal conv have no SANA-specific SP implementation. Use tensor and/or "
-            "CFG parallel instead."
+            f"SANA-Video supports sequence_parallel_size 1, 2 or 4, got {sp_size}. Set --usp to 1, 2 or 4."
         )
+    if parallel_config.ring_degree > 1:
+        raise NotImplementedError(
+            "SANA-Video does not support ring sequence parallel: its linear attention has no "
+            "log-sum-exp state to merge across ring stages. Use --usp for sequence parallel."
+        )
+    if parallel_config.allgather_degree > 1:
+        raise NotImplementedError("SANA-Video does not support AllGather-KV sequence parallel. Use --usp instead.")
     if parallel_config.pipeline_parallel_size > 1:
         raise NotImplementedError("SANA-Video does not support pipeline parallel. Set --pipeline-parallel-size to 1.")
     if parallel_config.use_hsdp:
@@ -61,6 +72,32 @@ def validate_sana_video_parallel_config(parallel_config) -> None:
         raise NotImplementedError(
             "SANA-Video does not support text encoder tensor parallel. Set text_encoder_tp_size to 1."
         )
+
+
+def _sp_frame_split_sizes(num_frames: int, world_size: int) -> list[int]:
+    """Balanced per-rank frame counts: the first ``num_frames % world_size``
+    ranks take one extra frame, so exactly ``world_size`` non-empty chunks."""
+    if num_frames < world_size:
+        raise ValueError(
+            f"SANA-Video sequence parallel needs at least one latent frame per rank, "
+            f"got {num_frames} frames for sequence parallel size {world_size}. "
+            "Lower the sequence parallel degree or increase num_frames."
+        )
+    base, rem = divmod(num_frames, world_size)
+    return [base + 1 if rank < rem else base for rank in range(world_size)]
+
+
+def _sp_gather_frames(hidden_states: torch.Tensor, sizes: list[int]) -> torch.Tensor:
+    """Gather per-rank frame shards of shape (B, sizes[rank]*hw, C) into the
+    full (B, sum(sizes)*hw, C) sequence. Shards are padded to the widest rank
+    only for the collective; pads are dropped before concatenation."""
+    rank = get_sequence_parallel_rank()
+    frames = hidden_states.unflatten(1, (sizes[rank], -1))
+    pad = max(sizes) - sizes[rank]
+    if pad:
+        frames = torch.cat([frames, frames.new_zeros((frames.shape[0], pad, *frames.shape[2:]))], dim=1)
+    parts = get_sp_group().all_gather(frames, dim=0, separate_tensors=True)
+    return torch.cat([part.narrow(1, 0, size) for part, size in zip(parts, sizes)], dim=1).flatten(1, 2)
 
 
 @dataclass
@@ -521,7 +558,37 @@ class GLUMBTempConv(nn.Module):
         hidden_states_temporal = hidden_states.view(batch_size, num_frames, num_channels, height * width).permute(
             0, 2, 1, 3
         )
-        hidden_states = hidden_states_temporal + self.conv_temp(hidden_states_temporal)
+        if get_sequence_parallel_world_size() > 1:
+            # The temporal conv reads one frame across each shard boundary, so
+            # each rank exchanges single frames with its neighbours only; the
+            # global first/last rank keeps the dense zero padding on its outer
+            # side.
+            assert self.conv_temp.kernel_size == (3, 1), (
+                "SP halo exchange assumes a temporal kernel of 3 (one frame per side), "
+                f"got {self.conv_temp.kernel_size}"
+            )
+            x = hidden_states_temporal
+            rank = get_sequence_parallel_rank()
+            world_size = get_sequence_parallel_world_size()
+            sp_group = get_sp_group()
+            left = x.new_zeros((x.shape[0], x.shape[1], 1, x.shape[3]))
+            right = torch.zeros_like(left)
+            p2p_ops = []
+            if rank > 0:
+                prev_rank = sp_group.ranks[rank - 1]
+                p2p_ops.append(dist.P2POp(dist.irecv, left, prev_rank, sp_group.device_group))
+                p2p_ops.append(dist.P2POp(dist.isend, x[:, :, :1].contiguous(), prev_rank, sp_group.device_group))
+            if rank < world_size - 1:
+                next_rank = sp_group.ranks[rank + 1]
+                p2p_ops.append(dist.P2POp(dist.isend, x[:, :, -1:].contiguous(), next_rank, sp_group.device_group))
+                p2p_ops.append(dist.P2POp(dist.irecv, right, next_rank, sp_group.device_group))
+            for req in dist.batch_isend_irecv(p2p_ops):
+                req.wait()
+            padded = torch.cat([left, x, right], dim=2)
+            temporal_out = nn.functional.conv2d(padded, self.conv_temp.weight, padding=0)
+        else:
+            temporal_out = self.conv_temp(hidden_states_temporal)
+        hidden_states = hidden_states_temporal + temporal_out
         hidden_states = hidden_states.permute(0, 2, 3, 1).view(batch_size, num_frames, height, width, num_channels)
 
         if self.norm_type == "rms_norm":
@@ -621,9 +688,15 @@ class SanaLinearAttention(nn.Module):
         # Keep the unrotated denominator contraction in the input dtype. This
         # intentionally matches Diffusers 0.38.0's SanaLinearAttnProcessor3_0;
         # only the rotated numerator path is accumulated in FP32.
-        z = 1 / (key.sum(dim=-1, keepdim=True).transpose(-2, -1) @ query + 1e-15)
-
+        k_sum = key.sum(dim=-1, keepdim=True)
         scores = torch.matmul(value, key_rotate.transpose(-1, -2))
+        if get_sequence_parallel_world_size() > 1:
+            # Token sums are the only sequence coupling; one packed all-reduce
+            # turns the per-rank partial state into the global one.
+            packed = torch.cat([scores, k_sum.float()], dim=-1)
+            packed = get_sp_group().all_reduce(packed)
+            scores, k_sum = packed[..., :-1], packed[..., -1:].to(key.dtype)
+        z = 1 / (k_sum.transpose(-2, -1) @ query + 1e-15)
         hidden_states = torch.matmul(scores, query_rotate)
 
         hidden_states = hidden_states * z
@@ -971,6 +1044,10 @@ class SanaVideoTransformer3DModel(nn.Module):
     )
     _layerwise_offload_blocks_attrs = ["transformer_blocks"]
 
+    # SP is implemented manually in forward (frame-aligned uneven sharding);
+    # the empty plan enables the registry's SP path with zero generic hooks.
+    _sp_plan = {}
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         return AutoWeightsLoader(self).load_weights(weights)
 
@@ -1151,6 +1228,26 @@ class SanaVideoTransformer3DModel(nn.Module):
         hidden_states = self.patch_embedding(hidden_states)
         hidden_states = hidden_states.flatten(2).transpose(1, 2)
 
+        sp_world_size = get_sequence_parallel_world_size()
+        local_frames = post_patch_num_frames
+        if sp_world_size > 1:
+            # Frame-aligned sharding: every rank keeps full spatial extent, so
+            # the per-frame convs, the GLUMB unflatten and the per-token
+            # modulation stay local. The I2V per-token timestep is sliced
+            # before the time embed so its MLP also runs on local tokens only.
+            sp_sizes = _sp_frame_split_sizes(post_patch_num_frames, sp_world_size)
+            sp_rank = get_sequence_parallel_rank()
+            local_frames = sp_sizes[sp_rank]
+            hidden_states = (
+                hidden_states.unflatten(1, (post_patch_num_frames, -1)).split(sp_sizes, dim=1)[sp_rank].flatten(1, 2)
+            )
+            rotary_emb = tuple(
+                freqs.unflatten(1, (post_patch_num_frames, -1)).split(sp_sizes, dim=1)[sp_rank].flatten(1, 2)
+                for freqs in rotary_emb
+            )
+            if timestep.ndim == 5:
+                timestep = timestep.split(sp_sizes, dim=2)[sp_rank]
+
         if guidance is not None:
             timestep, embedded_timestep = self.time_embed(
                 timestep.flatten(), guidance=guidance, hidden_dtype=hidden_states.dtype
@@ -1176,7 +1273,7 @@ class SanaVideoTransformer3DModel(nn.Module):
                 encoder_hidden_states,
                 encoder_attention_mask,
                 timestep,
-                post_patch_num_frames,
+                local_frames,
                 post_patch_height,
                 post_patch_width,
                 rotary_emb,
@@ -1188,6 +1285,10 @@ class SanaVideoTransformer3DModel(nn.Module):
         hidden_states = self.norm_out(hidden_states, embedded_timestep, self.scale_shift_table)
 
         hidden_states = self.proj_out(hidden_states)
+
+        if sp_world_size > 1:
+            # Gather after proj_out where the channel width is smallest.
+            hidden_states = _sp_gather_frames(hidden_states, sp_sizes)
 
         # 5. Unpatchify
         hidden_states = hidden_states.reshape(

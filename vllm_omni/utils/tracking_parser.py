@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import argparse
 from typing import Any
@@ -52,12 +52,28 @@ class TrackingNamespace(argparse.Namespace):
         else:
             setattr(self.unfiltered_ns, name, value)
 
+    def __getstate__(self) -> dict[str, Any]:
+        """Preserve wrapper state when API workers use ``spawn``.
+
+        Our __dict__ property exposes the inner namespace, so default state
+        serialization would lose unfiltered_ns and explicit_keys.
+        """
+        return {
+            "unfiltered_ns": self.unfiltered_ns,
+            "explicit_keys": self.explicit_keys,
+        }
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        object.__setattr__(self, "unfiltered_ns", state["unfiltered_ns"])
+        object.__setattr__(self, "explicit_keys", state["explicit_keys"])
+
     def get_explicit_kwargs_dict(self):
         """Return a dict containing only the explicitly passed key-value pairs."""
         return {k: v for k, v in vars(self.unfiltered_ns).items() if k in self.explicit_keys}
 
     def __getattr__(self, name: str) -> Any:
-        return getattr(self.unfiltered_ns, name)
+        namespace = object.__getattribute__(self, "unfiltered_ns")
+        return getattr(namespace, name)
 
     @property
     def __dict__(self):

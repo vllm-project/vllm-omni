@@ -1,15 +1,13 @@
 # MiniCPM-o 4.5 three-stage deploy on one large-memory GPU.
 pipeline: minicpmo_4_5
 async_chunk: true
-# Native full-duplex shares this profile with /v1/chat/completions. Every other
-# duplex_session knob keeps its runtime default.
+# Use minicpmo_4_5_turn.yaml to select the ordinary turn-based serving engine.
 session_mode: duplex
 # Keep the active window aligned with the session and stage capacities below.
 # A smaller window serializes first-packet generation for concurrent chat turns.
-active_stream_window: 4
 duplex_session:
   # Matches Stage 0/1 max_num_seqs below.
-  max_sessions: 4
+  max_sessions: 16
 
 trust_remote_code: true
 enable_prefix_caching: false
@@ -29,11 +27,17 @@ connectors:
       # HiFTGraphWrapper.derive_capture_bucket_size explicitly includes it.
       enable_hift_graph: true
       enable_cfm_graph: true
+      # Whole-Euler CUDA graphs exist for batch 1, 2, 4, ... up to
+      # micro_batch_size, which defaults to Stage 2 max_num_seqs: all graphs
+      # share one attention-cache arena of that many requests (~0.6 GiB each
+      # in fp32, 10 GiB at 16). Larger batches replay micro-batches;
+      # B > max_graph_batch runs eager.
+      max_graph_batch: 16
       cfm_max_graphs: 32
 
 stages:
   - stage_id: 0
-    max_num_seqs: 4
+    max_num_seqs: 16
     # Leave headroom on the shared GPU for Talker KV + concurrent Code2Wav.
     gpu_memory_utilization: 0.55
     enforce_eager: false
@@ -48,7 +52,7 @@ stages:
         fps: 1
         num_frames: 128
     limit_mm_per_prompt:
-      # Daily-Omni MiniCPM pack: up to 64 interleaved image/audio pairs (1fps).
+      # Daily-Omni: up to 64 interleaved image/audio pairs (1fps).
       image: 64
       audio: 64
       video: 1
@@ -63,14 +67,9 @@ stages:
       repetition_penalty: 1.0
 
   - stage_id: 1
-    max_num_seqs: 4
-    # Native duplex uses MiniCPMTTS.generate_with_buffer's supported
-    # sliding_recompute policy: retain one completed condition/codec chunk
-    # when the next condition arrives. Other deploy profiles continue to use
-    # the checkpoint's full_attention policy.
-    hf_overrides:
-      tts_config:
-        attention_type: sliding_recompute
+    max_num_seqs: 16
+    # Preserve the checkpoint's full-attention Talker prompt while it fits;
+    # native duplex rolls over to a one-chunk window at context capacity.
     # Leave device-level headroom for the colocated HiFi-GAN cuDNN workspace.
     gpu_memory_utilization: 0.15
     enforce_eager: false
@@ -98,7 +97,7 @@ stages:
       detokenize: false
 
   - stage_id: 2
-    max_num_seqs: 4
+    max_num_seqs: 16
     gpu_memory_utilization: 0.18
     enforce_eager: true
     enable_chunked_prefill: false
@@ -118,9 +117,12 @@ platforms:
   cuda:
     stages:
       - stage_id: 1
-        # Four Talker streams need much less KV than automatic sizing.
-        # Leave single-GPU headroom for concurrent Stage 2 diffusion batches.
-        kv_cache_memory_bytes: 2147483648  # 2 GiB
+        # Full-attention occupancy is bounded by max_num_seqs * max_model_len
+        # (16 * 4096 = 65536 tokens). Keep the reported CUDA KV token capacity
+        # above that bound because physical-preemption replay is unsupported
+        # (2 GiB holds ~35k tokens). The explicit cap leaves device headroom
+        # for concurrent Stage 2.
+        kv_cache_memory_bytes: 4294967296  # 4 GiB
 
   npu:
     stages:

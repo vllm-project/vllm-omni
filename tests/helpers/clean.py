@@ -60,6 +60,12 @@ def pick_least_used_device_indices(num_devices: int) -> list[int]:
     return get_physical_device_indices(logical_indices)
 
 
+def _logical_to_physical(logical: int) -> int:
+    """Physical id for logs / nvidia-smi; ``logical`` if the env does not map it."""
+    mapped = get_physical_device_indices([logical])
+    return mapped[0] if mapped else logical
+
+
 def wait_for_gpu_memory_to_clear(
     *,
     devices: list[int],
@@ -67,59 +73,106 @@ def wait_for_gpu_memory_to_clear(
     threshold_ratio: float | None = None,
     timeout_s: float = 120,
 ) -> None:
+    """Wait until *logical* device ordinals are under the memory threshold.
+
+    ``devices`` are CUDA/NPU ordinals in the current process (``0..N-1``),
+    the same space as ``current_omni_platform.device()`` / ``mem_get_info()``.
+    Physical ids (``CUDA_VISIBLE_DEVICES``) are only used for log labels and
+    Whisper-worker matching — remapping them into ``device()`` raises
+    ``invalid device ordinal`` when the visible set is a subset (e.g. ``4,5``).
+    """
     assert threshold_bytes is not None or threshold_ratio is not None
-    devices = get_physical_device_indices(devices)
+    logical_devices = list(devices)
+    physical_by_logical = {logical: _logical_to_physical(logical) for logical in logical_devices}
     start_time = time.time()
 
-    device_list = ", ".join(str(d) for d in devices)
+    device_list = ", ".join(str(physical_by_logical[d]) for d in logical_devices)
     if threshold_bytes is not None:
-        condition_str = f"Memory usage ≤ {threshold_bytes / 2**30:.2f} GiB"
+        condition_str = f"Memory usage ≤ {threshold_bytes / 2**30:.2f} GiB (excl. Whisper worker)"
 
         def is_free(used, total):
             return used <= threshold_bytes / 2**30
     else:
         ratio = threshold_ratio
         assert ratio is not None
-        condition_str = f"Memory usage ratio ≤ {ratio * 100:.1f}%"
+        condition_str = f"Memory usage ratio ≤ {ratio * 100:.1f}% (excl. Whisper worker)"
 
         def is_free(used, total):
             return used / total <= ratio
 
     print(f"[Device Memory Monitor] Waiting for device(s) {device_list} to free memory, Condition: {condition_str}")
-
-    def get_mem_gib(device: int) -> tuple[float, float]:
-        with current_omni_platform.device(device):
-            free_bytes, total_bytes = current_omni_platform.mem_get_info()
-        return (total_bytes - free_bytes) / 2**30, total_bytes / 2**30
+    whisper_allowance_gib, whisper_physical = _whisper_vram_allowance()
+    if whisper_allowance_gib > 0 and whisper_physical is not None:
+        print(
+            f"[Device Memory Monitor] Whisper worker allowance {whisper_allowance_gib:.1f}GiB "
+            f"on device {whisper_physical}"
+        )
 
     while True:
-        output_raw = {d: get_mem_gib(d) for d in devices}
-        output = {
-            d: f"{used:.1f}GiB/{total:.1f}GiB ({(used / total) * 100 if total > 0 else 0:.1f}%)"
-            for d, (used, total) in output_raw.items()
-        }
-
-        print("[Device Memory Status] Current usage:")
-        for device_id, mem_info in output.items():
-            print(f"  Device {device_id}: {mem_info}")
+        output_raw: dict[int, tuple[float, float, float]] = {}
+        for logical in logical_devices:
+            with current_omni_platform.device(logical):
+                free_bytes, total_bytes = current_omni_platform.mem_get_info()
+            used_gib = (total_bytes - free_bytes) / 2**30
+            total_gib = total_bytes / 2**30
+            physical = physical_by_logical[logical]
+            whisper_gib = (
+                min(used_gib, whisper_allowance_gib)
+                if whisper_physical is not None and physical == whisper_physical
+                else 0.0
+            )
+            output_raw[physical] = (max(0.0, used_gib - whisper_gib), total_gib, whisper_gib)
+        print("[Device Memory Status] Current usage (engine view excludes Whisper worker):")
+        for device_id, (used, total, whisper) in output_raw.items():
+            ratio_pct = (used / total) * 100 if total > 0 else 0.0
+            line = f"  Device {device_id}: {used:.1f}GiB/{total:.1f}GiB ({ratio_pct:.1f}%)"
+            if whisper > 0:
+                line += f" [Whisper worker {whisper:.1f}GiB excluded]"
+            print(line)
 
         dur_s = time.time() - start_time
-        if all(is_free(used, total) for used, total in output_raw.values()):
+        if all(is_free(used, total) for used, total, _whisper in output_raw.values()):
             print(f"[Device Memory Freed] Device(s) {device_list} meet memory condition")
             print(f"   Condition: {condition_str}")
             print(f"   Wait time: {dur_s:.1f} seconds ({dur_s / 60:.1f} minutes)")
             break
 
         if dur_s >= timeout_s:
+            status = "\n".join(
+                f"  Device {d}: {used:.1f}GiB/{total:.1f}GiB"
+                + (f" (+Whisper {whisper:.1f}GiB excluded)" if whisper > 0 else "")
+                for d, (used, total, whisper) in output_raw.items()
+            )
             raise ValueError(
                 f"[Device Memory Timeout] Device(s) {device_list} still don't meet memory condition after {dur_s:.1f} seconds\n"
                 f"Condition: {condition_str}\n"
-                f"Current status:\n" + "\n".join(f"  Device {d}: {output[d]}" for d in devices)
+                f"Current status:\n{status}"
             )
 
         gc.collect()
         current_omni_platform.empty_cache()
         time.sleep(5)
+
+
+def _whisper_vram_allowance() -> tuple[float, int | None]:
+    """Living Whisper worker's GPU footprint and physical device.
+
+    Orthogonal to RFC #6851 leftover-engine PID reap / a raised wait ratio:
+    this only excludes the transcriber's own allocator (capped by current used
+    on that device). CPU / unknown device → ``(0.0, None)``.
+    """
+    try:
+        from tests.helpers.media import whisper_resident_device_index, whisper_resident_vram_gib
+    except Exception:
+        return 0.0, None
+    gib = whisper_resident_vram_gib()
+    logical = whisper_resident_device_index()
+    if gib <= 0.0 or logical is None:
+        return 0.0, None
+    mapped = get_physical_device_indices([logical])
+    if not mapped:
+        return 0.0, None
+    return gib, mapped[0]
 
 
 def _run_smi(label: str, cmd: list[str], head_lines: int, timeout: float = 5) -> None:
@@ -170,36 +223,6 @@ def _print_device_processes() -> None:
         print("=" * 80)
 
 
-def _cleanup_stale_device_locks() -> None:
-    """Remove stale device-initialization lock files whose recorded PID is dead.
-
-    Lock files at ``/tmp/vllm_omni_device_*_init.lock`` may persist after a
-    crashed / killed test run and block subsequent orchestrator startups.
-    """
-    import glob as _glob
-
-    for lock_file in _glob.glob("/tmp/vllm_omni_device_*_init.lock"):
-        try:
-            with open(lock_file) as fh:
-                content = fh.read().strip()
-            if not content:
-                continue
-            pid = int(content)
-        except (OSError, ValueError):
-            continue
-
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            print(f"  Removing stale device lock {lock_file} (PID {pid} is dead)")
-            try:
-                os.unlink(lock_file)
-            except OSError:
-                pass
-        except PermissionError:
-            pass
-
-
 def cleanup_test_environment(*, shutdown_ray: bool = False) -> None:
     """Tear down distributed state and reset device memory for tests."""
     from vllm import envs
@@ -224,7 +247,15 @@ def cleanup_test_environment(*, shutdown_ray: bool = False) -> None:
         ray.shutdown()
 
     print("Pre-test device status:")
-    _cleanup_stale_device_locks()
+    gc.collect()
+    if not current_omni_platform.is_cpu():
+        current_omni_platform.empty_cache()
+        try:
+            import torch
+
+            torch._C._host_emptyCache()
+        except AttributeError:
+            logger.warning("torch._C._host_emptyCache() only available in Pytorch >=2.5")
 
     num_devices = current_omni_platform.device_count()
     if num_devices > 0:
@@ -236,16 +267,6 @@ def cleanup_test_environment(*, shutdown_ray: bool = False) -> None:
             )
         except Exception as e:
             print(f"Device cleanup note: {e}")
-
-    gc.collect()
-    if not current_omni_platform.is_cpu():
-        current_omni_platform.empty_cache()
-        try:
-            import torch
-
-            torch._C._host_emptyCache()
-        except AttributeError:
-            logger.warning("torch._C._host_emptyCache() only available in Pytorch >=2.5")
 
     if current_omni_platform.is_available():
         print("Post-test device status:")

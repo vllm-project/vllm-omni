@@ -156,9 +156,11 @@ class RingParallelAttention:
         # Extract joint tensors
         joint_key, joint_value = None, None
         joint_strategy = "front"
+        valid_kv_length = None
         if attn_metadata is not None:
             joint_key = attn_metadata.joint_key
             joint_value = attn_metadata.joint_value
+            valid_kv_length = attn_metadata.extra.get("valid_kv_length")
             if attn_metadata.joint_strategy is not None:
                 joint_strategy = attn_metadata.joint_strategy
 
@@ -176,6 +178,7 @@ class RingParallelAttention:
                 joint_tensor_key=joint_key,
                 joint_tensor_value=joint_value,
                 joint_strategy=joint_strategy,
+                valid_kv_length=valid_kv_length,
             )
 
         # Ring only implements local Flash/AITER and SDPA kernels. HuggingFace
@@ -261,4 +264,5 @@ class RingParallelAttention:
             joint_tensor_key=joint_key,
             joint_tensor_value=joint_value,
             joint_strategy=joint_strategy,
+            valid_kv_length=valid_kv_length,
         )

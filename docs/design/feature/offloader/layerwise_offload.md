@@ -36,12 +36,14 @@ dependencies, not incidental global synchronization, define correctness.
 ## Topology contract
 
 A DiT declares ordered block-container attributes using
-`_layerwise_offload_blocks_attrs` or an `OffloadPlan`. Each resolved item must
-be an executable `nn.Module`; ordering must match forward execution. Multiple
-containers are concatenated in execution order.
+`_layerwise_offload_blocks_attrs` or an `OffloadPlan`. A text encoder declares
+its block-list paths through `OffloadPlan.encoder_block_attrs`. Each resolved
+item must be an executable `nn.Module`; ordering must match forward execution.
+Multiple containers are streamed as separate hook rings.
 
-Non-block DiT modules, encoders, VAEs, and declared resident modules are not
-streamed by this backend.
+Non-block state of a selected DiT or text encoder remains device resident.
+Unselected components, VAEs, and declared resident modules are not streamed by
+this backend.
 
 ## Invariants and limitations
 
@@ -50,7 +52,8 @@ streamed by this backend.
 - Blocks with heterogeneous shapes and dtypes use their recorded metadata;
   implementations must not assume identical blocks.
 - The ring is initialized before the first forward so block zero is available.
-- This backend is single-device; distributed weight reconstruction belongs to
+- This backend uses rank-local host weights. Multi-device compute may remain
+  active, but cross-rank weight reconstruction belongs to
   [Distributed Layerwise Offload](distributed_layerwise_offload.md).
 
 Shared selection and lifecycle behavior is defined in the

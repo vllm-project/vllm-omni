@@ -443,3 +443,14 @@ def test_format_empty_diffusion_outputs_preserves_empty_response_shape() -> None
     assert [result.prompt for result in results] == ["prompt-0"]
     assert [result.images for result in results] == [[]]
     assert [result.metrics for result in results] == [{}]
+
+
+def test_format_empty_diffusion_outputs_preserves_custom_output() -> None:
+    [result] = format_empty_diffusion_outputs(
+        _request("prompt-0"),
+        finished=False,
+        custom_output={"lifecycle": "started"},
+    )
+
+    assert result.custom_output == {"lifecycle": "started"}
+    assert result.finished is False

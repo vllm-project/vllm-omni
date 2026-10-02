@@ -24,11 +24,7 @@ MINICPMO_4_5_PIPELINE = PipelineConfig(
     model_type="minicpmo_4_5",
     default_deploy_config_name="minicpmo_4_5.yaml",
     model_arch="MiniCPMO45OmniForConditionalGeneration",
-    duplex_runtime_extension=("vllm_omni.experimental.fullduplex.minicpmo45.runtime.MiniCPMO45DuplexRuntimeExtension"),
-    duplex_serving_adapter=(
-        "vllm_omni.experimental.fullduplex.minicpmo45.serving_adapter.MiniCPMO45ServingRuntimeAdapter"
-    ),
-    duplex_control_enabled=True,
+    duplex_plugin="vllm_omni.model_executor.models.minicpmo_4_5.duplex.plugin.MiniCPMO45DuplexPlugin",
     # MiniCPM-o 4.5's HF config.json reports `model_type="minicpmo"` and
     # `architectures=["MiniCPMO"]` — both shared verbatim with older MiniCPM-o
     # 1.0 / 2.6 checkpoints. The only field distinguishing the generations is
@@ -51,7 +47,14 @@ MINICPMO_4_5_PIPELINE = PipelineConfig(
             owns_tokenizer=True,
             requires_multimodal_data=True,
             engine_output_type="latent",
-            sampling_constraints={"detokenize": True},
+            supports_native_mrv2_data_plane=True,
+            sampling_constraints={
+                "detokenize": True,
+                # The llm2tts bridge discards this boundary and every row
+                # after it, so stop Stage 0 as soon as either valid
+                # MiniCPM-o 4.5 turn terminator is sampled.
+                "stop_token_ids": [151704, 151645],
+            },
         ),
         StagePipelineConfig(
             stage_id=1,
@@ -63,6 +66,9 @@ MINICPMO_4_5_PIPELINE = PipelineConfig(
             custom_process_input_func=f"{_PROC}.llm2tts",
             custom_process_next_stage_input_func=f"{_PROC}.tts2code2wav_full_payload",
             async_chunk_process_next_stage_input_func=f"{_PROC}.tts2code2wav_async_chunk",
+            # Takes effect only when the deploy selects model_runner v2 for
+            # this stage (turn sessions only; duplex stays on V1).
+            supports_native_mrv2_data_plane=True,
             sampling_constraints={
                 "detokenize": False,
                 # MiniCPM-o 4.5 codec EOS is tts_config.num_audio_tokens - 1.
@@ -79,6 +85,7 @@ MINICPMO_4_5_PIPELINE = PipelineConfig(
             final_output_type="audio",
             engine_output_type="audio",
             model_arch="MiniCPMO45Code2Wav",
+            supports_native_mrv2_data_plane=True,
             sync_process_input_func=f"{_PROC}.tts2code2wav_token_only",
             sampling_constraints={"detokenize": True},
             requires_full_payload_input=True,

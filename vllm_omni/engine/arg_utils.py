@@ -54,6 +54,7 @@ def _register_omni_hf_configs() -> None:
     try:
         from transformers import AutoConfig
 
+        from vllm_omni.model_executor.models.breeze_tts_2.configuration_breeze import BreezeConfig
         from vllm_omni.model_executor.models.indextts2.configuration_indextts2 import (
             IndexTTS2Config,
             IndexTTS25Config,
@@ -92,6 +93,7 @@ def _register_omni_hf_configs() -> None:
         _CONFIG_REGISTRY = None
 
     for model_type, config_cls in [
+        ("breeze", BreezeConfig),
         ("dense", MingDenseConfig),
         ("bailingmm", MingMoeConfig),
         ("indextts2", IndexTTS2Config),
@@ -177,15 +179,16 @@ class OmniEngineArgs(EngineArgs):
             (e.g. ["text", "audio"]). If None, all modalities supported by
             the model are used.
         log_stats: Whether to log engine statistics. Defaults to False.
-        custom_pipeline_args: Dictionary of arguments for custom pipeline
-            initialization (e.g., ``{"pipeline_class": "my.Module"}``).
-            Passed through to the diffusion stage engine.
+        custom_pipeline_args: Dictionary of arguments passed through to the
+            diffusion pipeline. When it contains ``pipeline_class``, it triggers
+            custom pipeline initialization.
     """
 
     stage_id: int = 0
     model_stage: str = "thinker"
     model_arch: str | None = None
     engine_output_type: str | None = None
+    final_output: bool = False
     hf_config_name: str | None = None
     custom_process_next_stage_input_func: str | None = None
     requires_full_payload_input: bool = False
@@ -195,6 +198,8 @@ class OmniEngineArgs(EngineArgs):
     async_chunk: bool = False
     session_mode: str = "turn"
     retains_state_across_chunks: bool = False
+    use_v2_model_runner: bool = False
+    supports_native_mrv2_data_plane: bool = False
     # WS-A: Stage-1 active stream slots. 0 = legacy preempt-everything.
     # Must be declared here so engine_args dict propagation does not silently
     # drop the value when constructing OmniEngineArgs from kwargs.
@@ -216,6 +221,12 @@ class OmniEngineArgs(EngineArgs):
     # Diffusion request-mode batch admission (forwarded to OmniDiffusionConfig).
     request_batch_max_wait_ms: float = 0.0
     fa_deterministic: bool = False
+    # Tensor-parallel degree for the diffusion text encoder (forwarded to
+    # DiffusionParallelConfig via the generic diffusion fallback). Declared
+    # here so ``from_cli_args`` field filtering keeps ``--text-encoder-tp-size``
+    # for library callers (#7564); registered pipelines may consume it through
+    # their own stage_cli_aliases or deploy YAML.
+    text_encoder_tp_size: int | None = None
 
     @classmethod
     def _add_omni_specific_args(cls, parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
@@ -381,9 +392,9 @@ class OmniEngineArgs(EngineArgs):
                 if tokenizer_subfolder:
                     # Download just the tokenizer files from the subfolder
                     try:
-                        from huggingface_hub import snapshot_download
+                        from vllm_omni.transformers_utils.repo_utils import hf_api
 
-                        local_dir = snapshot_download(
+                        local_dir = hf_api().snapshot_download(
                             model_path,
                             allow_patterns=[
                                 f"{tokenizer_subfolder}/tokenizer*",
@@ -419,6 +430,8 @@ class OmniEngineArgs(EngineArgs):
             async_chunk=self.async_chunk,
             session_mode=self.session_mode,
             retains_state_across_chunks=self.retains_state_across_chunks,
+            use_v2_model_runner=self.use_v2_model_runner,
+            supports_native_mrv2_data_plane=self.supports_native_mrv2_data_plane,
             active_stream_window=self.active_stream_window,
             duplex_max_sessions=self.duplex_max_sessions,
             model_stage=self.model_stage,
@@ -426,6 +439,7 @@ class OmniEngineArgs(EngineArgs):
             worker_type=self.worker_type,
             pooling_output_decoder=self.pooling_output_decoder,
             engine_output_type=self.engine_output_type,
+            final_output=self.final_output,
             hf_config_name=self.hf_config_name,
             custom_process_next_stage_input_func=self.custom_process_next_stage_input_func,
             requires_full_payload_input=self.requires_full_payload_input,
@@ -443,8 +457,8 @@ class OmniEngineArgs(EngineArgs):
 @dataclass
 class OmniAsyncEngineArgs(AsyncEngineArgs, OmniEngineArgs):
     @classmethod
-    def add_cli_args(cls, parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
-        parser = AsyncEngineArgs.add_cli_args(parser)
+    def add_cli_args(cls, parser: argparse.ArgumentParser, async_args_only: bool = False) -> argparse.ArgumentParser:
+        parser = AsyncEngineArgs.add_cli_args(parser, async_args_only=async_args_only)
         parser = OmniEngineArgs._add_omni_specific_args(parser)
         return parser
 
@@ -504,6 +518,10 @@ class OrchestratorArgs:
     # === Lifecycle ===
     stage_init_timeout: int = 300
     init_timeout: int = 600
+    # Initialize stages sharing a physical GPU concurrently, guarded by
+    # pre-launch admission + engine-core SH/EX device locks. Off by default;
+    # enable only when the GPU is dedicated to this deployment.
+    parallel_stage_init: bool = False
 
     # === Cross-stage Communication ===
     batch_timeout: int = 10
@@ -514,7 +532,7 @@ class OrchestratorArgs:
 
     # === Config Files ===
     deploy_config: str | None = None
-    stage_overrides: str | None = None  # raw JSON string; parsed downstream
+    stage_overrides: dict[str, dict[str, Any]] | None = None
     # Optional composable-parallel strategy.yaml; orchestrator reads it, overlays
     # derived sizing onto merged stages, then drops it before per-stage engine args.
     strategy_config: str | None = None
@@ -562,12 +580,18 @@ class OrchestratorArgs:
     diffusion_compile_dynamic: bool | None = None
     cache_backend: str = "none"
     cache_config: str | None = None
+    video_output_transport: dict[str, object] | None = None
     enable_cache_dit_summary: bool = False
     step_execution: bool = False
     vae_use_slicing: bool = False
     vae_use_tiling: bool = False
+    vae_fast_path: str = "lossless"
     enable_multithread_weight_load: bool = True
+    enable_broadcast_weight_load: bool = False
     num_weight_load_threads: int = 4
+    diffusion_offload_config: dict[str, Any] | None = None
+    # Compatibility aliases for existing callers and model-specific stage
+    # lifecycles that are broader than the compact dit/text_encoder selector.
     enable_cpu_offload: bool = False
     enable_layerwise_offload: bool = False
     enable_distributed_layerwise_offload: bool = False

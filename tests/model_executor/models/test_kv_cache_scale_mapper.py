@@ -67,8 +67,11 @@ class _FakeHunyuanModel(_FakeModel):
             use_cla=False,
         )
 
-    def get_expert_mapping(self) -> tuple[list[object], dict[str, object]]:
-        return [], {}
+    def get_expert_mapping(self) -> list[object]:
+        return []
+
+    def _get_expert_weights_remapping(self) -> dict[str, object]:
+        return {}
 
     def _split_qkv_weight(self, weight: torch.Tensor) -> torch.Tensor:
         return weight
@@ -79,6 +82,49 @@ def test_model_loaders_do_not_call_removed_get_cache_scale(rel_path: str) -> Non
     """Affected loaders must not call the removed vLLM get_cache_scale API."""
     source = (_REPO_ROOT / rel_path).read_text(encoding="utf-8")
     assert ".get_cache_scale(" not in source
+
+
+@pytest.mark.parametrize(
+    ("module_name", "class_name"),
+    [
+        (
+            "vllm_omni.model_executor.models.hunyuan_image3.hunyuan_image3",
+            "HunyuanModel",
+        ),
+        (
+            "vllm_omni.diffusion.models.hunyuan_image3.hunyuan_image3_transformer",
+            "HunyuanImage3Model",
+        ),
+    ],
+)
+def test_hunyuan_expert_mapping_separates_public_and_local_contracts(
+    module_name: str,
+    class_name: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The public expert mapping must be a flat list, not a loader-side pair."""
+    module = __import__(module_name, fromlist=[class_name])
+    expected_mapping = [("param", "weight", 0, "gate_proj")]
+    fake_model = SimpleNamespace(
+        config=SimpleNamespace(num_experts=1),
+        num_redundant_experts=0,
+    )
+    monkeypatch.setattr(module, "_is_moe", lambda config: True)
+    if hasattr(module, "fused_moe_make_expert_params_mapping"):
+        monkeypatch.setattr(module, "fused_moe_make_expert_params_mapping", lambda **kwargs: expected_mapping)
+    else:
+        monkeypatch.setattr(
+            module,
+            "FusedMoE",
+            SimpleNamespace(make_expert_params_mapping=lambda *args, **kwargs: expected_mapping),
+        )
+
+    model_cls = getattr(module, class_name)
+    assert model_cls.get_expert_mapping(fake_model) == expected_mapping
+    assert model_cls._get_expert_weights_remapping(fake_model) == {
+        "gate_proj": ("gate_and_up_proj", 1, 2),
+        "up_proj": ("gate_and_up_proj", 0, 2),
+    }
 
 
 @pytest.mark.parametrize(
