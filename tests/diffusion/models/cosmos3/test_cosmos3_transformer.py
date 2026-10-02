@@ -207,7 +207,7 @@ def test_transformer_component_quant_reaches_real_linear(monkeypatch: pytest.Mon
             del args, kwargs
             super().__init__()
 
-    monkeypatch.setattr(transformer_cosmos3, "FrameworkAttention", _StubFrameworkAttention)
+    monkeypatch.setattr(transformer_cosmos3, "build_attention", _StubFrameworkAttention)
 
     leaf = _LeafQuantConfig()
     router = ComponentQuantizationConfig({"transformer": leaf})
@@ -1179,6 +1179,10 @@ def test_multi_control_attention_weights_target_outputs() -> None:
     from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3 import Cosmos3CrossAttention
 
     class ControlValueAttention:
+        def for_layout(self, layout=None):
+            assert layout is None
+            return self
+
         def __call__(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, metadata) -> torch.Tensor:
             assert metadata.extra["protected_kv_prefix"] == 1
             del k

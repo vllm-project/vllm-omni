@@ -33,6 +33,7 @@ from vllm_omni.diffusion.attention.capabilities import (
     ParallelStrategy,
     SupportStatus,
 )
+from vllm_omni.diffusion.attention.contracts import MethodCapabilities
 from vllm_omni.diffusion.config import get_current_diffusion_config_or_none
 from vllm_omni.platforms import current_omni_platform
 
@@ -268,6 +269,8 @@ def _flash_attention_execution_path(
 
 
 class FlashAttentionBackend(AttentionBackend):
+    strategy_capabilities = MethodCapabilities(local_execution=True)
+
     accept_output_buffer: bool = True
     supports_piecewise_spans: bool = True
     supports_paged_kv: bool = True

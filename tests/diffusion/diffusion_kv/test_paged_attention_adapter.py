@@ -1355,6 +1355,7 @@ def test_omni_attention_wraps_paged_kernel_with_sp_hooks() -> None:
 
     layer = Attention.__new__(Attention)
     nn.Module.__init__(layer)
+    layer.attn_spec = None
     layer.prefix = "layer-0"
     layer.paged_kv_cache_role = "primary"
     layer.attn_backend = SimpleNamespace(supports_paged_kv=True, get_name=lambda: "FLASH_ATTN")
@@ -1401,6 +1402,7 @@ def test_omni_attention_strips_paged_ulysses_padding_around_kernel() -> None:
 
     layer = Attention.__new__(Attention)
     nn.Module.__init__(layer)
+    layer.attn_spec = None
     layer.prefix = "layer-0"
     layer.paged_kv_cache_role = "primary"
     layer.attn_backend = SimpleNamespace(supports_paged_kv=True, get_name=lambda: "FLASH_ATTN")
@@ -1425,6 +1427,7 @@ def test_omni_attention_rejects_paged_request_for_backend_without_paged_support(
 
     layer = Attention.__new__(Attention)
     nn.Module.__init__(layer)
+    layer.attn_spec = None
     layer.prefix = "layer-0"
     layer.paged_kv_cache_role = "primary"
     layer.attn_backend = SimpleNamespace(supports_paged_kv=False, get_name=lambda: "SDPA")
@@ -1456,6 +1459,7 @@ def test_omni_attention_keeps_dense_kernel_without_active_adapter() -> None:
 
     layer = Attention.__new__(Attention)
     nn.Module.__init__(layer)
+    layer.attn_spec = None
     layer.paged_kv_cache_role = "primary"
     layer.use_ring = False
     layer._no_parallel_strategy = object()
@@ -1479,6 +1483,7 @@ def test_omni_attention_keeps_dense_kernel_without_active_adapter() -> None:
 def test_omni_attention_rejects_scheduler_paged_forward_without_active_adapter() -> None:
     layer = Attention.__new__(Attention)
     nn.Module.__init__(layer)
+    layer.attn_spec = None
     layer._scheduler_paged_kv = True
     layer.paged_kv_cache_role = "primary"
     layer._get_active_parallel_strategy = lambda: object()

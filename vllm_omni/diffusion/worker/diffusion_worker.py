@@ -653,6 +653,25 @@ class DiffusionWorker:
         """Close runner-owned AR state through the collective RPC boundary."""
         return self._run_ar_diffusion_session_lifecycle("close_session", session_id)
 
+    def _attention_strategy_runners(self):
+        assert self.model_runner is not None
+        pipeline = self.model_runner.pipeline
+        for name in getattr(pipeline, "attention_strategy_components", ()):
+            model = getattr(pipeline, name, None)
+            runner = getattr(model, "_attention_strategy_runner", None)
+            if runner is not None:
+                yield name, runner
+
+    def attention_strategy_status(self):
+        """Read-only evidence; compiled activation alone is not warmup readiness."""
+        return {name: runner.warmup_status() for name, runner in self._attention_strategy_runners()}
+
+    def attention_strategy_warmup(self, active: bool):
+        """Serialized worker RPC, called before admitting serving requests."""
+        for _, runner in self._attention_strategy_runners():
+            runner.set_warmup(active)
+        return self.attention_strategy_status()
+
     def execute_model(
         self,
         req: OmniDiffusionRequest | list[NewRequestData],

@@ -8,6 +8,7 @@
 
 
 from collections.abc import Mapping
+from copy import deepcopy
 from dataclasses import replace
 from typing import cast
 
@@ -28,12 +29,13 @@ from vllm_omni.diffusion.attention.capabilities import (
     OuterBoundary,
     ParallelStrategy,
 )
+from vllm_omni.diffusion.attention.contracts import LEGACY_EXECUTION, validate_strategy_attention
 from vllm_omni.diffusion.attention.parallel import build_parallel_attention_strategy
 from vllm_omni.diffusion.attention.parallel.base import NoParallelAttention
 from vllm_omni.diffusion.attention.parallel.ring import RingParallelAttention
 from vllm_omni.diffusion.attention.selector import get_attn_backend_for_role
 from vllm_omni.diffusion.config import get_current_diffusion_config_or_none
-from vllm_omni.diffusion.data import BlockSparseAttentionSpec
+from vllm_omni.diffusion.data import AttentionConfig, AttentionSpec, BlockSparseAttentionSpec
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.diffusion_kv.layout import assert_backend_layout_supported
 from vllm_omni.diffusion.distributed.parallel_state import get_sp_group
@@ -57,8 +59,16 @@ def _try_extract_layer_index(prefix: str) -> int | None:
 
 
 class Attention(nn.Module):
+    attention_execution = LEGACY_EXECUTION
+
     _scheduler_paged_kv = False
     _has_custom_attention = False
+
+    def for_layout(self, layout: int | None = None) -> "Attention":
+        """Select the executor; legacy attention has no layout bank."""
+        if layout is not None:
+            raise ValueError("Legacy attention does not accept an attention layout")
+        return self
 
     def __init__(
         self,
@@ -98,6 +108,7 @@ class Attention(nn.Module):
         # Keep the platform-selected backend and its capabilities unchanged.
         # Each override must preserve the selected implementation's contract.
         impl_overrides: Mapping[str, type[AttentionImpl]] | None = None,
+        _attention_spec: AttentionSpec | BlockSparseAttentionSpec | None = None,
     ):
         super().__init__()
 
@@ -129,6 +140,8 @@ class Attention(nn.Module):
 
         config = get_current_diffusion_config_or_none()
         attention_config = config.diffusion_attention_config if config is not None else None
+        if _attention_spec is not None:
+            attention_config = AttentionConfig(default=_attention_spec)
         parallel_config = getattr(config, "parallel_config", None)
         self._hsdp_compile_boundary_enabled = bool(getattr(parallel_config, "use_hsdp", False))
 
@@ -202,6 +215,11 @@ class Attention(nn.Module):
                 self.backend_pref = attn_backend_cls.get_name()
                 logger.debug("Attention(role=%s) → platform default (%s)", role, self.backend_pref)
 
+            if _attention_spec is not None:
+                validate_strategy_attention(
+                    spec,
+                    attn_backend_cls,
+                )
             self.attn_backend = attn_backend_cls
             if isinstance(spec, BlockSparseAttentionSpec):
                 from vllm_omni.diffusion.attention.block_sparse import (
@@ -353,7 +371,9 @@ class Attention(nn.Module):
         (e.g., in noise_refiner/context_refiner before unified_prepare in Z-Image).
         This avoids unnecessary SP communication for layers not covered by _sp_plan.
         """
-        if self.skip_sequence_parallel:
+        if self.skip_sequence_parallel or (
+            self.attention_execution.local_tensor_forward and self.attention_execution.ulysses_degree == 1
+        ):
             return self._no_parallel_strategy
         if is_forward_context_available():
             ctx = get_forward_context()
@@ -391,6 +411,8 @@ class Attention(nn.Module):
             raise ValueError("Attention quantization skip_layers requires a parseable transformer block index.")
 
     def _should_apply_kv_cache_quant(self) -> bool:
+        if self.attention_execution.local_tensor_forward:
+            return False  # Startup validation requires unquantized local execution.
         skip_steps = self._kv_cache_skip_steps
         skip_layers = self._kv_cache_skip_layers
         if skip_steps is not None:
@@ -436,6 +458,8 @@ class Attention(nn.Module):
         return self._forward_impl(query, key, value, attn_metadata)
 
     def _uses_hsdp_compile_boundary(self) -> bool:
+        if self.attention_execution.local_tensor_forward:
+            return False
         if self._hsdp_compile_boundary_enabled:
             return True
         if not is_forward_context_available():
@@ -454,7 +478,12 @@ class Attention(nn.Module):
         *,
         inputs_are_local: bool = False,
     ) -> ExecutionPathResult:
-        """Compose backend capabilities with outer Attention boundaries."""
+        """Compose backend capabilities without executing communication or kernels.
+
+        Strategy Ulysses queries require ``inputs_are_local=True`` and the
+        actual local-kernel inputs after resharding, joint-KV assembly and
+        suffix trimming. Preparation evidence belongs to that geometry.
+        """
         boundaries = set(context.outer_boundaries)
         if self._uses_hsdp_compile_boundary():
             boundaries.add(OuterBoundary.HSDP)
@@ -531,8 +560,12 @@ class Attention(nn.Module):
     ) -> torch.Tensor:
         # Get the appropriate parallel strategy based on SP active state
         strategy = self._get_active_parallel_strategy()
-        paged_adapter = self._active_paged_kv_adapter()
-        in_kv_memory_profile = is_forward_context_available() and get_forward_context().in_diffusion_kv_memory_profile
+        paged_adapter = None if self.attention_execution.local_tensor_forward else self._active_paged_kv_adapter()
+        in_kv_memory_profile = (
+            not self.attention_execution.local_tensor_forward
+            and is_forward_context_available()
+            and get_forward_context().in_diffusion_kv_memory_profile
+        )
         if (
             self._scheduler_paged_kv
             and self.paged_kv_cache_role is not None
@@ -585,19 +618,19 @@ class Attention(nn.Module):
         # For Ring: Concat joint_q
         query, key, value, attn_metadata, ctx = strategy.pre_attention(query, key, value, attn_metadata)
 
-        sparse_sp_padding = 0
-        if sparse_ulysses and attn_metadata is not None:
-            sparse_sp_padding = attn_metadata.extra.get("ulysses_sp_padding", 0)
-            if sparse_sp_padding:
+        ulysses_sp_padding = 0
+        if strategy.name == "ulysses" and strategy.enabled and attn_metadata is not None:
+            ulysses_sp_padding = attn_metadata.extra.get("ulysses_sp_padding", 0)
+            if ulysses_sp_padding:
                 if (
-                    type(sparse_sp_padding) is not int
-                    or not 0 < sparse_sp_padding < query.shape[1]
+                    type(ulysses_sp_padding) is not int
+                    or not 0 < ulysses_sp_padding < query.shape[1]
                     or attn_metadata.joint_strategy != "front"
                 ):
-                    raise ValueError("Invalid sparse Ulysses suffix padding")
-                query = query[:, :-sparse_sp_padding].contiguous()
-                key = key[:, :-sparse_sp_padding].contiguous()
-                value = value[:, :-sparse_sp_padding].contiguous()
+                    raise ValueError("Invalid Ulysses suffix padding")
+                query = query[:, :-ulysses_sp_padding].contiguous()
+                key = key[:, :-ulysses_sp_padding].contiguous()
+                value = value[:, :-ulysses_sp_padding].contiguous()
 
         # Scheduler rows describe the logical sequence, while strict Ulysses
         # may append synthetic tokens solely to make the image shard divisible.
@@ -654,8 +687,8 @@ class Attention(nn.Module):
             output_padding = out.new_zeros((out.shape[0], paged_sp_padding, *out.shape[2:]))
             out = torch.cat((out[:, :padding_start], output_padding, out[:, padding_start:]), dim=1)
 
-        if sparse_sp_padding:
-            padding = out.new_zeros((out.shape[0], sparse_sp_padding, *out.shape[2:]))
+        if ulysses_sp_padding:
+            padding = out.new_zeros((out.shape[0], ulysses_sp_padding, *out.shape[2:]))
             out = torch.cat((out, padding), dim=1)
 
         # 3. Post-processing (Reverse Communication)
@@ -704,7 +737,11 @@ class Attention(nn.Module):
             logger.warning_once("Using SDPA for this layer's FP32 input with automatic CUDA FlashAttention selection.")
             return cast(AttentionImpl, self.sdpa_fallback).forward(query, key, value, attn_metadata)
 
-        in_kv_memory_profile = is_forward_context_available() and get_forward_context().in_diffusion_kv_memory_profile
+        in_kv_memory_profile = (
+            not self.attention_execution.local_tensor_forward
+            and is_forward_context_available()
+            and get_forward_context().in_diffusion_kv_memory_profile
+        )
         # The startup KV-capacity profile needs tensor shapes, not a paged
         # attention result. If dense FLASH_ATTN deps are absent (NPU MindIE-SD
         # or CUDA CuTe FA4), SDPA provides that profile forward. Formal paged
@@ -768,3 +805,66 @@ class Attention(nn.Module):
             )
 
         raise RuntimeError("Ring attention is enabled but strategy is not RingParallelAttention")
+
+
+def build_attention(*, operation=None, **options) -> "Attention | StrategyAttention":
+    """Build ordinary attention or a layout bank using Attention's keyword options."""
+    config = get_current_diffusion_config_or_none()
+    attention_config = config.diffusion_attention_config if config is not None else None
+    strategy = attention_config.strategy if attention_config is not None else None
+    if strategy is None:
+        return Attention(**options)
+    if options.get("custom_attention") is not None:
+        raise ValueError("Attention strategies require configurable concrete methods, not a custom kernel")
+
+    from vllm_omni.diffusion.attention.strategy import AttentionOperation
+
+    if not isinstance(operation, AttentionOperation):
+        raise ValueError("Strategy attention requires an explicit AttentionOperation descriptor")
+    if operation.role != options.get("role", "self") or operation.category != options.get("role_category"):
+        raise ValueError("Attention operation descriptor does not match the model's declared role")
+    return StrategyAttention(strategy, operation, options)
+
+
+class StrategyAttention(nn.Module):
+    """Own concrete executors without inheriting their backend-specific state or methods."""
+
+    attention_execution = LEGACY_EXECUTION
+
+    def __init__(self, strategy, operation, options):
+        super().__init__()
+        self._attention_strategy = strategy
+        self._strategy_operation = operation
+        self.prefix = operation.identity
+        self.role = operation.role
+        self.role_category = operation.category
+        specs = []
+        layout_variants = []
+        for spec in strategy.assignments(operation):
+            if spec not in specs:
+                specs.append(spec)
+            layout_variants.append(specs.index(spec))
+        self._strategy_layout_variants = tuple(layout_variants)
+        self._strategy_variants = nn.ModuleList(Attention(**options, _attention_spec=deepcopy(spec)) for spec in specs)
+        for executor in self._strategy_variants:
+            executor.layer_idx = operation.layer
+
+    def for_layout(self, layout: int | None = None) -> Attention:
+        if layout is None:
+            if len(self._strategy_variants) != 1:
+                raise ValueError("Scheduled attention requires an explicit layout selection")
+            return self._strategy_variants[0]
+        if type(layout) is not int or not 0 <= layout < len(self._strategy_layout_variants):
+            raise ValueError(f"Invalid attention layout: {layout!r}")
+        return self._strategy_variants[self._strategy_layout_variants[layout]]
+
+    def forward(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata: AttentionMetadata | None = None,
+        *,
+        attention_layout: int | None = None,
+    ) -> torch.Tensor:
+        return self.for_layout(attention_layout)(query, key, value, attn_metadata)

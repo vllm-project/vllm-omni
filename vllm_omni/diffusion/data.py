@@ -1429,6 +1429,11 @@ class OmniDiffusionConfig:
         # Match vLLM's config flow: parse entrypoint shorthands before the
         # config object is built, and keep a single runtime truth source.
         self.diffusion_attention_config = build_attention_config(self.diffusion_attention_config)
+        self._resolve_checkpoint_attention_config(self.tf_model_config)
+
+        from vllm_omni.diffusion.attention.strategy import validate_strategy_runtime
+
+        validate_strategy_runtime(self)
         self.diffusion_kv_cache_skip_step_indices = parse_kv_cache_skip_selector(self.diffusion_kv_cache_skip_steps)
         self.diffusion_kv_cache_skip_layer_indices = parse_kv_cache_skip_selector(self.diffusion_kv_cache_skip_layers)
 
@@ -1513,14 +1518,15 @@ class OmniDiffusionConfig:
         return False
 
     def set_tf_model_config(self, tf_config: "TransformerConfig") -> None:
-        """Assign `tf_model_config` and propagate quantization if detected.
+        """Assign transformer metadata and resolve quantization and attention defaults.
 
         In the normal startup flow `OmniDiffusionConfig` is created
         *before* the transformer `config.json` is loaded from disk, so
         `__post_init__` sees an empty `TransformerConfig`.  Callers
         that load the config later should use this method instead of bare
         assignment so that an embedded `quant_config` is propagated to
-        `self.quantization_config` automatically.
+        `self.quantization_config` automatically and checkpoint attention policies
+        are resolved before model construction.
 
         Args:
             tf_config: Transformer configuration, typically built via
@@ -1528,7 +1534,39 @@ class OmniDiffusionConfig:
         """
         self.tf_model_config = tf_config
         self._propagate_quantization_from_tf_config(tf_config)
+        self._resolve_checkpoint_attention_config(tf_config)
         self._propagate_skip_softmax_calibration(tf_config)
+        from vllm_omni.diffusion.attention.strategy import validate_strategy_runtime
+
+        try:
+            validate_strategy_runtime(self)
+        except ValueError as exc:
+            from vllm_omni.diffusion.attention.checkpoint import CheckpointAttentionPolicyError
+
+            raise CheckpointAttentionPolicyError(str(exc)) from exc
+
+    def _resolve_checkpoint_attention_config(self, tf_config: "TransformerConfig") -> None:
+        from vllm_omni.diffusion.attention.checkpoint import (
+            CheckpointAttentionPolicyError,
+            resolve_checkpoint_attention_config,
+        )
+
+        # Keep the deployment input separate from checkpoint-derived defaults so
+        # repeated metadata loading cannot turn a checkpoint policy into an override.
+        previous_source = getattr(self, "attention_policy_source", None)
+        runtime: AttentionConfig = (
+            self._runtime_attention_config if previous_source == "checkpoint" else self.diffusion_attention_config
+        )
+        try:
+            effective, source = resolve_checkpoint_attention_config(runtime, tf_config)
+        except (TypeError, ValueError) as exc:
+            raise CheckpointAttentionPolicyError(str(exc)) from exc
+        if source == "checkpoint" and previous_source != "checkpoint":
+            self._runtime_attention_config: AttentionConfig = copy.deepcopy(runtime)
+        self.diffusion_attention_config = effective
+        self.attention_policy_source = source
+        if source != "default":
+            logger.info("Resolved diffusion attention policy (source=%s)", source)
 
     def _propagate_skip_softmax_calibration(self, tf_config: "TransformerConfig") -> None:
         cfg = getattr(self, "diffusion_attention_config", None)
@@ -1597,6 +1635,7 @@ class OmniDiffusionConfig:
         """
         from vllm.transformers_utils.config import get_hf_file_to_dict
 
+        from vllm_omni.diffusion.attention.checkpoint import CheckpointAttentionPolicyError
         from vllm_omni.diffusion.registry import resolve_native_single_file
         from vllm_omni.diffusion.utils.hf_utils import (
             get_diffusion_model_index,
@@ -1649,6 +1688,8 @@ class OmniDiffusionConfig:
                         self.set_tf_model_config(TransformerConfig())
             else:
                 raise FileNotFoundError("Diffusers pipeline index not found")
+        except CheckpointAttentionPolicyError:
+            raise
         except (AttributeError, OSError, ValueError, FileNotFoundError):
             # Skip transformer config loading for diffusers adapter
             # (non-DiT models don't have a separate transformer folder/config)
@@ -2266,8 +2307,18 @@ class AttentionConfig:
 
     default: AttentionSpec | BlockSparseAttentionSpec | None = None
     per_role: dict[str, AttentionSpec | BlockSparseAttentionSpec] = field(default_factory=dict)
+    presets: dict[str, AttentionSpec | BlockSparseAttentionSpec] = field(default_factory=dict)
+    layout: dict[str, Any] | None = None
+    layouts: dict[str, Any] | None = None
+    schedule: dict[str, Any] | None = None
+    checkpoint_policy: str = "auto"
 
     def __post_init__(self) -> None:
+        if self.checkpoint_policy not in ("auto", "ignore"):
+            raise ValueError("checkpoint_policy must be 'auto' or 'ignore'")
+        active = any(value is not None for value in (self.layout, self.layouts, self.schedule))
+        if active and (self.default is not None or self.per_role):
+            raise ValueError("An active strategy is mutually exclusive with default and per_role")
         if self.default is not None:
             self.default = self._coerce_spec_or_none(self.default, "default")
 
@@ -2277,6 +2328,20 @@ class AttentionConfig:
             if spec is not None:
                 normalized_per_role[role_key] = spec
         self.per_role = normalized_per_role
+        if not isinstance(self.presets, Mapping):
+            raise ValueError("presets must be a mapping")
+        normalized_presets = {}
+        for name, raw in self.presets.items():
+            if not isinstance(name, str) or not name:
+                raise ValueError("Preset names must be nonempty strings")
+            spec = self._coerce_spec(raw, f"presets[{name!r}]")
+            normalized_presets[name] = spec
+        self.presets = normalized_presets
+        self.strategy = None
+        if active:
+            from vllm_omni.diffusion.attention.strategy import AttentionStrategy
+
+            self.strategy = AttentionStrategy(self.presets, self.layout, self.layouts, self.schedule)
 
     @staticmethod
     def _coerce_spec(spec_data: Any, field_name: str) -> AttentionSpec | BlockSparseAttentionSpec:
@@ -2356,6 +2421,8 @@ class AttentionConfig:
         role_category: str | None = None,
     ) -> tuple[AttentionSpec | BlockSparseAttentionSpec | None, str | None]:
         """Resolve the AttentionSpec and report which config entry matched."""
+        if self.strategy is not None:
+            raise ValueError("Active attention strategies require operation/layout resolution, not a single role spec")
         spec = self.per_role.get(role)
         if spec is not None:
             return spec, f"attention_config.per_role[{role!r}]"
@@ -2393,6 +2460,8 @@ def parse_attention_config(
         )
 
     if attention_backend is not None:
+        if normalized.strategy is not None:
+            raise ValueError("An active strategy is mutually exclusive with --diffusion-attention-backend")
         if normalized.default is not None:
             raise ValueError(
                 "--diffusion-attention-backend is mutually exclusive with --diffusion-attention-config.default.backend."
@@ -2422,7 +2491,7 @@ def build_attention_config(
     """
     normalized = parse_attention_config(attention_config)
 
-    if normalized.default is not None:
+    if normalized.strategy is not None or normalized.default is not None:
         return normalized
 
     env_attention_backend = os.environ.get("DIFFUSION_ATTENTION_BACKEND")
