@@ -115,6 +115,7 @@ def _make_pipeline() -> Wan22Pipeline:
     pipeline._guidance_scale_2 = None
     pipeline._num_timesteps = None
     pipeline._current_timestep = None
+    pipeline._cache_dit_requires_paired_cfg = False
     pipeline.check_inputs = lambda **kwargs: None
     pipeline.encode_prompt = _stub_encode_prompt  # type: ignore[method-assign]
     pipeline.prepare_latents = lambda **kwargs: torch.zeros((1, 4, 1, 8, 8), dtype=torch.float32)
@@ -287,6 +288,7 @@ def test_forward_emits_request_local_typed_media_after_vae_decode() -> None:
         latent_condition,
         first_frame_mask,
         generator,
+        guidance_interval,
     ):
         del (
             timesteps,
@@ -300,6 +302,7 @@ def test_forward_emits_request_local_typed_media_after_vae_decode() -> None:
             latent_condition,
             first_frame_mask,
             generator,
+            guidance_interval,
         )
         return torch.zeros_like(latents)
 
@@ -693,3 +696,86 @@ def test_load_weights_keeps_trained_vsa_gate(monkeypatch) -> None:
 
     assert pipeline.has_gate_compress_weights is True
     assert gate.to_gate_compress is original_gate
+
+
+def _run_diffuse_with_interval(pipeline, guidance_interval):
+    latents = torch.zeros((1, 1, 1, 2, 2), dtype=torch.float32)
+    predict_calls: list[dict[str, object]] = []
+
+    def _fake_predict_noise_maybe_with_cfg(**kwargs):
+        predict_calls.append(kwargs)
+        return torch.ones_like(latents)
+
+    def _fake_scheduler_step_maybe_with_cfg(noise_pred, t, current_latents, do_true_cfg):
+        return current_latents + noise_pred
+
+    pipeline.predict_noise_maybe_with_cfg = _fake_predict_noise_maybe_with_cfg  # type: ignore[method-assign]
+    pipeline.scheduler_step_maybe_with_cfg = _fake_scheduler_step_maybe_with_cfg  # type: ignore[method-assign]
+    pipeline.diffuse(
+        latents=latents,
+        timesteps=torch.tensor([900.0, 600.0, 500.0]),
+        prompt_embeds=torch.randn(1, 8),
+        negative_prompt_embeds=torch.randn(1, 8),
+        guidance_low=4.0,
+        guidance_high=4.0,
+        boundary_timestep=None,
+        dtype=torch.float32,
+        attention_kwargs={},
+        guidance_interval=guidance_interval,
+    )
+    return [(call["do_true_cfg"], call["true_cfg_scale"]) for call in predict_calls]
+
+
+def test_diffuse_guidance_interval_skips_the_negative_pass_outside_the_interval() -> None:
+    assert _run_diffuse_with_interval(_make_pipeline(), None) == [(True, 4.0)] * 3
+    # The interval is inclusive: the step at t=600 still runs guided, the step at t=500 does not.
+    assert _run_diffuse_with_interval(_make_pipeline(), (600.0, 1000.0)) == [(True, 4.0), (True, 4.0), (False, 1.0)]
+
+
+def test_diffuse_guidance_interval_keeps_paired_cfg_when_cache_dit_active() -> None:
+    pipeline = _make_pipeline()
+    pipeline._cache_dit_requires_paired_cfg = True
+    assert _run_diffuse_with_interval(pipeline, (600.0, 1000.0)) == [(True, 4.0), (True, 4.0), (True, 1.0)]
+
+
+def _forward_with_extra_args(pipeline, extra_args):
+    captured: dict[str, object] = {}
+
+    def _fake_diffuse(**kwargs):
+        captured.update(kwargs)
+        return kwargs["latents"] + 1
+
+    pipeline.diffuse = _fake_diffuse  # type: ignore[method-assign]
+    request = OmniDiffusionRequest(
+        prompt="prompt",
+        request_id="test-req",
+        sampling_params=OmniDiffusionSamplingParams(
+            num_frames=1,
+            num_inference_steps=2,
+            max_sequence_length=32,
+            output_type="latent",
+            guidance_scale=4.0,
+            extra_args=extra_args,
+        ),
+    )
+    pipeline.forward(DiffusionRequestBatch(requests=[request]))
+    return captured
+
+
+def test_forward_resolves_guidance_interval_from_extra_args() -> None:
+    assert _forward_with_extra_args(_make_pipeline(), {})["guidance_interval"] is None
+    captured = _forward_with_extra_args(_make_pipeline(), {"guidance_interval": [600, 1000]})
+    assert captured["guidance_interval"] == (600.0, 1000.0)
+
+
+@pytest.mark.parametrize("bad", [[1000, 600], [600], [float("nan"), 1000], "69", {"lo": 600, "hi": 1000}])
+def test_forward_rejects_malformed_guidance_interval(bad) -> None:
+    with pytest.raises(ValueError, match="guidance_interval"):
+        _forward_with_extra_args(_make_pipeline(), {"guidance_interval": bad})
+
+
+def test_forward_rejects_guidance_interval_on_expand_timesteps_checkpoints() -> None:
+    pipeline = _make_pipeline()
+    pipeline.expand_timesteps = True
+    with pytest.raises(ValueError, match="expand_timesteps"):
+        _forward_with_extra_args(pipeline, {"guidance_interval": [600, 1000]})
