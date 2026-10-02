@@ -396,3 +396,18 @@ def test_short_pauses_do_not_split_continuous_speech_into_repeated_turns():
     config = SileroVADConfig(threshold=0.5, prefix_padding_ms=0, silence_duration_ms=500, min_speech_duration_ms=32)
     scores = [0.9] + [0.1, 0.9, 0.9, 0.9] * 20
     assert _drive(config, scores) == [("start", 0)]
+
+
+def test_interrupt_response_false_is_accepted_as_listen_only() -> None:
+    assert (
+        validate_realtime_turn_detection(
+            {
+                "turn_detection": {
+                    "type": "server_vad",
+                    "interrupt_response": False,
+                },
+                "overlap_policy": "listen_only",
+            }
+        )
+        is None
+    )

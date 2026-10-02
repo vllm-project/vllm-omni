@@ -62,6 +62,12 @@ def _valid_vad_number(value: object, *, minimum: float, maximum: float | None = 
     )
 
 
+def _numeric(value: object, default: float) -> float:
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return default
+    return float(value)
+
+
 #: Every field a ``server_vad`` object may carry. Unknown keys are refused
 #: rather than ignored: a misspelled tuning knob that silently does nothing is
 #: worse than a rejected session, because the endpointing still *looks* applied.
@@ -102,11 +108,14 @@ def validate_realtime_turn_detection(session_payload: Mapping[str, object]) -> s
             value = turn_detection.get(name)
             if value is not None and not _valid_vad_number(value, minimum=0):
                 return f"{field}.{name} must be a non-negative number"
-        if turn_detection.get("interrupt_response", True) is not True:
-            return (
-                f"{field}.interrupt_response=false is unsupported; use turn_detection=null for model-owned listen/speak"
-            )
-    desired_policy = "barge_in_on_speech" if turn_detection is not None else "listen_only"
+        if turn_detection.get("interrupt_response", True) not in {True, False}:
+            return f"{field}.interrupt_response must be a boolean"
+    if turn_detection is None:
+        desired_policy = "listen_only"
+    elif turn_detection.get("interrupt_response", True) is False:
+        desired_policy = "listen_only"
+    else:
+        desired_policy = "barge_in_on_speech"
     overlap_policy = session_payload.get("overlap_policy")
     if isinstance(overlap_policy, str) and overlap_policy != desired_policy:
         return f"overlap_policy={overlap_policy!r} conflicts with turn_detection; expected {desired_policy!r}"
@@ -127,17 +136,17 @@ class TurnDetectionConfig:
     @classmethod
     def from_realtime(cls, turn_detection: Mapping[str, object]) -> TurnDetectionConfig:
         return cls(
-            threshold=float(turn_detection.get("threshold", 0.5)),
-            prefix_padding_ms=int(turn_detection.get("prefix_padding_ms", 300)),
-            silence_duration_ms=int(turn_detection.get("silence_duration_ms", 500)),
-            min_speech_duration_ms=int(turn_detection.get("min_speech_duration_ms", 96)),
+            threshold=_numeric(turn_detection.get("threshold"), 0.5),
+            prefix_padding_ms=int(_numeric(turn_detection.get("prefix_padding_ms"), 300)),
+            silence_duration_ms=int(_numeric(turn_detection.get("silence_duration_ms"), 500)),
+            min_speech_duration_ms=int(_numeric(turn_detection.get("min_speech_duration_ms"), 96)),
             create_response=bool(turn_detection.get("create_response", True)),
             interrupt_response=bool(turn_detection.get("interrupt_response", True)),
         )
 
     @property
     def overlap_policy(self) -> str:
-        return "barge_in_on_speech"
+        return "barge_in_on_speech" if self.interrupt_response else "listen_only"
 
     def build_detector(self, backend_provider: SileroVADBackendProvider | None = None) -> ServerTurnDetector:
         return ServerTurnDetector(self, backend_provider=backend_provider)

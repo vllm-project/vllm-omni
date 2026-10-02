@@ -23,7 +23,12 @@ from tests.engine.test_orchestrator import (
 from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
 from vllm_omni.engine.duplex import commands
 from vllm_omni.engine.duplex.config import DuplexSessionConfig, DuplexSessionState
-from vllm_omni.engine.duplex.contracts import DuplexFence, duplex_resource_request_id
+from vllm_omni.engine.duplex.contracts import (
+    DuplexFence,
+    DuplexStageRequestContext,
+    DuplexStageSubmission,
+    duplex_resource_request_id,
+)
 from vllm_omni.engine.duplex.messages import (
     CloseDuplexSessionMessage,
     DuplexControlResultMessage,
@@ -322,6 +327,59 @@ async def test_resumable_append_prompt_does_not_reach_prewarmed_stages() -> None
     assert clients[0].add_request_calls[0][0].model_intermediate_buffer
     assert len(clients[1].add_request_calls) == 1
     assert clients[1].add_request_calls[0][0].model_intermediate_buffer is None
+    await orchestrator.session_manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_submit_processes_raw_prompt_through_stage0_input_processor() -> None:
+    """Qwen3-Omni turn-commit plans carry text + audio, not prompt_token_ids.
+
+    The token builder would KeyError and drop multi_modal_data; Stage0
+    InputProcessor is the path that keeps audio features.
+    """
+    orchestrator, clients, rpc_q, _ = _build()
+    await _open(orchestrator, rpc_q)
+    request_id = _stage0_request_id()
+    request_state = orchestrator.request_states[request_id]
+    seen: list[dict[str, object]] = []
+
+    class FakeProcessor:
+        def process_inputs(self, **kwargs: object) -> SimpleNamespace:
+            seen.append(dict(kwargs))
+            return SimpleNamespace(
+                request_id=kwargs["request_id"],
+                prompt_token_ids=[9, 8, 7],
+                mm_features=[{"audio": "kept"}],
+                sampling_params=kwargs["params"],
+                resumable=kwargs.get("resumable", False),
+            )
+
+    orchestrator._get_stage_input_processor = lambda stage_id: FakeProcessor()  # type: ignore[method-assign]
+    prompt = {"prompt": "<|im_start|>user\n<audio>", "multi_modal_data": {"audio": ([0.1], 16000)}}
+    context = DuplexStageRequestContext(
+        request_id=request_id,
+        session_id=SESSION_ID,
+        fence=DuplexFence(SESSION_ID),
+        stage_id=0,
+        final_stage_id=0,
+        config_generation=request_state.config_generation,
+        sampling_params=tuple(request_state.sampling_params_list),
+    )
+    result = await orchestrator.submit(
+        DuplexStageSubmission(
+            context=context,
+            prompt=prompt,
+            already_submitted=False,
+            resumable=False,
+        )
+    )
+    assert result.request_id == request_id
+    assert seen and seen[0]["prompt"] == prompt
+    assert seen[0]["resumable"] is False
+    submitted = clients[0].add_request_calls[0][0]
+    assert submitted.prompt_token_ids == [9, 8, 7]
+    assert submitted.mm_features == [{"audio": "kept"}]
+    assert submitted.resumable is False
     await orchestrator.session_manager.shutdown()
 
 

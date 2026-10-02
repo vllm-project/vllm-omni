@@ -99,6 +99,8 @@ x-qwen3-omni: &qwen3_omni
   - vllm_omni/deploy/qwen3_omni_moe_mrv2.yaml
   - vllm_omni/deploy/qwen3_omni_moe_mrv2_h200.yaml
   - vllm_omni/deploy/qwen3_omni_moe_thinking.yaml
+  - vllm_omni/deploy/qwen3_omni_moe_duplex.yaml
+  - vllm_omni/deploy/qwen3_omni_duplex.yaml
 
 x-wan22: &wan22
   - vllm_omni/diffusion/models/wan2_2/
@@ -213,6 +215,13 @@ source_file_dependencies:
     - tests/e2e/online_serving/test_qwen3_omni.py
     - tests/e2e/online_serving/test_qwen3_omni_expansion.py
     - tests/e2e/online_serving/test_qwen3_omni_multi_replicas.py
+
+  omni_qwen3_omni_duplex_function:
+    - *qwen3_omni
+    - *minicpmo_4_5_duplex
+    - tests/entrypoints/openai_api/test_qwen3_omni_realtime_websocket.py
+    - tests/engine/duplex/
+    - tests/model_executor/models/qwen3_omni/duplex/
 
   omni_qwen3_omni_accuracy:
     - *qwen3_omni
