@@ -454,6 +454,7 @@ class TestGetRequestBatchSamplingParamsKey:
         [
             ({"sample_solver": "unipc"}, {"sample_solver": "euler"}),
             ({"flow_shift": 3.0}, {"flow_shift": 5.0}),
+            ({"guidance_interval": [600, 1000]}, {"guidance_interval": [400, 1000]}),
         ],
     )
     def test_distinguishes_wan_scheduler_structure(
@@ -472,6 +473,7 @@ class TestGetRequestBatchSamplingParamsKey:
         [
             ({"sample_solver": " Euler "}, {"sample_solver": "euler"}),
             ({"flow_shift": "5.0"}, {"flow_shift": 5.0}),
+            ({"guidance_interval": [600, 1000]}, {"guidance_interval": (600.0, 1000.0)}),
         ],
     )
     def test_normalizes_equivalent_wan_scheduler_structure(
@@ -485,6 +487,12 @@ class TestGetRequestBatchSamplingParamsKey:
             self._make(extra_args=first_extra_args)
         ) == scheduler._build_sampling_params_key(self._make(extra_args=second_extra_args))
 
+    def test_rejects_malformed_guidance_interval_at_admission(self) -> None:
+        scheduler = RequestScheduler()
+
+        with pytest.raises(ValueError, match="guidance_interval"):
+            scheduler._build_sampling_params_key(self._make(extra_args={"guidance_interval": [600]}))
+
     def test_uses_none_for_unspecified_wan_scheduler_structure(self) -> None:
         scheduler = RequestScheduler()
 
@@ -492,6 +500,7 @@ class TestGetRequestBatchSamplingParamsKey:
 
         assert key.sample_solver is None
         assert key.flow_shift is None
+        assert key.guidance_interval is None
 
     def test_distinguishes_pipeline_condition_structure(self) -> None:
         scheduler = RequestScheduler()
@@ -1459,6 +1468,7 @@ class TestRequestScheduler:
             ({"flow_shift": 3.0}, {"flow_shift": 5.0}),
             ({"sample_solver": "unipc"}, {}),
             ({"flow_shift": 3.0}, {}),
+            ({"guidance_interval": [600, 1000]}, {}),
         ],
     )
     def test_batches_incompatible_wan_scheduler_structure_separately(

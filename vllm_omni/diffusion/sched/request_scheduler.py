@@ -17,6 +17,7 @@ from vllm_omni.diffusion.sched.interface import (
     SchedulerRequestState,
     _AdmissionWaitDecision,
 )
+from vllm_omni.diffusion.utils.param_utils import parse_guidance_interval
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.data import AttentionScheduleConfig
@@ -32,6 +33,7 @@ _REQUEST_BATCH_SAMPLING_PARAMS_KEY_FIELD_NAMES = frozenset(
     "attention_schedule_explicit",
     "condition_key",
     "flow_shift",
+    "guidance_interval",
     "lora_int_id",
     "sample_solver",
 }
@@ -49,6 +51,13 @@ def _normalize_explicit_flow_shift(value: float | str | None) -> float | None:
     if value is None:
         return None
     return float(value)
+
+
+def _normalize_explicit_guidance_interval(value: object | None) -> tuple[float, float] | None:
+    """Normalize an explicitly provided guidance interval without selecting a default."""
+    if value is None:
+        return None
+    return parse_guidance_interval(value)
 
 
 def build_request_batch_sampling_params_key(
@@ -70,6 +79,7 @@ def build_request_batch_sampling_params_key(
     # inferred while building the request-batch key.
     key_kwargs["sample_solver"] = _normalize_explicit_sample_solver(extra_args.get("sample_solver"))
     key_kwargs["flow_shift"] = _normalize_explicit_flow_shift(extra_args.get("flow_shift"))
+    key_kwargs["guidance_interval"] = _normalize_explicit_guidance_interval(extra_args.get("guidance_interval"))
     key_kwargs["condition_key"] = getattr(request, "batch_compatibility_key", None)
     key_kwargs["lora_int_id"] = lora_request.lora_int_id if lora_request is not None else None
     key_kwargs["attention_schedule"] = resolve_request_attention_schedule(sampling, attention_schedule_config)
