@@ -43,6 +43,8 @@ def methods():
         "_transformer_forward",
         "_request_kv_spec",
         "ar_diffusion_request_spec",
+        "_validate_bound_kv_geometry",
+        "_can_batch_clean_commit",
     }
     body = [node for node in cls.body if getattr(node, "name", "") in selected]
     body += [node for node in tree.body if getattr(node, "name", "") == "_admission_int"]
@@ -58,6 +60,7 @@ def methods():
         "ARDiffusionKVBranchSpec": ARDiffusionKVBranchSpec,
         "ARDiffusionCrossAttentionKVSpec": ARDiffusionCrossAttentionKVSpec,
         "append_dense_kv_history": append_dense_kv_history,
+        "logger": Mock(),
     }
     exec(compile(ast.fix_missing_locations(module), str(SOURCE), "exec"), namespace)
     return type("PipelineMethods", (), {name: namespace[name] for name in selected})

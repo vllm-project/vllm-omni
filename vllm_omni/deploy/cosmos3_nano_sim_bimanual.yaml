@@ -19,7 +19,7 @@ stages:
       action_dim: 64
       num_embodiment_domains: 32
       default_fps: 15.0
-      clean_commit_mode: batched  # framewise | batched
+      clean_commit_mode: batched  # framewise | batched; page-unaligned frames fall back to framewise
       # Fresh full-video requests only; Wan decode starts before clean refresh.
       overlap_vae_decode: true
       ar_diffusion_kv_config:
