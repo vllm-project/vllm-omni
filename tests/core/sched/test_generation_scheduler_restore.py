@@ -25,6 +25,8 @@ class FakeAdapter:
     """Minimal mock of OmniChunkTransferAdapter tracking restore calls."""
 
     def __init__(self):
+        self.receives_chunks = True
+        self.requests_with_ready_chunks: set[str] = set()
         self.waiting_for_chunk_waiting_requests: deque = deque()
         self.waiting_for_chunk_running_requests: deque = deque()
         self.restore_called = False
@@ -38,6 +40,10 @@ class FakeAdapter:
     def is_done_receiving_chunks(self, request_id):
         return request_id in self.done_request_ids
 
+    def collect_timed_out_request_ids(self, timeout_s):
+        """These fixtures have ready chunks, not stalled input waits."""
+        return set()
+
     def collect_failed_send_request_ids(self):
         return {}
 
@@ -47,7 +53,8 @@ class FakeAdapter:
         self.waiting_for_chunk_running_requests = deque()
 
     def postprocess_scheduler_output(self, output):
-        pass
+        for request_id in output.num_scheduled_tokens:
+            self.requests_with_ready_chunks.discard(request_id)
 
 
 def _make_generation_scheduler(waiting_request, *, use_v2_model_runner=False):
@@ -62,6 +69,7 @@ def _make_generation_scheduler(waiting_request, *, use_v2_model_runner=False):
     scheduler.requests = {waiting_request.request_id: waiting_request}
     scheduler.policy = SchedulingPolicy.FCFS
     scheduler.chunk_transfer_adapter = FakeAdapter()
+    scheduler.chunk_transfer_adapter.requests_with_ready_chunks.add(waiting_request.request_id)
     scheduler.input_coordinator = None
     scheduler.log_stats = False
     scheduler.scheduler_config = SimpleNamespace(enable_chunked_prefill=True)
@@ -121,6 +129,8 @@ def _chunk_request(request_id, **kwargs):
         external_req_id=request_id,
         prefill_stats=None,
         record_event=lambda *args, **kwargs: None,
+        # These request stubs represent live chunks, never finished requests.
+        is_finished=lambda: False,
     )
     defaults.update(kwargs)
     return SimpleNamespace(**defaults)
