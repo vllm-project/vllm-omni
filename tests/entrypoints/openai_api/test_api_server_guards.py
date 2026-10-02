@@ -1454,7 +1454,7 @@ def test_engine_dead_error_handler_registered_returns_json(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_pure_diffusion_app_state_key_snapshot(monkeypatch) -> None:
+async def test_pure_diffusion_app_state_key_snapshot(diffusion_handler_factory) -> None:
     """Lock pure-diffusion ``app.state`` keys after init, including live vs None.
 
     Fails if bootstrap drops keys route owners still read (e.g. video/speech/
@@ -1463,28 +1463,6 @@ async def test_pure_diffusion_app_state_key_snapshot(monkeypatch) -> None:
     """
     stage = SimpleNamespace(stage_type="diffusion", engine_args={})
     engine = _FakeEngineClient(stage_configs=[stage])
-
-    def _for_diffusion_factory(label: str):
-        def _factory(cls, *args, **kwargs):
-            return _marker(label)
-
-        return classmethod(_factory)
-
-    monkeypatch.setattr(api_server.OmniOpenAIServingChat, "for_diffusion", _for_diffusion_factory("chat"))
-    monkeypatch.setattr(api_server.OmniOpenAIServingChatBatch, "for_diffusion", _for_diffusion_factory("chat_batch"))
-    monkeypatch.setattr(
-        api_server.OmniOpenAIServingAudioGenerate,
-        "for_diffusion",
-        _for_diffusion_factory("audio_generate"),
-    )
-    monkeypatch.setattr(api_server.OmniOpenAIServingVideo, "for_diffusion", _for_diffusion_factory("video"))
-    monkeypatch.setattr(api_server.OmniStreamingVideoOutputHandler, "__init__", lambda self, *a, **k: None)
-    monkeypatch.setattr(api_server.OmniOpenAIServingSpeech, "for_diffusion", _for_diffusion_factory("speech"))
-    monkeypatch.setattr(
-        api_server.ServingRealtimeRobotOpenPI,
-        "create_policy_server",
-        classmethod(lambda cls, *a, **k: _marker("openpi")),
-    )
 
     state = State()
     await api_server.omni_init_app_state(
@@ -1587,16 +1565,25 @@ async def test_multistage_app_state_key_snapshot(handler_factory, tmp_path, supp
         assert state.openai_serving_responses is None
 
 
+_GENERATE_MUST_BE_NONE = _DIFFUSION_MUST_BE_NONE.copy()
+_GENERATE_MUST_BE_NONE.update(_DIFFUSION_CAN_BE_NONE - {"openai_serving_realtime_robot", "rl_rollout_serving"})
+_GENERATE_MUST_BE_WIRED = _DIFFUSION_MUST_BE_WIRED.copy()
+_GENERATE_MUST_BE_WIRED = _GENERATE_MUST_BE_WIRED - _GENERATE_MUST_BE_NONE
+
 _SPEECH_TEST_NONE_KEYS = _DIFFUSION_MUST_BE_NONE.copy()
-_SPEECH_TEST_NONE_KEYS.add("openai_streaming_video")
+_SPEECH_TEST_NONE_KEYS.update(
+    _DIFFUSION_CAN_BE_NONE - {"openai_serving_speech", "openai_serving_realtime_robot", "rl_rollout_serving"}
+)
 _SPEECH_TEST_MUST_BE_WIRED = _DIFFUSION_MUST_BE_WIRED.copy()
 _SPEECH_TEST_MUST_BE_WIRED.add("openai_serving_speech")
 _SPEECH_TEST_MUST_BE_WIRED.add("openai_streaming_speech")
 _SPEECH_TEST_MUST_BE_WIRED = _SPEECH_TEST_MUST_BE_WIRED - _SPEECH_TEST_NONE_KEYS
 
 _VIDEO_TEST_NONE_KEYS = _DIFFUSION_MUST_BE_NONE.copy()
-_VIDEO_TEST_NONE_KEYS.add("openai_serving_speech")
-_VIDEO_TEST_NONE_KEYS.add("openai_streaming_speech")
+_VIDEO_TEST_NONE_KEYS.update(
+    _DIFFUSION_CAN_BE_NONE
+    - {"openai_serving_video", "openai_streaming_video_output", "openai_serving_realtime_robot", "rl_rollout_serving"}
+)
 _VIDEO_TEST_MUST_BE_WIRED = _DIFFUSION_MUST_BE_WIRED.copy()
 _VIDEO_TEST_MUST_BE_WIRED.add("openai_serving_video")
 _VIDEO_TEST_MUST_BE_WIRED.add("openai_streaming_video_output")
@@ -1606,7 +1593,7 @@ _VIDEO_TEST_MUST_BE_WIRED = _VIDEO_TEST_MUST_BE_WIRED - _VIDEO_TEST_NONE_KEYS
 @pytest.mark.parametrize(
     "supported_tasks,wired_keys,none_keys",
     [
-        (("generate",), _DIFFUSION_MUST_BE_WIRED, _DIFFUSION_MUST_BE_NONE),
+        (("generate",), _GENERATE_MUST_BE_WIRED, _GENERATE_MUST_BE_NONE),
         (("speech",), _SPEECH_TEST_MUST_BE_WIRED, _SPEECH_TEST_NONE_KEYS),
         (("x2v",), _VIDEO_TEST_MUST_BE_WIRED, _VIDEO_TEST_NONE_KEYS),
     ],
@@ -1633,8 +1620,13 @@ async def test_diffusion_supported_tasks_set_handlers(
     assert state.diffusion_engine is engine
 
 
+_GENERATE_MUST_BE_NONE = _MULTISTAGE_MUST_BE_NONE.copy()
+_GENERATE_MUST_BE_NONE.update(_MULTISTAGE_CAN_BE_NONE - {"openai_streaming_video"})
+_GENERATE_MUST_BE_WIRED = _MULTISTAGE_MUST_BE_WIRED.copy()
+_GENERATE_MUST_BE_WIRED = _GENERATE_MUST_BE_WIRED - _GENERATE_MUST_BE_NONE
+
 _SPEECH_TEST_NONE_KEYS = _MULTISTAGE_MUST_BE_NONE.copy()
-_SPEECH_TEST_NONE_KEYS.add("openai_streaming_video")
+_SPEECH_TEST_NONE_KEYS.update(_MULTISTAGE_CAN_BE_NONE - {"openai_serving_speech", "openai_streaming_speech"})
 _SPEECH_TEST_NONE_KEYS.add("openai_serving_chat")
 _SPEECH_TEST_NONE_KEYS.add("openai_serving_chat_batch")
 _SPEECH_TEST_MUST_BE_WIRED = _MULTISTAGE_MUST_BE_WIRED.copy()
@@ -1643,8 +1635,7 @@ _SPEECH_TEST_MUST_BE_WIRED.add("openai_streaming_speech")
 _SPEECH_TEST_MUST_BE_WIRED = _SPEECH_TEST_MUST_BE_WIRED - _SPEECH_TEST_NONE_KEYS
 
 _VIDEO_TEST_NONE_KEYS = _MULTISTAGE_MUST_BE_NONE.copy()
-_VIDEO_TEST_NONE_KEYS.add("openai_serving_speech")
-_VIDEO_TEST_NONE_KEYS.add("openai_streaming_speech")
+_VIDEO_TEST_NONE_KEYS.update(_MULTISTAGE_CAN_BE_NONE - {"openai_serving_video"})
 _VIDEO_TEST_NONE_KEYS.add("openai_serving_chat")
 _VIDEO_TEST_NONE_KEYS.add("openai_serving_chat_batch")
 _VIDEO_TEST_MUST_BE_WIRED = _MULTISTAGE_MUST_BE_WIRED.copy()
@@ -1655,7 +1646,7 @@ _VIDEO_TEST_MUST_BE_WIRED = _VIDEO_TEST_MUST_BE_WIRED - _VIDEO_TEST_NONE_KEYS
 @pytest.mark.parametrize(
     "supported_tasks,wired_keys,none_keys",
     [
-        (("generate",), _MULTISTAGE_MUST_BE_WIRED, _MULTISTAGE_MUST_BE_NONE),
+        (("generate",), _GENERATE_MUST_BE_WIRED, _GENERATE_MUST_BE_NONE),
         (("speech",), _SPEECH_TEST_MUST_BE_WIRED, _SPEECH_TEST_NONE_KEYS),
         (("x2v",), _VIDEO_TEST_MUST_BE_WIRED, _VIDEO_TEST_NONE_KEYS),
     ],
