@@ -772,9 +772,7 @@ class OmniEngineBase:
                 if kwargs.get("diffusion_compile_granularity") is None
                 else kwargs["diffusion_compile_granularity"]
             ),
-            "diffusion_compile_dynamic": (
-                True if kwargs.get("diffusion_compile_dynamic") is None else kwargs["diffusion_compile_dynamic"]
-            ),
+            "diffusion_compile_dynamic": kwargs.get("diffusion_compile_dynamic"),
             "fa_deterministic": bool(kwargs.get("fa_deterministic", False)),
             "boundary_ratio": kwargs.get("boundary_ratio", None),
             "flow_shift": kwargs.get("flow_shift", None),

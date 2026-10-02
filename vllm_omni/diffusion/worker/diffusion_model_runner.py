@@ -46,6 +46,7 @@ from vllm_omni.diffusion.forward_context import set_forward_context
 from vllm_omni.diffusion.interaction.coordinator import InteractionCoordinator
 from vllm_omni.diffusion.interaction.types import InteractionPayload
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
+from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
 from vllm_omni.diffusion.models.interface import (
     SupportsInteractionApply,
     adopt_request_scoped_cache_dit,
@@ -384,6 +385,12 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         # Apply torch.compile if not in eager mode
         if not self.od_config.enforce_eager:
             if current_omni_platform.supports_torch_inductor():
+                # Resolve here rather than during config normalization: only
+                # now is the pipeline class final for every entry point.
+                if self.od_config.diffusion_compile_dynamic is None:
+                    self.od_config.diffusion_compile_dynamic = get_diffusion_model_metadata(
+                        self.od_config.model_class_name
+                    ).compile_dynamic
                 if hasattr(self.pipeline, "setup_compile"):
                     try:
                         self.pipeline.setup_compile()

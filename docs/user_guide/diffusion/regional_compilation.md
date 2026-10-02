@@ -7,7 +7,10 @@ diffusion inference runs without `--enforce-eager`.
 ## Configuration
 
 Dynamic compilation is enabled by default so the compiled regions can handle
-mixed resolutions. For a fixed-shape workload, disable it explicitly:
+mixed resolutions. A pipeline can declare a static-shape default through
+`compile_dynamic` in its `DiffusionModelMetadata`. An explicit CLI or deploy
+setting always takes precedence. For a fixed-shape
+workload, disable it explicitly:
 
 ```bash
 vllm serve <model> --omni --no-diffusion-compile-dynamic

@@ -652,6 +652,112 @@ def test_pipeline_registered_and_exported() -> None:
         assert pipeline_name in CUSTOM_DIT_ENABLERS
 
 
+def test_multiview_pipeline_registers_guardrail_hooks() -> None:
+    from vllm_omni.diffusion.registry import (
+        _DIFFUSION_POST_PROCESS_FUNCS,
+        _DIFFUSION_PRE_PROCESS_FUNCS,
+    )
+    from vllm_omni.model_extras.cosmos3 import COSMOS3_MULTIVIEW_EXTRA_BODY_PARAMS
+
+    assert _DIFFUSION_PRE_PROCESS_FUNCS["Cosmos3MultiviewPipeline"] == "get_cosmos3_multiview_pre_process_func"
+    assert _DIFFUSION_POST_PROCESS_FUNCS["Cosmos3MultiviewPipeline"] == "get_cosmos3_post_process_func"
+    assert "guardrails" in COSMOS3_MULTIVIEW_EXTRA_BODY_PARAMS
+
+
+def _server_and_request_guardrail_gate(od_config: Any, sampling_params: Any = None) -> bool:
+    """Same server/per-request resolution as ``guardrails.is_guardrails_enabled``."""
+    if not od_config.model_config.get("guardrails", True):
+        return False
+    per_request = (sampling_params.extra_args or {}).get("guardrails") if sampling_params is not None else None
+    return True if per_request is None else bool(per_request)
+
+
+def _multiview_guardrail_request(extra_args: dict[str, Any]) -> SimpleNamespace:
+    return SimpleNamespace(
+        prompt={"prompt": "Drive through the intersection."},
+        sampling_params=make_sampling_params(
+            extra_args={
+                "multiview": {
+                    "views": [
+                        {"camera_key": "front", "control_path": "front.mp4", "prompt": "The front camera view."},
+                        {"camera_key": "rear", "control_path": "rear.mp4"},
+                        {"camera_key": "left", "control_path": "left.mp4", "prompt": " "},
+                    ]
+                },
+                **extra_args,
+            }
+        ),
+    )
+
+
+def test_multiview_preprocess_checks_shared_prompt_and_camera_captions(fake_cosmos3_guardrails) -> None:
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3_multiview import (
+        get_cosmos3_multiview_pre_process_func,
+    )
+
+    initialized = []
+    checked = []
+    fake_cosmos3_guardrails.is_guardrails_enabled = _server_and_request_guardrail_gate
+    fake_cosmos3_guardrails.ensure_initialized = initialized.append
+    fake_cosmos3_guardrails.check_text_safety = checked.append
+    od_config = SimpleNamespace(model_config={}, tf_model_config=None)
+
+    preprocess = get_cosmos3_multiview_pre_process_func(od_config)
+    assert initialized == [od_config]
+
+    request = _multiview_guardrail_request({})
+    assert preprocess(request) is request
+    assert checked == ["Drive through the intersection.", "The front camera view."]
+
+    checked.clear()
+    preprocess(_multiview_guardrail_request({"guardrails": False}))
+    assert checked == []
+
+
+def test_multiview_preprocess_skips_guardrail_load_when_disabled(fake_cosmos3_guardrails) -> None:
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3_multiview import (
+        get_cosmos3_multiview_pre_process_func,
+    )
+
+    fake_cosmos3_guardrails.is_guardrails_enabled = _server_and_request_guardrail_gate
+    fake_cosmos3_guardrails.ensure_initialized = Mock()
+    fake_cosmos3_guardrails.check_text_safety = Mock()
+
+    preprocess = get_cosmos3_multiview_pre_process_func(SimpleNamespace(model_config={"guardrails": False}))
+    # Per-request opt-in cannot enable checks the server never loaded.
+    preprocess(_multiview_guardrail_request({"guardrails": True}))
+
+    fake_cosmos3_guardrails.ensure_initialized.assert_not_called()
+    fake_cosmos3_guardrails.check_text_safety.assert_not_called()
+
+
+def test_multiview_postprocess_applies_video_guardrail_per_camera(fake_cosmos3_guardrails) -> None:
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import get_cosmos3_post_process_func
+
+    checked_shapes = []
+
+    def check_video_safety(video: torch.Tensor) -> torch.Tensor:
+        checked_shapes.append(tuple(video.shape))
+        return torch.zeros_like(video)
+
+    fake_cosmos3_guardrails.is_guardrails_enabled = lambda od_config, sampling_params=None: True
+    fake_cosmos3_guardrails.check_video_safety = check_video_safety
+    postprocess = get_cosmos3_post_process_func(SimpleNamespace(model_config={}))
+
+    video = torch.ones(1, 3, 2 * 3, 4, 4)
+    result = postprocess(
+        {
+            "payload": {"video": video},
+            "metadata": {"multiview": {"cameras": ["front", "rear"], "frames_per_view": 3}},
+        },
+        output_type="np",
+    )
+
+    assert checked_shapes == [(1, 3, 3, 4, 4), (1, 3, 3, 4, 4)]
+    # The guardrail output, not the raw decode, reaches the response.
+    assert np.allclose(result["payload"]["video"], 0.5)
+
+
 @pytest.mark.parametrize(
     "pipeline_name",
     ["Cosmos3OmniDiffusersPipeline", "Cosmos3OmniPipeline"],
@@ -1376,6 +1482,29 @@ def test_transfer_config_media_helpers_and_preprocess_budget(monkeypatch: pytest
     assert tuple(additional["preprocessed_transfer_video"].shape) == (1, 3, 4, 192, 320)
     assert additional["transfer_input_fps"] == 12.5
     assert "preprocessed_video" not in additional
+
+
+def test_transfer_resize_antialiases_downscales_like_reference() -> None:
+    from vllm_omni.diffusion.models.cosmos3 import transfer
+
+    # One-pixel stripes shrunk 3x. The reference's torchvision resize (and the
+    # training loader) averages them; plain bilinear samples single columns,
+    # which would return the stripes as alternating 0 and 255.
+    stripes = torch.zeros(3, 2, 6, 18, dtype=torch.uint8)
+    stripes[..., 1::2] = 255
+    resized = transfer.resize_center_crop_uint8_cthw(stripes, 2, 6)
+    assert tuple(resized.shape) == (3, 2, 2, 6)
+    assert resized.min() >= 100 and resized.max() <= 155
+
+
+def test_transfer_center_crop_rounds_offsets_like_torchvision() -> None:
+    from vllm_omni.diffusion.models.cosmos3 import transfer
+
+    # Cropping 7 rows to 4 leaves 3. torchvision rounds the 1.5-row offset to 2,
+    # as for 1720x1080 fisheye inputs at 480p (43 spare rows, offset 22).
+    rows = torch.arange(0, 70, 10, dtype=torch.uint8).reshape(1, 1, 7, 1).expand(3, 1, 7, 4).contiguous()
+    cropped = transfer.resize_center_crop_uint8_cthw(rows, 4, 4)
+    assert cropped[0, 0, :, 0].tolist() == [20, 30, 40, 50]
 
 
 def test_transfer_control_weight_validation_and_normalization() -> None:
@@ -2553,6 +2682,40 @@ def test_diffuse_transfer_skips_idle_cfg_branches(make_cosmos3_pipeline, sequent
     torch.testing.assert_close(text_result, torch.full_like(latents, 104.0))
 
 
+@pytest.mark.parametrize(
+    ("text_cfg_below_one", "expected_calls"),
+    [
+        (False, [(2, True)]),
+        (True, [(2, True), (1, True)]),
+    ],
+)
+def test_diffuse_transfer_guidance_below_one_runs_text_cfg_only_when_opted_in(
+    make_cosmos3_pipeline, sequential_cfg_parallel, text_cfg_below_one, expected_calls
+) -> None:
+    pipeline = make_cosmos3_pipeline()
+    latents = torch.zeros(1, 2, 1, 1, 1)
+    velocity_mask = torch.ones(1, 1, 1, 1, 1)
+
+    pipeline.diffuse_transfer(
+        latents=latents,
+        timesteps=torch.tensor([7]),
+        cond_ids=_ids(2),
+        cond_mask=_mask(),
+        uncond_ids=_ids(1),
+        uncond_mask=_mask(),
+        guidance_scale=0.0,
+        control_guidance=1.0,
+        control_guidance_interval=None,
+        control_latents=[torch.zeros_like(latents)],
+        shared_kwargs={"video_shape": (1, 1, 1), "fps": 24.0, "noisy_frame_mask": velocity_mask},
+        velocity_mask=velocity_mask,
+        condition_latents=torch.zeros_like(latents),
+        text_cfg_below_one=text_cfg_below_one,
+    )
+
+    assert [(call["token"], call["has_control"]) for call in pipeline.transformer.calls] == expected_calls
+
+
 def test_diffuse_transfer_interval_switches_branch_counts(make_cosmos3_pipeline, sequential_cfg_parallel) -> None:
     pipeline = make_cosmos3_pipeline()
     latents = torch.zeros(1, 2, 1, 1, 1)
@@ -3177,3 +3340,969 @@ class TestForwardRouting:
 
         with pytest.raises(ValueError, match=message):
             pipeline.forward(make_request_batch(prompt, sampling_params))
+
+
+# -- Multiview deployment contract (schema versions 2 and 3) -------------------
+
+
+def _multiview_lidar_contract(chunk: int = 9, context: int | None = 9) -> dict[str, Any]:
+    return {
+        "version": "1.2",
+        "dtype": "float32",
+        "sample_posterior": False,
+        "apply_validity_mask": True,
+        "fps": 10.0,
+        "latent_channels": 128,
+        "temporal_compression_factor": 1,
+        "spatial_compression": [16, 16],
+        "network_config": {
+            "resolution": [128, 1808],
+            "patch_size": [2, 2],
+            "depths": [1, 1, 1, 1],
+            "z_dim": 128,
+            "in_channels": 3,
+            "temporal_downsample": [False, False, False],
+        },
+        "range_projection": {
+            "semantic_width": 1800,
+            "model_width": 1808,
+            "native_height": 128,
+            "model_width_transform": "circular_pad",
+            "intensity_encoding": "unit",
+            "min_range_m": 0.0,
+            "max_range_m": 100.0,
+        },
+        "streaming_chunk_frames": chunk,
+        "streaming_context_frames": context,
+    }
+
+
+def _multiview_contract(model: str) -> dict[str, Any]:
+    """Contracts exactly as the fixed imaginaire4 exporter writes them for the three AV models."""
+    from vllm_omni.model_extras.cosmos3 import COSMOS3_MADS_CAMERAS
+
+    contract = {
+        "schema_version": 2,
+        "per_view_captions": True,
+        "variable_view_count": True,
+        "inference_defaults": {
+            "resolution": "480",
+            "fps": 30.0,
+            "num_steps": 35,
+            "guidance": 6.0,
+            "shift": 10.0,
+            "control_guidance": 1.0,
+            "emphasize_control_in_prompt": True,
+            "guidance_interval": None,
+            "control_guidance_interval": None,
+            "sigma_max": 80.0,
+            "normalize_cfg": False,
+            "negative_metadata_mode": "none",
+        },
+        "causal_training_strategy": "none",
+        "attention_scope": "decomposed",
+        "backend": "triton",
+        "cameras": list(COSMOS3_MADS_CAMERAS),
+        "max_views": len(COSMOS3_MADS_CAMERAS),
+        "share_vision_temporal_positions": True,
+        "decomposed_temporal_window_seconds": 0.4,
+        "control_attends_sensor": True,
+        "lidar_attends_captions": True,
+        "align_temporal_positions_across_views": True,
+        "lidar": _multiview_lidar_contract(),
+        "lidar_patch_spatial_hw": [2, 2],
+    }
+    if model == "baseline":
+        return contract
+    contract.update(
+        schema_version=3,
+        lidar=_multiview_lidar_contract(chunk=20, context=21),
+        lidar_patch_spatial_hw=[1, 1],
+        rig_view_embedding={
+            "num_embeddings": 12,
+            "camera_ids": {camera: index for index, camera in enumerate(COSMOS3_MADS_CAMERAS)},
+            "lidar_id": 11,
+        },
+    )
+    if model == "v2":  # overlapping maskless fold, no window
+        contract.update(backend="maskless", decomposed_temporal_window_seconds=None)
+    else:
+        assert model == "v3"  # exact-count maskless with a window is the Flex windowed mask
+    return contract
+
+
+def _validate_multiview_contract(contract: dict[str, Any], *, camera_patch: int = 2) -> dict[str, Any]:
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3_multiview import (
+        _validated_multiview_deployment_config,
+    )
+
+    return _validated_multiview_deployment_config(
+        {"backbone_type": "cosmos3_multiview", "latent_patch_size": camera_patch, "multiview": contract}
+    )
+
+
+@pytest.mark.parametrize("model", ["baseline", "v2", "v3"])
+def test_multiview_contract_accepts_exported_av_models(model: str) -> None:
+    validated = _validate_multiview_contract(_multiview_contract(model))
+
+    if model == "baseline":
+        assert validated["schema_version"] == 2
+        assert validated["lidar_patch_spatial_hw"] == [2, 2]
+        assert validated["rig_view_embedding"] is None
+    else:
+        assert validated["schema_version"] == 3
+        assert validated["lidar_patch_spatial_hw"] == [1, 1]
+        assert validated["rig_view_embedding"]["lidar_id"] == 11
+        assert validated["rig_view_embedding"]["camera_ids"]["camera_front_tele_30fov"] == 6
+    assert validated["backend"] == ("maskless" if model == "v2" else "triton")
+
+
+@pytest.mark.parametrize(
+    ("source", "override", "fa_version", "expected"),
+    [
+        ("triton", None, 4, "fa4"),
+        ("triton", None, 3, "triton"),
+        ("triton", None, None, "triton"),
+        ("triton", "triton", 4, "triton"),
+        ("triton", "fa4", 3, "fa4"),
+        ("fa4", None, 3, "fa4"),
+        ("maskless", None, 4, "maskless"),
+    ],
+)
+def test_multiview_sparse_backend_follows_vllm_flash_attn_version(
+    monkeypatch: pytest.MonkeyPatch, source: str, override: str | None, fa_version: int | None, expected: str
+) -> None:
+    from vllm_omni.diffusion.attention.backends.utils import fa
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3_multiview import (
+        COSMOS3_MULTIVIEW_BACKEND_ENV,
+        Cosmos3MultiviewPipeline,
+    )
+
+    def resolve_vllm_flash_attn_version() -> int:
+        if fa_version is None:
+            raise RuntimeError("vLLM-bundled versioned FlashAttention requires CUDA")
+        return fa_version
+
+    if override is None:
+        monkeypatch.delenv(COSMOS3_MULTIVIEW_BACKEND_ENV, raising=False)
+    else:
+        monkeypatch.setenv(COSMOS3_MULTIVIEW_BACKEND_ENV, override)
+    monkeypatch.setattr(fa, "resolve_vllm_flash_attn_version", resolve_vllm_flash_attn_version)
+
+    assert Cosmos3MultiviewPipeline._resolve_attention_backend({"backend": source}) == expected
+
+
+@pytest.mark.parametrize("error_type", [ImportError, ModuleNotFoundError])
+def test_multiview_sparse_backend_keeps_triton_when_flash_attn_import_fails(
+    monkeypatch: pytest.MonkeyPatch, error_type: type[ImportError]
+) -> None:
+    from vllm_omni.diffusion.attention.backends.utils import fa
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3_multiview import (
+        COSMOS3_MULTIVIEW_BACKEND_ENV,
+        Cosmos3MultiviewPipeline,
+    )
+
+    monkeypatch.delenv(COSMOS3_MULTIVIEW_BACKEND_ENV, raising=False)
+    monkeypatch.setattr(
+        fa,
+        "resolve_vllm_flash_attn_version",
+        Mock(side_effect=error_type("CUDA FlashAttention extensions unavailable")),
+    )
+
+    assert Cosmos3MultiviewPipeline._resolve_attention_backend({"backend": "triton"}) == "triton"
+
+
+def test_multiview_fa4_loads_vllm_bundled_flash_attn(monkeypatch: pytest.MonkeyPatch) -> None:
+    from vllm_omni.diffusion.models.cosmos3 import multiview_fa4
+
+    cute = types.ModuleType("cutlass.cute")
+    cute.jit = lambda fn: fn
+    cutlass = types.ModuleType("cutlass")
+    cutlass.cute = cute
+    fa_cute = types.ModuleType("vllm.vllm_flash_attn.cute")
+    fa_cute.flash_attn_func = object()
+    fa_cute.utils = types.ModuleType("vllm.vllm_flash_attn.cute.utils")
+    block_sparsity = types.ModuleType("vllm.vllm_flash_attn.cute.block_sparsity")
+    block_sparsity.BlockSparseTensorsTorch = object()
+    for module in (cutlass, cute, fa_cute, fa_cute.utils, block_sparsity):
+        monkeypatch.setitem(sys.modules, module.__name__, module)
+    # The standalone flash-attn-4 package is no longer needed.
+    monkeypatch.setitem(sys.modules, "flash_attn", None)
+    monkeypatch.setitem(sys.modules, "flash_attn.cute", None)
+    monkeypatch.setattr(multiview_fa4, "_load_fa4", multiview_fa4._load_fa4.__wrapped__)
+
+    entry = multiview_fa4._load_fa4()
+
+    assert entry.flash_attn_func is fa_cute.flash_attn_func
+    assert entry.block_sparse_cls is block_sparsity.BlockSparseTensorsTorch
+    assert (entry.mask_mod.__vec_size__, entry.vector_mask_mod.__vec_size__) == (1, 32)
+
+
+def _fa4_test_sparsity() -> SimpleNamespace:
+    return SimpleNamespace(
+        partial_counts=torch.ones(1, dtype=torch.int32),
+        partial_indices=torch.zeros(1, 1, dtype=torch.int32),
+        full_counts=torch.zeros(1, dtype=torch.int32),
+        full_indices=torch.zeros(1, 1, dtype=torch.int32),
+        q_word_base=torch.zeros(256, dtype=torch.int32),
+        k_group_ids=torch.zeros(128, dtype=torch.int32),
+        allowed_words=torch.ones(1, dtype=torch.int32),
+        q_block_size=256,
+        kv_block_size=128,
+        q_len=256,
+        kv_len=128,
+    )
+
+
+@pytest.mark.parametrize(
+    ("capability", "compiled"), [((9, 0), False), ((10, 0), False), ((11, 0), False), ((10, 0), True)]
+)
+def test_multiview_fa4_launch_preserves_sparse_mask_through_custom_op(
+    monkeypatch: pytest.MonkeyPatch, capability: tuple[int, int], compiled: bool
+) -> None:
+    from vllm_omni.diffusion.models.cosmos3 import multiview_fa4
+
+    sparsity = _fa4_test_sparsity()
+    q = torch.zeros(1, sparsity.q_len, 4, 8, dtype=torch.bfloat16)
+    k = v = torch.zeros(1, sparsity.kv_len, 2, 8, dtype=torch.bfloat16)
+    kernel = Mock(return_value=(q + 1, None))
+    entry = multiview_fa4._Fa4Entry(kernel, SimpleNamespace, object(), object())
+    monkeypatch.setattr(multiview_fa4, "_load_fa4", lambda: entry)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: capability)
+    attention = multiview_fa4.multiview_fa4_attention
+    if compiled:
+        attention = torch.compile(attention, backend="eager", fullgraph=True)
+
+    output = attention(q, k, v, sparsity)
+
+    torch.testing.assert_close(output, q + 1)
+    kernel.assert_called_once()
+    kwargs = kernel.call_args.kwargs
+    assert kwargs["mask_mod"] is (entry.vector_mask_mod if capability[0] in (10, 11) else entry.mask_mod)
+    assert all(
+        actual is expected
+        for actual, expected in zip(
+            kwargs["aux_tensors"], [sparsity.q_word_base, sparsity.k_group_ids, sparsity.allowed_words], strict=True
+        )
+    )
+    block_sparse = kwargs["block_sparse_tensors"]
+    assert block_sparse.block_size == (256, 128)
+    for name, expected in (
+        ("mask_block_cnt", sparsity.partial_counts),
+        ("mask_block_idx", sparsity.partial_indices),
+        ("full_block_cnt", sparsity.full_counts),
+        ("full_block_idx", sparsity.full_indices),
+    ):
+        torch.testing.assert_close(getattr(block_sparse, name), expected[None, None])
+
+
+@pytest.mark.parametrize("field", ["q_len", "kv_len", "q_word_base", "k_group_ids", "q_block_size", "kv_block_size"])
+def test_multiview_fa4_rejects_invalid_mask_before_launch(monkeypatch: pytest.MonkeyPatch, field: str) -> None:
+    from vllm_omni.diffusion.models.cosmos3 import multiview_fa4
+
+    sparsity = _fa4_test_sparsity()
+    q = torch.zeros(1, sparsity.q_len, 4, 8, dtype=torch.bfloat16)
+    k = v = torch.zeros(1, sparsity.kv_len, 2, 8, dtype=torch.bfloat16)
+    value = getattr(sparsity, field)
+    setattr(sparsity, field, value[:-1] if isinstance(value, torch.Tensor) else value - 1)
+    launch = Mock(side_effect=AssertionError("Invalid mask must fail before the FA4 launch"))
+    monkeypatch.setattr(multiview_fa4, "_cosmos3_multiview_fa4_op", launch)
+
+    with pytest.raises(ValueError, match="Cosmos3 multiview FA4"):
+        multiview_fa4.multiview_fa4_attention(q, k, v, sparsity)
+    launch.assert_not_called()
+
+
+def test_multiview_contract_defaults_legacy_lidar_patch_to_camera_patch() -> None:
+    contract = _multiview_contract("baseline")
+    del contract["lidar_patch_spatial_hw"]
+    # Exporters from 2026-09 wrote this field before per_view_captions replaced it.
+    contract["separate_view_text_tokenization"] = True
+
+    assert _validate_multiview_contract(contract)["lidar_patch_spatial_hw"] == [2, 2]
+
+
+def test_multiview_contract_keeps_unversioned_pass_through() -> None:
+    contract = _multiview_contract("baseline")
+    for field in ("schema_version", "lidar", "lidar_patch_spatial_hw"):
+        del contract[field]
+    contract["legacy_only_field"] = 1
+
+    assert _validate_multiview_contract(contract)["legacy_only_field"] == 1
+
+
+def _set(**values):
+    return lambda contract: contract.update(values)
+
+
+def _set_rig(**values):
+    return lambda contract: contract["rig_view_embedding"].update(values)
+
+
+def _drop_camera_id(contract: dict[str, Any]) -> None:
+    contract["rig_view_embedding"]["camera_ids"].pop("camera_rear_fisheye_200fov")
+
+
+@pytest.mark.parametrize(
+    ("model", "mutate", "match"),
+    [
+        ("v3", _set(schema_version=4), "Unsupported Cosmos3 multiview schema_version=4"),
+        ("baseline", _set(schema_version=True), "Unsupported Cosmos3 multiview schema_version=True"),
+        ("baseline", _set(future_field=1), r"Unknown Cosmos3 multiview contract fields \['future_field'\]"),
+        ("v3", _set(future_field=1), r"Unknown Cosmos3 multiview contract fields \['future_field'\]"),
+        # Version-2 readers would silently drop these; they need version 3.
+        ("v3", _set(schema_version=2, lidar_patch_spatial_hw=[2, 2]), "rig_view_embedding requires schema_version=3"),
+        ("baseline", _set(lidar_patch_spatial_hw=[1, 1]), "requires schema_version=3"),
+        (
+            "v3",
+            _set(rig_view_embedding=None, lidar_patch_spatial_hw=[2, 2]),
+            "schema_version=3 requires rig_view_embedding or a LiDAR patch",
+        ),
+        ("baseline", _set(schema_version=3), "schema_version=3 requires rig_view_embedding or a LiDAR patch"),
+        ("v3", _set(lidar_patch_spatial_hw=[1]), "lidar_patch_spatial_hw must be two positive integers"),
+        ("v3", _set(lidar_patch_spatial_hw=[1, 0]), "lidar_patch_spatial_hw must be two positive integers"),
+        ("v3", _set(lidar_patch_spatial_hw=[True, 1]), "lidar_patch_spatial_hw must be two positive integers"),
+        ("v3", _set(lidar_patch_spatial_hw=1), "lidar_patch_spatial_hw must be two positive integers"),
+        ("v3", _set(lidar=None), "lidar_patch_spatial_hw requires a lidar block"),
+        ("v3", _set_rig(num_embeddings=1), "num_embeddings must be an integer >= 2"),
+        ("v3", _set_rig(num_embeddings=12.0), "num_embeddings must be an integer >= 2"),
+        ("v3", _drop_camera_id, "camera_ids must name exactly the exported cameras"),
+        ("v3", _set_rig(camera_ids=None), "camera_ids must be an object"),
+        ("v3", lambda c: c["rig_view_embedding"]["camera_ids"].update(camera_front_wide_120fov=11), r"in \[0, 10\]"),
+        ("v3", lambda c: c["rig_view_embedding"]["camera_ids"].update(camera_front_wide_120fov=-1), r"in \[0, 10\]"),
+        ("v3", lambda c: c["rig_view_embedding"]["camera_ids"].update(camera_front_wide_120fov=True), r"in \[0, 10\]"),
+        ("v3", _set_rig(lidar_id=10), "lidar_id must be the final row 11"),
+        ("v3", _set_rig(lidar_id=11.0), "lidar_id must be the final row 11"),
+        ("v3", _set_rig(extra=1), "Unknown Cosmos3 multiview rig_view_embedding fields"),
+        ("v3", _set(rig_view_embedding=[1]), "rig_view_embedding must be an object"),
+    ],
+)
+def test_multiview_contract_rejects_invalid_versioned_metadata(model: str, mutate, match: str) -> None:
+    contract = _multiview_contract(model)
+    mutate(contract)
+
+    with pytest.raises((TypeError, ValueError), match=match):
+        _validate_multiview_contract(contract)
+
+
+def test_multiview_contract_v3_accepts_lidar_patch_without_rig_embedding() -> None:
+    contract = _multiview_contract("v3")
+    del contract["rig_view_embedding"]
+
+    validated = _validate_multiview_contract(contract)
+
+    assert validated["lidar_patch_spatial_hw"] == [1, 1]
+    assert validated["rig_view_embedding"] is None
+
+
+def test_multiview_contract_v3_accepts_camera_only_rig_embedding() -> None:
+    contract = _multiview_contract("v3")
+    for field in ("lidar", "lidar_patch_spatial_hw"):
+        del contract[field]
+
+    validated = _validate_multiview_contract(contract)
+
+    assert "lidar_patch_spatial_hw" not in validated
+    assert validated["rig_view_embedding"]["num_embeddings"] == 12
+
+
+@pytest.mark.parametrize(("version", "accepted"), [(2, True), (3, True), (None, False)])
+def test_multiview_variable_view_count_applies_to_versioned_contracts(version: int | None, accepted: bool) -> None:
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3_multiview import Cosmos3MultiviewPipeline
+    from vllm_omni.model_extras.cosmos3 import COSMOS3_MADS_CAMERAS
+
+    pipeline = object.__new__(Cosmos3MultiviewPipeline)
+    pipeline.multiview_cameras = COSMOS3_MADS_CAMERAS
+    pipeline.multiview_config = {"schema_version": version, "per_view_captions": True, "variable_view_count": True}
+    # A reordered subset: physical rig IDs, not request positions, identify cameras.
+    views = [
+        {"camera_key": "camera_front_tele_30fov", "prompt": "A truck merges."},
+        {"camera_key": "camera_front_wide_120fov", "prompt": "A car drives."},
+    ]
+    sp = SimpleNamespace(extra_args={"multiview": {"views": views}})
+
+    if accepted:
+        _, parsed = pipeline._parse_multiview_request(sp)
+        assert [view["camera_key"] for view in parsed] == ["camera_front_tele_30fov", "camera_front_wide_120fov"]
+    else:
+        with pytest.raises(ValueError, match="full exported camera order"):
+            pipeline._parse_multiview_request(sp)
+
+
+# -- Multiview per-camera caption parity with imaginaire4 ---------------------
+
+
+def test_multiview_rig_view_caption_matches_reference_single_camera() -> None:
+    from vllm_omni.diffusion.models.cosmos3.multiview_prompts import format_rig_view_captions
+
+    assert format_rig_view_captions(["A car drives."], ["camera_front_wide_120fov"]) == [
+        "This multiview driving sequence contains time-aligned recordings from 1 vehicle-mounted camera: "
+        "front wide-angle camera (forward-facing, 120° FOV).\n\n"
+        "The description below is for the front wide-angle camera mounted on the vehicle. "
+        "This camera is facing forward and has a 120° field of view:\n\nA car drives."
+    ]
+
+
+def test_multiview_rig_view_captions_list_request_cameras_in_order() -> None:
+    from vllm_omni.diffusion.models.cosmos3.multiview_prompts import format_rig_view_captions
+
+    captions = format_rig_view_captions(
+        ["A truck passes.", "Rain falls."], ["camera_rear_right_70fov", "camera_front_tele_30fov"]
+    )
+
+    rig = (
+        "This multiview driving sequence contains time-aligned recordings from 2 vehicle-mounted cameras: "
+        "rear-right camera (rear-right-facing, 70° FOV); front telephoto camera (forward-facing, 30° FOV)."
+    )
+    assert captions == [
+        f"{rig}\n\nThe description below is for the rear-right camera mounted on the vehicle. "
+        "This camera is facing rear-right and has a 70° field of view:\n\nA truck passes.",
+        f"{rig}\n\nThe description below is for the front telephoto camera mounted on the vehicle. "
+        "This camera is facing forward and has a 30° field of view:\n\nRain falls.",
+    ]
+    with pytest.raises(ValueError, match="must match the cameras"):
+        format_rig_view_captions(["only one"], ["camera_rear_right_70fov", "camera_front_tele_30fov"])
+
+
+def test_multiview_rig_view_attributes_cover_every_mads_camera() -> None:
+    from vllm_omni.diffusion.models.cosmos3.multiview_prompts import MADS_CAMERA_ATTRIBUTES
+    from vllm_omni.model_extras.cosmos3 import COSMOS3_MADS_CAMERAS
+
+    assert tuple(MADS_CAMERA_ATTRIBUTES) == COSMOS3_MADS_CAMERAS
+
+
+@pytest.mark.parametrize(("truncate", "expected"), [(False, "6.7"), (True, "6.0")])
+def test_metadata_duration_truncates_to_whole_seconds_for_per_view_captions(truncate: bool, expected: str) -> None:
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import (
+        COSMOS3_DURATION_TEMPLATE,
+        COSMOS3_RESOLUTION_TEMPLATE,
+        Cosmos3OmniDiffusersPipeline,
+    )
+
+    prompt = Cosmos3OmniDiffusersPipeline._apply_metadata_templates(
+        "A car drives.",
+        201,
+        30.0,
+        480,
+        832,
+        duration_template=COSMOS3_DURATION_TEMPLATE,
+        resolution_template=COSMOS3_RESOLUTION_TEMPLATE,
+        truncate_duration=truncate,
+    )
+
+    assert prompt == (
+        f"A car drives. The video is {expected} seconds long and is of 30 FPS. This video is of 480x832 resolution."
+    )
+
+
+@pytest.mark.parametrize(
+    ("per_view_captions", "transfer", "joint", "expected"),
+    [
+        (True, True, True, "joint"),
+        (True, True, False, "multiview"),
+        (False, True, True, "transfer"),
+        (False, True, False, "transfer"),
+        (True, False, False, "transfer"),
+    ],
+)
+def test_multiview_system_prompt_matches_reference_selection(
+    per_view_captions: bool, transfer: bool, joint: bool, expected: str
+) -> None:
+    from vllm_omni.diffusion.models.cosmos3.multiview_prompts import (
+        COSMOS3_AV_JOINT_CAMERA_LIDAR_TRANSFER_SYSTEM_PROMPT,
+        COSMOS3_AV_MULTIVIEW_TRANSFER_SYSTEM_PROMPT,
+    )
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import COSMOS3_TRANSFER_SYSTEM_PROMPT
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3_multiview import _multiview_system_prompt
+
+    prompts = {
+        "joint": COSMOS3_AV_JOINT_CAMERA_LIDAR_TRANSFER_SYSTEM_PROMPT,
+        "multiview": COSMOS3_AV_MULTIVIEW_TRANSFER_SYSTEM_PROMPT,
+        "transfer": COSMOS3_TRANSFER_SYSTEM_PROMPT,
+    }
+    actual = _multiview_system_prompt(per_view_captions=per_view_captions, transfer=transfer, joint=joint)
+
+    assert actual == prompts[expected]
+
+
+# -- Explicit per-view negative captions --------------------------------------
+
+
+@pytest.mark.parametrize("model", ["baseline", "v2", "v3"])
+@pytest.mark.parametrize(
+    ("source", "explicit", "separate", "expected"),
+    [
+        ("extra_args", "Textures crawl.", True, "Textures crawl."),
+        ("prompt", "Textures crawl.", True, "Textures crawl."),
+        ("attribute", "Textures crawl.", True, "Textures crawl."),
+        ("prompt", "", True, ""),
+        ("extra_args", "", True, ""),
+        ("extra_args", None, True, ""),
+        ("extra_args", "Textures crawl.", False, "Legacy negative."),
+    ],
+)
+def test_multiview_forward_per_view_negative_captions(
+    make_cosmos3_pipeline, model, source, explicit, separate, expected
+) -> None:
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3_multiview import Cosmos3MultiviewPipeline
+    from vllm_omni.model_extras.cosmos3 import COSMOS3_MADS_CAMERAS
+
+    pipeline = make_cosmos3_pipeline()
+    pipeline.__class__ = Cosmos3MultiviewPipeline
+    pipeline.multiview_config = _multiview_contract(model)
+    pipeline.multiview_config["per_view_captions"] = separate
+    pipeline.multiview_cameras = COSMOS3_MADS_CAMERAS
+    pipeline.multiview_align_temporal_positions_across_views = True
+    pipeline.multiview_attention_scope = "decomposed"
+    pipeline.multiview_decomposed_temporal_window_seconds = None
+    pipeline.multiview_control_attends_sensor = True
+    pipeline.multiview_backend = "triton"
+    pipeline.transformer._pad_to_patch_size = lambda h, w: (1, 1, 0, 0)
+    pipeline._prepare_camera_major_pixels = lambda *args, **kwargs: torch.zeros(1)
+    pipeline._encode_multiview_video = lambda *args, **kwargs: torch.zeros(1, 2, 150, 1, 1)
+    pipeline._prepare_multiview_latents = lambda **kwargs: (
+        torch.zeros(1, 2, 150, 1, 1),
+        torch.ones(1, 1, 150, 1, 1),
+        torch.zeros(1, 2, 150, 1, 1),
+    )
+    diffuse_calls = []
+
+    def diffuse(**kwargs):
+        diffuse_calls.append(kwargs)
+        return kwargs["latents"]
+
+    pipeline.diffuse_transfer = diffuse
+    pipeline._decode_multiview_latents = lambda *args, **kwargs: torch.zeros(1)
+    tokenizations = _capture_tokenize_calls(pipeline)
+    views = [
+        {"camera_key": COSMOS3_MADS_CAMERAS[1], "prompt": "A truck passes.", "control_path": "right.mp4"},
+        {"camera_key": COSMOS3_MADS_CAMERAS[0], "prompt": "A car drives.", "control_path": "front.mp4"},
+    ]
+    extra = {"multiview": {"views": views}, "wsm": {}, "aspect_ratio": "16,9"}
+    prompt = {"prompt": "Driving.", "negative_prompt": "Legacy negative."}
+    sp = make_sampling_params(num_frames=297, num_inference_steps=1, latents=None, extra_args=extra)
+    if explicit is not None:
+        if source == "prompt":
+            prompt["per_view_negative_prompt"] = explicit
+            extra["per_view_negative_prompt"] = "Must lose to the prompt value."
+        elif source == "attribute":
+            sp.per_view_negative_prompt = explicit
+        else:
+            extra["per_view_negative_prompt"] = explicit
+    pipeline.forward(make_request_batch(prompt, sp))
+
+    # Capture the real formatter's input to the tokenizer, and the separate
+    # unconditional segments delivered to CFG, rather than just its options.
+    negatives = tokenizations[1::2]
+    assert len(negatives) == (2 if separate else 1)
+    formatted = (
+        f"{expected} The video is 9.0 seconds long and is of 30 FPS. This video is of 480x832 resolution."
+        if separate and expected
+        else expected
+    )
+    assert all(call["text"] == formatted for call in negatives)
+    assert all(call["system_prompt"] == tokenizations[0]["system_prompt"] for call in negatives)
+    assert diffuse_calls[0]["uncond_mask"].tolist() == ([[1, 2]] if separate else [[1]])
+
+
+@pytest.mark.parametrize("negative", [[], {}, 42, True])
+def test_multiview_admission_rejects_non_string_per_view_negative_prompt(negative) -> None:
+    from vllm_omni.model_extras.cosmos3 import validate_multiview_request
+
+    with pytest.raises(ValueError, match="per_view_negative_prompt must be a string"):
+        validate_multiview_request({**_joint_multiview_extra(), "per_view_negative_prompt": negative})
+
+
+@pytest.mark.parametrize("nested", [False, True])
+def test_multiview_clients_forward_per_view_negative_prompt(tmp_path, monkeypatch, nested) -> None:
+    import importlib.util
+    from pathlib import Path
+
+    from vllm_omni.model_extras.cosmos3 import COSMOS3_MULTIVIEW_EXTRA_BODY_PARAMS
+
+    assert "per_view_negative_prompt" in COSMOS3_MULTIVIEW_EXTRA_BODY_PARAMS
+    root = Path(__file__).resolve().parents[4]
+
+    def load_client(name, relative):
+        spec = importlib.util.spec_from_file_location(name, root / relative)
+        module = importlib.util.module_from_spec(spec)
+        monkeypatch.setitem(sys.modules, name, module)
+        spec.loader.exec_module(module)
+        return module
+
+    # The example's engine is replaced at its public generate boundary; the
+    # request preparation code still uses real sampling params.
+    engine_module = types.ModuleType("vllm_omni.entrypoints.omni")
+    engine_module.Omni = SimpleNamespace
+    monkeypatch.setitem(sys.modules, engine_module.__name__, engine_module)
+    online = load_client(
+        "negative_online_client", "examples/online_serving/multiview_video/cosmos3_multiview_client.py"
+    )
+    offline = load_client("negative_offline_client", "examples/offline_inference/multiview_video/cosmos3_multiview.py")
+    params = {
+        "per_view_negative_prompt": "Textures crawl.",
+        "multiview": {"views": [{"camera_key": "camera_front_wide_120fov", "prompt": "A car drives."}]},
+    }
+    manifest = {"prompt": "Driving.", **({"extra_params": params} if nested else params)}
+    form, paths = online.prepare_request(manifest, tmp_path)
+    assert json.loads(form["extra_params"])["per_view_negative_prompt"] == "Textures crawl."
+    assert paths == []
+
+    class GeneratedError(Exception):
+        pass
+
+    def generate(prompt, sampling_params):
+        assert sampling_params.extra_args["per_view_negative_prompt"] == "Textures crawl."
+        raise GeneratedError
+
+    with pytest.raises(GeneratedError):
+        offline._run_request(
+            SimpleNamespace(generate=generate), manifest, output_dir=tmp_path, seed=0, fallback_negative_prompt=None
+        )
+
+
+# -- Multiview LiDAR prefix conditioning ---------------------------------------
+
+
+def _joint_multiview_extra(**lidar) -> dict[str, Any]:
+    return {
+        "multiview": {
+            "views": [
+                {"camera_key": "camera_front_wide_120fov", "control_path": "front.mp4", "prompt": "A car drives."}
+            ]
+        },
+        "wsm": True,
+        "lidar": {"control_path": "hdmap.safetensors", **lidar},
+    }
+
+
+def test_multiview_admission_accepts_lidar_condition_prefix() -> None:
+    from vllm_omni.model_extras.cosmos3 import validate_multiview_request
+
+    for lidar in (
+        {"condition_path": "measured.safetensors"},
+        {"condition_path": "measured.safetensors", "num_conditional_sweeps": 3, "return_output": True},
+    ):
+        validate_multiview_request(_joint_multiview_extra(**lidar), variable_view_count=True)
+
+
+@pytest.mark.parametrize(
+    ("lidar", "match"),
+    [
+        ({"condition_path": "measured.pt"}, "condition_path must be a .safetensors file"),
+        ({"num_conditional_sweeps": 1}, "requires lidar.condition_path"),
+        ({"condition_path": "measured.safetensors", "num_conditional_sweeps": 0}, "positive integer"),
+        ({"condition_path": "measured.safetensors", "num_conditional_sweeps": True}, "positive integer"),
+        ({"condition_path": "measured.safetensors", "num_conditional_sweeps": 1.0}, "positive integer"),
+        ({"condition_frames": 1}, r"Unsupported Cosmos3 lidar fields: \['condition_frames'\]"),
+    ],
+)
+def test_multiview_admission_rejects_invalid_lidar_condition(lidar: dict[str, Any], match: str) -> None:
+    from vllm_omni.model_extras.cosmos3 import validate_multiview_request
+
+    with pytest.raises(ValueError, match=match):
+        validate_multiview_request(_joint_multiview_extra(**lidar), variable_view_count=True)
+
+
+def _multiview_pipeline_with_packed_camera_and_lidar():
+    from vllm_omni.diffusion.models.cosmos3.multiview_packing import pack_state
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3_multiview import Cosmos3MultiviewPipeline
+
+    pipeline = object.__new__(Cosmos3MultiviewPipeline)
+    camera = torch.full((1, 2, 3, 1, 2), 5.0)
+    lidar = torch.full((1, 4, 3, 1, 1), 7.0)
+    velocity_mask = torch.tensor([0.0, 1.0, 1.0]).reshape(1, 1, 3, 1, 1)  # camera frame 0 conditioned
+    shared_kwargs = {
+        "packed_shapes": (tuple(camera.shape[1:]), tuple(lidar.shape[1:])),
+        "lidar_condition_frames": 2,
+        "lidar_condition_latents": torch.full((1, 4, 2, 1, 1), -1.0),
+    }
+    return pipeline, pack_state([camera, lidar]), velocity_mask, shared_kwargs
+
+
+def test_multiview_lidar_condition_prefix_masks_velocity_and_restores_sample() -> None:
+    from vllm_omni.diffusion.models.cosmos3.multiview_packing import unpack_state
+
+    pipeline, packed, velocity_mask, shared_kwargs = _multiview_pipeline_with_packed_camera_and_lidar()
+
+    noise = pipeline._mask_transfer_noise(packed.clone(), velocity_mask, shared_kwargs)
+    camera, lidar = unpack_state(noise, shared_kwargs["packed_shapes"])
+    assert camera[:, :, 0].eq(0).all() and camera[:, :, 1:].eq(5).all()
+    assert lidar[:, :, :2].eq(0).all() and lidar[:, :, 2:].eq(7).all()
+
+    condition = torch.full((1, 2, 3, 1, 2), 9.0)
+    latents = pipeline._apply_transfer_condition(packed.clone(), velocity_mask, condition, shared_kwargs)
+    camera, lidar = unpack_state(latents, shared_kwargs["packed_shapes"])
+    assert camera[:, :, 0].eq(9).all() and camera[:, :, 1:].eq(5).all()
+    assert lidar[:, :, :2].eq(-1).all() and lidar[:, :, 2:].eq(7).all()
+
+    # Without a LiDAR prefix the LiDAR stream is untouched.
+    shared_kwargs["lidar_condition_frames"] = 0
+    noise = pipeline._mask_transfer_noise(packed.clone(), velocity_mask, shared_kwargs)
+    assert unpack_state(noise, shared_kwargs["packed_shapes"])[1].eq(7).all()
+
+
+def test_multiview_encode_lidar_condition_bounds_and_shape(tmp_path) -> None:
+    from safetensors.torch import save_file
+
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3_multiview import Cosmos3MultiviewPipeline
+
+    path = tmp_path / "measured.safetensors"
+    frames = torch.zeros(3, 4, 128, 1800)
+    frames[0] = 10.0
+    save_file({"frames": frames}, str(path))
+    encoded: list[tuple[int, ...]] = []
+
+    class FakeEncoder:
+        config = {"streaming_chunk_frames": 20}
+
+        def __call__(self, sweeps: torch.Tensor) -> torch.Tensor:
+            encoded.append(tuple(sweeps.shape))
+            return torch.ones(1, 128, sweeps.shape[1], 8, 113)
+
+    pipeline = object.__new__(Cosmos3MultiviewPipeline)
+    pipeline.lidar_encoder = FakeEncoder()
+    pipeline.device = torch.device("cpu")
+    pipeline.dtype = torch.bfloat16
+    target = (1, 128, 5, 8, 113)
+
+    latents = pipeline._encode_lidar_condition({"condition_path": str(path)}, 5, target)
+    assert tuple(latents.shape) == (1, 128, 1, 8, 113)  # reference default: one measured sweep
+    assert latents.dtype == torch.float32  # part of the float32 denoising state
+    latents = pipeline._encode_lidar_condition({"condition_path": str(path), "num_conditional_sweeps": 3}, 5, target)
+    assert tuple(latents.shape) == (1, 128, 3, 8, 113)
+    # Zero-padded to the chunk boundary, capped at the request's 5 sweeps.
+    assert encoded == [(3, 5, 128, 1800), (3, 5, 128, 1800)]
+
+    with pytest.raises(ValueError, match="must leave at least one"):
+        pipeline._encode_lidar_condition({"condition_path": str(path), "num_conditional_sweeps": 5}, 5, target)
+    with pytest.raises(ValueError, match="requires 5 sweeps, but contains 4"):
+        pipeline._encode_lidar_condition({"condition_path": str(path), "num_conditional_sweeps": 5}, 6, target)
+
+
+def test_multiview_denoising_state_is_float32_with_bf16_model() -> None:
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3_multiview import Cosmos3MultiviewPipeline
+
+    pipeline = object.__new__(Cosmos3MultiviewPipeline)
+    pipeline.device = torch.device("cpu")
+    pipeline.dtype = torch.bfloat16
+    pipeline.transformer = SimpleNamespace(latent_channel_size=2)
+    pipeline.vae_scale_factor_temporal = 4
+    pipeline.vae_scale_factor_spatial = 8
+    # Two cameras with two latent frames each; latent frame 0 of each camera is conditioned.
+    encoded = torch.full((1, 2, 4, 2, 2), 0.3, dtype=torch.bfloat16)
+    pipeline._encode_multiview_video = lambda video, **kwargs: encoded
+    # 1 + 2**-12 rounds to 1 in BF16; injected reference noise must survive unrounded.
+    injected = torch.full((1, 2, 4, 2, 2), 1.0 + 2**-12)
+    prepare = dict(
+        target_pixels=torch.zeros(1),
+        condition_indexes=[0, 2],
+        num_views=2,
+        num_frames=5,
+        height=16,
+        width=16,
+        generator=torch.Generator().manual_seed(0),
+    )
+
+    latents, velocity_mask, condition = pipeline._prepare_multiview_latents(injected_latents=injected, **prepare)
+    assert latents.dtype == velocity_mask.dtype == condition.dtype == torch.float32
+    assert velocity_mask.flatten().tolist() == [0.0, 1.0, 0.0, 1.0]
+    assert latents[:, :, [0, 2]].eq(encoded[:, :, [0, 2]].float()).all()
+    assert latents[:, :, [1, 3]].eq(1.0 + 2**-12).all()
+    sampled, _, _ = pipeline._prepare_multiview_latents(injected_latents=None, **prepare)
+    assert sampled.dtype == torch.float32
+
+    # The transformer's BF16 velocity is masked in place by the float32 mask.
+    pipeline, packed, velocity_mask, shared_kwargs = _multiview_pipeline_with_packed_camera_and_lidar()
+    noise = pipeline._mask_transfer_noise(packed.to(torch.bfloat16), velocity_mask, shared_kwargs)
+    assert noise.dtype == torch.bfloat16
+
+
+def test_diffuse_transfer_runs_model_dtype_transformer_on_float32_state(make_cosmos3_pipeline) -> None:
+    pipeline = make_cosmos3_pipeline()
+    pipeline.dtype = torch.bfloat16
+    transformer_input_dtypes: list[torch.dtype] = []
+    stub_forward = pipeline.transformer.forward
+
+    def recording_forward(*, hidden_states: torch.Tensor, **kwargs: Any):
+        transformer_input_dtypes.append(hidden_states.dtype)
+        return stub_forward(hidden_states=hidden_states, **kwargs)
+
+    pipeline.transformer.forward = recording_forward
+    # 1 + 2**-12 rounds to 1 in BF16; the float32 sampler state must keep it.
+    latents = torch.full((1, 2, 1, 1, 1), 1.0 + 2**-12)
+    velocity_mask = torch.ones(1, 1, 1, 1, 1)
+
+    result = pipeline.diffuse_transfer(
+        latents=latents,
+        timesteps=torch.tensor([7]),
+        cond_ids=_ids(2),
+        cond_mask=_mask(),
+        uncond_ids=_ids(1),
+        uncond_mask=_mask(),
+        guidance_scale=1.0,
+        control_guidance=1.0,
+        control_guidance_interval=None,
+        control_latents=[torch.zeros_like(latents)],
+        shared_kwargs={"video_shape": (1, 1, 1), "fps": 24.0, "noisy_frame_mask": velocity_mask},
+        velocity_mask=velocity_mask,
+        condition_latents=torch.zeros_like(latents),
+    )
+
+    assert transformer_input_dtypes == [torch.bfloat16]
+    assert result.dtype == torch.float32
+    # The stub velocity is its cond token plus the control bonus: 2 + 100.
+    assert torch.equal(result, latents + 102.0)
+
+
+def _chunked_lidar_encoder(chunk: int, context: int):
+    """The real streaming loop of Cosmos3LidarEncoder.forward around a toy frame-causal block.
+
+    Each output frame is the mean of every input frame the block can see (the
+    kept cache plus the causal part of its chunk), so latents change whenever
+    the retained history does.
+    """
+    from vllm_omni.diffusion.models.cosmos3.lidar import Cosmos3LidarEncoder
+
+    class CausalMean:
+        def forward_stream(self, pixels, coords, cache):
+            history = pixels if cache is None else torch.cat([cache["x"][0], pixels], dim=2)
+            total, new = history.shape[2], pixels.shape[2]
+            running = history.mean(dim=(1, 3, 4), keepdim=True).cumsum(2)
+            running = running / torch.arange(1, total + 1).view(1, 1, total, 1, 1)
+            return running[:, :, total - new :].expand(-1, 6, -1, -1, -1), {"x": (history, history)}
+
+    encoder = object.__new__(Cosmos3LidarEncoder)
+    nn.Module.__init__(encoder)
+    encoder.config = {
+        "streaming_chunk_frames": chunk,
+        "streaming_context_frames": context,
+        "range_projection": {"semantic_width": 1800, "model_width": 1808, "min_range_m": 0.0, "max_range_m": 100.0},
+    }
+    encoder.encoder = CausalMean()
+    encoder.quant_conv = nn.Identity()
+    encoder.coords = torch.zeros(1)
+    encoder.latent_mean = torch.zeros(1, 3, 1, 1, 1)
+    encoder.latent_std = torch.ones(1, 3, 1, 1, 1)
+    return encoder
+
+
+@pytest.mark.parametrize("count", [3, 4, 5, 9, 10])
+def test_multiview_lidar_condition_matches_reference_full_clip_encoding(tmp_path, count: int) -> None:
+    """The reference encodes the prefix inside an empty full-length target clip."""
+    from safetensors.torch import save_file
+
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3_multiview import Cosmos3MultiviewPipeline
+
+    num_sweeps, chunk, context = 11, 4, 5  # the 20/21 streaming geometry, scaled down
+    generator = torch.Generator().manual_seed(0)
+    measured = torch.rand(3, count, 128, 1800, generator=generator)
+    measured[0] *= 50.0
+    path = tmp_path / "measured.safetensors"
+    save_file({"frames": measured}, str(path))
+    encoder = _chunked_lidar_encoder(chunk, context)
+    pipeline = object.__new__(Cosmos3MultiviewPipeline)
+    nn.Module.__init__(pipeline)
+    pipeline.lidar_encoder = encoder
+    pipeline.device = torch.device("cpu")
+    pipeline.dtype = torch.float32
+
+    actual = pipeline._encode_lidar_condition(
+        {"condition_path": str(path), "num_conditional_sweeps": count}, num_sweeps, (1, 3, num_sweeps, 1, 1)
+    )
+
+    full_target = torch.zeros(3, num_sweeps, 128, 1800)
+    full_target[:, :count] = measured
+    torch.testing.assert_close(actual, encoder(full_target)[:, :, :count], rtol=0, atol=0)
+    if count > chunk and count % chunk:
+        # Encoding the bare prefix keeps a different history for its trailing partial chunk.
+        assert not torch.equal(encoder(measured)[:, :, :count], actual)
+
+
+# -- Multiview LiDAR condition uploads -----------------------------------------
+
+
+def _uploaded_joint_manifest(**lidar) -> dict[str, Any]:
+    return {
+        "multiview": {
+            "views": [{"camera_key": "camera_front_wide_120fov", "control_reference_index": 0, "prompt": "A car."}]
+        },
+        "wsm": True,
+        "lidar": {"control_reference_index": 1, **lidar},
+    }
+
+
+def test_multiview_uploads_resolve_lidar_condition_reference() -> None:
+    from vllm_omni.model_extras.cosmos3 import (
+        has_multiview_upload_indexes,
+        multiview_lidar_upload_indexes,
+        resolve_multiview_uploads,
+    )
+
+    extra = _uploaded_joint_manifest(condition_reference_index=2, num_conditional_sweeps=3, return_output=True)
+    assert multiview_lidar_upload_indexes(extra) == {1, 2}
+    assert has_multiview_upload_indexes({"lidar": {"condition_reference_index": 0}})
+
+    resolved = resolve_multiview_uploads(extra, ["front.mp4", "hdmap.safetensors", "measured.safetensors"])
+
+    assert resolved["lidar"] == {
+        "control_path": "hdmap.safetensors",
+        "condition_path": "measured.safetensors",
+        "num_conditional_sweeps": 3,
+        "return_output": True,
+    }
+    assert resolved["multiview"]["views"][0]["control_path"] == "front.mp4"
+    assert "condition_reference_index" in extra["lidar"]  # the caller's manifest is not mutated
+
+
+@pytest.mark.parametrize(
+    ("lidar", "paths", "match"),
+    [
+        ({"condition_reference_index": 1}, 2, "referenced more than once"),
+        ({"condition_reference_index": 2, "condition_path": "x.safetensors"}, 3, "cannot be combined"),
+        ({"condition_reference_index": 5}, 3, "condition_reference_index must be an integer index"),
+        ({"condition_reference_index": "2"}, 3, "condition_reference_index must be an integer index"),
+        ({"condition_reference_index": 2}, 3 + 1, "must be referenced exactly once"),
+    ],
+)
+def test_multiview_uploads_reject_invalid_lidar_condition_reference(lidar, paths: int, match: str) -> None:
+    from vllm_omni.model_extras.cosmos3 import multiview_lidar_upload_indexes, resolve_multiview_uploads
+
+    extra = _uploaded_joint_manifest(**lidar)
+    multiview_lidar_upload_indexes(extra)  # malformed indexes never raise here
+    upload_paths = ["front.mp4", "hdmap.safetensors", "measured.safetensors", "extra.safetensors"][:paths]
+
+    with pytest.raises(ValueError, match=match):
+        resolve_multiview_uploads(extra, upload_paths)
+
+
+def test_multiview_client_uploads_lidar_condition(tmp_path) -> None:
+    import importlib.util
+    from pathlib import Path
+
+    client_path = (
+        Path(__file__).resolve().parents[4] / "examples/online_serving/multiview_video/cosmos3_multiview_client.py"
+    )
+    spec = importlib.util.spec_from_file_location("cosmos3_multiview_client", client_path)
+    client = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(client)
+    for name in ("front.mp4", "hdmap.safetensors", "measured.safetensors"):
+        (tmp_path / name).write_bytes(b"x")
+    manifest = {
+        "prompt": "",
+        "multiview": {
+            "views": [{"camera_key": "camera_front_wide_120fov", "control_path": "front.mp4", "prompt": "A car."}]
+        },
+        "wsm": True,
+        "lidar": {
+            "control_path": "hdmap.safetensors",
+            "condition_path": "measured.safetensors",
+            "num_conditional_sweeps": 2,
+        },
+    }
+
+    data, paths = client.prepare_request(manifest, tmp_path, resolution_override="480", aspect_ratio_override="16,9")
+
+    lidar = json.loads(data["extra_params"])["lidar"]
+    assert lidar == {"control_reference_index": 1, "condition_reference_index": 2, "num_conditional_sweeps": 2}
+    assert [path.name for path in paths] == ["front.mp4", "hdmap.safetensors", "measured.safetensors"]

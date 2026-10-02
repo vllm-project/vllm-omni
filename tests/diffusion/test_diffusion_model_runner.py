@@ -1242,6 +1242,73 @@ def test_load_model_clears_cache_backend_for_unsupported_pipeline(monkeypatch):
 
 @pytest.mark.core_model
 @pytest.mark.cpu
+@pytest.mark.parametrize(
+    ("model_class_name", "configured_dynamic", "expected_dynamic"),
+    [
+        ("WanPipeline", None, True),
+        ("Cosmos3MultiviewPipeline", None, False),
+        ("Cosmos3MultiviewPipeline", True, True),
+    ],
+)
+def test_load_model_resolves_unset_compile_dynamic_from_metadata(
+    monkeypatch, model_class_name, configured_dynamic, expected_dynamic
+):
+    seen_dynamic = []
+    pipeline = SimpleNamespace(setup_compile=lambda: seen_dynamic.append(runner.od_config.diffusion_compile_dynamic))
+
+    class _DummyLoader:
+        def __init__(self, load_config, od_config=None):
+            del load_config, od_config
+
+        def load_model(self, **kwargs):
+            del kwargs
+            return pipeline
+
+    class _DummyMemoryProfiler:
+        consumed_memory = 0
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            del exc_type, exc, tb
+            return False
+
+    runner = object.__new__(DiffusionModelRunner)
+    runner.vllm_config = object()
+    runner.device = torch.device("cpu")
+    runner.pipeline = None
+    runner.cache_backend = None
+    runner.offload_backend = None
+    runner.od_config = SimpleNamespace(
+        enable_cpu_offload=False,
+        enable_layerwise_offload=False,
+        cache_backend="none",
+        cache_config={},
+        model_class_name=model_class_name,
+        enforce_eager=False,
+        streaming_output=False,
+        diffusion_compile_dynamic=configured_dynamic,
+    )
+
+    monkeypatch.setattr(model_runner_module, "LoadConfig", lambda: object())
+    monkeypatch.setattr(model_runner_module, "DiffusersPipelineLoader", _DummyLoader)
+    monkeypatch.setattr(model_runner_module, "DeviceMemoryProfiler", _DummyMemoryProfiler)
+    monkeypatch.setattr(
+        model_runner_module,
+        "enable_offload_backend",
+        lambda od_config, pipeline, device: (pipeline, None),
+    )
+    monkeypatch.setattr(model_runner_module.current_omni_platform, "supports_torch_inductor", lambda: True)
+    monkeypatch.setattr(model_runner_module, "get_cache_backend", lambda cache_backend, cache_config: None)
+
+    DiffusionModelRunner.load_model(runner)
+
+    assert seen_dynamic == [expected_dynamic]
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
 def test_load_model_rejects_env_prompt_cache_before_text_encoder_allgather(monkeypatch):
     runner = object.__new__(DiffusionModelRunner)
     runner.vllm_config = object()

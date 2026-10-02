@@ -11,6 +11,7 @@ class DiffusionModelMetadata:
     supports_multimodal_inputs: bool = False
     max_multimodal_image_inputs: int | None = None
     supports_mixed_reference_inputs: bool = False
+    supports_multiview_reference_inputs: bool = False
     # Multipart controls are exposed as ``control_reference`` plus
     # ``control_type`` by the video API.  A pipeline that opts in receives the
     # persisted upload through ``extra_args[control_type]["control_path"]``.
@@ -21,6 +22,10 @@ class DiffusionModelMetadata:
     # noise masks for latent initialization. Unknown pipelines must remain
     # opted out so uploaded files never reach a model that cannot consume them.
     supports_latent_mask_editing: bool = False
+    # Default for ``diffusion_compile_dynamic`` when neither the CLI nor the
+    # deploy config sets it. The model runner applies it after loading, once the
+    # pipeline class is final.
+    compile_dynamic: bool = True
 
 
 # FLUX.2 Klein supports up to four reference images.
@@ -118,6 +123,11 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
     "Cosmos3OmniPipeline": DiffusionModelMetadata(
         supported_control_upload_types=("edge", "blur", "depth", "seg", "wsm"),
         final_output_type="video",
+    ),
+    "Cosmos3MultiviewPipeline": DiffusionModelMetadata(
+        supports_multiview_reference_inputs=True,
+        final_output_type="video",
+        compile_dynamic=False,
     ),
     "SanaVideoPipeline": DiffusionModelMetadata(final_output_type="video"),
     "SanaImageToVideoPipeline": DiffusionModelMetadata(final_output_type="video"),

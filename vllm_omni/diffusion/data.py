@@ -976,7 +976,8 @@ class OmniDiffusionConfig:
     # Controls the generic compilation path used when a pipeline does not
     # provide its own setup_compile() implementation.
     diffusion_compile_granularity: str = "regional"
-    diffusion_compile_dynamic: bool = True
+    # None selects the pipeline's DiffusionModelMetadata.compile_dynamic.
+    diffusion_compile_dynamic: bool | None = None
 
     # Parallel weight loading (for faster diffusion model startup)
     enable_multithread_weight_load: bool = True
@@ -1210,8 +1211,10 @@ class OmniDiffusionConfig:
                 "diffusion_compile_granularity must be 'regional' or 'full', "
                 f"got {self.diffusion_compile_granularity!r}"
             )
-        if not isinstance(self.diffusion_compile_dynamic, bool):
-            raise TypeError(f"diffusion_compile_dynamic must be a bool, got {type(self.diffusion_compile_dynamic)!r}")
+        if self.diffusion_compile_dynamic is not None and not isinstance(self.diffusion_compile_dynamic, bool):
+            raise TypeError(
+                f"diffusion_compile_dynamic must be a bool or None, got {type(self.diffusion_compile_dynamic)!r}"
+            )
         self.diffusion_kv_mode = parse_diffusion_kv_cache_mode(self.diffusion_kv_mode)
         if not isinstance(self.enable_prefix_caching, bool):
             raise TypeError("enable_prefix_caching must be a bool")

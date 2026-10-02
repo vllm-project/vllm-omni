@@ -595,11 +595,12 @@ class TestRequestBatchCapability:
 class TestDiffusionCompileConfig:
     pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
-    def test_config_defaults_to_dynamic_regional_compile(self) -> None:
+    def test_config_defaults_to_regional_compile_with_pipeline_dynamic_default(self) -> None:
         config = OmniDiffusionConfig(model="test")
 
         assert config.diffusion_compile_granularity == "regional"
-        assert config.diffusion_compile_dynamic is True
+        # The model runner resolves the pipeline metadata default after loading.
+        assert config.diffusion_compile_dynamic is None
 
     def test_from_kwargs_preserves_compile_controls(self) -> None:
         config = OmniDiffusionConfig.from_kwargs(
