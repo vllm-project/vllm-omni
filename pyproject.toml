@@ -56,7 +56,9 @@ dev = [
     # 0.3.12 includes acknowledged TCP writes (Mooncake #2850): completion
     # must mean the receive buffer is ready before zero-copy consumers read it.
     "mooncake-transfer-engine-cuda13==0.3.12.post1",
-    "av==18.0.0", # for ComfyUI tests
+    "av==18.0.0; python_version >= '3.11'", # for ComfyUI tests
+    "av==17.1.0; python_version < '3.11'", # last av release that supports Python 3.10
+    "tomli==2.4.1; python_version < '3.11'", # tomllib backport used by tests/helpers/mark.py
     "openpyxl==3.1.5", # for nightly CI
     "pyttsx3==2.99",
     "opencc==1.4.1",
@@ -66,14 +68,12 @@ dev = [
     "jiwer==4.0.0",
     "zhon==2.1.1",
     "zhconv==1.4.3",
-    "scipy==1.18.0",
     "funasr==1.3.29",
     "lpips==0.1.4", # for quantization fp8
     "orjson==3.11.9", # to make v1/embeddings API fast
     "voxcpm==2.0.3", # for VoxCPM2 path-locating in tests
     "torchdiffeq==0.2.5", # for covo_audio Test
     "FlagEmbedding==1.4.0", # for hunyuan_image3 tests
-    "s3tokenizer==0.3.0", # for tts test
     # Provides top-level cosyvoice2; do not co-install stepaudio2-minicpmo,
     # whose top-level stepaudio2 package conflicts with this distribution.
     "step-audio2==1.0.0", # Step-Audio2 / MiniCPM-o 4.5 Token2Wav (flashcosyvoice / hyperpyyaml)
@@ -123,6 +123,11 @@ fa4 = [
     "flash-attn-4[cu13]==4.0.0b18",
 ]
 
+# FastVideo VSA kernels for the supported Linux/Python 3.12 wheel environment.
+vsa = [
+    "fastvideo-kernel==0.3.4",
+]
+
 docs = [
     "mkdocs>=1.5.0",
     "mkdocs-api-autonav",
@@ -156,12 +161,25 @@ vllm-omni = "vllm_omni.entrypoints.cli.main:main"
 vllm_omni_register_models = "vllm_omni.engine.arg_utils:register_omni_models_to_vllm"
 
 
+[tool.setuptools]
+include-package-data = false
+
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["vllm_omni*"]
 
 [tool.setuptools.package-data]
-"vllm_omni" = ["_version.py", "py.typed", "transformers_utils/chat_templates/*.jinja"]
+"vllm_omni" = [
+    "_version.py",
+    "py.typed",
+    "deploy/*.md",
+    "deploy/*.yaml",
+    "diffusion/distributed/csrc/*.cu",
+    "diffusion/distributed/csrc/*.hpp",
+    "model_executor/models/covo_audio/speaker_prompt/*.npy",
+    "model_executor/models/step_audio2/assets/*.wav",
+    "transformers_utils/chat_templates/*.jinja",
+]
 
 [tool.setuptools_scm]
 # no extra settings needed, presence enables setuptools-scm
@@ -322,12 +340,15 @@ skip_covered = true
 
 [tool.typos.default]
 extend-ignore-identifiers-re = [
+    # Canonical PyTorch CUDA device property.
+    "^shared_memory_per_block_optin$",
     ".*_thw",
     ".*thw",
     "ein",
     ".*arange",
     ".*MoBA",
     ".*temperal_downsample",
+    ".*temperal_upsample",
     ".*_nd",
     ".*nd$",
     ".*EmbedND$",

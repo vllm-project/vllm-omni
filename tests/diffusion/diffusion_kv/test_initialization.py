@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -58,6 +58,7 @@ def _od_config(**overrides):
         gpu_memory_utilization=0.9,
         kv_cache_memory_bytes=None,
         max_num_seqs=1,
+        diffusion_kv_max_rows_per_request=1,
         max_num_batched_tokens=64,
         num_gpus=1,
     )
@@ -222,6 +223,22 @@ def test_paged_config_forwards_gpu_memory_utilization_to_native_cache_config() -
     )
 
     assert vllm_config.cache_config.gpu_memory_utilization == 0.42
+
+
+@pytest.mark.parametrize("enable_prefix_caching", [False, True])
+@pytest.mark.parametrize("requests,rows", [(1, 2), (2, 3)])
+def test_native_config_counts_cfg_rows_once(enable_prefix_caching, requests, rows) -> None:
+    od_config = _od_config(
+        max_num_seqs=requests,
+        diffusion_kv_max_rows_per_request=rows,
+        enable_prefix_caching=enable_prefix_caching,
+    )
+    config = diffusion_vllm_config.create_diffusion_vllm_config(torch.device("cpu"), od_config)
+    # Engine and Worker must see the same row capacity, including on reconfiguration.
+    diffusion_vllm_config.configure_diffusion_vllm_config(config, od_config)
+    assert config.scheduler_config.max_num_seqs == requests * rows
+    assert od_config.max_num_seqs == requests
+    assert config.cache_config.enable_prefix_caching is enable_prefix_caching
 
 
 def test_diffusion_vllm_model_config_supplies_dtype_for_quant_methods() -> None:

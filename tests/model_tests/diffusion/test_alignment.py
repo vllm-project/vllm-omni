@@ -28,7 +28,12 @@ EXCLUDED_MODELS = [
     "GlmImagePipeline",
     "ZImagePipeline",
     "OvisImagePipeline",
+    # Requires upstream AR hidden states and token boundaries; covered by
+    # dedicated MammothModa2 bridge/pipeline tests and real-checkpoint E2E.
+    "MammothModa2DiTPipeline",
     "WanPipeline",
+    # Uses a full checkpoint and video input; covered by its checkpoint-gated E2E test.
+    "SeedVR2Pipeline",
     "WanDMDPipeline",
     "WanVACEPipeline",
     "LTX2TwoStagePipeline",
@@ -50,13 +55,13 @@ EXCLUDED_MODELS = [
     "BooguImageTurboPipeline",
     "LancePipeline",
     "MingImagePipeline",
+    "MingImageDiffusionPipeline",
+    "MingImageLayeredDiffusionPipeline",
     "InternVLAA1Pipeline",
-    "StableDiffusion3Pipeline",
     "HunyuanImage3ForCausalMM",
     "ErnieImagePipeline",
     "NextStep11Pipeline",
     "FluxDMD2Pipeline",
-    "Krea2Pipeline",
     "QwenImageDMD2Pipeline",
     "OmniGen2Pipeline",
     "HeliosPipeline",
@@ -82,6 +87,7 @@ EXCLUDED_MODELS = [
     "StableDiffusionXLPipeline",
     "Gr00tN1d7Pipeline",
     "Pi0Pipeline",
+    "Pi05Pipeline",
     "SanaWmPipeline",
     # Audio pipeline conditioned by a separate Qwen2.5-Omni encoder stage;
     # covered by tests/diffusion/models/auk (CPU pipeline tests, parity) and

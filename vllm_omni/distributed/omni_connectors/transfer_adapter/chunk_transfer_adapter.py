@@ -18,6 +18,7 @@ from vllm.v1.utils import ConstantList
 from vllm_omni.data_entry_keys import MetaStruct, OmniPayloadStruct, unflatten_payload
 
 from ..adapter import construct_next_stage_streaming_input_prompt
+from ..connectors.shm_connector import SharedMemoryConnector
 from ..factory import OmniConnectorFactory
 from ..utils.config import ConnectorSpec, stage_receives_chunks
 from ..utils.initialization import resolve_connector_spec
@@ -44,6 +45,8 @@ class _SenderGeneration:
         # was up. The terminal task owes that cleanup once it is done with the
         # connector -- on every exit path, including a failed or raising put.
         self.cleanup_deferred = False
+        self.num_puts = 0
+        self.terminal_sent = False
 
 
 class _LoadEntry:
@@ -273,6 +276,8 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 frozen_ids = token_ids.copy()
                 setattr(snapshot, private_name, frozen_ids)
                 setattr(snapshot, public_name, ConstantList(frozen_ids))
+                if public_name == "output_token_ids":
+                    snapshot.output_token_count = len(frozen_ids)
         return snapshot
 
     @staticmethod
@@ -330,7 +335,6 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             if request_id in self._registered_load_entries:
                 return
             entry = _LoadEntry(request)
-            self._cancelled_load_reqs.discard(request_id)
             self._registered_load_entries[request_id] = entry
             self._pending_load_reqs.append(entry)
         with self._recv_cond:
@@ -495,8 +499,9 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         with self._receiver_state_lock:
             if self._registered_load_entries.get(req_id) is not entry:
                 return True
+            external_req_id = entry.external_req_id
+            self.request_ids_mapping[req_id] = external_req_id
             chunk_id = self.get_req_chunk[req_id]
-            external_req_id = self.request_ids_mapping.get(req_id, req_id)
         connector_get_key = f"{external_req_id}_{target_stage_id}_{chunk_id}"
 
         # Use timeout=0 for non-blocking poll
@@ -648,6 +653,11 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                         continue
                     info[key] = value
                 request.additional_information = info
+                if replace_snapshot:
+                    # New/resumed requests forward this field with priority
+                    # over additional_information. Replace the prewarm session
+                    # payload too, so chunk zero retains its codec metadata.
+                    request.model_intermediate_buffer = info
                 request.num_computed_tokens = 0
 
                 # Empty chunk with more data expected: keep polling.
@@ -672,6 +682,12 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         return False
 
     def _send_single_request(self, task: dict):
+        if "cleanup_shm" in task:
+            assert isinstance(self.connector, SharedMemoryConnector)
+            key_prefix, num_puts = task["cleanup_shm"]
+            for chunk_id in range(num_puts):
+                self.connector.cleanup(f"{key_prefix}_{chunk_id}")
+            return
         request = task["request"]
         external_req_id = request.external_req_id
         sender_token = task.get("sender_token")
@@ -708,6 +724,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 if self._sender_tokens.get(external_req_id) is sender_token:
                     sender_token.in_flight = False
                     if sender_token.cancelled and not sender_token.terminal_pending:
+                        self._queue_shm_cleanup_locked(external_req_id, sender_token)
                         self._sender_tokens.pop(external_req_id, None)
                         self._clear_sender_state_locked(external_req_id)
 
@@ -811,6 +828,10 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             logger.debug("Skipping cancelled chunk for request %s before connector put", external_req_id)
             return
 
+        if sender_token is not None:
+            # Include the in-flight key even if cancellation wins before put
+            # returns or the connector raises after creating the segment.
+            sender_token.num_puts = self.put_req_chunk[external_req_id] + 1
         success, size, metadata = self.connector.put(
             from_stage=str(stage_id),
             to_stage=str(next_stage_id),
@@ -820,6 +841,8 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
         with self._sender_state_lock:
             if sender_token is not None:
+                if success and is_finished:
+                    sender_token.terminal_sent = True
                 still_current = self._sender_tokens.get(external_req_id) is sender_token
                 retiring_without_terminal = sender_token.cancelled and not (
                     is_finished or sender_token.terminal_pending
@@ -878,6 +901,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
         if is_segment_finished:
             self.code_prompt_token_ids.pop(external_req_id, None)
+            getattr(self, "_qwen3_tts_emitted_frames", {}).pop(external_req_id, None)
             self.ramp_chunk_count.pop(external_req_id, None)
             self._adaptive_states.pop(external_req_id, None)
             cached_ic = getattr(self, "_cached_ic", None)
@@ -938,7 +962,6 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self._discard_from_chunk_deque(self.waiting_for_chunk_running_requests, request_id)
         self._discard_from_chunk_deque(self._held_non_active, request_id)
 
-        self._cancelled_load_reqs.add(request_id)
         self._finished_load_reqs.discard(request_id)
         self._waiting_since.pop(request_id, None)
 
@@ -984,14 +1007,31 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 # in-flight code can mutate this request's state. Let it own
                 # cleanup without making the scheduler wait for connector I/O.
                 return
+            self._queue_shm_cleanup_locked(external_req_id, sender_token)
             self._sender_tokens.pop(external_req_id, None)
             self._clear_sender_state_locked(external_req_id)
+
+    def _queue_shm_cleanup_locked(self, external_req_id: str, sender_token: _SenderGeneration) -> None:
+        # Successful terminal chunks must remain readable by downstream. On
+        # abort, queue exact keys on the same save thread as puts: the scheduler
+        # never performs SHM I/O, and cleanup precedes reuse of this external id.
+        if (
+            isinstance(self.connector, SharedMemoryConnector)
+            and sender_token.num_puts
+            and not sender_token.terminal_sent
+        ):
+            self._pending_save_reqs.append(
+                {"cleanup_shm": (f"{external_req_id}_{self.connector.stage_id}", sender_token.num_puts)}
+            )
+            with self._save_cond:
+                self._save_cond.notify()
 
     def _clear_sender_state_locked(self, external_req_id: str) -> None:
         """Clear sender state while ``_sender_state_lock`` is held."""
         self.put_req_chunk.pop(external_req_id, None)
         self.request_payload.pop(external_req_id, None)
         self.code_prompt_token_ids.pop(external_req_id, None)
+        getattr(self, "_qwen3_tts_emitted_frames", {}).pop(external_req_id, None)
         self.requests_num_chunks_sent.pop(external_req_id, None)
         self._segment_generation.pop(external_req_id, None)
         self.ramp_chunk_count.pop(external_req_id, None)

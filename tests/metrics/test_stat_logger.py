@@ -1,8 +1,21 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from __future__ import annotations
 
-import pytest
-from prometheus_client import CollectorRegistry, generate_latest
+import asyncio
+from unittest.mock import AsyncMock, Mock
 
+import pytest
+from prometheus_client import REGISTRY, CollectorRegistry, generate_latest
+from vllm.config import ModelConfig, ObservabilityConfig, SpeculativeConfig, VllmConfig
+from vllm.v1.engine import EngineCoreOutputs
+from vllm.v1.metrics.prometheus import unregister_vllm_metrics
+from vllm.v1.metrics.stats import IterationStats, SchedulerStats
+from vllm.v1.spec_decode.metrics import SpecDecodingStats
+
+from vllm_omni.engine.orchestrator import Orchestrator
+from vllm_omni.engine.stage_pool import StagePool
 from vllm_omni.metrics.stat_logger import (
     _ENGINE_INDEX_MAP,
     OmniPrometheusStatLogger,
@@ -454,3 +467,80 @@ class TestDoubleRewriteGuard:
         c.labels("m", "1", "stop").inc(3)
         out = generate_latest(fresh_registry).decode()
         assert 'dr_legacy_with_extra_total{model_name="m",reason="stop",replica="0",stage="1"} 3.0' in out
+
+
+@pytest.fixture
+def stats_config():
+    config = Mock(
+        spec=VllmConfig,
+        model_config=Mock(spec=ModelConfig, served_model_name="test-model", max_model_len=2048, is_diffusion=False),
+        observability_config=ObservabilityConfig(kv_cache_metrics=True),
+        speculative_config=Mock(spec=SpeculativeConfig, num_speculative_tokens=3),
+        kv_transfer_config=None,
+        lora_config=None,
+    )
+    yield config
+    unregister_vllm_metrics()
+
+
+@pytest.mark.parametrize("initial_map", [{}, {0: ("0", "0"), 1: ("1", "0")}])
+def test_register_replica_preserves_existing_metrics(stats_config, initial_map):
+    stat_logger = OmniPrometheusStatLogger(stats_config, dict(initial_map))
+    iteration = IterationStats()
+    iteration.num_generation_tokens = 7
+    if initial_map:
+        stat_logger.record(None, iteration, engine_idx=0)
+        stat_logger.record_sleep_state(sleep=1, level=1)
+    new_idx = len(initial_map)
+    stat_logger.register_replica(new_idx, "0", "4")
+    scheduler = SchedulerStats(num_running_reqs=2, num_waiting_reqs=3)
+    scheduler.spec_decoding_stats = SpecDecodingStats(
+        num_spec_tokens=3,
+        num_drafts=1,
+        num_draft_tokens=3,
+        num_accepted_tokens=2,
+        num_accepted_tokens_per_pos=[1, 1, 0],
+    )
+    stat_logger.record(scheduler, iteration, engine_idx=new_idx)
+    stat_logger.register_replica(new_idx, "0", "4")  # Rejoin keeps the same counters.
+    stat_logger.record(None, iteration, engine_idx=new_idx)
+    labels = {"model_name": "test-model", "stage": "0", "replica": "4"}
+    assert REGISTRY.get_sample_value("vllm:generation_tokens_total", labels) == 14
+    assert REGISTRY.get_sample_value("vllm:num_requests_running", labels) == 2
+    assert REGISTRY.get_sample_value("vllm:engine_sleep_state", labels | {"sleep_state": "awake"}) == 1
+    assert REGISTRY.get_sample_value("vllm:iteration_tokens_total_count", labels) == 2
+    assert (
+        REGISTRY.get_sample_value("vllm:spec_decode_num_accepted_tokens_per_pos_total", labels | {"position": "1"}) == 1
+    )
+    if initial_map:
+        assert (
+            REGISTRY.get_sample_value("vllm:engine_sleep_state", labels | {"replica": "0", "sleep_state": "awake"}) == 0
+        )
+        assert REGISTRY.get_sample_value("vllm:generation_tokens_total", labels | {"replica": "0"}) == 7
+    with pytest.raises(ValueError, match="already belongs"):
+        stat_logger.register_replica(new_idx, "2", "0")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("initial_replicas", [0, 1])
+async def test_orchestrator_records_stats_from_late_replica(stats_config, initial_replicas):
+    pool = Mock(spec=StagePool, num_replicas=initial_replicas, stage_vllm_config=stats_config)
+    pool.available_replica_ids.return_value = list(range(initial_replicas))
+    pool.process_llm_raw_outputs = AsyncMock(return_value=[])
+    orchestrator = Orchestrator(
+        request_async_queue=asyncio.Queue(),
+        output_async_queue=asyncio.Queue(),
+        rpc_async_queue=asyncio.Queue(),
+        stage_pools=[pool],
+        log_stats=True,
+    )
+    raw = EngineCoreOutputs(outputs=[], scheduler_stats=SchedulerStats(num_running_reqs=5))
+    await orchestrator._process_llm_stage_outputs(0, 3, raw, set())
+    assert (
+        REGISTRY.get_sample_value(
+            "vllm:num_requests_running", {"model_name": "test-model", "stage": "0", "replica": "3"}
+        )
+        == 5
+    )
+    await orchestrator._process_llm_stage_outputs(0, 3, raw, set())
+    assert len(orchestrator._stage_replica_to_engine_idx) == initial_replicas + 1

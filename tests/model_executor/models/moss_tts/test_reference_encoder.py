@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Unit tests for MossReferenceEncoder: content-addressed caching,
 single-flight, and micro-batched encoding."""
 
@@ -12,7 +12,9 @@ import torch
 
 from vllm_omni.model_executor.models.moss_tts.reference_encoder import (
     MossReferenceEncoder,
+    _prep_wav_sync,
     _RefEncodeBatcher,
+    _reference_resampler,
     build_reference_encoder,
     encode_request_references,
 )
@@ -534,3 +536,65 @@ async def test_encode_request_references_keys_second_speaker_by_slot(make_encode
     assert proc.total_items == 2
     # Concurrent, so both clips shared one batch window.
     assert proc.attempt_sizes == [2]
+
+
+@pytest.mark.parametrize("sr", [24000, 48000])
+def test_numeric_waveform_prep_matches_list_and_does_not_mutate_cache(sr):
+    import numpy as np
+
+    from vllm_omni.model_executor.models.moss_tts.reference_encoder import _prep_wav_sync
+
+    waveform = np.linspace(-1, 1, sr, dtype=np.float32)
+    expected = waveform.copy()
+    tensor = _prep_wav_sync(waveform, sr, 24000)
+    assert torch.equal(tensor, _prep_wav_sync(waveform.tolist(), sr, 24000))
+    tensor.zero_()
+    np.testing.assert_array_equal(waveform, expected)
+
+
+@pytest.mark.asyncio
+async def test_idle_batcher_releases_all_completed_waveforms():
+    import weakref
+
+    import numpy as np
+
+    batcher = _RefEncodeBatcher(
+        lambda payload: [torch.zeros((1, 4), dtype=torch.long) for _ in payload],
+        window_ms=0,
+        max_batch=8,
+    )
+    refs = []
+
+    async def submit_one():
+        waveform = np.zeros(24000, dtype=np.float32)
+        refs.append(weakref.ref(waveform))
+        await batcher.submit(waveform, 24000)
+
+    try:
+        await asyncio.gather(submit_one(), submit_one())
+
+        # Future completion can race the executor releasing its work item.
+        # Wait without forcing GC or overwriting first/jobs with a new batch.
+        async def wait_for_release():
+            while any(ref() is not None for ref in refs):
+                await asyncio.sleep(0.001)
+
+        await asyncio.wait_for(wait_for_release(), timeout=2.0)
+        assert batcher._drainer is not None and not batcher._drainer.done()
+    finally:
+        await batcher.aclose()
+
+
+def test_reference_resampler_is_cached_and_matches_functional_resample():
+    import torchaudio
+
+    _reference_resampler.cache_clear()
+    try:
+        waveform = torch.rand((1, 4800), generator=torch.Generator().manual_seed(123))
+        expected = torchaudio.functional.resample(waveform, 48000, _SR)
+        torch.testing.assert_close(_prep_wav_sync(waveform.numpy(), 48000, _SR), expected, rtol=0, atol=0)
+        torch.testing.assert_close(_prep_wav_sync(waveform.numpy(), 48000, _SR), expected, rtol=0, atol=0)
+        info = _reference_resampler.cache_info()
+        assert info.misses == 1 and info.hits == 1
+    finally:
+        _reference_resampler.cache_clear()

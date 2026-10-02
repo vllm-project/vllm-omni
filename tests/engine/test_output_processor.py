@@ -259,6 +259,17 @@ def test_native_text_tpot_only_accepts_positive_finished_metric(
     assert processor.pop_native_text_metrics("r")["vllm_tpot_ms"] == expected_tpot_ms
 
 
+def test_suppressed_native_tokens_use_authoritative_count_even_without_stats(monkeypatch):
+    monkeypatch.setattr(VLLMOutputProcessor, "_update_stats_from_output", lambda *args, **kwargs: None)
+    processor = object.__new__(MultimodalOutputProcessor)
+    processor._native_text_metrics_by_request = {}
+    state = _make_state(RequestOutputKind.FINAL_ONLY)
+    processor._update_stats_from_output(
+        state, SimpleNamespace(new_token_ids=[2150], num_generation_tokens=2048), None, None
+    )
+    assert processor.pop_native_text_metrics("r")["num_generation_tokens"] == 2048
+
+
 def test_delta_drains_output_modality_per_step():
     """DELTA drains the mm_type key (output modality) but preserves hidden-state keys."""
     s = _make_state(RequestOutputKind.DELTA)
@@ -616,6 +627,7 @@ def test_no_detokenizer_process_outputs_returns_nonterminal_audio_chunk(monkeypa
         finish_reason=None,
         stop_reason=None,
         kv_transfer_params=None,
+        ec_transfer_params=None,
         routed_experts=None,
         num_cached_tokens=0,
     )
@@ -631,6 +643,7 @@ def _make_mm_only_output_processor(monkeypatch):
     processor = object.__new__(MultimodalOutputProcessor)
     processor.output_modality = OutputModality.AUDIO
     processor.request_states = {"r": _make_no_detok_state(RequestOutputKind.DELTA)}
+    processor.tracing_enabled = False
     monkeypatch.setattr(
         VLLMOutputProcessor,
         "process_outputs",
@@ -660,6 +673,7 @@ def _audio_engine_output(*, is_segment_finished: bool, is_last_chunk: bool):
         finish_reason=FinishReason.STOP,
         stop_reason=None,
         kv_transfer_params=None,
+        ec_transfer_params=None,
         routed_experts=None,
         num_cached_tokens=0,
         is_segment_finished=is_segment_finished,
@@ -888,3 +902,24 @@ def test_abort_snapshot_leaves_state_until_commit():
     assert "0_parent" not in processor.request_states
     assert "parent" not in processor.parent_requests
     assert "parent" not in processor.external_req_ids
+
+
+def test_cumulative_audio_terminal_output_supplies_full_aligner_waveform():
+    from vllm_omni.model_executor.stage_input_processors.forced_aligner import code2wav2aligner
+
+    state = _make_state(RequestOutputKind.CUMULATIVE)
+    for index, count in enumerate((800, 1200, 400)):
+        state.add_multimodal_tensor(torch.full((1, count), float(index)), mm_type=AUDIO)
+        output = state.make_request_output([index], None, FinishReason.STOP if index == 2 else None, None)
+        assert output is not None
+        if index < 2:
+            assert code2wav2aligner([output], {}) == []
+    prompt = {"additional_information": {"text": ["Hello world"], "language": ["English"]}}
+    aligned = code2wav2aligner([output], prompt)[0]
+    waveform, sr = aligned["multi_modal_data"]["audio"]
+    assert sr == 24000
+    assert waveform.shape == (2400,)
+    assert (waveform[:800] == 0).all()
+    assert (waveform[800:2000] == 1).all()
+    assert (waveform[2000:] == 2).all()
+    assert aligned["additional_information"]["aligner_audio_duration_ms"] == [100.0]

@@ -21,6 +21,9 @@ from vllm_omni.experimental.ar_diffusion.kv_cache import (
     ar_diffusion_paged_attention,
     paged_write_attn,
 )
+from vllm_omni.experimental.ar_diffusion.kv_cache import paged_attention as paged_attention_module
+from vllm_omni.experimental.ar_diffusion.kv_cache.config import KV_GATHER_ENV
+from vllm_omni.experimental.ar_diffusion.kv_cache.paged import ChunkWindowManager
 from vllm_omni.experimental.ar_diffusion.kv_cache.state import ARDiffusionKVState
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
@@ -42,6 +45,7 @@ def make_state(
     reset_at_boundary=False,
     dtype=torch.float32,
     device=torch.device("cpu"),
+    reuse_history_staging=False,
 ):
     """Build a cache. ``chunk_size`` defaults to the block size, but the two are
     independent -- the shipped 832x480 gives 1560 tokens per frame against
@@ -52,6 +56,7 @@ def make_state(
         window_chunks=window_chunks,
         sink_chunks=sink_chunks,
         reset_at_boundary=reset_at_boundary,
+        reuse_history_staging=reuse_history_staging,
     )
     kv = ARDiffusionKVCache(
         cfg,
@@ -257,6 +262,112 @@ def test_paged_attention_matches_dense_reference_cpu(history_chunks, action_len,
     assert st.adapter(POS).completed_chunks == before + (1 if commit_current else 0)
 
 
+@pytest.mark.parametrize("history_chunks", [0, 1, 2, 3])
+@pytest.mark.parametrize("window_chunks", [2, 4])
+def test_staged_reuse_refreshes_the_current_blocks_at_their_live_offset(monkeypatch, history_chunks, window_chunks):
+    """A second probe of the same AR block restages its current K/V where the table actually holds it.
+
+    The padded table always ends in at least one action-capacity block, and while the window is still
+    growing in unused window capacity too, so "the last current_blocks entries" is padding. The refresh
+    has to start right after the visible history: empty (window growing), partial, full, and after a slide.
+    """
+    monkeypatch.setenv(KV_GATHER_ENV, "1")
+    device = torch.device("cpu")
+    dtype = torch.float32
+    kv, st = make_state(dtype=dtype, device=device, window_chunks=window_chunks, reuse_history_staging=True)
+    for buffer in kv.history_staging[0]:
+        buffer.fill_(-7)
+    if history_chunks:
+        _commit_video_span(kv, st, kv_branch=POS, n_chunks=history_chunks, dtype=dtype, device=device)
+
+    ctx = st.get_kv_caches(POS, seq_len=BLOCK, commit_current=False)[0].forward_ctx
+    ctx.max_video_tokens = 2 * BLOCK
+    ctx.ensure_video_slots(device)
+    key_cache, value_cache = kv.key_cache(0), kv.value_cache(0)
+
+    def probe(step: int):
+        # Each probe of the block writes new current K/V, then stages.
+        kv._k_pools[0][ctx.current_video_slot_mapping] = torch.full((BLOCK, N_HEADS, HEAD_DIM), float(step))
+        kv._v_pools[0][ctx.current_video_slot_mapping] = torch.full((BLOCK, N_HEADS, HEAD_DIM), -float(step))
+        # Store the metadata on the context the way prepare() does.
+        (ctx.block_table, ctx.query_start_loc, ctx.seq_lens, ctx.max_query_len, ctx.max_seq_len) = (
+            ctx.build_block_table(action_len=0, query_len=BLOCK, device=device)
+        )
+        block_table, max_seq_len = ctx.block_table, ctx.max_seq_len
+        ctx._prepare_history_staging(0)
+        n_blocks = max_seq_len // BLOCK
+        block_ids = block_table[0, :n_blocks].to(torch.long)
+        stage_k, stage_v = ctx.history_staging(0)
+        # The custom op narrows the manager-owned buffers before calling this helper.
+        stage_k, stage_v = stage_k[:max_seq_len], stage_v[:max_seq_len]
+        paged_attention_module._stage_window(
+            stage_k,
+            stage_v,
+            key_cache,
+            value_cache,
+            block_ids,
+            n_blocks,
+            BLOCK,
+            first_block=ctx.stage_first_block if ctx.reuse_history else 0,
+        )
+        full_k = key_cache.index_select(0, block_ids).reshape(n_blocks * BLOCK, N_HEADS, HEAD_DIM)
+        full_v = value_cache.index_select(0, block_ids).reshape(n_blocks * BLOCK, N_HEADS, HEAD_DIM)
+        for buffer in kv.history_staging[0]:
+            assert (buffer[max_seq_len:] == -7).all()
+        return stage_k, stage_v, full_k, full_v, n_blocks
+
+    stage_k, stage_v, full_k, full_v, n_blocks = probe(1)
+    assert ctx.reuse_history is False
+    assert torch.equal(stage_k, full_k) and torch.equal(stage_v, full_v)
+
+    stage_k, stage_v, full_k, full_v, n_blocks = probe(2)
+    assert ctx.reuse_history is True
+    visible_history_blocks = min(history_chunks, 2 - 1)  # window of 2 blocks minus the current one
+    assert ctx.stage_first_block == visible_history_blocks
+    # The padded table is wider than the live window, so the end-of-table guess is not the offset.
+    assert n_blocks - 1 != ctx.stage_first_block
+    assert torch.equal(stage_k, full_k) and torch.equal(stage_v, full_v)
+
+
+@pytest.mark.parametrize("gather_enabled", [False, True])
+def test_staging_is_only_allocated_for_the_gather_path(monkeypatch, gather_enabled):
+    if gather_enabled:
+        monkeypatch.setenv(KV_GATHER_ENV, "1")
+    else:
+        monkeypatch.delenv(KV_GATHER_ENV, raising=False)
+    device = torch.device("cpu")
+    kv, st = make_state(device=device, reuse_history_staging=True)
+    # The manager owns the pairs and allocates them only when their consumer is on.
+    assert bool(kv.history_staging) is gather_enabled
+    ctx = st.get_kv_caches(POS, seq_len=BLOCK, commit_current=False)[0].forward_ctx
+    ctx.ensure_video_slots(device)
+    (ctx.block_table, ctx.query_start_loc, ctx.seq_lens, ctx.max_query_len, ctx.max_seq_len) = ctx.build_block_table(
+        action_len=0, query_len=BLOCK, device=device
+    )
+    ctx._prepare_history_staging(0)
+    assert ctx.staging_enabled is gather_enabled
+    stage_k, _ = ctx.history_staging(0)
+    assert (stage_k is not None) is gather_enabled
+
+
+@pytest.mark.parametrize("window_chunks", [2, 4])
+def test_layer_inputs_preserve_static_staging_tensors(monkeypatch, window_chunks):
+    """Compiled inputs must retain the manager's static-address annotations, including with spare capacity."""
+    monkeypatch.setenv(KV_GATHER_ENV, "1")
+    device = torch.device("cpu")
+    kv, st = make_state(device=device, window_chunks=window_chunks, reuse_history_staging=True)
+    stage_key, stage_value = kv.history_staging[0]
+    for _ in range(2):
+        ctx = st.get_kv_caches(POS, seq_len=BLOCK, commit_current=False)[0].forward_ctx
+        ctx.max_video_tokens = 2 * BLOCK
+        ctx.prepare(device, action_len=0, query_len=BLOCK)
+        inputs = ctx.layer_inputs(0)
+        assert inputs.stage_key is stage_key
+        assert inputs.stage_value is stage_value
+        assert inputs.max_seq_len == 3 * BLOCK
+        assert stage_key.shape[0] == (window_chunks + 1) * BLOCK
+
+
 @pytest.mark.skipif(not _gpu_flash_attn_usable(), reason="usable GPU FlashAttention is required")
 @pytest.mark.parametrize("history_chunks", [1, 3])
 @pytest.mark.parametrize("action_len", [0, 3])
@@ -297,8 +408,8 @@ def test_paged_attention_matches_dense_reference_gpu(history_chunks, action_len,
         query[0],
         current_k[0],
         current_v[0],
-        action_k[0] if action_len else None,
-        action_v[0] if action_len else None,
+        action_k[0] if action_k is not None else None,
+        action_v[0] if action_v is not None else None,
         HEAD_DIM**-0.5,
     ).unsqueeze(0)
 
@@ -397,13 +508,27 @@ def test_custom_op_registration_idempotent():
     assert hasattr(torch.ops.vllm_omni, "ar_diffusion_paged_write_attn")
 
 
-def test_custom_op_compiles_fullgraph_without_recompile_on_value_change():
+def test_custom_op_mutable_arguments_cannot_be_elided_as_defaults():
+    # Older PyTorch ADInplaceOrView handlers index positional mutable inputs
+    # directly. Default-valued trailing inputs can disappear before that handler.
+    schema = torch.ops.vllm_omni.ar_diffusion_paged_write_attn.default._schema
+    mutable = [arg for arg in schema.arguments if arg.alias_info is not None and arg.alias_info.is_write]
+    assert {arg.name for arg in mutable} == {"key_pool", "value_pool", "stage_key", "stage_value"}
+    assert all(not arg.has_default_value() for arg in mutable)
+
+
+@pytest.mark.parametrize("reuse_history_staging", [False, True])
+def test_custom_op_compiles_fullgraph_without_recompile_on_value_change(monkeypatch, reuse_history_staging):
     """The op must trace as one opaque node: fullgraph OK, and changed tensor
     VALUES (new slots / block ids) must not trigger recompilation."""
     import torch._dynamo
 
     device = torch.device("cpu")
-    kv, st = make_state(num_layers=2, window_chunks=2)
+    monkeypatch.setenv(KV_GATHER_ENV, "1")
+    kv, st = make_state(num_layers=2, window_chunks=2, reuse_history_staging=reuse_history_staging)
+    if reuse_history_staging:
+        # Hold the host-side staging offset fixed while table/slot values change.
+        _commit_video_span(kv, st, kv_branch=POS, n_chunks=2, dtype=torch.float32, device=device)
 
     def run_one_forward(commit):
         contexts = st.get_kv_caches(POS, seq_len=BLOCK, commit_current=commit)
@@ -412,9 +537,8 @@ def test_custom_op_compiles_fullgraph_without_recompile_on_value_change():
         q = torch.randn(BLOCK, N_HEADS, HEAD_DIM)
         k = torch.randn(BLOCK, N_HEADS, HEAD_DIM)
         v = torch.randn(BLOCK, N_HEADS, HEAD_DIM)
-        # Both layers through ONE compiled fn: layer_idx is a tensor, so a
-        # different layer must NOT recompile (all 40 DiT blocks share the
-        # block-forward code object in production).
+        # Both layers use one compiled function; the tensor-valued layer index
+        # must not specialize it.
         for layer_ctx in contexts:
             out = compiled(layer_ctx.to_layer_inputs(), q, k, v)
         st.commit_paged_context(POS)
@@ -624,9 +748,26 @@ def _window_positions(end: int, *, sink: int, window: int, written, history: int
     return [p for p in sorted(written) if p >= history or (p // BLOCK in blocks and p // BLOCK in resident)]
 
 
+def _model_block_indices(kv, adapter) -> dict[int, int]:
+    """Each resident block's index in model positions, by block id.
+
+    Compaction removes the evicted gap after the sink's blocks and shifts the
+    rest of the table down by it, so a table index past the sink is
+    ``compacted_tokens`` behind the position it holds.
+    """
+    block_size = kv.block_size
+    sink_blocks = -(-(kv.spec.sink_chunks * kv.spec.chunk_size) // block_size)
+    shift = adapter.compacted_tokens // block_size
+    return {
+        int(block): index if index < sink_blocks else index + shift
+        for index, block in enumerate(kv.block_table(adapter))
+        if block != kv.null_block_id
+    }
+
+
 @pytest.mark.parametrize(
     ("sink_chunks", "window_chunks", "reset_at_boundary"),
-    [(1, 2, False), (0, 2, False), (1, 3, False), (2, 2, True)],
+    [(1, 2, False), (0, 2, False), (1, 3, False), (2, 2, True), (0, 2, True)],
 )
 def test_attention_after_eviction_reads_every_kept_token_and_nothing_unwritten(
     sink_chunks, window_chunks, reset_at_boundary
@@ -646,6 +787,12 @@ def test_attention_after_eviction_reads_every_kept_token_and_nothing_unwritten(
     The reset case keeps only the sink across a boundary, so the recent window
     reaches back over blocks that are no longer resident. Those must be skipped
     by position rather than read.
+
+    Eight chunks are enough for compaction to drop the evicted gap from the
+    table, after which storage positions run behind model positions. Removing
+    a gap that is not a whole number of chunks moves where eviction snaps, and
+    in the reset case the window then keeps tokens a boundary should have
+    dropped.
     """
     torch.manual_seed(0)
     device, dtype = torch.device("cpu"), torch.float32
@@ -659,10 +806,10 @@ def test_attention_after_eviction_reads_every_kept_token_and_nothing_unwritten(
     _poison_pools(kv)
     sink, window = sink_chunks * RAGGED_CHUNK, int(kv.spec.sliding_window)
     committed: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
-    evicted = False
+    evicted = compacted = False
 
     for chunk in range(8):
-        history = int(st.adapter(POS).num_computed_tokens)
+        history = int(st.adapter(POS).absolute_num_computed_tokens)
         end = history + RAGGED_CHUNK
         for commit_current in (False, True):
             ctx = st.get_kv_caches(POS, seq_len=RAGGED_CHUNK, commit_current=commit_current)[0].forward_ctx
@@ -675,9 +822,7 @@ def test_attention_after_eviction_reads_every_kept_token_and_nothing_unwritten(
             block_table, query_start_loc, seq_lens, max_query_len, max_seq_len = ctx.build_block_table(
                 action_len=0, query_len=RAGGED_CHUNK, device=device
             )
-            resident = {
-                index for index, block in enumerate(kv.block_table(st.adapter(POS))) if block != kv.null_block_id
-            }
+            resident = set(_model_block_indices(kv, st.adapter(POS)).values())
             positions = _window_positions(
                 end, sink=sink, window=window, written=written, history=history, resident=resident
             )
@@ -703,9 +848,80 @@ def test_attention_after_eviction_reads_every_kept_token_and_nothing_unwritten(
             torch.testing.assert_close(paged, ref, rtol=1e-5, atol=1e-5, msg=lambda m, label=label: f"{label}: {m}")
         committed = written
         st.commit_paged_context(POS)
-        evicted = evicted or kv.null_block_id in kv.block_table(st.adapter(POS))
+        compacted = compacted or st.adapter(POS).compacted_tokens > 0
+        evicted = evicted or compacted or kv.null_block_id in kv.block_table(st.adapter(POS))
 
     assert evicted, "the window never slid, so nothing after eviction was tested"
+    assert compacted, "the table was never compacted, so storage and model positions never diverged"
+
+
+@pytest.mark.parametrize(
+    ("sink_chunks", "window_chunks", "reset_at_boundary"),
+    [(1, 2, False), (0, 2, False), (1, 3, False), (2, 2, True), (0, 2, True)],
+)
+def test_compaction_does_not_change_which_tokens_stay_resident(
+    monkeypatch, sink_chunks, window_chunks, reset_at_boundary
+):
+    """Compaction renumbers the block table; it must not change what eviction keeps.
+
+    Storage positions run ``compacted_tokens`` behind model positions, and
+    eviction snaps to chunk boundaries counted in storage positions. Removing a
+    gap that is not a whole number of chunks moves every later snap, so eviction
+    keeps a different set of tokens -- in the reset case, tokens a boundary
+    should have dropped, which the window then reads. Attention checked against
+    what is resident cannot see that, so the oracle here is the same rollout
+    with compaction switched off.
+    """
+
+    def resident_blocks_per_tick(compact: bool) -> tuple[list[set[int]], int]:
+        with monkeypatch.context() as patch:
+            if not compact:
+                patch.setattr(ChunkWindowManager, "compact_block_table", lambda self, request_id: 0)
+            kv, st = make_state(
+                window_chunks=window_chunks,
+                sink_chunks=sink_chunks,
+                reset_at_boundary=reset_at_boundary,
+                chunk_size=RAGGED_CHUNK,
+            )
+            ticks = []
+            for _ in range(12):
+                ctx = st.get_kv_caches(POS, seq_len=RAGGED_CHUNK, commit_current=True)[0].forward_ctx
+                ctx.ensure_video_slots(torch.device("cpu"))
+                ticks.append(set(_model_block_indices(kv, st.adapter(POS)).values()))
+                st.commit_paged_context(POS)
+            return ticks, st.adapter(POS).compacted_tokens
+
+    expected, _ = resident_blocks_per_tick(compact=False)
+    actual, compacted_tokens = resident_blocks_per_tick(compact=True)
+    assert compacted_tokens > 0, "the table was never compacted, so nothing was tested"
+    for tick, (want, got) in enumerate(zip(expected, actual)):
+        assert got == want, f"tick {tick}: compaction kept blocks {sorted(got - want)} and dropped {sorted(want - got)}"
+
+
+def test_history_staging_holds_a_ragged_window_and_restages_it_whole(monkeypatch):
+    """The staging buffers must fit the table width this module pads to.
+
+    A sink or window that is not a whole number of blocks spans one more block
+    than its token count suggests, so sizing staging from tokens left it short
+    and the first prepared forward refused to run. And because such a chunk
+    shares its first block with the history's tail, the history a probe sees is
+    not left untouched by the next probe, so it is restaged rather than reused.
+    """
+    monkeypatch.setenv(KV_GATHER_ENV, "1")
+    device = torch.device("cpu")
+    kv, st = make_state(
+        device=device, window_chunks=2, sink_chunks=1, chunk_size=RAGGED_CHUNK, reuse_history_staging=True
+    )
+    capacity = int(kv.history_staging[0][0].shape[0])
+    for chunk in range(6):
+        for probe in range(2):
+            ctx = st.get_kv_caches(POS, seq_len=RAGGED_CHUNK, commit_current=False)[0].forward_ctx
+            ctx.prepare(device=device, action_len=0, query_len=RAGGED_CHUNK)
+            assert int(ctx.max_seq_len) <= capacity
+            assert not ctx.reuse_history, f"chunk {chunk}, probe {probe}: a ragged chunk reused the staged history"
+        ctx = st.get_kv_caches(POS, seq_len=RAGGED_CHUNK, commit_current=True)[0].forward_ctx
+        ctx.prepare(device=device, action_len=0, query_len=RAGGED_CHUNK)
+        st.commit_paged_context(POS)
 
 
 @pytest.mark.parametrize("commit_current", [False, True])
@@ -758,10 +974,10 @@ def test_the_shipped_geometry_reads_exactly_the_window_on_every_tick():
     sink, window = 9 * frame, int(kv.spec.sliding_window)
     holds: dict[int, int] = {}  # slot -> token position last written there
     widths: set[int] = set()
-    filled = False
+    filled = compacted = False
 
     for tick in range(12):
-        history = int(st.adapter(POS).num_computed_tokens)
+        history = int(st.adapter(POS).absolute_num_computed_tokens)
         end = history + seq_len
         ctx = st.get_kv_caches(POS, seq_len=seq_len, commit_current=True)[0].forward_ctx
         ctx.ensure_video_slots(torch.device("cpu"))
@@ -771,9 +987,7 @@ def test_the_shipped_geometry_reads_exactly_the_window_on_every_tick():
         widths.add(int(table.shape[1]))
         kv_len = int(seq_lens[0])
 
-        position_of_block = {
-            b: i * block for i, b in enumerate(kv.block_table(st.adapter(POS))) if b != kv.null_block_id
-        }
+        position_of_block = {b: i * block for b, i in _model_block_indices(kv, st.adapter(POS)).items()}
         read = []
         for b in table[0].tolist()[: -(-kv_len // block)]:
             assert b in position_of_block, f"tick {tick}: read block {b}, which holds no token of this session"
@@ -789,8 +1003,10 @@ def test_the_shipped_geometry_reads_exactly_the_window_on_every_tick():
 
         filled = filled or end > sink + window
         st.commit_paged_context(POS)
+        compacted = compacted or st.adapter(POS).compacted_tokens > 0
 
     assert filled, "the window never filled, so the case that fails was never reached"
+    assert compacted, "the table was never compacted, so storage and model positions never diverged"
     assert len(widths) == 1, f"block table width varied across ticks: {sorted(widths)}"
 
 
@@ -823,15 +1039,18 @@ class _CountedBlock:
         return self._block.block_id
 
 
-def test_reading_the_window_touches_only_the_blocks_it_can_keep():
-    """The block table grows with the session; reading the window must not.
+def test_reading_the_window_touches_only_the_blocks_it_can_keep(monkeypatch):
+    """However long the block table is, reading the window must not cost more.
 
-    Every evicted position stays in the table as a null entry, so walking the
-    whole table costs more on every tick of a long session. Only the sink's
-    blocks and the recent window's blocks can hold a kept token, so those are
-    all the read may touch -- checked on a session long enough that the table is
-    many times the window, and counted where the ids leave vLLM's block manager.
+    Evicted positions stay in the table as null entries until compaction drops
+    them a whole number of chunks at a time -- up to two frames' worth of blocks
+    at 832x480 -- so the table can still be far longer than the window. Only the
+    sink's blocks and the recent window's blocks can hold a kept token, so those
+    are all the read may touch. Compaction is switched off here so the table
+    grows to many times the window, and reads are counted where the ids leave
+    vLLM's block manager.
     """
+    monkeypatch.setattr(ChunkWindowManager, "compact_block_table", lambda self, request_id: 0)
     device = torch.device("cpu")
     kv, st = make_state(device=device, window_chunks=2, sink_chunks=1, chunk_size=RAGGED_CHUNK)
     reads: list[int] = []
@@ -983,3 +1202,52 @@ def test_the_shipped_resolution_geometry_on_the_real_kernel(commit_current):
     ref = _dense_attention(query, new_k, new_v)
 
     torch.testing.assert_close(paged, ref, rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.skipif(not _gpu_flash_attn_usable(), reason="usable GPU FlashAttention is required")
+@pytest.mark.parametrize("history_chunks", [0, 1, 3])
+@pytest.mark.parametrize("action_len", [0, 3])
+def test_contiguous_kv_gather_path_matches_paged_path_gpu(monkeypatch, history_chunks, action_len):
+    """VLLM_OMNI_AR_DIFFUSION_KV_GATHER=1 gathers the visible blocks and runs varlen FA3 without a block table.
+
+    Covers an empty, partial and full window plus a partially filled action block:
+    the gather reads the tail-padding null block, so its (zeroed) rows must be masked.
+    """
+
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    dtype = torch.float16
+    kv, st = make_state(dtype=dtype, device=device, window_chunks=2)
+    if history_chunks:
+        _commit_video_span(kv, st, kv_branch=POS, n_chunks=history_chunks, dtype=dtype, device=device)
+
+    layer_ctx = st.get_kv_caches(POS, seq_len=BLOCK, commit_current=False)[0]
+    ctx = layer_ctx.forward_ctx
+    current_k = torch.randn(1, BLOCK, N_HEADS, HEAD_DIM, dtype=dtype, device=device)
+    current_v = torch.randn(1, BLOCK, N_HEADS, HEAD_DIM, dtype=dtype, device=device)
+    action_k = action_v = None
+    if action_len:
+        action_k = torch.randn(1, action_len, N_HEADS, HEAD_DIM, dtype=dtype, device=device)
+        action_v = torch.randn(1, action_len, N_HEADS, HEAD_DIM, dtype=dtype, device=device)
+    query = torch.randn(1, BLOCK + action_len, N_HEADS, HEAD_DIM, dtype=dtype, device=device)
+    ctx.prepare(device=device, action_len=action_len, query_len=query.shape[1])
+    inputs = layer_ctx.to_layer_inputs()
+
+    def run() -> torch.Tensor:
+        return paged_write_attn(
+            inputs,
+            query[0],
+            current_k[0],
+            current_v[0],
+            action_k[0] if action_k is not None else None,
+            action_v[0] if action_v is not None else None,
+            HEAD_DIM**-0.5,
+        ).unsqueeze(0)
+
+    monkeypatch.delenv(KV_GATHER_ENV, raising=False)
+    paged = run()
+    monkeypatch.setenv(KV_GATHER_ENV, "1")
+    gathered = run()
+    assert torch.isfinite(gathered).all()
+    # Same kernel family on the same K/V: only accumulation order differs.
+    torch.testing.assert_close(gathered, paged, rtol=2e-3, atol=2e-3)

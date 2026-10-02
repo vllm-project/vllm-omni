@@ -30,7 +30,6 @@ from collections.abc import Mapping
 from typing import Any
 
 from vllm_omni.entrypoints.openai.video_stream_base import (
-    _BAD_FRAME,
     _DEFAULT_CONFIG_TIMEOUT,
     _DEFAULT_IDLE_TIMEOUT,
     PrewarmedFrame,
@@ -62,22 +61,19 @@ class QwenOmniStreamingVideoHandler(OmniStreamingVideoHandlerBase):
         message_history: list[dict[str, Any]],
         query_text: str,
         prewarmed_frames: Mapping[str, PrewarmedFrame],
+        *,
+        frame_indices: list[int] | None = None,
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-        n_buf = len(frame_buffer)
-        if n_buf <= config.num_frames:
-            frames = list(frame_buffer)
-        else:
-            stride = max(1, n_buf // config.num_frames)
-            idx = [i * stride for i in range(config.num_frames - 1)] + [n_buf - 1]
-            frames = [frame_buffer[i] for i in idx]
-
         prewarmed = prewarmed_frames or {}
+        if frame_indices is None:
+            frame_indices = self._sample_frame_indices(frame_buffer, config.num_frames, prewarmed)
         user_content: list[dict] = []
-        for frame_b64 in frames:
+        for index in frame_indices:
+            frame_b64 = frame_buffer[index]
             cached = prewarmed.get(frame_b64)
-            if cached is _BAD_FRAME:
-                continue
             if cached is not None:
+                # The shared selector excludes failed decodes before this point.
+                assert isinstance(cached, tuple)
                 pil, pil_uuid = cached
                 user_content.append(
                     {

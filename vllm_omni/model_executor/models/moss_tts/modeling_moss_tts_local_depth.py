@@ -21,6 +21,8 @@ checkpoint 1:1 so ``load_weights()`` needs no remapping.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -222,6 +224,44 @@ class MossTTSLocalDepthTransformer(nn.Module):
         forward_prefix = self._compiled_forward_prefix or self._forward_prefix
         return forward_prefix(seq_embeds, kv_cache, position)
 
+    @staticmethod
+    def _sample_channel(
+        audio_lm_heads: nn.ModuleList,
+        local_hidden: torch.Tensor,
+        codes: torch.Tensor,
+        *,
+        channel_index: int,
+        repetition_penalty: float,
+        history_per_codebook: list[list[int]] | None,
+        temperature: float,
+        top_k: int,
+        top_p: float,
+        do_sample: bool,
+        generator: torch.Generator | None,
+        generators: Sequence[torch.Generator | None] | None = None,
+    ) -> torch.Tensor:
+        """Compute channel logits, apply repetition penalty, sample, store."""
+        channel_logits = audio_lm_heads[channel_index](local_hidden).float()
+        if repetition_penalty != 1.0 and history_per_codebook is not None and channel_index < len(history_per_codebook):
+            hist = history_per_codebook[channel_index]
+            if hist:
+                hist_t = torch.tensor(hist, dtype=torch.long, device=channel_logits.device)
+                sel = channel_logits.index_select(-1, hist_t)
+                pos = sel > 0
+                sel = torch.where(pos, sel / repetition_penalty, sel * repetition_penalty)
+                channel_logits.index_copy_(-1, hist_t, sel)
+        channel_token = _sample_token(
+            channel_logits,
+            temperature,
+            top_k,
+            top_p,
+            do_sample,
+            generator=generator,
+            generators=generators,
+        )
+        codes[:, channel_index] = channel_token
+        return channel_token
+
     @torch.no_grad()
     def generate_frame(
         self,
@@ -241,6 +281,7 @@ class MossTTSLocalDepthTransformer(nn.Module):
         repetition_penalty: float = 1.0,
         history_per_codebook: list[list[int]] | None = None,
         generator: torch.Generator | None = None,
+        generators: Sequence[torch.Generator | None] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Generate one audio frame for batch B.
 
@@ -283,6 +324,7 @@ class MossTTSLocalDepthTransformer(nn.Module):
             text_top_p,
             do_sample,
             generator=generator,
+            generators=generators,
         )
         should_continue = binary_choice.eq(0)
         import os as _os
@@ -296,28 +338,20 @@ class MossTTSLocalDepthTransformer(nn.Module):
 
         codes = backbone_last_hidden.new_zeros((batch_size, n_vq), dtype=torch.long)
         for channel_index in range(n_vq):
-            channel_logits = audio_lm_heads[channel_index](local_hidden).float()
-            if (
-                repetition_penalty != 1.0
-                and history_per_codebook is not None
-                and channel_index < len(history_per_codebook)
-            ):
-                hist = history_per_codebook[channel_index]
-                if hist:
-                    hist_t = torch.tensor(hist, dtype=torch.long, device=channel_logits.device)
-                    sel = channel_logits.index_select(-1, hist_t)
-                    pos = sel > 0
-                    sel = torch.where(pos, sel / repetition_penalty, sel * repetition_penalty)
-                    channel_logits.index_copy_(-1, hist_t, sel)
-            channel_token = _sample_token(
-                channel_logits,
-                temperature,
-                top_k,
-                top_p,
-                do_sample,
+            channel_token = self._sample_channel(
+                audio_lm_heads,
+                local_hidden,
+                codes,
+                channel_index=channel_index,
+                repetition_penalty=repetition_penalty,
+                history_per_codebook=history_per_codebook,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                do_sample=do_sample,
                 generator=generator,
+                generators=generators,
             )
-            codes[:, channel_index] = channel_token
 
             if channel_index + 1 < n_vq:
                 embeds = audio_embeddings[channel_index](channel_token).to(dtype)[:, None, :]

@@ -323,12 +323,18 @@ def test_lingbot_like_sink_survives_sliding_window_eviction():
     kv = runner.kv_cache
     assert kv is not None
 
-    for _ in range(8):
+    state = commit_one_frame(runner, "s1", "main")
+    sink_block = kv.block_table(state.adapter("main"))[0]
+    for _ in range(7):
         state = commit_one_frame(runner, "s1", "main")
 
-    table = kv.block_table(state.adapter("main"))
-    assert table[0] != kv.null_block_id
-    assert table[1] == kv.null_block_id
+    adapter = state.adapter("main")
+    table = kv.block_table(adapter)
+    assert len(table) == 6  # one sink + five recent frames
+    assert table[0] == sink_block
+    assert kv.null_block_id not in table
+    assert adapter.absolute_num_computed_tokens == 8 * BLOCK
+    assert adapter.num_computed_tokens == 6 * BLOCK
 
     ctx = state.get_kv_caches("main", seq_len=BLOCK, commit_current=False)[0].forward_ctx
     visible, _ = ctx.video_block_table(torch.device("cpu"))

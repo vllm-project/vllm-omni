@@ -3,7 +3,11 @@
 
 from __future__ import annotations
 
-from typing import TypedDict
+from collections.abc import Mapping
+from typing import TYPE_CHECKING, TypedDict
+
+if TYPE_CHECKING:
+    from vllm_omni.engine.duplex.contracts import DuplexFence
 
 
 class DuplexIntermediateBuffer(TypedDict, total=False):
@@ -30,6 +34,49 @@ class DuplexIntermediateBuffer(TypedDict, total=False):
     omni_payload: object
     waveform: object
     mel_spec: object
+
+
+def build_duplex_append_prompt(
+    *,
+    request_id: str,
+    fence: DuplexFence,
+    session_config: Mapping[str, object],
+    runtime_config: Mapping[str, object],
+    seq: int,
+    turn_seq: int,
+    payload: object,
+    final: bool,
+    prompt_token_ids: list[int],
+    model_fields: Mapping[str, object],
+) -> dict[str, object]:
+    """Wrap model-selected tokens and payload in the shared append envelope.
+
+    Models own token selection and extra worker fields; the framework owns
+    request identity, sequencing and shallow config snapshots.
+    """
+    return {
+        "prompt_token_ids": prompt_token_ids,
+        "model_intermediate_buffer": {
+            "request_id": request_id,
+            "global_request_id": [fence.session_id],
+            "duplex": {
+                **model_fields,
+                "data_plane": True,
+                "fence": fence,
+                "session_id": fence.session_id,
+                "epoch": fence.epoch,
+                "seq": seq,
+                "turn_id": fence.turn_id,
+                "turn_seq": turn_seq,
+                "mode": "append_audio_chunk",
+                "payload": payload,
+                "final": final,
+                "session_config": dict(session_config),
+                "runtime_config": dict(runtime_config),
+                "scheduler_token_budget": len(prompt_token_ids),
+            },
+        },
+    }
 
 
 def build_duplex_intermediate_buffer(
@@ -62,12 +109,12 @@ def build_duplex_intermediate_buffer(
     return buffer
 
 
-def set_ref_audio(buffer: dict[str, object], waveform: object, sample_rate_hz: int) -> None:
+def set_ref_audio(buffer: DuplexIntermediateBuffer, waveform: object, sample_rate_hz: int) -> None:
     buffer.setdefault("codes", {})["ref"] = waveform
     buffer.setdefault("meta", {})["ref_audio_sr"] = int(sample_rate_hz)
 
 
-def set_tts_handoff(buffer: dict[str, object], token_ids: object | None, hidden_states: object | None) -> None:
+def set_tts_handoff(buffer: DuplexIntermediateBuffer, token_ids: object | None, hidden_states: object | None) -> None:
     """Store the AR-to-TTS handoff used by the full-duplex stage bridge."""
     if token_ids is not None:
         buffer.setdefault("ids", {})["tts"] = token_ids

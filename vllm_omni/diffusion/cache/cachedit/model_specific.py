@@ -867,6 +867,47 @@ def enable_cache_for_magi2(pipeline: Any, cache_config: Any) -> CacheDiTEnableRe
     return CacheDiTEnableResult(refresh=refresh, targets=(block_adapter,))
 
 
+def _get_mammothmoda2_transformer(pipeline: Any) -> torch.nn.Module:
+    return pipeline.gen_transformer
+
+
+def enable_cache_for_mammothmoda2(pipeline: Any, cache_config: Any) -> CacheDiTEnableResult:
+    """Cache only MammothModa2's repeated main DiT stack.
+
+    ``Transformer2DModel`` runs three Q-Former refiners (noise / ref-image /
+    context) whose inputs change every denoise step, plus the ``layers``
+    stack that dominates per-step compute. Only ``layers`` is a repeated
+    residual stack, so the ``BlockAdapter`` wraps it and the refiners stay
+    outside the cached region. Blocks take ``hidden_states`` plus keyword
+    step context and return only hidden states (``Pattern_3``).
+
+    The pipeline runs sequential CFG: each conditional forward is followed by
+    an unconditional forward. cache-dit tells cond/uncond apart purely by
+    transformer-forward parity (``has_separate_cfg=True``), so the
+    ``cfg_range`` optimization that skips the unconditional pass outside the
+    interval would desync that accounting. Like Cosmos3, we keep the passes
+    paired and neutralize CFG via scale=1.0 outside the interval; the
+    pipeline also disables hooks for no-CFG requests (single forward per
+    step), whose parity the accounting cannot represent.
+    """
+    pipeline._cache_dit_requires_paired_cfg = True
+    transformer = _get_mammothmoda2_transformer(pipeline)
+    block_adapter = BlockAdapter(
+        transformer=transformer,
+        blocks=[transformer.layers],
+        forward_pattern=[ForwardPattern.Pattern_3],
+        has_separate_cfg=True,
+        check_forward_pattern=True,
+    )
+    refresh = enable_cache_for_dit(
+        pipeline,
+        cache_config,
+        block_adapter,
+        get_pipeline_transformer=_get_mammothmoda2_transformer,
+    )
+    return CacheDiTEnableResult(refresh=refresh, targets=(block_adapter,))
+
+
 def register_custom_dit_enablers() -> None:
     """Register model-specific Cache-DiT enablers.
 
@@ -885,6 +926,7 @@ def register_custom_dit_enablers() -> None:
             "Cosmos3OmniPipeline": enable_cache_for_cosmos3,
             "Krea2Pipeline": enable_cache_for_krea2,
             "Magi2Pipeline": enable_cache_for_magi2,
+            "MammothModa2DiTPipeline": enable_cache_for_mammothmoda2,
         }
     )
 

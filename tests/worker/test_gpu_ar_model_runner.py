@@ -15,9 +15,11 @@ import numpy as np
 import pytest
 import torch
 from vllm.sampling_params import SamplingParams
+from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.worker import gpu_input_batch
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 
+from vllm_omni.core.prefix_cache import ModelCachePolicy
 from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
 from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
 from vllm_omni.entrypoints.openai.tts_adapters.base import PreparedRequest
@@ -37,6 +39,8 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 def _make_runner(engine_output_type: str | None, downstream_req_ids: set[str]) -> GPUARModelRunner:
     runner = object.__new__(GPUARModelRunner)
+    runner._omni_cache_policy = ModelCachePolicy(needs_full_hidden_states=True)
+    runner._pooler_payload_include_hidden_flag = True
     runner.vllm_config = SimpleNamespace(
         model_config=SimpleNamespace(engine_output_type=engine_output_type),
     )
@@ -57,6 +61,8 @@ def _mtp_runner(*, async_scheduling: bool, buffers: dict[str, dict]) -> tuple[GP
         return torch.tensor([[11, 12, 13]], dtype=torch.long)
 
     runner = object.__new__(GPUARModelRunner)
+    runner._omni_cache_policy = ModelCachePolicy(needs_full_hidden_states=True)
+    runner._pooler_payload_include_hidden_flag = True
     runner.use_async_scheduling = async_scheduling
     runner.model = SimpleNamespace(post_sample_talker_mtp=post_sample_talker_mtp)
     runner.requests = {req_id: SimpleNamespace() for req_id in buffers}
@@ -98,6 +104,8 @@ def test_post_sample_talker_mtp_uses_current_sample_and_hidden() -> None:
     )
 
     assert received["req_ids"] == ["ready"]
+    assert isinstance(received["input_ids"], torch.Tensor)
+    assert isinstance(received["hidden_states"], torch.Tensor)
     assert received["input_ids"].tolist() == [101]
     assert received["hidden_states"].tolist() == [[1.0, 2.0]]
     assert received["req_infos"] == [{"duplex": {"data_plane": True}}]
@@ -134,6 +142,8 @@ def test_post_sample_talker_mtp_uses_gpu_token_with_async_scheduling() -> None:
     )
 
     assert received["req_ids"] == ["ready"]
+    assert isinstance(received["input_ids"], torch.Tensor)
+    assert isinstance(received["hidden_states"], torch.Tensor)
     assert received["input_ids"].tolist() == [101]
     assert received["hidden_states"].tolist() == [[1.0, 2.0]]
     assert received["req_infos"] == [{"duplex": {"data_plane": True}}]
@@ -143,6 +153,8 @@ def test_post_sample_talker_mtp_uses_gpu_token_with_async_scheduling() -> None:
 
 def test_post_sample_talker_mtp_skips_shape_validation_without_duplex_rows() -> None:
     runner = object.__new__(GPUARModelRunner)
+    runner._omni_cache_policy = ModelCachePolicy(needs_full_hidden_states=True)
+    runner._pooler_payload_include_hidden_flag = True
     runner.use_async_scheduling = False
     runner.model = SimpleNamespace(
         post_sample_talker_mtp=lambda **_: pytest.fail("hook must not run"),
@@ -178,6 +190,8 @@ def test_post_sample_talker_mtp_rejects_invalid_selected_token_shape(
     error_match: str,
 ) -> None:
     runner = object.__new__(GPUARModelRunner)
+    runner._omni_cache_policy = ModelCachePolicy(needs_full_hidden_states=True)
+    runner._pooler_payload_include_hidden_flag = True
     runner.use_async_scheduling = False
     runner.model = SimpleNamespace(
         post_sample_talker_mtp=lambda **_: pytest.fail("hook must not run"),
@@ -205,6 +219,9 @@ def test_speech_extra_params_reach_model_sampler_as_sampling_metadata(monkeypatc
     )
 
     class Adapter:
+        def normalize(self, request):
+            return
+
         def validate(self, request):
             return None
 
@@ -231,6 +248,7 @@ def test_speech_extra_params_reach_model_sampler_as_sampling_metadata(monkeypatc
     serving._tts_model_type = "higgs_audio_v3"
     serving._get_tts_adapter = lambda: Adapter()
     serving._track_ref_audio_artifact_warmup = lambda *args, **kwargs: None
+    serving._speech_output_policies = {}
 
     _, stage_sampling_params, _ = asyncio.run(serving._prepare_speech_generation(request, request_id="speech-test"))
     stage0_params = stage_sampling_params[0]
@@ -262,13 +280,20 @@ def test_speech_extra_params_reach_model_sampler_as_sampling_metadata(monkeypatc
     )
     input_batch.sampling_metadata = input_batch._make_sampling_metadata()
 
-    received = []
+    received: list[SamplingMetadata] = []
+
+    def sample(logits: torch.Tensor, metadata: SamplingMetadata) -> str:
+        received.append(metadata)
+        return "model-sampler"
+
     runner = object.__new__(GPUARModelRunner)
+    runner._omni_cache_policy = ModelCachePolicy(needs_full_hidden_states=True)
+    runner._pooler_payload_include_hidden_flag = True
     runner.input_batch = input_batch
     runner.model = SimpleNamespace(
         prefer_model_sampler=True,
         skips_model_sampler_output_token_history=True,
-        sample=lambda logits, metadata: received.append(metadata) or "model-sampler",
+        sample=sample,
     )
     runner.sampler = SimpleNamespace()
     logits = torch.zeros((1, 4))
@@ -322,6 +347,8 @@ def test_sparse_mm_req_ids_requires_sparse_audio_marker():
 
 def test_runner_assisted_full_attention_metadata_request_is_opt_in():
     runner = object.__new__(GPUARModelRunner)
+    runner._omni_cache_policy = ModelCachePolicy(needs_full_hidden_states=True)
+    runner._pooler_payload_include_hidden_flag = True
     runner.model = object()
     runner.scheduler_config = SimpleNamespace(max_num_seqs=16)
 
@@ -376,6 +403,8 @@ def test_runner_assisted_full_attention_metadata_request_and_context_hooks():
             calls.append(("context", {"enabled": enabled, "num_reqs": num_reqs}))
 
     runner = object.__new__(GPUARModelRunner)
+    runner._omni_cache_policy = ModelCachePolicy(needs_full_hidden_states=True)
+    runner._pooler_payload_include_hidden_flag = True
     runner.model = Model()
     runner.scheduler_config = SimpleNamespace(max_num_seqs=8)
 
@@ -465,6 +494,8 @@ def test_omni_async_gpu_model_runner_output_reraises_background_exception():
 
 def _make_async_output_runner(engine_output_type: str = "audio"):
     runner = object.__new__(GPUARModelRunner)
+    runner._omni_cache_policy = ModelCachePolicy(needs_full_hidden_states=True)
+    runner._pooler_payload_include_hidden_flag = True
     model_config = SimpleNamespace(
         engine_output_type=engine_output_type,
         async_chunk=True,
@@ -486,7 +517,7 @@ def _make_async_output_runner(engine_output_type: str = "audio"):
     return runner
 
 
-def test_build_omni_output_uses_snapshots_and_connector_after_accumulation(monkeypatch):
+def test_build_omni_output_uses_snapshots_after_accumulation(monkeypatch):
     runner = _make_async_output_runner()
     events = []
 
@@ -501,10 +532,11 @@ def test_build_omni_output_uses_snapshots_and_connector_after_accumulation(monke
         "accumulate_full_payload_output",
         lambda self, rid, payload, request: events.append(f"accumulate:{rid}"),
     )
+    # The connector drain runs a TP collective and belongs to the caller's thread.
     monkeypatch.setattr(
         GPUARModelRunner,
         "get_omni_connector_output",
-        lambda self: events.append("connector") or "connector-output",
+        lambda self: pytest.fail("builder must not drain the connector"),
     )
 
     output = GPUARModelRunner._build_omni_model_runner_output_from_snapshot(
@@ -536,8 +568,7 @@ def test_build_omni_output_uses_snapshots_and_connector_after_accumulation(monke
     assert torch.equal(output.inter_stage_outputs[1]["hidden"], torch.tensor([[2.0], [3.0]]))
     assert output.multimodal_outputs is None
     assert output.kv_extracted_req_ids == ["r2"]
-    assert output.omni_connector_output == "connector-output"
-    assert events == ["accumulate:r1", "accumulate:r2", "connector"]
+    assert events == ["accumulate:r1", "accumulate:r2"]
 
 
 def test_build_omni_output_copies_hidden_for_partial_downstream_batch(monkeypatch):
@@ -641,10 +672,11 @@ def test_async_omni_output_guard_requires_safe_conditions():
 
     assert GPUARModelRunner._should_use_async_omni_output(runner)
 
+    # Prefix cache no longer forces the sync output path; leftover mm is
+    # snapshotted at save so the builder can materialize a step late.
     runner.omni_prefix_cache = object()
-    assert not GPUARModelRunner._should_use_async_omni_output(runner)
+    assert GPUARModelRunner._should_use_async_omni_output(runner)
 
-    runner.omni_prefix_cache = None
     runner.model.has_postprocess = True
     assert not GPUARModelRunner._should_use_async_omni_output(runner)
 
@@ -655,6 +687,7 @@ def test_async_omni_output_guard_requires_safe_conditions():
 def test_build_omni_output_skips_hidden_when_model_opts_out(monkeypatch):
     runner = _make_async_output_runner(engine_output_type="latent")
     runner.model.omni_pooler_payload_include_hidden = False
+    runner._pooler_payload_include_hidden_flag = False
 
     monkeypatch.setattr(
         GPUARModelRunner,
@@ -698,6 +731,7 @@ def test_build_omni_output_skips_hidden_when_model_opts_out(monkeypatch):
 def test_build_omni_output_splits_mm_by_scheduled_tokens_when_hidden_is_tail_only(monkeypatch):
     runner = _make_async_output_runner(engine_output_type="latent")
     runner.model.omni_pooler_payload_include_hidden = False
+    runner._pooler_payload_include_hidden_flag = False
     runner._async_chunk = False
     runner.requests = {"r1": object(), "r2": object(), "r3": object()}
 
@@ -744,6 +778,7 @@ def test_build_omni_output_splits_mm_by_hidden_len_when_scheduled_is_padded(monk
     """Thinker mm rows align to hidden_states.shape[0], not padded scheduled count."""
     runner = _make_async_output_runner(engine_output_type="latent")
     runner.model.omni_pooler_payload_include_hidden = False
+    runner._pooler_payload_include_hidden_flag = False
     runner._async_chunk = False
     runner.requests = {"r1": object(), "r2": object(), "r3": object()}
 
@@ -789,6 +824,7 @@ def test_build_omni_output_splits_mm_by_hidden_len_when_scheduled_is_padded(monk
 def test_async_snapshot_payload_omits_hidden_when_model_opts_out():
     runner = _make_async_output_runner()
     runner.model.omni_pooler_payload_include_hidden = False
+    runner._pooler_payload_include_hidden_flag = False
 
     payload = GPUARModelRunner._build_omni_async_snapshot_payload(
         runner,
@@ -818,6 +854,8 @@ def test_runner_assisted_full_attention_metadata_refresh_pads_buffers():
             self.commits.append(num_reqs_padded)
 
     runner = object.__new__(GPUARModelRunner)
+    runner._omni_cache_policy = ModelCachePolicy(needs_full_hidden_states=True)
+    runner._pooler_payload_include_hidden_flag = True
     block_table = BlockTable()
     runner.input_batch = SimpleNamespace(
         num_computed_tokens_cpu=torch.tensor([10, 20, 99, 99], dtype=torch.int32),
@@ -845,6 +883,8 @@ def test_runner_assisted_full_attention_metadata_refresh_pads_buffers():
 @pytest.mark.parametrize("query_start_loc_attr", ["method", "tensor_attr"])
 def test_sample_tokens_tail_only_prefix_cache_uses_staged_cpu_hidden_states(monkeypatch, query_start_loc_attr):
     runner = object.__new__(GPUARModelRunner)
+    runner._omni_cache_policy = ModelCachePolicy(needs_full_hidden_states=True)
+    runner._pooler_payload_include_hidden_flag = True
     runner.execute_model_state = ExecuteModelState(
         SimpleNamespace(
             total_num_scheduled_tokens=3,
@@ -907,12 +947,11 @@ def test_sample_tokens_tail_only_prefix_cache_uses_staged_cpu_hidden_states(monk
     )
     monkeypatch.setattr(GPUARModelRunner, "eplb_step", lambda self: None)
     monkeypatch.setattr(GPUARModelRunner, "_resolve_pooler_payload_req_ids", lambda self, req_ids: ("audio", req_ids))
-    monkeypatch.setattr(GPUARModelRunner, "_deferred_prefix_cache_mm_keys", lambda self: set())
     monkeypatch.setattr(GPUARModelRunner, "_model_needs_full_prefix_hidden_states", lambda self: False)
     monkeypatch.setattr(
         GPUARModelRunner,
-        "_maybe_get_combined_prefix_cache_tensors",
-        lambda *args, **kwargs: (None, None),
+        "_prepare_prefix_cache_pooler_payload_sources",
+        lambda self, **kwargs: (kwargs["staged_hidden_states_cpu"], None, None),
     )
     monkeypatch.setattr(GPUARModelRunner, "_process_additional_information_updates", lambda *args, **kwargs: None)
     monkeypatch.setattr(GPUARModelRunner, "_should_accumulate_full_payload_output", lambda self: False)
@@ -945,8 +984,6 @@ def test_build_omni_output_falls_back_to_mm_cpu_without_prefix_merge(monkeypatch
         lambda self, req_ids: ("latent", req_ids),
     )
     monkeypatch.setattr(GPUARModelRunner, "_model_needs_full_prefix_hidden_states", lambda self: False)
-    monkeypatch.setattr(GPUARModelRunner, "_deferred_prefix_cache_mm_keys", lambda self: {"codes.audio"})
-    monkeypatch.setattr(GPUARModelRunner, "_stage_deferred_prefix_cache_mm_outputs", lambda *args, **kwargs: None)
     monkeypatch.setattr(
         GPUARModelRunner,
         "_prepare_prefix_cache_pooler_payload_sources",
@@ -1094,8 +1131,6 @@ def test_build_omni_output_filters_multimodal_by_partial_downstream_batch(monkey
         lambda self, req_ids: ("latent", ["r1", "r3"]),
     )
     monkeypatch.setattr(GPUARModelRunner, "_model_needs_full_prefix_hidden_states", lambda self: False)
-    monkeypatch.setattr(GPUARModelRunner, "_deferred_prefix_cache_mm_keys", lambda self: {"codes.audio"})
-    monkeypatch.setattr(GPUARModelRunner, "_stage_deferred_prefix_cache_mm_outputs", lambda *args, **kwargs: None)
     monkeypatch.setattr(
         GPUARModelRunner,
         "_prepare_prefix_cache_pooler_payload_sources",
@@ -1171,8 +1206,6 @@ def test_build_omni_output_uses_combined_prefix_cache_mm_payload_for_partial_dow
         lambda self, req_ids: ("latent", ["r1", "r3"]),
     )
     monkeypatch.setattr(GPUARModelRunner, "_model_needs_full_prefix_hidden_states", lambda self: False)
-    monkeypatch.setattr(GPUARModelRunner, "_deferred_prefix_cache_mm_keys", lambda self: {"codes.audio"})
-    monkeypatch.setattr(GPUARModelRunner, "_stage_deferred_prefix_cache_mm_outputs", lambda *args, **kwargs: None)
     monkeypatch.setattr(
         GPUARModelRunner,
         "_prepare_prefix_cache_pooler_payload_sources",
@@ -1647,7 +1680,6 @@ class TestMergeModelKvTransferMetadata:
         # ...while the engine-shared originals are untouched.
         assert original["r1"]["custom_metadata"] is original_meta
         assert original_meta == {"a": 1}
-        assert "talker_codes" not in original["r1"]["custom_metadata"]
 
     def test_merge_without_model_meta_passes_entry_through(self):
         class _Model:
@@ -1690,7 +1722,7 @@ class TestDownstreamPayloadMemoization:
         return runner
 
     def test_missing_marker_defaults_true_without_memoizing(self):
-        stages = {"r1": None}
+        stages: dict[str, int | None] = {"r1": None}
         runner = self._runner(stages)
 
         assert runner._request_needs_downstream_stage_payload("r1") is True
@@ -1838,6 +1870,7 @@ class TestPreferModelSamplerNoneFallback:
             "minicpmo_4_5",
             "minimax_music3",
             "nemotron_voicechat",
+            "yue2",  # Always supplies SamplerOutput, including empty/prefill steps.
         }
         assert declarers == expected, (
             "The set of models declaring `prefer_model_sampler` changed:\n"

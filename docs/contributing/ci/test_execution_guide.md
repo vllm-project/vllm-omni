@@ -165,7 +165,7 @@ Failed jobs: 1/2
     pytest -sv tests/dfx/perf/scripts/run_benchmark.py -m "full_model and tts and H100"
     pytest -sv tests/dfx/perf/scripts/run_diffusion_benchmark.py -m "full_model and diffusion and H100"
     pytest -sv tests/dfx/perf/scripts/run_benchmark.py --test-config-file tests/dfx/perf/tests/test_tts.json
-    pytest -sv tests/dfx/perf/scripts/run_diffusion_benchmark.py --test-config-file tests/dfx/perf/tests/test_cosmos3_vllm_omni.json
+    pytest -sv tests/dfx/perf/scripts/run_benchmark.py --test-config-file tests/dfx/perf/tests/test_cosmos3_vllm_omni.json
     ```
     Nightly **Perf Test** jobs in [``test-nightly.yml``](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/cuda/test-nightly.yml) use ``--test-config-file`` only (no ``-m``). Weekly **Perf Test** in [``test-weekly.yml``](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/cuda/test-weekly.yml) runs ``test_qwen3_omni_vllm_text.json`` and ``test_qwen3_omni_multi_replicas.json`` (JSON ``mark`` includes ``slow``). E2e L4 function tests use ``full_model`` + ``--run-level full_model``. Example:
 
@@ -177,10 +177,10 @@ Failed jobs: 1/2
     cd tests
 
     # Stability: Qwen3-Omni
-    pytest -s -v dfx/stability/scripts/test_stability_qwen3_omni.py -m slow
+    pytest -s -v dfx/stability/scripts/run_stability_qwen3_omni.py -m slow
 
     # Stability: Wan2.2 (v1/videos diffusion benchmark loop)
-    pytest -s -v dfx/stability/scripts/test_stability_wan22.py -m slow
+    pytest -s -v dfx/stability/scripts/run_stability_wan22.py -m slow
 
     # Reliability: Qwen3-Omni (H100 × 2)
     pytest -s -v dfx/reliability/test_reliability_qwen3_omni.py -m slow

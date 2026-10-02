@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from collections.abc import Iterable
 from typing import Any, ClassVar
 
@@ -23,10 +24,13 @@ from safetensors import safe_open
 from torch import nn
 from vllm.logger import init_logger
 
+from vllm_omni.diffusion.compile import regionally_compile
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.models.auk.auk_transformer import AuKTransformer, dit_state_dict, sample_latents
 from vllm_omni.diffusion.models.auk.auk_vae import AuKVAE
+from vllm_omni.diffusion.models.auk.cudagraph_wrapper import AuKCUDAGraphWrapper
+from vllm_omni.diffusion.models.auk.vae_cudagraph import AuKVAEDecodeGraph
 from vllm_omni.diffusion.models.interface import (
     SupportAudioInput,
     SupportAudioOutput,
@@ -48,6 +52,13 @@ _FUSION_KEYS = frozenset({"layer_weights", "layer_scale"})
 # The distilled variant only reproduces its training recipe at these settings.
 _FLASH_NFE = 4
 _FLASH_CFG = 0.0
+# Startup DiT warm-up shapes: target frames of 3 / 6 / 12 s requests, with no
+# reference (instruct TTS) and a 3 s one (zero-shot). The first call compiles
+# the blocks; each shape then captures its graph bucket. Other shapes still
+# capture lazily, at about a second each.
+_WARMUP_TARGET_FRAMES = (150, 300, 600)
+_WARMUP_REF_FRAMES = (0, 150)
+_WARMUP_TEXT_TOKENS = 96
 # Decorrelates the VAE posterior draw from the initial latent for the same request seed.
 _VAE_SEED_OFFSET = 0x5EED_0A0C
 
@@ -138,6 +149,9 @@ class AuKPipeline(nn.Module, SupportAudioInput, SupportAudioOutput, SupportsComp
         super().__init__()
         del prefix  # Weights are not namespaced: one checkpoint, one pipeline.
         self.od_config = od_config
+        max_dit_graphs = od_config.model_config.get("max_dit_graphs", 32)
+        if isinstance(max_dit_graphs, bool) or not isinstance(max_dit_graphs, int) or max_dit_graphs < 1:
+            raise ValueError("AuK max_dit_graphs must be a positive integer")
         self.device = get_local_device()
         self.dtype = getattr(od_config, "dtype", None) or torch.bfloat16
 
@@ -177,11 +191,28 @@ class AuKPipeline(nn.Module, SupportAudioInput, SupportAudioOutput, SupportsComp
 
         # The transformer owns every key the checkpoint tool writes into `dit`,
         # `attn_mask_enabled` included, so the section passes straight through.
+        self.text_hidden_dim = int(config["dit"]["text_hidden_dim"])
         self.dit = AuKTransformer(latent_dim=self.latent_dim, **config["dit"])
         self.dit = self.dit.to(dtype=self.dtype)
         self.dit.load_state_dict(_read_dit_weights(model_dir, self.dtype), strict=True)
         self.dit = self.dit.to(device=self.device).eval()
         self.dit.requires_grad_(False)
+        self.cudagraph_wrapper = AuKCUDAGraphWrapper(
+            self.dit, enabled=not od_config.enforce_eager, max_graphs=max_dit_graphs
+        )
+        # The compiled decode buckets are warmed by setup_compile(), which the
+        # model runner calls at startup unless the stage is enforce_eager. The
+        # bucket list and the plain-graph cache size come from the stage's
+        # model_config, like the other codec graph wrappers' knobs.
+        model_config = getattr(od_config, "model_config", None) or {}
+        vae_decode_kwargs: dict[str, Any] = {}
+        if model_config.get("auk_vae_compile_shapes") is not None:
+            vae_decode_kwargs["compile_shapes"] = [int(size) for size in model_config["auk_vae_compile_shapes"]]
+        if model_config.get("auk_vae_max_graphs") is not None:
+            vae_decode_kwargs["max_graphs"] = int(model_config["auk_vae_max_graphs"])
+        if model_config.get("auk_vae_tile_frames") is not None:
+            vae_decode_kwargs["tile_frames"] = int(model_config["auk_vae_tile_frames"])
+        self.vae_decode = AuKVAEDecodeGraph(self.vae, enabled=not od_config.enforce_eager, **vae_decode_kwargs)
 
         logger.info(
             "AuK pipeline ready: variant=%s dtype=%s latent_dim=%d hop=%d sample_rate=%d",
@@ -190,6 +221,75 @@ class AuKPipeline(nn.Module, SupportAudioInput, SupportAudioOutput, SupportsComp
             self.latent_dim,
             self.hop_size,
             self.sample_rate,
+        )
+
+    def setup_compile(self) -> None:
+        """Compile the DiT as configured, then capture the codec decode buckets.
+
+        Defining this hook replaces the runner's generic transformer compile,
+        so the DiT's ``diffusion_compile_granularity`` is honoured here: full
+        compiles the whole denoise step;
+        regional compiles the double- and single-stream blocks. Compilation is
+        lazy and happens in the DiT CUDA graph's warm-up, before capture, so
+        each graph replays the compiled kernels. The startup cost worth paying
+        is the VAE decode, whose buckets are compiled and captured before the
+        first request.
+        """
+        granularity = self.od_config.diffusion_compile_granularity
+        dynamic = self.od_config.diffusion_compile_dynamic
+        if granularity == "full":
+            # The samplers drive prepare() and step() directly rather than
+            # __call__, so the per-step body is what gets compiled.
+            self.dit.step = torch.compile(self.dit.step, dynamic=dynamic)
+        else:
+            regionally_compile(self.dit, dynamic=dynamic)
+        logger.info("AuK DiT configured for lazy %s torch.compile with dynamic=%s", granularity, dynamic)
+        self._warmup_dit()
+        self.vae_decode.warmup(self.device)
+
+    def _warmup_dit(self) -> None:
+        """Compile the DiT step and capture the common graph buckets before serving.
+
+        The engine's synthetic warm-up request cannot reach this pipeline
+        (``dummy_run_num_frames = 0``), so without this the first real request
+        pays the whole torch.compile. Runs the variant's default guidance path
+        on zero conditioning; ``model_config.auk_dit_warmup_frames`` overrides
+        the target lengths and ``[]`` disables the warm-up.
+        """
+        if not self.cudagraph_wrapper.enabled:
+            return
+        model_config = getattr(self.od_config, "model_config", None) or {}
+        frames = model_config.get("auk_dit_warmup_frames", _WARMUP_TARGET_FRAMES)
+        if not frames:
+            logger.info("AuK DiT startup warm-up disabled")
+            return
+        cfg = _FLASH_CFG if self.is_flash else self.default_cfg
+        text = torch.zeros(1, _WARMUP_TEXT_TOKENS, self.text_hidden_dim, device=self.device, dtype=self.dtype)
+        c_mask = torch.ones(text.shape[:2], dtype=torch.bool, device=self.device)
+        timestep = torch.zeros((), device=self.device, dtype=torch.float32)
+        start = time.perf_counter()
+        with torch.inference_mode(), self._dit_autocast():
+            for ref_frames in _WARMUP_REF_FRAMES:
+                ref = torch.zeros(1, ref_frames, self.latent_dim, device=self.device, dtype=torch.float32)
+                ref_mask = torch.ones(ref.shape[:2], dtype=torch.bool, device=self.device)
+                for target_frames in frames:
+                    x = torch.zeros(1, int(target_frames), self.latent_dim, device=self.device, dtype=torch.float32)
+                    self.cudagraph_wrapper(
+                        x=x,
+                        text=text,
+                        c_mask=c_mask,
+                        ref=ref,
+                        ref_mask=ref_mask,
+                        timestep=timestep,
+                        cfg_strength=cfg,
+                        new_request=True,
+                    )
+        if self.device.type != "cpu":
+            torch.accelerator.synchronize(self.device)
+        logger.info(
+            "AuK DiT warm-up: compiled and captured %d shapes in %.1f s",
+            len(frames) * len(_WARMUP_REF_FRAMES),
+            time.perf_counter() - start,
         )
 
     # The assembled checkpoint is not a diffusers layout: __init__ reads
@@ -427,6 +527,7 @@ class AuKPipeline(nn.Module, SupportAudioInput, SupportAudioOutput, SupportsComp
                     device=self.device,
                     dtype=torch.float32,
                     generator=generator,
+                    sampler=self.cudagraph_wrapper,
                 )
 
             latents = latents.float()
@@ -435,7 +536,7 @@ class AuKPipeline(nn.Module, SupportAudioInput, SupportAudioOutput, SupportsComp
             if output_type == "latent":
                 return [DiffusionOutput(output=latents.detach().cpu())]
 
-            wav = self.vae.decode(latents)
+            wav = self.vae_decode(latents)
 
         # One mono waveform per request; the formatter expects [T].
         wav = wav.detach().to(device="cpu", dtype=torch.float32).reshape(-1)

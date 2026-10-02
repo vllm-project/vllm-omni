@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """Investigation tests for the num_stale_output_tokens drain (59b9e719).
 
@@ -89,7 +89,7 @@ def _make_drain_sched(session: Request) -> MagicMock:
     sched = MagicMock()
     sched.requests = {session.request_id: session}
     sched.perf_metrics = None
-    sched.structured_output_manager.should_advance.return_value = False
+    sched.structured_output_manager.accept_tokens.return_value = True
     sched._update_request_with_output.return_value = ([42], False)
     sched._process_kv_transfer_trigger.return_value = False
     sched.chunk_transfer_adapter = MagicMock()

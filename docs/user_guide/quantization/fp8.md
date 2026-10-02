@@ -65,7 +65,17 @@ vLLM-Omni points that cache at `~/.cache/vllm_omni/quack` (override with
 `QUACK_CACHE_DIR`) instead of quack's default under `/tmp`, so it survives restarts.
 In containers, set `QUACK_CACHE_DIR` to a mounted/persistent path — or bake it into
 the image — so the first cold start does not recompile. The engine's startup dummy
-run already exercises the kernels, so with a warm cache the first real request is fast.
+run exercises the kernels, but new shapes, layouts, dtypes, or bias settings may
+still need compilation or tuning. The warmup helper uses inference mode and
+transposed weights without bias. Daemon workers compile candidates in-process
+while retaining autotuning and caching.
+
+Scale validation and Quack/FlashInfer dispatch run inside a PyTorch custom op.
+This keeps layer-specific scale addresses and validation-cache updates out of
+Dynamo tracing without introducing a graph break. Unpopulated scales and Quack
+failures still fall back to FlashInfer at runtime. CUDA graph capture additionally
+requires warming the dispatch with populated scales; Python validation and
+dispatch do not rerun during CUDA graph replay.
 
 To pre-warm specific shapes (e.g. at image build time):
 
@@ -96,6 +106,7 @@ warmup_quack_fp8([(14040, 2048, 6144), (14040, 2048, 2048)])
 | HunyuanVideo-1.5 | `hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_t2v`, `720p_t2v`, `480p_i2v` | Yes | Yes | All layers | None | |
 | Cosmos3 | `nvidia/Cosmos3-Nano`, `nvidia/Cosmos3-Super` | Yes | Not validated | All layers | None | |
 | MiniMax-H3 | `MiniMaxAI/MiniMax-H3` (`FL2VA` / `Ref2VA`) | Yes | Not validated | `quantization="fp8"` quantizes eligible DiT and text-encoder linears; mixed-precision input/output heads stay FP32 | None | ✅︎ |
+| SenseNova-U1.5 | `sensenova/SenseNova-U1.5-8B-MoT` | Yes | Not validated | UND/GEN language-model linears only | None | |
 
 ### Multi-Stage Omni/TTS Model (Qwen3-Omni, Qwen3-TTS)
 

@@ -316,3 +316,12 @@ them unless `--allow-invalid-clock` is explicit.
   [`examples/offline_inference/minicpmo/`](../../offline_inference/minicpmo/)
 - Recipe:
   [`recipes/OpenBMB/MiniCPM-o-4_5.md`](../../../recipes/OpenBMB/MiniCPM-o-4_5.md)
+
+### Shared realtime UI implementation
+
+The `python -m examples.online_serving.minicpmo.realtime_web` command remains
+available with the same MiniCPM defaults and required `--ref-audio`. Its assets
+now live in [the shared realtime UI](../realtime_web/README.md), with a dedicated
+`minicpm-native` profile preserving native duplex input, playback ACKs and camera
+frames. Qwen3 uses a separate profile in the same shell, supporting manual STT
+turns or Server VAD turns with speech interruption.

@@ -94,7 +94,7 @@ class _FakeAttentionGroup:
         return self.builder
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class _FakeNativeMetadata:
     build_id: int
     causal: bool
@@ -102,6 +102,7 @@ class _FakeNativeMetadata:
     query_start_loc_cpu: torch.Tensor
     positions: torch.Tensor
     slot_mappings: torch.Tensor
+    max_num_splits: int = 0
 
 
 class _FakeLayer:
@@ -112,7 +113,7 @@ class _FakeLayer:
         self.head_size_v = 4
         self.spec = _FakeSpec(non_causal=non_causal)
         self.updates: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
-        self.calls: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, object]] = []
+        self.calls: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, _FakeNativeMetadata]] = []
         self.native_events: list[str] = []
         self.layer_name = "layer-0"
         self.kv_cache = object()
@@ -121,6 +122,8 @@ class _FakeLayer:
 
 
 class _FakeNativeImpl:
+    vllm_flash_attn_version: int
+
     def __init__(self, layer: _FakeLayer) -> None:
         self.layer = layer
 
@@ -142,7 +145,7 @@ class _FakeNativeImpl:
         key: torch.Tensor,
         value: torch.Tensor,
         _kv_cache,
-        metadata: object,
+        metadata: _FakeNativeMetadata,
         output: torch.Tensor,
     ) -> torch.Tensor:
         self.layer.native_events.append("forward")
@@ -201,7 +204,7 @@ def _make_adapter(
 
     config = SimpleNamespace(
         name="vllm-config",
-        model_config=SimpleNamespace(dtype=torch.float32),
+        model_config=SimpleNamespace(dtype=torch.float32, rswa_window=None),
     )
     adapter = DiffusionPagedAttentionAdapter(
         vllm_config=config,
@@ -288,6 +291,8 @@ def test_omni_paged_backend_consumes_context_and_restores_diffusion_shape(
     assert output.shape == query.shape
     assert torch.equal(output, query)
     assert layer.calls[0][0].shape == (5, 2, 4)
+    assert layer.calls[0][1] is None
+    assert layer.calls[0][2] is None
     assert layer.native_events == ["update", "forward"]
     assert layer.calls[0][3] is events[0][2]
 
@@ -440,9 +445,7 @@ def test_platform_prewrite_updates_once_then_piecewise_reads_cache(monkeypatch: 
 
 def test_omni_paged_backend_runs_hunyuan_piecewise_segments(monkeypatch: pytest.MonkeyPatch) -> None:
     adapter, _, layer, events = _make_adapter(monkeypatch)
-    # Exercise the Ascend-only homogeneous batch path. CUDA keeps its native
-    # output-buffer contract and is covered by the GPU adapter tests.
-    monkeypatch.setattr(adapter_module.current_omni_platform, "is_npu", lambda: True)
+    layer.impl.vllm_flash_attn_version = 2
     batch = adapter.prepare_batch(
         [
             DiffusionPagedAttentionRow(
@@ -499,10 +502,10 @@ def test_omni_paged_backend_runs_hunyuan_piecewise_segments(monkeypatch: pytest.
     assert torch.equal(layer.updates[0][0], key.reshape(12, 2, 4))
     assert torch.equal(layer.updates[0][1], value.reshape(12, 2, 4))
     assert [call[0].shape[0] for call in layer.calls] == [4, 6, 2]
-    assert [call[1].shape[0] for call in layer.calls] == [4, 6, 2]
-    assert [call[2].shape[0] for call in layer.calls] == [4, 6, 2]
+    assert all(call[1] is None and call[2] is None for call in layer.calls)
     assert all(call[3] is event[2] for call, event in zip(layer.calls, events[1:], strict=True))
     assert [metadata.build_id for metadata in context.piecewise_native_metadata] == [1, 2, 3]
+    assert [metadata.max_num_splits for metadata in context.piecewise_native_metadata] == [1, 1, 1]
 
     # The first metadata build is the normal whole-query path. Piecewise calls
     # then use causal [3, 5), full [5, 8), and causal [8, 9) segments.
@@ -537,6 +540,51 @@ def test_omni_paged_backend_runs_hunyuan_piecewise_segments(monkeypatch: pytest.
         [[5, 6, 7, 5, 6, 7]],
         [[8, 8]],
     ]
+
+
+def test_homogeneous_piecewise_packs_strided_query_only_per_segment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter, _, _, _ = _make_adapter(monkeypatch)
+    batch = adapter.prepare_batch(
+        [
+            DiffusionPagedAttentionRow(
+                request_id="req-0",
+                sequence_id=0,
+                query_len=6,
+                seq_len=9,
+                kv_start_pos=3,
+            ),
+            DiffusionPagedAttentionRow(
+                request_id="req-1",
+                sequence_id=1,
+                query_len=6,
+                seq_len=9,
+                kv_start_pos=3,
+            ),
+        ]
+    )
+    packed_qkv = torch.randn(2, 6, 3, 2, 4)
+    query, key, value = packed_qkv.unbind(dim=2)
+    assert not query.is_contiguous()
+    metadata = SimpleNamespace(
+        attn_mask=None,
+        full_attn_spans=[[(5, 8)], [(5, 8)]],
+        query_ranges=None,
+        extra={},
+    )
+
+    with adapter.activate(batch):
+        context = adapter.prepare_layer_context(
+            "layer-0",
+            query,
+            key,
+            value,
+            omni_attn_metadata=metadata,
+        )
+
+    assert not context.query.is_contiguous()
+    assert context.query.data_ptr() == query.data_ptr()
 
 
 def test_piecewise_metadata_snapshots_reused_native_scheduler_buffer(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1176,9 +1224,15 @@ def test_row_contract_rejects_invalid_identity_or_span(kwargs: dict, message: st
         DiffusionPagedAttentionRow(**values)
 
 
+@pytest.mark.parametrize("pcp_size", [1, 2])
+@pytest.mark.parametrize("selection_fails", [False, True])
 def test_layer_adapter_accepts_platform_native_backend_and_uses_rank_local_heads(
     monkeypatch: pytest.MonkeyPatch,
+    pcp_size: int,
+    selection_fails: bool,
 ) -> None:
+    from vllm.v1.attention import selector
+
     selected_backends = []
     specialized_backends = []
     impl_cls = Mock(return_value=SimpleNamespace(forward=Mock(), do_kv_cache_update=Mock()))
@@ -1191,28 +1245,39 @@ def test_layer_adapter_accepts_platform_native_backend_and_uses_rank_local_heads
 
     original_backend_per_kind = {"full": object()}
     config = SimpleNamespace(
-        attention_config=SimpleNamespace(backend=None, backend_per_kind=original_backend_per_kind),
-        parallel_config=SimpleNamespace(prefill_context_parallel_size=2),
-        model_config=SimpleNamespace(dtype=torch.float16),
-        cache_config=SimpleNamespace(cache_dtype="auto"),
+        attention_config=SimpleNamespace(backend=None, backend_per_kind=original_backend_per_kind, use_non_causal=True),
+        parallel_config=SimpleNamespace(prefill_context_parallel_size=pcp_size, decode_context_parallel_size=1),
+        model_config=SimpleNamespace(dtype=torch.float16, rswa_window=None),
+        cache_config=SimpleNamespace(cache_dtype="auto", user_specified_block_size=False),
+        kv_transfer_config=None,
+        speculative_config=None,
     )
 
-    def select_backend(**_kwargs):
-        selected_backends.append(
-            (
-                config.attention_config.backend,
-                config.attention_config.backend_per_kind,
-                config.parallel_config.prefill_context_parallel_size,
-            )
-        )
+    def select_backend(*, backend, attn_selector_config, num_heads):
+        # Exercise the real 0.29 selector, replacing only platform resolution.
+        # Ulysses has already gathered tokens and sharded heads before the
+        # native kernel; the MoE PCP mapping must not request PCP attention.
+        assert not attn_selector_config.use_pcp
+        assert not attn_selector_config.use_dcp
+        assert attn_selector_config.use_non_causal
+        assert num_heads == 4
+        selected_backends.append((backend, config.attention_config.backend_per_kind))
+        if selection_fails:
+            raise ValueError("test backend unavailable")
         return native_backend
 
-    monkeypatch.setattr(adapter_module, "get_attn_backend", select_backend)
+    monkeypatch.setattr("vllm.config.get_current_vllm_config", lambda: config)
+    monkeypatch.setattr(selector, "_cached_get_attn_backend", select_backend)
     monkeypatch.setattr(adapter_module, "set_current_vllm_config", lambda _config: nullcontext())
+
+    def specialize_backend(backend, *, ulysses_degree):
+        specialized_backends.append((backend, ulysses_degree))
+        return backend
+
     monkeypatch.setattr(
         adapter_module.current_omni_platform,
         "get_diffusion_paged_kv_attn_backend",
-        lambda backend, *, ulysses_degree: specialized_backends.append((backend, ulysses_degree)) or backend,
+        specialize_backend,
     )
     layer = SimpleNamespace(num_heads=8, softmax_scale=0.125)
     spec = FullAttentionSpec(
@@ -1223,7 +1288,7 @@ def test_layer_adapter_accepts_platform_native_backend_and_uses_rank_local_heads
         non_causal=True,
     )
 
-    native_layer = adapter_module.DiffusionPagedAttentionLayerAdapter(
+    kwargs = dict(
         layer_name="layer-0",
         layer=layer,
         spec=spec,
@@ -1231,12 +1296,21 @@ def test_layer_adapter_accepts_platform_native_backend_and_uses_rank_local_heads
         device=torch.device("cpu"),
         ulysses_degree=2,
     )
+    if selection_fails:
+        with pytest.raises(ValueError, match="test backend unavailable"):
+            adapter_module.DiffusionPagedAttentionLayerAdapter(**kwargs)
+    else:
+        native_layer = adapter_module.DiffusionPagedAttentionLayerAdapter(**kwargs)
 
-    assert selected_backends == [(adapter_module.AttentionBackendEnum.FLASH_ATTN, {}, 2)]
-    assert specialized_backends == [(native_backend, 2)]
+    assert selected_backends == [(adapter_module.AttentionBackendEnum.FLASH_ATTN, {})]
     assert config.attention_config.backend is None
     assert config.attention_config.backend_per_kind is original_backend_per_kind
-    assert config.parallel_config.prefill_context_parallel_size == 2
+    assert config.parallel_config.prefill_context_parallel_size == pcp_size
+    if selection_fails:
+        assert not specialized_backends
+        impl_cls.assert_not_called()
+        return
+    assert specialized_backends == [(native_backend, 2)]
     assert native_layer.num_heads == 4
     assert native_layer.num_kv_heads == 2
     assert native_layer.spec.num_kv_heads == 2
@@ -1386,7 +1460,12 @@ def test_omni_attention_keeps_dense_kernel_without_active_adapter() -> None:
     layer._no_parallel_strategy = object()
     layer._get_active_parallel_strategy = lambda: Strategy()
     layer._with_kv_cache_dtype = lambda metadata: metadata
-    layer._run_local_attention = lambda query, _key, _value, _metadata: events.append("dense") or query
+
+    def run_local_attention(query, _key, _value, _metadata):
+        events.append("dense")
+        return query
+
+    layer._run_local_attention = run_local_attention
     qkv = torch.zeros(1, 2, 2, 4)
 
     assert not layer.is_paged_kv_active()

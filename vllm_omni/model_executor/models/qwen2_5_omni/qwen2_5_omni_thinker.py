@@ -758,6 +758,7 @@ class Qwen2_5OmniThinkerMultiModalProcessor(
         tokenizer = self.info.get_tokenizer()
         processor = self.info.get_hf_processor()
         audio_token_id = tokenizer.get_vocab()[processor.audio_token]
+        video_token_id = tokenizer.get_vocab()[processor.video_token]
 
         result_placeholders = dict(placeholders)
         audio_placeholders = []
@@ -765,7 +766,10 @@ class Qwen2_5OmniThinkerMultiModalProcessor(
 
         audio_idx = 0
         for video_idx, video_placeholder in enumerate(placeholders["video"]):
-            audio_is_embed = torch.tensor(video_placeholder.tokens) == audio_token_id
+            placeholder_tokens = torch.tensor(video_placeholder.tokens)
+            audio_is_embed = placeholder_tokens == audio_token_id
+            # Audio boundary tokens keep their text embeddings.
+            video_is_embed = placeholder_tokens == video_token_id
 
             if video_use_audio_in_video[video_idx]:
                 audio_placeholder = PlaceholderFeaturesInfo(
@@ -783,13 +787,34 @@ class Qwen2_5OmniThinkerMultiModalProcessor(
                 item_idx=video_idx,
                 start_idx=video_placeholder.start_idx,
                 tokens=video_placeholder.tokens,
-                is_embed=~audio_is_embed,
+                is_embed=video_is_embed,
             )
             video_placeholders.append(video_placeholder_with_mask)
 
         result_placeholders["audio"] = audio_placeholders
         result_placeholders["video"] = video_placeholders
         return result_placeholders
+
+    def _reject_audio_tokens_outside_videos(
+        self,
+        prompt_ids: list[int],
+        placeholders: Mapping[str, list[PlaceholderFeaturesInfo]],
+    ) -> None:
+        # With use_audio_in_video, every audio item is interleaved into a video
+        # placeholder and standalone audio updates are skipped. A leftover
+        # <|AUDIO|> would reach the engine with no audio features behind it and
+        # crash MRoPE position computation, so reject the request here instead.
+        tokenizer = self.info.get_tokenizer()
+        audio_token_id = tokenizer.get_vocab()[self.info.get_hf_processor().audio_token]
+        in_video = [False] * len(prompt_ids)
+        for placeholder in placeholders.get("video", []):
+            end = placeholder.start_idx + len(placeholder.tokens)
+            in_video[placeholder.start_idx : end] = [True] * (end - placeholder.start_idx)
+        if any(tok == audio_token_id and not in_video[i] for i, tok in enumerate(prompt_ids)):
+            raise ValueError(
+                "use_audio_in_video=True interleaves each audio into its video "
+                "placeholder; remove the separate <|AUDIO|> placeholder from the prompt."
+            )
 
     def _maybe_apply_prompt_updates(
         self,
@@ -816,6 +841,7 @@ class Qwen2_5OmniThinkerMultiModalProcessor(
                 mm_prompt_updates,
                 video_use_audio_in_video,
             )
+            self._reject_audio_tokens_outside_videos(prompt_ids, mm_placeholders)
         else:
             prompt_ids, mm_placeholders = self._apply_prompt_updates(
                 prompt_ids,

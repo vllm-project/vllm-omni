@@ -36,6 +36,7 @@ from vllm_omni.model_executor.models.moss_tts.moss_codec_cudagraph import (
     MossTTSCUDAGraphCodecWrapper,
 )
 from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.model_executor.stage_input_processors.chunk_size_utils import parse_chunk_ramp
 
 logger = init_logger(__name__)
 
@@ -63,7 +64,7 @@ class _MossCodecStreamSession:
         self._cudagraph_wrapper: CUDAGraphStreamingDecoderWrapper | None = None
         batch_sizes = sorted({int(size) for size in (graph_batch_sizes or []) if 0 < int(size) <= self._state_capacity})
         frame_sizes = sorted({int(size) for size in (graph_frame_sizes or []) if int(size) > 0})
-        scratch_capacity = max(batch_sizes, default=0) if self._device.type == "cuda" else 0
+        scratch_capacity = max(batch_sizes, default=0) if self._device.type in ("cuda", "npu") else 0
         self._total_state_capacity = self._state_capacity + scratch_capacity
         self._state_slot_ids = torch.arange(
             self._total_state_capacity,
@@ -76,15 +77,29 @@ class _MossCodecStreamSession:
             raise RuntimeError("The streaming codec does not implement a decoder state pool.")
         with torch.no_grad():
             initialize_state_pool(self._state_capacity, scratch_capacity)
-        if batch_sizes and frame_sizes and self._device.type == "cuda":
-            self._cudagraph_wrapper = CUDAGraphStreamingDecoderWrapper(
-                codec,
-                state_capacity=self._state_capacity,
-                batch_sizes=batch_sizes,
-                frame_sizes=frame_sizes,
-                num_quantizers=self._n_vq,
-                vllm_config=vllm_config,
-            )
+        if batch_sizes and frame_sizes and self._device.type in ("cuda", "npu"):
+            if self._device.type == "npu":
+                from vllm_omni.platforms.npu.models.moss_tts_streaming_decode_wrapper import (
+                    NPUGraphStreamingDecoderWrapper,
+                )
+
+                self._cudagraph_wrapper = NPUGraphStreamingDecoderWrapper(
+                    codec,
+                    state_capacity=self._state_capacity,
+                    batch_sizes=batch_sizes,
+                    frame_sizes=frame_sizes,
+                    num_quantizers=self._n_vq,
+                    vllm_config=vllm_config,
+                )
+            else:
+                self._cudagraph_wrapper = CUDAGraphStreamingDecoderWrapper(
+                    codec,
+                    state_capacity=self._state_capacity,
+                    batch_sizes=batch_sizes,
+                    frame_sizes=frame_sizes,
+                    num_quantizers=self._n_vq,
+                    vllm_config=vllm_config,
+                )
             self._cudagraph_wrapper.warmup(self._device)
             self.reset_slots(list(range(self._state_capacity + scratch_capacity)))
             if not self._cudagraph_wrapper.is_ready:
@@ -211,6 +226,22 @@ class _MossCodecStreamSession:
         return out
 
 
+def _resolve_streaming_graph_frame_sizes(
+    initial_frames: int,
+    steady_frames: int,
+    connector_extra_cfg: dict | None,
+) -> list[int]:
+    """Streaming-graph frame sizes to pre-capture: ``{initial, steady}`` + ramp ladder.
+
+    Ladder parsing is delegated to ``parse_chunk_ramp`` so the codec and the
+    stage input processor agree on one validated ``codec_chunk_ramp``:
+    null / malformed / single-entry values disable the ramp on both sides
+    (warn only) and never raise during codec init.
+    """
+    ramp = parse_chunk_ramp(connector_extra_cfg or {}, steady=steady_frames) or []
+    return sorted({s for s in (initial_frames, steady_frames, *ramp) if s > 0})
+
+
 class MossTTSCodecDecoder(nn.Module):
     """Stage-1 decoder for all MOSS-TTS variants.
 
@@ -269,8 +300,12 @@ class MossTTSCodecDecoder(nn.Module):
         self._stream_req_slots: dict[str, int] = {}
         self._async_chunk = bool(getattr(self.vllm_config.model_config, "async_chunk", False))
         self._streaming_graph_batch_sizes = self._streaming_graph_batch_sizes_from_compilation_config()
-        self._streaming_graph_frame_sizes = sorted(
-            {frames for frames in (self._initial_stream_chunk_frames, self._stream_chunk_frames) if frames > 0}
+        # codec_chunk_ramp ladder sizes join the streaming graph frame-size
+        # set so every ladder (B, T) combination is captured during warmup.
+        self._streaming_graph_frame_sizes = _resolve_streaming_graph_frame_sizes(
+            self._initial_stream_chunk_frames,
+            self._stream_chunk_frames,
+            self._connector_extra_cfg(),
         )
 
     # ------------------------------------------------------------------
@@ -652,6 +687,15 @@ class MossTTSCodecDecoder(nn.Module):
             return int(extra_cfg[name])
         return default
 
+    def _connector_extra_cfg(self) -> dict:
+        model_cfg = getattr(self.vllm_config, "model_config", None)
+        connector_cfg = getattr(model_cfg, "stage_connector_config", None)
+        if isinstance(connector_cfg, dict):
+            extra_cfg: dict | None = connector_cfg.get("extra", connector_cfg)
+        else:
+            extra_cfg = getattr(connector_cfg, "extra", None)
+        return extra_cfg if isinstance(extra_cfg, dict) else {}
+
     def _streaming_graph_batch_sizes_from_compilation_config(self) -> list[int]:
         if getattr(self.vllm_config.model_config, "enforce_eager", True):
             return []
@@ -767,7 +811,8 @@ class MossTTSCodecDecoder(nn.Module):
         )
 
         codec.eval()
-        if device.type != "cpu":
+        # The v1 quantizer emits FP32 tensors, so its decoder must remain FP32.
+        if device.type != "cpu" and isinstance(codec, MossAudioTokenizerV2Model):
             codec.decoder.to(dtype=torch.bfloat16)
         attention_backend = getattr(self.vllm_config.model_config.hf_config, "codec_attention_backend", "sdpa")
         if attention_backend != "sdpa":
