@@ -290,6 +290,24 @@ curl -s http://localhost:8091/v1/videos \
   -F "fps=16"
 ```
 
+### Wan Text-to-Video Guidance Interval
+
+Wan text-to-video accepts `guidance_interval` in `extra_params`: two scheduler
+timesteps `[lo, hi]`, inclusive. Wan's schedule runs from 1000 down to 0.
+Classifier-free guidance runs only while the timestep is inside the interval.
+Outside the interval, the negative-prompt pass is skipped. With the default 40 steps
+and `flow_shift` 5, `[600, 1000]` skips the last 9 negative-prompt passes; other
+schedules skip a different number. The saving applies to sequential CFG. With `--cfg-parallel-size 2`
+each rank still runs one pass per step. With cache-dit, both passes run and guidance
+is set to 1.0 outside the interval. TI2V checkpoints reject the argument.
+
+```bash
+curl -s http://localhost:8091/v1/videos/sync \
+  -F "prompt=A red silk scarf ripples above a table" \
+  -F 'extra_params={"guidance_interval":[600,1000]}' \
+  -o output.mp4
+```
+
 ### Synchronous Generation
 
 ```bash
