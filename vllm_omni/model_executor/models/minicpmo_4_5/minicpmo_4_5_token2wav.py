@@ -64,6 +64,7 @@ class MiniCPMO45Token2wav:
         float16: bool = False,
         n_timesteps: int = 10,
         device: str | torch.device | None = None,
+        drop_upstream_chunk_att_buffers: bool = False,
     ):
         self.float16 = float16
         self.n_timesteps = n_timesteps
@@ -73,6 +74,7 @@ class MiniCPMO45Token2wav:
             float16=float16,
             device=self.device,
             n_timesteps=n_timesteps,
+            drop_upstream_chunk_att_buffers=drop_upstream_chunk_att_buffers,
         )
         # Eager-load so construction failures surface at init time (same as
         # the external Token2wav package), not on the first request.
