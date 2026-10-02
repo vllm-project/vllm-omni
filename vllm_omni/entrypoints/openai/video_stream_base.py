@@ -142,6 +142,14 @@ class StreamingVideoSessionConfig(BaseModel):
         default=None,
         description="Custom system prompt.",
     )
+    max_history_turns: int | None = Field(
+        default=1,
+        ge=1,
+        description=(
+            "Maximum completed text-only turns to include in each new request. "
+            "Set to null to include all retained turns."
+        ),
+    )
     use_audio_in_video: bool = Field(
         default=True,
         description="Interleave audio chunks with video frames when audio input is present.",
