@@ -598,3 +598,124 @@ def test_reference_resampler_is_cached_and_matches_functional_resample():
         assert info.misses == 1 and info.hits == 1
     finally:
         _reference_resampler.cache_clear()
+
+
+# --------------------------------------------------------------------------- #
+# Group F — disk tier (codes persist across restarts)                           #
+# --------------------------------------------------------------------------- #
+
+
+@pytest.fixture(autouse=True)
+def _isolate_disk_cache(monkeypatch):
+    """Keep the suite off the machine-wide default cache dir.
+
+    Without this, a previous run's persisted codes would turn the next run's
+    "cold" encodes into disk hits and break the encode-count assertions above.
+    The disk-tier tests below override the env with a tmp_path dir.
+    """
+    monkeypatch.setenv("VLLM_OMNI_MOSS_REF_CACHE_DIR", "off")
+
+
+@pytest.fixture
+def disk_dir(tmp_path, monkeypatch):
+    d = tmp_path / "ref_disk"
+    monkeypatch.setenv("VLLM_OMNI_MOSS_REF_CACHE_DIR", str(d))
+    return d
+
+
+async def test_cold_encode_persists_to_disk(make_encoder, disk_dir):
+    proc, audio = _FakeProcessor(), _FakeAudio()
+    audio.register("a", 7)
+    enc = make_encoder(proc)
+
+    await _encode(enc, audio, "a")
+
+    files = list(disk_dir.glob("*.pt"))
+    assert len(files) == 1
+    assert not list(disk_dir.glob("*.tmp"))  # atomic write leaves no strays
+
+
+async def test_restart_disk_hit_skips_encode(make_encoder, disk_dir):
+    proc, audio = _FakeProcessor(), _FakeAudio()
+    audio.register("a", 7)
+    enc1 = make_encoder(proc)
+    r1 = await _encode(enc1, audio, "a")
+    assert proc.total_items == 1
+
+    # Simulated restart: fresh speaker cache (empty memory) + fresh encoder.
+    proc2, audio2 = _FakeProcessor(), _FakeAudio()
+    audio2.register("a", 7)
+    enc2 = make_encoder(proc2)
+    r2 = await _encode(enc2, audio2, "a")
+
+    assert proc2.total_items == 0  # served from disk, no re-encode
+    assert torch.equal(r1, r2)
+    assert r2.dtype == torch.int64  # caller contract preserved
+
+
+async def test_named_voice_disk_hit_skips_resolve(make_encoder, disk_dir):
+    proc, audio = _FakeProcessor(), _FakeAudio()
+    audio.register("a", 7)
+    enc1 = make_encoder(proc)
+    r1 = await _encode(enc1, audio, "a", voice_name="Speaker", voice_created_at=42)
+
+    proc2, audio2 = _FakeProcessor(), _FakeAudio()
+    audio2.register("a", 7)
+    enc2 = make_encoder(proc2)
+    r2 = await _encode(enc2, audio2, "a", voice_name="Speaker", voice_created_at=42)
+
+    assert proc2.total_items == 0
+    assert audio2.resolve_calls == []  # pre-resolve disk hit: no audio fetch at all
+    assert torch.equal(r1, r2)
+
+
+async def test_corrupt_disk_file_falls_back_to_encode(make_encoder, disk_dir):
+    proc, audio = _FakeProcessor(), _FakeAudio()
+    audio.register("a", 7)
+    enc1 = make_encoder(proc)
+    await _encode(enc1, audio, "a")
+
+    for f in disk_dir.glob("*.pt"):
+        f.write_bytes(b"garbage")
+
+    proc2, audio2 = _FakeProcessor(), _FakeAudio()
+    audio2.register("a", 7)
+    enc2 = make_encoder(proc2)
+    r2 = await _encode(enc2, audio2, "a")
+
+    assert proc2.total_items == 1  # corrupt file = miss, re-encode
+    assert int(r2[0, 0]) == 7
+    obj = torch.load(next(disk_dir.glob("*.pt")), weights_only=True)
+    assert isinstance(obj, torch.Tensor)  # rewritten valid
+
+
+async def test_invalid_payload_type_is_dropped(make_encoder, disk_dir):
+    proc, audio = _FakeProcessor(), _FakeAudio()
+    audio.register("a", 7)
+    enc1 = make_encoder(proc)
+    await _encode(enc1, audio, "a")
+
+    # Loadable torch file, wrong payload shape/type -> must be treated as miss.
+    torch.save({"codes": torch.zeros(3, _N_VQ, dtype=torch.int64)}, next(disk_dir.glob("*.pt")))
+
+    proc2, audio2 = _FakeProcessor(), _FakeAudio()
+    audio2.register("a", 7)
+    enc2 = make_encoder(proc2)
+    r2 = await _encode(enc2, audio2, "a")
+
+    assert proc2.total_items == 1
+    assert int(r2[0, 0]) == 7
+
+
+async def test_disk_cache_disabled_by_env(make_encoder, disk_dir, monkeypatch):
+    monkeypatch.setenv("VLLM_OMNI_MOSS_REF_CACHE_DIR", "off")
+    from vllm_omni.model_executor.models.moss_tts.reference_encoder import _disk_cache_dir
+
+    proc, audio = _FakeProcessor(), _FakeAudio()
+    audio.register("a", 7)
+    enc = make_encoder(proc)
+    r1 = await _encode(enc, audio, "a")
+
+    assert int(r1[0, 0]) == 7
+    assert _disk_cache_dir() is None
+    assert not disk_dir.exists()  # nothing written anywhere

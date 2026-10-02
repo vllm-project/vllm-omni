@@ -15,10 +15,15 @@ speaker cache).
 
 On top of that cache the encoder adds content-addressed keys (the same clip
 arriving via different locators shares one entry), single-flight (concurrent
-requests for one uncached clip join a single encode), and micro-batched
-encoding (cold encodes arriving close together share one processor forward).
+requests for one uncached clip join a single encode), micro-batched encoding
+(cold encodes arriving close together share one processor forward), and a
+disk tier (``VLLM_OMNI_MOSS_REF_CACHE_DIR``, default
+``~/.cache/vllm-omni/moss_ref_codes``) so encoded codes survive process
+restarts — the in-memory cache alone re-pays the minutes-long CPU encode of
+every known speaker on each restart.
 
-Kept import-light (``asyncio`` / ``hashlib`` / ``numpy`` / ``torch`` plus the logger)
+Kept import-light (``asyncio`` / ``hashlib`` / ``os`` / ``pathlib`` /
+``numpy`` / ``torch`` plus the logger)
 so importing it from the API-server process does not pull the talker/codec.
 """
 
@@ -26,8 +31,10 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import os
 from collections.abc import Awaitable, Callable
 from functools import lru_cache
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -49,6 +56,87 @@ _Waveform = NDArray[np.float32] | list[float]
 
 def _sha1(s: str) -> str:
     return hashlib.sha1((s or "").encode("utf-8")).hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# Disk tier for encoded reference codes.
+#
+# The in-memory speaker cache dies with the process, so every restart re-pays
+# the CPU encode of each reference clip (minutes for the ~1.6B-param MOSS
+# audio tokenizer running on CPU). The compact codes are a few KB per clip,
+# so persisting them makes restarts free for already-seen speakers. Keys fold
+# the audio-content hash (anonymous refs) or (voice_name, created_at)
+# (registered voices), so an edited file or a re-uploaded voice simply misses
+# and re-encodes. Every failure mode degrades to memory-only caching.
+# ---------------------------------------------------------------------------
+
+_DISK_CACHE_ENV = "VLLM_OMNI_MOSS_REF_CACHE_DIR"
+_DISK_CACHE_MAX_ENTRIES = 1024
+
+
+def _disk_cache_dir() -> Path | None:
+    """Disk-cache directory, or ``None`` when disabled via env."""
+    raw = os.environ.get(_DISK_CACHE_ENV)
+    if raw is not None:
+        raw = raw.strip()
+        if raw.lower() in ("", "off", "none", "0"):
+            return None
+        return Path(raw)
+    base = os.environ.get("XDG_CACHE_HOME") or str(Path.home() / ".cache")
+    return Path(base) / "vllm-omni" / "moss_ref_codes"
+
+
+def _disk_cache_path(key: tuple) -> Path | None:
+    cache_dir = _disk_cache_dir()
+    if cache_dir is None:
+        return None
+    return cache_dir / f"{hashlib.sha256(repr(key).encode('utf-8')).hexdigest()}.pt"
+
+
+def _disk_cache_load(key: tuple) -> torch.Tensor | None:
+    """Load persisted codes for ``key``; any problem is a miss (never fatal).
+
+    Files are a few KB, so the blocking read costs micro- to milliseconds and
+    is kept inline instead of round-tripping a worker thread.
+    """
+    path = _disk_cache_path(key)
+    if path is None or not path.is_file():
+        return None
+    try:
+        obj = torch.load(path, map_location="cpu", weights_only=True)
+    except Exception:  # noqa: BLE001 — corrupt/unreadable file: drop and re-encode
+        logger.warning("MOSS ref disk cache: unreadable %s; removing", path.name)
+        path.unlink(missing_ok=True)
+        return None
+    if not isinstance(obj, torch.Tensor) or obj.ndim != 2 or obj.dtype not in (torch.int32, torch.int64):
+        logger.warning("MOSS ref disk cache: invalid payload in %s; removing", path.name)
+        path.unlink(missing_ok=True)
+        return None
+    return obj
+
+
+def _disk_cache_store(key: tuple, codes: torch.Tensor) -> None:
+    """Atomically persist ``codes``; failures degrade to memory-only caching."""
+    path = _disk_cache_path(key)
+    if path is None:
+        return
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+        torch.save(codes, tmp)
+        os.replace(tmp, path)
+        _disk_cache_prune(path.parent)
+    except Exception:  # noqa: BLE001 — a full/read-only disk must not break serving
+        logger.warning("MOSS ref disk cache: store failed for key=%s", key, exc_info=True)
+
+
+def _disk_cache_prune(cache_dir: Path) -> None:
+    try:
+        files = sorted(cache_dir.glob("*.pt"), key=lambda p: p.stat().st_mtime)
+    except OSError:
+        return
+    for stale in files[: max(0, len(files) - _DISK_CACHE_MAX_ENTRIES)]:
+        stale.unlink(missing_ok=True)
 
 
 @lru_cache(maxsize=16)
@@ -256,9 +344,16 @@ class MossReferenceEncoder:
             # A named voice has a stable key that does not depend on the
             # resolved audio, so the cache can be checked before resolving.
             flight_key = f"voice:{voice_name}:{created_at}"
-            cached = self._speaker_cache.get(self._make_cache_key(voice_name, created_at))
+            voice_key = self._make_cache_key(voice_name, created_at)
+            cached = self._speaker_cache.get(voice_key)
             if cached is not None:
                 return _clone_out(cached["codes"]), None
+            # Disk tier: survive restarts without paying resolve + encode.
+            disk = _disk_cache_load(voice_key)
+            if disk is not None:
+                self._speaker_cache.put(voice_key, {"codes": disk})
+                logger.info("MOSS ref codes DISK-HIT (voice=%s)", voice_name)
+                return _clone_out(disk), None
         else:
             # Anonymous refs have no pre-resolve hot path: the content key must
             # come from the resolve itself (mtime/size from a single stat) so an
@@ -331,9 +426,18 @@ class MossReferenceEncoder:
         if cached is not None:
             return cached["codes"], resolve_key
 
+        # Disk tier: a restarted process re-resolves the clip (cheap: stat /
+        # cached download) but skips the minutes-long CPU encode.
+        disk = _disk_cache_load(key)
+        if disk is not None:
+            self._speaker_cache.put(key, {"codes": disk})
+            logger.info("MOSS ref codes DISK-HIT key=%s shape=%s", key, tuple(disk.shape))
+            return disk, resolve_key
+
         codes = await self._batcher.submit(waveform, sr)
         compact = _to_compact_codes(codes)
         self._speaker_cache.put(key, {"codes": compact})
+        _disk_cache_store(key, compact)
         logger.debug(
             "MOSS ref encode STORE key=%s shape=%s dtype=%s",
             key,
