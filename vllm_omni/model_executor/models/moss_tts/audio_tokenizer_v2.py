@@ -22,6 +22,7 @@ import copy
 import math
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import cast
 
 import torch
@@ -33,6 +34,17 @@ from transformers.utils import ModelOutput, auto_docstring, logging
 from .configuration_moss_audio_tokenizer_v2 import MossAudioTokenizerConfig
 
 logger = logging.get_logger(__name__)
+
+
+@lru_cache(maxsize=1)
+def _get_torch_npu():
+    """Lazily import torch_npu once at module level (cached)."""
+    try:
+        import torch_npu
+
+        return torch_npu
+    except ImportError:
+        return None
 
 
 # =============================================================================
@@ -302,6 +314,7 @@ def apply_rope(
     offset: torch.Tensor,
     max_period: float = 10_000,
     time_before_heads: bool = False,
+    freqs_cache: torch.Tensor | None = None,
 ):
     """Apply rotary position embedding (GPT-J interleaved convention).
 
@@ -309,9 +322,16 @@ def apply_rope(
     instead of the manual 14-op eager rotation. The codec's GPT-J convention
     (even/odd index pairs) is mathematically identical to the neox convention
     after a layout conversion: interleaved ``[r0 i0 r1 i1 ...]`` -> neox
-    ``[r0 r1 ... i0 i1 ...]``, apply ``npu_rotary_mul``, convert back. This
-    fuses the 6 mul/add ops into 1 kernel. Result is bf16-identical
-    (max_abs_diff = 1 ULP). Falls back to the eager path on non-NPU.
+    ``[r0 r1 ... i0 i1 ...]``, apply ``npu_rotary_mul``.
+
+    **Layout contract**: the NPU path skips the neox→interleaved back-
+    conversion, so it returns Q/K in **neox** layout, while the non-NPU path
+    returns Q/K in **interleaved** (GPT-J) layout.  This is safe because
+    attention's QK^T dot product is invariant to a shared permutation of the
+    D dimension, and both Q and K are in the same layout.  However, the
+    returned tensors are **not** interchangeable between the two paths — callers
+    must not mix NPU and non-NPU outputs.  Result is bf16-equivalent (max
+    ``max_abs_diff <= 1 ULP``).  Falls back to the eager path on non-NPU.
     """
     if time_before_heads:
         B, T, H, D = q.shape
@@ -322,8 +342,11 @@ def apply_rope(
     if D <= 0 or (D % 2) != 0:
         raise ValueError(f"RoPE requires an even last dimension, got D={D}")
 
-    ds = torch.arange(D // 2, device=q.device, dtype=torch.float32)
-    freqs = torch.exp(ds * (-math.log(max_period) * 2 / D))
+    if freqs_cache is not None:
+        freqs = freqs_cache
+    else:
+        ds = torch.arange(D // 2, device=q.device, dtype=torch.float32)
+        freqs = torch.exp(ds * (-math.log(max_period) * 2 / D))
     ts = offset.float().view(-1, 1) + torch.arange(T, device=q.device, dtype=torch.float32)
 
     if time_before_heads:
@@ -333,7 +356,7 @@ def apply_rope(
 
     # Fast path: npu_rotary_mul (fused rotation kernel) on NPU.
     if q.device.type == "npu":
-        import torch_npu
+        torch_npu = _get_torch_npu()
 
         cos_d2 = torch.cos(freqs * ts)  # (..., 1, T, D//2)
         sin_d2 = torch.sin(freqs * ts)
@@ -342,15 +365,15 @@ def apply_rope(
         sin = torch.cat([sin_d2, sin_d2], dim=-1)
         dims = q.shape[:-1]
         # interleaved -> neox: [r0 i0 r1 i1 ...] -> [r0 r1 ... i0 i1 ...]
-        q_neox = q.view(*dims, D // 2, 2).transpose(-1, -2).reshape(*dims, D).contiguous()
-        k_neox = k.view(*dims, D // 2, 2).transpose(-1, -2).reshape(*dims, D).contiguous()
+        q_neox = q.view(*dims, D // 2, 2).transpose(-1, -2).reshape(*dims, D)
+        k_neox = k.view(*dims, D // 2, 2).transpose(-1, -2).reshape(*dims, D)
         # npu_rotary_mul: q_out = q * cos + rotate_half(q) * sin (neox rotation
         # = GPT-J rotation after the layout conversion -- verified bf16-identical).
         qo = torch_npu.npu_rotary_mul(q_neox, cos, sin)
         ko = torch_npu.npu_rotary_mul(k_neox, cos, sin)
-        # neox -> interleaved (back)
-        qo = qo.view(*dims, 2, D // 2).transpose(-1, -2).reshape(*dims, D).contiguous()
-        ko = ko.view(*dims, 2, D // 2).transpose(-1, -2).reshape(*dims, D).contiguous()
+        # Skip neox->interleaved back-conversion: attention QK^T is layout-
+        # independent (dot product sums over D regardless of element order),
+        # and Q/K are both in neox format. Verified bit-identical.
         return qo, ko
 
     # Eager fallback (non-NPU): original 14-op GPT-J rotation in fp32.
@@ -382,6 +405,18 @@ class MossAudioTokenizerRotaryEmbedding(nn.Module):
     def __init__(self, max_period: float = 10000.0):
         super().__init__()
         self.max_period = max_period
+        self._freqs_cache: torch.Tensor | None = None
+
+    def _get_freqs(self, dim: int, device: torch.device) -> torch.Tensor:
+        if (
+            self._freqs_cache is not None
+            and self._freqs_cache.shape[0] == dim // 2
+            and self._freqs_cache.device == device
+        ):
+            return self._freqs_cache
+        ds = torch.arange(dim // 2, device=device, dtype=torch.float32)
+        self._freqs_cache = torch.exp(ds * (-math.log(self.max_period) * 2 / dim))
+        return self._freqs_cache
 
     def forward(
         self,
@@ -390,7 +425,9 @@ class MossAudioTokenizerRotaryEmbedding(nn.Module):
         offset: torch.Tensor,
         time_before_heads: bool = False,
     ):
-        return apply_rope(q, k, offset, self.max_period, time_before_heads)
+        D = q.shape[-1]
+        freqs = self._get_freqs(D, q.device)  # noqa: N806
+        return apply_rope(q, k, offset, self.max_period, time_before_heads, freqs_cache=freqs)
 
 
 # =============================================================================
@@ -510,6 +547,20 @@ class RingKVCache:
             self.end_offset = torch.zeros(batch_size, device=device, dtype=torch.long)
         else:
             self.end_offset = torch.zeros(1, device=device, dtype=torch.long)
+        self._arange_capacity = torch.arange(capacity, device=device, dtype=torch.long)
+
+    def _get_arange_t(self, t_len: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        """Return ``torch.arange(t_len)`` reusing the object-lifetime ``_arange_capacity``.
+
+        ``_arange_capacity`` is allocated once in ``__init__`` and lives for the
+        object's lifetime, so sliced views are safe inside captured CUDA graphs
+        (the underlying storage is never freed).  Falls back to ``torch.arange``
+        only when ``t_len > capacity`` (should not happen in practice since
+        ``T <= capacity`` by construction, but guards against misuse).
+        """
+        if t_len <= self.capacity and dtype == torch.long:
+            return self._arange_capacity[:t_len]
+        return torch.arange(t_len, device=device, dtype=dtype)
 
     def reset(self, reset_mask: torch.Tensor) -> None:
         self.end_offset[:] = torch.where(reset_mask, torch.zeros_like(self.end_offset), self.end_offset)
@@ -539,7 +590,7 @@ class RingKVCache:
             end_offset = self.end_offset.index_select(0, slots)
             row_cache = self.cache.index_select(1, slots)
 
-            indexes = torch.arange(T, device=end_offset.device, dtype=end_offset.dtype)
+            indexes = self._get_arange_t(T, end_offset.device, end_offset.dtype)
             indexes = (indexes + end_offset.view(-1, 1)) % self.capacity
             scatter_indexes = indexes.view(B, 1, T, 1).expand(-1, H, T, D)
             row_cache[0].scatter_(2, scatter_indexes, k)
@@ -549,7 +600,7 @@ class RingKVCache:
             # request even though dense graph operators still execute it.
             self.cache.index_copy_(1, slots, row_cache)
 
-            cache_indexes = torch.arange(self.capacity, device=end_offset.device, dtype=torch.long)
+            cache_indexes = self._arange_capacity
             last_offset = end_offset.view(-1, 1) + T - 1
             end_index = last_offset % self.capacity
             delta = cache_indexes - end_index
@@ -561,10 +612,10 @@ class RingKVCache:
             next_offset = torch.where(valid_rows, end_offset + T, end_offset)
             self.end_offset.index_copy_(0, slots, next_offset)
             invalid = cache_indexes >= next_offset.view(-1, 1)
-            positions = torch.where(invalid, torch.full_like(positions, -1), positions)
+            positions.masked_fill_(invalid, -1)
             return KVCacheResult(row_cache[0], row_cache[1], positions)
 
-        indexes = torch.arange(T, device=self.end_offset.device, dtype=self.end_offset.dtype)
+        indexes = self._get_arange_t(T, self.end_offset.device, self.end_offset.dtype)
         indexes = indexes + self.end_offset.view(-1, 1)
         indexes = indexes % self.capacity
 
@@ -579,7 +630,7 @@ class RingKVCache:
         keys = self.cache[0]
         values = self.cache[1]
 
-        indexes = torch.arange(self.capacity, device=self.end_offset.device, dtype=torch.long)
+        indexes = self._arange_capacity
         last_offset = self.end_offset.view(-1, 1) + T - 1
         end_index = last_offset % self.capacity
         delta = indexes - end_index
@@ -598,7 +649,7 @@ class RingKVCache:
             self.end_offset.add_(T)
 
         invalid = indexes >= self.end_offset.view(-1, 1)
-        positions = torch.where(invalid, torch.full_like(positions, -1), positions)
+        positions.masked_fill_(invalid, -1)
 
         return KVCacheResult(keys, values, positions)
 
@@ -684,6 +735,13 @@ class MossAudioTokenizerMultiheadAttention(StreamingModule):
         self.num_heads = num_heads
         self.weights_per_step = weights_per_step
         self.weights_per_step_schedule = weights_per_step_schedule
+        # Cache arange(T) for causal mask construction — avoids ~92 redundant
+        # kernel launches per decode step (one per attention layer).
+        # Uses a dict keyed by (device, T) so that changing T never releases a
+        # previously allocated tensor — this is critical for CUDA graph safety:
+        # a captured graph bakes in the pointer, so the storage must live as
+        # long as the module (and all captured graphs).
+        self._arange_t_cache: dict[tuple[torch.device, int], torch.Tensor] = {}
 
         out_dim = 3 * embed_dim
         mult = 1
@@ -795,16 +853,39 @@ class MossAudioTokenizerMultiheadAttention(StreamingModule):
         pos_k = pos_k[:, None]
 
         if self.causal:
-            pos_q = offset.view(-1, 1, 1) + torch.arange(T, device=q.device, dtype=torch.long).view(-1, 1)
+            # Reuse cached arange(T) — keyed by (device, T) so that changing
+            # T never frees a previous allocation (CUDA graph safety: a
+            # captured graph bakes in the pointer, so storage must live as
+            # long as the module and all captured graphs).
+            cache_key = (q.device, T)
+            if cache_key not in self._arange_t_cache:
+                self._arange_t_cache[cache_key] = torch.arange(T, device=q.device, dtype=torch.long)
+            pos_q = offset.view(-1, 1, 1) + self._arange_t_cache[cache_key].view(-1, 1)
             delta = pos_q - pos_k
-            attn_bias = (pos_k >= 0) & (delta >= 0)
-            if self.context is not None:
-                attn_bias = attn_bias & (delta < self.context)
-            attn_bias = attn_bias[:, None]
+            # Build mask directly in the convention needed by the active path.
+            # SDPA / streaming_attention use True=attend; npu_fusion_attention
+            # uses True=masked.  On NPU we construct the inverted mask directly
+            # (avoids a ~attn_bias allocation + kernel per layer per step).
+            is_npu = q.device.type == "npu" and q.dtype in (torch.float16, torch.bfloat16)
+            streaming_attention = getattr(self, "_streaming_attention", None)
+            use_npu_path = is_npu and streaming_attention is None
+            if use_npu_path:
+                # NPU convention: True = masked (inverted)
+                attn_bias = (pos_k < 0) | (delta < 0)
+                if self.context is not None:
+                    attn_bias = attn_bias | (delta >= self.context)
+                attn_bias = attn_bias[:, None]
+            else:
+                # SDPA / streaming_attention convention: True = attend
+                attn_bias = (pos_k >= 0) & (delta >= 0)
+                if self.context is not None:
+                    attn_bias = attn_bias & (delta < self.context)
+                attn_bias = attn_bias[:, None]
         else:
             attn_bias = None
+            streaming_attention = getattr(self, "_streaming_attention", None)
+            use_npu_path = False
 
-        streaming_attention = getattr(self, "_streaming_attention", None)
         if (
             streaming_attention is not None
             and attn_bias is not None
@@ -812,6 +893,35 @@ class MossAudioTokenizerMultiheadAttention(StreamingModule):
             and q.shape[-1] == 64
         ):
             x = streaming_attention(q, k, v, attn_bias)
+        elif q.device.type == "npu" and q.dtype in (torch.float16, torch.bfloat16):
+            torch_npu = _get_torch_npu()
+
+            if attn_bias is not None:
+                # attn_bias was already constructed in NPU convention
+                # (True=masked) above, so no ~inversion needed here.
+                # The mask is the sole source of visibility:
+                # pre_tockens=capacity and next_tockens=k.shape[-2] are set
+                # wide enough that they cannot tighten the mask result.
+                atten_mask = attn_bias
+                pre_tockens = attn_bias.shape[-1]
+                next_tockens = k.shape[-2]
+            else:
+                atten_mask = None
+                pre_tockens = T
+                next_tockens = T
+            x = torch_npu.npu_fusion_attention(
+                q,
+                k,
+                v,
+                head_num=self.num_heads,
+                input_layout="BNSD",
+                atten_mask=atten_mask,
+                scale=1.0 / (self.embed_dim // self.num_heads) ** 0.5,
+                keep_prob=1.0,
+                pre_tockens=pre_tockens,
+                next_tockens=next_tockens,
+                sparse_mode=0,
+            )[0]
         else:
             x = F.scaled_dot_product_attention(q, k, v, attn_bias, dropout_p=0.0)
         x = x.transpose(1, 2).reshape(B, T, self.embed_dim)
@@ -943,7 +1053,7 @@ class MossAudioTokenizerTransformerLayer(StreamingModule):
                 update = apply_weights_per_step(self.gating, self.weights_per_step_schedule, x, offset)
             else:
                 update = self.gating(x)
-        return x_orig.to(update) + self.layer_scale_2(update)
+        return x_orig.to(update.dtype) + self.layer_scale_2(update)
 
     def _sa_block(
         self,
@@ -953,7 +1063,7 @@ class MossAudioTokenizerTransformerLayer(StreamingModule):
         x_orig = x
         x = self.norm1(x)
         update = self.self_attn(x, x, x, execution_context=execution_context)
-        return x_orig.to(update) + self.layer_scale_1(update)
+        return x_orig.to(update.dtype) + self.layer_scale_1(update)
 
     def forward(
         self,
@@ -2044,25 +2154,30 @@ class MossAudioTokenizerModel(MossAudioTokenizerPreTrainedModel):
         if codes_lengths is None:
             codes_lengths = torch.full((B,), T, device=device, dtype=torch.long)
 
-        # Keep eager execution and CUDA/NPU Graph capture on the same BF16 path.
-        # Autocast is required on NPU because #5235's decode-LUT uses .float()
-        # for precision, producing float32 embeddings.  Without autocast, these
-        # float32 tensors flow into bf16 LayerNorm weights and NPU's aclnnLayerNorm
-        # rejects the mixed dtype (CUDA auto-casts; NPU does not).
-        with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=device.type != "cpu"):
-            quantizer = cast(MossAudioTokenizerResidualVQ | MossAudioTokenizerResidualLFQ, self.quantizer)
-            zq = quantizer.decode_codes(codes)
+        # Cast quantizer output to the decoder's weight dtype explicitly.
+        # The decoder weights are bf16 (cast in modeling_moss_tts_codec.py), but
+        # the quantizer's decode_codes may return fp32 (e.g. RVQ without a LUT).
+        # Without autocast, NPU's aclnnLayerNorm rejects mixed dtypes; on CUDA,
+        # mixed dtypes cause silent type promotion (fp32 + bf16 -> fp32) through
+        # all ~92 layers, wasting memory and changing numerics.  Explicitly
+        # casting zq once is cheaper than wrapping the entire decoder in autocast
+        # (one cast vs ~92 layers of per-op dispatch overhead) and works for all
+        # quantizer types (RVQ, LFQ+LUT, etc.).
+        quantizer = cast(MossAudioTokenizerResidualVQ | MossAudioTokenizerResidualLFQ, self.quantizer)
+        zq = quantizer.decode_codes(codes)
+        decoder_weight = next(self.decoder.parameters())
+        zq = zq.to(dtype=decoder_weight.dtype)
 
-            d, d_lengths = zq, codes_lengths
-            for decoder_module in self.decoder:
-                if isinstance(decoder_module, StreamingModule):
-                    d, d_lengths = decoder_module(
-                        d,
-                        d_lengths,
-                        execution_context=execution_context,
-                    )
-                else:
-                    d, d_lengths = decoder_module(d, d_lengths)
+        d, d_lengths = zq, codes_lengths
+        for decoder_module in self.decoder:
+            if isinstance(decoder_module, StreamingModule):
+                d, d_lengths = decoder_module(
+                    d,
+                    d_lengths,
+                    execution_context=execution_context,
+                )
+            else:
+                d, d_lengths = decoder_module(d, d_lengths)
 
         d, d_lengths = self._restore_channels_from_codec(d, d_lengths)
         return d, d_lengths
