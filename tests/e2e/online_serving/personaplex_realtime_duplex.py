@@ -35,6 +35,11 @@ SAMPLE_RATE_HZ = 24_000
 FRAME_SAMPLES = 1_920
 FRAME_PERIOD_S = FRAME_SAMPLES / SAMPLE_RATE_HZ
 AUDIO_DELTA_EVENT_TYPES = frozenset({"response.audio.delta", "response.output_audio.delta"})
+TEXT_DELTA_EVENT_TYPES = frozenset(
+    {"response.text.delta", "response.output_text.delta", "response.output_audio_transcript.delta"}
+)
+# The simulated players start this long after their first buffered packet (a jitter buffer).
+PLAYOUT_START_DELAY_S = 0.120
 
 
 class _AudioAcceptanceError(AssertionError):
@@ -586,6 +591,62 @@ def _distribution(values: list[float]) -> dict[str, int | float | None]:
     }
 
 
+def _playout_stall_ms(packet_times: list[float], packet_samples: list[int], start_packet: int) -> float | None:
+    """Total stall of a player that starts PLAYOUT_START_DELAY_S after packet *start_packet* (or the last) arrives."""
+    if not packet_times:
+        return None
+    playout_start = packet_times[min(start_packet, len(packet_times) - 1)] + PLAYOUT_START_DELAY_S
+    stall_s, played = 0.0, 0
+    for received, samples in zip(packet_times, packet_samples, strict=True):
+        # A packet's first sample is due once everything before it has played.
+        stall_s += max(0.0, received - (playout_start + stall_s + played / SAMPLE_RATE_HZ))
+        played += samples
+    return stall_s * 1000
+
+
+def _stream_timing(
+    packet_times: list[float], packet_samples: list[int], sends: list[tuple[float, float, float]]
+) -> dict[str, object]:
+    """Output stream timing against the actual input sends; see ``stream_timing_definition`` in run_load.
+
+    The fit uses only the last frame each packet completes, so chunked output does not bias it. PersonaPlex's
+    first packet is one frame and its first five-frame chunk comes later, so the strict player
+    (``playout_stall_ms``) stalls even at N=1; the steady one starts from the second packet.
+    """
+    completed_at: list[float] = []  # per output frame that has an input frame
+    packet_edges: list[int] = []  # index of the last frame each packet completed
+    total = 0
+    for received, samples in zip(packet_times, packet_samples, strict=True):
+        total += samples
+        frames = min(total // FRAME_SAMPLES, len(sends))
+        if frames > len(completed_at):
+            completed_at.extend([received] * (frames - len(completed_at)))
+            packet_edges.append(frames - 1)
+    references = [sends[k][2] + FRAME_PERIOD_S for k in range(len(completed_at))]
+    lo, hi = int(len(completed_at) * 0.1), math.ceil(len(completed_at) * 0.9)
+    window = [k for k in packet_edges if lo <= k < hi]
+    rtf: float | None = None
+    drift_ms: float | None = None
+    if len(window) >= 2:
+        x = np.array([references[k] for k in window]) - references[window[0]]
+        y = np.array([completed_at[k] for k in window]) - completed_at[window[0]]
+        dx = x - x.mean()
+        if (spread := float(np.sum(dx**2))) > 0:
+            rtf = float(np.sum(dx * (y - y.mean())) / spread)
+            drift_ms = (rtf - 1) * float(x[-1]) * 1000
+    stall_ms = _playout_stall_ms(packet_times, packet_samples, 0)
+    steady_stall_ms = _playout_stall_ms(packet_times, packet_samples, 1)
+    return {
+        "server_stream_rtf": rtf,
+        "stream_lag_drift_ms": drift_ms,
+        "stream_lag_ms": _distribution([(done - ref) * 1000 for done, ref in zip(completed_at, references)]),
+        "playout_stall_ms": stall_ms,
+        "playout_stalled": None if stall_ms is None else stall_ms > 0,
+        "steady_playout_stall_ms": steady_stall_ms,
+        "steady_playout_stalled": None if steady_stall_ms is None else steady_stall_ms > 0,
+    }
+
+
 def _load_metrics(client: RawRealtimeProbe, sends: list[tuple[float, float, float]]) -> dict[str, object]:
     # Use the collector's local clock, never a timestamp supplied by the server.
     packets: list[dict[str, object]] = []
@@ -594,7 +655,13 @@ def _load_metrics(client: RawRealtimeProbe, sends: list[tuple[float, float, floa
     packet_bytes: list[int] = []
     invalid_packets: list[dict[str, object]] = []
     samples = 0
+    first_text_at: float | None = None
     for index, (raw, received) in enumerate(zip(client.events.events, client.events.event_received_at_s, strict=True)):
+        if raw.get("type") in TEXT_DELTA_EVENT_TYPES:
+            delta = raw.get("delta")
+            if first_text_at is None and isinstance(delta, str) and delta.strip():
+                first_text_at = received
+            continue
         if raw.get("type") not in AUDIO_DELTA_EVENT_TYPES:
             continue
         try:
@@ -616,6 +683,9 @@ def _load_metrics(client: RawRealtimeProbe, sends: list[tuple[float, float, floa
     first_send = sends[0][1] if sends else None
     audio_duration = samples / SAMPLE_RATE_HZ
     first_audio_ms = (packet_times[0] - first_send) * 1000 if packet_times and first_send is not None else None
+    first_text_ms = (
+        (first_text_at - first_send) * 1000 if first_text_at is not None and first_send is not None else None
+    )
     client_rtf = (packet_times[-1] - first_send) / audio_duration if audio_duration and first_send is not None else None
     continuity = compute_continuity_stats(packet_times, packet_bytes, SAMPLE_RATE_HZ) if packet_times else None
     lateness = _distribution([max(0.0, sent - planned) * 1000 for planned, sent, _ in sends])
@@ -627,6 +697,7 @@ def _load_metrics(client: RawRealtimeProbe, sends: list[tuple[float, float, floa
         "frame_deficit": None,
         "response_ids": sorted(response_ids),
         "client_first_audio_after_stream_start_ms": first_audio_ms,
+        "client_first_text_after_stream_start_ms": first_text_ms,
         "client_stream_rtf": client_rtf,
         "client_audio_packet_interval_ms": _distribution(intervals),
         "client_send_lateness_ms": lateness,
@@ -634,6 +705,7 @@ def _load_metrics(client: RawRealtimeProbe, sends: list[tuple[float, float, floa
         "audio_underrun_s": continuity.max_underrun_s if continuity else None,
         "audio_underrun_event_count": continuity.underrun_event_count if continuity else None,
         "audio_continuity_ok": continuity.is_continuous if continuity else None,
+        **_stream_timing(packet_times, [size // 2 for size in packet_bytes], sends),
         "input_timeline": [
             {"frame_index": i, "planned_at_s": planned, "send_started_at_s": sent, "send_completed_at_s": completed}
             for i, (planned, sent, completed) in enumerate(sends)
@@ -641,6 +713,15 @@ def _load_metrics(client: RawRealtimeProbe, sends: list[tuple[float, float, floa
         "audio_packet_timeline": packets,
         "invalid_audio_packets": invalid_packets,
     }
+
+
+def _stream_acceptance_error(args: argparse.Namespace, metrics: dict[str, object]) -> str | None:
+    """The first opt-in real-time ceiling the session's stream timing exceeds, if any."""
+    for option, key in (("max_stream_rtf", "server_stream_rtf"), ("max_lag_drift_ms", "stream_lag_drift_ms")):
+        limit, value = getattr(args, option), metrics[key]
+        if limit is not None and isinstance(value, float) and value > limit:
+            return f"{key} exceeds {limit}"
+    return None
 
 
 def _check_load_connection(client: RawRealtimeProbe) -> None:
@@ -671,6 +752,9 @@ async def _paced_load_frames(
     clock: Callable[[], float] = time.monotonic,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
 ) -> None:
+    # A fixed grid, so sleep overshoot and send time do not accumulate. A send completing over a frame past the
+    # next slot restarts the grid one frame after it (no catch-up burst); planned times keep the original grid.
+    grid_start, grid_seq = epoch, 0
     next_send = epoch
     for seq in range(math.ceil(pcm.size / FRAME_SAMPLES)):
         await sleep(max(0.0, next_send - clock()))
@@ -680,8 +764,10 @@ async def _paced_load_frames(
         await asyncio.wait_for(client.send(event), timeout=timeout_s)
         completed = clock()
         sends.append((epoch + seq * FRAME_PERIOD_S, started, completed))
-        # Do not burst to catch up after a stalled send; report accumulated lag.
-        next_send = max(epoch + (seq + 1) * FRAME_PERIOD_S, completed + FRAME_PERIOD_S)
+        next_send = grid_start + (seq + 1 - grid_seq) * FRAME_PERIOD_S
+        if completed - next_send > FRAME_PERIOD_S:
+            grid_start, grid_seq = completed + FRAME_PERIOD_S, seq + 1
+            next_send = grid_start
 
 
 async def _request_load_close(client: RawRealtimeProbe, timeout_s: float) -> None:
@@ -768,6 +854,7 @@ async def _run_load_session(
     rtf = metrics["client_stream_rtf"]
     if args.max_client_rtf is not None and isinstance(rtf, float) and rtf > args.max_client_rtf:
         error = error or f"client_stream_rtf exceeds {args.max_client_rtf}"
+    error = error or _stream_acceptance_error(args, metrics)
     return {
         "index": index,
         "session_id": session_id,
@@ -835,6 +922,8 @@ async def run_load(args: argparse.Namespace) -> dict[str, object]:
         "client_pacing_warning_threshold_ms": FRAME_PERIOD_S * 1000,
         "client_pacing_warning_sessions": [row["index"] for row in rows if row["client_pacing_warning"]],
         "max_client_rtf": args.max_client_rtf,
+        "max_stream_rtf": args.max_stream_rtf,
+        "max_lag_drift_ms": args.max_lag_drift_ms,
         "acceptance": {
             "max_frame_deficit": args.max_frame_deficit,
             "min_voiced_frames": args.min_voiced_frames,
@@ -846,6 +935,13 @@ async def run_load(args: argparse.Namespace) -> dict[str, object]:
         "reported_server": {"revision": args.server_revision, "hardware": args.server_hardware},
         "measurement_origin": "client monotonic clock; admission excluded; streaming and drain retained",
         "interval_definition": "nonempty audio packet arrivals, not server ticks or per-frame inference latency",
+        "stream_timing_definition": (
+            "output frame k completes when cumulative output samples reach k*1920; its reference is the send "
+            "completion of input frame k-1 plus 80 ms; server_stream_rtf is the least-squares slope of completion "
+            "against reference over the 10-90% output-frame window, on the last frame each packet completes; "
+            "playout_stall_ms plays from 120 ms after the first nonempty audio packet (strict), "
+            "steady_playout_stall_ms from 120 ms after the second (the first when there is only one)"
+        ),
     }
     with result_path.open("x", encoding="utf-8") as stream:
         json.dump(result, stream, ensure_ascii=False, indent=2, allow_nan=False)
@@ -908,6 +1004,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--load-frames", type=int, default=1000, help="Maximum input frames per load session (no repetition)."
     )
     parser.add_argument("--max-client-rtf", type=float, help="Optional client stream-window RTF acceptance ceiling.")
+    parser.add_argument("--max-stream-rtf", type=float, help="Optional server_stream_rtf acceptance ceiling.")
+    parser.add_argument("--max-lag-drift-ms", type=float, help="Optional stream_lag_drift_ms acceptance ceiling.")
     parser.add_argument("--server-revision", help="User-reported server commit/version; not verified by this client.")
     parser.add_argument(
         "--server-hardware", help="User-reported server hardware; not inferred from the client machine."
@@ -922,6 +1020,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
                 parser.error(f"{name} must be finite and non-negative (timeout must be positive)")
         if args.max_client_rtf is not None and (not math.isfinite(args.max_client_rtf) or args.max_client_rtf <= 0):
             parser.error("max-client-rtf must be finite and positive")
+        if args.max_stream_rtf is not None and (not math.isfinite(args.max_stream_rtf) or args.max_stream_rtf <= 0):
+            parser.error("max-stream-rtf must be finite and positive")
+        if args.max_lag_drift_ms is not None and (
+            not math.isfinite(args.max_lag_drift_ms) or args.max_lag_drift_ms < 0
+        ):
+            parser.error("max-lag-drift-ms must be finite and non-negative")
         if args.max_frame_deficit < 0 or args.min_voiced_frames < 1 or args.minimum_audio_chunks < 1:
             parser.error("frame-deficit must be non-negative; voiced frames and audio chunks must be positive")
         if not math.isfinite(args.voiced_frame_rms_threshold) or args.voiced_frame_rms_threshold < 0:

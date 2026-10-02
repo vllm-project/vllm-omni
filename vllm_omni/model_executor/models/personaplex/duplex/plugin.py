@@ -94,6 +94,11 @@ class PersonaPlexDuplexPlugin(DuplexModelPlugin):
     #: One codec frame: the runner keeps a model turn clocked with these when the client pauses.
     silence_continuation_samples = FRAME_SIZE
     silence_continuation_sample_rate_hz = SAMPLE_RATE
+    # The Stage 0 worker reads the voice/persona from the runtime config and
+    # never the session config, so no append builds or ships one.
+    plans_from_session_config = False
+    # Every live session appends one 80 ms frame per tick.
+    coalesces_resumable_updates = True
 
     def __init__(self, encode_audio: EncodeAudio) -> None:
         super().__init__(encode_audio)
@@ -139,34 +144,33 @@ class PersonaPlexDuplexPlugin(DuplexModelPlugin):
         final: bool,
         sampling_params: object,
     ) -> DuplexAppendPlan:
-        del sampling_params
+        del session_config, sampling_params, turn_seq, final
         decode_pcm_f32le_payload(payload, sample_rate_hz=SAMPLE_RATE, exact_samples=FRAME_SIZE, model="PersonaPlex")
         normalized_payload = dict(payload)  # type: ignore[call-overload]
         # One scheduler slot per frame; the first append of an epoch also
         # carries the voice/persona prefill (a new epoch is a new Stage 0
         # request with fresh KV, so the worker replays it).
-        prompt_slots = 1 + (prefill_slot_count(runtime_config) if seq <= 1 else 0)
+        first_append = seq <= 1
+        prompt_slots = 1 + (prefill_slot_count(runtime_config) if first_append else 0)
+        # Only what the Stage 0 worker reads: the append identity and the PCM,
+        # and the runtime config (voice, persona) for the first append's prefill.
+        # The worker merges each update into the request's buffer.
+        duplex: dict[str, object] = {
+            "data_plane": True,
+            "session_id": fence.session_id,
+            "epoch": fence.epoch,
+            "seq": seq,
+            "payload": normalized_payload,
+        }
+        if first_append:
+            duplex["runtime_config"] = dict(runtime_config)
         return DuplexAppendPlan(
             prompt={
                 "prompt_token_ids": [0] * prompt_slots,
                 "model_intermediate_buffer": {
                     "request_id": request_id,
                     "global_request_id": [fence.session_id],
-                    "duplex": {
-                        "data_plane": True,
-                        "fence": fence,
-                        "session_id": fence.session_id,
-                        "epoch": fence.epoch,
-                        "turn_id": fence.turn_id,
-                        "seq": seq,
-                        "turn_seq": turn_seq,
-                        "mode": "append_audio_chunk",
-                        "payload": normalized_payload,
-                        "final": final,
-                        "session_config": dict(session_config),
-                        "runtime_config": dict(runtime_config),
-                        "scheduler_token_budget": prompt_slots,
-                    },
+                    "duplex": duplex,
                 },
             }
         )

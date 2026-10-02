@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import base64
 from collections.abc import Mapping
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, field, fields
 from typing import TYPE_CHECKING, ClassVar
 
 from vllm_omni.protocol.duplex import RealtimeProtocolError
@@ -102,9 +102,13 @@ class AppendAudio(DuplexCommand, _duplex_wire.AppendAudio):
     type: ClassVar[str] = "input_audio_buffer.append"
     #: Empty ``audio`` with ``video_frames`` is legal when capabilities allow video without audio.
     audio: bytes = b""
+    #: The base64 text ``audio`` was decoded from, when the transport had it.
+    #: ``payload`` reuses it instead of encoding every frame again.
+    audio_base64: str | None = field(default=None, repr=False, compare=False)
 
     def payload(self) -> dict[str, object]:
         data = DuplexCommand.payload(self)
+        data.pop("audio_base64", None)
         hints = data.pop("hints", None)
         if isinstance(hints, Mapping):
             # Hints are raw wire values; the typed fields went through
@@ -117,7 +121,9 @@ class AppendAudio(DuplexCommand, _duplex_wire.AppendAudio):
             merged.update(data)
             data = merged
         if self.audio:
-            data["audio"] = base64.b64encode(self.audio).decode("ascii")
+            data["audio"] = (
+                self.audio_base64 if self.audio_base64 is not None else base64.b64encode(self.audio).decode("ascii")
+            )
         else:
             data.pop("audio", None)
         if not data.get("video_frames"):

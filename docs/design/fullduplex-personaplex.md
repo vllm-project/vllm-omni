@@ -164,12 +164,16 @@ aborted scheduler request resets and returns only that session's encoder.
 
 ### Stage 1 streaming decoder
 
-`PersonaPlexCode2Wav` runs eager (`enforce_eager: true` in the deploy) and
-maintains an independent streaming Mimi decoder for every active request,
-keyed by the Stage 1 request id and released by `on_requests_finished`. Each
-Stage 0 segment emits de-delayed agent codebooks; Stage 1 decodes only the new
-code frames and emits only the new PCM suffix. Connector chunk boundaries
-retain the final raw code frame needed to de-delay the next chunk.
+`PersonaPlexCode2Wav` serves every session from one shared streaming Mimi
+decoder with one row per session plus a scratch row for a request without an
+id. A Stage 1 request id leases a row on its first chunk, and
+`on_requests_finished` resets and releases it. Each Stage 0 segment emits
+de-delayed agent codebooks; Stage 1 decodes only the new code frames, one
+`decode_frame` call per frame index across all rows, and emits only the new PCM
+suffix. The stage keeps `enforce_eager: true`, since vLLM's own capture records
+nothing for it; with `mimi_cuda_graphs` in its `hf_overrides` each
+`decode_frame` call replays a CUDA graph captured at load. Connector chunk
+boundaries retain the final raw code frame needed to de-delay the next chunk.
 
 ### Data-plane projector
 

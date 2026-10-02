@@ -305,6 +305,16 @@ class DuplexOmniEngine(AsyncOmniEngine):
             ) from exc
 
     async def submit_command_async(self, session_id: str, command: DuplexCommand) -> None:
+        # Every audio frame comes through here, so an accepted command skips the
+        # executor round trip. Only a full queue (or a dead engine) takes the
+        # blocking path; callers await each submit, so none is overtaken.
+        if self.is_alive():
+            message = DuplexSessionCommandMessage(session_id=session_id, command=command)
+            try:
+                self.request_queue.sync_q.put_nowait(message)
+                return
+            except queue.Full:
+                pass
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, lambda: self._submit_command(session_id, command))
 

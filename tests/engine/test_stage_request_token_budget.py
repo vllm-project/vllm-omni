@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Token-budget clamping when the orchestrator builds a stage request."""
 
 from __future__ import annotations
@@ -72,3 +72,17 @@ class TestStageRequestTokenBudget:
         )
 
         assert request.sampling_params.max_tokens == 4000
+
+    def test_adjusted_params_are_cloned_and_the_caller_copy_is_untouched(self):
+        params = SamplingParams(min_tokens=0)
+        params.max_tokens = None
+
+        request = build_engine_core_request_from_tokens(
+            request_id="req-adjusted",
+            prompt={"prompt_token_ids": [0] * 96},
+            params=params,
+            model_config=_StageModelConfig(),
+        )
+
+        assert request.sampling_params is not params
+        assert params.max_tokens is None

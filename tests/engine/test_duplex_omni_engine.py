@@ -53,6 +53,9 @@ class _FakeSyncQueue:
             raise queue.Full
         self.items.append(item)
 
+    def put_nowait(self, item: Any) -> None:
+        self.put(item)
+
 
 def _engine(result: Any, *, alive: bool = True, full: bool = False) -> DuplexOmniEngine:
     engine = object.__new__(DuplexOmniEngine)

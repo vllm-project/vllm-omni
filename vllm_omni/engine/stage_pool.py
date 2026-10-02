@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
 
 from vllm.logger import init_logger
+from vllm.sampling_params import RequestOutputKind
 from vllm.v1.engine import EngineCoreOutputs
 from vllm.v1.metrics.stats import IterationStats
 
@@ -143,6 +144,10 @@ class StagePool:
         self._non_empty_first_output_timestamps_by_request: dict[str, float] = {}
         self._audio_frames_by_request: dict[str, int] = {}
         self._audio_sample_rate_by_request: dict[str, int] = {}
+        # CUMULATIVE requests (each output holds all audio so far) and the audio
+        # frames each already reported in earlier per-segment metrics events.
+        self._cumulative_output_requests: set[str] = set()
+        self._reported_audio_frames_by_request: dict[str, int] = {}
 
         # Distributed-mode state. Populated by add_client / remove_client.
         self._addr_to_replica_id: dict[str, int] = {}
@@ -526,6 +531,8 @@ class StagePool:
         self._non_empty_first_output_timestamps_by_request.pop(str(request_id), None)
         self._audio_frames_by_request.pop(str(request_id), None)
         self._audio_sample_rate_by_request.pop(str(request_id), None)
+        self._cumulative_output_requests.discard(str(request_id))
+        self._reported_audio_frames_by_request.pop(str(request_id), None)
 
     def release_bindings(self, request_ids: list[str]) -> None:
         """Drop route bindings for the given request ids in this stage."""
@@ -663,6 +670,16 @@ class StagePool:
         accumulated_audio_frames = self._audio_frames_by_request.pop(request_id, 0) if request_id else 0
         accumulated_audio_sample_rate = self._audio_sample_rate_by_request.pop(request_id, 0) if request_id else 0
         audio_generated_frames = max(accumulated_audio_frames, current_audio_frames)
+        if request_id in self._cumulative_output_requests:
+            # Both counts are the request's whole audio so far; this event
+            # reports only what came after the request's previous event.
+            reported_audio_frames = self._reported_audio_frames_by_request.get(request_id, 0)
+            if audio_generated_frames > reported_audio_frames:
+                self._reported_audio_frames_by_request[request_id] = audio_generated_frames
+            audio_generated_frames = max(audio_generated_frames - reported_audio_frames, 0)
+        if output_unit_type == "audio" and (current_audio_frames > 0 or accumulated_audio_frames > 0):
+            # An audio event's units are the frames it reports, not the audio of its output.
+            output_unit_count = audio_generated_frames
         audio_sample_rate = accumulated_audio_sample_rate or current_audio_sample_rate
         audio_duration_s = (
             float(audio_generated_frames) / float(audio_sample_rate)
@@ -896,10 +913,10 @@ class StagePool:
         if final_output_type == "text":
             return any(bool(getattr(output, "text", "")) for output in getattr(request_output, "outputs", None) or [])
 
-        if getattr(request_output, "images", None):
-            return True
-        if getattr(request_output, "video", None) or getattr(request_output, "videos", None):
-            return True
+        # Payloads may be arrays or tensors, whose truth value is ambiguous.
+        for name in ("images", "video", "videos"):
+            if self._is_non_empty_value(getattr(request_output, name, None)):
+                return True
         if getattr(request_output, "trajectory_latents", None) is not None:
             return True
         custom_output = getattr(request_output, "_custom_output", None)
@@ -973,9 +990,21 @@ class StagePool:
                 use_default_sample_rate=False,
             )
             if audio_frames > 0:
-                self._audio_frames_by_request[rid] = self._audio_frames_by_request.get(rid, 0) + audio_frames
+                if rid in self._cumulative_output_requests:
+                    # A CUMULATIVE output already holds the earlier outputs' audio.
+                    self._audio_frames_by_request[rid] = audio_frames
+                else:
+                    self._audio_frames_by_request[rid] = self._audio_frames_by_request.get(rid, 0) + audio_frames
             if self._audio_sample_rate_by_request.get(rid, 0) <= 0 and audio_sample_rate > 0:
                 self._audio_sample_rate_by_request[rid] = audio_sample_rate
+
+    def _note_output_kind(self, request_id: str, request: Any) -> None:
+        """Remember whether *request*'s outputs are CUMULATIVE (for audio frame counts)."""
+        sampling_params = getattr(request, "sampling_params", None)
+        if getattr(sampling_params, "output_kind", None) == RequestOutputKind.CUMULATIVE:
+            self._cumulative_output_requests.add(str(request_id))
+        else:
+            self._cumulative_output_requests.discard(str(request_id))
 
     # ---- Stage-local admission ----
 
@@ -1031,6 +1060,7 @@ class StagePool:
         except Exception:
             self.release_binding(request_id)
             raise
+        self._note_output_kind(request_id, request)
 
         try:
             await self._llm_client(replica_id).add_request_async(request, **submit_kwargs)
@@ -1058,8 +1088,13 @@ class StagePool:
         *,
         prompt_text: Any = None,
         submit_kwargs: dict[str, Any] | None = None,
+        coalesce: bool = False,
     ) -> int:
-        """Submit a streaming update to an already admitted request."""
+        """Submit a streaming update to an already admitted request.
+
+        With *coalesce*, a client that supports it queues the update for this
+        loop turn's coalesced ADD (``StageEngineCoreClient.add_request_coalesced``).
+        """
         submit_kwargs = submit_kwargs or {}
         params = req_state.sampling_params_list[self.stage_id]
         if self.stage_type == "diffusion":
@@ -1080,6 +1115,7 @@ class StagePool:
                 )
             await self._diffusion_client(replica_id).add_request_async(request_id, request, params, **submit_kwargs)
         else:
+            self._note_output_kind(request_id, request)
             # Refresh the shared output-processor state before yielding to the
             # stage client so streaming segments are merged against the latest
             # prompt/token metadata.
@@ -1091,7 +1127,13 @@ class StagePool:
                     request_index=0,
                     queue=None,
                 )
-                await self._llm_client(replica_id).add_request_async(request, **submit_kwargs)
+                llm_client = self._llm_client(replica_id)
+                add_coalesced = getattr(llm_client, "add_request_coalesced", None)
+                coalescable = not submit_kwargs and not getattr(request, "mm_features", None)
+                if coalesce and coalescable and callable(add_coalesced):
+                    add_coalesced(request)
+                else:
+                    await llm_client.add_request_async(request, **submit_kwargs)
             except Exception:
                 rollback = getattr(self.output_processor, "remove_request", None)
                 if callable(rollback):

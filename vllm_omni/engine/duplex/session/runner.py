@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import time
 import uuid
+from collections import deque
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, TypeVar
@@ -125,6 +126,29 @@ class _Internal:
 
 _CANCEL_EVENTS = frozenset({"input.cancel", "response.cancel", "barge_in", "output_audio_buffer.clear"})
 
+# Largest base64 PCM16 payload converted on the loop (~3 s at 16 kHz). Larger
+# appends, G.711 and resampling still go to the session executor.
+_INLINE_CONVERSION_MAX_CHARS = 128 * 1024
+
+
+def _input_conversion_runs_inline(audio: object, fmt: object, sample_rate_hz: object) -> bool:
+    """Whether ``convert_input_audio_with_rate`` is a no-op or a small PCM16 re-encode at 16 kHz.
+
+    For an 80 ms frame that is cheaper than the executor round trip (thread
+    wakeup, GIL handoffs, a serial wait per session).
+    """
+    if not isinstance(audio, str) or not isinstance(fmt, str):
+        return True
+    normalized = fmt.lower()
+    if normalized in {"g711_ulaw", "g711_alaw"}:
+        return False
+    if normalized not in {"pcm16", "pcm_s16le", "s16le"}:
+        return True
+    # Mirrors the converter: it resamples only a numeric rate off 16 kHz.
+    return len(audio) <= _INLINE_CONVERSION_MAX_CHARS and (
+        not isinstance(sample_rate_hz, int | float) or int(sample_rate_hz) == 16_000
+    )
+
 
 def compute_silence_continuation_deadline(
     *,
@@ -180,6 +204,14 @@ class DuplexSessionRunner:
         self.model_state: DuplexModelSessionState = session.model_state
         self.tasks = DuplexSessionTasks()
         self._mailbox: asyncio.Queue[DuplexCommand | StageOutput | _Internal] = asyncio.Queue()
+        #: Mailbox items the worker has taken, and whether it is handling one.
+        self._taken = 0
+        self._handling = False
+        #: Stage metrics snapshots waiting to be folded, each tagged with the
+        #: number of mailbox items put before it; it folds once that many are
+        #: handled, as if it were a mailbox item, without a worker wakeup.
+        self._deferred_stage_metrics: deque[tuple[int, dict[str, dict[str, object]]]] = deque()
+        self._stage_metrics_fold_requested = False
         self._worker: asyncio.Task[None] | None = None
         self._worker_stopped = False
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -293,7 +325,31 @@ class DuplexSessionRunner:
         snapshot = self.model.stage_metrics_snapshot(stage_id, metrics, output)
         if snapshot is None or self.run.closing or self.session.state == DuplexSessionState.CLOSED:
             return
-        self._mailbox.put_nowait(_Internal("stage_metrics", {"stage_metrics": snapshot}))
+        # Ordered with the mailbox as if it were an item put now (see
+        # _deferred_stage_metrics), but without waking the worker for it.
+        tag = self._taken + self._mailbox.qsize()
+        self._deferred_stage_metrics.append((tag, snapshot))
+        if tag == self._taken and not self._handling and not self._stage_metrics_fold_requested:
+            # The worker is idle: nothing else will reach this snapshot's turn.
+            self._stage_metrics_fold_requested = True
+            asyncio.get_running_loop().call_soon(self._fold_idle_stage_metrics)
+
+    def _fold_idle_stage_metrics(self) -> None:
+        self._stage_metrics_fold_requested = False
+        if self._worker_stopped or self._handling:
+            return
+        self._fold_deferred_stage_metrics()
+
+    def _fold_deferred_stage_metrics(self) -> None:
+        """Fold every snapshot put before the mailbox item the worker takes next."""
+        deferred = self._deferred_stage_metrics
+        while deferred and deferred[0][0] <= self._taken:
+            _, snapshot = deferred.popleft()
+            try:
+                self.session.stash_stage_metrics(snapshot)
+            except Exception as exc:
+                logger.exception("Duplex session %s failed folding stage metrics: %s", self.session.session_id, exc)
+                self._emit_error("internal_error", str(exc))
 
     def on_stage_failure(self, stage_id: int, exc: BaseException, *, request_id: str | None = None) -> None:
         """A stage rejected this session's request: fail the owning response.
@@ -443,7 +499,13 @@ class DuplexSessionRunner:
 
     async def _run(self) -> None:
         while not self._worker_stopped:
+            # Snapshots stashed while the previous item ran, then (after the
+            # wait) those stashed while the worker was parked.
+            self._fold_deferred_stage_metrics()
             item = await self._mailbox.get()
+            self._fold_deferred_stage_metrics()
+            self._taken += 1
+            self._handling = True
             try:
                 await self._handle_item(item)
             except asyncio.CancelledError:
@@ -451,6 +513,8 @@ class DuplexSessionRunner:
             except Exception as exc:
                 logger.exception("Duplex session %s failed handling %r: %s", self.session.session_id, item, exc)
                 self._emit_error("internal_error", str(exc))
+            finally:
+                self._handling = False
 
     async def _stop_worker(self) -> None:
         worker = self._worker
@@ -498,11 +562,6 @@ class DuplexSessionRunner:
         await self._on_command(item)
 
     async def _on_internal(self, item: _Internal) -> None:
-        if item.kind == "stage_metrics":
-            stage_metrics = item.payload.get("stage_metrics")
-            if isinstance(stage_metrics, Mapping):
-                self.session.stash_stage_metrics(stage_metrics)
-            return
         if item.kind == "promote_deferred_overlap":
             if self.run.closing or self.session.state != DuplexSessionState.OPEN:
                 return
@@ -836,12 +895,16 @@ class DuplexSessionRunner:
             vad_result = None
         else:
             try:
-                converted: tuple[object, object, int | float | None] = await self.offload(
-                    convert_input_audio_with_rate,
-                    audio,
-                    fmt,
-                    sample_rate_hz=sample_rate_hz,
-                )
+                converted: tuple[object, object, int | float | None]
+                if _input_conversion_runs_inline(audio, fmt, sample_rate_hz):
+                    converted = convert_input_audio_with_rate(audio, fmt, sample_rate_hz=sample_rate_hz)
+                else:
+                    converted = await self.offload(
+                        convert_input_audio_with_rate,
+                        audio,
+                        fmt,
+                        sample_rate_hz=sample_rate_hz,
+                    )
             except ValueError as exc:
                 self._emit_error("bad_event", str(exc))
                 return

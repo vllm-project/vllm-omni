@@ -101,7 +101,10 @@ def _event_driven_orch_enabled(*, default: bool = False) -> bool:
 
 def _event_driven_orch_default_for_pipeline(pipeline_model_type: str | None) -> bool:
     """Return whether a pipeline has a validated event-driven default."""
-    return pipeline_model_type == "qwen3_tts"
+    # PersonaPlex serves every live duplex session as one resumable Stage 0
+    # request that appends an 80 ms frame per step, and the loop that routes
+    # those outputs also runs every session's runner.
+    return pipeline_model_type in ("qwen3_tts", "personaplex")
 
 
 def _build_terminal_empty_output(
@@ -153,9 +156,13 @@ def build_engine_core_request_from_tokens(
     sampling_params = None
     pooling_params = None
     if isinstance(params, SamplingParams):
-        sampling_params = params.clone()
+        # Clone (a deep copy, built per appended chunk) only to adjust a field;
+        # the request is serialized to the stage and nothing mutates its params.
+        sampling_params = params
         if model_config is not None:
             remaining = model_config.max_model_len - len(prompt_token_ids)
+            if params.max_tokens is None or params.min_tokens > remaining:
+                sampling_params = params.clone()
             if sampling_params.max_tokens is None:
                 sampling_params.max_tokens = remaining
             # ``check_stop`` returns early while ``min_tokens`` is unmet, so a
@@ -1077,6 +1084,9 @@ class OrchestratorBase:
                     ):
                         await asyncio.sleep(0.001)
                         continue
+                    # Same dict pooling-output restore as the legacy poll
+                    # (StagePool._poll_stage_raw).
+                    StagePool._rehydrate_pooling_output_payloads(raw_outputs)
                     await ready_q.put(("llm", stage_id, replica_id, raw_outputs))
                     self._orch_monitor.set_dispatch_queue_size(ready_q.qsize())
             except asyncio.CancelledError:

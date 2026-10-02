@@ -17,7 +17,7 @@ from vllm.v1.request import Request, RequestStatus
 
 from vllm_omni.core.sched.omni_ar_scheduler import OmniARScheduler
 from vllm_omni.core.sched.omni_generation_scheduler import OmniGenerationScheduler
-from vllm_omni.data_entry_keys import CodesStruct, MetaStruct, OmniPayload, OmniPayloadStruct
+from vllm_omni.data_entry_keys import SKIP_TRANSFER, CodesStruct, MetaStruct, OmniPayload, OmniPayloadStruct, to_dict
 from vllm_omni.distributed.omni_connectors.adapter import construct_next_stage_streaming_input_prompt
 from vllm_omni.distributed.omni_connectors.connectors.shm_connector import SharedMemoryConnector
 from vllm_omni.distributed.omni_connectors.transfer_adapter.base import OmniTransferAdapterBase
@@ -136,6 +136,48 @@ def test_recv_loop_does_not_recreate_mapping_for_cancelled_entry(build_adapter):
     connector.get.assert_not_called()
     assert not adapter.request_ids_mapping
     assert not adapter._pending_load_reqs
+
+
+def test_a_key_missing_from_the_receive_listing_is_read_next_pass(build_adapter, monkeypatch):
+    """A pass of 16 polls reads from one listing; a segment created after it waits one pass."""
+    adapter, _ = build_adapter(stage_id=1, model_mode="generation")
+    receiver = SharedMemoryConnector({"stage_id": 1})
+    sender = SharedMemoryConnector({"stage_id": 0})
+    adapter.connector = receiver
+    prefix = f"pass_{uuid.uuid4().hex}"
+    requests = [_req(f"req-{index}", RequestStatus.WAITING, external_req_id=f"{prefix}_{index}") for index in range(16)]
+    late = requests[5]
+    finished_after_pass = []
+
+    def list_then_put():
+        listing = SharedMemoryConnector.present_keys()
+        if not finished_after_pass:
+            chunk = {
+                "codes": {"audio": torch.tensor([[1]], dtype=torch.long)},
+                "meta": {"left_context_size": 0, "finished": torch.tensor(False, dtype=torch.bool)},
+            }
+            assert sender.put("0", "1", f"{late.external_req_id}_0_0", chunk)[0]
+        return listing
+
+    def end_pass():
+        OmniChunkTransferAdapter._end_recv_pass(adapter)
+        finished_after_pass.append(set(adapter._finished_load_reqs))
+        if len(finished_after_pass) == 2:
+            adapter.stop_event.set()
+
+    try:
+        for request in requests:
+            adapter.load_async(request)
+        monkeypatch.setattr(receiver, "present_keys", list_then_put)
+        monkeypatch.setattr(adapter, "_end_recv_pass", end_pass)
+
+        adapter.recv_loop()
+
+        # The first pass's listing predates the segment; the second lists it.
+        assert finished_after_pass == [set(), {late.request_id}]
+    finally:
+        receiver.close()
+        sender.close()
 
 
 def test_idle_save_loop_reaps_consumed_shm(shm_sender):
@@ -1195,6 +1237,27 @@ def test_background_send_uses_enqueued_request_snapshot(build_adapter):
     ]
 
 
+@pytest.mark.parametrize("prompt_token_ids", [list(range(4096)), (1, 2, 3), None])
+def test_snapshot_freezes_prompt_ids_exactly_like_the_elementwise_walk(prompt_token_ids):
+    request = SimpleNamespace(
+        prompt_token_ids=prompt_token_ids,
+        additional_information={"ids": {"prompt": [5, 6]}, "meta": {"segment": "old"}},
+        _all_token_ids=[1, 2],
+        _output_token_ids=[2],
+    )
+
+    snapshot = OmniChunkTransferAdapter._snapshot_processor_request(request)
+
+    assert snapshot.prompt_token_ids == prompt_token_ids
+    assert type(snapshot.prompt_token_ids) is type(prompt_token_ids)
+    if isinstance(prompt_token_ids, list):
+        assert snapshot.prompt_token_ids is not prompt_token_ids
+        prompt_token_ids.append(-1)
+        assert snapshot.prompt_token_ids[-1] == 4095
+    assert snapshot.additional_information == request.additional_information
+    assert snapshot.additional_information["ids"]["prompt"] is not request.additional_information["ids"]["prompt"]
+
+
 def test_save_without_custom_processor_does_not_snapshot_request(build_adapter, mocker):
     adapter, _ = build_adapter(stage_id=1)
     request = _req("req-direct", RequestStatus.RUNNING, external_req_id="ext-direct")
@@ -1208,6 +1271,69 @@ def test_save_without_custom_processor_does_not_snapshot_request(build_adapter, 
 
     snapshot.assert_not_called()
     assert adapter._pending_save_reqs.popleft()["request"] is request
+
+
+def test_a_save_batch_holds_wakeups_only_for_a_batching_processor(build_adapter):
+    adapter, _ = build_adapter(stage_id=0)
+    notify = adapter._save_cond.notify = Mock()
+    requests = [_req(f"req-{i}", RequestStatus.RUNNING, external_req_id=f"ext-{i}") for i in range(2)]
+
+    # Without process_batch the bracket is a no-op: every save wakes the sender at once.
+    adapter.begin_save_batch()
+    for request in requests:
+        adapter.save_async(multimodal_output=None, request=request)
+    assert notify.call_count == 2
+    adapter.end_save_batch()
+    assert notify.call_count == 2
+
+    def processor(**kwargs):
+        return None
+
+    processor.process_batch = lambda transfer_manager, items: [None] * len(items)
+    processor.request_fields = ("resumable", "additional_information")
+    adapter.custom_process_next_stage_input_func = processor
+    notify.reset_mock()
+    adapter.begin_save_batch()
+    for i in range(2):
+        adapter.save_async(
+            multimodal_output=None, request=_req(f"req-b{i}", RequestStatus.RUNNING, external_req_id=f"ext-b{i}")
+        )
+    # A batching processor's saves wait for the end of the step, then wake the sender once.
+    notify.assert_not_called()
+    adapter.end_save_batch()
+    notify.assert_called_once()
+    # A save outside a batch wakes the sender by itself.
+    adapter.save_async(
+        multimodal_output=None, request=_req("req-late", RequestStatus.RUNNING, external_req_id="ext-late")
+    )
+    assert notify.call_count == 2
+
+
+def test_declared_request_fields_are_frozen_at_save_time(build_adapter):
+    adapter, _ = build_adapter(stage_id=0)
+
+    def processor(**kwargs):
+        return None
+
+    processor.request_fields = ("resumable", "additional_information")
+    adapter.custom_process_next_stage_input_func = processor
+    request = Request(
+        request_id="req-view",
+        prompt_token_ids=[0],
+        sampling_params=SamplingParams(max_tokens=8),
+        pooling_params=None,
+        resumable=True,
+    )
+    request.external_req_id = "ext-view"
+    request.additional_information = {"meta": {"segment": "old"}}
+
+    adapter.save_async(multimodal_output=None, request=request)
+    request.additional_information["meta"]["segment"] = "next"
+
+    # The ids the sender reads and the declared fields, as they were at the call.
+    view = adapter._pending_save_reqs.popleft()["request"]
+    assert (view.request_id, view.external_req_id, view.resumable) == ("req-view", "ext-view", True)
+    assert view.additional_information == {"meta": {"segment": "old"}}
 
 
 def test_send_single_request_terminal_chunk_still_flushes_processor(build_adapter, monkeypatch):
@@ -1266,7 +1392,8 @@ def test_send_single_request_struct_without_meta_does_not_crash(build_adapter, m
 def test_send_single_request_empty_struct_goes_on_wire(build_adapter, monkeypatch):
     """Pin the contract: an explicitly empty ``OmniPayloadStruct()`` passes
     the ``payload_data is None`` check and gets sent. To skip a chunk, the
-    producer must return ``None``, not an empty struct. (Filtering empty
+    producer must return ``None`` (or ``SKIP_TRANSFER``, which also withholds
+    a resumable segment marker), not an empty struct. (Filtering empty
     structs at the adapter would require introspecting all struct fields on
     every send and was rejected for cost vs. value.)
     """
@@ -1320,7 +1447,52 @@ def test_send_single_request_respects_processor_receiver_boundary(build_adapter,
     assert sent_payload.meta.is_segment_finished.item() is False
 
 
-def test_send_single_request_personaplex_pending_frame_is_not_segment_boundary(
+@pytest.mark.parametrize("is_segment_finished", [False, True])
+def test_send_single_request_skip_transfer_does_not_put(build_adapter, is_segment_finished):
+    adapter, connector = build_adapter(stage_id=0)
+    request = _req("req-skip", RequestStatus.RUNNING, external_req_id="ext-skip")
+    request.resumable = True
+    adapter.custom_process_next_stage_input_func = lambda **kwargs: SKIP_TRANSFER
+    adapter.put_req_chunk["ext-skip"] = 3
+    adapter.ramp_chunk_count["ext-skip"] = 2
+    adapter.code_prompt_token_ids["ext-skip"].append(torch.tensor([1]))
+
+    adapter.save_async(None, request, is_segment_finished=is_segment_finished)
+    task = adapter._pending_save_reqs.popleft()
+    sender_token = task["sender_token"]
+    adapter._send_single_request(task)
+
+    connector.put.assert_not_called()
+    assert adapter.put_req_chunk["ext-skip"] == 3
+    assert sender_token.num_puts == 0
+    assert not sender_token.in_flight
+    assert adapter._sender_tokens["ext-skip"] is sender_token
+    # A segment boundary still drops the sender's segment-local state, as it
+    # does after a put.
+    assert ("ext-skip" in adapter.ramp_chunk_count) is not is_segment_finished
+    assert ("ext-skip" in adapter.code_prompt_token_ids) is not is_segment_finished
+    assert not adapter._send_failures
+
+
+def test_send_single_request_never_skips_the_request_terminal(build_adapter, monkeypatch):
+    adapter, connector = build_adapter(stage_id=0)
+    request = _req("req-skip-terminal", RequestStatus.FINISHED_STOPPED, external_req_id="ext-skip-terminal")
+    adapter.custom_process_next_stage_input_func = lambda **kwargs: SKIP_TRANSFER
+    monkeypatch.setattr(adapter, "cleanup", lambda *a, **kw: None)
+
+    adapter.save_async(None, request)
+    task = adapter._pending_save_reqs.popleft()
+    assert task["is_finished"] is True
+    adapter._send_single_request(task)
+
+    connector.put.assert_called_once()
+    assert connector.put.call_args.kwargs["put_key"] == "ext-skip-terminal_0_0"
+    sent_payload = connector.put.call_args.kwargs["data"]
+    assert sent_payload.meta.finished.item() is True
+    assert not adapter._sender_tokens["ext-skip-terminal"].terminal_pending
+
+
+def test_send_single_request_personaplex_pending_frame_sends_nothing(
     build_adapter,
 ):
     from vllm_omni.model_executor.stage_input_processors.personaplex import (
@@ -1356,10 +1528,84 @@ def test_send_single_request_personaplex_pending_frame_is_not_segment_boundary(
         }
     )
 
-    sent_payload = connector.put.call_args.kwargs["data"]
-    assert sent_payload.codes is None
-    assert sent_payload.meta.finished.item() is False
-    assert sent_payload.meta.is_segment_finished.item() is False
+    # The frame only buffers the de-delay tail: no put and no segment marker,
+    # and the chunk key stays free for the first real chunk.
+    connector.put.assert_not_called()
+    assert adapter.put_req_chunk["ext-personaplex"] == 0
+    assert adapter.request_payload["ext-personaplex"]["personaplex_frames"][0].equal(torch.arange(8))
+
+
+class _InMemoryConnector:
+    """Connector pair sharing one key space; ``get`` consumes like SHM."""
+
+    def __init__(self, stage_id: int, store: dict, extra: dict | None = None) -> None:
+        self.stage_id = stage_id
+        self.config = {"extra": extra or {}}
+        self.store = store
+        self.put_keys: list[str] = []
+
+    def put(self, from_stage, to_stage, put_key, data):
+        assert put_key not in self.store
+        self.store[put_key] = to_dict(data)
+        self.put_keys.append(put_key)
+        return True, 1, {}
+
+    def get(self, from_stage, to_stage, get_key, metadata=None):
+        if get_key not in self.store:
+            return None
+        return self.store.pop(get_key), 1
+
+
+def test_personaplex_resumable_stream_puts_only_data_chunks_in_order(build_adapter, monkeypatch):
+    from vllm_omni.model_executor.stage_input_processors.personaplex import (
+        talker2code2wav_async_chunk,
+    )
+
+    extra = {"initial_codec_chunk_frames": 1, "codec_chunk_frames": 5}
+    store: dict = {}
+    sender, _ = build_adapter(stage_id=0, connector_extra=extra)
+    sender.connector = _InMemoryConnector(0, store, extra)
+    sender.custom_process_next_stage_input_func = talker2code2wav_async_chunk
+    monkeypatch.setattr(sender, "cleanup", lambda *a, **kw: None)
+    receiver, _ = build_adapter(stage_id=1, model_mode="generation")
+    receiver.connector = _InMemoryConnector(1, store)
+
+    request = _req("req-stream", RequestStatus.WAITING, external_req_id="ext-stream")
+    request.resumable = True
+    downstream = _req("req-code2wav", RequestStatus.WAITING, external_req_id="ext-stream")
+    frames = [torch.arange(8, dtype=torch.long).reshape(1, 8) + 100 * i for i in range(13)]
+    received: list[list[int]] = []
+    entry = _dequeue_load_entry(receiver, downstream)
+    for index, frame in enumerate(frames):
+        terminal = index == len(frames) - 1
+        if terminal:
+            request.resumable = False
+            request.status = RequestStatus.FINISHED_STOPPED
+        request.additional_information = {"codes": {"audio": frame}}
+        # Every duplex frame ends a resumable stage 0 segment.
+        sender._send_single_request(
+            {
+                "multimodal_output": None,
+                "request": request,
+                "is_finished": terminal,
+                "is_segment_finished": not terminal,
+            }
+        )
+        while receiver._poll_single_request(entry):
+            received.append(list(downstream.prompt_token_ids))
+            entry = _dequeue_load_entry(receiver, downstream)
+
+    # Initial chunk after frame 1, then every 5 frames, then the terminal tail.
+    assert sender.connector.put_keys == [f"ext-stream_0_{i}" for i in range(4)]
+    assert not store
+    raw = torch.cat(frames, dim=0)
+    dedelayed = torch.cat([raw[:-1, :1], raw[1:, 1:]], dim=1)  # [12, 8]
+    sizes = [1, 5, 5, 1]
+    offsets = [0, 1, 6, 11]
+    for codes, start, size in zip(received, offsets, sizes, strict=True):
+        assert codes == dedelayed[start : start + size].transpose(0, 1).reshape(-1).tolist()
+    assert receiver.get_req_chunk[downstream.request_id] == 4
+    assert downstream.request_id in receiver.upstream_exhausted_requests
 
 
 def test_personaplex_sender_cleanup_drops_delayed_frame_state(build_adapter):
@@ -1392,8 +1638,7 @@ def test_personaplex_sender_cleanup_drops_delayed_frame_state(build_adapter):
         request=request,
         is_finished=True,
     )
-    assert first is not None
-    assert first.codes is None
+    assert first is SKIP_TRANSFER
 
     adapter.cleanup_sender(request.external_req_id)
 
@@ -1415,8 +1660,103 @@ def test_personaplex_sender_cleanup_drops_delayed_frame_state(build_adapter):
         is_finished=True,
     )
 
-    assert second is not None
-    assert second.codes is None
+    assert second is SKIP_TRANSFER
+
+
+def _shm_personaplex_sender(build_adapter, monkeypatch, *, batched: bool):
+    """A PersonaPlex chunk sender on SHM, and the keys it puts, in order.
+
+    The keys are taken where each path hands its chunks to the connector:
+    ``put_batch`` for a run of saves, ``put`` for one save at a time.
+    """
+    from vllm_omni.model_executor.stage_input_processors.personaplex import (
+        talker2code2wav_async_chunk,
+    )
+
+    adapter, _ = build_adapter(stage_id=0)
+    extra = {"initial_codec_chunk_frames": 1, "codec_chunk_frames": 5}
+    connector = adapter.connector = SharedMemoryConnector({"stage_id": 0, "extra": extra})
+    adapter.custom_process_next_stage_input_func = talker2code2wav_async_chunk
+    keys: list[str] = []
+    if batched:
+        put_batch = connector.put_batch
+        monkeypatch.setattr(
+            connector, "put_batch", lambda *args: keys.extend(key for key, _ in args[2]) or put_batch(*args)
+        )
+    else:
+        put = connector.put
+        monkeypatch.setattr(connector, "put", lambda **kwargs: keys.append(kwargs["put_key"]) or put(**kwargs))
+    return adapter, keys
+
+
+def _duplex_session(external_req_id: str):
+    request = _req(f"req-{external_req_id}", RequestStatus.RUNNING, external_req_id=external_req_id)
+    request.resumable = True
+    return request
+
+
+def _save_frame(adapter, request, step: int, frame: torch.Tensor, *, terminal: bool = False) -> None:
+    """One duplex frame's save, as update_from_output queues it."""
+    # The scheduler bumps the generation at every resumable segment stop.
+    request._omni_segment_generation = step
+    if terminal:
+        request.resumable = False
+        request.status = RequestStatus.FINISHED_STOPPED
+    adapter.save_async({"codes.audio": frame}, request, not terminal)
+
+
+def _drain(adapter, *, batched: bool) -> None:
+    """Send the queued saves, in runs or one at a time."""
+    if batched:
+        adapter._send_pending_requests()
+        return
+    while adapter._pending_save_reqs:
+        adapter._send_single_request(adapter._pending_save_reqs.popleft())
+
+
+def _received_chunk(connector, key: str):
+    """The codes and end flags a receiver reads under ``key``, or None."""
+    result = connector.get("0", "1", key)
+    if result is None:
+        return None
+    payload, _size = result
+    meta = payload["meta"]
+    return payload["codes"]["audio"].tolist(), bool(meta["finished"]), bool(meta["is_segment_finished"])
+
+
+def test_a_run_of_saves_sends_what_one_by_one_sends(build_adapter, monkeypatch):
+    """Runs of saves put the same chunks, under the same keys, in the same order."""
+    frames = torch.randint(0, 2048, (8, 4, 1, 16), generator=torch.Generator().manual_seed(0))
+    sent = []
+    for batched in (True, False):
+        adapter, keys = _shm_personaplex_sender(build_adapter, monkeypatch, batched=batched)
+        prefix = f"run_{uuid.uuid4().hex}"
+        sessions = [_duplex_session(f"{prefix}-{index}") for index in range(4)]
+        try:
+            for step in range(8):
+                for index, request in enumerate(sessions):
+                    _save_frame(adapter, request, step, frames[step, index], terminal=index == 3 and step == 7)
+                    if index == 1 and step == 3:
+                        # An abort with a chunk unread queues its cleanup mid-run,
+                        # and a new session takes the id before the sender drains.
+                        adapter.cleanup_sender(request.external_req_id)
+                        sessions[1] = _duplex_session(request.external_req_id)
+                # Drain every third step: runs also end at a repeated request.
+                if step % 3 == 2 or step == 7:
+                    _drain(adapter, batched=batched)
+            assert not adapter._send_failures
+            chunks = [_received_chunk(adapter.connector, key) for key in dict.fromkeys(keys)]
+        finally:
+            adapter.connector.close()
+        sent.append(([key.removeprefix(prefix) for key in keys], chunks))
+
+    (batched_keys, batched_chunks), (keys, chunks) = sent
+    # First chunks, the reused id's first chunk, 5-frame chunks, the terminal tail.
+    assert keys == ["-0_0_0", "-1_0_0", "-2_0_0", "-3_0_0", "-1_0_0", "-0_0_1", "-2_0_1", "-3_0_1", "-3_0_2"]
+    assert batched_keys == keys
+    # A receiver then reads the same chunks, the reused id's own among them.
+    assert None not in chunks
+    assert batched_chunks == chunks
 
 
 def test_save_async_skips_stale_resumable_chunk_within_segment(build_adapter):

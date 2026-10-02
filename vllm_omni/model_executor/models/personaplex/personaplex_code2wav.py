@@ -32,6 +32,7 @@ from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import torch
 import torch.nn as nn
 from vllm.config import VllmConfig
@@ -42,7 +43,18 @@ from vllm_omni.model_executor.models.output_templates import OmniOutput
 
 logger = init_logger(__name__)
 
-_MIMI_DECODE_BATCH_FRAMES = 5
+
+def _payload_codes(runtime_info: Mapping[str, Any] | None) -> torch.Tensor | list | tuple | None:
+    """The connector-delivered codec ids in ``runtime_info``, if it carries any."""
+    if isinstance(runtime_info, Mapping):
+        codes = runtime_info.get("codes")
+        if isinstance(codes, Mapping):
+            audio = codes.get("audio")
+            if isinstance(audio, torch.Tensor) and audio.numel() > 0:
+                return audio
+            if isinstance(audio, (list, tuple)) and audio:
+                return audio
+    return None
 
 
 def _codec_ids_from_payload_or_input(
@@ -50,14 +62,11 @@ def _codec_ids_from_payload_or_input(
     runtime_info: Mapping[str, Any] | None,
 ) -> torch.Tensor:
     """Prefer connector-delivered codec ids over scheduler placeholders."""
-    if isinstance(runtime_info, Mapping):
-        codes = runtime_info.get("codes")
-        if isinstance(codes, Mapping):
-            audio = codes.get("audio")
-            if isinstance(audio, torch.Tensor) and audio.numel() > 0:
-                return audio.reshape(-1).to(device=input_ids.device, dtype=torch.long)
-            if isinstance(audio, (list, tuple)) and audio:
-                return torch.as_tensor(audio, device=input_ids.device, dtype=torch.long).reshape(-1)
+    audio = _payload_codes(runtime_info)
+    if isinstance(audio, torch.Tensor):
+        return audio.reshape(-1).to(device=input_ids.device, dtype=torch.long)
+    if audio is not None:
+        return torch.as_tensor(audio, device=input_ids.device, dtype=torch.long).reshape(-1)
     return input_ids.reshape(-1).to(dtype=torch.long)
 
 
@@ -69,6 +78,10 @@ class PersonaPlexCode2Wav(nn.Module):
     ``compute_logits`` (none -- this stage never samples), ``forward`` (the
     actual codec->PCM decode), ``make_omni_output`` (output normalization), and
     ``load_weights`` (eager Mimi construction).
+
+    One streaming decoder serves every session: each request id leases a row,
+    and a step decodes all requests' new frames with one ``decode_frame`` call
+    (a CUDA graph replay with ``mimi_cuda_graphs``) per frame index.
     """
 
     input_modalities = "audio"
@@ -78,6 +91,7 @@ class PersonaPlexCode2Wav(nn.Module):
         super().__init__()
         self.vllm_config = vllm_config
         self.model_path = vllm_config.model_config.model
+        self._async_chunk = bool(getattr(vllm_config.model_config, "async_chunk", False))
         self.config = vllm_config.model_config.hf_config
 
         # Runner-facing capability flags, matching Qwen3TTSCode2Wav so the
@@ -95,14 +109,18 @@ class PersonaPlexCode2Wav(nn.Module):
         self._samples_per_frame = int(getattr(mimi_cfg, "samples_per_frame", 1920))
         self._mimi_name = getattr(mimi_cfg, "mimi_name", None) or getattr(self.config, "mimi_name", None)
         self._max_codec_sessions = int(getattr(vllm_config.model_config, "duplex_max_sessions", 1))
+        # Rows 0..max_sessions-1 are leased per request id; the last row is
+        # scratch for a request without an id and is reset after every use.
+        self._scratch_row = self._max_codec_sessions
+        self._num_codec_rows = self._max_codec_sessions + 1
 
         # The Mimi module is constructed in load_weights() (it owns its own
         # weight format) and assigned here so vLLM's memory profiler can see it.
         self.mimi: nn.Module | None = None
-        self._additional_mimi = nn.ModuleList()
         self._mimi_device: torch.device | None = None
-        self._request_codes: dict[str, torch.Tensor] = {}
-        self._request_codec_slots: dict[str, int] = {}
+        self._request_rows: dict[str, int] = {}
+        self._consumed_full_payload_requests: set[str] = set()
+        self._pcm_copied: torch.cuda.Event | None = None
 
     # ------------------------------------------------------------------
     # Runner-facing no-op / placeholder hooks (mirror Qwen3TTSCode2Wav).
@@ -168,10 +186,11 @@ class PersonaPlexCode2Wav(nn.Module):
         """Decode flat codebook-major codec ids into PCM via Mimi.
 
         ``input_ids`` per request is ``[k * F]`` (codebook-major), where ``k``
-        is ``self._num_codebooks``. The connector may send either a new delta
-        chunk or the cumulative prefix of a resumable request. Request-local
-        code history identifies the new suffix, and the streaming Mimi decoder
-        consumes each new frame exactly once.
+        is ``self._num_codebooks``. Async inputs contain newly generated delta
+        frames. Sync connector payloads contain the full sequence and may
+        persist across forwards, so they are consumed once per request. Every
+        request of the step is decoded in the same shared-decoder pass (see
+        ``_decode_pending``).
         """
         sr_val = int(self._output_sample_rate)
         sr_tensor = torch.tensor(sr_val, dtype=torch.int32)
@@ -184,6 +203,23 @@ class PersonaPlexCode2Wav(nn.Module):
             )
 
         ids = input_ids.reshape(-1).to(dtype=torch.long)
+        if self.mimi is None:
+            raise RuntimeError("PersonaPlexCode2Wav.forward called before Mimi was loaded in load_weights().")
+        batched = self._decode_input_id_spans(
+            ids,
+            kwargs.get("seq_token_counts"),
+            kwargs.get("request_ids"),
+            runtime_additional_information,
+        )
+        if batched is not None:
+            return OmniOutput(
+                text_hidden_states=None,
+                multimodal_outputs={
+                    "model_outputs": [empty if wav is None else wav for wav in batched],
+                    "sr": [sr_tensor] * len(batched),
+                },
+            )
+
         request_ids_list = self._split_request_ids(ids, kwargs.get("seq_token_counts"))
         num_req = len(request_ids_list)
         state_ids = self._resolve_request_ids(
@@ -192,13 +228,11 @@ class PersonaPlexCode2Wav(nn.Module):
             runtime_additional_information,
         )
 
-        if self.mimi is None:
-            raise RuntimeError("PersonaPlexCode2Wav.forward called before Mimi was loaded in load_weights().")
-
         k = int(self._num_codebooks)
-        device = self._mimi_device or ids.device
         audios: list[torch.Tensor] = [empty] * num_req
         srs = [sr_tensor] * num_req
+        # (output index, request id, new codes [k, F]) of every request with frames to decode.
+        pending: list[tuple[int, str | None, torch.Tensor]] = []
 
         for i, req_ids in enumerate(request_ids_list):
             runtime_info = (
@@ -223,17 +257,137 @@ class PersonaPlexCode2Wav(nn.Module):
             frames = n // k
             codes_kf = flat.reshape(k, frames)
             state_id = state_ids[i]
-            delta_kf = self._new_code_suffix(state_id, codes_kf)
-            if delta_kf.shape[1] == 0:
-                continue
-            wav = self._decode_streaming_frames(state_id, delta_kf.to(device=device))
-            if wav.numel() > 0:
-                audios[i] = wav.to(dtype=torch.float32).reshape(-1)
+            if not self._async_chunk and state_id is not None:
+                if state_id in self._consumed_full_payload_requests:
+                    continue
+                self._consumed_full_payload_requests.add(state_id)
+            pending.append((i, state_id, codes_kf))
+
+        for i, wav in self._decode_pending(pending):
+            audios[i] = wav
 
         return OmniOutput(
             text_hidden_states=None,
             multimodal_outputs={"model_outputs": audios, "sr": srs},
         )
+
+    def _decode_input_id_spans(
+        self,
+        ids: torch.Tensor,
+        seq_token_counts: object,
+        request_ids: object,
+        runtime_additional_information: list[dict[str, Any]] | None,
+    ) -> list[torch.Tensor | None] | None:
+        """``forward``'s decode, with host work that does not grow with the requests.
+
+        Returns each request's PCM (None: nothing to decode), or None to leave
+        the step to the per-request path, whose results it matches. It takes
+        async-chunk steps whose ``seq_token_counts`` spans of ``input_ids`` hold
+        every request's codes, all well-formed and from requests with an id.
+        """
+        if not self._async_chunk or not isinstance(seq_token_counts, list | tuple) or not seq_token_counts:
+            return None
+        n = int(ids.numel())
+        # One request takes all of ``ids``, as _split_request_ids gives it.
+        counts = [int(count) for count in seq_token_counts] if len(seq_token_counts) > 1 else [n]
+        if sum(counts) > n:
+            return None
+        state_ids = self._resolve_request_ids(len(counts), request_ids, runtime_additional_information)
+        k = int(self._num_codebooks)
+        # (output index, request id, token offset, frames) of each request to decode.
+        spans: list[tuple[int, str, int, int]] = []
+        offset = 0
+        for i, count in enumerate(counts):
+            start, offset = offset, offset + count
+            runtime_info = (
+                runtime_additional_information[i]
+                if runtime_additional_information is not None and i < len(runtime_additional_information)
+                else None
+            )
+            meta = runtime_info.get("meta") if isinstance(runtime_info, Mapping) else None
+            if isinstance(meta, Mapping) and meta.get("personaplex_dummy_profile") is True:
+                continue
+            if _payload_codes(runtime_info) is not None or count % k != 0:
+                return None
+            if count == 0:
+                continue
+            state_id = state_ids[i]
+            if state_id is None:
+                return None
+            spans.append((i, state_id, start, count // k))
+        decoded: list[torch.Tensor | None] = [None] * len(counts)
+        if not spans:
+            return decoded
+        rows = [self._lease_row(state_id) for _, state_id, _, _ in spans]
+        for (i, _, _, _), wav in zip(spans, self._decode_spans(ids, spans, rows), strict=True):
+            decoded[i] = wav
+        return decoded
+
+    def _decode_spans(
+        self,
+        ids: torch.Tensor,
+        spans: list[tuple[int, str, int, int]],
+        rows: list[int],
+    ) -> tuple[torch.Tensor, ...]:
+        """``_decode_rows`` for ``(output index, request id, token offset, frames)`` spans of ``ids``.
+
+        The codes are scattered into the decoder input by an index plan
+        uploaded in one copy; the PCM comes back in one host copy.
+        """
+        codec = self.mimi
+        k = int(self._num_codebooks)
+        num_rows = self._num_codec_rows
+        device = self._mimi_device
+        starts = np.fromiter((span[2] for span in spans), dtype=np.int64, count=len(spans))
+        frames = np.fromiter((span[3] for span in spans), dtype=np.int64, count=len(spans))
+        row_of = np.asarray(rows, dtype=np.int64)
+        num_frames = int(frames.max())
+        # Token t of span j is codebook t // F_j, frame t % F_j (codebook-major);
+        # it lands at [frame, row_j, codebook] of the decoder input.
+        lengths = frames * k
+        token_span = np.repeat(np.arange(len(spans)), lengths)
+        local = np.arange(int(lengths.sum())) - np.repeat(np.cumsum(lengths) - lengths, lengths)
+        span_frames = frames[token_span]
+        source = starts[token_span] + local
+        target = ((local % span_frames) * num_rows + row_of[token_span]) * k + local // span_frames
+        # The (frame, row) cells the spans occupy, span-major: the decoder's
+        # active mask, and the order the PCM is gathered in.
+        cell_span = np.repeat(np.arange(len(spans)), frames)
+        cell_frame = np.arange(int(frames.sum())) - np.repeat(np.cumsum(frames) - frames, frames)
+        cells = cell_frame * num_rows + row_of[cell_span]
+        plan = torch.from_numpy(np.concatenate([source, target, cells]))
+        if device is not None and device.type == "cuda":
+            plan = plan.pin_memory()
+        source_d, target_d, cells_d = plan.to(device=device, non_blocking=True).split(
+            [source.size, target.size, cells.size]
+        )
+        codes = torch.zeros(num_frames * num_rows * k, dtype=torch.long, device=device)
+        # The runner's ids are on the decoder's device already; then this is free.
+        codes[target_d] = ids.to(device=device)[source_d]
+        codes = codes.view(num_frames, num_rows, k)
+        active = torch.zeros(num_frames * num_rows, dtype=torch.bool, device=device)
+        active[cells_d] = True
+        active = active.view(num_frames, num_rows)
+        pcm = torch.stack([codec.decode_frame(codes[f], active[f]) for f in range(num_frames)])
+        # [F, rows, samples] -> the spans' cells, span-major, in one host copy.
+        wav = self._pcm_to_host(pcm.reshape(num_frames * num_rows, -1)[cells_d])
+        # Each request's PCM views only this step's decoded frames.
+        return wav.reshape(-1).split((frames * wav.shape[1]).tolist())
+
+    def _pcm_to_host(self, pcm: torch.Tensor) -> torch.Tensor:
+        """``pcm.to("cpu", float32)`` into pinned memory, waited on a blocking-sync event.
+
+        A pageable copy would spin-wait a core in the driver for the whole decode.
+        """
+        if pcm.device.type != "cuda":
+            return pcm.to(device="cpu", dtype=torch.float32)
+        host = torch.empty(pcm.shape, dtype=torch.float32, pin_memory=True)
+        host.copy_(pcm, non_blocking=True)
+        if self._pcm_copied is None:
+            self._pcm_copied = torch.cuda.Event(blocking=True)
+        self._pcm_copied.record(torch.cuda.current_stream(pcm.device))
+        self._pcm_copied.synchronize()
+        return host
 
     @staticmethod
     def _resolve_request_ids(
@@ -263,101 +417,71 @@ class PersonaPlexCode2Wav(nn.Module):
             resolved.append(str(request_id) if request_id is not None else None)
         return resolved
 
-    def _new_code_suffix(self, request_id: str | None, codes_kf: torch.Tensor) -> torch.Tensor:
-        if request_id is None:
-            return codes_kf
+    def _decode_pending(
+        self,
+        pending: list[tuple[int, str | None, torch.Tensor]],
+    ) -> list[tuple[int, torch.Tensor]]:
+        """Decode the step's requests: one pass for all leased rows, one more per extra id-less request.
 
-        incoming = codes_kf.detach().to(device="cpu", dtype=torch.long)
-        previous = self._request_codes.get(request_id)
-        if (
-            previous is not None
-            and incoming.shape[1] >= previous.shape[1]
-            and torch.equal(incoming[:, : previous.shape[1]], previous)
-        ):
-            delta = incoming[:, previous.shape[1] :]
-            self._request_codes[request_id] = incoming
-            return delta
+        An id-less request decodes on the scratch row, which is reset after each pass.
+        """
+        leased = [(i, self._lease_row(request_id), codes) for i, request_id, codes in pending if request_id is not None]
+        anonymous = [(i, self._scratch_row, codes) for i, request_id, codes in pending if request_id is None]
+        passes = [leased + anonymous[:1], *([item] for item in anonymous[1:])]
+        decoded: list[tuple[int, torch.Tensor]] = []
+        for items in passes:
+            if items:
+                decoded.extend(self._decode_rows(items))
+        return decoded
 
-        self._request_codes[request_id] = incoming if previous is None else torch.cat([previous, incoming], dim=1)
-        return incoming
+    def _decode_rows(self, items: list[tuple[int, int, torch.Tensor]]) -> list[tuple[int, torch.Tensor]]:
+        """Decode frame ``f`` of every ``(output index, row, codes [k, F])`` item in one call, for each ``f``.
 
-    def _decode_streaming_frames(self, request_id: str | None, codes_kf: torch.Tensor) -> torch.Tensor:
-        codec, ephemeral = self._codec_for_request(request_id)
-        if not hasattr(codec, "decode_frame"):
-            raise RuntimeError("PersonaPlex Code2Wav requires a streaming Mimi decoder")
+        A row without a frame ``f`` is inactive for that call, so its streaming state does not advance.
+        """
+        codec = self.mimi
+        k = int(self._num_codebooks)
+        num_frames = max(int(codes_kf.shape[1]) for _, _, codes_kf in items)
+        codes = torch.zeros((num_frames, self._num_codec_rows, k), dtype=torch.long)
+        active = torch.zeros((num_frames, self._num_codec_rows), dtype=torch.bool)
+        for _, row, codes_kf in items:
+            frames = int(codes_kf.shape[1])
+            codes[:frames, row] = codes_kf.to(device="cpu", dtype=torch.long).T
+            active[:frames, row] = True
+        codes = codes.to(device=self._mimi_device)
+        active = active.to(device=self._mimi_device)
+        pcm = torch.stack([codec.decode_frame(codes[f], active[f]) for f in range(num_frames)])
+        pcm = pcm.to(device="cpu", dtype=torch.float32)  # [F, rows, samples]
+        if any(row == self._scratch_row for _, row, _ in items):
+            codec.reset_slot(self._scratch_row)
+        # Clone so each request's PCM owns its storage instead of viewing the whole pass.
+        return [(i, pcm[: codes_kf.shape[1], row].clone().reshape(-1)) for i, row, codes_kf in items]
 
-        decode_frames = getattr(codec, "decode_frames", None)
-        chunks: list[torch.Tensor] = []
-        for start in range(0, codes_kf.shape[1], _MIMI_DECODE_BATCH_FRAMES):
-            frame_batch = codes_kf[:, start : start + _MIMI_DECODE_BATCH_FRAMES]
-            if frame_batch.shape[1] > 1 and callable(decode_frames):
-                chunks.append(self._flatten_wav(decode_frames(frame_batch.unsqueeze(0))))
-            else:
-                chunks.extend(
-                    self._flatten_wav(codec.decode_frame(frame_batch[:, frame].unsqueeze(0)))
-                    for frame in range(frame_batch.shape[1])
-                )
-        wav = torch.cat(chunks, dim=0) if chunks else codes_kf.new_empty(0, dtype=torch.float32)
-        if ephemeral:
-            codec.reset_streaming()
-        return wav
+    def _lease_row(self, request_id: str) -> int:
+        row = self._request_rows.get(request_id)
+        if row is not None:
+            return row
+        occupied = set(self._request_rows.values())
+        row = next((index for index in range(self._max_codec_sessions) if index not in occupied), None)
+        if row is None:
+            raise RuntimeError(f"PersonaPlex Code2Wav decoder capacity {self._max_codec_sessions} is exhausted")
+        self._request_rows[request_id] = row
+        return row
 
-    def _set_mimi_codecs(self, codecs: list[nn.Module]) -> None:
-        if not codecs:
-            raise ValueError("PersonaPlex Code2Wav requires at least one Mimi decoder")
-        self.mimi = codecs[0]
-        self._additional_mimi = nn.ModuleList(codecs[1:])
-        self._request_codec_slots.clear()
-
-    def _mimi_codecs(self) -> list[nn.Module]:
-        if self.mimi is None:
-            return []
-        return [self.mimi, *self._additional_mimi]
-
-    def _codec_for_request(self, request_id: str | None) -> tuple[nn.Module, bool]:
-        codecs = self._mimi_codecs()
-        if not codecs:
-            raise RuntimeError("PersonaPlexCode2Wav.forward called before Mimi was loaded in load_weights().")
-        occupied = set(self._request_codec_slots.values())
-        if request_id is not None:
-            slot = self._request_codec_slots.get(request_id)
-            if slot is None:
-                slot = next((index for index in range(len(codecs)) if index not in occupied), None)
-                if slot is None:
-                    raise RuntimeError(f"PersonaPlex Code2Wav decoder capacity {len(codecs)} is exhausted")
-                codecs[slot].streaming_init(1)
-                self._request_codec_slots[request_id] = slot
-            return codecs[slot], False
-
-        slot = next((index for index in range(len(codecs)) if index not in occupied), None)
-        if slot is None:
-            raise RuntimeError(f"PersonaPlex Code2Wav decoder capacity {len(codecs)} is exhausted")
-        codecs[slot].streaming_init(1)
-        return codecs[slot], True
+    def _install_mimi(self, codec: nn.Module, device: torch.device) -> None:
+        """Share ``codec`` across sessions: one streaming row per session plus the scratch row (decoder half only)."""
+        codec.streaming_init(self._num_codec_rows, encode=False)
+        self.mimi = codec
+        self._mimi_device = device
+        self._request_rows.clear()
 
     def on_requests_finished(self, finished_req_ids: set[str] | list[str]) -> None:
         for request_id in finished_req_ids:
             state_id = str(request_id)
-            self._request_codes.pop(state_id, None)
-            slot = self._request_codec_slots.pop(state_id, None)
-            codecs = self._mimi_codecs()
-            if slot is not None and slot < len(codecs):
-                codecs[slot].reset_streaming()
-
-    @staticmethod
-    def _flatten_wav(wav: torch.Tensor) -> torch.Tensor:
-        """Normalize Mimi's decode output to a 1D PCM tensor.
-
-        Mimi may return ``[B, samples]`` or ``[B, C, samples]`` depending on the
-        moshi version; PersonaPlex is mono (``C == 1``), so collapse to 1D.
-        """
-        if wav.dim() == 3:
-            # [B, C, T] -> take batch 0, channel 0.
-            return wav[0, 0]
-        if wav.dim() == 2:
-            # [B, T] -> batch 0.
-            return wav[0]
-        return wav.reshape(-1)
+            self._consumed_full_payload_requests.discard(state_id)
+            row = self._request_rows.pop(state_id, None)
+            if row is not None and self.mimi is not None:
+                self.mimi.reset_slot(row)
 
     def make_omni_output(self, model_outputs: torch.Tensor | OmniOutput | tuple, **kwargs: Any) -> OmniOutput:
         if isinstance(model_outputs, OmniOutput):
@@ -399,35 +523,29 @@ class PersonaPlexCode2Wav(nn.Module):
         )
 
         checkpoint = Path(self.model_path) / (self._mimi_name or "tokenizer-e351c8d8-checkpoint125.safetensors")
-        codecs = [
-            PersonaPlexMimiCodec(
-                checkpoint=str(checkpoint) if checkpoint.is_file() else None,
-                device=str(device),
-            ).eval()
-            for _ in range(self._max_codec_sessions)
-        ]
-        self._set_mimi_codecs(codecs)
-        self._mimi_device = torch.device(str(device))
-        reported_sr = getattr(codecs[0].model.config, "sampling_rate", None)
+        codec = PersonaPlexMimiCodec(
+            checkpoint=str(checkpoint) if checkpoint.is_file() else None,
+            device=str(device),
+        ).eval()
+        # Allocate the streaming state and the decode graph's pool here, not on
+        # the first request, so vLLM's memory profiling sees them.
+        self._install_mimi(codec, torch.device(str(device)))
+        # Stage 1 runs with enforce_eager (the runner's own capture records
+        # nothing for this model); the flag alone decides the codec's graph.
+        if getattr(self.config, "mimi_cuda_graphs", False):
+            codec.capture_decode_graph()
+        reported_sr = getattr(codec.model.config, "sampling_rate", None)
         if reported_sr is not None:
             self._output_sample_rate = int(reported_sr)
-        bytes_per_mib = 1024**2
-        per_slot_weight_mib = (
-            sum(parameter.numel() * parameter.element_size() for parameter in codecs[0].parameters()) / bytes_per_mib
-        )
-        total_weight_mib = (
-            sum(parameter.numel() * parameter.element_size() for codec in codecs for parameter in codec.parameters())
-            / bytes_per_mib
-        )
+        weight_mib = sum(parameter.numel() * parameter.element_size() for parameter in codec.parameters()) / 1024**2
         logger.info(
-            "PersonaPlex Code2Wav loaded %d Mimi stream(s): "
-            "per_slot_weight_mib=%.2f total_weight_mib=%.2f "
-            "num_codebooks=%d sample_rate=%d samples_per_frame=%d",
-            len(codecs),
-            per_slot_weight_mib,
-            total_weight_mib,
+            "PersonaPlex Code2Wav loaded one shared Mimi decoder: rows=%d (%d sessions + 1 scratch) "
+            "weight_mib=%.2f num_codebooks=%d sample_rate=%d samples_per_frame=%d",
+            self._num_codec_rows,
+            self._max_codec_sessions,
+            weight_mib,
             self._num_codebooks,
             self._output_sample_rate,
             self._samples_per_frame,
         )
-        return {name for name, _ in self.named_parameters() if name.startswith(("mimi.", "_additional_mimi."))}
+        return {name for name, _ in self.named_parameters() if name.startswith("mimi.")}

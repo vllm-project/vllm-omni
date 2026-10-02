@@ -83,6 +83,15 @@ class OmniEngineCoreRequest(EngineCoreRequest):
     # additional_information request transport.
     model_intermediate_buffer: dict[str, Any] | None = None
     payload_sender_info: dict[str, Any] | None = None
+    # Coalesced ADD carrier only (``coalesced_add_carrier``): the requests it
+    # delivers, each added as if it had arrived in its own ADD message.
+    coalesced_requests: list["OmniEngineCoreRequest"] | None = None
+    # Coalesced resumable update only: with ``sampling_params``, the stage
+    # engine core holds them under this reference; without, the update uses
+    # the params held under it (and fails if there are none).
+    sampling_params_ref: int | None = None
+    # Carrier only: request ids whose held sampling params the core drops first.
+    released_sampling_params_ids: list[str] | None = None
 
     @classmethod
     def from_request(
@@ -130,6 +139,29 @@ class OmniEngineCoreRequest(EngineCoreRequest):
             model_intermediate_buffer=model_intermediate_buffer,
             payload_sender_info=payload_sender_info,
         )
+
+
+def coalesced_add_carrier(
+    requests: list[OmniEngineCoreRequest],
+    *,
+    client_index: int,
+    released_sampling_params_ids: list[str] | None = None,
+) -> OmniEngineCoreRequest:
+    """One ADD message carrying several requests; its own fields are placeholders."""
+    return OmniEngineCoreRequest(
+        request_id="",
+        prompt_token_ids=None,
+        mm_features=None,
+        sampling_params=None,
+        pooling_params=None,
+        arrival_time=0.0,
+        lora_request=None,
+        cache_salt=None,
+        data_parallel_rank=None,
+        client_index=client_index,
+        coalesced_requests=requests,
+        released_sampling_params_ids=released_sampling_params_ids,
+    )
 
 
 class OmniEngineCoreOutput(EngineCoreOutput):

@@ -17,11 +17,12 @@ import pybase64 as base64
 PCM_F32LE_BYTES_PER_SAMPLE = 4
 
 
-def decode_pcm_f32le_base64(encoded: object, *, model: str = "audio") -> bytes:
+def decode_pcm_f32le_base64(encoded: object, *, model: str = "audio", check_finite: bool = True) -> bytes:
     """Decode base64 ``pcm_f32le`` into raw bytes, refusing partial or non-finite samples.
 
     ``model`` names the caller in error messages so a client sees which model
-    rejected its audio.
+    rejected its audio. ``check_finite=False`` leaves the finiteness check to a
+    caller that checks many chunks at once (:func:`check_pcm_f32le_finite`).
     """
     if not isinstance(encoded, str):
         raise ValueError(f"{model} audio must be base64 pcm_f32le")
@@ -31,10 +32,15 @@ def decode_pcm_f32le_base64(encoded: object, *, model: str = "audio") -> bytes:
         raise ValueError(f"{model} audio is not valid base64") from exc
     if len(raw) % PCM_F32LE_BYTES_PER_SAMPLE:
         raise ValueError(f"{model} pcm_f32le byte length must be divisible by four")
-    samples = np.frombuffer(raw, dtype="<f4")
+    if check_finite:
+        check_pcm_f32le_finite(np.frombuffer(raw, dtype="<f4"), model=model)
+    return raw
+
+
+def check_pcm_f32le_finite(samples: np.ndarray, *, model: str = "audio") -> None:
+    """Refuse non-finite samples (the check :func:`decode_pcm_f32le_base64` makes)."""
     if samples.size and not bool(np.isfinite(samples).all()):
         raise ValueError(f"{model} pcm_f32le samples must be finite")
-    return raw
 
 
 def pcm_f32le_sample_count(raw: bytes) -> int:
@@ -48,6 +54,7 @@ def pcm_f32le_samples(raw: bytes) -> np.ndarray:
 
 __all__ = [
     "PCM_F32LE_BYTES_PER_SAMPLE",
+    "check_pcm_f32le_finite",
     "decode_pcm_f32le_base64",
     "pcm_f32le_sample_count",
     "pcm_f32le_samples",

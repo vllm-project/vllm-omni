@@ -47,6 +47,7 @@ from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTran
 from vllm_omni.distributed.omni_connectors.utils.config import stage_sends_async_output
 from vllm_omni.model_executor.duplex_sampling import DuplexSamplingRunnerMixin
 from vllm_omni.outputs import OmniModelRunnerOutput
+from vllm_omni.utils.device_copy import HostCopyBatch, index_to_device
 from vllm_omni.utils.mm_outputs import (
     build_mm_cpu,
     partition_payload_list,
@@ -1458,7 +1459,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         self,
         *,
         req_ids: list[str],
-        valid_sampled_token_ids: list[list[int]],
+        valid_sampled_token_ids: list[list[int]] | None,
         sampled_token_ids: torch.Tensor,
         invalid_req_indices: list[int],
         sample_hidden_states: torch.Tensor,
@@ -1471,6 +1472,10 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         codes. A resumable ``max_tokens=1`` segment has no later decode
         preprocess in which to do that work, so those models expose
         ``post_sample_talker_mtp`` instead.
+
+        Without ``valid_sampled_token_ids`` (before bookkeeping) rows are picked
+        from ``invalid_req_indices``, as under async scheduling. Device codes
+        reach the host with one non-blocking copy, ``_omni_post_sample_host_copies``.
         """
         model = getattr(self, "model", None)
         hook = getattr(model, "post_sample_talker_mtp", None)
@@ -1489,7 +1494,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             if not isinstance(duplex, dict) or duplex.get("data_plane") is not True:
                 continue
             duplex_indices.append(idx)
-            if use_async_scheduling:
+            if use_async_scheduling or valid_sampled_token_ids is None:
                 if idx in invalid_indices:
                     continue
             else:
@@ -1518,7 +1523,8 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                 f"shape={tuple(sampled_token_ids.shape)}"
             )
 
-        empty_audio = torch.empty(0, dtype=torch.long, device=sample_hidden_states.device)
+        # Host placeholder: it only marks the row as having no frame this step.
+        empty_audio = torch.empty(0, dtype=torch.long)
         merged = dict(multimodal_outputs) if isinstance(multimodal_outputs, dict) else {}
         existing_codes = merged.get("codes")
         codes_payload = dict(existing_codes) if isinstance(existing_codes, dict) else {}
@@ -1530,21 +1536,24 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             and existing_audio.ndim > 0
             and existing_audio.shape[0] == len(req_ids)
         ):
-            per_request_audio = [existing_audio[idx : idx + 1] for idx in range(len(req_ids))]
+            per_request_audio = list(existing_audio.split(1))
         else:
             per_request_audio = [empty_audio for _ in req_ids]
         for idx in duplex_indices:
             per_request_audio[idx] = empty_audio
 
-        indices = torch.tensor(
-            selected_indices,
-            dtype=torch.long,
-            device=sample_hidden_states.device,
-        )
-        input_ids = sampled_token_ids.index_select(0, indices).reshape(-1).to(torch.long)
+        num_selected = len(selected_indices)
+        if selected_indices == list(range(num_selected)):
+            # The usual all-duplex step: the rows are already in place.
+            input_ids = sampled_token_ids[:num_selected].reshape(-1).to(torch.long)
+            hidden_states = sample_hidden_states[:num_selected]
+        else:
+            indices = index_to_device(selected_indices, sample_hidden_states.device)
+            input_ids = sampled_token_ids.index_select(0, indices).reshape(-1).to(torch.long)
+            hidden_states = sample_hidden_states.index_select(0, indices)
         codes = hook(
             input_ids=input_ids,
-            hidden_states=sample_hidden_states.index_select(0, indices),
+            hidden_states=hidden_states,
             req_ids=selected_req_ids,
             req_infos=selected_req_infos,
         )
@@ -1554,13 +1563,24 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             raise ValueError(
                 f"post_sample_talker_mtp row count does not match requests: {codes.shape[0]} != {len(selected_req_ids)}"
             )
-        for row, (idx, req_id) in enumerate(zip(selected_indices, selected_req_ids, strict=True)):
-            request_codes = codes[row : row + 1]
+        if codes.device.type == "cpu":
+            host_codes = codes.detach()
+        elif ("codes", "audio") in getattr(model, "gpu_resident_buffer_keys", set()):
+            # One owned snapshot of the batch instead of one clone per row.
+            host_codes = codes.detach().clone()
+        else:
+            copies = HostCopyBatch(is_pin_memory_available())
+            host_codes = copies.copy(codes)
+            self._omni_post_sample_host_copies = copies
+        # Row views, stored as ``_update_intermediate_buffer`` would, without a copy per row.
+        for idx, req_id, request_codes in zip(selected_indices, selected_req_ids, host_codes.split(1), strict=True):
             per_request_audio[idx] = request_codes
-            self._update_intermediate_buffer(
-                req_id,
-                {"codes": {"audio": request_codes}},
-            )
+            req_state = self.requests.get(req_id)
+            if req_state is None:
+                continue
+            existing = self.model_intermediate_buffer.setdefault(req_id, {})
+            existing.setdefault("codes", {})["audio"] = request_codes
+            setattr(req_state, "additional_information_cpu", existing)
 
         # Empty rows are intentional: they suppress replay of the previous
         # frame while a chunked prefill has not sampled a token yet.
@@ -2133,6 +2153,24 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             else:
                 propose_drafts_after_bookkeeping = input_fits_in_drafter
 
+        # Opt-in: without spec decode the post-sample rows are the rows the
+        # discard mask keeps, so the MTP launches before bookkeeping, whose one
+        # sync then covers the forward, the MTP and the codes' host copy.
+        post_sample_before_bookkeeping = spec_config is None and self._runner_model_omni_flag(
+            "post_sample_talker_mtp_before_bookkeeping"
+        )
+        if post_sample_before_bookkeeping:
+            num_reqs = self.input_batch.num_reqs
+            with record_function_or_nullcontext("gpu_model_runner: post_sample_talker_mtp"):
+                multimodal_outputs = self._run_post_sample_talker_mtp(
+                    req_ids=list(self.input_batch.req_ids),
+                    valid_sampled_token_ids=None,
+                    sampled_token_ids=sampler_output.sampled_token_ids,
+                    invalid_req_indices=np.flatnonzero(self.discard_request_mask.np[:num_reqs]).tolist(),
+                    sample_hidden_states=sample_hidden_states,
+                    multimodal_outputs=multimodal_outputs,
+                )
+
         with record_function_or_nullcontext("gpu_model_runner: bookkeep"):
             (
                 num_nans_in_logits,
@@ -2159,14 +2197,15 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                 multimodal_outputs=multimodal_outputs,
             )
 
-        multimodal_outputs = self._run_post_sample_talker_mtp(
-            req_ids=req_ids_output_copy,
-            valid_sampled_token_ids=valid_sampled_token_ids,
-            sampled_token_ids=sampler_output.sampled_token_ids,
-            invalid_req_indices=invalid_req_indices,
-            sample_hidden_states=sample_hidden_states,
-            multimodal_outputs=multimodal_outputs,
-        )
+        if not post_sample_before_bookkeeping:
+            multimodal_outputs = self._run_post_sample_talker_mtp(
+                req_ids=req_ids_output_copy,
+                valid_sampled_token_ids=valid_sampled_token_ids,
+                sampled_token_ids=sampler_output.sampled_token_ids,
+                invalid_req_indices=invalid_req_indices,
+                sample_hidden_states=sample_hidden_states,
+                multimodal_outputs=multimodal_outputs,
+            )
 
         if propose_drafts_after_bookkeeping:
             # ngram and other speculative decoding methods use the sampled
@@ -2208,6 +2247,11 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
 
         use_async_omni_output = self._should_use_async_omni_output()
         omni_postprocess_already_applied = False
+        # The async snapshot and the output builder read the post-sample codes.
+        post_sample_host_copies = getattr(self, "_omni_post_sample_host_copies", None)
+        if post_sample_host_copies is not None:
+            self._omni_post_sample_host_copies = None
+            post_sample_host_copies.wait()
         if use_async_omni_output:
             omni_postprocess_already_applied = self._maybe_run_eager_omni_postprocess_before_async_output(
                 hidden_states=hidden_states,

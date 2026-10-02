@@ -135,6 +135,7 @@ def build_append_audio(
         duration_ms=decoded.duration_ms,
         audio_end_ms=decoded.audio_end_ms,
         hints=decoded.hints,
+        audio_base64=decoded.audio_base64,
     )
 
 

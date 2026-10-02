@@ -15,6 +15,7 @@ from vllm_omni.entrypoints.duplex.session_attachment import (
     DuplexJournalOverflowError,
     DuplexResumeCredential,
     DuplexSessionAttachmentRegistry,
+    EncodedEventPayload,
     InvalidResumeTokenError,
     ResumeToken,
 )
@@ -639,3 +640,18 @@ async def test_a_rolled_back_activation_orphans_the_lease_it_was_handed(mocker) 
     assert await registry.settle_lease_generation("sid-rollback", 2) is None
     assert await registry.settle_lease_generation("sid-rollback", 1) is None
     assert await registry.end_resume("sid-rollback") == 2, "the newest lease is the one to detach"
+
+
+def test_journaled_payload_carries_the_exact_send_json_text() -> None:
+    journal = DuplexEventJournal(max_bytes=1 << 20, ttl_s=60.0, clock=_Clock())
+    entry = journal.record({"type": "response.output_audio.delta", "audio": "QUJD", "text": "héllo"})
+
+    wire = entry.wire_payload()
+
+    assert isinstance(wire, EncodedEventPayload)
+    assert wire == dict(entry.payload)
+    # Starlette's WebSocket.send_json settings: the bytes on the wire do not change.
+    assert wire.encoded_text == json.dumps(wire, separators=(",", ":"), ensure_ascii=False)
+    assert entry.encoded_bytes == len(wire.encoded_text.encode("utf-8"))
+    wire["mutated"] = True
+    assert "mutated" not in entry.payload

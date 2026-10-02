@@ -95,8 +95,9 @@ class _RingKV:
     def reset_row(self, b: int) -> None:
         # Restart row b at position 0. Every cached entry of the row sits at or
         # past the new end offset, so all of them are masked until overwritten.
-        self.end_offset[b] = 0
-        self.start_offset[b] = 0
+        # (In-place fills: assigning 0 would sync the host on a device ring.)
+        self.end_offset[b].zero_()
+        self.start_offset[b].zero_()
 
     def bump_slot_start(self, b: int) -> None:
         self.start_offset[b] += 1

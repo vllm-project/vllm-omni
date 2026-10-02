@@ -186,6 +186,10 @@ def test_omitted_sessions_preserves_lifecycle_mode():
         ["--cleanup-timeout-s", "0"],
         ["--cleanup-timeout-s", "nan"],
         ["--max-client-rtf", "-1"],
+        ["--max-stream-rtf", "0"],
+        ["--max-stream-rtf", "nan"],
+        ["--max-lag-drift-ms", "-1"],
+        ["--max-lag-drift-ms", "inf"],
         ["--max-frame-deficit", "-1"],
         ["--minimum-audio-chunks", "0"],
         ["--min-voiced-frames", "0"],
@@ -200,6 +204,9 @@ def test_load_rejects_invalid_configuration(tmp_path, options):
 def test_metric_clock_and_packet_frame_distinction():
     client = driver.RawRealtimeProbe("ws://unused")
     client.events.add({"type": "session.created", "session": {"resume_token": "secret"}}, received_at_s=7)
+    # Blank text deltas (PersonaPlex pads) do not count as the first text.
+    client.events.add({"type": "response.output_text.delta", "delta": " "}, received_at_s=10.2)
+    client.events.add({"type": "response.output_text.delta", "delta": " Hi"}, received_at_s=10.6)
     for when in (10.4, 10.8, 11.6):
         event = _audio(samples=driver.FRAME_SAMPLES * 5)
         event["_client_received_at_s"] = -999.0
@@ -213,6 +220,7 @@ def test_metric_clock_and_packet_frame_distinction():
     assert intervals["max"] == pytest.approx(800)
     assert intervals["argmax_index"] == 1
     assert report["client_first_audio_after_stream_start_ms"] == pytest.approx(400)
+    assert report["client_first_text_after_stream_start_ms"] == pytest.approx(600)
     assert report["output_samples"] == 15 * driver.FRAME_SAMPLES
     assert report["audio_underrun_s"] == pytest.approx(0.4)
     assert report["audio_continuity_ok"] is False
@@ -231,6 +239,51 @@ def test_empty_output_has_missing_not_zero_latency():
     intervals = report["client_audio_packet_interval_ms"]
     assert isinstance(intervals, dict)
     assert intervals["p99"] is None
+
+
+def _grid_sends(frames: int, start: float = 100.0) -> list[tuple[float, float, float]]:
+    """Frames sent on the grid, each send completing 1 ms after it started."""
+    planned = [start + i * driver.FRAME_PERIOD_S for i in range(frames)]
+    return [(at, at, at + 0.001) for at in planned]
+
+
+def _five_frame_chunks(arrivals: list[float], first_frames: int = 5) -> driver.RawRealtimeProbe:
+    client = driver.RawRealtimeProbe("ws://unused")
+    for index, when in enumerate(arrivals):
+        client.events.add(_audio(samples=driver.FRAME_SAMPLES * (5 if index else first_frames)), received_at_s=when)
+    return client
+
+
+def test_stream_timing_of_chunked_output_slower_than_real_time():
+    sends = _grid_sends(50)
+    # Chunk 0 arrives 200 ms after the reference of its last frame: its send completion + 80 ms.
+    first = sends[4][2] + driver.FRAME_PERIOD_S + 0.2
+    report = driver._load_metrics(_five_frame_chunks([first + 0.44 * j for j in range(10)]), sends)
+    # The window holds chunks 1-8, 2.8 s of references apart; the fitted lag grows 10% of that. Once the
+    # 120 ms head start is used up (chunk 3), chunks 4-9 each stall the strict player 40 ms.
+    assert report["server_stream_rtf"] == pytest.approx(1.1)
+    assert report["stream_lag_drift_ms"] == pytest.approx(280)
+    lag = report["stream_lag_ms"]
+    # A chunk's first frame also waits for the four frames after it.
+    assert isinstance(lag, dict) and lag["count"] == 50 and lag["max"] == pytest.approx(880)
+    assert report["playout_stall_ms"] == pytest.approx(240)
+    assert report["playout_stalled"] is True
+    # The steady player starts 120 ms after chunk 1, more slack than chunks 1-9 lose.
+    assert report["steady_playout_stall_ms"] == 0.0 and report["steady_playout_stalled"] is False
+
+
+def test_only_the_strict_player_stalls_on_a_single_frame_before_the_first_chunk():
+    sends = _grid_sends(46)
+    # The shipped shape: one frame, then five-frame chunks in real time. The
+    # first chunk arrives 230 ms after the strict player has played that frame.
+    first = sends[0][2] + driver.FRAME_PERIOD_S + 0.2
+    first_chunk = first + driver.PLAYOUT_START_DELAY_S + driver.FRAME_PERIOD_S + 0.23
+    arrivals = [first] + [first_chunk + 0.4 * j for j in range(9)]
+    report = driver._load_metrics(_five_frame_chunks(arrivals, first_frames=1), sends)
+    assert report["playout_stall_ms"] == pytest.approx(230)
+    assert report["playout_stalled"] is True
+    assert report["steady_playout_stall_ms"] == 0.0
+    assert report["steady_playout_stalled"] is False
 
 
 def test_failed_acceptance_retains_frame_counts_without_remote_data():
@@ -397,40 +450,64 @@ async def test_client_rtf_ceiling_marks_slow_sessions_failed(tmp_path):
     assert all("client_stream_rtf exceeds" in row["error"] for row in rows)
 
 
-@pytest.mark.asyncio
-async def test_stalled_send_does_not_cause_catchup_burst():
-    class Clock:
-        now = 10.0
+async def _paced_sends(frames: int, stalls: dict[int, float], *, overshoot_s=0.0, send_s=0.0):
+    """Pace *frames* from t=10 s on a fake clock whose sleeps overshoot and whose sends take time (plus *stalls*)."""
+    now = [10.0]
 
-        def monotonic(self):
-            return self.now
-
-        async def sleep(self, delay):
-            self.now += delay
+    async def sleep(delay):
+        now[0] += delay + overshoot_s
 
     class Client(driver.RawRealtimeProbe):
         async def send(self, event):
-            if event["audio_end_ms"] == 80:
-                clock.now += 0.25
+            now[0] += send_s + stalls.get(event["audio_end_ms"] // 80 - 1, 0.0)
 
-    clock = Clock()
     sends: list[tuple[float, float, float]] = []
     await driver._paced_load_frames(
         Client("ws://unused"),
-        np.zeros(driver.FRAME_SAMPLES * 3, dtype="<f4"),
+        np.zeros(driver.FRAME_SAMPLES * frames, dtype="<f4"),
         epoch=10.0,
         timeout_s=1.0,
         sends=sends,
-        clock=clock.monotonic,
-        sleep=clock.sleep,
+        clock=lambda: now[0],
+        sleep=sleep,
     )
-    assert len(sends) == 3
-    assert sends[1][1] >= sends[0][2] + driver.FRAME_PERIOD_S
-    assert sends[1][1] - sends[1][0] == pytest.approx(0.25)
-    assert sends[2][1] >= sends[1][2] + driver.FRAME_PERIOD_S
-    metrics = driver._load_metrics(Client("ws://unused"), sends)
+    assert len(sends) == frames
+    return sends
+
+
+def test_stream_ceilings_are_off_by_default_and_fail_sessions_above_them(tmp_path):
+    metrics: dict[str, object] = {"server_stream_rtf": 1.2, "stream_lag_drift_ms": 150.0}
+    assert driver._stream_acceptance_error(_args(tmp_path), metrics) is None
+    rtf_ceiling = _args(tmp_path, "--max-stream-rtf", "1.1")
+    assert driver._stream_acceptance_error(rtf_ceiling, metrics) == "server_stream_rtf exceeds 1.1"
+    drift_ceiling = _args(tmp_path, "--max-lag-drift-ms", "100")
+    assert driver._stream_acceptance_error(drift_ceiling, metrics) == "stream_lag_drift_ms exceeds 100.0"
+    loose = _args(tmp_path, "--max-stream-rtf", "1.3", "--max-lag-drift-ms", "200")
+    assert driver._stream_acceptance_error(loose, metrics) is None
+    # A session too short to fit is not failed by the ceiling, as with client_stream_rtf.
+    unfitted: dict[str, object] = {"server_stream_rtf": None, "stream_lag_drift_ms": None}
+    assert driver._stream_acceptance_error(rtf_ceiling, unfitted) is None
+
+
+@pytest.mark.asyncio
+async def test_paced_frames_stay_on_the_grid_despite_sleep_overshoot_and_send_time():
+    # 30 s of frames; pacing each frame off the previous send's completion drifted 3 ms per frame here.
+    sends = await _paced_sends(375, {}, overshoot_s=0.002, send_s=0.001)
+    assert [planned for planned, _, _ in sends] == pytest.approx([10.0 + i * driver.FRAME_PERIOD_S for i in range(375)])
+    assert [started - planned for planned, started, _ in sends] == pytest.approx([0.002] * 375, abs=1e-9)
+
+
+@pytest.mark.asyncio
+async def test_stalled_send_does_not_cause_catchup_burst():
+    # Frame 1 completes 20 ms past the next slot, which keeps the grid. Frame 3 completes 170 ms past it:
+    # the grid restarts one frame after that send and does not catch up.
+    sends = await _paced_sends(6, {1: 0.1, 3: 0.25})
+    assert [started for _, started, _ in sends] == pytest.approx([10.0, 10.08, 10.18, 10.24, 10.57, 10.65])
+    # Planned times stay on the original grid, so every later frame reports the lag.
+    assert [started - planned for planned, started, _ in sends] == pytest.approx([0, 0, 0.02, 0, 0.25, 0.25])
+    metrics = driver._load_metrics(driver.RawRealtimeProbe("ws://unused"), sends)
     assert metrics["client_pacing_warning"] is True
-    assert asyncio.sleep != clock.sleep
+    assert metrics["client_send_lateness_ms"]["max"] == pytest.approx(250)
 
 
 @pytest.mark.asyncio

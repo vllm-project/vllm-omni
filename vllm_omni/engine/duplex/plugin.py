@@ -290,6 +290,13 @@ class DuplexModelPlugin(ABC):
     """
 
     projects_intermediate_outputs: bool = False
+    #: False when ``plan_append`` ignores its ``session_config`` (which carries a
+    #: copy of the conversation): appends then skip it and ``prepare_prompt_config``.
+    plans_from_session_config: bool = True
+    #: Whether the resumable updates all sessions submit in one orchestrator
+    #: loop turn reach a stage engine core as one message. Worth it for a
+    #: model where every live session appends a unit per clock tick.
+    coalesces_resumable_updates: bool = False
     plugin_id: str = ""
     private_runtime_config_keys: frozenset[str] = frozenset()
     #: Samples per silence unit the runner appends to keep a model turn going.
