@@ -34,6 +34,7 @@ related_code_paths:
   - vllm_omni/distributed/omni_connectors/**
   - vllm_omni/diffusion/request.py
   - vllm_omni/diffusion/worker/request_batch.py
+  - vllm_omni/entrypoints/openpi/**
   - vllm_omni/errors.py
 depends_on:
   - error_contracts.md
@@ -49,6 +50,8 @@ validation_paths:
   - tests/utils/test_mm_outputs.py
   - tests/utils/test_mm_outputs_partition.py
   - tests/diffusion/test_diffusion_output_metadata.py
+  - tests/diffusion/test_diffusion_output_formatter.py
+  - tests/entrypoints/openai_api/test_openpi_serving.py
 upstream_refs:
   - vllm.inputs/**
   - vllm.outputs/**
@@ -82,6 +85,66 @@ It does not own route-specific validation or rendering, model-specific
 interpretation, connector transport mechanics, scheduling policy, or semantic
 error classification. The `ErrorMessage` schema belongs here; the meaning and
 public rendering of its error fields belong to `error_contracts.md`.
+
+## Robot policy OpenPI contract
+
+The first robot-policy serving boundary is the existing OpenPI-compatible
+websocket route:
+
+```text
+/v1/realtime/robot/openpi
+```
+
+The wire payload stays compatible with OpenPI clients. For docs, validation,
+and examples, serving should be explainable with these semantic fields:
+
+```python
+{
+    "instruction": ...,  # task or language instruction, often "prompt"
+    "images": ...,       # camera observations
+    "state": ...,        # robot proprioception or state, if used
+    "session_id": ...,   # optional session identity
+    "reset": ...,        # optional reset signal
+    "extra": ...,        # model-specific extension fields
+}
+```
+
+OpenPI serving forwards the raw observation to the diffusion request through
+`sampling_params.extra_args["robot_obs"]`, plus serving-owned `session_id` and
+`reset` fields. Model pipelines own image processing, state encoding, prompt
+construction, action denoising, action unnormalization, and any low-latency
+backend choices.
+
+Action-producing pipelines should prefer the canonical diffusion envelope:
+
+```python
+{
+    "payload": {"actions": actions},
+    "metadata": {
+        "actions": {
+            "raw_action_dim": ...,
+            "action_mode": ...,
+            "domain_id": ...,
+            # Optional robot-policy fields. None are required in phase 1.
+            "horizon": ...,
+            "action_horizon": ...,  # compatibility with existing handshake keys
+            "action_dim": ...,
+            "valid_steps": ...,
+            "action_space": ...,
+        }
+    },
+}
+```
+
+After diffusion output formatting, serving readers must find actions at
+`multimodal_output["actions"]` and action metadata, when present, at
+`multimodal_output["metadata"]["actions"]`. The OpenPI route currently sends
+only actions back on the websocket, but it validates the normalized
+multimodal output so tests and future adapters share one action contract.
+
+`policy_server_config` remains the handshake source for model capabilities and
+client setup. Phase 1 does not make it the strict source of truth for every
+action-output shape field.
 
 ## Candidate invariants
 
