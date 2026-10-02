@@ -17,7 +17,7 @@ def test_dreamzero_resolves_through_registry_with_model_defaults(monkeypatch):
     )
     monkeypatch.setattr(
         "vllm_omni.config.config_factory.StageConfigFactory.get_hf_config",
-        classmethod(lambda _cls, model, trust_remote_code=True: None),
+        classmethod(lambda _cls, model, trust_remote_code=True, revision=None: None),
     )
     monkeypatch.setattr(
         "vllm_omni.config.config_factory._looks_like_dreamzero",

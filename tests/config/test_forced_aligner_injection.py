@@ -102,7 +102,7 @@ def test_aligner_uses_completed_audio_without_disabling_upstream_chunks(async_ch
     assert deploy.stages == []
 
 
-def test_injected_aligner_survives_typed_config_and_runtime_projections():
+def test_injected_aligner_survives_typed_config_and_runtime_projections(local_model_configs_only):
     pipeline, deploy = inject_forced_aligner_stage(
         _PIPELINE_REGISTRY["qwen3_tts"],
         DeployConfig(),

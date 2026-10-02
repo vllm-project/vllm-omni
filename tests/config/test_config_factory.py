@@ -13,8 +13,7 @@ import pytest
 from transformers import PretrainedConfig, Qwen3OmniMoeConfig
 
 from tests.helpers.stage_config import get_deploy_config_path, get_deploy_config_stage
-from vllm_omni.config import config_factory as config_factory_module
-from vllm_omni.config.config_factory import StageConfigFactory, _materialize_object_storage_configs
+from vllm_omni.config.config_factory import StageConfigFactory
 from vllm_omni.config.endpoint_policy import EndpointRestriction, OmniServingCapability
 from vllm_omni.config.omni_config import VllmOmniConfig
 from vllm_omni.config.pipeline_registry import OMNI_PIPELINES, register_pipeline, resolve_pipeline_config
@@ -38,6 +37,7 @@ from vllm_omni.config.stage_config import (
 )
 from vllm_omni.diffusion.data import DiffusionParallelConfig
 from vllm_omni.engine.arg_utils import SHARED_FIELDS, internal_blacklist_keys
+from vllm_omni.utils.model_source import materialize_object_storage_configs
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -62,7 +62,7 @@ def clear_config_factory_caches():
     yield
     StageConfigFactory.get_hf_config.cache_clear()
     StageConfigFactory.try_infer_model_type.cache_clear()
-    _materialize_object_storage_configs.cache_clear()
+    materialize_object_storage_configs.cache_clear()
 
 
 Q3_OMNI_ALL_STAGES_HF_CONFIG = Qwen3OmniMoeConfig(enable_audio_output=True)
@@ -437,6 +437,31 @@ class TestStageConfig:
 
 class TestStageConfigFactory:
     """Tests for StageConfigFactory class."""
+
+    def test_hf_config_cache_is_revision_aware(self):
+        configs = {revision: PretrainedConfig(revision=revision) for revision in ("rev-a", "rev-b")}
+        with patch(
+            "vllm_omni.config.config_factory.get_config",
+            side_effect=lambda _model, *, trust_remote_code, revision: configs[revision],
+        ) as get_config:
+            rev_a = StageConfigFactory.get_hf_config(
+                model="revision-aware/model", trust_remote_code=False, revision="rev-a"
+            )
+            assert get_config.call_count == 1
+            assert rev_a is configs["rev-a"]
+
+            rev_b = StageConfigFactory.get_hf_config(
+                model="revision-aware/model", trust_remote_code=False, revision="rev-b"
+            )
+            assert get_config.call_count == 2
+            assert rev_b is configs["rev-b"]
+
+            # Cached lookup for the revision returns the same object & doesn't call again
+            cached_rev_a = StageConfigFactory.get_hf_config(
+                model="revision-aware/model", trust_remote_code=False, revision="rev-a"
+            )
+            assert get_config.call_count == 2
+            assert cached_rev_a is rev_a
 
     def test_default_diffusion_no_yaml(self):
         """Test single-stage diffusion works without YAML config (@ZJY0516)."""
@@ -1071,7 +1096,7 @@ class TestPipelineRegistration:
 
         assert pipeline_cfg is None
 
-    def test_create_from_model_returns_structured_omni_config(self):
+    def test_create_from_model_returns_structured_omni_config(self, local_model_configs_only):
         class FakeConfig(PretrainedConfig):
             model_type = "qwen3_tts"
 
@@ -1087,7 +1112,7 @@ class TestPipelineRegistration:
         assert omni_config.pipeline_config is OMNI_PIPELINES["qwen3_tts"]
         assert len(omni_config.stage_configs) == 2
 
-    def test_create_from_model_preserves_model_on_structured_diffusion_stage(self):
+    def test_create_from_model_preserves_model_on_structured_diffusion_stage(self, local_model_configs_only):
         class FakeConfig(PretrainedConfig):
             model_type = "dreamzero"
 
@@ -1219,7 +1244,7 @@ class TestPipelineRegistration:
                 "trust_remote_code": True,
                 "model": "fake/model",
             }
-            mock_get_config.assert_called_once_with("fake/model", trust_remote_code=True)
+            mock_get_config.assert_called_once_with("fake/model", trust_remote_code=True, revision=None)
 
         with patch.object(StageConfigFactory, "_create_legacy_from_registry", return_value=([], None)) as mock_legacy:
             StageConfigFactory.create_legacy_stage_configs_from_model(
@@ -1244,7 +1269,9 @@ class TestPipelineRegistration:
         assert resolved_config is not None
         assert len(resolved_config.stage_configs) > 0
 
-    def test_legacy_and_structured_paths_share_deploy_pipeline_override(self, clean_pipeline_registry, tmp_path):
+    def test_legacy_and_structured_paths_share_deploy_pipeline_override(
+        self, clean_pipeline_registry, tmp_path, local_model_configs_only
+    ):
         pipeline_key = "deploy_only_pipeline"
         pipe_cfg = PipelineConfig(
             model_type=pipeline_key,
@@ -1280,7 +1307,9 @@ class TestPipelineRegistration:
         assert len(legacy_configs) == 1
         assert legacy_configs[0].yaml_engine_args["model_arch"] == "DeployOnlyArch"
 
-    def test_structured_path_loads_explicit_deploy_config_once(self, clean_pipeline_registry, tmp_path):
+    def test_structured_path_loads_explicit_deploy_config_once(
+        self, clean_pipeline_registry, tmp_path, local_model_configs_only
+    ):
         pipeline_key = "single_load_pipeline"
         pipeline_cfg = PipelineConfig(
             model_type=pipeline_key,
@@ -3642,7 +3671,7 @@ class TestObjectStorageConfigResolution:
                 for name, content in materialized_files:
                     (tmp_path / name).write_text(content)
 
-        monkeypatch.setattr(config_factory_module, "ObjectStorageModel", FakeObjectStorageModel)
+        monkeypatch.setattr("vllm_omni.utils.model_source.ObjectStorageModel", FakeObjectStorageModel)
 
         class Recorder:
             def __init__(self) -> None:
@@ -3655,15 +3684,15 @@ class TestObjectStorageConfigResolution:
         return Recorder()
 
     def test_passthrough_for_non_uri(self, fake_object_storage):
-        assert _materialize_object_storage_configs("org/model") == "org/model"
-        assert _materialize_object_storage_configs("/local/model") == "/local/model"
+        assert materialize_object_storage_configs("org/model") == "org/model"
+        assert materialize_object_storage_configs("/local/model") == "/local/model"
         assert fake_object_storage.pulls == []
 
     def test_materialize_pulls_configs_once_per_uri(self, fake_object_storage):
         uri = "s3://bucket/model"
 
-        first = _materialize_object_storage_configs(uri)
-        second = _materialize_object_storage_configs(uri)
+        first = materialize_object_storage_configs(uri)
+        second = materialize_object_storage_configs(uri)
 
         assert first == second
         assert len(fake_object_storage.pulls) == 1

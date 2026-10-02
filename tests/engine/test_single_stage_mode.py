@@ -47,11 +47,11 @@ def _make_stage_cfg(stage_id: int, stage_type: str = "llm"):
         stage_id=stage_id,
         stage_type=stage_type,
         runtime=SimpleNamespace(devices="0"),
-        engine_args=SimpleNamespace(
-            async_chunk=False,
-            model_stage=None,
-            engine_output_type=None,
-        ),
+        engine_args={
+            "async_chunk": False,
+            "model_stage": None,
+            "engine_output_type": None,
+        },
     )
 
 
@@ -93,7 +93,10 @@ def _make_llm_plan(
                 stage_connector_spec={},
                 omni_kv_connector=(None, None, None),
                 stage_vllm_config=vllm_config
-                or SimpleNamespace(parallel_config=SimpleNamespace(data_parallel_size_local=1)),
+                or SimpleNamespace(
+                    quant_config=None,
+                    parallel_config=SimpleNamespace(data_parallel_size_local=1),
+                ),
                 executor_class=object,
                 engine_args_dict={},
             )
@@ -667,7 +670,9 @@ class TestSingleStageInitialization:
             omni_master_port=26000,
         )
 
-    def test_build_logical_stage_init_plans_marks_non_matching_stage_remote(self, mocker: MockerFixture):
+    def test_build_logical_stage_init_plans_marks_non_matching_stage_remote(
+        self, mocker: MockerFixture, local_model_configs_only
+    ):
         import vllm_omni.engine.stage_runtime as runtime_mod
 
         stage_cfgs = [_make_stage_cfg(0), _make_stage_cfg(1)]
@@ -687,7 +692,11 @@ class TestSingleStageInitialization:
         monkeypatch.setattr(runtime_mod, "get_stage_connector_spec", lambda **_: {})
         monkeypatch.setattr(runtime_mod, "resolve_omni_kv_config_for_stage", lambda *_: (None, None, None))
         monkeypatch.setattr(runtime_mod, "build_engine_args_dict", lambda *_, **__: {})
-        monkeypatch.setattr(runtime_mod, "build_vllm_config", lambda *_, **__: (SimpleNamespace(), object))
+        monkeypatch.setattr(
+            runtime_mod,
+            "build_vllm_config",
+            lambda *_, **__: (SimpleNamespace(quant_config=None), object),
+        )
         try:
             stage_plans = runtime._build_logical_stage_init_plans(None, [1, 1], {})
         finally:
@@ -767,7 +776,7 @@ class TestSingleStageInitialization:
             runtime._start_omni_master_server([_make_llm_plan(0, stage_id=0, launch_mode="local")])
 
     def test_build_logical_stage_init_plans_preserves_runtime_cfg_for_local_llm_in_single_stage_mode(
-        self, mocker: MockerFixture
+        self, mocker: MockerFixture, local_model_configs_only
     ):
         import vllm_omni.engine.stage_runtime as runtime_mod
 
@@ -790,7 +799,10 @@ class TestSingleStageInitialization:
         monkeypatch.setattr(
             runtime_mod,
             "build_vllm_config",
-            lambda *_, **__: (SimpleNamespace(parallel_config=SimpleNamespace(data_parallel_size_local=1)), object),
+            lambda *_, **__: (
+                SimpleNamespace(quant_config=None, parallel_config=SimpleNamespace(data_parallel_size_local=1)),
+                object,
+            ),
         )
         try:
             stage_plans = runtime._build_logical_stage_init_plans(None, [1], {})
@@ -824,7 +836,7 @@ class TestSingleStageInitialization:
             runtime._validate_single_stage_mode_replica_constraints()
 
     def test_build_logical_stage_init_plans_preserves_diffusion_runtime_cfg_in_single_stage_mode(
-        self, mocker: MockerFixture
+        self, mocker: MockerFixture, local_model_configs_only
     ):
         import vllm_omni.engine.stage_runtime as runtime_mod
 
@@ -953,7 +965,9 @@ class TestSingleStageReplicaInitialization:
         runtime._omni_master_server = mocker.Mock(spec=OmniMasterServer)
         runtime._omni_master_server.get_stage_config.return_value = {"stage_id": 1, "stage_type": "llm"}
 
-        fake_vllm_config = SimpleNamespace(parallel_config=SimpleNamespace(data_parallel_size_local=1))
+        fake_vllm_config = SimpleNamespace(
+            quant_config=None, parallel_config=SimpleNamespace(data_parallel_size_local=1)
+        )
         fake_addresses = SimpleNamespace(
             inputs=["tcp://in"], outputs=["tcp://out"], frontend_stats_publish_address=None
         )
@@ -1041,7 +1055,9 @@ class TestSingleStageReplicaInitialization:
         runtime._omni_master_server = mocker.Mock(spec=OmniMasterServer)
         runtime._omni_master_server.get_stage_config.return_value = {"stage_id": 1, "stage_type": "llm"}
 
-        fake_vllm_config = SimpleNamespace(parallel_config=SimpleNamespace(data_parallel_size_local=1))
+        fake_vllm_config = SimpleNamespace(
+            quant_config=None, parallel_config=SimpleNamespace(data_parallel_size_local=1)
+        )
         fake_addresses = SimpleNamespace(
             inputs=["tcp://in"], outputs=["tcp://out"], frontend_stats_publish_address=None
         )
@@ -1093,7 +1109,7 @@ class TestSingleStageReplicaInitialization:
         runtime._coordinator_runtime = None
         runtime._stage_configs = []
 
-        fake_vllm_config = SimpleNamespace(parallel_config=SimpleNamespace())
+        fake_vllm_config = SimpleNamespace(quant_config=None, parallel_config=SimpleNamespace())
         fake_addresses = SimpleNamespace(
             inputs=["tcp://in"], outputs=["tcp://out"], frontend_stats_publish_address=None
         )

@@ -12,7 +12,7 @@ import vllm_omni.diffusion.diffusion_kv.initialization as initialization
 import vllm_omni.diffusion.vllm_config as diffusion_vllm_config
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.sched.request_scheduler import RequestScheduler
-from vllm_omni.quantization import build_quant_config
+from vllm_omni.quantization import build_quantization_config
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
@@ -242,7 +242,7 @@ def test_native_config_counts_cfg_rows_once(enable_prefix_caching, requests, row
 
 
 def test_diffusion_vllm_model_config_supplies_dtype_for_quant_methods() -> None:
-    quantization_config = build_quant_config(
+    quantization_config = build_quantization_config(
         {
             "quant_method": "modelopt",
             "quant_algo": "FP8",

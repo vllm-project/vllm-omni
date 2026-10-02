@@ -720,6 +720,7 @@ def test_initialize_model_sets_current_diffusion_config_during_model_constructio
 
     od_config = SimpleNamespace(
         model_class_name="DummyPipeline",
+        quantization_config=None,
         parallel_config=SimpleNamespace(vae_patch_parallel_size=1, sequence_parallel_size=1),
         vae_use_slicing=False,
         vae_use_tiling=False,

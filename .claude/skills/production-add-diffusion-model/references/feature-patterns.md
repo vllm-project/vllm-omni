@@ -33,9 +33,9 @@ validation before writing a recipe.
 The public builder accepts one method or a longest-prefix component map:
 
 ```python
-from vllm_omni.quantization import build_quant_config
+from vllm_omni.quantization import build_quantization_config
 
-config = build_quant_config({
+config = build_quantization_config({
     "transformer": {
         "method": "fp8",
         "ignored_layers": ["transformer.final_layer"],

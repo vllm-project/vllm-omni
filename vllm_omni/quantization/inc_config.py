@@ -1,24 +1,23 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Extended INC/AutoRound config for multi-stage omni models."""
 
 from __future__ import annotations
 
+import inspect
 from os.path import commonprefix
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import torch
 from torch.nn import Module
 from vllm.model_executor.layers.linear import LinearMethodBase
+from vllm.model_executor.layers.quantization import register_quantization_config
 from vllm.model_executor.layers.quantization.inc import INCConfig
 from vllm.model_executor.models.utils import WeightsMapper
 from vllm.model_executor.parameter import ModelWeightParameter
 from vllm.model_executor.utils import replace_parameter
 
-if TYPE_CHECKING:
-    from vllm.model_executor.layers.quantization.base_config import (
-        QuantizationConfig,
-    )
+from vllm_omni.quantization.factory import get_quantization_method
 
 _REGEX_SPECIAL_CHARS = frozenset(r"*+?^$()[]{}|\\")
 
@@ -49,6 +48,10 @@ def _map_with_stage_prefix(
     return result
 
 
+# Register Intel Neural Compressor quantization under "inc" only to match vLLM;
+# Then AutoRound is handled in override_quantization_method below rather than
+# as aliases in the registry.
+@register_quantization_config("inc")
 class OmniINCConfig(INCConfig):
     """INCConfig extended with multi-stage prefix remapping and MXFP8 support.
 
@@ -65,6 +68,34 @@ class OmniINCConfig(INCConfig):
     # Extend supported data types and formats to include MXFP8
     SUPPORTED_DTYPES = {"int", "mx_fp"}
     SUPPORTED_FORMATS = {"auto_round:auto_gptq", "auto_round:auto_awq", "auto_round:llm_compressor"}
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        # bits and weight_bits are aliases; we should consider getting rid of this unless
+        # there is a concrete need for it, but for now porting to keep the behavior in the
+        # original builder pattern.
+        if "bits" in kwargs:
+            bits = kwargs.pop("bits")
+            if kwargs.setdefault("weight_bits", bits) != bits:
+                raise ValueError(f"Conflicting bit widths: bits={bits}, weight_bits={kwargs['weight_bits']}.")
+
+        # Filter to only valid INCConfig params from vLLM
+        valid = frozenset(inspect.signature(INCConfig.__init__).parameters) - {"self"}
+        filtered = {k: v for k, v in kwargs.items() if k in valid}
+        super().__init__(*args, **filtered)
+
+    @classmethod
+    def override_quantization_method(cls, hf_quant_cfg, user_quant, hf_config=None):
+        """Claim AutoRound checkpoints for INC, accepting both name spellings.
+
+        NOTE: vLLM's INCConfig only matches "auto-round"; we also accept the
+        "auto_round" underscore variant so either spelling resolves to inc.
+
+        Ref: https://github.com/vllm-project/vllm/blob/v0.28.0/vllm/model_executor/layers/quantization/inc/inc.py#L253
+        """
+        if get_quantization_method(hf_quant_cfg) == "auto_round":
+            return cls.get_name()
+        # Canonical "auto-round" (and anything else) is delegated to the parent.
+        return super().override_quantization_method(hf_quant_cfg, user_quant, hf_config)
 
     # ------------------------------------------------------------------
     # Core integration: called by vLLM's configure_quant_config()
@@ -140,36 +171,6 @@ class OmniINCConfig(INCConfig):
             self.extra_config = new_extra
         elif self.extra_config is not None:
             self.extra_config = hf_to_vllm_mapper.apply_dict(self.extra_config)
-
-    # ------------------------------------------------------------------
-    # Upgrading a vanilla INCConfig created by vLLM
-    # ------------------------------------------------------------------
-
-    @classmethod
-    def from_inc_config(cls, inc: INCConfig) -> OmniINCConfig:
-        """Promote a vanilla :class:`INCConfig` to :class:`OmniINCConfig`.
-
-        Copies all attributes so that the new instance is a drop-in
-        replacement.
-        """
-        omni = object.__new__(cls)
-        omni.__dict__.update(inc.__dict__)
-        return omni
-
-    @classmethod
-    def maybe_upgrade(cls, quant_config: QuantizationConfig | None) -> QuantizationConfig | None:
-        """Upgrade *quant_config* to :class:`OmniINCConfig` if applicable.
-
-        Returns the original config unchanged when it is not an INC
-        config or is already an :class:`OmniINCConfig`.
-        """
-        if quant_config is None:
-            return None
-        if isinstance(quant_config, cls):
-            return quant_config
-        if isinstance(quant_config, INCConfig):
-            return cls.from_inc_config(quant_config)
-        return quant_config
 
 
 # ---------------------------------------------------------------------------

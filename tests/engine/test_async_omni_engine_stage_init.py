@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from subprocess import CompletedProcess
 
 import pytest
-from omegaconf import OmegaConf
+from omegaconf import DictConfig, OmegaConf
 from vllm.v1.engine.utils import EngineZmqAddresses
 
 from tests.helpers.mock import patch_hf_snapshot_download
@@ -35,6 +35,13 @@ from vllm_omni.engine.stage_runtime import StageRuntime
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
+def _stage_config(stage_type: str, **engine_args: object) -> DictConfig:
+    return OmegaConf.create(
+        {"stage_type": stage_type, "engine_args": engine_args},
+        flags={"allow_objects": True},
+    )
+
+
 @dataclass
 class _FakeParallelConfig:
     enable_fault_tolerance: bool = False
@@ -46,6 +53,7 @@ class _FakeParallelConfig:
 @dataclass
 class _FakeVllmConfig:
     parallel_config: _FakeParallelConfig = field(default_factory=_FakeParallelConfig)
+    quant_config: object = None
 
 
 @dataclass
@@ -254,13 +262,26 @@ def _make_diffusion_plan(
     )
 
 
-def _make_stage_runtime() -> StageRuntime:
+def _make_stage_runtime(
+    stage_configs: list[object] | None = None,
+    *,
+    stage_init_timeout: int = 1,
+    log_stats: bool = False,
+) -> StageRuntime:
     return StageRuntime(
-        stage_configs=[],
+        stage_configs=stage_configs or [],
         model="dummy-model",
         config_path="dummy-config",
-        stage_init_timeout=1,
+        stage_init_timeout=stage_init_timeout,
         async_chunk=False,
+        log_stats=log_stats,
+    )
+
+
+def _make_vllm_config_like() -> types.SimpleNamespace:
+    return types.SimpleNamespace(
+        quant_config=None,
+        model_config=types.SimpleNamespace(max_model_len=64),
     )
 
 
@@ -395,7 +416,7 @@ def test_compute_replica_layout_covers_every_replica_when_devices_unset():
     assert replica_devices_map == {0: [None, None, None]}
 
 
-def test_build_logical_stage_init_plans_handles_stage_without_devices(monkeypatch):
+def test_build_logical_stage_init_plans_handles_stage_without_devices(monkeypatch, local_model_configs_only):
     """Regression: a multi-replica stage with no ``devices`` must still plan.
 
     ``_build_logical_stage_init_plans`` indexes ``replica_devices_map`` by
@@ -410,13 +431,7 @@ def test_build_logical_stage_init_plans_handles_stage_without_devices(monkeypatc
         engine_args={},
         runtime=types.SimpleNamespace(num_replicas=3),
     )
-    runtime = StageRuntime(
-        stage_configs=[stage_cfg],
-        model="dummy-model",
-        config_path="dummy-config",
-        stage_init_timeout=1,
-        async_chunk=False,
-    )
+    runtime = _make_stage_runtime([stage_cfg])
 
     monkeypatch.setattr(
         runtime_mod,
@@ -426,7 +441,11 @@ def test_build_logical_stage_init_plans_handles_stage_without_devices(monkeypatc
     monkeypatch.setattr(runtime_mod, "get_stage_connector_spec", lambda **_: {})
     monkeypatch.setattr(runtime_mod, "resolve_omni_kv_config_for_stage", lambda *_: (None, None, None))
     monkeypatch.setattr(runtime_mod, "build_engine_args_dict", lambda *_, **__: {})
-    monkeypatch.setattr(runtime_mod, "build_vllm_config", lambda *_args, **_kwargs: (types.SimpleNamespace(), object))
+    monkeypatch.setattr(
+        runtime_mod,
+        "build_vllm_config",
+        lambda *_args, **_kwargs: (types.SimpleNamespace(quant_config=None), object),
+    )
 
     replicas_per_stage, replica_devices_map = compute_replica_layout([stage_cfg])
     stage_plans = runtime._build_logical_stage_init_plans(
@@ -502,13 +521,7 @@ def test_initialize_local_diffusion_replica_restores_device_visibility_after_loc
     from vllm_omni.engine.stage_engine_startup import StageReplicaResources
     from vllm_omni.platforms import current_omni_platform
 
-    runtime = StageRuntime(
-        stage_configs=[],
-        model="dummy-model",
-        config_path="dummy-config",
-        stage_init_timeout=1,
-        async_chunk=False,
-    )
+    runtime = _make_stage_runtime()
 
     plan = _make_diffusion_plan(0, stage_id=0).replicas[0]
 
@@ -546,13 +559,7 @@ def test_initialize_local_diffusion_replica_passes_stage_init_timeout_and_inline
     import vllm_omni.engine.stage_runtime as runtime_mod
     from vllm_omni.engine.stage_engine_startup import StageReplicaResources
 
-    runtime = StageRuntime(
-        stage_configs=[types.SimpleNamespace()] * num_stages,
-        model="dummy-model",
-        config_path="dummy-config",
-        stage_init_timeout=1,
-        async_chunk=False,
-    )
+    runtime = _make_stage_runtime([types.SimpleNamespace()] * num_stages)
 
     plan = _make_diffusion_plan(0, stage_id=0).replicas[0]
 
@@ -607,7 +614,7 @@ def test_initialize_local_llm_replica_scopes_runtime_env(monkeypatch):
     import vllm_omni.engine.stage_runtime as runtime_mod
 
     runtime = _make_stage_runtime()
-    plan = _make_llm_plan(0, stage_id=0, vllm_config=object()).replicas[0]
+    plan = _make_llm_plan(0, stage_id=0, vllm_config=types.SimpleNamespace(quant_config=None)).replicas[0]
     plan.engine_args_dict = {}
 
     runtime_env_var = "VLLM_OMNI_TEST_STAGE_RUNTIME_ENV"
@@ -671,6 +678,7 @@ def test_initialize_diffusion_stage_preserves_configured_max_num_seqs(monkeypatc
         metadata,
         stage_init_timeout=12,
         use_inline=True,
+        quantization_config=None,
     )
 
     assert od_config.max_num_seqs == 4
@@ -751,8 +759,10 @@ def test_launch_diffusion_stage_replica_preserves_configured_max_num_seqs(monkey
             stage_init_timeout=12,
             use_inline=False,
             omni_master_server=omni_master_server,
+            omni_coordinator_address=None,
             stage_visible_devices="1",
             spawn_device_lock=spawn_lock,
+            quantization_config=None,
         )
 
     assert not spawn_lock.locked()
@@ -783,6 +793,7 @@ def test_initialize_diffusion_stage_does_not_write_max_num_seqs(monkeypatch):
         metadata,
         stage_init_timeout=12,
         use_inline=True,
+        quantization_config=None,
     )
 
     assert od_config.max_num_seqs == 8
@@ -834,6 +845,10 @@ def test_launch_diffusion_stage_replica_preserves_step_execution_max_num_seqs(mo
         stage_init_timeout=12,
         use_inline=False,
         omni_master_server=omni_master_server,
+        omni_coordinator_address=None,
+        stage_visible_devices=None,
+        spawn_device_lock=None,
+        quantization_config=None,
     )
 
     assert od_config.max_num_seqs == 8
@@ -842,16 +857,10 @@ def test_launch_diffusion_stage_replica_preserves_step_execution_max_num_seqs(mo
 def test_stage_runtime_initializes_stage_pools(monkeypatch):
     import vllm_omni.engine.stage_runtime as runtime_mod
 
-    runtime = StageRuntime(
-        stage_configs=[types.SimpleNamespace(), types.SimpleNamespace()],
-        model="dummy-model",
-        config_path="dummy-config",
-        stage_init_timeout=1,
-        async_chunk=False,
-    )
+    runtime = _make_stage_runtime([types.SimpleNamespace(), types.SimpleNamespace()])
 
-    cfg0 = types.SimpleNamespace(model_config=types.SimpleNamespace(max_model_len=64))
-    cfg1 = types.SimpleNamespace(model_config=types.SimpleNamespace(max_model_len=64))
+    cfg0 = _make_vllm_config_like()
+    cfg1 = _make_vllm_config_like()
     stage_plans = [
         _make_llm_plan(0, stage_id=0, vllm_config=cfg0, num_replicas=2, is_comprehension=True),
         _make_llm_plan(1, stage_id=1, vllm_config=cfg1, final_output=True),
@@ -907,15 +916,8 @@ def test_stage_runtime_initializes_stage_pools(monkeypatch):
 def test_stage_runtime_passes_log_stats_to_llm_replica_launch(monkeypatch):
     import vllm_omni.engine.stage_runtime as runtime_mod
 
-    runtime = StageRuntime(
-        stage_configs=[types.SimpleNamespace()],
-        model="dummy-model",
-        config_path="dummy-config",
-        stage_init_timeout=1,
-        async_chunk=False,
-        log_stats=True,
-    )
-    cfg = types.SimpleNamespace(model_config=types.SimpleNamespace(max_model_len=64))
+    runtime = _make_stage_runtime([types.SimpleNamespace()], log_stats=True)
+    cfg = _make_vllm_config_like()
     plan = _make_llm_plan(0, stage_id=0, vllm_config=cfg).replicas[0]
     plan.engine_args_dict = {}
 
@@ -1290,15 +1292,8 @@ def test_stage_runtime_multi_api_failure_shuts_down_before_exceptional_context_e
 def test_stage_runtime_passes_log_stats_to_output_processor(monkeypatch):
     import vllm_omni.engine.stage_runtime as runtime_mod
 
-    runtime = StageRuntime(
-        stage_configs=[types.SimpleNamespace()],
-        model="dummy-model",
-        config_path="dummy-config",
-        stage_init_timeout=1,
-        async_chunk=False,
-        log_stats=True,
-    )
-    cfg = types.SimpleNamespace(model_config=types.SimpleNamespace(max_model_len=64))
+    runtime = _make_stage_runtime([types.SimpleNamespace()], log_stats=True)
+    cfg = _make_vllm_config_like()
     stage_plan = _make_llm_plan(0, stage_id=0, vllm_config=cfg)
     stage_client = types.SimpleNamespace(
         stage_type="llm",
@@ -1332,22 +1327,18 @@ def test_stage_runtime_passes_log_stats_to_output_processor(monkeypatch):
     }
 
 
-def test_build_logical_stage_init_plans_applies_replica_device_splits(monkeypatch):
+def test_build_logical_stage_init_plans_applies_replica_device_splits(monkeypatch, local_model_configs_only):
     import vllm_omni.engine.stage_runtime as runtime_mod
 
-    runtime = StageRuntime(
-        stage_configs=[
+    runtime = _make_stage_runtime(
+        [
             types.SimpleNamespace(
                 stage_id=0, stage_type="llm", engine_args={}, runtime=types.SimpleNamespace(devices="0")
             ),
             types.SimpleNamespace(
                 stage_id=1, stage_type="llm", engine_args={}, runtime=types.SimpleNamespace(devices="1,2,3")
             ),
-        ],
-        model="dummy-model",
-        config_path="dummy-config",
-        stage_init_timeout=1,
-        async_chunk=False,
+        ]
     )
 
     metadata_by_stage = {
@@ -1366,7 +1357,10 @@ def test_build_logical_stage_init_plans_applies_replica_device_splits(monkeypatc
     monkeypatch.setattr(
         runtime_mod,
         "build_vllm_config",
-        lambda stage_cfg, *_args, **_kwargs: (types.SimpleNamespace(tag=f"cfg-{stage_cfg.stage_id}"), object),
+        lambda stage_cfg, *_args, **_kwargs: (
+            types.SimpleNamespace(tag=f"cfg-{stage_cfg.stage_id}", quant_config=None),
+            object,
+        ),
     )
 
     stage_plans = runtime._build_logical_stage_init_plans(
@@ -1382,16 +1376,10 @@ def test_build_logical_stage_init_plans_applies_replica_device_splits(monkeypatc
 
 
 def test_initialize_stage_replicas_collects_results_by_stage_and_replica_id(monkeypatch):
-    runtime = StageRuntime(
-        stage_configs=[],
-        model="dummy-model",
-        config_path="dummy-config",
-        stage_init_timeout=123,
-        async_chunk=False,
-    )
+    runtime = _make_stage_runtime(stage_init_timeout=123)
 
-    cfg0 = types.SimpleNamespace(model_config=types.SimpleNamespace(max_model_len=64))
-    cfg1 = types.SimpleNamespace(model_config=types.SimpleNamespace(max_model_len=64))
+    cfg0 = _make_vllm_config_like()
+    cfg1 = _make_vllm_config_like()
     stage_plans = [
         _make_llm_plan(0, stage_id=0, vllm_config=cfg0, num_replicas=2),
         _make_llm_plan(1, stage_id=1, vllm_config=cfg1, num_replicas=2),
@@ -1419,17 +1407,11 @@ def test_initialize_stage_replicas_collects_results_by_stage_and_replica_id(monk
 
 
 def test_remote_replicas_use_distinct_init_group_keys():
-    runtime = StageRuntime(
-        stage_configs=[],
-        model="dummy-model",
-        config_path="dummy-config",
-        stage_init_timeout=123,
-        async_chunk=False,
-    )
+    runtime = _make_stage_runtime(stage_init_timeout=123)
     plan = _make_llm_plan(
         1,
         stage_id=1,
-        vllm_config=types.SimpleNamespace(model_config=types.SimpleNamespace(max_model_len=64)),
+        vllm_config=_make_vllm_config_like(),
         num_replicas=2,
     )
 
@@ -1441,15 +1423,9 @@ def test_remote_replicas_use_distinct_init_group_keys():
 
 
 def test_initialize_stages_cleans_up_successful_replicas_after_partial_multi_replica_failure(monkeypatch):
-    runtime = StageRuntime(
-        stage_configs=[types.SimpleNamespace()],
-        model="dummy-model",
-        config_path="dummy-config",
-        stage_init_timeout=1,
-        async_chunk=False,
-    )
+    runtime = _make_stage_runtime([types.SimpleNamespace()])
 
-    cfg0 = types.SimpleNamespace(model_config=types.SimpleNamespace(max_model_len=64))
+    cfg0 = _make_vllm_config_like()
     stage_plans = [_make_llm_plan(0, stage_id=0, vllm_config=cfg0, num_replicas=2)]
     initialized_client = types.SimpleNamespace(shutdown=lambda: None)
 
@@ -1477,15 +1453,9 @@ def test_initialize_stages_cleans_up_successful_replicas_after_partial_multi_rep
 
 
 def test_initialize_stages_cleans_up_late_successful_replicas_after_early_multi_replica_failure(monkeypatch):
-    runtime = StageRuntime(
-        stage_configs=[types.SimpleNamespace()],
-        model="dummy-model",
-        config_path="dummy-config",
-        stage_init_timeout=1,
-        async_chunk=False,
-    )
+    runtime = _make_stage_runtime([types.SimpleNamespace()])
 
-    cfg0 = types.SimpleNamespace(model_config=types.SimpleNamespace(max_model_len=64))
+    cfg0 = _make_vllm_config_like()
     stage_plans = [_make_llm_plan(0, stage_id=0, vllm_config=cfg0, num_replicas=2)]
     initialized_client = types.SimpleNamespace(shutdown=lambda: None)
 
@@ -1515,16 +1485,10 @@ def test_initialize_local_llm_replica_passes_stage_init_timeout_to_complete_stag
     import vllm_omni.engine.stage_runtime as runtime_mod
     from vllm_omni.platforms import current_omni_platform
 
-    runtime = StageRuntime(
-        stage_configs=[],
-        model="dummy-model",
-        config_path="dummy-config",
-        stage_init_timeout=1,
-        async_chunk=False,
-    )
+    runtime = _make_stage_runtime()
     stage_init_timeout = 302
 
-    fake_vllm_config = types.SimpleNamespace()
+    fake_vllm_config = types.SimpleNamespace(quant_config=None)
     fake_addresses = types.SimpleNamespace(inputs=["in"], outputs=["out"], frontend_stats_publish_address=None)
     captured_timeout: int | None = None
 
@@ -2516,7 +2480,9 @@ def test_dist_stage_runtime_applies_local_dp_to_stage_config(typed):
 
 @pytest.mark.parametrize("num_replicas", [1, 2, 3])
 @pytest.mark.parametrize("kv_owner", [None, "connector_config", "diffusion_config"])
-def test_typed_diffusion_replicas_share_one_config_between_planning_and_launch(mocker, num_replicas, kv_owner):
+def test_typed_diffusion_replicas_share_one_config_between_planning_and_launch(
+    mocker, num_replicas, kv_owner, local_model_configs_only
+):
     from vllm_omni.config.config_factory import StageConfigFactory
     from vllm_omni.engine import stage_runtime as runtime_module
 
@@ -2576,7 +2542,9 @@ def test_typed_diffusion_replicas_share_one_config_between_planning_and_launch(m
 
 @pytest.mark.parametrize("typed", [False, True], ids=["legacy", "typed"])
 @pytest.mark.parametrize("num_replicas", [1, 2])
-def test_native_kv_producer_replica_identity_and_bootstrap_are_isolated(mocker, typed, num_replicas):
+def test_native_kv_producer_replica_identity_and_bootstrap_are_isolated(
+    mocker, typed, num_replicas, local_model_configs_only
+):
     from vllm.config import KVTransferConfig
 
     from vllm_omni.config.omni_config import VllmOmniARStageConfig
@@ -2619,7 +2587,7 @@ def test_native_kv_producer_replica_identity_and_bootstrap_are_isolated(mocker, 
     mocker.patch.object(
         runtime_module,
         "build_vllm_config",
-        return_value=(types.SimpleNamespace(kv_transfer_config=kv_config), object),
+        return_value=(types.SimpleNamespace(kv_transfer_config=kv_config, quant_config=None), object),
     )
 
     for _ in range(2):
@@ -2773,8 +2741,11 @@ def test_colocated_diffusion_scopes_devices(monkeypatch, fail):
             metadata=plan.metadata,
             stage_init_timeout=1,
             use_inline=True,
+            omni_master_server=None,
+            omni_coordinator_address=None,
             stage_visible_devices="1",
             spawn_device_lock=lock,
+            quantization_config=None,
         )
         assert result is client
     assert os.environ[env_var] == "0,1"

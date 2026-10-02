@@ -11,6 +11,9 @@ import pytest
 import torch
 from vllm.config import DeviceConfig, VllmConfig, set_current_vllm_config
 
+from vllm_omni.config import config_factory
+from vllm_omni.quantization import factory
+
 
 @pytest.fixture(scope="session", autouse=True)
 def default_env():
@@ -54,3 +57,25 @@ def default_vllm_config():
 
     with set_current_vllm_config(VllmConfig(device_config=device_config)):
         yield
+
+
+@pytest.fixture
+def local_model_configs_only(monkeypatch):
+    """Only read HF and checkpoint quantization configs from local model directories.
+    If the model references a fake path, e.g., `test-model`, it resolves with no config
+    or checkpoint quantization without touching HF Hub.
+    """
+    read = factory.read_checkpoint_quantization_config
+    monkeypatch.setattr(
+        factory,
+        "read_checkpoint_quantization_config",
+        lambda model, revision: read(model, revision) if os.path.isdir(model) else None,
+    )
+    get_config = config_factory.get_config
+
+    def _get_config(model, *args, **kwargs):
+        if not os.path.isdir(model):
+            raise OSError(f"{model!r} is not a local model directory")
+        return get_config(model, *args, **kwargs)
+
+    monkeypatch.setattr(config_factory, "get_config", _get_config)

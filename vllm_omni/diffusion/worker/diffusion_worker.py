@@ -28,6 +28,7 @@ from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
 from vllm.distributed.parallel_state import get_ep_group, get_tp_group
 from vllm.logger import init_logger
+from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.profiler.wrapper import CudaProfilerWrapper, WorkerProfiler
 from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.utils.mem_utils import GiB_bytes, MemorySnapshot, format_gib, memory_profiling
@@ -183,7 +184,7 @@ def _setup_diffusion_worker_proc_title_and_log_prefix(
 
 
 @contextmanager
-def _force_cutlass_fp8_linear_kernel(quant_config: object | None) -> Iterator[None]:
+def _force_cutlass_fp8_linear_kernel(quant_config: QuantizationConfig | None) -> Iterator[None]:
     import vllm.model_executor.layers.quantization.modelopt as vllm_modelopt
 
     # vLLM #49381 replaced the per-format ModelOpt linear methods with the
@@ -214,7 +215,6 @@ def _force_cutlass_fp8_linear_kernel(quant_config: object | None) -> Iterator[No
             finally:
                 vllm_modelopt.init_fp8_linear_kernel = original_init_fp8_linear_kernel
             return
-
     yield
 
 

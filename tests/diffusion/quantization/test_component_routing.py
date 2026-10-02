@@ -206,36 +206,6 @@ class TestApplyVllmMapper:
 
 
 # ===================================================================
-# 2. OmniINCConfig upgrade helpers
-# ===================================================================
-
-
-class TestOmniINCConfigUpgrade:
-    def test_maybe_upgrade_none(self):
-        assert OmniINCConfig.maybe_upgrade(None) is None
-
-    def test_maybe_upgrade_non_inc(self):
-        """Non-INC configs are passed through unchanged."""
-        cfg = _MockQuantConfig("fp8")
-        assert OmniINCConfig.maybe_upgrade(cfg) is cfg
-
-    def test_maybe_upgrade_already_omni(self):
-        """Already OmniINCConfig is returned as-is."""
-        cfg = _make_inc_config()
-        assert OmniINCConfig.maybe_upgrade(cfg) is cfg
-
-    def test_maybe_upgrade_vanilla_inc(self):
-        """Vanilla INCConfig is promoted to OmniINCConfig."""
-        from vllm.model_executor.layers.quantization.inc import INCConfig
-
-        vanilla = INCConfig(weight_bits=4, group_size=128, sym=True)
-        upgraded = OmniINCConfig.maybe_upgrade(vanilla)
-        assert isinstance(upgraded, OmniINCConfig)
-        assert upgraded.weight_bits == 4
-        assert upgraded.group_size == 128
-
-
-# ===================================================================
 # 2. Three-branch thinker routing (simulated)
 # ===================================================================
 

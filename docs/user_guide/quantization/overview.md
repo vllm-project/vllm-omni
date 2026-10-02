@@ -96,12 +96,12 @@ attached to the intended stage rather than applied globally.
 ### Diffusion Model (Qwen-Image, Wan2.2)
 
 The default target is the diffusion transformer. Component routing is available
-through `build_quant_config()`:
+through `build_quantization_config()`:
 
 ```python
-from vllm_omni.quantization import build_quant_config
+from vllm_omni.quantization import build_quantization_config
 
-config = build_quant_config({
+config = build_quantization_config({
     "transformer": {"method": "fp8"},
     "vae": None,
 })
@@ -134,18 +134,18 @@ config = build_quant_config({
 
 ## Python API
 
-`build_quant_config()` accepts strings, dictionaries, per-component
+`build_quantization_config()` accepts strings, dictionaries, per-component
 dictionaries, existing `QuantizationConfig` objects, or `None`.
 
 ```python
-from vllm_omni.quantization import build_quant_config
+from vllm_omni.quantization import build_quantization_config
 
-build_quant_config("fp8")
-build_quant_config({"method": "fp8", "activation_scheme": "static"})
-build_quant_config("bitsandbytes")
-build_quant_config("auto-round", bits=4, group_size=128)
-build_quant_config({"transformer": {"method": "fp8"}, "vae": None})
-build_quant_config(None)
+build_quantization_config("fp8")
+build_quantization_config({"method": "fp8", "activation_scheme": "static"})
+build_quantization_config("bitsandbytes")
+build_quantization_config({"method": "auto-round", "bits": 4, "group_size": 128})
+build_quantization_config({"transformer": {"method": "fp8"}, "vae": None})
+build_quantization_config(None)
 ```
 
 ## Output Similarity Comparison Tool

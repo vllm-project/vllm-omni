@@ -61,7 +61,10 @@ from vllm.model_executor.layers.linear import (
     LinearBase,
     UnquantizedLinearMethod,
 )
-from vllm.model_executor.layers.quantization import QuantizationMethods
+from vllm.model_executor.layers.quantization import (
+    QuantizationMethods,
+    register_quantization_config,
+)
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
@@ -136,6 +139,8 @@ def _validate_smooth_scale(scale: torch.Tensor) -> None:
 # ---------------------------------------------------------------------------
 
 
+# TODO: Not registered as "mxfp4" since vLLM's "mxfp4" is a different scheme (MoE W4A16);
+# rename this to remove the per-stage lookup in quantization.factory.
 class DiffusionMXFP4Config(QuantizationConfig):
     """W4A4 MXFP4 quantization config for diffusion transformers.
 
@@ -919,6 +924,7 @@ def _parse_block_idx(prefix: str) -> int | None:
 # ---------------------------------------------------------------------------
 
 
+@register_quantization_config("mxfp4_dualscale")
 class DiffusionMXFP4DualScaleMixedConfig(QuantizationConfig):
     """W4A4 MXFP4 DualScale with per-layer BF16 fallback for diffusion transformers.
 

@@ -6,6 +6,7 @@ from typing import Any
 
 import pytest
 import torch
+from omegaconf import OmegaConf
 from pydantic import ValidationError
 
 from vllm_omni.config.config_factory import StageConfigFactory
@@ -108,7 +109,9 @@ def test_default_stage_config_preserves_and_overrides_promoted_extras():
         '{"0":{"extras":{"ltx2_use_conv_vae":true}}}',
     ],
 )
-def test_stage_override_preserves_model_extras_for_default_diffusion_stage(mocker, stage_overrides):
+def test_stage_override_preserves_model_extras_for_default_diffusion_stage(
+    mocker, stage_overrides, local_model_configs_only
+):
     """Local/unregistered Diffusers checkpoints still honor stage-0 extras."""
     mocker.patch(
         "vllm_omni.config.resolver.StageConfigFactory.create_from_model",
@@ -162,7 +165,7 @@ def test_legacy_diffusion_stage_rejects_unowned_field(field_name, value):
     metadata = SimpleNamespace(stage_id=0, cfg_kv_collect_func=None)
 
     with pytest.raises(ValueError, match=rf"stage 0.*{field_name}"):
-        build_diffusion_config("unused", stage_cfg, metadata)
+        build_diffusion_config("unused", stage_cfg, metadata, None)
 
 
 @pytest.mark.parametrize(
@@ -193,7 +196,7 @@ def test_legacy_default_stage_build_accepts_engine_adapter_metadata(monkeypatch)
     metadata = SimpleNamespace(stage_id=0, cfg_kv_collect_func=None, default_sampling_params=None)
     monkeypatch.setattr(stage_init_utils.current_omni_platform, "get_device_count", lambda: 1)
 
-    config = stage_init_utils.build_diffusion_config("unused", stage_cfg, metadata)
+    config = stage_init_utils.build_diffusion_config("unused", stage_cfg, metadata, None)
 
     assert config.model == "unused"
 
@@ -311,7 +314,7 @@ def test_default_stage_config_includes_default_sampling_params():
 
 @pytest.mark.parametrize("typed", [False, True], ids=["legacy", "typed"])
 @pytest.mark.parametrize("sampling_defaults", [{"0": {"guidance_scale": 7.5}}, '{"0":{"guidance_scale":7.5}}'])
-def test_generic_diffusion_sampling_defaults_remain_overridable(typed, sampling_defaults):
+def test_generic_diffusion_sampling_defaults_remain_overridable(typed, sampling_defaults, local_model_configs_only):
     from vllm_omni.config.yaml_util import create_config
     from vllm_omni.entrypoints.omni_base import OmniBase
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams
@@ -603,6 +606,8 @@ def test_invalid_diffusion_offload_config_fails_before_model_loading(monkeypatch
             stage_cfg=object(),
             metadata=mocker.Mock(),
             stage_init_timeout=30,
+            use_inline=False,
+            quantization_config=None,
         )
 
     create_client.assert_not_called()
@@ -765,11 +770,13 @@ def test_serve_cli_accepts_additional_config(subcommand_dest):
 
 
 def test_resolve_stage_configs_delegates_overrides_to_resolver(mocker):
-    """The engine consumes resolver output without a second merge pass."""
+    """The engine delegates config creation to the resolver."""
     additional_config = {"torchair_graph_config": {"enabled": True}}
-    fake_diffusion_stage = SimpleNamespace(
-        stage_type="diffusion",
-        engine_args=SimpleNamespace(additional_config=additional_config),
+    fake_diffusion_stage = OmegaConf.create(
+        {
+            "stage_type": "diffusion",
+            "engine_args": {"additional_config": additional_config},
+        }
     )
     resolve_config = mocker.patch(
         "vllm_omni.engine.omni_engine_base.resolve_omni_config",
@@ -778,10 +785,9 @@ def test_resolve_stage_configs_delegates_overrides_to_resolver(mocker):
             stage_configs=(fake_diffusion_stage,),
         ),
     )
-
     engine = AsyncOmniEngine.__new__(AsyncOmniEngine)
 
-    _, stage_configs = engine._resolve_stage_configs(
+    config_path, stage_configs = engine._resolve_stage_configs(
         "dummy-model",
         {
             "deploy_config": "dummy.yaml",
@@ -790,6 +796,7 @@ def test_resolve_stage_configs_delegates_overrides_to_resolver(mocker):
         trust_remote_code=False,
     )
 
+    assert config_path == "dummy.yaml"
     assert stage_configs == [fake_diffusion_stage]
     assert resolve_config.call_args.args == ("dummy-model",)
     assert resolve_config.call_args.kwargs["deploy_config_path"] == "dummy.yaml"
@@ -827,7 +834,7 @@ def test_default_stage_config_includes_quantization_config():
 
 
 @pytest.mark.parametrize("typed", [False, True], ids=["legacy", "typed"])
-def test_default_diffusion_factory_preserves_engine_quantization(typed, monkeypatch):
+def test_default_diffusion_factory_preserves_engine_quantization(typed, monkeypatch, local_model_configs_only):
     monkeypatch.setattr(OmniDiffusionConfig, "_resolve_master_port", lambda _self: 29500)
     monkeypatch.setattr(OmniDiffusionConfig, "enrich_config", lambda _self: None)
     kwargs = {"quantization": "fp8"}
@@ -845,7 +852,7 @@ def test_default_diffusion_factory_preserves_engine_quantization(typed, monkeypa
 
 
 @pytest.mark.parametrize("model_class_name", ["HeliosPipeline", "HunyuanVideo15Pipeline"])
-def test_generic_diffusion_uses_canonical_video_output_type(model_class_name):
+def test_generic_diffusion_uses_canonical_video_output_type(model_class_name, local_model_configs_only):
     config = StageConfigFactory.create_typed_default_diffusion(
         "generic-video",
         {"model_class_name": model_class_name},
@@ -854,7 +861,7 @@ def test_generic_diffusion_uses_canonical_video_output_type(model_class_name):
     assert config.stage_configs[0].final_output_type == "video"
 
 
-def test_generic_diffusion_resolves_structured_stage_without_legacy_conversion(mocker):
+def test_generic_diffusion_resolves_structured_stage_without_legacy_conversion(mocker, local_model_configs_only):
     """Generic diffusion reaches runtime as the structured stage itself."""
     mocker.patch("vllm_omni.config.resolver.StageConfigFactory.create_from_model", return_value=None)
     mocker.patch(
@@ -888,7 +895,7 @@ def test_generic_diffusion_resolves_structured_stage_without_legacy_conversion(m
     assert stage.runtime_config.devices == "0,1,2,3"
 
 
-def test_generic_diffusion_structured_stage_reaches_standard_startup(mocker):
+def test_generic_diffusion_structured_stage_reaches_standard_startup(mocker, local_model_configs_only):
     """Standard runtime resolves and starts the typed stage through the real launcher."""
     from vllm_omni.engine import stage_engine_startup as startup_module
     from vllm_omni.engine import stage_runtime as runtime_module

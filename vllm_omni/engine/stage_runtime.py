@@ -73,6 +73,7 @@ from vllm_omni.entrypoints.stage_utils import resolve_stage_physical_devices
 from vllm_omni.entrypoints.utils import inject_omni_kv_config
 from vllm_omni.outputs.output_metadata import FinalOutputModalityType
 from vllm_omni.platforms import current_omni_platform
+from vllm_omni.quantization.factory import get_stage_quantization_config
 
 logger = init_logger(__name__)
 
@@ -718,6 +719,9 @@ class StageRuntime:
         if not native_kv or stage_vllm_config is None:
             return stage_vllm_config
         replica_vllm_config = copy.deepcopy(stage_vllm_config)
+        # Repoint the quant config to the deepcopied object, since we validate with
+        # object identity in post init when creating the ReplicaInitPlan
+        replica_vllm_config.quant_config = stage_vllm_config.quant_config
         kv_config = replica_vllm_config.kv_transfer_config
         kv_config.engine_id = f"{kv_config.engine_id}-s{replica_metadata.stage_id}-r{replica_metadata.replica_id}"
         if kv_config.kv_connector == "MooncakeConnector" and kv_config.kv_role == "kv_producer":
@@ -772,6 +776,29 @@ class StageRuntime:
             num_replicas = replicas_per_stage[stage_idx]
             launch_mode = self._get_launch_mode(stage_id)
 
+            # TODO: (Alex) - check if we need the else branch here. A lot of the code
+            # in this file is defensive, but it looks like it this case is probably not needed.
+            if isinstance(stage_cfg, BaseVllmOmniStageConfig):
+                stage_quantization = stage_cfg.quantization_config
+                stage_revision = stage_cfg.model_config.revision
+                stage_trust_remote_code = stage_cfg.model_config.trust_remote_code
+                stage_hf_config_name = stage_cfg.hf_config_name
+            else:
+                stage_quantization = stage_cfg.engine_args.get("quantization_config")
+                stage_revision = stage_cfg.engine_args.get("revision")
+                stage_trust_remote_code = stage_cfg.engine_args.get("trust_remote_code", False)
+                stage_hf_config_name = stage_cfg.engine_args.get("hf_config_name")
+            quantization_config = get_stage_quantization_config(
+                self._model,
+                stage_quantization,
+                revision=stage_revision,
+                stage_type=base_metadata.stage_type,
+                trust_remote_code=stage_trust_remote_code,
+                hf_config_name=stage_hf_config_name,
+            )
+            if quantization_config is not None:
+                logger.info("created quantization config of type: %s", type(quantization_config).__name__)
+
             replicas: list[ReplicaInitPlan] = []
             stage_vllm_config = None
             executor_class = None
@@ -809,7 +836,9 @@ class StageRuntime:
                     engine_args_dict=engine_args_dict,
                     api_process_count=self._client_count,
                     api_process_rank=self._api_process_rank,
+                    quantization_config=quantization_config,
                 )
+                quantization_config = stage_vllm_config.quant_config
 
             for replica_id in range(num_replicas):
                 replica_cfg, native_kv = self._prepare_replica_stage_config(
@@ -851,6 +880,7 @@ class StageRuntime:
                         stage_vllm_config=replica_vllm_config,
                         executor_class=executor_class,
                         engine_args_dict=copy.deepcopy(engine_args_dict) if engine_args_dict is not None else None,
+                        quantization_config=quantization_config,
                     )
                 )
 
@@ -1264,6 +1294,7 @@ class StageRuntime:
                     replica_id=plan.replica_id,
                     omni_master_server=self._get_omni_master_server(),
                     omni_coordinator_address=self._get_coordinator_address(),
+                    quantization_config=plan.quantization_config,
                     stage_visible_devices=physical_devices,
                     spawn_device_lock=self._spawn_device_lock,
                 )
