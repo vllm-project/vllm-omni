@@ -13,6 +13,7 @@ from vllm_omni.diffusion.attention.capabilities import (
     ExecutionContext,
     ExecutionPathResult,
 )
+from vllm_omni.diffusion.attention.contracts import MethodCapabilities
 from vllm_omni.platforms import current_omni_platform
 
 
@@ -111,6 +112,9 @@ class AttentionBackend(ABC):
     # tensors instead of materializing a padding mask. Models may use this to
     # avoid a slower masked-attention plan when tail padding is not semantic.
     supports_prefix_kv_slicing: bool = False
+
+    # Providers declare local execution ownership; tracing is backend-owned.
+    strategy_capabilities: MethodCapabilities | None = None
 
     @classmethod
     def get_block_sparse_adapter(cls) -> type[BlockSparseAdapter] | None:

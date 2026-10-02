@@ -139,8 +139,9 @@ class _FinalOnlyStepPipeline:
         return DiffusionOutput(output=state.latents.clone())
 
 
-class _CompileTrackingModel:
+class _CompileTrackingModel(torch.nn.Module):
     def __init__(self):
+        super().__init__()
         self.compile_calls = []
 
     def compile(self, *args, **kwargs):
@@ -598,6 +599,48 @@ def test_compile_transformer_uses_full_granularity(monkeypatch):
     assert model.compile_calls == [((), {"dynamic": False})]
     assert regional_calls == []
     assert runner.pipeline.transformer is model
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+@pytest.mark.parametrize("granularity", ["full", "regional"])
+def test_compile_strategy_respects_granularity(monkeypatch, granularity):
+    from vllm_omni.diffusion.attention.strategy import AttentionStrategyRunner, ForwardStrategyPlan
+
+    class StrategyTrackingModel(_CompileTrackingModel):
+        _repeated_blocks = ["Linear"]
+
+        def __init__(self):
+            super().__init__()
+            self.block = torch.nn.Linear(2, 2)
+            self._attention_strategy_runner = AttentionStrategyRunner(
+                self, ForwardStrategyPlan(("dense", "sparse"), None, ())
+            )
+
+        def forward(self, *args, **kwargs):
+            return None
+
+    model = StrategyTrackingModel()
+    runner = _make_compile_runner(model, compile_granularity=granularity, compile_dynamic=False)
+    compile_calls = []
+
+    def compile_forward(forward, **options):
+        compile_calls.append(options)
+        return forward
+
+    monkeypatch.setattr(torch, "compile", compile_forward)
+    DiffusionModelRunner._compile_transformer(runner, "transformer")
+    assert model._attention_strategy_runner.compiled
+    assert compile_calls == [
+        {
+            "backend": "inductor",
+            "dynamic": False,
+            "fullgraph": False,
+            "recompile_limit": 8,
+            "isolate_recompiles": True,
+        }
+    ] * (2 if granularity == "full" else 1)
+    assert model.compile_calls == []
 
 
 @pytest.mark.core_model

@@ -22,6 +22,7 @@ from vllm_omni.diffusion.attention.capabilities import (
     PackingMode,
     ParallelStrategy,
 )
+from vllm_omni.diffusion.attention.contracts import MethodCapabilities
 from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
@@ -158,6 +159,8 @@ def _maybe_reshape_attn_mask(
 
 
 class SDPABackend(AttentionBackend):
+    strategy_capabilities = MethodCapabilities(local_execution=True)
+
     accept_output_buffer: bool = True
 
     @classmethod
