@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-"""CPU tests for the decoder tile-shortage guard in the MiniMax-H3 video VAE."""
+"""CPU tests for the tile-shortage guards in the MiniMax-H3 video VAE."""
 
 import sys
 import types
@@ -47,7 +47,7 @@ class _FakeCheckpointModel:
 def _vae(parallel_size, state):
     """A stand-in instance: the guard only reads .model/.remote/.parallel_size."""
     module = types.ModuleType("fake_ckpt.parallel")
-    module.get_parallel_state = lambda: state
+    module.__dict__["get_parallel_state"] = lambda: state
     sys.modules.setdefault("fake_ckpt", types.ModuleType("fake_ckpt"))
     sys.modules["fake_ckpt.parallel"] = module
 
@@ -212,3 +212,65 @@ def test_decode_latent_leaves_the_group_state_alone_when_the_grid_is_large_enoug
     assert seen["sp_enabled"] is True
     assert seen["sp_process_group"] is state["sp_process_group"]
     assert seen["parallel_tiling"] is True
+
+
+def _control_vae(parallel_size):
+    vae, state, seen = _dispatch_vae(parallel_size)
+    vae.parameters = lambda: iter([torch.zeros(1)])
+    # Control requests use the checkpoint's shipped 256/64 encoder grid.
+    vae.model.split_tiles = lambda length, is_decoder=False: _FakeCheckpointModel.split_tiles(vae.model, length, True)
+
+    def encode_temporal(pixels):
+        seen.update(state)
+        seen["parallel_tiling"] = vae.model.parallel_tiling
+        return torch.zeros(1, 48, 1, 2, 2)
+
+    vae.model.encode_temporal = encode_temporal
+    return vae, state, seen
+
+
+@pytest.mark.parametrize(
+    ("parallel_size", "height", "width", "expected_size", "expected_tiling"),
+    [
+        (4, 384, 256, 1, False),  # two tiles: two ranks would get no work
+        (4, 256, 256, 1, False),  # one tile: three ranks would get no work
+        (4, 384, 384, 4, True),  # four tiles: keep normal parallel encoding
+        (1, 256, 256, 1, False),  # clear a stale parallel_tiling flag
+    ],
+)
+def test_control_encode_uses_safe_tiling_and_restores_state(
+    parallel_size, height, width, expected_size, expected_tiling
+):
+    vae, state, seen = _control_vae(parallel_size)
+    saved_state = dict(state)
+
+    latent = vae.encode_control_latents(torch.zeros(1, 3, 1, height, width))
+
+    assert seen["sp_size"] == expected_size
+    assert seen["parallel_tiling"] is expected_tiling
+    if parallel_size > 1 and not expected_tiling:
+        assert seen["sp_enabled"] is False
+        assert seen["sp_process_group"] is None
+    assert latent.shape == (1, 24, 1, 2, 2)
+    assert state == saved_state
+    assert vae.model.parallel_tiling is True
+
+
+@pytest.mark.parametrize("parallel_size", [1, 4])
+def test_control_encode_restores_state_after_error(parallel_size):
+    vae, state, seen = _control_vae(parallel_size)
+    saved_state = dict(state)
+    record_encode = vae.model.encode_temporal
+
+    def fail_encode(pixels):
+        record_encode(pixels)
+        raise RuntimeError("encode failed")
+
+    vae.model.encode_temporal = fail_encode
+    with pytest.raises(RuntimeError, match="encode failed"):
+        vae.encode_control_latents(torch.zeros(1, 3, 1, 256, 256))
+
+    assert seen["sp_size"] == 1
+    assert seen["parallel_tiling"] is False
+    assert state == saved_state
+    assert vae.model.parallel_tiling is True
