@@ -29,6 +29,15 @@ _DEPLOY_DIR = Path(__file__).resolve().parent.parent / "deploy"
 
 _STAGE_OVERRIDE_PATTERN = re.compile(r"^stage_(\d+)_(.+)$")
 
+# Materialized from StagePipelineConfig. Deploy ``engine_extras``,
+# ``--stage-overrides``, and ``stage_*`` CLI runtime overrides cannot change them.
+_TOPOLOGY_OWNED_ENGINE_KEYS = frozenset(
+    {
+        "recompute_preemption",
+        "requires_full_payload_input",
+    }
+)
+
 
 def pipeline_cfg_resolver(config_type: type[PretrainedConfig]):
     """Wraps a resolver such that we return None if a hf_config of the wrong type is provided."""
@@ -245,6 +254,8 @@ class StagePipelineConfig:
     # The model keeps per-request execution state while awaiting the next
     # async chunk, so the parked request continues to consume model capacity.
     retains_state_across_chunks: bool = False
+    # Whether KV-pressure recompute preemption may requeue the request.
+    recompute_preemption: Literal["allow", "fail"] = "allow"
     sampling_constraints: dict[str, Any] = field(default_factory=dict)
     custom_process_input_func: str | None = None
     custom_process_next_stage_input_func: str | None = None
@@ -1106,6 +1117,11 @@ def _build_engine_args(
         )
     if ps.omni_kv_config:
         engine_args["omni_kv_config"] = dict(ps.omni_kv_config)
+    # Topology-owned capabilities: apply after deploy/engine_extras so runtime
+    # knobs cannot override replay or transport semantics. ``to_omegaconf()``
+    # reapplies the same keys after CLI / --stage-overrides so this is not the
+    # last writer on the legacy startup path.
+    engine_args["recompute_preemption"] = ps.recompute_preemption
     engine_args["requires_full_payload_input"] = ps.requires_full_payload_input
     return engine_args
 
@@ -1347,6 +1363,13 @@ class StageConfig:
                     engine_args[key] = _get_recursively_merged_dict(existing, value)
                 else:
                     engine_args[key] = value
+
+        # Topology-owned capabilities stay on the StagePipelineConfig values
+        # already materialized into yaml_engine_args. ``--stage-overrides`` and
+        # equivalent stage_* runtime knobs must not disable them.
+        for key in _TOPOLOGY_OWNED_ENGINE_KEYS:
+            if key in self.yaml_engine_args:
+                engine_args[key] = self.yaml_engine_args[key]
 
         # Terminal-stage ownership comes from topology, not engine overrides.
         engine_args["final_output"] = self.final_output

@@ -104,6 +104,32 @@ def _event_driven_orch_default_for_pipeline(pipeline_model_type: str | None) -> 
     return pipeline_model_type == "qwen3_tts"
 
 
+def _processed_output_error_text(output: Any) -> str | None:
+    """Return a client-visible error string for a processed stage output.
+
+    ``OmniRequestOutput.error`` is the explicit path. A finished
+    ``finish_reason=error`` completion is the scheduler fail-contract path:
+    it never sets ``.error``. Both must go through ``_handle_stage_error``
+    so the client receives ``ErrorMessage`` and any downstream or companion
+    requests are aborted.
+    """
+    error = getattr(output, "error", None)
+    if error:
+        return str(error)
+    if not getattr(output, "finished", False):
+        return None
+    completions = getattr(output, "outputs", None) or ()
+    if not completions:
+        return None
+    finish_reason = getattr(completions[0], "finish_reason", None)
+    if finish_reason not in (FinishReason.ERROR, "error"):
+        return None
+    stop_reason = getattr(completions[0], "stop_reason", None)
+    if stop_reason is None:
+        return "stage request failed"
+    return str(stop_reason)
+
+
 def _build_terminal_empty_output(
     request_id: str,
     *,
@@ -1314,7 +1340,11 @@ class OrchestratorBase:
                 )
                 continue
 
-            if getattr(output, "error", None) is not None:
+            error_text = _processed_output_error_text(output)
+            if error_text is not None:
+                explicit_error = getattr(output, "error", None) is not None
+                if not explicit_error:
+                    output = OmniRequestOutput.from_error(output.request_id, error_text)
                 await self._handle_stage_error(stage_id, output)
                 continue
 

@@ -149,6 +149,7 @@ def _make_scheduler_stub(requests: list[_Request]) -> SimpleNamespace:
         kv_cache_manager=SimpleNamespace(take_events=lambda: None),
         kv_event_publisher=SimpleNamespace(publish=lambda _events: None),
         recompute_kv_load_failures=False,
+        _pending_recompute_preemption_error_requests=[],
         _native_data_plane=False,
         vllm_config=SimpleNamespace(
             model_config=SimpleNamespace(
@@ -161,6 +162,9 @@ def _make_scheduler_stub(requests: list[_Request]) -> SimpleNamespace:
     for name in _MIXIN_UPDATE_HELPERS:
         setattr(scheduler, name, MethodType(getattr(OmniSchedulerMixin, name), scheduler))
     scheduler._cleanup_kv_tracking = MethodType(OmniARScheduler._cleanup_kv_tracking, scheduler)
+    scheduler._emit_pending_recompute_preemption_errors = MethodType(
+        OmniARScheduler._emit_pending_recompute_preemption_errors, scheduler
+    )
     scheduler._emit_streaming_context_overflow_outputs = MethodType(
         OmniARScheduler._emit_streaming_context_overflow_outputs, scheduler
     )
