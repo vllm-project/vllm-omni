@@ -109,6 +109,14 @@ class LMCacheHiddenStateMixin:
             pass
         return None
 
+    def _get_lmcache_mp_backend(self):
+        """Lazily find the MP hidden-state backend, if the MP connector is in use."""
+        if not hasattr(self, "_lmcache_mp_backend_cached"):
+            from vllm_omni.worker.lmcache_mp_hidden_state import find_mp_backend
+
+            self._lmcache_mp_backend_cached = find_mp_backend()
+        return self._lmcache_mp_backend_cached
+
     def _maybe_store_hs_to_lmcache(
         self,
         hidden_states: torch.Tensor,
@@ -125,18 +133,22 @@ class LMCacheHiddenStateMixin:
         """
         if not self._has_lmcache:
             return
-        adapter = self._get_lmcache_adapter()
-        if adapter is None or not hasattr(adapter, "lmcache_engine"):
-            return
-        engine = adapter.lmcache_engine
-        if engine is None:
-            return
-        hs_store = engine.hidden_state_store
-        if hs_store is None:
-            return
+        mp_backend = self._get_lmcache_mp_backend()
+        hs_store = None
+        if mp_backend is not None:
+            chunk_size = mp_backend.chunk_size
+        else:
+            adapter = self._get_lmcache_adapter()
+            if adapter is None or not hasattr(adapter, "lmcache_engine"):
+                return
+            engine = adapter.lmcache_engine
+            if engine is None:
+                return
+            hs_store = engine.hidden_state_store
+            if hs_store is None:
+                return
+            chunk_size = int(getattr(engine.config, "chunk_size", None) or 256)
         self._record_mm_features(scheduler_output)
-
-        chunk_size = int(getattr(engine.config, "chunk_size", None) or 256)
 
         layers_to_store: dict[str, torch.Tensor] = {}
         mm_layers: dict = {}
@@ -207,32 +219,13 @@ class LMCacheHiddenStateMixin:
             if any(int(fb.shape[0]) < skip + chunk_rows for fb in full_bufs.values()):
                 continue
 
-            all_stored = True
-            expected_chunks = chunk_rows // chunk_size
-            for layer_key, full_buf in full_bufs.items():
-                try:
-                    stored = hs_store.store_hidden_states(
-                        seg_token_ids,
-                        full_buf[skip : skip + chunk_rows],
-                        layer_idx=_hs_layer_idx(layer_key),
-                        token_offset=saved_boundary,
-                    )
-                except Exception:
-                    logger.exception("LMCache: store_hidden_states failed (req_id=%s layer=%s)", req_id, layer_key)
-                    all_stored = False
-                    continue
-                # A full HS pool stops the store early and returns normally, so
-                # the count is the only signal that a chunk did not persist.
-                if stored is not None and int(stored) != expected_chunks:
-                    logger.error(
-                        "LMCache: stored %d of %d HS chunks (req_id=%s layer=%s); the HS pool "
-                        "is likely full. Not advancing the boundary so the chunk is retried.",
-                        int(stored),
-                        expected_chunks,
-                        req_id,
-                        layer_key,
-                    )
-                    all_stored = False
+            segment = {k: fb[skip : skip + chunk_rows] for k, fb in full_bufs.items()}
+            if mp_backend is not None:
+                all_stored = self._store_hs_chunk_mp(mp_backend, segment, seg_token_ids, saved_boundary, req_id)
+            else:
+                all_stored = self._store_hs_chunk_inprocess(
+                    hs_store, segment, seg_token_ids, saved_boundary, chunk_rows // chunk_size, req_id
+                )
             # Only trim buffers and advance the boundary once every layer's chunk
             # is persisted, so a failure retries the same boundary next step.
             if not all_stored:
@@ -242,6 +235,44 @@ class LMCacheHiddenStateMixin:
                 req_buf[layer_key] = [remainder] if remainder.shape[0] > 0 else []
             self._hs_saved_boundary[req_id] = new_boundary
             self._hs_buffer_origin[req_id] = new_boundary
+
+    def _store_hs_chunk_inprocess(self, hs_store, segment, seg_token_ids, token_offset, expected_chunks, req_id) -> bool:
+        """Store one chunk range layer by layer into the in-process HS pool."""
+        all_stored = True
+        for layer_key, rows in segment.items():
+            try:
+                stored = hs_store.store_hidden_states(
+                    seg_token_ids,
+                    rows,
+                    layer_idx=_hs_layer_idx(layer_key),
+                    token_offset=token_offset,
+                )
+            except Exception:
+                logger.exception("LMCache: store_hidden_states failed (req_id=%s layer=%s)", req_id, layer_key)
+                all_stored = False
+                continue
+            # A full HS pool stops the store early and returns normally, so
+            # the count is the only signal that a chunk did not persist.
+            if stored is not None and int(stored) != expected_chunks:
+                logger.error(
+                    "LMCache: stored %d of %d HS chunks (req_id=%s layer=%s); the HS pool "
+                    "is likely full. Not advancing the boundary so the chunk is retried.",
+                    int(stored),
+                    expected_chunks,
+                    req_id,
+                    layer_key,
+                )
+                all_stored = False
+        return all_stored
+
+    def _store_hs_chunk_mp(self, backend, segment, seg_token_ids, token_offset, req_id) -> bool:
+        """Store one chunk range as a single stacked object per chunk."""
+        from vllm_omni.worker.lmcache_mp_hidden_state import stack_layers
+
+        stacked = stack_layers(segment, self._lmcache_hs_mm_keys)
+        if stacked is None:
+            return False
+        return backend.store(seg_token_ids, stacked, token_offset, req_id)
 
     def _take_restored_mm(self, req_ids) -> dict[str, dict[str, torch.Tensor]]:
         """Remove and return the restored prefixes for ``req_ids``."""
@@ -260,6 +291,25 @@ class LMCacheHiddenStateMixin:
         if restored_mm is not None:
             restored_mm.pop(req_id, None)
 
+    def _retrieve_hs_inprocess(self, hs_store, lookup_ids, num_computed) -> tuple[dict[str, torch.Tensor], bool]:
+        """Retrieve each layer separately from the in-process HS pool."""
+        layers: dict[str, torch.Tensor] = {}
+        for layer_key in (*self._lmcache_hs_mm_keys, "hidden"):
+            hs = hs_store.retrieve_hidden_states(lookup_ids, layer_idx=_hs_layer_idx(layer_key))
+            if hs is None or int(hs.shape[0]) < num_computed:
+                return {}, True
+            layers[layer_key] = hs[:num_computed]
+        return layers, False
+
+    def _retrieve_hs_mp(self, backend, lookup_ids, num_computed, req_id) -> tuple[dict[str, torch.Tensor], bool]:
+        """Retrieve every layer in one object per chunk from the MP server."""
+        from vllm_omni.worker.lmcache_mp_hidden_state import unstack_layers
+
+        stacked = backend.retrieve(lookup_ids, req_id)
+        if stacked is None or int(stacked.shape[0]) < num_computed:
+            return {}, True
+        return unstack_layers(stacked[:num_computed], self._lmcache_hs_mm_keys), False
+
     def _maybe_restore_hs_from_lmcache(self, scheduler_output=None):
         """Restore per-layer hidden states from LMCache for KV-hit new requests.
 
@@ -269,15 +319,21 @@ class LMCacheHiddenStateMixin:
         """
         if not self._has_lmcache or scheduler_output is None:
             return
-        adapter = self._get_lmcache_adapter()
-        if adapter is None or not hasattr(adapter, "lmcache_engine"):
-            return
-        engine = adapter.lmcache_engine
-        if engine is None:
-            return
-        hs_store = engine.hidden_state_store
-        if hs_store is None:
-            return
+        mp_backend = self._get_lmcache_mp_backend()
+        hs_store = None
+        if mp_backend is not None:
+            chunk_sz = mp_backend.chunk_size
+        else:
+            adapter = self._get_lmcache_adapter()
+            if adapter is None or not hasattr(adapter, "lmcache_engine"):
+                return
+            engine = adapter.lmcache_engine
+            if engine is None:
+                return
+            hs_store = engine.hidden_state_store
+            if hs_store is None:
+                return
+            chunk_sz = int(getattr(engine.config, "chunk_size", None) or 256)
         self._record_mm_features(scheduler_output)
 
         # Per-request restored HS, consumed (popped) by _build_omni_pooler_payload.
@@ -293,7 +349,6 @@ class LMCacheHiddenStateMixin:
             if req_idx is None:
                 continue
             num_computed = new_req.num_computed_tokens
-            chunk_sz = int(getattr(engine.config, "chunk_size", None) or 256)
             prompt_tokens = int(self.input_batch.num_prompt_tokens[req_idx])
             # Round up to the next chunk boundary so retrieval keys match offload.
             aligned_up = ((num_computed + chunk_sz - 1) // chunk_sz) * chunk_sz
@@ -302,14 +357,10 @@ class LMCacheHiddenStateMixin:
                 continue
             lookup_ids = self._keyed_token_ids(req_idx, req_id, retrieve_len)
 
-            layers: dict[str, torch.Tensor] = {}
-            incomplete = False
-            for layer_key in (*self._lmcache_hs_mm_keys, "hidden"):
-                hs = hs_store.retrieve_hidden_states(lookup_ids, layer_idx=_hs_layer_idx(layer_key))
-                if hs is None or int(hs.shape[0]) < num_computed:
-                    incomplete = True
-                    break
-                layers[layer_key] = hs[:num_computed]
+            if mp_backend is not None:
+                layers, incomplete = self._retrieve_hs_mp(mp_backend, lookup_ids, num_computed, req_id)
+            else:
+                layers, incomplete = self._retrieve_hs_inprocess(hs_store, lookup_ids, num_computed)
 
             if incomplete:
                 # KV is already restored but HS is not fully available; prepending
