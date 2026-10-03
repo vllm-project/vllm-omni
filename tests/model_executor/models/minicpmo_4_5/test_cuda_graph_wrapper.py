@@ -885,7 +885,7 @@ def test_whole_euler_graph_with_padding_matches_eager(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_whole_euler_cache_flushes_whole_generation(
+def test_whole_euler_lazy_capture_grows_budget_instead_of_flushing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(current_platform, "get_global_graph_pool", lambda: torch.cuda.graph_pool_handle())
@@ -922,13 +922,13 @@ def test_whole_euler_cache_flushes_whole_generation(
     assert wrapper._stats["captures"] == 2
     assert wrapper._stats["flushes"] == 0
 
-    # Third distinct shape exceeds max_graphs and triggers whole-generation flush
+    # A third distinct shape grows the budget (up to 4x) instead of retiring every graph
     _call(14)
-    assert wrapper._stats["flushes"] == 1
-    assert len(wrapper._cache) == 1
+    assert wrapper._stats["flushes"] == 0
+    assert len(wrapper._cache) == wrapper.max_graphs == 3
     assert wrapper._stats["captures"] == 3
 
-    # Replay evicted shape 10 and assert numerical match with eager
+    # Shape 10 is still cached: its replay matches eager
     torch.manual_seed(42)
     x10 = torch.randn(1, 4, 10, device="cuda")
     mu10 = torch.randn(2, 4, 10, device="cuda")
