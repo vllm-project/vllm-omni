@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """MiniCPM-o 4.5 Token2wav adapter over in-tree ``StepAudio2Token2WavCore``.
 
 ``minicpmo_4_5_omni_tts`` historically depended on the external

@@ -2133,7 +2133,16 @@ def test_whole_euler_disabled_via_serving_config() -> None:
 
 def _tiny_upstream_dit() -> nn.Module:
     """The shipped DiT architecture at toy width, so ``_blocks_forward_chunk_ragged`` runs as in serving."""
-    decoder_dit = pytest.importorskip("stepaudio2.cosyvoice2.flow.decoder_dit")
+    for name in ("cosyvoice2.flow.decoder_dit", "stepaudio2.cosyvoice2.flow.decoder_dit"):
+        try:
+            import importlib
+
+            decoder_dit = importlib.import_module(name)
+            break
+        except ImportError:
+            pass
+    else:
+        decoder_dit = pytest.importorskip("cosyvoice2.flow.decoder_dit")
     torch.manual_seed(0)
     estimator = decoder_dit.DiT(in_channels=16, out_channels=4, depth=2, num_heads=2, head_dim=8, hidden_size=16)
     with torch.no_grad():

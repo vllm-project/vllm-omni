@@ -15,7 +15,16 @@ _DEVICES = ["cpu"] + (["cuda"] if torch.cuda.is_available() else [])
 
 
 def _upstream_dit(device: str) -> nn.Module:
-    decoder_dit = pytest.importorskip("stepaudio2.cosyvoice2.flow.decoder_dit")
+    for name in ("cosyvoice2.flow.decoder_dit", "stepaudio2.cosyvoice2.flow.decoder_dit"):
+        try:
+            import importlib
+
+            decoder_dit = importlib.import_module(name)
+            break
+        except ImportError:
+            pass
+    else:
+        decoder_dit = pytest.importorskip("cosyvoice2.flow.decoder_dit")
     torch.manual_seed(0)
     estimator = decoder_dit.DiT(in_channels=320, out_channels=80, depth=2, num_heads=4, head_dim=16, hidden_size=64)
     with torch.no_grad():
@@ -47,9 +56,10 @@ def _run(body, estimator, *, rows: int, frames: int, cached: int, lengths):
 def test_fused_body_matches_ragged_body(device: str) -> None:
     estimator = _upstream_dit(device)
     assert supports_fused_body(estimator)
-    kwargs = dict(rows=4, frames=6, cached=5, lengths=[6, 4])
-    expected = _run(BatchedToken2Wav._blocks_forward_chunk_ragged, estimator, **kwargs)
-    actual = _run(blocks_forward_chunk_fused, estimator, **kwargs)
+    expected = _run(
+        BatchedToken2Wav._blocks_forward_chunk_ragged, estimator, rows=4, frames=6, cached=5, lengths=[6, 4]
+    )
+    actual = _run(blocks_forward_chunk_fused, estimator, rows=4, frames=6, cached=5, lengths=[6, 4])
     for want, got in zip(expected, actual, strict=True):
         torch.testing.assert_close(got, want, rtol=1e-5, atol=2e-5)
 
