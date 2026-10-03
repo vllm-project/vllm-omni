@@ -114,6 +114,13 @@ curl -s http://localhost:8091/v1/chat/completions \
 - **Known limitations (not yet supported):** CPU offload
   (`--enable-cpu-offload` / `--enable-layerwise-offload`), Cache-DiT
   (`--cache-backend cache_dit`), and TP / SP / HSDP multi-GPU parallelism.
+- **TeaCache:** pass `--cache-backend tea_cache` to skip recomputing the
+  single-stream stage (the bulk of the network) on similar consecutive
+  timesteps. Example: `--cache-backend tea_cache --cache-config '{"rel_l1_thresh":0.15}'`.
+  The default coefficients/threshold are an unfitted placeholder borrowed from
+  FLUX.1 (architecturally the closest dual→single-stream model); treat any
+  speed/quality numbers as provisional until Boogu-specific coefficients are
+  calibrated from branch-separated adjacent-step samples.
 
 ### 2 x H100 (CFG parallel, Base T2I)
 
@@ -286,6 +293,7 @@ curl -X POST http://localhost:8091/v1/images/generations \
     "size": "1024x1024",
     "seed": 42
   }' | jq -r '.data[0].b64_json' | base64 -d > output-turbo.png
+```
 
 ### Notes
 

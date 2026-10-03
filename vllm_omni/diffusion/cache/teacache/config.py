@@ -91,11 +91,26 @@ _MODEL_COEFFICIENTS = {
         -4.232669906169421e00,
         2.173782527946167e-01,
     ],
+    # Boogu-Image transformer coefficients.
+    # TODO(placeholder): not yet fitted from calibration data. Boogu's cached
+    # region (single_stream_layers) is architecturally the same dual->single
+    # stream shape as FLUX.1, so the FLUX coefficients are reused as a starting
+    # point; refit from branch-separated adjacent-step samples (see PR #6517's
+    # HiDream-O1 calibration methodology) before relying on this for quality claims.
+    "BooguImageTransformer2DModel": [
+        4.98651651e02,
+        -2.83781631e02,
+        5.58554382e01,
+        -3.82021401e00,
+        2.64230861e-01,
+    ],
 }
 
 _DEFAULT_REL_L1_THRESH = 0.2
 _MODEL_DEFAULT_REL_L1_THRESH = {
     "MiniMaxH3DiTModel": 0.17,
+    # TODO(placeholder): starting point pending calibration; see coefficient comment above.
+    "BooguImageTransformer2DModel": 0.15,
 }
 
 
