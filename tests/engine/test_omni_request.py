@@ -13,13 +13,15 @@ substitutable with the base class — including base-style calls that pass
 
 import inspect
 
+import msgspec
 import numpy as np
 import pytest
 import torch
 from vllm.sampling_params import SamplingParams
+from vllm.v1.engine import EngineCoreRequest
 from vllm.v1.request import Request
 
-from vllm_omni.engine import PromptEmbedsPayload
+from vllm_omni.engine import OmniEngineCoreRequest, PromptEmbedsPayload
 from vllm_omni.request import OmniRequest, OmniStreamingUpdate
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -111,3 +113,24 @@ def test_model_intermediate_buffer_round_trips_to_streaming_update():
     assert update is not None
     assert request.model_intermediate_buffer is buffer
     assert update.model_intermediate_buffer is buffer
+
+
+@pytest.mark.parametrize("session_id", [None, "session"])
+def test_session_survives_omni_upgrade_wire_transport_and_scheduler_conversion(session_id):
+    core = EngineCoreRequest(
+        request_id="session-request",
+        prompt_token_ids=[1, 2],
+        mm_features=None,
+        sampling_params=SamplingParams(max_tokens=2),
+        pooling_params=None,
+        arrival_time=0.0,
+        lora_request=None,
+        cache_salt=None,
+        data_parallel_rank=None,
+        session_id=session_id,
+    )
+    upgraded = OmniEngineCoreRequest.from_request(core)
+    decoded = msgspec.msgpack.decode(msgspec.msgpack.encode(upgraded), type=OmniEngineCoreRequest)
+    scheduled = OmniRequest.from_engine_core_request(decoded, block_hasher=None)
+    assert decoded.session_id == session_id
+    assert scheduled.session_id == session_id
