@@ -19,6 +19,7 @@ import asyncio
 import logging
 from typing import Any, NamedTuple
 
+import numpy as np
 import pytest
 import pytest_asyncio
 from vllm import SamplingParams
@@ -596,7 +597,12 @@ class TestBagelDiffusionSleepMode:
                 post_output = output
             assert post_output is not None
             assert len(base_output.images) == len(post_output.images)
-            assert post_output.images[0] is not None
+            for image_index, (base_image, post_image) in enumerate(zip(base_output.images, post_output.images)):
+                assert post_image is not None
+                assert np.array_equal(
+                    np.asarray(base_image.convert("RGB")),
+                    np.asarray(post_image.convert("RGB")),
+                ), f"Image {image_index} changed after sleep/wake."
         finally:
             await _ensure_awake(bagel_diffusion_engine, [0])
 
