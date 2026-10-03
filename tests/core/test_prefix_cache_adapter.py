@@ -149,10 +149,11 @@ def test_write_layout_uses_post_order_batch_and_slots():
         FakeView(), num_scheduled_tokens={"b": 2, "a": 1}
     )
     assert layout.total_rows == 3
-    assert [(w.req_id, w.row_start, w.row_end, w.slots) for w in layout.writes] == [
-        ("b", 0, 2, (20, 21)),
-        ("a", 2, 3, (7,)),
+    assert [(w.req_id, w.row_start, w.row_end) for w in layout.writes] == [
+        ("b", 0, 2),
+        ("a", 2, 3),
     ]
+    assert layout.slots_cpu.tolist() == [20, 21, 7]
     with pytest.raises(AttributeError):
         layout.writes = ()
 

@@ -48,13 +48,13 @@ class PrefixCacheWrite:
     req_id: str
     row_start: int
     row_end: int
-    slots: tuple[int, ...]
 
 
 @dataclass(frozen=True, slots=True)
 class PrefixCacheWriteLayout:
     writes: tuple[PrefixCacheWrite, ...]
     total_rows: int
+    slots_cpu: Any = None
 
 
 class PrefixCacheSchedulerAdapter:
@@ -209,17 +209,13 @@ class PrefixCacheSchedulerAdapter:
                 f"write layout slot count {actual_rows} does not match scheduled row count {expected_rows}"
             )
         writes: list[PrefixCacheWrite] = []
-        cursor = 0
         for req_id in req_order:
             start, end = offsets[req_id]
-            count = end - start
             writes.append(
                 PrefixCacheWrite(
                     req_id,
                     start,
                     end,
-                    tuple(int(x) for x in slots[cursor : cursor + count].tolist()),
                 )
             )
-            cursor += count
-        return PrefixCacheWriteLayout(tuple(writes), cursor)
+        return PrefixCacheWriteLayout(tuple(writes), cursor, slots)

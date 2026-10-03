@@ -106,13 +106,7 @@ class _Presence(IntEnum):
     UNKNOWN = 0
     ABSENT = 1
     PENDING = 2
-    IN_TRANSIT = 2  # compatibility alias for the pre-plan occupancy API
     PRESENT = 3
-    COMMITTED = 3
-
-# Compatibility name for the existing write/occupancy helpers.  New read
-# planning uses the more explicit Presence vocabulary above.
-_Occupancy = _Presence
 
 
 def _is_step_token_tensor(val: Any, n: int, padded: int) -> bool:
@@ -266,8 +260,9 @@ class _SlotBinding:
 class _ReadPlan:
     """A hit read bound to exact versions and producers before execution.
 
-    Committed rows are copied into ``resolved`` while the manager lock keeps
-    later claims out. Pending rows retain their concrete ``WriteTask``;
+    The lock captures occupancy and the durable pool reference only;
+    committed rows are gathered by the prefetch/execute thread. Pending rows
+    retain their concrete ``WriteTask``;
     immediate producers additionally lease the staging page. Consequently a
     later claim cannot redirect this plan to a newer tenant.
     """
@@ -278,8 +273,11 @@ class _ReadPlan:
     req_id: ReqId
     bindings: tuple[_SlotBinding, ...]
     resolved: torch.Tensor
+    stable: torch.Tensor
+    pool_storage: torch.Tensor | None
     producers: list[tuple[WriteTask, torch.Tensor]]
     leases: list[tuple[int, StagingBufferHolder]] = field(default_factory=list)
+    preserved: dict[int, torch.Tensor] = field(default_factory=dict)
     error: str | None = None
     _closed: bool = False
     _close_lock: threading.Lock = field(default_factory=threading.Lock)
@@ -318,6 +316,7 @@ class _StepContext:
     hits: dict[ReqId, tuple[int, list[int]]]  # (hit_upto, blocks)
     hit_plans: dict[ReqId, dict[TensorName, _ReadPlan]] = field(default_factory=dict)
     hit_prefetch: dict[ReqId, dict[TensorName, Future]] = field(default_factory=dict)
+    hit_misses: set[tuple[ReqId, TensorName]] = field(default_factory=set)
 
     # Key split frozen at save: recompute at materialize races ensure_key.
     cached_keys: set[TensorName] = field(default_factory=set)
@@ -338,15 +337,6 @@ class _SlotStatus(NamedTuple):
     producers: torch.Tensor  # Tid per kv slot; 0 = none
     slot_version: torch.Tensor  # int64[num_slots]; bumped each time a new write claims the slot
 
-    @property
-    def state(self) -> torch.Tensor:
-        return self.presence
-
-    @property
-    def tids(self) -> torch.Tensor:
-        return self.producers
-
-
 class _SlotStatusTable:
     """Per (KV slot, tensor name): empty, being written, or already in the pool.
 
@@ -361,9 +351,6 @@ class _SlotStatusTable:
         self.num_slots = num_slots
         self.presence: dict[TensorName, torch.Tensor] = {}  # int8[num_slots]
         self.producers: dict[TensorName, torch.Tensor] = {}  # Tid per kv slot; 0 = none
-        # Temporary private-name aliases for focused tests and debugging tools.
-        self.state = self.presence
-        self.tids = self.producers
         self.slot_versions: dict[TensorName, torch.Tensor] = {}  # int64[num_slots]; bumped on each new write claim
         self.task_bindings: dict[Tid, list[tuple[TensorName, torch.Tensor, torch.Tensor]]] = {}
 
@@ -400,7 +387,7 @@ class _SlotStatusTable:
             status.presence[slots] = _Presence.PENDING
             status.producers[slots] = tid
             # Bump the version so a reader that captured an older one detects
-            # this claim even after it later commits (COMMITTED, not IN_TRANSIT).
+            # this claim even after it later commits.
             status.slot_version[slots] += 1
             self.task_bindings.setdefault(tid, []).append((key, slots.clone(), status.slot_version[slots].clone()))
         return stolen
@@ -420,7 +407,7 @@ class _SlotStatusTable:
         return stolen
 
     def commit(self, tids: Iterable[Tid]) -> None:
-        """Flip still-owned slots to COMMITTED and drop the reverse index."""
+        """Flip still-owned slots to PRESENT and drop the reverse index."""
         for tid in tids:
             bindings = self.task_bindings.pop(tid, ())
             for key, slots, versions in bindings:
@@ -532,10 +519,11 @@ class OmniPrefixCacheManager:
         self._hit_spans: dict[ReqId, tuple[int, list[int]]] = {}  # (upto, blocks)
         self._hit_plans: dict[ReqId, dict[TensorName, _ReadPlan]] = {}
         self._hit_prefetch: dict[ReqId, dict[TensorName, Future]] = {}
+        self._hit_misses: set[tuple[ReqId, TensorName]] = set()
         self._prepared_write_layout: PrefixCacheWriteLayout | None = None
         self._prefetch_reads = prefetch_reads
         self._next_read_id = 1
-        self._pending_reads: list[_SlotRef] = []
+        self._pending_reads: list[_SlotRef | _ReadPlan] = []
         # Sticky fatal set on the first drained write failure; every later
         # facade entry re-raises it (see _commit_drained_writes).
         self._fatal_write_failure: str | None = None
@@ -666,7 +654,11 @@ class OmniPrefixCacheManager:
                 raise OmniPrefixCacheUnmatchError("prefix-cache write layout prepared more than once for one step")
             self._commit_drained_writes()
             self._prepared_write_layout = write_layout
-            write_slots = {int(slot) for write in write_layout.writes for slot in write.slots}
+            write_slots = (
+                set(int(slot) for slot in write_layout.slots_cpu.tolist())
+                if write_layout.slots_cpu is not None
+                else set()
+            )
             try:
                 if self._hit_spans:
                     self._prefetch_hit_spans(blocked_slots=write_slots)
@@ -733,10 +725,9 @@ class OmniPrefixCacheManager:
         if num_tokens_unpadded > 0:
             # Derive the slot mapping on CPU: reading the device one back
             # would need a stream sync that waits on the whole forward.
-            slots_cpu = torch.tensor(
-                [slot for write in write_layout.writes for slot in write.slots],
-                dtype=torch.long,
-            )
+            slots_cpu = write_layout.slots_cpu
+            if slots_cpu is None:
+                raise ValueError("write_layout is missing its CPU slot snapshot")
             if int(slots_cpu.numel()) != num_tokens_unpadded:
                 # Fail at the cause: skipping the save would leave rows absent
                 # behind hashes vLLM already published — a delayed crash at
@@ -866,12 +857,13 @@ class OmniPrefixCacheManager:
                             hit_sources[(req_id, key)] = fut
                             continue
                         plan = plans.get(key)
-                        if plan is None:
+                        if plan is not None:
+                            hit_sources[(req_id, key)] = plan
+                        elif (req_id, key) not in ctx.hit_misses:
                             raise OmniPrefixCacheUnmatchError(
                                 f"read plan missing for req {req_id}, key {key}; "
                                 "prefix-cache planning must complete before materialize"
                             )
-                        hit_sources[(req_id, key)] = plan
 
             # ---- unlocked: data movement + merge ----
             if ctx.mm_cpu_snapshot_event is not None:
@@ -981,6 +973,7 @@ class OmniPrefixCacheManager:
         self._hit_spans.clear()
         self._hit_plans.clear()
         self._hit_prefetch.clear()
+        self._hit_misses.clear()
         self._prepared_write_layout = None
 
     def _prefetch_hit_spans(self, blocked_slots: set[int] | None = None) -> None:
@@ -1006,6 +999,11 @@ class OmniPrefixCacheManager:
                 if key in plans:
                     continue
                 plan = self._read_plan(slots, key, req_id)
+                if plan is None:
+                    # Unknown/absent hidden rows are a cache miss, not a
+                    # request error. The forward output supplies this span.
+                    self._hit_misses.add((req_id, key))
+                    continue
                 plans[key] = plan
                 if self._prefetch_reads:
                     try:
@@ -1102,7 +1100,14 @@ class OmniPrefixCacheManager:
                 slots_cpu if slots_cpu is not None else torch.empty(0, dtype=torch.long)
             )
             pool_keys = self._pool.keys()
-            task_ids = self._controller.task_ids()
+            # Roll back only this step's requests and hit requests, rather
+            # than snapshotting the full live-request table.
+            snapshot_reqs = set(req_order) | set(self._hit_spans)
+            task_ids = {
+                tid
+                for tid in self._controller.task_ids()
+                if (task := self._controller.get_task(tid)) is not None and task.req_id in snapshot_reqs
+            }
             task_snapshots = {}
             budget_snapshots = {}
             for tid in task_ids:
@@ -1127,12 +1132,12 @@ class OmniPrefixCacheManager:
                     budget_snapshots[id(ticket)] = (ticket, set(ticket.tids))
             task_table_snapshot = (
                 self._request_tasks._next_tid,
-                dict(self._request_tasks.write_n),
-                {req: set(tids) for req, tids in self._request_tasks.tasks.items()},
-                dict(self._request_tasks.deferred),
-                set(self._request_tasks.live_reqs),
-                list(self._join_next_step_tids),
-                set(self._join_finished_tids),
+                {req: self._request_tasks.write_n[req] for req in snapshot_reqs if req in self._request_tasks.write_n},
+                {req: set(self._request_tasks.tasks[req]) for req in snapshot_reqs if req in self._request_tasks.tasks},
+                {req: self._request_tasks.deferred[req] for req in snapshot_reqs if req in self._request_tasks.deferred},
+                snapshot_reqs & self._request_tasks.live_reqs,
+                [tid for tid in self._join_next_step_tids if tid in task_ids],
+                self._join_finished_tids & task_ids,
             )
             try:
                 return self._publish_saved_step_impl(
@@ -1159,15 +1164,21 @@ class OmniPrefixCacheManager:
                 for ticket, tids in budget_snapshots.values():
                     ticket.tids = tids
                 self._slot_status.restore(status_snapshot)
-                (
-                    self._request_tasks._next_tid,
-                    self._request_tasks.write_n,
-                    self._request_tasks.tasks,
-                    self._request_tasks.deferred,
-                    self._request_tasks.live_reqs,
-                    self._join_next_step_tids,
-                    self._join_finished_tids,
-                ) = task_table_snapshot
+                next_tid, write_n, tasks, deferred, live_reqs, join_next, join_finished = task_table_snapshot
+                self._request_tasks._next_tid = next_tid
+                for req in snapshot_reqs:
+                    self._request_tasks.write_n.pop(req, None)
+                    self._request_tasks.tasks.pop(req, None)
+                    self._request_tasks.deferred.pop(req, None)
+                    self._request_tasks.live_reqs.discard(req)
+                self._request_tasks.write_n.update(write_n)
+                self._request_tasks.tasks.update(tasks)
+                self._request_tasks.deferred.update(deferred)
+                self._request_tasks.live_reqs.update(live_reqs)
+                self._join_next_step_tids = [tid for tid in self._join_next_step_tids if tid not in task_ids]
+                self._join_next_step_tids.extend(join_next)
+                self._join_finished_tids.difference_update(task_ids)
+                self._join_finished_tids.update(join_finished)
                 for key in self._pool.keys() - pool_keys:
                     self._pool.remove_key(key)
                 self._dispose_read_plans(self._hit_plans, self._hit_prefetch)
@@ -1232,7 +1243,7 @@ class OmniPrefixCacheManager:
                     if old_task is not None:
                         old_task.add_reassigned(key, stolen)
         if self._hit_spans:
-            # Same-step hits: their rows are registered now (IN_TRANSIT on
+            # Same-step hits: their rows are registered now (PENDING on
             # this step's tasks); start the gather before the next step.
             self._prefetch_hit_spans()
         step_id = self._next_step_id
@@ -1243,6 +1254,7 @@ class OmniPrefixCacheManager:
             hits=dict(self._hit_spans),
             hit_plans=dict(self._hit_plans),
             hit_prefetch=dict(self._hit_prefetch),
+            hit_misses=set(self._hit_misses),
             cached_keys=without_hidden(self._pool.keys()) & mm_keys,
             mm_cpu_snapshot=step_outputs.leftover,
             mm_cpu_snapshot_event=step_outputs.leftover_event,
@@ -1458,14 +1470,14 @@ class OmniPrefixCacheManager:
         """Caller holds ``_state_lock``. Copy still-valid committed rows into
         each pending ref before ``new_slots`` are claimed.
 
-        Only COMMITTED rows at the reserved version need rescuing: the save
+        Only PRESENT rows at the reserved version need rescuing: the save
         barrier joins JOIN_NEXT_STEP writes to ``done`` and publish drains
         before claiming, and JOIN_ON_FINISH in-transit rows are read through
         ``staged_list`` task refs directly.
         """
         new_set = {int(s) for s in new_slots.tolist()}
         for ref in self._pending_reads:
-            if ref.key not in keys or ref.reserved_version is None or not self._pool.has_key(ref.key):
+            if ref.key not in keys or not self._pool.has_key(ref.key):
                 continue
             status = self._slot_status.get_slot_status(ref.key)
             take: list[tuple[int, int]] = []  # (row index in ref, slot)
@@ -1473,8 +1485,13 @@ class OmniPrefixCacheManager:
                 s = int(s)
                 if s not in new_set or s in ref.preserved:
                     continue
-                committed = int(status.state[s]) == _Occupancy.COMMITTED
-                if committed and int(status.slot_version[s]) == int(ref.reserved_version[i]):
+                committed = int(status.presence[s]) == _Presence.PRESENT
+                planned_version = (
+                    ref.reserved_version[i]
+                    if isinstance(ref, _SlotRef)
+                    else ref.bindings[i].version
+                )
+                if committed and int(status.slot_version[s]) == int(planned_version):
                     take.append((i, s))
             if not take:
                 continue
@@ -1539,19 +1556,19 @@ class OmniPrefixCacheManager:
 
     # -------------------------------------------------- slot ref / fetch
 
-    def _read_plan(self, slots: torch.Tensor, key: str, req_id: str) -> _ReadPlan:
+    def _read_plan(self, slots: torch.Tensor, key: str, req_id: str) -> _ReadPlan | None:
         """Bind a read to producer/version/presence under ``_state_lock``.
 
         The returned object is a complete decision, not a promise to repeat
-        occupancy lookup later.  Committed rows are copied now; pending rows
-        retain their exact producer task.  Sparse MM absence is represented by
-        zero rows, while hidden absence remains a contract error.
+        occupancy lookup later. Committed rows retain a reference to the pool
+        and are gathered after the lock is released; pending rows retain their
+        exact producer task. Unknown rows are treated as cache misses.
         """
         status = self._slot_status.get_slot_status(key)
         slots = slots.clone()
         versions = status.slot_version[slots].clone()
-        presence = status.state[slots].clone()
-        producers = status.tids[slots].clone()
+        presence = status.presence[slots].clone()
+        producers = status.producers[slots].clone()
         bindings = [
             _SlotBinding(int(slot), int(ver), int(tid) or None, _Presence(int(present)))
             for slot, ver, tid, present in zip(slots.tolist(), versions.tolist(), producers.tolist(), presence.tolist())
@@ -1570,17 +1587,22 @@ class OmniPrefixCacheManager:
                 req_id,
                 tuple(bindings),
                 torch.empty(0),
+                torch.empty(0, dtype=torch.bool),
+                None,
                 [],
                 error=why,
             )
 
-        unknown = sum(binding.presence is _Presence.UNKNOWN for binding in bindings)
-        if unknown:
-            return unreadable(f"{unknown} slots have unknown presence")
+        bindings = [
+            _SlotBinding(b.slot, b.version, b.producer, _Presence.ABSENT)
+            if b.presence is _Presence.UNKNOWN
+            else b
+            for b in bindings
+        ]
         if is_hidden_key(key) and any(binding.presence is _Presence.ABSENT for binding in bindings):
-            return unreadable("explicitly absent slot")
+            return None
         if not self._pool.has_key(key):
-            return unreadable("key has no producer or committed storage")
+            return None
         producer_masks: dict[int, torch.Tensor] = {}
         holder = StagingBufferHolder.for_read(read_id)
         try:
@@ -1614,21 +1636,18 @@ class OmniPrefixCacheManager:
                         mask.zero_()
                         continue
                     leases.append((task.staging_slot, holder))  # type: ignore[arg-type]
-            # Read only stable durable rows. Pending producers may be writing
-            # the same CPU tensor concurrently; even though fetch_host would
-            # overlay those positions later, reading them here would race the
-            # committer's index_copy_.
+            # Classify stable rows under the lock. The potentially large
+            # gather is performed by _execute_read_plan after unlock.
             stable = torch.tensor(
                 [binding.presence is _Presence.PRESENT for binding in bindings],
                 dtype=torch.bool,
             )
-            stable_rows = self._pool.rows(key, slots[stable])
+            storage = self._pool.flat_rows(key)
             resolved = torch.empty(
-                (slots.numel(), stable_rows.shape[-1]),
-                dtype=stable_rows.dtype,
+                (slots.numel(), storage.shape[-1]),
+                dtype=storage.dtype,
             )
-            if bool(stable.any()):
-                resolved[stable] = stable_rows
+            resolved.zero_()
         except BaseException:
             for slot, read_holder in leases:
                 self._controller.staging_release(slot, read_holder)
@@ -1642,7 +1661,19 @@ class OmniPrefixCacheManager:
         for tid, mask in producer_masks.items():
             if bool(mask.any()):
                 producers_list.append((producer_tasks[tid], mask))
-        plan = _ReadPlan(read_id, slots, key, req_id, tuple(bindings), resolved, producers_list, leases)
+        plan = _ReadPlan(
+            read_id,
+            slots,
+            key,
+            req_id,
+            tuple(bindings),
+            resolved,
+            stable,
+            storage,
+            producers_list,
+            leases,
+        )
+        self._pending_reads.append(plan)
         return plan
 
     def _close_read_plan(self, plan: _ReadPlan) -> None:
@@ -1650,6 +1681,7 @@ class OmniPrefixCacheManager:
             if plan._closed:
                 return
             plan._closed = True
+            self._pending_reads = [ref for ref in self._pending_reads if ref is not plan]
             for slot, holder in plan.leases:
                 self._controller.staging_release(slot, holder)
 
@@ -1659,12 +1691,19 @@ class OmniPrefixCacheManager:
             if plan.error is not None:
                 _raise_unreadable_hit(plan.req_id, plan.key, plan.error)
             out = plan.resolved.clone()
+            if plan.pool_storage is not None and bool(plan.stable.any()):
+                out[plan.stable] = plan.pool_storage.index_select(0, plan.slots[plan.stable])
+            for index, slot in enumerate(plan.slots.tolist()):
+                if slot in plan.preserved:
+                    out[index] = plan.preserved[slot]
             for task, mask in plan.producers:
-                rows = self._controller.join([task.tid]) if task.schedule is WriteSchedule.JOIN_NEXT_STEP else None
-                del rows
+                if task.schedule is WriteSchedule.JOIN_NEXT_STEP:
+                    self._controller.join([task.tid])
                 out[mask] = self._controller.fetch_host(task, plan.slots[mask], plan.key)
             return out
         finally:
+            with self._state_lock:
+                self._pending_reads = [ref for ref in self._pending_reads if ref is not plan]
             self._close_read_plan(plan)
 
     def _get_hit_slots(self, hit_upto: int, hit_blocks: list[int]) -> torch.Tensor:
@@ -1693,10 +1732,10 @@ class OmniPrefixCacheManager:
         registration always precedes the reuse. ``_fetch_source`` unregisters.
         """
         status = self._slot_status.get_slot_status(key)
-        states = status.state[slots]
-        tids = status.tids[slots]
+        states = status.presence[slots]
+        tids = status.producers[slots]
         reserved_version = status.slot_version[slots].clone()
-        staged_mask = states == _Occupancy.IN_TRANSIT
+        staged_mask = states == _Presence.PENDING
 
         staged: list[tuple[WriteTask, torch.Tensor]] = []
         join_tids: list[int] = []
@@ -1712,7 +1751,7 @@ class OmniPrefixCacheManager:
         already_staged = self._pool.has_key(key)
         has_source = already_staged or bool(staged) or bool(join_tids)
         if is_hidden_key(key):
-            n_abs = int((states == _Occupancy.ABSENT).sum())
+            n_abs = int((states == _Presence.ABSENT).sum())
             if n_abs or not has_source:
                 _raise_unreadable_hit(req_id, key, f"{n_abs} absent slots")
         ref = _SlotRef(
@@ -1823,7 +1862,7 @@ class OmniPrefixCacheManager:
         vLLM frees a request's blocks when it finishes or is aborted, one
         step before the terminal lifecycle event reaches us, and may reuse them at
         once. A planned ``_SlotRef`` is registered in ``_pending_reads``;
-        the reusing write copy-on-writes those COMMITTED rows into
+        the reusing write copy-on-writes those PRESENT rows into
         ``preserved`` before it claims the slots. Those slots are safe.
         A version mismatch with no preserved copy means the pool rows are
         a newer tenant's — raise for live and finished alike, never serve
@@ -1838,7 +1877,7 @@ class OmniPrefixCacheManager:
             if planned_version is not None:
                 violated = status.slot_version[slots] != planned_version
             else:
-                violated = status.state[slots] == _Occupancy.IN_TRANSIT
+                violated = status.presence[slots] == _Presence.PENDING
             if in_transit_mask is not None:
                 violated &= ~in_transit_mask
             if preserved_slots:

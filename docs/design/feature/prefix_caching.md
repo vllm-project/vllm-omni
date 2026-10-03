@@ -174,10 +174,16 @@ The block/slot model is `vllm_omni/core/prefix_cache/`.
 hit spans, and merge.
 `OmniPrefixCacheController` moves data: a reusable `StagingBufferPool` for
 this step's device→host copy, and writes into the durable `PrefixBlockPool`.
-The state lock covers those tables only.
+The state lock covers those tables only. Read planning under the lock performs
+classification and captures the durable pool reference; the potentially large
+row gather runs on the prefetch worker. A small copy-on-write preservation
+path remains for delayed readers when vLLM reuses a slot before that worker
+gathers it. The old `_SlotRef` source path remains only as a compatibility
+boundary for direct controller/test callers; the production hit path uses
+`_ReadPlan`.
 
 Miss is not an error (this step's forward slice only). A hit span whose
-hidden rows are absent is fatal. For mm keys the rule is looser: a model may
+hidden rows are absent or unknown is treated as a cache miss. For mm keys the rule is looser: a model may
 emit a key only for some requests, so a hit span with no rows behind an mm key
 reads zeros from the pool for those positions rather than raising. Abort still
 writes: once a hash entered this step's batch it must land in the cache.
@@ -218,10 +224,10 @@ Hit spans come from `scheduled_new_reqs` only, as in the pre-refactor cache:
   still find a hit slot reassigned. Each `(slot, key)` carries a write
   version, bumped whenever a new write claims it. A planned read captures
   that version and is registered in `_pending_reads`; a later write that
-  reclaims those slots copy-on-writes the still-`COMMITTED` rows into the
-  ref before it overwrites the pool, so a delayed fetch serves the original
-  tenant. A version mismatch with no preserved copy raises for live and
-  finished alike (the pool rows are a newer tenant's). Production defaults
+  reclaims those slots copy-on-writes the still-present rows into the pending
+  read before it overwrites the pool, so a delayed fetch serves the original
+  tenant. This COW safeguard is separate from source selection: production
+  reads use `_ReadPlan` and its producer/version binding. Production defaults
   stay opt-in until preempt/resume hit spans are reconstructed.
 - `async_chunk` continuation: when the next upstream chunk arrives, the same
   request id re-enters `scheduled_new_reqs` with `num_computed_tokens` equal

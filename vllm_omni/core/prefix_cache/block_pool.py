@@ -79,6 +79,10 @@ class PrefixBlockPool:
         """Gather rows for non-contiguous slots (returns a copy)."""
         return self._flat(key).index_select(0, slots)
 
+    def flat_rows(self, key: str) -> torch.Tensor:
+        """Return the durable flat storage for an unlocked read-plan gather."""
+        return self._flat(key)
+
     def write(self, key: str, slots: torch.Tensor, src_cpu: torch.Tensor) -> None:
         """Write rows into the pool; caller (committer thread) is the single writer."""
         if slots.dtype != torch.int64:

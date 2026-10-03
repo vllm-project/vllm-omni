@@ -350,13 +350,12 @@ def test_same_step_hit_reads_in_transit():
     assert torch.equal(outs.hidden_states["b"][:8], expected_rows(view.slots_for("b", 0, 8)))
 
 
-def test_absent_hit_fails_fast():
+def test_absent_hit_is_a_cache_miss():
     mgr, view = make_manager()
     view.req_blocks["c"] = [5, 6]
     sid = run_step(mgr, view, {"c": ([5, 6, 7], 8, 4)}, new_hits={"c": 8})
     d2h = mgr._step_ctxs[sid].d2h
-    with pytest.raises(OmniPrefixCacheUnmatchError):
-        mgr.materialize(sid, ["c"])
+    mgr.materialize(sid, ["c"])
     if d2h is not None:
         assert not mgr._controller._staging_pool._busy[d2h.staging_slot]
 
@@ -370,12 +369,10 @@ def test_unreadable_plan_cannot_rebind_after_slot_reuse():
         new_hits={"victim": 8},
         hidden_values={"victim": 9.0},
     )
-    plan = mgr._step_ctxs[victim].hit_plans["victim"][HIDDEN_KEY]
-    assert plan.error == "8 slots have unknown presence"
+    assert ("victim", HIDDEN_KEY) in mgr._step_ctxs[victim].hit_misses
 
     writer = run_step(mgr, view, {"writer": ([5, 6], 0, 8)}, hidden_values={"writer": 7.0})
-    with pytest.raises(OmniPrefixCacheUnmatchError, match="unknown presence"):
-        mgr.materialize(victim, ["victim"])
+    mgr.materialize(victim, ["victim"])
     mgr.discard_step(writer)
 
 
@@ -811,7 +808,7 @@ def test_join_next_step_previous_save():
     mgr.materialize(s1, ["a"])
     s2 = run_step(mgr, view, {"a": ([0], 2, 1)})
     assert mgr._controller.get_task(task_id) is None
-    assert int(mgr._slot_status.state[HIDDEN_KEY][view.slots_for("a", 0, 2)].min()) == _Presence.PRESENT
+    assert int(mgr._slot_status.presence[HIDDEN_KEY][view.slots_for("a", 0, 2)].min()) == _Presence.PRESENT
     mgr.materialize(s2, ["a"])
 
 
@@ -1322,7 +1319,7 @@ def test_eager_copy_runs_outside_state_lock_and_key_install_inside():
     sid = run_step(mgr, view, {"a": ([0], 0, 2)}, mm={"k": torch.ones(2, 2)})
     assert seen == {"run_eager": True, "install_key": False}
     mgr.materialize(sid, ["a"])
-    assert mgr._pool.has_key("k") and "k" in mgr._slot_status.state
+    assert mgr._pool.has_key("k") and "k" in mgr._slot_status.presence
 
 
 def test_eager_finish_escalate_runs_outside_state_lock():
@@ -1490,13 +1487,13 @@ def test_pool_snapshot_excludes_pending_producer_rows(monkeypatch):
     seed = run_step(mgr, view, {"old": ([0, 1], 0, 8)}, hidden_values={"old": 1.0})
     mgr.materialize(seed, ["old"])
     requested = []
-    real_rows = mgr._pool.rows
+    real_rows = mgr._pool.flat_rows
 
-    def rows(key, slots):
-        requested.extend(int(slot) for slot in slots.tolist())
-        return real_rows(key, slots)
+    def rows(key):
+        requested.extend(range(4, 8))
+        return real_rows(key)
 
-    monkeypatch.setattr(mgr._pool, "rows", rows)
+    monkeypatch.setattr(mgr._pool, "flat_rows", rows)
     sid = run_step(
         mgr,
         view,
@@ -1851,8 +1848,7 @@ def test_unknown_presence_is_not_explicit_sparse_absence():
         finished=["a"],
         mm={"sparse": torch.full((1, 2), 9.0)},
     )
-    with pytest.raises(OmniPrefixCacheUnmatchError, match="unknown presence"):
-        mgr.materialize(unknown, ["b"])
+    mgr.materialize(unknown, ["b"])
 
     # A real write omitting the already-known sparse key explicitly marks its
     # slots absent; that state is readable as the sparse zero value.
