@@ -21,6 +21,7 @@ from vllm_omni.errors import OmniClientError
 from vllm_omni.model_executor.models.minimax_h3.conditioning import (
     MiniMaxH3EncoderMediaConditioning,
     MiniMaxH3EncoderMediaInput,
+    MiniMaxH3TimelineGuide,
 )
 from vllm_omni.model_executor.models.minimax_h3.long_video import max_output_seconds, resolve_long_video_mode
 from vllm_omni.model_executor.models.minimax_h3.preprocessing import (
@@ -40,6 +41,10 @@ from vllm_omni.model_executor.models.minimax_h3.reference_video import (
     sample_reference_video_frames,
     validate_reference_audio_files,
     validate_reference_audio_waveforms,
+)
+from vllm_omni.model_executor.models.minimax_h3.timeline_guides import (
+    MINIMAX_H3_TIMELINE_GUIDES_KEY,
+    prepare_timeline_guides,
 )
 
 MINIMAX_H3_FPS = 24
@@ -234,13 +239,17 @@ def _prepare_encoder_images(
     *,
     height: int,
     width: int,
+    guided: bool = False,
 ) -> list[Any]:
     if not images:
         return []
     if task == "ref2va":
+        # Guided references are kept within the output area: they ride through
+        # every denoising step next to the guide anchors.
+        max_area = width * height if guided else None
         return [
             image.resize(
-                resolve_minimax_h3_reference_image_shape(image),
+                resolve_minimax_h3_reference_image_shape(image, max_area=max_area),
                 Image.Resampling.LANCZOS,
             )
             for image in images
@@ -499,11 +508,24 @@ def prepare_encoder_inputs(
     if audio_edit_mask is not None and source_audio is None and source_video is None:
         raise OmniClientError("MiniMax H3 audio_noise_mask requires source_audio or source_video")
 
+    raw_guides = multi_modal_data.get(MINIMAX_H3_TIMELINE_GUIDES_KEY)
+    if raw_guides is not None:
+        # Guides change the packed layout, so every feature that rebuilds or
+        # extends that layout is rejected before any media is decoded.
+        if resolve_long_video_mode(extra_args, task) == "continuation":
+            raise OmniClientError("MiniMax H3 timeline guides do not support continuation; use long_video_mode=full")
+        if video_edit_mask is not None or audio_edit_mask is not None:
+            raise OmniClientError("MiniMax H3 timeline guides cannot be combined with latent-mask editing")
+        if lock_audio:
+            raise OmniClientError("MiniMax H3 timeline guides cannot be combined with audio_mode=lock_source")
+    timeline_guides = prepare_timeline_guides(raw_guides, width=width, height=height, num_frames=num_frames)
+
     images = _prepare_encoder_images(
         task,
         raw_images,
         height=height,
         width=width,
+        guided=bool(timeline_guides),
     )
     keyframe_indices = _resolve_fl2va_keyframe_indices(extra_args, len(images)) if task == "fl2va" else []
     video_timestamps: list[list[float]] = []
@@ -642,6 +664,7 @@ def prepare_encoder_inputs(
         video_edit_mask=video_edit_mask,
         audio_edit=audio_edit,
         audio_edit_mask=audio_edit_mask,
+        timeline_guides=timeline_guides,
     )
     audio_inputs = _effective_audio_inputs(
         media_input.video_audios,
@@ -671,6 +694,66 @@ def _image_from_tensor(value: torch.Tensor) -> Image.Image:
     return Image.fromarray(array, mode="RGB")
 
 
+def _encode_guide_frames(guide: MiniMaxH3TimelineGuide, video_vae: Any, height: int, width: int) -> torch.Tensor | None:
+    if guide.frames is None:
+        return None
+    frames = guide.frames.detach().cpu().to(torch.uint8).contiguous()
+    if guide.is_clip:
+        rows, shape = video_vae.encode_video(np.asarray(frames.numpy()))
+        latent_t = int(shape[0])
+    else:
+        rows = video_vae.encode_image(_image_from_tensor(frames[0]))
+        latent_t = 1
+    if tuple(rows.shape) != (latent_t * (height // 32) * (width // 32), 96):
+        raise ValueError(f"MiniMax H3 timeline guide VAE returned rows {tuple(rows.shape)}")
+    return rows.to(dtype=torch.float32).contiguous()
+
+
+def _timeline_guide_conditioning(
+    media: MiniMaxH3EncoderMediaInput,
+    visual_rows: Sequence[torch.Tensor | None],
+    *,
+    audio_vae: Any,
+    component_scope: Callable[[Any], AbstractContextManager[Any]],
+) -> tuple[tuple[dict[str, Any], ...], torch.Tensor | None, torch.Tensor | None]:
+    """Build ordered guide blocks with their visual and audio anchor rows."""
+    if not media.timeline_guides:
+        return (), None, None
+    latent_h, latent_w = media.height // 16, media.width // 16
+    frame_rows = (latent_h // 2) * (latent_w // 2)
+    blocks: list[dict[str, Any]] = []
+    audio_rows: list[torch.Tensor] = []
+    for guide, rows in zip(media.timeline_guides, visual_rows, strict=True):
+        block: dict[str, Any] = {"frame_index": int(guide.start)}
+        if rows is not None:
+            block.update(
+                kind="video" if guide.is_clip else "image",
+                latent_t=rows.shape[0] // frame_rows,
+                latent_h=latent_h,
+                latent_w=latent_w,
+                ref_audio_t=0,
+            )
+        if guide.audio is not None:
+            if audio_vae is None:
+                raise RuntimeError("MiniMax H3 audio WVAE is not resident on the encoder leader")
+            with component_scope(audio_vae):
+                encoded, length = audio_vae.encode_waveform(*guide.audio)
+            length = int(length)
+            if length < 1 or tuple(encoded.shape) != (2 * length, 32):
+                raise ValueError("MiniMax H3 timeline guide audio VAE returned empty or invalid stereo rows")
+            # Rows are channel-major: crop time per channel, not the flat prefix.
+            cropped = min(length, guide.audio_limit)
+            audio_rows.append(encoded.reshape(2, length, 32)[:, :cropped].reshape(-1, 32).to(torch.float32))
+            block.update(kind="video_audio" if rows is not None else "audio", ref_audio_t=cropped)
+        blocks.append(block)
+    present = [rows for rows in visual_rows if rows is not None]
+    return (
+        tuple(blocks),
+        torch.cat(present).contiguous() if present else None,
+        torch.cat(audio_rows).contiguous() if audio_rows else None,
+    )
+
+
 def encode_media(
     media: MiniMaxH3EncoderMediaInput,
     *,
@@ -698,7 +781,9 @@ def encode_media(
     visual_rows: list[torch.Tensor] = []
     visual_shapes: list[tuple[int, int, int]] = []
     video_edit_clean_rows: torch.Tensor | None = None
-    if media.images or media.videos or media.video_edit is not None:
+    guide_visual_rows: list[torch.Tensor | None] = [None] * len(media.timeline_guides)
+    has_guide_frames = any(guide.frames is not None for guide in media.timeline_guides)
+    if media.images or media.videos or media.video_edit is not None or has_guide_frames:
         if video_vae is None:
             raise RuntimeError("MiniMax H3 video VAE is not resident on this rank")
         with component_scope(video_vae):
@@ -724,6 +809,11 @@ def encode_media(
                         f"expected {expected_shape} and ({expected_rows}, 96)"
                     )
                 video_edit_clean_rows = rows.to(dtype=torch.float32).contiguous()
+            # Guide stills and clips share the video VAE collective with the
+            # references, so every visual participant encodes them as well.
+            guide_visual_rows = [
+                _encode_guide_frames(guide, video_vae, media.height, media.width) for guide in media.timeline_guides
+            ]
 
     if not emit_conditioning:
         return None
@@ -749,6 +839,12 @@ def encode_media(
                     int(source_audio_t),
                     target_audio_t=media.audio_t,
                 )
+    guide_blocks, guide_visual, guide_audio = _timeline_guide_conditioning(
+        media,
+        guide_visual_rows,
+        audio_vae=audio_vae,
+        component_scope=component_scope,
+    )
     reference_lengths = audio_lengths[:-1] if media.audio_mode == "lock_source" else audio_lengths
     if reference_lengths:
         if any(length < 80 or length > 600 for length in reference_lengths):
@@ -813,4 +909,7 @@ def encode_media(
         audio_edit_clean_rows=audio_edit_clean_rows,
         audio_edit_mask=audio_edit_mask,
         audio_edit_source_t=audio_edit_source_t,
+        guide_blocks=guide_blocks,
+        guide_visual_condition=guide_visual,
+        guide_audio_condition=guide_audio,
     )
