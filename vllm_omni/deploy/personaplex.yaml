@@ -91,7 +91,8 @@ stages:
     max_model_len: 65536
     devices: "0"
     # Replay each frame's streaming Mimi decode (all sessions plus a scratch
-    # row) from a model-local CUDA graph captured at load.
+    # row) from a model-local CUDA graph captured at load. Decoder GEMMs use
+    # TF32 (mimi_decode_tf32, default on); weights stay float32.
     hf_overrides:
       mimi_cuda_graphs: true
     input_connectors:

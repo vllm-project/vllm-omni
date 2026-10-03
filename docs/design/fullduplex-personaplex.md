@@ -172,8 +172,10 @@ de-delayed agent codebooks; Stage 1 decodes only the new code frames, one
 `decode_frame` call per frame index across all rows, and emits only the new PCM
 suffix. The stage keeps `enforce_eager: true`, since vLLM's own capture records
 nothing for it; with `mimi_cuda_graphs` in its `hf_overrides` each
-`decode_frame` call replays a CUDA graph captured at load. Connector chunk
-boundaries retain the final raw code frame needed to de-delay the next chunk.
+`decode_frame` call replays a CUDA graph captured at load. Stage 1 keeps Mimi
+weights in float32 and, by default (`mimi_decode_tf32`), enables TF32 for
+decoder GEMMs before that capture. Connector chunk boundaries retain the
+final raw code frame needed to de-delay the next chunk.
 
 ### Data-plane projector
 

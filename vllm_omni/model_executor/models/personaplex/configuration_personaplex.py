@@ -207,6 +207,11 @@ class PersonaPlexConfig(PretrainedConfig):
             Replay the streaming Mimi codec from model-local CUDA graphs. Set
             per stage through ``hf_overrides``; independent of ``enforce_eager``,
             which only governs vLLM's own graphs.
+        mimi_decode_tf32 (`bool`, *optional*, defaults to `True`):
+            Stage 1 Code2Wav: keep Mimi weights in float32 and run decoder GEMMs
+            in TF32. The flags are process-wide CUDA backend switches; this is
+            for the dedicated Stage 1 worker. Set ``False`` to restore IEEE
+            fp32 matmul.
         depformer_cuda_graphs (`bool`, *optional*, defaults to `False`):
             Replay the duplex post-sample depformer step (teacher-forcing gather,
             depformer, frame-state commit) from model-local CUDA graphs at vLLM's
@@ -231,6 +236,7 @@ class PersonaPlexConfig(PretrainedConfig):
         num_audio_codebooks: int = 16,
         mimi_name: str | None = None,
         mimi_cuda_graphs: bool = False,
+        mimi_decode_tf32: bool = True,
         depformer_cuda_graphs: bool = False,
         **kwargs: Any,
     ) -> None:
@@ -268,6 +274,7 @@ class PersonaPlexConfig(PretrainedConfig):
             self.mimi_config.mimi_name = mimi_name
         self.mimi_name = self.mimi_config.mimi_name
         self.mimi_cuda_graphs = mimi_cuda_graphs
+        self.mimi_decode_tf32 = mimi_decode_tf32
         self.depformer_cuda_graphs = depformer_cuda_graphs
 
     @staticmethod

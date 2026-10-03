@@ -182,9 +182,13 @@ def _model(
     cuda_graphs: bool = False,
     async_chunk: bool = True,
     device: str = "cpu",
+    runner_device: str = "cpu",
+    decode_tf32: bool | None = None,
 ) -> tuple[PersonaPlexCode2Wav, _FakeBatchedMimi]:
     mimi_config = SimpleNamespace(num_codebooks=2, sample_rate=24000, samples_per_frame=4, mimi_name=None)
     config = SimpleNamespace(mimi_config=mimi_config, mimi_name=None, mimi_cuda_graphs=cuda_graphs)
+    if decode_tf32 is not None:
+        config.mimi_decode_tf32 = decode_tf32
     vllm_config = SimpleNamespace(
         model_config=SimpleNamespace(
             model="/unused",
@@ -192,7 +196,7 @@ def _model(
             duplex_max_sessions=max_sessions,
             async_chunk=async_chunk,
         ),
-        device_config=SimpleNamespace(device="cpu"),
+        device_config=SimpleNamespace(device=runner_device),
     )
     model = PersonaPlexCode2Wav(vllm_config=vllm_config)
     mimi = _FakeBatchedMimi(device)
@@ -252,6 +256,72 @@ def test_load_weights_builds_one_shared_decoder_with_a_row_per_session(
     assert built[0].encodes is False
     # Only mimi_cuda_graphs decides the decode graph; Stage 1 stays enforce_eager.
     assert built[0].captured_rows == ([4] if cuda_graphs else [])
+
+
+class _LoadCodec(_FakeBatchedMimi):
+    def __init__(self, checkpoint: str | None, device: str) -> None:
+        super().__init__()
+        self.model = SimpleNamespace(config=SimpleNamespace(sampling_rate=24000))
+
+
+def test_load_weights_enables_tf32_on_cuda_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    old_matmul = torch.backends.cuda.matmul.allow_tf32
+    old_cudnn = torch.backends.cudnn.allow_tf32
+    old_precision = torch.get_float32_matmul_precision()
+    try:
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+        torch.set_float32_matmul_precision("highest")
+        monkeypatch.setattr(personaplex_mimi, "PersonaPlexMimiCodec", _LoadCodec)
+        model, _ = _model(install=False, runner_device="cuda")
+        model.load_weights(iter([("unused.weight", torch.zeros(1))]))
+        assert torch.backends.cuda.matmul.allow_tf32 is True
+        assert torch.backends.cudnn.allow_tf32 is True
+        assert torch.get_float32_matmul_precision() == "high"
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = old_matmul
+        torch.backends.cudnn.allow_tf32 = old_cudnn
+        torch.set_float32_matmul_precision(old_precision)
+
+
+def test_load_weights_keeps_ieee_matmul_when_tf32_is_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    old_matmul = torch.backends.cuda.matmul.allow_tf32
+    old_cudnn = torch.backends.cudnn.allow_tf32
+    old_precision = torch.get_float32_matmul_precision()
+    try:
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+        torch.set_float32_matmul_precision("highest")
+        monkeypatch.setattr(personaplex_mimi, "PersonaPlexMimiCodec", _LoadCodec)
+        model, _ = _model(install=False, runner_device="cuda", decode_tf32=False)
+        model.load_weights(iter([("unused.weight", torch.zeros(1))]))
+        assert torch.backends.cuda.matmul.allow_tf32 is False
+        assert torch.backends.cudnn.allow_tf32 is False
+        assert torch.get_float32_matmul_precision() == "highest"
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = old_matmul
+        torch.backends.cudnn.allow_tf32 = old_cudnn
+        torch.set_float32_matmul_precision(old_precision)
+
+
+def test_load_weights_on_cpu_leaves_tf32_flags_alone(monkeypatch: pytest.MonkeyPatch) -> None:
+    old_matmul = torch.backends.cuda.matmul.allow_tf32
+    old_cudnn = torch.backends.cudnn.allow_tf32
+    old_precision = torch.get_float32_matmul_precision()
+    try:
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+        torch.set_float32_matmul_precision("highest")
+        monkeypatch.setattr(personaplex_mimi, "PersonaPlexMimiCodec", _LoadCodec)
+        model, _ = _model(install=False, runner_device="cpu")
+        model.load_weights(iter([("unused.weight", torch.zeros(1))]))
+        assert torch.backends.cuda.matmul.allow_tf32 is False
+        assert torch.backends.cudnn.allow_tf32 is False
+        assert torch.get_float32_matmul_precision() == "highest"
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = old_matmul
+        torch.backends.cudnn.allow_tf32 = old_cudnn
+        torch.set_float32_matmul_precision(old_precision)
 
 
 def test_delta_codes_skip_cpu_history(mocker) -> None:

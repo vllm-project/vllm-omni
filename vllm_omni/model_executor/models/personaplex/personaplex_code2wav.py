@@ -44,6 +44,18 @@ from vllm_omni.model_executor.models.output_templates import OmniOutput
 logger = init_logger(__name__)
 
 
+def _enable_mimi_decode_tf32() -> None:
+    """Run Stage 1 Mimi GEMMs on TF32 tensor cores.
+
+    Code2Wav is its own worker process. Weights stay float32; TF32 is the
+    decoder-transformer linear path. cuDNN TF32 is already the conv default.
+    Call this before ``capture_decode_graph`` so the captured kernels use it.
+    """
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.set_float32_matmul_precision("high")
+
+
 def _payload_codes(runtime_info: Mapping[str, Any] | None) -> torch.Tensor | list | tuple | None:
     """The connector-delivered codec ids in ``runtime_info``, if it carries any."""
     if isinstance(runtime_info, Mapping):
@@ -532,7 +544,18 @@ class PersonaPlexCode2Wav(nn.Module):
             ).eval()
         # Allocate the streaming state and the decode graph's pool here, not on
         # the first request, so vLLM's memory profiling sees them.
-        self._install_mimi(codec, torch.device(str(device)))
+        codec_device = torch.device(str(device))
+        self._install_mimi(codec, codec_device)
+        # TF32 before graph capture so replay uses tensor-core GEMMs.
+        if codec_device.type == "cuda" and getattr(self.config, "mimi_decode_tf32", True):
+            _enable_mimi_decode_tf32()
+            logger.info(
+                "PersonaPlex Code2Wav TF32 enabled: matmul.allow_tf32=%s "
+                "cudnn.allow_tf32=%s float32_matmul_precision=%s",
+                torch.backends.cuda.matmul.allow_tf32,
+                torch.backends.cudnn.allow_tf32,
+                torch.get_float32_matmul_precision(),
+            )
         # Stage 1 runs with enforce_eager (the runner's own capture records
         # nothing for this model); the flag alone decides the codec's graph.
         if getattr(self.config, "mimi_cuda_graphs", False):
