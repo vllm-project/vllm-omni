@@ -141,7 +141,10 @@ The client accepts local reference files, URLs, and data URLs. `--stream` writes
 
 ### Prerequisites
 
+The talker extracts speech tokens from `ref_audio` with `s3tokenizer`, which is not part of the base install or of the published `vllm/vllm-omni` Docker image:
+
 ```bash
+pip install s3tokenizer
 huggingface-cli download FunAudioLLM/Fun-CosyVoice3-0.5B-2512
 ```
 
