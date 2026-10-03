@@ -13,7 +13,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from vllm_omni.model_executor.models.common.ops import qkv_head_layer_norm, residual_layer_norm
+from vllm_omni.model_executor.models.minicpmo_4_5.ops import qkv_head_layer_norm, residual_layer_norm
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cuda]
 

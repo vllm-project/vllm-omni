@@ -5,11 +5,9 @@
 
 """Fused attention prologue for a packed QKV projection with LayerNorm q/k norms.
 
-Shared LayerNorm sibling of ``omnivoice/fused_qkv_rope.py`` (RMSNorm + RoPE)
-and ``diffusion/layers/fused_qk_norm_rope.py``. DiT attention with
-``qk_norm=True`` and ``nn.LayerNorm`` (no RoPE) still splits a packed QKV,
-normalizes q and k per head, and a streaming block writes the new keys and
-values into its attention cache. Eagerly that is a
+MiniCPM-o DiT attention with ``qk_norm=True`` and ``nn.LayerNorm`` (no RoPE)
+splits a packed QKV, normalizes q and k per head, and a streaming block writes
+the new keys and values into its attention cache. Eagerly that is a
 transpose copy and a LayerNorm for each of q and k (``F.layer_norm`` needs a
 contiguous input) plus a copy of each of k and v into the cache.
 

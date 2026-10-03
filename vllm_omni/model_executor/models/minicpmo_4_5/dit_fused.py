@@ -52,7 +52,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from vllm_omni.model_executor.models.common.ops import qkv_head_layer_norm, residual_layer_norm
+from .ops import qkv_head_layer_norm, residual_layer_norm
 
 # adaLN chunk order of ``DiTBlock.adaLN_modulation``.
 _SHIFT_MSA, _SCALE_MSA, _GATE_MSA, _SHIFT_MLP, _SCALE_MLP, _GATE_MLP, _SHIFT_CONV, _SCALE_CONV, _GATE_CONV = range(9)
