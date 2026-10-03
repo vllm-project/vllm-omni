@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Cosmos3 guardrail hooks for vllm-omni.
 
 Thin adapter around the ``cosmos_guardrail`` package's ``CosmosSafetyChecker``
@@ -166,6 +166,26 @@ def check_text_safety(prompt: str) -> None:
 def check_video_safety(video_tensor: torch.Tensor) -> torch.Tensor:
     if _video_guardrail is None:
         return video_tensor
+
+    if video_tensor.dtype == torch.uint8:
+        if video_tensor.dim() not in (4, 5) or video_tensor.shape[-1] != 3:
+            raise ValueError(
+                "Cosmos3 display-frame guardrails expect [T, H, W, 3] or "
+                f"[1, T, H, W, 3] uint8 input, got {tuple(video_tensor.shape)}."
+            )
+        if video_tensor.dim() == 5 and video_tensor.shape[0] != 1:
+            raise ValueError(
+                "Cosmos3 video guardrails currently support one video per request, "
+                f"got batch size {video_tensor.shape[0]}."
+            )
+        # Already the guardrail's own channel-last format.
+        frames = video_tensor.detach().cpu()
+        batched = frames.dim() == 5
+        checked = _video_guardrail((frames[0] if batched else frames).numpy())
+        result = torch.from_numpy(checked.copy())
+        if batched:
+            result = result.unsqueeze(0)
+        return result.to(video_tensor.device)
 
     v = video_tensor.detach().cpu().float()
     if v.dim() == 5:

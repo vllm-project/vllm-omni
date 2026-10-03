@@ -313,6 +313,9 @@ class OmniOpenAIServingVideo:
             prompt["negative_prompt"] = request.negative_prompt
 
         gen_params = self._resolve_default_sampling_params()
+        # The response is encoded video, so compatible pipelines can avoid
+        # transferring floating-point frames that the encoder narrows again.
+        gen_params.prefer_video_uint8 = True
 
         input_image = None if reference_image is None else reference_image.data
         input_video = None if reference_video is None else reference_video.data
