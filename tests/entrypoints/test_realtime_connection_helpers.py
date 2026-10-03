@@ -4,7 +4,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
+import json
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -84,3 +87,56 @@ class TestAsyncOmniStreamingParamsValidation:
         p = SamplingParams(n=1, stop=["\n"], output_kind=RequestOutputKind.DELTA)
         with pytest.raises(ValueError, match="Input streaming"):
             AsyncOmni._validate_streaming_input_sampling_params(p)
+
+
+@pytest.mark.parametrize(
+    "frame,code,message",
+    [
+        ("{not-json", "invalid_event", "Invalid or unrecognized client event"),
+        (json.dumps({"type": "session.update"}), "invalid_event", "Invalid or unrecognized client event"),
+        (
+            json.dumps({"type": "session.update", "session": []}),
+            "invalid_event",
+            "Invalid or unrecognized client event",
+        ),
+        (json.dumps({"type": "input_audio_buffer.commit"}), "invalid_request_error", "Input audio buffer is empty"),
+        (json.dumps({"type": "unknown.event"}), "invalid_event", "Invalid or unrecognized client event"),
+        (
+            json.dumps({"type": "input_audio_buffer.append", "audio": "not-valid-base64!!!"}),
+            "invalid_request_error",
+            "Invalid base64 audio data",
+        ),
+    ],
+)
+def test_full_duplex_invalid_request_contract(frame, code, message):
+    from starlette.websockets import WebSocketDisconnect
+
+    from vllm_omni.entrypoints.openai.realtime.connection import OpenAIFullDuplexConnection
+
+    class Socket:
+        def __init__(self):
+            self.sent = []
+            self.frames = iter([frame])
+
+        async def accept(self):
+            pass
+
+        async def receive_text(self):
+            value = next(self.frames, None)
+            if value is None:
+                raise WebSocketDisconnect()
+            return value
+
+        async def send_text(self, payload):
+            self.sent.append(json.loads(payload))
+
+    async def run():
+        socket = Socket()
+        connection = OpenAIFullDuplexConnection(socket, SimpleNamespace(), "test-model", None)
+        await connection.handle_connection()
+        assert [event["type"] for event in socket.sent] == ["session.created", "conversation.created", "error"]
+        error = socket.sent[-1]["error"]
+        assert error["code"] == code
+        assert error["message"] == message
+
+    asyncio.run(run())
