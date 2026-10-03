@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """
 Base pipeline class for Diffusion models with shared CFG functionality.
@@ -118,7 +118,16 @@ class CFGParallelMixin(metaclass=ABCMeta):
             For multi-output models (e.g., video + audio where predict_noise
             returns a tuple), override combine_cfg_noise() for per-element CFG
             logic and set self.scheduler to a composite scheduler.
+
+            Sets ``self.transformer.do_true_cfg`` before predicting. TeaCache
+            reads it to keep one cache state per CFG branch; without it the
+            positive and negative calls of a step share a state and reuse each
+            other's residual.
         """
+        transformer = getattr(self, "transformer", None)
+        if transformer is not None:
+            transformer.do_true_cfg = do_true_cfg
+
         if do_true_cfg:
             # Automatically detect CFG parallel configuration
             cfg_parallel_ready = _get_cfg_world_size_or_one() > 1
