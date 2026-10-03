@@ -103,6 +103,7 @@ def _fake_wrapper(monkeypatch: pytest.MonkeyPatch) -> HiFTGraphWrapper:
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     wrapper = object.__new__(HiFTGraphWrapper)
     wrapper.capture_batch_sizes = [1]
+    wrapper._legit_shapes = {(7, 0), (9, 0)}
     wrapper.graph = {}
     wrapper.static_speech_inputs = {}
     wrapper.static_cache_source_inputs = {}
@@ -748,15 +749,19 @@ def _eager_solve_euler(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("fused_euler_step", [False, True])
 def test_whole_euler_graph_replay_matches_eager_for_uncached_and_cached_shapes(
     monkeypatch: pytest.MonkeyPatch,
+    fused_euler_step: bool,
 ) -> None:
     pool = torch.cuda.graph_pool_handle()
     monkeypatch.setattr(current_platform, "get_global_graph_pool", lambda: pool)
 
     torch.manual_seed(0)
     estimator = _WholeEulerDiT().eval().cuda()
-    wrapper = WholeEulerCFMGraphWrapper(estimator=estimator, n_timesteps=10, max_graphs=32)
+    wrapper = WholeEulerCFMGraphWrapper(
+        estimator=estimator, n_timesteps=10, max_graphs=32, fused_euler_step=fused_euler_step
+    )
 
     batch_size = 2
     chunk_size = 10
@@ -2315,7 +2320,7 @@ def test_whole_euler_request_caches_grow_and_update_in_place(monkeypatch: pytest
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_whole_euler_groups_are_acquired_again_after_a_flush(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_whole_euler_groups_are_acquired_again_after_a_flush() -> None:
     """Capturing a later group can retire an earlier one; no group replays until all are held at once."""
     wrapper = WholeEulerCFMGraphWrapper(estimator=_tiny_upstream_dit(), n_timesteps=10, max_graphs=8)
     calls: list[int] = []
@@ -2326,13 +2331,12 @@ def test_whole_euler_groups_are_acquired_again_after_a_flush(monkeypatch: pytest
             wrapper._stats["flushes"] += 1
         return ("entry", graph_batch, len(calls))
 
-    monkeypatch.setattr(wrapper, "_entry", entry)
     flush_always = False
     groups, fills = [(16, 16), (1, 1)], [None, None]
-    assert wrapper._group_entries(groups, fills) == [("entry", 16, 3), ("entry", 1, 4)]
+    assert wrapper._group_entries(entry, groups, fills) == [("entry", 16, 3), ("entry", 1, 4)]
     assert calls == [16, 1, 16, 1]
     flush_always = True
-    assert wrapper._group_entries(groups, fills) is None
+    assert wrapper._group_entries(entry, groups, fills) is None
 
 
 @pytest.mark.parametrize("fail", [False, True])

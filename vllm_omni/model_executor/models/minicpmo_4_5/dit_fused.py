@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 import functools
-from typing import Any, NamedTuple
+from typing import Any
 
 import torch
 import torch.nn as nn
@@ -15,31 +15,6 @@ from .ops import qkv_head_layer_norm, residual_layer_norm
 
 # adaLN chunk order of ``DiTBlock.adaLN_modulation``.
 _SHIFT_MSA, _SCALE_MSA, _GATE_MSA, _SHIFT_MLP, _SCALE_MLP, _GATE_MLP, _SHIFT_CONV, _SCALE_CONV, _GATE_CONV = range(9)
-
-
-class DitGemm(NamedTuple):
-    """The fused body's GEMM backend (``cfm_dit_gemm``; default cuBLAS)."""
-
-    conv_windows: bool = False
-    precision: str | None = None
-
-
-def _linear(
-    a: torch.Tensor,
-    weight: torch.Tensor,
-    bias: torch.Tensor | None,
-    gemm: DitGemm | None = None,
-    *,
-    activation: str | None = None,
-    view=None,
-) -> torch.Tensor:
-    """``act(A @ weight.T + bias)`` on cuBLAS."""
-    if activation == "gelu_tanh":
-        if bias is not None and a.is_cuda:
-            # cuBLASLt applies bias + tanh-GELU in the GEMM epilogue.
-            return torch._addmm_activation(bias, a, weight.t(), use_gelu=True)
-        return F.gelu(F.linear(a, weight, bias), approximate="tanh")
-    return F.linear(a, weight, bias)
 
 
 def supports_fused_body(estimator: nn.Module) -> bool:
@@ -79,11 +54,7 @@ def supports_fused_body(estimator: nn.Module) -> bool:
 def dit_modulation(estimator: nn.Module, time_embedding: torch.Tensor) -> torch.Tensor:
     """adaLN table ``(depth + 1, 9, C)`` for one timestep; scales stored as ``1 + scale``."""
     embedding = time_embedding.reshape(1, 1, -1)
-    rows = []
-    for block in estimator.blocks:
-        chunks = block.adaLN_modulation(embedding).reshape(9, -1)
-        rows.append(chunks)
-    table = torch.stack(rows, dim=0)
+    table = torch.stack([block.adaLN_modulation(embedding).reshape(9, -1) for block in estimator.blocks], dim=0)
     table[:, (_SCALE_MSA, _SCALE_MLP, _SCALE_CONV)] += 1.0
     final_shift, final_scale = estimator.final_layer.adaLN_modulation(embedding).reshape(2, -1)
     final = table.new_zeros((1, 9, int(table.shape[2])))
@@ -149,13 +120,14 @@ def gather_causal_cache(history: torch.Tensor, index: torch.Tensor) -> torch.Ten
     return history.gather(1, index[:, :, None].expand(-1, -1, int(history.shape[2]))).transpose(1, 2)
 
 
-def _mlp(mlp: nn.Module, hidden: torch.Tensor, gemm: DitGemm | None = None) -> torch.Tensor:
+def _mlp(mlp: nn.Module, hidden: torch.Tensor) -> torch.Tensor:
     rows = hidden.reshape(-1, int(hidden.shape[-1]))
-    if mlp.act.approximate == "tanh" and rows.is_cuda:
-        inner = _linear(rows, mlp.fc1.weight, mlp.fc1.bias, gemm, activation="gelu_tanh")
+    if mlp.act.approximate == "tanh" and rows.is_cuda and mlp.fc1.bias is not None:
+        # cuBLASLt applies bias + tanh-GELU in the GEMM epilogue.
+        inner = torch._addmm_activation(mlp.fc1.bias, rows, mlp.fc1.weight.t(), use_gelu=True)
     else:
         inner = mlp.act(F.linear(rows, mlp.fc1.weight, mlp.fc1.bias))
-    return _linear(inner, mlp.fc2.weight, mlp.fc2.bias, gemm).view(*hidden.shape[:-1], -1)
+    return F.linear(inner, mlp.fc2.weight, mlp.fc2.bias).view(*hidden.shape[:-1], -1)
 
 
 @functools.cache
@@ -171,12 +143,11 @@ def _attention(
     attn_mask: torch.Tensor | None,
     kv: torch.Tensor,
     slots: tuple[torch.Tensor, torch.Tensor] | None = None,
-    gemm: DitGemm | None = None,
 ) -> torch.Tensor:
     """``attn.forward_chunk`` over ``hidden``, writing new keys/values into ``kv``."""
     batch, frames, _ = hidden.shape
     weight, bias = packed_qkv(attn)
-    qkv = _linear(hidden.reshape(batch * frames, -1), weight, bias, gemm).view(batch, frames, -1)
+    qkv = F.linear(hidden.reshape(batch * frames, -1), weight, bias).view(batch, frames, -1)
     rows, positions = slots if slots is not None else (None, None)
     if slots is None:
         # ``att_cache`` behind the current frames: left where it is when it
@@ -209,7 +180,7 @@ def _attention(
             q, keys, values, attn_mask=None if attn_mask is None else attn_mask.unsqueeze(1)
         )
     out = out.transpose(1, 2).reshape(batch * frames, -1)
-    return _linear(out, attn.proj.weight, attn.proj.bias, gemm).view(batch, frames, -1)
+    return F.linear(out, attn.proj.weight, attn.proj.bias).view(batch, frames, -1)
 
 
 def blocks_forward_chunk_fused(
@@ -224,7 +195,6 @@ def blocks_forward_chunk_fused(
     valid_lengths: list[int] | torch.Tensor,
     modulation: torch.Tensor | None = None,
     slots: tuple[torch.Tensor, torch.Tensor] | None = None,
-    gemm: DitGemm | None = None,
 ) -> torch.Tensor:
     """``BatchedToken2Wav._blocks_forward_chunk_ragged`` with fused norms/GEMM/attention."""
     if isinstance(valid_lengths, torch.Tensor):
@@ -244,29 +214,16 @@ def blocks_forward_chunk_fused(
     hidden = residual_layer_norm(x, weight=first[_SCALE_MSA], bias=first[_SHIFT_MSA], eps=blocks[0].norm1.eps)
     for block_index, block in enumerate(blocks):
         mod = modulation[block_index]
-        x_att = _attention(
-            block.attn,
-            hidden,
-            att_cache[block_index],
-            attn_mask,
-            att_cache_buffer[block_index],
-            slots,
-            gemm,
-        )
+        x_att = _attention(block.attn, hidden, att_cache[block_index], attn_mask, att_cache_buffer[block_index], slots)
 
         # CausalConvBlock: [conv1, LayerNorm, Mish, conv2] on (N, width + T, C) histories.
         conv_layers = block.conv.block
         conv1, conv_norm, conv2 = conv_layers[1], conv_layers[3], conv_layers[6]
         width = int(conv1.kernel_size[0]) - 1
         old_cnn = cnn_cache[block_index]
-        history = _conv_history(
-            None if old_cnn is None else old_cnn[:, : conv1.in_channels],
-            rows,
-            width,
-            frames,
-            conv1.in_channels,
-            x,
-        )
+        split = conv1.in_channels
+        old_cnn1, old_cnn2 = (None, None) if old_cnn is None else (old_cnn[:, :split], old_cnn[:, split:])
+        history = _conv_history(old_cnn1, rows, width, frames, split, x)
         # x += gate_msa * attention; the conv block's modulated LayerNorm lands in the history.
         residual_layer_norm(
             x,
@@ -278,15 +235,8 @@ def blocks_forward_chunk_fused(
             residual_out=x,
             out=history[:, width:],
         )
-        taps1 = _linear(history.view(-1, conv1.in_channels), _conv_taps_weight(conv1), None, gemm)
-        history2 = _conv_history(
-            None if old_cnn is None else old_cnn[:, conv1.in_channels :],
-            rows,
-            width,
-            frames,
-            conv2.in_channels,
-            x,
-        )
+        taps1 = F.linear(history.view(-1, conv1.in_channels), _conv_taps_weight(conv1))
+        history2 = _conv_history(old_cnn2, rows, width, frames, conv2.in_channels, x)
         residual_layer_norm(
             None,
             taps1.view(rows, width + frames, -1),
@@ -298,7 +248,7 @@ def blocks_forward_chunk_fused(
             activation="mish",
             out=history2[:, width:],
         )
-        taps2 = _linear(history2.view(-1, conv2.in_channels), _conv_taps_weight(conv2), None, gemm)
+        taps2 = F.linear(history2.view(-1, conv2.in_channels), _conv_taps_weight(conv2))
         # x += gate_conv * conv2; the MLP's modulated LayerNorm.
         mlp_in = residual_layer_norm(
             x,
@@ -311,7 +261,7 @@ def blocks_forward_chunk_fused(
             eps=block.norm2.eps,
             residual_out=x,
         )
-        mlp_out = _mlp(block.mlp, mlp_in, gemm)
+        mlp_out = _mlp(block.mlp, mlp_in)
         # x += gate_mlp * MLP, then the next block's (or the final layer's) modulated LayerNorm:
         # table row ``depth`` holds the final layer's shift and 1 + scale where a block keeps its MSA pair.
         last = block_index + 1 == depth
@@ -328,14 +278,7 @@ def blocks_forward_chunk_fused(
         if width not in cache_index:
             cache_index[width] = causal_cache_index(lengths, width)
         cnn_out = cnn_cache_buffer[block_index]
-        cnn_out[:, : conv1.in_channels].copy_(gather_causal_cache(history, cache_index[width]))
-        cnn_out[:, conv1.in_channels :].copy_(gather_causal_cache(history2, cache_index[width]))
+        cnn_out[:, :split].copy_(gather_causal_cache(history, cache_index[width]))
+        cnn_out[:, split:].copy_(gather_causal_cache(history2, cache_index[width]))
 
-    final = estimator.final_layer.linear
-    if gemm is None:
-        return final(hidden).transpose(1, 2)
-    return (
-        _linear(hidden.reshape(rows * frames, -1), final.weight, final.bias, gemm)
-        .view(rows, frames, -1)
-        .transpose(1, 2)
-    )
+    return estimator.final_layer.linear(hidden).transpose(1, 2)

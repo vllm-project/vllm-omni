@@ -95,21 +95,19 @@ class _ConvRNNF0Predictor(nn.Module):
         return self.classifier(self.condnet(x).transpose(1, 2)).squeeze(-1).abs()
 
 
-# Upstream cosyvoice2 chunk-streaming att_cache_buffer (~2.1 GiB); unused by BatchedToken2Wav.
-_UPSTREAM_CHUNK_ATT_BUFFER = "att_cache_buffer"
-
-
 def drop_upstream_chunk_att_buffers(flow: nn.Module) -> int:
-    """Drop unused upstream chunk-streaming attention buffers. Returns bytes released."""
+    """Drop upstream cosyvoice2's unused chunk-streaming ``att_cache_buffer`` tensors (~2.1 GiB); returns bytes freed.
+
+    Only ``flow.setup_cache`` / ``flow.inference_chunk`` read them, and then
+    fail instead of computing on a stand-in.
+    """
     released = 0
     decoder = getattr(flow, "decoder", None)
     for module in (decoder, getattr(decoder, "estimator", None)):
-        if not isinstance(module, nn.Module):
-            continue
-        buffer = module._buffers.get(_UPSTREAM_CHUNK_ATT_BUFFER)
+        buffer = module._buffers.get("att_cache_buffer") if isinstance(module, nn.Module) else None
         if isinstance(buffer, torch.Tensor):
             released += buffer.numel() * buffer.element_size()
-            del module._buffers[_UPSTREAM_CHUNK_ATT_BUFFER]
+            del module._buffers["att_cache_buffer"]
     return released
 
 
@@ -140,7 +138,6 @@ class StepAudio2Token2WavCore(nn.Module):
         # A backend that never runs ``flow.setup_cache`` / ``flow.inference_chunk``
         # (MiniCPM-o's ``BatchedToken2Wav``) can drop their 2.1 GiB of buffers.
         self._drop_chunk_att_buffers = bool(drop_upstream_chunk_att_buffers)
-        self._chunk_att_buffers_dropped = False
         self.float16 = float16
         self.device = torch.device(device)
         self.n_timesteps = n_timesteps
@@ -202,7 +199,6 @@ class StepAudio2Token2WavCore(nn.Module):
         if self._drop_chunk_att_buffers:
             # Before ``.to(self.device)``: the buffers never reach the device.
             released = drop_upstream_chunk_att_buffers(self._flow)
-            self._chunk_att_buffers_dropped = True
             logger.info("Dropped the upstream flow chunk attention buffers (%.1f MiB)", released / 2**20)
         if self.float16:
             self._flow.half()
@@ -361,18 +357,10 @@ class StepAudio2Token2WavCore(nn.Module):
 
     # ------------------------------------------------------------------
     # Per-request streaming (does NOT mutate self – uses external state)
-    def _require_chunk_att_buffers(self) -> None:
-        if self._chunk_att_buffers_dropped:
-            raise RuntimeError(
-                "Token2Wav chunk streaming needs the upstream flow attention buffers, "
-                "which drop_upstream_chunk_att_buffers removed"
-            )
-
     # ------------------------------------------------------------------
 
     def setup_stream_for(self, prompt_wav: str, state: _StreamState) -> None:
         """Initialise flow + HiFT caches into *state* (no self mutation)."""
-        self._require_chunk_att_buffers()
         if prompt_wav not in self.cache:
             self.cache[prompt_wav] = self._prepare_prompt(prompt_wav)
         prompt_speech_tokens, _, spk_emb, prompt_mels, _ = self.cache[prompt_wav]
@@ -407,7 +395,6 @@ class StepAudio2Token2WavCore(nn.Module):
         state: _StreamState,
     ) -> torch.Tensor:
         """Process one chunk using *state* (no self mutation except speech_window)."""
-        self._require_chunk_att_buffers()
         if state.stream_cache is None:
             raise ValueError("stream_cache not initialised – call setup_stream_for() first")
 

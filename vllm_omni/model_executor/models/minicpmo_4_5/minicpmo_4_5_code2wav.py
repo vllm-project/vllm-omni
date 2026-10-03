@@ -9,12 +9,12 @@ import os
 import tempfile
 import time
 from collections import OrderedDict
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from functools import lru_cache
+from functools import lru_cache, partial
 from hashlib import sha256
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 
 import soundfile as sf
 import torch
@@ -31,7 +31,7 @@ from .batched_token2wav import (
     row_offset_signature,
     state_shape_signature,
 )
-from .cuda_graph_wrapper import ResidentAttCache, _memory_snapshot
+from .cuda_graph_wrapper import ResidentAttCache, _format_memory_delta, _memory_snapshot
 
 logger = init_logger(__name__)
 
@@ -54,13 +54,10 @@ def _tf32_mode(extra: Mapping[str, Any]) -> str:
     """Stage-2 TF32 scope: ``"off"`` (default), ``"flow"`` (CFM DiT only), or ``"all"``."""
     if bool(extra.get("token2wav_allow_tf32", False)):
         return "all"
-    value: Any = extra.get("code2wav_allow_tf32", False)
+    value = extra.get("code2wav_allow_tf32", False)
     if isinstance(value, str):
-        value = value.strip().lower()
-        if value == "flow":
-            return "flow"
-        return "all" if value in ("1", "true", "all", "yes") else "off"
-    return "all" if bool(value) else "off"
+        return {"flow": "flow", "1": "all", "true": "all", "all": "all", "yes": "all"}.get(value.strip().lower(), "off")
+    return "all" if value else "off"
 
 
 def _batch_error(reason: str, **details: Any) -> RuntimeError:
@@ -299,16 +296,10 @@ class MiniCPMO45Code2Wav(nn.Module):
             raise ValueError(f"Invalid MiniCPM-o connector chunk configuration: {self._connector_config}")
         max_num_seqs = getattr(getattr(vllm_config, "scheduler_config", None), "max_num_seqs", None)
         raw_capture_batch_sizes = extra.get("hift_graph_capture_batch_sizes")
-        if raw_capture_batch_sizes is None:
-            batch_cap = min(int(max_num_seqs), 32) if max_num_seqs else 32
-            capture_batch_sizes = []
-            size = 1
-            while size < batch_cap:
-                capture_batch_sizes.append(size)
-                size *= 2
-            capture_batch_sizes.append(batch_cap)
-        else:
-            capture_batch_sizes = raw_capture_batch_sizes
+        # Default: powers of two below the scheduler's batch (capped at 32) and the cap itself.
+        batch_cap = min(int(max_num_seqs), 32) if max_num_seqs else 32
+        pow2 = [1 << i for i in range(batch_cap.bit_length()) if 1 << i < batch_cap] + [batch_cap]
+        capture_batch_sizes = pow2 if raw_capture_batch_sizes is None else raw_capture_batch_sizes
         max_serial_batch = extra.get("max_serial_batch")
         max_serial_batch = 4 if max_serial_batch is None else int(max_serial_batch)
         self._hift_graph_config = {
@@ -331,12 +322,19 @@ class MiniCPMO45Code2Wav(nn.Module):
             "pad_max_rows": extra.get("whole_euler_pad_max_rows"),
             "fused_body": bool(extra.get("cfm_fused_body", False)),
             "slot_pool": bool(extra.get("cfm_slot_pool", False)),
-            "dit_gemm": extra.get("cfm_dit_gemm"),
-            "dit_gemm_precision": extra.get("cfm_dit_gemm_precision"),
-            "prompt_att_sharing": bool(extra.get("cfm_prompt_att_sharing", False)),
-            "arena_rows_from_graph_grid": bool(extra.get("cfm_arena_rows_from_graph_grid", False)),
             "row_offset_merge": extra.get("cfm_row_offset_merge", False) is True,
             "fused_euler_step": extra.get("cfm_fused_euler_step", False) is True,
+        }
+        # Exact-shape flow-encoder graphs (``FlowEncoderGraphs``, default off).
+        # ``cfm_encoder_graph_rows`` is the largest row count or a list of counts.
+        rows = extra.get("cfm_encoder_graph_rows", 8)
+        rows = sorted({int(r) for r in rows}) if isinstance(rows, (list, tuple)) else list(range(1, int(rows) + 1))
+        if any(r < 1 for r in rows):
+            raise ValueError("MiniCPM-o cfm_encoder_graph_rows must be positive")
+        self._encoder_graph_config = {
+            "enabled": extra.get("cfm_encoder_cuda_graph", False) is True,
+            "rows": [r for r in rows if not max_num_seqs or r <= int(max_num_seqs)],
+            "token_widths": [int(w) for w in extra.get("cfm_encoder_graph_token_widths") or ()],
         }
         self._ref_max_seconds = float(extra.get("ref_audio_max_seconds", _REF_MAX_SECONDS))
         if self._ref_max_seconds <= 0:
@@ -723,9 +721,7 @@ class MiniCPMO45Code2Wav(nn.Module):
     ) -> list[list[int]]:
         """A bucket's rows grouped by cache signature, for a bucket that cannot decode as one.
 
-        With ``row_offsets`` (``cfm_row_offset_merge``) the slot-pool groups
-        that differ only in their cache lengths stay one group when the
-        backend can solve them together.
+        With ``row_offsets``, slot-pool groups differing only in cache length stay one if the backend can solve it.
         """
         groups: dict[tuple[Any, ...], list[int]] = {}
         for row, state in enumerate(states):
@@ -747,6 +743,16 @@ class MiniCPMO45Code2Wav(nn.Module):
             else:
                 result.extend(parts)
         return result
+
+    def _decode_rows(
+        self, items: list[_WorkItem], states: list[BatchedToken2WavState], features: Any, *, ragged: bool
+    ) -> tuple[list[Any], list[Any]]:
+        """Decode ``items`` together: ragged when asked to, or when their token counts or last-chunk flags differ."""
+        tokens = [item.tokens for item in items]
+        last_chunks = [item.last_chunk for item in items]
+        if ragged or len({int(t.numel()) for t in tokens}) > 1 or len(set(last_chunks)) > 1:
+            return self.backend.decode_ragged_batch(tokens, features, states, last_chunks=last_chunks)
+        return self.backend.decode_batch(torch.stack(tokens, dim=0), features, states, last_chunk=last_chunks[0])
 
     @staticmethod
     def _onset_group_key(key: tuple[Any, ...], *, cross_turn: bool = False) -> tuple[Any, ...]:
@@ -1016,9 +1022,8 @@ class MiniCPMO45Code2Wav(nn.Module):
                 )
         decode_buckets: Iterable[list[_WorkItem]]
         if self._onset_merge and self.backend is not None and self.backend._whole_euler_ragged_active():
-            # Keep ordinary exact-shape buckets unchanged, but offer rows from
-            # the same prompt/epoch to the ragged Whole-Euler path when a
-            # fresh onset and a continuation are ready together.
+            # Offer a fresh onset and a continuation of one prompt/epoch, ready together, to ragged
+            # Whole-Euler; other exact-shape buckets stay as they are.
             grouped: dict[tuple[Any, ...], list[list[_WorkItem]]] = {}
             for key, bucket in buckets.items():
                 grouped.setdefault(self._onset_group_key(key, cross_turn=cross_turn), []).append(bucket)
@@ -1042,8 +1047,6 @@ class MiniCPMO45Code2Wav(nn.Module):
                 fresh = [item for item in bucket if item.previous is None]
                 setup = iter(self.backend.setup_batch(features, len(fresh)) if fresh else [])
                 states = [next(setup) if item.previous is None else item.previous.token2wav for item in bucket]
-                token_lengths = {int(item.tokens.numel()) for item in bucket}
-                last_chunk_values = {item.last_chunk for item in bucket}
                 onset_mix = (
                     self._onset_merge
                     and any(item.previous is None for item in bucket)
@@ -1055,9 +1058,7 @@ class MiniCPMO45Code2Wav(nn.Module):
                 row_groups: list[list[int]] | None = None
                 offset_mix = False
                 if onset_mix and not onset_ready:
-                    # The opt-in grouping is deliberately conservative. If
-                    # cache layouts do not satisfy ragged Whole-Euler, split
-                    # back into the historical signature buckets.
+                    # Cache layouts ragged Whole-Euler cannot take split back into signature buckets.
                     row_groups = self._signature_groups(bucket, states, row_offsets=row_offsets)
                 elif row_offsets and not onset_ready and batch_size > 1:
                     groups = self._signature_groups(bucket, states, row_offsets=True)
@@ -1066,51 +1067,16 @@ class MiniCPMO45Code2Wav(nn.Module):
                     else:
                         # One decode, ragged when it holds rows of different cache lengths.
                         offset_mix = len({state_shape_signature(state) for state in states}) > 1
-                if row_groups is not None:
-                    audios_rows: list[torch.Tensor | None] = [None] * batch_size
-                    next_states_rows: list[Any] = [None] * batch_size
-                    for rows in row_groups:
-                        row_tokens = [bucket[row].tokens for row in rows]
-                        row_states = [states[row] for row in rows]
-                        row_last = [bucket[row].last_chunk for row in rows]
-                        if (
-                            len({int(tokens.numel()) for tokens in row_tokens}) > 1
-                            or len(set(row_last)) > 1
-                            or (row_offsets and len({state_shape_signature(state) for state in row_states}) > 1)
-                        ):
-                            row_audios, row_next = self.backend.decode_ragged_batch(
-                                row_tokens,
-                                features,
-                                row_states,
-                                last_chunks=row_last,
-                            )
-                        else:
-                            row_audios, row_next = self.backend.decode_batch(
-                                torch.stack(row_tokens, dim=0),
-                                features,
-                                row_states,
-                                last_chunk=row_last[0],
-                            )
-                        for row, audio, next_state in zip(rows, row_audios, row_next, strict=True):
-                            audios_rows[row] = audio
-                            next_states_rows[row] = next_state
-                    audios = cast(list[torch.Tensor], audios_rows)
-                    next_states = next_states_rows
-                elif onset_ready or offset_mix or len(token_lengths) > 1 or len(last_chunk_values) > 1:
-                    audios, next_states = self.backend.decode_ragged_batch(
-                        [item.tokens for item in bucket],
-                        features,
-                        states,
-                        last_chunks=[item.last_chunk for item in bucket],
-                    )
+                if row_groups is None:
+                    audios, next_states = self._decode_rows(bucket, states, features, ragged=onset_ready or offset_mix)
                 else:
-                    tokens = torch.stack([item.tokens for item in bucket], dim=0)
-                    audios, next_states = self.backend.decode_batch(
-                        tokens,
-                        features,
-                        states,
-                        last_chunk=bucket[0].last_chunk,
-                    )
+                    audios, next_states = [None] * batch_size, [None] * batch_size
+                    for rows in row_groups:
+                        group_states = [states[row] for row in rows]
+                        mixed = row_offsets and len({state_shape_signature(state) for state in group_states}) > 1
+                        decoded = self._decode_rows([bucket[row] for row in rows], group_states, features, ragged=mixed)
+                        for row, audio, next_state in zip(rows, *decoded, strict=True):
+                            audios[row], next_states[row] = audio, next_state
             except Exception as exc:
                 self._trim_runtime_prompts()
                 if isinstance(exc, RuntimeError) and str(exc).startswith("MiniCPMO45Code2WavBatchError "):
@@ -1274,65 +1240,52 @@ class MiniCPMO45Code2Wav(nn.Module):
             bfloat16_attention_cache=bool(extra.get("code2wav_bfloat16_attention_cache", False)),
             setup_cache_size=self._setup_cache_size,
             cfm_tf32=tf32_mode == "flow",
+            encoder_graph_config=self._encoder_graph_config,
         )
-        # Captured by the first forward (the engine's warmup run): graphs captured
-        # while vLLM loads the weights held GiBs each, a few MiB at forward time.
+        # Captured by the first forward (the warmup run): under vLLM's weight load a graph held GiBs.
         self._precapture_pending = bool(extra.get("cfm_graph_precapture", True))
 
     def _release_precapture_cache(self) -> None:
-        """Release the allocator blocks startup left cached (``cfm_precapture_empty_cache``).
+        """Return startup's unused cached allocator blocks to the driver (``cfm_precapture_empty_cache``).
 
-        Only unused cached segments go back to the driver: live tensors, the
-        slot pool and the CUDA-graph pool's segments (held while their graphs
-        live) stay where they are, so every later solve reads the same values.
+        Live tensors, the slot pool and graph pools stay, so no later solve changes.
         """
-        if not torch.cuda.is_available() or not torch.cuda.is_initialized():
-            return
-        device = torch.device("cuda", torch.accelerator.current_device_index())
-        torch.accelerator.synchronize(device)
-        before = _memory_snapshot(device)
-        torch.accelerator.empty_cache()
-        after = _memory_snapshot(device)
-        if before is not None and after is not None:
-            logger.info(
-                "MiniCPM-o Code2Wav: released %.0f MiB of cached memory after precapture "
-                "(allocated %.0f MiB, reserved %.0f -> %.0f MiB)",
-                (before[1] - after[1]) / 2**20,
-                after[0] / 2**20,
-                before[1] / 2**20,
-                after[1] / 2**20,
-            )
+        if torch.cuda.is_available() and torch.cuda.is_initialized():
+            device = torch.device("cuda", torch.accelerator.current_device_index())
+            torch.accelerator.synchronize(device)
+            before = _memory_snapshot(device)
+            torch.accelerator.empty_cache()
+            delta = _format_memory_delta(before, _memory_snapshot(device))
+            logger.info("MiniCPM-o Code2Wav: emptied the allocator cache after precapture%s", delta)
 
     def _precapture_default_prompt(self) -> None:
-        """Capture the HiFT and default-voice Whole-Euler graphs before serving.
+        """Capture the HiFT, default-voice Whole-Euler and flow-encoder graphs before serving.
 
         Otherwise each graph is captured by the first chunk that needs it,
         stalling every stream for 1-2 s per graph.
         """
         self._precapture_pending = False
-        assert self.backend is not None
+        backend = self.backend
+        assert backend is not None
         started = time.perf_counter()
-        try:
-            hift_captured = self.backend.precapture_hift()
-        except Exception:
-            logger.warning("MiniCPM-o Code2Wav: HiFT precapture failed; graphs capture lazily", exc_info=True)
-            hift_captured = 0
-        if hift_captured:
-            logger.info(
-                "MiniCPM-o Code2Wav: precaptured %d HiFT CUDA Graph shapes in %.1f s",
-                hift_captured,
-                time.perf_counter() - started,
-            )
+
+        def precapture(name: str, capture: Callable[[], int]) -> bool:
+            try:
+                captured = capture()
+            except Exception:
+                logger.warning("MiniCPM-o Code2Wav: %s precapture failed; graphs capture lazily", name, exc_info=True)
+                return False
+            if captured:
+                elapsed = time.perf_counter() - started
+                logger.info("MiniCPM-o Code2Wav: precaptured %d %s CUDA Graphs in %.1f s", captured, name, elapsed)
+            return True
+
+        precapture("HiFT", backend.precapture_hift)
         prompt_wav, prompt_cache_id = self._normalized_default_prompt()
         try:
-            features = self.backend.prepare_prompt(prompt_cache_id, prompt_wav)
-            captured = self.backend.precapture_whole_euler(features)
+            features = backend.prepare_prompt(prompt_cache_id, prompt_wav)
         except Exception:
-            logger.warning("MiniCPM-o Code2Wav: Whole-Euler precapture failed; graphs capture lazily", exc_info=True)
+            logger.warning("MiniCPM-o Code2Wav: default prompt failed; graphs capture lazily", exc_info=True)
             return
-        if captured:
-            logger.info(
-                "MiniCPM-o Code2Wav: precaptured %d Whole-Euler graphs for the default prompt in %.1f s",
-                captured,
-                time.perf_counter() - started,
-            )
+        if precapture("Whole-Euler", partial(backend.precapture_whole_euler, features)):
+            precapture("flow encoder", partial(backend.precapture_flow_encoder, features))

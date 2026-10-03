@@ -93,13 +93,10 @@ def qkv_head_layer_norm(
     head_dim: int,
     q_norm: torch.nn.LayerNorm,
     k_norm: torch.nn.LayerNorm,
-    q_out: torch.Tensor | None = None,
     rows: torch.Tensor | None = None,
     positions: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Split packed ``qkv``, LayerNorm q/k per head, write q and interleaved ``kv``."""
-    if not isinstance(q_norm, torch.nn.LayerNorm) or not isinstance(k_norm, torch.nn.LayerNorm):
-        raise TypeError("qkv_head_layer_norm expects nn.LayerNorm q/k norms")
     batch, frames, width = (int(dim) for dim in qkv.shape)
     inner = num_heads * head_dim
     if width != 3 * inner or qkv.stride(2) != 1:
@@ -117,8 +114,7 @@ def qkv_head_layer_norm(
         raise ValueError(f"qkv_head_layer_norm: rows must be ({batch},), got {tuple(rows.shape)}")
     if positions is not None and (tuple(positions.shape) != (batch, frames) or not positions.is_contiguous()):
         raise ValueError(f"qkv_head_layer_norm: positions must be contiguous ({batch}, {frames})")
-    if q_out is None:
-        q_out = torch.empty((batch, num_heads, frames, head_dim), device=qkv.device, dtype=qkv.dtype)
+    q_out = torch.empty((batch, num_heads, frames, head_dim), device=qkv.device, dtype=qkv.dtype)
 
     if not _use_triton(qkv):
         heads = qkv.view(batch, frames, 3, num_heads, head_dim)

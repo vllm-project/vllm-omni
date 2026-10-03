@@ -173,7 +173,7 @@ def _config(minimum: int = 1, initial: int = 0, *, runtime_prompt_cache_size: in
 
 
 @pytest.mark.parametrize(
-    ("extra", "max_num_seqs", "micro"), [({}, 6, 6), ({}, 64, 16), ({"micro_batch_size": 2}, 6, 2)]
+    ("extra", "max_num_seqs", "micro"), [({}, 6, 6), ({}, 64, 64), ({"micro_batch_size": 2}, 6, 6)]
 )
 def test_whole_euler_micro_batch_defaults_to_stage_concurrency(extra, max_num_seqs, micro):
     config = _config()

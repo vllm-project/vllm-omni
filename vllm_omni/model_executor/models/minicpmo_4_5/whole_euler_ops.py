@@ -164,13 +164,10 @@ def euler_cfg_step(
 ) -> torch.Tensor:
     """``_euler_step(x, estimate, dt, r, B)`` into ``x_out`` (may be ``x``)."""
     batch, channels, frames = (int(d) for d in x.shape)
-    if tuple(estimate.shape) != (2 * batch, channels, frames) or tuple(x_out.shape) != tuple(x.shape):
-        raise ValueError("euler_cfg_step: shape mismatch")
-    if x.stride(2) != 1 or x_out.stride(2) != 1:
-        raise ValueError("euler_cfg_step: x needs contiguous frames")
-    if staged is not None and (
-        not staged.is_contiguous() or int(staged.shape[0]) != 2 * batch or int(staged.shape[1]) != frames
-    ):
+    strides = (x.stride(2), x_out.stride(2))
+    if estimate.shape != (2 * batch, channels, frames) or x_out.shape != x.shape or strides != (1, 1):
+        raise ValueError("euler_cfg_step: x/x_out (B, C, T) with contiguous frames, estimate (2B, C, T)")
+    if staged is not None and (not staged.is_contiguous() or tuple(staged.shape[:2]) != (2 * batch, frames)):
         raise ValueError("euler_cfg_step: staged must be a contiguous (2B, T, C_in) buffer")
     if not fused_euler_supported(x):
         conditional, unconditional = estimate.split(batch, dim=0)

@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import functools
+import itertools
 import time
 import weakref
 from collections import Counter
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable
 from typing import NamedTuple
 
 import numpy as np
@@ -19,7 +21,6 @@ from vllm_omni.model_executor.models.minicpmo_4_5.whole_euler_ops import (
     fused_euler_supported,
     stage_estimator_input,
 )
-from vllm_omni.platforms import current_omni_platform
 from vllm_omni.utils.device_copy import index_to_device, to_device_nonblocking
 
 logger = init_logger(__name__)
@@ -49,12 +50,9 @@ def codec_frame_range(value, *, name: str) -> range:
     """An inclusive ``[first, last]`` codec-frame range from the connector extra (empty: off)."""
     if value is None or (isinstance(value, (list, tuple)) and len(value) == 0):
         return range(0)
-    if not isinstance(value, (list, tuple)) or len(value) != 2:
-        raise ValueError(f"MiniCPM-o {name} must be [first, last] codec frames, got {value!r}")
-    first, last = (int(v) for v in value)
-    if first < 1 or last < first:
-        raise ValueError(f"MiniCPM-o {name} must satisfy 1 <= first <= last, got {value!r}")
-    return range(first, last + 1)
+    if not isinstance(value, (list, tuple)) or len(value) != 2 or not 1 <= int(value[0]) <= int(value[1]):
+        raise ValueError(f"MiniCPM-o {name} must be [first, last] codec frames with 1 <= first <= last, got {value!r}")
+    return range(int(value[0]), int(value[1]) + 1)
 
 
 def empty_hift_outputs(speech_feat: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -80,34 +78,22 @@ class HiFTGraphWrapper:
         self.flow_upsample_rate = int(getattr(token2wav.flow, "token_mel_ratio", 2))
         self.extra_codec_chunk_frames = [int(c) for c in connector_config.get("hift_graph_codec_chunk_frames") or ()]
         self.capture_bucket_size, self.capture_source_cache_len = self.derive_capture_bucket_size()
-        # The only (mel_frames, cache_source_len) shapes a graph is ever
-        # captured for. Duplex first chunks carry arbitrary mel widths that are
-        # seen once, so capturing one would stall every stream on the device
-        # for a graph that pays for itself once; they run eager (``replay``).
+        # The only (mel_frames, cache_source_len) shapes ever lazily captured: a duplex first chunk's
+        # arbitrary width is seen once, and capturing it would stall every stream for one replay.
         self._legit_shapes = set(zip(self.capture_bucket_size, self.capture_source_cache_len, strict=True))
-        # Exact-shape graphs (``hift_graph_first_chunk_frames`` /
-        # ``hift_graph_continuation_frames``, default off): the vocoder shapes
-        # outside the buckets -- a stream's short first chunk, a merged backlog
-        # continuation -- each get a graph of their own at
-        # ``hift_graph_exact_batch_sizes``, captured with the buckets and
-        # replayed without padding. The replay runs the kernels eager HiFT runs
-        # for that shape, so it changes no output; other batch sizes of these
-        # shapes still run eager (never padded, never captured lazily).
-        self.first_chunk_frames = codec_frame_range(
-            connector_config.get("hift_graph_first_chunk_frames"), name="hift_graph_first_chunk_frames"
-        )
-        self.continuation_frames = codec_frame_range(
-            connector_config.get("hift_graph_continuation_frames"), name="hift_graph_continuation_frames"
+        # Exact-shape graphs (default off): vocoder shapes outside the buckets (a short first chunk, a merged
+        # backlog continuation) captured with the buckets at ``hift_graph_exact_batch_sizes`` and replayed
+        # unpadded, so they run eager HiFT's kernels; other batch sizes of these shapes stay eager.
+        self.first_chunk_frames, self.continuation_frames = (
+            codec_frame_range(connector_config.get(name), name=name)
+            for name in ("hift_graph_first_chunk_frames", "hift_graph_continuation_frames")
         )
         self.exact_batch_sizes = sorted(
             {int(b) for b in connector_config.get("hift_graph_exact_batch_sizes") or (1,) if int(b) > 0}
         )
         self.exact_shapes = self.derive_exact_shapes()
-        self._exact_keys = frozenset(
-            (batch_size, mel_frames, cache_len)
-            for batch_size in self.exact_batch_sizes
-            for mel_frames, cache_len in self.exact_shapes
-        )
+        # Ordered (capture order) and hashable (replay lookups).
+        self._exact_keys = dict.fromkeys((b, *shape) for b in self.exact_batch_sizes for shape in self.exact_shapes)
         self.capture_batch_sizes = capture_batch_sizes
         self.graph: dict[tuple[int, int, int], torch.cuda.CUDAGraph] = {}
         self.static_speech_inputs: dict[tuple[int, int, int], torch.Tensor] = {}
@@ -129,39 +115,26 @@ class HiFTGraphWrapper:
 
     def derive_capture_bucket_size(self):
         chunk_mel_frames = self._chunk_mel_frames(self.codec_chunk_frames)
-
-        frames = [chunk_mel_frames, chunk_mel_frames + self.mel_cache_len]
-        cache_lengths = [0, self.source_cache_len]
+        shapes = [(chunk_mel_frames, 0), (chunk_mel_frames + self.mel_cache_len, self.source_cache_len)]
         if self.initial_codec_chunk_frames and self.initial_codec_chunk_frames != self.codec_chunk_frames:
             first_frames = self._chunk_mel_frames(self.initial_codec_chunk_frames)
             if first_frames <= self.mel_cache_len:
                 raise ValueError("MiniCPM-o initial codec chunk must emit audio beyond the HiFT mel cache")
-            frames.append(first_frames)
-            cache_lengths.append(0)
-        shapes = list(zip(frames, cache_lengths, strict=True))
+            shapes.append((first_frames, 0))
         for codec_frames in self.extra_codec_chunk_frames:
             mel_frames = self._chunk_mel_frames(codec_frames)
             if mel_frames <= self.mel_cache_len:
                 raise ValueError("MiniCPM-o hift_graph_codec_chunk_frames must emit audio beyond the HiFT mel cache")
-            for shape in ((mel_frames, 0), (mel_frames + self.mel_cache_len, self.source_cache_len)):
-                if shape not in shapes:
-                    shapes.append(shape)
+            shapes += [(mel_frames, 0), (mel_frames + self.mel_cache_len, self.source_cache_len)]
+        shapes = list(dict.fromkeys(shapes))
         return [shape[0] for shape in shapes], [shape[1] for shape in shapes]
 
     def derive_exact_shapes(self) -> list[tuple[int, int]]:
         """``(mel_frames, cache_source_len)`` of the exact-shape graphs, outside the buckets."""
-        buckets = set(zip(self.capture_bucket_size, self.capture_source_cache_len, strict=True))
-        shapes: list[tuple[int, int]] = []
-        candidates = [(self._chunk_mel_frames(f), 0) for f in getattr(self, "first_chunk_frames", ())]
-        candidates += [
-            (self._chunk_mel_frames(f) + self.mel_cache_len, self.source_cache_len)
-            for f in getattr(self, "continuation_frames", ())
+        shapes = [(self._chunk_mel_frames(f), 0) for f in self.first_chunk_frames] + [
+            (self._chunk_mel_frames(f) + self.mel_cache_len, self.source_cache_len) for f in self.continuation_frames
         ]
-        for mel_frames, cache_len in candidates:
-            shape = (int(mel_frames), int(cache_len))
-            if shape[0] > 0 and shape not in buckets and shape not in shapes:
-                shapes.append(shape)
-        return shapes
+        return list(dict.fromkeys(s for s in shapes if s[0] > 0 and s not in self._legit_shapes))
 
     def capture(self):
         for batch_size in self.capture_batch_sizes:
@@ -175,32 +148,19 @@ class HiFTGraphWrapper:
 
     def capture_exact(self) -> int:
         """Capture the exact-shape graphs (``derive_exact_shapes``); returns how many are new."""
-        shapes = getattr(self, "exact_shapes", ())
-        batch_sizes = getattr(self, "exact_batch_sizes", ())
-        if not shapes or not batch_sizes:
-            return 0
-        before = len(self.graph)
-        started = time.perf_counter()
-        memory_before = _memory_snapshot(self.device)
-        used_before = _device_used_bytes(self.device)
-        for batch_size in batch_sizes:
-            for mel_frames, source_cache_len in shapes:
-                key = (batch_size, mel_frames, source_cache_len)
-                self._capture(*key)
-                if key in self.graph:
-                    self.finalize_fn(self.static_magnitude_outputs[key][:1], self.static_phase_outputs[key][:1])
-        captured = len(self.graph) - before
-        used_after = _device_used_bytes(self.device)
-        logger.info(
-            "Captured %d exact-shape HiFT CUDA Graphs (batch sizes %s, %d shapes) in %.1f s%s, device memory %s",
-            captured,
-            list(batch_sizes),
-            len(shapes),
-            time.perf_counter() - started,
-            _format_memory_delta(memory_before, _memory_snapshot(self.device)),
-            "n/a" if used_before is None or used_after is None else f"+{(used_after - used_before) / 2**20:.1f} MiB",
-        )
-        return captured
+        before, started, memory_before = len(self.graph), time.perf_counter(), _memory_snapshot(self.device)
+        for key in self._exact_keys:
+            self._capture(*key)
+            # Builds the ISTFT window state before the first replay needs it.
+            self.finalize_fn(self.static_magnitude_outputs[key][:1], self.static_phase_outputs[key][:1])
+        if self._exact_keys:
+            logger.info(
+                "Captured %d exact-shape HiFT CUDA Graphs in %.1f s%s",
+                len(self.graph) - before,
+                time.perf_counter() - started,
+                _format_memory_delta(memory_before, _memory_snapshot(self.device)),
+            )
+        return len(self.graph) - before
 
     def _capture(
         self,
@@ -260,14 +220,8 @@ class HiFTGraphWrapper:
             return self._replay_key(exact_key, speech_feat, cache_source)
 
         if (num_frames, cache_source_len) not in self._legit_shapes:
-            # Never lazily captured (see ``_legit_shapes``); one eager call over
-            # the whole batch, since none of its rows can graph anyway.
-            logger.info(
-                "Falling back to eager HiFT inference for shape (%d, %d, %d) outside the capture buckets",
-                batch_size,
-                num_frames,
-                cache_source_len,
-            )
+            # Never lazily captured (see ``_legit_shapes``): one eager call over the whole batch.
+            logger.info("Eager HiFT for shape %s outside the capture buckets", exact_key)
             return self.decode_fn(speech_feat, cache_source)
 
         target_b = next((b for b in sorted(self.capture_batch_sizes) if b >= batch_size), None)
@@ -323,24 +277,19 @@ _DTYPE_MAP = {str(dtype): dtype for dtype in (torch.float32, torch.float16, torc
 
 
 def _memory_snapshot(device: torch.device) -> tuple[int, int] | None:
-    """(allocated, reserved) bytes, or None when the device cannot report them."""
+    """(allocated, reserved) bytes, or None when the device cannot report them.
+
+    Capture draws on the caching allocator, so these are the numbers that say
+    what a capture cost. Free device memory is not: the allocator serves a
+    capture out of memory it has already reserved, which is most of the device
+    on a normally configured worker.
+    """
     if device.type != "cuda":
         return None
     try:
         return int(torch.accelerator.memory_allocated(device)), int(torch.accelerator.memory_reserved(device))
     except Exception:
         return None
-
-
-def _device_used_bytes(device: torch.device) -> int | None:
-    """Device memory in use (``cudaMemGetInfo``), including graph driver allocations."""
-    if device.type != "cuda":
-        return None
-    try:
-        free, total = current_omni_platform.get_device_memory(device)
-    except Exception:
-        return None
-    return int(total - free)
 
 
 def _format_memory_delta(before: tuple[int, int] | None, after: tuple[int, int] | None) -> str:
@@ -355,10 +304,7 @@ def _format_memory_delta(before: tuple[int, int] | None, after: tuple[int, int] 
 
 # Frame granularity of the shared attention cache storage.
 _ATT_FRAME_ALIGN = 16
-
-
-def _minus_ones(shape, *, device, dtype) -> torch.Tensor:
-    return torch.full(shape, -1, device=device, dtype=dtype)
+_minus_ones = functools.partial(torch.full, fill_value=-1)
 
 
 def _align_up(n: int, bucket: int) -> int:
@@ -378,9 +324,8 @@ def _capture_query_width(mel_width: int, bucket: int | tuple[int, ...]) -> int:
     bucket (e.g. 304) align up separately so streaming replay stays on the
     small decode graph.
 
-    A tuple of widths snaps to the narrowest one that holds the chunk (a
-    25-token duplex unit and a 75-token turn chunk each keep their own width);
-    past the widest, the chunk aligns up on it.
+    A tuple of widths snaps to the narrowest one holding the chunk (a duplex
+    unit and a turn chunk keep their own width), past the widest aligns up on it.
     """
     widths = sorted(int(w) for w in (bucket if isinstance(bucket, tuple) else (bucket,)) if int(w) > 1)
     if not widths:
@@ -392,14 +337,11 @@ def _capture_query_width(mel_width: int, bucket: int | tuple[int, ...]) -> int:
 
 
 def _capture_offset(offset: int, bucket: int, steady: int) -> int:
-    """Snap an estimator-cache length onto the Whole-Euler offset grid.
+    """Snap an estimator-cache length onto the Whole-Euler offset grid (one graph per first-chunk size otherwise).
 
-    Exact lengths made one graph per first-chunk size: under full duplex a
-    capture (1-2 s, stalling every stream) on almost every response. The grid
-    is anchored at the steady ``prompt + 100`` length so the steady solve is
-    never padded; shorter caches round up to it in ``bucket``-frame steps. The
-    padded frames are masked out of attention (``_build_capture_mask``), the
-    only place the DiT reads its cache, so no row's result changes.
+    Anchored at the steady ``prompt + 100`` length so the steady solve is never
+    padded; shorter caches round up in ``bucket``-frame steps, the padded frames
+    masked out of attention (``_build_capture_mask``), so no row's result changes.
     """
     offset = int(offset)
     if bucket <= 1 or offset <= 0:
@@ -483,11 +425,7 @@ def _build_capture_mask(
 
 
 def _pad_invalid_queries(mask: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
-    """``mask`` with the queries past each CFG row's ``lengths`` taking that row's first query's keys.
-
-    Their output is dropped, but no attention row may be empty (see
-    ``_build_capture_mask``).
-    """
+    """Queries past each CFG row's ``lengths`` take its first query's keys: dropped, but never empty."""
     invalid = torch.arange(int(mask.shape[1]), device=mask.device).unsqueeze(0) >= lengths.unsqueeze(1)
     return torch.where(invalid.unsqueeze(2), mask[:, :1], mask)
 
@@ -568,67 +506,6 @@ def _copy_frame_segments(dst: torch.Tensor, src: torch.Tensor, segments: list[tu
     for start, length in segments:
         dst[..., position : position + length, :].copy_(src[..., start : start + length, :])
         position += length
-
-
-class SharedPromptAttCache:
-    """A request-owned cache prefix plus a read-only prompt suffix."""
-
-    __slots__ = ("prefix", "prompt")
-
-    def __init__(self, prefix: torch.Tensor, prompt: torch.Tensor) -> None:
-        if prefix.ndim != 6 or prompt.ndim != 6 or tuple(prefix.shape[:4]) != tuple(prompt.shape[:4]):
-            raise ValueError("shared prompt attention cache tensors have incompatible shapes")
-        if prefix.shape[5] != prompt.shape[5] or prefix.device != prompt.device or prefix.dtype != prompt.dtype:
-            raise ValueError("shared prompt attention cache tensors must have the same device, dtype and width")
-        self.prefix = prefix
-        self.prompt = prompt
-
-    @property
-    def shape(self) -> torch.Size:
-        return torch.Size((*self.prefix.shape[:4], self.prefix.shape[4] + self.prompt.shape[4], self.prefix.shape[5]))
-
-    @property
-    def dtype(self) -> torch.dtype:
-        return self.prefix.dtype
-
-    @property
-    def device(self) -> torch.device:
-        return self.prefix.device
-
-    def data_ptr(self) -> int:
-        """Expose a stable pointer for cache-owner accounting without a full materialization."""
-        return self.prefix.data_ptr()
-
-    def copy_range_to(self, dst: torch.Tensor, start: int, length: int) -> None:
-        """Copy a logical frame range into ``dst`` without joining prompt and tail."""
-        start, length = int(start), int(length)
-        if start < 0 or length < 0 or start + length > int(self.shape[4]):
-            raise ValueError(f"attention-cache range ({start}, {length}) is outside {tuple(self.shape)}")
-        prefix_len = int(self.prefix.shape[4])
-        position = 0
-        if start < prefix_len:
-            count = min(length, prefix_len - start)
-            dst[..., position : position + count, :].copy_(self.prefix[..., start : start + count, :])
-            position += count
-            start += count
-            length -= count
-        if length:
-            prompt_start = start - prefix_len
-            dst[..., position : position + length, :].copy_(self.prompt[..., prompt_start : prompt_start + length, :])
-
-    def materialize(self) -> torch.Tensor:
-        """Materialize the logical cache for eager or unsupported graph paths."""
-        return torch.cat((self.prefix, self.prompt), dim=4)
-
-
-def _copy_att_cache_range(dst: torch.Tensor, src, start: int, length: int) -> None:
-    if isinstance(src, SharedPromptAttCache):
-        src.copy_range_to(dst, start, length)
-    elif isinstance(src, ResidentAttCache):
-        materialized = src.materialize()
-        dst.copy_(materialized[..., int(start) : int(start) + int(length), :])
-    else:
-        dst.copy_(src[..., int(start) : int(start) + int(length), :])
 
 
 def _tensors_from_key(key: tuple) -> tuple[torch.Tensor, ...]:
@@ -931,19 +808,11 @@ class WholeEulerExecutionArena:
         return t_emb
 
     def get_modulation(self, modulation_fn: Callable[[torch.Tensor], torch.Tensor]) -> torch.Tensor:
-        """``modulation_fn`` of each timestep's (one-row) time embedding, stacked on dim 0.
-
-        Every row of a solve shares the timestep, so this is computed once,
-        outside any capture, and shared by every graph.
-        """
+        """``modulation_fn`` of each timestep's one-row time embedding, stacked; computed once for every graph."""
         if self._modulation is None:
-            self._modulation = torch.stack(
-                [
-                    modulation_fn(self.estimator.t_embedder(self.timeline[s].expand(1)).unsqueeze(1))
-                    for s in range(self.n_timesteps)
-                ],
-                dim=0,
-            )
+            embed = self.estimator.t_embedder
+            steps = [modulation_fn(embed(self.timeline[s].expand(1)).unsqueeze(1)) for s in range(self.n_timesteps)]
+            self._modulation = torch.stack(steps, dim=0)
         return self._modulation
 
     def _cnn_cache_shape(self, batch_size: int) -> tuple[int, ...]:
@@ -1022,25 +891,14 @@ class WholeEulerExecutionArena:
 class AttSlotPool:
     """Resident estimator attention caches, one slot per request, for Whole-Euler graphs."""
 
-    def __init__(
-        self,
-        *,
-        n_timesteps: int,
-        depth: int,
-        heads: int,
-        width: int,
-        slots: int,
-        frames: int,
-        suffix: int,
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> None:
-        self.n_timesteps, self.depth, self.heads, self.width = n_timesteps, depth, heads, width
+    def __init__(self, arena: WholeEulerExecutionArena, *, slots: int, frames: int, suffix: int) -> None:
+        """Slots shaped like ``arena``'s attention cache rows."""
+        self.n_timesteps, self.depth = arena.n_timesteps, arena.depth
+        self.heads, self.width = arena.heads, arena.att_width
         self.slots, self.frames, self.suffix = int(slots), int(frames), int(suffix)
-        self.device, self.dtype = device, dtype
-        self.storage = torch.zeros(
-            (n_timesteps, depth, self.slots, 2, heads, self.frames, width), device=device, dtype=dtype
-        )
+        self.device, self.dtype = arena.device, arena.att_cache_dtype
+        shape = (self.n_timesteps, self.depth, self.slots, 2, self.heads, self.frames, self.width)
+        self.storage = torch.zeros(shape, device=self.device, dtype=self.dtype)
         # Lowest slot first, so a lightly loaded pool keeps touching the same pages.
         self._free = list(range(self.slots - 1, -1, -1))
 
@@ -1111,7 +969,7 @@ class ResidentAttCache:
 
 
 def _materialize_att_rows(rows: list) -> list[torch.Tensor]:
-    return [row.materialize() if isinstance(row, (ResidentAttCache, SharedPromptAttCache)) else row for row in rows]
+    return [row.materialize() if isinstance(row, ResidentAttCache) else row for row in rows]
 
 
 class _WholeEulerStatics(NamedTuple):
@@ -1128,8 +986,7 @@ class _WholeEulerStatics(NamedTuple):
     lengths: torch.Tensor | None
     # (n_timesteps, ...) per-timestep modulation for a body that takes it.
     modulation: torch.Tensor | None = None
-    # Slot-pool graphs (``AttSlotPool``): each row's pool row, and the pool
-    # frame each query frame's key/value is written to (-1: not written).
+    # Slot-pool graphs: each row's pool row, and the pool frame each query writes (-1: none).
     slot_rows: torch.Tensor | None = None
     slot_positions: torch.Tensor | None = None
 
@@ -1149,10 +1006,9 @@ class WholeEulerCFMGraphWrapper:
     ten times what one step-level graph holds, so memory is the constraint:
     graphs exist for the powers of two up to ``micro_batch_size``, all of them
     share the one attention cache storage of ``WholeEulerExecutionArena``
-    (sized for ``micro_batch_size`` requests by default), and larger batches
-    run as a sequence of graph-tier replays that copy each request's cache in
-    and out of that storage directly. An opt-in grid-sized arena can use fewer
-    rows while retaining the scheduler's larger admission limit.
+    (sized for ``micro_batch_size`` requests), and larger batches run as a
+    sequence of micro-batch replays that copy each request's cache in and out
+    of that storage directly.
     """
 
     def __init__(
@@ -1172,9 +1028,7 @@ class WholeEulerCFMGraphWrapper:
         offset_bucket_frames: int = 0,
         modulation_fn: Callable[[torch.Tensor], torch.Tensor] | None = None,
         att_slots: int = 0,
-        arena_rows_from_graph_grid: bool = False,
         row_offsets: bool = False,
-        graph_grid: str | Sequence[int] | None = None,
         fused_euler_step: bool = False,
     ) -> None:
         """``ragged_body(estimator, input, t_emb, mask, cnn, att, cnn_out, att_out, lengths)``
@@ -1185,21 +1039,15 @@ class WholeEulerCFMGraphWrapper:
         query axis keep the CNN cache the unpadded solve would produce instead
         of zeroing it.
 
-        ``query_bucket_frames`` is one capture width or a tuple of them
+        ``query_bucket_frames`` is one capture width or several
         (``_capture_query_width``); ``offset_bucket_frames`` > 1 snaps cache
-        lengths onto a grid (``_capture_offset``). ``modulation_fn`` maps a
-        one-row time embedding to the per-timestep table a fused body takes as
-        ``modulation=``. ``att_slots`` > 0 keeps request caches resident in an
-        ``AttSlotPool`` (fused body only): streaming chunks then replay graphs
-        keyed by batch and width alone, with no cache copies; the arena serves
-        the prompt solve and any chunk the pool cannot hold. ``row_offsets``
-        lets such a replay take per-request caches of different lengths (a
-        stream's second chunk next to steady ones): each row attends its own
-        slot frames, so one graph solves them all.
-
-        ``fused_euler_step`` stages the estimator input once per solve and
-        runs each step's CFG combination and update as one pass that also
-        writes the next step's input (``whole_euler_ops.py``; same values).
+        lengths onto a grid (``_capture_offset``); ``modulation_fn`` gives a
+        fused body its per-timestep table. ``att_slots`` > 0 keeps request
+        caches resident in an ``AttSlotPool``: streaming chunks replay graphs
+        keyed by batch and width alone, with no cache copies, and with
+        ``row_offsets`` rows of different cache lengths share one replay.
+        ``fused_euler_step`` runs each CFG Euler update as one pass
+        (``whole_euler_ops.py``; same values).
         """
         self.estimator = estimator
         self.fused_euler_step = bool(fused_euler_step)
@@ -1211,14 +1059,13 @@ class WholeEulerCFMGraphWrapper:
         self.max_graphs = int(max_graphs)
         # Lazy captures may grow ``max_graphs`` up to 4x this (``_entry``).
         self._configured_max_graphs = int(max_graphs)
+        # The capture widths, narrowest first (``_capture_query_width``); the widest sizes the arena.
         if isinstance(query_bucket_frames, (tuple, list)):
-            widths = tuple(sorted({int(w) for w in query_bucket_frames if int(w) > 1}))
-            self.query_bucket_frames = widths[-1] if widths else 0
+            self.query_widths = tuple(sorted({int(w) for w in query_bucket_frames if int(w) > 1}))
+            self.query_bucket_frames = self.query_widths[-1] if self.query_widths else 0
         else:
-            self.query_bucket_frames = 0 if query_bucket_frames is None else int(query_bucket_frames)
-            widths = (self.query_bucket_frames,) if self.query_bucket_frames > 1 else ()
-        # The capture widths, narrowest first (``_capture_query_width``).
-        self.query_widths: tuple[int, ...] = widths
+            self.query_bucket_frames = int(query_bucket_frames or 0)
+            self.query_widths = (self.query_bucket_frames,) if self.query_bucket_frames > 1 else ()
         self.offset_bucket_frames = int(offset_bucket_frames)
         self.micro_batch_size = 4 if micro_batch_size is None else int(micro_batch_size)
         # ``max_serial_batch`` only caps the default ``max_graph_batch``.
@@ -1232,9 +1079,6 @@ class WholeEulerCFMGraphWrapper:
         if pad_max_rows is None:
             pad_max_rows = self.micro_batch_size // 4
         self.pad_max_rows = max(0, int(pad_max_rows))
-        self.graph_grid = graph_grid
-        self.arena_rows_from_graph_grid = bool(arena_rows_from_graph_grid)
-        self._arena_rows = max(self._graph_batches()) if self.arena_rows_from_graph_grid else self.micro_batch_size
         # Largest steady cache length a caller announced; sizes the arena storage.
         self._att_capacity = 0
         parameter = next(estimator.parameters(), None)
@@ -1347,9 +1191,7 @@ class WholeEulerCFMGraphWrapper:
             )
             if statics.lengths is not None:
                 assert self.ragged_body is not None
-                kwargs = {}
-                if statics.modulation is not None:
-                    kwargs["modulation"] = statics.modulation[step]
+                kwargs = {} if statics.modulation is None else {"modulation": statics.modulation[step]}
                 if slotted:
                     kwargs["slots"] = (statics.slot_rows, statics.slot_positions)
                 estimate = self.ragged_body(self.estimator, *args, statics.lengths, **kwargs)
@@ -1372,24 +1214,13 @@ class WholeEulerCFMGraphWrapper:
         return cur_x
 
     def _graph_batches(self) -> list[int]:
-        """Native graph batch sizes: the powers of two below ``micro_batch_size``, and it.
-
-        ``graph_grid`` pins them instead; sizes above ``micro_batch_size`` are dropped.
-        """
-        micro = self.micro_batch_size
-        raw = getattr(self, "graph_grid", None)
-        if raw:
-            if isinstance(raw, str):
-                sizes = sorted({int(x) for x in raw.split(",") if x.strip()})
-            else:
-                sizes = sorted({int(x) for x in raw if int(x) > 0})
-            return [b for b in sizes if 0 < b <= micro] or [micro]
+        """Native graph batch sizes: the powers of two below ``micro_batch_size``, and it."""
         sizes = []
         size = 1
-        while size < micro:
+        while size < self.micro_batch_size:
             sizes.append(size)
             size *= 2
-        sizes.append(micro)
+        sizes.append(self.micro_batch_size)
         return sizes
 
     def _plan_groups(self, batch_size: int) -> list[tuple[int, int]]:
@@ -1482,8 +1313,8 @@ class WholeEulerCFMGraphWrapper:
             assert att_cache is not None
             static_att_rows[:, :, :, :rows].copy_(att_cache.unflatten(2, (2, batch_size))[:, :, :, start:stop])
         else:
-            for row in range(rows):
-                _copy_att_cache_range(static_att_rows[:, :, :, row], att_rows[start + row], 0, offset)
+            for row, source in enumerate(_materialize_att_rows(att_rows[start:stop])):
+                static_att_rows[:, :, :, row].copy_(source[..., :offset, :])
 
     def _group_fills(self, groups: list[tuple[int, int]], after=None, **inputs) -> list[Callable]:
         """Per replay group, a ``fill(statics)`` that copies the group's requests in, then runs ``after``."""
@@ -1546,7 +1377,7 @@ class WholeEulerCFMGraphWrapper:
         # adding its width on top of the steady offset would hold ~300 frames
         # per row that nothing uses.
         capacity = max(offset + query_cap, max(offset, self._att_capacity) + 2 * self.query_bucket_frames)
-        rows = self._arena_rows
+        rows = self.micro_batch_size
         if self.att_slots:
             # Streaming chunks run from the slot pool; the arena only holds
             # what reaches it (the prompt solve), not a steady batch.
@@ -1650,9 +1481,8 @@ class WholeEulerCFMGraphWrapper:
             self._stats["hits"] += 1
             return entry
         if len(self._cache) >= self.max_graphs:
-            # Serving lazily captures keys precapture cannot enumerate (the
-            # prompt solve). A flush would retire every graph and the arena,
-            # so grow the budget instead, up to 4x the configured one.
+            # Serving lazily captures keys precapture cannot enumerate (the prompt solve): grow the
+            # budget, up to 4x, instead of a flush that would retire every graph and the arena.
             if len(self._cache) < 4 * self._configured_max_graphs:
                 self.max_graphs = len(self._cache) + 1
                 logger.warning(
@@ -1699,11 +1529,7 @@ class WholeEulerCFMGraphWrapper:
         return None
 
     def _ensure_slot_pool(self, keep: tuple[int, int]) -> AttSlotPool | None:
-        """The slot pool for streaming trim ``keep = (prefix, suffix)``, created on first use.
-
-        A slot holds a steady cache (``prefix + suffix`` frames) plus the
-        widest capture width, the largest chunk a steady cache takes.
-        """
+        """The slot pool for streaming trim ``keep``: a steady cache plus the widest chunk per slot."""
         if not self.att_slots or not self.enabled:
             return None
         prefix, suffix = int(keep[0]), int(keep[1])
@@ -1711,30 +1537,16 @@ class WholeEulerCFMGraphWrapper:
         if pool is None:
             if prefix < 0 or suffix <= 0 or self.query_bucket_frames <= 1:
                 return None
-            arena = self.arena
             frames = _align_up(prefix + suffix + self.query_bucket_frames, _ATT_FRAME_ALIGN)
             try:
-                pool = AttSlotPool(
-                    n_timesteps=self.n_timesteps,
-                    depth=arena.depth,
-                    heads=arena.heads,
-                    width=arena.att_width,
-                    slots=self.att_slots,
-                    frames=frames,
-                    suffix=suffix,
-                    device=self.device,
-                    dtype=self.att_cache_dtype,
-                )
+                pool = AttSlotPool(self.arena, slots=self.att_slots, frames=frames, suffix=suffix)
             except torch.OutOfMemoryError:
-                logger.warning(
-                    "Whole-Euler slot pool (%d slots x %d frames) does not fit; using the arena", self.att_slots, frames
-                )
+                logger.warning("Whole-Euler slot pool (%d x %d frames) does not fit", self.att_slots, frames)
                 self.att_slots = 0
                 return None
             self.slot_pool = pool
-            logger.info(
-                "Whole-Euler slot pool: %d slots x %d frames (%.2f GiB)", pool.slots, pool.frames, pool.bytes() / 2**30
-            )
+            gib = pool.bytes() / 2**30
+            logger.info("Whole-Euler slot pool: %d x %d frames, %.2f GiB", pool.slots, pool.frames, gib)
         return pool if pool.suffix == suffix else None
 
     def _slot_entry(self, *, graph_batch: int, query_cap: int, channels: int, spk_dim: int, fill) -> tuple | None:
@@ -1802,12 +1614,9 @@ class WholeEulerCFMGraphWrapper:
         """``replay`` on resident caches (``AttSlotPool``); ``None`` leaves the batch to the arena.
 
         Each row's new frames take free frames of its slot, its logical
-        ``[current | cache]`` mask is scattered onto the slot's frames, the
-        graph writes the new keys/values there and attends in place, and the
-        streaming trim drops frames from the row's layout afterwards. Rows may
-        hold caches of different lengths (``row_offsets``): the mask's cache
-        columns then span the longest one, and a shorter row's extra columns
-        map past its slot and are dropped.
+        ``[current | cache]`` mask is scattered onto the slot, the graph writes
+        and attends in place, and the trim drops frames from the row's layout.
+        With ``row_offsets`` the cache columns span the longest row's cache.
         """
         pool = self._ensure_slot_pool(att_keep)
         if pool is None:
@@ -1934,17 +1743,10 @@ class WholeEulerCFMGraphWrapper:
     def _precapture_slots(self, *, channels: int, spk_dim: int) -> int:
         """Capture every slot-pool graph (batch grid x capture widths); the cache offset is not a key."""
         before = self._stats["captures"]
-        for graph_batch in sorted(self._graph_batches(), reverse=True):
-            for query_cap in self.query_widths:
-                entry = self._slot_entry(
-                    graph_batch=graph_batch,
-                    query_cap=query_cap,
-                    channels=channels,
-                    spk_dim=spk_dim,
-                    fill=self._precapture_fill,
-                )
-                if entry is None:
-                    return self._stats["captures"] - before
+        shape = {"channels": channels, "spk_dim": spk_dim, "fill": self._precapture_fill}
+        for graph_batch, query_cap in itertools.product(sorted(self._graph_batches(), reverse=True), self.query_widths):
+            if self._slot_entry(graph_batch=graph_batch, query_cap=query_cap, **shape) is None:
+                break
         return self._stats["captures"] - before
 
     @staticmethod
@@ -1977,15 +1779,10 @@ class WholeEulerCFMGraphWrapper:
         keys = [(b, w, o) for b in sorted(self._graph_batches(), reverse=True) for w in widths for o in grid]
         room = self.max_graphs - len(self._cache)
         if len(keys) > room:
-            # Grow the budget rather than truncate the sweep (max_graph_bytes
-            # still bounds it), with a slot per width for the offset-0 prompt
+            # Grow the budget rather than truncate the sweep, plus a graph per width for the offset-0 prompt
             # solve the sweep cannot cover, so its lazy capture flushes nothing.
             self.max_graphs = len(self._cache) + len(keys) + len(widths)
-            logger.warning(
-                "Whole-Euler precapture needs %d graphs; raising max_graphs to %d",
-                len(keys),
-                self.max_graphs,
-            )
+            logger.warning("Whole-Euler precapture needs %d graphs; max_graphs is now %d", len(keys), self.max_graphs)
         x = torch.empty((1, int(channels), 1), device=self.device, dtype=self.dtype)
         before = self._stats["captures"]
         for graph_batch, query_cap, offset in keys:
@@ -2005,14 +1802,11 @@ class WholeEulerCFMGraphWrapper:
                 # What the graph itself holds, apart from the shared arena.
                 held = memory_after[1] - memory_before[1] - (self.arena.att_bytes() - arena_before)
                 if held > max_graph_bytes:
-                    # A capture failure disables every graph (see _capture),
-                    # so stop well before one could run the device dry.
+                    # A capture failure disables every graph (see _capture): stop before one runs the device dry.
                     logger.warning(
-                        "Whole-Euler precapture stopped at %s: the graph reserved %.2f GiB (limit %.2f GiB); "
-                        "the remaining graphs capture on first use",
+                        "Whole-Euler precapture stopped at %s: one graph reserved %.2f GiB; the rest capture lazily",
                         (graph_batch, query_cap, offset),
                         held / 2**30,
-                        max_graph_bytes / 2**30,
                     )
                     break
         return self._stats["captures"] - before
