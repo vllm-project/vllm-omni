@@ -324,16 +324,16 @@ def _capture_query_width(mel_width: int, bucket: int | tuple[int, ...]) -> int:
     bucket (e.g. 304) align up separately so streaming replay stays on the
     small decode graph.
 
-    A tuple of widths snaps to the narrowest one holding the chunk (a duplex
+    Ascending widths (``query_widths``) snap to the narrowest one holding the chunk (a duplex
     unit and a turn chunk keep their own width), past the widest aligns up on it.
     """
-    widths = sorted(int(w) for w in (bucket if isinstance(bucket, tuple) else (bucket,)) if int(w) > 1)
-    if not widths:
+    if isinstance(bucket, tuple):
+        bucket = next((width for width in bucket if mel_width <= width), bucket[-1]) if bucket else 0
+    if bucket <= 1:
         return int(mel_width)
-    for width in widths:
-        if mel_width <= width:
-            return width
-    return _align_up(int(mel_width), widths[-1])
+    if mel_width <= bucket:
+        return int(bucket)
+    return _align_up(int(mel_width), int(bucket))
 
 
 def _capture_offset(offset: int, bucket: int, steady: int) -> int:
@@ -716,22 +716,36 @@ def _zero_padded_cnn_cache(
     can come from it are cleared; the valid part of the window is kept.
     ``cnn_cache`` is indexed by block on its first axis.
     """
-    blocks = estimator.blocks
+    blocks = getattr(estimator, "blocks", None)
     if pad_frames > 0 and blocks and len(blocks) == cnn_cache.shape[0]:
         width = int(cnn_cache.shape[-1])
-        if width > 0 and all(int(block.conv.block[1].causal_padding[0]) == width for block in blocks):
+        if width > 0 and all(
+            hasattr(block, "conv")
+            and hasattr(block.conv, "block")
+            and len(block.conv.block) > 1
+            and hasattr(block.conv.block[1], "causal_padding")
+            and int(block.conv.block[1].causal_padding[0]) == width
+            for block in blocks
+        ):
             # _estimator_buffers packs equal-width blocks into one tensor.
             # Clear their shared tail with one write instead of one per block.
             cnn_cache[..., max(0, width - pad_frames) :] = 0.0
             return
 
-    for index, block in enumerate(blocks):
-        width = int(block.conv.block[1].causal_padding[0])
-        if width <= 0:
-            continue
-        zero_from = max(0, width - pad_frames)
-        if zero_from < width:
-            cnn_cache[index][..., zero_from:] = 0.0
+    if blocks is not None:
+        for index, block in enumerate(blocks):
+            if index >= len(cnn_cache):
+                break
+            conv = getattr(block, "conv", None)
+            conv_block = getattr(conv, "block", None) if conv is not None else None
+            if conv_block is None or len(conv_block) <= 1 or not hasattr(conv_block[1], "causal_padding"):
+                continue
+            width = int(conv_block[1].causal_padding[0])
+            if width <= 0:
+                continue
+            zero_from = max(0, width - pad_frames)
+            if zero_from < width:
+                cnn_cache[index][..., zero_from:] = 0.0
 
 
 class WholeEulerExecutionArena:
@@ -761,14 +775,14 @@ class WholeEulerExecutionArena:
         device: torch.device,
         dtype: torch.dtype,
         att_cache_dtype: torch.dtype = torch.float32,
-        timeline: torch.Tensor,
+        time_steps: list[torch.Tensor] | None = None,
     ) -> None:
         self.estimator = estimator
         self.n_timesteps = int(n_timesteps)
         self.device = device
         self.dtype = dtype
         self.att_cache_dtype = att_cache_dtype
-        self.timeline = timeline
+        self.time_steps = list(time_steps) if time_steps is not None else []
 
         blocks = estimator.blocks
         self.depth = len(blocks)
@@ -799,7 +813,7 @@ class WholeEulerExecutionArena:
         if t_emb is None:
             t_emb = torch.stack(
                 [
-                    self.estimator.t_embedder(self.timeline[s].expand(2 * batch_size)).unsqueeze(1)
+                    self.estimator.t_embedder(self.time_steps[s].expand(2 * batch_size)).unsqueeze(1)
                     for s in range(self.n_timesteps)
                 ],
                 dim=0,
@@ -811,7 +825,7 @@ class WholeEulerExecutionArena:
         """``modulation_fn`` of each timestep's one-row time embedding, stacked; computed once for every graph."""
         if self._modulation is None:
             embed = self.estimator.t_embedder
-            steps = [modulation_fn(embed(self.timeline[s].expand(1)).unsqueeze(1)) for s in range(self.n_timesteps)]
+            steps = [modulation_fn(embed(self.time_steps[s].expand(1)).unsqueeze(1)) for s in range(self.n_timesteps)]
             self._modulation = torch.stack(steps, dim=0)
         return self._modulation
 
@@ -931,10 +945,8 @@ class AttSlotPool:
 class ResidentAttCache:
     """A request's estimator attention cache resident in an ``AttSlotPool`` slot.
 
-    Stands in for the logical ``(n_t, depth, 2, heads, L, width)`` tensor.
-    The slot returns to the pool when the handle is collected; work queued
-    on it before then runs first, since all
-    of it is on one stream.
+    Stands in for the logical ``(n_t, depth, 2, heads, L, width)`` tensor. The slot returns
+    to the pool when the handle is collected; work queued on it before then runs first (one stream).
     """
 
     __slots__ = ("pool", "slot", "layout", "__weakref__")
@@ -1102,13 +1114,14 @@ class WholeEulerCFMGraphWrapper:
         }
 
         self.timeline, self.dt_steps = _euler_timeline(self.n_timesteps, self.device, self.dtype)
+        self.time_steps = [self.timeline[i] for i in range(self.n_timesteps)]
         arena_args = {
             "estimator": self.estimator,
             "n_timesteps": self.n_timesteps,
             "device": self.device,
             "dtype": self.dtype,
             "att_cache_dtype": self.att_cache_dtype,
-            "timeline": self.timeline,
+            "time_steps": self.time_steps,
         }
         self.arena = WholeEulerExecutionArena(**arena_args)
         # Resident request caches (``AttSlotPool``), sized once the prompt
@@ -1582,14 +1595,8 @@ class WholeEulerCFMGraphWrapper:
             logger.warning("Failed to allocate static buffers for Whole-Euler graph key: %s", key, exc_info=True)
             self._unsupported.add(key)
             return None
-        entry = self._record(
-            key,
-            statics,
-            out_cnn_cache,
-            pool.rows(),
-            graph_batch=graph_batch,
-            where=f"slot pool {pool.slots} x {pool.frames} frames",
-        )
+        where = f"slot pool {pool.slots} x {pool.frames} frames"
+        entry = self._record(key, statics, out_cnn_cache, pool.rows(), graph_batch=graph_batch, where=where)
         if entry is not None:
             self._slot_graphs[key] = entry
         return entry
@@ -1784,17 +1791,11 @@ class WholeEulerCFMGraphWrapper:
             self.max_graphs = len(self._cache) + len(keys) + len(widths)
             logger.warning("Whole-Euler precapture needs %d graphs; max_graphs is now %d", len(keys), self.max_graphs)
         x = torch.empty((1, int(channels), 1), device=self.device, dtype=self.dtype)
+        entry_fn = functools.partial(self._entry, x=x, spk_dim=int(spk_dim), fill=self._precapture_fill)
         before = self._stats["captures"]
         for graph_batch, query_cap, offset in keys:
             memory_before, arena_before = _memory_snapshot(self.device), self.arena.att_bytes()
-            entry = self._entry(
-                graph_batch=graph_batch,
-                query_cap=query_cap,
-                offset=offset,
-                x=x,
-                spk_dim=int(spk_dim),
-                fill=self._precapture_fill,
-            )
+            entry = entry_fn(graph_batch=graph_batch, query_cap=query_cap, offset=offset)
             if entry is None:
                 break
             memory_after = _memory_snapshot(self.device)
@@ -1933,7 +1934,11 @@ class WholeEulerCFMGraphWrapper:
 
         arena = self.arena
         chunk_mel = x.new_empty((batch_size, int(x.shape[1]), mel_frames))
-        out_cnn = torch.empty(arena._cnn_cache_shape(batch_size), device=x.device, dtype=self.dtype)
+        out_cnn = torch.empty(
+            (self.n_timesteps, arena.depth, 2 * batch_size, arena.cnn_channels, arena.cnn_width),
+            device=x.device,
+            dtype=self.dtype,
+        )
         out_cnn_rows = out_cnn.unflatten(2, (2, batch_size))
         out_att: torch.Tensor | None = None
         out_att_rows = None
@@ -2009,11 +2014,7 @@ class WholeEulerCFMGraphWrapper:
                     # The row's old cache was copied into the arena by ``fill``.
                     old = att_rows[start + row] if att_rows is not None else None
                     request = None
-                    if (
-                        isinstance(old, torch.Tensor)
-                        and old.dtype == self.att_cache_dtype
-                        and owners[old.data_ptr()] == 1
-                    ):
+                    if old is not None and old.dtype == self.att_cache_dtype and owners[old.data_ptr()] == 1:
                         request = _resized_frame_view(old, shape[4])
                     if request is None:
                         # Room for the steady length, so the cache grows into it in place.

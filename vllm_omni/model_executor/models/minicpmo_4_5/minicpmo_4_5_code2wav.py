@@ -1030,9 +1030,7 @@ class MiniCPMO45Code2Wav(nn.Module):
             merged: list[list[_WorkItem]] = []
             for entries in grouped.values():
                 combined = [item for bucket in entries for item in bucket]
-                mixed = any(item.previous is None for item in combined) and any(
-                    item.previous is not None for item in combined
-                )
+                mixed = len({item.previous is None for item in combined}) > 1
                 merged.extend([combined] if mixed else entries)
             decode_buckets = merged
         else:
@@ -1047,11 +1045,7 @@ class MiniCPMO45Code2Wav(nn.Module):
                 fresh = [item for item in bucket if item.previous is None]
                 setup = iter(self.backend.setup_batch(features, len(fresh)) if fresh else [])
                 states = [next(setup) if item.previous is None else item.previous.token2wav for item in bucket]
-                onset_mix = (
-                    self._onset_merge
-                    and any(item.previous is None for item in bucket)
-                    and any(item.previous is not None for item in bucket)
-                )
+                onset_mix = self._onset_merge and 0 < len(fresh) < batch_size
                 onset_ready = onset_mix and self.backend.can_merge_state_shapes(
                     states, [int(item.tokens.numel()) for item in bucket]
                 )

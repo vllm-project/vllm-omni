@@ -97,22 +97,7 @@ def _check_rows(name: str, tensor: torch.Tensor, rows: int, frames: int, width: 
         raise ValueError(f"residual_layer_norm: {name} needs {width} contiguous channels, got {tuple(tensor.shape)}")
 
 
-def _native(
-    *,
-    residual,
-    y,
-    gate,
-    weight,
-    bias,
-    eps,
-    taps,
-    y_bias,
-    activation,
-    residual_out,
-    out,
-    frames,
-    channels,
-):
+def _native(residual, y, gate, weight, bias, eps, taps, y_bias, activation, residual_out, out, frames, channels):
     value = None
     if y is not None:
         value = sum(y[:, k : k + frames, k * channels : (k + 1) * channels] for k in range(taps))
@@ -172,42 +157,23 @@ def residual_layer_norm(
 
     if not _use_triton(reference):
         return _native(
-            residual=residual,
-            y=y,
-            gate=gate,
-            weight=weight,
-            bias=bias,
-            eps=eps,
-            taps=taps,
-            y_bias=y_bias,
-            activation=activation,
-            residual_out=residual_out,
-            out=out,
-            frames=frames,
-            channels=channels,
+            residual, y, gate, weight, bias, eps, taps, y_bias, activation, residual_out, out, frames, channels
         )
     if rows * frames == 0:
         return out
-    dummy = reference
+
+    def strides(tensor: torch.Tensor | None) -> tuple[int, int]:
+        return (tensor.stride(0), tensor.stride(1)) if tensor is not None else (0, 0)
+
     _residual_layer_norm_kernel[(rows * frames,)](
         out,
-        residual_out if residual_out is not None else dummy,
-        residual if residual is not None else dummy,
-        y if y is not None else dummy,
-        gate if gate is not None else dummy,
-        y_bias if y_bias is not None else dummy,
-        weight if weight is not None else dummy,
-        bias if bias is not None else dummy,
+        *(t if t is not None else reference for t in (residual_out, residual, y, gate, y_bias, weight, bias)),
         frames,
         channels,
-        out.stride(0),
-        out.stride(1),
-        residual_out.stride(0) if residual_out is not None else 0,
-        residual_out.stride(1) if residual_out is not None else 0,
-        residual.stride(0) if residual is not None else 0,
-        residual.stride(1) if residual is not None else 0,
-        y.stride(0) if y is not None else 0,
-        y.stride(1) if y is not None else 0,
+        *strides(out),
+        *strides(residual_out),
+        *strides(residual),
+        *strides(y),
         float(eps),
         HAS_X=residual is not None,
         HAS_Y=y is not None,

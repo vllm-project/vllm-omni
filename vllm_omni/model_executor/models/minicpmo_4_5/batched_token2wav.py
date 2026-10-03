@@ -709,15 +709,16 @@ class BatchedToken2Wav(nn.Module):
         return graphs
 
     def _graph_encode(
-        self, tokens: torch.Tensor, states: list[BatchedToken2WavState]
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
-        """A continuation chunk's encoder outputs from its graph (shared views, rewritten by the next replay)."""
+        self, tokens: torch.Tensor, states: list[BatchedToken2WavState], copy: bool = False
+    ) -> tuple[torch.Tensor, ...] | None:
+        """A continuation chunk's encoder outputs from its graph: views rewritten by the next replay, or copies."""
         if self._encoder_graphs is None:
             return None
         flows = [state.flow_cache for state in states]
-        return self._encoder_graphs.run(
+        outputs = self._encoder_graphs.run(
             tokens, [flow["conformer_cnn_cache"] for flow in flows], [flow["conformer_att_cache"] for flow in flows]
         )
+        return tuple(value.clone() for value in outputs) if outputs and copy else outputs
 
     @torch.inference_mode()
     def precapture_flow_encoder(self, features: PromptFeatures) -> int:
@@ -1692,15 +1693,11 @@ class BatchedToken2Wav(nn.Module):
         speakers = features.speaker_embedding.expand(batch_size, -1)
         with self._autocast(tokens.device):
             # A graph's shared results are read below and copied per row by _split_flow_cache.
-            hidden, conformer_cnn, conformer_att = (
-                graphed
-                if graphed is not None
-                else self._encode_chunk(
-                    tokens,
-                    last_chunk=last_chunk or flush_encoder,
-                    cnn_cache=flow_cache["conformer_cnn_cache"],
-                    att_cache=flow_cache["conformer_att_cache"],
-                )
+            hidden, conformer_cnn, conformer_att = graphed or self._encode_chunk(
+                tokens,
+                last_chunk=last_chunk or flush_encoder,
+                cnn_cache=flow_cache["conformer_cnn_cache"],
+                att_cache=flow_cache["conformer_att_cache"],
             )
             projected_speakers = self._project_speakers(speakers)
             cond = torch.zeros_like(hidden).transpose(1, 2).contiguous()
@@ -1840,21 +1837,17 @@ class BatchedToken2Wav(nn.Module):
         for (*_, last_chunk), rows in encoder_groups.items():
             group_states = [states[row] for row in rows]
             group_tokens = torch.stack([tokens[row] for row in rows], dim=0)
-            graphed = None if last_chunk else self._graph_encode(group_tokens, group_states)
-            if graphed is not None and len(encoder_groups) > 1:
-                # The next group's replay rewrites the shared graph results.
-                graphed = tuple(value.clone() for value in graphed)
-            if graphed is None:
-                # The encoder reads only the conformer caches.
-                group_cache = self._stack_flow_cache(group_states, include_estimator_att=False)
-                with self._autocast(group_tokens.device):
-                    graphed = self._encode_chunk(
-                        group_tokens,
-                        last_chunk=last_chunk,
-                        cnn_cache=group_cache["conformer_cnn_cache"],
-                        att_cache=group_cache["conformer_att_cache"],
-                    )
-            hidden, conformer_cnn, conformer_att = graphed
+            # With several groups the next replay rewrites the shared graph results, so they are copied.
+            graphed = None if last_chunk else self._graph_encode(group_tokens, group_states, len(encoder_groups) > 1)
+            # The encoder reads only the conformer caches.
+            group_cache = {} if graphed else self._stack_flow_cache(group_states, include_estimator_att=False)
+            with self._autocast(group_tokens.device):
+                hidden, conformer_cnn, conformer_att = graphed or self._encode_chunk(
+                    group_tokens,
+                    last_chunk=last_chunk,
+                    cnn_cache=group_cache["conformer_cnn_cache"],
+                    att_cache=group_cache["conformer_att_cache"],
+                )
             for group_row, row in enumerate(rows):
                 hidden_rows[row] = hidden[group_row : group_row + 1]
                 conformer_cnn_rows[row] = conformer_cnn[group_row : group_row + 1]
