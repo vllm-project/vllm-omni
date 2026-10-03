@@ -13,6 +13,7 @@ from vllm import SamplingParams
 from vllm.config.compilation import CUDAGraphMode
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+from vllm.v1.worker.gpu.model_states.default import DefaultModelState
 from vllm.v1.worker.gpu.sample.sampler import Sampler
 
 from vllm_omni.config.model import OmniModelConfig
@@ -161,6 +162,28 @@ def test_init_model_state_factory_dispatches_omni_only(monkeypatch, flag, expect
     else:
         upstream.assert_called_once()
         assert state is upstream.return_value
+
+
+@pytest.mark.parametrize("omni_stage", [False, True])
+@pytest.mark.parametrize("specialized", [False, True])
+def test_auxiliary_default_state_has_omni_lifecycle_but_preserves_upstream_states(monkeypatch, omni_stage, specialized):
+    class SpecializedState(DefaultModelState):
+        pass
+
+    state_cls = SpecializedState if specialized else DefaultModelState
+    upstream_state = object.__new__(state_cls)
+    monkeypatch.setattr("vllm_omni.worker_v2.model_states._upstream_init_model_state", lambda *_args: upstream_state)
+    monkeypatch.setattr(OmniModelState, "__init__", lambda *_args: None)
+    model_config = object.__new__(OmniModelConfig) if omni_stage else SimpleNamespace()
+    state = init_omni_model_state(
+        SimpleNamespace(model_config=model_config), SimpleNamespace(), None, torch.device("cpu")
+    )
+    if omni_stage and not specialized:
+        assert isinstance(state, OmniModelState)
+        assert callable(state.run_preprocess)
+        assert callable(state.postprocess_model_output)
+    else:
+        assert state is upstream_state
 
 
 def test_finish_requests_notifies_model_and_cleans_only_known_slots(monkeypatch):
