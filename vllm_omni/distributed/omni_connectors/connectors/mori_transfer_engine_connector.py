@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """OmniConnector backed by the Mori RDMA transfer engine.
 
@@ -131,6 +131,8 @@ class MoriTransferEngineConnector(OmniConnectorBase):
         self._listener_ready = threading.Event()
         self._local_buffers: dict[str, Any] = {}
         self._local_buffers_lock = threading.Lock()
+        self._in_flight_buffers: dict[str, int] = {}
+        self._cleanup_pending: set[str] = set()
         self._req_local = threading.local()
         self._worker_local = threading.local()
         self._last_ttl_check: float = _time_mod.monotonic()
@@ -470,6 +472,11 @@ class MoriTransferEngineConnector(OmniConnectorBase):
                 return False, 0, None
 
             with self._local_buffers_lock:
+                if put_key in self._in_flight_buffers:
+                    if should_release and isinstance(holder, ManagedBuffer):
+                        holder.release()
+                    logger.warning("Cannot replace buffer during transfer: %s", put_key)
+                    return False, 0, None
                 old = self._local_buffers.pop(put_key, None)
                 if old:
                     _, _, oh, osr, _, _ = old
@@ -649,11 +656,19 @@ class MoriTransferEngineConnector(OmniConnectorBase):
         if from_stage is not None and to_stage is not None:
             request_id = self._make_key(request_id, from_stage, to_stage)
         with self._local_buffers_lock:
-            item = self._local_buffers.pop(request_id, None)
-            if item:
-                _, _, holder, sr, _, _ = item
-                if sr and isinstance(holder, ManagedBuffer):
-                    holder.release()
+            if request_id in self._in_flight_buffers:
+                self._cleanup_pending.add(request_id)
+                return
+            self._release_buffer_locked(request_id)
+
+    def _release_buffer_locked(self, request_id: str) -> None:
+        """Release sender storage while holding ``_local_buffers_lock``."""
+        self._cleanup_pending.discard(request_id)
+        item = self._local_buffers.pop(request_id, None)
+        if item:
+            _, _, holder, sr, _, _ = item
+            if sr and isinstance(holder, ManagedBuffer):
+                holder.release()
 
     # -------------------------------------------------------------- health()
     def health(self) -> dict[str, Any]:
@@ -691,6 +706,8 @@ class MoriTransferEngineConnector(OmniConnectorBase):
                 if sr and isinstance(holder, ManagedBuffer):
                     holder.release()
             self._local_buffers.clear()
+            self._in_flight_buffers.clear()
+            self._cleanup_pending.clear()
 
         cache: dict[str, zmq.Socket] | None = getattr(self._req_local, "cache", None)
         if cache:
@@ -740,24 +757,21 @@ class MoriTransferEngineConnector(OmniConnectorBase):
 
     # ============================================================== LISTENER
     def _cleanup_stale_buffers(self) -> None:
-        """Reclaim buffers older than ``_BUFFER_TTL_SECONDS``.
+        """Reclaim idle buffers older than ``_BUFFER_TTL_SECONDS``.
 
         Prevents permanent memory leaks when a receiver crashes or times out
         without ever pulling the data.
 
-        TODO(zejwang): In extreme rare case, long transfer time, there might
-        exist TTL cleanup vs in-flight RDMA transfer conflict, which will be
-        handled in a follow-up PR. Same race is acknowledged in
-        ``MooncakeTransferEngineConnector._cleanup_stale_buffers``.
         """
         now = _time_mod.monotonic()
         with self._local_buffers_lock:
-            stale = [k for k, v in self._local_buffers.items() if now - v[5] > _BUFFER_TTL_SECONDS]
+            stale = [
+                k
+                for k, v in self._local_buffers.items()
+                if k not in self._in_flight_buffers and now - v[5] > _BUFFER_TTL_SECONDS
+            ]
             for k in stale:
-                item = self._local_buffers.pop(k)
-                _, _, holder, sr, _, _ = item
-                if sr and isinstance(holder, ManagedBuffer):
-                    holder.release()
+                self._release_buffer_locked(k)
                 logger.warning(f"TTL expired ({_BUFFER_TTL_SECONDS}s): reclaimed buffer for {k}")
 
     def _zmq_listener_loop(self) -> None:
@@ -815,6 +829,7 @@ class MoriTransferEngineConnector(OmniConnectorBase):
                     if sock in events:
                         frames = sock.recv_multipart()
                         if len(frames) >= 2:
+                            assert self._sender_executor is not None
                             self._sender_executor.submit(
                                 self._handle_pull_request,
                                 response_queue,
@@ -840,6 +855,7 @@ class MoriTransferEngineConnector(OmniConnectorBase):
         identity: bytes,
         payload: bytes,
     ) -> None:
+        pinned_request_id: str | None = None
         try:
             if payload.startswith(QUERY_INFO):
                 self._handle_query_request(
@@ -853,7 +869,10 @@ class MoriTransferEngineConnector(OmniConnectorBase):
             pull = msgspec.msgpack.decode(payload, type=MoriPullRequest)
 
             with self._local_buffers_lock:
-                item = self._local_buffers.get(pull.request_id)
+                item = None if pull.request_id in self._cleanup_pending else self._local_buffers.get(pull.request_id)
+                if item:
+                    self._in_flight_buffers[pull.request_id] = self._in_flight_buffers.get(pull.request_id, 0) + 1
+                    pinned_request_id = pull.request_id
 
             if not item:
                 response_queue.put((identity, TRANS_ERROR))
@@ -914,6 +933,16 @@ class MoriTransferEngineConnector(OmniConnectorBase):
         except Exception as e:
             logger.error(f"Pull request handler error: {e}", exc_info=True)
             response_queue.put((identity, TRANS_ERROR))
+        finally:
+            if pinned_request_id is not None:
+                with self._local_buffers_lock:
+                    remaining = self._in_flight_buffers[pinned_request_id] - 1
+                    if remaining:
+                        self._in_flight_buffers[pinned_request_id] = remaining
+                    else:
+                        del self._in_flight_buffers[pinned_request_id]
+                        if pinned_request_id in self._cleanup_pending:
+                            self._release_buffer_locked(pinned_request_id)
 
         self._notify_listener(notify_addr)
 
@@ -927,7 +956,7 @@ class MoriTransferEngineConnector(OmniConnectorBase):
         try:
             q = msgspec.msgpack.decode(payload, type=QueryRequest)
             with self._local_buffers_lock:
-                item = self._local_buffers.get(q.request_id)
+                item = None if q.request_id in self._cleanup_pending else self._local_buffers.get(q.request_id)
             if not item:
                 response_queue.put((identity, INFO_NOT_FOUND))
             else:
