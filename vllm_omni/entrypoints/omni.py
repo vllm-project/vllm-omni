@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any, Literal, overload
 from tqdm.auto import tqdm
 from vllm.logger import init_logger
 from vllm.sampling_params import RequestOutputKind
+from vllm.v1.engine.exceptions import EngineDeadError
 
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
 from vllm_omni.engine.messages import OutputMessage
@@ -95,9 +96,17 @@ class Omni(OmniBase):
             if py_generator:
                 return self._run_generation_with_generator(prompts, sampling_params_list, use_tqdm)
             return list(self._run_generation(prompts, sampling_params_list, use_tqdm))
-        except Exception as e:
-            logger.exception("[Omni] Failed to run generation: %s", e)
+        except EngineDeadError as e:
+            # Fatal: a stage or the orchestrator is gone, so the engine cannot
+            # serve anything else. Release the processes now.
+            logger.exception("[Omni] Engine died during generation: %s", e)
             self.close()
+            raise
+        except Exception as e:
+            # Request-scoped failure (e.g. OmniClientError -> 4xx). The in-flight
+            # requests were already aborted inside _run_generation; keep the
+            # engine alive so later generate() calls work, like AsyncOmni.
+            logger.exception("[Omni] Failed to run generation: %s", e)
             raise
 
     def _run_generation_with_generator(
