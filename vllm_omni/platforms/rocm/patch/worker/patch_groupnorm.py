@@ -42,6 +42,13 @@ def _patched_initialize_model(od_config):
     model = _original_initialize_model(od_config)
 
     if hasattr(model, "vae"):
+        # AITER GroupNorm does not preserve the PyTorch autocast behavior required
+        # by Hunyuan Image 3.0. Keep PyTorch GroupNorm until the fix is released:
+        # https://github.com/ROCm/aiter/issues/4780
+        # https://github.com/ROCm/aiter/pull/4779
+        if od_config.model_class_name == "HunyuanImage3ForCausalMM":
+            return model
+
         try:
             from vllm._aiter_ops import is_aiter_found_and_supported
 
