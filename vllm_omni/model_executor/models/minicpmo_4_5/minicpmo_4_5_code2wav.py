@@ -54,7 +54,8 @@ def _tf32_mode(extra: Mapping[str, Any]) -> str:
     """Stage-2 TF32 scope: ``"off"`` (default), ``"flow"`` (CFM DiT only), or ``"all"``."""
     if bool(extra.get("token2wav_allow_tf32", False)):
         return "all"
-    value = extra.get("code2wav_allow_tf32", False)
+    raw = os.environ.get("MINICPMO_CODE2WAV_TF32")
+    value = raw if raw not in (None, "") else extra.get("code2wav_allow_tf32", False)
     if isinstance(value, str):
         return {"flow": "flow", "1": "all", "true": "all", "all": "all", "yes": "all"}.get(value.strip().lower(), "off")
     return "all" if value else "off"
