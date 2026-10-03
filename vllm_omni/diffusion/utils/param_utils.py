@@ -44,12 +44,13 @@ def ar_grid_max_tokens(ar_width: int, ar_height: int) -> int | None:
 
 def parse_guidance_interval(value: object) -> tuple[float, float]:
     """Parse ``[lo, hi]`` in scheduler timestep units; raises ValueError unless both are numbers with lo <= hi."""
+    message = f"Invalid guidance_interval={value!r}. Expected two numbers [lo, hi]."
     if not isinstance(value, (list, tuple)) or len(value) != 2:
-        raise ValueError(f"Invalid guidance_interval={value!r}. Expected two numbers [lo, hi].")
+        raise ValueError(message)
     try:
         lo, hi = float(value[0]), float(value[1])
     except (TypeError, ValueError) as exc:
-        raise ValueError(f"Invalid guidance_interval={value!r}. Expected two numbers [lo, hi].") from exc
+        raise ValueError(message) from exc
     if not lo <= hi:
         raise ValueError(f"Invalid guidance_interval={value!r}. Expected lo <= hi in scheduler timestep units.")
     return lo, hi
