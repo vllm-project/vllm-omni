@@ -741,9 +741,9 @@ def test_diffuse_guidance_interval_keeps_paired_cfg_when_cache_dit_active() -> N
 def _forward_with_extra_args(pipeline, extra_args):
     captured: dict[str, object] = {}
 
-    def _fake_diffuse(**kwargs):
-        captured.update(kwargs)
-        return kwargs["latents"] + 1
+    def _fake_diffuse(*, latents, **kwargs):
+        captured.update(kwargs, latents=latents)
+        return latents + 1
 
     pipeline.diffuse = _fake_diffuse  # type: ignore[method-assign]
     request = OmniDiffusionRequest(
