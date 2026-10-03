@@ -268,11 +268,21 @@ def test_stage_engine_core_client_module_reload_keeps_forward_refs_deferred():
     """Regression test for forward references in make_async_mp_client."""
     import vllm_omni.engine.stage_engine_core_client as client_mod
 
-    importlib.reload(client_mod)
+    # Snapshot the module namespace so a reload cannot strand other test
+    # modules that captured the pre-reload class objects (isinstance checks
+    # against the stale class would then fail). ``importlib.reload`` mutates
+    # the module dict in place; restoring it leaves the runtime exactly as it
+    # was before this test ran.
+    saved = dict(client_mod.__dict__)
+    try:
+        importlib.reload(client_mod)
 
-    assert client_mod.StageEngineCoreClientBase.make_async_mp_client.__annotations__["return"] == (
-        "StageEngineCoreClient | DPLBStageEngineCoreClient"
-    )
+        assert client_mod.StageEngineCoreClientBase.make_async_mp_client.__annotations__["return"] == (
+            "StageEngineCoreClient | DPLBStageEngineCoreClient"
+        )
+    finally:
+        client_mod.__dict__.clear()
+        client_mod.__dict__.update(saved)
 
 
 def test_async_omni_engine_initialize_stages_passes_log_stats_and_client_config_to_runtime(monkeypatch):
