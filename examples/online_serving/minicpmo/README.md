@@ -69,6 +69,44 @@ vllm serve openbmb/MiniCPM-o-4_5 --omni --trust-remote-code --port 8099 \
     --stage-overrides '{"0": {"gpu_memory_utilization": 0.55}}'
 ```
 
+## Offline encoder CUDA Graph (development)
+
+Encoder graphs are off by default and affect only the offline image/video
+SigLIP + resampler entry points. Audio stays eager: padding BF16 Whisper
+inputs changes encoder values and can change greedy transcript tokens,
+including when capture is restricted to the convolution front end.
+Native duplex keeps its
+stateful eager encoders; existing decoder and Code2Wav graph settings are
+unchanged. The released vLLM pin does not provide `capture_axes`, so the
+encoder protocol remains disabled there even when the flag is requested.
+
+For a compatible development vLLM build containing capture axes, the Stage0
+opt-in is:
+
+```bash
+vllm serve openbmb/MiniCPM-o-4_5 --omni --trust-remote-code \
+    --deploy-config vllm_omni/deploy/minicpmo_4_5.yaml \
+    --stage-overrides '{"0":{"compilation_config":{"cudagraph_mm_encoder":true,"encoder_cudagraph_token_budgets":[256],"encoder_cudagraph_max_vision_items_per_batch":2,"encoder_cudagraph_max_frames_per_batch":2}}}'
+```
+
+Do not change `enforce_eager` for an OFF/ON comparison. Without explicit
+budgets, the manager captures 64/128/256 output-token budgets at the default
+`query_num=64`, clipped to the scheduler/model limits. Each budget determines
+its slice capacity directly (1/2/4); the three patch tiers produce nine graphs
+in total. Capture runs largest budgets and patch tiers first.
+Actual item tokens are not inflated to fit a tier: a five-slice image has
+320 tokens and exceeds the example's 256-token budget, so it runs eager.
+Video frames reuse the image path. Larger explicit budgets are supported
+but increase persistent graph memory, competing with Talker and Code2Wav.
+
+Compare complete image/video requests with encoder graphs OFF and ON under
+the same compatible vLLM build and decoder configuration. The real-checkpoint
+parity test requires identical text and treats differences as failures.
+For repeatable greedy tokens across changing decoder batches, set
+`VLLM_BATCH_INVARIANT=1` in both comparison arms. Check actual encoder replay
+and output equality alongside throughput; component tests alone do not establish
+complete serving performance. Current hardware results are in [PR #7659](https://github.com/vllm-project/vllm-omni/pull/7659).
+
 ## Send multimodal requests
 
 ```bash
