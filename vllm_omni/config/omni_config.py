@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import copy
 from collections.abc import Mapping
-from dataclasses import InitVar, dataclass, field, fields
+from dataclasses import InitVar, asdict, dataclass, field, fields
 from functools import wraps
 from inspect import Parameter, signature
 from pathlib import Path
@@ -1604,6 +1604,8 @@ class VllmOmniOrchestratorConfig:
     """Configuration consumed by the orchestrator process only."""
 
     stage_init_timeout: int = Field(default=300, ge=1)
+    enable_tail_aware_scheduling: bool = False
+    tail_aware_scheduling_config: dict[str, Any] = field(default_factory=dict)
     init_timeout: int = Field(default=600, ge=1)
     worker_backend: str = "multi_process"
     ray_address: str | None = None
@@ -2336,9 +2338,27 @@ class VllmOmniConfig:
                     role=stage.model_stage,
                 )
 
+        from vllm_omni.scheduling.config import TailAwareSchedulingConfig
+
+        # Deployment values first; explicit CLI values take precedence.
+        scheduling_values: dict[str, Any] = {}
+        for settings, enabled in (
+            (deploy.tail_aware_scheduling_config, deploy.enable_tail_aware_scheduling),
+            (cli_overrides.get("tail_aware_scheduling_config"), cli_overrides.get("enable_tail_aware_scheduling")),
+        ):
+            if settings is not None:
+                if not isinstance(settings, Mapping):
+                    raise ValueError("tail_aware_scheduling_config must be an object")
+                scheduling_values.update(settings)
+            if enabled is not None:
+                scheduling_values["enabled"] = enabled
+        scheduling_config = asdict(TailAwareSchedulingConfig.from_dict(scheduling_values))
+        orchestrator_overrides = _orchestrator_cli_overrides(cli_overrides)
+        orchestrator_overrides["enable_tail_aware_scheduling"] = scheduling_config["enabled"]
+        orchestrator_overrides["tail_aware_scheduling_config"] = scheduling_config
         orchestrator_config = cast(Any, VllmOmniOrchestratorConfig)(
             deploy_config_path=loaded_deploy_config_path,
-            **_orchestrator_cli_overrides(cli_overrides),
+            **orchestrator_overrides,
         )
         return cast(Any, cls)(
             pipeline_config=pipeline_cfg,

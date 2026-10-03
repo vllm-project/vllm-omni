@@ -124,6 +124,8 @@ class OmniEngineBase:
     _prom_metrics: Any = None
     _enable_orch_monitor: bool = False
     _client_config: OmniClientConfig | None = None
+    _tail_aware_scheduling_config: dict[str, Any] | None = None
+    _tail_aware_scheduling_enabled: bool = False
     # Lazily created by get_output_blocking_async().
     _output_drain_executor: concurrent.futures.ThreadPoolExecutor | None = None
 
@@ -287,6 +289,16 @@ class OmniEngineBase:
             )
             for stage in self.stage_configs
         )
+        from vllm_omni.engine.tail_aware_runtime import prepare_tail_aware_stages
+
+        self._tail_aware_scheduling_enabled = prepare_tail_aware_stages(
+            self.stage_configs,
+            self._tail_aware_scheduling_config,
+            distributed=self.single_stage_mode or self._omni_master_address is not None,
+            async_chunk=self.async_chunk,
+            session_mode=getattr(self.deploy_config, "session_mode", "turn"),
+            api_client_count=int((self._client_config or {}).get("client_count", 1)),
+        )
         self.stage_pools: list[StagePool] = []
         self.stage_clients: list[StageClient] = []  # logical-stage view for external readers
         self.input_processor: InputProcessor | None = None
@@ -393,6 +405,10 @@ class OmniEngineBase:
 
         self.num_stages = len(self.stage_configs)
         self.stage_pools = self._runtime.stage_pools
+        if self._tail_aware_scheduling_enabled:
+            self.stage_pools[0].configure_tail_aware_scheduling(
+                self._tail_aware_scheduling_config,
+            )
         self.stage_clients = [
             cast(StageClient, pool.stage_client) for pool in self.stage_pools if pool.stage_client is not None
         ]
@@ -929,6 +945,7 @@ class OmniEngineBase:
         )
         if isinstance(resolution, OmniConfigResolution):
             self._config_resolution = resolution
+            self._tail_aware_scheduling_config = resolution.tail_aware_scheduling_config
             config_path = resolution.config_path
             stage_configs = list(resolution.stage_configs)
             strategy_lb_policy = resolution.omni_lb_policy
