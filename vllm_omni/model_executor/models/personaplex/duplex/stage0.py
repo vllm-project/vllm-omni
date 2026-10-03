@@ -73,12 +73,9 @@ class PersonaPlexStage0SessionState:
     request_ids: set[str] = field(default_factory=set)
     slot: int | None = None
     encoded_identity: tuple[int, int] | None = None
-    # (batch, row) of the step's [rows, ...] tensors: a batched step makes no
-    # per-row tensor.
     encoded_frame: tuple[Any, int] | None = None
     live_identity: tuple[int, int] | None = None
     live_embed: tuple[Any, int] | None = None
-    # Set by prepare_live_appends; ``prepared`` builds the append on first use.
     live_prepared: tuple[Any, ...] | None = None
     _prepared: PersonaPlexStage0PreparedAppend | None = None
 
@@ -87,11 +84,8 @@ class PersonaPlexStage0SessionState:
         if self.live_prepared is not None:
             input_ids, embed, frame, prompt_offset, info = self.live_prepared
             self._prepared = PersonaPlexStage0PreparedAppend(
-                input_ids=input_ids,
-                inputs_embeds=_row(embed),
-                user_frame=_row(frame),
-                info_update=_info_update(*info, first_append=False),
-                prefill_applied=False,
+                input_ids=input_ids, inputs_embeds=_row(embed), user_frame=_row(frame),
+                info_update=_info_update(*info, first_append=False), prefill_applied=False,
                 prompt_offset=prompt_offset,
             )
             self.live_prepared = None
@@ -125,11 +119,8 @@ def _info_update(
         "pplex_silence_codes": silence_cpu,
         "meta": {"pplex_frame": frame, "pplex_prefill_len": prefill_len},
         "duplex": {
-            "stage0_prepared": True,
-            "prefill_applied": first_append,
-            "session_id": session_id,
-            "epoch": epoch,
-            "seq": seq,
+            "stage0_prepared": True, "prefill_applied": first_append,
+            "session_id": session_id, "epoch": epoch, "seq": seq,
         },
     }
 
@@ -256,19 +247,9 @@ class PersonaPlexStage0DuplexRuntime:
         # finished by the engine and must not lease a row or record a sample.
         self._stale_requests: set[str] = set()
         # Per-slot device state, allocated on first use (see _slot_buffers).
-        self._slot_device: Any | None = None
-        self._last_text: Any | None = None
-        self._last_agent: Any | None = None
-        self._user_history: Any | None = None
-        self._teacher_tokens: Any | None = None
-        self._teacher_provided: Any | None = None
-        self._silence: Any | None = None
-        self._sine: Any | None = None
-        self._live_provided: Any | None = None
-        self._silence_cpu: Any | None = None
-        self._zero_ids: Any | None = None
-        # The [rows, hidden] embeds of the last _build_live_rows batch.
-        self._live_embeds: Any | None = None
+        self._slot_device = self._last_text = self._last_agent = self._user_history = None
+        self._teacher_tokens = self._teacher_provided = self._silence = self._sine = None
+        self._live_provided = self._silence_cpu = self._zero_ids = self._live_embeds = None
         if codec is not None:
             codec.streaming_init(max_sessions, decode=False)
             self._codec = codec
@@ -734,20 +715,13 @@ class PersonaPlexStage0DuplexRuntime:
         import torch
 
         device = self._model_device_dtype()[0]
-        # One row per slot plus the scratch row (scratch_slot). The buffers are
-        # only ever updated in place: a captured depformer graph holds their
-        # addresses.
         rows = self.max_sessions + 1
         self._silence = torch.tensor(SILENCE_TOKENS, dtype=torch.long, device=device)
         self._sine = torch.tensor(SINE_TOKENS, dtype=torch.long, device=device)
         self._silence_cpu = torch.tensor(SILENCE_TOKENS, dtype=torch.long)
         self._last_text = torch.full((rows,), ZERO_TEXT_TOKEN, dtype=torch.long, device=device)
         self._last_agent = self._silence.repeat(rows, 1)
-        # Newest first: [:, 0] is the frame being appended, [:, 1] and [:, 2]
-        # the two before it.
         self._user_history = self._sine.repeat(rows, 3, 1)
-        # The scratch row stays neutral: requests of a superseded epoch and
-        # padding rows read it.
         self._teacher_tokens = self._silence.repeat(rows, 2)
         self._teacher_provided = torch.zeros((rows, 16), dtype=torch.bool, device=device)
         self._live_provided = torch.tensor([False] * 8 + [True] * 8, dtype=torch.bool, device=device)
@@ -756,7 +730,6 @@ class PersonaPlexStage0DuplexRuntime:
 
     def _reset_slot_state(self, slot: int) -> None:
         self._slot_buffers()
-        # An in-place fill: assigning the Python int would sync the host.
         self._last_text[slot].fill_(ZERO_TEXT_TOKEN)
         self._last_agent[slot] = self._silence
         self._user_history[slot] = self._sine
@@ -776,14 +749,6 @@ class PersonaPlexStage0DuplexRuntime:
         return tensor.to(device, non_blocking=True)
 
     def load_encoder(self, *, cuda_graph: bool = False) -> None:
-        """Build the shared encoder at model load instead of on the first append.
-
-        Built with the weights, its checkpoint read stays off the first
-        session's step and vLLM's memory profiling sees its weights, streaming
-        state and graph pool. ``cuda_graph`` replays each step's encode from a
-        CUDA graph over all ``max_sessions`` rows. The per-slot frame state is
-        allocated here too, before any graph captures its addresses.
-        """
         self._slot_buffers()
         codec = self._shared_codec()
         if cuda_graph:
@@ -842,22 +807,12 @@ class PersonaPlexStage0DuplexRuntime:
         tokenizer = self._load_tokenizer()
         persona_tokens = tokenizer(wrap_with_system_tags(persona)) if persona else []
         prefill_tokens = torch.tensor(
-            [
-                *([ZERO_TEXT_TOKEN] * AUDIO_SILENCE_FRAME_CNT),
-                *persona_tokens,
-                *([ZERO_TEXT_TOKEN] * AUDIO_SILENCE_FRAME_CNT),
-            ],
-            dtype=torch.long,
-            device=device,
+            [ZERO_TEXT_TOKEN] * AUDIO_SILENCE_FRAME_CNT + persona_tokens + [ZERO_TEXT_TOKEN] * AUDIO_SILENCE_FRAME_CNT,
+            dtype=torch.long, device=device,
         )
-        # No autograd graph may outlive the call: the rows can be built at load,
-        # outside the runner's inference mode.
         with torch.no_grad():
             token_prefill = self.stage_model._build_prefill_embed(
-                prefill_tokens,
-                0,
-                int(prefill_tokens.numel()),
-                device,
+                prefill_tokens, 0, int(prefill_tokens.numel()), device,
                 torch.tensor(SILENCE_TOKENS, dtype=torch.long, device=device),
                 user_sine=torch.tensor(SINE_TOKENS, dtype=torch.long, device=device),
             )

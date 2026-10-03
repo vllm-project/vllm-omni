@@ -214,15 +214,10 @@ def test_post_sample_talker_mtp_rejects_invalid_selected_token_shape(
 
 
 def test_post_sample_talker_mtp_before_bookkeeping_gathers_the_kept_rows() -> None:
-    # No sampled tokens on the host yet: the discard mask picks the rows, here not a prefix.
     runner, received = _mtp_runner(
         async_scheduling=False,
-        buffers={
-            "discarded-prefill": {"duplex": {"data_plane": True}},
-            "ready": {"duplex": {"data_plane": True}},
-        },
+        buffers={"discarded-prefill": {"duplex": {"data_plane": True}}, "ready": {"duplex": {"data_plane": True}}},
     )
-
     multimodal = GPUARModelRunner._run_post_sample_talker_mtp(
         runner,
         req_ids=["discarded-prefill", "ready"],
@@ -232,12 +227,9 @@ def test_post_sample_talker_mtp_before_bookkeeping_gathers_the_kept_rows() -> No
         sample_hidden_states=torch.tensor([[1.0, 2.0], [3.0, 4.0]]),
         multimodal_outputs=None,
     )
-
-    assert received["req_ids"] == ["ready"]
-    assert received["input_ids"].tolist() == [102]
+    assert received["req_ids"] == ["ready"] and received["input_ids"].tolist() == [102]
     assert received["hidden_states"].tolist() == [[3.0, 4.0]]
-    assert multimodal["codes"]["audio"][1].tolist() == [[11, 12, 13]]
-    assert multimodal["codes"]["audio"][0].numel() == 0
+    assert multimodal["codes"]["audio"][1].tolist() == [[11, 12, 13]] and multimodal["codes"]["audio"][0].numel() == 0
 
 
 @pytest.mark.cuda
@@ -248,22 +240,18 @@ def test_post_sample_talker_mtp_moves_device_codes_with_one_pending_copy() -> No
         buffers={"a": {"duplex": {"data_plane": True}}, "b": {"duplex": {"data_plane": True}}},
     )
     runner.model = SimpleNamespace(
-        post_sample_talker_mtp=lambda *, input_ids, **_: input_ids[:, None].expand(-1, 3) * 10,
+        post_sample_talker_mtp=lambda *, input_ids, **_: input_ids[:, None].expand(-1, 3) * 10
     )
-    sampled = torch.tensor([[1], [2]], dtype=torch.long, device="cuda")
-
     multimodal = GPUARModelRunner._run_post_sample_talker_mtp(
         runner,
         req_ids=["a", "b"],
         valid_sampled_token_ids=[[1], [2]],
-        sampled_token_ids=sampled,
+        sampled_token_ids=torch.tensor([[1], [2]], dtype=torch.long, device="cuda"),
         invalid_req_indices=[],
         sample_hidden_states=torch.zeros((2, 2), device="cuda"),
         multimodal_outputs=None,
     )
-    copies = runner._omni_post_sample_host_copies
-    copies.wait()
-
+    runner._omni_post_sample_host_copies.wait()
     audio = multimodal["codes"]["audio"]
     assert all(row.device.type == "cpu" and row.is_pinned() for row in audio)
     assert [row.tolist() for row in audio] == [[[10] * 3], [[20] * 3]]

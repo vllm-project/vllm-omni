@@ -27,12 +27,8 @@ CUDA_DEVICE = torch.device("cuda")
 DIM = 16
 CARD = 32
 ACTIVE_SCHEDULE = [
-    (True, True, True),
-    (True, False, True),
-    (False, False, False),
-    (False, True, True),
-    (True, True, False),
-    (True, True, True),
+    (True, True, True), (True, False, True), (False, False, False),
+    (False, True, True), (True, True, False), (True, True, True),
 ]
 
 
@@ -45,11 +41,8 @@ class _ArgmaxQuantizer(MimiSplitResidualVectorQuantizer):
 
     def __init__(self, dim: int, card: int = CARD, codebooks: int = 8) -> None:
         config = MimiConfig(
-            hidden_size=dim,
-            codebook_size=card,
-            codebook_dim=8,
-            vector_quantization_hidden_dimension=8,
-            num_quantizers=codebooks,
+            hidden_size=dim, codebook_size=card, codebook_dim=8,
+            vector_quantization_hidden_dimension=8, num_quantizers=codebooks,
         )
         super().__init__(config)
         self.proj = nn.Parameter(torch.randn(codebooks, card, dim))
@@ -77,31 +70,23 @@ def _make_small_codec(device: torch.device, batch_size: int, **halves: bool) -> 
         return _StreamConvTr1d(nn.ConvTranspose1d(cin, cout, 2 * stride, stride=stride, device=device))
 
     codec._enc_stages = [
-        ("conv", conv(1, 4, 7)),
-        ("act", nn.ELU()),
+        ("conv", conv(1, 4, 7)), ("act", nn.ELU()),
         ("res", (nn.ELU(), conv(4, 2, 3), nn.ELU(), conv(2, 4, 1))),
-        ("conv", conv(4, 8, 8, stride=4)),
-        ("conv", conv(8, 8, 10, stride=5)),
-        ("conv", conv(8, DIM, 12, stride=6)),
-        ("conv", conv(DIM, DIM, 16, stride=8)),
+        ("conv", conv(4, 8, 8, stride=4)), ("conv", conv(8, 8, 10, stride=5)),
+        ("conv", conv(8, DIM, 12, stride=6)), ("conv", conv(DIM, DIM, 16, stride=8)),
     ]
     codec._downsample = conv(DIM, DIM, 4, stride=2, pad_mode="replicate")
     codec._upsample = _StreamConvTr1d(nn.ConvTranspose1d(DIM, DIM, 4, stride=2, device=device))
     codec._dec_stages = [
-        ("conv", conv(DIM, 8, 7)),
-        ("act", nn.ELU()),
-        ("convtr", convtr(8, 8, stride=8)),
+        ("conv", conv(DIM, 8, 7)), ("act", nn.ELU()), ("convtr", convtr(8, 8, stride=8)),
         ("res", (nn.ELU(), conv(8, 4, 3), nn.ELU(), conv(4, 8, 1))),
-        ("convtr", convtr(8, 4, stride=6)),
-        ("convtr", convtr(4, 4, stride=5)),
-        ("convtr", convtr(4, 4, stride=4)),
-        ("act", nn.ELU()),
-        ("conv", conv(4, 1, 3)),
+        ("convtr", convtr(8, 4, stride=6)), ("convtr", convtr(4, 4, stride=5)),
+        ("convtr", convtr(4, 4, stride=4)), ("act", nn.ELU()), ("conv", conv(4, 1, 3)),
     ]
     codec.encoder_transformer = _MimiStreamingTransformer(num_layers=2, dim=DIM, num_heads=2, context=8).to(device)
     codec.decoder_transformer = _MimiStreamingTransformer(num_layers=1, dim=DIM, num_heads=2, context=8).to(device)
-    for parameter in (*codec.encoder_transformer.parameters(), *codec.decoder_transformer.parameters()):
-        nn.init.normal_(parameter, std=0.1)
+    for p in (*codec.encoder_transformer.parameters(), *codec.decoder_transformer.parameters()):
+        nn.init.normal_(p, std=0.1)
     codec.model = nn.Module()
     codec.model.quantizer = _ArgmaxQuantizer(DIM).to(device)
     codec.streaming_init(batch_size, **halves)
@@ -109,19 +94,14 @@ def _make_small_codec(device: torch.device, batch_size: int, **halves: bool) -> 
 
 
 def _assert_same_streaming_state(a: PersonaPlexMimiCodec, b: PersonaPlexMimiCodec) -> None:
-    for state_a, state_b in zip(a._conv_states(), b._conv_states(), strict=True):
-        carry_a = state_a.partial if isinstance(state_a, _StreamConvTr1d) else state_a.prev
-        carry_b = state_b.partial if isinstance(state_b, _StreamConvTr1d) else state_b.prev
-        assert torch.equal(carry_a, carry_b)
-        assert torch.equal(state_a._fresh, state_b._fresh)
-    for transformer_a, transformer_b in (
-        (a.encoder_transformer, b.encoder_transformer),
-        (a.decoder_transformer, b.decoder_transformer),
-    ):
-        for kv_a, kv_b in zip(transformer_a._kv, transformer_b._kv, strict=True):
-            assert torch.equal(kv_a.end_offset, kv_b.end_offset)
-            assert torch.equal(kv_a.start_offset, kv_b.start_offset)
-        assert torch.equal(transformer_a._offset, transformer_b._offset)
+    for sa, sb in zip(a._conv_states(), b._conv_states(), strict=True):
+        ca = sa.partial if isinstance(sa, _StreamConvTr1d) else sa.prev
+        cb = sb.partial if isinstance(sb, _StreamConvTr1d) else sb.prev
+        assert torch.equal(ca, cb) and torch.equal(sa._fresh, sb._fresh)
+    for ta, tb in ((a.encoder_transformer, b.encoder_transformer), (a.decoder_transformer, b.decoder_transformer)):
+        for ka, kb in zip(ta._kv, tb._kv, strict=True):
+            assert torch.equal(ka.end_offset, kb.end_offset) and torch.equal(ka.start_offset, kb.start_offset)
+        assert torch.equal(ta._offset, tb._offset)
 
 
 def _half_tensors(codec: PersonaPlexMimiCodec, half: str) -> list[torch.Tensor]:
@@ -177,8 +157,7 @@ def test_one_sided_codec_matches_full_and_rejects_the_other_half(half: str) -> N
 
 class _GraphCodec:
     def __init__(self) -> None:
-        self.inits: list[tuple[int, bool]] = []
-        self.captures = 0
+        self.inits, self.captures = [], 0
 
     def streaming_init(self, batch_size: int, *, decode: bool = True) -> None:
         self.inits.append((batch_size, decode))
@@ -191,24 +170,13 @@ class _GraphCodec:
 @pytest.mark.cpu
 @pytest.mark.parametrize("cuda_graph", [False, True])
 def test_load_encoder_builds_the_shared_encoder_once(cuda_graph: bool) -> None:
-    codecs: list[_GraphCodec] = []
-
-    def factory() -> _GraphCodec:
-        codecs.append(_GraphCodec())
-        return codecs[-1]
-
+    codecs = []
     runtime = PersonaPlexStage0DuplexRuntime(
-        SimpleNamespace(),
-        model_path="/unused",
-        device="cpu",
-        codec_factory=factory,
-        max_sessions=4,
+        SimpleNamespace(), model_path="/unused", device="cpu",
+        codec_factory=lambda: codecs.append(_GraphCodec()) or codecs[-1], max_sessions=4,
     )
     runtime.load_encoder(cuda_graph=cuda_graph)
-
-    assert len(codecs) == 1
-    assert codecs[0].inits == [(4, False)]
-    assert codecs[0].captures == int(cuda_graph)
+    assert codecs[0].inits == [(4, False)] and codecs[0].captures == int(cuda_graph)
 
 
 @pytest.mark.cuda

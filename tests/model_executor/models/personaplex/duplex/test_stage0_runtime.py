@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import base64
+import io
+import tarfile
 from types import SimpleNamespace
 
 import numpy as np
@@ -18,6 +20,7 @@ from vllm_omni.model_executor.models.personaplex.duplex.stage0 import (
     PersonaPlexStage0DuplexRuntime,
     PersonaPlexStage0PreparedAppend,
     PersonaPlexStage0StaleEpochError,
+    load_personaplex_voice_state,
 )
 from vllm_omni.model_executor.models.personaplex.personaplex_talker import (
     PersonaPlexTalkerForConditionalGeneration,
@@ -42,7 +45,7 @@ class _FakeCodec:
         assert pcm.shape == (len(self.frames), 1920)
         assert active.shape == (len(self.frames),)
         self.encode_calls += 1
-        codes = torch.zeros((len(self.frames), 8), dtype=torch.long)
+        codes = torch.zeros((len(self.frames), 8), dtype=torch.long, device=pcm.device)
         for row, is_active in enumerate(active.tolist()):
             if is_active:
                 self.frames[row] += 1
@@ -55,8 +58,8 @@ class _FakeCodec:
 
 
 class _FakeTalker:
-    def __init__(self) -> None:
-        self.device = torch.device("cpu")
+    def __init__(self, device: torch.device | str = "cpu") -> None:
+        self.device = torch.device(device)
         self.dtype = torch.float32
         self.frame_calls: list[dict[str, torch.Tensor]] = []
 
@@ -105,18 +108,19 @@ def _duplex_info(*, seq: int, session_id: str = "session", epoch: int = 0):
     }
 
 
-def _runtime(codec: _FakeCodec, max_sessions: int = 1) -> PersonaPlexStage0DuplexRuntime:
-    voice_embeddings = torch.arange(8, dtype=torch.float32).reshape(2, 1, 1, 4)
+def _runtime(codec: _FakeCodec, max_sessions: int = 1, device: str = "cpu") -> PersonaPlexStage0DuplexRuntime:
+    dev = torch.device(device)
+    voice_embeddings = torch.arange(8, dtype=torch.float32, device=dev).reshape(2, 1, 1, 4)
     return PersonaPlexStage0DuplexRuntime(
-        _FakeTalker(),
+        _FakeTalker(dev),
         model_path="/unused",
-        device="cpu",
+        device=device,
         codec=codec,
         max_sessions=max_sessions,
         tokenizer=lambda _text: [7, 8, 9],
         voice_loader=lambda _voice: {
             "embeddings": voice_embeddings,
-            "cache": torch.zeros((1, 17, 4), dtype=torch.long),
+            "cache": torch.zeros((1, 17, 4), dtype=torch.long, device=dev),
         },
     )
 
@@ -588,3 +592,96 @@ def test_a_newer_frame_replaces_an_encoded_frame_that_was_never_prepared() -> No
     assert runtime.stage_model.frame_calls[-1]["user_d0"][:, 0].tolist() == [2]
     assert runtime.stage_model.frame_calls[-1]["user_d1"].tolist() == [list(SINE_TOKENS)]
     assert runtime.sessions[("session", 0)].user_frames == 2
+
+
+def test_live_appends_match_the_per_request_prepare() -> None:
+    sessions = [f"s{i}" for i in range(4)]
+    batched = _runtime(_FakeCodec(), max_sessions=4)
+    reference = _runtime(_FakeCodec(), max_sessions=4)
+    for rt in (batched, reference):
+        rt.encode_appends([_duplex_info(seq=1, session_id=s) for s in sessions])
+        for s in sessions:
+            rt.prepare_append(_duplex_info(seq=1, session_id=s), prompt_len=18, request_id=s)
+        rt.record_samples(
+            request_ids=sessions,
+            text_tokens=torch.arange(4) + 5,
+            agent_codes=torch.zeros((4, 8), dtype=torch.long),
+        )
+
+    appends = [(s, _duplex_info(seq=2, session_id=s), 19) for s in sessions]
+    batched.encode_appends([d for _, d, _ in appends])
+    handled, embeds = batched.prepare_live_appends(appends)
+
+    reference.encode_appends([_duplex_info(seq=2, session_id=s) for s in sessions])
+    prepared = [
+        reference.prepare_append(_duplex_info(seq=2, session_id=s), prompt_len=19, request_id=s) for s in sessions
+    ]
+
+    assert handled == list(range(4))
+    assert torch.equal(embeds, torch.cat([item.inputs_embeds for item in prepared]))
+    assert batched.request_sessions == reference.request_sessions
+    for key in ("_last_text", "_last_agent", "_user_history", "_teacher_tokens", "_teacher_provided"):
+        assert torch.equal(getattr(batched, key), getattr(reference, key)), key
+
+
+def test_talker_batch_preprocess_writes_the_rows() -> None:
+    sessions = [f"s{i}" for i in range(4)]
+    runtime = _runtime(_FakeCodec(), max_sessions=4)
+    runtime.encode_appends([_duplex_info(seq=1, session_id=s) for s in sessions])
+    for s in sessions:
+        runtime.prepare_append(_duplex_info(seq=1, session_id=s), prompt_len=18, request_id=s)
+    runtime.record_samples(
+        request_ids=sessions,
+        text_tokens=torch.arange(4) + 5,
+        agent_codes=torch.zeros((4, 8), dtype=torch.long),
+    )
+
+    talker = PersonaPlexTalkerForConditionalGeneration.__new__(PersonaPlexTalkerForConditionalGeneration)
+    torch.nn.Module.__init__(talker)
+    talker._personaplex_duplex_stage0_runtime = runtime
+    talker._dtype = torch.float32
+    talker.mtp_hidden_size = 4
+
+    req_ids = [*sessions, "unhandled"]
+    buffer = {s: {"duplex": _duplex_info(seq=2, session_id=s)} for s in req_ids}
+    inputs_embeds = torch.full((5, 4), -1.0)
+    handled = talker.preprocess_batch(
+        req_ids=req_ids,
+        model_intermediate_buffer=buffer,
+        device=torch.device("cpu"),
+        input_ids=torch.full((5,), 9, dtype=torch.int32),
+        inputs_embeds=inputs_embeds,
+        token_offsets=list(range(5)),
+        num_scheduled_tokens=[1] * 5,
+        num_computed_tokens=[18, 18, 18, 18, 0],
+        prompt_lens=[19] * 5,
+    )
+    assert handled == set(sessions)
+    assert torch.equal(inputs_embeds[4], torch.full((4,), -1.0))
+
+
+def test_prefill_cache_and_voice_archive(tmp_path) -> None:
+    runtime = _runtime(_FakeCodec(), max_sessions=4)
+    first = runtime.prepare_append(_duplex_info(seq=1, session_id="a"), prompt_len=64)
+    second = runtime.prepare_append(_duplex_info(seq=1, session_id="b"), prompt_len=64)
+    assert first.prefill_applied is True and second.prefill_applied is True
+    assert torch.equal(first.inputs_embeds[:-1], second.inputs_embeds[:-1])
+
+    diff = _duplex_info(seq=1, session_id="c")
+    diff["runtime_config"]["personaplex_persona"] = "Different persona."
+    third = runtime.prepare_append(diff, prompt_len=64)
+    assert not torch.equal(first.inputs_embeds[:-1], third.inputs_embeds[:-1])
+
+    buf = io.BytesIO()
+    torch.save({"embeddings": torch.arange(4.0).reshape(1, 4)}, buf)
+    data = buf.getvalue()
+    ti = tarfile.TarInfo("voices/A.pt")
+    ti.size = len(data)
+    with tarfile.open(tmp_path / "voices.tgz", "w:gz") as tar:
+        tar.addfile(ti, io.BytesIO(data))
+    assert "embeddings" in load_personaplex_voice_state(str(tmp_path), "A.pt")
+
+    fake = SimpleNamespace(
+        _duplex_stage0_runtime=lambda: SimpleNamespace(warm_prefill=lambda: (_ for _ in ()).throw(FileNotFoundError))
+    )
+    PersonaPlexTalkerForConditionalGeneration._warm_duplex_prefill(fake)

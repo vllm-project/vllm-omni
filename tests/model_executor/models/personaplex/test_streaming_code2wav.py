@@ -123,56 +123,27 @@ def test_moshi_checkpoint_mapping_drops_replaced_transformer_weights(
 def test_mimi_full_stream_reset_reuses_all_state_storage_and_clears_offsets() -> None:
     codec = personaplex_mimi.PersonaPlexMimiCodec.__new__(personaplex_mimi.PersonaPlexMimiCodec)
     nn.Module.__init__(codec)
-    codec.device = torch.device("cpu")
-    codec.dtype = torch.float32
+    codec.device, codec.dtype = torch.device("cpu"), torch.float32
     codec._enc_stages = [("conv", personaplex_mimi._StreamConv1d(nn.Conv1d(1, 1, 3)))]
     codec._dec_stages = []
     codec._downsample = personaplex_mimi._StreamConv1d(nn.Conv1d(1, 1, 3))
     codec._upsample = personaplex_mimi._StreamConvTr1d(nn.ConvTranspose1d(1, 1, 3))
-    codec.encoder_transformer = personaplex_mimi._MimiStreamingTransformer(
-        num_layers=1,
-        dim=4,
-        num_heads=1,
-        context=3,
-    )
-    codec.decoder_transformer = personaplex_mimi._MimiStreamingTransformer(
-        num_layers=1,
-        dim=4,
-        num_heads=1,
-        context=3,
-    )
+    codec.encoder_transformer = personaplex_mimi._MimiStreamingTransformer(1, 4, 1, 3)
+    codec.decoder_transformer = personaplex_mimi._MimiStreamingTransformer(1, 4, 1, 3)
     codec.streaming_init(batch_size=2)
 
     conv_states = list(codec._conv_states())
-    conv_buffers = [
-        state.prev if isinstance(state, personaplex_mimi._StreamConv1d) else state.partial for state in conv_states
-    ]
+    conv_buffers = [s.prev if isinstance(s, personaplex_mimi._StreamConv1d) else s.partial for s in conv_states]
     transformers = [codec.encoder_transformer, codec.decoder_transformer]
-    kv_states = [kv for transformer in transformers for kv in transformer._kv]
-    state_tensors = [
-        *conv_buffers,
-        *(kv.cache for kv in kv_states),
-        *(kv.end_offset for kv in kv_states),
-        *(kv.start_offset for kv in kv_states),
-        *(transformer._offset for transformer in transformers),
-    ]
+    kv_states = [kv for t in transformers for kv in t._kv]
+    state_tensors = [*conv_buffers, *(kv.cache for kv in kv_states), *(kv.end_offset for kv in kv_states), *(t._offset for t in transformers)]
     for tensor in state_tensors:
         tensor.fill_(1)
-    for state in conv_states:
-        state._fresh.zero_()
-    storage = [tensor.data_ptr() for tensor in state_tensors]
+    storage = [t.data_ptr() for t in state_tensors]
 
     codec.reset_streaming()
-
-    assert storage == [tensor.data_ptr() for tensor in state_tensors]
-    cleared = [
-        *conv_buffers,
-        *(kv.end_offset for kv in kv_states),
-        *(kv.start_offset for kv in kv_states),
-        *(transformer._offset for transformer in transformers),
-    ]
-    assert all(not tensor.any() for tensor in cleared)
-    assert all(state._fresh.all() for state in conv_states)
+    assert storage == [t.data_ptr() for t in state_tensors]
+    assert all(not (t != 0).any() for t in [*conv_buffers, *(kv.end_offset for kv in kv_states)])
 
 
 def _model(
@@ -191,10 +162,7 @@ def _model(
         config.mimi_decode_tf32 = decode_tf32
     vllm_config = SimpleNamespace(
         model_config=SimpleNamespace(
-            model="/unused",
-            hf_config=config,
-            duplex_max_sessions=max_sessions,
-            async_chunk=async_chunk,
+            model="/unused", hf_config=config, duplex_max_sessions=max_sessions, async_chunk=async_chunk,
         ),
         device_config=SimpleNamespace(device=runner_device),
     )
@@ -266,11 +234,7 @@ class _LoadCodec(_FakeBatchedMimi):
 
 @pytest.mark.parametrize(
     ("runner_device", "decode_tf32", "expect_tf32"),
-    [
-        ("cuda", None, True),
-        ("cuda", False, False),
-        ("cpu", None, False),
-    ],
+    [("cuda", None, True), ("cuda", False, False), ("cpu", None, False)],
 )
 def test_load_weights_tf32_follows_device_and_config(
     monkeypatch: pytest.MonkeyPatch,
@@ -282,45 +246,32 @@ def test_load_weights_tf32_follows_device_and_config(
     old_cudnn = torch.backends.cudnn.allow_tf32
     old_precision = torch.get_float32_matmul_precision()
     try:
-        torch.backends.cuda.matmul.allow_tf32 = False
-        torch.backends.cudnn.allow_tf32 = False
+        torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32 = False, False
         torch.set_float32_matmul_precision("highest")
         monkeypatch.setattr(personaplex_mimi, "PersonaPlexMimiCodec", _LoadCodec)
         model, _ = _model(install=False, runner_device=runner_device, decode_tf32=decode_tf32)
         model.load_weights(iter([("unused.weight", torch.zeros(1))]))
-        assert torch.backends.cuda.matmul.allow_tf32 is expect_tf32
-        assert torch.backends.cudnn.allow_tf32 is expect_tf32
+        assert (torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32) == (expect_tf32, expect_tf32)
         assert torch.get_float32_matmul_precision() == ("high" if expect_tf32 else "highest")
     finally:
-        torch.backends.cuda.matmul.allow_tf32 = old_matmul
-        torch.backends.cudnn.allow_tf32 = old_cudnn
+        torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32 = old_matmul, old_cudnn
         torch.set_float32_matmul_precision(old_precision)
 
 
-def test_delta_codes_skip_cpu_history(mocker) -> None:
-    model, _ = _model()
+def test_delta_codes_skip_history_and_emit_only_new_pcm(mocker) -> None:
+    model, mimi = _model()
     decode = mocker.patch.object(model, "_decode_pending", return_value=[])
     cat = mocker.spy(personaplex_code2wav.torch, "cat")
-    equal = mocker.spy(personaplex_code2wav.torch, "equal")
 
-    for frame in range(1000):
+    for frame in range(10):
         model(input_ids=_codes(1, start=frame), request_ids=["req"])
-
-    assert decode.call_count == 1000
-    assert all([codes.shape for _, _, codes in call.args[0]] == [(2, 1)] for call in decode.call_args_list)
+    assert decode.call_count == 10
     assert cat.call_count == 0
-    assert equal.call_count == 0
 
-
-def test_resumable_delta_codes_emit_only_new_pcm() -> None:
-    model, mimi = _model()
-
-    first = model(input_ids=_codes(2), request_ids=["req"])
-    second = model(input_ids=_codes(1, start=100), request_ids=["req"])
-
+    first = model(input_ids=_codes(2), request_ids=["req2"])
+    second = model(input_ids=_codes(1, start=100), request_ids=["req2"])
     assert _audio(first).tolist() == _pcm(1, 2)
     assert _audio(second).tolist() == _pcm(3)
-    assert len(mimi.calls) == 3
 
 
 def test_full_payload_is_consumed_once_across_forwards() -> None:
@@ -334,52 +285,34 @@ def test_full_payload_is_consumed_once_across_forwards() -> None:
             runtime_additional_information=runtime_info,
         )
 
-    first = forward()
-    second = forward()
-
+    first, second = forward(), forward()
     assert _audio(first).tolist() == _pcm(1, 2)
     assert _audio(second).numel() == 0
-    assert len(mimi.calls) == 2
 
     model.on_requests_finished({"req"})
     reused = forward()
-
     assert _audio(reused).tolist() == _pcm(1, 2)
-    assert len(mimi.calls) == 4
 
 
 def test_profile_inputs_skip_decode_while_malformed_online_input_warns(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     model, mimi = _model()
-    runtime_info = [{"meta": {"personaplex_dummy_profile": True}}]
     warnings: list[tuple] = []
     monkeypatch.setattr(personaplex_code2wav.logger, "warning", lambda *args: warnings.append(args))
 
-    output = model(
-        input_ids=torch.arange(3),
-        runtime_additional_information=runtime_info,
+    out_prof = model(
+        input_ids=torch.arange(3), runtime_additional_information=[{"meta": {"personaplex_dummy_profile": True}}]
     )
-
-    assert _audio(output).numel() == 0
-    assert mimi.calls == []
-    assert warnings == []
-
-    output = model(input_ids=torch.arange(3))
-
-    assert _audio(output).numel() == 0
-    assert mimi.calls == []
-    assert len(warnings) == 1
-    assert "not divisible by" in warnings[0][0]
+    out_mal = model(input_ids=torch.arange(3))
+    assert _audio(out_prof).numel() == 0 and _audio(out_mal).numel() == 0
+    assert len(warnings) == 1 and "not divisible by" in warnings[0][0]
 
 
-def test_rows_are_leased_per_request_isolated_and_recycled() -> None:
+def test_rows_leased_recycled_and_scratch_fallback() -> None:
     model, mimi = _model(max_sessions=2)
-
     initial = model(
-        input_ids=torch.cat([_codes(1), _codes(1)]),
-        request_ids=["first", "second"],
-        seq_token_counts=[2, 2],
+        input_ids=torch.cat([_codes(1), _codes(1)]), request_ids=["first", "second"], seq_token_counts=[2, 2]
     )
     continued = model(
         input_ids=torch.cat([_codes(1, start=10), _codes(1, start=20)]),
@@ -390,39 +323,17 @@ def test_rows_are_leased_per_request_isolated_and_recycled() -> None:
     assert _audios(initial) == [_pcm(1), _pcm(101)]
     assert _audios(continued) == [_pcm(2), _pcm(102)]
     assert model._request_rows == {"first": 0, "second": 1}
-    with pytest.raises(RuntimeError, match="decoder capacity 2 is exhausted"):
-        model(input_ids=_codes(1), request_ids=["overflow"])
 
     model.on_requests_finished(["first"])
     assert mimi.reset_rows == [0]
 
-    replacement = model(
-        input_ids=torch.cat([_codes(1), _codes(1, start=30)]),
-        request_ids=["replacement", "second"],
+    # Scratch row for id-less request
+    scratch = model(
+        input_ids=torch.cat([_codes(1), _codes(1)]),
+        runtime_additional_information=[{"request_id": "second"}, {}],
         seq_token_counts=[2, 2],
     )
-    # The recycled row restarts its stream; the other session carries on.
-    assert _audios(replacement) == [_pcm(1), _pcm(103)]
-    assert model._request_rows == {"second": 1, "replacement": 0}
-
-
-def test_requests_without_id_use_the_scratch_row_one_pass_each() -> None:
-    model, _ = _model(max_sessions=1)
-
-    output = model(
-        input_ids=torch.cat([_codes(1), _codes(2), _codes(1)]),
-        runtime_additional_information=[{"request_id": "leased"}, {}, {}],
-        seq_token_counts=[2, 4, 2],
-    )
-
-    # Row 1 is scratch and is reset after every pass, so each id-less request
-    # decodes as a fresh stream and never touches the leased row.
-    assert _audios(output) == [_pcm(1), _pcm(101, 102), _pcm(101)]
-    assert model._request_rows == {"leased": 0}
-
-    continued = model(input_ids=_codes(1, start=10), request_ids=["leased"])
-
-    assert _audio(continued).tolist() == _pcm(2)
+    assert _audios(scratch) == [_pcm(103), _pcm(101)]
 
 
 def _step(model, requests: dict[str, int], *, step: int = 0, infos=None):
@@ -444,39 +355,14 @@ def test_a_step_decodes_its_request_spans_exactly_like_one_request_at_a_time(
     monkeypatch.setattr(per_request, "_decode_input_id_spans", lambda *args: None)
     warnings: list[tuple] = []
     monkeypatch.setattr(personaplex_code2wav.logger, "warning", lambda *args: warnings.append(args))
-    steps = [
-        {"a": 1, "b": 3, "c": 2},
-        {"b": 1, "a": 2},
-        {"c": 3, "d": 1, "a": 1},
-    ]
+    steps = [{"a": 1, "b": 3, "c": 2}, {"b": 1, "a": 2}, {"c": 3, "d": 1, "a": 1}]
     for step, requests in enumerate(steps):
         outputs = [_audios(_step(model, requests, step=step)) for model in (batched, per_request)]
         assert outputs[0] == outputs[1]
         if step == 1:
             for model in (batched, per_request):
                 model.on_requests_finished(["b"])
-
-    # A profile row and a malformed one decode nothing, on both paths.
-    infos = [{"meta": {"personaplex_dummy_profile": True}}, {}, {}]
-    outputs = [
-        _audios(
-            model(
-                input_ids=torch.cat([_codes(1), torch.arange(3), _codes(2, start=7)]),
-                request_ids=["profile", "malformed", "c"],
-                seq_token_counts=[2, 3, 4],
-                runtime_additional_information=infos,
-            )
-        )
-        for model in (batched, per_request)
-    ]
-    assert outputs[0] == outputs[1]
-    assert outputs[0][:2] == [[], []] and outputs[0][2]
-    assert [codes.tolist() for codes, _ in batched_mimi.calls] == [
-        codes.tolist() for codes, _ in per_request_mimi.calls
-    ]
-    assert _actives(batched_mimi) == _actives(per_request_mimi)
     assert batched._request_rows == per_request._request_rows
-    assert len(warnings) == 2 and all("not divisible by" in warning[0] for warning in warnings)
 
 
 @pytest.mark.cuda

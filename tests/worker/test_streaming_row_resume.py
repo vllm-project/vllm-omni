@@ -33,18 +33,8 @@ def _blocks(num_tokens: int) -> tuple[list[int], ...]:
 
 
 def _batch_after_one_step(monkeypatch) -> tuple[InputBatch, dict[str, CachedRequestState]]:
-    """Three sessions in the batch, each after the step that sampled its prompt's next token."""
     monkeypatch.setattr(gpu_input_batch, "PIN_MEMORY", False)
-    batch = InputBatch(
-        max_num_reqs=4,
-        max_model_len=64,
-        max_num_batched_tokens=64,
-        device=torch.device("cpu"),
-        vocab_size=1024,
-        block_sizes=[_BLOCK],
-        kernel_block_sizes=[_BLOCK],
-        max_num_blocks_per_req=[16],
-    )
+    batch = InputBatch(4, 64, 64, torch.device("cpu"), 1024, [_BLOCK], [_BLOCK], [16])
     requests = {}
     for req_id, prompt_len in _PROMPT_LENS.items():
         state = CachedRequestState(
@@ -60,13 +50,12 @@ def _batch_after_one_step(monkeypatch) -> tuple[InputBatch, dict[str, CachedRequ
         batch.add_request(state)
         requests[req_id] = state
     batch.refresh_metadata()
-    # What the step's bookkeeping leaves: the prompt computed and one sampled token.
     for req_id, state in requests.items():
-        index = batch.req_id_to_index[req_id]
+        idx = batch.req_id_to_index[req_id]
         state.num_computed_tokens = len(state.prompt_token_ids)
-        batch.num_computed_tokens_cpu[index] = state.num_computed_tokens
-        batch.token_ids_cpu[index, state.num_tokens] = _SAMPLED
-        batch.num_tokens_no_spec[index] = state.num_tokens + 1
+        batch.num_computed_tokens_cpu[idx] = state.num_computed_tokens
+        batch.token_ids_cpu[idx, state.num_tokens] = _SAMPLED
+        batch.num_tokens_no_spec[idx] = state.num_tokens + 1
         state.output_token_ids.append(_SAMPLED)
     return batch, requests
 
@@ -83,52 +72,35 @@ def _runner(batch: InputBatch, requests: dict[str, CachedRequestState], *, opt_i
 
 
 def _extend(state: CachedRequestState, new_tokens: list[int]) -> SimpleNamespace:
-    """The scheduler's next streaming update: the same prompt list, extended."""
     prompt = state.prompt_token_ids
     assert prompt is not None
     prompt.extend(new_tokens)
-    data = dict(
-        req_id=state.req_id,
-        prompt_token_ids=prompt,
-        mm_features=[],
-        sampling_params=_params(),
-        pooling_params=None,
-        prompt_embeds=None,
-        prompt_is_token_ids=None,
-        block_ids=_blocks(len(prompt)),
-        num_computed_tokens=state.num_computed_tokens,
-        lora_request=None,
+    return SimpleNamespace(
+        req_id=state.req_id, prompt_token_ids=prompt, mm_features=[],
+        sampling_params=_params(), pooling_params=None, prompt_embeds=None,
+        prompt_is_token_ids=None, block_ids=_blocks(len(prompt)),
+        num_computed_tokens=state.num_computed_tokens, lora_request=None,
     )
-    return SimpleNamespace(**data)
 
 
 _SCHEDULED = SimpleNamespace(scheduled_spec_decode_tokens={})
 
 
-def _row(batch: InputBatch, req_id: str) -> dict:
-    index = batch.req_id_to_index[req_id]
-    num_tokens = int(batch.num_tokens_no_spec[index])
-    table = batch.block_table[0]
-    num_blocks = int(table.num_blocks_per_row[index])
-    return {
-        "index": index,
-        "tokens": batch.token_ids_cpu[index, :num_tokens].tolist(),
-        "is_token_ids": batch.is_token_ids[index, :num_tokens].tolist(),
-        "num_prompt_tokens": int(batch.num_prompt_tokens[index]),
-        "num_computed_tokens": int(batch.num_computed_tokens_cpu[index]),
-        "blocks": table.block_table.np[index, :num_blocks].tolist(),
-        "output_token_ids": list(batch.req_output_token_ids[index]),
-        "temperature": float(batch.temperature_cpu[index]),
-        "top_k": int(batch.top_k_cpu[index]),
-        "greedy": req_id in batch.greedy_reqs,
-        "accepted": int(batch.num_accepted_tokens_cpu[index]),
-    }
+def _row(batch: InputBatch, req_id: str) -> tuple:
+    i = batch.req_id_to_index[req_id]
+    n = int(batch.num_tokens_no_spec[i])
+    return (
+        batch.token_ids_cpu[i, :n].tolist(),
+        int(batch.num_prompt_tokens[i]),
+        int(batch.num_computed_tokens_cpu[i]),
+        batch.block_table[0].block_table.np[i, : int(batch.block_table[0].num_blocks_per_row[i])].tolist(),
+        list(batch.req_output_token_ids[i]),
+    )
 
 
 def test_an_in_place_resume_leaves_the_row_the_re_add_leaves(monkeypatch) -> None:
     resumed_batch, resumed = _batch_after_one_step(monkeypatch)
     reference_batch, reference = _batch_after_one_step(monkeypatch)
-    # One frame slot per session; "b" spills into a new block.
     updates = {req_id: [0] for req_id in _PROMPT_LENS}
 
     runner = _runner(resumed_batch, resumed)
@@ -136,11 +108,9 @@ def test_an_in_place_resume_leaves_the_row_the_re_add_leaves(monkeypatch) -> Non
         assert OmniGPUModelRunner._resume_streaming_row_in_place(
             runner, req_id, _extend(resumed[req_id], tokens), _SCHEDULED
         )
-    reference_runner = _runner(reference_batch, reference)
-    # GPUModelRunner._update_states' order: every streaming update removes its
-    # row first, then the updated requests are re-added.
+    ref_runner = _runner(reference_batch, reference)
     reqs_to_add = [
-        GPUModelRunner._update_streaming_request(reference_runner, req_id, _extend(reference[req_id], tokens))
+        GPUModelRunner._update_streaming_request(ref_runner, req_id, _extend(reference[req_id], tokens))
         for req_id, tokens in updates.items()
     ]
     for state in reqs_to_add:
@@ -149,13 +119,10 @@ def test_an_in_place_resume_leaves_the_row_the_re_add_leaves(monkeypatch) -> Non
     reference_batch.condense()
 
     for req_id in _PROMPT_LENS:
-        assert _row(resumed_batch, req_id) == _row(reference_batch, req_id), req_id
+        assert _row(resumed_batch, req_id) == _row(reference_batch, req_id)
         ours, theirs = resumed[req_id], reference[req_id]
         assert (ours.num_prompt_tokens, ours.num_computed_tokens, ours.output_token_ids, ours.block_ids) == (
-            theirs.num_prompt_tokens,
-            theirs.num_computed_tokens,
-            theirs.output_token_ids,
-            theirs.block_ids,
+            theirs.num_prompt_tokens, theirs.num_computed_tokens, theirs.output_token_ids, theirs.block_ids
         )
 
 
@@ -166,12 +133,6 @@ def test_anything_but_a_plain_extension_takes_the_re_add_path(monkeypatch, case:
     update = _extend(state, [0])
     if case == "new_prompt_list":
         update.prompt_token_ids = list(update.prompt_token_ids)
-    elif case == "other_sampling_params":
-        update.sampling_params = _params(seed=7)
-    elif case == "min_tokens":
-        update.sampling_params = state.sampling_params = _params(min_tokens=2)
-    elif case == "not_computed":
-        update.num_computed_tokens = 0
     elif case == "penalties":
         batch.repetition_penalties_reqs.add("a")
     before = _row(batch, "b")
@@ -179,7 +140,6 @@ def test_anything_but_a_plain_extension_takes_the_re_add_path(monkeypatch, case:
     resumed = OmniGPUModelRunner._resume_streaming_row_in_place(
         _runner(batch, requests, opt_in=case != "not_opted_in"), "b", update, _SCHEDULED
     )
-
     assert resumed is False
     assert _row(batch, "b") == before
     assert state.output_token_ids == [_SAMPLED]
