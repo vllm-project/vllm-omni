@@ -113,7 +113,7 @@ class PrefixCacheSchedulerAdapter:
         events: list[PrefixCacheRequestEvent] = []
         cached = getattr(scheduler_output, "scheduled_cached_reqs", None)
         resumed = {str(req_id) for req_id in (getattr(cached, "resumed_req_ids", ()) or ())} if cached is not None else set()
-        aborted = set(getattr(scheduler_output, "aborted_req_ids", ()) or ())
+        aborted = {str(req_id) for req_id in (getattr(scheduler_output, "aborted_req_ids", ()) or ())}
         scheduled_tokens = getattr(scheduler_output, "num_scheduled_tokens", {}) or {}
         terminal_ids = {
             str(req_id)
@@ -175,9 +175,8 @@ class PrefixCacheSchedulerAdapter:
                 )
             )
 
-        finished = set(getattr(scheduler_output, "finished_req_ids", ()) or ())
+        finished = {str(req_id) for req_id in (getattr(scheduler_output, "finished_req_ids", ()) or ())}
         for req_id in sorted(finished | aborted):
-            req_id = str(req_id)
             kind = PrefixCacheEventKind.ABORTED if req_id in aborted else PrefixCacheEventKind.FINISHED
             events.append(PrefixCacheRequestEvent(req_id, kind))
             self._observed_req_ids.discard(req_id)

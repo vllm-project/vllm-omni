@@ -272,7 +272,6 @@ class _ReadPlan:
     key: TensorName
     req_id: ReqId
     bindings: tuple[_SlotBinding, ...]
-    resolved: torch.Tensor
     stable: torch.Tensor
     pool_storage: torch.Tensor | None
     producers: list[tuple[WriteTask, torch.Tensor]]
@@ -524,6 +523,7 @@ class OmniPrefixCacheManager:
         self._prefetch_reads = prefetch_reads
         self._next_read_id = 1
         self._pending_reads: list[_SlotRef | _ReadPlan] = []
+        self._pending_reads_lock = threading.Lock()
         # Sticky fatal set on the first drained write failure; every later
         # facade entry re-raises it (see _commit_drained_writes).
         self._fatal_write_failure: str | None = None
@@ -711,7 +711,10 @@ class OmniPrefixCacheManager:
             raise ValueError("save_outputs requires an adapter-produced write_layout")
         with self._state_lock:
             prepared_layout = self._prepared_write_layout
-            if prepared_layout is not None and prepared_layout != write_layout:
+            # The pre-forward layout is an immutable snapshot, not a value to
+            # compare structurally: it owns a tensor and must be the exact
+            # object used to derive the planned reads and writes.
+            if prepared_layout is not None and prepared_layout is not write_layout:
                 raise OmniPrefixCacheUnmatchError("save write layout differs from the pre-forward layout")
         req_order = [write.req_id for write in write_layout.writes]
         num_sched = {write.req_id: write.row_end - write.row_start for write in write_layout.writes}
@@ -812,10 +815,10 @@ class OmniPrefixCacheManager:
 
         Any thread. `req_ids` must be (a subset of) the save-time snapshot;
         an outside id means the caller is reading the live batch.
-        A request without a hit is a plain miss and gets exactly
-        this step's rows — normal path, nothing logged. A hit span that
-        resolves to absent rows raises OmniPrefixCacheUnmatchError: fatal
-        by contract (do not pretend it was a miss).
+        A request without a hit is a plain miss and gets exactly this step's
+        rows — normal path, nothing logged. Hidden rows classified as absent
+        or unknown are also treated as misses; unreadable producer bindings
+        remain fatal because they indicate a broken planned source.
 
         Two phases: under the lock, publish finished writes and pin every
         row source (task refs + masks, absent checks included) — not yet
@@ -1459,7 +1462,9 @@ class OmniPrefixCacheManager:
         if another write still owns them, mark those rows skipped on it."""
         keys = tuple(keys)
         # Copy committed rows aside before this claim overwrites them.
-        if self._pending_reads:
+        with self._pending_reads_lock:
+            has_pending_reads = bool(self._pending_reads)
+        if has_pending_reads:
             self._preserve_for_pending_reads(slots, keys)
         for old, key, stolen in self._slot_status.map_slots(slots, tid, keys):
             old_task = self._controller.get_task(old)
@@ -1476,7 +1481,9 @@ class OmniPrefixCacheManager:
         ``staged_list`` task refs directly.
         """
         new_set = {int(s) for s in new_slots.tolist()}
-        for ref in self._pending_reads:
+        with self._pending_reads_lock:
+            pending_reads = tuple(self._pending_reads)
+        for ref in pending_reads:
             if ref.key not in keys or not self._pool.has_key(ref.key):
                 continue
             status = self._slot_status.get_slot_status(ref.key)
@@ -1586,7 +1593,6 @@ class OmniPrefixCacheManager:
                 key,
                 req_id,
                 tuple(bindings),
-                torch.empty(0),
                 torch.empty(0, dtype=torch.bool),
                 None,
                 [],
@@ -1643,20 +1649,12 @@ class OmniPrefixCacheManager:
                 dtype=torch.bool,
             )
             storage = self._pool.flat_rows(key)
-            resolved = torch.empty(
-                (slots.numel(), storage.shape[-1]),
-                dtype=storage.dtype,
-            )
-            resolved.zero_()
         except BaseException:
             for slot, read_holder in leases:
                 self._controller.staging_release(slot, read_holder)
             raise
         # Explicit sparse absence is not stale residency. Keep the row shape
         # from the fixed CPU mirror, but return a deterministic zero payload.
-        absent = torch.tensor([binding.presence is _Presence.ABSENT for binding in bindings], dtype=torch.bool)
-        if bool(absent.any()):
-            resolved[absent] = 0
         producers_list = []
         for tid, mask in producer_masks.items():
             if bool(mask.any()):
@@ -1667,13 +1665,13 @@ class OmniPrefixCacheManager:
             key,
             req_id,
             tuple(bindings),
-            resolved,
             stable,
             storage,
             producers_list,
             leases,
         )
-        self._pending_reads.append(plan)
+        with self._pending_reads_lock:
+            self._pending_reads.append(plan)
         return plan
 
     def _close_read_plan(self, plan: _ReadPlan) -> None:
@@ -1681,7 +1679,8 @@ class OmniPrefixCacheManager:
             if plan._closed:
                 return
             plan._closed = True
-            self._pending_reads = [ref for ref in self._pending_reads if ref is not plan]
+            with self._pending_reads_lock:
+                self._pending_reads = [ref for ref in self._pending_reads if ref is not plan]
             for slot, holder in plan.leases:
                 self._controller.staging_release(slot, holder)
 
@@ -1690,20 +1689,25 @@ class OmniPrefixCacheManager:
         try:
             if plan.error is not None:
                 _raise_unreadable_hit(plan.req_id, plan.key, plan.error)
-            out = plan.resolved.clone()
+            if plan.pool_storage is None:
+                raise RuntimeError(f"read plan {plan.read_id} has no pool storage")
+            out = torch.zeros(
+                (plan.slots.numel(), plan.pool_storage.shape[-1]),
+                dtype=plan.pool_storage.dtype,
+            )
             if plan.pool_storage is not None and bool(plan.stable.any()):
                 out[plan.stable] = plan.pool_storage.index_select(0, plan.slots[plan.stable])
+            with self._state_lock:
+                preserved = dict(plan.preserved)
             for index, slot in enumerate(plan.slots.tolist()):
-                if slot in plan.preserved:
-                    out[index] = plan.preserved[slot]
+                if slot in preserved:
+                    out[index] = preserved[slot]
             for task, mask in plan.producers:
                 if task.schedule is WriteSchedule.JOIN_NEXT_STEP:
                     self._controller.join([task.tid])
                 out[mask] = self._controller.fetch_host(task, plan.slots[mask], plan.key)
             return out
         finally:
-            with self._state_lock:
-                self._pending_reads = [ref for ref in self._pending_reads if ref is not plan]
             self._close_read_plan(plan)
 
     def _get_hit_slots(self, hit_upto: int, hit_blocks: list[int]) -> torch.Tensor:
@@ -1763,15 +1767,18 @@ class OmniPrefixCacheManager:
             join_tids=join_tids,
             reserved_version=reserved_version,
         )
-        self._pending_reads.append(ref)
+        with self._pending_reads_lock:
+            self._pending_reads.append(ref)
         return ref
 
-    def _apply_preserved_rows(self, src: _SlotRef, out: torch.Tensor) -> torch.Tensor:
+    def _apply_preserved_rows(
+        self, src: _SlotRef, out: torch.Tensor, preserved: dict[int, torch.Tensor]
+    ) -> torch.Tensor:
         """Write ``src.preserved`` rows over the matching slots in ``out``."""
-        if not src.preserved:
+        if not preserved:
             return out
         for i, s in enumerate(src.slots.tolist()):
-            row = src.preserved.get(int(s))
+            row = preserved.get(int(s))
             if row is not None:
                 out[i] = row
         return out
@@ -1779,7 +1786,7 @@ class OmniPrefixCacheManager:
     def _unregister_pending_read(self, src: _SlotRef) -> None:
         """Drop ``src`` from ``_pending_reads``. Identity, not dataclass eq
         (tensors in the ref make ``==`` unusable). Safe if already removed."""
-        with self._state_lock:
+        with self._pending_reads_lock:
             self._pending_reads = [ref for ref in self._pending_reads if ref is not src]
 
     def _fetch_source(self, src: _SlotRef) -> torch.Tensor:
@@ -1793,23 +1800,25 @@ class OmniPrefixCacheManager:
         (copied under the lock before that write claimed them).
         """
         try:
-            return self._fetch_source_inner(src)
+            with self._state_lock:
+                preserved = dict(src.preserved)
+            return self._fetch_source_inner(src, preserved)
         finally:
             self._unregister_pending_read(src)
 
-    def _fetch_source_inner(self, src: _SlotRef) -> torch.Tensor:
+    def _fetch_source_inner(self, src: _SlotRef, preserved: dict[int, torch.Tensor]) -> torch.Tensor:
         # For JOIN_NEXT_STEP, wait `done`, drain, read the pool
         if src.join_tids:
             self._controller.join(src.join_tids)
             with self._state_lock:
                 self._commit_drained_writes()
-            joined = self._apply_preserved_rows(src, self._pool.rows(src.key, src.slots))
+            joined = self._apply_preserved_rows(src, self._pool.rows(src.key, src.slots), preserved)
             self._ensure_not_reassigned(
                 src.slots,
                 src.key,
                 req_id=src.req_id,
                 planned_version=src.reserved_version,
-                preserved_slots=src.preserved,
+                preserved_slots=preserved,
             )
             return joined
 
@@ -1833,14 +1842,14 @@ class OmniPrefixCacheManager:
             out[mask] = rows
             in_transit = mask if in_transit is None else in_transit | mask
         if out is not None:
-            out = self._apply_preserved_rows(src, out)
+            out = self._apply_preserved_rows(src, out, preserved)
         self._ensure_not_reassigned(
             src.slots,
             src.key,
             in_transit_mask=in_transit,
             req_id=src.req_id,
             planned_version=src.reserved_version,
-            preserved_slots=src.preserved,
+            preserved_slots=preserved,
         )
         if out is None:
             _raise_unreadable_hit(src.req_id, src.key, "no source")
