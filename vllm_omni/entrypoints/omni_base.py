@@ -671,6 +671,14 @@ class OmniBase(PDDisaggregationMixin):
                             _m.image_time_to_first_output_ms / 1000.0,
                         )
 
+            # Merge the diffusion scheduler's admission delay with the
+            # orchestrator queue wait. The two queues are traversed
+            # sequentially, so serialized models otherwise hide almost all
+            # of their waiting time in stage generation latency.
+            queue_wait_s = extract_queue_wait_s(_m.pipeline_timings, _m.diffusion_metrics)
+            if queue_wait_s is not None:
+                stage_durations["queue_wait_ms"] = queue_wait_s * 1000.0
+
         if not stage_meta.final_output:
             return None
 
@@ -703,7 +711,10 @@ class OmniBase(PDDisaggregationMixin):
                     _gen_tok += int(evt.num_tokens_out)
                 self.prom_metrics.observe_tokens(_prompt_tok, _gen_tok)
 
-                queue_wait_s = extract_queue_wait_s(_m.pipeline_timings if _m is not None else None)
+                queue_wait_s = extract_queue_wait_s(
+                    _m.pipeline_timings if _m is not None else None,
+                    _m.diffusion_metrics if _m is not None else None,
+                )
                 if queue_wait_s is not None:
                     self.prom_metrics.observe_queue_wait(queue_wait_s)
 
