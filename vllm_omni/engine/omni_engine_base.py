@@ -761,6 +761,7 @@ class OmniEngineBase:
             "enable_cpu_offload": kwargs.get("enable_cpu_offload", False),
             "enable_layerwise_offload": kwargs.get("enable_layerwise_offload", False),
             "enable_distributed_layerwise_offload": kwargs.get("enable_distributed_layerwise_offload", False),
+            "offload_text_encoder": kwargs.get("offload_text_encoder", False),
             "dlo_use_allgather": kwargs.get("dlo_use_allgather", True),
             "dlo_resident_layers": kwargs.get("dlo_resident_layers", 0),
             "host_weight_runtime_mode": kwargs.get("host_weight_runtime_mode", "disabled"),
