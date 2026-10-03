@@ -466,6 +466,9 @@ class MiniCPMO45Code2Wav(nn.Module):
             # Slot-pool ragged solves keep each row's cache offset, so a
             # stream's second chunk and steady ones share one replay.
             "row_offset_merge": extra.get("cfm_row_offset_merge", False) is True,
+            # Fuse the estimator-input cat/transpose and the CFG Euler step
+            # (``whole_euler_ops.py``). Default off; same values as eager.
+            "fused_euler_step": extra.get("cfm_fused_euler_step", False) is True,
         }
         # Exact-shape CUDA graphs of the flow encoder's continuation chunk
         # (``cfm_encoder_cuda_graph``, default off; ``FlowEncoderGraphs``):
@@ -1417,12 +1420,6 @@ class MiniCPMO45Code2Wav(nn.Module):
             # Token2wav contains fp32-only S3Tokenizer/HiFT modules, so build
             # its independent assets in their native precision.
             torch.set_default_dtype(torch.float32)
-            # Connector extra ``token2wav_s3tokenizer_device`` (default unset:
-            # same device as the vocoder). "cpu" frees ~472 MiB of fp32
-            # S3Tokenizer weights; it only runs when a new reference voice is
-            # prepared (startup default prompt, runtime ``ref`` audio misses).
-            tokenizer_device = extra.get("token2wav_s3tokenizer_device")
-            tokenizer_kwargs = {"audio_tokenizer_device": str(tokenizer_device)} if tokenizer_device else {}
             token2wav = Token2wav(
                 str(token2wav_path),
                 float16=use_float16,
@@ -1430,7 +1427,6 @@ class MiniCPMO45Code2Wav(nn.Module):
                 # The batched backend builds its estimator caches itself and
                 # never runs the upstream chunk path that owns these buffers.
                 drop_upstream_chunk_att_buffers=extra.get("cfm_drop_upstream_att_buffer", False) is True,
-                **tokenizer_kwargs,
             )
         finally:
             torch.set_default_dtype(previous_dtype)

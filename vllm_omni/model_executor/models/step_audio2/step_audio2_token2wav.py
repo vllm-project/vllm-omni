@@ -143,7 +143,6 @@ class StepAudio2Token2WavCore(nn.Module):
         device: str = "cuda",
         n_timesteps: int = DEFAULT_TOKEN2WAV_CONFIG.n_timesteps,
         drop_upstream_chunk_att_buffers: bool = False,
-        audio_tokenizer_device: str | None = None,
     ):
         super().__init__()
         self.model_path = model_path
@@ -154,10 +153,6 @@ class StepAudio2Token2WavCore(nn.Module):
         self.float16 = float16
         self.device = torch.device(device)
         self.n_timesteps = n_timesteps
-        # S3Tokenizer only runs in ``_prepare_prompt`` (once per new reference
-        # voice). ``None`` keeps it on ``device``; "cpu" keeps its fp32 weights
-        # (~472 MiB) off the accelerator at the cost of a CPU quantize.
-        self.audio_tokenizer_device = torch.device(audio_tokenizer_device) if audio_tokenizer_device else self.device
 
         self._models_loaded = False
         self._audio_tokenizer = None
@@ -200,9 +195,7 @@ class StepAudio2Token2WavCore(nn.Module):
         logger.info(f"Loading Token2Wav models from: {self.model_path}")
 
         self._audio_tokenizer = (
-            s3tokenizer.load_model(f"{self.model_path}/speech_tokenizer_v2_25hz.onnx")
-            .to(self.audio_tokenizer_device)
-            .eval()
+            s3tokenizer.load_model(f"{self.model_path}/speech_tokenizer_v2_25hz.onnx").to(self.device).eval()
         )
 
         option = onnxruntime.SessionOptions()
@@ -295,11 +288,8 @@ class StepAudio2Token2WavCore(nn.Module):
         mels = s3tokenizer.log_mel_spectrogram(audio)
         mels, mels_lens = s3tokenizer.padding([mels])
         prompt_speech_tokens, prompt_speech_tokens_lens = self.audio_tokenizer.quantize(
-            mels.to(self.audio_tokenizer_device), mels_lens.to(self.audio_tokenizer_device)
+            mels.to(self.device), mels_lens.to(self.device)
         )
-        if self.audio_tokenizer_device != self.device:
-            prompt_speech_tokens = prompt_speech_tokens.to(self.device)
-            prompt_speech_tokens_lens = prompt_speech_tokens_lens.to(self.device)
 
         spk_feat = kaldi.fbank(audio.unsqueeze(0), num_mel_bins=80, dither=0, sample_frequency=16000)
         spk_feat = spk_feat - spk_feat.mean(dim=0, keepdim=True)

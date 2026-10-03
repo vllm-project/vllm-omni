@@ -534,12 +534,13 @@ class BatchedToken2Wav(nn.Module):
                         arena_rows_from_graph_grid=bool(cfm_graph_cfg.get("arena_rows_from_graph_grid", False)),
                         row_offsets=self._row_offset_merge,
                         graph_grid=cfm_graph_cfg.get("graph_grid") or cfm_graph_cfg.get("graph_batch_sizes"),
+                        fused_euler_step=bool(cfm_graph_cfg.get("fused_euler_step", False)),
                     )
                     logger.info(
                         "Whole-Euler CFM CUDA Graph enabled "
                         "(max_graphs=%d, max_serial_batch=%d, max_graph_batch=%s, "
                         "micro_batch_size=%d, arena_rows=%d, query_bucket_frames=%s, offset_bucket_frames=%d, "
-                        "fused_body=%s)",
+                        "fused_body=%s, fused_euler_step=%s)",
                         max_graphs,
                         max_serial_batch,
                         str(max_graph_batch),
@@ -548,6 +549,7 @@ class BatchedToken2Wav(nn.Module):
                         str(query_bucket_frames),
                         self._whole_euler_graph_wrapper.offset_bucket_frames,
                         self._ragged_fused_body,
+                        self._whole_euler_graph_wrapper.fused_euler_step,
                     )
                 elif enable_whole_euler:
                     logger.info("Whole-Euler CFM CUDA Graph disabled because TensorRT stepper is configured")

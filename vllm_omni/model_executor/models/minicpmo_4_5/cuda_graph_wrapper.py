@@ -14,6 +14,11 @@ from torch.cuda import CUDAGraph
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 
+from vllm_omni.model_executor.models.minicpmo_4_5.whole_euler_ops import (
+    euler_cfg_step,
+    fused_euler_supported,
+    stage_estimator_input,
+)
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.utils.device_copy import index_to_device, to_device_nonblocking
 
@@ -1229,6 +1234,7 @@ class WholeEulerCFMGraphWrapper:
         arena_rows_from_graph_grid: bool = False,
         row_offsets: bool = False,
         graph_grid: str | Sequence[int] | None = None,
+        fused_euler_step: bool = False,
     ) -> None:
         """``ragged_body(estimator, input, t_emb, mask, cnn, att, cnn_out, att_out, lengths)``
         replaces ``estimator.blocks_forward_chunk`` in the captured solve when
@@ -1249,8 +1255,13 @@ class WholeEulerCFMGraphWrapper:
         lets such a replay take per-request caches of different lengths (a
         stream's second chunk next to steady ones): each row attends its own
         slot frames, so one graph solves them all.
+
+        ``fused_euler_step`` stages the estimator input once per solve and
+        runs each step's CFG combination and update as one pass that also
+        writes the next step's input (``whole_euler_ops.py``; same values).
         """
         self.estimator = estimator
+        self.fused_euler_step = bool(fused_euler_step)
         self.ragged_body = ragged_body
         self.modulation_fn = modulation_fn if ragged_body is not None else None
         self.n_timesteps = int(n_timesteps)
@@ -1364,15 +1375,26 @@ class WholeEulerCFMGraphWrapper:
     ) -> torch.Tensor:
         cur_x = statics.x
         width = int(statics.mu_cfg.shape[2])
-        speaker_features = statics.speakers_cfg.unsqueeze(-1).expand(-1, -1, width)
         # A slot-pool graph attends to the pool in place: no cache goes in.
         slotted = statics.slot_rows is not None
         no_cache = [None] * len(self.estimator.blocks)
+        fused_step = self.fused_euler_step and fused_euler_supported(cur_x)
+        if fused_step:
+            # Frames-major estimator input, staged once; each fused step rewrites only x.
+            in_channels = sum(int(t.shape[1]) for t in (cur_x, statics.mu_cfg, statics.speakers_cfg, statics.cond_cfg))
+            staged = cur_x.new_empty((2 * batch_size, width, in_channels))
+            stage_estimator_input(staged, cur_x, statics.mu_cfg, statics.speakers_cfg, statics.cond_cfg)
+            # Out of place: padded rows of ``statics.x`` keep their values across replays.
+            next_x = torch.empty_like(cur_x)
 
         for step in range(self.n_timesteps):
             dt = self.dt_steps[step]
-            x_cfg = torch.cat((cur_x, cur_x), dim=0)
-            estimator_input = torch.cat((x_cfg, statics.mu_cfg, speaker_features, statics.cond_cfg), dim=1)
+            if fused_step:
+                estimator_input = staged.transpose(1, 2)
+            else:
+                x_cfg = torch.cat((cur_x, cur_x), dim=0)
+                speaker_features = statics.speakers_cfg.unsqueeze(-1).expand(-1, -1, width)
+                estimator_input = torch.cat((x_cfg, statics.mu_cfg, speaker_features, statics.cond_cfg), dim=1)
             args = (
                 estimator_input,
                 statics.time_embeddings[step],
@@ -1393,7 +1415,18 @@ class WholeEulerCFMGraphWrapper:
             else:
                 estimate = self.estimator.blocks_forward_chunk(*args)
 
-            cur_x = _euler_step(cur_x, estimate, dt, self.inference_cfg_rate, batch_size)
+            if fused_step:
+                last = step + 1 == self.n_timesteps
+                cur_x = euler_cfg_step(
+                    next_x,
+                    cur_x,
+                    estimate,
+                    dt,
+                    self.inference_cfg_rate,
+                    None if last else staged,
+                )
+            else:
+                cur_x = _euler_step(cur_x, estimate, dt, self.inference_cfg_rate, batch_size)
 
         return cur_x
 

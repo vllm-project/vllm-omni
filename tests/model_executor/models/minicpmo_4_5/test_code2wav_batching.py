@@ -198,15 +198,18 @@ def test_stage2_memory_switches_are_opt_in():
         {
             "cfm_prompt_att_sharing": True,
             "cfm_arena_rows_from_graph_grid": True,
+            "cfm_fused_euler_step": True,
         }
     )
     model = MiniCPMO45Code2Wav(vllm_config=config)
     assert model._cfm_graph_config["prompt_att_sharing"] is True
     assert model._cfm_graph_config["arena_rows_from_graph_grid"] is True
+    assert model._cfm_graph_config["fused_euler_step"] is True
 
     default = MiniCPMO45Code2Wav(vllm_config=_config())
     assert default._cfm_graph_config["prompt_att_sharing"] is False
     assert default._cfm_graph_config["arena_rows_from_graph_grid"] is False
+    assert default._cfm_graph_config["fused_euler_step"] is False
 
 
 @pytest.mark.parametrize("enabled", [False, True])

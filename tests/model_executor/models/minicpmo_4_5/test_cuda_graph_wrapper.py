@@ -809,15 +809,19 @@ def _eager_solve_euler(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("fused_euler_step", [False, True])
 def test_whole_euler_graph_replay_matches_eager_for_uncached_and_cached_shapes(
     monkeypatch: pytest.MonkeyPatch,
+    fused_euler_step: bool,
 ) -> None:
     pool = torch.cuda.graph_pool_handle()
     monkeypatch.setattr(current_platform, "get_global_graph_pool", lambda: pool)
 
     torch.manual_seed(0)
     estimator = _WholeEulerDiT().eval().cuda()
-    wrapper = WholeEulerCFMGraphWrapper(estimator=estimator, n_timesteps=10, max_graphs=32)
+    wrapper = WholeEulerCFMGraphWrapper(
+        estimator=estimator, n_timesteps=10, max_graphs=32, fused_euler_step=fused_euler_step
+    )
 
     batch_size = 2
     chunk_size = 10
