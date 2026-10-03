@@ -807,6 +807,7 @@ class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
                 ar_image_hidden_states=ar_image_embeds,
                 ar_image_attention_mask=ar_image_attention_mask,
                 freqs_cis=self.gen_freqs_cis,
+                teacache_branch="positive",
             )
             run_uncond = (any_active_per_step is not None and any_active_per_step[i]) if needs_uncond else False
             if requires_paired_cfg and negative_prompt_embeds is not None:
@@ -819,6 +820,7 @@ class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
                     text_attention_mask=negative_prompt_attention_mask,
                     ref_image_hidden_states=None,
                     freqs_cis=self.gen_freqs_cis,
+                    teacache_branch="negative",
                 )
                 # Fused CFG blend: torch.lerp fuses (uncond + scale * (cond - uncond)) into 1 kernel
                 blended = torch.lerp(model_pred_uncond, model_pred, scale_vec)
