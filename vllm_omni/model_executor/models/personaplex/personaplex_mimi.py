@@ -52,15 +52,7 @@ _GRAPH_STREAMS: dict[int, torch.cuda.Stream] = {}
 
 
 def graph_stream() -> torch.cuda.Stream:
-    """The one side stream every PersonaPlex CUDA graph of the current device warms up and is captured on.
-
-    The caching allocator reuses a freed block only for the stream that allocated it, and cuBLAS keeps a
-    workspace (32 MiB on sm90) for every stream that ran a matmul, for the life of the process. A new
-    stream per capture left each warmup's temporaries in segments that no later allocation could reuse,
-    and a workspace allocated among them kept ``empty_cache`` from releasing them. On one stream the
-    warmups reuse the same segments, and its workspace is created here, before any temporary, in a
-    segment of its own; the captured graphs replay with it.
-    """
+    """One capture stream per device so warmup allocations and the cuBLAS workspace share a segment."""
     device = torch.accelerator.current_device_index()
     stream = _GRAPH_STREAMS.get(device)
     if stream is None:

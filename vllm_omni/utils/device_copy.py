@@ -38,10 +38,10 @@ def index_to_device(values: Sequence[int], device: torch.device | str, dtype: to
 class HostCopyBatch:
     """Device-to-host copies of one step's outputs behind one host wait.
 
-    Like ``_HostCopyBatch`` of the generation runner (#8184), but :meth:`wait`
-    waits on an event recorded after the copies, not on the whole stream, and
-    is free when a later sync already covered them. Off CUDA, or without
-    pinned memory, :meth:`copy` is the blocking ``tensor.to("cpu")``.
+    ``wait`` waits on an event recorded after the copies, and is free when a
+    later sync already covered them. Off CUDA, or without pinned memory,
+    :meth:`copy` is the blocking ``tensor.to("cpu")``. A contiguous host tensor
+    passes through.
     """
 
     def __init__(self, pin_memory: bool) -> None:
@@ -49,6 +49,8 @@ class HostCopyBatch:
         self._event: torch.cuda.Event | None = None
 
     def copy(self, tensor: torch.Tensor) -> torch.Tensor:
+        if tensor.device.type == "cpu" and not tensor.requires_grad and tensor.is_contiguous():
+            return tensor
         tensor = tensor.detach()
         if tensor.device.type != "cuda" or not self._pin_memory:
             return tensor.to("cpu").contiguous()

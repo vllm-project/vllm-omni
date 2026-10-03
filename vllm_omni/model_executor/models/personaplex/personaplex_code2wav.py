@@ -40,6 +40,7 @@ from vllm.forward_context import get_forward_context, is_forward_context_availab
 from vllm.logger import init_logger
 
 from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.utils.device_copy import HostCopyBatch
 
 logger = init_logger(__name__)
 
@@ -132,7 +133,6 @@ class PersonaPlexCode2Wav(nn.Module):
         self._mimi_device: torch.device | None = None
         self._request_rows: dict[str, int] = {}
         self._consumed_full_payload_requests: set[str] = set()
-        self._pcm_copied: torch.cuda.Event | None = None
 
     # ------------------------------------------------------------------
     # Runner-facing no-op / placeholder hooks (mirror Qwen3TTSCode2Wav).
@@ -387,18 +387,11 @@ class PersonaPlexCode2Wav(nn.Module):
         return wav.reshape(-1).split((frames * wav.shape[1]).tolist())
 
     def _pcm_to_host(self, pcm: torch.Tensor) -> torch.Tensor:
-        """``pcm.to("cpu", float32)`` into pinned memory, waited on a blocking-sync event.
-
-        A pageable copy would spin-wait a core in the driver for the whole decode.
-        """
-        if pcm.device.type != "cuda":
-            return pcm.to(device="cpu", dtype=torch.float32)
-        host = torch.empty(pcm.shape, dtype=torch.float32, pin_memory=True)
-        host.copy_(pcm, non_blocking=True)
-        if self._pcm_copied is None:
-            self._pcm_copied = torch.cuda.Event(blocking=True)
-        self._pcm_copied.record(torch.cuda.current_stream(pcm.device))
-        self._pcm_copied.synchronize()
+        copies = HostCopyBatch(pcm.device.type == "cuda")
+        if pcm.dtype != torch.float32:
+            pcm = pcm.to(dtype=torch.float32)
+        host = copies.copy(pcm)
+        copies.wait()
         return host
 
     @staticmethod

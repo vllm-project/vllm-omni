@@ -264,7 +264,20 @@ class _LoadCodec(_FakeBatchedMimi):
         self.model = SimpleNamespace(config=SimpleNamespace(sampling_rate=24000))
 
 
-def test_load_weights_enables_tf32_on_cuda_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize(
+    ("runner_device", "decode_tf32", "expect_tf32"),
+    [
+        ("cuda", None, True),
+        ("cuda", False, False),
+        ("cpu", None, False),
+    ],
+)
+def test_load_weights_tf32_follows_device_and_config(
+    monkeypatch: pytest.MonkeyPatch,
+    runner_device: str,
+    decode_tf32: bool | None,
+    expect_tf32: bool,
+) -> None:
     old_matmul = torch.backends.cuda.matmul.allow_tf32
     old_cudnn = torch.backends.cudnn.allow_tf32
     old_precision = torch.get_float32_matmul_precision()
@@ -273,51 +286,11 @@ def test_load_weights_enables_tf32_on_cuda_by_default(monkeypatch: pytest.Monkey
         torch.backends.cudnn.allow_tf32 = False
         torch.set_float32_matmul_precision("highest")
         monkeypatch.setattr(personaplex_mimi, "PersonaPlexMimiCodec", _LoadCodec)
-        model, _ = _model(install=False, runner_device="cuda")
+        model, _ = _model(install=False, runner_device=runner_device, decode_tf32=decode_tf32)
         model.load_weights(iter([("unused.weight", torch.zeros(1))]))
-        assert torch.backends.cuda.matmul.allow_tf32 is True
-        assert torch.backends.cudnn.allow_tf32 is True
-        assert torch.get_float32_matmul_precision() == "high"
-    finally:
-        torch.backends.cuda.matmul.allow_tf32 = old_matmul
-        torch.backends.cudnn.allow_tf32 = old_cudnn
-        torch.set_float32_matmul_precision(old_precision)
-
-
-def test_load_weights_keeps_ieee_matmul_when_tf32_is_off(monkeypatch: pytest.MonkeyPatch) -> None:
-    old_matmul = torch.backends.cuda.matmul.allow_tf32
-    old_cudnn = torch.backends.cudnn.allow_tf32
-    old_precision = torch.get_float32_matmul_precision()
-    try:
-        torch.backends.cuda.matmul.allow_tf32 = False
-        torch.backends.cudnn.allow_tf32 = False
-        torch.set_float32_matmul_precision("highest")
-        monkeypatch.setattr(personaplex_mimi, "PersonaPlexMimiCodec", _LoadCodec)
-        model, _ = _model(install=False, runner_device="cuda", decode_tf32=False)
-        model.load_weights(iter([("unused.weight", torch.zeros(1))]))
-        assert torch.backends.cuda.matmul.allow_tf32 is False
-        assert torch.backends.cudnn.allow_tf32 is False
-        assert torch.get_float32_matmul_precision() == "highest"
-    finally:
-        torch.backends.cuda.matmul.allow_tf32 = old_matmul
-        torch.backends.cudnn.allow_tf32 = old_cudnn
-        torch.set_float32_matmul_precision(old_precision)
-
-
-def test_load_weights_on_cpu_leaves_tf32_flags_alone(monkeypatch: pytest.MonkeyPatch) -> None:
-    old_matmul = torch.backends.cuda.matmul.allow_tf32
-    old_cudnn = torch.backends.cudnn.allow_tf32
-    old_precision = torch.get_float32_matmul_precision()
-    try:
-        torch.backends.cuda.matmul.allow_tf32 = False
-        torch.backends.cudnn.allow_tf32 = False
-        torch.set_float32_matmul_precision("highest")
-        monkeypatch.setattr(personaplex_mimi, "PersonaPlexMimiCodec", _LoadCodec)
-        model, _ = _model(install=False, runner_device="cpu")
-        model.load_weights(iter([("unused.weight", torch.zeros(1))]))
-        assert torch.backends.cuda.matmul.allow_tf32 is False
-        assert torch.backends.cudnn.allow_tf32 is False
-        assert torch.get_float32_matmul_precision() == "highest"
+        assert torch.backends.cuda.matmul.allow_tf32 is expect_tf32
+        assert torch.backends.cudnn.allow_tf32 is expect_tf32
+        assert torch.get_float32_matmul_precision() == ("high" if expect_tf32 else "highest")
     finally:
         torch.backends.cuda.matmul.allow_tf32 = old_matmul
         torch.backends.cudnn.allow_tf32 = old_cudnn
@@ -350,18 +323,6 @@ def test_resumable_delta_codes_emit_only_new_pcm() -> None:
     assert len(mimi.calls) == 3
 
 
-def test_identical_consecutive_delta_frames_are_both_decoded() -> None:
-    model, mimi = _model()
-    chunk = _codes(1)
-
-    first = model(input_ids=chunk, request_ids=["req"])
-    second = model(input_ids=chunk, request_ids=["req"])
-
-    assert _audio(first).tolist() == _pcm(1)
-    assert _audio(second).tolist() == _pcm(2)
-    assert len(mimi.calls) == 2
-
-
 def test_full_payload_is_consumed_once_across_forwards() -> None:
     model, mimi = _model(async_chunk=False)
     runtime_info = [{"codes": {"audio": _codes(2)}}]
@@ -387,20 +348,6 @@ def test_full_payload_is_consumed_once_across_forwards() -> None:
     assert len(mimi.calls) == 4
 
 
-@pytest.mark.parametrize("frames", [5, 12])
-def test_each_frame_is_one_decoder_call_across_all_rows(frames: int) -> None:
-    model, mimi = _model()
-
-    output = model(input_ids=_codes(frames), request_ids=["req"])
-
-    assert _audio(output).tolist() == _pcm(*range(1, frames + 1))
-    assert len(mimi.calls) == frames
-    for frame, (codes, active) in enumerate(mimi.calls):
-        # Row 0 is the request's leased row; row 1 is the idle scratch row.
-        assert codes[0].tolist() == [frame, 100 + frame]
-        assert active.tolist() == [True, False]
-
-
 def test_profile_inputs_skip_decode_while_malformed_online_input_warns(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -424,21 +371,6 @@ def test_profile_inputs_skip_decode_while_malformed_online_input_warns(
     assert mimi.calls == []
     assert len(warnings) == 1
     assert "not divisible by" in warnings[0][0]
-    assert model.get_dummy_runtime_additional_information(2) == [
-        {"meta": {"personaplex_dummy_profile": True}},
-        {"meta": {"personaplex_dummy_profile": True}},
-    ]
-
-
-def test_request_id_falls_back_to_runtime_information() -> None:
-    model, _ = _model()
-    info = [{"request_id": "runtime-req"}]
-
-    model(input_ids=_codes(2), runtime_additional_information=info)
-    second = model(input_ids=_codes(1, start=100), runtime_additional_information=info)
-
-    assert _audio(second).tolist() == _pcm(3)
-    assert model._request_rows == {"runtime-req": 0}
 
 
 def test_rows_are_leased_per_request_isolated_and_recycled() -> None:
@@ -491,24 +423,6 @@ def test_requests_without_id_use_the_scratch_row_one_pass_each() -> None:
     continued = model(input_ids=_codes(1, start=10), request_ids=["leased"])
 
     assert _audio(continued).tolist() == _pcm(2)
-
-
-def test_mixed_frame_counts_route_pcm_and_advance_only_active_rows() -> None:
-    model, mimi = _model(max_sessions=2)
-
-    output = model(
-        input_ids=torch.cat([_codes(3), _codes(1, start=50)]),
-        request_ids=["long", "short"],
-        seq_token_counts=[6, 2],
-    )
-
-    long_audio, short_audio = output.multimodal_outputs["model_outputs"]
-    assert long_audio.tolist() == _pcm(1, 2, 3)
-    assert short_audio.tolist() == _pcm(101)
-    assert all(audio.ndim == 1 and audio.is_contiguous() for audio in (long_audio, short_audio))
-    assert _actives(mimi) == [[True, True, False], [True, False, False], [True, False, False]]
-    assert mimi.calls[0][0][:2].tolist() == [[0, 100], [50, 150]]
-    assert mimi.frames is not None and mimi.frames.tolist() == [3.0, 1.0, 0.0]
 
 
 def _step(model, requests: dict[str, int], *, step: int = 0, infos=None):

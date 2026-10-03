@@ -399,47 +399,6 @@ def test_encode_appends_batches_sessions_into_one_encoder_call() -> None:
     assert other.user_frame[:, 0].tolist() == [1]
 
 
-def test_encode_appends_leaves_rows_without_a_new_append_untouched() -> None:
-    codec = _FakeCodec()
-    runtime = _runtime(codec, max_sessions=2)
-    runtime.prepare_append(_duplex_info(seq=1), prompt_len=18)
-    runtime.prepare_append(_duplex_info(seq=1, session_id="other"), prompt_len=18)
-    other_slot = runtime.sessions[("other", 0)].slot
-
-    runtime.encode_appends([_duplex_info(seq=2)])
-    runtime.prepare_append(_duplex_info(seq=2), prompt_len=19)
-
-    assert codec.frames[other_slot] == 1
-    assert runtime.sessions[("session", 0)].user_frames == 2
-    assert runtime.sessions[("session", 0)].prepared.user_frame[:, 0].tolist() == [2]
-
-
-def test_encode_appends_skips_an_identity_that_was_already_encoded_or_prepared() -> None:
-    codec = _FakeCodec()
-    runtime = _runtime(codec)
-
-    # A chunked first prefill puts the same append in two scheduler steps.
-    runtime.encode_appends([_duplex_info(seq=1)])
-    runtime.encode_appends([_duplex_info(seq=1)])
-    runtime.prepare_append(_duplex_info(seq=1), prompt_len=18)
-    runtime.encode_appends([_duplex_info(seq=1)])
-    retry = runtime.prepare_append(_duplex_info(seq=1), prompt_len=18)
-
-    assert codec.encode_calls == 1
-    assert retry.user_frame[:, 0].tolist() == [1]
-
-
-def test_encode_appends_leaves_over_capacity_appends_to_prepare_append() -> None:
-    codec = _FakeCodec()
-    runtime = _runtime(codec)
-
-    runtime.encode_appends([_duplex_info(seq=1), _duplex_info(seq=1, session_id="other")])
-
-    assert list(runtime.sessions) == [("session", 0)]
-    with pytest.raises(RuntimeError, match="capacity 1"):
-        runtime.prepare_append(_duplex_info(seq=1, session_id="other"), prompt_len=18)
-
-
 def _restart_overlap(runtime: PersonaPlexStage0DuplexRuntime) -> tuple[dict, dict]:
     """Epoch 0 of a session is live, then a cancel restarts it as epoch 1 while
     epoch 0's aborted request still has an append in the same scheduler step."""

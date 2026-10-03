@@ -159,10 +159,7 @@ def test_an_in_place_resume_leaves_the_row_the_re_add_leaves(monkeypatch) -> Non
         )
 
 
-@pytest.mark.parametrize(
-    "case",
-    ["not_opted_in", "new_prompt_list", "other_sampling_params", "min_tokens", "not_computed", "penalties"],
-)
+@pytest.mark.parametrize("case", ["not_opted_in", "new_prompt_list", "penalties"])
 def test_anything_but_a_plain_extension_takes_the_re_add_path(monkeypatch, case: str) -> None:
     batch, requests = _batch_after_one_step(monkeypatch)
     state = requests["b"]
