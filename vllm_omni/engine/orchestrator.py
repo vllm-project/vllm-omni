@@ -751,7 +751,7 @@ class OrchestratorBase:
         stage_ids: list[int] = []
         for pool in target_pools:
             clear_sender = pool.stage_type != "diffusion" and (
-                method in ("reset_mm_cache", "sleep")
+                method in ("reset_mm_cache", "sleep", "release_kv_cache_memory")
                 or (method == "pause_scheduler" and kwargs.get("clear_cache", args[1] if len(args) > 1 else True))
             )
             for replica_id in pool.live_replica_ids():

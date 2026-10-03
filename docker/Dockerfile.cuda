@@ -1,4 +1,5 @@
-ARG BASE_IMAGE=vllm/vllm-openai:v0.30.0
+# Official vLLM v0.31.0 release image, before Docker Hub tag promotion.
+ARG BASE_IMAGE=public.ecr.aws/q9t5s3a7/vllm-release-repo:db9527a46873454610df6dbedf79a36d6bf1a7f6
 FROM ${BASE_IMAGE}
 
 ARG COMMON_WORKDIR=/app

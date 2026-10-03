@@ -18,6 +18,10 @@ from vllm_omni.data_entry_keys import (
 from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.inputs.data import OmniTokensPrompt
 from vllm_omni.model_executor.models.cosyvoice3.utils import unpad_prompt_conditioning
+from vllm_omni.outputs.output_modality import (
+    TensorAccumulationStrategy,
+    register_key_accumulation_strategy,
+)
 
 logger = init_logger(__name__)
 
@@ -288,11 +292,28 @@ def talker2code2wav_async_chunk(
 # keeps the orchestrator off the heavy-tensor path.
 # ============================================================================
 
-# All three embed tensors are emitted once at prefill and must REPLACE-not-
+# Prompt-conditioning fields are emitted once at prefill and must REPLACE-not-
 # CONCAT across the (already trivial) per-request accumulator history so a
 # regression where decode unexpectedly re-emits them does not silently
 # duplicate the prefill tensor.  See mixin._FULL_PAYLOAD_REPLACE_KEYS.
-_FULL_PAYLOAD_REPLACE_KEYS: frozenset[str] = frozenset({"embed.speech_token", "embed.speech_feat", "embed.embedding"})
+_FULL_PAYLOAD_REPLACE_KEYS: frozenset[str] = frozenset(
+    {
+        "embed.speech_token",
+        "embed.speech_feat",
+        "embed.speech_token_len",
+        "embed.embedding",
+    }
+)
+
+# The input conditioning snapshot remains in the request payload and the
+# talker also emits its padded snapshot. Both describe the same prompt;
+# concatenating them creates incompatible shapes before speech_token_len can
+# unpad the emitted value for code2wav.
+for _conditioning_key in _FULL_PAYLOAD_REPLACE_KEYS:
+    register_key_accumulation_strategy(
+        _conditioning_key,
+        TensorAccumulationStrategy.REPLACE,
+    )
 
 
 def text2flow_token_only(

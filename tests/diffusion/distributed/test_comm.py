@@ -14,6 +14,7 @@ from typing import Literal
 import pytest
 import torch
 
+from tests.helpers.distributed import configure_cpu_collective_worker, start_collective_workers
 from tests.helpers.mark import hardware_marks
 from vllm_omni.diffusion.distributed.comm import RingComm, SeqAllToAll4D, SeqAllToAll5D
 from vllm_omni.diffusion.distributed.parallel_state import (
@@ -56,6 +57,8 @@ def _init_worker(
             "MASTER_PORT": str(master_port),
         }
     )
+    if device_kind == "cpu":
+        configure_cpu_collective_worker()
     backend = "gloo" if device_kind == "cpu" else None
     init_distributed_environment(backend=backend)
 
@@ -227,6 +230,10 @@ def _run_ring_p2p(
             atol=atol,
             msg=f"[Rank {local_rank}] Ring P2P data mismatch",
         )
+        if device_kind == "cpu":
+            # P2P completion only synchronizes neighbors. Keep fast CPU ranks
+            # alive until every rank has finished constructing and using groups.
+            torch.distributed.barrier()
     finally:
         destroy_distributed_env()
 
@@ -243,7 +250,7 @@ def _spawn_4d_identity(
     device_kind: DeviceKind,
     master_port: int,
 ) -> None:
-    torch.multiprocessing.spawn(
+    start_collective_workers(
         _run_4d_identity,
         args=(
             world_size,
@@ -257,6 +264,7 @@ def _spawn_4d_identity(
             master_port,
         ),
         nprocs=world_size,
+        device_kind=device_kind,
     )
 
 
@@ -272,7 +280,7 @@ def _spawn_5d_identity(
     device_kind: DeviceKind,
     master_port: int,
 ) -> None:
-    torch.multiprocessing.spawn(
+    start_collective_workers(
         _run_5d_identity,
         args=(
             world_size,
@@ -286,6 +294,7 @@ def _spawn_5d_identity(
             master_port,
         ),
         nprocs=world_size,
+        device_kind=device_kind,
     )
 
 
@@ -299,10 +308,11 @@ def _spawn_ring_p2p(
     device_kind: DeviceKind,
     master_port: int,
 ) -> None:
-    torch.multiprocessing.spawn(
+    start_collective_workers(
         _run_ring_p2p,
         args=(world_size, dtype, batch_size, num_heads, head_size, device_kind, master_port),
         nprocs=world_size,
+        device_kind=device_kind,
     )
 
 
@@ -499,8 +509,9 @@ def _run_fused_qkv_matches_three_4d(
 @pytest.mark.cpu
 @pytest.mark.parametrize("world_size", [2, 4])
 def test_fused_qkv_all_to_all_matches_three_4d_exchanges_cpu(world_size: int) -> None:
-    torch.multiprocessing.spawn(
+    start_collective_workers(
         _run_fused_qkv_matches_three_4d,
         args=(world_size, "cpu", 29613),
         nprocs=world_size,
+        device_kind="cpu",
     )

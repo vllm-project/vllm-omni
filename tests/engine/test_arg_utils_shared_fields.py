@@ -8,6 +8,7 @@ from __future__ import annotations
 from dataclasses import fields
 
 import pytest
+from vllm.config import AuxOutputConfig
 
 from vllm_omni.engine.arg_utils import (
     SHARED_FIELDS,
@@ -49,3 +50,24 @@ def test_internal_blacklist_keys_derived_from_orchestrator():
     """
     blacklist = internal_blacklist_keys()
     assert blacklist == orchestrator_field_names() - SHARED_FIELDS
+
+
+@pytest.mark.parametrize(
+    "aux_args",
+    [
+        {"enable_return_routed_experts": True},
+        {"aux_output_config": {"enable_return_routed_experts": True}},
+        {"aux_output_config": AuxOutputConfig(enable_return_routed_experts=True)},
+    ],
+)
+@pytest.mark.parametrize("use_v2_model_runner", [False, True])
+def test_aux_outputs_require_the_actual_omni_stage_v2_runner(aux_args, use_v2_model_runner, monkeypatch):
+    # Upstream runner selection reads this environment variable; Omni workers
+    # select their runner from the separate per-stage flag instead.
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+    if use_v2_model_runner:
+        args = OmniEngineArgs(model="unused", use_v2_model_runner=True, **aux_args)
+        assert args.aux_output_config.enabled
+    else:
+        with pytest.raises(ValueError, match="use_v2_model_runner=True for this Omni stage"):
+            OmniEngineArgs(model="unused", **aux_args)

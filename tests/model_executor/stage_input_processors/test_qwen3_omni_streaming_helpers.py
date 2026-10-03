@@ -971,12 +971,40 @@ def test_cosyvoice3_text2flow_full_payload_nested_fallback() -> None:
 
 
 def test_cosyvoice3_full_payload_replace_keys_present() -> None:
-    """Confirm _FULL_PAYLOAD_REPLACE_KEYS lists the three embed.* keys."""
+    """Confirm all prompt-conditioning fields replace accumulated values."""
     from vllm_omni.model_executor.stage_input_processors.cosyvoice3 import (
         _FULL_PAYLOAD_REPLACE_KEYS,
     )
 
-    assert _FULL_PAYLOAD_REPLACE_KEYS == frozenset({"embed.speech_token", "embed.speech_feat", "embed.embedding"})
+    assert _FULL_PAYLOAD_REPLACE_KEYS == frozenset(
+        {
+            "embed.speech_token",
+            "embed.speech_feat",
+            "embed.speech_token_len",
+            "embed.embedding",
+        }
+    )
+
+
+def test_cosyvoice3_conditioning_replaces_snapshot_while_audio_accumulates() -> None:
+    from vllm_omni.model_executor.stage_input_processors.cosyvoice3 import _FULL_PAYLOAD_REPLACE_KEYS
+    from vllm_omni.outputs.mm_outputs import MultimodalPayload
+    from vllm_omni.outputs.output_modality import OutputModality
+
+    previous = {key: torch.ones(1, 174) for key in _FULL_PAYLOAD_REPLACE_KEYS}
+    padded = {key: torch.zeros(1, 1500) for key in _FULL_PAYLOAD_REPLACE_KEYS}
+    previous["embed.speech_token_len"] = torch.tensor([174])
+    padded["embed.speech_token_len"] = torch.tensor([174])
+    payload = MultimodalPayload.from_dict({**previous, "audio": torch.ones(2)})
+    incoming = MultimodalPayload.from_dict({**padded, "audio": torch.ones(3)})
+    assert payload is not None and incoming is not None
+
+    payload = payload.merged_with(incoming)
+    payload.consolidate_tensors(OutputModality.AUDIO)
+
+    for key in _FULL_PAYLOAD_REPLACE_KEYS:
+        assert torch.equal(payload[key], padded[key])
+    assert torch.equal(payload["audio"], torch.ones(5))
 
 
 def test_ming_flash_omni_thinker2talker_token_only_smoke() -> None:

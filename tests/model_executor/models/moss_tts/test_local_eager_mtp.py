@@ -132,10 +132,10 @@ def test_first_prefill_through_runner_preserves_parent_eager_contract(monkeypatc
         hidden_states=torch.zeros(2, 4),
         finished_req_ids=set(),
         ec_connector_output=None,
-        routed_experts=None,
     )
     runner._kv_extracted_req_ids = runner._last_aux_output = runner._last_multimodal_outputs = None
     runner.is_last_pp_rank, runner.pp_handler, runner.check_ep_fault = True, None, False
+    runner.aux_output_connector = None
     runner.model_config = SimpleNamespace(async_chunk=False)
     runner.vllm_config = SimpleNamespace(model_config=SimpleNamespace(engine_output_type="text"))
     runner.model_state, runner.model = state, model
@@ -154,7 +154,10 @@ def test_first_prefill_through_runner_preserves_parent_eager_contract(monkeypatc
             torch.zeros(1),
         )
     )
-    runner.prompt_logprobs_worker = SimpleNamespace(compute_prompt_logprobs=mocker.Mock(return_value={}))
+    runner.prompt_logprobs_worker = SimpleNamespace(
+        compute_prompt_logprobs=mocker.Mock(return_value={}),
+        compute_prompt_token_id_logprobs=mocker.Mock(return_value={}),
+    )
     runner.postprocess_sampled = mocker.Mock()
     runner.kv_connector = SimpleNamespace(post_forward=mocker.Mock(return_value=None))
     mock_out = SimpleNamespace(copy_event=None)

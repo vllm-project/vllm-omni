@@ -28,7 +28,7 @@ import pytest
 
 from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniServerParams
-from tests.helpers.stage_config import get_deploy_config_path
+from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
 
 pytestmark = [
     pytest.mark.advanced_model,
@@ -84,7 +84,12 @@ tts_server_params = [
     pytest.param(
         OmniServerParams(
             model=MODEL,
-            stage_config_path=get_deploy_config_path("moss_tts_realtime.yaml"),
+            stage_config_path=modify_stage_config(
+                get_deploy_config_path("moss_tts_realtime.yaml"),
+                # Leave room on the single L4 for the codec weights, reference
+                # encoder, and speech-serving activations in addition to KV.
+                updates={"stages": {0: {"gpu_memory_utilization": 0.35}}},
+            ),
             server_args=["--disable-log-stats"],
         ),
         id="moss_tts_realtime",
