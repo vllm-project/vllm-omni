@@ -84,8 +84,11 @@ class PersonaPlexStage0SessionState:
         if self.live_prepared is not None:
             input_ids, embed, frame, prompt_offset, info = self.live_prepared
             self._prepared = PersonaPlexStage0PreparedAppend(
-                input_ids=input_ids, inputs_embeds=_row(embed), user_frame=_row(frame),
-                info_update=_info_update(*info, first_append=False), prefill_applied=False,
+                input_ids=input_ids,
+                inputs_embeds=_row(embed),
+                user_frame=_row(frame),
+                info_update=_info_update(*info, first_append=False),
+                prefill_applied=False,
                 prompt_offset=prompt_offset,
             )
             self.live_prepared = None
@@ -119,8 +122,11 @@ def _info_update(
         "pplex_silence_codes": silence_cpu,
         "meta": {"pplex_frame": frame, "pplex_prefill_len": prefill_len},
         "duplex": {
-            "stage0_prepared": True, "prefill_applied": first_append,
-            "session_id": session_id, "epoch": epoch, "seq": seq,
+            "stage0_prepared": True,
+            "prefill_applied": first_append,
+            "session_id": session_id,
+            "epoch": epoch,
+            "seq": seq,
         },
     }
 
@@ -808,11 +814,15 @@ class PersonaPlexStage0DuplexRuntime:
         persona_tokens = tokenizer(wrap_with_system_tags(persona)) if persona else []
         prefill_tokens = torch.tensor(
             [ZERO_TEXT_TOKEN] * AUDIO_SILENCE_FRAME_CNT + persona_tokens + [ZERO_TEXT_TOKEN] * AUDIO_SILENCE_FRAME_CNT,
-            dtype=torch.long, device=device,
+            dtype=torch.long,
+            device=device,
         )
         with torch.no_grad():
             token_prefill = self.stage_model._build_prefill_embed(
-                prefill_tokens, 0, int(prefill_tokens.numel()), device,
+                prefill_tokens,
+                0,
+                int(prefill_tokens.numel()),
+                device,
                 torch.tensor(SILENCE_TOKENS, dtype=torch.long, device=device),
                 user_sine=torch.tensor(SINE_TOKENS, dtype=torch.long, device=device),
             )

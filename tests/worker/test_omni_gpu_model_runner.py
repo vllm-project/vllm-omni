@@ -1290,7 +1290,7 @@ class BatchFilledRowsModel:
     def __init__(self, filled, *, fills_rows=True):
         self.filled = set(filled)
         self.preprocess_batch_fills_rows = fills_rows
-        self.batch_kwargs = None
+        self.batch_kwargs: dict = {}
         self.calls = []
 
     def preprocess_batch(self, *, req_ids, model_intermediate_buffer, device, **layout):

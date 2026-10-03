@@ -1,15 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""CUDA graphs for the duplex depformer step of PersonaPlex Stage 0.
-
-The step (teacher-forcing gather, depformer, frame-state commit) is a few
-thousand small kernels. It replays from one graph per padded batch size: vLLM's
-cudagraph capture sizes up to ``max_num_seqs``. Padding rows read the neutral
-teacher-forcing row and commit to the runtime's scratch row, and every op is row
-independent. Without a graph for a bucket (off CUDA, capture failed, or under an
-outer capture) the same padded body runs eagerly; only batches above the largest
-bucket run eagerly at their own size.
-"""
+"""CUDA graphs for the duplex depformer step of PersonaPlex Stage 0."""
 
 from __future__ import annotations
 
@@ -37,15 +28,7 @@ def depformer_graph_buckets(capture_sizes: list[int] | None, max_num_seqs: int) 
 
 
 class PersonaPlexDepformerGraphs:
-    """Run the duplex depformer step, replayed from per-bucket CUDA graphs.
-
-    A step is: gather each row's teacher forcing from the runtime's slot buffers,
-    run ``depformer`` for ``num_steps`` inner steps, and commit each row's
-    effective agent frame and text token back to the slot buffers. The inputs
-    live in static buffers sized for the largest bucket; row ``i`` reads slot
-    ``read[i]`` and writes slot ``write[i]`` from
-    :meth:`PersonaPlexStage0DuplexRuntime.depformer_rows`.
-    """
+    """Run the duplex depformer step, replayed from per-bucket CUDA graphs."""
 
     def __init__(
         self,
@@ -136,20 +119,12 @@ class PersonaPlexDepformerGraphs:
         return self._text[:rows], self._hidden[:rows], self._slots[0, :rows], self._slots[1, :rows]
 
     def _step(
-        self,
-        text_tokens: torch.Tensor,
-        hidden: torch.Tensor,
-        read: torch.Tensor,
-        write: torch.Tensor,
+        self, text_tokens: torch.Tensor, hidden: torch.Tensor, read: torch.Tensor, write: torch.Tensor
     ) -> torch.Tensor:
         """The captured body: teacher-forcing gather, depformer, frame-state commit."""
         tokens, provided = self.runtime.teacher_forcing_rows(read)
         codes = self.depformer(
-            text_tokens,
-            hidden,
-            audio_tokens=tokens,
-            audio_provided=provided,
-            num_steps=self.num_steps,
+            text_tokens, hidden, audio_tokens=tokens, audio_provided=provided, num_steps=self.num_steps
         ).to(torch.long)
         self.runtime.commit_rows(write, text_tokens, codes, tokens, provided)
         return codes

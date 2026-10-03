@@ -13,17 +13,11 @@ from tests.model_executor.models.personaplex.duplex.test_stage0_runtime import (
 from tests.model_executor.models.personaplex.duplex.test_stage0_runtime import (
     _runtime as _make_runtime,
 )
-from vllm_omni.model_executor.models.personaplex.configuration_personaplex import (
-    PersonaPlexDepformerConfig,
-)
+from vllm_omni.model_executor.models.personaplex.configuration_personaplex import PersonaPlexDepformerConfig
 from vllm_omni.model_executor.models.personaplex.duplex.stage0 import PersonaPlexStage0DuplexRuntime
 from vllm_omni.model_executor.models.personaplex.personaplex_depformer import PersonaPlexDepformer
-from vllm_omni.model_executor.models.personaplex.personaplex_depformer_graph import (
-    PersonaPlexDepformerGraphs,
-)
-from vllm_omni.model_executor.models.personaplex.personaplex_talker import (
-    PersonaPlexTalkerForConditionalGeneration,
-)
+from vllm_omni.model_executor.models.personaplex.personaplex_depformer_graph import PersonaPlexDepformerGraphs
+from vllm_omni.model_executor.models.personaplex.personaplex_talker import PersonaPlexTalkerForConditionalGeneration
 
 pytestmark = pytest.mark.core_model
 
@@ -40,9 +34,15 @@ def _runtime(device: torch.device, max_sessions: int) -> PersonaPlexStage0Duplex
 def _depformer(device: torch.device, dtype: torch.dtype = torch.float32) -> PersonaPlexDepformer:
     torch.manual_seed(0)
     config = PersonaPlexDepformerConfig(
-        hidden_size=32, num_hidden_layers=2, num_attention_heads=4, head_dim=8,
-        num_key_value_heads=4, intermediate_size=48, dep_q=NUM_STEPS,
-        num_active_codebooks=NUM_STEPS, card=2048,
+        hidden_size=32,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        head_dim=8,
+        num_key_value_heads=4,
+        intermediate_size=48,
+        dep_q=NUM_STEPS,
+        num_active_codebooks=NUM_STEPS,
+        card=2048,
     )
     model = PersonaPlexDepformer(config, temporal_hidden_size=HIDDEN, text_card=100)
     for param in model.parameters():
@@ -52,8 +52,7 @@ def _depformer(device: torch.device, dtype: torch.dtype = torch.float32) -> Pers
 
 def _graphs(depformer, runtime, buckets, *, dtype=torch.float32) -> PersonaPlexDepformerGraphs:
     return PersonaPlexDepformerGraphs(
-        depformer, runtime, buckets=buckets, num_steps=NUM_STEPS,
-        hidden_size=HIDDEN, dtype=dtype, device=runtime.device,
+        depformer, runtime, buckets=buckets, num_steps=NUM_STEPS, hidden_size=HIDDEN, dtype=dtype, device=runtime.device
     )
 
 

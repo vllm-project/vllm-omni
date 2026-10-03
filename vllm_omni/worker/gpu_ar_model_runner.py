@@ -1571,7 +1571,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         else:
             copies = HostCopyBatch(is_pin_memory_available())
             host_codes = copies.copy(codes)
-            self._omni_post_sample_host_copies = copies
+            self._omni_post_sample_host_copies: HostCopyBatch | None = copies
         # Row views, stored as ``_update_intermediate_buffer`` would, without a copy per row.
         for idx, req_id, request_codes in zip(selected_indices, selected_req_ids, host_codes.split(1), strict=True):
             per_request_audio[idx] = request_codes

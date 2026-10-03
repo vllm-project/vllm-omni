@@ -1,10 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""A streaming session whose prompt only grew is resumed in its input-batch row.
-
-The in-place resume must leave the batch and the cached request state exactly
-as the upstream remove and re-add does, while writing only the new prompt tail.
-"""
+"""In-place resume for streaming sessions whose prompt only grew."""
 
 from types import SimpleNamespace
 
@@ -76,10 +72,16 @@ def _extend(state: CachedRequestState, new_tokens: list[int]) -> SimpleNamespace
     assert prompt is not None
     prompt.extend(new_tokens)
     return SimpleNamespace(
-        req_id=state.req_id, prompt_token_ids=prompt, mm_features=[],
-        sampling_params=_params(), pooling_params=None, prompt_embeds=None,
-        prompt_is_token_ids=None, block_ids=_blocks(len(prompt)),
-        num_computed_tokens=state.num_computed_tokens, lora_request=None,
+        req_id=state.req_id,
+        prompt_token_ids=prompt,
+        mm_features=[],
+        sampling_params=_params(),
+        pooling_params=None,
+        prompt_embeds=None,
+        prompt_is_token_ids=None,
+        block_ids=_blocks(len(prompt)),
+        num_computed_tokens=state.num_computed_tokens,
+        lora_request=None,
     )
 
 
@@ -122,7 +124,10 @@ def test_an_in_place_resume_leaves_the_row_the_re_add_leaves(monkeypatch) -> Non
         assert _row(resumed_batch, req_id) == _row(reference_batch, req_id)
         ours, theirs = resumed[req_id], reference[req_id]
         assert (ours.num_prompt_tokens, ours.num_computed_tokens, ours.output_token_ids, ours.block_ids) == (
-            theirs.num_prompt_tokens, theirs.num_computed_tokens, theirs.output_token_ids, theirs.block_ids
+            theirs.num_prompt_tokens,
+            theirs.num_computed_tokens,
+            theirs.output_token_ids,
+            theirs.block_ids,
         )
 
 

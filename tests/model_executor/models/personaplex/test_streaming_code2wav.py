@@ -7,13 +7,8 @@ import pytest
 import torch
 from torch import nn
 
-from vllm_omni.model_executor.models.personaplex import (
-    personaplex_code2wav,
-    personaplex_mimi,
-)
-from vllm_omni.model_executor.models.personaplex.personaplex_code2wav import (
-    PersonaPlexCode2Wav,
-)
+from vllm_omni.model_executor.models.personaplex import personaplex_code2wav, personaplex_mimi
+from vllm_omni.model_executor.models.personaplex.personaplex_code2wav import PersonaPlexCode2Wav
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -62,11 +57,7 @@ class _FakeMimiModel(nn.Module):
     def load_state_dict(self, _state_dict, strict: bool = True):
         assert not strict
         return SimpleNamespace(
-            missing_keys=[
-                "encoder_transformer.weight",
-                "decoder_transformer.weight",
-            ],
-            unexpected_keys=[],
+            missing_keys=["encoder_transformer.weight", "decoder_transformer.weight"], unexpected_keys=[]
         )
 
 
@@ -136,7 +127,12 @@ def test_mimi_full_stream_reset_reuses_all_state_storage_and_clears_offsets() ->
     conv_buffers = [s.prev if isinstance(s, personaplex_mimi._StreamConv1d) else s.partial for s in conv_states]
     transformers = [codec.encoder_transformer, codec.decoder_transformer]
     kv_states = [kv for t in transformers for kv in t._kv]
-    state_tensors = [*conv_buffers, *(kv.cache for kv in kv_states), *(kv.end_offset for kv in kv_states), *(t._offset for t in transformers)]
+    state_tensors = [
+        *conv_buffers,
+        *(kv.cache for kv in kv_states),
+        *(kv.end_offset for kv in kv_states),
+        *(t._offset for t in transformers),
+    ]
     for tensor in state_tensors:
         tensor.fill_(1)
     storage = [t.data_ptr() for t in state_tensors]
@@ -162,7 +158,7 @@ def _model(
         config.mimi_decode_tf32 = decode_tf32
     vllm_config = SimpleNamespace(
         model_config=SimpleNamespace(
-            model="/unused", hf_config=config, duplex_max_sessions=max_sessions, async_chunk=async_chunk,
+            model="/unused", hf_config=config, duplex_max_sessions=max_sessions, async_chunk=async_chunk
         ),
         device_config=SimpleNamespace(device=runner_device),
     )

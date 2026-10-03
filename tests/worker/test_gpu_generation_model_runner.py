@@ -181,11 +181,13 @@ def test_execute_model_zero_tokens_kv_connector_no_forward(monkeypatch):
     monkeypatch.setattr(gen_runner_module, "has_kv_transfer_group", lambda: True)
     runner = _make_guard_runner()
     sentinel = object()
-    calls = []
-    runner.kv_connector_no_forward = lambda scheduler_output, vllm_config: (
-        calls.append(scheduler_output),
-        sentinel,
-    )[1]
+    calls: list[object] = []
+
+    def _no_forward(scheduler_output, vllm_config):
+        calls.append(scheduler_output)
+        return sentinel
+
+    runner.kv_connector_no_forward = _no_forward
     runner.vllm_config = object()
 
     output = GPUGenerationModelRunner.execute_model(runner, _StubSchedulerOutput(0))

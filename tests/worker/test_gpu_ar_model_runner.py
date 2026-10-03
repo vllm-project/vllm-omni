@@ -49,8 +49,8 @@ def _make_runner(engine_output_type: str | None, downstream_req_ids: set[str]) -
     return runner
 
 
-def _mtp_runner(*, async_scheduling: bool, buffers: dict[str, dict]) -> tuple[GPUARModelRunner, dict[str, object]]:
-    received: dict[str, object] = {}
+def _mtp_runner(*, async_scheduling: bool, buffers: dict[str, dict]) -> tuple[GPUARModelRunner, dict[str, Any]]:
+    received: dict[str, Any] = {}
 
     def post_sample_talker_mtp(*, input_ids, hidden_states, req_ids, req_infos):
         received.update(

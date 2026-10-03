@@ -631,9 +631,7 @@ def test_talker_batch_preprocess_writes_the_rows() -> None:
     for s in sessions:
         runtime.prepare_append(_duplex_info(seq=1, session_id=s), prompt_len=18, request_id=s)
     runtime.record_samples(
-        request_ids=sessions,
-        text_tokens=torch.arange(4) + 5,
-        agent_codes=torch.zeros((4, 8), dtype=torch.long),
+        request_ids=sessions, text_tokens=torch.arange(4) + 5, agent_codes=torch.zeros((4, 8), dtype=torch.long)
     )
 
     talker = PersonaPlexTalkerForConditionalGeneration.__new__(PersonaPlexTalkerForConditionalGeneration)

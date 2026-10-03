@@ -9,9 +9,7 @@ import torch.nn as nn
 from transformers import MimiConfig
 from transformers.models.mimi.modeling_mimi import MimiSplitResidualVectorQuantizer
 
-from vllm_omni.model_executor.models.personaplex.duplex.stage0 import (
-    PersonaPlexStage0DuplexRuntime,
-)
+from vllm_omni.model_executor.models.personaplex.duplex.stage0 import PersonaPlexStage0DuplexRuntime
 from vllm_omni.model_executor.models.personaplex.personaplex_mimi import (
     FRAME_SIZE,
     PersonaPlexMimiCodec,
@@ -27,8 +25,12 @@ CUDA_DEVICE = torch.device("cuda")
 DIM = 16
 CARD = 32
 ACTIVE_SCHEDULE = [
-    (True, True, True), (True, False, True), (False, False, False),
-    (False, True, True), (True, True, False), (True, True, True),
+    (True, True, True),
+    (True, False, True),
+    (False, False, False),
+    (False, True, True),
+    (True, True, False),
+    (True, True, True),
 ]
 
 
@@ -41,8 +43,11 @@ class _ArgmaxQuantizer(MimiSplitResidualVectorQuantizer):
 
     def __init__(self, dim: int, card: int = CARD, codebooks: int = 8) -> None:
         config = MimiConfig(
-            hidden_size=dim, codebook_size=card, codebook_dim=8,
-            vector_quantization_hidden_dimension=8, num_quantizers=codebooks,
+            hidden_size=dim,
+            codebook_size=card,
+            codebook_dim=8,
+            vector_quantization_hidden_dimension=8,
+            num_quantizers=codebooks,
         )
         super().__init__(config)
         self.proj = nn.Parameter(torch.randn(codebooks, card, dim))
@@ -70,18 +75,26 @@ def _make_small_codec(device: torch.device, batch_size: int, **halves: bool) -> 
         return _StreamConvTr1d(nn.ConvTranspose1d(cin, cout, 2 * stride, stride=stride, device=device))
 
     codec._enc_stages = [
-        ("conv", conv(1, 4, 7)), ("act", nn.ELU()),
+        ("conv", conv(1, 4, 7)),
+        ("act", nn.ELU()),
         ("res", (nn.ELU(), conv(4, 2, 3), nn.ELU(), conv(2, 4, 1))),
-        ("conv", conv(4, 8, 8, stride=4)), ("conv", conv(8, 8, 10, stride=5)),
-        ("conv", conv(8, DIM, 12, stride=6)), ("conv", conv(DIM, DIM, 16, stride=8)),
+        ("conv", conv(4, 8, 8, stride=4)),
+        ("conv", conv(8, 8, 10, stride=5)),
+        ("conv", conv(8, DIM, 12, stride=6)),
+        ("conv", conv(DIM, DIM, 16, stride=8)),
     ]
     codec._downsample = conv(DIM, DIM, 4, stride=2, pad_mode="replicate")
     codec._upsample = _StreamConvTr1d(nn.ConvTranspose1d(DIM, DIM, 4, stride=2, device=device))
     codec._dec_stages = [
-        ("conv", conv(DIM, 8, 7)), ("act", nn.ELU()), ("convtr", convtr(8, 8, stride=8)),
+        ("conv", conv(DIM, 8, 7)),
+        ("act", nn.ELU()),
+        ("convtr", convtr(8, 8, stride=8)),
         ("res", (nn.ELU(), conv(8, 4, 3), nn.ELU(), conv(4, 8, 1))),
-        ("convtr", convtr(8, 4, stride=6)), ("convtr", convtr(4, 4, stride=5)),
-        ("convtr", convtr(4, 4, stride=4)), ("act", nn.ELU()), ("conv", conv(4, 1, 3)),
+        ("convtr", convtr(8, 4, stride=6)),
+        ("convtr", convtr(4, 4, stride=5)),
+        ("convtr", convtr(4, 4, stride=4)),
+        ("act", nn.ELU()),
+        ("conv", conv(4, 1, 3)),
     ]
     codec.encoder_transformer = _MimiStreamingTransformer(num_layers=2, dim=DIM, num_heads=2, context=8).to(device)
     codec.decoder_transformer = _MimiStreamingTransformer(num_layers=1, dim=DIM, num_heads=2, context=8).to(device)
@@ -157,7 +170,8 @@ def test_one_sided_codec_matches_full_and_rejects_the_other_half(half: str) -> N
 
 class _GraphCodec:
     def __init__(self) -> None:
-        self.inits, self.captures = [], 0
+        self.inits: list[tuple[int, bool]] = []
+        self.captures = 0
 
     def streaming_init(self, batch_size: int, *, decode: bool = True) -> None:
         self.inits.append((batch_size, decode))
@@ -171,9 +185,18 @@ class _GraphCodec:
 @pytest.mark.parametrize("cuda_graph", [False, True])
 def test_load_encoder_builds_the_shared_encoder_once(cuda_graph: bool) -> None:
     codecs = []
+
+    def _make_codec() -> _GraphCodec:
+        c = _GraphCodec()
+        codecs.append(c)
+        return c
+
     runtime = PersonaPlexStage0DuplexRuntime(
-        SimpleNamespace(), model_path="/unused", device="cpu",
-        codec_factory=lambda: codecs.append(_GraphCodec()) or codecs[-1], max_sessions=4,
+        SimpleNamespace(),
+        model_path="/unused",
+        device="cpu",
+        codec_factory=_make_codec,
+        max_sessions=4,
     )
     runtime.load_encoder(cuda_graph=cuda_graph)
     assert codecs[0].inits == [(4, False)] and codecs[0].captures == int(cuda_graph)
