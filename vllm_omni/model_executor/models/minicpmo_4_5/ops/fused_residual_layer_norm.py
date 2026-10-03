@@ -189,8 +189,8 @@ def residual_layer_norm(
             over its history (see the module docstring). ``None`` normalizes
             ``residual`` alone.
         gate: ``(C,)`` multiplier of ``y`` (after ``y_bias``).
-        weight / bias: ``(C,)`` LayerNorm affine; for adaLN pass
-            ``1 + scale`` and ``shift``.
+        weight: ``(C,)`` LayerNorm scale; for adaLN pass ``1 + scale``.
+        bias: ``(C,)`` LayerNorm shift; for adaLN pass ``shift``.
         taps: convolution taps folded into ``y``.
         y_bias: ``(C,)`` added to the tap sum (the convolution bias).
         activation: ``None`` or ``"mish"``, applied after the affine.
