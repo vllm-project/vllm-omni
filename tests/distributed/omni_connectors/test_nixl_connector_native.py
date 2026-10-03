@@ -272,14 +272,8 @@ def test_native_two_process_structured_mixed_device_transfer(direct, payload_kin
 
     producer.start()
     consumer.start()
-    producer.join(timeout=60)
-    consumer.join(timeout=60)
-    if producer.is_alive():
-        producer.terminate()
-        producer.join(timeout=10)
-    if consumer.is_alive():
-        consumer.terminate()
-        consumer.join(timeout=10)
+    producer.join()
+    consumer.join()
 
     records = [result.get(timeout=5) for _ in range(5)]
     print("Native ownership records:", records)

@@ -754,6 +754,8 @@ def test_deferred_transfer_is_retained_while_active(nixl_connector_cls):
     from vllm_omni.distributed.omni_connectors.connectors.nixl_connector import _DeferredTransfer
 
     connector = nixl_connector_cls({"role": "receiver"})
+    connector._agent.add_remote_agent = lambda metadata: "producer"
+    assert connector._acquire_remote_agent(b"producer") == "producer"
     released = []
     connector._agent.check_xfer_state = lambda handle: "PROC"
     connector._agent.release_xfer_handle = lambda handle: released.append(("handle", handle))
@@ -782,6 +784,8 @@ def test_deferred_transfer_releases_exactly_once_after_done(nixl_connector_cls):
     from vllm_omni.distributed.omni_connectors.connectors.nixl_connector import _DeferredTransfer
 
     connector = nixl_connector_cls({"role": "receiver"})
+    connector._agent.add_remote_agent = lambda metadata: "producer"
+    assert connector._acquire_remote_agent(b"producer") == "producer"
     released = []
     connector._agent.check_xfer_state = lambda handle: "DONE"
     connector._agent.release_xfer_handle = lambda handle: released.append(("handle", handle))
@@ -823,6 +827,8 @@ def test_close_returns_without_releasing_active_dma(nixl_connector_cls, poll_rai
     )
 
     connector = nixl_connector_cls({"role": "receiver"})
+    connector._agent.add_remote_agent = lambda metadata: "producer"
+    assert connector._acquire_remote_agent(b"producer") == "producer"
     released = []
 
     def check_state(handle):

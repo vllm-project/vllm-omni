@@ -94,6 +94,7 @@ from vllm_omni.diffusion.models.hunyuan_image3.layers import ResBlock
 from vllm_omni.diffusion.models.hunyuan_image3.layers.common import conv_nd, normalization
 from vllm_omni.diffusion.utils.kv_utils import repeat_kv
 from vllm_omni.model_executor.layers.timestep_embedding import timestep_embedding
+from vllm_omni.model_executor.models.hunyuan_image3.moe_routing import pack_hunyuan_topk, unpack_hunyuan_topk
 from vllm_omni.platforms import current_omni_platform
 
 logger = logging.getLogger(__name__)
@@ -1673,6 +1674,8 @@ class HunYuanSparseMoeBlock(nn.Module):
         else:
             top_k = config.moe_topk
 
+        self.top_k = top_k
+
         # If it is moe, moe_intermediate_size is preferred
         intermediate_size = config.intermediate_size
         if config.moe_intermediate_size is not None:
@@ -1690,7 +1693,8 @@ class HunYuanSparseMoeBlock(nn.Module):
             config.hidden_size,
             config.num_experts,
             bias=False,
-            quant_config=quant_config,
+            quant_config=None,
+            params_dtype=torch.float32,
             prefix=f"{prefix}.gate",
         )
         if config.use_mixed_mlp_moe > 0:
@@ -1721,12 +1725,13 @@ class HunYuanSparseMoeBlock(nn.Module):
             top_k=top_k,
             hidden_size=config.hidden_size,
             intermediate_size=intermediate_size,
-            renormalize=top_k > 1,
+            renormalize=False,
             quant_config=quant_config,
             prefix=f"{prefix}.experts",
             enable_eplb=self.enable_eplb,
             num_redundant_experts=self.n_redundant_experts,
             pcp_size=None if enable_expert_parallel else 1,
+            custom_routing_function=unpack_hunyuan_topk,
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -1736,8 +1741,10 @@ class HunYuanSparseMoeBlock(nn.Module):
         hidden_states = hidden_states.view(-1, hidden_dim)
 
         # router_logits: (num_tokens, n_experts)
-        router_logits, _ = self.gate(hidden_states)
-        final_hidden_states = self.experts(hidden_states=hidden_states, router_logits=router_logits)
+        with torch.autocast(device_type=hidden_states.device.type, enabled=False):
+            router_logits, _ = self.gate(hidden_states.float())
+        routing = pack_hunyuan_topk(router_logits, self.top_k, hidden_states.dtype)
+        final_hidden_states = self.experts(hidden_states=hidden_states, router_logits=routing)
 
         return final_hidden_states.view(orig_shape)
 

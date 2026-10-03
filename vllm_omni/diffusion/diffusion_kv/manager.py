@@ -260,6 +260,8 @@ class DiffusionKVCacheManager:
             sequences=tuple(sequence_metadata),
         )
         self._next_allocation_generation += 1
+        for request in requests:
+            request.allocation_generation = metadata.allocation_generation
         self._requests[public_request_id] = requests
         self._metadata[public_request_id] = metadata
         self._internal_request_ids.update(internal_ids)
