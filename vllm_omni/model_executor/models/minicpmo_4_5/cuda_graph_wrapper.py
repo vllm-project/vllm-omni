@@ -1393,8 +1393,8 @@ class WholeEulerCFMGraphWrapper:
         rows = self.micro_batch_size
         if self.att_slots:
             # Streaming chunks run from the slot pool; the arena only holds
-            # what reaches it (the prompt solve), not a steady batch.
-            capacity, rows = offset + query_cap, graph_batch
+            # what reaches it (the prompt solve or fallback), not a steady batch.
+            capacity, rows = max(capacity, offset + query_cap), max(rows, graph_batch)
         if self._cache and not arena.att_cache_fits(max(graph_batch, rows), offset + query_cap):
             # The captured graphs hold views of the current storage: retire
             # them, or they keep it alive beside the larger replacement.
@@ -1550,7 +1550,9 @@ class WholeEulerCFMGraphWrapper:
         if pool is None:
             if prefix < 0 or suffix <= 0 or self.query_bucket_frames <= 1:
                 return None
-            frames = _align_up(prefix + suffix + self.query_bucket_frames, _ATT_FRAME_ALIGN)
+            max_query = max(self.query_widths) if self.query_widths else self.query_bucket_frames
+            max_query = max(max_query, 200)
+            frames = _align_up(prefix + suffix + max_query, _ATT_FRAME_ALIGN)
             try:
                 pool = AttSlotPool(self.arena, slots=self.att_slots, frames=frames, suffix=suffix)
             except torch.OutOfMemoryError:
