@@ -432,6 +432,9 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         pooler_outputs = model_runner_output.pooler_output
         mm_outputs = getattr(model_runner_output, "multimodal_outputs", None)
         inter_stage_outputs = getattr(model_runner_output, "inter_stage_outputs", None)
+        # Token-only processors need sampled IDs even without a tensor payload.
+        processor = getattr(getattr(self, "chunk_transfer_adapter", None), "custom_process_next_stage_input_func", None)
+        requires_token_updates = getattr(processor, "requires_token_updates", False) is True
         num_nans_in_logits = model_runner_output.num_nans_in_logits
         kv_connector_output = model_runner_output.kv_connector_output
         ec_connector_output = getattr(model_runner_output, "ec_connector_output", None)
@@ -689,7 +692,9 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             # Only when this step might save. Read additional_information
             # before _free_request rewrites it.
             omits_chunk_transfer = False
-            if self.chunk_transfer_adapter is not None and (inter_stage_output is not None or stopped):
+            if self.chunk_transfer_adapter is not None and (
+                inter_stage_output is not None or (new_token_ids and requires_token_updates) or stopped
+            ):
                 omits_chunk_transfer = self._request_omits_chunk_transfer_to_next_stage(request)
             # Capture before resumable stop handling can clear token history.
             output_token_ids: Any = getattr(request, "output_token_ids", None)
@@ -818,7 +823,12 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             if (
                 self.chunk_transfer_adapter is not None
                 and not omits_chunk_transfer
-                and (inter_stage_output is not None or is_segment_finished or finished)
+                and (
+                    inter_stage_output is not None
+                    or (new_token_ids and requires_token_updates)
+                    or is_segment_finished
+                    or finished
+                )
             ):
                 save_kwargs = {
                     "new_token_ids": new_token_ids,

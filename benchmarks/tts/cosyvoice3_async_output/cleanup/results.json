@@ -1,0 +1,1227 @@
+{
+  "plan": {
+    "gpu_index": 0,
+    "gpu_uuid": "GPU-a745f6de-5fdb-68be-310e-5b6649033cd2",
+    "baseline": "3204a0b2ade0f05424b7f11e3bcc03cb3542e0c6",
+    "cleanup_source_parent": "10397d636baaf9e48683c9a8e106c7f03240b3b2",
+    "sources": {
+      "baseline": "/validation/baseline",
+      "cleanup": "/validation/next-step-20261003/v028-cleanup"
+    },
+    "hashes": {
+      "baseline": {
+        "vllm_omni/model_executor/models/cosyvoice3/cosyvoice3.py": "99bb4e09a54f8502cee0c949f84dc7d0a782988976c8b3f986c14c929d10942b",
+        "vllm_omni/model_executor/stage_input_processors/cosyvoice3.py": "3e083f90fbc161c618028fda1e19a7f6f67b0908ab7d260f4ff5208612ee693e",
+        "vllm_omni/core/sched/omni_ar_scheduler.py": "e1be517da9dd19be8bf8b78bf7f589dab922ac6abd15402701308bd4b7cd4b76",
+        "vllm_omni/worker/gpu_ar_model_runner.py": "c0e963589c3daaf820716559c58c628128e9abd9940887ea84b965a1fcc93fc2",
+        "tests/model_executor/models/cosyvoice3/test_cosyvoice3_model_helpers.py": "3c3f8720e987b6def46bfdbc0fd0d72a0d68d8b8f35876a8c8bddca7ef94f4cc",
+        "tests/core/sched/test_omni_ar_scheduler_streaming.py": "097cd69cf74f55a14ff1848e4df8d27a626b8a2dcf61f610a561930e34c67516",
+        "vllm_omni/deploy/cosyvoice3.yaml": "ce635e39985196383376af692ae444e0466f6b98e9cb121dc31f4530827978b5"
+      },
+      "cleanup": {
+        "vllm_omni/model_executor/models/cosyvoice3/cosyvoice3.py": "6ce6a2612040df060cb1d1bbaa6843d46247d9d09b045882732a9b32c70232bf",
+        "vllm_omni/model_executor/stage_input_processors/cosyvoice3.py": "0445c732674041c4211ddd3bf7466a95e33260b181593856c6854c87709f34b9",
+        "vllm_omni/core/sched/omni_ar_scheduler.py": "be69c210fc2cd3ac15dd182e93e02453a0a24e37023f92dbac09a9248fd212db",
+        "vllm_omni/worker/gpu_ar_model_runner.py": "c0e963589c3daaf820716559c58c628128e9abd9940887ea84b965a1fcc93fc2",
+        "tests/model_executor/models/cosyvoice3/test_cosyvoice3_model_helpers.py": "63682fdd540d821d2acfc991f2ce336917763eef8df561b3508d16b5a4188968",
+        "tests/core/sched/test_omni_ar_scheduler_streaming.py": "d27217455963ae5722d1be43332de791ee37f7a1879ac7ec1b0aaeedd001215e",
+        "vllm_omni/deploy/cosyvoice3.yaml": "ce635e39985196383376af692ae444e0466f6b98e9cb121dc31f4530827978b5"
+      }
+    },
+    "benchmark_sha256": "a066dfc26ea82661eb6c1fbf83d33ea8f192be9e8c4846febd05466ef46e5729",
+    "runtime": "vLLM 0.28.0+cu129, PyTorch 2.13.0+cu129",
+    "current_main_runtime_validated": false,
+    "model_revision": "29e01c4e8d000f4bcd70751be16fa94bf3d85a18",
+    "workloads": {
+      "natural_c1_pairs": 1,
+      "fixed_c1_pairs": 3,
+      "fixed_c4_pairs": 3,
+      "fixed_tokens": 128,
+      "warmup_batches": 2,
+      "requests_per_run": 8
+    },
+    "use_async_omni_output": false,
+    "requires_token_updates": true
+  },
+  "natural_c1": [
+    {
+      "baseline": {
+        "label": "natural_c1-baseline-r1",
+        "ar_itl_ms": 4.912333333333334,
+        "ar_intervals": 1092,
+        "per_request_intervals": [
+          130,
+          143,
+          130,
+          143,
+          130,
+          143,
+          130,
+          143
+        ],
+        "ttfa_median_ms": 463.8685863465071,
+        "last_audio_mean_ms": 1056.1609519645572,
+        "audio_seconds_per_second": 5.164036882983642,
+        "samples": [
+          124800,
+          137280,
+          124800,
+          137280,
+          124800,
+          137280,
+          124800,
+          137280
+        ],
+        "chunks": [
+          [
+            32640,
+            48000,
+            44160
+          ],
+          [
+            32640,
+            48000,
+            56640
+          ],
+          [
+            32640,
+            48000,
+            44160
+          ],
+          [
+            32640,
+            48000,
+            56640
+          ],
+          [
+            32640,
+            48000,
+            44160
+          ],
+          [
+            32640,
+            48000,
+            56640
+          ],
+          [
+            32640,
+            48000,
+            44160
+          ],
+          [
+            32640,
+            48000,
+            56640
+          ]
+        ]
+      },
+      "cleanup": {
+        "label": "natural_c1-cleanup-r1",
+        "ar_itl_ms": 4.8889523809523805,
+        "ar_intervals": 1092,
+        "per_request_intervals": [
+          130,
+          143,
+          130,
+          143,
+          130,
+          143,
+          130,
+          143
+        ],
+        "ttfa_median_ms": 461.21637523174286,
+        "last_audio_mean_ms": 989.0119875781238,
+        "audio_seconds_per_second": 5.514372908947789,
+        "samples": [
+          124800,
+          137280,
+          124800,
+          137280,
+          124800,
+          137280,
+          124800,
+          137280
+        ],
+        "chunks": [
+          [
+            32640,
+            48000,
+            44160
+          ],
+          [
+            32640,
+            48000,
+            56640
+          ],
+          [
+            32640,
+            48000,
+            44160
+          ],
+          [
+            32640,
+            48000,
+            56640
+          ],
+          [
+            32640,
+            48000,
+            44160
+          ],
+          [
+            32640,
+            48000,
+            56640
+          ],
+          [
+            32640,
+            48000,
+            44160
+          ],
+          [
+            32640,
+            48000,
+            56640
+          ]
+        ]
+      },
+      "ar_delta_ms": -0.02338095238095317,
+      "ar_change_pct": -0.4759642881377424,
+      "same_interval_count": true,
+      "same_audio_lengths": true,
+      "same_chunk_boundaries": true,
+      "bitwise_equal_requests": 8,
+      "bitwise_equal": [
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true
+      ]
+    }
+  ],
+  "fixed_c1": [
+    {
+      "baseline": {
+        "label": "fixed_c1-baseline-r1",
+        "ar_itl_ms": 5.08275,
+        "ar_intervals": 1016,
+        "per_request_intervals": [
+          127,
+          127,
+          127,
+          127,
+          127,
+          127,
+          127,
+          127
+        ],
+        "ttfa_median_ms": 469.7989709675312,
+        "last_audio_mean_ms": 1045.400409027934,
+        "audio_seconds_per_second": 4.890801562864088,
+        "samples": [
+          122880,
+          122880,
+          122880,
+          122880,
+          122880,
+          122880,
+          122880,
+          122880
+        ],
+        "chunks": [
+          [
+            32640,
+            48000,
+            42240
+          ],
+          [
+            32640,
+            48000,
+            42240
+          ],
+          [
+            32640,
+            48000,
+            42240
+          ],
+          [
+            32640,
+            48000,
+            42240
+          ],
+          [
+            32640,
+            48000,
+            42240
+          ],
+          [
+            32640,
+            48000,
+            42240
+          ],
+          [
+            32640,
+            48000,
+            42240
+          ],
+          [
+            32640,
+            48000,
+            42240
+          ]
+        ]
+      },
+      "cleanup": {
+        "label": "fixed_c1-cleanup-r1",
+        "ar_itl_ms": 4.99625,
+        "ar_intervals": 1016,
+        "per_request_intervals": [
+          127,
+          127,
+          127,
+          127,
+          127,
+          127,
+          127,
+          127
+        ],
+        "ttfa_median_ms": 473.7022202461958,
+        "last_audio_mean_ms": 973.7772732041776,
+        "audio_seconds_per_second": 5.251659835814923,
+        "samples": [
+          122880,
+          122880,
+          122880,
+          122880,
+          122880,
+          122880,
+          122880,
+          122880
+        ],
+        "chunks": [
+          [
+            32640,
+            48000,
+            42240
+          ],
+          [
+            32640,
+            48000,
+            42240
+          ],
+          [
+            32640,
+            48000,
+            42240
+          ],
+          [
+            32640,
+            48000,
+            42240
+          ],
+          [
+            32640,
+            48000,
+            42240
+          ],
+          [
+            32640,
+            48000,
+            42240
+          ],
+          [
+            32640,
+            48000,
+            42240
+          ],
+          [
+            32640,
+            48000,
+            42240
+          ]
+        ]
+      },
+      "ar_delta_ms": -0.08650000000000002,
+      "ar_change_pct": -1.701834636761601,
+      "same_interval_count": true,
+      "same_audio_lengths": true,
+      "same_chunk_boundaries": true,
+      "bitwise_equal_requests": 8,
+      "bitwise_equal": [
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true
+      ]
+    },
+    {
+      "baseline": {
+        "label": "fixed_c1-baseline-r2",
+        "ar_itl_ms": 4.96375,
+        "ar_intervals": 1016,
+        "per_request_intervals": [
+          127,
+          127,
+          127,
+          127,
+          127,
+          127,
+          127,
+          127
+        ],
+        "ttfa_median_ms": 460.18691547214985,
+        "last_audio_mean_ms": 947.7098821662366,
+        "audio_seconds_per_second": 5.395907960780031,
+        "samples": [
+          122880,
+          122880,
+          122880,
+          122880,
+          122880,
+          122880,
+          122880,
+          122880
+        ],
+        "chunks": [
+          [
+            32640,
+            48000,
+            42240
+          ],
+          [
+            32640,
+            48000,
+            42240
+          ],
+          [
+            32640,
+            48000,
+            42240
+          ],
+          [
+            32640,
+            48000,
+            42240
+          ],
+          [
+            32640,
+            48000,
+            42240
+          ],
+          [
+            32640,
+            48000,
+            42240
+          ],
+          [
+            32640,
+            48000,
+            42240
+          ],
+          [
+            32640,
+            48000,
+            42240
+          ]
+        ]
+      },
+      "cleanup": {
+        "label": "fixed_c1-cleanup-r2",
+        "ar_itl_ms": 4.97675,
+        "ar_intervals": 1016,
+        "per_request_intervals": [
+          127,
+          127,
+          127,
+          127,
+          127,
+          127,
+          127,
+          127
+        ],
+        "ttfa_median_ms": 467.39664673805237,
+        "last_audio_mean_ms": 969.3502248264849,
+        "audio_seconds_per_second": 5.275511420066445,
+        "samples": [
+          122880,
+          122880,
+          122880,
+          122880,
+          122880,
+          122880,
+          122880,
+          122880
+        ],
+        "chunks": [
+          [
+            32640,
+            48000,
+            42240
+          ],
+          [
+            32640,
+            48000,
+            42240
+          ],
+          [
+            32640,
+            48000,
+            42240
+          ],
+          [
+            32640,
+            48000,
+            42240
+          ],
+          [
+            32640,
+            48000,
+            42240
+          ],
+          [
+            32640,
+            48000,
+            42240
+          ],
+          [
+            32640,
+            48000,
+            42240
+          ],
+          [
+            32640,
+            48000,
+            42240
+          ]
+        ]
+      },
+      "ar_delta_ms": 0.0129999999999999,
+      "ar_change_pct": 0.26189876605389184,
+      "same_interval_count": true,
+      "same_audio_lengths": true,
+      "same_chunk_boundaries": true,
+      "bitwise_equal_requests": 8,
+      "bitwise_equal": [
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true
+      ]
+    },
+    {
+      "baseline": {
+        "label": "fixed_c1-baseline-r3",
+        "ar_itl_ms": 4.87675,
+        "ar_intervals": 1016,
+        "per_request_intervals": [
+          127,
+          127,
+          127,
+          127,
+          127,
+          127,
+          127,
+          127
+        ],
+        "ttfa_median_ms": 460.19248478114605,
+        "last_audio_mean_ms": 945.1086106710136,
+        "audio_seconds_per_second": 5.41097666034325,
+        "samples": [
+          122880,
+          122880,
+          122880,
+          122880,
+          122880,
+          122880,
+          122880,
+          122880
+        ],
+        "chunks": [
+          [
+            32640,
+            48000,
+            42240
+          ],
+          [
+            32640,
+            48000,
+            42240
+          ],
+          [
+            32640,
+            48000,
+            42240
+          ],
+          [
+            32640,
+            48000,
+            42240
+          ],
+          [
+            32640,
+            48000,
+            42240
+          ],
+          [
+            32640,
+            48000,
+            42240
+          ],
+          [
+            32640,
+            48000,
+            42240
+          ],
+          [
+            32640,
+            48000,
+            42240
+          ]
+        ]
+      },
+      "cleanup": {
+        "label": "fixed_c1-cleanup-r3",
+        "ar_itl_ms": 4.851999999999999,
+        "ar_intervals": 1016,
+        "per_request_intervals": [
+          127,
+          127,
+          127,
+          127,
+          127,
+          127,
+          127,
+          127
+        ],
+        "ttfa_median_ms": 457.3562815785408,
+        "last_audio_mean_ms": 940.7428097911179,
+        "audio_seconds_per_second": 5.435696031518655,
+        "samples": [
+          122880,
+          122880,
+          122880,
+          122880,
+          122880,
+          122880,
+          122880,
+          122880
+        ],
+        "chunks": [
+          [
+            32640,
+            48000,
+            42240
+          ],
+          [
+            32640,
+            48000,
+            42240
+          ],
+          [
+            32640,
+            48000,
+            42240
+          ],
+          [
+            32640,
+            48000,
+            42240
+          ],
+          [
+            32640,
+            48000,
+            42240
+          ],
+          [
+            32640,
+            48000,
+            42240
+          ],
+          [
+            32640,
+            48000,
+            42240
+          ],
+          [
+            32640,
+            48000,
+            42240
+          ]
+        ]
+      },
+      "ar_delta_ms": -0.024750000000000938,
+      "ar_change_pct": -0.507510124570687,
+      "same_interval_count": true,
+      "same_audio_lengths": true,
+      "same_chunk_boundaries": true,
+      "bitwise_equal_requests": 8,
+      "bitwise_equal": [
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true
+      ]
+    }
+  ],
+  "fixed_c4": [
+    {
+      "baseline": {
+        "label": "fixed_c4-baseline-r1",
+        "ar_itl_ms": 7.518125,
+        "ar_intervals": 1016,
+        "per_request_intervals": [
+          127,
+          127,
+          127,
+          127,
+          127,
+          127,
+          127,
+          127
+        ],
+        "ttfa_median_ms": 1473.9174991846085,
+        "last_audio_mean_ms": 3087.6357587985694,
+        "audio_seconds_per_second": 6.6255011676203015,
+        "samples": [
+          122880,
+          122880,
+          122880,
+          122880,
+          122880,
+          122880,
+          122880,
+          122880
+        ],
+        "chunks": [
+          [
+            32640,
+            48000,
+            42240
+          ],
+          [
+            32640,
+            48000,
+            42240
+          ],
+          [
+            32640,
+            48000,
+            42240
+          ],
+          [
+            32640,
+            48000,
+            42240
+          ],
+          [
+            32640,
+            48000,
+            42240
+          ],
+          [
+            32640,
+            48000,
+            42240
+          ],
+          [
+            32640,
+            48000,
+            42240
+          ],
+          [
+            32640,
+            48000,
+            42240
+          ]
+        ]
+      },
+      "cleanup": {
+        "label": "fixed_c4-cleanup-r1",
+        "ar_itl_ms": 7.486625,
+        "ar_intervals": 1016,
+        "per_request_intervals": [
+          127,
+          127,
+          127,
+          127,
+          127,
+          127,
+          127,
+          127
+        ],
+        "ttfa_median_ms": 1466.1990515887737,
+        "last_audio_mean_ms": 3078.8541873916984,
+        "audio_seconds_per_second": 6.644518813710732,
+        "samples": [
+          122880,
+          122880,
+          122880,
+          122880,
+          122880,
+          122880,
+          122880,
+          122880
+        ],
+        "chunks": [
+          [
+            32640,
+            48000,
+            42240
+          ],
+          [
+            32640,
+            48000,
+            42240
+          ],
+          [
+            32640,
+            48000,
+            42240
+          ],
+          [
+            32640,
+            48000,
+            42240
+          ],
+          [
+            32640,
+            48000,
+            42240
+          ],
+          [
+            32640,
+            48000,
+            42240
+          ],
+          [
+            32640,
+            48000,
+            42240
+          ],
+          [
+            32640,
+            48000,
+            42240
+          ]
+        ]
+      },
+      "ar_delta_ms": -0.031500000000000306,
+      "ar_change_pct": -0.418987447003083,
+      "same_interval_count": true,
+      "same_audio_lengths": true,
+      "same_chunk_boundaries": true,
+      "bitwise_equal_requests": 6,
+      "bitwise_equal": [
+        true,
+        true,
+        true,
+        true,
+        false,
+        false,
+        true,
+        true
+      ]
+    },
+    {
+      "baseline": {
+        "label": "fixed_c4-baseline-r2",
+        "ar_itl_ms": 7.57725,
+        "ar_intervals": 1016,
+        "per_request_intervals": [
+          127,
+          127,
+          127,
+          127,
+          127,
+          127,
+          127,
+          127
+        ],
+        "ttfa_median_ms": 1468.5762133449316,
+        "last_audio_mean_ms": 3060.625417623669,
+        "audio_seconds_per_second": 6.6842966278502045,
+        "samples": [
+          122880,
+          122880,
+          122880,
+          122880,
+          122880,
+          122880,
+          122880,
+          122880
+        ],
+        "chunks": [
+          [
+            32640,
+            48000,
+            42240
+          ],
+          [
+            32640,
+            48000,
+            42240
+          ],
+          [
+            32640,
+            48000,
+            42240
+          ],
+          [
+            32640,
+            48000,
+            42240
+          ],
+          [
+            32640,
+            48000,
+            42240
+          ],
+          [
+            32640,
+            48000,
+            42240
+          ],
+          [
+            32640,
+            48000,
+            42240
+          ],
+          [
+            32640,
+            48000,
+            42240
+          ]
+        ]
+      },
+      "cleanup": {
+        "label": "fixed_c4-cleanup-r2",
+        "ar_itl_ms": 7.478624999999999,
+        "ar_intervals": 1016,
+        "per_request_intervals": [
+          127,
+          127,
+          127,
+          127,
+          127,
+          127,
+          127,
+          127
+        ],
+        "ttfa_median_ms": 1491.1931604146957,
+        "last_audio_mean_ms": 3128.4483945928514,
+        "audio_seconds_per_second": 6.539437729412327,
+        "samples": [
+          122880,
+          122880,
+          122880,
+          122880,
+          122880,
+          122880,
+          122880,
+          122880
+        ],
+        "chunks": [
+          [
+            32640,
+            48000,
+            42240
+          ],
+          [
+            32640,
+            48000,
+            42240
+          ],
+          [
+            32640,
+            48000,
+            42240
+          ],
+          [
+            32640,
+            48000,
+            42240
+          ],
+          [
+            32640,
+            48000,
+            42240
+          ],
+          [
+            32640,
+            48000,
+            42240
+          ],
+          [
+            32640,
+            48000,
+            42240
+          ],
+          [
+            32640,
+            48000,
+            42240
+          ]
+        ]
+      },
+      "ar_delta_ms": -0.09862500000000107,
+      "ar_change_pct": -1.3015935860635541,
+      "same_interval_count": true,
+      "same_audio_lengths": true,
+      "same_chunk_boundaries": true,
+      "bitwise_equal_requests": 0,
+      "bitwise_equal": [
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false
+      ]
+    },
+    {
+      "baseline": {
+        "label": "fixed_c4-baseline-r3",
+        "ar_itl_ms": 7.5646249999999995,
+        "ar_intervals": 1016,
+        "per_request_intervals": [
+          127,
+          127,
+          127,
+          127,
+          127,
+          127,
+          127,
+          127
+        ],
+        "ttfa_median_ms": 1484.060199931264,
+        "last_audio_mean_ms": 3138.6066121049225,
+        "audio_seconds_per_second": 6.51827022967805,
+        "samples": [
+          122880,
+          122880,
+          122880,
+          122880,
+          122880,
+          122880,
+          122880,
+          122880
+        ],
+        "chunks": [
+          [
+            32640,
+            48000,
+            42240
+          ],
+          [
+            32640,
+            48000,
+            42240
+          ],
+          [
+            32640,
+            48000,
+            42240
+          ],
+          [
+            32640,
+            48000,
+            42240
+          ],
+          [
+            32640,
+            48000,
+            42240
+          ],
+          [
+            32640,
+            48000,
+            42240
+          ],
+          [
+            32640,
+            48000,
+            42240
+          ],
+          [
+            32640,
+            48000,
+            42240
+          ]
+        ]
+      },
+      "cleanup": {
+        "label": "fixed_c4-cleanup-r3",
+        "ar_itl_ms": 7.41725,
+        "ar_intervals": 1016,
+        "per_request_intervals": [
+          127,
+          127,
+          127,
+          127,
+          127,
+          127,
+          127,
+          127
+        ],
+        "ttfa_median_ms": 1478.945204988122,
+        "last_audio_mean_ms": 3112.675285898149,
+        "audio_seconds_per_second": 6.5722176812992,
+        "samples": [
+          122880,
+          122880,
+          122880,
+          122880,
+          122880,
+          122880,
+          122880,
+          122880
+        ],
+        "chunks": [
+          [
+            32640,
+            48000,
+            42240
+          ],
+          [
+            32640,
+            48000,
+            42240
+          ],
+          [
+            32640,
+            48000,
+            42240
+          ],
+          [
+            32640,
+            48000,
+            42240
+          ],
+          [
+            32640,
+            48000,
+            42240
+          ],
+          [
+            32640,
+            48000,
+            42240
+          ],
+          [
+            32640,
+            48000,
+            42240
+          ],
+          [
+            32640,
+            48000,
+            42240
+          ]
+        ]
+      },
+      "ar_delta_ms": -0.14737499999999937,
+      "ar_change_pct": -1.948212898854862,
+      "same_interval_count": true,
+      "same_audio_lengths": true,
+      "same_chunk_boundaries": true,
+      "bitwise_equal_requests": 0,
+      "bitwise_equal": [
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false
+      ]
+    }
+  ],
+  "natural_c1_aggregate": {
+    "paired_rounds": 1,
+    "mean_ar_delta_ms": -0.02338095238095317,
+    "all_pairs_same_interval_count": true,
+    "all_pairs_same_audio_lengths": true,
+    "bitwise_equal_requests": 8,
+    "baseline": {
+      "ar_itl_ms": 4.912333333333334,
+      "ttfa_median_ms": 463.8685863465071,
+      "last_audio_mean_ms": 1056.1609519645572,
+      "audio_seconds_per_second": 5.164036882983642
+    },
+    "cleanup": {
+      "ar_itl_ms": 4.8889523809523805,
+      "ttfa_median_ms": 461.21637523174286,
+      "last_audio_mean_ms": 989.0119875781238,
+      "audio_seconds_per_second": 5.514372908947789
+    },
+    "mean_ar_change_pct": -0.4759642881377424
+  },
+  "fixed_c1_aggregate": {
+    "paired_rounds": 3,
+    "mean_ar_delta_ms": -0.032750000000000355,
+    "all_pairs_same_interval_count": true,
+    "all_pairs_same_audio_lengths": true,
+    "bitwise_equal_requests": 24,
+    "baseline": {
+      "ar_itl_ms": 4.9744166666666665,
+      "ttfa_median_ms": 463.39279040694237,
+      "last_audio_mean_ms": 979.4063006217281,
+      "audio_seconds_per_second": 5.232562061329123
+    },
+    "cleanup": {
+      "ar_itl_ms": 4.941666666666666,
+      "ttfa_median_ms": 466.1517161875963,
+      "last_audio_mean_ms": 961.2901026072601,
+      "audio_seconds_per_second": 5.320955762466674
+    },
+    "mean_ar_change_pct": -0.6583686529408772,
+    "approximate_paired_t_95ci_ms": [
+      -0.15752847464625716,
+      0.09202847464625644
+    ]
+  },
+  "fixed_c4_aggregate": {
+    "paired_rounds": 3,
+    "mean_ar_delta_ms": -0.09250000000000025,
+    "all_pairs_same_interval_count": true,
+    "all_pairs_same_audio_lengths": true,
+    "bitwise_equal_requests": 6,
+    "baseline": {
+      "ar_itl_ms": 7.553333333333334,
+      "ttfa_median_ms": 1475.517970820268,
+      "last_audio_mean_ms": 3095.6225961757204,
+      "audio_seconds_per_second": 6.609356008382852
+    },
+    "cleanup": {
+      "ar_itl_ms": 7.460833333333333,
+      "ttfa_median_ms": 1478.7791389971972,
+      "last_audio_mean_ms": 3106.659289294233,
+      "audio_seconds_per_second": 6.585391408140754
+    },
+    "mean_ar_change_pct": -1.2246248896734313,
+    "approximate_paired_t_95ci_ms": [
+      -0.2370266672004038,
+      0.052026667200403304
+    ]
+  },
+  "profile_label": "cleanup-profile"
+}

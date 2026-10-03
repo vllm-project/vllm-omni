@@ -1,0 +1,338 @@
+diff --git a/docs/design/feature/omni_async_output_materialization.md b/docs/design/feature/omni_async_output_materialization.md
+index 50a2e7c5..a260a24f 100644
+--- a/docs/design/feature/omni_async_output_materialization.md
++++ b/docs/design/feature/omni_async_output_materialization.md
+@@ -101,0 +102,18 @@ the codec payload for Code2Wav in the background.
++CosyVoice3 also uses the mechanism in its AR Talker stage. Its async-chunk
++processor builds Code2Wav input from sampled codec tokens and prompt
++conditioning. In async-chunk mode the Talker omits hidden states from the
++payload, while prefill conditioning still receives safe snapshots. Its chunk
++processor declares `requires_token_updates = True`, allowing the scheduler to
++enqueue sampled codec IDs even when a decode step has no tensor payload.
++Without this opt-in, omitting hidden states would suppress intermediate chunks
++until EOS. Other processors keep their existing tensor-payload trigger. The
++Talker has no postprocess hook that needs an eager state update for the next
++decode step.
++
++When a step has neither a hidden payload nor multimodal outputs, the runner
++constructs the lightweight token-only response inline. There is no tensor
++materialization to overlap, so this avoids a background task on every decode
++step while preserving asynchronous sampled-token feedback. CosyVoice3 uses
++background materialization for prefill conditioning and this lightweight path
++for ordinary decode steps.
++
+@@ -109 +127 @@ results at concurrency 64:
+-|---|---:|---:|---:|
++| --- | ---: | ---: | ---: |
+@@ -226 +244 @@ outputs are not deferred because they affect scheduler-visible request state.
+-|---|---|---|
++| --- | --- | --- |
+@@ -319,0 +338,23 @@ because they use the same Talker implementation.
++### Example 3: CosyVoice3
++
++Start the CosyVoice3 pipeline:
++
++```bash
++vllm serve FunAudioLLM/Fun-CosyVoice3-0.5B-2512 \
++  --omni \
++  --trust-remote-code \
++  --port 8091
++```
++
++The model registry automatically loads `vllm_omni/deploy/cosyvoice3.yaml`,
++which enables async chunk and disables prefix caching. AR async scheduling
++defaults to enabled. Async output
++materialization activates for Stage 0, the AR Talker. Stage 1, Code2Wav, uses
++the normal generation-stage output path.
++
++For a CosyVoice3 performance comparison, keep async chunk and async scheduling
++enabled in both runs and change only the Talker's output-materialization
++behavior. Compare per-step decode time and streaming output correctness on the
++same hardware and inputs. The Qwen3-Omni performance figures above do not
++predict CosyVoice3's benefit; see [RFC #6870, B2](https://github.com/vllm-project/vllm-omni/issues/6870).
++
+@@ -340 +381 @@ runtime conditions hold:
+-|---|---|
++| --- | --- |
+@@ -343,0 +385 @@ runtime conditions hold:
++| A hidden or multimodal payload is present | Token-only steps skip background materialization and retain async sampled-token feedback |
+@@ -379,0 +422,7 @@ so Omni payload materialization remains synchronous.
++- `vllm_omni/model_executor/models/cosyvoice3/cosyvoice3.py`: CosyVoice3
++  Talker opt-in and hidden-state payload behavior.
++- `vllm_omni/model_executor/stage_input_processors/cosyvoice3.py`: CosyVoice3
++  chunk processor's sampled-token update contract.
++- `vllm_omni/core/sched/omni_ar_scheduler.py`: Token-only chunk handoff for
++  processors that declare `requires_token_updates`.
++- `vllm_omni/deploy/cosyvoice3.yaml`: Default CosyVoice3 deployment settings.
+diff --git a/tests/core/sched/test_omni_ar_scheduler_streaming.py b/tests/core/sched/test_omni_ar_scheduler_streaming.py
+index bca7d095..8e03f8bd 100644
+--- a/tests/core/sched/test_omni_ar_scheduler_streaming.py
++++ b/tests/core/sched/test_omni_ar_scheduler_streaming.py
+@@ -24,0 +25 @@ from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapt
++from vllm_omni.model_executor.stage_input_processors.cosyvoice3 import talker2code2wav_async_chunk
+@@ -251 +252,3 @@ def test_resumable_segment_boundary_keeps_pre_transition_send_watermark() -> Non
+-def test_running_decode_step_without_inter_stage_payload_does_not_raise() -> None:
++@pytest.mark.parametrize("processor", [None, talker2code2wav_async_chunk], ids=["no_opt_in", "cosyvoice3"])
++@pytest.mark.parametrize("new_token_ids", [[], [42]], ids=["no_tokens", "sampled_token"])
++def test_running_decode_step_without_inter_stage_payload_does_not_raise(processor, new_token_ids, mocker) -> None:
+@@ -261 +264 @@ def test_running_decode_step_without_inter_stage_payload_does_not_raise() -> Non
+-    sched = MagicMock()
++    sched = mocker.MagicMock()
+@@ -265 +268 @@ def test_running_decode_step_without_inter_stage_payload_does_not_raise() -> Non
+-    sched._update_request_with_output.return_value = ([42], False)
++    sched._update_request_with_output.return_value = (new_token_ids, False)
+@@ -267 +270,2 @@ def test_running_decode_step_without_inter_stage_payload_does_not_raise() -> Non
+-    sched.chunk_transfer_adapter = MagicMock()
++    sched.chunk_transfer_adapter = mocker.MagicMock()
++    sched.chunk_transfer_adapter.custom_process_next_stage_input_func = processor
+@@ -279 +283 @@ def test_running_decode_step_without_inter_stage_payload_does_not_raise() -> Non
+-    scheduler_output = MagicMock(spec=SchedulerOutput)
++    scheduler_output = mocker.MagicMock(spec=SchedulerOutput)
+@@ -284,2 +288,2 @@ def test_running_decode_step_without_inter_stage_payload_does_not_raise() -> Non
+-    model_runner_output = MagicMock(spec=ModelRunnerOutput)
+-    model_runner_output.sampled_token_ids = [[42]]
++    model_runner_output = mocker.MagicMock(spec=ModelRunnerOutput)
++    model_runner_output.sampled_token_ids = [new_token_ids]
+@@ -298,2 +302,12 @@ def test_running_decode_step_without_inter_stage_payload_does_not_raise() -> Non
+-    # Nothing to hand downstream: no payload, no segment boundary, not finished.
+-    sched.chunk_transfer_adapter.save_async.assert_not_called()
++    if processor is None or not new_token_ids:
++        # Tensor-only processors preserve their existing emission condition.
++        sched.chunk_transfer_adapter.save_async.assert_not_called()
++    else:
++        # CosyVoice3 needs each sampled codec ID even without a hidden payload.
++        sched.chunk_transfer_adapter.save_async.assert_called_once_with(
++            None,
++            session,
++            False,
++            new_token_ids=[42],
++            confirmed_num_computed_tokens=None,
++        )
+diff --git a/tests/model_executor/models/cosyvoice3/test_cosyvoice3_model_helpers.py b/tests/model_executor/models/cosyvoice3/test_cosyvoice3_model_helpers.py
+index e1692709..91e5c606 100644
+--- a/tests/model_executor/models/cosyvoice3/test_cosyvoice3_model_helpers.py
++++ b/tests/model_executor/models/cosyvoice3/test_cosyvoice3_model_helpers.py
+@@ -145,0 +146,171 @@ def _make_sampling_metadata(
++@pytest.fixture
++def async_output_vllm_config(tmp_path):
++    from vllm.config import VllmConfig
++
++    from vllm_omni.config.model import OmniModelConfig
++    from vllm_omni.transformers_utils.configs.cosyvoice3 import CosyVoice3Config
++
++    hf_config = CosyVoice3Config()
++    hf_config.llm.update(llm_input_size=16, llm_output_size=16, speech_token_size=32)
++    # Exercise the real config fields without model downloads or engine setup.
++    model_config = object.__new__(OmniModelConfig)
++    model_config.hf_config = hf_config
++    model_config.model_stage = "cosyvoice3_talker"
++    model_config.model = str(tmp_path)
++    model_config.async_chunk = True
++    model_config.enable_return_routed_experts = False
++    model_config.engine_output_type = "latent"
++    model_config.stage_connector_config = {"name": "SharedMemoryConnector", "extra": {"role": "sender"}}
++    vllm_config = object.__new__(VllmConfig)
++    vllm_config.model_config = model_config
++    return vllm_config
++
++
++@pytest.fixture
++def async_output_talker(monkeypatch, async_output_vllm_config):
++    CosyVoice3Model, _ = _cosyvoice3_model_and_runner()
++    from vllm_omni.model_executor.models.cosyvoice3 import cosyvoice3_talker
++
++    class DummyEncoder(nn.Module):
++        def __init__(self, **kwargs):
++            super().__init__()
++
++        def forward(self, inputs_embeds, positions):
++            return inputs_embeds
++
++    class DummyTalker(nn.Module):
++        def __init__(self, *, llm: nn.Module, **kwargs):
++            super().__init__()
++            self.llm = llm
++
++    monkeypatch.setattr(cosyvoice3_talker, "VLLMQwen2Encoder", DummyEncoder)
++    monkeypatch.setattr(cosyvoice3_talker, "CosyVoice3LM", DummyTalker)
++    monkeypatch.setattr(CosyVoice3Model, "_create_llm_vllm_config", lambda self, config: config)
++
++    return CosyVoice3Model(vllm_config=async_output_vllm_config)
++
++
++@pytest.mark.parametrize(
++    "async_chunk,async_scheduling,prefix_cache,expected",
++    [(True, True, None, True), (False, True, None, False), (True, False, None, False), (True, True, object(), False)],
++    ids=["enabled", "sync_chunks", "sync_scheduling", "prefix_cache"],
++)
++@pytest.mark.parametrize(
++    "payload", [None, {}, {"embed": {"embedding": torch.ones(1, 2)}}], ids=["none", "empty", "prefill"]
++)
++@pytest.mark.parametrize("include_hidden", [False, True], ids=["token_payload", "hidden_payload"])
++def test_talker_async_output_runtime_guards(
++    async_output_talker,
++    async_output_vllm_config,
++    async_chunk,
++    async_scheduling,
++    prefix_cache,
++    expected,
++    payload,
++    include_hidden,
++):
++    _, GPUARModelRunner = _cosyvoice3_model_and_runner()
++    runner = object.__new__(GPUARModelRunner)
++    runner.use_async_scheduling = async_scheduling
++    runner.omni_prefix_cache = prefix_cache
++    runner.speculative_config = None
++    runner.model_config = async_output_vllm_config.model_config
++    runner.model_config.async_chunk = async_chunk
++    runner.model = async_output_talker
++    runner.model.omni_pooler_payload_include_hidden = include_hidden
++
++    assert runner._should_use_async_omni_output(payload) is (expected and (include_hidden or bool(payload)))
++
++
++@pytest.mark.parametrize("is_prefill", [True, False], ids=["prefill", "decode"])
++def test_talker_async_output_preserves_conditioning_and_tokens(
++    async_output_talker, async_output_vllm_config, monkeypatch, is_prefill
++):
++    """The deferred path must retain conditioning after reusable buffers change."""
++    _, GPUARModelRunner = _cosyvoice3_model_and_runner()
++    from vllm.v1.core.sched.output import SchedulerOutput
++    from vllm.v1.worker.gpu_input_batch import InputBatch
++
++    from vllm_omni.worker.gpu_ar_model_runner import _snapshot_tensor_payload_to_cpu_async
++
++    runner = object.__new__(GPUARModelRunner)
++    runner.model = async_output_talker
++    runner.vllm_config = async_output_vllm_config
++    runner.model_config = async_output_vllm_config.model_config
++    runner._async_chunk = True
++    runner.omni_prefix_cache = None
++    runner.supports_mm_inputs = False
++    runner.routed_experts_initialized = False
++    runner.model_intermediate_buffer = {}
++    # The live batch has already advanced when the background builder runs.
++    runner.input_batch = object.__new__(InputBatch)
++    runner.input_batch._req_ids = ["next-request"]
++    runner.input_batch.req_id_to_index = {"next-request": 0}
++    monkeypatch.setattr(GPUARModelRunner, "_resolve_pooler_payload_req_ids", lambda self, req_ids: ("latent", req_ids))
++    monkeypatch.setattr(GPUARModelRunner, "get_omni_connector_output", lambda self: None)
++
++    conditioning = {
++        "speech_token": torch.tensor([[11, 12], [21, 0]], dtype=torch.long),
++        "speech_token_len": torch.tensor([2, 1], dtype=torch.long),
++        "speech_feat": torch.arange(16, dtype=torch.float32).reshape(2, 4, 2),
++        "embedding": torch.tensor([[0.1, 0.2], [0.3, 0.4]]),
++    }
++    expected = {key: value.clone() for key, value in conditioning.items()}
++    model_output = async_output_talker.forward(
++        input_ids=torch.tensor([1, 2, 3]),
++        positions=torch.arange(3),
++        inputs_embeds=torch.ones(3, 16),
++        **(conditioning if is_prefill else {}),
++    )
++    payload = runner._build_omni_async_snapshot_payload(
++        hidden_states=model_output.text_hidden_states,
++        staged_hidden_states_cpu=None,
++        multimodal_outputs=model_output.multimodal_outputs,
++    )
++    assert set(payload) == {"multimodal_outputs"}
++    # CPU tensors use the same snapshot helper without requiring a CUDA stream.
++    snapshot = _snapshot_tensor_payload_to_cpu_async(payload, copy_stream=None, pin_memory=False)
++    for tensor in conditioning.values():
++        tensor.zero_()
++    model_output.text_hidden_states.zero_()
++    snapshot.wait()
++
++    scheduler_output = object.__new__(SchedulerOutput)
++    scheduler_output.total_num_scheduled_tokens = 3
++    scheduler_output.num_scheduled_tokens = {"r1": 2, "r2": 1}
++    output = runner._build_omni_model_runner_output_from_snapshot(
++        scheduler_output=scheduler_output,
++        hidden_states=model_output.text_hidden_states[:0],
++        staged_hidden_states_cpu=None,
++        multimodal_outputs=snapshot.payload["multimodal_outputs"],
++        req_ids_output_copy=["r1", "r2"],
++        req_id_to_index_output_copy={"r1": 0, "r2": 1},
++        valid_sampled_token_ids=[[101], [102]],
++        logprobs_lists=None,
++        prompt_logprobs_dict={},
++        num_nans_in_logits=None,
++        kv_connector_output=None,
++        ec_connector_output=None,
++        cudagraph_stats=None,
++        kv_extracted_req_ids=None,
++        num_scheduled_tokens_np=torch.tensor([2, 1], dtype=torch.int32).numpy(),
++        query_start_loc_cpu=torch.tensor([0, 2], dtype=torch.long),
++    )
++    assert output.req_ids == ["r1", "r2"]
++    assert output.sampled_token_ids == [[101], [102]]
++    assert output.multimodal_outputs is None
++    if not is_prefill:
++        assert not output.inter_stage_outputs or all(not item for item in output.inter_stage_outputs)
++        return
++
++    assert len(output.inter_stage_outputs) == 2
++    for idx, prompt_len in enumerate([2, 1]):
++        item = output.inter_stage_outputs[idx]
++        assert "hidden" not in item
++        # The downstream processor removes padding using speech_token_len.
++        torch.testing.assert_close(item["embed.speech_token"], expected["speech_token"][idx : idx + 1])
++        torch.testing.assert_close(item["embed.speech_feat"], expected["speech_feat"][idx : idx + 1])
++        assert item["embed.speech_token_len"].item() == prompt_len
++        torch.testing.assert_close(item["embed.embedding"], expected["embedding"][idx : idx + 1])
++
++
+diff --git a/vllm_omni/core/sched/omni_ar_scheduler.py b/vllm_omni/core/sched/omni_ar_scheduler.py
+index 329e8ad8..6dbdcd6f 100644
+--- a/vllm_omni/core/sched/omni_ar_scheduler.py
++++ b/vllm_omni/core/sched/omni_ar_scheduler.py
+@@ -343,0 +344,3 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
++        # Token-only processors need sampled IDs even without a tensor payload.
++        processor = getattr(getattr(self, "chunk_transfer_adapter", None), "custom_process_next_stage_input_func", None)
++        requires_token_updates = getattr(processor, "requires_token_updates", False) is True
+@@ -683 +686,4 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
+-                inter_stage_output is not None or is_segment_finished or finished
++                inter_stage_output is not None
++                or (new_token_ids and requires_token_updates)
++                or is_segment_finished
++                or finished
+diff --git a/vllm_omni/model_executor/models/cosyvoice3/cosyvoice3.py b/vllm_omni/model_executor/models/cosyvoice3/cosyvoice3.py
+index 81bae6d6..0d4ffcd2 100644
+--- a/vllm_omni/model_executor/models/cosyvoice3/cosyvoice3.py
++++ b/vllm_omni/model_executor/models/cosyvoice3/cosyvoice3.py
+@@ -469,0 +470,6 @@ class CosyVoice3Model(
++            # Build conditioning payloads outside the AR decode critical path.
++            # The async-chunk processor opts into sampled-token updates, so
++            # streaming does not need a hidden-state payload on every step.
++            self.use_async_omni_output = True
++            if getattr(vllm_config.model_config, "async_chunk", False):
++                self.omni_pooler_payload_include_hidden = False
+diff --git a/vllm_omni/model_executor/stage_input_processors/cosyvoice3.py b/vllm_omni/model_executor/stage_input_processors/cosyvoice3.py
+index 07ea3af7..f6782e0f 100644
+--- a/vllm_omni/model_executor/stage_input_processors/cosyvoice3.py
++++ b/vllm_omni/model_executor/stage_input_processors/cosyvoice3.py
+@@ -280,0 +281,5 @@ def talker2code2wav_async_chunk(
++# Decode consumes request.output_token_ids even when no multimodal tensor is
++# emitted. Let the scheduler enqueue these updates before EOS.
++talker2code2wav_async_chunk.requires_token_updates = True  # type: ignore[attr-defined]
++
++
+diff --git a/vllm_omni/worker/gpu_ar_model_runner.py b/vllm_omni/worker/gpu_ar_model_runner.py
+index d293f631..3eafa126 100644
+--- a/vllm_omni/worker/gpu_ar_model_runner.py
++++ b/vllm_omni/worker/gpu_ar_model_runner.py
+@@ -1670 +1670 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
+-    def _should_use_async_omni_output(self) -> bool:
++    def _should_use_async_omni_output(self, multimodal_outputs: object = None) -> bool:
+@@ -1688,0 +1689,6 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
++        # Token-only steps need no tensor materialization. Building their
++        # lightweight output inline avoids creating a background task per token.
++        if not self._model_omni_pooler_payload_include_hidden() and (
++            multimodal_outputs is None or (isinstance(multimodal_outputs, dict) and not multimodal_outputs)
++        ):
++            return False
+@@ -2173 +2179 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
+-        use_async_omni_output = self._should_use_async_omni_output()
++        use_async_omni_output = self._should_use_async_omni_output(multimodal_outputs)

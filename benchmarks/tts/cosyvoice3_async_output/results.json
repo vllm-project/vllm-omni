@@ -1,0 +1,72 @@
+{
+  "rounds": [
+    {
+      "round": 1,
+      "baseline": {
+        "concurrency": 1,
+        "requests": 8,
+        "median_ttfa_ms": 458.0955859273672,
+        "mean_last_audio_ms": 973.4321376308799,
+        "audio_seconds_per_second": 5.602478906465808,
+        "unprofiled_ar_itl_ms": 4.852119047619047,
+        "ar_token_intervals": 1092,
+        "profiles": []
+      },
+      "b2": {
+        "concurrency": 1,
+        "requests": 8,
+        "median_ttfa_ms": 454.77564446628094,
+        "mean_last_audio_ms": 967.1074138022959,
+        "audio_seconds_per_second": 5.63923303341989,
+        "unprofiled_ar_itl_ms": 4.80502380952381,
+        "ar_token_intervals": 1092,
+        "profiles": []
+      },
+      "audio_matches": 8,
+      "chunk_boundaries_match": true
+    },
+    {
+      "round": 2,
+      "baseline": {
+        "concurrency": 1,
+        "requests": 8,
+        "median_ttfa_ms": 449.70230758190155,
+        "mean_last_audio_ms": 962.0850519277155,
+        "audio_seconds_per_second": 5.667878776739129,
+        "unprofiled_ar_itl_ms": 4.831392857142856,
+        "ar_token_intervals": 1092,
+        "profiles": []
+      },
+      "b2": {
+        "concurrency": 1,
+        "requests": 8,
+        "median_ttfa_ms": 451.184568926692,
+        "mean_last_audio_ms": 959.4700764864683,
+        "audio_seconds_per_second": 5.683805771281539,
+        "unprofiled_ar_itl_ms": 4.798119047619048,
+        "ar_token_intervals": 1092,
+        "profiles": []
+      },
+      "audio_matches": 8,
+      "chunk_boundaries_match": true
+    }
+  ],
+  "baseline_mean_ar_ms": 4.841755952380952,
+  "b2_mean_ar_ms": 4.801571428571429,
+  "delta_ar_ms": -0.040184523809522865,
+  "ar_reduction_percent": 0.8299576476951915,
+  "audio_matches": 16,
+  "conclusion": "Small C=1 AR latency reduction in two local rounds; TTFA is mixed. No general speedup claim.",
+  "validation_scope": "Historical vLLM 0.28.0 comparison; not a runtime test of current main.",
+  "test_results": {
+    "selected_regression_tests": 295,
+    "warnings": 21,
+    "test_duration_s": 5.23,
+    "cuda_snapshot_iterations": 64,
+    "paired_audio_outputs": 16,
+    "all_waveforms_bitwise_equal": true,
+    "all_chunk_boundaries_equal": true
+  },
+  "sampled_peak_device_memory_mib": 24760.4375,
+  "memory_sampling_interval_s": 0.2
+}

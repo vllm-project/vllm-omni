@@ -752,6 +752,10 @@ class CosyVoice3Model(
         self.model_dir = model_dir
         self.model = None
         if self.model_stage == "cosyvoice3_talker":
+            # Code2Wav consumes sampled tokens and prompt conditioning, not
+            # hidden states. The processor opts into token-only chunk updates.
+            if getattr(vllm_config.model_config, "async_chunk", False):
+                self.omni_pooler_payload_include_hidden = False
             # Initialize talker stage (text to speech tokens)
             from vllm_omni.model_executor.models.cosyvoice3.cosyvoice3_talker import CosyVoice3LM, VLLMQwen2Encoder
 

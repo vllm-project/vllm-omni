@@ -1,0 +1,17 @@
+{
+  "legacy_gpu_passed": false,
+  "same_preexisting_baseline_failure": true,
+  "runs": {
+    "sync-c1-baseline-r1": {
+      "exit_code": 1,
+      "speech_feat_concat_error": true,
+      "shape_mismatch_174_1500": true
+    },
+    "sync-c1-cleanup-r1": {
+      "exit_code": 1,
+      "speech_feat_concat_error": true,
+      "shape_mismatch_174_1500": true
+    }
+  },
+  "cpu_legacy_policy_and_output_tests_passed": true
+}

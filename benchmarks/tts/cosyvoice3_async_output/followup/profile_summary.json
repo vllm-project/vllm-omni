@@ -1,0 +1,81 @@
+{
+  "scope": "Diagnostic profiled inclusive CPU spans only; never substitute these for latency results.",
+  "limitations": "Background-thread annotations may be absent. Counts and main-thread spans are reported separately.",
+  "profiles": {
+    "control": [
+      {
+        "trace_path_in_evidence": "results/profile-control-c1/traces/20260915-021958_stage0_rank0_1789438798/trace_rank0.json.gz",
+        "bookkeep_steps": 132,
+        "scopes": {
+          "omni_output_builder:total": {
+            "count": 132,
+            "mean_inclusive_ms": 0.23884051515151516,
+            "total_inclusive_ms": 31.526948,
+            "main_thread_decode_count": 131,
+            "main_thread_decode_mean_ms": 0.23585174809160306
+          },
+          "omni_async_output:snapshot_cpu_payload": null,
+          "gpu_model_runner: AsyncGPUModelRunnerOutput": {
+            "count": 132,
+            "mean_inclusive_ms": 0.11521464393939394,
+            "total_inclusive_ms": 15.208333,
+            "main_thread_decode_count": 131,
+            "main_thread_decode_mean_ms": 0.11521563358778626
+          }
+        }
+      }
+    ],
+    "async_only": [
+      {
+        "trace_path_in_evidence": "results/profile-async_only-c1/traces/20260915-022151_stage0_rank0_1789438911/trace_rank0.json.gz",
+        "bookkeep_steps": 132,
+        "scopes": {
+          "omni_output_builder:total": null,
+          "omni_async_output:snapshot_cpu_payload": {
+            "count": 132,
+            "mean_inclusive_ms": 0.16440848484848486,
+            "total_inclusive_ms": 21.70192,
+            "main_thread_decode_count": 131,
+            "main_thread_decode_mean_ms": 0.16354069465648854
+          },
+          "gpu_model_runner: AsyncGPUModelRunnerOutput": {
+            "count": 132,
+            "mean_inclusive_ms": 0.4288925984848485,
+            "total_inclusive_ms": 56.613823,
+            "main_thread_decode_count": 131,
+            "main_thread_decode_mean_ms": 0.4280024961832061
+          }
+        }
+      }
+    ],
+    "b2": [
+      {
+        "trace_path_in_evidence": "results/profile-b2-c1/traces/20260915-022344_stage0_rank0_1789439024/trace_rank0.json.gz",
+        "bookkeep_steps": 132,
+        "scopes": {
+          "omni_output_builder:total": {
+            "count": 131,
+            "mean_inclusive_ms": 0.14429292366412214,
+            "total_inclusive_ms": 18.902373,
+            "main_thread_decode_count": 131,
+            "main_thread_decode_mean_ms": 0.14429292366412214
+          },
+          "omni_async_output:snapshot_cpu_payload": {
+            "count": 1,
+            "mean_inclusive_ms": 0.243869,
+            "total_inclusive_ms": 0.243869,
+            "main_thread_decode_count": 0,
+            "main_thread_decode_mean_ms": null
+          },
+          "gpu_model_runner: AsyncGPUModelRunnerOutput": {
+            "count": 132,
+            "mean_inclusive_ms": 0.12868418939393939,
+            "total_inclusive_ms": 16.986313,
+            "main_thread_decode_count": 131,
+            "main_thread_decode_mean_ms": 0.12622436641221374
+          }
+        }
+      }
+    ]
+  }
+}

@@ -1,0 +1,511 @@
+{
+  "natural_c1": {
+    "paired_rounds": 5,
+    "baseline": {
+      "ar_itl_ms": 4.862359523809523,
+      "ttfa_median_ms": 461.71821877360344,
+      "last_audio_mean_ms": 980.6827884167433,
+      "audio_seconds_per_second": 5.561699712956587
+    },
+    "b2": {
+      "ar_itl_ms": 4.838109523809524,
+      "ttfa_median_ms": 462.2775137424469,
+      "last_audio_mean_ms": 975.4915582947433,
+      "audio_seconds_per_second": 5.581968208146015
+    },
+    "ar_delta_ms": -0.02425000000000015,
+    "ar_reduction_pct": 0.49872906109174236,
+    "paired_ar_deltas_ms": [
+      -0.03753571428571423,
+      -0.031559523809524315,
+      0.002547619047619243,
+      -0.027857142857143025,
+      -0.026845238095238422
+    ],
+    "approximate_paired_t_95ci_ms": [
+      -0.04356374792245757,
+      -0.004936252077542731
+    ],
+    "matched_ar_workload": true,
+    "matched_audio_lengths": true,
+    "bitwise_equal_requests": 40,
+    "paired_requests": 40
+  },
+  "natural_c4": {
+    "paired_rounds": 3,
+    "baseline": {
+      "ar_itl_ms": 7.2891918714535775,
+      "ttfa_median_ms": 1474.8890896638234,
+      "last_audio_mean_ms": 3214.198496968796,
+      "audio_seconds_per_second": 7.203854453961199
+    },
+    "b2": {
+      "ar_itl_ms": 7.2333302314229195,
+      "ttfa_median_ms": 1484.9508466819923,
+      "last_audio_mean_ms": 3207.040067296475,
+      "audio_seconds_per_second": 7.08506993292648
+    },
+    "ar_delta_ms": -0.055861640030658265,
+    "ar_reduction_pct": 0.7663625956867368,
+    "paired_ar_deltas_ms": [
+      -0.04908106009288282,
+      0.022372848320169503,
+      -0.14087670831926147
+    ],
+    "approximate_paired_t_95ci_ms": [
+      -0.2591528620196896,
+      0.14742958195837308
+    ],
+    "matched_ar_workload": false,
+    "matched_audio_lengths": false,
+    "bitwise_equal_requests": 1,
+    "paired_requests": 24
+  },
+  "fixed128_c4": {
+    "paired_rounds": 3,
+    "baseline": {
+      "ar_itl_ms": 7.586416666666667,
+      "ttfa_median_ms": 1476.8540815760691,
+      "last_audio_mean_ms": 3072.7432020939887,
+      "audio_seconds_per_second": 6.65949914689401
+    },
+    "b2": {
+      "ar_itl_ms": 7.54725,
+      "ttfa_median_ms": 1480.818582077821,
+      "last_audio_mean_ms": 3117.888057293991,
+      "audio_seconds_per_second": 6.5618223934280655
+    },
+    "ar_delta_ms": -0.03916666666666687,
+    "ar_reduction_pct": 0.5162736030405247,
+    "paired_ar_deltas_ms": [
+      0.04025000000000034,
+      -0.22049999999999947,
+      0.06274999999999853
+    ],
+    "approximate_paired_t_95ci_ms": [
+      -0.43027358574511265,
+      0.35194025241177895
+    ],
+    "matched_ar_workload": true,
+    "matched_audio_lengths": true,
+    "bitwise_equal_requests": 16,
+    "paired_requests": 24
+  },
+  "resource_anomalies": {
+    "ablation-b2-c1-r1": {
+      "peak_device_mib": 36836.0,
+      "ar_itl_ms": 4.939345238095238
+    },
+    "ablation-b2-c1-r2": {
+      "peak_device_mib": 37578.0,
+      "ar_itl_ms": 7.850464285714286
+    }
+  },
+  "ablation_contrasts": {
+    "control->async_only": {
+      "all_observations": {
+        "paired_rounds": 4,
+        "baseline": {
+          "ar_itl_ms": 4.8625267857142855,
+          "ttfa_median_ms": 459.4240356236696,
+          "last_audio_mean_ms": 975.3554507624358,
+          "audio_seconds_per_second": 5.591408532005627
+        },
+        "b2": {
+          "ar_itl_ms": 5.246377976190476,
+          "ttfa_median_ms": 476.48465214297175,
+          "last_audio_mean_ms": 1025.88894253131,
+          "audio_seconds_per_second": 5.316350708977273
+        },
+        "ar_delta_ms": 0.3838511904761901,
+        "ar_reduction_pct": -7.894068400896302,
+        "paired_ar_deltas_ms": [
+          0.34721428571428525,
+          0.3539285714285709,
+          0.374821428571428,
+          0.45944047619047623
+        ],
+        "approximate_paired_t_95ci_ms": [
+          0.3015119771483463,
+          0.46619040380403387
+        ],
+        "matched_ar_workload": true,
+        "matched_audio_lengths": true,
+        "bitwise_equal_requests": 32,
+        "paired_requests": 32
+      },
+      "without_anomalous_device_activity": {
+        "paired_rounds": 4,
+        "baseline": {
+          "ar_itl_ms": 4.8625267857142855,
+          "ttfa_median_ms": 459.4240356236696,
+          "last_audio_mean_ms": 975.3554507624358,
+          "audio_seconds_per_second": 5.591408532005627
+        },
+        "b2": {
+          "ar_itl_ms": 5.246377976190476,
+          "ttfa_median_ms": 476.48465214297175,
+          "last_audio_mean_ms": 1025.88894253131,
+          "audio_seconds_per_second": 5.316350708977273
+        },
+        "ar_delta_ms": 0.3838511904761901,
+        "ar_reduction_pct": -7.894068400896302,
+        "paired_ar_deltas_ms": [
+          0.34721428571428525,
+          0.3539285714285709,
+          0.374821428571428,
+          0.45944047619047623
+        ],
+        "approximate_paired_t_95ci_ms": [
+          0.3015119771483463,
+          0.46619040380403387
+        ],
+        "matched_ar_workload": true,
+        "matched_audio_lengths": true,
+        "bitwise_equal_requests": 32,
+        "paired_requests": 32
+      },
+      "usable_pair_labels": [
+        [
+          "ablation-control-c1-r1",
+          "ablation-async_only-c1-r1"
+        ],
+        [
+          "ablation-control-c1-r2",
+          "ablation-async_only-c1-r2"
+        ],
+        [
+          "ablation-control-c1-r3",
+          "ablation-async_only-c1-r3"
+        ],
+        [
+          "ablation-control-c1-r4",
+          "ablation-async_only-c1-r4"
+        ]
+      ]
+    },
+    "control->payload_only": {
+      "all_observations": {
+        "paired_rounds": 4,
+        "baseline": {
+          "ar_itl_ms": 4.8625267857142855,
+          "ttfa_median_ms": 459.4240356236696,
+          "last_audio_mean_ms": 975.3554507624358,
+          "audio_seconds_per_second": 5.591408532005627
+        },
+        "b2": {
+          "ar_itl_ms": 4.842336309523809,
+          "ttfa_median_ms": 463.0137118510902,
+          "last_audio_mean_ms": 978.2346501015127,
+          "audio_seconds_per_second": 5.575397903075563
+        },
+        "ar_delta_ms": -0.020190476190476758,
+        "ar_reduction_pct": 0.4152260147912143,
+        "paired_ar_deltas_ms": [
+          -0.051583333333333314,
+          0.0077619047619039705,
+          -0.05713095238095356,
+          0.02019047619047587
+        ],
+        "approximate_paired_t_95ci_ms": [
+          -0.08358740516923152,
+          0.043206452788278005
+        ],
+        "matched_ar_workload": true,
+        "matched_audio_lengths": true,
+        "bitwise_equal_requests": 32,
+        "paired_requests": 32
+      },
+      "without_anomalous_device_activity": {
+        "paired_rounds": 4,
+        "baseline": {
+          "ar_itl_ms": 4.8625267857142855,
+          "ttfa_median_ms": 459.4240356236696,
+          "last_audio_mean_ms": 975.3554507624358,
+          "audio_seconds_per_second": 5.591408532005627
+        },
+        "b2": {
+          "ar_itl_ms": 4.842336309523809,
+          "ttfa_median_ms": 463.0137118510902,
+          "last_audio_mean_ms": 978.2346501015127,
+          "audio_seconds_per_second": 5.575397903075563
+        },
+        "ar_delta_ms": -0.020190476190476758,
+        "ar_reduction_pct": 0.4152260147912143,
+        "paired_ar_deltas_ms": [
+          -0.051583333333333314,
+          0.0077619047619039705,
+          -0.05713095238095356,
+          0.02019047619047587
+        ],
+        "approximate_paired_t_95ci_ms": [
+          -0.08358740516923152,
+          0.043206452788278005
+        ],
+        "matched_ar_workload": true,
+        "matched_audio_lengths": true,
+        "bitwise_equal_requests": 32,
+        "paired_requests": 32
+      },
+      "usable_pair_labels": [
+        [
+          "ablation-control-c1-r1",
+          "ablation-payload_only-c1-r1"
+        ],
+        [
+          "ablation-control-c1-r2",
+          "ablation-payload_only-c1-r2"
+        ],
+        [
+          "ablation-control-c1-r3",
+          "ablation-payload_only-c1-r3"
+        ],
+        [
+          "ablation-control-c1-r4",
+          "ablation-payload_only-c1-r4"
+        ]
+      ]
+    },
+    "payload_only->b2": {
+      "all_observations": {
+        "paired_rounds": 4,
+        "baseline": {
+          "ar_itl_ms": 4.842336309523809,
+          "ttfa_median_ms": 463.0137118510902,
+          "last_audio_mean_ms": 978.2346501015127,
+          "audio_seconds_per_second": 5.575397903075563
+        },
+        "b2": {
+          "ar_itl_ms": 5.615556547619048,
+          "ttfa_median_ms": 496.7183116823435,
+          "last_audio_mean_ms": 1087.5317285535857,
+          "audio_seconds_per_second": 5.138042478239982
+        },
+        "ar_delta_ms": 0.7732202380952384,
+        "ar_reduction_pct": -15.967916903550968,
+        "paired_ar_deltas_ms": [
+          0.1052976190476187,
+          2.9813452380952388,
+          0.049011904761905534,
+          -0.04277380952380927
+        ],
+        "approximate_paired_t_95ci_ms": [
+          -1.5712047882487843,
+          3.117645264439261
+        ],
+        "matched_ar_workload": true,
+        "matched_audio_lengths": true,
+        "bitwise_equal_requests": 32,
+        "paired_requests": 32
+      },
+      "without_anomalous_device_activity": {
+        "paired_rounds": 2,
+        "baseline": {
+          "ar_itl_ms": 4.833089285714285,
+          "ttfa_median_ms": 456.6272487863898,
+          "last_audio_mean_ms": 968.3044455014169,
+          "audio_seconds_per_second": 5.631919062952841
+        },
+        "b2": {
+          "ar_itl_ms": 4.836208333333333,
+          "ttfa_median_ms": 463.18247728049755,
+          "last_audio_mean_ms": 978.1749963294715,
+          "audio_seconds_per_second": 5.576472758386737
+        },
+        "ar_delta_ms": 0.003119047619048132,
+        "ar_reduction_pct": -0.06453527825913455,
+        "paired_ar_deltas_ms": [
+          0.049011904761905534,
+          -0.04277380952380927
+        ],
+        "approximate_paired_t_95ci_ms": [
+          -0.5800049911764552,
+          0.5862430864145515
+        ],
+        "matched_ar_workload": true,
+        "matched_audio_lengths": true,
+        "bitwise_equal_requests": 16,
+        "paired_requests": 16
+      },
+      "usable_pair_labels": [
+        [
+          "ablation-payload_only-c1-r3",
+          "ablation-b2-c1-r3"
+        ],
+        [
+          "ablation-payload_only-c1-r4",
+          "ablation-b2-c1-r4"
+        ]
+      ]
+    },
+    "async_only->b2": {
+      "all_observations": {
+        "paired_rounds": 4,
+        "baseline": {
+          "ar_itl_ms": 5.246377976190476,
+          "ttfa_median_ms": 476.48465214297175,
+          "last_audio_mean_ms": 1025.88894253131,
+          "audio_seconds_per_second": 5.316350708977273
+        },
+        "b2": {
+          "ar_itl_ms": 5.615556547619048,
+          "ttfa_median_ms": 496.7183116823435,
+          "last_audio_mean_ms": 1087.5317285535857,
+          "audio_seconds_per_second": 5.138042478239982
+        },
+        "ar_delta_ms": 0.3691785714285716,
+        "ar_reduction_pct": -7.036827561872339,
+        "paired_ar_deltas_ms": [
+          -0.29349999999999987,
+          2.635178571428572,
+          -0.382940476190476,
+          -0.48202380952380963
+        ],
+        "approximate_paired_t_95ci_ms": [
+          -2.037749605414514,
+          2.7761067482716566
+        ],
+        "matched_ar_workload": true,
+        "matched_audio_lengths": true,
+        "bitwise_equal_requests": 32,
+        "paired_requests": 32
+      },
+      "without_anomalous_device_activity": {
+        "paired_rounds": 2,
+        "baseline": {
+          "ar_itl_ms": 5.268690476190477,
+          "ttfa_median_ms": 479.99993432313204,
+          "last_audio_mean_ms": 1032.215927960351,
+          "audio_seconds_per_second": 5.2835370815649885
+        },
+        "b2": {
+          "ar_itl_ms": 4.836208333333333,
+          "ttfa_median_ms": 463.18247728049755,
+          "last_audio_mean_ms": 978.1749963294715,
+          "audio_seconds_per_second": 5.576472758386737
+        },
+        "ar_delta_ms": -0.4324821428571428,
+        "ar_reduction_pct": 8.208531983641004,
+        "paired_ar_deltas_ms": [
+          -0.382940476190476,
+          -0.48202380952380963
+        ],
+        "approximate_paired_t_95ci_ms": [
+          -1.0619687025062947,
+          0.19700441679200908
+        ],
+        "matched_ar_workload": true,
+        "matched_audio_lengths": true,
+        "bitwise_equal_requests": 16,
+        "paired_requests": 16
+      },
+      "usable_pair_labels": [
+        [
+          "ablation-async_only-c1-r3",
+          "ablation-b2-c1-r3"
+        ],
+        [
+          "ablation-async_only-c1-r4",
+          "ablation-b2-c1-r4"
+        ]
+      ]
+    },
+    "control->b2": {
+      "all_observations": {
+        "paired_rounds": 4,
+        "baseline": {
+          "ar_itl_ms": 4.8625267857142855,
+          "ttfa_median_ms": 459.4240356236696,
+          "last_audio_mean_ms": 975.3554507624358,
+          "audio_seconds_per_second": 5.591408532005627
+        },
+        "b2": {
+          "ar_itl_ms": 5.615556547619048,
+          "ttfa_median_ms": 496.7183116823435,
+          "last_audio_mean_ms": 1087.5317285535857,
+          "audio_seconds_per_second": 5.138042478239982
+        },
+        "ar_delta_ms": 0.7530297619047617,
+        "ar_reduction_pct": -15.486387943755966,
+        "paired_ar_deltas_ms": [
+          0.05371428571428538,
+          2.9891071428571427,
+          -0.008119047619048025,
+          -0.0225833333333334
+        ],
+        "approximate_paired_t_95ci_ms": [
+          -1.619619913579244,
+          3.1256794373887673
+        ],
+        "matched_ar_workload": true,
+        "matched_audio_lengths": true,
+        "bitwise_equal_requests": 32,
+        "paired_requests": 32
+      },
+      "without_anomalous_device_activity": {
+        "paired_rounds": 2,
+        "baseline": {
+          "ar_itl_ms": 4.851559523809524,
+          "ttfa_median_ms": 456.4065421000123,
+          "last_audio_mean_ms": 970.6136463209987,
+          "audio_seconds_per_second": 5.618563735651483
+        },
+        "b2": {
+          "ar_itl_ms": 4.836208333333333,
+          "ttfa_median_ms": 463.18247728049755,
+          "last_audio_mean_ms": 978.1749963294715,
+          "audio_seconds_per_second": 5.576472758386737
+        },
+        "ar_delta_ms": -0.015351190476190713,
+        "ar_reduction_pct": 0.31641764675571177,
+        "paired_ar_deltas_ms": [
+          -0.008119047619048025,
+          -0.0225833333333334
+        ],
+        "approximate_paired_t_95ci_ms": [
+          -0.10724427830193854,
+          0.07654189734955712
+        ],
+        "matched_ar_workload": true,
+        "matched_audio_lengths": true,
+        "bitwise_equal_requests": 16,
+        "paired_requests": 16
+      },
+      "usable_pair_labels": [
+        [
+          "ablation-control-c1-r3",
+          "ablation-b2-c1-r3"
+        ],
+        [
+          "ablation-control-c1-r4",
+          "ablation-b2-c1-r4"
+        ]
+      ]
+    }
+  },
+  "method_limits": [
+    "All inference uses the fixed vLLM 0.28-compatible source, not current-main runtime.",
+    "Two repeated texts and one reference recording; whole paired rounds are the statistical units.",
+    "Paired t intervals are approximate and have small sample sizes; no token-level independence assumption.",
+    "C4 consists of offline waves, not continuously refilled online serving.",
+    "Natural C4 generation lengths vary even between baseline repeats.",
+    "Fixed C4 forces min_tokens=max_tokens=128 and uses full-batch warmups; it is a separate workload.",
+    "Ablation cells share B2 framework wiring; control is not the untouched baseline.",
+    "All resource-anomalous runs are retained and reported; filtering is based on device activity, not speed.",
+    "Profiler spans are diagnostic inclusive CPU times and are never mixed with unprofiled latency."
+  ],
+  "measurement_date": "2026-09-15",
+  "experiment_totals": {
+    "unprofiled_completed_runs": 38,
+    "measured_requests": 304,
+    "profile_captures": 3,
+    "all_runs_exit_zero": true,
+    "pr_branch_unchanged": true,
+    "pr_head": "8e3f796c1b1f248be7fb3fdedc4194b07a077e59",
+    "runtime_scope": "vLLM 0.28.0-compatible pinned source; no current-main runtime claim",
+    "resource_anomaly_runs": [
+      "ablation-b2-c1-r1",
+      "ablation-b2-c1-r2"
+    ]
+  }
+}

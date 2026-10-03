@@ -295,6 +295,10 @@ def talker2code2wav_async_chunk(
 _FULL_PAYLOAD_REPLACE_KEYS: frozenset[str] = frozenset({"embed.speech_token", "embed.speech_feat", "embed.embedding"})
 
 
+# This processor consumes sampled codec IDs even when no tensor payload is emitted.
+talker2code2wav_async_chunk.requires_token_updates = True  # type: ignore[attr-defined]
+
+
 def text2flow_token_only(
     source_outputs: list,
     prompt: OmniTokensPrompt | TextPrompt = None,

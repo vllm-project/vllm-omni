@@ -1,0 +1,65 @@
+{
+  "measurement_base": "3204a0b2ade0f05424b7f11e3bcc03cb3542e0c6",
+  "measurement_snapshot": "10397d636baaf9e48683c9a8e106c7f03240b3b2",
+  "measurement_patch_sha256": "db51c95cfcc535cad15d7823cb561f2949bc1a119b230816f4a4ed6820746d6b",
+  "measurement_files": {
+    "docs/design/feature/omni_async_output_materialization.md": "3a5d18830cb25d0ef6316e0860b52fc3a0d5943da74555b39945167da26de762",
+    "tests/core/sched/test_omni_ar_scheduler_streaming.py": "d27217455963ae5722d1be43332de791ee37f7a1879ac7ec1b0aaeedd001215e",
+    "tests/model_executor/models/cosyvoice3/test_cosyvoice3_model_helpers.py": "3f2b8889f3e96bee665f43382170e35b8757e42562dbd9542944a8dd9c8f747e",
+    "vllm_omni/core/sched/omni_ar_scheduler.py": "be69c210fc2cd3ac15dd182e93e02453a0a24e37023f92dbac09a9248fd212db",
+    "vllm_omni/model_executor/models/cosyvoice3/cosyvoice3.py": "e74f181117b719d54bf96a73114c1d289bbd1aa44b2aba49bba247dd6eb3ed7d",
+    "vllm_omni/model_executor/stage_input_processors/cosyvoice3.py": "0445c732674041c4211ddd3bf7466a95e33260b181593856c6854c87709f34b9",
+    "vllm_omni/worker/gpu_ar_model_runner.py": "7dd38a0c7ca6837b87a575cb582d3b51eda11648897ed652667190c47315d460"
+  },
+  "implementation_commit_before_packaging": "7d4793ce9abd0511dd9db5e23e50402176b42279",
+  "runtime_versions": {
+    "python": "3.12.3 (main, Jun 19 2026, 12:46:00) [GCC 13.3.0]",
+    "vllm": "0.28.0+cu129",
+    "torch": "2.13.0+cu129",
+    "torchaudio": "2.11.0+cu129",
+    "torchvision": "0.28.0+cu129",
+    "transformers": "5.14.1",
+    "triton": "3.7.1",
+    "nvidia-nccl-cu12": "2.29.7",
+    "s3tokenizer": "0.3.0"
+  },
+  "gpu": "NVIDIA GeForce RTX 4090",
+  "gpu_count_used": 1,
+  "gpu_memory_total_mib": 49140,
+  "driver": "550.127.05",
+  "model": {
+    "repo_id": "FunAudioLLM/Fun-CosyVoice3-0.5B-2512",
+    "revision": "29e01c4e8d000f4bcd70751be16fa94bf3d85a18",
+    "total_bytes": 9747516745,
+    "ignored_files": [
+      "llm.rl.pt",
+      "flow.decoder.estimator.fp32.onnx",
+      "speech_tokenizer_v3.batch.onnx",
+      "speech_tokenizer_v3.onnx"
+    ],
+    "download_bytes": 4457714029
+  },
+  "backend": "Torch; COSYVOICE3_TRT=0",
+  "order": [
+    "baseline",
+    "B2",
+    "B2",
+    "baseline"
+  ],
+  "warmups_per_run": 2,
+  "measured_requests_per_run": 8,
+  "concurrency": 1,
+  "profiling": false,
+  "patch_apply_flags": [
+    "--unidiff-zero"
+  ],
+  "baseline_files": {
+    "docs/design/feature/omni_async_output_materialization.md": "c5966231f3386dee392b954e1d70e62f4d2e766fa3ed52cc9d337be0bc5c5d0b",
+    "tests/core/sched/test_omni_ar_scheduler_streaming.py": "097cd69cf74f55a14ff1848e4df8d27a626b8a2dcf61f610a561930e34c67516",
+    "tests/model_executor/models/cosyvoice3/test_cosyvoice3_model_helpers.py": "3c3f8720e987b6def46bfdbc0fd0d72a0d68d8b8f35876a8c8bddca7ef94f4cc",
+    "vllm_omni/core/sched/omni_ar_scheduler.py": "e1be517da9dd19be8bf8b78bf7f589dab922ac6abd15402701308bd4b7cd4b76",
+    "vllm_omni/model_executor/models/cosyvoice3/cosyvoice3.py": "99bb4e09a54f8502cee0c949f84dc7d0a782988976c8b3f986c14c929d10942b",
+    "vllm_omni/model_executor/stage_input_processors/cosyvoice3.py": "3e083f90fbc161c618028fda1e19a7f6f67b0908ab7d260f4ff5208612ee693e",
+    "vllm_omni/worker/gpu_ar_model_runner.py": "c0e963589c3daaf820716559c58c628128e9abd9940887ea84b965a1fcc93fc2"
+  }
+}

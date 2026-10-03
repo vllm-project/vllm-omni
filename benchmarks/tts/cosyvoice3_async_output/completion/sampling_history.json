@@ -1,0 +1,77 @@
+{
+  "all_histories_match_actual_prior_tokens": true,
+  "requests": [
+    {
+      "request": [
+        2,
+        0
+      ],
+      "first_token_difference": 9,
+      "first_generator_difference": 12,
+      "first_history_difference": 10
+    },
+    {
+      "request": [
+        2,
+        1
+      ],
+      "first_token_difference": 19,
+      "first_generator_difference": 25,
+      "first_history_difference": 20
+    },
+    {
+      "request": [
+        2,
+        2
+      ],
+      "first_token_difference": 13,
+      "first_generator_difference": 14,
+      "first_history_difference": 14
+    },
+    {
+      "request": [
+        2,
+        3
+      ],
+      "first_token_difference": 122,
+      "first_generator_difference": 126,
+      "first_history_difference": 123
+    },
+    {
+      "request": [
+        3,
+        0
+      ],
+      "first_token_difference": 29,
+      "first_generator_difference": 97,
+      "first_history_difference": 30
+    },
+    {
+      "request": [
+        3,
+        1
+      ],
+      "first_token_difference": 17,
+      "first_generator_difference": 25,
+      "first_history_difference": 18
+    },
+    {
+      "request": [
+        3,
+        2
+      ],
+      "first_token_difference": null,
+      "first_generator_difference": null,
+      "first_history_difference": null
+    },
+    {
+      "request": [
+        3,
+        3
+      ],
+      "first_token_difference": null,
+      "first_generator_difference": null,
+      "first_history_difference": null
+    }
+  ]
+}

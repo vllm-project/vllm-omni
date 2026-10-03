@@ -99,6 +99,13 @@ Qwen3-TTS uses the same mechanism in its AR Talker stage. The Talker updates
 the decode state it needs for the next step before returning, then constructs
 the codec payload for Code2Wav in the background.
 
+CosyVoice3 keeps output materialization inline. In async-chunk mode, its
+Talker omits unused hidden-state payloads while retaining prompt conditioning.
+The chunk processor opts into sampled-token updates with
+`requires_token_updates = True`, so codec tokens still reach Code2Wav on
+steps without a tensor payload. See [RFC #6870, B2](https://github.com/vllm-project/vllm-omni/issues/6870)
+for the measured benefit and the async-materialization ablation.
+
 ## Performance
 
 In the controlled Qwen3-Omni optimization sweep, enabling async output
@@ -106,7 +113,7 @@ materialization on top of CUDA Graph and async chunk produced the following
 results at concurrency 64:
 
 | Configuration | Request throughput | Mean audio TTFP | Mean audio RTF |
-|---|---:|---:|---:|
+| --- | ---: | ---: | ---: |
 | CUDA Graph + async chunk | 9.3 req/s | 655 ms | 0.63 |
 | + async output materialization | 11.3 req/s | 631 ms | 0.47 |
 | Change | **+22%** | **-4%** | **-25%** |
@@ -223,7 +230,7 @@ outputs are not deferred because they affect scheduler-visible request state.
 ### Qwen3-Omni Stage Behavior
 
 | Stage | Async output behavior | Reason |
-|---|---|---|
+| --- | --- | --- |
 | Thinker | Snapshots hidden states and multimodal outputs; builds the downstream payload in the background | The Talker needs the payload, but the next Thinker decode step only needs sampled-token feedback |
 | Talker | Runs lightweight postprocess eagerly; snapshots codec outputs; omits hidden states from the downstream payload | `hidden_states.last` is needed by the next Talker step, while Code2Wav only needs codec codes |
 | Code2Wav | Uses the normal generation-stage output path | Code2Wav is not executed by `GPUARModelRunner` |
@@ -337,7 +344,7 @@ because they use the same Talker implementation.
 runtime conditions hold:
 
 | Requirement | Reason |
-|---|---|
+| --- | --- |
 | AR async scheduling is enabled | The optimization relies on the scheduler advancing while the prior output is materialized |
 | `async_chunk` is enabled | The feature targets incremental downstream Omni payloads |
 | The model stage opts in with `use_async_omni_output` | Models must declare that their output lifecycle is safe to defer |

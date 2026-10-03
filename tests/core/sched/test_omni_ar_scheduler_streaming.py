@@ -23,6 +23,7 @@ from vllm.v1.engine import FinishReason
 from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm_omni.core.sched.omni_ar_scheduler import OmniARAsyncScheduler, OmniARScheduler
+from vllm_omni.model_executor.stage_input_processors.cosyvoice3 import talker2code2wav_async_chunk
 from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter import (
     OmniChunkTransferAdapter,
 )
@@ -287,7 +288,12 @@ def test_resumable_segment_boundary_keeps_pre_transition_send_watermark() -> Non
     )
 
 
-def test_running_decode_step_without_inter_stage_payload_does_not_raise() -> None:
+@pytest.mark.parametrize("processor", [None, talker2code2wav_async_chunk], ids=["no_opt_in", "cosyvoice3"])
+@pytest.mark.parametrize("new_token_ids", [[], [42]], ids=["no_tokens", "sampled_token"])
+@pytest.mark.parametrize("omit_chunk_transfer", [False, True], ids=["downstream", "stage0_final"])
+def test_running_decode_step_without_inter_stage_payload_does_not_raise(
+    processor, new_token_ids, omit_chunk_transfer, mocker
+) -> None:
     """A decode step that neither stops nor carries an inter-stage payload.
 
     ``finished`` is only assigned when the request stops, yet the async-chunk
@@ -296,14 +302,16 @@ def test_running_decode_step_without_inter_stage_payload_does_not_raise() -> Non
     """
     session = _make_request()
     session.status = RequestStatus.RUNNING
+    session.additional_information = {"omni_final_stage_id": 0} if omit_chunk_transfer else None
 
-    sched = MagicMock()
+    sched = mocker.MagicMock()
     sched.requests = {session.request_id: session}
     sched.perf_metrics = None
     sched.structured_output_manager.accept_tokens.return_value = True
-    sched._update_request_with_output.return_value = ([42], False)
+    sched._update_request_with_output.return_value = (new_token_ids, False)
     sched._process_kv_transfer_trigger.return_value = False
-    sched.chunk_transfer_adapter = MagicMock()
+    sched.chunk_transfer_adapter = mocker.MagicMock()
+    sched.chunk_transfer_adapter.custom_process_next_stage_input_func = processor
     sched.running = [session]
     sched.waiting_for_transfer_free = set()
     sched.transfer_triggered_requests = set()
@@ -316,13 +324,13 @@ def test_running_decode_step_without_inter_stage_payload_does_not_raise() -> Non
     sched.make_stats.return_value = None
     bind_omits_transfer_helpers(sched)
 
-    scheduler_output = MagicMock(spec=SchedulerOutput)
+    scheduler_output = mocker.MagicMock(spec=SchedulerOutput)
     scheduler_output.num_scheduled_tokens = {session.request_id: 1}
     scheduler_output.scheduled_spec_decode_tokens = {}
     scheduler_output.num_invalid_spec_tokens = 0
 
-    model_runner_output = MagicMock(spec=ModelRunnerOutput)
-    model_runner_output.sampled_token_ids = [[42]]
+    model_runner_output = mocker.MagicMock(spec=ModelRunnerOutput)
+    model_runner_output.sampled_token_ids = [new_token_ids]
     model_runner_output.logprobs = None
     model_runner_output.prompt_logprobs_dict = {}
     model_runner_output.pooler_output = None
@@ -335,8 +343,16 @@ def test_running_decode_step_without_inter_stage_payload_does_not_raise() -> Non
 
     OmniARScheduler.update_from_output(sched, scheduler_output, model_runner_output)
 
-    # Nothing to hand downstream: no payload, no segment boundary, not finished.
-    sched.chunk_transfer_adapter.save_async.assert_not_called()
+    if omit_chunk_transfer or processor is None or not new_token_ids:
+        sched.chunk_transfer_adapter.save_async.assert_not_called()
+    else:
+        sched.chunk_transfer_adapter.save_async.assert_called_once_with(
+            None,
+            session,
+            False,
+            new_token_ids=[42],
+            confirmed_num_computed_tokens=None,
+        )
 
 
 def test_queued_streaming_update_on_async_stop_fences_in_flight_once() -> None:

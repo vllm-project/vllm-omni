@@ -1,0 +1,21 @@
+{
+  "reason": "Ablation B2 runs 1 and 2 had anomalous total device memory and reduced GPU free memory before model startup; retain them but do not attribute their slowdown to B2.",
+  "affected_runs": {
+    "ablation-b2-c1-r1": {
+      "peak_device_mib": 36836,
+      "startup_free_gib": 38.63
+    },
+    "ablation-b2-c1-r2": {
+      "peak_device_mib": 37578,
+      "startup_free_gib": 34.75
+    }
+  },
+  "other_cells_typical_peak_mib": 24760.4375,
+  "other_cells_startup_free_gib": 47.12,
+  "additional_rounds": [
+    3,
+    4
+  ],
+  "monitor": "Wait for no GPU0 compute process before each case; record per-process GPU memory once per second plus total device memory every 0.2 s. Do not stop other workloads.",
+  "exclusion_rule": "Report both raw and monitored comparisons; flag anomalous device activity independently of performance sign."
+}

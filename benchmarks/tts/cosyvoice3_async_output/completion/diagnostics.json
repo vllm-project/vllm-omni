@@ -1,0 +1,122 @@
+[
+  {
+    "baseline": "main-baseline-natural",
+    "cleanup": "main-cleanup-natural",
+    "transport": {
+      "main-baseline-natural": {
+        "requests": 8,
+        "sender_chunks": 24,
+        "receiver_chunks": 24,
+        "all_codec_prefixes_match_talker": true,
+        "all_receiver_chunks_match_sender": true
+      },
+      "main-cleanup-natural": {
+        "requests": 8,
+        "sender_chunks": 24,
+        "receiver_chunks": 24,
+        "all_codec_prefixes_match_talker": true,
+        "all_receiver_chunks_match_sender": true
+      }
+    },
+    "same_final_codec_requests": 8,
+    "same_chunk_keys": true,
+    "common_chunks": 24,
+    "same_receiver_token_chunks": 24,
+    "same_conditioning_chunks": 24,
+    "flow_chunks_compared": 24,
+    "same_flow_noise_chunks": 24,
+    "same_flow_input_chunks": 24,
+    "bitwise_audio_requests": 8,
+    "same_audio_chunk_boundaries": true
+  },
+  {
+    "baseline": "main-baseline-per_request",
+    "cleanup": "main-cleanup-per_request",
+    "transport": {
+      "main-baseline-per_request": {
+        "requests": 8,
+        "sender_chunks": 24,
+        "receiver_chunks": 24,
+        "all_codec_prefixes_match_talker": true,
+        "all_receiver_chunks_match_sender": true
+      },
+      "main-cleanup-per_request": {
+        "requests": 8,
+        "sender_chunks": 24,
+        "receiver_chunks": 24,
+        "all_codec_prefixes_match_talker": true,
+        "all_receiver_chunks_match_sender": true
+      }
+    },
+    "same_final_codec_requests": 8,
+    "same_chunk_keys": true,
+    "common_chunks": 24,
+    "same_receiver_token_chunks": 24,
+    "same_conditioning_chunks": 24,
+    "flow_chunks_compared": 24,
+    "same_flow_noise_chunks": 24,
+    "same_flow_input_chunks": 24,
+    "bitwise_audio_requests": 8,
+    "same_audio_chunk_boundaries": true
+  },
+  {
+    "baseline": "v028-baseline-natural",
+    "cleanup": "v028-cleanup-natural",
+    "transport": {
+      "v028-baseline-natural": {
+        "requests": 8,
+        "sender_chunks": 24,
+        "receiver_chunks": 24,
+        "all_codec_prefixes_match_talker": true,
+        "all_receiver_chunks_match_sender": true
+      },
+      "v028-cleanup-natural": {
+        "requests": 8,
+        "sender_chunks": 24,
+        "receiver_chunks": 24,
+        "all_codec_prefixes_match_talker": true,
+        "all_receiver_chunks_match_sender": true
+      }
+    },
+    "same_final_codec_requests": 0,
+    "same_chunk_keys": true,
+    "common_chunks": 24,
+    "same_receiver_token_chunks": 4,
+    "same_conditioning_chunks": 24,
+    "flow_chunks_compared": 24,
+    "same_flow_noise_chunks": 24,
+    "same_flow_input_chunks": 4,
+    "bitwise_audio_requests": 0,
+    "same_audio_chunk_boundaries": true
+  },
+  {
+    "baseline": "v028-baseline-per_request",
+    "cleanup": "v028-cleanup-per_request",
+    "transport": {
+      "v028-baseline-per_request": {
+        "requests": 8,
+        "sender_chunks": 24,
+        "receiver_chunks": 24,
+        "all_codec_prefixes_match_talker": true,
+        "all_receiver_chunks_match_sender": true
+      },
+      "v028-cleanup-per_request": {
+        "requests": 8,
+        "sender_chunks": 24,
+        "receiver_chunks": 24,
+        "all_codec_prefixes_match_talker": true,
+        "all_receiver_chunks_match_sender": true
+      }
+    },
+    "same_final_codec_requests": 2,
+    "same_chunk_keys": true,
+    "common_chunks": 24,
+    "same_receiver_token_chunks": 8,
+    "same_conditioning_chunks": 24,
+    "flow_chunks_compared": 24,
+    "same_flow_noise_chunks": 24,
+    "same_flow_input_chunks": 8,
+    "bitwise_audio_requests": 2,
+    "same_audio_chunk_boundaries": true
+  }
+]

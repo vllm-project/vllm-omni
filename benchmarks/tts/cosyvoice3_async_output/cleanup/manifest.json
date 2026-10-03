@@ -1,0 +1,130 @@
+{
+  "performance_plan": {
+    "gpu_index": 0,
+    "gpu_uuid": "GPU-a745f6de-5fdb-68be-310e-5b6649033cd2",
+    "baseline": "3204a0b2ade0f05424b7f11e3bcc03cb3542e0c6",
+    "cleanup_source_parent": "10397d636baaf9e48683c9a8e106c7f03240b3b2",
+    "sources": {
+      "baseline": "/validation/baseline",
+      "cleanup": "/validation/next-step-20261003/v028-cleanup"
+    },
+    "hashes": {
+      "baseline": {
+        "vllm_omni/model_executor/models/cosyvoice3/cosyvoice3.py": "99bb4e09a54f8502cee0c949f84dc7d0a782988976c8b3f986c14c929d10942b",
+        "vllm_omni/model_executor/stage_input_processors/cosyvoice3.py": "3e083f90fbc161c618028fda1e19a7f6f67b0908ab7d260f4ff5208612ee693e",
+        "vllm_omni/core/sched/omni_ar_scheduler.py": "e1be517da9dd19be8bf8b78bf7f589dab922ac6abd15402701308bd4b7cd4b76",
+        "vllm_omni/worker/gpu_ar_model_runner.py": "c0e963589c3daaf820716559c58c628128e9abd9940887ea84b965a1fcc93fc2",
+        "tests/model_executor/models/cosyvoice3/test_cosyvoice3_model_helpers.py": "3c3f8720e987b6def46bfdbc0fd0d72a0d68d8b8f35876a8c8bddca7ef94f4cc",
+        "tests/core/sched/test_omni_ar_scheduler_streaming.py": "097cd69cf74f55a14ff1848e4df8d27a626b8a2dcf61f610a561930e34c67516",
+        "vllm_omni/deploy/cosyvoice3.yaml": "ce635e39985196383376af692ae444e0466f6b98e9cb121dc31f4530827978b5"
+      },
+      "cleanup": {
+        "vllm_omni/model_executor/models/cosyvoice3/cosyvoice3.py": "6ce6a2612040df060cb1d1bbaa6843d46247d9d09b045882732a9b32c70232bf",
+        "vllm_omni/model_executor/stage_input_processors/cosyvoice3.py": "0445c732674041c4211ddd3bf7466a95e33260b181593856c6854c87709f34b9",
+        "vllm_omni/core/sched/omni_ar_scheduler.py": "be69c210fc2cd3ac15dd182e93e02453a0a24e37023f92dbac09a9248fd212db",
+        "vllm_omni/worker/gpu_ar_model_runner.py": "c0e963589c3daaf820716559c58c628128e9abd9940887ea84b965a1fcc93fc2",
+        "tests/model_executor/models/cosyvoice3/test_cosyvoice3_model_helpers.py": "63682fdd540d821d2acfc991f2ce336917763eef8df561b3508d16b5a4188968",
+        "tests/core/sched/test_omni_ar_scheduler_streaming.py": "d27217455963ae5722d1be43332de791ee37f7a1879ac7ec1b0aaeedd001215e",
+        "vllm_omni/deploy/cosyvoice3.yaml": "ce635e39985196383376af692ae444e0466f6b98e9cb121dc31f4530827978b5"
+      }
+    },
+    "benchmark_sha256": "a066dfc26ea82661eb6c1fbf83d33ea8f192be9e8c4846febd05466ef46e5729",
+    "runtime": "vLLM 0.28.0+cu129, PyTorch 2.13.0+cu129",
+    "current_main_runtime_validated": false,
+    "model_revision": "29e01c4e8d000f4bcd70751be16fa94bf3d85a18",
+    "workloads": {
+      "natural_c1_pairs": 1,
+      "fixed_c1_pairs": 3,
+      "fixed_c4_pairs": 3,
+      "fixed_tokens": 128,
+      "warmup_batches": 2,
+      "requests_per_run": 8
+    },
+    "use_async_omni_output": false,
+    "requires_token_updates": true
+  },
+  "current_main_plan": {
+    "gpu_index": 0,
+    "gpu_uuid": "GPU-a745f6de-5fdb-68be-310e-5b6649033cd2",
+    "baseline": "ee8fdab1dc26ea8f09d7910cdc98a17c4b0ea02a",
+    "cleanup_source_parent": "ee8fdab1dc26ea8f09d7910cdc98a17c4b0ea02a",
+    "sources": {
+      "baseline": "/validation/next-step-20261003/main-baseline",
+      "cleanup": "/validation/next-step-20261003/current-main"
+    },
+    "hashes": {
+      "baseline": {
+        "vllm_omni/model_executor/models/cosyvoice3/cosyvoice3.py": "b10da0c738e80de1e08881431816d50f7dad66bcb782757aed779b0f3942631d",
+        "vllm_omni/model_executor/stage_input_processors/cosyvoice3.py": "3e083f90fbc161c618028fda1e19a7f6f67b0908ab7d260f4ff5208612ee693e",
+        "vllm_omni/core/sched/omni_ar_scheduler.py": "94bb6fa8f82dc98fe60c4a053b30428fb9769474410e76762400158398e8b2ca",
+        "vllm_omni/worker/gpu_ar_model_runner.py": "5691ecb33d230a45c9120daed7ab4dc8729f3062ad68e853a11e7bceefb257bd",
+        "tests/model_executor/models/cosyvoice3/test_cosyvoice3_model_helpers.py": "e3de937940c14434374889562c3d2ab92721b918b8de838a41c8e34349f440b5",
+        "tests/core/sched/test_omni_ar_scheduler_streaming.py": "20541e820585fae169895b9b5044681ccfe7e5be0e1b5c762adb2086949d589b",
+        "vllm_omni/deploy/cosyvoice3.yaml": "9fe73f74e3214bc236abbcc21372c4dbe1a82a8cd2e4e8abd35701dcc3d547a5"
+      },
+      "cleanup": {
+        "vllm_omni/model_executor/models/cosyvoice3/cosyvoice3.py": "8fe44903eb1e8116e7d5de9ee5c39c16eed06fbd4576ef1f85a34fd1cab348a4",
+        "vllm_omni/model_executor/stage_input_processors/cosyvoice3.py": "692852acbf774fdddd04a7fd84736709cd6adab6e867e597656ffbc3d29247d5",
+        "vllm_omni/core/sched/omni_ar_scheduler.py": "b409b690a2058a4e54f80d632a90cd4b77502e44b4dc933ae516fc5d35dc2eb4",
+        "vllm_omni/worker/gpu_ar_model_runner.py": "5691ecb33d230a45c9120daed7ab4dc8729f3062ad68e853a11e7bceefb257bd",
+        "tests/model_executor/models/cosyvoice3/test_cosyvoice3_model_helpers.py": "8fca990e53b4a6650ad8023d2ae185840cd0f4be17da113916499501d492bb64",
+        "tests/core/sched/test_omni_ar_scheduler_streaming.py": "1b3cf0760848a31d1278ab2c70aafdeb174eb00f45680dbc8a7a93de43c1716e",
+        "vllm_omni/deploy/cosyvoice3.yaml": "9fe73f74e3214bc236abbcc21372c4dbe1a82a8cd2e4e8abd35701dcc3d547a5"
+      }
+    },
+    "benchmark_sha256": "a066dfc26ea82661eb6c1fbf83d33ea8f192be9e8c4846febd05466ef46e5729",
+    "runtime": "vLLM 0.30.0+cu129, PyTorch 2.13.0+cu129",
+    "current_main_runtime_validated": true,
+    "model_revision": "29e01c4e8d000f4bcd70751be16fa94bf3d85a18",
+    "workloads": {
+      "paired_rounds": 1,
+      "concurrency": 1,
+      "fixed_tokens": 128,
+      "warmups": 2,
+      "measured_requests_per_run": 8
+    },
+    "use_async_omni_output": false,
+    "requires_token_updates": true
+  },
+  "current_main_base": "ee8fdab1dc26ea8f09d7910cdc98a17c4b0ea02a",
+  "cpu_tests": {
+    "v028": {
+      "passed": 273,
+      "warnings": 19,
+      "seconds": 6.62
+    },
+    "current_main_v030": {
+      "passed": 326,
+      "warnings": 18,
+      "seconds": 6.39
+    }
+  },
+  "profile": [
+    {
+      "file": "results/cleanup-profile/traces/20261003-144319_stage0_rank0_1791038599/trace_rank0.json.gz",
+      "bookkeep": 128,
+      "async_snapshots": 0,
+      "output_builds": 128,
+      "background_builds": 0
+    }
+  ],
+  "single_device": true,
+  "v028_service_restore": true,
+  "current_main_gpu_parity": {
+    "bitwise_equal_requests": 8,
+    "same_chunk_boundaries": true,
+    "same_audio_lengths": true,
+    "performance_claim": false
+  },
+  "current_main_service_restore": true,
+  "formatting_preserves_tested_python_ast": true,
+  "submission_files": {
+    "docs/design/feature/omni_async_output_materialization.md": "668484d8b26faba4761f80a43154100776423d613ac7de13e14b5f2123d1aa68",
+    "tests/core/sched/test_omni_ar_scheduler_streaming.py": "1b3cf0760848a31d1278ab2c70aafdeb174eb00f45680dbc8a7a93de43c1716e",
+    "tests/model_executor/models/cosyvoice3/test_cosyvoice3_model_helpers.py": "ed125f44a47369d3e2339681b39e0e86916ba00832d79c1bc337cc458d3df6f6",
+    "vllm_omni/core/sched/omni_ar_scheduler.py": "b409b690a2058a4e54f80d632a90cd4b77502e44b4dc933ae516fc5d35dc2eb4",
+    "vllm_omni/model_executor/models/cosyvoice3/cosyvoice3.py": "8fe44903eb1e8116e7d5de9ee5c39c16eed06fbd4576ef1f85a34fd1cab348a4",
+    "vllm_omni/model_executor/stage_input_processors/cosyvoice3.py": "692852acbf774fdddd04a7fd84736709cd6adab6e867e597656ffbc3d29247d5"
+  },
+  "v028_patch_sha256": "dde59460bd8452fd85f8b2ba6568305345e8fc80f5d08a3737bffdad92bf2ad5"
+}
