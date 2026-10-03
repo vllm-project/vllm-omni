@@ -1910,6 +1910,9 @@ class WholeEulerCFMGraphWrapper:
                 return slotted
         if mixed_offsets:
             return None
+        if att_rows is not None:
+            # A refused slot replay can leave resident rows; the arena path reads tensors.
+            att_rows = _materialize_att_rows(att_rows)
         offset_cap = _capture_offset(offset, self.offset_bucket_frames, sum(att_keep) if att_keep is not None else 0)
         mask_cap = _build_capture_mask(
             attn_mask=attn_mask,
