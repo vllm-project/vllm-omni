@@ -3,34 +3,7 @@
 
 # ruff: noqa: N803
 
-"""Fused gated residual + LayerNorm (+ adaLN modulation, + Mish) operator.
-
-adaLN DiT blocks run the same chain three times per block::
-
-    x = x + gate * y                       # gated residual
-    h = layer_norm(x) * (1 + scale) + shift  # the next sub-block's input
-
-In eager PyTorch that is five full passes over the activation (mul, add,
-layer_norm, mul, add) plus a ``1 + scale`` op. ``residual_layer_norm`` does
-the whole chain in one pass per row, the same shape of kernel as Qwen-Image's
-``_residual_layernorm_select01_kernel`` (``diffusion/layers/
-qwen_select01_modulation.py``) minus its two-branch select. The modulation is
-the LayerNorm's affine: pass ``weight = 1 + scale`` and ``bias = shift``.
-
-``y`` may also be the output of a causal convolution computed as one GEMM
-over its taps (``taps > 1``): for a ``K``-tap convolution over a history of
-``K - 1 + T`` frames, ``Y = history @ [W_0; ...; W_{K-1}]^T`` has ``K * C``
-columns and the convolution output is ``sum_k Y[t + k, k*C:(k+1)*C] + y_bias``,
-which the kernel reduces on the fly. That lets a convolution, its bias, the
-gated residual and the next LayerNorm share one pass, and lets a convolution
-followed by ``LayerNorm + Mish`` (no residual) finish in one pass too.
-
-The output may be a strided view (e.g. the frames of a causal-conv history
-buffer behind its cached prefix), so the result lands where the next GEMM
-reads it without a ``torch.cat``. Statistics are accumulated in fp32; storage
-dtype follows the tensors. On devices without Triton the native PyTorch chain
-runs instead, so callers never need a platform check.
-"""
+"""Fused ``act(layer_norm(residual + gate * y) * weight + bias)`` (optional conv taps)."""
 
 import torch
 import torch.nn.functional as F
@@ -110,9 +83,6 @@ def _residual_layer_norm_kernel(
     if HAS_BIAS:
         normalized = normalized + tl.load(bias_ptr + cols, mask=mask, other=0.0).to(tl.float32)
     if ACTIVATION == 1:
-        # Mish = v * tanh(softplus(v)), with tanh(log(1 + e)) = e(e + 2) / (e(e + 2) + 2)
-        # for e = exp(v): no log/tanh, exact for very negative v, and
-        # PyTorch's softplus threshold (v > 20 -> v) makes the factor 1 there.
         e = tl.exp(tl.minimum(normalized, 20.0))
         numerator = e * (e + 2.0)
         factor = tl.where(normalized > 20.0, 1.0, numerator / (numerator + 2.0))
@@ -179,26 +149,7 @@ def residual_layer_norm(
     residual_out: torch.Tensor | None = None,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """``act(layer_norm(residual + gate * y) * weight + bias)`` in one pass per row.
-
-    Args:
-        residual: ``(N, T, C)`` residual stream, or ``None`` to normalize
-            ``gate * y`` alone.
-        y: ``(N, T, C)`` sub-block output, or with ``taps = K > 1`` the
-            ``(N, K - 1 + T, K * C)`` GEMM of a ``K``-tap causal convolution
-            over its history (see the module docstring). ``None`` normalizes
-            ``residual`` alone.
-        gate: ``(C,)`` multiplier of ``y`` (after ``y_bias``).
-        weight: ``(C,)`` LayerNorm scale; for adaLN pass ``1 + scale``.
-        bias: ``(C,)`` LayerNorm shift; for adaLN pass ``shift``.
-        taps: convolution taps folded into ``y``.
-        y_bias: ``(C,)`` added to the tap sum (the convolution bias).
-        activation: ``None`` or ``"mish"``, applied after the affine.
-        residual_out: where ``residual + gate * y`` is stored, may be
-            ``residual`` itself (in place). ``None`` skips the store.
-        out: ``(N, T, C)`` destination, may be a strided view with
-            contiguous channels. Allocated when ``None``.
-    """
+    """``act(layer_norm(residual + gate * y) * weight + bias)`` in one pass per row."""
     if activation not in _ACTIVATIONS:
         raise ValueError(f"residual_layer_norm: unsupported activation {activation!r}")
     if residual is None and y is None:

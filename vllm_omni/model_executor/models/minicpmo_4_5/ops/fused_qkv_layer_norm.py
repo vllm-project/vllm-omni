@@ -3,25 +3,7 @@
 
 # ruff: noqa: N803
 
-"""Fused attention prologue for a packed QKV projection with LayerNorm q/k norms.
-
-MiniCPM-o DiT attention with ``qk_norm=True`` and ``nn.LayerNorm`` (no RoPE)
-splits a packed QKV, normalizes q and k per head, and a streaming block writes
-the new keys and values into its attention cache. Eagerly that is a
-transpose copy and a LayerNorm for each of q and k (``F.layer_norm`` needs a
-contiguous input) plus a copy of each of k and v into the cache.
-
-``qkv_head_layer_norm`` does it in one pass: each program reads one token's
-packed ``[q | k | v]`` row, normalizes the q and k heads, and stores q in the
-``(N, H, T, D)`` attention layout and k and v straight into a key/value
-buffer whose last axis is ``[k | v]`` (``2 * D`` wide, the layout of the CFM
-estimator's attention cache). Statistics are accumulated in fp32. Other
-devices run the native PyTorch ops.
-
-The key/value buffer may also be a pool of resident caches: ``rows`` maps
-each of the ``N`` rows to its pool row and ``positions`` each token to the
-frame it is written to (negative: not written, e.g. query padding).
-"""
+"""Fused packed-QKV split + per-head LayerNorm of q/k into the CFM KV cache."""
 
 import torch
 from vllm.triton_utils import tl, triton
@@ -115,15 +97,7 @@ def qkv_head_layer_norm(
     rows: torch.Tensor | None = None,
     positions: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Split ``qkv`` (N, T, 3*H*D), LayerNorm q/k per head, store q and ``kv``.
-
-    ``kv`` is an ``(N, H, >= T, 2 * D)`` buffer (any strides with a
-    contiguous last axis); frame ``t`` of it receives ``[k_t | v_t]``.
-    With ``rows`` (``(N,)`` integers) row ``n`` goes to ``kv[rows[n]]`` of an
-    ``(R, H, F, 2 * D)`` pool, and with ``positions`` (``(N, T)`` integers)
-    token ``t`` to frame ``positions[n, t]``, or nowhere when that is
-    negative. Returns q as ``(N, H, T, D)`` (``q_out`` when given).
-    """
+    """Split packed ``qkv``, LayerNorm q/k per head, write q and interleaved ``kv``."""
     if not isinstance(q_norm, torch.nn.LayerNorm) or not isinstance(k_norm, torch.nn.LayerNorm):
         raise TypeError("qkv_head_layer_norm expects nn.LayerNorm q/k norms")
     batch, frames, width = (int(dim) for dim in qkv.shape)

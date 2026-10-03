@@ -3,24 +3,7 @@
 
 # ruff: noqa: N803
 
-"""Fused Euler/CFG step of the Whole-Euler CFM solve (Stage 2).
-
-Every Euler step of ``WholeEulerCFMGraphWrapper._run_euler_loop`` stages the
-estimator input as ``cat(cat(x, x), mu, speakers, cond)`` on the channel axis
-(two copies), the estimator's ``in_proj`` reads it transposed (a third copy,
-plus a separate bias add because the transposed input cannot fold into
-``addmm``), and the step ends with five elementwise passes for
-``x + dt * ((1 + r) * cond - r * uncond)``.
-
-Only ``x`` changes between steps, so ``stage_estimator_input`` writes the
-whole input once per solve, frames-major ``(2B, T, C_in)`` (the layout
-``in_proj`` reads), and ``euler_cfg_step`` does the CFG combination and the
-update in one pass and writes the new ``x`` into both CFG halves of that
-buffer for the next step. The arithmetic is PyTorch's, op by op in fp32
-without FMA contraction, so ``x`` is bitwise identical to the eager step;
-only ``in_proj`` changes kernel (bias in the GEMM epilogue), which is fp32
-rounding-level.
-"""
+"""Fused Euler/CFG step: stage estimator input once, update x in one pass."""
 
 from __future__ import annotations
 
@@ -179,13 +162,7 @@ def euler_cfg_step(
     inference_cfg_rate: float,
     staged: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """``_euler_step(x, estimate, dt, r, B)`` into ``x_out`` (may be ``x``), and into ``staged``'s x channels.
-
-    ``x`` / ``x_out`` are ``(B, C, T)`` with contiguous frames, ``estimate``
-    is ``(2B, C, T)`` ``[cond | uncond]`` (any strides), ``staged`` the
-    ``(2B, T, C_in)`` buffer of ``stage_estimator_input`` whose first ``C``
-    channels of both CFG halves receive the new ``x``.
-    """
+    """``_euler_step(x, estimate, dt, r, B)`` into ``x_out`` (may be ``x``)."""
     batch, channels, frames = (int(d) for d in x.shape)
     if tuple(estimate.shape) != (2 * batch, channels, frames) or tuple(x_out.shape) != tuple(x.shape):
         raise ValueError("euler_cfg_step: shape mismatch")

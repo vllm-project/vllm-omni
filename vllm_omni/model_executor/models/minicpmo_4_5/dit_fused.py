@@ -1,47 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Fused forward of the Code2Wav CFM DiT blocks (Stage 2).
-
-The estimator's block is ``attention -> causal conv block -> MLP``, each behind
-an adaLN-modulated LayerNorm and a gated residual. The ragged body
-(``BatchedToken2Wav._blocks_forward_chunk_ragged``) runs it op by op: about 47
-kernels per block, most of them full passes over the activation (the
-modulation, the gates, transposes, ``torch.cat`` of the conv histories, and the
-layout conversions cuDNN adds around every convolution). This body computes
-the same function with about 15:
-
-* The modulation depends only on the Euler timestep (``c = t_embedder(t)``,
-  identical for every row), so the shift/scale/gate vectors of all blocks are
-  computed once per timestep (``dit_modulation``) instead of by 16 SiLU+GEMM
-  pairs over every row on every step.
-* ``gated residual -> LayerNorm -> (1 + scale), shift`` is one pass
-  (``residual_layer_norm``); the modulation is the LayerNorm affine.
-* q/k/v come from one packed GEMM; the q/k LayerNorms and the key/value
-  writes into the attention cache are one pass (``qkv_head_layer_norm``).
-* Each 3-tap causal convolution is one GEMM over its history with the taps
-  stacked on the output axis; its tap sum and bias are reduced by the pass
-  that follows it (``LayerNorm + Mish`` after the first, the gated residual
-  and the MLP's LayerNorm after the second). The pass before each convolution
-  writes straight into the history buffer behind its cached frames.
-* The MLP's GELU (tanh) runs in the GEMM epilogue.
-* Attention is the tiled fp32 (tf32x3) kernel (``cfm_attention.py``) on
-  NVIDIA SM80+, fp32-equivalent and faster than SDPA at these short windows;
-  SDPA elsewhere.
-
-Everything is fp32 storage with the matmul precision the caller configured
-(the ``flow`` TF32 scope in serving), so results match the ragged body to fp32
-rounding, not bitwise: reductions and the tap sums associate differently.
-
-With ``gemm=DitGemm(...)`` (``cfm_dit_gemm``) the GEMMs run on
-``tf32_linear`` (Triton) instead of cuBLAS, with a tile shape and a
-deterministic split-K picked per row count (``dit_gemm_config``) so the small
-streaming batches fill the device; TF32 products under the ``flow`` scope,
-three TF32 products (fp32-level) outside it, or as ``DitGemm.precision`` says. ``conv_windows`` also computes
-each causal convolution as one GEMM over its overlapping im2col windows of the
-history (``conv_window_view``) instead of the tap-stacked GEMM, so the GEMM
-writes ``C`` instead of ``K * C`` columns over ``T`` instead of ``K - 1 + T``
-frames and the following pass reads a third of the data.
-"""
+"""Fused Code2Wav CFM DiT block forward (~15 kernels vs ~47 eager ops per block)."""
 
 from __future__ import annotations
 
@@ -118,14 +77,7 @@ def supports_fused_body(estimator: nn.Module) -> bool:
 
 
 def dit_modulation(estimator: nn.Module, time_embedding: torch.Tensor) -> torch.Tensor:
-    """The adaLN vectors of every block and of the final layer for one timestep.
-
-    ``time_embedding`` is one row, ``(1, 1, C)`` (every row of a solve shares
-    the timestep). Returns ``(depth + 1, 9, C)``: row ``i < depth`` is block
-    ``i``'s chunks in ``adaLN_modulation`` order with each scale replaced by
-    ``1 + scale``; row ``depth`` holds the final layer's ``shift`` and
-    ``1 + scale`` in its first two slots.
-    """
+    """adaLN table ``(depth + 1, 9, C)`` for one timestep; scales stored as ``1 + scale``."""
     embedding = time_embedding.reshape(1, 1, -1)
     rows = []
     for block in estimator.blocks:
@@ -221,15 +173,7 @@ def _attention(
     slots: tuple[torch.Tensor, torch.Tensor] | None = None,
     gemm: DitGemm | None = None,
 ) -> torch.Tensor:
-    """``attn.forward_chunk`` over ``hidden`` that writes the new keys/values into ``kv`` (``[current | cache]``).
-
-    With ``slots = (rows, positions)`` ``kv`` is an ``AttSlotPool`` block
-    (``(2 * slots, heads, frames, 2 * head_dim)``): row ``n`` writes its
-    keys/values to frames ``positions[n]`` of pool row ``rows[n]`` and attends
-    to that row under ``attn_mask`` over the pool frames. Attention is the
-    tiled tf32x3 kernel (``cfm_attention``) on NVIDIA SM80+ and always for a
-    pool, SDPA otherwise.
-    """
+    """``attn.forward_chunk`` over ``hidden``, writing new keys/values into ``kv``."""
     batch, frames, _ = hidden.shape
     weight, bias = packed_qkv(attn)
     qkv = _linear(hidden.reshape(batch * frames, -1), weight, bias, gemm).view(batch, frames, -1)
@@ -282,14 +226,7 @@ def blocks_forward_chunk_fused(
     slots: tuple[torch.Tensor, torch.Tensor] | None = None,
     gemm: DitGemm | None = None,
 ) -> torch.Tensor:
-    """``BatchedToken2Wav._blocks_forward_chunk_ragged``, fused (see the module docstring).
-
-    Same arguments and results; ``modulation`` is this timestep's
-    ``dit_modulation`` table (computed from ``time_embedding[:1]`` when
-    ``None``). ``slots`` attends to an ``AttSlotPool`` in place (see ``_attention``);
-    ``att_cache`` is then unused and ``att_cache_buffer`` is the pool.
-    ``gemm`` selects the GEMM backend (``DitGemm``; ``None``: cuBLAS).
-    """
+    """``BatchedToken2Wav._blocks_forward_chunk_ragged`` with fused norms/GEMM/attention."""
     if isinstance(valid_lengths, torch.Tensor):
         lengths = valid_lengths
     else:

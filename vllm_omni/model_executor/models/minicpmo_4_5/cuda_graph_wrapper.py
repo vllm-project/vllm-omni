@@ -58,13 +58,7 @@ def codec_frame_range(value, *, name: str) -> range:
 
 
 def empty_hift_outputs(speech_feat: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """HiFT's ``(speech, source)`` for a zero-width mel, without touching the device.
-
-    HiFT emits a fixed number of samples per mel frame (480 at 24 kHz), so no
-    frames means no samples. Running it instead fails in its first convolution,
-    which cannot pad an empty input up to its kernel. Zero-element tensors
-    allocate nothing and launch no kernel.
-    """
+    """HiFT ``(speech, source)`` for a zero-width mel, without launching the vocoder."""
     batch_size = int(speech_feat.shape[0])
     return speech_feat.new_empty((batch_size, 0)), speech_feat.new_empty((batch_size, 1, 0))
 
@@ -144,10 +138,6 @@ class HiFTGraphWrapper:
                 raise ValueError("MiniCPM-o initial codec chunk must emit audio beyond the HiFT mel cache")
             frames.append(first_frames)
             cache_lengths.append(0)
-        # Extra codec chunk sizes that also stream as continuations. A
-        # full-duplex unit is one ``initial_codec_chunk_frames``-sized chunk
-        # after another, so its steady vocoder call (mel cache + source
-        # cache) is outside the buckets above and would run eager every unit.
         shapes = list(zip(frames, cache_lengths, strict=True))
         for codec_frames in self.extra_codec_chunk_frames:
             mel_frames = self._chunk_mel_frames(codec_frames)
@@ -159,12 +149,7 @@ class HiFTGraphWrapper:
         return [shape[0] for shape in shapes], [shape[1] for shape in shapes]
 
     def derive_exact_shapes(self) -> list[tuple[int, int]]:
-        """``(mel_frames, cache_source_len)`` of the exact-shape graphs, outside the buckets.
-
-        A first chunk of ``f`` codec frames vocodes ``_chunk_mel_frames(f)``
-        mel frames with no source cache; a continuation also carries the mel
-        cache in front and the source cache.
-        """
+        """``(mel_frames, cache_source_len)`` of the exact-shape graphs, outside the buckets."""
         buckets = set(zip(self.capture_bucket_size, self.capture_source_cache_len, strict=True))
         shapes: list[tuple[int, int]] = []
         candidates = [(self._chunk_mel_frames(f), 0) for f in getattr(self, "first_chunk_frames", ())]
@@ -203,8 +188,6 @@ class HiFTGraphWrapper:
                 key = (batch_size, mel_frames, source_cache_len)
                 self._capture(*key)
                 if key in self.graph:
-                    # Build this frame count's ISTFT envelope now: the first build
-                    # reads a value back to the host (``_istft_without_host_sync``).
                     self.finalize_fn(self.static_magnitude_outputs[key][:1], self.static_phase_outputs[key][:1])
         captured = len(self.graph) - before
         used_after = _device_used_bytes(self.device)
@@ -340,13 +323,7 @@ _DTYPE_MAP = {str(dtype): dtype for dtype in (torch.float32, torch.float16, torc
 
 
 def _memory_snapshot(device: torch.device) -> tuple[int, int] | None:
-    """(allocated, reserved) bytes, or None when the device cannot report them.
-
-    Capture draws on the caching allocator, so these are the numbers that say
-    what a capture cost. Free device memory is not: the allocator serves a
-    capture out of memory it has already reserved, which is most of the device
-    on a normally configured worker.
-    """
+    """(allocated, reserved) bytes, or None when the device cannot report them."""
     if device.type != "cuda":
         return None
     try:
@@ -356,11 +333,7 @@ def _memory_snapshot(device: torch.device) -> tuple[int, int] | None:
 
 
 def _device_used_bytes(device: torch.device) -> int | None:
-    """Device memory in use (``cudaMemGetInfo``), including what the caching allocator never sees.
-
-    CUDA graphs also hold driver-side memory per captured graph, which the
-    allocator's ``memory_reserved`` does not count.
-    """
+    """Device memory in use (``cudaMemGetInfo``), including graph driver allocations."""
     if device.type != "cuda":
         return None
     try:
@@ -598,14 +571,7 @@ def _copy_frame_segments(dst: torch.Tensor, src: torch.Tensor, segments: list[tu
 
 
 class SharedPromptAttCache:
-    """A request-owned cache prefix plus a read-only prompt suffix.
-
-    The logical cache remains ``(..., frames, width)`` so callers and graph
-    bucketing keep their existing shape contracts.  Only the tail is retained
-    per request; graph staging can copy a range directly without materializing
-    the shared suffix. The current-first cache layout means the immutable
-    voice segment is at the logical tail after streaming trim.
-    """
+    """A request-owned cache prefix plus a read-only prompt suffix."""
 
     __slots__ = ("prefix", "prompt")
 
@@ -1054,24 +1020,7 @@ class WholeEulerExecutionArena:
 
 
 class AttSlotPool:
-    """Resident estimator attention caches, one slot per request, for the Whole-Euler graphs.
-
-    The arena path copies each request's cache (~0.5 GiB in fp32) into the
-    shared arena and the new one back out on every replay; here the cache
-    stays in its slot and the graph attends to it in place.
-
-    The streaming trim (``_att_keep_ranges``) keeps a cache's first ``prefix``
-    and last ``suffix`` frames, and chunks are prepended, so the last
-    ``suffix`` frames never change once present. They sit at physical frames
-    ``0 .. suffix - 1`` and the streaming frames anywhere behind them (a
-    ``ResidentAttCache`` lists where). The graph writes a chunk's keys/values
-    to free frames and a trim only releases frames, so nothing moves and the
-    cache offset is no graph key: attention runs over the whole slot under a
-    mask of the request's frames (no positional term reads the key order).
-
-    Storage is ``(n_t, depth, slots, 2, heads, frames, width)``; request
-    ``s``'s CFG rows are rows ``2s`` and ``2s + 1`` of ``rows()``.
-    """
+    """Resident estimator attention caches, one slot per request, for Whole-Euler graphs."""
 
     def __init__(
         self,
@@ -1111,12 +1060,7 @@ class AttSlotPool:
         return self.suffix <= frames <= self.frames
 
     def adopt(self, cache: torch.Tensor) -> "ResidentAttCache | None":
-        """A slot holding the logical ``(n_t, depth, 2, heads, L, width)`` ``cache``; ``None`` when full.
-
-        The last ``suffix`` frames go to the fixed frames, the rest in order
-        behind them. ``cache`` itself is not written, so a shared one (the
-        prompt state) can be adopted by every request that starts from it.
-        """
+        """A slot holding the logical cache; ``None`` when the pool is full."""
         frames = int(cache.shape[4])
         if not self._free or not self.fits(frames):
             return None
@@ -1129,12 +1073,9 @@ class AttSlotPool:
 class ResidentAttCache:
     """A request's estimator attention cache resident in an ``AttSlotPool`` slot.
 
-    Stands in for the ``(n_t, depth, 2, heads, L, width)`` tensor the
-    Whole-Euler path otherwise hands back per request: ``shape``, ``dtype``
-    and ``device`` describe that logical tensor, and ``materialize()`` builds
-    it for the paths that need one. ``layout`` is the physical frame of each
-    streaming frame, in logical order. The slot returns to the pool when the
-    handle is collected; work queued on it before then runs first, since all
+    Stands in for the logical ``(n_t, depth, 2, heads, L, width)`` tensor.
+    The slot returns to the pool when the handle is collected; work queued
+    on it before then runs first, since all
     of it is on one stream.
     """
 
@@ -2023,21 +1964,7 @@ class WholeEulerCFMGraphWrapper:
         max_graph_bytes: int = 1 << 30,
         keep: tuple[int, int] | None = None,
     ) -> int:
-        """Capture the graphs streams of one prompt need, before serving them.
-
-        A capture while serving stalls every stream on the device (warmup
-        solves plus the capture, 1-2 s), so every graph batch, capture width
-        and cache offset (``offsets``, snapped onto the ``_capture_offset``
-        grid anchored at ``steady``) is captured here instead. The cross
-        product is bounded by ``max_graphs`` so no capture flushes another,
-        and it stops once one graph holds more than ``max_graph_bytes`` of
-        device memory beyond the shared arena (a graph normally holds a few
-        MiB; the rest then capture on first use). Returns the number of
-        graphs captured.
-
-        With a slot pool (``att_slots``) and the streaming trim ``keep``,
-        the streaming graphs are the slot-pool ones, one per batch and width.
-        """
+        """Capture Whole-Euler graphs for one prompt before serving. Returns the capture count."""
         if not self.enabled:
             return 0
         if self.att_slots and keep is not None and self._ensure_slot_pool(keep) is not None:

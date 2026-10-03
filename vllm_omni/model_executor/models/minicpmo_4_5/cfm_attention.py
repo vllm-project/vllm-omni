@@ -98,22 +98,11 @@ def cfm_attention(
     mask: torch.Tensor | None = None,
     kv_rows: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """FP32 Q/K/V, bool [B,Q,K] mask, [B,H,Q,D] result (BQHD storage).
-
-    Uses three TF32 products per FP32 dot; no BF16 casts or cache changes.
-    Numerical equivalence is tolerance-based, not bitwise. With ``kv_rows``
-    (``[B]`` integers) K/V are ``[R,H,K,D]`` pools and query row ``b``
-    attends to pool row ``kv_rows[b]``.
-    """
+    """FP32 tiled attention; optional ``kv_rows`` indexes a pooled K/V cache."""
     b, heads, nq, dim = q.shape
     nk = k.shape[2]
     if q.dtype != torch.float32 or k.dtype != torch.float32 or v.dtype != torch.float32:
         raise ValueError("CFM tiled attention requires float32 Q/K/V")
-    # Strided FP32 tiles can exceed the 99 KiB per-block limit on L4.
-    # Measured on A800 (SM80) across the deployed shapes (2..32 rows, Q<=150,
-    # K<=524, D=64): two stages beat three everywhere, e.g. 265 vs 356 us at
-    # (16, 8, 150, 524); the extra stage only paid for SRAM capacity, not
-    # latency.
     num_stages = 2
     out = torch.empty((b, nq, heads, dim), device=q.device, dtype=q.dtype)
     _attention[(b, heads, triton.cdiv(nq, 32))](

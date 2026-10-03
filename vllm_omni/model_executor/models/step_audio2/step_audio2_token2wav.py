@@ -95,21 +95,12 @@ class _ConvRNNF0Predictor(nn.Module):
         return self.classifier(self.condnet(x).transpose(1, 2)).squeeze(-1).abs()
 
 
-# Upstream cosyvoice2 registers these non-persistent fp32 buffers for its own
-# chunked streaming (``CausalConditionalCFM.solve_euler_chunk`` and
-# ``DiT.forward_chunk``): (16, 16, 2, 8, 1000, 128) on the decoder (2,000 MiB)
-# and (16, 2, 8, 1000, 128) on the estimator (125 MiB). Only
-# ``flow.setup_cache`` / ``flow.inference_chunk`` reach them.
+# Upstream cosyvoice2 chunk-streaming att_cache_buffer (~2.1 GiB); unused by BatchedToken2Wav.
 _UPSTREAM_CHUNK_ATT_BUFFER = "att_cache_buffer"
 
 
 def drop_upstream_chunk_att_buffers(flow: nn.Module) -> int:
-    """Remove the upstream chunk-streaming attention buffers from ``flow``.
-
-    Returns the bytes released. The attributes are gone afterwards, so any
-    upstream chunk path that still reaches them fails with an AttributeError
-    instead of computing on a stand-in.
-    """
+    """Drop unused upstream chunk-streaming attention buffers. Returns bytes released."""
     released = 0
     decoder = getattr(flow, "decoder", None)
     for module in (decoder, getattr(decoder, "estimator", None)):

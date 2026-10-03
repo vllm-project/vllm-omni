@@ -19,27 +19,14 @@ from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import (
     _zero_padded_frames,
 )
 from vllm_omni.model_executor.models.minicpmo_4_5.cuda_graph_wrapper import (
-    SharedPromptAttCache,
     _att_keep_ranges,
     _build_capture_mask,
-    _capture_offset,
     _capture_query_width,
     _whole_euler_att_segments,
     _zero_padded_cnn_cache,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
-
-
-def test_shared_prompt_attention_cache_is_bit_exact_and_range_copyable():
-    prefix = torch.arange(2 * 2 * 2 * 1 * 5 * 4, dtype=torch.float32).reshape(2, 2, 2, 1, 5, 4)
-    prompt = torch.arange(2 * 2 * 2 * 1 * 3 * 4, dtype=torch.float32).reshape(2, 2, 2, 1, 3, 4) + 1000
-    shared = SharedPromptAttCache(prefix, prompt)
-    torch.testing.assert_close(shared.materialize(), torch.cat((prefix, prompt), dim=4), rtol=0, atol=0)
-    copied = torch.empty_like(shared.materialize())
-    shared.copy_range_to(copied[..., :4, :], 0, 4)
-    shared.copy_range_to(copied[..., 4:, :], 4, 4)
-    torch.testing.assert_close(copied, shared.materialize(), rtol=0, atol=0)
 
 
 def test_pads_partial_chunk_up_to_bucket():
@@ -156,80 +143,6 @@ def test_varied_chunk_lengths_collapse_onto_few_widths():
     }
     assert len(padded) == 4, sorted(padded)  # 16 / 32 / 48 / 64
     assert len(padded) < len(varied)
-
-
-def test_capture_query_width_tuple_takes_the_narrowest_width_that_fits():
-    widths = (56, 150)
-    # A 25-token duplex unit (50 mel frames, 56 as a final chunk) keeps its own
-    # narrow graph instead of the 75-token turn chunk's 150.
-    assert _capture_query_width(50, widths) == 56
-    assert _capture_query_width(56, widths) == 56
-    assert _capture_query_width(57, widths) == 150
-    assert _capture_query_width(150, widths) == 150
-    assert _capture_query_width(156, widths) == 300
-    assert _capture_query_width(50, (150,)) == _capture_query_width(50, 150) == 150
-    assert _capture_query_width(50, ()) == 50
-
-
-def test_capture_offset_grid_is_anchored_at_the_steady_cache():
-    steady = 400  # prompt (300) + the 100 frames the streaming trim keeps
-    # First chunks of any size land on one of three offsets; steady is exact.
-    assert {_capture_offset(o, 50, steady) for o in range(300, 401)} == {300, 350, 400}
-    assert _capture_offset(301, 50, steady) == 350
-    assert _capture_offset(350, 50, steady) == 350
-    assert _capture_offset(351, 50, steady) == 400
-    assert _capture_offset(400, 50, steady) == 400
-    # A 274-frame prompt: steady 374, still exact.
-    assert {_capture_offset(o, 50, 374) for o in range(274, 375)} == {274, 324, 374}
-    # The offset-0 prompt solve, no grid, and caches past steady.
-    assert _capture_offset(0, 50, steady) == 0
-    assert _capture_offset(322, 0, steady) == 322
-    assert _capture_offset(322, 1, steady) == 322
-    assert _capture_offset(410, 50, steady) == 450
-    assert _capture_offset(322, 50, 0) == 350
-
-
-def test_capture_mask_masks_the_offset_grid_padding():
-    offset, offset_cap, query_cap, mel_width = 322, 350, 64, 50
-    mask = _build_capture_mask(
-        attn_mask=None,
-        batch_size=2,
-        query_cap=query_cap,
-        offset=offset,
-        mel_width=mel_width,
-        mel_frames=mel_width,
-        device=torch.device("cpu"),
-        offset_cap=offset_cap,
-    )
-    assert mask.shape == (4, query_cap, query_cap + offset_cap)
-    assert mask[:, :, query_cap : query_cap + offset].all()
-    assert not mask[:, :, query_cap + offset :].any()
-    exact = _build_capture_mask(
-        attn_mask=None,
-        batch_size=2,
-        query_cap=query_cap,
-        offset=offset,
-        mel_width=mel_width,
-        mel_frames=mel_width,
-        device=torch.device("cpu"),
-    )
-    assert torch.equal(mask[..., : query_cap + offset], exact)
-    # A caller mask (padded chunk columns masked) moves into the grid layout too.
-    caller = torch.ones(4, mel_width, mel_width + offset, dtype=torch.bool)
-    caller[:, :, 40:mel_width] = False
-    gridded = _build_capture_mask(
-        attn_mask=caller,
-        batch_size=2,
-        query_cap=query_cap,
-        offset=offset,
-        mel_width=mel_width,
-        mel_frames=40,
-        device=torch.device("cpu"),
-        offset_cap=offset_cap,
-    )
-    assert not gridded[:, :mel_width, 40:query_cap].any()
-    assert gridded[:, :mel_width, query_cap : query_cap + offset].all()
-    assert not gridded[:, :, query_cap + offset :].any()
 
 
 def test_capture_query_width_collapses_decode_grid_onto_one_bucket():
