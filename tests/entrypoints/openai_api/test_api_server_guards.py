@@ -867,22 +867,23 @@ def test_chat_completion_raw_body_guards_allow_null_defaults(raw_body) -> None:
 
 
 @pytest.mark.asyncio
-async def test_multi_api_rejects_runtime_voice_upload() -> None:
+async def test_multi_api_allows_runtime_voice_upload_and_deletion() -> None:
+    # The speaker directory is shared by every API process, so these routes
+    # are not process-local; without a speech handler they report 404.
     app = FastAPI()
     app.state.api_server_count = 2
-    raw_request = _request_for(app, method="POST", path="/v1/audio/voices")
+    app.state.openai_serving_speech = None
 
-    with pytest.raises(HTTPException) as exc_info:
-        await api_server.upload_voice(
-            raw_request,
-            audio_sample=None,
-            speaker_embedding=None,
-            consent="consent-id",
-            name="probe",
-        )
+    upload = await api_server.upload_voice(
+        _request_for(app, method="POST", path="/v1/audio/voices"),
+        audio_sample=None,
+        speaker_embedding=None,
+        consent="consent-id",
+        name="probe",
+    )
+    deletion = await api_server.delete_voice("probe", _request_for(app, method="DELETE", path="/v1/audio/voices/probe"))
 
-    assert exc_info.value.status_code == 409
-    assert "process-local frontend state" in exc_info.value.detail
+    assert upload.status_code == deletion.status_code == 404
 
 
 @pytest.mark.asyncio
