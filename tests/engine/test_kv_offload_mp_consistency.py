@@ -27,18 +27,23 @@ os.environ.setdefault("VLLM_BATCH_INVARIANT", "1")
 MODEL = "Qwen/Qwen2.5-Omni-3B"
 
 # The MP server is a fourth process on the same box, but it holds its cache in
-# CPU memory, so the GPU split matches the in-process test.
+# CPU memory, so only the three stages claim GPU.
+#
+# These fractions are of total card memory, so the in-process test's 0.5/0.1/0.05
+# leaves the two downstream stages too little on a 24 GB card to load their
+# weights. This split holds on both 24 GB and 40 GB, and still leaves room for
+# three CUDA contexts -- each stage is its own process.
 _THINKER = {
     "max_model_len": 1024,
     "max_num_batched_tokens": 1024,
-    "gpu_memory_utilization": 0.5,
+    "gpu_memory_utilization": 0.45,
     "devices": "0",
     "enforce_eager": True,
     "async_chunk": False,
 }
 _DOWNSTREAM = {
-    "1": {"devices": "0", "gpu_memory_utilization": 0.1, "enforce_eager": True},
-    "2": {"devices": "0", "gpu_memory_utilization": 0.05, "enforce_eager": True},
+    "1": {"devices": "0", "gpu_memory_utilization": 0.20, "enforce_eager": True},
+    "2": {"devices": "0", "gpu_memory_utilization": 0.10, "enforce_eager": True},
 }
 
 # autostart lets the connector own the server process for the duration of the
