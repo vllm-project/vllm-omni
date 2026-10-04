@@ -34,6 +34,23 @@ class RealtimeConnection(VllmRealtimeConnection):
         self.engine = cast(AsyncOmni, self.serving.engine_client)
         self._realtime_audio_ref: np.ndarray | None = None
 
+    async def handle_event(self, event: dict):
+        """Override to emit session.updated and handle empty final commits gracefully."""
+        event_type = event.get("type")
+        # Only intercept empty FINAL commits if model IS validated (avoid engine crash)
+        if (
+            event_type == "input_audio_buffer.commit"
+            and self._is_model_validated
+            and self.audio_queue.empty()
+            and event.get("final")
+        ):
+            await self.send_json({"type": "transcription.done", "text": ""})
+            return
+        # All other events go through parent, then emit session.updated if applicable
+        await super().handle_event(event)
+        if event_type == "session.update" and self._is_model_validated:
+            await self.send_json({"type": "session.updated"})
+
     async def start_generation(self):
         await super().start_generation()
 
