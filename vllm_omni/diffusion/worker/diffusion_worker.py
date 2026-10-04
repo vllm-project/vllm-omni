@@ -446,6 +446,12 @@ class DiffusionWorker:
         if load_format != "dummy":
             assert self.model_runner.pipeline is not None
 
+    def run_helios_vae_warmup(self) -> None:
+        """Run the optional, model-owned warmup once startup dummy work completes."""
+        if self.model_runner is None:
+            raise RuntimeError("Model runner must be initialized before Helios VAE warmup")
+        self.model_runner.run_helios_vae_warmup()
+
     def get_kv_cache_specs(self) -> list[dict[str, KVCacheSpec]]:
         """Return native rank-local specs for every diffusion Worker."""
 
