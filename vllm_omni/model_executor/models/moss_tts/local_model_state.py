@@ -243,7 +243,9 @@ class MossLocalModelState(OmniModelState):
                 continue
             if self._batch_prefill:
                 ref = (buf.get("codes", {}) or {}).get("ref")
-                ref_offset = int(buf.get("ref_offset", 0))
+                # Prefix hits skip hooks for cached prompt tokens. Use the
+                # scheduler's absolute prompt position, also on first admission.
+                ref_offset = int(computed) if computed is not None else int(buf.get("ref_offset", 0))
                 # Device-side references keep the canonical path; do not add
                 # an implicit D2H just to place them in a host staging buffer.
                 if not isinstance(ref, torch.Tensor) or ref.device.type == "cpu":

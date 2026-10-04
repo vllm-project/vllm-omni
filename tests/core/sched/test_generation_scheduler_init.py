@@ -44,7 +44,7 @@ def _config(*, native=True, stateful=True, tp=1, pp=1, extras=None, capacity=128
     )
 
 
-@pytest.mark.parametrize("profile", ["high_concurrency", "low_latency"])
+@pytest.mark.parametrize("profile", ["high_concurrency", "low_latency", "default"])
 @pytest.mark.parametrize("platform", ["cuda", "npu", "xpu", "rocm", "musa"])
 def test_moss_profile_generation_constructor_after_platform_resolution(
     construct_scheduler, monkeypatch, mocker, profile, platform
@@ -53,7 +53,9 @@ def test_moss_profile_generation_constructor_after_platform_resolution(
     # instead of applying an override first and then resolving the worker's
     # actual platform a second time.
     monkeypatch.setattr(current_omni_platform, "device_name", platform)
-    deploy = load_deploy_config(get_deploy_config_path(f"moss_tts_local_mrv2_{profile}.yaml"))
+    deploy = load_deploy_config(
+        get_deploy_config_path("moss_tts_local.yaml" if profile == "default" else f"moss_tts_local_mrv2_{profile}.yaml")
+    )
     pipeline = resolve_pipeline_config("moss_tts_local")
     codec = merge_pipeline_deploy(pipeline, deploy)[1]
     extras = deploy.connectors["shm"]["extra"]

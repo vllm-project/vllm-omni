@@ -159,8 +159,35 @@ curl -X POST http://localhost:8091/v1/audio/speech \
 
 ## Local 1.5 MRV2 and slot attention
 
-`MOSS-TTS-Local-Transformer-v1.5` supports the native CUDA MRV2 pipeline with
-an explicit deploy profile. The default Local profile continues to use V1.
+`MOSS-TTS-Local-Transformer-v1.5` defaults to the native CUDA MRV2 pipeline
+on a single large-memory GPU. The default profile enables GPU request slots,
+batch prefill, direct tokens, prefix caching, codec first-chunk decode and
+private CUDA MPS. It uses the Triton backbone attention backend, precomputed
+frame-local QKV tables and fused audio-channel sampling, with dense codec
+graph buckets through 128. Both stage capacities are 128, with a 32 GiB
+Talker KV budget; this profile targets H200-class memory. For smaller GPUs
+or an explicit V1 fallback, select `moss_tts_local_v1.yaml`. NPU, XPU, ROCm
+and MUSA retain V1 and do not start MPS.
+
+```bash
+CUDA_VISIBLE_DEVICES=0 OMP_NUM_THREADS=1 \
+vllm serve OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5 --omni \
+  --stage-init-timeout 1200 --init-timeout 1500
+```
+
+The lookup table is derived after loading weights and before graph capture.
+Fused attention and a differently sized projection can change rounding;
+fused sampling uses inverse CDF and consumes RNG differently from PyTorch
+multinomial, with lower token IDs breaking ties. Explicit per-request seeds,
+unsupported sampling settings and non-CUDA devices keep the original sampler.
+Set `VLLM_OMNI_MOSS_LOCAL_QKV_LOOKUP=0` or
+`VLLM_OMNI_MOSS_LOCAL_FUSED_SAMPLING=0` in a stage-0 environment override to
+disable either optimization. Do not apply partial MPS SM quotas: BF16 GEMM
+outputs were observed incomplete in that configuration on the validation
+environment. MPS uses an owned control socket or an explicitly supplied
+operator socket; only the owned daemon is stopped at shutdown.
+
+The explicit C64 MRV2 and capped-C128 throughput profiles remain available.
 Both profiles below preserve 1-frame initial and 15-frame steady codec chunks
 and the model's sampling defaults.
 

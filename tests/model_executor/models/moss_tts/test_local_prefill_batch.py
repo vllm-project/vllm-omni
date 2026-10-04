@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Reference batching preserves coordinates and asynchronous source ownership."""
 
-from types import SimpleNamespace
+from dataclasses import dataclass
 
 import numpy as np
 import pytest
@@ -13,6 +13,12 @@ from vllm_omni.model_executor.models.moss_tts.local_model_state import MossLocal
 from vllm_omni.model_executor.models.moss_tts.modeling_moss_tts_talker import MossTTSLocalTalkerForGeneration
 
 pytestmark = pytest.mark.core_model
+
+
+@dataclass
+class _PrefillPositions:
+    prompt_len: np.ndarray
+    num_computed_tokens: np.ndarray
 
 
 @pytest.mark.cpu
@@ -28,7 +34,8 @@ def test_prefill_reuses_text_embeddings_and_noncontiguous_reference_offsets(mock
             "ref_offset": offset,
         }
     batch = _batch(torch.device("cpu"), [3, 0], [2, 1])
-    req = SimpleNamespace(prompt_len=np.full(5, 8), num_computed_tokens=np.zeros(5))
+    req = _PrefillPositions(prompt_len=np.full(5, 8), num_computed_tokens=np.zeros(5))
+    req.num_computed_tokens[[3, 0]] = [1, 2]
     embeds = state._static_inputs_embeds[:3]
     expected = state.model.embed_input_ids(batch.input_ids) + state.model._audio_embed(codes[[1, 2, 2]])
     embed = mocker.spy(state.model.model.embed_tokens, "forward")
@@ -38,6 +45,38 @@ def test_prefill_reuses_text_embeddings_and_noncontiguous_reference_offsets(mock
     assert embed.call_count == 1
     assert state.intermediate_buffer.buffers[3]["ref_offset"] == 3
     assert state.intermediate_buffer.buffers[0]["ref_offset"] == 3
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("batch_prefill", [False, True])
+@pytest.mark.parametrize("cached,count", [(2, 1), (1, 2)])
+def test_cached_prefix_prefill_uses_absolute_reference_position(batch_prefill, cached, count):
+    state = _state(MossLocalModelState, torch.device("cpu"))
+    state._batch_prefill = batch_prefill
+    codes = torch.tensor([[1, 2], [3, 4], [5, 6], [2, 3]])
+    state.intermediate_buffer.buffers[0] = {"req_id": "prefix-hit", "codes": {"ref": codes}}
+    batch = _batch(torch.device("cpu"), [0], [count])
+    req = _PrefillPositions(prompt_len=np.full(5, 4), num_computed_tokens=np.full(5, cached))
+    embeds = state._static_inputs_embeds[:count]
+    expected = state.model.embed_input_ids(batch.input_ids) + state.model._audio_embed(codes[cached : cached + count])
+    with torch.inference_mode():
+        state.run_preprocess(batch, {"input_ids": batch.input_ids, "inputs_embeds": embeds}, req)
+    torch.testing.assert_close(embeds, expected, rtol=0, atol=0)
+    assert state.intermediate_buffer.buffers[0]["ref_offset"] == cached + count
+
+
+@pytest.mark.cpu
+def test_scalar_prefill_uses_cached_prompt_position():
+    state = _state(MossLocalModelState, torch.device("cpu"))
+    codes = torch.tensor([[1, 2], [3, 4], [5, 6], [2, 3]])
+    ids = torch.tensor([2])
+    expected = state.model.embed_input_ids(ids) + state.model._audio_embed(codes[2:3])
+    with torch.inference_mode():
+        _, actual, updates = state.model.preprocess(
+            ids, None, codes={"ref": codes}, _omni_is_prefill=True, _omni_num_computed_tokens=2
+        )
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert updates["ref_offset"] == 3
 
 
 @pytest.mark.cuda

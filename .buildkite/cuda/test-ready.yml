@@ -35,6 +35,17 @@ steps:
           - "pytest -sv tests/worker_v2/test_capture_query_bound_gpu.py tests/worker_v2/test_decode_query_bound_gpu.py -m 'core_model and cuda and H100' --run-level=core_model"
         mirror_hardwares: h100_1
 
+      - label: "Simple · MOSS Local Lookup Test"
+        timeout_in_minutes: 15
+        source_file_dependencies:
+          - tests/model_executor/models/moss_tts/test_local_lookup.py
+          - vllm_omni/model_executor/models/moss_tts/local_kernels.py
+          - vllm_omni/model_executor/models/moss_tts/modeling_moss_tts_local_depth.py
+          - vllm_omni/model_executor/models/moss_tts/modeling_moss_tts_talker.py
+        commands:
+          - "pytest -sv tests/model_executor/models/moss_tts/test_local_lookup.py -m 'core_model and cuda' --run-level=core_model"
+        mirror_hardwares: h100_1
+
       - label: "Simple · Diffusion Test"
         timeout_in_minutes: 30
         commands:
