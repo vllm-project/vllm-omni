@@ -57,11 +57,10 @@ def _use_endpoint_backend_when_implicit(args: argparse.Namespace) -> None:
 
 
 def main(args: argparse.Namespace) -> dict[str, Any]:
-    if getattr(args, "seed_tts_wer_eval", False):
+    if getattr(args, "wer_eval", False):
         os.environ["SEED_TTS_WER_EVAL"] = "1"
-    if getattr(args, "seed_tts_wer_save_items", False):
+    if getattr(args, "save_eval_items", False):
         os.environ["SEED_TTS_WER_SAVE_ITEMS"] = "1"
-    if getattr(args, "daily_omni_save_eval_items", False):
         os.environ["DAILY_OMNI_SAVE_EVAL_ITEMS"] = "1"
     if getattr(args, "videomme_save_eval_items", False):
         os.environ["VIDEOMME_SAVE_EVAL_ITEMS"] = "1"

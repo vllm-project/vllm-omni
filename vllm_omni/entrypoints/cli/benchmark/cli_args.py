@@ -265,11 +265,10 @@ def add_daily_omni_cli_args(parser: argparse.ArgumentParser) -> None:
     )
     group.add_argument(
         "--daily-omni-save-eval-items",
+        dest="save_eval_items",
         action="store_true",
         default=False,
-        help="Include per-request Daily-Omni accuracy rows (gold/predicted/correct) "
-        "in the saved JSON under key daily_omni_eval_items. "
-        "Alternatively set env DAILY_OMNI_SAVE_EVAL_ITEMS=1.",
+        help=argparse.SUPPRESS,
     )
 
 
@@ -393,21 +392,41 @@ def add_seed_tts_cli_args(parser: argparse.ArgumentParser) -> None:
         "Default follows official Qwen3-Omni identity + zero-shot voice-clone instructions.",
     )
     group.add_argument(
-        "--seed-tts-wer-eval",
+        "--wer-eval",
+        dest="wer_eval",
         action="store_true",
         default=False,
-        help="Keep synthesized audio as 24 kHz mono PCM for WER (works with "
+        help="Keep synthesized audio as 24 kHz mono PCM for WER evaluation (works with "
         "--backend openai-audio-speech or openai-chat-omni). Scoring follows "
         "zhaochenyang20/seed-tts-eval (Whisper-large-v3 / Paraformer-zh + jiwer). "
         "Sets SEED_TTS_WER_EVAL=1. Install: pip install 'vllm-omni[dev]'. "
-        "Optional: SEED_TTS_EVAL_DEVICE, SEED_TTS_HF_WHISPER_MODEL.",
+        "Optional: SEED_TTS_EVAL_DEVICE, SEED_TTS_HF_WHISPER_MODEL. "
+        "Currently works only with Seed-TTS datasets.",
+    )
+    group.add_argument(
+        "--save-eval-items",
+        dest="save_eval_items",
+        action="store_true",
+        default=False,
+        help="Include per-item evaluation rows in the saved JSON (key depends on dataset: "
+        "seed_tts_wer_eval_items for WER, daily_omni_eval_items for Daily-Omni, "
+        "videomme_eval_items for Video-MME). Also controllable via env vars: "
+        "SEED_TTS_WER_SAVE_ITEMS=1, DAILY_OMNI_SAVE_EVAL_ITEMS=1, VIDEOMME_SAVE_EVAL_ITEMS=1.",
+    )
+    # Deprecated aliases for backwards compatibility
+    group.add_argument(
+        "--seed-tts-wer-eval",
+        dest="wer_eval",
+        action="store_true",
+        default=False,
+        help=argparse.SUPPRESS,
     )
     group.add_argument(
         "--seed-tts-wer-save-items",
+        dest="save_eval_items",
         action="store_true",
         default=False,
-        help="Include per-utterance ASR rows in the saved JSON under key seed_tts_wer_eval_items. "
-        "Or set SEED_TTS_WER_SAVE_ITEMS=1.",
+        help=argparse.SUPPRESS,
     )
 
 

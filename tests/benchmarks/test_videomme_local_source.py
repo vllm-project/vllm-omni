@@ -274,9 +274,8 @@ def test_videomme_save_eval_items_cli_sets_env(monkeypatch: pytest.MonkeyPatch) 
 
     args = Namespace(
         videomme_save_eval_items=True,
-        seed_tts_wer_eval=False,
-        seed_tts_wer_save_items=False,
-        daily_omni_save_eval_items=False,
+        wer_eval=False,
+        save_eval_items=False,
         omni_request_timeout_s=None,
         endpoint=None,
         backend="openai-chat-omni",

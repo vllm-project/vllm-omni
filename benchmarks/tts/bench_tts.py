@@ -152,7 +152,7 @@ def build_bench_args(
         cmd += ["--max-concurrency", str(concurrency), "--request-rate", "inf"]
 
     if wer_eval:
-        cmd.append("--seed-tts-wer-eval")
+        cmd.append("--wer-eval")
 
     if output_len is not None:
         cmd += ["--hf-output-len", str(output_len)]

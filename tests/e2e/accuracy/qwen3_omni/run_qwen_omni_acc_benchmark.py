@@ -292,8 +292,8 @@ def run_daily_omni(ns: argparse.Namespace, vllm: str) -> Path:
     pack_mode = getattr(ns, "daily_omni_pack_mode", None)
     if pack_mode:
         argv.extend(["--daily-omni-pack-mode", pack_mode])
-    if ns.daily_omni_save_eval_items:
-        argv.append("--daily-omni-save-eval-items")
+    if ns.save_eval_items:
+        argv.append("--save-eval-items")
     print("\n$", vllm, *argv, "\n", flush=True)
     run_vllm_bench_subprocess(vllm, argv)
     out = Path(ns.result_dir) / result_filename
@@ -363,8 +363,8 @@ def run_seed_tts(ns: argparse.Namespace, vllm: str) -> Path:
     )
     if ns.seed_tts_turns_per_session > 1:
         argv.extend(["--seed-tts-turns-per-session", str(ns.seed_tts_turns_per_session)])
-    if ns.seed_tts_wer_save_items:
-        argv.append("--seed-tts-wer-save-items")
+    if ns.save_eval_items:
+        argv.append("--save-eval-items")
     if ns.seed_tts_file_ref_audio:
         argv.append("--seed-tts-file-ref-audio")
     extra_env: dict[str, str] = {"SEED_TTS_WER_EVAL": "1"}
@@ -477,9 +477,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="JSON merged into each chat request for Daily-Omni (default matches common L4 / text-output runs).",
     )
     p.add_argument(
-        "--daily-omni-save-eval-items",
+        "--save-eval-items",
+        dest="save_eval_items",
         action="store_true",
         help="Sets env via CLI flag so per-item rows are stored in the result JSON.",
+    )
+    # Deprecated alias for backwards compatibility
+    p.add_argument(
+        "--daily-omni-save-eval-items",
+        dest="save_eval_items",
+        action="store_true",
+        help=argparse.SUPPRESS,
     )
     p.add_argument(
         "--min-daily-omni-accuracy",
@@ -599,7 +607,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=1,
         help="Group this many Seed-TTS target texts into each Realtime session.",
     )
-    p.add_argument("--seed-tts-wer-save-items", action="store_true")
+    p.add_argument(
+        "--save-eval-items",
+        dest="save_eval_items",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    # Deprecated alias
+    p.add_argument("--seed-tts-wer-save-items", dest="save_eval_items", action="store_true", help=argparse.SUPPRESS)
     p.add_argument(
         "--seed-tts-file-ref-audio",
         action="store_true",
