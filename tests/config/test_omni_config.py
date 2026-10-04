@@ -59,7 +59,10 @@ from vllm_omni.config.stage_config import (
 )
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.engine.stage_engine_startup import _serialize_stage_config
-from vllm_omni.engine.stage_init_utils import build_legacy_engine_args_dict
+from vllm_omni.engine.stage_init_utils import (
+    build_engine_args_dict_from_omni_stage_config,
+    build_legacy_engine_args_dict,
+)
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -1046,6 +1049,7 @@ def test_sub_config_fields_match_structured_scopes():
         "interleave_mm_strings",
         "media_io_kwargs",
         "final_output",
+        "single_stage_pipeline",
         "supports_running_prefix_cache_reset",
         "active_stream_window",
         "session_mode",
@@ -1530,6 +1534,30 @@ def test_from_pipeline_config_accepts_pre_resolved_pipeline():
     assert omni_config.pipeline_config is resolved_pipeline
 
 
+@pytest.mark.parametrize("stage_count", [1, 2])
+def test_text_stage_knows_when_pipeline_has_no_downstream_stage(stage_count: int):
+    pipeline = PipelineConfig(
+        model_type="text-stage-topology",
+        stages=tuple(
+            StagePipelineConfig(
+                stage_id=stage_id,
+                model_stage=f"text-{stage_id}",
+                input_sources=(stage_id - 1,) if stage_id else (),
+                final_output=stage_id == stage_count - 1,
+                engine_output_type="text",
+            )
+            for stage_id in range(stage_count)
+        ),
+    )
+
+    config = VllmOmniConfig.from_pipeline_config(pipeline, user_deploy_config=DeployConfig(async_chunk=False))
+
+    for stage in config.stage_configs:
+        assert stage.model_config.single_stage_pipeline is (stage_count == 1)
+        engine_args = build_engine_args_dict_from_omni_stage_config(stage, "text-stage-topology")
+        assert engine_args["single_stage_pipeline"] is (stage_count == 1)
+
+
 def test_from_pipeline_config_prefers_loaded_user_deploy_config(monkeypatch):
     pipeline = _resolve_pipeline_or_skip("qwen3_tts")
     user_deploy_config = DeployConfig(
@@ -1887,7 +1915,7 @@ def test_from_pipeline_config_rejects_reserved_diffusion_kv_mode(tmp_path):
 
 @pytest.mark.parametrize("source", ["default", "topology", "deploy", "stage-cli"])
 @pytest.mark.parametrize("key_container", [list, tuple])
-def test_diffusion_stage_payload_keys_roundtrip(source, key_container):
+def test_diffusion_stage_payload_keys_roundtrip(source, key_container, tmp_path: Path):
     from vllm_omni.diffusion.data import OmniDiffusionConfig
     from vllm_omni.engine.stage_init_utils import build_engine_args_dict_from_omni_stage_config
 
@@ -1920,10 +1948,16 @@ def test_diffusion_stage_payload_keys_roundtrip(source, key_container):
     legacy_stage = merge_pipeline_deploy(pipeline, deploy)[0]
     legacy_args = {**legacy_stage.yaml_engine_args, **(override_keys if source == "stage-cli" else {})}
     restored_stage = ForkingPickler.loads(ForkingPickler.dumps(stage))
-    engine_args = build_engine_args_dict_from_omni_stage_config(restored_stage, model="test-model")
+    (tmp_path / "model_index.json").write_text('{"_class_name": "DreamZeroPipeline"}')
+    transformer = tmp_path / "transformer"
+    transformer.mkdir()
+    (transformer / "config.json").write_text("{}")
+    engine_args = build_engine_args_dict_from_omni_stage_config(restored_stage, model=str(tmp_path))
     diffusion_kwargs = omni_config_module.extract_diffusion_stage_config_kwargs(
         engine_args, stage_id=restored_stage.stage_id, include_engine_adapter_metadata=True
     )
+    assert legacy_args["single_stage_pipeline"] is True
+    assert "single_stage_pipeline" not in diffusion_kwargs
     for name in topology_keys:
         diffusion_kwargs[name] = key_container(diffusion_kwargs[name])
     od_config = OmniDiffusionConfig.from_kwargs(**diffusion_kwargs)

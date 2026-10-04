@@ -482,6 +482,7 @@ class OmniStageModelConfig(_TrackExplicitConfigFields):
     interleave_mm_strings: bool | None = None
     media_io_kwargs: dict[str, Any] | None = None
     final_output: bool = False
+    single_stage_pipeline: bool = False
     supports_running_prefix_cache_reset: bool = True
     active_stream_window: int = Field(default=0, ge=0)
     session_mode: str = "turn"
@@ -1328,6 +1329,7 @@ _DIFFUSION_STAGE_METADATA_FIELDS = frozenset(
         "retains_state_across_chunks",
         "supports_running_prefix_cache_reset",
         "scheduler_cls",
+        "single_stage_pipeline",
         "stage_connector_spec",
         "worker_type",
     }
@@ -1974,6 +1976,7 @@ def _build_model_config(
     if "active_stream_window" not in kwargs:
         kwargs["active_stream_window"] = _copy_value(deploy.active_stream_window)
     kwargs["final_output"] = topology.final_output
+    kwargs["single_stage_pipeline"] = len(pipeline.stages) == 1
     if not topology.supports_running_prefix_cache_reset:
         kwargs["supports_running_prefix_cache_reset"] = False
     if "custom_voice_dir" not in kwargs and deploy.custom_voice_dir is not None:
