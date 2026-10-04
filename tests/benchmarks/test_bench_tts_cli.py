@@ -260,3 +260,22 @@ def test_summary_table_includes_task_type(capsys: pytest.CaptureFixture) -> None
     assert "Task Type" in output
     assert "voice_clone" in output
     assert "Base" in output
+
+
+def test_summary_table_reports_seed_tts_quality_metrics(capsys: pytest.CaptureFixture) -> None:
+    # Quality keys as saved by --seed-tts-wer-eval; SIM is null when no
+    # reference audio could be embedded.
+    bench_tts.print_summary_table(
+        [
+            {
+                "_task": "voice_clone",
+                "_concurrency": 1,
+                "seed_tts_content_error_mean": 0.0234,
+                "seed_tts_sim_mean": None,
+                "seed_tts_utmos_mean": 3.912,
+            }
+        ]
+    )
+
+    row = capsys.readouterr().out.splitlines()[-2]
+    assert row.split()[-3:] == ["0.023", "n/a", "3.912"]
