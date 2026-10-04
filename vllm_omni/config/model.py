@@ -140,6 +140,7 @@ class OmniModelConfig(ModelConfig):
     model_arch: str | None = None
     worker_type: str | None = None
     engine_output_type: str | None = None
+    single_stage_pipeline: bool = False
     # Optional dotted path of a per-stage pooling-output decoder applied
     # worker-side before IPC. Read by the AR scheduler.
     pooling_output_decoder: str | None = None
