@@ -37,6 +37,8 @@ class CacheDiTEnableResult:
 
     refresh: RefreshCacheContextFunc
     targets: tuple[Any, ...]
+    refresh_is_inert: bool = False
+    """Set when ``refresh`` is a deliberate no-op because the backend refreshes itself per request."""
 
 
 CacheDiTEnabler: TypeAlias = Callable[
@@ -269,18 +271,25 @@ class CacheDiTBackend(CacheBackend):
         super().__init__(config)
         self._refresh_funcs: list[RefreshCacheContextFunc] = []
         self._cache_targets: list[Any] = []
+        self._refresh_is_inert = False
+
+    @property
+    def requires_request_refresh(self) -> bool:
+        return not self._refresh_is_inert
 
     def enable(self, pipeline: SupportsComponentDiscovery) -> None:
         pipeline_name = type(pipeline).__name__
         custom_enabler = CUSTOM_DIT_ENABLERS.get(pipeline_name)
         self._refresh_funcs = []
         self._cache_targets = []
+        self._refresh_is_inert = False
         if custom_enabler is not None:
             logger.info("Using custom cache-dit enabler for model: %s", pipeline_name)
             result = custom_enabler(pipeline, self.config)
             if isinstance(result, CacheDiTEnableResult):
                 self._refresh_funcs = [result.refresh]
                 self._cache_targets = list(result.targets)
+                self._refresh_is_inert = result.refresh_is_inert
             else:
                 self._refresh_funcs = [result]
                 self._cache_targets = [_default_get_pipeline_transformer(pipeline)]
@@ -325,6 +334,7 @@ class CacheDiTBackend(CacheBackend):
         finally:
             self._refresh_funcs = []
             self._cache_targets = []
+            self._refresh_is_inert = False
             if hasattr(pipeline, "_cache_dit_targets"):
                 del pipeline._cache_dit_targets
             self.enabled = False

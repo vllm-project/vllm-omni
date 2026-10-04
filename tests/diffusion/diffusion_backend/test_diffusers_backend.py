@@ -230,7 +230,6 @@ class TestPipelineArgumentsHandling:
             "ulysses",
             "ring",
             "teacache",
-            "cache_dit",
             "enforce_eager",
             "unsupported_quantization",
         ],
@@ -264,11 +263,6 @@ class TestPipelineArgumentsHandling:
             od_config = _make_od_config(
                 parallel_config=DiffusionParallelConfig(cfg_parallel_size=1, sequence_parallel_size=1),
                 cache_backend="tea_cache",
-            )
-        elif feature_id == "cache_dit":
-            od_config = _make_od_config(
-                parallel_config=DiffusionParallelConfig(cfg_parallel_size=1, sequence_parallel_size=1),
-                cache_backend="cache_dit",
             )
         elif feature_id == "enforce_eager":
             od_config = _make_od_config(enforce_eager=True)
@@ -814,3 +808,18 @@ class TestDiffusersBackendEndToEndExecution:
 
         # Request config has incomplete width/height, so internal assertion in `send_diffusion_request` is incomplete.
         assert image.size == (512, 512)
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+@pytest.mark.parametrize("explicit", [False, True])
+def test_adapter_only_forwards_explicit_secondary_guidance(explicit):
+    adapter = DiffusersAdapterPipeline(od_config=_make_od_config())
+    adapter._accept_call_kwargs = {"prompt", "guidance_scale", "guidance_scale_2"}
+    sampling = OmniDiffusionSamplingParams(guidance_scale=5.0, guidance_scale_2=4.0 if explicit else None)
+    request = _make_request(sampling_params=sampling)
+    kwargs = adapter._build_call_kwargs(DiffusionRequestBatch(requests=[request]))
+    if explicit:
+        assert kwargs["guidance_scale_2"] == 4.0
+    else:
+        assert "guidance_scale_2" not in kwargs
