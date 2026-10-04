@@ -50,13 +50,7 @@ def _filter_dict_like_object(obj: dict | Any) -> dict:
     result = {}
     filtered_keys = []
     for key, value in obj.items():
-        # Preserve class objects as import paths for consumers such as
-        # custom_pipeline_args.pipeline_class.
-        if isinstance(value, type):
-            module = getattr(value, "__module__", None)
-            qualname = getattr(value, "__qualname__", getattr(value, "__name__", None))
-            result[key] = f"{module}.{qualname}" if module and qualname and module != "builtins" else qualname
-        elif callable(value):
+        if callable(value):
             filtered_keys.append(str(key))
         else:
             result[key] = _convert_dataclasses_to_dict(value)
@@ -70,7 +64,11 @@ def _filter_dict_like_object(obj: dict | Any) -> dict:
 
 
 def _convert_dataclasses_to_dict(obj: Any) -> Any:
-    """Recursively convert caller values to OmegaConf-compatible types."""
+    """Recursively convert caller values to OmegaConf-compatible types.
+
+    Classes are callables too and may not have importable names. Callers
+    should supply explicit import-path strings instead of class objects.
+    """
     # Check by class name before dict to cover both collections.Counter and
     # vllm.utils.Counter without importing either implementation.
     if hasattr(obj, "__class__") and obj.__class__.__name__ == "Counter":
@@ -79,7 +77,7 @@ def _convert_dataclasses_to_dict(obj: Any) -> Any:
         except (TypeError, ValueError):
             return {}
     if isinstance(obj, set):
-        return list(obj)
+        return _convert_dataclasses_to_dict(list(obj))
     if is_dataclass(obj) and not isinstance(obj, type):
         result = {}
         for config_field in fields(obj):
@@ -95,10 +93,6 @@ def _convert_dataclasses_to_dict(obj: Any) -> Any:
         return result
     if isinstance(obj, dict):
         return _filter_dict_like_object(obj)
-    if isinstance(obj, type):
-        module = getattr(obj, "__module__", None)
-        qualname = getattr(obj, "__qualname__", getattr(obj, "__name__", None))
-        return f"{module}.{qualname}" if module and qualname and module != "builtins" else qualname
     if callable(obj):
         logger.warning(
             "Cannot convert callable %r to an OmegaConf-compatible value.",
