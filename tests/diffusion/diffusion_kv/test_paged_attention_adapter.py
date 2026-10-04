@@ -116,6 +116,7 @@ class _FakeLayer:
         self.calls: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, _FakeNativeMetadata]] = []
         self.native_events: list[str] = []
         self.layer_name = "layer-0"
+        self.cache_role = "primary"
         self.kv_cache = object()
         self.attn_backend = SimpleNamespace(forward_includes_kv_cache_update=False)
         self.impl = _FakeNativeImpl(self)
@@ -264,6 +265,39 @@ def test_prepare_batch_reuses_native_block_table_and_metadata_builders(monkeypat
     assert batch.attn_metadata["layer-0"] is events[0][2]
     assert events[0][2].build_id == 0
     assert batch.slot_mappings_by_layer["layer-0"].tolist() == [4, 5, 6, 0, 1]
+
+
+def test_prepare_batch_rejects_rows_from_different_cache_roles(monkeypatch: pytest.MonkeyPatch) -> None:
+    adapter, _, _, _ = _make_adapter(monkeypatch)
+    adapter.resolve_row = lambda _request_id, sequence_id, _context_id: DiffusionPagedAttentionRowBinding(
+        row_index=2 if sequence_id is not None else 1,
+        max_seq_len=16,
+        cache_role="primary" if sequence_id is not None else "ar_decode",
+    )
+
+    with pytest.raises(ValueError, match="one cache role per forward"):
+        adapter.prepare_batch(
+            (
+                DiffusionPagedAttentionRow(request_id="req-0", sequence_id=0, query_len=1, seq_len=1),
+                DiffusionPagedAttentionRow(request_id="req-0", context_id="ar", query_len=1, seq_len=1),
+            )
+        )
+
+
+def test_layer_rejects_rows_for_a_different_cache_role(monkeypatch: pytest.MonkeyPatch) -> None:
+    adapter, _, _, _ = _make_adapter(monkeypatch)
+    adapter.resolve_row = lambda *_args: DiffusionPagedAttentionRowBinding(
+        row_index=1,
+        max_seq_len=16,
+        cache_role="ar_decode",
+    )
+    batch = adapter.prepare_batch(
+        (DiffusionPagedAttentionRow(request_id="req-0", context_id="ar", query_len=1, seq_len=1),)
+    )
+    query = torch.randn(1, 1, 2, 4)
+
+    with adapter.activate(batch), pytest.raises(ValueError, match="active rows use 'ar_decode'"):
+        adapter.prepare_layer_context("layer-0", query, query, query)
 
 
 def test_omni_paged_backend_consumes_context_and_restores_diffusion_shape(
@@ -1279,7 +1313,7 @@ def test_layer_adapter_accepts_platform_native_backend_and_uses_rank_local_heads
         "get_diffusion_paged_kv_attn_backend",
         specialize_backend,
     )
-    layer = SimpleNamespace(num_heads=8, softmax_scale=0.125)
+    layer = SimpleNamespace(num_heads=8, softmax_scale=0.125, paged_kv_cache_role="primary")
     spec = FullAttentionSpec(
         block_size=16,
         num_kv_heads=4,
@@ -1313,6 +1347,7 @@ def test_layer_adapter_accepts_platform_native_backend_and_uses_rank_local_heads
     assert specialized_backends == [(native_backend, 2)]
     assert native_layer.num_heads == 4
     assert native_layer.num_kv_heads == 2
+    assert native_layer.cache_role == "primary"
     assert native_layer.spec.num_kv_heads == 2
     # 0.29: the flag no longer rides on the spec, it selects the layout.
     assert layout_for_backend(native_layer.attn_backend).is_block_outermost is True

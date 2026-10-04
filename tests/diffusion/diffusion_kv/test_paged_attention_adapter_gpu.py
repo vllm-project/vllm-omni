@@ -15,6 +15,7 @@ from vllm.v1.worker.gpu.attn_utils import init_attn_backend, init_kv_cache
 from vllm.v1.worker.gpu.block_table import BlockTables
 
 from tests.helpers.kv_layout import build_kv_cache_tensor
+from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.backends.flash_attn import FlashAttentionImpl
 from vllm_omni.diffusion.diffusion_kv.layout import resolve_diffusion_kv_cache_layout
@@ -35,15 +36,16 @@ _BLOCK_SIZE = 16
 
 
 class _SmokeDiffusionAttention(nn.Module):
-    def __init__(self) -> None:
+    def __init__(self, cache_role: str = "primary") -> None:
         super().__init__()
         self.num_heads = _NUM_HEADS
         self.num_kv_heads = _NUM_HEADS
         self.head_size = _HEAD_SIZE
         self.softmax_scale = _HEAD_SIZE**-0.5
+        self.paged_kv_cache_role = cache_role
 
 
-def _native_adapter(num_rows: int = 1):
+def _native_adapter(num_rows: int = 1, cache_role: str = "primary", resolve_row=None):
     device = torch.device("cuda", torch.accelerator.current_device_index())
     vllm_config = VllmConfig(
         cache_config=CacheConfig(
@@ -68,7 +70,7 @@ def _native_adapter(num_rows: int = 1):
     )
     vllm_config.compilation_config.static_forward_context.clear()
 
-    diffusion_layer = _SmokeDiffusionAttention().to(device)
+    diffusion_layer = _SmokeDiffusionAttention(cache_role).to(device)
     spec = FullAttentionSpec(
         block_size=_BLOCK_SIZE,
         num_kv_heads=_NUM_HEADS,
@@ -134,22 +136,51 @@ def _native_adapter(num_rows: int = 1):
         block_tables=block_tables,
         attn_groups=attn_groups,
         layers={_LAYER_NAME: native_layer},
-        resolve_row=lambda _request_id, sequence_id, _context_id: DiffusionPagedAttentionRowBinding(
-            row_index=sequence_id,
-            max_seq_len=19,
+        resolve_row=resolve_row
+        or (
+            lambda _request_id, sequence_id, _context_id: DiffusionPagedAttentionRowBinding(
+                row_index=sequence_id,
+                max_seq_len=19,
+            )
         ),
     )
     return adapter, diffusion_layer, device
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for native paged attention")
-def test_adapter_executes_native_paged_attention_on_non_contiguous_blocks() -> None:
-    adapter, diffusion_layer, device = _native_adapter()
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@pytest.mark.parametrize(
+    ("sequence_id", "context_id", "cache_role"),
+    [
+        pytest.param(0, None, "primary", id="primary-sequence"),
+        pytest.param(None, "ar", "ar_decode", id="request-context"),
+    ],
+)
+def test_adapter_executes_native_paged_attention_on_non_contiguous_blocks(
+    sequence_id: int | None,
+    context_id: str | None,
+    cache_role: str,
+) -> None:
+    resolved_identities: list[tuple[str, int | None, str | None]] = []
+
+    def resolve_row(
+        request_id: str,
+        resolved_sequence_id: int | None,
+        resolved_context_id: str | None,
+    ) -> DiffusionPagedAttentionRowBinding:
+        resolved_identities.append((request_id, resolved_sequence_id, resolved_context_id))
+        return DiffusionPagedAttentionRowBinding(
+            row_index=0,
+            max_seq_len=19,
+            cache_role=cache_role,
+        )
+
+    adapter, diffusion_layer, device = _native_adapter(cache_role=cache_role, resolve_row=resolve_row)
     prefix_batch = adapter.prepare_batch(
         [
             DiffusionPagedAttentionRow(
                 request_id="req-0",
-                sequence_id=0,
+                sequence_id=sequence_id,
+                context_id=context_id,
                 query_len=17,
                 seq_len=17,
             )
@@ -184,7 +215,8 @@ def test_adapter_executes_native_paged_attention_on_non_contiguous_blocks() -> N
         [
             DiffusionPagedAttentionRow(
                 request_id="req-0",
-                sequence_id=0,
+                sequence_id=sequence_id,
+                context_id=context_id,
                 query_len=2,
                 seq_len=19,
                 kv_start_pos=17,
@@ -200,7 +232,8 @@ def test_adapter_executes_native_paged_attention_on_non_contiguous_blocks() -> N
         [
             DiffusionPagedAttentionRow(
                 request_id="req-0",
-                sequence_id=0,
+                sequence_id=sequence_id,
+                context_id=context_id,
                 query_len=19,
                 seq_len=19,
             )
@@ -259,6 +292,7 @@ def test_adapter_executes_native_paged_attention_on_non_contiguous_blocks() -> N
 
     assert prefix_slot_mappings.cpu().tolist() == [list(range(3 * _BLOCK_SIZE, 4 * _BLOCK_SIZE)) + [_BLOCK_SIZE]]
     assert suffix_slot_mappings.cpu().tolist() == [[_BLOCK_SIZE + 1, _BLOCK_SIZE + 2]]
+    assert resolved_identities == [("req-0", sequence_id, context_id)] * 3
     torch.testing.assert_close(prefix_output, prefix_reference, rtol=2e-2, atol=2e-2)
     torch.testing.assert_close(suffix_output, suffix_reference, rtol=2e-2, atol=2e-2)
     torch.testing.assert_close(piecewise_output, piecewise_reference, rtol=2e-2, atol=2e-2)

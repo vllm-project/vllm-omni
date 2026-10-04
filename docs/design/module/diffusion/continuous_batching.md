@@ -9,10 +9,12 @@ primary_code_paths:
   - vllm_omni/diffusion/sched/**
 related_code_paths:
   - vllm_omni/diffusion/executor/**
+  - vllm_omni/diffusion/diffusion_kv/**
 depends_on:
   - diffusion_runtime.md
 validation_paths:
   - tests/diffusion/batching/**
+  - tests/diffusion/diffusion_kv/**
 upstream_refs: []
 last_reviewed: 2026-07-16
 ---

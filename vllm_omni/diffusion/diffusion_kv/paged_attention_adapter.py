@@ -35,6 +35,7 @@ class DiffusionPagedAttentionRowBinding:
     row_index: int
     max_seq_len: int
     block_ids: tuple[tuple[int, ...], ...] = ()
+    cache_role: str = "primary"
 
 
 DiffusionKVRowResolver = Callable[
@@ -120,6 +121,10 @@ class DiffusionPagedAttentionLayerAdapter(AttentionLayerBase):
             num_kv_heads=num_kv_heads,
         )
         self.layer_name = layer_name
+        cache_role = getattr(layer, "paged_kv_cache_role", None)
+        if type(cache_role) is not str or not cache_role:
+            raise ValueError(f"Paged attention layer {layer_name!r} must declare a non-empty cache role")
+        self.cache_role = cache_role
         self.spec = canonical_spec
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
@@ -249,6 +254,7 @@ class PreparedDiffusionPagedAttentionBatch:
     """Native metadata shared by all paged attention layers in one forward."""
 
     rows: tuple[DiffusionPagedAttentionRow, ...]
+    cache_role: str
     row_indices: torch.Tensor
     query_start_loc: torch.Tensor
     seq_lens: torch.Tensor
@@ -513,6 +519,10 @@ class DiffusionPagedAttentionAdapter:
         if len(set(identities)) != len(identities):
             raise ValueError("Paged attention batch contains duplicate row identities")
         row_bindings = [self.resolve_row(row.request_id, row.sequence_id, row.context_id) for row in rows]
+        cache_roles = {binding.cache_role for binding in row_bindings}
+        if len(cache_roles) != 1:
+            raise ValueError(f"Paged attention rows must use one cache role per forward; got {sorted(cache_roles)!r}")
+        cache_role = cache_roles.pop()
         row_indices_list = [binding.row_index for binding in row_bindings]
         if len(set(row_indices_list)) != len(row_indices_list):
             raise ValueError("Paged attention batch resolves multiple inputs to the same Worker row")
@@ -592,6 +602,7 @@ class DiffusionPagedAttentionAdapter:
         )
         return PreparedDiffusionPagedAttentionBatch(
             rows=rows,
+            cache_role=cache_role,
             row_indices=row_indices,
             query_start_loc=query_start_loc,
             seq_lens=seq_lens,
@@ -812,6 +823,11 @@ class DiffusionPagedAttentionAdapter:
         except KeyError as exc:
             raise KeyError(f"Unknown diffusion paged attention layer {layer_name!r}") from exc
         batch = self._active_batch
+        if layer.cache_role != batch.cache_role:
+            raise ValueError(
+                f"Paged attention layer {layer_name!r} uses cache role {layer.cache_role!r}, "
+                f"but the active rows use {batch.cache_role!r}"
+            )
         full_attn_spans = self._validate_omni_attn_metadata(omni_attn_metadata)
 
         query_flat, query_token_shape, query_has_head_dims = self._flatten_tensor(

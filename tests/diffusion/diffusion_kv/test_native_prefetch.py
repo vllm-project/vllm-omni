@@ -170,6 +170,7 @@ def _config():
             kv_connector_extra_config={"mooncake_protocol": "tcp", "enable_kv_async_prefetch": True},
         ),
         diffusion_kv_mode=DiffusionKVCacheMode.PAGED_SCHEDULER,
+        diffusion_kv_max_rows_per_request=2,
         max_num_seqs=1,
         model_class_name="TestDiffusionPipeline",
     )
