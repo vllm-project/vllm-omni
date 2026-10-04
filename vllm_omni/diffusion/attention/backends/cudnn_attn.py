@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+from functools import cache
+from importlib.metadata import version
+
 import torch
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
@@ -8,13 +11,128 @@ from vllm_omni.diffusion.attention.backends.abstract import (
     AttentionBackend,
     AttentionImpl,
     AttentionMetadata,
+    BlockSparseAdapter,
 )
 from vllm_omni.diffusion.attention.backends.sdpa import _maybe_reshape_attn_mask
+from vllm_omni.diffusion.attention.block_selection.abstract import BlockSelection
+from vllm_omni.diffusion.attention.capabilities import CompilationMode
+
+if not hasattr(torch.ops.vllm_omni, "cudnn_selected_attention"):
+
+    @torch.library.custom_op("vllm_omni::cudnn_selected_attention", mutates_args=())
+    def _cudnn_selected_attention_op(
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        indices: torch.Tensor,
+        counts: torch.Tensor,
+        scale: float,
+        block_size: int,
+    ) -> torch.Tensor:
+        return CuDNNSparseAdapter._run(query, key, value, indices, counts, scale, block_size)
+
+    @_cudnn_selected_attention_op.register_fake
+    def _cudnn_selected_attention_fake(query, key, value, indices, counts, scale, block_size):
+        return query.new_empty((*query.shape[:-1], value.shape[-1]))
+
+
+_cudnn_selected_attention_op = torch.ops.vllm_omni.cudnn_selected_attention
+
+
+class CuDNNSparseAdapter(BlockSparseAdapter):
+    """Execute selected keys through the cuDNN frontend's CuTe DSL BSA API.
+
+    Keep native head mapping and per-query-head routes, including under GQA.
+    Only dependency callables are cached; metadata and workspaces belong to
+    each invocation. Installed-provider checks decide device/shape support.
+    """
+
+    provider = "CUDNN_ATTN"
+    kernel_variant = "cudnn_bsa"
+    compilation_mode = CompilationMode.CUSTOM_OP
+
+    @staticmethod
+    @cache
+    def _load_api():
+        from cudnn import BSA
+
+        return BSA.block_sparse_attention_forward, version("nvidia-cudnn-frontend")
+
+    @staticmethod
+    def validate_selection(implementation: str, head_size: int) -> None:
+        if implementation != "auto":
+            raise ValueError("cuDNN BSA has no kernel-ID selection interface; use implementation='auto'")
+
+    @staticmethod
+    def _validate_block_size(block_size: tuple[int, int]) -> None:
+        # The provider accepts one scalar geometry, not independent Q/KV sizes.
+        # Legal scalar values belong to the installed kernel, not this adapter.
+        if block_size[0] != block_size[1]:
+            raise ValueError("cuDNN BSA takes one block size; unequal Q/KV blocks require a different provider API")
+
+    def prepare(
+        self,
+        implementation: str,
+        head_size: int,
+        num_heads: int,
+        num_kv_heads: int,
+        device: torch.device,
+        block_size: tuple[int, int],
+    ) -> None:
+        self.validate_selection(implementation, head_size)
+        self._validate_block_size(block_size)
+        if device.type != "cuda":
+            raise ValueError("cuDNN BSA requires CUDA")
+        _, self.dependency_version = self._load_api()
+
+    @classmethod
+    def _run(cls, query, key, value, indices, counts, scale, block_size):
+        forward, _ = cls._load_api()
+        key_length = key.shape[1]
+        blocks = (key_length + block_size - 1) // block_size
+        block_sizes = (key_length - torch.arange(blocks, device=key.device, dtype=torch.int32) * block_size).clamp(
+            max=block_size
+        )
+        query, key, value = (t.contiguous() if t.stride(-1) != 1 else t for t in (query, key, value))
+        output, _lse = forward(
+            query,
+            key,
+            value,
+            indices,
+            block_sparse_num=indices.shape[-1],
+            block_sizes=block_sizes,
+            q2k_block_nums=counts,
+            sparse_block_size=block_size,
+            allow_empty_block_nums=False,
+            softmax_scale=scale,
+            pack_gqa=False,
+            layout="bshd",
+            kv_splits=1,
+        )
+        return output.contiguous()
+
+    def execute(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        selection: BlockSelection,
+        scale: float,
+        block_size: tuple[int, int],
+    ) -> torch.Tensor:
+        self._validate_block_size(block_size)
+        return _cudnn_selected_attention_op(
+            query, key, value, selection.indices, selection.counts, scale, block_size[0]
+        )
 
 
 class CuDNNAttentionBackend(AttentionBackend):
     accept_output_buffer: bool = True
     supports_prefix_kv_slicing: bool = True
+
+    @classmethod
+    def get_block_sparse_adapter(cls) -> type[CuDNNSparseAdapter]:
+        return CuDNNSparseAdapter
 
     # cuDNN 9.5+ FMHA on Blackwell: head_dim divisible by 8 and at most 256
     # for BF16/FP16. Used by automatic platform selection; explicit CUDNN_ATTN

@@ -5,17 +5,24 @@ import os
 from collections.abc import Callable
 from dataclasses import replace
 from functools import cache, partial
+from importlib.metadata import version
 from typing import NamedTuple
 
 import torch
 from vllm.logger import init_logger
 
-from vllm_omni.diffusion.attention.backends.abstract import AttentionBackend, AttentionImpl, AttentionMetadata
+from vllm_omni.diffusion.attention.backends.abstract import (
+    AttentionBackend,
+    AttentionImpl,
+    AttentionMetadata,
+    BlockSparseAdapter,
+)
 from vllm_omni.diffusion.attention.backends.sdpa import _maybe_reshape_attn_mask
 from vllm_omni.diffusion.attention.backends.utils.piecewise_attn import (
     piecewise_attn,
     run_paged_piecewise_plan,
 )
+from vllm_omni.diffusion.attention.block_selection.abstract import BlockSelection
 from vllm_omni.diffusion.attention.capabilities import (
     CapabilityResult,
     CompilationMode,
@@ -79,6 +86,98 @@ if not hasattr(torch.ops.vllm_omni, "fa4_dense_attention"):
 
 
 _fa4_dense_attention_op = torch.ops.vllm_omni.fa4_dense_attention
+
+
+if not hasattr(torch.ops.vllm_omni, "fa4_selected_attention"):
+
+    @torch.library.custom_op("vllm_omni::fa4_selected_attention", mutates_args=())
+    def _fa4_selected_attention_op(
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        scale: float,
+        indices: torch.Tensor,
+        counts: torch.Tensor,
+        block_q: int,
+        block_kv: int,
+    ) -> torch.Tensor:
+        query, key, value = (t.contiguous() if t.stride(-1) != 1 else t for t in (query, key, value))
+        return FA4SparseAdapter._run(query, key, value, indices, scale, (block_q, block_kv), counts)
+
+    @_fa4_selected_attention_op.register_fake
+    def _fa4_selected_attention_fake(query, key, value, scale, indices, counts, block_q, block_kv):
+        return query.new_empty((*query.shape[:-1], value.shape[-1]))
+
+
+_fa4_selected_attention_op = torch.ops.vllm_omni.fa4_selected_attention
+
+
+class FA4SparseAdapter(BlockSparseAdapter):
+    """Provider-specific preparation and sparse metadata conversion only."""
+
+    provider = "FLASH_ATTN"
+    kernel_variant = "fa4"
+    compilation_mode = CompilationMode.CUSTOM_OP
+
+    @staticmethod
+    @cache
+    def _load_api():
+        """Cache dependency callables only; request tensors remain invocation-local."""
+        from flash_attn.cute import flash_attn_func
+        from flash_attn.cute.block_sparsity import BlockSparseTensorsTorch
+
+        return flash_attn_func, BlockSparseTensorsTorch, version("flash-attn-4")
+
+    @classmethod
+    def _run(cls, query, key, value, indices, scale, block_size, counts):
+        """Pass the logical sparse geometry directly to FA4, without retile conversion."""
+        flash_attn_func, sparse_type, _ = cls._load_api()
+        sparse = sparse_type(
+            mask_block_cnt=counts,
+            mask_block_idx=indices,
+            full_block_cnt=torch.zeros_like(counts),
+            full_block_idx=indices,
+            block_size=block_size,
+        )
+        result = flash_attn_func(
+            query,
+            key,
+            value,
+            softmax_scale=scale,
+            causal=False,
+            num_splits=1,
+            pack_gqa=False,
+            block_sparse_tensors=sparse,
+        )
+        return (result[0] if isinstance(result, tuple) else result).contiguous()
+
+    @staticmethod
+    def validate_selection(implementation: str, head_size: int) -> None:
+        if implementation != "auto":
+            raise ValueError("FA4 has no kernel-ID selection interface; use implementation='auto'")
+
+    def prepare(
+        self,
+        implementation: str,
+        head_size: int,
+        num_heads: int,
+        num_kv_heads: int,
+        device: torch.device,
+        block_size: tuple[int, int],
+    ) -> None:
+        self.validate_selection(implementation, head_size)
+        _, _, self.dependency_version = self._load_api()
+
+    def execute(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        selection: BlockSelection,
+        scale: float,
+        block_size: tuple[int, int],
+    ) -> torch.Tensor:
+        return _fa4_selected_attention_op(query, key, value, scale, selection.indices, selection.counts, *block_size)
 
 
 _PACKED_KEYS = ("cu_seqlens_q", "cu_seqlens_k", "max_seqlen_q", "max_seqlen_k")
@@ -172,6 +271,10 @@ class FlashAttentionBackend(AttentionBackend):
     accept_output_buffer: bool = True
     supports_piecewise_spans: bool = True
     supports_paged_kv: bool = True
+
+    @classmethod
+    def get_block_sparse_adapter(cls) -> type[FA4SparseAdapter]:
+        return FA4SparseAdapter
 
     @classmethod
     def supports_packed_mask_free(cls) -> bool:

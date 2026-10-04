@@ -677,3 +677,35 @@ def test_resolve_sigma_positions_uses_release_metadata_schedule():
     assert steps == 8 == len(positions) - 1
     with pytest.raises(OmniClientError, match="must be 8"):
         pipeline._resolve_sigma_positions("t2va", _sampling(num_inference_steps=9))
+
+
+@pytest.mark.parametrize(
+    "default,category,exact,topk,error",
+    [
+        ("FASTVIDEO_VSA", "FASTVIDEO_VSA", "TORCH_SDPA", None, "FASTVIDEO_VSA"),
+        ("TORCH_SDPA", "TORCH_SDPA", "FASTVIDEO_VSA", None, None),
+        ("TORCH_SDPA", "TORCH_SDPA", "FASTVIDEO_VSA", 2, "fixed fastvideo_vsa_topk"),
+        ("TORCH_SDPA", "FASTVIDEO_VSA", None, None, None),
+        ("TORCH_SDPA", "FASTVIDEO_VSA", None, 2, "fixed fastvideo_vsa_topk"),
+    ],
+)
+def test_v2_dit_role_precedence(default, category, exact, topk, error):
+    roles = {"self": AttentionSpec(backend=category, fastvideo_vsa_topk=topk if exact is None else None)}
+    if exact is not None:
+        roles["minimax_h3.dit"] = AttentionSpec(backend=exact, fastvideo_vsa_topk=topk)
+    config = _od_config(backend=default, per_role=roles)
+    spec = FastH3CheckpointSpec.from_metadata(_fastvideo_metadata())
+    if error:
+        with pytest.raises(ValueError, match=error):
+            spec.check_serving_contract(partition="fl2va", od_config=config)
+    else:
+        spec.check_serving_contract(partition="fl2va", od_config=config)
+
+
+def test_v2_legacy_backend_only_config():
+    from types import SimpleNamespace
+
+    config = SimpleNamespace(diffusion_attention_backend="FASTVIDEO_VSA")
+    FastH3CheckpointSpec.from_metadata(_fastvideo_metadata()).check_serving_contract(
+        partition="fl2va", od_config=config
+    )
