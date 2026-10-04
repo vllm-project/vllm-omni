@@ -761,6 +761,7 @@ async def _init_duplex_chat(
         tool_parser=args.tool_call_parser,
         reasoning_parser=args.structured_outputs_config.reasoning_parser,
         default_chat_template_kwargs=args.default_chat_template_kwargs,
+        log_error_stack=getattr(args, "log_error_stack", False),
     )
     return OmniOpenAIServingChat(
         engine_client=engine_client,
@@ -781,6 +782,7 @@ async def _init_duplex_chat(
         enable_force_include_usage=args.enable_force_include_usage,
         enable_log_outputs=args.enable_log_outputs,
         enable_log_deltas=args.enable_log_deltas,
+        enable_per_request_metrics=getattr(args, "enable_per_request_metrics", False),
     )
 
 
@@ -1038,6 +1040,7 @@ async def omni_init_app_state(
             enable_prompt_tokens_details=args.enable_prompt_tokens_details,
             enable_force_include_usage=args.enable_force_include_usage,
             enable_log_outputs=args.enable_log_outputs,
+            default_chat_template_kwargs=args.default_chat_template_kwargs,
         )
         if "generate" in supported_tasks
         else None
@@ -1062,6 +1065,7 @@ async def omni_init_app_state(
         enable_force_include_usage=args.enable_force_include_usage,
         enable_log_outputs=args.enable_log_outputs,
         enable_log_deltas=args.enable_log_deltas,
+        enable_per_request_metrics=getattr(args, "enable_per_request_metrics", False),
     )
 
     state.openai_serving_chat = OmniOpenAIServingChat(**_chat_kwargs) if "generate" in supported_tasks else None
@@ -1083,6 +1087,7 @@ async def omni_init_app_state(
             return_tokens_as_token_ids=args.return_tokens_as_token_ids,
             enable_prompt_tokens_details=args.enable_prompt_tokens_details,
             enable_force_include_usage=args.enable_force_include_usage,
+            enable_per_request_metrics=getattr(args, "enable_per_request_metrics", False),
         )
         if "generate" in supported_tasks
         else None
@@ -1126,6 +1131,7 @@ async def omni_init_app_state(
             request_logger=request_logger,
             chat_template_config=chat_template_config,
             log_error_stack=args.log_error_stack,
+            enable_flash_late_interaction=getattr(args, "enable_flash_late_interaction", True),
         )
         if any(t in supported_tasks for t in ("embed", "score", "token_embed"))
         else None

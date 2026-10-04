@@ -291,6 +291,23 @@ def _assert_app_state_snapshot(
     assert not unexpectedly_set, f"app.state keys expected to stay None: {unexpectedly_set}"
 
 
+def _recording_ctor(name: str, captured: dict[str, dict[str, Any]]):
+    """A stand-in handler class that records the kwargs it was constructed with.
+
+    Used to assert which frontend options reach each handler; the returned class
+    also answers the (synchronous) ``warmup()`` the init path calls.
+    """
+
+    class _Recording:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            captured[name] = kwargs
+
+        def warmup(self) -> None:
+            return None
+
+    return _Recording
+
+
 def _minimal_args(**overrides) -> SimpleNamespace:
     args = SimpleNamespace(
         tool_parser_plugin=None,
@@ -333,6 +350,7 @@ def _minimal_args(**overrides) -> SimpleNamespace:
         enable_force_include_usage=False,
         enable_log_outputs=False,
         enable_log_deltas=False,
+        enable_per_request_metrics=False,
         tokens_only=False,
         shutdown_timeout=0,
         stage_configs_path=None,
@@ -1190,3 +1208,126 @@ def test_video_lifecycle_guard_precedes_processing(monkeypatch, count, status, m
     with TestClient(app) as client:
         response = client.request(method, path)
     assert response.status_code == status
+
+
+@pytest.mark.asyncio
+async def test_multistage_wiring_forwards_options_upstream_passes(monkeypatch) -> None:
+    """Every handler must receive the frontend options upstream passes to it.
+
+    ``vllm serve --omni`` builds its parser with upstream ``make_arg_parser``, so
+    ``--enable-per-request-metrics``, ``--default-chat-template-kwargs`` and
+    ``--enable-flash-late-interaction`` are all accepted. Omni's hand-rolled copy
+    of upstream's ``init_generate_state`` used to construct the handlers without
+    forwarding them, which accepted each option and silently ignored it.
+    """
+    captured: dict[str, dict[str, Any]] = {}
+
+    class _ScoreCapableEngine(_FakeEngineClient):
+        async def get_supported_tasks(self) -> tuple[str, ...]:
+            # A pooling task so the scores handler is built as well.
+            return ("generate", "score")
+
+    engine = _ScoreCapableEngine(
+        stage_configs=[object(), object()],
+        vllm_config=SimpleNamespace(
+            lora_config=None,
+            model_config=SimpleNamespace(),
+            parallel_config=SimpleNamespace(_api_process_rank=0),
+        ),
+    )
+
+    class _FakeModels:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def init_static_loras(self):
+            return None
+
+    class _Stub:
+        def __init__(self, *args, **kwargs):
+            pass
+
+    class _StubSpeech(_Stub):
+        async def warmup(self):
+            return None
+
+    monkeypatch.setattr(api_server, "load_chat_template", lambda *_a, **_k: None)
+    monkeypatch.setattr(api_server, "process_lora_modules", lambda modules, _defaults: modules or [])
+    monkeypatch.setattr(api_server, "OpenAIServingModels", _FakeModels)
+    monkeypatch.setattr(api_server, "OnlineRenderer", _recording_ctor("renderer", captured))
+    monkeypatch.setattr(api_server, "OpenAIServingResponses", _recording_ctor("responses", captured))
+    monkeypatch.setattr(api_server, "OmniOpenAIServingChat", _recording_ctor("chat", captured))
+    monkeypatch.setattr(api_server, "OmniOpenAIServingChatBatch", _recording_ctor("chat_batch", captured))
+    monkeypatch.setattr(api_server, "OpenAIServingCompletion", _recording_ctor("completion", captured))
+    monkeypatch.setattr(api_server, "ServingTokenization", _recording_ctor("tokenization", captured))
+    monkeypatch.setattr(api_server, "AnthropicServingMessages", _recording_ctor("anthropic", captured))
+    monkeypatch.setattr(api_server, "ServingScores", _recording_ctor("scores", captured))
+    monkeypatch.setattr(api_server, "ServingPooling", _Stub)
+    monkeypatch.setattr(api_server, "OpenAIServingEmbedding", _Stub)
+    monkeypatch.setattr(api_server, "ServingClassification", _Stub)
+    monkeypatch.setattr(api_server, "OpenAIServingTranscription", _Stub)
+    monkeypatch.setattr(api_server, "OpenAIServingTranslation", _Stub)
+    monkeypatch.setattr(api_server, "ServingTokens", _Stub)
+    monkeypatch.setattr(api_server, "OmniOpenAIServingSpeech", _StubSpeech)
+    monkeypatch.setattr(api_server, "OmniOpenAIServingAudioGenerate", _Stub)
+    monkeypatch.setattr(api_server, "OmniStreamingSpeechHandler", _Stub)
+    monkeypatch.setattr(api_server, "OmniOpenAIServingVideo", _Stub)
+    monkeypatch.setattr(api_server, "OpenAIServingRealtime", _Stub)
+    monkeypatch.setattr(api_server, "create_streaming_video_handler", lambda **_k: _marker("streaming_video"))
+
+    template_kwargs = {"enable_thinking": False}
+    await api_server.omni_init_app_state(
+        engine,
+        State(),
+        _minimal_args(
+            default_chat_template_kwargs=template_kwargs,
+            enable_per_request_metrics=True,
+            # Non-default on purpose: the handler's own default is True, so
+            # asserting the default would pass even if the option were dropped.
+            enable_flash_late_interaction=False,
+        ),
+    )
+
+    for name in ("renderer", "responses", "chat", "chat_batch", "tokenization", "anthropic"):
+        assert captured[name].get("default_chat_template_kwargs") == template_kwargs, name
+    for name in ("chat", "chat_batch", "completion"):
+        assert captured[name].get("enable_per_request_metrics") is True, name
+    assert captured["scores"].get("enable_flash_late_interaction") is False
+
+    # Option off -> the handlers must see the off value, not a hardcoded one.
+    captured.clear()
+    await api_server.omni_init_app_state(engine, State(), _minimal_args())
+    for name in ("chat", "chat_batch", "completion"):
+        assert captured[name].get("enable_per_request_metrics") is False, name
+    assert captured["responses"].get("default_chat_template_kwargs") is None
+
+
+@pytest.mark.asyncio
+async def test_duplex_wiring_forwards_options_upstream_passes(monkeypatch) -> None:
+    """Duplex builds the same handlers, so it forwards the same options.
+
+    ``_init_duplex_chat`` is a second construction site for ``OnlineRenderer``
+    and ``OmniOpenAIServingChat``; an option accepted by the CLI must not behave
+    differently just because the engine is a duplex one.
+    """
+    captured: dict[str, dict[str, Any]] = {}
+
+    class _DuplexEngine(_FakeEngineClient):
+        duplex_capabilities = SimpleNamespace(supports_chat_completions=True)
+
+    engine = _DuplexEngine()
+    monkeypatch.setattr(api_server, "load_chat_template", lambda *_a, **_k: None)
+    monkeypatch.setattr(api_server, "OnlineRenderer", _recording_ctor("renderer", captured))
+    monkeypatch.setattr(api_server, "OmniOpenAIServingChat", _recording_ctor("chat", captured))
+
+    state = State()
+    state.openai_serving_models = _marker("models")
+    await api_server._init_duplex_chat(
+        engine,
+        state,
+        _minimal_args(enable_per_request_metrics=True, log_error_stack=True),
+        None,
+    )
+
+    assert captured["chat"].get("enable_per_request_metrics") is True
+    assert captured["renderer"].get("log_error_stack") is True
