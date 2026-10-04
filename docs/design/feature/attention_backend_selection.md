@@ -45,7 +45,8 @@ qualified class paths. `register_diffusion_backend()` may replace a path at
 runtime without changing the public enum value.
 
 The active `OmniPlatform` owns compatibility policy through
-`get_diffusion_attn_backend_cls()`. It must:
+`resolve_diffusion_attn_backend()`. Dense requests delegate to each platform’s
+existing `get_diffusion_attn_backend_cls()` implementation. It must:
 
 - validate explicit selections and fail with an actionable error when the
   requested kernel cannot run;
@@ -55,6 +56,16 @@ The active `OmniPlatform` owns compatibility policy through
 
 The selector must not duplicate device capability or package-availability
 policy that belongs to the platform.
+
+For `method="block_sparse"`, the platform requires an explicit provider and
+checks the shared method's CUDA requirement before loading it. It resolves the
+registered backend and calls its adapter's `validate_selection()` with the
+unchanged implementation ID and head size (`-1` for capability queries).
+Dense availability and head-size checks do not establish sparse support and
+are not applied to this path. Missing adapters and provider errors propagate;
+there is no fallback. Platforms may override the method-aware entry point.
+Actual tensor compatibility is established during sparse request preparation,
+not by selection or capability queries.
 
 ## Typed backend options
 
