@@ -1,13 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+from pathlib import Path
+from threading import Lock
 from types import SimpleNamespace
 
 import pytest
 import torch
+import yaml
 from vllm.multimodal.processing import ProcessorInputs
 
-from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.config.stage_config import load_deploy_config
+from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.models.ming_image.pipeline import (
     MingImageDiffusionPipeline,
     _validate_variant_config,
@@ -91,6 +95,105 @@ def test_layer_latent_frames_flatten_once_in_frame_major_order():
     assert torch.equal(flat[0], latents[0, :, 0])
     assert torch.equal(flat[1], latents[1, :, 0])
     assert torch.equal(flat[2], latents[0, :, 1])
+
+
+@pytest.mark.parametrize("num_layers", [1, 6])
+def test_layer_decode_preserves_composite_and_layer_order(num_layers):
+    pipeline = MingImageDiffusionPipeline.__new__(MingImageDiffusionPipeline)
+    torch.nn.Module.__init__(pipeline)
+    pipeline.is_layer_decomposition = True
+    pipeline._configure_output_frames(reference=object(), num_layers=num_layers, is_dummy_run=False)
+    frames = pipeline._num_frames_per_prompt
+    latents = torch.arange(frames, dtype=torch.float32).reshape(1, 1, frames, 1, 1)
+
+    class FakeVae(torch.nn.Module):
+        dtype = torch.float32
+        config = SimpleNamespace(scaling_factor=1.0, shift_factor=0.0)
+
+        def decode(self, z, return_dict=False):
+            assert z.shape == (frames, 1, 1, 1, 1)
+            return (z.repeat(1, 4, 1, 1, 1),)
+
+    pipeline.vae = FakeVae()
+    decoded = pipeline._decode_latent_frames(latents)
+    assert decoded.shape == (frames, 4, 1, 1)
+    assert decoded[:, 0, 0, 0].tolist() == list(range(frames))
+
+
+@pytest.mark.parametrize("profiled", [False, True])
+def test_layer_forward_returns_decode_duration_only_when_profiled(monkeypatch, profiled):
+    pipeline = MingImageDiffusionPipeline.__new__(MingImageDiffusionPipeline)
+    torch.nn.Module.__init__(pipeline)
+    pipeline.device = torch.device("cpu")
+    pipeline.od_config = SimpleNamespace(dtype=torch.float32)
+    pipeline.default_num_inference_steps = 12
+    pipeline.default_guidance_scale = 2.0
+    pipeline.conditioning = lambda query, direct: (query, direct)
+    pipeline.is_layer_decomposition = True
+    pipeline._encode_reference = lambda *args: None
+    if profiled:
+        pipeline._profiler_lock = Lock()
+        pipeline._stage_durations = {"diffuse": 1.0}
+    pipeline.vae = torch.nn.Identity()
+
+    def denoise(self, req):
+        assert req.sampling_params.output_type == "latent"
+        return DiffusionOutput(output=torch.zeros((1, 1, 2, 1, 1)), stage_durations={"diffuse": 1.0})
+
+    def decode(latents):
+        if profiled:
+            pipeline._stage_durations["MingImageDiffusionPipeline.vae.decode"] = 0.5
+        return torch.zeros((2, 4, 1, 1))
+
+    monkeypatch.setattr(ZImagePipeline, "forward", denoise)
+    pipeline._decode_latent_frames = decode
+    request = DiffusionRequestBatch(
+        requests=[
+            OmniDiffusionRequest(
+                prompt={
+                    "extra": {
+                        "query_hidden_states": torch.zeros(1, 1),
+                        "direct_hidden_states": torch.zeros(1, 1),
+                        "reference_image": object(),
+                    }
+                },
+                sampling_params=OmniDiffusionSamplingParams(extra_args={"num_layers": 1}),
+                request_id="layers",
+            )
+        ]
+    )
+    result = pipeline.forward(request)
+    if profiled:
+        assert result.stage_durations["MingImageDiffusionPipeline.vae.decode"] == 0.5
+    else:
+        assert result.stage_durations is None
+
+
+@pytest.mark.parametrize(
+    ("filename", "devices", "ulysses", "vae_parallel", "mode"),
+    [
+        ("ming_image_layer_tiled.yaml", "1", None, None, None),
+        ("ming_image_layer_tile_parallel.yaml", "1,2", 2, 2, "tile"),
+        ("ming_image_layer_spatial_shard.yaml", "1,2", 2, 2, "spatial_shard_height"),
+        ("ming_image_layer_spatial_shard_width.yaml", "1,2", 2, 2, "spatial_shard_width"),
+    ],
+)
+def test_layer_vae_deploy_topology(filename, devices, ulysses, vae_parallel, mode):
+    path = Path(__file__).resolve().parents[4] / "vllm_omni" / "deploy" / filename
+    config = yaml.safe_load(path.read_text())
+    load_deploy_config(path)
+    assert len(config["stages"]) == 2
+    assert config["stages"][0]["devices"] == "0"
+    stage = config["stages"][1]
+    assert stage["devices"] == devices
+    assert stage["vae_use_tiling"] is True
+    parallel = stage.get("parallel_config", {})
+    assert parallel.get("ulysses_degree") == ulysses
+    assert parallel.get("vae_patch_parallel_size") == vae_parallel
+    if vae_parallel:
+        assert parallel["tensor_parallel_size"] == 1
+        assert parallel["vae_parallel_mode"] == mode
+        assert len(stage["devices"].split(",")) == parallel["tensor_parallel_size"] * ulysses == vae_parallel
 
 
 def test_layer_pipeline_allows_missing_reference_only_for_dummy_run():

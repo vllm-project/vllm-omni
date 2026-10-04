@@ -164,6 +164,19 @@ def test_pack_and_unpack():
     assert torch.equal(coord_tensor_map[(0, 0)], torch.tensor([[1, 2], [3, 4]]))
 
 
+def test_pack_and_unpack_seven_rgba_frames_with_partial_edge():
+    executor = DistributedVaeExecutor()
+    executor.world_size = 1
+    grid = GridSpec(split_dims=(3, 4), grid_shape=(1, 2))
+    full = torch.arange(7 * 4 * 1 * 2 * 3).reshape(7, 4, 1, 2, 3)
+    local = [(0, full[..., :2]), (1, full[..., 2:])]
+    packed, meta = executor._pack_local_tiles(local, [2, 7, 4, 1, 2, 2], grid, "cpu", torch.int64)
+    tiles = executor._unpack_tiles([meta], [packed], grid, {0: (0, 0), 1: (0, 1)})
+    assert tiles[(0, 0)].shape == (7, 4, 1, 2, 2)
+    assert tiles[(0, 1)].shape == (7, 4, 1, 2, 1)
+    assert torch.equal(torch.cat([tiles[(0, 0)], tiles[(0, 1)]], dim=-1), full)
+
+
 def test_is_distributed_enabled():
     mixin = DummyMixin()
     assert mixin.is_distributed_enabled() is True
