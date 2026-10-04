@@ -700,6 +700,7 @@ class OmniGen2Pipeline(CFGParallelMixin, nn.Module, SupportsComponentDiscovery):
             subfolder="mllm",
             prefetch_list=omnigen2_subfolders,
             local_files_only=local_files_only,
+            dtype=self.od_config.dtype,
         ).to(self.device)
         self.processor = from_pretrained_with_prefetch(
             Qwen2_5_VLProcessor.from_pretrained,

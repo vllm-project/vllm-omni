@@ -112,6 +112,7 @@ def _run_pipeline_init(monkeypatch, *, enable_cpu_offload, loader_device, diffus
         enable_cpu_offload=enable_cpu_offload,
         diffusion_offload_config=diffusion_offload_config,
         enable_diffusion_pipeline_profiler=False,
+        dtype=torch.bfloat16,
     )
     return QwenImagePipeline(od_config=od_config)
 
