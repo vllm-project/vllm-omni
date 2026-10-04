@@ -2197,49 +2197,33 @@ def test_normalize_image():
 
 
 @pytest.mark.parametrize(
-    "channels,batched",
-    [(None, False), (3, False), (4, False), (3, True), (4, True)],
-    ids=["grayscale", "rgb", "rgba", "batched-rgb", "batched-rgba"],
+    "values,dtype,expected,channels,batched",
+    [
+        *[
+            ([0, 1, 32, 64, 128, 255], "uint8", [0, 1, 32, 64, 128, 255], channels, batched)
+            for channels, batched in [(None, False), (3, False), (4, False), (3, True), (4, True)]
+        ],
+        ([-10, 128, 300], "int16", [0, 128, 255], 3, False),
+        ([0.0, 0.5, 1.0], "float32", [0, 127, 255], 3, False),
+        ([-1.0, 0.0, 1.0], "float32", [0, 127, 255], 3, False),
+    ],
+    ids=["grayscale", "rgb", "rgba", "batched-rgb", "batched-rgba", "integer-clipping", "float", "signed-float"],
 )
-def test_normalize_image_preserves_byte_pixels(channels, batched):
+def test_normalize_image_pixel_values(values, dtype, expected, channels, batched):
     import numpy as np
 
     from vllm_omni.entrypoints.openai.images.helpers import _normalize_image
 
-    pixels = np.array([[0, 1, 32], [64, 128, 255]], dtype=np.uint8)
+    pixels = np.array([values], dtype=dtype)
+    expected_pixels = np.array([expected], dtype=np.uint8)
     if channels is not None:
         pixels = np.repeat(pixels[..., None], channels, axis=-1)
+        expected_pixels = np.repeat(expected_pixels[..., None], channels, axis=-1)
     image = pixels[None, None] if batched else pixels
 
     result = _normalize_image(image)
 
-    np.testing.assert_array_equal(np.asarray(result), pixels)
-
-
-def test_normalize_image_clips_integer_pixels():
-    import numpy as np
-
-    from vllm_omni.entrypoints.openai.images.helpers import _normalize_image
-
-    pixels = np.array([[[-10, 128, 300]]], dtype=np.int16)
-
-    result = _normalize_image(pixels)
-
-    np.testing.assert_array_equal(np.asarray(result), np.array([[[0, 128, 255]]], dtype=np.uint8))
-
-
-@pytest.mark.parametrize("signed", [False, True], ids=["zero-to-one", "minus-one-to-one"])
-def test_normalize_image_preserves_float_scaling(signed):
-    import numpy as np
-
-    from vllm_omni.entrypoints.openai.images.helpers import _normalize_image
-
-    pixels = np.array([[[0.0, 0.5, 1.0]]], dtype=np.float32)
-    image = pixels * 2 - 1 if signed else pixels
-
-    result = _normalize_image(image)
-
-    np.testing.assert_array_equal(np.asarray(result), np.array([[[0, 127, 255]]], dtype=np.uint8))
+    np.testing.assert_array_equal(np.asarray(result), expected_pixels)
 
 
 def test_image_generation_preserves_byte_pixels(test_client):
@@ -2278,7 +2262,8 @@ def test_extract_images_from_result():
     class EmptyResult:
         pass
 
-    images = _extract_images_from_result(EmptyResult())
+    result: object = EmptyResult()
+    images = _extract_images_from_result(result)
     assert images == []
 
     # Test nested batch: [np.array(shape=(3, 64, 64, 3))]
@@ -2288,7 +2273,8 @@ def test_extract_images_from_result():
         def __init__(self):
             self.images = [batch]
 
-    images = _extract_images_from_result(BatchResult())
+    result = BatchResult()
+    images = _extract_images_from_result(result)
     assert len(images) == 3
     assert all(isinstance(img, Image.Image) for img in images)
     assert all(img.size == (64, 64) for img in images)
@@ -2298,7 +2284,8 @@ def test_extract_images_from_result():
         def __init__(self):
             self.images = [np.random.randint(0, 255, (64, 64, 3), dtype=np.uint8)]
 
-    images = _extract_images_from_result(DictRequestOutput())
+    result = DictRequestOutput()
+    images = _extract_images_from_result(result)
     assert len(images) == 1
     assert isinstance(images[0], Image.Image)
 
@@ -2307,7 +2294,8 @@ def test_extract_images_from_result():
         def __init__(self):
             self.images = [np.random.randint(0, 255, (32, 32, 3), dtype=np.uint8)]
 
-    images = _extract_images_from_result(AttrRequestOutput())
+    result = AttrRequestOutput()
+    images = _extract_images_from_result(result)
     assert len(images) == 1
     assert isinstance(images[0], Image.Image)
     assert images[0].size == (32, 32)

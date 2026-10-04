@@ -30,9 +30,8 @@ from typing import Any, cast
 import httpx
 import numpy as np
 import pybase64 as base64
-from fastapi import HTTPException, Request
+from fastapi import HTTPException, Request, UploadFile
 from PIL import Image
-from starlette.datastructures import UploadFile
 from vllm.logger import init_logger
 
 from vllm_omni.entrypoints.openai.app_state import _get_diffusion_od_config
