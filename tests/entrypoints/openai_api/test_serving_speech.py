@@ -1105,6 +1105,38 @@ class TestTTSMethods:
         assert isinstance(audio_obj, CreateAudio)
         assert audio_obj.speed == 1.0
 
+    @pytest.mark.asyncio
+    async def test_audio_synthesis_error_flag_raises_tts_generation_error(
+        self,
+        speech_server,
+        mocker: MockerFixture,
+    ):
+        """A model-flagged synthesis failure surfaces as a non-retryable
+        TTSGenerationError, so create_speech answers 500 instead of shipping a
+        zero-length WAV or crashing on an unpacked Response."""
+
+        async def mock_generate():
+            yield create_mock_audio_output_for_test()
+
+        mocker.patch.object(
+            speech_server,
+            "_prepare_speech_generation",
+            new=mocker.AsyncMock(return_value=("speech-synth-err", mock_generate(), {})),
+        )
+        adapter = mocker.MagicMock()
+        adapter.collect_response_metadata = lambda _audio_output, collect: collect.__setitem__(
+            "audio_synthesis_error", True
+        )
+        mocker.patch.object(speech_server, "_get_tts_adapter", return_value=adapter)
+
+        with pytest.raises(TTSGenerationError, match="failed to synthesize audio") as exc_info:
+            await speech_server._generate_audio_bytes(
+                OpenAICreateSpeechRequest(input="Hello"),
+                collect={},
+            )
+
+        assert exc_info.value.retryable is False
+
     def test_is_tts_detection_with_tts_stage(self, mocker: MockerFixture):
         """Test TTS model detection when TTS stage exists."""
         mock_engine_client = mocker.MagicMock()
@@ -2144,7 +2176,9 @@ class TestTTSMethods:
         speech_server._tts_model_type = "moss_tts"
         speech_server._adapter = speech_server._get_tts_adapter()
         speech_server._adapter._moss_variant = "ttsd"
-        speech_server.uploaded_speakers = {"alice": {}}
+        speech_server.uploaded_speakers = {
+            "alice": {"embedding_source": "audio", "created_at": 42, "file_path": "/test.safetensors"}
+        }
         mocker.patch.object(speech_server, "_voice_created_at", return_value=42)
 
         proc = mocker.MagicMock()
@@ -2166,16 +2200,16 @@ class TestTTSMethods:
         req = OpenAICreateSpeechRequest(
             input="hello",
             voice="alice",
-            ref_audio="data:audio/wav;base64,aaa",
             ref_audio_2="data:audio/wav;base64,bbb",
         )
+        assert speech_server._adapter._bind_registered_reference(req) is None
         params = await speech_server._adapter._build_moss_tts_params(req, has_inline_ref_audio=False)
         assert sorted(seen) == [
-            ("data:audio/wav;base64,aaa", "alice"),
             ("data:audio/wav;base64,bbb", None),
+            ("registered:alice:42", "alice"),
         ]
         # Per-slot salt keys survive the concurrent (gather) encode order.
-        assert params["ref_audio_cache_key"] == "rk:data:audio/wav;base64,aaa"
+        assert "ref_audio_cache_key" not in params
         assert params["ref_audio_2_cache_key"] == "rk:data:audio/wav;base64,bbb"
 
     def test_precomputed_qwen3_voice_infers_base_without_ref_audio(self, speech_server):
@@ -5365,6 +5399,9 @@ class TestTTSAsyncOffloading:
         adapter_model_type = "adapter_dummy_tts"
 
         class FakeAdapter:
+            def normalize(self, request):
+                return
+
             def validate(self, request):
                 return None
 

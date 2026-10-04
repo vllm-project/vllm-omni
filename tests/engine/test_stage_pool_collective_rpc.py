@@ -155,6 +155,46 @@ def test_abort_requests_does_not_commit_op_state_when_engine_abort_fails():
 
 
 @pytest.mark.cpu
+def test_release_request_resources_skips_without_async_chunk():
+    async def run() -> None:
+        call = AsyncMock()
+        pool = StagePool(
+            0,
+            [SimpleNamespace(call_utility_async=call)],  # type: ignore[list-item]
+            stage_vllm_config=SimpleNamespace(model_config=SimpleNamespace(async_chunk=False)),
+        )
+
+        await pool.release_request_resources(["req-1"])
+        call.assert_not_awaited()
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
+def test_release_request_resources_times_out_hung_replica_without_blocking_others(monkeypatch):
+    async def run() -> None:
+        async def hang(*_args):
+            await asyncio.Event().wait()
+
+        live = AsyncMock()
+        pool = StagePool(
+            0,
+            [SimpleNamespace(call_utility_async=hang), SimpleNamespace(call_utility_async=live)],  # type: ignore[list-item]
+            stage_vllm_config=SimpleNamespace(model_config=SimpleNamespace(async_chunk=True)),
+        )
+        monkeypatch.setattr(pool, "RELEASE_RPC_TIMEOUT_S", 0.2)
+
+        release = asyncio.create_task(pool.release_request_resources(["req-1"]))
+        await asyncio.sleep(0.05)
+        live.assert_awaited_once_with("omni_release_request_resources", ["req-1"])
+        assert not release.done()
+
+        await asyncio.wait_for(release, timeout=1.0)
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
 @pytest.mark.parametrize("method", ["reset_prefix_cache", "reset_encoder_cache", "reset_mm_cache"])
 @pytest.mark.parametrize("failure", ["error", "timeout", "missing"])
 def test_cache_reset_failure_is_serialized_and_pool_remains_usable(method, failure):

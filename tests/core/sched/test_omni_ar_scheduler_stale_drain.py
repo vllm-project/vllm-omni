@@ -40,6 +40,7 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm_omni.core.sched.omni_ar_scheduler import OmniARScheduler
+from tests.helpers.omni_scheduler import bind_omits_transfer_helpers
 
 # isort: on
 
@@ -103,10 +104,11 @@ def _make_drain_sched(session: Request) -> MagicMock:
     sched.kv_cache_manager.estimate_cached_tokens.return_value = 0
     sched.finished_req_ids_dict = {}
     sched.make_stats.return_value = None
+    bind_omits_transfer_helpers(sched)
     return sched
 
 
-def _run_step(sched: MagicMock, session: Request, *, num_scheduled: int, token: int) -> bool:
+def _run_step(sched: MagicMock, session: Request, *, num_scheduled: int, token: int, spec=None) -> bool:
     """Feed one model-runner frame through update_from_output.
 
     Returns True when the frame's tokens were delivered (the append ran),
@@ -114,7 +116,7 @@ def _run_step(sched: MagicMock, session: Request, *, num_scheduled: int, token: 
     """
     scheduler_output = MagicMock(spec=SchedulerOutput)
     scheduler_output.num_scheduled_tokens = {session.request_id: num_scheduled}
-    scheduler_output.scheduled_spec_decode_tokens = {}
+    scheduler_output.scheduled_spec_decode_tokens = {session.request_id: spec} if spec else {}
     scheduler_output.num_invalid_spec_tokens = 0
 
     model_runner_output = MagicMock(spec=ModelRunnerOutput)
@@ -132,6 +134,27 @@ def _run_step(sched: MagicMock, session: Request, *, num_scheduled: int, token: 
     sched._update_request_with_output.reset_mock()
     OmniARScheduler.update_from_output(sched, scheduler_output, model_runner_output)
     return sched._update_request_with_output.called
+
+
+def test_connector_prompt_replacement_drops_old_frame_and_delivers_new_frame() -> None:
+    from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin
+
+    session = _make_session()
+    session.num_computed_tokens = 6
+    session.num_in_flight_tokens = 1
+    session.num_output_placeholders = 1
+    sched = _make_drain_sched(session)
+    sched.chunk_transfer_adapter.replaced_streaming_prompt_ids = {session.request_id}
+    sched.chunk_transfer_adapter.requests_with_ready_chunks = {session.request_id}
+    sched.chunk_transfer_adapter.requests_num_chunks_sent = {session.external_req_id: 2}
+
+    OmniSchedulerMixin._reset_ready_async_chunk_replacements(sched)
+    assert session.num_stale_output_tokens == 1 and session.drop_stale_output
+    assert session.num_output_placeholders == 0
+    sched._release_replaced_streaming_prompt_cache.assert_called_once_with(session)
+    assert _run_step(sched, session, num_scheduled=1, token=42) is False
+    assert session.num_stale_output_tokens == 0
+    assert _run_step(sched, session, num_scheduled=1, token=43) is True
 
 
 def test_exact_drain_delivers_new_segment_frame() -> None:
@@ -225,3 +248,80 @@ def test_in_flight_prefill_chunk_drains_exactly_without_underflow() -> None:
     assert _run_step(sched, session, num_scheduled=5, token=42) is False  # late prefill chunk dropped
     assert session.num_stale_output_tokens == 0
     assert _run_step(sched, session, num_scheduled=1, token=43) is True  # new segment survives
+
+
+@pytest.mark.parametrize("drop", [False, True])
+def test_preemption_stale_output_follows_upstream_delivery_policy(drop):
+    request = _make_session()
+    request.status = RequestStatus.PREEMPTED
+    request.num_stale_output_tokens = 1
+    request.num_in_flight_tokens = 1
+    request.drop_stale_output = drop
+    sched = _make_drain_sched(request)
+    assert _run_step(sched, request, num_scheduled=1, token=42) is (not drop)
+    assert request.num_stale_output_tokens == 0
+    if not drop:
+        sched._update_request_with_output.assert_called_once_with(request, [42], is_stale=True)
+
+
+def test_preemption_stale_spec_rejection_does_not_roll_back_resumed_counters():
+    request = _make_session()
+    request.num_stale_output_tokens = 2
+    request.num_in_flight_tokens = 2
+    request.num_computed_tokens = 3
+    request.num_output_placeholders = 2
+    request.drop_stale_output = False
+    sched = _make_drain_sched(request)
+    assert _run_step(sched, request, num_scheduled=2, token=42, spec=[41])
+    assert request.num_computed_tokens == 3
+    assert request.num_output_placeholders == 2
+
+
+@pytest.mark.parametrize(
+    "arch,supports_reset,running,reset_running,blocked",
+    [
+        ("Qwen3TTSTalkerForConditionalGeneration", False, True, True, True),
+        ("Qwen3TTSTalkerForConditionalGeneration", False, False, True, False),
+        ("Qwen3TTSTalkerForConditionalGeneration", False, True, False, False),
+        ("Qwen3TTSTalkerForConditionalGeneration", True, True, True, False),
+        ("AnotherStatefulAudioModel", False, True, True, True),
+        ("AnotherStatefulAudioModel", True, True, True, False),
+    ],
+)
+def test_reset_running_streaming_codec_is_rejected_before_preemption(
+    mocker, arch, supports_reset, running, reset_running, blocked
+):
+    from vllm.config import VllmConfig
+    from vllm.v1.core.sched.scheduler import Scheduler
+
+    from vllm_omni.config.model import OmniModelConfig
+
+    scheduler = OmniARScheduler.__new__(OmniARScheduler)
+    scheduler.vllm_config = mocker.Mock(
+        spec=VllmConfig,
+        model_config=mocker.Mock(
+            spec=OmniModelConfig,
+            model_arch=arch,
+            supports_running_prefix_cache_reset=supports_reset,
+        ),
+    )
+    request = _make_session()
+    request.num_in_flight_tokens = 1
+    request.num_output_placeholders = 1
+    scheduler.running = [request] if running else []
+
+    def reset_cache(_self, reset_running_requests=False, reset_connector=False):
+        assert reset_running_requests is reset_running and reset_connector is True
+        return True
+
+    reset = mocker.patch.object(Scheduler, "reset_prefix_cache", autospec=True, side_effect=reset_cache)
+
+    assert scheduler.reset_prefix_cache(reset_running, reset_connector=True) is (not blocked)
+    if blocked:
+        reset.assert_not_called()
+        assert scheduler.running == [request]
+        assert request.status == RequestStatus.RUNNING
+        assert request.num_in_flight_tokens == request.num_output_placeholders == 1
+        assert not request.drop_stale_output
+    else:
+        reset.assert_called_once()

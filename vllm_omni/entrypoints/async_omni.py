@@ -128,6 +128,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         reasoning_ended: bool | None = None,
         reasoning_parser_kwargs: dict[str, Any] | None = None,
         arrival_time: float | None = None,
+        submitted: asyncio.Future[None] | None = None,
     ) -> AsyncGenerator[OmniRequestOutput, None]:
         """Generate outputs for the given prompt(s) asynchronously.
 
@@ -296,6 +297,9 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
             if admitting:
                 await self._release_generate_admission()
                 admitting = False
+            # Callers wait on this before abort so Stage0 observes the sender cache.
+            if submitted is not None and not submitted.done():
+                submitted.set_result(None)
             # Refresh gauges on arrival.
             self._publish_request_gauges(len(self.request_states))
 

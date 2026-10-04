@@ -14,6 +14,7 @@ Extends ``OmniGPUModelRunner`` with:
 from __future__ import annotations
 
 from contextlib import nullcontext
+from functools import partial
 from typing import Any, cast
 
 import numpy as np
@@ -35,7 +36,9 @@ from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.utils.mm_outputs import partition_flat_payload
 from vllm_omni.worker_v2.omni_model_runner import OmniGPUModelRunner
-from vllm_omni.worker_v2.output_snapshot import PackedOutputSnapshot, pack_output_snapshot
+from vllm_omni.worker_v2.omni_sampler import sample_with_output
+from vllm_omni.worker_v2.output_snapshot import PackedOutputSnapshot, RequestOutputSnapshot, pack_output_snapshot
+from vllm_omni.worker_v2.streaming_audio import StreamingAudioOutput
 
 logger = init_logger(__name__)
 _ASYNC_MM_SNAPSHOT_MAX_BUCKETS_PER_SLOT = 64
@@ -135,6 +138,23 @@ class OmniARModelRunner(OmniGPUModelRunner):
     # sample_tokens: OmniOutput handling + pooler_output + async D2H
     # ------------------------------------------------------------------
 
+    def sample(self, hidden_states, input_batch, grammar_output):
+        # An explicitly declared model-state hook may return already determined
+        # tokens. Unsupported sampling features retain the upstream path.
+        sample_determined = getattr(type(self.model_state), "sample_determined_tokens", None)
+        if (
+            sample_determined is not None
+            and grammar_output is None
+            and self.batch_sharder is None
+            and self.pp_handler is None
+            and input_batch.num_draft_tokens == 0
+            and input_batch.num_reqs > 0
+        ):
+            output = sample_determined(self.model_state, input_batch, self.sampler)
+            if output is not None:
+                return output, output.num_sampled, output.num_rejected
+        return super().sample(hidden_states, input_batch, grammar_output)
+
     @torch.inference_mode()
     @step_eplb_after()
     def sample_tokens(
@@ -187,11 +207,13 @@ class OmniARModelRunner(OmniGPUModelRunner):
                 ),
             )
         with sampling_context:
-            sampler_output, num_sampled, num_rejected = self.sample(
-                text_hidden,
-                input_batch,
-                grammar_output,
+            sampling_output = sample_with_output(
+                self.sampler, self.sample, text_hidden, input_batch, self.req_states, grammar_output
             )
+        sampler_output = sampling_output.sampler_output
+        num_sampled, num_rejected = sampling_output.num_sampled, sampling_output.num_rejected
+        if sampling_output.multimodal_outputs is not None:
+            multimodal_outputs = sampling_output.multimodal_outputs
         run_eager_mtp = getattr(self.model_state, "run_eager_mtp", None)
         if multimodal_outputs and run_eager_mtp is not None:
             run_eager_mtp(
@@ -201,6 +223,17 @@ class OmniARModelRunner(OmniGPUModelRunner):
                 multimodal_outputs,
                 self._dispatch_mtp_batch_descriptor,
             )
+        publish_sampled = getattr(self.model_state, "publish_sampled_embeddings", None)
+        extra_outputs = (
+            publish_sampled(input_batch, sampler_output.sampled_token_ids)
+            if (
+                multimodal_outputs
+                and callable(publish_sampled)
+                and bool(getattr(self.model_config, "async_chunk", False))
+                and getattr(self.model_config, "engine_output_type", "text") != "text"
+            )
+            else None
+        )
         if self.pp_handler is not None:
             self.pp_handler.broadcast(
                 sampler_output.sampled_token_ids,
@@ -236,6 +269,13 @@ class OmniARModelRunner(OmniGPUModelRunner):
         model_runner_output.kv_extracted_req_ids = kv_extracted
         model_runner_output._async_chunk = bool(getattr(self.model_config, "async_chunk", False))
 
+        prepare_streaming = getattr(self.model_state, "prepare_streaming_audio_output", None)
+        streaming_audio = (
+            prepare_streaming(input_batch, self.req_states, multimodal_outputs)
+            if need_pooler and multimodal_outputs and callable(prepare_streaming)
+            else None
+        )
+
         # --- Async D2H via OmniAsyncOutput ---
         materialize_native = self._uses_native_output_materializer()
         async_output = OmniAsyncOutput(
@@ -244,19 +284,23 @@ class OmniARModelRunner(OmniGPUModelRunner):
             num_sampled_tokens=num_sampled,
             main_stream=self.main_stream,
             copy_stream=self.output_copy_stream,
-            text_hidden=text_hidden if need_pooler else None,
+            text_hidden=text_hidden if need_pooler and sampling_output.include_hidden_states else None,
             multimodal_outputs=multimodal_outputs if need_pooler else None,
             input_batch=input_batch if need_pooler else None,
             async_chunk=bool(getattr(self.model_config, "async_chunk", False)),
             finalize_output=(None if materialize_native else self._finalize_native_data_plane_output),
+            finalize_multimodal=sampling_output.finalize_multimodal,
             check_ep_fault=self.check_ep_fault,
             routed_experts=routed_experts,
+            streaming_audio=streaming_audio,
+            extra_multimodal_outputs=extra_outputs,
         )
         self._release_multimodal_snapshot(snapshot_slot, async_output.copy_event)
         _guard_graph_replay_for_pooler_copy(
             self.main_stream,
             async_output.copy_event,
-            need_pooler=need_pooler,
+            need_pooler=need_pooler
+            and (sampling_output.include_hidden_states or not sampling_output.owns_multimodal_outputs),
             async_chunk=bool(getattr(self.model_config, "async_chunk", False)),
         )
 
@@ -279,6 +323,15 @@ class OmniARModelRunner(OmniGPUModelRunner):
 
     def _retain_multimodal_outputs(self, outputs: dict[str, Any]) -> dict[str, Any]:
         if not bool(getattr(self.model_config, "async_chunk", False)) or not outputs:
+            return outputs
+        if getattr(self.model, "mm_outputs_fresh_per_step", False):
+            # Freshly allocated each step and filled after sampling; nothing
+            # overwrites them before the host copy.
+            return outputs
+        # A producer-side PackedOutputSnapshot already owns its device slabs
+        # for this forward and carries the event that makes them visible to
+        # the output copy stream. Repacking it would add a second GPU copy.
+        if isinstance(outputs, PackedOutputSnapshot):
             return outputs
         slot_index = self._async_mm_snapshot_cursor
         if self._async_mm_snapshot_pending[slot_index]:
@@ -499,6 +552,12 @@ def _async_copy_mm_value(
             for key, val in value.items()
         }
     if isinstance(value, list):
+        if len(value) > 1 and isinstance(value[0], torch.Tensor) and value[0].device.type == "cpu":
+            first = value[0]
+            if all(val is first for val in value):
+                # One shared per-step host tensor (e.g. every request's sample
+                # rate): one copy serves all entries.
+                return [_async_copy_tensor(first)] * len(value)
         return [
             _async_copy_mm_value(
                 val,
@@ -530,6 +589,8 @@ def _async_copy_mm(
     if not mm_outputs:
         return {}
     if isinstance(mm_outputs, PackedOutputSnapshot):
+        if mm_outputs.producer_event is not None:
+            mm_outputs.producer_event.wait(copy_stream)
         return mm_outputs.copy_to_cpu(
             lambda tensor: _async_copy_tensor(tensor, copy_stream=copy_stream, pin_memory=pin_memory)
         )
@@ -541,6 +602,18 @@ def _async_copy_mm(
         )
         for key, value in mm_outputs.items()
     }
+
+
+def _merge_payload_trees(base: dict[str, Any], extra: dict[str, Any]) -> dict[str, Any]:
+    """``base`` with ``extra`` merged in; nested mappings merge key by key."""
+    merged = dict(base)
+    for key, value in extra.items():
+        current = merged.get(key)
+        if isinstance(current, dict) and isinstance(value, dict):
+            merged[key] = _merge_payload_trees(current, value)
+        else:
+            merged[key] = value
+    return merged
 
 
 def _slice_pooler_value(
@@ -647,8 +720,11 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
         input_batch: Any | None = None,
         async_chunk: bool = False,
         finalize_output: Any | None = None,
+        finalize_multimodal: Any | None = None,
         check_ep_fault: bool = False,
         routed_experts: RoutedExpertsTensors | None = None,
+        streaming_audio: StreamingAudioOutput | None = None,
+        extra_multimodal_outputs: tuple[dict[str, Any], torch.cuda.Event] | None = None,
     ):
         self.model_runner_output = model_runner_output
         self.sampler_output = sampler_output
@@ -657,10 +733,13 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
         self.copy_event = copy_event if copy_event is not None else torch.cuda.Event(blocking=True)
         self._async_chunk = bool(async_chunk)
         self._finalize_output = finalize_output
+        self._finalize_multimodal = finalize_multimodal
         self._has_fault: torch.Tensor | None = None
 
         # Snapshot input_batch metadata needed for pooler_output slicing
-        self._need_pooler = text_hidden is not None or (self._async_chunk and bool(multimodal_outputs))
+        self._need_pooler = text_hidden is not None or (
+            (self._async_chunk or finalize_multimodal is not None) and bool(multimodal_outputs)
+        )
         self._query_start_loc_np: np.ndarray | None = None
         self._num_scheduled_tokens: np.ndarray | None = None
         self._num_reqs: int = 0
@@ -734,17 +813,45 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
             self._hidden_cpu: torch.Tensor | None = None
             self._mm_cpu: dict[str, Any] = {}
             self._mm_snapshot: dict[str, Any] = {}
-            if self._need_pooler and self._async_chunk:
+            self._streaming_audio = (
+                streaming_audio.to_cpu(
+                    copy_stream, partial(_async_copy_tensor, copy_stream=copy_stream, pin_memory=pin_memory)
+                )
+                if streaming_audio is not None
+                else None
+            )
+            if self._need_pooler and (self._async_chunk or self._finalize_multimodal is not None):
                 # CUDA graph replay reuses the model's output buffers. Take
                 # ownership directly in pinned host memory on the output copy
                 # stream so deferred finalization never performs a blocking
                 # D2H copy on the runner thread.
-                self._mm_snapshot = _async_copy_mm(
-                    multimodal_outputs,
-                    self._total_tokens,
-                    copy_stream=copy_stream,
-                    pin_memory=pin_memory,
-                )
+                if (
+                    streaming_audio is None
+                    or self._finalize_multimodal is not None
+                    or extra_multimodal_outputs is not None
+                ):
+                    # PCM owns its request partition. Generic codes/meta are
+                    # discarded unless a finalizer or extra payload needs them.
+                    self._mm_snapshot = _async_copy_mm(
+                        multimodal_outputs,
+                        self._total_tokens,
+                        copy_stream=copy_stream,
+                        pin_memory=pin_memory,
+                    )
+                if extra_multimodal_outputs:
+                    # Produced after sampling on the producer stream; copy only
+                    # once its completion event has been observed.
+                    extra_outputs, extra_ready = extra_multimodal_outputs
+                    copy_stream.wait_event(extra_ready)
+                    self._mm_snapshot = _merge_payload_trees(
+                        self._mm_snapshot,
+                        _async_copy_mm(
+                            extra_outputs,
+                            self._total_tokens,
+                            copy_stream=copy_stream,
+                            pin_memory=pin_memory,
+                        ),
+                    )
             elif self._need_pooler and text_hidden is not None:
                 self._hidden_cpu = _async_copy_tensor(
                     text_hidden,
@@ -797,16 +904,31 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
         #   * pooler_output  -> sync/full-payload path (inline pooling_output bridge)
         #   * multimodal_outputs -> wire multimodal_output, which the async_chunk
         #     stage-input processor (talker2code2wav_async_chunk) reads for codes.
-        if self._need_pooler and self._async_chunk:
-            pooler_inter, pooler_client = OmniARModelRunner._build_async_chunk_outputs_from_mm(
-                self._mm_snapshot,
-                self._query_start_loc_np,
-                self._num_scheduled_tokens,
-                self._num_reqs,
-                self._total_tokens,
-                self._padded_total_tokens,
-            )
-            self.model_runner_output.pooler_output = None
+        if self._need_pooler and (self._async_chunk or self._finalize_multimodal is not None):
+            if self._finalize_multimodal is not None:
+                self._mm_snapshot = self._finalize_multimodal(self._mm_snapshot, num_sampled_tokens)
+            pooler_inter: list[dict[str, Any] | None] | None
+            pooler_client: list[dict[str, Any] | None] | None
+            if isinstance(self._mm_snapshot, RequestOutputSnapshot):
+                pooler_inter, pooler_client = self._mm_snapshot.inter_stage, self._mm_snapshot.client
+                if len(pooler_inter) != self._num_reqs or (
+                    pooler_client is not None and len(pooler_client) != self._num_reqs
+                ):
+                    raise ValueError("Model-owned output snapshot does not match the request batch")
+            elif self._streaming_audio is None:
+                # In-stage PCM already owns its request partition. Building
+                # generic code payloads here would immediately discard them.
+                pooler_inter, pooler_client = OmniARModelRunner._build_async_chunk_outputs_from_mm(
+                    self._mm_snapshot,
+                    self._query_start_loc_np,
+                    self._num_scheduled_tokens,
+                    self._num_reqs,
+                    self._total_tokens,
+                    self._padded_total_tokens,
+                )
+            if self._streaming_audio is not None:
+                pooler_inter, pooler_client = None, self._streaming_audio.get_output()
+            self.model_runner_output.pooler_output = None if self._async_chunk else pooler_inter
             self.model_runner_output.inter_stage_outputs = pooler_inter
             self.model_runner_output.multimodal_outputs = (
                 [_ensure_tensor_values(_async_copy_mm_value(p)) if p else {} for p in pooler_client]

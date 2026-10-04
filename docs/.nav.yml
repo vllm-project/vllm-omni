@@ -47,6 +47,7 @@ nav:
     - configuration/*
   - Models:
     - models/supported_models.md
+    - SeedVR2: models/seedvr2.md
   - Features:
     - Overview: features/README.md
     - Runtime and Stage Execution:
@@ -151,6 +152,7 @@ nav:
           - Hybrid Sharded Data Parallel (HSDP): design/feature/hsdp.md
           - Pipeline Parallel: design/feature/pipeline_parallel.md
           - Sequence Parallel: design/feature/sequence_parallel.md
+          - Window Sequence Parallel: design/feature/window_sequence_parallel.md
           - Tensor Parallel: design/feature/tensor_parallel.md
           - VAE Patch Parallelism: design/feature/vae_parallel.md
         - Attention Optimization:

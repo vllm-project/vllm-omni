@@ -3,6 +3,10 @@
 # Capacity and graph capture require more than 80 GiB of GPU memory.
 async_chunk: true
 
+speech_cache:
+  resolve_max_bytes: 2147483648  # 2 GiB
+  resolve_max_entries: 2048
+
 connectors:
   shm:
     name: SharedMemoryConnector

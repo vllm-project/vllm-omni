@@ -30,12 +30,14 @@ from vllm_omni.model_executor.models.moss_tts.configuration_moss_tts import (
 )
 from vllm_omni.model_executor.models.moss_tts.modeling_moss_tts_local import (
     MossTTSRealtimeLocalTransformer,
+    _normalize_generators,
 )
 from vllm_omni.model_executor.models.moss_tts.modeling_moss_tts_local_depth import (
     MossTTSLocalDepthTransformer,
 )
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.platforms import current_omni_platform
+from vllm_omni.worker.sampling_utils import get_tts_local_seed
 
 logger = init_logger(__name__)
 
@@ -1355,6 +1357,7 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
         self._stacked_audio_emb_w: torch.Tensor | None = None
         self.mtp_hidden_size = hidden_size
         self.talker_mtp_graph_safe = not current_omni_platform.is_npu()
+        self.talker_mtp_accepts_per_row_generators = True
         self.talker_mtp_output_key = ("audio_codes", "current")
         # ``make_omni_output`` keeps code rows fixed-shape and performs all
         # state updates eagerly, so the runner can safely pack/snapshot them
@@ -1621,9 +1624,14 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
         top_k: int | None = None,
         top_p: float | None = None,
         generator: torch.Generator | None = None,
+        generators: list[torch.Generator | None] | None = None,
         **_: Any,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         bsz = int(input_embeds.shape[0])
+        # One generator per row, or the extra rows would silently sample from
+        # the global RNG. Validate before the n_vq-step depth loop so a wrong
+        # generator count fails on entry.
+        generators = _normalize_generators(generators, bsz)
         input_embeds_out = input_embeds.reshape(bsz, -1)
         last_talker_hidden = last_talker_hidden.reshape(bsz, -1).to(
             device=input_embeds.device,
@@ -1652,6 +1660,7 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
             repetition_penalty=1.0,
             history_per_codebook=None,
             generator=generator,
+            generators=generators,
         )
         new_codes = new_codes.to(device=input_embeds.device, dtype=torch.long)
         emit_mask = active_mask & should_continue_t.reshape(bsz, 1)
@@ -1667,6 +1676,31 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
         return input_embeds_out, output_codes
 
     # ------------------------------------------------------------------
+    # MRV2 reads model-owned capabilities; retain the V1 hook and platform
+    # graph-safety setting as the canonical implementation.
+    mtp = talker_mtp
+    get_mtp_seed = staticmethod(get_tts_local_seed)
+
+    def create_mrv2_model_state(self, vllm_config, encoder_cache, device):
+        from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState
+
+        state_cls = OmniModelState
+        if getattr(self.config, "mrv2_gpu_slot_state", False):
+            from .local_model_state import MossLocalModelState
+
+            state_cls = MossLocalModelState
+        return state_cls(vllm_config, self, encoder_cache, device)
+
+    @property
+    def mtp_output_key(self) -> tuple[str, str]:
+        """Return the request-buffer destination for one local audio frame."""
+        return self.talker_mtp_output_key
+
+    @property
+    def mtp_graph_safe(self) -> bool:
+        """Honor the same platform graph-safety override as the V1 runner."""
+        return self.talker_mtp_graph_safe
+
     # Package runner-generated audio frames
     # ------------------------------------------------------------------
 
