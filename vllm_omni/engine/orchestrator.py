@@ -728,6 +728,51 @@ class OrchestratorBase:
         for pool in self.stage_pools:
             pool.release_bindings(request_ids)
 
+    async def _collective_rpc_for_pool(
+        self,
+        pool: StagePool,
+        method: str,
+        timeout: float | None,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+    ) -> list[Any]:
+        """Run one control-plane RPC on every live replica of a stage, in order."""
+        results: list[Any] = []
+        clear_sender = pool.stage_type != "diffusion" and (
+            method in ("reset_mm_cache", "sleep")
+            or (method == "pause_scheduler" and kwargs.get("clear_cache", args[1] if len(args) > 1 else True))
+        )
+        for replica_id in pool.live_replica_ids():
+            try:
+                if clear_sender:
+                    processor = self._stage_input_processors.get(pool.stage_id)
+                    if processor is not None:
+                        clear = processor.renderer.clear_mm_cache_async()
+                        if timeout is None:
+                            await clear
+                        else:
+                            await asyncio.wait_for(clear, timeout=timeout)
+                    clear_sender = False
+                stage_result = await pool.collective_rpc(
+                    replica_id=replica_id,
+                    method=method,
+                    timeout=timeout,
+                    args=args,
+                    kwargs=kwargs,
+                )
+            except Exception as exc:
+                if (
+                    method not in ("pause_scheduler", "resume_scheduler")
+                    and method not in StagePool._CACHE_RESET_METHODS
+                ):
+                    raise
+                # Administrative failures must reach the caller without
+                # terminating unrelated stages. _engine_core_rpc raises
+                # on this result; remaining replicas still receive the RPC.
+                stage_result = {"supported": False, "error": f"{type(exc).__name__}: {exc}"}
+            results.append(stage_result)
+        return results
+
     async def _handle_collective_rpc(self, msg: CollectiveRPCRequestMessage) -> None:
         """Handle a control-plane RPC request from the main thread."""
         rpc_id = msg.rpc_id
@@ -747,43 +792,17 @@ class OrchestratorBase:
                     continue
                 target_pools.append(self.stage_pools[lid])
 
+        # Stages are independent, so fan out across them concurrently; each
+        # stage still visits its replicas in order. gather keeps results in
+        # target_pools order.
+        per_pool_results = await asyncio.gather(
+            *(self._collective_rpc_for_pool(pool, method, timeout, args, kwargs) for pool in target_pools)
+        )
         results: list[Any] = []
         stage_ids: list[int] = []
-        for pool in target_pools:
-            clear_sender = pool.stage_type != "diffusion" and (
-                method in ("reset_mm_cache", "sleep")
-                or (method == "pause_scheduler" and kwargs.get("clear_cache", args[1] if len(args) > 1 else True))
-            )
-            for replica_id in pool.live_replica_ids():
-                try:
-                    if clear_sender:
-                        processor = self._stage_input_processors.get(pool.stage_id)
-                        if processor is not None:
-                            clear = processor.renderer.clear_mm_cache_async()
-                            if timeout is None:
-                                await clear
-                            else:
-                                await asyncio.wait_for(clear, timeout=timeout)
-                        clear_sender = False
-                    stage_result = await pool.collective_rpc(
-                        replica_id=replica_id,
-                        method=method,
-                        timeout=timeout,
-                        args=args,
-                        kwargs=kwargs,
-                    )
-                except Exception as exc:
-                    if (
-                        method not in ("pause_scheduler", "resume_scheduler")
-                        and method not in StagePool._CACHE_RESET_METHODS
-                    ):
-                        raise
-                    # Administrative failures must reach the caller without
-                    # terminating unrelated stages. _engine_core_rpc raises
-                    # on this result; remaining replicas still receive the RPC.
-                    stage_result = {"supported": False, "error": f"{type(exc).__name__}: {exc}"}
-                stage_ids.append(pool.stage_id)
-                results.append(stage_result)
+        for pool, pool_results in zip(target_pools, per_pool_results):
+            stage_ids.extend([pool.stage_id] * len(pool_results))
+            results.extend(pool_results)
 
         await self.rpc_async_queue.put(
             CollectiveRPCResultMessage(

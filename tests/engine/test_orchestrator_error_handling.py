@@ -1347,3 +1347,44 @@ async def test_downstream_sender_clear_failure_is_nonfatal(failure):
     finally:
         for q in queues:
             q.close()
+
+
+@pytest.mark.asyncio
+async def test_collective_rpc_fans_out_across_stages_concurrently():
+    """Stages run concurrently, replicas within a stage stay sequential, and
+    results keep dispatch order even when stage 0 finishes last."""
+    pools = _build_stage_pools([[FakeStageClient(stage_type="llm") for _ in range(n)] for n in (1, 2)])
+    orchestrator, queues = _build_bare_orchestrator(pools)
+    in_flight = {"total": 0, "peak": 0, 1: 0, "stage1_peak": 0}
+
+    def make_rpc(stage_id: int, delay_s: float):
+        async def rpc(*, replica_id, **_kwargs):
+            in_flight["total"] += 1
+            in_flight["peak"] = max(in_flight["peak"], in_flight["total"])
+            if stage_id == 1:
+                in_flight[1] += 1
+                in_flight["stage1_peak"] = max(in_flight["stage1_peak"], in_flight[1])
+            try:
+                await asyncio.sleep(delay_s)
+            finally:
+                in_flight["total"] -= 1
+                if stage_id == 1:
+                    in_flight[1] -= 1
+            return f"s{stage_id}r{replica_id}"
+
+        return rpc
+
+    pools[0].collective_rpc = AsyncMock(side_effect=make_rpc(0, 0.2))
+    pools[1].collective_rpc = AsyncMock(side_effect=make_rpc(1, 0.02))
+    try:
+        await orchestrator._handle_collective_rpc(
+            CollectiveRPCRequestMessage(rpc_id="fanout", method="list_loras", args=(), kwargs={}, stage_ids=None)
+        )
+        result = queues[2].async_q.get_nowait()
+        assert result.stage_ids == [0, 1, 1]
+        assert result.results == ["s0r0", "s1r0", "s1r1"]
+        assert in_flight["peak"] == 2  # stage 0 overlaps stage 1
+        assert in_flight["stage1_peak"] == 1  # stage 1 replicas stay sequential
+    finally:
+        for q in queues:
+            q.close()
