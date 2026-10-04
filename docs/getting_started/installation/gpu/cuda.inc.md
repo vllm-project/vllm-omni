@@ -139,6 +139,20 @@ DOCKER_BUILDKIT=1 docker build \
 
 #### Launch the docker image
 
+##### Running as a non-root user
+
+The CUDA image configures writable runtime locations so it can run in
+environments that assign an arbitrary non-root UID, such as Kubernetes
+and OpenShift.
+
+The following runtime paths are configured:
+
+```text
+HOME=/tmp
+VLLM_CACHE_ROOT=/tmp/vllm
+TORCHINDUCTOR_CACHE_DIR=/tmp/torchinductor
+```
+
 ##### Launch with OpenAI API Server
 
 !!! note
