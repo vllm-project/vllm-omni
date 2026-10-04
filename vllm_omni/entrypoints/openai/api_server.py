@@ -73,7 +73,6 @@ from vllm.entrypoints.serve.utils.api_utils import (
 )
 from vllm.entrypoints.serve.utils.orca_metrics import metrics_header
 from vllm.entrypoints.serve.utils.request_logger import RequestLogger
-from vllm.entrypoints.speech_to_text.realtime.serving import OpenAIServingRealtime
 from vllm.entrypoints.speech_to_text.transcription.serving import (
     OpenAIServingTranscription,
 )
@@ -692,7 +691,6 @@ async def _init_duplex_app_state(
         "openai_streaming_speech",
         "openai_streaming_video",
         "openai_streaming_video_output",
-        "openai_serving_realtime",
         "openai_serving_realtime_robot",
         "anthropic_serving_messages",
     ):
@@ -1227,12 +1225,6 @@ async def omni_init_app_state(
         else None
     )
     state.openai_serving_duplex = None
-    state.openai_serving_realtime = OpenAIServingRealtime(
-        engine_client=engine_client,
-        models=state.openai_serving_models,
-        request_logger=request_logger,
-    )
-
     state.openai_serving_video = OmniOpenAIServingVideo(
         engine_client,
         model_name=served_model_names[0] if served_model_names else None,

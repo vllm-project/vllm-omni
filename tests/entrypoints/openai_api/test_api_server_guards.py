@@ -58,7 +58,7 @@ from starlette.requests import Request
 from starlette.websockets import WebSocketDisconnect
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 
-from vllm_omni.entrypoints.openai import api_server, realtime_connection
+from vllm_omni.entrypoints.openai import api_server
 from vllm_omni.entrypoints.serve.utils import errors as serve_errors
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -670,21 +670,15 @@ async def test_realtime_route_defaults_to_configured_duplex_handler(
         async def handle_realtime_session(self, _websocket) -> None:
             calls.append("duplex")
 
-    class _LegacyConnection:
-        async def handle_connection(self) -> None:
-            calls.append("legacy")
+    async def _dispatch_turn_based(_websocket) -> None:
+        calls.append("legacy")
 
-    monkeypatch.setattr(
-        realtime_connection,
-        "RealtimeConnection",
-        lambda _websocket, _serving: _LegacyConnection(),
-    )
+    monkeypatch.setattr(api_server, "dispatch_realtime_websocket", _dispatch_turn_based)
     query_params = {} if duplex_query is None else {"duplex": duplex_query}
     websocket = SimpleNamespace(
         app=SimpleNamespace(
             state=SimpleNamespace(
                 openai_serving_duplex=_DuplexHandler(),
-                openai_serving_realtime=object(),
             )
         ),
         query_params=query_params,
