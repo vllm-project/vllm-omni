@@ -44,6 +44,7 @@ def _stub_transcribe(monkeypatch) -> dict:
         "vllm_omni.platforms",
         SimpleNamespace(current_omni_platform=SimpleNamespace(is_available=lambda: False)),
     )
+    monkeypatch.setattr(media, "_serialize_whisper_model_download", lambda _model_size: nullcontext())
     return captured
 
 
@@ -63,6 +64,23 @@ def test_transcribe_defaults_to_auto_language(monkeypatch):
     media._whisper_transcribe_in_current_process("/tmp/does-not-matter.wav", "small")
 
     assert captured.get("language") is None
+    assert captured["temperature"] == 0.0
+
+
+def test_transcribe_uses_seeded_upstream_fallback_when_requested(monkeypatch):
+    captured = _stub_transcribe(monkeypatch)
+    seeds: list[int] = []
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(manual_seed=seeds.append))
+
+    media._whisper_transcribe_in_current_process(
+        "/tmp/does-not-matter.wav", "small", language="en", temperature_fallback=True
+    )
+
+    assert captured["temperature"] == (0.0, 0.2, 0.4, 0.6, 0.8, 1.0)
+    assert captured["language"] == "en"
+    assert captured["word_timestamps"] is True
+    assert captured["condition_on_previous_text"] is False
+    assert seeds == [0]
 
 
 class _FakeExecutor:
@@ -172,7 +190,17 @@ def test_bytes_entrypoint_forwards_language_to_subprocess(monkeypatch, tmp_path)
 
     fn, args = created[0].submitted[0]
     assert fn is media._whisper_transcribe_in_current_process
-    assert args[1:] == ("small", "en")
+    assert args[1:] == ("small", "en", False)
+
+
+def test_file_entrypoint_forwards_fallback_to_isolated_worker(monkeypatch):
+    created = _patch_executors(monkeypatch)
+
+    assert media.convert_audio_file_to_text("/tmp/clip.wav", temperature_fallback=True) == "London"
+
+    fn, args = created[0].submitted[0]
+    assert fn is media._whisper_transcribe_in_current_process
+    assert args == ("/tmp/clip.wav", "small", None, True)
 
 
 def test_parent_reuses_one_spawned_worker_across_calls(monkeypatch):
