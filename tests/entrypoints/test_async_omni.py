@@ -12,6 +12,7 @@ from vllm.lora.request import LoRARequest
 from vllm.sampling_params import RequestOutputKind, SamplingParams
 
 from tests.helpers.mark import hardware_test
+from tests.helpers.runtime import AsyncOmniParams
 from tests.helpers.stage_config import get_deploy_config_path
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
 from vllm_omni.entrypoints import async_omni as async_omni_mod
@@ -797,10 +798,12 @@ def test_qwen_video_sampling_keeps_all_three_stages_delta(input_kind):
 # End to end tests for ensuring internal manipulation of request ID
 # in diffusion / Omni models don't leak back to the user.
 #
-# One AsyncOmni per test function (all cases in a single asyncio loop) to avoid
-# repeated cold starts. Do not use class/module-scoped engine fixtures here:
-# pytest-asyncio uses a function-scoped event loop by default, so reusing an
-# engine across tests can hang on the second generate() call.
+# One engine per test function through the function-scoped
+# ``async_omni_runner_function`` fixture (all cases of a test share one asyncio
+# loop) to avoid repeated cold starts. Do not switch to the module-scoped
+# ``async_omni_runner`` fixture here: pytest-asyncio uses a function-scoped
+# event loop by default, so reusing an engine across tests can hang on the
+# second generate() call.
 
 
 # Covers:
@@ -816,7 +819,12 @@ _OMNI_REQ_IDS = ["my-req-1", "img_gen-abc123", "chatcmpl-xyz"]
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.omni
 @pytest.mark.asyncio
-async def test_diffusion_generate_request_id():
+@pytest.mark.parametrize(
+    "async_omni_runner_function",
+    [pytest.param(AsyncOmniParams(model=DIFFUSION_MODEL), id="qwen_image_random")],
+    indirect=True,
+)
+async def test_diffusion_generate_request_id(async_omni_runner_function):
     """Diffusion E2E request-id contract (``riverclouds/qwen_image_random``).
 
     Scenarios (one engine, sequential ``generate`` calls):
@@ -828,21 +836,23 @@ async def test_diffusion_generate_request_id():
     Each streaming output must expose the user-supplied id unchanged; internal
     UUID suffixing must not leak into ``output.request_id``.
     """
-    engine = AsyncOmni(model=DIFFUSION_MODEL)
-    try:
-        for req_id in _DIFFUSION_REQ_IDS:
-            async for output in engine.generate("a white cat", request_id=req_id):
-                assert output.request_id == req_id
-        async for output in engine.generate("a white cat", request_id=""):
-            assert output.request_id != ""
-    finally:
-        engine.shutdown()
+    engine = async_omni_runner_function.engine
+    for req_id in _DIFFUSION_REQ_IDS:
+        async for output in engine.generate("a white cat", request_id=req_id):
+            assert output.request_id == req_id
+    async for output in engine.generate("a white cat", request_id=""):
+        assert output.request_id != ""
 
 
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.omni
 @pytest.mark.asyncio
-async def test_omni_generate_request_id():
+@pytest.mark.parametrize(
+    "async_omni_runner_function",
+    [pytest.param(AsyncOmniParams(model=OMNI_MODEL, deploy_config=OMNI_STAGE_CONFIG), id="qwen2_5_omni_thinker")],
+    indirect=True,
+)
+async def test_omni_generate_request_id(async_omni_runner_function):
     """Omni E2E request-id contract (``Qwen/Qwen2.5-Omni-7B``, thinker-only stage).
 
     Same scenarios as ``test_diffusion_generate_request_id``:
@@ -854,20 +864,17 @@ async def test_omni_generate_request_id():
     Text modality only; asserts caller-visible ids are preserved across the
     multi-stage orchestrator path on H100.
     """
-    engine = AsyncOmni(model=OMNI_MODEL, deploy_config=OMNI_STAGE_CONFIG)
-    try:
-        for req_id in _OMNI_REQ_IDS:
-            async for output in engine.generate(
-                "Say hello in one word.",
-                request_id=req_id,
-                output_modalities=["text"],
-            ):
-                assert output.request_id == req_id
+    engine = async_omni_runner_function.engine
+    for req_id in _OMNI_REQ_IDS:
         async for output in engine.generate(
             "Say hello in one word.",
-            request_id="",
+            request_id=req_id,
             output_modalities=["text"],
         ):
-            assert output.request_id != ""
-    finally:
-        engine.shutdown()
+            assert output.request_id == req_id
+    async for output in engine.generate(
+        "Say hello in one word.",
+        request_id="",
+        output_modalities=["text"],
+    ):
+        assert output.request_id != ""

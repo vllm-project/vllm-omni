@@ -221,6 +221,36 @@ See code in `vllm-omni/tests/helpers/mark.py` for existing examples (`_cuda_mark
 
 ## Test case style
 
+### Runtime fixtures
+
+Live engines start through the shared fixtures in `tests/helpers/fixtures/runtime.py`, never by hand. Each fixture takes `omni_fixture_lock`, keeps the Whisper judge off the accelerator around the engine, and runs `cleanup_test_environment` before start and after shutdown, including when construction fails after workers were already spawned.
+
+| Fixture | Scope | Engine | Parametrize with (`indirect=True`) |
+| :--- | :--- | :--- | :--- |
+| `omni_server` / `omni_server_function` | module / function | `vllm_omni serve` subprocess | `OmniServerParams` |
+| `omni_runner` / `omni_runner_function` | module / function | in-process `Omni` (`OmniRunner`) | `(model, stage_config_path[, extra_omni_kwargs])` |
+| `async_omni_runner` / `async_omni_runner_function` | module / function | in-process `AsyncOmni` (`AsyncOmniRunner`) | `AsyncOmniParams` |
+
+For `AsyncOmni` the function-scoped `async_omni_runner_function` is the default, the opposite of the two pairs above. `AsyncOmni.__init__` is synchronous, but its coroutine methods bind to the event loop of their first call, and pytest-asyncio's default loop scope is `function`: an engine shared across tests hangs on the second `generate()`. Use the module-scoped `async_omni_runner` only when every consumer in the module is marked `@pytest.mark.asyncio(loop_scope="module")`. Do not construct `AsyncOmni(...)` directly in a live test or wrap it in `ExitStack` / `try/finally`; L1 tests that build the object with `object.__new__` or a fake engine are unaffected.
+
+```python
+from tests.helpers.runtime import AsyncOmniParams
+
+_PARAMS = [AsyncOmniParams(model="tiny-random/Qwen-Image", extra_omni_kwargs={"enforce_eager": True})]
+
+
+@pytest.mark.core_model
+@pytest.mark.diffusion
+@pytest.mark.asyncio
+@pytest.mark.parametrize("async_omni_runner_function", _PARAMS, indirect=True)
+async def test_generate_once(async_omni_runner_function) -> None:
+    engine = async_omni_runner_function.engine
+    async for output in engine.generate("a white cat", request_id="req-1"):
+        assert output.request_id == "req-1"
+```
+
+On teardown both runners close the engine, kill engine workers that survived it (PIDs are snapshotted while the engine is alive, because daemon diffusion workers are reparented once `StageDiffusionProc` is joined), then run `cleanup_test_environment`. At `--run-level core_model` the deploy YAML is patched to `load_format: dummy` and `diffusion`-marked tests get the tiny-model rewrite, exactly as with `omni_runner`.
+
 ### L1 & L2 Level Testing - Unit Testing and Basic End-to-End Verification
 
 #### 1.1 Testing Purpose
