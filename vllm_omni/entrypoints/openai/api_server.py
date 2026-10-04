@@ -115,7 +115,10 @@ from vllm_omni.entrypoints.openai.app_state import (
     _get_engine_and_model,
 )
 from vllm_omni.entrypoints.openai.batch_serving import OmniOpenAIServingChatBatch
-from vllm_omni.entrypoints.openai.chat_template import _load_model_chat_template_json
+from vllm_omni.entrypoints.openai.chat_template import (
+    _load_model_chat_template_json,
+    load_pipeline_chat_template,
+)
 from vllm_omni.entrypoints.openai.diffusion import (
     MAX_UINT32_SEED,
     _generate_with_async_omni,
@@ -739,7 +742,11 @@ async def _init_duplex_chat(
     if "generate" not in supported_tasks:
         return None
 
-    resolved_chat_template = load_chat_template(args.chat_template)
+    resolved_chat_template = load_chat_template(args.chat_template) or load_pipeline_chat_template(
+        args.model,
+        trust_remote_code=args.trust_remote_code,
+        deploy_config_path=getattr(args, "deploy_config", None),
+    )
     if resolved_chat_template is None:
         try:
             tokenizer = await engine_client.get_tokenizer()
@@ -925,7 +932,11 @@ async def omni_init_app_state(
         supported_tasks = set(await engine_client.get_supported_tasks())
     logger.info("Supported tasks: %s", supported_tasks)
 
-    resolved_chat_template = load_chat_template(args.chat_template)
+    resolved_chat_template = load_chat_template(args.chat_template) or load_pipeline_chat_template(
+        args.model,
+        trust_remote_code=args.trust_remote_code,
+        deploy_config_path=getattr(args, "deploy_config", None),
+    )
     if resolved_chat_template is None:
         try:
             tokenizer = await engine_client.get_tokenizer()
