@@ -429,6 +429,10 @@ class OmniEngineBase:
             supported_tasks.add("generate")
         if any(meta.final_output_type == "audio" for meta in self.stage_metadata):
             supported_tasks.add("speech")
+        if any(meta.final_output_type == "image" for meta in self.stage_metadata):
+            supported_tasks.add("x2i")
+        if any(meta.final_output_type == "video" for meta in self.stage_metadata):
+            supported_tasks.add("x2v")
         self.supported_tasks = tuple(supported_tasks) if supported_tasks else ("generate",)
 
     def _bootstrap_orchestrator(

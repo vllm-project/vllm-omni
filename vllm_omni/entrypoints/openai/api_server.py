@@ -820,6 +820,12 @@ async def omni_init_app_state(
                 is_pure_diffusion = True
                 logger.info("Detected pure diffusion mode (single diffusion stage)")
 
+    # Get supported tasks
+    supported_tasks: set[str] = {"generate"}
+    if hasattr(engine_client, "get_supported_tasks"):
+        supported_tasks = set(await engine_client.get_supported_tasks())
+    logger.info("Supported tasks: %s", supported_tasks)
+
     if args.served_model_name is not None:
         served_model_names = args.served_model_name
     else:
@@ -854,17 +860,18 @@ async def omni_init_app_state(
         state.serving_tokenization = None
 
         # Use for_diffusion method to create chat handler
+        # The chat handler should always be loaded to support conversational and multimodal pipelines
         state.openai_serving_chat = OmniOpenAIServingChat.for_diffusion(
             diffusion_engine=engine_client,  # type: ignore
             model_name=model_name,
         )
+
         state.openai_serving_chat_batch = OmniOpenAIServingChatBatch.for_diffusion(
             diffusion_engine=engine_client,  # type: ignore
             model_name=model_name,
         )
 
         # audio related
-        state.openai_serving_speech = None
         state.openai_serving_audio_generate = OmniOpenAIServingAudioGenerate.for_diffusion(
             engine_client,
             state.openai_serving_models,
@@ -874,24 +881,35 @@ async def omni_init_app_state(
 
         # video related
         diffusion_stage_configs = engine_client.stage_configs if hasattr(engine_client, "stage_configs") else None
-        state.openai_serving_video = OmniOpenAIServingVideo.for_diffusion(
-            diffusion_engine=engine_client,  # type: ignore
-            model_name=model_name,
-            stage_configs=diffusion_stage_configs,
+        state.openai_serving_video = (
+            OmniOpenAIServingVideo.for_diffusion(
+                diffusion_engine=engine_client,  # type: ignore
+                model_name=model_name,
+                stage_configs=diffusion_stage_configs,
+            )
+            if "x2v" in supported_tasks
+            else None
         )
-        state.openai_streaming_video_output = OmniStreamingVideoOutputHandler(
-            engine_client=engine_client,
-            model_name=model_name,
-            stage_configs=diffusion_stage_configs,
+        state.openai_streaming_video_output = (
+            OmniStreamingVideoOutputHandler(
+                engine_client=engine_client,
+                model_name=model_name,
+                stage_configs=diffusion_stage_configs,
+            )
+            if "x2v" in supported_tasks
+            else None
         )
-
-        state.openai_serving_speech = OmniOpenAIServingSpeech.for_diffusion(
-            diffusion_engine=engine_client,
-            model_name=model_name,
-            stage_configs=diffusion_stage_configs,
-            speech_cache_config=speech_cache_config,
-            allowed_local_media_path=getattr(args, "allowed_local_media_path", ""),
-            allowed_media_domains=getattr(args, "allowed_media_domains", None),
+        state.openai_serving_speech = (
+            OmniOpenAIServingSpeech.for_diffusion(
+                diffusion_engine=engine_client,
+                model_name=model_name,
+                stage_configs=diffusion_stage_configs,
+                speech_cache_config=speech_cache_config,
+                allowed_local_media_path=getattr(args, "allowed_local_media_path", ""),
+                allowed_media_domains=getattr(args, "allowed_media_domains", None),
+            )
+            if "speech" in supported_tasks
+            else None
         )
         state.openai_serving_duplex = None
         state.openai_streaming_speech = None
@@ -918,12 +936,6 @@ async def omni_init_app_state(
             logger.warning("vllm_config is None, some features may not work correctly")
 
     state.vllm_config = vllm_config
-
-    # Get supported tasks
-    supported_tasks: set[str] = {"generate"}
-    if hasattr(engine_client, "get_supported_tasks"):
-        supported_tasks = set(await engine_client.get_supported_tasks())
-    logger.info("Supported tasks: %s", supported_tasks)
 
     resolved_chat_template = load_chat_template(args.chat_template)
     if resolved_chat_template is None:
@@ -1194,29 +1206,38 @@ async def omni_init_app_state(
         else None
     )
 
-    state.openai_serving_speech = OmniOpenAIServingSpeech(
-        engine_client,
-        state.openai_serving_models,
-        request_logger=request_logger,
-        model_name=model_name,
-        speech_cache_config=speech_cache_config,
-        forced_aligner_enabled=build_forced_aligner_config(
-            getattr(args, "forced_aligner", None),
-            getattr(args, "forced_aligner_config", None),
+    state.openai_serving_speech = (
+        OmniOpenAIServingSpeech(
+            engine_client,
+            state.openai_serving_models,
+            request_logger=request_logger,
+            model_name=model_name,
+            speech_cache_config=speech_cache_config,
+            forced_aligner_enabled=build_forced_aligner_config(
+                getattr(args, "forced_aligner", None),
+                getattr(args, "forced_aligner_config", None),
+            )
+            is not None,
         )
-        is not None,
+        if "speech" in supported_tasks
+        else None
     )
 
     # Warm up speech pipeline (CUDA Graph capture, torch.compile) so the first
     # real user request is fast instead of paying a 100s compilation tax.
-    await state.openai_serving_speech.warmup()
+    if state.openai_serving_speech is not None:
+        await state.openai_serving_speech.warmup()
 
     state.openai_serving_audio_generate = OmniOpenAIServingAudioGenerate(
         engine_client, state.openai_serving_models, request_logger=request_logger, model_name=model_name
     )
 
-    state.openai_streaming_speech = OmniStreamingSpeechHandler(
-        speech_service=state.openai_serving_speech,
+    state.openai_streaming_speech = (
+        OmniStreamingSpeechHandler(
+            speech_service=state.openai_serving_speech,
+        )
+        if state.openai_serving_speech is not None
+        else None
     )
     state.openai_streaming_video = (
         create_streaming_video_handler(
@@ -1233,10 +1254,14 @@ async def omni_init_app_state(
         request_logger=request_logger,
     )
 
-    state.openai_serving_video = OmniOpenAIServingVideo(
-        engine_client,
-        model_name=served_model_names[0] if served_model_names else None,
-        stage_configs=state.stage_configs,
+    state.openai_serving_video = (
+        OmniOpenAIServingVideo(
+            engine_client,
+            model_name=served_model_names[0] if served_model_names else None,
+            stage_configs=state.stage_configs,
+        )
+        if "x2v" in supported_tasks
+        else None
     )
     state.openai_serving_realtime_robot = None
     state.rl_rollout_serving = None
