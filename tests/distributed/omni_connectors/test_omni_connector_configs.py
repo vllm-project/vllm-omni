@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -11,7 +12,11 @@ from vllm_omni.distributed.omni_connectors.utils.config import (
     stage_receives_chunks,
     stage_sends_async_output,
 )
-from vllm_omni.distributed.omni_connectors.utils.initialization import load_omni_transfer_config
+from vllm_omni.distributed.omni_connectors.utils.initialization import (
+    get_connectors_config_for_stage,
+    load_omni_transfer_config,
+    resolve_omni_kv_config_for_stage,
+)
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -41,6 +46,203 @@ def get_config_files():
 
 # Collect files at module level for parametrization
 config_files = get_config_files()
+
+
+def _duplicate_edge_config(
+    output_extra: dict | None = None,
+    input_extra: dict | None = None,
+    *,
+    schema: str = "new",
+    output_name: str = "TestConnector",
+    input_name: str = "TestConnector",
+) -> dict:
+    """Build a two-sided config for one logical edge."""
+    output = {"name": output_name, "extra": output_extra or {}}
+    incoming = {"name": input_name, "extra": input_extra or {}}
+    if schema == "legacy":
+        return {
+            "runtime": {"connectors": {}},
+            "stage_args": [
+                {"stage_id": 0, "output_connectors": {"to_stage_1": output}},
+                {"stage_id": 1, "input_connectors": {"from_stage_0": incoming}},
+            ],
+        }
+    return {
+        "connectors": {},
+        "stages": [
+            {"stage_id": 0, "output_connectors": {"to_stage_1": output}},
+            {"stage_id": 1, "input_connectors": {"from_stage_0": incoming}},
+        ],
+    }
+
+
+def test_duplicate_edge_with_equal_specs_is_registered_once():
+    config_dict = _duplicate_edge_config(
+        output_extra={"connector_get_max_wait": 300},
+        input_extra={"connector_get_max_wait": 300},
+    )
+
+    config = load_omni_transfer_config(config_dict=config_dict)
+
+    assert config is not None
+    assert list(config.connectors) == [("0", "1")]
+    assert config.connectors[("0", "1")].extra == {"connector_get_max_wait": 300}
+
+
+def test_duplicate_edge_equal_specs_are_order_independent():
+    config_dict = _duplicate_edge_config(
+        output_extra={"connector_get_max_wait": 300},
+        input_extra={"connector_get_max_wait": 300},
+    )
+    reversed_config_dict = deepcopy(config_dict)
+    reversed_config_dict["stages"].reverse()
+
+    first = load_omni_transfer_config(config_dict=config_dict)
+    second = load_omni_transfer_config(config_dict=reversed_config_dict)
+
+    assert first is not None and second is not None
+    assert first.connectors == second.connectors
+
+
+def test_duplicate_edge_equal_global_and_inline_specs_are_accepted():
+    config_dict = {
+        "connectors": {
+            "shared": {"name": "TestConnector", "extra": {"buffer_size": 4096}},
+        },
+        "stages": [
+            {"stage_id": 0, "output_connectors": {"to_stage_1": "shared"}},
+            {
+                "stage_id": 1,
+                "input_connectors": {"from_stage_0": {"name": "TestConnector", "extra": {"buffer_size": 4096}}},
+            },
+        ],
+    }
+
+    config = load_omni_transfer_config(config_dict=config_dict)
+
+    assert config is not None
+    assert config.connectors[("0", "1")].extra == {"buffer_size": 4096}
+
+
+def test_duplicate_edge_with_different_extra_fails_fast():
+    config_dict = _duplicate_edge_config(
+        output_extra={"connector_get_max_wait": 300},
+        input_extra={"connector_get_max_wait": 600},
+    )
+
+    with pytest.raises(ValueError, match=r"Conflicting connector options for edge 0->1.*connector_get_max_wait"):
+        load_omni_transfer_config(config_dict=config_dict)
+
+
+def test_duplicate_edge_with_different_connector_name_fails_fast():
+    config_dict = _duplicate_edge_config(
+        output_name="FirstConnector",
+        input_name="SecondConnector",
+    )
+
+    with pytest.raises(ValueError, match=r"Connector type mismatch for edge 0->1"):
+        load_omni_transfer_config(config_dict=config_dict)
+
+
+def test_duplicate_edge_with_nested_extra_difference_fails_fast():
+    config_dict = _duplicate_edge_config(
+        output_extra={"transport": {"host": "sender-a", "port": 50051}},
+        input_extra={"transport": {"host": "sender-b", "port": 50051}},
+    )
+
+    with pytest.raises(ValueError, match=r"Conflicting connector options for edge 0->1.*transport"):
+        load_omni_transfer_config(config_dict=config_dict)
+
+
+def test_duplicate_edge_role_differences_do_not_conflict():
+    config_dict = _duplicate_edge_config(
+        output_extra={"role": "sender"},
+        input_extra={"role": "receiver"},
+    )
+
+    config = load_omni_transfer_config(config_dict=config_dict)
+
+    assert config is not None
+    assert config.connectors[("0", "1")].extra == {"role": "sender"}
+
+
+@pytest.mark.parametrize(
+    ("stage_key", "stage_id", "expected_role"),
+    [("output_connectors", 0, "receiver"), ("input_connectors", 1, "sender")],
+)
+def test_explicit_role_is_preserved_for_single_sided_edge(stage_key, stage_id, expected_role):
+    config_dict = {"runtime": {"connectors": {}}, "stage_args": []}
+    if stage_key == "output_connectors":
+        config_dict["stage_args"].append(
+            {
+                "stage_id": 0,
+                "output_connectors": {"to_stage_1": {"name": "TestConnector", "extra": {"role": expected_role}}},
+            }
+        )
+    else:
+        config_dict["stage_args"].append(
+            {
+                "stage_id": 1,
+                "input_connectors": {"from_stage_0": {"name": "TestConnector", "extra": {"role": expected_role}}},
+            }
+        )
+
+    config = load_omni_transfer_config(config_dict=config_dict)
+
+    assert config is not None
+    if stage_key == "output_connectors":
+        resolved, _, _ = resolve_omni_kv_config_for_stage(config, stage_id)
+        assert resolved is not None
+        assert resolved["role"] == expected_role
+    else:
+        resolved = get_connectors_config_for_stage(config, stage_id)
+        assert resolved["from_stage_0"]["spec"]["extra"]["role"] == expected_role
+
+
+def test_duplicate_edge_with_different_wakeup_scope_fails_fast():
+    config_dict = _duplicate_edge_config(
+        output_extra={"wakeup_scope": "deployment-a"},
+        input_extra={"wakeup_scope": "deployment-b"},
+    )
+
+    with pytest.raises(ValueError, match=r"Conflicting connector options for edge 0->1.*wakeup_scope"):
+        load_omni_transfer_config(config_dict=config_dict)
+
+
+def test_duplicate_edge_does_not_mutate_config_dict():
+    config_dict = _duplicate_edge_config(
+        output_extra={"transport": {"host": "sender", "port": 50051}},
+        input_extra={"transport": {"host": "sender", "port": 50051}},
+    )
+    original = deepcopy(config_dict)
+
+    load_omni_transfer_config(config_dict=config_dict)
+
+    assert config_dict == original
+
+
+def test_duplicate_edge_missing_and_none_extra_values_conflict():
+    config_dict = _duplicate_edge_config(
+        output_extra={},
+        input_extra={"wakeup_scope": None},
+    )
+
+    with pytest.raises(ValueError, match=r"Conflicting connector options for edge 0->1.*wakeup_scope"):
+        load_omni_transfer_config(config_dict=config_dict)
+
+
+@pytest.mark.parametrize("schema", ["new", "legacy"])
+def test_duplicate_edge_equal_specs_support_both_schemas(schema):
+    config = load_omni_transfer_config(
+        config_dict=_duplicate_edge_config(
+            output_extra={"codec_chunk_frames": 25},
+            input_extra={"codec_chunk_frames": 25},
+            schema=schema,
+        )
+    )
+
+    assert config is not None
+    assert config.connectors[("0", "1")].extra == {"codec_chunk_frames": 25}
 
 
 @pytest.mark.parametrize(
