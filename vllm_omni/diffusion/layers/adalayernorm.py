@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
+from collections.abc import Callable
 from importlib.util import find_spec
 from typing import TYPE_CHECKING
 
@@ -33,6 +37,7 @@ _ADALN_DTYPES = (torch.bfloat16, torch.float16, torch.float32)
 # back to forward_native and are not retried (mirrors the LTX2
 # residual-AdaLN failed-key cache in residual_adaln.py).
 _FAILED_ADALN_KEYS: set = set()
+_adaln_fused_forward: Callable[["AdaLayerNorm", torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor | None] | None
 
 
 if _HAS_TRITON:
@@ -59,14 +64,13 @@ if _HAS_TRITON:
     ):
         """One program per LayerNorm row: out = ln(x) * (1 + scale) + shift.
 
-        Modulation indexing: rows enumerate the (B, L) positions of a
-        contiguous (B, L, C) tensor, so sample_idx = row // seq_len. With
-        per_sample_* the scale/shift tensors are (B, 1, C) with row stride
-        scale_row_stride/shift_row_stride (a chunk(6, dim=1) view of a
-        (B, 6, C) projection has row stride 6*C) and index as
-        sample_idx * row_stride; otherwise they are shared (1, C) and index
-        as 0. (B, C) at B > 1 is a native-path broadcast error and never
-        reaches this kernel.
+        Rows enumerate contiguous (B, L, C) or (B, F, S, C) input.
+        sample_idx = row // seq_len selects a sample, or a flattened
+        batch/frame group with seq_len = S. Per-group modulation is
+        (B, 1, C) or (B, F, 1, C); explicit row strides support projection
+        chunk views. Shared modulation addresses one channel vector.
+        (B, C) at B > 1 is a native-path broadcast error and never reaches
+        this kernel.
 
         Mean/variance use a shift-invariant two-pass: the row is centered on
         its first element (x0) before the fp32 tree sum, so for inputs with a
@@ -121,14 +125,14 @@ if _HAS_TRITON:
             y = (t2.to(tl.float32) + sh).to(out_dtype)
         else:
             y = xn * (1.0 + s) + sh
-        # out is always freshly allocated contiguous (B, L, C)
+        # out 与输入形状相同，按连续行写入。
         tl.store(out_ptr + row * channels + cols, y.to(out_dtype), mask=mask)
 
     def _adaln_modulation_mode(t: torch.Tensor, x: torch.Tensor):
-        """Classify scale/shift against x (B, L, C) for the fused kernel.
+        """Classify scale/shift against 3D/4D x for the fused kernel.
 
         "shared"     every leading dim is 1: (C,), (1, C), (1, 1, C)
-        "per_sample" (B, 1, C): one modulation row per sample
+        "per_sample" (B, 1, C) or (B, F, 1, C): one row per sample/frame
         None         anything else - native torch broadcasting on the
                      forward_native path handles it (or raises, for the
                      frozen B > 1 (B, C) RuntimeError)
@@ -138,7 +142,12 @@ if _HAS_TRITON:
             return None
         if all(d == 1 for d in shape[:-1]):
             return "shared"
-        if t.ndim == 3 and shape == (x.shape[0], 1, x.shape[-1]):
+        if x.ndim == 3 and t.ndim == 3 and shape == (x.shape[0], 1, x.shape[-1]):
+            return "per_sample"
+        if x.ndim == 4 and t.ndim == 4 and shape == (x.shape[0], x.shape[1], 1, x.shape[-1]):
+            # batch/frame 必须能用单个 row stride 线性寻址；保留 chunk view。
+            if shape[0] > 1 and shape[1] > 1 and t.stride(0) != shape[1] * t.stride(1):
+                return None
             return "per_sample"
         return None
 
@@ -162,7 +171,13 @@ if _HAS_TRITON:
         under torch.compile so regional compilation is not disrupted."""
         if torch.compiler.is_compiling():
             return None
-        if not _HAS_TRITON or x.device.type != "cuda" or x.ndim != 3 or x.numel() == 0 or not x.is_contiguous():
+        if (
+            not _HAS_TRITON
+            or x.device.type != "cuda"
+            or x.ndim not in (3, 4)
+            or x.numel() == 0
+            or not x.is_contiguous()
+        ):
             return None
         if x.dtype not in _ADALN_DTYPES:
             return None
@@ -194,7 +209,7 @@ if _HAS_TRITON:
                 return None
         return channels, block_c, mode_s == "per_sample", mode_h == "per_sample"
 
-    def _adaln_fused_forward(module: "AdaLayerNorm", x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor):
+    def _adaln_fused_forward_impl(module: "AdaLayerNorm", x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor):
         """Fused fast path. Returns the output tensor, or None when the inputs
         are unsupported or the optimized path failed synchronously (the caller
         then uses forward_native). The runtime fallback is best-effort: it
@@ -204,9 +219,9 @@ if _HAS_TRITON:
         if supported is None:
             return None
         channels, block_c, per_sample_scale, per_sample_shift = supported
-        batch, seq_len, _ = x.shape
-        rows = batch * seq_len
-        out = torch.empty((batch, seq_len, channels), dtype=x.dtype, device=x.device)
+        seq_len = x.shape[-2]
+        rows = x.numel() // channels
+        out = torch.empty(x.shape, dtype=x.dtype, device=x.device)
         ln = module.layernorm
         weight = ln.weight
         bias = ln.bias
@@ -218,8 +233,9 @@ if _HAS_TRITON:
             num_warps = 4 if block_c <= 1024 else (8 if block_c <= 4096 else 16)
             cfg = (block_c, num_warps)
             _ADALN_CONFIGS[block_c] = cfg
-        scale_row_stride = scale.stride(0)
-        shift_row_stride = shift.stride(0)
+        # F > 1 时按 frame 跨行；F = 1 时按 batch 跨行。
+        scale_row_stride = scale.stride(1) if scale.ndim == 4 and scale.shape[1] > 1 else scale.stride(0)
+        shift_row_stride = shift.stride(1) if shift.ndim == 4 and shift.shape[1] > 1 else shift.stride(0)
         # Dummy pointer args for disabled branches: never dereferenced because
         # the loads are constexpr-pruned when has_weight/has_bias is False.
         args = (
@@ -267,6 +283,8 @@ if _HAS_TRITON:
             )
             return None
         return out
+
+    _adaln_fused_forward = _adaln_fused_forward_impl
 
 
 else:

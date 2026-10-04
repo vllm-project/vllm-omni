@@ -69,6 +69,74 @@ def assert_close(a, b, dtype, loose=False):
 
 
 @pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("chunks", [2, 6])
+@pytest.mark.parametrize("bs,frames,spatial", [(1, 21, 880), (2, 3, 5), (2, 1, 5), (1, 3, 5)])
+def test_matrix_framewise_modulation(dtype, chunks, bs, frames, spatial):
+    hidden = 2240
+    m = make_module(hidden, False, 1e-6, "cuda", dtype)
+    g = torch.Generator(device="cuda").manual_seed(61)
+    x = torch.randn(bs, frames, spatial, hidden, generator=g, device="cuda", dtype=dtype)
+    modulation = torch.randn(bs, frames, chunks, hidden, generator=g, device="cuda", dtype=dtype)
+    scale, shift = modulation.chunk(chunks, dim=2)[:2]
+    # Sana 的 block/final modulation 是跨帧的 chunk view。
+    assert scale.shape == (bs, frames, 1, hidden)
+    assert scale.stride(1) == chunks * hidden
+    fused = _adaln_fused_forward(m, x, scale, shift)
+    assert fused is not None, "framewise chunk views must take the fused path"
+    assert fused.shape == x.shape and fused.dtype == dtype
+    assert_close(fused, m.forward_native(x, scale, shift), dtype)
+    ref = torch.nn.functional.layer_norm(x.float(), (hidden,), eps=m.eps)
+    ref = ref * (1 + scale.float()) + shift.float()
+    assert_close(fused, ref, dtype, loose=True)
+
+
+@pytest.mark.parametrize("shared_scale,shared_shift", [(False, True), (True, False), (True, True)])
+def test_matrix_framewise_shared_modulation(shared_scale, shared_shift):
+    dtype = torch.bfloat16
+    hidden = 2240
+    m = make_module(hidden, True, 1e-6, "cuda", dtype, nondefault_affine=True)
+    x = torch.randn(2, 3, 5, hidden, device="cuda", dtype=dtype)
+    scale = torch.randn((hidden,) if shared_scale else (2, 3, 1, hidden), device="cuda", dtype=dtype)
+    shift = torch.randn((1, 1, 1, hidden) if shared_shift else (2, 3, 1, hidden), device="cuda", dtype=dtype)
+    fused = _adaln_fused_forward(m, x, scale, shift)
+    assert fused is not None
+    assert_close(fused, m.forward_native(x, scale, shift), dtype)
+
+
+def test_matrix_framewise_irregular_group_stride_falls_back():
+    dtype = torch.bfloat16
+    hidden = 2240
+    m = make_module(hidden, False, 1e-6, "cuda", dtype)
+    x = torch.randn(2, 3, 5, hidden, device="cuda", dtype=dtype)
+    modulation = torch.randn(3, 2, 2, hidden, device="cuda", dtype=dtype).transpose(0, 1)
+    scale, shift = modulation.chunk(2, dim=2)
+    assert scale.stride(0) != x.shape[1] * scale.stride(1)
+    assert _adaln_fused_forward(m, x, scale, shift) is None
+    assert_close(m.forward_cuda(x, scale, shift), m.forward_native(x, scale, shift), dtype)
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+def test_matrix_sana_patch_embed_reaches_framewise_fused_path(dtype):
+    from vllm_omni.diffusion.models.sana_wm.sana_wm_transformer import SanaWmPatchEmbedMS3D
+
+    hidden = 2240
+    patch = SanaWmPatchEmbedMS3D((1, 1, 1), 8, hidden).to(device="cuda", dtype=dtype)
+    latents = torch.randn(2, 8, 3, 2, 3, device="cuda", dtype=dtype)
+    with torch.no_grad():
+        projected = patch.proj(latents)
+        tokens, (frames, height, width) = patch.project_with_shape(latents)
+    torch.testing.assert_close(tokens, projected.flatten(2).transpose(1, 2), atol=0, rtol=0)
+    assert tokens.is_contiguous()
+    x = tokens.reshape(2, frames, height * width, hidden)
+    modulation = torch.randn(2, frames, 6, hidden, device="cuda", dtype=dtype)
+    scale, shift = modulation.chunk(6, dim=2)[:2]
+    m = make_module(hidden, False, 1e-6, "cuda", dtype)
+    fused = _adaln_fused_forward(m, x, scale, shift)
+    assert fused is not None, "real Sana patch features must reach the fused path"
+    assert_close(fused, m.forward_native(x, scale, shift), dtype)
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("affine", [False, True])
 @pytest.mark.parametrize(
     "bs,seq,hidden", [(1, 4096, 3072), (2, 1024, 1536), (3, 128, 4096), (1, 1, 3072), (1, 8192, 1536)]

@@ -23,16 +23,24 @@ from vllm_omni.diffusion.layers.adalayernorm import (
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cuda]
 
 
-def _make(bs=2, seq=512, hidden=3072, dtype=torch.bfloat16, seed=0):
+def _make(bs=2, seq=512, hidden=3072, dtype=torch.bfloat16, seed=0, framewise=False):
+    if framewise:
+        hidden = 2240
     m = AdaLayerNorm(hidden).to(device="cuda", dtype=dtype)
     g = torch.Generator(device="cuda").manual_seed(seed)
+    if framewise:
+        x = torch.randn(bs, 4, seq // 4, hidden, generator=g, device="cuda", dtype=dtype)
+        modulation = torch.randn(bs, 4, 6, hidden, generator=g, device="cuda", dtype=dtype)
+        scale, shift = modulation.chunk(6, dim=2)[:2]
+        return m, x, scale, shift
     x = torch.randn(bs, seq, hidden, generator=g, device="cuda", dtype=dtype)
     scale = torch.randn(bs, 1, hidden, generator=g, device="cuda", dtype=dtype)
     shift = torch.randn(bs, 1, hidden, generator=g, device="cuda", dtype=dtype)
     return m, x, scale, shift
 
 
-def test_compile_smoke():
+@pytest.mark.parametrize("framewise", [False, True])
+def test_compile_smoke(framewise):
     # torch.compile over the guarded forward_cuda: with the is_compiling
     # guard the compiled region takes the NATIVE chain, so this compares
     # inductor's own LN+modulation fusion against the eager 4-kernel chain.
@@ -40,8 +48,8 @@ def test_compile_smoke():
     # ulps at O(1-8) magnitudes), hence the loose tolerance. The smoke
     # verifies the compiled workload stays functional - no crash, finite
     # outputs, no request failure.
-    m, x, scale, shift = _make()
-    compiled = torch.compile(m.forward_cuda, dynamic=False)
+    m, x, scale, shift = _make(framewise=framewise)
+    compiled = torch.compile(m.forward_cuda, dynamic=False, fullgraph=True)
     out1 = compiled(x, scale, shift)
     out2 = compiled(x, scale, shift)
     native = m.forward_native(x, scale, shift)
@@ -63,14 +71,15 @@ def test_compile_smoke():
     assert runtime_key not in _FAILED_ADALN_KEYS
 
 
-def test_cuda_graph_capture_replay_smoke():
+@pytest.mark.parametrize("framewise", [False, True])
+def test_cuda_graph_capture_replay_smoke(framewise):
     # CUDA graph capture must prove the FUSED path itself is captured: call
     # _adaln_fused_forward inside the capture and assert it returned a tensor
     # (None would mean the guard/fallback silently degraded the graph to the
     # native chain). Warm the JIT on a side stream so capture contains no
     # compile-time allocations, then replay and compare against the native
     # fallback on the same static input buffers.
-    m, x, scale, shift = _make()
+    m, x, scale, shift = _make(framewise=framewise)
     s = torch.cuda.Stream()
     s.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(s):
