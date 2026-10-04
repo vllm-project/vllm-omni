@@ -589,3 +589,35 @@ def test_receive_poll_interval_validation(monkeypatch, value, expected):
 
     monkeypatch.setenv("VLLM_OMNI_CONNECTOR_RECV_POLL_MS", value)
     assert _recv_poll_seconds() == expected
+
+
+def test_poll_miss_does_not_attach_shared_memory(connector, monkeypatch):
+    """A miss is answered by the existence probe, without a raising shm_open."""
+    from vllm_omni.distributed.omni_connectors.connectors import shm_connector as module
+
+    if module._POSIX_SHM_DIR is None:
+        pytest.skip("no /dev/shm on this host")
+
+    def unexpected_attach(*args, **kwargs):
+        raise AssertionError("missing segment must not be attached")
+
+    monkeypatch.setattr(module.shm_pkg, "SharedMemory", unexpected_attach)
+    assert connector.get("0", "1", f"missing_{uuid.uuid4().hex}") is None
+
+
+@pytest.mark.parametrize("probe", [True, False])
+def test_key_read_is_unchanged_with_or_without_the_probe(connector, monkeypatch, probe):
+    from vllm_omni.distributed.omni_connectors.connectors import shm_connector as module
+
+    if not probe:
+        monkeypatch.setattr(module, "_POSIX_SHM_DIR", None)
+    key = f"probe_{probe}_{uuid.uuid4().hex}"
+    assert connector.get("0", "1", key) is None
+    payload = {"codes": torch.arange(28, dtype=torch.long), "meta": {"chunk_seq": 3}}
+    assert connector.put("0", "1", key, payload)[0]
+
+    obj, _ = connector.get("0", "1", key)
+
+    assert torch.equal(obj["codes"], payload["codes"]) and obj["meta"] == {"chunk_seq": 3}
+    assert connector.get("0", "1", key) is None
+    assert not os.path.exists(f"/dev/shm/{key}")

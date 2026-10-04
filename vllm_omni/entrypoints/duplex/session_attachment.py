@@ -70,9 +70,29 @@ class JournalEntry:
     created_monotonic: float
     encoded_bytes: int
     payload: Mapping[str, object] = field(repr=False)
+    #: ``payload`` as the websocket sends it (compact JSON, UTF-8 unescaped).
+    encoded_text: str = field(repr=False, compare=False)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "payload", MappingProxyType(dict(self.payload)))
+
+    def wire_payload(self) -> dict[str, object]:
+        """A fresh copy of the payload that carries its encoding for the transport."""
+        return EncodedEventPayload(self.payload, encoded_text=self.encoded_text)
+
+
+class EncodedEventPayload(dict):
+    """An event payload with its wire JSON (``json.dumps`` with Starlette's ``send_json`` settings).
+
+    The journal encodes every event to count its bytes; the websocket sends
+    that text instead of encoding the often audio-sized payload again.
+    """
+
+    __slots__ = ("encoded_text",)
+
+    def __init__(self, payload: Mapping[str, object], *, encoded_text: str) -> None:
+        super().__init__(payload)
+        self.encoded_text = encoded_text
 
 
 class DuplexEventJournal:
@@ -115,13 +135,12 @@ class DuplexEventJournal:
         sequence = self._next_sequence
         sequenced_payload = dict(payload)
         sequenced_payload["server_event_seq"] = sequence
-        encoded_bytes = len(
-            json.dumps(
-                sequenced_payload,
-                separators=(",", ":"),
-                ensure_ascii=False,
-            ).encode("utf-8")
+        encoded_text = json.dumps(
+            sequenced_payload,
+            separators=(",", ":"),
+            ensure_ascii=False,
         )
+        encoded_bytes = len(encoded_text.encode("utf-8"))
         if self._retained_bytes + encoded_bytes > self._max_bytes:
             self._overflowed = True
             raise DuplexJournalOverflowError(
@@ -132,6 +151,7 @@ class DuplexEventJournal:
             created_monotonic=self._clock(),
             encoded_bytes=encoded_bytes,
             payload=sequenced_payload,
+            encoded_text=encoded_text,
         )
         self._entries.append(entry)
         self._retained_bytes += encoded_bytes
@@ -311,7 +331,7 @@ class DuplexSessionAttachmentRegistry:
                     raise KeyError(f"unknown duplex attachment session: {session_id}")
                 entry = state.journal.record(payload) if journal else None
                 attachment = state.attachment
-                wire_payload = dict(entry.payload) if entry is not None else dict(payload)
+                wire_payload = entry.wire_payload() if entry is not None else dict(payload)
             if entry is not None and on_accepted is not None:
                 on_accepted()
             if attachment is not None:
@@ -501,7 +521,7 @@ class DuplexSessionAttachmentRegistry:
                 try:
                     await send(dict(activation_payload_factory(rotated_token, attachment_generation)))
                     for entry in replay_entries:
-                        await send(dict(entry.payload))
+                        await send(entry.wire_payload())
                 except (Exception, asyncio.CancelledError):
                     # CancelledError derives from BaseException, so an
                     # ``except Exception`` here would let a cancellation during
@@ -586,6 +606,7 @@ __all__ = [
     "DuplexSessionAttachmentRegistry",
     "DuplexSessionResumeResult",
     "DuplexTransportAttachment",
+    "EncodedEventPayload",
     "InvalidResumeTokenError",
     "JournalEntry",
     "ResumeToken",

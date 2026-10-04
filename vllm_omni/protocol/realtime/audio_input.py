@@ -91,6 +91,9 @@ class RealtimeAudioAppend:
     hints: dict[str, object] = field(default_factory=dict)
     #: Client correlation id (OpenAI ``event_id``), echoed on error events.
     event_id: str | None = None
+    #: The base64 text ``audio`` was decoded from, kept so a consumer that
+    #: needs base64 again does not re-encode it.
+    audio_base64: str | None = field(default=None, repr=False, compare=False)
 
 
 # ---- speech hints ----
@@ -246,18 +249,19 @@ def decode_audio_append(
     if hints_source is not None:
         copy_realtime_input_hints(hints_source, hints)
     copy_realtime_input_hints(event, hints)
+    # Decode once: the speech check reads the same bytes.
+    try:
+        audio_bytes = base64.b64decode(audio, validate=True) if isinstance(audio, str) and audio else b""
+    except (binascii.Error, ValueError) as exc:
+        raise RealtimeProtocolError("input audio is not valid base64", code="bad_audio", event_id=event_id) from exc
     looks_like_speech = input_looks_like_speech(
         {**(hints_source or {}), **event},
-        audio=audio,
+        audio=audio_bytes if audio_bytes else audio,
         fmt=fmt,
         overlap_silence_rms=defaults.overlap_silence_rms,
     )
     duration_ms = hints.get("duration_ms", hints.get("audio_duration_ms"))
     audio_end_ms = hints.get("audio_end_ms")
-    try:
-        audio_bytes = base64.b64decode(audio, validate=True) if isinstance(audio, str) and audio else b""
-    except (binascii.Error, ValueError) as exc:
-        raise RealtimeProtocolError("input audio is not valid base64", code="bad_audio", event_id=event_id) from exc
     return RealtimeAudioAppend(
         event_id=event_id,
         audio=audio_bytes,
@@ -268,4 +272,5 @@ def decode_audio_append(
         duration_ms=int(duration_ms) if isinstance(duration_ms, int | float) else None,
         audio_end_ms=int(audio_end_ms) if isinstance(audio_end_ms, int | float) else None,
         hints=hints,
+        audio_base64=audio if audio_bytes and isinstance(audio, str) else None,
     )

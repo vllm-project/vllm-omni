@@ -1220,6 +1220,27 @@ def test_background_send_uses_enqueued_request_snapshot(build_adapter):
     ]
 
 
+@pytest.mark.parametrize("prompt_token_ids", [list(range(4096)), (1, 2, 3), None])
+def test_snapshot_freezes_prompt_ids_exactly_like_the_elementwise_walk(prompt_token_ids):
+    request = SimpleNamespace(
+        prompt_token_ids=prompt_token_ids,
+        additional_information={"ids": {"prompt": [5, 6]}, "meta": {"segment": "old"}},
+        _all_token_ids=[1, 2],
+        _output_token_ids=[2],
+    )
+
+    snapshot = OmniChunkTransferAdapter._snapshot_processor_request(request)
+
+    assert snapshot.prompt_token_ids == prompt_token_ids
+    assert type(snapshot.prompt_token_ids) is type(prompt_token_ids)
+    if isinstance(prompt_token_ids, list):
+        assert snapshot.prompt_token_ids is not prompt_token_ids
+        prompt_token_ids.append(-1)
+        assert snapshot.prompt_token_ids[-1] == 4095
+    assert snapshot.additional_information == request.additional_information
+    assert snapshot.additional_information["ids"]["prompt"] is not request.additional_information["ids"]["prompt"]
+
+
 def test_save_without_custom_processor_does_not_snapshot_request(build_adapter, mocker):
     adapter, _ = build_adapter(stage_id=1)
     request = _req("req-direct", RequestStatus.RUNNING, external_req_id="ext-direct")

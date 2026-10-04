@@ -144,7 +144,16 @@ def build_engine_core_request_from_tokens(
     resumable: bool = False,
     mm_features: list | None = None,
 ) -> OmniEngineCoreRequest:
-    """Build an OmniEngineCoreRequest directly from an OmniTokensPrompt."""
+    """Build an OmniEngineCoreRequest directly from an OmniTokensPrompt.
+
+    Note:
+        When ``params`` is a ``SamplingParams`` and requires no adjustment
+        (e.g., max_tokens / min_tokens clamping against the remaining context
+        window), ``request.sampling_params`` may alias the caller's ``params``
+        object rather than a deep copy. Downstream stage communication
+        msgspec-encodes the request before its first await, and callers must
+        not mutate ``request.sampling_params`` in-place.
+    """
     if arrival_time is None:
         arrival_time = _time.time()
 
@@ -153,9 +162,13 @@ def build_engine_core_request_from_tokens(
     sampling_params = None
     pooling_params = None
     if isinstance(params, SamplingParams):
-        sampling_params = params.clone()
+        # Clone (a deep copy, built per appended chunk) only to adjust a field;
+        # the request is serialized to the stage and nothing mutates its params.
+        sampling_params = params
         if model_config is not None:
             remaining = model_config.max_model_len - len(prompt_token_ids)
+            if params.max_tokens is None or params.min_tokens > remaining:
+                sampling_params = params.clone()
             if sampling_params.max_tokens is None:
                 sampling_params.max_tokens = remaining
             # ``check_stop`` returns early while ``min_tokens`` is unmet, so a
@@ -1110,6 +1123,9 @@ class OrchestratorBase:
                     ):
                         await asyncio.sleep(0.001)
                         continue
+                    # Same dict pooling-output restore as the legacy poll
+                    # (StagePool._poll_stage_raw).
+                    StagePool._rehydrate_pooling_output_payloads(raw_outputs)
                     await ready_q.put(("llm", stage_id, replica_id, raw_outputs))
                     self._orch_monitor.set_dispatch_queue_size(ready_q.qsize())
             except asyncio.CancelledError:

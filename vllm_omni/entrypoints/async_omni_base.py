@@ -12,8 +12,10 @@ request handling lives in ``AsyncOmni``; duplex sessions in ``DuplexOmni``.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import time
+from collections import deque
 from collections.abc import AsyncGenerator, Iterable
 from typing import Any
 
@@ -25,6 +27,7 @@ from vllm.v1.engine.exceptions import EngineDeadError
 
 from vllm_omni.diffusion.data import OmniACK
 from vllm_omni.engine.messages import ErrorMessage, OutputMessage
+from vllm_omni.engine.output_handoff import LoopHandoffQueue
 from vllm_omni.entrypoints.omni_base import (
     OmniBase,
     OmniEngineDeadError,
@@ -36,9 +39,11 @@ logger = init_logger(__name__)
 _FINAL_OUTPUT_IDLE_SLEEP_S = 0.001
 # Blocking-wait interval for the event-driven final-output drain
 # (explicit env value or the engine pipeline default): a message wakes the drain immediately via
-# the janus queue's condition variable; this timeout only bounds how often the
+# the loop handoff or the janus queue's condition variable; this timeout only bounds how often the
 # orchestrator liveness check runs while the pipeline is idle.
 _FINAL_OUTPUT_BLOCKING_WAIT_S = 1.0
+# Most messages the loop takes per wake before yielding to its other tasks.
+_OUTPUT_HANDOFF_BATCH = 64
 # Shared DELETE / generate() cleanup abort bound. Env is the documented knob.
 ABORT_TIMEOUT_S = float(os.environ.get("VLLM_OMNI_ABORT_TIMEOUT", 2.0))
 
@@ -323,12 +328,46 @@ class AsyncOmniBase(OmniBase):
         event_driven_drain = _event_driven_orch_enabled(
             default=bool(getattr(engine, "_event_driven_orch_default", False))
         ) and hasattr(engine, "get_output_blocking_async")
+        # No drain thread: the orchestrator wakes this loop once per loop turn
+        # that queued output, and the loop takes the messages itself.
+        handoff = getattr(engine, "output_queue", None) if event_driven_drain else None
+        if not isinstance(handoff, LoopHandoffQueue):
+            handoff = None
 
         async def _final_output_loop():
             """Background coroutine that dispatches final outputs to request queues."""
+            # The current handoff batch, dispatched one message per iteration.
+            pending: deque[Any] = deque()
+            outputs_ready = asyncio.Event()
+            if handoff is not None:
+                # Set, so whatever was queued before the consumer attached is read.
+                outputs_ready.set()
+                handoff.set_consumer(asyncio.get_running_loop(), outputs_ready.set)
             try:
                 while True:
-                    if event_driven_drain:
+                    if pending:
+                        msg = pending.popleft()
+                    elif handoff is not None:
+                        if outputs_ready.is_set():
+                            # Yield once per batch so a backlog cannot hold the loop.
+                            await asyncio.sleep(0)
+                        else:
+                            # asyncio.TimeoutError is not the builtin TimeoutError before Python 3.11.
+                            with contextlib.suppress(TimeoutError, asyncio.TimeoutError):
+                                await asyncio.wait_for(outputs_ready.wait(), _FINAL_OUTPUT_BLOCKING_WAIT_S)
+                        outputs_ready.clear()
+                        pending.extend(handoff.drain_nowait(_OUTPUT_HANDOFF_BATCH))
+                        if not pending:
+                            # Woken without output or timed out: check liveness (after the
+                            # drain, so a failure message the orchestrator queued is read first).
+                            if not engine.is_alive():
+                                raise RuntimeError("Orchestrator died unexpectedly. See logs above.")
+                            continue
+                        if len(pending) >= _OUTPUT_HANDOFF_BATCH:
+                            # More may be queued: drain again without waiting for a wake.
+                            outputs_ready.set()
+                        msg = pending.popleft()
+                    elif event_driven_drain:
                         msg = await engine.get_output_blocking_async(timeout=_FINAL_OUTPUT_BLOCKING_WAIT_S)
                         if msg is None:
                             # Timed out with the orchestrator alive; loop for
@@ -424,6 +463,9 @@ class AsyncOmniBase(OmniBase):
                     await req_state.queue.put(error_msg)
                 self.final_output_task = None
                 self._on_engine_dead(str(e))
+            finally:
+                if handoff is not None:
+                    handoff.clear_consumer()
 
         self.final_output_task = asyncio.create_task(_final_output_loop())
         logger.debug("[AsyncOmni] Final output handler started")

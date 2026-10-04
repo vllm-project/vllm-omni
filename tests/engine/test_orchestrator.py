@@ -15,8 +15,9 @@ from typing import Any
 
 import janus
 import pytest
+import torch
 from vllm.outputs import CompletionOutput, RequestOutput
-from vllm.sampling_params import SamplingParams
+from vllm.sampling_params import RequestOutputKind, SamplingParams
 from vllm.v1.engine import EngineCoreOutput, EngineCoreOutputs, FinishReason
 from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.metrics.stats import IterationStats
@@ -39,6 +40,7 @@ from vllm_omni.engine.orchestrator import (
     OrchestratorRequestState,
     StreamingSegmentState,
     _build_terminal_empty_output,
+    build_engine_core_request_from_tokens,
 )
 from vllm_omni.engine.stage_pool import StagePool
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
@@ -1633,6 +1635,93 @@ def test_stage_pool_metrics_use_resumable_segment_token_count() -> None:
     assert metrics.finish_reason == "length"
 
 
+def _audio_pool() -> StagePool:
+    stage = FakeStageClient(stage_type="llm", final_output=True, final_output_type="audio")
+    return StagePool(
+        0,
+        [stage],
+        output_processor=FakeOutputProcessor(),
+        stage_vllm_config=SimpleNamespace(model_config=SimpleNamespace(max_model_len=64)),
+    )
+
+
+def _audio_output(request_id: str, frames: int, *, finished: bool = False) -> SimpleNamespace:
+    return SimpleNamespace(
+        request_id=request_id,
+        outputs=[
+            SimpleNamespace(
+                finish_reason=FinishReason.STOP if finished else None,
+                multimodal_output={"audio": torch.zeros(frames), "sr": 24000},
+            )
+        ],
+    )
+
+
+async def _submit_audio_request(pool: StagePool, request_id: str, output_kind: RequestOutputKind) -> None:
+    params = SamplingParams(max_tokens=4, output_kind=output_kind)
+    req_state = OrchestratorRequestState(request_id=request_id, sampling_params_list=[params], final_stage_id=0)
+    request = SimpleNamespace(request_id=request_id, prompt_token_ids=[1], sampling_params=params)
+    await pool.submit_initial(request_id, req_state, request)
+
+
+def _audio_metrics(pool: StagePool, output: SimpleNamespace):
+    return pool.build_stage_metrics([output], submit_ts=time.time(), request_timestamp=time.time(), replica_id=0)
+
+
+@pytest.mark.asyncio
+async def test_stage_pool_counts_cumulative_audio_once() -> None:
+    # A CUMULATIVE output carries all of the request's audio so far: 100,
+    # then 250, then 400 frames in total, so 400 frames were generated.
+    pool = _audio_pool()
+    await _submit_audio_request(pool, "req-audio", RequestOutputKind.CUMULATIVE)
+    outputs = [_audio_output("req-audio", 100), _audio_output("req-audio", 250)]
+    final = _audio_output("req-audio", 400, finished=True)
+    for output in (*outputs, final):
+        pool.record_output_timestamps([output], output_ts=time.time())
+
+    metrics = _audio_metrics(pool, final)
+
+    assert metrics.audio_generated_frames == metrics.output_unit_count == 400
+    assert metrics.audio_sample_rate == 24000
+    assert metrics.audio_duration_s == pytest.approx(400 / 24000)
+
+
+@pytest.mark.asyncio
+async def test_stage_pool_reports_cumulative_audio_per_segment() -> None:
+    # A resumable request reports once per segment and consumers sum the
+    # events, so each event carries only the frames of its own segment.
+    pool = _audio_pool()
+    await _submit_audio_request(pool, "req-seg", RequestOutputKind.CUMULATIVE)
+    per_event = []
+    for total in (100, 250, 400):
+        output = _audio_output("req-seg", total, finished=True)
+        pool.record_output_timestamps([output], output_ts=time.time())
+        per_event.append(_audio_metrics(pool, output))
+
+    assert [metrics.audio_generated_frames for metrics in per_event] == [100, 150, 150]
+    # An audio event's units are the frames it reports.
+    assert [(metrics.output_unit_type, metrics.output_unit_count) for metrics in per_event] == [
+        ("audio", 100),
+        ("audio", 150),
+        ("audio", 150),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_stage_pool_sums_delta_audio_chunks() -> None:
+    # DELTA outputs carry only their own frames; the count is their sum.
+    pool = _audio_pool()
+    await _submit_audio_request(pool, "req-delta", RequestOutputKind.DELTA)
+    chunks = [_audio_output("req-delta", 100), _audio_output("req-delta", 150)]
+    final = _audio_output("req-delta", 150, finished=True)
+    for output in (*chunks, final):
+        pool.record_output_timestamps([output], output_ts=time.time())
+
+    # The final DELTA output alone holds only the last chunk.
+    metrics = _audio_metrics(pool, final)
+    assert metrics.audio_generated_frames == metrics.output_unit_count == 400
+
+
 def test_image_ttfo_preserves_request_time_and_tracks_stage_time() -> None:
     stage = FakeStageClient(stage_type="diffusion", final_output=True, final_output_type="image")
     pool = StagePool(
@@ -2097,3 +2186,29 @@ async def test_duplex_session_request_error_finish_is_delivered_as_request_error
         plain_state,
     )
     assert output_queue.empty()
+
+
+def test_build_engine_core_request_from_tokens_preserves_caller_params() -> None:
+    params = SamplingParams(max_tokens=10, min_tokens=2, temperature=0.7)
+    model_config = SimpleNamespace(max_model_len=100)
+    prompt = {"prompt_token_ids": [1, 2, 3]}
+
+    req1 = build_engine_core_request_from_tokens("req-1", prompt, params, model_config=model_config)
+    req2 = build_engine_core_request_from_tokens("req-2", prompt, params, model_config=model_config)
+
+    # When no clamping is required, params can be aliased and remain unmutated
+    assert req1.sampling_params is params
+    assert req2.sampling_params is params
+    assert params.max_tokens == 10
+    assert params.min_tokens == 2
+    assert params.temperature == 0.7
+
+    # Clamping creates a clone and does not mutate caller's params
+    tight_config = SimpleNamespace(max_model_len=5)
+    req3 = build_engine_core_request_from_tokens("req-3", prompt, params, model_config=tight_config)
+    assert req3.sampling_params is not params
+    assert req3.sampling_params.max_tokens == 2
+    assert req3.sampling_params.min_tokens == 2
+    assert params.max_tokens == 10
+    assert params.min_tokens == 2
+

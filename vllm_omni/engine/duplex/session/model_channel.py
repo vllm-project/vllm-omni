@@ -26,7 +26,6 @@ import copy
 import time
 import uuid
 from collections.abc import Awaitable, Callable, Mapping
-from dataclasses import replace
 from typing import TYPE_CHECKING, Protocol
 
 from vllm.logger import init_logger
@@ -301,11 +300,14 @@ class ModelChannel:
             append_plan = await self._ctx.plugin.prepare_append_plan(
                 request_id=request_id,
                 fence=fence,
+                # The history copy grows with the conversation: build it only for a plugin that reads it.
                 session_config=self._ctx.plugin.prepare_prompt_config(
                     {**request_context.session_config, "conversation": list(session.history)},
                     state=self._ctx.model_state,
                     payload=prompt_payload,
-                ),
+                )
+                if self._ctx.plugin.plans_from_session_config
+                else {},
                 runtime_config=dict(request_context.runtime_config),
                 seq=reservation.update.seq,
                 turn_seq=reservation.update.turn_seq,
@@ -487,12 +489,18 @@ class ModelChannel:
         if not isinstance(metrics, StageRequestStats):
             return None
         event = metrics
-        if event.stage_id is None:
-            event = replace(event, stage_id=stage_id)
-        if event.final_output_type is None:
-            final_output_type = getattr(output, "final_output_type", None)
-            if isinstance(final_output_type, str):
-                event = replace(event, final_output_type=final_output_type)
+        final_output_type = event.final_output_type
+        if final_output_type is None:
+            output_type = getattr(output, "final_output_type", None)
+            if isinstance(output_type, str):
+                final_output_type = output_type
+        if event.stage_id is None or final_output_type is not event.final_output_type:
+            # One shallow copy (what ``dataclasses.replace`` made, twice): the
+            # orchestrator still owns *metrics*.
+            event = copy.copy(event)
+            if event.stage_id is None:
+                event.stage_id = stage_id
+            event.final_output_type = final_output_type
         self._ctx.session.observe_stage_request_stats(stage_id, event)
         try:
             merged = OrchestratorAggregator._merge_stage_metric_event(None, event)
@@ -978,14 +986,14 @@ class ModelChannel:
             self._out.emit(speak_payload)
         target_id = draining_response_id if draining_response_id not in (None, session.active_response_id) else None
         previous_sent_ms = session.playback_for_response(target_id).sent_ms
-        text_chars_before_append = len(session.assistant_transcript(target_id))
+        text_chars_before_append = session.assistant_transcript_chars(target_id)
         if isinstance(text, str) and text:
             if target_id is not None:
                 session.append_draining_assistant_text(target_id, text)
             else:
                 session.append_assistant_text(text)
         duration_ms = model_result.get("audio_duration_ms")
-        text_chars = len(session.assistant_transcript(target_id))
+        text_chars = session.assistant_transcript_chars(target_id)
         mark_duration_ms = None
         mark_text_chars: int | None = text_chars
         if model_result.get("audio_text_mark") is False:

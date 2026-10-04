@@ -42,7 +42,12 @@ def attachment_callbacks(websocket: WebSocket) -> tuple[SendJson, CloseFn]:
 
     async def attachment_send(payload: dict[str, object]) -> None:
         try:
-            await websocket.send_json(payload)
+            encoded_text = getattr(payload, "encoded_text", None)
+            if isinstance(encoded_text, str):
+                # Already encoded by the event journal with send_json's settings.
+                await websocket.send_text(encoded_text)
+            else:
+                await websocket.send_json(payload)
         except RuntimeError as exc:
             message = str(exc)
             if "after sending 'websocket.close'" in message or "response already completed" in message:

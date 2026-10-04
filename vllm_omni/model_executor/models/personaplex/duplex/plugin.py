@@ -94,6 +94,9 @@ class PersonaPlexDuplexPlugin(DuplexModelPlugin):
     #: One codec frame: the runner keeps a model turn clocked with these when the client pauses.
     silence_continuation_samples = FRAME_SIZE
     silence_continuation_sample_rate_hz = SAMPLE_RATE
+    # The Stage 0 worker reads the voice/persona from the runtime config and
+    # never the session config, so no append builds or ships one.
+    plans_from_session_config = False
 
     def __init__(self, encode_audio: EncodeAudio) -> None:
         super().__init__(encode_audio)
@@ -139,7 +142,7 @@ class PersonaPlexDuplexPlugin(DuplexModelPlugin):
         final: bool,
         sampling_params: object,
     ) -> DuplexAppendPlan:
-        del sampling_params
+        del session_config, sampling_params
         decode_pcm_f32le_payload(payload, sample_rate_hz=SAMPLE_RATE, exact_samples=FRAME_SIZE, model="PersonaPlex")
         normalized_payload = dict(payload)  # type: ignore[call-overload]
         # One scheduler slot per frame; the first append of an epoch also
@@ -163,7 +166,6 @@ class PersonaPlexDuplexPlugin(DuplexModelPlugin):
                         "mode": "append_audio_chunk",
                         "payload": normalized_payload,
                         "final": final,
-                        "session_config": dict(session_config),
                         "runtime_config": dict(runtime_config),
                         "scheduler_token_budget": prompt_slots,
                     },
