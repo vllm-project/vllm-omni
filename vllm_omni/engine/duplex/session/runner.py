@@ -1035,6 +1035,16 @@ class DuplexSessionRunner:
         if resolved.payload is not None:
             self._mailbox.put_nowait(_Internal("commit", resolved.payload))
 
+    def _silence_continuation_enabled(self) -> bool:
+        """Whether the runner may feed the model silence units the client never sent.
+
+        A client that streams its microphone continuously (silence and
+        background noise included) turns this off with
+        ``extra_body.silence_continuation: false``, so the model only ever
+        hears audio the client actually sent.
+        """
+        return self.session.config.extra_body.get("silence_continuation") is not False
+
     def _clear_completed_pending_silence(self) -> None:
         task = self.model_state.pending_silence_task
         if task is not None and task.done():
@@ -1179,6 +1189,8 @@ class DuplexSessionRunner:
     ) -> bool:
         session = self.session
         model_state = self.model_state
+        if not self._silence_continuation_enabled():
+            return False
         self._clear_completed_pending_silence()
         pending_silence = model_state.pending_silence_task
         if pending_silence is not None and not pending_silence.done():

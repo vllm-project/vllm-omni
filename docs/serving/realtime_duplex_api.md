@@ -443,6 +443,15 @@ without `extra_body.auto_response`, and `response.cancel` /
 `output_audio_buffer.clear` restart its conversation context (a new Stage 0
 request replays the voice/persona prefill).
 
+### Session options that control model time
+
+A few `extra_body` keys on `session.update` change how the server advances the
+model between client inputs. They are model-neutral and off by default.
+
+| `extra_body` key | Default | Effect |
+| --- | --- | --- |
+| `silence_continuation` | `true` | `false` stops the server from feeding the model silence units of its own while a response is running. Use it when the client streams its microphone continuously (silence included), so the model only ever hears audio the client sent. |
+
 ### Compatibility with the OpenAI Realtime protocol
 
 The Realtime dialect is, by design, an OpenAI-Realtime-compatible surface:
