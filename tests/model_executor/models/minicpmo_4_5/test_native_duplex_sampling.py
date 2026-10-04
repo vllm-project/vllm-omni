@@ -111,3 +111,23 @@ def test_deferred_rows_match_the_synchronous_rows(seed, all_greedy, monkeypatch)
     assert _run(model, md, steps) == (expected, [True, True])
     assert {row: vars(s) for row, s in states.items()} == {row: vars(s) for row, s in sync_states.items()}
     assert all(torch.equal(md.generators[r].get_state(), sync_md.generators[r].get_state()) for r in range(6))
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("top_p", [1.0, 0.8, 0.5])
+def test_duplex_candidates_preserves_tied_logits_and_top_p(dtype, top_p):
+    logits = torch.tensor(
+        [
+            [4.0, 3.0, 3.0, 1.0],
+            [5.0, 2.0, 1.0, 0.0],
+            [2.0, 2.0, 2.0, 2.0],
+        ],
+        dtype=dtype,
+    )
+    for top_k in [1, 2, 3]:
+        filtered = Model._top_k_top_p_filter(logits, top_k=top_k, top_p=top_p)
+        expected = torch.softmax(filtered, dim=-1)
+        probs, ids = Model._duplex_top_k_top_p_candidates(logits, top_k=top_k, top_p=top_p)
+        actual = torch.zeros_like(expected).scatter_(1, ids, probs)
+        torch.testing.assert_close(actual, expected)
+

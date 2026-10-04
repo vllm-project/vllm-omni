@@ -1617,11 +1617,22 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
 
         The nucleus is decided on the k sorted candidates, O(V + k log k)
         instead of sorting the vocabulary. A tie at the k-th logit keeps
-        exactly k candidates here, where the filter keeps every tied value.
+        every tied value, preserving dense top-k threshold filtering semantics.
         """
         vocab = logits.shape[-1]
-        keep = vocab if not top_k or top_k <= 0 else min(int(top_k), vocab)
-        values, indices = torch.topk(logits, keep, dim=-1)
+        if not top_k or top_k <= 0 or top_k >= vocab:
+            values, indices = torch.sort(logits, descending=True, dim=-1, stable=True)
+        else:
+            kth = torch.topk(logits, top_k, dim=-1).values[..., -1, None]
+            counts = (logits >= kth).sum(dim=-1)
+            max_k = int(counts.max().item())
+            values, indices = torch.topk(logits, max_k, dim=-1)
+            values = values.masked_fill(values < kth, float("-inf"))
+            perm = torch.argsort(indices, dim=-1)
+            v_sorted = values.gather(-1, perm)
+            idx_sorted = indices.gather(-1, perm)
+            values, final_perm = torch.sort(v_sorted, descending=True, dim=-1, stable=True)
+            indices = idx_sorted.gather(-1, final_perm)
         probs = torch.softmax(values, dim=-1)
         if 0.0 < float(top_p) < 1.0:
             cumulative = probs.cumsum(dim=-1)
@@ -1629,7 +1640,8 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             remove[..., 1:] = remove[..., :-1].clone()
             remove[..., 0] = False
             probs = probs.masked_fill(remove, 0.0)
-            probs = probs / probs.sum(dim=-1, keepdim=True)
+            sum_p = probs.sum(dim=-1, keepdim=True)
+            probs = torch.where(sum_p > 0, probs / sum_p, probs)
         return probs, indices
 
     @staticmethod
