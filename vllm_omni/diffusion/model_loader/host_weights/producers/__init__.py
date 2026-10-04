@@ -12,6 +12,11 @@ from .final_layout_bf16 import (
     FinalLayoutBF16Policy,
     FinalLayoutBF16Producer,
 )
+from .final_layout_fp8 import (
+    DEFAULT_FP8_QUANT_CHUNK_BYTES,
+    DEFAULT_FP8_SHARD_SIZE_BYTES,
+    FinalLayoutFP8Producer,
+)
 
 __all__ = [
     "FINAL_LAYOUT_BF16_MANIFEST_SCHEMA",
@@ -22,4 +27,7 @@ __all__ = [
     "FINAL_LAYOUT_BF16_VERSION",
     "FinalLayoutBF16Policy",
     "FinalLayoutBF16Producer",
+    "DEFAULT_FP8_QUANT_CHUNK_BYTES",
+    "DEFAULT_FP8_SHARD_SIZE_BYTES",
+    "FinalLayoutFP8Producer",
 ]
