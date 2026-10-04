@@ -509,6 +509,9 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         # to avoid expensive operations inside the loop.
         stopped_running_reqs: set[Request] = set()
         stopped_preempted_reqs: set[Request] = set()
+        if self.chunk_transfer_adapter is not None:
+            # Wake the chunk sender once for the step's saves, not per request.
+            self.chunk_transfer_adapter.begin_save_batch()
         for req_id, num_tokens_scheduled in num_scheduled_tokens.items():
             assert num_tokens_scheduled > 0
             request = self.requests.get(req_id)
@@ -832,6 +835,8 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                     is_segment_finished,
                     **save_kwargs,
                 )
+        if self.chunk_transfer_adapter is not None:
+            self.chunk_transfer_adapter.end_save_batch()
 
         self._remove_stopped_requests_from_queues(
             stopped_running_reqs,

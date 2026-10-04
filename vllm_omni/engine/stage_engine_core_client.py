@@ -9,16 +9,21 @@ Directly inherits from vLLM's AsyncMPClient to reuse EngineCore architecture.
 
 from __future__ import annotations
 
+import asyncio
+import copy
 import inspect
 import os
 import socket
+from collections.abc import Awaitable
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
+import msgspec
 import vllm.v1.engine as _vllm_engine_module
 import vllm.v1.engine.core_client as _vllm_core_client_module
 from vllm.logger import init_logger
-from vllm.v1.engine import EngineCoreRequest
+from vllm.sampling_params import SamplingParams
+from vllm.v1.engine import EngineCoreRequest, EngineCoreRequestType
 from vllm.v1.engine.core_client import AsyncMPClient, DPLBAsyncMPClient, MPClient
 from vllm.v1.engine.exceptions import EngineDeadError
 
@@ -29,7 +34,12 @@ from vllm_omni.distributed.omni_connectors.utils.initialization import (
     KV_TRANSFER_PORT_OFFSET,
 )
 from vllm_omni.distributed.omni_connectors.utils.kv_utils import kv_zmq_port
-from vllm_omni.engine import OmniEngineCoreOutput, OmniEngineCoreOutputs
+from vllm_omni.engine import (
+    OmniEngineCoreOutput,
+    OmniEngineCoreOutputs,
+    OmniEngineCoreRequest,
+    coalesced_add_carrier,
+)
 from vllm_omni.engine.stage_client import StageClientBase
 from vllm_omni.engine.stage_init_utils import StageMetadata
 
@@ -527,6 +537,122 @@ class StageEngineCoreClientBase(StageClientBase):
 
 class StageEngineCoreClient(StageEngineCoreClientBase, AsyncMPClient):
     """Stage async client backed by vLLM's ``AsyncMPClient``."""
+
+    _coalesced_requests: list[EngineCoreRequest] | None = None
+    _coalesced_flush_scheduled = False
+    # Request id -> (reference, copy) of the sampling params the engine core holds for it.
+    _held_sampling_params: dict[str, tuple[int, SamplingParams]] | None = None
+    # Aborted request ids whose held params the next coalesced ADD releases.
+    _released_sampling_params_ids: list[str] | None = None
+    _last_sampling_params_ref = 0
+
+    def add_request_coalesced(self, request: EngineCoreRequest) -> None:
+        """Queue *request* for one ADD message with the others queued in this loop turn.
+
+        They go out in queue order at the end of the turn, before any other
+        message this client sends. A send failure is only logged: a dead
+        engine fails its requests on its own path.
+        """
+        request.client_index = self.client_index
+        request = self._refer_to_held_sampling_params(request)
+        if self._coalesced_requests is None:
+            self._coalesced_requests = []
+        self._coalesced_requests.append(request)
+        if not self._coalesced_flush_scheduled:
+            self._coalesced_flush_scheduled = True
+            asyncio.get_running_loop().call_soon(self._flush_coalesced_requests)
+
+    def _refer_to_held_sampling_params(self, request: EngineCoreRequest) -> EngineCoreRequest:
+        """Send a resumable update's sampling params once; later updates refer to them.
+
+        Params that differ from a copy of the ones sent last travel in full under
+        a new reference, equal ones as the reference alone. A stream end drops the
+        held params; an abort releases them with the next coalesced ADD.
+        """
+        held_by_id = self._held_sampling_params
+        if not request.resumable:
+            if held_by_id:
+                held_by_id.pop(request.request_id, None)
+            return request
+        params = request.sampling_params
+        if not isinstance(params, SamplingParams) or not isinstance(request, OmniEngineCoreRequest):
+            return request
+        if held_by_id is None:
+            held_by_id = self._held_sampling_params = {}
+        held = held_by_id.get(request.request_id)
+        try:
+            if held is not None and held[1] == params:
+                # A copy: the caller's request keeps its params.
+                return msgspec.structs.replace(request, sampling_params=None, sampling_params_ref=held[0])
+            snapshot = copy.deepcopy(params)
+        except Exception:
+            # Params that cannot be compared or copied always travel in full.
+            return request
+        self._last_sampling_params_ref += 1
+        ref = self._last_sampling_params_ref
+        held_by_id[request.request_id] = (ref, snapshot)
+        request.sampling_params_ref = ref
+        return request
+
+    def _forget_held_sampling_params(self, request_type: EngineCoreRequestType, request: Any) -> None:
+        held_by_id = self._held_sampling_params
+        if not held_by_id:
+            return
+        if request_type == EngineCoreRequestType.ABORT:
+            released = [request_id for request_id in request if held_by_id.pop(request_id, None) is not None]
+            if released:
+                self._released_sampling_params_ids = (self._released_sampling_params_ids or []) + released
+        elif request_type == EngineCoreRequestType.ADD and not getattr(request, "resumable", True):
+            # The engine core drops the held params when it adds this request.
+            held_by_id.pop(request.request_id, None)
+
+    def _flush_coalesced_requests(self) -> None:
+        self._coalesced_flush_scheduled = False
+        requests = self._coalesced_requests
+        if not requests:
+            return
+        self._coalesced_requests = None
+        released = self._released_sampling_params_ids
+        self._released_sampling_params_ids = None
+        if len(requests) == 1 and not released:
+            message = requests[0]
+        else:
+            message = coalesced_add_carrier(
+                requests,
+                client_index=self.client_index,
+                released_sampling_params_ids=released,
+            )
+        try:
+            sent = AsyncMPClient._send_input(self, EngineCoreRequestType.ADD, message)
+            self._ensure_output_queue_task()
+        except Exception:
+            logger.exception(
+                "[%s] stage-%s [rep-%s] failed to send %d coalesced requests",
+                self.__class__.__name__,
+                self.stage_id,
+                self.replica_id,
+                len(requests),
+            )
+            return
+        if isinstance(sent, asyncio.Future) and not sent.done():
+            sent.add_done_callback(self._log_coalesced_send_failure)
+
+    def _log_coalesced_send_failure(self, sent: asyncio.Future[Any]) -> None:
+        if not sent.cancelled() and sent.exception() is not None:
+            logger.error(
+                "[%s] stage-%s [rep-%s] coalesced ADD send failed: %s",
+                self.__class__.__name__,
+                self.stage_id,
+                self.replica_id,
+                sent.exception(),
+            )
+
+    def _send_input(self, request_type: EngineCoreRequestType, request: Any, engine: Any = None) -> Awaitable[Any]:
+        # Queued coalesced requests were submitted first, so they go first.
+        if self._coalesced_requests:
+            self._flush_coalesced_requests()
+        self._forget_held_sampling_params(request_type, request)
+        return super()._send_input(request_type, request, engine)
 
 
 class DPLBStageEngineCoreClient(StageEngineCoreClientBase, DPLBAsyncMPClient):

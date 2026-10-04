@@ -59,6 +59,7 @@ class OmniTransferAdapterBase:
         while not self.stop_event.is_set():
             n = len(self._pending_load_reqs)
             any_success = False
+            self._begin_recv_pass(n)
             for _ in range(n):
                 if not self._pending_load_reqs:
                     break
@@ -73,6 +74,7 @@ class OmniTransferAdapterBase:
                 except Exception as e:
                     self._pending_load_reqs.append(request)
                     logger.warning(f"Error receiving data for {request_id}: {e}")
+            self._end_recv_pass()
 
             # Timeout is the fallback for lock-free append/notify races.
             with self._recv_cond:
@@ -80,6 +82,12 @@ class OmniTransferAdapterBase:
                     self._recv_cond.wait(timeout=0.1)
                 elif not any_success and not self.stop_event.is_set():
                     self._recv_cond.wait(timeout=0.001)
+
+    def _begin_recv_pass(self, num_polls: int) -> None:
+        """Called before a pass of ``num_polls`` polls; subclasses may prepare shared state."""
+
+    def _end_recv_pass(self) -> None:
+        """Called after the pass."""
 
     def record_send_failure(self, request_id: str | None, reason: str) -> None:
         """Note that a chunk for *request_id* will never be delivered.
@@ -114,28 +122,41 @@ class OmniTransferAdapterBase:
         """Loop to send outgoing data."""
         while not self.stop_event.is_set():
             while self._pending_save_reqs:
-                task = self._pending_save_reqs.popleft()
-                try:
-                    self._send_single_request(task)
-                except Exception as e:
-                    # R1.2 of #4855. The task was popleft()-ed and is not re-queued,
-                    # so this is a give-up, not a retry: the consumer will wait for a
-                    # chunk that is never coming. Record it so the scheduler can fail
-                    # the request now instead of leaving it to the wait deadline.
-                    # The task dict carries the Request object, not a bare id --
-                    # `task.get("request_id")` is always None (it was that way in the
-                    # original warning too, which logged "None" for every failure).
-                    # Use the scheduler-side id: that is what `self.requests` is keyed
-                    # by, and what `finish_requests` expects.
-                    failed = getattr(task.get("request"), "request_id", None)
-                    logger.error("Send gave up for %s: %s", failed, e)
-                    self.record_send_failure(failed, f"{type(e).__name__}: {e}")
+                self._send_pending_requests()
 
             if self.connector is not None:
                 self.connector.reap_consumed()
             with self._save_cond:
                 if not self._pending_save_reqs and not self.stop_event.is_set():
                     self._save_cond.wait(timeout=0.1)
+
+    def _send_pending_requests(self) -> None:
+        """Send the queued save tasks, oldest first.
+
+        Subclasses may send a run of tasks together, in queue order.
+        """
+        while self._pending_save_reqs:
+            self._send_task(self._pending_save_reqs.popleft())
+
+    def _send_task(self, task: dict) -> None:
+        try:
+            self._send_single_request(task)
+        except Exception as e:
+            self._record_task_failure(task, e)
+
+    def _record_task_failure(self, task: dict, e: Exception) -> None:
+        # R1.2 of #4855. The task was popleft()-ed and is not re-queued,
+        # so this is a give-up, not a retry: the consumer will wait for a
+        # chunk that is never coming. Record it so the scheduler can fail
+        # the request now instead of leaving it to the wait deadline.
+        # The task dict carries the Request object, not a bare id --
+        # `task.get("request_id")` is always None (it was that way in the
+        # original warning too, which logged "None" for every failure).
+        # Use the scheduler-side id: that is what `self.requests` is keyed
+        # by, and what `finish_requests` expects.
+        failed = getattr(task.get("request"), "request_id", None)
+        logger.error("Send gave up for %s: %s", failed, e)
+        self.record_send_failure(failed, f"{type(e).__name__}: {e}")
 
     def _poll_single_request(self, *args, **kwargs):
         """Poll connector for a single request task.
