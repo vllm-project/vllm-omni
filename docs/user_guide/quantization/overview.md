@@ -76,7 +76,7 @@ attached to the intended stage rather than applied globally.
 
 | Method | Guide | Scope | Example models | Status |
 | -------- | ------- | ------- | ---------------- | -------- |
-| FP8 | [FP8](fp8.md) | Stage-specific DiT or transformer module | BAGEL, GLM-Image | Requires model-specific validation |
+| FP8 | [FP8](fp8.md) | Diffusion-stage MoT / DiT module | BAGEL, GLM-Image | BAGEL online FP8 validated; GLM-Image still needs model-specific validation |
 | Int8 | [Int8](int8.md) | Stage-specific DiT or transformer module | BAGEL, GLM-Image | Requires model-specific validation |
 | BitsAndBytes | [BitsAndBytes](bitsandbytes.md) | Stage-specific transformer or DiT module | BAGEL, GLM-Image | Not validated |
 | ModelOpt | [ModelOpt](modelopt.md) | Checkpoint-defined diffusion stage | BAGEL, GLM-Image | Requires model-specific validation |
