@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 # Copyright 2025 The HuggingFace Team and SANA-Video Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,6 +19,7 @@ import math
 import numbers
 from collections.abc import Iterable
 from dataclasses import dataclass, fields
+from typing import ClassVar
 
 import torch
 import torch.distributed as dist
@@ -1047,6 +1051,12 @@ class SanaVideoTransformer3DModel(nn.Module):
     # SP is implemented manually in forward (frame-aligned uneven sharding);
     # the empty plan enables the registry's SP path with zero generic hooks.
     _sp_plan = {}
+    # Compile only the convolutional feed-forward region and preserve the
+    # explicit BF16 cast boundaries required to match eager numerics.
+    _repeated_blocks: ClassVar[list[str]] = ["GLUMBTempConv"]
+    # Offloading uses whole transformer blocks; compilation targets only GLUMB.
+    _regional_compile_blocks_attrs: ClassVar[list[str]] = []
+    _regional_compile_inductor_options: ClassVar[dict[str, bool]] = {"emulate_precision_casts": True}
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         return AutoWeightsLoader(self).load_weights(weights)
