@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Output modality types for vLLM-Omni.
 
 This module defines the OutputModality enum and TensorAccumulationStrategy
@@ -87,7 +90,7 @@ class OutputModality(Flag):
             try:
                 result |= cls[p.upper()]
             except KeyError:
-                raise ValueError(f"Unknown modality: {p!r}. Supported: {[m.name.lower() for m in cls]}")
+                raise ValueError(f"Unknown modality: {p!r}. Supported: {[(m.name or '').lower() for m in cls]}")
         return result
 
     @property
@@ -123,7 +126,14 @@ class TensorAccumulationStrategy(Enum):
 # re-emitted unchanged at every step. Pipelines that produce such keys
 # register the correct strategy here via ``register_key_accumulation_strategy``
 # instead of forcing every tensor of the modality through one default.
-_KEY_ACCUMULATION_OVERRIDES: dict[str, TensorAccumulationStrategy] = {}
+# Schema-defined prompt conditioning is a complete reference snapshot. Keep
+# these defaults in the output process too, which may never import the model's
+# worker-side stage input processor. Feature lengths can change between
+# snapshots and cannot be concatenated as generated content deltas.
+_KEY_ACCUMULATION_OVERRIDES: dict[str, TensorAccumulationStrategy] = {
+    key: TensorAccumulationStrategy.REPLACE
+    for key in ("embed.speech_token", "embed.speech_feat", "embed.embedding", "embed.speech_token_len")
+}
 
 
 def register_key_accumulation_strategy(key: str, strategy: TensorAccumulationStrategy) -> None:

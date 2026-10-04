@@ -13,6 +13,7 @@ from vllm_omni.model_executor.stage_input_processors.cosyvoice3 import (
     text2flow_full_payload,
     text2flow_token_only,
 )
+from vllm_omni.outputs.mm_outputs import MultimodalPayload
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -119,6 +120,24 @@ def test_text2flow_full_payload_does_not_send_codec_ids():
     assert "codes" not in payload
     assert "next_stage_prompt_len" not in payload["meta"]
     assert torch.equal(payload["embed"]["speech_token"], torch.tensor([[1, 2]], dtype=torch.long))
+
+
+def test_text2flow_full_payload_accepts_structured_multimodal_payload():
+    speech_token = torch.tensor([[1, 2]], dtype=torch.long)
+    payload = text2flow_full_payload(
+        None,
+        MultimodalPayload(
+            tensors={
+                "embed.speech_token": speech_token,
+                "codes.audio": torch.tensor([7, 8, 9], dtype=torch.long),
+            }
+        ),
+        SimpleNamespace(external_req_id="req-structured"),
+    )
+
+    assert payload is not None
+    assert "codes" not in payload
+    assert torch.equal(payload["embed"]["speech_token"], speech_token)
 
 
 def test_talker2code2wav_async_chunk_final_payload_uses_absolute_token_offset():
@@ -355,3 +374,36 @@ def test_talker2code2wav_async_chunk_emits_terminal_eof_without_duplicate_audio(
     assert payload_final is not None
     assert payload_final.meta.finished.item() is True
     assert payload_final.codes.audio.tolist() == []
+
+
+def test_full_payload_retains_true_length_for_padded_conditioning():
+    from vllm_omni.data_entry_keys import to_struct
+
+    token = torch.tensor([[7, 8, 0, 0]], dtype=torch.int32)
+    feat = torch.randn(1, 8, 80)
+    speaker = torch.randn(1, 192)
+    length = torch.tensor([[2]], dtype=torch.int32)
+    result = text2flow_full_payload(
+        None,
+        {
+            "embed.speech_token": token,
+            "embed.speech_feat": feat,
+            "embed.embedding": speaker,
+            "embed.speech_token_len": length,
+        },
+        SimpleNamespace(request_id="padded"),
+    )
+    payload = to_struct(result)
+    assert payload.embed.speech_token_len is length
+
+
+def test_reference_features_are_snapshots_under_output_accumulation():
+    from vllm_omni.outputs.mm_outputs import MultimodalPayload
+    from vllm_omni.outputs.output_modality import OutputModality
+
+    first = torch.ones(1, 174, 80)
+    latest = torch.zeros(1, 1500, 80)
+    payload = MultimodalPayload.from_dict({"embed.speech_feat": first})
+    payload = payload.merged_with(MultimodalPayload.from_dict({"embed.speech_feat": latest}))
+    payload.consolidate_tensors(OutputModality.LATENT)
+    assert payload["embed.speech_feat"] is latest
