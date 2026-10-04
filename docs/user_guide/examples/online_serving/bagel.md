@@ -181,6 +181,8 @@ To use Mooncake, create a custom deploy YAML that binds `output_connectors` / `i
 cd examples/online_serving/bagel
 ```
 
+Prompts are plain text. The server builds the context the way BAGEL was trained: every text segment is framed with `<|im_start|>` / `<|im_end|>`, image inputs are wrapped in `<|vision_start|>` / `<|vision_end|>`, and text generation starts from a fresh `<|im_start|>`. This applies to the image endpoints and to chat completions, in the two-stage and the single-stage deployment, so requests should not add these tokens themselves.
+
 ### Text to Image (text2img)
 
 **Python client:**
@@ -199,7 +201,7 @@ python openai_chat_client.py \
 curl http://localhost:8091/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "messages": [{"role": "user", "content": [{"type": "text", "text": "<|im_start|>A beautiful sunset over mountains<|im_end|>"}]}],
+    "messages": [{"role": "user", "content": [{"type": "text", "text": "A beautiful sunset over mountains"}]}],
     "modalities": ["image"],
     "height": 512,
     "width": 512,
@@ -230,7 +232,7 @@ cat <<EOF > payload.json
     "messages": [{
       "role": "user",
       "content": [
-        {"type": "text", "text": "<|im_start|>Make the cat stand up<|im_end|>"},
+        {"type": "text", "text": "Make the cat stand up"},
         {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,${IMAGE_BASE64}"}}
       ]
     }],
@@ -281,7 +283,7 @@ cat <<EOF > payload.json
   "messages": [{
     "role": "user",
     "content": [
-      {"type": "text", "text": "<|im_start|>user\n<|image_pad|>\nDescribe this image in detail<|im_end|>\n<|im_start|>assistant\n"},
+      {"type": "text", "text": "Describe this image in detail"},
       {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,${IMAGE_BASE64}"}}
     ]
   }],
@@ -310,7 +312,7 @@ python openai_chat_client.py \
 curl http://localhost:8091/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "messages": [{"role": "user", "content": [{"type": "text", "text": "<|im_start|>user\nWhat is the capital of France?<|im_end|>\n<|im_start|>assistant\n"}]}],
+    "messages": [{"role": "user", "content": [{"type": "text", "text": "What is the capital of France?"}]}],
     "modalities": ["text"]
   }'
 ```
