@@ -885,7 +885,7 @@ def test_whole_euler_graph_with_padding_matches_eager(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_whole_euler_lazy_capture_grows_budget_instead_of_flushing(
+def test_whole_euler_graph_boundary_enforces_budget_and_falls_back_to_eager(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(current_platform, "get_global_graph_pool", lambda: torch.cuda.graph_pool_handle())
@@ -908,7 +908,8 @@ def test_whole_euler_lazy_capture_grows_budget_instead_of_flushing(
             att_cache=None,
         )
 
-    _call(10)
+    res10 = _call(10)
+    assert res10 is not None
     assert len(wrapper._cache) == 1
     assert wrapper._stats["captures"] == 1
 
@@ -917,46 +918,66 @@ def test_whole_euler_lazy_capture_grows_budget_instead_of_flushing(
     assert wrapper._stats["hits"] == 1
 
     # Second distinct shape fills cache to max_graphs=2
-    _call(12)
+    res12 = _call(12)
+    assert res12 is not None
     assert len(wrapper._cache) == 2
     assert wrapper._stats["captures"] == 2
     assert wrapper._stats["flushes"] == 0
 
-    # A third distinct shape grows the budget (up to 4x) instead of retiring every graph
-    _call(14)
+    # A third distinct shape exceeds max_graphs=2: falls back to eager (replay returns None) without expanding budget
+    res14 = _call(14)
+    assert res14 is None
     assert wrapper._stats["flushes"] == 0
-    assert len(wrapper._cache) == wrapper.max_graphs == 3
-    assert wrapper._stats["captures"] == 3
+    assert len(wrapper._cache) == 2
+    assert wrapper.max_graphs == 2
+    assert wrapper._stats["captures"] == 2
 
-    # Shape 10 is still cached: its replay matches eager
-    torch.manual_seed(42)
-    x10 = torch.randn(1, 4, 10, device="cuda")
-    mu10 = torch.randn(2, 4, 10, device="cuda")
-    spk10 = torch.randn(2, 4, device="cuda")
-    cond10 = torch.randn(2, 4, 10, device="cuda")
-    res10 = wrapper.replay(
-        x=x10.clone(),
-        mu_cfg=mu10.clone(),
-        speakers_cfg=spk10.clone(),
-        cond_cfg=cond10.clone(),
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_whole_euler_precapture_enforces_budget_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(current_platform, "get_global_graph_pool", lambda: torch.cuda.graph_pool_handle())
+
+    torch.manual_seed(0)
+    estimator = _WholeEulerDiT().eval().cuda()
+    # Configure max_graphs=1 with query_bucket_frames=16
+    wrapper = WholeEulerCFMGraphWrapper(
+        estimator=estimator,
+        n_timesteps=10,
+        max_graphs=1,
+        max_graph_batch=2,
+        micro_batch_size=2,
+        query_bucket_frames=16,
+    )
+
+    count = wrapper.precapture(
+        offsets=[0, 16, 32],
+        steady=32,
+        channels=4,
+        spk_dim=4,
+    )
+    # Must capture at most 1 graph and strictly respect max_graphs=1
+    assert count <= 1
+    assert wrapper.max_graphs == 1
+    assert len(wrapper._cache) <= 1
+
+    # An uncached shape falls back to eager (None) because max_graphs=1 is already exhausted
+    x_uncached = torch.randn(1, 4, 10, device="cuda")
+    mu_uncached = torch.randn(2, 4, 10, device="cuda")
+    spk_uncached = torch.randn(2, 4, device="cuda")
+    cond_uncached = torch.randn(2, 4, 10, device="cuda")
+    res_uncached = wrapper.replay(
+        x=x_uncached,
+        mu_cfg=mu_uncached,
+        speakers_cfg=spk_uncached,
+        cond_cfg=cond_uncached,
         cnn_cache=None,
         att_cache=None,
     )
-    assert res10 is not None
-    eager_x10, _, _ = _eager_solve_euler(
-        estimator,
-        x10.clone(),
-        mu10.clone(),
-        spk10.clone(),
-        cond10.clone(),
-        None,
-        None,
-        None,
-        wrapper.timeline,
-        mel_frames=10,
-        pad_frames=0,
-    )
-    torch.testing.assert_close(res10[0], eager_x10, rtol=1e-4, atol=1e-5)
+    assert res_uncached is None  # Eager fallback
+    assert wrapper.max_graphs == 1
+    assert len(wrapper._cache) == 1
     wrapper._flush()
 
 

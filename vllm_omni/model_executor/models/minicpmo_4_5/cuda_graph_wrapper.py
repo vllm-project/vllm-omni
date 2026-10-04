@@ -1069,8 +1069,6 @@ class WholeEulerCFMGraphWrapper:
         self.inference_cfg_rate = float(inference_cfg_rate)
         self.att_cache_dtype = att_cache_dtype
         self.max_graphs = int(max_graphs)
-        # Lazy captures may grow ``max_graphs`` up to 4x this (``_entry``).
-        self._configured_max_graphs = int(max_graphs)
         # The capture widths, narrowest first (``_capture_query_width``); the widest sizes the arena.
         if isinstance(query_bucket_frames, (tuple, list)):
             self.query_widths = tuple(sorted({int(w) for w in query_bucket_frames if int(w) > 1}))
@@ -1494,18 +1492,8 @@ class WholeEulerCFMGraphWrapper:
             self._stats["hits"] += 1
             return entry
         if len(self._cache) >= self.max_graphs:
-            # Serving lazily captures keys precapture cannot enumerate (the prompt solve): grow the
-            # budget, up to 4x, instead of a flush that would retire every graph and the arena.
-            if len(self._cache) < 4 * self._configured_max_graphs:
-                self.max_graphs = len(self._cache) + 1
-                logger.warning(
-                    "Whole-Euler lazy capture grew max_graphs to %d (cache=%d)",
-                    self.max_graphs,
-                    len(self._cache),
-                )
-            else:
-                self._unsupported.add(key)
-                return None
+            self._unsupported.add(key)
+            return None
         entry = self._capture(
             key,
             graph_batch=graph_batch,
@@ -1788,10 +1776,13 @@ class WholeEulerCFMGraphWrapper:
         keys = [(b, w, o) for b in sorted(self._graph_batches(), reverse=True) for w in widths for o in grid]
         room = self.max_graphs - len(self._cache)
         if len(keys) > room:
-            # Grow the budget rather than truncate the sweep, plus a graph per width for the offset-0 prompt
-            # solve the sweep cannot cover, so its lazy capture flushes nothing.
-            self.max_graphs = len(self._cache) + len(keys) + len(widths)
-            logger.warning("Whole-Euler precapture needs %d graphs; max_graphs is now %d", len(keys), self.max_graphs)
+            logger.warning(
+                "Whole-Euler precapture requested %d graphs; max_graphs budget is %d (room=%d). Excess shapes will execute eagerly",
+                len(keys),
+                self.max_graphs,
+                room,
+            )
+            keys = keys[:max(0, room)]
         x = torch.empty((1, int(channels), 1), device=self.device, dtype=self.dtype)
         entry_fn = functools.partial(self._entry, x=x, spk_dim=int(spk_dim), fill=self._precapture_fill)
         before = self._stats["captures"]
