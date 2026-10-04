@@ -82,7 +82,10 @@ class Attention(nn.Module):
         B, N, C = x.shape
 
         if self.fused_attn:
-            from flash_attn import flash_attn_varlen_func, flash_attn_varlen_qkvpacked_func
+            from vllm_omni.diffusion.attention.backends.utils.fa import flash_attn_varlen_func
+
+            if flash_attn_varlen_func is None:
+                raise ImportError("Kimi acoustic attention requires a FlashAttention varlen kernel")
 
             if nopadding:
                 qkv = self.qkv(x)
@@ -126,8 +129,9 @@ class Attention(nn.Module):
                     cu_seqlens_k=cu_seqlens_k,
                     max_seqlen_q=max_seqlen,
                     max_seqlen_k=max_seqlen_k,
-                    dropout_p=self.attn_drop.p if self.training else 0.0,
                 )
+                # FA3 kernels may return (out, lse).
+                x = x[0] if isinstance(x, tuple) else x
             else:
                 if incremental_state is not None:
                     raise NotImplementedError(
@@ -148,12 +152,17 @@ class Attention(nn.Module):
 
                 qkv = torch.cat(qkv_collect, dim=0)
 
-                x = flash_attn_varlen_qkvpacked_func(
-                    qkv=qkv,
-                    cu_seqlens=cu_seqlens,
-                    max_seqlen=max_seqlen,
-                    dropout_p=self.attn_drop.p if self.training else 0.0,
+                q, k, v = qkv.unbind(1)
+                x = flash_attn_varlen_func(
+                    q=q,
+                    k=k,
+                    v=v,
+                    cu_seqlens_q=cu_seqlens,
+                    cu_seqlens_k=cu_seqlens,
+                    max_seqlen_q=max_seqlen,
+                    max_seqlen_k=max_seqlen,
                 )
+                x = x[0] if isinstance(x, tuple) else x
 
                 # unpack and pad 0
                 x_collect = []
@@ -168,6 +177,21 @@ class Attention(nn.Module):
         x = self.proj(x)
         x = self.proj_drop(x)
         return x
+
+
+class Mlp(nn.Module):
+    """fc1 -> activation -> fc2, parameter-compatible with timm's Mlp."""
+
+    def __init__(self, in_features, hidden_features, act_layer=nn.GELU, drop=0.0):
+        super().__init__()
+        self.fc1 = nn.Linear(in_features, hidden_features)
+        self.act = act_layer()
+        self.drop1 = nn.Dropout(drop)
+        self.fc2 = nn.Linear(hidden_features, in_features)
+        self.drop2 = nn.Dropout(drop)
+
+    def forward(self, x):
+        return self.drop2(self.fc2(self.drop1(self.act(self.fc1(x)))))
 
 
 def modulate(x, shift, scale):
@@ -215,8 +239,6 @@ class DiTBlock(nn.Module):
         self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
 
         if ffn_type == "vanilla_mlp":
-            from timm.models.vision_transformer import Mlp
-
             mlp_hidden_dim = int(hidden_size * mlp_ratio)
             self.mlp = Mlp(
                 in_features=hidden_size,

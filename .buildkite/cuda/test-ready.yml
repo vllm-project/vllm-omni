@@ -219,7 +219,6 @@ steps:
         timeout_in_minutes: 40
         source_file_dependencies: tts_kimi_audio_function
         commands:
-          - pip install --no-build-isolation -e '.[kimi-audio]'
           - |
             timeout 30m bash -c "
               pytest -s -v tests/e2e/online_serving/test_kimi_audio.py -m 'core_model' --run-level 'core_model'
