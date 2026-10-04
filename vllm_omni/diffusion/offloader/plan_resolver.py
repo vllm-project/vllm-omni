@@ -226,6 +226,8 @@ def _resolve_dit_stacks(
 
     distributed = config.strategy is OffloadStrategy.DISTRIBUTED_LAYER_WISE
     resident_head = 0
+    if not distributed and declaration is not None:
+        resident_head = min(declaration.layerwise_resident_layers.get(path, 0), max(0, len(blocks) - 2))
     if (
         distributed
         and config.dlo_resident_layers

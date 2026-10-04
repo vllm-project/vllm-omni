@@ -266,6 +266,23 @@ class TestResolvedTopology:
 
 
 class TestResidentLayers:
+    @pytest.mark.parametrize("requested,expected", [(0, 0), (1, 1), (2, 2), (9, 2)])
+    def test_ordinary_residency_preserves_a_streaming_ring(self, requested, expected):
+        pipeline = _StagedComponentPipeline()
+        pipeline._offload_plan = OffloadPlan(layerwise_resident_layers={"transformer": requested})
+        stack = _stack_of(resolve_offload_plan(pipeline, _config({"dit"})).dits[0])
+        assert stack.resident_head == expected
+        assert list(stack.streaming) == list(pipeline.transformer.blocks)[expected:]
+
+    def test_ordinary_residency_does_not_change_distributed_selection(self):
+        pipeline = _StagedComponentPipeline()
+        pipeline._offload_plan = OffloadPlan(
+            layerwise_resident_layers={"transformer": 2},
+            resident_dit_paths=frozenset({"transformer"}),
+        )
+        stack = _stack_of(resolve_offload_plan(pipeline, self._dlo_config(1, {"dit"})).dits[0])
+        assert stack.resident_head == 1
+
     def _dlo_config(self, resident_layers: int, components: set[str] | None = None) -> OffloadConfig:
         return _config(
             components,

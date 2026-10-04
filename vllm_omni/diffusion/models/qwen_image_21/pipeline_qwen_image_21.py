@@ -46,6 +46,7 @@ from vllm_omni.diffusion.models.qwen_image_21.qwen_image_21_transformer import (
     QwenImage21Transformer2DModel,
 )
 from vllm_omni.diffusion.models.utils import create_transformers_model
+from vllm_omni.diffusion.offloader.offload_plan import OffloadPlan
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.utils.prompt_utils import (
@@ -295,6 +296,7 @@ class QwenImage21Pipeline(
     _dit_modules: ClassVar[list[str]] = ["transformer"]
     _encoder_modules: ClassVar[list[str]] = ["text_encoder"]
     _vae_modules: ClassVar[list[str]] = ["vae"]
+    _offload_plan = OffloadPlan(layerwise_resident_layers={"transformer": 6})
 
     def __init__(
         self,
