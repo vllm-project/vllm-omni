@@ -51,22 +51,19 @@ def _resolve_model_dir(model_ref: str, revision: str | None = None) -> str:
 
 
 def _tf32_mode(extra: Mapping[str, Any]) -> str:
-    """Stage-2 TF32 scope: ``"off"`` (default), ``"flow"`` (CFM DiT only), or ``"all"``."""
-    if bool(extra.get("token2wav_allow_tf32", False)):
-        return "all"
+    """Stage-2 TF32x3 Tensor Core scope: ``"off"`` (default) or ``"tf32x3"`` (CFM DiT only)."""
     raw = os.environ.get("MINICPMO_CODE2WAV_TF32")
     value = raw if raw not in (None, "") else extra.get("code2wav_allow_tf32", False)
     if isinstance(value, str):
         return {
-            "flow": "flow",
-            "tf32x3": "flow",
-            "3xtf32": "flow",
-            "1": "all",
-            "true": "all",
-            "all": "all",
-            "yes": "all",
+            "tf32x3": "tf32x3",
+            "3xtf32": "tf32x3",
+            "flow": "tf32x3",
+            "1": "tf32x3",
+            "true": "tf32x3",
+            "yes": "tf32x3",
         }.get(value.strip().lower(), "off")
-    return "all" if value else "off"
+    return "tf32x3" if value else "off"
 
 
 def _batch_error(reason: str, **details: Any) -> RuntimeError:
@@ -842,22 +839,14 @@ class MiniCPMO45Code2Wav(nn.Module):
         runtime_additional_information: list[dict[str, Any]] | None = None,
         **kwargs: Any,
     ) -> OmniOutput:
-        # This stage owns the vocoder process. Restore its previous matmul
-        # policy after eager execution/capture; cuDNN's policy is independent.
-        previous_tf32 = torch.backends.cuda.matmul.allow_tf32
-        try:
-            if self._extra_config().get("token2wav_allow_tf32", False):
-                torch.backends.cuda.matmul.allow_tf32 = True
-            return self._forward_impl(
-                input_ids,
-                positions,
-                intermediate_tensors,
-                inputs_embeds,
-                runtime_additional_information,
-                **kwargs,
-            )
-        finally:
-            torch.backends.cuda.matmul.allow_tf32 = previous_tf32
+        return self._forward_impl(
+            input_ids,
+            positions,
+            intermediate_tensors,
+            inputs_embeds,
+            runtime_additional_information,
+            **kwargs,
+        )
 
     @torch.inference_mode()
     def _forward_impl(
@@ -1195,14 +1184,11 @@ class MiniCPMO45Code2Wav(nn.Module):
         if not token2wav_path.is_dir():
             raise FileNotFoundError(f"MiniCPM-o Code2Wav assets not found: {token2wav_path}")
         # Token2wav runs in fp32, so without TF32 every flow-DiT GEMM runs on
-        # SIMT cores (the top Stage-2 kernel on A800); cuDNN convolutions
-        # already default to TF32. Stage 2 owns its process, so the global flag
-        # stays within it; it is set before any CUDA graph is captured.
+        # SIMT cores. TF32x3 uses SM80+ Tensor Cores scoped strictly to CFM DiT,
+        # leaving HiFT vocoder in high-fidelity FP32.
         tf32_mode = _tf32_mode(extra) if current_omni_platform.is_cuda() else "off"
-        if tf32_mode == "all":
-            torch.backends.cuda.matmul.allow_tf32 = True
         if tf32_mode != "off":
-            logger.info("MiniCPM-o Code2Wav: TF32 matmul enabled (%s)", tf32_mode)
+            logger.info("MiniCPM-o Code2Wav: TF32x3 Tensor Core enabled (CFM DiT only)")
         use_float16 = bool(extra.get("token2wav_float16", False))
         previous_dtype = torch.get_default_dtype()
         try:
@@ -1250,7 +1236,7 @@ class MiniCPMO45Code2Wav(nn.Module):
             cfm_graph_config=self._cfm_graph_config,
             bfloat16_attention_cache=bool(extra.get("code2wav_bfloat16_attention_cache", False)),
             setup_cache_size=self._setup_cache_size,
-            cfm_tf32=tf32_mode == "flow",
+            cfm_tf32=tf32_mode != "off",
             encoder_graph_config=self._encoder_graph_config,
         )
         # Captured by the first forward (the warmup run): under vLLM's weight load a graph held GiBs.
