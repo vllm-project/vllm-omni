@@ -30,6 +30,7 @@ from vllm_omni.diffusion.distributed.parallel_state import get_sequence_parallel
 from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelInput, SequenceParallelOutput
 from vllm_omni.diffusion.distributed.sp_sharding import sp_shard_with_padding
 from vllm_omni.diffusion.forward_context import get_forward_context
+from vllm_omni.diffusion.layers.gated_residual import gated_residual
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 from vllm_omni.diffusion.models.flux.flux_transformer import FeedForward
 
@@ -180,10 +181,10 @@ class HunyuanVideo15IndividualTokenRefinerBlock(nn.Module):
         )
 
         gate_msa, gate_mlp = self.norm_out(temb)
-        hidden_states = hidden_states + attn_output * gate_msa
+        hidden_states = gated_residual(hidden_states, attn_output, gate_msa)
 
         ff_output = self.ff(self.norm2(hidden_states))
-        hidden_states = hidden_states + ff_output * gate_mlp
+        hidden_states = gated_residual(hidden_states, ff_output, gate_mlp)
 
         return hidden_states
 
@@ -567,8 +568,8 @@ class HunyuanVideo15TransformerBlock(nn.Module):
             hidden_states_mask=hidden_states_mask,
         )
 
-        hidden_states = hidden_states + attn_output * gate_msa.unsqueeze(1)
-        encoder_hidden_states = encoder_hidden_states + context_attn_output * c_gate_msa.unsqueeze(1)
+        hidden_states = gated_residual(hidden_states, attn_output, gate_msa.unsqueeze(1))
+        encoder_hidden_states = gated_residual(encoder_hidden_states, context_attn_output, c_gate_msa.unsqueeze(1))
 
         norm_hidden_states = self.norm2(hidden_states)
         norm_encoder_hidden_states = self.norm2_context(encoder_hidden_states)
@@ -579,8 +580,8 @@ class HunyuanVideo15TransformerBlock(nn.Module):
         ff_output = self.ff(norm_hidden_states)
         context_ff_output = self.ff_context(norm_encoder_hidden_states)
 
-        hidden_states = hidden_states + gate_mlp.unsqueeze(1) * ff_output
-        encoder_hidden_states = encoder_hidden_states + c_gate_mlp.unsqueeze(1) * context_ff_output
+        hidden_states = gated_residual(hidden_states, ff_output, gate_mlp.unsqueeze(1))
+        encoder_hidden_states = gated_residual(encoder_hidden_states, context_ff_output, c_gate_mlp.unsqueeze(1))
 
         return hidden_states, encoder_hidden_states
 
