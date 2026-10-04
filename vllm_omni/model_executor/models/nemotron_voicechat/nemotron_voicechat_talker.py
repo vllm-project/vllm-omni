@@ -1027,7 +1027,10 @@ class NemotronVoiceChatTalkerForConditionalGeneration(nn.Module):
         tts_data.setdefault("frame_length", float(getattr(self.config, "frame_length", 0.08)))
         # DuplexEARTTS consumes the whole speech_generation section layout
         # ({"data": ..., "model": ...}), matching NeMo's constructor call.
-        tts = DuplexEARTTS({"data": tts_data, "model": tts_model_cfg})
+        tts = DuplexEARTTS(
+            {"data": tts_data, "model": tts_model_cfg},
+            initialize_audio_prompt_projection=False,
+        )
 
         prefix = "tts_model."
         backbone_prefix = "tts_model.tts_model.backbone."
