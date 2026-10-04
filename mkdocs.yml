@@ -55,6 +55,7 @@ theme:
   custom_dir: docs/mkdocs/overrides
 
 hooks:
+  - docs/mkdocs/hooks/local_inventories.py
   - docs/mkdocs/hooks/search_index.py
   - docs/mkdocs/hooks/generate_api_readme.py
   - docs/mkdocs/hooks/url_schemes.py
@@ -138,7 +139,9 @@ plugins:
             signature_crossrefs: true
             show_source: false
           inventories:
-          - https://docs.python.org/3/objects.inv
+          # Keep Python cross-references available during docs.python.org outages.
+          - url: docs/mkdocs/inventories/python-3.14.inv
+            base_url: https://docs.python.org/3.14/
           # Read the Docs rate-limits these external inventories in strict builds.
           # - https://typing-extensions.readthedocs.io/en/latest/objects.inv
           # Disabled because Read the Docs strict builds fail if this
