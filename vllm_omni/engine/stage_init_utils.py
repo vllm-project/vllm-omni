@@ -1837,6 +1837,9 @@ def acquire_device_locks(
             lock_acquired = False
 
             while not lock_acquired:
+                # Reset per attempt so the OSError handler never closes an fd
+                # already handed off to lock_fds for a previous device.
+                lock_fd = None
                 try:
                     lock_fd, lock_writable = open_device_lock_file(lock_file)
                     try:
@@ -1844,11 +1847,13 @@ def acquire_device_locks(
                         record_lock_holder_pid(lock_fd, lock_writable)
                         lock_acquired = True
                         lock_fds.append(lock_fd)
+                        lock_fd = None
                         if locked_devices is not None:
                             locked_devices.add(device_id)
                         logger.debug("Acquired exclusive lock for device %s", device_id)
                     except BlockingIOError:
                         os.close(lock_fd)
+                        lock_fd = None
                         # NOTE: no stale-lock cleanup here. ``flock`` is released
                         # by the kernel when the holder exits (SIGKILL included),
                         # so a dead holder never keeps this lock. Unlinking the
@@ -1875,10 +1880,11 @@ def acquire_device_locks(
                         device_id,
                         e,
                     )
-                    try:
-                        os.close(lock_fd)
-                    except (OSError, NameError):
-                        pass
+                    if lock_fd is not None:
+                        try:
+                            os.close(lock_fd)
+                        except OSError:
+                            pass
                     break
 
     except Exception as e:
