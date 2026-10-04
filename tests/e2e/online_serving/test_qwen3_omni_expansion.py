@@ -33,6 +33,32 @@ LARGE_IMAGE_WIDTH = 1920
 LARGE_IMAGE_HEIGHT = 1080
 LONG_AUDIO_DURATION_SEC = 120
 
+# The CI overlay deliberately keeps short default budgets for the broad
+# function suite. The long-form case needs a larger downstream budget so the
+# talker and code2wav stages can render the complete 300-word thinker output.
+# Keep this override request-local rather than increasing every test's cost.
+LONG_OUTPUT_SAMPLING_PARAMS = [
+    {
+        "temperature": 0.0,
+        "max_tokens": 512,
+        "ignore_eos": False,
+    },
+    {
+        "temperature": 0.9,
+        "top_k": 50,
+        "max_tokens": 3072,
+        "repetition_penalty": 1.05,
+        "seed": int(os.environ.get("VLLM_CI_QWEN3_OMNI_SEED", "42")),
+    },
+    {
+        "temperature": 0.0,
+        "top_p": 1.0,
+        "top_k": -1,
+        "max_tokens": 6144,
+        "repetition_penalty": 1.1,
+    },
+]
+
 
 def get_batch_token_config(default_path):
     """Override stage 1's max_num_batched_tokens to exercise small-batch paths.
@@ -63,7 +89,10 @@ def get_batch_token_config(default_path):
 # The overlay explicitly sets ``async_chunk: False``, so ``default`` tests the
 # sync path and ``async_chunk`` tests the streaming path with a longer thinker
 # output — two distinct scenarios, kept as separate parametrizations.
-default_path = get_deploy_config_path("qwen3_omni_moe.yaml")
+# Use the CI overlay rather than the production config directly. The overlay
+# preserves production sampling parameters and pins only the test seed so
+# stochastic talker output is repeatable across CUDA and ROCm runs.
+default_path = get_deploy_config_path("ci/qwen3_omni_moe.yaml")
 
 test_params = [
     pytest.param(
@@ -477,7 +506,12 @@ def test_text_to_audio_long_output_001(omni_server, online_client) -> None:
         content_text="Tell a 300-word story.",
     )
 
-    request_config = {"model": omni_server.model, "messages": messages, "stream": True}
+    request_config = {
+        "model": omni_server.model,
+        "messages": messages,
+        "stream": True,
+        "sampling_params_list": LONG_OUTPUT_SAMPLING_PARAMS,
+    }
     responses = online_client.send_omni_request(request_config, request_num=get_max_batch_size())
     text = responses[0].text_content if responses else ""
     word_count = len(text.split())

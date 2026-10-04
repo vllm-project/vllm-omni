@@ -293,11 +293,27 @@ def _maybe_save_output(output_dir: Path | None, config: QualityTestConfig, label
 
 def _build_omni_kwargs(config: QualityTestConfig, model: str) -> dict:
     kwargs = {"model": model, "enforce_eager": True}
+    # Large offloaded checkpoints can spend the default startup budget loading
+    # weights before the warmup request. CI may supply bounded startup limits
+    # for both quality arms while ordinary runs retain Omni's defaults.
+    for name in ("init_timeout", "stage_init_timeout"):
+        if value := os.environ.get(f"VLLM_OMNI_TEST_{name.upper()}"):
+            kwargs[name] = int(value)
     if config.enable_cpu_offload:
         kwargs["enable_cpu_offload"] = True
     if config.diffusion_attention_backend is not None:
         kwargs["diffusion_attention_backend"] = config.diffusion_attention_backend
     return kwargs
+
+
+def _resolve_quality_threshold(config: QualityTestConfig) -> tuple[str, float]:
+    from tests.e2e.accuracy.helpers import resolve_device_threshold
+
+    # CUDA marker scopes also run on ROCm. Until a ROCm-specific quality
+    # budget is calibrated, enforce the strictest existing device budget.
+    if torch.version.hip and isinstance(config.max_lpips, dict):
+        return "rocm", min(config.max_lpips.values())
+    return resolve_device_threshold(config.max_lpips, label=f"{config.id} max_lpips")
 
 
 def _generate_image(omni, config: QualityTestConfig):
@@ -455,6 +471,45 @@ def _free_gpu_memory():
 
 @pytest.mark.core_model
 @pytest.mark.cpu
+@pytest.mark.parametrize("timeouts", [None, {"init_timeout": 1800, "stage_init_timeout": 1200}])
+def test_quality_startup_budgets_apply_to_both_arms(monkeypatch, timeouts):
+    for name in ("init_timeout", "stage_init_timeout"):
+        variable = f"VLLM_OMNI_TEST_{name.upper()}"
+        monkeypatch.delenv(variable, raising=False)
+        if timeouts is not None:
+            monkeypatch.setenv(variable, str(timeouts[name]))
+
+    config = next(config for config in QUALITY_CONFIGS if config.id == "fp8_flux2_dev_text_encoder")
+    for model in (config.baseline_ref(), config.quantized_ref()):
+        kwargs = _build_omni_kwargs(config, model)
+        assert kwargs == {"model": model, "enforce_eager": True, "enable_cpu_offload": True, **(timeouts or {})}
+    assert config.max_lpips == {"H100": 0.15, "B200": 0.17}
+    assert config.quantization_ref() == {"text_encoder": "fp8", "transformer": None, "vae": None}
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+@pytest.mark.parametrize("hip", [None, "7.2"])
+def test_quality_threshold_preserves_cuda_profiles_and_uses_strictest_rocm_budget(monkeypatch, hip):
+    from tests.e2e.accuracy import helpers
+
+    resolve = helpers.resolve_device_threshold
+    monkeypatch.setattr(torch.version, "hip", hip)
+    config = next(config for config in QUALITY_CONFIGS if config.id == "fp8_flux2_dev_text_encoder")
+    for device, expected in (("NVIDIA H100", ("H100", 0.15)), ("NVIDIA B200", ("B200", 0.17))):
+        monkeypatch.setattr(
+            helpers,
+            "resolve_device_threshold",
+            lambda thresholds, *, label: resolve(thresholds, device_name=device, label=label),
+        )
+        assert _resolve_quality_threshold(config) == (("rocm", 0.15) if hip else expected)
+    scalar = next(config for config in QUALITY_CONFIGS if config.id == "fp8_flux")
+    assert _resolve_quality_threshold(scalar) == ("default", 0.20)
+    assert config.max_lpips == {"H100": 0.15, "B200": 0.17}
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
 def test_benchmark_generate_image_unwraps_nested_omni_request_output(monkeypatch):
     from benchmarks.diffusion.quantization_quality import _generate_image as benchmark_generate_image
     from vllm_omni.outputs import OmniRequestOutput
@@ -576,7 +631,6 @@ def _quality_param(c: QualityTestConfig):
 )
 def test_quantization_quality(config: QualityTestConfig):
     """Validate that quantized output stays within LPIPS threshold of BF16."""
-    from tests.e2e.accuracy.helpers import resolve_device_threshold
     from vllm_omni.entrypoints.omni import Omni
 
     generate_fn = _generate_video if config.task == "t2v" else _generate_image
@@ -612,7 +666,7 @@ def test_quantization_quality(config: QualityTestConfig):
     # --- Similarity metrics ---
     lpips_score = _compute_lpips(baseline_out, quant_out, config.task)
     psnr_score, mae_score = _compute_psnr_and_mae(baseline_out, quant_out, config.task)
-    gpu_key, max_lpips = resolve_device_threshold(config.max_lpips, label=f"{config.id} max_lpips")
+    gpu_key, max_lpips = _resolve_quality_threshold(config)
     assert lpips_score <= max_lpips, (
         f"LPIPS {lpips_score:.4f} exceeds threshold {max_lpips} ({gpu_key}) "
         f"for {config.quantization_ref() or 'pre-quantized checkpoint'} on {config.quantized_ref()}"
