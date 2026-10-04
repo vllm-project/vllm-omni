@@ -710,6 +710,25 @@ def test_multistage_images_async_omni_construction(async_omni_test_client):
     assert captured[1].guidance_scale == 6.5
 
 
+def test_multistage_generate_forwards_layers(async_omni_test_client):
+    """Regression: the multi-stage /v1/images/generations branch forwards ``layers``.
+
+    The single-stage generate branch and both /v1/images/edits branches forward
+    it; the multi-stage generate branch builds ``extra_body`` by hand and
+    omitted it, so the diffusion stage kept its default layer count and a
+    request asking for a different layer count was silently ignored.
+    """
+    response = async_omni_test_client.post(
+        "/v1/images/generations",
+        json={"prompt": "a cat", "size": "128x256", "layers": 4},
+    )
+    assert response.status_code == 200
+
+    captured = async_omni_test_client.app.state.engine_client.captured_sampling_params_list
+    assert captured is not None
+    assert captured[1].layers == 4
+
+
 def test_generate_images_async_omni_glm_image_sets_stage0_max_tokens():
     """GLM-Image multistage: stage-0 gets target_h/w from requested size.
 
