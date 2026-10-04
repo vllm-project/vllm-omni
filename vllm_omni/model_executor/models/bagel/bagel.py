@@ -756,7 +756,7 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
             num_vae, num_vit, _, _ = info
             num_img2img = num_vae + 1 + num_vit
 
-            if seq_len >= num_img2img:
+            if seq_len >= num_img2img and self._has_img2img_placeholder(input_ids):
                 self._pending_img2img_info = [info]
                 positions = self._adjust_positions_for_img2img(positions, input_ids)
                 use_mot = True
@@ -767,6 +767,9 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
         if use_mot:
             return self._mot_forward(input_ids, positions, intermediate_tensors, inputs_embeds, **kwargs)
         return super().forward(input_ids, positions, intermediate_tensors, inputs_embeds, **kwargs)
+
+    def _has_img2img_placeholder(self, input_ids: torch.Tensor | None) -> bool:
+        return input_ids is None or bool((input_ids == self._img2img_token_id).any())
 
     def _adjust_positions_for_img2img(
         self,
@@ -825,13 +828,11 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
                 num_vae, num_vit, img_H, img_W = cur_info
                 num_img2img = num_vae + 1 + num_vit  # +1 separator
 
-                if req_len >= num_img2img:
-                    pre_text_len = 0
-                    if input_ids is not None:
-                        req_ids_slice = input_ids[start:end]
-                        indices = (req_ids_slice == self._img2img_token_id).nonzero(as_tuple=True)[0]
-                        if indices.numel() > 0:
-                            pre_text_len = int(indices[0].item())
+                indices = None
+                if input_ids is not None:
+                    indices = (input_ids[start:end] == self._img2img_token_id).nonzero(as_tuple=True)[0]
+                if req_len >= num_img2img and (indices is None or indices.numel() > 0):
+                    pre_text_len = int(indices[0].item()) if indices is not None else 0
 
                     M = pre_text_len
                     img_start = start + M
