@@ -312,6 +312,8 @@ class HeliosPipeline(
         frame_num = int(extra.get("frame_num", 132))
         height = (int(state.sampling.height or extra.get("height", 384)) // 16) * 16
         width = (int(state.sampling.width or extra.get("width", 640)) // 16) * 16
+        if extra.get("is_enable_stage2", False):
+            self._validate_stage2_resolution(height, width, extra.get("pyramid_num_stages", 3))
         num_frames = max(int(state.sampling.num_frames or frame_num), 1)
         num_steps = int(state.sampling.num_inference_steps or extra.get("num_inference_steps", 50))
         output_type = extra.get("output_type", "np")
@@ -1026,6 +1028,8 @@ class HeliosPipeline(
 
         height = (height // 16) * 16
         width = (width // 16) * 16
+        if is_enable_stage2:
+            self._validate_stage2_resolution(height, width, pyramid_num_stages)
         num_frames = max(num_frames, 1)
 
         device = self.device
@@ -1444,6 +1448,25 @@ class HeliosPipeline(
                 pbar.update()
 
         return latents
+
+    def _validate_stage2_resolution(self, height: int, width: int, pyramid_num_stages: int) -> None:
+        """Reject pyramid grids that truncate patches or lose the final latent extent."""
+        if isinstance(pyramid_num_stages, bool) or not isinstance(pyramid_num_stages, int) or pyramid_num_stages < 1:
+            raise ValueError("Helios Stage2 pyramid_num_stages must be a positive integer")
+
+        _, patch_height, patch_width = self.transformer.config.patch_size
+        spatial_scale = self.vae_scale_factor_spatial
+        # Each halving must be exact, and the smallest grid must contain whole patches.
+        pyramid_scale = 2 ** (pyramid_num_stages - 1)
+        height_multiple = spatial_scale * pyramid_scale * patch_height
+        width_multiple = spatial_scale * pyramid_scale * patch_width
+        if height <= 0 or width <= 0 or height % height_multiple or width % width_multiple:
+            raise ValueError(
+                f"Helios Stage2 height and width must be positive multiples of {height_multiple} and "
+                f"{width_multiple}, respectively, for pyramid_num_stages={pyramid_num_stages}, "
+                f"vae_scale_factor_spatial={spatial_scale}, patch_size={self.transformer.config.patch_size}; "
+                f"got {height}x{width} after 16-pixel alignment"
+            )
 
     def _stage2_sample(
         self,
