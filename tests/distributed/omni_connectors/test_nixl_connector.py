@@ -574,8 +574,8 @@ def test_unknown_key_is_queried_once(producer, consumer, monkeypatch, force_time
 
     assert consumer._resolve_metadata("never-published", None) is None
     assert send_count == 1
-    if force_timeout:
-        assert socket.closed
+    # A timed-out receive retires the socket; a served reply must leave it reusable.
+    assert socket.closed is force_timeout
 
 
 @pytest.mark.usefixtures("reliable_claim_queries")
