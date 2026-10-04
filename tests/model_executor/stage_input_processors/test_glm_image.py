@@ -1,20 +1,32 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Unit tests for GLM-Image stage input processor."""
 
+import importlib
+import inspect
 from types import SimpleNamespace
 
 import pytest
 import torch
 
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.model_executor.stage_input_processors.glm_image import (
+    AR_GRID_FACTOR,
+    DEFAULT_TARGET_SIZE,
     _first_source_image,
     _has_source_image,
     _parse_generated_tokens,
+    _resolve_target_size,
+    _snap_to_ar_grid,
     _upsample_token_ids,
     ar2diffusion,
     compute_max_tokens,
+    prepare_ar_prompt,
 )
+
+# The diffusion stage derives its expected prior-token sequence length by
+# dividing each edge by `vae_scale_factor * patch_size`.
+DIT_PATCH_PIXELS = 16
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -383,3 +395,297 @@ class TestAr2Diffusion:
         assert result["prompt"] == "first"
         assert result["height"] == 1024
         assert result["width"] == 1024
+
+    def test_raw_string_prompt_keeps_its_text(self):
+        """Offline ``Omni.generate("<text>")`` hands the bridge a bare ``str``.
+
+        The orchestrator stores the *untransformed* prompt, so for an offline
+        request ``prompt`` is the string itself. Dropping it would condition the
+        diffusion stage on an empty caption.
+        """
+        token_ids = list(range(256)) + list(range(1024)) + [16385]
+        source_outputs = [_source_output(token_ids)]
+
+        result = ar2diffusion(source_outputs, prompt="a red apple on a white table")
+        assert result["prompt"] == "a red apple on a white table"
+
+    def test_sampling_params_supply_the_size(self):
+        """The diffusion stage's params size the token layout offline.
+
+        ``prompt`` carries no size at all here, so without the fallback this
+        would parse a 1024x1024 layout out of 512x512 worth of tokens and fail.
+        """
+        # 512x512 t2i: small(16x16=256) + large(16x16=256) + EOS
+        token_ids = list(range(256)) + list(range(256)) + [16385]
+        source_outputs = [_source_output(token_ids)]
+
+        result = ar2diffusion(
+            source_outputs,
+            prompt="a cat",
+            sampling_params=OmniDiffusionSamplingParams(height=512, width=512),
+        )
+        assert result["height"] == 512
+        assert result["width"] == 512
+        # 256 large tokens upsampled 2x in each dimension.
+        assert len(result["extra"]["prior_token_ids"]) == 1024
+
+    def test_prompt_size_wins_over_sampling_params(self):
+        """An explicit request size is never overridden by the stage default."""
+        token_ids = list(range(256)) + list(range(1024)) + [16385]
+        source_outputs = [_source_output(token_ids)]
+
+        result = ar2diffusion(
+            source_outputs,
+            prompt={"prompt": "a cat", "mm_processor_kwargs": {"target_h": 1024, "target_w": 1024}},
+            sampling_params=OmniDiffusionSamplingParams(height=512, width=512),
+        )
+        assert result["height"] == 1024
+        assert result["width"] == 1024
+
+    def test_sampling_params_parameter_name_is_load_bearing(self):
+        """The orchestrator discovers this kwarg by name via ``inspect``.
+
+        ``orchestrator._forward_to_next_stage_unguarded`` only passes the stage
+        params when the probe finds a parameter called exactly
+        ``sampling_params``, so a rename would silently disable the fallback.
+        """
+        assert "sampling_params" in inspect.signature(ar2diffusion).parameters
+
+
+# =============================================================================
+# Tests for prepare_ar_prompt (stage-0 prompt transform)
+# =============================================================================
+
+
+class TestPrepareArPrompt:
+    def test_string_prompt_gets_target_size_from_sampling_params(self):
+        """A raw offline prompt is what used to miss the AR grid scaffold."""
+        result = prepare_ar_prompt(
+            "a red apple on a white table",
+            [SimpleNamespace(), OmniDiffusionSamplingParams(height=512, width=768)],
+        )
+        assert result["prompt"] == "a red apple on a white table"
+        assert result["mm_processor_kwargs"] == {"target_h": 512, "target_w": 768}
+
+    def test_serving_layer_kwargs_take_precedence(self):
+        """The served path already resolved the size; leave it alone."""
+        result = prepare_ar_prompt(
+            {"prompt": "a cat", "mm_processor_kwargs": {"target_h": 1024, "target_w": 1024}},
+            [SimpleNamespace(), OmniDiffusionSamplingParams(height=512, width=512)],
+        )
+        assert result["mm_processor_kwargs"]["target_h"] == 1024
+        assert result["mm_processor_kwargs"]["target_w"] == 1024
+
+    def test_top_level_height_width_used_before_sampling_params(self):
+        result = prepare_ar_prompt(
+            {"prompt": "a cat", "height": 640, "width": 640},
+            [SimpleNamespace(), OmniDiffusionSamplingParams(height=512, width=512)],
+        )
+        assert result["mm_processor_kwargs"] == {"target_h": 640, "target_w": 640}
+
+    def test_unset_sizes_fall_back_to_default(self):
+        result = prepare_ar_prompt("a cat", [SimpleNamespace(), OmniDiffusionSamplingParams()])
+        assert result["mm_processor_kwargs"] == {
+            "target_h": DEFAULT_TARGET_SIZE,
+            "target_w": DEFAULT_TARGET_SIZE,
+        }
+
+    def test_missing_diffusion_params_fall_back_to_default(self):
+        """No single diffusion stage to read a size from — keep the old default."""
+        result = prepare_ar_prompt("a cat", [SimpleNamespace()])
+        assert result["mm_processor_kwargs"] == {
+            "target_h": DEFAULT_TARGET_SIZE,
+            "target_w": DEFAULT_TARGET_SIZE,
+        }
+
+    def test_other_prompt_fields_are_preserved(self):
+        from PIL import Image
+
+        img = Image.new("RGB", (64, 64))
+        result = prepare_ar_prompt(
+            {"prompt": "edit this", "multi_modal_data": {"image": img}, "negative_prompt": "blurry"},
+            [SimpleNamespace(), OmniDiffusionSamplingParams(height=512, width=512)],
+        )
+        assert result["multi_modal_data"] == {"image": img}
+        assert result["negative_prompt"] == "blurry"
+        assert result["mm_processor_kwargs"] == {"target_h": 512, "target_w": 512}
+
+    def test_does_not_mutate_the_caller_prompt(self):
+        """Downstream stages receive the original prompt; it must stay pristine."""
+        prompt = {"prompt": "a cat"}
+        prepare_ar_prompt(prompt, [SimpleNamespace(), OmniDiffusionSamplingParams(height=512, width=512)])
+        assert prompt == {"prompt": "a cat"}
+
+    def test_embeds_prompt_passes_through_untouched(self):
+        """This caller already decided the AR stage's input."""
+        prompt = {"prompt_embeds": "embeds"}
+        assert prepare_ar_prompt(prompt, [OmniDiffusionSamplingParams(height=512, width=512)]) is prompt
+
+    def test_token_prompt_is_stamped(self):
+        """Safe to stamp: the scaffold append is guarded by a suffix check, so a
+        caller that built its own scaffold keeps it (``glm_image_ar.py`` ``apply``).
+        """
+        result = prepare_ar_prompt(
+            {"prompt_token_ids": [1, 2, 3]},
+            [SimpleNamespace(), OmniDiffusionSamplingParams(height=512, width=512)],
+        )
+        assert result["mm_processor_kwargs"] == {"target_h": 512, "target_w": 512}
+
+    def test_non_prompt_object_passes_through_unchanged(self):
+        sentinel = SimpleNamespace(already_built=True)
+        assert prepare_ar_prompt(sentinel, [OmniDiffusionSamplingParams()]) is sentinel
+
+    def test_list_prompt_passes_through_unchanged(self):
+        """A list of prompts is not this hook's to rewrite."""
+        prompt = ["a cat", "a dog"]
+        assert prepare_ar_prompt(prompt, [OmniDiffusionSamplingParams(height=512, width=512)]) is prompt
+
+    def test_transformed_prompt_clears_the_multimodal_routing_gate(self):
+        """This gate is the defect: only prompts with ``mm_processor_kwargs``
+        reach ``GlmImageMultiModalProcessor``, so before the transform a raw
+        offline prompt bypassed it and the AR stage saw plain text.
+        """
+        from vllm_omni.inputs.preprocess import OmniRenderer
+
+        raw = "a red apple on a white table"
+        assert OmniRenderer._routes_no_media_kwargs({"prompt": raw, "prompt_token_ids": [1, 2, 3]}) is False
+
+        transformed = prepare_ar_prompt(raw, [SimpleNamespace(), OmniDiffusionSamplingParams(height=512, width=512)])
+        # prompt_token_ids is filled in by upstream tokenization before the
+        # renderer sees the prompt.
+        transformed["prompt_token_ids"] = [1, 2, 3]
+        assert OmniRenderer._routes_no_media_kwargs(transformed) is True
+
+    def test_agrees_with_ar2diffusion_size_resolution(self):
+        """The two sites must resolve the same size, per dimension.
+
+        ``prepare_ar_prompt`` picks the grid the AR stage generates and
+        ``ar2diffusion`` re-derives it to slice the prior tokens back out. A
+        disagreement would slice at the wrong offsets without raising.
+        """
+        diffusion_params = OmniDiffusionSamplingParams(height=512, width=768)
+        prompts = [
+            "a cat",
+            {"prompt": "a cat"},
+            {"prompt": "a cat", "height": 640, "width": 896},
+            {"prompt": "a cat", "mm_processor_kwargs": {"target_h": 1024, "target_w": 1024}},
+        ]
+        for prompt in prompts:
+            transformed = prepare_ar_prompt(prompt, [SimpleNamespace(), diffusion_params])
+            ar_size = (
+                transformed["mm_processor_kwargs"]["target_h"],
+                transformed["mm_processor_kwargs"]["target_w"],
+            )
+            # ar2diffusion sees the *untransformed* prompt plus the stage params.
+            bridge_size = _resolve_target_size(
+                prompt if isinstance(prompt, dict) else {"prompt": prompt},
+                diffusion_params,
+            )
+            assert ar_size == bridge_size
+
+
+# =============================================================================
+# Tests for the stage-0 registration
+# =============================================================================
+
+
+class TestPipelineRegistration:
+    def test_stage0_registers_the_prompt_transform(self):
+        """Without this wiring the offline path never gets target_h/target_w."""
+        from vllm_omni.model_executor.models.glm_image.pipeline import GLM_IMAGE_PIPELINE
+
+        path = GLM_IMAGE_PIPELINE.stages[0].prompt_transform_func
+        assert path is not None
+        # Resolved the same way stage_init_utils resolves the hook.
+        module_path, fn_name = path.rsplit(".", 1)
+        assert getattr(importlib.import_module(module_path), fn_name) is prepare_ar_prompt
+
+
+# =============================================================================
+# Tests for AR-grid snapping (sizes that are not a multiple of 32)
+# =============================================================================
+
+
+class TestSnapToArGrid:
+    def test_multiple_of_the_factor_is_untouched(self):
+        assert _snap_to_ar_grid(1024) == 1024
+        assert _snap_to_ar_grid(1312) == 1312
+
+    def test_floors_onto_the_grid(self):
+        # 1328 is a multiple of 16 but not of 32 -- the case that used to reach
+        # the DiT as 1328 while the AR had already committed to 1312.
+        assert _snap_to_ar_grid(1328) == 1312
+
+    def test_never_returns_zero(self):
+        """A sub-cell request still has to name one whole cell."""
+        assert _snap_to_ar_grid(1) == AR_GRID_FACTOR
+        assert _snap_to_ar_grid(AR_GRID_FACTOR - 1) == AR_GRID_FACTOR
+
+    def test_resolve_target_size_snaps(self):
+        height, width = _resolve_target_size({}, OmniDiffusionSamplingParams(height=1328, width=1328))
+        assert (height, width) == (1312, 1312)
+
+    def test_resolve_target_size_snaps_serving_kwargs(self):
+        height, width = _resolve_target_size({"mm_processor_kwargs": {"target_h": 1328, "target_w": 720}})
+        assert (height, width) == (1312, 704)
+
+    def test_prepare_ar_prompt_stamps_the_snapped_size(self):
+        prompt = prepare_ar_prompt("a cat", [None, OmniDiffusionSamplingParams(height=1328, width=1328)])
+        assert prompt["mm_processor_kwargs"] == {"target_h": 1312, "target_w": 1312}
+
+
+class TestParseGeneratedTokensReportsEffectiveSize:
+    """The size handed onward must describe the grid, not the original request."""
+
+    @staticmethod
+    def _t2i_stream(token_h: int, token_w: int, *, eos: bool = True) -> list[int]:
+        small = [7] * (16 * 16)  # square target -> 16x16 preview
+        large = list(range(token_h * token_w))
+        return small + large + ([16385] if eos else [])
+
+    def test_non_multiple_of_factor_reports_floored_size(self):
+        # 1328 floors to a 41x41 grid == 1312px.
+        prior, h, w = _parse_generated_tokens(self._t2i_stream(41, 41), 1328, 1328)
+        assert (h, w) == (1312, 1312)
+        assert prior.shape[-1] == 82 * 82
+
+    def test_reported_size_satisfies_the_dit_length_check(self):
+        """This equality is exactly what pipeline_glm_image.py asserts."""
+        for requested in (1024, 1312, 1328, 1344):
+            token_edge = requested // AR_GRID_FACTOR
+            prior, h, w = _parse_generated_tokens(self._t2i_stream(token_edge, token_edge), requested, requested)
+            expected = (h // DIT_PATCH_PIXELS) * (w // DIT_PATCH_PIXELS)
+            assert prior.shape[-1] == expected, requested
+
+    def test_multiple_of_factor_is_unchanged(self):
+        _, h, w = _parse_generated_tokens(self._t2i_stream(32, 32), 1024, 1024)
+        assert (h, w) == (1024, 1024)
+
+    def test_unterminated_overrun_raises(self):
+        """max_tokens truncation must not be sliced into a plausible-looking image."""
+        runaway = self._t2i_stream(32, 32, eos=False) + [11] * 2000
+        with pytest.raises(ValueError, match="never emitted EOS"):
+            _parse_generated_tokens(runaway, 1024, 1024)
+
+    def test_terminated_overrun_raises(self):
+        """A stream that stopped cleanly but is too long described a different grid.
+
+        Observed at 768x768, where the AR emits 1120 tokens plus EOS although the
+        scaffolded 16x16 preview + 24x24 target only accounts for 832. The extra
+        tokens mean the offsets below do not delimit the image, so slicing them
+        would hand the diffusion stage a confidently wrong picture.
+        """
+        overrun = [7] * (16 * 16) + list(range(24 * 24)) + [11] * 288 + [16385]
+        with pytest.raises(ValueError, match="different grid"):
+            _parse_generated_tokens(overrun, 768, 768)
+
+    def test_exact_length_without_eos_is_still_accepted(self):
+        """Some configs strip the stop token; only an overrun is a failure."""
+        _, h, w = _parse_generated_tokens(self._t2i_stream(32, 32, eos=False), 1024, 1024)
+        assert (h, w) == (1024, 1024)
+
+    def test_i2i_t2i_style_layout_still_accepted_without_eos(self):
+        stream = [7] * (16 * 16) + list(range(32 * 32))
+        prior, h, w = _parse_generated_tokens(stream, 1024, 1024, is_i2i=True)
+        assert (h, w) == (1024, 1024)
+        assert prior.shape[-1] == 64 * 64
