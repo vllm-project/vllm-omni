@@ -360,7 +360,11 @@ class Qwen2_5OmniForConditionalGeneration(
                     inputs_embeds=inputs_embeds,
                 )
 
-            if sampling_metadata is not None:
+            # ``SamplingMetadata.prompt_token_ids`` is populated lazily since
+            # vLLM v1 (only when a sampler needs it, e.g. penalties) and is
+            # ``None`` otherwise (surfaced as a crash on vllm 0.24.0). Guard the
+            # attribute, not just ``sampling_metadata``.
+            if sampling_metadata is not None and sampling_metadata.prompt_token_ids is not None:
                 # the padding token id is set to text model's pad token id,
                 # which do not match with the talker model's word embedding size
                 sampling_metadata.prompt_token_ids[sampling_metadata.prompt_token_ids == 152064] = 8448
