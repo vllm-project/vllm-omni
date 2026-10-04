@@ -2120,11 +2120,13 @@ class OrchestratorBase:
         if (stage_id + 1) in parent_state.stage_submit_ts:
             return
 
+        src_replica_id = self.stage_pools[stage_id].get_bound_replica_id(parent_id)
         await self._forward_to_next_stage(
             parent_id,
             stage_id,
             deferred["engine_outputs"],
             parent_state,
+            src_replica_id=src_replica_id,
         )
 
     async def _handle_kv_ready_raw_outputs(
@@ -2161,7 +2163,10 @@ class OrchestratorBase:
             if self._cfg_tracker.has_companions(req_id) and not self._cfg_tracker.all_companions_done(req_id):
                 self._cfg_tracker.defer_parent(req_id, raw_output, stage_id)
             else:
-                await self._forward_to_next_stage(req_id, stage_id, raw_output, req_state)
+                src_replica_id = self.stage_pools[stage_id].get_bound_replica_id(req_id)
+                await self._forward_to_next_stage(
+                    req_id, stage_id, raw_output, req_state, src_replica_id=src_replica_id
+                )
 
     def _build_pd_decode_params(self, req_id: str, sp: Any) -> Any:
         """Build decode-side sampling params with KV transfer params for PD routing.
@@ -2243,6 +2248,43 @@ class OrchestratorBase:
                 exc_info=True,
             )
 
+    def _common_producer_topology_domain(
+        self,
+        producer_stage_ids: list[int],
+        request_id: str,
+        *,
+        replica_id_overrides: dict[int, int] | None = None,
+    ) -> str | None:
+        """Return a routing hint only when every producer shares one domain.
+
+        Multi-source consumers must not be placed near one arbitrarily chosen
+        producer at the expense of the others. Missing bindings or metadata,
+        and producers in different domains, therefore disable the topology
+        hint and let the configured balancer use its global fallback.
+        """
+        domains: set[str] = set()
+        overrides = replica_id_overrides or {}
+        for producer_stage_id in dict.fromkeys(producer_stage_ids):
+            producer_pool = self.stage_pools[producer_stage_id]
+            producer_replica_id = overrides.get(producer_stage_id)
+            if producer_replica_id is None:
+                get_bound_replica_id = getattr(producer_pool, "get_bound_replica_id", None)
+                if not callable(get_bound_replica_id):
+                    return None
+                producer_replica_id = get_bound_replica_id(request_id)
+            if producer_replica_id is None:
+                return None
+            get_topology_domain = getattr(producer_pool, "get_replica_topology_domain", None)
+            if not callable(get_topology_domain):
+                return None
+            domain = get_topology_domain(producer_replica_id)
+            if domain is None:
+                return None
+            domains.add(domain)
+            if len(domains) > 1:
+                return None
+        return next(iter(domains), None)
+
     async def _forward_to_next_stage(
         self,
         req_id: str,
@@ -2296,6 +2338,17 @@ class OrchestratorBase:
         already_submitted = self._next_stage_already_submitted(src_stage_id, req_state)
         requires_multimodal_data = getattr(next_client, "requires_multimodal_data", False)
         _t_submit_start = _time.perf_counter()
+
+        # For multi-source stages, use a locality hint only when every producer
+        # is already bound in the same domain. Otherwise the topology-aware
+        # balancer deliberately falls back to global least-queue-length.
+        producer_stage_ids = list(getattr(next_client, "engine_input_source", None) or [src_stage_id])
+        replica_id_overrides = {src_stage_id: src_replica_id} if src_replica_id is not None else None
+        topology_domain = self._common_producer_topology_domain(
+            producer_stage_ids,
+            req_id,
+            replica_id_overrides=replica_id_overrides,
+        )
 
         if next_pool.stage_type == "diffusion":
             # Gate: never dispatch with an incomplete CFG bundle. Checked
@@ -2430,7 +2483,11 @@ class OrchestratorBase:
                 submit_kwargs["payload_sender_info"] = payload_sender_info
             if already_submitted:
                 replica_id = await next_pool.submit_update(
-                    req_id, req_state, diffusion_prompt, submit_kwargs=submit_kwargs
+                    req_id,
+                    req_state,
+                    diffusion_prompt,
+                    submit_kwargs=submit_kwargs,
+                    topology_domain=topology_domain,
                 )
             else:
                 replica_id = await next_pool.submit_initial(
@@ -2439,6 +2496,7 @@ class OrchestratorBase:
                     diffusion_prompt,
                     submit_kwargs=submit_kwargs,
                     params_override=self._maybe_clone_diffusion_params_for_cfg(req_id, params),
+                    topology_domain=topology_domain,
                 )
             self._on_stage_submitted(
                 next_logical,
@@ -2490,9 +2548,13 @@ class OrchestratorBase:
                 )
                 request.external_req_id = request.request_id
                 if already_submitted:
-                    replica_id = await next_pool.submit_update(req_id, req_state, request)
+                    replica_id = await next_pool.submit_update(
+                        req_id, req_state, request, topology_domain=topology_domain
+                    )
                 else:
-                    replica_id = await next_pool.submit_initial(req_id, req_state, request, prompt_text=None)
+                    replica_id = await next_pool.submit_initial(
+                        req_id, req_state, request, prompt_text=None, topology_domain=topology_domain
+                    )
                 self._on_stage_submitted(
                     next_logical,
                     req_id,
@@ -2615,9 +2677,11 @@ class OrchestratorBase:
             )
 
             if already_submitted:
-                replica_id = await next_pool.submit_update(req_id, req_state, request)
+                replica_id = await next_pool.submit_update(req_id, req_state, request, topology_domain=topology_domain)
             else:
-                replica_id = await next_pool.submit_initial(req_id, req_state, request, prompt_text=None)
+                replica_id = await next_pool.submit_initial(
+                    req_id, req_state, request, prompt_text=None, topology_domain=topology_domain
+                )
             self._on_stage_submitted(
                 next_logical,
                 req_id,
@@ -2689,6 +2753,11 @@ class OrchestratorBase:
                 # execute before that conditioning payload arrives.
                 continue
 
+            producer_stage_ids = list(
+                getattr(next_pool.stage_client, "engine_input_source", None) or [next_stage_id - 1]
+            )
+            topology_domain = self._common_producer_topology_domain(producer_stage_ids, request_id)
+
             req_state.stage_submit_ts[next_stage_id] = _time.time()
             _t_submit_start = _time.perf_counter()
 
@@ -2705,6 +2774,7 @@ class OrchestratorBase:
                         req_state,
                         req_state.prompt,
                         submit_kwargs=submit_kwargs,
+                        topology_domain=topology_domain,
                     ),
                     req_id=request_id,
                     stage_id=next_stage_id,
@@ -2758,6 +2828,7 @@ class OrchestratorBase:
                         req_state,
                         request,
                         prompt_text=None,
+                        topology_domain=topology_domain,
                     ),
                     req_id=request_id,
                     stage_id=next_stage_id,
