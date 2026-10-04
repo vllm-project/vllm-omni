@@ -259,6 +259,7 @@ class _ParallelConfigEngineOverrides(TypedDict, total=False):
     allgather_degree: int
     ulysses_mode: str
     ulysses_a2a_permute: bool
+    enable_combine_qkv_a2a: bool
     cfg_parallel_size: int
     vae_patch_parallel_size: int
     vae_parallel_mode: str
@@ -711,6 +712,7 @@ class OmniStageDiffusionParallelConfig(OmniStageParallelConfig):
     mask_sp_padding: bool = False
     hsdp_shard_size: int = -1
     hsdp_replicate_size: int = Field(default=1, ge=1)
+    enable_combine_qkv_a2a: bool = True
 
     def __post_init__(self) -> None:
         self.data_parallel_index = self.data_parallel_rank
