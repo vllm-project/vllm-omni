@@ -499,7 +499,7 @@ async def _persist_uploaded_video_references(uploads: list[UploadFile]) -> list[
             with os.fdopen(fd, "wb") as output:
                 while chunk := await upload.read(1024 * 1024):
                     output.write(chunk)
-    except Exception:
+    except (asyncio.CancelledError, Exception):
         for path in paths:
             if os.path.exists(path):
                 os.unlink(path)
@@ -841,7 +841,7 @@ async def _persist_uploaded_media_references(
                 audios.append(path)
             else:
                 videos.append(path)
-    except Exception:
+    except (asyncio.CancelledError, Exception):
         for path in paths:
             if os.path.exists(path):
                 os.unlink(path)
@@ -1045,11 +1045,13 @@ async def _parse_video_form(
     reference_image = None
     reference_video = None
     reference_audio: ReferenceAudio | None = None
+    video_paths: list[str] = []
     if input_references:
         if not supports_mixed_reference_inputs:
             video_paths = await _persist_uploaded_video_references(input_references)
             reference_video = ReferenceVideo(data=video_paths, cleanup_paths=tuple(video_paths))
-            images, audio_paths = [], []
+            images: list[Image.Image] = []
+            audio_paths: list[str] = []
         else:
             images, video_paths, audio_paths = await _persist_uploaded_media_references(input_references)
         if images:
@@ -1059,7 +1061,6 @@ async def _parse_video_form(
         if audio_paths:
             reference_audio = ReferenceAudio(path=audio_paths, cleanup_paths=tuple(audio_paths))
     else:
-        video_paths: list[str] = []
         try:
             image_items = _reference_list(request.image_reference)
             video_items = _reference_list(request.video_reference)
@@ -1121,13 +1122,13 @@ async def _parse_video_form(
     audio_paths = [] if reference_audio is None else list(_reference_list(reference_audio.path))
     if request.audio_reference is not None:
         try:
-            for audio_reference in _reference_list(request.audio_reference):
-                audio_paths.append(await decode_audio_url(audio_reference.audio_url))
+            for audio_item in _reference_list(request.audio_reference):
+                audio_paths.append(await decode_audio_url(audio_item.audio_url))
         except InvalidInputReferenceError as exc:
             _cleanup_video_references(reference_video, reference_audio)
-            cleanup_paths = set(() if reference_audio is None else reference_audio.cleanup_paths)
+            cleaned_paths = set(() if reference_audio is None else reference_audio.cleanup_paths)
             for path in audio_paths:
-                if path not in cleanup_paths and os.path.exists(path):
+                if path not in cleaned_paths and os.path.exists(path):
                     os.unlink(path)
             raise HTTPException(400, detail=str(exc)) from exc
     if audio_paths:

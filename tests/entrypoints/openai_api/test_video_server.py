@@ -20,7 +20,7 @@ import av
 import httpx
 import numpy as np
 import pytest
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile
 from fastapi.testclient import TestClient
 from PIL import Image
 from pytest_mock import MockerFixture
@@ -274,7 +274,7 @@ def test_resolve_diffusion_od_config_prefers_getter_over_attribute():
 class BlockingVideoHandler:
     supports_mixed_reference_inputs = False
     supports_latent_mask_editing = False
-    supported_control_upload_types = frozenset()
+    supported_control_upload_types: frozenset[str] = frozenset()
 
     def __init__(self):
         self.model_name = "Wan-AI/Wan2.2-T2V-A14B-Diffusers"
@@ -965,6 +965,7 @@ def test_magi2_serving_applies_native_defaults_and_rejects_explicit_frame_mismat
 
     asyncio.run(handler._run_and_extract(VideoGenerationRequest(prompt="A fox walks through snow"), "defaults"))
 
+    assert engine.captured_sampling_params_list is not None
     sampling = engine.captured_sampling_params_list[0]
     assert (sampling.width, sampling.height) == (896, 512)
     assert sampling.num_frames == 125
@@ -1425,6 +1426,47 @@ def test_h3_latent_edit_rejects_oversized_mask_json(test_client, monkeypatch):
 
     assert response.status_code == 400
     assert "JSON exceeds" in response.json()["detail"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mixed_media", [False, True], ids=["video-only", "mixed-media"])
+async def test_cancelled_reference_uploads_remove_temporary_files(tmp_path, mocker: MockerFixture, mixed_media):
+    reference_dir = tmp_path / "references"
+    reference_dir.mkdir()
+    unrelated = reference_dir / "unrelated.mp4"
+    unrelated.write_bytes(b"another request")
+    mocker.patch.object(video_generation_helpers.tempfile, "tempdir", str(reference_dir))
+    uploads = [
+        UploadFile(io.BytesIO(b"first video"), filename="first.mp4"),
+        UploadFile(io.BytesIO(b"second reference"), filename="second.wav" if mixed_media else "second.mp4"),
+        UploadFile(io.BytesIO(b"last video"), filename="last.mp4"),
+    ]
+    reading_last = asyncio.Event()
+
+    async def wait_for_cancel(size=-1):
+        reading_last.set()
+        await asyncio.Future()
+
+    mocker.patch.object(uploads[-1], "read", side_effect=wait_for_cancel)
+    persist = (
+        video_generation_helpers._persist_uploaded_media_references
+        if mixed_media
+        else video_generation_helpers._persist_uploaded_video_references
+    )
+    task = asyncio.create_task(persist(uploads))
+    try:
+        await asyncio.wait_for(reading_last.wait(), timeout=5)
+        contents = {path.read_bytes() for path in reference_dir.iterdir() if path != unrelated}
+        assert {b"first video", b"second reference"} <= contents
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        for upload in uploads:
+            await upload.close()
+
+    assert list(reference_dir.iterdir()) == [unrelated]
+    assert unrelated.read_bytes() == b"another request"
 
 
 def test_cancelled_latent_edit_persistence_cleans_prior_source(test_client, monkeypatch):
