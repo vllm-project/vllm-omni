@@ -21,6 +21,7 @@ from vllm_omni.model_executor.models.minicpmo_4_5 import (
     MINICPMO45_DUPLEX_TURN_END_CODEC_TOKENS,
 )
 from vllm_omni.model_executor.models.minicpmo_4_5.pipeline import MINICPMO45_REFERENCE_AUDIO_KEY
+from vllm_omni.model_executor.models.minicpmo_4_5.talker_handoff import get_talker_handoff_producer
 
 logger = logging.getLogger(__name__)
 _MINICPMO45_ASYNC_STATE = "_minicpmo45_async_codec_state"
@@ -807,10 +808,19 @@ def llm2tts(
     prompt: OmniTokensPrompt | TextPrompt = None,
     requires_multimodal_data: bool = False,
     _streaming_context=None,
+    *,
+    target_model_config=None,
 ):
-    """Build Talker conditioning for ordinary and full-duplex streaming."""
+    """Build Talker conditioning for ordinary and full-duplex streaming.
+
+    ``target_model_config`` is the Talker stage's model config, supplied by the
+    stage client. When its stage connector opts in (``thinker_talker_handoff``),
+    the hidden states are put on that connector and the request carries a
+    marker; otherwise they ride the request as nested float lists.
+    """
     if not source_outputs:
         raise ValueError("source_outputs cannot be empty")
+    handoff_producer = get_talker_handoff_producer(target_model_config)
 
     llm_outputs = source_outputs
     tts_inputs = []
@@ -1038,14 +1048,25 @@ def llm2tts(
         if ref_audio is not None:
             ref_waveform, ref_sr = ref_audio
             set_ref_audio(model_intermediate_buffer, _to_transport_list(ref_waveform), ref_sr)
-        handoff_hidden = _to_transport_list(tts_hidden_slice) if tts_hidden_slice is not None else None
+        handoff_hidden = tts_hidden_slice
         native_turn_end_handoff = False
         if is_native_duplex_handoff:
             turn_eos_id = special_token_ids.get("turn_eos_token_id")
             native_turn_end_handoff = turn_eos_id is not None and handoff_ids is not None and turn_eos_id in handoff_ids
             if not handoff_ids:
                 continue
-        set_tts_handoff(model_intermediate_buffer, handoff_ids, handoff_hidden)
+        handoff_transport = None
+        if handoff_hidden is not None:
+            if handoff_producer is not None:
+                # Opt-in: the tensor travels on the Talker's stage connector
+                # and the request carries only a marker. put() is synchronous,
+                # so the payload exists before the request reaches the Talker.
+                handoff_transport = handoff_producer.put(str(llm_output.request_id), handoff_hidden)
+            if handoff_transport is None:
+                # Default (and put-failure) path: nested float lists inside
+                # the msgpack request.
+                handoff_transport = _to_transport_list(handoff_hidden)
+        set_tts_handoff(model_intermediate_buffer, handoff_ids, handoff_transport)
         if native_turn_end_handoff:
             model_intermediate_buffer.setdefault("meta", {})["turn_end"] = True
 

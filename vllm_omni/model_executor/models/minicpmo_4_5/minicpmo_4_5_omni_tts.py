@@ -34,6 +34,12 @@ from vllm_omni.model_executor.models.minicpmo_4_5 import (
     MINICPMO45_DUPLEX_CODEC_TOKENS_PER_CHUNK,
     MINICPMO45_DUPLEX_TURN_END_CODEC_TOKENS,
 )
+from vllm_omni.model_executor.models.minicpmo_4_5.talker_handoff import (
+    create_handoff_connector,
+    handoff_connector_spec,
+    is_handoff_marker,
+    resolve_talker_handoff,
+)
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.utils.device_copy import index_to_device, to_device_nonblocking
@@ -102,6 +108,16 @@ def blank_scheduler_prompt_for_penalties(
     them would tax unrelated codec tokens.
     """
     return torch.full_like(prompt_token_ids, int(vocab_size))
+
+
+def _tp_group():
+    """The initialized TP group, or ``None`` outside a distributed worker."""
+    try:
+        from vllm.distributed.parallel_state import get_tp_group
+
+        return get_tp_group()
+    except (AssertionError, ImportError, RuntimeError):
+        return None
 
 
 def _restore_weight_norm_weight(weight_g: torch.Tensor, weight_v: torch.Tensor) -> torch.Tensor:
@@ -365,6 +381,10 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         config: MiniCPMOConfig = vllm_config.model_config.hf_config
         self.config = config
         self.vllm_config = vllm_config
+        # Opt-in Thinker->Talker handoff over the stage connector (see
+        # talker_handoff.py). The connector is built on first use.
+        self._handoff_spec = handoff_connector_spec(vllm_config.model_config)
+        self._handoff_connector: Any = None
         self._force_eos_rows: list[bool] | None = None
         self._mask_eos_rows: list[bool] | None = None
         self._pending_force_eos_rows: list[bool] | None = None
@@ -449,6 +469,36 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         """Embed the ``<text_eos><audio_bos>`` tail every condition ends with."""
         ids = index_to_device([self._text_eos_id, self._tts_bos_id], self.emb_text.weight.device)
         return self.emb_text(ids)
+
+    def _resolve_connector_handoff(self, info_dict: dict[str, Any]) -> torch.Tensor:
+        """Fetch a connector-transported Thinker handoff into ``info_dict``.
+
+        The payload is claimed once: the tensor replaces the marker in the
+        runner's per-request buffer so later prefill chunks reuse it. With
+        TP>1 the local rank 0 claims it and the other ranks receive it by
+        broadcast.
+        """
+        if self._handoff_spec is None:
+            raise ValueError(
+                "MiniCPM-o Talker received a connector handoff but its stage connector does not "
+                "enable thinker_talker_handoff; the producer and the Talker must share one deploy config"
+            )
+        tp_group = _tp_group()
+        tensor: torch.Tensor | None = None
+        if tp_group is None or tp_group.rank_in_group == 0:
+            if self._handoff_connector is None:
+                self._handoff_connector = create_handoff_connector(self._handoff_spec)
+            tensor = resolve_talker_handoff(info_dict, self._handoff_connector)
+        if tp_group is not None and tp_group.world_size > 1:
+            device = self.emb_text.weight.device
+            payload = {"tts": tensor.to(device)} if tensor is not None else None
+            tensor = tp_group.broadcast_tensor_dict(payload, src=0)["tts"]
+            hidden_info = info_dict.get("hidden_states")
+            if isinstance(hidden_info, dict):
+                hidden_info["tts"] = tensor
+        if tensor is None:
+            raise ValueError("MiniCPM-o Talker connector handoff resolved to nothing")
+        return tensor
 
     def _build_condition_embeddings(
         self,
@@ -627,6 +677,10 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
 
         if is_prefill or first_call:
             token_ids, hidden_states = get_tts_handoff(info_dict)
+            if is_handoff_marker(hidden_states):
+                # Opt-in transport: the request names a connector payload
+                # instead of carrying the hidden states themselves.
+                hidden_states = self._resolve_connector_handoff(info_dict)
             # Cross-process stage transport serializes CPU tensors as lists.
             # Normalize both local tensor handoffs and transported payloads
             # before validating/building the Talker condition.
