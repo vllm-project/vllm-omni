@@ -126,6 +126,7 @@ class OmniEngineCoreRequest(EngineCoreRequest):
             reasoning_ended=request.reasoning_ended,
             reasoning_parser_kwargs=request.reasoning_parser_kwargs,
             abort_immediately=request.abort_immediately,
+            session_id=request.session_id,
             additional_information=additional_information,
             model_intermediate_buffer=model_intermediate_buffer,
             payload_sender_info=payload_sender_info,
