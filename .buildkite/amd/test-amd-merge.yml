@@ -168,6 +168,11 @@ steps:
           timeout --signal=TERM --kill-after=2m 15m
           pytest -sv tests/diffusion/ar_diffusion/test_paged_attention.py
           -m 'core_model and rocm and MI325 and cards_1' --run-level core_model
+        # Keep the pinned-ring device contract blocking without making the
+        # cold, experimental AITER coverage lane a required check.
+        - >-
+          timeout 5m pytest -sv tests/diffusion/utils/test_chunked_transfer.py
+          -m 'core_model and rocm and MI325 and cards_1' --run-level core_model
 
     - label: "Diffusion · LoRA Test"
       agent_pool: mi300_1
@@ -232,6 +237,8 @@ steps:
         - pytest -s -v tests/diffusion/distributed/test_ulysses_uaa_perf.py
 
 
+    # Four-GPU jobs remain merge-only because mi300_4 capacity is scarce.
+    # The blocking two-GPU ready lane covers every non-hybrid UAA/SP variant.
     - label: "ROCm · Ulysses UAA Attention · 4-GPU"
       agent_pool: mi300_4
       depends_on: amd-build
@@ -243,6 +250,11 @@ steps:
         - >-
           timeout 20m pytest -s -v
           tests/diffusion/attention/test_ulysses_uaa.py
+          -m 'core_model and rocm and MI325 and cards_4'
+          --run-level "core_model"
+        - >-
+          timeout 20m pytest -s -v
+          tests/diffusion/attention/test_attention_sp.py
           -m 'core_model and rocm and MI325 and cards_4'
           --run-level "core_model"
 
