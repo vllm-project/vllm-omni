@@ -138,8 +138,7 @@ class DiffusionExecutor(ABC):
         raise NotImplementedError(f"{type(self).__name__} does not support asynchronous output")
 
     def drop_output(self, async_output_id: str) -> None:
-        """Reclaim an async output that will never be waited on (e.g. an
-        aborted request).
+        """Reclaim an async output whose consumer is no longer available.
 
         Only executors with an async output path (result pump) cache outputs
         that a consumer must later claim; executors without one have nothing to
