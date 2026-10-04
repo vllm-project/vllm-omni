@@ -34,7 +34,6 @@ from vllm_omni.entrypoints.openai.protocol.rollout import (
 )
 from vllm_omni.entrypoints.openai.rollout_session import (
     RolloutSession,
-    RolloutSessionClosedError,
     RolloutSessionNotFoundError,
     RolloutSessionStore,
 )
@@ -166,7 +165,7 @@ class ServingRLRollout:
         req: RolloutStepRequest,
     ) -> RolloutStepResponse:
         try:
-            session = await self._store.get(session_id)
+            session = await self._store.get(session_id, include_closed=True)
         except RolloutSessionNotFoundError:
             return self._error_response(
                 req.step_id,
@@ -175,16 +174,16 @@ class ServingRLRollout:
                 "session_not_found",
                 f"Session {session_id!r} does not exist.",
             )
-        except RolloutSessionClosedError:
-            return self._error_response(
-                req.step_id,
-                -1,
-                0,
-                "session_closed",
-                f"Session {session_id!r} is closed.",
-            )
-
         async with session.lock:
+            # A close may have completed while this step waited for the lock.
+            if session.closed:
+                return self._error_response(
+                    req.step_id,
+                    -1,
+                    0,
+                    "session_closed",
+                    f"Session {session_id!r} is closed.",
+                )
             return await self._run_step(session, req)
 
     async def _run_step(
