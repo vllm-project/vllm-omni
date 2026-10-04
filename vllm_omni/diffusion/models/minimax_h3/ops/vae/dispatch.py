@@ -12,8 +12,8 @@ from vllm.triton_utils import HAS_TRITON
 
 from vllm_omni.platforms import current_omni_platform
 
-from .qk_norm_rope import try_qk_norm_rope_exact
-from .scaled_residual import try_scaled_residual_exact
+from .nvidia.qk_norm_rope import try_qk_norm_rope_exact
+from .nvidia.scaled_residual import try_scaled_residual_exact
 
 QKNormRopeOp = Callable[
     [
