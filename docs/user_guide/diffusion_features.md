@@ -211,7 +211,11 @@ The following tables show which models support each feature:
 
 > **Step execution note:** Helios supports single-request step execution only;
 > use `max_num_seqs=1`.
-**Frame Interpolation Support**
+
+For a reproducible Helios-Distilled dense attention comparison, see the
+[H20 attention recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/Helios/Helios-Distilled-H20.md).
+
+### Frame Interpolation Support
 
 - **Supported**: Wan2.2 text-to-video, image-to-video, and TI2V pipelines; SANA-Video-2B native text-to-video and image-to-video pipelines
 - **Not supported**: Wan2.1-VACE, LTX-2, LTX-2.3, LTX-2.5, Helios, HunyuanVideo-1.5, DreamID-Omni, SANA-WM; SANA-Video-2B Diffusers-adapter text-to-video and image-to-video pipelines
