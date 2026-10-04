@@ -32,6 +32,7 @@ from vllm_omni.diffusion.attention.backends.abstract import (
     PackedPaddingMetadata,
     VideoTokenLayout,
 )
+from vllm_omni.diffusion.attention.backends.vdnh3_attn import VDNLayout
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.cache.cachedit import CacheDiTAdapterConfig
 from vllm_omni.diffusion.distributed.sp_plan import (
@@ -57,6 +58,7 @@ from vllm_omni.platforms import current_omni_platform
 
 from .adaln_cache import MiniMaxH3RuntimeAdalnCache
 from .fasth3 import _resolve_native_target
+from .vdnh3 import VDNConfig, VDNH3HybridAttention
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import (
@@ -460,6 +462,9 @@ class MiniMaxH3Attention(nn.Module):
         self._gate_hidden_size = arch.hidden_size
         self._gate_quant_config = quant_config
         self._gate_prefix = f"{prefix}.to_gate_compress"
+        # VDN-H3 hybrid attention; built by enable_vdn for a VDN checkpoint.
+        self.vdn: VDNH3HybridAttention | None = None
+        self._prefix = prefix
         from .attention.fastvideo_h3 import MiniMaxH3VSAImpl
 
         self.attention = Attention(
@@ -497,6 +502,20 @@ class MiniMaxH3Attention(nn.Module):
         )
         nn.init.zeros_(self.to_gate_compress.weight)
 
+    def enable_vdn(self, config: VDNConfig) -> None:
+        """Attach the learned half of VDN-H3 hybrid attention (see ``vdnh3.py``)."""
+        backend = self.attention.attn_backend.get_name()
+        if backend != "VDNH3_ATTN":
+            raise ValueError(f"VDN-H3 attention needs the VDNH3_ATTN backend, but {self._prefix} resolved {backend}")
+        self.vdn = VDNH3HybridAttention(
+            self._gate_hidden_size,
+            self.total_num_heads,
+            self.head_dim,
+            config,
+            quant_config=self._gate_quant_config,
+            prefix=f"{self._prefix}.vdn",
+        )
+
     def _apply_rope(self, x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
         """Rotate the first rot_dim head dims; pass the rest through.
 
@@ -524,6 +543,7 @@ class MiniMaxH3Attention(nn.Module):
         video_layout: VideoTokenLayout | None = None,
         vsa_prefix_segments: tuple[int, ...] = (),
         gate_compress: torch.Tensor | None = None,
+        vdn_window: VDNLayout | None = None,
     ) -> torch.Tensor:
         """Run packed attention as a small eager island.
 
@@ -617,6 +637,8 @@ class MiniMaxH3Attention(nn.Module):
                     if gate_compress is not None and video_layout is not None and video_layout.video_spans
                     else {}
                 ),
+                # The VDNH3_ATTN frame window; every other backend ignores it.
+                **({"vdn_window": vdn_window} if vdn_window is not None else {}),
             },
             video_layout=video_layout,
         )
@@ -639,6 +661,7 @@ class MiniMaxH3Attention(nn.Module):
         sp_seq_lens: list[int] | None = None,
         video_layout: VideoTokenLayout | None = None,
         vsa_prefix_segments: tuple[int, ...] = (),
+        vdn_window: VDNLayout | None = None,
     ) -> torch.Tensor:
         """x: [T, hidden] packed thd rows -> [T, hidden].
 
@@ -659,6 +682,10 @@ class MiniMaxH3Attention(nn.Module):
         q = q.view(total, self.num_heads, self.head_dim)
         k = k.view(total, self.num_kv_heads, self.head_dim)
         v = v.view(total, self.num_kv_heads, self.head_dim)
+        if self.vdn is not None and vdn_window is None:
+            raise ValueError(f"{self._prefix} is VDN-H3 hybrid attention but received no VDN window")
+        # The VDN linear branch reads the raw projections; norm/RoPE are out of place.
+        q_raw, k_raw = q, k
         if rope_table is None:
             q = self.q_norm(q)
             k = self.k_norm(k)
@@ -698,9 +725,14 @@ class MiniMaxH3Attention(nn.Module):
             video_layout=video_layout,
             vsa_prefix_segments=vsa_prefix_segments,
             gate_compress=gate_compress,
+            vdn_window=vdn_window,
         )
+        if self.vdn is not None:
+            out = self.vdn.gate_softmax(out, x)
         out = out.reshape(total, self.num_heads * self.head_dim)
         out, _ = self.out_proj(out)
+        if self.vdn is not None:
+            out = self.vdn.add_linear(out, x, q_raw, k_raw, v, vdn_window)
         return out
 
 
@@ -930,6 +962,7 @@ class MiniMaxH3DiTBlock(nn.Module):
         sp_seq_lens: list[int] | None = None,
         video_layout: VideoTokenLayout | None = None,
         vsa_prefix_segments: tuple[int, ...] = (),
+        vdn_window: VDNLayout | None = None,
     ) -> torch.Tensor:
         """x: [T, H]; t_emb: [M, t_dim]; combined_indices: [T]
         (= inverse_indices * modality_num + token_tags.clamp(min=0)).
@@ -966,6 +999,7 @@ class MiniMaxH3DiTBlock(nn.Module):
             sp_seq_lens=sp_seq_lens,
             video_layout=video_layout,
             vsa_prefix_segments=vsa_prefix_segments,
+            vdn_window=vdn_window,
         )
         x, h = indexed_gate_rms_norm_scale_shift(
             residual,
@@ -1081,6 +1115,8 @@ class MiniMaxH3DiTModel(nn.Module):
     )
     _repeated_blocks = ["MiniMaxH3DiTBlock"]
     _layerwise_offload_blocks_attrs = ["blocks"]
+    # Set by enable_vdn for a VDN-H3 checkpoint.
+    vdn_config: VDNConfig | None = None
 
     @staticmethod
     def _is_transformer_block(name: str, module: nn.Module) -> bool:
@@ -1285,6 +1321,28 @@ class MiniMaxH3DiTModel(nn.Module):
             if sparsity is not None:
                 block.attn.to_gate_compress.weight.missing_param_init = "error"
         self.vsa_gates_enabled = True
+
+    def enable_vdn(self, config: VDNConfig) -> None:
+        """Convert every DiT block to VDN-H3 hybrid attention before loading.
+
+        The token refiner attends over text only and stays dense.
+        """
+        for block in self.blocks:
+            block.attn.enable_vdn(config)
+        self.vdn_config = config
+        self._mark_missing_params_required()
+
+    def vdn_parameter_names(self) -> set[str]:
+        """VDN parameters the checkpoint supplies; quantization fills its scales after loading."""
+        return {name for name, _ in self.named_parameters() if ".attn.vdn." in name and not name.endswith("_scale")}
+
+    def _vdn_window(self, layout: VideoTokenLayout | None, *, text_len: int, num_requests: int) -> VDNLayout:
+        if num_requests != 1 or layout is None or layout.used_len is None:
+            raise ValueError("VDN-H3 attention needs one packed request with its video layout per forward")
+        target = next(span for span in reversed(layout.video_spans) if span.role == "target")
+        return self.vdn_config.window(
+            used=layout.used_len, text_len=text_len, video_start=target.start, grid=target.latent_grid
+        )
 
     def _mark_missing_params_required(self) -> None:
         for _, param in self.named_parameters():
@@ -1595,6 +1653,10 @@ class MiniMaxH3DiTModel(nn.Module):
         refiner_cu = self._psp_field(refiner_psp, "refiner_packed_seq_params", "cu_seqlens_q").to(torch.int32)
         refiner_max = int(self._psp_field(refiner_psp, "refiner_packed_seq_params", "max_seqlen_q"))
         video_layout = kwargs.get("video_token_layout")
+        vdn_window = None
+        if self.vdn_config is not None:
+            # Text rows lead the packed document.
+            vdn_window = self._vdn_window(video_layout, text_len=int(text_pos.shape[0]), num_requests=num_requests)
 
         if x.dim() != 3 or x.shape[0] != 1:
             raise ValueError(f"x must be [1, S, C], got {list(x.shape)}")
@@ -1676,6 +1738,7 @@ class MiniMaxH3DiTModel(nn.Module):
                 num_requests=num_requests,
                 video_layout=video_layout,
                 vsa_prefix_segments=vsa_prefix_segments,
+                vdn_window=vdn_window,
             )
         if local_len == seq_len:
             hidden = self.sp_gather(hidden)
