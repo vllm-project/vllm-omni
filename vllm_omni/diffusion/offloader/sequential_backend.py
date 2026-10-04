@@ -13,6 +13,7 @@ from vllm_omni.diffusion.hooks import HookRegistry, ModelHook
 from vllm_omni.platforms import current_omni_platform
 
 from .base import OffloadBackend, OffloadConfig, SupportsModelCpuOffload
+from .pinned_host import move_module_to_pinned_cpu, release_cached_pinned_memory
 from .plan_resolver import resolve_offload_plan
 
 logger = init_logger(__name__)
@@ -84,22 +85,33 @@ class SequentialOffloadHook(ModelHook):
         refer to
         https://github.com/vipshop/cache-dit/blob/v1.2.3/src/cache_dit/caching/cache_blocks/__init__.py#L83
         """
-        moved = False
-        for p in module.parameters():
-            if p.data.device != target_device:
-                data = p.data.to(target_device, non_blocking=non_blocking)
-                if pin_memory and target_device.type == "cpu" and not isinstance(data, DTensor):
-                    data = data.pin_memory()
-                p.data = data
-                moved = True
-        for b in module.buffers():
-            if b.device != target_device:
-                data = b.data.to(target_device, non_blocking=non_blocking)
-                if pin_memory and target_device.type == "cpu" and not isinstance(data, DTensor):
-                    data = data.pin_memory()
-                b.data = data
-                moved = True
-        return moved
+        rocm = current_omni_platform.is_rocm()
+        if rocm:
+            release_cached_pinned_memory()
+        try:
+            if rocm and pin_memory and target_device == torch.device("cpu"):
+                moved = move_module_to_pinned_cpu(module, non_blocking=non_blocking)
+                if moved is not None:
+                    return moved
+            moved = False
+            for p in module.parameters():
+                if p.data.device != target_device:
+                    data = p.data.to(target_device, non_blocking=non_blocking)
+                    if pin_memory and target_device.type == "cpu" and not isinstance(data, DTensor):
+                        data = data.pin_memory()
+                    p.data = data
+                    moved = True
+            for b in module.buffers():
+                if b.device != target_device:
+                    data = b.data.to(target_device, non_blocking=non_blocking)
+                    if pin_memory and target_device.type == "cpu" and not isinstance(data, DTensor):
+                        data = data.pin_memory()
+                    b.data = data
+                    moved = True
+            return moved
+        finally:
+            if rocm:
+                release_cached_pinned_memory()
 
     def _to_cpu(self, module: nn.Module) -> None:
         # XPU's allocator doesn't respect stream dependencies in empty_cache,
