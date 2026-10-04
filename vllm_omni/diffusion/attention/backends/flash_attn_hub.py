@@ -15,6 +15,7 @@ from vllm_omni.diffusion.attention.backends.abstract import (
     AttentionMetadata,
 )
 from vllm_omni.diffusion.attention.backends.utils.piecewise_attn import piecewise_attn
+from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
 
@@ -82,7 +83,12 @@ def _run_varlen_dense(
 
 class FlashAttentionHubBackend(AttentionBackend):
     accept_output_buffer: bool = True
-    supports_piecewise_spans: bool = True
+
+    @classmethod
+    def supports_piecewise_spans(cls) -> bool:
+        # Only forward_cuda dispatches piecewise_attn; ROCm / MUSA reach it through
+        # the default forward_hip / forward_musa delegation.
+        return current_omni_platform.is_cuda() or current_omni_platform.is_rocm() or current_omni_platform.is_musa()
 
     @classmethod
     def supports_attention_mask(cls, attention_spec: object | None = None) -> bool:
@@ -250,7 +256,12 @@ class FlashAttentionHubImpl(AttentionImpl[AttentionMetadata]):
 
 class FlashAttention3HubBackend(AttentionBackend):
     accept_output_buffer: bool = True
-    supports_piecewise_spans: bool = True
+
+    @classmethod
+    def supports_piecewise_spans(cls) -> bool:
+        # Only forward_cuda dispatches piecewise_attn; ROCm / MUSA reach it through
+        # the default forward_hip / forward_musa delegation.
+        return current_omni_platform.is_cuda() or current_omni_platform.is_rocm() or current_omni_platform.is_musa()
 
     @classmethod
     def supports_attention_mask(cls, attention_spec: object | None = None) -> bool:

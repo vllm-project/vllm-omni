@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 # Copyright 2025 The Qwen Team and The HuggingFace Inc. team. All rights reserved.
 #
@@ -515,7 +515,7 @@ class HiDreamO1ImageTransformer(nn.Module):
     @property
     def supports_piecewise_attention(self) -> bool:
         return all(
-            layer.self_attn.attn.attn_backend.supports_piecewise_spans for layer in self.model.language_model.layers
+            layer.self_attn.attn.attn_backend.supports_piecewise_spans() for layer in self.model.language_model.layers
         )
 
     def forward(
