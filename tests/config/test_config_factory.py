@@ -2729,8 +2729,8 @@ class TestBaseConfigInheritance:
 
         deploy = load_deploy_config(ci_path)
         s0 = deploy.stages[0].default_sampling_params
-        # CI overrides max_tokens
-        assert s0["max_tokens"] == 150
+        # CI raises the thinker budget for the 200-word generation assertion.
+        assert s0["max_tokens"] == 512
 
     def test_qwen3_omni_colocate_async_bounds_only_rocm_kv_cache(self):
         ci_path = Path(get_deploy_config_path("ci/qwen3_omni_moe_colocate_async.yaml"))

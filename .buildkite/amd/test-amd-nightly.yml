@@ -19,9 +19,25 @@ steps:
         mirror_hardwares: [amdproduction]
         grade: NonBlocking
         timeout_in_minutes: 180
+        artifact_paths:
+          - artifacts/rocm-qwen3-omni-function/**/*
         commands:
           - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
-          - pytest -s -v tests/e2e/online_serving/test_qwen3_omni_expansion.py -m "full_model and rocm and MI325 and cards_2" --run-level "full_model"
+          - export VLLM_CI_QWEN3_OMNI_SEED=42
+          - export PYTHONHASHSEED=42
+          - export QWEN3_OMNI_FUNCTION_ARTIFACT_DIR="$$BUILDKITE_BUILD_CHECKOUT_PATH/artifacts/rocm-qwen3-omni-function"
+          - mkdir -p "$$QWEN3_OMNI_FUNCTION_ARTIFACT_DIR"
+          - >-
+            timeout --signal=TERM --kill-after=1m 170m
+            pytest -s -v -ra
+            tests/e2e/online_serving/test_qwen3_omni_expansion.py
+            -m "full_model and rocm and MI325 and cards_2"
+            --run-level "full_model"
+            --durations=0
+            --junitxml="$$QWEN3_OMNI_FUNCTION_ARTIFACT_DIR/pytest.xml"
+            2>&1 | tee "$$QWEN3_OMNI_FUNCTION_ARTIFACT_DIR/pytest.log"
+          - tail -n 100 "$$QWEN3_OMNI_FUNCTION_ARTIFACT_DIR/pytest.log" > "$$QWEN3_OMNI_FUNCTION_ARTIFACT_DIR/pytest-summary.txt"
+          - printf 'qwen3_omni_sampling_seed=42\npythonhashseed=42\n' > "$$QWEN3_OMNI_FUNCTION_ARTIFACT_DIR/reproducibility.txt"
 
       - label: "Qwen3-Omni Accuracy"
         agent_pool: mi300_2
@@ -31,11 +47,27 @@ steps:
         timeout_in_minutes: 180
         artifact_paths:
           - tests/e2e/accuracy/qwen3_omni/results/qwen_omni_acc/*.json
+          - artifacts/rocm-qwen3-omni-accuracy/**/*
         commands:
           - export SEED_TTS_WER_EVAL=1
+          - export SEED_TTS_WER_SAVE_ITEMS=1
           # PyTorch ROCm uses the torch.cuda device namespace.
           - export SEED_TTS_EVAL_DEVICE=cuda:1
-          - pytest -s -v tests/e2e/accuracy/qwen3_omni/test_qwen3_omni.py -m "full_model and rocm and MI325 and cards_2" --run-level "full_model"
+          - export VLLM_CI_QWEN3_OMNI_SEED=42
+          - export PYTHONHASHSEED=42
+          - export QWEN3_OMNI_ACCURACY_ARTIFACT_DIR="$$BUILDKITE_BUILD_CHECKOUT_PATH/artifacts/rocm-qwen3-omni-accuracy"
+          - mkdir -p "$$QWEN3_OMNI_ACCURACY_ARTIFACT_DIR"
+          - >-
+            timeout --signal=TERM --kill-after=1m 170m
+            pytest -s -v -ra
+            tests/e2e/accuracy/qwen3_omni/test_qwen3_omni.py
+            -m "full_model and rocm and MI325 and cards_2"
+            --run-level "full_model"
+            --durations=0
+            --junitxml="$$QWEN3_OMNI_ACCURACY_ARTIFACT_DIR/pytest.xml"
+            2>&1 | tee "$$QWEN3_OMNI_ACCURACY_ARTIFACT_DIR/pytest.log"
+          - tail -n 100 "$$QWEN3_OMNI_ACCURACY_ARTIFACT_DIR/pytest.log" > "$$QWEN3_OMNI_ACCURACY_ARTIFACT_DIR/pytest-summary.txt"
+          - printf 'qwen3_omni_sampling_seed=42\npythonhashseed=42\n' > "$$QWEN3_OMNI_ACCURACY_ARTIFACT_DIR/reproducibility.txt"
           # Native tests run from the image copy under /app/vllm-omni, while
           # Buildkite's artifact hook searches the checkout workspace.
           - |
