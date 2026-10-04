@@ -270,7 +270,7 @@ class TestResidentLayers:
         return _config(
             components,
             strategy=OffloadStrategy.DISTRIBUTED_LAYER_WISE,
-            dlo_transfers={"dit": "rank-local", "text_encoder": "rank-local"},
+            dlo_transfers={"dit": "rank-local", "text_encoder": "rank-local", "vae": "rank-local"},
             dlo_resident_layers=resident_layers,
         )
 
@@ -360,7 +360,7 @@ class TestValidation:
             {"text_encoder"},
             strategy=OffloadStrategy.DISTRIBUTED_LAYER_WISE,
             dp_size=2,
-            dlo_transfers={"dit": "rank-local", "text_encoder": "allgather"},
+            dlo_transfers={"dit": "rank-local", "text_encoder": "allgather", "vae": "rank-local"},
         )
 
         with pytest.raises(ValueError, match="not declared replicated"):

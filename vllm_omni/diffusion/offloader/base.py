@@ -16,6 +16,7 @@ from .component_utils import encoder_component_type
 from .config import (
     DIT_COMPONENT,
     TEXT_ENCODER_COMPONENT,
+    VAE_COMPONENT,
     DLOTransfer,
     OffloadStrategy,
     parse_dlo_transfer,
@@ -85,6 +86,7 @@ class OffloadConfig:
             self.dlo_transfers = {
                 DIT_COMPONENT: DLOTransfer.ALLGATHER if self.dlo_use_allgather else DLOTransfer.RANK_LOCAL,
                 TEXT_ENCODER_COMPONENT: DLOTransfer.RANK_LOCAL,
+                VAE_COMPONENT: DLOTransfer.RANK_LOCAL,
             }
         self.dlo_transfers = parse_dlo_transfer(self.dlo_transfers)
         # Preserve the old field as the DiT transfer compatibility view.

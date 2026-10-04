@@ -2729,7 +2729,7 @@ class TestDistributedComponentSelection:
                 pin_cpu_memory=False,
                 dp_size=2,
                 components=frozenset({"text_encoder"}),
-                dlo_transfers={"dit": "rank-local", "text_encoder": "allgather"},
+                dlo_transfers={"dit": "rank-local", "text_encoder": "allgather", "vae": "rank-local"},
             ),
             torch.device("cpu"),
         )
@@ -2761,7 +2761,7 @@ class TestDistributedComponentSelection:
                 pin_cpu_memory=False,
                 dp_size=2,
                 components=frozenset({"dit", "text_encoder"}),
-                dlo_transfers={"dit": "allgather", "text_encoder": "rank-local"},
+                dlo_transfers={"dit": "allgather", "text_encoder": "rank-local", "vae": "rank-local"},
             ),
             torch.device("cpu"),
         )
@@ -2851,7 +2851,7 @@ class TestDistributedComponentSelection:
                 pin_cpu_memory=False,
                 dp_size=2,
                 components=frozenset({"dit", "text_encoder"}),
-                dlo_transfers={"dit": "allgather", "text_encoder": "rank-local"},
+                dlo_transfers={"dit": "allgather", "text_encoder": "rank-local", "vae": "rank-local"},
             ),
             torch.device("cpu"),
         )
@@ -2986,7 +2986,7 @@ class TestDistributedComponentSelection:
                 pin_cpu_memory=False,
                 dp_size=2,
                 components=frozenset({"dit", "text_encoder"}),
-                dlo_transfers={"dit": "rank-local", "text_encoder": "allgather"},
+                dlo_transfers={"dit": "rank-local", "text_encoder": "allgather", "vae": "rank-local"},
             ),
             torch.device("cpu"),
         )
@@ -3024,7 +3024,7 @@ class TestDistributedComponentSelection:
                 pin_cpu_memory=False,
                 dp_size=2,
                 components=frozenset({"text_encoder"}),
-                dlo_transfers={"dit": "rank-local", "text_encoder": "allgather"},
+                dlo_transfers={"dit": "rank-local", "text_encoder": "allgather", "vae": "rank-local"},
             ),
             torch.device("cpu"),
         )
@@ -3048,7 +3048,7 @@ class TestDistributedComponentSelection:
             pin_cpu_memory=False,
             dp_size=2,
             components=frozenset({"text_encoder"}),
-            dlo_transfers={"dit": "rank-local", "text_encoder": "allgather"},
+            dlo_transfers={"dit": "rank-local", "text_encoder": "allgather", "vae": "rank-local"},
         )
 
         with pytest.raises(ValueError, match="not declared replicated"):

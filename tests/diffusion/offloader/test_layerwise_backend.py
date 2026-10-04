@@ -646,11 +646,17 @@ class TestLayerwiseComponentConfig:
         plan = OffloadPlan(encoder_component_types={"mllm": "text_encoder"})
         assert config.offloads_encoder("mllm", plan)
 
-    @pytest.mark.parametrize("component", ["image_encoder", "vae", "scheduler", "text-encoder"])
+    @pytest.mark.parametrize("component", ["image_encoder", "scheduler", "text-encoder"])
     def test_unknown_or_noncanonical_component_is_rejected(self, component):
         with pytest.raises(ValueError, match="Unknown diffusion offload component"):
             OffloadConfig.from_od_config(
                 _offload_od_config(diffusion_offload_config={"mode": "layer", "components": [component]})
+            )
+
+    def test_vae_component_requires_module_mode(self):
+        with pytest.raises(ValueError, match="requires mode='module'"):
+            OffloadConfig.from_od_config(
+                _offload_od_config(diffusion_offload_config={"mode": "layer", "components": ["dit", "vae"]})
             )
 
     def test_components_is_selection_only_not_an_options_mapping(self):

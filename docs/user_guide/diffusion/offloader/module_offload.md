@@ -10,7 +10,8 @@ Pre-forward hooks enforce mutual exclusion between DiT and encoder modules:
 
 - before an encoder runs, selected DiTs move to CPU;
 - before a DiT runs, selected encoders and other selected DiTs move to CPU; and
-- VAE modules remain on the accelerator.
+- VAE modules remain on the accelerator unless the pipeline owns their
+  lifecycle and selects the `vae` component.
 
 Pinned host memory reduces transfer overhead. Transfers occur at phase
 boundaries, so cold-start and encoder-to-denoiser transitions become slower.
@@ -41,8 +42,12 @@ such as `weight_transfer` and `resident_layers`. The
 `enable_cpu_offload=True` compatibility entry point remains supported. New
 integrations should prefer the explicit config; existing model-specific stage
 lifecycles do not need to migrate until equivalent component coverage exists.
-For example, MiniMax-H3's compatibility lifecycle also stages its VAEs, while
-the compact selector intentionally covers only `dit` and `text_encoder`.
+Pipelines that own a VAE lifecycle (for example a non-`forward` `decode` entry
+point) may additionally select the `vae` component so the VAE leaves the
+accelerator during denoising; it is only valid with `mode="module"`. Pipelines
+without such a lifecycle keep their VAE resident and reject `vae`. For example,
+MiniMax-H3's compatibility lifecycle stages its VAEs but does not expose them
+through the compact selector.
 
 ## Model integration
 
