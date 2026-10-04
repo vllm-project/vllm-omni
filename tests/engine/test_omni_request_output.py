@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Tests for OmniRequestOutput class."""
 
 import pytest
@@ -7,8 +7,30 @@ from PIL import Image
 from vllm.outputs import CompletionOutput, RequestOutput
 
 from vllm_omni.outputs import OmniRequestOutput
+from vllm_omni.outputs.mm_outputs import MultimodalCompletionOutput
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+@pytest.mark.parametrize("payload_location", ["request", "completion", "missing"])
+def test_multimodal_output_audio_accessor(payload_location):
+    audio = {"audio": [0.1, -0.1], "sr": 24000}
+    output = OmniRequestOutput(request_id="audio-accessor")
+    if payload_location == "request":
+        output = OmniRequestOutput.from_diffusion(request_id="audio-accessor", images=[], multimodal_output=audio)
+    elif payload_location == "completion":
+        output.outputs = [
+            MultimodalCompletionOutput(
+                index=0,
+                text="",
+                token_ids=[],
+                cumulative_logprob=None,
+                logprobs=None,
+                multimodal_output=audio,
+            )
+        ]
+
+    assert output.multimodal_output == ({} if payload_location == "missing" else audio)
 
 
 # ── helpers ────────────────────────────────────────────────────────────────
