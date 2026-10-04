@@ -35,6 +35,10 @@ from vllm_omni.transformers_utils.repo_utils import hf_api
 logger = init_logger(__name__)
 
 
+# Intermediate-buffer key holding a seeded request's flow-matching noise generator.
+_NOISE_GENERATOR_KEY = "_voxtral_noise_generator"
+
+
 def parse_batched_audio_input(input_ids: torch.Tensor, num_codebooks: int) -> tuple[list[torch.Tensor], list[int]]:
     """Parse batched input_ids with [ctx_frames, context_length, ...tokens] format.
 
@@ -222,6 +226,15 @@ class VoxtralTTSForConditionalGeneration(
 
     def tts_preprocess(self, input_ids: torch.Tensor, input_embeds: torch.Tensor, **info_dict: dict | None):
         self.post_process_idx = 0
+        # SamplingParams.seed (runner passes it as ``_omni_seed``) never reaches
+        # the flow-matching noise, so a seeded request gets its own generator.
+        # It lives in the request's intermediate buffer, which the runner drops
+        # when the request finishes.
+        seed = info_dict.get("_omni_seed")
+        if seed is not None and _NOISE_GENERATOR_KEY not in info_dict:
+            generator = torch.Generator(device=input_ids.device)
+            generator.manual_seed(int(seed))
+            info_dict[_NOISE_GENERATOR_KEY] = generator
         codes = info_dict.get("codes")
         audio_tokens = codes.get("audio") if isinstance(codes, Mapping) else None
         if audio_tokens is None:
@@ -347,6 +360,15 @@ class VoxtralTTSForConditionalGeneration(
             dtype=input_hidden_states.dtype,
         )
 
+    @staticmethod
+    def _extract_noise_generators(**kwargs) -> list[torch.Generator | None] | None:
+        """Return per-row noise generators of seeded requests, in batch order."""
+        infos = kwargs.get("model_intermediate_buffer")
+        if not infos:
+            return None
+        generators = [info.get(_NOISE_GENERATOR_KEY) if isinstance(info, Mapping) else None for info in infos]
+        return generators if any(g is not None for g in generators) else None
+
     def make_omni_output(
         self, model_outputs: torch.Tensor | OmniOutput | tuple, logits_index: int | None = None, **kwargs
     ) -> OmniOutput:
@@ -356,13 +378,14 @@ class VoxtralTTSForConditionalGeneration(
                 assert logits_index is not None
                 input_hidden_states = hidden_states[logits_index]
                 cfg_alpha = self._extract_cfg_alpha(input_hidden_states, **kwargs)
+                noise_generators = self._extract_noise_generators(**kwargs)
                 if self._cudagraph_acoustic_transformer is not None:
                     fake_eos, multimodal_outputs = self._cudagraph_acoustic_transformer(
-                        input_hidden_states, cfg_alpha=cfg_alpha
+                        input_hidden_states, cfg_alpha=cfg_alpha, noise_generators=noise_generators
                     )
                 else:
                     fake_eos, multimodal_outputs = self.model.compute_mm_logits(
-                        input_hidden_states, cfg_alpha=cfg_alpha
+                        input_hidden_states, cfg_alpha=cfg_alpha, noise_generators=noise_generators
                     )
                 hidden_states[logits_index, 0] = fake_eos
                 return OmniOutput(

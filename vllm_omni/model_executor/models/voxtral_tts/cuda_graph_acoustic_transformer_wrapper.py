@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """
 CUDA Graph wrapper for AcousticTransformer in VoxtralTTS.
 
@@ -8,6 +11,8 @@ n-step Euler ODE with CFG) into CUDA graphs for fixed batch sizes,
 eliminating kernel launch overhead on every decode step.
 """
 
+from collections.abc import Sequence
+
 import torch
 from torch.cuda import CUDAGraph
 from vllm.logger import init_logger
@@ -15,6 +20,7 @@ from vllm.platforms import current_platform
 
 from vllm_omni.model_executor.models.voxtral_tts.voxtral_tts_audio_generation import (
     AudioSpecialTokens,
+    fill_seeded_noise,
 )
 
 logger = init_logger(__name__)
@@ -232,6 +238,7 @@ class CUDAGraphAcousticTransformerWrapper:
         self,
         hidden_states: torch.Tensor,
         cfg_alpha: torch.Tensor,
+        noise_generators: Sequence[torch.Generator | None] | None = None,
     ) -> tuple[torch.Tensor, dict[str, list[torch.Tensor]] | None]:
         """
         Drop-in replacement for model.compute_mm_logits().
@@ -243,15 +250,15 @@ class CUDAGraphAcousticTransformerWrapper:
         actual_size = hidden_states.shape[0]
 
         if not self.enabled or not self._warmed_up:
-            return self.model.compute_mm_logits(hidden_states, cfg_alpha=cfg_alpha)
+            return self.model.compute_mm_logits(hidden_states, cfg_alpha=cfg_alpha, noise_generators=noise_generators)
 
         # Inner graph replay is illegal during an outer stream capture.
         if torch.cuda.is_current_stream_capturing():
-            return self.model.compute_mm_logits(hidden_states, cfg_alpha=cfg_alpha)
+            return self.model.compute_mm_logits(hidden_states, cfg_alpha=cfg_alpha, noise_generators=noise_generators)
 
         padded_size = self._get_padded_size(actual_size)
         if padded_size is None or padded_size not in self.graphs:
-            return self.model.compute_mm_logits(hidden_states, cfg_alpha=cfg_alpha)
+            return self.model.compute_mm_logits(hidden_states, cfg_alpha=cfg_alpha, noise_generators=noise_generators)
 
         # Zero static input, then copy actual data
         self.static_inputs[padded_size].zero_()
@@ -262,8 +269,10 @@ class CUDAGraphAcousticTransformerWrapper:
         self.static_cfg_alpha[padded_size][:actual_size, 0] = cfg_alpha
 
         # Fill noise buffer with fresh random values before replay so the
-        # flow-matching ODE starts from different initial noise each time.
+        # flow-matching ODE starts from different initial noise each time;
+        # seeded requests then redraw their rows from their own generators.
         self.static_noise[padded_size].normal_()
+        fill_seeded_noise(self.static_noise[padded_size], noise_generators)
 
         # Replay captured graph
         self.graphs[padded_size].replay()
