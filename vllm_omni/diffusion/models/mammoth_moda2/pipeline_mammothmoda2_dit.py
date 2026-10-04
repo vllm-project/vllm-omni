@@ -8,7 +8,6 @@ from typing import ClassVar
 
 import torch
 from diffusers.image_processor import VaeImageProcessor
-from diffusers.models.autoencoders.autoencoder_kl import AutoencoderKL
 from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
 from vllm.logger import init_logger
@@ -20,6 +19,8 @@ from vllm_omni.diffusion.cache.cachedit import (
     RequestScopedCacheDiTRuntime,
 )
 from vllm_omni.diffusion.data import DiffusionCacheConfig, DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl import DistributedAutoencoderKL
+from vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor import DistributedVaeMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.layers.norm import RMSNorm
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
@@ -364,7 +365,7 @@ class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
         if self.config.gen_vae_config is None or self.config.gen_dit_config is None:
             raise ValueError("Mammothmoda2Config.gen_vae_config / gen_dit_config must not be None")
 
-        self.gen_vae = AutoencoderKL.from_config(self.config.gen_vae_config)
+        self.gen_vae = DistributedAutoencoderKL.from_config(self.config.gen_vae_config)
         self.gen_transformer = Transformer2DModel.from_config(self.config.gen_dit_config)
 
         # llm_config is a Mammothmoda2Qwen2_5_VLConfig which has nested text_config
@@ -835,6 +836,7 @@ class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
             latents = latents.to(dtype=target_dtype)
 
         # VAE decode (in-place scaling to reduce peak VRAM before decode)
+        latents = self._sync_latents_for_vae_decode(latents)
         if self.gen_vae.config.scaling_factor is not None:
             latents.div_(self.gen_vae.config.scaling_factor)
         if self.gen_vae.config.shift_factor is not None:
@@ -879,6 +881,12 @@ class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
         if any(output is None for output in outputs):
             raise RuntimeError("DiT batching produced no image for at least one scheduled request")
         return [output for output in outputs if output is not None]
+
+    def _sync_latents_for_vae_decode(self, latents: torch.Tensor) -> torch.Tensor:
+        """Give each VAE tile rank the same final latent from rank 0."""
+        if isinstance(self.gen_vae, DistributedVaeMixin) and self.gen_vae.is_distributed_enabled():
+            return self.gen_vae.distributed_executor.broadcast_tensor(latents)
+        return latents
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)

@@ -382,6 +382,9 @@ class TransformerBlock(nn.Module):
             softmax_scale=self.attn.scale,
             num_kv_heads=num_kv_heads,
             allow_fp32_fallback=True,
+            # Mammoth has no DiT sequence-sharding plan. An SP group may still
+            # coordinate VAE patch parallelism, but DiT attention stays local.
+            skip_sequence_parallel=True,
         )
 
         # Initialize feed-forward network

@@ -10,6 +10,7 @@ import cache_dit
 import pytest
 import torch
 from cache_dit import BlockAdapter
+from diffusers.models.autoencoders.autoencoder_kl import AutoencoderKL
 from torch import nn
 
 from vllm_omni.diffusion.cache.cachedit import CacheDiTBackend, RequestScopedCacheDiTRuntime
@@ -22,6 +23,8 @@ from vllm_omni.diffusion.data import (
     OmniDiffusionConfig,
     TransformerConfig,
 )
+from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl import DistributedAutoencoderKL
+from vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor import DistributedVaeMixin
 from vllm_omni.diffusion.models.interface import adopt_request_scoped_cache_dit
 from vllm_omni.diffusion.models.mammoth_moda2 import pipeline_mammothmoda2_dit
 from vllm_omni.diffusion.models.mammoth_moda2.pipeline_mammothmoda2_dit import (
@@ -363,6 +366,26 @@ class _FakeVae(nn.Module):
         return (torch.zeros(b, 3, 32, 48, dtype=latents.dtype) + base,)
 
 
+def test_pipeline_builds_distributed_gen_vae_without_changing_checkpoint_prefix(mocker) -> None:
+    vae = _FakeVae()
+    distributed_factory = mocker.patch.object(pipeline_mammothmoda2_dit, "DistributedAutoencoderKL", create=True)
+    distributed_factory.from_config.return_value = vae
+    legacy_factory = mocker.patch.object(pipeline_mammothmoda2_dit, "AutoencoderKL", create=True)
+    legacy_factory.from_config.return_value = vae
+    mocker.patch.object(pipeline_mammothmoda2_dit.Transformer2DModel, "from_config", return_value=_FakeTransformer())
+    mocker.patch.object(MammothModa2DiTPipeline, "_reinit_caption_embedder")
+    mocker.patch.object(pipeline_mammothmoda2_dit.RotaryPosEmbedReal, "get_freqs_real", return_value=torch.zeros(1))
+    mocker.patch.object(pipeline_mammothmoda2_dit, "get_local_device", return_value=torch.device("cpu"))
+
+    pipeline = MammothModa2DiTPipeline(od_config=_od_config())
+
+    distributed_factory.from_config.assert_called_once_with(pipeline.config.gen_vae_config)
+    assert pipeline.gen_vae is vae
+    assert "gen_vae.anchor" in pipeline.state_dict()
+    assert not hasattr(pipeline, "vae")
+    assert issubclass(DistributedAutoencoderKL, AutoencoderKL)
+
+
 class _FakeScheduler:
     def __init__(self) -> None:
         self.timesteps = torch.tensor([])
@@ -409,6 +432,52 @@ def test_forward_returns_diffusion_output_with_request_sampling(mocker) -> None:
     assert captured["seed"] == 42
     assert scheduler.requested_steps == 2
     assert pipeline.gen_transformer.calls == 2
+
+
+@pytest.mark.parametrize("steps", [(1,), (1, 1), (1, 2)])
+def test_forward_syncs_final_latents_before_distributed_vae_decode(mocker, steps) -> None:
+    class _FakeDistributedVae(_FakeVae, DistributedVaeMixin):
+        def __init__(self) -> None:
+            super().__init__()
+            self.broadcast_calls = 0
+            self.decoded_latents = None
+            self.distributed_executor = SimpleNamespace(broadcast_tensor=self.broadcast_tensor)
+
+        def is_distributed_enabled(self) -> bool:
+            return True
+
+        def broadcast_tensor(self, latents):
+            self.broadcast_calls += 1
+            return torch.full_like(latents, 3)
+
+        def decode(self, latents, return_dict=False):
+            self.decoded_latents = latents.clone()
+            return super().decode(latents, return_dict=return_dict)
+
+    pipeline = _pipeline_shell()
+    pipeline.gen_transformer = _FakeTransformer()
+    pipeline.gen_image_condition_refiner = None
+    pipeline.gen_vae = _FakeDistributedVae()
+    pipeline.gen_vae.config.scaling_factor = 2.0
+    pipeline.gen_vae.config.shift_factor = 0.5
+    pipeline.gen_freqs_cis = torch.zeros(1)
+    module = "vllm_omni.diffusion.models.mammoth_moda2.pipeline_mammothmoda2_dit"
+    mocker.patch(f"{module}.FlowMatchEulerDiscreteScheduler", return_value=_FakeScheduler())
+    mocker.patch(f"{module}.randn_tensor", side_effect=lambda shape, **kwargs: torch.ones(shape))
+
+    requests = [
+        _batch(
+            request_id=f"sync-{i}",
+            sampling=OmniDiffusionSamplingParams(seed=42, guidance_scale=1.0, num_inference_steps=count),
+        ).requests[0]
+        for i, count in enumerate(steps)
+    ]
+    for repeat in range(2):
+        outputs = pipeline.forward(DiffusionRequestBatch(requests))
+        assert len(outputs) == len(requests)
+        assert all(torch.all(output.output == 2.0) for output in outputs)
+        assert pipeline.gen_vae.broadcast_calls == (repeat + 1) * len(set(steps))
+        assert torch.all(pipeline.gen_vae.decoded_latents == 2.0)
 
 
 def test_forward_rejects_missing_visual_tokens_before_model_access() -> None:
@@ -477,11 +546,33 @@ def _cache_dit_od_config() -> OmniDiffusionConfig:
     )
 
 
+@pytest.fixture
+def single_rank_world(monkeypatch, tmp_path):
+    """Match the worker's world-group lifecycle for the real distributed VAE."""
+    from vllm_omni.diffusion.distributed import parallel_state
+
+    monkeypatch.setattr(parallel_state.current_omni_platform, "get_device_count", lambda: 1)
+    monkeypatch.setattr(parallel_state.current_omni_platform, "set_device", lambda _device: None)
+    parallel_state.init_distributed_environment(
+        world_size=1,
+        rank=0,
+        local_rank=0,
+        distributed_init_method=f"file://{tmp_path / 'world'}",
+        backend="gloo",
+    )
+    try:
+        yield
+    finally:
+        parallel_state.destroy_distributed_env()
+
+
 @pytest.mark.skipif(
     current_omni_platform.is_rocm(),
     reason="vLLM ROCm custom ops lack CPU fallback",
 )
-def test_forward_transitions_request_scoped_cache_dit_across_requests(request: pytest.FixtureRequest) -> None:
+def test_forward_transitions_request_scoped_cache_dit_across_requests(
+    request: pytest.FixtureRequest, single_rank_world
+) -> None:
     """Cache-DiT request lifecycle on one production-built pipeline instance.
 
     Mirrors the diffusion runner startup (``get_cache_backend`` → ``enable`` →
