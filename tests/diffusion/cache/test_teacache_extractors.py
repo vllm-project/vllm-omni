@@ -32,6 +32,7 @@ from vllm_omni.diffusion.cache.teacache.extractors import (
     extract_flux2_context,
     extract_flux2_klein_context,
     extract_flux_context,
+    extract_ming_image_context,
     extract_minimax_h3_context,
     extract_zimage_context,
 )
@@ -108,6 +109,106 @@ def test_zimage_extractor_accepts_extended_patchify_output():
     )
 
     assert context.modulated_input.shape == (1, 64, 4)
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("alignment_mode, has_reference", [("zero_masked", False), ("learned", True)])
+def test_ming_extractor_preserves_conditioning_and_generated_frames(alignment_mode, has_reference):
+    class _Block(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.attention_norm1 = nn.Identity()
+
+        def adaLN_modulation(self, value):
+            return value.new_zeros((value.shape[0], 16))
+
+        def forward(self, hidden, *_args):
+            return hidden + 1
+
+    class _FinalLayer(nn.Module):
+        def forward(self, hidden, _timestep):
+            return hidden
+
+    class _Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.alignment_padding_mode = alignment_mode
+            self.layers = nn.ModuleList([_Block()])
+            self.noise_refiner = nn.ModuleList()
+            self.context_refiner = nn.ModuleList()
+            self.all_x_embedder = nn.ModuleDict({"2-1": nn.Identity()})
+            self.all_final_layer = nn.ModuleDict({"2-1": _FinalLayer()})
+            self.cap_embedder = nn.Identity()
+            self.x_pad_token = nn.Parameter(torch.zeros((1, 4)))
+            self.cap_pad_token = nn.Parameter(torch.zeros((1, 4)))
+            self.t_scale = 1.0
+            self.received_ref = None
+            self.received_direct = None
+
+        @staticmethod
+        def t_embedder(timestep):
+            return timestep.new_ones((timestep.shape[0], 4))
+
+        @staticmethod
+        def rope_embedder(position_ids):
+            rope = torch.zeros((position_ids.shape[0], 2))
+            return rope, rope
+
+        def patchify_and_embed(self, _x, _cap, _patch, _f_patch, ref_x, cap_feats_2):
+            self.received_ref = ref_x
+            self.received_direct = cap_feats_2
+            positions = [torch.zeros((32, 3), dtype=torch.int32)]
+            return (
+                [torch.ones((32, 4))],
+                [torch.zeros((32, 4))],
+                [(2, 1, 1)],
+                positions,
+                [torch.zeros((64, 3), dtype=torch.int32)],
+                [torch.zeros(32, dtype=torch.bool)],
+                [torch.zeros(64, dtype=torch.bool)],
+                [torch.full((32, 4), 2.0)],
+            )
+
+        @staticmethod
+        def unified_prepare(x, x_cos, x_sin, cap, cap_cos, cap_sin, *_args):
+            hidden = torch.cat([x, cap], dim=1)
+            cos = torch.cat([x_cos, cap_cos], dim=1)
+            sin = torch.cat([x_sin, cap_sin], dim=1)
+            mask = torch.ones(hidden.shape[:2], dtype=torch.bool)
+            return hidden, cos, sin, mask
+
+        @staticmethod
+        def unpatchify(hidden, _sizes, _patch, _f_patch):
+            return [torch.stack([hidden[0][0, 0], hidden[0][-1, 0]]).reshape(1, 2, 1, 1)]
+
+    model = _Model()
+    reference = torch.ones((1, 1, 1, 1, 1)) if has_reference else None
+    forward_context = SimpleNamespace(ref_latent=reference, direct_condition=torch.ones((1, 1, 4)))
+    with (
+        patch("vllm_omni.diffusion.cache.teacache.extractors.is_forward_context_available", return_value=True),
+        patch("vllm_omni.diffusion.cache.teacache.extractors.get_forward_context", return_value=forward_context),
+    ):
+        context = extract_ming_image_context(
+            model,
+            x=[torch.zeros((1, 1, 1, 1))],
+            t=torch.zeros(1),
+            cap_feats=[torch.zeros((1, 4))],
+        )
+
+    received_ref = model.received_ref
+    assert (received_ref is not None) == has_reference
+    if has_reference:
+        assert received_ref is not None
+        assert reference is not None
+        assert torch.equal(received_ref[0], reference[0])
+    received_direct = model.received_direct
+    assert received_direct is not None
+    assert torch.equal(received_direct[0], forward_context.direct_condition[0])
+    assert context.hidden_states.shape == (1, 96, 4)
+    output, metadata = context.postprocess(context.run_transformer_blocks()[0])
+    assert output[0].shape == (1, 1, 1, 1)
+    assert output[0].item() == 2.0
+    assert metadata == {}
 
 
 class BaseExtractorTest(ABC):

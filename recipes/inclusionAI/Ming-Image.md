@@ -139,3 +139,69 @@ jq -r '.choices[0].message.content[].image_url.url | split(",")[1]' response.jso
 - A non-empty `negative_prompt` is rejected; Ming-Image uses zero negative conditioning.
 - Height and width must be divisible by 16.
 - Returned images retain the checkpoint's four RGBA channels.
+
+## Step caching
+
+Step caching is disabled by default. To enable it for serving, pass the cache backend and its JSON threshold configuration on the command line. The step cache runs in the diffusion stage.
+
+```bash
+# Design: TeaCache 0.30
+vllm serve inclusionAI/Ming-Image-0.1-Design --omni \
+  --deploy-config vllm_omni/deploy/ming_image.yaml \
+  --cache-backend tea_cache \
+  --cache-config '{"rel_l1_thresh":0.3}' \
+  --port 8091
+
+# Design: Cache-DiT 0.16
+vllm serve inclusionAI/Ming-Image-0.1-Design --omni \
+  --deploy-config vllm_omni/deploy/ming_image.yaml \
+  --cache-backend cache_dit \
+  --cache-config '{"residual_diff_threshold":0.16}' \
+  --port 8091
+
+# Design-Layer: TeaCache 0.13
+vllm serve inclusionAI/Ming-Image-0.1-Design-Layer --omni \
+  --deploy-config vllm_omni/deploy/ming_image.yaml \
+  --cache-backend tea_cache \
+  --cache-config '{"rel_l1_thresh":0.13}' \
+  --port 8091
+
+# Design-Layer: Cache-DiT 0.16
+vllm serve inclusionAI/Ming-Image-0.1-Design-Layer --omni \
+  --deploy-config vllm_omni/deploy/ming_image.yaml \
+  --cache-backend cache_dit \
+  --cache-config '{"residual_diff_threshold":0.16}' \
+  --port 8091
+```
+
+In these measured runs, Design TeaCache 0.30 reduced E2E latency by 6.8%, Design Cache-DiT 0.16 by 23.5%, Design-Layer TeaCache 0.13 by 18.7%, and Design-Layer Cache-DiT 0.16 by 23.3% versus no cache.
+
+Representative online runs on 2×H100 80 GB (vLLM 0.30.0, 1024×1024, 12 steps, concurrency 1):
+
+For Design, all profiles use one shared no-cache control: the same 1024×1024 botanical-poster prompt, CFG 1.0, 12 steps, and seed 42.
+
+### Design
+
+| Profile | E2E s | Stage 1 ms | req/s | SSIM / PSNR dB / LPIPS |
+| --- | ---: | ---: | ---: | ---: |
+| No cache | 2.219 | 1,596 | 0.451 | — |
+| TeaCache 0.20 | 2.202 | 1,589 | 0.454 | 0.953 / 24.70 / 0.018 |
+| TeaCache 0.30 | 2.068 | 1,465 | 0.484 | 0.948 / 24.51 / 0.021 |
+| Cache-DiT 0.10 | 2.206 | 1,591 | 0.453 | 0.953 / 24.70 / 0.018 |
+| Cache-DiT 0.16 | 1.698 | 1,289 | 0.589 | 0.853 / 19.11 / 0.095 |
+| Cache-DiT 0.20 | 1.783 | 1,291 | 0.561 | 0.840 / 18.73 / 0.114 |
+| Cache-DiT 0.24 | 1.988 | 1,238 | 0.503 | 0.787 / 17.20 / 0.146 |
+
+### Design-Layer
+
+One fixed reference image and prompt, CFG 2.0, one warmup and three measured runs per profile, sharing one no-cache control.
+
+| Profile | E2E s | Stage 1 ms | req/s | SSIM / PSNR dB / LPIPS |
+| --- | ---: | ---: | ---: | ---: |
+| No cache | 12.723 | 10,813 | 0.079 | — |
+| TeaCache 0.10 | 12.524 | 10,754 | 0.080 | 1.000 / ∞ / 0.000 |
+| TeaCache 0.13 | 10.343 | 8,547 | 0.097 | 0.988 / 22.06 / 0.011 |
+| TeaCache 0.15 | 8.869 | 6,959 | 0.113 | 0.812 / 12.18 / 0.303 |
+| Cache-DiT 0.16 | 9.764 | 7,986 | 0.102 | 0.991 / 28.06 / 0.007 |
+| Cache-DiT 0.20 | 8.770 | 7,503 | 0.114 | 0.986 / 25.94 / 0.009 |
+| Cache-DiT 0.24 | 8.772 | 7,160 | 0.114 | 0.990 / 26.01 / 0.008 |
