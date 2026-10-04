@@ -624,3 +624,70 @@ def test_locked_driving_audio_is_clean_and_unchanged_during_denoising():
     assert len(seen) == 2
     torch.testing.assert_close(result_audio, audio)
     assert not torch.equal(result_video, video)
+
+
+@pytest.mark.parametrize("locked_audio", [False, True])
+@pytest.mark.parametrize("edit_targets", [False, True])
+def test_timestep_positions_preserve_interleaved_conditions(locked_audio, edit_targets):
+    from vllm_omni.diffusion.models.minimax_h3.denoise_loop import MiniMaxH3DenoiseBranch
+
+    packed = {
+        "seq_len": torch.tensor(12),
+        "img_pos": torch.tensor([2, 4, 6, 8]),
+        "audio_pos": torch.tensor([3, 5, 7]),
+        "text_pos": torch.tensor([0, 1]),
+        "update_mask": torch.tensor([False, True, False, True]),
+        "audio_update_mask": torch.tensor([True, False, True]),
+        "cu_seqlens": torch.tensor([0, 9, 12], dtype=torch.int32),
+        "img_position_ids": torch.zeros(12, 3, dtype=torch.long),
+        "latent_grid": torch.tensor([1, 1, 4]),
+        "video_row_start": torch.tensor(2),
+    }
+    branch = MiniMaxH3DenoiseBranch(
+        packed=packed,
+        text_embeddings=torch.zeros(2, _HIDDEN),
+        token_tags=torch.zeros(12, dtype=torch.long),
+        device=torch.device("cpu"),
+    )
+    if locked_audio:
+        branch.locked_audio_rows = torch.zeros(2, 32)
+    output = torch.empty(12)
+    for video_time, audio_time in [(0.0, 0.0), (0.31, 0.72), (1.0, 1.0)]:
+        video_targets = torch.tensor([0.2, 0.8]) if edit_targets else None
+        audio_targets = torch.tensor([0.4, 0.6]) if edit_targets else None
+        branch.fill_timesteps(
+            output,
+            t_video=video_time,
+            t_audio=audio_time,
+            imgvid_cond_timestep=0.999,
+            audio_ref_cond_timestep=1.0,
+            video_target_timesteps=video_targets,
+            audio_target_timesteps=audio_targets,
+        )
+        expected = torch.full((12,), video_time)
+        expected[[2, 6]] = 0.999
+        expected[[4, 8]] = video_targets if edit_targets else video_time
+        expected[[3, 7]] = audio_targets if edit_targets else (1.0 if locked_audio else audio_time)
+        expected[5] = 1.0
+        assert torch.equal(output, expected)
+    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU]) as profile:
+        branch.fill_timesteps(
+            output,
+            t_video=0.5,
+            t_audio=0.5,
+            imgvid_cond_timestep=0.999,
+            audio_ref_cond_timestep=1.0,
+        )
+    keys = {event.key for event in profile.key_averages()}
+    assert "aten::fill_" in keys
+    assert "aten::index_fill_" in keys
+    assert "aten::nonzero" not in keys
+    with pytest.raises(ValueError, match="video_target_timesteps rows 1 != target rows 2"):
+        branch.fill_timesteps(
+            output,
+            t_video=0.5,
+            t_audio=0.5,
+            imgvid_cond_timestep=0.999,
+            audio_ref_cond_timestep=1.0,
+            video_target_timesteps=torch.zeros(1),
+        )
