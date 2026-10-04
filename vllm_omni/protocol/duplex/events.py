@@ -349,6 +349,36 @@ class PlaybackAcknowledged(RealtimeEvent):
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
+class InputProcessed(RealtimeEvent):
+    """Input-clocked sessions: the acknowledgement of a client input, in input order.
+
+    Sent once for every ``input_audio_buffer.append``, ``input_audio_buffer.commit``
+    and ``response.create`` of a session with ``extra_body.clock == "input"``,
+    only after every output that input caused has been sent. ``audio_end_ms`` is
+    the total input audio received so far, ``unit_end_ms`` the input covered by
+    the model units finished so far (completed by the model, or settled), and
+    ``units`` the units finished since the previous acknowledgement, oldest
+    first: ``{"end_ms", "decision"}``, plus ``"reason"`` for a unit settled as
+    ``cancelled``, ``aborted`` or ``timed_out`` (a ``dropped`` unit has no
+    reason). A session teardown acknowledges all inputs still owed with one
+    event that also carries ``first_input_index``.
+    """
+
+    wire_type = "input_audio_buffer.processed"
+    optional_wire_fields = frozenset({"first_input_index"})
+
+    audio_end_ms: int = 0
+    unit_end_ms: int = 0
+    #: 1-based position of the acknowledged input among this session's acknowledged inputs.
+    input_index: int = 0
+    #: Teardown only: the first of the inputs (``first_input_index`` .. ``input_index``) this event acknowledges.
+    first_input_index: int | None = None
+    #: Client event type acknowledged (``input_audio_buffer.append`` / ``.commit`` / ``response.create``).
+    trigger: str = ""
+    units: tuple[Mapping[str, object], ...] = ()
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
 class DuplexRawEvent(RealtimeEvent):
     """A session-internal event with no dedicated Realtime type (``duplex.<internal type>``)."""
 
@@ -422,6 +452,7 @@ __all__ = [
     "TranscriptDelta",
     # Tier 3 --- vLLM-Omni only.
     "DuplexRawEvent",
+    "InputProcessed",
     "Listen",
     "OverlapDecision",
     "PlaybackAcknowledged",
