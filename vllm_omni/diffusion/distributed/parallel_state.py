@@ -392,9 +392,10 @@ def init_world_group(ranks: list[int], local_rank: int, backend: str) -> GroupCo
 def init_distributed_environment(
     world_size: int = -1,
     rank: int = -1,
-    distributed_init_method: str = "env://",
     local_rank: int = -1,
     backend: str | None = None,
+    *,
+    distributed_init_method: str,
 ):
     if backend is None:
         backend = current_omni_platform.dist_backend

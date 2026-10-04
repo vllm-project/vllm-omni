@@ -682,7 +682,7 @@ def _test_cfg_parallel_worker(
         }
     )
 
-    init_distributed_environment()
+    init_distributed_environment(distributed_init_method="env://")
     initialize_model_parallel(cfg_parallel_size=cfg_parallel_size)
     assert get_classifier_free_guidance_world_size() == cfg_parallel_size
 
@@ -737,7 +737,7 @@ def _test_cfg_sequential_worker(
         }
     )
 
-    init_distributed_environment()
+    init_distributed_environment(distributed_init_method="env://")
     initialize_model_parallel(cfg_parallel_size=1)
     assert get_classifier_free_guidance_world_size() == 1
 
@@ -793,7 +793,7 @@ def _test_multi_branch_parallel_worker(
         }
     )
 
-    init_distributed_environment()
+    init_distributed_environment(distributed_init_method="env://")
     initialize_model_parallel(cfg_parallel_size=cfg_parallel_size)
     assert get_classifier_free_guidance_world_size() == cfg_parallel_size
 
@@ -847,7 +847,7 @@ def _test_multi_branch_sequential_worker(
         }
     )
 
-    init_distributed_environment()
+    init_distributed_environment(distributed_init_method="env://")
     initialize_model_parallel(cfg_parallel_size=1)
     assert get_classifier_free_guidance_world_size() == 1
 

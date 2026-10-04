@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """Tests for Ulysses + Ring sequence-parallel attention correctness.
 
@@ -652,7 +652,7 @@ def ulysses_attention_on_test_model(
         }
     )
     # Initialize distributed environment
-    init_distributed_environment()
+    init_distributed_environment(distributed_init_method="env://")
 
     # Set up OmniDiffusionConfig with parallel config
     parallel_config = DiffusionParallelConfig(

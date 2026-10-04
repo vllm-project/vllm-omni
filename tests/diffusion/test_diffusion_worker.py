@@ -45,7 +45,7 @@ def mock_gpu_worker(mocker: MockerFixture, mock_od_config):
     """Create a DiffusionWorker with mocked initialization."""
     mocker.patch.object(DiffusionWorker, "init_device")
     mocker.patch.object(DiffusionWorker, "load_model")
-    worker = DiffusionWorker(local_rank=0, rank=0, od_config=mock_od_config)
+    worker = DiffusionWorker(local_rank=0, rank=0, od_config=mock_od_config, distributed_init_method="env://")
     # Mock the model_runner with pipeline
     worker.model_runner = mocker.Mock()
     worker.model_runner._kv_receive_progress = None

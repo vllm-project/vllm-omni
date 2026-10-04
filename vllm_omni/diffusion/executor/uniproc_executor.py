@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """In-process diffusion executor for single-GPU deployments.
 
@@ -70,6 +70,7 @@ class UniProcDiffusionExecutor(DiffusionExecutor):
             worker_extension_cls=self.od_config.worker_extension_cls,
             custom_pipeline_args=getattr(self.od_config, "custom_pipeline_args", None),
             base_worker_class=resolve_obj_by_qualname(worker_cls_path),
+            distributed_init_method="env://",
         )
         logger.info("Diffusion worker initialized in-process (uniproc executor)")
 
