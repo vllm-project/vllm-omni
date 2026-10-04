@@ -23,6 +23,7 @@ import pytest
 import torch
 import torch.nn as nn
 
+from tests.helpers.cpu_threads import single_threaded_cpu as single_threaded_cpu
 from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.hifigan import (
     CausalConvRNNF0Predictor,
     CausalHiFTGenerator,
@@ -33,7 +34,7 @@ from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.hifigan import (
 from vllm_omni.model_executor.models.cosyvoice3.cosyvoice3_code2wav import CosyVoice3Code2Wav
 from vllm_omni.platforms import current_omni_platform
 
-pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.usefixtures("single_threaded_cpu")]
 
 CHUNK_LEN = 24
 TOTAL_MEL = 96

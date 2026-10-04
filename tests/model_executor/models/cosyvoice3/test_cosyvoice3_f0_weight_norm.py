@@ -7,9 +7,11 @@ import torch
 from torch import nn
 from torch.nn.utils import parametrize
 
+from tests.helpers.cpu_threads import single_threaded_cpu as single_threaded_cpu
 from vllm_omni.model_executor.models.cosyvoice3.code2wav_core import hifigan
 
 pytestmark = [
+    pytest.mark.usefixtures("single_threaded_cpu"),
     pytest.mark.core_model,
     pytest.mark.filterwarnings("ignore:.*weight_norm.*:FutureWarning"),
 ]
