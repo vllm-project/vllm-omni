@@ -342,7 +342,11 @@ class BatchedToken2Wav(nn.Module):
         self._cfm_graph_wrapper: CFMGraphWrapper | None = None
         self._whole_euler_graph_wrapper: WholeEulerCFMGraphWrapper | None = None
         cfm_graph_cfg = dict(cfm_graph_config or {})
-        if bool(cfm_graph_cfg.get("enabled", False)):
+        # Graph capture can be provided by the platform instead of the CUDA
+        # wrapper above (on NPU it is the platform graph runner), so keep the
+        # request flag separate: bucketing and padding key off this.
+        self._cfm_graph_enabled = bool(cfm_graph_cfg.get("enabled", False))
+        if self._cfm_graph_enabled:
             flow_parameter = next(self.flow.parameters(), None)
             if flow_parameter is not None and flow_parameter.device.type == "cuda":
                 estimator = self.flow.decoder.estimator
@@ -407,7 +411,12 @@ class BatchedToken2Wav(nn.Module):
         # space stays small (0 disables bucketing, e.g. when graphs are off).
         self._cfm_graph_bucket_frames = (
             int(cfm_graph_cfg.get("bucket_frames", 0))
-            if (self._cfm_graph_wrapper is not None or self._whole_euler_graph_wrapper is not None)
+            if (
+                self._cfm_graph_wrapper is not None
+                or self._whole_euler_graph_wrapper is not None
+                # NPU has no wrappers; the platform runner is keyed by this flag.
+                or self._cfm_graph_enabled
+            )
             else 0
         )
         if self._cfm_graph_bucket_frames > 1:
@@ -860,6 +869,10 @@ class BatchedToken2Wav(nn.Module):
         else:
             offset = int(att_cache.shape[4]) if att_cache is not None else 0
         mel_frames = int(mu.shape[2])
+        # Padding only pays off while replay is active: whole-Euler replay,
+        # or the CFM wrapper (`_disable` keeps the object alive, so check its
+        # flag) with no TRT stepper in the way. On NPU there is no wrapper and
+        # the platform runner is keyed by `_cfm_graph_enabled`.
         graphs_active = valid_lengths is None and (
             self._whole_euler_active()
             or (
@@ -867,6 +880,7 @@ class BatchedToken2Wav(nn.Module):
                 and getattr(self._cfm_graph_wrapper, "enabled", True)
                 and self._trt_stepper is None
             )
+            or (self._cfm_graph_wrapper is None and self._cfm_graph_enabled)
         )
         pad_frames = _cfm_pad_frames(
             mel_frames=mel_frames,

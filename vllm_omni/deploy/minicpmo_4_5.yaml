@@ -19,7 +19,12 @@ connectors:
       connector_get_sleep_s: 0.01
       connector_get_max_wait_first_chunk: 3000
       connector_get_max_wait: 300
-      codec_chunk_frames: 25
+      # Steady-state payload length in codec frames.
+      codec_chunk_frames: 75
+      # Smaller first payload so the first audio packet is emitted earlier.
+      # Takes effect only when initial < codec_chunk_frames; values far below
+      # the steady-state chunk length add a seam between chunks and hurt WER.
+      initial_codec_chunk_frames: 25
       codec_left_context_frames: 3
       # HiFT capture buckets are derived from codec_chunk_frames and
       # codec_left_context_frames. (#5869)
@@ -41,6 +46,11 @@ stages:
     # Leave headroom on the shared GPU for Talker KV + concurrent Code2Wav.
     gpu_memory_utilization: 0.55
     enforce_eager: false
+    # Stage-level prefix caching is NPU-only (see platforms.npu below): in the
+    # platform-shared block it killed the stage-1 replica on CUDA (empty tts
+    # handoff, then an indexSelectSmallIndex device assert). Stage-0 n-gram
+    # speculation stays off either way -- the omni prefix cache refuses it next
+    # to enable_prefix_caching.
     tensor_parallel_size: 1
     max_num_batched_tokens: 16384
     devices: "0"
@@ -127,16 +137,53 @@ platforms:
   npu:
     stages:
       - stage_id: 0
+        # Keep the three stages' concurrency caps aligned so the top tier is
+        # not gated by a single stage.
+        max_num_seqs: 8
         max_num_batched_tokens: 8192
+        # Moved here from the platform-shared block; see the base stage note.
+        # Duplex KV window (window_kv.py) requires prefix caching disabled.
+        enable_prefix_caching: false
         compilation_config:
+          # A full decode-step graph keeps in-graph sampling and multi-frame
+          # expansion. The static-shape builder gates its runtime buckets on
+          # the decode graph mode, so PIECEWISE also runs here (K included,
+          # verified on 910B1). This is stage 0 and it ships PIECEWISE; the
+          # K-step's measured RTF win is FULL-only on stage 1, which ships
+          # FULL_DECODE_ONLY below. Stage-0 data point for scale (910B1):
+          # PIECEWISE without K is +75% RTF at 32/1 versus FULL_DECODE_ONLY
+          # with K=8.
           cudagraph_mode: PIECEWISE
       - stage_id: 1
+        # Concurrency cap raised from 4 to 8; the override block only covered
+        # stages 0 and 2, so stage 1 kept the base value of 4.
+        max_num_seqs: 8
         max_num_batched_tokens: 8192
+        # Multi-frame decode: 8 codec frames per step. NPU-only -- only the NPU
+        # worker intercepts the step and injects the constant continue drafts,
+        # so the block stays in this section. stop_token_ids below is the
+        # two-wide continue/stop id that head emits; drop the block (or set it
+        # to null) for one frame per step, and drop that id with it.
+        speculative_config:
+          method: ngram
+          num_speculative_tokens: 7
+          prompt_lookup_min: 1
+          prompt_lookup_max: 1
+        async_scheduling: false
+        default_sampling_params:
+          # The Talker's stop head emits this id to finish a request.
+          stop_token_ids: [1]
         compilation_config:
-          cudagraph_mode: PIECEWISE
+          cudagraph_mode: FULL_DECODE_ONLY
       - stage_id: 2
+        max_num_seqs: 8
         # Stage 2 stays outer-eager and captures only exact-shape CFM DiT
         # estimator kernels through the NPU platform patch.
         additional_config:
           code2wav_enable_npu_graph: true
-          code2wav_max_npu_graphs: 32
+          # NPU graph pool raised from 32 to 64. Once the 32 captured shapes are
+          # exhausted, later shapes permanently degrade to eager. The CFM mel
+          # bucketing already present in main (cfm_graph_bucket_frames: 16) keeps
+          # the captured shape count at 19, which is what makes a pool this size
+          # sustainable.
+          code2wav_max_npu_graphs: 64

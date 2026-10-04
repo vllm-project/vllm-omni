@@ -54,11 +54,54 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
     _omni_enum = OmniPlatformEnum.NPU
     dist_backend: str = "hccl"
 
+    @classmethod
+    def get_attn_backend_cls(cls, selected_backend, attn_selector_config, num_heads: int | None = None):
+        """Route short-context decoders onto the static-shape decode backend.
+
+        Under FULL_DECODE_ONLY the captured decode step has to re-issue attention on
+        every layer on every step, because the op takes the KV length as a host
+        argument that grows each step. On the small Talker decoder that rebind is
+        most of its busy time. Scoped by ``max_model_len`` (Talker 4096 engages,
+        a 32768-token Thinker does not), which is the only thing that decides: the
+        backend declines above the ceiling, so nothing else changes. The 910B
+        family also needs it to capture at all: with the K-step armed the stock
+        capture path faults there (acl 507035).
+        """
+        resolved = super().get_attn_backend_cls(selected_backend, attn_selector_config, num_heads)
+        if resolved != "vllm_ascend.attention.attention_v1.AscendAttentionBackend":
+            return resolved
+        from vllm.config import get_current_vllm_config
+
+        from vllm_omni.platforms.npu.attention import static_shape_decode
+
+        vllm_config = get_current_vllm_config()
+        max_model_len = getattr(getattr(vllm_config, "model_config", None), "max_model_len", None)
+        block_size = getattr(getattr(vllm_config, "cache_config", None), "block_size", None)
+        capacity = static_shape_decode.capacity_for(max_model_len, block_size) if max_model_len and block_size else None
+        static_shape_decode.install_into_ascend_aclgraph()
+        if capacity:
+            logger.info(
+                "[minicpmo] static-shape decode attention on (max_model_len=%s, kv_capacity=%s)",
+                max_model_len,
+                capacity,
+            )
+        else:
+            # The backend class is still returned; it declines for this
+            # max_model_len, so no bucket is captured and nothing engages.
+            logger.info(
+                "[minicpmo] static-shape decode attention not engaged (max_model_len=%s is above the context ceiling)",
+                max_model_len,
+            )
+        return "vllm_omni.platforms.npu.attention.static_shape_backend.OmniStaticShapeAttentionBackend"
+
     # conv2d convolution operator in the code2wav module of Qwen3-TTS not being able to run on Aclnn
     def __init__(self) -> None:
         from vllm_ascend.utils import adapt_patch
 
         from vllm_omni.platforms.npu._310p import apply_patches as apply_310p_patches
+        from vllm_omni.platforms.npu.ascend_warmup_patch import (
+            apply_ascend_warmup_patch,
+        )
         from vllm_omni.platforms.npu.models.minicpmo_4_5_code2wav import (
             apply_minicpmo_4_5_code2wav_patch,
         )
@@ -74,6 +117,9 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
         apply_qwen3_tts_patches()
         apply_qwen3_tts_tokenizer_v2_patch()
         apply_310p_patches()
+        # The Triton rejection/penalties warmup guard for multi-frame decode must
+        # be installed before the Ascend kernel warmup runs.
+        apply_ascend_warmup_patch()
 
     @classmethod
     def set_device(cls, device: torch.device) -> None:
