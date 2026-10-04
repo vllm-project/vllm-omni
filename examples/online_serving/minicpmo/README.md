@@ -260,6 +260,11 @@ vllm serve Qwen/Qwen2.5-VL-7B-Instruct \
 
 Generate, evaluate, and summarize:
 
+`omni-duplex-eval generate` requires `--ref-audio` to pin the assistant voice
+across benchmark samples. Pass the model-bundled `assets/HT_ref_audio.wav` when
+you want to score that default voice; regular duplex clients may omit the
+reference and let the server load it.
+
 ```bash
 vllm bench omni-duplex-eval --omni generate \
     --url ws://127.0.0.1:8099/v1/realtime?duplex=1 \
@@ -320,7 +325,8 @@ them unless `--allow-invalid-clock` is explicit.
 ### Shared realtime UI implementation
 
 The `python -m examples.online_serving.minicpmo.realtime_web` command remains
-available with the same MiniCPM defaults and required `--ref-audio`. Its assets
+available with the same MiniCPM defaults. `--ref-audio` is optional: when it is
+omitted, the server uses the model-bundled `assets/HT_ref_audio.wav`. Its assets
 now live in [the shared realtime UI](../realtime_web/README.md), with a dedicated
 `minicpm-native` profile preserving native duplex input, playback ACKs and camera
 frames. Qwen3 uses a separate profile in the same shell, supporting manual STT
