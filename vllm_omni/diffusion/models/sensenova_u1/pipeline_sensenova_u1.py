@@ -1542,7 +1542,7 @@ class SenseNovaU1Pipeline(
                 clear_flash_kv_cache(caches[key])
 
         images = _to_pil(image_prediction)
-        img = images[0] if images else None
+        img = images[0] if len(images) == 1 else images
         metadata = {}
         if think_text:
             metadata["text"] = {"think_text": think_text}
