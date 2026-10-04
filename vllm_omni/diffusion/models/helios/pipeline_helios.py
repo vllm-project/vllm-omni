@@ -14,7 +14,6 @@ from typing import TYPE_CHECKING, Any, ClassVar
 import numpy as np
 import torch
 import torch.nn.functional as F
-from diffusers import AutoencoderKLWan
 from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
 from transformers import AutoConfig, AutoTokenizer, UMT5EncoderModel
@@ -27,6 +26,7 @@ from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.interaction.mixin import InteractionMixin
 from vllm_omni.diffusion.interaction.types import ChunkMediaSpec
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
+from vllm_omni.diffusion.models.helios.autoencoder_kl_wan import HeliosAutoencoderKLWan
 from vllm_omni.diffusion.models.helios.helios_transformer import HeliosTransformer3DModel
 from vllm_omni.diffusion.models.helios.scheduling_helios import HeliosScheduler
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
@@ -214,7 +214,7 @@ class HeliosPipeline(
         self.text_encoder = UMT5EncoderModel.from_pretrained(
             model, subfolder="text_encoder", config=text_enc_cfg, torch_dtype=dtype, local_files_only=local_files_only
         ).to(self.device)
-        self.vae = AutoencoderKLWan.from_pretrained(
+        self.vae = HeliosAutoencoderKLWan.from_pretrained(
             model, subfolder="vae", torch_dtype=torch.float32, local_files_only=local_files_only
         ).to(self.device)
 
