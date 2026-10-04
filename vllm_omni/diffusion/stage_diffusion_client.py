@@ -524,14 +524,28 @@ class StageDiffusionClient(StageClientBase):
 
     def shutdown(self) -> None:
         self._shutting_down = True
+        shutdown_requested = False
         try:
             # A blocking send never returns once the subprocess is gone.
             self._request_socket.send(self._encoder.encode({"type": "shutdown"}), flags=zmq.NOBLOCK)
+            shutdown_requested = True
         except Exception:
             pass
 
         if self._proc_manager is not None and self._proc_manager.proc.is_alive():
-            self._proc_manager.shutdown(timeout=10)
+            if self._proc_manager.distributed_executor_backend == "ray":
+                # Let the subprocess kill its remote actors before terminating it.
+                stopped = shutdown_requested and self._proc_manager.wait_for_shutdown(timeout=10.0)
+                if not stopped:
+                    logger.warning(
+                        "Stage-%d Ray diffusion subprocess did not stop within %.1fs; "
+                        "falling back to signal-based shutdown",
+                        self.stage_id,
+                        10.0,
+                    )
+                    self._proc_manager.shutdown(timeout=10.0)
+            else:
+                self._proc_manager.shutdown(timeout=10.0)
 
         self._request_socket.close(linger=0)
         self._response_socket.close(linger=0)
