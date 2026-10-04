@@ -622,6 +622,8 @@ class Cosmos3CausalAttention(nn.Module):
             num_heads=self.num_heads,
             head_size=self.head_dim,
             causal=True,
+            role="cosmos3.und",
+            role_category="self",
             softmax_scale=1.0 / (self.head_dim**0.5),
             num_kv_heads=self.num_kv_heads,
             skip_sequence_parallel=True,
@@ -726,23 +728,29 @@ class Cosmos3CrossAttention(nn.Module):
             self.norm_q = RMSNorm(self.head_dim, eps=rms_norm_eps)
             self.norm_k = RMSNorm(self.head_dim, eps=rms_norm_eps)
 
+        # Attention consumes the rank-local heads produced by the TP projections.
         self.attn = FrameworkAttention(
-            num_heads=self.num_heads,
+            num_heads=self.num_heads_local,
             head_size=self.head_dim,
             causal=False,
+            # Keep legacy per_role.self routing; exact roles opt into overrides.
+            role="cosmos3.gen",
+            role_category="self",
             softmax_scale=1.0 / (self.head_dim**0.5),
-            num_kv_heads=self.num_kv_heads,
+            num_kv_heads=self.num_kv_heads_local,
         )
         # Multi-control attention operates on one full [control_i, target]
         # sequence at a time. Keep those sequences replicated when Ulysses is
         # active; sharding the concatenated [control_1, ..., control_N, target]
         # layout would split the per-control ranges across ranks.
         self.multi_control_attn = FrameworkAttention(
-            num_heads=self.num_heads,
+            num_heads=self.num_heads_local,
             head_size=self.head_dim,
             causal=False,
+            role="cosmos3.gen_multi_control",
+            role_category="self",
             softmax_scale=1.0 / (self.head_dim**0.5),
-            num_kv_heads=self.num_kv_heads,
+            num_kv_heads=self.num_kv_heads_local,
             prefix=f"{prefix}.multi_control_attn",
             skip_sequence_parallel=True,
         )
@@ -766,7 +774,8 @@ class Cosmos3CrossAttention(nn.Module):
         k_all = torch.cat([k_und, k], dim=1)
         v_all = torch.cat([v_und, v], dim=1)
 
-        out = self.attn(q, k_all, v_all)
+        metadata = AttentionMetadata(extra={"protected_kv_prefix": k_und.shape[1]})
+        out = self.attn(q, k_all, v_all, metadata)
         return out.reshape(B, S_gen, -1)
 
     # -- SP path: framework Attention with joint_key/value -------------------
@@ -806,6 +815,7 @@ class Cosmos3CrossAttention(nn.Module):
             joint_key=k_und,
             joint_value=v_und,
             joint_strategy="front",
+            extra={"protected_kv_prefix": k_und.shape[1]},
         )
         out = self.attn(q, k, v, attn_metadata)
         return out.reshape(B, S_gen, -1)
@@ -843,6 +853,7 @@ class Cosmos3CrossAttention(nn.Module):
         v_target = v[:, control_tokens:]
         control_outputs: list[torch.Tensor] = []
         target_output: torch.Tensor | None = None
+        metadata = AttentionMetadata(extra={"protected_kv_prefix": k_und.shape[1]})
         start = 0
         for size, weight in zip(control_token_sizes, control_weights, strict=True):
             if size <= 0:
@@ -854,7 +865,7 @@ class Cosmos3CrossAttention(nn.Module):
             q_pair = torch.cat([q_control, q_target], dim=1)
             k_pair = torch.cat([k_und, k_control, k_target], dim=1)
             v_pair = torch.cat([v_und, v_control, v_target], dim=1)
-            pair_output = self.multi_control_attn(q_pair, k_pair, v_pair)
+            pair_output = self.multi_control_attn(q_pair, k_pair, v_pair, metadata)
             control_outputs.append(pair_output[:, :size])
             weighted_target = pair_output[:, size:] * weight
             target_output = weighted_target if target_output is None else target_output + weighted_target

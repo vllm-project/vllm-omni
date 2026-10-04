@@ -31,6 +31,7 @@ from vllm_omni.diffusion.attention.parallel.base import NoParallelAttention
 from vllm_omni.diffusion.attention.parallel.ring import RingParallelAttention
 from vllm_omni.diffusion.attention.selector import get_attn_backend_for_role
 from vllm_omni.diffusion.config import get_current_diffusion_config_or_none
+from vllm_omni.diffusion.data import BlockSparseAttentionSpec
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.diffusion_kv.layout import assert_backend_layout_supported
 from vllm_omni.diffusion.distributed.parallel_state import get_sp_group
@@ -114,6 +115,7 @@ class Attention(nn.Module):
         self.num_kv_heads = num_kv_heads if num_kv_heads is not None else num_heads
         self.head_size = head_size
 
+        self.attn_impl_cls: type[AttentionImpl]
         self._has_custom_attention = custom_attention is not None
 
         # Resolve backend via role-aware config.
@@ -187,7 +189,8 @@ class Attention(nn.Module):
                 )
             self.attn_spec = spec
             if spec is not None:
-                backend_kwargs = spec.backend_kwargs()
+                if not isinstance(spec, BlockSparseAttentionSpec):
+                    backend_kwargs = spec.backend_kwargs()
                 self.backend_pref = spec.backend
                 self.backend_explicit = True
                 logger.debug("Attention(role=%s) → backend=%s", role, spec.backend)
@@ -197,33 +200,56 @@ class Attention(nn.Module):
                 self.backend_pref = attn_backend_cls.get_name()
                 logger.debug("Attention(role=%s) → platform default (%s)", role, self.backend_pref)
 
-            self.attn_backend: type[AttentionBackend] | None = attn_backend_cls
-            self.attn_impl_cls = self.attn_backend.get_impl_cls()
-            if impl_overrides is not None:
-                override = impl_overrides.get(attn_backend_cls.get_name())
-                if override is not None:
-                    if not issubclass(override, self.attn_impl_cls):
-                        raise TypeError(
-                            f"Attention implementation override {override.__qualname__} must subclass "
-                            f"the selected implementation {self.attn_impl_cls.__qualname__} "
-                            f"for backend {attn_backend_cls.__qualname__}"
-                        )
-                    self.attn_impl_cls = override
-            self.attention = self.attn_impl_cls(
-                num_heads=num_heads,
-                head_size=head_size,
-                softmax_scale=softmax_scale,
-                causal=causal,
-                num_kv_heads=num_kv_heads,
-                qkv_layout=qkv_layout,
-                prefix=prefix,
-                backend_kwargs=backend_kwargs,
-                role=role,
-                backend_explicit=self.backend_explicit,
-            )
+            self.attn_backend = attn_backend_cls
+            if isinstance(spec, BlockSparseAttentionSpec):
+                from vllm_omni.diffusion.attention.block_sparse import BlockSparseAttention, BlockSparseBackend
+
+                if impl_overrides and attn_backend_cls.get_name() in impl_overrides:
+                    raise ValueError("Block-sparse attention does not support dense implementation overrides")
+                adapter_cls = attn_backend_cls.get_block_sparse_adapter()
+                if adapter_cls is None:
+                    raise ValueError("Selected provider has no adapter for the shared block selection")
+                self.attention = BlockSparseAttention(
+                    num_heads,
+                    num_heads if num_kv_heads is None else num_kv_heads,
+                    head_size,
+                    softmax_scale,
+                    causal,
+                    qkv_layout,
+                    spec,
+                    adapter=adapter_cls(),
+                )
+                self.attn_impl_cls = BlockSparseAttention
+                # Expose the selected method's capabilities, not the dense
+                # provider's packed/piecewise/paged declarations.
+                self.attn_backend = BlockSparseBackend
+            else:
+                self.attn_impl_cls = self.attn_backend.get_impl_cls()
+                if impl_overrides is not None:
+                    override = impl_overrides.get(attn_backend_cls.get_name())
+                    if override is not None:
+                        if not issubclass(override, self.attn_impl_cls):
+                            raise TypeError(
+                                f"Attention implementation override {override.__qualname__} must subclass "
+                                f"the selected implementation {self.attn_impl_cls.__qualname__} "
+                                f"for backend {attn_backend_cls.__qualname__}"
+                            )
+                        self.attn_impl_cls = override
+                self.attention = self.attn_impl_cls(
+                    num_heads=num_heads,
+                    head_size=head_size,
+                    softmax_scale=softmax_scale,
+                    causal=causal,
+                    num_kv_heads=num_kv_heads,
+                    qkv_layout=qkv_layout,
+                    prefix=prefix,
+                    backend_kwargs=backend_kwargs,
+                    role=role,
+                    backend_explicit=self.backend_explicit,
+                )
             # Compatibility kernels run inside shared dispatch, between the
             # parallel strategy's input preparation and output restoration.
-            self.sdpa_fallback: AttentionImpl | None = SDPABackend.get_impl_cls()(
+            self.sdpa_fallback = SDPABackend.get_impl_cls()(
                 num_heads=num_heads,
                 head_size=head_size,
                 softmax_scale=softmax_scale,
@@ -483,6 +509,9 @@ class Attention(nn.Module):
                 "Only the startup KV memory profile may execute before paged KV initialization."
             )
         use_paged_attention = paged_adapter is not None and self.paged_kv_cache_role is not None
+        if isinstance(self.attn_spec, BlockSparseAttentionSpec):
+            if use_paged_attention or (strategy is not self._no_parallel_strategy and strategy.enabled):
+                raise ValueError("Block-sparse attention does not support paged KV or sequence parallel execution")
         if use_paged_attention and not getattr(self.attn_backend, "supports_paged_kv", False):
             backend_name = (
                 self.attn_backend.get_name() if self.attn_backend is not None else type(self.attention).__name__

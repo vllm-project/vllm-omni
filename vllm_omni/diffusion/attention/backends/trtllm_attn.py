@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import functools
 import math
 from dataclasses import dataclass, replace
 from typing import NamedTuple, cast
@@ -13,8 +14,11 @@ from vllm_omni.diffusion.attention.backends.abstract import (
     AttentionBackend,
     AttentionImpl,
     AttentionMetadata,
+    BlockSparseAdapter,
     PackedPaddingMetadata,
 )
+from vllm_omni.diffusion.attention.block_selection.abstract import BlockSelection
+from vllm_omni.diffusion.attention.capabilities import CompilationMode
 
 logger = init_logger(__name__)
 
@@ -156,7 +160,141 @@ def _workspace_bytes() -> int:
     return getattr(envs, "VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE", 394 * 1024 * 1024)
 
 
+def _selected_block_bits(selection: BlockSelection, key_blocks: int) -> torch.Tensor:
+    """Convert per-head indices/counts to PrimTS exact-route UInt32 words.
+
+    Active IDs are sorted, unique and in range by the shared selector contract.
+    Inactive storage may contain arbitrary values and must never become a route.
+    """
+    indices, counts = selection
+    active = torch.arange(indices.shape[-1], device=indices.device) < counts[..., None]
+    safe = torch.where(active, indices, 0).long()
+    words = torch.zeros(*counts.shape, (key_blocks + 31) // 32, device=indices.device, dtype=torch.int64)
+    bits = torch.bitwise_left_shift(torch.ones_like(safe), safe % 32) * active
+    words.scatter_add_(-1, safe // 32, bits)
+    return words.to(torch.uint32)
+
+
+if not hasattr(torch.ops.vllm_omni, "trtllm_selected_attention"):
+
+    @torch.library.custom_op("vllm_omni::trtllm_selected_attention", mutates_args=())
+    def _trtllm_selected_attention_op(
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        indices: torch.Tensor,
+        counts: torch.Tensor,
+        scale: float,
+        block_q: int,
+        block_kv: int,
+    ) -> torch.Tensor:
+        return TrtllmSparseAdapter._run(query, key, value, BlockSelection(indices, counts), scale, (block_q, block_kv))
+
+    @_trtllm_selected_attention_op.register_fake
+    def _trtllm_selected_attention_fake(query, key, value, indices, counts, scale, block_q, block_kv):
+        return query.new_empty((*query.shape[:-1], value.shape[-1]))
+
+
+_trtllm_selected_attention_op = torch.ops.vllm_omni.trtllm_selected_attention
+
+
+class TrtllmSparseAdapter(BlockSparseAdapter):
+    """Draft exact-route PrimTS adapter; actual kernel validation needs Blackwell.
+
+    Uses FlashInfer's public task-scheduled API, separate from the dense
+    TRTLLM-GEN and skip-softmax paths below. Plans/workspaces stay invocation-local.
+    """
+
+    provider = "TRTLLM_ATTN"
+    kernel_variant = "prims_ts_block_sparse"
+    compilation_mode = CompilationMode.CUSTOM_OP
+
+    @staticmethod
+    @functools.cache
+    def _load_api():
+        import flashinfer
+        from flashinfer.attention.prims_ts import BlockSparseTSWrapper
+
+        return BlockSparseTSWrapper, flashinfer.__version__
+
+    @staticmethod
+    def validate_selection(implementation: str, head_size: int) -> None:
+        if implementation != "auto":
+            raise ValueError("PrimTS BlockSparseTSWrapper has no kernel-ID interface; use implementation='auto'")
+
+    def prepare(
+        self,
+        implementation: str,
+        head_size: int,
+        num_heads: int,
+        num_kv_heads: int,
+        device: torch.device,
+        block_size: tuple[int, int],
+    ) -> None:
+        self.validate_selection(implementation, head_size)
+        if num_heads != num_kv_heads:
+            raise ValueError("TRT-LLM block-sparse adapter requires MHA; per-query-head GQA/MQA is unsupported")
+        if device.type != "cuda":
+            raise ValueError("TRT-LLM block-sparse adapter requires CUDA")
+        _, self.dependency_version = self._load_api()
+
+    def validate_inputs(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor) -> None:
+        if query.shape[2] != key.shape[2]:
+            raise ValueError("TRT-LLM block-sparse adapter requires MHA; per-query-head GQA/MQA is unsupported")
+        # The planning API has one head_dim for Q/K/V, independent of which
+        # numeric dimensions the installed kernel supports.
+        if value.shape[-1] != query.shape[-1]:
+            raise ValueError("PrimTS planning accepts one Q/K/V head dimension")
+
+    @classmethod
+    def _run(cls, query, key, value, selection, scale, block_size):
+        wrapper_cls, _ = cls._load_api()
+        bq, bkv = block_size
+        bits = _selected_block_bits(selection, (key.shape[1] + bkv - 1) // bkv)
+        # The plan owns mutable routing scratch. Fresh ownership prevents races
+        # between requests, streams and layer copies; no pattern is cached.
+        wrapper = wrapper_cls()
+        wrapper.plan(
+            batch_size=query.shape[0],
+            seq_len_q=query.shape[1],
+            seq_len_kv=key.shape[1],
+            num_qo_heads=query.shape[2],
+            num_kv_heads=key.shape[2],
+            head_dim=query.shape[-1],
+            q_block_size=bq,
+            kv_block_size=bkv,
+            device=query.device,
+            max_blocks_per_row=selection.indices.shape[-1],
+            use_kv_valid_bits=False,
+            sparse_format="bitmask",
+            use_proxy_routes=False,
+            mask_type="dense",
+            q_data_type=query.dtype,
+            kv_data_type=key.dtype,
+            o_data_type=query.dtype,
+        )
+        return wrapper.run(
+            query.contiguous(), key.contiguous(), value.contiguous(), exact_block_bits=bits, sm_scale=scale
+        ).contiguous()
+
+    def execute(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        selection: BlockSelection,
+        scale: float,
+        block_size: tuple[int, int],
+    ) -> torch.Tensor:
+        self.validate_inputs(query, key, value)
+        return _trtllm_selected_attention_op(query, key, value, selection.indices, selection.counts, scale, *block_size)
+
+
 class TrtllmAttentionBackend(AttentionBackend):
+    @classmethod
+    def get_block_sparse_adapter(cls) -> type[TrtllmSparseAdapter]:
+        return TrtllmSparseAdapter
+
     accept_output_buffer: bool = True
 
     @classmethod
