@@ -228,7 +228,7 @@ def build_pipeline(tmp_path, monkeypatch):
     monkeypatch.setattr(pipeline_auk, "AuKVAE", _StubVAE)
 
     def _build(
-        variant: str = "base", *, model_config: dict[str, Any] | None = None
+        variant: str = "base", *, model_config: dict[str, Any] | None = None, quantization: str | None = None
     ) -> tuple[AuKPipeline, list[dict[str, Any]]]:
         calls: list[dict[str, Any]] = []
         monkeypatch.setattr(pipeline_auk, "sample_latents", _stub_sampler(calls))
@@ -237,6 +237,7 @@ def build_pipeline(tmp_path, monkeypatch):
             dtype=torch.float32,
             model_class_name="AuKPipeline",
             model_config=model_config or {},
+            quantization_config=quantization,
         )
         return AuKPipeline(od_config=od_config), calls
 
@@ -302,6 +303,34 @@ class TestRequestParsing:
     def test_invalid_ref_cache_size_is_rejected(self, build_pipeline, size):
         with pytest.raises(ValueError, match="AuK auk_ref_cache_size must be a non-negative integer"):
             build_pipeline(model_config={"auk_ref_cache_size": size})
+
+    def test_dit_stays_in_the_model_dtype_by_default(self, build_pipeline, monkeypatch):
+        monkeypatch.setattr(pipeline_auk, "fp8_supported", lambda device: True)
+        monkeypatch.setattr(pipeline_auk, "quantize_block_linears", lambda dit: pytest.fail("FP8 was not requested"))
+        pipeline, _ = build_pipeline()
+        assert pipeline.dit_fp8 is False
+
+    def test_fp8_quantization_swaps_the_block_linears(self, build_pipeline, monkeypatch):
+        swapped = []
+
+        def record(dit) -> int:
+            swapped.append(dit)
+            return 160
+
+        monkeypatch.setattr(pipeline_auk, "fp8_supported", lambda device: True)
+        monkeypatch.setattr(pipeline_auk, "quantize_block_linears", record)
+        pipeline, _ = build_pipeline(quantization="fp8")
+        assert pipeline.dit_fp8 is True
+        assert swapped == [pipeline.dit]
+
+    def test_fp8_quantization_is_skipped_on_an_unsupported_device(self, build_pipeline, monkeypatch):
+        monkeypatch.setattr(pipeline_auk, "quantize_block_linears", lambda dit: pytest.fail("no FP8 GEMMs on CPU"))
+        pipeline, _ = build_pipeline(quantization="fp8")
+        assert pipeline.dit_fp8 is False
+
+    def test_other_quantization_methods_are_rejected(self, build_pipeline):
+        with pytest.raises(ValueError, match="AuK supports only 'fp8' quantization"):
+            build_pipeline(quantization="int8")
 
     def test_pipeline_declares_audio_output(self, build_pipeline):
         pipeline, _ = build_pipeline()

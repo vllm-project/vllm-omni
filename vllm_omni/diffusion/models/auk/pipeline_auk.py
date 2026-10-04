@@ -37,6 +37,7 @@ from vllm_omni.diffusion.models.auk.auk_transformer import (
 )
 from vllm_omni.diffusion.models.auk.auk_vae import AuKVAE
 from vllm_omni.diffusion.models.auk.cudagraph_wrapper import AuKCUDAGraphWrapper
+from vllm_omni.diffusion.models.auk.fp8_linear import fp8_supported, quantize_block_linears
 from vllm_omni.diffusion.models.auk.vae_cudagraph import AuKVAEDecodeGraph
 from vllm_omni.diffusion.models.interface import (
     SupportAudioInput,
@@ -93,6 +94,16 @@ def get_auk_post_process_func(od_config: OmniDiffusionConfig):
         return audio.cpu().float().numpy()
 
     return post_process_func
+
+
+def _wants_fp8(quant_config: Any) -> bool:
+    """Whether the stage asked for FP8 GEMMs; any other quantization method is rejected."""
+    if quant_config is None:
+        return False
+    name = quant_config.get_name() if hasattr(quant_config, "get_name") else str(quant_config)
+    if name != "fp8":
+        raise ValueError(f"AuK supports only 'fp8' quantization of the DiT, got {name!r}")
+    return True
 
 
 def _prompt_mapping(prompt: Any) -> dict[str, Any]:
@@ -211,6 +222,20 @@ class AuKPipeline(nn.Module, SupportAudioInput, SupportAudioOutput, SupportsComp
         self.dit.load_state_dict(_read_dit_weights(model_dir, self.dtype), strict=True)
         self.dit = self.dit.to(device=self.device).eval()
         self.dit.requires_grad_(False)
+        # Opt-in FP8 GEMMs for the block linears (stage `diffusion_quantization_config: fp8`).
+        # The swap happens before compilation and graph capture, which then see the FP8 modules.
+        self.dit_fp8 = False
+        if _wants_fp8(getattr(od_config, "quantization_config", None)):
+            if fp8_supported(self.device):
+                count = quantize_block_linears(self.dit)
+                self.dit_fp8 = True
+                logger.info("AuK DiT: %d block linears run as FP8 GEMMs", count)
+            else:
+                logger.warning(
+                    "AuK FP8 quantization needs an Ada or Hopper CUDA device; the DiT stays %s on %s",
+                    self.dtype,
+                    self.device,
+                )
         self.cudagraph_wrapper = AuKCUDAGraphWrapper(
             self.dit, enabled=not od_config.enforce_eager, max_graphs=max_dit_graphs
         )
