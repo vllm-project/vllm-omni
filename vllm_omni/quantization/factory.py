@@ -81,6 +81,17 @@ from .component_config import ComponentQuantizationConfig  # noqa: E402
 logger = init_logger(__name__)
 
 
+def _build_fp8(**kw: Any) -> QuantizationConfig:
+    """Keep vLLM FP8 defaults; build explicit online blocks only when requested."""
+    if "online_block_size" in kw:
+        from .online_block_fp8 import OnlineBlockFp8Config
+
+        return OnlineBlockFp8Config(**kw)
+    from vllm.model_executor.layers.quantization.fp8 import Fp8Config
+
+    return Fp8Config(**kw)
+
+
 def _build_int8(**kw: Any) -> QuantizationConfig:
     """Lazy import for Int8 diffusion config (supports CUDA + NPU)."""
     from .int8_config import DiffusionInt8Config
@@ -168,6 +179,7 @@ def _build_torchao_float8_weight_only(**kw: Any) -> QuantizationConfig:
 
 
 _OVERRIDES: dict[str, Callable[..., QuantizationConfig]] = {
+    "fp8": _build_fp8,
     "int8": _build_int8,
     "bitsandbytes": _build_bitsandbytes,
     "mxfp8": _build_mxfp8,

@@ -123,6 +123,9 @@ QUALITY_CONFIGS = [
         model="Tongyi-MAI/Z-Image-Turbo",
         quantization={
             "method": "fp8",
+            # MI300 full-FP8 quality requires finer weight/activation scales.
+            # Keep the original NVIDIA recipe and all model exclusions.
+            **({"online_block_size": 64} if torch.version.hip else {}),
             "ignored_layers": [
                 "img_mlp",
                 *[
