@@ -408,6 +408,17 @@ class DuplexSessionManager:
 
     def sampling_params_for(self, session: DuplexEngineSession) -> tuple[object, ...]:
         defaults = tuple(self.stage_port.sampling_defaults())
+        # Asked for on every append: reuse the configured params until the
+        # runtime config generation or a stage's default object (compared by
+        # identity, so a replaced stage client counts) changes.
+        cached = session.configured_sampling
+        if (
+            cached is not None
+            and cached[0] == session.config_generation
+            and len(cached[1]) == len(defaults)
+            and all(held is default for held, default in zip(cached[1], defaults, strict=True))
+        ):
+            return cached[2]
         configured = self.plugin.configure_sampling_params(
             runtime_config=dict(session.runtime_config),
             defaults=defaults,
@@ -416,6 +427,7 @@ class DuplexSessionManager:
             raise TypeError("duplex plugin must return sampling parameters as a tuple")
         if len(configured) != len(defaults):
             raise ValueError("duplex plugin must return one sampling parameter per stage")
+        session.configured_sampling = (session.config_generation, defaults, configured)
         return configured
 
     @staticmethod

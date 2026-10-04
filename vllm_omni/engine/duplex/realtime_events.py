@@ -113,7 +113,12 @@ class _ResponseProjection:
     transcript_parts: list[str] = field(default_factory=list)
     text_parts: list[str] = field(default_factory=list)
     audio_duration_ms: int | None = None
+    # Sorted by (audio_end_ms, text_chars), one mark per key.
     audio_text_marks: list[dict[str, int]] = field(default_factory=list)
+    # Copies of ``audio_text_marks``, in order, for the in-progress item's
+    # audio part. Valid while the marks only grow at the end; cleared when
+    # they are re-sorted.
+    item_audio_text_marks: list[dict[str, int]] = field(default_factory=list)
     audio_delta_emitted: bool = False
     audio_done_emitted: bool = False
     audio_part_added: bool = False
@@ -358,11 +363,11 @@ def _refresh_in_progress_response_item(state: RealtimeProjectionState, response_
     audio_text_marks = projection.audio_text_marks
     has_audio = projection.audio_part_added or bool(transcript) or audio_duration_ms is not None
     if has_audio:
-        audio_part = _response_item_content_part(
-            transcript=transcript,
-            audio_duration_ms=audio_duration_ms,
-            audio_text_marks=audio_text_marks,
-        )
+        audio_part = _response_item_content_part(transcript=transcript, audio_duration_ms=audio_duration_ms)
+        if audio_text_marks:
+            # The same part _response_item_content_part builds, with the mark
+            # copies made once per mark instead of once per refresh.
+            audio_part["audio_text_marks"] = _in_progress_item_audio_text_marks(projection)
         if content and isinstance(content[0], dict) and content[0].get("type") in {"audio", "output_audio"}:
             content[0] = audio_part
         else:
@@ -382,6 +387,13 @@ def _refresh_in_progress_response_item(state: RealtimeProjectionState, response_
         else:
             content.insert(text_index, text_part)
     _apply_pending_item_truncation(state, item)
+
+
+def _in_progress_item_audio_text_marks(projection: _ResponseProjection) -> list[dict[str, int]]:
+    """Copies of the projection's marks, copying only the marks added since the last call."""
+    copies = projection.item_audio_text_marks
+    copies.extend(dict(mark) for mark in projection.audio_text_marks[len(copies) :])
+    return list(copies)
 
 
 def _append_response_transcript(state: RealtimeProjectionState, response_id: object, text: str) -> None:
@@ -445,7 +457,13 @@ def _remember_response_audio_metadata(
             continue
         clean_marks.append({"text_chars": max(0, int(text_chars)), "audio_end_ms": max(0, int(audio_end_ms))})
     if clean_marks:
-        merged = list(projection.audio_text_marks)
+        existing = projection.audio_text_marks
+        if _marks_extend_in_order(existing, clean_marks):
+            # Every delta usually adds one mark past the last: appending gives
+            # the same sorted, deduplicated list without re-sorting it.
+            existing.extend(clean_marks)
+            return
+        merged = list(existing)
         merged.extend(clean_marks)
         deduped: dict[tuple[int, int], dict[str, int]] = {}
         for mark in merged:
@@ -453,6 +471,13 @@ def _remember_response_audio_metadata(
         projection.audio_text_marks = sorted(
             deduped.values(), key=lambda mark: (mark["audio_end_ms"], mark["text_chars"])
         )
+        projection.item_audio_text_marks = []
+
+
+def _marks_extend_in_order(existing: list[dict[str, int]], marks: list[dict[str, int]]) -> bool:
+    """Whether each of *marks* sorts strictly after the one before it, the first after *existing*."""
+    keys = [(mark["audio_end_ms"], mark["text_chars"]) for mark in [*existing[-1:], *marks]]
+    return all(before < after for before, after in zip(keys, keys[1:]))
 
 
 def _response_created_event(event: Mapping[str, object]) -> ResponseCreated:

@@ -21,6 +21,10 @@ from .base import OmniConnectorBase
 
 logger = get_connector_logger(__name__)
 
+# Where glibc places POSIX shared-memory objects (the lock files live there
+# too). None disables the existence probe on hosts without it.
+_POSIX_SHM_DIR = "/dev/shm" if os.path.isdir("/dev/shm") else None
+
 
 def _wakeup_enabled() -> bool:
     return os.environ.get("VLLM_OMNI_SHM_WAKEUP", "1") == "1"
@@ -250,6 +254,10 @@ class SharedMemoryConnector(OmniConnectorBase):
 
     def _get_by_key(self, get_key: str) -> tuple[Any, int] | None:
         """Read a SHM segment addressed purely by *get_key*."""
+        # Nearly every poll misses; os.access reports that without building a
+        # FileNotFoundError. A segment created after the probe is read next poll.
+        if _POSIX_SHM_DIR is not None and not os.access(f"{_POSIX_SHM_DIR}/{get_key}", os.F_OK):
+            return None
         shm = None
         try:
             shm = shm_pkg.SharedMemory(name=get_key)

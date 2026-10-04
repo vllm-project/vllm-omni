@@ -56,6 +56,7 @@ from vllm_omni.engine.messages import (
     OutputMessage,
 )
 from vllm_omni.engine.orchestrator import OrchestratorBase, _event_driven_orch_default_for_pipeline
+from vllm_omni.engine.output_handoff import LoopHandoffQueue
 from vllm_omni.engine.rpc_result_router import CorrelatedRpcClient
 from vllm_omni.engine.stage_client import StageClient
 from vllm_omni.engine.stage_init_utils import build_stage0_input_processor
@@ -301,7 +302,7 @@ class OmniEngineBase:
         # ``async_q`` lazily binds to whatever event loop first awaits on
         # it (the orchestrator loop), so cross-thread use stays correct.
         self.request_queue: janus.Queue[EngineQueueMessage] = janus.Queue(maxsize=_REQUEST_QUEUE_MAXSIZE)
-        self.output_queue: janus.Queue[EngineQueueMessage] = janus.Queue()
+        self.output_queue: LoopHandoffQueue[EngineQueueMessage] = LoopHandoffQueue()
         self.rpc_output_queue: janus.Queue[EngineQueueMessage] = janus.Queue()
         self._shutdown_called = False
         self._weak_finalizer: weakref.finalize | None = None

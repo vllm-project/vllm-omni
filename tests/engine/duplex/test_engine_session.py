@@ -5,9 +5,12 @@
 
 from __future__ import annotations
 
+import copy
+import dataclasses
 import time
 from collections.abc import Callable
 from dataclasses import FrozenInstanceError
+from types import SimpleNamespace
 
 import pytest
 
@@ -1059,3 +1062,100 @@ def test_finished_drain_keeps_sent_audio_ackable() -> None:
     session.release_finished_drain_response(silent)
     assert silent not in session._conversation.assistant_response_snapshots
     assert f"item_{silent}" not in session._conversation.history_item_placeholders
+
+
+def test_stage_metric_copies_match_deepcopy_and_stay_independent() -> None:
+    session = _session(num_stages=2)
+    session.begin_response()
+    snapshot = {
+        "0": {"num_tokens_out": 2, "vllm_itls_ms": [1.0, 2.0], "finish_reason": None, "extra": {"k": [1, (2, 3)]}},
+        "1": {"inter_output_latencies_ms": [80.0], "output_unit_type": "audio"},
+    }
+    returned = session.accumulate_response_stage_metrics(snapshot)
+
+    assert returned == copy.deepcopy(session._response.stage_metrics)
+    returned["0"]["vllm_itls_ms"].append(99.0)
+    returned["0"]["extra"]["k"].append(4)
+    assert session._response.stage_metrics["0"]["vllm_itls_ms"] == [1.0, 2.0]
+    assert session._response.stage_metrics["0"]["extra"] == {"k": [1, (2, 3)]}
+    snapshot["0"]["extra"]["k"].append(5)
+    assert session._response.stage_metrics["0"]["extra"] == {"k": [1, (2, 3)]}
+
+
+def test_assistant_transcript_chars_track_the_joined_text() -> None:
+    session = _session()
+    session.begin_response()
+    for chunk in ("he", "", "llo", " wörld"):
+        session.append_assistant_text(chunk)
+        assert session.assistant_transcript_chars() == len(session.assistant_transcript())
+    session.end_response(commit_text=False)
+    assert session.assistant_transcript_chars() == 0 == len(session.assistant_transcript())
+
+
+def _legacy_stage_metrics_snapshot(
+    session: DuplexEngineSession, stage_id: int, metrics: StageRequestStats, output: object
+) -> dict[str, dict[str, object]] | None:
+    """``ModelChannel.stage_metrics_snapshot`` as it was: up to two ``replace`` copies (reference only)."""
+    event = metrics
+    if event.stage_id is None:
+        event = dataclasses.replace(event, stage_id=stage_id)
+    if event.final_output_type is None:
+        final_output_type = getattr(output, "final_output_type", None)
+        if isinstance(final_output_type, str):
+            event = dataclasses.replace(event, final_output_type=final_output_type)
+    session.observe_stage_request_stats(stage_id, event)
+    try:
+        merged = OrchestratorAggregator._merge_stage_metric_event(None, event)
+    except Exception:
+        return None
+    return {str(stage_id): merged}
+
+
+def _recorded_stage_events() -> list[tuple[str, int, StageRequestStats | None, object]]:
+    """A PersonaPlex-like run: Stage 0 frames before and inside a response."""
+    events: list[tuple[str, int, StageRequestStats | None, object]] = []
+    stage0_output = SimpleNamespace(final_output_type="text")
+    for index in range(4):  # before any response exists: held
+        stats = _stage_stats(stage_id=0, num_tokens_out=1, vllm_ttft_ms=3.0 + index)
+        stats.stage_id = None
+        stats.final_output_type = None
+        events.append(("stash", 0, stats, stage0_output))
+    events.append(("begin", 0, None, None))
+    for index in range(12):
+        stats = _stage_stats(
+            stage_id=0,
+            num_tokens_out=1,
+            vllm_ttft_ms=0.0 if index % 3 else 2.5,
+            vllm_tpot_ms=1.25 * (index % 2),
+            serving_time_to_first_output_ms=float(index % 4),
+        )
+        stats.stage_id = None if index % 2 else 0
+        stats.final_output_type = None if index % 3 == 0 else "text"
+        stats.finish_reason = "length"
+        stats.vllm_itls_ms = [0.5 * index] * (index % 3)
+        stats.inter_output_latencies_ms = [80.0 + index] if index % 4 == 1 else None
+        events.append(("stash", 0, stats, stage0_output))
+    return events
+
+
+def test_stage_metric_snapshots_match_the_replace_based_ones_on_a_recorded_run() -> None:
+    from vllm_omni.engine.duplex.session.model_channel import ModelChannel
+
+    legacy = _session(num_stages=2, log_stats=True)
+    current = _session(num_stages=2, log_stats=True)
+    current_channel = SimpleNamespace(_ctx=SimpleNamespace(session=current))
+    for action, stage_id, stats, output in _recorded_stage_events():
+        if action == "begin":
+            legacy.begin_response()
+            current.begin_response()
+            continue
+        assert stats is not None
+        before = dataclasses.asdict(stats)
+        legacy_snapshot = _legacy_stage_metrics_snapshot(legacy, stage_id, stats, output)
+        current_snapshot = ModelChannel.stage_metrics_snapshot(current_channel, stage_id, stats, output)
+        # The orchestrator's metrics object is left as it was, by both.
+        assert dataclasses.asdict(stats) == before
+        assert current_snapshot == legacy_snapshot
+        assert [(stage, dataclasses.asdict(event)) for stage, event in current._pending_stage_request_stats] == [
+            (stage, dataclasses.asdict(event)) for stage, event in legacy._pending_stage_request_stats
+        ]

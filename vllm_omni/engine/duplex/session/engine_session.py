@@ -77,6 +77,20 @@ def _copy_list(value: object) -> list[object] | None:
     return [item for item in value]
 
 
+_ATOMIC_METRIC_TYPES = (int, float, str, bool, type(None))
+
+
+def _copy_metric_value(value: object) -> object:
+    """``copy.deepcopy`` for JSON-shaped stage metrics, without its per-object dispatch (a per-chunk cost)."""
+    if isinstance(value, _ATOMIC_METRIC_TYPES):
+        return value
+    if type(value) is list:
+        return [_copy_metric_value(item) for item in value]
+    if type(value) is dict:
+        return {key: _copy_metric_value(item) for key, item in value.items()}
+    return copy.deepcopy(value)
+
+
 @dataclass
 class InputBufferState:
     commit_seq: int = 0
@@ -97,6 +111,8 @@ class ResponseState:
     #: their own ``response_id`` after the next turn opened a new response.
     draining_response_by_request: dict[str, str] = field(default_factory=dict)
     assistant_text_buffer: list[str] = field(default_factory=list)
+    #: ``len("".join(assistant_text_buffer))``, kept so audio marks need no join per chunk.
+    assistant_text_chars: int = 0
     assistant_audio_text_marks: list[DuplexAssistantAudioTextMark] = field(default_factory=list)
     pending_options: ResponseCreateOptions | None = None
     active_options: ResponseCreateOptions | None = None
@@ -201,6 +217,9 @@ class DuplexEngineSession:
     _runtime_config: dict[str, object] = field(default_factory=dict, repr=False)
     #: Bumped on every published session / runtime config change.
     config_generation: int = 0
+    #: ``(config_generation, stage defaults, configured params)`` of the last
+    #: ``DuplexSessionManager.sampling_params_for`` call.
+    configured_sampling: tuple[int, tuple[object, ...], tuple[object, ...]] | None = field(default=None, repr=False)
     #: Stage request ids reserved or submitted for this session, keyed by ``(stage_id, request_id)``.
     request_resources: dict[tuple[int, str], DuplexRequestResource] = field(default_factory=dict, repr=False)
     #: Highest fence accepted for a stage request (monotonic; reset of the append
@@ -843,6 +862,12 @@ class DuplexEngineSession:
             return content if isinstance(content, str) else ""
         return "".join(self._response.assistant_text_buffer)
 
+    def assistant_transcript_chars(self, response_id: str | None = None) -> int:
+        """``len(assistant_transcript(response_id))`` without joining the active response's text."""
+        if response_id is not None and response_id != self.active_response_id:
+            return len(self.assistant_transcript(response_id))
+        return self._response.assistant_text_chars
+
     def begin_response(self, *, turn_id: int | None = None) -> str:
         if self._response_aggregator is not None:
             self._log_response_aggregator()
@@ -859,6 +884,7 @@ class DuplexEngineSession:
         self._response.active_response_awaits_input_commit = self.turn_state == DuplexTurnState.USER_SPEAKING
         self._response.last_response_id = response_id
         self._response.assistant_text_buffer.clear()
+        self._response.assistant_text_chars = 0
         self._response.assistant_audio_text_marks.clear()
         self._clear_response_metrics()
         self._conversation.last_assistant_full_message = None
@@ -1007,7 +1033,7 @@ class DuplexEngineSession:
         if not snapshot:
             return
         if self.active_response_id is not None:
-            self.accumulate_response_stage_metrics(snapshot)
+            self._fold_response_stage_metrics(snapshot)
             return
         self._pending_stage_metrics.append(snapshot)
 
@@ -1015,14 +1041,19 @@ class DuplexEngineSession:
         self,
         stage_metrics: Mapping[Any, Any] | None,
     ) -> dict[str, dict[str, object]]:
+        """Fold *stage_metrics* into the active response; return a copy of its totals."""
+        self._fold_response_stage_metrics(stage_metrics)
+        return _copy_metric_value(self._response.stage_metrics)  # type: ignore[return-value]
+
+    def _fold_response_stage_metrics(self, stage_metrics: Mapping[Any, Any] | None) -> None:
         if self.active_response_id is None:
-            return copy.deepcopy(self._response.stage_metrics)
+            return
         if self._pending_stage_metrics:
             pending, self._pending_stage_metrics = self._pending_stage_metrics, []
             for held in pending:
-                self.accumulate_response_stage_metrics(held)
+                self._fold_response_stage_metrics(held)
         if not isinstance(stage_metrics, Mapping):
-            return copy.deepcopy(self._response.stage_metrics)
+            return
 
         additive_fields = (
             "num_tokens_in",
@@ -1097,9 +1128,7 @@ class DuplexEngineSession:
 
             for name, value in raw_values.items():
                 if name not in handled_fields:
-                    current[str(name)] = copy.deepcopy(value)
-
-        return copy.deepcopy(self._response.stage_metrics)
+                    current[str(name)] = _copy_metric_value(value)
 
     def replace_response_stage_metric_snapshots(
         self,
@@ -1107,16 +1136,16 @@ class DuplexEngineSession:
     ) -> dict[str, dict[str, object]]:
         """Merge cumulative chat snapshots by replacing each stage's latest value."""
         if self.active_response_id is None or not isinstance(stage_metrics, Mapping):
-            return copy.deepcopy(self._response.stage_metrics)
+            return _copy_metric_value(self._response.stage_metrics)  # type: ignore[return-value]
 
         for raw_stage_id, raw_values in stage_metrics.items():
             if not isinstance(raw_values, Mapping):
                 continue
             stage_id = str(raw_stage_id)
-            self._response.stage_metrics[stage_id] = copy.deepcopy(dict(raw_values))
+            self._response.stage_metrics[stage_id] = _copy_metric_value(dict(raw_values))  # type: ignore[assignment]
             self._response.stage_metric_tpot_weighted_ms.pop(stage_id, None)
             self._response.stage_metric_tpot_weight.pop(stage_id, None)
-        return copy.deepcopy(self._response.stage_metrics)
+        return _copy_metric_value(self._response.stage_metrics)  # type: ignore[return-value]
 
     def accumulate_overlap_speech(self, duration_ms: int) -> int:
         self._input.overlap_speech_ms += max(0, int(duration_ms))
@@ -1130,6 +1159,7 @@ class DuplexEngineSession:
     def append_assistant_text(self, text: str) -> None:
         if text:
             self._response.assistant_text_buffer.append(text)
+            self._response.assistant_text_chars += len(text)
 
     def mark_audio_sent(
         self,
@@ -1341,6 +1371,7 @@ class DuplexEngineSession:
         elif response_id is not None and not assistant_text:
             self._discard_history_item_placeholder(f"item_{response_id}")
         self._response.assistant_text_buffer.clear()
+        self._response.assistant_text_chars = 0
         if not preserve_request:
             self._response.active_request_id = None
         self._response.active_response_id = None
@@ -1679,6 +1710,7 @@ class DuplexEngineSession:
         self.epoch += 1
         self.sync_fence()
         self._response.assistant_text_buffer.clear()
+        self._response.assistant_text_chars = 0
         self._response.assistant_audio_text_marks.clear()
         self._response.active_request_id = None
         self._response.active_response_id = None

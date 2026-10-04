@@ -76,13 +76,16 @@ class RecordingStagePort(DuplexStagePort):
         #: When set, ``submit`` parks on it after signalling ``submit_started``.
         self.submit_gate: asyncio.Event | None = None
         self.submit_started = asyncio.Event()
+        # Like the orchestrator port, hand out the same default objects on
+        # every call: the session caches its configured params by their identity.
+        self._sampling_defaults = tuple(SamplingParams(max_tokens=8) for _ in range(stage_count))
 
     @property
     def stage_count(self) -> int:
         return self._stage_count
 
     def sampling_defaults(self) -> tuple[object, ...]:
-        return tuple(SamplingParams(max_tokens=8) for _ in range(self._stage_count))
+        return self._sampling_defaults
 
     def ensure_request(self, context: DuplexStageRequestContext) -> None:
         self.ensured.append(context)
@@ -1403,6 +1406,74 @@ async def test_stage0_metrics_from_several_units_are_summed_into_one_response() 
         events = await h.deliver_and_settle(tts_output(request_id, samples=24000, text="hi"))
         stage_metrics = _stage_metrics_of(find(events, "response.output_audio.delta"))
         assert stage_metrics["0"]["num_tokens_out"] == 7
+    finally:
+        await close_harness(h)
+
+
+def _stage0_text_output(request_id: str) -> SimpleNamespace:
+    return SimpleNamespace(
+        request_id=request_id,
+        finished=False,
+        outputs=[SimpleNamespace(text="hi", token_ids=[11], multimodal_output={})],
+        multimodal_output={},
+    )
+
+
+def _deliver_stage0_metrics(h: Harness, tokens: int) -> None:
+    request_id = h.stage0_request_id()
+    forwarded = h.deliver(
+        _stage0_text_output(request_id),
+        stage_id=0,
+        metrics=stage_stats(stage_id=0, request_id=request_id, num_tokens_out=tokens),
+    )
+    assert forwarded is False
+
+
+@pytest.mark.asyncio
+async def test_stage0_metrics_fold_in_mailbox_order_while_the_worker_is_busy() -> None:
+    """Metrics that arrive between two mailbox items fold between them, as an item of their own did."""
+    from vllm_omni.engine.duplex.session.runner import _Internal
+
+    h = await open_harness()
+    try:
+        await h.run(append_audio())
+        h.session.begin_response()
+        gate = asyncio.Event()
+        gate_item = _Internal("test-gate")
+        probe_item = _Internal("test-probe")
+        seen: list[dict[str, dict[str, object]]] = []
+        handle_item = h.runner._handle_item
+
+        async def handle(item: object) -> None:
+            if item is gate_item:
+                await gate.wait()
+                return
+            if item is probe_item:
+                seen.append({stage: dict(values) for stage, values in h.session._response.stage_metrics.items()})
+                return
+            await handle_item(item)
+
+        h.runner._handle_item = handle
+        h.runner._mailbox.put_nowait(gate_item)
+        for _ in range(20):
+            await asyncio.sleep(0)
+            if h.runner._handling:
+                break
+        assert h.runner._handling
+
+        _deliver_stage0_metrics(h, 3)  # after the gate, before the probe
+        h.runner._mailbox.put_nowait(probe_item)
+        _deliver_stage0_metrics(h, 4)  # after the probe
+        await asyncio.sleep(0)
+        # The worker is still inside the gate item: nothing folded yet.
+        assert "0" not in h.session._response.stage_metrics
+
+        gate.set()
+        await h.settle()
+
+        assert seen == [{"0": seen[0]["0"]}]
+        assert seen[0]["0"]["num_tokens_out"] == 3
+        assert h.session._response.stage_metrics["0"]["num_tokens_out"] == 7
     finally:
         await close_harness(h)
 

@@ -35,6 +35,7 @@ from vllm_omni.engine.duplex.commands import (
 )
 from vllm_omni.engine.duplex.realtime_commands import (
     RealtimeInputDefaults,
+    build_append_audio,
     translate_realtime_command,
 )
 
@@ -468,3 +469,17 @@ def test_duplex_command_mixin_keeps_empty_slots():
     assert getattr(params, "slots", False) is False, "slots=True on DuplexCommand breaks the import on Python 3.10"
     assert DuplexCommand.__slots__ == ()
     assert not hasattr(AppendAudio(audio=b"\x00\x00" * 8), "__dict__")
+
+
+def test_append_audio_keeps_the_wire_base64_and_payload_reuses_it() -> None:
+    samples = np.full(8, 0.25, dtype="<f4")
+    wire_audio = base64.b64encode(samples.tobytes()).decode("ascii")
+    command = build_append_audio(
+        {"type": "input_audio_buffer.append", "audio": wire_audio, "format": "pcm_f32le", "sample_rate_hz": 16000},
+        defaults=RealtimeInputDefaults(),
+    )
+
+    assert command.audio == samples.tobytes()
+    payload = command.payload()
+    assert payload["audio"] == wire_audio
+    assert "audio_base64" not in payload

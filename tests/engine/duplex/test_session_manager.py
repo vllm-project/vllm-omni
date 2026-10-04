@@ -234,13 +234,15 @@ class FakeStagePort(DuplexStagePort):
         self.cleanup_failures_remaining = 0
         self.cleanup_gate: asyncio.Event | None = None
         self.cleanup_started = asyncio.Event()
+        # Like DuplexOrchestrator, the same default objects on every call.
+        self._sampling_defaults = tuple(f"default-{stage_id}" for stage_id in range(stage_count))
 
     @property
     def stage_count(self) -> int:
         return self._stage_count
 
     def sampling_defaults(self) -> tuple[object, ...]:
-        return tuple(f"default-{stage_id}" for stage_id in range(self._stage_count))
+        return self._sampling_defaults
 
     def ensure_request(self, context: DuplexStageRequestContext) -> None:
         self.ensure_calls.append(context)
@@ -526,6 +528,35 @@ async def test_sampling_params_for_validates_the_plugin_policy() -> None:
         assert result.ok is False
         assert result.error_code == "invalid_argument"
         assert "as a tuple" in str(result.error_message)
+
+
+async def test_sampling_params_are_configured_once_per_config_generation() -> None:
+    class CountingSamplingPlugin(FakePlugin):
+        def __init__(self) -> None:
+            super().__init__()
+            self.calls = 0
+
+        def configure_sampling_params(self, *, runtime_config, defaults):
+            self.calls += 1
+            return tuple(f"{default}-g{self.calls}" for default in defaults)
+
+    plugin = CountingSamplingPlugin()
+    async with Harness.create(plugin=plugin) as harness:
+        assert (await harness.open("sid-cache")).ok is True
+        session = harness.session("sid-cache")
+
+        first = harness.manager.sampling_params_for(session)
+        calls = plugin.calls
+
+        session.replace_runtime_config({**session.runtime_config, "changed": True})
+        refreshed = harness.manager.sampling_params_for(session)
+        assert refreshed is not first
+        assert plugin.calls == calls + 1
+
+        harness.stage_port.sampling_defaults = lambda: ("other-0", "other-1")
+        rebuilt = harness.manager.sampling_params_for(session)
+        assert plugin.calls == calls + 2
+        assert rebuilt == (f"other-0-g{plugin.calls}", f"other-1-g{plugin.calls}")
 
 
 async def test_duplicate_open_is_rejected_with_session_exists() -> None:

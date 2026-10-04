@@ -48,6 +48,11 @@ class FakeWebSocket:
             )
         self.sent.append(json.loads(json.dumps(payload)))
 
+    async def send_text(self, text: str) -> None:
+        # Journaled events arrive pre-encoded (EncodedEventPayload). Route them
+        # through send_json so a test that replaces it still sees every send.
+        await self.send_json(json.loads(text))
+
     async def receive_text(self) -> str:
         item = await self._inbound.get()
         if item is _DISCONNECT:
