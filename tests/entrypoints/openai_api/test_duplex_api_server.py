@@ -64,6 +64,7 @@ _DUPLEX_APP_STATE_KEYS = {
     "openai_serving_duplex",
     "enable_server_load_tracking",
     "server_load_metrics",
+    "serving_render",
 }
 #: Every turn-based service, plus the Realtime route that is not the duplex one.
 #: ``openai_serving_chat`` is absent: a duplex engine also serves chat, through
