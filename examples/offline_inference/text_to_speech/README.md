@@ -508,19 +508,25 @@ Single-stage native AR TTS at 22.05 kHz. Pipeline: `Qwen3.5 backbone → 32 FSQ 
 The NanoCodec decoder needs NeMo (NVIDIA Open Model License), installed separately:
 
 ```bash
-uv pip install "nemo_toolkit[tts]==2.7.3" \
-    --overrides <(printf '%s\n' "transformers>=5.5.3" "huggingface-hub>=1.0")
+pip install "nemo_toolkit[tts]==2.7.3"
+pip install "transformers>=5.13.0,<5.15" "huggingface-hub>=1.31.0" "protobuf>=5.29.6,<6"
 ```
 
-The overrides are what make that command work. `nemo_toolkit[tts]` declares
-`transformers~=4.57.0`, so a plain install downgrades the version
-`requirements/common.txt` pins and takes `huggingface-hub` back to 0.x with it — after
-which `import vllm` fails. Both packages are named here rather than left to resolve on
-their own: transformers 5.x happens to require `huggingface-hub` 1.x, but relying on
-that would make the second repair an accident of the first. `--constraint` cannot be
-used instead, since it narrows a version range rather than overriding a dependency a
-package declares, and the two sets never intersect. NeMo 2.7.3 decodes correctly
-against transformers 5.x, so nothing is lost by holding it there.
+Two installs, in that order. `nemo_toolkit[tts]` declares `transformers~=4.57.0`
+and `protobuf~=5.29.5`, so the first command downgrades the pins in
+`requirements/common.txt` and takes `huggingface-hub` back to 0.x with
+transformers — after which `import vllm` fails. The second command puts those
+pins back. Name them explicitly: transformers 5.x happens to require
+`huggingface-hub` 1.x, but relying on that would make the hub repair an
+accident of the transformers one. `--constraint` cannot replace the second
+install, since it narrows a range rather than overriding a dependency a
+package declares, and the two transformers ranges never intersect. NeMo 2.7.3
+decodes correctly against transformers 5.x.
+
+Use pip for this extra. The extra also pulls `pyopenjtalk` (Japanese text
+processing; Gepard does not import it), and uv rejects the 0.4.1 build because
+the package metadata reports version `0.0.0`. pip accepts that build. The
+weekly `TTS · Gepard-1.0 · L4` step runs these two commands.
 
 (The same clash is why this is documented here rather than declared in
 `pyproject.toml`: an extra resolves together with the base dependencies, so
