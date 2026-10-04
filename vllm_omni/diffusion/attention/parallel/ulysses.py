@@ -254,15 +254,31 @@ class UlyssesParallelAttention:
         self._gather_idx = gather_idx
         self._use_sync = use_sync
         self._ulysses_a2a_permute = ulysses_a2a_permute
+        self._ulysses_a2a_backend = "symmetric"
+        self._qk_input_landing_enabled = False
         if _a2a_permute_enabled(
             ulysses_a2a_permute,
             scatter_idx,
             gather_idx,
             sp_group.ulysses_world_size,
         ):
-            from vllm_omni.diffusion.distributed.a2a_permute import ensure_a2a_permute_available
+            from vllm_omni.diffusion.distributed.flashinfer_ulysses import configured_backend
 
-            ensure_a2a_permute_available()
+            self._ulysses_a2a_backend = configured_backend()
+            if self._ulysses_a2a_backend == "flashinfer-pcie":
+                from vllm_omni.diffusion.distributed.flashinfer_ulysses import (
+                    ensure_flashinfer_pcie_available,
+                    is_qk_producer_direct_enabled,
+                )
+
+                ensure_flashinfer_pcie_available()
+                self._qk_input_landing_enabled = is_qk_producer_direct_enabled()
+            elif self._ulysses_a2a_backend == "symmetric":
+                from vllm_omni.diffusion.distributed.a2a_permute import ensure_a2a_permute_available
+
+                ensure_a2a_permute_available()
+            else:
+                raise ValueError("VLLM_OMNI_ULYSSES_A2A_BACKEND must be symmetric or flashinfer-pcie")
 
     @property
     def enabled(self) -> bool:
@@ -271,6 +287,45 @@ class UlyssesParallelAttention:
     @property
     def name(self) -> str:
         return "ulysses"
+
+    @property
+    def supports_qk_input_landing(self) -> bool:
+        return self._qk_input_landing_enabled
+
+    def prepare_qk_input_landings(self, query: torch.Tensor, key: torch.Tensor):
+        if not self.supports_qk_input_landing or get_ulysses_mode(default="strict") != "strict":
+            return None
+        if self._sp_group.ring_world_size != 1:
+            return None
+        from vllm_omni.diffusion.distributed.flashinfer_ulysses import flashinfer_ulysses_qk_input_landings
+
+        return flashinfer_ulysses_qk_input_landings(query, key, self._ulysses_pg, self._sp_group.ulysses_world_size)
+
+    def _scatter_heads(self, tensor: torch.Tensor, slot: str) -> torch.Tensor:
+        group_name = self._ulysses_pg.group_name
+        world_size = self._sp_group.ulysses_world_size
+        if self._ulysses_a2a_backend == "flashinfer-pcie":
+            from vllm_omni.diffusion.distributed.flashinfer_ulysses import flashinfer_ulysses_qkv_fwd
+
+            return flashinfer_ulysses_qkv_fwd(tensor, group_name, world_size, slot, self._use_sync)
+        from vllm_omni.diffusion.distributed.a2a_permute import ulysses_qkv_fwd
+
+        return ulysses_qkv_fwd(tensor, group_name, world_size)
+
+    def _exchange_qkv(self, query, key, value, attn_metadata):
+        """Exchange independent operands; subclasses may schedule producers between exchanges."""
+        return self._scatter_heads(query, "q"), self._scatter_heads(key, "k"), self._scatter_heads(value, "v")
+
+    def _gather_heads(self, tensor: torch.Tensor, ctx: _UlyssesCtx) -> torch.Tensor:
+        group_name = ctx.ulysses_pg.group_name
+        world_size = dist.get_world_size(ctx.ulysses_pg)
+        if self._ulysses_a2a_backend == "flashinfer-pcie":
+            from vllm_omni.diffusion.distributed.flashinfer_ulysses import flashinfer_ulysses_o_rev
+
+            return flashinfer_ulysses_o_rev(tensor, group_name, world_size, ctx.use_sync)
+        from vllm_omni.diffusion.distributed.a2a_permute import ulysses_o_rev
+
+        return ulysses_o_rev(tensor, group_name, world_size)
 
     def pre_attention(
         self,
@@ -526,14 +581,9 @@ class UlyssesParallelAttention:
                 self._gather_idx,
                 ulysses_world_size,
             ):
-                from vllm_omni.diffusion.distributed.a2a_permute import ulysses_qkv_fwd
-
-                group_name = self._ulysses_pg.group_name
-                query = ulysses_qkv_fwd(query, group_name, ulysses_world_size)
-                key = ulysses_qkv_fwd(key, group_name, ulysses_world_size)
-                value = ulysses_qkv_fwd(value, group_name, ulysses_world_size)
+                query, key, value = self._exchange_qkv(query, key, value, attn_metadata)
                 if gate_compress is not None:
-                    gate_compress = ulysses_qkv_fwd(gate_compress, group_name, ulysses_world_size)
+                    gate_compress = self._scatter_heads(gate_compress, "g")
             else:
                 query = SeqAllToAll4D.apply(
                     self._ulysses_pg, query, self._scatter_idx, self._gather_idx, self._use_sync
@@ -666,13 +716,7 @@ class UlyssesParallelAttention:
                 ctx.gather_idx,
                 dist.get_world_size(ctx.ulysses_pg),
             ):
-                from vllm_omni.diffusion.distributed.a2a_permute import ulysses_o_rev
-
-                output_img = ulysses_o_rev(
-                    output_img,
-                    ctx.ulysses_pg.group_name,
-                    dist.get_world_size(ctx.ulysses_pg),
-                )
+                output_img = self._gather_heads(output_img, ctx)
             else:
                 output_img = SeqAllToAll4D.apply(
                     ctx.ulysses_pg, output_img, ctx.gather_idx, ctx.scatter_idx, ctx.use_sync
@@ -711,11 +755,5 @@ class UlyssesParallelAttention:
             ctx.gather_idx,
             dist.get_world_size(ctx.ulysses_pg),
         ):
-            from vllm_omni.diffusion.distributed.a2a_permute import ulysses_o_rev
-
-            return ulysses_o_rev(
-                attn_output,
-                ctx.ulysses_pg.group_name,
-                dist.get_world_size(ctx.ulysses_pg),
-            )
+            return self._gather_heads(attn_output, ctx)
         return SeqAllToAll4D.apply(ctx.ulysses_pg, attn_output, ctx.gather_idx, ctx.scatter_idx, ctx.use_sync)

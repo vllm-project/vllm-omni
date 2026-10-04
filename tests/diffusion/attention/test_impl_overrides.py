@@ -89,7 +89,7 @@ def test_specialization_must_extend_selected_implementation(mocker, local_attent
 
 
 def test_platform_backend_capabilities_survive_model_specialization(mocker, local_attention):
-    from vllm_omni.diffusion.models.minimax_h3.attention.fastvideo_h3 import MiniMaxH3VSAImpl
+    from vllm_omni.diffusion.models.minimax_h3.attention.vsa import MiniMaxH3VSAImpl
 
     class PlatformBackend(FastVideoVSABackend):
         @classmethod

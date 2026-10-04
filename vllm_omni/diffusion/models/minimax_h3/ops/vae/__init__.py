@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from types import MethodType
 from typing import Any
 
@@ -13,6 +14,55 @@ import torch.nn as nn
 from vllm_omni.diffusion.layers.activation import SiluAndMul
 
 from .dispatch import resolve_h3_vae_operators
+
+
+@dataclass(frozen=True)
+class H3VAEExactOpStatsSnapshot:
+    """Immutable per-decoder exact-op dispatch counters."""
+
+    transformer_fast: int = 0
+    transformer_fallback: int = 0
+    qk_norm_rope_fast: int = 0
+    qk_norm_rope_fallback: int = 0
+    swiglu_fast: int = 0
+    swiglu_fallback: int = 0
+    scaled_residual_fast: int = 0
+    scaled_residual_fallback: int = 0
+
+    def delta(self, previous: H3VAEExactOpStatsSnapshot) -> H3VAEExactOpStatsSnapshot:
+        """Return counters accumulated after ``previous``."""
+
+        return H3VAEExactOpStatsSnapshot(
+            **{name: int(getattr(self, name)) - int(getattr(previous, name)) for name in self.__dataclass_fields__}
+        )
+
+
+@dataclass
+class _H3VAEExactOpStats:
+    """Mutable counters shared by all optimized blocks in one decoder."""
+
+    transformer_fast: int = 0
+    transformer_fallback: int = 0
+    qk_norm_rope_fast: int = 0
+    qk_norm_rope_fallback: int = 0
+    swiglu_fast: int = 0
+    swiglu_fallback: int = 0
+    scaled_residual_fast: int = 0
+    scaled_residual_fallback: int = 0
+
+    def snapshot(self) -> H3VAEExactOpStatsSnapshot:
+        return H3VAEExactOpStatsSnapshot(
+            **{name: int(getattr(self, name)) for name in H3VAEExactOpStatsSnapshot.__dataclass_fields__}
+        )
+
+
+def snapshot_h3_vae_exact_op_stats(decoder: nn.Module) -> H3VAEExactOpStatsSnapshot | None:
+    """Snapshot an installed decoder, or return ``None`` when not installed."""
+
+    stats = getattr(decoder, "_omni_h3_vae_exact_op_stats", None)
+    if not isinstance(stats, _H3VAEExactOpStats):
+        return None
+    return stats.snapshot()
 
 
 def _is_boolean_flag(value: Any) -> bool:
@@ -44,10 +94,13 @@ def _optimized_feed_forward(self: nn.Module, hidden_states: torch.Tensor) -> tor
     if torch.compiler.is_compiling():
         return type(self).forward(self, hidden_states)
 
+    stats = self._omni_h3_vae_exact_op_stats
     hidden_states = self.w1(hidden_states)
     if hidden_states.is_cuda and hidden_states.dtype == torch.float16:
+        stats.swiglu_fast += 1
         hidden_states = self._omni_silu_and_mul(hidden_states)
     else:
+        stats.swiglu_fallback += 1
         gate, hidden_states = hidden_states.chunk(2, dim=-1)
         hidden_states = self.act_fn(gate) * hidden_states
     return self.w2(hidden_states)
@@ -60,7 +113,10 @@ def _optimized_attention(
     pack_info: dict[str, Any] | None = None,
 ) -> torch.Tensor:
     pack_info = {} if pack_info is None else pack_info
+    stats = self._omni_h3_vae_exact_op_stats
     if torch.compiler.is_compiling() or self.spatial_parallel or rotary_pos_emb is None:
+        if not torch.compiler.is_compiling():
+            stats.qk_norm_rope_fallback += 1
         return type(self).forward(self, hidden_states, rotary_pos_emb, pack_info)
 
     batch_size, sequence, _ = hidden_states.shape
@@ -78,8 +134,10 @@ def _optimized_attention(
         float(self.norm_q.eps),
     )
     if optimized_qk is None:
+        stats.qk_norm_rope_fallback += 1
         return type(self).forward(self, hidden_states, rotary_pos_emb, pack_info)
 
+    stats.qk_norm_rope_fast += 1
     query, key = optimized_qk
     hidden_states = self.perform_attention(query, key, value, pack_info)
     hidden_states = hidden_states.reshape(batch_size, sequence, -1)
@@ -93,9 +151,13 @@ def _optimized_transformer_block(
     pack_info: dict[str, Any] | None = None,
 ) -> torch.Tensor:
     pack_info = {} if pack_info is None else pack_info
+    stats = self._omni_h3_vae_exact_op_stats
     if torch.compiler.is_compiling() or hidden_states.dtype != torch.float32:
+        if not torch.compiler.is_compiling():
+            stats.transformer_fallback += 1
         return type(self).forward(self, hidden_states, rotary_pos_emb, pack_info)
 
+    stats.transformer_fast += 1
     normalized = self.norm1(hidden_states.float()).to(hidden_states.dtype)
     attention_output = self.attn(normalized, rotary_pos_emb, pack_info)
     updated = self._omni_scaled_residual(
@@ -103,6 +165,10 @@ def _optimized_transformer_block(
         attention_output,
         self.scale1,
     )
+    if updated is None:
+        stats.scaled_residual_fallback += 1
+    else:
+        stats.scaled_residual_fast += 1
     hidden_states = hidden_states + attention_output * self.scale1 if updated is None else updated
 
     normalized = self.norm2(hidden_states.float()).to(hidden_states.dtype)
@@ -112,6 +178,10 @@ def _optimized_transformer_block(
         feed_forward_output,
         self.scale2,
     )
+    if updated is None:
+        stats.scaled_residual_fallback += 1
+    else:
+        stats.scaled_residual_fast += 1
     return hidden_states + feed_forward_output * self.scale2 if updated is None else updated
 
 
@@ -184,6 +254,7 @@ def install_h3_vae_optimizations(
     decoder: nn.Module,
     *,
     device: torch.device,
+    persist_fp16_weights: bool = True,
 ) -> bool:
     """Install the operators selected for ``device`` once."""
 
@@ -199,19 +270,29 @@ def install_h3_vae_optimizations(
 
     # The H3 decode path always uses FP16 CUDA autocast. Persisting these
     # rounded decoder-block weights avoids rebuilding the same casts per tile.
-    for linear in linears:
-        linear.to(dtype=torch.float16)
+    if persist_fp16_weights:
+        for linear in linears:
+            linear.to(dtype=torch.float16)
 
+    stats = _H3VAEExactOpStats()
     for block in decoder.transformer_blocks:
+        block._omni_h3_vae_exact_op_stats = stats
         block.ff._omni_silu_and_mul = SiluAndMul()
+        block.ff._omni_h3_vae_exact_op_stats = stats
         block.ff.forward = MethodType(_optimized_feed_forward, block.ff)
         block.attn._omni_qk_norm_rope = operators.qk_norm_rope
+        block.attn._omni_h3_vae_exact_op_stats = stats
         block.attn.forward = MethodType(_optimized_attention, block.attn)
         block._omni_scaled_residual = operators.scaled_residual
         block.forward = MethodType(_optimized_transformer_block, block)
 
+    decoder._omni_h3_vae_exact_op_stats = stats
     decoder._omni_h3_vae_optimizations_installed = True
     return True
 
 
-__all__ = ["install_h3_vae_optimizations"]
+__all__ = [
+    "H3VAEExactOpStatsSnapshot",
+    "install_h3_vae_optimizations",
+    "snapshot_h3_vae_exact_op_stats",
+]

@@ -27,10 +27,15 @@ dtype already selected by decode autocast. Unsupported model contracts, tensor
 inputs, execution modes, and devices retain the original implementation.
 
 Hardware dispatch is an explicit allowlist. SM90, SM100, and SM103 are enabled;
-other capabilities fall back to the reference path. Bit-exact full-decode and
-operator evidence has been collected on SM90, with independent full-decode and
-stress validation on SM103. Enabling a target and claiming it as validated are
-kept separate so the evidence remains clear.
+other capabilities fall back to the reference path. SM120 has an experimental,
+default-off entry gated by
+`VLLM_OMNI_MINIMAX_H3_VAE_EXACT_OPS_SM120=1`; this is a process-startup setting,
+not a request-time toggle. Bit-exact full-decode and operator evidence has been
+collected on SM90, with independent full-decode and stress validation on SM103.
+On SM120, production-shape operator checks and one 7-token, 704x1280, tile-256
+real-weight decode were bit-exact; full PP8 and complete-video qualification is
+still required before default enablement. Enabling a target and claiming it as
+validated are kept separate so the evidence remains clear.
 
 ## Extending platform support
 

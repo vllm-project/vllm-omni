@@ -196,9 +196,7 @@ class FastVideoVSABackend(AttentionBackend):
         if importlib.util.find_spec("fastvideo_kernel") is None:
             raise ImportError(
                 "FASTVIDEO_VSA requires the optional fastvideo-kernel package "
-                "included in vllm-omni[vsa]. Install with `uv pip install 'vllm-omni[vsa]'` "
-                "(from source: `uv pip install -e '.[vsa]'`). "
-                "Prebuilt kernels require Linux, Python 3.12 and glibc >= 2.34."
+                "(the installation must provide the 'fastvideo_kernel' Python module)."
             )
 
     @staticmethod

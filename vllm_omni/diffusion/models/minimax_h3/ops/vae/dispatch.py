@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -14,6 +15,8 @@ from vllm_omni.platforms import current_omni_platform
 
 from .qk_norm_rope import try_qk_norm_rope_exact
 from .scaled_residual import try_scaled_residual_exact
+
+MINIMAX_H3_VAE_EXACT_OPS_SM120_ENV = "VLLM_OMNI_MINIMAX_H3_VAE_EXACT_OPS_SM120"
 
 QKNormRopeOp = Callable[
     [
@@ -65,6 +68,25 @@ def _supports_cuda_sm103(device: torch.device) -> bool:
     return _supports_cuda_capability(device, 103)
 
 
+def resolve_minimax_h3_vae_exact_ops_sm120(raw: str | None = None) -> bool:
+    """Resolve the experimental SM120 exact-op gate without silent fallback."""
+
+    if raw is None:
+        raw = os.environ.get(MINIMAX_H3_VAE_EXACT_OPS_SM120_ENV, "0")
+    normalized = str(raw).strip().lower()
+    if normalized in {"1", "true", "yes", "on", "enable", "enabled"}:
+        return True
+    if normalized in {"0", "false", "no", "off", "disable", "disabled", ""}:
+        return False
+    raise ValueError(f"{MINIMAX_H3_VAE_EXACT_OPS_SM120_ENV} must be 0 or 1, got {raw!r}")
+
+
+def _supports_cuda_sm120(device: torch.device) -> bool:
+    # Parse the opt-in only on the exact experimental target. An invalid value
+    # must fail that worker at startup, but must not affect other architectures.
+    return _supports_cuda_capability(device, 120) and resolve_minimax_h3_vae_exact_ops_sm120()
+
+
 # Keep hardware selection flat: adding a backend means adding one operator set,
 # without changing the installer or the model execution path.
 H3_VAE_OPERATOR_TABLE: tuple[H3VAEOperatorSet, ...] = (
@@ -83,6 +105,11 @@ H3_VAE_OPERATOR_TABLE: tuple[H3VAEOperatorSet, ...] = (
         qk_norm_rope=try_qk_norm_rope_exact,
         scaled_residual=try_scaled_residual_exact,
     ),
+    H3VAEOperatorSet(
+        supports=_supports_cuda_sm120,
+        qk_norm_rope=try_qk_norm_rope_exact,
+        scaled_residual=try_scaled_residual_exact,
+    ),
 )
 
 
@@ -94,7 +121,9 @@ def resolve_h3_vae_operators(device: torch.device) -> H3VAEOperatorSet | None:
 
 
 __all__ = [
+    "MINIMAX_H3_VAE_EXACT_OPS_SM120_ENV",
     "H3VAEOperatorSet",
     "H3_VAE_OPERATOR_TABLE",
+    "resolve_minimax_h3_vae_exact_ops_sm120",
     "resolve_h3_vae_operators",
 ]

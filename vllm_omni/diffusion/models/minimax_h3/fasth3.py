@@ -42,7 +42,6 @@ import torch
 from safetensors import safe_open
 from vllm.logger import init_logger
 
-from vllm_omni.diffusion.offloader.config import offload_enabled, resolve_offload_strategy
 from vllm_omni.diffusion.sched.sigma_schedule import DMD2SigmaSchedule
 from vllm_omni.errors import OmniClientError
 from vllm_omni.platforms import current_omni_platform
@@ -103,7 +102,6 @@ _MODEL_LEVEL_TARGETS = {
     "time_embedder.linear_2": "time_embedder.proj_out",
     "norm_out.linear": "final_layer.adaln_proj.linear",
     "norm_out.norm": "final_layer.norm",
-    "token_refiner.final_norm": "token_refiner.final_norm",
 }
 
 # Per-block adapter suffix -> (native suffix, how a delta enters the native
@@ -117,8 +115,6 @@ _BLOCK_TARGETS = {
     "attn.to_v": ("attn.qkv_proj", _QKV_V),
     "attn.to_out.0": ("attn.out_proj", _PLAIN),
     "attn.to_gate_compress": ("attn.to_gate_compress", _PLAIN),
-    "attn.norm_q": ("attn.q_norm", _PLAIN),
-    "attn.norm_k": ("attn.k_norm", _PLAIN),
     "ff.net.0.proj": ("mlp.fc1", _SWAP_HALVES),
     "ff.net.2": ("mlp.fc2", _PLAIN),
     "adaln_proj.linear": ("adaln_proj.linear", _PLAIN),
@@ -346,6 +342,8 @@ class FastH3WeightFusion:
         self._injections = dict(injections or {})
         self._injected: set[str] = set()
         self._applied: set[str] = set()
+        self._sidecar_satisfied: set[str] = set()
+        self._stream_started = False
         self._device: torch.device | None = None
 
     @property
@@ -510,6 +508,8 @@ class FastH3WeightFusion:
         patch = self._patches.get(name)
         if patch is None:
             return weight
+        if name in self._sidecar_satisfied:
+            return weight
         self._applied.add(name)
 
         device = self._compute_device(weight)
@@ -549,11 +549,12 @@ class FastH3WeightFusion:
 
     def apply(self, weights: Iterable[tuple[str, torch.Tensor]]) -> Iterator[tuple[str, torch.Tensor]]:
         """Fuse every streamed checkpoint tensor on its way into the model."""
-        if self._applied:
+        if self._stream_started or (self._applied - self._sidecar_satisfied):
             # ``validate_fully_applied`` released the deltas, so a second stream
             # would fuse nothing and then pass its own completeness check: the
             # server would serve base H3 weights on the student's ladder.
             raise FastH3AdapterError(f"{self._source} has already been fused into this checkpoint")
+        self._stream_started = True
         for name, weight in weights:
             if name in self._injections:
                 raise FastH3AdapterError(
@@ -566,6 +567,26 @@ class FastH3WeightFusion:
         for name, weight in self._injections.items():
             self._injected.add(name)
             yield name, weight
+
+    def mark_sidecar_satisfied(self, names: Iterable[str]) -> None:
+        """Mark adapter edits supplied by a verified AdaLN sidecar.
+
+        The cache owns only block/final AdaLN projections. Its runtime binding
+        verifies that it was built from this adapter and exact four-step
+        schedule before exposing the names. Keep this method strict as the last
+        boundary: a sidecar may satisfy only edits this adapter really carries,
+        and it must be bound before checkpoint streaming starts.
+        """
+        if self._stream_started:
+            raise FastH3AdapterError("FastH3 AdaLN sidecar must be bound before checkpoint weights start streaming")
+        satisfied = frozenset(str(name) for name in names)
+        unknown = sorted(satisfied - set(self._patches))
+        if unknown:
+            raise FastH3AdapterError(
+                f"FastH3 AdaLN sidecar claims parameters this adapter does not edit: {unknown[:5]}"
+            )
+        self._sidecar_satisfied.update(satisfied)
+        self._applied.update(satisfied)
 
     def validate_fully_applied(self, loaded: Iterable[str] | None = None) -> None:
         """Close the fusion: every edit must have met its parameter.
@@ -609,14 +630,19 @@ class FastH3WeightFusion:
         """Hold a starting server to the ladder this student was trained on."""
         if partition == "ref2va":
             raise ValueError("FastH3 preview v1 distills T2VA only, so it cannot serve a Ref2VA partition")
-        if offload_enabled(od_config):
+        offloads = [
+            flag
+            for flag in ("enable_cpu_offload", "enable_layerwise_offload", "enable_distributed_layerwise_offload")
+            if getattr(od_config, flag, False)
+        ]
+        if offloads:
             # A host-weight plan installs the transformer without going through
             # load_weights(), which is where the fusion and its completeness
             # check live. Serving base H3 weights under a four-step schedule
             # would otherwise degrade output with nothing to signal it.
             raise ValueError(
-                "FastH3 is fused while the checkpoint streams in, so it cannot be combined with "
-                f"{resolve_offload_strategy(od_config).value} offload. Serve it without offload."
+                f"FastH3 is fused while the checkpoint streams in, so it cannot be combined with "
+                f"{sorted(offloads)}. Serve it without offload."
             )
         if self.requires_vsa:
             backend = _resolve_dit_attention_backend(od_config)
