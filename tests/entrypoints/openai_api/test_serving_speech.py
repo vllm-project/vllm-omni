@@ -821,6 +821,25 @@ class TestSpeechAPI:
         assert response.status_code == 400
         assert "finite" in response.json()["detail"]
 
+    @pytest.mark.parametrize(
+        "bad_value",
+        ["1" + "0" * 400, "1e39"],
+        ids=["int_too_large_for_float", "overflows_float32"],
+    )
+    def test_upload_voice_embedding_out_of_range_rejected(self, client, bad_value):
+        """Values that cannot be stored as finite float32 return 400, not a 500 or a stored Inf."""
+
+        data = {
+            "speaker_embedding": "[" + ", ".join(["0.1"] * 1023 + [bad_value]) + "]",
+            "consent": "consent_range",
+            "name": "range_voice",
+        }
+        response = client.post("/v1/audio/voices", data=data)
+        assert response.status_code == 400
+        assert "finite" in response.json()["detail"]
+        listing = client.get("/v1/audio/voices").json()
+        assert "range_voice" not in {v["name"] for v in listing["uploaded_voices"]}
+
     @pytest.mark.asyncio
     async def test_diffusion_create_speech_with_unknown_voice(self, mocker: MockerFixture):
         engine_client = mocker.MagicMock()
