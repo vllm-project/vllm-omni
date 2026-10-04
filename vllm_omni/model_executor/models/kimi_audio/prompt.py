@@ -13,6 +13,7 @@ from dataclasses import field as dataclass_field
 from numbers import Integral
 from typing import TYPE_CHECKING, Literal
 
+import msgspec
 import torch
 
 if TYPE_CHECKING:
@@ -45,6 +46,30 @@ class KimiAudioSpecialTokens:
         if len(set(values.values())) != len(values):
             raise ValueError("Kimi-Audio special tokens must have distinct IDs")
         return cls(**values)
+
+
+class KimiAudioPreparedInput(msgspec.Struct, frozen=True):
+    """Model-private request layout carried in ``model_intermediate_buffer``.
+
+    Produced by ``prepare_kimi_audio_inputs`` and read back by the stage input
+    processors and the AR stage. Only builtins cross the request boundary.
+    """
+
+    text_token_ids: list[int]
+    audio_token_ids: list[int]
+    # [message index, start, end) of each audio span in the prompt.
+    audio_spans: list[tuple[int, int, int]]
+    output_type: Literal["text", "both"]
+    special_tokens: dict[str, int]
+    audio_token_offset: int
+    audio_vocab_size: int
+
+    def to_wire(self) -> dict:
+        return msgspec.to_builtins(self)
+
+    @classmethod
+    def from_wire(cls, wire: object) -> "KimiAudioPreparedInput":
+        return msgspec.convert(wire, cls)
 
 
 @dataclass(frozen=True)

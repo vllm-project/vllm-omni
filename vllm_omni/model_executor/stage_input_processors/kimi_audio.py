@@ -11,10 +11,9 @@ from typing import Any
 import msgspec
 import torch
 
-from vllm_omni.data_entry_keys import CodesStruct, MetaStruct, OmniPayloadStruct, deserialize_payload
-from vllm_omni.engine import AdditionalInformationPayload
+from vllm_omni.data_entry_keys import CodesStruct, MetaStruct, OmniPayloadStruct
 from vllm_omni.errors import OmniClientError
-from vllm_omni.model_executor.models.kimi_audio.prompt import KimiAudioSpecialTokens
+from vllm_omni.model_executor.models.kimi_audio.prompt import KimiAudioPreparedInput, KimiAudioSpecialTokens
 from vllm_omni.model_executor.models.kimi_audio.sampling import KimiAudioSamplingParams
 
 
@@ -91,8 +90,8 @@ def prepare_kimi_audio_request(prompt: dict[str, Any], sampling_params_list: Seq
     except (TypeError, ValueError) as exc:
         raise OmniClientError(str(exc)) from None
 
-    payload = deserialize_payload(msgspec.convert(info["kimi_audio_input"], AdditionalInformationPayload))
-    special = KimiAudioSpecialTokens(**payload["meta"]["special_tokens"])
+    prepared = KimiAudioPreparedInput.from_wire(info["kimi_audio_input"])
+    special = KimiAudioSpecialTokens(**prepared.special_tokens)
     # Only blanks are returned to the scheduler before completion, then one
     # msg_end. True text/audio IDs stay in the model's two histories, so the
     # native tokenizer's different EOS cannot prematurely end either stream.
@@ -133,15 +132,13 @@ def kimi_audio_to_decoder(
     Offset and vocabulary size come from the prepared prompt's model config.
     This adapter consumes full requests, not async_chunk deltas.
     """
-    wire = prompt["model_intermediate_buffer"]["kimi_audio_input"]
-    config = deserialize_payload(msgspec.convert(wire, AdditionalInformationPayload))
-    meta = config["meta"]
-    if meta["output_type"] != "both":
+    prepared = KimiAudioPreparedInput.from_wire(prompt["model_intermediate_buffer"]["kimi_audio_input"])
+    if prepared.output_type != "both":
         raise OmniClientError(
             "Kimi-Audio output_type='text' cannot feed the audio decoder; "
             "use output_type='both' for audio output or select only the text stage"
         )
-    offset, vocab_size = meta["audio_token_offset"], meta["audio_vocab_size"]
+    offset, vocab_size = prepared.audio_token_offset, prepared.audio_vocab_size
     inputs = []
     for source in source_outputs:
         if not source.finished:
@@ -196,14 +193,12 @@ def kimi_audio_to_decoder_async_chunk(
     try:
         state = transfer_manager.request_payload.setdefault(request_id, {})
         if "kimi_audio" not in state:
-            wire = request.model_intermediate_buffer["kimi_audio_input"]
-            config = deserialize_payload(msgspec.convert(wire, AdditionalInformationPayload))
-            meta = config["meta"]
-            if meta["output_type"] != "both":
+            prepared = KimiAudioPreparedInput.from_wire(request.model_intermediate_buffer["kimi_audio_input"])
+            if prepared.output_type != "both":
                 raise ValueError("Kimi-Audio audio streaming requires output_type='both'")
             state["kimi_audio"] = {
-                "offset": meta["audio_token_offset"],
-                "vocab_size": meta["audio_vocab_size"],
+                "offset": prepared.audio_token_offset,
+                "vocab_size": prepared.audio_vocab_size,
                 "chunk_seq": 0,
             }
         state = state["kimi_audio"]

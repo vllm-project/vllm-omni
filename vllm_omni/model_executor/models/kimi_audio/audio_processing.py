@@ -11,12 +11,11 @@ from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
 from typing import TYPE_CHECKING, Literal
 
-import msgspec
 import numpy as np
 import torch
 from transformers import WhisperFeatureExtractor
 
-from .prompt import KimiAudioEncodedAudio, KimiAudioPromptBuilder
+from .prompt import KimiAudioEncodedAudio, KimiAudioPreparedInput, KimiAudioPromptBuilder
 
 if TYPE_CHECKING:
     from vllm_omni.inputs.data import OmniTokensPrompt
@@ -90,8 +89,6 @@ def prepare_kimi_audio_inputs(
     Encoders run in the worker; AR ``preprocess`` adds the aligned text stream.
     Resource URLs/paths are never sent to the worker.
     """
-    from vllm_omni.data_entry_keys import serialize_payload
-
     audio_inputs = {} if audio_inputs is None else audio_inputs
     expected = {i for i, message in enumerate(messages) if message.get("message_type") in ("audio", "audio-text")}
     if set(audio_inputs) != expected:
@@ -100,14 +97,6 @@ def prepare_kimi_audio_inputs(
         raise ValueError("Kimi-Audio expects audio resampled to 16000 Hz by the input layer")
     placeholders = {}
     mm_audio = []
-    payload = {
-        "meta": {
-            "output_type": output_type,
-            "special_tokens": asdict(prompt_builder.tokens),
-            "audio_token_offset": prompt_builder.audio_token_offset,
-            "audio_vocab_size": prompt_builder.audio_vocab_size,
-        }
-    }
     for index in sorted(audio_inputs):
         waveform = audio_inputs[index]
         if waveform.ndim != 1 or waveform.size == 0 or not np.issubdtype(waveform.dtype, np.floating):
@@ -134,14 +123,18 @@ def prepare_kimi_audio_inputs(
         output_type=output_type,
         add_assistant_start_msg=add_assistant_start_msg,
     )
-    payload.update(
+    prepared = KimiAudioPreparedInput(
         text_token_ids=layout.text_token_ids,
         audio_token_ids=layout.audio_token_ids,
-        audio_spans=[[index, start, end] for index, (start, end) in layout.audio_spans.items()],
+        audio_spans=[(index, start, end) for index, (start, end) in layout.audio_spans.items()],
+        output_type=output_type,
+        special_tokens=asdict(prompt_builder.tokens),
+        audio_token_offset=prompt_builder.audio_token_offset,
+        audio_vocab_size=prompt_builder.audio_vocab_size,
     )
     # Only the dual-stream layout crosses Omni's request-buffer boundary.
     # Waveforms and encoding modes enter native MM processing and caching.
-    wire = msgspec.to_builtins(serialize_payload(payload))
+    wire = prepared.to_wire()
     return {
         "prompt_token_ids": layout.audio_token_ids,
         **({"multi_modal_data": {"audio": mm_audio}} if mm_audio else {}),

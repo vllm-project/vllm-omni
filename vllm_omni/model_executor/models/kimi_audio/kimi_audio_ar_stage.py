@@ -14,7 +14,7 @@ from vllm.model_executor.models.interfaces import SupportsPP
 from vllm.sequence import IntermediateTensors
 
 from .audio_processing import CHUNK_SAMPLES, SAMPLE_RATE, SAMPLES_PER_TOKEN, KimiAudioWhisperInputs
-from .prompt import KimiAudioEncodedAudio, KimiAudioSpecialTokens
+from .prompt import KimiAudioEncodedAudio, KimiAudioPreparedInput, KimiAudioSpecialTokens
 from .sampling import KimiAudioSamplingParams, sample_kimi_audio_step
 
 if TYPE_CHECKING:
@@ -776,11 +776,6 @@ class KimiAudioARStage(torch.nn.Module, SupportsPP):
         Absolute offsets also handle one-token prefill tails and replay across
         the prompt/generation boundary without advancing either history.
         """
-        import msgspec
-
-        from vllm_omni.data_entry_keys import deserialize_payload
-        from vllm_omni.engine import AdditionalInformationPayload
-
         generation = info_dict.get("kimi_audio_generation")
         if not info_dict.get("_omni_is_prefill", False) and generation is None:
             raise ValueError("Missing Kimi-Audio generation state for decode")
@@ -797,30 +792,29 @@ class KimiAudioARStage(torch.nn.Module, SupportsPP):
             wire = info_dict.get("kimi_audio_input")
             if wire is None:
                 raise ValueError("Missing Kimi-Audio prepared input; use prepare_kimi_audio_inputs")
-            payload = deserialize_payload(msgspec.convert(wire, AdditionalInformationPayload))
-            meta = payload["meta"]
-            audio_ids = payload["audio_token_ids"]
-            text_ids = payload["text_token_ids"]
+            payload = KimiAudioPreparedInput.from_wire(wire)
+            audio_ids = payload.audio_token_ids
+            text_ids = payload.text_token_ids
             if not len(audio_ids) == len(text_ids) == prompt_len:
                 raise ValueError("Kimi-Audio prepared input length differs from the scheduled prompt")
             last_end = 0
-            for _, start, stop in payload["audio_spans"]:
+            for _, start, stop in payload.audio_spans:
                 if not last_end <= start < stop <= prompt_len:
                     raise ValueError("Invalid or overlapping Kimi-Audio audio spans")
                 last_end = stop
             update["kimi_audio_prompt"] = payload
             if generation is None:
-                KimiAudioSpecialTokens(**meta["special_tokens"])
-                if any(not 0 <= value < self.config.vocab_size for value in meta["special_tokens"].values()):
+                KimiAudioSpecialTokens(**payload.special_tokens)
+                if any(not 0 <= value < self.config.vocab_size for value in payload.special_tokens.values()):
                     raise ValueError("Kimi-Audio special tokens exceed the checkpoint vocabulary")
-                if meta["output_type"] not in ("text", "both"):
+                if payload.output_type not in ("text", "both"):
                     raise ValueError("Kimi-Audio requires output_type text/both")
                 generation = {
-                    "special_tokens": meta["special_tokens"],
+                    "special_tokens": payload.special_tokens,
                     "seed": info_dict.get("_omni_seed"),
                     "max_tokens": info_dict.get("_omni_max_tokens"),
                     "prompt_len": prompt_len,
-                    "output_type": meta["output_type"],
+                    "output_type": payload.output_type,
                     "text_history": [],
                     "audio_history": [],
                     "scheduler_history": [],
@@ -843,16 +837,16 @@ class KimiAudioARStage(torch.nn.Module, SupportsPP):
         ids, embeds = [], []
         if offset < prompt_len:
             stop = min(end, prompt_len)
-            prompt_ids = payload["audio_token_ids"][offset:stop]
+            prompt_ids = payload.audio_token_ids[offset:stop]
             # With audio disabled, Omni may pass an uninitialized embedding
             # buffer to preprocess. Text-only prompts need no MM cache values.
-            if input_embeds is None or not payload["audio_spans"]:
-                if any(start < stop and span_end > offset for _, start, span_end in payload["audio_spans"]):
+            if input_embeds is None or not payload.audio_spans:
+                if any(start < stop and span_end > offset for _, start, span_end in payload.audio_spans):
                     raise ValueError("Kimi-Audio audio spans require native multimodal embeddings")
                 audio = self.embed_tokens(input_ids[: stop - offset])
             else:
                 audio = input_embeds[: stop - offset]
-            text = torch.tensor(payload["text_token_ids"][offset:stop], device=input_ids.device, dtype=torch.long)
+            text = torch.tensor(payload.text_token_ids[offset:stop], device=input_ids.device, dtype=torch.long)
             ids.extend(prompt_ids)
             embeds.append(audio + self.embed_tokens(text))
         if end > prompt_len:
