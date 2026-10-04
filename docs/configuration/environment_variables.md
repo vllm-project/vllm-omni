@@ -223,11 +223,11 @@ Every audited model-specific name has a migration disposition in the
 
 | Disposition | Count | Required outcome |
 | --- | ---: | --- |
-| Promote | 64 | Move a stable setting into typed stage or model configuration. |
+| Promote | 66 | Move a stable setting into typed stage or model configuration. |
 | Request scope | 5 | Move request-varying behavior into a declared request-option schema. |
 | External | 0 | Retain only when a supported third-party library owns the contract. |
 | Internalize | 17 | Keep a debug or diagnostic switch out of public documentation and configuration. |
-| Deprecate/remove | 7 | Remove a compatibility escape hatch that has no continuing contract. |
+| Deprecate/remove | 5 | Remove a compatibility escape hatch that has no continuing contract. |
 
 The disposition is a migration target, not a statement that the existing
 environment switch is stable. Promote or request-scope work should land in
