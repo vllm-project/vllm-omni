@@ -16,11 +16,6 @@ from torch.cuda import CUDAGraph
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 
-from vllm_omni.model_executor.models.minicpmo_4_5.whole_euler_ops import (
-    euler_cfg_step,
-    fused_euler_supported,
-    stage_estimator_input,
-)
 from vllm_omni.utils.device_copy import index_to_device, to_device_nonblocking
 
 logger = init_logger(__name__)
@@ -1041,7 +1036,6 @@ class WholeEulerCFMGraphWrapper:
         modulation_fn: Callable[[torch.Tensor], torch.Tensor] | None = None,
         att_slots: int = 0,
         row_offsets: bool = False,
-        fused_euler_step: bool = False,
     ) -> None:
         """``ragged_body(estimator, input, t_emb, mask, cnn, att, cnn_out, att_out, lengths)``
         replaces ``estimator.blocks_forward_chunk`` in the captured solve when
@@ -1058,11 +1052,8 @@ class WholeEulerCFMGraphWrapper:
         caches resident in an ``AttSlotPool``: streaming chunks replay graphs
         keyed by batch and width alone, with no cache copies, and with
         ``row_offsets`` rows of different cache lengths share one replay.
-        ``fused_euler_step`` runs each CFG Euler update as one pass
-        (``whole_euler_ops.py``; same values).
         """
         self.estimator = estimator
-        self.fused_euler_step = bool(fused_euler_step)
         self.ragged_body = ragged_body
         self.modulation_fn = modulation_fn if ragged_body is not None else None
         self.n_timesteps = int(n_timesteps)
@@ -1174,23 +1165,11 @@ class WholeEulerCFMGraphWrapper:
         # A slot-pool graph attends to the pool in place: no cache goes in.
         slotted = statics.slot_rows is not None
         no_cache = [None] * len(self.estimator.blocks)
-        fused_step = self.fused_euler_step and fused_euler_supported(cur_x)
-        if fused_step:
-            # Frames-major estimator input, staged once; each fused step rewrites only x.
-            in_channels = sum(int(t.shape[1]) for t in (cur_x, statics.mu_cfg, statics.speakers_cfg, statics.cond_cfg))
-            staged = cur_x.new_empty((2 * batch_size, width, in_channels))
-            stage_estimator_input(staged, cur_x, statics.mu_cfg, statics.speakers_cfg, statics.cond_cfg)
-            # Out of place: padded rows of ``statics.x`` keep their values across replays.
-            next_x = torch.empty_like(cur_x)
-
         for step in range(self.n_timesteps):
             dt = self.dt_steps[step]
-            if fused_step:
-                estimator_input = staged.transpose(1, 2)
-            else:
-                x_cfg = torch.cat((cur_x, cur_x), dim=0)
-                speaker_features = statics.speakers_cfg.unsqueeze(-1).expand(-1, -1, width)
-                estimator_input = torch.cat((x_cfg, statics.mu_cfg, speaker_features, statics.cond_cfg), dim=1)
+            x_cfg = torch.cat((cur_x, cur_x), dim=0)
+            speaker_features = statics.speakers_cfg.unsqueeze(-1).expand(-1, -1, width)
+            estimator_input = torch.cat((x_cfg, statics.mu_cfg, speaker_features, statics.cond_cfg), dim=1)
             args = (
                 estimator_input,
                 statics.time_embeddings[step],
@@ -1209,18 +1188,7 @@ class WholeEulerCFMGraphWrapper:
             else:
                 estimate = self.estimator.blocks_forward_chunk(*args)
 
-            if fused_step:
-                last = step + 1 == self.n_timesteps
-                cur_x = euler_cfg_step(
-                    next_x,
-                    cur_x,
-                    estimate,
-                    dt,
-                    self.inference_cfg_rate,
-                    None if last else staged,
-                )
-            else:
-                cur_x = _euler_step(cur_x, estimate, dt, self.inference_cfg_rate, batch_size)
+            cur_x = _euler_step(cur_x, estimate, dt, self.inference_cfg_rate, batch_size)
 
         return cur_x
 
@@ -1777,7 +1745,8 @@ class WholeEulerCFMGraphWrapper:
         room = self.max_graphs - len(self._cache)
         if len(keys) > room:
             logger.warning(
-                "Whole-Euler precapture requested %d graphs; max_graphs budget is %d (room=%d). Excess shapes will execute eagerly",
+                "Whole-Euler precapture requested %d graphs; max_graphs budget is %d (room=%d). "
+                "Excess shapes will execute eagerly",
                 len(keys),
                 self.max_graphs,
                 room,

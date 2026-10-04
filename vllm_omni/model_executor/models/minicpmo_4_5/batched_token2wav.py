@@ -478,7 +478,6 @@ class BatchedToken2Wav(nn.Module):
                         # The fused body takes each timestep's modulation, computed once outside the graphs.
                         modulation_fn=functools.partial(dit_modulation, estimator) if self._ragged_fused_body else None,
                         row_offsets=self._row_offset_merge,
-                        fused_euler_step=bool(cfm_graph_cfg.get("fused_euler_step", False)),
                     )
                     logger.info(
                         "Whole-Euler CFM CUDA Graph enabled "

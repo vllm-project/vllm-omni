@@ -341,7 +341,6 @@ class MiniCPMO45Code2Wav(nn.Module):
             "fused_body": bool(extra.get("cfm_fused_body", False)),
             "slot_pool": bool(extra.get("cfm_slot_pool", False)),
             "row_offset_merge": extra.get("cfm_row_offset_merge", False) is True,
-            "fused_euler_step": extra.get("cfm_fused_euler_step", False) is True,
         }
         # Exact-shape flow-encoder graphs (``FlowEncoderGraphs``, default off).
         # ``cfm_encoder_graph_rows`` is the largest row count or a list of counts.
