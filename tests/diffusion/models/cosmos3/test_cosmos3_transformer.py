@@ -1050,7 +1050,8 @@ def test_multi_control_attention_weights_target_outputs() -> None:
     from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3 import Cosmos3CrossAttention
 
     class ControlValueAttention:
-        def __call__(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        def __call__(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, metadata) -> torch.Tensor:
+            assert metadata.extra["protected_kv_prefix"] == 1
             del k
             # Each per-control K/V layout is [text, control_i, target].
             return v[:, 1:2].expand(q.shape[0], q.shape[1], -1, -1)
@@ -1394,3 +1395,247 @@ def test_compute_rope_freqs_places_text_video_action_and_sound_positions() -> No
     )
     _, offset_gen_pos = rotary.position_ids
     assert offset_gen_pos[0, 0].tolist() == [102, 103, 104, 105, 106, 107]
+
+
+@pytest.mark.cuda
+@pytest.mark.parametrize("multi_control_sparse", [False, True])
+@torch.inference_mode()
+def test_cosmos3_sparse_recipe_constructs_model_and_dispatches(monkeypatch, multi_control_sparse):
+    """Exercise model-owned roles and prefix metadata, not a hand-built Attention."""
+    import json
+    from pathlib import Path
+
+    from tests.helpers.block_sparse import selected_attention_reference
+    from vllm_omni.diffusion.attention import layer as layer_mod
+    from vllm_omni.diffusion.attention.block_sparse import BlockSparseAttention
+    from vllm_omni.diffusion.attention.parallel.base import NoParallelAttention
+    from vllm_omni.diffusion.config import set_current_diffusion_config
+    from vllm_omni.diffusion.data import AttentionConfig
+    from vllm_omni.diffusion.models.cosmos3 import transformer_cosmos3
+
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (9, 0):
+        pytest.skip("Requires Hopper SM90 and FA4")
+    pytest.importorskip("flash_attn.cute")
+    monkeypatch.setattr(layer_mod, "build_parallel_attention_strategy", lambda **kwargs: NoParallelAttention())
+    monkeypatch.setattr(transformer_cosmos3, "_is_sp_active", lambda: False)
+    recipe = json.loads((Path(__file__).resolve().parents[4] / "recipes/attention/fa4-subblock.json").read_text())
+    if multi_control_sparse:
+        recipe["per_role"]["cosmos3.gen_multi_control"] = recipe["per_role"]["cosmos3.gen"]
+    cfg = SimpleNamespace(
+        tf_model_config=_tiny_cosmos3_config(
+            hidden_size=256,
+            intermediate_size=512,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=128,
+            rope_scaling={"mrope_section": [24, 20, 20]},
+        ),
+        diffusion_attention_config=AttentionConfig(**recipe),
+        parallel_config=SimpleNamespace(ring_degree=1),
+        dtype=torch.bfloat16,
+        diffusion_kv_cache_dtype=None,
+        diffusion_kv_cache_skip_step_indices=None,
+        diffusion_kv_cache_skip_layer_indices=None,
+    )
+    with set_current_diffusion_config(cfg):
+        model = transformer_cosmos3.Cosmos3VFMTransformer(cfg).to(device="cuda", dtype=cfg.dtype)
+    # No checkpoint is needed to exercise construction and attention dispatch.
+    for parameter in model.parameters():
+        parameter.fill_(1) if parameter.ndim == 1 else parameter.normal_(std=0.02)
+    understanding = model.language_model.layers[0].self_attn
+    generation = model.gen_layers[0].cross_attention
+    assert understanding.attn.role == "cosmos3.und"
+    assert understanding.attn.role_category == "self"
+    assert not isinstance(understanding.attn.attention, BlockSparseAttention)
+    assert generation.attn.role == "cosmos3.gen"
+    assert generation.attn.role_category == "self"
+    assert isinstance(generation.attn.attention, BlockSparseAttention)
+    assert generation.multi_control_attn.role == "cosmos3.gen_multi_control"
+    assert isinstance(generation.multi_control_attn.attention, BlockSparseAttention) == multi_control_sparse
+
+    calls: list[str] = []
+
+    def check_dispatch(layer, args, output):
+        q, k, v, metadata = args
+        assert metadata.extra["protected_kv_prefix"] == prefix_length
+        torch.testing.assert_close(k[:, :prefix_length], k_und)
+        torch.testing.assert_close(v[:, :prefix_length], v_und)
+        calls.append(layer.role)
+        if isinstance(layer.attention, BlockSparseAttention):
+            impl = layer.attention
+            selection = impl.selector.select(q, k, impl.scale, prefix_length)
+            protected_blocks = (prefix_length + impl.block_size[1] - 1) // impl.block_size[1]
+            expected_prefix = torch.arange(protected_blocks, device=q.device, dtype=torch.int32)
+            torch.testing.assert_close(
+                selection.indices[..., :protected_blocks],
+                expected_prefix.expand(*selection.indices.shape[:-1], protected_blocks),
+            )
+            expected = selected_attention_reference(q, k, v, selection, impl.scale, impl.block_size)
+            torch.testing.assert_close(output.float(), expected, atol=0.004, rtol=0.02)
+
+    generation.attn.register_forward_hook(check_dispatch)
+    generation.multi_control_attn.register_forward_hook(check_dispatch)
+    hidden = torch.randn(1, 2049, 256, device="cuda", dtype=cfg.dtype)
+    cos = torch.ones(1, hidden.shape[1], 1, 128, device="cuda", dtype=cfg.dtype)
+    sin = torch.zeros_like(cos)
+    for prefix_length in (0, 65):
+        if prefix_length:
+            text = hidden[:, :prefix_length]
+            _, k_und, v_und = understanding(text, cos[:, :prefix_length], sin[:, :prefix_length])
+        else:
+            k_und = v_und = hidden.new_empty(1, 0, 1, 128)
+        calls.clear()
+        output = generation(hidden, k_und, v_und, cos, sin)
+        assert output.shape == hidden.shape
+        assert calls == ["cosmos3.gen"]
+        calls.clear()
+        output = generation(
+            hidden,
+            k_und,
+            v_und,
+            cos,
+            sin,
+            control_token_sizes=(64, 64),
+            control_weights=(0.25, 0.75),
+        )
+        assert output.shape == hidden.shape
+        assert calls == ["cosmos3.gen_multi_control", "cosmos3.gen_multi_control"]
+
+
+@pytest.mark.parametrize(
+    "overrides,expected",
+    [
+        ({"self": {"backend": "TORCH_SDPA"}}, ("SDPA", "SDPA", "SDPA")),
+        ({"cross": {"backend": "TORCH_SDPA"}}, ("FLASH_ATTN", "FLASH_ATTN", "FLASH_ATTN")),
+        (
+            {
+                "self": {"backend": "TORCH_SDPA"},
+                "cross": {"backend": "TORCH_SDPA"},
+                "cosmos3.gen": {"backend": "FLASH_ATTN"},
+                "cosmos3.gen_multi_control": {"backend": "FLASH_ATTN"},
+            },
+            ("SDPA", "FLASH_ATTN", "FLASH_ATTN"),
+        ),
+    ],
+)
+def test_cosmos3_exact_roles_preserve_legacy_self_category(monkeypatch, overrides, expected):
+    from vllm_omni.diffusion.attention import layer as layer_mod
+    from vllm_omni.diffusion.attention.parallel.base import NoParallelAttention
+    from vllm_omni.diffusion.config import set_current_diffusion_config
+    from vllm_omni.diffusion.data import AttentionConfig
+    from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3 import Cosmos3VFMTransformer
+
+    monkeypatch.setattr(layer_mod, "build_parallel_attention_strategy", lambda **kwargs: NoParallelAttention())
+    cfg = SimpleNamespace(
+        tf_model_config=_tiny_cosmos3_config(
+            hidden_size=256,
+            intermediate_size=512,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=128,
+            rope_scaling={"mrope_section": [24, 20, 20]},
+        ),
+        diffusion_attention_config=AttentionConfig(default={"backend": "FLASH_ATTN"}, per_role=overrides),
+        parallel_config=SimpleNamespace(ring_degree=1),
+        dtype=torch.bfloat16,
+        diffusion_kv_cache_dtype=None,
+        diffusion_kv_cache_skip_step_indices=None,
+        diffusion_kv_cache_skip_layer_indices=None,
+    )
+    with set_current_diffusion_config(cfg):
+        model = Cosmos3VFMTransformer(cfg)
+    generation = model.gen_layers[0].cross_attention
+    layers = (model.language_model.layers[0].self_attn.attn, generation.attn, generation.multi_control_attn)
+    assert tuple(layer.role for layer in layers) == ("cosmos3.und", "cosmos3.gen", "cosmos3.gen_multi_control")
+    assert all(layer.role_category == "self" for layer in layers)
+    assert tuple(layer.attn_backend.get_name() for layer in layers) == expected
+
+
+@pytest.mark.cuda
+@pytest.mark.parametrize("tp_rank", [0, 1])
+@pytest.mark.parametrize("sparse_role", ["cosmos3.gen", "cosmos3.gen_multi_control"])
+@torch.inference_mode()
+def test_cosmos3_sparse_tensor_parallel_local_heads(monkeypatch, tp_rank, sparse_role):
+    """Run real sharded projections and sparse attention; exclude the output collective."""
+    from vllm.model_executor import parameter
+    from vllm.model_executor.layers import linear
+
+    from tests.helpers.block_sparse import selected_attention_reference
+    from vllm_omni.diffusion.attention import layer as layer_mod
+    from vllm_omni.diffusion.attention.parallel.base import NoParallelAttention
+    from vllm_omni.diffusion.config import set_current_diffusion_config
+    from vllm_omni.diffusion.data import AttentionConfig
+    from vllm_omni.diffusion.models.cosmos3 import transformer_cosmos3
+
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (9, 0):
+        pytest.skip("Requires Hopper SM90 and FA4")
+    pytest.importorskip("flash_attn.cute")
+    for module in (linear, parameter):
+        monkeypatch.setattr(module, "get_tensor_model_parallel_rank", lambda: tp_rank)
+        monkeypatch.setattr(module, "get_tensor_model_parallel_world_size", lambda: 2)
+    monkeypatch.setattr(transformer_cosmos3, "get_tensor_model_parallel_world_size", lambda: 2)
+    monkeypatch.setattr(transformer_cosmos3, "_is_sp_active", lambda: False)
+    monkeypatch.setattr(layer_mod, "build_parallel_attention_strategy", lambda **kwargs: NoParallelAttention())
+    cfg = SimpleNamespace(
+        diffusion_attention_config=AttentionConfig(
+            default={"backend": "FLASH_ATTN"},
+            per_role={
+                sparse_role: {
+                    "name": "block_sparse",
+                    "config": {
+                        "block_size": [64, 64],
+                        "selection": {"name": "block_topk", "config": {"target_sparsity": 0.75}},
+                        "backend": {"require": "FLASH_ATTN", "implementation": "auto"},
+                    },
+                }
+            },
+        ),
+        parallel_config=SimpleNamespace(tensor_parallel_size=2, ring_degree=1),
+        diffusion_kv_cache_dtype=None,
+        diffusion_kv_cache_skip_step_indices=None,
+        diffusion_kv_cache_skip_layer_indices=None,
+    )
+    with set_current_diffusion_config(cfg):
+        attention = transformer_cosmos3.Cosmos3CrossAttention(
+            hidden_size=512,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=128,
+            rms_norm_eps=1e-6,
+        ).to(device="cuda", dtype=torch.bfloat16)
+    # Validate the attention boundary on each TP rank without simulating all-reduce.
+    attention.to_out = nn.Identity()
+    for weight in attention.parameters():
+        weight.fill_(1) if weight.ndim == 1 else weight.normal_(std=0.02)
+    for layer in (attention.attn, attention.multi_control_attn):
+        assert layer.num_heads == 2 and layer.num_kv_heads == 1
+    calls = []
+
+    def check_local_attention(layer, args, output):
+        q, k, v, metadata = args
+        assert q.shape[2] == 2 and k.shape[2] == v.shape[2] == 1
+        assert metadata.extra["protected_kv_prefix"] == 65
+        impl = layer.attention
+        selection = impl.selector.select(q, k, impl.scale, 65)
+        expected = selected_attention_reference(q, k, v, selection, impl.scale, impl.block_size)
+        torch.testing.assert_close(output.float(), expected, atol=0.004, rtol=0.02)
+        calls.append(layer.role)
+
+    target = attention.attn if sparse_role == "cosmos3.gen" else attention.multi_control_attn
+    target.register_forward_hook(check_local_attention)
+    hidden = torch.randn(1, 1153, 512, device="cuda", dtype=torch.bfloat16)
+    k_und, v_und = (torch.randn(1, 65, 1, 128, device=hidden.device, dtype=hidden.dtype) for _ in range(2))
+    cos = torch.ones(1, hidden.shape[1], 1, 128, device=hidden.device, dtype=hidden.dtype)
+    kwargs = (
+        {}
+        if sparse_role == "cosmos3.gen"
+        else {
+            "control_token_sizes": (64, 64),
+            "control_weights": (0.25, 0.75),
+        }
+    )
+    output = attention(hidden, k_und, v_und, cos, torch.zeros_like(cos), **kwargs)
+    assert output.shape == (1, 1153, 256)
+    assert calls == [sparse_role] * (1 if sparse_role == "cosmos3.gen" else 2)

@@ -10,6 +10,7 @@ import pytest
 import torch
 from safetensors.torch import save_file
 
+from vllm_omni.diffusion.data import AttentionConfig, AttentionSpec
 from vllm_omni.diffusion.models.minimax_h3.fasth3 import (
     FASTH3_BASE_MODEL,
     FASTH3_BASE_SCHEDULE,
@@ -459,7 +460,7 @@ def test_a_vsa_variant_accepts_normalized_attention_config(tmp_path):
     sparse = tmp_path / "vsa" / "adapter_model.safetensors"
     _write_adapter(sparse, tensors={"transformer_blocks.0.attn.to_gate_compress.set_weight": torch.ones((2, 2))})
     od_config = SimpleNamespace(
-        diffusion_attention_config=SimpleNamespace(default=SimpleNamespace(backend="FASTVIDEO_VSA")),
+        diffusion_attention_config=AttentionConfig(default=AttentionSpec(backend="FASTVIDEO_VSA")),
         parallel_config=SimpleNamespace(sequence_parallel_size=1),
     )
     _load(sparse.parent).check_serving_contract(
@@ -467,8 +468,9 @@ def test_a_vsa_variant_accepts_normalized_attention_config(tmp_path):
     )
 
 
-def test_a_vsa_variant_reads_the_backend_the_dit_will_actually_resolve(tmp_path):
-    # The 50 DiT blocks carry attention role "self", so a per_role entry - not
+@pytest.mark.parametrize("role", ["self", "minimax_h3.dit"])
+def test_a_vsa_variant_reads_the_backend_the_dit_will_actually_resolve(tmp_path, role):
+    # The exact DiT role or legacy self category override - not
     # the default - decides whether the compression gates ever reach a sparse
     # kernel.
     sparse = tmp_path / "vsa" / "adapter_model.safetensors"
@@ -477,9 +479,9 @@ def test_a_vsa_variant_reads_the_backend_the_dit_will_actually_resolve(tmp_path)
     contract = {"partition": "fl2va", "video_shift": 12.0, "audio_shift": 3.0}
 
     dense_dit = SimpleNamespace(
-        diffusion_attention_config=SimpleNamespace(
-            default=SimpleNamespace(backend="FASTVIDEO_VSA"),
-            per_role={"self": SimpleNamespace(backend="TRTLLM_ATTN")},
+        diffusion_attention_config=AttentionConfig(
+            default=AttentionSpec(backend="FASTVIDEO_VSA"),
+            per_role={role: AttentionSpec(backend="TRTLLM_ATTN")},
         ),
         parallel_config=SimpleNamespace(sequence_parallel_size=1),
     )
@@ -487,9 +489,9 @@ def test_a_vsa_variant_reads_the_backend_the_dit_will_actually_resolve(tmp_path)
         fusion.check_serving_contract(od_config=dense_dit, **contract)
 
     sparse_dit = SimpleNamespace(
-        diffusion_attention_config=SimpleNamespace(
+        diffusion_attention_config=AttentionConfig(
             default=None,
-            per_role={"self": SimpleNamespace(backend="FASTVIDEO_VSA")},
+            per_role={role: AttentionSpec(backend="FASTVIDEO_VSA")},
         ),
         parallel_config=SimpleNamespace(sequence_parallel_size=1),
     )

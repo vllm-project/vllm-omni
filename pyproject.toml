@@ -120,7 +120,7 @@ quack = [
 # Optional Blackwell-native FlashAttention-4 backend. Keep this opt-in because
 # the CuTe/CUTLASS dependency is CUDA 13 and Blackwell specific.
 fa4 = [
-    "flash-attn-4[cu13]==4.0.0b18",
+    "flash-attn-4[cu13]==4.0.0b33",
 ]
 
 # FastVideo VSA kernels for the supported Linux/Python 3.12 wheel environment.

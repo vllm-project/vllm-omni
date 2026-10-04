@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import cache
 from typing import TYPE_CHECKING
 
 import torch
@@ -14,7 +15,10 @@ from vllm_omni.diffusion.attention.backends.abstract import (
     AttentionBackend,
     AttentionImpl,
     AttentionMetadata,
+    BlockSparseAdapter,
 )
+from vllm_omni.diffusion.attention.block_selection.abstract import BlockSelection
+from vllm_omni.diffusion.attention.capabilities import CompilationMode
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.attention.backends.sdpa import SDPAImpl
@@ -34,8 +38,147 @@ except Exception as e:
     )
 
 
+if not hasattr(torch.ops.vllm_omni, "flashinfer_selected_attention"):
+
+    @torch.library.custom_op("vllm_omni::flashinfer_selected_attention", mutates_args=())
+    def _flashinfer_selected_attention_op(
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        indices: torch.Tensor,
+        counts: torch.Tensor,
+        scale: float,
+        block_q: int,
+        block_kv: int,
+        implementation: str,
+    ) -> torch.Tensor:
+        return FlashInferSparseAdapter._run(
+            query, key, value, indices, counts, scale, (block_q, block_kv), implementation
+        )
+
+    @_flashinfer_selected_attention_op.register_fake
+    def _flashinfer_selected_attention_fake(
+        query, key, value, indices, counts, scale, block_q, block_kv, implementation
+    ):
+        return query.new_empty((*query.shape[:-1], value.shape[-1]))
+
+
+_flashinfer_selected_attention_op = torch.ops.vllm_omni.flashinfer_selected_attention
+
+
+class FlashInferSparseAdapter(BlockSparseAdapter):
+    """MHA selected-block execution through FlashInfer's variable-block API.
+
+    This API permits a different pattern per KV head, not per grouped query
+    head. Reject GQA/MQA rather than changing selections or replicating K/V.
+    Plans and workspaces are invocation-local: planning consumes the current
+    selection on every call, including calls inside an opaque compiled op.
+    """
+
+    provider = "FLASHINFER_ATTN"
+    compilation_mode = CompilationMode.CUSTOM_OP
+
+    @staticmethod
+    @cache
+    def _load_api():
+        import flashinfer
+        from flashinfer.sparse import VariableBlockSparseAttentionWrapper
+
+        return VariableBlockSparseAttentionWrapper, flashinfer.__version__
+
+    @staticmethod
+    def validate_selection(implementation: str, head_size: int) -> None:
+        # The provider owns backend IDs and validates them during planning.
+        # Do not maintain a second, closed list of FlashInfer kernel names.
+        if not isinstance(implementation, str) or not implementation:
+            raise ValueError("FlashInfer implementation must be a nonempty provider backend ID")
+
+    def prepare(
+        self,
+        implementation: str,
+        head_size: int,
+        num_heads: int,
+        num_kv_heads: int,
+        device: torch.device,
+        block_size: tuple[int, int],
+    ) -> None:
+        self.validate_selection(implementation, head_size)
+        if device.type != "cuda":
+            raise ValueError("FlashInfer block-sparse attention requires CUDA")
+        if num_heads != num_kv_heads:
+            raise ValueError("FlashInfer variable-block adapter requires MHA; per-query-head GQA/MQA is unsupported")
+        _, self.dependency_version = self._load_api()
+        self.implementation = implementation
+        self.kernel_variant = f"flashinfer_variable_{implementation}"
+
+    def validate_inputs(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor) -> None:
+        if query.shape[2] != key.shape[2]:
+            raise ValueError("FlashInfer variable-block adapter requires MHA; per-query-head GQA/MQA is unsupported")
+        if value.shape[-1] != query.shape[-1]:
+            raise ValueError("FlashInfer variable-block adapter requires equal Q/K/V head dimensions")
+
+    @classmethod
+    def _run(cls, query, key, value, indices, counts, scale, block_size, implementation):
+        wrapper_cls, _ = cls._load_api()
+        batch, query_length, heads, head_size = query.shape
+        key_length = key.shape[1]
+        block_q, block_kv = block_size
+        query_blocks = (query_length + block_q - 1) // block_q
+        key_blocks = (key_length + block_kv - 1) // block_kv
+        # Reserve a throwaway column for unspecified padding entries. It avoids
+        # indexing arbitrary padding IDs or overwriting an active selected bit.
+        active = torch.arange(indices.shape[-1], device=query.device) < counts[..., None]
+        columns = torch.where(active, indices, key_blocks).long()
+        mask = torch.zeros(*counts.shape, key_blocks + 1, device=query.device, dtype=torch.bool)
+        mask.scatter_(-1, columns, True)
+        mask = mask[..., :key_blocks].reshape(batch * heads, query_blocks, key_blocks).contiguous()
+
+        def block_lengths(length, width, blocks):
+            sizes = (length - torch.arange(blocks, device=query.device, dtype=torch.int32) * width).clamp(max=width)
+            return sizes.expand(batch * heads, blocks).contiguous()
+
+        # Fold independent batch entries into independent MHA heads. No token
+        # duplication, cross-batch attention, block subdivision or K/V expansion.
+        packed = [t.permute(0, 2, 1, 3).reshape(batch * heads, t.shape[1], head_size) for t in (query, key, value)]
+        workspace = torch.empty(128 * 1024 * 1024, device=query.device, dtype=torch.uint8)
+        wrapper = wrapper_cls(workspace, backend=implementation)
+        wrapper.plan(
+            mask,
+            block_lengths(query_length, block_q, query_blocks),
+            block_lengths(key_length, block_kv, key_blocks),
+            batch * heads,
+            batch * heads,
+            head_size,
+            causal=False,
+            sm_scale=scale,
+            q_data_type=query.dtype,
+            kv_data_type=key.dtype,
+            non_blocking=False,
+        )
+        result = wrapper.run(*packed)
+        return result.reshape(batch, heads, query_length, head_size).permute(0, 2, 1, 3).contiguous()
+
+    def execute(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        selection: BlockSelection,
+        scale: float,
+        block_size: tuple[int, int],
+    ) -> torch.Tensor:
+        self.validate_inputs(query, key, value)
+        return _flashinfer_selected_attention_op(
+            query, key, value, selection.indices, selection.counts, scale, *block_size, self.implementation
+        )
+
+
 class FlashInferAttentionBackend(AttentionBackend):
     accept_output_buffer: bool = True
+
+    @classmethod
+    def get_block_sparse_adapter(cls) -> type[FlashInferSparseAdapter]:
+        return FlashInferSparseAdapter
 
     @classmethod
     def supports_attention_mask(cls, attention_spec: object | None = None) -> bool:
