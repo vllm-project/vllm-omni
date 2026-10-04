@@ -42,6 +42,7 @@ class _DummyCode2Wav:
         self.outputs = list(outputs or [])
         self.forward_calls: list[dict[str, object]] = []
         self.forward_streaming_calls: list[dict[str, object]] = []
+        self.forward_streaming_batch_calls: list[list[dict[str, object]]] = []
 
     def forward(self, **kwargs):
         self.forward_calls.append(kwargs)
@@ -64,6 +65,22 @@ class _DummyCode2Wav:
                 "speech_offset": audio.shape[-1],
             }
         return audio, new_state
+
+    def forward_streaming_batch(self, items, *, n_timesteps: int = 10):
+        self.forward_streaming_batch_calls.append(items)
+        return [
+            self.forward_streaming(
+                token=item["token"],
+                prompt_token=item["prompt_token"],
+                prompt_feat=item["prompt_feat"],
+                embedding=item["embedding"],
+                cache_state=item.get("cache_state"),
+                n_timesteps=n_timesteps,
+                token_offset_tokens=int(item.get("token_offset_tokens", 0)),
+                finalize=bool(item.get("finalize", False)),
+            )
+            for item in items
+        ]
 
 
 def _make_code2wav_model(
@@ -373,6 +390,53 @@ def test_forward_clears_streaming_cache_on_terminal_chunk():
     assert "rid-stream" not in model._stream_vocoder_cache_by_req
 
 
+def test_forward_batches_streaming_flow_items(monkeypatch):
+    monkeypatch.setenv("COSYVOICE3_BATCH_FLOW", "1")
+    model = _make_code2wav_model()
+    runtime_info = [
+        {
+            "embed": {
+                "speech_token": torch.tensor([[1, 2, 3]], dtype=torch.long),
+                "speech_feat": torch.tensor([[[0.1, 0.2], [0.3, 0.4]]], dtype=torch.float32),
+                "embedding": torch.tensor([[0.5, 0.6]], dtype=torch.float32),
+            },
+            "meta": {
+                "req_id": ["rid-a"],
+                "stream_finished": torch.tensor(False),
+                "left_context_size": 0,
+            },
+        },
+        {
+            "embed": {
+                "speech_token": torch.tensor([[1, 2, 3]], dtype=torch.long),
+                "speech_feat": torch.tensor([[[0.1, 0.2], [0.3, 0.4]]], dtype=torch.float32),
+                "embedding": torch.tensor([[0.7, 0.8]], dtype=torch.float32),
+            },
+            "meta": {
+                "req_id": ["rid-b"],
+                "stream_finished": torch.tensor(False),
+                "left_context_size": 1,
+            },
+        },
+    ]
+
+    out = model.forward(
+        input_ids=torch.tensor([0, 1, 2, 0, 1, 2], dtype=torch.long),
+        positions=torch.arange(6, dtype=torch.long),
+        model_intermediate_buffer=runtime_info,
+        seq_token_counts=[3, 3],
+    )
+
+    assert len(out.multimodal_outputs["audio"]) == 2
+    assert len(model.code2wav.forward_streaming_batch_calls) == 1
+    batch_items = model.code2wav.forward_streaming_batch_calls[0]
+    assert [item["index"] for item in batch_items] == [0, 1]
+    assert torch.equal(batch_items[0]["token"], torch.tensor([[0, 1, 2]]))
+    assert batch_items[1]["token_offset_tokens"] == 1
+    assert "rid-a" in model._stream_vocoder_cache_by_req
+    assert "rid-b" in model._stream_vocoder_cache_by_req
+
+
 def test_sample_uses_ras_rejection_for_recent_repetition():
     model = _make_talker_model()
     metadata = _make_sampling_metadata(output_token_ids=[[1] * 10])
@@ -445,6 +509,37 @@ def test_sample_keeps_only_finite_token_after_ras_rejection():
 
     assert out is not None
     assert out.sampled_token_ids.tolist() == [[1]]
+
+
+def test_batched_ras_matches_serial_seeded_requests_and_rng_state():
+    model = _make_talker_model()
+    logits = torch.tensor([[2.0, 1.0, 0.0, -1.0], [0.0, 3.0, 1.0, -2.0], [1.0, 0.0, 2.0, -1.0]])
+    metadata = _make_sampling_metadata(output_token_ids=[[0] * 10, [], [2] * 10])
+    metadata.temperature = torch.tensor([0.5, 1.0, 1.5])
+    metadata.top_k = torch.tensor([1, 2, 4])
+    metadata.top_p = torch.tensor([0.7, 0.8, 0.9])
+    metadata.generators = {i: torch.Generator().manual_seed(400 + i) for i in range(3)}
+    reference_generators = {i: torch.Generator().manual_seed(400 + i) for i in range(3)}
+    for _ in range(6):
+        expected = []
+        for i in range(3):
+            scores = torch.log_softmax(logits[i] / metadata.temperature[i], dim=0)
+            expected.append(
+                model._ras_sample_one(
+                    scores,
+                    metadata.output_token_ids[i],
+                    top_p=float(metadata.top_p[i]),
+                    top_k=int(metadata.top_k[i]),
+                    win_size=10,
+                    tau_r=0.1,
+                    generator=reference_generators[i],
+                )
+            )
+        actual = model._ras_sample_batch(logits, metadata, default_top_p=0.8, default_top_k=25, win_size=10, tau_r=0.1)
+        assert actual.tolist() == expected
+        for i, token in enumerate(expected):
+            assert torch.equal(metadata.generators[i].get_state(), reference_generators[i].get_state())
+            metadata.output_token_ids[i].append(token)
 
 
 def test_gpu_ar_model_runner_prefers_model_sampler_when_opted_in():
@@ -573,3 +668,311 @@ def test_gpu_ar_model_runner_repairs_async_placeholders_for_model_sampler():
     assert runner.input_batch.async_copy_ready_event.synced is True
     assert runner.input_batch.update_async_called is True
     assert seen_histories == [[[11, 29]]]
+
+
+@pytest.mark.parametrize(
+    "order",
+    [("decode", "short", "decode", "long"), ("short", "decode", "long", "decode"), ("long", "short", "decode")],
+)
+def test_embed_input_ids_preserves_interleaved_request_boundaries(order):
+    model = _make_talker_model()
+    speech = nn.Embedding.from_pretrained(torch.arange(100 * 4, dtype=torch.float32).reshape(100, 4))
+    text = nn.Embedding.from_pretrained(torch.arange(100 * 4, dtype=torch.float32).reshape(100, 4) + 1000)
+    model.model = SimpleNamespace(
+        speech_embedding=speech, sos=0, task_id=1, llm=SimpleNamespace(model=SimpleNamespace(embed_tokens=text))
+    )
+    requests = {
+        "decode": (torch.tensor([7]), torch.tensor([False]), None, speech.weight[7:8]),
+        "short": (
+            torch.tensor([1, 1, 1, 1, 21]),
+            torch.tensor([True] * 4 + [False]),
+            speech.weight[2:4],
+            torch.cat((speech.weight[0:1], text.weight[21:22], speech.weight[1:2], speech.weight[2:4])),
+        ),
+        "long": (
+            torch.tensor([1, 1, 1, 1, 1, 30, 31]),
+            torch.tensor([True] * 5 + [False] * 2),
+            speech.weight[4:7],
+            torch.cat((speech.weight[0:1], text.weight[30:32], speech.weight[1:2], speech.weight[4:7])),
+        ),
+    }
+    rows = [requests[name] for name in order]
+    boundaries = [0]
+    for ids, *_ in rows:
+        boundaries.append(boundaries[-1] + ids.numel())
+    actual = model.embed_input_ids(
+        torch.cat([r[0] for r in rows]),
+        multimodal_embeddings=[r[2] for r in rows if r[2] is not None],
+        is_multimodal=torch.cat([r[1] for r in rows]),
+        query_start_loc=boundaries,
+    )
+    torch.testing.assert_close(actual, torch.cat([r[3] for r in rows]), rtol=0, atol=0)
+    conditioning = [torch.full((1, 192), i + 1.0) for i in range(sum(name != "decode" for name in order))]
+    aligned = model._align_prompt_conditioning(conditioning)
+    assert len(aligned) == len(order)
+    index = 0
+    for name, value in zip(order, aligned):
+        if name == "decode":
+            assert value is None
+        else:
+            assert value is conditioning[index]
+            index += 1
+    with pytest.raises(ValueError, match="conditioning must match"):
+        model._align_prompt_conditioning(conditioning[:-1])
+
+
+def test_mrv2_conditioning_follows_encoded_prompts_to_batch_rows():
+    from collections import OrderedDict
+
+    model = _make_talker_model()
+    speech = nn.Embedding.from_pretrained(torch.arange(100 * 4, dtype=torch.float32).reshape(100, 4))
+    text = nn.Embedding.from_pretrained(torch.arange(100 * 4, dtype=torch.float32).reshape(100, 4) + 1000)
+    model.model = SimpleNamespace(
+        speech_embedding=speech, sos=0, task_id=1, llm=SimpleNamespace(model=SimpleNamespace(embed_tokens=text))
+    )
+    model._mrv2_encoded_conditioning = OrderedDict()
+    tokens = [torch.tensor([2, 3]), torch.tensor([4, 5, 6])]
+    feats = [torch.full((4, 2), 1.0), torch.full((6, 2), 2.0)]
+    speakers = [torch.full((1, 3), 1.0), torch.full((1, 3), 2.0)]
+    encoded = model.embed_multimodal(speech_token=tokens, speech_feat=feats, embedding=speakers)
+    # Batch: decode, short prompt, decode, long prompt, short again (same
+    # reference: the encoder cache hands back the same tensor).
+    ids = torch.tensor([7, 1, 1, 1, 1, 21, 8, 1, 1, 1, 1, 1, 30, 1, 1, 1, 1, 22])
+    is_mm = torch.tensor([False] + [True] * 4 + [False, False] + [True] * 5 + [False] + [True] * 4 + [False])
+    model.embed_input_ids(
+        ids,
+        multimodal_embeddings=[encoded[0], encoded[1], encoded[0]],
+        is_multimodal=is_mm,
+        query_start_loc=[0, 1, 6, 7, 13, 18],
+    )
+    output = model.make_omni_output(torch.zeros(18, 4), model_intermediate_buffer=[None] * 5)
+    embed = output.multimodal_outputs["embed"]
+    assert [value is None for value in embed["speech_token"]] == [True, False, True, False, False]
+    for row, item in ((1, 0), (3, 1), (4, 0)):
+        torch.testing.assert_close(embed["speech_token"][row], tokens[item][None])
+        torch.testing.assert_close(embed["speech_feat"][row], feats[item][None])
+        torch.testing.assert_close(embed["embedding"][row], speakers[item])
+    # A following decode step carries no conditioning.
+    model.embed_input_ids(
+        torch.tensor([9, 10]), multimodal_embeddings=[], is_multimodal=torch.zeros(2, dtype=torch.bool)
+    )
+    assert model.make_omni_output(torch.zeros(2, 4)).multimodal_outputs == {}
+    with pytest.raises(ValueError, match="lost its prompt conditioning"):
+        model.embed_input_ids(
+            torch.tensor([1, 1, 1, 1, 21]),
+            multimodal_embeddings=[speech.weight[2:4].clone()],
+            is_multimodal=torch.tensor([True] * 4 + [False]),
+            query_start_loc=[0, 5],
+        )
+
+
+def test_talker_declares_its_narrow_logits_head():
+    model = _make_talker_model()
+    assert model.logits_vocab_size == 6561 + 200
+    model.model_stage = "cosyvoice3_code2wav"
+    assert model.logits_vocab_size is None
+
+
+def test_embed_input_ids_rejects_cross_request_placeholder_block():
+    model = _make_talker_model()
+    speech = nn.Embedding(100, 4)
+    model.model = SimpleNamespace(
+        speech_embedding=speech,
+        sos=0,
+        task_id=1,
+        llm=SimpleNamespace(model=SimpleNamespace(embed_tokens=nn.Embedding(100, 4))),
+    )
+    with pytest.raises(ValueError, match="complete prefill block"):
+        model.embed_input_ids(
+            torch.tensor([7, 1, 1, 1, 1, 20]),
+            multimodal_embeddings=[speech.weight[2:4]],
+            is_multimodal=torch.tensor([False, True, True, True, True, False]),
+        )
+
+
+def test_full_response_singleton_uses_the_optimized_batch_path(monkeypatch):
+    import vllm_omni.model_executor.models.cosyvoice3.cosyvoice3 as module
+
+    monkeypatch.setenv("COSYVOICE3_BATCH_FLOW", "1")
+    monkeypatch.setattr(module, "cosyvoice3_packed_inference_enabled", lambda: True)
+    model = _make_code2wav_model()
+    model.forward(
+        input_ids=torch.tensor([0, 1, 2]),
+        positions=torch.arange(3),
+        seq_token_counts=[3],
+        model_intermediate_buffer=[
+            {
+                "embed": {
+                    "speech_token": torch.tensor([[1, 2, 3]]),
+                    "speech_feat": torch.ones(1, 6, 2),
+                    "embedding": torch.ones(1, 2),
+                },
+                "meta": {"req_id": ["single"], "stream_finished": torch.tensor(True), "left_context_size": 0},
+            }
+        ],
+    )
+    assert len(model.code2wav.forward_streaming_batch_calls) == 1
+    assert model.code2wav.forward_streaming_batch_calls[0][0]["finalize"]
+
+
+def test_full_response_adapter_uses_live_prefill_then_empty_decode(monkeypatch):
+    from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+
+    from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
+
+    model = _make_talker_model()
+    hidden = torch.ones(2, 4)
+    runner = object.__new__(OmniGPUModelRunner)
+    runner.model = model
+    runner._build_model_kwargs_extra = lambda: {}
+    # Replay the same graph tensor while the live conditioning changes.
+    monkeypatch.setattr(GPUModelRunner, "_model_forward", lambda *_args, **_kwargs: hidden)
+    model._conditioning_request_rows = [1]
+    model._conditioning_request_count = 2
+    prompt = torch.tensor([[7, 8]])
+    output = runner._model_forward(speech_token=prompt)
+    values = output.multimodal_outputs["embed"]["speech_token"]
+    assert values[0] is None
+    torch.testing.assert_close(values[1], prompt)
+    decode = runner._model_forward()
+    assert decode.text_hidden_states is hidden
+    assert decode.multimodal_outputs == {}
+
+
+def test_packed_flow_preserves_torch_estimator_when_speaker_trt_is_enabled(monkeypatch):
+    import vllm_omni.model_executor.models.cosyvoice3.cosyvoice3 as module
+
+    model = _make_code2wav_model()
+    model._code2wav_trt_done = False
+    monkeypatch.setattr(module.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(module, "cosyvoice3_packed_inference_enabled", lambda: True)
+    monkeypatch.setattr(module, "_cosyvoice3_trt_enabled", lambda: True)
+
+    def unexpected_estimator_resolution():
+        raise AssertionError("Packed Flow must not resolve or replace its torch estimator")
+
+    monkeypatch.setattr(model, "_resolve_flow_estimator_onnx", unexpected_estimator_resolution)
+    model._maybe_enable_code2wav_trt()
+    assert model._code2wav_trt_done
+
+
+def test_standard_sampling_preserves_parameters_and_excludes_prompt_penalties(monkeypatch):
+    model = _make_talker_model()
+    model.config.cosyvoice3_sampling_mode = "standard"
+    metadata = _make_sampling_metadata(output_token_ids=[[2, 3]], repetition_penalty=1.21)
+    metadata.prompt_token_ids = torch.tensor([[2, 4]], dtype=torch.long)
+    metadata.temperature = torch.tensor([0.7])
+    metadata.top_k = torch.tensor([20])
+    captured = {}
+    expected = SamplerOutput(sampled_token_ids=torch.tensor([[5]], dtype=torch.int32), logprobs_tensors=None)
+
+    def standard_sampler(*, logits, sampling_metadata):
+        captured["metadata"] = sampling_metadata
+        return expected
+
+    model._talker_sampler = standard_sampler
+    monkeypatch.setattr(model, "_ras_sample_batch", lambda *a, **k: pytest.fail("RAS must not run in standard mode"))
+    assert model.sample(torch.zeros(1, 8), metadata) is expected
+    actual = captured["metadata"]
+    assert actual is not metadata
+    assert actual.output_token_ids == [[2, 3]]
+    torch.testing.assert_close(actual.prompt_token_ids, torch.tensor([[8, 8]]))
+    torch.testing.assert_close(metadata.prompt_token_ids, torch.tensor([[2, 4]]))
+    assert actual.temperature is metadata.temperature
+    assert actual.top_k is metadata.top_k
+    assert actual.top_p is metadata.top_p
+    assert actual.repetition_penalties is metadata.repetition_penalties
+
+
+@pytest.mark.parametrize("mode", ["ras", "standard"])
+def test_sampling_mode_preserves_or_merges_control_logits(mode):
+    model = _make_talker_model()
+    model.config.cosyvoice3_sampling_mode = mode
+    model.config.vocab_size = 6770
+    model.model = nn.Module()
+    model.model.llm_decoder = lambda hidden: hidden.clone()
+    hidden = torch.linspace(-2, 2, 6761).reshape(1, -1)
+    logits = model.compute_logits(hidden)
+    torch.testing.assert_close(logits[:, :6561], hidden[:, :6561])
+    assert torch.isneginf(logits[:, 6761:]).all()
+    if mode == "standard":
+        torch.testing.assert_close(logits[:, 6561:6761], hidden[:, 6561:])
+    else:
+        torch.testing.assert_close(logits[:, 6562], torch.logsumexp(hidden[:, 6561:], dim=-1))
+        assert torch.isneginf(logits[:, 6561]).all()
+        assert torch.isneginf(logits[:, 6563:6761]).all()
+
+
+def test_cancelled_stream_releases_only_its_vocoder_state():
+    model_cls, _ = _cosyvoice3_model_and_runner()
+    model = SimpleNamespace(
+        _stream_audio_cache_lock=Lock(),
+        _stream_vocoder_cache_by_req={"cancelled": {"mel": torch.ones(2)}, "live": {"mel": torch.zeros(2)}},
+    )
+    model_cls.on_requests_finished(model, {"cancelled", "unknown"})
+    model_cls.on_requests_finished(model, {"cancelled"})
+    assert set(model._stream_vocoder_cache_by_req) == {"live"}
+
+
+@pytest.mark.parametrize("mrv2,packed", [(False, False), (False, True), (True, False)])
+def test_talker_output_contract(monkeypatch, mrv2, packed):
+    import vllm_omni.model_executor.models.cosyvoice3.cosyvoice3 as mod
+
+    monkeypatch.setattr(mod, "cosyvoice3_packed_inference_enabled", lambda: packed)
+    model = _make_talker_model()
+    hidden = torch.zeros(2, 4)
+    model.model = SimpleNamespace(llm=lambda embeddings, positions: embeddings)
+    sentinel = object()
+    model.make_omni_output = lambda *args, **kwargs: sentinel
+    if mrv2:
+        model._sampling_eps = 1e-6
+        model.mrv2_custom_sampler(SimpleNamespace(penalties_state=None))
+    output = model.forward(torch.ones(2, dtype=torch.long), torch.arange(2), inputs_embeds=hidden)
+    assert output is hidden
+
+
+def test_request_conditioning_normalizes_singletons_without_changing_schema():
+    from vllm_omni.data_entry_keys import to_struct
+    from vllm_omni.model_executor.models.cosyvoice3.cosyvoice3 import _normalize_request_conditioning
+
+    token = torch.tensor([[7, 8]], dtype=torch.int32)
+    feat = torch.randn(1, 4, 80)
+    speaker = torch.randn(1, 192)
+    length = torch.tensor([[2]], dtype=torch.int32)
+    raw = {"embed": {"speech_token": token, "speech_feat": feat, "embedding": speaker, "speech_token_len": [length]}}
+    result = to_struct(_normalize_request_conditioning(raw))
+    assert result.embed.speech_token is token
+    assert result.embed.speech_feat is feat
+    assert result.embed.embedding is speaker
+    assert result.embed.speech_token_len is length
+    assert raw["embed"]["speech_token_len"] == [length]
+
+
+def test_request_conditioning_rejects_unsplit_voices():
+    from vllm_omni.model_executor.models.cosyvoice3.cosyvoice3 import _normalize_request_conditioning
+
+    with pytest.raises(ValueError, match="unsplit batch"):
+        _normalize_request_conditioning({"embed": {"embedding": [torch.ones(1, 192), torch.zeros(1, 192)]}})
+
+
+def test_request_conditioning_reaches_code2wav_with_true_prompt_length():
+    model = _make_code2wav_model()
+    output = model.forward(
+        torch.tensor([1, 2]),
+        torch.arange(2),
+        model_intermediate_buffer=[
+            {
+                "embed": {
+                    "speech_token": torch.tensor([[3, 2, 0, 0]], dtype=torch.int32),
+                    "speech_feat": torch.randn(1, 8, 80),
+                    "embedding": torch.randn(1, 192),
+                    "speech_token_len": [torch.tensor([[2]], dtype=torch.int32)],
+                },
+                "meta": {"req_id": ["voice"]},
+            }
+        ],
+    )
+    call = model.code2wav.forward_calls[0]
+    assert call["prompt_token"].shape == (1, 2)
+    assert call["prompt_feat"].shape == (1, 4, 80)
+    assert output.multimodal_outputs

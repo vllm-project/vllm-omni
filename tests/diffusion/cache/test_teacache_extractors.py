@@ -33,6 +33,7 @@ from vllm_omni.diffusion.cache.teacache.extractors import (
     extract_flux2_klein_context,
     extract_flux_context,
     extract_minimax_h3_context,
+    extract_zimage_context,
 )
 from vllm_omni.diffusion.models.flux.flux_transformer import FluxTransformer2DModel
 from vllm_omni.diffusion.models.flux2_klein.flux2_klein_transformer import (
@@ -53,6 +54,62 @@ def setup_tp_group():
             yield
 
 
+@pytest.mark.cpu
+def test_zimage_extractor_accepts_extended_patchify_output():
+    class _Block(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.attention_norm1 = nn.Identity()
+
+        def adaLN_modulation(self, value):
+            return value.new_zeros((value.shape[0], 16))
+
+    class _Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layers = nn.ModuleList([_Block()])
+            self.noise_refiner = nn.ModuleList()
+            self.context_refiner = nn.ModuleList()
+            self.all_x_embedder = nn.ModuleDict({"2-1": nn.Linear(2, 4)})
+            self.cap_embedder = nn.Linear(3, 4)
+            self.x_pad_token = nn.Parameter(torch.zeros(1, 4))
+            self.cap_pad_token = nn.Parameter(torch.zeros(1, 4))
+            self.t_scale = 1.0
+
+        @staticmethod
+        def t_embedder(timestep):
+            return timestep.new_ones((timestep.shape[0], 4))
+
+        @staticmethod
+        def rope_embedder(position_ids):
+            rope = torch.zeros((position_ids.shape[0], 2))
+            return rope, rope
+
+        @staticmethod
+        def patchify_and_embed(*_args):
+            positions = [torch.zeros((32, 3), dtype=torch.int32)]
+            masks = [torch.zeros(32, dtype=torch.bool)]
+            return (
+                [torch.zeros((32, 2))],
+                [torch.zeros((32, 3))],
+                [(1, 1, 1)],
+                positions,
+                positions,
+                masks,
+                masks,
+                [],
+            )
+
+    context = extract_zimage_context(
+        _Model(),
+        x=[torch.zeros((1, 1, 1, 1))],
+        t=torch.zeros(1),
+        cap_feats=[torch.zeros((1, 3))],
+    )
+
+    assert context.modulated_input.shape == (1, 64, 4)
+
+
 class BaseExtractorTest(ABC):
     """Base class for testing TeaCache extractors.
 
@@ -68,12 +125,12 @@ class BaseExtractorTest(ABC):
         pass
 
     @abstractmethod
-    def get_module(self):
+    def get_module(self, module, /):
         """Return model module instance."""
         pass
 
     @abstractmethod
-    def get_sample_inputs(self):
+    def get_sample_inputs(self, sample_inputs, /):
         """Return sample inputs for model."""
         pass
 
@@ -595,6 +652,9 @@ class TestMiniMaxH3Extractor(BaseExtractorTest):
         monkeypatch.setattr(h3, "get_tensor_model_parallel_world_size", lambda: 1)
 
         model = h3.MiniMaxH3DiTModel(_minimax_h3_small_od_config(), quant_config=None)
+        # Normally loaded from the checkpoint; torch.empty() can contain NaNs.
+        # With one frequency per axis, the RoPE inverse frequency is 1.
+        model.rope.inv_freq.fill_(1.0)
         for submodule in model.modules():
             if isinstance(submodule, h3.MiniMaxH3Attention):
                 submodule.rope._forward_method = submodule.rope.forward_native
@@ -737,10 +797,10 @@ class TestMiniMaxH3Extractor(BaseExtractorTest):
         monkeypatch,
     ):
         """Strict SP must not mix local TeaCache state with gathered block rows."""
-        from vllm_omni.diffusion.attention.ops import minimax_h3_modulation
         from vllm_omni.diffusion.cache.teacache.config import TeaCacheConfig
         from vllm_omni.diffusion.cache.teacache.hook import TeaCacheHook
         from vllm_omni.diffusion.distributed import parallel_state
+        from vllm_omni.diffusion.layers import indexed_modulation
 
         seq_len = sample_inputs["x"].shape[1]
         local_len = seq_len // 2
@@ -844,13 +904,13 @@ class TestMiniMaxH3Extractor(BaseExtractorTest):
         )
         monkeypatch.setattr(parallel_state, "get_sp_group", lambda: sp_group)
 
-        original_indexed_scale_shift = minimax_h3_modulation.indexed_scale_shift_
+        original_indexed_scale_shift = indexed_modulation.indexed_scale_shift_
 
         def capture_indexed_scale_shift(hidden, shift, scale, indices):
             captured_modulation_indices.append(indices.clone())
             return original_indexed_scale_shift(hidden, shift, scale, indices)
 
-        monkeypatch.setattr(minimax_h3_modulation, "indexed_scale_shift_", capture_indexed_scale_shift)
+        monkeypatch.setattr(indexed_modulation, "indexed_scale_shift_", capture_indexed_scale_shift)
 
         local_img_pos = torch.tensor([0, 1])
         local_audio_pos = torch.tensor([2, 3])

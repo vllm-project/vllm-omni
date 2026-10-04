@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 import pytest
 import torch
 from transformers import T5Config
@@ -52,6 +52,13 @@ def setup_tp_group(monkeypatch, mocker):
     monkeypatch.setattr(
         "vllm.model_executor.layers.vocab_parallel_embedding.get_tensor_model_parallel_rank",
         lambda: 0,
+    )
+
+    # vLLM 0.29 added a CUDA-only fused embedding kernel that engages whenever
+    # tp_size > 1; these tests drive CPU tensors, so keep the portable masked path.
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.vocab_parallel_embedding.current_platform.is_cuda",
+        lambda: False,
     )
 
     # TP group

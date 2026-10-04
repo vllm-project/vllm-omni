@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """LancePipeline — Lance (ByteDance) packaged for the vLLM-Omni diffusion engine.
 
 Lance is BAGEL-lineage (Qwen2-MoT unified AR+diffusion), so the transformer
@@ -59,9 +59,14 @@ from vllm_omni.diffusion.models.bagel.pipeline_bagel import (
     BagelPipeline,
     add_special_tokens,
 )
+from vllm_omni.diffusion.offloader.config import (
+    OffloadStrategy,
+    resolve_offload_strategy,
+)
 from vllm_omni.model_executor.model_loader.weight_utils import (
     download_weights_from_hf_specific,
 )
+from vllm_omni.model_executor.models.utils import normalize_decoded_video_frames
 
 from .lance_transformer import (
     LanceBagel,
@@ -400,7 +405,9 @@ class LancePipeline(BagelPipeline):
                 )
             )
 
-        if quant_config is None and not (od_config.enable_layerwise_offload or od_config.parallel_config.use_hsdp):
+        if quant_config is None and not (
+            resolve_offload_strategy(od_config) is OffloadStrategy.LAYER_WISE or od_config.parallel_config.use_hsdp
+        ):
             self.to(self.device)
         self.setup_diffusion_pipeline_profiler(
             enable_diffusion_pipeline_profiler=self.od_config.enable_diffusion_pipeline_profiler
@@ -1454,6 +1461,8 @@ class LancePipeline(BagelPipeline):
                     frames_bgr.append(_cv2.cvtColor(f, _cv2.COLOR_BGR2RGB))
                 cap.release()
                 video_raw = _np.stack(frames_bgr, axis=0)
+        elif isinstance(video_input, (list, tuple)):
+            video_raw, origin_fps = normalize_decoded_video_frames(video_input, default_fps=origin_fps_default)
         elif isinstance(video_input, _np.ndarray):
             video_raw = video_input
             origin_fps = origin_fps_default

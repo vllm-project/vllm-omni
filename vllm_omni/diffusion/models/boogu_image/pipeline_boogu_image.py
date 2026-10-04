@@ -34,9 +34,13 @@ from diffusers.models.autoencoders.autoencoder_kl import AutoencoderKL
 from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
 from torch.nn.attention import SDPBackend, sdpa_kernel
-from transformers import Qwen3VLForConditionalGeneration, Qwen3VLProcessor
+from transformers import AutoModel, Qwen3VLConfig, Qwen3VLForConditionalGeneration, Qwen3VLModel, Qwen3VLProcessor
+from vllm.config.quantization import QuantizationConfigArgs
 from vllm.logger import init_logger
-from vllm.model_executor.models.utils import AutoWeightsLoader
+from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+from vllm.model_executor.layers.quantization.fp8 import Fp8Config
+from vllm.model_executor.layers.quantization.online.base import OnlineQuantizationConfig
+from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
@@ -54,9 +58,11 @@ from vllm_omni.diffusion.models.boogu_image.scheduling_flow_match_euler_discrete
 )
 from vllm_omni.diffusion.models.interface import SupportImageInput, SupportsComponentDiscovery
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
+from vllm_omni.diffusion.models.utils import create_transformers_model_with_vllm_linears
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch, split_diffusion_output_by_request
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
+from vllm_omni.platforms import current_omni_platform
 from vllm_omni.quantization.component_config import resolve_component_quant_config
 
 logger = init_logger(__name__)
@@ -106,18 +112,15 @@ def get_boogu_image_post_process_func(od_config: OmniDiffusionConfig):
     return post_process_func
 
 
-def _boogu_batch_compatibility_key(has_reference: bool, request_id: str) -> tuple:
-    """Request-batch isolation key. ``forward`` reads shared guidance/shape fields
-    from the batch's first request, so t2i and ti2i must not share a key.
+def _boogu_batch_compatibility_key(has_reference: bool) -> tuple:
+    """Separate T2I and TI2I denoise paths.
 
-    ti2i is held at batch=1 (request-unique key) because
-    ``guidance_scale_2_provided`` is absent from ``RequestBatchSamplingParamsKey``
-    while ``forward`` reads it from the first request, so mixed-``_provided`` edits
-    with equal numeric ``guidance_scale_2`` would co-batch into the wrong mode.
+    Shared shape/guidance fields, including ``guidance_scale_2_provided``,
+    are checked by ``RequestBatchSamplingParamsKey``.
     """
     if not has_reference:
         return ("boogu_image", "t2i")
-    return ("boogu_image", "ti2i", request_id)
+    return ("boogu_image", "ti2i")
 
 
 def get_boogu_image_pre_process_func(od_config: OmniDiffusionConfig):
@@ -151,14 +154,14 @@ def get_boogu_image_pre_process_func(od_config: OmniDiffusionConfig):
         prompt = request.prompt
         if isinstance(prompt, str):
             # Plain-text prompt cannot carry an image -> text-to-image.
-            request.batch_compatibility_key = _boogu_batch_compatibility_key(False, request.request_id)
+            request.batch_compatibility_key = _boogu_batch_compatibility_key(False)
             return request
 
         multi_modal_data = prompt.get("multi_modal_data") or {}
         raw_image = multi_modal_data.get("image")
         if not raw_image:
             # No reference image -> text-to-image (Base checkpoint).
-            request.batch_compatibility_key = _boogu_batch_compatibility_key(False, request.request_id)
+            request.batch_compatibility_key = _boogu_batch_compatibility_key(False)
             return request
 
         if isinstance(raw_image, list):
@@ -193,7 +196,7 @@ def get_boogu_image_pre_process_func(od_config: OmniDiffusionConfig):
         prompt["additional_information"]["preprocessed_image"] = preprocessed_image
         prompt["additional_information"]["prompt_image"] = prompt_image
         request.prompt = prompt
-        request.batch_compatibility_key = _boogu_batch_compatibility_key(True, request.request_id)
+        request.batch_compatibility_key = _boogu_batch_compatibility_key(True)
         return request
 
     return pre_process_func
@@ -243,6 +246,7 @@ class BooguImagePipeline(CFGParallelMixin, nn.Module, ProgressBarMixin, Supports
         self.od_config = od_config
         self._raise_unsupported_features()
         transformer_quant_config = resolve_component_quant_config(od_config.quantization_config, "transformer")
+        mllm_quant_config = resolve_component_quant_config(od_config.quantization_config, "mllm")
         self.weights_sources = [
             DiffusersPipelineLoader.ComponentSource(
                 model_or_path=od_config.model,
@@ -273,22 +277,7 @@ class BooguImagePipeline(CFGParallelMixin, nn.Module, ProgressBarMixin, Supports
             local_files_only=local_files_only,
             revision=od_config.revision,
         )
-
-        mllm = from_pretrained_with_prefetch(
-            Qwen3VLForConditionalGeneration.from_pretrained,
-            model,
-            subfolder="mllm",
-            prefetch_list=boogu_subfolders,
-            local_files_only=local_files_only,
-            torch_dtype=od_config.dtype,
-            revision=od_config.revision,
-        )
-        # Upstream reuses the full VLM as an optional instruction rewriter and
-        # encodes with its inner model (no ``lm_head``); the rewriter is not
-        # ported, so keep only the inner ``Qwen3VLModel`` as the encoder.
-        if hasattr(mllm, "lm_head"):
-            mllm = mllm.model
-        self.mllm = mllm.to(self._execution_device)
+        self.mllm = self._load_mllm(model, local_files_only, mllm_quant_config, boogu_subfolders)
 
         self.processor = Qwen3VLProcessor.from_pretrained(
             model,
@@ -323,13 +312,104 @@ class BooguImagePipeline(CFGParallelMixin, nn.Module, ProgressBarMixin, Supports
         self.SYSTEM_PROMPT_4_TI2I = SYSTEM_PROMPT_4_TI2I_UNIFIED
         self.SYSTEM_PROMPT_4_I2I = SYSTEM_PROMPT_4_TI2I_UNIFIED
 
+    def _load_mllm(
+        self,
+        model_path: str,
+        local_files_only: bool,
+        quant_config: QuantizationConfig | None,
+        prefetch_list: list[str],
+    ) -> Qwen3VLModel:
+        """Load MLLM through HF, or prepare it for deferred online FP8 loading."""
+        config = None
+        if quant_config is not None:
+            if not isinstance(quant_config, Fp8Config):
+                raise ValueError(
+                    "Boogu MLLM only supports FP8 quantization. Set mllm to null to disable online quantization."
+                )
+            config = Qwen3VLConfig.from_pretrained(
+                model_path, subfolder="mllm", local_files_only=local_files_only, revision=self.od_config.revision
+            )
+
+        # With no MLLM quantization override, or with checkpoint quantization
+        # metadata, preserve HF model initialization and weight loading.
+        if config is None or getattr(config, "quantization_config", None):
+            mllm = from_pretrained_with_prefetch(
+                Qwen3VLForConditionalGeneration.from_pretrained,
+                model_path,
+                subfolder="mllm",
+                prefetch_list=prefetch_list,
+                local_files_only=local_files_only,
+                torch_dtype=self.od_config.dtype,
+                revision=self.od_config.revision,
+            )
+            # Upstream reuses the full VLM as an optional instruction rewriter and
+            # encodes with its inner model (no ``lm_head``); the rewriter is not
+            # ported, so keep only the inner ``Qwen3VLModel`` as the encoder.
+            if hasattr(mllm, "lm_head"):
+                mllm = mllm.model
+            return mllm.to(self._execution_device)
+
+        online_quant_config = OnlineQuantizationConfig(
+            QuantizationConfigArgs(linear="fp8_per_block", ignore=quant_config.ignored_layers)
+        )
+
+        mllm = create_transformers_model_with_vllm_linears(
+            AutoModel,
+            config,
+            online_quant_config,
+            dtype=self.od_config.dtype,
+            device=self._execution_device,
+            prefix="mllm",
+            skip_modules=("mllm.visual",),
+        )
+
+        self.weights_sources.append(
+            DiffusersPipelineLoader.ComponentSource(
+                model_or_path=model_path,
+                subfolder="mllm",
+                revision=self.od_config.revision,
+                prefix="mllm.",
+            )
+        )
+
+        return mllm.requires_grad_(False).eval()
+
     def _raise_unsupported_features(self) -> None:
         """Reject execution modes that do not have Boogu-specific support."""
         parallel_config = self.od_config.parallel_config
         if parallel_config.tensor_parallel_size > 1:
             raise NotImplementedError("Tensor parallelism is not supported by BooguImagePipeline.")
         if (parallel_config.sequence_parallel_size or 1) > 1:
-            raise NotImplementedError("Sequence parallelism is not supported by BooguImagePipeline.")
+            if parallel_config.cfg_parallel_size > 1:
+                # SP × CFG-Parallel is unvalidated: the combined path runs
+                # without crashing but drifts far from the SP=1 baseline
+                # (~19 dB PSNR at 4 steps), so guidance semantics differ.
+                # Remove this guard only alongside a parity test.
+                raise NotImplementedError(
+                    "BooguImagePipeline: sequence parallelism combined with CFG parallelism is not validated."
+                )
+            if parallel_config.ring_degree > 1 or getattr(parallel_config, "allgather_degree", 1) > 1:
+                raise NotImplementedError(
+                    "BooguImagePipeline currently supports sequence parallelism through Ulysses only."
+                )
+            if not current_omni_platform.is_cuda():
+                raise NotImplementedError("BooguImagePipeline sequence parallelism currently requires CUDA.")
+            if parallel_config.ulysses_mode == "strict":
+                # Subscript rather than get(): a missing key means the config
+                # schema has drifted and we would silently validate against a
+                # stale default, not the actual head count.
+                tf_params = self.od_config.tf_model_config.params
+                num_heads = tf_params["num_attention_heads"]
+                num_kv_heads = tf_params["num_kv_heads"]
+                if (
+                    num_heads % parallel_config.ulysses_degree != 0
+                    or num_kv_heads % parallel_config.ulysses_degree != 0
+                ):
+                    raise ValueError(
+                        "BooguImagePipeline GQA heads are not divisible by the "
+                        "configured Ulysses degree; set "
+                        "parallel_config.ulysses_mode='advanced_uaa'."
+                    )
         if parallel_config.use_hsdp:
             raise NotImplementedError("HSDP is not supported by BooguImagePipeline.")
         if self.od_config.cache_backend not in (None, "", "none"):
@@ -339,7 +419,8 @@ class BooguImagePipeline(CFGParallelMixin, nn.Module, ProgressBarMixin, Supports
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights)
+        mapper = WeightsMapper(orig_to_new_prefix={"mllm.lm_head.": None, "mllm.model.": "mllm."})
+        return loader.load_weights(weights, mapper=mapper)
 
     # ------------------------------------------------------------------
     # Prompt encoding (upstream ``encode_instruction``, t2i path)
@@ -876,14 +957,6 @@ class BooguImagePipeline(CFGParallelMixin, nn.Module, ProgressBarMixin, Supports
         # in the request-batch compatibility key, so Turbo stays at batch=1.
         if self._is_turbo and req.num_reqs > 1:
             raise RuntimeError("BooguImageTurboPipeline does not support request batching.")
-
-        # Fail-closed: a batched ti2i must never reach here (it is gated to batch=1).
-        if has_reference and req.num_reqs > 1:
-            raise RuntimeError(
-                f"BooguImagePipeline received a batched TI2I (edit) request "
-                f"(num_reqs={req.num_reqs}); TI2I batching is gated to batch=1 "
-                "pending guidance-mode / compatibility-key validation."
-            )
 
         sampling_params_list = req.sampling_params_list
         # Shared shape/step/guidance fields are guaranteed identical across the

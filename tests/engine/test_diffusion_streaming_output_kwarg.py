@@ -33,7 +33,7 @@ def _resolve(monkeypatch, kwargs: dict[str, Any]) -> dict[str, Any]:
         return "config.yaml", [], None
 
     monkeypatch.setattr(
-        "vllm_omni.engine.async_omni_engine.load_and_resolve_stage_configs",
+        "vllm_omni.engine.omni_engine_base.load_and_resolve_stage_configs",
         _fake_load,
     )
     engine = SimpleNamespace(

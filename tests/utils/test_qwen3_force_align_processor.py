@@ -10,7 +10,21 @@ def test_build_prompt_has_boundary_timestamp_markers():
 
     assert prompt.count("<timestamp>") == 4
     assert "hello<timestamp><timestamp>world" in prompt
-    assert prompt.endswith("<|im_start|>assistant\n")
+    # Official aligner format: audio placeholder + words, no chat template
+    # (a leading "<|im_start|>user\n" shifts the predicted markers one bin late).
+    assert prompt == f"{processor.AUDIO_PLACEHOLDER}hello<timestamp><timestamp>world<timestamp><timestamp>"
+    assert "<|im_start|>" not in prompt
+    assert processor.build_prompt([]) == f"{processor.AUDIO_PLACEHOLDER}<timestamp><timestamp>"
+
+
+def test_build_prompt_matches_official_encode_timestamp():
+    pytest.importorskip("qwen_asr")
+    from qwen_asr.inference.qwen3_forced_aligner import Qwen3ForceAlignProcessor
+
+    text = "It's 3 o'clock, 你好 world."
+    word_list, official_prompt = Qwen3ForceAlignProcessor().encode_timestamp(text, "english")
+
+    assert processor.build_prompt(list(word_list)) == official_prompt
 
 
 @pytest.mark.parametrize(

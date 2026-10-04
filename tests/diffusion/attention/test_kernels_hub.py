@@ -13,6 +13,12 @@ from vllm_omni.diffusion.attention.backends.sdpa import SDPAImpl
 from vllm_omni.platforms import current_omni_platform
 
 
+def _clear_hub_module_cache(monkeypatch: pytest.MonkeyPatch) -> None:
+    from vllm_omni.diffusion.attention.backends import flash_attn_hub
+
+    monkeypatch.setattr(flash_attn_hub, "_hub_modules", {})
+
+
 @pytest.mark.core_model
 @pytest.mark.cpu
 def test_explicit_kernels_hub_selection_does_not_fallback(monkeypatch: pytest.MonkeyPatch):
@@ -52,6 +58,74 @@ def test_explicit_kernels_hub_selection_does_not_fallback(monkeypatch: pytest.Mo
         CudaOmniPlatform.get_diffusion_attn_backend_cls("FLASH_ATTN_HUB", head_size=64)
     with pytest.raises(ValueError, match="require.*Hopper GPU"):
         CudaOmniPlatform.get_diffusion_attn_backend_cls("FLASH_ATTN_3_HUB", head_size=64)
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_explicit_kernels_hub_variant_miss_does_not_fallback(monkeypatch: pytest.MonkeyPatch):
+    """Explicit Hub backends must fail loudly when no build variant resolves (#6971)."""
+    from vllm.platforms.interface import DeviceCapability
+
+    from vllm_omni.diffusion.envs import PACKAGES_CHECKER
+    from vllm_omni.platforms.cuda.platform import CudaOmniPlatform
+
+    monkeypatch.setattr(
+        CudaOmniPlatform,
+        "get_device_capability",
+        classmethod(lambda cls, device_id=0: DeviceCapability(9, 0)),
+    )
+    monkeypatch.setattr(PACKAGES_CHECKER, "get_packages_info", lambda: {"has_flash_attn": True})
+    _clear_hub_module_cache(monkeypatch)
+
+    kernels_module = types.ModuleType("kernels")
+
+    def _missing_variant(repo_id, version=None, **kwargs):
+        raise FileNotFoundError(f"Cannot find a build variant for this system in {repo_id}")
+
+    kernels_module.get_kernel = _missing_variant  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "kernels", kernels_module)
+
+    with pytest.raises(RuntimeError, match="no compatible build"):
+        CudaOmniPlatform.get_diffusion_attn_backend_cls("FLASH_ATTN_3_HUB", head_size=64)
+    with pytest.raises(RuntimeError, match="no compatible build"):
+        CudaOmniPlatform.get_diffusion_attn_backend_cls("FLASH_ATTN_HUB", head_size=64)
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_explicit_kernels_hub_preflight_uses_v2_when_v1_misses(monkeypatch: pytest.MonkeyPatch):
+    """Preflight must share _load_hub_module's (1, 2) policy, not pin version=1."""
+    from vllm.platforms.interface import DeviceCapability
+
+    from vllm_omni.diffusion.attention.backends.registry import DiffusionAttentionBackendEnum
+    from vllm_omni.diffusion.envs import PACKAGES_CHECKER
+    from vllm_omni.platforms.cuda.platform import CudaOmniPlatform
+
+    monkeypatch.setattr(
+        CudaOmniPlatform,
+        "get_device_capability",
+        classmethod(lambda cls, device_id=0: DeviceCapability(9, 0)),
+    )
+    monkeypatch.setattr(PACKAGES_CHECKER, "get_packages_info", lambda: {"has_flash_attn": True})
+    _clear_hub_module_cache(monkeypatch)
+
+    kernels_module = types.ModuleType("kernels")
+    versions_tried: list[int | None] = []
+
+    def _v1_miss_v2_hit(repo_id, version=None, **kwargs):
+        versions_tried.append(version)
+        if version == 1:
+            raise FileNotFoundError(f"Cannot find a build variant for this system in {repo_id}")
+        return types.SimpleNamespace(name=f"{repo_id}@v{version}")
+
+    kernels_module.get_kernel = _v1_miss_v2_hit  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "kernels", kernels_module)
+
+    fa3_path = CudaOmniPlatform.get_diffusion_attn_backend_cls("FLASH_ATTN_3_HUB", head_size=64)
+    assert fa3_path == DiffusionAttentionBackendEnum.FLASH_ATTN_3_HUB.get_path()
+    fa2_path = CudaOmniPlatform.get_diffusion_attn_backend_cls("FLASH_ATTN_HUB", head_size=64)
+    assert fa2_path == DiffusionAttentionBackendEnum.FLASH_ATTN_HUB.get_path()
+    assert versions_tried == [1, 2, 1, 2]
 
 
 @pytest.mark.core_model

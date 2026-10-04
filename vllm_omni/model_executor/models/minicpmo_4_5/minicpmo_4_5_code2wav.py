@@ -7,8 +7,10 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+from collections import OrderedDict
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
+from functools import lru_cache
 from hashlib import sha256
 from pathlib import Path
 from typing import Any
@@ -20,6 +22,7 @@ from vllm.config import VllmConfig
 from vllm.logger import init_logger
 
 from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.utils.device_copy import to_device_nonblocking
 
 from .batched_token2wav import (
     BatchedToken2Wav,
@@ -39,9 +42,9 @@ def _resolve_model_dir(model_ref: str, revision: str | None = None) -> str:
     """
     if Path(model_ref).is_dir():
         return model_ref
-    from huggingface_hub import snapshot_download
+    from vllm_omni.transformers_utils.repo_utils import hf_api
 
-    return snapshot_download(model_ref, revision=revision, allow_patterns=["assets/*"])
+    return hf_api().snapshot_download(model_ref, revision=revision, allow_patterns=["assets/*"])
 
 
 def _batch_error(reason: str, **details: Any) -> RuntimeError:
@@ -57,11 +60,99 @@ def _scalar(value: Any, default: Any = None) -> Any:
     return default if value is None else value
 
 
+_REF_TARGET_SAMPLE_RATE = 24000
+# Overridable per deployment via ``ref_audio_max_seconds``.
+_REF_MAX_SECONDS = 6.0
+# Channel ceiling for the optional (channels, samples) downmix guard.
+_REF_MAX_CHANNELS = 8
+
+
+@lru_cache(maxsize=8)
+def _get_resampler(orig_freq: int, new_freq: int):
+    """Cached anti-aliased resampler matching token2wav's own loader.
+
+    ``torchaudio`` is imported lazily (it is not a hard runtime requirement of
+    this model on every platform) and the transform is built once per rate pair
+    instead of once per request, keeping it off the first-packet path.
+    """
+    import torchaudio
+
+    return torchaudio.transforms.Resample(orig_freq=orig_freq, new_freq=new_freq)
+
+
+def _read_reference_wav(path: str) -> tuple[Any, int]:
+    """Read a WAV file for :func:`_normalize_reference`.
+
+    ``soundfile`` returns ``(samples, channels)`` for multi-channel files
+    while the normalizer expects ``(channels, samples)``. Without the
+    transpose a stereo prompt looks like a huge channel count, the downmix
+    guard rejects it, and the caller silently falls back to the raw file --
+    a second L0 value for the same content.
+    """
+    waveform, sample_rate_hz = sf.read(path, dtype="float32", always_2d=False)
+    if getattr(waveform, "ndim", 1) > 1:
+        waveform = waveform.T
+    return waveform, int(sample_rate_hz)
+
+
+def _normalize_reference(
+    ref_audio: Any,
+    sample_rate_hz: int,
+    *,
+    max_seconds: float = _REF_MAX_SECONDS,
+) -> tuple[torch.Tensor, int]:
+    """Normalize a per-request reference waveform onto a shared grid.
+
+    MiniCPM-o streaming uses the reference-audio length as the CFM attention
+    cache origin (L0). Unnormalized references give every request a distinct
+    L0, which explodes the CFM CUDA-graph cache key space (see #6628). Fold
+    every reference onto the same sample rate and a fixed length (truncate
+    long ones, zero-pad short ones) so L0 becomes one constant value.
+
+    References longer than ``max_seconds`` are truncated with a warning;
+    the window is configurable via ``ref_audio_max_seconds``.
+    """
+    tensor = torch.as_tensor(ref_audio, dtype=torch.float32)
+    if tensor.dim() > 1:
+        # (channels, samples) -> mono; plain reshape(-1) would interleave.
+        # Upstream flattens request references to 1-D, so anything else is a
+        # non-standard caller: reject layouts we cannot downmix unambiguously
+        # instead of silently averaging the waveform away.
+        if tensor.shape[0] > _REF_MAX_CHANNELS:
+            raise ValueError(f"reference audio must be 1-D or (channels, samples); got shape {tuple(tensor.shape)}")
+        tensor = tensor.mean(dim=0)
+    waveform = tensor.reshape(-1).cpu().contiguous()
+    if waveform.numel() == 0:
+        # Keep the caller's "empty_ref_audio" error path intact: an empty
+        # waveform must not be zero-padded into a valid-length reference.
+        return waveform, _REF_TARGET_SAMPLE_RATE
+    if sample_rate_hz != _REF_TARGET_SAMPLE_RATE:
+        # Match token2wav's own loader (torchaudio, anti-aliased): it only
+        # resamples when the stored rate differs, so this output is what the
+        # model consumes.
+        waveform = _get_resampler(sample_rate_hz, _REF_TARGET_SAMPLE_RATE)(waveform.view(1, -1)).view(-1).contiguous()
+    max_samples = max(1, int(max_seconds * _REF_TARGET_SAMPLE_RATE))
+    if waveform.numel() > max_samples:
+        logger.warning(
+            "Reference audio is %.2fs, truncating to the %.2fs window (set ``ref_audio_max_seconds`` to keep more).",
+            waveform.numel() / _REF_TARGET_SAMPLE_RATE,
+            max_seconds,
+        )
+        waveform = waveform[:max_samples].contiguous()
+    elif waveform.numel() < max_samples:
+        # Zero-pad short references so every request shares one L0; trailing
+        # silence has minimal style impact (verified via E3 WER/SIM).
+        waveform = torch.nn.functional.pad(waveform, (0, max_samples - waveform.numel()))
+    return waveform, _REF_TARGET_SAMPLE_RATE
+
+
 def _codec_tensor(value: Any, fallback: torch.Tensor) -> torch.Tensor:
+    # Codec ids arrive from the connector as host data. A pageable host copy
+    # would block the host once per request per step; stage them pinned.
     if isinstance(value, torch.Tensor):
-        return value.reshape(-1).to(device=fallback.device, dtype=torch.long)
+        return to_device_nonblocking(value.reshape(-1).to(dtype=torch.long), fallback.device)
     if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
-        return torch.as_tensor(value, device=fallback.device, dtype=torch.long).reshape(-1)
+        return to_device_nonblocking(torch.as_tensor(value, dtype=torch.long).reshape(-1), fallback.device)
     return fallback.reshape(-1).to(dtype=torch.long)
 
 
@@ -160,12 +251,18 @@ class MiniCPMO45Code2Wav(nn.Module):
         self._model_revision = getattr(vllm_config.model_config, "revision", None)
         self.backend: BatchedToken2Wav | None = None
         self._states: dict[str, _RequestState] = {}
-        self._runtime_prompts: dict[str, _RuntimePrompt] = {}
+        self._runtime_prompts: OrderedDict[str, _RuntimePrompt] = OrderedDict()
         self._request_prompt_keys: dict[str, str] = {}
         self._runtime_prompt_dir = tempfile.TemporaryDirectory(
             prefix="minicpmo45-runtime-prompts-",
         )
         extra = self._extra_config()
+        self._runtime_prompt_cache_size = int(extra.get("token2wav_runtime_prompt_cache_size", 4))
+        if self._runtime_prompt_cache_size < 0:
+            raise ValueError("MiniCPM-o Code2Wav runtime prompt cache capacity must be >= 0")
+        self._setup_cache_size = int(extra.get("token2wav_setup_cache_size", 1))
+        if self._setup_cache_size < 0:
+            raise ValueError("MiniCPM-o Code2Wav setup cache capacity must be >= 0")
         self._connector_config = {
             "codec_chunk_frames": int(extra.get("codec_chunk_frames", 25)),
             "codec_left_context_frames": int(extra.get("codec_left_context_frames", 3)),
@@ -174,14 +271,38 @@ class MiniCPMO45Code2Wav(nn.Module):
             raise ValueError(f"Invalid MiniCPM-o connector chunk configuration: {self._connector_config}")
         raw_capture_batch_sizes = extra.get("hift_graph_capture_batch_sizes")
         capture_batch_sizes = [1] if raw_capture_batch_sizes is None else raw_capture_batch_sizes
+        max_serial_batch = extra.get("max_serial_batch")
+        max_serial_batch = 4 if max_serial_batch is None else int(max_serial_batch)
         self._hift_graph_config = {
             "enabled": bool(extra.get("enable_hift_graph", False)),
             "capture_batch_sizes": capture_batch_sizes,
+            "max_serial_batch": max_serial_batch,
         }
+        enable_whole_euler = extra.get("enable_whole_euler")
+        max_graph_batch_raw = extra.get("max_graph_batch")
+        max_graph_batch = int(max_graph_batch_raw) if max_graph_batch_raw is not None else None
+        micro_batch_size_raw = extra.get("micro_batch_size")
+        if micro_batch_size_raw is not None:
+            micro_batch_size = int(micro_batch_size_raw)
+        else:
+            # The Whole-Euler arena reserves one attention cache per micro-batch
+            # row, so size it for the most requests this stage ever batches.
+            max_num_seqs = getattr(getattr(vllm_config, "scheduler_config", None), "max_num_seqs", None)
+            micro_batch_size = min(int(max_num_seqs), max_graph_batch or 16) if max_num_seqs else None
         self._cfm_graph_config = {
             "enabled": bool(extra.get("enable_cfm_graph", False)),
             "max_graphs": int(extra.get("cfm_max_graphs", 32)),
+            "bucket_frames": int(extra.get("cfm_graph_bucket_frames", 0)),
+            "capture_frames": extra.get("cfm_graph_capture_frames"),
+            "enable_whole_euler": enable_whole_euler is None or bool(enable_whole_euler),
+            "max_serial_batch": max_serial_batch,
+            "max_graph_batch": max_graph_batch,
+            "micro_batch_size": micro_batch_size,
+            "pad_max_rows": extra.get("whole_euler_pad_max_rows"),
         }
+        self._ref_max_seconds = float(extra.get("ref_audio_max_seconds", _REF_MAX_SECONDS))
+        if self._ref_max_seconds <= 0:
+            raise ValueError("MiniCPM-o Code2Wav ref_audio_max_seconds must be > 0")
         self._min_batch_size = int(extra.get("code2wav_min_batch_size", 1))
         if self._min_batch_size < 1:
             raise ValueError("MiniCPM-o Code2Wav code2wav_min_batch_size must be >= 1")
@@ -192,12 +313,53 @@ class MiniCPMO45Code2Wav(nn.Module):
             raise ValueError("MiniCPM-o Code2Wav code2wav_initial_batch_size must be 0 or >= code2wav_min_batch_size")
         self._default_prompt_id = str(extra.get("prompt_cache_id", "HT_ref_audio"))
         self._prompt_wav_override = extra.get("prompt_wav")
+        self._default_prompt_normalized: tuple[str, str] | None = None
 
     @property
     def _default_prompt_wav(self) -> str:
         if self._prompt_wav_override is not None:
             return str(self._prompt_wav_override)
         return str(Path(self.model_path) / "assets" / "HT_ref_audio.wav")
+
+    def _normalized_default_prompt(self) -> tuple[str, str]:
+        """Fold the shipped default prompt onto the request-reference grid.
+
+        The shipped asset is 6.016 s and is loaded directly by token2wav, so a
+        request without a reference would otherwise keep a second L0 value a
+        couple of frames away from the normalized request references -- two
+        graph-key families instead of one (both use ``ref_audio_max_seconds``).
+        Returns ``(prompt_wav,
+        prompt_cache_id)``; if the asset cannot be read, the shipped path is
+        returned unchanged.
+        """
+        if self._default_prompt_normalized is not None:
+            return self._default_prompt_normalized
+        source = self._default_prompt_wav
+        fallback = (source, self._default_prompt_id)
+        try:
+            waveform, sample_rate_hz = _read_reference_wav(source)
+            normalized, target_sr = _normalize_reference(
+                waveform,
+                sample_rate_hz,
+                max_seconds=self._ref_max_seconds,
+            )
+        except Exception:
+            logger.warning("Could not normalize the default prompt %s; using it as-is", source)
+            self._default_prompt_normalized = fallback
+            return self._default_prompt_normalized
+        if normalized.numel() == 0:
+            self._default_prompt_normalized = fallback
+            return self._default_prompt_normalized
+        digest = sha256()
+        digest.update(normalized.numpy().tobytes())
+        digest.update(str(target_sr).encode())
+        cache_id = f"default-ref-{digest.hexdigest()[:24]}-{target_sr}"
+        path = Path(self._runtime_prompt_dir.name) / f"{cache_id}.wav"
+        if not path.is_file():
+            sf.write(path, normalized.numpy(), target_sr, format="WAV")
+        logger.info("Default prompt normalized onto the %.2fs window: %s", self._ref_max_seconds, path)
+        self._default_prompt_normalized = (str(path), cache_id)
+        return self._default_prompt_normalized
 
     def _extra_config(self) -> dict[str, Any]:
         model_config = getattr(self.vllm_config, "model_config", None)
@@ -220,9 +382,13 @@ class MiniCPMO45Code2Wav(nn.Module):
         sample_rate: Any,
     ) -> tuple[str, _RuntimePrompt]:
         sample_rate_hz = int(_scalar(sample_rate, 0))
-        waveform = torch.as_tensor(ref_audio, dtype=torch.float32).reshape(-1).cpu().contiguous()
         if sample_rate_hz <= 0:
             raise _batch_error("invalid_ref_audio_sample_rate", sample_rate=sample_rate_hz)
+        waveform, sample_rate_hz = _normalize_reference(
+            ref_audio,
+            sample_rate_hz,
+            max_seconds=self._ref_max_seconds,
+        )
         if waveform.numel() == 0:
             raise _batch_error("empty_ref_audio")
         if not bool(torch.isfinite(waveform).all().item()):
@@ -238,6 +404,8 @@ class MiniCPMO45Code2Wav(nn.Module):
         if entry is None:
             entry = _RuntimePrompt(cache_id=cache_id, path=path, owners=set())
             self._runtime_prompts[cache_key] = entry
+        else:
+            self._runtime_prompts.move_to_end(cache_key)
         prompt_path = Path(entry.path)
         if not prompt_path.is_file():
             with tempfile.NamedTemporaryFile(
@@ -288,9 +456,10 @@ class MiniCPMO45Code2Wav(nn.Module):
         if entry is not None:
             return entry.cache_id, entry.path, cache_key
 
+        default_wav, default_cache_id = self._normalized_default_prompt()
         return (
-            str(_scalar(meta.get("prompt_cache_id"), self._default_prompt_id)),
-            str(_scalar(meta.get("prompt_wav"), self._default_prompt_wav)),
+            str(_scalar(meta.get("prompt_cache_id"), default_cache_id)),
+            str(_scalar(meta.get("prompt_wav"), default_wav)),
             None,
         )
 
@@ -300,8 +469,9 @@ class MiniCPMO45Code2Wav(nn.Module):
         if entry is None:
             return
         entry.owners.discard(state_id)
-        if entry.owners:
-            return
+        self._trim_runtime_prompts()
+
+    def _evict_runtime_prompt(self, cache_key: str, entry: _RuntimePrompt) -> None:
         if self.backend is not None:
             self.backend.evict_prompt(entry.cache_id, entry.path)
         Path(entry.path).unlink(missing_ok=True)
@@ -313,21 +483,25 @@ class MiniCPMO45Code2Wav(nn.Module):
             if cache_key is None:
                 continue
             previous_key = self._request_prompt_keys.get(item.state_id)
-            if previous_key != cache_key:
-                self._release_request_prompt(item.state_id)
             entry = self._runtime_prompts.get(cache_key)
-            if entry is not None:
-                entry.owners.add(item.state_id)
-                self._request_prompt_keys[item.state_id] = cache_key
-
-    def _prune_unowned_runtime_prompts(self) -> None:
-        for cache_key, entry in list(self._runtime_prompts.items()):
-            if entry.owners:
+            if entry is None:
                 continue
-            if self.backend is not None:
-                self.backend.evict_prompt(entry.cache_id, entry.path)
-            Path(entry.path).unlink(missing_ok=True)
-            self._runtime_prompts.pop(cache_key, None)
+            if previous_key != cache_key:
+                previous = self._runtime_prompts.get(previous_key) if previous_key is not None else None
+                if previous is not None:
+                    previous.owners.discard(item.state_id)
+            entry.owners.add(item.state_id)
+            self._request_prompt_keys[item.state_id] = cache_key
+            self._runtime_prompts.move_to_end(cache_key)
+        self._trim_runtime_prompts()
+
+    def _trim_runtime_prompts(self) -> None:
+        """Evict least-recent unowned references, never request-owned state."""
+        while len(self._runtime_prompts) > self._runtime_prompt_cache_size:
+            victim = next(((key, entry) for key, entry in self._runtime_prompts.items() if not entry.owners), None)
+            if victim is None:
+                return
+            self._evict_runtime_prompt(*victim)
 
     @staticmethod
     def _split_segments(input_ids: torch.Tensor, counts: Any) -> list[torch.Tensor]:
@@ -560,6 +734,33 @@ class MiniCPMO45Code2Wav(nn.Module):
         runtime_additional_information: list[dict[str, Any]] | None = None,
         **kwargs: Any,
     ) -> OmniOutput:
+        # This stage owns the vocoder process. Restore its previous matmul
+        # policy after eager execution/capture; cuDNN's policy is independent.
+        previous_tf32 = torch.backends.cuda.matmul.allow_tf32
+        try:
+            if self._extra_config().get("token2wav_allow_tf32", False):
+                torch.backends.cuda.matmul.allow_tf32 = True
+            return self._forward_impl(
+                input_ids,
+                positions,
+                intermediate_tensors,
+                inputs_embeds,
+                runtime_additional_information,
+                **kwargs,
+            )
+        finally:
+            torch.backends.cuda.matmul.allow_tf32 = previous_tf32
+
+    @torch.inference_mode()
+    def _forward_impl(
+        self,
+        input_ids: torch.Tensor | None = None,
+        positions: torch.Tensor | None = None,
+        intermediate_tensors: Any = None,
+        inputs_embeds: torch.Tensor | None = None,
+        runtime_additional_information: list[dict[str, Any]] | None = None,
+        **kwargs: Any,
+    ) -> OmniOutput:
         del positions, intermediate_tensors, inputs_embeds
         ids = input_ids if isinstance(input_ids, torch.Tensor) else torch.empty(0, dtype=torch.long)
         segments = self._split_segments(ids, kwargs.get("seq_token_counts"))
@@ -623,11 +824,11 @@ class MiniCPMO45Code2Wav(nn.Module):
                     )
                 items.append(self._parse_item(index, str(state_id), segment, info))
         except Exception:
-            self._prune_unowned_runtime_prompts()
+            self._trim_runtime_prompts()
             raise
         state_ids = [item.state_id for item in items]
         if len(state_ids) != len(set(state_ids)):
-            self._prune_unowned_runtime_prompts()
+            self._trim_runtime_prompts()
             raise _batch_error("duplicate_request_in_forward", request_ids=state_ids)
         outputs = [empty for _ in segments]
         sentinels = [item for item in items if item.last_chunk and item.tokens.numel() == 0]
@@ -641,7 +842,7 @@ class MiniCPMO45Code2Wav(nn.Module):
             if item.has_payload and not item.last_chunk and not item.tts_is_last_chunk and item.tokens.numel() == 0
         ]
         if invalid_empty:
-            self._prune_unowned_runtime_prompts()
+            self._trim_runtime_prompts()
             raise _batch_error("empty_nonfinal_chunk", request_ids=invalid_empty)
 
         buckets: dict[tuple[Any, ...], list[_WorkItem]] = {}
@@ -657,7 +858,7 @@ class MiniCPMO45Code2Wav(nn.Module):
             if len(bucket) < self._min_batch_size
         ]
         if undersized:
-            self._prune_unowned_runtime_prompts()
+            self._trim_runtime_prompts()
             raise _batch_error(
                 "exact_shape_bucket_below_minimum",
                 minimum=self._min_batch_size,
@@ -696,7 +897,7 @@ class MiniCPMO45Code2Wav(nn.Module):
                 )
                 states = self.backend.setup_batch(features, len(bucket))
             except Exception as exc:
-                self._prune_unowned_runtime_prompts()
+                self._trim_runtime_prompts()
                 if isinstance(exc, RuntimeError) and str(exc).startswith("MiniCPMO45Code2WavBatchError "):
                     raise
                 raise _batch_error(
@@ -706,7 +907,7 @@ class MiniCPMO45Code2Wav(nn.Module):
                     error=str(exc),
                 ) from exc
             if len(states) != len(bucket):
-                self._prune_unowned_runtime_prompts()
+                self._trim_runtime_prompts()
                 raise _batch_error(
                     "backend_result_size_mismatch",
                     expected=len(bucket),
@@ -749,7 +950,7 @@ class MiniCPMO45Code2Wav(nn.Module):
                         last_chunk=bucket[0].last_chunk,
                     )
             except Exception as exc:
-                self._prune_unowned_runtime_prompts()
+                self._trim_runtime_prompts()
                 if isinstance(exc, RuntimeError) and str(exc).startswith("MiniCPMO45Code2WavBatchError "):
                     raise
                 raise _batch_error(
@@ -759,7 +960,7 @@ class MiniCPMO45Code2Wav(nn.Module):
                     error=str(exc),
                 ) from exc
             if len(audios) != batch_size or len(next_states) != batch_size:
-                self._prune_unowned_runtime_prompts()
+                self._trim_runtime_prompts()
                 raise _batch_error(
                     "backend_result_size_mismatch",
                     expected=batch_size,
@@ -897,4 +1098,5 @@ class MiniCPMO45Code2Wav(nn.Module):
             hift_graph_config=self._hift_graph_config,
             cfm_graph_config=self._cfm_graph_config,
             bfloat16_attention_cache=bool(extra.get("code2wav_bfloat16_attention_cache", False)),
+            setup_cache_size=self._setup_cache_size,
         )

@@ -27,14 +27,15 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torchvision.transforms as T
-from huggingface_hub import snapshot_download
 from PIL import Image
 from transformers import AutoTokenizer
 from vllm.logger import init_logger
+from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
+from vllm_omni.diffusion.layers.fused_moe import FusedMoE
 from vllm_omni.diffusion.lora.loader import (
     LoraLoaderMixin,
     _apply_diffusers_lora_alpha_scaling,
@@ -47,6 +48,7 @@ from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+from vllm_omni.quantization import resolve_component_quant_config
 from vllm_omni.transformers_utils.configs.sensenova_u1 import (
     SenseNovaU1Config,
 )
@@ -109,7 +111,9 @@ def _resolve_model_path(model_path: str) -> str:
     """Resolve a HuggingFace model ID or local path to a local directory."""
     if os.path.isdir(model_path):
         return model_path
-    return snapshot_download(model_path)
+    from vllm_omni.transformers_utils.repo_utils import hf_api
+
+    return hf_api().snapshot_download(model_path)
 
 
 def _round_by_factor(number: float, factor: int) -> int:
@@ -496,7 +500,9 @@ class SenseNovaU1Pipeline(
 
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = ""):
         super().__init__()
+        quant_config = resolve_component_quant_config(od_config.quantization_config, "language_model")
         self.od_config = od_config
+        self._unsupported_quant_methods_check(quant_config)
         self.device = get_local_device()
         model_path = od_config.model
         self.local_model_path = _resolve_model_path(model_path)
@@ -512,6 +518,7 @@ class SenseNovaU1Pipeline(
         # Language model (TP-aware)
         self.language_model = SenseNovaU1ForCausalLM(
             self.llm_cfg,
+            quant_config=quant_config,
             prefix="language_model",
         )
         # Cache-DiT hooks pipeline.transformer(.blocks), so it must point at the
@@ -575,12 +582,34 @@ class SenseNovaU1Pipeline(
         ]
 
         self.setup_diffusion_pipeline_profiler(
-            enable_diffusion_pipeline_profiler=od_config.enable_diffusion_pipeline_profiler
+            profiler_targets=[
+                "_t2i_prefix_forward",
+                "_it2i_prefix_forward",
+                "_generate_think",
+                "_generate_text",
+                "_run_denoising_loop",
+            ],
+            enable_diffusion_pipeline_profiler=od_config.enable_diffusion_pipeline_profiler,
         )
 
     # -----------------------------------------------------------------------
     # Helpers
     # -----------------------------------------------------------------------
+
+    def _unsupported_quant_methods_check(self, quant_config: QuantizationConfig | None) -> None:
+        """Reject online FP8 combined with distilled LoRA."""
+        if (
+            quant_config is None
+            or quant_config.get_name() != "fp8"
+            or getattr(quant_config, "is_checkpoint_fp8_serialized", False)
+        ):
+            return
+
+        if self.od_config.lora_backend == "distill" and self.od_config.lora_path:
+            raise ValueError(
+                "SenseNova does not support online FP8 with distilled LoRA "
+                "Use BF16 without quantization for distilled LoRA, or omit the LoRA options for online FP8."
+            )
 
     def _extract_feature(self, pixel_values, gen_model=False, grid_hw=None):
         if gen_model:
@@ -1649,29 +1678,43 @@ class SenseNovaU1Pipeline(
             applied += 1
         return applied
 
+    def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
+        num_experts = max(
+            getattr(self.llm_cfg, "num_experts", 0) or 0,
+            getattr(self.llm_cfg, "gen_num_experts", 0) or 0,
+        )
+        if num_experts <= 1:
+            return []
+        return FusedMoE.make_expert_params_mapping(
+            self,
+            ckpt_gate_proj_name="gate_proj",
+            ckpt_down_proj_name="down_proj",
+            ckpt_up_proj_name="up_proj",
+            num_experts=num_experts,
+        )
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         stacked_params_mapping = self.stacked_params_mapping
+        expert_params_mapping = self.get_expert_mapping()
 
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
 
         for name, loaded_weight in weights:
-            loaded = False
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in name:
-                    continue
-                stacked_name = name.replace(weight_name, param_name)
-                if stacked_name not in params_dict:
-                    break
-                param = params_dict[stacked_name]
-                weight_loader = getattr(param, "weight_loader", None)
-                if weight_loader is not None:
-                    weight_loader(param, loaded_weight, shard_id)
-                loaded_params.add(stacked_name)
-                loaded = True
-                break
+            # Expert FFN shards must skip the stacked mapping: ``.gate_proj`` is
+            # a substring of ``experts.{i}.gate_proj``, which would fuse them
+            # into a dense gate_up_proj instead of reaching the FusedMoE loader.
+            is_expert_weight = ".experts." in name
 
-            if loaded:
+            if not is_expert_weight and self._load_stacked_weight(
+                name, loaded_weight, params_dict, stacked_params_mapping, loaded_params
+            ):
+                continue
+
+            if is_expert_weight:
+                # A shard that matches no mapping belongs to an expert this rank
+                # does not own, so dropping it here is expected under TP/EP.
+                self._load_expert_weight(name, loaded_weight, params_dict, expert_params_mapping, loaded_params)
                 continue
 
             if name not in params_dict:
@@ -1689,3 +1732,54 @@ class SenseNovaU1Pipeline(
             loaded_params.add(name)
 
         return loaded_params
+
+    @staticmethod
+    def _load_stacked_weight(
+        name: str,
+        loaded_weight: torch.Tensor,
+        params_dict: dict[str, torch.nn.Parameter],
+        stacked_params_mapping: list[tuple[str, str, str | int]],
+        loaded_params: set[str],
+    ) -> bool:
+        for param_name, weight_name, shard_id in stacked_params_mapping:
+            if weight_name not in name:
+                continue
+            stacked_name = name.replace(weight_name, param_name)
+            if stacked_name not in params_dict:
+                return False
+            param = params_dict[stacked_name]
+            weight_loader = getattr(param, "weight_loader", None)
+            if weight_loader is not None:
+                weight_loader(param, loaded_weight, shard_id)
+            loaded_params.add(stacked_name)
+            return True
+        return False
+
+    @staticmethod
+    def _load_expert_weight(
+        name: str,
+        loaded_weight: torch.Tensor,
+        params_dict: dict[str, torch.nn.Parameter],
+        expert_params_mapping: list[tuple[str, str, int, str]],
+        loaded_params: set[str],
+    ) -> bool:
+        for param_name, weight_name, expert_id, shard_id in expert_params_mapping:
+            if weight_name not in name:
+                continue
+            stacked_name = name.replace(weight_name, param_name)
+            param = params_dict.get(stacked_name)
+            weight_loader = getattr(param, "weight_loader", None) if param is not None else None
+            if weight_loader is None:
+                continue
+            success = weight_loader(
+                param,
+                loaded_weight,
+                stacked_name,
+                shard_id=shard_id,
+                expert_id=expert_id,
+                return_success=True,
+            )
+            if success:
+                loaded_params.add(stacked_name)
+                return True
+        return False

@@ -41,7 +41,6 @@ def _make_omni_base_with_mock_prom(mocker):
     obj = object.__new__(OmniBase)
     obj.prom_metrics = mocker.Mock(spec=OmniPrometheusMetrics)
     obj.request_states = {}
-    obj._consumed_metric_messages = {}
     obj.log_stats = True
     return obj, obj.prom_metrics
 
@@ -112,7 +111,7 @@ class TestFailureCounterWiring:
         obj.request_states["req-1"] = SimpleNamespace(
             metrics=SimpleNamespace(
                 e2e_done=set(),
-                build_and_log_summary=lambda: None,
+                log_timing_summary=lambda: None,
             ),
             failure_recorded=False,
         )
@@ -128,7 +127,7 @@ class TestFailureCounterWiring:
         obj.request_states["req-1"] = SimpleNamespace(
             metrics=SimpleNamespace(
                 e2e_done=set(),
-                build_and_log_summary=lambda: None,
+                log_timing_summary=lambda: None,
             ),
             failure_recorded=False,
         )
@@ -270,7 +269,7 @@ class TestStageWorkloadMetricScope:
 
         obj = object.__new__(OmniBase)
         obj._enable_ar_profiler = False
-        obj._consumed_metric_messages = {}
+        obj.request_states = {"req-replay": SimpleNamespace(consumed_metric_message_ids=set())}
         obj.prom_metrics = mocker.Mock(spec=OmniPrometheusMetrics)
         obj.mod_metrics = mocker.Mock()
         obj.engine = SimpleNamespace(

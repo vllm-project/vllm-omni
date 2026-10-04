@@ -25,7 +25,6 @@ connectors:
       # Window geometry is fixed by the checkpoint (200-frame windows on a
       # 100-frame hop, models/minimax_music3/constants.py), so there are no
       # codec_chunk_frames knobs here: changing the window changes the audio.
-      shm_threshold_bytes: 65536
       connector_get_sleep_s: 0.01
       # One window is 200 AR frames = 8 s of music, so stage 1 waits far longer
       # for a chunk than a per-step codec stage would. First chunk additionally

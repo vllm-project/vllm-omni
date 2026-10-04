@@ -1,7 +1,26 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
-Shared helper utilities for OpenAI-compatible video generation API.
+Shared media utilities for OpenAI-compatible video APIs.
+
+PUT HERE:
+  - Shared media backends reused by generation and streaming serving:
+    decode/encode of image/video/audio references and frames, streaming
+    encoders, frame/audio coercion. No FastAPI Request / job-store orchestration.
+
+DO NOT PUT HERE:
+  - ``/v1/videos*`` multipart form parsing, upload limits, job runners,
+    cleanup, or response factories — those go in ``video.generation.helpers``.
+
+LONGEVITY:
+  - This root utils file is a **temporary shared home**.
+  - TODO(#5227, P1.3): tidy up / move into the video family (e.g.
+    ``video/generation/media.py``) in the P1.3 video modality PR; do not treat this
+    file as the long-term owner.
+  - ``video.generation.helpers`` is the longer home for ``/v1/videos*``
+    endpoint logic through P0.2/P0.3 until P1.3 further splits it.
+
+See ``openai/README.md`` and ``video/README.md`` (utils vs helpers, no overlap).
 """
 
 from __future__ import annotations
@@ -71,6 +90,21 @@ class VideoFrames(list[Image.Image]):
         self.source_path = source_path
 
 
+class _ImagePixelLimitError(InvalidInputReferenceError):
+    """An image exceeded a configured or decoder-enforced pixel limit."""
+
+
+def _validate_image_pixel_limit(image: Image.Image) -> None:
+    width, height = image.size
+    max_pixels = envs.VLLM_MAX_IMAGE_PIXELS
+    if max_pixels > 0 and width * height > max_pixels:
+        raise _ImagePixelLimitError(
+            f"Image dimensions {width}x{height} ({width * height} pixels) exceed "
+            f"the maximum of {max_pixels} pixels. Set "
+            f"VLLM_MAX_IMAGE_PIXELS to increase this limit."
+        )
+
+
 def positive_float(value: Any) -> float | None:
     if value is None:
         return None
@@ -87,7 +121,13 @@ def positive_float(value: Any) -> float | None:
 
 def _decode_image_bytes(image_bytes: bytes, *, source: str) -> Image.Image:
     try:
-        return Image.open(BytesIO(image_bytes)).convert("RGB")
+        with Image.open(BytesIO(image_bytes)) as image:
+            _validate_image_pixel_limit(image)
+            return image.convert("RGB")
+    except _ImagePixelLimitError:
+        raise
+    except Image.DecompressionBombError as exc:
+        raise _ImagePixelLimitError(f"Invalid {source}: image exceeds the decoder pixel limit.") from exc
     except (UnidentifiedImageError, OSError, ValueError) as exc:
         raise InvalidInputReferenceError(f"Invalid {source}: provided content is not a valid image.") from exc
 
@@ -135,7 +175,9 @@ def _decode_video_bytes(
         frames_array, metadata = loader.load_bytes(
             video_bytes,
             num_frames=num_frames,
-            backend="pyav",
+            # vLLM 0.29 removed the "pyav" decoder backend; "opencv" is
+            # upstream's default and the remaining CPU-only option.
+            backend="opencv",
             keep=keep,
         )
     except Exception as exc:
@@ -158,6 +200,8 @@ def _decode_media_bytes(
 ) -> Image.Image | VideoFrames:
     try:
         return _decode_image_bytes(media_bytes, source=source)
+    except _ImagePixelLimitError:
+        raise
     except InvalidInputReferenceError:
         try:
             return _decode_video_bytes(
@@ -705,13 +749,21 @@ def _iter_planar_video_frames(
         converter.shutdown()
 
 
+def _iter_borrowed_rgb_video_frames(frames: list[np.ndarray]) -> Generator[av.VideoFrame, None, None]:
+    """Wrap RGB arrays in AVFrames without copying their pixel storage."""
+    import av
+
+    for frame in frames:
+        yield av.VideoFrame.from_numpy_buffer(frame, format="rgb24")
+
+
 def _log_video_encoding_path(
     *,
     selected_path: str,
     frames: list[np.ndarray],
     frame_shape: tuple[int, ...],
     common_dtype: np.dtype,
-    fps: int,
+    fps: int | float,
     audio: AudioInput | None,
     audio_sample_rate: int | None,
     effective_frame_conversion_workers: int,
@@ -746,7 +798,7 @@ def _encode_prepared_video_bytes_legacy(
     frames: list[np.ndarray],
     frame_shape: tuple[int, ...],
     common_dtype: np.dtype,
-    fps: int,
+    fps: int | float,
     audio: Any | None = None,
     audio_sample_rate: int | None = None,
     video_codec_options: dict[str, str] | None = None,
@@ -791,14 +843,42 @@ def _encode_video_bytes(
     audio_sample_rate: int | None = None,
     video_codec_options: dict[str, str] | None = None,
     frame_converter: _PlanarFrameConverter | None = None,
+    enable_borrowed_frames: bool = False,
 ) -> bytes:
-    """Encode a video payload through the direct planar or legacy path."""
+    """Encode through the opt-in borrowed RGB, direct planar or legacy path."""
     from vllm_omni.diffusion.utils.media_utils import mux_av_video_audio_bytes
 
     # Prepare once so validation is shared by both paths and malformed common
     # input is reported before any muxer is opened.
     frames, frame_shape, common_dtype = _prepare_video_frames(video)
     effective_audio_sample_rate = _resolve_audio_sample_rate(audio, audio_sample_rate) if audio is not None else None
+    if (
+        enable_borrowed_frames
+        and common_dtype == np.dtype(np.uint8)
+        and len(frame_shape) == 3
+        and frame_shape[-1] == 3
+        and all(frame.dtype == np.uint8 and frame.strides[1:] == (3, 1) for frame in frames)
+    ):
+        _log_video_encoding_path(
+            selected_path="borrowed_rgb",
+            frames=frames,
+            frame_shape=frame_shape,
+            common_dtype=common_dtype,
+            fps=fps,
+            audio=audio,
+            audio_sample_rate=effective_audio_sample_rate,
+            effective_frame_conversion_workers=0,
+        )
+        audio_np = _coerce_audio_to_numpy(audio) if audio is not None else None
+        return mux_av_video_audio_bytes(
+            _iter_borrowed_rgb_video_frames(frames),
+            width=frame_shape[1],
+            height=frame_shape[0],
+            audio_waveform=audio_np,
+            fps=float(fps),
+            audio_sample_rate=effective_audio_sample_rate,
+            video_codec_options=video_codec_options,
+        )
     fallback_reason = _direct_planar_fallback_reason(
         frames,
         frame_shape,
@@ -913,6 +993,7 @@ def encode_video_base64(
     audio_sample_rate: int | None = None,
     video_codec_options: dict[str, str] | None = None,
     frame_converter: _PlanarFrameConverter | None = None,
+    enable_borrowed_frames: bool = False,
 ) -> str:
     """Encode a video (frames/array/tensor) to base64 MP4."""
     video_bytes = _encode_video_bytes(
@@ -922,5 +1003,6 @@ def encode_video_base64(
         audio_sample_rate=audio_sample_rate,
         video_codec_options=video_codec_options,
         frame_converter=frame_converter,
+        **({"enable_borrowed_frames": True} if enable_borrowed_frames else {}),
     )
     return base64.b64encode(video_bytes).decode("utf-8")

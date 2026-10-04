@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """End-to-end online serving test for GR00T N1.7 through the OpenPI robot endpoint."""
 
 import os
@@ -29,8 +29,7 @@ test_params = [
         OmniServerParams(
             model=MODEL,
             stage_config_path=get_deploy_config_path("Gr00tN1d7.yaml"),
-            server_args=["--disable-log-stats"],
-            env_dict={"VLLM_DISABLE_COMPILE_CACHE": "1", "GR00T_NOISE_SEED": "42"},
+            env_dict={"VLLM_DISABLE_COMPILE_CACHE": "1"},
             init_timeout=1200,
             stage_init_timeout=900,
         ),
@@ -162,14 +161,14 @@ def test_gr00t_n1d7_openpi_online(omni_server, openai_client) -> None:
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_gr00t_n1d7_openpi_precision(omni_server, openai_client) -> None:
-    """Assert actions match Isaac-GR00T reference (GR00T_NOISE_SEED=42, zero inputs)."""
+    """Assert actions match Isaac-GR00T reference (request seed=42, zero inputs)."""
     response = openai_client.send_robot_openpi_ws_request(
         {
             "operations": [
                 {"endpoint": "reset", "payload": {}},
                 {
                     "endpoint": "infer",
-                    "payload": build_openpi_droid_observation(session_id="gr00t-precision-e2e"),
+                    "payload": build_openpi_droid_observation(session_id="gr00t-precision-e2e", seed=42),
                 },
             ],
         }

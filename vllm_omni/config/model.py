@@ -1,7 +1,11 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from dataclasses import MISSING, field
 from typing import Any
 
 from pydantic import ConfigDict, TypeAdapter
+from transformers import PretrainedConfig
 from vllm.config import ModelConfig
 from vllm.config.utils import config
 from vllm.logger import init_logger
@@ -121,9 +125,14 @@ class OmniModelConfig(ModelConfig):
     """
 
     stage_id: int = 0
+    # Match the upstream derived field while its value is replaced per stage.
+    hf_text_config: PretrainedConfig = field(init=False)
     async_chunk: bool = False
     session_mode: str = "turn"
     retains_state_across_chunks: bool = False
+    supports_running_prefix_cache_reset: bool = True
+    use_v2_model_runner: bool = False
+    supports_native_mrv2_data_plane: bool = False
     # Stage-1 active stream slots; 0 keeps legacy chunk-level round-robin.
     active_stream_window: int = 0
     duplex_max_sessions: int = 1
@@ -134,6 +143,7 @@ class OmniModelConfig(ModelConfig):
     # Optional dotted path of a per-stage pooling-output decoder applied
     # worker-side before IPC. Read by the AR scheduler.
     pooling_output_decoder: str | None = None
+    final_output: bool = False
     hf_config_name: str | None = None
     custom_process_next_stage_input_func: str | None = None
     stage_connector_config: dict[str, Any] = field(
@@ -212,7 +222,7 @@ class OmniModelConfig(ModelConfig):
             return convertor.convert()
         return super().get_model_arch_config()
 
-    def draw_hf_text_config(self):
+    def draw_hf_text_config(self) -> PretrainedConfig:
         # transformers' get_text_config method is used to get the text config from thinker_config.
         # to handle the case that each model stage has their own text config,
         # we need to draw the text config from the corresponding model stage.

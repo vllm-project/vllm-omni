@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """External model loading, audio I/O, and emotion conditioning for IndexTTS2."""
 
 from __future__ import annotations
@@ -171,9 +171,10 @@ def load_semantic_codec(
         codec.load_state_dict(state, strict=False)
     else:
         import safetensors.torch
-        from huggingface_hub import hf_hub_download
 
-        ckpt_path = hf_hub_download("amphion/MaskGCT", filename="semantic_codec/model.safetensors")
+        from vllm_omni.transformers_utils.repo_utils import hf_api
+
+        ckpt_path = hf_api().hf_hub_download("amphion/MaskGCT", filename="semantic_codec/model.safetensors")
         safetensors.torch.load_model(codec, ckpt_path)
     _freeze(codec.to(device=device, dtype=torch.float32))
     _semantic_codec_cache[cache_key] = codec
@@ -198,9 +199,11 @@ def load_campplus(model_path: str, device: torch.device):
         if ckpt_path is not None:
             break
     if ckpt_path is None:
-        from huggingface_hub import hf_hub_download
+        if os.path.isdir(model_path):
+            raise FileNotFoundError(f"IndexTTS CAMPPlus checkpoint is missing from local bundle {model_path!r}")
+        from vllm_omni.transformers_utils.repo_utils import hf_api
 
-        ckpt_path = hf_hub_download("funasr/campplus", filename="campplus_cn_common.bin")
+        ckpt_path = hf_api().hf_hub_download("funasr/campplus", filename="campplus_cn_common.bin")
     state = torch.load(ckpt_path, map_location="cpu", weights_only=True)
     campplus.load_state_dict(state, strict=False)
     _freeze(campplus.to(device=device, dtype=torch.float32))

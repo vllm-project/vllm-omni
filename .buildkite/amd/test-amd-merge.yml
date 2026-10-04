@@ -9,15 +9,26 @@ steps:
   steps:
     - label: "Simple · Model Executor Test · Shard %N/%t"
       agent_pool: mi300_1
-      parallelism: 2
+      parallelism: 3
       depends_on: amd-build
       mirror_hardwares: [amdproduction]
       grade: Blocking
+      timeout_in_minutes: 90
       commands:
         - export VLLM_ROCM_USE_AITER=0
         # ignore test_teacache_extractors.py because it use rocm gemm kernel from vLLM
         # that is not supported on CPU
-        - "pytest -sv tests/model_executor -m 'core_model and cpu' --num-shards=$$BUILDKITE_PARALLEL_JOB_COUNT --shard-id=$$BUILDKITE_PARALLEL_JOB"
+        - "pytest -sv tests/model_executor -m 'core_model and cpu and not omni' --num-shards=$$BUILDKITE_PARALLEL_JOB_COUNT --shard-id=$$BUILDKITE_PARALLEL_JOB"
+
+    - label: "Simple · Omni Processor Test"
+      agent_pool: mi300_1
+      depends_on: amd-build
+      mirror_hardwares: [amdproduction]
+      grade: Blocking
+      timeout_in_minutes: 60
+      commands:
+        - export VLLM_ROCM_USE_AITER=0
+        - "pytest -sv tests/model_executor/models/test_omni_processing.py -m 'core_model and cpu and omni'"
 
     - label: "Simple · Diffusion Test · Shard %N/%t"
       agent_pool: mi300_1
@@ -25,11 +36,38 @@ steps:
       depends_on: amd-build
       mirror_hardwares: [amdproduction]
       grade: Blocking
+      timeout_in_minutes: 45
       commands:
         - export VLLM_ROCM_USE_AITER=0
         # ignore test_teacache_extractors.py because it use rocm gemm kernel from vLLM
         # that is not supported on CPU
-        - "pytest -sv tests/diffusion -m 'core_model and cpu' --ignore=tests/diffusion/cache/test_teacache_extractors.py --num-shards=$$BUILDKITE_PARALLEL_JOB_COUNT --shard-id=$$BUILDKITE_PARALLEL_JOB"
+        # Keep multi-GPU tests out of this one-GPU pool even when their module
+        # also carries the cpu marker for unit tests.
+        - "pytest -sv tests/diffusion -m 'core_model and cpu and not (cards_2 or cards_3 or cards_4 or cards_5 or cards_6 or cards_7 or cards_8)' --ignore=tests/diffusion/cache/test_teacache_extractors.py --ignore=tests/diffusion/models/pi05/test_pi05_units.py --num-shards=$$BUILDKITE_PARALLEL_JOB_COUNT --shard-id=$$BUILDKITE_PARALLEL_JOB"
+    # This module takes about 22 minutes on MI300 and was consistently assigned to shard 4,
+    # pushing that shard to the 45-minute timeout. Keep its module-scoped fixture in one lane.
+    - label: "Simple · Pi0.5 CPU Test"
+      agent_pool: mi300_1
+      depends_on: amd-build
+      mirror_hardwares: [amdproduction]
+      grade: Blocking
+      timeout_in_minutes: 45
+      commands:
+        - export VLLM_ROCM_USE_AITER=0
+        - "pytest -sv tests/diffusion/models/pi05/test_pi05_units.py -m 'core_model and cpu'"
+
+    - label: "Diffusion · AuK VAE GPU Test"
+      agent_pool: mi300_1
+      depends_on: amd-build
+      mirror_hardwares: [amdproduction]
+      grade: Blocking
+      timeout_in_minutes: 40
+      commands:
+        - export VLLM_ROCM_USE_AITER=0
+        - >-
+          timeout --signal=TERM --kill-after=2m 35m
+          pytest -sv tests/diffusion/models/auk/test_auk_vae_fastpath.py
+          -m 'core_model and rocm and cards_1' --run-level core_model
 
     - label: "Simple · Engine&Entrypoints Test"
       agent_pool: mi300_1
@@ -119,6 +157,11 @@ steps:
       grade: Blocking
       commands:
         - pytest -s -v tests/diffusion/distributed/test_tensor_parallel.py
+        - >-
+          timeout 20m pytest -s -v
+          tests/diffusion/attention/test_ulysses_uaa.py::test_ulysses_uaa_2d_mask_layout_matches_baseline
+          -m 'core_model and cards_2'
+          --run-level "core_model"
 
     - label: "Diffusion Model Test"
       agent_pool: mi300_1
@@ -126,7 +169,9 @@ steps:
       mirror_hardwares: [amdproduction]
       grade: Blocking
       commands:
-        - timeout 30m pytest -s -v tests/e2e/offline_inference/test_z_image.py
+        # A cold Z-Image run spends about six minutes loading weights before
+        # the first-request AITER compilation, which can itself exceed 23m.
+        - timeout 55m pytest -s -v tests/e2e/offline_inference/test_z_image.py
 
     - label: "Diffusion GPU Worker Test"
       agent_pool: mi300_2
