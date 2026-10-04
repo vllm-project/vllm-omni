@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Configuration for PersonaPlex (a Moshi finetune; 2-stage audio->audio pipeline).
 
 PersonaPlex is a staged AR speech model composed of:
@@ -203,6 +203,9 @@ class PersonaPlexConfig(PretrainedConfig):
         mimi_name (`str`, *optional*):
             Convenience mirror of ``mimi_config.mimi_name``; if set, it
             overrides the value carried inside ``mimi_config``.
+        depformer_cuda_graphs (`bool`, *optional*, defaults to `False`):
+            Capture ``PersonaPlexDepformer.forward`` into model-local CUDA
+            graphs. The HF default is False, could be overridden in ``hf_overrides``.
     """
 
     model_type = "personaplex"
@@ -222,6 +225,7 @@ class PersonaPlexConfig(PretrainedConfig):
         audio_vocab_size: int = 2048,
         num_audio_codebooks: int = 16,
         mimi_name: str | None = None,
+        depformer_cuda_graphs: bool = False,
         **kwargs: Any,
     ) -> None:
         if temporal_config is None:
@@ -257,6 +261,8 @@ class PersonaPlexConfig(PretrainedConfig):
         if mimi_name is not None:
             self.mimi_config.mimi_name = mimi_name
         self.mimi_name = self.mimi_config.mimi_name
+
+        self.depformer_cuda_graphs = depformer_cuda_graphs
 
     @staticmethod
     def _coerce(value: Any, config_cls: type[PretrainedConfig]) -> PretrainedConfig:

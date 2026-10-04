@@ -36,6 +36,8 @@ The integration supports:
   (pure lockstep: the model listens while it speaks);
 - bundled `.pt` voice prompts (`voice`) and a session persona (`instructions`);
 - greedy text and depformer sampling (one temporal token per frame);
+- Stage 0 depformer CUDA graphs (`hf_overrides.depformer_cuda_graphs`; shipped
+  on in `personaplex.yaml`). Capture failure falls back to eager;
 - the public client preset
   `vllm_omni.clients.personaplex.create_duplex_session_config()` (24 kHz
   `pcm_f32le` input, voice, persona) as the canonical session-config source
@@ -161,6 +163,16 @@ request finds nothing to close.
 Every live session has an independent Mimi encoder instance; encoder state is
 never shared between asynchronously scheduled sessions. A finished or
 aborted scheduler request resets and returns only that session's encoder.
+
+### Stage 0 CUDA graphs
+
+The AR runner FULL-graphs Helium. The depformer is launch-bound (16-step
+unroll), so `CUDAGraphDepformerWrapper` captures `PersonaPlexDepformer.forward`
+per padded batch with statc KV. Sizes come from Stage 0
+`compilation_config.cudagraph_capture_sizes.`. `personaplex.yaml` sets
+`hf_overrides.depformer_cuda_graphs: true`. `enforce_eager: true` disables graphs.
+Shape mismatch or capture failure replays eager. Graphed vs eager codes are tested
+in `tests/model_executor/models/personaplex/duplex/`;
 
 ### Stage 1 streaming decoder
 

@@ -76,4 +76,7 @@ Stage 0 request replays the voice/persona prefill).
 - The model plugin, worker-side lockstep runtime and input framing live in
   `vllm_omni/model_executor/models/personaplex/duplex/`; design notes in
   [`docs/design/fullduplex-personaplex.md`](../../../docs/design/fullduplex-personaplex.md).
+- Stage 0 uses VLLM FULL CUDA graphs on the temporal transformer. The depformer is a
+  separate per-padded-B graph, on by default via `hf_overrides.depformer_cuda_graphs: true`
+  in `personaplex.yaml`. Delete that `hf_overrides` block to run the depformer eager.
 - Full runbook: [`recipes/NVIDIA/PersonaPlex.md`](../../../recipes/NVIDIA/PersonaPlex.md).
