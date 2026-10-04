@@ -68,6 +68,21 @@ from vllm_omni.utils.speaker_cache import get_speaker_cache
 
 logger = init_logger(__name__)
 
+
+def _validate_speech_token_ids(input_ids: torch.Tensor, num_speech_tokens: int) -> None:
+    """Reject unsafe ids before they reach the talker's speech embedding gather."""
+    if input_ids.numel() == 0:
+        return
+    out_of_range = (input_ids < 0) | (input_ids >= num_speech_tokens)
+    if bool(out_of_range.any()):
+        bad = input_ids[out_of_range].flatten()[:8].tolist()
+        raise ValueError(
+            f"cosyvoice3 talker: speech token id out of range [0, {num_speech_tokens}); "
+            f"got out-of-range ids {bad}. Non-multimodal text-only requests are not "
+            "supported by the CosyVoice3 talker; provide the required audio prompt."
+        )
+
+
 # Process-wide cache of per-model mm-processor runtime components (tokenizer,
 # feat_extractor, campplus session/engine). The mm processor is re-created per
 # request (mm_processor_cache_gb: 0), so this avoids rebuilding them every time.
@@ -1249,24 +1264,66 @@ class CosyVoice3Model(
         input_ids: torch.Tensor,
         multimodal_embeddings=None,
         is_multimodal=None,
+        prefill_token_mask: bool | torch.Tensor | None = None,
+        scheduled_token_counts: list[int] | None = None,
         query_start_loc: Sequence[int] | None = None,
     ) -> torch.Tensor:
         if self.model_stage == "cosyvoice3_talker":
+            num_speech_tokens = self.model.speech_embedding.weight.shape[0]
+
+            def validate_prefill_ids(mask: bool | torch.Tensor | None) -> None:
+                # ``None`` is deliberately fail-safe: direct model callers do
+                # not have scheduler metadata, so every id must be safe to
+                # gather from the speech embedding table.
+                if mask is False:
+                    return
+                prefill_ids = input_ids
+                if isinstance(mask, torch.Tensor):
+                    if mask.shape != input_ids.shape:
+                        raise ValueError(
+                            "cosyvoice3 talker: prefill_token_mask must match "
+                            f"input_ids shape; got {mask.shape} and {input_ids.shape}."
+                        )
+                    prefill_ids = input_ids[mask.to(device=input_ids.device, dtype=torch.bool)]
+                _validate_speech_token_ids(prefill_ids, num_speech_tokens)
+
             # Decode-only steps carry no speech embeddings; checking the
             # (device) placeholder mask would synchronize every step.
             if not multimodal_embeddings or is_multimodal is None or not torch.any(is_multimodal):
+                validate_prefill_ids(prefill_token_mask)
                 return self.model.speech_embedding.weight[input_ids]
 
             # Requests can interleave new prefills and ongoing decodes after
             # scheduler slot reuse. A placeholder group identifies the start
             # of a prompt, but cannot identify its end: use runner boundaries.
             total_tokens = input_ids.numel()
-            boundaries = list(query_start_loc) if query_start_loc is not None else [0, total_tokens]
+            if query_start_loc is not None:
+                boundaries = list(query_start_loc)
+            elif scheduled_token_counts is not None:
+                if any(count < 0 for count in scheduled_token_counts) or sum(scheduled_token_counts) != total_tokens:
+                    raise ValueError(
+                        "cosyvoice3 talker: scheduled_token_counts must be non-negative "
+                        "and sum to the input_ids length."
+                    )
+                boundaries = [0]
+                for count in scheduled_token_counts:
+                    boundaries.append(boundaries[-1] + count)
+            else:
+                boundaries = [0, total_tokens]
             if not boundaries or boundaries[0] != 0 or boundaries[-1] != total_tokens:
                 raise ValueError("CosyVoice3 input embedding boundaries must cover all scheduled tokens")
             if any(end <= start for start, end in zip(boundaries, boundaries[1:])):
                 raise ValueError("CosyVoice3 input embedding boundaries must be strictly increasing")
+            if isinstance(prefill_token_mask, torch.Tensor):
+                if prefill_token_mask.shape != input_ids.shape:
+                    raise ValueError(
+                        "cosyvoice3 talker: prefill_token_mask must match "
+                        f"input_ids shape; got {prefill_token_mask.shape} and {input_ids.shape}."
+                    )
+                prefill_token_mask = prefill_token_mask.to(device=input_ids.device, dtype=torch.bool)
             mm_mask = is_multimodal.reshape(-1).tolist()
+            if len(mm_mask) != total_tokens:
+                raise ValueError("CosyVoice3 multimodal token mask must match input_ids length")
             # Conditioning contains prefill rows only, whereas the downstream
             # payload splitter indexes the full (prefill + decode) request batch.
             self._conditioning_request_rows = [
@@ -1283,6 +1340,11 @@ class CosyVoice3Model(
             for start, end in zip(boundaries, boundaries[1:]):
                 request_mask = mm_mask[start:end]
                 if not any(request_mask):
+                    if prefill_token_mask is not False:
+                        request_ids = input_ids[start:end]
+                        if isinstance(prefill_token_mask, torch.Tensor):
+                            request_ids = request_ids[prefill_token_mask[start:end]]
+                        _validate_speech_token_ids(request_ids, num_speech_tokens)
                     segments.append(self.model.speech_embedding.weight[input_ids[start:end]])
                     continue
                 if multimodal_embeddings is None or mm_index >= len(multimodal_embeddings):

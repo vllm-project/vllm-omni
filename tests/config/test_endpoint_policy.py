@@ -15,6 +15,7 @@ from vllm_omni.config.endpoint_policy import (
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 SERVER_ROUTE = "/v1/completions"
+CHAT_SERVER_ROUTE = "/v1/chat/completions"
 REJECTION_REASON = "This route is banned!"
 
 
@@ -38,6 +39,36 @@ def test_restricted_completions_returns_400():
 
     client = TestClient(app)
     resp = client.post(SERVER_ROUTE, json={"prompt": "hello", "model": "m"})
+    assert resp.status_code == 400
+    body = resp.json()
+    assert body["error"]["message"] == REJECTION_REASON
+    assert body["error"]["type"] == "BadRequestError"
+
+
+def test_restricted_chat_completions_returns_400():
+    """Ensure that chat completion routes can be rejected by pipeline policy."""
+    app = FastAPI()
+
+    @app.post(CHAT_SERVER_ROUTE)
+    async def existing_handler():
+        return {"ok": True}
+
+    restrictions = (
+        EndpointRestriction(
+            OmniServingCapability.CHAT_COMPLETIONS,
+            REJECTION_REASON,
+        ),
+    )
+    shutdown_unsupported_routes(app, restrictions)
+
+    client = TestClient(app)
+    resp = client.post(
+        CHAT_SERVER_ROUTE,
+        json={
+            "model": "m",
+            "messages": [{"role": "user", "content": "hello"}],
+        },
+    )
     assert resp.status_code == 400
     body = resp.json()
     assert body["error"]["message"] == REJECTION_REASON
