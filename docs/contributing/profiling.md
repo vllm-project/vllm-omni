@@ -31,6 +31,7 @@ Supported fields:
 | `torch_profiler_with_memory` | Enable memory profiling and attempt to dump `memory_snapshot_rank*.pickle`. The pickle is only generated when the current backend supports memory history and snapshot APIs. |
 | `torch_profiler_with_flops` | Enable FLOPs collection in `torch.profiler`. This does not add a separate output file. |
 | `torch_profiler_dump_cuda_time_total` | Export an additional text summary `profiler_out_<rank>.txt` sorted by `self_cuda_time_total`. |
+| `torch_profiler_execution_trace` | Also capture a PyTorch execution trace (ET) per rank via an `ExecutionTraceObserver`, written as `execution_trace_rank*.json` in the session dir. Local trace dirs only. |
 | `delay_iterations` | Number of worker iterations to skip before profiling starts. |
 | `max_iterations` | Maximum number of worker iterations to capture before auto-stop. |
 | `wait_iterations` | Torch-profiler wait iterations before warmup. |
