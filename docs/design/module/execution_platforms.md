@@ -44,6 +44,12 @@ capability detection and MUST fail clearly when unsupported.
 **Rule:** Platform-neutral modules MUST NOT import a vendor implementation
 directly when a common selection interface exists.
 
+**Enforcement:** `tests/platforms/test_platform_import_boundary.py` rejects any
+new import of a concrete `vllm_omni.platforms.<backend>` module from neutral
+code and any platform class that eagerly imports model, layer, quantization, or
+connector bodies. The remaining violations are listed there as named migration
+debt from RFC #6691; the list only shrinks.
+
 ### PLATFORM-INV-003: Overrides are minimal
 
 **Rule:** A platform implementation SHOULD override only behavior that differs
