@@ -126,6 +126,7 @@ steps:
           timeout --signal=TERM --kill-after=2m 55m
           pytest -s -v -n 1
           tests/diffusion/attention/
+          tests/diffusion/utils/test_chunked_transfer.py
           -m 'core_model and rocm and MI325 and cards_1'
           --run-level "core_model"
 
@@ -176,6 +177,21 @@ steps:
           timeout 20m pytest -s -v
           tests/diffusion/models/ltx2/test_ltx2_transformer_ulysses.py
           -m 'core_model and rocm and cards_2'
+          --run-level "core_model"
+
+
+    - label: "ROCm · Ulysses UAA Attention · 2-GPU"
+      agent_pool: mi300_2
+      depends_on: amd-build
+      mirror_hardwares: [amdproduction]
+      grade: Blocking
+      timeout_in_minutes: 25
+      commands:
+        - export VLLM_WORKER_MULTIPROC_METHOD=spawn
+        - >-
+          timeout 20m pytest -s -v
+          tests/diffusion/attention/test_ulysses_uaa.py
+          -m 'core_model and rocm and MI325 and cards_2'
           --run-level "core_model"
 
     - label: "Diffusion GPU Worker Test"

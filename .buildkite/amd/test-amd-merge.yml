@@ -149,6 +149,21 @@ steps:
         - export VLLM_WORKER_MULTIPROC_METHOD=spawn
         - pytest -s -v tests/diffusion/distributed/test_ulysses_uaa_perf.py
 
+
+    - label: "ROCm · Ulysses UAA Attention · 4-GPU"
+      agent_pool: mi300_4
+      depends_on: amd-build
+      mirror_hardwares: [amdproduction]
+      grade: Blocking
+      timeout_in_minutes: 25
+      commands:
+        - export VLLM_WORKER_MULTIPROC_METHOD=spawn
+        - >-
+          timeout 20m pytest -s -v
+          tests/diffusion/attention/test_ulysses_uaa.py
+          -m 'core_model and rocm and MI325 and cards_4'
+          --run-level "core_model"
+
     # merge-only tests
     - label: "Diffusion Tensor Parallelism Test"
       agent_pool: mi300_2

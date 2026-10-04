@@ -13,7 +13,7 @@ import pytest
 import torch
 from vllm.utils.network_utils import get_file_store_init_method
 
-from tests.helpers.mark import hardware_test
+from tests.helpers.mark import hardware_marks, hardware_test
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.attention.parallel.ulysses import UlyssesParallelAttention
@@ -27,7 +27,7 @@ from vllm_omni.diffusion.distributed.parallel_state import (
 from vllm_omni.diffusion.forward_context import get_forward_context, set_forward_context
 from vllm_omni.platforms import current_omni_platform
 
-pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
+pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
 
 
 @pytest.mark.core_model
@@ -521,6 +521,7 @@ def test_advanced_uaa_hybrid_rejects_non_gqa_shapes(monkeypatch: pytest.MonkeyPa
         strategy.pre_attention(query, key, value, None)
 
 
+@pytest.mark.cpu
 def test_strict_ulysses_reshards_vsa_gate_with_qkv(monkeypatch) -> None:
     from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 
@@ -748,17 +749,35 @@ def _run_attention_case(
     "sp_world_size,seq_len,joint_len,num_heads,num_kv_heads",
     [
         # MHA (num_kv_heads=None, joint_len=None)
-        (2, 6, None, 3, None),  # head_cnt not divisible by P=2
-        (2, 5, None, 4, None),  # seq_len not divisible by P=2
-        (4, 9, None, 30, None),  # Z-Image-like: head_cnt not divisible by P=4
-        (4, 10, None, 8, None),  # seq_len not divisible by P=4
+        pytest.param(
+            2, 6, None, 3, None, marks=hardware_marks(res={"cuda": "L4", "rocm": "MI325"}, num_cards=2)
+        ),  # head_cnt not divisible by P=2
+        pytest.param(
+            2, 5, None, 4, None, marks=hardware_marks(res={"cuda": "L4", "rocm": "MI325"}, num_cards=2)
+        ),  # seq_len not divisible by P=2
+        pytest.param(
+            4, 9, None, 30, None, marks=hardware_marks(res={"cuda": "L4", "rocm": "MI325"}, num_cards=4)
+        ),  # Z-Image-like: head_cnt not divisible by P=4
+        pytest.param(
+            4, 10, None, 8, None, marks=hardware_marks(res={"cuda": "L4", "rocm": "MI325"}, num_cards=4)
+        ),  # seq_len not divisible by P=4
         # GQA (joint_len=None)
-        (2, 6, None, 28, 7),  # BOOGU-like GQA: neither Q nor KV divisible by P=2
-        (2, 5, None, 6, 3),  # KV divisible by P, Q is not
-        (4, 8, None, 12, 3),  # KV not divisible by P=4
+        pytest.param(
+            2, 6, None, 28, 7, marks=hardware_marks(res={"cuda": "L4", "rocm": "MI325"}, num_cards=2)
+        ),  # BOOGU-like GQA: neither Q nor KV divisible by P=2
+        pytest.param(
+            2, 5, None, 6, 3, marks=hardware_marks(res={"cuda": "L4", "rocm": "MI325"}, num_cards=2)
+        ),  # KV divisible by P, Q is not
+        pytest.param(
+            4, 8, None, 12, 3, marks=hardware_marks(res={"cuda": "L4", "rocm": "MI325"}, num_cards=4)
+        ),  # KV not divisible by P=4
         # Joint GQA (MMDiT-style text stream via AttentionMetadata.joint_*)
-        (2, 6, 5, 28, 7),  # BOOGU-like GQA joint: KV=7 not divisible by P=2
-        (2, 5, 4, 6, 3),  # KV divisible by P, Q is not
+        pytest.param(
+            2, 6, 5, 28, 7, marks=hardware_marks(res={"cuda": "L4", "rocm": "MI325"}, num_cards=2)
+        ),  # BOOGU-like GQA joint: KV=7 not divisible by P=2
+        pytest.param(
+            2, 5, 4, 6, 3, marks=hardware_marks(res={"cuda": "L4", "rocm": "MI325"}, num_cards=2)
+        ),  # KV divisible by P, Q is not
     ],
 )
 def test_ulysses_uaa_matches_baseline(
@@ -964,6 +983,7 @@ def _run_contract_skip_case(
     destroy_distributed_env()
 
 
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize(
     "num_heads,num_kv_heads",
     [
@@ -1122,6 +1142,7 @@ def test_ulysses_uaa_2d_mask_layout_matches_baseline(
                 pass
 
 
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=4)
 @pytest.mark.parametrize(
     "num_heads,num_kv_heads,joint_len",
     [
