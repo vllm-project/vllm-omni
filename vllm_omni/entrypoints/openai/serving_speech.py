@@ -79,6 +79,8 @@ _SPEECH_USAGE_OUTPUT_TOKENS_HEADER = "X-VLLM-OMNI-OUTPUT-TOKENS"
 _SPEECH_USAGE_TOTAL_TOKENS_HEADER = "X-VLLM-OMNI-TOTAL-TOKENS"
 _SPEECH_USAGE_INPUT_TEXT_TOKENS_HEADER = "X-VLLM-OMNI-INPUT-TEXT-TOKENS"
 _SPEECH_USAGE_INPUT_AUDIO_TOKENS_HEADER = "X-VLLM-OMNI-INPUT-AUDIO-TOKENS"
+# Cached in place of the usage tokenizer after a failed load.
+_USAGE_TOKENIZER_UNAVAILABLE = object()
 
 
 def _stage_speech_metadata(stage: Any) -> tuple[str | None, str | None, str | None]:
@@ -573,20 +575,34 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         active model). Fall back to a lazily-loaded, cached generic tokenizer
         for models that never populate `_tts_tokenizer`. Returns None if no
         tokenizer can be obtained (usage then reports text_tokens=0).
+
+        The fallback load is attempted once: a failure is cached too, because
+        this runs on the request path and a failing `from_pretrained` can take
+        seconds of hub lookups. It follows the server's `trust_remote_code`,
+        and is skipped when the engine runs with `skip_tokenizer_init`.
         """
         if self._tts_tokenizer is not None:
             return self._tts_tokenizer
-        if getattr(self, "_usage_text_tokenizer", None) is None:
+        tokenizer = getattr(self, "_usage_text_tokenizer", None)
+        if tokenizer is None:
             try:
                 from transformers import AutoTokenizer
 
-                self._usage_text_tokenizer = AutoTokenizer.from_pretrained(
-                    self.engine_client.model_config.model, trust_remote_code=True
-                )
-            except Exception as e:  # pragma: no cover - environment dependent
+                model_config = self.engine_client.model_config
+                if getattr(model_config, "skip_tokenizer_init", False):
+                    # The engine loads no tokenizer either; the speech models
+                    # that set this (YuE2, IndexTTS-2) ship none to load.
+                    tokenizer = _USAGE_TOKENIZER_UNAVAILABLE
+                else:
+                    tokenizer = AutoTokenizer.from_pretrained(
+                        model_config.model,
+                        trust_remote_code=bool(getattr(model_config, "trust_remote_code", False)),
+                    )
+            except Exception as e:
                 logger.warning("Usage: could not load a text tokenizer (%s); text_tokens will be 0", e)
-                self._usage_text_tokenizer = None
-        return self._usage_text_tokenizer
+                tokenizer = _USAGE_TOKENIZER_UNAVAILABLE
+            self._usage_text_tokenizer = tokenizer
+        return None if tokenizer is _USAGE_TOKENIZER_UNAVAILABLE else tokenizer
 
     def _count_usage_text_tokens(self, text: str) -> int:
         """Token count of `text` using the model's text tokenizer (0 on failure)."""
