@@ -237,6 +237,7 @@ vllm_omni/
 │           ├── model_channel.py     ModelChannel: submit an append, project stage output, continue a turn
 │           ├── control.py           SessionControl: server VAD and the events that reconfigure it
 │           ├── append_task.py       AppendAttempt: one append in flight and the rollback its failure owes
+│           ├── prefix_warmup.py     PrefixWarmer: Stage0 prefill of pending camera frames before a turn commits
 │           ├── helpers.py           pure reads and payload builders over a session
 │           ├── lease.py             DuplexLeaseState (idle TTL, disconnect grace, resume generation)
 │           └── overlap_policy.py / commit_policy.py / playback_ledger.py
@@ -339,6 +340,16 @@ Everything below runs on the orchestrator asyncio loop; there is no lock.
   playback on `response.done` / `audio.cancelled` rather than waiting for the
   stream to drain. Bounding those buffers and letting an accepted invalidation
   skip undelivered media is left to the follow-up RFC.
+- **Prefix warmup follows the mailbox.** With
+  `duplex_session.visual_prefix_warmup`, the runner calls
+  `PrefixWarmer.refresh()` after every mailbox item. While the unanswered
+  user turn holds a camera frame and nothing else is in flight (no response,
+  append task, bound stream or committed audio), it keeps one background
+  warmup whose prompt the plugin renders as the prefix of the next turn;
+  `stage_port.run_prefix_warmup` prefills it on Stage0 alone. A changed
+  conversation replaces the warmup and anything that starts a turn cancels it,
+  so a warmup never delays or changes a turn. Its output reaches neither the
+  session nor a client, and its failure is only logged.
 - **Backpressure before the mailbox.** `DuplexSessionManager.dispatch`
   checks `max_pending_input_bytes_per_session` and reserves a pending turn for
   `Commit` before the put; a rejected command is answered with
@@ -380,6 +391,16 @@ carries the session identity (`session_id`, `fence`, `epoch`, `turn_id`,
 `model_turn_id`), the public session config and the server-owned runtime
 config for the worker-side model hooks.
 
+`run_prefix_warmup` is the one port call a session makes for itself rather
+than for a turn. It submits a Stage0-final request (`max_tokens=1`, no
+downstream payload, no KV transfer, no async-chunk prewarm) marked
+`prefix_warmup`, consumes its output in `_intercept_stage_output` and turns a
+stage error into a log line instead of an `ErrorMessage`. The request is not
+a session resource, so its failure never closes the session. Cancelling the
+caller aborts it, but only after its submission lands: the input processor's
+multimodal cache records a preprocessed image as sent, so Stage0's receiver
+cache has to receive it too.
+
 ## Model plugin
 
 `DuplexModelPlugin` (ABC, `engine/duplex/plugin.py`) is the one class a model
@@ -389,7 +410,7 @@ policy that used to be two separately configured objects:
 
 | Half | Members |
 | --- | --- |
-| engine policy | `configure_sampling_params(runtime_config, defaults)`, `plan_append(...) -> DuplexAppendPlan` (the resumable Stage0 prompt for one unit), `decide_output(...) -> DuplexOutputDecision \| None` (e.g. the listen decision on a finished Stage0 segment) |
+| engine policy | `configure_sampling_params(runtime_config, defaults)`, `plan_append(...) -> DuplexAppendPlan` (the resumable Stage0 prompt for one unit), `decide_output(...) -> DuplexOutputDecision \| None` (e.g. the listen decision on a finished Stage0 segment), `prepare_prefix_warmup_plan(...) -> DuplexAppendPlan \| None` (a prefix of the next turn's prompt; only when `supports_prefix_warmup`) |
 | session policy | `capabilities(max_sessions)`, `validate_client_extra_body`, `prepare_runtime_config(config, model_config)` (server-owned runtime keys, reference audio resolution), `runtime_config_for_update`, `runtime_config_for_function_output`, `runtime_config_after_model_output` (consumption acknowledgement), `create_session_state() -> DuplexModelSessionState`, `data_plane: DuplexDataPlane` (projects raw stage outputs into internal events), `data_plane_context(...)` |
 
 `DuplexOmniEngine._validate_deployment` loads the plugin before any stage

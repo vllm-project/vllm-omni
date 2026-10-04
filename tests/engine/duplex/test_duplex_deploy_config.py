@@ -8,7 +8,7 @@ from dataclasses import FrozenInstanceError
 
 import pytest
 
-from tests.helpers.stage_config import get_deploy_duplex_max_sessions
+from tests.helpers.stage_config import get_deploy_config_path, get_deploy_duplex_max_sessions
 from vllm_omni.config.stage_config import (
     DuplexSessionRuntimeConfig,
     load_deploy_config,
@@ -91,6 +91,39 @@ def test_duplex_session_runtime_rejects_non_positive_values(tmp_path, name: str,
 
     with pytest.raises(ValueError, match=rf"duplex_session\.{name} must be positive"):
         load_deploy_config(deploy_path)
+
+
+def test_duplex_session_visual_prefix_warmup_is_an_explicit_boolean(tmp_path) -> None:
+    deploy_path = tmp_path / "duplex.yaml"
+    deploy_path.write_text("duplex_session: {}\nstages: []\n", encoding="utf-8")
+    assert load_deploy_config(deploy_path).duplex_session.visual_prefix_warmup is False
+
+    deploy_path.write_text("duplex_session:\n  visual_prefix_warmup: true\nstages: []\n", encoding="utf-8")
+    assert load_deploy_config(deploy_path).duplex_session.visual_prefix_warmup is True
+
+    deploy_path.write_text("duplex_session:\n  visual_prefix_warmup: 'true'\nstages: []\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="visual_prefix_warmup must be a boolean"):
+        load_deploy_config(deploy_path)
+
+
+def test_qwen_duplex_overlay_enables_visual_prefix_warmup_with_stage0_prefix_caching(tmp_path) -> None:
+    base = get_deploy_config_path("qwen3_omni_duplex.yaml")
+    overlay = tmp_path / "qwen3_omni_duplex_visual_warmup.yaml"
+    overlay.write_text(
+        f"base_config: {base}\n"
+        "duplex_session:\n  visual_prefix_warmup: true\n"
+        "stages:\n  - stage_id: 0\n    enable_prefix_caching: true\n",
+        encoding="utf-8",
+    )
+
+    deploy = load_deploy_config(overlay)
+
+    assert deploy.session_mode == "duplex"
+    assert deploy.duplex_session.visual_prefix_warmup is True
+    stages = {stage.stage_id: stage for stage in deploy.stages}
+    assert stages[0].engine_extras["enable_prefix_caching"] is True
+    assert stages[0].engine_extras["limit_mm_per_prompt"] == {"audio": 4, "image": 8}
+    assert stages[1].engine_extras["enable_prefix_caching"] is False
 
 
 @pytest.mark.parametrize(
