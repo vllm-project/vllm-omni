@@ -26,7 +26,7 @@
       return url.toString();
     },
     initialMessages(config, instructions) {
-      const session = { modalities: ['audio', 'text'], voice: 'default',
+      const session = { modalities: ['audio', 'text'], voice: 'default', playback_commit_policy: 'ack_only',
         extra_body: { auto_response: true } };
       if (config.refAudio) session.ref_audio = config.refAudio;
       if (instructions) session.instructions = instructions;

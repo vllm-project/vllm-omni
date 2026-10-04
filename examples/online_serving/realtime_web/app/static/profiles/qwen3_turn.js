@@ -37,7 +37,7 @@
           { type: 'session.update', model: config.model },
           { type: 'input_audio_buffer.commit', final: false },
         ];
-        const session = { model: config.model, overlap_policy: 'barge_in_on_speech', audio: { input: {
+        const session = { model: config.model, overlap_policy: 'barge_in_on_speech', playback_commit_policy: 'ack_only', audio: { input: {
           format: { type: 'audio/pcm', rate: 24000 },
           turn_detection: { type: 'server_vad', threshold: 0.5, prefix_padding_ms: 300,
             silence_duration_ms: 500, create_response: true, interrupt_response: true },
