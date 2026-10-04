@@ -71,8 +71,8 @@ class RunnerServices(Protocol):
     from the runner is reaching for orchestration that belongs in the runner.
     """
 
-    def spawn(self, coro: Awaitable[None], *, name: str) -> None:
-        """Run ``coro`` as a tracked background task on the session's loop."""
+    def spawn(self, coro: Awaitable[None], *, name: str) -> asyncio.Future[None]:
+        """Run ``coro`` as a tracked background task on the session's loop; closing the runner cancels it."""
         ...
 
     async def offload(self, fn: Callable[..., _OffloadT], *args: object, **kwargs: object) -> _OffloadT:

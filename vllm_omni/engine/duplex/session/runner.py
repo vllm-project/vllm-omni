@@ -98,6 +98,7 @@ from vllm_omni.engine.duplex.session.emitter import SessionEmitter
 from vllm_omni.engine.duplex.session.engine_session import DuplexEngineSession
 from vllm_omni.engine.duplex.session.lease import DuplexLeaseActivity
 from vllm_omni.engine.duplex.session.model_channel import ModelChannel
+from vllm_omni.engine.duplex.session.prefix_warmup import PrefixWarmer
 from vllm_omni.engine.duplex.turn_detection import (
     TurnDetectionResult,
 )
@@ -210,6 +211,7 @@ class DuplexSessionRunner:
             self.model,
             wait_for_append_tail=self._wait_for_append_tail,
         )
+        self.prefix_warmer = PrefixWarmer(self.ctx, enabled=manager.runtime_config.visual_prefix_warmup)
 
     # ------------------------------------------------------------------ #
     # Public interface                                                   #
@@ -446,6 +448,7 @@ class DuplexSessionRunner:
             item = await self._mailbox.get()
             try:
                 await self._handle_item(item)
+                self.prefix_warmer.refresh()
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -468,11 +471,12 @@ class DuplexSessionRunner:
             worker.cancel()
             await asyncio.gather(worker, return_exceptions=True)
 
-    def spawn(self, coro: Awaitable[None], *, name: str) -> None:
+    def spawn(self, coro: Awaitable[None], *, name: str) -> asyncio.Future[None]:
         task = asyncio.ensure_future(coro)
         task.set_name(name)
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
+        return task
 
     async def offload(self, fn: Callable[..., _OffloadT], *args: object, **kwargs: object) -> _OffloadT:
         loop = self._loop or asyncio.get_running_loop()

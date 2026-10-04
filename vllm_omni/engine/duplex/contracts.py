@@ -134,6 +134,21 @@ class DuplexStagePort(ABC):
     @abstractmethod
     async def abort_requests(self, request_ids: list[str]) -> None: ...
 
+    async def run_prefix_warmup(
+        self,
+        *,
+        request_id: str,
+        session_id: str,
+        prompt: Mapping[str, object],
+        sampling_params: object,
+    ) -> bool:
+        """Prefill ``prompt`` on Stage0 alone and wait for it; return whether it finished.
+
+        The request is internal: its output reaches neither a client nor the
+        session. Cancelling the caller aborts it.
+        """
+        raise NotImplementedError(f"{type(self).__name__} does not run prefix warmups")
+
 
 def duplex_data_plane_request_info(result: dict[str, object]) -> tuple[str | None, int | None]:
     stage_results = result.get("stage_results")

@@ -190,6 +190,54 @@ def test_validate_deployment_requires_a_plugin_and_duplex_session_mode() -> None
         engine._validate_deployment()
 
 
+@pytest.mark.parametrize("supported", [False, True])
+def test_visual_prefix_warmup_needs_a_plugin_that_plans_it(monkeypatch, supported: bool) -> None:
+    from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
+
+    plugin = SimpleNamespace(plugin_id="fake", supports_prefix_warmup=supported)
+    monkeypatch.setattr("vllm_omni.engine.duplex_omni_engine.load_duplex_plugin", lambda path, encoder: plugin)
+    engine = object.__new__(DuplexOmniEngine)
+    engine.model = "duplex-model"
+    engine._audio_encoder = None
+    engine.pipeline_config = SimpleNamespace(duplex_plugin="pkg.mod.Plugin")
+    engine.deploy_config = SimpleNamespace(
+        session_mode="duplex", duplex_session=DuplexSessionRuntimeConfig(visual_prefix_warmup=True)
+    )
+    if supported:
+        engine._validate_deployment()
+        assert engine.plugin is plugin
+    else:
+        with pytest.raises(ValueError, match="not supported by the 'fake' duplex plugin"):
+            engine._validate_deployment()
+
+
+@pytest.mark.parametrize("prefix_caching", [False, True])
+def test_visual_prefix_warmup_needs_stage0_prefix_caching(monkeypatch, prefix_caching: bool) -> None:
+    from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
+
+    built: list[dict[str, Any]] = []
+
+    def build(**kwargs: Any) -> dict[str, Any]:
+        built.append(kwargs)
+        return kwargs
+
+    monkeypatch.setattr("vllm_omni.engine.duplex_orchestrator.DuplexOrchestrator", build)
+    engine = object.__new__(DuplexOmniEngine)
+    engine.plugin = SimpleNamespace()
+    engine.duplex_session_config = DuplexSessionRuntimeConfig(visual_prefix_warmup=True)
+    stage0_config = SimpleNamespace(
+        model_config="stage0-model", cache_config=SimpleNamespace(enable_prefix_caching=prefix_caching)
+    )
+    engine.stage_pools = [SimpleNamespace(stage_vllm_config=stage0_config)]
+    if prefix_caching:
+        engine._create_orchestrator()
+        assert built[0]["model_config"] == "stage0-model"
+    else:
+        with pytest.raises(ValueError, match="requires enable_prefix_caching on stage 0"):
+            engine._create_orchestrator()
+        assert not built
+
+
 @pytest.mark.asyncio
 async def test_async_wrappers_run_the_blocking_calls_off_the_event_loop() -> None:
     loop = asyncio.get_running_loop()

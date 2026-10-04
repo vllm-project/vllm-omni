@@ -41,6 +41,44 @@ Grouping and pruning affect only the model-input view. They do not merge or
 delete the source conversation items exposed to clients, and do not change
 playback acknowledgement or interruption handling.
 
+### Visual prefix warmup
+
+By default, camera frames are encoded and prefilled only after the user's
+audio commits, which adds their cost to the time to first audio. With
+`duplex_session.visual_prefix_warmup: true`, the server prefills Stage 0 while
+the user is still speaking. The prompt covers everything up to where the
+utterance will go: instructions, retained history and the camera frames of the
+pending turn. The committed turn then reuses those KV blocks through prefix
+caching and computes only its audio and trailing text. The knob is off by
+default. It requires `enable_prefix_caching` on Stage 0, which the base
+Qwen3-Omni deployment disables, and startup fails without it. The overlay below
+sits next to `qwen3_omni_duplex.yaml`, because `base_config` resolves relative
+to the overlay file:
+
+```yaml
+base_config: qwen3_omni_duplex.yaml
+duplex_session:
+  visual_prefix_warmup: true
+stages:
+  - stage_id: 0
+    enable_prefix_caching: true
+```
+
+A warmup starts only while the unanswered user turn holds an image and nothing
+else is running for the session: no response generating or awaiting its
+playback acknowledgement, and no committed audio. A newer conversation state
+replaces the warmup in flight. A commit, a response or closing the session
+cancels it. The warmup's output is discarded, and a failed warmup is only
+logged; the client sees neither.
+
+Each distinct set of pending frames costs one Stage 0 prefill of the prompt
+prefix, competing with other sessions for Stage 0 batch slots and KV cache.
+Reuse ends at the first changed token, so a client that keeps a sliding window
+of frames (deleting the oldest when it adds one) re-prefills from the first
+frame that changed. The processor cache still saves re-preprocessing the frames
+that stayed. The turn gains the most when its frames stop changing between the
+last warmup and the commit.
+
 ## Quick Start
 
 ### Start the Server

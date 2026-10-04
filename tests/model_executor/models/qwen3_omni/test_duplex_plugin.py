@@ -23,6 +23,7 @@ from vllm_omni.engine.duplex.commands import (
     CancelResponse,
     ClearOutputAudio,
     Commit,
+    CreateItem,
     CreateResponse,
     UpdateSession,
 )
@@ -71,10 +72,10 @@ def test_buffer_refuses_video_frames_and_points_at_the_openai_interface():
     committed.commit()
 
 
-async def open_qwen():
+async def open_qwen(*, runtime_config=None, processor=None, port=None):
     plugin = Qwen3OmniDuplexPlugin(lambda audio, *args: "AAAA")
-    plugin.processor = SimpleNamespace(apply_chat_template=lambda messages, **kw: repr(messages))
-    port = RecordingStagePort(stage_count=3)
+    plugin.processor = processor or SimpleNamespace(apply_chat_template=lambda messages, **kw: repr(messages))
+    port = port or RecordingStagePort(stage_count=3)
     output: asyncio.Queue[Any] = asyncio.Queue()
     results: asyncio.Queue[Any] = asyncio.Queue()
     manager = DuplexSessionManager(
@@ -82,7 +83,7 @@ async def open_qwen():
         stage_port=port,
         output_sink=output,
         result_sink=results,
-        runtime_config=DuplexSessionRuntimeConfig(),
+        runtime_config=runtime_config or DuplexSessionRuntimeConfig(),
         model_config=None,
     )
     config = DuplexSessionConfig(model="qwen", modalities=["text", "audio"], overlap_policy="barge_in_on_speech")
@@ -944,5 +945,236 @@ async def test_visual_capture_records_submitted_pixels_and_request(tmp_path, mon
             actual = submission.prompt["multi_modal_data"]["image"][0]
             assert saved.size == actual.size
             assert saved.tobytes() == actual.tobytes()
+    finally:
+        await h.manager.shutdown()
+
+
+_MEDIA_MARKERS = {
+    "image": "<|vision_start|><|image_pad|><|vision_end|>",
+    "audio": "<|audio_start|><|audio_pad|><|audio_end|>",
+}
+
+
+def qwen_processor():
+    """Renders placeholders the way Qwen3-Omni's chat template does."""
+
+    def apply_chat_template(messages, *, add_generation_prompt=False, **kwargs):
+        rendered = []
+        for message in messages:
+            content = message["content"]
+            if not isinstance(content, str):
+                content = "".join(_MEDIA_MARKERS.get(part["type"], part.get("text", "")) for part in content)
+            rendered.append(f"<|im_start|>{message['role']}\n{content}<|im_end|>\n")
+        return "".join(rendered) + ("<|im_start|>assistant\n" if add_generation_prompt else "")
+
+    return SimpleNamespace(
+        apply_chat_template=apply_chat_template,
+        image_token="<|image_pad|>",
+        audio_token="<|audio_pad|>",
+        audio_bos_token="<|audio_start|>",
+    )
+
+
+class WarmupRecordingPort(RecordingStagePort):
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.warmups: list[dict[str, Any]] = []
+        self.cancelled_warmups: list[str] = []
+        #: When set, a warmup parks on it until it is released or cancelled.
+        self.warmup_gate: asyncio.Event | None = None
+        self.warmup_error: Exception | None = None
+
+    async def run_prefix_warmup(self, *, request_id, session_id, prompt, sampling_params):
+        self.warmups.append({"request_id": request_id, "session_id": session_id, "prompt": prompt})
+        if self.warmup_error is not None:
+            raise self.warmup_error
+        if self.warmup_gate is not None:
+            try:
+                await self.warmup_gate.wait()
+            except asyncio.CancelledError:
+                self.cancelled_warmups.append(request_id)
+                raise
+        return True
+
+
+async def open_warming_qwen(*, enabled: bool = True):
+    port = WarmupRecordingPort(stage_count=3)
+    h = await open_qwen(
+        runtime_config=DuplexSessionRuntimeConfig(visual_prefix_warmup=enabled), processor=qwen_processor(), port=port
+    )
+    return h, port
+
+
+async def answer_turn(h, *, text="an answer"):
+    await h.run(append_audio())
+    await h.run(Commit(final=True, create_response=True))
+    request_id = h.port.submissions[-1].context.request_id
+    response_id = h.session.active_response_id
+    await h.deliver_and_settle(tts_output(request_id, samples=0, text=text, finished=True), stage_id=0)
+    await h.deliver_and_settle(tts_output(request_id, finished=True), stage_id=2)
+    await h.run(AckPlayback(response_id=response_id, played_ms=1000, committed_ms=1000))
+    assert h.session.active_response_id is None
+
+
+def assert_warms_the_turn(warm: dict[str, Any], turn: dict[str, Any]) -> None:
+    assert turn["prompt"].startswith(warm["prompt"])
+    assert turn["prompt"][len(warm["prompt"]) :].startswith("<|audio_start|>")
+    warm_mm, turn_mm = warm["multi_modal_data"], turn["multi_modal_data"]
+    assert [image.tobytes() for image in warm_mm["image"]] == [image.tobytes() for image in turn_mm["image"]]
+    assert len(warm_mm.get("audio", ())) == len(turn_mm["audio"]) - 1
+    for (warm_audio, _), (turn_audio, _) in zip(warm_mm.get("audio", ()), turn_mm["audio"]):
+        np.testing.assert_array_equal(warm_audio, turn_audio)
+
+
+@pytest.mark.asyncio
+async def test_prefix_warmup_prompt_is_a_prefix_of_the_turn_it_rehearses():
+    h = await open_qwen(processor=qwen_processor())
+    try:
+        await answer_turn(h)
+        await h.run(CreateItem(item=image_item()))
+        session, state = h.session, h.runner.ctx.model_state
+        retained = [id(payload) for _, payload in state.audio_history]
+        plan = await h.manager.plugin.prepare_prefix_warmup_plan(
+            request_id="warm",
+            session_config={**session.config.as_dict(), "conversation": list(session.history)},
+            runtime_config=dict(session.runtime_config),
+            state=state,
+        )
+        assert [id(payload) for _, payload in state.audio_history] == retained, "a rehearsal retains nothing"
+
+        await h.run(append_audio(value=0.2))
+        await h.run(Commit(final=True, create_response=True))
+        turn = h.port.submissions[-1].prompt
+        assert len(turn["multi_modal_data"]["audio"]) == 2
+        assert_warms_the_turn(plan.prompt, turn)
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.parametrize(
+    ("case", "plans"),
+    [("image", True), ("no_image", False), ("no_audio_marker", False), ("placeholder_in_text", False)],
+)
+def test_prefix_warmup_plan_needs_an_image_and_a_cut_that_matches_its_media(case, plans):
+    plugin = Qwen3OmniDuplexPlugin(lambda *args: None)
+    plugin.processor = qwen_processor()
+    audio = base64.b64encode(np.full(160, 0.1, dtype="<f4").tobytes()).decode()
+    url = "data:image/jpeg;base64," + camera_frame()
+    history: list[dict[str, Any]] = [
+        {"role": "user", "content": [{"type": "image_url", "image_url": {"url": url}}]},
+        {"role": "user", "audio_payload": {"audio": audio}},
+    ]
+    if case == "no_image":
+        history[0]["content"] = [{"type": "text", "text": "hello"}]
+    elif case == "no_audio_marker":
+        plugin.processor.audio_bos_token = None
+    elif case == "placeholder_in_text":
+        history[:0] = [
+            {"role": "user", "content": [{"type": "text", "text": "what does <|image_pad|> mean?"}]},
+            {"role": "assistant", "content": "a placeholder"},
+        ]
+
+    plan = plugin.plan_prefix_warmup(
+        request_id="warm", session_config={"qwen_messages": history}, runtime_config={}, payload={"audio": audio}
+    )
+
+    assert (plan is not None) is plans
+    if plans:
+        assert len(plan.prompt["multi_modal_data"]["image"]) == 1
+        assert "audio" not in plan.prompt["multi_modal_data"]
+        assert plan.prompt["prompt"].endswith(_MEDIA_MARKERS["image"])
+
+
+@pytest.mark.asyncio
+async def test_camera_frame_warms_the_pending_turn_that_the_commit_then_submits():
+    h, port = await open_warming_qwen()
+    try:
+        await answer_turn(h)
+        assert not port.warmups, "an answered turn has nothing pending to warm"
+        await h.run(CreateItem(item=image_item()))
+        assert len(port.warmups) == 1
+        warmup = port.warmups[0]
+        assert warmup["session_id"] == SESSION_ID
+        assert ".warmup-" in warmup["request_id"]
+
+        # Neither streamed audio nor a repeated state starts another warmup.
+        await h.run(append_audio(value=0.2))
+        assert len(port.warmups) == 1
+        await h.run(Commit(final=True, create_response=True))
+        assert len(port.warmups) == 1
+        assert_warms_the_turn(warmup["prompt"], h.port.submissions[-1].prompt)
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_newer_camera_frame_replaces_the_warmup_in_flight():
+    h, port = await open_warming_qwen()
+    port.warmup_gate = asyncio.Event()
+    try:
+        h.submit(CreateItem(item=image_item("first")))
+        await h.settle(timeout_s=0.3)
+        assert len(port.warmups) == 1 and not port.cancelled_warmups
+        h.submit(CreateItem(item=image_item("second")))
+        await h.settle(timeout_s=0.3)
+        assert len(port.warmups) == 2
+        assert port.cancelled_warmups == [port.warmups[0]["request_id"]]
+        assert len(port.warmups[1]["prompt"]["multi_modal_data"]["image"]) == 2
+    finally:
+        port.warmup_gate.set()
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_commit_cancels_the_warmup_and_a_playing_response_holds_the_next_one():
+    h, port = await open_warming_qwen()
+    port.warmup_gate = asyncio.Event()
+    try:
+        h.submit(CreateItem(item=image_item()))
+        await h.settle(timeout_s=0.3)
+        assert len(port.warmups) == 1
+        h.submit(append_audio())
+        h.submit(Commit(final=True, create_response=True))
+        await h.settle(timeout_s=0.3)
+        assert port.cancelled_warmups == [port.warmups[0]["request_id"]]
+        assert len(h.port.submissions) == 1
+        assert h.session.active_response_id is not None
+
+        h.submit(CreateItem(item=image_item("during-answer")))
+        await h.settle(timeout_s=0.3)
+        assert len(port.warmups) == 1
+    finally:
+        port.warmup_gate.set()
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_failed_warmup_is_logged_and_the_turn_still_runs():
+    h, port = await open_warming_qwen()
+    port.warmup_error = RuntimeError("stage0 refused the warmup")
+    try:
+        await h.run(CreateItem(item=image_item()))
+        assert len(port.warmups) == 1
+        await h.run(append_audio())
+        await h.run(Commit(final=True, create_response=True))
+        assert len(h.port.submissions) == 1
+        assert h.session.active_response_id is not None
+        assert not any(event.type == "error" for event in h.events)
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("enabled", [False, True])
+async def test_no_warmup_when_disabled_or_nothing_visual_is_pending(enabled):
+    h, port = await open_warming_qwen(enabled=enabled)
+    try:
+        if enabled:
+            await h.run(
+                CreateItem(item={"type": "message", "role": "user", "content": [{"type": "text", "text": "hi"}]})
+            )
+        else:
+            await h.run(CreateItem(item=image_item()))
+        assert not port.warmups
     finally:
         await h.manager.shutdown()

@@ -81,6 +81,10 @@ class DuplexOmniEngine(AsyncOmniEngine):
             )
         self.duplex_session_config = deploy_config.duplex_session
         self.plugin = load_duplex_plugin(plugin_path, self._audio_encoder)
+        if self.duplex_session_config.visual_prefix_warmup and not self.plugin.supports_prefix_warmup:
+            raise ValueError(
+                f"duplex_session.visual_prefix_warmup is not supported by the {self.plugin.plugin_id!r} duplex plugin"
+            )
 
     # Any: signature of the ``OmniEngineBase._create_orchestrator`` seam it overrides.
     def _create_orchestrator(self, **orchestrator_kwargs: Any) -> OrchestratorBase:
@@ -89,6 +93,14 @@ class DuplexOmniEngine(AsyncOmniEngine):
         assert self.plugin is not None, "_validate_deployment() must run before the orchestrator is created"
         stage0_vllm_config = self.stage_pools[0].stage_vllm_config if self.stage_pools else None
         model_config = getattr(stage0_vllm_config, "model_config", None)
+        cache_config = getattr(stage0_vllm_config, "cache_config", None)
+        if self.duplex_session_config.visual_prefix_warmup and not getattr(
+            cache_config, "enable_prefix_caching", False
+        ):
+            raise ValueError(
+                "duplex_session.visual_prefix_warmup requires enable_prefix_caching on stage 0; "
+                "without it the warmup computes KV blocks that the next turn cannot reuse"
+            )
         return DuplexOrchestrator(
             plugin=self.plugin,
             duplex_session_config=self.duplex_session_config,

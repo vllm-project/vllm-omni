@@ -16,6 +16,7 @@ import json
 import os
 from collections.abc import Mapping
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pybase64 as base64
@@ -35,6 +36,10 @@ logger = init_logger(__name__)
 #: the engine and this one in the deploy config; the prompt is the only place
 #: that can keep them from drifting apart into a rejected submission.
 MAX_PROMPT_IMAGES = 8
+
+#: Stands in for the next committed utterance (0.1 s of silence) while its prompt is rehearsed.
+_REHEARSAL_AUDIO = base64.b64encode(np.zeros(1600, dtype="<f4").tobytes()).decode()
+_REHEARSAL_URL = "native-duplex:input-audio"
 
 
 class QwenDataPlane(DuplexDataPlane):
@@ -122,6 +127,7 @@ class QwenDataPlane(DuplexDataPlane):
 class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
     plugin_id = "qwen3-omni"
     projects_intermediate_outputs = True
+    supports_prefix_warmup = True
 
     def __init__(self, encode_audio):
         self.data_plane = QwenDataPlane(encode_audio)
@@ -358,11 +364,49 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
         snapshot = copy.deepcopy(kwargs)
         return await asyncio.to_thread(self.plan_append, **snapshot)
 
-    def plan_append(
-        self, *, request_id, fence, session_config, runtime_config, seq, turn_seq, payload, final, sampling_params
-    ):
-        if not final or not isinstance(payload, dict):
-            raise DuplexRuntimeConfigError("Qwen generation requires a committed audio turn")
+    async def prepare_prefix_warmup_plan(self, *, request_id, session_config, runtime_config, state):
+        # Rehearse the next committed-audio turn on a copy so retention and windowing match it.
+        payload = {"type": "audio", "audio": _REHEARSAL_AUDIO}
+        committed_audio = {"role": "user", "content": [{"type": "audio_url", "audio_url": {"url": _REHEARSAL_URL}}]}
+        conversation = [*session_config.get("conversation", ()), committed_audio]
+        rehearsal_state = SimpleNamespace(audio_history=list(state.audio_history))
+        config = self.prepare_prompt_config(
+            {**session_config, "conversation": conversation}, state=rehearsal_state, payload=payload
+        )
+        snapshot = copy.deepcopy(
+            {"request_id": request_id, "session_config": config, "runtime_config": runtime_config, "payload": payload}
+        )
+        return await asyncio.to_thread(self.plan_prefix_warmup, **snapshot)
+
+    def plan_prefix_warmup(self, *, request_id, session_config, runtime_config, payload):
+        """Render the rehearsed turn and cut it before its stand-in audio.
+
+        Everything before that audio -- instructions, earlier turns and the
+        pending camera frames -- is rendered by the code that renders the real
+        turn, so it is a prefix of the next prompt whatever the user says.
+        """
+        prompt, audios, images = self._render_turn(
+            session_config=session_config, runtime_config=runtime_config, payload=payload
+        )
+        marker = getattr(self.processor, "audio_bos_token", None)
+        cut = prompt.rfind(marker) if isinstance(marker, str) and marker else -1
+        if not images or not audios or cut < 0:
+            return None
+        prefix, audios = prompt[:cut], audios[:-1]
+        for token, expected in (
+            (getattr(self.processor, "image_token", None), len(images)),
+            (getattr(self.processor, "audio_token", None), len(audios)),
+        ):
+            if isinstance(token, str) and token and prefix.count(token) != expected:
+                logger.warning_once("Qwen duplex prefix warmup skipped: the prompt cut does not match its media")
+                return None
+        mm = {"audio": audios} if audios else {}
+        mm["image"] = images
+        logger.debug("Qwen duplex prefix warmup request=%s images=%d audios=%d", request_id, len(images), len(audios))
+        return DuplexAppendPlan(prompt={"prompt": prefix, "multi_modal_data": mm})
+
+    def _render_turn(self, *, session_config, runtime_config, payload):
+        """Return the chat-template prompt and its audio and image inputs for one turn."""
         messages = []
         if runtime_config.get("instructions"):
             messages.append({"role": "system", "content": runtime_config["instructions"]})
@@ -402,6 +446,16 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
         messages, images = self._trim_prompt_images(messages, images)
         messages = self.format_history(messages)
         prompt = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        return prompt, audios, images
+
+    def plan_append(
+        self, *, request_id, fence, session_config, runtime_config, seq, turn_seq, payload, final, sampling_params
+    ):
+        if not final or not isinstance(payload, dict):
+            raise DuplexRuntimeConfigError("Qwen generation requires a committed audio turn")
+        prompt, audios, images = self._render_turn(
+            session_config=session_config, runtime_config=runtime_config, payload=payload
+        )
         mm = {"audio": audios} if audios else {}
         if images:
             mm["image"] = images
