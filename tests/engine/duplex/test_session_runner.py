@@ -7,8 +7,8 @@ The runner is driven exactly the way ``DuplexOrchestrator`` drives it: typed
 commands go through ``DuplexSessionManager.dispatch``, stage outputs are pushed
 with ``runner.on_stage_output`` and everything the session says is read back
 from the manager's output sink as typed events. The stage port is a recording
-fake; the model plugin is the real MiniCPM-o 4.5 one so append planning and
-output projection are exercised end to end.
+fake; real model plugins exercise append planning and output projection end
+to end, with MiniCPM-o 4.5 as the default.
 """
 
 from __future__ import annotations
@@ -36,6 +36,7 @@ from vllm_omni.engine.duplex.contracts import (
     DuplexStageRequestContext,
     DuplexStageSubmission,
     DuplexStageSubmissionResult,
+    duplex_ephemeral_stage_request_id,
     duplex_resource_request_id,
 )
 from vllm_omni.engine.duplex.events import DuplexEvent
@@ -46,6 +47,7 @@ from vllm_omni.engine.duplex.messages import (
     DuplexSessionEventMessage,
     OpenDuplexSessionMessage,
 )
+from vllm_omni.engine.duplex.plugin import DuplexModelPlugin
 from vllm_omni.engine.duplex.session.engine_session import RESPONSE_REQUEST_MEASUREMENT_ORIGIN
 from vllm_omni.engine.duplex.session.manager import DuplexSessionManager
 from vllm_omni.engine.duplex.session.runner import DuplexSessionRunner
@@ -210,8 +212,11 @@ async def open_harness(
     stage_count: int = 2,
     clock: Any = None,
     log_stats: bool = False,
+    plugin: DuplexModelPlugin | None = None,
+    model: str = "openbmb/MiniCPM-o-4_5",
 ) -> Harness:
-    plugin = MiniCPMO45DuplexPlugin(_fake_encode_audio)
+    if plugin is None:
+        plugin = MiniCPMO45DuplexPlugin(_fake_encode_audio)
     port = RecordingStagePort(stage_count=stage_count)
     output: asyncio.Queue[Any] = asyncio.Queue()
     results: asyncio.Queue[Any] = asyncio.Queue()
@@ -227,7 +232,7 @@ async def open_harness(
     )
     body: dict[str, object] = {"auto_response": auto_response, **(extra_body or {})}
     config = DuplexSessionConfig(
-        model="openbmb/MiniCPM-o-4_5",
+        model=model,
         modalities=list(modalities),
         instructions="You are a concise assistant.",
         extra_body=body,
@@ -1517,6 +1522,76 @@ async def test_first_audio_delta_carries_server_request_start_metrics() -> None:
         later_vllm_omni = later_metadata.get("vllm_omni") if isinstance(later_metadata, dict) else None
         later_metrics = later_vllm_omni.get("response_request_metrics") if isinstance(later_vllm_omni, dict) else None
         assert later_metrics is None
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("old_text", ["first", "first later"])
+@pytest.mark.parametrize("initial_samples", [0, 24000])
+async def test_draining_audio_does_not_own_new_response_first_output_metrics(
+    old_text: str, initial_samples: int
+) -> None:
+    """AURA R1's late audio must not consume R2's accepted request-start clock."""
+    from dataclasses import replace
+
+    from vllm_omni.model_executor.models.aura_omni.duplex.plugin import AuraDuplexPlugin
+
+    clock = {"now": 1000.0}
+    h = await open_harness(
+        clock=lambda: clock["now"],
+        plugin=AuraDuplexPlugin(_fake_encode_audio),
+        model="aura",
+        stage_count=4,
+        modalities=("text", "audio"),
+    )
+    try:
+        assert h.session.capabilities.supports_concurrent_turn_requests
+        # Start at the accepted-request seam; model execution is the fake stage port.
+        r1_request = duplex_ephemeral_stage_request_id(h.session.fence, stage_id=3)
+        h.session.mark_model_turn_request_started(0, clock["now"])
+        h.session.bind_request(r1_request)
+        clock["now"] = 1000.2
+        first_events = await h.deliver_and_settle(
+            tts_output(r1_request, samples=initial_samples, text="first"), stage_id=3
+        )
+        if initial_samples == 0:
+            assert "response.output_audio.delta" not in types(first_events)
+        r1 = h.session.active_response_id
+        assert r1 is not None
+        h.session.snapshot_active_response_for_drain()
+        h.session.bind_draining_request(r1_request, r1)
+
+        clock["now"] = 1001.0
+        h.session.mark_model_turn_request_started(1, clock["now"])
+        r2 = h.session.begin_response(turn_id=1)
+        r2_request = duplex_ephemeral_stage_request_id(replace(h.session.fence, turn_id=1), stage_id=3)
+        h.session.bind_request(r2_request)
+        h.runner.emit({"type": "response.created", "response_id": r2, "epoch": h.session.epoch})
+        await h.settle()
+
+        clock["now"] = 1001.2
+        old_events = await h.deliver_and_settle(tts_output(r1_request, samples=48000, text=old_text), stage_id=3)
+        old_audio = find(old_events, "response.output_audio.delta")
+        assert old_audio.response_id == r1
+        if initial_samples == 0:
+            old_metrics = _response_request_metrics_of(old_audio)
+            assert old_metrics["ttft_ms"] == pytest.approx(200.0)
+            assert old_metrics["ttfp_ms"] == pytest.approx(1200.0)
+
+        clock["now"] = 1001.8
+        new_events = await h.deliver_and_settle(
+            tts_output(r2_request, samples=24000, text="second", turn_id=1), stage_id=3
+        )
+        new_audio = find(new_events, "response.output_audio.delta")
+        assert new_audio.response_id == r2
+        metrics = _response_request_metrics_of(new_audio)
+        assert metrics["ttft_ms"] == pytest.approx(800.0)
+        assert metrics["ttfp_ms"] == pytest.approx(800.0)
+        old_metadata = old_audio.to_realtime().get("metadata", {})
+        old_extensions = old_metadata.get("vllm_omni", {})
+        if initial_samples:
+            assert "response_request_metrics" not in old_extensions
     finally:
         await close_harness(h)
 
