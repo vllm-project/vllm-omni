@@ -183,3 +183,82 @@ and checks bitwise repeatability for repeated requests at the same hit boundary.
 Images, logs, deployment YAMLs, hit traces and quality metrics are saved under
 pytest's temporary output directory. `HUNYUAN_IMAGE3_MODEL` selects a local model;
 DFX uses the repository's normal model/cache resolution.
+
+## MixFusion benchmarks
+
+MixFusion packs a multi-request, mixed-resolution DiT batch into one flat varlen
+attention call instead of padding every request to the longest sequence. It only
+pays off when the per-request token counts share a large common divisor: the
+chunk size is their GCD, so `1024x1024` + `1024x768` (4096 + 3072 tokens, GCD
+1024) batch well, while `1024x1024` + `640x640` (4096 + 1600, GCD 64) fall below
+the 256-token minimum and run independently instead.
+
+Three entry points cover different levels of the stack.
+
+### Synthetic DiT-like stack
+
+`mixfusion_kernel_benchmark.py` builds a HunyuanImage-3.0-shaped transformer stack
+(RMSNorm, fused QKV, SwiGLU MLP) at the requested hidden size and times three
+layouts of the same sequences: independent, padded, and MixFusion. It never loads
+a checkpoint, so it isolates the attention/layout effect and runs in seconds;
+sweep resolutions here before spending GPU time on a real model.
+
+```bash
+python benchmarks/diffusion/mixfusion_kernel_benchmark.py \
+  --image-sizes 1024x1024,512x512 --layers 4 --hidden-size 4096 \
+  --heads 32 --dtype bfloat16 --iters 20
+```
+
+Its JSON reports `correctness` (max-abs diff against independent), `time_ms` per
+strategy, `speedup`, `peak_memory_mb`, and `relative_work`.
+
+### Real pipeline
+
+`mixfusion_benefit.py` loads the real pipeline through `DiffusionEngine` and
+compares one-request-at-a-time serving against the same prompts admitted
+concurrently. `--family` selects the model family and its defaults:
+
+| | `--family qwen` | `--family hunyuan` |
+| --- | --- | --- |
+| Default model | `Qwen/Qwen-Image` | `tencent/HunyuanImage-3.0-Instruct` |
+| Resolution carried in | sampling params | prompt dict |
+| Small-GCD pre-check | yes | n/a |
+
+```bash
+DIFFUSION_ATTENTION_BACKEND=FLASH_ATTN \
+python benchmarks/diffusion/mixfusion_benefit.py \
+  --family qwen --model Qwen/Qwen-Image \
+  --image-sizes 1024x1024,1024x768 --steps 8 --iters 3
+
+python benchmarks/diffusion/mixfusion_benefit.py \
+  --family hunyuan --model tencent/HunyuanImage-3.0-Instruct \
+  --image-sizes 1024x1024,512x512 --steps 20 --iters 3 \
+  --tensor-parallel-size 4 --quantization fp8
+```
+
+Pass `--no-enable-mixfusion` for a batching-only control run, and
+`--json-output <path>` to also write the result JSON to disk.
+
+### Online serving
+
+To measure MixFusion through the OpenAI-compatible server, replay a trace with
+mixed resolutions and attach the extra args to every request:
+
+```bash
+vllm serve Qwen/Qwen-Image --omni --port 8099
+```
+
+```bash
+python3 benchmarks/diffusion/diffusion_benchmark_serving.py \
+ --base-url http://localhost:8099 --model Qwen/Qwen-Image --task t2i \
+ --dataset trace --num-prompts 20 --max-concurrency 4 \
+ --warmup-requests 4 --warmup-concurrency 4 \
+ --extra-body '{"extra_args": {"enable_mixfusion": true}}'
+```
+
+The trace supplies per-request `width`/`height`; `--extra-body` is merged into
+every request body. Warm the same in-flight shape as the measured run, otherwise
+the first batch still pays compile/CUDA-graph capture cost.
+
+`OMNI_PROFILER_ACTIVITIES` narrows the pipeline profiler's activity list (default
+`CPU,CUDA`), for example `OMNI_PROFILER_ACTIVITIES=CPU,CUDA,NPU`.
