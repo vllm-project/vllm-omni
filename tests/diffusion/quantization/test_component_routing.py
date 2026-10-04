@@ -380,6 +380,23 @@ class TestComponentApplyVllmMapper:
         assert thinker.ignore == ["thinker.language_model.model.layers.0.mlp.gate"]
         assert default.ignore == ["talker.language_model.model.layers.0.mlp.gate"]
 
+    def test_maps_shared_config_once_per_call(self):
+        shared = CompressedTensorsConfig(
+            target_scheme_map={},
+            ignore=["layers.0.mlp.gate"],
+            quant_format="pack-quantized",
+        )
+        config = ComponentQuantizationConfig(
+            component_configs={"model": shared},
+            default_config=shared,
+        )
+        mapper = WeightsMapper(orig_to_new_prefix={"": "model."}).get_rename_mapper()
+
+        config.apply_vllm_mapper(mapper)
+        config.apply_vllm_mapper(WeightsMapper(orig_to_new_prefix={"model.": "renamed."}).get_rename_mapper())
+
+        assert shared.ignore == ["renamed.layers.0.mlp.gate"]
+
 
 # ===================================================================
 # 5. ComponentQuantizationConfig.resolve
