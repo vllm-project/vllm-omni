@@ -52,6 +52,10 @@
 {{ indent }}                value: "0"
 {{ indent }}              - name: VLLM_ROCM_USE_AITER
 {{ indent }}                value: "0"
+{{ indent }}              - name: GPU_ARCHS
+{{ indent }}                value: "gfx942"
+{{ indent }}              - name: CLANG_TOOLCHAIN_PROGRAM_TIMEOUT
+{{ indent }}                value: "300"
 {{ indent }}              - name: PYTORCH_ROCM_ARCH
 {{ indent }}                value: ""
 {{ indent }}        volumes:
@@ -127,6 +131,8 @@ steps:
           MIOPEN_DEBUG_CONV_DIRECT: "0"
           MIOPEN_DEBUG_CONV_GEMM: "0"
           VLLM_ROCM_USE_AITER: "0"
+          GPU_ARCHS: "gfx942"
+          CLANG_TOOLCHAIN_PROGRAM_TIMEOUT: "300"
           PYTORCH_ROCM_ARCH: ""
 {% if step.env %}
 {% for name in step.env %}
@@ -203,6 +209,8 @@ steps:
       MIOPEN_DEBUG_CONV_DIRECT: "0"
       MIOPEN_DEBUG_CONV_GEMM: "0"
       VLLM_ROCM_USE_AITER: "0"
+      GPU_ARCHS: "gfx942"
+      CLANG_TOOLCHAIN_PROGRAM_TIMEOUT: "300"
       PYTORCH_ROCM_ARCH: ""
 {% if step.env %}
 {% for name in step.env %}

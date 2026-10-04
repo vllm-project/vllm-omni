@@ -104,3 +104,19 @@ def test_amd_template_preserves_step_retry_policy() -> None:
     # policy when the source suite is rendered into the uploaded pipeline.
     assert template.count("{% if step.retry %}") == 2
     assert template.count("{% for retry_rule in step.retry.automatic %}") == 2
+
+
+def test_amd_template_pins_aiter_jit_architecture() -> None:
+    template = AMD_TEMPLATE.read_text(encoding="utf-8")
+
+    # AITER otherwise emits --offload-arch=native for every Ninja compile
+    # process. Under cold, highly parallel JIT builds, the repeated ROCm
+    # architecture probes can time out before compilation starts.
+    assert template.count("GPU_ARCHS") == 3
+    assert template.count('GPU_ARCHS: "gfx942"') == 2
+    assert template.count("- name: GPU_ARCHS") == 1
+
+    # Keep a bounded fallback for any toolchain child probes that remain.
+    assert template.count("CLANG_TOOLCHAIN_PROGRAM_TIMEOUT") == 3
+    assert template.count('CLANG_TOOLCHAIN_PROGRAM_TIMEOUT: "300"') == 2
+    assert template.count("- name: CLANG_TOOLCHAIN_PROGRAM_TIMEOUT") == 1
