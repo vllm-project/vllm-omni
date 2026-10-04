@@ -38,6 +38,11 @@ from vllm.config import VllmConfig
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 
+from vllm_omni.metrics.duplex_frame_timing import (
+    frame_timing_clock,
+    frame_timing_synchronize,
+    log_stage1_decode_event,
+)
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 
 logger = init_logger(__name__)
@@ -226,7 +231,12 @@ class PersonaPlexCode2Wav(nn.Module):
             delta_kf = self._new_code_suffix(state_id, codes_kf)
             if delta_kf.shape[1] == 0:
                 continue
+            decode_t0 = frame_timing_clock()
             wav = self._decode_streaming_frames(state_id, delta_kf.to(device=device))
+            # Close the span with a host sync so decode_ms covers GPU
+            # execution; serializes stage-1 decode while timing is on.
+            frame_timing_synchronize()
+            log_stage1_decode_event(state_id, int(delta_kf.shape[1]), decode_t0, num_req)
             if wav.numel() > 0:
                 audios[i] = wav.to(dtype=torch.float32).reshape(-1)
 
