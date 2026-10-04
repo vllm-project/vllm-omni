@@ -365,6 +365,19 @@ class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
             raise ValueError("Mammothmoda2Config.gen_vae_config / gen_dit_config must not be None")
 
         self.gen_vae = AutoencoderKL.from_config(self.config.gen_vae_config)
+        # The registry applies the stage's VAE memory modes to ``model.vae``
+        # (vllm_omni/diffusion/registry.py), but this pipeline owns ``gen_vae``,
+        # so read the standard fields here -- as hunyuan_image3, ltx2 and
+        # sana_wm do for their own VAE attributes.  Tiling only engages above
+        # the checkpoint's tile threshold.
+        self.gen_vae.use_slicing = bool(od_config.vae_use_slicing)
+        self.gen_vae.use_tiling = bool(od_config.vae_use_tiling)
+        if self.gen_vae.use_slicing or self.gen_vae.use_tiling:
+            logger.info(
+                "MammothModa2 gen_vae memory modes: slicing=%s, tiling=%s",
+                self.gen_vae.use_slicing,
+                self.gen_vae.use_tiling,
+            )
         self.gen_transformer = Transformer2DModel.from_config(self.config.gen_dit_config)
 
         # llm_config is a Mammothmoda2Qwen2_5_VLConfig which has nested text_config

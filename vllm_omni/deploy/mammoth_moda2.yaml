@@ -31,3 +31,7 @@ stages:
     #   residual_diff_threshold: 0.24
     #   max_continuous_cached_steps: 3
     # enable_cache_dit_summary: true
+    # Optional VAE decode memory modes for the DiT stage (off by default; see
+    # the recipe). Tiling engages only above the checkpoint's tile threshold.
+    # vae_use_slicing: true
+    # vae_use_tiling: true
