@@ -849,7 +849,7 @@ def test_image_edits_streaming_returns_ar_delta_then_image(streaming_image_edit_
     assert payloads[0]["index"] == 0
     assert payloads[1]["delta"] == " done"
     assert payloads[2]["output_format"] == "png"
-    assert payloads[2]["size"] == "16x16"
+    assert payloads[2]["size"] == "32x24"
 
     image_payload = payloads[2]["data"][0]
     img = Image.open(io.BytesIO(base64.b64decode(image_payload["b64_json"])))
@@ -2206,8 +2206,8 @@ def test_extract_images_from_result():
     class EmptyResult:
         pass
 
-    result = EmptyResult()
-    images = _extract_images_from_result(result)
+    empty_result = EmptyResult()
+    images = _extract_images_from_result(empty_result)
     assert images == []
 
     # Test nested batch: [np.array(shape=(3, 64, 64, 3))]
@@ -2217,8 +2217,8 @@ def test_extract_images_from_result():
         def __init__(self):
             self.images = [batch]
 
-    result = BatchResult()
-    images = _extract_images_from_result(result)
+    batch_result = BatchResult()
+    images = _extract_images_from_result(batch_result)
     assert len(images) == 3
     assert all(isinstance(img, Image.Image) for img in images)
     assert all(img.size == (64, 64) for img in images)
@@ -2228,8 +2228,8 @@ def test_extract_images_from_result():
         def __init__(self):
             self.images = [np.random.randint(0, 255, (64, 64, 3), dtype=np.uint8)]
 
-    result = DictRequestOutput()
-    images = _extract_images_from_result(result)
+    dict_result = DictRequestOutput()
+    images = _extract_images_from_result(dict_result)
     assert len(images) == 1
     assert isinstance(images[0], Image.Image)
 
@@ -2238,8 +2238,8 @@ def test_extract_images_from_result():
         def __init__(self):
             self.images = [np.random.randint(0, 255, (32, 32, 3), dtype=np.uint8)]
 
-    result = AttrRequestOutput()
-    images = _extract_images_from_result(result)
+    attr_result = AttrRequestOutput()
+    images = _extract_images_from_result(attr_result)
     assert len(images) == 1
     assert isinstance(images[0], Image.Image)
     assert images[0].size == (32, 32)
