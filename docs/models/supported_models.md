@@ -102,6 +102,7 @@ th {
 | `Flux2Pipeline` | FLUX.2-dev | `black-forest-labs/FLUX.2-dev` | ✅︎ | ✅︎ | | ✅︎ | — |
 | `FishSpeechSlowARForConditionalGeneration` | Fish Speech S2 Pro | `fishaudio/s2-pro` | ✅︎ | ✅︎ | | ✅︎ | — |
 | `Audio8TTSSlowARForConditionalGeneration` | Audio8 TTS Preview | `Audio8/Audio8-TTS-Preview-0.6b` | ✅︎ | | | ✅︎ | — |
+| `Audio8TTS01BSlowARForConditionalGeneration` | Audio8 TTS Preview 0.1B | `Audio8/Audio8-TTS-Preview-0.1b` | ✅︎ | | | | — |
 | `SenseNovaU1Pipeline` | SenseNova-U1 (DiT-only), SenseNova-U1.5 | `SenseNova/SenseNova-U1-8B-MoT`, `sensenova/SenseNova-U1.5-8B-MoT` | ✅︎ | | | ✅︎ | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/SenseNova/SenseNova-U1.5.md) |
 | `SenseNovaU1Pipeline` | SenseNova-U1-A3B (MoE) | `sensenova/SenseNova-U1-A3B-MoT` | ✅︎ | | | | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/SenseNova/SenseNova-U1.md#a3b-moe-variant) |
 | `LancePipeline` | Lance | `bytedance-research/Lance` | ✅︎ | | | | — |
