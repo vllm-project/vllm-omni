@@ -1,10 +1,15 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import asyncio
 import contextlib
 import os
 import stat
 import time
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from dataclasses import dataclass, field
+from functools import partial
 from tempfile import NamedTemporaryFile
 from typing import Generic, Literal, TypeVar
 
@@ -34,6 +39,7 @@ class FileStorageHandle(BaseStorageHandle):
 
 
 K = TypeVar("K", bound=BaseStorageHandle, covariant=True)
+T = TypeVar("T")
 
 
 class StorageBaseManager(Generic[K], ABC):
@@ -63,6 +69,22 @@ class LocalStorageManager(StorageBaseManager[FileStorageHandle]):
 
         self._io_semaphore = asyncio.Semaphore(max(1, max_concurrency))
 
+    async def _run_io(self, operation: Callable[[], T]) -> T:
+        await self._io_semaphore.acquire()
+        task = asyncio.create_task(asyncio.to_thread(operation))
+
+        def io_done(completed: asyncio.Task[T]) -> None:
+            self._io_semaphore.release()
+            if not completed.cancelled():
+                error = completed.exception()
+                if error is not None:
+                    logger.debug("Storage I/O failed", exc_info=error)
+
+        task.add_done_callback(io_done)
+        # Cancelling an awaiter cannot stop a running disk operation. Keep its
+        # concurrency slot until the worker finishes, and observe late errors.
+        return await asyncio.shield(task)
+
     async def open(self, storage_key: str) -> FileStorageHandle | None:
         local_file = self.get_full_file_path(storage_key)
         if not os.path.exists(local_file):
@@ -91,8 +113,7 @@ class LocalStorageManager(StorageBaseManager[FileStorageHandle]):
             raise
 
     async def save(self, data: bytes, file_name: str) -> SaveContext:
-        async with self._io_semaphore:
-            return await asyncio.to_thread(self._save_sync, data, file_name)
+        return await self._run_io(partial(self._save_sync, data, file_name))
 
     def _delete_sync(self, file_name: str) -> bool:
         try:
@@ -102,8 +123,7 @@ class LocalStorageManager(StorageBaseManager[FileStorageHandle]):
         return True
 
     async def delete(self, file_name: str) -> bool:
-        async with self._io_semaphore:
-            return await asyncio.to_thread(self._delete_sync, file_name)
+        return await self._run_io(partial(self._delete_sync, file_name))
 
     def exists(self, file_name: str) -> bool:
         return os.path.exists(self.get_full_file_path(file_name))
@@ -151,13 +171,7 @@ class LocalStorageTTLManager(LocalStorageManager):
         deleted = 0
         for path in expired:
             try:
-                async with self._io_semaphore:
-                    st = await asyncio.to_thread(os.stat, path, follow_symlinks=False)
-                    if not stat.S_ISREG(st.st_mode):
-                        continue
-                    if st.st_mtime >= cutoff:
-                        continue
-                    await asyncio.to_thread(os.remove, path)
+                if await self._run_io(partial(self._delete_expired_sync, path, cutoff)):
                     deleted += 1
             except FileNotFoundError:
                 logger.debug("TTL sweep skipped %s; file already removed", path)
@@ -165,6 +179,13 @@ class LocalStorageTTLManager(LocalStorageManager):
                 logger.warning("TTL sweep failed to delete expired file %s", path, exc_info=True)
 
         return deleted
+
+    def _delete_expired_sync(self, path: str, cutoff: float) -> bool:
+        st = os.stat(path, follow_symlinks=False)
+        if not stat.S_ISREG(st.st_mode) or st.st_mtime >= cutoff:
+            return False
+        os.remove(path)
+        return True
 
     async def _sweep_loop(self) -> None:
         while True:
@@ -189,6 +210,7 @@ class LocalStorageTTLManager(LocalStorageManager):
 
 
 def get_storage_manager(storage_config: FileBackend) -> StorageBaseManager[FileStorageHandle]:
+    manager: LocalStorageManager
     if isinstance(storage_config, FileBackend):
         if storage_config.file_ttl is not None and storage_config.ttl_sweep_interval is not None:
             manager = LocalStorageTTLManager(
