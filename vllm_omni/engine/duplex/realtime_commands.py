@@ -26,7 +26,16 @@ existing importers. The canonical definitions are in
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import cast
+from typing import Annotated, cast
+
+from openai.types.realtime import (
+    ConversationItemDeleteEvent,
+    ConversationItemRetrieveEvent,
+    ConversationItemTruncateEvent,
+    InputAudioBufferClearEvent,
+    ResponseCancelEvent,
+)
+from pydantic import Field, ValidationError
 
 from vllm_omni.engine.duplex.commands import (
     AckPlayback,
@@ -80,6 +89,17 @@ from vllm_omni.protocol.duplex import (
     validate_realtime_video_frames,
     validate_session_payload,
 )
+
+_NonEmptyItemID = Annotated[str, Field(min_length=1)]
+
+
+class _DuplexConversationItemDeleteEvent(ConversationItemDeleteEvent):
+    item_id: _NonEmptyItemID
+
+
+class _DuplexConversationItemTruncateEvent(ConversationItemTruncateEvent):
+    item_id: _NonEmptyItemID
+    content_index: int = 0
 
 
 def _validate_duplex_turn_detection(session_payload: Mapping[str, object]) -> str | None:
@@ -146,6 +166,25 @@ def translate_realtime_command(
     *,
     defaults: RealtimeInputDefaults | None = None,
 ) -> DuplexCommand:
+    """Map one Realtime event and normalize SDK validation failures."""
+    try:
+        return _translate_realtime_command(payload, defaults=defaults)
+    except ValidationError as exc:
+        event_type = payload.get("type")
+        event_id = payload.get("event_id")
+        event_name = event_type if isinstance(event_type, str) else "duplex"
+        raise DuplexCommandError(
+            f"Invalid {event_name} event",
+            code="bad_event",
+            event_id=event_id if isinstance(event_id, str) else None,
+        ) from exc
+
+
+def _translate_realtime_command(
+    payload: Mapping[str, object],
+    *,
+    defaults: RealtimeInputDefaults | None = None,
+) -> DuplexCommand:
     """Map one OpenAI Realtime client event onto a :class:`DuplexCommand`.
 
     Raises :class:`DuplexCommandError` for malformed or unsupported payloads.
@@ -181,30 +220,16 @@ def translate_realtime_command(
         )
 
     if event_type == "conversation.item.delete":
-        item_id = payload.get("item_id")
-        if not isinstance(item_id, str) or not item_id:
-            raise DuplexCommandError(
-                "conversation.item.delete requires item_id", code="missing_item_id", event_id=event_id
-            )
-        return DeleteItem(event_id=event_id, item_id=item_id)
+        event = _DuplexConversationItemDeleteEvent.model_validate(payload)
+        return DeleteItem(event_id=event.event_id, item_id=event.item_id)
 
     if event_type == "conversation.item.truncate":
-        item_id = payload.get("item_id")
-        audio_end_ms = payload.get("audio_end_ms")
-        content_index = payload.get("content_index", 0)
-        if not isinstance(item_id, str) or not item_id:
-            raise DuplexCommandError(
-                "conversation.item.truncate requires item_id", code="missing_item_id", event_id=event_id
-            )
-        if not isinstance(audio_end_ms, int | float):
-            raise DuplexCommandError(
-                "conversation.item.truncate requires numeric audio_end_ms", code="bad_event", event_id=event_id
-            )
+        event = _DuplexConversationItemTruncateEvent.model_validate(payload)
         return TruncateItem(
-            event_id=event_id,
-            item_id=item_id,
-            audio_end_ms=int(audio_end_ms),
-            content_index=int(content_index) if isinstance(content_index, int | float) else 0,
+            event_id=event.event_id,
+            item_id=event.item_id,
+            audio_end_ms=event.audio_end_ms,
+            content_index=event.content_index,
         )
 
     if event_type == "input_audio_buffer.append":
@@ -226,7 +251,8 @@ def translate_realtime_command(
         )
 
     if event_type == "input_audio_buffer.clear":
-        return ClearInput(event_id=event_id)
+        event = InputAudioBufferClearEvent.model_validate(payload)
+        return ClearInput(event_id=event.event_id)
 
     if event_type == "output_audio_buffer.clear":
         response_id = payload.get("response_id")
@@ -236,10 +262,10 @@ def translate_realtime_command(
         )
 
     if event_type == "response.cancel":
-        response_id = payload.get("response_id")
+        event = ResponseCancelEvent.model_validate(payload)
         return CancelResponse(
-            event_id=event_id,
-            response_id=response_id if isinstance(response_id, str) and response_id else None,
+            event_id=event.event_id,
+            response_id=event.response_id or None,
         )
 
     if event_type == "response.create":
@@ -273,7 +299,12 @@ def translate_realtime_command(
 
     if event_type == "conversation.item.retrieve":
         # The projected conversation items live engine-side; the runner answers.
-        return SignalTurn(event_id=event_id, event="conversation.item.retrieve", signal_payload=dict(payload))
+        event = ConversationItemRetrieveEvent.model_validate(payload)
+        return SignalTurn(
+            event_id=event.event_id,
+            event="conversation.item.retrieve",
+            signal_payload=dict(payload),
+        )
 
     if event_type in {"session.close", "close", "close_session"}:
         reason = payload.get("reason")
