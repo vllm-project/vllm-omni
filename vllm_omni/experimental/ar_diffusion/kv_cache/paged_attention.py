@@ -88,6 +88,9 @@ class ARDiffusionPagedForwardContext:
     seq_len: int
     commit_current: bool
     max_video_tokens: int
+    # Clean refresh: one query sequence per frame, staged in scratch until all
+    # layers finish so publishing later frames cannot evict earlier history.
+    frame_causal: bool = False
     current_video_block_ids: list[int] = field(default_factory=list)
     current_video_slot_mapping: torch.Tensor | None = None
     action_scratch_block_ids: list[int] = field(default_factory=list)
@@ -203,7 +206,7 @@ class ARDiffusionPagedForwardContext:
 
         n_blocks = self.num_current_video_blocks
         self._history_tokens = int(self.adapter.num_computed_tokens)
-        if self.commit_current:
+        if self.commit_current and not self.frame_causal:
             start = int(self.adapter.num_computed_tokens)
             self._current_offset = start % self.block_size
             self.kv_cache.allocate_token_slots(self.adapter, self.seq_len)
@@ -242,7 +245,7 @@ class ARDiffusionPagedForwardContext:
         self._allocated_video = True
 
     def ensure_action_slots(self, action_len: int, device: torch.device) -> None:
-        """Reserve scratch slots for action/state K/V, if present."""
+        """Reserve scratch slots for auxiliary K/V, if present."""
         if action_len <= 0:
             self.action_scratch_block_ids = []
             self.action_slot_mapping = torch.empty(0, dtype=torch.long, device=device)
@@ -254,9 +257,8 @@ class ARDiffusionPagedForwardContext:
             return
 
         action_blocks = (action_len + self.block_size - 1) // self.block_size
-        # Count scratch blocks, not entries: the video list may lead with the
-        # history's tail block, which lives in the managed pool.
-        scratch_offset = 0 if self.commit_current else self._scratch_blocks_used
+        # The history tail is managed and does not consume scratch blocks.
+        scratch_offset = 0 if self.commit_current and not self.frame_causal else self._scratch_blocks_used
         self.action_scratch_block_ids = self.kv_cache.scratch_block_ids(
             self.kv_branch,
             scratch_offset,
@@ -355,6 +357,8 @@ class ARDiffusionPagedForwardContext:
         (and, later, CUDA-graph capture). The kernel only dereferences the first
         ``ceil(seq_lens/block_size)`` entries, so padding is never read.
         """
+        if self.frame_causal:
+            return self._build_frame_causal_block_table(action_len=action_len, query_len=query_len, device=device)
         video_blocks, video_len = self.video_block_table(device)
         # Action K/V is listed after the video blocks and the kernel reads the
         # table as one run, so the video run has to end on a block edge. If it
@@ -400,10 +404,45 @@ class ARDiffusionPagedForwardContext:
         seq_lens = _to_device_async(torch.tensor([self.kv_len], dtype=torch.int32), device)
         return block_table, query_start_loc, seq_lens, self.query_len, max_seq_len
 
+    def _build_frame_causal_block_table(
+        self, *, action_len: int, query_len: int, device: torch.device
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int]:
+        """Give each frame exactly the view of its sequential clean forward.
+
+        Each row includes retained sink/history frames, earlier clean frames,
+        the entire current frame, and shared text. Attention stays noncausal
+        within each row; future frames are absent from its block table.
+        """
+        if query_len != self.seq_len:
+            raise ValueError("Frame-causal refresh requires one query per current token")
+        self.ensure_video_slots(device)
+        self.ensure_action_slots(action_len, device)
+        capacity = self.max_video_tokens // self.block_size
+        blocks_per_frame = self.chunk_size // self.block_size
+        sink = int(self.kv_cache.spec.sink_chunks) * blocks_per_frame
+        action_capacity = max(1, (action_len + self.block_size - 1) // self.block_size)
+        rows, lengths = [], []
+        for frame in range(self.seq_len // self.chunk_size):
+            visible = self.history_block_ids + self.current_video_block_ids[: (frame + 1) * blocks_per_frame]
+            if len(visible) > capacity:
+                visible = visible[:sink] + visible[-(capacity - sink) :]
+            lengths.append(len(visible) * self.block_size + action_len)
+            row = visible + self.action_scratch_block_ids
+            rows.append(row + [0] * (capacity + action_capacity - len(row)))
+        self.query_len = query_len
+        self.kv_len = max(lengths)
+        return (
+            torch.tensor(rows, dtype=torch.int32, device=device),
+            torch.arange(0, query_len + 1, self.chunk_size, dtype=torch.int32, device=device),
+            torch.tensor(lengths, dtype=torch.int32, device=device),
+            self.chunk_size,
+            self.max_video_tokens + action_capacity * self.block_size,
+        )
+
     def prepare(self, device: torch.device, action_len: int, query_len: int) -> None:
         """Host-side, once-per-KV-branch setup (called OUTSIDE torch.compile).
 
-        Allocates the current video/action slots (still lazy: only the KV branch a
+        Allocates the current video/auxiliary slots (still lazy: only the KV branch a
         CFG-parallel rank actually runs reaches its ``_forward_blocks``), builds
         the padded block-table metadata ONCE for all layers, and publishes the
         pool registry for the fused custom op. The compiled per-layer code then
@@ -603,6 +642,13 @@ def _reference_paged_attention(
         physical_blocks = block_table[i, logical_blocks].long()
         k = key_cache[physical_blocks, offsets]
         v = value_cache[physical_blocks, offsets]
+        # Match the CUDA kernel's grouped-query attention in the CPU oracle.
+        if q.shape[1] != k.shape[1]:
+            if q.shape[1] % k.shape[1]:
+                raise ValueError("Query head count must be divisible by KV head count")
+            groups = q.shape[1] // k.shape[1]
+            k = k.repeat_interleave(groups, dim=1)
+            v = v.repeat_interleave(groups, dim=1)
         scores = torch.einsum("qhd,khd->hqk", q.float(), k.float()) * float(softmax_scale)
         probs = torch.softmax(scores, dim=-1).to(v.dtype)
         outs.append(torch.einsum("hqk,khd->qhd", probs, v))
@@ -701,6 +747,7 @@ def ar_diffusion_paged_attention(
     max_seq_len: int,
     softmax_scale: float,
     causal: bool = False,
+    framewise_attention: bool = False,
     stage_key: torch.Tensor | None = None,
     stage_value: torch.Tensor | None = None,
     reuse_history: bool = False,
@@ -719,7 +766,31 @@ def ar_diffusion_paged_attention(
     else:
         query_flat = query
 
-    if not query_flat.is_cuda:
+    if framewise_attention and query_start_loc.numel() > 2:
+        # Preserve the single-frame backend dispatch, including automatic KV
+        # splitting. FA4 can choose different reduction kernels for one vs
+        # several query rows; the resulting BF16 drift accumulates over layers.
+        # Projections, normalization and MLPs still run on the full chunk.
+        num_frames = query_start_loc.numel() - 1
+        if query_flat.shape[0] != num_frames * max_query_len:
+            raise ValueError("Framewise attention requires equally sized query frames")
+        outputs = [
+            ar_diffusion_paged_attention(
+                query_flat[frame * max_query_len : (frame + 1) * max_query_len],
+                key_cache,
+                value_cache,
+                block_table=block_table[frame : frame + 1].contiguous(),
+                query_start_loc=query_start_loc[:2],
+                seq_lens=seq_lens[frame : frame + 1],
+                max_query_len=max_query_len,
+                max_seq_len=max_seq_len,
+                softmax_scale=softmax_scale,
+                causal=causal,
+            )
+            for frame in range(num_frames)
+        ]
+        out = torch.cat(outputs, dim=0)
+    elif not query_flat.is_cuda:
         out = _reference_paged_attention(
             query_flat,
             key_cache,
@@ -891,6 +962,7 @@ def _paged_write_attn_impl(
     stage_value: torch.Tensor | None = None,
     reuse_history: bool = False,
     stage_first_block: int = 0,
+    framewise_attention: bool = False,
 ) -> torch.Tensor:
     key_pool[video_slots] = k_curr.to(key_pool.dtype)
     value_pool[video_slots] = v_curr.to(value_pool.dtype)
@@ -910,6 +982,7 @@ def _paged_write_attn_impl(
         max_seq_len=max_seq_len,
         softmax_scale=softmax_scale,
         causal=False,
+        framewise_attention=framewise_attention,
         stage_key=stage_key,
         stage_value=stage_value,
         reuse_history=reuse_history,
@@ -949,6 +1022,7 @@ if not hasattr(torch.ops.vllm_omni, "ar_diffusion_paged_write_attn"):
         stage_value: torch.Tensor | None,
         reuse_history: bool,
         stage_first_block: int,
+        framewise_attention: bool,
     ) -> torch.Tensor:
         return _paged_write_attn_impl(
             query,
@@ -971,6 +1045,7 @@ if not hasattr(torch.ops.vllm_omni, "ar_diffusion_paged_write_attn"):
             stage_value,
             reuse_history,
             stage_first_block,
+            framewise_attention,
         )
 
     @_paged_write_attn_op.register_fake
@@ -995,12 +1070,21 @@ if not hasattr(torch.ops.vllm_omni, "ar_diffusion_paged_write_attn"):
         stage_value=None,
         reuse_history=False,
         stage_first_block=0,
+        framewise_attention=False,
     ):
         return torch.empty_like(query)
 
 
 def paged_write_attn(
-    inputs: ARDiffusionPagedLayerInputs, query, k_curr, v_curr, k_act, v_act, softmax_scale: float
+    inputs: ARDiffusionPagedLayerInputs,
+    query,
+    k_curr,
+    v_curr,
+    k_act,
+    v_act,
+    softmax_scale: float,
+    *,
+    framewise_attention: bool = False,
 ) -> torch.Tensor:
     """Model-facing entry: routes through the custom op (traceable in fullgraph)."""
     return torch.ops.vllm_omni.ar_diffusion_paged_write_attn(
@@ -1024,4 +1108,5 @@ def paged_write_attn(
         inputs.stage_value,
         inputs.reuse_history,
         inputs.stage_first_block,
+        framewise_attention,
     )

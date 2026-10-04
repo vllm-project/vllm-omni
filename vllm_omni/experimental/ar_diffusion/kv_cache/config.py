@@ -40,9 +40,8 @@ class ARDiffusionKVConfig:
     # Fraction of free device memory used to admit additional resident
     # sessions. One session is admitted whenever it fits actual free memory.
     gpu_memory_fraction: float = 0.1
-    # When CUDA graph / torch.compile is on (not enforce_eager), pre-capture the
-    # DiT graphs for every window-fill shape at load time via a synthetic rollout,
-    # so the serving run is fast from the first chunk. No effect when eager.
+    # Warm the model-valid synthetic rollout, including explicitly enabled
+    # native graph captures. This flag alone does not enable CUDA graphs.
     warmup_cudagraph: bool = True
     # Keep one contiguous K/V staging buffer per layer and refresh only the tokens that changed.
     # Within one AR block every forward attends the same history and differs only in the current

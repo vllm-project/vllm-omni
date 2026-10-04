@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from contextlib import contextmanager
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -200,6 +201,15 @@ def make_runner(
     return runner
 
 
+def test_allocation_does_not_pin_later_request_window():
+    pipeline = CapablePipeline(tiny_spec())
+    runner = make_runner(pipeline)
+    assert runner.ar_diffusion_kv_config.window_chunks is None
+    larger = replace(pipeline.spec, window_frames=226)
+    effective, config = runner._effective_spec(pipeline, larger)
+    assert effective.window_frames == config.window_chunks == 226
+
+
 def commit_one_frame(runner: ARDiffusionModelRunner, session_id: str, kv_branch: str):
     state = runner._get_or_create_session(session_id)
     ctx = state.get_kv_caches(kv_branch, seq_len=BLOCK, commit_current=True)[0].forward_ctx
@@ -270,6 +280,7 @@ def test_lingbot_like_single_branch_session_reuse_reset_and_close():
     assert kv is not None
     assert kv.num_local_kv_branches == 1
     assert kv.frames_per_block == 3
+    assert kv.max_scratch_frames_per_branch == 3
     assert kv.spec.window_chunks == 5
     assert kv.spec.sink_chunks == 1
     assert kv.cross_attention_lengths == {"text": 8}

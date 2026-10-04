@@ -157,6 +157,37 @@ def test_paged_context_allocates_lazily_and_commits_after_forward():
     assert st._committed[POS] == BLOCK
 
 
+@pytest.mark.parametrize("chunk_size", [BLOCK, 2 * BLOCK, 3 * BLOCK])
+def test_frame_causal_refresh_groups_and_commits_all_blocks_in_each_frame(chunk_size):
+    kv, st = make_state(chunk_size=chunk_size)
+    try:
+        ctx = st.get_kv_caches(
+            POS,
+            seq_len=2 * chunk_size,
+            commit_current=True,
+            extra_visible_tokens=chunk_size,
+            frame_causal=True,
+        )[0].forward_ctx
+        ctx.prepare(device=torch.device("cpu"), action_len=3, query_len=2 * chunk_size)
+        assert ctx.block_table.shape[0] == 2
+        assert ctx.query_start_loc.tolist() == [0, chunk_size, 2 * chunk_size]
+        assert ctx.seq_lens.tolist() == [chunk_size + 3, 2 * chunk_size + 3]
+        assert ctx.max_query_len == chunk_size
+        assert ctx.action_scratch_block_ids == kv.scratch_block_ids(POS, 2 * chunk_size // BLOCK, 1)
+        keys = torch.randn(2 * chunk_size, N_HEADS, HEAD_DIM)
+        values = torch.randn_like(keys)
+        kv._k_pools[0][ctx.current_video_slot_mapping] = keys
+        kv._v_pools[0][ctx.current_video_slot_mapping] = values
+        assert st.adapter(POS).completed_chunks == 0
+        st.commit_paged_context(POS)
+        assert st.adapter(POS).completed_chunks == 2
+        blocks = kv.window_block_ids(st.adapter(POS))
+        torch.testing.assert_close(kv.key_cache(0)[blocks].flatten(0, 1), keys)
+        torch.testing.assert_close(kv.value_cache(0)[blocks].flatten(0, 1), values)
+    finally:
+        st.close()
+
+
 def test_scratch_video_and_action_blocks_do_not_commit():
     kv, st = make_state()
 
@@ -208,7 +239,8 @@ def test_paged_attention_matches_dense_reference_cpu(history_chunks, action_len,
         history_k_parts.append(k)
         history_v_parts.append(v)
 
-    ctx = st.get_kv_caches(POS, seq_len=BLOCK, commit_current=commit_current)[0].forward_ctx
+    layer_ctx = st.get_kv_caches(POS, seq_len=BLOCK, commit_current=commit_current)[0]
+    ctx = layer_ctx.forward_ctx
     ctx.ensure_video_slots(device)
     current_k = torch.randn(1, BLOCK, N_HEADS, HEAD_DIM, dtype=dtype, device=device)
     current_v = torch.randn(1, BLOCK, N_HEADS, HEAD_DIM, dtype=dtype, device=device)
@@ -257,9 +289,65 @@ def test_paged_attention_matches_dense_reference_cpu(history_chunks, action_len,
 
     torch.testing.assert_close(paged, ref, rtol=1e-5, atol=1e-5)
 
+    ctx.prepare(device=device, action_len=action_len, query_len=query.shape[1])
+    fused = paged_write_attn(
+        layer_ctx.to_layer_inputs(),
+        query[0],
+        current_k[0],
+        current_v[0],
+        action_k[0] if action_len else None,
+        action_v[0] if action_len else None,
+        HEAD_DIM**-0.5,
+    ).unsqueeze(0)
+    torch.testing.assert_close(fused, ref, rtol=1e-5, atol=1e-5)
+
     before = st.adapter(POS).completed_chunks
     st.commit_paged_context(POS)
     assert st.adapter(POS).completed_chunks == before + (1 if commit_current else 0)
+
+
+def test_extra_visible_tokens_keeps_the_history_window_in_addition_to_current():
+    torch.manual_seed(0)
+    device = torch.device("cpu")
+    kv, st = make_state(window_chunks=2, device=device)
+    committed = [
+        _commit_video_span(
+            kv,
+            st,
+            kv_branch=POS,
+            n_chunks=1,
+            dtype=torch.float32,
+            device=device,
+        )
+        for _ in range(3)
+    ]
+
+    layer_ctx = st.get_kv_caches(
+        POS,
+        seq_len=BLOCK,
+        commit_current=False,
+        extra_visible_tokens=BLOCK,
+    )[0]
+    current_k = torch.randn(BLOCK, N_HEADS, HEAD_DIM)
+    current_v = torch.randn_like(current_k)
+    text_k = torch.randn(3, N_HEADS, HEAD_DIM)
+    text_v = torch.randn_like(text_k)
+    query = torch.randn(BLOCK, N_HEADS, HEAD_DIM)
+    layer_ctx.forward_ctx.prepare(device=device, action_len=text_k.shape[0], query_len=query.shape[0])
+
+    paged = paged_write_attn(
+        layer_ctx.to_layer_inputs(),
+        query,
+        current_k,
+        current_v,
+        text_k,
+        text_v,
+        HEAD_DIM**-0.5,
+    ).unsqueeze(0)
+    dense_k = torch.cat([committed[-2][0], committed[-1][0], current_k.unsqueeze(0), text_k.unsqueeze(0)], dim=1)
+    dense_v = torch.cat([committed[-2][1], committed[-1][1], current_v.unsqueeze(0), text_v.unsqueeze(0)], dim=1)
+
+    torch.testing.assert_close(paged, _dense_attention(query.unsqueeze(0), dense_k, dense_v))
 
 
 @pytest.mark.parametrize("history_chunks", [0, 1, 2, 3])
