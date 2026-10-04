@@ -338,6 +338,12 @@ def listen_output(request_id: str) -> SimpleNamespace:
     )
 
 
+def _is_silence_unit(submission: DuplexStageSubmission) -> bool:
+    """A continuation unit: the only append whose audio is all zeros."""
+    payload = submission.prompt["model_intermediate_buffer"]["duplex"]["payload"]
+    return set(base64.b64decode(payload["audio"])) == {0}
+
+
 def types(events: Sequence[DuplexEvent]) -> list[str]:
     return [event.type for event in events]
 
@@ -984,6 +990,81 @@ async def test_tts_segment_end_schedules_a_silence_continuation_unit() -> None:
         assert h.runner.model_state.continuation_units == 1
         # The response stays open across the segment boundary.
         assert h.session.active_response_id is not None
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_answer_continues_when_the_segment_end_arrives_before_the_answer() -> None:
+    """A continuation planned for the model turn is re-aimed at the answer that opened (#7729)."""
+    h = await open_harness()
+    try:
+        for _ in range(4):
+            await h.run(append_audio())
+        request_id = h.stage0_request_id()
+
+        # A TTS segment ends with no text or audio before any response exists.
+        # This schedules a continuation, which waits for up to one chunk period.
+        h.deliver(tts_output(request_id, samples=0, text="", tts_is_last_chunk=True))
+        await asyncio.sleep(0.1)
+
+        # During that wait the last real units arrive and the answer starts.
+        h.submit(append_audio())
+        await asyncio.sleep(0.1)
+        h.deliver(tts_output(request_id, samples=24000, text="no"))
+        await asyncio.sleep(0.1)
+        h.submit(append_audio())
+        h.submit(commands.Commit())
+        await h.settle(timeout_s=5.0)
+
+        # More of the answer. Its segment only ends after another unit is processed.
+        for samples, text in ((48000, "no fi"), (72000, "no fight, bu"), (96000, "no fight, but yes,")):
+            await h.deliver_and_settle(tts_output(request_id, samples=samples, text=text))
+        await h.settle(idle_s=2.5, timeout_s=8.0)
+
+        assert h.session.active_response_id is not None
+        # 6 real units, then a silence unit that keeps the answer going.
+        assert len(h.port.submissions) == 7
+        assert _is_silence_unit(h.port.submissions[6])
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_a_dropped_continuation_is_not_re_aimed_across_a_barge_in() -> None:
+    """The re-aim in #7729 stays inside the epoch that planned the unit.
+
+    The next answer must open while the old continuation is still waiting out
+    its chunk period, so this drives the runner with ``submit``/``deliver`` and
+    short sleeps. ``run``/``settle`` would wait for that continuation to drop
+    first, and then a fix that re-arms with the current epoch passes too.
+    """
+    h = await open_harness()
+    try:
+        for _ in range(2):
+            await h.run(append_audio())
+        request_id = h.stage0_request_id()
+
+        # Plan a continuation for the model turn of epoch 0. It waits for up to
+        # one chunk period (1 s) before it submits.
+        h.deliver(tts_output(request_id, samples=0, text="", tts_is_last_chunk=True))
+        await asyncio.sleep(0.1)
+
+        # The user barges in while it waits, and the next turn opens its own answer.
+        h.submit(commands.BargeIn())
+        await asyncio.sleep(0.1)
+        assert h.session.epoch == 1
+        h.submit(append_audio())
+        await asyncio.sleep(0.1)
+        assert any(task.get_name() == "duplex-continue" and not task.done() for task in h.runner._background_tasks), (
+            "the old continuation should still be waiting when the new answer opens"
+        )
+        h.deliver(tts_output(h.stage0_request_id(), samples=24000, text="hi", epoch=1))
+        await h.settle(idle_s=2.5, timeout_s=8.0)
+
+        assert h.session.epoch == 1
+        assert h.session.active_response_id is not None
+        assert [s for s in h.port.submissions if _is_silence_unit(s)] == []
     finally:
         await close_harness(h)
 
