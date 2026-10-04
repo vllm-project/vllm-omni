@@ -378,6 +378,68 @@ def test_build_add_request_message_scopes_mm_uuids_to_selected_stage0_replica(mo
     assert seen_uuids[0].removeprefix("stage0:rep0:") == seen_uuids[1].removeprefix("stage0:rep1:")
 
 
+def _two_replica_engine_recording_uuids(mocker: MockerFixture) -> tuple[AsyncOmniEngine, list[str]]:
+    engine = object.__new__(AsyncOmniEngine)
+    params = SamplingParams(max_tokens=8)
+    engine.model = "test-model"
+    engine.default_sampling_params_list = [params]
+    engine.stage_metadata = [StageRuntimeInfo(final_output=False, final_output_type=None, stage_type="llm")]
+    engine.supported_tasks = ("generate",)
+    engine.stage_pools = [StagePool(0, [_FakeStageClient(), _FakeStageClient()])]
+
+    seen_uuids: list[str] = []
+
+    def process_inputs(**kwargs):
+        seen_uuids.append(kwargs["prompt"]["multi_modal_uuids"]["image"][0])
+        return _make_engine_core_request(kwargs["request_id"])
+
+    engine.input_processor = mocker.Mock()
+    engine.input_processor.process_inputs.side_effect = process_inputs
+    return engine, seen_uuids
+
+
+def test_mm_uuid_scoping_leaves_caller_prompt_untouched(mocker: MockerFixture):
+    engine, seen_uuids = _two_replica_engine_recording_uuids(mocker)
+    params = SamplingParams(max_tokens=8)
+    prompt = {
+        "prompt": "describe",
+        "multi_modal_data": {"image": "image-a"},
+        "multi_modal_uuids": {"image": ["user-uuid"]},
+    }
+
+    engine._build_add_request_message(
+        request_id="req-1", prompt=prompt, sampling_params_list=[params], final_stage_id=0
+    )
+
+    assert seen_uuids == ["stage0:rep0:user-uuid"]
+    assert prompt["multi_modal_uuids"] == {"image": ["user-uuid"]}
+
+
+def test_mm_uuid_scoping_keys_reused_prompt_by_its_own_media(mocker: MockerFixture):
+    # Callers may build each request from a dict that already went through the
+    # engine. Every request must still be keyed by its own media, otherwise the
+    # sender cache omits the new media and the replica serves the old one.
+    engine, seen_uuids = _two_replica_engine_recording_uuids(mocker)
+    params = SamplingParams(max_tokens=8)
+    template = {"prompt": "describe", "multi_modal_data": {"image": "image-a"}}
+
+    engine._build_add_request_message(
+        request_id="req-0", prompt=template, sampling_params_list=[params], final_stage_id=0
+    )
+    for i, image in enumerate(("image-b", "image-c", "image-d"), start=1):
+        prompt = dict(template)
+        prompt["multi_modal_data"] = {"image": image}
+        engine._build_add_request_message(
+            request_id=f"req-{i}", prompt=prompt, sampling_params_list=[params], final_stage_id=0
+        )
+
+    assert "multi_modal_uuids" not in template
+    # Round-robin: requests 0/2 land on replica 0, requests 1/3 on replica 1.
+    assert [uuid.split(":")[1] for uuid in seen_uuids] == ["rep0", "rep1", "rep0", "rep1"]
+    assert len(set(seen_uuids)) == 4
+    assert all(uuid.count("stage0:") == 1 for uuid in seen_uuids)
+
+
 @pytest.mark.asyncio
 async def test_build_add_request_message_scopes_mm_uuids_to_distributed_stage0_replica(mocker: MockerFixture):
     engine = object.__new__(AsyncOmniEngine)
