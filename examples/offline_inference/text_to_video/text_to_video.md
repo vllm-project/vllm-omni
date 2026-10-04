@@ -285,6 +285,9 @@ python text_to_video.py \
 - `--boundary-ratio`: boundary split for low/high DiT (default 0.875).
 - `--flow-shift`: scheduler flow_shift (5.0 for 720p, 12.0 for 480p).
 - `--cache-backend`: `cache_dit` for acceleration.
+- `--extra-body '{"guidance_interval": [600, 1000]}'`: apply classifier-free guidance only while the scheduler
+  timestep is inside the interval (inclusive). Outside it, the negative-prompt pass is skipped. Text-to-video
+  only. Measured on Wan2.1 T2V; not measured on the two-transformer Wan2.2-A14B.
 
 ### HunyuanVideo-1.5 Optimal Configs
 

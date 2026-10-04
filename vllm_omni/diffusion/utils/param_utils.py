@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -25,3 +25,17 @@ def apply_declared_extra_args(
     if not declared:
         return
     sampling_params.extra_args = {**(sampling_params.extra_args or {}), **declared}
+
+
+def parse_guidance_interval(value: object) -> tuple[float, float]:
+    """Parse ``[lo, hi]`` in scheduler timestep units; raises ValueError unless both are numbers with lo <= hi."""
+    message = f"Invalid guidance_interval={value!r}. Expected two numbers [lo, hi]."
+    if not isinstance(value, (list, tuple)) or len(value) != 2:
+        raise ValueError(message)
+    try:
+        lo, hi = float(value[0]), float(value[1])
+    except (TypeError, ValueError) as exc:
+        raise ValueError(message) from exc
+    if not lo <= hi:
+        raise ValueError(f"Invalid guidance_interval={value!r}. Expected lo <= hi in scheduler timestep units.")
+    return lo, hi

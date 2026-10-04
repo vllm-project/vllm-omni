@@ -226,6 +226,7 @@ def test_separate_wan22_custom_enabler_has_separate_cfg(mock_cache_dit, mock_blo
     mock_cache_dit.enable_cache.assert_called_once()
     adapter_kwargs = mock_block_adapter.call_args.kwargs
     assert adapter_kwargs["has_separate_cfg"] is True
+    assert mock_pipeline._cache_dit_requires_paired_cfg is True
 
 
 @pytest.mark.parametrize("has_transformer_2", [False, True])
