@@ -12,7 +12,7 @@ quantize during model loading via the `bitsandbytes` CUDA kernels.
 ## Hardware Support
 
 | Device | Support |
-|--------|---------|
+| -------- | --------- |
 | NVIDIA CUDA GPU (SM 75+) | ✅ |
 | NVIDIA Blackwell GPU (SM 100+) | ✅ |
 | NVIDIA Ada/Hopper GPU (SM 89+) | ✅ |
@@ -31,26 +31,26 @@ Requires the optional `bitsandbytes` package (`pip install bitsandbytes`).
 ### Diffusion Model (Qwen-Image, Wan2.2)
 
 | Model | HF models | CUDA | Mode | Recommendation |
-|-------|-----------|:----:|------|----------------|
+| ------- | ----------- | :----: | ------ | ---------------- |
 | Z-Image | `Tongyi-MAI/Z-Image-Turbo` | Yes | Online W4 weight-only | All heavy linear layers; sensitive embedders stay BF16 |
 | Qwen-Image | `Qwen/Qwen-Image`, `Qwen/Qwen-Image-2512` | Not validated | Online W4 weight-only | Compare vs BF16 before enabling |
-| Wan2.2 | Wan2.2 diffusion pipelines | Not validated | Online W4 weight-only | Validate before enabling in docs |
+| Wan2.2-TI2V-5B | `Wan-AI/Wan2.2-TI2V-5B-Diffusers` | Yes, T2V | Online W4 weight-only | 240 transformer linears quantized; check quality against BF16 |
 
 Other diffusion models may work if their transformer uses supported linear
 layers, but they are not validated in this guide.
 
 ### Multi-Stage Omni/TTS Model (Qwen3-Omni, Qwen3-TTS)
 
-| Model | Scope | Status | Notes |
-|-------|-------|--------|-------|
+| Model      | Scope                        | Status        | Notes                                                       |
+| ---------- | ---------------------------- | ------------- | ----------------------------------------------------------- |
 | Qwen3-Omni | Thinker language-model stage | Not validated | Prefer checkpoint-supported ModelOpt FP8 or AutoRound paths |
-| Qwen3-TTS | TTS language-model stage | Not validated | No BitsAndBytes TTS stage support is documented |
+| Qwen3-TTS  | TTS language-model stage     | Not validated | No BitsAndBytes TTS stage support is documented             |
 
 ### Multi-Stage Diffusion Model (BAGEL, GLM-Image)
 
-| Model | Scope | Status | Notes |
-|-------|-------|--------|-------|
-| BAGEL | Stage-specific transformer or DiT module | Not validated | Requires explicit stage routing |
+| Model     | Scope                                    | Status        | Notes                                 |
+| --------- | ---------------------------------------- | ------------- | ------------------------------------- |
+| BAGEL     | Stage-specific transformer or DiT module | Not validated | Requires explicit stage routing       |
 | GLM-Image | Stage-specific transformer or DiT module | Not validated | Requires quality comparison with BF16 |
 
 ## Configuration
@@ -88,13 +88,22 @@ vllm serve Tongyi-MAI/Z-Image-Turbo --omni --quantization bitsandbytes
 ## Parameters
 
 | Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
+| ----------- | ------ | --------- | ------------- |
 | `method` | str | - | Quantization method (`"bitsandbytes"`) |
 | `quant_type` | str | `"nf4"` | 4-bit data type: `"nf4"` (recommended) or `"fp4"` |
 | `compress_statistics` | bool | `True` | Double-quantize block scaling statistics for better accuracy |
 | `ignored_layers` | list[str] | `[]` | Layer name patterns to keep in BF16/FP16 |
 
 ## Validation and Notes
+
+Wan2.2-TI2V-5B T2V was validated with native `Omni.generate()` on one RTX 5090:
+480×832, 81 frames, 40 steps, guidance 5, CPU offload and VAE tiling.
+For three measured videos after warmup, W4 averaged 60.32 seconds versus
+58.64 seconds for BF16 (0.972× BF16 speed). Peak allocated GPU memory was
+12.46 versus 12.40 GiB under model-level CPU offload. All 240 transformer
+linear projections used packed W4 weights. On two fixed seeds, all-frame
+SSIM against BF16 was 0.809/0.873; compare visual quality for your workload.
+This validation does not cover Wan2.2-A14B or I2V.
 
 On Z-Image-Turbo (single GPU, 1024×1024, 50 steps), BitsAndBytes W4 typically
 reduces peak VRAM from roughly 24.5 GiB (BF16) to roughly 17 GiB. Compare output
