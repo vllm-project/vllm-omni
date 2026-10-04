@@ -18,6 +18,7 @@ import torch
 from PIL import Image
 
 from vllm_omni.errors import OmniClientError
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.model_executor.models.minimax_h3.conditioning import (
     MiniMaxH3EncoderMediaConditioning,
     MiniMaxH3EncoderMediaInput,
@@ -142,6 +143,28 @@ def _validate_reference_image(image: Image.Image) -> None:
     resolve_minimax_h3_reference_image_shape(image)
 
 
+def resolve_minimax_h3_exact_output_size(sampling: OmniDiffusionSamplingParams) -> tuple[int, int] | None:
+    """Return the explicit output canvas; encoders still use a 32-aligned grid."""
+    extra = sampling.extra_args or {}
+    enabled = extra.get("exact_output_size", False)
+    if not isinstance(enabled, bool):
+        raise OmniClientError("MiniMax H3 exact_output_size must be a boolean")
+    if not enabled:
+        return None
+    height, width = getattr(sampling, "height", None), getattr(sampling, "width", None)
+    if any(isinstance(v, bool) or not isinstance(v, (int, np.integer)) or v < 32 or v % 2 for v in (height, width)):
+        raise OmniClientError("MiniMax H3 exact_output_size requires explicit even width and height >= 32")
+    if width > 4 * height or height > 4 * width:
+        raise OmniClientError("MiniMax H3 canvas aspect ratio must be in [1:4, 4:1]")
+    if any(
+        extra.get(name) is not None and extra.get(name) is not False for name in ("latent_upscale", "latent_refine")
+    ):
+        raise OmniClientError("MiniMax H3 exact_output_size cannot be combined with latent_upscale or latent_refine")
+    if extra.get("long_video_mode", "full") != "full":
+        raise OmniClientError("MiniMax H3 exact_output_size currently requires long_video_mode=full")
+    return int(height), int(width)
+
+
 def resolve_minimax_h3_shape(
     task: str,
     sampling: Any,
@@ -196,8 +219,12 @@ def resolve_minimax_h3_shape(
         )
     if height is None or width is None:
         height, width = resolve_minimax_h3_output_canvas(aspect_ratio, int(raw_short_edge))
-    height = int(height) // 32 * 32
-    width = int(width) // 32 * 32
+    exact_size = resolve_minimax_h3_exact_output_size(sampling)
+    if exact_size is not None:
+        height, width = ((value + 31) // 32 * 32 for value in exact_size)
+    else:
+        height = int(height) // 32 * 32
+        width = int(width) // 32 * 32
     if min(height, width) <= 0:
         raise OmniClientError(f"invalid MiniMax H3 canvas {width}x{height}")
     if width > 4 * height or height > 4 * width:
@@ -466,6 +493,10 @@ def prepare_encoder_inputs(
     source_audio = multi_modal_data.get("source_audio")
     raw_video_edit_mask = multi_modal_data.get("video_noise_mask")
     raw_audio_edit_mask = multi_modal_data.get("audio_noise_mask")
+    if resolve_minimax_h3_exact_output_size(diffusion_sampling_params) is not None and any(
+        value is not None for value in (source_video, source_audio, raw_video_edit_mask, raw_audio_edit_mask)
+    ):
+        raise OmniClientError("MiniMax H3 exact_output_size currently does not support latent-mask editing")
     if (source_video is not None or source_audio is not None) and (
         raw_video_edit_mask is None and raw_audio_edit_mask is None
     ):

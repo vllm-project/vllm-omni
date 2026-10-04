@@ -86,6 +86,7 @@ from vllm_omni.model_executor.models.minimax_h3.encoder_processing import (
     PreparedEncoderInputs,
     encode_media,
     prepare_encoder_inputs,
+    resolve_minimax_h3_exact_output_size,
 )
 from vllm_omni.model_executor.models.minimax_h3.long_video import validate_encoded_frame_limit
 from vllm_omni.model_executor.models.minimax_h3.preprocessing import (
@@ -373,8 +374,19 @@ def _minimax_h3_output_canvas(
 ) -> tuple[int, int]:
     """The decoded frame size, which the upscaler moves when it runs."""
     if target is None:
-        return int(shape["height"]), int(shape["width"])
+        return int(shape.get("output_height") or shape["height"]), int(shape.get("output_width") or shape["width"])
     return target.height, target.width
+
+
+def _minimax_h3_output_crop_kwargs(shape: Mapping[str, Any]) -> dict[str, tuple[int, int]]:
+    if shape.get("output_height") is None:
+        return {}
+    return {
+        "crop_offset": (
+            (int(shape["height"]) - int(shape["output_height"])) // 2,
+            (int(shape["width"]) - int(shape["output_width"])) // 2,
+        )
+    }
 
 
 def _minimax_h3_post_process(output, output_type: str = "np"):
@@ -2135,6 +2147,7 @@ class MiniMaxH3Pipeline(
         max_pending: int = 2,
         batch_frames: int = 17,
         video_codec_options: dict[str, str] | None = None,
+        crop_offset: tuple[int, int] = (0, 0),
     ) -> bytes:
         """Decode and encode one output on the worker without full-video materialization.
 
@@ -2173,6 +2186,7 @@ class MiniMaxH3Pipeline(
                     max_pending=max_pending,
                     video_codec_options=video_codec_options,
                     crop=(height, width),
+                    crop_offset=crop_offset,
                 )
         if not videos:
             return b""
@@ -2207,6 +2221,7 @@ class MiniMaxH3Pipeline(
         *,
         height: int,
         width: int,
+        crop_offset: tuple[int, int] = (0, 0),
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # Denoise just ended: its freed activation pages must not stay mapped
         # through the VAE decode peak. Decoding needs only the ViT decoder
@@ -2219,7 +2234,8 @@ class MiniMaxH3Pipeline(
                 enabled=True,
             ):
                 video = self.video_vae.decode_latent(video_latent)
-        video = video[..., :height, :width].contiguous()
+        top, left = crop_offset
+        video = video[..., top : top + height, left : left + width].contiguous()
         with self._component_on_device(self.audio_vae):
             audio = self.audio_vae.decode_latent(audio_latent)
         audio = self._offload_model_cpu_stage_output(audio)
@@ -2744,6 +2760,18 @@ class MiniMaxH3Pipeline(
         sampling: Any,
     ) -> dict[str, Any]:
         extra = sampling.extra_args or {}
+        exact_size = resolve_minimax_h3_exact_output_size(sampling)
+        if exact_size is not None:
+            additional = getattr(getattr(self, "od_config", None), "additional_config", None) or {}
+            for feature in ("latent_upscale", "latent_refine"):
+                effective = extra[feature] if feature in extra else additional.get(feature)
+                if effective is not None and effective is not False:
+                    raise OmniClientError(f"MiniMax H3 exact_output_size cannot be combined with {feature}")
+            aligned_size = tuple((value + 31) // 32 * 32 for value in exact_size)
+            if (conditioning.height, conditioning.width) != aligned_size:
+                raise OmniClientError("MiniMax H3 exact_output_size does not match the aligned encoder canvas")
+            if conditioning.video_edit_clean_rows is not None or conditioning.audio_edit_clean_rows is not None:
+                raise OmniClientError("MiniMax H3 exact_output_size currently does not support latent-mask editing")
         continuation = resolve_continuation(
             extra, task=conditioning.task, step_execution=bool(getattr(self.od_config, "step_execution", False))
         )
@@ -2917,6 +2945,8 @@ class MiniMaxH3Pipeline(
             "keyframe_images": [],
             "height": conditioning.height,
             "width": conditioning.width,
+            "output_height": exact_size[0] if exact_size is not None else None,
+            "output_width": exact_size[1] if exact_size is not None else None,
             "num_frames": conditioning.num_frames,
             "latent_t": conditioning.latent_t,
             "latent_h": conditioning.height // 16,
@@ -2978,6 +3008,7 @@ class MiniMaxH3Pipeline(
         upscale_target = context.get("latent_upscale")
         latent_refine = context.get("latent_refine")
         height, width = _minimax_h3_output_canvas(context, upscale_target)
+        crop_kwargs = _minimax_h3_output_crop_kwargs(context)
         videos = []
         audios = []
         for output_seed in _minimax_h3_output_seeds(context["seed"], num_outputs):
@@ -3013,6 +3044,7 @@ class MiniMaxH3Pipeline(
                         width=width,
                         video_codec_options=context["video_codec_options"],
                         batch_frames=context["preencode_batch_frames"],
+                        **crop_kwargs,
                     )
                 )
                 audios.append(None)
@@ -3022,6 +3054,7 @@ class MiniMaxH3Pipeline(
                     audio_latent,
                     height=height,
                     width=width,
+                    **crop_kwargs,
                 )
                 # Rebind rather than append the expression: the local would
                 # otherwise keep the decoded frames' device storage alive for the
@@ -3172,6 +3205,8 @@ class MiniMaxH3Pipeline(
                 _STEP_SHAPE: {
                     "height": context["height"],
                     "width": context["width"],
+                    "output_height": context.get("output_height"),
+                    "output_width": context.get("output_width"),
                     "latent_t": context["latent_t"],
                     "latent_h": context["latent_h"],
                     "latent_w": context["latent_w"],
@@ -3403,6 +3438,7 @@ class MiniMaxH3Pipeline(
         if upscale_target is not None:
             video_latent = self._upscaled_latent(video_latent, upscale_target)
         height, width = _minimax_h3_output_canvas(shape, upscale_target)
+        crop_kwargs = _minimax_h3_output_crop_kwargs(shape)
         if shape.get("preencode_mp4", False):
             video = self.decode_to_mp4(
                 video_latent,
@@ -3411,6 +3447,7 @@ class MiniMaxH3Pipeline(
                 width=width,
                 video_codec_options=shape.get("video_codec_options"),
                 batch_frames=shape.get("preencode_batch_frames", 17),
+                **crop_kwargs,
             )
             audio = None
         else:
@@ -3419,6 +3456,7 @@ class MiniMaxH3Pipeline(
                 audio_latent,
                 height=height,
                 width=width,
+                **crop_kwargs,
             )
             video = self._offload_model_cpu_stage_output(_prepare_minimax_h3_video_output(video))
             self._release_stage_cache()
