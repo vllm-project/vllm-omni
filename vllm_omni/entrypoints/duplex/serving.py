@@ -34,6 +34,7 @@ from vllm_omni.engine.duplex.events import (
     SessionReplaced,
     SessionResumed,
     SessionResyncRequired,
+    SessionUpdated,
 )
 from vllm_omni.engine.duplex.messages import DuplexSessionError
 from vllm_omni.entrypoints.duplex.realtime_input import RealtimeEnvelope, ResumeRequest, parse_resume_request
@@ -114,6 +115,10 @@ class OmniDuplexSessionHandler:
         #: are negotiated on the session but live on the per-connection
         #: envelope, so a reconnect has to be handed them back.
         self._input_defaults: dict[str, RealtimeInputDefaults] = {}
+        #: Live connection envelopes keyed by session id. ``session.updated``
+        #: arrives on the session-scoped pump; the envelope that must apply the
+        #: new wire defaults lives on the read loop, so the pump looks it up here.
+        self._live_envelopes: dict[str, RealtimeEnvelope] = {}
         self._pumps: dict[str, asyncio.Task[None]] = {}
 
     # ------------------------------------------------------------------ #
@@ -150,6 +155,7 @@ class OmniDuplexSessionHandler:
                     return
             if pending_command is not None:
                 await self._submit_wire_event(attachment, envelope, pending_command, send_json)
+            self._live_envelopes[attachment.handle.session_id] = envelope
             self._input_defaults[attachment.handle.session_id] = envelope.defaults
             await self._read_loop(websocket, envelope, attachment, send_json)
             await self._drain_terminal_pump(attachment)
@@ -361,6 +367,7 @@ class OmniDuplexSessionHandler:
         remembered = self._input_defaults.get(session_id)
         if remembered is not None:
             envelope.defaults = remembered
+        self._live_envelopes[session_id] = envelope
         self._start_pump(handle, None)
         return _Attachment(handle=handle, generation=resumed.attachment_generation)
 
@@ -478,6 +485,8 @@ class OmniDuplexSessionHandler:
                         attachment_generation=credentials.attachment_generation,
                         resume_token=credentials.resume_token,
                     )
+                if isinstance(event, SessionUpdated):
+                    self._apply_accepted_session_defaults(session_id, event.session)
                 await self._send_event(session_id, event)
                 if isinstance(event, SessionClosed):
                     close_reason = event.reason or event.type
@@ -490,6 +499,7 @@ class OmniDuplexSessionHandler:
             self._pumps.pop(session_id, None)
             self._resync_required_sessions.discard(session_id)
             self._input_defaults.pop(session_id, None)
+            self._live_envelopes.pop(session_id, None)
             attachment = None
             with suppress(Exception):
                 attachment = await self._attachment_registry.close(session_id)
@@ -649,10 +659,20 @@ class OmniDuplexSessionHandler:
         except DuplexCommandError as exc:
             await send_json(envelope.command_error_payload(exc))
             return
-        # ``translate`` folds a session.update's audio settings into the
-        # envelope; remember them so a later reconnect starts where this left off.
+        # Remember accepted wire defaults for reconnect. Mid-session
+        # session.update must not land here until session.updated (see pump).
         self._input_defaults[attachment.handle.session_id] = envelope.defaults
         await self._submit_command(attachment, envelope, command, send_json)
+
+    def _apply_accepted_session_defaults(self, session_id: str, session_payload: Mapping[str, object]) -> None:
+        """Apply wire defaults only after the engine accepted a session.update."""
+        envelope = self._live_envelopes.get(session_id)
+        if envelope is not None:
+            envelope.apply_accepted_session(session_payload)
+            self._input_defaults[session_id] = envelope.defaults
+            return
+        remembered = self._input_defaults.get(session_id) or RealtimeInputDefaults()
+        self._input_defaults[session_id] = remembered.with_session_payload(session_payload)
 
     async def _submit_command(
         self,

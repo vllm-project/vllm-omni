@@ -598,6 +598,24 @@ def test_realtime_envelope_first_message_classification() -> None:
     assert autostarted.pending_command_payload == {"type": "input_audio_buffer.commit"}
 
 
+def test_session_update_does_not_mutate_defaults_until_accepted() -> None:
+    """#7636 Issue 10: rejected session.update must not change append decode defaults."""
+    envelope = RealtimeEnvelope.from_query_params({"model": "m"})
+    assert envelope.defaults.input_audio_format == "pcm16"
+
+    envelope.translate(
+        {
+            "type": "session.update",
+            "session": {"model": "another-model", "input_audio_format": "pcm_f32le"},
+        }
+    )
+    # Engine would reject the model change; wire defaults stay pcm16 until session.updated.
+    assert envelope.defaults.input_audio_format == "pcm16"
+
+    envelope.apply_accepted_session({"input_audio_format": "pcm_f32le"})
+    assert envelope.defaults.input_audio_format == "pcm_f32le"
+
+
 def test_parse_resume_request_requires_the_three_fields_only() -> None:
     request = parse_resume_request({"session_id": "s", "resume_token": "t", "last_received_server_event_seq": 3})
     assert request is not None
