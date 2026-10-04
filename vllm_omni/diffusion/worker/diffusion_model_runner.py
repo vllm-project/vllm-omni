@@ -1079,6 +1079,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         finished_req_ids = scheduler_output.finished_req_ids
         for request_id in finished_req_ids:
             self.state_cache.pop(request_id, None)
+        self._drop_retired_input_batch()
 
         if (
             getattr(self.od_config, "diffusion_kv_mode", DiffusionKVCacheMode.DENSE_LEGACY)
@@ -1086,6 +1087,12 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
             and finished_req_ids
         ):
             self.remove_diffusion_kv_requests(list(finished_req_ids))
+
+    def _drop_retired_input_batch(self) -> None:
+        """A cached batch must not prolong the lifetime of retired dense state."""
+        batch = getattr(self, "input_batch", None)
+        if batch is not None and any(self.state_cache.get(s.request_id) is not s for s in batch.states):
+            self.input_batch = None
 
     def _update_states(self, scheduler_output: DiffusionSchedulerOutput) -> tuple[list[StepRequestState], list[str]]:
         """Resolve cached state and create state for newly admitted requests."""
@@ -1216,6 +1223,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
             prepared_states.append(state)
 
         if not prepared_states:
+            self._drop_retired_input_batch()
             return prepared_states, None, error_outputs
         input_batch = InputBatch.make_batch(
             prepared_states,
@@ -1247,6 +1255,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         for state in states:
             if interrupted or state.request_denoise_completed:
                 self.state_cache.pop(state.request_id, None)
+        self._drop_retired_input_batch()
 
     def execute_stepwise(self, scheduler_output: DiffusionSchedulerOutput) -> BatchRunnerOutput:
         """Execute one step for one scheduled request and return runner output."""
@@ -1350,6 +1359,12 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                 in_diffusion_kv_memory_profile=in_diffusion_kv_memory_profile,
             )
         except Exception:
+            # A failed batched forward retires every request in this wave.
+            for request_id in scheduler_output.scheduled_cached_reqs.request_ids:
+                self.state_cache.pop(request_id, None)
+            for new_req in scheduler_output.scheduled_new_reqs:
+                self.state_cache.pop(new_req.request_id, None)
+            self._drop_retired_input_batch()
             if installed_request_ids:
                 self.remove_diffusion_kv_requests(installed_request_ids)
             raise

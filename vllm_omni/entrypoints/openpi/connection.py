@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """WebSocket connection for robot policy inference (OpenPI protocol).
 
@@ -29,7 +29,7 @@ mappings.
 from __future__ import annotations
 
 import asyncio
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from typing import Any
 
 import msgspec
@@ -48,6 +48,7 @@ MAX_OPENPI_PAYLOAD_BYTES = 64 * 1024 * 1024
 _MISSING = object()
 # Upper bound on the per-connection set of seen session ids.
 MAX_TRACKED_SESSIONS = 1024
+MAX_PENDING_OBSERVATIONS = 8
 
 
 def _pack_numpy(obj: Any) -> Any:
@@ -176,6 +177,7 @@ class RobotRealtimeConnection:
         self._current_session_id: str | None = None
         # Session ids seen on this connection, most-recently-used last.
         self._seen_sessions: OrderedDict[str, None] = OrderedDict()
+        self._pending_messages: deque[dict[str, Any]] = deque()
 
     def reset(self) -> None:
         self._current_session_id = None
@@ -212,9 +214,42 @@ class RobotRealtimeConnection:
             raise ValueError("Invalid request payload")
         return obs
 
+    async def _infer_with_disconnect(self, obs, *, session_id, reset):
+        """Keep receiving while inference runs, with one reader and bounded buffering."""
+        inference = asyncio.create_task(self.serving.infer(obs, session_id=session_id, reset=reset))
+        receiver = asyncio.create_task(self.websocket.receive())
+        try:
+            while True:
+                await asyncio.wait((inference, receiver), return_when=asyncio.FIRST_COMPLETED)
+                if inference.done():
+                    # Preserve an observation/reset already received during the
+                    # inference. Only the outer loop processes buffered messages.
+                    if receiver.done():
+                        if len(self._pending_messages) >= MAX_PENDING_OBSERVATIONS:
+                            await self.websocket.close(code=1013, reason="Too many pending observations")
+                            raise WebSocketDisconnect(1013)
+                        self._pending_messages.append(receiver.result())
+                    return inference.result()
+                msg = receiver.result()
+                if msg.get("type") == "websocket.disconnect":
+                    raise WebSocketDisconnect(msg.get("code", 1000))
+                if len(self._pending_messages) >= MAX_PENDING_OBSERVATIONS:
+                    await self.websocket.close(code=1013, reason="Too many pending observations")
+                    raise WebSocketDisconnect(1013)
+                self._pending_messages.append(msg)
+                receiver = asyncio.create_task(self.websocket.receive())
+        finally:
+            for task in (inference, receiver):
+                if not task.done():
+                    task.cancel()
+            # Await cancellation so AsyncOmni.generate can finish its bounded
+            # abort propagation before this connection is considered retired.
+            await asyncio.gather(inference, receiver, return_exceptions=True)
+
     async def handle_connection(self) -> None:
         """Main loop for OpenPI-compatible policy serving."""
         await self.websocket.accept()
+        self._pending_messages.clear()
 
         try:
             # Send model-specific PolicyServerConfig resolved by serving from
@@ -224,7 +259,9 @@ class RobotRealtimeConnection:
 
             while True:
                 idle_timeout = self._idle_timeout
-                if idle_timeout is None:
+                if self._pending_messages:
+                    msg = self._pending_messages.popleft()
+                elif idle_timeout is None:
                     msg = await self.websocket.receive()
                 else:
                     try:
@@ -275,12 +312,14 @@ class RobotRealtimeConnection:
                             self._current_session_id = session_id
 
                         reset = self._mark_session_seen(session_id)
-                        actions = await self.serving.infer(
+                        actions = await self._infer_with_disconnect(
                             obs,
                             session_id=session_id,
                             reset=reset,
                         )
                         await self.websocket.send_bytes(_pack(actions))
+                except WebSocketDisconnect:
+                    break
                 except Exception:
                     logger.exception("Error handling request")
                     try:
@@ -292,3 +331,5 @@ class RobotRealtimeConnection:
             pass
         except Exception:
             logger.exception("Connection error")
+        finally:
+            self._pending_messages.clear()

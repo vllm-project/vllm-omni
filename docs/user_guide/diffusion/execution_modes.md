@@ -125,6 +125,36 @@ its throughput — see the measured numbers in the
 — so keep `--max-num-seqs 1` unless you need step-level scheduling. Consult the
 selected pipeline's documentation and source for the latest support status.
 
+### Pi0.5 Robot Policy
+
+Pi0.5 supports opt-in step-wise batching through the OpenPI endpoint. From the
+repository root, after following the checkpoint and tokenizer setup in the
+[Pi0.5 recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/lerobot/Pi05.md):
+
+```bash
+vllm serve lerobot/pi05_base --omni \
+  --deploy-config vllm_omni/deploy/pi05_step.yaml --port 8093
+```
+
+The experimental config uses BF16, eager execution and `max_num_seqs=4`.
+Four is a starting capacity, not a model limit or a proven optimum; tune it
+for memory and latency. The existing `pi05.yaml` remains FP32, full-forward,
+capacity one. Use FP32 when validating strict numerical parity; BF16 batching
+requires separate action-quality qualification for your checkpoint and task.
+
+Send concurrent observations on independent WebSocket connections to
+`/v1/realtime/robot/openpi`. Image/text prefix encoding remains per request;
+compatible requests share denoising steps and may have different positive
+`sampling_params.num_inference_steps` values. Custom `timesteps` and `sigmas`
+are unsupported. The response remains one final action chunk, not streamed
+partial actions. Disconnecting a client cancels its pending inference; reset
+messages retain their connection order. More than eight pending messages on
+one busy connection closes it with code 1013.
+
+Capacity one has no cross-request batching benefit and may add scheduler
+overhead. For reproducible full/step comparisons at equal precision, see the
+[Pi0.5 benchmark](https://github.com/vllm-project/vllm-omni/tree/main/benchmarks/diffusion/pi05).
+
 ## Streaming Output
 
 Use `--diffusion-streaming-output` for a pipeline that can produce intermediate

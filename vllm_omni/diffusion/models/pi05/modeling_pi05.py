@@ -685,6 +685,36 @@ class Pi05ForActionPrediction(nn.Module):
 
     # ── Full action generation ───────────────────────────────────────
     @torch.no_grad()
+    def initialize_noise(self, lang_tokens, generator=None):
+        """Request-local FP32 noise, shared by full and step execution."""
+        bsize = lang_tokens.shape[0]
+        shape = (self.action_horizon, self.action_dim)
+        if isinstance(generator, list):
+            if len(generator) != bsize:
+                raise ValueError(f"Expected {bsize} generators, got {len(generator)}.")
+            return torch.stack(
+                [torch.randn(shape, dtype=torch.float32, device=lang_tokens.device, generator=g) for g in generator]
+            )
+        return torch.randn(bsize, *shape, dtype=torch.float32, device=lang_tokens.device, generator=generator)
+
+    @torch.no_grad()
+    def encode_prefix(self, images, image_masks, lang_tokens, lang_masks):
+        """Encode immutable conditioning once per request."""
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+            images, image_masks, lang_tokens, lang_masks
+        )
+        prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+        _, past_key_values = self.paligemma_with_expert.forward(
+            attention_mask=prepare_attention_masks_4d(prefix_att_2d_masks),
+            position_ids=prefix_position_ids,
+            past_key_values=None,
+            inputs_embeds=[prefix_embs, None],
+            use_cache=True,
+        )
+        return prefix_pad_masks, past_key_values
+
+    @torch.no_grad()
     def sample_actions(
         self,
         images: list[torch.Tensor],
@@ -708,38 +738,10 @@ class Pi05ForActionPrediction(nn.Module):
         bsize = lang_tokens.shape[0]
         device = lang_tokens.device
         if noise is None:
-            noise_shape = (self.action_horizon, self.action_dim)
-            if isinstance(generator, list):
-                if len(generator) != bsize:
-                    raise ValueError(f"Expected {bsize} generators, got {len(generator)}.")
-                noise = torch.stack(
-                    [torch.randn(noise_shape, dtype=torch.float32, device=device, generator=item) for item in generator]
-                )
-            else:
-                noise = torch.randn(
-                    bsize,
-                    *noise_shape,
-                    dtype=torch.float32,
-                    device=device,
-                    generator=generator,
-                )
+            noise = self.initialize_noise(lang_tokens, generator)
 
         # 1. Prefix embeddings + mask building.
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
-            images, image_masks, lang_tokens, lang_masks
-        )
-        prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
-        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
-        prefix_att_2d_masks_4d = prepare_attention_masks_4d(prefix_att_2d_masks)
-
-        # 2. Forward prefix through PaliGemma LM, producing a list[(k, v)] cache.
-        _, past_key_values = self.paligemma_with_expert.forward(
-            attention_mask=prefix_att_2d_masks_4d,
-            position_ids=prefix_position_ids,
-            past_key_values=None,
-            inputs_embeds=[prefix_embs, None],
-            use_cache=True,
-        )
+        prefix_pad_masks, past_key_values = self.encode_prefix(images, image_masks, lang_tokens, lang_masks)
 
         # 3. Euler-integrated denoising from t=1 down to t=0.
         dt = -1.0 / num_steps

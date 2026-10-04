@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
@@ -30,8 +33,9 @@ class FakeWebSocket:
     async def receive(self):
         return self._messages.pop(0)
 
-    async def close(self):
+    async def close(self, code=1000, reason=None):
         self.closed = True
+        self.close_code = code
 
 
 def _serving_mock():
@@ -283,7 +287,7 @@ def test_handle_connection_closes_websocket_on_idle_timeout(monkeypatch):
     async def never_receives():
         await asyncio.sleep(1)
 
-    websocket.receive = never_receives
+    monkeypatch.setattr(websocket, "receive", never_receives)
     serving = MagicMock()
     serving.policy_server_config = PolicyServerConfig(
         {
@@ -457,3 +461,133 @@ def test_handle_connection_reset_endpoint_resets_next_infer(monkeypatch):
     serving.reset.assert_called_once_with({})
     assert websocket.sent_bytes[2] == {"status": "reset successful"}
     assert websocket.sent_texts == []
+
+
+def test_disconnect_cancels_pending_inference_and_awaits_cleanup(mocker):
+    async def scenario():
+        incoming: asyncio.Queue[dict] = asyncio.Queue()
+        started, cleaned = asyncio.Event(), asyncio.Event()
+        ws = FakeWebSocket([])
+        mocker.patch.object(ws, "receive", new=incoming.get)
+        serving = mocker.Mock(policy_server_config=PolicyServerConfig({}))
+
+        async def infer(*args, **kwargs):
+            started.set()
+            try:
+                await asyncio.Future()
+            finally:
+                cleaned.set()
+
+        serving.infer = infer
+        await incoming.put({"bytes": openpi_connection._pack({"prompt": "test"})})
+        task = asyncio.create_task(openpi_connection.RobotRealtimeConnection(ws, serving).handle_connection())
+        await asyncio.wait_for(started.wait(), 2)
+        await incoming.put({"type": "websocket.disconnect"})
+        await asyncio.wait_for(task, 2)
+        assert cleaned.is_set()
+        assert len(ws.sent_bytes) == 1  # handshake only; no response to a disconnected client
+
+    asyncio.run(scenario())
+
+
+def test_connection_cancellation_reaps_inference_and_reader(mocker):
+    async def scenario():
+        incoming: asyncio.Queue[dict] = asyncio.Queue()
+        started = asyncio.Event()
+        cleaned = asyncio.Event()
+        ws = FakeWebSocket([])
+        mocker.patch.object(ws, "receive", new=incoming.get)
+        serving = mocker.Mock(policy_server_config=PolicyServerConfig({}))
+
+        async def infer(*args, **kwargs):
+            started.set()
+            try:
+                await asyncio.Future()
+            finally:
+                cleaned.set()
+
+        serving.infer = infer
+        await incoming.put({"bytes": openpi_connection._pack({"prompt": "test"})})
+        before = asyncio.all_tasks()
+        task = asyncio.create_task(openpi_connection.RobotRealtimeConnection(ws, serving).handle_connection())
+        await asyncio.wait_for(started.wait(), 2)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert cleaned.is_set()
+        assert asyncio.all_tasks() == before
+
+    asyncio.run(scenario())
+
+
+def test_pending_observations_overflow_aborts_inference(mocker):
+    async def scenario():
+        incoming: asyncio.Queue[dict] = asyncio.Queue()
+        started, cleaned = asyncio.Event(), asyncio.Event()
+        ws = FakeWebSocket([])
+        mocker.patch.object(ws, "receive", new=incoming.get)
+        serving = mocker.Mock(policy_server_config=PolicyServerConfig({}))
+
+        async def infer(*args, **kwargs):
+            started.set()
+            try:
+                await asyncio.Future()
+            finally:
+                cleaned.set()
+
+        serving.infer = infer
+        message = {"bytes": openpi_connection._pack({"prompt": "test"})}
+        await incoming.put(message)
+        connection = openpi_connection.RobotRealtimeConnection(ws, serving)
+        task = asyncio.create_task(connection.handle_connection())
+        await asyncio.wait_for(started.wait(), 2)
+        for _ in range(openpi_connection.MAX_PENDING_OBSERVATIONS + 1):
+            await incoming.put(message)
+        await asyncio.wait_for(task, 2)
+        assert ws.close_code == 1013
+        assert cleaned.is_set()
+        assert not connection._pending_messages
+
+    asyncio.run(scenario())
+
+
+def test_buffered_reset_is_processed_after_inference(mocker):
+    async def scenario():
+        incoming: asyncio.Queue[dict] = asyncio.Queue()
+        started, release, reset_received = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        ws = FakeWebSocket([])
+
+        async def receive():
+            message = await incoming.get()
+            if message.get("bytes") == reset_payload:
+                reset_received.set()
+            return message
+
+        mocker.patch.object(ws, "receive", new=receive)
+        serving = mocker.Mock(policy_server_config=PolicyServerConfig({}))
+        events = []
+
+        async def infer(*args, **kwargs):
+            events.append("infer")
+            started.set()
+            await release.wait()
+            events.append("complete")
+            return np.zeros((50, 32), dtype=np.float32)
+
+        serving.infer = infer
+        serving.reset.side_effect = lambda obs: events.append("reset")
+        reset_payload = openpi_connection._pack({"endpoint": "reset"})
+        await incoming.put({"bytes": openpi_connection._pack({"prompt": "test"})})
+        task = asyncio.create_task(openpi_connection.RobotRealtimeConnection(ws, serving).handle_connection())
+        await asyncio.wait_for(started.wait(), 2)
+        await incoming.put({"bytes": reset_payload})
+        await asyncio.wait_for(reset_received.wait(), 2)
+        assert events == ["infer"]
+        release.set()
+        # Let the outer reader retire after the buffered reset.
+        await incoming.put({"type": "websocket.disconnect"})
+        await asyncio.wait_for(task, 2)
+        assert events == ["infer", "complete", "reset"]
+        assert openpi_connection._unpack(ws.sent_bytes[2]) == {"status": "reset successful"}
+
+    asyncio.run(scenario())

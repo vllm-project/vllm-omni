@@ -6,6 +6,7 @@ import contextlib
 import os
 import queue
 import threading
+import weakref
 from contextlib import contextmanager
 from types import SimpleNamespace
 
@@ -239,8 +240,8 @@ class _AutoDenoiseProfilerPipeline(DiffusionPipelineProfilerMixin):
 class _InterruptingStepPipeline(_StepPipeline):
     interrupt = True
 
-    def denoise_step(self, state, **kwargs):
-        del state, kwargs
+    def denoise_step(self, input_batch, **kwargs):
+        del input_batch, kwargs
         self.denoise_calls += 1
         return None
 
@@ -629,6 +630,30 @@ def test_step_profiler_reports_denoise_step_as_diffuse(monkeypatch):
 @pytest.mark.cpu
 class TestRunner:
     """DiffusionModelRunner.execute_stepwise"""
+
+    @pytest.mark.parametrize("terminal", ["complete", "cancel", "failure"])
+    def test_retired_dense_kv_is_not_retained_by_cached_input_batch(self, terminal, mocker):
+        runner = _make_runner()
+        state = _make_input_batch_state("req-1", 1.0)
+        state.extra["dense_kv"] = torch.ones(2, 8, 16)
+        kv_ref = weakref.ref(state.extra["dense_kv"])
+        runner.state_cache[state.request_id] = state
+        runner.input_batch = InputBatch.make_batch([state])
+        if terminal == "complete":
+            state.step_index = 1
+            runner._update_states_after([state], runner.input_batch)
+        elif terminal == "cancel":
+            runner._cleanup_finished_step_requests(_make_cached_scheduler_output(finished_req_ids={"req-1"}))
+        else:
+            mocker.patch.object(runner, "_execute_stepwise_core", side_effect=RuntimeError("failed denoise"))
+            with pytest.raises(RuntimeError, match="failed denoise"):
+                runner.execute_stepwise(_make_cached_scheduler_output())
+            # Mock call/exception traceback ownership is not runner retention.
+            mocker.stopall()
+        assert runner.input_batch is None
+        assert not runner.state_cache
+        del state
+        assert kv_ref() is None
 
     @pytest.fixture(autouse=True)
     def mock_platform_memory(self, monkeypatch):
@@ -1097,6 +1122,8 @@ class TestRunner:
         kv_payload = object()
 
         class _CapturingStepPipeline(_StepPipeline):
+            device = torch.device("cpu")
+
             def prepare_encode(self, state, **kwargs):
                 captured["past_key_values"] = getattr(state.sampling, "past_key_values", None)
                 return super().prepare_encode(state, **kwargs)
@@ -1108,7 +1135,6 @@ class TestRunner:
                 req.sampling_params.past_key_values = kv_payload
 
         runner.pipeline = _CapturingStepPipeline()
-        runner.pipeline.device = torch.device("cpu")
         runner.od_config.cfg_kv_collect_func = "collect-cfg"
         runner.kv_transfer_manager = _KVTransferManager()
         monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)

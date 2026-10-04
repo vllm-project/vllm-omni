@@ -1105,3 +1105,137 @@ def test_request_denoising_steps_must_be_a_positive_integer(bad):
     with pytest.raises(ValueError, match="num_inference_steps must be a positive integer"):
         _spy_pipeline(spy).forward(_spy_request(bad))
     assert spy.seen == []
+
+
+def test_step_batch_matches_independent_actions_after_admission_and_reorder(tiny_model, mocker):
+    from vllm_omni.diffusion.models.pi05.pipeline_pi05 import Pi05Pipeline
+    from vllm_omni.diffusion.models.pi05.processor_pi05 import Pi05Processor
+    from vllm_omni.diffusion.worker.input_batch import InputBatch
+    from vllm_omni.diffusion.worker.utils import StepRequestState
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+    pipeline = Pi05Pipeline.__new__(Pi05Pipeline)
+    torch.nn.Module.__init__(pipeline)
+    pipeline.model = tiny_model
+    pipeline.config = Pi05Config()
+    pipeline.processor = mocker.create_autospec(Pi05Processor, instance=True)
+    pipeline.processor.build_model_inputs.side_effect = lambda obs: (
+        [torch.full((1, 3, 224, 224), obs["offset"] / 3) for _ in range(3)],
+        [torch.tensor([i <= obs["offset"]]) for i in range(3)],
+        obs["tokens"],
+        obs["mask"],
+    )
+    pipeline.processor.build_model_outputs.side_effect = lambda actions, obs: actions + obs["offset"]
+    encode = mocker.spy(tiny_model, "encode_prefix")
+    denoise = mocker.spy(tiny_model, "denoise_step")
+    states, expected = {}, {}
+    for index, (name, steps) in enumerate((("a", 2), ("b", 4), ("c", 1))):
+        obs = {
+            "tokens": torch.tensor([[index + 1, 4, 2]]),
+            "mask": torch.tensor([[True, True, index == 0]]),
+            "offset": index,
+        }
+        with torch.inference_mode():
+            expected[name] = (
+                tiny_model.sample_actions(
+                    *pipeline.processor.build_model_inputs(obs),
+                    num_steps=steps,
+                    generator=torch.Generator().manual_seed(index),
+                )
+                + index
+            )
+        states[name] = StepRequestState(
+            request_id=name,
+            sampling=OmniDiffusionSamplingParams(
+                num_inference_steps=steps, generator=torch.Generator().manual_seed(index), extra_args={"robot_obs": obs}
+            ),
+        )
+    encode.reset_mock()
+    denoise.reset_mock()
+    cached = None
+    for names in (("a",), ("b", "a"), ("c", "b"), ("b",), ("b",)):
+        current = [states[name] for name in names]
+        for state in current:
+            if state.latents is None:
+                pipeline.prepare_encode(state)
+        cached = InputBatch.make_batch(current, cached_batch=cached)
+        velocity = pipeline.denoise_step(cached)
+        for row, state in enumerate(current):
+            pipeline.step_scheduler(state, velocity[row : row + 1])
+            if state.denoise_completed:
+                torch.testing.assert_close(
+                    pipeline.post_decode(state).output["actions"], expected[state.request_id], atol=1e-4, rtol=1e-5
+                )
+    assert encode.call_count == 3
+    assert denoise.call_count == 5
+    assert [call.args[2].shape[0] for call in denoise.call_args_list] == [1, 2, 2, 1, 1]
+
+
+@pytest.mark.parametrize("steps", [None, 1, 3, 10])
+def test_step_admission_resolves_default_and_warmup(steps):
+    from vllm_omni.diffusion.models.pi05.pipeline_pi05 import _pi05_pre_process
+    from vllm_omni.diffusion.request import OmniDiffusionRequest
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+    request = OmniDiffusionRequest(
+        request_id="obs",
+        prompt="obs",
+        sampling_params=OmniDiffusionSamplingParams(
+            num_inference_steps=steps, extra_args={"robot_obs": {"state": [0]}}
+        ),
+    )
+    _pi05_pre_process(request, default_steps=7, step_execution=True)
+    assert request.sampling_params.num_inference_steps == (7 if steps is None else steps)
+    assert request.use_step_execution
+    warmup = OmniDiffusionRequest(
+        request_id="warmup", prompt="dummy run", sampling_params=OmniDiffusionSamplingParams()
+    )
+    _pi05_pre_process(warmup, default_steps=7, step_execution=True)
+    assert warmup.use_step_execution is False
+
+
+@pytest.mark.parametrize("bad", [0, -1, True, 2.5, "4"])
+def test_step_admission_rejects_invalid_steps(bad):
+    from vllm_omni.diffusion.models.pi05.pipeline_pi05 import _pi05_pre_process
+    from vllm_omni.diffusion.request import OmniDiffusionRequest
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+    request = OmniDiffusionRequest(
+        request_id="invalid",
+        prompt="test",
+        sampling_params=OmniDiffusionSamplingParams(num_inference_steps=bad, extra_args={"robot_obs": {"state": 0}}),
+    )
+    with pytest.raises(ValueError, match="positive integer"):
+        _pi05_pre_process(request, default_steps=10, step_execution=True)
+
+
+@pytest.mark.parametrize("field", ["timesteps", "sigmas"])
+def test_step_admission_rejects_custom_schedule(field):
+    from vllm_omni.diffusion.models.pi05.pipeline_pi05 import _pi05_pre_process
+    from vllm_omni.diffusion.request import OmniDiffusionRequest
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+    params = OmniDiffusionSamplingParams(num_inference_steps=2, extra_args={"robot_obs": {"state": 0}})
+    setattr(params, field, [1.0, 0.5])
+    request = OmniDiffusionRequest(request_id="custom", prompt="test", sampling_params=params)
+    with pytest.raises(ValueError, match="timesteps/sigmas"):
+        _pi05_pre_process(request, default_steps=10, step_execution=True)
+
+
+def test_step_warmup_uses_request_batch_forward():
+    from vllm_omni.diffusion.models.pi05.pipeline_pi05 import _pi05_pre_process
+    from vllm_omni.diffusion.request import OmniDiffusionRequest
+    from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+    request = OmniDiffusionRequest(
+        request_id="dummy_req_id",
+        prompt={"prompt": "dummy run"},
+        sampling_params=OmniDiffusionSamplingParams(num_inference_steps=1),
+    )
+    _pi05_pre_process(request, default_steps=10, step_execution=True)
+    assert not request.use_step_execution
+    pipeline = _spy_pipeline(_SpyModel())
+    output = pipeline.forward(DiffusionRequestBatch([request]))
+    assert output.output["actions"].shape == (50, 32)
+    assert not output.output["actions"].any()

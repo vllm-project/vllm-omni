@@ -25,6 +25,7 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import fields as dataclass_fields
+from functools import partial
 
 import numpy as np
 import torch
@@ -37,6 +38,8 @@ from vllm_omni.diffusion.models.pi05.modeling_pi05 import Pi05ForActionPredictio
 from vllm_omni.diffusion.models.pi05.processor_pi05 import Pi05Processor
 from vllm_omni.diffusion.models.pi05_pipeline_config import PI05_PIPELINE as PI05_PIPELINE
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.worker.input_batch import InputBatch
+from vllm_omni.diffusion.worker.utils import StepRequestState
 
 logger = init_logger(__name__)
 
@@ -67,6 +70,26 @@ def _comparable(value):
     return list(value) if isinstance(value, (list, tuple)) else value
 
 
+def _build_pi05_config(model_dir: str | None, model_config: dict | None) -> Pi05Config:
+    checkpoint = Pi05Config.from_pretrained(model_dir) if model_dir else None
+    if checkpoint is None:
+        return Pi05Config.from_model_config(model_config)
+    if not model_config:
+        return checkpoint
+    resolved = {item.name: getattr(checkpoint, item.name) for item in dataclass_fields(Pi05Config) if item.init}
+    declared_keys = _checkpoint_declared_keys(model_dir)
+    for key, value in model_config.items():
+        if key in resolved and key in declared_keys and _comparable(value) != _comparable(resolved[key]):
+            logger.warning(
+                "Pi05Pipeline: the deploy config sets %s=%r, overriding %r from the checkpoint.",
+                key,
+                value,
+                resolved[key],
+            )
+    resolved.update(model_config)
+    return Pi05Config.from_model_config(resolved)
+
+
 def _pi05_post_process(x):
     """Module-level identity post-process (picklable across the orchestrator's
     multiprocess boundary — a local closure is not)."""
@@ -77,6 +100,51 @@ def get_pi05_post_process_func(od_config: OmniDiffusionConfig):
     """π0.5 returns actions directly; post-processing is identity."""
     del od_config
     return _pi05_post_process
+
+
+def _resolve_steps(value, default: int) -> int:
+    value = default if value is None else value
+    if isinstance(value, bool) or not isinstance(value, (int, np.integer)) or int(value) < 1:
+        raise ValueError(f"num_inference_steps must be a positive integer, got {value!r}.")
+    return int(value)
+
+
+def _is_dummy_request(prompt, sampling) -> bool:
+    if isinstance(prompt, list):
+        prompt = prompt[0] if prompt else ""
+    prompt = prompt if isinstance(prompt, str) else (prompt.get("prompt") or "")
+    return prompt == "dummy run" or sampling.num_inference_steps == 1
+
+
+def _pi05_pre_process(req: OmniDiffusionRequest, *, default_steps: int, step_execution: bool):
+    sampling = req.sampling_params
+    if step_execution:
+        # Warmup's zero-output forward has no conditioning and cannot share a
+        # denoise batch. Keep its existing full-forward behavior.
+        if not (sampling.extra_args or {}).get("robot_obs") and _is_dummy_request(req.prompt, sampling):
+            req.use_step_execution = False
+        sampling.num_inference_steps = _resolve_steps(sampling.num_inference_steps, default_steps)
+        if req.use_step_execution:
+            if sampling.timesteps is not None or sampling.sigmas is not None:
+                raise ValueError(
+                    "Pi0.5 step execution uses its fixed Euler schedule; timesteps/sigmas are unsupported."
+                )
+    return req
+
+
+def get_pi05_pre_process_func(od_config: OmniDiffusionConfig):
+    default_steps = 10
+    if od_config.step_execution:
+        model_dir = od_config.model
+        if model_dir and not os.path.isdir(model_dir):
+            from vllm_omni.transformers_utils.repo_utils import hf_api
+
+            model_dir = hf_api().snapshot_download(repo_id=model_dir, allow_patterns=["config.json"])
+        # Use precisely the same checkpoint/deploy resolution as the worker,
+        # without constructing the model or downloading weights in the engine.
+        config = _build_pi05_config(model_dir, od_config.model_config)
+        default_steps = config.num_inference_steps
+    return partial(_pi05_pre_process, default_steps=default_steps, step_execution=od_config.step_execution)
 
 
 _LEROBOT_FLOAT32_IN_BFLOAT16 = (
@@ -123,6 +191,8 @@ class Pi05Pipeline(nn.Module):
     Registered as ``"Pi05Pipeline"`` in the diffusion registry.
     """
 
+    supports_step_execution = True
+
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = ""):
         super().__init__()
         self.od_config = od_config
@@ -162,29 +232,7 @@ class Pi05Pipeline(nn.Module):
 
     def _build_config(self, od_config: OmniDiffusionConfig) -> Pi05Config:
         """Read the config from the checkpoint, then let the deploy yaml override it."""
-        checkpoint_config = Pi05Config.from_pretrained(self.model_dir) if self.model_dir else None
-        if checkpoint_config is None:
-            return Pi05Config.from_model_config(od_config.model_config)
-        if not od_config.model_config:
-            return checkpoint_config
-
-        resolved = {
-            item.name: getattr(checkpoint_config, item.name) for item in dataclass_fields(Pi05Config) if item.init
-        }
-        # Only a key the checkpoint actually declares can disagree with the yaml.
-        # Comparing against the dataclass default instead would report every
-        # serving-only field, such as policy_server_config, on every start.
-        declared_keys = _checkpoint_declared_keys(self.model_dir)
-        for key, value in od_config.model_config.items():
-            if key in resolved and key in declared_keys and _comparable(value) != _comparable(resolved[key]):
-                logger.warning(
-                    "Pi05Pipeline: the deploy config sets %s=%r, overriding %r from the checkpoint.",
-                    key,
-                    value,
-                    resolved[key],
-                )
-        resolved.update(od_config.model_config)
-        return Pi05Config.from_model_config(resolved)
+        return _build_pi05_config(self.model_dir, od_config.model_config)
 
     def _resolve_tokenizer_source(self) -> str:
         """Prefer the checkpoint dir if it ships tokenizer files; else PaliGemma."""
@@ -265,6 +313,45 @@ class Pi05Pipeline(nn.Module):
     # Inference
     # ------------------------------------------------------------------
     @torch.inference_mode()
+    def prepare_encode(self, state: StepRequestState, **kwargs) -> StepRequestState:
+        obs = (state.sampling.extra_args or {}).get("robot_obs")
+        if obs is None:
+            raise ValueError("Pi0.5 step execution requires robot_obs.")
+        steps = _resolve_steps(state.sampling.num_inference_steps, self.config.num_inference_steps)
+        images, masks, tokens, token_masks = self.processor.build_model_inputs(obs)
+        state.latents = self.model.initialize_noise(tokens, state.sampling.generator)
+        prefix_mask, kv = self.model.encode_prefix(images, masks, tokens, token_masks)
+        dt = -1.0 / steps
+        # Compute in Python double precision before casting, exactly as the
+        # monolithic loop does. A float32 arange changes rounded timesteps.
+        state.timesteps = torch.tensor([1.0 + i * dt for i in range(steps)], device=tokens.device, dtype=torch.float32)
+        state.step_index = 0
+        state.extra.update(pi05_prefix_mask=prefix_mask, pi05_kv=kv, pi05_dt=dt, pi05_obs=obs)
+        return state
+
+    @torch.inference_mode()
+    def denoise_step(self, input_batch: InputBatch, *, states=None, **kwargs) -> torch.Tensor:
+        # InputBatch order is authoritative: newly admitted requests may precede
+        # previously running ones. Never infer identity from a row's old slot.
+        states = input_batch.states
+        masks = torch.cat([s.extra["pi05_prefix_mask"] for s in states], dim=0)
+        caches = [s.extra["pi05_kv"] for s in states]
+        kv = [
+            (torch.cat([c[i][0] for c in caches], dim=0), torch.cat([c[i][1] for c in caches], dim=0))
+            for i in range(len(caches[0]))
+        ]
+        return self.model.denoise_step(masks, kv, input_batch.latents, input_batch.timesteps)
+
+    def step_scheduler(self, state: StepRequestState, noise_pred: torch.Tensor, **kwargs) -> None:
+        state.latents = state.latents + state.extra["pi05_dt"] * noise_pred
+        state.step_index += 1
+
+    def post_decode(self, state: StepRequestState, **kwargs) -> DiffusionOutput:
+        return DiffusionOutput(
+            output={"actions": self.processor.build_model_outputs(state.latents, state.extra["pi05_obs"])}
+        )
+
+    @torch.inference_mode()
     def forward(self, req: OmniDiffusionRequest, **kwargs) -> DiffusionOutput:
         extra_args = getattr(req.sampling_params, "extra_args", None) or {}
         robot_obs = extra_args.get("robot_obs")
@@ -272,10 +359,8 @@ class Pi05Pipeline(nn.Module):
         if robot_obs is None:
             # Dummy warmup path (no obs): return zeros so engine warmup/capture
             # doesn't crash. Mirrors DreamZero's dummy-run handling.
-            first_prompt = req.prompts[0] if req.prompts else ""
-            prompt = first_prompt if isinstance(first_prompt, str) else (first_prompt.get("prompt") or "")
-            num_steps = getattr(req.sampling_params, "num_inference_steps", None)
-            if prompt == "dummy run" or num_steps == 1:
+            prompt = getattr(req, "prompt", getattr(req, "prompts", []))
+            if _is_dummy_request(prompt, req.sampling_params):
                 logger.info("Pi05Pipeline: dummy warmup request without robot_obs — returning zeros.")
                 return DiffusionOutput(
                     output={
@@ -292,12 +377,8 @@ class Pi05Pipeline(nn.Module):
         images, image_masks, lang_tokens, lang_masks = self.processor.build_model_inputs(robot_obs)
 
         num_steps = getattr(req.sampling_params, "num_inference_steps", None)
-        if num_steps is not None and (
-            isinstance(num_steps, bool) or not isinstance(num_steps, (int, np.integer)) or int(num_steps) < 1
-        ):
-            raise ValueError(f"num_inference_steps must be a positive integer, got {num_steps!r}.")
         if num_steps is not None:
-            num_steps = int(num_steps)
+            num_steps = _resolve_steps(num_steps, self.config.num_inference_steps)
 
         actions = self.model.sample_actions(
             images=images,
