@@ -47,10 +47,12 @@ class NPUExactGraphRunner:
         max_graphs: int = 32,
         component_name: str = "device graph",
         disable_config_hint: str = "disable graph capture",
+        use_shared_pool: bool = True,
     ) -> None:
         self.max_graphs = max(0, int(max_graphs))
         self.component_name = component_name
         self.disable_config_hint = disable_config_hint
+        self._use_shared_pool = use_shared_pool
         self._enabled = self.max_graphs > 0
         self._graphs: dict[tuple[object, ...], CapturedDeviceGraph] = {}
         self._failed_keys: set[tuple[object, ...]] = set()
@@ -108,9 +110,12 @@ class NPUExactGraphRunner:
         npu.synchronize()
         graph = npu.NPUGraph()
         if self._graph_pool is None:
-            from vllm.platforms import current_platform
+            if self._use_shared_pool:
+                from vllm.platforms import current_platform
 
-            self._graph_pool = current_platform.get_global_graph_pool()
+                self._graph_pool = current_platform.get_global_graph_pool()
+            else:
+                self._graph_pool = torch.npu.graph_pool_handle() if hasattr(torch.npu, "graph_pool_handle") else None
         with torch.inference_mode(), npu.graph(graph, pool=self._graph_pool):
             static_outputs = compute(*static_inputs)
         npu.synchronize()

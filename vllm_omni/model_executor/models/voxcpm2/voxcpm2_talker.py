@@ -55,6 +55,25 @@ logger = init_logger(__name__)
 
 _ENABLE_NVTX_PROFILE = False
 
+_VAE_NPU_GRAPH_RUNNER = None
+
+
+def _get_vae_npu_graph_runner():
+    global _VAE_NPU_GRAPH_RUNNER
+    if _VAE_NPU_GRAPH_RUNNER is None:
+        from vllm_omni.platforms.npu.graph_tools import NPUExactGraphRunner
+        torch.npu.config.allow_internal_format = False
+        _VAE_NPU_GRAPH_RUNNER = NPUExactGraphRunner(
+            max_graphs=8,
+            component_name="VoxCPM2 AudioVAE",
+            disable_config_hint="disable the AudioVAE NPUGraph",
+        )
+        if not _VAE_NPU_GRAPH_RUNNER.is_supported():
+            logger.warning("AudioVAE NPUGraph not supported; using eager execution")
+            _VAE_NPU_GRAPH_RUNNER = False
+    return _VAE_NPU_GRAPH_RUNNER if _VAE_NPU_GRAPH_RUNNER is not False else None
+
+
 # Lower bound for the _active_states leak-warn threshold.  The effective
 # threshold is max(_ACTIVE_STATE_LEAK_WARN_MIN, 4 * max_batch_size) so small
 # deployments still get a usable floor instead of a tiny noisy one.
@@ -1582,7 +1601,21 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         if feat.device.type != omni_platform.current_omni_platform.device_type:
             return self.tts.audio_vae.decode(feat)
 
+        vae_dtype = getattr(self, "_vae_dtype", torch.float32)
+        feat = feat.to(dtype=vae_dtype)
         sr_cond = self._get_vae_decode_sr_cond(feat.device)
+
+        graph_runner = _get_vae_npu_graph_runner()
+        if graph_runner is not None and feat.dim() == 3:
+            audio_vae = self.tts.audio_vae
+            result = graph_runner.run(
+                "decode",
+                (feat, sr_cond),
+                (),
+                lambda z, sr: (audio_vae.decode(z, sr_cond=sr),),
+            )
+            return result[0]
+
         if not self._enable_vae_cuda_graph:
             return self.tts.audio_vae.decode(feat, sr_cond=sr_cond)
 
