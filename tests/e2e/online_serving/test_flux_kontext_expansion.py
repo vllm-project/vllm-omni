@@ -12,7 +12,7 @@ from tests.helpers.mark import hardware_marks
 from tests.helpers.media import generate_synthetic_image
 from tests.helpers.runtime import OmniServer, OmniServerParams, OnlineOmniClient, dummy_messages_from_mix_data
 
-pytestmark = [pytest.mark.diffusion, pytest.mark.slow]
+pytestmark = [pytest.mark.diffusion, pytest.mark.core_model]
 
 EDIT_PROMPT = "Transform this modern, geometrist image into a Vincent van Gogh style impressionist painting."
 NEGATIVE_PROMPT = "blurry, low quality, modern, geometrist"
