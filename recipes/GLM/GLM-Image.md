@@ -108,5 +108,6 @@ Overall summary from the run’s metrics. Rough wall-time split: **Stage 0 (AR)*
 - Memory usage: Roughly **~38 GiB + KV** on Stage 0 (AR) and **~20 GiB** on Stage 1 (DiT+VAE) per the user guide; two 80 GB cards match the default split.
 - Key flags: `--omni` is required; `--deploy-config` is optional unless you use a custom YAML (for example single-GPU).
 - Keep **Transformers ≥ 5.5.1** (this recipe used **5.5.4**) so `glm_image` configs resolve; otherwise Stage 0 can fail at `ModelConfig` validation.
+- VAE patch parallelism: decode-only; enable on stage 1 with `tensor_parallel_size=2` and `parallel_config.vae_patch_parallel_size=2`, plus `--vae-use-tiling`. See `docs/user_guide/examples/online_serving/glm_image.md`.
 - Known limitations: This starter recipe follows the dual-GPU online path documented under `examples/online_serving/glm_image`. The first request may be slower due to warmup.
 - Generation time: about **61 s** wall time end-to-end for the sample above (50 inference steps, 1024×1024).

@@ -6,7 +6,7 @@ GlmImagePipeline implementation for vLLM-Omni.
 This pipeline implements GLM-Image text-to-image generation with:
 - AR stage (vLLM): GLM-Image AR stage generates prior tokens
 - DiT stage: GlmImageTransformer2DModel performs diffusion denoising
-- VAE: AutoencoderKL decodes latents to images
+- VAE: DistributedAutoencoderKL decodes latents to images
 """
 
 from __future__ import annotations
@@ -23,7 +23,6 @@ import numpy as np
 import PIL.Image
 import torch
 from diffusers.image_processor import VaeImageProcessor
-from diffusers.models.autoencoders.autoencoder_kl import AutoencoderKL
 from diffusers.schedulers.scheduling_flow_match_euler_discrete import (
     FlowMatchEulerDiscreteScheduler,
 )
@@ -35,6 +34,7 @@ from transformers import (
 )
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl import DistributedAutoencoderKL
 from vllm_omni.diffusion.distributed.parallel_state import (
     get_cfg_group,
     get_classifier_free_guidance_rank,
@@ -248,7 +248,7 @@ class GlmImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, SupportsCompon
     - AR stage (vLLM): Generates prior image tokens
     - Text encoder (T5EncoderModel): Encodes glyph/text embeddings
     - DiT model (GlmImageTransformer2DModel): Diffusion transformer
-    - VAE (AutoencoderKL): Encodes/decodes images to/from latent space
+    - VAE (DistributedAutoencoderKL): Encodes/decodes images to/from latent space
 
     The pipeline flow:
     1. AR stage provides prior_token_ids (and optionally prior_token_image_ids)
@@ -299,8 +299,8 @@ class GlmImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, SupportsCompon
         self.tokenizer = ByT5Tokenizer.from_pretrained(model_path, subfolder="tokenizer", local_files_only=True)
 
         # Load VAE
-        logger.info("Loading AutoencoderKL (VAE)...")
-        self.vae = AutoencoderKL.from_pretrained(
+        logger.info("Loading DistributedAutoencoderKL (VAE)...")
+        self.vae = DistributedAutoencoderKL.from_pretrained(
             model_path, subfolder="vae", local_files_only=True, torch_dtype=torch.bfloat16
         ).to(self.device)
         self.vae.eval()
