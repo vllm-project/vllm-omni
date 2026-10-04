@@ -181,7 +181,7 @@ steps:
       commands:
         - timeout 20m pytest -s -v tests/diffusion/test_diffusion_worker.py
 
-    - label: "Diffusion · Wan22 Test"
+    - label: "Diffusion · Wan22 Advanced Test"
       agent_pool: mi300_1
       depends_on: amd-build
       mirror_hardwares: [amdproduction]
@@ -205,7 +205,7 @@ steps:
 #     - export VLLM_WORKER_MULTIPROC_METHOD=spawn
 #     - timeout 20m pytest -s -v tests/e2e/offline_inference/test_stable_audio_expansion.py -m "advanced_model and diffusion and L4" --run-level advanced_model
 
-- label: "Engine Test"
+- label: "Engine Test · Merge"
   agent_pool: mi300_1
   depends_on: amd-build
   mirror_hardwares: [amdproduction]

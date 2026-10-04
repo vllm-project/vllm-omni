@@ -201,7 +201,7 @@ steps:
           (cards_2 or cards_3 or cards_4 or cards_5 or cards_6 or cards_7 or cards_8)'
           --run-level "core_model"
 
-    - label: "Diffusion · Wan22 Test"
+    - label: "Diffusion · Wan22 Core Test"
       agent_pool: mi300_1
       depends_on: amd-build
       mirror_hardwares: [amdproduction]
@@ -259,7 +259,7 @@ steps:
       tail -n 100 "$$R2_01_ARTIFACT_DIR/pytest.log" >
       "$$R2_01_ARTIFACT_DIR/pytest-summary.txt"
 
-- label: "Engine Test"
+- label: "Engine Test · Ready"
   agent_pool: mi300_1
   depends_on: amd-build
   mirror_hardwares: [amdproduction]
