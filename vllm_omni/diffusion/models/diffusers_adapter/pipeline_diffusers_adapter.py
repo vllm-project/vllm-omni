@@ -82,6 +82,20 @@ _DIFFUSERS_CONFIG_LOAD_KWARGS = {
     "user_agent",
 }
 
+_TOKEN_ID_PROMPT_FIELDS = (
+    "prompt_ids",
+    "prompt_token_ids",
+    "negative_prompt_ids",
+    "negative_prompt_token_ids",
+)
+_UNSUPPORTED_PROMPT_FIELDS = (
+    *_TOKEN_ID_PROMPT_FIELDS,
+    "prompt_mask",
+    "negative_prompt_mask",
+    "prompt_embeds",
+    "negative_prompt_embeds",
+)
+
 
 class DiffusersAdapterPipeline(nn.Module, DiffusionPipelineProfilerMixin):
     """Black-box adapter that delegates full pipeline execution to a diffusers pipeline.
@@ -503,8 +517,41 @@ class DiffusersAdapterPipeline(nn.Module, DiffusionPipelineProfilerMixin):
 
         return kwargs
 
+    @staticmethod
+    def _validate_prompt_fields(prompt_obj: list[OmniPromptType]) -> None:
+        """Reject conditioning inputs that this adapter does not consume."""
+        for index, prompt in enumerate(prompt_obj):
+            if isinstance(prompt, (list, tuple)):
+                raise ValueError(
+                    "DiffusersAdapterPipeline does not support a token-ID prompt "
+                    f"at index {index}. Pass text through `prompt` or use a native "
+                    "pipeline that supports token IDs."
+                )
+
+            if not isinstance(prompt, dict):
+                continue
+
+            unsupported_fields: list[str] = []
+            for field in _UNSUPPORTED_PROMPT_FIELDS:
+                value = prompt.get(field)
+                if value is None:
+                    continue
+                if field in _TOKEN_ID_PROMPT_FIELDS and isinstance(value, (list, tuple)) and not value:
+                    continue
+                unsupported_fields.append(field)
+
+            if unsupported_fields:
+                fields = ", ".join(unsupported_fields)
+                raise ValueError(
+                    "DiffusersAdapterPipeline does not support prompt field(s) "
+                    f"at index {index}: {fields}. Pass text through `prompt` or use a native "
+                    "pipeline that supports these conditioning inputs."
+                )
+
     def _extract_input(self, prompt_obj: list[OmniPromptType]) -> dict[str, Any]:
         """Extract the text prompts and negative prompts from a list of prompt objects."""
+        self._validate_prompt_fields(prompt_obj)
+
         if len(prompt_obj) == 1:
             if isinstance(prompt_obj[0], str):
                 return {"prompt": prompt_obj[0]}
