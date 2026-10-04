@@ -420,14 +420,16 @@ class NemotronVoiceChatThinkerForConditionalGeneration(nn.Module, HasInnerState,
                 multimodal_outputs["nvc_function_response_consumed_generation"] = [
                     torch.tensor([generation], dtype=torch.int64) for generation in generations
                 ]
-        single_request = isinstance(info_dicts, list) and len(info_dicts) == 1
+        spans = kwargs.get("request_token_spans")
+        single_request = isinstance(info_dicts, list) and len(info_dicts) == 1 and spans and len(spans) == 1
         if self._use_function_head and model_outputs.numel() and single_request:
-            # Only a single-request batch can attribute the batch's last row
-            # to a request.  With several concurrent requests this key is
-            # omitted and postprocess computes each request's token from its
-            # own hidden-state slice instead (and applies any forced token).
+            # Graph output can include padding rows. Use the request's last
+            # scheduled row; postprocess handles batches without row spans.
+            start, end = spans[0]
+            if not 0 <= start < end <= model_outputs.shape[0]:
+                raise ValueError(f"Invalid thinker request token span: {(start, end)}")
             with torch.inference_mode():
-                function_token = self.function_head(model_outputs[-1:, :].to(self._dtype)).argmax(dim=-1)
+                function_token = self.function_head(model_outputs[end - 1 : end, :].to(self._dtype)).argmax(dim=-1)
             info = info_dicts[0]
             request_id = info.get("request_id") if isinstance(info, dict) else None
             session = self._sessions.get(request_id) if isinstance(request_id, str) else None
