@@ -205,6 +205,49 @@ def test_forward_uses_decoder_audio_contract_without_context():
     torch.testing.assert_close(audio, expected)
 
 
+def test_streaming_backend_uses_scheduler_ids_and_releases_segment_state(mocker):
+    model = _make_model(async_chunk=True)
+    backend = mocker.Mock()
+    backend.decode.return_value = [torch.ones(1, 4)]
+    model._streaming_codec = backend
+    out = model.forward(
+        input_ids=torch.tensor([1, 2]),
+        request_ids=["scheduler-id"],
+        model_intermediate_buffer=[{"meta": {"request_id": "external-id", "is_segment_finished": True}}],
+    )
+    call = backend.decode.call_args.kwargs
+    assert call["request_ids"] == ["scheduler-id"]
+    assert call["terminal"] == [True]
+    assert len(call["caches"]) == 1
+    backend.release.assert_called_once_with(["scheduler-id"])
+    assert model._decoder_state_cache == {}
+    torch.testing.assert_close(out.multimodal_outputs["model_outputs"][0], torch.ones(4))
+
+
+def test_empty_terminal_chunk_and_abort_release_streaming_slots(mocker):
+    model = _make_model(async_chunk=True)
+    backend = mocker.Mock()
+    model._streaming_codec = backend
+    model._decoder_state_cache["scheduler-id"] = {}
+    out = model.forward(
+        input_ids=torch.tensor([0]),
+        request_ids=["scheduler-id"],
+        model_intermediate_buffer=[{"meta": {"request_id": "external-id", "finished": True}}],
+    )
+    assert out.multimodal_outputs["model_outputs"][0].numel() == 0
+    backend.decode.assert_not_called()
+    backend.release.assert_called_once_with(["scheduler-id"])
+    model.on_requests_finished({"aborted-id"})
+    assert backend.release.call_args.args == ({"aborted-id"},)
+
+
+@pytest.mark.parametrize("async_chunk", [False, True])
+def test_streaming_config_rejects_cpu_stage(async_chunk):
+    model = _make_model(async_chunk=async_chunk, stage_connector_config={"extra": {"decode_streaming": True}})
+    with pytest.raises(ValueError, match="CUDA/BF16"):
+        _load_weights_noop(model)
+
+
 def test_forward_reads_current_model_intermediate_buffer_for_full_payload():
     """Full-payload sync mode must decode connector codec ids, not placeholders."""
     model = _make_model()

@@ -82,6 +82,40 @@ vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice \
     --omni --port 8091 --trust-remote-code
 ```
 
+### Stateful codec in a two-stage deployment
+
+For deployments that need separate Talker and Code2Wav workers, CUDA/BF16
+Code2Wav can opt into `StreamingCodecDecoder`. It keeps causal convolution
+history and attention KV per request and decodes only the new frames. Save
+this overlay and pass its path to `--deploy-config`:
+
+```yaml
+base_config: qwen3_tts_high_concurrency_mrv2_single_gpu.yaml
+connectors:
+  connector_of_shared_memory:
+    extra:
+      decode_streaming: true
+      # Include streams waiting between chunks in this budget.
+      decode_streaming_num_slots: 128
+stages:
+  - stage_id: 1
+    max_num_seqs: 128
+    async_scheduling: true
+```
+
+The example colocates both workers on one GPU. To separate them, set stage 1
+`devices: "1"` and top-level `cuda_mps: false`. `decode_batch_max_size` limits
+codec batches; `decode_cudagraph_batch_sizes` selects batch buckets. Graphs
+cover the configured initial, steady and ramp chunk sizes; other shapes run
+eagerly. Stage 1 `enforce_eager: true` disables both codec graph backends.
+
+The backend is opt-in and requires `async_chunk: true`. ICL voice cloning
+retains the existing anchored-reference decoder. If the state slot budget is
+exhausted, new requests use the existing decoder until they finish. Floating
+point results can differ from the original decoder; validate quality and
+end-to-end throughput for your workload. The fused single-stage profile
+remains the recommended starting point for single-GPU throughput.
+
 ## Verification
 
 **Quick smoke test with curl (CustomVoice):**
