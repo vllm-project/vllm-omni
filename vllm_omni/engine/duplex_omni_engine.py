@@ -37,6 +37,7 @@ from vllm_omni.engine.orchestrator import OrchestratorBase
 
 if TYPE_CHECKING:
     from vllm_omni.engine.duplex.commands import DuplexCommand
+    from vllm_omni.engine.duplex.delivery import DuplexOutputBuffer
 
 logger = init_logger(__name__)
 
@@ -151,6 +152,7 @@ class DuplexOmniEngine(AsyncOmniEngine):
         session_id: str,
         session_config: DuplexSessionConfig,
         *,
+        output_buffer: DuplexOutputBuffer,
         timeout: float | None = _DEFAULT_CONTROL_TIMEOUT_S,
     ) -> DuplexControlResultMessage:
         control_id = uuid.uuid4().hex
@@ -159,6 +161,7 @@ class DuplexOmniEngine(AsyncOmniEngine):
                 control_id=control_id,
                 session_id=session_id,
                 session_config=session_config,
+                output_buffer=output_buffer,
             ),
             control_id=control_id,
             operation="open",
@@ -171,10 +174,14 @@ class DuplexOmniEngine(AsyncOmniEngine):
         session_id: str,
         session_config: DuplexSessionConfig,
         *,
+        output_buffer: DuplexOutputBuffer,
         timeout: float | None = _DEFAULT_CONTROL_TIMEOUT_S,
     ) -> DuplexControlResultMessage:
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, lambda: self._open_session(session_id, session_config, timeout=timeout))
+        return await loop.run_in_executor(
+            None,
+            lambda: self._open_session(session_id, session_config, output_buffer=output_buffer, timeout=timeout),
+        )
 
     def _close_session(
         self,
