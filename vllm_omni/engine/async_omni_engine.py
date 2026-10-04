@@ -5,8 +5,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import shutil
+import threading
 import time
 from collections.abc import Mapping, Sequence
 from typing import Any, Literal, cast
@@ -33,6 +35,8 @@ from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.inputs.data import OmniInteractionPrompt, OmniSamplingParams
 
 logger = init_logger(__name__)
+
+_PreparedAddRequest = tuple[StageSubmissionMessage, list[AddCompanionRequestMessage]]
 
 
 class AsyncOmniEngine(OmniEngineBase):
@@ -527,49 +531,120 @@ class AsyncOmniEngine(OmniEngineBase):
         a queue + coroutine-switch round-trip.  The Orchestrator receives a
         ready-to-submit OmniEngineCoreRequest.
         """
-        try:
-            msg = self._build_add_request_message(
-                request_id=request_id,
-                prompt=prompt,
-                prompt_text=prompt_text,
-                sampling_params_list=sampling_params_list,
-                final_stage_id=final_stage_id,
-                final_output_stage_ids=final_output_stage_ids,
-                arrival_time=arrival_time,
-                lora_request=lora_request,
-                tokenization_kwargs=tokenization_kwargs,
-                trace_headers=trace_headers,
-                priority=priority,
-                data_parallel_rank=data_parallel_rank,
-                reasoning_ended=reasoning_ended,
-                resumable=resumable,
-            )
-        except BaseException:
-            if isinstance(prompt, dict):
-                for artifact_dir in prompt.pop(REQUEST_ARTIFACT_DIRS_KEY, None) or ():
-                    if isinstance(artifact_dir, str):
-                        shutil.rmtree(artifact_dir, ignore_errors=True)
-            raise
-        # CFG companions are built before the parent is admitted, so the group
-        # is all-or-nothing: a build failure raises here, nothing is enqueued,
-        # and the caller sees the error. Admitting the parent first would leave
-        # an orphan holding scheduler and KV capacity that can never complete,
-        # because a model whose guidance is mandatory cannot decode a request
-        # whose companion never arrived.
-        companions: list[AddCompanionRequestMessage] = []
-        try:
-            if self.prompt_expand_func is not None and final_stage_id > 0:
-                effective_spl = msg.sampling_params_list
-                stage0_params = effective_spl[0] if effective_spl else None
-                if stage0_params is not None:
-                    companions = self._build_cfg_companions(
-                        request_id, msg.original_prompt, stage0_params, effective_spl
-                    )
+        prepared = self._prepare_add_request(
+            request_id=request_id,
+            prompt=prompt,
+            prompt_text=prompt_text,
+            sampling_params_list=sampling_params_list,
+            final_stage_id=final_stage_id,
+            final_output_stage_ids=final_output_stage_ids,
+            arrival_time=arrival_time,
+            lora_request=lora_request,
+            tokenization_kwargs=tokenization_kwargs,
+            trace_headers=trace_headers,
+            priority=priority,
+            data_parallel_rank=data_parallel_rank,
+            reasoning_ended=reasoning_ended,
+            resumable=resumable,
+        )
+        assert prepared is not None
+        self._commit_prepared_add_request(request_id, prepared)
 
+    def _input_processing_lock(self) -> threading.RLock:
+        """Serialize input processor access across sync and async admissions."""
+        lock = getattr(self, "_input_processor_lock", None)
+        if lock is None:
+            # Tests and lightweight integrations may bypass OmniEngineBase.__init__.
+            lock = threading.RLock()
+            self._input_processor_lock = lock
+        return lock
+
+    def _prepare_add_request(
+        self,
+        request_id: str,
+        prompt: EngineCoreRequest | PromptType,
+        prompt_text: str | None = None,
+        sampling_params_list: Sequence[Any] | None = None,
+        final_stage_id: int = 0,
+        final_output_stage_ids: Sequence[int] | None = None,
+        arrival_time: float | None = None,
+        lora_request: Any = None,
+        tokenization_kwargs: dict[str, Any] | None = None,
+        trace_headers: Mapping[str, str] | None = None,
+        priority: int = 0,
+        data_parallel_rank: int | None = None,
+        reasoning_ended: bool | None = None,
+        *,
+        resumable: bool = False,
+        cancelled: threading.Event | None = None,
+    ) -> _PreparedAddRequest | None:
+        """Build the parent and CFG requests without admitting either one."""
+        with self._input_processing_lock():
+            if cancelled is not None and cancelled.is_set():
+                return None
+            try:
+                msg = self._build_add_request_message(
+                    request_id=request_id,
+                    prompt=prompt,
+                    prompt_text=prompt_text,
+                    sampling_params_list=sampling_params_list,
+                    final_stage_id=final_stage_id,
+                    final_output_stage_ids=final_output_stage_ids,
+                    arrival_time=arrival_time,
+                    lora_request=lora_request,
+                    tokenization_kwargs=tokenization_kwargs,
+                    trace_headers=trace_headers,
+                    priority=priority,
+                    data_parallel_rank=data_parallel_rank,
+                    reasoning_ended=reasoning_ended,
+                    resumable=resumable,
+                )
+            except BaseException:
+                if isinstance(prompt, dict):
+                    for artifact_dir in prompt.pop(REQUEST_ARTIFACT_DIRS_KEY, None) or ():
+                        if isinstance(artifact_dir, str):
+                            shutil.rmtree(artifact_dir, ignore_errors=True)
+                raise
+
+            # Build companions before admission so a guided request remains
+            # all-or-nothing if companion preprocessing fails.
+            companions: list[AddCompanionRequestMessage] = []
+            try:
+                if self.prompt_expand_func is not None and final_stage_id > 0:
+                    effective_spl = msg.sampling_params_list
+                    stage0_params = effective_spl[0] if effective_spl else None
+                    if stage0_params is not None:
+                        companions = self._build_cfg_companions(
+                            request_id, msg.original_prompt, stage0_params, effective_spl
+                        )
+            except BaseException:
+                self._discard_prepared_add_request(request_id, (msg, companions))
+                raise
+
+            prepared = (msg, companions)
+            if cancelled is not None and cancelled.is_set():
+                self._discard_prepared_add_request(request_id, prepared)
+                return None
+            return prepared
+
+    def _discard_prepared_add_request(self, request_id: str, prepared: _PreparedAddRequest) -> None:
+        """Release resources held by a prepared request that will not be queued."""
+        msg, _companions = prepared
+        for artifact_dir in msg.request_artifact_dirs or ():
+            shutil.rmtree(artifact_dir, ignore_errors=True)
+        if isinstance(msg.original_prompt, dict):
+            msg.original_prompt.pop(REQUEST_ARTIFACT_DIRS_KEY, None)
+        stage_pools = getattr(self, "stage_pools", None)
+        if stage_pools:
+            stage_pools[0].release_binding(request_id)
+
+    def _commit_prepared_add_request(self, request_id: str, prepared: _PreparedAddRequest) -> None:
+        """Admit a fully prepared request and its companions to the orchestrator."""
+        msg, companions = prepared
+        try:
             self.request_queue.sync_q.put(msg)
         except BaseException:
-            for artifact_dir in msg.request_artifact_dirs or ():
-                shutil.rmtree(artifact_dir, ignore_errors=True)
+            self._discard_prepared_add_request(request_id, prepared)
             raise
         finally:
             if isinstance(msg.original_prompt, dict):
@@ -601,23 +676,54 @@ class AsyncOmniEngine(OmniEngineBase):
         *,
         resumable: bool = False,
     ) -> None:
-        """Async add_request API."""
-        self.add_request(
-            request_id=request_id,
-            prompt=prompt,
-            prompt_text=prompt_text,
-            sampling_params_list=sampling_params_list,
-            final_stage_id=final_stage_id,
-            final_output_stage_ids=final_output_stage_ids,
-            arrival_time=arrival_time,
-            lora_request=lora_request,
-            tokenization_kwargs=tokenization_kwargs,
-            trace_headers=trace_headers,
-            priority=priority,
-            data_parallel_rank=data_parallel_rank,
-            reasoning_ended=reasoning_ended,
-            resumable=resumable,
+        """Prepare an add request away from the event loop, then admit it.
+
+        Input preprocessing may decode and transform large multimodal payloads.
+        Running it synchronously here prevents API cancellation and other
+        requests from being handled until preprocessing finishes. Preparation
+        does not enqueue work; the final queue commit happens only if this task
+        survives.
+        """
+        loop = asyncio.get_running_loop()
+        cancelled = threading.Event()
+        future = loop.run_in_executor(
+            None,
+            lambda: self._prepare_add_request(
+                request_id=request_id,
+                prompt=prompt,
+                prompt_text=prompt_text,
+                sampling_params_list=sampling_params_list,
+                final_stage_id=final_stage_id,
+                final_output_stage_ids=final_output_stage_ids,
+                arrival_time=arrival_time,
+                lora_request=lora_request,
+                tokenization_kwargs=tokenization_kwargs,
+                trace_headers=trace_headers,
+                priority=priority,
+                data_parallel_rank=data_parallel_rank,
+                reasoning_ended=reasoning_ended,
+                resumable=resumable,
+                cancelled=cancelled,
+            ),
         )
+        try:
+            prepared = await asyncio.shield(future)
+        except asyncio.CancelledError:
+            cancelled.set()
+
+            def discard_late_result(done: asyncio.Future[_PreparedAddRequest | None]) -> None:
+                try:
+                    late_prepared = done.result()
+                except BaseException:
+                    return
+                if late_prepared is not None:
+                    self._discard_prepared_add_request(request_id, late_prepared)
+
+            future.add_done_callback(discard_late_result)
+            raise
+
+        if prepared is not None:
+            self._commit_prepared_add_request(request_id, prepared)
 
     def add_streaming_update(
         self,
@@ -633,18 +739,19 @@ class AsyncOmniEngine(OmniEngineBase):
         resumable: bool = True,
     ) -> None:
         """Send an incremental streaming update for an existing request."""
-        msg = self._build_add_request_message(
-            request_id=request_id,
-            prompt=prompt,
-            prompt_text=prompt_text,
-            sampling_params_list=sampling_params_list,
-            final_stage_id=final_stage_id,
-            final_output_stage_ids=final_output_stage_ids,
-            arrival_time=arrival_time,
-            lora_request=lora_request,
-            resumable=resumable,
-            message_type="streaming_update",
-        )
+        with self._input_processing_lock():
+            msg = self._build_add_request_message(
+                request_id=request_id,
+                prompt=prompt,
+                prompt_text=prompt_text,
+                sampling_params_list=sampling_params_list,
+                final_stage_id=final_stage_id,
+                final_output_stage_ids=final_output_stage_ids,
+                arrival_time=arrival_time,
+                lora_request=lora_request,
+                resumable=resumable,
+                message_type="streaming_update",
+            )
         self.request_queue.sync_q.put(msg)
 
     async def add_streaming_update_async(
