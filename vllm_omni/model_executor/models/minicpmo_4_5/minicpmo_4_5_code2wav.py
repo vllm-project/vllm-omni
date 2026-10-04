@@ -57,7 +57,15 @@ def _tf32_mode(extra: Mapping[str, Any]) -> str:
     raw = os.environ.get("MINICPMO_CODE2WAV_TF32")
     value = raw if raw not in (None, "") else extra.get("code2wav_allow_tf32", False)
     if isinstance(value, str):
-        return {"flow": "flow", "1": "all", "true": "all", "all": "all", "yes": "all"}.get(value.strip().lower(), "off")
+        return {
+            "flow": "flow",
+            "tf32x3": "flow",
+            "3xtf32": "flow",
+            "1": "all",
+            "true": "all",
+            "all": "all",
+            "yes": "all",
+        }.get(value.strip().lower(), "off")
     return "all" if value else "off"
 
 
