@@ -318,3 +318,31 @@ def test_exact_shape_models_receive_unpadded_input_ids(monkeypatch, exact_shape,
     assert seen["counts"] == [3]
     if exact_shape:
         assert sum(seen["counts"]) == seen["input_ids"].numel()
+
+
+def test_connector_only_return_posts_no_pp_token_receive(monkeypatch):
+    """A non-final PP rank under async scheduling must not post the sampled-token receive.
+
+    The AR runner pairs vLLM's async broadcast receive with a last-rank send (#7393). This
+    runner never samples and never sends, so a receive here would be an unmatched collective.
+    """
+    runner = object.__new__(GPUGenerationModelRunner)
+    runner.execute_model_state = None
+    runner.kv_connector_output = None
+    runner.use_async_scheduling = True
+    runner.attach_omni_connector_output = lambda output: output
+    monkeypatch.setattr(
+        gen_runner_module,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_last_rank=False, rank=0, world_size=2, last_rank=1),
+    )
+
+    def fail(*args, **kwargs):
+        pytest.fail("generation runner posted a PP sampled-token receive with no matching send")
+
+    monkeypatch.setattr(torch.distributed, "broadcast", fail)
+    runner._pp_receive_prev_sampled_token_ids_to_input_batch = fail
+
+    output = GPUGenerationModelRunner.sample_tokens(runner)
+    assert output is not None
+    assert not hasattr(runner, "_pp_recv_work") or runner._pp_recv_work is None
