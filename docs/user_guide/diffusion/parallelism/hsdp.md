@@ -1,6 +1,5 @@
 # HSDP Guide
 
-
 ## Table of Content
 
 - [Overview](#overview)
@@ -101,6 +100,31 @@ hardware.
 
 ---
 
+### Ovis-Image: reuse gathered weights within a request
+
+Ovis-Image can retain gathered transformer weights across denoising steps:
+
+```python
+omni = Omni(
+    model="ATH-MaaS/Ovis-Image-7B",
+    parallel_config=DiffusionParallelConfig(
+        cfg_parallel_size=2,
+        use_hsdp=True,
+        hsdp_shard_size=2,
+    ),
+    additional_config={"hsdp_reshard_after_forward": False},
+    enforce_eager=True,
+)
+```
+
+This performs one weight all-gather per block per request instead of repeating
+it at every denoising step. Parameters return to their sharded form before VAE
+decode, including when denoising raises an exception. Each GPU must have room
+for the full transformer plus local shards during denoising; this option does **not** preserve
+the active-request memory savings of blockwise HSDP. The default remains
+`True`, which reshards after every block forward.
+This mode has been validated with eager execution.
+
 ## Example Script
 
 ### Offline Inference
@@ -144,7 +168,7 @@ vllm serve Wan-AI/Wan2.2-T2V-A14B-Diffusers --omni --port 8091 \
 In `DiffusionParallelConfig`:
 
 | Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
+| ----------- | ------ | --------- | ------------- |
 | `use_hsdp` | bool | False | Enable HSDP |
 | `hsdp_shard_size` | int | -1 | Number of GPUs to shard weights across. `-1` = auto (requires other parallelism > 1) |
 | `hsdp_replicate_size` | int | 1 | Number of replica groups. Each group holds a full sharded copy |
