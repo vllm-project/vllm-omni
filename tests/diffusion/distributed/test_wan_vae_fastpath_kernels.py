@@ -788,6 +788,130 @@ def test_cached_conv_chunk_loop_matches_reference_including_mixed_paths(
             assert torch.equal(out, ref), pattern
 
 
+def _first_frame_test_conv(dtype: torch.dtype, **kwargs) -> WanCausalConv3d:
+    options = dict(kernel_size=3, padding=1)
+    options.update(kwargs)
+    conv = WanCausalConv3d(16, 32, **options).eval().to(device="cuda", dtype=dtype)
+    conv.to(memory_format=torch.channels_last_3d)
+    setattr(conv, fp.CFG_ATTR, fp.FastPathConfig(channels_last=True))
+    return conv
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("dtype", ALL_DTYPES)
+@pytest.mark.parametrize("temporal_only", [False, True])
+@pytest.mark.parametrize("start", [None, "Rep"])
+def test_first_frame_conv2d_preserves_following_cached_frame(dtype, temporal_only, start, monkeypatch) -> None:
+    torch.manual_seed(19)
+    kwargs = dict(kernel_size=(3, 1, 1), padding=(1, 0, 0)) if temporal_only else {}
+    conv = _first_frame_test_conv(dtype, **kwargs)
+    chunks = [_dense_5d((2, 16, 1, 7, 11), dtype, True) for _ in range(2)]
+    calls = []
+    original = fp._first_frame_conv2d
+
+    def spy(*args):
+        pair = original(*args)
+        calls.append(pair is not None)
+        return pair
+
+    monkeypatch.setattr(fp, "_first_frame_conv2d", spy)
+    cache = [start]
+    reference_cache = None
+    # Disable TF32 so the FP32 comparison isolates Conv2d/Conv3d accumulation.
+    with torch.backends.cudnn.flags(enabled=True, allow_tf32=False):
+        for index, chunk in enumerate(chunks):
+            expected = WanCausalConv3d.forward(conv, chunk, reference_cache)
+            actual = fp._run_cached_causal_conv(conv, chunk, cache, 0)
+            assert actual.is_contiguous(memory_format=torch.channels_last_3d)
+            tol = dict(rtol=1e-4, atol=1e-5) if dtype is torch.float32 else dict(rtol=2e-2, atol=2e-2)
+            torch.testing.assert_close(actual, expected, **tol)
+            previous = torch.zeros_like(chunk) if index == 0 else chunks[index - 1]
+            assert _bits_equal(cache[0], torch.cat([previous, chunk], dim=2))
+            assert cache[0].is_contiguous(memory_format=torch.channels_last_3d)
+            reference_cache = chunk.clone() if index == 0 and start is None else torch.cat([previous, chunk], dim=2)
+    assert calls == [True], "A later T=1 chunk with history must retain the temporal convolution"
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("dtype", LOW_PRECISION)
+@pytest.mark.parametrize("with_bias", [False, True])
+def test_first_frame_conv2d_deferred_bias_matches_autocast(dtype, with_bias) -> None:
+    torch.manual_seed(20)
+    conv = _first_frame_test_conv(torch.float32)
+    if with_bias:
+        conv.bias.copy_(torch.randn_like(conv.bias))
+    else:
+        conv.register_parameter("bias", None)
+    x = _dense_5d((1, 16, 1, 7, 11), torch.float32, True)
+    cache = [None]
+    with torch.autocast("cuda", dtype=dtype):
+        expected = WanCausalConv3d.forward(conv, x)
+        out, bias = fp._run_cached_causal_conv(conv, x, cache, 0, return_bias=True)
+        assert out.dtype == expected.dtype == dtype
+        if with_bias:
+            assert bias is not None and bias.dtype == dtype
+            assert _bits_equal(bias, conv.bias.to(dtype))
+            out = out + bias.view(1, -1, 1, 1, 1)
+        else:
+            assert bias is None
+    assert isinstance(cache[0], torch.Tensor)
+    assert cache[0].dtype == x.dtype, "Autocast must not round the temporal cache"
+    assert _bits_equal(cache[0], torch.cat([torch.zeros_like(x), x], dim=2))
+    torch.testing.assert_close(out, expected, rtol=2e-2, atol=2e-2)
+
+
+@torch.no_grad()
+@pytest.mark.parametrize(
+    "case,kwargs",
+    [
+        ("lossless", {}),
+        ("multiframe", {}),
+        ("kernel", dict(kernel_size=(3, 5, 5), padding=(1, 2, 2))),
+        ("stride", dict(stride=(1, 2, 2))),
+        ("dilation", dict(padding=(1, 2, 2))),
+        ("groups", {}),
+        ("temporal_padding", dict(padding=(2, 1, 1))),
+    ],
+)
+def test_first_frame_conv2d_declines_unsupported_calls(case, kwargs) -> None:
+    conv = _first_frame_test_conv(torch.float32, **kwargs)
+    if case == "lossless":
+        setattr(conv, fp.CFG_ATTR, fp.FastPathConfig())
+    elif case == "dilation":
+        conv.dilation = (1, 2, 2)
+    elif case == "groups":
+        conv.groups = 2
+        conv.weight = nn.Parameter(conv.weight[:, :8].contiguous(memory_format=torch.channels_last_3d))
+    x = _dense_5d((1, 16, 2 if case == "multiframe" else 1, 7, 11), torch.float32, True)
+    assert fp._first_frame_conv2d(conv, x, conv.bias) is None
+    expected = WanCausalConv3d.forward(conv, x)
+    actual = fp._run_cached_causal_conv(conv, x, [None], 0)
+    assert _bits_equal(actual, expected), "Declined inputs must keep the existing exact fallback"
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("attribute,value", [("padding_mode", "reflect"), ("padding", (0, 1, 1))])
+def test_first_frame_conv2d_declines_nonzero_native_padding(attribute, value) -> None:
+    conv = _first_frame_test_conv(torch.float32)
+    setattr(conv, attribute, value)
+    x = _dense_5d((1, 16, 1, 7, 11), torch.float32, True)
+    assert fp._first_frame_conv2d(conv, x, conv.bias) is None
+
+
+@torch.no_grad()
+def test_first_frame_conv2d_uses_reloaded_weights() -> None:
+    torch.manual_seed(21)
+    conv = _first_frame_test_conv(torch.bfloat16)
+    x = _dense_5d((1, 16, 1, 7, 11), torch.bfloat16, True)
+    before = fp._run_cached_causal_conv(conv, x, [None], 0)
+    replacement = {name: -value.clone() for name, value in conv.state_dict().items()}
+    conv.load_state_dict(replacement)
+    after = fp._run_cached_causal_conv(conv, x, [None], 0)
+    expected = WanCausalConv3d.forward(conv, x)
+    assert not torch.equal(before, after)
+    torch.testing.assert_close(after, expected, rtol=2e-2, atol=2e-2)
+
+
 # --------------------------------------------------------------------------- #
 # Whole decoder
 # --------------------------------------------------------------------------- #
