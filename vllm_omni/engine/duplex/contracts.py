@@ -102,6 +102,9 @@ class DuplexOutputContext:
     segment_finished: bool
     segment_token_ids: tuple[int, ...] = ()
     segment_output_metadata: Mapping[str, object] = field(default_factory=dict)
+    # Set by the engine on a finished ``response_judge`` stage output that
+    # needs no reply; the turn then ends like a model listen decision.
+    response_judge_rejected: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "segment_token_ids", tuple(self.segment_token_ids))

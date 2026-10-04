@@ -17,6 +17,7 @@ from vllm_omni.config.stage_config import (
     StageExecutionType,
     StagePipelineConfig,
 )
+from vllm_omni.model_executor.stage_input_processors.response_judge import RESPONSE_JUDGE_STAGE
 
 _AURA_PROC = "vllm_omni.model_executor.stage_input_processors.aura_omni"
 _QWEN3_TTS_PROC = "vllm_omni.model_executor.stage_input_processors.qwen3_tts"
@@ -74,6 +75,88 @@ AURA_OMNI_PIPELINE = PipelineConfig(
             model_stage="code2wav",
             execution_type=StageExecutionType.LLM_GENERATION,
             input_sources=(2,),
+            final_output=True,
+            final_output_type="audio",
+            engine_output_type="audio",
+            model_arch="Qwen3TTSCode2Wav",
+            sync_process_input_func=f"{_QWEN3_TTS_PROC}.talker2code2wav_token_only",
+            sampling_constraints={"detokenize": True},
+            extras={"tts_args": {"max_instructions_length": 500}},
+            requires_full_payload_input=True,
+        ),
+    ),
+)
+
+
+# Opt-in variant: a response-judge stage between ASR and AURA. A turn that
+# needs no reply (backchannel, cough, noise, side talk) ends at the judge;
+# AURA and TTS do not run. The judge model is set by the deploy config
+# (``deploy/aura_omni_judged.yaml``); the default ``aura_omni`` pipeline above
+# is unchanged and loads no judge.
+AURA_OMNI_JUDGED_PIPELINE = PipelineConfig(
+    model_type="aura_omni_judged",
+    default_deploy_config_name="aura_omni_judged.yaml",
+    model_arch="Qwen3ASRForConditionalGeneration",
+    duplex_plugin="vllm_omni.model_executor.models.aura_omni.duplex.plugin.AuraJudgedDuplexPlugin",
+    stages=(
+        StagePipelineConfig(
+            stage_id=0,
+            model_stage="asr",
+            execution_type=StageExecutionType.LLM_AR,
+            input_sources=(),
+            owns_tokenizer=True,
+            requires_multimodal_data=True,
+            engine_output_type="text",
+            model_arch="Qwen3ASRForConditionalGeneration",
+            sampling_constraints={"detokenize": True},
+        ),
+        StagePipelineConfig(
+            stage_id=1,
+            model_stage=RESPONSE_JUDGE_STAGE,
+            execution_type=StageExecutionType.LLM_AR,
+            input_sources=(0,),
+            owns_tokenizer=True,
+            engine_output_type="text",
+            # Default judge; a deploy config may set another model_arch/runner.
+            model_arch="ResponseJudgeQwen3ForCausalLM",
+            custom_process_input_func=f"{_AURA_PROC}.asr2judge",
+            sampling_constraints={"detokenize": True},
+        ),
+        StagePipelineConfig(
+            stage_id=2,
+            model_stage="aura",
+            execution_type=StageExecutionType.LLM_AR,
+            input_sources=(1,),
+            final_output=True,
+            final_output_type="text",
+            owns_tokenizer=True,
+            requires_multimodal_data=True,
+            engine_output_type="text",
+            model_arch="AuraQwen3VLForConditionalGeneration",
+            custom_process_input_func=f"{_AURA_PROC}.judge2aura",
+            sampling_constraints={"detokenize": True},
+        ),
+        StagePipelineConfig(
+            stage_id=3,
+            model_stage="qwen3_tts",
+            execution_type=StageExecutionType.LLM_AR,
+            input_sources=(2,),
+            owns_tokenizer=True,
+            engine_output_type="latent",
+            model_arch="Qwen3TTSTalkerForConditionalGeneration",
+            custom_process_input_func=f"{_AURA_PROC}.aura2tts",
+            custom_process_next_stage_input_func=f"{_QWEN3_TTS_PROC}.talker2code2wav_full_payload",
+            async_chunk_process_next_stage_input_func=f"{_QWEN3_TTS_PROC}.talker2code2wav_async_chunk",
+            sampling_constraints={
+                "detokenize": False,
+                "stop_token_ids": [2150],
+            },
+        ),
+        StagePipelineConfig(
+            stage_id=4,
+            model_stage="code2wav",
+            execution_type=StageExecutionType.LLM_GENERATION,
+            input_sources=(3,),
             final_output=True,
             final_output_type="audio",
             engine_output_type="audio",

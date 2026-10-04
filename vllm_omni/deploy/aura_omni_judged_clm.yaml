@@ -1,0 +1,32 @@
+# aura_omni_judged.yaml with a CLM (Contrastive-LM) judge on stage 1.
+# CLM is a Qwen3 encoder (last-token pooling) plus projection heads, served
+# with the pooling runner. `model` is a directory prepared for vLLM: the
+# encoder weights, the state head and the fixed option projections
+# (clm_head.safetensors), and config.json with architectures:
+# [ClmDecisionModel] and the matching response_judge options.
+#
+# The encoder is Qwen3-8B (about 16 GB of weights). gpu_memory_utilization
+# below is sized for an 80 GB GPU shared with the other stages; on a smaller
+# GPU, raise it or place stage 1 on its own card (devices).
+base_config: aura_omni_judged.yaml
+pipeline: aura_omni_judged
+
+stages:
+  - stage_id: 1
+    model: /path/to/clm-v0.1-8b-judge
+    model_arch: ClmDecisionModel
+    runner: pooling
+    async_scheduling: false
+    enable_prefix_caching: false
+    gpu_memory_utilization: 0.25
+    max_model_len: 2048
+    max_num_batched_tokens: 2048
+    # CLM state prompts are a few dozen tokens (about 36 on the test
+    # transcripts), above vLLM's default capture sizes (up to 2 * max_num_seqs).
+    compilation_config:
+      cudagraph_capture_sizes: [16, 32, 48, 64, 96, 128, 192, 256]
+    default_pooling_params:
+      task: classify
+    # Clear the base file's chat_yes_no options: the prepared model
+    # directory's config.json carries the CLM response_judge options.
+    hf_overrides: {}

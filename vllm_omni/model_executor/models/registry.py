@@ -467,6 +467,22 @@ _OMNI_MODELS = {
         "qwen3_vl",
         "AuraQwen3VLForConditionalGeneration",
     ),
+    ## Response-judge stage models
+    "ResponseJudgeQwen3ForCausalLM": (
+        "response_judge",
+        "qwen3",
+        "ResponseJudgeQwen3ForCausalLM",
+    ),
+    "LayaDecisionModel": (
+        "response_judge",
+        "laya",
+        "LayaDecisionModel",
+    ),
+    "ClmDecisionModel": (
+        "response_judge",
+        "clm",
+        "ClmDecisionModel",
+    ),
     "MiniMaxH3Encoder": (
         "minimax_h3",
         "encoder",
