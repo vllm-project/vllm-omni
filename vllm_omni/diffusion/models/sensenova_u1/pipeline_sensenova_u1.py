@@ -19,7 +19,9 @@ from __future__ import annotations
 
 import math
 import os
-from collections.abc import Iterable
+import time
+from collections.abc import Callable, Iterable
+from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any, ClassVar
 
@@ -46,7 +48,7 @@ from vllm_omni.diffusion.lora.loader import (
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
-from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.request import DUMMY_DIFFUSION_REQUEST_ID, OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.quantization import resolve_component_quant_config
 from vllm_omni.transformers_utils.configs.sensenova_u1 import (
@@ -102,6 +104,53 @@ SYSTEM_MESSAGE_FOR_GEN = (
     "the user's description, not the language of the prompt. If no language is specified, use the "
     "user's input language."
 )
+
+
+@dataclass(frozen=True)
+class _MixedWarmupConfig:
+    resolutions: tuple[tuple[int, int], ...]
+    text_to_text: bool
+    image_to_text: bool
+    cfg_scale: float | None
+
+
+def _parse_mixed_warmup_config(value: object, grid_factor: int) -> _MixedWarmupConfig | None:
+    """Validate the bounded, opt-in SenseNova mixed-traffic warmup profile."""
+    if value is None:
+        return None
+    if not isinstance(value, dict) or set(value) - {"resolutions", "text_to_text", "image_to_text", "cfg_scale"}:
+        raise ValueError("sensenova_mixed_warmup has an invalid type or unknown key")
+    raw_resolutions = value.get("resolutions", [])
+    if not isinstance(raw_resolutions, list) or len(raw_resolutions) > 3:
+        raise ValueError("sensenova_mixed_warmup.resolutions must contain at most three [width, height] pairs")
+    resolutions = []
+    for pair in raw_resolutions:
+        if (
+            not isinstance(pair, list)
+            or len(pair) != 2
+            or any(type(dimension) is not int or dimension <= 0 for dimension in pair)
+        ):
+            raise ValueError("Each sensenova_mixed_warmup resolution must be a positive [width, height] pair")
+        width, height = pair
+        if width % grid_factor or height % grid_factor or width * height > 4096**2:
+            raise ValueError(
+                f"SenseNova warmup resolutions must be divisible by {grid_factor} and contain at most 4096² pixels"
+            )
+        resolutions.append((width, height))
+    if len(set(resolutions)) != len(resolutions):
+        raise ValueError("sensenova_mixed_warmup.resolutions contains duplicates")
+    text_to_text = value.get("text_to_text", False)
+    image_to_text = value.get("image_to_text", False)
+    if type(text_to_text) is not bool or type(image_to_text) is not bool:
+        raise ValueError("sensenova_mixed_warmup text_to_text/image_to_text must be booleans")
+    cfg_scale = value.get("cfg_scale")
+    if cfg_scale is not None:
+        if type(cfg_scale) not in (int, float) or not math.isfinite(cfg_scale) or cfg_scale <= 0:
+            raise ValueError("sensenova_mixed_warmup.cfg_scale must be a positive finite number")
+        cfg_scale = float(cfg_scale)
+    if not resolutions and not text_to_text and not image_to_text:
+        raise ValueError("sensenova_mixed_warmup must enable at least one request shape")
+    return _MixedWarmupConfig(tuple(resolutions), text_to_text, image_to_text, cfg_scale)
 
 
 # ---------------------------------------------------------------------------
@@ -569,6 +618,18 @@ class SenseNovaU1Pipeline(
         self.patch_size = patch_size
         self.merge_size = merge_size
         self.downsample_ratio = self.model_cfg.downsample_ratio
+        self._mixed_warmup = _parse_mixed_warmup_config(
+            (getattr(od_config, "additional_config", None) or {}).get("sensenova_mixed_warmup"),
+            grid_factor=patch_size * merge_size,
+        )
+        if self._mixed_warmup is not None:
+            logger.info(
+                "SenseNova mixed warmup profile armed: resolutions=%s text_to_text=%s image_to_text=%s",
+                list(self._mixed_warmup.resolutions),
+                self._mixed_warmup.text_to_text,
+                self._mixed_warmup.image_to_text,
+            )
+        self._mixed_warmup_done = False
 
         # Weight sources for diffusers_loader
         self.weights_sources = [
@@ -596,6 +657,10 @@ class SenseNovaU1Pipeline(
     # Helpers
     # -----------------------------------------------------------------------
 
+    def _has_fused_distilled_lora(self) -> bool:
+        """Return whether the configured LoRA is fused at model load time."""
+        return self.od_config.lora_backend == "distill" and bool(self.od_config.lora_path)
+
     def _unsupported_quant_methods_check(self, quant_config: QuantizationConfig | None) -> None:
         """Reject online FP8 combined with distilled LoRA."""
         if (
@@ -605,7 +670,7 @@ class SenseNovaU1Pipeline(
         ):
             return
 
-        if self.od_config.lora_backend == "distill" and self.od_config.lora_path:
+        if self._has_fused_distilled_lora():
             raise ValueError(
                 "SenseNova does not support online FP8 with distilled LoRA "
                 "Use BF16 without quantization for distilled LoRA, or omit the LoRA options for online FP8."
@@ -1294,12 +1359,83 @@ class SenseNovaU1Pipeline(
             layer.values = layer.values.expand(batch_size, *layer.values.shape[1:])
         prepare_flash_kv_cache(kv, current_len=token_hw, batch_size=batch_size)
 
+    def _warm_mixed_shapes(self) -> None:
+        """Run selected mixed request paths before the engine becomes ready.
+
+        The generic engine dummy covers only 512px image-conditioned generation.
+        This optional profile adds short text and text-to-image requests at the
+        operator-selected shapes. The ordinary text request also exercises the
+        existing paged decode runner; this method does not implement its graph
+        capture machinery. Unlike _warm_ar_decode, failures are not swallowed:
+        when invoked by the engine dummy, they abort startup.
+        """
+        config = self._mixed_warmup
+        if config is None or self._mixed_warmup_done:
+            return
+
+        def params(
+            prompt: dict[str, object], width: int, height: int, extra_args: dict[str, object]
+        ) -> SimpleNamespace:
+            request = SimpleNamespace(
+                prompts=[prompt],
+                sampling_params=SimpleNamespace(
+                    width=width,
+                    height=height,
+                    num_inference_steps=1,
+                    seed=42,
+                    extra_args=extra_args,
+                ),
+            )
+            return self._parse_request(request)
+
+        def record(label: str, operation: Callable[[], object]) -> None:
+            started = time.perf_counter()
+            operation()
+            logger.info("SenseNova mixed warmup %s took %.2f s", label, time.perf_counter() - started)
+
+        if config.text_to_text:
+            text_params = params(
+                {"prompt": "Describe the scene briefly.", "modalities": ["text"]},
+                512,
+                512,
+                {"max_tokens": 1},
+            )
+            record("text_to_text", lambda: self._forward_text(text_params, None))
+        if config.image_to_text:
+            image_params = params(
+                {"prompt": "Describe the image.", "modalities": ["text"]},
+                512,
+                512,
+                {"max_tokens": 1},
+            )
+            image = Image.new("RGB", (512, 512), (127, 127, 127))
+            record("image_to_text", lambda: self._forward_text(image_params, [image]))
+        cfg_scale = (
+            config.cfg_scale if config.cfg_scale is not None else (1.0 if self._has_fused_distilled_lora() else 4.0)
+        )
+        for width, height in config.resolutions:
+            image_params = params(
+                {"prompt": "A red cube on a white table", "modalities": ["image"]},
+                width,
+                height,
+                {"cfg_scale": cfg_scale, "think": False},
+            )
+            record(f"text_to_image_{width}x{height}", lambda: self._forward_t2i(image_params))
+        self._mixed_warmup_done = True
+
     @staticmethod
     def _is_warmup_request(req) -> bool:
         is_dummy_run = getattr(req, "is_dummy_run", None)
         if callable(is_dummy_run):
             return bool(is_dummy_run())
         return OmniDiffusionRequest.is_dummy_run_request_id(getattr(req, "request_id", None))
+
+    @staticmethod
+    def _is_engine_dummy_request(req: OmniDiffusionRequest | DiffusionRequestBatch) -> bool:
+        """Exclude prefixed KV-profile requests from the mixed warmup."""
+        if isinstance(req, DiffusionRequestBatch):
+            return req.num_reqs == 1 and req.request_id == DUMMY_DIFFUSION_REQUEST_ID
+        return getattr(req, "request_id", None) == DUMMY_DIFFUSION_REQUEST_ID
 
     def _warm_ar_decode(self) -> None:
         """Run one single-token decode at startup so its compiled region is built.
@@ -1323,7 +1459,8 @@ class SenseNovaU1Pipeline(
 
     @torch.inference_mode()
     def forward(self, req: DiffusionRequestBatch) -> DiffusionOutput:
-        if self._is_warmup_request(req):
+        is_warmup = self._is_warmup_request(req)
+        if is_warmup:
             self._warm_ar_decode()
         p = self._parse_request(req)
 
@@ -1332,10 +1469,19 @@ class SenseNovaU1Pipeline(
         is_text_output = "text" in modalities
 
         if is_text_output:
-            return self._forward_text(p, input_images)
-        if input_images is not None:
-            return self._forward_it2i(p, input_images)
-        return self._forward_t2i(p)
+            output = self._forward_text(p, input_images)
+        elif input_images is not None:
+            output = self._forward_it2i(p, input_images)
+        else:
+            output = self._forward_t2i(p)
+        if self._mixed_warmup is not None:
+            if self._is_engine_dummy_request(req):
+                self._warm_mixed_shapes()
+            elif not is_warmup and not self._mixed_warmup_done:
+                logger.warning_once(
+                    "SenseNova mixed warmup was armed but never ran; the first requests will pay the warmup cost."
+                )
+        return output
 
     def _forward_t2i(self, p) -> DiffusionOutput:
         """Text-to-image generation path."""
