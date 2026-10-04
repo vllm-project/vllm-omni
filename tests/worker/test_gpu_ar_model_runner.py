@@ -1872,6 +1872,7 @@ class TestPreferModelSamplerNoneFallback:
             "minimax_music3",
             "nemotron_voicechat",
             "yue2",  # Always supplies SamplerOutput, including empty/prefill steps.
+            "zonos2",
         }
         assert declarers == expected, (
             "The set of models declaring `prefer_model_sampler` changed:\n"

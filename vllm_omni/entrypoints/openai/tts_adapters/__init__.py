@@ -125,6 +125,7 @@ from vllm_omni.entrypoints.openai.tts_adapters import (  # noqa: E402,F401
     voxcpm2,
     voxtral,
     yue2,
+    zonos2,
 )
 
 __all__ = [

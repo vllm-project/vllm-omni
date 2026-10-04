@@ -1090,3 +1090,31 @@ weights and working memory. The shared cache itself does not move tensors
 between devices; other adapters determine the device of their cached artifacts.
 Separate model-worker caches are not controlled by this section. The process-wide singleton rejects a
 conflicting explicit budget instead of silently ignoring it.
+
+## ZONOS2
+
+Use the standard endpoint with a converted local safetensors checkpoint.
+The [A40 recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/Zyphra/ZONOS2-A40.md) supplies setup/launch
+commands and the qualified B1 profile. Output is mono 44100Hz; streaming
+requires PCM/WAV and supports raw audio or SSE. Speaker extraction is CPU-only.
+
+| Field | ZONOS2 behavior |
+| --- | --- |
+| `input` | Nonempty text, NeMo normalization by default |
+| `language` | Explicit language/alias; omitted English; `Auto` rejected |
+| `voice` | `default` or omitted; one `ref_audio` for cloning |
+| `ref_audio` / `speaker_embedding` | One reference or finite 2048D vector; mutually exclusive; no transcript |
+| `speed` | Native rate bucket; mutually exclusive with rate/bucket extras |
+| `extra_params.quality_buckets` / `quality_values` | Ordered list/feature-name object; mutually exclusive |
+| `seed` | Request-local RNG, not official RNG or cross-batch bit identity |
+| `max_new_tokens` | Up to 1024 frames; hitting the budget is incomplete generation |
+| CFG extras | `emotion_cfg_scale`/`cfg_scale` only accept 1; style instructions rejected |
+
+Quality order is `lufs`, `estimated_snr`, `max_pause`, `estimated_bandlimit_hz`,
+`leading_silence_s`, `trailing_silence_s`. Boolean extras are `text_normalization`,
+`clean_speaker_background`, `accurate_mode`. Unknown extras are rejected.
+
+The B1 default avoids the fixed-set C4 Chinese cap failure. Explicit batching
+is experimental. Prefix caching, async AR scheduling and AR CUDA graphs are
+unsupported. A streaming budget error may follow partial audio; clients must
+handle the error rather than treating it as a successful complete utterance.

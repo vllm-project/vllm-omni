@@ -243,3 +243,21 @@ steps:
             export VLLM_TEST_MINIMAX_H3_LATENT_UPSCALER
             timeout 35m pytest -s -v tests/e2e/online_serving/minimax_h3/test_minimax_h3.py -m 'advanced_model and cuda and diffusion' --run-level 'advanced_model'
         mirror_hardwares: h100_2
+
+  - label: "TTS · ZONOS2 · advanced_model"
+    depends_on: upload-merge-pipeline
+    source_file_dependencies: zonos2_function
+    timeout_in_minutes: 60
+    env:
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+    commands:
+      - uv pip install --system -r requirements/zonos2.txt --overrides requirements/zonos2-overrides.txt
+      # Explicit preparation may download pinned assets; the test stays offline.
+      # An owned cache and preprovisioned paths can be supplied by the agent.
+      - |
+        set -eu
+        ASSET_ROOT="$${ZONOS2_CI_ASSET_ROOT:-$$(mktemp -d -t zonos2-ci-XXXXXX)}"
+        python tools/prepare_zonos2_ci.py --asset-root "$$ASSET_ROOT" --env-file "$$ASSET_ROOT/asset.env"
+        . "$$ASSET_ROOT/asset.env"
+        pytest -sv tests/e2e/zonos2 -m 'advanced_model and cuda and (H100 or B200) and cards_1' --run-level advanced_model

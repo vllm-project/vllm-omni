@@ -150,7 +150,32 @@ x-lingbot-world: &lingbot_world
   - vllm_omni/diffusion/models/lingbot_world/
 
 
+x-zonos2: &zonos2
+  - vllm_omni/model_executor/models/zonos2/
+  - vllm_omni/model_executor/stage_input_processors/zonos2.py
+  - vllm_omni/entrypoints/openai/tts_adapters/
+  - vllm_omni/entrypoints/openai/serving_speech.py
+  - vllm_omni/worker/gpu_model_runner.py
+  - vllm_omni/engine/arg_utils.py
+  - vllm_omni/config/
+  - vllm_omni/core/sched/
+  - vllm_omni/distributed/omni_connectors/
+  - vllm_omni/model_executor/models/registry.py
+  - vllm_omni/transformers_utils/configs/zonos2.py
+  - vllm_omni/deploy/zonos2.yaml
+  - tests/model_executor/models/zonos2/
+  - tests/entrypoints/openai_api/test_zonos2_tts_adapter.py
+  - tests/worker/test_gpu_ar_model_runner.py
+  - requirements/zonos2
+  - tools/prepare_zonos2_ci.py
+  - tools/convert_zonos2_to_safetensors.py
+
 source_file_dependencies:
+  zonos2_core:
+    - *zonos2
+  zonos2_function:
+    - *zonos2
+    - tests/e2e/zonos2/
   # Hardware presets and shared test helpers. Not a job key — do not attach this
   # to a step. Used only when no job-key prefix matches: then a hit keeps every job.
   source_filter_fallback:

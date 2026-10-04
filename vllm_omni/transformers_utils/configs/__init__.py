@@ -37,6 +37,7 @@ _CLASS_TO_MODULE: dict[str, str] = {
     "AuKConfig": "vllm_omni.transformers_utils.configs.auk",
     "SenseNovaU1Config": "vllm_omni.transformers_utils.configs.sensenova_u1",
     "SenseNovaU1MoELLMConfig": "vllm_omni.transformers_utils.configs.sensenova_u1",
+    "Zonos2Config": "vllm_omni.transformers_utils.configs.zonos2",
 }
 
 __all__ = [
@@ -67,6 +68,7 @@ __all__ = [
     "WhisperEncoderConfig",
     "SenseNovaU1Config",
     "SenseNovaU1MoELLMConfig",
+    "Zonos2Config",
 ]
 
 
@@ -99,3 +101,4 @@ from vllm_omni.transformers_utils.configs import sensenova_u1 as _sensenova_u1  
 from vllm_omni.transformers_utils.configs import voxcpm2 as _voxcpm2  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import voxtral_tts as _voxtral_tts  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import yue2 as _yue2  # noqa: F401, E402
+from vllm_omni.transformers_utils.configs import zonos2 as _zonos2  # noqa: F401, E402

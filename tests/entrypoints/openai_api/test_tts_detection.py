@@ -184,6 +184,7 @@ _PIPELINE_STAGES = [
     "tts",
     "encoder",
     "yue2",
+    "zonos2",
 ]
 
 _STAGES = [*_PIPELINE_STAGES, None, "vae", "not_a_real_stage"]

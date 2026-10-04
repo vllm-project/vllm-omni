@@ -31,6 +31,16 @@ For the full list of supported architectures across all modalities, see
 
 CosyVoice3 is intentionally absent: no online example exists for it yet. See its [offline section](../../offline_inference/text_to_speech/README.md#cosyvoice3) instead.
 
+## ZONOS2
+
+Native AR → DAC speech at 44.1kHz supports optional 2048D reference speaker
+conditioning and PCM/WAV/SSE streaming. The recommended A40 profile uses B1,
+eager AR and asynchronous codec chunks. Convert the original checkpoint and
+provision DAC/speaker/TN assets locally. See the
+[A40 recipe](../../../recipes/Zyphra/ZONOS2-A40.md) for verified commands,
+controls, dependency installation and batch/performance limitations.
+No new model-specific Python example is required.
+
 ## Common Quick Start
 
 Launch the server (defaults shown — adjust `--port`, `--gpu-memory-utilization`, etc. as needed):

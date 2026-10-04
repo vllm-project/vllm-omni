@@ -31,6 +31,16 @@ list of supported architectures across all modalities, see
 | IndexTTS-2.5 | native `checkpoints/` bundle | 2 (AR talker + EnhancedCodec + S2Mel DiT + BigVGAN) | ✓ (required) | — | multilingual (`--lang`) + emotion control | 22.05 kHz |
 | Voxtral TTS | `mistralai/Voxtral-4B-TTS-2603` | varies | ✓ | ✓ | voice presets | 24 kHz |
 
+## ZONOS2
+
+Native AR → DAC speech at 44.1kHz supports optional 2048D reference speaker
+conditioning and PCM/WAV/SSE streaming. The recommended A40 profile uses B1,
+eager AR and asynchronous codec chunks. Convert the original checkpoint and
+provision DAC/speaker/TN assets locally. See the
+[A40 recipe](../../../recipes/Zyphra/ZONOS2-A40.md) for verified commands,
+controls, dependency installation and batch/performance limitations.
+No new model-specific Python example is required.
+
 ## Common Quick Start
 
 Most models share this invocation shape:
