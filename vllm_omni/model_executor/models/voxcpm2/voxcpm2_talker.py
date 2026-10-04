@@ -276,6 +276,7 @@ class _RequestState:
     prefill_masks: tuple | None = None
     is_stopping: bool = False
     precomputed_is_stopping: bool | None = None
+    pending_stop_mask_cpu: torch.Tensor | None = None
     prefill_embeds: torch.Tensor | None = None
 
 
@@ -2698,6 +2699,7 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
     ) -> None:
         state.precomputed_stop_logits = stop_logits
         state.precomputed_is_stopping = None
+        state.pending_stop_mask_cpu = None
         state.curr_embed_for_next = next_embed.detach()
         state.prev_feat_embed = next_embed.detach()
         state.curr_prefix_feat_cond = pred_feat[0].detach()
@@ -2810,21 +2812,24 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
             return
 
         stacked = torch.stack([stop_logits[0] for _, stop_logits in pending], dim=0)
-        stop_mask = stacked[:, 1] > stacked[:, 0]
-        stop_mask_cpu = stop_mask.cpu()
+        stop_mask_cpu = torch.empty(len(pending), dtype=torch.bool, pin_memory=True)
+        stop_mask_cpu.copy_(stacked[:, 1] > stacked[:, 0], non_blocking=True)
         for i, (state, _) in enumerate(pending):
-            is_stopping = bool(stop_mask_cpu[i])
-            state.precomputed_is_stopping = is_stopping
-            if is_stopping:
-                state.is_stopping = True
+            state.pending_stop_mask_cpu = stop_mask_cpu[i : i + 1]
 
-    @staticmethod
-    def _should_stop_from_cached_logits(state: _RequestState) -> bool:
+    def _should_stop_from_cached_logits(self, state: _RequestState) -> bool:
         if state.is_stopping:
             return True
         cached = state.precomputed_is_stopping
         if cached is not None:
             return cached
+        if state.pending_stop_mask_cpu is not None:
+            is_stopping = bool(state.pending_stop_mask_cpu[0])
+            state.pending_stop_mask_cpu = None
+            state.precomputed_is_stopping = is_stopping
+            if is_stopping:
+                state.is_stopping = True
+            return is_stopping
         stop_logits = state.precomputed_stop_logits
         if stop_logits is None:
             return False
@@ -3046,6 +3051,7 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
                         logits[i, 1] = 1.0
                         state.precomputed_stop_logits = None
                         state.precomputed_is_stopping = None
+                        state.pending_stop_mask_cpu = None
                     else:
                         logits[i, 0] = stop_logits[0, 0]
                         logits[i, 1] = stop_logits[0, 1]
@@ -3054,6 +3060,7 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
                                 state.is_stopping = state.precomputed_is_stopping
                             state.precomputed_stop_logits = None
                             state.precomputed_is_stopping = None
+                            state.pending_stop_mask_cpu = None
                 elif state and state.prefill_completed:
                     logits[i, 1] = 1.0
                 else:
@@ -3187,6 +3194,7 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
                 state.decode_step_count = 0
                 state.precomputed_stop_logits = None
                 state.precomputed_is_stopping = None
+                state.pending_stop_mask_cpu = None
                 state.last_audio_patch_gpu = None
                 # SamplingParams.seed reaches vLLM's own sampler but never the
                 # CFM noise draws below, so a seeded request threads its seed
