@@ -292,6 +292,10 @@ class OmniEngineBase:
         self.input_processor: InputProcessor | None = None
         self.prompt_transform_func: Any | None = None
         self.prompt_expand_func: Any | None = None
+        # InputProcessor and prompt transforms maintain process-local caches
+        # and mutable request context; async admissions run in worker threads,
+        # so serialize their preparation with synchronous engine callers.
+        self._input_processor_lock = threading.RLock()
         self.supported_tasks: tuple[str, ...] = ("generate",)
         self.default_sampling_params_list: list[OmniSamplingParams] = []
         self.stage_metadata: list[StageRuntimeInfo] = []
