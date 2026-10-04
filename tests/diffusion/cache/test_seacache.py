@@ -29,6 +29,71 @@ from vllm_omni.diffusion.data import DiffusionCacheConfig
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
+@pytest.mark.parametrize("with_control", [False, True])
+def test_real_extractor_keeps_partial_target_but_not_control_in_indicator(with_control, mocker):
+    from vllm_omni.diffusion.cache.teacache.extractors import extract_cosmos3_context
+    from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3 import _GenPrepared
+
+    target = torch.randn(1, 2, 3, 2, 2)
+    controls = [torch.randn_like(target)] if with_control else None
+    mask = torch.tensor([0, 1, 1]).reshape(1, 1, 3, 1, 1)
+    prep = _GenPrepared(
+        hidden_gen=torch.randn(1, 24, 2),
+        time_embed=torch.zeros(1, 2),
+        t=3,
+        h=2,
+        w=2,
+        s_video=12,
+        s_control=12 if with_control else 0,
+        s_action=0,
+        s_sound=0,
+        has_control=with_control,
+        has_action=False,
+        has_sound=False,
+        action_domain_ids=None,
+        ulysses_size=1,
+        use_multi_control_attention=False,
+        multi_control_token_sizes=None,
+        multi_control_weights=None,
+    )
+    module = mocker.Mock()
+    module._gen_preprocess.return_value = prep
+    ctx = extract_cosmos3_context(
+        module,
+        target,
+        torch.tensor([500]),
+        torch.ones(1, 2),
+        torch.ones(1, 2),
+        (3, 2, 2),
+        control_latents=controls,
+        noisy_frame_mask=mask,
+    )
+    assert module._gen_preprocess.call_args.kwargs["control_latents"] is controls
+    assert ctx.hidden_states is prep.hidden_gen
+    assert len(ctx.extra_states["sea_cache_latents"]) == 1
+    assert ctx.extra_states["sea_cache_latents"][0] is target
+    assert ctx.extra_states["sea_cache_noisy_frame_mask"] is mask
+
+
+def test_peer_ineligible_bypasses_and_clears_local_history(monkeypatch):
+    transformer = TinyCosmos3Transformer()
+    metadata = SimpleNamespace(step=0, sigma=0.5, num_steps=4)
+    hook = _apply_test_hook(transformer, metadata)
+    _run_step(transformer, 500, 1.0, hook=hook)
+    metadata.step = 1
+    votes = []
+
+    def peer_bypasses(decision, device):
+        votes.append(decision)
+        return 2
+
+    monkeypatch.setattr(hook, "_synchronize_decision", peer_bypasses)
+    _run_step(transformer, 500, 1.0, hook=hook)
+    assert votes == [0]
+    assert not hook.state_manager._states
+    assert hook.skip_count == 0
+
+
 class TinyCosmos3Transformer(torch.nn.Module):
     """Small model that exposes a cache-neutral execution boundary."""
 
@@ -98,7 +163,7 @@ def _extract_tiny_cosmos3_context(
         run_transformer_blocks=lambda: (module._run_gen_layers(gen_input),),
         postprocess=lambda output: output,
         extra_states={
-            "sea_cache_latents": vision_items,
+            "sea_cache_latents": [hidden_states],
             "sea_cache_noisy_frame_mask": noisy_frame_mask,
         },
     )
@@ -162,6 +227,177 @@ def _apply_test_hook(
         num_inference_steps_callback=lambda: metadata.num_steps,
         extractor_fn=_extract_tiny_cosmos3_context,
     )
+
+
+def _control_inputs(value: float, names=("cond", "cond_no_control", "uncond")):
+    return {name: ([_latent(value)] if name == "cond_no_control" else [_latent(10), _latent(value)]) for name in names}
+
+
+def _execute_control_branches(transformer, hook, inputs):
+    for name, items in inputs.items():
+        with hook.cache_context(name):
+            transformer(hidden_states=items[-1], timestep=torch.tensor([500]), control_latents=items[:-1])
+
+
+@pytest.mark.parametrize("order", [0, 1, 2])
+def test_target_only_indicators_align_branches_with_separate_residuals(monkeypatch, order):
+    transformer = TinyCosmos3Transformer()
+    metadata = SimpleNamespace(step=0, sigma=0.5, num_steps=7)
+    hook = _apply_test_hook(transformer, metadata, SeaCacheConfig(residual_order=order))
+    gate = hook._resolve_gate
+    votes, indicators = [], []
+
+    def observed_gate(state, indicator, step, num_steps):
+        result = gate(state, indicator, step, num_steps)
+        votes.append((step, result))
+        indicators.append(indicator)
+        return result
+
+    monkeypatch.setattr(hook, "_resolve_gate", observed_gate)
+    for step, value in enumerate((1.0, 1.2, 1.4, 1.4, 1.4, 1.4, 1.4)):
+        metadata.step = step
+        inputs = _control_inputs(value)
+        hook.begin_step(tuple(inputs))
+        with torch.inference_mode():
+            _execute_control_branches(transformer, hook, inputs)
+        assert len({vote for s, vote in votes if s == step}) == 1
+        for indicator in indicators[-3:]:
+            assert len(indicator) == 1
+            torch.testing.assert_close(indicator[0], indicators[-1][0])
+        histories = [state.history for state in hook.state_manager._states.values()]
+        assert len({tuple(s for s, _ in history) for history in histories}) == 1
+        assert len({history[-1][1].data_ptr() for history in histories}) == 3
+    assert len(votes) == 21
+    assert hook.full_count == 12 and hook.skip_count == 9
+
+
+@pytest.mark.parametrize("branches", [(), ("cond", "cond"), ("",)])
+def test_begin_step_rejects_invalid_branch_names(branches):
+    hook = _apply_test_hook(TinyCosmos3Transformer(), SimpleNamespace(step=0, sigma=0.5, num_steps=4))
+    with pytest.raises(ValueError, match="branch names"):
+        hook.begin_step(branches)
+
+
+def test_branch_exception_and_refresh_clear_state():
+    transformer = TinyCosmos3Transformer()
+    metadata = SimpleNamespace(step=0, sigma=0.5, num_steps=4)
+    hook = _apply_test_hook(transformer, metadata)
+    with pytest.raises(ValueError, match="forward failed"), hook.cache_context("cond"):
+        hook.begin_step(("cond",))
+        raise ValueError("forward failed")
+    assert not hook.state_manager._states and not hook._active_branches
+    hook.begin_step(("cond",))
+    _run_step(transformer, 500, 1.0, hook=hook)
+    hook.refresh(transformer)
+    assert not hook.state_manager._states
+    assert hook._active_branches == () and hook._last_evaluation_step is None
+
+
+@pytest.mark.parametrize(
+    "active",
+    [
+        ("cond", "uncond"),
+        ("cond", "cond_no_control"),
+        ("cond", "cond_no_control", "uncond"),
+    ],
+)
+def test_guidance_interval_transitions_restart_all_histories(active):
+    transformer = TinyCosmos3Transformer()
+    metadata = SimpleNamespace(step=0, sigma=0.5, num_steps=10)
+    hook = _apply_test_hook(transformer, metadata)
+    schedule = [("cond",), ("cond",), active, active, ("cond",), active]
+    for step, names in enumerate(schedule):
+        metadata.step = step
+        hook.begin_step(names)
+        before = hook.full_count
+        with torch.inference_mode():
+            _execute_control_branches(transformer, hook, _control_inputs(1.0, names))
+        changed = step == 0 or names != schedule[step - 1]
+        assert hook.full_count - before == (len(names) if changed else 0)
+        assert set(hook.state_manager._states) == set(names)
+
+
+def test_repeated_solver_evaluation_resets_history():
+    transformer = TinyCosmos3Transformer()
+    metadata = SimpleNamespace(step=1, sigma=0.5, num_steps=4)
+    hook = _apply_test_hook(transformer, metadata)
+    for value in (1.0, 2.0):
+        hook.begin_step(("cond",))
+        _run_step(transformer, 500, value, hook=hook)
+    assert hook.full_count == 2 and hook.skip_count == 0
+    assert [s for s, _ in hook.state_manager._states["cond"].history] == [1]
+
+
+def test_shape_mismatch_is_resolved_before_rank_vote(monkeypatch):
+    transformer = TinyCosmos3Transformer()
+    metadata = SimpleNamespace(step=0, sigma=0.5, num_steps=4)
+    hook = _apply_test_hook(transformer, metadata)
+    _run_step(transformer, 500, 1.0, hook=hook)
+    metadata.step = 1
+    hook.state_manager._states["cond"].history = [(0, torch.zeros(1, 1, 2))]
+    seen = []
+
+    def vote(compute, device):
+        seen.append(compute)
+        return compute
+
+    monkeypatch.setattr(hook, "_synchronize_decision", vote)
+    _run_step(transformer, 500, 1.0, hook=hook)
+    assert seen == [True]
+    assert hook.full_count == 2 and hook.skip_count == 0
+
+
+def _control_cfg_parallel_worker(rank, world_size, init_method, result_queue):
+    from vllm_omni.diffusion.distributed import parallel_state
+
+    torch.distributed.init_process_group(
+        "gloo",
+        init_method=init_method,
+        rank=rank,
+        world_size=world_size,
+        timeout=datetime.timedelta(seconds=30),
+    )
+    parallel_state._CFG = SimpleNamespace(
+        world_size=world_size, rank_in_group=rank, device_group=torch.distributed.group.WORLD
+    )
+    parallel_state._SP = SimpleNamespace(world_size=1)
+    try:
+        transformer = TinyCosmos3Transformer()
+        metadata = SimpleNamespace(step=0, sigma=0.5, num_steps=8)
+        hook = _apply_test_hook(transformer, metadata, SeaCacheConfig())
+        rows = []
+        # Changing the global tuple must reset even a rank whose local name
+        # remains cond; ownership moves as the no-control branch enters/exits.
+        schedule = [("cond", "uncond")] * 2 + [("cond", "cond_no_control", "uncond")] * 2
+        for step, names in enumerate(schedule):
+            metadata.step = step
+            hook.begin_step(names)
+            local = [name for i, name in enumerate(names) if i % world_size == rank] or [names[0]]
+            before = hook.full_count
+            with torch.inference_mode():
+                _execute_control_branches(transformer, hook, _control_inputs(1.0, local))
+            rows.append(hook.full_count - before)
+        result_queue.put((rank, rows))
+    finally:
+        parallel_state._CFG = None
+        parallel_state._SP = None
+        torch.distributed.destroy_process_group()
+
+
+@pytest.mark.parametrize("world_size", [2, 4])
+def test_target_only_cfg_parallel_uneven_idle_ranks_and_intervals(world_size):
+    context = torch.multiprocessing.get_context("spawn")
+    with context.Manager() as manager:
+        result_queue = manager.Queue()
+        torch.multiprocessing.spawn(
+            _control_cfg_parallel_worker,
+            args=(world_size, get_distributed_init_method("seacache_target_cfg_"), result_queue),
+            nprocs=world_size,
+        )
+        results = [result_queue.get(timeout=2) for _ in range(world_size)]
+    for rank, rows in results:
+        counts = [max(1, sum(i % world_size == rank for i in range(n))) for n in (2, 3)]
+        assert rows == [counts[0], 0, counts[1], 0]
 
 
 def test_config_validation() -> None:
@@ -493,7 +729,7 @@ def test_hook_keeps_three_transfer_branches_separate() -> None:
     assert set(hook.state_manager._states) == set(contexts)
     assert hook.full_count == 3
     assert hook.skip_count == 3
-    assert len(hook.state_manager._states["cond"].previous_indicator) == 2
+    assert len(hook.state_manager._states["cond"].previous_indicator) == 1
     assert len(hook.state_manager._states["cond_no_control"].previous_indicator) == 1
 
 
@@ -590,6 +826,7 @@ def test_backend_selector_and_refresh(monkeypatch: pytest.MonkeyPatch) -> None:
     hook = pipeline.transformer._hook_registry.get_hook(SeaCacheRootHook._HOOK_NAME)
     assert isinstance(hook, SeaCacheRootHook)
     assert callable(getattr(pipeline, "_cache_context_factory", None))
+    assert getattr(pipeline, "_cache_begin_step", None) == hook.begin_step
     for name in ("_seacache_skip", "_seacache_record", "_seacache_residual", "_seacache_last_residual"):
         assert not hasattr(pipeline.transformer, name)
     pipeline._current_step_index = 0
@@ -599,6 +836,7 @@ def test_backend_selector_and_refresh(monkeypatch: pytest.MonkeyPatch) -> None:
     assert hook.full_count == 1
 
     backend.refresh(pipeline, num_inference_steps=7)
+    assert getattr(pipeline, "_cache_begin_step", None) == hook.begin_step
     assert hook.full_count == 0
     assert hook.skip_count == 0
     assert hook.state_manager._states == {}
