@@ -29,6 +29,7 @@ from vllm_omni.diffusion.cache.cachedit.backend import (
     RefreshCacheContextFunc,
     _build_cache_context_refresh,
     _default_get_pipeline_transformer,
+    _make_pipeline_transformer_getter,
     _maybe_build_block_adapter,
     enable_cache_for_dit,
 )
@@ -149,7 +150,7 @@ def enable_cache_for_wan22(pipeline: Any, cache_config: Any) -> RefreshCacheCont
     )
 
     refresh_trans_one = _build_cache_context_refresh(cache_config)
-    refresh_trans_two = _build_cache_context_refresh(cache_config, lambda pipeline: pipeline.transformer_2)
+    refresh_trans_two = _build_cache_context_refresh(cache_config, _make_pipeline_transformer_getter("transformer_2"))
 
     def refresh_cache_context(pipeline: Any, num_inference_steps: int, verbose: bool = True) -> None:
         """Refresh cache context for both transformers with new num_inference_steps.
@@ -837,6 +838,32 @@ def enable_cache_for_krea2(pipeline: Any, cache_config: Any) -> RefreshCacheCont
     return enable_cache_for_dit(pipeline, cache_config, block_adapter)
 
 
+def enable_cache_for_boogu(pipeline: Any, cache_config: Any) -> CacheDiTEnableResult:
+    """Enable Cache-DiT for Boogu's double- and single-stream blocks."""
+    transformer = _default_get_pipeline_transformer(pipeline)
+    # Match upstream Boogu's all-layer Cache-DiT profile. These per-stack
+    # modifiers override only Fn; settings such as Bn remain user-configurable.
+    block_adapter = BlockAdapter(
+        transformer=transformer,
+        blocks=[
+            transformer.double_stream_layers,
+            transformer.single_stream_layers,
+        ],
+        forward_pattern=[
+            ForwardPattern.Pattern_0,
+            ForwardPattern.Pattern_3,
+        ],
+        params_modifiers=[
+            ParamsModifier(cache_config=DBCacheConfig().reset(Fn_compute_blocks=2)),
+            ParamsModifier(cache_config=DBCacheConfig().reset(Fn_compute_blocks=4)),
+        ],
+        has_separate_cfg=pipeline._cache_dit_separate_cfg,
+        check_forward_pattern=False,
+    )
+    refresh = enable_cache_for_dit(pipeline, cache_config, block_adapter)
+    return CacheDiTEnableResult(refresh=refresh, targets=(block_adapter,))
+
+
 def _get_magi2_transformer_block(pipeline: Any) -> torch.nn.Module:
     return pipeline.transformer.block
 
@@ -926,6 +953,7 @@ def register_custom_dit_enablers() -> None:
             "Cosmos3OmniPipeline": enable_cache_for_cosmos3,
             "Krea2Pipeline": enable_cache_for_krea2,
             "Magi2Pipeline": enable_cache_for_magi2,
+            "BooguImagePipeline": enable_cache_for_boogu,
             "MammothModa2DiTPipeline": enable_cache_for_mammothmoda2,
         }
     )
