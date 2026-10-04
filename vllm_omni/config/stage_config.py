@@ -269,6 +269,11 @@ class StagePipelineConfig:
     # next stage over the connector. Only diffusion producers need this; AR
     # stages already send through ``send_full_payload_outputs``.
     stage_output_payload_keys: tuple[str, ...] = ()
+    # Set on an async-chunk receiving stage. The orchestrator calls it with the
+    # original prompt when it submits this stage's prewarm placeholder; it
+    # returns a flat ``{name: Tensor | scalar}`` dict (or ``None``) sent under
+    # ``ASYNC_CHUNK_PREWARM_NS`` so the stage can warm up before chunk 0.
+    async_chunk_prewarm_payload_func: str | None = None
     omni_kv_config: dict[str, Any] | None = None
     scheduler_cls: str | None = None
     # Model subdirectory indirections: for multi-component HF repos where the
@@ -1154,6 +1159,8 @@ def _build_extras(
         extras["prompt_expand_func"] = ps.prompt_expand_func
     if ps.cfg_kv_collect_func:
         extras["cfg_kv_collect_func"] = ps.cfg_kv_collect_func
+    if ps.async_chunk_prewarm_payload_func:
+        extras["async_chunk_prewarm_payload_func"] = ps.async_chunk_prewarm_payload_func
     if ps.extras:
         extras.update(ps.extras)
     return extras

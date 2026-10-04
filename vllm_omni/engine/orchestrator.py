@@ -35,7 +35,7 @@ from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.metrics.stats import IterationStats
 
 from vllm_omni.core.sched.omni_scheduling_coordinator import uses_native_mrv2_data_plane
-from vllm_omni.data_entry_keys import FIRST_AUDIO_KEY, FIRST_AUDIO_REQUIRED_KEY
+from vllm_omni.data_entry_keys import ASYNC_CHUNK_PREWARM_NS, FIRST_AUDIO_KEY, FIRST_AUDIO_REQUIRED_KEY
 from vllm_omni.diffusion.data import is_diffusion_request_started_output
 from vllm_omni.distributed.omni_connectors.utils.config import stage_receives_chunks
 from vllm_omni.engine import OmniEngineCoreRequest
@@ -193,6 +193,41 @@ def build_engine_core_request_from_tokens(
         additional_information=additional_info_payload,
         model_intermediate_buffer=model_intermediate_buffer if isinstance(model_intermediate_buffer, dict) else None,
     )
+
+
+def _attach_async_chunk_prewarm_payload(
+    base_input: dict[str, Any],
+    prompt: Any,
+    stage_client: Any,
+    request_id: str,
+    stage_id: int,
+) -> None:
+    """Add the stage's prewarm payload to its placeholder's additional_information.
+
+    Keys are flat ``f"{ASYNC_CHUNK_PREWARM_NS}.{name}"`` so tensor values stay
+    top-level tensors on the wire. ``prompt`` itself is never mutated.
+    """
+    payload_func = getattr(stage_client, "async_chunk_prewarm_payload_func", None)
+    if not callable(payload_func):
+        return
+    try:
+        payload = payload_func(prompt)
+    except Exception:
+        # The stage still gets everything it needs with chunk 0.
+        logger.warning(
+            "[Orchestrator] req=%s stage=%s: async_chunk prewarm payload failed; submitting the placeholder without it",
+            request_id,
+            stage_id,
+            exc_info=True,
+        )
+        return
+    if not isinstance(payload, dict) or not payload:
+        return
+    additional_information = base_input.get("additional_information")
+    base_input["additional_information"] = {
+        **(additional_information if isinstance(additional_information, dict) else {}),
+        **{f"{ASYNC_CHUNK_PREWARM_NS}.{key}": value for key, value in payload.items()},
+    }
 
 
 @dataclass
@@ -2641,8 +2676,15 @@ class OrchestratorBase:
         request_id: str,
         stage0_request: Any,
         req_state: OrchestratorRequestState,
+        *,
+        attach_prewarm_payload: bool = False,
     ) -> bool:
         """Pre-submit downstream stages for async-chunk mode.
+
+        ``attach_prewarm_payload`` adds each LLM stage's
+        ``async_chunk_prewarm_payload_func`` output to its placeholder. Only the
+        initial add sets it; a re-prewarm would resend the payload for a
+        request the stage already holds.
 
         Returns False when the request was failed and cleaned up in here, so a
         caller still holding ``req_state`` stops instead of recording state on
@@ -2743,6 +2785,18 @@ class OrchestratorBase:
                 base_input["multi_modal_data"] = None
                 base_input["mm_processor_kwargs"] = None
                 downstream_resumable = bool(getattr(stage0_request, "resumable", req_state.streaming.enabled))
+                # Session-owned and resumable requests keep their downstream
+                # request across turns, so they stay on the chunk-0 path.
+                if attach_prewarm_payload and not req_state.session_owned and not downstream_resumable:
+                    # Pass the original prompt: base_input has already dropped
+                    # multi_modal_data, which the payload function may read.
+                    _attach_async_chunk_prewarm_payload(
+                        base_input,
+                        req_state.prompt,
+                        next_pool.stage_client,
+                        request_id,
+                        next_stage_id,
+                    )
                 request = build_engine_core_request_from_tokens(
                     request_id=request_id,
                     prompt=base_input,
@@ -3034,7 +3088,7 @@ class Orchestrator(OrchestratorBase):
             return
 
         if self.async_chunk and stage_id == 0 and final_stage_id > 0:
-            await self._prewarm_async_chunk_stages(request_id, prompt, req_state)
+            await self._prewarm_async_chunk_stages(request_id, prompt, req_state, attach_prewarm_payload=True)
 
     async def _handle_streaming_update(self, msg: StageSubmissionMessage) -> None:
         """Handle a streaming_update message for an existing request."""

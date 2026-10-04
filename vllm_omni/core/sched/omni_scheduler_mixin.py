@@ -7,7 +7,7 @@ import math
 import os
 import queue
 import time
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable, Iterator, Mapping
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -39,19 +39,22 @@ from vllm_omni.core.sched.omni_scheduling_coordinator import (
 from vllm_omni.core.sched.output import (
     OmniChunkRecvHandle,
     OmniNewRequestData,
+    OmniRequestPrewarm,
     OmniSchedulerOutput,
 )
+from vllm_omni.data_entry_keys import ASYNC_CHUNK_PREWARM_NS, deserialize_payload, unflatten_payload
 from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter import (
     OmniChunkTransferAdapter,
 )
 from vllm_omni.distributed.omni_connectors.utils.config import stage_receives_chunks
-from vllm_omni.engine import OmniEngineCoreOutput
+from vllm_omni.engine import AdditionalInformationPayload, OmniEngineCoreOutput
 from vllm_omni.engine.serialization import serialize_additional_information
 from vllm_omni.outputs import OmniConnectorOutput
 
 logger = init_logger(__name__)
 
 _STATS_INTERVAL_S = 1.0
+_ASYNC_CHUNK_PREWARM_PREFIX = f"{ASYNC_CHUNK_PREWARM_NS}."
 
 # Upper bound on how long a request may wait for stage input before the
 # scheduler force-fails it.  Defends against stuck consumer-side requests when
@@ -172,6 +175,9 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
         self._latest_omni_connector_output: OmniConnectorOutput | None = None
         self._init_omni_connector_output_inbox()
         self._pending_data_plane_terminal_req_ids: set[str] = set()
+        # Async-chunk prewarm payloads popped in add_request, keyed by request
+        # id; handed to the runner once by _wrap_omni_scheduler_output.
+        self._pending_request_prewarms: dict[str, dict[str, Any]] = {}
         # Optional per-stage pooling-output decoder hook (dotted path in
         # model_config); applied worker-side before IPC.
         self._pooling_output_decoder = None
@@ -626,12 +632,22 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
                     scheduled_terminal_req_ids,
                 )
             input_coordinator.postprocess_scheduler_output(base)
+        # Every step drains, so each prewarm reaches the runner at most once and
+        # ids freed since add_request are dropped here.
+        pending_prewarms: dict[str, dict[str, Any]] = getattr(self, "_pending_request_prewarms", {})
+        request_prewarms = [
+            OmniRequestPrewarm(request_id=request_id, payload=payload)
+            for request_id, payload in pending_prewarms.items()
+            if request_id in self.requests
+        ]
+        pending_prewarms.clear()
         return OmniSchedulerOutput(
             **base_data,
             finished_requests_needing_kv_transfer=finished_requests_needing_kv_transfer or {},
             pending_input_registrations=pending_input_registrations,
             data_plane_terminal_req_ids=data_plane_terminal_req_ids,
             input_terminal_req_ids=input_terminal_req_ids or set(),
+            pending_request_prewarms=request_prewarms,
         )
 
     def _rewrap_scheduled_new_reqs(self, scheduler_output: SchedulerOutput) -> None:
@@ -916,14 +932,76 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
         orchestrator's terminal update, a window of tens of milliseconds at
         the end of the last segment. Emit the terminal chunk here so the
         downstream stage terminates on the payload path either way.
+
+        A new request id also has its async-chunk prewarm payload moved into
+        scheduler state (see ``_take_async_chunk_prewarm``).
         """
         existing = self.requests.get(request.request_id)
-        if existing is not None and existing.status == RequestStatus.WAITING_FOR_STREAMING_REQ:
+        if existing is None:
+            # Only a fresh prewarm placeholder carries the payload; streaming
+            # updates re-add a live id and are left untouched.
+            self._take_async_chunk_prewarm(request)
+        elif existing.status == RequestStatus.WAITING_FOR_STREAMING_REQ:
             adapter = None if getattr(request, "resumable", False) else self._adapter_owing_terminal(existing)
             if adapter is not None:
                 self._finish_parked_streaming_session(existing, adapter)
                 return
         super().add_request(request)
+
+    def _take_async_chunk_prewarm(self, request: Request) -> None:
+        """Pop the ``ASYNC_CHUNK_PREWARM_NS.*`` entries off a new request.
+
+        The orchestrator ships the prewarm as flat dotted keys in the
+        placeholder's additional_information. Taking them out here keeps them
+        out of the runner's per-request buffer; the deserialized namespace is
+        held in ``_pending_request_prewarms`` until the next scheduler output.
+        A malformed payload is dropped: the prewarm is only an optimization.
+        """
+        pending: dict[str, dict[str, Any]] | None = getattr(self, "_pending_request_prewarms", None)
+        if pending is None:
+            pending = self._pending_request_prewarms = {}
+        # A reused id must not inherit an aborted request's undrained payload.
+        pending.pop(request.request_id, None)
+
+        info = getattr(request, "additional_information", None)
+        if isinstance(info, AdditionalInformationPayload):
+            entries = info.entries
+        elif isinstance(info, dict):
+            entries = info
+        else:
+            return
+        picked = {
+            key: value
+            for key, value in entries.items()
+            if isinstance(key, str) and key.startswith(_ASYNC_CHUNK_PREWARM_PREFIX)
+        }
+        if not picked:
+            return
+        remaining = {key: value for key, value in entries.items() if key not in picked}
+        # serialize_payload maps an empty payload to None, so a placeholder
+        # that carried only the prewarm looks exactly as it would without it.
+        if not remaining:
+            request.additional_information = None
+        elif isinstance(info, AdditionalInformationPayload):
+            request.additional_information = AdditionalInformationPayload(entries=remaining)
+        else:
+            request.additional_information = remaining
+
+        # An OmniPayload TypedDict or a plain dict; both are Mappings.
+        payload: Mapping[str, Any]
+        try:
+            if isinstance(info, AdditionalInformationPayload):
+                payload = deserialize_payload(AdditionalInformationPayload(entries=picked))
+            else:
+                payload = unflatten_payload(picked)
+        except Exception as exc:
+            logger.debug("Dropping malformed async-chunk prewarm for request %s: %s", request.request_id, exc)
+            return
+        prewarm = payload.get(ASYNC_CHUNK_PREWARM_NS)
+        if not isinstance(prewarm, dict) or not prewarm:
+            logger.debug("Dropping malformed async-chunk prewarm for request %s.", request.request_id)
+            return
+        pending[request.request_id] = prewarm
 
     def _adapter_owing_terminal(self, request: Request) -> OmniChunkTransferAdapter | None:
         """The adapter that owes *request*'s downstream stage a terminal chunk.
@@ -995,8 +1073,11 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
         self._purge_finished_from_running(target_request_ids)
         self._resync_streaming_input_counter()
 
+        pending_prewarms = getattr(self, "_pending_request_prewarms", None)
         for request in finished:
             self._free_input_coordinator_request(request.request_id)
+            if pending_prewarms:
+                pending_prewarms.pop(request.request_id, None)
         return finished
 
     def make_stats(self, *args, **kwargs) -> SchedulerStats | None:

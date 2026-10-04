@@ -114,6 +114,9 @@ def _make_guard_runner():
     # Stubbed far enough that a span escaping the guard reaches the real
     # `_prepare_inputs`, i.e. fails the way the reported crash does.
     runner = object.__new__(GPUGenerationModelRunner)
+    # Set by __init__, which object.__new__ skips.
+    runner._prev_step_idle = False
+    runner._failed_optional_model_hooks = set()
     runner.execute_model_state = None
     runner.routed_experts_initialized = False
     runner.speculative_config = None

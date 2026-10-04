@@ -1170,6 +1170,18 @@ class BatchedToken2Wav(nn.Module):
             for row in split
         ]
 
+    def _setup_cache_key(self, features: PromptFeatures) -> tuple[tuple[str, str], int]:
+        bucket_frames = (
+            self._cfm_graph_bucket_frames
+            if self._cfm_graph_wrapper is not None and self._cfm_graph_wrapper.enabled
+            else 0
+        )
+        return (features.cache_key, bucket_frames)
+
+    def has_cached_setup(self, features: PromptFeatures) -> bool:
+        """Whether :meth:`setup_batch` would hit its cache now; read-only."""
+        return self._setup_cache_key(features) in self._setup_cache
+
     def setup_batch(self, features: PromptFeatures, batch_size: int) -> list[BatchedToken2WavState]:
         """Initial states for ``batch_size`` requests sharing one prompt.
 
@@ -1182,14 +1194,9 @@ class BatchedToken2Wav(nn.Module):
         per batch size recomputed identical rows and cached one ~0.3 GiB
         estimator cache copy per request.
         """
-        bucket_frames = (
-            self._cfm_graph_bucket_frames
-            if self._cfm_graph_wrapper is not None and self._cfm_graph_wrapper.enabled
-            else 0
-        )
         # Capture the policy before setup: graph capture may disable the wrapper
         # after padding has already been chosen for these initial states.
-        cache_key = (features.cache_key, bucket_frames)
+        cache_key = self._setup_cache_key(features)
         state = self._setup_cache.get(cache_key)
         if state is not None:
             self._setup_cache.move_to_end(cache_key)

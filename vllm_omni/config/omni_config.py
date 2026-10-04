@@ -1725,6 +1725,10 @@ class BaseVllmOmniStageConfig:
     def cfg_kv_collect_func(self) -> str | None:
         return self.stage_pipeline_config.cfg_kv_collect_func
 
+    @property
+    def async_chunk_prewarm_payload_func(self) -> str | None:
+        return self.stage_pipeline_config.async_chunk_prewarm_payload_func
+
 
 @config(config=ConfigDict(arbitrary_types_allowed=True))
 class VllmOmniARStageConfig(BaseVllmOmniStageConfig):
