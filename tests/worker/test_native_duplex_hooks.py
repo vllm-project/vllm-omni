@@ -1171,57 +1171,241 @@ def test_minicpmo_seeded_text_survives_explicit_initial_listen():
     assert state.pending_speech_context is True
 
 
-@pytest.mark.parametrize("initial_text", [None, "", "Please say hello.", "请说你好。"])
-@pytest.mark.parametrize("speech_envelope", [False, True])
-def test_minicpmo_seeded_context_keeps_assistant_turn_open_until_eos(initial_text, speech_envelope, mocker):
-    from vllm.v1.sample.metadata import SamplingMetadata
+@pytest.mark.parametrize("start_token", ["tts_bos_token_id", "speak_token_id"])
+@pytest.mark.parametrize("repeat_control", [False, True])
+def test_minicpmo_pending_input_survives_empty_response(start_token, repeat_control):
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import _MiniCPMO45Stage0SessionState
 
+    runtime = _stage0_vision_runtime()
+    state = _MiniCPMO45Stage0SessionState(session_id="initial-text")
+    runtime._prepare_session_context(state, {}, runtime_config={"initial_user_text": "Read this aloud."})
+    model, row = _minicpmo_duplex_policy_case(state, {"is_speech": False, "force_listen": True})
+    model._minicpmo45_native_duplex_token_ids_cache = runtime._special_token_ids()
+    model.thinker = SimpleNamespace(get_tokenizer=lambda: runtime.tokenizer)
+
+    def step(seq, accepted, raw):
+        metadata = _native_duplex_sampling_metadata(accepted, unit_token_id=runtime.unit_token_id)
+        logits = torch.full((1, 256), -100.0)
+        logits[0, raw] = 30.0
+        model.prepare_duplex_sampling(logits, metadata, (replace(row, seq=seq),))
+        return model.sample(logits, metadata).sampled_token_ids.item()
+
+    listen = runtime.listen_token_id
+    bos = runtime.tts_bos_token_id
+    start = getattr(runtime, start_token)
+    eos = runtime.turn_eos_token_id
+    runtime._stage_prefill_embeddings_only(state, np.zeros(4, dtype=np.float32), seq=1)
+    assert step(1, [], listen) == listen
+    assert step(1, [listen, -1], 200) == listen  # discarded lookahead
+    assert state.pending_speech_context is True
+
+    row = replace(row, payload={"is_speech": False, "force_listen": False})
+    runtime._stage_prefill_embeddings_only(state, np.zeros(4, dtype=np.float32), seq=2)
+    assert step(2, [], start) == start
+    assert state.pending_speech_context is True
+    assert state.pending_speech_response_open is True
+    accepted = [start]
+    if repeat_control:
+        assert step(2, accepted, listen) == bos
+        accepted.append(bos)
+        assert state.pending_speech_context is True
+        assert state.pending_speech_response_open is True
+    assert step(2, accepted, eos) == eos
+    accepted.append(eos)
+    assert state.pending_speech_context is True
+    assert step(2, accepted, listen) == listen
+
+    # Empty envelopes do not consume the seed, but actual response text does.
+    runtime._stage_prefill_embeddings_only(state, np.zeros(4, dtype=np.float32), seq=3)
+    assert step(3, [], start) == start
+    assert step(3, [start], 200) == 200
+    assert state.pending_speech_context is False
+    assert step(3, [start, 200], eos) == eos
+    assert step(3, [start, 200, eos], listen) == listen
+    runtime._stage_prefill_embeddings_only(state, np.zeros(4, dtype=np.float32), seq=4)
+    assert step(4, [], 200) == listen
+
+
+@pytest.mark.parametrize("force_listen", [False, True])
+def test_minicpmo_base_seed_starts_once_after_forced_listen(force_listen):
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import _MiniCPMO45Stage0SessionState
+
+    runtime = _stage0_vision_runtime()
+    state = _MiniCPMO45Stage0SessionState(session_id="base-initial-text")
+    runtime._prepare_session_context(
+        state,
+        {},
+        runtime_config={"initial_user_text": "Read this aloud.", "initial_user_text_is_tts": True},
+        epoch=0,
+        seq=1,
+    )
+    model, row = _minicpmo_duplex_policy_case(state, {"is_speech": False, "force_listen": force_listen})
+    model._minicpmo45_native_duplex_token_ids_cache = runtime._special_token_ids()
+    model.thinker = SimpleNamespace(get_tokenizer=lambda: runtime.tokenizer)
+
+    def step(seq, accepted, raw):
+        metadata = _native_duplex_sampling_metadata(accepted, unit_token_id=runtime.unit_token_id)
+        logits = torch.full((1, 256), -100.0)
+        logits[0, raw] = 30.0
+        model.prepare_duplex_sampling(logits, metadata, (replace(row, seq=seq),))
+        return model.sample(logits, metadata).sampled_token_ids.item()
+
+    listen = runtime.listen_token_id
+    bos = runtime.tts_bos_token_id
+    eos = runtime.turn_eos_token_id
+    seq = 1
+    runtime._stage_prefill_embeddings_only(state, np.zeros(4, dtype=np.float32), epoch=0, seq=seq)
+    assert state.pending_initial_tts_start is True
+    assert state.pending_speech_context is True
+    assert state.current_turn_ended is True
+    if force_listen:
+        assert step(seq, [], 200) == listen
+        assert step(seq, [listen, -1], 200) == listen  # discarded lookahead
+        assert state.pending_initial_tts_start is True
+        assert state.pending_speech_context is True
+        assert state.pending_speech_response_open is False
+        assert state.current_turn_ended is True
+        assert state.generated_tokens == []
+        row = replace(row, payload={"is_speech": False, "force_listen": False})
+        seq += 1
+        runtime._stage_prefill_embeddings_only(state, np.zeros(4, dtype=np.float32), epoch=0, seq=seq)
+
+    # The explicit TTS prefix opens a response only on its first eligible step.
+    assert step(seq, [], listen) == bos
+    assert state.pending_initial_tts_start is False
+    assert state.pending_speech_context is True
+    assert state.pending_speech_response_open is True
+    assert state.current_turn_ended is False
+    assert step(seq, [bos], listen) == bos
+    assert state.pending_speech_context is True
+    assert step(seq, [bos, bos], 200) == 200
+    assert state.pending_speech_context is False
+    assert state.pending_speech_response_open is False
+    assert step(seq, [bos, bos, 200], eos) == eos
+    assert state.current_turn_ended is True
+    assert step(seq, [bos, bos, 200, eos], listen) == listen
+    generated_tokens = state.generated_tokens.copy()
+    assert step(seq, [bos, bos, 200, eos, listen, -1], 200) == listen
+    assert state.generated_tokens == generated_tokens
+    assert state.current_turn_ended is True
+    assert state.pending_initial_tts_start is False
+
+    runtime._stage_prefill_embeddings_only(state, np.zeros(4, dtype=np.float32), epoch=0, seq=seq + 1)
+    assert step(seq + 1, [], 200) == listen
+    assert state.pending_speech_context is False
+    assert state.pending_speech_response_open is False
+    assert state.pending_initial_tts_start is False
+
+
+@pytest.mark.parametrize("epoch,seq", [(1, 1), (0, 2)])
+def test_minicpmo_base_seed_does_not_restart_after_cancel_or_rebuild(epoch, seq):
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import _MiniCPMO45Stage0SessionState
+
+    runtime = _stage0_vision_runtime()
+    state = _MiniCPMO45Stage0SessionState(session_id="base-rebuilt-text")
+    runtime._prepare_session_context(
+        state,
+        {},
+        runtime_config={"initial_user_text": "Read this aloud.", "initial_user_text_is_tts": True},
+        epoch=epoch,
+        seq=seq,
+    )
+    runtime._stage_prefill_embeddings_only(state, np.zeros(4, dtype=np.float32), epoch=epoch, seq=seq)
+    model, row = _minicpmo_duplex_policy_case(state, {"is_speech": False, "force_listen": False})
+    model._minicpmo45_native_duplex_token_ids_cache = runtime._special_token_ids()
+    model.thinker = SimpleNamespace(get_tokenizer=lambda: runtime.tokenizer)
+    metadata = _native_duplex_sampling_metadata([], unit_token_id=runtime.unit_token_id)
+    logits = torch.full((1, 256), -100.0)
+    logits[0, 200] = 30.0
+
+    model.prepare_duplex_sampling(logits, metadata, (replace(row, seq=seq),))
+    sampled = model.sample(logits, metadata)
+
+    assert sampled.sampled_token_ids.item() == runtime.listen_token_id
+    assert state.pending_initial_tts_start is False
+    assert state.pending_speech_context is False
+    assert state.pending_speech_response_open is False
+    assert state.current_turn_ended is True
+
+
+def test_minicpmo_native_seed_can_still_choose_listen():
+    runtime, state, model, row = _minicpmo_seeded_silence_sampling_case("Only speak when a red ball appears.")
+    metadata = _native_duplex_sampling_metadata([], unit_token_id=runtime.unit_token_id)
+    logits = torch.full((1, 256), -100.0)
+    logits[0, runtime.listen_token_id] = 30.0
+    original_logits = logits.clone()
+
+    model.prepare_duplex_sampling(logits, metadata, (row,))
+    sampled = model.sample(logits, metadata)
+
+    assert torch.equal(logits, original_logits)
+    assert sampled.sampled_token_ids.item() == runtime.listen_token_id
+    assert state.pending_initial_tts_start is False
+    assert state.pending_speech_context is True
+    assert state.pending_speech_response_open is False
+    assert state.current_turn_ended is True
+
+
+@pytest.mark.parametrize("initial_text", [None, "", "Please say hello.", "请说你好。"])
+@pytest.mark.parametrize("initial_user_text_is_tts", [False, True])
+def test_minicpmo_seeded_context_allows_content_without_speech_envelope(initial_text, initial_user_text_is_tts):
     from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import _MiniCPMO45Stage0SessionState
 
     runtime = _stage0_vision_runtime()
     state = _MiniCPMO45Stage0SessionState(session_id="seeded-context")
-    runtime._prepare_session_context(state, {}, runtime_config={"initial_user_text": initial_text})
+    runtime._prepare_session_context(
+        state,
+        {},
+        runtime_config={"initial_user_text": initial_text, "initial_user_text_is_tts": initial_user_text_is_tts},
+        epoch=0,
+        seq=1,
+    )
     result = runtime._stage_prefill_embeddings_only(
         state, np.zeros(4, dtype=np.float32), epoch=0, seq=1, is_speech=False
     )
     assert result["success"] is True
     model, row = _minicpmo_duplex_policy_case(state, {"is_speech": False})
-    logits = torch.zeros((1, 16), dtype=torch.float32)
-    logits[0, 10] = 20.0
-    original_logits = logits.clone()
-    sampling_metadata = mocker.Mock(spec=SamplingMetadata)
-    model.prepare_duplex_sampling(logits, sampling_metadata, (row,))
-    token_ids = model._minicpmo45_native_duplex_token_ids_cache
-    sampled = model._finalize_minicpmo45_native_duplex_sample(0, 7, token_ids)
+    model._minicpmo45_native_duplex_token_ids_cache = runtime._special_token_ids()
+    model.thinker = SimpleNamespace(get_tokenizer=lambda: runtime.tokenizer)
+
+    def step(seq, accepted, raw):
+        metadata = _native_duplex_sampling_metadata(accepted, unit_token_id=runtime.unit_token_id)
+        logits = torch.full((1, 256), -100.0)
+        logits[0, raw] = 30.0
+        model.prepare_duplex_sampling(logits, metadata, (replace(row, seq=seq),))
+        return model.sample(logits, metadata).sampled_token_ids.item()
+
+    # Context preparation alone must not open an ordinary native response.
+    # Explicit Base defers its one-time start until an accepted sampling step.
+    assert state.current_turn_ended is True
+    assert state.pending_speech_response_open is False
+    assert state.pending_speech_context is bool(initial_text)
+    assert state.pending_initial_tts_start is (bool(initial_text) and initial_user_text_is_tts)
+    sampled = step(1, [], 200)
 
     if not initial_text:
-        assert sampled == 7
-        assert logits[0, 7].item() == 0.0
-        assert torch.isneginf(logits[0, :7]).all()
-        assert torch.isneginf(logits[0, 8:]).all()
+        assert sampled == runtime.listen_token_id
+        assert state.current_turn_ended is True
         return
 
-    assert torch.equal(logits, original_logits)
-    assert sampled == 8
-    if speech_envelope:
-        model._record_minicpmo45_duplex_terminator(0, 8, token_ids)
-        assert state.current_turn_ended is False
-        assert state.pending_speech_context is True
-    model._record_minicpmo45_duplex_terminator(0, 10, token_ids)
+    # A first content token is sufficient; a generated SPEAK/BOS is optional.
+    assert sampled == 200
+    assert state.current_turn_ended is False
     assert state.pending_speech_context is False
-    model._record_minicpmo45_duplex_terminator(0, 9, token_ids)
+    assert state.pending_speech_response_open is False
+    assert state.pending_initial_tts_start is False
+    assert step(1, [200], runtime.turn_eos_token_id) == runtime.turn_eos_token_id
+    assert state.current_turn_ended is True
+    assert step(1, [200, runtime.turn_eos_token_id], runtime.listen_token_id) == runtime.listen_token_id
 
     # A later silent unit must not re-admit the seed after the turn ended.
     result = runtime._stage_prefill_embeddings_only(
         state, np.zeros(4, dtype=np.float32), epoch=0, seq=2, is_speech=False
     )
     assert result["success"] is True
-    logits = original_logits.clone()
-    model.prepare_duplex_sampling(logits, sampling_metadata, (replace(row, seq=4),))
-    assert logits[0, 7].item() == 0.0
-    assert torch.isneginf(logits[0, :7]).all()
-    assert torch.isneginf(logits[0, 8:]).all()
-    assert model._finalize_minicpmo45_native_duplex_sample(0, 7, token_ids) == 7
+    assert step(2, [], 200) == runtime.listen_token_id
+    assert state.pending_speech_context is False
+    assert state.pending_initial_tts_start is False
 
 
 def test_minicpmo_stage0_puts_every_frame_of_an_append_in_one_unit():
@@ -2678,10 +2862,17 @@ def test_minicpmo_stage0_native_sampler_cuts_before_request_length_cap():
     assert sampled.sampled_token_ids.tolist() == [[151718]]
 
 
-def test_minicpmo_stage0_native_sampler_cuts_on_decoded_text_length():
+@pytest.mark.parametrize("greedy", [True, False], ids=["greedy", "sampled"])
+@pytest.mark.parametrize(
+    "candidate_text, retained",
+    [("十六十七十八十", True), ("十六十七十八十九", False)],
+    ids=["below_cap", "at_cap"],
+)
+def test_minicpmo_stage0_native_sampler_cuts_on_decoded_text_length(greedy, candidate_text, retained):
     from vllm_omni.model_executor.models.minicpmo_4_5.duplex.policy import (
         MiniCPMO45DuplexPolicy,
     )
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import _MiniCPMO45Stage0SessionState
     from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import (
         MiniCPMO45OmniForConditionalGeneration,
     )
@@ -2710,7 +2901,8 @@ def test_minicpmo_stage0_native_sampler_cuts_on_decoded_text_length():
             token_text = {
                 200: "一二三四五六七八九十",
                 201: "十一十二十三十四十五",
-                202: "十六十七十八十九",
+                202: candidate_text,
+                203: "继续",
             }
             special = set(self.all_special_ids) if skip_special_tokens else set()
             return "".join(token_text.get(int(token_id), "") for token_id in ids if int(token_id) not in special)
@@ -2718,26 +2910,48 @@ def test_minicpmo_stage0_native_sampler_cuts_on_decoded_text_length():
     model = MiniCPMO45OmniForConditionalGeneration.__new__(MiniCPMO45OmniForConditionalGeneration)
     model.model_stage = "llm"
     model.thinker = SimpleNamespace(get_tokenizer=lambda: _Tokenizer())
+    accepted_prefix = [151706, 200, 201]
+    session_key = "sid-character-cap"
+    state = _MiniCPMO45Stage0SessionState(
+        session_id=session_key, current_turn_ended=False, generated_tokens=accepted_prefix.copy()
+    )
+    model._minicpmo45_duplex_row_sessions = {0: session_key}
+    model._minicpmo45_duplex_data_plane_helper = SimpleNamespace(sessions={session_key: state})
     vocab_size = 151723
     candidate = 202
-    logits = torch.full((1, vocab_size), -100.0)
+    alternative = 203
+    logits = torch.full((1, vocab_size), float("-inf"))
     logits[0, candidate] = 20.0
     sampling_metadata = SimpleNamespace(
-        all_greedy=True,
-        all_random=False,
-        temperature=torch.tensor([0.0]),
+        all_greedy=greedy,
+        all_random=not greedy,
+        temperature=torch.tensor([0.0 if greedy else 1.0]),
         top_k=torch.tensor([1]),
         top_p=torch.tensor([1.0]),
-        generators={},
+        generators={0: torch.Generator().manual_seed(0)},
         prompt_token_ids=torch.tensor([[151683] * 16]),
-        output_token_ids=[[151706, 200, 201]],
+        output_token_ids=[accepted_prefix.copy()],
     )
 
     sampled = model.sample(logits, sampling_metadata)
 
     assert MiniCPMO45DuplexPolicy.DEFAULT_MAX_SPEAK_CHARS_PER_CHUNK == 28
     assert sampled is not None
-    assert sampled.sampled_token_ids.tolist() == [[151718]]
+    assert sampled.sampled_token_ids.tolist() == [[candidate if retained else 151718]]
+    accepted_history = accepted_prefix + ([candidate] if retained else [])
+    assert state.generated_tokens == accepted_history
+
+    # The next unit must penalize retained text, but not the rejected token:
+    # 10 / 1.05 < 9.7 < 10. Top-k=1 keeps the sampled branch deterministic.
+    sampling_metadata.output_token_ids = [[]]
+    logits[0, candidate] = 10.0
+    logits[0, alternative] = 9.7
+    next_sampled = model.sample(logits, sampling_metadata)
+    expected_next = alternative if retained else candidate
+
+    assert next_sampled is not None
+    assert next_sampled.sampled_token_ids.tolist() == [[expected_next]]
+    assert state.generated_tokens == accepted_history + [expected_next]
 
 
 def test_minicpmo_stage0_native_sampler_ignores_pending_placeholders():
@@ -2791,7 +3005,8 @@ def test_minicpmo_stage0_native_sampler_ignores_pending_placeholders():
     assert sampled.sampled_token_ids.tolist() == [[newline]]
 
 
-def test_minicpmo_stage0_native_sampler_converts_mid_turn_listen_to_tts_bos():
+@pytest.mark.parametrize("greedy", [True, False], ids=["greedy", "sampled"])
+def test_minicpmo_stage0_native_sampler_converts_mid_turn_listen_to_tts_bos(greedy):
     from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import (
         MiniCPMO45OmniForConditionalGeneration,
     )
@@ -2823,15 +3038,15 @@ def test_minicpmo_stage0_native_sampler_converts_mid_turn_listen_to_tts_bos():
     model._minicpmo45_duplex_row_sessions = {0: ("sid-native", 0)}
     model._minicpmo45_duplex_data_plane_helper = SimpleNamespace(sessions={("sid-native", 0): state})
     vocab_size = 151723
-    logits = torch.full((1, vocab_size), -100.0)
+    logits = torch.full((1, vocab_size), float("-inf"))
     logits[0, 151705] = 30.0
     sampling_metadata = SimpleNamespace(
-        all_greedy=True,
-        all_random=False,
-        temperature=torch.tensor([0.0]),
+        all_greedy=greedy,
+        all_random=not greedy,
+        temperature=torch.tensor([0.0 if greedy else 1.0]),
         top_k=torch.tensor([1]),
         top_p=torch.tensor([1.0]),
-        generators={},
+        generators={0: torch.Generator().manual_seed(0)},
         prompt_token_ids=torch.tensor([[151683] * 16]),
         output_token_ids=[[]],
     )
@@ -2841,6 +3056,7 @@ def test_minicpmo_stage0_native_sampler_converts_mid_turn_listen_to_tts_bos():
     assert sampled is not None
     assert sampled.sampled_token_ids.tolist() == [[151703]]
     assert state.current_turn_ended is False
+    assert state.generated_tokens == [151705]
 
 
 def test_minicpmo_stage0_native_sampler_forced_listen_yields_floor():
@@ -3112,16 +3328,27 @@ def _native_duplex_model_with_state():
     return model, state
 
 
-def _native_duplex_sampling_metadata(output_token_ids: list[int]):
-    return SimpleNamespace(
+def _native_duplex_sampling_metadata(output_token_ids: list[int], *, unit_token_id: int = 151683):
+    from vllm.v1.sample.logits_processor.state import LogitsProcessors
+    from vllm.v1.sample.metadata import SamplingMetadata
+
+    return SamplingMetadata(
         all_greedy=True,
         all_random=False,
         temperature=torch.tensor([0.0]),
         top_k=torch.tensor([1]),
         top_p=torch.tensor([1.0]),
         generators={},
-        prompt_token_ids=torch.tensor([[151683] * 16]),
+        max_num_logprobs=None,
+        no_penalties=True,
+        prompt_token_ids=torch.tensor([[unit_token_id] * 16]),
+        frequency_penalties=torch.zeros(1, dtype=torch.float32),
+        presence_penalties=torch.zeros(1, dtype=torch.float32),
+        repetition_penalties=torch.ones(1, dtype=torch.float32),
         output_token_ids=[output_token_ids],
+        allowed_token_ids_mask=None,
+        bad_words_token_ids={},
+        logitsprocs=LogitsProcessors(),
     )
 
 
@@ -3178,3 +3405,91 @@ def test_minicpmo_stage0_stop_tokens_exclude_turn_eos():
     stop_ids = _stage0_stop_token_ids(_NativeDuplexTokenizer())
 
     assert stop_ids == [151718, 151721, 151705]
+
+
+@pytest.mark.parametrize("has_ref_audio", [False, True])
+@pytest.mark.parametrize("seconds", [1, 2, 3])
+@pytest.mark.parametrize("initial_user_text_is_tts", [False, True])
+def test_minicpmo_seeded_context_budget_matches_native_prefill(
+    monkeypatch, has_ref_audio, seconds, initial_user_text_is_tts
+):
+    import base64
+
+    from vllm_omni.engine.duplex.contracts import DuplexFence
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.plugin import (
+        _apply_first_append_context_tokens,
+        build_duplex_data_plane_prompt,
+    )
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import _MiniCPMO45Stage0SessionState
+
+    runtime = _stage0_vision_runtime()
+    state = _MiniCPMO45Stage0SessionState(session_id="seeded-budget")
+    monkeypatch.setattr(runtime.tokenizer, "encode", lambda text, add_special_tokens=False: list(map(ord, text)))
+    monkeypatch.setattr(
+        runtime.processor, "get_streaming_chunk_size", lambda: 16560 if state.audio_chunk_idx == 0 else 16000
+    )
+    monkeypatch.setattr(
+        runtime.processor,
+        "_streaming_mel_processor",
+        SimpleNamespace(get_config=lambda: {"effective_first_chunk_ms": 1035}),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        runtime.stage_model,
+        "get_audio_hidden_states",
+        lambda data: [torch.zeros((len(data["audio_features"]) // 1600, 2))],
+    )
+    seed = "What is the capital of France?"
+    runtime_config = {"initial_user_text": seed, "initial_user_text_is_tts": initial_user_text_is_tts}
+    ref_samples = 3200 if has_ref_audio else None
+    if ref_samples is not None:
+        runtime_config["ref_audio_data"] = base64.b64encode(bytes(ref_samples * 4)).decode()
+    _apply_first_append_context_tokens(
+        runtime_config,
+        tokenizer=runtime.tokenizer,
+        instructions="Speak exactly.",
+        initial_user_text=seed,
+        ref_sample_count=ref_samples,
+    )
+    runtime._prepare_session_context(
+        state, {"instructions": "Speak exactly."}, runtime_config=runtime_config, epoch=0, seq=1
+    )
+
+    prefix = "<|im_start|>system\nSpeak exactly." + ("\n<|audio_start|>" if has_ref_audio else "")
+    suffix = ("<|audio_end|>" if has_ref_audio else "") + f"<|im_end|>\n<|im_start|>user\n{seed}<|im_end|>"
+    if initial_user_text_is_tts:
+        suffix += "\n<|im_start|>assistant\n<think>\n\n</think>\n\n<|tts_bos|>"
+    expected_context = list(map(ord, prefix)) + ([runtime.unit_token_id] * 2 if has_ref_audio else [])
+    expected_context += list(map(ord, suffix))
+    assert state.context_token_ids == expected_context
+    assert runtime_config["duplex_first_append_context_tokens"] == len(expected_context)
+    assert runtime_config["duplex_window_suffix_token_ids"] == state.context_suffix_token_ids
+    assert state.context_suffix_token_ids == list(map(ord, suffix))
+
+    audio = np.zeros(seconds * 16000, dtype=np.float32)
+    prefill = runtime._stage_prefill_embeddings_only(state, audio, epoch=0, seq=1)
+    prompt = build_duplex_data_plane_prompt(
+        request_id="seeded-budget-request",
+        fence=DuplexFence(state.session_id),
+        session_config={},
+        runtime_config=runtime_config,
+        seq=1,
+        turn_seq=1,
+        payload={
+            "audio": base64.b64encode(audio.tobytes()).decode(),
+            "format": "pcm_f32le",
+            "sample_rate_hz": 16000,
+        },
+        final=False,
+    )
+
+    # The first unit consumes 1035 ms; a partial following unit stays buffered.
+    unit_count = max(1, seconds - 1)
+    expected_units = [runtime.unit_token_id] + [11] * 10
+    expected_units += ([runtime.unit_end_token_id, runtime.unit_token_id] + [11] * 10) * (unit_count - 1)
+    assert prefill["success"] is True
+    assert prefill["input_token_ids"] == expected_context + expected_units
+    assert prefill["num_input_tokens"] == prefill["inputs_embeds"].shape[0] == len(prompt["prompt_token_ids"])
+    assert prefill["prompt_suffix_len"] == 0
+    assert state.audio_chunk_idx == unit_count
+    assert state.audio_buffer.size == (0 if seconds == 1 else 15440)

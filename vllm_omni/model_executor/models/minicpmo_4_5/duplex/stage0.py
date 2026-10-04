@@ -62,6 +62,7 @@ class _MiniCPMO45Stage0SessionState:
     pending_speech_context: bool = False
     pending_speech_append_identity: tuple[int | None, int] | None = None
     pending_speech_response_open: bool = False
+    pending_initial_tts_start: bool = False
     generated_tokens: list[int] = field(default_factory=list)
 
 
@@ -155,6 +156,8 @@ class MiniCPMO45Stage0DuplexRuntime:
         session_config: dict[str, object],
         *,
         runtime_config: dict[str, object] | None = None,
+        epoch: int | None = None,
+        seq: int | None = None,
     ) -> None:
         window_config = (runtime_config or {}).get("duplex_window_config")
         state.window_enabled = isinstance(window_config, dict) and window_config.get("sliding_window_mode", "off") in {
@@ -171,10 +174,12 @@ class MiniCPMO45Stage0DuplexRuntime:
         # template is shared with the serving adapter so the first-append
         # scheduler reserve can count these tokens exactly.
         initial_user_text = (runtime_config or {}).get("initial_user_text")
+        initial_user_text_is_tts = (runtime_config or {}).get("initial_user_text_is_tts") is True
         prefix, suffix = MiniCPMO45DuplexPolicy.session_context_texts(
             session_config.get("instructions"),
             ref_audio is not None,
             initial_user_text,
+            initial_user_text_is_tts=initial_user_text_is_tts,
         )
         for token_id in self._encode_text(prefix):
             embed = self._embed_token(token_id)
@@ -201,12 +206,10 @@ class MiniCPMO45Stage0DuplexRuntime:
             # Seeded text is pending user content just like a speech append.
             # Otherwise the turn-ended latch forces its silent input clock to
             # listen before the model can answer. Generated content clears it.
-            state.pending_speech_context = True
-            # The seeded template already opens the assistant turn. Match
-            # that prefix in the native listen/speak state machine so silence
-            # advances this response until the model emits turn_eos.
-            state.current_turn_ended = False
-            state.pending_speech_response_open = True
+            # A cancelled or rebuilt request must not restart the original TTS
+            # seed. A live first append retains this flag across forced LISTEN.
+            state.pending_speech_context = not initial_user_text_is_tts or (epoch == 0 and seq == 1)
+            state.pending_initial_tts_start = initial_user_text_is_tts and state.pending_speech_context
 
     def _stage_prefill_embeddings_only(
         self,
@@ -381,10 +384,9 @@ class MiniCPMO45Stage0DuplexRuntime:
                 state.pending_window_unit.embeds.extend(embed_parts[unit_embed_start:])
                 state.pending_window_unit.token_ids.extend(token_ids[unit_token_start:])
             chunk_size = self._streaming_chunk_size(processor)
-        # Match official streaming_prefill: per chunk feed ONLY <unit>+audio. The assistant
-        # turn is opened once at session init; re-emitting the turn-open prefix per chunk
-        # re-opened the turn each chunk -> degenerate repetition. tts_bos/listen/turn_eos are
-        # model-generated and tracked via current_turn_ended (mirrors streaming_generate).
+        # Match official streaming_prefill: each chunk feeds <unit>+audio,
+        # without opening a ChatML assistant turn. Native tts_bos/listen/turn_eos
+        # are model-generated and tracked via current_turn_ended.
         prompt_suffix_len = 0
 
         import torch

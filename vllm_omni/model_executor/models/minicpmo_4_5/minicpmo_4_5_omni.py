@@ -418,6 +418,16 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             embeds = input_embeds if input_embeds is not None else self.get_input_embeddings(input_ids)
             return input_ids, embeds, {"duplex": {"prefill_success": False, "reason": "bad_duplex_payload"}}
 
+        seq = duplex.get("seq")
+        try:
+            seq = int(seq) if seq is not None else None
+        except (TypeError, ValueError):
+            seq = None
+        epoch = duplex.get("epoch")
+        try:
+            epoch = int(epoch) if epoch is not None else None
+        except (TypeError, ValueError):
+            epoch = None
         session_key = session_id
         state = helper.sessions.get(session_key)
         if state is None:
@@ -434,7 +444,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             if hasattr(helper.thinker, "audio_past_key_values"):
                 helper.thinker.audio_past_key_values = None
             helper._configure_streaming_processor(state)
-            helper._prepare_session_context(state, session_config, runtime_config=runtime_config)
+            helper._prepare_session_context(state, session_config, runtime_config=runtime_config, epoch=epoch, seq=seq)
 
         audio_waveform = helper._decode_audio_payload(payload)
         try:
@@ -442,16 +452,6 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         except ValueError as exc:
             embeds = input_embeds if input_embeds is not None else self.get_input_embeddings(input_ids)
             return input_ids, embeds, {"duplex": {"prefill_success": False, "reason": str(exc)}}
-        seq = duplex.get("seq")
-        try:
-            seq = int(seq) if seq is not None else None
-        except (TypeError, ValueError):
-            seq = None
-        epoch = duplex.get("epoch")
-        try:
-            epoch = int(epoch) if epoch is not None else None
-        except (TypeError, ValueError):
-            epoch = None
         result = helper._stage_prefill_embeddings_only(
             state,
             audio_waveform,
@@ -867,6 +867,16 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         top_k = int(self._sampling_metadata_value(sampling_metadata, "top_k", row_idx, 100))
         top_p = float(self._sampling_metadata_value(sampling_metadata, "top_p", row_idx, 0.8))
         state = self._minicpmo45_duplex_state_for_row(row_idx)
+        payload = self._minicpmo45_duplex_payload_for_row(row_idx)
+        if getattr(state, "pending_initial_tts_start", False) and not (
+            isinstance(payload, dict) and payload.get("force_listen") is True
+        ):
+            # The explicit Base prefix already opens a TTS response. Activate
+            # it only on an accepted sampling step, after forced-listen warmup
+            # and the discarded-lookahead guard, then use normal continuation.
+            state.current_turn_ended = False
+            state.pending_speech_response_open = True
+            state.pending_initial_tts_start = False
         if chunk_eos_id >= 0 and chunk_eos_id < logits.shape[-1]:
             max_speak_tokens = int(
                 getattr(
@@ -914,24 +924,28 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
 
         if getattr(sampling_metadata, "all_greedy", False) or temperature <= 0:
             sampled = int(torch.argmax(logits, dim=-1).item())
-            self._record_minicpmo45_duplex_generation_token(row_idx, sampled)
             sampled = self._maybe_cut_minicpmo45_native_duplex_text_chunk(
                 sampled,
                 recent_tokens,
                 token_ids,
             )
+            # Cap-rejected text never enters the model context or repetition
+            # history. Keep raw LISTEN history before TTS_BOS finalization.
+            if sampled != chunk_eos_id:
+                self._record_minicpmo45_duplex_generation_token(row_idx, sampled)
             return self._finalize_minicpmo45_native_duplex_sample(row_idx, sampled, token_ids)
 
         logits = logits / temperature
         logits = self._top_k_top_p_filter(logits, top_k=top_k, top_p=top_p)
         probs = F.softmax(logits, dim=-1)
         sampled = int(torch.multinomial(probs, num_samples=1, generator=generator).item())
-        self._record_minicpmo45_duplex_generation_token(row_idx, sampled)
         sampled = self._maybe_cut_minicpmo45_native_duplex_text_chunk(
             sampled,
             recent_tokens,
             token_ids,
         )
+        if sampled != chunk_eos_id:
+            self._record_minicpmo45_duplex_generation_token(row_idx, sampled)
         return self._finalize_minicpmo45_native_duplex_sample(
             row_idx,
             sampled,
@@ -1093,10 +1107,10 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             with suppress(Exception):
                 state.pending_speech_response_open = False
             return
-        # A seeded prefix can open the response before tts_bos is sampled.
+        # A seeded prefix can open the response before its start control is sampled.
         # Keep its pending input until the first content token in either case.
         if (
-            sampled == tts_bos_id
+            sampled in (tts_bos_id, token_ids.get("speak_token_id", -1))
             and (getattr(state, "current_turn_ended", True) or getattr(state, "pending_speech_response_open", False))
             and getattr(state, "pending_speech_context", False)
         ):

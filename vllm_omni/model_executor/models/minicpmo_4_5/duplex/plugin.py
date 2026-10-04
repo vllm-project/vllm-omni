@@ -94,6 +94,7 @@ PRIVATE_RUNTIME_CONFIG_KEYS = frozenset(
         "ref_audio_format",
         "ref_audio_sample_rate_hz",
         "initial_user_text",
+        "initial_user_text_is_tts",
         "duplex_window_config",
         "duplex_window_prefix_tokens",
         "duplex_window_suffix_token_ids",
@@ -458,6 +459,7 @@ def _apply_first_append_context_tokens(
         instructions,
         ref_sample_count is not None,
         initial_user_text,
+        initial_user_text_is_tts=runtime_config.get("initial_user_text_is_tts") is True,
     )
     try:
         prefix_ids = tokenizer.encode(prefix, add_special_tokens=False)
@@ -699,6 +701,8 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
             initial_user_text = config.initial_user_text
         if isinstance(initial_user_text, str) and initial_user_text:
             runtime_config["initial_user_text"] = initial_user_text
+            if extra_body.get("task_type") == "Base":
+                runtime_config["initial_user_text_is_tts"] = True
         tokenizer = await self._tokenizer_for(model_config)
         _apply_default_scheduler_policy(runtime_config, config=config, tokenizer=tokenizer, model_config=model_config)
 
@@ -759,6 +763,14 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
     ) -> dict[str, object]:
         runtime_config = deepcopy(dict(current))
         extra_body = dict(config.extra_body)
+        if runtime_config.get("initial_user_text") and "task_type" in extra_body:
+            reject_changed_runtime_value(
+                extra_body["task_type"] == "Base",
+                runtime_config.get("initial_user_text_is_tts") is True,
+                message="the initial text task cannot be changed after the session is created",
+                code="initial_text_task_update_unsupported",
+                error_cls=MiniCPMO45ClientRuntimeConfigError,
+            )
         requested_window = self._pop_window_config(extra_body)
         if requested_window is not None:
             reject_changed_runtime_value(
