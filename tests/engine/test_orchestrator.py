@@ -40,6 +40,7 @@ from vllm_omni.engine.orchestrator import (
     OrchestratorRequestState,
     StreamingSegmentState,
     _build_terminal_empty_output,
+    build_engine_core_request_from_tokens,
 )
 from vllm_omni.engine.stage_pool import StagePool
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
@@ -2185,3 +2186,29 @@ async def test_duplex_session_request_error_finish_is_delivered_as_request_error
         plain_state,
     )
     assert output_queue.empty()
+
+
+def test_build_engine_core_request_from_tokens_preserves_caller_params() -> None:
+    params = SamplingParams(max_tokens=10, min_tokens=2, temperature=0.7)
+    model_config = SimpleNamespace(max_model_len=100)
+    prompt = {"prompt_token_ids": [1, 2, 3]}
+
+    req1 = build_engine_core_request_from_tokens("req-1", prompt, params, model_config=model_config)
+    req2 = build_engine_core_request_from_tokens("req-2", prompt, params, model_config=model_config)
+
+    # When no clamping is required, params can be aliased and remain unmutated
+    assert req1.sampling_params is params
+    assert req2.sampling_params is params
+    assert params.max_tokens == 10
+    assert params.min_tokens == 2
+    assert params.temperature == 0.7
+
+    # Clamping creates a clone and does not mutate caller's params
+    tight_config = SimpleNamespace(max_model_len=5)
+    req3 = build_engine_core_request_from_tokens("req-3", prompt, params, model_config=tight_config)
+    assert req3.sampling_params is not params
+    assert req3.sampling_params.max_tokens == 2
+    assert req3.sampling_params.min_tokens == 2
+    assert params.max_tokens == 10
+    assert params.min_tokens == 2
+

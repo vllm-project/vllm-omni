@@ -57,6 +57,9 @@ class LoopHandoffQueue(janus.Queue[T]):
         return batch
 
     # janus calls this with its mutex held, for sync and async puts alike.
+    # Note: verified against janus 2.0.0 (requirements specify janus>=1.0.0).
+    # If a future janus release routes puts differently, the consumer serving loop
+    # falls back to its 1 s timeout and test_output_handoff.py catches it in CI.
     def _put(self, item: T) -> None:
         super()._put(item)
         if self._consumer is None or self._consumer_wake_pending or self._flush_scheduled:

@@ -75,8 +75,6 @@ logger = init_logger(__name__)
 
 _STARTUP_POLL_INTERVAL_S = 1.0
 _REQUEST_QUEUE_MAXSIZE = 256
-# Most output messages one drain-thread round trip hands to the serving loop.
-_OUTPUT_DRAIN_BATCH = 64
 _ConfigResolutionResult = OmniConfigResolution | tuple[str | None, list[Any], str | None]
 
 

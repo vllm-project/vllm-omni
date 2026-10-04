@@ -144,7 +144,16 @@ def build_engine_core_request_from_tokens(
     resumable: bool = False,
     mm_features: list | None = None,
 ) -> OmniEngineCoreRequest:
-    """Build an OmniEngineCoreRequest directly from an OmniTokensPrompt."""
+    """Build an OmniEngineCoreRequest directly from an OmniTokensPrompt.
+
+    Note:
+        When ``params`` is a ``SamplingParams`` and requires no adjustment
+        (e.g., max_tokens / min_tokens clamping against the remaining context
+        window), ``request.sampling_params`` may alias the caller's ``params``
+        object rather than a deep copy. Downstream stage communication
+        msgspec-encodes the request before its first await, and callers must
+        not mutate ``request.sampling_params`` in-place.
+    """
     if arrival_time is None:
         arrival_time = _time.time()
 
