@@ -1218,12 +1218,6 @@ class MiniMaxH3Pipeline(
         if path is None or not transformer.adaln_cache.max_bytes:
             return
         try:
-            # Compiled blocks bypass projection reuse. Reject before reading the
-            # sidecar so load completion cannot move an unused payload to GPU.
-            if not self.od_config.enforce_eager:
-                raise ValueError(
-                    "offline sidecars require --enforce-eager; compiled H3 blocks bypass cached projections"
-                )
             if not eligible or get_tensor_model_parallel_world_size() != 1:
                 raise ValueError("offline sidecar uses native BF16 TP1 math; use the default runtime cache here")
             sidecar = MiniMaxH3AdalnCache(transformer.arch, path=path, model_variant=variant)

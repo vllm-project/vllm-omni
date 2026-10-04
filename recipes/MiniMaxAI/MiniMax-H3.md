@@ -271,8 +271,8 @@ For a combined service on four high-memory GPUs, use:
 - regional `torch.compile` for the repeated DiT blocks;
 - dense BF16 `TRTLLM_ATTN`, with Ring and TP left at 1.
 
-Both DiTs remain resident in this no-offload configuration. If they do not fit,
-use model-level CPU offload.
+Both DiTs remain resident except for their default AdaLN projection weight
+offload. If they do not fit, use model-level CPU offload.
 
 ```bash
 export MODEL=MiniMaxAI/MiniMax-H3
@@ -1040,12 +1040,13 @@ normally, avoiding cyclic eviction on repeated original-H3 requests. All origina
 remain loaded so new schedules and adapters can compute normally. Adapter changes,
 weight reloads, and model device moves invalidate the cache; parameter versions
 also guard individual entries. TP ranks coordinate hits before skipping a
-projection collective. Gradient-enabled execution, compilation, custom linear
-hooks, and tensors without weight version counters use the original computation.
+projection collective. Gradient-enabled execution, custom linear hooks, and
+tensors without weight version counters use the original computation. Both
+eager and compiled execution support projection reuse.
 Offload paths that replace weight storage can therefore reduce the hit rate.
 
-The runtime cache uses the shared `ExactProjectionCache` implementation; H3 keeps
-only its optional sidecar adaptation. Other models can integrate the same
+The runtime cache uses the shared `ExactProjectionCache` implementation; H3 owns
+its sidecar adaptation and projection weight offload. Other models can use the same
 [projection cache interface](../../docs/design/module/diffusion/diffusion_model_integration.md#exact-conditioning-projection-reuse).
 This cache retains projection outputs, not offloaded weights, and does not skip
 block weight prefetch.
@@ -1056,15 +1057,32 @@ For an A/B comparison, disable only this reuse at server startup:
 --cache-config '{"minimax_h3_adaln_cache": false}'
 ```
 
+### Default AdaLN weight offload
+
+AdaLN weight offload is enabled automatically for unquantized BF16 CUDA
+inference with the default exact result cache. It reduces GPU memory usage by
+keeping projection weights in host memory and reusing exact cached results.
+Both compiled and eager execution are supported; no extra enable flag is needed.
+Allow additional host RAM for the offloaded weights.
+
+To keep AdaLN weights on the GPU while retaining result caching:
+
+```bash
+--cache-config '{"minimax_h3_adaln_offload": false}'
+```
+
+Non-CUDA platforms, quantized models, DiT-wide offload and HSDP retain their
+existing weight placement. Disabling the result cache also disables automatic
+AdaLN offload. Explicitly enabling it in an incompatible configuration raises
+an error.
+
 ### Optional offline sidecar
 
 An offline sidecar can seed the first projection results; it is not required to
-enable the default cache. Sidecars require `--enforce-eager`, native BF16 TP1
-math, and the same numerical environment as the builder. With the default
-compiled execution, sidecars are rejected before reading their payloads: compiled
-H3 blocks bypass cached projections, so retaining those payloads would waste GPU
-memory. This applies to both the main and Ref2VA sidecars. Other serving
-configurations retain the default runtime-cache behavior described above.
+enable the default cache. Sidecars require native BF16 TP1 math and the same
+numerical environment as the builder. Both eager and compiled H3 execution
+consult sidecars through the host cache boundary. Uncovered or incompatible
+inputs use the original projection instead.
 From the repository root, for a fixed FastH3 adapter and its own four-step schedule:
 
 ```bash
@@ -1081,10 +1099,9 @@ The builder accepts a native transformer directory with `config.json` and indexe
 or single-file safetensors. It streams the required inputs and refuses to overwrite
 an existing output. It does not instantiate the full DiT.
 
-Pass the resulting local artifact at eager server startup:
+Pass the resulting local artifact at server startup:
 
 ```bash
---enforce-eager \
 --cache-config '{"minimax_h3_adaln_cache_path": "/path/to/h3-adaln.safetensors"}'
 ```
 
@@ -1097,8 +1114,8 @@ the runtime path. A request with different settings similarly falls back.
 Build sidecars from trusted local inputs: checksums verify identity and integrity,
 not the correctness of an untrusted generator.
 
-This implementation saves repeated projection work. It does not remove AdaLN
-weights or claim a GPU memory reduction. End-to-end gains depend on the workload,
+Caching and sidecars alone save repeated projection work; GPU residency changes
+with weight offload, which is enabled by default where supported. Gains depend on the workload,
 offload behavior, embedding fingerprint cost, and TP coordination overhead.
 
 ## LoRA
@@ -1274,8 +1291,8 @@ hf download FastVideo/FastVideo-FastH3-4-step-Preview-v1-LoRA \
 export FASTH3_LORA="${FASTH3_DIR}/dense-datafree/adapter_model.safetensors"
 ```
 
-Add `--task-type fl2va --lora-path "${FASTH3_LORA}"` to a non-offloaded server
-command. T2VA is served by the FL2VA partition, so `--task-type fl2va` is
+Add `--task-type fl2va --lora-path "${FASTH3_LORA}"` to a server command without
+DiT-wide offload. T2VA is served by the FL2VA partition, so `--task-type fl2va` is
 correct even though FastH3 preview v1 distills T2VA only. Because the adapter is
 fused, `--lora-backend` does not apply and a request carrying a `lora=` field is
 rejected rather than served without the adapter it asked for.
@@ -1296,18 +1313,29 @@ Only a release that identifies itself as FastH3 is fused; any other
 `fastvideo-lora-v2` adapter stays on the dynamic LoRA route. A claimed artifact
 is then held to its own metadata: one that misdeclares its tensor counts or
 leaves a transformer block unedited is refused at startup instead of serving
-mostly base H3 weights on a four-step schedule. Offload is refused for the same
+mostly base H3 weights on a four-step schedule. DiT-wide offload is refused for the same
 reason - `--enable-cpu-offload`, `--enable-layerwise-offload` and
 `--enable-distributed-layerwise-offload` all bypass the fusion, so they fail fast.
 
-The VSA variants are supported through FastVideo's external kernel. Install a
-`fastvideo-kernel` build that provides the `fastvideo_kernel` Python module,
-then add the following flags to the same command:
+For the VSA variants, add the following flags to the same command. H3 selects
+FlashInfer BF16 automatically on SM120/SM121 when the required tile64 API is
+installed; otherwise it uses FastVideo's external kernel, supplied by the
+`vllm-omni[vsa]` extra. The video request API is unchanged:
 
 ```bash
 --diffusion-attention-backend FASTVIDEO_VSA \
 --fastvideo-vsa-topk 64
 ```
+
+To use approximate Sage attention on SM120, replace those two flags with:
+
+```bash
+--diffusion-attention-config '{"default":{"backend":"FASTVIDEO_VSA","fastvideo_vsa_precision":"sage","fastvideo_vsa_topk":64},"per_role":{"minimax_h3.token_refiner":{"backend":"TORCH_SDPA"}}}'
+```
+
+Sage requires a compatible FlashInfer build; BF16 remains the default. See
+[provider selection](../../docs/user_guide/diffusion/attention_backends/fastvideo_vsa.md#automatic-provider-selection)
+for hardware requirements and provider overrides.
 
 FastH3 VSA applies its learned `.set_weight` compression gates to the complete
 packed `[text | cond | audio | video]` document using the official H3 geometry:
