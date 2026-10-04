@@ -94,7 +94,7 @@ def _sigmas(num_steps: int, shift: float) -> list[float]:
     return minimax_h3_time_shift_sigmas(num_steps=num_steps, shift_scale=shift)
 
 
-def _make_state(request_id: str, model, branch, video_rows, audio_rows, sigmas_video, sigmas_audio):
+def _make_state(request_id: str, model, branch, video_rows, audio_rows, sigmas_video, sigmas_audio, sampler="euler"):
     from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as mod
     from vllm_omni.diffusion.worker.utils import StepRequestState
 
@@ -102,7 +102,11 @@ def _make_state(request_id: str, model, branch, video_rows, audio_rows, sigmas_v
     state.latents = video_rows.clone()
     state.timesteps = torch.tensor([1.0 - sigma for sigma in sigmas_video[:-1]], dtype=torch.float32)
     state.step_index = 0
+    from vllm_omni.diffusion.models.minimax_h3.sampling import create_h3_sample_solver
+
     state.extra = {
+        mod._STEP_VIDEO_SOLVER: create_h3_sample_solver(sampler, sigmas_video),
+        mod._STEP_AUDIO_SOLVER: create_h3_sample_solver(sampler, sigmas_audio),
         mod._STEP_BRANCH: branch,
         # Co-batched requests must share one DiT instance, or denoise_step()
         # treats the batch as mixed-task and falls back to one forward each.
@@ -130,8 +134,79 @@ def _step_pipeline(model, *, packed_batch_supported: bool = True):
     return pipeline
 
 
+@pytest.mark.parametrize("sampler", ["euler", "res_multistep"])
+@pytest.mark.parametrize("strength", [0.5, 0.125])
+def test_refine_preserves_partial_schedules_and_selected_sampler(sampler, strength, mocker):
+    """Refine must re-noise each stream at its start sigma and run only the remaining steps."""
+    from vllm_omni.diffusion.models.minimax_h3.denoise_loop import minimax_h3_denoise_loop
+    from vllm_omni.diffusion.models.minimax_h3.latent_upscaler import MiniMaxH3LatentRefineSpec
+    from vllm_omni.diffusion.models.minimax_h3.packed_tokens import (
+        minimax_h3_pack_audio_latent,
+        minimax_h3_patchify_video_latent,
+    )
+
+    model = mocker.Mock(wraps=_SegmentMeanModel())
+    pipeline = _step_pipeline(model)
+    refine = MiniMaxH3LatentRefineSpec(strength=strength)
+    video_latent = torch.full((1, 24, 2, 4, 6), 0.25)
+    audio_latent = torch.full((2, 32, 3), -0.5)
+    kwargs = dict(
+        task="t2va",
+        text_embeddings=torch.zeros(2, _HIDDEN),
+        text_tags=torch.ones(2, dtype=torch.long),
+        seed=17,
+        latent_t=2,
+        latent_h=4,
+        latent_w=6,
+        audio_t=3,
+        num_frames=22,
+        num_steps=8,
+        video_shift=12.0,
+        audio_shift=3.0,
+        base_schedule=None,
+        visual_condition=None,
+        visual_condition_shape=None,
+        audio_condition=None,
+        ref_audio_t=None,
+        sampler=sampler,
+        init_latents=(video_latent, audio_latent),
+        refine=refine,
+    )
+    inputs = pipeline._build_denoise_inputs(**kwargs)
+    remaining_steps = round(strength * 8)
+    expected_video_sigmas = _sigmas(8, 12.0)[8 - remaining_steps :]
+    expected_audio_sigmas = _sigmas(8, 3.0)[8 - remaining_steps :]
+    assert inputs["sigmas_video"] == expected_video_sigmas
+    assert inputs["sigmas_audio"] == expected_audio_sigmas
+    noise_video, noise_audio = pipeline._initial_noise(seed=17, latent_t=2, latent_h=4, latent_w=6, audio_t=3)
+    torch.testing.assert_close(
+        inputs["video_rows"], (1 - expected_video_sigmas[0]) * 0.25 + expected_video_sigmas[0] * noise_video
+    )
+    torch.testing.assert_close(
+        inputs["audio_rows"], (1 - expected_audio_sigmas[0]) * -0.5 + expected_audio_sigmas[0] * noise_audio
+    )
+    reference_video, reference_audio = minimax_h3_denoise_loop(
+        model=model,
+        positive=inputs["branch"],
+        initial_video_rows=inputs["video_rows"],
+        initial_audio_rows=inputs["audio_rows"],
+        keyframe_cond_rows=None,
+        audio_ref_rows=None,
+        sigmas_video=expected_video_sigmas,
+        sigmas_audio=expected_audio_sigmas,
+        device=torch.device("cpu"),
+        sampler=sampler,
+    )
+    model.reset_mock()
+    actual_video, actual_audio = pipeline.diffuse(**kwargs)
+    assert model.call_count == remaining_steps
+    torch.testing.assert_close(minimax_h3_patchify_video_latent(actual_video, patch_size=(1, 2, 2)), reference_video)
+    torch.testing.assert_close(minimax_h3_pack_audio_latent(actual_audio), reference_audio)
+
+
+@pytest.mark.parametrize("sampler", ["euler", "res_multistep"])
 @pytest.mark.parametrize("num_steps", [1, 8, 50])
-def test_step_execution_matches_request_mode_denoise_loop(num_steps, mocker):
+def test_step_execution_matches_request_mode_denoise_loop(num_steps, sampler, mocker):
     """Stepping through the contract must reproduce the request-mode loop."""
     from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as mod
     from vllm_omni.diffusion.models.minimax_h3.denoise_loop import minimax_h3_denoise_loop
@@ -142,6 +217,7 @@ def test_step_execution_matches_request_mode_denoise_loop(num_steps, mocker):
     sigmas_audio = _sigmas(num_steps, 3.0)
 
     reference_video, reference_audio = minimax_h3_denoise_loop(
+        sampler=sampler,
         model=model,
         positive=branch,
         initial_video_rows=video_rows,
@@ -155,7 +231,7 @@ def test_step_execution_matches_request_mode_denoise_loop(num_steps, mocker):
     assert model.call_count == num_steps
     model.reset_mock()
     pipeline = _step_pipeline(model)
-    state = _make_state("req-0", model, branch, video_rows, audio_rows, sigmas_video, sigmas_audio)
+    state = _make_state("req-0", model, branch, video_rows, audio_rows, sigmas_video, sigmas_audio, sampler=sampler)
     input_batch = SimpleNamespace(states=(state,))
 
     steps = 0
@@ -272,8 +348,11 @@ def test_step_execution_matches_request_mode_with_latent_edits():
     torch.testing.assert_close(state.extra[mod._STEP_AUDIO_ROWS], reference_audio)
 
 
+@pytest.mark.parametrize(
+    "samplers", [("euler", "euler"), ("res_multistep", "res_multistep"), ("euler", "res_multistep")]
+)
 @pytest.mark.parametrize("lock_audio", [False, True])
-def test_batched_step_execution_matches_independent_requests(lock_audio):
+def test_batched_step_execution_matches_independent_requests(lock_audio, samplers):
     """Two co-batched requests must land where they would have landed alone."""
     from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as mod
     from vllm_omni.diffusion.models.minimax_h3.latent_mask import MiniMaxH3LatentEdit
@@ -292,7 +371,9 @@ def test_batched_step_execution_matches_independent_requests(lock_audio):
     def make_state(request_id: str, index: int):
         branch, video_rows, audio_rows = _make_branch(**specs[index])
         sigmas_video, sigmas_audio = schedules[index]
-        state = _make_state(request_id, model, branch, video_rows, audio_rows, sigmas_video, sigmas_audio)
+        state = _make_state(
+            request_id, model, branch, video_rows, audio_rows, sigmas_video, sigmas_audio, sampler=samplers[index]
+        )
         video_mask = torch.linspace(0.1 * index, 0.8 + 0.1 * index, video_rows.shape[0])
         video_edit = MiniMaxH3LatentEdit.from_rows(
             torch.full_like(video_rows, 10.0 + index),
