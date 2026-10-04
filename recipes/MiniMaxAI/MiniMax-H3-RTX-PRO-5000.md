@@ -1,8 +1,9 @@
 # MiniMax-H3 on RTX PRO 5000 Blackwell GPUs
 
 This recipe runs MiniMax-H3 in BF16 on 72 GiB RTX PRO 5000 Blackwell GPUs. It
-contains the validated two-GPU DLO configuration and the recommended resident
-configurations: TP1 x Ulysses2 with 20 resident layers on two GPUs, TP2 x
+contains the two-GPU DLO configuration validated before SM120 exact VAE ops
+and the recommended resident configurations: TP1 x Ulysses2 with 20 resident
+layers on two GPUs, TP2 x
 Ulysses2 on four GPUs, and TP4 x Ulysses2 on eight GPUs. The four- and
 eight-GPU routes do not require offload.
 
@@ -41,8 +42,9 @@ reproduce the same PCIe and NUMA relationships on the target host.
 
 ### Two GPUs
 
-Two 72 GiB cards require distributed layerwise offload. The validated route
-uses TP1 x Ulysses2, keeps 20 leading DiT layers resident, and streams
+Two 72 GiB cards require distributed layerwise offload. The route validated
+before SM120 exact VAE ops uses TP1 x Ulysses2, keeps 20 leading DiT layers
+resident, and streams
 rank-local weights without AllGather. Eager execution avoids regional-compile
 instability on this offload path.
 
@@ -144,6 +146,12 @@ For Ref2VA, stop the FL2VA server and restart the same command with
 `MODEL="${MODEL_ROOT}/Ref2VA"`.
 
 ## Target-hardware validation
+
+These measurements predate the SM120 exact VAE operator dispatch and decoder
+Linear FP16 precast. Their VAE decode, end-to-end, and memory figures have not
+been revalidated with that path enabled. The new operator evidence is limited
+to a single RTX 5090 D v2 using tiled eager decode; it does not validate these
+multi-GPU configurations, including the two-GPU DLO residency-staging route.
 
 All three configurations were exercised on a PCIe-only, dual-socket host with
 eight RTX PRO 5000 GPUs. The run used PyTorch 2.11.0+cu130, CUDA 13.0, driver

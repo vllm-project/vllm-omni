@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+from contextlib import nullcontext
 from unittest.mock import Mock
 
 import pytest
@@ -10,7 +11,7 @@ import torch.nn.functional as F
 
 from vllm_omni.platforms import current_omni_platform
 
-pytestmark = [pytest.mark.core_model, pytest.mark.gpu, pytest.mark.diffusion]
+pytestmark = [pytest.mark.core_model, pytest.mark.gpu, pytest.mark.cuda, pytest.mark.diffusion]
 
 
 def _selected_operators():
@@ -60,7 +61,7 @@ def _failing_norm_input(_module, _hidden_states):
     raise RuntimeError("unsupported remote normalization semantics")
 
 
-@pytest.mark.parametrize(("batch", "sequence"), [(1, 1), (1, 195), (2, 1797)])
+@pytest.mark.parametrize(("batch", "sequence"), [(1, 1), (1, 195), (2, 1797), (1, 8192)])
 def test_h3_vae_qk_norm_rope_is_bit_exact(batch, sequence):
     device, operators = _selected_operators()
 
@@ -88,12 +89,13 @@ def test_h3_vae_qk_norm_rope_is_bit_exact(batch, sequence):
     assert torch.equal(actual_k, expected_k)
 
 
-def test_h3_vae_scaled_residual_is_bit_exact():
+@pytest.mark.parametrize("rows", [1, 195, 8192])
+def test_h3_vae_scaled_residual_is_bit_exact(rows):
     device, operators = _selected_operators()
 
     torch.manual_seed(29)
-    residual = torch.randn(195, 2048, device=device, dtype=torch.float32)
-    branch = torch.randn(195, 2048, device=device, dtype=torch.float16)
+    residual = torch.randn(rows, 2048, device=device, dtype=torch.float32)
+    branch = torch.randn(rows, 2048, device=device, dtype=torch.float16)
     scale = torch.randn(2048, device=device, dtype=torch.float32)
     expected = residual + branch * scale
 
@@ -247,6 +249,42 @@ def test_h3_vae_install_precasts_only_block_linears(monkeypatch):
     )
 
 
+def test_h3_vae_install_survives_residency_staging(monkeypatch, mocker):
+    from vllm_omni.diffusion.models.minimax_h3.ops import vae as vae_ops
+    from vllm_omni.diffusion.offloader import module_residency
+
+    operators = _operator_set()
+    monkeypatch.setattr(vae_ops, "resolve_h3_vae_operators", lambda _device: operators)
+    # Keep real storage rebinding on CPU; only accelerator runtime calls
+    # are mocked. This does not validate CUDA transfers or multi-GPU DLO.
+    for name in ("Stream", "Event", "current_stream", "synchronize", "empty_cache"):
+        monkeypatch.setattr(module_residency.current_omni_platform, name, mocker.Mock())
+    monkeypatch.setattr(module_residency.current_omni_platform, "stream", lambda _stream: nullcontext())
+    decoder = _make_decoder()
+    assert vae_ops.install_h3_vae_optimizations(decoder, device=torch.device("cpu"))
+    expected = {name: tensor.detach().clone() for name, tensor in decoder.state_dict().items()}
+    stager = module_residency.PinnedModuleStager(decoder, torch.device("cpu"), pin_memory=False)
+    master_ptr = decoder.transformer_blocks[0].attn.to_qkv.weight.data_ptr()
+
+    for _ in range(2):
+        for transition, loaded in ((stager.load, True), (stager.offload, False)):
+            transition()
+            assert stager.loaded is loaded
+            assert (decoder.transformer_blocks[0].attn.to_qkv.weight.data_ptr() != master_ptr) is loaded
+            for name, tensor in decoder.state_dict().items():
+                assert tensor.dtype == expected[name].dtype
+                assert torch.equal(tensor, expected[name])
+            for block in decoder.transformer_blocks:
+                for module in block.modules():
+                    if isinstance(module, nn.Linear):
+                        assert module.weight.dtype == torch.float16
+                assert block.forward.__func__ is vae_ops._optimized_transformer_block
+                assert block.attn.forward.__func__ is vae_ops._optimized_attention
+                assert block.ff.forward.__func__ is vae_ops._optimized_feed_forward
+                assert block.attn._omni_qk_norm_rope is operators.qk_norm_rope
+                assert block._omni_scaled_residual is operators.scaled_residual
+
+
 def test_h3_vae_install_accepts_remote_integer_parallel_flag(monkeypatch):
     from vllm_omni.diffusion.models.minimax_h3.ops import vae as vae_ops
 
@@ -375,11 +413,19 @@ def test_h3_vae_dispatch_selects_supported_cuda_capabilities(monkeypatch):
     platform.is_available.return_value = True
     monkeypatch.setattr(dispatch, "HAS_TRITON", True)
     monkeypatch.setattr(dispatch, "current_omni_platform", platform)
+    monkeypatch.setattr(torch.version, "hip", None)
 
-    for capability in (90, 100, 103):
+    for capability in (90, 100, 103, 120):
         platform.get_device_capability.return_value.to_int.return_value = capability
         assert dispatch.resolve_h3_vae_operators(torch.device("cuda:0")) is not None
 
-    for capability in (89, 101, 110):
+    for capability in (89, 101, 110, 121):
         platform.get_device_capability.return_value.to_int.return_value = capability
         assert dispatch.resolve_h3_vae_operators(torch.device("cuda:0")) is None
+
+    monkeypatch.setattr(torch.version, "hip", "6.3.0")
+    platform.get_device_capability.reset_mock()
+    for capability in (90, 100, 103, 120):
+        platform.get_device_capability.return_value.to_int.return_value = capability
+        assert dispatch.resolve_h3_vae_operators(torch.device("cuda:0")) is None
+    platform.get_device_capability.assert_not_called()

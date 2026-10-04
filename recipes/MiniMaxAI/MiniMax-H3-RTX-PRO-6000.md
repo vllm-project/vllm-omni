@@ -8,6 +8,7 @@ CPU offload and distributed layerwise offload are not required in any of
 these configurations.
 
 Validated on:
+
 - Host: YLX Y762
 - GPUs: 8 × RTX PRO 6000 Blackwell (96 GiB)
 - Device order: default (`CUDA_VISIBLE_DEVICES` not set)
@@ -23,7 +24,7 @@ Validated on:
 | Checkpoint storage | 135 GiB per partition | 135 GiB per partition | 135 GiB per partition |
 | Available system RAM | 200 GiB minimum | 200 GiB minimum | 200 GiB minimum |
 | Recommended system RAM | 384 GiB | 384 GiB | 384 GiB |
-| Measured peak HBM per GPU | 77.49 GiB | 66.44 GiB | 61.07 GiB |
+| Measured peak HBM per GPU (before SM120 exact VAE ops) | 77.49 GiB | 66.44 GiB | 61.07 GiB |
 
 `FL2VA` and `Ref2VA` are separate checkpoint partitions. Start one server at
 a time on a host sized for the minimum system-memory requirement, or pass
@@ -233,6 +234,12 @@ layerwise offload.
 
 ## Target-hardware validation
 
+These measurements predate the SM120 exact VAE operator dispatch and decoder
+Linear FP16 precast. Their VAE decode, end-to-end, and memory figures have not
+been revalidated with that path enabled. The new operator evidence is limited
+to a single RTX 5090 D v2 using tiled eager decode; it does not validate these
+multi-GPU configurations or patch-parallel scaling.
+
 T2VA, 1344×768, `duration=5.0`, `fps=24`, 50 steps, `flow_shift=12`,
 `seed=1101`, BF16, `CUDNN_ATTN`, tiled VAE, one request at a time. Servers
 were started with the commands above — default device order, no NUMA
@@ -247,7 +254,7 @@ preceded each measured request.
 | Per step | 5.571 s | 3.375 s | 1.758 s |
 | VAE decode | 5.396 s | 2.791 s | 1.798 s |
 | Client E2E | 284.76 s | 172.32 s | 90.48 s |
-| Peak HBM per GPU | 77.49 GiB | 66.44 GiB | 61.07 GiB |
+| Peak HBM per GPU (before SM120 exact VAE ops) | 77.49 GiB | 66.44 GiB | 61.07 GiB |
 | Headroom below 96 GiB | 18.5 GiB | 29.6 GiB | 34.9 GiB |
 
 Stage times are read from the `X-Stage-Durations` response header of
@@ -281,7 +288,7 @@ Peak memory falls by 11.05 GiB from two to four GPUs and by a further
 because all three configurations shard the DiT with TP2 and hold identical
 weights per GPU. Fitting the first two points gives:
 
-```
+```text
 peak HBM per GPU ≈ 55.4 GiB + 22.1 GiB / ulysses_degree
 ```
 
