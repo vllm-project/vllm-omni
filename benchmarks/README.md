@@ -4,6 +4,11 @@ This directory contains benchmark suites for evaluating different model families
 
 ## Benchmark families
 
+### [Qwen3-Omni](qwen3_omni/README.md) — Seed-TTS Realtime Turn-Trigger Performance
+
+Matched audio and text over explicit-commit Realtime turns and server-VAD
+Realtime turns, with client-observed text/audio latency and RTF.
+
 ### [Qwen2.5-Omni](qwen2_5_omni/README.md) — Embedding Wrapper Latency
 
 CPU-observed A/B timings for redundant text embedding removal, with real checkpoint

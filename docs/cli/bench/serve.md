@@ -4,7 +4,7 @@ The vllm bench command launches the vLLM-Omni benchmark to evaluate the performa
 
 ## Notes
 
-vLLM-Omni registers the `openai-chat-omni`, `openai-audio-speech`, `openai-image-edits-omni`, `daily-omni`, and `openai-realtime-duplex` serving benchmark backends. It also adds the `omniinteract` dataset.
+vLLM-Omni registers the `openai-chat-omni`, `openai-audio-speech`, `openai-image-edits-omni`, `daily-omni`, `openai-realtime-duplex`, `openai-realtime-tts`, and `openai-realtime-chat` serving benchmark backends. It also adds the `omniinteract` dataset.
 
 ## Basic Parameter Description
 
@@ -14,7 +14,16 @@ You can use `vllm bench serve --omni --help=all` to get descriptions of all para
   Enable Omni (multimodal) mode, supporting multimodal inputs and outputs such as images, videos, and audio.
 
 - `--backend`
-  Specify the backend adapter. vLLM-Omni adds `openai-chat-omni`, `openai-audio-speech`, `openai-image-edits-omni`, `daily-omni`, and `openai-realtime-duplex` to the upstream vLLM backend choices.
+  Specify the backend adapter. vLLM-Omni adds `openai-chat-omni`, `openai-audio-speech`, `openai-image-edits-omni`, `daily-omni`, `openai-realtime-duplex`, `openai-realtime-tts`, and `openai-realtime-chat` to the upstream vLLM backend choices.
+
+  The three WebSocket backends all talk to `/v1/realtime`, but they drive different turn shapes:
+
+  | Backend | Turn shape |
+  | --- | --- |
+  | `openai-realtime-duplex` / `openai-realtime-tts` | One session per utterance; the target text rides the session context (`duplex_initial_user_text`) and the client streams silence so a model-native duplex session has audio units to speak on. Reports server-side `ttft_ms`/`ttfp_ms` when the server returns them, and Stage-0 engine TPOT. |
+  | `openai-realtime-chat` | One session per utterance; the target text is a `conversation.item.create` message and real reference speech is streamed as an ordinary audio turn. Reports client-observed timings measured from the end of that speech. Requires `--seed-tts-reference-as-input`. |
+
+  Because those two report from different origins, their TTFT/TTFP/RTF numbers are not comparable with each other.
 
 - `--model`
   The model identifier to load, filled according to the models supported by vLLM-Omni.
@@ -408,6 +417,46 @@ chunks. Official-manifest eligibility is reported separately because clipped or 
 signal, not a transport failure. Accuracy must finish with `status=ok` on every subset. After all three subsets finish,
 All Global IA-QTF1 is recomputed from pooled `Global_TP` / `Global_FP` / `Global_FN` and must be at or above
 `omniinteract_aggregate_min_ia_qtf1` (checked in as `0.2`).
+
+### Seed-TTS reference speech as real audio input
+
+By default the Seed-TTS dataset sends its reference clip as voice-cloning metadata: `ref_audio` / `ref_text` ride the
+request body and the model is asked to synthesize the target text in that voice.
+
+`--seed-tts-reference-as-input` changes the request shape instead of the request contents. The reference clip becomes an
+ordinary **user audio turn**, `ref_audio` / `ref_text` are dropped entirely, and the system prompt asks the model to read
+the accompanying text rather than transcribe or answer the audio. This is what makes the workload exercise a real duplex
+conversation turn rather than a TTS call. It requires `--backend openai-realtime-chat`.
+
+```bash
+vllm bench serve --omni \
+  --backend openai-realtime-chat \
+  --endpoint /v1/realtime \
+  --dataset-name seed-tts \
+  --dataset-path zhaochenyang20/seed-tts-eval \
+  --seed-tts-reference-as-input \
+  --seed-tts-locale en \
+  --model Qwen/Qwen3-Omni-30B-A3B-Instruct \
+  --base-url http://127.0.0.1:8000 \
+  --num-prompts 4 --max-concurrency 1 --output-len 256 \
+  --percentile-metrics ttft,e2el,audio_ttfp,audio_rtf,audio_duration \
+  --extra-body '{"realtime_trigger": "vad"}'
+```
+
+Each clip is normalized once to mono 24 kHz PCM16 and a one-second silent tail is appended. `realtime_trigger` selects how
+the turn ends:
+
+- `explicit` — the client streams the speech at real-time speed and then sends `input_audio_buffer.commit` plus
+  `response.create`. The silent tail is **not** sent: an explicit client ends the turn when the speaker stops, so
+  streaming silence first would charge it for latency no real caller pays.
+- `vad` — the client streams the speech *and* the tail, and server VAD ends the turn on its own. The tail must stay longer
+  than the session's `silence_duration_ms` or the turn never ends.
+
+All reported latencies start at the end of the reference speech, which is the instant a live speaker stops talking and
+begins waiting. Timing from session start instead would fold the client's own real-time upload into TTFT/TTFP/RTF, making
+the numbers a function of each clip's length rather than of the model. `duplex_request_metrics` keeps the session-start
+values (`session_start_to_first_audio_ms`, `session_start_to_response_done_ms`) plus the trigger breakdown
+(`explicit_commit_to_first_audio_ms`, or `vad_stop_received_ms` / `vad_stop_to_first_audio_ms`) for diagnosis.
 
 ### Video-MME Benchmark
 

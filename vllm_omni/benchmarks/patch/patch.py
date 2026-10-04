@@ -319,6 +319,7 @@ def _attach_seed_tts_to_request_func_input(sample: SampleRequest, rfi: RequestFu
     setattr(rfi, "seed_tts_system_prompt", sys_prompt)
     setattr(rfi, "seed_tts_speech_extra", sample.seed_tts_speech_extra)
     setattr(rfi, "seed_tts_turns", sample.seed_tts_turns)
+    setattr(rfi, "seed_tts_utterance_id", sample.seed_tts_utterance_id)
     setattr(
         rfi,
         "omni_chat_messages",
@@ -327,6 +328,11 @@ def _attach_seed_tts_to_request_func_input(sample: SampleRequest, rfi: RequestFu
             {"role": "user", "content": [{"type": "text", "text": sample.prompt}]},
         ],
     )
+    if sample.seed_tts_input_audio is not None:
+        # Carried as raw PCM for the Realtime backend to pace over the socket,
+        # not as chat content: the reference speech is an audio turn, not a
+        # message attachment.
+        setattr(rfi, "seed_tts_input_audio", sample.seed_tts_input_audio)
     ex = sample.seed_tts_speech_extra
     if not ex:
         return  # voice comes from --extra-body in config; no ref_audio to merge
@@ -817,11 +823,12 @@ def get_samples(args, tokenizer, **kwargs):
             "openai-chat-omni",
             "openai-realtime-duplex",
             "openai-realtime-tts",
+            "openai-realtime-chat",
         ):
             raise ValueError(
                 "Seed-TTS requires --backend openai-audio-speech (POST /v1/audio/speech) or "
                 "--backend openai-chat-omni (POST /v1/chat/completions with ref_audio/ref_text), or "
-                "--backend openai-realtime-duplex or openai-realtime-tts "
+                "--backend openai-realtime-duplex, openai-realtime-tts or openai-realtime-chat "
                 "(WebSocket /v1/realtime). "
                 f"Got backend={args.backend!r}."
             )
@@ -831,6 +838,11 @@ def get_samples(args, tokenizer, **kwargs):
                 "Seed-TTS requires --dataset-path (HF dataset repo id or local directory) or "
                 "--hf-name for the Hub dataset id."
             )
+        reference_as_input = bool(getattr(args, "seed_tts_reference_as_input", False))
+        if reference_as_input and (args.dataset_name != "seed-tts" or args.backend != "openai-realtime-chat"):
+            raise ValueError("--seed-tts-reference-as-input requires seed-tts with --backend openai-realtime-chat")
+        if args.backend == "openai-realtime-chat" and not reference_as_input:
+            raise ValueError("openai-realtime-chat requires --seed-tts-reference-as-input")
         turns_per_session = int(getattr(args, "seed_tts_turns_per_session", 1))
         if turns_per_session > 1 and args.backend not in {
             "openai-realtime-duplex",
@@ -869,6 +881,7 @@ def get_samples(args, tokenizer, **kwargs):
             request_id_prefix=args.request_id_prefix,
             no_oversample=args.no_oversample,
             turns_per_session=turns_per_session,
+            reference_as_input=reference_as_input,
         )
 
     # Handle random-mm dataset (Omni's synthetic multimodal dataset)
@@ -3216,6 +3229,36 @@ async def async_request_openai_realtime_duplex(
     if pbar:
         pbar.update(1)
     return output
+
+
+async def async_request_openai_realtime_chat(
+    request_func_input: RequestFuncInput,
+    session: aiohttp.ClientSession,
+    pbar: tqdm | None = None,
+) -> MixRequestFuncOutput:
+    from vllm_omni.benchmarks.realtime_seed_tts import run_realtime_seed_tts
+
+    del session
+    output = MixRequestFuncOutput()
+    output.prompt_len = request_func_input.prompt_len
+    output.start_time = time.perf_counter()
+    try:
+        metrics = await run_realtime_seed_tts(request_func_input)
+        for key, value in metrics.items():
+            setattr(output, key, value)
+        output.success = True
+    except Exception:
+        output.success = False
+        output.error = traceback.format_exc()
+        logger.error("Seed-TTS Realtime chat request failed: %s", output.error)
+    if pbar:
+        pbar.update(1)
+    return output
+
+
+ASYNC_REQUEST_FUNCS["openai-realtime-chat"] = async_request_openai_realtime_chat
+if "openai-realtime-chat" not in OPENAI_COMPATIBLE_BACKENDS:
+    OPENAI_COMPATIBLE_BACKENDS.append("openai-realtime-chat")
 
 
 ASYNC_REQUEST_FUNCS["openai-chat-omni"] = async_request_openai_chat_omni_completions
