@@ -20,7 +20,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import vllm.forward_context as vllm_forward_context
 from cache_dit import ForwardPattern
-from transformers.cache_utils import DynamicCache
+from transformers.cache_utils import DynamicCache, DynamicLayer
 from vllm.config import get_current_vllm_config, get_current_vllm_config_or_none
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.logger import init_logger
@@ -73,9 +73,30 @@ def create_block_causal_mask(index: torch.Tensor):
     return torch.where(mask[None, None], 0.0, float("-inf"))
 
 
+class FlashKVLayer(DynamicLayer):
+    """Expose the HF [B,H,S,D] API over contiguous [B,S,H,D] storage."""
+
+    def update(self, key_states, value_states, *args, **kwargs):
+        k, v = key_states.transpose(1, 2), value_states.transpose(1, 2)
+        if not self.is_initialized:
+            self.dtype, self.device = k.dtype, k.device
+            k, v = k.contiguous(), v.contiguous()
+            self.is_initialized = True
+        else:
+            k = torch.cat((self.keys.transpose(1, 2), k), dim=1)
+            v = torch.cat((self.values.transpose(1, 2), v), dim=1)
+        self.keys, self.values = k.transpose(1, 2), v.transpose(1, 2)
+        return self.keys, self.values
+
+
+class FlashKVCache(DynamicCache):
+    def __init__(self):
+        super().__init__()
+        self.layer_class_to_replicate = FlashKVLayer
+
+
 def prepare_flash_kv_cache(past_key_values, current_len: int, batch_size: int):
-    """Convert prefix cache [B,H,S,D] → flash layout [B,S,H,D] and
-    preallocate buffers for [prefix + current] tokens."""
+    """Reserve a current-step suffix while keeping the prefix in flash layout."""
     if past_key_values is None:
         return
     for layer in past_key_values.layers:
@@ -86,8 +107,8 @@ def prepare_flash_kv_cache(past_key_values, current_len: int, batch_size: int):
             layer.flash_k_cache = None
             layer.flash_v_cache = None
             continue
-        past_k_flash = past_k.transpose(1, 2).contiguous()
-        past_v_flash = past_v.transpose(1, 2).contiguous()
+        past_k_flash = past_k.transpose(1, 2)
+        past_v_flash = past_v.transpose(1, 2)
         prefix_len = past_k_flash.shape[1]
         total_len = prefix_len + current_len
         k_cache = torch.empty(
@@ -98,6 +119,8 @@ def prepare_flash_kv_cache(past_key_values, current_len: int, batch_size: int):
         v_cache = torch.empty_like(k_cache)
         k_cache[:, :prefix_len].copy_(past_k_flash)
         v_cache[:, :prefix_len].copy_(past_v_flash)
+        layer.keys = k_cache[:, :prefix_len].transpose(1, 2)
+        layer.values = v_cache[:, :prefix_len].transpose(1, 2)
         layer.flash_prefix_len = prefix_len
         layer.flash_total_len = total_len
         layer.flash_k_cache = k_cache
@@ -457,7 +480,9 @@ class SenseNovaU1Attention(nn.Module):
         attn_metadata = AttentionMetadata(attn_mask=attention_mask) if attention_mask is not None else None
         return self.attn(query_bshd, key_bshd, value_bshd, attn_metadata)
 
-    def _project_and_rope(self, hidden_states, position_embeddings, qkv_proj, q_norm, k_norm, q_norm_hw, k_norm_hw):
+    def _project_and_rope(
+        self, hidden_states, position_embeddings, qkv_proj, q_norm, k_norm, q_norm_hw, k_norm_hw, kv_output=None
+    ):
         """Project Q/K/V via the given QKVParallelLinear and apply 3D RoPE.
 
         The three tables come from the model, which builds them once per forward
@@ -493,8 +518,11 @@ class SenseNovaU1Attention(nn.Module):
                 cos_w,
                 sin_w,
                 self.config.rms_norm_eps,
+                key_output=kv_output[0] if kv_output is not None else None,
+                value=v if kv_output is not None else None,
+                value_output=kv_output[1] if kv_output is not None else None,
             )
-            return query_states, key_states, value_states
+            return query_states, key_states, kv_output[1] if kv_output is not None else value_states
         logger.debug("Triton fused SenseNova qk norm rope unavailable; using PyTorch fallback")
 
         # Split head_dim into t and hw halves
@@ -519,6 +547,10 @@ class SenseNovaU1Attention(nn.Module):
         # Reassemble: [B, H, S, head_dim]
         query_states = torch.cat([q_t, q_h, q_w], dim=-1)
         key_states = torch.cat([k_t, k_h, k_w], dim=-1)
+        if kv_output is not None:
+            kv_output[0].copy_(key_states)
+            kv_output[1].copy_(value_states)
+            key_states, value_states = kv_output
         return query_states, key_states, value_states
 
     def forward_und(self, hidden_states, indexes, attention_mask, past_key_values=None, **kwargs):
@@ -561,6 +593,17 @@ class SenseNovaU1Attention(nn.Module):
     def forward_gen(self, hidden_states, indexes, attention_mask, past_key_values=None, **kwargs):
         """Generation path — unified Attention, bidirectional with optional KV cache."""
         input_shape = hidden_states.shape[:-1]
+        update_cache = kwargs.get("update_cache", True)
+        kv_output = None
+        if attention_mask is None and past_key_values is not None and not update_cache:
+            layer = past_key_values.layers[self.layer_idx]
+            if getattr(layer, "flash_k_cache", None) is not None:
+                start = layer.flash_prefix_len
+                end = start + input_shape[1]
+                kv_output = (
+                    layer.flash_k_cache[:, start:end].transpose(1, 2),
+                    layer.flash_v_cache[:, start:end].transpose(1, 2),
+                )
         query_states, key_states, value_states = self._project_and_rope(
             hidden_states,
             kwargs["position_embeddings"],
@@ -569,14 +612,14 @@ class SenseNovaU1Attention(nn.Module):
             self.k_norm_mot_gen,
             self.q_norm_hw_mot_gen,
             self.k_norm_hw_mot_gen,
+            kv_output=kv_output,
         )
-        update_cache = kwargs.get("update_cache", True)
 
         if attention_mask is None:
             # Bidirectional path: no causal mask, optionally attend to a prefix.
             q = query_states.transpose(1, 2).contiguous()  # [B,S,H,D]
-            k_cur = key_states.transpose(1, 2).contiguous()
-            v_cur = value_states.transpose(1, 2).contiguous()
+            k_cur = key_states.transpose(1, 2)
+            v_cur = value_states.transpose(1, 2)
 
             if past_key_values is not None:
                 if update_cache:
@@ -588,16 +631,14 @@ class SenseNovaU1Attention(nn.Module):
                     if hasattr(layer, "flash_k_cache") and layer.flash_k_cache is not None:
                         prefix_len = layer.flash_prefix_len
                         cur_len = k_cur.shape[1]
-                        layer.flash_k_cache[:, prefix_len : prefix_len + cur_len].copy_(k_cur)
-                        layer.flash_v_cache[:, prefix_len : prefix_len + cur_len].copy_(v_cur)
                         k = layer.flash_k_cache[:, : prefix_len + cur_len]
                         v = layer.flash_v_cache[:, : prefix_len + cur_len]
                     else:
                         past_k = past_key_values.layers[self.layer_idx].keys
                         past_v = past_key_values.layers[self.layer_idx].values
                         if past_k is not None:
-                            k = torch.cat([past_k.transpose(1, 2).contiguous(), k_cur], dim=1)
-                            v = torch.cat([past_v.transpose(1, 2).contiguous(), v_cur], dim=1)
+                            k = torch.cat([past_k.transpose(1, 2), k_cur], dim=1)
+                            v = torch.cat([past_v.transpose(1, 2), v_cur], dim=1)
                         else:
                             k, v = k_cur, v_cur
             else:
@@ -778,7 +819,7 @@ class SenseNovaU1Model(nn.Module):
             inputs_embeds = self.embed_tokens(input_ids)
 
         if use_cache and past_key_values is None:
-            past_key_values = DynamicCache()
+            past_key_values = FlashKVCache()
 
         # Resolve attention mask. Callers must always provide `indexes`; this
         # keeps the model stateless and safe under concurrent requests.
