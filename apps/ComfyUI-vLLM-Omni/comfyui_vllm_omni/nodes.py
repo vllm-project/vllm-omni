@@ -1069,6 +1069,7 @@ class VLLMOmniLatentMaskEditing:
                 "source_audio": ("AUDIO",),
                 "video_mask": ("MASK",),
                 "audio_mask": ("FLOAT", {"default": -1.0, "min": -1.0, "max": 1.0, "step": 0.01}),
+                "audio_temporal_mask": ("MASK",),
             },
         }
 
@@ -1083,6 +1084,7 @@ class VLLMOmniLatentMaskEditing:
         source_audio: AudioInput | None = None,
         video_mask: torch.Tensor | None = None,
         audio_mask: float = -1.0,
+        audio_temporal_mask: torch.Tensor | None = None,
         **kwargs,
     ):
         if kwargs:
@@ -1096,6 +1098,8 @@ class VLLMOmniLatentMaskEditing:
             edit["video_mask"] = video_mask
         if audio_mask >= 0.0:
             edit["audio_mask"] = audio_mask
+        if audio_temporal_mask is not None:
+            edit["audio_temporal_mask"] = audio_temporal_mask
         return (edit,)
 
 
