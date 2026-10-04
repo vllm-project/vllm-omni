@@ -78,6 +78,7 @@ th {
 | `MammothModa2ForConditionalGeneration` | MammothModa2-Dev (AR-only image understanding) | `bytedance-research/MammothModa2-Dev` | ✅︎ | | | | — |
 | `Flux2KleinPipeline` | FLUX.2-klein | `black-forest-labs/FLUX.2-klein-4B`, `black-forest-labs/FLUX.2-klein-9B` | ✅︎ | ✅︎ | ✅︎ | ✅︎ | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/black-forest-labs/FLUX.2-klein.md) |
 | `FluxKontextPipeline` | FLUX.1-Kontext-dev | `black-forest-labs/FLUX.1-Kontext-dev` | ✅︎ | ✅︎ | | ✅︎ | — |
+| `NucleusMoEImagePipeline` | NucleusImage (MoE) | `NucleusAI/Nucleus-Image` | ✅︎ | ✅︎ | ✅︎ | ✅︎ | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/NucleusAI/Nucleus-Image.md) |
 | `FluxPipeline` | FLUX.1-dev | `black-forest-labs/FLUX.1-dev` | ✅︎ | ✅︎ | | ✅︎ | — |
 | `FluxPipeline` | FLUX.1-schnell | `black-forest-labs/FLUX.1-schnell` | ✅︎ | ✅︎ | | ✅︎ | — |
 | `OmniGen2Pipeline` | OmniGen2 | `OmniGen2/OmniGen2` | ✅︎ | ✅︎ | | ✅︎ | — |

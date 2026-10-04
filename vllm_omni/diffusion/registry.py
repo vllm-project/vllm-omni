@@ -365,6 +365,11 @@ _DIFFUSION_MODELS = {
         "pipeline_diffusers_adapter",
         "DiffusersAdapterPipeline",
     ),
+    "NucleusMoEImagePipeline": (
+        "nucleus_image",
+        "pipeline_nucleus_image",
+        "NucleusMoEImagePipeline",
+    ),
     "HiDreamImagePipeline": (
         "hidream_image",
         "pipeline_hidream_image",
@@ -696,6 +701,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "Magi2Pipeline": "get_magi2_post_process_func",
     "SeedVR2Pipeline": "get_seedvr2_post_process_func",
     "OmniVoicePipeline": "get_omnivoice_post_process_func",
+    "NucleusMoEImagePipeline": "get_nucleus_image_post_process_func",
     "SenseNovaU1Pipeline": "get_sensenova_u1_post_process_func",
     "Cosmos3OmniDiffusersPipeline": "get_cosmos3_post_process_func",
     "Cosmos3OmniPipeline": "get_cosmos3_post_process_func",
