@@ -132,6 +132,12 @@ def _build_svdquant(**kw: Any) -> QuantizationConfig:
     return DiffusionSVDQuantConfig.from_config(kw)
 
 
+def _build_comfy_nvfp4(**kw: object) -> QuantizationConfig:
+    from .comfy_nvfp4_config import ComfyNvfp4Config
+
+    return ComfyNvfp4Config.from_config(kw)
+
+
 def _build_inc(**kw: Any) -> QuantizationConfig:
     """Lazy import for INC/AutoRound config with checkpoint kwarg normalization."""
     from .inc_config import OmniINCConfig
@@ -174,6 +180,7 @@ _OVERRIDES: dict[str, Callable[..., QuantizationConfig]] = {
     "mxfp4": _build_mxfp4,
     "mxfp4_dualscale": _build_mxfp4_dualscale,
     "svdquant": _build_svdquant,
+    "comfy_nvfp4": _build_comfy_nvfp4,
     "inc": _build_inc,
     "auto-round": _build_inc,
     "auto_round": _build_inc,
