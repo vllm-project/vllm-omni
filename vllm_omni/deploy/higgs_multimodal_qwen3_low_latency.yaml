@@ -87,3 +87,15 @@ stages:
       max_tokens: 65536
       seed: 42
       repetition_penalty: 1.0
+
+platforms:
+  xpu:
+    stages:
+      - stage_id: 0
+        # FlashInfer is not supported on XPU, and CUDA graph capture fails here.
+        # Both stages share one 32 GiB card.
+        attention_backend: FLASH_ATTN
+        enforce_eager: true
+        gpu_memory_utilization: 0.4
+      - stage_id: 1
+        gpu_memory_utilization: 0.15

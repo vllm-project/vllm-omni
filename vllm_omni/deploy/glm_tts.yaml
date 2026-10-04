@@ -81,3 +81,10 @@ stages:
       use_dit_cuda_graphs: true
     disable_hybrid_kv_cache_manager: true
     skip_mm_profiling: true
+
+platforms:
+  xpu:
+    stages:
+      - stage_id: 1
+        # XPU flash attention has no float32 kernel.
+        dtype: bfloat16

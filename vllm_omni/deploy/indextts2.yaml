@@ -54,3 +54,14 @@ stages:
     default_sampling_params:
       temperature: 0.0
       max_tokens: 32767
+
+platforms:
+  xpu:
+    stages:
+      - stage_id: 0
+        # Stage 0 bf16 drifts on XPU. Eager float32 plus a colder sample holds it.
+        enforce_eager: true
+        dtype: float32
+        default_sampling_params:
+          temperature: 0.1
+          top_p: 0.95

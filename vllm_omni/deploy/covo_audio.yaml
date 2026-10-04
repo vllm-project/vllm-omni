@@ -44,3 +44,11 @@ stages:
       max_tokens: 2048
       seed: 42
       repetition_penalty: 1.1
+
+platforms:
+  xpu:
+    stages:
+      - stage_id: 0
+        # 32 GiB card: 0.7 leaves KV room after the ~18.5 GiB non-KV footprint.
+        gpu_memory_utilization: 0.7
+        max_model_len: 8192

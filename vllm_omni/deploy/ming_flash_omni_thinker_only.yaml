@@ -32,5 +32,12 @@ stages:
       detokenize: true
       ignore_eos: false
 
-# Ming-flash-omni-2.0 has only been verified on CUDA devices
-platforms: {}
+platforms:
+  xpu:
+    stages:
+      - stage_id: 0
+        # TP=4 puts ~26 GiB of BF16 weights on each 32 GiB card and OOMs.
+        devices: "0,1,2,3,4,5,6,7"
+        tensor_parallel_size: 8
+        enforce_eager: true
+        skip_mm_profiling: true
