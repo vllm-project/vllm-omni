@@ -18,12 +18,21 @@ The generic example formats the AR prompt, drives the AR → DiT stage pipeline,
 and forwards MammothModa2-specific generation parameters through the
 pipeline-declared `extra_body` contract.
 
-MammothModa2's DiT stage runs in the shared diffusion runtime in request mode.
-The first integration intentionally supports one request and one image per
-forward only (`max_num_seqs: 1`, `num_outputs_per_prompt: 1`). Request-level
-batching, step execution, continuous batching, cache acceleration,
-compilation, quantization, parallelism, and offload are not enabled by this
-recipe.
+MammothModa2's DiT stage runs in the shared diffusion runtime. The default
+`mammoth_moda2.yaml` uses request-level batching with up to eight compatible
+requests (`max_num_seqs: 8`) and one image per request
+(`num_outputs_per_prompt: 1`). Cache-DiT is optional in request mode and can
+be enabled using the commented settings in that YAML.
+
+To use step execution and continuous batching, select
+[`mammoth_moda2_step.yaml`](../../vllm_omni/deploy/mammoth_moda2_step.yaml)
+with `--deploy-config vllm_omni/deploy/mammoth_moda2_step.yaml` in the
+text-to-image commands below. This preset inherits the same stage placement
+and capacity, enables step execution for Stage 1, and disables request-batch
+admission waiting and diffusion cache acceleration. Compatible requests can
+join between denoising steps and finish independently, including requests
+with different inference-step counts. Step mode cannot be combined with
+Cache-DiT or other diffusion cache backends.
 
 Image size, seed, guidance, and denoising steps use the standard diffusion
 request fields. `cfg_range` remains a MammothModa2-specific `extra_body`
