@@ -173,7 +173,13 @@ def _config(minimum: int = 1, initial: int = 0, *, runtime_prompt_cache_size: in
 
 
 @pytest.mark.parametrize(
-    ("extra", "max_num_seqs", "micro"), [({}, 6, 6), ({}, 64, 16), ({"micro_batch_size": 2}, 6, 2)]
+    ("extra", "max_num_seqs", "micro"),
+    [
+        ({}, 6, 6),
+        ({}, 64, 16),
+        ({"micro_batch_size": 2}, 6, 2),
+        ({"max_graph_batch": 8}, 64, 8),
+    ],
 )
 def test_whole_euler_micro_batch_defaults_to_stage_concurrency(extra, max_num_seqs, micro):
     config = _config()
@@ -183,6 +189,8 @@ def test_whole_euler_micro_batch_defaults_to_stage_concurrency(extra, max_num_se
     model = MiniCPMO45Code2Wav(vllm_config=config)
 
     assert model._cfm_graph_config["micro_batch_size"] == micro
+    if "max_graph_batch" in extra:
+        assert model._cfm_graph_config["max_graph_batch"] == extra["max_graph_batch"]
 
 
 def _model(initial: int = 0, minimum: int = 1, *, runtime_prompt_cache_size: int = 4, setup_cache_size: int = 1):
