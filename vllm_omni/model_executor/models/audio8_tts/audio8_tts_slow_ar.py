@@ -34,19 +34,20 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.qwen2 import Qwen2Model
 from vllm.model_executor.models.utils import PPMissingLayer, maybe_prefix
 from vllm.sequence import IntermediateTensors
+from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.v1.outputs import SamplerOutput
 
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.utils.speaker_cache import get_speaker_cache
 
 from .audio8_tts_fast_ar import Audio8TTSFastAR
-from .codec_utils import encode_reference_audio_codes
+from .codec_utils import encode_reference_audio_codes, load_arktts_codec, prepare_reference_waveform
 from .configuration_audio8_tts import (
     Audio8TTSConfig,
     Audio8TTSFastARConfig,
     Audio8TTSSlowARConfig,
 )
-from .prompt_utils import build_voice_clone_prompt_ids
+from .prompt_utils import build_voice_clone_prompt_parts
 from .sampling import SAMPLING_EPS, ras_sample_batch
 
 logger = init_logger(__name__)
@@ -140,6 +141,7 @@ class Audio8TTSSlowARForConditionalGeneration(nn.Module):
     """Stage 0: text -> semantic tokens + residual codec codes."""
 
     prefer_model_sampler = True
+    skips_model_sampler_output_token_history = True
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
@@ -165,10 +167,21 @@ class Audio8TTSSlowARForConditionalGeneration(nn.Module):
         self.have_multimodal_outputs = True
         self.has_preprocess = True
         self.has_postprocess = True
+        self.use_async_omni_output = True
+        self.eager_omni_postprocess_before_async_output = True
+        self.omni_pooler_payload_include_hidden = False
         self.mtp_hidden_size = int(self.text_config.hidden_size)
         self.talker_mtp_output_key = ("codes", "audio")
-        self.gpu_resident_buffer_keys: set[tuple[str, str]] = {("hidden_states", "last")}
+        self.gpu_resident_buffer_keys: set[tuple[str, str]] = {
+            ("hidden_states", "last"),
+            ("embed", "prefill"),
+            ("codes", "audio"),
+        }
         self.talker_mtp_graph_safe = True
+        self._ras_recent_gpu: torch.Tensor | None = None
+        self._ras_recent_staging: list[tuple[torch.Tensor, torch.cuda.Event | None]] = []
+        self._ras_req_ids: list[str] = []
+        self._ras_intermediate_buffer: dict[str, dict[str, Any]] | None = None
 
         self.model = Qwen2Model(vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model"))
         self._fix_rope_style()
@@ -291,17 +304,43 @@ class Audio8TTSSlowARForConditionalGeneration(nn.Module):
         is_eos = local_ids >= self._num_semantic_ids
         return torch.where(is_eos, torch.full_like(local_ids, self._eos_token_id), local_ids + self._semantic_begin_id)
 
+    def _ensure_recent_buffers(self, device: torch.device, num_reqs: int) -> None:
+        window = self._ras_window_size
+        if window <= 0:
+            return
+        capacity = max(num_reqs, int(self.vllm_config.scheduler_config.max_num_seqs))
+        current = self._ras_recent_gpu
+        if current is None or current.device != device or current.shape[0] < capacity or current.shape[1] != window:
+            self._ras_recent_gpu = torch.empty((capacity, window), device=device, dtype=torch.long)
+            self._ras_recent_staging.clear()
+
     def _recent_local_ids(self, output_token_ids: list[list[int]], num_reqs: int, device: torch.device):
         """Build the ``[B, W]`` RAS window in compact id space.
 
-        Reads the host-side decoded-token history the AR runner already
-        materialised, so this costs one small H2D copy and never syncs the GPU.
-        Returns ``None`` when no request has history yet.
+        Stage host history in reusable pinned memory, then enqueue one
+        non-blocking H2D copy. In-flight staging buffers are not reused until
+        their copy event completes.
         """
         window = self._ras_window_size
         if window <= 0:
             return None
-        rows: list[list[int]] = []
+        self._ensure_recent_buffers(device, num_reqs)
+        staging = None
+        slot = -1
+        for index, (buffer, event) in enumerate(self._ras_recent_staging):
+            if event is None or event.query():
+                staging, slot = buffer, index
+                break
+        if staging is None:
+            staging = torch.empty(
+                (self._ras_recent_gpu.shape[0], window),
+                dtype=torch.long,
+                device="cpu",
+                pin_memory=device.type == "cuda",
+            )
+            slot = len(self._ras_recent_staging)
+            self._ras_recent_staging.append((staging, None))
+        staging[:num_reqs].fill_(-1)
         any_history = False
         for req_idx in range(num_reqs):
             history = output_token_ids[req_idx] if req_idx < len(output_token_ids) else []
@@ -311,10 +350,40 @@ class Audio8TTSSlowARForConditionalGeneration(nn.Module):
                 for token in recent
             ]
             any_history = any_history or bool(local)
-            rows.append([-1] * (window - len(local)) + local)
+            if local:
+                staging[req_idx, window - len(local) : window] = torch.tensor(local, dtype=torch.long)
         if not any_history:
             return None
-        return torch.tensor(rows, dtype=torch.long, device=device)
+        recent_gpu = self._ras_recent_gpu[:num_reqs]
+        recent_gpu.copy_(staging[:num_reqs], non_blocking=device.type == "cuda")
+        if device.type == "cuda":
+            event = torch.cuda.Event()
+            event.record(torch.cuda.current_stream(device))
+            self._ras_recent_staging[slot] = (staging, event)
+        return recent_gpu
+
+    def _resident_recent_local_ids(self, num_reqs: int, device: torch.device) -> torch.Tensor | None:
+        buffer = self._ras_intermediate_buffer
+        if buffer is None or len(self._ras_req_ids) < num_reqs or self._ras_window_size <= 0:
+            return None
+        rows: list[torch.Tensor] = []
+        any_history = False
+        for req_id in self._ras_req_ids[:num_reqs]:
+            state = buffer[req_id]["ras"]
+            rows.append(state["recent_local_ids"].to(device=device))
+            any_history = any_history or state["history_count"] > 0
+        return torch.stack(rows, dim=0) if any_history else None
+
+    def _update_resident_recent_local_ids(self, local_ids: torch.Tensor, num_reqs: int) -> None:
+        buffer = self._ras_intermediate_buffer
+        if buffer is None or len(self._ras_req_ids) < num_reqs or self._ras_window_size <= 0:
+            return
+        semantic = torch.where(local_ids < self._num_semantic_ids, local_ids, -1)
+        for index, req_id in enumerate(self._ras_req_ids[:num_reqs]):
+            state = buffer[req_id]["ras"]
+            previous = state["recent_local_ids"]
+            state["recent_local_ids"] = torch.cat((previous[1:], semantic[index : index + 1]))
+            state["history_count"] += 1
 
     def sample(self, logits: torch.Tensor, sampling_metadata: Any) -> SamplerOutput | None:
         """Sample the semantic token with the reference filter order + RAS.
@@ -324,11 +393,18 @@ class Audio8TTSSlowARForConditionalGeneration(nn.Module):
         """
         if logits is None or logits.numel() == 0:
             return None
-        if sampling_metadata.max_num_logprobs is not None:
-            return None
-        if not sampling_metadata.no_penalties:
-            return None
-        if sampling_metadata.bad_words_token_ids:
+        if (
+            sampling_metadata.max_num_logprobs is not None
+            or not sampling_metadata.no_penalties
+            or sampling_metadata.bad_words_token_ids
+        ):
+            # The default sampler owns these features. Once it takes over a
+            # batch, this model no longer sees every sampled token, so its GPU
+            # RAS window cannot be advanced reliably. Use runner-built host
+            # history on subsequent steps instead of reusing stale state.
+            self.skips_model_sampler_output_token_history = False
+            self._ras_intermediate_buffer = None
+            self._ras_req_ids = []
             return None
 
         logits = logits.to(torch.float32)
@@ -349,7 +425,9 @@ class Audio8TTSSlowARForConditionalGeneration(nn.Module):
             temperature = temperature[:num_reqs]
             top_p = DEFAULT_TOP_P if sampling_metadata.top_p is None else sampling_metadata.top_p[:num_reqs]
             top_k = DEFAULT_TOP_K if sampling_metadata.top_k is None else sampling_metadata.top_k[:num_reqs]
-            recent = self._recent_local_ids(sampling_metadata.output_token_ids, num_reqs, device)
+            recent = self._resident_recent_local_ids(num_reqs, device)
+            if recent is None and self._ras_intermediate_buffer is None:
+                recent = self._recent_local_ids(sampling_metadata.output_token_ids, num_reqs, device)
             local_ids = ras_sample_batch(
                 compact,
                 recent,
@@ -363,6 +441,7 @@ class Audio8TTSSlowARForConditionalGeneration(nn.Module):
                 num_reqs=num_reqs,
             )
 
+        self._update_resident_recent_local_ids(local_ids, num_reqs)
         token_ids = self._local_to_token_id(local_ids).to(dtype=torch.int32)
         return SamplerOutput(sampled_token_ids=token_ids.unsqueeze(-1), logprobs_tensors=None)
 
@@ -394,27 +473,156 @@ class Audio8TTSSlowARForConditionalGeneration(nn.Module):
 
     # -------------------- preprocess / postprocess --------------------
 
+    @staticmethod
+    def _merged_info(info_dict: dict[str, Any]) -> dict[str, Any]:
+        additional = info_dict.get("additional_information")
+        if not isinstance(additional, dict):
+            return info_dict
+        merged = {key: value for key, value in info_dict.items() if key != "additional_information"}
+        for key, value in additional.items():
+            merged.setdefault(key, value)
+        return merged
+
+    @torch.inference_mode()
+    def preprocess_batch(
+        self,
+        *,
+        req_ids: list[str],
+        model_intermediate_buffer: dict[str, dict[str, Any]],
+        device: torch.device,
+    ) -> None:
+        """Batch reference-audio encodes before the runner's scalar prefill loop."""
+        if self.skips_model_sampler_output_token_history and self._ras_window_size > 0:
+            self._ras_req_ids = list(req_ids)
+            self._ras_intermediate_buffer = model_intermediate_buffer
+            for req_id in req_ids:
+                state = model_intermediate_buffer.setdefault(req_id, {}).setdefault("ras", {})
+                recent = state.get("recent_local_ids")
+                if not isinstance(recent, torch.Tensor) or recent.shape != (self._ras_window_size,):
+                    state["recent_local_ids"] = torch.full(
+                        (self._ras_window_size,), -1, device=device, dtype=torch.long
+                    )
+                    state["history_count"] = 0
+                elif recent.device != device:
+                    state["recent_local_ids"] = recent.to(device=device, non_blocking=True)
+                state.setdefault("history_count", 0)
+        pending: list[tuple[dict[str, Any], dict[str, Any], tuple[str, str, int] | None]] = []
+        waveforms: list[torch.Tensor] = []
+
+        def stage_prompt(info: dict[str, Any], prompt: torch.Tensor) -> None:
+            prompt_buf = prompt.detach().to(dtype=torch.bfloat16).contiguous()
+            info.setdefault("embed", {})["prefill"] = prompt_buf
+
+        for req_id in req_ids:
+            original = model_intermediate_buffer.get(req_id)
+            if not isinstance(original, dict):
+                continue
+            info = self._merged_info(original)
+            if not bool(info.get("audio8_structured_voice_clone", False)):
+                continue
+            embed = info.get("embed", {})
+            meta = info.get("meta", {})
+            if (isinstance(embed, dict) and isinstance(embed.get("prefill"), torch.Tensor)) or (
+                isinstance(meta, dict) and int(meta.get("prefill_offset", 0) or 0) > 0
+            ):
+                continue
+
+            text, ref_text = info.get("text"), info.get("ref_text")
+            if not isinstance(text, str) or not isinstance(ref_text, str):
+                raise ValueError("Audio8 TTS voice cloning requires string 'text' and 'ref_text'")
+            voice_name = info.get("voice_name")
+            cache_key = (
+                self._speaker_cache.make_cache_key(
+                    voice_name, model_type="audio8_tts", created_at=int(info.get("voice_created_at") or 0)
+                )
+                if isinstance(voice_name, str) and voice_name
+                else None
+            )
+            cached = self._speaker_cache.get(cache_key) if cache_key is not None else None
+            if cached is not None:
+                stage_prompt(original, self._embed_voice_clone_prompt(text, ref_text, cached["ref_codes_fq"]))
+                continue
+
+            ref_audio_sr = info.get("ref_audio_sr")
+            if not isinstance(ref_audio_sr, int):
+                raise ValueError("Audio8 TTS voice cloning requires integer 'ref_audio_sr'")
+            ref_audio_wav = info.get("ref_audio_wav")
+            if ref_audio_wav is None:
+                raise ValueError("Audio8 TTS voice cloning requires 'ref_audio_wav'")
+            waveforms.append(prepare_reference_waveform(ref_audio_wav, ref_audio_sr, device=device))
+            pending.append((original, info, cache_key))
+
+        if not pending:
+            return
+        codec = load_arktts_codec(
+            self.model_path,
+            device=device,
+            dtype=torch.float32,
+            role="encode",
+            vllm_config=self.vllm_config,
+            **self._codec_kwargs(),
+        )
+        encoded = codec.encode(waveforms)
+        if len(encoded) != len(pending):
+            raise ValueError(f"Audio8 codec encoded {len(encoded)} references for {len(pending)} requests")
+        for (original, info, cache_key), wav, codes_qf in zip(pending, waveforms, encoded, strict=True):
+            frames = -(-wav.numel() // codec.frame_length)
+            codes_fq = codes_qf[:, :frames].transpose(0, 1).to(dtype=torch.long).contiguous()
+            if cache_key is not None:
+                self._speaker_cache.put(cache_key, {"ref_codes_fq": codes_fq.detach()})
+            stage_prompt(original, self._embed_voice_clone_prompt(info["text"], info["ref_text"], codes_fq))
+
     def preprocess(
         self,
         input_ids: torch.Tensor,
         input_embeds: torch.Tensor | None,
         **info_dict: Any,
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
-        additional_information = info_dict.get("additional_information")
-        if isinstance(additional_information, dict):
-            merged: dict[str, Any] = {k: v for k, v in info_dict.items() if k != "additional_information"}
-            for key, value in additional_information.items():
-                merged.setdefault(key, value)
-            info_dict = merged
+        info_dict = self._merged_info(info_dict)
 
         span_len = int(input_ids.shape[0])
         if span_len <= 0:
             embeds = input_embeds if input_embeds is not None else self.embed_input_ids(input_ids)
             return input_ids, embeds, {}
 
-        if span_len > 1:
+        if bool(info_dict.get("_omni_is_prefill", False)):
             return self._preprocess_prefill(input_ids, info_dict, span_len)
         return self._preprocess_decode(input_ids, info_dict)
+
+    def preprocess_decode_batch(
+        self,
+        *,
+        input_ids: torch.Tensor,
+        req_infos: list[dict[str, Any]],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, list[dict[str, Any]]]:
+        """Embed decode tokens together and assemble their Fast AR inputs."""
+        input_ids = input_ids.reshape(-1)
+        batch_size = len(req_infos)
+        if input_ids.numel() != batch_size:
+            raise ValueError(f"Audio8 decode preprocess got {input_ids.numel()} ids for {batch_size} requests")
+        embeddings = self.embed_input_ids(input_ids.reshape(-1, 1).to(torch.long)).to(dtype=torch.bfloat16)
+        embeddings = embeddings.reshape(batch_size, -1)
+        hidden_rows: list[torch.Tensor] = []
+        active_rows: list[bool] = []
+        updates: list[dict[str, Any]] = []
+        for info in req_infos:
+            last_hidden = self._merged_info(info).get("hidden_states", {}).get("last")
+            if isinstance(last_hidden, torch.Tensor):
+                hidden_rows.append(last_hidden.to(device=input_ids.device, dtype=torch.bfloat16).reshape(1, -1))
+                active_rows.append(True)
+                updates.append({})
+            else:
+                logger.warning("Audio8 TTS preprocess: hidden_states.last missing; emitting text-only embedding")
+                hidden_rows.append(torch.zeros_like(embeddings[:1]))
+                active_rows.append(False)
+                updates.append({})
+        last_talker_hidden = torch.cat(hidden_rows, dim=0)
+        text_step = torch.zeros_like(last_talker_hidden)
+        text_step[:, 0].fill_(1)
+        for index, active in enumerate(active_rows):
+            if not active:
+                text_step[index, 0].zero_()
+        return input_ids, embeddings, last_talker_hidden, text_step, updates
 
     def _prefill_chunk(
         self,
@@ -423,7 +631,7 @@ class Audio8TTSSlowARForConditionalGeneration(nn.Module):
         span_len: int,
         device: torch.device,
     ) -> torch.Tensor:
-        """Slice ``span_len`` rows out of the pinned CPU prompt-embed buffer."""
+        """Slice ``span_len`` rows out of the resident prompt-embed buffer."""
         total = int(prompt_embeds_buf.shape[0])
         begin = max(0, min(start, total))
         end = max(0, min(start + span_len, total))
@@ -431,7 +639,7 @@ class Audio8TTSSlowARForConditionalGeneration(nn.Module):
         if int(take.shape[0]) < span_len:
             pad_rows = span_len - int(take.shape[0])
             pad_embed = self.embed_input_ids(
-                torch.tensor([self._pad_token_id], device=device, dtype=torch.long)
+                torch.full((1,), self._pad_token_id, device=device, dtype=torch.long)
             ).reshape(1, -1)
             take = torch.cat([take.to(device=device, dtype=torch.bfloat16), pad_embed.expand(pad_rows, -1)], dim=0)
             return take.to(dtype=torch.bfloat16)
@@ -453,9 +661,7 @@ class Audio8TTSSlowARForConditionalGeneration(nn.Module):
                 prompt_embeds = self._build_voice_clone_prefill_embeds(info_dict)
             else:
                 prompt_embeds = self.embed_input_ids(input_ids.reshape(1, -1).to(torch.long)).squeeze(0)
-            prompt_embeds_buf = prompt_embeds.detach().to("cpu", dtype=torch.bfloat16).contiguous()
-            if not prompt_embeds_buf.is_pinned():
-                prompt_embeds_buf = prompt_embeds_buf.pin_memory()
+            prompt_embeds_buf = prompt_embeds.detach().to(dtype=torch.bfloat16).contiguous()
             offset = 0
         else:
             offset = int(info_dict.get("meta", {}).get("prefill_offset", 0) or 0)
@@ -468,10 +674,13 @@ class Audio8TTSSlowARForConditionalGeneration(nn.Module):
         # the codes buffer aligned with the hidden-state span.
         zeros = torch.zeros((chunk.shape[0], self._num_codebooks), device=device, dtype=torch.long)
         info_update = {
-            "embed": {"prefill": prompt_embeds_buf if next_offset < total_prompt_len else None},
             "meta": {"prefill_offset": next_offset},
             "codes": {"audio": zeros},
         }
+        if next_offset >= total_prompt_len:
+            info_update["embed"] = {"prefill": None}
+        elif is_first_chunk:
+            info_update["embed"] = {"prefill": prompt_embeds_buf}
         return torch.full_like(input_ids, self._pad_token_id), chunk, info_update
 
     def _preprocess_decode(
@@ -491,10 +700,12 @@ class Audio8TTSSlowARForConditionalGeneration(nn.Module):
 
         # Codebook embeddings are added in talker_mtp, using this step's Fast AR
         # output; adding them here would use the previous step's codes.
+        text_step = torch.zeros((1, self.text_config.hidden_size), device=device, dtype=torch.bfloat16)
+        text_step[:, 0].fill_(1)
         info_update = {
             "mtp_inputs": (
                 last_hidden.to(device=device, dtype=torch.bfloat16).reshape(1, -1),
-                torch.zeros(1, self.text_config.hidden_size, device=device, dtype=torch.bfloat16),
+                text_step,
             ),
         }
         return input_ids, token_embed.reshape(1, -1), info_update
@@ -556,10 +767,11 @@ class Audio8TTSSlowARForConditionalGeneration(nn.Module):
             ref_audio_wav,
             ref_audio_sr,
             device=device,
+            vllm_config=self.vllm_config,
             **self._codec_kwargs(),
         )
         if cache_key is not None:
-            self._speaker_cache.put(cache_key, {"ref_codes_fq": ref_codes_fq.detach().cpu()})
+            self._speaker_cache.put(cache_key, {"ref_codes_fq": ref_codes_fq.detach()})
             logger.debug("Speaker cache STORE for Audio8 TTS speaker '%s'", voice_name)
         return self._embed_voice_clone_prompt(text, ref_text, ref_codes_fq)
 
@@ -576,14 +788,21 @@ class Audio8TTSSlowARForConditionalGeneration(nn.Module):
         """
         device = self.codebook_embeddings.weight.device
         ref_codes_fq = ref_codes_fq.to(device=device, dtype=torch.long)
-        semantic_token_ids = (ref_codes_fq[:, 0] + self._semantic_begin_id).tolist()
-        prompt_ids, ref_start, _, _ = build_voice_clone_prompt_ids(
-            self._get_tokenizer(), text, ref_text, semantic_token_ids
+        prefix, suffix, _, _ = build_voice_clone_prompt_parts(self._get_tokenizer(), text, ref_text)
+        frames = int(ref_codes_fq.shape[0])
+        ref_start = len(prefix)
+        prompt_ids_cpu = torch.empty(
+            len(prefix) + frames + len(suffix),
+            dtype=torch.long,
+            device="cpu",
+            pin_memory=device.type == "cuda" and is_pin_memory_available(),
         )
-        prompt = torch.tensor(prompt_ids, dtype=torch.long, device=device)
+        prompt_ids_cpu[:ref_start] = torch.tensor(prefix, dtype=torch.long)
+        prompt_ids_cpu[ref_start + frames :] = torch.tensor(suffix, dtype=torch.long)
+        prompt = prompt_ids_cpu.to(device=device, non_blocking=prompt_ids_cpu.is_pinned())
+        prompt[ref_start : ref_start + frames] = ref_codes_fq[:, 0] + self._semantic_begin_id
         embeds = self.embed_input_ids(prompt.unsqueeze(0)).squeeze(0).to(dtype=torch.bfloat16)
 
-        frames = int(ref_codes_fq.shape[0])
         if frames <= 0:
             return embeds
         codebooks = min(int(ref_codes_fq.shape[1]), self._num_codebooks)
@@ -614,7 +833,6 @@ class Audio8TTSSlowARForConditionalGeneration(nn.Module):
             ``(inputs_embeds, audio_codes)`` where ``audio_codes`` is
             ``[B, num_codebooks]``.
         """
-        del text_step
         bsz = int(input_ids.shape[0])
         device = input_embeds.device
 
@@ -646,8 +864,10 @@ class Audio8TTSSlowARForConditionalGeneration(nn.Module):
             0
         )
         codebook_sum = self.codebook_embeddings(audio_codes + offsets).sum(dim=1).to(dtype=embeds.dtype)
-        is_semantic = (token_ids >= self._semantic_begin_id) & (token_ids <= self._semantic_end_id)
+        active = text_step.reshape(bsz, -1)[:, 0] > 0
+        is_semantic = active & (token_ids >= self._semantic_begin_id) & (token_ids <= self._semantic_end_id)
         embeds = torch.where(is_semantic.unsqueeze(-1), embeds + codebook_sum, embeds)
+        audio_codes = torch.where(active[:, None], audio_codes, torch.zeros_like(audio_codes))
         return embeds, audio_codes.to(dtype=torch.long)
 
     # -------------------- prompt length estimation --------------------
