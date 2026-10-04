@@ -339,9 +339,15 @@ does not write the pool or carry abort/preempt occupancy.
 
 ```python
 cache.register_policy(ModelCachePolicy.from_model(model))   # load_model
-cache.new_step_starts(scheduler_output)   # before _update_states
+adapter = PrefixCacheSchedulerAdapter()
+step = adapter.translate_step(scheduler_output)
+cache.new_step_starts(step)   # before _update_states
+layout = adapter.build_write_layout(
+    prefix_cache_group_view,
+    num_scheduled_tokens=dict(step.scheduled_tokens),
+)
 sid = cache.save_outputs(hidden, mm_outputs, num_tokens_unpadded=n,
-                         num_tokens_padded=n_pad)
+                         num_tokens_padded=n_pad, write_layout=layout)
 outs = cache.materialize(sid, req_ids)    # or discard_step(sid)
 ```
 

@@ -30,6 +30,7 @@ except ModuleNotFoundError:
     sys.modules["vllm"] = _vllm
     sys.modules["vllm.logger"] = _vllm_logger
 
+from vllm_omni.core.prefix_cache.adapter import PrefixCacheStep, PrefixCacheWriteLayout
 from vllm_omni.core.prefix_cache.interface import PrefixCacheConfig, StageCacheOutputs
 from vllm_omni.core.prefix_cache.runner_mixin import PrefixCacheRunnerMixin
 
@@ -104,8 +105,8 @@ class _CacheStub:
         self.materialize_calls = []
         self.outs = StageCacheOutputs(hidden_states=None, mm_outputs={})
 
-    def save_outputs(self, hidden, mm, *, num_tokens_unpadded, num_tokens_padded):
-        self.save_calls.append((hidden, mm, num_tokens_unpadded, num_tokens_padded))
+    def save_outputs(self, hidden, mm, *, num_tokens_unpadded, num_tokens_padded, write_layout):
+        self.save_calls.append((hidden, mm, num_tokens_unpadded, num_tokens_padded, write_layout))
         return 7
 
     def materialize(self, step_id, req_ids):
@@ -160,6 +161,11 @@ def test_save_step_gates_and_passthrough(monkeypatch):
     _patch_pp(monkeypatch, is_last=True)
     assert save() is None  # cache off
     r.omni_prefix_cache = stub
+    r._prefix_cache_adapter = SimpleNamespace(
+        build_write_layout=lambda view, *, num_scheduled_tokens: PrefixCacheWriteLayout((), 0)
+    )
+    r._prefix_cache_group_view = SimpleNamespace()
+    r._prefix_cache_step = PrefixCacheStep((), ())
     r.is_pooling_model = True
     assert save() is None  # pooling stage never writes
     r.is_pooling_model = False
@@ -167,7 +173,7 @@ def test_save_step_gates_and_passthrough(monkeypatch):
     assert save() is None  # not the last PP rank
     _patch_pp(monkeypatch, is_last=True)
     assert save() == 7
-    assert stub.save_calls == [(hidden, {}, 2, 2)]  # empty mm stays {}
+    assert stub.save_calls == [(hidden, {}, 2, 2, PrefixCacheWriteLayout((), 0))]  # empty mm stays {}
 
 
 def test_materialize_requires_explicit_step_and_snapshot_req_ids():
