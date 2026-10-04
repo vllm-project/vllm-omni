@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """SANA-WM Stage-1 transformer.
 
 Native vLLM-Omni port of the NVlabs SANA-WM DiT. Modules are built eagerly at
@@ -137,7 +137,7 @@ def _delta_scan(
     query: torch.Tensor | None = None,
     key: torch.Tensor | None = None,
     skip_z: bool = False,
-    flip_output: bool = False,
+    reverse_exclusive: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """One-directional gated delta-rule recurrence over frames.
 
@@ -147,9 +147,10 @@ def _delta_scan(
     camera branch needs (NVlabs ``torch_recurrent_cam_single_path_delta_rule``),
     so ``query``/``key`` may be omitted there.
 
-    ``flip_output=True`` emits the frames in reverse of the order they were
-    computed, which is what a caller running on flipped inputs wants; it costs a
-    list reversal instead of a flip over the assembled result.
+    ``reverse_exclusive=True`` traverses target frames from ``T - 1`` to zero
+    and updates each target from source frame ``target + 1``.  The final target
+    therefore queries the initial zero state.  Its query matmuls are retained
+    so NaN/Inf propagation matches the old synthetic zero-frame scan.
     """
     if not skip_z and (query is None or key is None):
         raise ValueError("Sana-WM delta scan needs non-rotary query/key unless skip_z is set.")
@@ -163,8 +164,11 @@ def _delta_scan(
         return tensor.view(batch_size, num_heads, head_dim, frames, spatial_tokens).permute(0, 1, 3, 2, 4)
 
     query_rot_f = to_frames(query_rot)
-    key_rot_f = to_frames(key_rot)
-    value_f = to_frames(value)
+    # The materialized shifted inputs used by the old backward scan were
+    # contiguous. Preserve those K/V leading dimensions so cuBLAS follows the
+    # same bit-exact path while selecting source frames directly.
+    key_rot_f = to_frames(key_rot.contiguous() if reverse_exclusive else key_rot)
+    value_f = to_frames(value.contiguous() if reverse_exclusive else value)
     state_kv = torch.zeros(batch_size, num_heads, head_dim, head_dim, device=query_rot.device, dtype=query_rot.dtype)
     numerators: list[torch.Tensor] = []
 
@@ -174,35 +178,39 @@ def _delta_scan(
         denominators = None
     else:
         query_f = to_frames(query)
-        key_f = to_frames(key)
+        key_f = to_frames(key.contiguous() if reverse_exclusive else key)
         state_z = torch.zeros(batch_size, num_heads, head_dim, 1, device=query_rot.device, dtype=query_rot.dtype)
         denominators = []
 
-    for frame_idx in range(frames):
+    frame_indices = range(frames - 1, -1, -1) if reverse_exclusive else range(frames)
+    for frame_idx in frame_indices:
+        source_idx = frame_idx + 1 if reverse_exclusive else frame_idx
         query_rot_t = query_rot_f[:, :, frame_idx]
-        key_rot_t = key_rot_f[:, :, frame_idx]
-        value_t = value_f[:, :, frame_idx]
-        beta_t = beta[:, :, frame_idx].unsqueeze(2)
-        decay_t = decay[:, :, frame_idx].view(batch_size, num_heads, 1, 1)
+        if source_idx < frames:
+            key_rot_t = key_rot_f[:, :, source_idx]
+            value_t = value_f[:, :, source_idx]
+            beta_t = beta[:, :, source_idx].unsqueeze(2)
+            decay_t = decay[:, :, source_idx].view(batch_size, num_heads, 1, 1)
 
-        state_kv = state_kv * decay_t
-        value_pred = torch.matmul(state_kv, key_rot_t)
-        delta_value = (value_t - value_pred) * beta_t
-        state_kv = state_kv + torch.matmul(delta_value, key_rot_t.transpose(-1, -2))
+            state_kv = state_kv * decay_t
+            value_pred = torch.matmul(state_kv, key_rot_t)
+            delta_value = (value_t - value_pred) * beta_t
+            state_kv = state_kv + torch.matmul(delta_value, key_rot_t.transpose(-1, -2))
         numerators.append(torch.matmul(state_kv, query_rot_t))
 
         if skip_z:
             continue
         query_t = query_f[:, :, frame_idx]
-        key_t = key_f[:, :, frame_idx]
-        state_z = state_z * decay_t
-        z_pred = torch.matmul(state_z.transpose(-1, -2), key_t)
-        delta_z = (1.0 - z_pred) * beta_t
-        state_z = state_z + torch.matmul(key_t, delta_z.transpose(-1, -2))
+        if source_idx < frames:
+            key_t = key_f[:, :, source_idx]
+            state_z = state_z * decay_t
+            z_pred = torch.matmul(state_z.transpose(-1, -2), key_t)
+            delta_z = (1.0 - z_pred) * beta_t
+            state_z = state_z + torch.matmul(key_t, delta_z.transpose(-1, -2))
         denominators.append(torch.matmul(state_z.transpose(-1, -2), query_t))
 
     def restore(tensors: list[torch.Tensor], dim: int) -> torch.Tensor:
-        stacked = torch.stack(tensors[::-1] if flip_output else tensors, dim=2)
+        stacked = torch.stack(tensors[::-1] if reverse_exclusive else tensors, dim=2)
         return stacked.permute(0, 1, 3, 2, 4).reshape(batch_size, num_heads, dim, token_count)
 
     return restore(numerators, head_dim), (None if skip_z else restore(denominators, 1))
@@ -222,16 +230,11 @@ def _bidirectional_delta_scan(
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Forward + backward delta scan, summed.
 
-    The backward direction shifts K/V/beta by one frame (zero pad) and the decay
-    by one frame (neutral 1.0 pad), matching the NVlabs ``flip_and_shift``
-    convention. The backward scan also emits its frames in forward order, so the
-    two directions add directly instead of flipping the assembled result back.
+    The backward direction consumes K/V/beta/decay from the following frame,
+    matching the NVlabs ``flip_and_shift`` convention without materializing
+    flipped full-video tensors.  Its outputs are restored to forward frame order
+    before the two directions are added.
     """
-    frames = beta.shape[2]
-
-    def reverse(tensor: torch.Tensor, *, shift_value: float | None = None) -> torch.Tensor:
-        return _reverse_frames(tensor, frames=frames, spatial_tokens=spatial_tokens, shift_value=shift_value)
-
     num_fwd, den_fwd = _delta_scan(
         query_rot,
         key_rot,
@@ -244,55 +247,20 @@ def _bidirectional_delta_scan(
         skip_z=skip_z,
     )
 
-    bwd_kwargs: dict[str, torch.Tensor] = {}
-    if not skip_z:
-        bwd_kwargs["query"] = reverse(query)
-        bwd_kwargs["key"] = reverse(key, shift_value=0.0)
-
     num_bwd, den_bwd = _delta_scan(
-        reverse(query_rot),
-        reverse(key_rot, shift_value=0.0),
-        reverse(value, shift_value=0.0),
-        _flip_and_shift(beta, dim=2, shift_value=0.0),
-        _flip_and_shift(decay, dim=2, shift_value=1.0),
+        query_rot,
+        key_rot,
+        value,
+        beta,
+        decay,
         spatial_tokens=spatial_tokens,
+        query=query,
+        key=key,
         skip_z=skip_z,
-        flip_output=True,
-        **bwd_kwargs,
+        reverse_exclusive=True,
     )
 
     return num_fwd + num_bwd, (None if skip_z else den_fwd + den_bwd)
-
-
-def _reverse_frames(
-    tensor: torch.Tensor,
-    *,
-    frames: int,
-    spatial_tokens: int,
-    shift_value: float | None = None,
-) -> torch.Tensor:
-    """Reverse frame order on a ``[..., T*S]`` tensor, optionally shifting by one frame.
-
-    The frame axis is the outer half of the flat token axis, so unfolding it in
-    place keeps the tensor's own layout: the flip writes a contiguous result and
-    the reshape back is a view. Routing this through a ``[..., T, D, S]``
-    permutation instead would cost a second full materialization.
-    """
-    lead = tensor.shape[:-1]
-    reversed_ = torch.flip(tensor.reshape(*lead, frames, spatial_tokens), dims=[-2])
-    if shift_value is not None:
-        padding = torch.full((*lead, 1, spatial_tokens), shift_value, device=tensor.device, dtype=tensor.dtype)
-        reversed_ = torch.cat([padding, reversed_.narrow(-2, 0, frames - 1)], dim=-2)
-    return reversed_.reshape(*lead, frames * spatial_tokens)
-
-
-def _flip_and_shift(tensor: torch.Tensor, *, dim: int, shift_value: float) -> torch.Tensor:
-    flipped = torch.flip(tensor, dims=[dim])
-    shifted = flipped.narrow(dim, 0, tensor.shape[dim] - 1)
-    pad_shape = list(tensor.shape)
-    pad_shape[dim] = 1
-    padding = torch.full(pad_shape, shift_value, device=tensor.device, dtype=tensor.dtype)
-    return torch.cat([padding, shifted], dim=dim)
 
 
 def reference_bidirectional_gated_delta_net(
