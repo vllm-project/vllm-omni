@@ -938,3 +938,92 @@ class TestShutdownClearsCompletedOutputs:
         executor.shutdown()
 
         assert executor._completed_outputs == {}
+
+
+class TestRpcErrorKeepsClientStatus:
+    """Worker-side ``OmniClientError`` must survive the result queue as a 4xx.
+
+    Before this fix the worker flattened the exception to ``str(e)`` and the
+    pump rebuilt a bare ``RuntimeError``, so the API answered HTTP 500 for a
+    request validation failure (observed with MiniMax-H3 continuation options).
+    """
+
+    def test_rpc_error_envelope_carries_metadata(self):
+        from vllm_omni.errors import OmniClientError
+
+        msg = AsyncDiffusionOutput.rpc_error("7", OmniClientError("bad overlap", status_code=422, error_type="X"))
+
+        assert msg.kind == AsyncOutputKind.RPC_RESULT
+        assert msg.rpc_id == "7"
+        assert msg.error == "bad overlap"
+        assert msg.error_status_code == 422
+        assert msg.error_type == "X"
+
+    def test_rpc_error_envelope_without_metadata_for_generic_exception(self):
+        msg = AsyncDiffusionOutput.rpc_error("7", RuntimeError("cuda failed"))
+
+        assert msg.error == "cuda failed"
+        assert msg.error_status_code is None
+        assert msg.error_type is None
+
+    def test_pump_restores_client_error_from_rpc_result(self):
+        from vllm_omni.errors import OmniClientError
+
+        executor = _make_executor()
+        fut: concurrent.futures.Future = concurrent.futures.Future()
+        with executor._futures_lock:
+            executor._rpc_futures["1"] = fut
+
+        msg = AsyncDiffusionOutput(
+            kind=AsyncOutputKind.RPC_RESULT,
+            rpc_id="1",
+            error="MiniMax H3 continuation overlap must be an integer on the 17n+5 frame grid",
+            error_status_code=400,
+            error_type="BadRequestError",
+        )
+        _feed_one_msg_to_pump(executor, msg)
+
+        assert fut.done()
+        with pytest.raises(OmniClientError, match="17n\\+5 frame grid") as excinfo:
+            fut.result(timeout=1.0)
+        assert excinfo.value.status_code == 400
+        assert excinfo.value.error_type == "BadRequestError"
+
+    def test_pump_keeps_runtime_error_without_metadata(self):
+        executor = _make_executor()
+        fut: concurrent.futures.Future = concurrent.futures.Future()
+        with executor._futures_lock:
+            executor._rpc_futures["1"] = fut
+
+        _feed_one_msg_to_pump(
+            executor,
+            AsyncDiffusionOutput(kind=AsyncOutputKind.RPC_RESULT, rpc_id="1", error="worker crashed"),
+        )
+
+        assert fut.done()
+        with pytest.raises(RuntimeError, match="worker crashed") as excinfo:
+            fut.result(timeout=1.0)
+        assert type(excinfo.value) is RuntimeError
+
+    def test_execute_request_preserves_client_error_metadata(self):
+        from vllm_omni.errors import OmniClientError
+
+        executor = _make_executor()
+        executor._ensure_open = lambda: None
+
+        def failing_collective_rpc(*args, **kwargs):
+            raise OmniClientError("rejected", status_code=422, error_type="UnprocessableEntity")
+
+        executor.collective_rpc = failing_collective_rpc
+        req = SimpleNamespace(request_id="r0")
+        scheduler_output = SimpleNamespace(
+            scheduled_new_reqs=[SimpleNamespace(request_id="r0", req=req, diffusion_kv_metadata=None)],
+            kv_prefetch_job=None,
+        )
+
+        batch = executor.execute_request(scheduler_output)
+
+        (runner_output,) = batch.runner_outputs
+        assert runner_output.result.error == "rejected"
+        assert runner_output.result.error_status_code == 422
+        assert runner_output.result.error_type == "UnprocessableEntity"

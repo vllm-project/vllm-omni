@@ -1918,6 +1918,28 @@ class AsyncDiffusionOutput:
     result: Any | None = None
     output: DiffusionOutput | None = None
     error: str | None = None
+    # Client-error metadata (same contract as ``DiffusionOutput``): a 4xx
+    # ``error_status_code`` lets the executor rebuild ``OmniClientError`` so the
+    # API answers 4xx instead of a generic 500. ``None`` means a server error.
+    error_status_code: int | None = None
+    error_type: str | None = None
+
+    @classmethod
+    def rpc_error(cls, rpc_id: str, exc: BaseException) -> "AsyncDiffusionOutput":
+        """Build an ``RPC_RESULT`` error reply that keeps client-error metadata.
+
+        Mirrors ``DiffusionOutput.from_exception`` so a worker-side
+        ``OmniClientError`` still surfaces as a 4xx after crossing the
+        result queue instead of being flattened into a generic string.
+        """
+        status_code, error_type = client_error_metadata(exc)
+        return cls(
+            kind=AsyncOutputKind.RPC_RESULT,
+            rpc_id=rpc_id,
+            error=str(exc),
+            error_status_code=status_code,
+            error_type=error_type,
+        )
 
 
 class DiffusionRequestAbortedError(RuntimeError):

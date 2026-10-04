@@ -22,7 +22,11 @@ from vllm_omni.model_executor.models.minimax_h3.conditioning import (
     MiniMaxH3EncoderMediaConditioning,
     MiniMaxH3EncoderMediaInput,
 )
-from vllm_omni.model_executor.models.minimax_h3.long_video import max_output_seconds, resolve_long_video_mode
+from vllm_omni.model_executor.models.minimax_h3.long_video import (
+    max_output_seconds,
+    resolve_continuation,
+    resolve_long_video_mode,
+)
 from vllm_omni.model_executor.models.minimax_h3.preprocessing import (
     MINIMAX_H3_OUTPUT_SHORT_EDGE,
     load_minimax_h3_images,
@@ -438,6 +442,7 @@ def prepare_encoder_inputs(
     if lock_audio and len(audio_values) != 1:
         raise OmniClientError("MiniMax H3 lock_source requires exactly one driving audio")
     task = task if task is not None else _resolve_task(extra_args, multi_modal_data)
+    resolve_continuation(extra_args, task=task)
     raw_images = load_minimax_h3_images(image_values) if image_values else []
 
     if task == "t2va":
