@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """Ray-serializable verl-omni HTTP server test double for RLHF E2E tests.
 
@@ -212,6 +212,11 @@ class vLLMOmniHttpServerLocal:
 
         self.engine = engine_client
 
+    async def shutdown(self) -> None:
+        if self.engine is not None:
+            self.engine.shutdown(timeout=30)
+            self.engine = None
+
     async def generate(
         self,
         prompt_ids: list[int],
@@ -222,6 +227,7 @@ class vLLMOmniHttpServerLocal:
         negative_prompt_ids: list[int] | None = None,
         priority: int = 0,  # noqa: ARG002 (signature parity)
     ) -> DiffusionOutput:
+        assert self.engine is not None, "Server must be launched before generating"
         prompt_ids = normalize_token_ids(prompt_ids)
 
         multi_modal_data: dict[str, Any] = {}
