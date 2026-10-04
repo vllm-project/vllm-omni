@@ -55,6 +55,26 @@ logger = init_logger(__name__)
 
 _ENABLE_NVTX_PROFILE = False
 
+
+def _remove_weight_norm_from_module(module: nn.Module) -> None:
+    """Recursively remove weight_norm from all submodules.
+
+    This materializes the final weight (weight_g * weight_v / ||weight_v||)
+    so it is computed once at load time instead of on every forward pass,
+    avoiding fp32 upcast from the norm computation.
+    """
+    removed = 0
+    for m in module.modules():
+        if hasattr(m, "weight_g") and hasattr(m, "weight_v"):
+            try:
+                nn.utils.remove_weight_norm(m)
+                removed += 1
+            except (ValueError, RuntimeError):
+                pass
+    if removed:
+        logger.info("Removed weight_norm from %d modules in audio_vae", removed)
+
+
 # Lower bound for the _active_states leak-warn threshold.  The effective
 # threshold is max(_ACTIVE_STATE_LEAK_WARN_MIN, 4 * max_batch_size) so small
 # deployments still get a usable floor instead of a tiny noisy one.
@@ -908,7 +928,14 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         VoxCPM = import_voxcpm2_core()
         native = VoxCPM.from_pretrained(model_path, load_denoiser=False, optimize=False)
         self._tts: nn.Module = native.tts_model.to(self._device)
+
+        # Remove weight_norm from audio_vae: materialize final weights so
+        # forward passes avoid recomputing norm (which forces fp32 aten::to).
+        _remove_weight_norm_from_module(self._tts.audio_vae)
+        self._tts.audio_vae.to(dtype=torch.bfloat16)
+
         self._side_dtype = self._tts.fusion_concat_proj.weight.dtype
+        self._vae_dtype = next(self._tts.audio_vae.parameters()).dtype
         self._patch_size = self._tts.patch_size
         self._feat_dim = self._tts.feat_dim
         self._sample_rate = getattr(self.config, "sample_rate", 48000)
@@ -1582,6 +1609,7 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         if feat.device.type != omni_platform.current_omni_platform.device_type:
             return self.tts.audio_vae.decode(feat)
 
+        feat = feat.to(dtype=self._vae_dtype)
         sr_cond = self._get_vae_decode_sr_cond(feat.device)
         if not self._enable_vae_cuda_graph:
             return self.tts.audio_vae.decode(feat, sr_cond=sr_cond)
@@ -2859,7 +2887,7 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         state.last_audio_patch_gpu = None
 
         # patch shape: (patch_size, feat_dim) or (1, patch_size, feat_dim)
-        new_latent = patch.reshape(-1, self._feat_dim).to(torch.float32)
+        new_latent = patch.reshape(-1, self._feat_dim).to(self._vae_dtype)
         vae_decode_every = getattr(self, "_vae_decode_every", 1)
         if vae_decode_every > 1:
             is_stopping = self._should_stop_from_cached_logits(state)
@@ -2971,7 +2999,7 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
                 continue
             state.last_audio_patch_gpu = None
 
-            new_latent = patch.reshape(-1, self._feat_dim).to(torch.float32)
+            new_latent = patch.reshape(-1, self._feat_dim).to(self._vae_dtype)
             if vae_decode_every > 1:
                 is_stopping = self._should_stop_from_cached_logits(state)
                 state.pending_vae_latents_gpu.append(new_latent.detach())
