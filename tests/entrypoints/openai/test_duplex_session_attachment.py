@@ -491,16 +491,17 @@ async def test_registry_repr_never_contains_plaintext_tokens() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("detached", [False, True], ids=["takeover", "reconnect"])
 @pytest.mark.parametrize("cancel_on", ["activation", "replay"])
-async def test_registry_resume_cancelled_mid_delivery_rolls_back_like_a_failure(cancel_on: str) -> None:
+async def test_registry_resume_cancelled_mid_delivery_rolls_back_like_a_failure(detached: bool, cancel_on: str) -> None:
     """Cancellation must take the same rollback as an ordinary delivery failure.
 
     ``CancelledError`` derives from ``BaseException``, so an ``except
     Exception`` around the activation and replay sends let a cancelled resume
     keep its attachment as the current generation while the token it rotated
     past was already gone — the session left attached to an unusable transport
-    with no way back. Both send points are covered because either can be the
-    one that gets cancelled.
+    with no way back. Cover both an attached takeover and a detached reconnect,
+    because either activation or replay delivery can be the cancellation point.
     """
     registry = DuplexSessionAttachmentRegistry(replay_ttl_s=60.0, replay_max_bytes_per_session=4096)
 
@@ -513,7 +514,8 @@ async def test_registry_resume_cancelled_mid_delivery_rolls_back_like_a_failure(
     created = await registry.create("sid-cancel", send=send, close=close)
     # One journaled event, so the replay loop has something to send.
     await registry.send_event("sid-cancel", {"type": "response.output_text.delta", "delta": "a"})
-    await registry.detach("sid-cancel", attachment_generation=1)
+    if detached:
+        await registry.detach("sid-cancel", attachment_generation=1)
 
     sends = 0
     cancel_at = 1 if cancel_on == "activation" else 2
