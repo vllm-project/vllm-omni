@@ -322,6 +322,14 @@ class AsyncOmniEngine(OmniEngineBase):
                 for item in prompt:
                     inject_global_id(item, request_id)
 
+            # Preserve caller UUIDs for MammothModa2's reusable image prompts.
+            model_config = getattr(self.input_processor, "model_config", None)
+            if getattr(model_config, "model_arch", None) == "MammothModa2ForConditionalGeneration":
+                if isinstance(prompt, dict):
+                    prompt = copy.copy(prompt)
+                elif isinstance(prompt, list):
+                    prompt = [copy.copy(item) for item in prompt]
+
             preselected_stage0_replica = self._scope_stage0_multimodal_cache_to_replica(
                 request_id,
                 prompt,

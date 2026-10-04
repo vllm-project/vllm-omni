@@ -342,7 +342,14 @@ def _replica(input_addr: str) -> ReplicaInfo:
     )
 
 
-def test_build_add_request_message_scopes_mm_uuids_to_selected_stage0_replica(mocker: MockerFixture):
+@pytest.mark.parametrize("reuse_prompt", [False, True])
+@pytest.mark.parametrize("explicit_uuid", [False, True])
+@pytest.mark.parametrize(
+    "model_arch", ["MammothModa2ForConditionalGeneration", "Qwen2_5_VLForConditionalGeneration", None]
+)
+def test_build_add_request_message_scopes_mm_uuids_to_selected_stage0_replica(
+    mocker: MockerFixture, reuse_prompt: bool, explicit_uuid: bool, model_arch: str | None
+):
     engine = object.__new__(AsyncOmniEngine)
     params = SamplingParams(max_tokens=8)
     engine.model = "test-model"
@@ -356,26 +363,37 @@ def test_build_add_request_message_scopes_mm_uuids_to_selected_stage0_replica(mo
     def process_inputs(**kwargs):
         prompt = kwargs["prompt"]
         seen_uuids.append(prompt["multi_modal_uuids"]["image"][0])
+        if model_arch != "MammothModa2ForConditionalGeneration":
+            assert prompt is submitted_prompt
         return _make_engine_core_request(kwargs["request_id"])
 
     input_processor = mocker.Mock()
+    input_processor.model_config.model_arch = model_arch
     input_processor.process_inputs.side_effect = process_inputs
     engine.input_processor = input_processor
 
-    for request_id in ("req-1", "req-2"):
+    prompt = {"prompt": "describe", "multi_modal_data": {"image": "same-image"}}
+    if explicit_uuid:
+        prompt["multi_modal_uuids"] = {"image": ["user-image"]}
+    for request_id in ("req-1", "req-2", "req-3"):
+        submitted_prompt = prompt if reuse_prompt else prompt.copy()
         engine._build_add_request_message(
             request_id=request_id,
-            prompt={
-                "prompt": "describe",
-                "multi_modal_data": {"image": "same-image"},
-            },
+            prompt=submitted_prompt,
             sampling_params_list=[params],
             final_stage_id=0,
         )
 
     assert seen_uuids[0].startswith("stage0:rep0:")
     assert seen_uuids[1].startswith("stage0:rep1:")
+    if model_arch != "MammothModa2ForConditionalGeneration" and reuse_prompt:
+        assert seen_uuids[1] == f"stage0:rep1:{seen_uuids[0]}"
+        assert seen_uuids[2] == f"stage0:rep0:{seen_uuids[1]}"
+        assert prompt["multi_modal_uuids"] == {"image": [seen_uuids[2]]}
+        return
     assert seen_uuids[0].removeprefix("stage0:rep0:") == seen_uuids[1].removeprefix("stage0:rep1:")
+    assert seen_uuids[2] == seen_uuids[0]
+    assert prompt.get("multi_modal_uuids") == ({"image": ["user-image"]} if explicit_uuid else None)
 
 
 @pytest.mark.asyncio
@@ -402,22 +420,23 @@ async def test_build_add_request_message_scopes_mm_uuids_to_distributed_stage0_r
         return _make_engine_core_request(kwargs["request_id"])
 
     input_processor = mocker.Mock()
+    input_processor.model_config.model_arch = "MammothModa2ForConditionalGeneration"
     input_processor.process_inputs.side_effect = process_inputs
     engine.input_processor = input_processor
 
-    for request_id in ("req-1", "req-2"):
+    prompt = {"prompt": "describe", "multi_modal_data": {"image": "same-image"}}
+    for request_id in ("req-1", "req-2", "req-3"):
         engine._build_add_request_message(
             request_id=request_id,
-            prompt={
-                "prompt": "describe",
-                "multi_modal_data": {"image": "same-image"},
-            },
+            prompt=prompt,
             sampling_params_list=[params],
             final_stage_id=0,
         )
 
     assert seen_uuids[0].startswith("stage0:rep0:")
     assert seen_uuids[1].startswith("stage0:rep1:")
+    assert seen_uuids[2] == seen_uuids[0]
+    assert "multi_modal_uuids" not in prompt
     assert stage_pool.get_bound_replica_id("req-1") == 0
     assert stage_pool.get_bound_replica_id("req-2") == 1
     assert await stage_pool.pick("req-1") == 0
