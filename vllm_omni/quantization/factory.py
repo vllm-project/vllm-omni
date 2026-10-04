@@ -167,7 +167,29 @@ def _build_torchao_float8_weight_only(**kw: Any) -> QuantizationConfig:
     )
 
 
+def _build_online(**kw: Any) -> QuantizationConfig:
+    """Build vLLM's online (load-time) quantization config from its user-facing args.
+
+    Accepts the ``QuantizationConfigArgs`` fields: ``linear`` / ``moe`` (a
+    shorthand such as ``fp8_per_channel`` or a spec dict), ``ignore`` (layer
+    names or fnmatch patterns left unquantized) and ``targets``. The vLLM
+    registry maps the online shorthands to ``OnlineQuantizationConfig``, whose
+    constructor takes the parsed args object rather than keyword arguments,
+    so ``quantization: fp8_per_channel`` alone cannot be built by the generic
+    path; ``method: online`` (or a shorthand name with extra keys) can.
+    """
+    from vllm.config.quantization import QuantizationConfigArgs
+    from vllm.model_executor.layers.quantization.online.base import OnlineQuantizationConfig
+
+    fields = {key: kw[key] for key in ("linear", "moe", "ignore", "targets") if key in kw and kw[key] is not None}
+    unknown = set(kw) - {"linear", "moe", "ignore", "targets"}
+    if unknown:
+        raise TypeError(f"online quantization config accepts linear, moe, ignore and targets; got {sorted(unknown)}")
+    return OnlineQuantizationConfig(QuantizationConfigArgs(**fields))
+
+
 _OVERRIDES: dict[str, Callable[..., QuantizationConfig]] = {
+    "online": _build_online,
     "int8": _build_int8,
     "bitsandbytes": _build_bitsandbytes,
     "mxfp8": _build_mxfp8,
@@ -259,6 +281,14 @@ def _normalize_method_name(method: Any) -> str:
     return str(method).lower().replace("-", "_")
 
 
+def _is_online_shorthand(method: str) -> bool:
+    try:
+        from vllm.config.quantization import _ONLINE_SHORTHANDS
+    except ImportError:  # older vLLM without online quantization
+        return False
+    return method in _ONLINE_SHORTHANDS
+
+
 def _detect_modelopt_method(config: Mapping[str, Any]) -> str | None:
     quantization = config.get("quantization")
     if isinstance(quantization, Mapping):
@@ -324,6 +354,10 @@ def _build_single(method: str, **kwargs: Any) -> QuantizationConfig:
 
     if method in _OVERRIDES:
         return _OVERRIDES[method](**kwargs)
+
+    if _is_online_shorthand(method):
+        # e.g. {"method": "fp8_per_channel", "ignore": [...]} or plain "fp8_per_channel"
+        return _build_online(linear=method, **kwargs)
 
     if method not in QUANTIZATION_METHODS:
         raise ValueError(f"Unknown quantization method: {method!r}. Supported: {SUPPORTED_QUANTIZATION_METHODS}")
