@@ -99,6 +99,13 @@ def test_sample_tokens_dict_output():
     assert output.multimodal_outputs[0]["audio"].shape == (1, 4)
 
 
+def test_host_copy_still_makes_other_outputs_contiguous_host_tensors():
+    for tensor in (torch.randn(4, 2).t(), torch.randn(3, requires_grad=True)):
+        host = gen_runner_module._HostCopyBatch(pin_memory=False).copy(tensor)
+        assert host.device.type == "cpu" and host.is_contiguous() and not host.requires_grad
+        assert torch.equal(host, tensor.detach())
+
+
 class _StubSchedulerOutput:
     def __init__(self, total_num_scheduled_tokens):
         self.total_num_scheduled_tokens = total_num_scheduled_tokens
@@ -174,11 +181,13 @@ def test_execute_model_zero_tokens_kv_connector_no_forward(monkeypatch):
     monkeypatch.setattr(gen_runner_module, "has_kv_transfer_group", lambda: True)
     runner = _make_guard_runner()
     sentinel = object()
-    calls = []
-    runner.kv_connector_no_forward = lambda scheduler_output, vllm_config: (
-        calls.append(scheduler_output),
-        sentinel,
-    )[1]
+    calls: list[object] = []
+
+    def _no_forward(scheduler_output, vllm_config):
+        calls.append(scheduler_output)
+        return sentinel
+
+    runner.kv_connector_no_forward = _no_forward
     runner.vllm_config = object()
 
     output = GPUGenerationModelRunner.execute_model(runner, _StubSchedulerOutput(0))

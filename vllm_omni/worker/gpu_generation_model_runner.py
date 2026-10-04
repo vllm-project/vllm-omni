@@ -41,6 +41,7 @@ from vllm.v1.worker.ubatch_utils import maybe_create_ubatch_slices
 from vllm.v1.worker.utils import sanity_check_mm_encoder_outputs
 
 from vllm_omni.outputs import OmniModelRunnerOutput
+from vllm_omni.utils.device_copy import HostCopyBatch as _HostCopyBatch
 from vllm_omni.utils.mm_outputs import partition_payload_list
 from vllm_omni.worker.gpu_ar_model_runner import ExecuteModelState, _ensure_tensor_values
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
@@ -51,36 +52,6 @@ from vllm_omni.worker.omni_connector_model_runner_mixin import (
 )
 
 logger = logging.getLogger(__name__)
-
-
-class _HostCopyBatch:
-    """Device-to-host copies of one step's outputs behind a single host sync.
-
-    ``tensor.to("cpu")`` blocks the host once per tensor, so a step returning
-    one waveform per request paid one sync per request. Here each CUDA tensor
-    is copied into pinned host memory without blocking and ``wait`` blocks
-    once, after which every returned tensor holds its data, exactly like the
-    per-tensor ``.detach().to("cpu").contiguous()`` it replaces. Without
-    pinned memory, or off CUDA, the per-tensor blocking copy is kept.
-    """
-
-    def __init__(self, pin_memory: bool) -> None:
-        self._pin_memory = bool(pin_memory)
-        self._pending = False
-
-    def copy(self, tensor: torch.Tensor) -> torch.Tensor:
-        tensor = tensor.detach()
-        if tensor.device.type != "cuda" or not self._pin_memory:
-            return tensor.to("cpu").contiguous()
-        host = torch.empty(tensor.shape, dtype=tensor.dtype, device="cpu", pin_memory=True)
-        host.copy_(tensor, non_blocking=True)
-        self._pending = True
-        return host
-
-    def wait(self) -> None:
-        if self._pending:
-            torch.cuda.current_stream().synchronize()
-            self._pending = False
 
 
 class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
