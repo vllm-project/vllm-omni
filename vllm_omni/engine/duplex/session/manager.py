@@ -21,7 +21,7 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import time
-from collections.abc import Awaitable, Callable, Iterable
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
@@ -57,6 +57,7 @@ from vllm_omni.engine.duplex.messages import (
 )
 from vllm_omni.engine.duplex.plugin import DuplexModelPlugin, DuplexRuntimeConfigError, validate_duplex_plugin_sampling
 from vllm_omni.engine.duplex.session.engine_session import DuplexEngineSession, DuplexFenceMismatchError
+from vllm_omni.engine.duplex.session.input_clock import check_input_clock_supported, input_clock_lease_idle_s
 from vllm_omni.engine.duplex.session.lease import DuplexLeaseActivity, DuplexLeaseConfig, DuplexLeaseState
 from vllm_omni.engine.duplex.turn_detection import SileroVADBackendProvider
 
@@ -435,6 +436,7 @@ class DuplexSessionManager:
         ok: bool,
         session: DuplexEngineSession | None = None,
         error: BaseException | None = None,
+        public_extra: Mapping[str, object] | None = None,
     ) -> None:
         error_code, error_message, error_retryable = (
             self._control_error(error) if error is not None else (None, None, False)
@@ -446,7 +448,9 @@ class DuplexSessionManager:
             ok=ok,
             lease_generation=session.lease_generation if session is not None else None,
             capabilities=session.capabilities if session is not None and ok else None,
-            public_session=session.as_public_dict() if session is not None and ok else None,
+            public_session=(
+                {**session.as_public_dict(), **(public_extra or {})} if session is not None and ok else None
+            ),
             error_code=error_code,
             error_message=error_message,
             error_retryable=error_retryable,
@@ -560,6 +564,7 @@ class DuplexSessionManager:
             holds_admission_slot = True
             config = message.session_config
             self.plugin.validate_client_extra_body(config.extra_body)
+            check_input_clock_supported(self.plugin, config.extra_body)
             try:
                 runtime_config = await self.plugin.prepare_runtime_config(config, model_config=self.model_config)
             except DuplexRuntimeConfigError:
@@ -795,7 +800,17 @@ class DuplexSessionManager:
                 )
             except ValueError as exc:
                 raise DuplexSessionError(str(exc), code="session_resume_conflict") from exc
-            await self._put_result(message, operation="resume", ok=True, session=session)
+            # An input-clocked client learns how many of its inputs reached the
+            # session (``input_index`` of the latest), so it can resend exactly
+            # those lost with the old connection.
+            admitted = runner.admitted_inputs
+            await self._put_result(
+                message,
+                operation="resume",
+                ok=True,
+                session=session,
+                public_extra={"input_index": admitted} if admitted is not None else None,
+            )
         except Exception as exc:
             logger.exception("resume_duplex_session failed: %s", exc)
             await self._put_result(message, operation="resume", ok=False, session=session, error=exc)
@@ -888,6 +903,14 @@ class DuplexSessionManager:
             lease = runner.session.lease
             if lease.disconnect_grace_expired(effective_now):
                 reason = "disconnect_grace_expired"
+            elif runner.input_clocked:
+                # An input-clocked client may pause between inputs while it
+                # thinks: its idle window is the session's (default 10 min),
+                # capped at max(idle_ttl_s, 10 min).
+                idle_s = input_clock_lease_idle_s(runner.session.config.idle_timeout_s, lease.config.idle_ttl_s)
+                if idle_s is None or not lease.idle_expired_after(effective_now, idle_s):
+                    continue
+                reason = "idle_ttl_expired"
             elif lease.idle_expired(effective_now):
                 reason = "idle_ttl_expired"
             else:

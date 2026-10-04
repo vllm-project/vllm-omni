@@ -38,6 +38,8 @@ REALTIME_ERROR_TYPES_BY_CODE: dict[str, str] = {
     "unknown_session": "invalid_request_error",
     "invalid_duplex_runtime_config": "invalid_request_error",
     "instructions_update_unsupported": "invalid_request_error",
+    "input_clock_unsupported": "invalid_request_error",
+    "input_clock_update_unsupported": "invalid_request_error",
     "persona_update_unsupported": "invalid_request_error",
     "voice_update_unsupported": "invalid_request_error",
     "unsupported_nemotron_duplex_mode": "invalid_request_error",

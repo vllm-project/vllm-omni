@@ -259,6 +259,27 @@ class DuplexAudioChunk:
     sample_rate_hz: int | None = None
 
 
+#: ``extra_body`` key and value that make a session input-clocked (``session/input_clock.py``).
+INPUT_CLOCK_KEY = "clock"
+INPUT_CLOCK_VALUE = "input"
+#: Default idle window of a session (``idle_timeout_s``).
+DEFAULT_IDLE_TIMEOUT_S = 300.0
+#: Default idle window of an input-clocked session: the socket read timeout and the
+#: engine lease's idle expiry. Long enough for a client that pauses between inputs (a
+#: user simulator thinking), short enough to release a forgotten one.
+INPUT_CLOCK_IDLE_TIMEOUT_S = 600.0
+
+
+def input_clocked(extra_body: object) -> bool:
+    """Whether a session's ``extra_body`` opts into the input clock (``clock: "input"``)."""
+    return isinstance(extra_body, Mapping) and extra_body.get(INPUT_CLOCK_KEY) == INPUT_CLOCK_VALUE
+
+
+def default_idle_timeout_s(extra_body: object) -> float:
+    """``idle_timeout_s`` of a session that did not set one."""
+    return INPUT_CLOCK_IDLE_TIMEOUT_S if input_clocked(extra_body) else DEFAULT_IDLE_TIMEOUT_S
+
+
 @dataclass
 class DuplexSessionConfig:
     model: str | None = None
@@ -275,7 +296,7 @@ class DuplexSessionConfig:
     max_tokens: int | None = None
     speed: float | None = None
     use_tts_template: bool = True
-    idle_timeout_s: float = 300.0
+    idle_timeout_s: float = DEFAULT_IDLE_TIMEOUT_S
     overlap_policy: str = DuplexOverlapPolicy.LISTEN_ONLY.value
     overlap_short_ack_ms: int = 700
     overlap_barge_in_ms: int = 1200
@@ -355,6 +376,10 @@ class DuplexSessionConfig:
         if isinstance(source.get("extra_body"), dict):
             config.extra_body = dict(source["extra_body"])
             extra = config.extra_body
+            if not isinstance(source.get("idle_timeout_s"), int | float):
+                # An input-clocked client may pause between inputs while it
+                # thinks: give it a longer idle window than a live microphone.
+                config.idle_timeout_s = default_idle_timeout_s(extra)
             overlap_policy = extra.get("overlap_policy")
             if isinstance(overlap_policy, str):
                 config.overlap_policy = cls._normalize_overlap_policy(overlap_policy)
@@ -476,7 +501,7 @@ class DuplexSessionConfig:
                 or payload.get("max_tokens")
             ),
             "speed": speed,
-            "idle_timeout_s": payload.get("idle_timeout_s") or 300.0,
+            "idle_timeout_s": payload.get("idle_timeout_s") or default_idle_timeout_s(extra_body),
             **realtime_overlap_fields(payload),
             "extra_body": extra_body,
         }
