@@ -1,15 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Unit tests for SANA-WM request normalization."""
 
 import pytest
 
+from vllm_omni.diffusion.models.sana_wm.pipeline_sana_wm import (
+    SANA_WM_DEFAULT_GUIDANCE_SCALE,
+    SanaWmPipeline,
+)
 from vllm_omni.diffusion.models.sana_wm.request import (
     SANA_WM_DEFAULT_HEIGHT,
     SANA_WM_DEFAULT_NUM_FRAMES,
     SANA_WM_DEFAULT_WIDTH,
     normalize_sana_wm_payload,
 )
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -41,6 +46,51 @@ def test_defaults_are_latent_aligned():
     assert payload["num_frames"] == SANA_WM_DEFAULT_NUM_FRAMES
     assert payload["height"] == SANA_WM_DEFAULT_HEIGHT
     assert payload["width"] == SANA_WM_DEFAULT_WIDTH
+
+
+@pytest.mark.parametrize(
+    ("guidance_scale", "guidance_scale_provided", "expected"),
+    [
+        (None, None, SANA_WM_DEFAULT_GUIDANCE_SCALE),
+        (1.0, False, SANA_WM_DEFAULT_GUIDANCE_SCALE),
+        (0.0, True, 0.0),
+        (2.5, True, 2.5),
+    ],
+)
+def test_native_params_preserves_explicit_guidance_scale(guidance_scale, guidance_scale_provided, expected):
+    payload = {
+        "height": SANA_WM_DEFAULT_HEIGHT,
+        "width": SANA_WM_DEFAULT_WIDTH,
+        "num_frames": SANA_WM_DEFAULT_NUM_FRAMES,
+    }
+    sampling_params = None
+    if guidance_scale_provided is not None:
+        sampling_params = OmniDiffusionSamplingParams(
+            guidance_scale=guidance_scale,
+            guidance_scale_provided=guidance_scale_provided,
+        )
+
+    params = SanaWmPipeline.__new__(SanaWmPipeline)._native_params(payload, sampling_params)
+
+    assert params.cfg_scale == expected
+
+
+@pytest.mark.parametrize(
+    "sampling_params",
+    [
+        OmniDiffusionSamplingParams(num_inference_steps=0),
+        OmniDiffusionSamplingParams(extra_args={"num_inference_steps": 0}),
+    ],
+)
+def test_native_params_rejects_zero_num_inference_steps(sampling_params):
+    payload = {
+        "height": SANA_WM_DEFAULT_HEIGHT,
+        "width": SANA_WM_DEFAULT_WIDTH,
+        "num_frames": SANA_WM_DEFAULT_NUM_FRAMES,
+    }
+
+    with pytest.raises(ValueError, match="steps must be positive"):
+        SanaWmPipeline.__new__(SanaWmPipeline)._native_params(payload, sampling_params)
 
 
 @pytest.mark.parametrize("num_frames", [9, 33, 161])
