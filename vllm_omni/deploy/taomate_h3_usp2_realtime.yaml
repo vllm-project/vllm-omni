@@ -1,0 +1,117 @@
+# TaoMate-H3 streaming on two GPUs: pure Ulysses sequence parallel (USP2),
+# tensor parallel 1, AR-Diffusion stepwise engine, streaming output, FP8
+# online linears and CUDA-graph replay of the audio teacher.
+#
+# Serve (under a GPU reservation on the shared machine):
+#
+#   gpu run --gpus 2 --timeout 4h --note "taomate-h3 usp2" -- \
+#     vllm serve /path/to/MiniMax-H3/FL2VA --omni --trust-remote-code \
+#       --deploy-config vllm_omni/deploy/taomate_h3_usp2_realtime.yaml \
+#       --lora-path /path/to/TaoMate-H3 --port 8000
+#
+# Status (see recipes/TaoLiveAIGC/TaoMate-H3.md, "Two GPUs"): measured locally at
+# 480x864 on two H200-class GPUs with persona-length prompts (330-410 tokens)
+# that change every request: 4.74 s of wall time per 4.958 s request on
+# average over 100 requests, 4.88 s at most, none above budget (real-time
+# factor 0.96; 4.58 s over a 21-request run), with the
+# output matching eager BF16 (the LoRA delta stays on the hooks; the merged
+# FP8 weights that blurred the video are off). Eager BF16 took 6.3 s. Size
+# taomate_h3_pad_text_tokens and taomate_h3_teacher_graph_text_lengths to
+# the deployment's prompts (below: the live-agent lesson prompts of 373-444 tokens, p99 424); start-up
+# takes about 7 minutes with the graph captures, so raise the stage init
+# timeout.
+
+pipeline: taomate_h3
+async_chunk: false
+distributed_executor_backend: mp
+dtype: bfloat16
+
+stages:
+  - stage_id: 0
+    devices: "0,1"
+    max_num_seqs: 1
+    enforce_eager: true
+    # Online FP8 for the DiT blocks only: per-channel weight scales with
+    # per-token activation scales (validated visually against eager BF16);
+    # the layers that map between pixels, tokens and timesteps and the text
+    # encoder stay in BF16. The LoRA hooks add their BF16 delta on top.
+    # `method: fp8_per_channel` with an ignore list needs the online-quantization
+    # factory PR #8315 (split out of the TaoMate-H3 PR).
+    quantization:
+      transformer:
+        method: fp8_per_channel
+        ignore:
+          - "*patch_proj*"
+          - "*condition_proj*"
+          - "*time_embedder*"
+          - "*token_refiner*"
+          - "*final_layer*"
+          - "*adaln_proj*"
+      text_encoder: null
+    model_class_name: TaoMateH3Pipeline
+    engine_backend: vllm_omni.experimental.ar_diffusion.engine.ARDiffusionEngine
+    step_execution: true
+    streaming_output: true
+    parallel_config:
+      tensor_parallel_size: 1
+      sequence_parallel_size: 2
+      ulysses_degree: 2
+      ring_degree: 1
+      text_encoder_tp_size: 2
+      vae_patch_parallel_size: 2
+      vae_parallel_mode: tile
+    default_sampling_params:
+      num_inference_steps: 3
+      output_type: np
+      fps: 24
+    model_config:
+      taomate_h3_width: 480
+      taomate_h3_height: 864
+      taomate_h3_seed: 8301
+      taomate_h3_audio_kv_reset_requests: 12
+      # One packed length per document kind (prompts up to 256 tokens), so
+      # the teacher's graphs are keyed by prompt length only.
+      taomate_h3_pad_text_tokens: 512
+      # Replay the audio teacher's nine forwards from CUDA graphs (one graph
+      # per document shape, LRU of taomate_h3_cuda_graph_max_entries).
+      taomate_h3_teacher_cuda_graph: true
+      # Capture the teacher graphs of prompts with 360-470 tokens during the
+      # load-time warmup (3 shapes per token count, about 0.5 s each), so a
+      # prompt update never captures inside the stream. Other lengths are
+      # captured lazily at the request that first needs them.
+      taomate_h3_teacher_graph_text_lengths: "360-470"
+      # Replay the text-only prompt encode of an update from a CUDA graph too
+      # (one graph per token count, captured for the same range at load).
+      taomate_h3_text_encoder_cuda_graph: true
+      # The exact AdaLN projection cache keys on a host digest of the timestep
+      # embedding (one device-to-host copy per forward); recompute instead.
+      taomate_h3_adaln_cache: false
+      # Do not merge the LoRA delta into the FP8 student weights: the delta is
+      # 0.2-0.7% of |W| and per-channel FP8 requantization turns 83-98% of it
+      # into rounding error; the merged student renders about 4.7x less sharp
+      # video (median Laplacian variance 105-110 against 497 without the merge
+      # and 500-512 for the four-GPU BF16 demo, measured locally on 24-25
+      # frames each). The BF16 delta stays on the hooks.
+      taomate_h3_lora_merge: false
+      # 256 px decoder tiles (the only tile size the decoder renders correctly)
+      # with a 32 px minimum overlap: 8 tiles covering 1.26x the canvas instead of
+      # the checkpoint's 15 tiles at 64 px overlap covering 2.37x (no seams,
+      # checked at the tile borders); halves the decode time.
+      taomate_h3_vae_decoder_tile_overlap_min: 32
+      # Decode a rank's tiles as one batched ViT forward: bit-identical output,
+      # about 3 GB less peak memory per rank, same speed (measured locally).
+      taomate_h3_vae_stack_tiling: true
+      taomate_h3_cuda_graph_max_entries: 512
+      # Do not set taomate_h3_vae_decoder_tile_size: 480 px decoder tiles render
+      # a uniform 16 px lattice over the frame (isolated 2026-09-28); the
+      # checkpoint's 256 px tiles are the correct decode.
+      # Pack each phase's frames into shared memory on the worker's background
+      # thread instead of the step thread (about 45 ms per phase at 480x864).
+      # Measured locally: 4.98 -> 4.78 s per 4.958 s request with a constant
+      # short prompt (ten requests), prompt updates unaffected.
+      # Needs the step_async_output PR (branch tzhouam:feat/step-async-output, split out of the TaoMate-H3 PR); the
+      # knob is ignored until it lands, at about 0.2 s per request.
+      step_async_output: true
+      ar_diffusion_kv_config:
+        gpu_memory_fraction: 0.02
+        warmup_cudagraph: true

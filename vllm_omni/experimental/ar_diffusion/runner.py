@@ -143,7 +143,11 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         if self.pipeline is None:
             return
         self._preallocate_kv_cache()
-        if not self.od_config.enforce_eager and self.ar_diffusion_kv_config.warmup_cudagraph:
+        # The rollout warmup exists for CUDA graph capture, but a pipeline may
+        # also want it in eager mode (first-request kernel selection, lazy
+        # allocations); ``ar_diffusion_warmup_eager`` opts in.
+        warmup_eager = bool(getattr(self.pipeline, "ar_diffusion_warmup_eager", False))
+        if self.ar_diffusion_kv_config.warmup_cudagraph and (not self.od_config.enforce_eager or warmup_eager):
             self._warmup_ar_rollout()
 
     def _available_memory_bytes(self) -> int:
