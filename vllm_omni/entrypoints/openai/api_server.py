@@ -71,6 +71,7 @@ from vllm.entrypoints.serve.utils.api_utils import (
     validate_json_request,
     with_cancellation,
 )
+from vllm.entrypoints.serve.utils.fingerprint import set_default_fingerprint_mode
 from vllm.entrypoints.serve.utils.orca_metrics import metrics_header
 from vllm.entrypoints.serve.utils.request_logger import RequestLogger
 from vllm.entrypoints.speech_to_text.realtime.serving import OpenAIServingRealtime
@@ -819,6 +820,18 @@ async def omni_init_app_state(
             if stage_type == "diffusion":
                 is_pure_diffusion = True
                 logger.info("Detected pure diffusion mode (single diffusion stage)")
+
+    # Upstream applies the CLI fingerprint mode at the top of
+    # ``init_generate_state``, before any serving class is constructed, and each
+    # ``BaseServing.__init__`` reads the module-level mode once and caches the
+    # result on ``self.system_fingerprint``. omni builds those classes itself
+    # (here, in the duplex path below, and in the diffusion path) and never calls
+    # ``init_generate_state``, so without this the ``--fingerprint-mode`` /
+    # ``--fingerprint-value`` flags are accepted and silently ignored.
+    set_default_fingerprint_mode(
+        getattr(args, "fingerprint_mode", "full"),
+        getattr(args, "fingerprint_value", None),
+    )
 
     if args.served_model_name is not None:
         served_model_names = args.served_model_name
