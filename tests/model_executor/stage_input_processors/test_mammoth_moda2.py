@@ -17,21 +17,10 @@ from vllm_omni.engine.serialization import (
 from vllm_omni.engine.stage_engine_core_client import StageEngineCoreClient
 from vllm_omni.model_executor.models.mammoth_moda2.pipeline import MAMMOTH_MODA2_PIPELINE
 from vllm_omni.model_executor.stage_input_processors.mammoth_moda2 import ar2diffusion
+from vllm_omni.outputs import OmniRequestOutput
+from vllm_omni.outputs.mm_outputs import MultimodalCompletionOutput, MultimodalPayload
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
-
-
-@dataclass
-class _CompletionOutputStub:
-    cumulative_token_ids: list[int]
-    multimodal_output: dict[str, torch.Tensor]
-
-
-@dataclass
-class _AROutputStub:
-    request_id: str
-    prompt_token_ids: list[int]
-    outputs: list[_CompletionOutputStub]
 
 
 @dataclass
@@ -48,13 +37,24 @@ class _MammothConfigStub:
     vision_end_token_id: int
 
 
-def _source_output(*, include_latent: bool = True) -> _AROutputStub:
-    multimodal_output = {"latent": torch.arange(32, dtype=torch.float32).reshape(4, 8)} if include_latent else {}
-    completion = _CompletionOutputStub(
-        cumulative_token_ids=[100, 101, 102],
-        multimodal_output=multimodal_output,
+def _source_output(
+    *,
+    include_latent: bool = True,
+    dtype: torch.dtype = torch.float32,
+) -> OmniRequestOutput:
+    multimodal_output = {"latent": torch.arange(32, dtype=dtype).reshape(4, 8)} if include_latent else {}
+    completion = MultimodalCompletionOutput(
+        index=0,
+        text="",
+        token_ids=[100, 101, 102],
+        cumulative_logprob=None,
+        logprobs=None,
+        finish_reason="stop",
+        multimodal_output=MultimodalPayload(tensors=multimodal_output),
     )
-    return _AROutputStub(
+    # The native output processor attaches this inter-stage field.
+    completion.cumulative_token_ids = [100, 101, 102]
+    return OmniRequestOutput(
         request_id="req-7",
         prompt_token_ids=[10, 11],
         outputs=[completion],
@@ -126,7 +126,7 @@ def test_ar2diffusion_reports_missing_latent_with_request_id() -> None:
 
 def test_ar2diffusion_rejects_hidden_state_length_mismatch() -> None:
     source = _source_output()
-    source.outputs[0].multimodal_output["latent"] = torch.zeros(3, 8)
+    source.outputs[0].multimodal_output.tensors["latent"] = torch.zeros(3, 8)
     with pytest.raises(ValueError, match="Hidden states length mismatch"):
         ar2diffusion([source], {})
 
@@ -135,7 +135,7 @@ def test_ar2diffusion_rejects_hidden_state_length_mismatch() -> None:
 def test_ar2diffusion_preserves_low_precision_through_engine_core_payload(dtype: torch.dtype) -> None:
     source = _source_output()
     hidden_states = torch.arange(32, dtype=dtype).reshape(4, 8)
-    source.outputs[0].multimodal_output["latent"] = hidden_states
+    source.outputs[0].multimodal_output.tensors["latent"] = hidden_states
     diffusion_input = ar2diffusion([source], {})
 
     wire_payload = serialize_additional_information(diffusion_input["additional_information"])
@@ -204,4 +204,13 @@ def test_stage_client_forwards_completed_ar_output_to_mammoth_adapter() -> None:
     info = diffusion_input["additional_information"]
     assert info["full_token_ids"] == [10, 11, 100, 101]
     assert info["answer_start_index"] == 2
-    assert torch.equal(info["full_hidden_states"], source.outputs[0].multimodal_output["latent"])
+    assert torch.equal(info["full_hidden_states"], source.outputs[0].multimodal_output.tensors["latent"])
+
+
+@pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16))
+def test_ar2diffusion_preserves_low_precision_hidden_states(dtype: torch.dtype) -> None:
+    result = ar2diffusion([_source_output(dtype=dtype)], {})
+
+    hidden_states = result["additional_information"]["full_hidden_states"]
+    assert hidden_states.dtype == dtype
+    assert hidden_states.is_contiguous()
