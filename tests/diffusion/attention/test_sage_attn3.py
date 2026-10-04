@@ -21,7 +21,7 @@ def load_sage_attn3_module(monkeypatch: pytest.MonkeyPatch, kernel_impl):
     fake_module = types.ModuleType("sageattn3")
     setattr(fake_module, "sageattn3_blackwell", kernel_impl)
     monkeypatch.setitem(sys.modules, "sageattn3", fake_module)
-    sys.modules.pop(SAGE_ATTN3_MODULE, None)
+    monkeypatch.delitem(sys.modules, SAGE_ATTN3_MODULE, raising=False)
     return importlib.import_module(SAGE_ATTN3_MODULE)
 
 
@@ -205,3 +205,130 @@ def test_cuda_platform_rejects_missing_explicit_sage_attn3(monkeypatch: pytest.M
 
     with pytest.raises(ImportError, match="explicitly selected"):
         CudaOmniPlatform.get_diffusion_attn_backend_cls("SAGE_ATTN_3", head_size=64)
+
+
+@pytest.mark.parametrize("length", [1, 17])
+def test_sage3_custom_op_owns_mutated_key(monkeypatch, length):
+    def kernel(q, k, v, is_causal=False):
+        k.sub_(k.mean(dim=-2, keepdim=True))
+        # Exercise a noncontiguous vendor output as well as in-place K centering.
+        return (q + k + v).transpose(-1, -2).contiguous().transpose(-1, -2)
+
+    module = load_sage_attn3_module(monkeypatch, kernel)
+    q = torch.randn(1, 1, length, 64)
+    original = q.clone()
+    op = module._sageattn3_blackwell_op.default
+    checks = torch.library.opcheck(op, (q, q, q, False), test_utils=("test_schema", "test_faketensor"))
+    assert all(result == "SUCCESS" for result in checks.values())
+    impl = module.SageAttention3Impl(1, 64, 0.125)
+    torch.compiler.reset()
+    try:
+        compiled = torch.compile(impl.forward_cuda, fullgraph=True, dynamic=True)
+        for _ in range(2):
+            out = compiled(q, q, q)
+            torch.testing.assert_close(out, impl.forward_cuda(q, q, q))
+            assert out.is_contiguous()
+            torch.testing.assert_close(q, original, atol=0, rtol=0)
+    finally:
+        torch.compiler.reset()
+
+
+def test_sage3_contract_does_not_inherit_sage2_verification(monkeypatch):
+    from vllm_omni.diffusion.attention.capabilities import ExecutionContext, SupportStatus
+
+    module = load_sage_attn3_module(monkeypatch, lambda q, k, v, **kw: q + k + v)
+    context = ExecutionContext(platform="cuda", kernel_variant="sage_sm90", require_fullgraph=True)
+    impl = module.SageAttention3Impl(1, 64, 0.125)
+    q = torch.randn(1, 17, 1, 64)
+    for result in (
+        module.SageAttention3Backend.resolve_capabilities(context),
+        impl.resolve_execution_path(context, q, q, q, None),
+    ):
+        assert result.backend == "SAGE_ATTN_3"
+        assert result.kernel_variant is None
+        assert result.support.status is SupportStatus.UNMIGRATED
+        assert result.requested_support(context).status is not SupportStatus.SUPPORTED
+
+
+@pytest.mark.parametrize("variant", ["sage3_sm90", "sage3_sm100", "sage3_sm103", "sage3_sm120", "sage3_sm121"])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("head_size", [64, 128])
+def test_sage3_verified_device_scope(monkeypatch, variant, dtype, head_size):
+    from vllm_omni.diffusion.attention.capabilities import CompilationMode, ExecutionContext, SupportStatus
+
+    module = load_sage_attn3_module(monkeypatch, lambda q, k, v, **kw: q + k + v)
+    monkeypatch.setattr(module, "_sage3_kernel_variant", lambda q: variant)
+    impl = module.SageAttention3Impl(2, head_size, head_size**-0.5)
+    q = torch.randn(1, 17, 2, head_size, dtype=dtype)
+    context = ExecutionContext(platform="cuda", require_fullgraph=True)
+    result = impl.resolve_execution_path(context, q, q, q, None)
+    assert result.kernel_variant == variant
+    expected = SupportStatus.SUPPORTED if variant == "sage3_sm120" else SupportStatus.UNMIGRATED
+    assert result.support.status is expected
+    if expected is SupportStatus.SUPPORTED:
+        assert result.compilation_mode is CompilationMode.CUSTOM_OP
+        assert result.requested_support(context).status is SupportStatus.SUPPORTED
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "packed",
+        "piecewise",
+        "paged",
+        "parallel",
+        "hsdp",
+        "kv_quant",
+        "dropout",
+        "head256",
+        "gqa",
+        "causal_cross",
+        "dtype",
+        "shape",
+        "mask",
+    ],
+)
+def test_sage3_unverified_and_invalid_paths(monkeypatch, case):
+    from vllm_omni.diffusion.attention.capabilities import (
+        ExecutionContext,
+        OuterBoundary,
+        ParallelStrategy,
+        SupportStatus,
+    )
+
+    module = load_sage_attn3_module(monkeypatch, lambda q, k, v, **kw: q + k + v)
+    monkeypatch.setattr(module, "_sage3_kernel_variant", lambda q: "sage3_sm120")
+    head = 256 if case == "head256" else 64
+    impl = module.SageAttention3Impl(
+        2, head, head**-0.5, causal=case == "causal_cross", dropout_p=0.1 if case == "dropout" else 0.0
+    )
+    q, k, v = (torch.randn(1, 17, 2, head, dtype=torch.bfloat16) for _ in range(3))
+    context = ExecutionContext(
+        platform="cuda",
+        paged_kv=case == "paged",
+        parallel_strategy=ParallelStrategy.ULYSSES if case == "parallel" else ParallelStrategy.NONE,
+        outer_boundaries=frozenset({OuterBoundary.HSDP}) if case == "hsdp" else frozenset(),
+    )
+    metadata = None
+    if case == "packed":
+        metadata = AttentionMetadata(extra={"cu_seqlens_q": torch.tensor([0, 17])})
+    elif case == "piecewise":
+        metadata = AttentionMetadata(full_attn_spans=[[(0, 17)]])
+    elif case == "kv_quant":
+        metadata = AttentionMetadata(extra={"kv_cache_dtype": "fp8"})
+    elif case == "gqa":
+        k, v = k[:, :, :1], v[:, :, :1]
+    elif case == "causal_cross":
+        k, v = k[:, :12], v[:, :12]
+    elif case == "dtype":
+        k = k.float()
+    elif case == "shape":
+        v = v[:, :12]
+    elif case == "mask":
+        metadata = AttentionMetadata(attn_mask=torch.ones(1, 17))
+        with pytest.raises(ValueError, match="attn_mask"):
+            impl.resolve_execution_path(context, q, k, v, metadata)
+        return
+    result = impl.resolve_execution_path(context, q, k, v, metadata)
+    expected = SupportStatus.UNSUPPORTED if case in ("dtype", "shape") else SupportStatus.UNMIGRATED
+    assert result.support.status is expected
