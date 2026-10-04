@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # Copyright 2025 The vLLM-Omni team.
 
 """Ming-specific subclass of ZImageTransformer2DModel that supports ``ref_x``.
@@ -31,8 +32,20 @@ class MingZImageTransformer2DModel(ZImageTransformer2DModel):
     ):
         ref_latent = get_forward_context().ref_latent if is_forward_context_available() else None
         if ref_latent is not None:
-            per_item = ref_latent[0].unsqueeze(1).to(dtype=x[0].dtype, device=x[0].device)  # [C, 1, H, W]
-            x = [torch.cat([img, per_item], dim=1) for img in x]
+            if ref_latent.dim() == 3:
+                ref_latent = ref_latent.unsqueeze(0)
+            if ref_latent.dim() != 4 or ref_latent.shape[0] != len(x):
+                raise ValueError(
+                    "Ming reference latent batch must match transformer batch: "
+                    f"latents={tuple(ref_latent.shape)}, requests={len(x)}"
+                )
+            x = [
+                torch.cat(
+                    [img, ref_latent[i].unsqueeze(1).to(dtype=img.dtype, device=img.device)],
+                    dim=1,
+                )
+                for i, img in enumerate(x)
+            ]
         return super().forward(x, t, cap_feats, patch_size=patch_size, f_patch_size=f_patch_size)
 
     def unpatchify(

@@ -131,7 +131,7 @@ vsa = [
 docs = [
     "mkdocs>=1.5.0",
     "mkdocs-api-autonav",
-    "mkdocs-material",
+    "mkdocs-material<9.7",
     "mkdocstrings-python",
     "mkdocs-gen-files",
     "mkdocs-awesome-nav",
