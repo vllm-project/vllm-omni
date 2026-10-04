@@ -7,7 +7,7 @@ import os
 from collections import Counter
 from collections.abc import Iterable
 from contextlib import nullcontext
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn as nn
@@ -20,6 +20,7 @@ from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper
 from vllm_omni.data_entry_keys import FIRST_AUDIO_REQUIRED_KEY
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.model_executor.stage_input_processors.chunk_size_utils import parse_chunk_ramp
+from vllm_omni.platforms import current_omni_platform
 
 from .tokenizer_12hz.configuration_qwen3_tts_tokenizer_v2 import (
     Qwen3TTSTokenizerV2Config,
@@ -29,6 +30,9 @@ from .tokenizer_12hz.modeling_qwen3_tts_tokenizer_v2 import (
 )
 
 logger = init_logger(__name__)
+
+if TYPE_CHECKING:
+    from .streaming_code2wav import StreamingCode2Wav
 
 _DUMMY_REQUEST_ID = "__qwen3_tts_dummy_run__"
 
@@ -121,6 +125,7 @@ class Qwen3TTSCode2Wav(nn.Module):
         self._decoder_sliding_window = int(getattr(dec_config, "sliding_window", 0) or 0)
         self._decoder_state_cache: dict[str, dict[str, Any]] = {}
         self._decoder_state_cache_warn_entries = 512
+        self._streaming_codec: StreamingCode2Wav | None = None
 
     def embed_input_ids(self, input_ids: torch.Tensor, **_: Any) -> torch.Tensor:
         # This stage ignores token embeddings. Keep a stable dummy embedding for vLLM runner.
@@ -233,6 +238,8 @@ class Qwen3TTSCode2Wav(nn.Module):
     def on_requests_finished(self, finished_req_ids: set[str] | list[str]) -> None:
         for req_id in finished_req_ids:
             self._decoder_state_cache.pop(req_id, None)
+        if self._streaming_codec is not None:
+            self._streaming_codec.release(finished_req_ids)
 
     def log_decode_batch_stats(self) -> None:
         if not self._batch_stats_enabled or self._batch_stats_requests == 0:
@@ -434,7 +441,7 @@ class Qwen3TTSCode2Wav(nn.Module):
                 strict=False,
             ):
                 if req_id is not None and (finished or segment_finished):
-                    self._decoder_state_cache.pop(req_id, None)
+                    self.on_requests_finished([req_id])
             return OmniOutput(
                 text_hidden_states=None,
                 multimodal_outputs={
@@ -494,14 +501,26 @@ class Qwen3TTSCode2Wav(nn.Module):
             bucket_frames=max_request_length,
             actual_frames=request_lengths,
         )
-        request_wavs = decoder.batched_chunked_decode(
-            request_codes,
-            request_lengths,
-            caches=request_states,
-            chunk_size=self._decode_chunk_frames,
-            left_context_size=self._decode_left_context_frames,
-            max_batch_size=self._decode_batch_max_size,
-        )
+        if self._streaming_codec is not None and request_states is not None:
+            request_wavs = self._streaming_codec.decode(
+                request_codes,
+                request_lengths,
+                request_ids=[str(state_req_id) for state_req_id, _ in valid_codes_qf],
+                caches=request_states,
+                terminal=[finished_flags[idx] or segment_finished_flags[idx] for idx in valid_indices],
+                legacy_decoder=decoder,
+                chunk_size=self._decode_chunk_frames,
+                left_context_size=self._decode_left_context_frames,
+            )
+        else:
+            request_wavs = decoder.batched_chunked_decode(
+                request_codes,
+                request_lengths,
+                caches=request_states,
+                chunk_size=self._decode_chunk_frames,
+                left_context_size=self._decode_left_context_frames,
+                max_batch_size=self._decode_batch_max_size,
+            )
         if len(request_wavs) != len(valid_codes_qf):
             raise ValueError(
                 f"Qwen3-TTS batched decoder returned {len(request_wavs)} outputs for {len(valid_codes_qf)} requests"
@@ -544,7 +563,7 @@ class Qwen3TTSCode2Wav(nn.Module):
             strict=False,
         ):
             if req_id is not None and (finished or segment_finished):
-                self._decoder_state_cache.pop(req_id, None)
+                self.on_requests_finished([req_id])
 
         return OmniOutput(
             text_hidden_states=None,
@@ -698,6 +717,7 @@ class Qwen3TTSCode2Wav(nn.Module):
             return sorted(pairs)
 
         if isinstance(extra_cfg, dict):
+            decode_streaming = _get_bool_config("decode_streaming", False)
             codec_chunk_frames = int(extra_cfg.get("codec_chunk_frames") or 0)
             codec_left_context_frames = int(extra_cfg.get("codec_left_context_frames") or 0)
             initial_codec_chunk_frames = int(extra_cfg.get("initial_codec_chunk_frames") or 1)
@@ -730,6 +750,7 @@ class Qwen3TTSCode2Wav(nn.Module):
             )
             decode_cudnn_benchmark = _get_bool_config("decode_cudnn_benchmark", False)
         else:
+            decode_streaming = False
             codec_chunk_frames = 0
             codec_left_context_frames = 0
             initial_codec_chunk_frames = 1
@@ -739,6 +760,18 @@ class Qwen3TTSCode2Wav(nn.Module):
             decode_enable_tf32 = False
             decode_cudnn_benchmark = False
             decode_time_major_conv = False
+
+        if decode_streaming:
+            if (
+                not self._async_chunk
+                or device.type != "cuda"
+                or not current_omni_platform.is_cuda()
+                or self.vllm_config.model_config.dtype != torch.bfloat16
+            ):
+                raise ValueError("Qwen3-TTS decode_streaming requires async_chunk and a CUDA/BF16 Code2Wav stage")
+            # The streaming backend supplies xvector graphs; native ICL
+            # graphs retain the anchored-reference semantics.
+            self.decoder_cudagraph_modes = ("icl",)
 
         if decode_enable_tf32 and device.type == "cuda":
             # PyTorch exposes TF32 controls as process-wide CUDA backend
@@ -793,5 +826,21 @@ class Qwen3TTSCode2Wav(nn.Module):
                     "Failed to enable CUDA Graph for Code2Wav decoder",
                     exc_info=True,
                 )
+
+        if decode_streaming:
+            from .streaming_code2wav import StreamingCode2Wav
+
+            num_slots = _get_int_config("decode_streaming_num_slots", self.vllm_config.scheduler_config.max_num_seqs)
+            with torch.inference_mode():
+                self._streaming_codec = StreamingCode2Wav(
+                    self.decoder,
+                    num_slots=num_slots,
+                    max_batch_size=self._decode_batch_max_size,
+                    batch_sizes=decode_cudagraph_batch_sizes or [1],
+                    frame_sizes=[1, initial_codec_chunk_frames, codec_chunk_frames, *(codec_chunk_ramp or [])],
+                    # enforce_eager disables both native and streaming graphs.
+                    capture=not getattr(self.vllm_config.model_config, "enforce_eager", False),
+                )
+            logger.info("Code2Wav streaming codec enabled: %d slots; ICL retains anchored-reference decode", num_slots)
 
         return loaded

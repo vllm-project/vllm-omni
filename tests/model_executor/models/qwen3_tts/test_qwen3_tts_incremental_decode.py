@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import copy
 from collections import Counter
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 import torch
@@ -142,6 +143,7 @@ def test_code2wav_full_graph_dummy_forward_uses_exact_batched_decode(monkeypatch
     model._decode_left_context_frames = 25
     model._decode_batch_max_size = 0
     model._decoder_state_cache = {}
+    model._streaming_codec = None
     model._decoder_state_cache_warn_entries = 512
     model._logged_codec_stats = True
     model._logged_malformed_codec_lengths = set()
@@ -341,7 +343,7 @@ def test_incremental_request_audio_matches_full_decode(mode):
         (1, decoder.config.num_quantizers, prefix_frames + suffix_frames),
     )
     suffix_codes = codes[..., prefix_frames:]
-    caches = {"prefix_frames": prefix_frames}
+    caches: dict[str, Any] = {"prefix_frames": prefix_frames}
 
     with torch.no_grad():
         first = decoder(codes[..., : prefix_frames + 1], caches=caches)
@@ -383,7 +385,7 @@ def test_single_frame_xvec_prefix_keeps_all_next_chunk_conv_frames():
     decoder = Qwen3TTSTokenizerV2Decoder(config).eval()
     decoder._incremental_chunk_frames = 25
     codes = torch.randint(0, config.codebook_size, (1, config.num_quantizers, 26))
-    caches = {"prefix_frames": 0}
+    caches: dict[str, Any] = {"prefix_frames": 0}
 
     with torch.no_grad():
         decoder(codes[..., :1], caches=caches)
@@ -421,7 +423,7 @@ def test_xvec_rolling_matches_truncated_suffix_window():
     decoder = Qwen3TTSTokenizerV2Decoder(config).eval()
     decoder._incremental_chunk_frames = 25
     codes = torch.randint(0, config.codebook_size, (1, config.num_quantizers, 101))
-    caches = {"prefix_frames": 0}
+    caches: dict[str, Any] = {"prefix_frames": 0}
 
     with torch.no_grad():
         decoder(codes[..., :1], caches=caches)
@@ -470,7 +472,7 @@ def test_icl_rolling_matches_reference_plus_truncated_suffix_window():
     )
     prefix_codes = codes[..., :prefix_frames]
     suffix_codes = codes[..., prefix_frames:]
-    caches = {"prefix_frames": prefix_frames}
+    caches: dict[str, Any] = {"prefix_frames": prefix_frames}
 
     with torch.no_grad():
         decoder(codes[..., : prefix_frames + 1], caches=caches)
@@ -975,7 +977,7 @@ def test_batched_chunked_decode_groups_exact_phases(monkeypatch):
 
     prefix_frames = 48
     codes_list = [torch.zeros(1, 2, prefix_frames + 1)]
-    caches = [{"prefix_frames": prefix_frames}]
+    caches: list[dict[str, Any]] = [{"prefix_frames": prefix_frames}]
     for previous, _suffix_frames, cached_frames in (
         (1, 26, 1),
         (26, 51, 26),
@@ -1064,7 +1066,7 @@ def test_missing_graph_phase_falls_back_instead_of_returning_empty(monkeypatch):
     wrapper._record_graph_fallback = lambda *_args: None
 
     codes = [torch.zeros(1, 2, 25)]
-    caches = [{}]
+    caches: list[dict[str, Any]] = [{}]
 
     assert wrapper._decode_icl_prefix_batch(codes, caches) is None
     assert wrapper._decode_suffix_batch("xvec", 50, codes, caches, [25]) is None
@@ -1078,9 +1080,12 @@ def test_xvec_first_chunk_uses_prefixless_initializer(monkeypatch):
     wrapper._icl_previous_frames_by_target = {26: 1}
     wrapper._xvec_previous_frames_by_target = {26: 1}
     calls = []
-    wrapper.decoder = _decoder_stub(
-        _decode_xvec_first_chunk=lambda codes, cache: calls.append("xvec") or codes[:, :1, :],
-    )
+
+    def decode_xvec(codes, cache):
+        calls.append("xvec")
+        return codes[:, :1, :]
+
+    wrapper.decoder = _decoder_stub(_decode_xvec_first_chunk=decode_xvec)
 
     output = wrapper._batched_request_decode(
         [torch.zeros(1, 2, 25)],
