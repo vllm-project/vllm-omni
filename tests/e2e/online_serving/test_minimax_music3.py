@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """E2E online tests for MiniMax Music 3 text-to-music.
 
 This is a music model on the speech endpoint, so the request shape differs
@@ -18,6 +18,7 @@ os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
 import pytest
 
+from tests.helpers.assertions import assert_wav_audio_valid
 from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniServerParams
 from tests.helpers.stage_config import get_deploy_config_path
@@ -32,6 +33,9 @@ _FRAMES_10S = 250
 _FRAMES_30S = 750
 _MIN_BYTES_10S = 500_000
 _MIN_BYTES_30S = 1_500_000
+_SAMPLE_RATE = 32_000
+_CHANNELS = 2
+_SAMPLE_WIDTH_BYTES = 2
 
 LYRICS = (
     "[Verse]\nWalking down the empty street at midnight\n"
@@ -80,8 +84,18 @@ def test_text_to_music_001(omni_server, openai_client) -> None:
         "response_format": "wav",
         "timeout": DEFAULT_AUDIO_SPEECH_TIMEOUT_S,
         "min_audio_bytes": _MIN_BYTES_10S,
+        # Music 3 provides generative lyric control, not a guarantee that every
+        # requested line is sung verbatim within a short clip.
+        "transcript_expected_text": None,
     }
-    openai_client.send_audio_speech_request(request_config)
+    responses = openai_client.send_audio_speech_request(request_config)
+    assert_wav_audio_valid(
+        responses[0].audio_bytes,
+        sample_rate=_SAMPLE_RATE,
+        channels=_CHANNELS,
+        sample_width_bytes=_SAMPLE_WIDTH_BYTES,
+        min_audio_bytes=_MIN_BYTES_10S,
+    )
 
 
 @pytest.mark.slow
@@ -108,5 +122,13 @@ def test_text_to_music_multi_window_002(omni_server, openai_client) -> None:
         "response_format": "wav",
         "timeout": DEFAULT_AUDIO_SPEECH_TIMEOUT_S,
         "min_audio_bytes": _MIN_BYTES_30S,
+        "transcript_expected_text": None,
     }
-    openai_client.send_audio_speech_request(request_config)
+    responses = openai_client.send_audio_speech_request(request_config)
+    assert_wav_audio_valid(
+        responses[0].audio_bytes,
+        sample_rate=_SAMPLE_RATE,
+        channels=_CHANNELS,
+        sample_width_bytes=_SAMPLE_WIDTH_BYTES,
+        min_audio_bytes=_MIN_BYTES_30S,
+    )
