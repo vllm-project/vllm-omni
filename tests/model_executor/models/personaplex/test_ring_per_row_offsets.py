@@ -118,7 +118,9 @@ def _make_codec_stub(mocker: MockerFixture) -> PersonaPlexMimiCodec:
     nn.Module.__init__(codec)
 
     quantizer = mocker.Mock(spec=["encode", "decode"])
-    quantizer.encode.side_effect = lambda x: torch.zeros(8, x.shape[0], x.shape[-1], dtype=torch.long)
+    quantizer.encode.side_effect = lambda x, num_quantizers=8: torch.zeros(
+        num_quantizers, x.shape[0], x.shape[-1], dtype=torch.long
+    )
     quantizer.decode.side_effect = lambda codes: torch.zeros(codes.shape[0], 1, codes.shape[-1])
 
     codec.device = torch.device("cpu")
