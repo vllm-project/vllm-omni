@@ -17,7 +17,6 @@ import math
 
 import pytest
 import torch
-
 from vllm_omni.diffusion.models.pi0.config import Pi0Config
 from vllm_omni.diffusion.models.pi0.modeling_pi0 import (
     OPENPI_ATTENTION_MASK_VALUE,
@@ -34,7 +33,10 @@ from vllm_omni.diffusion.models.pi0.processor_pi0 import (
     build_model_inputs,
     pil_image_to_tensor,
     resize_with_pad,
+    tokenize_prompt,
 )
+
+from vllm_omni.diffusion.models.pi.common import backbone
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -117,6 +119,12 @@ def test_config_deploy_yaml_override():
     c = Pi0Config.from_model_config({**_LEROBOT_CFG, "dtype": "bfloat16", "num_inference_steps": 4})
     assert c.dtype == "bfloat16"
     assert c.num_inference_steps == 4
+
+
+@pytest.mark.parametrize("dtype", ["float16", "float64", "auto"])
+def test_config_rejects_unsupported_dtype(dtype):
+    with pytest.raises(ValueError, match="dtype must be one of"):
+        Pi0Config(dtype=dtype)
 
 
 # ----------------------------------------------------------------------------
@@ -432,6 +440,27 @@ class _FakeTokenizer:
         return {"input_ids": ids, "attention_mask": attn}
 
 
+def test_tokenize_prompt_keeps_pi0_newline_policy():
+    class RecordingTokenizer(_FakeTokenizer):
+        def __call__(self, text, **kwargs):
+            self.text = text
+            self.kwargs = kwargs
+            return super().__call__(text, **kwargs)
+
+    tokenizer = RecordingTokenizer()
+    ids, attn = tokenize_prompt(tokenizer, "pick up the block", 12)
+
+    assert tokenizer.text == "pick up the block\n"
+    assert tokenizer.kwargs == {
+        "padding": "max_length",
+        "max_length": 12,
+        "truncation": True,
+        "add_special_tokens": True,
+        "return_tensors": None,
+    }
+    assert len(ids) == len(attn) == 12
+
+
 def test_build_model_inputs_camera_order_and_padding():
     import numpy as np
 
@@ -578,7 +607,7 @@ def test_version_stable_embed_image():
     model = _selfconsist_model(device)
     g = torch.Generator(device="cpu").manual_seed(7)
     img = torch.rand(1, 3, 224, 224, generator=g, dtype=torch.float32).to(device)
-    std = model.paligemma_with_expert.embed_image(img).float().std().item()
+    std = backbone.embed_image(model.paligemma_with_expert.paligemma, img).float().std().item()
     assert abs(std - _GOLDEN_EMBED_IMAGE_STD) < 0.05, (
         f"embed_image std drifted: {std} vs {_GOLDEN_EMBED_IMAGE_STD} — "
         "likely a vision_tower weight-load regression under this transformers version."

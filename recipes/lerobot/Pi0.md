@@ -100,7 +100,7 @@ reference (`max|Δ| = 7.15e-07`, CPU/float32, fixed noise; see
 
 - Model blog: <https://www.physicalintelligence.company/blog/pi0>
 - Checkpoint: <https://huggingface.co/lerobot/pi0_base>
-- Pipeline: [`vllm_omni/diffusion/models/pi0/pipeline_pi0.py`](../../vllm_omni/diffusion/models/pi0/pipeline_pi0.py)
+- Pipeline: [`vllm_omni/diffusion/models/pi/pi0/pipeline_pi0.py`](../../vllm_omni/diffusion/models/pi/pi0/pipeline_pi0.py)
 - Deploy config: [`vllm_omni/deploy/pi0.yaml`](../../vllm_omni/deploy/pi0.yaml)
 - Example client: [`examples/online_serving/pi0/`](../../examples/online_serving/pi0/)
 - Tests: CPU units + LeRobot parity in [`tests/diffusion/models/pi0/`](../../tests/diffusion/models/pi0/),
