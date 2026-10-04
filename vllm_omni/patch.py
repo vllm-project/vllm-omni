@@ -233,7 +233,14 @@ try:
     _modelopt = importlib.import_module(_MODELOPT_MODULE)
     _legacy_nvfp4_linear_method = getattr(_modelopt, _LEGACY_NVFP4_LINEAR_METHOD, None)
     _generic_linear_method = getattr(_modelopt, _GENERIC_LINEAR_METHOD, None)
-except ImportError as _nan_clamp_import_err:
+except Exception as _nan_clamp_import_err:  # noqa: BLE001 - this optional import
+    # transitively pulls in vllm.model_executor.layers.quantization.utils.w8a8_utils,
+    # whose module-level `cutlass_fp8_supported()` probes NVML and can raise
+    # environment/driver errors (e.g. NVMLError_InvalidArgument, which is NOT an
+    # ImportError subclass) instead of failing to import. A narrower `except
+    # ImportError` here lets that escape and crashes the whole vllm_omni import
+    # instead of degrading gracefully. See
+    # https://github.com/vllm-project/vllm-omni/issues/7232.
     _PATCH_LOGGER.warning(
         "NVFP4 weight_scale NaN-clamp patch could NOT install: %s. NVFP4 W4A4 "
         "checkpoints with NaN bytes in per-block weight_scale will serve `!!!!`.",
