@@ -3062,6 +3062,8 @@ async def omni_sleep(request: OmniSleepRequest, raw_request: Request):
         raise HTTPException(status_code=501, detail="Engine does not support sleep")
     try:
         acks = await engine_client.sleep(stage_ids=request.stage_ids, level=request.level)
+    except ValueError as e:
+        raise HTTPException(status_code=HTTPStatus.BAD_REQUEST.value, detail=str(e)) from e
     except RuntimeError as e:
         raise HTTPException(status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value, detail=f"Failed to sleep: {e}") from e
     finally:
@@ -3086,6 +3088,8 @@ async def omni_wakeup(request: OmniWakeupRequest, raw_request: Request):
         acks = await engine_client.wake_up(stage_ids=request.stage_ids)
     except NotImplementedError:
         raise
+    except ValueError as e:
+        raise HTTPException(status_code=HTTPStatus.BAD_REQUEST.value, detail=str(e)) from e
     except RuntimeError as e:
         raise HTTPException(status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value, detail=f"Failed to wake up: {e}") from e
     for sid in request.stage_ids:
