@@ -75,6 +75,8 @@ class ARDiffusionPagedLayerInputs(NamedTuple):
     # Index of the current chunk's first block within the staged window: right after the visible history,
     # which is not the end of the padded block table (that carries at least one action-capacity block).
     stage_first_block: int = 0
+    tail_source_slots: torch.Tensor | None = None
+    tail_destination_slots: torch.Tensor | None = None
 
 
 @dataclass
@@ -122,6 +124,8 @@ class ARDiffusionPagedForwardContext:
     max_query_len: int = 0
     max_seq_len: int = 0
     _prepared: bool = False
+    tail_source_slots: torch.Tensor | None = None
+    tail_destination_slots: torch.Tensor | None = None
 
     @property
     def block_size(self) -> int:
@@ -360,24 +364,13 @@ class ARDiffusionPagedForwardContext:
         if self.frame_causal:
             return self._build_frame_causal_block_table(action_len=action_len, query_len=query_len, device=device)
         video_blocks, video_len = self.video_block_table(device)
-        # Action K/V is listed after the video blocks and the kernel reads the
-        # table as one run, so the video run has to end on a block edge. If it
-        # stops part way through its last block, the run reads that block's
-        # unwritten slots as the first action tokens and never reaches the last
-        # ones -- a wrong attention with every shape intact. A frame that is a
-        # whole number of blocks always ends on an edge, so this refuses only
-        # geometries that could not page at all before the paging unit was
-        # separated from the frame.
-        if action_len > 0 and video_len % self.block_size:
-            raise ValueError(
-                "AR-Diffusion paged attention cannot place action tokens after a partly written video block: "
-                f"the video run ends {video_len % self.block_size} slots into block {video_blocks[-1]}, so the "
-                "kernel would read its unwritten slots as action tokens. Action tokens need tokens_per_frame "
-                f"to be a whole number of blocks (block_size={self.block_size})."
-            )
-        self.ensure_action_slots(action_len, device)
-        action_blocks = self.action_scratch_block_ids if action_len > 0 else []
-        block_ids = video_blocks + action_blocks
+        # Keep tensor shapes fixed for compile/CUDA graphs, including steps whose
+        # accumulated video length happens to be page-aligned.
+        if action_len and self.chunk_size % self.block_size:
+            block_ids = self._pack_auxiliary_tails([(video_blocks, video_len)], action_len, device)[0]
+        else:
+            self.ensure_action_slots(action_len, device)
+            block_ids = video_blocks + self.action_scratch_block_ids
         if not block_ids:
             raise RuntimeError("AR-Diffusion paged attention needs at least current video KV blocks")
 
@@ -403,6 +396,33 @@ class ARDiffusionPagedForwardContext:
         query_start_loc = _to_device_async(torch.tensor([0, self.query_len], dtype=torch.int32), device)
         seq_lens = _to_device_async(torch.tensor([self.kv_len], dtype=torch.int32), device)
         return block_table, query_start_loc, seq_lens, self.query_len, max_seq_len
+
+    def _pack_auxiliary_tails(
+        self, views: list[tuple[list[int], int]], action_len: int, device: torch.device
+    ) -> list[list[int]]:
+        """Pack each row's video tail and text into private scratch pages."""
+        block = self.block_size
+        pages = -(-(block - 1 + action_len) // block)
+        offset = 0 if self.commit_current and not self.frame_causal else self._scratch_blocks_used
+        rows: list[list[int]] = []
+        sources: list[int] = []
+        destinations: list[int] = []
+        actions = []
+        for index, (video, length) in enumerate(views):
+            tail = length % block
+            private = self.kv_cache.scratch_block_ids(self.kv_branch, offset + index * pages, pages)
+            # Keep appended auxiliary KV out of the persistent video history.
+            # Copy a fixed-size page, then overwrite its suffix with text; seq_lens masks padding.
+            source = video[-1] if tail else self.kv_cache.null_block_id
+            sources.extend(source * block + i for i in range(block))
+            destinations.extend(private[0] * block + i for i in range(block))
+            actions.append(compute_slot_mapping(private, torch.arange(tail, tail + action_len), block))
+            rows.append((video[:-1] if tail else video) + private[: -(-(tail + action_len) // block)])
+        self.tail_source_slots = _to_device_async(torch.tensor(sources, dtype=torch.long), device)
+        self.tail_destination_slots = _to_device_async(torch.tensor(destinations, dtype=torch.long), device)
+        self.action_slot_mapping = _to_device_async(torch.stack(actions), device)
+        self._action_len = action_len
+        return rows
 
     def _build_frame_causal_block_table(
         self, *, action_len: int, query_len: int, device: torch.device
@@ -545,6 +565,8 @@ class ARDiffusionPagedForwardContext:
             stage_value=stage_value,
             reuse_history=self.reuse_history,
             stage_first_block=int(self.stage_first_block),
+            tail_source_slots=self.tail_source_slots,
+            tail_destination_slots=self.tail_destination_slots,
         )
 
     def mark_committed(self) -> None:
@@ -690,29 +712,12 @@ def _resolve_fa_version(head_size: int) -> int:
 
 
 def supported_kernel_block_sizes() -> list[int | MultipleOf]:
-    """Block sizes the kernel this module dispatches to will accept.
+    """Portable page sizes for the kernels selected by this module.
 
-    Same shape as vLLM's ``AttentionBackend.get_supported_kernel_block_sizes``
-    -- a plain int is that exact size, ``MultipleOf(b)`` is any positive
-    multiple of ``b`` -- but answered here rather than read off a backend,
-    because AR-Diffusion does not go through backend selection. It calls
-    ``flash_attn_varlen_func`` itself, choosing between vLLM's CUDA build and
-    ROCm's AITER a few lines below, and only this module knows which.
-
-    It lives next to that choice so there is one place to change. The
-    constraint is a property of the kernel, not of the card, and the kernels
-    reachable from here agree on 16 today: vLLM's CUDA FlashAttention, ROCm
-    AITER, and upstream ``flash_attn`` all advertise ``MultipleOf(16)``. Other
-    backends in the same tree do not -- ``hpc_attn`` accepts only 64, and
-    FlashInfer advertises pages of 128 or more solely on Blackwell -- so a
-    caller must treat this as data to be queried, never as the number 16.
-
-    vLLM's FlashAttention backend does advertise a single 128-token page when FA4
-    runs its dedicated head-size-256 kernel on SM100/SM110. That kernel is not
-    reachable from here: ``get_flash_attn_version`` selects it only when the
-    caller passes ``supports_fa4_hd256=True``, and :func:`_resolve_fa_version`
-    does not, so a head size of 256 falls back to FA2, which pages at any
-    multiple of 16. Passing that flag later has to change this answer as well.
+    FA2 requires multiples of 16. FA3/FA4 can accept other sizes through
+    non-TMA paths, but use the same cache policy here. The FA4 head-size-256
+    specialization is not selected by _resolve_fa_version; enabling it must
+    also account for its 128-token page requirement.
     """
     from vllm.v1.attention.backend import MultipleOf
 
@@ -963,9 +968,14 @@ def _paged_write_attn_impl(
     reuse_history: bool = False,
     stage_first_block: int = 0,
     framewise_attention: bool = False,
+    tail_source_slots: torch.Tensor | None = None,
+    tail_destination_slots: torch.Tensor | None = None,
 ) -> torch.Tensor:
     key_pool[video_slots] = k_curr.to(key_pool.dtype)
     value_pool[video_slots] = v_curr.to(value_pool.dtype)
+    if tail_source_slots is not None:
+        key_pool[tail_destination_slots] = key_pool[tail_source_slots]
+        value_pool[tail_destination_slots] = value_pool[tail_source_slots]
     if k_act is not None and v_act is not None and k_act.shape[0] > 0:
         key_pool[action_slots] = k_act.to(key_pool.dtype)
         value_pool[action_slots] = v_act.to(value_pool.dtype)
@@ -1023,6 +1033,8 @@ if not hasattr(torch.ops.vllm_omni, "ar_diffusion_paged_write_attn"):
         reuse_history: bool,
         stage_first_block: int,
         framewise_attention: bool,
+        tail_source_slots: torch.Tensor | None,
+        tail_destination_slots: torch.Tensor | None,
     ) -> torch.Tensor:
         return _paged_write_attn_impl(
             query,
@@ -1046,6 +1058,8 @@ if not hasattr(torch.ops.vllm_omni, "ar_diffusion_paged_write_attn"):
             reuse_history,
             stage_first_block,
             framewise_attention,
+            tail_source_slots,
+            tail_destination_slots,
         )
 
     @_paged_write_attn_op.register_fake
@@ -1071,6 +1085,8 @@ if not hasattr(torch.ops.vllm_omni, "ar_diffusion_paged_write_attn"):
         reuse_history=False,
         stage_first_block=0,
         framewise_attention=False,
+        tail_source_slots=None,
+        tail_destination_slots=None,
     ):
         return torch.empty_like(query)
 
@@ -1109,4 +1125,6 @@ def paged_write_attn(
         inputs.reuse_history,
         inputs.stage_first_block,
         framewise_attention,
+        inputs.tail_source_slots,
+        inputs.tail_destination_slots,
     )
