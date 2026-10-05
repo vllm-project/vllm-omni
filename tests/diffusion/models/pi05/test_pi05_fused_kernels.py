@@ -24,9 +24,10 @@ reduction:
   split-K GEMMs round twice in bfloat16, so the fused path is often the more
   accurate one.
 
-Needs a CUDA GPU; no checkpoint::
+Needs a CUDA GPU; no checkpoint. ``-s`` prints each fused kernel's max absolute
+and relative L2 error against its eager op::
 
-    python -m pytest tests/diffusion/models/pi05/test_pi05_fused_kernels.py -v
+    python -m pytest tests/diffusion/models/pi05/test_pi05_fused_kernels.py -v -s
 """
 
 from __future__ import annotations
@@ -98,9 +99,33 @@ def _proj_dtype_module(module: nn.Module, dtype: torch.dtype) -> nn.Module:
     return module.to(device=DEVICE, dtype=dtype)
 
 
-def _assert_as_accurate_as_eager(actual: torch.Tensor, expected: torch.Tensor, reference: torch.Tensor) -> None:
+_DTYPE_NAMES = {torch.float32: "fp32", torch.bfloat16: "bf16"}
+_MODULATION_NOTE = "The scale, shift and gate modulation is still computed by the torch Linear norm.dense, as in eager."
+
+
+def _print_vs_eager(actual, expected, kernel: str, eager: str, dtype: torch.dtype, note: str) -> None:
+    """Print the fused kernel's distance from its eager op (shown with ``-s``)."""
+    diff = actual.double() - expected.double()
+    max_abs = diff.abs().max().item()
+    rel_l2 = (diff.norm() / expected.double().norm()).item()
+    print(
+        f"\nFused {kernel} kernel versus eager {eager} (dtype={_DTYPE_NAMES[dtype]}): "
+        f"max absolute error = {max_abs:.3e}; relative L2 error = {rel_l2:.3e}." + (f" {note}" if note else "")
+    )
+
+
+def _assert_as_accurate_as_eager(
+    actual: torch.Tensor,
+    expected: torch.Tensor,
+    reference: torch.Tensor,
+    kernel: str,
+    eager: str,
+    dtype: torch.dtype,
+    note: str = "",
+) -> None:
     """``actual`` (fused) is as close to the float64 ``reference`` as ``expected`` (eager) is."""
     assert actual.shape == expected.shape and actual.dtype == expected.dtype
+    _print_vs_eager(actual, expected, kernel, eager, dtype, note)
     reference = reference.double()
 
     def errors(t):
@@ -115,8 +140,11 @@ def _assert_as_accurate_as_eager(actual: torch.Tensor, expected: torch.Tensor, r
     )
 
 
-def _assert_bit_exact(actual: torch.Tensor, expected: torch.Tensor) -> None:
+def _assert_bit_exact(
+    actual: torch.Tensor, expected: torch.Tensor, kernel: str, eager: str, dtype: torch.dtype, note: str = ""
+) -> None:
     assert actual.shape == expected.shape and actual.dtype == expected.dtype
+    _print_vs_eager(actual, expected, kernel, eager, dtype, note)
     mismatches = int((actual != expected).sum())
     assert mismatches == 0, f"{mismatches} of {actual.numel()} elements differ from eager"
 
@@ -141,10 +169,10 @@ def test_gelu_mul_is_bit_exact(dtype):
     expected = mlp.act_fn(gate) * up
     actual = torch.empty_like(gate)
     M._fused_gelu_mul(gate, up, actual)
-    _assert_bit_exact(actual, expected)
+    _assert_bit_exact(actual, expected, "GELU-multiply", "GemmaMLP act_fn(gate) * up", dtype)
 
     M._fused_gelu_mul(gate, up, gate)  # in place, as the prefix runs it
-    _assert_bit_exact(gate, expected)
+    _assert_bit_exact(gate, expected, "in-place GELU-multiply", "GemmaMLP act_fn(gate) * up", dtype)
 
 
 # ── Norms: the RMS variance is a reordered reduction ──────────────────
@@ -172,9 +200,12 @@ def test_rms_norm_matches_gemma_rms_norm(dtype, residual_add):
     actual = torch.empty(tokens, width, dtype=dtype, device=DEVICE)
     summed_out = torch.full_like(residual, float("nan")) if residual_add else None
     M._fused_rms_norm(residual, norm, actual, add=sublayer_out, res_out=summed_out)
+    kernel = "residual-add RMSNorm" if residual_add else "RMSNorm"
     if residual_add:
-        _assert_bit_exact(summed_out, summed)
-    _assert_as_accurate_as_eager(actual, expected, _rms_norm_reference(summed, norm.eps, weight=norm.weight))
+        _assert_bit_exact(summed_out, summed, kernel, "sublayer_out + residual", dtype)
+    _assert_as_accurate_as_eager(
+        actual, expected, _rms_norm_reference(summed, norm.eps, weight=norm.weight), kernel, "GemmaRMSNorm", dtype
+    )
 
 
 @pytest.mark.parametrize("dtype", DTYPES, ids=_dtype_id)
@@ -189,7 +220,10 @@ def test_final_rms_norm_keeps_the_residual_dtype(dtype):
     expected = norm(summed)
     actual = torch.empty_like(residual)
     M._fused_rms_norm(residual, norm, actual, add=mlp_out)
-    _assert_as_accurate_as_eager(actual, expected, _rms_norm_reference(summed, norm.eps, weight=norm.weight))
+    reference = _rms_norm_reference(summed, norm.eps, weight=norm.weight)
+    _assert_as_accurate_as_eager(
+        actual, expected, reference, "residual-add final RMSNorm", "GemmaRMSNorm (model.norm)", dtype
+    )
 
 
 @pytest.mark.parametrize("dtype", DTYPES, ids=_dtype_id)
@@ -205,7 +239,8 @@ def test_adarms_norm_matches_pi05_adarms_norm(dtype):
     actual = torch.empty(tokens, width, dtype=dtype, device=DEVICE)
     M._fused_rms_norm(x, norm, actual, modulation=modulation)
     scale, shift, _ = modulation.chunk(3)
-    _assert_as_accurate_as_eager(actual, expected, _rms_norm_reference(x, norm.eps, scale=scale, shift=shift))
+    reference = _rms_norm_reference(x, norm.eps, scale=scale, shift=shift)
+    _assert_as_accurate_as_eager(actual, expected, reference, "AdaRMSNorm", "Pi05AdaRMSNorm", dtype, _MODULATION_NOTE)
 
 
 # ── GEMMs with their epilogues ─────────────────────────────────────────
@@ -218,11 +253,14 @@ def gemm(request, monkeypatch):
     return request.param
 
 
-def _check_gemm_epilogue(gemm: str, dtype: torch.dtype, actual, expected, reference) -> None:
+def _check_gemm_epilogue(
+    gemm: str, dtype: torch.dtype, actual, expected, reference, kernel: str, eager: str, cublas_note: str
+) -> None:
+    """``cublas_note`` says what stays in torch when cuBLAS runs the GEMM."""
     if gemm == "cublas":
-        _assert_bit_exact(actual, expected)
+        _assert_bit_exact(actual, expected, kernel, eager, dtype, cublas_note)
     else:
-        _assert_as_accurate_as_eager(actual, expected, reference)
+        _assert_as_accurate_as_eager(actual, expected, reference, kernel, eager, dtype)
 
 
 def _skip_unserved(gemm: str, dtype: torch.dtype) -> None:
@@ -268,9 +306,16 @@ def test_qkv_rope_matches_eager(gemm, dtype, part):
 
     for cache in (key_cache, value_cache):
         assert torch.isnan(cache[:offset]).all() and torch.isnan(cache[offset + tokens :]).all()
-    _check_gemm_epilogue(gemm, dtype, q_out, q[0].contiguous(), q64[0])
-    _check_gemm_epilogue(gemm, dtype, key_cache[rows], k[0, 0], k64[0, 0])
-    _check_gemm_epilogue(gemm, dtype, value_cache[rows], v[0, 0], v64)
+    note = (
+        "The q/k/v projection GEMMs run in torch (cuBLAS); the Triton kernel only applies RoPE and writes q, K and V."
+    )
+    _check_gemm_epilogue(
+        gemm, dtype, q_out, q[0].contiguous(), q64[0], "QKV+RoPE", f"q_proj + RoPE on the {part}", note
+    )
+    _check_gemm_epilogue(
+        gemm, dtype, key_cache[rows], k[0, 0], k64[0, 0], "QKV+RoPE", f"k_proj + RoPE on the {part}", note
+    )
+    _check_gemm_epilogue(gemm, dtype, value_cache[rows], v[0, 0], v64, "QKV+RoPE", f"v_proj on the {part}", note)
 
 
 @pytest.mark.parametrize("dtype", DTYPES, ids=_dtype_id)
@@ -291,7 +336,10 @@ def test_linear_residual_matches_gated_residual(gemm, dtype, gated, n_in):
     reference = residual.double() + (gate.double() * projection64 if gated else projection64)
     actual = residual.clone()
     M._fused_linear_residual(x, linear, actual, actual, gate=gate)
-    _check_gemm_epilogue(gemm, dtype, actual, expected, reference)
+    proj = {2048: "o_proj", 4096: "down_proj"}[n_in]
+    residual_add = "gated residual add" if gated else "residual add"
+    note = f"The {proj} GEMM runs in torch (cuBLAS); the Triton kernel only applies the {residual_add}."
+    _check_gemm_epilogue(gemm, dtype, actual, expected, reference, "linear-residual", f"{proj} + {residual_add}", note)
 
 
 @pytest.mark.parametrize("dtype", DTYPES, ids=_dtype_id)
@@ -309,7 +357,9 @@ def test_linear_gelu_mul_matches_gemma_mlp_input(gemm, dtype):
     )
     actual = torch.empty_like(expected)
     M._fused_linear_gelu_mul(x, mlp, actual)
-    _check_gemm_epilogue(gemm, dtype, actual, expected, reference)
+    eager = "GemmaMLP act_fn(gate_proj(x)) * up_proj(x)"
+    note = "The gate_proj and up_proj GEMMs run in torch (cuBLAS); the Triton kernel only applies the GELU and product."
+    _check_gemm_epilogue(gemm, dtype, actual, expected, reference, "linear GELU-multiply", eager, note)
 
 
 # ── Reordered reductions: attention and the output head ────────────────
@@ -347,7 +397,14 @@ def test_attention_matches_eager_attend(dtype, part):
     actual = torch.empty_like(expected)
     scores = torch.empty(HEADS * tokens, n_keys, dtype=dtype, device=DEVICE)
     M._fused_attention(q[0], key, value, mask[0, 0], scaling, scores, actual)
-    _assert_as_accurate_as_eager(actual, expected, reference)
+    if M._triton_gemms(dtype):
+        note = (
+            "It runs as three Triton kernels (scores, masked softmax, values) that keep the full score matrix "
+            "in memory, not as one flash-attention kernel."
+        )
+    else:
+        note = "The QK^T and PV matmuls run in torch (cuBLAS); only the masked softmax is a Triton kernel."
+    _assert_as_accurate_as_eager(actual, expected, reference, "attention", f"_attend on the {part}", dtype, note)
 
 
 @pytest.mark.parametrize("dtype", DTYPES, ids=_dtype_id)
@@ -368,4 +425,12 @@ def test_final_head_matches_norm_and_action_out_proj(dtype):
     reference = normed64 @ head.weight.double().t() + head.bias.double()
     actual = torch.empty_like(expected)
     M._fused_final_head(x, norm, modulation, head, actual)
-    _assert_as_accurate_as_eager(actual, expected, reference)
+    _assert_as_accurate_as_eager(
+        actual,
+        expected,
+        reference,
+        "final AdaRMSNorm + action_out_proj",
+        "Pi05AdaRMSNorm + action_out_proj",
+        dtype,
+        _MODULATION_NOTE,
+    )

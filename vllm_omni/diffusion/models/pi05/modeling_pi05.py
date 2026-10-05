@@ -409,12 +409,12 @@ def _compute_layer_suffix_only(
 # ──────────────────────────────────────────────────────────────────────
 # ``Pi05Pipeline`` enables them together with its CUDA graphs (the stage leaves
 # ``enforce_eager`` unset) through ``Pi05ForActionPrediction.enable_fused_kernels``;
-# the eager baseline never runs them. In the prefix they replace the torch ops
-# between the cuBLAS GEMMs (norms, residual adds, QKV projection with RoPE,
-# attention, GELU); in the action expert, whose GEMMs have only
-# ``chunk_size`` rows, they replace whole layers and the output head. They
-# read every weight in place and write K/V straight into the ``Pi05KVCache``
-# slots the eager path copies into.
+# the eager baseline never runs them. In the prefix they apply only RoPE and
+# the GELU and leave every reduction to the torch op eager runs, so the prefix
+# K/V every denoising step reads is bit-exact with eager; in the action
+# expert, whose GEMMs have only ``chunk_size`` rows, they replace whole layers
+# and the output head. They read every weight in place and write K/V straight
+# into the ``Pi05KVCache`` slots the eager path copies into.
 #
 # Numerics: each kernel performs the eager path's operations in its order, in
 # its dtypes and with its rounding points. A value eager materializes in a
@@ -902,18 +902,23 @@ def _fused_qkv_rope(
     q_out: torch.Tensor,
     k_out: torch.Tensor,
     v_out: torch.Tensor,
+    *,
+    triton_gemm: bool = True,
 ) -> None:
-    """Q/K/V projections of ``x`` with RoPE: Q into ``q_out``, K and V into their cache slots."""
+    """Q/K/V projections of ``x`` with RoPE: Q into ``q_out``, K and V into their cache slots.
+
+    ``triton_gemm=False`` keeps the projections on cuBLAS, as eager runs them.
+    """
     n_rows, n_in = x.shape
     num_heads, _, head_dim = q_out.shape
     dtype = attn.q_proj.weight.dtype
-    fused_gemm = _triton_gemms(dtype)
+    fused_gemm = triton_gemm and _triton_gemms(dtype)
     if fused_gemm:
         weights = (attn.q_proj.weight, attn.k_proj.weight, attn.v_proj.weight)
     else:
         weights = tuple(proj(x[None])[0] for proj in (attn.q_proj, attn.k_proj, attn.v_proj))
         n_in = weights[0].shape[1]
-    tiles = _tiles("qkv", n_rows, dtype)
+    tiles = _tiles("qkv", n_rows, dtype) if fused_gemm else _EPILOGUE_TILES
     splits = head_dim // 2 // tiles.block_n
     _qkv_rope_kernel[(triton.cdiv(n_rows, tiles.block_m), (num_heads + 2) * splits)](
         x,
@@ -1140,10 +1145,12 @@ def _fused_prefix_forward(
 ) -> torch.Tensor:
     """``PaliGemmaWithActionExpertPi05.forward``'s prefix pass, batch 1, with fused kernels.
 
-    Per layer: fused residual add + norm, fused QKV projection + RoPE writing
-    the layer's K/V into ``kv_cache``, fused attention, and cuBLAS for
-    ``o_proj`` and the MLP GEMMs around a fused GELU. Returns the final norm's
-    output, as the eager pass does; ``inputs_embeds`` is not modified.
+    Bit-exact with the eager pass: every denoising step attends over the
+    prefix K/V and amplifies any rounding difference in it, so the norms,
+    residual adds, GEMMs and attention are the torch ops eager runs. Fused are
+    only RoPE, which writes the layer's K/V straight into ``kv_cache``, and the
+    GELU. Returns the final norm's output, as the eager pass does;
+    ``inputs_embeds`` is not modified.
     """
     lm = paligemma.model.language_model
     x_in = inputs_embeds[0]
@@ -1157,33 +1164,38 @@ def _fused_prefix_forward(
     hidden_states = torch.empty(seq_len, width, dtype=torch.promote_types(x_in.dtype, proj_dtype), device=device)
     x_normed = torch.empty(seq_len, width, dtype=proj_dtype, device=device)
     q = torch.empty(num_heads, seq_len, head_dim, dtype=proj_dtype, device=device)
-    scores = torch.empty(num_heads * seq_len, seq_len, dtype=proj_dtype, device=device)
-    att = torch.empty(seq_len, num_heads * head_dim, dtype=proj_dtype, device=device)
     # Every eager layer builds this same table, in its V projection's dtype.
     cos, sin = lm.rotary_emb(x_normed, position_ids)
-    mask = attention_mask[0, 0]
 
     residual, mlp_out = x_in, None
     for layer_idx, layer in enumerate(lm.layers):
         attn = layer.self_attn
         if mlp_out is None:
-            _fused_rms_norm(residual, layer.input_layernorm, x_normed)
+            x_normed.copy_(layer.input_layernorm(residual))
         else:
-            _fused_rms_norm(residual, layer.input_layernorm, x_normed, add=mlp_out, res_out=hidden_states)
+            torch.add(mlp_out, residual, out=hidden_states)
+            x_normed.copy_(layer.input_layernorm(hidden_states))
             residual = hidden_states
         key, value = kv_cache.key[layer_idx, 0, 0], kv_cache.value[layer_idx, 0, 0]
-        _fused_qkv_rope(x_normed, attn, cos[0], sin[0], q, key[:seq_len], value[:seq_len])
-        _fused_attention(q, key[:seq_len], value[:seq_len], mask, 1.0 / math.sqrt(head_dim), scores, att)
-        attn_out = attn.o_proj(att[None])[0]
-        _fused_rms_norm(residual, layer.post_attention_layernorm, x_normed, add=attn_out, res_out=hidden_states)
+        _fused_qkv_rope(x_normed, attn, cos[0], sin[0], q, key[:seq_len], value[:seq_len], triton_gemm=False)
+        att = _attend(
+            q[None],
+            key[None, None, :seq_len],
+            value[None, None, :seq_len],
+            attention_mask,
+            num_kv_groups=attn.num_key_value_groups,
+            scaling=1.0 / math.sqrt(head_dim),
+        )
+        attn_out = attn.o_proj(att.transpose(1, 2).reshape(1, seq_len, num_heads * head_dim))[0]
+        torch.add(attn_out, residual, out=hidden_states)
+        x_normed.copy_(layer.post_attention_layernorm(hidden_states))
         residual = hidden_states
         gate = layer.mlp.gate_proj(x_normed[None])
         _fused_gelu_mul(gate, layer.mlp.up_proj(x_normed[None]), gate)
         mlp_out = layer.mlp.down_proj(gate)[0]
 
-    out = torch.empty(1, seq_len, width, dtype=hidden_states.dtype, device=device)
-    _fused_rms_norm(residual, lm.norm, out[0], add=mlp_out)
-    return out
+    torch.add(mlp_out, residual, out=hidden_states)
+    return lm.norm(hidden_states[None])
 
 
 def _fused_denoise_forward(
