@@ -10,7 +10,7 @@ from tests.helpers.mark import hardware_marks
 from tests.helpers.media import generate_synthetic_image
 from tests.helpers.runtime import OmniServer, OmniServerParams, OpenAIClientHandler
 
-pytestmark = [pytest.mark.diffusion, pytest.mark.full_model]
+pytestmark = [pytest.mark.diffusion, pytest.mark.slow]
 
 DISTILLED_MODEL = os.getenv("VLLM_TEST_LTX23_DISTILLED_MODEL", "diffusers/LTX-2.3-Distilled-Diffusers")
 BASE_MODEL = os.getenv("VLLM_TEST_LTX23_MODEL", "diffusers/LTX-2.3-Diffusers")

@@ -1,0 +1,124 @@
+[
+  {
+    "test_name": "test_hunyuanvideo15_i2v_single_device",
+    "mark": [
+      {
+        "hardware_marks": {
+          "res": {
+            "cuda": [
+              "H100",
+              "B200"
+            ]
+          },
+          "num_cards": 1
+        }
+      },
+      "full_model",
+      "diffusion"
+    ],
+    "description": "Single-device baseline",
+    "server_params": {
+      "model": "hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_i2v",
+      "serve_args": {
+        "flow-shift": 5.0,
+        "enable-diffusion-pipeline-profiler": true
+      }
+    },
+    "benchmark_params": [
+      {
+        "name": "832x480_frames33_steps4",
+        "dataset_name": "random-mm",
+        "tokenizer": "gpt2",
+        "endpoint": "/v1/videos",
+        "num_prompts": 10,
+        "max_concurrency": 1,
+        "random_input_len": 8,
+        "random_output_len": 1,
+        "random_range_ratio": 0.0,
+        "percentile_metrics": "e2el",
+        "random_mm_base_items_per_request": 1,
+        "random_mm_num_mm_items_range_ratio": 0,
+        "random_mm_limit_mm_per_prompt": {
+          "image": 1
+        },
+        "random_mm_bucket_config": {
+          "(480, 832, 1)": 1.0
+        },
+        "extra_body": {
+          "width": 832,
+          "height": 480,
+          "num_inference_steps": 4,
+          "num_frames": 33,
+          "fps": 24,
+          "seed": 42,
+          "guidance_scale": 6.0,
+          "flow_shift": 5.0,
+          "negative_prompt": "Negative prompt for benchmarking diffusion models"
+        }
+      }
+    ]
+  },
+  {
+    "test_name": "test_hunyuanvideo15_i2v_cachedit_tp2_vae_patch2",
+    "mark": [
+      {
+        "hardware_marks": {
+          "res": {
+            "cuda": [
+              "H100",
+              "B200"
+            ]
+          },
+          "num_cards": 2
+        }
+      },
+      "full_model",
+      "diffusion"
+    ],
+    "description": "CacheDiT + TP=2 + VAE patch parallel=2 + VAE tiling",
+    "server_params": {
+      "model": "hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_i2v",
+      "serve_args": {
+        "flow-shift": 5.0,
+        "cache-backend": "cache_dit",
+        "tensor-parallel-size": 2,
+        "vae-patch-parallel-size": 2,
+        "vae-use-tiling": true,
+        "enable-diffusion-pipeline-profiler": true
+      }
+    },
+    "benchmark_params": [
+      {
+        "name": "832x480_frames33_steps4",
+        "dataset_name": "random-mm",
+        "tokenizer": "gpt2",
+        "endpoint": "/v1/videos",
+        "num_prompts": 10,
+        "max_concurrency": 1,
+        "random_input_len": 8,
+        "random_output_len": 1,
+        "random_range_ratio": 0.0,
+        "percentile_metrics": "e2el",
+        "random_mm_base_items_per_request": 1,
+        "random_mm_num_mm_items_range_ratio": 0,
+        "random_mm_limit_mm_per_prompt": {
+          "image": 1
+        },
+        "random_mm_bucket_config": {
+          "(480, 832, 1)": 1.0
+        },
+        "extra_body": {
+          "width": 832,
+          "height": 480,
+          "num_inference_steps": 4,
+          "num_frames": 33,
+          "fps": 24,
+          "seed": 42,
+          "guidance_scale": 6.0,
+          "flow_shift": 5.0,
+          "negative_prompt": "Negative prompt for benchmarking diffusion models"
+        }
+      }
+    ]
+  }
+]

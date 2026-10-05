@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Cosmos3 transfer inference helpers.
 
 The reference Cosmos Framework transfer path accepts one or more control hints
@@ -14,6 +14,7 @@ generation, or action generation.
 from __future__ import annotations
 
 import importlib
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -24,7 +25,17 @@ import PIL.Image
 import torch
 import torch.nn.functional as F
 
+from vllm_omni.diffusion.utils.video_decode import decode_path_video_frames
+
 TRANSFER_HINT_KEYS: tuple[str, ...] = ("edge", "blur", "depth", "seg", "wsm")
+_TRANSFER_HINT_COMMON_FIELDS = frozenset({"control_path", "control", "control_weight"})
+_TRANSFER_HINT_FIELDS: dict[str, frozenset[str]] = {
+    "edge": _TRANSFER_HINT_COMMON_FIELDS | {"preset_edge_threshold"},
+    "blur": _TRANSFER_HINT_COMMON_FIELDS | {"preset_blur_strength"},
+    "depth": _TRANSFER_HINT_COMMON_FIELDS,
+    "seg": _TRANSFER_HINT_COMMON_FIELDS,
+    "wsm": _TRANSFER_HINT_COMMON_FIELDS,
+}
 TRANSFER_SAMPLE_DEFAULTS: dict[str, Any] = {
     "num_video_frames_per_chunk": 93,
     "num_conditional_frames": 1,
@@ -33,6 +44,7 @@ TRANSFER_SAMPLE_DEFAULTS: dict[str, Any] = {
     "show_input": False,
     "num_first_chunk_conditional_frames": 0,
     "share_vision_temporal_positions": True,
+    "emphasize_control_in_prompt": True,
 }
 TRANSFER_DEFAULTS: dict[str, dict[str, Any]] = {
     "edge": {"guidance_scale": 3.0, "control_guidance": 1.5, "flow_shift": 10.0},
@@ -85,6 +97,7 @@ class Cosmos3TransferHint:
     key: str
     control_path: str | None = None
     control: Any | None = None
+    control_weight: float = 1.0
     preset_edge_threshold: str = "medium"
     preset_blur_strength: str = "medium"
 
@@ -103,12 +116,23 @@ class Cosmos3TransferConfig:
     show_input: bool = False
     num_first_chunk_conditional_frames: int = 0
     share_vision_temporal_positions: bool = True
+    emphasize_control_in_prompt: bool = True
     num_frames: int | None = None
     fps: float | None = None
 
     @property
     def ordered_hints(self) -> list[Cosmos3TransferHint]:
         return [self.hints[key] for key in TRANSFER_HINT_KEYS if key in self.hints]
+
+    @property
+    def normalized_control_weights(self) -> list[float]:
+        weights = [hint.control_weight for hint in self.ordered_hints]
+        if any(not math.isfinite(weight) or weight < 0.0 for weight in weights):
+            raise ValueError(f"Cosmos3 transfer control_weight values must be finite and non-negative, got {weights}.")
+        total = sum(weights)
+        if total <= 0.0:
+            raise ValueError("Cosmos3 transfer control_weight values must have a positive sum.")
+        return [weight / total for weight in weights]
 
 
 def _extra_args(sp: Any) -> Mapping[str, Any]:
@@ -184,7 +208,7 @@ def _as_interval(value: Any) -> tuple[float, float] | None:
         return None
     if isinstance(value, str):
         value = [item.strip() for item in value.split(",") if item.strip()]
-    if not isinstance(value, (list, tuple)) or len(value) != 2:
+    if not isinstance(value, list | tuple) or len(value) != 2:
         raise ValueError("Cosmos3 transfer control_guidance_interval must contain exactly two values.")
     lo, hi = float(value[0]), float(value[1])
     if lo > hi:
@@ -220,10 +244,27 @@ def resolve_transfer_config(sp: Any, prompt_data: Any = None) -> Cosmos3Transfer
             raise TypeError(
                 f"Cosmos3 transfer hint '{key}' must be an object, path string, or true; got {type(raw)!r}."
             )
+        unknown_fields = set(raw) - _TRANSFER_HINT_FIELDS[key]
+        if unknown_fields:
+            raise ValueError(
+                f"Unsupported Cosmos3 transfer hint '{key}' fields: {sorted(unknown_fields)}. "
+                f"Supported fields are: {sorted(_TRANSFER_HINT_FIELDS[key])}."
+            )
+        try:
+            control_weight = float(raw.get("control_weight", 1.0))
+        except (TypeError, ValueError) as exc:
+            raise TypeError(
+                f"Cosmos3 transfer hint '{key}' control_weight must be a finite non-negative number."
+            ) from exc
+        if not math.isfinite(control_weight) or control_weight < 0.0:
+            raise ValueError(
+                f"Cosmos3 transfer hint '{key}' control_weight must be finite and non-negative, got {control_weight!r}."
+            )
         hints[key] = Cosmos3TransferHint(
             key=key,
             control_path=str(raw["control_path"]) if raw.get("control_path") is not None else None,
             control=raw.get("control"),
+            control_weight=control_weight,
             preset_edge_threshold=str(raw.get("preset_edge_threshold") or "medium").lower(),
             preset_blur_strength=str(raw.get("preset_blur_strength") or "medium").lower(),
         )
@@ -239,6 +280,7 @@ def resolve_transfer_config(sp: Any, prompt_data: Any = None) -> Cosmos3Transfer
             "show_input",
             "num_first_chunk_conditional_frames",
             "share_vision_temporal_positions",
+            "emphasize_control_in_prompt",
         )
         if any(_is_user_field(extra, sp, prompt_data, key) for key in transfer_only):
             raise ValueError("Cosmos3 transfer options were provided, but no transfer hint was selected.")
@@ -293,6 +335,10 @@ def resolve_transfer_config(sp: Any, prompt_data: Any = None) -> Cosmos3Transfer
             _param(extra, sp, prompt_data, "share_vision_temporal_positions", None),
             bool(TRANSFER_SAMPLE_DEFAULTS["share_vision_temporal_positions"]),
         ),
+        emphasize_control_in_prompt=_as_bool(
+            _param(extra, sp, prompt_data, "emphasize_control_in_prompt", None),
+            bool(TRANSFER_SAMPLE_DEFAULTS["emphasize_control_in_prompt"]),
+        ),
         num_frames=(
             int(_param(extra, sp, prompt_data, "num_frames"))
             if _param(extra, sp, prompt_data, "num_frames", None) is not None
@@ -328,6 +374,7 @@ def resolve_transfer_config(sp: Any, prompt_data: Any = None) -> Cosmos3Transfer
             raise ValueError(f"Unsupported Cosmos3 edge preset: {hint.preset_edge_threshold!r}.")
         if hint.key == "blur" and hint.preset_blur_strength not in BLUR_DOWNUP_PRESETS:
             raise ValueError(f"Unsupported Cosmos3 blur preset: {hint.preset_blur_strength!r}.")
+    _ = config.normalized_control_weights
     return config
 
 
@@ -394,9 +441,9 @@ def uint8_cthw_to_normalized_5d(frames: torch.Tensor, *, dtype: torch.dtype) -> 
 
 def _pil_to_uint8_rgb(value: Any) -> np.ndarray:
     if isinstance(value, PIL.Image.Image):
-        return np.asarray(value.convert("RGB"), dtype=np.uint8)
+        return np.array(value.convert("RGB"), dtype=np.uint8, copy=True)
     if isinstance(value, str | Path):
-        return np.asarray(PIL.Image.open(value).convert("RGB"), dtype=np.uint8)
+        return np.array(PIL.Image.open(value).convert("RGB"), dtype=np.uint8, copy=True)
     if isinstance(value, torch.Tensor):
         tensor = value.detach().cpu()
         if tensor.ndim == 3 and tensor.shape[0] in (3, 4):
@@ -493,23 +540,9 @@ def _path_media_to_uint8_cthw(path: str | Path, max_frames: int | None) -> torch
         array = _pil_to_uint8_rgb(media_path)
         return torch.from_numpy(array).permute(2, 0, 1).unsqueeze(1).contiguous()
 
-    try:
-        import imageio.v3 as iio
-    except ImportError as exc:
-        raise ImportError(
-            "Cosmos3 transfer video control_path loading requires imageio. "
-            "Install imageio[ffmpeg] or provide decoded control frames."
-        ) from exc
-
-    frames: list[torch.Tensor] = []
-    limit = max_frames if max_frames is not None else None
-    for frame in iio.imiter(media_path):
-        frames.append(torch.from_numpy(_pil_to_uint8_rgb(frame)).permute(2, 0, 1))
-        if limit is not None and len(frames) >= int(limit):
-            break
-    if not frames:
-        raise ValueError(f"Cosmos3 transfer control_path produced no frames: {media_path}")
-    return torch.stack(frames, dim=1).contiguous()
+    rgb_frames = decode_path_video_frames(media_path, max_frames=max_frames, keep="first")
+    stacked = [torch.from_numpy(frame).permute(2, 0, 1) for frame in rgb_frames]
+    return torch.stack(stacked, dim=1).contiguous()
 
 
 def media_to_uint8_cthw(value: Any, *, height: int, width: int, max_frames: int | None = None) -> torch.Tensor:

@@ -25,7 +25,6 @@ def test_validate_accepts_canonical_metadata_fields() -> None:
             },
             "audio": {
                 "sample_rate": 48000,
-                "audiox_task": "tts",
             },
             "actions": {
                 "raw_action_dim": 7,
@@ -55,7 +54,6 @@ def test_validate_accepts_canonical_metadata_fields() -> None:
         ({"video": {"video_fps_multiplier": 0}}, ValueError),
         ({"video": {"shape": [1, 0, 64]}}, ValueError),
         ({"audio": {"sample_rate": 0}}, ValueError),
-        ({"audio": {"audiox_task": ""}}, ValueError),
         ({"actions": {"raw_action_dim": 0}}, ValueError),
         ({"actions": {"action_mode": ""}}, ValueError),
         ({"actions": {"domain_id": "7"}}, TypeError),

@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """
 Analogous to: https://github.com/vllm-project/vllm/blob/v0.23.0/tests/models/multimodal/generation/vlm_utils/case_filtering.py
 
@@ -17,7 +20,12 @@ import itertools
 import pytest
 
 from tests.helpers.mark import hardware_marks
-from tests.model_tests.diffusion.config_types import DiffusionAccs, DiffusionModelTestOpts, get_required_device_count
+from tests.model_tests.diffusion.config_types import (
+    DiffusionAccs,
+    DiffusionModelTestOpts,
+    ModelTypeMarker,
+    get_required_device_count,
+)
 from vllm_omni.platforms import current_omni_platform
 
 # These tests are intended to run on L4 GPUs since they test parallelism (i.e., need GPUs),
@@ -29,7 +37,12 @@ from vllm_omni.platforms import current_omni_platform
 MAX_CI_DEVICES = 4
 
 
-def get_test_group_marks(model_name: str, test_group: list[DiffusionAccs] | None, model_marks: list | None) -> list:
+def get_test_group_marks(
+    model_name: str,
+    test_group: list[DiffusionAccs] | None,
+    model_marks: list | None,
+    model_type_marker: ModelTypeMarker,
+) -> list:
     """Build the full set of pytest marks for a test group.
 
     For now, single device groups default to core model, and multi device groups
@@ -37,6 +50,7 @@ def get_test_group_marks(model_name: str, test_group: list[DiffusionAccs] | None
     the max number of GPUs for the CI to prevent accidentally adding configurations that
     would be skipped in the CI."""
     marks = list(model_marks) if model_marks is not None else []
+    marks.append(getattr(pytest.mark, model_type_marker.value))
 
     required_devices = get_required_device_count(test_group)
     if required_devices > MAX_CI_DEVICES:
@@ -45,7 +59,6 @@ def get_test_group_marks(model_name: str, test_group: list[DiffusionAccs] | None
             f"but the max CI device count is {MAX_CI_DEVICES}. "
         )
 
-    marks.extend(hardware_marks(res={"cuda": "L4"}, num_cards=required_devices))
     # hardware_marks only adds skipif for num_cards > 1, so we currently handle the single-device case
     # directly here. This should probably be handled in a more common way later on.
     assert current_omni_platform is not None and current_omni_platform.device_count is not None
@@ -53,8 +66,10 @@ def get_test_group_marks(model_name: str, test_group: list[DiffusionAccs] | None
     if current_omni_platform.is_cuda() and device_count < required_devices:
         marks.append(pytest.mark.skip(reason=f"Need {required_devices} devices, got {device_count}"))
     if required_devices > 1:
+        marks.extend(hardware_marks(res={"cuda": ["L4", "B200"]}, num_cards=required_devices))
         marks.append(pytest.mark.full_model)
     else:
+        marks.extend(hardware_marks(res={"cuda": "L4"}, num_cards=1))
         marks.append(pytest.mark.core_model)
     return marks
 
@@ -76,8 +91,15 @@ def get_model_parametrization(model_name: str, test_info: DiffusionModelTestOpts
             test_info.supported_tasks,
             test_info.check_multi_output and test_group is None,
             test_info.check_determinism and test_group is None,
+            # The divergence check compares generated outputs, which only the offline test does.
+            *([] if online else [test_info.check_i2v_t2v_divergence]),
             id=f"{model_name}[{'+'.join(test_group)}]" if test_group else model_name,
-            marks=get_test_group_marks(model_name, test_group, test_info.marks),
+            marks=get_test_group_marks(
+                model_name,
+                test_group,
+                test_info.marks,
+                model_type_marker=test_info.model_type_marker,
+            ),
         )
         for test_group in test_groups
     ]

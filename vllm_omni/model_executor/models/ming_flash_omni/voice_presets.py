@@ -16,15 +16,14 @@ import torch
 from transformers.utils.hub import cached_file
 from vllm.logger import init_logger
 
-from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
+from vllm_omni.model_executor.model_loader.weight_utils import resolve_model_to_local_path
+from vllm_omni.model_executor.models.common.ming.spk_embedding import SpkembExtractor
 
-from .spk_embedding import SpkembExtractor
 from .talker_module import resample
 
 if TYPE_CHECKING:
+    from vllm_omni.model_executor.models.common.ming.aggregator import Aggregator
     from vllm_omni.model_executor.models.common.ming.audio_vae import AudioVAE
-
-    from .talker_module import Aggregator
 
 logger = init_logger(__name__)
 
@@ -273,18 +272,19 @@ class VoicePresetRegistry:
             if os.path.isfile(path):
                 return path, candidate
 
-        if not os.path.isdir(self._model_path):
-            try:
-                hf_root = download_weights_from_hf_specific(
-                    self._model_path,
-                    self._download_dir,
-                    allow_patterns=["talker/data/**"],
-                    require_all=True,
-                )
-                candidate = os.path.join(hf_root, "talker", "data", "voice_name.json")
-                if os.path.isfile(candidate):
-                    return candidate, os.path.join(hf_root, "talker")
-            except Exception as e:  # pragma: no cover
-                logger.info("Could not download voice presets from HF: %s", e)
+        try:
+            hf_root = resolve_model_to_local_path(
+                self._model_path,
+                allow_download=True,
+                allow_patterns=["talker/data/**"],
+                cache_dir=self._download_dir,
+            )
+        except Exception as e:
+            logger.info("Could not download voice presets from HF: %s", e)
+            return None, None
+
+        candidate = os.path.join(hf_root, "talker", "data", "voice_name.json")
+        if os.path.isfile(candidate):
+            return candidate, os.path.join(hf_root, "talker")
 
         return None, None

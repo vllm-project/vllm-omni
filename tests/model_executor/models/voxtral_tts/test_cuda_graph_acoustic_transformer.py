@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
 Tests for CUDA Graph acoustic transformer wrapper numerical equivalence.
 
@@ -18,11 +18,12 @@ import pytest
 import torch
 import torch.nn as nn
 
+from tests.helpers.mark import hardware_marks
+
 pytestmark = [
     pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"),
     pytest.mark.core_model,
-    pytest.mark.cuda,
-    pytest.mark.L4,
+    *hardware_marks(res={"cuda": "L4"}),
 ]
 
 DEVICE = torch.device("cuda:0")

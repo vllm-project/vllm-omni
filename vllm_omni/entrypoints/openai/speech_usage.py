@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Token-usage accounting for the Speech (``/v1/audio/speech``) API.
 
 Why this module exists (issue #4646)
@@ -160,6 +161,7 @@ class SpeechOutputTokenCounter:
     """
 
     output_tokens: int = 0
+    stage0_finish_reason: str | None = None
 
     def observe(self, res: Any) -> None:
         metrics = getattr(res, "metrics", None)
@@ -168,6 +170,11 @@ class SpeechOutputTokenCounter:
         stage_metrics = metrics.get("stage_metrics")
         if not isinstance(stage_metrics, dict):
             return
+        stage0 = stage_metrics.get("0", stage_metrics.get(0))
+        if isinstance(stage0, dict):
+            reason = stage0.get("finish_reason")
+            if reason is not None:
+                self.stage0_finish_reason = str(reason)
         for stage in stage_metrics.values():
             if not isinstance(stage, dict):
                 continue

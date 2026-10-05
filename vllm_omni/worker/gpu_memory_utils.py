@@ -96,7 +96,7 @@ def get_process_gpu_memory(local_rank: int) -> int | None:
             except Exception as e:
                 raise RuntimeError(
                     f"Failed to get NVML handle for device '{device_id}' (local_rank={local_rank}). "
-                    f"Check CUDA_VISIBLE_DEVICES or stage config 'devices' setting."
+                    f"Check CUDA_VISIBLE_DEVICES or the deploy config `devices` setting."
                 ) from e
         else:
             # No CUDA_VISIBLE_DEVICES or local_rank out of range: use index directly
@@ -104,7 +104,7 @@ def get_process_gpu_memory(local_rank: int) -> int | None:
             if local_rank >= device_count:
                 raise RuntimeError(
                     f"Invalid GPU device {local_rank}. Only {device_count} GPU(s) available. "
-                    f"Check CUDA_VISIBLE_DEVICES or stage config 'devices' setting."
+                    f"Check CUDA_VISIBLE_DEVICES or the deploy config `devices` setting."
                 )
             handle = nvmlDeviceGetHandleByIndex(local_rank)
 

@@ -18,11 +18,11 @@ examples in this repository.
 
 Qwen3-TTS supports three task types, each backed by a dedicated model checkpoint:
 
-| Task Type     | Model                                    | Description                                                  |
-| ------------- | ---------------------------------------- | ------------------------------------------------------------ |
-| `CustomVoice` | `Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice`  | Predefined speaker voices with optional style/emotion control |
-| `VoiceDesign` | `Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign`  | Generate speech from a natural language voice description     |
-| `Base`        | `Qwen/Qwen3-TTS-12Hz-1.7B-Base`         | Voice cloning from reference audio + transcript              |
+| Task Type     | Model                                    | Description                                                   |
+| ------------- | ---------------------------------------- | ------------------------------------------------------------- |
+| `CustomVoice` | `Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice`   | Predefined speaker voices with optional style/emotion control |
+| `VoiceDesign` | `Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign`   | Generate speech from a natural language voice description     |
+| `Base`        | `Qwen/Qwen3-TTS-12Hz-1.7B-Base`          | Voice cloning from reference audio + transcript               |
 
 Smaller 0.6B variants are also available for `CustomVoice` and `Base`.
 
@@ -71,8 +71,10 @@ Alternatively, use the convenience script:
 ```
 
 The bundled deploy config (`vllm_omni/deploy/qwen3_tts.yaml`) enables async
-chunking for low first-audio latency. For advanced deployment tuning, pass a
-custom deploy config:
+chunking for low first-audio latency, and selects the experimental Model
+Runner V2 on CUDA. Copy it and set `model_runner: v1` to run V1; NPU, XPU,
+ROCm and MUSA keep V1 through the `platforms:` sections. For advanced
+deployment tuning, pass a custom deploy config:
 
 ```bash
 vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice \
@@ -166,6 +168,16 @@ python examples/offline_inference/text_to_speech/qwen3_tts/end2end.py --query-ty
 - Key flags: `--omni` is required. `--deploy-config` points to the bundled two-stage pipeline config.
 - Async chunking: Enabled by default in `qwen3_tts.yaml` for streaming-friendly first-audio latency. Raw audio streaming requires `stream=true`, `stream_format="audio"`, and `response_format="pcm"`.
 - Task/model matching: Each task type requires its matching model checkpoint. Using a CustomVoice model for a Base (voice clone) request will fail.
+- Stored voices: Uploaded and precomputed voices use the Base task and require a Base checkpoint. Built-in preset speakers remain CustomVoice voices.
+- Base codec termination: Base requests without an explicit `max_new_tokens`
+  use a text-scaled safety ceiling (at least 192 codec frames and no more than
+  the configured model limit). If the Talker reaches that ceiling without
+  codec EOS, non-streaming serving discards the incomplete audio and retries
+  once with a fresh seed; an explicit `seed` or `max_new_tokens` disables the
+  retry. SSE and WebSocket clients receive structured errors and must discard
+  previously emitted audio when the error contains `"action":"discard"`;
+  raw PCM streams terminate with a connection error after any partial bytes
+  already sent.
 - Known limitations: The server serves one model variant at a time. To switch task types (e.g., CustomVoice to Base), restart the server with the corresponding model.
 
 ## Hardware Support
@@ -252,3 +264,141 @@ curl -X POST http://localhost:8091/v1/audio/speech \
     - stage_id: 1
       gpu_memory_utilization: 0.15
   ```
+
+### 1x A100 40GB (0.6B CustomVoice)
+
+#### Environment
+
+- OS: Linux 4.18.0-553 (RHEL 8.10), x86_64
+- Python: 3.12.14
+- PyTorch: 2.13.0+cu129
+- Driver / runtime: NVIDIA 570.124.06 / CUDA 12.8 (`nvidia-smi`); PyTorch CUDA 12.9
+- GPU: NVIDIA A100-SXM4-40GB, 40960 MiB
+- vLLM version: 0.28.0+cu129
+- vLLM-Omni version or commit: `3204a0b2ade0f05424b7f11e3bcc03cb3542e0c6`
+
+#### Command
+
+```bash
+vllm serve Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice \
+    --deploy-config vllm_omni/deploy/qwen3_tts.yaml \
+    --omni --port 8091
+```
+
+The default deploy config (`qwen3_tts.yaml`) works without modification on this
+A100 40GB. Both stages (talker + code2wav) share GPU 0 with
+`gpu_memory_utilization: 0.3` each.
+
+#### Verification
+
+**English synthesis:**
+
+```bash
+curl -X POST http://localhost:8091/v1/audio/speech \
+    -H "Content-Type: application/json" \
+    -d '{
+        "input": "Hello, this is Qwen3-TTS running on A100 40GB.",
+        "voice": "vivian",
+        "language": "English"
+    }' --output test_english.wav
+```
+
+**Chinese synthesis:**
+
+```bash
+curl -X POST http://localhost:8091/v1/audio/speech \
+    -H "Content-Type: application/json" \
+    -d '{
+        "input": "你好，这是在A100 40GB上运行的语音合成测试。",
+        "voice": "vivian",
+        "language": "Chinese"
+    }' --output test_chinese.wav
+```
+
+**With emotion instruction:**
+
+```bash
+curl -X POST http://localhost:8091/v1/audio/speech \
+    -H "Content-Type: application/json" \
+    -d '{
+        "input": "I am so excited about this!",
+        "voice": "vivian",
+        "language": "English",
+        "instructions": "Speak with great enthusiasm"
+    }' --output test_emotion.wav
+```
+
+#### Notes
+
+- Memory usage: **16283 MiB / 40960 MiB** peak (`nvidia-smi`) during the three
+  verification requests with the default deploy config
+  (`gpu_memory_utilization: 0.3` per stage). Stage 0 used 12404 MiB and stage 1
+  used 3862 MiB. The 0.6B weights occupy only ~2.4 GiB (Stage 0: 1.91 GiB,
+  Stage 1: 0.45 GiB); the rest is KV cache reserved as a fraction of device
+  memory, so the same `0.3` setting reads higher in GiB on 40GB than the
+  ~13.5 GiB idle figure on the 24GB 4090 profile above. To shrink the
+  reservation, use the `gpu_memory_utilization: 0.15` override documented in
+  that 4090 section.
+- vLLM 0.28.0's default wheel targets CUDA 13.0. Driver 570 cannot load that
+  variant. This qualification used the official CUDA 12.9 wheel (same pin as
+  the A100 Wan2.2 recipe):
+
+  ```bash
+  uv pip install \
+    'https://github.com/vllm-project/vllm/releases/download/v0.28.0/vllm-0.28.0%2Bcu129-cp38-abi3-manylinux_2_28_x86_64.whl' \
+    --torch-backend=cu129
+  ```
+
+  Confirm `torch.__version__` contains `cu129`. If a CPU build is already
+  installed, `uv pip install --torch-backend=cu129` is a no-op; use
+  `--reinstall`.
+
+### 1x AMD MI300X, 1.7B checkpoints
+
+#### Environment
+
+- OS: Linux 6.8.0-134-generic, x86_64
+- Container: official ROCm image built from `docker/Dockerfile.rocm`
+- Python: 3.12.13
+- PyTorch: 2.11.0+gitd0c8b1f
+- Driver / runtime: AMD 6.19.14.31400000 / ROCm 7.2.53211
+- GPU: one AMD Instinct MI300X, `gfx942:sramecc+:xnack-`, 191.69 GiB visible HBM
+- vLLM version: 0.27.0+rocm723
+- vLLM Omni version or commit: `3fecb6953ca8dc51210cc0421ef24552267a41ef`
+- Installed vLLM Omni package metadata: `0.27.0rc2.dev44+g55abdade9.rocm`
+- ONNX Runtime: onnxruntime-rocm 1.22.2.post3 with `ROCMExecutionProvider`
+- transformers: 5.15.0
+
+#### Command
+
+The MI300X tests also worked without `enforce_eager`. To use that setup, remove `enforce_eager: true` from stage 1 under `platforms.rocm` in `vllm_omni/deploy/qwen3_tts.yaml`.
+
+Set this environment variable before you start Qwen3-TTS:
+
+```bash
+export MIOPEN_FIND_MODE=FAST
+```
+
+#### Verification
+
+Each row records one offline request with one prompt and batch size one. Request time is the logged `e2e_wall_time_ms`, and stage 1 time is the logged `e2e_stage_1_wall_time_ms`.
+
+| Checkpoint | Code2Wav configuration | `MIOPEN_FIND_MODE` | Request time | Stage 1 time | Output duration | Real time factor | Maximum sampled device memory |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: |
+| CustomVoice | Eager | Unset | 1.683 s | 1.613 s | 5.68 s | 0.30 | 60.91 GiB |
+| CustomVoice | Graphs allowed | `FAST` | 1.326 s | 1.259 s | 5.68 s | 0.23 | 62.19 GiB |
+| VoiceDesign | Eager | Unset | 1.195 s | 1.180 s | 4.40 s | 0.27 | 60.91 GiB |
+| VoiceDesign | Graphs allowed | `FAST` | 1.127 s | 1.054 s | 4.40 s | 0.26 | 62.21 GiB |
+| Base | Eager | Unset | 13.330 s | 13.263 s | 4.32 s | 3.09 | 61.74 GiB |
+| Base | Graphs allowed | `FAST` | 14.314 s | 14.245 s | 4.80 s | 2.98 | 62.84 GiB |
+
+All six processes finished successfully, and each output passed the 24 kHz mono WAV checks.
+
+#### Notes
+
+- The current ROCm config keeps Code2Wav in eager mode.
+- The tested alternative allows graphs and sets [`MIOPEN_FIND_MODE=FAST`](https://rocm.docs.amd.com/projects/MIOpen/en/develop/reference/env_variables.html). MIOpen uses a saved kernel choice when available and uses its immediate fallback otherwise.
+- CustomVoice used a graph for one of four logged Code2Wav batches. VoiceDesign used a graph for two of four batches. Base used no graphs for its four logged batches.
+- The recorded request time with graphs allowed was lower for CustomVoice and VoiceDesign and higher for Base. The Base runs generated different amounts of audio, so their request times are not a direct comparison.
+- Each setup was tested with one request, so the timing is not a performance benchmark.
+- GPU memory was sampled once per second with `rocm-smi`.

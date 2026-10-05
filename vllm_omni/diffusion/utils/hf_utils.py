@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import os
 from collections.abc import Mapping
 from functools import lru_cache
@@ -10,6 +13,14 @@ logger = init_logger(__name__)
 DIFFUSION_MODEL_INDEX_FILES = (
     "model_index.json",
     "modular_model_index.json",
+)
+
+_MAGI2_MODEL_ID = "sand-ai/MAGI-2-preview"
+_MAGI2_REQUIRED_FILES = (
+    "preview/model.safetensors.index.json",
+    "text_encoder/config.json",
+    "vae/Wan2.2_VAE.pth",
+    "turbo_vae/checkpoint.ckpt",
 )
 
 
@@ -46,6 +57,26 @@ def _looks_like_bagel(model_name: str) -> bool:
         return False
 
 
+def _looks_like_magi2(model_name: str) -> bool:
+    """Detect the official Hub ID or a complete local Preview checkpoint."""
+    normalized = str(model_name).strip().rstrip("/")
+    hub_prefix = "https://huggingface.co/"
+    if normalized.lower().startswith(hub_prefix):
+        normalized = normalized[len(hub_prefix) :]
+        normalized = normalized.split("/tree/", 1)[0]
+    if normalized.lower() == _MAGI2_MODEL_ID.lower():
+        return True
+    return os.path.isdir(normalized) and all(
+        os.path.isfile(os.path.join(normalized, *relative.split("/"))) for relative in _MAGI2_REQUIRED_FILES
+    )
+
+
+def resolve_native_diffusion_model_class(model_name: str) -> str | None:
+    """Resolve native checkpoints that have no root HF or Diffusers config."""
+
+    return "Magi2Pipeline" if _looks_like_magi2(model_name) else None
+
+
 def _looks_like_dreamzero(model_name: str) -> bool:
     """Best-effort detection for DreamZero-style VLA diffusion checkpoints."""
     try:
@@ -71,6 +102,30 @@ def _looks_like_dreamzero(model_name: str) -> bool:
         return False
 
 
+HIDREAM_O1_SIGNATURE_WEIGHTS = (
+    "model.final_layer2.linear.weight",
+    "final_layer2.linear.weight",
+)
+
+
+def _looks_like_hidream_o1(model_name: str, config: Mapping | None = None) -> bool:
+    """Detect HiDream-O1 without matching regular Qwen3-VL checkpoints."""
+    try:
+        cfg = config if config is not None else get_hf_file_to_dict("config.json", model_name)
+        if not isinstance(cfg, Mapping) or cfg.get("model_type") != "qwen3_vl":
+            return False
+
+        index = get_hf_file_to_dict("model.safetensors.index.json", model_name)
+        if not isinstance(index, Mapping):
+            return False
+        weight_map = index.get("weight_map")
+        if not isinstance(weight_map, Mapping):
+            return False
+        return any(key in weight_map for key in HIDREAM_O1_SIGNATURE_WEIGHTS)
+    except (AttributeError, OSError, TypeError, ValueError):
+        return False
+
+
 @lru_cache
 def is_diffusion_model(model_name: str) -> bool:
     """Check if a model is a diffusion model.
@@ -80,6 +135,11 @@ def is_diffusion_model(model_name: str) -> bool:
     2. Check using vllm's get_hf_file_to_dict utility
     3. Try the standard diffusers approach (may fail due to import issues)
     """
+    # Some native diffusion checkpoints have neither a standard Diffusers
+    # index nor a root HF config. Recognize their exact Hub ID/local signature.
+    if resolve_native_diffusion_model_class(model_name) is not None:
+        return True
+
     # Strategy 1: Check local file system first (fastest, avoids import issues)
     if os.path.isdir(model_name):
         for filename in DIFFUSION_MODEL_INDEX_FILES:
@@ -115,7 +175,4 @@ def is_diffusion_model(model_name: str) -> bool:
     except Exception as e:
         logger.debug("Failed to load diffusers config via DiffusionPipeline: %s", e)
 
-        # Bagel and DreamZero are not diffusers pipelines (no model_index.json),
-        # but are still diffusion-style models in vllm-omni. Detect them via
-        # config.json.
-    return _looks_like_bagel(model_name) or _looks_like_dreamzero(model_name)
+    return _looks_like_bagel(model_name) or _looks_like_dreamzero(model_name) or _looks_like_hidream_o1(model_name)

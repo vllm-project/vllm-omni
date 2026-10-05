@@ -16,6 +16,8 @@ For backend selection and SageAttention usage, see the [Diffusion Attention Back
 | `Lightricks/LTX-2` | 512x768 | 121 | 40 | video 3.0 / audio 7.0 | Model-dependent |
 | `hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_t2v` | 480x832 | 121 | 50 | 6.0 | 1×A100 80GB |
 | `hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-720p_t2v` | 720x1280 | 121 | 50 | 6.0 | FP8 + VAE tiling required |
+| `Efficient-Large-Model/SANA-Video_2B_480p_diffusers` | 480x832 | 81 | 50 | 6.0 | BF16 DiT + FP32 Wan VAE |
+| `Efficient-Large-Model/SANA-Video_2B_720p_diffusers` | 704x1280 | 81 | 50 | 6.0 | ~23.6 GiB |
 
 ## Local CLI Usage
 
@@ -121,6 +123,31 @@ python text_to_video.py \
   --flow-shift 5.0 \
   --output quick_test.mp4
 ```
+
+### SANA-Video-2B
+
+```bash
+python text_to_video.py \
+  --model Efficient-Large-Model/SANA-Video_2B_480p_diffusers \
+  --model-class-name SanaVideoPipeline \
+  --prompt "A cinematic tracking shot of a sailboat crossing the ocean at sunset." \
+  --height 480 \
+  --width 832 \
+  --num-frames 81 \
+  --num-inference-steps 50 \
+  --guidance-scale 6.0 \
+  --extra-body '{"motion_score": 30}' \
+  --fps 16 \
+  --output sana_video_480p.mp4
+```
+
+For the 720p checkpoint, switch the model to
+`Efficient-Large-Model/SANA-Video_2B_720p_diffusers`, use
+`--height 704 --width 1280`, and write to a different output path. SANA-Video
+accepts `motion_score`, `clean_caption`, and `use_resolution_binning` through
+`--extra-body`. For image-to-video, use the shared
+`examples/offline_inference/image_to_video/image_to_video.py` example with
+`--model-class-name SanaImageToVideoPipeline` and `--image <path>`.
 
 ## Key Arguments
 

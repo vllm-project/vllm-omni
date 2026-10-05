@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """
 Performance benchmark CI runner for diffusion models.
 
@@ -49,9 +52,6 @@ from tests.dfx.conftest import (
     resource_label_for_filename,
 )
 from tests.helpers.runtime import get_open_port
-
-os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
-os.environ.setdefault("DIFFUSION_ATTENTION_BACKEND", "FLASH_ATTN")
 
 
 # ---------------------------------------------------------------------------
@@ -204,11 +204,11 @@ def load_diffusion_benchmark_configs(
 ) -> list[dict[str, Any]]:
     """Load one diffusion benchmark JSON, or merge all ``*.json`` under *config_dir*."""
     if config_path is not None:
-        configs = load_configs(config_path)
+        loaded = load_configs(config_path)
         source = str(Path(config_path).resolve())
-        for cfg in configs:
+        for cfg in loaded:
             cfg.setdefault(_DIFFUSION_SOURCE_CONFIG_KEY, source)
-        return configs
+        return loaded
     if config_dir is None:
         raise ValueError("load_diffusion_benchmark_configs requires config_path or config_dir")
     configs: list[dict[str, Any]] = []
@@ -231,7 +231,15 @@ if CONFIG_FILE_PATH is None:
         f"use -m to filter, e.g. -m diffusion)"
     )
 else:
-    BENCHMARK_CONFIGS = load_diffusion_benchmark_configs(CONFIG_FILE_PATH)
+    _loaded = load_diffusion_benchmark_configs(CONFIG_FILE_PATH)
+    BENCHMARK_CONFIGS = [cfg for cfg in _loaded if is_diffusion_perf_config(cfg)]
+    skipped = len(_loaded) - len(BENCHMARK_CONFIGS)
+    if skipped:
+        print(
+            f"--test-config-file: loaded {len(BENCHMARK_CONFIGS)} diffusion case(s); "
+            f"skipped {skipped} omni-bench generation case(s) "
+            f"(/v1/images/edits, /v1/images/generations, /v1/videos → run_benchmark.py)"
+        )
 
 _AGGREGATED_RESULT_FILES_BY_SOURCE: dict[str, Path] = {}
 
@@ -359,6 +367,8 @@ def _resolve_offline_model(model: str) -> str:
     """
     import huggingface_hub
 
+    from vllm_omni.transformers_utils.repo_utils import hf_api
+
     if not model or os.path.isdir(model):
         return model
 
@@ -383,9 +393,7 @@ def _resolve_offline_model(model: str) -> str:
     if len(parts) >= 3:
         repo_id = "/".join(parts[:2])
         subfolder = "/".join(parts[2:])
-        from huggingface_hub import snapshot_download
-
-        snapshot_root = snapshot_download(
+        snapshot_root = hf_api().snapshot_download(
             repo_id,
             allow_patterns=[f"{subfolder}/**"],
             local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
@@ -394,9 +402,7 @@ def _resolve_offline_model(model: str) -> str:
 
     if not huggingface_hub.constants.HF_HUB_OFFLINE:
         return model
-    from huggingface_hub import snapshot_download
-
-    return snapshot_download(model, local_files_only=True)
+    return hf_api().snapshot_download(model, local_files_only=True)
 
 
 class DiffusionServer:
@@ -837,7 +843,7 @@ def run_benchmark(
         "Quantization": _to_quantization_value(server_type, serve_args_dict),
         "offload": _to_offload_string(server_type, serve_args_dict),
         "compile": _to_compile_value(server_type, serve_args_dict),
-        "Attn_backend": os.environ.get("DIFFUSION_ATTENTION_BACKEND", ""),
+        "Attn_backend": str(serve_args_dict.get("diffusion-attention-backend") or ""),
         "num_inference_steps": params.get("num-inference-steps", ""),
         "completed": completed,
         "failed": failed,

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """
 Unit tests for cache backends (cache-dit and teacache).
@@ -164,7 +164,10 @@ class TestCacheDiTBackend:
             num_inference_steps=20,
             verbose=True,
         )
-        mock_cache_dit.summary.assert_called_once_with(transformer, details=True)
+        mock_cache_dit.summary.assert_called_once_with(
+            mock_block_adapter.return_value,
+            details=True,
+        )
 
     @patch("vllm_omni.diffusion.cache.cachedit.backend.logger")
     @patch("vllm_omni.diffusion.cache.cachedit.backend.cache_dit")
@@ -365,13 +368,10 @@ class TestCacheDiTBackend:
 
     @patch("vllm_omni.diffusion.cache.cachedit.backend.BlockAdapter")
     @patch("vllm_omni.diffusion.cache.cachedit.backend.cache_dit")
-    def test_enable_dreamid_pipeline_uses_fused_blocks(self, mock_cache_dit, mock_block_adapter):
-        """Test DreamID uses pipeline.transformer for cache enable/refresh.
-
-        NOTE: DreamID no longer has a custom enabler, so this tests against the generic path.
-        """
+    def test_enable_pipeline_uses_fused_blocks(self, mock_cache_dit, mock_block_adapter):
+        """Generic cache path should pick up ``transformer.fused_blocks``."""
         mock_pipeline = Mock()
-        mock_pipeline.__class__.__name__ = "DreamIDOmniPipeline"
+        mock_pipeline.__class__.__name__ = "FakeFusedBlocksPipeline"
         mock_pipeline.transformer = Mock()
         mock_pipeline.transformer.fused_blocks = Mock()
         mock_pipeline.transformer._cache_dit_adapter_config = CacheDiTAdapterConfig(
@@ -570,6 +570,57 @@ class TestTeaCacheBackend:
         # Test refresh
         backend.refresh(mock_pipeline, num_inference_steps=50)
         mock_registry.reset_hook.assert_called_once()
+
+    @patch("vllm_omni.diffusion.cache.teacache.backend.apply_teacache_hook")
+    def test_enable_mammoth_moda2_uses_gen_transformer(self, mock_apply_hook):
+        """MammothModa2 exposes its DiT as gen_transformer, not transformer."""
+        mock_pipeline = Mock()
+        mock_pipeline.__class__.__name__ = "MammothModa2DiTPipeline"
+        mock_pipeline.gen_transformer = Mock()
+        del mock_pipeline.transformer
+
+        backend = TeaCacheBackend(DiffusionCacheConfig())
+        backend.enable(mock_pipeline)
+
+        assert backend.enabled is True
+        mock_apply_hook.assert_called_once()
+        transformer_arg, config_arg = mock_apply_hook.call_args.args
+        assert transformer_arg is mock_pipeline.gen_transformer
+        assert config_arg.transformer_type == "MammothModa2Transformer2DModel"
+        assert config_arg.rel_l1_thresh == 0.075
+        assert mock_pipeline.transformer is mock_pipeline.gen_transformer
+
+    @patch("vllm_omni.diffusion.cache.teacache.backend.apply_teacache_hook")
+    def test_enable_mammoth_moda2_preserves_explicit_threshold(self, mock_apply_hook):
+        pipeline = Mock()
+        pipeline.__class__.__name__ = "MammothModa2DiTPipeline"
+        pipeline.gen_transformer = Mock()
+        del pipeline.transformer
+
+        TeaCacheBackend(DiffusionCacheConfig(rel_l1_thresh=0.05)).enable(pipeline)
+
+        assert mock_apply_hook.call_args.args[1].rel_l1_thresh == 0.05
+
+    @patch("vllm_omni.diffusion.cache.teacache.backend.apply_teacache_hook")
+    def test_refresh_mammoth_moda2_resets_gen_transformer_hook(self, mock_apply_hook):
+        """Refresh should find the hook through the transformer alias set by the enabler."""
+        mock_pipeline = Mock()
+        mock_pipeline.__class__.__name__ = "MammothModa2DiTPipeline"
+        mock_pipeline.gen_transformer = Mock()
+        del mock_pipeline.transformer
+
+        backend = TeaCacheBackend(DiffusionCacheConfig())
+        backend.enable(mock_pipeline)
+
+        mock_hook = Mock()
+        mock_registry = Mock()
+        mock_registry.get_hook = Mock(return_value=mock_hook)
+        mock_registry.reset_hook = Mock()
+        mock_pipeline.gen_transformer._hook_registry = mock_registry
+
+        backend.refresh(mock_pipeline, num_inference_steps=12)
+
+        mock_registry.reset_hook.assert_called_once_with("teacache")
 
 
 class TestCacheSelector:

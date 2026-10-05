@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Model-facing session state backed by paged AR-Diffusion KV storage."""
 
 from __future__ import annotations
@@ -130,7 +131,7 @@ class ARDiffusionKVState:
         if ctx.commit_current and ctx._allocated_video:
             n_chunks = ctx.seq_len // self.kv_cache.spec.chunk_size
             for _ in range(n_chunks):
-                ctx.adapter.on_chunk_committed()
+                self.kv_cache.commit_chunk(ctx.adapter)
             self._committed[kv_branch] += ctx.seq_len
             _log.debug(
                 "AR-Diffusion COMMIT [%s] new_tokens=%d chunks=%d resident=%d/%d",
@@ -172,6 +173,17 @@ class ARDiffusionKVState:
             self.kv_cache.read_cross_attention_kv(self.session_id, cache_name, i, kv_branch)
             for i in range(self.num_layers)
         ]
+
+    def clear_cross_attention(self) -> None:
+        """Invalidate all named cross-attention caches without dropping self-KV.
+
+        Prompt changes may preserve the autoregressive world history while
+        requiring fresh text projections. This operation deliberately leaves
+        branch adapters and their resident self-attention blocks untouched.
+        """
+        if self._closed:
+            raise RuntimeError(f"AR-Diffusion session {self.session_id!r} is closed")
+        self.kv_cache.release_cross_attention(self.session_id)
 
     def close(self) -> None:
         """Release all self- and cross-attention storage owned by this session."""

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from collections import defaultdict
 from types import SimpleNamespace
@@ -70,6 +70,16 @@ def _codes(payload) -> list[int]:
     assert payload.codes.audio.dtype == torch.long
     assert payload.codes.audio.ndim == 1
     return payload.codes.audio.tolist()
+
+
+def test_empty_full_payload_releases_consumer_wait_gate() -> None:
+    payload = tts2code2wav_full_payload(_manager(), None, _request("req"))
+
+    assert _codes(payload) == []
+    assert payload.meta.code_flat_numel == 0
+    assert payload.meta.left_context_size == 0
+    assert payload.meta.last_chunk is True
+    assert payload.meta.finished.item() is True
 
 
 @pytest.mark.parametrize(("count", "emitted"), [(24, False), (25, True), (26, True)])
@@ -158,9 +168,13 @@ def test_duplex_turn_end_waits_for_terminal_codec_flush() -> None:
 def test_first_chunk_forwards_reference_voice_and_duplex_identity() -> None:
     manager = _manager()
     request = _request("req")
-    request.additional_information = {
+    request.model_intermediate_buffer = {
         "codes": {"ref": [0.1, -0.1]},
         "meta": {"ref_audio_sr": 16000},
+    }
+    request.additional_information = {
+        "codes": {"ref": [0.9]},
+        "meta": {"ref_audio_sr": 8000},
     }
 
     payload = tts2code2wav_async_chunk(
@@ -183,10 +197,33 @@ def test_first_chunk_forwards_reference_voice_and_duplex_identity() -> None:
     assert payload.meta.turn_end is True
 
 
+def test_first_chunk_falls_back_to_legacy_reference_fields() -> None:
+    manager = _manager()
+    request = _request("req")
+    request.model_intermediate_buffer = {
+        "meta": {"ref_audio_sr": 16000},
+    }
+    request.additional_information = {
+        "codes": {"ref": [0.9]},
+        "meta": {"ref_audio_sr": 8000},
+    }
+
+    payload = tts2code2wav_async_chunk(
+        manager,
+        _duplex_delta(*range(7), turn_end=True),
+        request,
+        True,
+    )
+
+    assert payload is not None
+    assert payload.codes.ref.tolist() == pytest.approx([0.9])
+    assert payload.meta.ref_audio_sr == 16000
+
+
 def test_full_payload_forwards_all_codes_and_request_metadata() -> None:
     manager = _manager()
     request = _request("req")
-    request.additional_information = {
+    request.model_intermediate_buffer = {
         "codes": {"ref": [0.1, -0.1]},
         "meta": {
             "ref_audio_sr": 16000,
@@ -423,6 +460,12 @@ def test_duplex_turn_end_closes_epoch_and_next_turn_restarts_sequence() -> None:
         request,
         True,
     )
+    duplicate_boundary = tts2code2wav_async_chunk(
+        manager,
+        _duplex_delta(turn_id=7, turn_end=True),
+        request,
+        True,
+    )
     next_turn = tts2code2wav_async_chunk(
         manager,
         _duplex_delta(20, turn_id=8),
@@ -435,6 +478,10 @@ def test_duplex_turn_end_closes_epoch_and_next_turn_restarts_sequence() -> None:
     assert turn_end.meta.last_chunk is True
     assert turn_end.meta.turn_end is True
     assert turn_end.meta.is_segment_finished.item() is True
+    assert turn_end.meta.replace_runtime_additional_information is True
+    assert duplicate_boundary is not None
+    assert duplicate_boundary.meta.is_segment_finished.item() is True
+    assert duplicate_boundary.meta.replace_runtime_additional_information is True
     assert next_turn.meta.cache_epoch == turn_end.meta.cache_epoch + 1
     assert next_turn.meta.chunk_seq == 0
     assert next_turn.meta.last_chunk is False

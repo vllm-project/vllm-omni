@@ -17,11 +17,17 @@ implementation contract; it is not, by itself, a general support claim.
 
 ### Runtime and stage execution
 
+- [Full-Duplex Runtime (MiniCPM-o 4.5)](fullduplex.md)
+- [Full-Duplex Runtime (PersonaPlex)](fullduplex-personaplex.md)
 - [Disaggregated Inference](feature/disaggregated_inference.md)
+- [Host Weight Runtime](feature/host_weight_runtime.md)
 - [Async Chunk](feature/async_chunk.md)
 - [Async Diffusion Output](feature/async_diffusion_output.md)
 - [Async Omni Output Materialization](feature/omni_async_output_materialization.md)
+- [Runner-to-model Prefill/Decode Phase Contract](feature/preprocess_phase_contract.md)
 - [Automatic Prefix Caching in Omni Models](feature/prefix_caching.md)
+- [Model-local KV Caches](feature/model_local_kv_caches.md)
+- [Realtime AR-Diffusion Sessions](feature/realtime_ar_diffusion.md)
 
 ### Communication
 
@@ -30,6 +36,7 @@ implementation contract; it is not, by itself, a general support claim.
 - [Mooncake Store Connector](feature/omni_connectors/mooncake_store_connector.md)
 - [Mooncake Transfer Engine Connector](feature/omni_connectors/mooncake_transfer_engine_connector.md)
 - [Mori Transfer Engine Connector](feature/omni_connectors/mori_transfer_engine_connector.md)
+- [NIXL Connector](feature/omni_connectors/nixl_connector.md)
 - [Shared Memory Connector](feature/omni_connectors/shared_memory_connector.md)
 - [Yuanrong Store Connector](feature/omni_connectors/yuanrong_connector.md)
 - [Yuanrong Transfer Engine Connector](feature/omni_connectors/yuanrong_transfer_engine_connector.md)
@@ -50,18 +57,30 @@ implementation contract; it is not, by itself, a general support claim.
 - [Tensor Parallel](feature/tensor_parallel.md)
 - [VAE Patch Parallelism](feature/vae_parallel.md)
 
+#### KV cache and memory management
+
+- [Scheduler-Managed Paged KV Cache for Diffusion DiT Stages](feature/diffusion_paged_kv_cache.md)
+
 #### Attention optimization
 
 The [Diffusion Attention Backends](../user_guide/diffusion/attention_backends.md)
-guide lists all selectable backends and their platform defaults. Skip-Softmax
-is the backend-related optimization with a standalone feature-design contract:
+guides list selectable backends, platform defaults, installation, and tuning.
+The design contracts separate selection mechanics from backend algorithms:
 
+- [Attention Backend Selection](feature/attention_backend_selection.md)
+- [Attention Execution Contract PoC](feature/attention_execution_contract_poc.md)
 - [Skip-Softmax](feature/skip_softmax.md)
+
+#### CPU offloading
+
+- [Overview and Shared Contracts](feature/offloader/README.md)
+- [Model-Level Offload](feature/offloader/module_offload.md)
+- [Layerwise Offload](feature/offloader/layerwise_offload.md)
+- [Distributed Layerwise Offload](feature/offloader/distributed_layerwise_offload.md)
 
 - [Cache-DiT](feature/cache_dit.md)
 - [TeaCache](feature/teacache.md)
 - [Diffusion Continuous Batching](feature/diffusion_continuous_batching.md)
-- [Distributed Layerwise Offload](feature/distributed_layerwise_offload.md)
 
 ## Infrastructure and Performance
 
@@ -80,14 +99,15 @@ is the backend-related optimization with a standalone feature-design contract:
 - [Model Integration](module/model_integration.md)
 - [Autoregressive Runtime](module/ar_runtime.md)
 - Diffusion
-  - [Overview](module/diffusion/index.md)
-  - [Runtime](module/diffusion/diffusion_runtime.md)
-  - [Model Integration](module/diffusion/diffusion_model_integration.md)
-  - [Continuous Batching](module/diffusion/continuous_batching.md)
-  - [Parallelism](module/diffusion/parallelism.md)
-  - [Offloader](module/diffusion/offloader.md)
+    - [Overview](module/diffusion/index.md)
+    - [Runtime](module/diffusion/diffusion_runtime.md)
+    - [Model Integration](module/diffusion/diffusion_model_integration.md)
+    - [Continuous Batching](module/diffusion/continuous_batching.md)
+    - [Parallelism](module/diffusion/parallelism.md)
+    - [Offloader](module/diffusion/offloader.md)
 - [Execution Platforms](module/execution_platforms.md)
 - [Cache Management](module/cache_management.md)
+- [Host Weight Runtime](module/host_weight_runtime.md)
 - [Quantization](module/quantization.md)
 - [Observability](module/observability.md)
 - [Profiling](module/profiling.md)
@@ -96,3 +116,6 @@ is the backend-related optimization with a standalone feature-design contract:
 The pre-#5137 pages are preserved in the
 [legacy module archive](module/archive/README.md) for historical reference and
 are not active design contracts.
+
+- [Qwen3-Omni MRv2 performance](qwen3_omni_mrv2_performance.md)
+- [MiniCPM-o 4.5 turn-mode MRv2 performance](minicpm_o45_mrv2_performance.md)

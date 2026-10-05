@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import math
 from dataclasses import dataclass
 
 import numpy as np
@@ -14,6 +13,10 @@ from diffusers.utils import BaseOutput
 from diffusers.utils.torch_utils import randn_tensor
 from einops import rearrange
 from torch import Tensor, nn
+
+# ResnetBlock is platform-dispatched in the layers package __init__: CUDA gets a
+# fused GroupNorm+SiLU kernel, every other backend gets the plain PyTorch block.
+from vllm_omni.diffusion.models.hunyuan_image3.layers import ResnetBlock
 
 
 class DiagonalGaussianDistribution:
@@ -53,10 +56,6 @@ class DecoderOutput(BaseOutput):
     posterior: DiagonalGaussianDistribution | None = None
 
 
-def swish(x: Tensor) -> Tensor:
-    return x * torch.sigmoid(x)
-
-
 def forward_with_checkpointing(module, *inputs, use_checkpointing=False):
     def create_custom_forward(module):
         def custom_forward(*inputs):
@@ -70,46 +69,6 @@ def forward_with_checkpointing(module, *inputs, use_checkpointing=False):
         return module(*inputs)
 
 
-class Conv3d(nn.Conv3d):
-    """
-    Perform Conv3d on patches with numerical differences from nn.Conv3d within 1e-5.
-    Only symmetric padding is supported.
-    """
-
-    def forward(self, input):
-        B, C, T, H, W = input.shape
-        memory_count = (C * T * H * W) * 2 / 1024**3
-        if memory_count > 2:
-            n_split = math.ceil(memory_count / 2)
-            assert n_split >= 2
-            chunks = torch.chunk(input, chunks=n_split, dim=-3)
-            padded_chunks = []
-            for i in range(len(chunks)):
-                if self.padding[0] > 0:
-                    padded_chunk = F.pad(
-                        chunks[i],
-                        (0, 0, 0, 0, self.padding[0], self.padding[0]),
-                        mode="constant" if self.padding_mode == "zeros" else self.padding_mode,
-                        value=0,
-                    )
-                    if i > 0:
-                        padded_chunk[:, :, : self.padding[0]] = chunks[i - 1][:, :, -self.padding[0] :]
-                    if i < len(chunks) - 1:
-                        padded_chunk[:, :, -self.padding[0] :] = chunks[i + 1][:, :, : self.padding[0]]
-                else:
-                    padded_chunk = chunks[i]
-                padded_chunks.append(padded_chunk)
-            padding_bak = self.padding
-            self.padding = (0, self.padding[1], self.padding[2])
-            outputs = []
-            for i in range(len(padded_chunks)):
-                outputs.append(super().forward(padded_chunks[i]))
-            self.padding = padding_bak
-            return torch.cat(outputs, dim=-3)
-        else:
-            return super().forward(input)
-
-
 class AttnBlock(nn.Module):
     """Attention with torch sdpa implementation."""
 
@@ -119,10 +78,12 @@ class AttnBlock(nn.Module):
 
         self.norm = nn.GroupNorm(num_groups=32, num_channels=in_channels, eps=1e-6, affine=True)
 
-        self.q = Conv3d(in_channels, in_channels, kernel_size=1)
-        self.k = Conv3d(in_channels, in_channels, kernel_size=1)
-        self.v = Conv3d(in_channels, in_channels, kernel_size=1)
-        self.proj_out = Conv3d(in_channels, in_channels, kernel_size=1)
+        # The memory concern is already handled via VAE tiling,
+        # so there's no need to chunk here — calling nn.Conv3d directly is fine.
+        self.q = nn.Conv3d(in_channels, in_channels, kernel_size=1)
+        self.k = nn.Conv3d(in_channels, in_channels, kernel_size=1)
+        self.v = nn.Conv3d(in_channels, in_channels, kernel_size=1)
+        self.proj_out = nn.Conv3d(in_channels, in_channels, kernel_size=1)
 
     def attention(self, h_: Tensor) -> Tensor:
         h_ = self.norm(h_)
@@ -142,41 +103,12 @@ class AttnBlock(nn.Module):
         return x + self.proj_out(self.attention(x))
 
 
-class ResnetBlock(nn.Module):
-    def __init__(self, in_channels: int, out_channels: int):
-        super().__init__()
-        self.in_channels = in_channels
-        out_channels = in_channels if out_channels is None else out_channels
-        self.out_channels = out_channels
-
-        self.norm1 = nn.GroupNorm(num_groups=32, num_channels=in_channels, eps=1e-6, affine=True)
-        self.conv1 = Conv3d(in_channels, out_channels, kernel_size=3, stride=1, padding=1)
-        self.norm2 = nn.GroupNorm(num_groups=32, num_channels=out_channels, eps=1e-6, affine=True)
-        self.conv2 = Conv3d(out_channels, out_channels, kernel_size=3, stride=1, padding=1)
-        if self.in_channels != self.out_channels:
-            self.nin_shortcut = Conv3d(in_channels, out_channels, kernel_size=1, stride=1, padding=0)
-
-    def forward(self, x):
-        h = x
-        h = self.norm1(h)
-        h = swish(h)
-        h = self.conv1(h)
-
-        h = self.norm2(h)
-        h = swish(h)
-        h = self.conv2(h)
-
-        if self.in_channels != self.out_channels:
-            x = self.nin_shortcut(x)
-        return x + h
-
-
 class DownsampleDCAE(nn.Module):
     def __init__(self, in_channels: int, out_channels: int, add_temporal_downsample: bool = True):
         super().__init__()
         factor = 2 * 2 * 2 if add_temporal_downsample else 1 * 2 * 2
         assert out_channels % factor == 0
-        self.conv = Conv3d(in_channels, out_channels // factor, kernel_size=3, stride=1, padding=1)
+        self.conv = nn.Conv3d(in_channels, out_channels // factor, kernel_size=3, stride=1, padding=1)
 
         self.add_temporal_downsample = add_temporal_downsample
         self.group_size = factor * in_channels // out_channels
@@ -196,7 +128,7 @@ class UpsampleDCAE(nn.Module):
     def __init__(self, in_channels: int, out_channels: int, add_temporal_upsample: bool = True):
         super().__init__()
         factor = 2 * 2 * 2 if add_temporal_upsample else 1 * 2 * 2
-        self.conv = Conv3d(in_channels, out_channels * factor, kernel_size=3, stride=1, padding=1)
+        self.conv = nn.Conv3d(in_channels, out_channels * factor, kernel_size=3, stride=1, padding=1)
 
         self.add_temporal_upsample = add_temporal_upsample
         self.repeats = factor * out_channels // in_channels
@@ -233,7 +165,7 @@ class Encoder(nn.Module):
         self.num_res_blocks = num_res_blocks
 
         # downsampling
-        self.conv_in = Conv3d(in_channels, block_out_channels[0], kernel_size=3, stride=1, padding=1)
+        self.conv_in = nn.Conv3d(in_channels, block_out_channels[0], kernel_size=3, stride=1, padding=1)
 
         self.down = nn.ModuleList()
         block_in = block_out_channels[0]
@@ -265,7 +197,7 @@ class Encoder(nn.Module):
 
         # end
         self.norm_out = nn.GroupNorm(num_groups=32, num_channels=block_in, eps=1e-6, affine=True)
-        self.conv_out = Conv3d(block_in, 2 * z_channels, kernel_size=3, stride=1, padding=1)
+        self.conv_out = nn.Conv3d(block_in, 2 * z_channels, kernel_size=3, stride=1, padding=1)
 
         self.gradient_checkpointing = False
 
@@ -291,7 +223,7 @@ class Encoder(nn.Module):
         group_size = self.block_out_channels[-1] // (2 * self.z_channels)
         shortcut = rearrange(h, "b (c r) f h w -> b c r f h w", r=group_size).mean(dim=2)
         h = self.norm_out(h)
-        h = swish(h)
+        h = F.silu(h)
         h = self.conv_out(h)
         h += shortcut
         return h
@@ -321,7 +253,7 @@ class Decoder(nn.Module):
 
         # z to block_in
         block_in = block_out_channels[0]
-        self.conv_in = Conv3d(z_channels, block_in, kernel_size=3, stride=1, padding=1)
+        self.conv_in = nn.Conv3d(z_channels, block_in, kernel_size=3, stride=1, padding=1)
 
         # middle
         self.mid = nn.Module()
@@ -351,7 +283,7 @@ class Decoder(nn.Module):
 
         # end
         self.norm_out = nn.GroupNorm(num_groups=32, num_channels=block_in, eps=1e-6, affine=True)
-        self.conv_out = Conv3d(block_in, out_channels, kernel_size=3, stride=1, padding=1)
+        self.conv_out = nn.Conv3d(block_in, out_channels, kernel_size=3, stride=1, padding=1)
 
         self.gradient_checkpointing = False
 
@@ -376,7 +308,7 @@ class Decoder(nn.Module):
 
         # end
         h = self.norm_out(h)
-        h = swish(h)
+        h = F.silu(h)
         h = self.conv_out(h)
         return h
 

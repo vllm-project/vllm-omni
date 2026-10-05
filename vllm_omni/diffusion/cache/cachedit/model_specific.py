@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """Model-specific Cache-DiT adapters and enablers."""
 
@@ -25,6 +25,7 @@ from vllm.logger import init_logger
 
 from vllm_omni.diffusion.cache.cachedit.backend import (
     CUSTOM_DIT_ENABLERS,
+    CacheDiTEnableResult,
     RefreshCacheContextFunc,
     _build_cache_context_refresh,
     _default_get_pipeline_transformer,
@@ -836,6 +837,77 @@ def enable_cache_for_krea2(pipeline: Any, cache_config: Any) -> RefreshCacheCont
     return enable_cache_for_dit(pipeline, cache_config, block_adapter)
 
 
+def _get_magi2_transformer_block(pipeline: Any) -> torch.nn.Module:
+    return pipeline.transformer.block
+
+
+def enable_cache_for_magi2(pipeline: Any, cache_config: Any) -> CacheDiTEnableResult:
+    """Cache only MAGI-2's repeated native transformer-layer stack.
+
+    The pre/post adapters still execute on every denoising step. MAGI-2 either
+    packs both CFG branches into one transformer call or assigns one branch to
+    each CFG-parallel rank. In both layouts each rank invokes this stack once
+    per denoising step, so it remains a non-separate-CFG Pattern-3 stack.
+    """
+
+    transformer_block = _get_magi2_transformer_block(pipeline)
+    block_adapter = BlockAdapter(
+        transformer=transformer_block,
+        blocks=[transformer_block.layers],
+        forward_pattern=[ForwardPattern.Pattern_3],
+        has_separate_cfg=False,
+        check_forward_pattern=True,
+    )
+    refresh = enable_cache_for_dit(
+        pipeline,
+        cache_config,
+        block_adapter,
+        get_pipeline_transformer=_get_magi2_transformer_block,
+    )
+    return CacheDiTEnableResult(refresh=refresh, targets=(block_adapter,))
+
+
+def _get_mammothmoda2_transformer(pipeline: Any) -> torch.nn.Module:
+    return pipeline.gen_transformer
+
+
+def enable_cache_for_mammothmoda2(pipeline: Any, cache_config: Any) -> CacheDiTEnableResult:
+    """Cache only MammothModa2's repeated main DiT stack.
+
+    ``Transformer2DModel`` runs three Q-Former refiners (noise / ref-image /
+    context) whose inputs change every denoise step, plus the ``layers``
+    stack that dominates per-step compute. Only ``layers`` is a repeated
+    residual stack, so the ``BlockAdapter`` wraps it and the refiners stay
+    outside the cached region. Blocks take ``hidden_states`` plus keyword
+    step context and return only hidden states (``Pattern_3``).
+
+    The pipeline runs sequential CFG: each conditional forward is followed by
+    an unconditional forward. cache-dit tells cond/uncond apart purely by
+    transformer-forward parity (``has_separate_cfg=True``), so the
+    ``cfg_range`` optimization that skips the unconditional pass outside the
+    interval would desync that accounting. Like Cosmos3, we keep the passes
+    paired and neutralize CFG via scale=1.0 outside the interval; the
+    pipeline also disables hooks for no-CFG requests (single forward per
+    step), whose parity the accounting cannot represent.
+    """
+    pipeline._cache_dit_requires_paired_cfg = True
+    transformer = _get_mammothmoda2_transformer(pipeline)
+    block_adapter = BlockAdapter(
+        transformer=transformer,
+        blocks=[transformer.layers],
+        forward_pattern=[ForwardPattern.Pattern_3],
+        has_separate_cfg=True,
+        check_forward_pattern=True,
+    )
+    refresh = enable_cache_for_dit(
+        pipeline,
+        cache_config,
+        block_adapter,
+        get_pipeline_transformer=_get_mammothmoda2_transformer,
+    )
+    return CacheDiTEnableResult(refresh=refresh, targets=(block_adapter,))
+
+
 def register_custom_dit_enablers() -> None:
     """Register model-specific Cache-DiT enablers.
 
@@ -853,6 +925,8 @@ def register_custom_dit_enablers() -> None:
             "Cosmos3OmniDiffusersPipeline": enable_cache_for_cosmos3,
             "Cosmos3OmniPipeline": enable_cache_for_cosmos3,
             "Krea2Pipeline": enable_cache_for_krea2,
+            "Magi2Pipeline": enable_cache_for_magi2,
+            "MammothModa2DiTPipeline": enable_cache_for_mammothmoda2,
         }
     )
 

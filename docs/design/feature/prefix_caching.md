@@ -1,6 +1,5 @@
 # Automatic Prefix Caching in Omni Models
 
-
 ---
 
 ## Table of Contents
@@ -9,6 +8,9 @@
 - [High-Level Approach](#high-level-approach)
 - [Example](#example)
 - [What About Multimodal Inputs?](#what-about-multimodal-inputs)
+- [Diffusion KV Prefix Caching](#diffusion-kv-prefix-caching)
+- [Implementation](#implementation)
+- [Related Files](#related-files)
 
 ---
 
@@ -24,9 +26,10 @@ vLLM implements automatic prefix caching for managing its kv-cache, which is bes
 - Model / stage specific multimodal data
 
 !!! note "Note 1"
-    This document describes vLLM-Omni's mechanism for caching tensor outputs that are meant to be passed between stages, when requests have common prefixes, similar to the way in which vLLM has prefix caching for the kv-cache. This works in conjunction with vLLM's multimodal encoder caching, but is distinct. See the final section for a concrete example for how they tie together in practice.
+    The following sections describe caching tensor outputs passed between AR stages. This is distinct from multimodal encoder caching and from [diffusion KV prefix caching](#diffusion-kv-prefix-caching), which reuses GPU KV pages inside a diffusion stage.
 
 ### High-Level Approach
+
 !!! note "Note 2"
     Prior to reading this section, it's recommended to take a look at the design documents in vLLM for [Automatic Prefix Caching](https://docs.vllm.ai/en/latest/features/automatic_prefix_caching/), which will make some of the concepts more clear.
 
@@ -38,10 +41,12 @@ The main focus of vLLM-Omni's approach to prefix caching stage outputs is to bui
 
 With this in mind, consider the set of blocks in a 2D layout, where the row represents the index of blocks being considered, and the columns represent the slots corresponding to tokens within each block. Since we know the `num_blocks` and `block_size` from our kv cache config, if we want to cache a tensor with feature size `D`, we can preallocate a CPU tensor of size `(num_blocks, block_size, D)`, and use the same block index and slot mapping to retrieve the corresponding feature vector.
 
+Host footprint: each cached key costs `num_blocks × block_size × D × dtype_bytes` of **pinned** CPU memory (pinned so device→host can overlap compute), allocated on the first `save_outputs` that sees the key — the first real request pays the `cudaHostAlloc`. Measured on a Qwen3-Omni deployment: thinker `__hidden_states__` `[15092, 16, 2048]` bf16 ≈ 0.92 GiB (plus the same again for each `hidden_states.layer_*` key a model exposes), Qwen3-TTS talker `codes.audio` `[16180, 16, 16]` ≈ 33 MiB. Budget host RAM for the stage accordingly.
 
 ### Example
+
 !!! note "Note 3"
-    Prefix caching in vLLM-Omni currently is only supported on AutoRegressive stages with one kv-cache group. It can be enabled/disabled per-stage via the `enable_prefix_caching` parameter in the model's stage config.
+    The stage-output tensor cache described here supports AutoRegressive stages with one kv-cache group. Configure it with the pipeline-wide `enable_prefix_caching` field in the deploy config. Diffusion KV caching has the separate requirements below.
 
 The way in which vLLM-Omni ties into vLLM's prefix caching is best understood by example. Say that we have the following:
 
@@ -56,7 +61,7 @@ The prefix cache flow is then outlined below.
 
 2. Say we process the request `The quick brown fox was tired and slept beneath the shady tree`, which is 12 tokens and evenly divides into 3 blocks as shown below.
 
-```
+```text
          [  The quick brown fox  ] [  was tired and slept ] [beneath the shady tree ]
 Block 1: |<--- block tokens ---->|
 Block 2: |<------- prefix ------>| |<--- block tokens --->|
@@ -65,10 +70,9 @@ Block 3: |<------------------ prefix -------------------->| |<--- block tokens -
 
 When the request processes, we inspect the multimodal outputs and identify the `mm_feature` tensor, which will be of shape `(seq_len, feature_dim)`, i.e., `(12, 16)` in this example. We note that the first axis is dependent on the `seq_len` and add a new cache_tensor of shape `(num_blocks, block_size, feature_dim)` to our multimodal cache for tensors.
 
+1. If we lay out the cache as a 2D tensor of shape (`num_blocks`, `block_size`), we'll have something like the following:
 
-3. If we lay out the cache as a 2D tensor of shape (`num_blocks`, `block_size`), we'll have something like the following:
-
-```
+```text
 0: [  The quick brown fox  ]
 1: [  was tired and slept  ]
 2: [beneath the shady tree ]
@@ -78,7 +82,8 @@ When the request processes, we inspect the multimodal outputs and identify the `
 ```
 
 Or, if we flatten it down to 1D,
-```
+
+```text
 0: The
 1: quick
 2: brown
@@ -90,7 +95,8 @@ Or, if we flatten it down to 1D,
 ```
 
 which we can think of as row indices into the hidden states tensor if we view it as the 2D shape `(num_blocks x block_size, feature_dim)`. That is, the analogous flattened (from 3D -> 2D) mapping of the cache for hidden states becomes the following.
-```
+
+```text
 0: <hidden states vector of len 2 corresponding to 'The'>
 1: <hidden states vector of len 2 corresponding to 'quick'>
 2: <hidden states vector of len 2 corresponding to 'brown'>
@@ -103,10 +109,9 @@ which we can think of as row indices into the hidden states tensor if we view it
 
 Similarly, for the multimodal outputs cache, the flattened coordinates are the same, but the `mm_feature` maps to vectors of length `16` instead of the hidden size of `2`. Note that in practice, we may have multiple  multimodal output tensors per forward pass, which may have different names and different feature dimensions.
 
+1. Now, say that we receive a new request `The quick brown fox jumped over the dog`.
 
-4. Now, say that we receive a new request `The quick brown fox jumped over the dog`.
-
-```
+```text
          [  The quick brown fox  ] [  jumped over the dog ]
 Block 1: |<--- block tokens ---->|
 Block 2: |<------- prefix ------>| |<--- block tokens --->|
@@ -116,7 +121,7 @@ Here, we will have a cache hit for `Block 1` which will be detected by vLLM base
 
 Since we have the block indices / slot mappings from the kv cache manager, we can simply mirror the mappings and leverage the same indices for the cached hidden states and multimodal outputs. This allows us to look up the correct tensors from our externally maintained 3D caches.
 
-```
+```text
 0: [  The quick brown fox  ] < already in the cache
 1: [  was tired and slept  ]
 2: [beneath the shady tree ]
@@ -129,11 +134,11 @@ Since we have the block indices / slot mappings from the kv cache manager, we ca
 
 Finally, to pass the full hidden states and multimodal outputs to the next stage, we simply concatenate the cached contents with the corresponding new tensors computed from the current forward call.
 
-
 ### What About Multimodal Inputs?
+
 It's also useful to consider the case about how Omni prefix caching is handled when we have multimodal inputs that don't cleanly end on block boundaries, as well as how this works with multimodal encoder caching in vLLM. For example:
 
-```
+```text
          [   Im0  Im1  Im2  Im3  ] [ Im4  Im5 foo <empty> ]
 Block 1: |<--- block tokens ---->|
 Block 2: |<------- prefix ------>| |<--- block tokens --->|
@@ -147,9 +152,9 @@ In reality, this isn't a big problem for correctness, because vLLM also maintain
 - The hash describing the image data starting at position 0 and with length 6
 - In vLLM's encoder cache, a mapping from the image hash above to the encoder output
 
-
 To understand what happens, say we get the following input as a second request:
-```
+
+```text
          [   Im0  Im1  Im2  Im3  ] [  Im4  Im5 bar  baz  ]
 Block 1: |<--- block tokens ---->|
 Block 2: |<------- prefix ------>| |<--- block tokens --->|
@@ -162,3 +167,221 @@ Because we have multimodal data in a scheduled span that isn't fully precomputed
 When we pass our multimodal tensors to the language model component in the same stage, we'll then expect the same outputs, because the prefix caching behaviors in vLLM-Omni / vLLM match, so the LLM will use vLLM's KV cache manager's prefix caching to correctly handle the attention information for `Block 1` while calculating the outputs for `Block 2`, giving us the correct results for processing `Block 2` with the context of `Block 1`.
 
 Finally, we look up the output hidden states/multimodal tensors corresponding to the prefix cache hit `Block 1` and concatenate it with the forward pass result to get the final result, which is expected to be identical to the full hidden states when prefix caching is disabled.
+
+### Diffusion KV Prefix Caching
+
+HunyuanImage3's standalone DiT pipeline can reuse stable text/reference-image KV
+across requests. Enable it on the diffusion stage in the deploy config:
+
+```yaml
+pipeline: hunyuan_image3_dit
+stages:
+  - stage_id: 0
+    diffusion_kv_mode: paged_scheduler
+    enable_prefix_caching: true
+```
+
+The Scheduler uses vLLM's native `KVCacheManager` to look up and retain complete
+prefix blocks. The Worker owns the GPU pages and block tables. On a hit, the first
+denoise forward computes only the uncached query suffix while attending to both
+cached and new KV. Dynamic target-image KV is never published as a reusable prefix.
+
+Cache identity includes token IDs, reference-image content and VAE random state,
+plus model/layout and LoRA context. The same image with different prompts can
+reuse the common leading blocks; it does not imply that every image span or CFG
+branch is interchangeable. Disabling prefix caching skips cache-identity hashing;
+`dense_legacy` remains the default. Enabling prefix caching with a mode other than
+`paged_scheduler`, without a registered model hook, or together with native
+`kv_transfer_config` raises a configuration error.
+Combining it with `enable_sleep_mode: true` is also rejected: sleep discards KV
+pages without invalidating the Scheduler's prefix-cache index. Disable either
+prefix caching or sleep mode.
+
+The current scope is local DiT reuse, not AR-imported KV or missing-page-only
+cross-stage transfer. Prefix-hit accuracy has been exercised with TP4/SP1 and
+TP2/SP2 (Ulysses), both with EP and CFGP1. Other combinations still require validation. See the
+[diffusion compatibility notes](../../user_guide/diffusion_features.md#diffusion-kv-prefix-caching).
+
+#### Shared-reference benchmark
+
+From the repository root, use the unified `vllm bench serve --omni` test runner:
+
+```bash
+pytest tests/dfx/perf/scripts/run_benchmark.py \
+  --test-config-file tests/dfx/perf/tests/test_hunyuan_image3_prefix_caching.json
+```
+
+Run GPU tests through your environment's GPU scheduler. The suite reuses the
+two-image IT2I accuracy input on a single DiT stage, comparing dense, paged without
+prefix caching, and paged with prefix caching. Each mode runs two ordinary upstream
+warmups followed by eight identical requests at CFG 2.5, 8 denoise steps and seed 42.
+Warmups are excluded from latency and request throughput. This measures full-prefix
+reuse, not the earlier distinct-prompt workload; its results must be reported separately.
+
+`tests/e2e/accuracy/test_hunyuan_image3_prefix_cache_accuracy.py` uses the same input
+at CFG 2.5, 50 steps and seed 42, comparing all modes against the existing official
+Instruct output image and IT2I thresholds (CLIP ≥90, SSIM ≥0.26, PSNR ≥12.5).
+A different prompt warms the cache; the original prompt then exercises partial
+and repeated hits, with reference-image reuse and query slicing verified.
+Only outputs for the original prompt are scored. The golden comes from AR-to-DiT;
+this single-DiT quality check does not establish identical conditioning between
+the pipelines. The existing AR-to-DiT test remains unchanged.
+
+### Implementation
+
+The block/slot model is `vllm_omni/core/prefix_cache/`.
+`OmniPrefixCacheManager` owns slot occupancy, the request-task table,
+hit spans, and merge.
+`OmniPrefixCacheController` moves data: a reusable `StagingBufferPool` for
+this step's device→host copy, and writes into the durable `PrefixBlockPool`.
+The state lock covers those tables only.
+
+Miss is not an error (this step's forward slice only). A hit span whose
+hidden rows are absent is fatal. For mm keys the rule is looser: a model may
+emit a key only for some requests, so a hit span with no rows behind an mm key
+reads zeros from the pool for those positions rather than raising. Abort still
+writes: once a hash entered this step's batch it must land in the cache.
+
+`enable_prefix_caching` is refused on KV-consumer stages (`kv_role` of
+`kv_consumer` or `kv_both`). KV received from a producer is reported as
+`num_computed_tokens` too, and the manager cannot tell it from a local hit.
+Producer-only stages are unaffected. Pooling stages never save, so they get
+no cache. This gate is one function, `stage_prefix_cache_config`, called by
+both the GPU and the NPU model runner at kv-cache init.
+
+Which stages may set `enable_prefix_caching: true`:
+
+| Stage | `enable_prefix_caching` | Why |
+| --- | --- | --- |
+| AR stage with one full-attention kv group whose hidden states / per-token mm feed the next stage (Qwen3-Omni thinker and talker) | supported | The case the cache is built for: full-prompt hidden states are merged from the pool on a hit. |
+| AR stage that sets `requires_full_prefix_cached_hidden_states = False`, optionally with `deferred_prefix_cache_mm_keys` (Qwen3-TTS talker, Higgs v3 talker) | supported | Hidden is not cached; deferred codec rows are written once on finish. |
+| Pooling stage | ignored | Never saves; the gate returns no config. |
+| `kv_role: kv_consumer` / `kv_both` | refused at kv-cache init (`OmniPrefixCacheUnmatchError`) | Producer KV shows up as `num_computed_tokens` and is indistinguishable from a local hit. |
+| Speculative decoding on the stage | refused at kv-cache init | Under async scheduling vLLM keeps `num_computed_tokens_cpu` optimistic (all drafts accepted) during the forward and corrects it afterwards; `step_slots_cpu` would mirror rows at the wrong slots. Not verified; refused as a whole. |
+| `prefix_match_unit` smaller than `block_size` | refused at kv-cache init | Sub-block hits make `num_computed_tokens` unaligned; the hit registry only mirrors whole blocks. |
+| Hybrid / sliding-window / multi-group kv cache (e.g. a talker with `attention_type: sliding_recompute`) | refused at kv-cache init | The cache mirrors exactly one full-attention block table. |
+| Attention backend whose kernel block size differs from `--block-size` (FlashInfer / FlashMLA / CutlassMLA with a block size they do not list natively), or decode context parallel | refused at first step (`FullAttentionGroupView`) | `step_slots_cpu` computes `table[req, pos // block_size] * block_size + pos % block_size` over allocator block ids; hybrid kernel blocks and DCP token striping change that row layout. FlashAttention / Triton accept any multiple of 16 and never split blocks. |
+| Codec decoder / Code2Wav stages (Qwen3-Omni stage 2, Qwen3-TTS stage 1) | keep `false` | Nothing downstream consumes their hidden states; the cache would only add device→host copies. Not validated. |
+| Diffusion stages | n/a | No vLLM KV cache to mirror. |
+
+Hit spans come from `scheduled_new_reqs` only, as in the pre-refactor cache:
+
+- A new request with a (partial) prefix hit is the normal path: the hit
+  blocks are read from the pool, the rest is this step's rows, and the
+  divergent tail is written under its own blocks. The gather starts on the
+  prefetch thread at `new_step_starts`; a same-step hit (vLLM hashes blocks
+  at schedule time, so `b` can hit blocks `a` computes in the same forward)
+  cannot plan until `a`'s write is registered and starts at `save_outputs`
+  instead. Either way it runs before the next step can hand those blocks
+  to a new tenant. vLLM frees blocks one step before `finished_req_ids`
+  arrives, so a finished request whose last step materializes late may
+  still find a hit slot reassigned. Each `(slot, key)` carries a write
+  version, bumped whenever a new write claims it. A planned read captures
+  that version and is registered in `_pending_reads`; a later write that
+  reclaims those slots copy-on-writes the still-`COMMITTED` rows into the
+  ref before it overwrites the pool, so a delayed fetch serves the original
+  tenant. A version mismatch with no preserved copy raises for live and
+  finished alike (the pool rows are a newer tenant's). Production defaults
+  stay opt-in until preempt/resume hit spans are reconstructed.
+- `async_chunk` continuation: when the next upstream chunk arrives, the same
+  request id re-enters `scheduled_new_reqs` with `num_computed_tokens` equal
+  to what it already computed itself. Ids already in `live_reqs` are skipped
+  for hit marking: those rows were delivered in earlier steps and re-emitting
+  them would duplicate output. A `delivered_upto` span for this case is
+  Phase 2.
+- Preemption + reschedule: vLLM resets `num_computed_tokens` to 0 on
+  preemption and re-runs prefix matching on resume, so the resumed request
+  can come back with a fresh hit. With the V1 model runner it arrives
+  through `scheduled_cached_reqs` (id in `resumed_req_ids`, `new_block_ids`
+  replaces the table); with the V2 runner it re-enters `scheduled_new_reqs`
+  while still in `live_reqs`. Neither path marks an omni hit span: the
+  resumed request gets only the rows it recomputes, and its still-open
+  deferred write keeps appending (a slot written twice keeps the later
+  chunk). Cache integrity holds either way — the hit blocks already have
+  rows, from this request or the one it hit. Stages that need full prompt
+  hidden states should be sized so preemption does not occur while prefix
+  caching is on. Same as before this refactor; tracked for Phase 2.
+
+Two write paths, split by `ModelCachePolicy.deferred_keys`:
+
+- Immediate (`JOIN_NEXT_STEP`): save launches a whole-step device→host into
+  a staging slot; the committer waits that event and writes the CPU pool.
+  The next save waits `done` (the pool write): a reused slot must never
+  leave a pending pool write behind, or a delayed hit read of the old rows
+  would find nothing recoverable.
+- Deferred (`JOIN_ON_FINISH`): mm whose first dim is this step's token count
+  stays on a per-request GPU clone; `_WriteChunk`s append across steps;
+  finish/abort (or GPU-byte-budget pressure) forces the copy. One open
+  WriteTask per request; a budget flush may close it mid-request, in which
+  case the next save opens a new one (`write_n` + 1) and a hit reads both,
+  so one long request cannot pin the whole budget.
+
+A `WriteTask` moves through `TaskState` only via `transition()`, one step at
+a time along a strict chain:
+`PENDING` (registered, not queued) → `QUEUED` (on a copy queue) →
+`COPYING` (one thread owns the copy stage) → `HOST_READY` (host rows ready) →
+`WRITTEN` (in the CPU pool); `FAILED` is reachable from any non-terminal
+state. Skipping a step raises. The worker claims `COPYING` in the same `_wake`
+critical section as the queue pop, so `escalate` never re-queues a task it can
+see is already claimed. `host_ready` / `done` are wait primitives set by the
+transitions into `HOST_READY` / `WRITTEN` / `FAILED`. GPU-clone bytes are
+charged once per clone on a `_BudgetTicket` pinned by every task that views
+it, and uncharged when the last holder releases (idempotent per tid).
+
+Mm whose first dim equals the unpadded scheduled length *or* the CUDA-graph
+padded length is registered on first sighting. Talker `codes.audio` is a
+cat of scheduled rows and stays unpadded while hidden is padded; both must
+open a pool key, whether immediate or deferred.
+Leftover mm (lists, `codes.ref`, any tensor whose first dim is not this
+step's token count) is copied to CPU at save without truncating that first
+dim. That leftover copy is the async-builder read replica for this step; it
+does not write the pool or carry abort/preempt occupancy.
+
+```python
+cache.register_policy(ModelCachePolicy.from_model(model))   # load_model
+cache.new_step_starts(scheduler_output)   # before _update_states
+sid = cache.save_outputs(hidden, mm_outputs, num_tokens_unpadded=n,
+                         num_tokens_padded=n_pad)
+outs = cache.materialize(sid, req_ids)    # or discard_step(sid)
+```
+
+Each step id is consumed exactly once. `req_ids` must be a subset of the save
+snapshot. At most `staging_depth` unused step ids may exist at once: every
+`save_outputs` claims one staging slot, including saves with only leftover
+mm that copy no device→host page. A slot is also held by each immediate
+write that views it, until the committer's pool write. A later save waits
+for `materialize`/`discard_step` or that pool write to free a slot;
+`staging_claim_timeout_s` then errors with the unused ids and the task count.
+`join`/`join_host_ready` use the same bound and raise with the stuck task's
+id and state instead of hanging the caller.
+`materialize` may run on the async output builder after the engine has
+entered the next step; leftover mm (not written to the pool) is copied
+to CPU at `save_outputs` so the builder never reads live CUDA-graph
+buffers. See
+[Async Omni Output Materialization](omni_async_output_materialization.md).
+
+The cache is constructed only on the last pipeline-parallel rank
+(`_ensure_omni_prefix_cache`). Other ranks skip it: they never call
+`save_outputs`, so a hit table there would resolve to absent slots.
+
+Threads, locks, and what each may block on:
+
+| Thread | Role | May block on | Must not hold while blocked |
+| --- | --- | --- | --- |
+| Engine | `new_step_starts`, `save_outputs` | previous-step `join` (`done`) / finished-write `join_host_ready`; `reserve()` GPU-byte flush; staging-slot claim; `dispatch()` / finish-abort `escalate()` (eager mode: the copy + pool write run inline) | `_state_lock` |
+| Async output builder | `materialize` (may overlap the next engine step) | this step's `step_d2h_event`; `join` (`done`); deferred `fetch_host` | `_state_lock` |
+| Committer | `_worker_loop`: wait device→host / deferred copy / pool write | `_wake.wait`; `step_d2h_event` or copy-stream sync | never takes `_state_lock` |
+| Prefetch pool | hit-span gather during forward | `join` (`done`); deferred `fetch_host` | `_state_lock` |
+
+| Lock | Covers | Does not cover |
+| --- | --- | --- |
+| manager `_state_lock` | occupancy tables, step contexts, hit spans, task registration, pool-key publish (`install_key`) | join, GPU-byte flush, copy, `step_d2h_event` wait, pool-key allocation, eager `dispatch()` / `escalate()` |
+| controller `_lock` / `_wake` | task registry, queues, GPU-clone byte budget | device→host / pool-write body (released before `synchronize`) |
+| `WriteTask.lock` | `state`, `reassigned`, `append_chunk` | waiting on `host_ready` / `done` (those are events) |
+
+### Related Files
+
+- `vllm_omni/core/prefix_cache/`
+- `vllm_omni/worker/gpu_model_runner.py` (`_ensure_omni_prefix_cache`)
+- `tests/core/test_prefix_cache.py`
+- [Async Omni Output Materialization](omni_async_output_materialization.md)

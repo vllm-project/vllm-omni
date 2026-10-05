@@ -46,7 +46,7 @@ REFERENCE_TEXT_IMG2TEXT = (
 _OMNI_RUNNER_PARAM = (MODEL_NAME, STAGE_CONFIG)
 
 pytestmark = [
-    pytest.mark.advanced_model,
+    pytest.mark.slow,
     pytest.mark.diffusion,
     pytest.mark.parametrize("omni_runner", [_OMNI_RUNNER_PARAM], indirect=True),
 ]

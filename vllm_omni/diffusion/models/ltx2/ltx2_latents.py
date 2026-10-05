@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """Shared latent layout and normalization primitives for LTX pipelines."""
 
@@ -18,6 +18,11 @@ class LTXAVState:
 
     video: torch.Tensor
     audio: torch.Tensor
+
+
+def official_video_token_layout(latents: torch.Tensor) -> torch.Tensor:
+    """Match the token-major view produced by the official LTX patchifier."""
+    return latents.transpose(1, 2).contiguous().transpose(1, 2)
 
 
 def pack_latents(
@@ -62,6 +67,13 @@ def unpack_latents(
         patch_size,
     )
     return latents.permute(0, 4, 1, 5, 2, 6, 3, 7).flatten(6, 7).flatten(4, 5).flatten(2, 3)
+
+
+def resolve_video_latent_statistics(pipeline: Any) -> tuple[torch.Tensor, torch.Tensor, float]:
+    """Return statistics owned by the active video decoder."""
+    decoder = pipeline.diffusion_decoder if getattr(pipeline, "use_diffusion_decoder", False) else pipeline.vae
+    scaling_factor = getattr(getattr(decoder, "config", None), "scaling_factor", 1.0)
+    return decoder.latents_mean, decoder.latents_std, scaling_factor
 
 
 def normalize_latents(
@@ -117,9 +129,23 @@ def create_noised_state(
         device=latents.device,
         dtype=latents.dtype,
     )
-    if isinstance(noise_scale, torch.Tensor):
-        noise_scale = noise_scale.float()
-    return torch.lerp(latents.float(), noise.float(), noise_scale).to(latents.dtype)
+    # Official GaussianNoisier blends in fp32, then materializes the next
+    # latent state in the model dtype. Batched request weights may arrive in
+    # the model dtype, so promote tensor weights alongside both endpoints.
+    lerp_weight = noise_scale.float() if isinstance(noise_scale, torch.Tensor) else noise_scale
+    return torch.lerp(latents.float(), noise.float(), lerp_weight).to(latents.dtype)
+
+
+def create_conditioned_noised_state(
+    latents: torch.Tensor,
+    clean_latents: torch.Tensor,
+    denoise_mask: torch.Tensor,
+    noise_scale: float | torch.Tensor,
+    generator: torch.Generator | list[torch.Generator] | None = None,
+) -> torch.Tensor:
+    """Match the official conditioned Gaussian noisier operation order."""
+    noised_latents = create_noised_state(latents, noise_scale, generator)
+    return torch.lerp(clean_latents.float(), noised_latents.float(), denoise_mask.float()).to(latents.dtype)
 
 
 def pack_audio_latents(latents: torch.Tensor) -> torch.Tensor:
@@ -138,7 +164,7 @@ def unpad_audio_latents(latents: torch.Tensor, num_frames: int) -> torch.Tensor:
 
 
 def clear_audio_padding(latents: torch.Tensor, num_frames: int) -> torch.Tensor:
-    """Keep Omni's SP-only audio padding outside the sampler state."""
+    """Keep SP-only audio padding outside the logical sampler state."""
     if not 0 < num_frames <= latents.shape[1]:
         raise ValueError(f"Audio frame count must be in [1, {latents.shape[1]}], got {num_frames}.")
     if num_frames == latents.shape[1]:
@@ -183,11 +209,12 @@ def prepare_video_latents(
 ) -> torch.Tensor:
     if latents is not None:
         if latents.ndim == 5:
+            latents_mean, latents_std, scaling_factor = resolve_video_latent_statistics(pipeline)
             latents = normalize_latents(
                 latents,
-                pipeline.vae.latents_mean,
-                pipeline.vae.latents_std,
-                pipeline.vae.config.scaling_factor,
+                latents_mean,
+                latents_std,
+                scaling_factor,
             )
             latents = pack_latents(
                 latents,
@@ -196,7 +223,8 @@ def prepare_video_latents(
             )
         if latents.ndim != 3:
             raise ValueError(f"Provided `latents` has shape {latents.shape}, expected [batch, seq, features].")
-        return create_noised_state(latents, noise_scale, generator).to(device=device, dtype=dtype)
+        latents = create_noised_state(latents, noise_scale, generator).to(device=device, dtype=dtype)
+        return official_video_token_layout(latents)
 
     num_frames, height, width = resolve_video_latent_shape(
         height,
@@ -218,11 +246,7 @@ def prepare_video_latents(
             f" size of {batch_size}. Make sure the batch size matches the length of the generators."
         )
     latents = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
-    # Official LTX samples the 5D video latent first and then patchifies it,
-    # leaving token-major storage behind the [B, tokens, channels] view.  The
-    # logical values are unchanged, but preserving that layout is important:
-    # CUDA selects a different bf16 GEMM path for a contiguous token tensor.
-    return latents.transpose(1, 2).contiguous().transpose(1, 2)
+    return official_video_token_layout(latents)
 
 
 def prepare_audio_latents(

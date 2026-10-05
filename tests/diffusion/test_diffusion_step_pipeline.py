@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Tests for step-level diffusion execution across runner / worker / executor / engine."""
 
 import contextlib
@@ -15,8 +15,11 @@ from pytest_mock import MockerFixture
 
 import vllm_omni.diffusion.worker.diffusion_model_runner as model_runner_module
 from tests.helpers.mark import hardware_test
+from vllm_omni.config.config_factory import StageConfigFactory
 from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
+from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
+from vllm_omni.diffusion.diffusion_kv.metadata import DiffusionKVMetadata
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.comm import RingComm, SeqAllToAll4D
 from vllm_omni.diffusion.distributed.parallel_state import (
@@ -44,7 +47,7 @@ from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunn
 from vllm_omni.diffusion.worker.diffusion_worker import DiffusionWorker
 from vllm_omni.diffusion.worker.input_batch import InputBatch
 from vllm_omni.diffusion.worker.utils import RunnerOutput, StepRequestState
-from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
+from vllm_omni.errors import OmniClientError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.platforms import current_omni_platform
 
@@ -98,6 +101,94 @@ class _StepPipeline:
         del kwargs
         self.decode_calls += 1
         return DiffusionOutput(output=torch.tensor([state.step_index], dtype=torch.float32))
+
+
+class _ChunkedStepPipeline(_StepPipeline):
+    """Streaming stub: two chunks of two denoise steps each, one decode per chunk."""
+
+    supports_chunk_step_grouping = False
+
+    def prepare_encode(self, state, **kwargs):
+        del kwargs
+        self.prepare_calls += 1
+        state.timesteps = [torch.tensor(10), torch.tensor(5), torch.tensor(10), torch.tensor(5)]
+        state.latents = torch.tensor([0.0])
+        state.prompt_embeds = torch.tensor([[0.0, 0.0], [1.0, 1.0]])
+        state.chunk_num_steps = 2
+        state.total_chunks = 2
+        state.chunk_index = 0
+        state.step_in_chunk = 0
+        return state
+
+    def step_scheduler(self, state, noise_pred, **kwargs):
+        del noise_pred, kwargs
+        self.scheduler_calls += 1
+        state.step_in_chunk += 1
+        state.step_index = state.step_in_chunk
+
+    def post_decode(self, state, **kwargs):
+        del kwargs
+        self.decode_calls += 1
+        result = DiffusionOutput(output=torch.tensor([float(state.chunk_index)]))
+        state.chunk_index += 1
+        state.step_in_chunk = 0
+        return result
+
+
+class _BatchDependentChunkPipeline(_ChunkedStepPipeline):
+    """Streaming stub whose noise depends on the batch's latents and timesteps, so a stale batch shows."""
+
+    def __init__(self):
+        super().__init__()
+        self.seen: list[tuple[float, float]] = []
+
+    def prepare_encode(self, state, **kwargs):
+        super().prepare_encode(state, **kwargs)
+        state.latents = torch.tensor([1.0])
+        return state
+
+    def denoise_step(self, input_batch, **kwargs):
+        self.denoise_calls += 1
+        latent = float(input_batch.latents.reshape(-1)[0])
+        timestep = float(input_batch.timesteps.reshape(-1)[0])
+        self.seen.append((latent, timestep))
+        return torch.full((input_batch.latents.shape[0], 1), latent + timestep)
+
+    def step_scheduler(self, state, noise_pred, **kwargs):
+        del kwargs
+        self.scheduler_calls += 1
+        state.latents = state.latents + noise_pred.reshape(-1)[0]
+        state.step_in_chunk += 1
+        state.step_index = state.step_in_chunk
+
+    def post_decode(self, state, **kwargs):
+        self.final_latent = state.latents.reshape(-1)[0].clone()
+        return super().post_decode(state, **kwargs)
+
+
+class _FailsMidChunkPipeline(_ChunkedStepPipeline):
+    """Streaming stub whose second denoise step of the first chunk raises."""
+
+    def step_scheduler(self, state, noise_pred, **kwargs):
+        super().step_scheduler(state, noise_pred, **kwargs)
+        if state.chunk_index == 0 and state.step_in_chunk == 2:
+            raise RuntimeError("boom mid chunk")
+
+
+class _PerRequestErrorStepPipeline(_StepPipeline):
+    def prepare_encode(self, state, **kwargs):
+        if state.prompt == "fail-prepare":
+            raise OmniClientError(
+                "invalid request input",
+                status_code=422,
+                error_type="UnprocessableEntityError",
+            )
+        return super().prepare_encode(state, **kwargs)
+
+    def denoise_step(self, input_batch, **kwargs):
+        del kwargs
+        self.denoise_calls += 1
+        return torch.ones_like(input_batch.latents)
 
 
 class _ProfilingStepPipeline(_StepPipeline):
@@ -306,11 +397,15 @@ def _make_vllm_config():
     )
 
 
-def _make_runner():
-    runner = object.__new__(DiffusionModelRunner)
+def _make_runner(
+    diffusion_kv_mode: DiffusionKVCacheMode = DiffusionKVCacheMode.DENSE_LEGACY,
+    runner_cls: type[DiffusionModelRunner] = DiffusionModelRunner,
+):
+    runner = object.__new__(runner_cls)
     runner.vllm_config = _make_vllm_config()
     runner.od_config = SimpleNamespace(
         cache_backend=None,
+        diffusion_kv_mode=diffusion_kv_mode,
         parallel_config=SimpleNamespace(use_hsdp=False),
         streaming_output=False,
     )
@@ -330,6 +425,7 @@ def _make_distributed_runner(mode: str, device: torch.device):
     runner.vllm_config = _make_vllm_config()
     runner.od_config = SimpleNamespace(
         cache_backend=None,
+        diffusion_kv_mode=DiffusionKVCacheMode.DENSE_LEGACY,
         parallel_config=SimpleNamespace(use_hsdp=False),
         streaming_output=False,
     )
@@ -489,7 +585,39 @@ def test_input_batch_cached_repack_keeps_static_prompt_fields_for_same_compositi
 
 
 @pytest.mark.cpu
-def test_step_profiler_reports_denoise_step_as_diffuse():
+def test_make_batch_identity_mapping_never_reads_the_device_tensor_back(monkeypatch):
+    """The default index mapping is built on the host; reading it back from the device would sync every step."""
+
+    def forbidden(self, *args, **kwargs):
+        raise AssertionError("make_batch read a tensor back to the host")
+
+    monkeypatch.setattr(torch.Tensor, "tolist", forbidden)
+    monkeypatch.setattr(torch.Tensor, "cpu", forbidden)
+    states = [_make_input_batch_state("req-1", 1.0), _make_input_batch_state("req-2", 2.0)]
+
+    batch = InputBatch.make_batch(states)
+    repacked = InputBatch.make_batch(states, cached_batch=batch)
+
+    assert repacked is batch
+    assert list(batch.idx_mapping_np) == [0, 1]
+    assert batch.idx_mapping.dtype is torch.int32 and batch.idx_mapping.shape == (2,)
+    assert batch.request_ids == ["req-1", "req-2"]
+
+
+@pytest.mark.cpu
+def test_make_batch_explicit_mapping_still_selects_and_orders_states():
+    states = [_make_input_batch_state("req-1", 1.0), _make_input_batch_state("req-2", 2.0)]
+
+    batch = InputBatch.make_batch(states, idx_mapping=torch.tensor([1, 0]))
+
+    assert batch.request_ids == ["req-2", "req-1"]
+    assert list(batch.idx_mapping_np) == [1, 0]
+    torch.testing.assert_close(batch.latents, torch.tensor([[2.0], [1.0]]))
+
+
+@pytest.mark.cpu
+def test_step_profiler_reports_denoise_step_as_diffuse(monkeypatch):
+    monkeypatch.setattr(current_omni_platform, "synchronize", lambda: None)
     pipeline = _AutoDenoiseProfilerPipeline()
 
     assert pipeline.denoise_step() == "ok"
@@ -501,6 +629,88 @@ def test_step_profiler_reports_denoise_step_as_diffuse():
 @pytest.mark.cpu
 class TestRunner:
     """DiffusionModelRunner.execute_stepwise"""
+
+    @pytest.fixture(autouse=True)
+    def mock_platform_memory(self, monkeypatch):
+        monkeypatch.setattr(model_runner_module.current_omni_platform, "is_available", lambda: True)
+        monkeypatch.setattr(model_runner_module.current_omni_platform, "reset_peak_memory_stats", lambda: None)
+        monkeypatch.setattr(model_runner_module.current_omni_platform, "max_memory_reserved", lambda: 0)
+        monkeypatch.setattr(model_runner_module.current_omni_platform, "max_memory_allocated", lambda: 0)
+
+    @pytest.mark.parametrize(
+        ("diffusion_kv_mode", "should_cleanup"),
+        [
+            (DiffusionKVCacheMode.DENSE_LEGACY, False),
+            (DiffusionKVCacheMode.PAGED_SCHEDULER, True),
+        ],
+    )
+    def test_scheduler_finished_cleanup_only_runs_for_paged_kv(
+        self,
+        mocker: MockerFixture,
+        diffusion_kv_mode: DiffusionKVCacheMode,
+        should_cleanup: bool,
+    ):
+        runner = _make_runner(diffusion_kv_mode)
+        cleanup = mocker.patch.object(runner, "remove_diffusion_kv_requests")
+        expected_output = object()
+        mocker.patch.object(runner, "_execute_stepwise_core", return_value=expected_output)
+        scheduler_output = DiffusionSchedulerOutput(
+            step_id=1,
+            scheduled_new_reqs=[],
+            scheduled_cached_reqs=CachedRequestData.make_empty(),
+            finished_req_ids={"finished-request"},
+            num_running_reqs=0,
+            num_waiting_reqs=0,
+        )
+
+        output = DiffusionModelRunner.execute_stepwise(runner, scheduler_output)
+
+        assert output is expected_output
+        if should_cleanup:
+            cleanup.assert_called_once_with(["finished-request"])
+        else:
+            cleanup.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("diffusion_kv_mode", "should_cleanup"),
+        [
+            (DiffusionKVCacheMode.DENSE_LEGACY, False),
+            (DiffusionKVCacheMode.PAGED_SCHEDULER, True),
+        ],
+    )
+    def test_terminal_cleanup_only_runs_for_paged_kv(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        mocker: MockerFixture,
+        diffusion_kv_mode: DiffusionKVCacheMode,
+        should_cleanup: bool,
+    ):
+        runner = _make_runner(diffusion_kv_mode)
+        cleanup = mocker.patch.object(runner, "remove_diffusion_kv_requests")
+        install = mocker.patch.object(runner, "install_diffusion_kv_metadata")
+        req = _make_step_request()
+        scheduler_output = _make_scheduler_output(req, step_id=0)
+        if should_cleanup:
+            scheduler_output.scheduled_new_reqs[0].diffusion_kv_metadata = DiffusionKVMetadata(
+                request_id=req.request_id,
+                allocation_generation=1,
+                sequences=(),
+            )
+        monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+
+        first_output = DiffusionModelRunner.execute_stepwise(runner, scheduler_output)
+        assert first_output.get_request_output(req.request_id).finished is False
+        cleanup.assert_not_called()
+
+        output = DiffusionModelRunner.execute_stepwise(runner, _make_cached_scheduler_output(step_id=1))
+
+        assert output.get_request_output(req.request_id).finished is True
+        if should_cleanup:
+            install.assert_called_once_with(scheduler_output.scheduled_new_reqs[0].diffusion_kv_metadata)
+            cleanup.assert_called_once_with([req.request_id])
+        else:
+            install.assert_not_called()
+            cleanup.assert_not_called()
 
     def test_completes_request_and_clears_state(self, monkeypatch):
         runner = _make_runner()
@@ -529,6 +739,146 @@ class TestRunner:
         assert runner.pipeline.denoise_calls == 2
         assert runner.pipeline.scheduler_calls == 2
         assert runner.pipeline.decode_calls == 1
+
+    @staticmethod
+    def _make_grouping_runner(pipeline, *, grouping: bool):
+        """An AR runner without KV (so it inherits the stepwise entry) over a streaming stub pipeline."""
+        from vllm_omni.experimental.ar_diffusion.runner import ARDiffusionModelRunner
+
+        runner = _make_runner(runner_cls=ARDiffusionModelRunner)
+        runner.od_config.streaming_output = True
+        runner.kv_cache = None
+        runner.pipeline = pipeline
+        runner.pipeline.supports_chunk_step_grouping = grouping
+        return runner
+
+    @staticmethod
+    def _drive_to_completion(runner, num_steps=4):
+        outputs = [runner.execute_stepwise(_make_scheduler_output(_make_step_request(num_steps)))]
+        step = 1
+        while not outputs[-1].get_request_output("req-1").finished:
+            outputs.append(runner.execute_stepwise(_make_cached_scheduler_output(step_id=step)))
+            step += 1
+        return [o.get_request_output("req-1") for o in outputs]
+
+    @pytest.mark.parametrize("grouping", [False, True])
+    def test_ar_runner_runs_every_step_of_a_chunk_in_one_call_when_the_pipeline_declares_it(
+        self, monkeypatch, grouping
+    ):
+        """With the capability declared, one AR runner call drives a whole chunk; the outputs are the same either way."""
+        runner = self._make_grouping_runner(_ChunkedStepPipeline(), grouping=grouping)
+        monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+        denoise_calls_after_each_call = []
+        original = runner.execute_stepwise
+
+        def counting(scheduler_output):
+            output = original(scheduler_output)
+            denoise_calls_after_each_call.append(runner.pipeline.denoise_calls)
+            return output
+
+        runner.execute_stepwise = counting
+
+        per_call = self._drive_to_completion(runner)
+
+        # Chunk outputs, and the steps they were emitted at, are identical.
+        emitted = [(o.step_index, float(o.result.output[0])) for o in per_call if o.result is not None]
+        assert emitted == [(2, 0.0), (2, 1.0)]
+        assert per_call[-1].finished is True
+        assert runner.pipeline.denoise_calls == 4 and runner.pipeline.scheduler_calls == 4
+        assert runner.pipeline.decode_calls == 2
+        assert runner.pipeline.prepare_calls == 1
+        # One call per chunk with the capability, one per step without; a
+        # grouped call never crosses into the next chunk.
+        assert denoise_calls_after_each_call == ([2, 4] if grouping else [1, 2, 3, 4])
+        assert "req-1" not in runner.state_cache
+
+    def test_ar_runner_continues_a_grouped_chunk_as_a_cached_request(self, monkeypatch):
+        """The first step admits the new request; every further step of the chunk is a cached-request continuation."""
+        runner = self._make_grouping_runner(_ChunkedStepPipeline(), grouping=True)
+        monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+        seen = []
+        original_core = DiffusionModelRunner._execute_stepwise_core
+
+        def recording_core(self_, scheduler_output, **kwargs):
+            seen.append(scheduler_output)
+            return original_core(self_, scheduler_output, **kwargs)
+
+        monkeypatch.setattr(DiffusionModelRunner, "_execute_stepwise_core", recording_core)
+
+        first = runner.execute_stepwise(_make_scheduler_output(_make_step_request(4), finished_req_ids={"old"}))
+
+        assert first.get_request_output("req-1").result is not None
+        assert runner.pipeline.prepare_calls == 1
+        assert len(seen) == 2
+        assert [n.request_id for n in seen[0].scheduled_new_reqs] == ["req-1"]
+        continuation = seen[1]
+        assert continuation.scheduled_new_reqs == []
+        assert continuation.scheduled_cached_reqs.request_ids == ["req-1"]
+        assert continuation.finished_req_ids == set()
+        assert continuation.kv_prefetch_job is None and continuation.kv_connector_metadata is None
+        assert continuation.step_id == seen[0].step_id
+
+    def test_ar_runner_grouped_steps_see_the_same_inputs_as_per_step_calls(self, monkeypatch):
+        """Every grouped step sees the latents and timestep step_scheduler just advanced, exactly as per-step calls do."""
+        finals = {}
+        seen = {}
+        for grouping in (False, True):
+            runner = self._make_grouping_runner(_BatchDependentChunkPipeline(), grouping=grouping)
+            monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+            self._drive_to_completion(runner)
+            finals[grouping] = float(runner.pipeline.final_latent)
+            seen[grouping] = runner.pipeline.seen
+
+        # 1 -> +(1+10)=12 -> +(12+5)=29 -> +(29+10)=68 -> +(68+5)=141 in both modes.
+        assert seen[False] == [(1.0, 10.0), (12.0, 5.0), (29.0, 10.0), (68.0, 5.0)]
+        assert seen[True] == seen[False]
+        assert finals[True] == finals[False] == 141.0
+
+    def test_ar_runner_grouped_chunk_stops_at_a_failing_step_and_drops_the_state(self, monkeypatch):
+        """A failure mid-chunk ends the grouped call with that step's error; nothing runs after it."""
+        runner = self._make_grouping_runner(_FailsMidChunkPipeline(), grouping=True)
+        monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+
+        output = runner.execute_stepwise(_make_scheduler_output(_make_step_request(4)))
+
+        failed = output.get_request_output("req-1")
+        assert failed.finished is True
+        assert failed.result is not None and "boom mid chunk" in failed.result.error
+        assert runner.pipeline.denoise_calls == 2 and runner.pipeline.decode_calls == 0
+        assert "req-1" not in runner.state_cache
+
+    def test_ar_runner_fails_a_chunk_that_never_advances(self, monkeypatch):
+        pipeline = _ChunkedStepPipeline()
+        monkeypatch.setattr(pipeline, "step_scheduler", lambda *args, **kwargs: None)
+        runner = self._make_grouping_runner(pipeline, grouping=True)
+        monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+        output = runner.execute_stepwise(_make_scheduler_output(_make_step_request(4)))
+        failed = output.get_request_output("req-1")
+        assert failed.finished
+        assert "within 2 denoise steps" in failed.result.error
+        assert pipeline.denoise_calls == 2
+        assert "req-1" not in runner.state_cache
+
+    def test_base_runner_never_groups_and_the_ar_policy_needs_capability_streaming_and_one_request(self, monkeypatch):
+        """The shared runner is one step per call; the AR runner groups only a lone streaming request that declares it."""
+        base = _make_runner()
+        base.od_config.streaming_output = True
+        base.pipeline = _ChunkedStepPipeline()
+        base.pipeline.supports_chunk_step_grouping = True
+        monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+        first = DiffusionModelRunner.execute_stepwise(base, _make_scheduler_output(_make_step_request(4)))
+        assert first.get_request_output("req-1").result is None and base.pipeline.denoise_calls == 1
+
+        ar = self._make_grouping_runner(_ChunkedStepPipeline(), grouping=False)
+        one = _make_cached_scheduler_output()
+        two = _make_batch_scheduler_output([_make_step_request(4), _make_step_request(4)])
+        two.scheduled_new_reqs[1].request_id = two.scheduled_new_reqs[1].req.request_id = "req-2"
+        assert ar._groups_chunk_steps(one) is False  # no capability declared
+        ar.pipeline.supports_chunk_step_grouping = True
+        assert ar._groups_chunk_steps(one) is True
+        assert ar._groups_chunk_steps(two) is False  # not for a batch
+        ar.od_config.streaming_output = False
+        assert ar._groups_chunk_steps(one) is False  # not without streaming output
 
     def test_stepwise_output_includes_stage_and_peak_metrics(self, monkeypatch):
         runner = _make_runner()
@@ -615,6 +965,131 @@ class TestRunner:
 
         result = DiffusionModelRunner.execute_stepwise(runner, scheduler_output)
         assert len(result) == 2
+
+    def test_prepare_error_isolated_from_healthy_request(self, monkeypatch):
+        runner = _make_runner()
+        runner.pipeline = _PerRequestErrorStepPipeline()
+        bad_req = _make_step_request()
+        bad_req.request_id = "req-bad"
+        bad_req.prompt = "fail-prepare"
+        good_req = _make_step_request()
+        good_req.request_id = "req-good"
+        good_req.prompt = "valid"
+        monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+
+        result = DiffusionModelRunner.execute_stepwise(
+            runner,
+            _make_batch_scheduler_output([bad_req, good_req]),
+        )
+
+        bad_output = result.get_request_output("req-bad")
+        assert bad_output.finished is True
+        assert bad_output.result is not None
+        assert bad_output.result.error == "invalid request input"
+        assert bad_output.result.error_status_code == 422
+        assert bad_output.result.error_type == "UnprocessableEntityError"
+        good_output = result.get_request_output("req-good")
+        assert good_output.finished is False
+        assert good_output.step_index == 1
+        assert good_output.result is None
+        assert set(runner.state_cache) == {"req-good"}
+        assert runner.pipeline.denoise_calls == 1
+        assert runner.pipeline.scheduler_calls == 1
+
+    def test_prepare_error_on_other_rank_is_isolated_via_all_reduce(self, monkeypatch):
+        """P1-B: rank-0-only pipeline work (e.g. H3 reference-video prep)
+        can raise on rank 0 while non-zero ranks return cleanly and then hang
+        on a downstream ``dist.broadcast``. Beyond the pipeline-side guard,
+        the runner all-reduces a per-request failure flag across the DiT
+        group so a rank that ``prepare_encode`` returned cleanly on still
+        skips the request and does not enter the denoise step batch.
+        """
+        runner = _make_runner()
+        runner.pipeline = _StepPipeline()  # locally always succeeds
+        monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+
+        # Simulate a peer DiT rank having reported failure. We patch the
+        # helper directly (rather than ``torch.distributed`` broadly) because
+        # ``execute_stepwise`` also queries ``torch.distributed.get_rank``.
+        monkeypatch.setattr(
+            model_runner_module,
+            "_dit_any_rank_failed",
+            lambda local_failed: True,
+        )
+
+        req = _make_step_request(num_inference_steps=1)
+        result = DiffusionModelRunner.execute_stepwise(
+            runner,
+            _make_scheduler_output(req),
+        )
+
+        output = result.get_request_output("req-1")
+        assert output.finished is True
+        assert output.result is not None
+        assert output.result.error is not None
+        assert "another DiT rank" in output.result.error
+        # A rank that skipped the request must not have driven a denoise step.
+        assert runner.pipeline.denoise_calls == 0
+        assert runner.state_cache == {}
+
+    def test_peer_prepare_encode_failure_skips_interaction_session_initialization(self, monkeypatch):
+        """One rank's failure in ``_prepare_batch_inputs -> prepare_encode`` must be handled before all ranks initialize interaction sessions.
+
+        ``maybe_prepare_initial_session`` calls ``synchronized_monotonic_time()``
+        (a broadcast). If this rank's ``prepare_encode`` succeeded while a peer
+        failed, entering that broadcast while the peer enters the failure
+        all-reduce would hang.
+        """
+        from unittest.mock import MagicMock
+
+        from vllm_omni.diffusion.interaction.types import ChunkMediaSpec, InteractionChunkMetadata
+
+        class _InteractionStepPipeline(_StepPipeline):
+            def __init__(self):
+                super().__init__()
+                self.prepare_next_chunk_calls = 0
+
+            def peek_chunk_media(self, state):
+                del state
+                return ChunkMediaSpec(num_media_frames=8, fps=16.0, num_latent_frames=8)
+
+            def apply_interaction_at_chunk_boundary(self, state):
+                del state
+
+            def prepare_next_chunk(self, state):
+                del state
+                self.prepare_next_chunk_calls += 1
+
+        runner = _make_runner()
+        pipeline = _InteractionStepPipeline()
+        runner.pipeline = pipeline
+        coordinator = MagicMock()
+        coordinator.maybe_prepare_initial_session.return_value = InteractionChunkMetadata(
+            started_event_ids=[],
+            active_event_ids=[],
+            completed_event_ids=[],
+        )
+        runner._interaction_coordinator = coordinator
+        monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+        # Peer failed during prepare_encode; this rank's local encode succeeds.
+        monkeypatch.setattr(
+            model_runner_module,
+            "_dit_any_rank_failed",
+            lambda local_failed: True,
+        )
+
+        req = _make_step_request(num_inference_steps=1)
+        result = DiffusionModelRunner.execute_stepwise(runner, _make_scheduler_output(req))
+
+        output = result.get_request_output("req-1")
+        assert output.finished is True
+        assert output.result is not None
+        assert "another DiT rank" in (output.result.error or "")
+        assert pipeline.prepare_calls == 1
+        coordinator.maybe_prepare_initial_session.assert_not_called()
+        assert pipeline.prepare_next_chunk_calls == 0
+        assert pipeline.denoise_calls == 0
+        assert runner.state_cache == {}
 
     def test_receives_kv_payload_before_prepare_encode(self, monkeypatch):
         runner = _make_runner()
@@ -715,7 +1190,11 @@ class TestRunner:
 
         monkeypatch.setattr(model_runner_module, "DiffusersPipelineLoader", _FakeLoader)
         monkeypatch.setattr(model_runner_module, "DeviceMemoryProfiler", _FakeProfiler)
-        monkeypatch.setattr(model_runner_module, "get_offload_backend", lambda *args, **kwargs: None)
+        monkeypatch.setattr(
+            model_runner_module,
+            "enable_offload_backend",
+            lambda _config, pipeline, **_kwargs: (pipeline, None),
+        )
         monkeypatch.setattr(model_runner_module, "get_cache_backend", lambda *args, **kwargs: None)
 
         with pytest.raises(ValueError, match="RequestOnlyPipeline"):
@@ -1014,7 +1493,7 @@ class TestSupportedPipelines:
     """Step-execution protocol checks for supported pipelines."""
 
     def test_default_stage_config_includes_step_execution(self):
-        stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg(
+        stage_cfg = StageConfigFactory.create_default_diffusion(
             {
                 "step_execution": True,
             }

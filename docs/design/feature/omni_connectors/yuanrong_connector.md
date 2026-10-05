@@ -65,23 +65,22 @@ dscli stop --worker_address "${WORKER_IP}:31501"
 
 ## Configuration
 
-Define the connector in runtime:
+Define the connector at the top level of the deploy YAML:
 
 ```yaml
-runtime:
-  connectors:
-    connector_of_yuanrong:
-      name: YuanrongConnector
-      extra:
-        host: "127.0.0.1"
-        port: 31501
-        get_sub_timeout_ms: 1000
+connectors:
+  connector_of_yuanrong:
+    name: YuanrongConnector
+    extra:
+      host: "127.0.0.1"
+      port: 31501
+      get_sub_timeout_ms: 1000
 ```
 
 Wire stages to the connector:
 
 ```yaml
-stage_args:
+stages:
   - stage_id: 0
     output_connectors:
       to_stage_1: connector_of_yuanrong

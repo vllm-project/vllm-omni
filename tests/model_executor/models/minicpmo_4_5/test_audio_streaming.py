@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from dataclasses import dataclass
 
 import pytest
@@ -189,6 +192,7 @@ def test_streaming_audio_reuses_cache_across_chunks() -> None:
     assert second_call.suffix_extra_frames == 2
     assert second_call.cnn_min_length == 8
 
+    assert model.audio_past_key_values is not None
     assert model.audio_past_key_values is not first_cache
     assert first_cache[0][0].shape[2] == 2
     assert model.audio_past_key_values[0][0].shape[2] == 3

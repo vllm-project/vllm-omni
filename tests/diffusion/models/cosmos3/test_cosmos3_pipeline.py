@@ -1,13 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
+import json
 import sys
 import types
+from contextlib import contextmanager
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import Mock
 
 import numpy as np
 import pytest
@@ -21,6 +24,20 @@ from vllm_omni.experimental.world_models.session_state import SessionStateManage
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
 
+@pytest.mark.parametrize(
+    ("alias", "canonical_name"),
+    [
+        ("galbot", "embodiment_b"),
+        ("agibot_gear_gripper", "embodiment_c_gripper"),
+        ("agibot_gear_gripper_ext", "embodiment_c_gripper_ext"),
+    ],
+)
+def test_action_domain_table_preserves_legacy_aliases(alias: str, canonical_name: str) -> None:
+    from vllm_omni.diffusion.models.cosmos3.action import resolve_domain_id
+
+    assert resolve_domain_id(domain_name=alias) == resolve_domain_id(domain_name=canonical_name)
+
+
 def test_pipeline_declares_layerwise_offload_components() -> None:
     from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import Cosmos3OmniDiffusersPipeline
 
@@ -29,6 +46,42 @@ def test_pipeline_declares_layerwise_offload_components() -> None:
     assert Cosmos3OmniDiffusersPipeline._vae_modules == ["vae"]
     assert Cosmos3OmniDiffusersPipeline._resident_modules == []
     assert hasattr(Cosmos3OmniDiffusersPipeline, "enable_omni_model_cpu_offload")
+
+    from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3 import (
+        Cosmos3LanguageModel,
+        Cosmos3VFMTransformer,
+    )
+
+    assert Cosmos3LanguageModel._layerwise_offload_blocks_attrs == ["layers"]
+    assert Cosmos3VFMTransformer._layerwise_offload_blocks_attrs == ["gen_layers"]
+
+
+def test_component_selective_model_offload_fails_before_component_loading(monkeypatch) -> None:
+    from vllm_omni.diffusion.models.cosmos3 import pipeline_cosmos3 as pipeline_module
+
+    monkeypatch.setattr(
+        pipeline_module,
+        "get_local_device",
+        lambda: pytest.fail("component loading must not start for an unsupported selector"),
+    )
+    config = SimpleNamespace(
+        diffusion_offload_config={"mode": "module", "components": ["dit"]},
+        enable_cpu_offload=False,
+        enable_layerwise_offload=False,
+        enable_distributed_layerwise_offload=False,
+        dlo_use_allgather=True,
+        dlo_resident_layers=0,
+        pin_cpu_memory=True,
+    )
+
+    with pytest.raises(ValueError, match="does not support the dit/text_encoder component selector"):
+        pipeline_module.Cosmos3OmniDiffusersPipeline(od_config=config)
+
+
+def test_sampling_dtype_defaults_to_float32() -> None:
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import Cosmos3OmniDiffusersPipeline
+
+    assert Cosmos3OmniDiffusersPipeline.sampling_dtype == torch.float32
 
 
 class StubScheduler:
@@ -39,6 +92,7 @@ class StubScheduler:
         flow_shift: float = 1.0,
     ) -> None:
         self.timesteps = torch.tensor(timesteps or [9, 3], dtype=torch.int64)
+        self.sigmas = self.timesteps.float() / 10
         self.config = SimpleNamespace(
             num_train_timesteps=1000,
             flow_shift=flow_shift,
@@ -67,6 +121,7 @@ class StubScheduler:
         else:
             assert num_inference_steps is not None
             self.timesteps = torch.arange(num_inference_steps, 0, -1, dtype=torch.int64, device=device)
+        self.sigmas = self.timesteps.float()
 
     def step(self, noise_pred: torch.Tensor, timestep: torch.Tensor, latents: torch.Tensor, **kwargs):
         del kwargs
@@ -179,6 +234,7 @@ class StubCosmos3Transformer(nn.Module):
             {
                 "token": token,
                 "has_control": control_latents is not None,
+                "hidden_states_dtype": hidden_states.dtype,
                 "timestep": timestep.clone(),
                 "text_mask": text_mask.clone(),
                 "cache_before": self.cached_kv,
@@ -204,7 +260,7 @@ def passthrough_progress_bar(iterable):
 
 @pytest.fixture(autouse=True)
 def fake_cosmos3_guardrails(monkeypatch: pytest.MonkeyPatch):
-    module = types.ModuleType("vllm_omni.diffusion.models.cosmos3.guardrails")
+    module: Any = types.ModuleType("vllm_omni.diffusion.models.cosmos3.guardrails")
     module.is_guardrails_enabled = lambda od_config, sampling_params=None: False
     module.ensure_initialized = lambda od_config: None
     module.check_text_safety = lambda text: None
@@ -237,6 +293,8 @@ def make_cosmos3_pipeline():
         pipeline.is_edge_model = False
         pipeline._guidance_scale = None
         pipeline._num_timesteps = None
+        pipeline._current_step_index = None
+        pipeline._current_sigma = None
         pipeline._cosmos3_branch_caches = None
         pipeline._cache_dit_requires_paired_cfg = False
         pipeline._sound_tokenizer = None
@@ -254,7 +312,7 @@ def sequential_cfg_parallel(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def make_sampling_params(**overrides: Any) -> SimpleNamespace:
-    values = {
+    values: dict[str, Any] = {
         "height": None,
         "width": None,
         "num_frames": None,
@@ -331,23 +389,31 @@ def _capture_tokenize_calls(pipeline: Any) -> list[dict[str, Any]]:
 
 
 @pytest.mark.parametrize(
-    ("provided", "value", "default", "is_distilled", "expected"),
+    ("provided", "value", "default", "is_distilled", "expected", "expected_warning"),
     [
-        (False, 1.0, 7.0, False, 7.0),
-        (True, 1.0, 7.0, False, 1.0),
-        (True, 4.5, 7.0, False, 4.5),
-        (False, 1.0, 7.0, True, 1.0),
-        (True, 4.5, 7.0, True, 1.0),
+        (False, 1.0, 7.0, False, 7.0, False),
+        (True, 1.0, 7.0, False, 1.0, False),
+        (True, 4.5, 7.0, False, 4.5, False),
+        (False, 1.0, 7.0, True, 1.0, False),
+        (True, 1.0, 7.0, True, 1.0, False),
+        (True, 4.5, 7.0, True, 1.0, True),
+        (True, 0.0, 7.0, True, 1.0, True),
     ],
 )
 def test_resolve_guidance_scale(
     make_cosmos3_pipeline,
+    monkeypatch: pytest.MonkeyPatch,
     provided: bool,
     value: float,
     default: float,
     is_distilled: bool,
     expected: float,
+    expected_warning: bool,
 ) -> None:
+    from vllm_omni.diffusion.models.cosmos3 import pipeline_cosmos3
+
+    warning_once = Mock()
+    monkeypatch.setattr(pipeline_cosmos3.logger, "warning_once", warning_once)
     pipeline = make_cosmos3_pipeline()
     pipeline.is_distilled_model = is_distilled
     sp = make_sampling_params(
@@ -356,6 +422,12 @@ def test_resolve_guidance_scale(
     )
 
     assert pipeline._resolve_guidance_scale(sp, default) == expected
+    if expected_warning:
+        warning_once.assert_called_once()
+        assert "overridden to 1.0" in warning_once.call_args.args[0]
+        assert "negative_prompt does not affect generation" in warning_once.call_args.args[0]
+    else:
+        warning_once.assert_not_called()
 
 
 def test_distilled_generation_accepts_t2i_and_i2v(make_cosmos3_pipeline) -> None:
@@ -447,6 +519,69 @@ def test_forward_threads_request_id_to_robolab(make_cosmos3_pipeline) -> None:
 
     assert pipeline.forward(request) is expected
     assert captured["session_id"] == "robolab-request-7"
+
+
+@pytest.mark.parametrize("format_prompt_as_json", [False, True])
+def test_robolab_input_builder_threads_prompt_format_and_uses_wam(
+    make_cosmos3_pipeline,
+    monkeypatch: pytest.MonkeyPatch,
+    format_prompt_as_json: bool,
+) -> None:
+    from vllm_omni.diffusion.models.cosmos3 import pipeline_cosmos3
+
+    pipeline = make_cosmos3_pipeline()
+    pipeline.transformer = StubCosmos3Transformer(action_gen=True, action_dim=64)
+    captured: dict[str, Any] = {}
+
+    def fake_transform(sample, resolution):
+        captured["sample_mode"] = sample["mode"]
+        captured["resolution"] = resolution
+        sample["sequence_plan"] = SimpleNamespace(
+            condition_frame_indexes_action=[0],
+            action_start_frame_offset=1,
+        )
+        sample["raw_action_dim"] = torch.tensor(8)
+        sample["image_size"] = torch.tensor([16, 16, 16, 16])
+        if format_prompt_as_json:
+            sample["ai_caption"] = {"actions": {"instruction": sample["ai_caption"]}}
+        return sample
+
+    def fake_get_transform(*, format_prompt_as_json: bool):
+        captured["format_prompt_as_json"] = format_prompt_as_json
+        return fake_transform
+
+    pipeline._get_robolab_transform = fake_get_transform
+    monkeypatch.setattr(pipeline_cosmos3, "get_robolab_domain_id", lambda name: 8)
+    obs = {
+        "prompt": "Pick up the cube.",
+        "observation/image": np.zeros((16, 16, 3), dtype=np.uint8),
+        "observation/joint_position": np.zeros(7, dtype=np.float32),
+        "observation/gripper_position": np.zeros(1, dtype=np.float32),
+    }
+    sampling_params = make_sampling_params(
+        extra_args={
+            "robot_obs": obs,
+            "action_chunk_size": 2,
+            "image_height": 16,
+            "image_width": 16,
+            "format_prompt_as_json": format_prompt_as_json,
+        }
+    )
+
+    inputs = pipeline._build_robolab_policy_inputs(sampling_params, request_id="request-1")
+
+    assert inputs is not None
+    assert captured == {
+        "sample_mode": "wam",
+        "resolution": "480",
+        "format_prompt_as_json": format_prompt_as_json,
+    }
+    assert inputs.domain_id == 8
+    assert inputs.raw_action_dim == 8
+    if format_prompt_as_json:
+        assert json.loads(inputs.prompt) == {"actions": {"instruction": "Pick up the cube."}}
+    else:
+        assert inputs.prompt == "Pick up the cube."
 
 
 @pytest.mark.parametrize(
@@ -627,6 +762,7 @@ def _make_od_config(
         custom_pipeline_args={},
         model_config=model_config or {},
         tf_model_config=tf_model_config,
+        parallel_config=SimpleNamespace(cfg_parallel_size=1, ulysses_degree=1),
     )
 
 
@@ -662,6 +798,7 @@ def test_pipeline_init_uses_flow_unipc_with_cosmos3_defaults(stub_real_pipeline_
     assert pipeline._engine_init_flow_shift == 2.5
 
 
+@pytest.mark.parametrize("cfg_parallel_size,ulysses_degree", [(1, 1), (1, 2), (2, 1), (2, 2)])
 @pytest.mark.parametrize(
     ("scheduler_class_name", "expected_distilled"),
     [
@@ -675,6 +812,8 @@ def test_pipeline_resolves_scheduler_class_from_checkpoint_file(
     monkeypatch: pytest.MonkeyPatch,
     scheduler_class_name: str,
     expected_distilled: bool,
+    cfg_parallel_size: int,
+    ulysses_degree: int,
 ) -> None:
     import json
 
@@ -687,7 +826,7 @@ def test_pipeline_resolves_scheduler_class_from_checkpoint_file(
     t_list = [1.0, 0.75, 0.5, 0.25]
     scheduler_dir = tmp_path / "scheduler"
     scheduler_dir.mkdir()
-    scheduler_config = {"_class_name": scheduler_class_name}
+    scheduler_config: dict[str, Any] = {"_class_name": scheduler_class_name}
     if expected_distilled:
         scheduler_config["fixed_step_sampler_config"] = {"sample_type": "sde", "t_list": t_list}
     (scheduler_dir / "scheduler_config.json").write_text(json.dumps(scheduler_config))
@@ -723,6 +862,20 @@ def test_pipeline_resolves_scheduler_class_from_checkpoint_file(
 
     od_config = _make_od_config(sound_gen=False)
     od_config.model = str(tmp_path)
+    od_config.parallel_config.cfg_parallel_size = cfg_parallel_size
+    od_config.parallel_config.ulysses_degree = ulysses_degree
+    if expected_distilled and cfg_parallel_size > 1:
+        monkeypatch.setattr(
+            pipeline_cosmos3.AutoTokenizer,
+            "from_pretrained",
+            lambda *args, **kwargs: pytest.fail("component loading must not start for distilled CFG parallelism"),
+        )
+        with pytest.raises(ValueError, match="Set --cfg-parallel-size 1 and use --ulysses-degree"):
+            Cosmos3OmniDiffusersPipeline(od_config=od_config)
+        assert StubFlowMatchScheduler.from_config_calls == []
+        assert StubFlowUniPCScheduler.from_config_calls == []
+        return
+
     pipeline = Cosmos3OmniDiffusersPipeline(od_config=od_config)
 
     assert pipeline.is_distilled_model is expected_distilled
@@ -975,7 +1128,7 @@ def test_pipeline_init_passes_tokenizer_attrs_into_transformer(
 def test_preprocess_i2v_image_and_action_video_inputs() -> None:
     from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import get_cosmos3_pre_process_func
 
-    preprocess = get_cosmos3_pre_process_func(SimpleNamespace())
+    preprocess = get_cosmos3_pre_process_func(SimpleNamespace(model_config={"guardrails": False}, tf_model_config=None))
     i2v = SimpleNamespace(
         prompt={"prompt": "A slow camera push.", "multi_modal_data": {"image": Image.new("RGB", (320, 160))}},
         sampling_params=make_sampling_params(height=None, width=None, extra_args={}),
@@ -1009,6 +1162,130 @@ def test_preprocess_i2v_image_and_action_video_inputs() -> None:
     assert additional["condition_frame_indexes_vision"] == [0, 1]
 
 
+def test_preprocess_v2v_decodes_uploaded_video_path(tmp_path) -> None:
+    """Serving may pass multipart uploads as /tmp/...mp4 path lists (#8073)."""
+    imageio = pytest.importorskip("imageio.v3")
+
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import get_cosmos3_pre_process_func
+
+    frames = [np.full((16, 32, 3), i * 40, dtype=np.uint8) for i in range(6)]
+    video_path = tmp_path / "vllm_omni_video_reference_test.mp4"
+    imageio.imwrite(video_path, frames, fps=4, codec="libx264")
+
+    preprocess = get_cosmos3_pre_process_func(SimpleNamespace(model_config={"guardrails": False}, tf_model_config=None))
+    request = SimpleNamespace(
+        prompt={"prompt": "Continue.", "multi_modal_data": {"video": [str(video_path)]}},
+        sampling_params=make_sampling_params(
+            height=16,
+            width=32,
+            extra_args={"condition_frame_indexes_vision": [0, 1], "condition_video_keep": "first"},
+        ),
+    )
+
+    additional = preprocess(request).prompt["additional_information"]
+    # condition_frame_indexes_vision=[0,1] => 5 pixel frames after VAE indexing.
+    assert tuple(additional["preprocessed_video"].shape) == (1, 3, 5, 16, 32)
+    assert additional["condition_frame_indexes_vision"] == [0, 1]
+
+
+def test_decode_path_video_frames_honors_max_frames_and_keep(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    pytest.importorskip("imageio.v3")
+    import imageio.v3 as iio
+
+    from vllm_omni.diffusion.utils.video_decode import decode_path_video_frames
+
+    source = tmp_path / "clip.mp4"
+    source.write_bytes(b"placeholder")
+    seen = {"n": 0}
+
+    def fake_imiter(_path):
+        for idx in range(20):
+            seen["n"] += 1
+            yield np.full((4, 4, 3), idx, dtype=np.uint8)
+
+    monkeypatch.setattr(iio, "imiter", fake_imiter)
+
+    first = decode_path_video_frames(source, max_frames=5, keep="first")
+    assert len(first) == 5
+    assert seen["n"] == 5
+    assert first[0][0, 0, 0] == 0
+    assert first[-1][0, 0, 0] == 4
+
+    seen["n"] = 0
+    last = decode_path_video_frames(source, max_frames=5, keep="last")
+    assert len(last) == 5
+    assert seen["n"] == 20
+    assert last[0][0, 0, 0] == 15
+    assert last[-1][0, 0, 0] == 19
+
+
+def test_preprocess_v2v_video_path_honors_prompt_level_keep_and_indexes(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pytest.importorskip("imageio.v3")
+    import imageio.v3 as iio
+
+    from vllm_omni.diffusion.models.cosmos3 import pipeline_cosmos3 as cosmos_pipeline
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import get_cosmos3_pre_process_func
+    from vllm_omni.diffusion.utils.video_decode import decode_path_video_frames
+
+    source = tmp_path / "vllm_omni_video_reference_prompt.mp4"
+    source.write_bytes(b"placeholder")
+    captured: dict[str, Any] = {}
+
+    def fake_imiter(_path):
+        for idx in range(20):
+            yield np.full((16, 32, 3), idx, dtype=np.uint8)
+
+    def spy_decode(*args, **kwargs):
+        frames = decode_path_video_frames(*args, **kwargs)
+        captured["keep"] = kwargs.get("keep")
+        captured["max_frames"] = kwargs.get("max_frames")
+        captured["n"] = len(frames)
+        captured["first"] = int(frames[0][0, 0, 0])
+        captured["last"] = int(frames[-1][0, 0, 0])
+        return frames
+
+    monkeypatch.setattr(iio, "imiter", fake_imiter)
+    monkeypatch.setattr(cosmos_pipeline, "decode_path_video_frames", spy_decode)
+
+    preprocess = get_cosmos3_pre_process_func(SimpleNamespace(model_config={"guardrails": False}, tf_model_config=None))
+    last_keep = SimpleNamespace(
+        prompt={
+            "prompt": "Continue.",
+            "condition_video_keep": "last",
+            "condition_frame_indexes_vision": [0, 1],
+            "multi_modal_data": {"video": [str(source)]},
+        },
+        sampling_params=make_sampling_params(height=16, width=32, extra_args={}),
+    )
+    additional = preprocess(last_keep).prompt["additional_information"]
+    assert captured["keep"] == "last"
+    assert captured["max_frames"] == 5
+    assert captured["n"] == 5
+    assert captured["first"] == 15
+    assert captured["last"] == 19
+    assert tuple(additional["preprocessed_video"].shape) == (1, 3, 5, 16, 32)
+    assert additional["condition_frame_indexes_vision"] == [0, 1]
+
+    wider_indexes = SimpleNamespace(
+        prompt={
+            "prompt": "Continue.",
+            "condition_frame_indexes_vision": [0, 1, 2],
+            "multi_modal_data": {"video": [str(source)]},
+        },
+        sampling_params=make_sampling_params(height=16, width=32, extra_args={}),
+    )
+    additional = preprocess(wider_indexes).prompt["additional_information"]
+    assert captured["keep"] == "first"
+    assert captured["max_frames"] == 9
+    assert captured["n"] == 9
+    assert captured["first"] == 0
+    assert captured["last"] == 8
+    assert tuple(additional["preprocessed_video"].shape) == (1, 3, 9, 16, 32)
+    assert additional["condition_frame_indexes_vision"] == [0, 1, 2]
+
+
 def test_transfer_config_media_helpers_and_preprocess_budget(monkeypatch: pytest.MonkeyPatch) -> None:
     from vllm_omni.diffusion.models.cosmos3 import transfer
     from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import (
@@ -1019,11 +1296,19 @@ def test_transfer_config_media_helpers_and_preprocess_budget(monkeypatch: pytest
     cfg = transfer.resolve_transfer_config(make_sampling_params(extra_args={"edge": True}))
     assert cfg is not None
     assert list(cfg.hints) == ["edge"]
+    assert cfg.hints["edge"].control_weight == 1.0
+    assert cfg.normalized_control_weights == [1.0]
     assert cfg.guidance_scale == 3.0
     assert cfg.control_guidance == 1.5
     assert cfg.flow_shift == 10.0
     assert cfg.num_video_frames_per_chunk == 93
     assert cfg.share_vision_temporal_positions is True
+    assert cfg.emphasize_control_in_prompt is True
+    prompt_ablation_cfg = transfer.resolve_transfer_config(
+        make_sampling_params(extra_args={"edge": True, "emphasize_control_in_prompt": False})
+    )
+    assert prompt_ablation_cfg is not None
+    assert prompt_ablation_cfg.emphasize_control_in_prompt is False
     # fps omitted (no fps/frame_rate on the sampling params) -> wsm preset default (10) applies.
     defaulted_fps_cfg = transfer.resolve_transfer_config(make_sampling_params(extra_args={"wsm": True}))
     assert defaulted_fps_cfg is not None
@@ -1070,7 +1355,7 @@ def test_transfer_config_media_helpers_and_preprocess_budget(monkeypatch: pytest
     )
     assert tuple(loaded.shape) == (3, 2, 8, 8)
 
-    preprocess = get_cosmos3_pre_process_func(SimpleNamespace())
+    preprocess = get_cosmos3_pre_process_func(SimpleNamespace(model_config={"guardrails": False}, tf_model_config=None))
 
     class FramesWithFps(list):
         fps = 12.5
@@ -1087,9 +1372,44 @@ def test_transfer_config_media_helpers_and_preprocess_budget(monkeypatch: pytest
     )
     additional = preprocess(request).prompt["additional_information"]
     assert (request.sampling_params.height, request.sampling_params.width) == (192, 320)
+    assert request.sampling_params.extra_args["_cosmos3_transfer_requested_size"] == {"width": 32, "height": 16}
     assert tuple(additional["preprocessed_transfer_video"].shape) == (1, 3, 4, 192, 320)
     assert additional["transfer_input_fps"] == 12.5
     assert "preprocessed_video" not in additional
+
+
+def test_transfer_control_weight_validation_and_normalization() -> None:
+    from vllm_omni.diffusion.models.cosmos3 import transfer
+
+    single = transfer.resolve_transfer_config(make_sampling_params(extra_args={"edge": {"control_weight": 0.4}}))
+    assert single is not None
+    assert single.hints["edge"].control_weight == 0.4
+    assert single.normalized_control_weights == [1.0]
+
+    multiple = transfer.resolve_transfer_config(
+        make_sampling_params(
+            extra_args={
+                "edge": {"control_weight": 1.0},
+                "depth": {"control_weight": 3.0, "control": torch.zeros(3, 1, 8, 8, dtype=torch.uint8)},
+            }
+        )
+    )
+    assert multiple is not None
+    assert multiple.normalized_control_weights == [0.25, 0.75]
+
+    with pytest.raises(ValueError, match="Unsupported.*weight"):
+        transfer.resolve_transfer_config(make_sampling_params(extra_args={"edge": {"weight": 0.5}}))
+    with pytest.raises(ValueError, match="finite and non-negative"):
+        transfer.resolve_transfer_config(make_sampling_params(extra_args={"edge": {"control_weight": -0.5}}))
+    with pytest.raises(ValueError, match="positive sum"):
+        transfer.resolve_transfer_config(
+            make_sampling_params(
+                extra_args={
+                    "edge": {"control_weight": 0.0},
+                    "depth": {"control_weight": 0.0, "control": torch.zeros(3, 1, 8, 8, dtype=torch.uint8)},
+                }
+            )
+        )
 
 
 def test_transfer_fps_matches_resolved_frame_rate_precedence() -> None:
@@ -1105,6 +1425,87 @@ def test_transfer_fps_matches_resolved_frame_rate_precedence() -> None:
     assert cfg is not None
     # edge has no preset fps default, so cfg.fps comes straight from fps resolution.
     assert cfg.fps == sp.resolved_frame_rate == 12.0
+
+
+@pytest.mark.parametrize("use_path", [False, True], ids=["image", "path"])
+def test_transfer_pil_conversion_returns_writable_array(tmp_path, use_path: bool) -> None:
+    from vllm_omni.diffusion.models.cosmos3 import transfer
+
+    image = Image.new("RGB", (5, 4), "red")
+    value = image
+    if use_path:
+        value = tmp_path / "control.png"
+        image.save(value)
+
+    array = transfer._pil_to_uint8_rgb(value)
+
+    assert array.flags.writeable
+
+
+def test_transfer_vae_executor_requires_distributed_vae() -> None:
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import Cosmos3OmniDiffusersPipeline
+
+    pipeline = object.__new__(Cosmos3OmniDiffusersPipeline)
+    executor = object()
+    pipeline.vae = SimpleNamespace(distributed_executor=executor, is_distributed_enabled=lambda: True)
+    assert pipeline._transfer_vae_executor() is executor
+
+    pipeline.vae = SimpleNamespace(distributed_executor=executor, is_distributed_enabled=lambda: False)
+    assert pipeline._transfer_vae_executor() is None
+
+
+def test_sync_transfer_overlap_slices_output_rank_and_broadcasts() -> None:
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import Cosmos3OmniDiffusersPipeline
+
+    class RecordingExecutor:
+        rank = 0
+
+        def __init__(self) -> None:
+            self.value = None
+
+        def broadcast_tensor(self, value):
+            self.value = value
+            return value
+
+    pipeline = object.__new__(Cosmos3OmniDiffusersPipeline)
+    output = torch.arange(1 * 3 * 5 * 2 * 2).reshape(1, 3, 5, 2, 2)
+    executor = RecordingExecutor()
+
+    overlap = pipeline._sync_transfer_overlap(
+        output,
+        overlap_frames=2,
+        reference_video=output,
+        vae_executor=executor,
+    )
+
+    assert overlap is not None
+    torch.testing.assert_close(overlap, output[:, :, -2:])
+    assert executor.value is overlap
+
+
+def test_sync_transfer_overlap_allocates_receive_buffer_on_non_output_rank() -> None:
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import Cosmos3OmniDiffusersPipeline
+
+    class ReceivingExecutor:
+        rank = 1
+
+        def broadcast_tensor(self, value):
+            assert value.shape == (1, 3, 2, 4, 5)
+            return torch.ones_like(value)
+
+    pipeline = SimpleNamespace(device=torch.device("cpu"), vae=SimpleNamespace(dtype=torch.float32))
+    reference = torch.zeros(1, 3, 6, 4, 5)
+
+    overlap = Cosmos3OmniDiffusersPipeline._sync_transfer_overlap(
+        pipeline,
+        torch.empty(0),
+        overlap_frames=2,
+        reference_video=reference,
+        vae_executor=ReceivingExecutor(),
+    )
+
+    assert overlap is not None
+    assert torch.equal(overlap, torch.ones_like(overlap))
 
 
 def test_transfer_edge_uses_rgb_canny(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1266,7 +1667,7 @@ def test_ir_op_priority_hook_preserves_platform_fields(monkeypatch: pytest.Monke
         fused_add_rms_norm: list[str]
         custom_op: list[str]
 
-    fake_kernel = types.ModuleType("vllm.config.kernel")
+    fake_kernel: Any = types.ModuleType("vllm.config.kernel")
     fake_kernel.IrOpPriorityConfig = FakeIrOpPriorityConfig
     monkeypatch.setitem(sys.modules, fake_kernel.__name__, fake_kernel)
 
@@ -1352,6 +1753,63 @@ def test_format_and_tokenize_prompts_applies_video_templates_and_system_override
     ]
 
 
+def test_format_and_tokenize_prompts_applies_transfer_prompt_contract(make_cosmos3_pipeline) -> None:
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import (
+        COSMOS3_TRANSFER_CONTROL_DIRECTIVE_TEMPLATE,
+        COSMOS3_TRANSFER_SYSTEM_PROMPT,
+    )
+
+    pipeline = make_cosmos3_pipeline()
+    calls = _capture_tokenize_calls(pipeline)
+    directive = COSMOS3_TRANSFER_CONTROL_DIRECTIVE_TEMPLATE.format(hint_names="edge")
+
+    pipeline._format_and_tokenize_prompts(
+        "A robot",
+        "bad",
+        num_frames=48,
+        frame_rate=24,
+        height=720,
+        width=1280,
+        max_sequence_length=32,
+        sp=SimpleNamespace(
+            extra_args={
+                "use_resolution_template": True,
+                "system_prompt": "request-level system prompt",
+            }
+        ),
+        use_system_prompt=True,
+        is_t2i=False,
+        system_prompt=COSMOS3_TRANSFER_SYSTEM_PROMPT,
+        prompt_suffix=directive,
+        use_duration_template=True,
+        use_resolution_template=True,
+        negative_metadata_mode="same",
+    )
+
+    metadata = "The video is 2.0 seconds long and is of 24 FPS. This video is of 720x1280 resolution."
+    assert calls[0]["text"] == f"A robot. {metadata} {directive}"
+    assert calls[1]["text"] == f"bad. {metadata}"
+    assert all(call["use_system_prompt"] is True for call in calls)
+    assert all(call["system_prompt"] == COSMOS3_TRANSFER_SYSTEM_PROMPT for call in calls)
+
+
+def test_format_and_tokenize_prompts_rejects_unknown_negative_metadata_mode(make_cosmos3_pipeline) -> None:
+    pipeline = make_cosmos3_pipeline()
+
+    with pytest.raises(ValueError, match="negative_metadata_mode"):
+        pipeline._format_and_tokenize_prompts(
+            "A robot",
+            "bad",
+            num_frames=48,
+            frame_rate=24,
+            height=720,
+            width=1280,
+            max_sequence_length=32,
+            sp=SimpleNamespace(extra_args={}),
+            negative_metadata_mode="unexpected",
+        )
+
+
 def test_format_and_tokenize_prompts_uses_image_templates_for_t2i(make_cosmos3_pipeline) -> None:
     from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import COSMOS3_T2I_SYSTEM_PROMPT
 
@@ -1418,6 +1876,140 @@ def test_format_and_tokenize_prompts_rewrites_json_object_metadata(make_cosmos3_
     assert "The video is 2.0 seconds long" not in calls[0]["text"]
     assert calls[1]["text"] == (
         "bad. The video is not 2.0 seconds long and is not of 24 FPS. This video is not of 720x1280 resolution."
+    )
+
+
+def test_format_and_tokenize_prompts_transfer_aspect_ratio_override(make_cosmos3_pipeline) -> None:
+    import json
+
+    pipeline = make_cosmos3_pipeline()
+    calls = _capture_tokenize_calls(pipeline)
+
+    pipeline._format_and_tokenize_prompts(
+        '{"caption": "A robot", "aspect_ratio": "4,3"}',
+        "",
+        num_frames=48,
+        frame_rate=24,
+        height=480,
+        width=832,
+        max_sequence_length=32,
+        sp=SimpleNamespace(extra_args={"aspect_ratio": "4:3"}),
+        is_t2i=False,
+        aspect_ratio_override="16,9",
+    )
+
+    assert json.loads(calls[0]["text"])["aspect_ratio"] == "16,9"
+
+
+@pytest.mark.parametrize("rank_zero", [True, False])
+def test_format_and_tokenize_prompts_corrects_conflicting_aspect_ratio_metadata_on_every_rank(
+    make_cosmos3_pipeline,
+    monkeypatch: pytest.MonkeyPatch,
+    mocker,
+    rank_zero: bool,
+) -> None:
+    import json
+
+    from vllm_omni.diffusion.models.cosmos3 import pipeline_cosmos3
+
+    pipeline = make_cosmos3_pipeline()
+    calls = _capture_tokenize_calls(pipeline)
+    monkeypatch.setattr(pipeline_cosmos3, "_is_rank_zero", lambda: rank_zero)
+    warning = mocker.patch.object(pipeline_cosmos3.logger, "warning")
+
+    pipeline._format_and_tokenize_prompts(
+        '{"caption": "A robot", "aspect_ratio": "4,3"}',
+        "",
+        num_frames=48,
+        frame_rate=24,
+        height=720,
+        width=1280,
+        max_sequence_length=32,
+        sp=SimpleNamespace(extra_args={}),
+        is_t2i=False,
+    )
+
+    assert json.loads(calls[0]["text"])["aspect_ratio"] == "16,9"
+    if rank_zero:
+        rendered_warning = warning.call_args.args[0] % warning.call_args.args[1:]
+        assert "JSON prompt aspect_ratio='4,3' conflicts with the generated 1280x720 canvas" in rendered_warning
+    else:
+        warning.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("width", "height", "aspect_ratio"),
+    [
+        (1104, 816, "4,3"),
+        (832, 468, "16,9"),
+    ],
+)
+def test_format_and_tokenize_prompts_keeps_nearest_canonical_aspect_ratio(
+    make_cosmos3_pipeline,
+    mocker,
+    width: int,
+    height: int,
+    aspect_ratio: str,
+) -> None:
+    import json
+
+    from vllm_omni.diffusion.models.cosmos3 import pipeline_cosmos3
+
+    pipeline = make_cosmos3_pipeline()
+    calls = _capture_tokenize_calls(pipeline)
+    warning = mocker.patch.object(pipeline_cosmos3.logger, "warning")
+
+    pipeline._format_and_tokenize_prompts(
+        json.dumps({"caption": "A robot", "aspect_ratio": aspect_ratio}),
+        "",
+        num_frames=48,
+        frame_rate=24,
+        height=height,
+        width=width,
+        max_sequence_length=32,
+        sp=SimpleNamespace(extra_args={}),
+        is_t2i=False,
+    )
+
+    assert json.loads(calls[0]["text"])["aspect_ratio"] == aspect_ratio
+    warning.assert_not_called()
+
+
+def test_transfer_bucket_selection_warns_on_size_and_aspect_ratio_conflicts(
+    make_cosmos3_pipeline,
+    mocker,
+) -> None:
+    from vllm_omni.diffusion.models.cosmos3 import pipeline_cosmos3
+
+    pipeline = make_cosmos3_pipeline()
+    warning = mocker.patch.object(pipeline_cosmos3.logger, "warning")
+    sp = make_sampling_params(
+        width=832,
+        height=480,
+        extra_args={
+            "resolution": "480",
+            "aspect_ratio": "4:3",
+            "_cosmos3_transfer_requested_size": {"width": 1280, "height": 720},
+        },
+    )
+
+    height, width, aspect_ratio = pipeline._transfer_bucket_size(sp, (480, 832))
+    assert (height, width, aspect_ratio) == (480, 832, "16,9")
+
+    pipeline._warn_transfer_bucket_conflicts(
+        sp,
+        "A transfer prompt",
+        source_hw=(480, 832),
+        height=height,
+        width=width,
+        aspect_ratio=aspect_ratio,
+    )
+
+    rendered_warnings = [call.args[0] % call.args[1:] for call in warning.call_args_list]
+    assert any("ignores requested size=1280x720 (WxH)" in message for message in rendered_warnings)
+    assert any(
+        "requested aspect_ratio='4:3' conflicts with the control-selected 16,9 bucket" in message
+        for message in rendered_warnings
     )
 
 
@@ -1564,6 +2156,43 @@ def test_prepare_latents_for_video_image_sound_and_action(make_cosmos3_pipeline)
     torch.testing.assert_close(action, clean)
 
 
+def test_sampling_state_casts_transformer_execution_to_model_dtype(make_cosmos3_pipeline) -> None:
+    pipeline = make_cosmos3_pipeline()
+    pipeline.dtype = torch.bfloat16
+
+    latents = pipeline._prepare_latents(16, 24, 5, torch.Generator(device="cpu").manual_seed(0))
+    assert pipeline.sampling_dtype == torch.float32
+    assert latents.dtype == torch.float32
+
+    prediction = pipeline.predict_noise(
+        hidden_states=latents,
+        timestep=torch.tensor([1]),
+        text_ids=_ids(2),
+        text_mask=_mask(),
+    )
+
+    assert pipeline.transformer.calls[-1]["hidden_states_dtype"] == torch.bfloat16
+    assert prediction.dtype == torch.float32
+
+
+def test_sampling_dtype_can_use_model_dtype(make_cosmos3_pipeline) -> None:
+    pipeline = make_cosmos3_pipeline()
+    pipeline.dtype = torch.bfloat16
+    pipeline.sampling_dtype = pipeline.dtype
+
+    latents = pipeline._prepare_latents(16, 24, 5, torch.Generator(device="cpu").manual_seed(0))
+    prediction = pipeline.predict_noise(
+        hidden_states=latents,
+        timestep=torch.tensor([1]),
+        text_ids=_ids(2),
+        text_mask=_mask(),
+    )
+
+    assert latents.dtype == torch.bfloat16
+    assert pipeline.transformer.calls[-1]["hidden_states_dtype"] == torch.bfloat16
+    assert prediction.dtype == torch.bfloat16
+
+
 def test_prepare_latents_i2v_encodes_only_conditioning_frame(make_cosmos3_pipeline) -> None:
     pipeline = make_cosmos3_pipeline()
     calls: list[tuple[str, tuple[int, ...]]] = []
@@ -1647,6 +2276,7 @@ def test_prepare_inverse_dynamics_latents_encodes_full_video(make_cosmos3_pipeli
 
 def test_diffuse_covers_cfg_i2v_and_multimodal_steps(make_cosmos3_pipeline) -> None:
     pipeline = make_cosmos3_pipeline()
+    pipeline.dtype = torch.bfloat16
     latents = torch.zeros(1, 2, 1, 1, 1)
 
     result = pipeline.diffuse(
@@ -1661,6 +2291,8 @@ def test_diffuse_covers_cfg_i2v_and_multimodal_steps(make_cosmos3_pipeline) -> N
         guidance_interval=(500.0, 1000.0),
     )
     assert [call["token"] for call in pipeline.transformer.calls] == [2, 1, 2]
+    assert all(call["hidden_states_dtype"] == torch.bfloat16 for call in pipeline.transformer.calls)
+    assert result.dtype == torch.float32
     torch.testing.assert_close(result, torch.full_like(latents, 6.0))
 
     i2v = pipeline.diffuse(
@@ -1675,6 +2307,8 @@ def test_diffuse_covers_cfg_i2v_and_multimodal_steps(make_cosmos3_pipeline) -> N
         velocity_mask=torch.tensor([[[[[0.0]], [[1.0]]]]]),
         image_latent=torch.full((1, 2, 1, 1, 1), 7.0),
     )
+    assert pipeline.transformer.calls[-1]["hidden_states_dtype"] == torch.bfloat16
+    assert i2v.dtype == torch.float32
     torch.testing.assert_close(i2v[:, :, 0:1], torch.full((1, 2, 1, 1, 1), 7.0))
     i2v_noise = pipeline.scheduler.step_calls[-1][0]
     torch.testing.assert_close(i2v_noise[:, :, 0:1], torch.zeros(1, 2, 1, 1, 1))
@@ -1694,8 +2328,52 @@ def test_diffuse_covers_cfg_i2v_and_multimodal_steps(make_cosmos3_pipeline) -> N
         guidance_scale=1.0,
         shared_kwargs={"video_shape": (1, 1, 1), "fps": 24.0, "action_domain_ids": torch.tensor([0])},
     )
+    assert all(call["hidden_states_dtype"] == torch.bfloat16 for call in pipeline.transformer.calls)
+    assert video_result.dtype == torch.float32
+    assert action_result.dtype == torch.float32
     torch.testing.assert_close(video_result, torch.full_like(latents, 4.0))
     torch.testing.assert_close(action_result, torch.full((), 44.0).expand_as(action_result))
+
+
+def test_diffuse_publishes_exact_seacache_metadata_and_cfg_contexts(make_cosmos3_pipeline) -> None:
+    pipeline = make_cosmos3_pipeline()
+    pipeline.scheduler.sigmas = torch.tensor([0.91, 0.17])
+    observations: list[tuple[str, int | None, float | None, int | None]] = []
+
+    class RecordingHook:
+        @contextmanager
+        def cache_context(self, name: str):
+            sigma = pipeline.current_sigma
+            observations.append(
+                (
+                    name,
+                    pipeline.current_step_index,
+                    None if sigma is None else float(sigma),
+                    pipeline.num_timesteps,
+                )
+            )
+            yield
+
+    pipeline._cache_context_factory = RecordingHook().cache_context
+    pipeline.diffuse(
+        latents=torch.zeros(1, 2, 1, 1, 1),
+        timesteps=torch.tensor([900, 100]),
+        cond_ids=_ids(2),
+        cond_mask=_mask(),
+        uncond_ids=_ids(1),
+        uncond_mask=_mask(),
+        guidance_scale=3.0,
+        shared_kwargs={"video_shape": (1, 1, 1), "fps": 24.0},
+    )
+
+    assert observations == [
+        ("cond", 0, pytest.approx(0.91), 2),
+        ("uncond", 0, pytest.approx(0.91), 2),
+        ("cond", 1, pytest.approx(0.17), 2),
+        ("uncond", 1, pytest.approx(0.17), 2),
+    ]
+    assert pipeline.current_step_index is None
+    assert pipeline.current_sigma is None
 
 
 def test_diffuse_drops_session_when_progress_iteration_fails(make_cosmos3_pipeline) -> None:
@@ -1740,6 +2418,7 @@ def test_diffuse_transfer_applies_control_cfg(make_cosmos3_pipeline, sequential_
         control_guidance=1.5,
         control_guidance_interval=None,
         control_latents=[torch.zeros_like(latents)],
+        control_weights=[1.0],
         shared_kwargs={"video_shape": (1, 1, 1), "fps": 24.0, "noisy_frame_mask": velocity_mask},
         velocity_mask=velocity_mask,
         condition_latents=torch.zeros_like(latents),
@@ -1750,7 +2429,57 @@ def test_diffuse_transfer_applies_control_cfg(make_cosmos3_pipeline, sequential_
         (2, False),
         (1, True),
     ]
+    assert pipeline.transformer.calls[0]["kwargs"]["control_weights"] == [1.0]
+    assert "control_weights" not in pipeline.transformer.calls[1]["kwargs"]
+    assert pipeline.transformer.calls[2]["kwargs"]["control_weights"] == [1.0]
     torch.testing.assert_close(result, torch.full_like(latents, 254.0))
+
+
+def test_diffuse_transfer_uses_named_seacache_contexts(make_cosmos3_pipeline, sequential_cfg_parallel) -> None:
+    pipeline = make_cosmos3_pipeline()
+    pipeline.scheduler.sigmas = torch.tensor([0.42])
+    contexts: list[tuple[str, int | None, float | None, int | None]] = []
+
+    class RecordingHook:
+        @contextmanager
+        def cache_context(self, name: str):
+            sigma = pipeline.current_sigma
+            contexts.append(
+                (
+                    name,
+                    pipeline.current_step_index,
+                    None if sigma is None else float(sigma),
+                    pipeline.num_timesteps,
+                )
+            )
+            yield
+
+    pipeline._cache_context_factory = RecordingHook().cache_context
+    latents = torch.zeros(1, 2, 1, 1, 1)
+    velocity_mask = torch.ones(1, 1, 1, 1, 1)
+    pipeline.diffuse_transfer(
+        latents=latents,
+        timesteps=torch.tensor([7]),
+        cond_ids=_ids(2),
+        cond_mask=_mask(),
+        uncond_ids=_ids(1),
+        uncond_mask=_mask(),
+        guidance_scale=3.0,
+        control_guidance=1.5,
+        control_guidance_interval=None,
+        control_latents=[torch.zeros_like(latents)],
+        shared_kwargs={"video_shape": (1, 1, 1), "fps": 24.0, "noisy_frame_mask": velocity_mask},
+        velocity_mask=velocity_mask,
+        condition_latents=torch.zeros_like(latents),
+    )
+
+    assert contexts == [
+        ("cond", 0, pytest.approx(0.42), 1),
+        ("cond_no_control", 0, pytest.approx(0.42), 1),
+        ("uncond", 0, pytest.approx(0.42), 1),
+    ]
+    assert pipeline.current_step_index is None
+    assert pipeline.current_sigma is None
 
 
 def test_diffuse_transfer_rejects_session_state_manager(make_cosmos3_pipeline) -> None:
@@ -1857,14 +2586,36 @@ def test_diffuse_transfer_interval_switches_branch_counts(make_cosmos3_pipeline,
     torch.testing.assert_close(result, torch.full_like(latents, 508.0))
 
 
-@pytest.mark.parametrize(("hint_key", "expected_fps"), [("edge", 8.0), ("wsm", 10.0)])
-def test_forward_transfer_uses_source_fps_except_wsm(make_cosmos3_pipeline, hint_key: str, expected_fps: float) -> None:
+@pytest.mark.parametrize(
+    ("hint_key", "emphasize_control", "expected_fps", "negative_prompt"),
+    [
+        ("edge", None, 8.0, None),
+        ("wsm", None, 10.0, ""),
+        ("edge", False, 8.0, "custom negative"),
+    ],
+)
+def test_forward_transfer_uses_transfer_prompt_contract_and_source_fps_except_wsm(
+    make_cosmos3_pipeline,
+    hint_key: str,
+    emphasize_control: bool | None,
+    expected_fps: float,
+    negative_prompt: str | None,
+) -> None:
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import (
+        COSMOS3_TRANSFER_CONTROL_DIRECTIVE_TEMPLATE,
+        COSMOS3_TRANSFER_SYSTEM_PROMPT,
+    )
+
     pipeline = make_cosmos3_pipeline()
     captured: dict[str, Any] = {}
 
     def fake_format(prompt, negative_prompt, num_frames, frame_rate, height, width, *args, **kwargs):
-        del prompt, negative_prompt, num_frames, height, width, args, kwargs
+        del num_frames, height, width, args
+        captured["prompt"] = prompt
+        captured["negative_prompt"] = negative_prompt
         captured["format_frame_rate"] = frame_rate
+        captured["format_kwargs"] = kwargs
+        captured["format_aspect_ratio"] = kwargs["aspect_ratio_override"]
         return _ids(2), _mask(), _ids(1), _mask()
 
     def fake_encode(video: torch.Tensor) -> torch.Tensor:
@@ -1887,7 +2638,7 @@ def test_forward_transfer_uses_source_fps_except_wsm(make_cosmos3_pipeline, hint
         captured["shared_kwargs"] = kwargs["shared_kwargs"]
         return kwargs["latents"]
 
-    pipeline._transfer_bucket_size = lambda sp, source_hw: (16, 16)
+    pipeline._transfer_bucket_size = lambda sp, source_hw: (16, 16, "1,1")
     pipeline._format_and_tokenize_prompts = fake_format
     pipeline._encode_video_tensor = fake_encode
     pipeline._prepare_transfer_latents = fake_prepare
@@ -1901,33 +2652,49 @@ def test_forward_transfer_uses_source_fps_except_wsm(make_cosmos3_pipeline, hint
     pipeline._decode_latents = lambda latents: torch.zeros(1, 3, 5, 16, 16, device="meta")
 
     control = torch.zeros(3, 5, 16, 16, dtype=torch.uint8)
+    extra_args = {
+        hint_key: {"control": control},
+        "max_frames": 5,
+        "num_video_frames_per_chunk": 5,
+        "show_control_condition": True,
+    }
+    if emphasize_control is not None:
+        extra_args["emphasize_control_in_prompt"] = emphasize_control
+    prompt_data = {
+        "prompt": "transfer",
+        "modalities": ["video"],
+        "additional_information": {
+            "preprocessed_transfer_video": torch.zeros(1, 3, 5, 16, 16),
+            "transfer_input_fps": 8.0,
+        },
+    }
+    if negative_prompt is not None:
+        prompt_data["negative_prompt"] = negative_prompt
     request = SimpleNamespace(
-        prompts=[
-            {
-                "prompt": "transfer",
-                "modalities": ["video"],
-                "additional_information": {
-                    "preprocessed_transfer_video": torch.zeros(1, 3, 5, 16, 16),
-                    "transfer_input_fps": 8.0,
-                },
-            }
-        ],
+        prompts=[prompt_data],
         sampling_params=make_sampling_params(
             height=16,
             width=16,
             # fps omitted (no frame_rate) -> non-wsm uses the source video fps (8), wsm uses its preset (10).
-            extra_args={
-                hint_key: {"control": control},
-                "max_frames": 5,
-                "num_video_frames_per_chunk": 5,
-                "show_control_condition": True,
-            },
+            extra_args=extra_args,
         ),
     )
 
     output = pipeline.forward(request)
 
     assert captured["format_frame_rate"] == expected_fps
+    assert captured["format_aspect_ratio"] == "1,1"
+    expected_negative_prompt = "" if negative_prompt is None else negative_prompt
+    assert captured["negative_prompt"] == expected_negative_prompt
+    assert captured["format_kwargs"]["use_system_prompt"] is True
+    assert captured["format_kwargs"]["system_prompt"] == COSMOS3_TRANSFER_SYSTEM_PROMPT
+    assert captured["format_kwargs"]["use_duration_template"] is True
+    assert captured["format_kwargs"]["use_resolution_template"] is True
+    assert captured["format_kwargs"]["negative_metadata_mode"] == "same"
+    expected_suffix = (
+        None if emphasize_control is False else COSMOS3_TRANSFER_CONTROL_DIRECTIVE_TEMPLATE.format(hint_names=hint_key)
+    )
+    assert captured["format_kwargs"]["prompt_suffix"] == expected_suffix
     assert captured["shared_kwargs"]["fps"] == expected_fps
     assert captured["flow_shifts"] == [10.0]
     # Transfer applies the V2V flow shift when building its timestep schedule.
@@ -1943,7 +2710,7 @@ def test_forward_transfer_runs_multichunk_overlap_path(
     pipeline = make_cosmos3_pipeline()
     captured: dict[str, Any] = {"targets": [], "conditional_frames": []}
 
-    pipeline._transfer_bucket_size = lambda sp, source_hw: (16, 16)
+    pipeline._transfer_bucket_size = lambda sp, source_hw: (16, 16, "1,1")
     pipeline._format_and_tokenize_prompts = lambda *args, **kwargs: (_ids(2), _mask(), _ids(1), _mask())
     pipeline._set_flow_shift = lambda target, **_kwargs: captured.setdefault("flow_shifts", []).append(target)
 
@@ -2014,6 +2781,42 @@ def test_forward_transfer_runs_multichunk_overlap_path(
     torch.testing.assert_close(captured["targets"][1][:, :, 0], torch.full((1, 3, 16, 16), -0.2))
 
 
+def test_forward_transfer_non_output_rank_uses_canonical_envelope(
+    make_cosmos3_pipeline,
+    sequential_cfg_parallel,
+) -> None:
+    pipeline = make_cosmos3_pipeline()
+    pipeline.vae.distributed_executor = SimpleNamespace(rank=1)
+    pipeline.vae.is_distributed_enabled = lambda: True
+    pipeline._transfer_bucket_size = lambda sp, source_hw: (16, 16, "1,1")
+    pipeline._format_and_tokenize_prompts = lambda *args, **kwargs: (_ids(2), _mask(), _ids(1), _mask())
+    pipeline._set_flow_shift = lambda *_args, **_kwargs: None
+    decoded = torch.zeros(1, 3, 1, 16, 16)
+    pipeline._decode_latents = lambda latents: decoded
+
+    request = SimpleNamespace(
+        prompts=[{"prompt": "transfer", "modalities": ["video"]}],
+        sampling_params=make_sampling_params(
+            height=16,
+            width=16,
+            num_inference_steps=1,
+            guidance_scale=1.0,
+            extra_args={
+                "edge": {"control": torch.zeros(3, 1, 16, 16, dtype=torch.uint8)},
+                "max_frames": 1,
+                "num_video_frames_per_chunk": 1,
+            },
+        ),
+    )
+
+    output = pipeline.forward(request)
+
+    assert set(output.output) == {"payload", "metadata"}
+    assert set(output.output["payload"]) == {"video"}
+    torch.testing.assert_close(output.output["payload"]["video"], decoded)
+    assert output.output["metadata"] == {"video": {"fps": 24.0}}
+
+
 def test_diffuse_keeps_paired_cfg_when_cache_dit_active(make_cosmos3_pipeline) -> None:
     """With cache-dit active the uncond pass is kept even outside the guidance
     interval (so cache-dit's has_separate_cfg parity stays in phase), and the
@@ -2049,7 +2852,7 @@ def test_diffuse_keeps_paired_cfg_when_cache_dit_active(make_cosmos3_pipeline) -
 
 class TestForwardRouting:
     def _install_forward_stubs(self, pipeline):
-        captured: dict[str, object] = {"diffuse_calls": [], "prepare_calls": []}
+        captured: dict[str, Any] = {"diffuse_calls": [], "prepare_calls": []}
 
         def fake_format(
             prompt,

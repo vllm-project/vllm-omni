@@ -93,13 +93,13 @@ Each optimization stacks on the previous one. The summary plots below show the c
 
 **Benchmark environment:**
 
-| | Qwen3-Omni                  | Qwen3-TTS |
-| --- |-----------------------------| --- |
-| **GPU** | A100                        | H200 |
+| | Qwen3-Omni | Qwen3-TTS |
+| --- | ----------------------------- | --- |
+| **GPU** | A100 | H200 |
 | **Model** | Qwen3-Omni-30B-A3B-Instruct | Qwen3-TTS-12Hz-1.7B-CustomVoice |
-| **vLLM** | v0.17.0                     | v0.18.0 |
-| **vllm-omni** | commit 199f7832             | v0.18.0rc2 |
-| **CUDA** | 12.9                        | 12.8 |
+| **vLLM** | v0.17.0 | v0.18.0 |
+| **vllm-omni** | commit 199f7832 | v0.18.0rc2 |
+| **CUDA** | 12.9 | 12.8 |
 
 This post walks through each optimization in the same order they are typically enabled in practice, then ends with deployment playbooks for both models.
 
@@ -111,7 +111,7 @@ This post walks through each optimization in the same order they are typically e
 
 For both Qwen3-Omni and Qwen3-TTS, batching is a pipeline-level optimization:
 
-- Requests are grouped per stage using `runtime.max_batch_size`
+- Requests are grouped per stage using `stages[].max_num_seqs`
 - Each stage executes batch inference with its own scheduler/worker
 - Stage outputs are routed to downstream stages with per-request mapping preserved
 
@@ -171,7 +171,7 @@ At concurrency 10, batching alone brings Qwen3-TTS RTF from 2.19 (slower than re
 
 In decode-heavy serving, repeatedly launching many small kernels from CPU can become a visible overhead. CUDA Graph reduces this overhead by capturing and replaying stable execution graphs.
 
-In stage configs, this is represented by `enforce_eager: false` for stages where graph capture is desired (Thinker/Talker), while Code2Wav keeps eager mode depending on stage behavior.
+In deploy configs, this is represented by `enforce_eager: false` for stages where graph capture is desired (Thinker/Talker), while Code2Wav keeps eager mode depending on stage behavior.
 
 ### CUDA Graph results on top of batching
 
@@ -310,7 +310,68 @@ self._compiled_model_fwd = torch.compile(
 
 `mode="default"` is used instead of `mode="reduce-overhead"` to avoid conflicts with vLLM's own CUDA graph capture on the main Talker model. `dynamic=True` handles the growing sequence length without recompilation.
 
-These optimizations are always-on in the current codebase - all Qwen3-TTS benchmark results in this post include them.
+The historical benchmark results above use re-prefill. It remains the default
+for Qwen3-TTS and the shared Qwen3-Omni predictor.
+
+### Experimental Qwen3-TTS single-GPU throughput profile
+
+The opt-in `qwen3_tts_high_concurrency_mrv2_single_gpu.yaml` profile uses a
+Qwen3-TTS-specific execution path on CUDA with BF16 weights:
+
+- `code_predictor_kv_cache` reuses each layer's keys and values across the 15
+  residual-codebook predictions within one audio frame. The first step writes
+  two positions; subsequent steps write one. Scratch storage is bounded by the
+  configured batch capacity, overwritten for every frame, and never shared
+  between requests across frames. The worker's serialized CUDA stream owns it;
+  it is separate from the Talker's paged KV cache.
+- A short causal/GQA Triton kernel masks unwritten K/V loads. Dynamic-batch
+  `torch.compile` warms the predictor before the runner captures whole-MTP
+  CUDA graphs. This path creates no inner CUDA graphs. Unsupported devices and
+  dtypes retain re-prefill; FP16 retains its existing precision safeguards.
+- `code_predictor_fused_sampling` fuses temperature scaling, top-k filtering,
+  and Gumbel argmax when the runner supplies FP32 uniforms. It preserves top-k
+  ties and uses the supplied randomness. Explicit generator paths retain the
+  existing sampler. Qwen3-Omni does not read either TTS option.
+- `decode_cudnn_benchmark` selects convolution algorithms during Code2Wav
+  warmup and graph capture. The process's cuDNN flags are restored afterwards,
+  including on capture failure. Captured graphs retain the selected algorithms.
+
+- `decode_time_major_conv` keeps codec convolution activations in time-major
+  layout to reduce transposes and copies between layers.
+- `talker_first_audio` completes residual prediction immediately after the
+  first codebook sample and decodes the first frame in the Talker process.
+  The codec advances its state without repeating the delivered frame; the
+  orchestrator orders that frame before subsequent codec chunks. This path
+  requires CUDA, MRV2, asynchronous chunks, a single-process executor, TP/PP 1,
+  and disabled prefix caching. Reference-code requests retain codec delivery.
+  Supported Qwen3-TTS profiles enable it explicitly; other models do not opt in.
+
+The predictor, sampling, convolution-layout and autotuning options default to
+false outside this throughput profile. It uses fixed 1/25-frame chunks,
+72 frames of left context, Talker/codec capacities of 128/64, codec batches
+through 8, and synchronous codec scheduling. Client concurrency is independent
+of those capacities. This profile also sets `cuda_mps: true`; the runtime owns
+a private MPS daemon unless an operator supplies an existing MPS pipe directory.
+Ordinary profiles leave MPS disabled. See
+[experimental MPS deployment](../configuration/stage_configs.md#experimental-mps-deployment)
+for requirements and ownership. Startup includes compilation and graph capture.
+
+```bash
+vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice --omni \
+  --deploy-config vllm_omni/deploy/qwen3_tts_high_concurrency_mrv2_single_gpu.yaml \
+  --api-server-count 4 --stage-init-timeout 1800 --init-timeout 2400
+```
+
+KV reuse changes GEMM shapes and attention reduction order; cuDNN autotuning
+can also change waveform numerics. This path is not bitwise equivalent to
+re-prefill, and aggregate WER alone cannot establish perceptual or speaker
+similarity equivalence. Validate quality on the intended workload before
+adopting it. Qwen3-Omni keeps its existing predictor and audio-delivery behavior.
+
+For a controlled ablation, copy the profile and disable individual options while keeping capacities, chunking, hardware, client concurrency,
+and warmup identical. Report repeated runs, first-audio latency and failures
+alongside throughput. Warm requests measure a ready service; they do not measure
+cold-start latency.
 
 ---
 
@@ -320,7 +381,7 @@ In the async chunk pipeline, the standard `codec_chunk_frames` is 25 (each chunk
 
 **Dynamic initial chunk sizing (default behavior):**
 
-Rather than using a fixed initial chunk size, vLLM-Omni dynamically selects it based on current server load. The initial chunk size is chosen from power-of-2 steps [2, 4, 8, 16] based on load factor (`active_requests / max_batch_size`):
+Rather than using a fixed initial chunk size, vLLM-Omni dynamically selects it based on current server load. The initial chunk size is chosen from power-of-2 steps [2, 4, 8, 16] based on load factor (`active_requests / max_num_seqs`):
 
 | Server load | Initial chunk frames | Rationale |
 | --- | --- | --- |
@@ -349,16 +410,15 @@ This overrides the dynamic calculation for that request.
 **Config (server-side):**
 
 ```yaml
-runtime:
-  connectors:
-    connector_of_shared_memory:
-      name: SharedMemoryConnector
-      extra:
-        codec_streaming: true
-        codec_chunk_frames: 25              # standard chunk size (~2s of audio)
-        codec_left_context_frames: 25
-        # initial chunk is computed dynamically by default
-        # set initial_codec_chunk_frames: 2 to force a fixed value
+connectors:
+  connector_of_shared_memory:
+    name: SharedMemoryConnector
+    extra:
+      codec_streaming: true
+      codec_chunk_frames: 25              # standard chunk size (~2s of audio)
+      codec_left_context_frames: 25
+      # initial chunk is computed dynamically by default
+      # set initial_codec_chunk_frames: 2 to force a fixed value
 ```
 
 The 64 ms TTFP result reported above for Qwen3-TTS at concurrency 1 uses the dynamic initial chunk, which picks `initial_codec_chunk_frames=2` at low load. At higher concurrency the dynamic sizing increases the initial chunk to maintain decode efficiency.
@@ -408,11 +468,11 @@ vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct \
 
 Notes:
 
-- `runtime.max_batch_size` controls stage-level batching.
+- `stages[].max_num_seqs` controls stage-level batching.
 - Thinker/Talker commonly use `enforce_eager: false` for CUDA Graph paths.
 - Code2Wav often remains eager (`enforce_eager: true`) depending on runtime behavior.
-- Qwen3-Omni defaults `VLLM_USE_FLASHINFER_MOE_FP16=0`. The Triton has been more stable & faster
- than the FlashInfer CUTLASS unquantized MoE backend on recent vLLM rebases.
+- The Qwen3-Omni deploy config pins `moe_backend: triton` for the Thinker and Talker stages. Triton has been more
+ stable and faster than the FlashInfer CUTLASS unquantized MoE backend on recent vLLM rebases.
 
 #### 2) Enable async chunk
 
@@ -426,32 +486,25 @@ vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct \
 
 ```yaml
 async_chunk: true
-stage_args:
+stages:
   - stage_id: 0  # thinker
-    runtime:
-      max_batch_size: 64
-    engine_args:
-      enforce_eager: false
-      max_num_batched_tokens: 32768
-      custom_process_next_stage_input_func: >-
-        vllm_omni.model_executor.stage_input_processors.qwen3_omni.thinker2talker_async_chunk
+    max_num_seqs: 64
+    enforce_eager: false
+    max_num_batched_tokens: 32768
 
   - stage_id: 1  # talker
-    runtime:
-      max_batch_size: 64
-    engine_args:
-      enforce_eager: false
-      max_num_batched_tokens: 32768
-      custom_process_next_stage_input_func: >-
-        vllm_omni.model_executor.stage_input_processors.qwen3_omni.talker2code2wav_async_chunk
+    max_num_seqs: 64
+    enforce_eager: false
+    max_num_batched_tokens: 32768
 
   - stage_id: 2  # code2wav
-    runtime:
-      max_batch_size: 64
-    engine_args:
-      enforce_eager: true
-      max_num_batched_tokens: 51200
+    max_num_seqs: 64
+    enforce_eager: true
+    max_num_batched_tokens: 51200
 ```
+
+The async handoff processors are fixed by the registered Qwen3-Omni
+`PipelineConfig`; deploy YAML only selects `async_chunk` and runtime sizing.
 
 #### Reproduce Qwen3-Omni benchmarks
 
@@ -483,7 +536,7 @@ vllm-omni serve Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice \
 
 The default config (`qwen3_tts.yaml`) enables the full optimization stack:
 
-- Batching with `max_batch_size: 10` on the Talker stage
+- Batching with `max_num_seqs: 10` on the Talker stage
 - CUDA Graph on the Talker (`enforce_eager: false`)
 - Async chunk with streaming transport
 
@@ -500,32 +553,28 @@ vllm-omni serve Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice \
 
 ```yaml
 async_chunk: true
-stage_args:
+stages:
   - stage_id: 0  # Talker (AR decoder)
-    runtime:
-      max_batch_size: 10
-    engine_args:
-      enforce_eager: false
-      max_num_batched_tokens: 512
-      custom_process_next_stage_input_func: >-
-        vllm_omni.model_executor.stage_input_processors.qwen3_tts.talker2code2wav_async_chunk
+    max_num_seqs: 10
+    enforce_eager: false
+    max_num_batched_tokens: 512
 
   - stage_id: 1  # Code2Wav (vocoder)
-    runtime:
-      max_batch_size: 1
-    engine_args:
-      enforce_eager: true
-      max_num_batched_tokens: 8192
+    max_num_seqs: 1
+    enforce_eager: true
+    max_num_batched_tokens: 8192
 
-runtime:
-  connectors:
-    connector_of_shared_memory:
-      name: SharedMemoryConnector
-      extra:
-        codec_streaming: true
-        codec_chunk_frames: 25
-        codec_left_context_frames: 25
+connectors:
+  connector_of_shared_memory:
+    name: SharedMemoryConnector
+    extra:
+      codec_streaming: true
+      codec_chunk_frames: 25
+      codec_left_context_frames: 25
 ```
+
+The async Talker-to-Code2Wav processor is defined by the registered Qwen3-TTS
+pipeline rather than the deploy YAML.
 
 #### Reproduce Qwen3-TTS benchmarks
 

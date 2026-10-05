@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """Unit tests for LTX guidance and forward-parallel behavior."""
 
@@ -27,6 +27,15 @@ def test_velocity_from_x0_uses_official_host_scalar_sigma(mocker):
 
 class TestCFGParallelHelpers:
     """Test LTX-2.3 CFG helper math without loading model weights."""
+
+    def test_single_guidance_pass_preserves_official_token_layout(self):
+        from vllm_omni.diffusion.models.ltx2.ltx2_guidance import _repeat_batch
+
+        tokens = torch.randn(1, 16, 32).transpose(1, 2).contiguous().transpose(1, 2)
+        repeated = _repeat_batch(tokens, 1)
+
+        assert repeated is tokens
+        assert repeated.stride() == tokens.stride()
 
     def test_combine_cfg_noise_matches_x0_space_formula(self):
         from vllm_omni.diffusion.models.ltx2.pipeline_ltx2 import LTX2Pipeline
@@ -76,14 +85,14 @@ class TestCFGParallelHelpers:
 
         LTX_GUIDANCE_EXECUTOR.validate_guidance_world_size(plan, guidance_world_size)
 
-    def test_guidance_parallel_dummy_warms_full_guidance_plan(self, monkeypatch):
+    def test_guidance_parallel_preserves_full_guidance_plan(self, monkeypatch):
         from vllm_omni.diffusion.models.ltx2 import ltx2_runtime
         from vllm_omni.diffusion.models.ltx2.ltx2_recipes import LTX23_ONE_STAGE_RECIPE
         from vllm_omni.diffusion.models.ltx2.pipeline_ltx2 import LTX2Pipeline
 
         monkeypatch.setattr(ltx2_runtime, "get_guidance_parallel_world_size", lambda: 2)
         pipe = object.__new__(LTX2Pipeline)
-        req = SimpleNamespace(is_dummy_run=lambda: True)
+        req = SimpleNamespace()
         request_inputs = SimpleNamespace(guidance=LTX23_ONE_STAGE_RECIPE.request_guidance)
 
         guidance_parallel_ready = pipe._setup_forward_runtime(req, request_inputs, attention_kwargs=None)

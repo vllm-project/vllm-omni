@@ -10,11 +10,21 @@ import torch
 import vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 as wan22_module
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import (
     create_transformer_from_config,
+    get_wan22_post_process_func,
     load_transformer_config,
     retrieve_latents,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
+
+
+def test_t2v_pipeline_declares_text_encoder_offload_blocks() -> None:
+    plan = wan22_module.Wan22Pipeline._offload_plan
+
+    assert plan.encoder_component_types == {"text_encoder": "text_encoder"}
+    assert plan.encoder_block_attrs == {"text_encoder": ("encoder.block",)}
+    assert plan.encoder_dlo_weight_replication == frozenset({"text_encoder"})
+    assert plan.on_demand_component_paths == frozenset()
 
 
 class _LatentDist:
@@ -24,6 +34,17 @@ class _LatentDist:
 
     def mode(self):
         return torch.tensor([2.0])
+
+
+def test_wan22_postprocess_honors_request_output_type() -> None:
+    video = torch.zeros(1, 4, 1, 2, 2)
+
+    output = get_wan22_post_process_func(SimpleNamespace())(
+        video,
+        sampling_params=SimpleNamespace(output_type="latent"),
+    )
+
+    assert output is video
 
 
 def test_retrieve_latents_supports_sample_mode_argmax_and_direct_latents() -> None:

@@ -1,78 +1,110 @@
 # Chat Completions API
 
-vLLM-Omni supports generating and editing images via the `/v1/chat/completions`
-endpoint using diffusion models. This page explains how to pass generation
-parameters (such as `num_inference_steps`, `height`, `width`) to diffusion
-models through this endpoint.
+Use `/v1/chat/completions` for conversational and multimodal pipelines that
+follow the OpenAI Chat API schema. Depending on the loaded model, a request can
+contain text, image, audio, or video input and can return text, audio, images,
+or other model-specific output.
 
-!!! tip
-    For dedicated endpoints that accept generation parameters as top-level
-    fields, see [Image Generation API](image_generation_api.md) and
-    [Image Edit API](image_edit_api.md).
+Some diffusion pipelines also support image generation and editing through
+Chat Completions. Prefer the dedicated [Image Generation
+API](image_generation_api.md) or [Image Edit API](image_edit_api.md) for
+task-specific clients; their request fields and response contracts are more
+direct.
 
-## Passing Generation Parameters
-
-The `/v1/chat/completions` endpoint follows the OpenAI Chat API schema, which
-does not natively include diffusion-specific fields like `num_inference_steps`
-or `height`. How you pass these extra fields depends on your client.
-
-### curl / Python `requests`
-
-Wrap generation parameters inside an `"extra_body"` key in the JSON body:
+## Basic Request
 
 ```bash
-curl -s http://localhost:8091/v1/chat/completions \
+curl http://localhost:8091/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "messages": [
-      {"role": "user", "content": "A beautiful landscape painting"}
+      {"role": "user", "content": "Describe vLLM-Omni briefly."}
     ],
-    "extra_body": {
-      "num_inference_steps": 50,
-      "seed": 42
-    }
+    "modalities": ["text"]
   }'
 ```
 
-### OpenAI Python SDK
+Use `stream: true` for Server-Sent Events. Input media syntax, supported output
+`modalities`, and response choices depend on the model; see the
+[model-specific online serving examples](../user_guide/examples/online_serving/qwen3_omni.md).
 
-Use the `extra_body` **keyword argument**. The SDK automatically merges these
-fields into the top-level request body:
+!!! tip
+    Each server hosts one model. Query `GET /v1/models` for its served model
+    name when your client requires the `model` field.
 
-```python
-response = client.chat.completions.create(
-    model="Qwen/Qwen-Image",
-    messages=[{"role": "user", "content": "A beautiful landscape painting"}],
-    extra_body={
-        "num_inference_steps": 50,
-        "seed": 42,
-    },
-)
+## vLLM Extension Parameters
+
+Send standard and vLLM-specific Chat parameters as top-level fields in a
+direct HTTP request. When using the OpenAI Python SDK, pass vLLM-specific
+fields through the SDK's `extra_body` keyword; the SDK merges them into the
+top-level JSON sent to the server.
+
+=== "curl"
+
+    ```bash
+    curl http://localhost:8091/v1/chat/completions \
+      -H "Content-Type: application/json" \
+      -d '{
+        "messages": [{"role": "user", "content": "Write a short haiku."}],
+        "top_k": 40
+      }'
+    ```
+
+=== "OpenAI Python SDK"
+
+    ```python
+    from openai import OpenAI
+
+    client = OpenAI(base_url="http://localhost:8091/v1", api_key="none")
+
+    response = client.chat.completions.create(
+        model="your-served-model",
+        messages=[{"role": "user", "content": "Write a short haiku."}],
+        extra_body={"top_k": 40},
+    )
+    ```
+
+??? note "Diffusion compatibility"
+
+    Diffusion models exposed through Chat Completions can accept supported
+    fields such as `num_inference_steps`, `seed`, `height`, and `width`. Send
+    them at the top level with direct HTTP, or in the SDK's `extra_body`
+    keyword argument.
+
+    A literal nested `"extra_body"` JSON object is accepted for compatibility,
+    but it is not recommended for new direct HTTP clients. Do not provide the
+    same parameter in multiple locations; the server returns a `400` error for
+    duplicate diffusion parameters. Prefer the dedicated [Image Generation
+    API](image_generation_api.md) or [Image Edit API](image_edit_api.md) when
+    either endpoint matches the task.
+
+## Batch Requests
+
+`POST /v1/chat/completions/batch` accepts the same shared generation fields,
+but `messages` is a list of conversations. The response contains one choice
+per conversation in input order.
+
+```bash
+curl http://localhost:8091/v1/chat/completions/batch \
+  -H "Content-Type: application/json" \
+  -d '{
+    "messages": [
+      [{"role": "user", "content": "Summarize vLLM in one sentence."}],
+      [{"role": "user", "content": "Summarize vLLM-Omni in one sentence."}]
+    ],
+    "max_tokens": 64
+  }'
 ```
 
-!!! note "SDK `extra_body` vs. JSON `extra_body`"
-    These two `extra_body` usages look similar but work differently under the
-    hood. The SDK flattens the dict into the top-level request JSON, while the
-    curl/requests approach sends it as a nested `"extra_body"` key. Both are
-    handled correctly by the server.
-
-!!! note "About the `ignored fields` warning"
-    You may see a log message like:
-
-    ```
-    WARNING: The following fields were present in the request but ignored: {'height', 'width', ...}
-    ```
-
-    This is **harmless**. It is emitted by vLLM's request validation layer
-    because these fields are not part of the standard OpenAI
-    `ChatCompletionRequest` schema. The fields are still stored internally
-    and correctly forwarded to the diffusion pipeline.
+Batch Chat Completions does not support streaming, tools, beam search, or
+`n > 1`.
 
 ## Model-Specific Examples
 
-For complete examples with full request/response details, see the model-specific
-guides:
+For complete examples with model-specific inputs and outputs, see:
 
+- [Qwen3-Omni](../user_guide/examples/online_serving/qwen3_omni.md)
+- [Qwen2.5-Omni](../user_guide/examples/online_serving/qwen2_5_omni.md)
 - [Text-to-Image (Qwen-Image)](../user_guide/examples/online_serving/text_to_image.md)
 - [Image-to-Image (Qwen-Image-Edit, Qwen-Image-Layered)](../user_guide/examples/online_serving/image_to_image.md)
 - [GLM-Image](../user_guide/examples/online_serving/glm_image.md)

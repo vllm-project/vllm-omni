@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """TTS model detection: registry-driven stage -> model-type resolution.
 
 ``serving_speech.py`` used to carry a hand-written 20-branch ladder mapping
@@ -14,7 +15,6 @@ import itertools
 import pytest
 
 from vllm_omni.entrypoints.openai.tts_adapters import (
-    LEGACY_TTS_DETECTORS,
     TTS_ADAPTER_REGISTRY,
     all_tts_stage_keys,
     detect_tts_model_type,
@@ -133,10 +133,14 @@ _PIPELINE_STAGES = [
     "audex_thinker",
     "audex_tta_thinker",
     "audex_xcodec",
+    "audio8_tts_codec_decoder",
+    "audio8_tts_slow_ar",
     "audio_generation",
     "audio_tokenizer",
     "audio_vae",
     "aura",
+    "breeze_tts_2",
+    "breeze_tts_2_codec",
     "code2wav",
     "cosyvoice3_code2wav",
     "cosyvoice3_talker",
@@ -145,6 +149,7 @@ _PIPELINE_STAGES = [
     "dit",
     "fish_speech_slow_ar",
     "fused_thinker_talker",
+    "gepard",
     "glm_tts",
     "glm_tts_dit",
     "higgs_audio_v2",
@@ -154,6 +159,7 @@ _PIPELINE_STAGES = [
     "indextts2_talker",
     "latent_generator",
     "llm",
+    "minimax_music3_ar",
     "ming_tts",
     "moss_tts",
     "moss_tts_codec",
@@ -176,12 +182,15 @@ _PIPELINE_STAGES = [
     "token2text",
     "token2wav",
     "tts",
+    "encoder",
+    "yue2",
 ]
 
 _STAGES = [*_PIPELINE_STAGES, None, "vae", "not_a_real_stage"]
 _ARCHS = [
     None,
     "VoxCPM2TalkerForConditionalGeneration",
+    "BreezeForConditionalGeneration",
     "MingTTSForConditionalGeneration",
     "CovoAudioForConditionalGeneration",
     "MyCovoAudioThing",
@@ -255,6 +264,10 @@ def test_arch_matching_is_a_fallback_not_an_override():
     assert detect_tts_model_type("ming_tts", "MingTTSForConditionalGeneration") == "ming_flash_omni_tts"
 
 
+def test_shared_latent_generator_resolves_by_architecture_priority():
+    assert detect_tts_model_type("latent_generator", "VoxCPM2TalkerForConditionalGeneration") == "voxcpm2"
+
+
 def test_stage_keys_cover_legacy_stage_set():
     """No stage key was dropped when the module constants were deleted."""
     assert _LEGACY_TTS_MODEL_STAGES <= all_tts_stage_keys()
@@ -272,34 +285,32 @@ def test_pipeline_stage_list_is_complete():
     assert not missing, f"stage keys claimed by adapters but absent from _PIPELINE_STAGES: {sorted(missing)}"
 
 
-def test_entry_stage_archs_is_ming_only():
-    """Only Ming dense identifies its entry stage by architecture.
+def test_entry_stage_archs_are_explicit():
+    """Only Ming dense and AuK identify their entry stage by architecture.
 
-    Widening this set would change which stage ``_find_tts_stage`` selects in
-    mixed deployments — notably VoxCPM2, which declares ``model_archs`` but is
-    found by its ``latent_generator`` stage key.
+    Both use a generic ``model_stage`` (``llm`` and ``encoder``) that other
+    pipelines share. Widening this set would change which stage
+    ``_find_tts_stage`` selects in mixed deployments — notably VoxCPM2, which
+    declares ``model_archs`` but is found by its ``latent_generator`` stage key.
     """
-    assert tts_entry_stage_archs() == frozenset({"MingTTSForConditionalGeneration"})
+    assert tts_entry_stage_archs() == frozenset({"MingTTSForConditionalGeneration", "AuKForConditionalGeneration"})
 
 
-def test_every_detected_type_is_adapter_backed_or_declared_legacy():
-    """Detection may only name a model that has an adapter or an explicit
-    :data:`LEGACY_TTS_DETECTORS` entry — never an undeclared string."""
-    legacy_names = {d.name for d in LEGACY_TTS_DETECTORS}
+def test_minimax_h3_encoder_is_not_a_tts_stage():
+    """MiniMax H3 shares AuK's ``encoder`` stage key but is not a speech model."""
+    assert "encoder" not in all_tts_stage_keys()
+    assert detect_tts_model_type("encoder", "MiniMaxH3Encoder") is None
+    assert detect_tts_model_type("encoder", "AuKForConditionalGeneration") == "auk"
+
+
+def test_every_detected_type_is_adapter_backed():
+    """Detection may only name a model that has a registered adapter."""
     for stage, arch in itertools.product(_STAGES, _ARCHS):  # full cross product on purpose
         detected = detect_tts_model_type(stage, arch)
         if detected is None:
             continue
-        assert detected in TTS_ADAPTER_REGISTRY or detected in legacy_names, (
+        assert detected in TTS_ADAPTER_REGISTRY, (
             f"detection produced undeclared model type {detected!r} for stage={stage!r} arch={arch!r}"
-        )
-
-
-def test_legacy_detectors_have_no_adapter():
-    """A legacy entry that gained an adapter must be deleted from the list."""
-    for detector in LEGACY_TTS_DETECTORS:
-        assert resolve_adapter(detector.name) is None, (
-            f"{detector.name!r} now has an adapter; remove it from LEGACY_TTS_DETECTORS"
         )
 
 

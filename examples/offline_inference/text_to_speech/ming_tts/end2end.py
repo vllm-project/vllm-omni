@@ -13,6 +13,7 @@ import yaml
 from transformers import AutoTokenizer
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
+from vllm_omni.model_executor.models.common.ming.speaker_extractor import SpeakerEmbeddingExtractor
 from vllm_omni.model_executor.models.ming_tts.config_ming_tts import (
     KEY_CFG,
     KEY_MAX_DECODE_STEPS,
@@ -21,7 +22,6 @@ from vllm_omni.model_executor.models.ming_tts.config_ming_tts import (
     SAMPLE_RATE,
 )
 from vllm_omni.model_executor.models.ming_tts.prompt_assembly import build_ming_dense_prompt
-from vllm_omni.model_executor.models.ming_tts.speaker_extractor import MingSpeakerEmbeddingExtractor
 
 try:
     from .runner import (
@@ -142,7 +142,8 @@ def _resolve_speaker_embedding(args, case: dict, paths: list[str]):
         return _load_speaker_embedding(args.speaker_embedding)
     if not (case.get("auto_extract_speaker_embeddings") or args.extract_speaker_embeddings) or not paths:
         return None
-    embs = MingSpeakerEmbeddingExtractor(args.model).extract_many(paths)
+    # Runs before the engine is built, so nothing has pre-fetched campplus.onnx.
+    embs = SpeakerEmbeddingExtractor(args.model, allow_download=True).extract_many(paths)
     if not embs:
         raise RuntimeError("Speaker extraction produced no embeddings")
     return embs[0] if len(embs) == 1 else torch.stack(embs, dim=0)

@@ -1,20 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Unit tests for OmniDiffusionConfig master_port resolution (issue #3794)."""
 
 import socket
 
 import pytest
 
+from tests.helpers.runtime import get_open_port
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
-
-
-def _get_available_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("", 0))
-        return sock.getsockname()[1]
 
 
 def _bind_available_port_below(max_port: int, port_inc: int) -> socket.socket:
@@ -36,27 +31,27 @@ def _bind_available_port_below(max_port: int, port_inc: int) -> socket.socket:
 
 class TestOmniDiffusionConfigMasterPort:
     def test_honors_master_port_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        port = _get_available_port()
+        port = get_open_port()
         monkeypatch.setenv("MASTER_PORT", str(port))
         config = OmniDiffusionConfig(model="test")
         assert config.master_port == port
 
     def test_honors_explicit_master_port(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv("MASTER_PORT", raising=False)
-        port = _get_available_port()
+        port = get_open_port()
         config = OmniDiffusionConfig(model="test", master_port=port)
         assert config.master_port == port
 
     def test_master_port_env_takes_precedence_over_kwarg(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        env_port = _get_available_port()
-        kwarg_port = _get_available_port()
+        env_port = get_open_port()
+        kwarg_port = get_open_port()
         monkeypatch.setenv("MASTER_PORT", str(env_port))
         config = OmniDiffusionConfig(model="test", master_port=kwarg_port)
         assert config.master_port == env_port
 
     def test_explicit_master_port_is_stable_without_jitter(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv("MASTER_PORT", raising=False)
-        port = _get_available_port()
+        port = get_open_port()
         ports = {OmniDiffusionConfig(model="test", master_port=port).master_port for _ in range(5)}
         assert ports == {port}
 
