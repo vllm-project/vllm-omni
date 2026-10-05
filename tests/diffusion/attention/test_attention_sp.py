@@ -7,13 +7,23 @@ What is tested
 --------------
 * ``test_sequence_parallel`` verifies that the ``Attention`` layer produces
   numerically equivalent results whether the sequence is processed on a single
-  rank (baseline, SP=1) or sharded across multiple ranks via Ulysses/Ring SP.
-  The test spawns two separate multi-process runs with ``torch.multiprocessing.spawn``:
-  1. Baseline   – world_size=1, ulysses_degree=1, ring_degree=1.
-  2. SP run     – world_size=ulysses_degree*ring_degree, each rank holds a
-                  contiguous slice of the full sequence.
+  rank (baseline, SP=1) or sharded across multiple ranks via Ulysses / Ring /
+  AllGather-KV SP.  The test spawns two separate multi-process runs with
+  ``torch.multiprocessing.spawn``:
+  1. Baseline   – world_size=1, no SP.
+  2. SP run     – world_size=ulysses_degree*ring_degree*allgather_degree, each
+                  rank holds a contiguous slice of the full sequence.
   After both runs, rank-0 output tensors are compared element-wise with a
   tolerance appropriate for the dtype (bfloat16).
+
+* The ``_Mock*`` tests pin the communication contract of the parallel attention
+  strategies on CPU, without a GPU or a process group.  For the composed
+  Ulysses x AllGather-KV strategy in particular they assert the *ordering* of
+  the collectives (Ulysses first, then the K/V AllGather, then joint re-attach),
+  which the multi-process equivalence test cannot observe on its own: softmax
+  attention is invariant to a permutation of the K/V slots, so a wrong region
+  order only shows up when a mask or sparse index makes the slot position
+  meaningful.
 
 SP-plan hooks are NOT applied in this test
 ------------------------------------------
@@ -30,12 +40,17 @@ import tempfile
 
 import pytest
 import torch
+import torch.distributed
 
 from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata, QueryRange
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.attention.parallel.allgather_kv import (
     AllGatherKVParallelAttention,
+)
+from vllm_omni.diffusion.attention.parallel.ulysses import UlyssesParallelAttention
+from vllm_omni.diffusion.attention.parallel.ulysses_allgather import (
+    UlyssesAllGatherKVParallelAttention,
 )
 from vllm_omni.diffusion.config import set_current_diffusion_config
 from vllm_omni.diffusion.data import (
@@ -62,6 +77,14 @@ def update_environment_variables(envs_dict: dict[str, str]):
 def seed_everything(seed: int):
     torch.manual_seed(seed)
     current_omni_platform.manual_seed(seed)
+
+
+def _sp_kind_label(ulysses_degree: int, ring_degree: int, allgather_degree: int) -> str:
+    if allgather_degree > 1 and ulysses_degree > 1:
+        return f"ulysses={ulysses_degree}, allgather={allgather_degree}"
+    if allgather_degree > 1:
+        return f"allgather={allgather_degree}"
+    return f"ulysses={ulysses_degree}, ring={ring_degree}"
 
 
 class TestAttentionModel(torch.nn.Module):
@@ -410,6 +433,142 @@ def test_allgather_kv_keeps_gathered_kv_compressed_for_gqa():
     torch.testing.assert_close(v_full, expected_value)
 
 
+class _MockComposedSPGroup(_MockAllGatherSPGroup):
+    """AllGather SP-group stub extended with the Ulysses sub-group fields."""
+
+    def __init__(self, *, rank: int, allgather_world_size: int, gather_chunks: list[list[torch.Tensor]]) -> None:
+        super().__init__(rank=rank, gather_chunks=gather_chunks)
+        self.allgather_world_size = allgather_world_size
+        self.ulysses_group = object()
+        self.ulysses_world_size = 2
+        self.ulysses_rank = rank % 2
+
+
+def test_composed_strategy_orders_ulysses_before_allgather(monkeypatch):
+    """K/V must be gathered *after* the Ulysses reshard, and joint K/V after that.
+
+    Gathering pre-Ulysses shards would concatenate the strided head layout of
+    different regions (a permuted sequence), and folding joint K/V in before the
+    gather would replicate them once per AllGather rank. Both are pinned here by
+    the recorded gather shapes and the final key length.
+    """
+    rank = 1
+    img_local = 2  # S / (U * A), the rank's own shard
+    region = 4  # S / A, after the Ulysses all-to-all
+    heads_local = 2
+    joint_len = 1
+    head_dim = 1
+
+    key_chunks = [torch.full((1, region, heads_local, head_dim), 10.0 + i) for i in range(2)]
+    value_chunks = [torch.full((1, region, heads_local, head_dim), 20.0 + i) for i in range(2)]
+    sp_group = _MockComposedSPGroup(rank=rank, allgather_world_size=2, gather_chunks=[key_chunks, value_chunks])
+
+    seen: dict[str, object] = {}
+
+    def fake_pre_attention(self, query, key, value, attn_metadata, defer_joint=False):
+        seen["defer_joint"] = defer_joint
+        seen["ulysses_input_seq_len"] = query.shape[1]
+        joint = torch.ones(1, joint_len, heads_local, head_dim)
+        if attn_metadata is not None:
+            attn_metadata.joint_query = joint
+            attn_metadata.joint_key = joint
+            attn_metadata.joint_value = joint
+        return (
+            torch.zeros(1, region, heads_local, head_dim),
+            torch.full((1, region, heads_local, head_dim), 10.0 + rank),
+            torch.full((1, region, heads_local, head_dim), 20.0 + rank),
+            attn_metadata,
+            "ulysses-ctx",
+        )
+
+    def fake_post_attention(self, attn_output, ctx):
+        seen["post_ctx"] = ctx
+        return attn_output
+
+    monkeypatch.setattr(UlyssesParallelAttention, "pre_attention", fake_pre_attention)
+    monkeypatch.setattr(UlyssesParallelAttention, "post_attention", fake_post_attention)
+
+    strategy = UlyssesAllGatherKVParallelAttention(sp_group, scatter_idx=2, gather_idx=1, use_sync=False)
+    # Skip the one-time region-length collective: it is covered separately.
+    strategy._validated_region_len = region
+
+    query = torch.zeros(1, img_local, 4, head_dim)
+    key = torch.zeros(1, img_local, 4, head_dim)
+    value = torch.zeros(1, img_local, 4, head_dim)
+
+    q_out, k_out, v_out, _, ctx = strategy.pre_attention(query, key, value, AttentionMetadata(joint_strategy="front"))
+
+    assert seen["defer_joint"] is True
+    assert seen["ulysses_input_seq_len"] == img_local, "Ulysses must see the local shard, not the gathered one"
+    # The gather consumed post-Ulysses K/V, exactly once each, on the AllGather group.
+    assert sp_group.gathered_input_shapes == [(1, region, heads_local, head_dim)] * 2
+    # Joint K/V are re-attached after the gather, so they appear exactly once.
+    assert k_out.shape[1] == joint_len + 2 * region
+    assert v_out.shape[1] == joint_len + 2 * region
+    assert q_out.shape[1] == joint_len + region
+    torch.testing.assert_close(k_out[:, joint_len:], torch.cat(key_chunks, dim=1))
+    torch.testing.assert_close(v_out[:, joint_len:], torch.cat(value_chunks, dim=1))
+
+    # The reverse transform stays Ulysses', on the same ctx.
+    assert strategy.post_attention(q_out, ctx) is q_out
+    assert seen["post_ctx"] == "ulysses-ctx"
+    assert strategy.name == "ulysses_allgather_kv"
+
+
+def test_composed_strategy_rejects_2d_key_mask():
+    sp_group = _MockComposedSPGroup(
+        rank=0,
+        allgather_world_size=2,
+        gather_chunks=[[torch.zeros(1, 2, 1, 1)] * 2, [torch.zeros(1, 2, 1, 1)] * 2],
+    )
+    strategy = UlyssesAllGatherKVParallelAttention(sp_group, scatter_idx=2, gather_idx=1, use_sync=False)
+    metadata = AttentionMetadata(attn_mask=torch.ones(1, 8, dtype=torch.bool))
+
+    with pytest.raises(NotImplementedError, match="2D key mask"):
+        strategy.pre_attention(torch.zeros(1, 2, 4, 1), torch.zeros(1, 2, 4, 1), torch.zeros(1, 2, 4, 1), metadata)
+
+
+def test_composed_strategy_detects_uneven_allgather_regions(monkeypatch):
+    """Uneven regions fail closed, and the check is skipped in strict mode."""
+    sp_group = _MockComposedSPGroup(
+        rank=0,
+        allgather_world_size=2,
+        gather_chunks=[[torch.zeros(1, 2, 1, 1)] * 2, [torch.zeros(1, 2, 1, 1)] * 2],
+    )
+    strategy = UlyssesAllGatherKVParallelAttention(sp_group, scatter_idx=2, gather_idx=1, use_sync=False)
+
+    collective_calls: list[int] = []
+
+    def fake_all_gather(gathered, local, group=None):
+        collective_calls.append(1)
+        for tensor in gathered:
+            tensor.fill_(4)
+
+    monkeypatch.setattr(torch.distributed, "all_gather", fake_all_gather)
+
+    # Strict mode (default without a forward context): the Ulysses all-to-all
+    # already guarantees equal region lengths, so the check costs no collective.
+    strategy._assert_equal_region_lengths(4, torch.device("cpu"))
+    strategy._assert_equal_region_lengths(4, torch.device("cpu"))
+    assert collective_calls == []
+
+    # advanced_uaa: rank-local region lengths may legitimately differ, so the
+    # check runs on every call and fails closed when they do.
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.attention.parallel.ulysses_allgather.get_ulysses_mode",
+        lambda *, default="strict": "advanced_uaa",
+    )
+    uaa_strategy = UlyssesAllGatherKVParallelAttention(sp_group, scatter_idx=2, gather_idx=1, use_sync=False)
+
+    def fake_all_gather_uneven(gathered, local, group=None):
+        gathered[0].fill_(4)
+        gathered[1].fill_(5)
+
+    monkeypatch.setattr(torch.distributed, "all_gather", fake_all_gather_uneven)
+    with pytest.raises(ValueError, match="equally long region"):
+        uaa_strategy._assert_equal_region_lengths(4, torch.device("cpu"))
+
+
 @hardware_test(res={"cuda": "L4"}, num_cards=4)
 @pytest.mark.parametrize(
     "test_model_cls",
@@ -422,6 +581,7 @@ def test_allgather_kv_keeps_gathered_kv_compressed_for_gqa():
     [
         pytest.param(2, 2, 1, None, id="ulysses-ring"),
         pytest.param(1, 1, 2, None, id="allgather-kv"),
+        pytest.param(2, 1, 2, None, id="ulysses-allgather-kv"),
         pytest.param(1, 2, 1, 2, id="ring-gqa"),
         pytest.param(1, 2, 1, 1, id="ring-mqa"),
     ],
@@ -451,8 +611,8 @@ def test_sequence_parallel(
     head_size: int,
     num_kv_heads: int | None,
 ):
-    """Compare Ulysses/Ring and AllGather-KV SP against a single-rank run."""
-    sequence_parallel_size = allgather_degree if allgather_degree > 1 else ulysses_degree * ring_degree
+    """Compare Ulysses/Ring, AllGather-KV and Ulysses x AllGather-KV SP against a single-rank run."""
+    sequence_parallel_size = ulysses_degree * ring_degree * allgather_degree
 
     # Skip if not enough GPUs available
     available_gpus = current_omni_platform.get_device_count()
@@ -630,10 +790,7 @@ def ulysses_attention_on_test_model(
     RANDOM_SEED = 42
     seed_everything(RANDOM_SEED)
 
-    if allgather_degree > 1:
-        sp_kind = f"allgather={allgather_degree}"
-    else:
-        sp_kind = f"ulysses={ulysses_degree}, ring={ring_degree}"
+    sp_kind = _sp_kind_label(ulysses_degree, ring_degree, allgather_degree)
     mode_str = "Baseline (no SP)" if is_baseline else f"SP ({sp_kind})"
     print(f"\n[{mode_str}] Rank {local_rank}/{world_size} - Random seed set to {RANDOM_SEED}")
 
@@ -802,10 +959,7 @@ def ulysses_attention_on_test_model(
             with open(output_file, "wb") as f:
                 pickle.dump(output_np, f)
 
-            if allgather_degree > 1:
-                sp_kind = f"allgather={allgather_degree}"
-            else:
-                sp_kind = f"ulysses={ulysses_degree}, ring={ring_degree}"
+            sp_kind = _sp_kind_label(ulysses_degree, ring_degree, allgather_degree)
             mode_str = "baseline (no SP)" if is_baseline else f"SP ({sp_kind})"
             print(
                 f"\n[{mode_str}] ✓ Saved output with shape {full_output.shape}:\n"

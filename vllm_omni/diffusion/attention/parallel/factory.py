@@ -14,6 +14,9 @@ from vllm_omni.diffusion.attention.parallel.base import (
 )
 from vllm_omni.diffusion.attention.parallel.ring import RingParallelAttention
 from vllm_omni.diffusion.attention.parallel.ulysses import UlyssesParallelAttention
+from vllm_omni.diffusion.attention.parallel.ulysses_allgather import (
+    UlyssesAllGatherKVParallelAttention,
+)
 from vllm_omni.diffusion.distributed.parallel_state import (
     get_sequence_parallel_world_size,
     get_sp_group,
@@ -64,14 +67,30 @@ def build_parallel_attention_strategy(
             f"allgather={allgather_degree}), but the initialized SP world size is not greater than one."
         )
 
+    # AllGather-KV, optionally composed with Ulysses as an orthogonal 2D
+    # sequence-parallel topology. K/V are gathered over the AllGather group
+    # *after* any Ulysses reshard, so the attention backend always runs a
+    # local-Q/global-KV problem.
     if allgather_degree > 1:
         if causal:
             raise ValueError("AllGather-KV SP only supports non-causal attention.")
-        if ulysses_degree > 1 or ring_degree > 1:
+        if ring_degree > 1:
             raise ValueError(
-                f"AllGather-KV SP is mutually exclusive with Ulysses/Ring in v1 "
+                "AllGather-KV SP cannot be composed with Ring "
                 f"(got ulysses_degree={ulysses_degree}, ring_degree={ring_degree}, "
                 f"allgather_degree={allgather_degree})."
+            )
+        if ulysses_degree > 1:
+            logger.debug(
+                f"Using UlyssesAllGatherKVParallelAttention "
+                f"(ulysses_degree={ulysses_degree}, allgather_degree={allgather_degree})"
+            )
+            return UlyssesAllGatherKVParallelAttention(
+                sp_group=sp_group,
+                scatter_idx=scatter_idx,
+                gather_idx=gather_idx,
+                use_sync=use_sync,
+                ulysses_a2a_permute=ulysses_a2a_permute,
             )
         logger.debug(f"Using AllGatherKVParallelAttention (allgather_degree={allgather_degree})")
         return AllGatherKVParallelAttention(sp_group=sp_group)
