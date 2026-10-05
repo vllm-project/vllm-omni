@@ -56,6 +56,27 @@ async def test_silence_continuation_can_be_turned_off_per_session() -> None:
         await close_harness(h)
 
 
+async def test_turning_silence_continuation_off_mid_session_stops_a_unit_already_waiting_for_its_slot() -> None:
+    """A continuation planned before ``session.update`` applied ``false`` must not submit after it."""
+    h = await open_harness()
+    try:
+        await h.run(append_audio())
+        request_id = h.stage0_request_id()
+        await h.deliver_and_settle(tts_output(request_id, samples=24000, text="hello"))
+        h.deliver(tts_output(request_id, samples=48000, text="hello", tts_is_last_chunk=True, finished=True))
+        for _ in range(20):  # the continuation is planned and sleeps until its slot (one chunk period)
+            await asyncio.sleep(0.005)
+        assert len(h.port.submissions) == 1
+
+        events = await h.run(commands.UpdateSession(patch={"extra_body": {"silence_continuation": False}}))
+
+        assert "session.updated" in types(events) and "error" not in types(events)
+        assert len(h.port.submissions) == 1, "no silence unit after session.update turned continuation off"
+        assert h.runner.model_state.continuation_units == 0
+    finally:
+        await close_harness(h)
+
+
 # --------------------------------------------------------------------------- #
 # Input-clocked sessions (extra_body.clock == "input")                       #
 # --------------------------------------------------------------------------- #
