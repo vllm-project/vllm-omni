@@ -87,6 +87,10 @@ from vllm_omni.model_extras.ming_image import (
     build_text_to_image_prompt as build_ming_image_text_to_image_prompt,
 )
 from vllm_omni.model_extras.sana_video import SANA_VIDEO_EXTRA_BODY_PARAMS
+from vllm_omni.model_extras.sana_video2 import (
+    SANA_VIDEO2_EXTRA_BODY_PARAMS,
+    get_sana_video2_video_generation_defaults,
+)
 from vllm_omni.model_extras.sensenova_u1 import (
     SENSENOVA_U1_EXTRA_BODY_PARAMS,
     SENSENOVA_U1_EXTRA_OUTPUT_PARAMS,
@@ -285,6 +289,11 @@ _EXTRA_SPECS: dict[str, dict[str, Any]] = {
         "init_extra_args_for_non_diffusion_stages": HUNYUAN_IMAGE3_INIT_EXTRA_ARGS_FOR_NON_DIFFUSION_STAGES,
         "ar_input_builder": build_hunyuan_image3_ar_stage_inputs,
         "ar_tokenizer_validator": validate_hunyuan_image3_ar_tokenizer,
+    },
+    "SanaVideo2Pipeline": {
+        "extra_body_params": SANA_VIDEO2_EXTRA_BODY_PARAMS,
+        "video_generation_defaults_builder": get_sana_video2_video_generation_defaults,
+        "reference_image_size_resolver": _always_preserve_reference_image_size,
     },
     "SanaVideoPipeline": {
         "extra_body_params": SANA_VIDEO_EXTRA_BODY_PARAMS,
