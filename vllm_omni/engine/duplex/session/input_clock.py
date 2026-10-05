@@ -79,7 +79,7 @@ from __future__ import annotations
 import math
 import time
 from collections import deque
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass
 from fractions import Fraction
 from typing import TypeGuard
@@ -887,6 +887,33 @@ class InputClock:
     def has_open_units(self) -> bool:
         return bool(self._units)
 
+    def timeout_due(self, units: Collection[InputClockUnit]) -> bool:
+        """Whether ``expire`` would settle one of ``units`` now, or one is a stalled re-submission (no side effects).
+
+        A deferred turn re-submitted into its already-settled slot is no
+        longer open, so ``expire`` never looks at it; its submission still
+        gets the maximum unit age as a deadline here, so a command waiting
+        for it is bounded too.
+        """
+        now = self._clock()
+        if any(
+            unit.complete and unit.ordinal is None and now - unit.started_at >= self.unit_max_age_s for unit in units
+        ):
+            return True
+        return any(unit in units for unit, _ in self._due(now))
+
+    def _due(self, now: float) -> list[tuple[InputClockUnit, str]]:
+        if self._closed or not self._units:
+            return []
+        expired: list[tuple[InputClockUnit, str]] = []
+        if now - self.last_progress >= self.unit_timeout_s:
+            expired.append((self._units[0], REASON_NO_PROGRESS))
+        for unit in self._units:
+            if not unit.placeholder and not unit.complete and now - unit.started_at >= self.unit_max_age_s:
+                if all(unit is not seen for seen, _ in expired):
+                    expired.append((unit, REASON_MAX_AGE))
+        return expired
+
     def expire(self) -> bool:
         """Timeouts: settle units the pipeline will evidently not complete (``timed_out``).
 
@@ -900,16 +927,8 @@ class InputClock:
         A model that breaks the unit contract degrades into slow
         acknowledgements instead of a client that waits forever.
         """
-        if self._closed or not self._units:
-            return False
         now = self._clock()
-        expired: list[tuple[InputClockUnit, str]] = []
-        if now - self.last_progress >= self.unit_timeout_s:
-            expired.append((self._units[0], REASON_NO_PROGRESS))
-        for unit in self._units:
-            if not unit.placeholder and not unit.complete and now - unit.started_at >= self.unit_max_age_s:
-                if all(unit is not seen for seen, _ in expired):
-                    expired.append((unit, REASON_MAX_AGE))
+        expired = self._due(now)
         if not expired:
             return False
         for unit, reason in expired:
