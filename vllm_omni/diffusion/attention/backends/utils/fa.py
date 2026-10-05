@@ -15,6 +15,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # Adapted from https://github.com/huggingface/transformers/blob/main/src/transformers/modeling_flash_attention_utils.py
+import inspect
 from collections.abc import Callable
 from functools import cache, lru_cache
 from typing import Any
@@ -232,6 +233,99 @@ def resolve_vllm_flash_attn_version(requested: str | int | None = None) -> int:
         raise RuntimeError("Cannot resolve FlashAttention without a CUDA device capability")
     supported_versions = frozenset(version for version in (2, 3, 4) if is_fa_version_supported(version))
     return _choose_vllm_flash_attn_version(capability.major, requested, supported_versions)
+
+
+_FA3_MISSING = "A standalone FlashAttention-3 varlen interface (flash_attn_interface) is required"
+
+
+@cache
+def _external_fa3_varlen() -> tuple[FlashAttnFn, frozenset[str] | None] | None:
+    """Return the standalone FlashAttention-3 varlen function and its parameter names, if installed.
+
+    The names are ``None`` when the function's signature cannot be inspected.
+    """
+    try:
+        from flash_attn_interface import flash_attn_varlen_func as func
+    except ImportError:
+        return None
+    try:
+        return func, frozenset(inspect.signature(func).parameters)
+    except (TypeError, ValueError):
+        return func, None
+
+
+@cache
+def flash_attn_3_varlen_unsupported(softcap: bool = False, return_softmax_lse: bool = False) -> str | None:
+    """Return why ``flash_attn_3_varlen`` cannot run with these options, or ``None`` when it can."""
+    provider = _external_fa3_varlen()
+    if provider is None:
+        return _FA3_MISSING
+    parameters = provider[1]
+    if parameters is None:
+        return "The FlashAttention-3 provider's signature cannot be inspected"
+    if softcap and "softcap" not in parameters:
+        return "This FlashAttention-3 provider does not support softcap"
+    if return_softmax_lse and not parameters & {"return_attn_probs", "return_softmax_lse"}:
+        return "This FlashAttention-3 provider does not expose an LSE return option"
+    return None
+
+
+def flash_attn_3_varlen(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    softmax_scale: float | None = None,
+    softcap: float = 0.0,
+    causal: bool = False,
+    return_softmax_lse: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """Call standalone FA3 and return the output, or ``(output, LSE)`` with LSE packed as ``[heads, tokens]``.
+
+    Providers name the LSE request either ``return_attn_probs`` or ``return_softmax_lse``.
+    """
+    softcap = max(float(softcap), 0.0)
+    unsupported = flash_attn_3_varlen_unsupported(softcap > 0, return_softmax_lse)
+    if unsupported is not None:
+        raise (ImportError if unsupported == _FA3_MISSING else NotImplementedError)(unsupported)
+    provider = _external_fa3_varlen()
+    assert provider is not None  # flash_attn_3_varlen_unsupported reports a missing provider
+    func, parameters = provider
+    assert parameters is not None  # and an uninspectable signature
+    kwargs = {
+        "q": q,
+        "k": k,
+        "v": v,
+        "cu_seqlens_q": cu_seqlens_q,
+        "cu_seqlens_k": cu_seqlens_k,
+        "max_seqlen_q": int(max_seqlen_q),
+        "max_seqlen_k": int(max_seqlen_k),
+        "softmax_scale": softmax_scale,
+        "causal": causal,
+    }
+    if "softcap" in parameters:
+        kwargs["softcap"] = softcap
+    if return_softmax_lse:
+        kwargs["return_attn_probs" if "return_attn_probs" in parameters else "return_softmax_lse"] = True
+    result = func(**kwargs)
+    if not return_softmax_lse:
+        out = result[0] if isinstance(result, tuple) and result else result
+        if not isinstance(out, torch.Tensor):
+            raise RuntimeError("FlashAttention-3 must return an output tensor")
+        return out
+    if not isinstance(result, tuple) or len(result) < 2:
+        raise RuntimeError("FlashAttention-3 must return (output, softmax_lse) when LSE is requested")
+    out, lse = result[:2]
+    if not isinstance(out, torch.Tensor) or not isinstance(lse, torch.Tensor):
+        raise RuntimeError("FlashAttention-3 output and softmax_lse must be tensors")
+    expected_shape = (q.shape[1], q.shape[0])
+    if lse.shape != expected_shape:
+        raise RuntimeError(f"Expected packed softmax_lse shape {expected_shape}, got {tuple(lse.shape)}")
+    return out, lse
 
 
 def vllm_flash_attn_varlen_with_lse(
