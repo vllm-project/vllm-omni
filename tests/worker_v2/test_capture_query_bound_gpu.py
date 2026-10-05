@@ -44,6 +44,7 @@ def _check_prefill():
     spec = FullAttentionSpec(block_size=16, num_kv_heads=8, head_size=128, dtype=torch.bfloat16)
     kvconfig = KVCacheConfig(num_blocks=1024, kv_cache_tensors=[], kv_cache_groups=[KVCacheGroupSpec(["attn"], spec)])
     state = OmniModelState.__new__(OmniModelState)
+    state.vllm_config = c
     state.max_model_len = 256
     state.supports_mm_inputs = False
     with set_current_vllm_config(c):

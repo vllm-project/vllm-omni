@@ -437,6 +437,10 @@ class OmniGPUModelRunner(GPUModelRunner):
         capture_first_frame = getattr(self.model, "capture_first_frame_graphs", None)
         if callable(capture_first_frame):
             capture_first_frame()
+        capture_stream = getattr(self.model, "capture_stream_decode_graphs", None)
+        if callable(capture_stream):
+            sizes = [int(s) for s in self.model_state._get_mtp_capture_sizes()]
+            capture_stream(sorted(set(sizes + [1])))
         return result
 
     def _dispatch_mtp_batch_descriptor(self, num_mtp_reqs: int) -> Any:
@@ -746,7 +750,16 @@ class OmniGPUModelRunner(GPUModelRunner):
             # Request-owned state outlives generation slots and chunk boundaries.
             # Notify even if the last chunk already released its runner slot.
             on_finished(finished)
+        finish_state = getattr(self.model_state, "on_requests_finished", None)
+        if finished and callable(finish_state):
+            finish_state(finished)
         preempted = scheduler_output.preempted_req_ids
+        suspend_state = getattr(self.model_state, "on_request_preempted", None)
+        if preempted and callable(suspend_state):
+            for req_id in preempted - finished:
+                idx = self.req_states.req_id_to_index.get(req_id)
+                if idx is not None:
+                    suspend_state(req_id, idx)
         all_done = finished | preempted if preempted else finished
         for req_id in all_done:
             idx = self.req_states.req_id_to_index.get(req_id)

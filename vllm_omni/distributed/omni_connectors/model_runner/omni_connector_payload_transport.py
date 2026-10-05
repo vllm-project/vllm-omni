@@ -1169,7 +1169,12 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
                 self._payload_finished(payload_data),
             )
 
-        self._get_req_chunk[req_id] += 1
+        with self._lock:
+            if self._async_chunk and request is not None and req_id not in self._pending_load_reqs:
+                # A connector get can return after cancellation removed its
+                # receiver. Do not recreate delivery state for that request.
+                return False
+            self._get_req_chunk[req_id] += 1
 
         if self._async_chunk:
             is_finished = self._payload_finished(payload_data)
@@ -1180,8 +1185,16 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
                 if not self._payload_value_has_content(new_ids) and not is_finished:
                     return False
                 payload_consumable = self._payload_is_consumable(payload_data)
+                first_chunk_hook = getattr(self, "_first_chunk_hook", None)
+                if first_chunk_hook is not None and chunk_id == 0 and not is_finished and payload_consumable:
+                    first_chunk_hook(req_id, request, payload_data)
 
             with self._lock:
+                if request is not None and req_id not in self._pending_load_reqs:
+                    # The first-chunk hook may have overlapped cancellation.
+                    # Its slot cleanup is ordered by the model; this payload
+                    # must not republish readiness after receive teardown.
+                    return False
                 if self._model_mode == "ar":
                     # Accumulation, staging, and model-side consume/ack share
                     # this lock. Keeping the transition atomic prevents the
@@ -1723,3 +1736,7 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
         sink: Callable[[OmniConnectorOutput], None] | None,
     ) -> None:
         self._omni_connector_output_sink = sink
+
+    def set_first_chunk_hook(self, hook: Callable[[str, Any, OmniPayload], bool]) -> None:
+        """Claim eligible first chunks before publishing them to the model loop."""
+        self._first_chunk_hook = hook

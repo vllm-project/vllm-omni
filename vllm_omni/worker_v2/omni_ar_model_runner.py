@@ -14,6 +14,7 @@ Extends ``OmniGPUModelRunner`` with:
 from __future__ import annotations
 
 from contextlib import nullcontext
+from functools import partial
 from typing import Any, cast
 
 import numpy as np
@@ -37,6 +38,7 @@ from vllm_omni.utils.mm_outputs import partition_flat_payload
 from vllm_omni.worker_v2.omni_model_runner import OmniGPUModelRunner
 from vllm_omni.worker_v2.omni_sampler import sample_with_output
 from vllm_omni.worker_v2.output_snapshot import PackedOutputSnapshot, RequestOutputSnapshot, pack_output_snapshot
+from vllm_omni.worker_v2.streaming_audio import StreamingAudioOutput
 
 logger = init_logger(__name__)
 _ASYNC_MM_SNAPSHOT_MAX_BUCKETS_PER_SLOT = 64
@@ -135,6 +137,23 @@ class OmniARModelRunner(OmniGPUModelRunner):
     # ------------------------------------------------------------------
     # sample_tokens: OmniOutput handling + pooler_output + async D2H
     # ------------------------------------------------------------------
+
+    def sample(self, hidden_states, input_batch, grammar_output):
+        # An explicitly declared model-state hook may return already determined
+        # tokens. Unsupported sampling features retain the upstream path.
+        sample_determined = getattr(type(self.model_state), "sample_determined_tokens", None)
+        if (
+            sample_determined is not None
+            and grammar_output is None
+            and self.batch_sharder is None
+            and self.pp_handler is None
+            and input_batch.num_draft_tokens == 0
+            and input_batch.num_reqs > 0
+        ):
+            output = sample_determined(self.model_state, input_batch, self.sampler)
+            if output is not None:
+                return output, output.num_sampled, output.num_rejected
+        return super().sample(hidden_states, input_batch, grammar_output)
 
     @torch.inference_mode()
     @step_eplb_after()
@@ -250,6 +269,13 @@ class OmniARModelRunner(OmniGPUModelRunner):
         model_runner_output.kv_extracted_req_ids = kv_extracted
         model_runner_output._async_chunk = bool(getattr(self.model_config, "async_chunk", False))
 
+        prepare_streaming = getattr(self.model_state, "prepare_streaming_audio_output", None)
+        streaming_audio = (
+            prepare_streaming(input_batch, self.req_states, multimodal_outputs)
+            if need_pooler and multimodal_outputs and callable(prepare_streaming)
+            else None
+        )
+
         # --- Async D2H via OmniAsyncOutput ---
         materialize_native = self._uses_native_output_materializer()
         async_output = OmniAsyncOutput(
@@ -266,6 +292,7 @@ class OmniARModelRunner(OmniGPUModelRunner):
             finalize_multimodal=sampling_output.finalize_multimodal,
             check_ep_fault=self.check_ep_fault,
             routed_experts=routed_experts,
+            streaming_audio=streaming_audio,
             extra_multimodal_outputs=extra_outputs,
         )
         self._release_multimodal_snapshot(snapshot_slot, async_output.copy_event)
@@ -296,6 +323,15 @@ class OmniARModelRunner(OmniGPUModelRunner):
 
     def _retain_multimodal_outputs(self, outputs: dict[str, Any]) -> dict[str, Any]:
         if not bool(getattr(self.model_config, "async_chunk", False)) or not outputs:
+            return outputs
+        if getattr(self.model, "mm_outputs_fresh_per_step", False):
+            # Freshly allocated each step and filled after sampling; nothing
+            # overwrites them before the host copy.
+            return outputs
+        # A producer-side PackedOutputSnapshot already owns its device slabs
+        # for this forward and carries the event that makes them visible to
+        # the output copy stream. Repacking it would add a second GPU copy.
+        if isinstance(outputs, PackedOutputSnapshot):
             return outputs
         slot_index = self._async_mm_snapshot_cursor
         if self._async_mm_snapshot_pending[slot_index]:
@@ -516,6 +552,12 @@ def _async_copy_mm_value(
             for key, val in value.items()
         }
     if isinstance(value, list):
+        if len(value) > 1 and isinstance(value[0], torch.Tensor) and value[0].device.type == "cpu":
+            first = value[0]
+            if all(val is first for val in value):
+                # One shared per-step host tensor (e.g. every request's sample
+                # rate): one copy serves all entries.
+                return [_async_copy_tensor(first)] * len(value)
         return [
             _async_copy_mm_value(
                 val,
@@ -547,6 +589,8 @@ def _async_copy_mm(
     if not mm_outputs:
         return {}
     if isinstance(mm_outputs, PackedOutputSnapshot):
+        if mm_outputs.producer_event is not None:
+            mm_outputs.producer_event.wait(copy_stream)
         return mm_outputs.copy_to_cpu(
             lambda tensor: _async_copy_tensor(tensor, copy_stream=copy_stream, pin_memory=pin_memory)
         )
@@ -679,6 +723,7 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
         finalize_multimodal: Any | None = None,
         check_ep_fault: bool = False,
         routed_experts: RoutedExpertsTensors | None = None,
+        streaming_audio: StreamingAudioOutput | None = None,
         extra_multimodal_outputs: tuple[dict[str, Any], torch.cuda.Event] | None = None,
     ):
         self.model_runner_output = model_runner_output
@@ -768,17 +813,31 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
             self._hidden_cpu: torch.Tensor | None = None
             self._mm_cpu: dict[str, Any] = {}
             self._mm_snapshot: dict[str, Any] = {}
+            self._streaming_audio = (
+                streaming_audio.to_cpu(
+                    copy_stream, partial(_async_copy_tensor, copy_stream=copy_stream, pin_memory=pin_memory)
+                )
+                if streaming_audio is not None
+                else None
+            )
             if self._need_pooler and (self._async_chunk or self._finalize_multimodal is not None):
                 # CUDA graph replay reuses the model's output buffers. Take
                 # ownership directly in pinned host memory on the output copy
                 # stream so deferred finalization never performs a blocking
                 # D2H copy on the runner thread.
-                self._mm_snapshot = _async_copy_mm(
-                    multimodal_outputs,
-                    self._total_tokens,
-                    copy_stream=copy_stream,
-                    pin_memory=pin_memory,
-                )
+                if (
+                    streaming_audio is None
+                    or self._finalize_multimodal is not None
+                    or extra_multimodal_outputs is not None
+                ):
+                    # PCM owns its request partition. Generic codes/meta are
+                    # discarded unless a finalizer or extra payload needs them.
+                    self._mm_snapshot = _async_copy_mm(
+                        multimodal_outputs,
+                        self._total_tokens,
+                        copy_stream=copy_stream,
+                        pin_memory=pin_memory,
+                    )
                 if extra_multimodal_outputs:
                     # Produced after sampling on the producer stream; copy only
                     # once its completion event has been observed.
@@ -856,7 +915,9 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
                     pooler_client is not None and len(pooler_client) != self._num_reqs
                 ):
                     raise ValueError("Model-owned output snapshot does not match the request batch")
-            else:
+            elif self._streaming_audio is None:
+                # In-stage PCM already owns its request partition. Building
+                # generic code payloads here would immediately discard them.
                 pooler_inter, pooler_client = OmniARModelRunner._build_async_chunk_outputs_from_mm(
                     self._mm_snapshot,
                     self._query_start_loc_np,
@@ -865,6 +926,8 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
                     self._total_tokens,
                     self._padded_total_tokens,
                 )
+            if self._streaming_audio is not None:
+                pooler_inter, pooler_client = None, self._streaming_audio.get_output()
             self.model_runner_output.pooler_output = None if self._async_chunk else pooler_inter
             self.model_runner_output.inter_stage_outputs = pooler_inter
             self.model_runner_output.multimodal_outputs = (

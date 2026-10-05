@@ -111,7 +111,7 @@ class TestFailureCounterWiring:
         obj.request_states["req-1"] = SimpleNamespace(
             metrics=SimpleNamespace(
                 e2e_done=set(),
-                build_and_log_summary=lambda: None,
+                log_timing_summary=lambda: None,
             ),
             failure_recorded=False,
         )
@@ -127,7 +127,7 @@ class TestFailureCounterWiring:
         obj.request_states["req-1"] = SimpleNamespace(
             metrics=SimpleNamespace(
                 e2e_done=set(),
-                build_and_log_summary=lambda: None,
+                log_timing_summary=lambda: None,
             ),
             failure_recorded=False,
         )

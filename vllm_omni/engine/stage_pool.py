@@ -99,6 +99,8 @@ class StagePool:
 
     DISPATCH_WAIT_TIMEOUT_S: float = 10.0
     DISPATCH_RETRY_INTERVAL_S: float = 0.1
+    # A replica that dies mid-release never answers; without a bound its background release never finishes.
+    RELEASE_RPC_TIMEOUT_S: float = 5.0
     # Only these EngineCore helpers may skip collective_rpc_async. A generic
     # ``{method}_async`` on AsyncMPClient must not silently drop timeout.
     _CACHE_RESET_METHODS = frozenset({"reset_prefix_cache", "reset_encoder_cache", "reset_mm_cache"})
@@ -135,6 +137,9 @@ class StagePool:
         self.clients: list[StagePoolClient | None] = list(normalized_clients)
         self._output_processor = output_processor
         self._stage_vllm_config = stage_vllm_config
+        self._has_chunk_transfer_adapter = bool(
+            getattr(getattr(stage_vllm_config, "model_config", None), "async_chunk", False)
+        )
         self._next_replica_id = 0
         self._request_bindings: dict[str, int] = {}
         self._unavailable_replicas: set[int] = set()
@@ -1303,6 +1308,28 @@ class StagePool:
                     commit(replica_request_ids, internal=False)
 
         return abort_outputs
+
+    async def release_request_resources(self, request_ids: list[str]) -> None:
+        """Ask every live replica to drop transfer resources for *request_ids*.
+
+        Broadcast rather than binding-routed: the orchestrator releases route
+        bindings as part of the same teardown, so a binding lookup here would
+        race it. The engine-core handler is idempotent for unknown ids.
+        """
+        if not request_ids or not self._has_chunk_transfer_adapter:
+            return
+        ids = list(request_ids)
+
+        async def release(replica_id: int, call: Any) -> None:
+            try:
+                await asyncio.wait_for(call("omni_release_request_resources", ids), timeout=self.RELEASE_RPC_TIMEOUT_S)
+            except Exception as e:
+                logger.warning(
+                    "[StagePool-%s] release_request_resources on replica %s failed: %r", self.stage_id, replica_id, e
+                )
+
+        calls = [(i, getattr(self.clients[i], "call_utility_async", None)) for i in self.live_replica_ids()]
+        await asyncio.gather(*(release(i, call) for i, call in calls if call is not None))
 
     async def collective_rpc(
         self,

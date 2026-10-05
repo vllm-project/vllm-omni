@@ -38,6 +38,12 @@ def init_omni_model_state(
         getattr(model, flag, False) is True for flag in ("has_preprocess", "has_postprocess", "have_multimodal_outputs")
     )
     if uses_omni_lifecycle:
+        factory = getattr(type(model), "create_mrv2_model_state", None)
+        if callable(factory):
+            state = factory(model, vllm_config, encoder_cache, device)
+            if not isinstance(state, ModelState):
+                raise TypeError("create_mrv2_model_state must return a ModelState")
+            return state
         from vllm_omni.worker_v2.model_states.omni_model_state import (
             OmniModelState,
         )

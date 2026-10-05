@@ -101,6 +101,23 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
     max_num_running_reqs: int
 
+    def reset_prefix_cache(self, reset_running_requests: bool = False, reset_connector: bool = False) -> bool:
+        model_config = self.vllm_config.model_config
+        if (
+            reset_running_requests
+            and self.running
+            and not getattr(model_config, "supports_running_prefix_cache_reset", True)
+        ):
+            # Reset preempts and resumes in the same step while discarding
+            # in-flight tokens. The stateful codec and queued PCM have already
+            # consumed those frames and cannot roll back to that boundary.
+            logger.warning(
+                "This stage cannot reset running requests; wait for "
+                "completion or abort them before resetting the prefix cache."
+            )
+            return False
+        return super().reset_prefix_cache(reset_running_requests, reset_connector)
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         # Track requests that need KV cache transfer when finished
@@ -127,8 +144,11 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         # Track requests that have already triggered prefill transfer to avoid duplicates
         self.transfer_triggered_requests: set[str] = set()
 
-        # Cache per-request flag to avoid repeated deserialization of additional_information
-        self._omits_kv_transfer_cache: dict[str, bool] = {}
+        # Cache per-request flags to avoid repeated deserialization of
+        # additional_information. Value is (payload_id, is_stage_zero_final,
+        # force_kv_transfer); payload_id invalidates the entry when the
+        # object is replaced.
+        self._omits_kv_transfer_cache: dict[str, tuple[int, bool, bool]] = {}
 
         # KV-wait start ts for the vllm_omni:kv_wait_s metric; see
         # _emit_kv_wait_output for the engine-core → orchestrator carry.
@@ -247,26 +267,40 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             return config.get(key, default)
         return getattr(config, key, default) if config is not None else default
 
-    def _request_omits_kv_transfer_to_next_stage(self, request: Request) -> bool:
-        """True when this stage-zero-final request does not need downstream KV.
-
-        The result is cached per request to avoid repeated deserialization of
-        additional_information on every scheduler tick.
-        """
-        rid = request.request_id
-        cached = self._omits_kv_transfer_cache.get(rid)
-        if cached is not None:
-            return cached
-
+    def _omni_final_stage_flags(self, request: Request) -> tuple[bool, bool]:
+        """Return ``(is_stage_zero_final, force_kv_transfer)`` from request metadata."""
         payload = getattr(request, "additional_information", None)
         if payload is None:
-            result = False
-        else:
-            info = deserialize_additional_information(payload)
-            result = info.get("omni_final_stage_id") == 0 and not bool(info.get("omni_force_kv_transfer", False))
+            return False, False
 
-        self._omits_kv_transfer_cache[rid] = result
-        return result
+        cache = getattr(self, "_omits_kv_transfer_cache", None)
+        rid = request.request_id
+        payload_id = id(payload)
+        if cache is not None:
+            cached = cache.get(rid)
+            if cached is not None and cached[0] == payload_id:
+                return cached[1], cached[2]
+
+        info = deserialize_additional_information(payload)
+        is_final = info.get("omni_final_stage_id") == 0
+        force_kv = bool(info.get("omni_force_kv_transfer", False))
+        if cache is not None:
+            cache[rid] = (payload_id, is_final, force_kv)
+        return is_final, force_kv
+
+    def _request_omits_kv_transfer_to_next_stage(self, request: Request) -> bool:
+        """True when this stage-zero-final request does not need downstream KV."""
+        is_final, force_kv = self._omni_final_stage_flags(request)
+        return is_final and not force_kv
+
+    def _request_omits_chunk_transfer_to_next_stage(self, request: Request) -> bool:
+        """True when this request has no downstream chunk consumer.
+
+        CFG companions still force KV transfer but are stage-0-final for
+        ordinary inter-stage chunks, so they omit ``save_async`` here.
+        """
+        is_final, _ = self._omni_final_stage_flags(request)
+        return is_final
 
     def _should_defer_waiting_admission(self) -> bool:
         return False
@@ -398,6 +432,9 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         pooler_outputs = model_runner_output.pooler_output
         mm_outputs = getattr(model_runner_output, "multimodal_outputs", None)
         inter_stage_outputs = getattr(model_runner_output, "inter_stage_outputs", None)
+        # Token-only processors need sampled IDs even without a tensor payload.
+        processor = getattr(getattr(self, "chunk_transfer_adapter", None), "custom_process_next_stage_input_func", None)
+        requires_token_updates = getattr(processor, "requires_token_updates", False) is True
         num_nans_in_logits = model_runner_output.num_nans_in_logits
         kv_connector_output = model_runner_output.kv_connector_output
         ec_connector_output = getattr(model_runner_output, "ec_connector_output", None)
@@ -517,7 +554,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 # domains must consume the old frame before new output passes.
                 request.async_tokens_to_discard = max(0, stale_async_tokens - len(generated_token_ids))
 
-            if output_is_stale or async_output_is_stale:
+            if async_output_is_stale or (output_is_stale and request.drop_stale_output):
                 # Output of a step scheduled before the request's in-flight
                 # tokens were discarded (segment stop / session replacement).
                 # num_computed_tokens was rolled back at the discard site, so
@@ -556,12 +593,13 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 # tokens and rejections. If some tokens are rejected,
                 # num_computed_tokens is decreased by the number of rejected
                 # tokens.
-                if request.num_computed_tokens > 0:
-                    request.num_computed_tokens -= num_rejected
-                # If async scheduling, num_output_placeholders also includes
-                # the scheduled spec tokens count and so is similarly adjusted.
-                if request.num_output_placeholders > 0:
-                    request.num_output_placeholders -= num_rejected
+                if not output_is_stale:
+                    if request.num_computed_tokens > 0:
+                        request.num_computed_tokens -= num_rejected
+                    # If async scheduling, num_output_placeholders also includes
+                    # the scheduled spec tokens count and so is similarly adjusted.
+                    if request.num_output_placeholders > 0:
+                        request.num_output_placeholders -= num_rejected
                 spec_decoding_stats = self.make_spec_decoding_stats(
                     spec_decoding_stats,
                     num_draft_tokens=num_draft_tokens,
@@ -600,7 +638,10 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             # Check for stop and update request status.
             if new_token_ids:
                 num_sampled_tokens = len(new_token_ids)
-                new_token_ids, stopped = self._update_request_with_output(request, new_token_ids)
+                if output_is_stale:
+                    new_token_ids, stopped = self._update_request_with_output(request, new_token_ids, is_stale=True)
+                else:
+                    new_token_ids, stopped = self._update_request_with_output(request, new_token_ids)
                 if new_logprobs is not None and len(new_token_ids) < num_sampled_tokens:
                     # A mid-step stop (e.g. spec-decode tokens sampled past
                     # EOS) trims new_token_ids after the validation slice
@@ -648,6 +689,13 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
             confirmed_num_computed_tokens = None
             boundary_generation = None
+            # Only when this step might save. Read additional_information
+            # before _free_request rewrites it.
+            omits_chunk_transfer = False
+            if self.chunk_transfer_adapter is not None and (
+                inter_stage_output is not None or (new_token_ids and requires_token_updates) or stopped
+            ):
+                omits_chunk_transfer = self._request_omits_chunk_transfer_to_next_stage(request)
             # Capture before resumable stop handling can clear token history.
             output_token_ids: Any = getattr(request, "output_token_ids", None)
             if output_token_ids is None:
@@ -704,6 +752,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                     # a queued streaming update, and adding twice swallows the
                     # next duplex unit's listen/speak under async scheduling.
                     if request.num_in_flight_tokens > 0:
+                        request.drop_stale_output = True
                         request.num_stale_output_tokens = request.num_in_flight_tokens
                     if outstanding_async_tokens > 0:
                         # Discard only outputs that are already in flight and
@@ -765,8 +814,21 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 # Invariant: EngineCore returns no partial prefill outputs.
                 assert not prompt_logprobs_tensors
 
-            if self.chunk_transfer_adapter is not None and (
-                inter_stage_output is not None or is_segment_finished or finished
+            if omits_chunk_transfer and inter_stage_output is not None:
+                logger.warning(
+                    "Skipping inter-stage chunk for request %s: "
+                    "omni_final_stage_id=0 but inter_stage_output is present",
+                    req_id,
+                )
+            if (
+                self.chunk_transfer_adapter is not None
+                and not omits_chunk_transfer
+                and (
+                    inter_stage_output is not None
+                    or (new_token_ids and requires_token_updates)
+                    or is_segment_finished
+                    or finished
+                )
             ):
                 save_kwargs = {
                     "new_token_ids": new_token_ids,
@@ -884,6 +946,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         # a resumable stop applies a queued update through this helper.
         in_flight_tokens = int(getattr(session, "num_in_flight_tokens", 0) or 0)
         if in_flight_tokens > 0:
+            session.drop_stale_output = True
             session.num_stale_output_tokens = in_flight_tokens
         if outstanding_async_tokens > 0:
             # Async scheduling may already have sampled the previous
@@ -1405,6 +1468,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             if status is not None:
                 request.status = status
         if native_transfer and connector_delay_free_blocks:
+            assert transfer_params is not None
             kv_xfer_params = {
                 **(kv_xfer_params or {}),
                 "transfer_id": transfer_params["transfer_id"],
