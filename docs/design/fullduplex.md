@@ -463,7 +463,10 @@ and an append's outcome and the timeout checks are settled from the mailbox
 too, so an acknowledgement never overtakes the output it covers. A unit takes
 its ordinal among its epoch's Stage0 submissions when Stage0 accepts it, and
 the n-th Stage0 segment end of the epoch decides that unit (also after the
-unit was settled, so late output is never credited to the next unit); a
+unit was settled, so late output is never credited to the next unit; a unit
+settled before Stage0 accepted it stays matchable until its submission
+resolves, and a deferred turn submitted after its reserved slot was settled
+takes that settled unit's place unless a client input submitted it); a
 non-final stage only ends a unit through a decision, and only
 the final stage completes a speaking unit. Two optional hooks carry what only
 the model knows. `unit_decision(stage_id, decision, output, context,

@@ -948,6 +948,35 @@ async def test_late_audio_of_a_timed_out_speaking_unit_is_not_credited_to_the_ne
 
 
 @pytest.mark.usefixtures("input_clock_model")
+async def test_a_unit_timed_out_in_submission_keeps_its_segment_end_from_the_next_unit() -> None:
+    """Unit 1 times out before Stage 0 accepted it; unit 2 queues behind it; unit 1's segment end
+    overtakes its acceptance callback: it must not decide (and acknowledge) unit 2."""
+    h = await open_harness(extra_body=INPUT_CLOCK)
+    try:
+        now = _fake_time(h)
+        h.port.submit_gate = asyncio.Event()
+        h.submit(append_audio())
+        await asyncio.wait_for(h.port.submit_started.wait(), timeout=2.0)
+        now[0] += DEFAULT_UNIT_TIMEOUT_S
+        h.runner._on_input_clock_timer()
+        (ack,) = _acks(await h.settle(timeout_s=0.3))
+        assert _units(ack) == [("timed_out", "no_progress")]
+        h.submit(append_audio())  # queued behind unit 1's submission
+        await h.settle(timeout_s=0.3)
+
+        events = await _deliver_listen_at(h, h.stage0_request_id(), epoch=0)  # unit 1's, ahead of its callback
+        assert _acks(events) == [], "unit 2 has not even been submitted"
+
+        h.port.submit_gate.set()
+        await h.settle()
+        assert len(h.port.submissions) == 2
+        (ack,) = _acks(await _deliver_listen(h, h.stage0_request_id()))
+        assert ack.input_index == 2 and _units(ack) == [("listen", None)]
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.usefixtures("input_clock_model")
 async def test_a_failing_completion_hook_does_not_send_an_error_per_output(monkeypatch: pytest.MonkeyPatch) -> None:
     def _boom(self, **kwargs):
         raise RuntimeError("plugin bug")

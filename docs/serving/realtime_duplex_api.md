@@ -582,7 +582,9 @@ chunk or an 80 ms frame) or, for a commit-based model, one committed turn.
 Settling a unit only releases the acknowledgements: if the model's output
 for a settled unit still arrives, it is sent as usual and stays that unit's —
 it is never credited to the next unit (except output of a cancelled
-response, which is dropped).
+response, which is dropped). This includes a unit settled before the model had even accepted it, and a
+deferred committed turn whose slot timed out before the response it waited
+for ended and submitted it.
 
 Input clocking is available only for models whose plugin declares it
 (`DuplexModelPlugin.supports_input_clock`), because the engine needs the
