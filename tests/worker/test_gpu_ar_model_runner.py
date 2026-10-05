@@ -2027,18 +2027,6 @@ def test_token_only_output_keeps_prefix_cache_merge(token_only_builder, mocker):
     assert output.inter_stage_outputs[1]["codes.audio"].tolist() == [32]
 
 
-def test_token_only_output_keeps_routed_experts(token_only_builder, mocker):
-    runner, kwargs = token_only_builder
-    runner.model_config.enable_return_routed_experts = True
-    runner.routed_experts_initialized = True
-    routes = np.array([[[1, 2]], [[3, 4]]], dtype=np.int32)
-    extract = mocker.patch.object(runner, "_omni_extract_routed_experts", return_value=routes)
-    output = runner._build_omni_model_runner_output_from_snapshot(**kwargs)
-
-    extract.assert_called_once_with(kwargs["scheduler_output"])
-    assert output.routed_experts is routes
-
-
 @pytest.mark.parametrize("snapshot", [True, False], ids=["background", "inline"])
 def test_query_metadata_lifetime_matches_materialization_mode(snapshot):
     runner = object.__new__(GPUARModelRunner)

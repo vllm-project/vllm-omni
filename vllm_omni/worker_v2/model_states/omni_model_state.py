@@ -760,7 +760,8 @@ class OmniModelState(DefaultModelState):
             n_tok = int(input_batch.num_scheduled_tokens[i])
             if (
                 self._eager_mtp
-                and self.model.stream_decoder is not None
+                # Only the Qwen3-TTS Talker has an in-Talker streaming codec.
+                and getattr(self.model, "stream_decoder", None) is not None
                 and self._eager_state.replay_inputs(
                     buf["req_id"],
                     req_idx,

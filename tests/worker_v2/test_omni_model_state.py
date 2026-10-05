@@ -603,8 +603,13 @@ def test_eager_decode_without_a_frame_fails_loudly():
         state._eager_state._apply_eager_frames(batches, torch.zeros((1, _EAGER_DIM)), _EagerBatch([1]), None)
 
 
-def test_run_preprocess_records_rows_that_keep_a_sample():
+@pytest.mark.parametrize("has_stream_decoder", [True, False])
+def test_run_preprocess_records_rows_that_keep_a_sample(has_stream_decoder):
     state = _make_eager_state()
+    if not has_stream_decoder:
+        # Eager-MTP talkers without an in-Talker codec (Qwen3-Omni) do not
+        # define the attribute at all.
+        del state.model.stream_decoder
     _fill_buffers(state, "chunk", "final", "decode")
     state._eager_ready = {2: "decode"}
     state._eager_embeds[2] = 4.0
