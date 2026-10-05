@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Exercise the offline runner with a CPU engine double and real MP4 metadata."""
 
 from __future__ import annotations
@@ -42,7 +43,9 @@ def install_module(monkeypatch, name: str, **attributes: object) -> None:
 
 def test_asset_downloads_use_hf_cache_and_http_cache(tmp_path: Path, monkeypatch) -> None:
     download = Mock(return_value=str(tmp_path / "cached.mp4"))
-    install_module(monkeypatch, "huggingface_hub", hf_hub_download=download)
+    monkeypatch.setattr(
+        "vllm_omni.transformers_utils.repo_utils.hf_api", Mock(return_value=Mock(hf_hub_download=download))
+    )
     assert (
         resolve_asset(
             "https://huggingface.co/nvidia/private-preview/resolve/main/samples/a%20b.mp4",
