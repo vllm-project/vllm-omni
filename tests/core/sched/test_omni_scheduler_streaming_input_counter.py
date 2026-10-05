@@ -59,7 +59,8 @@ def _make_scheduler(scheduler_cls, *, requests, running, waiting, counter, skipp
     scheduler.requests = requests
     scheduler.running = running
     scheduler.waiting = waiting
-    scheduler.skipped_waiting = skipped if skipped is not None else []
+    scheduler.kv_holding_waiting = skipped if skipped is not None else []
+    scheduler.deferred_waiting = set()
     scheduler.num_waiting_for_streaming_input = counter
     return scheduler
 
@@ -97,8 +98,8 @@ def test_finish_requests_clears_counter_left_by_a_stomped_status(
     assert scheduler.num_waiting_for_streaming_input == 0
 
 
-def test_resync_counts_parked_requests_in_skipped_waiting() -> None:
-    """``get_num_unfinished_requests`` sums ``waiting`` and ``skipped_waiting``,
+def test_resync_counts_parked_requests_in_kv_holding_waiting() -> None:
+    """``get_num_unfinished_requests`` sums ``waiting`` and ``kv_holding_waiting``,
     so the resync has to look at both or it under-counts and reintroduces the
     spin the counter exists to prevent."""
     parked = _StubRequest("req-skipped", RequestStatus.WAITING_FOR_STREAMING_REQ)
@@ -128,9 +129,11 @@ def test_ar_schedule_resyncs_before_delegating_upstream(monkeypatch: pytest.Monk
     scheduler.requests = {parked.request_id: parked}
     scheduler.running = [parked]
     scheduler.waiting = []
-    scheduler.skipped_waiting = []
+    scheduler.kv_holding_waiting = []
+    scheduler.deferred_waiting = set()
     scheduler.num_waiting_for_streaming_input = 1  # leaked by the status rewrite
     scheduler.policy = "fcfs"
+    scheduler.max_num_active_reqs = 8
     scheduler.max_num_running_reqs = 8
 
     seen: dict[str, int] = {}
@@ -161,12 +164,13 @@ def test_generation_scheduler_sweep_removes_aborted_requests_from_all_queues() -
     scheduler = OmniGenerationScheduler.__new__(OmniGenerationScheduler)
     scheduler.waiting = create_request_queue(SchedulingPolicy.FCFS)
     scheduler.waiting.add_request(aborted)
-    scheduler.skipped_waiting = create_request_queue(SchedulingPolicy.FCFS)
-    scheduler.skipped_waiting.add_request(aborted)
+    scheduler.kv_holding_waiting = create_request_queue(SchedulingPolicy.FCFS)
+    scheduler.deferred_waiting = set()
+    scheduler.kv_holding_waiting.add_request(aborted)
     scheduler.running = [aborted]
 
     scheduler._drop_aborted_queued_requests()
 
     assert list(scheduler.waiting) == []
-    assert list(scheduler.skipped_waiting) == []
+    assert list(scheduler.kv_holding_waiting) == []
     assert scheduler.running == []

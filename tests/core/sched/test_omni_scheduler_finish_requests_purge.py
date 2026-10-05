@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Integration tests for the post-finish defensive purge of
 ``self.running`` placed in
 ``OmniARScheduler.finish_requests`` /
@@ -52,6 +55,8 @@ def _make_scheduler(scheduler_cls, *, requests, running, waiting):
     scheduler.requests = requests
     scheduler.running = running
     scheduler.waiting = waiting
+    scheduler.kv_holding_waiting = []
+    scheduler.deferred_waiting = set()
     return scheduler
 
 

@@ -130,7 +130,7 @@ python examples/offline_inference/text_to_speech/cosyvoice3/end2end.py \
 ### Notes
 
 - Stage 0 (`talker`) emits speech tokens; stage 1 (`code2wav`) runs flow matching + HiFiGAN to synthesize waveform.
-- Deploy config auto-loads from `vllm_omni/deploy/cosyvoice3.yaml` based on HF `model_type`. Pass `--deploy-config <path>` to override.
+- H200 automatically selects `cosyvoice3_packed_streaming_optimized_standard.yaml` when the CUDA MPS control tool is available; other devices and environments use `cosyvoice3.yaml`. See the [serving defaults and tradeoffs](../online_serving/text_to_speech.md#cosyvoice3). Pass `--deploy-config cosyvoice3.yaml` for the previous profile or `--deploy-config <path>` to override. The example uses the resolved profile's sampling parameters.
 - `async_chunk: true` is the default; pass `--no-async-chunk` to switch to the legacy synchronous path.
 
 ---

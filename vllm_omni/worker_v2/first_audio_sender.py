@@ -111,9 +111,10 @@ class _PreparedDelivery:
 
 
 class _EngineOutputSink:
-    def __init__(self, output_queue: Any, scheduler: Any) -> None:
+    def __init__(self, output_queue: Any, scheduler: Any, *, upstream_first_audio: bool = True) -> None:
         self.output_queue = output_queue
         self.scheduler = scheduler
+        self.upstream_first_audio = upstream_first_audio
 
     def prepare(self, request_ids: list[str]) -> _PreparedDelivery:
         routes = {}
@@ -130,15 +131,14 @@ class _EngineOutputSink:
         for request_id, pcm in zip(request_ids, pcm_rows, strict=True):
             if request_id not in routes:
                 continue
+            payload = {"model_outputs": pcm, "sr": sample_rate}
+            if self.upstream_first_audio:
+                payload[FIRST_AUDIO_KEY] = torch.tensor(True)
             by_client.setdefault(routes[request_id], []).append(
                 OmniEngineCoreOutput(
                     request_id=request_id,
                     new_token_ids=[],
-                    multimodal_output={
-                        "model_outputs": pcm,
-                        "sr": sample_rate,
-                        FIRST_AUDIO_KEY: torch.tensor(True),
-                    },
+                    multimodal_output=payload,
                 )
             )
         for client_index, outputs in by_client.items():
@@ -163,5 +163,8 @@ class _EngineOutputSink:
                 routes.pop(request_id)
 
 
-def engine_output_queue_sink(output_queue: Any, scheduler: Any) -> _EngineOutputSink:
-    return _EngineOutputSink(output_queue, scheduler)
+def engine_output_queue_sink(
+    output_queue: Any, scheduler: Any, *, upstream_first_audio: bool = True
+) -> _EngineOutputSink:
+    """Route prepared audio; final-stage PCM must not carry the upstream marker."""
+    return _EngineOutputSink(output_queue, scheduler, upstream_first_audio=upstream_first_audio)

@@ -123,13 +123,21 @@ def _make_fast_path_sched(*, defer_block_free: bool) -> tuple[MagicMock, Request
 
     sched = MagicMock()
     sched.max_num_scheduled_tokens = 8
+    sched.max_num_active_reqs = 8
     sched.max_num_running_reqs = 8
     sched._native_data_plane = False
     sched._retains_state_across_chunks = False
+    # Unset MagicMock attributes are truthy. Keep optional scheduling modes
+    # disabled so this fixture actually schedules its one-shot request.
+    sched._generation_defer_batch = False
+    sched._generation_first_chunk_only = False
+    sched._generation_max_regular_batch = 0
     sched._pause_state = PauseState.UNPAUSED
     sched.requests = {request.request_id: request}
     sched.running = [request]
     sched.waiting = []  # falsy: the waiting loop never runs
+    sched.kv_holding_waiting = []
+    sched.deferred_waiting = set()
     sched.policy = SchedulingPolicy.FCFS
     sched.chunk_transfer_adapter = None
     sched.scheduler_config = MagicMock(enable_chunked_prefill=True)

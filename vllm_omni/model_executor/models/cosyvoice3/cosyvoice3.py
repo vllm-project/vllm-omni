@@ -28,7 +28,6 @@ from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import MultiModalFieldConfig, MultiModalKwargsItems
 from vllm.multimodal.parse import MultiModalDataItems, MultiModalDataParser
 from vllm.multimodal.processing import (
-    BaseDummyInputsBuilder,
     BaseProcessingInfo,
     ProcessorInputs,
     PromptIndexTargets,
@@ -42,7 +41,7 @@ from vllm.v1.sample.ops.topk_topp_sampler import random_sample
 from vllm.v1.sample.sampler import Sampler
 
 from vllm_omni.data_entry_keys import EmbeddingsStruct, OmniPayloadStruct, to_dict, to_struct
-from vllm_omni.inputs.mm_processor import OmniMultiModalProcessor
+from vllm_omni.inputs.mm_processor import OmniDummyInputsBuilder, OmniMultiModalProcessor
 from vllm_omni.model_executor.models.cosyvoice3.ras_sampler import MAX_FUSED_TOP_K, fused_ras_sample
 from vllm_omni.model_executor.models.cosyvoice3.runtime import (
     cosyvoice3_batch_flow_debug,
@@ -72,6 +71,27 @@ logger = init_logger(__name__)
 # feat_extractor, campplus session/engine). The mm processor is re-created per
 # request (mm_processor_cache_gb: 0), so this avoids rebuilding them every time.
 _RUNTIME_COMPONENTS_CACHE: dict[str, dict] = {}
+
+
+def _normalize_request_conditioning(payload: dict) -> dict:
+    """Unwrap singleton conditioning containers at the per-request boundary.
+
+    A processor/prefix-cache passthrough can retain a one-item tensor list.
+    The code2wav schema consumes one request, so that wrapper carries no
+    batch dimension. A multi-item list here is an unsplit batch and must
+    fail instead of silently choosing another request's voice.
+    """
+    embed = payload.get("embed")
+    if not isinstance(embed, Mapping):
+        return payload
+    normalized = dict(embed)
+    for key in ("speech_token", "speech_feat", "embedding", "speech_token_len"):
+        value = normalized.get(key)
+        if isinstance(value, (list, tuple)):
+            if len(value) != 1:
+                raise ValueError(f"CosyVoice3 per-request {key} contains an unsplit batch of {len(value)} items")
+            normalized[key] = value[0]
+    return {**payload, "embed": normalized}
 
 
 def _cosyvoice3_trt_enabled() -> bool:
@@ -675,7 +695,7 @@ class CosyVoice3MultiModalProcessor(OmniMultiModalProcessor[CosyVoice3MultiModal
         ]
 
 
-class CosyVoice3DummyInputsBuilder(BaseDummyInputsBuilder[CosyVoice3MultiModalProcessingInfo]):
+class CosyVoice3DummyInputsBuilder(OmniDummyInputsBuilder[CosyVoice3MultiModalProcessingInfo]):
     def get_dummy_text(self, mm_counts: Mapping[str, int]) -> str:
         return "Hello, this is a test of the CosyVoice3 system capability."
 
@@ -752,6 +772,10 @@ class CosyVoice3Model(
         self.model_dir = model_dir
         self.model = None
         if self.model_stage == "cosyvoice3_talker":
+            # Code2Wav consumes sampled tokens and prompt conditioning, not
+            # hidden states. The processor opts into token-only chunk updates.
+            if getattr(vllm_config.model_config, "async_chunk", False):
+                self.omni_pooler_payload_include_hidden = False
             # Initialize talker stage (text to speech tokens)
             from vllm_omni.model_executor.models.cosyvoice3.cosyvoice3_talker import CosyVoice3LM, VLLMQwen2Encoder
 
@@ -1501,9 +1525,10 @@ class CosyVoice3Model(
             # [total_tokens, hidden]
             hidden_states = self.model.llm(inputs_embeds, positions)
 
-            if getattr(self, "_mrv2_tensor_output", False) or cosyvoice3_packed_inference_enabled():
-                return hidden_states
-            return self.make_omni_output(hidden_states, **kwargs)
+            # Both runners attach the live step's conditioning after replay.
+            # Capturing an OmniOutput here would retain the dummy prefill lists
+            # and re-emit them during decode, replacing the real reference.
+            return hidden_states
         elif self.model_stage == "cosyvoice3_code2wav":
             # Lazily swap the flow-decoder estimator to a TensorRT engine on the
             # first code2wav step (after weights are loaded), gated by the same
@@ -1539,7 +1564,7 @@ class CosyVoice3Model(
 
             for idx, req_ids in enumerate(request_ids_list):
                 raw = runtime_info[idx] if idx < len(runtime_info) and isinstance(runtime_info[idx], dict) else {}
-                payload = to_struct(raw)
+                payload = to_struct(_normalize_request_conditioning(raw))
                 meta = payload.meta
                 embed = payload.embed
 

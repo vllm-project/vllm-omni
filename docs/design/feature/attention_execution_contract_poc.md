@@ -131,3 +131,24 @@ and real-kernel schema/fake checks pass. The full suite must be rerun with the
 vLLM version required by upstream. NPU/ROCm device numerics and compilation remain
 unvalidated. Pre-commit passes with the CI hook skips. Upstream PyTorch/CUTLASS
 warnings remain.
+
+## TRTLLM dense execution
+
+`TRTLLM_ATTN` declares `SUPPORTED` / `CUSTOM_OP` for noncausal dense BF16 on
+B200/GB200 (SM100) and B300/GB300 (SM103), head dimension 128, and equal Q/K/V
+head counts, without parallel, paged-KV, piecewise, or HSDP boundaries. Pre-construction, SAGE, skip-softmax, packed,
+and other unverified paths remain `UNMIGRATED`. Resolution and dispatch share
+metadata validation; workspace mutation is explicit in the custom-op schema.
+
+CPU contract tests cover fullgraph replay and schema/fake consistency using a
+substituted dispatcher. Real-kernel validation requires Blackwell with FlashInfer:
+
+```bash
+python -m pytest tests/diffusion/attention/test_trtllm_attn.py \
+  -k dense_contract_fullgraph_matches_sdpa -q -rs
+```
+
+These hardware tests compare eager/compiled output with FP32 SDPA and check
+schema/fake agreement. The TRTLLM and contract suite passed on Blackwell before the final architecture
+restriction was added: 61 passed, no skips (19 dependency deprecation warnings).
+The SM100/SM103 restriction is additionally covered by CPU contract tests.

@@ -1,6 +1,6 @@
 # NOTE: this is largely taken from vLLM
 
-# Exclude .git for CI builds — version is set via SETUPTOOLS_SCM_PRETEND_VERSION
+# Exclude .git for CI builds — version is set via VLLM_OMNI_VERSION_OVERRIDE
 .git
 .venv
 /build

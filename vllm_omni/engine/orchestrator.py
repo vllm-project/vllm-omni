@@ -301,6 +301,7 @@ class OrchestratorBase:
     _transfer_emitter: Any = None
     _prom_metrics: Any = None
     _stat_logger: OmniPrometheusStatLogger | None = None
+    _transfer_release_tasks: set[asyncio.Task] = set()
 
     def __init__(
         self,
@@ -348,6 +349,8 @@ class OrchestratorBase:
             self._pd_bootstrap_addr = pd_config.get("bootstrap_addr")
             self._pd_prefill_engine_id = pd_config.get("prefill_engine_id")
         self.request_states: dict[str, OrchestratorRequestState] = {}
+        # Strong refs for in-flight releases; the loop only weak-refs tasks, so dropping these risks mid-flight GC.
+        self._transfer_release_tasks: set[asyncio.Task] = set()
         self._init_metrics_state(
             stage_pools,
             running_counter,
@@ -690,6 +693,36 @@ class OrchestratorBase:
             output_msg.finished = index == last_index_by_req[output_msg.request_id]
         return abort_outputs
 
+    def _release_stage_transfer_resources(self, request_ids: list[str]) -> None:
+        """Drop each stage's inter-stage transfer resources for finished requests.
+
+        This is the only point that knows every stage is done with the request,
+        so it is the only safe place to reclaim segments a consumer never
+        drained. Scheduled rather than awaited: reclaim is best-effort and must
+        not add RPC latency to request teardown.
+        """
+        if not request_ids:
+            return
+
+        async def _run() -> None:
+            results = await asyncio.gather(
+                *(pool.release_request_resources(request_ids) for pool in self.stage_pools),
+                return_exceptions=True,
+            )
+            for result in results:
+                if isinstance(result, Exception):
+                    logger.warning("[Orchestrator] release transfer resources failed: %s", result)
+
+        try:
+            task = asyncio.get_running_loop().create_task(_run())
+            self._transfer_release_tasks.add(task)
+            task.add_done_callback(self._transfer_release_tasks.discard)
+        except RuntimeError:
+            logger.warning(
+                "[Orchestrator] no running event loop; skipped reclaim of transfer resources for %s",
+                request_ids,
+            )
+
     def _release_request_bindings(self, request_ids: list[str]) -> None:
         """Release all stage-local route bindings for the given request ids."""
         for pool in self.stage_pools:
@@ -718,7 +751,7 @@ class OrchestratorBase:
         stage_ids: list[int] = []
         for pool in target_pools:
             clear_sender = pool.stage_type != "diffusion" and (
-                method in ("reset_mm_cache", "sleep")
+                method in ("reset_mm_cache", "sleep", "release_kv_cache_memory")
                 or (method == "pause_scheduler" and kwargs.get("clear_cache", args[1] if len(args) > 1 else True))
             )
             for replica_id in pool.live_replica_ids():
@@ -1645,6 +1678,7 @@ class OrchestratorBase:
         if abort:
             abort_outputs = await self._abort_request_ids(cleanup_ids)
         self._release_request_bindings(cleanup_ids)
+        self._release_stage_transfer_resources(cleanup_ids)
         for request_id in cleanup_ids:
             self._pd_kv_params.pop(request_id, None)
             req_state = self.request_states.pop(request_id, None)

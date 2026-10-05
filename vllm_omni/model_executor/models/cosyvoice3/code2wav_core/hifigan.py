@@ -966,7 +966,20 @@ class CausalHiFTGenerator(HiFTGenerator):
         self.conv_pre_look_right = conv_pre_look_right
         self.f0_predictor = f0_predictor
 
+    def enable_decode_graphs(self) -> None:
+        """Opt into exact-shape CUDA replay after frozen weights are loaded."""
+        from .hift_graph import HiFTDecodeGraphs
+
+        self.enable_cached_istft()
+        self._decode_graphs = HiFTDecodeGraphs(self._decode_eager)
+
     def decode(self, x: torch.Tensor, s: torch.Tensor = torch.zeros(1, 1, 0), finalize: bool = True) -> torch.Tensor:
+        runner = getattr(self, "_decode_graphs", None)
+        if runner is not None:
+            return runner.run(x, s, finalize)
+        return self._decode_eager(x, s, finalize=finalize)
+
+    def _decode_eager(self, x: torch.Tensor, s: torch.Tensor, finalize: bool = True) -> torch.Tensor:
         s_stft_real, s_stft_imag = self._stft(s.squeeze(1))
         if finalize is True:
             x = self.conv_pre(x)

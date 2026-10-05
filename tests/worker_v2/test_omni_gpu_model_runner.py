@@ -13,6 +13,7 @@ from vllm import SamplingParams
 from vllm.config.compilation import CUDAGraphMode
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+from vllm.v1.worker.gpu.model_states.default import DefaultModelState
 from vllm.v1.worker.gpu.sample.sampler import Sampler
 
 from vllm_omni.config.model import OmniModelConfig
@@ -95,7 +96,8 @@ def test_full_payload_receive_is_polled_without_scheduled_tokens(mocker):
 
 
 @pytest.mark.parametrize("output_form", ["tuple", "omni"])
-def test_capture_model_unwraps_exclude_full_and_capture_mtp(output_form):
+@pytest.mark.parametrize("profile_only", [False, True])
+def test_capture_model_unwraps_exclude_full_and_capture_mtp(output_form, profile_only):
     runner = object.__new__(OmniGPUModelRunner)
     hidden = torch.ones(1, 2)
 
@@ -117,16 +119,21 @@ def test_capture_model_unwraps_exclude_full_and_capture_mtp(output_form):
     runner.model_state = SimpleNamespace(capture_mtp_graphs=MagicMock())
     runner._dispatch_mtp_batch_descriptor = MagicMock(return_value="desc")
 
-    def assert_unwrapped(_self):
+    def assert_unwrapped(_self, *, profile_only: bool = False):
         assert torch.equal(runner.model.forward(), hidden)  # forward unwrapped during capture
+        assert profile_only is expected_profile_only
         return 3
 
+    expected_profile_only = profile_only
     with patch.object(GPUModelRunner, "capture_model", assert_unwrapped):
-        assert runner.capture_model() == 3
+        assert runner.capture_model(profile_only=profile_only) == 3
 
     assert runner.model.forward is original_forward  # restored after capture
     assert runner.cudagraph_manager._capture_descs == {CUDAGraphMode.PIECEWISE: [piecewise]}
-    runner.model_state.capture_mtp_graphs.assert_called_once_with(runner._dispatch_mtp_batch_descriptor)
+    if profile_only:
+        runner.model_state.capture_mtp_graphs.assert_not_called()
+    else:
+        runner.model_state.capture_mtp_graphs.assert_called_once_with(runner._dispatch_mtp_batch_descriptor)
 
 
 @pytest.mark.parametrize(
@@ -161,6 +168,28 @@ def test_init_model_state_factory_dispatches_omni_only(monkeypatch, flag, expect
     else:
         upstream.assert_called_once()
         assert state is upstream.return_value
+
+
+@pytest.mark.parametrize("omni_stage", [False, True])
+@pytest.mark.parametrize("specialized", [False, True])
+def test_auxiliary_default_state_has_omni_lifecycle_but_preserves_upstream_states(monkeypatch, omni_stage, specialized):
+    class SpecializedState(DefaultModelState):
+        pass
+
+    state_cls = SpecializedState if specialized else DefaultModelState
+    upstream_state = object.__new__(state_cls)
+    monkeypatch.setattr("vllm_omni.worker_v2.model_states._upstream_init_model_state", lambda *_args: upstream_state)
+    monkeypatch.setattr(OmniModelState, "__init__", lambda *_args: None)
+    model_config = object.__new__(OmniModelConfig) if omni_stage else SimpleNamespace()
+    state = init_omni_model_state(
+        SimpleNamespace(model_config=model_config), SimpleNamespace(), None, torch.device("cpu")
+    )
+    if omni_stage and not specialized:
+        assert isinstance(state, OmniModelState)
+        assert callable(state.run_preprocess)
+        assert callable(state.postprocess_model_output)
+    else:
+        assert state is upstream_state
 
 
 def test_finish_requests_notifies_model_and_cleans_only_known_slots(monkeypatch):
@@ -209,7 +238,7 @@ def test_full_graph_aux_contract_keeps_full_and_round_trips_leaves():
     runner.model_state = SimpleNamespace()
     captured = {}
 
-    def capture(_self):
+    def capture(_self, *, profile_only=False):
         # The graph manager stores (hidden, leaves) in its aux buffers.
         assert runner.use_aux_hidden_state_outputs is True
         hidden, leaves = runner.model.forward(4)
@@ -262,7 +291,9 @@ def test_full_graph_output_without_contract_is_hidden_only():
 
 
 @pytest.mark.parametrize("runner_kind", ["gpu", "ar", "generation"])
-def test_dummy_forward_uses_upstream_execution_state(runner_kind, monkeypatch):
+@pytest.mark.parametrize("randomize_inputs", [False, True])
+@pytest.mark.parametrize("is_profile", [False, True])
+def test_dummy_forward_uses_upstream_execution_state(runner_kind, randomize_inputs, is_profile, monkeypatch):
     from vllm.v1.worker.gpu.input_batch import InputBatch
     from vllm.v1.worker.gpu.model_runner import ExecuteModelState
 
@@ -288,6 +319,7 @@ def test_dummy_forward_uses_upstream_execution_state(runner_kind, monkeypatch):
     runner.model_state.prepare_inputs.return_value = {}
     runner._omni_data_plane = object()
     runner.supports_mm_inputs = False
+    runner.vocab_size = 32
     runner.lora_config = None
     runner.is_encoder_decoder = False
     runner.eplb = MagicMock()
@@ -308,7 +340,15 @@ def test_dummy_forward_uses_upstream_execution_state(runner_kind, monkeypatch):
         cg_mode=CUDAGraphMode.NONE, num_reqs=1, num_tokens=1, num_active_loras=0, max_query_len=1
     )
     runner._dispatch_batch_descriptor = MagicMock(return_value=(batch_desc, None))
-    monkeypatch.setattr(InputBatch, "make_dummy", lambda *args, **kwargs: input_batch)
+    make_dummy = MagicMock(return_value=input_batch)
+    monkeypatch.setattr(InputBatch, "make_dummy", make_dummy)
+    randomized = []
+
+    def randomize(tensor, low, high):
+        randomized.append((low, high))
+        return tensor.fill_(7)
+
+    monkeypatch.setattr(torch.Tensor, "random_", randomize)
     monkeypatch.setattr("vllm_omni.worker_v2.omni_model_runner.build_slot_mappings_by_layer", lambda *args: {})
     for module in ("omni_model_runner", "omni_generation_model_runner"):
         monkeypatch.setattr(f"vllm_omni.worker_v2.{module}.set_forward_context", lambda *args, **kwargs: nullcontext())
@@ -318,7 +358,20 @@ def test_dummy_forward_uses_upstream_execution_state(runner_kind, monkeypatch):
 
     # Upstream _dummy_run always supplies valid_dummy_state_slots, and the
     # result must use the real upstream constructor rather than a mocked state.
-    assert runner.execute_model(scheduled, dummy_run=True, valid_dummy_state_slots=True) is None
+    assert (
+        runner.execute_model(
+            scheduled,
+            dummy_run=True,
+            valid_dummy_state_slots=True,
+            randomize_inputs=randomize_inputs,
+            is_profile=is_profile,
+        )
+        is None
+    )
+    assert make_dummy.call_args.kwargs["is_padding"] is not is_profile
+    should_randomize = randomize_inputs and runner_kind != "generation"
+    assert randomized == ([(0, 32)] if should_randomize else [])
+    assert input_batch.input_ids.tolist() == ([7] if should_randomize else [1])
     assert isinstance(runner.execute_model_state, ExecuteModelState)
     assert runner.execute_model_state.input_batch is input_batch
     assert runner.execute_model_state.cudagraph_stats is None

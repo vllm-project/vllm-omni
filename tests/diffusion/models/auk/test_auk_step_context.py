@@ -127,7 +127,9 @@ def test_hoisted_euler_loop_matches_per_step_forward(cfg_strength: float) -> Non
             v = dit(x, time=timesteps[i], **inputs)
         x = x + (timesteps[i + 1] - timesteps[i]) * v
 
-    torch.testing.assert_close(got, x, rtol=0, atol=0)
+    # sample_latents precomputes the adaLN modulations of the whole grid in one
+    # GEMM per layer, whose rows round differently from one-row GEMMs in fp32.
+    torch.testing.assert_close(got, x, rtol=0, atol=1e-6)
     assert dit.text_cond is None and dit.text_uncond is None
 
 

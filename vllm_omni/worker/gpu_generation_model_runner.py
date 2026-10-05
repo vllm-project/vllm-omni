@@ -137,9 +137,6 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
         if self.execute_model_state is not None:
             raise RuntimeError("State error: sample_tokens() must be called after execute_model() returns None.")
 
-        if self.routed_experts_initialized:
-            self.routed_experts_capturer.clear_buffer()
-
         if hasattr(self, "_omni_connector"):
             for request in getattr(scheduler_output, "pending_input_registrations", []):
                 self.register_chunk_recv(request)
@@ -149,11 +146,6 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
                 flush_ids.update({rid for rid in self._pending_full_payload_send if rid not in self.requests})
                 if flush_ids:
                     self.flush_full_payload_outputs(flush_ids)
-
-        if self.routed_experts_initialized:
-            capturer = self.routed_experts_capturer
-            if capturer is not None and hasattr(capturer, "finalize_pending_copy"):
-                capturer.finalize_pending_copy()
 
         # If ngram_gpu is used, we need to copy the scheduler_output to avoid
         # the modification has influence on the scheduler_output in engine core process.
@@ -401,9 +393,6 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
         if deferred_state_corrections_fn:
             deferred_state_corrections_fn()
 
-        if self.routed_experts_initialized and hasattr(self, "_positions_cpu"):
-            self._omni_routed_experts_d2h(scheduler_output)
-
         return None
 
     @torch.inference_mode()
@@ -516,9 +505,6 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
         # [Omni] Copy req_id mappings to avoid async scheduling mutation.
         req_ids_output_copy = self.input_batch.req_ids.copy()
         req_id_to_index_output_copy = self.input_batch.req_id_to_index.copy()
-        routed_experts_lists = None
-        if self.routed_experts_initialized:
-            routed_experts_lists = self._omni_extract_routed_experts(scheduler_output)
         if inter_stage_outputs and self._should_accumulate_full_payload_output():
             for i, rid in enumerate(req_ids_output_copy):
                 req_state = self.requests.get(rid)
@@ -541,7 +527,6 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
             ec_connector_output=ec_connector_output if self.supports_mm_inputs else None,
         )
         output.omni_connector_output = self.get_omni_connector_output()
-        output.routed_experts = routed_experts_lists
 
         if not self.use_async_scheduling:
             return output
@@ -884,7 +869,6 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
                 # in code2wav warmup. The expert-balance rationale behind
                 # randomize_inputs targets text-MoE models, which generation
                 # stages are not. The kwarg stays accepted for vLLM API compat.
-                self.maybe_randomize_inputs(input_ids, inputs_embeds),
                 set_forward_context(
                     attn_metadata,
                     self.vllm_config,
@@ -964,7 +948,7 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
 
         return hidden_states, None
 
-    def profile_run(self) -> None:
+    def profile_run(self, randomize_inputs: bool = False) -> None:
         # Profile with multimodal encoder & encoder cache.
         if self.supports_mm_inputs:
             mm_config = self.model_config.multimodal_config
@@ -1017,7 +1001,7 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
                             self.encoder_cache[f"tmp_{i}"] = output
 
         # Add `is_profile` here to pre-allocate communication buffers
-        hidden_states, _ = self._dummy_run(self.max_num_tokens, is_profile=True)
+        hidden_states, _ = self._dummy_run(self.max_num_tokens, is_profile=True, randomize_inputs=randomize_inputs)
         output = None
         self._sync_device()
         del hidden_states

@@ -168,6 +168,37 @@ def test_build_add_request_message_preserves_additional_information(mocker: Mock
     output_processor.add_request.assert_not_called()
 
 
+def test_build_add_request_message_preserves_kv_hints_after_omni_payload_upgrade(mocker):
+    from vllm.v1.engine.input_processor import InputProcessor
+    from vllm.v1.kv_hints import KvHintsEnvelope
+
+    engine = object.__new__(AsyncOmniEngine)
+    params = SamplingParams(max_tokens=8)
+    engine.default_sampling_params_list = [params]
+    engine.stage_metadata = [StageRuntimeInfo(final_output=False, final_output_type=None, stage_type="llm")]
+    engine.supported_tasks = ("generate",)
+    processor = mocker.create_autospec(InputProcessor, instance=True)
+    hints = KvHintsEnvelope("1", "hint-message", [])
+
+    def process(**kwargs):
+        request = _make_engine_core_request()
+        request.kv_hints = kwargs["kv_hints"]
+        return request
+
+    processor.process_inputs.side_effect = process
+    engine.input_processor = processor
+    msg = engine._build_add_request_message(
+        request_id="req-1",
+        prompt={"prompt_token_ids": [1], "additional_information": {"speaker": "voice"}},
+        sampling_params_list=[params],
+        kv_hints=hints,
+    )
+    assert processor.process_inputs.call_args.kwargs["kv_hints"] is hints
+    assert isinstance(msg.prompt, OmniEngineCoreRequest)
+    assert msg.prompt.kv_hints is hints
+    assert msg.prompt.additional_information is not None
+
+
 def test_build_add_request_message_injects_global_id_before_prompt_transform(mocker: MockerFixture):
     engine = object.__new__(AsyncOmniEngine)
     params = SamplingParams(max_tokens=8)

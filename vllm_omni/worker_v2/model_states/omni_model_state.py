@@ -16,7 +16,7 @@ from __future__ import annotations
 import inspect
 import threading
 import types
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import replace
 from typing import Any, cast
 
@@ -31,6 +31,7 @@ from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.gpu.model_states.default import DefaultModelState
+from vllm.v1.worker.gpu.model_states.interface import ModelSpecificAttnMetadata
 from vllm.v1.worker.gpu.states import RequestState
 from vllm.v1.worker.utils import AttentionGroup
 
@@ -447,13 +448,20 @@ class OmniModelState(DefaultModelState):
         kv_cache_config: KVCacheConfig,
         for_capture: bool = False,
         ubatch_idx: int = 0,
+        model_specific_attn_metadata: ModelSpecificAttnMetadata | None = None,
     ) -> dict[str, Any]:
-        if for_capture and input_batch.max_query_len is None:
+        if (
+            for_capture
+            and input_batch.max_query_len is None
+            and not self.vllm_config.compilation_config.cudagraph_mode.separate_routine()
+        ):
             # vLLM 0.30 distributes dummy tokens evenly across requests. For
             # an unconstrained FULL graph that split is not a query-length
             # bound: replay may put the entire token bucket in one request.
             # Attention launch parameters are fixed at capture, so use the
             # bucket's worst-case query length, not the dummy per-row length.
+            # Separate decode graphs must retain their uniform query bound:
+            # FA3's captured GQA layout must match the runtime AOT schedule.
             # Keep explicit bounds (e.g. varlen decode) and runtime metadata.
             input_batch = replace(input_batch, max_query_len=input_batch.num_tokens)
         return super().prepare_attn(
@@ -465,6 +473,7 @@ class OmniModelState(DefaultModelState):
             kv_cache_config,
             for_capture=for_capture,
             ubatch_idx=ubatch_idx,
+            model_specific_attn_metadata=model_specific_attn_metadata,
         )
 
     def prepare_inputs_embeds(
@@ -485,7 +494,7 @@ class OmniModelState(DefaultModelState):
         mm_embeds, is_mm_embed = self.gather_mm_embeddings(input_batch)
         kwargs: dict[str, Any] = {"multimodal_embeddings": mm_embeds, "is_multimodal": is_mm_embed}
         if mm_embeds:
-            kwargs["query_start_loc"] = input_batch.query_start_loc_np.tolist()
+            kwargs["query_start_loc"] = input_batch.query_start_loc_np[: input_batch.num_reqs + 1].tolist()
         embeds = self.model.embed_input_ids(input_batch.input_ids[: input_batch.num_tokens], **kwargs)
         inputs_embeds = self.encoder_runner.inputs_embeds
         inputs_embeds[: embeds.shape[0]] = embeds
@@ -651,6 +660,44 @@ class OmniModelState(DefaultModelState):
                 else:
                     del updates[key]
 
+    @staticmethod
+    def _split_settled_rows(
+        input_batch: InputBatch,
+        req_indices: list[int],
+        settled: dict[int, str],
+    ) -> tuple[list[tuple[int, int, int, str]], list[tuple[int, int]]] | None:
+        """Vectorized settled-row test of ``run_preprocess``.
+
+        In steady decode almost every row is settled: it schedules one token
+        and ``settled`` maps its slot to its request id. ``settled`` entries
+        are dropped together with the slot buffer, so comparing against the
+        row's request id equals the per-row ``buf["req_id"]`` test. Returns the
+        settled rows and the remaining ``(row, slot)`` pairs, both in row
+        order, or ``None`` when no row is settled.
+        """
+        n = input_batch.num_reqs
+        slots = np.asarray(input_batch.idx_mapping_np[:n])
+        owners = np.full(max(int(slots.max()), max(settled)) + 1, None, dtype=object)
+        owners[np.fromiter(settled.keys(), dtype=np.int64, count=len(settled))] = np.array(
+            list(settled.values()), dtype=object
+        )
+        req_ids = np.empty(n, dtype=object)
+        req_ids[:] = input_batch.req_ids[:n]
+        is_settled = (np.asarray(input_batch.num_scheduled_tokens[:n]) == 1) & (owners[slots] == req_ids)
+        if not is_settled.any():
+            return None
+        rows = np.flatnonzero(is_settled)
+        settled_rows = list(
+            zip(
+                rows.tolist(),
+                slots[rows].tolist(),
+                np.asarray(input_batch.query_start_loc_np[:n])[rows].tolist(),
+                req_ids[rows].tolist(),
+            )
+        )
+        remaining = [(i, req_indices[i]) for i in np.flatnonzero(~is_settled).tolist()]
+        return settled_rows, remaining
+
     def run_preprocess(
         self,
         input_batch: InputBatch,
@@ -688,7 +735,7 @@ class OmniModelState(DefaultModelState):
         mtp_batches: list[tuple[int, int, tuple[torch.Tensor, torch.Tensor]]] = []
         prepacked_mtp_inputs: tuple[torch.Tensor, torch.Tensor] | None = None
 
-        req_indices = [int(input_batch.idx_mapping_np[i]) for i in range(input_batch.num_reqs)]
+        req_indices = np.asarray(input_batch.idx_mapping_np[: input_batch.num_reqs]).tolist()
         self._stage_batched_preprocess_inputs(req_indices, embeds.device)
 
         preprocess_entries: list[tuple[int, int, int, int, dict[str, Any], bool]] = []
@@ -698,7 +745,12 @@ class OmniModelState(DefaultModelState):
         # Declared identity decode has no per-row updates or hook work.
         skip_decode_rows = self._decode_preprocess_is_identity and not self._eager_mtp
         is_prefilling_np = getattr(input_batch, "is_prefilling_np", None) if skip_decode_rows else None
-        for i, req_idx in enumerate(req_indices):
+        rows: Iterable[tuple[int, int]] = enumerate(req_indices)
+        if settled and is_prefilling_np is None and not self._eager_state.has_pending_replay():
+            split = self._split_settled_rows(input_batch, req_indices, settled)
+            if split is not None:
+                settled_rows, rows = split
+        for i, req_idx in rows:
             if is_prefilling_np is not None and not is_prefilling_np[i]:
                 continue
             buf = self.intermediate_buffer.buffers[req_idx]

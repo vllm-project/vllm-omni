@@ -28,7 +28,6 @@ from vllm.multimodal.inputs import (
 )
 from vllm.multimodal.parse import MultiModalDataItems, MultiModalDataParser
 from vllm.multimodal.processing import (
-    BaseDummyInputsBuilder,
     BaseProcessingInfo,
     ProcessorInputs,
     PromptIndexTargets,
@@ -37,7 +36,7 @@ from vllm.multimodal.processing import (
 )
 from vllm.sequence import IntermediateTensors
 
-from vllm_omni.inputs.mm_processor import OmniMultiModalProcessor
+from vllm_omni.inputs.mm_processor import OmniDummyInputsBuilder, OmniMultiModalProcessor
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.transformers_utils.configs.omnivoice import OmniVoiceConfig
@@ -117,7 +116,7 @@ class OmniVoiceMultiModalProcessor(OmniMultiModalProcessor[OmniVoiceMultiModalPr
     def _apply_hf_processor_main(
         self,
         mm_items: MultiModalDataItems,
-        hf_processor_mm_kwargs: Mapping[str, object],
+        hf_kwargs: Mapping[str, object],
     ) -> BatchFeature:
         """Encode the reference audio, if any; the prompt was tokenized in apply().
 
@@ -126,7 +125,13 @@ class OmniVoiceMultiModalProcessor(OmniMultiModalProcessor[OmniVoiceMultiModalPr
         touch the text tokenizer.
         """
         valid_items = mm_items.select({key for key, count in mm_items.get_all_counts().items() if count > 0})
-        mm_data, passthrough = self._get_hf_mm_data(valid_items)
+        mm_data: dict[str, object] = {}
+        passthrough: dict[str, object] = {}
+        for items in valid_items.values():
+            if not items:
+                continue
+            mm_data.update(items.get_processor_data())
+            passthrough.update(items.get_passthrough_data())
         audio = self._get_reference_audio(mm_data)
         if audio is None:
             return BatchFeature(dict(passthrough))
@@ -235,7 +240,7 @@ class OmniVoiceMultiModalProcessor(OmniMultiModalProcessor[OmniVoiceMultiModalPr
         ]
 
 
-class OmniVoiceDummyInputsBuilder(BaseDummyInputsBuilder[OmniVoiceMultiModalProcessingInfo]):
+class OmniVoiceDummyInputsBuilder(OmniDummyInputsBuilder[OmniVoiceMultiModalProcessingInfo]):
     def get_dummy_text(self, mm_counts: Mapping[str, int]) -> str:
         return "Hello, this is a test of the OmniVoice system."
 

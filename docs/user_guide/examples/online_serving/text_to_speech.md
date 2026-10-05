@@ -155,16 +155,22 @@ vllm serve FunAudioLLM/Fun-CosyVoice3-0.5B-2512 --omni --port 8091 --trust-remot
 ./cosyvoice3/run_server.sh
 ```
 
-Streaming is on by default via `async_chunk: true` in `vllm_omni/deploy/cosyvoice3.yaml`. Pass `--no-async-chunk` (or `NO_ASYNC_CHUNK=1 ./cosyvoice3/run_server.sh`) for the legacy synchronous path.
+Streaming is on by default. On CUDA Hopper GPUs with at least 140 GiB of device memory (H200), serving automatically selects `cosyvoice3_packed_streaming_optimized_standard.yaml` when `nvidia-cuda-mps-control` is available on `PATH`: AR32 / codec32, standard sampling, packed Flow, cached ISTFT, HiFT decode graphs, and local CUDA MPS. No `--hf-overrides` is needed. Other devices and environments without the MPS control tool use `cosyvoice3.yaml` with RAS sampling and AR8 / codec8.
 
-Cross-request Stage-1 flow batching is opt-in. Enable it in the server environment when concurrent requests should share a flow-estimator call:
+The optimized profile is not a universal hardware configuration. Its packed kernels are Hopper-only; the talker's Model Runner V2 is unsupported on NPU/XPU, and CUDA MPS requires a local NVIDIA GPU and its control tool. Larger batches, 25-frame chunks, and graph allocations also require per-device validation on smaller or slower GPUs. Automatic selection retains the generic profile outside the validated device class; an explicit deploy configuration takes precedence.
+
+The H200 default targets streaming throughput at C32/C64. It changes sampling from RAS to standard (temperature 0.7, top-p 0.8, top-k 20, repetition penalty 1.21); output lengths and quality can differ. HiFT captures a recurring exact shape on its third use, which adds latency to that request, and its graph pool needs memory headroom beyond the engine reservations. This profile is not a claim of optimal first-audio latency at low concurrency. Pass `--deploy-config cosyvoice3.yaml` to retain the previous configuration, or `--deploy-config <path>` to select another profile.
+
+Pass `--no-async-chunk` (or `NO_ASYNC_CHUNK=1 ./cosyvoice3/run_server.sh`) for the legacy synchronous path; use `--deploy-config cosyvoice3.yaml` alongside it when selecting that path on H200.
+
+Cross-request Stage-1 flow batching is enabled in the H200 profile. For the generic configuration, enable it in the server environment when concurrent requests should share a flow-estimator call:
 
 ```bash
 export COSYVOICE3_BATCH_FLOW=1
 vllm serve FunAudioLLM/Fun-CosyVoice3-0.5B-2512 --omni --port 8091 --trust-remote-code
 ```
 
-Batching preserves output lengths and streaming cache alignment, but the different GEMM shapes can produce small waveform differences compared with processing each request separately. Leave `COSYVOICE3_BATCH_FLOW` unset (or set it to `0`) when request-independent numerical behavior is required. Set `COSYVOICE3_BATCH_FLOW_DEBUG=1` to log the observed group-size distribution and enable detailed Stage-1 profiler scopes; diagnostics are disabled by default to avoid per-step profiling overhead.
+Batching preserves output lengths and streaming cache alignment, but the different GEMM shapes can produce small waveform differences compared with processing each request separately. Use `--deploy-config cosyvoice3.yaml` and leave `COSYVOICE3_BATCH_FLOW` unset (or set it to `0`) when request-independent numerical behavior is required. Set `COSYVOICE3_BATCH_FLOW_DEBUG=1` to log the observed group-size distribution and enable detailed Stage-1 profiler scopes; diagnostics are disabled by default to avoid per-step profiling overhead.
 
 ### CLI client
 
@@ -194,7 +200,7 @@ The client supports `--api-base`, `--model`, `--text`, `--ref-audio`, `--ref-tex
 ### Notes
 
 - Stage 0 (`talker`) emits speech tokens; stage 1 (`code2wav`) runs flow matching + HiFiGAN to synthesize waveform.
-- Deploy config auto-loads from `vllm_omni/deploy/cosyvoice3.yaml` based on HF `model_type`. Pass `--deploy-config <path>` to override.
+- Deploy config auto-loads the device-specific CosyVoice3 default described above. Pass `--deploy-config <path>` to override.
 - For offline inference and the end-to-end script, see the [offline CosyVoice3 section](https://github.com/vllm-project/vllm-omni/tree/main/examples/offline_inference/text_to_speech/README.md#cosyvoice3).
 
 ---

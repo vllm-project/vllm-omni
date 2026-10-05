@@ -516,7 +516,7 @@ class MingFlashOmniThinkerMultiModalProcessor(BaseMultiModalProcessor[MingFlashO
     def _apply_hf_processor_main(
         self,
         mm_items: MultiModalDataItems,
-        hf_processor_mm_kwargs: Mapping[str, object],
+        hf_kwargs: Mapping[str, object],
     ) -> BatchFeature:
         """Call Ming's modality processors without expanding prompt text.
 
@@ -525,7 +525,13 @@ class MingFlashOmniThinkerMultiModalProcessor(BaseMultiModalProcessor[MingFlashO
         placeholder tokens remain under vLLM's prompt-update control.
         """
         valid_mm_items = mm_items.select({key for key, count in mm_items.get_all_counts().items() if count > 0})
-        mm_data, passthrough_data = self._get_hf_mm_data(valid_mm_items)
+        mm_data: dict[str, object] = {}
+        passthrough_data: dict[str, object] = {}
+        for items in valid_mm_items.values():
+            if not items:
+                continue
+            mm_data.update(items.get_processor_data())
+            passthrough_data.update(items.get_passthrough_data())
         hf_processor = self.info.get_hf_processor()
 
         data: dict[str, object] = {}

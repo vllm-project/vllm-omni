@@ -21,7 +21,14 @@ models = ["Qwen/Qwen2.5-Omni-7B"]
 
 # Single CI deploy YAML; rocm/xpu deltas are picked automatically via the
 # platforms: section in vllm_omni/deploy/ci/qwen2_5_omni.yaml.
-stage_configs = [modify_stage_config(get_deploy_config_path("ci/qwen2_5_omni.yaml"))]
+stage_configs = [
+    modify_stage_config(
+        get_deploy_config_path("ci/qwen2_5_omni.yaml"),
+        # This suite requests two cards. Share the Talker's card with
+        # Code2Wav and leave room for its whole-sequence DiT workspace.
+        updates={"stages": {1: {"gpu_memory_utilization": 0.3}, 2: {"devices": "1"}}},
+    )
+]
 
 # Create parameter combinations for model and stage config
 test_params = [

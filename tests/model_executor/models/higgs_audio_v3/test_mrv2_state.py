@@ -13,6 +13,7 @@ from vllm_omni.model_executor.models.higgs_audio_v3.higgs_audio_v3_talker import
     HiggsAudioV3TalkerForConditionalGeneration,
 )
 from vllm_omni.model_executor.models.higgs_audio_v3.model_state import HiggsModelState
+from vllm_omni.worker_v2.model_states.eager_mtp import EagerMTPState
 from vllm_omni.worker_v2.model_states.intermediate_buffer import OmniIntermediateBuffer
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -34,6 +35,8 @@ def make_state():
         _audio_continuation_id=99,
         update_decode_step_metadata=Mock(),
     )
+    state._stream_pos = {}
+    state._eager_state = EagerMTPState(state)
     return state
 
 

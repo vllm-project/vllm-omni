@@ -25,3 +25,18 @@ def apply_declared_extra_args(
     if not declared:
         return
     sampling_params.extra_args = {**(sampling_params.extra_args or {}), **declared}
+
+
+def ar_grid_max_tokens(ar_width: int, ar_height: int) -> int | None:
+    """Return the AR-stage ``max_tokens`` for MammothModa2-style visual-token grids.
+
+    The AR stage emits one visual token per grid cell, one EOL token per row,
+    and one final look-ahead token, so the generation budget is
+    ``ar_height * (ar_width + 1) + 1``. Shared by the online serving path and
+    the offline example so a grid-contract change cannot desynchronize one
+    copy. Returns ``None`` when the grid is absent or non-positive, letting
+    callers keep their existing default.
+    """
+    if ar_width <= 0 or ar_height <= 0:
+        return None
+    return ar_height * (ar_width + 1) + 1

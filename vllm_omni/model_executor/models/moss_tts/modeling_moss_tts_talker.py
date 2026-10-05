@@ -37,6 +37,7 @@ from vllm_omni.model_executor.models.moss_tts.modeling_moss_tts_local_depth impo
 )
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.platforms import current_omni_platform
+from vllm_omni.worker.sampling_utils import get_tts_local_seed
 
 logger = init_logger(__name__)
 
@@ -1675,6 +1676,31 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
         return input_embeds_out, output_codes
 
     # ------------------------------------------------------------------
+    # MRV2 reads model-owned capabilities; retain the V1 hook and platform
+    # graph-safety setting as the canonical implementation.
+    mtp = talker_mtp
+    get_mtp_seed = staticmethod(get_tts_local_seed)
+
+    def create_mrv2_model_state(self, vllm_config, encoder_cache, device):
+        from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState
+
+        state_cls = OmniModelState
+        if getattr(self.config, "mrv2_gpu_slot_state", False):
+            from .local_model_state import MossLocalModelState
+
+            state_cls = MossLocalModelState
+        return state_cls(vllm_config, self, encoder_cache, device)
+
+    @property
+    def mtp_output_key(self) -> tuple[str, str]:
+        """Return the request-buffer destination for one local audio frame."""
+        return self.talker_mtp_output_key
+
+    @property
+    def mtp_graph_safe(self) -> bool:
+        """Honor the same platform graph-safety override as the V1 runner."""
+        return self.talker_mtp_graph_safe
+
     # Package runner-generated audio frames
     # ------------------------------------------------------------------
 

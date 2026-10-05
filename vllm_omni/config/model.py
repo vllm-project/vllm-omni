@@ -105,7 +105,7 @@ class OmniModelConfig(ModelConfig):
          worker_type: Model Type, e.g., "ar" or "generation"
          engine_output_type: Optional output type specification for the engine.
              Used to route outputs to appropriate processors (e.g., "image",
-             "audio", "latents"). If None, output type is inferred.
+             "audio", "latent", "token_ids"). If None, output type is inferred.
          stage_connector_config: Stage connector configuration dictionary.
              Contains "name" (connector name), "extra" (extra connector config).
          task_type: Model-defined startup task type. Each model validates its

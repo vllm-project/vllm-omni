@@ -1151,6 +1151,9 @@ _DIFFUSION_MOVED_SHARED_FIELDS = frozenset(
         "disable_autocast",
     }
 )
+# Runtime-populated OmniDiffusionConfig state (init=False) that is never
+# user-configurable and therefore not part of the projection.
+_DIFFUSION_INTERNAL_FIELDS = frozenset({"ray_worker_env"})
 
 
 _STAGE_DEPLOY_ENGINE_FIELDS: tuple[str, ...] = tuple(_STAGE_DEPLOY_FIELDS)

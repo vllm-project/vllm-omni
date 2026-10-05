@@ -34,6 +34,7 @@ from tests.engine.duplex.test_session_runner import (
 from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
 from vllm_omni.engine.duplex import commands
 from vllm_omni.engine.duplex.config import DuplexSessionConfig
+from vllm_omni.engine.duplex.delivery import DuplexOutputBuffer
 from vllm_omni.engine.duplex.messages import DuplexControlResultMessage, OpenDuplexSessionMessage
 from vllm_omni.engine.duplex.session.manager import DuplexSessionManager
 from vllm_omni.model_executor.models.personaplex.duplex import stage0
@@ -55,12 +56,17 @@ async def open_personaplex_harness(*, extra_body: dict[str, object] | None = Non
     port = RecordingStagePort(stage_count=2)
     output: asyncio.Queue[Any] = asyncio.Queue()
     results: asyncio.Queue[Any] = asyncio.Queue()
+    limits = DuplexSessionRuntimeConfig()
+    output_buffer = DuplexOutputBuffer(
+        max_bytes=limits.max_pending_output_bytes_per_session,
+        max_events=limits.max_pending_output_events_per_session,
+    )
     manager = DuplexSessionManager(
         plugin=plugin,
         stage_port=port,
         output_sink=output,
         result_sink=results,
-        runtime_config=DuplexSessionRuntimeConfig(),
+        runtime_config=limits,
         model_config=SimpleNamespace(model="/models/personaplex-7b-v1"),
     )
     config = DuplexSessionConfig(
@@ -70,10 +76,21 @@ async def open_personaplex_harness(*, extra_body: dict[str, object] | None = Non
         voice="NATF2.pt",
         extra_body=dict(extra_body or {}),
     )
-    await manager.handle(OpenDuplexSessionMessage(control_id="c-open", session_id=SESSION_ID, session_config=config))
+    await manager.handle(
+        OpenDuplexSessionMessage(
+            control_id="c-open", session_id=SESSION_ID, session_config=config, output_buffer=output_buffer
+        )
+    )
     result = await asyncio.wait_for(results.get(), timeout=2.0)
     assert isinstance(result, DuplexControlResultMessage) and result.ok, result
-    harness = Harness(manager=manager, port=port, output=output, results=results, runner=manager.runners[SESSION_ID])
+    harness = Harness(
+        manager=manager,
+        port=port,
+        output=output,
+        output_buffer=output_buffer,
+        results=results,
+        runner=manager.runners[SESSION_ID],
+    )
     await harness.settle()
     return harness
 

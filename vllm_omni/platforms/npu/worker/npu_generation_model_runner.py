@@ -89,10 +89,6 @@ class NPUGenerationModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin
         scheduler_output: SchedulerOutput,
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> OmniModelRunnerOutput | IntermediateTensors | None:
-        if self.vllm_config.model_config.enable_return_routed_experts:
-            capturer = self.routed_experts_capturer
-            if capturer is not None and hasattr(capturer, "finalize_pending_copy"):
-                capturer.finalize_pending_copy()
         profiling_chunk_config = self.ascend_config.scheduler_config.profiling_chunk_config
         if profiling_chunk_config.enabled and profiling_chunk_config.need_timing:
             if getattr(scheduler_output, "disable_profiling_timing", False):
@@ -127,6 +123,7 @@ class NPUGenerationModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin
                 if flush_ids:
                     self.flush_full_payload_outputs(flush_ids)
 
+        self._begin_omni_aux_output_step(scheduler_output)
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         with record_function_or_nullcontext("prepare input"):
             #  -------------------------------------- Omni-new -------------------------------------------------
@@ -418,9 +415,6 @@ class NPUGenerationModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin
         if deferred_state_corrections_fn:
             deferred_state_corrections_fn()
 
-        if self.vllm_config.model_config.enable_return_routed_experts and hasattr(self, "_positions_cpu"):
-            self._omni_routed_experts_d2h(scheduler_output)
-
         return None
 
     @torch.inference_mode()
@@ -461,6 +455,7 @@ class NPUGenerationModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin
             multimodal_outputs_raw,  # Omni-Specific
             _prefix_cache_step_id,  # generation stages never save to the prefix cache
         ) = self.execute_model_state
+        pending_aux_output = self._prepare_omni_aux_output()
         # Clear ephemeral state.
         self.execute_model_state = None
 
@@ -518,11 +513,7 @@ class NPUGenerationModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin
                 req_state = self.requests.get(rid)
                 if req_state is not None and inter_stage_outputs[i]:
                     self.accumulate_full_payload_output(rid, inter_stage_outputs[i], req_state)
-        routed_experts_lists = None
-        if self.vllm_config.model_config.enable_return_routed_experts and hasattr(
-            self.input_batch, "num_tokens_no_spec"
-        ):
-            routed_experts_lists = self._omni_extract_routed_experts(scheduler_output)
+        aux_output = self._finish_omni_aux_output(pending_aux_output, scheduler_output)
         output = OmniModelRunnerOutput(
             req_ids=req_ids_output_copy,
             req_id_to_index=req_id_to_index_output_copy,
@@ -537,7 +528,7 @@ class NPUGenerationModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin
             cudagraph_stats=cudagraph_stats,
             ec_connector_output=ec_connector_output if self.supports_mm_inputs else None,
         )
-        output.routed_experts = routed_experts_lists
+        output.aux_output_connector_output = aux_output
         output.omni_connector_output = self.get_omni_connector_output()
         #  -------------------------------------- Omni-new -------------------------------------------------
 

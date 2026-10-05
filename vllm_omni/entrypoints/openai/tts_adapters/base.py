@@ -81,13 +81,24 @@ def conditioning_cache_salt(
     This replaces the uploaded data URI in the hash without changing the request.
     """
     h = hashlib.sha256()
+    ref_audio: str | list[str] | tuple[str, int] | None = request.ref_audio
+    if (
+        isinstance(ref_audio, str)
+        and len(ref_audio) > 256
+        and tts_params is not None
+        and tts_params.get("ref_audio_cache_key") is not None
+    ):
+        # The resolve key below is already a content-aware digest of this
+        # locator. Hashing a repr of a large inline data URI again dominates
+        # the per-request serving cost without adding information.
+        ref_audio = ("ref_audio_cache_key", len(ref_audio))
     for part in (
         request.input,
         request.task_type,
         request.language,
         request.voice,
         request.ref_text,
-        registered_voice if registered_voice is not None else request.ref_audio,
+        registered_voice if registered_voice is not None else ref_audio,
         request.instructions,
         request.x_vector_only_mode,
         request.speaker_embedding,
