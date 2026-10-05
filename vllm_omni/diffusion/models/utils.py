@@ -168,6 +168,28 @@ def init_parameters(
         init_parameters(child, dtype, device)
 
 
+def release_module_parameters_to_meta(module: nn.Module) -> None:
+    """Release a fully constructed module's parameter storage to meta.
+
+    The module must finish construction first so initialization code and vLLM
+    weight-loader metadata follow the ordinary CPU path. ``swap_tensors`` keeps
+    each registered Parameter object's identity while dropping only its storage.
+    Persistent buffers intentionally remain materialized.
+    """
+    for param in module.parameters():
+        if param.device.type == "meta":
+            continue
+
+        meta_tensor = torch.empty_like(param, device="meta")
+        if type(param) is nn.Parameter:
+            meta_param = nn.Parameter(meta_tensor, requires_grad=param.requires_grad)
+        else:
+            meta_param = param.__class__.__new__(param.__class__, meta_tensor)
+            meta_param.requires_grad_(param.requires_grad)
+        meta_param.__dict__.update(getattr(param, "__dict__", {}))
+        torch.utils.swap_tensors(param, meta_param)
+
+
 def init_parameters_preserving_vllm_linear(
     module: nn.Module,
     dtype: torch.dtype | None,

@@ -22,6 +22,7 @@ import json
 from collections.abc import Mapping
 from contextlib import suppress
 from dataclasses import dataclass, replace
+from functools import partial
 
 from fastapi import WebSocket, WebSocketDisconnect
 from vllm.logger import init_logger
@@ -478,7 +479,7 @@ class OmniDuplexSessionHandler:
                         attachment_generation=credentials.attachment_generation,
                         resume_token=credentials.resume_token,
                     )
-                await self._send_event(session_id, event)
+                await self._send_event(session_id, event, handle=handle)
                 if isinstance(event, SessionClosed):
                     close_reason = event.reason or event.type
                     break
@@ -523,19 +524,22 @@ class OmniDuplexSessionHandler:
         with suppress(Exception):
             await asyncio.wait_for(asyncio.shield(pump), _PUMP_DRAIN_TIMEOUT_S)
 
-    async def _send_event(self, session_id: str, event: DuplexEvent) -> None:
+    async def _send_event(self, session_id: str, event: DuplexEvent, *, handle: DuplexSessionHandle) -> None:
         payload = event.to_realtime()
         journal = not isinstance(event, _UNJOURNALED_EVENTS) and session_id not in self._resync_required_sessions
+        event_guard = partial(handle.output_guard, event)
         try:
             try:
-                await self._attachment_registry.send_event(session_id, payload, journal=journal)
+                await self._attachment_registry.send_event(
+                    session_id, payload, journal=journal, event_guard=event_guard
+                )
             except DuplexJournalOverflowError:
                 first_overflow = session_id not in self._resync_required_sessions
                 self._resync_required_sessions.add(session_id)
                 if first_overflow:
                     resync = SessionResyncRequired(session_id=session_id, reason="journal_overflow")
                     await self._attachment_registry.send_event(session_id, resync.to_realtime(), journal=False)
-                await self._attachment_registry.send_event(session_id, payload, journal=False)
+                await self._attachment_registry.send_event(session_id, payload, journal=False, event_guard=event_guard)
         except KeyError:
             # Attachment already closed (takeover or teardown); the journal is gone.
             pass

@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Non-KV per-session state and fail-closed request fingerprinting."""
 
 from __future__ import annotations
@@ -8,6 +9,8 @@ from typing import Any
 
 import torch
 
+from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.dense_attention import CosmosSimDenseAttentionCache
+
 
 def append_dense_kv_history(
     history: list[tuple[torch.Tensor, torch.Tensor]] | None,
@@ -15,7 +18,7 @@ def append_dense_kv_history(
     *,
     tokens_per_frame: int,
     sink_frames: int,
-    window_frames: int,
+    window_frames: int | None,
 ) -> list[tuple[torch.Tensor, torch.Tensor]]:
     """Append a dense oracle block while retaining only one rebuilt layer."""
 
@@ -25,14 +28,16 @@ def append_dense_kv_history(
         isinstance(sink_frames, bool)
         or not isinstance(sink_frames, int)
         or sink_frames < 0
-        or isinstance(window_frames, bool)
-        or not isinstance(window_frames, int)
-        or window_frames <= 0
+        or (
+            window_frames is not None
+            and (isinstance(window_frames, bool) or not isinstance(window_frames, int) or window_frames <= 0)
+        )
+        or (window_frames is None and sink_frames != 0)
     ):
         raise ValueError("sink_frames must be non-negative and window_frames must be positive.")
     sink_tokens = sink_frames * tokens_per_frame
-    tail_tokens = window_frames * tokens_per_frame
-    max_tokens = sink_tokens + tail_tokens
+    tail_tokens = window_frames * tokens_per_frame if window_frames is not None else 0
+    max_tokens = sink_tokens + tail_tokens if window_frames is not None else None
     if not current_kv:
         raise ValueError("Cosmos3-Nano-Sim-Bimanual dense K/V update must contain at least one layer.")
 
@@ -57,11 +62,12 @@ def append_dense_kv_history(
         # The transformer output already owns exactly the first committed
         # block. Retain its detached storage directly instead of copying it
         # through a concatenation with zero-length views.
-        if any(key.shape[1] > max_tokens for key, _ in current_kv):
-            raise ValueError(
-                "The initial Cosmos3-Nano-Sim-Bimanual dense K/V block exceeds the configured history window."
-            )
-        return [(key.detach(), value.detach()) for key, value in current_kv]
+        def retain_initial(tensor):
+            if max_tokens is None or tensor.shape[1] <= max_tokens:
+                return tensor.detach()
+            return torch.cat([tensor[:, :sink_tokens], tensor[:, -tail_tokens:]], dim=1).detach()
+
+        return [(retain_initial(key), retain_initial(value)) for key, value in current_kv]
     if len(history) != len(current_kv):
         raise ValueError(
             "Cosmos3-Nano-Sim-Bimanual dense K/V layer count changed within a session: "
@@ -100,7 +106,7 @@ def append_dense_kv_history(
         return parts
 
     def append_bounded(old: torch.Tensor, new: torch.Tensor) -> torch.Tensor:
-        if old.shape[1] + new.shape[1] <= max_tokens:
+        if max_tokens is None or old.shape[1] + new.shape[1] <= max_tokens:
             return torch.cat([old, new], dim=1)
         # Build the final sink+tail tensor directly. Appending the full history
         # and trimming it afterward creates another layer-sized transient at
@@ -166,6 +172,7 @@ class Cosmos3NanoSimBimanualSessionState:
     tick_output_type: str | None = None
     text_kv_by_branch: dict[str, list[tuple[torch.Tensor, torch.Tensor]]] = field(default_factory=dict)
     dense_kv_by_branch: dict[str, list[tuple[torch.Tensor, torch.Tensor]]] = field(default_factory=dict)
+    dense_attention: CosmosSimDenseAttentionCache | None = None
     latents: list[torch.Tensor] = field(default_factory=list)
     vae_decoder_feat_cache: list[Any] | None = None
     vae_decoder_initialized: bool = False
@@ -257,6 +264,7 @@ class Cosmos3NanoSimBimanualSessionState:
         self.tick_output_type = None
         self.text_kv_by_branch.clear()
         self.dense_kv_by_branch.clear()
+        self.dense_attention = None
         self.latents.clear()
         self.vae_decoder_feat_cache = None
         self.vae_decoder_initialized = False

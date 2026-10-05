@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Real frame-sized Transfer pages against contiguous FlashAttention."""
+"""Transfer pages against contiguous FlashAttention."""
 
 import pytest
 import torch
@@ -18,9 +18,13 @@ pytestmark = [pytest.mark.core_model, pytest.mark.gpu]
     ("chunk_size", "execution"),
     [(chunk, "eager") for chunk in (1, 2, 3, 4, 8)] + [(chunk, mode) for chunk in (1, 4) for mode in ("compile", "cg")],
 )
-def test_transfer_frame_pages_match_contiguous_attention(chunk_size, execution, monkeypatch):
+@pytest.mark.parametrize("block_size,fa_version", [(16, 2), (16, 4), (390, 4)])
+def test_transfer_frame_pages_match_contiguous_attention(chunk_size, execution, block_size, fa_version, monkeypatch):
     from vllm.vllm_flash_attn import flash_attn_varlen_func
 
+    from vllm_omni.experimental.ar_diffusion.kv_cache import paged_attention
+
+    monkeypatch.setitem(paged_attention._FA_VERSION_BY_HEAD_SIZE, 128, fa_version)
     device = torch.device("cuda")
     dtype = torch.bfloat16
     tokens, heads, dim = 390, 8, 128  # 832x480 Transfer, vision-only pages
@@ -36,7 +40,7 @@ def test_transfer_frame_pages_match_contiguous_attention(chunk_size, execution, 
         num_kv_heads=heads,
         head_size=dim,
         dtype=dtype,
-        block_size=tokens,
+        block_size=block_size,
         max_model_len=1 << 20,
         available_bytes=1 << 28,
         kv_branches=(ARDiffusionKVBranchSpec("main", 0),),

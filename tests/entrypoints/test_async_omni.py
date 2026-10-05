@@ -10,6 +10,7 @@ import pytest
 from vllm.engine.protocol import StreamingInput
 from vllm.lora.request import LoRARequest
 from vllm.sampling_params import RequestOutputKind, SamplingParams
+from vllm.v1.kv_hints import KvHintsEnvelope
 
 from tests.helpers.mark import hardware_test
 from tests.helpers.stage_config import get_deploy_config_path
@@ -134,6 +135,39 @@ def test_generate_forwards_lora_request_to_engine():
         assert len(submitted_ids) == 1
         assert len(submitted_loras) == 1
         assert submitted_loras[0] is lora
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("streaming", [None, "chunk", "empty"])
+def test_generate_forwards_kv_hints_on_initial_stage_submission(streaming):
+    async def run():
+        submissions = []
+
+        async def add(**kwargs):
+            submissions.append(kwargs)
+
+        omni = get_async_omni_instance(fake_add_request=add)
+        omni.engine.add_streaming_update_async = _noop
+        omni.engine.stage_configs = [SimpleNamespace(is_comprehension=True, stage_type="llm")]
+        omni.engine.stage_vllm_configs = [SimpleNamespace(model_config=SimpleNamespace(is_encoder_decoder=False))]
+        hints = KvHintsEnvelope("1", "message", [])
+        params = SamplingParams(max_tokens=2, output_kind=RequestOutputKind.DELTA)
+
+        async def chunks():
+            if streaming == "chunk":
+                yield StreamingInput(prompt={"prompt_token_ids": [1]})
+
+        async for _ in omni.generate(
+            prompt=chunks() if streaming else {"prompt_token_ids": [1]},
+            request_id="hints",
+            sampling_params_list=[params],
+            kv_hints=hints,
+        ):
+            pass
+        assert len(submissions) == 1
+        assert submissions[0]["kv_hints"] is hints
 
     asyncio.run(run())
 

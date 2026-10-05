@@ -20,6 +20,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 def test_multimodal_runner_preserves_forwarded_token_identities(monkeypatch):
     stage_model = torch.nn.Module()
+    stage_model.logits_vocab_size = 6562
     stage_model.make_empty_intermediate_tensors = lambda: None
     monkeypatch.setattr(
         "vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni.init_vllm_registered_model",

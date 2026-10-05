@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Exercise the real admission/rollout methods with CPU transformer/decoder doubles.
 
 Extracting the methods avoids loading CUDA-only import-time dependencies on CPU
@@ -32,13 +33,14 @@ from vllm_omni.diffusion.media import (
     VideoTensorSpec,
     VideoValueRange,
 )
-from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.action_inputs import prepare_action_values
+from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.action_inputs import (
+    domains_for_frames,
+    prepare_action_values,
+    prepare_domain_ids,
+)
 from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.geometry import (
     Cosmos3NanoSimBimanualResolutionPolicy,
     resolve_cosmos3_nano_sim_bimanual_geometry,
-)
-from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.inference_config import (
-    Cosmos3NanoSimBimanualInferenceConfig,
 )
 from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.normalizer import ActionAffineNormalizer
 from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.state_cosmos3_nano_sim_bimanual import (
@@ -75,6 +77,8 @@ def pipeline_methods() -> type:
         "resolve_cosmos3_nano_sim_bimanual_geometry": resolve_cosmos3_nano_sim_bimanual_geometry,
         "parse_cosmos3_nano_sim_bimanual_tick": parse_cosmos3_nano_sim_bimanual_tick,
         "prepare_action_values": prepare_action_values,
+        "prepare_domain_ids": prepare_domain_ids,
+        "domains_for_frames": domains_for_frames,
         "DiffusionMediaOutput": DiffusionMediaOutput,
         "VideoMediaOutput": VideoMediaOutput,
         "VideoTensorSpec": VideoTensorSpec,
@@ -142,7 +146,6 @@ def fake_pipeline(*, prefix: bool = True) -> tuple[Any, Any]:
 
     pipe = pipeline_methods()()
     pipe.manifest = manifest()
-    pipe.inference_config = Cosmos3NanoSimBimanualInferenceConfig.from_od_config(SimpleNamespace(), pipe.manifest)
     pipe._states = {}
     pipe._bound_session_id = None
     pipe._ar_diffusion_kv_state = None
@@ -180,6 +183,7 @@ def fake_pipeline(*, prefix: bool = True) -> tuple[Any, Any]:
 
     pipe._get_or_create_state = create_state
     pipe._ensure_text_kv = Mock(return_value=[])
+    pipe._prepare_dense_attention = Mock()
     pipe._resolve_seed = Mock(return_value=42)
     pipe._transformer_forward = Mock(side_effect=lambda _state, latent, *_args, **_kw: SimpleNamespace(video=latent))
     pipe._sample_distilled = Mock(side_effect=lambda velocity, noise, **_kw: velocity(noise, torch.tensor([1.0])))

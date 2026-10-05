@@ -215,6 +215,8 @@ class _MiniDiT(nn.Module):
             cnn_cache_buffer[b_idx] = x[:, -2:, :].transpose(1, 2).contiguous()
             dt = x.shape[1]
             att_cache_buffer[b_idx][:, :, :dt, :] = x.unsqueeze(1)
+            if att_b is not None:
+                att_cache_buffer[b_idx][:, :, dt:, :] = att_b
         x = self.final_layer(x)
         x = x.transpose(1, 2)
         return x
@@ -229,8 +231,12 @@ def _cfm_inputs(
     time_emb = torch.randn(batch_size, 1, hidden, device=device)
     cnn_cache = torch.randn(depth, batch_size, hidden, 2, device=device)
     att_cache = torch.randn(depth, batch_size, 1, old_att_len, hidden, device=device)
-    cnn_out = torch.empty(depth, batch_size, hidden, 2, device=device)
-    att_out = torch.empty(depth, batch_size, 1, old_att_len + chunk_size, hidden, device=device)
+    # The fake estimator only fills ``att_out[:, :, :, :chunk_size]``. The tail
+    # is the previous cache slot and is not written. ``empty`` leaves it
+    # uninitialized, so eager and replay compare different garbage and CI
+    # fails when that garbage is NaN.
+    cnn_out = torch.zeros(depth, batch_size, hidden, 2, device=device)
+    att_out = torch.zeros(depth, batch_size, 1, old_att_len + chunk_size, hidden, device=device)
     return estimator_input, time_emb, cnn_cache, att_cache, cnn_out, att_out
 
 
@@ -248,6 +254,9 @@ def test_cfm_graph_replay_matches_eager_for_uncached_and_cached_shapes(
     with torch.inference_mode():
         for _, chunk_size, old_att_len in ((2, 10, 0), (2, 10, 5)):
             inputs = _cfm_inputs(2, chunk_size, old_att_len)
+            # A cache output must overwrite every row, including the old tail.
+            inputs[4].fill_(float("nan"))
+            inputs[5].fill_(float("nan"))
 
             eager_inputs = tuple(v.clone() for v in inputs)
             with torch.no_grad():
@@ -268,6 +277,8 @@ def test_cfm_graph_replay_matches_eager_for_uncached_and_cached_shapes(
             torch.testing.assert_close(graph_result, eager_result, rtol=1e-4, atol=1e-5)
             torch.testing.assert_close(graph_cnn, eager_inputs[4], rtol=1e-4, atol=1e-5)
             torch.testing.assert_close(graph_att, eager_inputs[5], rtol=1e-4, atol=1e-5)
+            assert torch.isfinite(graph_att).all()
+            torch.testing.assert_close(graph_att[:, :, :, chunk_size:, :], inputs[3])
 
     wrapper._flush()
 
@@ -1969,7 +1980,10 @@ def test_whole_euler_query_bucket_keeps_current_first_cache_layout(monkeypatch: 
         (_whole_euler_chunk(1, 8), 6, 2),  # narrow padded chunk: capture pads 8 -> 16
         (_whole_euler_chunk(1, 16), 16, 0),  # consumes the narrow chunk's cache
     ]
-    caches = {"exact": (None, None), "bucketed": (None, None)}
+    caches: dict[str, tuple[torch.Tensor | None, torch.Tensor | None]] = {
+        "exact": (None, None),
+        "bucketed": (None, None),
+    }
     for chunk, mel_frames, pad_frames in chunks:
         chunk["x"][:, :, mel_frames:] = 0.0
         results = {}
@@ -2319,3 +2333,24 @@ def test_whole_euler_groups_are_acquired_again_after_a_flush(monkeypatch: pytest
     assert calls == [16, 1, 16, 1]
     flush_always = True
     assert wrapper._group_entries(groups, fills) is None
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_vocoder_restores_tf32_policy(fail):
+    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_code2wav import MiniCPMO45Code2Wav
+
+    previous = torch.backends.cuda.matmul.allow_tf32
+
+    def forward(*args, **kwargs):
+        assert torch.backends.cuda.matmul.allow_tf32
+        if fail:
+            raise RuntimeError("injected")
+        return "ok"
+
+    model = SimpleNamespace(_extra_config=lambda: {"token2wav_allow_tf32": True}, _forward_impl=forward)
+    if fail:
+        with pytest.raises(RuntimeError, match="injected"):
+            MiniCPMO45Code2Wav.forward(model)
+    else:
+        assert MiniCPMO45Code2Wav.forward(model) == "ok"
+    assert torch.backends.cuda.matmul.allow_tf32 == previous

@@ -15,8 +15,8 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 def test_dispatch_eager_and_manager_paths(monkeypatch, dp_size):
     runner = object.__new__(OmniGPUModelRunner)
     runner.cudagraph_manager = None
-    runner.dp_size = dp_size
-    runner.dp_rank = 1
+    runner.parallel_config = SimpleNamespace(data_parallel_size=dp_size, data_parallel_rank=1)
+    runner.dp_size, runner.dp_rank = dp_size, 1
 
     import vllm.v1.worker.gpu.dp_utils as dp_utils
 
@@ -52,6 +52,7 @@ def test_dispatch_eager_and_manager_paths(monkeypatch, dp_size):
         return expected
 
     runner.cudagraph_manager = SimpleNamespace(dispatch=dispatch)
+    runner.parallel_config.data_parallel_size = 1
     runner.dp_size = 1
     batch_desc, _ = runner._dispatch_batch_descriptor(
         num_reqs=1, num_toks=8, uniform_tok_count=8, num_active_loras=0, use_eager=False, max_query_len=8

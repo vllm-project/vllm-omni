@@ -288,6 +288,9 @@ def _setup_log_mocks(monkeypatch):
         def build_and_log_summary(self):
             return "Fake summary"
 
+        def log_timing_summary(self):
+            pass
+
     monkeypatch.setattr(
         "vllm_omni.entrypoints.omni.OrchestratorAggregator",
         _FakeOrchestratorAggregator,

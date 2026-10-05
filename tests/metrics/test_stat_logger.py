@@ -477,6 +477,7 @@ def stats_config():
         observability_config=ObservabilityConfig(kv_cache_metrics=True),
         speculative_config=Mock(spec=SpeculativeConfig, num_speculative_tokens=3),
         kv_transfer_config=None,
+        ec_transfer_config=None,
         lora_config=None,
     )
     yield config

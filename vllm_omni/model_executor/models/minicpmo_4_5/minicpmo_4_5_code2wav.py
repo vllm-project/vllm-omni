@@ -22,6 +22,7 @@ from vllm.config import VllmConfig
 from vllm.logger import init_logger
 
 from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.utils.device_copy import to_device_nonblocking
 
 from .batched_token2wav import (
     BatchedToken2Wav,
@@ -146,10 +147,12 @@ def _normalize_reference(
 
 
 def _codec_tensor(value: Any, fallback: torch.Tensor) -> torch.Tensor:
+    # Codec ids arrive from the connector as host data. A pageable host copy
+    # would block the host once per request per step; stage them pinned.
     if isinstance(value, torch.Tensor):
-        return value.reshape(-1).to(device=fallback.device, dtype=torch.long)
+        return to_device_nonblocking(value.reshape(-1).to(dtype=torch.long), fallback.device)
     if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
-        return torch.as_tensor(value, device=fallback.device, dtype=torch.long).reshape(-1)
+        return to_device_nonblocking(torch.as_tensor(value, dtype=torch.long).reshape(-1), fallback.device)
     return fallback.reshape(-1).to(dtype=torch.long)
 
 
@@ -723,6 +726,33 @@ class MiniCPMO45Code2Wav(nn.Module):
 
     @torch.inference_mode()
     def forward(
+        self,
+        input_ids: torch.Tensor | None = None,
+        positions: torch.Tensor | None = None,
+        intermediate_tensors: Any = None,
+        inputs_embeds: torch.Tensor | None = None,
+        runtime_additional_information: list[dict[str, Any]] | None = None,
+        **kwargs: Any,
+    ) -> OmniOutput:
+        # This stage owns the vocoder process. Restore its previous matmul
+        # policy after eager execution/capture; cuDNN's policy is independent.
+        previous_tf32 = torch.backends.cuda.matmul.allow_tf32
+        try:
+            if self._extra_config().get("token2wav_allow_tf32", False):
+                torch.backends.cuda.matmul.allow_tf32 = True
+            return self._forward_impl(
+                input_ids,
+                positions,
+                intermediate_tensors,
+                inputs_embeds,
+                runtime_additional_information,
+                **kwargs,
+            )
+        finally:
+            torch.backends.cuda.matmul.allow_tf32 = previous_tf32
+
+    @torch.inference_mode()
+    def _forward_impl(
         self,
         input_ids: torch.Tensor | None = None,
         positions: torch.Tensor | None = None,

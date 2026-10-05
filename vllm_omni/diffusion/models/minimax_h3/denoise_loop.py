@@ -3,7 +3,7 @@
 """MiniMax H3 cfg-distilled full denoise loop.
 
 Per step, the positive presentation is forwarded exactly once. Video and audio
-target rows chain through the Euler-eta0 update while visual and audio condition
+target rows chain through the selected solver while visual and audio condition
 rows stay pinned to their noised step-0 anchors.
 """
 
@@ -25,8 +25,8 @@ from vllm_omni.diffusion.forward_context import (
 from vllm_omni.platforms import current_omni_platform
 
 from .latent_mask import MiniMaxH3LatentEdit, minimax_h3_prepare_edit_rows
+from .sampling import create_h3_sample_solver
 from .scheduling_minimax_h3_euler_ancestral import (
-    minimax_h3_euler_eta0_step,
     minimax_h3_rf_v_to_x0,
 )
 
@@ -333,6 +333,7 @@ def minimax_h3_denoise_loop(
     audio_cond_noise_aug_for_inference: float = MINIMAX_H3_AUDIO_REF_COND_TIMESTEP,
     on_step: Callable[[int, torch.Tensor, torch.Tensor], None] | None = None,
     step_profiler: Callable[[int], AbstractContextManager] | None = None,
+    sampler: str = "euler",
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run the full denoise loop; returns final (video_rows, audio_rows).
 
@@ -365,13 +366,15 @@ def minimax_h3_denoise_loop(
     if audio_edit is not None:
         audio_edit = audio_edit.to(device=device, dtype=torch.float32)
 
+    video_solver = create_h3_sample_solver(sampler, sigmas_video)
+    audio_solver = create_h3_sample_solver(sampler, sigmas_audio)
     num_steps = len(sigmas_video) - 1
     for step in range(num_steps):
         check_request_cancellation()
         step_cm = step_profiler(step) if step_profiler is not None else nullcontext()
         with step_cm:
-            s_v, s_v_next = sigmas_video[step], sigmas_video[step + 1]
-            s_a, s_a_next = sigmas_audio[step], sigmas_audio[step + 1]
+            s_v = sigmas_video[step]
+            s_a = sigmas_audio[step]
             # Publish where we are so step-gated attention features (the dense
             # warmup of RAINFUSION_ATTN, the timestep gate of TRTLLM_ATTN) can
             # see it. Gates use the scheduler-style descending timestep, which
@@ -425,7 +428,7 @@ def minimax_h3_denoise_loop(
                     mv_video_t,
                     t_v,
                 )
-            new_target = minimax_h3_euler_eta0_step(video_rows[update], x0_video, sigma_curr=s_v, sigma_next=s_v_next)
+            new_target = video_solver.step(video_rows[update], x0_video, step)
             video_rows = video_rows.clone()
             video_rows[update] = new_target
             if cond_anchor is not None:
@@ -443,9 +446,7 @@ def minimax_h3_denoise_loop(
                     mv_audio_t,
                     t_a,
                 )
-            new_audio = minimax_h3_euler_eta0_step(
-                audio_rows[audio_update], x0_audio, sigma_curr=s_a, sigma_next=s_a_next
-            )
+            new_audio = audio_solver.step(audio_rows[audio_update], x0_audio, step)
             audio_rows = audio_rows.clone()
             audio_rows[audio_update] = new_audio if positive.locked_audio_rows is None else positive.locked_audio_rows
             if audio_anchor is not None:

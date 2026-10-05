@@ -445,6 +445,17 @@ class Cosmos3NanoSimTransferPipeline(Cosmos3NanoSimBimanualPipeline):
             max_scratch_tokens_per_branch=text,
         )
 
+    def _request_kv_spec(self, geometry: Cosmos3NanoSimBimanualGeometry) -> ARDiffusionRequestKVSpec:
+        return ARDiffusionRequestKVSpec(
+            self._kv_spec_for_geometry(geometry),
+            (
+                geometry.session_key,
+                self.manifest.window_frames,
+                self.manifest.sink_frames,
+                self.manifest.text_cache_max_len,
+            ),
+        )
+
     def ar_diffusion_request_spec(self, request: Any) -> ARDiffusionRequestKVSpec:
         # Runner admission receives OmniDiffusionRequest; pipeline admission
         # receives its single-prompt DiffusionRequestBatch representation.
@@ -516,7 +527,7 @@ class Cosmos3NanoSimTransferPipeline(Cosmos3NanoSimBimanualPipeline):
             reset_at_boundary=cache.spec.reset_at_boundary,
         )
         if geometry is not None:
-            actual["tokens_per_frame"] = cache.block_size
+            actual["tokens_per_frame"] = cache.spec.chunk_size
         mismatches = {
             name: (getattr(expected_spec, name), value)
             for name, value in actual.items()
@@ -595,6 +606,10 @@ class Cosmos3NanoSimTransferPipeline(Cosmos3NanoSimBimanualPipeline):
         if limit <= 0:
             raise ARDiffusionRequestRejectedError("max_prompt_tokens must be positive.")
         return limit
+
+    def _prepare_dense_attention(self, state, text_kv, real_text_kv_len, geometry, target_frame):
+        # Transfer retains control/RGB pairs, not the action/video frame layout.
+        state.dense_attention = None
 
     def _append_dense_kv(
         self,

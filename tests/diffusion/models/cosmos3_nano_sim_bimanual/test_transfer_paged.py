@@ -32,7 +32,7 @@ def paged_pipeline(chunk_size=1):
     return p
 
 
-def make_cache(spec):
+def make_cache(spec, block_size=None):
     return ARDiffusionKVCache(
         ARDiffusionKVConfig(
             enable=True,
@@ -45,7 +45,7 @@ def make_cache(spec):
         num_kv_heads=spec.num_kv_heads,
         head_size=spec.head_size,
         dtype=torch.float32,
-        block_size=spec.tokens_per_frame,
+        block_size=spec.tokens_per_frame if block_size is None else block_size,
         max_model_len=spec.max_model_len,
         available_bytes=1 << 20,
         kv_branches=spec.kv_branches,
@@ -60,7 +60,8 @@ def make_cache(spec):
 
 
 @pytest.mark.parametrize("window,sink", [(1, 0), (2, 1), (4, 0), (4, 2), (30, 3), (51, 1)])
-def test_transfer_paged_rollout_visibility_and_attention(window, sink, monkeypatch):
+@pytest.mark.parametrize("size,block_size", [(32, 1), (96, 16)])
+def test_transfer_paged_rollout_visibility_and_attention(window, sink, size, block_size, monkeypatch):
     """Exercise real allocation, scratch writes, attention, eviction and reuse.
 
     Frame labels are independent of physical page IDs and absolute positions;
@@ -68,9 +69,10 @@ def test_transfer_paged_rollout_visibility_and_attention(window, sink, monkeypat
     """
     monkeypatch.delenv("VLLM_OMNI_AR_DIFFUSION_KV_GATHER", raising=False)
     p = paged_pipeline()
-    geometry = Cosmos3NanoSimBimanualGeometry(height=32, width=32)
+    geometry = Cosmos3NanoSimBimanualGeometry(height=size, width=size)
     spec = p._kv_spec_for_geometry(geometry, window_frames=window, sink_frames=sink, text_capacity=3)
-    cache = make_cache(spec)
+    cache = make_cache(spec, block_size=block_size)
+    tokens = spec.tokens_per_frame
     free_before = cache.manager.block_pool.get_num_free_blocks()
     adapter = cache.begin_request("paired")
     paged = ARDiffusionKVState(cache, "paired", {"main": adapter}, num_layers=2)
@@ -90,28 +92,29 @@ def test_transfer_paged_rollout_visibility_and_attention(window, sink, monkeypat
         if phase != "control":
             labels.append(float(2 * frame))
         current = float(2 * frame if phase == "control" else 2 * frame + 1)
-        contexts = paged.get_kv_caches("main", seq_len=1, commit_current=commit, extra_visible_tokens=1)
+        contexts = paged.get_kv_caches("main", seq_len=tokens, commit_current=commit, extra_visible_tokens=tokens)
         ctx = contexts[0].forward_ctx
         # The retained K/V must be unchanged across all four denoising calls.
-        for layer in range(2):
-            actual = cache.key_cache(layer)[ctx.history_block_ids, 0, 0, 0].tolist()
-            assert actual == labels, (phase, frame, actual, labels)
+        if block_size == 1:
+            for layer in range(2):
+                actual = cache.key_cache(layer)[ctx.history_block_ids, 0, 0, 0].tolist()
+                assert actual == labels, (phase, frame, actual, labels)
         before = adapter.completed_chunks
-        ctx.prepare(device=torch.device("cpu"), action_len=3, query_len=1)
+        ctx.prepare(device=torch.device("cpu"), action_len=3, query_len=tokens)
         for layer_context in contexts:
             inputs = layer_context.to_layer_inputs()
             table_shapes.add(tuple(inputs.block_table.shape))
-            q = torch.zeros(1, 1, 4)
+            q = torch.zeros(tokens, 1, 4)
             kv = torch.full_like(q, current)
             text = torch.full((3, 1, 4), -1.0)
             actual = paged_write_attn(inputs, q, kv, kv, text, text, 0.5)
-            expected = (sum(labels) + current - 3) / (len(labels) + 4)
+            expected = ((sum(labels) + current) * tokens - 3) / ((len(labels) + 1) * tokens + 3)
             torch.testing.assert_close(actual, torch.full_like(actual, expected), rtol=1e-5, atol=1e-5)
         if not commit:
             scratch_slots.append(ctx.current_video_slot_mapping.clone())
         paged.commit_paged_context("main")
         assert adapter.completed_chunks == before + int(commit)
-        assert len(cache.window_block_ids(adapter)) <= 2 * window - 1
+        assert len(cache.window_block_ids(adapter)) <= (2 * window * tokens + block_size - 1) // block_size + 2
         calls.append((phase, frame))
 
     def control(*args, frame_start, **kwargs):
@@ -147,9 +150,11 @@ def test_transfer_paged_rollout_visibility_and_attention(window, sink, monkeypat
         )
     assert ("clean", total - 1) not in calls
     assert adapter.completed_chunks == 2 * total - 1
-    assert adapter.compacted_tokens > 0
+    if block_size == 1:
+        assert adapter.compacted_tokens > 0
     assert len(table_shapes) == 1
-    assert all(torch.equal(slots, scratch_slots[0]) for slots in scratch_slots)
+    if block_size == 1:
+        assert all(torch.equal(slots, scratch_slots[0]) for slots in scratch_slots)
     assert not state.dense_kv_by_branch
     paged.close()
     assert cache.manager.block_pool.get_num_free_blocks() == free_before
@@ -176,6 +181,21 @@ def test_transfer_request_spec_uses_control_geometry_and_overrides(window, sink,
     p.validate_ar_diffusion_effective_spec(spec)
     batch = SimpleNamespace(prompts=[request.prompt], sampling_params=sp)
     assert p.ar_diffusion_request_spec(batch) == result
+
+
+def test_transfer_default_request_spec_uses_control_latent_layout():
+    p = paged_pipeline()
+    result = p.ar_diffusion_default_request_spec()
+    assert result.kv_spec == p.ar_diffusion_kv_cache_spec()
+    assert result.geometry_key == (
+        p.resolution_policy.default_resolution,
+        p.manifest.window_frames,
+        p.manifest.sink_frames,
+        p.manifest.text_cache_max_len,
+    )
+    p.validate_ar_diffusion_effective_spec(result.kv_spec)
+    for worst in p.ar_diffusion_worst_case_request_specs():
+        p.validate_ar_diffusion_effective_spec(worst.kv_spec)
 
 
 def test_transfer_paged_rejects_unpaired_spec():
@@ -254,11 +274,12 @@ def test_chunkwise_request_spec_preserves_full_history_contract(chunk_size):
         p.ar_diffusion_request_spec(request)
 
 
-def test_transfer_bound_pool_checks_request_limits():
+@pytest.mark.parametrize("block_size", [1, 16])
+def test_transfer_bound_pool_checks_request_limits(block_size):
     p = paged_pipeline()
     geometry = Cosmos3NanoSimBimanualGeometry(height=32, width=32)
     spec = p._kv_spec_for_geometry(geometry, window_frames=30, sink_frames=3, text_capacity=4096)
-    cache = make_cache(spec)
+    cache = make_cache(spec, block_size=block_size)
     state = SimpleNamespace(kv_cache=cache)
     p._validate_bound_kv_geometry(state)
     p._validate_bound_kv_geometry(state, geometry, expected_spec=spec)

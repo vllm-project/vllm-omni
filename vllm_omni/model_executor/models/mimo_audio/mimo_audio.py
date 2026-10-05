@@ -29,7 +29,6 @@ from vllm.multimodal.inputs import (
 )
 from vllm.multimodal.parse import AudioProcessorItems, MultiModalDataItems, MultiModalDataParser
 from vllm.multimodal.processing import (
-    BaseDummyInputsBuilder,
     BaseProcessingInfo,
     ProcessorInputs,
     PromptReplacement,
@@ -44,7 +43,7 @@ from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 
-from vllm_omni.inputs.mm_processor import OmniMultiModalProcessor
+from vllm_omni.inputs.mm_processor import OmniDummyInputsBuilder, OmniMultiModalProcessor
 from vllm_omni.model_executor.custom_process_mixin import CustomProcessMixin
 from vllm_omni.model_executor.models.mimo_audio.config_mimo_audio import (
     NO_INTERLEAVE_NEXT_TOKEN_ID,
@@ -224,7 +223,7 @@ class MiMoAudioLLMProcessingInfo(
         return {"audio": 1}
 
 
-class MiMoAudioLLMDummyInputsBuilder(BaseDummyInputsBuilder[MiMoAudioLLMProcessingInfo]):
+class MiMoAudioLLMDummyInputsBuilder(OmniDummyInputsBuilder[MiMoAudioLLMProcessingInfo]):
     _processor_inputs_cache: LRUCache = LRUCache(capacity=1024)
 
     def get_dummy_text(self, mm_counts: Mapping[str, int]) -> str:
@@ -372,7 +371,7 @@ class MiMoAudioLLMMultiModalProcessor(OmniMultiModalProcessor[MiMoAudioLLMProces
 
         # Text-only input not supported in composite processor
         if not mm_data.get("audio", []):
-            prompt_ids = self._apply_hf_processor_tokens_only(prompt_ids)
+            prompt_ids = self._postprocess_prompt(prompt_ids)
 
             return BatchFeature(dict(input_ids=[prompt_ids]), tensor_type="pt")
 

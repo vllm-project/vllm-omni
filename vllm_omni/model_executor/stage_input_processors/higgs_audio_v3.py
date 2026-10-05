@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Stage-input processor for higgs-audio v3: Talker -> Code2Wav.
 
 Two adapters:
@@ -21,6 +21,7 @@ to avoid corrupting valid tail content.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any
 
 import torch
@@ -95,6 +96,18 @@ def _filter_real_code_frames(audio_codes_qt: torch.Tensor) -> torch.Tensor:
     return frames[valid].t().contiguous()
 
 
+def _whole_utterance_codec_codes(audio_rows: torch.Tensor) -> torch.Tensor:
+    """Convert complete delayed [T, Q] rows to flat codebook-major CPU codes."""
+    codes = _revert_delay_pattern(audio_rows.to(device="cpu", dtype=torch.long).t().contiguous())
+    # Substitute special/padding codes after de-delay. Clamping would map EOC
+    # to a valid codec entry and introduce audible artifacts.
+    codes = torch.where((codes < 0) | (codes >= _NUM_REAL_CODES), 0, codes)
+    # Preserve the existing removal of the residual ramp-down frame.
+    if codes.shape[-1] >= 2:
+        codes = codes[:, :-1]
+    return codes.reshape(-1).contiguous()
+
+
 def talker2code2wav(
     source_outputs: list[Any],
     prompt: Any = None,
@@ -133,43 +146,16 @@ def talker2code2wav(
                 f"got {audio_codes.shape[1]}. Audio codes shape: {tuple(audio_codes.shape)}"
             )
 
-        # Transpose to [Q, T] for delay pattern reversal
-        codes_qt = audio_codes.transpose(0, 1).contiguous().cpu()
-
-        # Step 1: Revert delay pattern
         try:
-            codes_qt = _revert_delay_pattern(codes_qt)
+            codec_codes = _whole_utterance_codec_codes(audio_codes)
         except ValueError as exc:
             logger.warning("Skipping invalid Higgs Audio v3 code sequence for Stage 1: %s", exc)
             code2wav_inputs.append(_empty_code2wav_prompt())
             continue
 
-        # Step 2: Replace out-of-range codes (BOC=1024, EOC=1025, -1) with 0.
-        # Must use torch.where, NOT clamp: clamp(max=1023) turns 1025→1023
-        # which is a valid codec code and decodes to audio artifacts.
-        # Matches sglang's: torch.where(codes >= codec_vocab, 0, codes)
-        codes_qt = torch.where(
-            (codes_qt >= _NUM_REAL_CODES) | (codes_qt < 0),
-            torch.zeros_like(codes_qt),
-            codes_qt,
-        )
-
-        # Step 3: Trim the last frame. After de-delay, the final frame
-        # contains residual ramp-down codes (EOC→0 substituted) that
-        # decode to a brief noise artifact at the end of the audio.
-        if codes_qt.shape[-1] >= 2:
-            codes_qt = codes_qt[:, :-1]
-
-        if codes_qt.numel() == 0:
-            code2wav_inputs.append(_empty_code2wav_prompt())
-            continue
-
-        # Code2Wav expects codebook-major flat: [Q * num_frames]
-        codec_codes = codes_qt.reshape(-1).tolist()
-
         code2wav_inputs.append(
             OmniTokensPrompt(
-                prompt_token_ids=codec_codes,
+                prompt_token_ids=codec_codes.tolist(),
                 multi_modal_data=None,
                 mm_processor_kwargs=None,
                 additional_information=None,
@@ -261,6 +247,13 @@ def talker2code2wav_async_chunk(
     elif not finished:
         return None
 
+    return _flush_async_chunk(
+        transfer_manager, request_id, finished, _async_chunk_config(transfer_manager), emitted_frames
+    )
+
+
+def _async_chunk_config(transfer_manager: Any) -> tuple[int, int, int, int]:
+    """Validated (chunk, left context, right holdback, initial chunk) frames."""
     connector = getattr(transfer_manager, "connector", None)
     raw_cfg = getattr(connector, "config", {}) or {}
     cfg = raw_cfg.get("extra", raw_cfg) if isinstance(raw_cfg, dict) else {}
@@ -281,7 +274,18 @@ def talker2code2wav_async_chunk(
             f"codec_right_holdback_frames={right_holdback_size_config}, "
             f"initial_codec_chunk_frames={configured_initial_chunk_size}"
         )
+    return chunk_size, left_context_size_config, right_holdback_size_config, configured_initial_chunk_size
 
+
+def _flush_async_chunk(
+    transfer_manager: Any,
+    request_id: str,
+    finished: bool,
+    config: tuple[int, int, int, int],
+    emitted_frames: dict[str, int],
+) -> OmniPayloadStruct | None:
+    """Emit the next sliding-window codec chunk once enough rows accumulated."""
+    chunk_size, left_context_size_config, right_holdback_size_config, configured_initial_chunk_size = config
     n_rows = len(transfer_manager.code_prompt_token_ids[request_id])
     de_delayed_total = max(0, n_rows - (_NUM_CODEBOOKS - 1))
     emitted = int(emitted_frames.get(request_id, 0))
@@ -385,3 +389,83 @@ def talker2code2wav_async_chunk(
         codes=CodesStruct(audio=codec_codes),
         meta=meta,
     )
+
+
+def talker2code2wav_async_chunk_batch(
+    transfer_manager: Any,
+    pooling_outputs: list[OmniPayload | None],
+    requests: list[Any],
+    is_finished: list[bool],
+) -> list[OmniPayloadStruct | None]:
+    """One talker step of async-chunk payloads with one host conversion per row.
+
+    Same accumulation and flush semantics as ``talker2code2wav_async_chunk``;
+    the chunk config is resolved once per step and each emitted ``[1, Q]``
+    CPU row is converted with a single ``tolist`` instead of several small
+    tensor operations per request.
+    """
+    if not (len(pooling_outputs) == len(requests) == len(is_finished)):
+        raise ValueError("batch codec inputs must have identical lengths")
+    emitted_frames = getattr(transfer_manager, "higgs_v3_emitted_frames", None)
+    if emitted_frames is None:
+        emitted_frames = {}
+        transfer_manager.higgs_v3_emitted_frames = emitted_frames
+    config = None
+    rows_by_request = transfer_manager.code_prompt_token_ids
+    payloads: list[OmniPayloadStruct | None] = []
+    for pooling_output, request, finished_flag in zip(pooling_outputs, requests, is_finished):
+        request_id = request.external_req_id
+        finished = bool(finished_flag or request.is_finished())
+        if isinstance(pooling_output, dict):
+            codes = pooling_output.get("codes")
+            audio = codes.get("audio") if isinstance(codes, dict) else None
+            if isinstance(audio, torch.Tensor) and audio.numel():
+                if audio.ndim == 2 and audio.device.type == "cpu" and not audio.is_floating_point():
+                    row = audio.tolist()[-1]
+                    if len(row) != _NUM_CODEBOOKS:
+                        raise ValueError(
+                            f"talker emit row has {len(row)} codebooks; expected {_NUM_CODEBOOKS} "
+                            "for higgs_audio_v3 async_chunk."
+                        )
+                else:
+                    row = _extract_last_step_row(pooling_output)
+                    row = None if row is None else row.cpu().tolist()
+                if row is not None:
+                    rows_by_request[request_id].append(row)
+        elif not finished:
+            payloads.append(None)
+            continue
+        if config is None:
+            config = _async_chunk_config(transfer_manager)
+        payloads.append(_flush_async_chunk(transfer_manager, request_id, finished, config, emitted_frames))
+    return payloads
+
+
+def talker2code2wav_token_only(source_outputs, prompt=None, _requires_multimodal_data=False):
+    """Control slots for the native full-payload consumer."""
+    result = []
+    for output in source_outputs:
+        if not output.finished:
+            continue
+        mm = getattr(output.outputs[0], "multimodal_output", None)
+        if isinstance(mm, Mapping) and isinstance(mm.get("codes", {}).get("audio"), torch.Tensor):
+            result.extend(talker2code2wav([output], prompt, _requires_multimodal_data))
+        else:
+            result.append(OmniTokensPrompt(prompt_token_ids=[0]))
+    return result
+
+
+def talker2code2wav_full_payload(transfer_manager, pooling_output, request):
+    """De-delay the accumulated raw rows once before native codec delivery."""
+    del transfer_manager, request
+    audio = pooling_output.get("codes.audio") if isinstance(pooling_output, dict) else None
+    if audio is None and isinstance(pooling_output, dict):
+        audio = pooling_output.get("codes", {}).get("audio")
+    codes = torch.empty(0, dtype=torch.long)
+    if isinstance(audio, torch.Tensor) and audio.numel():
+        if audio.numel() % _NUM_CODEBOOKS:
+            raise ValueError("Higgs payload must contain complete codebook rows")
+        rows = audio.reshape(-1, _NUM_CODEBOOKS).to(device="cpu", dtype=torch.long)
+        if rows.shape[0] >= _NUM_CODEBOOKS:
+            codes = _whole_utterance_codec_codes(rows)
+    return {"codes": {"audio": codes}, "meta": {"finished": torch.tensor(True)}}

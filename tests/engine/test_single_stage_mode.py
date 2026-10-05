@@ -1219,7 +1219,11 @@ class TestSingleStageReplicaInitialization:
         runtime._init_visible_devices_baseline = "0"
 
         mocker.patch.object(runtime_mod, "inject_kv_stage_info")
-        od_config = SimpleNamespace(max_num_seqs=4, parallel_config=SimpleNamespace(world_size=1))
+        od_config = SimpleNamespace(
+            max_num_seqs=4,
+            parallel_config=SimpleNamespace(world_size=1),
+            distributed_executor_backend="mp",
+        )
         mocker.patch("vllm_omni.engine.stage_engine_startup.build_diffusion_config", return_value=od_config)
         mock_register = mocker.patch(
             "vllm_omni.engine.stage_engine_startup.register_stage_with_omni_master",
@@ -1352,7 +1356,11 @@ class TestSingleStageReplicaInitialization:
         runtime._init_visible_devices_baseline = "0"
 
         mocker.patch.object(runtime_mod, "inject_kv_stage_info")
-        od_config = SimpleNamespace(max_num_seqs=None, parallel_config=SimpleNamespace(world_size=1))
+        od_config = SimpleNamespace(
+            max_num_seqs=None,
+            parallel_config=SimpleNamespace(world_size=1),
+            distributed_executor_backend="mp",
+        )
         mocker.patch("vllm_omni.engine.stage_engine_startup.build_diffusion_config", return_value=od_config)
         mocker.patch(
             "vllm_omni.engine.stage_engine_startup.register_stage_with_omni_master",
