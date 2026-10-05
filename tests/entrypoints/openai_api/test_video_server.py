@@ -278,6 +278,7 @@ def test_resolve_diffusion_od_config_prefers_getter_over_attribute():
 class BlockingVideoHandler:
     supports_mixed_reference_inputs = False
     supports_latent_mask_editing = False
+    is_minimax_h3 = False
     supported_control_upload_types = frozenset()
 
     def __init__(self):

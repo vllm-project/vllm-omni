@@ -749,14 +749,11 @@ def _validate_h3_control_uploads(
 def _attach_control_upload(
     request: VideoGenerationRequest,
     control_type: str,
-    control_path: str | None = None,
 ) -> None:
-    """Declare an uploaded control and attach its persisted path when available."""
+    """Declare the uploaded control type before selecting the reference decode policy."""
     extra_params = dict(request.extra_params or {})
     existing = extra_params.get(control_type)
     control_params = dict(existing) if isinstance(existing, Mapping) else {}
-    if control_path is not None:
-        control_params["control_path"] = control_path
     extra_params[control_type] = control_params
     request.extra_params = extra_params
 
@@ -1081,7 +1078,7 @@ async def _parse_video_form(
         audio_noise_mask=parsed_audio_noise_mask,
     )
 
-    h3_control = bool(getattr(handler, "is_minimax_h3", False))
+    h3_control = handler.is_minimax_h3
     if h3_control:
         normalized_control_type = _validate_h3_control_uploads(
             handler,
