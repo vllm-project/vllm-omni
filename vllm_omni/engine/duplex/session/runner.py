@@ -1667,7 +1667,9 @@ class DuplexSessionRunner:
         if delay_s > 0:
             await asyncio.sleep(delay_s)
         if (
-            self.tasks.append_tail is not append_tail
+            # A session.update may have turned continuation off while this one waited.
+            not self._silence_continuation_enabled()
+            or self.tasks.append_tail is not append_tail
             or ((append_tail is None or append_tail.done()) and self._real_input_waiting())
             or self.model.silence_continuation_is_stale(
                 request_id=request_id,
@@ -1681,9 +1683,12 @@ class DuplexSessionRunner:
 
         def _still_valid() -> bool:
             return (
+                # Still allowed: a session.update may have turned continuation off
+                # while this unit waited behind the append in flight.
+                self._silence_continuation_enabled()
                 # The anchor changed (a real append was accepted) after this
                 # continuation was planned; the unit is outdated.
-                model_state.last_native_submit_monotonic == anchor
+                and model_state.last_native_submit_monotonic == anchor
                 and not self._real_input_waiting()
                 and not self.model.silence_continuation_is_stale(
                     request_id=request_id,

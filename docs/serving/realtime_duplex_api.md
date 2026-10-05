@@ -447,7 +447,8 @@ request replays the voice/persona prefill).
 
 A few `extra_body` keys change how the server advances the model between
 client inputs. They are model-neutral. `silence_continuation` can be changed
-with any `session.update` and is on by default. `clock` and the two
+with any `session.update` and is on by default; turning it off also stops a
+silence unit that was already waiting for its slot. `clock` and the two
 `input_clock_unit_*` timeouts are set when the session is created and cannot
 be changed afterwards, and `clock` requires a model that supports it (see
 below).
