@@ -56,6 +56,7 @@ import yaml
 from vllm.utils.torch_utils import set_default_torch_dtype
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.models.pi05.modeling_pi05 import make_att_2d_masks, prepare_attention_masks_4d
 from vllm_omni.diffusion.models.pi05.pipeline_pi05 import Pi05Pipeline
 
 pytestmark = [
@@ -234,6 +235,69 @@ def test_optimized_path_matches_eager(outputs, pipeline, num_views, num_steps):
         f"optimized path moved the chunk by rel L2 {rel:.3e}, max |diff| {abs_diff:.3e}; "
         f"allowed {max_rel:.1e}, {max_abs:.1e}"
     )
+
+
+def test_reported_deterministic_failing_case_for_regression(pipeline):
+    """Regression for the one input reported failing on H100 in PR #8202
+    (3 cameras, 224x224, 10 steps, bfloat16): at ``b04fa71`` the fused path
+    moved the chunk by rel L2 1.54e-2, max |diff| 0.1098 > 0.05. Rebuilt
+    deterministically: the 27th draw of one ``default_rng(0)`` stream, noise
+    seed 26."""
+    if pipeline._torch_dtype != torch.bfloat16:
+        pytest.skip("the H100 failure was reported in bfloat16")
+    rng = np.random.default_rng(0)
+    for _ in range(27):
+        images = {
+            key: rng.integers(0, 256, size=(224, 224, 3), dtype=np.uint8) for key in pipeline.config.image_feature_keys
+        }
+        state = rng.uniform(-1.0, 1.0, size=pipeline.config.state_dim).astype(np.float32)
+    inputs = pipeline.processor.build_model_inputs({"images": images, "state": state, "prompt": PROMPT})
+
+    model = pipeline.model
+    with _path(model, graphs=None, fused_kernels=False):
+        reference = _sample(model, inputs, num_steps=None, seed=26).double()
+    actual = _sample(model, inputs, num_steps=None, seed=26).double()
+
+    max_rel, max_abs = TOLERANCE[torch.bfloat16]
+    rel = ((actual - reference).norm() / reference.norm()).item()
+    abs_diff = (actual - reference).abs().max().item()
+    print(
+        "\nReported failing case on H100 - rel L2: 1.54e-02, max |diff|: 1.098e-01; "
+        "configs: 3 cameras, 224x224, 10 steps, bfloat16. "
+        f"Now, rel L2: {rel:.3e}, max |diff|: {abs_diff:.3e}."
+    )
+    assert rel <= max_rel and abs_diff <= max_abs, (
+        f"input reported failing on H100 (PR #8202): optimized path moved the chunk by rel L2 {rel:.3e}, "
+        f"max |diff| {abs_diff:.3e}; allowed {max_rel:.1e}, {max_abs:.1e}"
+    )
+
+
+@pytest.mark.parametrize("num_views", NUM_VIEWS, ids=lambda views: f"views={views}")
+def test_prefix_forward_is_bit_exact(pipeline, num_views):
+    """Every denoising step attends over the prefix K/V and amplifies any
+    rounding difference in it into the whole chunk, so the fused prefix pass
+    equals the eager one bit for bit: its K/V cache slots and its output."""
+    model = pipeline.model
+    images, image_masks, lang_tokens, lang_masks = pipeline.processor.build_model_inputs(
+        _robot_obs(pipeline.config, num_views, seed=0)
+    )
+    results = []
+    with torch.inference_mode():
+        embs, pad_masks, att_masks = model.embed_prefix(images, image_masks, lang_tokens, lang_masks)
+        prefix_len = embs.shape[1]
+        for fused_kernels in (False, True):
+            kv_cache = model.new_kv_cache(1, prefix_len)
+            with _path(model, graphs=None, fused_kernels=fused_kernels):
+                (out, _), _ = model.paligemma_with_expert.forward(
+                    attention_mask=prepare_attention_masks_4d(make_att_2d_masks(pad_masks, att_masks)),
+                    position_ids=torch.cumsum(pad_masks, dim=1) - 1,
+                    past_key_values=kv_cache,
+                    inputs_embeds=[embs, None],
+                    use_cache=True,
+                )
+            results.append((out, kv_cache.key[:, :, :, :prefix_len], kv_cache.value[:, :, :, :prefix_len]))
+    for name, eager, fused in zip(("output", "prefix K", "prefix V"), *results):
+        assert torch.equal(fused, eager), f"fused prefix {name} differs from eager"
 
 
 def test_cases_differ_from_each_other(outputs):
