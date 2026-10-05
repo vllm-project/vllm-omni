@@ -56,10 +56,16 @@ open, and a maximum unit age, ``extra_body.input_clock_unit_max_s`` (default
 60 s), for a unit that keeps producing but never completes.
 
 Settling only concerns the acknowledgement. A unit settled before its output
-arrived keeps its place in the pipeline: its Stage-0 segment end still decides
-it (and only it), and if it speaks it still takes its own final-stage output
-until that output is complete, so late output is never credited to the next
-unit. Output of a cancelled epoch is dropped by the session (the
+arrived keeps its place in the pipeline: while its submission is unresolved it
+can still be matched by a Stage-0 segment end that overtakes its acceptance
+callback, its Stage-0 segment end still decides it (and only it), and if it
+speaks it still takes its own final-stage output until that output is
+complete, so late output is never credited to the next unit. That includes a
+deferred committed turn whose reserved slot was settled before the turn was
+submitted: when the end of the response submits it after all, the submission
+takes that settled unit's place instead of becoming a new unit. Only a
+submission that ended without reaching Stage 0 (or whose epoch was cancelled)
+leaves the pipeline. Output of a cancelled epoch is dropped by the session (the
 cancelled-output boundary), so its units leave the pipeline with the cancel.
 
 The plugin hooks run on the session's output path: a hook that raises is
@@ -292,6 +298,10 @@ class InputClock:
         #: Per epoch: Stage-0 submissions accepted, and Stage-0 segment ends seen.
         self._accepted: dict[int, int] = {}
         self._segment_ends: dict[int, int] = {}
+        #: Units whose Stage-0 submission is unresolved (started, neither accepted nor ended), in
+        #: submission order, settled or not: a segment end that overtakes its acceptance callback
+        #: belongs to the oldest of its epoch.
+        self._in_submission: deque[InputClockUnit] = deque()
         #: Accepted units waiting for their Stage-0 segment end, by (epoch, ordinal).
         self._undecided: dict[tuple[int, int], InputClockUnit] = {}
         #: Speaking units waiting for their final-stage output, in decision order.
@@ -411,6 +421,7 @@ class InputClock:
                     unit.input_us = input_us
                     unit.epoch = epoch
                     unit.started_at = now
+                    self._in_submission.append(unit)
                     return unit
             settled = self._settled_turns.pop(turn, None)
             if settled is not None and not from_input and not self._closed:
@@ -419,6 +430,7 @@ class InputClock:
                 settled.decision = settled.reason = None
                 settled.epoch = epoch
                 settled.started_at = now
+                self._in_submission.append(settled)
                 return settled
         self._note_busy(now)
         self._units_created += 1
@@ -427,6 +439,7 @@ class InputClock:
             unit.complete = True  # nothing is acknowledged after teardown
         else:
             self._units.append(unit)
+            self._in_submission.append(unit)
         return unit
 
     def reserve_unit(self, turn: str | None) -> None:
@@ -468,7 +481,12 @@ class InputClock:
                 return
 
     def unit_submitted(self, unit: InputClockUnit) -> None:
-        """Stage 0 accepted the unit's submission: it takes the next ordinal of its epoch."""
+        """Stage 0 accepted the unit's submission: it takes the next ordinal of its epoch.
+
+        Also for a unit already settled (e.g. timed out while it waited for
+        Stage 0): its output is still coming and must stay its own.
+        """
+        self._end_submission(unit)
         if unit.ordinal is not None or self._closed or unit.epoch < self._live_epoch:
             # Already claimed, or its epoch was cancelled (its output is dropped).
             return
@@ -484,9 +502,16 @@ class InputClock:
         append that fails after Stage 0 accepted it closes the session, whose
         teardown settles the unit (``aborted``).
         """
+        self._end_submission(unit)
         if unit.ordinal is None:
             self.settle_unit(unit, DECISION_DROPPED)
             self._drop_stray_held()
+
+    def _end_submission(self, unit: InputClockUnit) -> None:
+        try:
+            self._in_submission.remove(unit)
+        except ValueError:
+            pass
 
     # ------------------------------------------------------------------ #
     # Settling (units that will produce no further model output)         #
@@ -532,6 +557,7 @@ class InputClock:
             if not unit.placeholder and unit.epoch < before_epoch:
                 self._settle(unit, DECISION_CANCELLED, reason)
         self._undecided = {key: unit for key, unit in self._undecided.items() if key[0] >= before_epoch}
+        self._in_submission = deque(unit for unit in self._in_submission if unit.epoch >= before_epoch)
         self._speaking = deque(unit for unit in self._speaking if unit.epoch >= before_epoch)
         for counts in (self._accepted, self._segment_ends):
             for epoch in [epoch for epoch in counts if epoch < before_epoch]:
@@ -556,6 +582,7 @@ class InputClock:
         self._closed = True
         self._settled_turns.clear()
         self._held.clear()
+        self._in_submission.clear()
         self._undecided.clear()
         self._speaking.clear()
         if not self._acks:
@@ -631,8 +658,7 @@ class InputClock:
     def _stage0_pending(self, epoch: int) -> bool:
         """A Stage-0 submission of ``epoch`` has no segment end yet (accepted or not)."""
         return any(key[0] == epoch for key in self._undecided) or any(
-            unit.epoch == epoch and unit.ordinal is None and not unit.placeholder and not unit.complete
-            for unit in self._units
+            unit.epoch == epoch and unit.ordinal is None for unit in self._in_submission
         )
 
     def _drop_stray_held(self) -> None:
@@ -680,11 +706,15 @@ class InputClock:
     def _claim_unaccepted(self, epoch: int, ordinal: int) -> InputClockUnit | None:
         """A segment end that overtook its submission's acceptance callback: give that unit the ordinal now.
 
-        Appends run in wire order, so only the oldest open unit of the epoch
-        that Stage 0 has not acknowledged yet can be the one in submission.
+        Appends run in wire order, so only the oldest unit of the epoch whose
+        submission is still unresolved can be the one Stage 0 answered. That
+        includes a unit already settled (e.g. timed out before its acceptance
+        callback ran): it leaves the acknowledgements, not the pipeline, so a
+        later unit queued behind it is never claimed in its place.
         """
-        for unit in self._units:
-            if unit.epoch == epoch and unit.ordinal is None and not unit.placeholder and not unit.complete:
+        for unit in self._in_submission:
+            if unit.epoch == epoch and unit.ordinal is None:
+                self._in_submission.remove(unit)
                 unit.ordinal = ordinal
                 self._accepted[epoch] = max(self._accepted.get(epoch, 0), ordinal)
                 return unit
