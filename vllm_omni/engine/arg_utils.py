@@ -270,6 +270,10 @@ class OmniEngineArgs(EngineArgs):
         )
         validate_worker_omni_connector(self.worker_cls, needs_connector)
         super().__post_init__()
+        # The NPU runner implements the auxiliary connector on its legacy
+        # execution path; CUDA/ROCm Omni stages use the V2 implementation.
+        if self.aux_output_config.enabled and not self.use_v2_model_runner and not current_omni_platform.is_npu():
+            raise ValueError("Auxiliary outputs require use_v2_model_runner=True for this Omni stage.")
 
     def _ensure_omni_models_registered(self):
         if hasattr(self, "_omni_models_registered"):

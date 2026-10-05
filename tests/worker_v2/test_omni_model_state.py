@@ -22,6 +22,16 @@ from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState, _m
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
+def test_prepare_attn_forwards_release_model_specific_metadata():
+    state = object.__new__(OmniModelState)
+    metadata = object()
+    output = object()
+    batch = SimpleNamespace()
+    with patch.object(DefaultModelState, "prepare_attn", return_value=output) as prepare:
+        assert state.prepare_attn(batch, None, (), None, [], None, model_specific_attn_metadata=metadata) is output
+    assert prepare.call_args.kwargs["model_specific_attn_metadata"] is metadata
+
+
 class _DummyInputBatch:
     is_prefilling_np: np.ndarray
     req_ids: list[str]

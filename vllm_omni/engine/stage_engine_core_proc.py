@@ -16,7 +16,8 @@ import signal
 from typing import Any
 
 import vllm.v1.engine.core as _vllm_engine_core_module
-from vllm.logger import init_logger
+from vllm.config import VllmConfig
+from vllm.logger import configure_logging, init_logger
 from vllm.transformers_utils.config import (
     maybe_register_config_serialize_by_value,
 )
@@ -195,6 +196,10 @@ class StageEngineCoreProc(EngineCoreProc):
             logging / metrics only.
         """
         signal_callback: SignalCallback | None = None
+        vllm_config: VllmConfig = kwargs["vllm_config"]
+        if logging_config := getattr(vllm_config, "logging_config", None):
+            configure_logging(logging_config)
+
         maybe_register_config_serialize_by_value()
 
         # Register vllm-omni reasoning parsers (e.g. step_audio) in this

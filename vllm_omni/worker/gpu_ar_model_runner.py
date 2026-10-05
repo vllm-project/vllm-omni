@@ -206,7 +206,6 @@ class OmniAsyncGPUModelRunnerOutput(AsyncGPUModelRunnerOutput):
         invalid_req_indices = kwargs.pop("invalid_req_indices")
         async_output_copy_stream = kwargs.pop("async_output_copy_stream")
         vocab_size = kwargs.pop("vocab_size")
-        routed_experts = kwargs.pop("routed_experts", None)
         num_nans = kwargs.pop("num_nans", None)
         # Upstream AsyncGPUModelRunnerOutput added check_ep_fault / _has_fault
         # for EP all2all fault tolerance (PR #43637). Omni doesn't use this
@@ -223,7 +222,6 @@ class OmniAsyncGPUModelRunnerOutput(AsyncGPUModelRunnerOutput):
         self._sampled_token_ids = sampled_token_ids
         self.vocab_size = vocab_size
         self._logprobs_tensors = logprobs_tensors
-        self._routed_experts = routed_experts
         self._has_fault: torch.Tensor | None = None
         # Upstream b1e12d142d (PR #51304) added device-side NaN-in-logits
         # counts (num_nans) to AsyncGPUModelRunnerOutput. Omni keeps the
@@ -240,9 +238,6 @@ class OmniAsyncGPUModelRunnerOutput(AsyncGPUModelRunnerOutput):
             # output asynchronously.
             self.sampled_token_ids_cpu = self._sampled_token_ids.to("cpu", non_blocking=True)
             self._logprobs_tensors_cpu = self._logprobs_tensors.to_cpu_nonblocking() if self._logprobs_tensors else None
-            self._routed_experts_cpu = (
-                self._routed_experts.to_cpu_nonblocking() if self._routed_experts is not None else None
-            )
             self._num_nans_cpu = self._num_nans.to("cpu", non_blocking=True) if self._num_nans is not None else None
             self.async_copy_ready_event.record()
 
@@ -940,9 +935,6 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         if self.execute_model_state is not None:
             raise RuntimeError("State error: sample_tokens() must be called after execute_model() returns None.")
 
-        if self.routed_experts_initialized:
-            self.routed_experts_capturer.clear_buffer()
-
         if not getattr(self, "_warmup_state_cleared", False):
             self._warmup_state_cleared = True
             if hasattr(self.model, "_clear_warmup_state"):
@@ -973,11 +965,6 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                 flush_ids.update({rid for rid in self._pending_full_payload_send if rid not in self.requests})
                 if flush_ids:
                     self.flush_full_payload_outputs(flush_ids)
-
-        if self.routed_experts_initialized:
-            capturer = self.routed_experts_capturer
-            if capturer is not None and hasattr(capturer, "finalize_pending_copy"):
-                capturer.finalize_pending_copy()
 
         # If ngram_gpu is used, we need to copy the scheduler_output to avoid
         # the modification has influence on the scheduler_output in engine core process.
@@ -1371,9 +1358,6 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         if deferred_state_corrections_fn:
             deferred_state_corrections_fn()
 
-        if self._should_return_omni_routed_experts() and hasattr(self, "_positions_cpu"):
-            self._omni_routed_experts_d2h(scheduler_output)
-
         return None
 
     def _sample(
@@ -1628,14 +1612,6 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         except TypeError:
             return scheduler_output
 
-    def _should_return_omni_routed_experts(self) -> bool:
-        model_config = getattr(self, "model_config", None)
-        if model_config is None:
-            model_config = getattr(getattr(self, "vllm_config", None), "model_config", None)
-        return bool(getattr(model_config, "enable_return_routed_experts", False)) and bool(
-            getattr(self, "routed_experts_initialized", False)
-        )
-
     @staticmethod
     def _model_omni_flag(model: Any, name: str, default: bool = False) -> bool:
         return bool(getattr(model, name, default)) if model is not None else default
@@ -1699,8 +1675,6 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         if not bool(getattr(model_config, "async_chunk", False)) and not self._model_omni_flag(
             getattr(self, "model", None), "supports_async_whole_payload"
         ):
-            return False
-        if bool(getattr(model_config, "enable_return_routed_experts", False)):
             return False
 
         model = getattr(self, "model", None)
@@ -1997,9 +1971,6 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             )
 
         with record_function_or_nullcontext("gpu_model_runner: ModelRunnerOutput"):
-            routed_experts_lists = None
-            if self._should_return_omni_routed_experts():
-                routed_experts_lists = self._omni_extract_routed_experts(scheduler_output)
             output = OmniModelRunnerOutput(
                 req_ids=req_ids_output_copy,
                 req_id_to_index=req_id_to_index_output_copy,
@@ -2015,7 +1986,6 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                 cudagraph_stats=cudagraph_stats,
             )
             output.kv_extracted_req_ids = kv_extracted_req_ids
-            output.routed_experts = routed_experts_lists
         return output
 
     @torch.inference_mode()

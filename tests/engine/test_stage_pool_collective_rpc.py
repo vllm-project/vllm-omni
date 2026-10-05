@@ -84,6 +84,27 @@ def test_collective_rpc_control_method_reraises_worker_error():
 
 
 @pytest.mark.cpu
+def test_kv_memory_release_uses_engine_core_and_propagates_pause_errors():
+    async def run() -> None:
+        release = AsyncMock(return_value=None)
+        pool, client = _make_pool(release_kv_cache_memory_async=release)
+        await pool.collective_rpc(0, "release_kv_cache_memory", timeout=2.0)
+        release.assert_awaited_once_with()
+        client.collective_rpc_async.assert_not_awaited()
+
+        release.side_effect = RuntimeError("requires a completed pause first")
+        with pytest.raises(RuntimeError, match="completed pause"):
+            await pool.collective_rpc(0, "release_kv_cache_memory")
+
+        del client.release_kv_cache_memory_async
+        result = await pool.collective_rpc(0, "release_kv_cache_memory")
+        assert result["supported"] is False
+        client.collective_rpc_async.assert_not_awaited()
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
 def test_collective_rpc_reset_caches_use_control_helpers():
     async def run() -> None:
         reset_prefix = AsyncMock(return_value=True)

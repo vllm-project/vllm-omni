@@ -31,6 +31,7 @@ from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.gpu.model_states.default import DefaultModelState
+from vllm.v1.worker.gpu.model_states.interface import ModelSpecificAttnMetadata
 from vllm.v1.worker.gpu.states import RequestState
 from vllm.v1.worker.utils import AttentionGroup
 
@@ -447,6 +448,7 @@ class OmniModelState(DefaultModelState):
         kv_cache_config: KVCacheConfig,
         for_capture: bool = False,
         ubatch_idx: int = 0,
+        model_specific_attn_metadata: ModelSpecificAttnMetadata | None = None,
     ) -> dict[str, Any]:
         if (
             for_capture
@@ -471,6 +473,7 @@ class OmniModelState(DefaultModelState):
             kv_cache_config,
             for_capture=for_capture,
             ubatch_idx=ubatch_idx,
+            model_specific_attn_metadata=model_specific_attn_metadata,
         )
 
     def prepare_inputs_embeds(

@@ -109,6 +109,7 @@ class StagePool:
             "pause_scheduler",
             "resume_scheduler",
             "sleep",
+            "release_kv_cache_memory",
             "wake_up",
             "reset_prefix_cache",
             "reset_encoder_cache",
@@ -1361,7 +1362,7 @@ class StagePool:
                     if timeout is not None:
                         return await asyncio.wait_for(result, timeout=timeout)
                     return await result
-                if method in self._CACHE_RESET_METHODS:
+                if method in self._CACHE_RESET_METHODS or method == "release_kv_cache_memory":
                     return {"supported": False, "error": f"EngineCore helper {method}_async is unavailable"}
 
             return await client.collective_rpc_async(
