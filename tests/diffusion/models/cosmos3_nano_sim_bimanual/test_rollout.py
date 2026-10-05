@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Exercise the real admission/rollout methods with CPU transformer/decoder doubles.
 
 Extracting the methods avoids loading CUDA-only import-time dependencies on CPU
@@ -104,7 +105,6 @@ def pipeline_methods() -> type:
         "_actions_for_frames",
         "_build_output",
         "_commit_clean_chunk",
-        "_can_batch_clean_commit",
     }
     selected = [node for node in pipeline.body if isinstance(node, ast.FunctionDef) and node.name in methods]
     body.append(ast.ClassDef(name="Pipeline", bases=[], keywords=[], decorator_list=[], body=selected))
@@ -243,19 +243,6 @@ def test_batched_clean_commit_preserves_terminal_frame_and_action_slices(frames,
         assert call.kwargs["null_action_frame_indexes"] == tuple(range(count))
     assert committed == list(range(state.next_frame_idx - 1))
     assert pipe._set_mixed_precision_step.call_count == pipe._reset_mixed_precision.call_count
-
-
-def test_batched_mode_commits_framewise_when_frames_are_not_page_aligned():
-    pipe, state = fake_pipeline()
-    pipe.clean_commit_mode = "batched"
-    pipe._can_batch_clean_commit = Mock(return_value=False)
-    pipe._commit_clean_chunk = Mock()
-    pipe.forward(request(17))
-    pipe._commit_clean_chunk.assert_not_called()
-    assert not any(call.kwargs.get("frame_causal") for call in pipe._transformer_forward.call_args_list)
-    assert [call.kwargs["frame_idx"] for call in pipe._commit_clean_frame.call_args_list] == list(
-        range(state.next_frame_idx - 1)
-    )
 
 
 def test_batched_clean_commit_resets_precision_on_failure():

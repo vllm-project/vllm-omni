@@ -274,7 +274,7 @@ class ARDiffusionPagedForwardContext:
         )
         self._action_len = action_len
 
-    def video_block_table(self, device: torch.device) -> tuple[list[int], int]:
+    def video_block_table(self, device: torch.device, seq_len: int | None = None) -> tuple[list[int], int]:
         """Blocks the attention reads, and how many of their slots it reads.
 
         The kernel reads the listed blocks as one contiguous run and stops after
@@ -298,9 +298,11 @@ class ARDiffusionPagedForwardContext:
         self.ensure_video_slots(device)
         block_size = self.block_size
         history = self._history_tokens
-        end = history + self.seq_len
+        end = history + (self.seq_len if seq_len is None else seq_len)
         sink_end = self.sink_tokens
         recent_start = end - self.window_tokens
+        if self.frame_causal and self.kv_cache.spec.reset_at_boundary:
+            recent_start = max(recent_start, end - self.chunk_size)
 
         # Position of each block's first slot. History comes from the block
         # table, where an evicted block is a null placeholder, so a block's index
@@ -335,6 +337,8 @@ class ARDiffusionPagedForwardContext:
         visible_video_blocks: list[int] = []
         video_len = 0
         for block, first in sorted(first_position.items(), key=lambda item: item[1]):
+            if first >= end:
+                continue
             if first >= sink_end and first + block_size <= recent_start:
                 continue  # wholly between the sink and the recent window
             if video_len % block_size:
@@ -411,7 +415,7 @@ class ARDiffusionPagedForwardContext:
         for index, (video, length) in enumerate(views):
             tail = length % block
             private = self.kv_cache.scratch_block_ids(self.kv_branch, offset + index * pages, pages)
-            # Keep appended auxiliary KV out of the persistent video history.
+            # Private pages prevent text from overwriting later frames in the shared video page.
             # Copy a fixed-size page, then overwrite its suffix with text; seq_lens masks padding.
             source = video[-1] if tail else self.kv_cache.null_block_id
             sources.extend(source * block + i for i in range(block))
@@ -427,36 +431,28 @@ class ARDiffusionPagedForwardContext:
     def _build_frame_causal_block_table(
         self, *, action_len: int, query_len: int, device: torch.device
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int]:
-        """Give each frame exactly the view of its sequential clean forward.
-
-        Each row includes retained sink/history frames, earlier clean frames,
-        the entire current frame, and shared text. Attention stays noncausal
-        within each row; future frames are absent from its block table.
-        """
+        """One attention row per clean frame, with no future-frame tokens."""
         if query_len != self.seq_len:
             raise ValueError("Frame-causal refresh requires one query per current token")
-        self.ensure_video_slots(device)
-        self.ensure_action_slots(action_len, device)
-        capacity = self.max_video_tokens // self.block_size
-        blocks_per_frame = self.chunk_size // self.block_size
-        sink = int(self.kv_cache.spec.sink_chunks) * blocks_per_frame
-        action_capacity = max(1, (action_len + self.block_size - 1) // self.block_size)
-        rows, lengths = [], []
-        for frame in range(self.seq_len // self.chunk_size):
-            visible = self.history_block_ids + self.current_video_block_ids[: (frame + 1) * blocks_per_frame]
-            if len(visible) > capacity:
-                visible = visible[:sink] + visible[-(capacity - sink) :]
-            lengths.append(len(visible) * self.block_size + action_len)
-            row = visible + self.action_scratch_block_ids
-            rows.append(row + [0] * (capacity + action_capacity - len(row)))
+        views = [
+            self.video_block_table(device, end) for end in range(self.chunk_size, self.seq_len + 1, self.chunk_size)
+        ]
+        if action_len and self.chunk_size % self.block_size:
+            rows = self._pack_auxiliary_tails(views, action_len, device)
+        else:
+            self.ensure_action_slots(action_len, device)
+            rows = [video + self.action_scratch_block_ids for video, _ in views]
+        capacity = self.max_video_blocks + max(1, -(-action_len // self.block_size))
+        rows = [row + [0] * (capacity - len(row)) for row in rows]
+        lengths = [length + action_len for _, length in views]
         self.query_len = query_len
         self.kv_len = max(lengths)
         return (
-            torch.tensor(rows, dtype=torch.int32, device=device),
-            torch.arange(0, query_len + 1, self.chunk_size, dtype=torch.int32, device=device),
-            torch.tensor(lengths, dtype=torch.int32, device=device),
+            _to_device_async(torch.tensor(rows, dtype=torch.int32), device),
+            _to_device_async(torch.arange(0, query_len + 1, self.chunk_size, dtype=torch.int32), device),
+            _to_device_async(torch.tensor(lengths, dtype=torch.int32), device),
             self.chunk_size,
-            self.max_video_tokens + action_capacity * self.block_size,
+            capacity * self.block_size,
         )
 
     def prepare(self, device: torch.device, action_len: int, query_len: int) -> None:

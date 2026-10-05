@@ -2,8 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Frames the KV page size does not divide.
 
-The default 720x1280 request is 23 x 40 + 4 = 924 tokens per frame, and the CUDA
-and ROCm kernels page by multiples of 16, so the pool pages at 16 tokens while
+The default 720x1280 request is 23 x 40 + 4 = 924 tokens per frame. The
+portable paging policy uses 16-token pages for this geometry while
 still evicting whole 924-token frames.
 """
 
@@ -89,17 +89,3 @@ def test_pool_for_another_resolution_is_still_rejected():
     state = bound_state(pipe, DEFAULT)
     with pytest.raises(RuntimeError, match=r"tokens_per_frame=expected 394, got 924"):
         pipe._validate_bound_kv_geometry(state, SMALL)
-
-
-@pytest.mark.parametrize(
-    ("geometry", "batched"),
-    [(DEFAULT, False), (SMALL, False), (ALIGNED, True)],
-)
-def test_clean_commit_batches_only_page_aligned_frames(geometry, batched):
-    pipe = pipeline()
-    pipe._ar_diffusion_kv_state = bound_state(pipe, geometry)
-    assert pipe._can_batch_clean_commit() is batched
-
-
-def test_dense_history_always_batches():
-    assert pipeline()._can_batch_clean_commit() is True
