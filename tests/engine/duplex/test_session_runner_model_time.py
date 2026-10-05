@@ -28,6 +28,7 @@ from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
 from vllm_omni.engine.duplex.config import INPUT_CLOCK_IDLE_TIMEOUT_S, DuplexSessionConfig
 from vllm_omni.engine.duplex.messages import CloseDuplexSessionMessage, ResumeDuplexSessionMessage
 from vllm_omni.engine.duplex.plugin import DuplexUnitDecision
+from vllm_omni.engine.duplex.session import runner as runner_module
 from vllm_omni.engine.duplex.session.input_clock import DEFAULT_UNIT_MAX_AGE_S, DEFAULT_UNIT_TIMEOUT_S, StageProgress
 from vllm_omni.engine.duplex.session.manager import DuplexSessionManager
 from vllm_omni.engine.duplex.session.runner import DuplexSessionRunner
@@ -993,6 +994,156 @@ async def test_a_failing_completion_hook_does_not_send_an_error_per_output(monke
         now[0] += DEFAULT_UNIT_TIMEOUT_S
         (ack,) = _acks(await _check_timeouts(h))
         assert _units(ack) == [("timed_out", "no_progress")], "left to the timeouts"
+    finally:
+        await close_harness(h)
+
+
+@pytest.fixture
+def fast_input_clock_checks(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(runner_module, "_INPUT_CLOCK_CHECK_INTERVAL_S", 0.01)
+
+
+@pytest.mark.parametrize(
+    ("command", "error_code", "acknowledged"),
+    [
+        (commands.Commit(event_id="evt-wait"), "commit_aborted", True),
+        (commands.UpdateSession(patch={"temperature": 0.3}, event_id="evt-wait"), "session_update_aborted", False),
+    ],
+    ids=["commit", "session-update"],
+)
+@pytest.mark.usefixtures("input_clock_model", "fast_input_clock_checks")
+async def test_a_command_waiting_for_a_stalled_append_lets_the_timeouts_settle_it(
+    command, error_code: str, acknowledged: bool
+) -> None:
+    """The command blocks the mailbox worker: the timeout queued behind it must still run."""
+    h = await open_harness(extra_body=INPUT_CLOCK)
+    try:
+        now = _fake_time(h)
+        h.port.submit_gate = asyncio.Event()  # Stage-0 submission stalls
+        h.submit(append_audio())
+        await asyncio.wait_for(h.port.submit_started.wait(), timeout=2.0)
+        h.submit(command)  # waits for the append in flight
+        assert _acks(await h.settle(timeout_s=0.2)) == []
+
+        now[0] += DEFAULT_UNIT_TIMEOUT_S
+        events = await h.settle(timeout_s=0.3)
+
+        errors = [event for event in events if event.type == "error"]
+        assert [(e.code, e.related_event_id) for e in errors] == [(error_code, "evt-wait")]
+        acks = _acks(events)
+        assert [a.input_index for a in acks] == ([1, 2] if acknowledged else [1])
+        assert _units(acks[0]) == [("timed_out", "no_progress")]
+        assert types(events).index("error") < types(events).index("input_audio_buffer.processed")
+    finally:
+        h.port.submit_gate.set()
+        await close_harness(h)
+
+
+@pytest.mark.usefixtures("input_clock_model", "fast_input_clock_checks")
+async def test_a_timeout_of_another_unit_does_not_abort_a_command_waiting_for_a_healthy_append() -> None:
+    # Only the maximum age applies here, so unit 1 becomes due exactly once the commit waits
+    # (a no-progress timeout could fire earlier and settle it ahead of the commit).
+    h = await open_harness(extra_body={**INPUT_CLOCK, "input_clock_unit_timeout_s": 10 * DEFAULT_UNIT_MAX_AGE_S})
+    try:
+        now = _fake_time(h)
+        await _speaking_unit(h)  # unit 1 speaks; it will outlive its maximum age
+        now[0] += DEFAULT_UNIT_MAX_AGE_S - 1
+        h.port.submit_gate = asyncio.Event()  # unit 2's submission is slow, not stalled
+        h.submit(append_audio())
+        await asyncio.wait_for(h.port.submit_started.wait(), timeout=2.0)
+        h.submit(commands.Commit(event_id="evt-wait"))
+        # Let the worker take the commit first: a timeout check queued before it
+        # would otherwise run ahead of the commit once unit 1 is due. (Checks the
+        # timer queues while the commit waits sit behind it.)
+
+        def commit_queued() -> bool:
+            return any(getattr(item, "command", None) is not None for item in list(h.runner._mailbox._queue))
+
+        for _ in range(400):
+            if not commit_queued():
+                break
+            await asyncio.sleep(0.005)
+        assert not commit_queued(), "the worker should be waiting inside the commit"
+        now[0] += 1  # unit 1 is due (maximum age); unit 2 is not
+        events = await h.settle(timeout_s=0.3)
+        assert [e for e in events if e.type == "error"] == [] and _acks(events) == []
+
+        h.port.submit_gate.set()
+        events = await h.settle()
+
+        assert [e for e in events if e.type == "error"] == [], types(events)
+        assert "input_audio_buffer.committed" in types(events), "the commit was applied, not aborted"
+    finally:
+        h.port.submit_gate.set()
+        await close_harness(h)
+
+
+@pytest.mark.usefixtures("input_clock_model", "fast_input_clock_checks")
+async def test_a_commit_does_not_wait_for_an_append_whose_unit_already_timed_out() -> None:
+    h = await open_harness(extra_body=INPUT_CLOCK)
+    try:
+        now = _fake_time(h)
+        h.port.submit_gate = asyncio.Event()
+        h.submit(append_audio())
+        await asyncio.wait_for(h.port.submit_started.wait(), timeout=2.0)
+        now[0] += DEFAULT_UNIT_TIMEOUT_S
+        h.runner._on_input_clock_timer()
+        (ack,) = _acks(await h.settle(timeout_s=0.3))
+        assert _units(ack) == [("timed_out", "no_progress")]
+
+        h.submit(commands.Commit())
+        events = await h.settle(timeout_s=0.3)
+
+        assert "commit_aborted" in [e.code for e in events if e.type == "error"]
+        assert [a.input_index for a in _acks(events)] == [2]
+    finally:
+        h.port.submit_gate.set()
+        await close_harness(h)
+
+
+@pytest.mark.usefixtures("input_clock_model", "fast_input_clock_checks")
+async def test_a_commit_waiting_on_a_stalled_resubmission_of_a_settled_turn_is_bounded() -> None:
+    """A deferred turn re-submitted into its timed-out slot still gets the maximum unit age as a deadline."""
+    h = await open_harness(auto_response=False, extra_body=INPUT_CLOCK)
+    try:
+        now = _fake_time(h)
+        request_id = await _defer_a_commit_behind_the_active_response(h)
+        now[0] += DEFAULT_UNIT_TIMEOUT_S
+        await _check_timeouts(h)  # the speaking unit
+        now[0] += DEFAULT_UNIT_TIMEOUT_S
+        assert _units(_acks(await _check_timeouts(h))[-1]) == [("timed_out", "no_progress")]  # the turn's slot
+        h.port.submit_gate = asyncio.Event()  # the re-submission stalls in Stage 0
+        h.deliver(
+            tts_output(request_id, samples=24000, text="hello", tts_is_last_chunk=True, finished=True),
+            segment_finished=True,
+        )
+        await asyncio.wait_for(h.port.submit_started.wait(), timeout=2.0)
+        await h.run(append_audio(samples=3200))
+        h.submit(commands.Commit(event_id="evt-wait"))
+        assert [e for e in await h.settle(timeout_s=0.3) if e.type == "error"] == []
+
+        now[0] += DEFAULT_UNIT_MAX_AGE_S
+        events = await h.settle(timeout_s=0.5)
+
+        assert [(e.code, e.related_event_id) for e in events if e.type == "error"] == [("commit_aborted", "evt-wait")]
+        assert _acks(events), "the commit is acknowledged"
+    finally:
+        h.port.submit_gate.set()
+        await close_harness(h)
+
+
+@pytest.mark.usefixtures("input_clock_model")
+async def test_a_final_output_that_overtakes_its_stage0_segment_end_still_completes_its_unit() -> None:
+    h = await open_harness(extra_body=INPUT_CLOCK)
+    try:
+        await h.run(append_audio())
+        request_id = h.stage0_request_id()
+        assert _acks(await _deliver_audio_end(h, request_id)) == [], "held until the unit speaks"
+
+        h.deliver(_speak_segment_end(request_id), stage_id=0, segment_finished=True)
+        (ack,) = _acks(await h.settle())
+
+        assert _units(ack) == [("speak", None)]
     finally:
         await close_harness(h)
 

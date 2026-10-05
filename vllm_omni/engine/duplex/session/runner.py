@@ -101,6 +101,7 @@ from vllm_omni.engine.duplex.session.engine_session import DuplexEngineSession
 from vllm_omni.engine.duplex.session.input_clock import (
     ACKNOWLEDGED_INPUTS,
     DECISION_CANCELLED,
+    DECISION_TIMED_OUT,
     InputClock,
     InputClockUnit,
     PendingAck,
@@ -402,9 +403,12 @@ class DuplexSessionRunner:
         self._input_clock_timer = loop.call_later(_INPUT_CLOCK_CHECK_INTERVAL_S, self._on_input_clock_timer)
 
     def _on_input_clock_timer(self) -> None:
+        self._input_clock_timer = None
+        self._queue_input_clock_expire()
+
+    def _queue_input_clock_expire(self) -> None:
         # Checked on the mailbox, behind the outputs already queued: a timeout
         # never overtakes an output (or its acknowledgement) that arrived first.
-        self._input_clock_timer = None
         if self._input_clock_expire_queued or self.run.closing or self.session.state == DuplexSessionState.CLOSED:
             return
         self._input_clock_expire_queued = True
@@ -1571,6 +1575,9 @@ class DuplexSessionRunner:
         if predecessor is None:
             return True
         try:
+            clock = self._input_clock
+            if clock is not None and not await self._input_clock_wait_for_append(clock, predecessor):
+                return False
             return await predecessor
         except asyncio.CancelledError:
             if helpers.task_is_cancelling(asyncio.current_task()):
@@ -1578,6 +1585,33 @@ class DuplexSessionRunner:
             return False
         except Exception:
             return False
+
+    async def _input_clock_wait_for_append(self, clock: InputClock, append: asyncio.Task[bool]) -> bool:
+        """Wait for ``append`` from a command, but not for a submission the input clock has timed out.
+
+        The command blocks the session's single mailbox worker, so the timeout
+        check queued behind it could never run, and a stalled submission would
+        hold every acknowledgement back. The wait therefore watches the units
+        of the appends still running (``append`` and the ones it is queued
+        behind) and gives up -- the caller rejects its command as for a failed
+        append -- once one of them was settled by a timeout or a timeout is
+        due for it. A timeout due for any other unit does not abort the
+        command; it is settled once the worker is free. The settling itself
+        happens on the mailbox (queued here if the timer has not queued it
+        yet), after the outputs that arrived first, so output-before-
+        acknowledgement order is unchanged. Returns whether ``append`` finished.
+        """
+        while not append.done():
+            running = [unit for task, unit in self._input_clock_appends.items() if not task.done()]
+            if any(unit.decision == DECISION_TIMED_OUT for unit in running) or clock.timeout_due(running):
+                logger.warning(
+                    "Duplex session %s: a command stopped waiting for an append the input clock timed out",
+                    self.session.session_id,
+                )
+                self._queue_input_clock_expire()
+                return False
+            await asyncio.wait({append}, timeout=_INPUT_CLOCK_CHECK_INTERVAL_S)
+        return True
 
     async def _schedule_silence_continuation(
         self,

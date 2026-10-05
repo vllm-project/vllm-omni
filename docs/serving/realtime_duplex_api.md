@@ -710,6 +710,22 @@ or a barge-in) recovers from this state: it starts a new epoch, settles the
 open units of the old one as `cancelled`, and the units after it are no
 longer queued behind the missing output. No other event signals the state.
 
+A commit or `session.update` is applied only after the appends sent before
+it, and the session handles nothing else (a cancel included) while it waits.
+If such an append stalls (its submission to the model never finishes), the
+command does not wait past the timeouts: once a timeout is due for an open
+unit of that append, or of an append it is queued behind (at the latest
+`input_clock_unit_max_s` after that unit was submitted), or one of them was
+already settled by a timeout, the command is rejected as for a failed append
+(`commit_aborted` / `session_update_aborted`; a `function_call_output` item
+waiting for it is dropped, as after a failed append), and the
+acknowledgements the timeout releases follow, after any output that arrived
+before it. A timeout due for any other unit does not abort the command; it
+is settled once the command is done, so while a command waits for a stalled
+append, an older unit's no-progress settling can be delayed up to that
+bound. (An append whose units the model already completed but whose
+submission never returns is waited for as in any duplex session.)
+
 ##### Fixed at creation; sessions without the clock
 
 `clock`, `input_clock_unit_timeout_s` and `input_clock_unit_max_s` are fixed

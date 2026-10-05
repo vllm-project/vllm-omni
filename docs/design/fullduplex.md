@@ -455,15 +455,18 @@ its mailbox; an input the manager refuses at admission is indexed by an
 explicit `runner.input_refused` call in each refusal branch, which only queues
 a payload-free marker acknowledged as `rejected`, like an append the runner
 refuses before any of its audio reaches the model, `_refuse_append`), begins
-and ends, a Stage0 submission is created
-/ accepted / finishes, a committed turn is deferred or its deferred audio is
-dropped, a cancel advances the epoch, and teardown. Each stage output puts a
-`StageProgress` item on the session mailbox *after* the events of that output,
-and an append's outcome and the timeout checks are settled from the mailbox
-too, so an acknowledgement never overtakes the output it covers. A unit takes
-its ordinal among its epoch's Stage0 submissions when Stage0 accepts it, and
-the n-th Stage0 segment end of the epoch decides that unit (also after the
-unit was settled, so late output is never credited to the next unit; a unit
+and ends, a Stage0 submission is created / accepted / finishes, a committed turn is deferred or
+its deferred audio is dropped, a cancel advances the epoch, and teardown. Each
+stage output puts a `StageProgress` item on the session mailbox *after* the
+events of that output, and an append's outcome and the timeout checks are
+settled from the mailbox too, so an acknowledgement never overtakes the output
+it covers. A command that waits on the mailbox for an append (a commit or
+`session.update`) watches the timeouts of the appends still running and gives
+up once one of their units is due or timed out, so a stalled submission
+cannot keep the timeout check queued behind it from running. A unit takes its
+ordinal among its epoch's Stage0 submissions when Stage0 accepts it, and the
+n-th Stage0 segment end of the epoch decides that unit (also after the unit
+was settled, so late output is never credited to the next unit; a unit
 settled before Stage0 accepted it stays matchable until its submission
 resolves, and a deferred turn submitted after its reserved slot was settled
 takes that settled unit's place unless a client input submitted it); a
