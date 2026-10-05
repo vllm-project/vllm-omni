@@ -1,0 +1,4 @@
+interface:
+  display_name: "3D Animation Shorts"
+  short_description: "Plan stories, character anchors, shots, and edits"
+  default_prompt: "Use $3d-animation-short-generator to prepare the requested H3 prompts or video with the available tools."

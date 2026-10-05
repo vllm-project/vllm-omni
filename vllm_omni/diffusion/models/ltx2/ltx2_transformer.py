@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 # Copyright 2025 The Lightricks team and The HuggingFace Team.
 # All rights reserved.
 #
@@ -47,8 +50,11 @@ from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.cache.cachedit import CacheDiTAdapterConfig
 from vllm_omni.diffusion.distributed.hsdp_utils import is_transformer_block_module
+from vllm_omni.diffusion.distributed.parallel_state import get_sp_group
 from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelInput, SequenceParallelOutput
 from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
+
+from .ltx2_sequence_parallel import LTX2VideoToAudioParallelAttention
 
 logger = init_logger(__name__)
 
@@ -359,6 +365,34 @@ def to_ltx_padding_mask(attention_mask: torch.Tensor) -> torch.Tensor:
 class _LTX2ParallelAttention(Attention):
     """Preserve LTX SP collectives while applying model-specific padding masks."""
 
+    _SP_MODES = frozenset({"local", "video_self", "video_to_audio"})
+
+    def __init__(self, *args, ltx_sp_mode: str = "local", **kwargs):
+        if ltx_sp_mode not in self._SP_MODES:
+            raise ValueError(
+                f"Unsupported LTX sequence-parallel mode {ltx_sp_mode!r}; expected one of {sorted(self._SP_MODES)}."
+            )
+        super().__init__(*args, **kwargs)
+        self.ltx_sp_mode = ltx_sp_mode
+        self._video_to_audio_strategy = None
+
+    def _get_active_parallel_strategy(self):
+        base_strategy = super()._get_active_parallel_strategy()
+        if self.ltx_sp_mode == "local" or not base_strategy.enabled:
+            return self._no_parallel_strategy
+        if self.ltx_sp_mode == "video_self":
+            return base_strategy
+        if base_strategy.name != "ulysses":
+            raise NotImplementedError(
+                f"LTX video-to-audio sequence parallelism requires pure Ulysses; got strategy={base_strategy.name!r}."
+            )
+        if self._video_to_audio_strategy is None:
+            self._video_to_audio_strategy = LTX2VideoToAudioParallelAttention(
+                get_sp_group(),
+                use_sync=self.use_sync,
+            )
+        return self._video_to_audio_strategy
+
     def _run_local_attention(self, query, key, value, attn_metadata):
         attention_mask = attn_metadata.attn_mask if attn_metadata is not None else None
         if attention_mask is not None:
@@ -597,6 +631,7 @@ class LTX2Attention(torch.nn.Module):
         quant_config: "QuantizationConfig | None" = None,
         prefix: str = "",
         disable_kv_quant: bool = False,
+        sequence_parallel_mode: str = "local",
     ):
         super().__init__()
         # LTX-2 uses "rms_norm_across_heads", LTX-2.3 uses "rms_norm" -- both
@@ -721,6 +756,7 @@ class LTX2Attention(torch.nn.Module):
             causal=False,
             prefix=prefix,
             disable_kv_quant=disable_kv_quant,
+            ltx_sp_mode=sequence_parallel_mode,
         )
 
         # LTX-2.3: per-head gated attention
@@ -876,6 +912,7 @@ class LTX2VideoTransformerBlock(nn.Module):
             apply_gated_attention=video_gated_attn,
             quant_config=quant_config,
             prefix=f"{prefix}.attn1" if prefix else "attn1",
+            sequence_parallel_mode="video_self",
         )
 
         self.audio_norm1 = _make_rms_norm(audio_dim, eps=eps, elementwise_affine=elementwise_affine)
@@ -965,6 +1002,7 @@ class LTX2VideoTransformerBlock(nn.Module):
             apply_gated_attention=audio_gated_attn,
             quant_config=quant_config,
             prefix=f"{prefix}.video_to_audio_attn" if prefix else "video_to_audio_attn",
+            sequence_parallel_mode="video_to_audio",
         )
 
         # 4. Feedforward layers
@@ -1568,24 +1606,16 @@ class LTX2VideoTransformer3DModel(nn.Module):
 
         return {
             "": {
-                # Shard video/audio latents across sequence
+                # Keep only the long video stream sequence-sharded. Audio and
+                # prompt streams remain replicated on every SP rank.
                 "hidden_states": SequenceParallelInput(split_dim=1, expected_dims=3, split_output=False),
-                "audio_hidden_states": SequenceParallelInput(split_dim=1, expected_dims=3, split_output=False),
                 "keyframes_mask": SequenceParallelInput(split_dim=1, expected_dims=3, split_output=False),
-                # Shard prompt embeds across sequence
-                "encoder_hidden_states": SequenceParallelInput(split_dim=1, expected_dims=3, split_output=False),
-                "audio_encoder_hidden_states": SequenceParallelInput(split_dim=1, expected_dims=3, split_output=False),
-                # Keep per-token video/audio timestep embeddings aligned with
-                # their corresponding latent sequence shards. Official LTX
-                # multi-guidance supplies both tensors as (B, seq_len).
+                # Keep per-token video timestep embeddings aligned with the
+                # video latent shard. LTX guidance supplies a separate,
+                # replicated audio_timestep under SP.
                 "timestep": SequenceParallelInput(split_dim=1, expected_dims=2, split_output=False),
-                "audio_timestep": SequenceParallelInput(split_dim=1, expected_dims=2, split_output=False),
             },
             "rope": {
-                0: SequenceParallelInput(split_dim=rope_split_dim, expected_dims=rope_expected_dims, split_output=True),
-                1: SequenceParallelInput(split_dim=rope_split_dim, expected_dims=rope_expected_dims, split_output=True),
-            },
-            "audio_rope": {
                 0: SequenceParallelInput(split_dim=rope_split_dim, expected_dims=rope_expected_dims, split_output=True),
                 1: SequenceParallelInput(split_dim=rope_split_dim, expected_dims=rope_expected_dims, split_output=True),
             },
@@ -1593,13 +1623,8 @@ class LTX2VideoTransformer3DModel(nn.Module):
                 0: SequenceParallelInput(split_dim=rope_split_dim, expected_dims=rope_expected_dims, split_output=True),
                 1: SequenceParallelInput(split_dim=rope_split_dim, expected_dims=rope_expected_dims, split_output=True),
             },
-            "cross_attn_audio_rope": {
-                0: SequenceParallelInput(split_dim=rope_split_dim, expected_dims=rope_expected_dims, split_output=True),
-                1: SequenceParallelInput(split_dim=rope_split_dim, expected_dims=rope_expected_dims, split_output=True),
-            },
-            # Gather outputs before returning
+            # Video output is sharded; audio output is already replicated.
             "proj_out": SequenceParallelOutput(gather_dim=1, expected_dims=3),
-            "audio_proj_out": SequenceParallelOutput(gather_dim=1, expected_dims=3),
         }
 
     def __init__(

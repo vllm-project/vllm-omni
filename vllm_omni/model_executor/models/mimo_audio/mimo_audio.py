@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 # Copyright 2025 Xiaomi Corporation.
 import os
 from collections.abc import Iterable, Mapping, Sequence
@@ -26,15 +29,13 @@ from vllm.multimodal.inputs import (
 )
 from vllm.multimodal.parse import AudioProcessorItems, MultiModalDataItems, MultiModalDataParser
 from vllm.multimodal.processing import (
-    BaseDummyInputsBuilder,
-    BaseMultiModalProcessor,
     BaseProcessingInfo,
     ProcessorInputs,
     PromptReplacement,
     PromptUpdate,
     PromptUpdateDetails,
 )
-from vllm.multimodal.utils import group_mm_kwargs_by_modality
+from vllm.multimodal.utils import group_and_batch_mm_kwargs
 from vllm.sequence import IntermediateTensors
 from vllm.utils.cache import LRUCache
 from vllm.utils.collection_utils import is_list_of
@@ -42,6 +43,7 @@ from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 
+from vllm_omni.inputs.mm_processor import OmniDummyInputsBuilder, OmniMultiModalProcessor
 from vllm_omni.model_executor.custom_process_mixin import CustomProcessMixin
 from vllm_omni.model_executor.models.mimo_audio.config_mimo_audio import (
     NO_INTERLEAVE_NEXT_TOKEN_ID,
@@ -221,7 +223,7 @@ class MiMoAudioLLMProcessingInfo(
         return {"audio": 1}
 
 
-class MiMoAudioLLMDummyInputsBuilder(BaseDummyInputsBuilder[MiMoAudioLLMProcessingInfo]):
+class MiMoAudioLLMDummyInputsBuilder(OmniDummyInputsBuilder[MiMoAudioLLMProcessingInfo]):
     _processor_inputs_cache: LRUCache = LRUCache(capacity=1024)
 
     def get_dummy_text(self, mm_counts: Mapping[str, int]) -> str:
@@ -348,7 +350,7 @@ class MiMoAudioDataParser(MultiModalDataParser):
         return AudioProcessorItems(new_audios)
 
 
-class MiMoAudioLLMMultiModalProcessor(BaseMultiModalProcessor[MiMoAudioLLMProcessingInfo]):
+class MiMoAudioLLMMultiModalProcessor(OmniMultiModalProcessor[MiMoAudioLLMProcessingInfo]):
     def _call_hf_processor(
         self,
         prompt: str,
@@ -369,7 +371,7 @@ class MiMoAudioLLMMultiModalProcessor(BaseMultiModalProcessor[MiMoAudioLLMProces
 
         # Text-only input not supported in composite processor
         if not mm_data.get("audio", []):
-            prompt_ids = self._apply_hf_processor_tokens_only(prompt_ids)
+            prompt_ids = self._postprocess_prompt(prompt_ids)
 
             return BatchFeature(dict(input_ids=[prompt_ids]), tensor_type="pt")
 
@@ -484,7 +486,7 @@ class MiMoAudioLLMMultiModalProcessor(BaseMultiModalProcessor[MiMoAudioLLMProces
         return [
             PromptReplacement(
                 modality="audio",
-                target=audio_token,
+                target=[audio_token_id],
                 replacement=get_replacement_mimo_audio,
             )
         ]
@@ -626,7 +628,7 @@ class MiMoAudioForConditionalGeneration(
                 )
             mm_kwargs.append((mm_feature.modality, mm_item))
 
-        for modality, num_items, mm_kwargs_group in group_mm_kwargs_by_modality(
+        for modality, num_items, mm_kwargs_group in group_and_batch_mm_kwargs(
             mm_kwargs,
             device=self.device,
             pin_memory=self.pin_memory,

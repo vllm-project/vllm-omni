@@ -12,17 +12,19 @@ import os
 import struct
 import uuid
 from collections.abc import Callable
+from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from types import TracebackType
 
 import torch
-from safetensors import safe_open
 
 from ..identity import WeightArtifactIdentity, canonical_json
 from ..manifest import FileManifestEntry, PublicationMarker, TensorManifestEntry, WeightManifest
 from ..protocols import ProductionMetadata, TensorWriteSpec
 
 _HASH_CHUNK_BYTES = 8 * 1024**2
+_MAX_HASH_WORKERS = 8
 _MANIFEST_FILE = "manifest.json"
 _READY_FILE = "READY.json"
 
@@ -79,21 +81,47 @@ def _fsync_directory(path: Path) -> None:
         os.close(fd)
 
 
-def _file_sha256(path: Path) -> str:
-    digest = hashlib.sha256()
+def _fsync_payload(fd: int) -> None:
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+@dataclass(frozen=True)
+class _PayloadDigests:
+    file: str
+    tensors: dict[str, str]
+
+
+def _scan_payload(path: Path, specs: tuple[TensorWriteSpec, ...]) -> _PayloadDigests:
+    """Calculate file and tensor digests in one ordered read."""
+    file_digest = hashlib.sha256()
+    tensor_digests: dict[str, str] = {}
     with path.open("rb") as handle:
-        while chunk := handle.read(_HASH_CHUNK_BYTES):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def _tensor_sha256(tensor: torch.Tensor) -> str:
-    digest = hashlib.sha256()
-    byte_view = tensor.detach().reshape(-1).view(torch.uint8)
-    for offset in range(0, byte_view.numel(), _HASH_CHUNK_BYTES):
-        chunk = byte_view[offset : offset + _HASH_CHUNK_BYTES]
-        digest.update(memoryview(chunk.numpy()))
-    return digest.hexdigest()
+        prefix = handle.read(8)
+        if len(prefix) != 8:
+            raise ArtifactWriterError(f"truncated safetensors header in {path.name!r}")
+        header_size = struct.unpack("<Q", prefix)[0]
+        header = handle.read(header_size)
+        if len(header) != header_size:
+            raise ArtifactWriterError(f"truncated safetensors header in {path.name!r}")
+        file_digest.update(prefix)
+        file_digest.update(header)
+        for spec in specs:
+            digest = hashlib.sha256()
+            remaining = spec.nbytes
+            while remaining:
+                chunk = handle.read(min(remaining, _HASH_CHUNK_BYTES))
+                if not chunk:
+                    raise ArtifactWriterError(f"truncated tensor {spec.name!r} in {path.name!r}")
+                file_digest.update(chunk)
+                digest.update(chunk)
+                remaining -= len(chunk)
+            tensor_digests[spec.name] = digest.hexdigest()
+        if handle.read(1):
+            raise ArtifactWriterError(f"unexpected trailing bytes in {path.name!r}")
+    return _PayloadDigests(file_digest.hexdigest(), tensor_digests)
 
 
 class _Coverage:
@@ -130,6 +158,8 @@ class StreamingSafeTensorFile:
         owner: FilesystemArtifactWriter,
         relative_name: str,
         specs: tuple[TensorWriteSpec, ...],
+        *,
+        ordered: bool,
     ) -> None:
         self._owner = owner
         self.relative_name = _safe_relative_name(relative_name)
@@ -144,6 +174,7 @@ class StreamingSafeTensorFile:
         self.specs = tuple(sorted(specs, key=lambda spec: spec.name))
         self._specs = {spec.name: spec for spec in self.specs}
         self._coverage = {spec.name: _Coverage(spec.nbytes) for spec in self.specs}
+        self._ordered = ordered
         self._closed = False
 
         offsets: dict[str, int] = {}
@@ -167,6 +198,7 @@ class StreamingSafeTensorFile:
         total_size = self._payload_offset + cursor
         owner._reserve_file(total_size)
         self._fd = os.open(self._path, os.O_CREAT | os.O_EXCL | os.O_RDWR | os.O_CLOEXEC, 0o600)
+        prefix = struct.pack("<Q", len(encoded_header))
         try:
             if hasattr(os, "posix_fallocate"):
                 try:
@@ -177,13 +209,16 @@ class StreamingSafeTensorFile:
                     os.ftruncate(self._fd, total_size)
             else:  # pragma: no cover - Linux production path has posix_fallocate
                 os.ftruncate(self._fd, total_size)
-            _pwrite_all(self._fd, struct.pack("<Q", len(encoded_header)), 0)
+            _pwrite_all(self._fd, prefix, 0)
             _pwrite_all(self._fd, encoded_header, 8)
         except BaseException:
             os.close(self._fd)
             self._path.unlink(missing_ok=True)
             owner._forget_reserved_file(total_size)
             raise
+        self._file_digest = hashlib.sha256(prefix + encoded_header) if ordered else None
+        self._tensor_digests = {spec.name: hashlib.sha256() for spec in self.specs} if ordered else {}
+        self._write_cursor = self._payload_offset
         owner._opened(self)
 
     @staticmethod
@@ -226,9 +261,19 @@ class StreamingSafeTensorFile:
             raise ArtifactWriterError(f"tensor {name!r} was not declared in this payload file") from exc
 
     def _write(self, name: str, byte_offset: int, data: memoryview) -> None:
+        file_offset = self._payload_offset + self._offsets[name] + byte_offset
+        if self._ordered and file_offset != self._write_cursor:
+            raise ArtifactWriterError(
+                f"ordered tensor payload expected offset {self._write_cursor}, got {file_offset} for {name!r}"
+            )
         coverage = self._coverage[name]
         coverage.add(byte_offset, byte_offset + len(data))
-        _pwrite_all(self._fd, data, self._payload_offset + self._offsets[name] + byte_offset)
+        _pwrite_all(self._fd, data, file_offset)
+        if self._ordered:
+            assert self._file_digest is not None
+            self._file_digest.update(data)
+            self._tensor_digests[name].update(data)
+            self._write_cursor += len(data)
 
     def close(self) -> None:
         if self._closed:
@@ -238,11 +283,19 @@ class StreamingSafeTensorFile:
             self.abort()
             raise ArtifactWriterError(f"tensor payload closed with incomplete writes: {missing}")
         self._closed = True
+        digests = None
+        if self._ordered:
+            assert self._file_digest is not None
+            digests = _PayloadDigests(
+                self._file_digest.hexdigest(),
+                {name: digest.hexdigest() for name, digest in self._tensor_digests.items()},
+            )
         try:
-            os.fsync(self._fd)
-        finally:
+            os.fchmod(self._fd, 0o444)
+            self._owner._closed(self, digests, self._fd)
+        except BaseException:
             os.close(self._fd)
-        self._owner._closed(self)
+            raise
 
     def abort(self) -> None:
         if self._closed:
@@ -281,20 +334,25 @@ class FilesystemArtifactWriter:
         self._capacity_check = capacity_check
         self._active: set[StreamingSafeTensorFile] = set()
         self._files: dict[str, tuple[TensorWriteSpec, ...]] = {}
+        self._digests: dict[str, _PayloadDigests] = {}
         self._reserved_bytes = 0
         self._finalized = False
+        self._fsync_executor: ThreadPoolExecutor | None = None
+        self._fsync_futures: list[Future[None]] = []
 
     def open_tensor_file(
         self,
         relative_name: str,
         specs: tuple[TensorWriteSpec, ...],
+        *,
+        ordered: bool = False,
     ) -> StreamingSafeTensorFile:
         if self._finalized:
             raise ArtifactWriterError("cannot add payloads after artifact finalization")
         relative_name = _safe_relative_name(relative_name)
         if relative_name in self._files or any(item.relative_name == relative_name for item in self._active):
             raise ArtifactWriterError(f"artifact payload {relative_name!r} was declared more than once")
-        return StreamingSafeTensorFile(self, relative_name, specs)
+        return StreamingSafeTensorFile(self, relative_name, specs, ordered=ordered)
 
     def _reserve_file(self, size: int) -> None:
         self._capacity_check(self._reserved_bytes + size, size)
@@ -306,9 +364,14 @@ class FilesystemArtifactWriter:
     def _opened(self, writer: StreamingSafeTensorFile) -> None:
         self._active.add(writer)
 
-    def _closed(self, writer: StreamingSafeTensorFile) -> None:
+    def _closed(self, writer: StreamingSafeTensorFile, digests: _PayloadDigests | None, fd: int) -> None:
         self._active.remove(writer)
         self._files[writer.relative_name] = writer.specs
+        if digests is not None:
+            self._digests[writer.relative_name] = digests
+        if self._fsync_executor is None:
+            self._fsync_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="hwr-fsync")
+        self._fsync_futures.append(self._fsync_executor.submit(_fsync_payload, fd))
 
     def _aborted(self, writer: StreamingSafeTensorFile, size: int) -> None:
         self._active.discard(writer)
@@ -318,6 +381,19 @@ class FilesystemArtifactWriter:
         for writer in tuple(self._active):
             with contextlib.suppress(Exception):
                 writer.abort()
+        with contextlib.suppress(Exception):
+            self._wait_for_payload_fsync()
+
+    def _wait_for_payload_fsync(self) -> None:
+        if self._fsync_executor is None:
+            return
+        executor = self._fsync_executor
+        futures = tuple(self._fsync_futures)
+        self._fsync_executor = None
+        self._fsync_futures.clear()
+        executor.shutdown(wait=True)
+        for future in futures:
+            future.result()
 
     def finalize(
         self,
@@ -335,46 +411,50 @@ class FilesystemArtifactWriter:
         if metadata.restorer_schema != identity.producer.restorer_schema:
             raise ArtifactWriterError("production metadata does not match the identity's restorer schema")
 
+        self._wait_for_payload_fsync()
+
         tensor_entries: list[TensorManifestEntry] = []
         file_entries: list[FileManifestEntry] = []
         seen_tensors: set[str] = set()
-        for file_name in sorted(self._files):
+        file_names = sorted(self._files)
+        unhashed = [file_name for file_name in file_names if file_name not in self._digests]
+        if unhashed:
+            with ThreadPoolExecutor(max_workers=min(_MAX_HASH_WORKERS, len(unhashed))) as executor:
+                scans = executor.map(
+                    lambda file_name: _scan_payload(self.staging_dir / file_name, self._files[file_name]),
+                    unhashed,
+                )
+                self._digests.update(zip(unhashed, scans, strict=True))
+
+        for file_name in file_names:
             path = self.staging_dir / file_name
-            os.chmod(path, 0o444)
-            with path.open("rb") as handle:
-                os.fsync(handle.fileno())
+            specs = self._files[file_name]
+            digests = self._digests[file_name]
             file_entries.append(
                 FileManifestEntry(
                     file_name=file_name,
                     size=path.stat().st_size,
-                    sha256=_file_sha256(path),
+                    sha256=digests.file,
                 )
             )
-            expected = {spec.name: spec for spec in self._files[file_name]}
-            with safe_open(str(path), framework="pt", device="cpu") as handle:
-                if set(handle.keys()) != set(expected):
-                    raise ArtifactWriterError(f"published tensor keys differ in {file_name!r}")
-                for name in sorted(expected):
-                    if name in seen_tensors:
-                        raise ArtifactWriterError(f"artifact tensor {name!r} occurs in multiple payload files")
-                    seen_tensors.add(name)
-                    spec = expected[name]
-                    tensor = handle.get_tensor(name)
-                    if tuple(tensor.shape) != spec.shape or tensor.dtype != spec.dtype:
-                        raise ArtifactWriterError(f"published tensor {name!r} differs from its declared metadata")
-                    entry = TensorManifestEntry(
-                        name=name,
+            for spec in specs:
+                if spec.name in seen_tensors:
+                    raise ArtifactWriterError(f"artifact tensor {spec.name!r} occurs in multiple payload files")
+                seen_tensors.add(spec.name)
+                tensor_entries.append(
+                    TensorManifestEntry(
+                        name=spec.name,
                         kind=spec.kind,
                         role=spec.role,
                         file_name=file_name,
-                        storage_key=name,
-                        shape=tuple(tensor.shape),
-                        dtype=str(tensor.dtype),
-                        stride=tuple(tensor.stride()),
-                        nbytes=tensor.numel() * tensor.element_size(),
-                        sha256=_tensor_sha256(tensor),
+                        storage_key=spec.name,
+                        shape=spec.shape,
+                        dtype=str(spec.dtype),
+                        stride=tuple(torch.empty(spec.shape, dtype=spec.dtype, device="meta").stride()),
+                        nbytes=spec.nbytes,
+                        sha256=digests.tensors[spec.name],
                     )
-                    tensor_entries.append(entry)
+                )
 
         ordered_tensor_entries = tuple(sorted(tensor_entries, key=lambda entry: entry.name))
         content_digest = hashlib.sha256()

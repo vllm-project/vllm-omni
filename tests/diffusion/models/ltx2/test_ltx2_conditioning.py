@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """Unit tests for LTX image-to-video input and conditioning behavior."""
 
@@ -257,6 +257,39 @@ class TestLTXImageToVideoConditioning:
         from vllm_omni.diffusion.models.ltx2.pipeline_ltx2 import LTX2Pipeline
 
         assert LTX2Pipeline.support_image_input is True
+
+    def test_ltx25_i2v_encode_uses_diffusion_decoder_statistics(self, monkeypatch):
+        import vllm_omni.diffusion.models.ltx2.ltx2_conditioning as ltx2_conditioning
+        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2 import LTX2Pipeline
+
+        pipe = object.__new__(LTX2Pipeline)
+        torch.nn.Module.__init__(pipe)
+        pipe.use_diffusion_decoder = True
+        pipe.vae = SimpleNamespace(
+            encode=lambda image: image,
+            latents_mean=torch.full((2,), 100.0),
+            latents_std=torch.full((2,), 10.0),
+            config=SimpleNamespace(scaling_factor=1.0),
+        )
+        pipe.diffusion_decoder = SimpleNamespace(
+            latents_mean=torch.tensor([1.0, 3.0]),
+            latents_std=torch.tensor([2.0, 4.0]),
+            config=SimpleNamespace(scaling_factor=2.0),
+        )
+        monkeypatch.setattr(
+            ltx2_conditioning,
+            "retrieve_latents",
+            lambda *_args, **_kwargs: torch.tensor([[[[[3.0]]], [[[7.0]]]]]),
+        )
+
+        actual = pipe._encode_i2v_image_latents(
+            torch.zeros(1, 3, 1, 1),
+            batch_size=1,
+            generator=None,
+            dtype=torch.float32,
+        )
+
+        torch.testing.assert_close(actual, torch.full((1, 2, 1, 1, 1), 2.0))
 
     def test_ltx23_i2v_rejects_multi_image_prompt_list(self):
         from vllm_omni.diffusion.models.ltx2.pipeline_ltx2 import LTX2Pipeline

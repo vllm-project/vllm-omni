@@ -37,6 +37,7 @@ from vllm_omni.diffusion.models.longcat_image.longcat_image_transformer import (
 from vllm_omni.diffusion.models.longcat_image.pipeline_longcat_image import calculate_shift
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.utils.size_utils import normalize_min_aligned_size
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.inputs.data import OmniTextPrompt
 from vllm_omni.model_executor.model_loader.weight_utils import (
@@ -93,17 +94,16 @@ def get_longcat_image_edit_pre_process_func(
         height = request.sampling_params.height or calculated_height
         width = request.sampling_params.width or calculated_width
 
-        # Store calculated dimensions in request
-        prompt["additional_information"]["calculated_height"] = calculated_height
-        prompt["additional_information"]["calculated_width"] = calculated_width
+        # Ensure dimensions are multiples of vae_scale_factor * 2
+        height, width = normalize_min_aligned_size(height, width, vae_scale_factor * 2)
         request.sampling_params.height = height
         request.sampling_params.width = width
 
         # Preprocess image
         if image is not None and not (isinstance(image, torch.Tensor) and image.size(1) == latent_channels):
-            image = image_processor.resize(image, calculated_height, calculated_width)
-            prompt_image = image_processor.resize(image, calculated_height // 2, calculated_width // 2)
-            image = image_processor.preprocess(image, calculated_height, calculated_width)
+            image = image_processor.resize(image, height, width)
+            prompt_image = image_processor.resize(image, height // 2, width // 2)
+            image = image_processor.preprocess(image, height, width)
 
             # Store preprocessed image and prompt image in request
             prompt["additional_information"]["preprocessed_image"] = image
@@ -575,15 +575,13 @@ class LongCatImageEditPipeline(
         ):
             prompt_image = additional_information.get("prompt_image")
             image = additional_information.get("preprocessed_image")
-            calculated_height = additional_information.get("calculated_height", height)
-            calculated_width = additional_information.get("calculated_width", width)
         else:
             raise RuntimeError("Missing preprocess image that should have been created by the preprocess function.")
 
         self.check_inputs(
             prompt,
-            calculated_height,
-            calculated_width,
+            height,
+            width,
             negative_prompt=negative_prompt,
             prompt_embeds=prompt_embeds,
             negative_prompt_embeds=negative_prompt_embeds,
@@ -610,8 +608,8 @@ class LongCatImageEditPipeline(
             image,
             batch_size * num_images_per_prompt,
             num_channels_latents,
-            calculated_height,
-            calculated_width,
+            height,
+            width,
             prompt_embeds.dtype,
             prompt_embeds.shape[1],
             device,
@@ -692,7 +690,7 @@ class LongCatImageEditPipeline(
         if output_type == "latent":
             image = latents
         else:
-            latents = self._unpack_latents(latents, calculated_height, calculated_width, self.vae_scale_factor)
+            latents = self._unpack_latents(latents, height, width, self.vae_scale_factor)
             latents = (latents / self.vae.config.scaling_factor) + self.vae.config.shift_factor
 
             if latents.dtype != self.vae.dtype:

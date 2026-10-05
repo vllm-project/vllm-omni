@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from dataclasses import dataclass, field
 from typing import Any
@@ -13,6 +13,7 @@ TRANSFER_ENGINE_CONNECTOR_NAMES = frozenset(
         "MooncakeTransferEngineConnector",
         "MoriTransferEngineConnector",
         "YuanrongTransferEngineConnector",
+        "NixlConnector",
     }
 )
 
@@ -32,7 +33,7 @@ def get_stage_connector_role(model_config: Any) -> str | None:
 
 def stage_receives_chunks(model_config: Any) -> bool:
     """Whether connector chunks, rather than the orchestrator, feed a stage."""
-    return get_stage_connector_role(model_config) != "sender"
+    return bool(getattr(model_config, "async_chunk", True)) and get_stage_connector_role(model_config) != "sender"
 
 
 def stage_sends_async_output(model_config: Any) -> bool:

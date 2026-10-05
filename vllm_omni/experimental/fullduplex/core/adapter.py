@@ -41,3 +41,10 @@ class DuplexAdapter(ABC):
     async def on_barge_in(self, session: DuplexSession) -> None: ...
 
     async def on_playback_ack(self, session: DuplexSession, cursor: int) -> None: ...
+
+    async def on_close(self, session: DuplexSession) -> None:
+        del session
+
+    async def flush(self, session: DuplexSession) -> None:
+        """Wait for deferred input processing before an explicit close."""
+        del session

@@ -15,6 +15,7 @@ from vllm_omni.model_extras import build_x_to_text_prompt, get_x_to_text_model_f
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _HUNYUAN_AR_DEPLOY_CONFIG = _REPO_ROOT / "vllm_omni" / "deploy" / "hunyuan_image3_ar.yaml"
+_MAMMOTH_AR_DEPLOY_CONFIG = _REPO_ROOT / "vllm_omni" / "deploy" / "mammoth_moda2_ar.yaml"
 
 
 def parse_args() -> argparse.Namespace:
@@ -61,7 +62,7 @@ def main() -> None:
     omni_kwargs: dict[str, Any] = {
         "model": args.model,
         "mode": "image-to-text" if image is not None else "text-to-text",
-        "trust_remote_code": args.trust_remote_code or family == "hunyuan_image3",
+        "trust_remote_code": args.trust_remote_code or family in {"hunyuan_image3", "mammoth_moda2"},
         "log_stats": args.log_stats,
     }
     if args.enforce_eager is not None:
@@ -70,6 +71,8 @@ def main() -> None:
         omni_kwargs["deploy_config"] = args.deploy_config
     elif family == "hunyuan_image3":
         omni_kwargs["deploy_config"] = str(_HUNYUAN_AR_DEPLOY_CONFIG)
+    elif family == "mammoth_moda2":
+        omni_kwargs["deploy_config"] = str(_MAMMOTH_AR_DEPLOY_CONFIG)
 
     omni = Omni(**omni_kwargs)
     try:

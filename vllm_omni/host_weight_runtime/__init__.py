@@ -35,7 +35,7 @@ from .inspection import (
     DomainInspection,
     HostWeightInspector,
 )
-from .lease import HostWeightLease, LeaseProvenance, MappedHostRegion
+from .lease import HostWeightLease, HostWeightLeaseCarrier, LeaseProvenance, MappedHostRegion
 from .manifest import (
     FileManifestEntry,
     ManifestValidationError,
@@ -92,6 +92,7 @@ __all__ = [
     "HostWeightError",
     "HostWeightFailure",
     "HostWeightLease",
+    "HostWeightLeaseCarrier",
     "HostWeightResolution",
     "HostWeightInspector",
     "HostWeightRuntime",

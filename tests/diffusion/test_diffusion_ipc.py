@@ -6,6 +6,7 @@ import multiprocessing as mp
 import queue
 import threading
 import time
+from collections import OrderedDict
 from multiprocessing import shared_memory
 from multiprocessing.connection import Connection
 
@@ -108,6 +109,7 @@ def test_per_worker_result_queues_release_nested_numpy_shm_and_processes() -> No
         executor._rpc_futures = {}
         executor._output_futures = {}
         executor._completed_outputs = {}
+        executor._dropped_output_ids = OrderedDict()
         executor._batch_split_map = {}
         executor._start_result_pump()
 
@@ -181,7 +183,7 @@ def test_diffusion_output_dict_tensors_round_trip_through_shm() -> None:
 
 
 def test_diffusion_output_tuple_tensors_round_trip_through_shm() -> None:
-    # LTX2 / DreamID return (video, audio) tuples as DiffusionOutput.output.
+    # LTX2 returns (video, audio) tuples as DiffusionOutput.output.
     video = torch.arange(300_000, dtype=torch.float32)
     audio = torch.arange(300_000, dtype=torch.float32) * 3
     output = DiffusionOutput(output=(video, audio))

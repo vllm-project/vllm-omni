@@ -37,7 +37,7 @@ def omni_server(request: pytest.FixtureRequest):
     with _omni_server_lock:
         # Same tuple and CLI composition as ``tests/dfx/perf/scripts/run_benchmark.py``;
         # ``serve_args`` from JSON are folded into ``extra_cli_args`` inside
-        # ``create_unique_server_params``.
+        # ``create_unique_server_pytest_params`` (JSON ``mark`` → pytest marks).
         test_name, model, deploy_path, stage_overrides, extra_cli_args, use_omni = request.param
 
         print(f"Starting OmniServer with test: {test_name}, model: {model}")

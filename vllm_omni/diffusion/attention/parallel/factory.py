@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ from vllm_omni.diffusion.distributed.parallel_state import (
     get_sequence_parallel_world_size,
     get_sp_group,
 )
-from vllm_omni.diffusion.forward_context import get_forward_context
+from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
 
 logger = init_logger(__name__)
 
@@ -37,31 +37,32 @@ def build_parallel_attention_strategy(
     - Parallel attention selection is handled here, based on distributed config
       and initialized process groups.
     """
-    try:
-        cfg = get_forward_context().omni_diffusion_config
-        p = cfg.parallel_config
-    except Exception as e:
-        logger.debug(f"No forward context available for parallel attention strategy: {e}")
+    if not is_forward_context_available():
         return NoParallelAttention()
+    cfg = get_forward_context().omni_diffusion_config
+    p = cfg.parallel_config
 
     ulysses_degree = getattr(p, "ulysses_degree", 1)
     ring_degree = getattr(p, "ring_degree", 1)
     allgather_degree = getattr(p, "allgather_degree", 1)
+    ulysses_a2a_permute = getattr(p, "ulysses_a2a_permute", False)
+
+    sp_configured = ulysses_degree > 1 or ring_degree > 1 or allgather_degree > 1
+    if not sp_configured:
+        return NoParallelAttention()
 
     try:
         sp_group = get_sp_group()
-        # Ensure SP group is initialized and world size > 1
-        if get_sequence_parallel_world_size() <= 1:
-            return NoParallelAttention()
     except Exception as e:
-        # Log warning if SP is configured but group is not available
-        if ulysses_degree > 1 or ring_degree > 1 or allgather_degree > 1:
-            logger.warning(
-                f"SP configured (ulysses={ulysses_degree}, ring={ring_degree}, "
-                f"allgather={allgather_degree}) but SP group not available: {e}. "
-                f"Falling back to NoParallelAttention. This may cause incorrect results."
-            )
-        return NoParallelAttention()
+        raise RuntimeError(
+            f"SP is configured (ulysses={ulysses_degree}, ring={ring_degree}, "
+            f"allgather={allgather_degree}), but the SP group is unavailable."
+        ) from e
+    if get_sequence_parallel_world_size() <= 1:
+        raise RuntimeError(
+            f"SP is configured (ulysses={ulysses_degree}, ring={ring_degree}, "
+            f"allgather={allgather_degree}), but the initialized SP world size is not greater than one."
+        )
 
     if allgather_degree > 1:
         if causal:
@@ -83,6 +84,7 @@ def build_parallel_attention_strategy(
             scatter_idx=scatter_idx,
             gather_idx=gather_idx,
             use_sync=use_sync,
+            ulysses_a2a_permute=ulysses_a2a_permute,
         )
 
     # Pure Ring Attention

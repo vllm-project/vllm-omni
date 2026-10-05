@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import os
 from collections import OrderedDict, defaultdict
 from collections.abc import Callable
@@ -7,11 +10,12 @@ from diffusers.loaders.lora_conversion_utils import (
     _convert_non_diffusers_qwen_lora_to_diffusers,
     _convert_non_diffusers_wan_lora_to_diffusers,
 )
-from huggingface_hub import hf_hub_download
 from safetensors.torch import load_file
 from vllm.logger import init_logger
 
+from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.utils.tf_utils import get_transformer_from_pipeline
+from vllm_omni.transformers_utils.repo_utils import hf_api
 
 logger = init_logger(__name__)
 
@@ -40,8 +44,9 @@ def _prepare_lora_delta(
     lora_a_suffix: str = "lora_A.weight",
     lora_b_suffix: str = "lora_B.weight",
     lora_bias_suffix: str = "bias",
+    compute_device: torch.device | None = None,
 ):
-    used_keys = set()
+    used_keys: set[str] = set()
     # stacked_params_mapping                       param_to_weight_names
     # [(".to_qkv", ".to_q.", "q")
     # (".to_qkv", ".to_k.", "k")  ========> {".to_qkv": [".to_q", ".to_k", ".to_v"]}
@@ -54,7 +59,10 @@ def _prepare_lora_delta(
     if param_to_weight_names is None:
         param_to_weight_names = defaultdict(list)
     for param_name, weight_names in param_to_weight_names.items():
-        if param_name not in base_key:
+        # Fused names can overlap by prefix (`.qkv_proj` is a substring of
+        # `.qkv_proj_mot_gen`), and a substring match stacks both mappings into
+        # one delta of twice the height.
+        if not base_key.endswith(param_name):
             continue
         is_stacked_param = True
         # handle lora_a_key and lora_b_key together
@@ -64,6 +72,8 @@ def _prepare_lora_delta(
                 if lora_bias_key not in lora_state_dict:
                     return None, used_keys
                 delta = lora_state_dict[lora_bias_key]
+                if compute_device is not None and compute_device.type != "cpu":
+                    delta = delta.to(compute_device)
                 stacked_deltas.append(delta)
                 used_keys.add(lora_bias_key)
         else:
@@ -74,11 +84,14 @@ def _prepare_lora_delta(
                     return None, used_keys
                 a = lora_state_dict[lora_a_key]
                 b = lora_state_dict[lora_b_key]
+                if compute_device is not None and compute_device.type != "cpu":
+                    a = a.to(compute_device)
+                    b = b.to(compute_device)
                 delta = torch.matmul(b, a)
                 stacked_deltas.append(delta)
                 used_keys.add(lora_a_key)
                 used_keys.add(lora_b_key)
-        continue
+        break
 
     if is_stacked_param:
         return torch.concat(stacked_deltas), used_keys
@@ -88,7 +101,10 @@ def _prepare_lora_delta(
         if lora_bias_key not in lora_state_dict:
             return None, used_keys
         used_keys.add(lora_bias_key)
-        return lora_state_dict[lora_bias_key], used_keys
+        delta = lora_state_dict[lora_bias_key]
+        if compute_device is not None and compute_device.type != "cpu":
+            delta = delta.to(compute_device)
+        return delta, used_keys
 
     lora_a_key = f"{base_key}.{lora_a_suffix}"
     lora_b_key = f"{base_key}.{lora_b_suffix}"
@@ -96,9 +112,29 @@ def _prepare_lora_delta(
         return None, used_keys
     a = lora_state_dict[lora_a_key]
     b = lora_state_dict[lora_b_key]
+    if compute_device is not None and compute_device.type != "cpu":
+        a = a.to(compute_device)
+        b = b.to(compute_device)
+    delta = torch.matmul(b, a)
     used_keys.add(lora_a_key)
     used_keys.add(lora_b_key)
-    return torch.matmul(b, a), used_keys
+    return delta, used_keys
+
+
+def _resolve_lora_compute_device() -> torch.device | None:
+    """Return the local accelerator device if actually usable, else None.
+
+    get_local_device() may return cuda:N/npu:N even when no physical device is
+    present, so probe with a tiny allocation before trusting the lookup.
+    """
+    try:
+        dev = get_local_device()
+        if dev.type != "cpu":
+            torch.empty(1, device=dev)
+            return dev
+    except Exception:
+        pass
+    return None
 
 
 def _load_lora_state_dict(
@@ -125,7 +161,7 @@ def _load_lora_state_dict(
 
     # finally, we try to load it from the internet
     try:
-        model_file = hf_hub_download(
+        model_file = hf_api().hf_hub_download(
             pretrained_model_name_or_path,
             filename=weights_name,
             subfolder=subfolder,
@@ -200,6 +236,11 @@ def _apply_diffusers_lora_alpha_scaling(state_dict: dict[str, torch.Tensor]) -> 
 class LoraLoaderMixin:
     transformer_name = "transformer"
 
+    # Set by the pipeline this mixin is combined with; annotated, not assigned.
+    transformer: torch.nn.Module
+    _lora_loaded: dict[str | None, dict[str, torch.Tensor]]
+    _lora_is_fused: bool
+
     # Lazy initialization to avoid MRO issues: __init__ may not be called
     # when mixin with nn.Module
     @property
@@ -211,6 +252,18 @@ class LoraLoaderMixin:
     @lora_loaded.setter
     def lora_loaded(self, value):
         self._lora_loaded = value
+
+    @property
+    def lora_is_fused(self) -> bool:
+        """True when LoRA weights are fused into base weights.
+
+        Mixin loads are in-place fusions, so non-empty `_lora_loaded` implies fused.
+        """
+        return getattr(self, "_lora_is_fused", False) or bool(getattr(self, "_lora_loaded", None))
+
+    @lora_is_fused.setter
+    def lora_is_fused(self, value: bool):
+        self._lora_is_fused = value
 
     @classmethod
     def load_lora_into_module(
@@ -234,6 +287,9 @@ class LoraLoaderMixin:
             for param_name, weight_name, _ in module.stacked_params_mapping:
                 param_to_weight_names[param_name].append(weight_name)
 
+        # Resolve the accelerator fallback once, outside the parameter loop.
+        accel_dev = _resolve_lora_compute_device()
+
         for name, params in module.named_parameters(prefix):
             is_bias = False
             if name.endswith(".bias"):
@@ -244,6 +300,7 @@ class LoraLoaderMixin:
             else:
                 continue
 
+            compute_dev = params.device if params.device.type != "cpu" else accel_dev
             delta, used_keys = _prepare_lora_delta(
                 state_dict,
                 base_key,
@@ -252,6 +309,7 @@ class LoraLoaderMixin:
                 lora_a_suffix,
                 lora_b_suffix,
                 lora_bias_suffix,
+                compute_device=compute_dev,
             )
             if delta is None:
                 continue
@@ -286,6 +344,9 @@ class LoraLoaderMixin:
             for param_name, weight_name, _ in module.stacked_params_mapping:
                 param_to_weight_names[param_name].append(weight_name)
 
+        # Resolve the accelerator fallback once, outside the parameter loop.
+        accel_dev = _resolve_lora_compute_device()
+
         for name, param in module.named_parameters(prefix):
             is_bias = False
             if name.endswith(".bias"):
@@ -296,6 +357,7 @@ class LoraLoaderMixin:
             else:
                 continue
 
+            compute_dev = param.device if param.device.type != "cpu" else accel_dev
             delta, used_keys = _prepare_lora_delta(
                 state_dict,
                 base_key,
@@ -304,6 +366,7 @@ class LoraLoaderMixin:
                 lora_a_suffix,
                 lora_b_suffix,
                 lora_bias_suffix,
+                compute_device=compute_dev,
             )
             if delta is None:
                 continue
@@ -373,6 +436,7 @@ class QwenImageLoraLoaderMixin(LoraLoaderMixin):
 
 class WanLoraLoaderMixin(LoraLoaderMixin):
     transformer_2_name = "transformer_2"
+    has_transformer_2: bool
 
     def load_lora_weights(
         self,

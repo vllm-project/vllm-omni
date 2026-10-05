@@ -4,23 +4,24 @@ When you want to add L4-level ***performance test*** cases, add entries to JSON 
 
 | Model type | Runner | Example JSON files |
 | ---------- | ------ | ------------------ |
-| Omni (nightly) | `run_benchmark.py` | `test_qwen3_omni_no_async_chunk.json`, `test_qwen3_omni_async_chunk.json` (`full_model` in `mark`) |
-| Omni (weekly) | `run_benchmark.py` | `test_qwen3_omni_vllm_text.json`, `test_qwen3_omni_multi_replicas.json` (`slow` in `mark`; **Perf Test** in `test-weekly.yml`) |
+| Omni (nightly) | `run_benchmark.py` | `test_qwen3_omni_no_async_chunk.json`, `test_qwen3_omni_async_chunk.json` (`full_model` without `slow` in `mark`) |
+| Omni (weekly) | `run_benchmark.py` | `test_qwen3_omni_async_chunk.json` (CUDA only), `test_qwen3_omni_vllm_text.json`, `test_qwen3_omni_multi_replicas.json` (`slow` in `mark`; **Perf Test** in `test-weekly.yml`) |
 | TTS | `run_benchmark.py` | `test_tts.json`, `test_voxcpm2.json`, `test_higgs_audio_v3.json` |
-| Diffusion | `run_diffusion_benchmark.py` | `test_qwen_image_vllm_omni.json`, `test_bagel_vllm_omni.json`, `test_wan22_i2v_vllm_omni.json`, `test_cosmos3_vllm_omni.json`, … |
+| Diffusion (`/v1/chat/completions`) | `run_diffusion_benchmark.py` | `test_qwen_image_vllm_omni.json`, `test_bagel_vllm_omni.json`, … |
+| Diffusion (`/v1/images/generations`, `/v1/images/edits`, `/v1/videos`) | `run_benchmark.py` | `test_wan22_i2v_vllm_omni.json`, `test_cosmos3_vllm_omni.json`, `test_lingbot_video_vllm_omni.json`, … |
 
 #### How runners pick cases
 
 Without **`--test-config-file`**, each runner scans all `*.json` under `tests/dfx/perf/tests/` but only keeps its own model type:
 
-- **`run_benchmark.py`**: omni and TTS cases only (skips diffusion JSON).
-- **`run_diffusion_benchmark.py`**: diffusion cases only (skips omni / TTS JSON).
+- **`run_benchmark.py`**: cases whose `benchmark_params` use ``dataset_name`` (omni, TTS, and image/video OpenAI generation via `vllm bench serve --omni`).
+- **`run_diffusion_benchmark.py`**: cases whose `benchmark_params` use ``dataset`` (diffusion client schema, including custom jsonl).
 
-Diffusion cases are detected when the JSON has `server_type` (typically `"vllm-omni"`) or `"diffusion"` in the `mark` array. Omni / TTS JSON has neither.
+Diffusion-script cases are detected by `is_diffusion_perf_config()`: presence of ``dataset`` (without ``dataset_name``) in `benchmark_params`. Marks / `server_type` / endpoint values are not used for this split.
 
 #### Running perf cases
 
-Pass **`--test-config-file`** to run one JSON file as-is, or omit it for the bulk scan above and filter with pytest **`-m`** on each case's JSON `mark` (for example `pytest … run_benchmark.py -m "full_model and tts and H100"` or `-m "slow and omni and H100"` for weekly Omni configs).
+Pass **`--test-config-file`** to load one JSON file, or omit it for the bulk scan above. In either mode, pytest **`-m`** filters each case using its JSON `mark`. A single file can contain nightly, weekly, and platform-specific case objects. For example, the nightly object in `test_qwen3_omni_async_chunk.json` declares both H100 and A3, while its `slow` weekly object is CUDA-only; there is no NPU weekly counterpart. Use `-m "H100 and full_model and not slow"`, `-m "H100 and full_model and slow"`, or `-m "npu"` to select the intended schedule and platform.
 
 ```JSON
 {
@@ -60,29 +61,29 @@ Pass **`--test-config-file`** to run one JSON file as-is, or omit it for the bul
 
 ##### Overview
 
-| Field              | Required       | Description                                  |
-| ------------------ | -------------- | -------------------------------------------- |
-| test_name          | Yes            | Unique identifier for the test case          |
-| mark               | No             | Pytest marks; see **`mark` field** below     |
-| server_params      | Yes            | Server-side configuration parameters         |
-| benchmark_params   | Yes            | Benchmark running parameters                 |
-| server_type        | Diffusion only | Routes case to run_diffusion_benchmark.py    |
-| benchmark_endpoint | Diffusion only | Benchmark API path                           |
+| Field              | Required  | Description                                                                              |
+| ------------------ | --------- | ---------------------------------------------------------------------------------------- |
+| test_name          | Yes       | Unique identifier for the test case                                                      |
+| mark               | No        | Pytest marks; see **`mark` field** below                                                 |
+| server_params      | Yes       | Server-side configuration parameters                                                     |
+| benchmark_params   | Yes       | Benchmark running parameters                                                             |
+| server_type        | Diffusion | Only for diffusion-script JSON; omit on omni-bench generation cases                      |
+| benchmark_endpoint | Optional  | Legacy diffusion custom-jsonl alias; prefer `benchmark_params[].endpoint`                |
 
-Omit `mark` only for configs not meant to be filtered by `-m`. `server_type` is typically `"vllm-omni"`. `benchmark_endpoint` examples: `/v1/videos`, `/v1/images/generations`.
+Omit `mark` only for configs not meant to be filtered by `-m`. Cases that call `/v1/images/edits`, `/v1/images/generations`, or `/v1/videos` use the same `benchmark_params` schema as Omni/TTS (`dataset_name`, `endpoint`, `extra_body`) and are executed by `run_benchmark.py` — do not set `server_type` or `task` on those cases. Remaining diffusion cases (usually `/v1/chat/completions`, or custom jsonl) stay on `run_diffusion_benchmark.py` and may keep `server_type`.
 
 #### `mark` field
 
 Optional top-level field on each perf JSON **case object** (one per `test_name`). `run_benchmark.py` and `run_diffusion_benchmark.py` read it via `tests.dfx.conftest.resolve_pytest_marks` and attach the marks to the corresponding `pytest.param`, so you can filter locally with `-m`.
 
-When `mark` is present, it must be an **array** with exactly one ``hardware_marks`` object (same shape as `@hardware_test` / `hardware_marks()` in `tests/helpers/mark.py`), followed by registered pytest marker name strings such as `full_model`, `omni`, `tts`, `diffusion`, or `local_model`.
+When `mark` is present, it must be an **array** with exactly one ``hardware_marks`` object (same shape as `@hardware_test` / `hardware_marks()` in `tests/helpers/mark.py`), followed by registered pytest marker name strings such as `full_model`, `slow`, `omni`, `tts`, `diffusion`, or `local_model`.
 
 Supported form:
 
 | Form | Example | Effect |
 | ---- | ------- | ------ |
-| Array (single platform) | `"mark": [{"hardware_marks": {"res": {"cuda": "H100"}, "num_cards": 2}}, "full_model", "diffusion"]` | Hardware marks from `hardware_marks(...)`; `num_cards` > 1 adds `distributed_*` (+ CUDA `skipif_cuda` when applicable). String entries become extra pytest marks. |
-| Array (multi-platform) | `"mark": [{"hardware_marks": {"res": {"cuda": "H100", "rocm": "MI325", "npu": "A2"}, "num_cards": {"cuda": 2, "rocm": 2, "npu": 1}}}, "full_model", "omni"]` | Same as above, but declares **multiple platforms** in one case. Filter examples: `-m "full_model and H100 and cuda"`, `-m "full_model and MI325 and rocm"`. |
+| Array (single platform) | `"mark": [{"hardware_marks": {"res": {"cuda": "H100"}, "num_cards": 2}}, "full_model", "diffusion"]` | Hardware marks from `hardware_marks(...)`; `num_cards` adds `cards_{n}` (including `cards_1` when omitted). String entries become extra pytest marks. |
+| Array (multi-platform) | `"mark": [{"hardware_marks": {"res": {"cuda": "H100", "rocm": "MI325"}, "num_cards": 2}}, "full_model", "omni"]` | Same as above, but declares **multiple platforms** on one item. All platforms must share the same `num_cards` (int or identical dict values). Different counts need `@hardware_test` or one `hardware_marks()` per `pytest.param`. Filter examples: `-m "full_model and H100 and cards_2 and cuda"`, `-m "full_model and MI325 and cards_2 and rocm"`. |
 
 Recommended for L4 perf cases:
 
@@ -100,7 +101,7 @@ Recommended for L4 perf cases:
 }
 ```
 
-Multi-GPU diffusion (example: Cosmos3 with `cfg-parallel-size=2`):
+Multi-GPU generation via omni bench (example: Cosmos3 with `cfg-parallel-size=2`):
 
 ```JSON
 {
@@ -110,10 +111,17 @@ Multi-GPU diffusion (example: Cosmos3 with `cfg-parallel-size=2`):
         "full_model",
         "diffusion"
     ],
-    "server_type": "vllm-omni",
-    "benchmark_endpoint": "/v1/images/generations",
     "server_params": { "...": "..." },
-    "benchmark_params": [ { "name": "1024x1024_steps4", "...": "..." } ]
+    "benchmark_params": [
+        {
+            "name": "1024x1024_steps4",
+            "dataset_name": "random",
+            "endpoint": "/v1/images/generations",
+            "num_prompts": 3,
+            "max_concurrency": 1,
+            "extra_body": { "width": 1024, "height": 1024, "num_inference_steps": 4 }
+        }
+    ]
 }
 ```
 
@@ -132,8 +140,8 @@ Result files use the **runtime** hardware label from `get_runtime_resource_label
 
 Examples:
 
-- Omni/TTS: `result_{test_name}_{optional_hw}_{dataset}_....json` under `BENCHMARK_DIR`
-- Diffusion: one aggregate `diffusion_result_{config_stem}_{optional_hw}_{timestamp}.json` per source JSON file (array of all runs from that file)
+- Omni/TTS and OpenAI generation endpoints (`/v1/images/*`, `/v1/videos`): `result_{test_name}_{optional_hw}_{dataset}_....json` under `BENCHMARK_DIR`
+- Remaining diffusion (`run_diffusion_benchmark.py`): one aggregate `diffusion_result_{config_stem}_{optional_hw}_{timestamp}.json` per source JSON file
 
 #### Local commands
 
@@ -142,15 +150,25 @@ Examples:
 pytest -s -v tests/dfx/perf/scripts/run_diffusion_benchmark.py -m "full_model and H100 and diffusion"
 pytest -s -v tests/dfx/perf/scripts/run_benchmark.py -m "full_model and omni and H100"
 
-# Single file (same as nightly CI Perf steps)
+# Single file (same selectors as the CI Perf steps)
 pytest -s -v tests/dfx/perf/scripts/run_diffusion_benchmark.py \
   --test-config-file tests/dfx/perf/tests/test_bagel_vllm_omni.json
 pytest -s -v tests/dfx/perf/scripts/run_benchmark.py \
-  --test-config-file tests/dfx/perf/tests/test_qwen3_omni_async_chunk.json
+  --test-config-file tests/dfx/perf/tests/test_cosmos3_vllm_omni.json \
+  -m "H100 and B200 and cards_2"
+pytest -s -v tests/dfx/perf/scripts/run_benchmark.py \
+  --test-config-file tests/dfx/perf/tests/test_qwen3_omni_async_chunk.json \
+  -m "H100 and full_model and not slow"
+pytest -s -v tests/dfx/perf/scripts/run_benchmark.py \
+  --test-config-file tests/dfx/perf/tests/test_qwen3_omni_async_chunk.json \
+  -m "H100 and full_model and slow"
+pytest -s -v tests/dfx/perf/scripts/run_benchmark.py \
+  --test-config-file tests/dfx/perf/tests/test_qwen3_omni_async_chunk.json \
+  -m "npu"
 ```
 
 <!-- markdownlint-disable-next-line MD051 -->
-See also [Markers for Tests](#markers-for-tests) for registered hardware markers (`H100`, `L4`, `cuda`, `distributed_cuda`, …).
+See also [Markers for Tests](#markers-for-tests) for registered hardware markers (`H100`, `L4`, `cuda`, `cards_1`, …).
 
 #### `server_params` Configuration
 
@@ -196,7 +214,8 @@ You can add any benchmark running parameters you need here. For all optional par
 2. For boolean variables in the running parameters, modify them to forms such as ignore_eos: true/false and fill them into the JSON file.
 3. Optionally add a `baseline` object (see **Baseline thresholds** below). If you omit `baseline` or leave it empty, the performance test still runs but does not assert metric thresholds from this field.
 4. Set `"name"` on each `benchmark_params` entry for stable pytest ids and readable result keys.
-5. The qps and concurrency modes are recommended to be mutually exclusive. For detailed explanations, see the table below:
+5. Image/video generation cases (`/v1/images/generations`, `/v1/images/edits`, `/v1/videos`) use this same schema: set `endpoint` to the API path, put width/height/steps/frames in `extra_body`, use `dataset_name: random` for text-only inputs or `random-mm` when the request needs a synthetic image/video. Do not set `server_type` or `task`, and do not use `random-request-config` or kebab-case diffusion client fields.
+6. The qps and concurrency modes are recommended to be mutually exclusive. For detailed explanations, see the table below:
 
 | Parameter       | Type          | Required | Example/Values       | Description                          |
 | --------------- | ------------- | -------- | -------------------- | ------------------------------------ |

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """
 Online serving tests for ``Qwen/Qwen-Image-Edit-2511`` (image-to-image via chat completions).
@@ -8,7 +8,7 @@ Online serving tests for ``Qwen/Qwen-Image-Edit-2511`` (image-to-image via chat 
 - ``test_multi_images_to_image_001``: two reference images, fixed 512×512.
 - ``test_different_sizes_001``: ``slow`` — mixed input resolutions; ``extra_body`` uses
   per-output ``width``/``height`` lists; the test client sends one scalar-size request
-  per list index in parallel and merges images (see ``OpenAIClientHandler.send_diffusion_request``).
+  per list index in parallel and merges images (see ``OnlineOmniClient.send_diffusion_request``).
 
 ``_get_diffusion_feature_cases`` registers a single ``default`` ``OmniServerParams`` row.
 
@@ -24,7 +24,7 @@ from tests.helpers.media import generate_synthetic_image
 from tests.helpers.runtime import (
     OmniServer,
     OmniServerParams,
-    OpenAIClientHandler,
+    OnlineOmniClient,
     dummy_messages_from_mix_data,
 )
 
@@ -59,7 +59,7 @@ def _get_diffusion_feature_cases(model: str = MODEL):
     _get_diffusion_feature_cases(),
     indirect=True,
 )
-def test_single_image_to_image_001(omni_server: OmniServer, openai_client: OpenAIClientHandler):
+def test_single_image_to_image_001(omni_server: OmniServer, online_client: OnlineOmniClient):
     """Single-reference edit smoke for ``Qwen/Qwen-Image-Edit-2511`` (CFG when negative prompt + ``true_cfg_scale`` > 1)."""
     image_data_url = f"data:image/jpeg;base64,{generate_synthetic_image(512, 512)['base64']}"
 
@@ -79,7 +79,7 @@ def test_single_image_to_image_001(omni_server: OmniServer, openai_client: OpenA
         },
     }
 
-    openai_client.send_diffusion_request(request_config)
+    online_client.send_diffusion_request(request_config)
 
 
 @pytest.mark.slow
@@ -89,7 +89,7 @@ def test_single_image_to_image_001(omni_server: OmniServer, openai_client: OpenA
     _get_diffusion_feature_cases(),
     indirect=True,
 )
-def test_multi_images_to_image_001(omni_server: OmniServer, openai_client: OpenAIClientHandler):
+def test_multi_images_to_image_001(omni_server: OmniServer, online_client: OnlineOmniClient):
     """Two-reference edit smoke for ``Qwen/Qwen-Image-Edit-2511``."""
 
     image_data_url_list = [f"data:image/jpeg;base64,{generate_synthetic_image(512, 512)['base64']}" for _ in range(2)]
@@ -110,7 +110,7 @@ def test_multi_images_to_image_001(omni_server: OmniServer, openai_client: OpenA
         },
     }
 
-    openai_client.send_diffusion_request(request_config)
+    online_client.send_diffusion_request(request_config)
 
 
 @pytest.mark.slow
@@ -120,7 +120,7 @@ def test_multi_images_to_image_001(omni_server: OmniServer, openai_client: OpenA
     _get_diffusion_feature_cases(),
     indirect=True,
 )
-def test_different_sizes_001(omni_server: OmniServer, openai_client: OpenAIClientHandler):
+def test_different_sizes_001(omni_server: OmniServer, online_client: OnlineOmniClient):
     """Multi-reference edit with distinct input resolutions; per-output ``width``/``height`` as lists (client splits into concurrent scalar-size calls)."""
     image_data_url_list = [
         f"data:image/jpeg;base64,{generate_synthetic_image(512, 512)['base64']}",
@@ -143,4 +143,4 @@ def test_different_sizes_001(omni_server: OmniServer, openai_client: OpenAIClien
         },
     }
 
-    openai_client.send_diffusion_request(request_config)
+    online_client.send_diffusion_request(request_config)

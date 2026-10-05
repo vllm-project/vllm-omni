@@ -7,11 +7,15 @@ import inspect
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
+from vllm_omni.diffusion.models.diffusers_adapter.pipeline_utils import resolve_diffusers_pipeline_class
 from vllm_omni.diffusion.registry import DiffusionModelRegistry
 
 
 def supports_multimodal_input(od_config: OmniDiffusionConfig) -> tuple[bool, bool]:
-    if od_config.diffusion_load_format == "diffusers" and (pipe_cls := od_config.diffusers_pipeline_cls) is not None:
+    if (
+        od_config.diffusion_load_format == "diffusers"
+        and (pipe_cls := resolve_diffusers_pipeline_class(od_config)) is not None
+    ):
         signature = inspect.signature(pipe_cls.__call__)
         support_image_input = "image" in signature.parameters
         support_audio_input = (
@@ -39,6 +43,16 @@ def supports_audio_output(model_class_name: str) -> bool:
     if model_cls is None:
         return False
     return bool(getattr(model_cls, "support_audio_output", False))
+
+
+def get_diffusion_output_type(model_class_name: str | None) -> str:
+    """Return the declared final modality for a diffusion model."""
+    declared_output_type = get_diffusion_model_metadata(model_class_name).final_output_type
+    if declared_output_type is not None:
+        return declared_output_type
+    if model_class_name and supports_audio_output(model_class_name):
+        return "audio"
+    return "image"
 
 
 def get_dummy_run_num_frames(model_class_name: str, supports_audio_input: bool) -> int:

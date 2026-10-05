@@ -5,6 +5,9 @@
 Main entry points for vLLM-Omni inference and serving.
 
 - [vllm_omni.entrypoints.async_omni.AsyncOmni][]
+- [vllm_omni.entrypoints.async_omni_base.AsyncOmniBase][]
+- [vllm_omni.entrypoints.duplex_omni.DuplexOmni][]
+- [vllm_omni.entrypoints.duplex_omni.DuplexSessionHandle][]
 - [vllm_omni.engine.cfg_companion_tracker.CfgCompanionTracker][]
 - [vllm_omni.entrypoints.cli.benchmark.base.OmniBenchmarkSubcommandBase][]
 - [vllm_omni.entrypoints.cli.benchmark.main.OmniBenchmarkSubcommand][]
@@ -14,6 +17,38 @@ Main entry points for vLLM-Omni inference and serving.
 - [vllm_omni.entrypoints.omni.Omni][]
 - [vllm_omni.entrypoints.omni_base.OmniBase][]
 - [vllm_omni.entrypoints.pd_utils.PDDisaggregationMixin][]
+
+## Clients
+
+Client libraries for full-duplex sessions: the Realtime WebSocket client, the in-process client over `DuplexOmni`, and the per-model session presets.
+
+- [vllm_omni.clients.duplex.AudioDelta][]
+- [vllm_omni.clients.duplex.AudioFormat][]
+- [vllm_omni.clients.duplex.ConnectionResumed][]
+- [vllm_omni.clients.duplex.DuplexClient][]
+- [vllm_omni.clients.duplex.DuplexClientBase][]
+- [vllm_omni.clients.duplex.DuplexClientError][]
+- [vllm_omni.clients.duplex.DuplexConnectionError][]
+- [vllm_omni.clients.duplex.DuplexEvent][]
+- [vllm_omni.clients.duplex.DuplexProtocolError][]
+- [vllm_omni.clients.duplex.DuplexSessionClosedError][]
+- [vllm_omni.clients.duplex.ErrorEvent][]
+- [vllm_omni.clients.duplex.EventCollector][]
+- [vllm_omni.clients.duplex.ListenDecision][]
+- [vllm_omni.clients.duplex.ReconnectPolicy][]
+- [vllm_omni.clients.duplex.ResponseCreated][]
+- [vllm_omni.clients.duplex.ResponseDone][]
+- [vllm_omni.clients.duplex.ResponseHandle][]
+- [vllm_omni.clients.duplex.SessionClosed][]
+- [vllm_omni.clients.duplex.SessionConfig][]
+- [vllm_omni.clients.duplex.SessionCreated][]
+- [vllm_omni.clients.duplex.SessionExpired][]
+- [vllm_omni.clients.duplex.SessionResumed][]
+- [vllm_omni.clients.duplex.SpeakDecision][]
+- [vllm_omni.clients.duplex.TextDelta][]
+- [vllm_omni.clients.duplex.TranscriptDelta][]
+- [vllm_omni.clients.duplex.WebSocketTransport][]
+- [vllm_omni.clients.inline_duplex.InlineDuplexClient][]
 
 ## Inputs
 
@@ -114,6 +149,10 @@ Configuration classes.
 - [vllm_omni.model_executor.models.qwen3_tts.tokenizer_25hz.configuration_qwen3_tts_tokenizer_v1.Qwen3TTSTokenizerV1DecoderDiTConfig][]
 - [vllm_omni.model_executor.models.qwen3_tts.tokenizer_25hz.configuration_qwen3_tts_tokenizer_v1.Qwen3TTSTokenizerV1EncoderConfig][]
 - [vllm_omni.transformers_utils.configs.cosyvoice3.CosyVoice3Config][]
+- [vllm_omni.transformers_utils.configs.mammoth_moda2.Mammothmoda2Config][]
+- [vllm_omni.transformers_utils.configs.mammoth_moda2.Mammothmoda2Qwen2_5_VLConfig][]
+- [vllm_omni.transformers_utils.configs.mammoth_moda2.Mammothmoda2Qwen2_5_VLTextConfig][]
+- [vllm_omni.transformers_utils.configs.mammoth_moda2.Mammothmoda2Qwen2_5_VLVisionConfig][]
 - [vllm_omni.transformers_utils.configs.omnivoice.OmniVoiceConfig][]
 - [vllm_omni.transformers_utils.configs.voxcpm2.VoxCPM2Config][]
 

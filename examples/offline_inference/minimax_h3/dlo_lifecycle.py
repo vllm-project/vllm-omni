@@ -121,7 +121,6 @@ def engine_kwargs(args: argparse.Namespace) -> dict[str, Any]:
             data_parallel_size=1,
             text_encoder_tp_size=args.tp_size,
             vae_patch_parallel_size=args.tp_size,
-            enable_distributed_layerwise_offload=False,
         )
     return common
 

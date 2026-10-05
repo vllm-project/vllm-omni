@@ -17,18 +17,18 @@ The main entrypoint is:
 vllm serve Qwen/Qwen-Image --omni --port 8099
 ```
 
-2. Run a minimal benchmark:
+1. Run a minimal benchmark:
 
 ```bash
 python3 benchmarks/diffusion/diffusion_benchmark_serving.py \
-	--base-url http://localhost:8099 \
-	--model Qwen/Qwen-Image \
-	--task t2i \
-	--dataset vbench \
-	--num-prompts 5
+ --base-url http://localhost:8099 \
+ --model Qwen/Qwen-Image \
+ --task t2i \
+ --dataset vbench \
+ --num-prompts 5
 ```
 
-**Notes**
+### Notes
 
 - By default, image tasks talk to `http://<host>:<port>/v1/chat/completions`; video tasks talk to `/v1/videos`.
 - If you run the server on another host or port, pass `--base-url` accordingly.
@@ -52,14 +52,14 @@ Example (`t2v`):
 
 ```bash
 python3 benchmarks/diffusion/diffusion_benchmark_serving.py \
-	--base-url http://localhost:8099 \
-	--model Wan-AI/Wan2.2-T2V-A14B-Diffusers \
-	--task t2v \
-	--dataset vbench \
-	--num-prompts 50 \
-	--width 640 --height 480 \
-	--num-frames 81 --fps 16 \
-	--num-inference-steps 40
+ --base-url http://localhost:8099 \
+ --model Wan-AI/Wan2.2-T2V-A14B-Diffusers \
+ --task t2v \
+ --dataset vbench \
+ --num-prompts 50 \
+ --width 640 --height 480 \
+ --num-frames 81 --fps 16 \
+ --num-inference-steps 40
 ```
 
 Note: `vbench` can also be used for other tasks such as `t2i` / `i2v` (and `i2i`). For `t2i`, the loader reuses VBench t2v text prompts; for `i2v` / `i2i`, it loads the VBench i2v dataset (with image paths).
@@ -140,6 +140,21 @@ Traffic / concurrency flags:
 - `--request-rate`: Target request rate (requests/second). If set to `inf`, the script sends all requests immediately.
 - `--max-concurrency`: Max number of in-flight requests (default: `1`). This can hard-cap the achieved QPS: if it is too small, requests will queue behind the semaphore, and both achieved throughput and observed SLO attainment can be skewed.
 
+### Video job timeout and failures
+
+`--video-job-timeout` controls how long each `/v1/videos` job may be polled,
+including time queued on the server (default: `900` seconds). For long video
+jobs at high concurrency, use a larger budget, for example
+`--video-job-timeout 1800`. This also applies to warmup jobs. The polling budget
+starts after job creation; it excludes time waiting for the client concurrency
+semaphore. Individual HTTP calls still use the aiohttp session timeout.
+
+An expired job is counted as failed and deleted, which cancels queued or running
+server generation. The benchmark continues processing the remaining requests.
+The progress bar counts both successful and failed requests. The final report
+shows the failure count and the first 10 errors; `--output-file` saves all errors
+with their request IDs in `request_errors`.
+
 ### Batched warmup note
 
 For batched serving runs, warm the same in-flight shape you plan to measure.
@@ -149,3 +164,22 @@ batch may still pay compile or CUDA-graph capture cost.
 
 For a Qwen-Image continuous-batching replay example, see
 [`performance_dashboard/qwen_image_serving_performance.md`](./performance_dashboard/qwen_image_serving_performance.md).
+
+## HunyuanImage3 reference-prefix reuse
+
+The prefix-cache benchmark uses the unified `vllm bench serve --omni` runner,
+not this legacy diffusion benchmark. It reuses the two-image IT2I input on a
+single DiT stage, comparing dense, paged without caching, and paged with caching.
+See [Shared-reference benchmark](../../docs/design/feature/prefix_caching.md#shared-reference-benchmark)
+for the configuration, commands, and separate partial-hit accuracy coverage.
+
+The accuracy regression compares paged-no-cache, partial-hit and exact-repeat
+outputs against the checked-in official-repository reference-image goldens at
+**50 steps, CFG=2.5, seeds 43/45** (both CFG branches remain on CFGP1).
+It uses the AR-to-DiT image criteria: CLIP ≥ 90, SSIM ≥ 0.26, PSNR ≥ 12.5 dB.
+`HUNYUAN_IMAGE3_INCLUDE_DENSE=1` adds dense as another comparison to the goldens.
+It also requires actual reference-image hits and model-side query slicing,
+and checks bitwise repeatability for repeated requests at the same hit boundary.
+Images, logs, deployment YAMLs, hit traces and quality metrics are saved under
+pytest's temporary output directory. `HUNYUAN_IMAGE3_MODEL` selects a local model;
+DFX uses the repository's normal model/cache resolution.

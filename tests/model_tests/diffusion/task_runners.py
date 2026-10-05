@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """
 Definitions running and validating individual tasks, e.g., text to image,
 image to image, and so on. These are called by the core test runner.
@@ -6,12 +9,15 @@ image to image, and so on. These are called by the core test runner.
 import base64
 import io
 from dataclasses import replace
+from typing import Any
 
 import numpy as np
 import pytest
 from PIL import Image
 
-from tests.helpers.runtime import DiffusionResponse, OmniServer, OpenAIClientHandler, dummy_messages_from_mix_data
+from benchmarks.accuracy.common import pil_to_png_bytes
+from tests.helpers.assertions import assert_images_generations_response
+from tests.helpers.runtime import DiffusionResponse, OmniServer, OnlineOmniClient, dummy_messages_from_mix_data
 from tests.model_tests.diffusion.config_types import DiffusionTasks
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
@@ -48,7 +54,7 @@ IMAGE_GEN_EXTRA_BODY = {
 }
 
 # Online form_data for video generation requests (multipart /v1/videos API)
-VIDEO_GEN_FORM_DATA = {
+VIDEO_GEN_FORM_DATA: dict[str, Any] = {
     "height": HEIGHT,
     "width": WIDTH,
     "num_inference_steps": 4,
@@ -171,7 +177,7 @@ def _build_online_image_data_url() -> str:
 
 
 def _run_online_t2i(
-    server: OmniServer, client: OpenAIClientHandler, extra_body: dict | None = None
+    server: OmniServer, client: OnlineOmniClient, extra_body: dict | None = None
 ) -> list[DiffusionResponse]:
     """Run a text to image request through the server."""
     messages = dummy_messages_from_mix_data(content_text=PROMPT)
@@ -184,7 +190,7 @@ def _run_online_t2i(
 
 
 def _run_online_i2i(
-    server: OmniServer, client: OpenAIClientHandler, extra_body: dict | None = None
+    server: OmniServer, client: OnlineOmniClient, extra_body: dict | None = None
 ) -> list[DiffusionResponse]:
     """Run an image to image request through the server."""
     image_data_url = _build_online_image_data_url()
@@ -198,6 +204,25 @@ def _run_online_i2i(
         "extra_body": extra_body or IMAGE_GEN_EXTRA_BODY,
     }
     return client.send_diffusion_request(request_config)
+
+
+def _build_online_image_edits_request(model: str, num_images: int) -> dict[str, Any]:
+    """Build a multipart ``/v1/images/edits`` request with repeated image fields."""
+    files = [
+        ("image", (f"image_{index}.png", pil_to_png_bytes(INPUT_IMAGE), "image/png")) for index in range(num_images)
+    ]
+    return {
+        "data": {
+            "model": model,
+            "prompt": PROMPT,
+            "size": f"{WIDTH}x{HEIGHT}",
+            "n": 1,
+            "response_format": "b64_json",
+            "num_inference_steps": 2,
+            "seed": 42,
+        },
+        "files": files,
+    }
 
 
 ### Offline task runners
@@ -216,16 +241,20 @@ def run_and_validate_text_to_video_request(omni: Omni):
     _validate_video(_run_offline_t2v(omni))
 
 
-def run_and_validate_image_to_video_request(omni: Omni):
+def run_and_validate_image_to_video_request(omni: Omni, check_t2v_divergence: bool = True):
     """Run and validate an image to video request.
 
     LTX2Pipeline uses a unified text/image entry and can fall back to T2V if
     the image never reaches conditioning, so also run T2V with the same seed
     and prompt and assert the outputs differ; a regression that silently
     drops the input image would otherwise still pass a "did we get a valid
-    video back" check alone.
+    video back" check alone. Pipelines that mandate an image and fail closed
+    without one (SANA-Video I2V) pass check_t2v_divergence=False: a dropped
+    image raises instead of silently degrading, so the T2V comparison is moot.
     """
     i2v_video = _validate_video_frames(_get_offline_videos(_run_offline_i2v(omni)))[0]
+    if not check_t2v_divergence:
+        return
     t2v_video = _validate_video_frames(_get_offline_videos(_run_offline_t2v(omni)))[0]
     assert not np.array_equal(i2v_video, t2v_video), (
         "I2V output is identical to T2V output with the same seed and prompt; "
@@ -278,7 +307,7 @@ def run_and_validate_multi_output(omni: Omni, task_type: DiffusionTasks):
 
 
 def _run_online_t2v(
-    server: OmniServer, client: OpenAIClientHandler, form_data: dict | None = None
+    server: OmniServer, client: OnlineOmniClient, form_data: dict | None = None
 ) -> list[DiffusionResponse]:
     """Run a text to video request through the server's /v1/videos API."""
     data = dict(form_data or VIDEO_GEN_FORM_DATA)
@@ -287,7 +316,7 @@ def _run_online_t2v(
     return client.send_video_diffusion_request({"form_data": data})
 
 
-def _run_online_i2v(server: OmniServer, client: OpenAIClientHandler) -> list[DiffusionResponse]:
+def _run_online_i2v(server: OmniServer, client: OnlineOmniClient) -> list[DiffusionResponse]:
     """Run an image to video request through the server's /v1/videos API."""
     data = dict(VIDEO_GEN_FORM_DATA)
     data.setdefault("prompt", PROMPT)
@@ -306,17 +335,46 @@ def _get_online_videos(responses: list[DiffusionResponse]) -> list:
 
 
 ### Online task runners
-def run_and_validate_online_text_to_image_request(server: OmniServer, client: OpenAIClientHandler):
+def run_and_validate_online_text_to_image_request(server: OmniServer, client: OnlineOmniClient):
     """Run and validate a text to image request through the server."""
     _validate_images(_get_online_images(_run_online_t2i(server, client)))
 
 
-def run_and_validate_online_image_to_image_request(server: OmniServer, client: OpenAIClientHandler):
+def run_and_validate_online_image_to_image_request(server: OmniServer, client: OnlineOmniClient):
     """Run and validate an image to image request through the server."""
     _validate_images(_get_online_images(_run_online_i2i(server, client)))
 
 
-def run_and_validate_online_determinism(server: OmniServer, client: OpenAIClientHandler, task_type: DiffusionTasks):
+def run_and_validate_online_image_edits(
+    server: OmniServer,
+    client: OnlineOmniClient,
+    num_images: int,
+    max_multimodal_image_inputs: int,
+):
+    """Run and validate one request through ``/v1/images/edits``."""
+    request = _build_online_image_edits_request(server.model, num_images)
+    if num_images <= max_multimodal_image_inputs:
+        response = client.send_images_edits_http_request(request)[0]
+        assert response.success, response.error_message
+        assert isinstance(response.json_body, dict)
+        assert_images_generations_response(
+            response.json_body,
+            {"json": {"n": 1, "size": f"{WIDTH}x{HEIGHT}"}},
+        )
+    else:
+        err_message = (
+            "Only a single image is supported by this model."
+            if max_multimodal_image_inputs == 1
+            else f"At most {max_multimodal_image_inputs} images are supported"
+        )
+        client.send_images_edits_http_request(
+            request,
+            err_code=400,
+            err_message=err_message,
+        )
+
+
+def run_and_validate_online_determinism(server: OmniServer, client: OnlineOmniClient, task_type: DiffusionTasks):
     """Checks for determinism through the server, dispatching by task type.
 
     Video is skipped online only: send_video_diffusion_request returns encoded
@@ -342,7 +400,7 @@ def run_and_validate_online_determinism(server: OmniServer, client: OpenAIClient
         raise ValueError(f"Task type {task_type} is not yet supported for determinism checks")
 
 
-def run_and_validate_online_multi_output(server: OmniServer, client: OpenAIClientHandler, task_type: DiffusionTasks):
+def run_and_validate_online_multi_output(server: OmniServer, client: OnlineOmniClient, task_type: DiffusionTasks):
     """Checks for multi-output through the server, dispatching by task type.
 
     Video is skipped online only: send_video_diffusion_request explicitly
@@ -368,11 +426,11 @@ def run_and_validate_online_multi_output(server: OmniServer, client: OpenAIClien
         raise ValueError(f"Task type {task_type} is not yet supported for multi-output checks")
 
 
-def run_and_validate_online_text_to_video_request(server: OmniServer, client: OpenAIClientHandler):
+def run_and_validate_online_text_to_video_request(server: OmniServer, client: OnlineOmniClient):
     """Run and validate a text to video request through the server."""
     _get_online_videos(_run_online_t2v(server, client))
 
 
-def run_and_validate_online_image_to_video_request(server: OmniServer, client: OpenAIClientHandler):
+def run_and_validate_online_image_to_video_request(server: OmniServer, client: OnlineOmniClient):
     """Run and validate an image to video request through the server."""
     _get_online_videos(_run_online_i2v(server, client))

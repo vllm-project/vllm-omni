@@ -1,11 +1,11 @@
 # adapted from sglang and fastvideo
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
 import random
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniPromptType
@@ -15,6 +15,25 @@ if TYPE_CHECKING:
 
 DUMMY_DIFFUSION_REQUEST_ID = "dummy_req_id"
 _DUMMY_DIFFUSION_REQUEST_ID_PREFIX = f"{DUMMY_DIFFUSION_REQUEST_ID}/"
+
+
+def resolve_video_num_frames(
+    num_frames: int | None,
+    *,
+    default_num_frames: int,
+    is_dummy_run: bool,
+) -> int:
+    """Resolve the shared image-model frame sentinel for a video pipeline.
+
+    ``OmniDiffusionSamplingParams`` defaults ``num_frames`` to one for image
+    models, so an omitted video API field reaches model code as ``1``. Video
+    pipelines with a different default must materialize it at their boundary.
+    Startup profiling intentionally requests one frame, however, and must stay
+    lightweight.
+    """
+    if num_frames is None or (num_frames == 1 and not is_dummy_run):
+        return default_num_frames
+    return num_frames
 
 
 @dataclass
@@ -36,6 +55,7 @@ class OmniDiffusionRequest:
     sampling_params: OmniDiffusionSamplingParams
     request_id: str
     kv_sender_info: dict[str, Any] | None = None
+    payload_sender_info: dict[str, Any] | None = None
     # Optional opaque, model-owned input prepared before Scheduler admission.
     # Model code validates its concrete type when consuming it on the Worker.
     prepared_layout: Any | None = None
@@ -48,6 +68,22 @@ class OmniDiffusionRequest:
     # This is populated by a pipeline preprocessor before the request reaches
     # the scheduler; ``None`` keeps the default behavior for other pipelines.
     batch_compatibility_key: tuple[Any, ...] | None = None
+    # Opaque native vLLM connector parameters. The Orchestrator and Scheduler
+    # transport this bag without interpreting local pages or block IDs.
+    kv_transfer_params: dict[str, Any] | None = None
+    # Worker-populated scheduler reuse boundaries, available before encoding.
+    kv_computed_tokens: tuple[int, ...] = ()
+    # A model preprocessor may keep selected requests on the legacy full-forward
+    # path even when the engine is globally configured for step execution.
+    use_step_execution: bool = True
+    # KV-recv wall-clock (ms), set by the runner's _prepare_request_for_forward
+    # and carried to DiffusionOutput for the vllm_omni:diffusion_kv_load_s metric.
+    kv_recv_ms: float = 0.0
+    # Time spent waiting for initial admission by the diffusion scheduler.
+    scheduler_queue_wait_ms: float | None = None
+    # Engine-owned shared-memory signal for cooperative full-forward workers.
+    # Only the engine creates/unlinks it; workers attach readers until return.
+    cancellation_signal: str | None = field(default=None, repr=False)
 
     def __post_init__(self):
         """Initialize dependent fields after dataclass initialization."""

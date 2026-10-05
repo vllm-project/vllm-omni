@@ -1,0 +1,4 @@
+interface:
+  display_name: "Brand Promo Videos"
+  short_description: "Build brand promos from verified assets and claims"
+  default_prompt: "Use $brand-promo-video-generator to prepare the requested H3 prompts or video with the available tools."

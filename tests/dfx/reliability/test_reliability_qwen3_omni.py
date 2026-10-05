@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """
 Qwen3-Omni reliability integration tests.
 """
@@ -63,7 +66,7 @@ DEPLOY_CONFIGS_DIR = Path(__file__).resolve().parent.parent.parent.parent / "vll
 
 def _default_oom_device_spec() -> str:
     """Use currently visible CUDA ordinals to avoid invalid device index in sidecar."""
-    count = torch.accelerator.device_count()
+    count = torch.accelerator.device_count() or 0
     if count <= 0:
         return "0"
     return ",".join(str(i) for i in range(count))
@@ -414,7 +417,7 @@ def test_reliability_fault_gpu_oom_error_contract_consistent_chat_speech(
 @pytest.mark.slow
 @hardware_test(res={"cuda": "H100"}, num_cards=2)
 @pytest.mark.parametrize("omni_server_function", QWEN_PARAMS, indirect=True)
-def test_reliability_fault_gpu_oom_chat_large_payload_failure(omni_server_function, openai_client_function) -> None:
+def test_reliability_fault_gpu_oom_chat_large_payload_failure(omni_server_function, online_client_function) -> None:
     device_spec = resolve_oom_device_spec(
         OOM_INJECTION_CONFIG,
         _deploy_config_path_from_omni_server(omni_server_function),
@@ -444,7 +447,7 @@ def test_reliability_fault_gpu_oom_chat_large_payload_failure(omni_server_functi
             "key_words": {"audio": ["test"]},
         }
         try:
-            openai_client_function.send_omni_request(request_config, request_num=1)
+            online_client_function.send_omni_request(request_config, request_num=1)
         except Exception as exc:
             assert_fault_exception(exc, FAULT_ERROR_KEYWORDS)
         else:
@@ -456,7 +459,7 @@ def test_reliability_fault_gpu_oom_chat_large_payload_failure(omni_server_functi
 @pytest.mark.slow
 @hardware_test(res={"cuda": "H100"}, num_cards=2)
 @pytest.mark.parametrize("omni_server_function", QWEN_PARAMS, indirect=True)
-def test_reliability_fault_gpu_oom_concurrent_pressure_failure(omni_server_function, openai_client_function) -> None:
+def test_reliability_fault_gpu_oom_concurrent_pressure_failure(omni_server_function, online_client_function) -> None:
     device_spec = resolve_oom_device_spec(
         OOM_INJECTION_CONFIG,
         _deploy_config_path_from_omni_server(omni_server_function),
@@ -487,7 +490,7 @@ def test_reliability_fault_gpu_oom_concurrent_pressure_failure(omni_server_funct
             "key_words": {"audio": ["test"]},
         }
         try:
-            openai_client_function.send_omni_request(request_config, request_num=4)
+            online_client_function.send_omni_request(request_config, request_num=4)
         except Exception as exc:
             assert_fault_exception(exc, FAULT_ERROR_KEYWORDS)
         else:
@@ -505,7 +508,7 @@ def test_reliability_fault_gpu_oom_concurrent_pressure_failure(omni_server_funct
 )
 @pytest.mark.parametrize("omni_server_function", QWEN_PARAMS, indirect=True)
 def test_reliability_fault_process_kill_request_failure(
-    omni_server_after_fault_function, openai_client_function
+    omni_server_after_fault_function, online_client_function
 ) -> None:
     messages = dummy_messages_from_mix_data(
         system_prompt=_get_system_prompt(),
@@ -519,7 +522,7 @@ def test_reliability_fault_process_kill_request_failure(
         "key_words": {"text": ["beijing"]},
     }
     try:
-        openai_client_function.send_omni_request(request_config, request_num=1)
+        online_client_function.send_omni_request(request_config, request_num=1)
     except Exception as exc:
         assert_fault_exception(exc, PROCESS_KILL_ERROR_KEYWORDS)
     else:
@@ -567,7 +570,7 @@ def test_reliability_fault_process_kill_health_fast_fail_and_concurrent(
         assert elapsed <= _PROCESS_KILL_WORKER_CHAT_FF_MAX_ELAPSED_SEC + 1.0, (
             f"[process_kill fast_fail] request did not fail fast after fault: {elapsed:.2f}s"
         )
-        assert ff_status >= 500, (
+        assert ff_status is not None and ff_status >= 500, (
             f"[process_kill fast_fail] expected server-side failure after fault, "
             f"got status={ff_status}, body={ff_body[:200]!r}"
         )
@@ -652,13 +655,13 @@ def test_reliability_fault_process_kill_health_fast_fail_and_concurrent(
 @pytest.mark.parametrize("omni_server_function", QWEN_PARAMS, indirect=True)
 def test_reliability_fault_process_kill_worker_with_load_request_failure(
     omni_server_function,
-    openai_client_function,
+    online_client_function,
     fault_injector: FaultInjector,
 ) -> None:
     request_config = _chat_request_config(omni_server_function)
     scenario = "kill_worker_with_load"
     load_result = run_fault_injection_with_rate_load(
-        submit_request=lambda: openai_client_function.send_omni_request(request_config, request_num=1),
+        submit_request=lambda: online_client_function.send_omni_request(request_config, request_num=1),
         inject_fault=lambda: fault_injector(omni_server_function),
         num_requests=INFLIGHT_INJECTION_REQUEST_COUNT,
         request_rate=INFLIGHT_INJECTION_REQUEST_RATE,
@@ -704,14 +707,14 @@ def test_reliability_fault_process_kill_serve_root_no_load_fast_fail_and_cleanup
 @pytest.mark.parametrize("omni_server_function", QWEN_PARAMS, indirect=True)
 def test_reliability_fault_process_kill_serve_root_with_load_fast_fail_and_cleanup(
     omni_server_function,
-    openai_client_function,
+    online_client_function,
     signal_name: str,
 ) -> None:
     request_config = _chat_request_config(omni_server_function)
     scenario = f"kill_serve_root_with_load_{signal_name.lower()}"
     injector = make_server_root_kill_fault_injector(signal_name=signal_name, post_kill_wait_seconds=2.0)
     load_result = run_fault_injection_with_rate_load(
-        submit_request=lambda: openai_client_function.send_omni_request(request_config, request_num=1),
+        submit_request=lambda: online_client_function.send_omni_request(request_config, request_num=1),
         inject_fault=lambda: injector(omni_server_function),
         num_requests=INFLIGHT_INJECTION_REQUEST_COUNT,
         request_rate=INFLIGHT_INJECTION_REQUEST_RATE,
@@ -764,7 +767,7 @@ def test_reliability_fault_process_kill_tree_no_load_fast_fail_and_cleanup(
 @pytest.mark.parametrize("omni_server_function", QWEN_PARAMS, indirect=True)
 def test_reliability_fault_process_kill_tree_with_load_fast_fail_and_cleanup(
     omni_server_function,
-    openai_client_function,
+    online_client_function,
     signal_name: str,
 ) -> None:
     request_config = _chat_request_config(omni_server_function)
@@ -775,7 +778,7 @@ def test_reliability_fault_process_kill_tree_with_load_fast_fail_and_cleanup(
         inter_kill_wait_seconds=0.1,
     )
     load_result = run_fault_injection_with_rate_load(
-        submit_request=lambda: openai_client_function.send_omni_request(request_config, request_num=1),
+        submit_request=lambda: online_client_function.send_omni_request(request_config, request_num=1),
         inject_fault=lambda: injector(omni_server_function),
         num_requests=INFLIGHT_INJECTION_REQUEST_COUNT,
         request_rate=INFLIGHT_INJECTION_REQUEST_RATE,

@@ -1,14 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import math
+from unittest.mock import Mock
 
 import pytest
 import torch
 import torch.nn.functional as F
+from packaging.version import Version
 
 from vllm_omni.diffusion.attention.backends import trtllm_attn as tg
-from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
+from vllm_omni.diffusion.attention.backends.abstract import (
+    AttentionMetadata,
+    PackedPaddingMetadata,
+)
 from vllm_omni.diffusion.attention.backends.trtllm_attn import TrtllmAttentionImpl
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cuda]
@@ -33,6 +38,15 @@ requires_trtllm_attn = pytest.mark.skipif(
 
 def _impl(**bk):
     return TrtllmAttentionImpl(8, 128, 1.0 / math.sqrt(128), causal=False, num_kv_heads=8, backend_kwargs=bk)
+
+
+def _packed_padding(cu_seqlens_q, cu_seqlens_k, q_length, kv_length):
+    return PackedPaddingMetadata(
+        q_length=q_length,
+        kv_length=kv_length,
+        cu_seqlens_q=cu_seqlens_q[:2],
+        cu_seqlens_k=cu_seqlens_k[:2],
+    )
 
 
 def test_skip_config_pure_resolution():
@@ -63,27 +77,51 @@ def test_quant_rejects_non_sage_dtype():
         _impl(quant={"dtype_qk": "bfloat16"})
 
 
-def test_quant_quantize_requires_flashinfer_routine(monkeypatch):
-    import vllm_omni.diffusion.attention.backends.trtllm_attn as mod
-
-    monkeypatch.setattr(mod, "_sage_kernel_available", lambda: True)
-    monkeypatch.setattr(mod, "_sage_quantize_fn", lambda: None)
-    with pytest.raises(RuntimeError, match="trtllm_sage_attention_quantize"):
-        _impl(quant={"dtype_qk": "int8"})
-
-
 def test_quant_quantize_calls_routine_and_shapes_sfs():
     from vllm_omni.diffusion.attention.backends.trtllm_attn import QuantConfig
 
-    captured = {}
+    captured: dict[str, object] = {}
 
-    def fake_quantize(q, k, v, q_block_size, k_block_size, qk_quant_dtype):
-        captured.update(q_block_size=q_block_size, k_block_size=k_block_size, qk_quant_dtype=qk_quant_dtype)
-        return "qq", "kq", "vq", "qsfs", "ksfs", "vsfs"
+    def fake_quantize(
+        q,
+        k,
+        v,
+        q_block_size,
+        k_block_size,
+        qk_quant_dtype,
+        smooth_k,
+        cum_seq_lens_q,
+        cum_seq_lens_kv,
+    ):
+        captured.update(
+            q_block_size=q_block_size,
+            k_block_size=k_block_size,
+            qk_quant_dtype=qk_quant_dtype,
+            smooth_k=smooth_k,
+            cum_seq_lens_q=cum_seq_lens_q,
+            cum_seq_lens_kv=cum_seq_lens_kv,
+        )
+        return "qq", "kq", "vq", "qsfs", "ksfs", "vsfs", "k_mean"
 
-    q_q, k_q, v_q, sfs, blk = QuantConfig(dtype_qk="int8").quantize(object(), object(), object(), fake_quantize)
+    cu_seq_lens_q = object()
+    cu_seq_lens_kv = object()
+    q_q, k_q, v_q, sfs, blk = QuantConfig(dtype_qk="int8").quantize(
+        object(),
+        object(),
+        object(),
+        fake_quantize,
+        cu_seq_lens_q,
+        cu_seq_lens_kv,
+    )
     assert (q_q, k_q, v_q, sfs, blk) == ("qq", "kq", "vq", ("qsfs", "ksfs", None, "vsfs"), (1, 16, 0, 1))
-    assert captured == {"q_block_size": 1, "k_block_size": 16, "qk_quant_dtype": torch.int8}
+    assert captured == {
+        "q_block_size": 1,
+        "k_block_size": 16,
+        "qk_quant_dtype": torch.int8,
+        "smooth_k": True,
+        "cum_seq_lens_q": cu_seq_lens_q,
+        "cum_seq_lens_kv": cu_seq_lens_kv,
+    }
 
 
 def test_skip_factor_none_without_curve():
@@ -209,62 +247,80 @@ def test_masked_layer_raises():
         _impl().forward_cuda(q, k, v, _Meta())
 
 
-def test_packed_metadata_trims_padding_mask(monkeypatch):
-    b, s, h, d = 1, 8, 8, 128
-    q, k, v = (torch.zeros(b, s, h, d) for _ in range(3))
-    mask = torch.tensor([[True, True, True, True, True, True, False, False]])
-    cu_seqlens = torch.tensor([0, 6, 8], dtype=torch.int32)
+def test_generic_packed_metadata_preserves_ragged_batch(monkeypatch):
+    b, h, d = 1, 8, 128
+    q = torch.zeros(b, 5, h, d)
+    k, v = (torch.zeros(b, 7, h, d) for _ in range(2))
     metadata = AttentionMetadata(
-        attn_mask=mask,
         extra={
-            "cu_seqlens_q": cu_seqlens,
-            "cu_seqlens_k": cu_seqlens,
-            "max_seqlen_q": 6,
-            "max_seqlen_k": 6,
+            "cu_seqlens_q": torch.tensor([0, 2, 5], dtype=torch.int32),
+            "cu_seqlens_k": torch.tensor([0, 3, 7], dtype=torch.int32),
+            "max_seqlen_q": 3,
+            "max_seqlen_k": 4,
+        }
+    )
+    fake_attention = Mock(return_value=torch.zeros_like(q.reshape(5, h, d)))
+
+    monkeypatch.setattr(tg, "HAS_FLASHINFER", True)
+    monkeypatch.setattr(tg, "trtllm_ragged_attention_deepseek", fake_attention)
+    monkeypatch.setattr(TrtllmAttentionImpl, "_get_workspace", classmethod(lambda cls, device: torch.empty(0)))
+
+    _impl().forward_cuda(q, k, v, metadata)
+    captured = fake_attention.call_args.kwargs
+
+    assert captured["query"].shape[0] == 5
+    assert captured["key"].shape[0] == 7
+    assert captured["value"].shape[0] == 7
+    assert captured["batch_size"] == 2
+    assert captured["seq_lens"].tolist() == [3, 4]
+    assert tg.TrtllmAttentionBackend.supports_multi_doc_packed_varlen()
+
+
+def test_packed_padding_metadata_trims_without_mask(monkeypatch):
+    q_len, kv_len = 8, 9
+    valid_q_tokens, valid_kv_tokens = 5, 6
+    b, h, d = 1, 8, 128
+    q = torch.zeros(b, q_len, h, d)
+    k, v = (torch.zeros(b, kv_len, h, d) for _ in range(2))
+    cu_seqlens_q = torch.tensor([0, valid_q_tokens, q_len], dtype=torch.int32)
+    cu_seqlens_k = torch.tensor([0, valid_kv_tokens, kv_len], dtype=torch.int32)
+    metadata = AttentionMetadata(
+        packed_padding=_packed_padding(
+            cu_seqlens_q,
+            cu_seqlens_k,
+            valid_q_tokens,
+            valid_kv_tokens,
+        ),
+        extra={
+            "cu_seqlens_q": cu_seqlens_q,
+            "cu_seqlens_k": cu_seqlens_k,
+            "max_seqlen_q": valid_q_tokens,
+            "max_seqlen_k": valid_kv_tokens,
+            "valid_kv_length": valid_kv_tokens,
         },
     )
-    captured = {}
-
-    def fake_attention(**kwargs):
-        captured.update(kwargs)
-        return torch.zeros_like(kwargs["query"])
+    fake_attention = Mock(return_value=torch.ones(valid_q_tokens, h, d))
 
     monkeypatch.setattr(tg, "HAS_FLASHINFER", True)
     monkeypatch.setattr(tg, "trtllm_ragged_attention_deepseek", fake_attention)
     monkeypatch.setattr(TrtllmAttentionImpl, "_get_workspace", classmethod(lambda cls, device: torch.empty(0)))
 
     out = _impl().forward_cuda(q, k, v, metadata)
+    captured = fake_attention.call_args.kwargs
 
+    assert tg.TrtllmAttentionBackend.supports_packed_mask_free()
     assert out.shape == q.shape
-    assert captured["query"].shape[0] == 6
-    assert captured["key"].shape[0] == 6
-    assert captured["value"].shape[0] == 6
+    assert captured["query"].shape[0] == valid_q_tokens
+    assert captured["key"].shape[0] == valid_kv_tokens
+    assert captured["value"].shape[0] == valid_kv_tokens
     assert captured["batch_size"] == 1
-    assert captured["seq_lens"].tolist() == [6]
-    assert captured["cum_seq_lens_q"].tolist() == [0, 6]
-    assert captured["cum_seq_lens_kv"].tolist() == [0, 6]
-    assert captured["max_q_len"] == 6
-    assert captured["max_kv_len"] == 6
-    assert torch.count_nonzero(out[:, 6:]) == 0
-
-
-def test_packed_metadata_rejects_non_prefix_mask(monkeypatch):
-    b, s, h, d = 1, 8, 8, 128
-    q, k, v = (torch.zeros(b, s, h, d) for _ in range(3))
-    cu_seqlens = torch.tensor([0, 6, 8], dtype=torch.int32)
-    metadata = AttentionMetadata(
-        attn_mask=torch.tensor([[True, True, False, True, True, True, False, False]]),
-        extra={
-            "cu_seqlens_q": cu_seqlens,
-            "cu_seqlens_k": cu_seqlens,
-            "max_seqlen_q": 6,
-            "max_seqlen_k": 6,
-        },
-    )
-    monkeypatch.setattr(tg, "HAS_FLASHINFER", True)
-
-    with pytest.raises(ValueError, match="prefix-valid"):
-        _impl().forward_cuda(q, k, v, metadata)
+    assert captured["seq_lens"].tolist() == [valid_kv_tokens]
+    assert captured["cum_seq_lens_q"].tolist() == [0, valid_q_tokens]
+    assert captured["cum_seq_lens_kv"].tolist() == [0, valid_kv_tokens]
+    assert captured["max_q_len"] == valid_q_tokens
+    assert captured["max_kv_len"] == valid_kv_tokens
+    assert torch.count_nonzero(out[:, :valid_q_tokens] != 1) == 0
+    assert torch.count_nonzero(out[:, valid_q_tokens:]) == 0
 
 
 def test_packed_metadata_must_be_complete():
@@ -393,12 +449,13 @@ def test_bf16_packed_padding_matches_sdpa():
     q, k, v = (torch.randn(b, s, h, d, device="cuda", dtype=torch.bfloat16) for _ in range(3))
     cu_seqlens = torch.tensor([0, used, s], dtype=torch.int32, device="cuda")
     metadata = AttentionMetadata(
-        attn_mask=torch.arange(s, device="cuda")[None] < used,
+        packed_padding=_packed_padding(cu_seqlens, cu_seqlens, used, used),
         extra={
             "cu_seqlens_q": cu_seqlens,
             "cu_seqlens_k": cu_seqlens,
             "max_seqlen_q": used,
             "max_seqlen_k": used,
+            "valid_kv_length": used,
         },
     )
 
@@ -410,8 +467,8 @@ def test_bf16_packed_padding_matches_sdpa():
 
 
 requires_sage = pytest.mark.skipif(
-    not (_has_trtllm_attn() and tg._sage_quantize_fn() is not None),
-    reason="requires Blackwell SM100+ GPU with flashinfer >= 0.6.16rc1 (trtllm_sage_attention_quantize)",
+    not _has_trtllm_attn() or Version(tg.flashinfer.__version__) < Version("0.6.18rc10"),
+    reason="requires Blackwell SM100+ GPU with flashinfer >= 0.6.18rc10",
 )
 
 
@@ -443,12 +500,13 @@ def test_sage_packed_non_aligned_length_matches_sdpa():
     q, k, v = (torch.randn(b, s, h, d, device="cuda", dtype=torch.bfloat16) for _ in range(3))
     cu_seqlens = torch.tensor([0, used, s], dtype=torch.int32, device="cuda")
     metadata = AttentionMetadata(
-        attn_mask=torch.arange(s, device="cuda")[None] < used,
+        packed_padding=_packed_padding(cu_seqlens, cu_seqlens, used, used),
         extra={
             "cu_seqlens_q": cu_seqlens,
             "cu_seqlens_k": cu_seqlens,
             "max_seqlen_q": used,
             "max_seqlen_k": used,
+            "valid_kv_length": used,
         },
     )
 
@@ -458,22 +516,6 @@ def test_sage_packed_non_aligned_length_matches_sdpa():
     rel = (out[:, :used].float() - ref).abs().mean() / ref.abs().mean()
     assert rel < 0.2, f"SAGE packed valid-token rel err {rel:.4f} too high"
     assert torch.count_nonzero(out[:, used:]) == 0
-
-
-@requires_sage
-def test_sage_short_sequence_uses_dense_kernel():
-    torch.manual_seed(0)
-    b, s, h, d = 1, 14, 8, 128
-    scale = 1.0 / math.sqrt(d)
-    q, k, v = (torch.randn(b, s, h, d, device="cuda", dtype=torch.bfloat16) for _ in range(3))
-
-    impl = _impl(quant={"dtype_qk": "fp8_e4m3", "q_block_size": 1, "k_block_size": 16})
-    impl._sage_quantize_fn = lambda *args, **kwargs: pytest.fail("short sequence must not use SAGE")
-    out = impl.forward_cuda(q, k, v)
-    ref = _sdpa_ref(q, k, v, scale)
-    rel = (out.float() - ref).abs().mean() / ref.abs().mean()
-    assert torch.isfinite(out).all()
-    assert rel < 0.01, f"SAGE short-sequence dense fallback rel err {rel:.4f} too high"
 
 
 @requires_trtllm_attn
@@ -575,3 +617,68 @@ def test_skip_end_to_end_config_path(monkeypatch):
     ctx = fc.ForwardContext(denoise_timestep=0.3)
     monkeypatch.setattr(fc, "_forward_context", ctx)
     assert impl._resolve_skip_factor(4096) == pytest.approx(expected)
+
+
+@requires_trtllm_attn
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
+    reason="verified TRTLLM contract requires SM100/SM103",
+)
+@pytest.mark.parametrize("batch", [1, 2])
+def test_dense_contract_fullgraph_matches_sdpa(batch):
+    from vllm_omni.diffusion.attention.capabilities import (
+        CompilationMode,
+        ExecutionContext,
+        SupportStatus,
+    )
+
+    torch.compiler.reset()
+    try:
+        impl = _impl()
+        context = ExecutionContext(platform="cuda", require_fullgraph=True)
+        compiled = torch.compile(impl.forward_cuda, fullgraph=True, dynamic=True)
+        for q_len, kv_len in ((64, 64), (128, 192), (256, 128)):
+            # Noncontiguous Q exercises the reshape before the opaque boundary.
+            q = torch.randn(batch, 8, q_len, 128, device="cuda", dtype=torch.bfloat16).transpose(1, 2)
+            k, v = (torch.randn(batch, kv_len, 8, 128, device="cuda", dtype=torch.bfloat16) for _ in range(2))
+            result = impl.resolve_execution_path(context, q, k, v, None)
+            assert result.requested_support(context).status is SupportStatus.SUPPORTED
+            assert result.compilation_mode is CompilationMode.CUSTOM_OP
+            before = [t.clone() for t in (q, k, v)]
+            eager = impl.forward_cuda(q, k, v)
+            for _ in range(2):
+                out = compiled(q, k, v)
+                assert out.dtype == q.dtype and out.device == q.device and out.is_contiguous()
+                torch.testing.assert_close(out, eager, atol=1e-2, rtol=1e-2)
+                torch.testing.assert_close(out.float(), _sdpa_ref(q, k, v, 128**-0.5), atol=1e-2, rtol=1e-2)
+            for actual, original in zip((q, k, v), before):
+                torch.testing.assert_close(actual, original, atol=0, rtol=0)
+        # Check the real kernel's mutation and output metadata against its schema/fake.
+        qf, kf, vf = (t.reshape(-1, 8, 128).contiguous() for t in (q, k, v))
+        args = (
+            qf,
+            kf,
+            vf,
+            impl._get_workspace(q.device),
+            torch.full((batch,), kv_len, device=q.device, dtype=torch.int32),
+            torch.arange(batch + 1, device=q.device, dtype=torch.int32) * q_len,
+            torch.arange(batch + 1, device=q.device, dtype=torch.int32) * kv_len,
+            None,
+            None,
+            None,
+            q_len,
+            kv_len,
+            batch,
+            128**-0.5,
+            1.0,
+            -1.0,
+            0,
+            0,
+            False,
+        )
+        checks = torch.library.opcheck(
+            tg._trtllm_ragged_attention_op, args, test_utils=("test_schema", "test_faketensor")
+        )
+        assert all(value == "SUCCESS" for value in checks.values())
+    finally:
+        torch.compiler.reset()

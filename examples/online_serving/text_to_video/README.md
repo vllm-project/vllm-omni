@@ -11,6 +11,11 @@ This example demonstrates how to deploy text-to-video models for online video ge
 | Wan2.2 T2V | `Wan-AI/Wan2.2-T2V-A14B-Diffusers` |
 | LTX-2 | `Lightricks/LTX-2` |
 | Helios (Base / Mid / Distilled) | `BestWishYsh/Helios-Base`, `Helios-Mid`, `Helios-Distilled` |
+| SANA-Video 2B (480p) | `Efficient-Large-Model/SANA-Video_2B_480p_diffusers` |
+| SANA-Video 2B (720p) | `Efficient-Large-Model/SANA-Video_2B_720p_diffusers` |
+
+For SANA-Video 2B text-to-video online serving, see the
+[SANA-Video 2B recipe](../../../recipes/NVIDIA/SANA-Video-2B.md).
 
 ## Wan2.2 T2V
 

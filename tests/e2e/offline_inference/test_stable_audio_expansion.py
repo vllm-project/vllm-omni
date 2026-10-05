@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """Stable Audio offline e2e: real weights, FP8 + TeaCache (single job to save GPU).
 
@@ -15,7 +15,6 @@ import numpy as np
 import pytest
 import torch
 
-from tests.helpers import skip_if_gated_repo_inaccessible
 from tests.helpers.assertions import assert_audio_valid
 from tests.helpers.mark import hardware_test
 from vllm_omni import Omni
@@ -24,8 +23,6 @@ from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.platforms import current_omni_platform
 
 pytestmark = [pytest.mark.slow, pytest.mark.diffusion]
-
-_MODEL_REPO = "stabilityai/stable-audio-open-1.0"
 
 _SAMPLE_RATE = 44100
 _CLIP_DURATION_S = 2.0
@@ -80,7 +77,6 @@ def test_stable_audio_quantization_and_teacache() -> None:
 
     CI should provide ``HF_TOKEN`` if the checkpoint is gated.
     """
-    skip_if_gated_repo_inaccessible(_MODEL_REPO)
     # ``model_class_name`` must be passed explicitly: the default-stage-cfg
     # factory in ``async_omni_engine.py`` reads it out of ``kwargs`` when
     # deciding ``final_output_type`` (#2077), and at construction time the

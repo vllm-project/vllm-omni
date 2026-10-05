@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """The server/runner fixtures free the Whisper judge around each instance.
 
@@ -48,7 +48,7 @@ def _server_generator():
         param=OmniServerParams(model="fake-model"),
         node=SimpleNamespace(get_closest_marker=lambda name: None),
     )
-    return runtime.iter_omni_server(request, "core_model", "", threading.Lock())
+    return runtime.iter_omni_server(request, "core_model", threading.Lock())
 
 
 def test_releases_before_construction_and_after_teardown(events):

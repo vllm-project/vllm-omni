@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import argparse
 import functools
@@ -14,7 +14,7 @@ from diffusers.utils import numpy_to_pil
 
 from vllm_omni.diffusion.data import logger
 from vllm_omni.diffusion.utils.image_output import extract_images_from_outputs
-from vllm_omni.diffusion.utils.param_utils import apply_declared_extra_args
+from vllm_omni.diffusion.utils.param_utils import apply_declared_extra_args, ar_grid_max_tokens
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.entrypoints.openai.stage_params import clone_sampling_params
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
@@ -24,6 +24,8 @@ from vllm_omni.model_extras import (
     build_text_to_image_prompt as build_model_text_to_image_prompt,
 )
 from vllm_omni.model_extras import (
+    get_ar_input_builder,
+    get_ar_tokenizer_validator,
     get_extra_body_params,
     get_model_class_name,
     should_init_extra_args_for_non_diffusion_stages,
@@ -56,6 +58,7 @@ def parse_json_object(value: str, flag_name: str = "argument") -> dict[str, Any]
 
 
 parse_profiler_config = functools.partial(parse_json_object, flag_name="--profiler-config")
+parse_custom_pipeline_args = functools.partial(parse_json_object, flag_name="--custom-pipeline-args")
 
 
 def build_text_to_image_prompt(prompt: str, negative_prompt: str | None) -> dict[str, Any]:
@@ -69,6 +72,24 @@ def build_text_to_image_prompt(prompt: str, negative_prompt: str | None) -> dict
     return result
 
 
+def build_parallel_knob_kwargs(args: argparse.Namespace) -> dict[str, Any]:
+    """Forward explicitly-set parallel knobs so they can override a deploy YAML.
+
+    The argparse defaults are ``None``; only explicitly supplied values enter
+    the returned dict, letting a deploy YAML's parallel_config stay in effect
+    when the flags are omitted (and letting explicit values equal to the old
+    argparse defaults, e.g. ``--ulysses-degree 1``, still override the YAML).
+    """
+    knob_names = (
+        "ulysses_degree",
+        "ring_degree",
+        "ulysses_mode",
+        "cfg_parallel_size",
+        "vae_patch_parallel_size",
+    )
+    return {name: getattr(args, name) for name in knob_names if getattr(args, name) is not None}
+
+
 def _normalize_images_for_save(images: list[Any]) -> list[Any]:
     """Convert NumPy diffusion outputs to PIL images before saving."""
     normalized = []
@@ -80,7 +101,8 @@ def _normalize_images_for_save(images: list[Any]) -> list[Any]:
     return normalized
 
 
-def parse_args() -> argparse.Namespace:
+def build_parser() -> argparse.ArgumentParser:
+    """Build the example's CLI parser (kept separate for testability)."""
     parser = argparse.ArgumentParser(description="Generate an image with supported diffusion models.")
     parser.add_argument(
         "--model",
@@ -154,33 +176,40 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--enable-cache-dit-summary",
         action="store_true",
-        help="Enable cache-dit summary logging after diffusion forward passes.",
+        default=None,
+        help=(
+            "Enable cache-dit summary logging after diffusion forward passes. "
+            "Default: unset (defer to the deploy YAML's enable_cache_dit_summary)."
+        ),
     )
     parser.add_argument(
         "--ulysses-degree",
         type=int,
-        default=1,
-        help="Number of GPUs used for ulysses sequence parallelism.",
+        default=None,
+        help="Number of GPUs used for ulysses sequence parallelism. "
+        "Explicitly passing 1 overrides a deploy YAML value.",
     )
     parser.add_argument(
         "--ulysses-mode",
         type=str,
-        default="strict",
+        default=None,
         choices=["strict", "advanced_uaa"],
-        help="Ulysses sequence-parallel mode: 'strict' (divisibility required) or 'advanced_uaa' (UAA).",
+        help="Ulysses sequence-parallel mode: 'strict' (divisibility required) or 'advanced_uaa' (UAA). "
+        "Explicitly passing 'strict' overrides a deploy YAML value.",
     )
     parser.add_argument(
         "--ring-degree",
         type=int,
-        default=1,
-        help="Number of GPUs used for ring sequence parallelism.",
+        default=None,
+        help="Number of GPUs used for ring sequence parallelism. Explicitly passing 1 overrides a deploy YAML value.",
     )
     parser.add_argument(
         "--cfg-parallel-size",
         type=int,
-        default=1,
+        default=None,
         choices=[1, 2],
-        help="Number of GPUs used for classifier free guidance parallel size.",
+        help="Number of GPUs used for classifier free guidance parallel size. "
+        "Explicitly passing 1 overrides a deploy YAML value.",
     )
     parser.add_argument(
         "--enforce-eager",
@@ -289,8 +318,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--vae-patch-parallel-size",
         type=int,
-        default=1,
-        help="Number of ranks used for VAE patch/tile parallelism (decode/encode).",
+        default=None,
+        help="Number of ranks used for VAE patch/tile parallelism (decode/encode). "
+        "Explicitly passing 1 overrides a deploy YAML value.",
     )
     # NextStep-1.1 specific arguments
     parser.add_argument(
@@ -377,8 +407,125 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Supplementary auxiliary text encoder parameters model name or path (especially for Hidream-l1-full).",
     )
+    parser.add_argument(
+        "--model-class-name",
+        type=str,
+        default=None,
+        help="Override the diffusion pipeline class name (e.g. AnimaPipeline).",
+    )
+    parser.add_argument(
+        "--custom-pipeline-args",
+        type=parse_custom_pipeline_args,
+        default=None,
+        help='JSON object passed to native/custom pipelines (e.g. \'{"components_path": "/path"}\').',
+    )
+    parser.add_argument(
+        "--trust-remote-code",
+        action="store_true",
+        help="Trust and execute custom modeling code from the model repo (required by e.g. HunyuanImage-3.0).",
+    )
+    parser.add_argument(
+        "--allow-tokenizer-fallback",
+        action="store_true",
+        help=(
+            "For models with a declared ar_input_builder (e.g. HunyuanImage-3.0): if loading "
+            "the AR tokenizer fails, degrade to the string-prompt form (no BPE parity) instead "
+            "of failing the run. Off by default -- a tokenizer load failure usually means a "
+            "missing --trust-remote-code or a network/cache issue that's worth surfacing, not "
+            "silently masking with a possibly-wrong prompt."
+        ),
+    )
     current_omni_platform.pre_register_and_update(parser)
-    return parser.parse_args()
+    return parser
+
+
+def parse_args() -> argparse.Namespace:
+    return build_parser().parse_args()
+
+
+def _apply_ar_stage_inputs(
+    ar_input_builder: Any,
+    *,
+    model: str,
+    prompt_text: str,
+    extra_body: dict[str, Any],
+    num_images: int,
+    height: int | None,
+    width: int | None,
+    prompt_dict: dict[str, Any],
+    sampling_params_list: list[Any],
+    text_output: bool = False,
+    trust_remote_code: bool = False,
+    validate_tokenizer: Any | None = None,
+    allow_tokenizer_fallback: bool = False,
+) -> None:
+    """Apply a model's declared AR-stage inputs to the request in place.
+
+    Loads the model tokenizer (for byte-for-byte HF-parity segment
+    tokenization) and asks the model's ``ar_input_builder`` for the AR
+    prefill + stop tokens, then writes them onto ``prompt_dict`` and the
+    non-diffusion (AR) stage sampling params. Kept model-agnostic: the
+    example only knows the declared-hook contract.
+
+    ``trust_remote_code`` must be threaded in from the caller's own resolved
+    ``--trust-remote-code`` flag -- this is a separate tokenizer load outside
+    the main engine, so it needs the same explicit user opt-in rather than
+    defaulting to trusting whatever ``--model`` was passed.
+
+    ``validate_tokenizer``, when the model declares one via
+    ``get_ar_tokenizer_validator``, is called on a successfully-loaded real
+    tokenizer -- outside the load's try/except, so a validation failure (a
+    model/tokenizer revision drifting from hardcoded special-token ids)
+    raises instead of being swallowed into the string-prompt fallback.
+
+    ``allow_tokenizer_fallback`` (default ``False``, i.e. fail fast): a
+    tokenizer load failure normally raises, since silently degrading to the
+    string-prompt form can produce a request that completes with subtly
+    wrong stop tokens instead of surfacing the real problem (missing
+    ``--trust-remote-code``, network/cache issue, etc.). Set ``True`` only
+    for explicit unit tests or a deliberate offline-compat run where the
+    caller has already decided a degraded prompt is acceptable.
+    """
+    try:
+        from transformers import AutoTokenizer
+
+        ar_tokenizer: Any | None = AutoTokenizer.from_pretrained(model, trust_remote_code=trust_remote_code)
+    except Exception as exc:  # noqa: BLE001 - re-raised unless the caller opts into the fallback
+        if not allow_tokenizer_fallback:
+            raise
+        logger.warning(f"AR tokenizer load failed ({exc}); falling back to string prompt (no BPE parity).")
+        ar_tokenizer = None
+
+    if ar_tokenizer is not None and validate_tokenizer is not None:
+        validate_tokenizer(ar_tokenizer)
+
+    ar_inputs = ar_input_builder(
+        prompt=prompt_text,
+        tokenizer=ar_tokenizer,
+        extra_body=extra_body,
+        num_images=num_images,
+        height=height,
+        width=width,
+        text_output=text_output,
+    )
+
+    if ar_inputs.prompt_token_ids is not None:
+        prompt_dict["prompt_token_ids"] = ar_inputs.prompt_token_ids
+    elif ar_inputs.prompt is not None:
+        prompt_dict["prompt"] = ar_inputs.prompt
+    if ar_inputs.use_system_prompt:
+        prompt_dict["use_system_prompt"] = ar_inputs.use_system_prompt
+    prompt_dict["modalities"] = ar_inputs.modalities
+
+    # Apply stop_token_ids to exactly the stage(s) the builder names -- not
+    # "whichever stage isn't a diffusion stage," which would misfire on any
+    # future topology with more than one non-diffusion stage.
+    for stage_index in ar_inputs.stage_indices:
+        if stage_index >= len(sampling_params_list):
+            continue
+        stage_params = sampling_params_list[stage_index]
+        if not isinstance(stage_params, OmniDiffusionSamplingParams) and hasattr(stage_params, "stop_token_ids"):
+            stage_params.stop_token_ids = ar_inputs.stop_token_ids
 
 
 def main():
@@ -407,14 +554,8 @@ def main():
             "scm_steps_policy": "dynamic",  # SCM steps policy: "dynamic" or "static"
         }
     elif cache_backend == "tea_cache":
-        # TeaCache configuration
-        # All parameters marked with [tea_cache only] in DiffusionCacheConfig
-        cache_config = {
-            # TeaCache parameters [tea_cache only]
-            "rel_l1_thresh": 0.2,  # Threshold for accumulated relative L1 distance
-            # Note: coefficients will use model-specific defaults based on model_type
-            #       (e.g., QwenImagePipeline or FluxPipeline)
-        }
+        # Let TeaCache select the model-specific threshold and coefficients.
+        cache_config = {}
 
     profiler_enabled = args.profiler_config is not None
 
@@ -442,22 +583,11 @@ def main():
 
     omni_kwargs = {
         "model": args.model,
-        "enable_layerwise_offload": args.enable_layerwise_offload,
-        "vae_use_slicing": args.vae_use_slicing,
-        "vae_use_tiling": args.vae_use_tiling,
         "cache_backend": args.cache_backend,
         "cache_config": cache_config,
-        "enable_cache_dit_summary": args.enable_cache_dit_summary,
-        "ulysses_degree": args.ulysses_degree,
-        "ring_degree": args.ring_degree,
-        "ulysses_mode": args.ulysses_mode,
-        "cfg_parallel_size": args.cfg_parallel_size,
-        "vae_patch_parallel_size": args.vae_patch_parallel_size,
         "enable_expert_parallel": args.enable_expert_parallel,
         "enable_cpu_offload": args.enable_cpu_offload,
-        "mode": "text-to-image",
         "log_stats": args.log_stats,
-        "enable_diffusion_pipeline_profiler": args.enable_diffusion_pipeline_profiler,
         "profiler_config": args.profiler_config,
         "init_timeout": args.init_timeout,
         "stage_init_timeout": args.stage_init_timeout,
@@ -465,19 +595,39 @@ def main():
         **lora_args,
         **quant_kwargs,
     }
+    # Diffusion-only engine args: pass only when explicitly set, so pipelines
+    # without a DIFFUSION stage pass ownership validation.
     if args.tensor_parallel_size is not None:
         omni_kwargs["tensor_parallel_size"] = args.tensor_parallel_size
     if args.enforce_eager is not None:
         omni_kwargs["enforce_eager"] = args.enforce_eager
+    if args.trust_remote_code:
+        omni_kwargs["trust_remote_code"] = True
     if args.deploy_config:
         omni_kwargs["deploy_config"] = args.deploy_config
-    if use_nextstep:
+    if args.model_class_name:
+        omni_kwargs["model_class_name"] = args.model_class_name
+    elif use_nextstep:
         # NextStep-1.1 requires explicit pipeline class
         omni_kwargs["model_class_name"] = "NextStep11Pipeline"
+    if args.custom_pipeline_args is not None:
+        omni_kwargs["custom_pipeline_args"] = args.custom_pipeline_args
     # Cosmos3 loads its (gated) guardrail models at build time, so the guardrails
     # gate is an engine-level config (offline analog of the server's --no-guardrails).
     if args.extra_body and "guardrails" in args.extra_body:
         omni_kwargs["model_config"] = {"guardrails": bool(args.extra_body["guardrails"])}
+    if args.enable_layerwise_offload:
+        omni_kwargs["enable_layerwise_offload"] = True
+    if args.vae_use_slicing:
+        omni_kwargs["vae_use_slicing"] = True
+    if args.vae_use_tiling:
+        omni_kwargs["vae_use_tiling"] = True
+    if args.enable_cache_dit_summary:
+        omni_kwargs["enable_cache_dit_summary"] = True
+    if args.enable_diffusion_pipeline_profiler:
+        omni_kwargs["enable_diffusion_pipeline_profiler"] = True
+    omni_kwargs.update(build_parallel_knob_kwargs(args))
+
     omni = Omni(**omni_kwargs)
     model_class_name = get_model_class_name(omni)
     declared_extra_body_params = get_extra_body_params(model_class_name)
@@ -496,11 +646,17 @@ def main():
     if ignored_layers:
         print(f"  Ignored layers: {ignored_layers}")
     tp_display = args.tensor_parallel_size if args.tensor_parallel_size is not None else "deploy/default"
+
+    def _knob_display(value: Any, default: Any) -> Any:
+        return value if value is not None else f"deploy/default ({default})"
+
     print(
         f"  Parallel configuration: tensor_parallel_size={tp_display}, "
-        f"ulysses_degree={args.ulysses_degree}, ulysses_mode={args.ulysses_mode}, "
-        f"ring_degree={args.ring_degree}, cfg_parallel_size={args.cfg_parallel_size}, "
-        f"vae_patch_parallel_size={args.vae_patch_parallel_size}, "
+        f"ulysses_degree={_knob_display(args.ulysses_degree, 1)}, "
+        f"ulysses_mode={_knob_display(args.ulysses_mode, 'strict')}, "
+        f"ring_degree={_knob_display(args.ring_degree, 1)}, "
+        f"cfg_parallel_size={_knob_display(args.cfg_parallel_size, 1)}, "
+        f"vae_patch_parallel_size={_knob_display(args.vae_patch_parallel_size, 1)}, "
         f"enable_expert_parallel={args.enable_expert_parallel}."
     )
     print(f"  CPU offload: {args.enable_cpu_offload}; CPU Layerwise Offload: {args.enable_layerwise_offload}")
@@ -509,6 +665,10 @@ def main():
         print(f"  LoRA: scale={args.lora_scale}")
     if args.deploy_config:
         print(f"  deploy-config: {args.deploy_config}")
+    if args.model_class_name:
+        print(f"  Model class name: {args.model_class_name}")
+    if args.custom_pipeline_args is not None:
+        print(f"  Custom pipeline args: {args.custom_pipeline_args}")
     print(f"{'=' * 60}\n")
 
     # Build LoRA request when --lora-path is set
@@ -599,8 +759,44 @@ def main():
             if args.seed is not None and hasattr(params, "seed"):
                 params.seed = args.seed
 
+            # MammothModa2's AR stage emits one visual token per grid cell,
+            # one EOL token per row, and one final look-ahead token whose hidden
+            # state is unavailable. Size the first stage from the prompt metadata
+            # instead of SamplingParams' default of 16 tokens.
+            prompt_info = prompt_dict.get("additional_information", {})
+            if idx == 0 and prompt_info.get("omni_task") == ["t2i"]:
+                ar_width = int(prompt_info.get("ar_width", [0])[0])
+                ar_height = int(prompt_info.get("ar_height", [0])[0])
+                ar_grid_budget = ar_grid_max_tokens(ar_width, ar_height)
+                if ar_grid_budget is not None:
+                    params.max_tokens = ar_grid_budget
+
     if not diffusion_replaced and len(sampling_params_list) == 1:
         sampling_params_list = [diffusion_params]
+
+    # Models with an AR text stage (e.g. HunyuanImage3) declare an
+    # ar_input_builder. When present, build the AR prefill token-ids and AR
+    # stop-token-ids declaratively from the plain prompt + extra_body, so this
+    # example stays model-agnostic. Models without one are untouched.
+    ar_input_builder = get_ar_input_builder(model_class_name)
+    # A model can also be deployed with only its diffusion stage. Keep those
+    # requests on the string-prompt path, as in the single-stage images API.
+    has_ar_stage = any(not isinstance(params, OmniDiffusionSamplingParams) for params in sampling_params_list)
+    if ar_input_builder is not None and has_ar_stage:
+        _apply_ar_stage_inputs(
+            ar_input_builder,
+            model=args.model,
+            prompt_text=args.prompt,
+            extra_body=user_extra,
+            num_images=0,
+            height=args.height,
+            width=args.width,
+            prompt_dict=prompt_dict,
+            sampling_params_list=sampling_params_list,
+            trust_remote_code=args.trust_remote_code,
+            validate_tokenizer=get_ar_tokenizer_validator(model_class_name),
+            allow_tokenizer_fallback=args.allow_tokenizer_fallback,
+        )
 
     outputs = omni.generate(prompt_dict, sampling_params_list=sampling_params_list)
 

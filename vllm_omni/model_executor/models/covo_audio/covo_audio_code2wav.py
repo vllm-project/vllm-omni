@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 # Copyright 2026 Tencent.
 import os
 from collections.abc import Iterable
@@ -25,9 +28,9 @@ class CovoAudioCode2WavForConditionalGeneration(nn.Module, SupportsPP):
         if os.path.isdir(model_name):
             model_path = model_name
         else:
-            from huggingface_hub import snapshot_download
+            from vllm_omni.transformers_utils.repo_utils import hf_api
 
-            model_path = snapshot_download(model_name)
+            model_path = hf_api().snapshot_download(model_name)
         token2wav_path = os.path.join(model_path, "token2wav")
 
         code2wav_config = CovoAudioCode2WavConfig()
@@ -46,7 +49,7 @@ class CovoAudioCode2WavForConditionalGeneration(nn.Module, SupportsPP):
             map_location="cpu",
             weights_only=True,
         )
-        self.decoder.load_state_dict(ckpt)
+        self.decoder.load_state_dict(ckpt, strict=False)
         self.decoder.eval()
         self.infer_config = code2wav_config.inference
         self._decoder_moved = False

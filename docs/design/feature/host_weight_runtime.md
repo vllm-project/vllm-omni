@@ -14,12 +14,12 @@ specified in the [Host Weight Runtime module design](../module/host_weight_runti
 
 ## Status
 
-The first implementation provides contracts and a CPU local-filesystem store.
-The initial diffusion consumer contract additionally defines typed,
+The implementation provides contracts and a CPU local-filesystem store. The
+diffusion consumer additionally defines typed,
 representation-independent final-layout identity/restoration mechanics plus a
-concrete BF16-with-preserved-FP32 policy for MiniMax H3. It remains
-library-only: no loader or DLO path selects, publishes, restores, or transports
-that artifact yet.
+concrete BF16-with-preserved-FP32 policy for MiniMax H3 and
+`black-forest-labs/FLUX.2-klein-4B`. The opt-in no-AllGather DLO integration
+selects, publishes, restores, and transfers these artifacts.
 
 V1 includes:
 
@@ -33,15 +33,19 @@ V1 includes:
 
 V1 does not include:
 
-- a public CLI, loader activation, or default-on model integration;
-- lease handoff to DLO or another transport consumer;
-- FP8, quantized, merged-adaptation, or additional model producers;
-- CUDA registration, pinned staging, H2D scheduling, or GPU kernels;
+- default-on activation or consumers outside no-AllGather DLO;
+- online FP8, quantized, merged-adaptation, or additional model producers;
+- HWR interaction with DLO AllGather;
 - a remote artifact provider or cross-node coordination;
 - automatic eviction; or
-- a change to DLO AllGather or no-AllGather behavior.
+- a change to DLO collective or execution behavior.
 
 ## Motivation and use cases
+
+For investigating CPU memory retained by dependency tensor materialization,
+see the [standalone safetensors diagnostic](https://github.com/vllm-project/vllm-omni/blob/main/benchmarks/host_weight_runtime/README.md).
+It distinguishes repeated dependency calls from reuse of cached views and does
+not establish per-request HWR leakage.
 
 Model loading can create the same final host representation repeatedly. This
 is especially expensive when loading performs checkpoint decoding, tensor
@@ -255,7 +259,8 @@ The contract is intentionally separate from loader activation:
 - `FinalLayoutBF16Producer` accepts only the matching identity context and a
   finalized CPU model. It is `POST_LOAD_ONLY` and `SINGLE_PROCESS` per exact TP
   coordinate. Its BF16 policy preserves model-declared FP32 parameters and
-  buffers and revalidates MiniMax H3 mixed-precision invariants.
+  buffers, revalidates MiniMax H3 mixed-precision invariants, and revalidates
+  FLUX.2-klein's two block stacks, packed QKV mapping, and BF16 base layout.
 
 Other representations reuse source identity, typed parallel identity, tensor
 ownership, and exact restoration only when their policy proves those semantics.
@@ -313,8 +318,15 @@ One process per exact identity owns a build; other workers wait and then acquire
 leases for the published artifact. Publication is invisible until all payloads
 and metadata are validated, hashed, fsynced, and atomically renamed.
 
-`coordination_timeout_seconds` bounds filesystem lock acquisition. It does not
-cancel synchronous validation, a producer that has already started, or atomic
+`coordination_timeout_seconds` bounds domain-initialization and lookup/build
+lock acquisition. Store construction and each later resolution or publication
+operation have separate budgets from the same wait policy, rather than one
+end-to-end startup deadline. A domain-init timeout follows the retryable domain
+failure policy below. After contention ends, a fresh runtime construction can
+retry initialization; the timed-out runtime retains its original failure.
+
+The coordination budget does not cancel filesystem I/O, synchronous validation,
+a producer that has already started, or atomic
 publication. A hung in-process producer therefore blocks its owning process and
 must be handled by external process supervision. Enforceable producer
 cancellation requires a future process-isolated producer contract.

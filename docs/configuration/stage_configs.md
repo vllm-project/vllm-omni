@@ -14,9 +14,10 @@ describe fixed model topology and are not accepted in deploy YAMLs.
 Common `PipelineConfig` fields include:
 
 | Field | Description |
-|-------|-------------|
+| ------- | ------------- |
 | `model_type` | Pipeline identifier used during model and config resolution. |
 | `default_deploy_config_name` | Bundled deploy YAML loaded when the user does not pass `deploy_config`. |
+| `duplex_plugin` | Dotted path of the model's `DuplexModelPlugin`. Set only for full-duplex models; it makes `vllm-omni serve` run the model through `DuplexOmni` (a server whose every surface runs on a duplex session) and the engine host a `DuplexOrchestrator` with the plugin loaded. |
 | `model_arch` | Default Hugging Face architecture for the pipeline. |
 | `hf_architectures` | Architecture names used to identify checkpoints whose `model_type` is shared. |
 | `hf_config_predicate` | Optional predicate used to select between pipelines with otherwise identical HF metadata. |
@@ -26,7 +27,7 @@ Common `PipelineConfig` fields include:
 Common `StagePipelineConfig` fields include:
 
 | Field | Description |
-|-------|-------------|
+| ------- | ------------- |
 | `stage_id` | Stable stage identifier. |
 | `model_stage` | Logical stage name used by runtime and strategy resolution. |
 | `execution_type` | `LLM_AR`, `LLM_GENERATION`, or `DIFFUSION`. |
@@ -34,32 +35,76 @@ Common `StagePipelineConfig` fields include:
 | `final_output` / `final_output_type` | Whether the stage produces a user-visible output and its modality. |
 | `owns_tokenizer` | Whether this stage owns the pipeline tokenizer. |
 | `model_arch`, `hf_config_name` | Stage-specific model architecture and nested HF config selector. |
-| `engine_output_type` | Runtime output representation such as `text`, `latent`, or `audio`. |
+| `engine_output_type` | Canonical runtime output type: `text`, `image`, `audio`, `latent`, or `token_ids`. |
 | `custom_process_input_func` | Processor applied to this stage's incoming payload. |
 | `custom_process_next_stage_input_func` | Processor used for full-payload handoff to the next stage. |
 | `async_chunk_process_next_stage_input_func` | Processor used for async chunk handoff. |
-| `sampling_constraints` | Model-owned sampling constraints that deploy defaults cannot override. |
+| `sampling_constraints` | Model-owned sampling constraints that deploy defaults cannot override. Scalar values replace deploy defaults; required `stop_token_ids` extend and deduplicate them. |
 
 To add or change topology, define and register a new pipeline variant. Use
 deploy YAML only for runtime placement, resource sizing, connectors, and other
 deployment overrides.
+
+### Engine output types
+
+`engine_output_type` is parsed when the LLM stage's output processor is built
+during service initialization. Invalid values fail startup before requests
+are accepted; engine replicas may already have been initialized at that point
+and are cleaned up on failure.
+
+Use the exact lowercase names listed above. Combinations such as `text+audio`
+or `text,audio` remain supported, with every component canonical. Omitted or
+`None` values retain the default behavior (`TEXT` in the output processor).
+Empty strings, whitespace, case variants, and aliases are rejected.
+
+For existing custom pipelines or direct callers, replace old aliases explicitly:
+
+| Old value | Canonical value |
+| ------- | ------- |
+| `speech`, `wav`, `waveform` | `audio` |
+| `images`, `pixel_values`, `pixels` | `image` |
+| `latents` | `latent` |
+| `tokens` | `text` for text output, or `token_ids` for discrete IDs |
+
+`token_ids` is a separate type, not a `text` alias. It describes discrete
+vocabulary or codebook indices, distinct from continuous latent representations.
+Existing models using `latent` retain their historical payload contracts.
+GLM-Image's AR stage keeps `engine_output_type="token_ids"`; generated IDs still
+travel through `cumulative_token_ids`, and source-image IDs through
+`ids.prior_image`.
+
+Bare primary tensors and generic producer keys (`model_outputs` or `hidden`)
+use the declared type as their default output key, including `token_ids`.
+The normalizer does not inspect or convert their dtype. Distinct auxiliary
+outputs must use explicit field names: `model_outputs` and `hidden` both map
+to the same default key and must not represent two independent outputs.
+GLM-Image disables auxiliary hidden output for its default GPU execution.
+Some runner paths still attach it; that field is then named `token_ids` even
+though it contains hidden states. The GLM-Image bridge ignores this auxiliary
+field and reads generated IDs from `cumulative_token_ids` instead.
+
+Token-ID tensors use the existing dimension-0 accumulation default, subject to
+registered per-key overrides, and remain available after DELTA emissions.
+This is separate from the existing accumulation of `cumulative_token_ids`.
+`final_output_type` and Diffusion's `output_type` are separate settings and are
+unchanged by these rules.
 
 ## Deploy configuration schema
 
 The new deploy schema lives under `vllm_omni/deploy/` and is paired with a frozen `PipelineConfig` registered by the model's `pipeline.py`. Each deploy YAML has these top-level fields:
 
 | Field | Type | Required | Default | Description |
-|-------|------|----------|---------|-------------|
+| ------- | ------ | ---------- | --------- | ------------- |
 | `base_config` | str (path) | optional | — | Overlay parent (relative or absolute). `stages:` / `platforms:` deep-merged by stage_id; other scalars overlay-wins. Intended for user-authored overlays; prod yamls stay flat. |
 | `async_chunk` | bool | optional | `true` | Enable chunked streaming between stages. Pin to `false` if the pipeline runs end-to-end. |
-| `session_mode` | str | optional | `"turn"` | Session behavior. Use `"duplex"` only with a pipeline that enables duplex control. |
+| `session_mode` | str | optional | `"turn"` | Session behavior. For pipelines with a `duplex_plugin`, explicitly select `"duplex"` for the duplex engine or `"turn"` for the ordinary online serving stack. The shipped MiniCPM-o 4.5 default remains `"duplex"`. See [Full Duplex](../serving/full_duplex_api.md#enable-full-duplex). |
 | `active_stream_window` | int | optional | `0` | Number of active downstream stream slots; `0` preserves all-stream cycling. |
 | `duplex_session` | dict | optional | runtime defaults | Full-duplex session lifecycle, buffering, replay, and capacity limits. |
 | `connectors` | dict | optional | `null` | Named connector specs (`{name, extra}`). Referenced by each stage's `input_connectors` / `output_connectors`. See [Connector schema](#connector-schema). |
 | `edges` | list | optional | `null` | Explicit edge list for the KV transfer graph. Auto-derived from stage inputs if omitted. |
 | `stages` | list | optional | `[]` | Per-stage runtime overrides matched by `stage_id`. Pipeline stages are still created from `PipelineConfig` when this list is empty. |
 | `platforms` | dict | optional | `null` | Keyed by `npu` / `rocm` / `xpu`, each contains a `stages:` list with per-platform overrides applied on top of the CUDA defaults. |
-| `pipeline` | str | optional | `null` | Override the auto-detected pipeline registry key (used for structural variants like `qwen2_5_omni_thinker_only`). |
+| `pipeline` | str | optional | `null` | Override the auto-detected pipeline registry key (used for structural variants like `qwen2_5_omni_thinker_only` / `qwen3_omni_moe_thinker_only`). |
 | `trust_remote_code` | bool \| null | optional | `null` | **Pipeline-wide.** Trust HF remote code on model load; applies to every stage when specified. |
 | `distributed_executor_backend` | str \| null | optional | `null` | **Pipeline-wide.** Distributed executor backend forwarded to vLLM (`"mp"`, `"ray"`, `"external_launcher"`). If omitted, vLLM auto-selects backend from runtime topology. |
 | `dtype` | str \| null | optional | `null` | **Pipeline-wide.** Model dtype for every stage. |
@@ -77,14 +122,64 @@ explicit CLI or stage override, or the downstream vLLM engine default.
 Note: for the diffusion path, an omitted `distributed_executor_backend` selects
 `uni` on a single GPU (in-process worker, no MessageQueue / `/dev/shm` output
 segments) and `mp` when `num_gpus > 1`. Set `mp` explicitly to keep a worker
-subprocess on one GPU. `ray` / `external_launcher` are not fully supported yet.
+subprocess on one GPU. Set `ray` for Ray-managed single- or multi-node
+diffusion workers. `external_launcher` is not supported yet.
+
+The diffusion `ray` backend runs one worker actor per GPU and supports workers
+spanning Ray nodes. Enable it in the deploy YAML:
+
+```yaml
+distributed_executor_backend: ray
+```
+
+The executor reuses Ray when already initialized; otherwise it calls
+`ray.init()`, which handles cluster discovery or local startup and respects
+`RAY_ADDRESS`. There is no diffusion-specific address setting. Ray must be
+installed on every node.
+
+Ray diffusion workers receive the driver's `VLLM_*`, `OMNI_*`, `DIFFUSION_*`,
+`NCCL_*`, `TORCH_NCCL_*`, `UCX_*`, and Hugging Face environment settings,
+plus `PYTHONPATH`, `CUDA_LAUNCH_BLOCKING`, and `OMP_NUM_THREADS`.
+Explicit stage `runtime.env` entries are also forwarded and take precedence.
+Device visibility, rank/rendezvous settings, worker host addresses, and `RAY_*`
+variables are excluded so each worker retains its own assignment and identity.
+
+For multiple nodes, start the cluster before launching Omni. For example,
+with head IP `10.0.0.1`:
+
+```bash
+# On the head node:
+ray start --head --node-ip-address=10.0.0.1 --port=6379
+
+# On each additional worker node:
+ray start --address=10.0.0.1:6379
+
+# On the host launching Omni (MODEL and my_deploy.yaml are placeholders):
+RAY_ADDRESS=10.0.0.1:6379 vllm serve MODEL --omni --deploy-config my_deploy.yaml
+```
+
+Omni creates actors on the resources of that cluster; it does not start Ray
+on additional machines.
+
+### Stage-level runner selection
+
+`model_runner: v1` or `v2` at the deploy level sets the default runner.
+A `model_runner` on an individual stage overrides that default, allowing
+one stage to migrate or roll back independently. This does not change
+`PipelineConfig` topology, input adapters, or the connector payload contract.
+An omitted stage override preserves the deploy-level selection.
+
+MRv2 native downstream receivers currently support turn-based requests only;
+streaming sessions and resumable input require the V1 prompt-replacement path.
+Selecting a runner does not add the session capabilities it lacks. Platform
+fallbacks and stage overrides are validated after configuration resolution.
 
 ### Stage fields
 
 Each entry under `stages:` accepts any `StageDeployConfig` field directly (no nested `engine_args:`). Only fields whose value legitimately varies across stages live here; pipeline-wide settings (trust_remote_code, distributed_executor_backend, dtype, quantization, prefix/chunked prefill, DP/PP sizes) are declared at the top level and applied to every stage. Unknown keys fall through to `engine_extras:` and are forwarded to the engine. Frequently used fields are listed below; the source-of-truth schema is `StageDeployConfig` in `vllm_omni/config/stage_config.py`.
 
 | Field | Type | Required | Default | Description |
-|-------|------|----------|---------|-------------|
+| ------- | ------ | ---------- | --------- | ------------- |
 | `stage_id` | int | required | — | Stage identity; matched against `PipelineConfig.stages[*].stage_id`. |
 | `max_num_seqs` | int \| null | optional | `null` | Max concurrent sequences per stage. |
 | `gpu_memory_utilization` | float \| null | optional | `null` | Per-stage total memory target; used for automatic KV-cache sizing. |
@@ -94,11 +189,13 @@ Each entry under `stages:` accepts any `StageDeployConfig` field directly (no ne
 | `max_num_batched_tokens` | int \| null | optional | `null` | Per-stage prefill/token budget; also contributes to the native maximum in-flight token limit. |
 | `max_model_len` | int \| null | optional | `null` | Per-sequence context or KV length; `-1` enables native cache-capacity auto-fitting, while values above the HF default auto-set `VLLM_ALLOW_LONG_MAX_MODEL_LEN=1`. |
 | `async_scheduling` | bool \| null | optional | `null` | Per-stage async scheduling toggle. |
-| `devices` | str \| null | optional | `null` | Device list assigned to this stage. |
+| `devices` | str \| null | optional | `null` | Device list assigned to this stage. The number of device ids must equal this stage's local world size (`tensor_parallel_size` × local data-parallel size × `pipeline_parallel_size`, or `num_replicas` × that product for a replica pool); a mismatch fails early — see the note below. |
 | `output_connectors` | dict \| null | optional | `null` | Keyed by `to_stage_<n>`; values are names registered under top-level `connectors:`. |
 | `input_connectors` | dict \| null | optional | `null` | Keyed by `from_stage_<n>`; values are names registered under top-level `connectors:`. |
-| `default_sampling_params` | dict \| null | optional | `null` | Baseline sampling params. Deep-merged with pipeline `sampling_constraints` (pipeline wins). |
+| `default_sampling_params` | dict \| null | optional | `null` | Baseline sampling params. Merged with pipeline `sampling_constraints`; scalar constraints win, while required `stop_token_ids` are appended and deduplicated. |
 | `engine_extras` | dict | optional | `{}` | Catch-all for engine fields not listed above; deep-merged across overlays and forwarded to the stage engine. |
+
+**Note:** a stage's `devices` count must equal its local world size (`tensor_parallel_size` × `data_parallel_size_local` × `pipeline_parallel_size`, falling back to global `data_parallel_size` when the local size is unset), or `num_replicas` × that product for a replica pool. A mismatch fails early and names the offending stage. A top-level `--tensor-parallel-size` is broadcast to every stage, so it can make a single-GPU stage violate this contract ([issue #5003](gh-issue:5003)); fix that case with `--stage-overrides` (set `tensor_parallel_size` and `devices` together per stage) or set TP only on the multi-GPU stage.
 
 ### Connector schema
 
@@ -113,9 +210,9 @@ connectors:
       # Additional connector-specific options
 ```
 
-| Connector class | Use case | `extra` keys |
-|-----------------|----------|--------------|
-| `SharedMemoryConnector` | Same-host KV transfer between stages (default for bundled YAMLs). | None. All payloads use shared memory. |
+| Connector class          | Use case                                                              | `extra` keys                                                                                                      |
+|--------------------------|-----------------------------------------------------------------------|-------------------------------------------------------------------------------------------------------------------|
+| `SharedMemoryConnector`  | Same-host KV transfer between stages (default for bundled YAMLs).     | None. All payloads use shared memory.                                                                             |
 | `MooncakeStoreConnector` | Cross-host KV transfer over TCP. Required for multi-node deployments. | `host`, `metadata_server`, `master`, `segment` (int bytes), `localbuf` (int bytes), `proto` (`"tcp"` / `"rdma"`). |
 
 A stage references a connector by name in its `input_connectors` / `output_connectors`:
@@ -135,7 +232,7 @@ stages:
 ### CLI flags
 
 | Flag | Description |
-|------|-------------|
+| ------ | ------------- |
 | `--deploy-config PATH` | Load a deploy YAML. **Optional** — when omitted, the bundled `vllm_omni/deploy/<model_type>.yaml` is auto-loaded by the model registry. |
 | `--stage-overrides JSON` | Per-stage JSON overrides, e.g. `'{"0":{"gpu_memory_utilization":0.5}}'`. Per-stage values always win over global flags. |
 | `--async-chunk` / `--no-async-chunk` | Flip the deploy YAML's `async_chunk:` bool. Unset (default) leaves the YAML value in force. |
@@ -249,7 +346,7 @@ CUDA_VISIBLE_DEVICES=0 vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni \
 Effective config per stage after the merge:
 
 | Stage | Field | Final value | Source |
-|-------|-------|-------------|--------|
+| ------- | ------- | ------------- | -------- |
 | 0 | `gpu_memory_utilization` | `0.9` | base YAML (overlay didn't touch stage 0) |
 | 0 | `max_num_seqs` | `8` | per-stage CLI (`--stage-overrides`) — wins over base `32` |
 | 0 | `max_model_len` | `16384` | global CLI |
@@ -273,15 +370,275 @@ when loading a deploy configuration.
 Examples:
 
 For offline inference (assuming the necessary dependencies have been imported):
+
 ```python
 model_name = "Qwen/Qwen2.5-Omni-7B"
 omni = Omni(model=model_name, deploy_config="/path/to/deploy_config.yaml")
 ```
 
 For online serving:
+
 ```bash
 vllm serve Qwen/Qwen2.5-Omni-7B --omni --port 8091 --deploy-config /path/to/deploy_config.yaml
 ```
 
 !!! important
     We are actively iterating on the definition of deployment configurations, and we welcome feedback from users and developers.
+
+## Qwen3-TTS with Model Runner V2
+
+Qwen3-TTS runs the native CUDA Model Runner V2 pipeline by default on vLLM
+0.29.0. MRV2 is an experimental feature for this model: the bundled default
+profile selects it on CUDA only, and its scheduler and delivery paths are
+still being qualified. Set `model_runner: v1` in a copy of the deploy config
+to opt out; the `platforms:` sections of `qwen3_tts.yaml` keep V1 on NPU, XPU,
+ROCm and MUSA. Select one of these deployment profiles:
+
+| Profile | Runner | Code2Wav graph batches | Intended use |
+| --- | --- | --- | --- |
+| `qwen3_tts.yaml` | V2 (default) | Existing defaults | Shipped default; experimental |
+| `qwen3_tts_mrv2.yaml` | V2 | B1 | Explicit MRV2 profile (same runner selection as the default) |
+| `qwen3_tts_high_concurrency_mrv2.yaml` | V2 | B1, B2 | Opt-in throughput tuning |
+| `qwen3_tts_high_concurrency_mrv2_b4.yaml` | V2 | B1, B2, B3, B4 | Experimental throughput / buffered playback |
+| `qwen3_tts_high_concurrency_mrv2_single_gpu.yaml` | V2 | B1–B8 | Experimental two-stage deployment on one GPU, with MPS |
+| `qwen3_tts_high_concurrency.yaml` | V1 | Existing defaults | V1 high-concurrency control |
+| `qwen3_tts_fused_single_gpu.yaml` | V2 | N/A (in-Talker decoder) | Opt-in single-stage CUDA pipeline on one GPU |
+
+```bash
+# MRV2 is the default; pass a copy with `model_runner: v1` to force V1.
+vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-Base --omni \
+  --deploy-config /path/to/qwen3_tts_v1.yaml
+```
+
+The V2 profiles bound Talker prefill to 512 tokens per step and select the
+Talker AR runner and the Code2Wav generation
+runner together. Native inter-stage delivery carries codec payloads directly;
+request-owned snapshots preserve buffers through asynchronous completion and
+CUDA graph reuse. Terminal completion waits for upstream stage metrics before
+releasing request state. Platform sections retain V1 on NPU, XPU, ROCm and MUSA;
+this change does not qualify MRV2 on those backends or enable other model families.
+Selecting V2 for a stage without `supports_native_mrv2_data_plane` emits a warning
+when pipeline and deployment settings are merged. That stage retains the legacy
+transport path; the warning does not establish support for that combination.
+
+MRV2 model hooks use capability declarations rather than architecture or stage
+names. Omni lifecycle flags select the model state, and `_returns_tuple` declares
+the capture output contract. The optional batched predictor hook is `mtp`, with
+an explicit `mtp_output_key` (a string or two-part payload key), optional
+`mtp_validity_key`, and `mtp_graph_safe`/`mtp_disable_graph` capture controls.
+Its inputs are token IDs, embeddings, previous hidden states and per-row
+conditioning; it returns updated embeddings and prediction codes. Models may
+supply `mtp_sampling_params` and `get_mtp_seed(sampling_params)` for model-local explicit seeds, and declare
+`mtp_accepts_per_row_generators`, `mtp_accepts_req_infos`, or `mtp_sample_uniforms`
+(with `mtp_sample_steps` and `mtp_sample_vocab_size`) as needed. Qwen3-TTS retains
+its existing `talker_mtp` entry point for V1.
+
+### Selecting one or two Qwen3-TTS stages
+
+Choose the deployment profile explicitly with `--deploy-config`. The default
+`qwen3_tts` pipeline retains two stages: the Talker publishes codec chunks to
+Code2Wav, which produces audio. Its stage devices can be placed on the same
+GPU or on separate GPUs. `qwen3_tts_fused` is a separate, opt-in pipeline for
+one CUDA GPU: the Talker owns the stateful codec decoder and emits PCM directly,
+without a Code2Wav engine or stage connector.
+
+```bash
+# Two stages on one GPU; the two-stage pipeline remains independently selectable.
+vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice --omni \
+  --deploy-config vllm_omni/deploy/qwen3_tts_high_concurrency_mrv2_single_gpu.yaml
+
+# One stage on one GPU; no inter-stage transport or Code2Wav scheduling.
+vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice --omni \
+  --deploy-config vllm_omni/deploy/qwen3_tts_fused_single_gpu.yaml
+```
+
+The single-stage profile requires CUDA, V2, asynchronous chunks, TP=PP=1,
+an in-process worker and disabled prefix caching. Select the full profile;
+adding `talker_stream_decode: true` to a two-stage Talker is rejected because
+its latent output belongs to the Code2Wav input contract. Single-stage options
+live in `stages[].additional_config`; two-stage transport and first-frame
+options live in `connectors.*.extra`.
+
+The single-stage profile defaults `talker_stream_first_audio` to `false` for
+throughput. To opt into a separate first-frame delivery queue, save this
+overlay beside the bundled deployment files and pass its path to
+`--deploy-config`:
+
+```yaml
+base_config: qwen3_tts_fused_single_gpu.yaml
+stages:
+  - stage_id: 0
+    additional_config:
+      talker_stream_decode: true
+      talker_stream_first_audio: true
+      ref_code_context_frames: 72
+      code_predictor_kv_cache: true
+      code_predictor_fused_sampling: true
+      code_predictor_fused: true
+```
+
+This queue uses PCM from the single-stage decoder. The two-stage
+`talker_first_audio` option below uses its own first-frame decoder and does
+not require single-stage execution. The two options cannot be enabled
+together. Single-stage prefix-cache reset with
+`reset_running_requests=True` returns `False` while requests are active;
+wait for completion or abort them before retrying.
+
+Reference-cloning context is selected independently by each profile. The
+single-stage profile explicitly uses 72 reference frames, matching the
+`qwen3_tts.yaml` context boundary. A shorter
+`additional_config.ref_code_context_frames` (for example 25) can change
+timbre continuity even when WER is similar;
+the throughput measurements for CustomVoice do not qualify Base voice
+cloning quality. Reference layout, grouping and priming are model hooks;
+the shared worker does not select Qwen's context length or codebook layout.
+
+### Qwen3-TTS first-frame delivery and rollback
+
+The standard `qwen3_tts.yaml`, `qwen3_tts_high_concurrency.yaml`,
+`qwen3_tts_mrv2.yaml` and `qwen3_tts_high_concurrency_mrv2.yaml` profiles
+enable the `talker_first_audio` connector option, as does the experimental
+two-stage `qwen3_tts_high_concurrency_mrv2_single_gpu.yaml` profile.
+This changes the default CUDA MRV2 streaming path:
+residual prediction runs eagerly after the Talker sample, the Talker loads
+an additional first-frame decoder with its weights and CUDA graphs, and the
+orchestrator orders its audio before subsequent Code2Wav chunks.
+
+Code2Wav retains full-audio prefix graphs alongside the optional state-only
+graphs. Each request's delivery marker selects the graph and audio trimming;
+enabling the option alone never suppresses audio or disables prefix batching
+for requests that retain regular codec delivery.
+
+The path requires asynchronous chunks, TP/PP 1, an in-process executor and
+disabled prefix caching. Requests with reference codes and unsupported
+runners or platforms retain regular Code2Wav delivery.
+
+To restore regular codec delivery and avoid loading the Talker's additional
+decoder, use a deploy overlay with the relevant base profile:
+
+```yaml
+base_config: qwen3_tts.yaml
+connectors:
+  connector_of_shared_memory:
+    extra:
+      talker_first_audio: false
+```
+
+First-packet latency measures when PCM starts arriving. Time to first audible
+audio (TTFA) also includes any leading silence in the generated audio. An
+earlier first packet therefore does not necessarily improve TTFA; measure
+both for the intended voice and workload.
+
+### Included performance work
+
+- Request snapshots have a fast path for immutable scalar leaves, including
+  waveform lists. Mutable containers, aliases and cycles keep deep-copy
+  semantics. This is not the historical shallow `dict(prompt)` experiment.
+- The API reference cache holds owned float32 arrays with a default capacity
+  of 1024 entries and a 512 MiB waveform-payload budget. Cache hits return
+  independent lists. Qwen3-TTS model artifact caches also default to 1024
+  entries. These caches have different owners and eviction policies; equal
+  entry limits do not make them a single coherent cache.
+- Talker state stays on GPU where its lifecycle allows it. BOS/EOS projections
+  are cached in their projection dtype and invalidated on weight loading.
+- Code2Wav packs CPU codec inputs before device transfer. Optional B2/B4 graph
+  buckets batch compatible requests without sharing their per-request state.
+- Native output materialization runs in a bounded worker and drains before
+  closing the data plane. The existing control-only shortcut avoids launching
+  model work for a step that has only lifecycle events.
+
+MTP prefix re-prefill remains disabled in the high-concurrency V2 profile.
+Adding more graph shapes increases compilation cost and has not established a
+stable end-to-end gain for this extracted version.
+
+### Decoder batches and playback
+
+Changing `decode_cudagraph_batch_sizes` selects the captured batch buckets.
+Keep `decode_batch_max_size` consistent with the intended maximum too; the
+stateful graph path currently groups according to the captured buckets, while
+the stateless path also uses the explicit maximum.
+
+B4 remains experimental. First-packet latency alone does not establish
+uninterrupted playback. Validate inter-chunk arrival times, buffering, WER and
+speaker similarity before adopting either batching preset for a production
+workload. Floating-point decoder outputs can differ across batch sizes; this PR
+does not claim bitwise or quality equivalence.
+
+### Experimental MPS deployment
+
+NVIDIA MPS lets colocated CUDA stage processes share GPU execution resources.
+It is disabled by default. The experimental
+`qwen3_tts_high_concurrency_mrv2_single_gpu.yaml` profile sets `cuda_mps: true`,
+alongside cached residual prediction, fused sampling, time-major codec
+convolutions, first-frame delivery, and larger graph batches.
+
+The runtime requires `nvidia-cuda-mps-control` on `PATH` and one explicit CUDA
+GPU per local EngineCore stage, with `parallel_stage_init: false`.
+Use numeric GPU ordinals for stage placement and visibility so initialization
+locks identify the physical GPU before MPS remaps it. It starts a private MPS daemon for each selected
+GPU and stops its own daemon after the stages exit. If
+`CUDA_MPS_PIPE_DIRECTORY` already names an operator-managed daemon, the runtime
+reuses it without stopping it. Diffusion and remote stages are unsupported.
+Set `cuda_mps: false` in a deploy overlay to disable automatic MPS management.
+
+Stage `env.CUDA_MPS_PIPE_DIRECTORY` overrides the parent setting when selecting
+the daemon; an explicit empty string selects a private daemon. Stages sharing
+a GPU reuse the first stage's daemon. Later stages may omit the setting or
+explicitly match that policy; a conflicting explicit setting fails before
+that stage starts. The parent environment is unchanged.
+
+MPS can improve throughput under concurrent load while increasing first-packet
+or first-audible-audio latency, particularly at low request rates. For a
+latency-sensitive workload, compare the same profile with `cuda_mps: false`.
+An inherited operator-managed MPS daemon must also be disabled by its owner
+for that comparison; this switch only controls automatic MPS management.
+
+MPS does not reserve a GPU. Use only assigned GPUs, explicitly place stages on
+the intended GPU, and warm the complete pipeline before measuring performance.
+
+## MOSS-TTS Local 1.5 with Model Runner V2
+
+`OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5` can opt into CUDA MRV2 using
+the shared runtime introduced for Qwen3-TTS:
+
+```bash
+vllm serve OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5 --omni \
+  --deploy-config vllm_omni/deploy/moss_tts_local_mrv2.yaml
+```
+
+This profile inherits the batching, codec graph buckets and 1-frame/15-frame
+chunk geometry from `moss_tts_local.yaml`, and selects V2 for both the Local
+Talker and codec stages. The Local depth predictor exposes the MRV2 `mtp`
+capabilities while retaining its V1 `talker_mtp` implementation, sampling
+defaults and explicit request-seed handling. Codec chunks use the native data
+plane; the internal Talker retains its final-only orchestrator output policy.
+
+On CUDA, the profile bounds stage-0 prefill work to 512 tokens per iteration.
+The codec retains its own CUDA Graph capture/replay, including batch buckets
+through 64, but disables Inductor compilation (`compilation_config.mode: 0`)
+of the stateful decoder to avoid lengthy compilation at startup. This is
+independent of `enforce_eager`; the profile keeps `enforce_eager: false`.
+It explicitly selects `cudagraph_mode: FULL`, which works without Inductor;
+the default `FULL_AND_PIECEWISE` would otherwise normalize to `NONE` and clear
+the codec's capture buckets when compilation is disabled.
+
+For sustained C128 serving on a large-memory CUDA GPU, select the
+separate `moss_tts_local_mrv2_high_concurrency.yaml` profile. It uses 128
+stream slots per stage, a 32 GiB Talker KV budget, and the codec's
+`triton_slot` backend with Inductor compilation and codec-owned CUDA graphs.
+The bounded KV budget leaves room for codec state and graphs; it does not
+guarantee that 128 maximum-length prompts fit simultaneously. See the
+[MOSS recipe](gh-file:recipes/OpenMOSS/MOSS-TTS.md#local-15-mrv2-and-slot-attention)
+for activation, backend comparisons, memory requirements and benchmark commands.
+
+Omitting `--deploy-config`, or selecting `moss_tts_local.yaml`, retains V1.
+NPU, XPU, ROCm and MUSA overrides also retain V1. This profile does not enable
+MRV2 for MOSS Delay, Realtime or Nano. Local 1.5 outputs 48 kHz stereo audio;
+set `VLLM_OMNI_BENCH_AUDIO_SAMPLE_RATE=48000` and
+`VLLM_OMNI_BENCH_AUDIO_CHANNELS=2` when benchmarking raw PCM.
+
+Event-driven orchestration remains independently selectable with
+`VLLM_OMNI_EVENT_DRIVEN_ORCH=0` or `1`. Keep the runner and deployment identical
+when comparing these modes. Model-runner selection does not change the
+orchestration default or enable experimental reference encoding, chunk ramps,
+generation-output draining or MPS.

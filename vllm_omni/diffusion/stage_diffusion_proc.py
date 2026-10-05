@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Subprocess entry point for the diffusion engine.
 
 StageDiffusionProc runs DiffusionEngine in a child process,
@@ -10,7 +13,7 @@ import asyncio
 import contextlib
 import multiprocessing.connection
 import signal
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Awaitable, Callable
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
@@ -22,10 +25,18 @@ from vllm.logger import init_logger
 from vllm.utils.network_utils import get_open_zmq_ipc_path, zmq_socket_ctx
 from vllm.utils.system_utils import get_mp_context
 from vllm.v1.engine.core import EngineCoreProc
-from vllm.v1.engine.utils import CoreEngine, EngineZmqAddresses, wait_for_engine_startup
+from vllm.v1.engine.utils import (
+    CoreEngine,
+    CoreEngineLaunch,
+    EngineZmqAddresses,
+    wait_for_engine_startup,
+)
 from vllm.v1.utils import shutdown
 
-from vllm_omni.diffusion.data import DiffusionRequestAbortedError
+from vllm_omni.diffusion.data import (
+    DiffusionRequestAbortedError,
+    is_diffusion_request_started_output,
+)
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.distributed.omni_connectors.utils.serialization import (
@@ -36,6 +47,7 @@ from vllm_omni.distributed.omni_coordinator import OmniCoordClientForStage
 from vllm_omni.engine.stage_init_utils import set_death_signal
 from vllm_omni.errors import client_error_metadata
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+from vllm_omni.metrics.utils import diffusion_exception_metrics
 from vllm_omni.outputs import OmniRequestOutput
 
 if TYPE_CHECKING:
@@ -118,6 +130,25 @@ class StageDiffusionProc:
         )
         self._fatal_event.set()
 
+    def _watch_executor_failure(self, loop: asyncio.AbstractEventLoop) -> None:
+        """Tear down when the executor fails between requests.
+
+        Executor monitors fire failure callbacks from their own threads, so
+        the signal is marshalled onto ``run_loop``'s event loop.
+        """
+        executor: DiffusionExecutor | None = getattr(self._engine, "executor", None)
+        if executor is None:
+            return
+
+        def _on_executor_failure() -> None:
+            # The loop is closed once run_loop has exited; nothing to signal.
+            with contextlib.suppress(RuntimeError):
+                loop.call_soon_threadsafe(self._signal_fatal_engine_failure, "diffusion executor failed")
+
+        executor.register_failure_callback(_on_executor_failure)
+        if executor.is_dead:
+            self._signal_fatal_engine_failure("diffusion executor failed before run_loop started")
+
     # ------------------------------------------------------------------
     # Initialization
     # ------------------------------------------------------------------
@@ -154,6 +185,9 @@ class StageDiffusionProc:
         prompt: Any,
         sampling_params_dict: dict,
         kv_sender_info: dict[str, Any] | None = None,
+        on_request_started: Callable[[OmniRequestOutput], Awaitable[None]] | None = None,
+        kv_transfer_params: dict[str, Any] | None = None,
+        payload_sender_info: dict[str, Any] | None = None,
     ) -> OmniRequestOutput:
         """Build a diffusion request and consume DiffusionEngine.step_streaming() to completion."""
         sampling_params = self._reconstruct_sampling_params(sampling_params_dict)
@@ -163,13 +197,21 @@ class StageDiffusionProc:
             sampling_params=sampling_params,
             request_id=request_id,
             kv_sender_info=kv_sender_info,
+            kv_transfer_params=kv_transfer_params,
+            payload_sender_info=payload_sender_info,
         )
 
         # Non-streaming callers share the streaming engine path but only
         # return the final output.
         result = None
         async for results in self._engine.step_streaming(request):
-            result = results[0]
+            output = results[0]
+            if is_diffusion_request_started_output(output) and on_request_started is not None:
+                if not output.request_id:
+                    output.request_id = request_id
+                await on_request_started(output)
+                continue
+            result = output
         if result is None:
             raise RuntimeError("Diffusion execution finished without output.")
         if not result.request_id:
@@ -182,6 +224,8 @@ class StageDiffusionProc:
         prompt: Any,
         sampling_params_dict: dict,
         kv_sender_info: dict[str, Any] | None = None,
+        kv_transfer_params: dict[str, Any] | None = None,
+        payload_sender_info: dict[str, Any] | None = None,
     ) -> AsyncGenerator[OmniRequestOutput, None]:
         """Process a streaming diffusion request and yield the results from DiffusionEngine.step_streaming()."""
         sampling_params = self._reconstruct_sampling_params(sampling_params_dict)
@@ -191,6 +235,8 @@ class StageDiffusionProc:
             sampling_params=sampling_params,
             request_id=request_id,
             kv_sender_info=kv_sender_info,
+            kv_transfer_params=kv_transfer_params,
+            payload_sender_info=payload_sender_info,
         )
 
         async for results in self._engine.step_streaming(request):  # pyright: ignore[reportOptionalMemberAccess]
@@ -330,21 +376,31 @@ class StageDiffusionProc:
         # "DiffusionExecutor is closed" on every subsequent request.
         fatal_event = asyncio.Event()
         self._fatal_event = fatal_event
+        self._watch_executor_failure(asyncio.get_running_loop())
 
         async def _dispatch_request(
             request_id: str,
             prompt: Any,
             sampling_params_dict: dict,
             kv_sender_info: dict[str, Any] | None = None,
+            kv_transfer_params: dict[str, Any] | None = None,
+            payload_sender_info: dict[str, Any] | None = None,
         ) -> None:
             """Process a single diffusion request and send the response."""
             try:
                 if not self._od_config.streaming_output:
+
+                    async def _send_request_started(output: OmniRequestOutput) -> None:
+                        await response_socket.send(encoder.encode({"type": "result", "output": output}))
+
                     result = await self._process_request(
                         request_id,
                         prompt,
                         sampling_params_dict,
                         kv_sender_info=kv_sender_info,
+                        on_request_started=_send_request_started,
+                        kv_transfer_params=kv_transfer_params,
+                        payload_sender_info=payload_sender_info,
                     )
                     await response_socket.send(encoder.encode({"type": "result", "output": result}))
                 else:
@@ -353,6 +409,8 @@ class StageDiffusionProc:
                         prompt,
                         sampling_params_dict,
                         kv_sender_info=kv_sender_info,
+                        kv_transfer_params=kv_transfer_params,
+                        payload_sender_info=payload_sender_info,
                     ):
                         await response_socket.send(encoder.encode({"type": "result", "output": result}))
             except DiffusionRequestAbortedError as e:
@@ -361,6 +419,16 @@ class StageDiffusionProc:
                     request_id,
                     str(e),
                 )
+                metrics = diffusion_exception_metrics(e)
+                if metrics:
+                    await response_socket.send(
+                        encoder.encode(
+                            {
+                                "type": "metrics",
+                                "metrics": metrics,
+                            }
+                        )
+                    )
             except Exception as e:
                 logger.exception("Diffusion request %s failed: %s", request_id, e)
                 status_code, error_type = client_error_metadata(e)
@@ -372,6 +440,7 @@ class StageDiffusionProc:
                             "error": str(e),
                             "status_code": status_code,
                             "error_type": error_type,
+                            "metrics": diffusion_exception_metrics(e),
                         }
                     )
                 )
@@ -420,15 +489,16 @@ class StageDiffusionProc:
                             msg["prompt"],
                             msg["sampling_params"],
                             msg.get("kv_sender_info"),
+                            kv_transfer_params=msg.get("kv_transfer_params"),
+                            payload_sender_info=msg.get("payload_sender_info"),
                         )
                     )
                     tasks[request_id] = task
 
                 elif msg_type == "abort":
                     for rid in msg.get("request_ids", []):
-                        task = tasks.pop(rid, None)
-                        if task:
-                            task.cancel()
+                        # Let the request task consume the terminal abort
+                        # output so it can publish the scheduler snapshot.
                         self._engine.abort(rid)
 
                 elif msg_type == "collective_rpc":
@@ -579,6 +649,8 @@ class StageDiffusionProc:
           - ``omni_replica_id``: cluster-unique replica id within the
             stage (logging / metrics only).
         """
+        from vllm_omni.plugins import load_omni_general_plugins
+
         shutdown_requested = False
 
         set_death_signal(signal.SIGTERM)
@@ -591,6 +663,11 @@ class StageDiffusionProc:
 
         signal.signal(signal.SIGTERM, signal_handler)
         signal.signal(signal.SIGINT, signal_handler)
+
+        # ``spawn`` starts this process with a fresh interpreter, so plugin
+        # side effects (for example, custom diffusion loader hooks) must be
+        # applied again before the engine is constructed.
+        load_omni_general_plugins()
 
         proc = cls(model, od_config)
         coord_client: OmniCoordClientForStage | None = None
@@ -703,6 +780,7 @@ class StageDiffusionProcManager:
         )
         proc.start()
         self.proc = proc
+        self.distributed_executor_backend = od_config.distributed_executor_backend
         self.addresses = addresses
         self.manager_stopped = False
         self.failed_proc_name: str | None = None
@@ -740,6 +818,7 @@ class StageDiffusionProcManager:
         )
         proc.start()
         self.proc = proc
+        self.distributed_executor_backend = od_config.distributed_executor_backend
         self.addresses = addresses
         self.manager_stopped = False
         self.failed_proc_name = None
@@ -750,7 +829,6 @@ class StageDiffusionProcManager:
             with zmq_socket_ctx(handshake_address, zmq.ROUTER, bind=True) as handshake_socket:
                 wait_for_engine_startup(
                     handshake_socket,
-                    self.addresses,
                     [CoreEngine(index=0, local=True)],
                     SimpleNamespace(
                         data_parallel_size_local=1,
@@ -759,8 +837,17 @@ class StageDiffusionProcManager:
                     ),
                     False,
                     None,
-                    self,
-                    None,
+                    CoreEngineLaunch(
+                        engine_manager=self,
+                        coordinator=None,
+                        addresses=self.addresses,
+                        tensor_queue=None,
+                        # StageDiffusionProcManager is not a CoreEngineProcManager,
+                        # so upstream's isinstance-gated sentinel registration would
+                        # be skipped; watch the subprocess directly so a proc death
+                        # during handshake is still detected.
+                        watched_frontend_processes=[self.proc],
+                    ),
                 )
         except Exception:
             shutdown([self.proc])
@@ -769,6 +856,12 @@ class StageDiffusionProcManager:
     def shutdown(self, timeout: float | None = None) -> None:
         self.manager_stopped = True
         shutdown([self.proc], timeout=timeout)
+
+    def wait_for_shutdown(self, timeout: float | None = None) -> bool:
+        """Wait for subprocess cleanup without sending a termination signal."""
+        self.manager_stopped = True
+        self.proc.join(timeout)
+        return not self.proc.is_alive()
 
     def sentinels(self) -> list[int]:
         return [self.proc.sentinel]

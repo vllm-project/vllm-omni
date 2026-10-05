@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -28,7 +28,18 @@ from vllm_omni.model_extras.helios import (
     HELIOS_EXTRA_BODY_PARAMS,
     HELIOS_EXTRA_OUTPUT_PARAMS,
 )
+from vllm_omni.model_extras.hunyuan_image3 import (
+    HUNYUAN_IMAGE3_EXTRA_BODY_PARAMS,
+    HUNYUAN_IMAGE3_EXTRA_OUTPUT_PARAMS,
+    HUNYUAN_IMAGE3_INIT_EXTRA_ARGS_FOR_NON_DIFFUSION_STAGES,
+)
+from vllm_omni.model_extras.hunyuan_image3 import (
+    build_ar_stage_inputs as build_hunyuan_image3_ar_stage_inputs,
+)
 from vllm_omni.model_extras.hunyuan_image3 import build_x_to_text_prompt as build_hunyuan_x_to_text_prompt
+from vllm_omni.model_extras.hunyuan_image3 import (
+    validate_ar_tokenizer as validate_hunyuan_image3_ar_tokenizer,
+)
 from vllm_omni.model_extras.lingbot_video import LINGBOT_VIDEO_EXTRA_BODY_PARAMS
 from vllm_omni.model_extras.ltx2 import (
     LTX_EXTRA_BODY_PARAMS,
@@ -36,9 +47,22 @@ from vllm_omni.model_extras.ltx2 import (
     ltx_preserves_reference_image_size,
     ltx_transformer_config_subfolder,
 )
-from vllm_omni.model_extras.magi_human import (
-    MAGI_HUMAN_EXTRA_BODY_PARAMS,
-    MAGI_HUMAN_EXTRA_OUTPUT_PARAMS,
+from vllm_omni.model_extras.magi2 import (
+    MAGI2_EXTRA_BODY_PARAMS,
+    MAGI2_EXTRA_OUTPUT_PARAMS,
+    get_magi2_video_generation_defaults,
+    magi2_preserves_reference_image_size,
+)
+from vllm_omni.model_extras.mammothmodal2_preview import (
+    MAMMOTHMODA2_PREVIEW_EXTRA_BODY_PARAMS,
+    MAMMOTHMODA2_PREVIEW_EXTRA_OUTPUT_PARAMS,
+    MAMMOTHMODA2_PREVIEW_INIT_EXTRA_ARGS_FOR_NON_DIFFUSION_STAGES,
+)
+from vllm_omni.model_extras.mammothmodal2_preview import (
+    build_text_to_image_prompt as build_mammothmoda2_text_to_image_prompt,
+)
+from vllm_omni.model_extras.mammothmodal2_preview import (
+    build_x_to_text_prompt as build_mammothmoda2_x_to_text_prompt,
 )
 from vllm_omni.model_extras.ming_flash_omni import (
     MING_FLASH_OMNI_EXTRA_BODY_PARAMS,
@@ -51,6 +75,18 @@ from vllm_omni.model_extras.ming_flash_omni import (
 from vllm_omni.model_extras.ming_flash_omni import (
     build_text_to_image_prompt as build_ming_flash_omni_text_to_image_prompt,
 )
+from vllm_omni.model_extras.ming_image import (
+    MING_IMAGE_EXTRA_BODY_PARAMS,
+    MING_IMAGE_EXTRA_OUTPUT_PARAMS,
+    MING_IMAGE_INIT_EXTRA_ARGS_FOR_NON_DIFFUSION_STAGES,
+)
+from vllm_omni.model_extras.ming_image import (
+    build_image_to_image_prompt as build_ming_image_image_to_image_prompt,
+)
+from vllm_omni.model_extras.ming_image import (
+    build_text_to_image_prompt as build_ming_image_text_to_image_prompt,
+)
+from vllm_omni.model_extras.sana_video import SANA_VIDEO_EXTRA_BODY_PARAMS
 from vllm_omni.model_extras.sensenova_u1 import (
     SENSENOVA_U1_EXTRA_BODY_PARAMS,
     SENSENOVA_U1_EXTRA_OUTPUT_PARAMS,
@@ -62,6 +98,7 @@ from vllm_omni.model_extras.vace import (
 from vllm_omni.model_extras.vace import (
     build_image_to_video_prompt as build_vace_image_to_video_prompt,
 )
+from vllm_omni.model_extras.video_generation import VideoGenerationDefaults
 
 TextToImagePromptBuilder = Callable[
     [str, str | None, int | None, int | None],
@@ -116,6 +153,7 @@ def default_x_to_text_prompt(
 _X_TO_TEXT_SPECS: dict[str, XToTextPromptBuilder] = {
     "bagel": build_bagel_x_to_text_prompt,
     "hunyuan_image3": build_hunyuan_x_to_text_prompt,
+    "mammoth_moda2": build_mammothmoda2_x_to_text_prompt,
 }
 
 
@@ -130,6 +168,8 @@ def get_x_to_text_model_family(model: str) -> str:
         return "bagel"
     if model_type == "hunyuan_image_3_moe" or any("hunyuanimage3" in value for value in architectures):
         return "hunyuan_image3"
+    if "mammoth" in model_type or any("mammothmoda2" in value for value in architectures):
+        return "mammoth_moda2"
     return "generic"
 
 
@@ -160,6 +200,16 @@ def default_image_to_image_prompt(
     return result
 
 
+def _always_preserve_reference_image_size(
+    *,
+    model: str | None,
+    revision: str | None = None,
+) -> bool:
+    """Declare that a pipeline owns reference-image geometry."""
+    del model, revision
+    return True
+
+
 _EXTRA_SPECS: dict[str, dict[str, Any]] = {
     "BagelPipeline": {
         "extra_body_params": BAGEL_EXTRA_BODY_PARAMS,
@@ -181,9 +231,11 @@ _EXTRA_SPECS: dict[str, dict[str, Any]] = {
         "extra_body_params": COSMOS3_EXTRA_BODY_PARAMS,
         "extra_output_params": COSMOS3_EXTRA_OUTPUT_PARAMS,
     },
-    "MagiHumanPipeline": {
-        "extra_body_params": MAGI_HUMAN_EXTRA_BODY_PARAMS,
-        "extra_output_params": MAGI_HUMAN_EXTRA_OUTPUT_PARAMS,
+    "Magi2Pipeline": {
+        "extra_body_params": MAGI2_EXTRA_BODY_PARAMS,
+        "extra_output_params": MAGI2_EXTRA_OUTPUT_PARAMS,
+        "video_generation_defaults_builder": get_magi2_video_generation_defaults,
+        "reference_image_size_resolver": magi2_preserves_reference_image_size,
     },
     "HeliosPipeline": {
         "extra_body_params": HELIOS_EXTRA_BODY_PARAMS,
@@ -201,6 +253,15 @@ _EXTRA_SPECS: dict[str, dict[str, Any]] = {
     },
     **{
         model_class_name: {
+            "reference_image_size_resolver": _always_preserve_reference_image_size,
+        }
+        for model_class_name in (
+            "MiniMaxH3Pipeline",
+            "MiniMaxH3ModularPipeline",
+        )
+    },
+    **{
+        model_class_name: {
             "extra_body_params": LTX_EXTRA_BODY_PARAMS,
             "extra_output_params": LTX_EXTRA_OUTPUT_PARAMS,
             "reference_image_size_resolver": ltx_preserves_reference_image_size,
@@ -213,10 +274,34 @@ _EXTRA_SPECS: dict[str, dict[str, Any]] = {
             "LTX2DistilledTwoStagePipeline",
         )
     },
+    # HunyuanImage3 keys on the model architecture name that ``get_model_class_name``
+    # reports at runtime for its AR+DiT / AR-only / DiT-only deploys
+    # (``od_config.model_class_name`` == the diffusion registry arch key). The
+    # "HunyuanImage3Pipeline" alias is kept for any path that surfaces the
+    # pipeline class name instead.
+    "HunyuanImage3ForCausalMM": {
+        "extra_body_params": HUNYUAN_IMAGE3_EXTRA_BODY_PARAMS,
+        "extra_output_params": HUNYUAN_IMAGE3_EXTRA_OUTPUT_PARAMS,
+        "init_extra_args_for_non_diffusion_stages": HUNYUAN_IMAGE3_INIT_EXTRA_ARGS_FOR_NON_DIFFUSION_STAGES,
+        "ar_input_builder": build_hunyuan_image3_ar_stage_inputs,
+        "ar_tokenizer_validator": validate_hunyuan_image3_ar_tokenizer,
+    },
+    "SanaVideoPipeline": {
+        "extra_body_params": SANA_VIDEO_EXTRA_BODY_PARAMS,
+    },
+    "SanaImageToVideoPipeline": {
+        "extra_body_params": SANA_VIDEO_EXTRA_BODY_PARAMS,
+    },
     "WanVACEPipeline": {
         "extra_body_params": VACE_EXTRA_BODY_PARAMS,
         "extra_output_params": VACE_EXTRA_OUTPUT_PARAMS,
         "image_to_video_prompt_builder": build_vace_image_to_video_prompt,
+    },
+    "MammothModa2DiTPipeline": {
+        "extra_body_params": MAMMOTHMODA2_PREVIEW_EXTRA_BODY_PARAMS,
+        "extra_output_params": MAMMOTHMODA2_PREVIEW_EXTRA_OUTPUT_PARAMS,
+        "init_extra_args_for_non_diffusion_stages": MAMMOTHMODA2_PREVIEW_INIT_EXTRA_ARGS_FOR_NON_DIFFUSION_STAGES,
+        "text_to_image_prompt_builder": build_mammothmoda2_text_to_image_prompt,
     },
     "MingImagePipeline": {
         "extra_body_params": MING_FLASH_OMNI_EXTRA_BODY_PARAMS,
@@ -225,10 +310,28 @@ _EXTRA_SPECS: dict[str, dict[str, Any]] = {
         "text_to_image_prompt_builder": build_ming_flash_omni_text_to_image_prompt,
         "image_to_image_prompt_builder": build_ming_flash_omni_image_to_image_prompt,
     },
+    "MingImageDiffusionPipeline": {
+        "extra_body_params": MING_IMAGE_EXTRA_BODY_PARAMS,
+        "extra_output_params": MING_IMAGE_EXTRA_OUTPUT_PARAMS,
+        "init_extra_args_for_non_diffusion_stages": MING_IMAGE_INIT_EXTRA_ARGS_FOR_NON_DIFFUSION_STAGES,
+        "text_to_image_prompt_builder": build_ming_image_text_to_image_prompt,
+        "image_to_image_prompt_builder": build_ming_image_image_to_image_prompt,
+    },
 }
+_EXTRA_SPECS["MingImageLayeredDiffusionPipeline"] = _EXTRA_SPECS["MingImageDiffusionPipeline"]
 
 for model_class_name in ("LTX2Pipeline", "LTX2TwoStagePipeline"):
     _EXTRA_SPECS[model_class_name]["transformer_config_subfolder_resolver"] = ltx_transformer_config_subfolder
+
+
+# Alias: some code paths surface HunyuanImage3's pipeline class name rather than
+# the architecture name; point both at the same spec.
+_EXTRA_SPECS["HunyuanImage3Pipeline"] = _EXTRA_SPECS["HunyuanImage3ForCausalMM"]
+
+# Multi-stage discovery reports the top-level wrapper rather than its DiT
+# submodule, so both names must resolve to the same request builders.
+_EXTRA_SPECS["MammothModa2ForConditionalGeneration"] = _EXTRA_SPECS["MammothModa2DiTPipeline"]
+_EXTRA_SPECS["Mammothmoda2Model"] = _EXTRA_SPECS["MammothModa2DiTPipeline"]
 
 
 def _get_spec(model_class_name: str | None) -> dict[str, Any] | None:
@@ -259,6 +362,18 @@ def get_extra_body_params(model_class_name: str | None) -> frozenset[str]:
 def get_extra_output_params(model_class_name: str | None) -> frozenset[str]:
     spec = _get_spec(model_class_name)
     return spec.get("extra_output_params", frozenset()) if spec is not None else frozenset()
+
+
+def get_video_generation_defaults(
+    model_class_name: str | None,
+    extra_body: Mapping[str, Any] | None = None,
+) -> VideoGenerationDefaults | None:
+    """Return model-owned defaults for the shared video examples, if declared."""
+    spec = _get_spec(model_class_name)
+    if spec is None:
+        return None
+    builder = spec.get("video_generation_defaults_builder")
+    return builder(extra_body) if builder is not None else None
 
 
 def get_output_tensor_range(model_class_name: str | None) -> OutputTensorRange:
@@ -306,6 +421,32 @@ def should_preserve_reference_image_size(
 def should_init_extra_args_for_non_diffusion_stages(model_class_name: str | None) -> bool:
     spec = _get_spec(model_class_name)
     return bool(spec and spec.get("init_extra_args_for_non_diffusion_stages", False))
+
+
+def get_ar_input_builder(model_class_name: str | None) -> Callable[..., Any] | None:
+    """Return a model's AR-stage input builder, or ``None`` if undeclared.
+
+    Models with a text/AR stage that needs template-formatted prompt tokens
+    and AR stop tokens (e.g. HunyuanImage3) declare an ``ar_input_builder``.
+    The shared task examples call it generically when present, so the example
+    scripts stay model-agnostic; models without one are unaffected.
+    """
+    spec = _get_spec(model_class_name)
+    return spec.get("ar_input_builder") if spec is not None else None
+
+
+def get_ar_tokenizer_validator(model_class_name: str | None) -> Callable[[Any], None] | None:
+    """Return a model's AR-tokenizer validator, or ``None`` if undeclared.
+
+    Models whose AR prompt/stop-token logic depends on hardcoded special
+    token ids (e.g. HunyuanImage3) declare an ``ar_tokenizer_validator`` to
+    check those ids against whatever tokenizer actually loads at runtime.
+    The shared task examples call it generically, right after loading a real
+    tokenizer, so model/tokenizer revision drift fails loudly instead of
+    silently producing a request with the wrong stop tokens.
+    """
+    spec = _get_spec(model_class_name)
+    return spec.get("ar_tokenizer_validator") if spec is not None else None
 
 
 def build_text_to_image_prompt(
