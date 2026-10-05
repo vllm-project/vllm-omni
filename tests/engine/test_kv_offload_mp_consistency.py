@@ -47,8 +47,14 @@ _DOWNSTREAM = {
 }
 
 # autostart lets the connector own the server process for the duration of the
-# run, so the test needs no external service.
-_MP = {"mode": "mp", "mp.autostart": True}
+# run, so the test needs no external service. The server requires an L1 size and
+# an eviction policy, which autostart does not default, so they are passed here.
+# 8 GB is well clear of what these prompts need and of the box's memory.
+_MP = {
+    "mode": "mp",
+    "mp.autostart": True,
+    "mp.autostart.server_args": "--l1-size-gb 8 --eviction-policy LRU",
+}
 
 
 def _run(*, lmcache: bool, rounds: int) -> dict[str, dict]:
