@@ -21,6 +21,7 @@ from vllm_omni.engine.duplex.session.input_clock import (
     DEFAULT_UNIT_TIMEOUT_S,
     InputClock,
     InputClockUnit,
+    PendingAck,
     StageProgress,
     check_input_clock_supported,
     check_input_clock_unchanged,
@@ -133,11 +134,18 @@ def _progress(
     )
 
 
+def _begin(clock: InputClock, trigger: str) -> PendingAck:
+    """A client input reaches the session and its handling starts."""
+    ack = clock.admit_input(trigger)
+    clock.begin_input(ack)
+    return ack
+
+
 def _append(
     clock: InputClock, *, ms: int = 1000, units: int = 1, epoch: int = 0, accepted: bool = True
 ) -> list[InputClockUnit]:
     """One append of ``ms`` of audio that submits ``units`` units (accepted by Stage 0 unless told otherwise)."""
-    ack = clock.begin_input(APPEND)
+    ack = _begin(clock, APPEND)
     clock.note_input_audio(ack, samples=16 * ms, sample_rate_hz=16000)
     created = [clock.new_unit(input_us=ms * 1000 // max(units, 1), epoch=epoch) for _ in range(units)]
     if accepted:
@@ -229,8 +237,61 @@ def test_the_acknowledgement_has_only_its_own_wire_fields() -> None:
     assert (ack.audio_end_ms, ack.unit_end_ms, ack.units) == (200, 0, ())
     assert (ack.input_index, ack.first_input_index, ack.trigger) == (1, None, APPEND)
     own = {f.name for f in fields(InputProcessed)} - {"session_id", "epoch", "event_id"}
-    assert own == {"audio_end_ms", "unit_end_ms", "input_index", "first_input_index", "trigger", "units"}
-    assert InputProcessed.optional_wire_fields == frozenset({"first_input_index"})
+    assert own == {
+        "audio_end_ms",
+        "unit_end_ms",
+        "input_index",
+        "first_input_index",
+        "trigger",
+        "units",
+        "decision",
+        "reason",
+    }
+    # Optional wire fields are omitted when None: an ordinary acknowledgement has none of them.
+    assert InputProcessed.optional_wire_fields == frozenset({"first_input_index", "decision", "reason"})
+    assert (ack.first_input_index, ack.decision, ack.reason) == (None, None, None)
+
+
+def test_a_refused_input_is_acknowledged_in_order_as_rejected_with_its_error_code() -> None:
+    clock, sent = _clock()
+    _append(clock)  # unit 0 in flight
+    refused = clock.admit_input(APPEND, refused="input_backpressure")
+    clock.begin_input(refused)
+    clock.end_input(refused)
+    assert sent == [], "it waits behind the acknowledgement of the input before it"
+
+    _progress(clock, stage_id=0, decision="listen")
+
+    assert [(a.input_index, a.decision, a.reason) for a in sent] == [
+        (1, None, None),
+        (2, "rejected", "input_backpressure"),
+    ]
+
+
+def test_a_teardown_acknowledging_only_a_refused_input_is_its_own_rejected_acknowledgement() -> None:
+    clock, sent = _clock()
+    clock.admit_input(APPEND, refused="input_backpressure")
+
+    clock.close("client_close")
+
+    (ack,) = sent
+    assert (ack.first_input_index, ack.input_index, ack.decision, ack.reason) == (
+        None,
+        1,
+        "rejected",
+        "input_backpressure",
+    )
+
+
+def test_a_teardown_acknowledgement_covering_a_refused_input_carries_no_decision() -> None:
+    clock, sent = _clock()
+    _append(clock)
+    clock.admit_input(APPEND, refused="input_backpressure")
+
+    clock.close("client_close")
+
+    (ack,) = sent
+    assert (ack.first_input_index, ack.input_index, ack.decision, ack.reason) == (1, 2, None, None)
 
 
 # --------------------------------------------------------------------------- #
@@ -415,7 +476,7 @@ def test_a_segment_end_that_overtakes_the_acceptance_callback_decides_the_unit_i
 
 def test_a_deferred_committed_turn_is_counted_before_it_is_submitted() -> None:
     clock, sent = _clock()
-    ack = clock.begin_input(COMMIT)
+    ack = _begin(clock, COMMIT)
     clock.reserve_unit("turn-a")
     clock.end_input(ack)
     _append(clock, ms=200, units=0)
@@ -430,7 +491,7 @@ def test_a_deferred_committed_turn_is_counted_before_it_is_submitted() -> None:
 
 def test_a_reserved_turn_is_claimed_only_by_its_own_submission() -> None:
     clock, _ = _clock()
-    ack = clock.begin_input(COMMIT)
+    ack = _begin(clock, COMMIT)
     clock.reserve_unit("turn-a")
     clock.end_input(ack)
 
@@ -446,7 +507,7 @@ def test_a_reserved_turn_is_claimed_only_by_its_own_submission() -> None:
 def test_a_second_deferred_commit_merges_into_the_reserved_turn() -> None:
     clock, sent = _clock()
     for turn in ("turn-a", "turn-b"):
-        ack = clock.begin_input(COMMIT)
+        ack = _begin(clock, COMMIT)
         clock.reserve_unit(turn)
         clock.end_input(ack)
     assert clock.placeholder_turns() == ["turn-b"], "one submission, one slot"
@@ -459,7 +520,7 @@ def test_a_second_deferred_commit_merges_into_the_reserved_turn() -> None:
 
 def test_a_dropped_deferred_turn_releases_its_slot_as_cancelled() -> None:
     clock, sent = _clock()
-    ack = clock.begin_input(COMMIT)
+    ack = _begin(clock, COMMIT)
     clock.reserve_unit("turn-a")
     clock.end_input(ack)
     clock.release_placeholder("turn-other", "input_cleared")
@@ -475,7 +536,7 @@ def test_a_reserved_turn_submitted_after_its_slot_timed_out_takes_the_settled_sl
     """Submitted by the end of the response: its output stays its own, no later input waits for it."""
     now = [0.0]
     clock, sent = _clock(now=now)
-    ack = clock.begin_input(COMMIT)
+    ack = _begin(clock, COMMIT)
     clock.reserve_unit("turn-a")
     clock.end_input(ack)
     now[0] = DEFAULT_UNIT_TIMEOUT_S
@@ -498,13 +559,13 @@ def test_a_reserved_turn_submitted_after_its_slot_timed_out_takes_the_settled_sl
 
 def test_a_released_turn_that_a_client_input_submits_is_that_inputs_unit() -> None:
     clock, sent = _clock()
-    ack = clock.begin_input(COMMIT)
+    ack = _begin(clock, COMMIT)
     clock.reserve_unit("turn-a")
     clock.end_input(ack)
     clock.release_placeholder("turn-a", "output_audio_buffer_clear")  # its response was cancelled
     assert _decisions(sent) == [[("cancelled", "output_audio_buffer_clear")]]
 
-    ack = clock.begin_input("response.create")
+    ack = _begin(clock, "response.create")
     unit = clock.new_unit(input_us=500_000, epoch=1, turn="turn-a", from_input=True)
     clock.unit_submitted(unit)
     clock.end_input(ack)
@@ -552,7 +613,7 @@ def test_cancel_settles_open_units_of_the_cancelled_epoch_and_ignores_their_late
     _append(clock, epoch=0)
     _progress(clock, stage_id=0, epoch=0)  # speaking
     _append(clock, epoch=0)  # still undecided
-    ack = clock.begin_input(COMMIT)
+    ack = _begin(clock, COMMIT)
     clock.reserve_unit("turn-a")  # a deferred turn survives the cancel unless it was dropped
     clock.end_input(ack)
 
@@ -575,7 +636,7 @@ def test_close_acknowledges_every_owed_input_with_one_event_and_then_stays_silen
     clock, sent = _clock()
     _append(clock)
     _progress(clock, stage_id=0)  # speaking
-    in_progress = clock.begin_input(APPEND)  # an input still being handled
+    in_progress = _begin(clock, APPEND)  # an input still being handled
     clock.new_unit(input_us=1_000_000, epoch=0)
 
     clock.close("client_close")
@@ -905,7 +966,7 @@ def test_audio_end_and_unit_end_are_exact_with_odd_sized_appends() -> None:
 
     clock, sent = _clock()
     for _ in range(3000):
-        ack = clock.begin_input(APPEND)
+        ack = _begin(clock, APPEND)
         clock.note_input_audio(ack, samples=1, sample_rate_hz=48000)
         clock.end_input(ack)
     unit = clock.new_unit(input_us=Fraction(3000 * 1_000_000, 48000), epoch=0)
@@ -913,3 +974,19 @@ def test_audio_end_and_unit_end_are_exact_with_odd_sized_appends() -> None:
     _append(clock, ms=0, units=0)
 
     assert (sent[-1].audio_end_ms, sent[-1].unit_end_ms) == (62, 62)
+
+
+def test_a_refused_input_takes_its_audio_back() -> None:
+    clock, sent = _clock()
+    _append(clock, ms=200, units=0)
+    ack = _begin(clock, APPEND)
+    clock.note_input_audio(ack, samples=16000, sample_rate_hz=16000)
+    clock.refuse_input(ack, "input_backpressure")
+    clock.end_input(ack)
+    _append(clock, ms=200, units=0)
+
+    assert [(e.input_index, e.audio_end_ms, e.decision) for e in sent] == [
+        (1, 200, None),
+        (2, 200, "rejected"),
+        (3, 400, None),
+    ]

@@ -7,10 +7,10 @@ A session opts in with ``extra_body.clock == "input"`` at creation (on a model
 whose plugin sets ``DuplexModelPlugin.supports_input_clock``). The server then
 never invents input of its own (no silence continuation; the idle window
 defaults to 10 minutes) and acknowledges every client input that can advance
-the model -- each ``input_audio_buffer.append``, ``input_audio_buffer.commit``
-and ``response.create`` -- with exactly one ``input_audio_buffer.processed``
-event, in input order, sent only once every output that input caused has been
-sent. A client can therefore step the model as fast as acknowledgements come
+the model and reaches the session -- each ``input_audio_buffer.append``,
+``input_audio_buffer.commit`` and ``response.create`` -- with exactly one
+``input_audio_buffer.processed`` event, in input order, sent only once every
+output that input caused has been sent. A client can therefore step the model as fast as acknowledgements come
 back, or pause between inputs while it thinks, and always knows which outputs
 belong to which input position.
 
@@ -247,6 +247,10 @@ class PendingAck:
     audio_end_us: int
     #: Units created before this input was handled; ``None`` until then.
     watermark: int | None = None
+    #: Error code of an input refused before any of it reached the model (acknowledged as ``rejected``).
+    refused: str | None = None
+    #: Input audio this input added to ``audio_end_ms`` (taken back if the input is refused).
+    audio_us: Fraction = Fraction(0)
 
 
 class InputClock:
@@ -323,13 +327,24 @@ class InputClock:
     # Input side                                                         #
     # ------------------------------------------------------------------ #
 
-    def begin_input(self, trigger: str) -> PendingAck:
-        """A client input left the mailbox; its acknowledgement is owed from now on."""
+    def admit_input(self, trigger: str, *, refused: str | None = None) -> PendingAck:
+        """A client input reached the session (in wire order): it takes the next index, its acknowledgement is owed.
+
+        ``refused`` is the error code of an input the session refused at
+        admission (the runner sets ``PendingAck.refused`` later for an append
+        refused while its audio is prepared): it is acknowledged in input order
+        like an input that only buffers audio, as ``decision: "rejected"`` with
+        that code as ``reason``.
+        """
         self._input_count += 1
-        ack = PendingAck(index=self._input_count, trigger=trigger, audio_end_us=self.audio_end_us)
+        ack = PendingAck(index=self._input_count, trigger=trigger, audio_end_us=self.audio_end_us, refused=refused)
         if not self._closed:
             self._acks.append(ack)
         return ack
+
+    def begin_input(self, ack: PendingAck) -> None:
+        """The input left the mailbox and is being handled (the inputs before it are handled)."""
+        ack.audio_end_us = self.audio_end_us
 
     def note_input_audio(self, ack: PendingAck, *, samples: int, sample_rate_hz: int) -> None:
         """The input being handled carries ``samples`` of audio: it counts in ``audio_end_ms`` from now on.
@@ -340,7 +355,20 @@ class InputClock:
         """
         if samples <= 0 or sample_rate_hz <= 0:
             return
-        self._audio_end += Fraction(samples * 1_000_000, int(sample_rate_hz))
+        audio_us = Fraction(samples * 1_000_000, int(sample_rate_hz))
+        self._audio_end += audio_us
+        ack.audio_us += audio_us
+        ack.audio_end_us = self.audio_end_us
+
+    def refuse_input(self, ack: PendingAck, code: str) -> None:
+        """The input being handled was refused before any of it reached the model (error ``code``).
+
+        It is acknowledged as ``rejected`` and its audio no longer counts in
+        ``audio_end_ms``: the client sends it again if the model should hear it.
+        """
+        ack.refused = code
+        self._audio_end -= ack.audio_us
+        ack.audio_us = Fraction(0)
         ack.audio_end_us = self.audio_end_us
 
     def end_input(self, ack: PendingAck) -> None:
@@ -534,6 +562,8 @@ class InputClock:
             return
         first, last = self._acks[0], self._acks[-1]
         self._acks.clear()
+        # Inputs still queued were never handled: report all audio handled so far.
+        last.audio_end_us = self.audio_end_us
         self._emit([self._ack_event(last, first_index=first.index if first is not last else None, teardown=True)])
 
     # ------------------------------------------------------------------ #
@@ -806,6 +836,9 @@ class InputClock:
             first_input_index=first_index,
             trigger=ack.trigger,
             units=tuple(units),
+            # A teardown acknowledgement covers several inputs: it has no single decision.
+            decision="rejected" if ack.refused is not None and first_index is None else None,
+            reason=ack.refused if first_index is None else None,
         )
 
     def flush(self) -> None:

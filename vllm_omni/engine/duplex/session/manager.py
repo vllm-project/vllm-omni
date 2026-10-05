@@ -277,6 +277,11 @@ class DuplexSessionManager:
         command (the runner then re-reserves the decoded size around its PCM
         reservation), so the mailbox never holds more bytes than the session
         limit even while the worker is busy.
+
+        A command refused here is answered with an ``error``. The modality and
+        backpressure refusals also call ``runner.input_refused``, which gives
+        an input-clocked session's refused input its acknowledgement in input
+        order; a refusal because the session is closing does not.
         """
         runner = self.runners.get(message.session_id)
         command = message.command
@@ -302,6 +307,9 @@ class DuplexSessionManager:
                     )
                 ],
             )
+            # Not ``input_refused``: an input-clocked session acknowledges only
+            # inputs that arrived before it began closing (its teardown
+            # acknowledgement covers them).
             return
         if isinstance(command, AppendAudio):
             has_audio = bool(command.audio)
@@ -312,6 +320,7 @@ class DuplexSessionManager:
                     session,
                     [self._error_event("invalid_input_modality", modality_error, command=command)],
                 )
+                runner.input_refused(command, "invalid_input_modality")
                 return
             limit = int(self.runtime_config.max_pending_input_bytes_per_session)
             pending_bytes = len(command.audio) + sum(len(frame) for frame in command.video_frames)
@@ -326,6 +335,7 @@ class DuplexSessionManager:
                         )
                     ],
                 )
+                runner.input_refused(command, "input_backpressure")
                 return
         elif isinstance(command, Commit):
             if not session.reserve_pending_turn(limit=int(self.runtime_config.max_pending_turns_per_session)):
@@ -339,6 +349,7 @@ class DuplexSessionManager:
                         )
                     ],
                 )
+                runner.input_refused(command, "input_backpressure")
                 return
         runner.submit(command)
 

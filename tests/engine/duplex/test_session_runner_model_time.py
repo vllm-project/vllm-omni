@@ -26,7 +26,7 @@ from tests.engine.duplex.test_session_runner import (
 )
 from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
 from vllm_omni.engine.duplex.config import INPUT_CLOCK_IDLE_TIMEOUT_S, DuplexSessionConfig
-from vllm_omni.engine.duplex.messages import ResumeDuplexSessionMessage
+from vllm_omni.engine.duplex.messages import CloseDuplexSessionMessage, ResumeDuplexSessionMessage
 from vllm_omni.engine.duplex.plugin import DuplexUnitDecision
 from vllm_omni.engine.duplex.session.input_clock import DEFAULT_UNIT_MAX_AGE_S, DEFAULT_UNIT_TIMEOUT_S, StageProgress
 from vllm_omni.engine.duplex.session.manager import DuplexSessionManager
@@ -168,6 +168,177 @@ async def test_an_input_rejected_with_an_error_is_still_acknowledged() -> None:
         events = await h.run(commands.Commit())
         assert types(events) == ["error", "input_audio_buffer.processed"]
         assert _acks(events)[0].units == ()
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.usefixtures("input_clock_model")
+async def test_an_append_refused_at_admission_is_acknowledged_in_input_order() -> None:
+    """Input backpressure refuses the second append before the runner sees it: it still gets its turn."""
+    h = await open_harness(
+        extra_body=INPUT_CLOCK,
+        runtime_config=DuplexSessionRuntimeConfig(max_pending_input_bytes_per_session=16000 * 4),
+    )
+    try:
+        h.submit(append_audio())  # holds the whole input budget until the runner dequeues it
+        h.submit(append_audio(event_id="evt-refused"))
+        events = await h.settle()
+        errors = [event for event in events if event.type == "error"]
+        assert [(e.code, e.related_event_id) for e in errors] == [("input_backpressure", "evt-refused")]
+        assert _acks(events) == [], "the refused input waits behind the first one's unit"
+
+        events = await _deliver_listen(h, h.stage0_request_id())
+
+        acks = _acks(events)
+        assert [a.input_index for a in acks] == [1, 2]
+        assert [_units(a) for a in acks] == [[("listen", None)], []]
+        assert (acks[1].trigger, acks[1].audio_end_ms) == ("input_audio_buffer.append", 1000)
+        assert [(a.decision, a.reason) for a in acks] == [(None, None), ("rejected", "input_backpressure")]
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.usefixtures("input_clock_model")
+async def test_an_append_with_a_modality_the_model_refuses_is_acknowledged() -> None:
+    h = await open_harness(extra_body=INPUT_CLOCK)
+    try:
+        events = await h.run(replace(append_audio(event_id="evt-empty"), audio=b""))
+
+        assert types(events) == ["error", "input_audio_buffer.processed"]
+        assert (events[0].code, events[0].related_event_id) == ("invalid_input_modality", "evt-empty")
+        assert (events[1].input_index, events[1].units) == (1, ())
+        assert (events[1].decision, events[1].reason) == ("rejected", "invalid_input_modality")
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.usefixtures("input_clock_model")
+async def test_an_append_the_runner_refuses_before_it_reaches_the_model_is_acknowledged_as_rejected() -> None:
+    """Refused while its audio is prepared (here: undecodable pcm16): same acknowledgement as at admission."""
+    h = await open_harness(extra_body=INPUT_CLOCK)
+    try:
+        odd = commands.AppendAudio(audio=b"\x00" * 3, format="pcm16", sample_rate_hz=16000, event_id="evt-odd")
+        events = await h.run(odd)
+
+        assert types(events) == ["error", "input_audio_buffer.processed"]
+        assert (events[0].code, events[0].related_event_id) == ("bad_audio", "evt-odd")
+        assert (events[1].input_index, events[1].decision, events[1].reason) == (1, "rejected", "bad_audio")
+        assert not h.port.submissions
+
+        events = await h.run(append_audio(samples=3200))  # the next input is acknowledged normally
+        assert [(a.input_index, a.decision) for a in _acks(events)] == [(2, None)]
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.usefixtures("input_clock_model")
+async def test_an_append_the_runner_refuses_after_decoding_does_not_count_its_audio() -> None:
+    """pcm16 passes admission at 2 B/sample but the runner reserves the decoded 4 B/sample: refused, not heard."""
+    h = await open_harness(
+        extra_body=INPUT_CLOCK, runtime_config=DuplexSessionRuntimeConfig(max_pending_input_bytes_per_session=40000)
+    )
+    try:
+        big = commands.AppendAudio(audio=b"\x10\x00" * 16000, format="pcm16", sample_rate_hz=16000, event_id="evt-big")
+        events = await h.run(big)
+
+        assert [(e.code, e.related_event_id) for e in events if e.type == "error"] == [
+            ("input_backpressure", "evt-big")
+        ]
+        (ack,) = _acks(events)
+        assert (ack.decision, ack.reason, ack.audio_end_ms) == ("rejected", "input_backpressure", 0)
+        assert h.port.submissions == []
+
+        (ack,) = _acks(await h.run(append_audio(samples=3200)))  # a resend of what fits counts once
+        assert (ack.input_index, ack.audio_end_ms, ack.decision) == (2, 200, None)
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.usefixtures("input_clock_model")
+async def test_a_handler_failure_is_reported_before_the_acknowledgement(monkeypatch: pytest.MonkeyPatch) -> None:
+    h = await open_harness(extra_body=INPUT_CLOCK)
+    try:
+
+        async def _boom(self, command):
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(DuplexSessionRunner, "_on_command", _boom)
+        events = await h.run(commands.CreateResponse())
+
+        assert types(events) == ["error", "input_audio_buffer.processed"]
+        assert events[0].code == "internal_error"
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.usefixtures("input_clock_model")
+async def test_a_refused_response_create_error_names_its_event() -> None:
+    h = await open_harness(auto_response=False, extra_body=INPUT_CLOCK)
+    try:
+        events = await h.run(commands.CreateResponse(event_id="evt-create"))
+
+        errors = [e for e in events if e.type == "error"]
+        assert [(e.code, e.related_event_id) for e in errors] == [("response_create_without_input", "evt-create")]
+        assert _acks(events)[0].input_index == 1
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.usefixtures("input_clock_model")
+async def test_an_input_refused_because_the_session_is_closing_is_not_acknowledged() -> None:
+    h = await open_harness(extra_body=INPUT_CLOCK)
+    try:
+        h.runner._begin_close("client_close")
+
+        events = await h.run(append_audio())
+
+        assert [e.code for e in events if e.type == "error"] == ["session_closed"]
+        assert _acks(events) == []
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.usefixtures("input_clock_model")
+async def test_a_commit_refused_at_admission_is_acknowledged() -> None:
+    h = await open_harness(
+        extra_body=INPUT_CLOCK, runtime_config=DuplexSessionRuntimeConfig(max_pending_turns_per_session=1)
+    )
+    try:
+        h.submit(commands.Commit())
+        h.submit(commands.Commit(event_id="evt-refused"))
+        events = await h.settle()
+
+        assert [e.code for e in events if e.type == "error"] == ["input_backpressure", "input_audio_buffer_empty"]
+        # The first commit is rejected while handled (nothing to commit), the
+        # second refused at admission (its slot is still held by the first).
+        assert [(a.input_index, a.trigger, a.decision, a.reason) for a in _acks(events)] == [
+            (1, "input_audio_buffer.commit", None, None),
+            (2, "input_audio_buffer.commit", "rejected", "input_backpressure"),
+        ]
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.usefixtures("input_clock_model")
+async def test_inputs_still_queued_at_teardown_are_covered_by_its_acknowledgement() -> None:
+    h = await open_harness(extra_body=INPUT_CLOCK)
+    try:
+        h.port.submit_gate = asyncio.Event()
+        h.submit(append_audio())
+        await asyncio.wait_for(h.port.submit_started.wait(), timeout=2.0)
+        h.submit(commands.Commit())  # waits for the append in flight
+        h.submit(append_audio())  # queued behind the commit
+        await _wait_until(lambda: h.runner._mailbox.qsize() == 1)  # the worker is inside the commit
+
+        await h.manager.handle(
+            CloseDuplexSessionMessage(control_id="c-close", session_id=SESSION_ID, reason="client_close")
+        )
+        events = await h.settle(timeout_s=1.0)
+
+        (ack,) = _acks(events)
+        assert (ack.first_input_index, ack.input_index) == (1, 3)
+        assert _units(ack) == [("aborted", "client_close")]
+        assert types(events).index("input_audio_buffer.processed") < types(events).index("session.closed")
     finally:
         await close_harness(h)
 
@@ -815,6 +986,9 @@ async def _clock_free_scenario(h) -> tuple[list[str], list[str]]:
     events += await h.run(commands.Commit())
     events += await h.run(commands.CancelResponse())
     events += await h.run(append_audio(samples=3200))
+    # Refused at admission, then by the runner.
+    events += await h.run(replace(append_audio(), audio=b""))
+    events += await h.run(commands.AppendAudio(audio=b"\x00" * 3, format="pcm16", sample_rate_hz=16000))
     events += await h.run(commands.ClearInput())
     events += await h.run(commands.CloseSession())
     return types(events), [s.context.request_id for s in h.port.submissions]
@@ -839,11 +1013,12 @@ async def test_without_the_clock_nothing_changes(monkeypatch: pytest.MonkeyPatch
         await close_harness(h)
 
     assert "input_audio_buffer.processed" not in with_feature[0]
-    assert not any(isinstance(item, StageProgress) for item in queued)
+    assert not any(isinstance(item, StageProgress) or type(item).__name__ == "_ClockedInput" for item in queued)
     assert not any(str(getattr(item, "kind", "")).startswith("input_clock") for item in queued)
 
     # The same scenario with every clock call site of the runner stubbed out.
     for name in (
+        "input_refused",
         "_settle_cancelled_units",
         "_release_dropped_deferred_turn",
         "_close_input_clock",
@@ -852,7 +1027,6 @@ async def test_without_the_clock_nothing_changes(monkeypatch: pytest.MonkeyPatch
     ):
         monkeypatch.setattr(DuplexSessionRunner, name, lambda self, *args: None)
     monkeypatch.setattr(DuplexSessionRunner, "_input_clock_progress", lambda self, *args: None)
-    monkeypatch.setattr(DuplexSessionRunner, "_on_client_command", DuplexSessionRunner._on_command)
     baseline = await open_harness()
     try:
         assert await _clock_free_scenario(baseline) == with_feature

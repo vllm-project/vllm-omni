@@ -502,8 +502,8 @@ session) gives that contract:
   connection once the old socket has been closed or replaced (the client
   closed it, or saw it closed).
 - Every `input_audio_buffer.append`, `input_audio_buffer.commit` and
-  `response.create` gets exactly one `input_audio_buffer.processed`, in input
-  order (a teardown acknowledges all inputs still owed with one event that
+  `response.create` that reaches the session gets exactly one
+  `input_audio_buffer.processed`, in input order (a teardown acknowledges all inputs still owed with one event that
   covers `first_input_index` .. `input_index`). It is sent only after every
   output that input caused has been sent:
   for each model unit the input completed, the model's decision has been
@@ -540,12 +540,13 @@ session) gives that contract:
 
 | Field | Meaning |
 | --- | --- |
-| `audio_end_ms` | Total input audio received so far. |
+| `audio_end_ms` | Total input audio the session had handled up to and including this input (on a teardown acknowledgement, all audio it handled): the client's input position. The audio of a refused input (`decision: "rejected"`) is not counted; audio the session handled but discarded without submitting it is (see below). |
 | `unit_end_ms` | Input audio covered by the settled model units (completed by the model, or settled as below) created up to and including this input. |
 | `input_index` | 1-based position of the acknowledged input among this session's acknowledged inputs. |
 | `first_input_index` | Only on the acknowledgement a teardown sends: it acknowledges inputs `first_input_index` .. `input_index` at once (see below). |
 | `trigger` | Client event type acknowledged (on a teardown acknowledgement, that of input `input_index`). |
 | `units` | Settled model units created up to and including this input that no earlier acknowledgement reported, oldest first: `end_ms`, `decision`, and `reason` for a unit settled as `cancelled`, `aborted` or `timed_out`. A unit of a later input that settled first waits for that input's acknowledgement. |
+| `decision`, `reason` | Only on the acknowledgement of an input the session refused before any of it reached the model: `"rejected"` and the error code. |
 
 For audio input, `unit_end_ms` never exceeds `audio_end_ms` (a unit of a
 commit-based model that also retains video frames counts the retained bytes,
@@ -568,6 +569,12 @@ unit that will produce no further model output:
 | `cancelled` | A cancel cancelled the unit or called off its append: `response.cancel`, `output_audio_buffer.clear`, a barge-in (client `barge_in` / `input.cancel`, or an overlap barge-in decided by the server); or a committed turn deferred behind the active response was not submitted because a cancel ended that response or its audio was dropped (`input_audio_buffer.clear`, or a short interjection discarded while the model speaks). | `client_cancelled`, `output_audio_buffer_clear`, `barge_in`, `turn_detected`, `input_cleared` or `short_overlap_discarded` |
 | `aborted` | The session ended (closed, expired, or failed) with the unit open. | The close reason, e.g. `client_close`, `idle_ttl_expired`, `runtime_append_task_failed`. |
 | `timed_out` | A timeout settled the unit. | `no_progress` or `max_age` |
+
+The acknowledgement of an input the session refused before any of it reached
+the model carries the same two keys at the top level: `decision: "rejected"`
+and `reason` = the code of its `error` (see the contract below). Both keys
+are absent from every other acknowledgement, and from a teardown
+acknowledgement that covers several inputs.
 
 A *model unit* is one submission to the model's first stage: what the model's
 input buffer cuts from appends (`capabilities.chunk_period_ms`, e.g. a 1 s
@@ -603,9 +610,36 @@ that sets it.
   teardown acknowledgement). Keep appends no longer than one unit to get one
   unit per acknowledgement.
 - **An input rejected with an error.** An append, commit or
-  `response.create` the server rejects (an `error` event, e.g.
-  `input_audio_buffer_empty`) caused nothing, and is acknowledged like an
-  input that only buffers audio.
+  `response.create` the server rejects with an `error` event caused nothing,
+  and is acknowledged like an input that only buffers audio, in its input
+  order (after the acknowledgements of the inputs sent before it):
+    - Refused before any of it reached the model: when the session admits
+      it (`input_backpressure`, `invalid_input_modality`) or when it prepares
+      an append's audio (`input_backpressure`, `invalid_input_modality`,
+      `bad_audio`, `bad_event`). The acknowledgement carries
+      `decision: "rejected"` and `reason` = the error code, and the input's
+      audio is not counted in `audio_end_ms`. Send the input again (for
+      `input_backpressure`, after a short back-off) if the model should hear
+      it.
+    - Rejected while the session handles it otherwise (e.g.
+      `input_audio_buffer_empty`, `commit_aborted`, or `input_backpressure`
+      for audio a commit-based model already buffered): a plain
+      acknowledgement; the `error` says why.
+- **An input rejected before it reaches the session.** An event the server's
+  transport layer rejects gets only its `error`: it is not acknowledged and
+  is not assigned an `input_index`. This covers a frame that cannot be read
+  as an event (`invalid_json`, `event_too_large`, or `bad_event` for a frame
+  that is not an object with a string `type`), an event that cannot be
+  translated (e.g. `bad_audio` for undecodable audio,
+  `unsupported_audio_format`, `bad_event`), and an event the engine's request
+  queue did not take (`engine_backpressure`). The client identifies it by the
+  error's `event_id`, the `event_id` of the rejected client event (a frame
+  that could not be parsed has none), so give every input an `event_id`.
+  `bad_audio` and `bad_event` can also come from the session (above); a
+  client that keeps one input in flight tells the two apart by whether an
+  acknowledgement follows the error.
+  Inputs sent after the session began closing are refused with
+  `session_closed` and are not acknowledged either (see teardown below).
 - **A commit deferred behind an active response.** A commit that arrives
   while the model is still responding is retained and submitted once the
   response ends; its acknowledgement waits for that turn. This holds on
@@ -632,12 +666,15 @@ that sets it.
   acknowledgements owed — `session.close`, an idle or disconnect expiry, a
   runtime failure — the open units are settled as `aborted` and all owed
   inputs are acknowledged by a single `input_audio_buffer.processed`
-  (`first_input_index` .. `input_index`, or a plain acknowledgement when only
-  one input was owed), sent before `session.closed` / `session.expired`. A
+  (`first_input_index` .. `input_index`, or the input's own acknowledgement
+  when only one input was owed), sent before `session.closed` / `session.expired`.
+  Owed inputs include those the session received but had not handled yet. A
   teardown therefore adds at most one event to the session's output however
   many inputs were in flight. Inputs that arrive after the session began
   closing are not acknowledged, and no acknowledgement follows the terminal
-  event. (An engine shutdown sends no events at all.)
+  event. (An engine shutdown sends no events at all. A session closed for
+  `output_backpressure` suppresses ordinary events, this acknowledgement
+  included; see [Output limits and slow consumers](#output-limits-and-slow-consumers).)
 - **Server VAD.** With server VAD turn detection the commit the server
   derives is not a client input, so its response is reported with the next
   acknowledged input; drive turns with explicit commits instead.
