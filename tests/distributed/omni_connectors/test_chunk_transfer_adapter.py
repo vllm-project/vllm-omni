@@ -26,9 +26,149 @@ from vllm_omni.distributed.omni_connectors.transfer_adapter.base import OmniTran
 from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter import (
     OmniChunkTransferAdapter,
 )
+from vllm_omni.distributed.omni_connectors.transfer_adapter.request_state import (
+    RequestStateUnavailableError,
+    StageRequestIdentity,
+)
 from vllm_omni.distributed.omni_connectors.utils.config import ConnectorSpec
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+@pytest.mark.parametrize("send_success", [True, False])
+def test_namespaced_producer_state_terminal_commit(build_adapter, send_success):
+    adapter, connector = build_adapter()
+    request = _req("internal", RequestStatus.FINISHED_STOPPED, external_req_id="external")
+    connector.put.return_value = (send_success, 1, {})
+    views = []
+
+    def producer(transfer_manager, request, **kwargs):
+        identity = StageRequestIdentity(request.request_id, request.external_req_id)
+        view = transfer_manager.request_state
+        views.append((view, identity))
+        view.get_or_create(identity, "synthetic.codec", list).append(7)
+        view.get_or_create(identity, "synthetic.prompt", dict)["ready"] = True
+        return OmniPayloadStruct(codes=CodesStruct(audio=torch.tensor([7])))
+
+    adapter.custom_process_next_stage_input_func = producer
+    adapter.save_async(None, request)
+    adapter._send_single_request(adapter._pending_save_reqs.popleft())
+    assert connector.put.call_count == 1
+    if send_success:
+        assert "external" not in adapter.request_payload
+    else:
+        assert "external" in adapter.request_payload
+        assert "internal" in adapter.collect_failed_send_request_ids()
+        adapter.finish_requests(["internal"], RequestStatus.FINISHED_ERROR, {"internal": request})
+    assert "external" not in adapter.request_payload
+    view, identity = views[0]
+    with pytest.raises(RequestStateUnavailableError):
+        view.get_or_create(identity, "late", list)
+
+
+def test_namespaced_state_survives_segment_but_not_cancel_or_id_reuse(build_adapter):
+    adapter, connector = build_adapter()
+    views = []
+    states = []
+
+    def producer(transfer_manager, request, **kwargs):
+        identity = StageRequestIdentity(request.request_id, request.external_req_id)
+        view = transfer_manager.request_state
+        state = view.get_or_create(identity, "synthetic.codec", list)
+        state.append(request.request_id)
+        states.append(state)
+        views.append((view, identity))
+        return OmniPayloadStruct(codes=CodesStruct(audio=torch.tensor([1])))
+
+    adapter.custom_process_next_stage_input_func = producer
+    request = _req("old", RequestStatus.RUNNING, external_req_id="external")
+    request.resumable = True
+    request._omni_segment_generation = 0
+    adapter.save_async(None, request, is_segment_finished=True)
+    adapter._send_single_request(adapter._pending_save_reqs.popleft())
+    assert "external" in adapter.request_payload
+    request._omni_segment_generation = 1
+    adapter.save_async(None, request, is_segment_finished=True)
+    adapter._send_single_request(adapter._pending_save_reqs.popleft())
+    assert states[0] is states[1]
+    adapter.finish_requests(["old"], RequestStatus.FINISHED_ABORTED, {"old": request})
+    adapter.cleanup("old", "external")  # Duplicate finalization is harmless.
+    replacement = _req("new", RequestStatus.RUNNING, external_req_id="external")
+    adapter.save_async(None, replacement)
+    while adapter._pending_save_reqs:
+        adapter._send_single_request(adapter._pending_save_reqs.popleft())
+    assert states[-1] == ["new"]
+    old_view, old_identity = views[0]
+    with pytest.raises(RequestStateUnavailableError):
+        old_view.get_or_create(old_identity, "synthetic.codec", list)
+
+
+def test_processor_exception_fails_request_without_empty_terminal_send(build_adapter):
+    adapter, connector = build_adapter()
+    request = _req("internal", RequestStatus.FINISHED_STOPPED, external_req_id="external")
+
+    def producer(transfer_manager, request, **kwargs):
+        identity = StageRequestIdentity(request.request_id, request.external_req_id)
+        transfer_manager.request_state.get_or_create(identity, "synthetic.codec", list).append(1)
+        raise ValueError("invalid codec state")
+
+    adapter.custom_process_next_stage_input_func = producer
+    adapter.save_async(None, request)
+    adapter._send_single_request(adapter._pending_save_reqs.popleft())
+    connector.put.assert_not_called()
+    assert "invalid codec state" in adapter.collect_failed_send_request_ids()["internal"]
+    assert "external" in adapter.request_payload
+    adapter.finish_requests(["internal"], RequestStatus.FINISHED_ERROR, {"internal": request})
+    assert "external" not in adapter.request_payload
+    with pytest.raises(RequestStateUnavailableError):
+        _ = adapter.request_state
+
+
+def test_namespaced_state_retains_buffered_output_and_isolates_finalization(build_adapter):
+    adapter, connector = build_adapter()
+    views = {}
+
+    def producer(transfer_manager, request, **kwargs):
+        identity = StageRequestIdentity(request.request_id, request.external_req_id)
+        view = transfer_manager.request_state
+        views[request.request_id] = (view, identity)
+        view.get_or_create(identity, "synthetic.buffer", list).append(request.request_id)
+        return None
+
+    adapter.custom_process_next_stage_input_func = producer
+    requests = {name: _req(name, RequestStatus.RUNNING) for name in ("first", "second")}
+    for request in requests.values():
+        adapter.save_async(None, request)
+        adapter._send_single_request(adapter._pending_save_reqs.popleft())
+    connector.put.assert_not_called()
+    assert set(adapter.request_payload) == {"first", "second"}
+    adapter.finish_requests(["first"], RequestStatus.FINISHED_ERROR, requests)
+    assert set(adapter.request_payload) == {"second"}
+    view, identity = views["second"]
+    assert view.get_or_create(identity, "synthetic.buffer", list) == ["second"]
+
+
+def test_raising_connector_records_failure_and_keeps_state_until_finalization(build_adapter):
+    adapter, connector = build_adapter()
+    request = _req("internal", RequestStatus.FINISHED_STOPPED, external_req_id="external")
+
+    def producer(transfer_manager, request, **kwargs):
+        identity = StageRequestIdentity(request.request_id, request.external_req_id)
+        transfer_manager.request_state.get_or_create(identity, "synthetic.codec", list).append(7)
+        return OmniPayloadStruct(codes=CodesStruct(audio=torch.tensor([7])))
+
+    def failed_put(**kwargs):
+        adapter.stop_event.set()
+        raise OSError("connector unavailable")
+
+    adapter.custom_process_next_stage_input_func = producer
+    connector.put.side_effect = failed_put
+    adapter.save_async(None, request)
+    adapter.save_loop()
+    assert "connector unavailable" in adapter.collect_failed_send_request_ids()["internal"]
+    assert "external" in adapter.request_payload
+    adapter.finish_requests(["internal"], RequestStatus.FINISHED_ERROR, {"internal": request})
+    assert "external" not in adapter.request_payload
 
 
 @pytest.fixture

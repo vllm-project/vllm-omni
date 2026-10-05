@@ -25,6 +25,7 @@ from ..utils.initialization import resolve_connector_spec
 from ..utils.kv_utils import get_local_tp_rank, get_omni_replica_id
 from ..utils.logging import get_connector_logger
 from .base import OmniTransferAdapterBase
+from .request_state import RequestStateAccessor, RequestStateUnavailableError, StageRequestIdentity
 
 logger = get_connector_logger(__name__)
 
@@ -153,6 +154,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         # segment's queued or in-flight work after the same request id resumes.
         self._registered_load_entries: dict[str, _LoadEntry] = {}
         self._sender_tokens: dict[str, _SenderGeneration] = {}
+        self._processor_state_context = threading.local()
         self.scheduler_max_num_seqs = vllm_config.scheduler_config.max_num_seqs
         (
             self._max_model_len,
@@ -195,7 +197,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self._adaptive_states: dict[str, Any] = {}
         self.upstream_exhausted_requests: set[str] = set()
         self.segment_finished_requests: set[str] = set()
-        self.request_payload = {}
+        self.request_payload: dict[str, Any] = {}
         self.code_prompt_token_ids: dict[str, list[torch.Tensor]] = defaultdict(list)
         self.request_ids_mapping: dict[str, str] = {}
         # Save-thread only: running count of segments reclaimed after finish.
@@ -234,6 +236,14 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         # becomes a client-visible error instead of parking forever.  Mirrors
         # OmniSchedulingCoordinator._waiting_since on the full-payload path.
         self._waiting_since: dict[str, float] = {}
+
+    @property
+    def request_state(self) -> RequestStateAccessor:
+        """Namespaced state for the current custom producer invocation."""
+        accessor = getattr(self._processor_state_context, "accessor", None)
+        if accessor is None:
+            raise RequestStateUnavailableError("Request state is only available inside a queued producer invocation")
+        return accessor
 
     @staticmethod
     def _is_truthy_scalar(value: Any) -> bool:
@@ -803,10 +813,22 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 }
                 if self._accepts_new_token_ids(processor):
                     processor_kwargs["new_token_ids"] = task.get("new_token_ids", ())
+                if sender_token is not None:
+                    self._processor_state_context.accessor = RequestStateAccessor(
+                        self.request_payload,
+                        StageRequestIdentity(request.request_id, external_req_id),
+                        sender_token,
+                        self._sender_state_lock,
+                        lambda: self._sender_tokens.get(external_req_id) is sender_token and not sender_token.cancelled,
+                    )
                 payload_data = processor(**processor_kwargs)
 
             except Exception as e:
                 logger.error(f"Failed to use custom_process_input_func for payload extraction: {e}")
+                self.record_send_failure(request.request_id, f"Stage input processor failed: {e}")
+                return
+            finally:
+                self._processor_state_context.accessor = None
 
         if payload_data is None:
             if not (is_segment_finished or is_finished):
