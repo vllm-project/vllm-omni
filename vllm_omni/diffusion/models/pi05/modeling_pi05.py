@@ -409,11 +409,12 @@ def _compute_layer_suffix_only(
 # ──────────────────────────────────────────────────────────────────────
 # ``Pi05Pipeline`` enables them together with its CUDA graphs (the stage leaves
 # ``enforce_eager`` unset) through ``Pi05ForActionPrediction.enable_fused_kernels``;
-# the eager baseline never runs them. In the prefix they apply only RoPE and
-# the GELU and leave every reduction to the torch op eager runs, so the prefix
-# K/V every denoising step reads is bit-exact with eager; in the action
-# expert, whose GEMMs have only ``chunk_size`` rows, they replace whole layers
-# and the output head. They read every weight in place and write K/V straight
+# the eager baseline never runs them. In the prefix, in either dtype, they apply
+# only RoPE and the GELU and leave every reduction to the torch op eager runs,
+# so the prefix K/V every denoising step reads is bit-exact with eager. In the
+# action expert, whose GEMMs have only ``chunk_size`` rows, they replace whole
+# layers and the output head: in bfloat16 including the GEMMs, in float32
+# around cuBLAS GEMMs. They read every weight in place and write K/V straight
 # into the ``Pi05KVCache`` slots the eager path copies into.
 #
 # Numerics: each kernel performs the eager path's operations in its order, in
@@ -421,9 +422,10 @@ def _compute_layer_suffix_only(
 # narrower dtype is rounded there too (``_round``), and kernels launch with
 # ``enable_fp_fusion=False`` so no multiply-add is contracted into an FMA that
 # eager does not have (the one it has, in torch's GELU, is spelled out). What
-# still differs is the order of reductions: GEMM accumulation, the RMS
-# variance and the softmax sums. An elementwise kernel is therefore bit-exact
-# with eager, and the others differ by reduction-order rounding only.
+# still differs, in the action expert, is the order of reductions: GEMM
+# accumulation, the RMS variance and the softmax sums. An elementwise kernel
+# is therefore bit-exact with eager, and the others differ by reduction-order
+# rounding only.
 # ``tests/diffusion/models/pi05/test_pi05_fused_kernels.py`` holds each kernel
 # to that.
 

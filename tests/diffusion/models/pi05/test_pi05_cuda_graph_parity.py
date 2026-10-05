@@ -3,34 +3,13 @@
 """π0.5's optimized path (fused Triton kernels under CUDA graphs) against the eager baseline.
 
 Loads the real checkpoint once per serving dtype through ``Pi05Pipeline`` with
-``enforce_eager=False``, which enables the fused kernels and captures the CUDA
-graphs over them at init, and runs ``sample_actions`` on simulated robot
-observations with 1, 2 and 3 real camera views, each at the configured
-denoising-step count and at a per-request override. Every case runs on the
-eager baseline, then with the fused kernels outside the graphs, then on the
-optimized path (twice, in both case orders, so a region replaying stale
-buffers from the previous case is caught).
-
-Two expectations follow from what changes the computation:
-
-* Graph capture and replay change nothing: the optimized path is bit-exact
-  with the same fused kernels run eagerly, and every region must have replayed
-  its graph rather than fallen back to eager.
-* The fused kernels reorder reductions (GEMM accumulation, RMS variance,
-  softmax sums) but keep eager's operations and rounding points
-  (``test_pi05_fused_kernels.py``), so the optimized path is held to eager by
-  a tolerance. float32 drifts by reduction-order noise; bfloat16 by the
-  rounding flips that noise sets off, which is the same size as the drift
-  between eager bfloat16 and eager float32.
-
-Further checks: a region falling back to eager mixes bit-exactly with
-replayed ones, no graph replays under a default dtype other than the float32
-it was captured under, ``sample_actions`` never syncs with the host, and it
-fills the KV cache the pipeline preallocates.
-
-All paths share one model; only ``model.cuda_graphs`` and the backbone's
-``fused_kernels`` switch are swapped. The float32 checkpoint alone is
-~14.5 GB, so a second copy would not fit a 16 GB card.
+``enforce_eager=False`` and runs ``sample_actions`` on simulated robot
+observations with 1, 2 and 3 camera views, at the configured denoising-step
+count and at a per-request override. Each case runs on the eager baseline,
+on the fused kernels outside the graphs, and on the optimized path (twice, in
+both case orders). All paths share one model, swapping only
+``model.cuda_graphs`` and the backbone's ``fused_kernels`` switch, so the
+float32 checkpoint (~14.5 GB) fits a 16 GB card.
 
 Needs a CUDA GPU and the real checkpoint::
 
@@ -78,13 +57,12 @@ PROMPT = "pick up the red block and place it in the bin"
 
 # How far the optimized path may move a chunk from the eager baseline, per
 # serving dtype: (relative L2, largest absolute difference).
-# * float32: reduction-order noise, measured at most 1.5e-6 and 3.3e-6 on these
-#   cases; the bound leaves room for other GPUs' cuBLAS kernel choices and is
-#   still far below any real error.
+# * float32: reduction-order noise, measured at most 2.8e-7 and 9.5e-7 on these
+#   cases on an RTX 5080; the bound leaves room for other GPUs' cuBLAS kernel
+#   choices and is still far below any real error.
 # * bfloat16: no further than the bfloat16 layout itself moves a chunk from
 #   float32, which eager bfloat16 does by up to 2.4% and 0.049 on these cases.
-#   Measured: at most 1.4% and 0.021, and fused bfloat16 is as close to eager
-#   float32 as eager bfloat16 is.
+#   Measured: at most 0.22% and 0.0068 on an RTX 5080.
 TOLERANCE = {torch.float32: (1e-4, 1e-4), torch.bfloat16: (2.5e-2, 5e-2)}
 
 
