@@ -341,7 +341,7 @@ python examples/offline_inference/text_to_image/text_to_image.py \
 #### CFG Parallel
 
 Set `--cfg-parallel-size 2` to enable CFG Parallel for faster inference on multi-GPU setups.
-See more examples in the [cfg_parallel user guide](../../../docs/user_guide/parallelism/cfg_parallel.md#using-cfg-parallel).
+See more examples in the [cfg_parallel user guide](../../../docs/user_guide/diffusion/parallelism/cfg_parallel.md).
 
 #### LoRA
 
