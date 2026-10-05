@@ -738,6 +738,41 @@ def test_a_late_segment_end_of_a_timed_out_unit_is_not_credited_to_the_next_unit
     assert _decisions(sent) == [[("timed_out", "no_progress")], [("speak", None)]]
 
 
+def test_a_unit_timed_out_before_its_acceptance_keeps_the_segment_end_that_overtakes_it() -> None:
+    """Settled is not resolved: the next unit, queued behind it, is never claimed in its place."""
+    now = [0.0]
+    clock, sent = _clock(now=now)
+    (first,) = _append(clock, accepted=False)  # parked in its Stage-0 submission
+    now[0] = DEFAULT_UNIT_TIMEOUT_S
+    assert clock.expire() is True  # settled before its acceptance callback ran
+    (second,) = _append(clock, accepted=False)  # queued behind the first, not submitted yet
+
+    _progress(clock, stage_id=0, decision="listen")  # the first's segment end overtakes its callback
+    assert (first.ordinal, second.ordinal) == (1, None)
+    assert [e.input_index for e in sent] == [1], "the second unit has not been submitted"
+
+    clock.unit_submitted(first)  # the first's callback, late
+    clock.unit_submitted(second)
+    assert second.ordinal == 2
+    _progress(clock, stage_id=0, decision="listen")
+    assert [e.input_index for e in sent] == [1, 2]
+    assert _decisions(sent) == [[("timed_out", "no_progress")], [("listen", None)]]
+
+
+def test_a_timed_out_unit_that_never_reached_stage0_leaves_the_pipeline() -> None:
+    now = [0.0]
+    clock, sent = _clock(now=now)
+    (first,) = _append(clock, accepted=False)
+    now[0] = DEFAULT_UNIT_TIMEOUT_S
+    assert clock.expire() is True
+    clock.append_finished(first)  # its submission ended without reaching Stage 0
+    (second,) = _append(clock, accepted=False)
+
+    _progress(clock, stage_id=0, decision="listen")  # the second's segment end, ahead of its callback
+    assert second.ordinal == 1
+    assert _decisions(sent) == [[("timed_out", "no_progress")], [("listen", None)]]
+
+
 def test_late_final_stage_output_of_a_timed_out_speaking_unit_stays_its_own() -> None:
     now = [0.0]
     clock, sent = _clock(now=now)
