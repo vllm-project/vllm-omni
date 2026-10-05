@@ -129,6 +129,34 @@ def test_align_bf16_routes_preserves_routes_and_pads_expert_blocks(route_ids):
         assert torch.all(block_routes[block_routes >= ids.numel()] == ids.numel())
 
 
+@pytest.mark.parametrize(
+    "device_type",
+    [
+        pytest.param("cuda", marks=[pytest.mark.cuda, pytest.mark.gpu]),
+        pytest.param("musa", marks=[pytest.mark.musa, pytest.mark.gpu]),
+    ],
+)
+def test_align_bf16_routes_on_device_matches_host(device_type):
+    device = _gpu_device(device_type)
+    # One SP4 rank at 272p: 3 local heads x 256 experts, top-6 routes for 14,601 tokens per head.
+    num_experts = 3 * 256
+    ids = torch.randint(0, num_experts, (14_601 * 3 * 6,), generator=torch.Generator().manual_seed(5))
+    expected = moe._align_bf16_routes(ids, num_experts=num_experts, block_size=128)
+    actual = moe._align_bf16_routes(ids.to(device), num_experts=num_experts, block_size=128)
+    live_blocks = int(expected[2].item()) // 128
+    assert actual[2].cpu().tolist() == expected[2].tolist()
+    assert torch.equal(actual[1][:live_blocks].cpu(), expected[1][:live_blocks])
+
+    def routes_by_expert(sorted_ids, expert_ids):
+        # argsort may order ties differently per device, so compare each expert's route set.
+        routes = sorted_ids[: live_blocks * 128].cpu().view(live_blocks, 128)
+        experts = expert_ids[:live_blocks].cpu().repeat_interleave(128)
+        keys = experts.long() * (ids.numel() + 1) + routes.reshape(-1).long()
+        return torch.sort(keys).values
+
+    assert torch.equal(routes_by_expert(*actual[:2]), routes_by_expert(*expected[:2]))
+
+
 @pytest.mark.cpu
 @pytest.mark.parametrize(("num_tokens", "num_heads"), [(0, 3), (1, 1), (5, 2), (7, 3)])
 def test_bf16_forward_head_offsets_and_interleaved_weights(monkeypatch, num_tokens, num_heads):

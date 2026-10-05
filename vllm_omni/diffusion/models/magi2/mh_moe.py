@@ -86,8 +86,10 @@ def _align_bf16_routes(
     route_count = flat_ids.numel()
     order = torch.argsort(flat_ids)
     sorted_experts = flat_ids[order]
-    counts = torch.zeros(num_experts, device=flat_ids.device, dtype=torch.int64)
-    counts.scatter_add_(0, flat_ids.long(), torch.ones_like(flat_ids, dtype=torch.int64))
+    # Count in int32 and widen once: MUSA's int64 scatter_add_ is far slower than its int32 one.
+    counts = torch.zeros(num_experts, device=flat_ids.device, dtype=torch.int32)
+    counts.scatter_add_(0, flat_ids.long(), torch.ones_like(flat_ids))
+    counts = counts.long()
     padded_counts = ((counts + block_size - 1) // block_size) * block_size
     starts = torch.cumsum(padded_counts, 0) - padded_counts
     ends = torch.cumsum(counts, 0)
