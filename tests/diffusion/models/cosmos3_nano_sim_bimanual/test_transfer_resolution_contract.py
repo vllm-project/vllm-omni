@@ -221,6 +221,14 @@ def test_rollout_history_matches_reference_visibility(window: int, sink: int) ->
     assert not any(phase == "clean" and frame == total - 1 for phase, frame, _ in reads)
 
 
+def test_transfer_does_not_activate_action_frame_dense_storage() -> None:
+    p = pipeline()
+    state = Cosmos3NanoSimBimanualSessionState(session_id="test")
+    state.dense_attention = object()
+    p._prepare_dense_attention(state, [], 1, Cosmos3NanoSimBimanualGeometry(height=32, width=32), 25)
+    assert state.dense_attention is None
+
+
 def test_emphasis_and_explicit_geometry() -> None:
     kwargs = dict(hint="depth", num_frames=121, fps=30, height=480, width=832)
     plain = format_cosmos3_nano_sim_transfer_prompt("A robot moves.", emphasize_control_in_prompt=False, **kwargs)

@@ -84,6 +84,27 @@ def test_collective_rpc_control_method_reraises_worker_error():
 
 
 @pytest.mark.cpu
+def test_kv_memory_release_uses_engine_core_and_propagates_pause_errors():
+    async def run() -> None:
+        release = AsyncMock(return_value=None)
+        pool, client = _make_pool(release_kv_cache_memory_async=release)
+        await pool.collective_rpc(0, "release_kv_cache_memory", timeout=2.0)
+        release.assert_awaited_once_with()
+        client.collective_rpc_async.assert_not_awaited()
+
+        release.side_effect = RuntimeError("requires a completed pause first")
+        with pytest.raises(RuntimeError, match="completed pause"):
+            await pool.collective_rpc(0, "release_kv_cache_memory")
+
+        del client.release_kv_cache_memory_async
+        result = await pool.collective_rpc(0, "release_kv_cache_memory")
+        assert result["supported"] is False
+        client.collective_rpc_async.assert_not_awaited()
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
 def test_collective_rpc_reset_caches_use_control_helpers():
     async def run() -> None:
         reset_prefix = AsyncMock(return_value=True)
@@ -150,6 +171,46 @@ def test_abort_requests_does_not_commit_op_state_when_engine_abort_fails():
         assert output_processor.collected is True
         assert output_processor.committed is False
         abort.assert_awaited_once()
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
+def test_release_request_resources_skips_without_async_chunk():
+    async def run() -> None:
+        call = AsyncMock()
+        pool = StagePool(
+            0,
+            [SimpleNamespace(call_utility_async=call)],  # type: ignore[list-item]
+            stage_vllm_config=SimpleNamespace(model_config=SimpleNamespace(async_chunk=False)),
+        )
+
+        await pool.release_request_resources(["req-1"])
+        call.assert_not_awaited()
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
+def test_release_request_resources_times_out_hung_replica_without_blocking_others(monkeypatch):
+    async def run() -> None:
+        async def hang(*_args):
+            await asyncio.Event().wait()
+
+        live = AsyncMock()
+        pool = StagePool(
+            0,
+            [SimpleNamespace(call_utility_async=hang), SimpleNamespace(call_utility_async=live)],  # type: ignore[list-item]
+            stage_vllm_config=SimpleNamespace(model_config=SimpleNamespace(async_chunk=True)),
+        )
+        monkeypatch.setattr(pool, "RELEASE_RPC_TIMEOUT_S", 0.2)
+
+        release = asyncio.create_task(pool.release_request_resources(["req-1"]))
+        await asyncio.sleep(0.05)
+        live.assert_awaited_once_with("omni_release_request_resources", ["req-1"])
+        assert not release.done()
+
+        await asyncio.wait_for(release, timeout=1.0)
 
     asyncio.run(run())
 

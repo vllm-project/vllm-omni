@@ -446,6 +446,10 @@ class Cosmos3NanoSimTransferPipeline(Cosmos3NanoSimBimanualPipeline):
             raise ARDiffusionRequestRejectedError("max_prompt_tokens must be positive.")
         return limit
 
+    def _prepare_dense_attention(self, state, text_kv, real_text_kv_len, geometry, target_frame):
+        # Transfer retains control/RGB pairs, not the action/video frame layout.
+        state.dense_attention = None
+
     def _append_dense_kv(
         self,
         state: Cosmos3NanoSimBimanualSessionState,

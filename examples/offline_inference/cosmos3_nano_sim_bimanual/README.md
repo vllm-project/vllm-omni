@@ -33,14 +33,13 @@ Omit both `--height` and `--width` to infer an aligned, aspect-preserving
 canvas from the input media, or to use the deployment default when the record
 has no media. Supply both flags to request any policy-valid explicit canvas.
 
-## Inference overrides
+## Checkpoint sampling and history
 
-For `nvidia/Cosmos3-Nano-Sim-Bimanual@1d95a0b5b19d49a24aceebf578cf5e85db310ac0`,
-use `--deploy-config vllm_omni/deploy/cosmos3_nano_sim_bimanual_full_history.yaml`.
-With a conditioning image, every generated chunk uses two denoising steps:
-`[1, 0.8333333333333334]`. Frame 0 is encoded from the image. The four-step
-schedule applies only when generating frame 0 without an image. Full history
-is retained for up to 901 video frames at 480 resolution.
+Sampling uses the checkpoint's `t_list` for every generated chunk, whether it
+contains two or four sigmas. `window_frames: null` retains full history; the
+paged cache is sized from the request's `num_frames`. Streaming sessions must
+declare their total video length up front and keep it fixed across ticks.
+Older checkpoints retain their exported finite window and schedule.
 
 For the preprocessed AgiBot NPZ example:
 
@@ -49,7 +48,7 @@ python examples/offline_inference/cosmos3_nano_sim_bimanual/cosmos3_nano_sim_bim
   --model /checkpoints/cosmos3-nano-sim-bimanual-diffusers \
   --jsonl agibot_eval_257f_npz/samples.jsonl \
   --sample-index 0 \
-  --deploy-config vllm_omni/deploy/cosmos3_nano_sim_bimanual_full_history.yaml \
+  --deploy-config vllm_omni/deploy/cosmos3_nano_sim_bimanual.yaml \
   --num-frames 257 --height 480 --width 640 --fps 30 --seed 42 \
   --output outputs/agibot_257f.mp4
 ```
@@ -62,19 +61,13 @@ action-conditioned image preprocessing:
 python examples/offline_inference/cosmos3_nano_sim_bimanual/cosmos3_nano_sim_bimanual.py \
   --model /checkpoints/cosmos3-nano-sim-bimanual-diffusers \
   --jsonl /data/agibot.jsonl --input-format cookbook --sample-index 0 \
-  --deploy-config vllm_omni/deploy/cosmos3_nano_sim_bimanual_full_history.yaml \
+  --deploy-config vllm_omni/deploy/cosmos3_nano_sim_bimanual.yaml \
   --resolution 480 --num-frames 901 --fps 30 --seed 42 \
   --output outputs/agibot_901f.mp4
 ```
 
 Supply an initial image already at the target canvas (832×480 for 16:9)
 to avoid reflection padding in the generated video.
-
-Overrides live under `stages[0].model_config.inference_overrides`. The last
-`frame_sigma_schedules` entry repeats; chunk starts select schedules by absolute
-latent-frame index. `history_mode: full` requires `max_num_frames`; longer
-rollouts are rejected. Sliding mode accepts `kv_cache_inference_size` and
-`attention_sink_size`. Omitted settings retain the artifact defaults.
 
 ## Action-sidecar and camera inputs
 
@@ -224,10 +217,17 @@ model_config:
 Disabled by default. HSDP + CUDA graphs is currently unsupported and rejected.
 
 Clean K/V commits are batched by default. Set `model_config.clean_commit_mode: framewise`
-to disable batching.
+to disable batching. Batching needs each frame to be a multiple of the KV page size
+(16 tokens on the CUDA and ROCm kernels); other frames, including the 924-token frames of
+the default 720x1280 resolution, are committed frame by frame automatically.
 
 Decode overlap is enabled by default for full-video CUDA requests. Set
 `model_config.overlap_vae_decode: false` for serial decode.
+
+TODO: add and validate production schema-5 examples for camera, AgiBot, MECKA,
+YAM and Behavior-1K once matching input media are available. Prepared action
+sidecars use `action_space: normalized_unified_v1`, 59D `action` rows and
+`domain_names` (one name or one per row); pass them through `action_path`.
 
 ## Cosmos3-Nano-Sim-Transfer
 

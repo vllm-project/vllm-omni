@@ -125,7 +125,6 @@ def test_committed_history_survives_reuse_of_graph_output_storage(frame_causal):
     pipeline.transformer = ReusedOutputs()
     pipeline._ar_diffusion_kv_state = None
     pipeline.manifest = SimpleNamespace(conditioning_tokens_per_frame=0, sink_frames=0, window_frames=4)
-    pipeline.inference_config = SimpleNamespace(sink_frames=0, window_frames=4)
     state = SimpleNamespace(dense_kv_by_branch={})
     geometry = SimpleNamespace(tokens_per_frame=lambda _: 1)
 

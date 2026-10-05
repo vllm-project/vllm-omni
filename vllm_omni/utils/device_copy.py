@@ -20,6 +20,14 @@ from collections.abc import Sequence
 import torch
 
 
+def to_device_nonblocking(tensor: torch.Tensor, device: torch.device | str) -> torch.Tensor:
+    """``tensor.to(device)`` without a host sync when ``tensor`` is on the CPU and ``device`` is CUDA."""
+    device = torch.device(device)
+    if tensor.device.type != "cpu" or device.type != "cuda":
+        return tensor.to(device)
+    return tensor.pin_memory().to(device, non_blocking=True)
+
+
 def index_to_device(values: Sequence[int], device: torch.device | str, dtype: torch.dtype = torch.long) -> torch.Tensor:
     """A host index list as a device tensor, without a host sync."""
     if torch.device(device).type != "cuda":

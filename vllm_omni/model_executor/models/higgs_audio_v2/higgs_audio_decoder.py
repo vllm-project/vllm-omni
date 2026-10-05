@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """HiggsAudio codec decoder kernel for higgs-audio v2.
 
 This module hosts the parameter-side building blocks for the higgs-audio-v2
@@ -16,10 +16,13 @@ from __future__ import annotations
 
 import json
 import os
+import types
 from typing import Any
 
 import torch
 import torch.nn as nn
+
+from vllm_omni.platforms import current_omni_platform
 
 __all__ = [
     "HiggsAudioVQLayer",
@@ -97,6 +100,138 @@ class _Snake1d(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return _snake(x, self.alpha)
+
+
+class _FusedDacSnake1d(nn.Module):
+    """Drop-in for ``transformers`` ``DacModel`` Snake1d with a fused CUDA kernel.
+
+    Same ``alpha`` parameter, so checkpoints load unchanged. Inference on CUDA
+    runs one bit-identical kernel instead of about seven elementwise launches;
+    everything else keeps the transformers expression.
+    """
+
+    def __init__(self, channels: int):
+        super().__init__()
+        self.alpha = nn.Parameter(torch.ones(1, channels, 1))
+        self._inverse: tuple[tuple[int, int], torch.Tensor] | None = None
+
+    def can_fuse(self, x: torch.Tensor) -> bool:
+        # The kernel uses NVIDIA PTX and float32 intermediates. ROCm tensors
+        # also report is_cuda; retain the eager path there and for float64.
+        return (
+            current_omni_platform.is_cuda()
+            and x.is_cuda
+            and x.dim() == 3
+            and not torch.is_grad_enabled()
+            and x.dtype in (torch.float16, torch.bfloat16, torch.float32)
+            and x.dtype == self.alpha.dtype
+        )
+
+    def fused(
+        self,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+        residual: torch.Tensor | None = None,
+        write_sum: bool = False,
+    ) -> tuple[torch.Tensor | None, torch.Tensor]:
+        """Snake of ``residual + (x + bias)`` in one kernel; see ``fused_snake1d``."""
+        from .snake_kernel import fused_snake1d
+
+        alpha = self.alpha.detach()
+        try:
+            key = (alpha.data_ptr(), alpha._version)
+        except RuntimeError:  # inference tensors carry no version counter
+            key = None
+        if key is not None and self._inverse is not None and self._inverse[0] == key:
+            inverse = self._inverse[1]
+        else:
+            # The eager (alpha + 1e-9).reciprocal(), computed once per weight
+            # update in the same dtype instead of on every call.
+            inverse = (alpha + 1e-9).reciprocal().reshape(-1).contiguous()
+            self._inverse = None if key is None else (key, inverse)
+        return fused_snake1d(x, alpha.reshape(-1), inverse, bias=bias, residual=residual, write_sum=write_sum)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.can_fuse(x):
+            return self.fused(x)[1]
+        shape = x.shape
+        x = x.reshape(shape[0], shape[1], -1)
+        x = x + (self.alpha + 1e-9).reciprocal() * torch.sin(self.alpha * x).pow(2)
+        return x.reshape(shape)
+
+
+def _conv_without_bias(conv: nn.Module, x: torch.Tensor) -> torch.Tensor:
+    # cuDNN convolutions add the bias as a separate kernel anyway, so leaving
+    # it to the next fused Snake changes no bits.
+    if isinstance(conv, nn.ConvTranspose1d):
+        return nn.functional.conv_transpose1d(
+            x, conv.weight, None, conv.stride, conv.padding, conv.output_padding, conv.groups, conv.dilation
+        )
+    return conv._conv_forward(x, conv.weight, None)
+
+
+def _fused_dac_decoder_forward(decoder: nn.Module, hidden_state: torch.Tensor) -> torch.Tensor:
+    """transformers ``DacDecoder.forward`` with conv biases and residual adds
+    folded into the Snake kernels (5 elementwise passes per residual unit -> 2).
+
+    A value is carried as ``residual + (raw + bias)`` until the next Snake
+    consumes it, and only materialized where a residual connection needs it.
+    """
+    if not decoder.snake1.can_fuse(hidden_state):
+        return type(decoder).forward(decoder, hidden_state)
+    raw, bias, residual = _conv_without_bias(decoder.conv1, hidden_state), decoder.conv1.bias, None
+    for block in decoder.block:
+        _, act = block.snake1.fused(raw, bias, residual)
+        raw, bias, residual = _conv_without_bias(block.conv_t1, act), block.conv_t1.bias, None
+        for unit in (block.res_unit1, block.res_unit2, block.res_unit3):
+            residual, act = unit.snake1.fused(raw, bias, residual, write_sum=True)
+            _, act = unit.snake2.fused(_conv_without_bias(unit.conv1, act), unit.conv1.bias)
+            raw, bias = _conv_without_bias(unit.conv2, act), unit.conv2.bias
+    _, act = decoder.snake1.fused(raw, bias, residual)
+    return decoder.tanh(decoder.conv2(act))
+
+
+def _fuse_dac_decoder(decoder: nn.Module) -> int:
+    """Swap transformers DAC Snake1d modules for fused ones (before weights
+    load) and, when the decoder has the stock layout, fuse its forward."""
+    try:
+        from transformers.models.dac.modeling_dac import DacDecoder
+        from transformers.models.dac.modeling_dac import Snake1d as DacSnake1d
+    except ImportError:
+        return 0
+    replaced = 0
+    for module in list(decoder.modules()):
+        for name, child in list(module.named_children()):
+            if isinstance(child, DacSnake1d):
+                fused = _FusedDacSnake1d(int(child.alpha.shape[1]))
+                fused.to(device=child.alpha.device, dtype=child.alpha.dtype)
+                setattr(module, name, fused)
+                replaced += 1
+    if type(decoder) is DacDecoder and _has_fusable_dac_layout(decoder):
+        decoder.forward = types.MethodType(_fused_dac_decoder_forward, decoder)
+    return replaced
+
+
+def _has_fusable_dac_layout(decoder: nn.Module) -> bool:
+    convs = [decoder.conv1]
+    for block in decoder.block:
+        units = (block.res_unit1, block.res_unit2, block.res_unit3)
+        convs.append(block.conv_t1)
+        for unit in units:
+            conv1, conv2 = unit.conv1, unit.conv2
+            # Length-preserving convs, so the residual add needs no crop.
+            if conv1.stride[0] != 1 or 2 * conv1.padding[0] != conv1.dilation[0] * (conv1.kernel_size[0] - 1):
+                return False
+            if conv2.stride[0] != 1 or conv2.kernel_size[0] != 1 or conv2.padding[0] != 0:
+                return False
+            convs += [conv1, conv2]
+        if not all(isinstance(m, _FusedDacSnake1d) for m in (block.snake1, *(u.snake1 for u in units))):
+            return False
+        if not all(isinstance(u.snake2, _FusedDacSnake1d) for u in units):
+            return False
+    return isinstance(decoder.snake1, _FusedDacSnake1d) and all(
+        conv.bias is not None and conv.padding_mode == "zeros" for conv in convs
+    )
 
 
 def _wn_conv1d(*args: Any, **kwargs: Any) -> nn.Module:
@@ -248,6 +383,7 @@ def build_higgs_audio_acoustic_decoder(
     dac_cfg = DacConfig(**tokenizer_config["acoustic_model_config"])
     dac_model = DacModel(dac_cfg)
     decoder = dac_model.decoder.to(device)
+    _fuse_dac_decoder(decoder)
     adjust_conv_transpose_output_padding(decoder)
     if hasattr(decoder, "tanh"):
         decoder.tanh = nn.Identity()

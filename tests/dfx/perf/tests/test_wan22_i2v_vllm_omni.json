@@ -125,6 +125,11 @@
             "request_throughput": 0.05263,
             "mean_e2el_ms": 18941.5,
             "mean_peak_memory_mb": 50053.7
+          },
+          "A3": {
+            "request_throughput": 0.0155,
+            "mean_e2el_ms": 64626.4676,
+            "mean_peak_memory_mb": 59932.5714
           }
         }
       },
@@ -161,6 +166,11 @@
             "request_throughput": 0.009595,
             "mean_e2el_ms": 104105.8,
             "mean_peak_memory_mb": 59718.0
+          },
+          "A3": {
+            "request_throughput": 0.0021,
+            "mean_e2el_ms": 469604.3521,
+            "mean_peak_memory_mb": 59889.7714
           }
         }
       }

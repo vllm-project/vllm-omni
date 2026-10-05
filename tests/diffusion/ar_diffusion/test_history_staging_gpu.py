@@ -11,7 +11,7 @@ from tests.diffusion.ar_diffusion.test_paged_attention import (
     N_HEADS,
     POS,
     _commit_video_span,
-    _gpu_flash_attn_usable,
+    _require_gpu_flash_attn,
     make_state,
 )
 from tests.helpers.mark import hardware_test
@@ -22,14 +22,18 @@ from vllm_omni.platforms import current_omni_platform
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
 
 
-@pytest.mark.skipif(
-    torch.version.hip is not None or not _gpu_flash_attn_usable(), reason="usable CUDA FlashAttention is required"
-)
+def _require_cuda_flash_attn() -> None:
+    if torch.version.hip is not None:
+        pytest.skip("usable CUDA FlashAttention is required")
+    _require_gpu_flash_attn()
+
+
 @hardware_test(res={"cuda": ["L4", "H100"]}, num_cards=1)
 @pytest.mark.parametrize("window_chunks", [2, 4])
 @torch.inference_mode()
 def test_staged_attention_updates_only_the_active_window_gpu(monkeypatch, window_chunks):
     """Full and reused gathers match fresh attention without touching spare capacity or stale history."""
+    _require_cuda_flash_attn()
     monkeypatch.setenv(KV_GATHER_ENV, "1")
     device, dtype = torch.device("cuda"), torch.bfloat16
     kv, st = make_state(device=device, dtype=dtype, window_chunks=window_chunks, reuse_history_staging=True)
@@ -65,15 +69,13 @@ def test_staged_attention_updates_only_the_active_window_gpu(monkeypatch, window
             assert (staged[inputs.max_seq_len :] == -7).all()
 
 
-@pytest.mark.skipif(
-    torch.version.hip is not None or not _gpu_flash_attn_usable(), reason="usable CUDA FlashAttention is required"
-)
 @hardware_test(res={"cuda": ["L4", "H100"]}, num_cards=1)
 @pytest.mark.parametrize("window_chunks", [2, 4])
 @pytest.mark.parametrize("reuse_history", [False, True])
 @torch.inference_mode()
 def test_staged_attention_replays_inductor_cudagraph(monkeypatch, window_chunks, reuse_history):
     """Inductor must capture the real mutable op and replay with fresh current K/V."""
+    _require_cuda_flash_attn()
     monkeypatch.setenv(KV_GATHER_ENV, "1")
     device, dtype = torch.device("cuda"), torch.bfloat16
     kv, st = make_state(device=device, dtype=dtype, window_chunks=window_chunks, reuse_history_staging=True)

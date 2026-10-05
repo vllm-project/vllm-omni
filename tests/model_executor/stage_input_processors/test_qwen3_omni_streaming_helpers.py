@@ -971,12 +971,14 @@ def test_cosyvoice3_text2flow_full_payload_nested_fallback() -> None:
 
 
 def test_cosyvoice3_full_payload_replace_keys_present() -> None:
-    """Confirm _FULL_PAYLOAD_REPLACE_KEYS lists the three embed.* keys."""
+    """Reference tensors and their length travel as complete snapshots."""
     from vllm_omni.model_executor.stage_input_processors.cosyvoice3 import (
         _FULL_PAYLOAD_REPLACE_KEYS,
     )
 
-    assert _FULL_PAYLOAD_REPLACE_KEYS == frozenset({"embed.speech_token", "embed.speech_feat", "embed.embedding"})
+    assert _FULL_PAYLOAD_REPLACE_KEYS == frozenset(
+        {"embed.speech_token", "embed.speech_token_len", "embed.speech_feat", "embed.embedding"}
+    )
 
 
 def test_ming_flash_omni_thinker2talker_token_only_smoke() -> None:
@@ -1047,3 +1049,80 @@ def test_qwen2_5_omni_thinker2talker_full_payload_noop() -> None:
 
     payload = thinker2talker_full_payload(None, {"any": "thing"}, None)
     assert payload is None
+
+
+def _codec_transfer_manager(request_id: str, *, initial_frames: int = 2, chunk_frames: int = 4):
+    return SimpleNamespace(
+        code_prompt_token_ids=defaultdict(list),
+        put_req_chunk=defaultdict(int, {request_id: 0}),
+        connector=SimpleNamespace(
+            config={
+                "extra": {
+                    "initial_codec_chunk_frames": initial_frames,
+                    "codec_chunk_frames": chunk_frames,
+                    "codec_left_context_frames": 4,
+                }
+            }
+        ),
+    )
+
+
+def _codec_request(request_id: str) -> SimpleNamespace:
+    return SimpleNamespace(
+        external_req_id=request_id,
+        sampling_params=SimpleNamespace(stop_token_ids=[2150], stop_token_id=None),
+    )
+
+
+def test_talker2code2wav_async_chunk_reads_last_valid_row_of_multi_row_span() -> None:
+    # MRv2 eager frames: a prefill span carries its first frame in its last row.
+    request_id = "eager_prefill"
+    manager = _codec_transfer_manager(request_id)
+    codes = torch.zeros((5, 3), dtype=torch.long)
+    codes[-1] = torch.tensor([11, 12, 13])
+    valid = torch.tensor([0, 0, 0, 0, 1], dtype=torch.int8)
+
+    payload = q3.talker2code2wav_async_chunk(
+        manager, {"codes": {"audio": codes}, "meta": {"codec_frame_valid": valid}}, _codec_request(request_id)
+    )
+
+    assert payload is None  # below the initial chunk size
+    assert [frame.tolist() for frame in manager.code_prompt_token_ids[request_id]] == [[[11, 12, 13]]]
+
+
+def test_talker2code2wav_async_chunk_skips_invalid_frame_and_flushes_on_finish() -> None:
+    request_id = "eager_eos"
+    manager = _codec_transfer_manager(request_id)
+    manager.code_prompt_token_ids[request_id] = [torch.tensor([[7, 8, 9]])]
+    # The step that sampled codec EOS carries an invalid (placeholder) frame.
+    output = {
+        "codes": {"audio": torch.tensor([[2150, 0, 0]])},
+        "meta": {"codec_frame_valid": torch.tensor([0], dtype=torch.int8)},
+    }
+
+    payload = q3.talker2code2wav_async_chunk(manager, output, _codec_request(request_id), is_finished=True)
+
+    assert len(manager.code_prompt_token_ids[request_id]) == 1
+    assert payload is not None
+    assert payload.codes.audio.tolist() == [7, 8, 9]
+    assert payload.meta.finished.item() is True
+
+
+def test_talker2code2wav_async_chunk_without_validity_keeps_one_row_contract() -> None:
+    # V1 / MRv2 deferred frames: one row per step, zero rows are prefill
+    # placeholders and a stop-token CB0 marks the post-EOS step.
+    request_id = "legacy_rows"
+    manager = _codec_transfer_manager(request_id)
+    request = _codec_request(request_id)
+
+    assert (
+        q3.talker2code2wav_async_chunk(manager, {"codes": {"audio": torch.zeros((4, 3), dtype=torch.long)}}, request)
+        is None
+    )
+    assert q3.talker2code2wav_async_chunk(manager, {"codes": {"audio": torch.tensor([[2150, 1, 1]])}}, request) is None
+    assert manager.code_prompt_token_ids[request_id] == []
+    q3.talker2code2wav_async_chunk(manager, {"codes": {"audio": torch.tensor([[5, 6, 7]])}}, request)
+    payload = q3.talker2code2wav_async_chunk(manager, {"codes": {"audio": torch.tensor([[8, 9, 10]])}}, request)
+
+    assert payload is not None  # two frames fill the initial chunk
+    assert payload.codes.audio.tolist() == [5, 8, 6, 9, 7, 10]

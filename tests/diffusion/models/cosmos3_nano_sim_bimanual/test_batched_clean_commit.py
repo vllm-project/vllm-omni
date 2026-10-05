@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Compare real clean-refresh layer math and managed caches across window rolls."""
 
 from __future__ import annotations
@@ -55,14 +56,14 @@ def layers(device, dtype):
     return result.to(device=device, dtype=dtype).eval()
 
 
-def state(device, dtype, window, sink):
+def state(device, dtype, window, sink, page_size=None):
     cache = ARDiffusionKVCache(
         ARDiffusionKVConfig(enable=True, chunk_size=BLOCK, window_chunks=window, sink_chunks=sink),
         num_layers=LAYERS,
         num_kv_heads=2,
         head_size=HEAD,
         dtype=dtype,
-        block_size=BLOCK,
+        block_size=BLOCK if page_size is None else page_size,
         max_model_len=4096,
         available_bytes=1 << 25,
         kv_branches=(ARDiffusionKVBranchSpec("main", 0),),
@@ -75,7 +76,20 @@ def state(device, dtype, window, sink):
 
 
 @torch.no_grad()
-def run_forward(net, h, text, start, *, paged=None, dense=None, batched=False, window=5, sink=0, commit=True):
+def run_forward(
+    net,
+    h,
+    text,
+    start,
+    *,
+    paged=None,
+    dense=None,
+    batched=False,
+    window=5,
+    sink=0,
+    commit=True,
+    dense_cache=None,
+):
     frames = h.shape[1] // BLOCK
     nulls = tuple(i for i in range(frames) if (start + i) % 3 == 0)
     positions = torch.arange(start * BLOCK, (start + frames) * BLOCK, device=h.device).float()
@@ -100,7 +114,9 @@ def run_forward(net, h, text, start, *, paged=None, dense=None, batched=False, w
             real_text_kv_len=text[index][0].shape[1],
             freqs_cos=cos,
             freqs_sin=sin,
-            dense_history=None if dense is None else dense[index],
+            dense_history=None if dense is None or dense_cache is not None else dense[index],
+            dense_joint_kv=None if dense_cache is None else dense_cache.kv[index],
+            dense_history_tokens=0 if dense_cache is None else dense_cache.history_length,
             paged_context=None if contexts is None else contexts[index].to_layer_inputs(),
             num_frames=frames,
             tokens_per_frame=BLOCK,
@@ -111,6 +127,8 @@ def run_forward(net, h, text, start, *, paged=None, dense=None, batched=False, w
         current.append((k, v))
     if paged is not None:
         paged.commit_paged_context("main")
+    elif commit and dense_cache is not None:
+        dense = dense_cache.commit(frames * BLOCK)
     elif commit:
         for offset in range(frames):
             dense = append_dense_kv_history(
@@ -126,7 +144,7 @@ def run_forward(net, h, text, start, *, paged=None, dense=None, batched=False, w
     return h, dense
 
 
-def compare(*, device, dtype, history, window, sink, frames, paged):
+def compare(*, device, dtype, history, window, sink, frames, paged, page_size=None):
     torch.manual_seed(123)
     net = layers(device, dtype)
     text = [
@@ -134,7 +152,11 @@ def compare(*, device, dtype, history, window, sink, frames, paged):
         for _ in net
     ]
     inputs = torch.randn(1, (history + frames + 1) * BLOCK, WIDTH, device=device, dtype=dtype)
-    a, b = (state(device, dtype, window, sink), state(device, dtype, window, sink)) if paged else (None, None)
+    a, b = (
+        (state(device, dtype, window, sink, page_size), state(device, dtype, window, sink, page_size))
+        if paged
+        else (None, None)
+    )
     da = db = None
     tolerance = 5e-2 if dtype == torch.bfloat16 else 2e-5
     try:
@@ -161,18 +183,20 @@ def compare(*, device, dtype, history, window, sink, frames, paged):
         )
         torch.testing.assert_close(actual, torch.cat(sequential, dim=1), atol=tolerance, rtol=tolerance)
         if paged:
+            assert a is not None and b is not None
             assert a.adapter("main").completed_chunks == b.adapter("main").completed_chunks == history + frames
             for layer in range(LAYERS):
                 ia = a.kv_cache.window_block_ids(a.adapter("main"))
                 ib = b.kv_cache.window_block_ids(b.adapter("main"))
                 assert len(ia) == len(ib)
                 for accessor in ("key_cache", "value_cache"):
-                    torch.testing.assert_close(
-                        getattr(a.kv_cache, accessor)(layer)[ia],
-                        getattr(b.kv_cache, accessor)(layer)[ib],
-                        atol=tolerance,
-                        rtol=tolerance,
-                    )
+                    ka = getattr(a.kv_cache, accessor)(layer)[ia].flatten(0, 1)
+                    kb = getattr(b.kv_cache, accessor)(layer)[ib].flatten(0, 1)
+                    tail = a.adapter("main").num_computed_tokens % a.kv_cache.block_size
+                    if tail:
+                        padding = a.kv_cache.block_size - tail
+                        ka, kb = ka[:-padding], kb[:-padding]
+                    torch.testing.assert_close(ka, kb, atol=tolerance, rtol=tolerance)
         else:
             for pair_a, pair_b in zip(da, db, strict=True):
                 for ka, kb in zip(pair_a, pair_b, strict=True):
@@ -315,3 +339,34 @@ def test_framewise_paged_attention_preserves_single_frame_numerics(tokens_per_fr
         **kwargs,
     )
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.cpu
+def test_real_frame_geometry_on_small_pages_cpu(monkeypatch):
+    monkeypatch.setitem(globals(), "BLOCK", 394)
+    compare(
+        device=torch.device("cpu"), dtype=torch.float32, history=1, window=5, sink=0, frames=2, paged=True, page_size=16
+    )
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA FlashAttention")
+@pytest.mark.parametrize("frame_tokens", [394, 924])
+@pytest.mark.parametrize("fa_version", [2, 4])
+def test_real_frame_geometry_on_small_pages_cuda(monkeypatch, frame_tokens, fa_version):
+    from vllm_omni.experimental.ar_diffusion.kv_cache import paged_attention
+
+    if fa_version == 4 and torch.cuda.get_device_capability()[0] < 10:
+        pytest.skip("FA4 validation requires Blackwell")
+    monkeypatch.setitem(globals(), "BLOCK", frame_tokens)
+    monkeypatch.setattr(paged_attention, "_resolve_fa_version", lambda head_size: fa_version)
+    compare(
+        device=torch.device("cuda"),
+        dtype=torch.bfloat16,
+        history=1,
+        window=5,
+        sink=0,
+        frames=2,
+        paged=True,
+        page_size=16,
+    )

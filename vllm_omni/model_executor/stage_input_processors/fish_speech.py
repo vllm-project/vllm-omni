@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Stage input processor for Fish Speech S2 Pro: Slow AR → DAC Decoder."""
 
 from collections.abc import Mapping
@@ -122,9 +125,9 @@ def slow_ar_to_dac_decoder_async_chunk(
 ) -> OmniPayloadStruct | None:
     """Async streaming processor: emit code chunks as they are produced.
 
-    Accumulates per-step codes and emits fixed-size chunks with left context
-    overlap for smooth audio transitions, analogous to
-    ``talker2code2wav_async_chunk`` in Qwen3 TTS.
+    Accumulates per-step codes and emits contiguous chunks with left context
+    overlap. The per-request output frontier remains absolute when the backlog
+    policy changes the chunk size; a final callback flushes every pending frame.
     """
     request_id = request.external_req_id
     finished = bool(is_finished or request.is_finished())
@@ -174,49 +177,41 @@ def slow_ar_to_dac_decoder_async_chunk(
             )
         return None
 
-    single_initial_chunk = _cfg_bool(
-        cfg,
-        "fish_speech_single_initial_chunk",
-        False,
+    # Keep the absolute output frontier in the request payload so that changing
+    # the backlog chunk size cannot reinterpret frames already emitted. Both
+    # connector runtimes reclaim request_payload on completion/cancellation.
+    request_payload = getattr(transfer_manager, "request_payload", None)
+    if request_payload is None:
+        request_payload = {}
+        transfer_manager.request_payload = request_payload
+    state = request_payload.setdefault(request_id, {}).setdefault(
+        "_fish_speech_async_state", {"emitted_frames": 0, "terminal_sent": False}
     )
-    use_first_chunk = initial_chunk_size > 0 and initial_chunk_size < steady_chunk_size
+    if state["terminal_sent"]:
+        return None
+    emitted_frames = state["emitted_frames"]
+    pending = length - emitted_frames
+    if pending <= 0:
+        if not finished:
+            return None
+        state["terminal_sent"] = True
+        return OmniPayloadStruct(
+            codes=CodesStruct(audio=torch.empty(0, dtype=torch.long)),
+            meta=MetaStruct(finished=torch.tensor(True, dtype=torch.bool)),
+        )
 
-    if single_initial_chunk and use_first_chunk:
-        if length <= initial_chunk_size:
-            if not finished and length < initial_chunk_size:
-                return None
-            context_length = length if finished and length < initial_chunk_size else initial_chunk_size
-        else:
-            adjusted = length - initial_chunk_size
-            if adjusted <= 0:
-                return None
-            if not finished and adjusted % steady_chunk_size != 0:
-                return None
-            chunk_length = adjusted % steady_chunk_size
-            context_length = chunk_length if chunk_length != 0 else steady_chunk_size
-        end_index = min(length, left_context_size_config + context_length)
-        left_context_size = max(0, int(end_index - context_length))
-        window_frames = transfer_manager.code_prompt_token_ids[request_id][-end_index:]
-    elif initial_chunk_size > 0 and length <= chunk_size:
-        already_sent = transfer_manager.put_req_chunk[request_id] * initial_chunk_size
-        pending = length - already_sent
-        if pending <= 0:
-            return None
-        if pending < initial_chunk_size and not finished:
-            return None
-        context_length = min(pending, initial_chunk_size)
-        left_context_size = max(0, length - context_length)
-        window_frames = transfer_manager.code_prompt_token_ids[request_id][:length]
-    else:
-        initial_coverage = (chunk_size // initial_chunk_size) * initial_chunk_size if initial_chunk_size > 0 else 0
-        adjusted = length - initial_coverage
-        chunk_length = adjusted % steady_chunk_size
-        if chunk_length != 0 and not finished:
-            return None
-        context_length = chunk_length if chunk_length != 0 else steady_chunk_size
-        end_index = min(length, left_context_size_config + context_length)
-        left_context_size = max(0, int(end_index - context_length))
-        window_frames = transfer_manager.code_prompt_token_ids[request_id][-end_index:]
+    single_initial_chunk = _cfg_bool(cfg, "fish_speech_single_initial_chunk", False)
+    initial_coverage = (
+        (initial_chunk_size if single_initial_chunk else (chunk_size // initial_chunk_size) * initial_chunk_size)
+        if initial_chunk_size > 0
+        else 0
+    )
+    target_chunk_size = initial_chunk_size if emitted_frames < initial_coverage else steady_chunk_size
+    if not finished and pending < target_chunk_size:
+        return None
+
+    left_context_size = min(emitted_frames, left_context_size_config)
+    window_frames = transfer_manager.code_prompt_token_ids[request_id][emitted_frames - left_context_size : length]
 
     # Pack into codebook-major codes. The tensor path avoids expanding codec
     # indices into Python ints across the connector boundary; Stage1 schedules
@@ -228,6 +223,8 @@ def slow_ar_to_dac_decoder_async_chunk(
     else:
         code_predictor_codes = codes_qf.reshape(-1)
 
+    state["emitted_frames"] = length
+    state["terminal_sent"] = finished
     return OmniPayloadStruct(
         codes=CodesStruct(audio=code_predictor_codes),
         meta=MetaStruct(

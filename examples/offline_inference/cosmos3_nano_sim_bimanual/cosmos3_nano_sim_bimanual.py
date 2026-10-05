@@ -13,7 +13,6 @@ from typing import Any
 
 import numpy as np
 import torch
-import yaml
 from PIL import Image, UnidentifiedImageError
 
 
@@ -35,6 +34,21 @@ def _load_record(jsonl_path: Path, sample_index: int) -> dict[str, Any]:
                 value = archive[key]
                 payload[key] = value.item() if value.ndim == 0 else value
         record = {**payload, **record}
+    if record.get("action_path") is not None:
+        path = Path(record["action_path"])
+        if not path.is_absolute():
+            path = jsonl_path.parent / path
+        payload = json.loads(path.read_text())
+        if not isinstance(payload, dict):
+            return record  # Legacy cookbook arrays retain their existing preparation path.
+        if payload.get("action_space") != "normalized_unified_v1":
+            raise ValueError("Expected a normalized_unified_v1 action sidecar")
+        record = {**record, "action": payload["action"], "action_space": payload["action_space"]}
+        if payload.get("domain_names") is not None:
+            record["domain_names"] = payload["domain_names"]
+        elif payload.get("domain_id") is not None:
+            record["domain_id"] = payload["domain_id"]
+        record.setdefault("image", record.get("vision_path"))
     return record
 
 
@@ -175,7 +189,7 @@ def _reference_request(
     if domain_name is not None:
         extra["domain_name"] = str(domain_name)
     if record.get("domain_id") is not None:
-        extra["domain_id"] = int(record["domain_id"])
+        extra["domain_id"] = record["domain_id"]
     if action is not None:
         extra["action"] = action
     if "action_space" in record:
@@ -205,28 +219,21 @@ def _video_metadata(path: Path) -> dict[str, Any]:
 
 def main() -> None:
     args = parse_args()
+    from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.config import Cosmos3NanoSimBimanualManifest
     from vllm_omni.entrypoints.omni import Omni
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams
     from vllm_omni.platforms import current_omni_platform
 
-    manifest = None
-    inference_config = None
-    if args.input_format == "cookbook":
-        from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.config import Cosmos3NanoSimBimanualManifest
+    config_path = Path(args.model) / "transformer" / "config.json"
+    if not config_path.is_file() and not Path(args.model).exists():
+        from huggingface_hub import hf_hub_download
 
-        config_path = Path(args.model) / "transformer" / "config.json"
-        manifest = Cosmos3NanoSimBimanualManifest.from_od_config(
-            SimpleNamespace(tf_model_config=json.loads(config_path.read_text(encoding="utf-8")))
-        )
-        manifest.require_exported_artifact()
-        from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.inference_config import (
-            Cosmos3NanoSimBimanualInferenceConfig,
-        )
-
-        deployment = yaml.safe_load(Path(args.deploy_config).read_text())
-        inference_config = Cosmos3NanoSimBimanualInferenceConfig.from_od_config(
-            SimpleNamespace(model_config=deployment["stages"][0].get("model_config", {})), manifest
-        )
+        config_path = Path(hf_hub_download(args.model, "transformer/config.json"))
+    artifact = Cosmos3NanoSimBimanualManifest.from_od_config(
+        SimpleNamespace(tf_model_config=json.loads(config_path.read_text(encoding="utf-8")))
+    )
+    artifact.require_exported_artifact()
+    manifest = artifact if args.input_format == "cookbook" else None
     count = sum(bool(line.strip()) for line in args.jsonl.read_text().splitlines())
     indexes = range(count) if args.all_samples else [args.sample_index]
     if count == 0:
@@ -241,6 +248,11 @@ def main() -> None:
             started = time.perf_counter()
             try:
                 record = _load_record(args.jsonl, index)
+                if record.get("domain_names") is not None:
+                    names = record["domain_names"]
+                    if not isinstance(names, list) or not names:
+                        raise ValueError("domain_names must be a nonempty list")
+                    record["domain_id"] = [artifact.resolve_domain_name(name) for name in names]
                 status["name"] = str(record.get("name", f"sample_{index}"))
                 if args.output_dir:
                     name = re.sub(r"[^A-Za-z0-9_.-]", "_", status["name"]).strip(".") or "sample"
@@ -285,13 +297,12 @@ def main() -> None:
                     status.update(prepared.metadata)
                     status.pop("num_steps", None)
                     status.update(
-                        window_frames=inference_config.window_frames,
-                        sink_frames=inference_config.sink_frames,
-                        history_mode=inference_config.history_mode,
+                        window_frames=manifest.window_frames,
+                        sink_frames=manifest.sink_frames,
                         sampler=manifest.sample_type,
-                        frame_sigma_schedules=inference_config.frame_sigma_schedules,
-                        num_steps_by_frame=[len(row) for row in inference_config.frame_sigma_schedules],
-                        inference_id=inference_config.digest,
+                        t_list=manifest.t_list,
+                        num_steps=len(manifest.t_list),
+                        inference_id=manifest.digest,
                     )
                     if prepared.poses is not None:
                         pose_path = output.with_suffix(".camera_trajectory.json")

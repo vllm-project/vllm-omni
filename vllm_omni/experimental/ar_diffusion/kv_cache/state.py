@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Model-facing session state backed by paged AR-Diffusion KV storage."""
 
 from __future__ import annotations
@@ -9,9 +10,11 @@ from typing import TYPE_CHECKING
 import torch
 from vllm.logger import init_logger
 
+from vllm_omni.experimental.ar_diffusion.kv_cache.paged import compute_slot_mapping
 from vllm_omni.experimental.ar_diffusion.kv_cache.paged_attention import (
     ARDiffusionPagedForwardContext,
     ARDiffusionPagedLayerContext,
+    _to_device_async,
 )
 
 if TYPE_CHECKING:
@@ -103,11 +106,9 @@ class ARDiffusionKVState:
         defined as history can use it to include the current chunk in addition.
         """
         cs = self.kv_cache.spec.chunk_size
-        if frame_causal and (
-            not commit_current or seq_len <= 0 or cs != self.kv_cache.block_size or extra_visible_tokens != cs
-        ):
+        if frame_causal and (not commit_current or seq_len <= 0 or extra_visible_tokens != cs):
             raise ValueError(
-                "Frame-causal clean refresh requires committing frame-sized blocks and exactly one extra visible frame"
+                "Frame-causal clean refresh requires committing complete frames and exactly one extra visible frame"
             )
         if int(seq_len) % cs != 0:
             raise AssertionError(
@@ -168,11 +169,16 @@ class ARDiffusionKVState:
                     # all old history. Sequential allocation preserves the
                     # manager's sink/window eviction and partial-chunk rules.
                     table = self.kv_cache.allocate_chunk(ctx.adapter)
-                    destination = table[ctx.adapter.num_computed_tokens // ctx.block_size]
-                    source = ctx.current_video_block_ids[frame]
+                    size = self.kv_cache.spec.chunk_size
+                    start = ctx.adapter.num_computed_tokens
+                    assert ctx.current_video_slot_mapping is not None
+                    source = ctx.current_video_slot_mapping[frame * size : (frame + 1) * size]
+                    destination = _to_device_async(
+                        compute_slot_mapping(table, torch.arange(start, start + size), ctx.block_size), source.device
+                    )
                     for layer in range(self.num_layers):
-                        self.kv_cache.key_cache(layer)[destination].copy_(self.kv_cache.key_cache(layer)[source])
-                        self.kv_cache.value_cache(layer)[destination].copy_(self.kv_cache.value_cache(layer)[source])
+                        for pool in (self.kv_cache._k_pools[layer], self.kv_cache._v_pools[layer]):
+                            pool.index_copy_(0, destination, pool.index_select(0, source))
                 self.kv_cache.commit_chunk(ctx.adapter)
             self._committed[kv_branch] += ctx.seq_len
             _log.debug(

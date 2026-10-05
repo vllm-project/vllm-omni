@@ -94,6 +94,19 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         patch_minicpmo_remote_config(config)
 
         self.model_stage = vllm_config.model_config.model_stage
+        self._use_v2_model_runner = bool(getattr(vllm_config.model_config, "use_v2_model_runner", False))
+        if (
+            self.model_stage == "llm"
+            and self._use_v2_model_runner
+            and getattr(vllm_config.model_config, "session_mode", "turn") != "turn"
+        ):
+            raise NotImplementedError("MiniCPM-o duplex Thinker requires model_runner: v1")
+        if (
+            self.model_stage == "llm"
+            and self._use_v2_model_runner
+            and getattr(vllm_config.model_config, "async_chunk", False)
+        ):
+            raise ValueError("MiniCPM-o MRv2 Thinker requires async_chunk: false for its full llm2tts payload")
         # The Thinker's row ledger needs real token identities even when
         # embeddings are supplied, including during CUDA graph capture/replay.
         self.requires_raw_input_tokens = self.model_stage == "llm"
@@ -155,6 +168,22 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             if hasattr(self.talker, "init_multi_modal"):
                 self.talker.init_multi_modal(config)
             self.model = self.talker
+            # The runner looks this hook up on the wrapper. Without it every
+            # decode row runs scalar preprocess, which reads its codec id with
+            # a blocking ``.item()``.
+            batch_decode = getattr(self.talker, "preprocess_decode_batch", None)
+            if callable(batch_decode):
+                self.preprocess_decode_batch = batch_decode
+            # Model Runner V2 hooks: device-side codec output, EOS control and
+            # codec penalty (see MiniCPMO45OmniTTSForConditionalGeneration).
+            for hook_name in ("preprocess_decode_batch_mrv2", "make_omni_output_mrv2", "mrv2_custom_sampler"):
+                hook = getattr(self.talker, hook_name, None)
+                if callable(hook):
+                    setattr(self, hook_name, hook)
+            self.mrv2_decode_preprocess_is_identity = bool(
+                getattr(self.talker, "mrv2_decode_preprocess_is_identity", False)
+            )
+            self.logits_vocab_size = int(self.talker.logits_vocab_size)
         else:
             raise ValueError(f"Invalid model stage: {self.model_stage}. Must be one of: 'llm', 'tts'")
 
@@ -173,7 +202,13 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         # preprocess for duplex audio, while the Talker converts the
         # tts_token_ids/tts_hidden_states handoff into its conditioning
         # embeddings and initializes request-local codec generation state.
-        self.has_preprocess = self.model_stage in {"llm", "tts"}
+        # Turn-mode Thinker inputs use the native multimodal encoder/cache on
+        # MRv2. Marking it as a custom-preprocess model disables that encoder
+        # path in the runner. Duplex still uses the V1 preprocess hook.
+        self.has_preprocess = self.model_stage == "tts" or not self._use_v2_model_runner
+        # Neither AR stage has a postprocess, so step outputs can use the
+        # runner's async snapshot instead of a blocking per-step D2H.
+        self.use_async_omni_output = self.model_stage in {"llm", "tts"}
 
         if self.model_stage == "llm" and getattr(vllm_config.model_config, "session_mode", "turn") == "duplex":
             # Build the Stage-0 duplex runtime (remote-code processor and
@@ -617,6 +652,12 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             if text_hidden_states.ndim == 3 and text_hidden_states.shape[0] == 1:
                 text_hidden_states = text_hidden_states.squeeze(0)
 
+            if getattr(self, "_use_v2_model_runner", False):
+                # FULL graphs return tensors. The row ledger is reconstructed
+                # from this step's live input batch after replay, never from
+                # Python values or token buffers captured during warmup.
+                return text_hidden_states
+
             # Return hidden states with latent in multimodal_outputs for stage_input_processors
             multimodal_outputs = {"latent": text_hidden_states}
             # Keep per-forward row identities alongside the latent payload.
@@ -690,6 +731,27 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             )
 
         raise ValueError(f"Unsupported model stage: {self.model_stage}")
+
+    def make_omni_output_mrv2(self, model_outputs, *, input_batch, req_states, model_intermediate_buffer):
+        """Attach the Thinker row identities used by the llm2tts bridge."""
+        if self.model_stage != "llm":
+            return self.talker.make_omni_output_mrv2(
+                model_outputs,
+                input_batch=input_batch,
+                req_states=req_states,
+                model_intermediate_buffer=model_intermediate_buffer,
+            )
+        if any(isinstance(info, dict) and info.get("duplex") for info in model_intermediate_buffer):
+            raise NotImplementedError("MiniCPM-o duplex Thinker requires model_runner: v1")
+        num_tokens = model_outputs.shape[0]
+        return OmniOutput(
+            text_hidden_states=model_outputs,
+            multimodal_outputs={
+                "latent": model_outputs,
+                "latent_input_ids": input_batch.input_ids[:num_tokens].reshape(-1, 1),
+                "latent_positions": input_batch.positions[:num_tokens].reshape(-1, 1),
+            },
+        )
 
     def make_omni_output(self, model_outputs, **kwargs):
         if self.model_stage != "tts":

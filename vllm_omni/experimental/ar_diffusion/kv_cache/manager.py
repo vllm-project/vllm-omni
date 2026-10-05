@@ -46,6 +46,7 @@ from vllm_omni.experimental.ar_diffusion.kv_cache.paged import (
     chunk_slot_mapping,
     pool_write_chunk,
     resident_block_ids,
+    visible_window_blocks,
 )
 
 _log = init_logger(__name__)
@@ -170,6 +171,7 @@ def estimate_ar_diffusion_kv_cache_memory(
     *,
     session_capacity: int = 1,
     scratch_blocks_override: int = 0,
+    block_size: int | None = None,
 ) -> ARDiffusionKVCacheMemoryEstimate:
     """Estimate all pool allocations without constructing managers or tensors."""
 
@@ -185,15 +187,21 @@ def estimate_ar_diffusion_kv_cache_memory(
             f"{config.chunk_size} != {spec.tokens_per_frame}"
         )
 
-    page_size_bytes = int(
-        2 * spec.tokens_per_frame * spec.num_kv_heads * spec.head_size * dtype.itemsize * spec.num_layers
-    )
+    block_size = spec.tokens_per_frame if block_size is None else block_size
+    if block_size <= 0:
+        raise ValueError(f"block_size must be positive, got {block_size}")
+    blocks_per_frame = -(-spec.tokens_per_frame // block_size)
+    page_size_bytes = int(2 * block_size * spec.num_kv_heads * spec.head_size * dtype.itemsize * spec.num_layers)
     scratch_frames = spec.frames_per_block
     if spec.max_scratch_frames_per_branch is not None:
         scratch_frames = spec.max_scratch_frames_per_branch
-    extra_scratch_blocks = (spec.max_scratch_tokens_per_branch + spec.tokens_per_frame - 1) // spec.tokens_per_frame
+    extra_scratch_blocks = -(-spec.max_scratch_tokens_per_branch // block_size)
+    if spec.tokens_per_frame % block_size and spec.max_scratch_tokens_per_branch:
+        extra_scratch_blocks = max(1, scratch_frames) * -(
+            -(block_size - 1 + spec.max_scratch_tokens_per_branch) // block_size
+        )
     scratch_blocks_per_local_branch = max(
-        scratch_frames + extra_scratch_blocks,
+        scratch_frames * blocks_per_frame + extra_scratch_blocks,
         scratch_blocks_override,
     )
     scratch_num_blocks = spec.num_local_kv_branches * scratch_blocks_per_local_branch
@@ -201,7 +209,8 @@ def estimate_ar_diffusion_kv_cache_memory(
     managed_num_blocks = (
         spec.num_local_kv_branches
         * (session_capacity * (spec.sink_frames + spec.window_frames) + spec.frames_per_block)
-        + 2
+        * blocks_per_frame
+        + 2 * blocks_per_frame
     )
     cross_attention_bytes_per_session = int(
         2
@@ -216,7 +225,13 @@ def estimate_ar_diffusion_kv_cache_memory(
     # The contiguous history staging buffers are shared by all sessions.
     history_staging_tokens = 0
     if config.reuse_history_staging and contiguous_kv_gather_enabled():
-        history_staging_tokens = (config.window_chunks + config.sink_chunks + 1) * spec.tokens_per_frame
+        window_blocks = visible_window_blocks(
+            chunk_size=config.chunk_size,
+            block_size=block_size,
+            sink_tokens=config.sink_chunks * config.chunk_size,
+            window_tokens=config.window_chunks * config.chunk_size,
+        )
+        history_staging_tokens = (window_blocks + 1) * block_size
     history_staging_reserved_bytes = int(
         2 * spec.num_layers * history_staging_tokens * spec.num_kv_heads * spec.head_size * dtype.itemsize
     )
@@ -400,12 +415,13 @@ class ARDiffusionKVCache:
         )
 
         override_blocks = ar_diffusion_scratch_blocks_override()
+        self.blocks_per_frame = -(-config.chunk_size // block_size)
 
         effective_spec = ARDiffusionKVCacheSpec(
             num_layers=num_layers,
             num_kv_heads=num_kv_heads,
             head_size=head_size,
-            tokens_per_frame=block_size,
+            tokens_per_frame=config.chunk_size,
             frames_per_block=frames_per_block,
             window_frames=config.window_chunks,
             sink_frames=config.sink_chunks,
@@ -426,6 +442,7 @@ class ARDiffusionKVCache:
             effective_spec,
             dtype,
             scratch_blocks_override=override_blocks,
+            block_size=block_size,
         )
         self.scratch_blocks_per_kv_branch = one_session.scratch_blocks_per_local_branch
         self.scratch_num_blocks = one_session.scratch_num_blocks
@@ -477,6 +494,7 @@ class ARDiffusionKVCache:
                 dtype,
                 session_capacity=candidate,
                 scratch_blocks_override=override_blocks,
+                block_size=block_size,
             )
             if candidate_estimate.required_bytes <= self.memory_budget_bytes:
                 effective_capacity = candidate
@@ -757,6 +775,16 @@ class ARDiffusionKVCache:
 
     def block_table(self, adapter: ARDiffusionRequestAdapter) -> list[int]:
         return list(self.manager.get_block_ids(adapter.request_id)[0])
+
+    def block_ids_at(self, adapter: ARDiffusionRequestAdapter, indices: Sequence[int]) -> list[int]:
+        """Block ids at ``indices`` of the request's block table, without copying it.
+
+        The table keeps a null entry for every evicted position, so it grows with
+        the session. :meth:`block_table` reads every entry; this reads only the
+        ones asked for, straight from the manager's own block list.
+        """
+        blocks = self.manager.get_blocks(adapter.request_id).blocks[0]
+        return [blocks[index].block_id for index in indices]
 
     def chunk_write_slots(self, adapter: ARDiffusionRequestAdapter) -> torch.Tensor:
         """Slot mapping for the in-flight chunk — the K/V write target."""

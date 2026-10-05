@@ -10,7 +10,8 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 REPO_ROOT = Path(__file__).resolve().parents[2]
 AMD_TEMPLATE = REPO_ROOT / ".buildkite/amd/test-template-amd-omni.j2"
 AMD_BUILD_SCRIPT = REPO_ROOT / ".buildkite/amd/scripts/build-ci-image.sh"
-CI_DOCKERFILE = REPO_ROOT / "docker/Dockerfile.ci"
+CUDA_RELEASE_DOCKERFILE = REPO_ROOT / "docker/Dockerfile.cuda"
+CUDA_CI_DOCKERFILE = REPO_ROOT / "docker/Dockerfile.ci"
 ROCM_DOCKERFILE = REPO_ROOT / "docker/Dockerfile.rocm"
 ROCM_DOCKERIGNORE = REPO_ROOT / "docker/Dockerfile.rocm.dockerignore"
 
@@ -30,14 +31,18 @@ def _line_index(lines: list[str], prefix: str) -> int:
     return matches[0]
 
 
-def test_rocm_base_tracks_ci_vllm_release() -> None:
-    ci_release = _docker_arg(CI_DOCKERFILE, "VLLM_BASE_TAG")
+def test_rocm_base_tracks_cuda_vllm_release() -> None:
+    cuda_base = _docker_arg(CUDA_RELEASE_DOCKERFILE, "BASE_IMAGE")
+    cuda_image, _, cuda_release = cuda_base.rpartition(":")
     rocm_base = _docker_arg(ROCM_DOCKERFILE, "BASE_IMAGE")
 
     image_ref, separator, image_tag = rocm_base.rpartition(":")
     assert separator, f"expected a tagged ROCm base image, got {rocm_base}"
-    assert image_ref.rsplit("/", 1)[-1] == "vllm-openai-rocm", image_ref
-    assert image_tag == ci_release
+    assert cuda_image == "vllm/vllm-openai"
+    assert image_ref == "vllm/vllm-openai-rocm"
+    assert image_tag == cuda_release == f"v{_docker_arg(CUDA_CI_DOCKERFILE, 'VLLM_VERSION')}"
+    assert _docker_arg(CUDA_CI_DOCKERFILE, "VLLM_BASE_IMAGE") == cuda_image
+    assert _docker_arg(CUDA_CI_DOCKERFILE, "VLLM_BASE_TAG") == "v${VLLM_VERSION}"
 
 
 def test_rocm_defaults_to_prebuilt_base_image() -> None:
@@ -103,11 +108,11 @@ def test_rocm_build_context_excludes_git_history() -> None:
     assert ".git" in patterns
 
 
-def test_rocm_source_ref_tracks_ci_vllm_release() -> None:
-    ci_release = _docker_arg(CI_DOCKERFILE, "VLLM_BASE_TAG")
+def test_rocm_source_ref_tracks_cuda_vllm_release() -> None:
+    cuda_release = _docker_arg(CUDA_CI_DOCKERFILE, "VLLM_VERSION")
     rocm_source_ref = _docker_arg(ROCM_DOCKERFILE, "VLLM_VERSION_OR_COMMIT_HASH")
 
-    assert rocm_source_ref == ci_release
+    assert rocm_source_ref == f"v{cuda_release}"
 
 
 def test_rocm_dockerfile_contains_vllm_api_canary() -> None:
