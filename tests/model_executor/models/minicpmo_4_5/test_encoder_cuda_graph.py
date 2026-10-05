@@ -9,6 +9,7 @@ from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_llm import (
     SiglipVisionConfig,
     SiglipVisionTransformer,
 )
+from vllm_omni.platforms import current_omni_platform
 
 pytestmark = [pytest.mark.core_model]
 
@@ -227,3 +228,101 @@ def test_managers_do_not_share_buffers_between_streams():
     for actual, expected in outputs:
         torch.testing.assert_close(actual, expected)
     assert not graph.vllm_config.compilation_config.encoder_cudagraph_token_budgets
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"max_graphs": -1},
+        {"max_graphs": True},
+        {"min_capture_calls": 1},
+        {"min_capture_calls": 2.5},
+        {"min_free_bytes": -1},
+    ],
+)
+def test_invalid_admission_options(options):
+    with pytest.raises(ValueError, match="must be an integer"):
+        _make_graph(torch.sin, **options)
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@torch.inference_mode()
+def test_configurable_admission_and_capacity_miss_accounting():
+    graph = _make_graph(torch.sin, max_graphs=1, min_capture_calls=3)
+    x = torch.randn(2, 8, device="cuda")
+    for _ in range(2):
+        torch.testing.assert_close(graph(x), x.sin())
+        assert not graph.graphs
+    torch.testing.assert_close(graph(x), x.sin())
+    torch.testing.assert_close(graph(x + 1), (x + 1).sin())
+    for _ in range(5):
+        other = torch.randn(3, 8, device="cuda")
+        torch.testing.assert_close(graph(other), other.sin())
+    stats = graph.get_cumulative_stats()
+    assert stats["num_graphs"] == 1
+    assert stats["graph_hits"] == 2
+    assert stats["graph_misses"] == 7
+    assert stats["capacity_misses"] == 5
+    assert stats["warmup_misses"] == 2
+    assert stats["hit_rate"] == pytest.approx(2 / 9)
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@torch.inference_mode()
+def test_memory_admission_defers_capture_but_preserves_existing_replay(monkeypatch):
+    graph = _make_graph(torch.sin, min_free_bytes=1024)
+    x = torch.randn(2, 8, device="cuda")
+    graph(x)
+    monkeypatch.setattr(current_omni_platform, "get_free_memory", lambda device: 1023)
+    for _ in range(3):
+        torch.testing.assert_close(graph(x), x.sin())
+    assert not graph.graphs
+    assert graph.get_cumulative_stats()["memory_misses"] == 3
+    monkeypatch.setattr(current_omni_platform, "get_free_memory", lambda device: 1024)
+    old = graph(x)
+    assert len(graph.graphs) == 1
+    monkeypatch.setattr(current_omni_platform, "get_free_memory", lambda device: 0)
+    torch.testing.assert_close(graph(x + 1), (x + 1).sin())
+    torch.testing.assert_close(old, x.sin())
+    assert graph.get_cumulative_stats()["graph_hits"] == 2
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@torch.inference_mode()
+def test_capture_failure_is_fatal_without_retry_or_eager_fallback(monkeypatch):
+    from unittest.mock import Mock
+
+    forward = Mock(side_effect=torch.sin)
+    graph = _make_graph(forward)
+    x = torch.randn(2, 8, device="cuda")
+    graph(x)
+    capture = Mock(side_effect=RuntimeError("injected capture failure"))
+    monkeypatch.setattr(graph, "_capture", capture)
+    with pytest.raises(RuntimeError, match="injected capture failure"):
+        graph(x)
+    for value in (x, torch.randn(3, 8, device="cuda"), torch.randn(2, 8)):
+        with pytest.raises(RuntimeError, match="restart the worker"):
+            graph(value)
+    capture.assert_called_once()
+    forward.assert_called_once()
+    assert not graph.graphs
+    assert not graph._seen
+    assert not graph._seen_calls
+    assert graph.get_cumulative_stats()["capture_failures"] == 1
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@torch.inference_mode()
+def test_zero_capacity_disables_capture():
+    graph = _make_graph(torch.sin, max_graphs=0)
+    x = torch.randn(2, 8, device="cuda")
+    for _ in range(3):
+        torch.testing.assert_close(graph(x), x.sin())
+    assert not graph.graphs
+    assert not graph._seen
+    assert graph.get_cumulative_stats()["capacity_misses"] == 3

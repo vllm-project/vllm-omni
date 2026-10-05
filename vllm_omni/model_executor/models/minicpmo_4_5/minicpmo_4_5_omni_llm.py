@@ -3943,6 +3943,13 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
         encoder_graphs = (
             bool(getattr(config, "encoder_cuda_graph", True)) and not vllm_config.model_config.enforce_eager
         )
+        # Per-encoder limits, configurable via --hf-overrides. No eviction:
+        # increasing the cap trades retained GPU memory for shape coverage.
+        encoder_graph_options = {
+            "max_graphs": getattr(config, "encoder_cuda_graph_max_graphs", 4),
+            "min_capture_calls": getattr(config, "encoder_cuda_graph_min_capture_calls", 2),
+            "min_free_bytes": getattr(config, "encoder_cuda_graph_min_free_bytes", 1 << 30),
+        }
 
         # Initialize image processor
         self.image_processor = MiniCPMVImageProcessor(
@@ -3963,7 +3970,9 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
 
             self.vpm = SiglipVisionTransformer(config.vision_config)
             if encoder_graphs:
-                self.vpm._encoder_graph = EncoderCudaGraph(self.vpm._encode_last_hidden_state, vllm_config)
+                self.vpm._encoder_graph = EncoderCudaGraph(
+                    self.vpm._encode_last_hidden_state, vllm_config, **encoder_graph_options
+                )
             # Drop last layer if configured
             if config.drop_vision_last_layer:
                 self.vpm.encoder.layers = self.vpm.encoder.layers[:-1]
@@ -4032,7 +4041,9 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
             self.audio_past_key_values = None
 
         self._audio_encoder_graph = (
-            EncoderCudaGraph(self._encode_audio_features, vllm_config) if encoder_graphs else None
+            EncoderCudaGraph(self._encode_audio_features, vllm_config, **encoder_graph_options)
+            if encoder_graphs
+            else None
         )
         self.mm_token_ids = set[int]()
         self.make_empty_intermediate_tensors = self.llm.make_empty_intermediate_tensors

@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Exact-shape MiniCPM adapters for vLLM encoder CUDA graph management."""
 
+from collections import Counter
 from collections.abc import Callable, Hashable
 from copy import copy
 from math import prod
@@ -16,6 +17,8 @@ from vllm.v1.worker.encoder_cudagraph_defs import (
     EncoderCudaGraphReplayBuffers,
     EncoderItemSpec,
 )
+
+from vllm_omni.platforms import current_omni_platform
 
 
 def _copy_exact(target: torch.Tensor, source: torch.Tensor) -> None:
@@ -113,16 +116,61 @@ class EncoderCudaGraph:
     data-dependent Python branches. Each entry owns a private graph pool;
     callers get a clone so a later replay cannot overwrite retained embeddings.
     Unseen shapes after the cap run eagerly instead of growing GPU memory.
+    Admission is first-come, with no eviction or automatic recapture. Startup
+    profiling can consume slots. The free-memory floor is a pre-capture guard,
+    not a bound on pool bytes or a guarantee that capture will fit.
+
+    Capture errors are fatal for this instance: propagate the original error
+    and reject subsequent calls without retrying or falling back to CUDA eager
+    execution, since a failed capture may leave the CUDA context unusable.
     """
 
-    def __init__(self, forward: Callable[..., torch.Tensor], vllm_config: VllmConfig, *, max_graphs: int = 4):
+    def __init__(
+        self,
+        forward: Callable[..., torch.Tensor],
+        vllm_config: VllmConfig,
+        *,
+        max_graphs: int = 4,
+        min_capture_calls: int = 2,
+        min_free_bytes: int = 1 << 30,
+    ):
+        for name, value, minimum in (
+            ("max_graphs", max_graphs, 0),
+            ("min_capture_calls", min_capture_calls, 2),
+            ("min_free_bytes", min_free_bytes, 0),
+        ):
+            if type(value) is not int or value < minimum:
+                raise ValueError(f"{name} must be an integer >= {minimum}")
         self.forward = forward
         self.vllm_config = vllm_config
         self.max_graphs = max_graphs
+        self.min_capture_calls = min_capture_calls
+        self.min_free_bytes = min_free_bytes
         self.graphs: dict[tuple, EncoderCudaGraphManager] = {}
         self._seen: dict[tuple, torch.Size] = {}
+        self._seen_calls: Counter[tuple] = Counter()
+        self._misses: Counter[str] = Counter()
+        self._capture_failed = False
+
+    def get_cumulative_stats(self) -> dict[str, int | float]:
+        """Include eager admission misses that never reach an upstream manager."""
+        hits = sum(entry.graph_hits for entry in self.graphs.values())
+        misses = sum(self._misses.values()) + sum(entry.graph_misses for entry in self.graphs.values())
+        return {
+            "graph_hits": hits,
+            "graph_misses": misses,
+            "hit_rate": hits / (hits + misses) if hits + misses else 0.0,
+            "num_graphs": len(self.graphs),
+            "ineligible_misses": self._misses["ineligible"],
+            "capacity_misses": self._misses["capacity"],
+            "warmup_misses": self._misses["warmup"],
+            "memory_misses": self._misses["memory"],
+            "capture_failures": int(self._capture_failed),
+        }
 
     def __call__(self, *inputs: torch.Tensor | None) -> torch.Tensor:
+        if self._capture_failed:
+            raise RuntimeError("Encoder CUDA graph capture previously failed; restart the worker before reuse")
         tensors = [value for value in inputs if value is not None]
         if (
             not tensors
@@ -132,6 +180,7 @@ class EncoderCudaGraph:
             or torch.is_autocast_enabled("cuda")
             or torch.cuda.is_current_stream_capturing()
         ):
+            self._misses["ineligible"] += 1
             return self.forward(*inputs)
         # Do not share mutable replay buffers across independent CUDA streams.
         key = (
@@ -141,18 +190,37 @@ class EncoderCudaGraph:
         entry = self.graphs.get(key)
         if entry is None:
             if len(self.graphs) >= self.max_graphs:
+                self._misses["capacity"] += 1
                 return self.forward(*inputs)
             if key not in self._seen:
                 # Avoid paying capture latency for one-off shapes. Bound even
                 # the admission metadata for streams with arbitrary resolutions.
                 if len(self._seen) >= self.max_graphs * 4:
-                    self._seen.pop(next(iter(self._seen)))
+                    oldest = next(iter(self._seen))
+                    self._seen.pop(oldest)
+                    self._seen_calls.pop(oldest)
                 output = self.forward(*inputs)
                 self._seen[key] = output.shape
+                self._seen_calls[key] = 1
+                self._misses["warmup"] += 1
                 return output
-            entry = self._capture(inputs, self._seen[key])
+            self._seen_calls[key] = min(self._seen_calls[key] + 1, self.min_capture_calls)
+            if self._seen_calls[key] < self.min_capture_calls:
+                self._misses["warmup"] += 1
+                return self.forward(*inputs)
+            if self.min_free_bytes and current_omni_platform.get_free_memory(tensors[0].device) < self.min_free_bytes:
+                self._misses["memory"] += 1
+                return self.forward(*inputs)
+            try:
+                entry = self._capture(inputs, self._seen[key])
+            except Exception:
+                self._capture_failed = True
+                self._seen.clear()
+                self._seen_calls.clear()
+                raise
             self.graphs[key] = entry
             self._seen.pop(key)
+            self._seen_calls.pop(key)
         return entry.execute({str(i): x for i, x in enumerate(inputs) if x is not None})[0]
 
     def _capture(self, inputs: tuple[torch.Tensor | None, ...], output_shape: torch.Size) -> EncoderCudaGraphManager:
