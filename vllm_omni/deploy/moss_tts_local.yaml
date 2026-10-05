@@ -18,6 +18,9 @@ connectors:
       connector_get_max_wait: 300
       initial_codec_chunk_frames: 1   # 1 frame * 80 ms/frame = 80 ms first audio chunk
       codec_chunk_frames: 15          # 15 frames * 80 ms/frame = 1.2 s steady chunks
+      # Optional startup ramp; its first entry overrides initial chunk size.
+      # Extra graph shapes/calls trade codec cost and latency for less underrun.
+      # codec_chunk_ramp: [1, 4, 15]
       codec_left_context_frames: 0
       # Chunk ramp (opt-in): gradual chunk-size ladder replacing the
       # initial_codec_chunk_frames -> codec_chunk_frames cliff. The last

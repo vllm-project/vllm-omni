@@ -16,6 +16,9 @@ x-qwen3-tts: &qwen3_tts
   - vllm_omni/worker/gpu_model_runner.py
   - vllm_omni/model_executor/models/qwen3_tts/
   - vllm_omni/model_executor/models/common/qwen3_code_predictor.py
+  - vllm_omni/model_executor/models/common/fused_sampling.py
+  - vllm_omni/model_executor/models/common/short_kv_attention.py
+  - vllm_omni/model_executor/models/common/talker_first_audio.py
   - vllm_omni/model_executor/models/common/snake_activation.py
   - vllm_omni/model_executor/models/common/alias_free_activation.py
   - vllm_omni/model_executor/stage_input_processors/qwen3_tts.py
@@ -85,11 +88,16 @@ x-qwen3-omni: &qwen3_omni
   - vllm_omni/entrypoints/openai/serving_chat.py
   - vllm_omni/model_executor/models/qwen3_omni/
   - vllm_omni/model_executor/models/common/qwen3_code_predictor.py
+  - vllm_omni/model_executor/models/common/fused_sampling.py
+  - vllm_omni/model_executor/models/common/short_kv_attention.py
+  - vllm_omni/model_executor/models/common/talker_first_audio.py
   - vllm_omni/model_executor/models/common/snake_activation.py
   - vllm_omni/model_executor/models/qwen2_5_omni/qwen2_5_omni_thinker.py
   - vllm_omni/model_executor/models/qwen3_tts/cuda_graph_decoder_wrapper.py
   - vllm_omni/model_executor/stage_input_processors/qwen3_omni.py
   - vllm_omni/deploy/qwen3_omni_moe.yaml
+  - vllm_omni/deploy/qwen3_omni_moe_mrv2.yaml
+  - vllm_omni/deploy/qwen3_omni_moe_mrv2_h200.yaml
   - vllm_omni/deploy/qwen3_omni_moe_thinking.yaml
 
 x-wan22: &wan22

@@ -30,7 +30,7 @@ class VoxCPM2OmniARAsyncScheduler(OmniARAsyncScheduler):
     def _should_defer_waiting_for_unified_decode_graph(self) -> bool:
         if not self._unified_decode_graph_enabled():
             return False
-        if not self.waiting or not self.running:
+        if not (self.waiting or self.kv_holding_waiting) or not self.running:
             return False
 
         for request in self.running:

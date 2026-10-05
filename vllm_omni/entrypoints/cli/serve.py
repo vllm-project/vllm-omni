@@ -567,6 +567,15 @@ class OmniServeCommand(CLISubcommand):
             help="Local original MiniMax H3 Fun ControlNet Union safetensors checkpoint.",
         )
         omni_config_group.add_argument(
+            "--hsdp-weight-load-strategy",
+            choices=["full", "pre_sharded"],
+            default=None,
+            help=(
+                "HSDP checkpoint loading strategy: 'full' loads then shards; "
+                "'pre_sharded' shards meta parameters first and reads rank-local HF safetensors slices."
+            ),
+        )
+        omni_config_group.add_argument(
             "--lora-path",
             type=str,
             nargs="+",

@@ -14,6 +14,7 @@ import pytest
 
 from vllm_omni.engine.duplex.commands import Heartbeat
 from vllm_omni.engine.duplex.config import DuplexCapabilities, DuplexSessionConfig
+from vllm_omni.engine.duplex.delivery import DuplexOutputBuffer
 from vllm_omni.engine.duplex.messages import (
     CloseDuplexSessionMessage,
     DuplexControlResultMessage,
@@ -72,14 +73,16 @@ async def test_open_session_runs_the_correlated_rpc_with_the_typed_config() -> N
     result = _ok("open", capabilities=DuplexCapabilities(), public_session={"id": "sid"}, lease_generation=0)
     engine = _engine(result)
     config = DuplexSessionConfig(model="m")
+    output_buffer = DuplexOutputBuffer(max_bytes=2 * 1024 * 1024, max_events=512)
 
-    returned = await engine.open_session_async("sid", config, timeout=3.0)
+    returned = await engine.open_session_async("sid", config, output_buffer=output_buffer, timeout=3.0)
 
     assert returned is result
     ((key, message, timeout),) = engine.rpc_client.calls
     assert key == ("duplex", message.control_id)
     assert isinstance(message, OpenDuplexSessionMessage)
     assert message.session_id == "sid" and message.session_config is config
+    assert message.output_buffer is output_buffer
     assert timeout == 3.0
     # A momentarily full request queue is backpressure, not a failed open: the
     # control RPC blocks rather than raising an untyped queue.Full at the caller.
@@ -116,7 +119,9 @@ async def test_failed_control_result_maps_to_a_typed_session_error() -> None:
         )
     )
     with pytest.raises(DuplexSessionError) as excinfo:
-        await engine.open_session_async("sid", DuplexSessionConfig())
+        await engine.open_session_async(
+            "sid", DuplexSessionConfig(), output_buffer=DuplexOutputBuffer(max_bytes=2 * 1024 * 1024, max_events=512)
+        )
     assert excinfo.value.code == "resource_exhausted"
     assert excinfo.value.retryable is True
     assert excinfo.value.session_id == "sid"
@@ -133,7 +138,9 @@ async def test_engine_error_and_timeout_map_to_session_errors() -> None:
 
     engine = _engine(TimeoutError("duplex open timed out for session sid"))
     with pytest.raises(DuplexSessionError) as excinfo:
-        await engine.open_session_async("sid", DuplexSessionConfig())
+        await engine.open_session_async(
+            "sid", DuplexSessionConfig(), output_buffer=DuplexOutputBuffer(max_bytes=2 * 1024 * 1024, max_events=512)
+        )
     assert excinfo.value.code == "timeout" and excinfo.value.retryable is True
 
 

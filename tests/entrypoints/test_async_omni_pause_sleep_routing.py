@@ -195,6 +195,56 @@ def test_reset_encoder_cache_forwards_to_ar_stages():
 
 
 @pytest.mark.cpu
+def test_release_kv_memory_requires_pause_and_wakes_only_ar_kv_allocations():
+    async def run() -> None:
+        omni = _make_omni(stage_types=["llm", "diffusion", "llm"])
+        with pytest.raises(RuntimeError, match="completed pause"):
+            await omni.release_kv_cache_memory()
+        omni.collective_rpc.assert_not_awaited()
+
+        omni._paused = True
+        await omni.release_kv_cache_memory()
+        omni._clear_frontend_mm_cache.assert_awaited_once_with()
+        omni.collective_rpc.assert_awaited_once_with(
+            method="release_kv_cache_memory",
+            args=(),
+            kwargs=None,
+            stage_ids=[0, 2],
+            timeout=CACHE_RESET_TIMEOUT_S,
+        )
+        assert omni._stage_sleeping_tags == {0: {"kv_cache"}, 2: {"kv_cache"}}
+        assert not omni._level2_sleeping
+
+        omni.collective_rpc.reset_mock()
+        await omni.wake_up(stage_ids=[0, 2], tags=["kv_cache"])
+        omni.collective_rpc.assert_awaited_once_with(
+            method="wake_up", args=(), kwargs={"tags": ["kv_cache"]}, stage_ids=[0, 2]
+        )
+        assert not omni._sleeping_tags
+        assert omni._paused
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
+def test_release_kv_memory_skips_diffusion_and_reports_engine_failures():
+    async def run() -> None:
+        diffusion = _make_omni(stage_types=["diffusion"])
+        await diffusion.release_kv_cache_memory()
+        diffusion.collective_rpc.assert_not_awaited()
+        assert not diffusion._paused
+
+        omni = _make_omni(stage_types=["llm"])
+        omni._paused = True
+        omni.collective_rpc.return_value = [{"supported": False, "error": "requires all executor memory resident"}]
+        with pytest.raises(RuntimeError, match="all executor memory resident"):
+            await omni.release_kv_cache_memory()
+        assert not omni._sleeping_tags
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
 def test_reset_mm_cache_clears_frontend_then_forwards_to_ar_stages():
     async def run() -> None:
         omni = _make_omni(stage_types=["llm", "diffusion"])

@@ -24,6 +24,7 @@ from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
 from vllm_omni.engine.duplex import commands
 from vllm_omni.engine.duplex.config import DuplexSessionConfig, DuplexSessionState
 from vllm_omni.engine.duplex.contracts import DuplexFence, duplex_resource_request_id
+from vllm_omni.engine.duplex.delivery import DuplexOutputBuffer
 from vllm_omni.engine.duplex.messages import (
     CloseDuplexSessionMessage,
     DuplexControlResultMessage,
@@ -78,10 +79,15 @@ def _build(
     return orchestrator, clients, rpc_q, output_q
 
 
-def _open_message(extra_body: dict[str, object] | None = None) -> OpenDuplexSessionMessage:
+def _open_message(
+    extra_body: dict[str, object] | None = None,
+    *,
+    output_buffer: DuplexOutputBuffer | None = None,
+) -> OpenDuplexSessionMessage:
     return OpenDuplexSessionMessage(
         control_id=f"open-{SESSION_ID}",
         session_id=SESSION_ID,
+        output_buffer=output_buffer or DuplexOutputBuffer(max_bytes=2 * 1024 * 1024, max_events=512),
         session_config=DuplexSessionConfig(
             model="openbmb/MiniCPM-o-4_5",
             modalities=["text"],
@@ -369,12 +375,13 @@ async def test_forwarded_stage_requests_are_bound_and_barge_in_aborts_them() -> 
 @pytest.mark.asyncio
 async def test_session_owned_outputs_reach_the_runner_and_never_the_client_queue() -> None:
     orchestrator, _, rpc_q, output_q = _build(stages=2)
-    await _open(orchestrator, rpc_q)
+    output_buffer = DuplexOutputBuffer(max_bytes=2 * 1024 * 1024, max_events=512)
+    await _open(orchestrator, rpc_q, output_buffer=output_buffer)
     request_id = _stage0_request_id()
     await _submit(orchestrator, _append_audio())
     request_state = orchestrator.request_states[request_id]
-    while not output_q.empty():
-        output_q.get_nowait()
+    while output_buffer.pending_events:
+        await output_buffer.get()
 
     consumed = await orchestrator._intercept_stage_output(1, 0, _tts_output(request_id), request_state, None, None)
     await _settle(orchestrator)
@@ -382,8 +389,9 @@ async def test_session_owned_outputs_reach_the_runner_and_never_the_client_queue
     assert consumed is True
     session = orchestrator.session_manager.get(SESSION_ID)
     assert session is not None and session.active_response_id is not None
-    types = [message.event.type for message in [output_q.get_nowait() for _ in range(output_q.qsize())]]
+    types = [(await output_buffer.get()).type for _ in range(output_buffer.pending_events)]
     assert "response.created" in types and "response.output_audio.delta" in types
+    assert output_q.empty()
 
     orphan = DuplexOrchestratorRequestState(
         request_id="duplex-s.b3RoZXI.e.0.r.stage0",
@@ -401,7 +409,8 @@ async def test_session_owned_outputs_reach_the_runner_and_never_the_client_queue
 @pytest.mark.asyncio
 async def test_forward_failure_closes_the_owning_session() -> None:
     orchestrator, clients, rpc_q, output_q = _build(stages=2)
-    await _open(orchestrator, rpc_q)
+    output_buffer = DuplexOutputBuffer(max_bytes=2 * 1024 * 1024, max_events=512)
+    await _open(orchestrator, rpc_q, output_buffer=output_buffer)
     request_id = _stage0_request_id()
     await _submit(orchestrator, _append_audio())
     request_state = orchestrator.request_states[request_id]
@@ -417,7 +426,8 @@ async def test_forward_failure_closes_the_owning_session() -> None:
     assert SESSION_ID not in orchestrator.session_manager.runners
     assert session.state == DuplexSessionState.CLOSED
     assert orchestrator.session_manager.active_count() == 0
-    types = [message.event.type for message in [output_q.get_nowait() for _ in range(output_q.qsize())]]
+    types = [(await output_buffer.get()).type for _ in range(output_buffer.pending_events)]
+    types.extend(output_q.get_nowait().event.type for _ in range(output_q.qsize()))
     # The stage failure is reported before the session expires, never after.
     assert types.index("error") < types.index("session.expired")
     assert types[-1] == "session.expired"
@@ -428,7 +438,8 @@ async def test_aura_forward_failure_keeps_the_session() -> None:
     from vllm_omni.model_executor.models.aura_omni.duplex.plugin import AuraDuplexPlugin
 
     orchestrator, clients, rpc_q, output_q = _build(stages=2, plugin=AuraDuplexPlugin(_encode_audio))
-    await _open(orchestrator, rpc_q)
+    output_buffer = DuplexOutputBuffer(max_bytes=2 * 1024 * 1024, max_events=512)
+    await _open(orchestrator, rpc_q, output_buffer=output_buffer)
     request_id = next(iter(orchestrator.request_states))
     await _submit(orchestrator, _append_audio())
     request_state = orchestrator.request_states[request_id]
@@ -442,7 +453,8 @@ async def test_aura_forward_failure_keeps_the_session() -> None:
     assert request_id not in orchestrator.request_states
     assert SESSION_ID in orchestrator.session_manager.runners
     assert session.state != DuplexSessionState.CLOSED
-    types = [message.event.type for message in [output_q.get_nowait() for _ in range(output_q.qsize())]]
+    types = [(await output_buffer.get()).type for _ in range(output_buffer.pending_events)]
+    types.extend(output_q.get_nowait().event.type for _ in range(output_q.qsize()))
     assert "error" in types
     assert "session.expired" not in types
     await orchestrator.session_manager.shutdown()
@@ -604,6 +616,7 @@ async def test_turn_plugin_processes_multimodal_prompt_before_stage_submission(m
             control_id="open-qwen",
             session_id=SESSION_ID,
             session_config=DuplexSessionConfig(model="qwen", modalities=["text", "audio"]),
+            output_buffer=DuplexOutputBuffer(max_bytes=2 * 1024 * 1024, max_events=512),
         )
     )
     assert (await rpc_q.get()).ok

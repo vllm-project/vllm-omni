@@ -391,7 +391,7 @@ class OmniGPUModelRunner(GPUModelRunner):
         }
         logger.info("Excluded FULL CUDA graph capture for Omni model. PIECEWISE graphs will still be captured.")
 
-    def capture_model(self) -> int:
+    def capture_model(self, *, profile_only: bool = False) -> int:
         """Handle CUDA graph capture for Omni models.
 
         Tuple-returning models use PIECEWISE graphs; FULL replay requires
@@ -424,12 +424,17 @@ class OmniGPUModelRunner(GPUModelRunner):
             use_aux = self.use_aux_hidden_state_outputs
             self.use_aux_hidden_state_outputs = use_aux or aux_outputs
             try:
-                result = super().capture_model()
+                result = super().capture_model(profile_only=profile_only)
             finally:
                 self.model.forward = original_forward  # type: ignore[assignment]
                 self.use_aux_hidden_state_outputs = use_aux
         else:
-            result = super().capture_model()
+            result = super().capture_model(profile_only=profile_only)
+
+        if profile_only:
+            # Upstream discards captures in its temporary profiling pool.
+            # Model-owned graphs must be recorded during the real capture.
+            return result
 
         capture_mtp = getattr(getattr(self, "model_state", None), "capture_mtp_graphs", None)
         if callable(capture_mtp):
@@ -437,6 +442,10 @@ class OmniGPUModelRunner(GPUModelRunner):
         capture_first_frame = getattr(self.model, "capture_first_frame_graphs", None)
         if callable(capture_first_frame):
             capture_first_frame()
+        capture_stream = getattr(self.model, "capture_stream_decode_graphs", None)
+        if callable(capture_stream):
+            sizes = [int(s) for s in self.model_state._get_mtp_capture_sizes()]
+            capture_stream(sorted(set(sizes + [1])))
         return result
 
     def _dispatch_mtp_batch_descriptor(self, num_mtp_reqs: int) -> Any:
@@ -490,6 +499,7 @@ class OmniGPUModelRunner(GPUModelRunner):
         is_profile: bool = False,
         context_len: int = 0,
         valid_dummy_state_slots: bool = False,
+        randomize_inputs: bool = False,
     ) -> Any:
         if not dummy_run:
             self._prepare_native_data_plane(scheduler_output)
@@ -499,6 +509,8 @@ class OmniGPUModelRunner(GPUModelRunner):
             self.update_requests(scheduler_output)
             self._sync_native_data_plane_payloads(scheduler_output)
             self.block_tables.apply_staged_writes()
+            if self.aux_output_connector is not None:
+                self.aux_output_connector.begin_step(scheduler_output.aux_output_connector_metadata)
             if scheduler_output.total_num_scheduled_tokens == 0:
                 empty_output = self.kv_connector.no_forward(scheduler_output)
                 return self._attach_native_data_plane_signals(
@@ -540,7 +552,7 @@ class OmniGPUModelRunner(GPUModelRunner):
 
         if not dummy_run:
             assert batch_req_state is not None
-            input_batch = self.prepare_inputs(scheduler_output, batch_req_state, batch_desc)
+            input_batch = self.prepare_inputs(scheduler_output, batch_req_state, batch_desc, num_active_loras)
             block_tables, slot_mappings = self.prepare_attn(input_batch)
             self.model_state.preprocess_state(
                 input_batch,
@@ -564,7 +576,10 @@ class OmniGPUModelRunner(GPUModelRunner):
                 batch_desc.num_tokens,
                 self.input_buffers,
                 max_query_len=batch_desc.max_query_len,
+                is_padding=not is_profile,
             )
+            if randomize_inputs:
+                input_batch.input_ids.random_(0, self.vocab_size)
             if not skip_attn_for_dummy_run:
                 block_tables, slot_mappings = self.prepare_dummy_attn(input_batch, valid_dummy_state_slots)
                 if context_len:
@@ -681,11 +696,6 @@ class OmniGPUModelRunner(GPUModelRunner):
         if not dummy_run and isinstance(hidden_states, torch.Tensor):
             self.model_state.run_postprocess(hidden_states, input_batch)
 
-        routed_experts = None
-        if not dummy_run and (capturer := self.routed_experts_capturer) is not None:
-            assert slot_mappings is not None
-            routed_experts = capturer.get_routed_experts(slot_mappings, num_toks)
-
         self.execute_model_state = ExecuteModelState(
             input_batch=input_batch,
             attn_metadata=attn_metadata,
@@ -695,7 +705,6 @@ class OmniGPUModelRunner(GPUModelRunner):
             finished_req_ids=scheduler_output.finished_req_ids,
             dp_sync=dp_sync,
             ec_connector_output=ec_connector_output,
-            routed_experts=routed_experts,
             cudagraph_stats=None,
         )
 
@@ -746,7 +755,16 @@ class OmniGPUModelRunner(GPUModelRunner):
             # Request-owned state outlives generation slots and chunk boundaries.
             # Notify even if the last chunk already released its runner slot.
             on_finished(finished)
+        finish_state = getattr(self.model_state, "on_requests_finished", None)
+        if finished and callable(finish_state):
+            finish_state(finished)
         preempted = scheduler_output.preempted_req_ids
+        suspend_state = getattr(self.model_state, "on_request_preempted", None)
+        if preempted and callable(suspend_state):
+            for req_id in preempted - finished:
+                idx = self.req_states.req_id_to_index.get(req_id)
+                if idx is not None:
+                    suspend_state(req_id, idx)
         all_done = finished | preempted if preempted else finished
         for req_id in all_done:
             idx = self.req_states.req_id_to_index.get(req_id)

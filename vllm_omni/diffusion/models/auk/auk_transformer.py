@@ -153,6 +153,33 @@ class TimeEmbedding(nn.Module):
         return self.time_mlp(hidden.to(self.time_mlp[0].weight.dtype))
 
 
+def _grouped_conv1d_btc(x: torch.Tensor, conv: nn.Conv1d) -> torch.Tensor:
+    """``conv`` applied to channels-last ``x`` ``[B, T, C]``, returning ``[B, T, C]``.
+
+    A same-padded grouped convolution written as one im2col copy and one
+    batched GEMM over the groups. cuDNN runs a grouped conv of this shape as
+    one kernel per group plus two layout transposes, which at AuK's sizes
+    (1536 channels in 16 groups, kernel 31, a few hundred frames) costs about
+    ten times the arithmetic.
+    """
+    batch, frames, channels = x.shape
+    groups = conv.groups
+    kernel = conv.kernel_size[0]
+    per_group = channels // groups
+    pad = conv.padding[0]
+    padded = F.pad(x, (0, 0, pad, pad))
+    # unfold gives a [B, T, C, K] view; one copy lays it out as [B, T, G, C/G * K].
+    cols = padded.unfold(1, kernel, 1).reshape(batch * frames, groups, per_group * kernel)
+    # conv.weight [C_out, C/G, K] -> [G, C/G * K, C_out/G]; the reduction order matches the columns.
+    weight = conv.weight.reshape(groups, channels // groups, per_group * kernel).transpose(1, 2).to(cols.dtype)
+    # [G, B*T, C/G*K] @ [G, C/G*K, C_out/G] -> [G, B*T, C_out/G]
+    out = torch.bmm(cols.transpose(0, 1), weight)
+    out = out.transpose(0, 1).reshape(batch, frames, channels)
+    if conv.bias is not None:
+        out = out + conv.bias.to(out.dtype)
+    return out
+
+
 class ConvPosEmbedding(nn.Module):
     """Depthwise-grouped conv stack that adds local position information."""
 
@@ -169,17 +196,19 @@ class ConvPosEmbedding(nn.Module):
         )
 
     def forward(self, x: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
-        keep = None if mask is None else mask.unsqueeze(1)
-        x = x.transpose(1, 2)
+        keep = None if mask is None else mask.unsqueeze(-1)
         if keep is not None:
             x = x.masked_fill(~keep, 0.0)
         for layer in self.conv1d:
-            x = layer(x)
-            # Re-zero padding after each convolution so it cannot bleed into
-            # valid frames through the kernel window.
-            if keep is not None and isinstance(layer, nn.Conv1d):
-                x = x.masked_fill(~keep, 0.0)
-        return x.transpose(1, 2)
+            if isinstance(layer, nn.Conv1d):
+                x = _grouped_conv1d_btc(x, layer)
+                # Re-zero padding after each convolution so it cannot bleed into
+                # valid frames through the kernel window.
+                if keep is not None:
+                    x = x.masked_fill(~keep, 0.0)
+            else:
+                x = layer(x)
+        return x
 
 
 class AudioEmbedding(nn.Module):
@@ -205,9 +234,12 @@ class AdaLayerNorm(nn.Module):
         self.norm = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
 
     def forward(
-        self, x: torch.Tensor, emb: torch.Tensor
+        self, x: torch.Tensor, emb: torch.Tensor | None, mod: torch.Tensor | None = None
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.linear(self.silu(emb)).chunk(6, dim=1)
+        """``mod`` is the precomputed ``linear(silu(emb))``; ``emb`` is then unused."""
+        if mod is None:
+            mod = self.linear(self.silu(emb))
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = mod.chunk(6, dim=1)
         x = self.norm(x) * (1 + scale_msa[:, None]) + shift_msa[:, None]
         return x, gate_msa, shift_mlp, scale_mlp, gate_mlp
 
@@ -221,8 +253,11 @@ class AdaLayerNormFinal(nn.Module):
         self.linear = nn.Linear(dim, dim * 2)
         self.norm = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
 
-    def forward(self, x: torch.Tensor, emb: torch.Tensor) -> torch.Tensor:
-        scale, shift = self.linear(self.silu(emb)).chunk(2, dim=1)
+    def forward(self, x: torch.Tensor, emb: torch.Tensor | None, mod: torch.Tensor | None = None) -> torch.Tensor:
+        """``mod`` is the precomputed ``linear(silu(emb))``; ``emb`` is then unused."""
+        if mod is None:
+            mod = self.linear(self.silu(emb))
+        scale, shift = mod.chunk(2, dim=1)
         return self.norm(x) * (1 + scale)[:, None, :] + shift[:, None, :]
 
 
@@ -383,9 +418,11 @@ class DoubleBlock(nn.Module):
         c_rope: RopeCache,
         c_mask: torch.Tensor | None,
         bias: torch.Tensor | None = None,
+        mod_c: torch.Tensor | None = None,
+        mod_x: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        norm_c, c_gate_msa, c_shift_mlp, c_scale_mlp, c_gate_mlp = self.attn_norm_c(c, t)
-        norm_x, x_gate_msa, x_shift_mlp, x_scale_mlp, x_gate_mlp = self.attn_norm_x(x, t)
+        norm_c, c_gate_msa, c_shift_mlp, c_scale_mlp, c_gate_mlp = self.attn_norm_c(c, t, mod_c)
+        norm_x, x_gate_msa, x_shift_mlp, x_scale_mlp, x_gate_mlp = self.attn_norm_x(x, t, mod_x)
 
         x_attn, c_attn = self.attn(x=norm_x, c=norm_c, mask=mask, rope=rope, c_rope=c_rope, c_mask=c_mask, bias=bias)
 
@@ -416,8 +453,9 @@ class SingleBlock(nn.Module):
         mask: torch.Tensor | None,
         rope: RopeCache,
         bias: torch.Tensor | None = None,
+        mod: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        norm, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.attn_norm(x, t)
+        norm, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.attn_norm(x, t, mod)
         x = x + gate_msa[:, None] * self.attn(x=norm, mask=mask, rope=rope, bias=bias)
         norm = self.ff_norm(x) * (1 + scale_mlp[:, None]) + shift_mlp[:, None]
         return x + gate_mlp[:, None] * self.ff(norm)
@@ -491,6 +529,28 @@ class AuKTransformer(nn.Module):
 
         self.norm_out = AdaLayerNormFinal(dim)
         self.proj_out = nn.Linear(dim, latent_dim)
+        # Widths of the adaLN modulations in the order modulation_table() lays them out.
+        self._modulation_widths = [module.linear.out_features for module in self._adaln_modules()]
+
+    def _adaln_modules(self) -> list[nn.Module]:
+        """Every timestep-conditioned norm, in the order :meth:`step` consumes them."""
+        modules: list[nn.Module] = []
+        for block in self.transformer_blocks:
+            modules += [block.attn_norm_c, block.attn_norm_x]
+        modules += [block.attn_norm for block in self.single_transformer_blocks]
+        modules.append(self.norm_out)
+        return modules
+
+    def modulation_table(self, timesteps: torch.Tensor) -> torch.Tensor:
+        """adaLN modulations for every timestep, ``[len(timesteps), sum of widths]``.
+
+        The modulations depend only on the timestep, and a request's time grid
+        is known before its first step. Computing them for the whole grid at
+        once reads each modulation weight once per request instead of once per
+        step, which at batch 1 is what those matrix-vector products cost.
+        """
+        emb = F.silu(self.time_embed(timesteps.reshape(-1).float()))
+        return torch.cat([module.linear(emb) for module in self._adaln_modules()], dim=1)
 
     def project_text(self, text: torch.Tensor) -> torch.Tensor:
         """Project LLM hidden states ``[B, nt, text_hidden_dim]`` to model width."""
@@ -520,6 +580,7 @@ class AuKTransformer(nn.Module):
         drop_text: bool = False,
         cfg_infer: bool = False,
         cache: bool = False,
+        timesteps: torch.Tensor | None = None,
     ) -> "AuKStepContext":
         """Everything a denoise step needs that does not depend on ``x`` or the time.
 
@@ -528,6 +589,9 @@ class AuKTransformer(nn.Module):
         prompt embedding, the padding masks and biases and the rotary tables
         are not recomputed on every step. Arguments are those of
         :meth:`forward`; ``target_len`` is the target frame count ``n``.
+        ``timesteps`` are the times the steps will run at (the grid without
+        its end point); when given, their adaLN modulations are precomputed
+        and :meth:`step` selects them by ``step_index``.
         """
         batch = text.shape[0]
         if c_mask is None:
@@ -593,25 +657,44 @@ class AuKTransformer(nn.Module):
             rope_text=_rope_cos_sin(self.rotary_embed(text_len, c_mask)),
             rope_single=_rope_cos_sin(self.rotary_embed(text_len + audio_len, single_mask)),
             branches=branches,
+            modulation=None if timesteps is None else self.modulation_table(timesteps),
         )
 
-    def step(self, x: torch.Tensor, time: torch.Tensor, ctx: "AuKStepContext") -> torch.Tensor:
+    def step(
+        self,
+        x: torch.Tensor,
+        time: torch.Tensor,
+        ctx: "AuKStepContext",
+        step_index: torch.Tensor | int | None = None,
+    ) -> torch.Tensor:
         """Predict the velocity of ``x`` at ``time`` under a :meth:`prepare` context.
 
         The target embedding does not depend on the CFG branch, so it is
-        computed once and shared by both branches.
+        computed once and shared by both branches. When the context carries a
+        modulation table, ``step_index`` selects this step's row of it and
+        ``time`` is unused; the row broadcasts over the CFG branches.
         """
-        if time.ndim == 0:
-            time = time.repeat(x.shape[0])
-        t = self.time_embed(time)
         target = self.audio_embed(x, mask=ctx.target_mask)
+        if ctx.modulation is not None and step_index is not None:
+            if isinstance(step_index, int):
+                row = ctx.modulation[step_index : step_index + 1]
+            else:
+                row = ctx.modulation.index_select(0, step_index.reshape(1))
+            mods = list(torch.split(row, self._modulation_widths, dim=1))
+            t = None
+        else:
+            if time.ndim == 0:
+                time = time.repeat(x.shape[0])
+            t = self.time_embed(time)
+            if ctx.branches == 2:
+                t = torch.cat((t, t), dim=0)
+            mods = [None] * len(self._modulation_widths)
         if ctx.branches == 2:
-            t = torch.cat((t, t), dim=0)
             target = torch.cat((target, target), dim=0)
         audio = target if ctx.prompt is None else torch.cat([ctx.prompt, target], dim=1)
         c = ctx.c
 
-        for block in self.transformer_blocks:
+        for i, block in enumerate(self.transformer_blocks):
             c, audio = block(
                 audio,
                 c,
@@ -621,14 +704,24 @@ class AuKTransformer(nn.Module):
                 c_rope=ctx.rope_text,
                 c_mask=ctx.c_mask,
                 bias=ctx.joint_bias,
+                mod_c=mods[2 * i],
+                mod_x=mods[2 * i + 1],
             )
 
         h = torch.cat([c, audio], dim=1)
-        for block in self.single_transformer_blocks:
-            h = block(h, t, mask=ctx.single_mask, rope=ctx.rope_single, bias=ctx.single_bias)
+        offset = 2 * len(self.transformer_blocks)
+        for i, block in enumerate(self.single_transformer_blocks):
+            h = block(
+                h,
+                t,
+                mask=ctx.single_mask,
+                rope=ctx.rope_single,
+                bias=ctx.single_bias,
+                mod=mods[offset + i],
+            )
 
         h = h[:, h.shape[1] - x.shape[1] :]
-        return self.proj_out(self.norm_out(h, t))
+        return self.proj_out(self.norm_out(h, t, mods[-1]))
 
     def forward(
         self,
@@ -706,6 +799,8 @@ class AuKStepContext:
     rope_text: RopeCache
     rope_single: RopeCache
     branches: int
+    #: adaLN modulations per step, ``[steps, widths]``, when the time grid was known.
+    modulation: torch.Tensor | None = None
 
     def tensors(self) -> list[torch.Tensor | None]:
         """Every tensor field in a fixed order, rope pairs flattened."""
@@ -721,6 +816,7 @@ class AuKStepContext:
             *self.rope_audio,
             *self.rope_text,
             *self.rope_single,
+            self.modulation,
         ]
 
     def copy_(self, other: "AuKStepContext") -> None:
@@ -752,6 +848,7 @@ class AuKStepContext:
             rope_text=(self.rope_text[0].clone(), self.rope_text[1].clone()),
             rope_single=(self.rope_single[0].clone(), self.rope_single[1].clone()),
             branches=self.branches,
+            modulation=_clone(self.modulation),
         )
 
 
@@ -881,6 +978,8 @@ def sample_latents(
                     timestep=t[i],
                     cfg_strength=cfg_strength,
                     new_request=i == 0,
+                    timesteps=t[:-1],
+                    step_index=i,
                 )
                 x = x + (t[i + 1] - t[i]) * velocity
         finally:
@@ -922,9 +1021,10 @@ def _sample_latents(
             ref_mask=ref_mask,
             cfg_infer=guided,
             cache=guided,
+            timesteps=timesteps[:-1],
         )
         for i in range(timesteps.shape[0] - 1):
-            v = dit.step(x, timesteps[i], ctx)
+            v = dit.step(x, timesteps[i], ctx, step_index=i)
             if guided:
                 v_cond, v_uncond = v.chunk(2, dim=0)
                 v = v_cond + (v_cond - v_uncond) * cfg_strength

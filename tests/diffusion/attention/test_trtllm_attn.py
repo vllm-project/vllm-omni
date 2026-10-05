@@ -617,3 +617,68 @@ def test_skip_end_to_end_config_path(monkeypatch):
     ctx = fc.ForwardContext(denoise_timestep=0.3)
     monkeypatch.setattr(fc, "_forward_context", ctx)
     assert impl._resolve_skip_factor(4096) == pytest.approx(expected)
+
+
+@requires_trtllm_attn
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
+    reason="verified TRTLLM contract requires SM100/SM103",
+)
+@pytest.mark.parametrize("batch", [1, 2])
+def test_dense_contract_fullgraph_matches_sdpa(batch):
+    from vllm_omni.diffusion.attention.capabilities import (
+        CompilationMode,
+        ExecutionContext,
+        SupportStatus,
+    )
+
+    torch.compiler.reset()
+    try:
+        impl = _impl()
+        context = ExecutionContext(platform="cuda", require_fullgraph=True)
+        compiled = torch.compile(impl.forward_cuda, fullgraph=True, dynamic=True)
+        for q_len, kv_len in ((64, 64), (128, 192), (256, 128)):
+            # Noncontiguous Q exercises the reshape before the opaque boundary.
+            q = torch.randn(batch, 8, q_len, 128, device="cuda", dtype=torch.bfloat16).transpose(1, 2)
+            k, v = (torch.randn(batch, kv_len, 8, 128, device="cuda", dtype=torch.bfloat16) for _ in range(2))
+            result = impl.resolve_execution_path(context, q, k, v, None)
+            assert result.requested_support(context).status is SupportStatus.SUPPORTED
+            assert result.compilation_mode is CompilationMode.CUSTOM_OP
+            before = [t.clone() for t in (q, k, v)]
+            eager = impl.forward_cuda(q, k, v)
+            for _ in range(2):
+                out = compiled(q, k, v)
+                assert out.dtype == q.dtype and out.device == q.device and out.is_contiguous()
+                torch.testing.assert_close(out, eager, atol=1e-2, rtol=1e-2)
+                torch.testing.assert_close(out.float(), _sdpa_ref(q, k, v, 128**-0.5), atol=1e-2, rtol=1e-2)
+            for actual, original in zip((q, k, v), before):
+                torch.testing.assert_close(actual, original, atol=0, rtol=0)
+        # Check the real kernel's mutation and output metadata against its schema/fake.
+        qf, kf, vf = (t.reshape(-1, 8, 128).contiguous() for t in (q, k, v))
+        args = (
+            qf,
+            kf,
+            vf,
+            impl._get_workspace(q.device),
+            torch.full((batch,), kv_len, device=q.device, dtype=torch.int32),
+            torch.arange(batch + 1, device=q.device, dtype=torch.int32) * q_len,
+            torch.arange(batch + 1, device=q.device, dtype=torch.int32) * kv_len,
+            None,
+            None,
+            None,
+            q_len,
+            kv_len,
+            batch,
+            128**-0.5,
+            1.0,
+            -1.0,
+            0,
+            0,
+            False,
+        )
+        checks = torch.library.opcheck(
+            tg._trtllm_ragged_attention_op, args, test_utils=("test_schema", "test_faketensor")
+        )
+        assert all(value == "SUCCESS" for value in checks.values())
+    finally:
+        torch.compiler.reset()

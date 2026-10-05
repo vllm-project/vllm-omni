@@ -10,6 +10,7 @@ from functools import cached_property
 import torch
 from aenum import extend_enum
 from vllm.config import ModelConfig as _OriginalModelConfig
+from vllm.config import VllmConfig as _OriginalVllmConfig
 from vllm.inputs import TokensPrompt as _OriginalTokensPrompt
 from vllm.model_executor.layers.rotary_embedding import (
     MRotaryEmbedding as _OriginalMRotaryEmbedding,
@@ -28,6 +29,23 @@ from vllm_omni.model_executor.layers.rotary_embedding import OmniMRotaryEmbeddin
 from vllm_omni.request import OmniRequest, OmniStreamingUpdate
 
 _PATCH_LOGGER = logging.getLogger("vllm_omni.patch")
+
+# Omni's deploy config selects a runner per stage. vLLM 0.31's config property
+# otherwise defaults to v2 independently of the runner selected by our workers,
+# making shared consumers such as InputProcessor choose the wrong API.
+_runner_property = _OriginalVllmConfig.use_v2_model_runner
+if not getattr(_runner_property.fget, "_omni_stage_runner", False):
+
+    def _patched_use_v2_model_runner(self, _upstream=_runner_property.fget):
+        # Lazy import keeps the package's patch/config initialization acyclic.
+        from vllm_omni.config.model import OmniModelConfig
+
+        if isinstance(self.model_config, OmniModelConfig):
+            return self.model_config.use_v2_model_runner
+        return _upstream(self)
+
+    _patched_use_v2_model_runner._omni_stage_runner = True
+    _OriginalVllmConfig.use_v2_model_runner = property(_patched_use_v2_model_runner)
 
 # =============================================================================
 # Patch ModelConfig.is_mm_prefix_lm to support omni-specific models
@@ -390,8 +408,8 @@ def _patch_chat_template_registry():
         )
 
         if "qwen3_omni_moe" not in _MODEL_TYPE_TO_CHAT_TEMPLATE_FALLBACK:
-            _MODEL_TYPE_TO_CHAT_TEMPLATE_FALLBACK["qwen3_omni_moe"] = (
-                lambda _: CHAT_TEMPLATES_DIR / "template_chatml.jinja"
+            _MODEL_TYPE_TO_CHAT_TEMPLATE_FALLBACK["qwen3_omni_moe"] = lambda _: (
+                CHAT_TEMPLATES_DIR / "template_chatml.jinja"
             )
     except ImportError:
         pass
