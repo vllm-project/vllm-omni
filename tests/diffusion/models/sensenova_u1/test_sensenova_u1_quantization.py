@@ -9,7 +9,7 @@ import torch
 from torch import nn
 
 import vllm_omni.diffusion.models.sensenova_u1.pipeline_sensenova_u1 as pipeline_module
-from vllm_omni.quantization import build_quant_config
+from vllm_omni.quantization import build_quantization_config
 from vllm_omni.quantization.component_config import ComponentQuantizationConfig
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
@@ -55,8 +55,8 @@ def pipeline_setup(monkeypatch):
 )
 def test_pipeline_routes_online_fp8_config(pipeline_setup, quantization, lora_backend, lora_path):
     model_config, language_model_class = pipeline_setup
-    fp8_config = build_quant_config("fp8")
-    serialized_fp8_config = build_quant_config({"method": "fp8", "is_checkpoint_fp8_serialized": True})
+    fp8_config = build_quantization_config("fp8")
+    serialized_fp8_config = build_quantization_config({"method": "fp8", "is_checkpoint_fp8_serialized": True})
     quant_config, expected_config = {
         None: (None, None),
         "fp8": (fp8_config, fp8_config),
@@ -91,7 +91,7 @@ def test_pipeline_routes_online_fp8_config(pipeline_setup, quantization, lora_ba
 @pytest.mark.parametrize("quantization", ["fp8", "component_match", "component_default"])
 def test_pipeline_rejects_online_fp8_with_distilled_lora_before_loading(pipeline_setup, quantization):
     _, language_model_class = pipeline_setup
-    fp8_config = build_quant_config("fp8")
+    fp8_config = build_quantization_config("fp8")
     quant_config = {
         "fp8": fp8_config,
         "component_match": ComponentQuantizationConfig({"language_model": fp8_config}),

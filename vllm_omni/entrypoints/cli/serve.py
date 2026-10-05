@@ -1449,6 +1449,7 @@ def run_headless(args: TrackingNamespace) -> None:
         stage_connector_spec=stage_connector_spec,
         engine_args_dict=engine_args_dict,
         headless=True,
+        quantization_config=stage_cfg.quantization_config,
     )
     parallel_config = vllm_config.parallel_config
 

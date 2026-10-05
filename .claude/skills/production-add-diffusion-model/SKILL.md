@@ -233,12 +233,12 @@ self.qkv_proj = QKVParallelLinear(
 )
 ```
 
-Use `build_quant_config()` for direct construction/testing:
+Use `build_quantization_config()` for direct construction/testing:
 
 ```python
-from vllm_omni.quantization import build_quant_config
+from vllm_omni.quantization import build_quantization_config
 
-quant_config = build_quant_config({
+quant_config = build_quantization_config({
     "transformer": {"method": "fp8"},
     "text_encoder": None,
     "vae": None,

@@ -38,7 +38,6 @@ from transformers import AutoModel, Qwen3VLConfig, Qwen3VLForConditionalGenerati
 from vllm.config.quantization import QuantizationConfigArgs
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
-from vllm.model_executor.layers.quantization.fp8 import Fp8Config
 from vllm.model_executor.layers.quantization.online.base import OnlineQuantizationConfig
 from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper
 
@@ -64,7 +63,7 @@ from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch, spli
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.quantization.component_config import resolve_component_quant_config
-from vllm_omni.quantization.fp8_config import DiffusionFp8Config
+from vllm_omni.quantization.fp8_config import OmniFp8Config
 
 logger = init_logger(__name__)
 
@@ -323,7 +322,7 @@ class BooguImagePipeline(CFGParallelMixin, nn.Module, ProgressBarMixin, Supports
         """Load MLLM through HF, or prepare it for deferred online FP8 loading."""
         config = None
         if quant_config is not None:
-            if not isinstance(quant_config, (Fp8Config, DiffusionFp8Config)):
+            if not isinstance(quant_config, OmniFp8Config):
                 raise ValueError(
                     "Boogu MLLM only supports FP8 quantization. Set mllm to null to disable online quantization."
                 )

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Wan AutoRound-format MXFP4 configuration and layer-mapping tests."""
 
 from unittest.mock import patch
@@ -12,7 +12,8 @@ from vllm.model_executor.model_loader.utils import configure_quant_config
 from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import (
     WanTransformer3DModel,
 )
-from vllm_omni.quantization import build_quant_config
+from vllm_omni.quantization import build_quantization_config
+from vllm_omni.quantization.factory import resolve_quantization_config_from_disk
 from vllm_omni.quantization.inc_config import OmniINCConfig
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
@@ -38,7 +39,7 @@ def _autoround_mxfp4_config() -> dict:
 
 
 def test_build_wan_autoround_mxfp4_config():
-    config = build_quant_config(_autoround_mxfp4_config())
+    config = build_quantization_config(_autoround_mxfp4_config())
 
     assert isinstance(config, OmniINCConfig)
     assert config.get_name() == "inc"
@@ -49,8 +50,21 @@ def test_build_wan_autoround_mxfp4_config():
     assert config.block_name_to_quantize == ["blocks"]
 
 
+@pytest.mark.parametrize("has_active_config", [False, True], ids=["auto_detect", "reconcile"])
+def test_resolve_wan_autoround_mxfp4_from_disk(has_active_config):
+    """Ensure Wan2.2 experts (transformer / transformer_2) rebuild quantization from their config.jsons"""
+    disk_config = _autoround_mxfp4_config()
+    active_config = build_quantization_config(disk_config) if has_active_config else None
+
+    config = resolve_quantization_config_from_disk(active_config, disk_config)
+
+    assert isinstance(config, OmniINCConfig)
+    assert config.weight_bits == 4
+    assert config.data_type == "mx_fp"
+
+
 def test_wan_autoround_config_uses_runtime_layer_names():
-    config = build_quant_config(_autoround_mxfp4_config())
+    config = build_quantization_config(_autoround_mxfp4_config())
     configure_quant_config(config, WanTransformer3DModel)
 
     assert config.packed_modules_mapping is WanTransformer3DModel.packed_modules_mapping
@@ -69,7 +83,7 @@ def test_wan_autoround_config_uses_runtime_layer_names():
 
 
 def test_wan_autoround_scope_dispatches_only_blocks_to_mxfp4():
-    config = build_quant_config(_autoround_mxfp4_config())
+    config = build_quantization_config(_autoround_mxfp4_config())
     configure_quant_config(config, WanTransformer3DModel)
 
     layer = object.__new__(LinearBase)

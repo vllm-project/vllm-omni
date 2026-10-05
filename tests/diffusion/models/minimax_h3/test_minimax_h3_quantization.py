@@ -8,6 +8,8 @@ import pytest
 import torch
 import torch.nn as nn
 
+from vllm_omni.quantization import build_quantization_config
+
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
 
@@ -76,7 +78,7 @@ def test_fp8_scope_and_prefix_propagation(monkeypatch):
     )
 
     from vllm_omni.diffusion.models.minimax_h3 import minimax_h3_transformer as h3
-    from vllm_omni.quantization.fp8_config import DiffusionFp8Config
+    from vllm_omni.quantization.fp8_config import OmniFp8Config
 
     monkeypatch.setattr(h3, "ColumnParallelLinear", _FakeLinear)
     monkeypatch.setattr(h3, "MergedColumnParallelLinear", _FakeLinear)
@@ -92,7 +94,7 @@ def test_fp8_scope_and_prefix_propagation(monkeypatch):
         "blocks.0.adaln_proj.linear",
         "final_layer.adaln_proj.linear",
     }
-    fp8_config = DiffusionFp8Config(ignored_layers=sorted(ignored_layers))
+    fp8_config = OmniFp8Config(ignored_layers=sorted(ignored_layers))
     model = h3.MiniMaxH3DiTModel(
         _small_od_config(),
         quant_config=fp8_config,
@@ -259,10 +261,9 @@ def test_pipeline_resolves_transformer_component_quant_config():
     from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import (
         _resolve_component_quant_config,
     )
-    from vllm_omni.quantization import build_quant_config
 
     ignored_layers = ["blocks.0.attn.qkv_proj"]
-    component_config = build_quant_config(
+    component_config = build_quantization_config(
         {
             "transformer": {
                 "method": "fp8",

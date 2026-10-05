@@ -125,7 +125,7 @@ def test_single_stage_diffusion_gguf(model: DiffusionGGUFTestConfig, monkeypatch
     # GGUF
     images, mem_gguf = _generate_single_stage_image(
         model=model.hf_model,
-        diffusion_quantization_config={
+        quantization_config={
             "method": "gguf",
             "gguf_model": model.gguf_model,
         },

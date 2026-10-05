@@ -6,11 +6,14 @@ and loading details, see `modelopt-fp8.md`.
 
 ## Unified Entry Point
 
-`vllm_omni.quantization.build_quant_config()` accepts:
+`vllm_omni.quantization.build_quantization_config()` accepts:
 
 - `None` or `"none"` to disable quantization
 - a method string such as `"fp8"`, `"int8"`, `"mxfp8"`, `"awq"`, or `"auto-round"`
-- a flat dict with `"method"` or `"quant_method"`
+- a flat dict with `"method"`, to quantize full-precision weights while the
+  model loads
+- a flat dict with `"quant_method"`, describing an already-quantized checkpoint
+  (the `quantization_config` from its `config.json`)
 - a per-component dict such as `{"transformer": {"method": "fp8"}, "vae": None}`
 - an already-built `QuantizationConfig`
 
@@ -20,12 +23,12 @@ to vLLM names, apply the mapper to `ignored_layers` or component prefixes.
 
 ## Local Overrides
 
-The local factory delegates most methods to upstream `vllm`, but has vLLM-Omni
-overrides for methods that need diffusion, NPU, XPU, or component behavior:
+The factory resolves methods through vLLM's quantization registry. vLLM-Omni
+registers its own configs into that registry for omni models:
 
 | Method | Local Config | Main Use |
 |--------|--------------|----------|
-| `gguf` | `DiffusionGGUFConfig` | Pre-quantized diffusion transformer weights |
+| `gguf` | `DiffusionGGUFConfig` (provided by vllm-gguf-plugin) | Pre-quantized diffusion transformer weights |
 | `int8` | `DiffusionInt8Config` | Online or serialized W8A8 diffusion transformers |
 | `mxfp8` | `DiffusionMXFP8Config` | W8A8 MXFP8 diffusion on NPU and online XPU path |
 | `mxfp4` | `DiffusionMXFP4Config` | Online W4A4 MXFP4 diffusion on NPU |

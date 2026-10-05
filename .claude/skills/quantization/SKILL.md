@@ -27,7 +27,7 @@ Check `docs/user_guide/quantization/` and the closest implementation first.
 | Task | Start With |
 |------|------------|
 | Choose a method or command | `references/methods.md` and `references/modality-compat.md` |
-| Use `build_quant_config()` or per-component routing | `references/methods.md` |
+| Use `build_quantization_config()` or per-component routing | `references/methods.md` |
 | Work on diffusion quantization | `references/diffusion.md` |
 | Add quantization to a new model | `references/adding-models.md` |
 | Convert or load ModelOpt FP8 checkpoints | `references/modelopt-fp8.md` |
@@ -38,13 +38,13 @@ Check `docs/user_guide/quantization/` and the closest implementation first.
 The unified entrypoint is:
 
 ```python
-from vllm_omni.quantization import build_quant_config
+from vllm_omni.quantization import build_quantization_config
 ```
 
 It supports method strings, flat method dictionaries, per-component
 dictionaries, existing `QuantizationConfig` objects, and `None`. The factory
-delegates generic methods to upstream `vllm` and keeps vLLM-Omni overrides for
-diffusion or omni-specific routing:
+resolves methods through vLLM's quantization registry, into which vLLM-Omni
+registers its quantization configs & overrides for omni models:
 
 - `gguf`
 - `int8`

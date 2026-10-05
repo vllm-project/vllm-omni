@@ -12,7 +12,7 @@ or run the checkpoint.
 from __future__ import annotations
 
 import functools
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import torch
 from torch.nn import Parameter
@@ -33,6 +33,10 @@ from vllm.model_executor.layers.linear import (
     LinearMethodBase,
     UnquantizedLinearMethod,
 )
+from vllm.model_executor.layers.quantization import (
+    QuantizationMethods,
+    register_quantization_config,
+)
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
@@ -44,9 +48,6 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 from vllm.platforms.interface import DeviceCapability
-
-if TYPE_CHECKING:
-    from vllm.model_executor.layers.quantization import QuantizationMethods
 
 logger = init_logger(__name__)
 
@@ -95,6 +96,7 @@ def _nvfp4_kernel() -> NvFp4LinearKernel:
     return kernel
 
 
+@register_quantization_config("svdquant")
 class DiffusionSVDQuantConfig(QuantizationConfig):
     """Configuration for serialized NVFP4 W4A4 plus low-rank correction."""
 

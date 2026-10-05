@@ -61,7 +61,10 @@ from vllm.model_executor.layers.linear import (
     LinearBase,
     UnquantizedLinearMethod,
 )
-from vllm.model_executor.layers.quantization import QuantizationMethods
+from vllm.model_executor.layers.quantization import (
+    QuantizationMethods,
+    register_quantization_config,
+)
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
@@ -71,7 +74,6 @@ from vllm.model_executor.model_loader.weight_utils import initialize_single_dumm
 from vllm.model_executor.parameter import ModelWeightParameter
 from vllm.model_executor.utils import replace_parameter
 
-from vllm_omni.platforms import current_omni_platform
 from vllm_omni.quantization._copy_missing_attrs import (
     copy_missing_attrs as _copy_missing_attrs,
 )
@@ -136,6 +138,8 @@ def _validate_smooth_scale(scale: torch.Tensor) -> None:
 # ---------------------------------------------------------------------------
 
 
+# TODO: Not registered as "mxfp4" since vLLM's "mxfp4" is a different scheme (MoE W4A16);
+# rename this to remove the per-stage lookup in quantization.factory.
 class DiffusionMXFP4Config(QuantizationConfig):
     """W4A4 MXFP4 quantization config for diffusion transformers.
 
@@ -209,6 +213,8 @@ class DiffusionMXFP4Config(QuantizationConfig):
         layer: torch.nn.Module,
         prefix: str,
     ) -> QuantizeMethodBase | None:
+        from vllm_omni.platforms import current_omni_platform
+
         if isinstance(layer, LinearBase):
             if is_layer_skipped(
                 prefix=prefix,
@@ -919,6 +925,7 @@ def _parse_block_idx(prefix: str) -> int | None:
 # ---------------------------------------------------------------------------
 
 
+@register_quantization_config("mxfp4_dualscale")
 class DiffusionMXFP4DualScaleMixedConfig(QuantizationConfig):
     """W4A4 MXFP4 DualScale with per-layer BF16 fallback for diffusion transformers.
 
@@ -1013,6 +1020,8 @@ class DiffusionMXFP4DualScaleMixedConfig(QuantizationConfig):
         layer: torch.nn.Module,
         prefix: str,
     ) -> QuantizeMethodBase | None:
+        from vllm_omni.platforms import current_omni_platform
+
         if not isinstance(layer, LinearBase):
             return None
 

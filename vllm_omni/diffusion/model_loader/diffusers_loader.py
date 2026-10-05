@@ -17,7 +17,7 @@ from torch import nn
 from vllm.config.load import LoadConfig
 from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import UnquantizedLinearMethod
-from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
+from vllm.model_executor.layers.quantization.base_config import QuantizationConfig, QuantizeMethodBase
 from vllm.model_executor.model_loader.weight_utils import (
     download_weights_from_hf,
     filter_files_not_needed_for_inference,
@@ -63,6 +63,7 @@ from vllm_omni.diffusion.offloader.module_collector import ModuleDiscovery, Pipe
 from vllm_omni.diffusion.offloader.offload_plan import get_offload_plan
 from vllm_omni.diffusion.registry import initialize_model
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
+from vllm_omni.quantization import resolve_component_quant_config
 from vllm_omni.transformers_utils.repo_utils import hf_api
 
 
@@ -428,12 +429,8 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
                 return checkpoint_adapter.adapt(prefixed_weights_iterator)
         return prefixed_weights_iterator
 
-    def _get_source_quant_config(self, source: "ComponentSource") -> object | None:
-        quant_config = self.quant_config
-        resolve = getattr(quant_config, "resolve", None)
-        if resolve is not None:
-            return resolve(source.prefix.rstrip("."))
-        return quant_config
+    def _get_source_quant_config(self, source: "ComponentSource") -> QuantizationConfig | None:
+        return resolve_component_quant_config(self.quant_config, source.prefix.rstrip("."))
 
     def _get_checkpoint_adapter(
         self,
@@ -702,9 +699,10 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         offload_after_quant = False
         if load_device == "cpu" and self.quant_config is not None and device is not None:
             quant_cfg = self.quant_config
-            is_offline = getattr(quant_cfg, "data_type", None) == "mx_fp" or getattr(
-                quant_cfg, "is_checkpoint_quantized", False
-            )
+            # TODO: Check if we need to handle FP8 / NVFP4 here, since is_checkpoint_*_serialized
+            # isn't handled, but these would also be offline checkpoints
+            is_offline = getattr(quant_cfg, "data_type", None) == "mx_fp"
+
             if not is_offline:
                 load_device = device.type
                 offload_after_quant = True

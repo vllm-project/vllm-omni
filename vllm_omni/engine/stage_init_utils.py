@@ -26,7 +26,10 @@ from pathlib import Path
 from typing import Any, Literal, cast
 
 import regex as re
+from vllm.config import VllmConfig
 from vllm.logger import init_logger
+from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+from vllm.model_executor.layers.quantization.online.base import OnlineQuantizationConfig
 from vllm.pooling_params import PoolingParams
 from vllm.renderers import BaseRenderer
 from vllm.sampling_params import SamplingParams
@@ -60,7 +63,6 @@ from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniSamplingParam
 from vllm_omni.inputs.preprocess import build_omni_renderer, omni_renderer_cls
 from vllm_omni.outputs.output_processor import MultimodalOutputProcessor
 from vllm_omni.platforms import current_omni_platform
-from vllm_omni.quantization.inc_config import OmniINCConfig
 from vllm_omni.transformers_utils.repo_utils import hf_api
 
 logger = init_logger(__name__)
@@ -77,7 +79,7 @@ class ReplicaInitPlan:
     metadata: Any
     stage_connector_spec: dict[str, Any]
     omni_kv_connector: tuple[dict[str, Any] | None, str | None, str | None]
-    stage_vllm_config: Any | None = None
+    stage_vllm_config: VllmConfig | None = None
     executor_class: type | None = None
     engine_args_dict: dict[str, Any] | None = None
 
@@ -1209,12 +1211,8 @@ def _project_omni_stage_engine_args(
             )
         )
 
-    quantization_config = stage_config.quantization_config
-    if quantization_config is not None:
-        quantization_key = (
-            "quantization" if isinstance(quantization_config, str) and not is_diffusion else "quantization_config"
-        )
-        engine_args[quantization_key] = copy.deepcopy(quantization_config)
+    if stage_config.quantization_config is not None:
+        engine_args["quantization_config"] = stage_config.quantization_config
 
     return engine_args
 
@@ -1482,6 +1480,7 @@ def build_vllm_config(
     headless: bool = False,
     api_process_count: int = 1,
     api_process_rank: int = 0,
+    quantization_config: QuantizationConfig | None = None,
 ) -> tuple[Any, type]:
     """Build engine args, then create VllmConfig and executor_class.
 
@@ -1501,6 +1500,22 @@ def build_vllm_config(
     if api_process_count != 1 or api_process_rank != 0:
         filtered_engine_args_dict["_api_process_count"] = api_process_count
         filtered_engine_args_dict["_api_process_rank"] = api_process_rank
+
+    has_quant = (
+        filtered_engine_args_dict.get("quantization_config") is not None
+        or filtered_engine_args_dict.get("quantization") is not None
+    )
+    # This is an invariant now that we have moved quantization config to be on the common path
+    # with diffusion; we expect the QuantizationConfig to be preconstructed and .replace it on
+    # the vLLM config for now.
+    if has_quant and quantization_config is None:
+        raise RuntimeError("Engine args require quantization, but no quantization_config was provided.")
+
+    # Pop quantization related configs from engine args, since if we have a
+    # quantization config, we already have it, and we can't pass the pre-initialized
+    # config to vLLM's initializer. Then we'll .replace() the config on the final object.
+    filtered_engine_args_dict.pop("quantization_config", None)
+    filtered_engine_args_dict.pop("quantization", None)
 
     # _to_dict serializes dataclass fields (e.g. StructuredOutputsConfig) into
     # plain dicts.  When OmniEngineArgs is instantiated with the dict, these
@@ -1545,16 +1560,34 @@ def build_vllm_config(
     )
     executor_class = Executor.get_class(vllm_config)
 
-    # Upgrade vanilla INCConfig to OmniINCConfig for multi-stage models.
-    upgraded = OmniINCConfig.maybe_upgrade(vllm_config.quant_config)
-    if upgraded is not vllm_config.quant_config:
-        vllm_config = replace(vllm_config, quant_config=upgraded)
+    vllm_config = _maybe_patch_quantization_config(vllm_config, quantization_config)
 
     custom_voice_dir = engine_args_dict.get("custom_voice_dir")
     if custom_voice_dir:
         setattr(vllm_config.model_config.hf_config, "custom_voice_dir", custom_voice_dir)
 
     return vllm_config, executor_class
+
+
+def _maybe_patch_quantization_config(
+    vllm_config: VllmConfig,
+    quantization_config: QuantizationConfig | None,
+) -> VllmConfig:
+    """Apply the early-built quantization config only when vLLM found none in the stage checkpoint.
+
+    vLLM reads the stage's own checkpoint (model_subdir, hf_overrides, sidecar files), which the
+    early build does not, so a checkpoint-derived config from vLLM takes precedence.
+
+    TODO (Alex) - handle this case in early resolution after migrating to the omni model config;
+    this is needed for now because of when we build the vLLM Config, but should not allow patching.
+    """
+    if quantization_config is not None and vllm_config.quant_config is None:
+        vllm_config = replace(vllm_config, quant_config=quantization_config)
+        vllm_config.model_config.quantization = quantization_config.get_name()
+        if isinstance(quantization_config, OnlineQuantizationConfig):
+            # Online presets share the name "online", so their args keep the compile-cache hash distinct
+            vllm_config.model_config.quantization_config = quantization_config.args
+    return vllm_config
 
 
 def build_llm_stage_output_processor(

@@ -1,18 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Omni's online FP8 option backed by vLLM's online quantization API."""
+"""FP8 config covering both serialized checkpoints and online quantization."""
 
-from vllm.config.quantization import QuantizationConfigArgs, QuantSpec
+from torch import nn
+from vllm.config.quantization import resolve_quantization_config
+from vllm.model_executor.layers.quantization import register_quantization_config
+from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
+from vllm.model_executor.layers.quantization.fp8 import Fp8Config
 from vllm.model_executor.layers.quantization.online.base import OnlineQuantizationConfig
 
 
-class DiffusionFp8Config(OnlineQuantizationConfig):
-    """Keep the diffusion ``fp8`` option for quantizing BF16/FP16 weights.
-
-    Upstream Fp8Config now describes serialized checkpoints only. Keeping the
-    Omni method name also lets checkpoint metadata replace this online config
-    through the existing serialized-checkpoint reconciliation path.
-    """
+@register_quantization_config("fp8")
+class OmniFp8Config(Fp8Config):
+    """Fp8Config that also supports online FP8 when is_checkpoint_fp8_serialized is False."""
 
     def __init__(
         self,
@@ -22,26 +22,32 @@ class DiffusionFp8Config(OnlineQuantizationConfig):
         weight_block_size: list[int] | None = None,
         store_dtype: str | None = None,
     ) -> None:
-        if is_checkpoint_fp8_serialized:
-            raise ValueError("Serialized FP8 checkpoints require upstream Fp8Config")
-        if activation_scheme != "dynamic":
-            raise ValueError("Online FP8 quantization requires activation_scheme='dynamic'")
-        if weight_block_size is not None:
-            raise ValueError("Block-wise FP8 quantization requires a serialized checkpoint or fp8_per_block")
-        if store_dtype is not None:
-            raise ValueError("Online FP8 quantization does not support store_dtype")
+        # Upstream rejects non-serialized FP8, so initialize as serialized and then set the real mode.
         super().__init__(
-            QuantizationConfigArgs(
-                linear=QuantSpec(weight="fp8_per_tensor_static"),
-                moe=QuantSpec(weight="fp8_per_tensor_static"),
-                ignore=list(ignored_layers or []),
-            )
+            is_checkpoint_fp8_serialized=True,
+            activation_scheme=activation_scheme,
+            ignored_layers=ignored_layers,
+            weight_block_size=weight_block_size,
+            store_dtype=store_dtype,
         )
-        self.is_checkpoint_fp8_serialized = False
-        self.activation_scheme = activation_scheme
-        self.weight_block_size = None
-        self.store_dtype = None
+        if not is_checkpoint_fp8_serialized:
+            if activation_scheme != "dynamic":
+                raise ValueError("Online FP8 quantization requires activation_scheme='dynamic'")
+            if weight_block_size is not None:
+                raise ValueError("Block-wise FP8 quantization requires a serialized checkpoint or fp8_per_block")
+            if store_dtype is not None:
+                raise ValueError("Online FP8 quantization does not support store_dtype")
+            self.is_checkpoint_fp8_serialized = False
 
-    @classmethod
-    def get_name(cls) -> str:
-        return "fp8"
+    def get_quant_method(self, layer: nn.Module, prefix: str) -> QuantizeMethodBase | None:
+        if self.is_checkpoint_fp8_serialized:
+            return super().get_quant_method(layer, prefix)
+        # https://github.com/vllm-project/vllm/blob/v0.31.0/vllm/model_executor/model_loader/weight_utils.py#L347
+        args = resolve_quantization_config("fp8_per_tensor", {"ignore": self.ignored_layers})
+        # fp8_per_tensor has a built-in preset and a config dict is passed, so we should never get None here
+        if args is None:
+            raise RuntimeError("vLLM did not resolve the fp8_per_tensor online quantization preset")
+        online = OnlineQuantizationConfig(args)
+        # Ensure packed module mapping is forwarded through properly
+        online.packed_modules_mapping = self.packed_modules_mapping
+        return online.get_quant_method(layer, prefix)

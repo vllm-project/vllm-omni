@@ -153,7 +153,7 @@ def test_raw_and_base64_encoders_receive_persistent_converter(mocker: MockerFixt
 
 @pytest.mark.parametrize("typed_stage", [False, True], ids=["legacy", "typed"])
 def test_remote_diffusion_stage_enables_borrowed_frames_for_both_video_responses(
-    mocker: MockerFixture, typed_stage: bool
+    mocker: MockerFixture, typed_stage: bool, local_model_configs_only
 ):
     from vllm_omni.config.config_factory import StageConfigFactory
 
@@ -1212,7 +1212,7 @@ def test_mixed_reference_capability_uses_model_metadata_when_config_defaults_fal
     assert handler.supports_mixed_reference_inputs
 
 
-def test_typed_stage_drives_video_capability_checks():
+def test_typed_stage_drives_video_capability_checks(local_model_configs_only):
     from vllm_omni.config.config_factory import StageConfigFactory
     from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
 
@@ -1524,7 +1524,9 @@ def test_cosmos3_reference_video_limit_uses_v2v_condition_frames():
         (None, {"action_mode": "inverse_dynamics", "action_chunk_size": 16}, (17, "first")),
     ],
 )
-def test_cosmos3_reference_video_decode_policy_with_runtime_configs(typed, num_frames, extra_params, expected):
+def test_cosmos3_reference_video_decode_policy_with_runtime_configs(
+    typed, num_frames, extra_params, expected, local_model_configs_only
+):
     from vllm_omni.config.config_factory import StageConfigFactory
 
     if typed:

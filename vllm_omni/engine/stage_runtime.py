@@ -73,6 +73,7 @@ from vllm_omni.entrypoints.stage_utils import resolve_stage_physical_devices
 from vllm_omni.entrypoints.utils import inject_omni_kv_config
 from vllm_omni.outputs.output_metadata import FinalOutputModalityType
 from vllm_omni.platforms import current_omni_platform
+from vllm_omni.quantization.factory import get_stage_quantization_config
 
 logger = init_logger(__name__)
 
@@ -772,6 +773,22 @@ class StageRuntime:
             num_replicas = replicas_per_stage[stage_idx]
             launch_mode = self._get_launch_mode(stage_id)
 
+            # TODO: (Alex) - check if we need the else branch here. A lot of the code
+            # in this file is defensive, but it looks like in this case is probably not needed.
+            if isinstance(stage_cfg, BaseVllmOmniStageConfig):
+                quantization_config = stage_cfg.quantization_config
+            else:
+                quantization_config = get_stage_quantization_config(
+                    self._model,
+                    stage_cfg.engine_args.get("quantization_config"),
+                    revision=stage_cfg.engine_args.get("revision"),
+                    stage_type=base_metadata.stage_type,
+                    trust_remote_code=stage_cfg.engine_args.get("trust_remote_code", False),
+                    hf_config_name=stage_cfg.engine_args.get("hf_config_name"),
+                )
+            if quantization_config is not None:
+                logger.info("created quantization config of type: %s", type(quantization_config).__name__)
+
             replicas: list[ReplicaInitPlan] = []
             stage_vllm_config = None
             executor_class = None
@@ -809,6 +826,7 @@ class StageRuntime:
                     engine_args_dict=engine_args_dict,
                     api_process_count=self._client_count,
                     api_process_rank=self._api_process_rank,
+                    quantization_config=quantization_config,
                 )
 
             for replica_id in range(num_replicas):

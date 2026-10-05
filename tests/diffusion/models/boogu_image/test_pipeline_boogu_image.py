@@ -243,7 +243,7 @@ def test_constructor_routes_mllm_quantization(mock_dependencies, quantization_co
     from vllm.model_executor.layers.quantization.utils.quant_utils import kFp8Static128BlockSym
 
     from vllm_omni.diffusion.models.boogu_image.pipeline_boogu_image import BooguImagePipeline
-    from vllm_omni.quantization.fp8_config import DiffusionFp8Config
+    from vllm_omni.quantization.fp8_config import OmniFp8Config
 
     od_config = OmniDiffusionConfig(
         model="dummy-boogu",
@@ -287,14 +287,14 @@ def test_constructor_routes_mllm_quantization(mock_dependencies, quantization_co
         mock_dependencies["mllm_config_loader"].assert_not_called()
         mock_dependencies["mllm_builder"].assert_not_called()
         assert [source.subfolder for source in pipeline.weights_sources] == ["transformer"]
-    assert isinstance(mock_dependencies["transformer_cls"].call_args.kwargs["quant_config"], DiffusionFp8Config)
+    assert isinstance(mock_dependencies["transformer_cls"].call_args.kwargs["quant_config"], OmniFp8Config)
 
 
 def test_constructor_preserves_mllm_ignored_layers(mock_dependencies):
     from vllm_omni.diffusion.models.boogu_image.pipeline_boogu_image import BooguImagePipeline
-    from vllm_omni.quantization.fp8_config import DiffusionFp8Config
+    from vllm_omni.quantization.fp8_config import OmniFp8Config
 
-    quant_config = DiffusionFp8Config(
+    quant_config = OmniFp8Config(
         ignored_layers=["mllm.language_model.layers.0.self_attn.q_proj", "transformer.blocks.0.attn.to_q"]
     )
     od_config = OmniDiffusionConfig(

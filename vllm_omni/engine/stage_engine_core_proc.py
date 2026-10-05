@@ -202,20 +202,6 @@ class StageEngineCoreProc(EngineCoreProc):
 
         maybe_register_config_serialize_by_value()
 
-        # Register vllm-omni reasoning parsers (e.g. step_audio) in this
-        # subprocess so they are available when the engine core resolves
-        # ``--reasoning-parser``.  The main process already registered them
-        # at import time, but the forked subprocess starts with a fresh
-        # ReasoningParserManager.
-        try:
-            import vllm_omni.reasoning  # noqa: F401
-        except ImportError:
-            logger.warning(
-                "Failed to import vllm_omni.reasoning in subprocess; "
-                "custom reasoning parsers (e.g. step_audio) will not be "
-                "available."
-            )
-
         engine_core: StageEngineCoreProc | None = None
         coord_client = None
         try:

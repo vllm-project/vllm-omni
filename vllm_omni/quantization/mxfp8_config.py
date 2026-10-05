@@ -44,7 +44,9 @@ from vllm.model_executor.layers.linear import (
     LinearMethodBase,
     UnquantizedLinearMethod,
 )
-from vllm.model_executor.layers.quantization import QuantizationMethods
+from vllm.model_executor.layers.quantization import (
+    QuantizationMethods,
+)
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
@@ -57,7 +59,6 @@ from vllm.model_executor.model_loader.weight_utils import initialize_single_dumm
 from vllm.model_executor.parameter import ModelWeightParameter
 from vllm.model_executor.utils import replace_parameter
 
-from vllm_omni.platforms import current_omni_platform
 from vllm_omni.quantization._copy_missing_attrs import (
     copy_missing_attrs as _copy_missing_attrs,
 )
@@ -72,6 +73,8 @@ logger = init_logger(__name__)
 # ---------------------------------------------------------------------------
 
 
+# TODO: Not registered as "mxfp8" since vLLM's "mxfp8" is ModelOpt MXFP8 with its own platform support;
+# rename this to remove the per-stage lookup in quantization.factory.
 class DiffusionMXFP8Config(QuantizationConfig):
     """W8A8 MXFP8 quantization config for diffusion transformers.
 
@@ -127,6 +130,8 @@ class DiffusionMXFP8Config(QuantizationConfig):
         layer: torch.nn.Module,
         prefix: str,
     ) -> QuantizeMethodBase | None:
+        from vllm_omni.platforms import current_omni_platform
+
         if isinstance(layer, LinearBase):
             if is_layer_skipped(
                 prefix=prefix,
