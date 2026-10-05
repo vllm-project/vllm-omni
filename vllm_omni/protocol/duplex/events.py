@@ -334,20 +334,24 @@ class PlaybackAcknowledged(RealtimeEvent):
 class InputProcessed(RealtimeEvent):
     """Input-clocked sessions: the acknowledgement of a client input, in input order.
 
-    Sent once for every ``input_audio_buffer.append``, ``input_audio_buffer.commit``
-    and ``response.create`` of a session with ``extra_body.clock == "input"``,
-    only after every output that input caused has been sent. ``audio_end_ms`` is
-    the total input audio received so far, ``unit_end_ms`` the input covered by
-    the model units finished so far (completed by the model, or settled), and
-    ``units`` the units finished since the previous acknowledgement, oldest
-    first: ``{"end_ms", "decision"}``, plus ``"reason"`` for a unit settled as
+    Sent once for every ``input_audio_buffer.append``,
+    ``input_audio_buffer.commit`` and ``response.create`` that reaches a
+    session with ``extra_body.clock == "input"``, only after every output that
+    input caused has been sent. ``audio_end_ms`` is the input audio handled up
+    to and including this input (refused inputs not counted), ``unit_end_ms``
+    the input covered by the finished model units (completed by the model, or
+    settled) created up to this input, and ``units`` those units that no
+    earlier acknowledgement reported, oldest first:
+    ``{"end_ms", "decision"}``, plus ``"reason"`` for a unit settled as
     ``cancelled``, ``aborted`` or ``timed_out`` (a ``dropped`` unit has no
-    reason). A session teardown acknowledges all inputs still owed with one
-    event that also carries ``first_input_index``.
+    reason). The acknowledgement of an input the session refused before any of
+    it reached the model carries ``decision: "rejected"`` and ``reason`` (the
+    code of its ``error``). A session teardown acknowledges all inputs still
+    owed with one event that also carries ``first_input_index``.
     """
 
     wire_type = "input_audio_buffer.processed"
-    optional_wire_fields = frozenset({"first_input_index"})
+    optional_wire_fields = frozenset({"first_input_index", "decision", "reason"})
 
     audio_end_ms: int = 0
     unit_end_ms: int = 0
@@ -358,6 +362,10 @@ class InputProcessed(RealtimeEvent):
     #: Client event type acknowledged (``input_audio_buffer.append`` / ``.commit`` / ``response.create``).
     trigger: str = ""
     units: tuple[Mapping[str, object], ...] = ()
+    #: ``"rejected"`` only for an input the session refused at admission (otherwise omitted).
+    decision: str | None = None
+    #: With ``decision``: the code of the ``error`` the input was refused with, e.g. ``input_backpressure``.
+    reason: str | None = None
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

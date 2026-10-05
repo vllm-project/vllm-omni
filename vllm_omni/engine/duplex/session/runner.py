@@ -24,6 +24,7 @@ import asyncio
 import sys
 import time
 import uuid
+from collections import deque
 from collections.abc import Awaitable, Callable, Mapping
 from contextlib import ExitStack
 from copy import deepcopy
@@ -172,6 +173,16 @@ class _DeferredSilenceContinuation:
     defer_generation: int
 
 
+@dataclass(frozen=True, slots=True)
+class _RefusedInput:
+    """An input the manager refused at admission (``input_refused``) in an input-clocked session.
+
+    Only its acknowledgement travels, in input order; its payload is not kept.
+    """
+
+    ack: PendingAck
+
+
 _CANCEL_EVENTS = frozenset({"input.cancel", "response.cancel", "barge_in", "output_audio_buffer.clear"})
 #: How often an input-clocked session checks its unit timeouts while units are in flight.
 _INPUT_CLOCK_CHECK_INTERVAL_S = 1.0
@@ -234,7 +245,9 @@ class DuplexSessionRunner:
             session.model_state = plugin.create_session_state()
         self.model_state: DuplexModelSessionState = session.model_state
         self.tasks = DuplexSessionTasks()
-        self._mailbox: asyncio.Queue[DuplexCommand | StageOutput | StageProgress | _Internal] = asyncio.Queue()
+        self._mailbox: asyncio.Queue[DuplexCommand | StageOutput | StageProgress | _RefusedInput | _Internal] = (
+            asyncio.Queue()
+        )
         # Audio awaiting mailbox dispatch or offloaded decoding is real input
         # too, even before it reaches the PCM buffer. Continuations must not
         # insert a synthetic frame ahead of that already-received audio.
@@ -312,6 +325,8 @@ class DuplexSessionRunner:
             )
         #: Acknowledgement owed for the client input being handled right now.
         self._current_input_ack: PendingAck | None = None
+        #: Acknowledgements of the clocked inputs on the mailbox, in admission order.
+        self._admitted_acks: deque[PendingAck] = deque()
         #: The unit each append task in flight carries, until its outcome is settled.
         self._input_clock_appends: dict[asyncio.Task[bool], InputClockUnit] = {}
         #: Timeout-check timer, armed while the input clock has units in flight.
@@ -345,7 +360,27 @@ class DuplexSessionRunner:
     def submit(self, command: DuplexCommand) -> None:
         if isinstance(command, AppendAudio):
             self._pending_input_appends += 1
+        clock = self._input_clock
+        if clock is not None and command.wire_type in ACKNOWLEDGED_INPUTS:
+            # Indexed on admission, in wire order: a teardown before the worker
+            # reaches it still acknowledges it. The worker takes the commands in
+            # the same order, so it takes their acknowledgements in order too.
+            self._admitted_acks.append(clock.admit_input(command.wire_type))
         self._mailbox.put_nowait(command)
+
+    def input_refused(self, command: DuplexCommand, code: str) -> None:
+        """The manager refused ``command`` at admission and answered it with error ``code``.
+
+        An input-clocked session still owes an append / commit /
+        ``response.create`` its acknowledgement, in input order, as
+        ``decision: "rejected"`` with ``reason`` = ``code``: only a marker joins
+        the mailbox (the payload is not kept), and the acknowledgement follows
+        those of the inputs before it. A no-op without the clock.
+        """
+        clock = self._input_clock
+        if clock is None or command.wire_type not in ACKNOWLEDGED_INPUTS:
+            return
+        self._mailbox.put_nowait(_RefusedInput(clock.admit_input(command.wire_type, refused=code)))
 
     def on_stage_output(
         self,
@@ -483,21 +518,30 @@ class DuplexSessionRunner:
         if clock.has_open_units():
             self._arm_input_clock_timer()
 
-    async def _on_client_command(self, command: DuplexCommand) -> None:
-        """Run one client command; an input-clocked session acknowledges each input once its outputs are out.
+    def _acknowledge_refused_input(self, ack: PendingAck) -> None:
+        """An input refused at admission caused nothing: acknowledge it after the inputs before it."""
+        clock = self._input_clock
+        assert clock is not None, "only an input-clocked session queues these"
+        clock.begin_input(ack)
+        clock.end_input(ack)
 
-        Every acknowledged input gets its acknowledgement, including one the
-        handler rejects with an error (it then caused nothing). Inputs that
-        arrive once the session is closing never get here.
+    async def _on_clocked_command(self, command: DuplexCommand, ack: PendingAck) -> None:
+        """Run one acknowledged input of an input-clocked session; it is acknowledged once its outputs are out.
+
+        Every such input gets its acknowledgement, including one the handler
+        rejects with an error: it then caused nothing.
         """
         clock = self._input_clock
-        if clock is None or command.wire_type not in ACKNOWLEDGED_INPUTS:
-            await self._on_command(command)
-            return
-        ack = clock.begin_input(command.wire_type)
+        assert clock is not None, "only an input-clocked session takes acknowledgements"
+        clock.begin_input(ack)
         self._current_input_ack = ack
         try:
             await self._on_command(command)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # Reported before the acknowledgement, which then follows it.
+            self._report_handler_failure(command, exc)
         finally:
             self._current_input_ack = None
             clock.end_input(ack)
@@ -792,20 +836,23 @@ class DuplexSessionRunner:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                logger.exception("Duplex session %s failed handling %r: %s", self.session.session_id, item, exc)
-                # The serving reader waits for this command's id. An unstamped
-                # internal_error never matches, so the connection parks forever.
-                event_id = getattr(item, "event_id", None)
-                self._emit_error(
-                    "internal_error",
-                    str(exc),
-                    event_id=event_id if isinstance(event_id, str) and event_id else None,
-                )
+                self._report_handler_failure(item, exc)
             finally:
                 if isinstance(item, AppendAudio):
                     self._pending_input_appends -= 1
                     if self._pending_input_appends == 0 and self._deferred_silence is not None:
                         self.spawn(self._rearm_deferred_silence(), name="duplex-continue")
+
+    def _report_handler_failure(self, item: object, exc: Exception) -> None:
+        logger.exception("Duplex session %s failed handling %r: %s", self.session.session_id, item, exc)
+        # The serving reader waits for this command's id. An unstamped
+        # internal_error never matches, so the connection parks forever.
+        event_id = getattr(item, "event_id", None)
+        self._emit_error(
+            "internal_error",
+            str(exc),
+            event_id=event_id if isinstance(event_id, str) and event_id else None,
+        )
 
     async def _stop_worker(self) -> None:
         if self.ctx.history_calibration is not None:
@@ -840,7 +887,7 @@ class DuplexSessionRunner:
             return await loop.run_in_executor(self.manager.executor, lambda: fn(*args, **kwargs))
         return await loop.run_in_executor(self.manager.executor, fn, *args)
 
-    async def _handle_item(self, item: DuplexCommand | StageOutput | StageProgress | _Internal) -> None:
+    async def _handle_item(self, item: DuplexCommand | StageOutput | StageProgress | _RefusedInput | _Internal) -> None:
         session = self.session
         if isinstance(item, StageOutput):
             if self.model.is_input_transcription(item.request_id) and not await self._wait_for_append_tail():
@@ -861,14 +908,33 @@ class DuplexSessionRunner:
         if isinstance(item, _Internal):
             await self._on_internal(item)
             return
-        if self.run.closing or session.state == DuplexSessionState.CLOSED:
-            if isinstance(item, Commit):
-                session.release_pending_turn()
-            elif isinstance(item, AppendAudio):
-                admission = len(item.audio) + sum(len(frame) for frame in item.video_frames)
-                session.release_input_bytes(admission, queued=True)
+        if isinstance(item, _RefusedInput):
+            if not self.run.closing and session.state != DuplexSessionState.CLOSED:
+                # Otherwise its acknowledgement went out with the teardown.
+                self._acknowledge_refused_input(item.ack)
             return
-        await self._on_client_command(item)
+        ack = (
+            self._admitted_acks.popleft()
+            if self._input_clock is not None and item.wire_type in ACKNOWLEDGED_INPUTS
+            else None
+        )
+        if self.run.closing or session.state == DuplexSessionState.CLOSED:
+            # A clocked input's acknowledgement went out with the teardown.
+            self._release_admission(item)
+            return
+        if ack is None:
+            await self._on_command(item)
+            return
+        await self._on_clocked_command(item, ack)
+
+    def _release_admission(self, command: DuplexCommand) -> None:
+        """A command dropped unhandled (the session is closing) gives back what admission reserved for it."""
+        if isinstance(command, Commit):
+            self.session.release_pending_turn()
+        elif isinstance(command, AppendAudio):
+            self.session.release_input_bytes(
+                len(command.audio) + sum(len(frame) for frame in command.video_frames), queued=True
+            )
 
     async def _on_internal(self, item: _Internal) -> None:
         if item.kind == "input_clock_settle":
@@ -1162,6 +1228,19 @@ class DuplexSessionRunner:
         if projector is None:
             return
         discard_pending_commit_item(projector, realtime_item_id)
+
+    def _refuse_append(self, code: str, message: str, event: Mapping[str, object]) -> None:
+        """Reject an append before any of its audio reached the model.
+
+        The error carries the client's ``event_id``. In an input-clocked
+        session the append is acknowledged as ``decision: "rejected"`` with
+        ``reason`` = ``code``, like an input the manager refused at admission.
+        """
+        self._emit_error(code, message, event_id=event.get("realtime_event_id"))
+        ack = self._current_input_ack
+        if self._input_clock is not None and ack is not None:
+            # Rejected, and its audio no longer counts in ``audio_end_ms``.
+            self._input_clock.refuse_input(ack, code)
 
     def _require_projector(self) -> RealtimeProjectionState:
         return self.out.require_projector()
@@ -1474,7 +1553,7 @@ class DuplexSessionRunner:
         has_video = bool(video_frames)
         modality_error = session.capabilities.validate_append_modalities(has_audio=has_audio, has_video=has_video)
         if modality_error is not None:
-            self._emit_error("invalid_input_modality", modality_error)
+            self._refuse_append("invalid_input_modality", modality_error, event)
             return
         video_only = has_video and not has_audio
         if not session.capabilities.supports_barge_in and overlap_policy.event_requests_barge_in(event):
@@ -1510,13 +1589,13 @@ class DuplexSessionRunner:
                     sample_rate_hz=sample_rate_hz,
                 )
             except ValueError as exc:
-                self._emit_error("bad_event", str(exc))
+                self._refuse_append("bad_event", str(exc), event)
                 return
             audio, fmt, converted_rate = converted
             if converted_rate is not None:
                 sample_rate_hz = converted_rate
             if isinstance(fmt, str) and fmt.lower() in {"pcm16", "pcm_s16le", "s16le"}:
-                self._emit_error("bad_audio", "input_audio_buffer.append pcm16 audio could not be decoded")
+                self._refuse_append("bad_audio", "input_audio_buffer.append pcm16 audio could not be decoded", event)
                 return
             event["audio"] = audio
             event["format"] = fmt
@@ -1686,7 +1765,7 @@ class DuplexSessionRunner:
             release_queued_input()
         try:
             if not session.reserve_input_bytes(raw_audio_bytes, limit=limit):
-                self._emit_error("input_backpressure", "Duplex session pending input exceeds server limit")
+                self._refuse_append("input_backpressure", "Duplex session pending input exceeds server limit", event)
                 return
             # Full-duplex: emit each ~chunk_period of audio so the model runs
             # per-chunk generation without an explicit response.create.
@@ -1699,7 +1778,7 @@ class DuplexSessionRunner:
             )
         except ValueError as exc:
             session.release_input_bytes(raw_audio_bytes)
-            self._emit_error("bad_event", str(exc))
+            self._refuse_append("bad_event", str(exc), event)
             return
         # Only audio the buffer actually took counts as input for the next commit.
         model_state.input_since_commit = True
@@ -1714,7 +1793,12 @@ class DuplexSessionRunner:
             if pending_delta > 0 and not session.reserve_input_bytes(pending_delta, limit=limit):
                 if pcm_reservation is not None:
                     pcm_reservation.rollback()
-                self._emit_error("input_backpressure", "Duplex session pending input exceeds server limit")
+                # The audio is already in the commit buffer: an error, not a refusal.
+                self._emit_error(
+                    "input_backpressure",
+                    "Duplex session pending input exceeds server limit",
+                    event_id=event.get("realtime_event_id"),
+                )
                 return
             if pending_delta < 0:
                 session.release_input_bytes(-pending_delta)
@@ -2766,7 +2850,7 @@ class DuplexSessionRunner:
             model_state.deferred_response_create = False
         return True
 
-    async def _start_response_from_committed_audio(self) -> None:
+    async def _start_response_from_committed_audio(self, *, event_id: object = None) -> None:
         """Answer a client ``response.create``.
 
         A turn starts from committed input. Audio is the usual kind, but the
@@ -2778,7 +2862,8 @@ class DuplexSessionRunner:
         anything this layer invents.
 
         Refused only when nothing is waiting, or a response is already running,
-        rather than silently producing an empty turn.
+        rather than silently producing an empty turn; the error carries the
+        ``event_id`` of the client's ``response.create``.
         """
         session = self.session
         model_state = self.model_state
@@ -2796,7 +2881,9 @@ class DuplexSessionRunner:
             ):
                 return
             self._emit_error(
-                "response_already_active", "response.create cannot start while another response is active."
+                "response_already_active",
+                "response.create cannot start while another response is active.",
+                event_id=event_id,
             )
             session.discard_response_options()
             return
@@ -2841,6 +2928,7 @@ class DuplexSessionRunner:
                 "initial_user_text to ask it in text."
                 if session.capabilities.supports_chat_completions
                 else "This duplex model answers speech input only.",
+                event_id=event_id,
             )
             session.reset_unanswered_user_items()
             session.discard_response_options()
@@ -2848,6 +2936,7 @@ class DuplexSessionRunner:
         self._emit_error(
             "response_create_without_input",
             "Duplex response.create requires committed audio to answer.",
+            event_id=event_id,
         )
         session.discard_response_options()
 
@@ -3159,7 +3248,7 @@ class DuplexSessionRunner:
                 await self._commit_and_start_auto_response(event, realtime_item_id=realtime_item_id)
                 return
         if event_type == "response.create":
-            await self._start_response_from_committed_audio()
+            await self._start_response_from_committed_audio(event_id=event.get("realtime_event_id"))
             return
         next_commit_allowed = helpers.next_commit_allowed(
             self.session,
