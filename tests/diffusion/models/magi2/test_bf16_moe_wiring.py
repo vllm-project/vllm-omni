@@ -151,6 +151,23 @@ def test_bf16_forward_head_offsets_and_interleaved_weights(monkeypatch, num_toke
 
 
 @pytest.mark.cpu
+@pytest.mark.parametrize("is_musa", [False, True])
+def test_bf16_forward_selects_the_k_tile_per_platform(monkeypatch, is_musa):
+    tiles = []
+
+    def invoke(*args, **kwargs):
+        tiles.append((kwargs["fuse_swiglu"], kwargs["config"]["BLOCK_SIZE_K"]))
+        return _torch_invoke(*args, **kwargs)
+
+    monkeypatch.setattr(moe, "invoke_fused_moe_bf16", invoke)
+    monkeypatch.setattr(moe.current_omni_platform, "is_musa", Mock(return_value=is_musa))
+    x, probabilities, indices, gate, up, down = _moe_inputs(5, 2)
+    moe._bf16_fused_moe_forward(x, probabilities, indices, moe._pack_bf16_w13(gate, up), down)
+    k_tile = 64 if is_musa else 32
+    assert tiles == [(True, k_tile), (False, k_tile)]
+
+
+@pytest.mark.cpu
 @pytest.mark.parametrize(
     ("device_type", "dtype", "deterministic", "num_tokens", "is_musa", "expected_path"),
     [

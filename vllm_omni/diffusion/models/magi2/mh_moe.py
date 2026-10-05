@@ -157,14 +157,15 @@ def _bf16_fused_moe_forward(
     intermediate = torch.empty(
         (num_heads * num_tokens * top_k, intermediate_size), device=x_heads.device, dtype=x_heads.dtype
     )
-    # Keep the qualified MUSA point unchanged.  CUDA/H20 benefits from the
-    # pre-Blackwell tile found by the MAGI-2 BF16 sweep (smaller K/warp count
-    # and deeper pipelining reduce register pressure).  The launch contract
-    # remains the same; only legal, device-specific values are selected.
+    # CUDA/H20 benefits from the pre-Blackwell tile found by the MAGI-2 BF16
+    # sweep (smaller K/warp count and deeper pipelining reduce register
+    # pressure).  On MUSA both GEMMs are faster with a 64-wide K tile.  The
+    # launch contract remains the same; only legal, device-specific values
+    # are selected.
     config = {
         "BLOCK_SIZE_M": 128,
         "BLOCK_SIZE_N": 128,
-        "BLOCK_SIZE_K": 32,
+        "BLOCK_SIZE_K": 32 if not current_omni_platform.is_musa() else 64,
         "GROUP_SIZE_M": 16,
         "num_warps": 4 if not current_omni_platform.is_musa() else 16,
         "num_stages": 3 if not current_omni_platform.is_musa() else 1,
