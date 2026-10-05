@@ -6,25 +6,29 @@
 
 The sink and context-parallel math is adapted from SandAI's Apache-2.0
 MAGI-2 preview implementation.  This version uses vLLM's bundled
-FlashAttention extension and vLLM-Omni's existing Ulysses process group; the
-PyTorch path is an exact, portable oracle for small tests.
+FlashAttention extension on CUDA, standalone FlashAttention-3 on MUSA, and
+vLLM-Omni's existing Ulysses process group; the chunked PyTorch path is the
+portable reference and the MUSA fallback.
 """
 
 from __future__ import annotations
 
-import logging
 import os
 from dataclasses import dataclass
 from functools import cache
 
 import torch
 import torch.nn as nn
+from vllm.logger import init_logger
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.backends.utils.fa import (
+    flash_attn_3_varlen,
+    flash_attn_3_varlen_unsupported,
     resolve_vllm_flash_attn_version,
     vllm_flash_attn_varlen_with_lse,
 )
+from vllm_omni.platforms import current_omni_platform
 
 from .parallel import (
     Magi2ParallelGroup,
@@ -33,7 +37,12 @@ from .parallel import (
     scatter_seqlen_gather_heads,
 )
 
-logger = logging.getLogger(__name__)
+logger = init_logger(__name__)
+
+# MATE's Mubin kernel, which runs when no native sinks are passed, truncates the BF16
+# softmax probabilities. Packed batches whose longest query sequence is shorter than
+# this use the exact Torch reference; MAGI-2 production sequences are far longer.
+_MUSA_FA3_MIN_TOKENS = 32
 
 
 @cache
@@ -202,10 +211,10 @@ def packed_attention_with_sink(
 ) -> torch.Tensor:
     """Run packed attention on one rank after Ulysses head exchange."""
 
-    cu_q, cu_k, max_q, max_k = varlen.resolved(q.shape[0], k.shape[0])
-    cu_q = cu_q.to(device=q.device, dtype=torch.int32).contiguous()
-    cu_k = cu_k.to(device=q.device, dtype=torch.int32).contiguous()
-    if q.is_cuda:
+    bounds_q, bounds_k, max_q, max_k = varlen.resolved(q.shape[0], k.shape[0])
+    cu_q = bounds_q.to(device=q.device, dtype=torch.int32).contiguous()
+    cu_k = bounds_k.to(device=q.device, dtype=torch.int32).contiguous()
+    if q.is_cuda and current_omni_platform.is_cuda():
         out, lse = vllm_flash_attn_varlen_with_lse(
             q,
             k,
@@ -219,12 +228,42 @@ def packed_attention_with_sink(
             fa_version=_resolve_flash_attn_version(),
         )
         return correct_out_lse_with_sink(out, lse, sink)[0]
+    if (
+        current_omni_platform.is_musa()
+        and q.device.type == current_omni_platform.device_type
+        and q.dtype in (torch.float16, torch.bfloat16)
+        and q.shape[0] > 0
+        and k.shape[0] > 0
+        and max_q >= _MUSA_FA3_MIN_TOKENS
+    ):
+        unsupported = flash_attn_3_varlen_unsupported(softcap > 0, True)
+        if unsupported is None:
+            out, lse = flash_attn_3_varlen(
+                q,
+                k,
+                v,
+                cu_seqlens_q=cu_q,
+                cu_seqlens_k=cu_k,
+                max_seqlen_q=max_q,
+                max_seqlen_k=max_k,
+                softmax_scale=q.shape[-1] ** -0.5,
+                softcap=softcap,
+                return_softmax_lse=True,
+            )
+            # Correct the learned sinks in FP32; FA3 itself runs in the activation dtype.
+            if sink is not None:
+                out = out.float()
+            return correct_out_lse_with_sink(out, lse, sink)[0].to(q.dtype)
+        logger.warning_once(
+            "MAGI-2 FlashAttention-3 is unavailable on MUSA; using Torch reference attention: %s", unsupported
+        )
+    # The reference reads the sequence bounds on the host; device copies would sync per sequence.
     return torch_varlen_attention_with_sink(
         q,
         k,
         v,
-        cu_seqlens_q=cu_q,
-        cu_seqlens_k=cu_k,
+        cu_seqlens_q=bounds_q.cpu(),
+        cu_seqlens_k=bounds_k.cpu(),
         softcap=softcap,
         sink=sink,
     )
