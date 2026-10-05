@@ -25,6 +25,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import torch
 import torch.distributed as dist
@@ -34,6 +35,9 @@ from vllm_omni.diffusion.distributed.head_parallel import (
     scatter_heads_gather_tokens,
     scatter_tokens_gather_heads,
 )
+
+if TYPE_CHECKING:
+    from vllm_omni.diffusion.data import DiffusionParallelConfig
 
 
 @dataclass(frozen=True)
@@ -78,17 +82,69 @@ def get_magi2_ulysses_group() -> Magi2ParallelGroup:
     )
 
 
+def get_magi2_expert_parallel_config() -> DiffusionParallelConfig | None:
+    """Return the parallel config when the model opted into head-EP, else ``None``.
+
+    ``use_head_expert_parallel`` is the metadata-driven opt-in that makes
+    ``expert_parallel_size`` settable independently of the SP degree, so it also
+    decides whether the MoE head axis follows the framework's EP group.
+    """
+
+    from vllm_omni.diffusion.forward_context import get_forward_context
+
+    try:
+        od_config = get_forward_context().omni_diffusion_config
+    except AssertionError:
+        return None
+    if od_config is not None and getattr(od_config, "use_head_expert_parallel", False):
+        return od_config.parallel_config
+    return None
+
+
+def _head_expert_parallel_group() -> Magi2ParallelGroup | None:
+    """Return the head-sharded expert group, or ``None`` when it is not active.
+
+    vLLM-Omni builds this group only when the model declares
+    ``expert_parallel_style="head"`` *and* expert parallelism is enabled. Its
+    degree comes from ``expert_parallel_size`` and may be smaller than the
+    sequence-parallel degree, in which case it is a subgroup of the SP ranks.
+    """
+
+    try:
+        from vllm.distributed import parallel_state as vllm_parallel_state
+    except ImportError:
+        return None
+    coordinator = getattr(vllm_parallel_state, "_EP", None)
+    if coordinator is None:
+        return None
+    # ``init_model_parallel_group`` returns a GroupCoordinator; the raw
+    # device_group is what the collectives below expect.
+    device_group = getattr(coordinator, "device_group", None)
+    if device_group is None:
+        return None
+    return Magi2ParallelGroup(
+        group=device_group,
+        world_size=dist.get_world_size(device_group),
+        rank=dist.get_rank(device_group),
+    )
+
+
 def get_magi2_ep_group() -> Magi2ParallelGroup:
     """Return the process group used for MAGI's MoE-head parallelism.
 
-    TP is the explicit MoE-head axis when it is larger than one.  Otherwise
-    the released SP-only layout overlaps head parallelism with Ulysses.  Both
-    groups are initialized and owned by vLLM-Omni; MAGI creates no ad-hoc
-    process groups.
+    Head-sharded expert parallelism wins when it is active, because it is the
+    only layout that lets the MoE degree differ from the sequence-parallel
+    degree. Otherwise TP is the explicit MoE-head axis when it is larger than
+    one, and failing that the released SP-only layout overlaps head parallelism
+    with Ulysses. All of these groups are initialized and owned by vLLM-Omni;
+    MAGI creates no ad-hoc process groups.
     """
 
     if not dist.is_available() or not dist.is_initialized():
         return Magi2ParallelGroup(None, 1, 0)
+    head_ep = _head_expert_parallel_group()
+    if head_ep is not None:
+        return head_ep
     try:
         from vllm.distributed.parallel_state import get_tp_group
 
@@ -103,6 +159,41 @@ def get_magi2_ep_group() -> Magi2ParallelGroup:
         rank=coordinator.rank_in_group,
         replicated_sequence=True,
     )
+
+
+def validate_magi2_expert_parallel(parallel: DiffusionParallelConfig) -> None:
+    """Reject head-EP layouts the native transformer cannot execute.
+
+    The MoE head axis is the full ``hidden_size`` head count, and the EP-sharded
+    gate/up/down weights are sliced over that same axis.  Tensor parallelism
+    already column-shards the routed hidden state, so combining the two would
+    slice the head axis twice.
+    """
+
+    if parallel.enable_expert_parallel and parallel.tensor_parallel_size != 1:
+        raise ValueError("MAGI-2 head-EP currently requires tensor_parallel_size=1")
+
+
+def get_magi2_ep_split_indices(ep_group: Magi2ParallelGroup, sp_group: Magi2ParallelGroup) -> tuple[int, ...] | None:
+    """Map SP-local token counts into EP rank order without a collective.
+
+    Legacy TP replicates each SP token shard, so it does not use this mapping.
+    """
+    if ep_group.replicated_sequence:
+        return None
+
+    def members(group: Magi2ParallelGroup) -> list[int]:
+        if group.group is not None:
+            return dist.get_process_group_ranks(group.group)
+        if group.world_size != 1:
+            raise ValueError("A multi-rank MAGI-2 group requires a process group")
+        return [dist.get_rank() if dist.is_available() and dist.is_initialized() else 0]
+
+    ep_ranks, sp_ranks = members(ep_group), members(sp_group)
+    try:
+        return tuple(sp_ranks.index(rank) for rank in ep_ranks)
+    except ValueError as exc:
+        raise ValueError("MAGI-2 head-EP group must be contained in its SP group") from exc
 
 
 def get_magi2_tp_group() -> Magi2ParallelGroup:

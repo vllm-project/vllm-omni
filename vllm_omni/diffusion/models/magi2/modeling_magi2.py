@@ -36,7 +36,12 @@ from .layers import (
     swiglu7,
 )
 from .mh_moe import Magi2MultiHeadMoE, Magi2MultiHeadMoEConfig
-from .parallel import Magi2SequenceDispatcher
+from .parallel import (
+    Magi2SequenceDispatcher,
+    get_magi2_ep_split_indices,
+    get_magi2_expert_parallel_config,
+    get_magi2_ulysses_group,
+)
 
 
 class Modality(IntEnum):
@@ -259,6 +264,17 @@ class Magi2MultiHeadMoELayer(nn.Module):
                 route_scale=moe.routing_scale,
             )
         )
+        # Head-EP may shard the MoE heads across a subgroup of the SP ranks, so
+        # the SP-ordered token counts need re-indexing into EP rank order before
+        # the head dispatch. Resolving it here keeps the counts on the host and
+        # spares every MoE forward a size all-gather.
+        self._ep_split_indices: tuple[int, ...] | None = None
+        self._sp_world_size = 1
+        parallel = get_magi2_expert_parallel_config()
+        if parallel is not None:
+            sp_group = get_magi2_ulysses_group()
+            self._sp_world_size = sp_group.world_size
+            self._ep_split_indices = get_magi2_ep_split_indices(self.moe_mlp.ep_group, sp_group)
         self.merge_linear = make_grouped_linear(
             config.hidden_size,
             config.hidden_size,
@@ -299,6 +315,19 @@ class Magi2MultiHeadMoELayer(nn.Module):
         tp_size = self.split_linear.tp_group.world_size
         self.local_shared_expert_intermediate_size = moe.shared_expert_intermediate_size // tp_size
         self.local_modality_shared_expert_intermediate_size = moe.modality_shared_expert_intermediate_size // tp_size
+
+    def ep_sequence_split_sizes(self, cp_split_sizes: list[int] | torch.Tensor) -> list[int] | None:
+        """Re-index SP-ordered token counts into EP rank order.
+
+        Returns ``None`` when head-EP is inactive or the counts are not a host
+        list, which leaves the MoE to discover its own counts collectively.
+        """
+
+        if self._ep_split_indices is None or not isinstance(cp_split_sizes, list):
+            return None
+        if len(cp_split_sizes) != self._sp_world_size:
+            raise ValueError("MAGI-2 token counts must be in SP group rank order")
+        return [cp_split_sizes[index] for index in self._ep_split_indices]
 
     def _shared_experts(
         self,
@@ -626,7 +655,7 @@ class Magi2TransformerLayer(nn.Module):
         streams, mlp_logits, normalized, routed = self._moe_input(
             streams, attention, gates, attention_logits, modality_dispatcher
         )
-        routed = self.mlp.moe_mlp(routed)
+        routed = self.mlp.moe_mlp(routed, self.mlp.ep_sequence_split_sizes(cp_split_sizes))
         return self._moe_output(streams, mlp_logits, normalized, routed, modality_dispatcher)
 
 
