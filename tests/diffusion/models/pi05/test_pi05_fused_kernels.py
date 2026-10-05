@@ -7,7 +7,9 @@ dtypes and in the deployed mixed-dtype layout: bfloat16 GEMM weights, K/V and
 GEMM inputs, with the float32 residual stream, norms and head that
 ``_to_bfloat16_for_inference`` keeps. The shapes are the deployed ones: a
 968-token prefix on the Gemma 2B widths and a 50-token action chunk on the
-Gemma 300M ones, with 8 query heads, 1 KV head and head_dim 256.
+Gemma 300M ones, with 8 query heads, 1 KV head and head_dim 256. The action
+expert's GEMM kernels also run a 256-token chunk: every chunk length uses the
+same tiles.
 
 The kernels perform eager's operations in its order and round where it
 rounds, so what a test expects depends on whether a kernel reorders a
@@ -61,6 +63,9 @@ DEVICE = "cuda"
 HEADS, HEAD_DIM = 8, 256
 # (tokens, width, MLP width): the prefix on Gemma 2B, the action chunk on Gemma 300M.
 SHAPES = {"prefix": (968, 2048, 16384), "suffix": (50, 1024, 4096)}
+# Action-chunk lengths for the GEMM kernels: the deployed one and a long one. A
+# chunk of 256 tokens or more once looked up tiles that did not exist.
+CHUNKS = [SHAPES["suffix"][0], 256]
 
 
 def _dtype_id(dtype: torch.dtype) -> str:
@@ -321,11 +326,12 @@ def test_qkv_rope_matches_eager(gemm, dtype, part):
 @pytest.mark.parametrize("dtype", DTYPES, ids=_dtype_id)
 @pytest.mark.parametrize("gated", [True, False], ids=["gated", "plain"])
 @pytest.mark.parametrize("n_in", [2048, 4096], ids=["o_proj", "down_proj"])
-def test_linear_residual_matches_gated_residual(gemm, dtype, gated, n_in):
+@pytest.mark.parametrize("tokens", CHUNKS, ids=lambda tokens: f"chunk={tokens}")
+def test_linear_residual_matches_gated_residual(gemm, dtype, gated, n_in, tokens):
     """``_gated_residual(residual, linear(x), gate)``, the float32 residual stream
     updated in place as the fused denoising step runs it."""
     _skip_unserved(gemm, dtype)
-    tokens, width, _ = SHAPES["suffix"]
+    _, width, _ = SHAPES["suffix"]
     linear = _proj_dtype_module(_randomize(nn.Linear(n_in, width, bias=False), seed=17), dtype)
     x = _randn(tokens, n_in, dtype=dtype, seed=18)
     residual = _randn(tokens, width, scale=4.0, seed=19)
@@ -343,10 +349,11 @@ def test_linear_residual_matches_gated_residual(gemm, dtype, gated, n_in):
 
 
 @pytest.mark.parametrize("dtype", DTYPES, ids=_dtype_id)
-def test_linear_gelu_mul_matches_gemma_mlp_input(gemm, dtype):
+@pytest.mark.parametrize("tokens", CHUNKS, ids=lambda tokens: f"chunk={tokens}")
+def test_linear_gelu_mul_matches_gemma_mlp_input(gemm, dtype, tokens):
     """``act_fn(gate_proj(x)) · up_proj(x)``, the action expert's MLP up to ``down_proj``."""
     _skip_unserved(gemm, dtype)
-    tokens, width, mlp_width = SHAPES["suffix"]
+    _, width, mlp_width = SHAPES["suffix"]
     mlp = _proj_dtype_module(_randomize(GemmaMLP(_gemma_config(width, mlp_width)), seed=21), dtype)
     x = _randn(tokens, width, dtype=dtype, seed=22)
 
