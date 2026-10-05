@@ -326,3 +326,54 @@ def test_zero_capacity_disables_capture():
     assert not graph.graphs
     assert not graph._seen
     assert graph.get_cumulative_stats()["capacity_misses"] == 3
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("share_pools", [False, True])
+@torch.inference_mode()
+def test_pool_reuse_preserves_outputs_across_late_capture_and_arbitrary_replay(share_pools):
+    graph = _make_graph(lambda x: (x.sin() + 2).cos(), share_pools=share_pools)
+    retained = []
+    for size in (64, 128, 32, 96):
+        x = torch.randn(size, 64, device="cuda")
+        graph(x)
+        retained.append((graph(x), (x.sin() + 2).cos()))
+        # Replay older shapes between captures, including smaller -> larger.
+        for previous in (64, size, 64):
+            value = torch.randn(previous, 64, device="cuda")
+            torch.testing.assert_close(graph(value), (value.sin() + 2).cos())
+        for actual, expected in retained:
+            torch.testing.assert_close(actual, expected)
+    pools = {entry.graph_pool for entry in graph.graphs.values()}
+    assert len(pools) == (1 if share_pools else 4)
+    assert len(graph._capture_pools) == (1 if share_pools else 0)
+    for size in (96, 32, 128, 64, 128, 32):
+        value = torch.randn(size, 64, device="cuda")
+        torch.testing.assert_close(graph(value), (value.sin() + 2).cos())
+    for actual, expected in retained:
+        torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@torch.inference_mode()
+def test_shared_pools_are_isolated_by_encoder_and_replay_stream():
+    graphs = [_make_graph(torch.sin), _make_graph(torch.cos)]
+    streams = [torch.cuda.Stream(), torch.cuda.Stream()]
+    retained = []
+    for graph in graphs:
+        for stream in streams:
+            with torch.cuda.stream(stream):
+                for size in (16, 32):
+                    x = torch.randn(size, 64, device="cuda")
+                    graph(x)
+                    retained.append((graph(x), graph.forward(x)))
+                    graph(x + 1)
+    for stream in streams:
+        torch.cuda.current_stream().wait_stream(stream)
+    pools = {entry.graph_pool for graph in graphs for entry in graph.graphs.values()}
+    assert len(pools) == 4
+    assert all(len(graph._capture_pools) == 2 for graph in graphs)
+    for actual, expected in retained:
+        torch.testing.assert_close(actual, expected)

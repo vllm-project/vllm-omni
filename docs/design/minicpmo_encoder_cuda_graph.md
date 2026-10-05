@@ -13,7 +13,8 @@ Use `--hf-overrides` to configure both encoders:
   "encoder_cuda_graph": true,
   "encoder_cuda_graph_max_graphs": 4,
   "encoder_cuda_graph_min_capture_calls": 2,
-  "encoder_cuda_graph_min_free_bytes": 1073741824
+  "encoder_cuda_graph_min_free_bytes": 1073741824,
+  "encoder_cuda_graph_share_pools": true
 }
 ```
 
@@ -24,7 +25,16 @@ so an evicted history entry must accumulate its calls again. Increasing the
 graph cap can improve coverage but retains more GPU memory. Existing graphs
 are not replaced, avoiding repeated capture costs when traffic changes.
 
-Each graph owns a separate memory pool. The graph count is **not a byte limit**.
+By default, graphs in the same encoder on the same device and replay stream
+share a memory pool and capture stream. Different encoders and replay streams
+remain isolated. Graph inputs and output buffers are allocated outside capture;
+only transient capture allocations share the pool. Returned outputs remain
+cloned. A late capture waits for earlier replay work and output clones before
+reusing the pool. Set `encoder_cuda_graph_share_pools` to `false` for an A/B
+comparison with a separate pool and capture stream per graph.
+
+The graph count is **not a byte limit**. Sharing pools reuses intermediate
+storage but does not eliminate per-shape static input and output buffers.
 Before a new capture, the adapter checks device-free memory against
 `min_free_bytes`, a nonnegative integer (default: 1 GiB; zero disables the check).
 Below this floor the call runs eagerly, and a later call may try admission

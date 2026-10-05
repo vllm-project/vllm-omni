@@ -113,7 +113,10 @@ class EncoderCudaGraph:
     """Capture repeated shapes without padding or changing attention semantics.
 
     The owner must bypass this object for training, stateful KV caches and
-    data-dependent Python branches. Each entry owns a private graph pool;
+    data-dependent Python branches. Entries on the same device and replay
+    stream share a graph pool and capture stream. Different replay streams
+    and encoder instances remain isolated. Graphs must not run concurrently
+    on a shared pool, and their intermediate tensors must not escape capture;
     callers get a clone so a later replay cannot overwrite retained embeddings.
     Unseen shapes after the cap run eagerly instead of growing GPU memory.
     Admission is first-come, with no eviction or automatic recapture. Startup
@@ -133,6 +136,7 @@ class EncoderCudaGraph:
         max_graphs: int = 4,
         min_capture_calls: int = 2,
         min_free_bytes: int = 1 << 30,
+        share_pools: bool = True,
     ):
         for name, value, minimum in (
             ("max_graphs", max_graphs, 0),
@@ -146,6 +150,8 @@ class EncoderCudaGraph:
         self.max_graphs = max_graphs
         self.min_capture_calls = min_capture_calls
         self.min_free_bytes = min_free_bytes
+        self.share_pools = share_pools
+        self._capture_pools: dict[tuple, tuple[tuple[int, int], torch.cuda.Stream]] = {}
         self.graphs: dict[tuple, EncoderCudaGraphManager] = {}
         self._seen: dict[tuple, torch.Size] = {}
         self._seen_calls: Counter[tuple] = Counter()
@@ -236,9 +242,21 @@ class EncoderCudaGraph:
         config.parallel_config = copy(config.parallel_config)
         config.parallel_config.tensor_parallel_size = 1
         manager = EncoderCudaGraphManager(config, tensor.device, tensor.dtype, adapter)
-        stream = torch.cuda.Stream(device=tensor.device)
-        stream.wait_stream(torch.cuda.current_stream(tensor.device))
+        replay_stream = torch.cuda.current_stream(tensor.device)
+        pool_key = (tensor.device, replay_stream.cuda_stream)
+        if self.share_pools and pool_key in self._capture_pools:
+            pool, stream = self._capture_pools[pool_key]
+        else:
+            pool = torch.cuda.graph_pool_handle()
+            stream = torch.cuda.Stream(device=tensor.device)
+        # A late capture must wait for prior replays and output clones before
+        # reusing their pool. Reusing the capture stream also lets the allocator
+        # reuse freed blocks from earlier captures. Manager input/output buffers
+        # are allocated outside capture; only transient intermediates share it.
+        stream.wait_stream(replay_stream)
         with torch.cuda.stream(stream):
-            manager.capture(graph_pool=torch.cuda.graph_pool_handle())
-        torch.cuda.current_stream(tensor.device).wait_stream(stream)
+            manager.capture(graph_pool=pool)
+        replay_stream.wait_stream(stream)
+        if self.share_pools:
+            self._capture_pools[pool_key] = (pool, stream)
         return manager

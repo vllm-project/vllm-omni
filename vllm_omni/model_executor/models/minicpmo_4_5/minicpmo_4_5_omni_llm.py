@@ -3955,6 +3955,7 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
             "max_graphs": getattr(config, "encoder_cuda_graph_max_graphs", 4),
             "min_capture_calls": getattr(config, "encoder_cuda_graph_min_capture_calls", 2),
             "min_free_bytes": getattr(config, "encoder_cuda_graph_min_free_bytes", 1 << 30),
+            "share_pools": getattr(config, "encoder_cuda_graph_share_pools", True),
         }
 
         # Initialize image processor
