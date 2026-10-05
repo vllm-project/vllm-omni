@@ -22,8 +22,19 @@ from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState, _m
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
+def test_prepare_attn_forwards_release_model_specific_metadata():
+    state = object.__new__(OmniModelState)
+    metadata = object()
+    output = object()
+    batch = SimpleNamespace()
+    with patch.object(DefaultModelState, "prepare_attn", return_value=output) as prepare:
+        assert state.prepare_attn(batch, None, (), None, [], None, model_specific_attn_metadata=metadata) is output
+    assert prepare.call_args.kwargs["model_specific_attn_metadata"] is metadata
+
+
 class _DummyInputBatch:
     is_prefilling_np: np.ndarray
+    req_ids: list[str]
 
     input_ids: SimpleNamespace
     query_start_loc: torch.Tensor
@@ -699,6 +710,58 @@ def test_publish_sampled_embeddings_is_opt_in() -> None:
     state = _make_state()
     state.model.publishes_sampled_embeddings = False
     assert state.publish_sampled_embeddings(SimpleNamespace(num_reqs=1), torch.tensor([[1]])) is None
+
+
+def test_split_settled_rows_matches_per_row_check():
+    batch = _DummyInputBatch(np.array([3, 0, 2, 1, 4]))
+    batch.req_ids = ["c", "a", "x", "b", "e"]
+    batch.num_scheduled_tokens = [1, 1, 1, 4, 1]
+    batch.query_start_loc_np = [0, 1, 2, 3, 7]
+    req_indices = batch.idx_mapping_np.tolist()
+    # Slot 2 still names a finished request, slot 1 schedules a prefill
+    # chunk, slot 4 is not settled and slot 7 is not scheduled.
+    settled = {3: "c", 0: "a", 2: "old", 1: "b", 7: "z"}
+    split = OmniModelState._split_settled_rows(batch, req_indices, settled)
+    assert split is not None
+    settled_rows, remaining = split
+    assert settled_rows == [(0, 3, 0, "c"), (1, 0, 1, "a")]
+    assert remaining == [(2, 2), (3, 1), (4, 4)]
+    assert OmniModelState._split_settled_rows(batch, req_indices, {2: "old"}) is None
+
+
+def test_settled_row_split_preserves_mixed_batch_and_pending_replay(monkeypatch):
+    """Exercise run_preprocess, including the scalar fallback during replay."""
+
+    def prepare():
+        state = _make_eager_state()
+        _fill_buffers(state, "prefill", "decode")
+        state._eager_fastpath = True
+        state._eager_settled = {1: "decode"}
+        state._eager_ready = {1: "decode"}
+        state._eager_embeds[1].fill_(7)
+        state.model.eager_settled_text_step = lambda: torch.ones(_EAGER_DIM)
+        state.model.eager_decode_settled = lambda info: False
+        state.model.preprocess = lambda input_ids, input_embeds, **info: (input_ids, input_embeds, {})
+        batch = _EagerBatch([3, 1])
+        batch.req_ids = ["prefill", "decode"]
+        inputs = {"input_ids": torch.zeros(4, dtype=torch.long), "inputs_embeds": torch.zeros(4, _EAGER_DIM)}
+        return state, batch, inputs
+
+    vector, batch, inputs = prepare()
+    vector.run_preprocess(batch, inputs)
+    reference, ref_batch, ref_inputs = prepare()
+    monkeypatch.setattr(reference, "_split_settled_rows", lambda *args: None)
+    reference.run_preprocess(ref_batch, ref_inputs)
+    torch.testing.assert_close(inputs["inputs_embeds"], ref_inputs["inputs_embeds"], rtol=0, atol=0)
+    assert vector._eager_rows[1] == reference._eager_rows[1]
+    assert inputs["inputs_embeds"][3].tolist() == [8.0] * _EAGER_DIM
+
+    replay, replay_batch, replay_inputs = prepare()
+    replay._eager_state._restore_audio["prefill"] = [torch.ones(1)]
+    assert replay._eager_state.has_pending_replay()
+    monkeypatch.setattr(replay, "_split_settled_rows", MagicMock(side_effect=AssertionError("replay must skip split")))
+    replay.run_preprocess(replay_batch, replay_inputs)
+    torch.testing.assert_close(replay_inputs["inputs_embeds"], ref_inputs["inputs_embeds"], rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("prefilling", [False, True])

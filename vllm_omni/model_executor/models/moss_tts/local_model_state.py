@@ -14,7 +14,10 @@ from vllm.forward_context import set_forward_context
 from vllm.logger import init_logger
 from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.worker.gpu.input_batch import get_num_sampled_and_rejected
+from vllm.v1.worker.gpu.sample.bad_words import BadWordsState
+from vllm.v1.worker.gpu.sample.logit_bias import LogitBiasState
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
+from vllm.v1.worker.gpu.sample.penalties import PenaltiesState
 from vllm.v1.worker.gpu.sample.sampler import Sampler
 
 from vllm_omni.model_executor.output_snapshot import PackedOutputSnapshot
@@ -118,15 +121,24 @@ class MossLocalModelState(OmniModelState):
             or sampler.return_sampling_mask
             or sampler.trace_replay_state is not None
             or sampler.get_logprobs_dims(rows) is not None
-            or np.any(sampler.logit_bias_state.use_logit_bias[rows])
-            or np.any(sampler.penalties_state.use_penalty[rows])
-            or np.any(sampler.bad_words_state.num_bad_words.np[rows])
             or (
                 sampler.thinking_budget_state.enabled
                 and np.any(sampler.thinking_budget_state.use_thinking_budget[rows])
             )
         ):
             return None
+        for processor in sampler.logits_processors:
+            if type(processor) is LogitBiasState:
+                active = np.any(processor.use_logit_bias[rows])
+            elif type(processor) is PenaltiesState:
+                active = np.any(processor.use_penalty[rows])
+            elif type(processor) is BadWordsState:
+                active = np.any(processor.num_bad_words.np[rows])
+            else:
+                # Custom processors can alter even a single finite logit.
+                return None
+            if active:
+                return None
         keep = self.model._batch_should_continue
         if keep is None or keep.numel() != batch.num_reqs:
             return None

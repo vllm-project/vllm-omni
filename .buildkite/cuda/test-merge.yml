@@ -38,6 +38,17 @@ steps:
   - group: ":card_index_dividers: Diffusion Test"
     depends_on: upload-merge-pipeline
     steps:
+      - label: "Diffusion · AR Paged Attention GPU Test"
+        timeout_in_minutes: 20
+        commands:
+          - export VLLM_OMNI_AR_FA_REQUIRED=1
+          - >-
+            timeout 15m pytest -sv
+            tests/diffusion/ar_diffusion/test_paged_attention.py
+            -m 'core_model and cuda and L4 and cards_1'
+            --run-level "core_model"
+        mirror_hardwares: l4_1
+
       - label: "Diffusion · LoRA Test"
         timeout_in_minutes: 30
         commands:

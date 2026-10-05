@@ -185,10 +185,15 @@ def test_stage_zero_final_skips_inter_stage_output(mocker):
 def test_streaming_session_update_invalidates_omits_kv_transfer_cache():
     scheduler = OmniARScheduler.__new__(OmniARScheduler)
     scheduler._omits_kv_transfer_cache = {}
-    scheduler.skipped_waiting = []
+    scheduler.deferred_waiting = set()
+    scheduler.kv_holding_waiting = []
     scheduler.log_stats = False
     tagged = apply_omni_final_stage_metadata(_make_engine_request(), final_stage_id=0)
-    session = SimpleNamespace(
+
+    class Session(SimpleNamespace):
+        __hash__ = object.__hash__
+
+    session = Session(
         request_id="req",
         additional_information=tagged.additional_information,
         status=RequestStatus.WAITING,

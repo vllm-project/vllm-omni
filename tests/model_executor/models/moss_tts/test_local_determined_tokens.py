@@ -7,7 +7,11 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
+from vllm.config import VllmConfig
 from vllm.sampling_params import SamplingParams
+from vllm.v1.worker.gpu.sample.bad_words import BadWordsState
+from vllm.v1.worker.gpu.sample.logit_bias import LogitBiasState
+from vllm.v1.worker.gpu.sample.penalties import PenaltiesState
 from vllm.v1.worker.gpu.sample.sampler import Sampler
 from vllm.v1.worker.gpu.states import RequestState
 
@@ -27,11 +31,11 @@ def test_matches_real_sampler_for_mixed_prefill_decode_stop_and_reordering(seed,
         pytest.skip("CUDA required")
     device = torch.device("cuda")
     reqs = RequestState(5, 32, 16, 0, 8, device)
-    sampler = Sampler(5, 8, device, reqs)
+    sampler = Sampler(VllmConfig(), 5, 8, device, reqs)
     for i, length in enumerate([4, 1, 3]):
         reqs.add_request(str(i), length, [2] * length, 0, 8)
         slot = reqs.req_id_to_index[str(i)]
-        sampler.add_request(slot, length, SamplingParams(temperature=temperature, top_k=3, top_p=0.8, seed=seed))
+        sampler.add_request(slot, SamplingParams(temperature=temperature, top_k=3, top_p=0.8, seed=seed))
     reqs.apply_staged_writes()
     sampler.apply_staged_writes()
     state = _state(MossLocalModelState, device)
@@ -39,6 +43,7 @@ def test_matches_real_sampler_for_mixed_prefill_decode_stop_and_reordering(seed,
     state.model._batch_state = None
     batch = _batch(device, [2, 4, 3], [1, 2, 1])
     batch.seq_lens = torch.tensor([5, 2, 2], device=device, dtype=torch.int32)
+    batch.seq_lens_cpu_upper_bound = torch.tensor([5, 2, 2], dtype=torch.int32)
     batch.cu_num_logits_np = np.arange(4, dtype=np.int32)
     batch.cu_num_logits = torch.tensor(batch.cu_num_logits_np, device=device)
     batch.expanded_idx_mapping = batch.idx_mapping
@@ -73,10 +78,10 @@ def test_real_sampler_constraints_disable_determined_tokens(constraint):
         pytest.skip("CUDA required")
     device = torch.device("cuda")
     reqs = RequestState(5, 32, 16, 0, 8, device)
-    sampler = Sampler(5, 8, device, reqs)
+    sampler = Sampler(VllmConfig(), 5, 8, device, reqs)
     reqs.add_request("constrained", 1, [2], 0, 8)
     slot = reqs.req_id_to_index["constrained"]
-    sampler.add_request(slot, 1, SamplingParams(**constraint))
+    sampler.add_request(slot, SamplingParams(**constraint))
     state = _state(MossLocalModelState, device)
     state._direct_tokens = True
     # Use the actual upstream request registration, including its combined
@@ -85,16 +90,22 @@ def test_real_sampler_constraints_disable_determined_tokens(constraint):
 
 
 @pytest.mark.cpu
-@pytest.mark.parametrize("feature", ["logprobs", "bias", "penalty", "bad_words", "thinking", "trace", "mask", "nans"])
+@pytest.mark.parametrize(
+    "feature", ["logprobs", "bias", "penalty", "bad_words", "custom", "thinking", "trace", "mask", "nans"]
+)
 def test_distribution_features_fall_back_before_using_gpu(feature):
     sampler = object.__new__(Sampler)
     sampler.compute_nans = feature == "nans"
     sampler.return_sampling_mask = feature == "mask"
     sampler.trace_replay_state = object() if feature == "trace" else None
     sampler.get_logprobs_dims = lambda rows: (1, 0) if feature == "logprobs" else None
-    sampler.logit_bias_state = SimpleNamespace(use_logit_bias=np.array([feature == "bias"]))
-    sampler.penalties_state = SimpleNamespace(use_penalty=np.array([feature == "penalty"]))
-    sampler.bad_words_state = SimpleNamespace(num_bad_words=SimpleNamespace(np=np.array([feature == "bad_words"])))
+    bias = object.__new__(LogitBiasState)
+    bias.use_logit_bias = np.array([feature == "bias"])
+    penalties = object.__new__(PenaltiesState)
+    penalties.use_penalty = np.array([feature == "penalty"])
+    bad_words = object.__new__(BadWordsState)
+    bad_words.num_bad_words = SimpleNamespace(np=np.array([feature == "bad_words"]))
+    sampler.logits_processors = [bias, penalties, bad_words] + ([object()] if feature == "custom" else [])
     sampler.thinking_budget_state = SimpleNamespace(enabled=True, use_thinking_budget=np.array([feature == "thinking"]))
     state = object.__new__(MossLocalModelState)
     state._direct_tokens = True

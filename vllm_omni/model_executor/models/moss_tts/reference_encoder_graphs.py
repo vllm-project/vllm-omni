@@ -65,6 +65,24 @@ def _cached_reference_rope(self, q: torch.Tensor, k: torch.Tensor, cache: dict):
     return qo.view(batch, heads, seqlen, dim), ko.view(batch, heads, seqlen, dim)
 
 
+def _reference_flash_attn_varlen_func():
+    """Resolve the platform's variable-length FlashAttention entrypoint.
+
+    vLLM's bundled extension is NVIDIA-only. ROCm exposes the compatible
+    unpacked-QKV API through AITER, with upstream flash-attn as its fallback.
+    """
+    if torch.version.hip is not None:
+        try:
+            from aiter import flash_attn_varlen_func
+
+            return flash_attn_varlen_func, True
+        except ImportError:
+            from flash_attn import flash_attn_varlen_func
+    else:
+        from vllm.vllm_flash_attn import flash_attn_varlen_func
+    return flash_attn_varlen_func, False
+
+
 def _windowed_attention(
     self,
     x: torch.Tensor,
@@ -86,7 +104,7 @@ def _windowed_attention(
     q, k = self._apply_dense_rope(q, k) if rope_cache is None else _cached_reference_rope(self, q, k, rope_cache)
     if q.dtype not in (torch.bfloat16, torch.float16):
         return sdpa(x, input_lengths)
-    from vllm.vllm_flash_attn import flash_attn_varlen_func
+    flash_attn_varlen_func, is_aiter = _reference_flash_attn_varlen_func()
 
     heads, dim = q.shape[1], q.shape[-1]
 
@@ -95,7 +113,16 @@ def _windowed_attention(
 
     starts = torch.arange(0, (batch + 1) * seqlen, seqlen, device=x.device, dtype=torch.int32)
     window = [self.context - 1, 0] if self.causal and self.context is not None else [-1, -1]
-    out = flash_attn_varlen_func(
+    kwargs = {}
+    if torch.version.hip is None:
+        # Only vLLM's NVIDIA wrapper accepts its backend-selection argument.
+        kwargs["fa_version"] = fa_version
+    elif is_aiter and torch.is_grad_enabled() and any(t.requires_grad for t in (q, k, v)):
+        # AITER's autograd wrapper requires LSE to be retained for backward.
+        # The inference path avoids this allocation, and upstream flash-attn
+        # manages its own autograd state without this AITER-specific keyword.
+        kwargs["return_lse"] = True
+    result = flash_attn_varlen_func(
         packed(q),
         packed(k),
         packed(v),
@@ -105,8 +132,10 @@ def _windowed_attention(
         cu_seqlens_k=starts,
         causal=self.causal,
         window_size=window,
-        fa_version=fa_version,
-    ).view(batch, seqlen, heads, dim)
+        **kwargs,
+    )
+    out = result[0] if isinstance(result, tuple) else result
+    out = out.view(batch, seqlen, heads, dim)
     if not skip_padded_query_mask:
         valid = (torch.arange(seqlen, device=x.device).view(1, seqlen) < input_lengths.view(-1, 1)).view(
             batch, seqlen, 1, 1

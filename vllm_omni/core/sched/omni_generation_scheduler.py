@@ -26,7 +26,6 @@ from vllm.v1.spec_decode.metrics import SpecDecodingStats
 
 from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin
 from vllm_omni.core.sched.output import OmniCachedRequestData, OmniNewRequestData
-from vllm_omni.core.sched.utils import omni_routed_experts_for_request
 from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.outputs import OmniModelRunnerOutput
 
@@ -275,6 +274,10 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         if self.connector is not None:
             meta = self._build_kv_connector_meta(self.connector, scheduler_output)
             scheduler_output.kv_connector_metadata = meta
+        if self.aux_output_connector is not None:
+            scheduler_output.aux_output_connector_metadata = self.aux_output_connector.build_connector_meta(
+                scheduler_output, self.requests
+            )
         # EC Connector: package metadata
         if self.ec_connector is not None:
             ec_meta = self.ec_connector.build_connector_meta(scheduler_output)
@@ -330,7 +333,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         ):
             # Downstream async-chunk stages receive the next segment from the
             # connector, not from an API StreamingUpdate. Enqueue them as
-            # schedulable before the base class can park them in skipped_waiting.
+            # schedulable before the base class can defer a streaming-input wait.
             request.status = RequestStatus.WAITING
             self._enqueue_waiting_request(request)
             return False
@@ -342,7 +345,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         A generation batch slot belongs to one chunk, not the entire stream.
         Keep requests with outstanding output in ``running`` so their state
         cannot be reused before completion. Other live requests join the tail
-        of ``waiting`` without freeing their decoder state or KV blocks.
+        of the appropriate waiting queue without freeing decoder state or KV blocks.
         Preserve WAITING_FOR_CHUNK until the coordinator observes fresh input.
         Stateful codecs retain lifetime admission until their decoder state is
         released, even when no chunk is currently executing.
@@ -360,7 +363,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                 continue
             if request.status == RequestStatus.RUNNING:
                 request.status = RequestStatus.WAITING
-            self.waiting.add_request(request)
+            self._enqueue_waiting_request(request)
         self.running = in_flight
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
@@ -391,6 +394,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
 
         # Temporary queue: preserve waiting order while requests await input.
         skipped_waiting_requests = create_request_queue(self.policy)
+        skipped_kv_holding_requests = create_request_queue(self.policy)
         req_index = 0
         self._drop_aborted_queued_requests()
         self._requeue_completed_native_chunks()
@@ -502,7 +506,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         # Fast path selection and scheduling (treat all as diffusion requests,
         # independent of pooling_params)
         while (
-            self.waiting
+            (self.kv_holding_waiting or self.waiting)
             and token_budget > 0
             and len(num_scheduled_tokens) < execution_batch_size
             and (
@@ -510,38 +514,47 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                 if native_chunks and not self._retains_state_across_chunks
                 else len(self.running) + reserved_running_slots
             )
-            < self.max_num_running_reqs
+            < self.max_num_active_reqs
             and self._pause_state == PauseState.UNPAUSED
         ):
-            request = self.waiting.peek_request()
+            request_queue = self.kv_holding_waiting or self.waiting
+            skipped_requests = (
+                skipped_kv_holding_requests if request_queue is self.kv_holding_waiting else skipped_waiting_requests
+            )
+            request = request_queue.peek_request()
             if express and request.request_id in self._chunk_started:
-                self.waiting.pop_request()
-                skipped_waiting_requests.add_request(request)
+                request_queue.pop_request()
+                self.deferred_waiting.add(request)
+                skipped_requests.add_request(request)
                 continue
             if native_chunks and request.num_in_flight_tokens > 0:
                 # A restored waiting entry can still own an outstanding batch.
                 # Do not let it block other ready streams or execute it twice.
-                self.waiting.pop_request()
-                skipped_waiting_requests.add_request(request)
+                request_queue.pop_request()
+                self.deferred_waiting.add(request)
+                skipped_requests.add_request(request)
                 continue
             # OMNI: Skip requests that are not in self.requests
             if request.request_id not in self.requests or (
                 self.chunk_transfer_adapter is None and request.status == RequestStatus.FINISHED_STOPPED
             ):
                 # Pop the finished request from waiting queue and don't schedule it
-                self.waiting.pop_request()
+                request_queue.pop_request()
+                self.deferred_waiting.discard(request)
                 continue
 
             # async_chunk: wait for the first upstream chunk (don't start with placeholders).
             if async_chunk_transport and len(request.prompt_token_ids) == 0:
                 if self._is_done_receiving_chunks(request.request_id):
                     if not _has_async_chunk_payload_to_run(request):
-                        self.waiting.pop_request()
+                        request_queue.pop_request()
+                        self.deferred_waiting.discard(request)
                         self._pending_finish_reqs.append(request)
                         continue
                 else:
-                    self.waiting.pop_request()
-                    skipped_waiting_requests.prepend_request(request)
+                    request_queue.pop_request()
+                    self.deferred_waiting.add(request)
+                    skipped_requests.prepend_request(request)
                     continue
 
             # Allocate all input tokens for the request in one shot
@@ -557,11 +570,13 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                     ):
                         required_tokens = 1
                     else:
-                        self.waiting.pop_request()
+                        request_queue.pop_request()
                         if self._is_done_receiving_chunks(request.request_id):
+                            self.deferred_waiting.discard(request)
                             self._pending_finish_reqs.append(request)
                         else:
-                            skipped_waiting_requests.add_request(request)
+                            self.deferred_waiting.add(request)
+                            skipped_requests.add_request(request)
                         continue
             num_new_tokens = min(required_tokens, token_budget)
             new_blocks = self.kv_cache_manager.allocate_slots(
@@ -577,7 +592,8 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                 break
 
             # Officially schedule this request
-            request = self.waiting.pop_request()
+            request = request_queue.pop_request()
+            self.deferred_waiting.discard(request)
             self.running.append(request)
             if self.log_stats:
                 request.record_event(EngineCoreEventType.SCHEDULED, scheduled_timestamp)
@@ -592,7 +608,9 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         if first_chunk_express:
             self._chunk_started.update(num_scheduled_tokens)
 
-        # Return skipped waiting requests
+        # Return skipped requests to their original queue.
+        if skipped_kv_holding_requests:
+            self.kv_holding_waiting.prepend_requests(skipped_kv_holding_requests)
         if skipped_waiting_requests:
             self.waiting.prepend_requests(skipped_waiting_requests)
 
@@ -936,8 +954,11 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                     prefill_stats.finalize(self.kv_cache_manager.estimate_cached_tokens(request))
 
             if stopped:
-                if model_runner_output.routed_experts is not None:
-                    routed_experts = omni_routed_experts_for_request(model_runner_output.routed_experts, request)
+                if (
+                    self.aux_output_connector is not None
+                    and (aux_output := model_runner_output.aux_output_connector_output) is not None
+                ):
+                    routed_experts = self.aux_output_connector.take_output(request, aux_output)
                 finish_reason = request.get_finished_reason()
                 finished = self._handle_stopped_request(request)
                 is_segment_finished = not finished

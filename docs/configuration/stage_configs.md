@@ -35,7 +35,7 @@ Common `StagePipelineConfig` fields include:
 | `final_output` / `final_output_type` | Whether the stage produces a user-visible output and its modality. |
 | `owns_tokenizer` | Whether this stage owns the pipeline tokenizer. |
 | `model_arch`, `hf_config_name` | Stage-specific model architecture and nested HF config selector. |
-| `engine_output_type` | Runtime output representation such as `text`, `latent`, or `audio`. |
+| `engine_output_type` | Canonical runtime output type: `text`, `image`, `audio`, `latent`, or `token_ids`. |
 | `custom_process_input_func` | Processor applied to this stage's incoming payload. |
 | `custom_process_next_stage_input_func` | Processor used for full-payload handoff to the next stage. |
 | `async_chunk_process_next_stage_input_func` | Processor used for async chunk handoff. |
@@ -44,6 +44,50 @@ Common `StagePipelineConfig` fields include:
 To add or change topology, define and register a new pipeline variant. Use
 deploy YAML only for runtime placement, resource sizing, connectors, and other
 deployment overrides.
+
+### Engine output types
+
+`engine_output_type` is parsed when the LLM stage's output processor is built
+during service initialization. Invalid values fail startup before requests
+are accepted; engine replicas may already have been initialized at that point
+and are cleaned up on failure.
+
+Use the exact lowercase names listed above. Combinations such as `text+audio`
+or `text,audio` remain supported, with every component canonical. Omitted or
+`None` values retain the default behavior (`TEXT` in the output processor).
+Empty strings, whitespace, case variants, and aliases are rejected.
+
+For existing custom pipelines or direct callers, replace old aliases explicitly:
+
+| Old value | Canonical value |
+| ------- | ------- |
+| `speech`, `wav`, `waveform` | `audio` |
+| `images`, `pixel_values`, `pixels` | `image` |
+| `latents` | `latent` |
+| `tokens` | `text` for text output, or `token_ids` for discrete IDs |
+
+`token_ids` is a separate type, not a `text` alias. It describes discrete
+vocabulary or codebook indices, distinct from continuous latent representations.
+Existing models using `latent` retain their historical payload contracts.
+GLM-Image's AR stage keeps `engine_output_type="token_ids"`; generated IDs still
+travel through `cumulative_token_ids`, and source-image IDs through
+`ids.prior_image`.
+
+Bare primary tensors and generic producer keys (`model_outputs` or `hidden`)
+use the declared type as their default output key, including `token_ids`.
+The normalizer does not inspect or convert their dtype. Distinct auxiliary
+outputs must use explicit field names: `model_outputs` and `hidden` both map
+to the same default key and must not represent two independent outputs.
+GLM-Image disables auxiliary hidden output for its default GPU execution.
+Some runner paths still attach it; that field is then named `token_ids` even
+though it contains hidden states. The GLM-Image bridge ignores this auxiliary
+field and reads generated IDs from `cumulative_token_ids` instead.
+
+Token-ID tensors use the existing dimension-0 accumulation default, subject to
+registered per-key overrides, and remain available after DELTA emissions.
+This is separate from the existing accumulation of `cumulative_token_ids`.
+`final_output_type` and Diffusion's `output_type` are separate settings and are
+unchanged by these rules.
 
 ## Deploy configuration schema
 
@@ -78,7 +122,44 @@ explicit CLI or stage override, or the downstream vLLM engine default.
 Note: for the diffusion path, an omitted `distributed_executor_backend` selects
 `uni` on a single GPU (in-process worker, no MessageQueue / `/dev/shm` output
 segments) and `mp` when `num_gpus > 1`. Set `mp` explicitly to keep a worker
-subprocess on one GPU. `ray` / `external_launcher` are not fully supported yet.
+subprocess on one GPU. Set `ray` for Ray-managed single- or multi-node
+diffusion workers. `external_launcher` is not supported yet.
+
+The diffusion `ray` backend runs one worker actor per GPU and supports workers
+spanning Ray nodes. Enable it in the deploy YAML:
+
+```yaml
+distributed_executor_backend: ray
+```
+
+The executor reuses Ray when already initialized; otherwise it calls
+`ray.init()`, which handles cluster discovery or local startup and respects
+`RAY_ADDRESS`. There is no diffusion-specific address setting. Ray must be
+installed on every node.
+
+Ray diffusion workers receive the driver's `VLLM_*`, `OMNI_*`, `DIFFUSION_*`,
+`NCCL_*`, `TORCH_NCCL_*`, `UCX_*`, and Hugging Face environment settings,
+plus `PYTHONPATH`, `CUDA_LAUNCH_BLOCKING`, and `OMP_NUM_THREADS`.
+Explicit stage `runtime.env` entries are also forwarded and take precedence.
+Device visibility, rank/rendezvous settings, worker host addresses, and `RAY_*`
+variables are excluded so each worker retains its own assignment and identity.
+
+For multiple nodes, start the cluster before launching Omni. For example,
+with head IP `10.0.0.1`:
+
+```bash
+# On the head node:
+ray start --head --node-ip-address=10.0.0.1 --port=6379
+
+# On each additional worker node:
+ray start --address=10.0.0.1:6379
+
+# On the host launching Omni (MODEL and my_deploy.yaml are placeholders):
+RAY_ADDRESS=10.0.0.1:6379 vllm serve MODEL --omni --deploy-config my_deploy.yaml
+```
+
+Omni creates actors on the resources of that cluster; it does not start Ray
+on additional machines.
 
 ### Stage-level runner selection
 
