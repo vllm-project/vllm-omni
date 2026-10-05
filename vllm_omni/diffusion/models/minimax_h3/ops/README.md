@@ -53,6 +53,11 @@ remeasured here; the 5090 recipe has no VAE timing table. SM121 remains on the
 reference path. The mocked dispatch test checks capability routing only;
 SM120 kernel equality is supported by the real 5090 D v2 measurements above.
 
+The `MiniMax-H3-Spark-GB10.md` recipe was not revalidated here. Its historical
+VAE timings are not evidence for this operator path. Dispatch uses the reported
+compute capability, not the product name: `120` selects the operators and FP16
+decoder Linear precast; `121` retains the reference path.
+
 The [reproduction commands and scripts](https://github.com/Tokha233/ComfyUI-H3-SpeedKit/tree/d6d6da7/experiments/omni-migration-1002)
 and [raw measurements](https://github.com/Tokha233/ComfyUI-H3-SpeedKit/tree/d6d6da7/evidence/omni-migration-1002)
 pin the baseline, official model revision, autocast, warmup, and timing scope.
