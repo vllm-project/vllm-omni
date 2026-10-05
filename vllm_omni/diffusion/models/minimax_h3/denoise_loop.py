@@ -98,11 +98,32 @@ class MiniMaxH3DenoiseBranch:
         self.audio_pos_dev = self.audio_pos.to(device)
         self.update_mask_dev = self.update_mask.to(device)
         self.audio_update_mask_dev = self.audio_update_mask.to(device)
-        # Layouts are fixed for a branch; avoid CUDA nonzero synchronization per step.
-        self.video_target_positions = self.img_pos[self.update_mask].to(device)
-        self.video_condition_positions = self.img_pos[~self.update_mask].to(device)
-        self.audio_target_positions = self.audio_pos[self.audio_update_mask].to(device)
-        self.audio_condition_positions = self.audio_pos[~self.audio_update_mask].to(device)
+
+        # Canonical layouts have a condition prefix followed by target rows.
+        # Slice the existing device positions in that case; arbitrary layouts
+        # retain cached indices instead of rediscovering them on every step.
+        def split_positions(
+            positions: torch.Tensor, positions_dev: torch.Tensor, mask: torch.Tensor
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            split = int((~mask).sum())
+            if not mask[:split].any() and mask[split:].all():
+                return positions_dev[split:], positions_dev[:split]
+            return positions[mask].to(device), positions[~mask].to(device)
+
+        self.video_target_positions, self.video_condition_positions = split_positions(
+            self.img_pos, self.img_pos_dev, self.update_mask
+        )
+        self.audio_target_positions, self.audio_condition_positions = split_positions(
+            self.audio_pos, self.audio_pos_dev, self.audio_update_mask
+        )
+        # A no-edit request has at most four timestep classes. Resolve row
+        # ownership once on the CPU; text/padding share the video target class.
+        row_classes = torch.zeros(seq_len, dtype=torch.int32, device="cpu")
+        row_classes[self.img_pos[~self.update_mask]] = 2
+        row_classes[self.audio_pos[self.audio_update_mask]] = 1
+        row_classes[self.audio_pos[~self.audio_update_mask]] = 3
+        self.timestep_classes_dev = row_classes.to(device)
+        self.timestep_classes_present = torch.unique(row_classes).to(torch.long)
         self.x_base = torch.zeros(1, seq_len, MINIMAX_H3_VIDEO_ROW_WIDTH, dtype=torch.float32, device=device)
         self.audio_x_base = torch.zeros(1, seq_len, MINIMAX_H3_AUDIO_ROW_WIDTH, dtype=torch.float32, device=device)
         self.text_pos_dev = packed["text_pos"].view(-1).to(torch.long).to(device)
@@ -200,6 +221,53 @@ class MiniMaxH3DenoiseBranch:
         x[0].index_copy_(0, self.img_pos_dev, video_rows)
         audio_x = self.audio_x_base.clone()
         audio_x[0].index_copy_(0, self.audio_pos_dev, audio_rows)
+        unique_timesteps, inverse_indices = self.prepare_timesteps(
+            t_video=t_video,
+            t_audio=t_audio,
+            imgvid_cond_timestep=imgvid_cond_timestep,
+            audio_ref_cond_timestep=audio_ref_cond_timestep,
+            video_target_timesteps=video_target_timesteps,
+            audio_target_timesteps=audio_target_timesteps,
+        )
+        return {
+            **self.static_kwargs,
+            "x": x,
+            "audio_x": audio_x,
+            "unique_timesteps": unique_timesteps,
+            "inverse_indices": inverse_indices,
+        }
+
+    def prepare_timesteps(
+        self,
+        *,
+        t_video: float,
+        t_audio: float,
+        imgvid_cond_timestep: float,
+        audio_ref_cond_timestep: float,
+        video_target_timesteps: torch.Tensor | None = None,
+        audio_target_timesteps: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return sorted unique times and their packed-row inverse mapping."""
+        if video_target_timesteps is None and audio_target_timesteps is None:
+            # Convert to FP32 *before* deduplication: distinct Python floats
+            # can round to the same model timestep. Only present classes count.
+            values = torch.tensor(
+                [
+                    t_video,
+                    t_audio if self.locked_audio_rows is None else 1.0,
+                    imgvid_cond_timestep,
+                    audio_ref_cond_timestep,
+                ],
+                dtype=torch.float32,
+                device="cpu",
+            )
+            if torch.isfinite(values).all():
+                unique, inverse = torch.unique(values[self.timestep_classes_present], sorted=True, return_inverse=True)
+                remap = torch.zeros(4, dtype=torch.long, device="cpu")
+                remap[self.timestep_classes_present] = inverse
+                return unique.to(self.device), remap.to(self.device).index_select(0, self.timestep_classes_dev)
+        # Editing may assign an independent time to every target row. Preserve
+        # the general operation, including non-finite timestep behavior.
         timesteps = torch.empty(self.seq_len, dtype=torch.float32, device=self.device)
         self.fill_timesteps(
             timesteps,
@@ -210,14 +278,7 @@ class MiniMaxH3DenoiseBranch:
             video_target_timesteps=video_target_timesteps,
             audio_target_timesteps=audio_target_timesteps,
         )
-        unique_timesteps, inverse_indices = torch.unique(timesteps, sorted=True, return_inverse=True)
-        return {
-            **self.static_kwargs,
-            "x": x,
-            "audio_x": audio_x,
-            "unique_timesteps": unique_timesteps,
-            "inverse_indices": inverse_indices,
-        }
+        return torch.unique(timesteps, sorted=True, return_inverse=True)
 
     def fill_timesteps(
         self,

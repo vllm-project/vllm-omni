@@ -670,6 +670,17 @@ def test_timestep_positions_preserve_interleaved_conditions(locked_audio, edit_t
         expected[[3, 7]] = audio_targets if edit_targets else (1.0 if locked_audio else audio_time)
         expected[5] = 1.0
         assert torch.equal(output, expected)
+        unique, inverse = branch.prepare_timesteps(
+            t_video=video_time,
+            t_audio=audio_time,
+            imgvid_cond_timestep=0.999,
+            audio_ref_cond_timestep=1.0,
+            video_target_timesteps=video_targets,
+            audio_target_timesteps=audio_targets,
+        )
+        expected_unique, expected_inverse = torch.unique(expected, sorted=True, return_inverse=True)
+        assert torch.equal(unique, expected_unique)
+        assert torch.equal(inverse, expected_inverse)
     with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU]) as profile:
         branch.fill_timesteps(
             output,
@@ -691,3 +702,45 @@ def test_timestep_positions_preserve_interleaved_conditions(locked_audio, edit_t
             audio_ref_cond_timestep=1.0,
             video_target_timesteps=torch.zeros(1),
         )
+
+
+@pytest.mark.parametrize(
+    "times", [(0.3, 0.6, 0.999, 1.0), (1.0, 1.0, 1.0, 1.0), (0.5, 0.5000000001, 0.5, 0.5), (0.999, 1.0, 0.999, 1.0)]
+)
+@pytest.mark.parametrize("locked_audio", [False, True])
+@pytest.mark.parametrize("edit_targets", [False, True])
+def test_small_timestep_classes_match_dense_unique(times, locked_audio, edit_targets):
+    from vllm_omni.diffusion.models.minimax_h3.denoise_loop import MiniMaxH3DenoiseBranch
+    from vllm_omni.diffusion.models.minimax_h3.packed_sequence import minimax_h3_packed_sequence_ref2va_blocks
+
+    packed = minimax_h3_packed_sequence_ref2va_blocks(
+        text_len=2,
+        latent_t=2,
+        latent_h=4,
+        latent_w=4,
+        audio_t=4,
+        ref_blocks=[{"kind": "image", "latent_h": 4, "latent_w": 4}, {"kind": "audio", "ref_audio_t": 2}],
+    )
+    branch = MiniMaxH3DenoiseBranch(
+        packed=packed,
+        text_embeddings=torch.zeros(2, _HIDDEN),
+        token_tags=packed["token_tags"],
+        device=torch.device("cpu"),
+    )
+    if locked_audio:
+        branch.locked_audio_rows = torch.zeros(4, 32)
+    kwargs = dict(zip(("t_video", "t_audio", "imgvid_cond_timestep", "audio_ref_cond_timestep"), times))
+    if edit_targets:
+        kwargs["video_target_timesteps"] = torch.linspace(0.1, 0.9, branch.video_target_positions.numel())
+    dense = torch.empty(branch.seq_len)
+    branch.fill_timesteps(dense, **kwargs)
+    expected = torch.unique(dense, sorted=True, return_inverse=True)
+    actual = branch.prepare_timesteps(**kwargs)
+    for got, wanted in zip(actual, expected):
+        assert torch.equal(got, wanted)
+    # Canonical masks must reuse storage even across separated reference blocks.
+    assert branch.video_target_positions.untyped_storage().data_ptr() == branch.img_pos_dev.untyped_storage().data_ptr()
+    assert (
+        branch.audio_condition_positions.untyped_storage().data_ptr()
+        == branch.audio_pos_dev.untyped_storage().data_ptr()
+    )
