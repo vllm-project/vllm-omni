@@ -21,11 +21,27 @@ import torch.nn.functional as F
 
 from vllm_omni.diffusion.layers.mhc import MHCMix, MHCPostResidual, sinkhorn_knopp
 from vllm_omni.diffusion.layers.swiglu7 import SwiGLU7
+from vllm_omni.platforms import current_omni_platform
 
 from .parallel import Magi2ParallelGroup, get_magi2_tp_group
 
 _mhc_post_residual = MHCPostResidual()
 _mhc_mix = MHCMix()
+
+
+def _mhc_mix_fp32(
+    streams: torch.Tensor,
+    branch_output: torch.Tensor,
+    post_coefficients: torch.Tensor,
+    residual_matrix: torch.Tensor,
+) -> torch.Tensor:
+    """``MHCMix.forward_native`` with the stream mix as an elementwise contraction in at least FP32."""
+    branch = torch.einsum("tn,tc->tnc", post_coefficients, branch_output)
+    accumulate = torch.promote_types(streams.dtype, torch.float32)
+    mixed = (residual_matrix.to(accumulate).unsqueeze(-1) * streams.to(accumulate).unsqueeze(1)).sum(2)
+    return mixed.to(streams.dtype) + branch
+
+
 _swiglu7_op = SwiGLU7()
 
 
@@ -353,6 +369,9 @@ class MHCHandler:
         self.sinkhorn_epsilon = sinkhorn_epsilon
         self.dtype = dtype
         self.matmul_scale = 1.0 / math.sqrt(float(num_streams * hidden_size))
+        # MUSA lowers the four-stream contractions to slow small-K batched GEMMs,
+        # so it uses FP32 forms that Inductor fuses or that split K by stream.
+        self.fp32_stream_contractions = current_omni_platform.is_musa()
 
     def flatten(self, tensor: torch.Tensor) -> torch.Tensor:
         self._check_multi(tensor)
@@ -366,7 +385,14 @@ class MHCHandler:
     ) -> MHCTensorTuple:
         if flattened.ndim != 2 or flattened.shape[-1] != self.num_streams * self.hidden_size:
             raise ValueError("invalid flattened mHC shape")
-        fused = norm(flattened).to(self.dtype) @ phi_fused
+        normed = norm(flattened).to(self.dtype)
+        if self.fp32_stream_contractions:
+            fused = torch.bmm(
+                normed.reshape(-1, self.num_streams, self.hidden_size).transpose(0, 1),
+                phi_fused.reshape(self.num_streams, self.hidden_size, -1),
+            ).sum(0)
+        else:
+            fused = normed @ phi_fused
         pre, post, residual = torch.split(
             fused,
             (self.num_streams, self.num_streams, self.num_streams**2),
@@ -384,7 +410,16 @@ class MHCHandler:
         self._check_multi(streams)
         alpha, bias, logits = alpha_bias_logits
         coefficients = torch.sigmoid(alpha * self.matmul_scale * logits + bias.unsqueeze(0))
-        return torch.einsum("tn,tnc->tc", coefficients.to(out_dtype or streams.dtype), streams)
+        coefficients = coefficients.to(out_dtype or streams.dtype)
+        if (
+            self.fp32_stream_contractions
+            and coefficients.shape == streams.shape[:2]
+            and coefficients.dtype == streams.dtype
+            and streams.dtype in (torch.float32, torch.bfloat16, torch.float16)
+            and not torch.is_autocast_enabled(streams.device.type)
+        ):
+            return (coefficients.float().unsqueeze(-1) * streams.float()).sum(1).to(streams.dtype)
+        return torch.einsum("tn,tnc->tc", coefficients, streams)
 
     def compute_post_residual(
         self,
@@ -419,7 +454,10 @@ class MHCHandler:
         self._check_multi(residual_streams)
         if branch_output.ndim != 2 or branch_output.shape[-1] != self.hidden_size:
             raise ValueError("invalid mHC branch-output shape")
-        mix = _mhc_mix if not torch.compiler.is_compiling() else _mhc_mix.forward_native
+        if not torch.compiler.is_compiling():
+            mix = _mhc_mix
+        else:
+            mix = _mhc_mix_fp32 if self.fp32_stream_contractions else _mhc_mix.forward_native
         return mix(residual_streams, branch_output, post_coefficients, residual_matrix)
 
     def _check_multi(self, tensor: torch.Tensor) -> None:
