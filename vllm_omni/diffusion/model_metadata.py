@@ -96,6 +96,10 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
         supports_multimodal_inputs=True,
         max_multimodal_image_inputs=1,
         final_output_type="video",
+        # MAGI-2 shards MoE experts along the head axis over the SP ranks rather
+        # than through vLLM's FusedMoE; the head style lets ``expert_parallel_size``
+        # differ from the sequence-parallel degree.
+        expert_parallel_style="head",
     ),
     # Joint text/image-to-video-and-audio, same shape as MiniMaxH3Pipeline
     # above (an MP4 with both tracks) — declared "video" for the same reason:
