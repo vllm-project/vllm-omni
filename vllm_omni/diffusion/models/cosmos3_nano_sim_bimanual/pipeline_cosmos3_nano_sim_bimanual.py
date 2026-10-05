@@ -43,6 +43,7 @@ from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.config import (
     validate_sim_parallel_config,
 )
 from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.decode_overlap import CausalDecodeQueue
+from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.dense_attention import CosmosSimDenseAttentionCache
 from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.geometry import (
     Cosmos3NanoSimBimanualGeometry,
     Cosmos3NanoSimBimanualResolutionPolicy,
@@ -499,6 +500,7 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
         """
         if getattr(self.transformer, "_inductor_cudagraphs", False):
             torch._dynamo.reset()
+        self._dense_attention_cache = None
 
     def close_ar_diffusion_session(self, session_id: str) -> None:
         self._drop_session(session_id)
@@ -684,6 +686,26 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
             window_frames=self.manifest.window_frames,
         )
 
+    def _prepare_dense_attention(self, state, text_kv, real_text_kv_len, geometry, target_frame):
+        state.dense_attention = None
+        if self._ar_diffusion_kv_state is not None or self.manifest.window_frames is not None:
+            return
+        # The Sim pipeline admits one dense session. Keep the backing storage
+        # across requests, while activation resets its conditioning/history.
+        if self._SESSION_CAPACITY != 1:
+            return
+        capacity = real_text_kv_len + target_frame * geometry.tokens_per_frame(
+            self.manifest.conditioning_tokens_per_frame
+        )
+        cache = getattr(self, "_dense_attention_cache", None)
+        if cache is None:
+            cache = CosmosSimDenseAttentionCache()
+        elif not cache.fits(text_kv, capacity):
+            self.release_captured_graphs()
+        cache.activate(state, text_kv, real_text_kv_len, capacity, state.dense_kv_by_branch.get(self._MAIN_BRANCH))
+        self._dense_attention_cache = cache
+        state.dense_attention = cache
+
     def _transformer_forward(
         self,
         state: Cosmos3NanoSimBimanualSessionState,
@@ -707,6 +729,7 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
         seq_len = hidden_states.shape[2] * tokens_per_frame
         paged_kv = None
         dense_history = None
+        dense_cache = getattr(state, "dense_attention", None) if paged_state is None else None
         if paged_state is not None:
             paged_kv = paged_state.get_kv_caches(
                 self._MAIN_BRANCH,
@@ -715,7 +738,7 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
                 extra_visible_tokens=tokens_per_frame if frame_causal else seq_len,
                 frame_causal=frame_causal,
             )
-        else:
+        elif dense_cache is None:
             dense_history = state.dense_kv_by_branch.get(self._MAIN_BRANCH)
 
         output = self.transformer(
@@ -730,6 +753,7 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
             action_domain_ids=action_domain_ids,
             paged_kv=paged_kv,
             dense_history=dense_history,
+            dense_attention=dense_cache,
             condition_vision=condition_vision,
             null_action_frame_indexes=null_action_frame_indexes,
             frame_causal=frame_causal,
@@ -737,24 +761,17 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
         )
         if paged_state is not None:
             paged_state.commit_paged_context(self._MAIN_BRANCH)
+        elif commit_current and dense_cache is not None:
+            state.dense_kv_by_branch[self._MAIN_BRANCH] = dense_cache.commit(seq_len)
         elif commit_current:
             if dense_history is None and getattr(self.transformer, "_inductor_cudagraphs", False):
                 # The first dense commit retains its inputs with detach(), which
                 # aliases graph-owned storage. Later commits use cat() and own
                 # their storage; denoising does not retain current K/V at all.
                 output.current_kv = [(key.clone(), value.clone()) for key, value in output.current_kv]
-            if frame_causal:
-                for start in range(0, seq_len, tokens_per_frame):
-                    self._append_dense_kv(
-                        state,
-                        [
-                            (k[:, start : start + tokens_per_frame], v[:, start : start + tokens_per_frame])
-                            for k, v in output.current_kv
-                        ],
-                        geometry,
-                    )
-            else:
-                self._append_dense_kv(state, output.current_kv, geometry)
+            # Attention already applied each frame's sequential window. Publish
+            # the final sink/tail once, without recopying history per clean frame.
+            self._append_dense_kv(state, output.current_kv, geometry)
         return output
 
     # -- Action and latent preparation ------------------------------------
@@ -1378,6 +1395,7 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniDiffusersPipeline):
 
         domain_ids = frame_domains(0, 1)
         text_kv = self._ensure_text_kv(state, text_ids, text_mask)
+        self._prepare_dense_attention(state, text_kv, real_text_kv_len, geometry, target_frame)
 
         terminal_request = close_session or not tick
         seed = self._resolve_seed(sp, sp.generator if isinstance(sp.generator, torch.Generator) else None)

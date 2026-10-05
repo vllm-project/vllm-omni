@@ -171,6 +171,7 @@ def fake_pipeline(*, prefix: bool = True) -> tuple[Any, Any]:
 
     pipe._get_or_create_state = create_state
     pipe._ensure_text_kv = Mock(return_value=[])
+    pipe._prepare_dense_attention = Mock()
     pipe._resolve_seed = Mock(return_value=42)
     pipe._transformer_forward = Mock(side_effect=lambda _state, latent, *_args, **_kw: SimpleNamespace(video=latent))
     pipe._denoise_chunk = Mock(side_effect=lambda velocity, noise, **_kw: velocity(noise, torch.tensor([1.0])))
