@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Talker -> Code2Wav input processors for PersonaPlex.
 
 The talker (stage 0) emits, per frame, the ``dep_q`` depformer audio codes under
@@ -237,7 +237,10 @@ def talker2code2wav_async_chunk(
         state["personaplex_emitted"] = True
     return OmniPayloadStruct(
         codes=CodesStruct(audio=flat),
-        meta=MetaStruct(finished=torch.tensor(bool(finished), dtype=torch.bool)),
+        meta=MetaStruct(
+            finished=torch.tensor(bool(finished), dtype=torch.bool),
+            personaplex_codes_delta=True,
+        ),
     )
 
 

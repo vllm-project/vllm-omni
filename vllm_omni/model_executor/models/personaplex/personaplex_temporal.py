@@ -98,14 +98,34 @@ class _RingKV:
         self.end_offset[b] = 0
         self.start_offset[b] = 0
 
+    def reset_rows(self, rows: torch.Tensor) -> None:
+        self.end_offset.index_fill_(0, rows, 0)
+        self.start_offset.index_fill_(0, rows, 0)
+
     def bump_slot_start(self, b: int) -> None:
         self.start_offset[b] += 1
 
-    def complete(self, k: torch.Tensor, v: torch.Tensor, active: torch.Tensor):
+    def complete(
+        self,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        active: torch.Tensor,
+        state_slot_ids: torch.Tensor | None = None,
+    ):
         B, H, T, D = k.shape
+        if state_slot_ids is None:
+            cache = self.cache
+            end_offset = self.end_offset
+            start_offset = self.start_offset
+        else:
+            if state_slot_ids.shape != (B,):
+                raise ValueError(f"state_slot_ids must have shape ({B},), got {tuple(state_slot_ids.shape)}")
+            cache = self.cache.index_select(1, state_slot_ids)
+            end_offset = self.end_offset.index_select(0, state_slot_ids)
+            start_offset = self.start_offset.index_select(0, state_slot_ids)
+
         indexes = (
-            torch.arange(T, device=self.end_offset.device, dtype=self.end_offset.dtype).view(1, -1)
-            + self.end_offset.view(-1, 1)
+            torch.arange(T, device=end_offset.device, dtype=end_offset.dtype).view(1, -1) + end_offset.view(-1, 1)
         ) % self.capacity
         idx4 = indexes.view(B, 1, T, 1).expand(-1, H, -1, D)
         # Keep inactive rows completely inert. Once the ring is full, the
@@ -113,31 +133,31 @@ class _RingKV:
         # writing it for an inactive row would therefore leak padded data into
         # its next attention step.
         active_view = active.view(B, 1, 1, 1)
-        old_k = self.cache[0].gather(2, idx4)
-        old_v = self.cache[1].gather(2, idx4)
+        old_k = cache[0].gather(2, idx4)
+        old_v = cache[1].gather(2, idx4)
         k = torch.where(active_view, k, old_k)
         v = torch.where(active_view, v, old_v)
-        self.cache[0].scatter_(2, idx4, k)
-        self.cache[1].scatter_(2, idx4, v)
-        self.end_offset.add_(T * active.to(self.end_offset.dtype))
+        cache[0].scatter_(2, idx4, k)
+        cache[1].scatter_(2, idx4, v)
+        next_end_offset = end_offset + T * active.to(end_offset.dtype)
 
-        idx = torch.arange(self.capacity, device=self.end_offset.device, dtype=torch.long)
-        end_offset = self.end_offset.view(-1, 1)
-        invalid = idx.view(1, -1) >= end_offset
-        end_index = end_offset % self.capacity
+        idx = torch.arange(self.capacity, device=end_offset.device, dtype=torch.long)
+        end_view = next_end_offset.view(-1, 1)
+        invalid = idx.view(1, -1) >= end_view
+        end_index = end_view % self.capacity
         delta = idx.view(1, -1) - end_index
-        # `delta <= 0` (not `< 0`) is moshi's exact convention (transformer.py
-        # RingKVCache.complete). It labels the just-past-newest slot as the future
-        # write position, so once the ring has wrapped the single oldest in-window
-        # cell is excluded and the effective window is capacity-1. This is inherited
-        # verbatim from the reference and only shows after the window fills (Helium
-        # ~3000 frames / 240 s); it costs one frame out of thousands. Do NOT change
-        # this to `< 0`: it would diverge from moshi and break greedy bit-parity.
-        positions = torch.where(delta <= 0, end_offset + delta, end_offset + delta - self.capacity)
+        # Preserve the reference's delta <= 0 convention for the future slot.
+        positions = torch.where(delta <= 0, end_view + delta, end_view + delta - self.capacity)
         positions = torch.where(invalid, torch.full_like(positions, -1), positions)
-        below = positions < self.start_offset.view(-1, 1)  # [B, capacity]
+        below = positions < start_offset.view(-1, 1)
         positions = torch.where(below, torch.full_like(positions, -1), positions)
-        return self.cache[0], self.cache[1], positions
+
+        if state_slot_ids is None:
+            self.end_offset.copy_(next_end_offset)
+        else:
+            self.cache.index_copy_(1, state_slot_ids, cache)
+            self.end_offset.index_copy_(0, state_slot_ids, next_end_offset)
+        return cache[0], cache[1], positions
 
 
 def _normalize_temporal_active(active: torch.Tensor, reference: torch.Tensor) -> torch.Tensor:
@@ -168,6 +188,7 @@ class _TemporalLayer(nn.Module):
         offset: torch.Tensor,
         context: int,
         active: torch.Tensor,
+        state_slot_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         B, T, _ = x.shape
         h = _rms_norm_f32(x, self.norm1_alpha, 1e-8)
@@ -178,7 +199,7 @@ class _TemporalLayer(nn.Module):
         q, k, v = qkv[0], qkv[1], qkv[2]
         q, k = _apply_rope(q, k, offset)
 
-        keys, values, pos_k = kv.complete(k, v, active)
+        keys, values, pos_k = kv.complete(k, v, active, state_slot_ids=state_slot_ids)
         pos_k = pos_k.view(pos_k.shape[0], 1, pos_k.shape[1])  # [B, 1, cap]
         pos_q = offset.view(-1, 1, 1) + torch.arange(T, device=q.device, dtype=torch.long).view(1, -1, 1)
         delta = pos_q - pos_k
@@ -256,13 +277,30 @@ class PersonaPlexTemporalStreaming(nn.Module):
         self,
         frame_embedding: torch.Tensor,
         active: torch.Tensor,
+        state_slot_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         assert self._kv is not None, "call streaming_init first"
-        active = _normalize_temporal_active(active, self._offset)
+        if state_slot_ids is None:
+            active = _normalize_temporal_active(active, self._offset)
+            offset = self._offset
+        else:
+            if state_slot_ids.shape != active.shape:
+                raise ValueError(
+                    f"state_slot_ids must have shape {tuple(active.shape)}, got {tuple(state_slot_ids.shape)}"
+                )
+            if state_slot_ids.dtype != torch.long or state_slot_ids.device != self._offset.device:
+                raise TypeError("state_slot_ids must be int64 on the temporal state device")
+            active = _normalize_temporal_active(active, state_slot_ids)
+            offset = self._offset.index_select(0, state_slot_ids)
+
         x = frame_embedding
         for layer, kv in zip(self.layers, self._kv):
-            x = layer(x, kv, self._offset, self.context, active)
-        self._offset.add_(x.shape[1] * active.to(self._offset.dtype))
+            x = layer(x, kv, offset, self.context, active, state_slot_ids=state_slot_ids)
+        next_offset = offset + x.shape[1] * active.to(offset.dtype)
+        if state_slot_ids is None:
+            self._offset.copy_(next_offset)
+        else:
+            self._offset.index_copy_(0, state_slot_ids, next_offset)
         out = _rms_norm_f32(x, self.out_norm_alpha, 1e-8)
         text_logits = F.linear(out, self.text_linear)
         return out, text_logits[:, None]

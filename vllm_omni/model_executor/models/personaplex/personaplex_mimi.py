@@ -43,17 +43,25 @@ FRAME_SIZE = 1920
 CODEBOOKS = 8
 
 
-def _normalize_active(active: torch.Tensor | None, all_active: torch.Tensor) -> torch.Tensor:
-    # Stage 0 and Code2Wav currently use one B=1 codec per session and omit
-    # `active`, so preserve that API by treating None as all rows active. When
-    # they switch to shared B>1 codecs, their batch builders must pass bool[B]:
-    # True advances that row's streaming state; False keeps an absent or padded
-    # row's offsets and convolution carries unchanged.
+def _normalize_active(
+    active: torch.Tensor | None,
+    all_active: torch.Tensor,
+    state_slot_ids: torch.Tensor | None = None,
+) -> torch.Tensor:
+    # ``all_active`` describes the physical state pool. With compact slot
+    # addressing, the execution batch is indexed by ``state_slot_ids``.
+    reference = all_active if state_slot_ids is None else state_slot_ids
     if active is None:
-        return all_active
-    if active.shape != all_active.shape:
-        raise ValueError(f"active must have shape {tuple(all_active.shape)}, got {tuple(active.shape)}")
-    return active.to(device=all_active.device, dtype=torch.bool)
+        return all_active if state_slot_ids is None else torch.ones_like(reference, dtype=torch.bool)
+    if active.shape != reference.shape:
+        raise ValueError(f"active must have shape {tuple(reference.shape)}, got {tuple(active.shape)}")
+    if active.dtype != torch.bool:
+        raise TypeError(f"active must have dtype torch.bool, got {active.dtype}")
+    if active.device != reference.device:
+        raise ValueError(f"active must be on {reference.device}, got {active.device}")
+    if not active.is_contiguous():
+        raise ValueError("active must be contiguous")
+    return active
 
 
 def _map_moshi_codec_weights(
@@ -122,22 +130,42 @@ class _StreamConv1d:
         self.prev = torch.zeros(batch_size, self.conv.in_channels, pad, device=device, dtype=dtype)
         self._fresh = torch.ones(batch_size, dtype=torch.bool, device=device)
 
+    def reset_all(self) -> None:
+        """Reset every row without reallocating the streaming state."""
+        self.prev.zero_()
+        self._fresh.fill_(True)
+
     def reset_slot(self, b: int) -> None:
         self.prev[b].zero_()
         self._fresh[b] = True
 
-    def __call__(self, x: torch.Tensor, active: torch.Tensor) -> torch.Tensor:
+    def reset_slots(self, rows: torch.Tensor) -> None:
+        self.prev.index_fill_(0, rows, 0)
+        self._fresh.index_fill_(0, rows, True)
+
+    def __call__(
+        self,
+        x: torch.Tensor,
+        active: torch.Tensor,
+        state_slot_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        prev = self.prev if state_slot_ids is None else self.prev.index_select(0, state_slot_ids)
+        fresh_state = self._fresh if state_slot_ids is None else self._fresh.index_select(0, state_slot_ids)
+        active_view = active.view(-1, 1, 1)
         if self.pad_mode == "replicate":
-            pad = self.prev.shape[-1]
+            pad = prev.shape[-1]
             edge = x[..., 0:1].expand(-1, -1, pad)
-            fresh = (self._fresh & active).view(-1, 1, 1)
-            self.prev = torch.where(fresh, edge.to(self.prev.dtype), self.prev)
-        self._fresh[active] = False
-        x = torch.cat([self.prev, x], dim=-1)
+            fresh = (fresh_state & active).view(-1, 1, 1)
+            prev.copy_(torch.where(fresh, edge.to(prev.dtype), prev))
+        fresh_state.logical_and_(~active)
+        x = torch.cat([prev, x], dim=-1)
         t = x.shape[-1]
         num_frames = max(0, (t - self.kernel) // self.stride + 1)
-        prev = x[..., num_frames * self.stride :]
-        self.prev = torch.where(active.view(-1, 1, 1), prev, self.prev)
+        next_prev = x[..., num_frames * self.stride :]
+        prev.copy_(torch.where(active_view, next_prev, prev))
+        if state_slot_ids is not None:
+            self.prev.index_copy_(0, state_slot_ids, prev)
+            self._fresh.index_copy_(0, state_slot_ids, fresh_state)
         if num_frames == 0:
             return x.new_zeros(x.shape[0], self.conv.out_channels, 0)
         return self.conv(x[..., : (num_frames - 1) * self.stride + self.kernel])
@@ -159,26 +187,46 @@ class _StreamConvTr1d:
         )
         self._fresh = torch.ones(batch_size, dtype=torch.bool, device=device)
 
+    def reset_all(self) -> None:
+        """Reset every row without reallocating the streaming state."""
+        self.partial.zero_()
+        self._fresh.fill_(True)
+
     def reset_slot(self, b: int) -> None:
         self.partial[b].zero_()
         self._fresh[b] = True
 
-    def __call__(self, x: torch.Tensor, active: torch.Tensor) -> torch.Tensor:
+    def reset_slots(self, rows: torch.Tensor) -> None:
+        self.partial.index_fill_(0, rows, 0)
+        self._fresh.index_fill_(0, rows, True)
+
+    def __call__(
+        self,
+        x: torch.Tensor,
+        active: torch.Tensor,
+        state_slot_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        partial_state = self.partial if state_slot_ids is None else self.partial.index_select(0, state_slot_ids)
+        fresh_state = self._fresh if state_slot_ids is None else self._fresh.index_select(0, state_slot_ids)
         out = self.conv(x)
         length = out.shape[-1]
         tail = self.kernel - self.stride
-        pt = self.partial.shape[-1]
-        merge = self.partial.clone()
+        pt = partial_state.shape[-1]
+        merge = partial_state
         if self.conv.bias is not None:
             # The carried tail already includes the bias; the fresh output adds
             # it again, so subtract one copy -- except on a row's very first
             # frame, where the carry is zeros by construction.
             merge = merge - self.conv.bias[:, None]
-            merge[self._fresh & active] = 0.0
-            self._fresh[active] = False
+            first = (fresh_state & active).view(-1, 1, 1)
+            merge = torch.where(first, torch.zeros_like(merge), merge)
+            fresh_state.logical_and_(~active)
         out[..., :pt] += merge
-        partial = out[..., length - tail :].clone()
-        self.partial = torch.where(active.view(-1, 1, 1), partial, self.partial)
+        next_partial = out[..., length - tail :].clone()
+        partial_state.copy_(torch.where(active.view(-1, 1, 1), next_partial, partial_state))
+        if state_slot_ids is not None:
+            self.partial.index_copy_(0, state_slot_ids, partial_state)
+            self._fresh.index_copy_(0, state_slot_ids, fresh_state)
         return out[..., : length - tail]
 
 
@@ -206,6 +254,7 @@ class _MimiTransformerLayer(nn.Module):
         offset: torch.Tensor,
         context: int,
         active: torch.Tensor,
+        state_slot_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         B, T, _ = x.shape
         h = self.norm1(x)
@@ -213,7 +262,7 @@ class _MimiTransformerLayer(nn.Module):
         qkv = qkv.view(B, T, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]
         q, k = _apply_rope(q, k, offset)
-        keys, values, pos_k = kv.complete(k, v, active=active)
+        keys, values, pos_k = kv.complete(k, v, active=active, state_slot_ids=state_slot_ids)
         pos_k = pos_k.view(pos_k.shape[0], 1, pos_k.shape[1])
         pos_q = offset.view(-1, 1, 1) + torch.arange(T, device=q.device, dtype=torch.long).view(1, -1, 1)
         delta = pos_q - pos_k
@@ -237,6 +286,9 @@ class _MimiStreamingTransformer(nn.Module):
         self._offset: torch.Tensor | None = None
 
     def streaming_init(self, batch_size: int) -> None:
+        if self._offset is not None and self._offset.shape == (batch_size,):
+            self.reset_streaming()
+            return
         p = next(self.parameters())
         heads = self.layers[0].num_heads
         hd = self.layers[0].head_dim
@@ -255,11 +307,35 @@ class _MimiStreamingTransformer(nn.Module):
             kv.reset_row(b)
         self._offset[b] = 0
 
-    def step(self, x: torch.Tensor, active: torch.Tensor) -> torch.Tensor:
-        """``x`` is ``[B, T, dim]`` (T = positions this frame, typically 2)."""
+    def reset_slots(self, rows: torch.Tensor) -> None:
+        for kv in self._kv:
+            kv.reset_rows(rows)
+        self._offset.index_fill_(0, rows, 0)
+
+    def step(
+        self,
+        x: torch.Tensor,
+        active: torch.Tensor,
+        state_slot_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """x is [B, T, dim] (T = positions this frame, typically 2)."""
+        if state_slot_ids is None:
+            offset = self._offset
+        else:
+            if state_slot_ids.shape != (x.shape[0],):
+                raise ValueError(f"state_slot_ids must have shape ({x.shape[0]},), got {tuple(state_slot_ids.shape)}")
+            if state_slot_ids.dtype != torch.long:
+                raise TypeError(f"state_slot_ids must have dtype torch.int64, got {state_slot_ids.dtype}")
+            if state_slot_ids.device != self._offset.device:
+                raise ValueError(f"state_slot_ids must be on {self._offset.device}, got {state_slot_ids.device}")
+            offset = self._offset.index_select(0, state_slot_ids)
         for layer, kv in zip(self.layers, self._kv):
-            x = layer(x, kv, self._offset, self.context, active)
-        self._offset.add_(x.shape[1] * active.to(self._offset.dtype))
+            x = layer(x, kv, offset, self.context, active, state_slot_ids)
+        next_offset = offset + x.shape[1] * active.to(offset.dtype)
+        if state_slot_ids is None:
+            self._offset.copy_(next_offset)
+        else:
+            self._offset.index_copy_(0, state_slot_ids, next_offset)
         return x
 
     def load_weights(self, state_dict: dict[str, torch.Tensor], prefix: str) -> int:
@@ -365,6 +441,7 @@ class PersonaPlexMimiCodec(nn.Module):
         self._upsample = _StreamConvTr1d(m.upsample.conv)
         self._dec_stages = _walk_seanet(m.decoder.layers)
         self._batch_size: int | None = None
+        self._state_capacity: int | None = None
         self._all_active: torch.Tensor
 
     # -- streaming state ------------------------------------------------------
@@ -379,8 +456,18 @@ class PersonaPlexMimiCodec(nn.Module):
         yield self._downsample
         yield self._upsample
 
-    def streaming_init(self, batch_size: int) -> None:
+    def streaming_init(self, batch_size: int, *, state_capacity: int | None = None) -> None:
+        if batch_size <= 0:
+            raise ValueError(f"batch_size must be positive, got {batch_size}")
+        if state_capacity is None:
+            state_capacity = batch_size
+        if not 0 < state_capacity <= batch_size:
+            raise ValueError(f"state_capacity must be in [1, {batch_size}], got {state_capacity}")
+        if getattr(self, "_batch_size", None) == batch_size and self._state_capacity == state_capacity:
+            self.reset_streaming()
+            return
         self._batch_size = batch_size
+        self._state_capacity = state_capacity
         self._all_active = torch.ones(batch_size, dtype=torch.bool, device=self.device)
         for s in self._conv_states():
             s.reset(batch_size, self.device, self.dtype)
@@ -390,8 +477,7 @@ class PersonaPlexMimiCodec(nn.Module):
     def reset_streaming(self) -> None:
         assert self._batch_size is not None
         for state in self._conv_states():
-            for b in range(self._batch_size):
-                state.reset_slot(b)
+            state.reset_all()
         self.encoder_transformer.reset_streaming()
         self.decoder_transformer.reset_streaming()
 
@@ -401,45 +487,177 @@ class PersonaPlexMimiCodec(nn.Module):
         self.encoder_transformer.reset_slot(b)
         self.decoder_transformer.reset_slot(b)
 
+    @torch.no_grad()
+    def reset_decoder_state_slots(self, state_slot_ids: torch.Tensor) -> None:
+        """Reset selected physical rows without reallocating the state pool."""
+        if self._batch_size is None:
+            raise RuntimeError("call streaming_init before resetting decoder state slots")
+        if state_slot_ids.ndim != 1 or state_slot_ids.dtype != torch.long:
+            raise TypeError("state_slot_ids must be a one-dimensional torch.int64 tensor")
+        if state_slot_ids.numel() == 0:
+            return
+        rows = state_slot_ids.to(device=self.device, dtype=torch.long)
+        if int(rows.min()) < 0 or int(rows.max()) >= self._batch_size:
+            raise ValueError(f"state_slot_ids must be in [0, {self._batch_size})")
+        for state in self._conv_states():
+            state.reset_slots(rows)
+        self.encoder_transformer.reset_slots(rows)
+        self.decoder_transformer.reset_slots(rows)
+
     # -- per-frame codec -------------------------------------------------------
 
     @staticmethod
-    def _run_stages(x: torch.Tensor, stages, active: torch.Tensor) -> torch.Tensor:
+    def _run_stages(
+        x: torch.Tensor,
+        stages,
+        active: torch.Tensor,
+        state_slot_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         for kind, stage in stages:
             if kind == "res":
                 act0, conv1, act2, conv3 = stage
-                x = x + conv3(act2(conv1(act0(x), active)), active)
+                if state_slot_ids is None:
+                    x = x + conv3(act2(conv1(act0(x), active)), active)
+                else:
+                    x = x + conv3(
+                        act2(conv1(act0(x), active, state_slot_ids=state_slot_ids)),
+                        active,
+                        state_slot_ids=state_slot_ids,
+                    )
+            elif kind in {"conv", "convtr"}:
+                x = stage(x, active) if state_slot_ids is None else stage(x, active, state_slot_ids=state_slot_ids)
             else:
-                x = stage(x, active) if kind in {"conv", "convtr"} else stage(x)
+                x = stage(x)
         return x
 
     @torch.no_grad()
-    def encode_frame(self, pcm: torch.Tensor, active: torch.Tensor | None = None) -> torch.Tensor:
-        """``[B, frame_size]`` float PCM -> ``[B, 8]`` codes."""
+    def encode_frame(
+        self,
+        pcm: torch.Tensor,
+        active: torch.Tensor | None = None,
+        state_slot_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """[B, frame_size] float PCM -> [B, 8] codes."""
         x = pcm.to(self.device, self.dtype).view(-1, 1, FRAME_SIZE)
-        active = _normalize_active(active, self._all_active)
-        x = self._run_stages(x, self._enc_stages, active)
-        x = self.encoder_transformer.step(x.transpose(1, 2), active).transpose(1, 2)
-        x = self._downsample(x, active)
-        codes = self.model.quantizer.encode(x)  # [Q, B, T]
+        active = _normalize_active(active, self._all_active, state_slot_ids)
+        x = self._run_stages(x, self._enc_stages, active, state_slot_ids)
+        if state_slot_ids is None:
+            x = self.encoder_transformer.step(x.transpose(1, 2), active)
+        else:
+            x = self.encoder_transformer.step(
+                x.transpose(1, 2),
+                active,
+                state_slot_ids=state_slot_ids,
+            )
+        x = x.transpose(1, 2)
+        x = (
+            self._downsample(x, active)
+            if state_slot_ids is None
+            else self._downsample(x, active, state_slot_ids=state_slot_ids)
+        )
+        codes = self.model.quantizer.encode(x)
         return codes[:CODEBOOKS, :, 0].transpose(0, 1).contiguous()
 
     @torch.no_grad()
-    def decode_frame(self, codes: torch.Tensor, active: torch.Tensor | None = None) -> torch.Tensor:
-        """``[B, 8]`` codes -> ``[B, frame_size]`` float PCM."""
+    def decode_frame(
+        self,
+        codes: torch.Tensor,
+        active: torch.Tensor | None = None,
+        state_slot_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """[B, 8] codes -> [B, frame_size] float PCM."""
         emb = self.model.quantizer.decode(codes.to(self.device).view(-1, CODEBOOKS, 1))
-        active = _normalize_active(active, self._all_active)
-        emb = self._upsample(emb, active)
-        emb = self.decoder_transformer.step(emb.transpose(1, 2), active).transpose(1, 2)
-        x = self._run_stages(emb, self._dec_stages, active)
+        active = _normalize_active(active, self._all_active, state_slot_ids)
+        emb = (
+            self._upsample(emb, active)
+            if state_slot_ids is None
+            else self._upsample(emb, active, state_slot_ids=state_slot_ids)
+        )
+        if state_slot_ids is None:
+            emb = self.decoder_transformer.step(emb.transpose(1, 2), active)
+        else:
+            emb = self.decoder_transformer.step(
+                emb.transpose(1, 2),
+                active,
+                state_slot_ids=state_slot_ids,
+            )
+        emb = emb.transpose(1, 2)
+        x = self._run_stages(emb, self._dec_stages, active, state_slot_ids)
         return x[:, 0, :]
 
     @torch.no_grad()
-    def decode_frames(self, codes: torch.Tensor, active: torch.Tensor | None = None) -> torch.Tensor:
-        """``[B, 8, F]`` codes -> ``[B, F * frame_size]`` float PCM."""
+    def decode_frames(
+        self,
+        codes: torch.Tensor,
+        active: torch.Tensor | None = None,
+        state_slot_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """[B, 8, F] codes -> [B, F * frame_size] float PCM."""
         emb = self.model.quantizer.decode(codes.to(self.device))
-        active = _normalize_active(active, self._all_active)
-        emb = self._upsample(emb, active)
-        emb = self.decoder_transformer.step(emb.transpose(1, 2), active).transpose(1, 2)
-        x = self._run_stages(emb, self._dec_stages, active)
+        active = _normalize_active(active, self._all_active, state_slot_ids)
+        emb = (
+            self._upsample(emb, active)
+            if state_slot_ids is None
+            else self._upsample(emb, active, state_slot_ids=state_slot_ids)
+        )
+        if state_slot_ids is None:
+            emb = self.decoder_transformer.step(emb.transpose(1, 2), active)
+        else:
+            emb = self.decoder_transformer.step(
+                emb.transpose(1, 2),
+                active,
+                state_slot_ids=state_slot_ids,
+            )
+        emb = emb.transpose(1, 2)
+        x = self._run_stages(emb, self._dec_stages, active, state_slot_ids)
         return x[:, 0, :]
+
+    @torch.no_grad()
+    def decode_streaming_tensors(
+        self,
+        codes: torch.Tensor,
+        codes_lengths: torch.Tensor,
+        state_slot_ids: torch.Tensor,
+        valid_rows: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Decode padded frame-major codes through the pooled streaming state."""
+        if codes.ndim != 3 or codes.shape[0] != CODEBOOKS:
+            raise ValueError(f"codes must have shape ({CODEBOOKS}, B, T), got {tuple(codes.shape)}")
+        batch_size, max_frames = codes.shape[1:]
+        if self._batch_size is None:
+            raise RuntimeError("call streaming_init before decode_streaming_tensors")
+        if codes.device != self.device:
+            raise ValueError(f"codes must be on {self.device}, got {codes.device}")
+        for name, value, dtype in (
+            ("codes_lengths", codes_lengths, torch.long),
+            ("state_slot_ids", state_slot_ids, torch.long),
+            ("valid_rows", valid_rows, torch.bool),
+        ):
+            if value.shape != (batch_size,):
+                raise ValueError(f"{name} must have shape ({batch_size},), got {tuple(value.shape)}")
+            if value.dtype != dtype:
+                raise TypeError(f"{name} must have dtype {dtype}, got {value.dtype}")
+            if value.device != self.device:
+                raise ValueError(f"{name} must be on {self.device}, got {value.device}")
+        if state_slot_ids.numel() and (int(state_slot_ids.min()) < 0 or int(state_slot_ids.max()) >= self._batch_size):
+            raise ValueError(f"state_slot_ids must be in [0, {self._batch_size})")
+        if state_slot_ids.unique().numel() != batch_size:
+            raise ValueError("state_slot_ids must be unique within one decode batch")
+
+        frame_audio: list[torch.Tensor] = []
+        for frame in range(max_frames):
+            frame_active = valid_rows & (codes_lengths > frame)
+            audio = self.decode_frame(
+                codes[:, :, frame].transpose(0, 1),
+                frame_active,
+                state_slot_ids,
+            )
+            frame_audio.append(torch.where(frame_active.view(-1, 1), audio, torch.zeros_like(audio)))
+
+        if max_frames == 0:
+            audio = torch.zeros((batch_size, 0), device=self.device, dtype=self.dtype)
+        else:
+            audio = torch.stack(frame_audio, dim=1).reshape(batch_size, -1)
+        audio_lengths = codes_lengths.clamp(min=0, max=max_frames) * FRAME_SIZE
+        audio_lengths = torch.where(valid_rows, audio_lengths, torch.zeros_like(audio_lengths))
+        return audio, audio_lengths

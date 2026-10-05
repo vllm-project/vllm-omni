@@ -271,12 +271,28 @@ class CUDAGraphStreamingDecoderWrapper:
         codes: torch.Tensor,
         state_slot_ids: torch.Tensor,
         *,
+        codes_lengths: torch.Tensor | None = None,
+        valid_rows: torch.Tensor | None = None,
         allow_frame_padding: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, int] | None:
+        # PersonaPlex uses per-row masks for compact streaming batches;
+        # this wrapper can later be extracted as a shared speech-model utility.
         if not codes.is_cuda or torch.cuda.is_current_stream_capturing():
             return None
         n_vq, actual_batch_size, frame_size = codes.shape
         if int(n_vq) != self.num_quantizers or state_slot_ids.shape != (actual_batch_size,):
+            return None
+        if codes_lengths is not None and (
+            codes_lengths.shape != (actual_batch_size,)
+            or codes_lengths.dtype != torch.long
+            or codes_lengths.device != codes.device
+        ):
+            return None
+        if valid_rows is not None and (
+            valid_rows.shape != (actual_batch_size,)
+            or valid_rows.dtype != torch.bool
+            or valid_rows.device != codes.device
+        ):
             return None
         batch_size = self._select_batch_size(int(actual_batch_size))
         if batch_size is None:
@@ -291,13 +307,21 @@ class CUDAGraphStreamingDecoderWrapper:
         entry.static_codes.zero_()
         entry.static_codes[:, :actual_batch_size, :frame_size].copy_(codes, non_blocking=True)
         entry.static_lengths.zero_()
-        entry.static_lengths[:actual_batch_size].fill_(int(frame_size))
+        if codes_lengths is None:
+            entry.static_lengths[:actual_batch_size].fill_(int(frame_size))
+        else:
+            if codes_lengths.numel() and (int(codes_lengths.min()) < 0 or int(codes_lengths.max()) > int(frame_size)):
+                return None
+            entry.static_lengths[:actual_batch_size].copy_(codes_lengths, non_blocking=True)
         entry.static_state_slot_ids.copy_(
             self.scratch_base + torch.arange(batch_size, dtype=torch.long, device=entry.static_state_slot_ids.device)
         )
         entry.static_state_slot_ids[:actual_batch_size].copy_(state_slot_ids, non_blocking=True)
         entry.static_valid_rows.zero_()
-        entry.static_valid_rows[:actual_batch_size].fill_(True)
+        if valid_rows is None:
+            entry.static_valid_rows[:actual_batch_size].fill_(True)
+        else:
+            entry.static_valid_rows[:actual_batch_size].copy_(valid_rows, non_blocking=True)
         entry.graph.replay()
         return entry.static_audio, entry.static_audio_lengths, int(actual_batch_size)
 

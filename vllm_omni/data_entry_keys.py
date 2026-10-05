@@ -223,6 +223,7 @@ class MetaStruct(_StructBase):
     height: int | None = None
     width: int | None = None
     decode_flag: bool | None = None
+    personaplex_codes_delta: bool | None = None
     codec_streaming: bool | None = None
     first_audio: torch.Tensor | None = None
     codec_frame_valid: torch.Tensor | None = None

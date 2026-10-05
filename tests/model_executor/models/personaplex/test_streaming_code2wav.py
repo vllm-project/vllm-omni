@@ -55,6 +55,65 @@ class _FakeChunkedMimi(_FakeStreamingMimi):
         return torch.arange(codes.shape[-1] * 4, dtype=torch.float32).reshape(1, -1)
 
 
+class _FakePooledMimi(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.streaming_init_calls: list[int] = []
+        self.reset_slots: list[int] = []
+        self.decode_calls = 0
+        self.last_inputs: tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...], tuple[int, ...]] | None = None
+
+    def streaming_init(self, batch_size: int) -> None:
+        self.streaming_init_calls.append(batch_size)
+
+    def reset_slot(self, slot: int) -> None:
+        self.reset_slots.append(slot)
+
+    def decode_streaming_tensors(
+        self,
+        codes: torch.Tensor,
+        codes_lengths: torch.Tensor,
+        state_slot_ids: torch.Tensor,
+        valid_rows: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        self.decode_calls += 1
+        self.last_inputs = (
+            tuple(codes.shape),
+            tuple(codes_lengths.tolist()),
+            tuple(state_slot_ids.tolist()),
+            tuple(valid_rows.tolist()),
+        )
+        frames = codes.shape[-1]
+        audio = torch.zeros(codes.shape[1], frames * 4, dtype=torch.float32)
+        for row, slot in enumerate(state_slot_ids.tolist()):
+            audio[row].view(frames, 4).fill_(float(slot + 1))
+        return audio, codes_lengths * 4
+
+    def decode_frame(
+        self,
+        codes: torch.Tensor,
+        active: torch.Tensor | None = None,
+        state_slot_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        assert codes.shape[0] == 1
+        assert active is not None and state_slot_ids is not None
+        assert active.tolist() == [True]
+        value = float(state_slot_ids[0].item() + 1)
+        return torch.full((1, 4), value, dtype=torch.float32)
+
+    def decode_frames(
+        self,
+        codes: torch.Tensor,
+        active: torch.Tensor | None = None,
+        state_slot_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        assert codes.shape[0] == 1
+        assert active is not None and state_slot_ids is not None
+        assert active.tolist() == [True]
+        value = float(state_slot_ids[0].item() + 1)
+        return torch.full((1, codes.shape[-1] * 4), value, dtype=torch.float32)
+
+
 class _FakeMimiModel(nn.Module):
     def __init__(self, _config) -> None:
         super().__init__()
@@ -314,3 +373,81 @@ def test_decoder_slot_lifecycle_isolated_capacity_and_reuse() -> None:
     assert second.reset_calls == 0
     replacement = model(input_ids=_codes(1), request_ids=["replacement"])
     assert _audio(replacement).tolist() == [13.0] * 4
+
+
+def test_cumulative_decode_uses_pooled_state_slot() -> None:
+    model, _ = _model(max_sessions=2)
+    mimi = _FakePooledMimi()
+    model._set_mimi_codecs([mimi])
+
+    first = model(input_ids=_codes(2), request_ids=["req"])
+    cumulative = torch.cat([torch.arange(3), torch.arange(100, 103)])
+    second = model(input_ids=cumulative, request_ids=["req"])
+
+    assert first.multimodal_outputs["model_outputs"][0].tolist() == [1.0] * 8
+    assert second.multimodal_outputs["model_outputs"][0].tolist() == [1.0] * 4
+
+
+def test_delta_batch_decode_slices_variable_frame_lengths() -> None:
+    model, _ = _model(max_sessions=2)
+    mimi = _FakePooledMimi()
+    model._set_mimi_codecs([mimi])
+
+    output = model(
+        input_ids=torch.cat([_codes(1), _codes(2, start=20)]),
+        request_ids=["short", "long"],
+        seq_token_counts=[2, 4],
+        runtime_additional_information=[
+            {"meta": {"personaplex_codes_delta": True}},
+            {"meta": {"personaplex_codes_delta": True}},
+        ],
+    )
+
+    assert mimi.last_inputs == ((2, 2, 2), (1, 2), (0, 1), (True, True))
+    assert [audio.tolist() for audio in output.multimodal_outputs["model_outputs"]] == [
+        [1.0] * 4,
+        [2.0] * 8,
+    ]
+
+
+def test_delta_batch_decode_uses_one_pooled_codec_and_recycles_slots() -> None:
+    model, _ = _model(max_sessions=2)
+    mimi = _FakePooledMimi()
+    model._set_mimi_codecs([mimi])
+
+    runtime_info = [
+        {"meta": {"personaplex_codes_delta": True}},
+        {"meta": {"personaplex_codes_delta": True}},
+    ]
+    first = model(
+        input_ids=torch.cat([_codes(1), _codes(1, start=20)]),
+        request_ids=["first", "second"],
+        seq_token_counts=[2, 2],
+        runtime_additional_information=runtime_info,
+    )
+
+    assert mimi.streaming_init_calls == [2]
+    assert mimi.decode_calls == 1
+    assert mimi.last_inputs == ((2, 2, 1), (1, 1), (0, 1), (True, True))
+    assert [audio.tolist() for audio in first.multimodal_outputs["model_outputs"]] == [
+        [1.0] * 4,
+        [2.0] * 4,
+    ]
+
+    mimi.reset_slots.clear()
+    model.on_requests_finished(["first"])
+    assert mimi.reset_slots == [0]
+
+    replacement = model(
+        input_ids=_codes(1, start=40),
+        request_ids=["replacement"],
+        runtime_additional_information=[{"meta": {"personaplex_codes_delta": True}}],
+    )
+
+    assert mimi.decode_calls == 2
+    assert mimi.last_inputs == ((2, 1, 1), (1,), (0,), (True,))
+    assert replacement.multimodal_outputs["model_outputs"][0].tolist() == [1.0] * 4
+
+    mimi.reset_slots.clear()
+    model.on_requests_finished(["second", "replacement"])
+    assert mimi.reset_slots == [1, 0]

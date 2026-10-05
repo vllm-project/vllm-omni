@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from types import SimpleNamespace
 
@@ -35,6 +35,8 @@ def test_full_payload_accepts_worker_and_cached_payload_sources(source: str) -> 
 
     expected = torch.cat([audio[:-1, :1], audio[1:, 1:]], dim=1).reshape(-1)
     assert torch.equal(payload.codes.audio, expected)
+    assert payload.meta is not None
+    assert payload.meta.personaplex_codes_delta is None
 
 
 def test_async_chunk_keeps_delay_tail_across_resumable_segments() -> None:
@@ -80,6 +82,8 @@ def test_async_chunk_keeps_delay_tail_across_resumable_segments() -> None:
     assert first.meta.is_segment_finished.item() is False
     expected = torch.cat([first_frame[:, :1], second_frame[:, 1:]], dim=1).reshape(-1)
     assert torch.equal(second.codes.audio, expected)
+    assert second.meta is not None
+    assert second.meta.personaplex_codes_delta is True
     assert manager.request_payload["req"]["personaplex_frames"][0].equal(second_frame.reshape(-1))
 
 
