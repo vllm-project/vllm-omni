@@ -3551,7 +3551,7 @@ def test_request_cancellation_at_prepare_and_decode_boundaries(preencode, cancel
     def prepare(*args):
         if cancel_phase == "prepare":
             registry.cancel(["request"])
-        return {"num_outputs": 1, "seed": 1101, "preencode_mp4": preencode}
+        return {"num_outputs": 1, "seed": 1101, "preencode_mp4": preencode, "height": 2, "width": 2}
 
     def diffuse(**kwargs):
         registry.cancel(["request"])

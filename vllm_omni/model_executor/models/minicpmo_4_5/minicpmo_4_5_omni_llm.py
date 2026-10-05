@@ -3473,19 +3473,25 @@ class MiniCPMO45OmniLLMMultiModalProcessor(BaseMultiModalProcessor[MiniCPMO45Omn
     def _apply_hf_processor_main(
         self,
         mm_items: MultiModalDataItems,
-        hf_processor_mm_kwargs: Mapping[str, object],
+        hf_kwargs: Mapping[str, object],
     ) -> BatchFeature:
         """
         Process each modality independently because the MiniCPM processor
         asserts that image tags and image sizes have matching lengths.
         """
         valid_mm_items = mm_items.select({key for key, count in mm_items.get_all_counts().items() if count > 0})
-        mm_data, passthrough_data = self._get_hf_mm_data(valid_mm_items)
+        mm_data: dict[str, object] = {}
+        passthrough_data: dict[str, object] = {}
+        for items in valid_mm_items.values():
+            if not items:
+                continue
+            mm_data.update(items.get_processor_data())
+            passthrough_data.update(items.get_passthrough_data())
 
         tokenizer = self.info.get_tokenizer()
         prompt_text = self.dummy_inputs.get_dummy_text(mm_items.get_all_counts())
         input_ids = torch.tensor([tokenizer.encode(prompt_text)])
-        mm_inputs = self.process_mm_inputs(mm_data, hf_processor_mm_kwargs)
+        mm_inputs = self.process_mm_inputs(mm_data, hf_kwargs)
         processed_data = BatchFeature(
             {
                 "input_ids": input_ids,

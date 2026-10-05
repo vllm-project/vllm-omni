@@ -245,6 +245,8 @@ class StagePipelineConfig:
     # The model keeps per-request execution state while awaiting the next
     # async chunk, so the parked request continues to consume model capacity.
     retains_state_across_chunks: bool = False
+    # Some stateful audio stages cannot roll back already consumed frames.
+    supports_running_prefix_cache_reset: bool = True
     sampling_constraints: dict[str, Any] = field(default_factory=dict)
     custom_process_input_func: str | None = None
     custom_process_next_stage_input_func: str | None = None
@@ -295,6 +297,9 @@ class PipelineConfig:
     model_type: str
     model_arch: str = ""
     stages: tuple[StagePipelineConfig, ...] = ()
+    # A single stage that streams its own final output in async-chunk mode
+    # (e.g. a Talker decoding audio in-stage) keeps deploy.async_chunk.
+    single_stage_async_chunk: bool = False
     # HF architecture aliases: used by StageConfigFactory when the model's
     # HF config reports a generic model_type that collides with a different
     # model (e.g. MiMo Audio reports model_type="qwen2"). The factory
@@ -492,6 +497,7 @@ class StageDeployConfig:
     auxiliary_text_encoder: str | None = None
 
     # Runtime optimizations used by diffusion loading/execution.
+    hsdp_weight_load_strategy: str | None = None
     enable_multithread_weight_load: bool | None = None
     enable_broadcast_weight_load: bool | None = None
     num_weight_load_threads: int | None = None
@@ -530,6 +536,8 @@ class DuplexSessionRuntimeConfig:
     resume_replay_max_bytes_per_session: int = 8 * 1024 * 1024
     max_pending_input_bytes_per_session: int = 16 * 1024 * 1024
     max_pending_turns_per_session: int = 4
+    max_pending_output_bytes_per_session: int = 2 * 1024 * 1024
+    max_pending_output_events_per_session: int = 512
     max_sessions: int = 1
     # Unread by the plugin framework. It used to bound the per-session
     # completed-append table that made a retried append RPC submit once; the
@@ -555,6 +563,8 @@ class DuplexSessionRuntimeConfig:
             "resume_replay_max_bytes_per_session": self.resume_replay_max_bytes_per_session,
             "max_pending_input_bytes_per_session": self.max_pending_input_bytes_per_session,
             "max_pending_turns_per_session": self.max_pending_turns_per_session,
+            "max_pending_output_bytes_per_session": self.max_pending_output_bytes_per_session,
+            "max_pending_output_events_per_session": self.max_pending_output_events_per_session,
             "max_sessions": self.max_sessions,
             "completed_append_cache_size": self.completed_append_cache_size,
         }
@@ -1106,6 +1116,8 @@ def _build_engine_args(
     if ps.omni_kv_config:
         engine_args["omni_kv_config"] = dict(ps.omni_kv_config)
     engine_args["requires_full_payload_input"] = ps.requires_full_payload_input
+    if not ps.supports_running_prefix_cache_reset:
+        engine_args["supports_running_prefix_cache_reset"] = False
     return engine_args
 
 
@@ -1171,8 +1183,11 @@ def _resolve_pipeline_async_chunk_enabled(
     and False otherwise. If the user tried to enable async chunk through the deploy
     config, but it's inapplicable or unsupported, it will be disabled with a warning.
     """
-    # Single stage should never use async chunk
     if len(pipeline.stages) <= 1:
+        if pipeline.single_stage_async_chunk:
+            if deploy.async_chunk is False:
+                raise ValueError(f"Pipeline {pipeline.model_type!r} requires async_chunk=True")
+            return True
         if deploy.async_chunk:
             logger.warning(
                 "Deploy config set async_chunk=True, but async chunk is inapplicable "
@@ -1349,6 +1364,8 @@ class StageConfig:
 
         # Terminal-stage ownership comes from topology, not engine overrides.
         engine_args["final_output"] = self.final_output
+        if self.yaml_engine_args.get("supports_running_prefix_cache_reset") is False:
+            engine_args["supports_running_prefix_cache_reset"] = False
 
         # Build runtime config from YAML defaults + CLI overrides
         runtime: dict[str, Any] = dict(self.yaml_runtime)

@@ -102,7 +102,11 @@ def _make_state(request_id: str, model, branch, video_rows, audio_rows, sigmas_v
     state.latents = video_rows.clone()
     state.timesteps = torch.tensor([1.0 - sigma for sigma in sigmas_video[:-1]], dtype=torch.float32)
     state.step_index = 0
+    from vllm_omni.diffusion.models.minimax_h3.sampling import create_h3_sample_solver
+
     state.extra = {
+        mod._STEP_VIDEO_SOLVER: create_h3_sample_solver("euler", sigmas_video),
+        mod._STEP_AUDIO_SOLVER: create_h3_sample_solver("euler", sigmas_audio),
         mod._STEP_BRANCH: branch,
         # Co-batched requests must share one DiT instance, or denoise_step()
         # treats the batch as mixed-task and falls back to one forward each.

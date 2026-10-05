@@ -97,7 +97,6 @@ _OMNI_ONLY_LLM_STAGE_ENGINE_FIELDS = frozenset(
         "enable_multithread_weight_load",
         "env",
         "has_sampling_extra_args",
-        "log_level",
         "log_stats",
         "model_arch",
         "model_subdir",

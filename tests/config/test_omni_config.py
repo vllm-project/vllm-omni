@@ -1046,6 +1046,7 @@ def test_sub_config_fields_match_structured_scopes():
         "interleave_mm_strings",
         "media_io_kwargs",
         "final_output",
+        "supports_running_prefix_cache_reset",
         "active_stream_window",
         "session_mode",
         "duplex_max_sessions",
@@ -1947,7 +1948,9 @@ def test_diffusion_config_field_classification_covers_current_fields():
 
     assert classified_fields == {f.name for f in fields(omni_config_module._DiffusionConfigProjection)}
     assert {f.name for f in fields(OmniDiffusionConfig)} <= (
-        classified_fields | omni_config_module._DIFFUSION_MOVED_SHARED_FIELDS
+        classified_fields
+        | omni_config_module._DIFFUSION_MOVED_SHARED_FIELDS
+        | omni_config_module._DIFFUSION_INTERNAL_FIELDS
     )
     assert {
         "enable_prompt_embed_cache",

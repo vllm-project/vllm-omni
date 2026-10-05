@@ -45,7 +45,6 @@ from vllm_omni.utils.device_copy import index_to_device
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
-    from vllm.v1.outputs import RoutedExpertsLists
 else:
     xgr = LazyLoader("xgr", globals(), "xgrammar")
     xgr_torch_compile = LazyLoader(
@@ -107,52 +106,6 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
             if sampled is not None:
                 return sampled
         return super()._to_list(sampled_token_ids)
-
-    def _omni_routed_experts_d2h(self, scheduler_output) -> None:
-        """Issue routed-experts D2H copy matching upstream GPUModelRunner pattern.
-
-        Upstream does this inline in ``execute_model``:
-            buf = self.routed_experts_capturer.get_device_buffer()
-            total = scheduler_output.total_num_scheduled_tokens
-            self.routed_experts_cpu[:total].copy_(buf[:total], non_blocking=True)
-            self.routed_experts_slot_mapping_cpu[:total].copy_(
-                self.routed_experts_slot_mapping_device[:total], non_blocking=True)
-        """
-        if not self.routed_experts_initialized:
-            return
-        buf = self.routed_experts_capturer.get_device_buffer()
-        total = scheduler_output.total_num_scheduled_tokens
-        self.routed_experts_cpu[:total].copy_(buf[:total], non_blocking=True)
-        if hasattr(self, "routed_experts_slot_mapping_device"):
-            self.routed_experts_slot_mapping_cpu[:total].copy_(
-                self.routed_experts_slot_mapping_device[:total],
-                non_blocking=True,
-            )
-
-    def _omni_extract_routed_experts(self, scheduler_output) -> "RoutedExpertsLists | None":
-        """Extract routed experts matching upstream GPUModelRunner pattern.
-
-        Upstream (sync path, sample_tokens):
-            total = scheduler_output.total_num_scheduled_tokens
-            output.routed_experts = RoutedExpertsLists(
-                routing_data=self.routed_experts_cpu[:total].numpy(),
-                slot_mapping=self.routed_experts_slot_mapping_cpu[:total].numpy(),
-            )
-
-        Returns RoutedExpertsLists (batch-level, with slot_mapping) so that
-        downstream schedulers can use slot_mapping to map back to requests.
-        """
-        from vllm.v1.outputs import RoutedExpertsLists
-
-        if not self.routed_experts_initialized:
-            return None
-        total = scheduler_output.total_num_scheduled_tokens
-        if total <= 0:
-            return None
-        return RoutedExpertsLists(
-            routing_data=self.routed_experts_cpu[:total].numpy(),
-            slot_mapping=self.routed_experts_slot_mapping_cpu[:total].numpy(),
-        )
 
     def initialize_metadata_builders(self, kv_cache_config, kernel_block_sizes):
         """Initialize metadata builders and keep FA3 graph metadata buffers sized.
@@ -2166,7 +2119,19 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
         model_kwargs_extra = self._build_model_kwargs_extra()
         update_decode_metadata = getattr(self.model, "update_decode_step_metadata", None)
         if getattr(self.model, "supports_omni_decode_step_metadata", False) and callable(update_decode_metadata):
+            cpu_input_tail_ids = None
+            if (
+                getattr(self.model, "requires_cpu_input_tail_ids", False)
+                and not self.use_async_scheduling
+                and input_ids is not None
+                and input_ids.data_ptr() == self.input_ids.gpu.data_ptr()
+            ):
+                count = len(self.input_batch.req_ids)
+                tails = self.query_start_loc.cpu[1 : count + 1].to(torch.long) - 1
+                if count and bool((tails >= 0).all()) and bool((tails < input_ids.numel()).all()):
+                    cpu_input_tail_ids = self.input_ids.cpu.index_select(0, tails).tolist()
             update_decode_metadata(
+                cpu_input_tail_ids=cpu_input_tail_ids,
                 input_ids=input_ids,
                 positions=positions,
                 inputs_embeds=inputs_embeds,
@@ -2174,14 +2139,19 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
                 req_ids=self.input_batch.req_ids,
             )
 
-        model_output = super()._model_forward(
-            input_ids=input_ids,
-            positions=positions,
-            intermediate_tensors=intermediate_tensors,
-            inputs_embeds=inputs_embeds,
-            **model_kwargs,
-            **model_kwargs_extra,
-        )
+        try:
+            model_output = super()._model_forward(
+                input_ids=input_ids,
+                positions=positions,
+                intermediate_tensors=intermediate_tensors,
+                inputs_embeds=inputs_embeds,
+                **model_kwargs,
+                **model_kwargs_extra,
+            )
+        finally:
+            finish_decode_step = getattr(self.model, "finish_decode_step_forward", None)
+            if callable(finish_decode_step):
+                finish_decode_step()
         # CUDAGraphWrapper's weak_ref_tensors preserves the fields but turns
         # NamedTuple outputs into plain tuples. Restore the Omni envelope
         # before a model adapter or extraction discards its multimodal fields.
