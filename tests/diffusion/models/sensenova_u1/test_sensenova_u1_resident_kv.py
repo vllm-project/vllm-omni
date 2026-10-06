@@ -50,6 +50,41 @@ def test_flash_cache_update_and_reserve(batch_size):
 
 
 @pytest.mark.cpu
+@pytest.mark.parametrize("batch_size", [1, 2])
+@pytest.mark.parametrize("suffix_len", [4, 1024])
+def test_clear_flash_cache_retires_suffix_storage(batch_size, suffix_len):
+    cache = FlashKVCache()
+    expected = []
+    for layer_idx in range(2):
+        k, v = torch.randn(2, 1, 2, 9, 8)
+        cache.update(k, v, layer_idx)
+        expected.append((k.expand(batch_size, -1, -1, -1), v.expand(batch_size, -1, -1, -1)))
+
+    for _ in range(2):
+        prepare_flash_kv_cache(cache, suffix_len, batch_size)
+        clear_flash_kv_cache(cache)
+        # Callers keep the prefix cache alive during output conversion. Its
+        # logical shape alone does not show whether it still owns the suffix.
+        for layer, prefix in zip(cache.layers, expected):
+            for name, wanted in zip(("keys", "values"), prefix):
+                value = getattr(layer, name)
+                torch.testing.assert_close(value, wanted, rtol=0, atol=0)
+                assert value.untyped_storage().nbytes() == value.numel() * value.element_size()
+                assert value.transpose(1, 2).is_contiguous()
+            for attr in ("flash_prefix_len", "flash_total_len", "flash_k_cache", "flash_v_cache"):
+                assert not hasattr(layer, attr)
+
+    pointers = [(layer.keys.data_ptr(), layer.values.data_ptr()) for layer in cache.layers]
+    clear_flash_kv_cache(cache)
+    assert pointers == [(layer.keys.data_ptr(), layer.values.data_ptr()) for layer in cache.layers]
+    for layer_idx, (k, v) in enumerate(expected):
+        next_k, next_v = torch.randn(2, batch_size, 2, 1, 8)
+        cache.update(next_k, next_v, layer_idx)
+        torch.testing.assert_close(cache.layers[layer_idx].keys, torch.cat((k, next_k), dim=2), rtol=0, atol=0)
+        torch.testing.assert_close(cache.layers[layer_idx].values, torch.cat((v, next_v), dim=2), rtol=0, atol=0)
+
+
+@pytest.mark.cpu
 def test_paged_handoff_keeps_flash_layout_and_request_ownership():
     cache = FlashKVCache()
     k, v = torch.randn(2, 1, 2, 7, 8)
@@ -139,6 +174,17 @@ def test_resident_cache_matches_dynamic_prefill_and_denoise(tiny_model, masked, 
             torch.testing.assert_close(layer.keys, k, rtol=0, atol=0)
             torch.testing.assert_close(layer.values, v, rtol=0, atol=0)
             assert layer.flash_k_cache.data_ptr() == ptr
+
+    clear_flash_kv_cache(resident.past_key_values)
+    for layer, (k, v) in zip(resident.past_key_values.layers, prefix):
+        torch.testing.assert_close(layer.keys, k, rtol=0, atol=0)
+        torch.testing.assert_close(layer.values, v, rtol=0, atol=0)
+        for value in (layer.keys, layer.values):
+            assert value.untyped_storage().nbytes() == value.numel() * value.element_size()
+            assert value.transpose(1, 2).is_contiguous()
+    # A caller may still read the prefix after retiring the denoise buffers.
+    actual = tiny_model(past_key_values=resident.past_key_values, **kwargs)
+    torch.testing.assert_close(actual.hidden_states, expected.hidden_states, rtol=0, atol=0)
 
 
 @hardware_test(res={"cuda": "L4"})

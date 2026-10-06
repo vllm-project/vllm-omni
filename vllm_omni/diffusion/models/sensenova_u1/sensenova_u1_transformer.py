@@ -131,6 +131,13 @@ def clear_flash_kv_cache(past_key_values):
     if past_key_values is None:
         return
     for layer in past_key_values.layers:
+        # Prefix views still own the denoise suffix. Keep only a compact prefix
+        # when callers retain the cache during output conversion. contiguous()
+        # alone may return the same storage for a single-batch prefix view.
+        if getattr(layer, "flash_k_cache", None) is not None:
+            layer.keys = layer.keys.transpose(1, 2).clone(memory_format=torch.contiguous_format).transpose(1, 2)
+        if getattr(layer, "flash_v_cache", None) is not None:
+            layer.values = layer.values.transpose(1, 2).clone(memory_format=torch.contiguous_format).transpose(1, 2)
         for attr in ("flash_prefix_len", "flash_total_len", "flash_k_cache", "flash_v_cache"):
             if hasattr(layer, attr):
                 delattr(layer, attr)
