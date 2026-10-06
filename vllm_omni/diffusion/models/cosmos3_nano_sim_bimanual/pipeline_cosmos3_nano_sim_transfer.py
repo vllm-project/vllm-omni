@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Offline dense-oracle pipeline for Cosmos3-Nano-Sim-Transfer."""
 
 from __future__ import annotations
@@ -35,6 +36,7 @@ from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.control_contract impor
     TRANSFER_HINTS,
     TransferHint,
 )
+from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.dense_attention import CosmosSimDenseAttentionCache
 from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.geometry import (
     Cosmos3NanoSimBimanualGeometry,
     Cosmos3NanoSimBimanualResolutionPolicy,
@@ -248,6 +250,7 @@ def _trim_transfer_history(
     tokens_per_frame: int,
     window_frames: int,
     sink_frames: int,
+    dense_cache: CosmosSimDenseAttentionCache | None = None,
 ) -> None:
     """Select paired sinks and recent past before the next control forward.
 
@@ -266,7 +269,17 @@ def _trim_transfer_history(
             prefix = tensor[:, :sink_tokens]
             return torch.cat((prefix, tensor[:, -recent_tokens:]), dim=1) if recent_tokens else prefix.clone()
 
-        history[layer_idx] = (select(key), select(value))
+        if dense_cache is None:
+            history[layer_idx] = (select(key), select(value))
+        else:
+            end = dense_cache.text_length + sink_tokens + recent_tokens
+            for buffer, source in zip(dense_cache.kv[layer_idx], (key, value)):
+                if recent_tokens:
+                    # The source tail can overlap its destination; preserve it before shifting.
+                    buffer[:, end - recent_tokens : end].copy_(source[:, -recent_tokens:].clone())
+            history[layer_idx] = tuple(buffer[:, dense_cache.text_length : end] for buffer in dense_cache.kv[layer_idx])
+    if dense_cache is not None:
+        dense_cache.history_length = history[0][0].shape[1]
 
 
 def get_cosmos3_nano_sim_transfer_pre_process_func(od_config: OmniDiffusionConfig):
@@ -447,8 +460,22 @@ class Cosmos3NanoSimTransferPipeline(Cosmos3NanoSimBimanualPipeline):
         return limit
 
     def _prepare_dense_attention(self, state, text_kv, real_text_kv_len, geometry, target_frame):
-        # Transfer retains control/RGB pairs, not the action/video frame layout.
         state.dense_attention = None
+        if self._ar_diffusion_kv_state is not None or self._SESSION_CAPACITY != 1:
+            return
+        frames = target_frame
+        if self.manifest.chunk_size == 1:
+            frames = min(frames, dict(state.fingerprint.conditioning)["window_frames"])
+        # Each temporal frame owns control and generated latent spans, including current scratch.
+        capacity = real_text_kv_len + 2 * frames * geometry.vision_tokens_per_frame
+        cache = getattr(self, "_dense_attention_cache", None)
+        if cache is None:
+            cache = CosmosSimDenseAttentionCache()
+        elif not cache.fits(text_kv, capacity):
+            self.release_captured_graphs()
+        cache.activate(state, text_kv, real_text_kv_len, capacity, state.dense_kv_by_branch.get(self._MAIN_BRANCH))
+        self._dense_attention_cache = cache
+        state.dense_attention = cache
 
     def _append_dense_kv(
         self,
@@ -753,6 +780,7 @@ class Cosmos3NanoSimTransferPipeline(Cosmos3NanoSimBimanualPipeline):
                     tokens_per_frame=geometry.vision_tokens_per_frame,
                     window_frames=conditioning.request.window_frames,
                     sink_frames=conditioning.request.sink_frames,
+                    dense_cache=state.dense_attention,
                 )
         control_chunk = conditioning.control_latents[:, :, chunk_start:chunk_end]
         with self._timed_tick_stage(

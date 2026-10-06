@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Transfer request geometry, prompt, and sliding-history contracts."""
 
 import importlib.util
@@ -155,7 +156,8 @@ def test_chunk4_full_history_contract() -> None:
 
 
 @pytest.mark.parametrize("window,sink", [(1, 0), (2, 1), (4, 0), (4, 2), (30, 3), (51, 1)])
-def test_rollout_history_matches_reference_visibility(window: int, sink: int) -> None:
+@pytest.mark.parametrize("joint", [False, True])
+def test_rollout_history_matches_reference_visibility(window: int, sink: int, joint: bool) -> None:
     p = pipeline()
     state = Cosmos3NanoSimBimanualSessionState(session_id="test")
     geometry = Cosmos3NanoSimBimanualGeometry(height=32, width=32)
@@ -165,6 +167,11 @@ def test_rollout_history_matches_reference_visibility(window: int, sink: int) ->
         None,
     )
     conditioning = _TransferConditioning(request, torch.zeros(1, 48, total, 2, 2))
+    if joint:
+        p._ar_diffusion_kv_state = None
+        state.fingerprint = SimpleNamespace(conditioning=(("window_frames", window),))
+        text = [(torch.zeros(1, 1, 1), torch.zeros(1, 1, 1))]
+        p._prepare_dense_attention(state, text, 1, geometry, total)
     reads = []
 
     def visible() -> list[int]:
@@ -173,7 +180,14 @@ def test_rollout_history_matches_reference_visibility(window: int, sink: int) ->
 
     def commit(label: int) -> None:
         kv = torch.tensor([[[float(label)]]])
-        p._append_dense_kv(state, [(kv, kv)], geometry)
+        cache = state.dense_attention
+        if cache is None:
+            p._append_dense_kv(state, [(kv, kv)], geometry)
+        else:
+            offset = cache.text_length + cache.history_length
+            for buffer in cache.kv[0]:
+                buffer[:, offset : offset + 1].copy_(kv)
+            state.dense_kv_by_branch["main"] = cache.commit(1)
 
     def control_forward(*args, frame_start, **kwargs):
         reads.append(("control", frame_start, visible()))
@@ -221,11 +235,38 @@ def test_rollout_history_matches_reference_visibility(window: int, sink: int) ->
     assert not any(phase == "clean" and frame == total - 1 for phase, frame, _ in reads)
 
 
-def test_transfer_does_not_activate_action_frame_dense_storage() -> None:
-    p = pipeline()
+@pytest.mark.parametrize("chunk,window,target", [(1, 3, 8), (1, 30, 4), (4, 96, 9)])
+def test_transfer_joint_storage_capacity_and_reset(chunk, window, target) -> None:
+    p = pipeline(chunk)
+    p._ar_diffusion_kv_state = None
+    p.release_captured_graphs = lambda: None
+    text = [(torch.randn(1, 5, 2, 8), torch.randn(1, 5, 2, 8))]
+    geometry = Cosmos3NanoSimBimanualGeometry(height=32, width=32)
     state = Cosmos3NanoSimBimanualSessionState(session_id="test")
-    state.dense_attention = object()
-    p._prepare_dense_attention(state, [], 1, Cosmos3NanoSimBimanualGeometry(height=32, width=32), 25)
+    state.fingerprint = SimpleNamespace(conditioning=(("window_frames", window),))
+    p._prepare_dense_attention(state, text, 5, geometry, target)
+    cache = state.dense_attention
+    assert cache is not None
+    frames = min(target, window) if chunk == 1 else target
+    assert cache.kv[0][0].shape[1] == 5 + 2 * frames * geometry.vision_tokens_per_frame
+    address = cache.kv[0][0].data_ptr()
+    cache.commit(geometry.vision_tokens_per_frame)
+    replacement = [(k + 1, v + 2) for k, v in text]
+    state.reset()
+    state.fingerprint = SimpleNamespace(conditioning=(("window_frames", window),))
+    p._prepare_dense_attention(state, replacement, 5, geometry, target)
+    assert state.dense_attention is cache
+    assert cache.history_length == 0 and cache.kv[0][0].data_ptr() == address
+    assert all(torch.equal(a[:, :5], b) for a, b in zip(cache.kv[0], replacement[0]))
+
+
+@pytest.mark.parametrize("paged,sessions", [(True, 1), (False, 2)])
+def test_transfer_joint_storage_requires_single_dense_session(paged, sessions) -> None:
+    p = pipeline()
+    p._ar_diffusion_kv_state = object() if paged else None
+    p._SESSION_CAPACITY = sessions
+    state = Cosmos3NanoSimBimanualSessionState(session_id="test")
+    p._prepare_dense_attention(state, [], 1, None, 1)
     assert state.dense_attention is None
 
 
@@ -263,6 +304,7 @@ def test_prompt_file_relative_to_record_and_cli_override(tmp_path: Path) -> None
         / "examples/offline_inference/cosmos3_nano_sim_bimanual/cosmos3_nano_sim_transfer.py"
     )
     spec = importlib.util.spec_from_file_location("transfer_example", script)
+    assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     caption = {"scene": "robot", "objects": ["arm", "cube"]}
