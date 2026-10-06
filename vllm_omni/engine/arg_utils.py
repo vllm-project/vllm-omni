@@ -188,6 +188,7 @@ class OmniEngineArgs(EngineArgs):
     model_stage: str = "thinker"
     model_arch: str | None = None
     engine_output_type: str | None = None
+    single_stage_pipeline: bool = False
     final_output: bool = False
     hf_config_name: str | None = None
     custom_process_next_stage_input_func: str | None = None
@@ -445,6 +446,7 @@ class OmniEngineArgs(EngineArgs):
             worker_type=self.worker_type,
             pooling_output_decoder=self.pooling_output_decoder,
             engine_output_type=self.engine_output_type,
+            single_stage_pipeline=self.single_stage_pipeline,
             final_output=self.final_output,
             hf_config_name=self.hf_config_name,
             custom_process_next_stage_input_func=self.custom_process_next_stage_input_func,
