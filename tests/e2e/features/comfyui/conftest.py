@@ -50,9 +50,17 @@ def _setup_comfyui_test_environment():
 
         def __init__(self, data: bytes = b"mock_video_data"):
             self._data = data
+            self.save_calls: list[tuple[str, str, float | None]] = []
 
-        def save_to(self, file: str | BinaryIO):
+        def save_to(
+            self,
+            file: str | BinaryIO,
+            format: str = "auto",
+            codec: str = "auto",
+            crf: float | None = None,
+        ):
             """Save video data to file or file-like object."""
+            self.save_calls.append((format, codec, crf))
             if isinstance(file, str):
                 print("Called VideoInput.save_to with file path. Saving to a path is no-op in tests.")
             else:
