@@ -137,8 +137,10 @@ class MiniCPMO45DuplexPolicy:
         instructions: object,
         has_ref_audio: bool,
         initial_user_text: object = None,
+        *,
+        initial_user_text_is_tts: bool = False,
     ) -> tuple[str, str]:
-        """System-context prefix/suffix, matching MiniCPMODuplex.prepare()."""
+        """Native user context, or an explicitly opened Base TTS response."""
         system_prompt = (
             instructions if isinstance(instructions, str) and instructions else "Streaming Omni Conversation."
         )
@@ -148,7 +150,12 @@ class MiniCPMO45DuplexPolicy:
             prefix += "\n<|audio_start|>"
             suffix = "<|audio_end|>" + suffix
         if isinstance(initial_user_text, str) and initial_user_text:
-            suffix += f"\n<|im_start|>user\n{initial_user_text}<|im_end|>\n<|im_start|>assistant\n"
+            # The next native unit supplies the response decision, not a ChatML assistant turn.
+            suffix += f"\n<|im_start|>user\n{initial_user_text}<|im_end|>"
+            if initial_user_text_is_tts:
+                # Base requests literal TTS, not an autonomous response decision.
+                # Match the checkpoint's ordinary TTS response prefix.
+                suffix += "\n<|im_start|>assistant\n<think>\n\n</think>\n\n<|tts_bos|>"
         return prefix, suffix
 
     SPECIAL_TOKEN_FIELDS: dict[str, str] = {

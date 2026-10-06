@@ -18,6 +18,50 @@ def _plugin():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("task_type", [None, "Base", "VoiceDesign"])
+@pytest.mark.parametrize("seed", [None, "What is the capital of France?"])
+async def test_initial_text_task_and_context_budget_are_prepared_together(monkeypatch, task_type, seed):
+    tokenizer = SimpleNamespace(
+        all_special_ids=[90],
+        unk_token_id=-1,
+        eos_token_id=99,
+        encode=lambda text, add_special_tokens=False: [ord(char) for char in text],
+        convert_tokens_to_ids=lambda token: {"<|listen|>": 91}.get(token, -1),
+    )
+    monkeypatch.setattr(module, "_load_tokenizer", lambda config: tokenizer)
+    config = DuplexSessionConfig(
+        modalities=("text",),
+        initial_user_text=seed,
+        extra_body={} if task_type is None else {"task_type": task_type},
+    )
+    runtime = await _plugin().prepare_runtime_config(config, model_config=None)
+    is_tts = seed is not None and task_type == "Base"
+    assert (runtime.get("initial_user_text_is_tts") is True) == is_tts
+    suffix = "".join(map(chr, runtime["duplex_window_suffix_token_ids"]))
+    assert suffix.endswith("\n<|im_start|>assistant\n<think>\n\n</think>\n\n<|tts_bos|>") == is_tts
+    assert runtime["duplex_first_append_context_tokens"] == runtime["duplex_window_prefix_tokens"] + len(suffix)
+
+
+def test_initial_text_task_selector_is_server_owned_and_cannot_change():
+    plugin = _plugin()
+    with pytest.raises(module.MiniCPMO45ClientRuntimeConfigError):
+        plugin.validate_client_extra_body({"initial_user_text_is_tts": True})
+    current = {"initial_user_text": "Read me.", "initial_user_text_is_tts": True}
+    with pytest.raises(module.MiniCPMO45ClientRuntimeConfigError) as exc:
+        plugin.runtime_config_for_update(DuplexSessionConfig(extra_body={"task_type": "VoiceDesign"}), current)
+    assert exc.value.code == "initial_text_task_update_unsupported"
+    updated = plugin.runtime_config_for_update(DuplexSessionConfig(extra_body={"task_type": "Base"}), current)
+    assert updated["initial_user_text_is_tts"] is True
+    updated = plugin.runtime_config_for_update(DuplexSessionConfig(), current)
+    assert updated["initial_user_text_is_tts"] is True
+    with pytest.raises(module.MiniCPMO45ClientRuntimeConfigError) as exc:
+        plugin.runtime_config_for_update(
+            DuplexSessionConfig(extra_body={"task_type": "Base"}), {"initial_user_text": "Read me."}
+        )
+    assert exc.value.code == "initial_text_task_update_unsupported"
+
+
+@pytest.mark.asyncio
 async def test_window_configuration_is_prepared_by_plugin(monkeypatch):
     tokenizer = SimpleNamespace(
         all_special_ids=[90],

@@ -8,7 +8,10 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import re
+import time
 from pathlib import Path
+from typing import TypedDict
 
 import pytest
 import websockets
@@ -30,7 +33,7 @@ from tests.e2e.online_serving.run_minicpmo_realtime_duplex_multi_session import 
     run_multi_session,
 )
 from tests.helpers.mark import hardware_test
-from vllm_omni.clients.duplex import build_realtime_url, metric_mean
+from vllm_omni.clients.duplex import DuplexClient, EventCollector, SessionConfig, build_realtime_url, metric_mean
 from vllm_omni.experimental.fullduplex.video_stacking import concat_frames_b64
 
 pytestmark = pytest.mark.omni
@@ -174,6 +177,13 @@ async def _run_text_only_response_create(
         return await asyncio.wait_for(receive_outcome(), timeout=timeout_s)
 
 
+class _SeededTextResult(TypedDict):
+    audio_bytes: int
+    transcript: str
+    output_text: str
+    event_types: list[str]
+
+
 async def _run_seeded_text_to_audio(
     *,
     url: str,
@@ -183,7 +193,7 @@ async def _run_seeded_text_to_audio(
     modalities: tuple[str, ...] = ("audio", "text"),
     silence_seconds: float = 12.0,
     timeout_s: float = 180.0,
-) -> dict[str, object]:
+) -> _SeededTextResult:
     """Speak a seeded text: the duplex route's text-to-speech shape.
 
     A model-native session takes its text once, in the session context
@@ -416,6 +426,68 @@ def test_duplex_seeded_text_to_text_needs_no_reference_voice(omni_server) -> Non
     assert "response.done" in result["event_types"], result["event_types"]
     produced_text = str(result["output_text"]) or str(result["transcript"])
     assert produced_text.strip(), f"text-only session produced nothing: {result['event_types']}"
+    assert re.search(r"\bparis\b", produced_text, re.IGNORECASE), (
+        f"text-only session did not answer the question: {produced_text!r}"
+    )
+
+
+@pytest.mark.advanced_model
+@hardware_test(res={"cuda": "H100", "npu": "A3"}, num_cards=1)
+@pytest.mark.parametrize("omni_server", SERVER_PARAMS, indirect=True)
+@pytest.mark.parametrize("with_reference", [False, True], ids=["no-reference", "with-reference"])
+def test_duplex_seeded_conditional_watch_remains_silent(omni_server, with_reference: bool) -> None:
+    async def observe() -> tuple[EventCollector, float, float]:
+        config = SessionConfig(
+            modalities=("text",),
+            temperature=0.0,
+            ref_audio=_ref_audio_data_url(str(resolve_ref_audio())) if with_reference else None,
+            extra_body={
+                "force_listen_count": 0,
+                "duplex_initial_user_text": (
+                    "Watch the video and speak only when a red ball appears. Otherwise remain silent."
+                ),
+            },
+        )
+        collector = EventCollector()
+        async with DuplexClient(
+            realtime_url(omni_server),
+            model=omni_server.model,
+            config=config,
+            reconnect=None,
+            heartbeat_interval_s=None,
+            handshake_timeout_s=60.0,
+        ) as client:
+            task = asyncio.create_task(collector.consume(client))
+            await asyncio.sleep(0)
+            started = time.monotonic()
+            try:
+                await client.stream_pcm(bytes(2 * 16_000 * 10), chunk_ms=200, realtime=True)
+                await asyncio.sleep(2.0)
+                observed_until = time.monotonic()
+            finally:
+                await client.close(timeout_s=20.0)
+                await asyncio.wait_for(task, timeout=5.0)
+        return collector, started, observed_until
+
+    collector, started, observed_until = asyncio.run(observe())
+    listen_times = [
+        received - started
+        for event, received in zip(collector.events, collector.event_received_at_s, strict=True)
+        if received <= observed_until
+        and event.get("type") == "response.listen"
+        and isinstance(response := event.get("response"), dict)
+        and isinstance(metadata := response.get("metadata"), dict)
+        and metadata.get("model_listen") is True
+    ]
+    assert not collector.errors(), collector.errors()
+    assert collector.count("session.closed") > 0
+    # A 1035 ms first unit plus steady 1000 ms units fits nine decisions, not ten.
+    assert len(listen_times) >= 9, listen_times
+    assert listen_times[-1] >= 5.0, listen_times
+    assert collector.count("response.speak") == 0
+    assert collector.count("response.output_audio.delta") == 0
+    text_types = {"response.output_text.delta", "response.text.delta", "response.output_audio_transcript.delta"}
+    assert not any(event.get("delta") for event in collector.events if event.get("type") in text_types)
 
 
 @pytest.mark.advanced_model
