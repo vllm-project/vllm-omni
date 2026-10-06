@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import copy
+import logging
 import time
 from collections import defaultdict
 from collections.abc import Callable, Sequence
@@ -851,9 +852,62 @@ class OrchestratorAggregator:
             for cached_key in [k for k in self._replica_cache if k[1] == rid_key]:
                 self._replica_cache.pop(cached_key, None)
 
+    def log_timing_summary(self) -> None:
+        """Emit only the concise per-request ``[OmniTiming]`` lines.
+
+        The serving path uses this unless DEBUG tables are requested; it skips
+        the table rows that ``build_and_log_summary`` builds for its result.
+        """
+        if not self.log_stats:
+            return
+        if logger.isEnabledFor(logging.DEBUG):
+            self.build_and_log_summary()
+            return
+        for rid in sorted(set(self.stage_events.keys()) | {e.request_id for e in self.e2e_events}):
+            e2e_evt = next((e for e in self.e2e_events if e.request_id == rid), None)
+            stage_evts = sorted(
+                self.stage_events.get(rid, []),
+                key=lambda e: e.stage_id if e.stage_id is not None else -1,
+            )
+            self._log_omni_timing(rid, e2e_evt, stage_evts)
+
+    def _log_omni_timing(self, rid: str, e2e_evt: RequestE2EStats | None, stage_evts: list[StageRequestStats]) -> None:
+        pt: dict[str, float] = {}
+        if stage_evts:
+            pt = stage_evts[-1].pipeline_timings or {}
+        if pt or e2e_evt:
+            parts = [f"req={rid}"]
+            if e2e_evt:
+                parts.append(f"total={e2e_evt.e2e_total_ms / 1000.0:.2f}s")
+            if "preprocess_ms" in pt:
+                parts.append(f"preprocess={pt['preprocess_ms'] / 1000.0:.2f}s")
+            if e2e_evt:
+                engine_ms = e2e_evt.e2e_total_ms - pt.get("preprocess_ms", 0.0)
+                parts.append(f"engine={engine_ms / 1000.0:.2f}s")
+            stage_parts = []
+            for evt in stage_evts:
+                sid = evt.stage_id if evt.stage_id is not None else "?"
+                t = evt.stage_gen_time_ms / 1000.0
+                stage_parts.append(f"{sid}:{t:.2f}s")
+            if stage_parts:
+                parts.append(f"stages=[{','.join(stage_parts)}]")
+            transfer_parts = []
+            for te in self.transfer_events.values():
+                if te.request_id == rid:
+                    transfer_parts.append(f"{te.from_stage}->{te.to_stage}={te.tx_time_ms:.2f}ms")
+            if transfer_parts:
+                parts.append(f"transfers=[{','.join(transfer_parts)}]")
+            if "ar2diffusion_ms" in pt:
+                parts.append(f"ar2diffusion={pt['ar2diffusion_ms']:.2f}ms")
+            logger.info("[OmniTiming] %s", " ".join(parts))
+
     def build_and_log_summary(self) -> dict[str, Any]:
         if not self.log_stats:
             return {}
+        # Per-request tables are diagnostic. Formatting them on the serving
+        # event loop costs more than the request's own bookkeeping, so they
+        # are emitted at DEBUG; the concise [OmniTiming] line stays at INFO.
+        log_tables = logger.isEnabledFor(logging.DEBUG)
         wall_time_ms = max(0.0, (self.last_finish_ts - self.wall_start_ts) * 1000.0)
         e2e_avg_req = (wall_time_ms / self.e2e_count) if self.e2e_count > 0 else 0.0
         e2e_avg_tok = (self.e2e_total_tokens * 1000.0 / wall_time_ms) if wall_time_ms > 0 else 0.0
@@ -895,8 +949,8 @@ class OrchestratorAggregator:
             v = overall_summary.get(k, None)
             if v not in (0, 0.0, 0.000, None, ""):
                 overall_fields.append(k)
-        if overall_fields:
-            logger.info(
+        if log_tables and overall_fields:
+            logger.debug(
                 "\n%s",
                 _format_table("Overall Summary", overall_summary, overall_fields),
             )
@@ -921,8 +975,8 @@ class OrchestratorAggregator:
                         nonzero_e2e_fields.add(k)
                 value_fields_e2e = sorted(nonzero_e2e_fields)
 
-                if value_fields_e2e:
-                    logger.info(
+                if log_tables and value_fields_e2e:
+                    logger.debug(
                         "\n%s",
                         _format_table(
                             f"RequestE2EStats [request_id={rid}]",
@@ -936,34 +990,7 @@ class OrchestratorAggregator:
                 self.stage_events.get(rid, []),
                 key=lambda e: e.stage_id if e.stage_id is not None else -1,
             )
-            pt = {}
-            if stage_evts:
-                pt = stage_evts[-1].pipeline_timings or {}
-            if pt or e2e_evt:
-                parts = [f"req={rid}"]
-                if e2e_evt:
-                    parts.append(f"total={e2e_evt.e2e_total_ms / 1000.0:.2f}s")
-                if "preprocess_ms" in pt:
-                    parts.append(f"preprocess={pt['preprocess_ms'] / 1000.0:.2f}s")
-                if e2e_evt:
-                    engine_ms = e2e_evt.e2e_total_ms - pt.get("preprocess_ms", 0.0)
-                    parts.append(f"engine={engine_ms / 1000.0:.2f}s")
-                stage_parts = []
-                for evt in stage_evts:
-                    sid = evt.stage_id if evt.stage_id is not None else "?"
-                    t = evt.stage_gen_time_ms / 1000.0
-                    stage_parts.append(f"{sid}:{t:.2f}s")
-                if stage_parts:
-                    parts.append(f"stages=[{','.join(stage_parts)}]")
-                transfer_parts = []
-                for te in self.transfer_events.values():
-                    if te.request_id == rid:
-                        transfer_parts.append(f"{te.from_stage}->{te.to_stage}={te.tx_time_ms:.2f}ms")
-                if transfer_parts:
-                    parts.append(f"transfers=[{','.join(transfer_parts)}]")
-                if "ar2diffusion_ms" in pt:
-                    parts.append(f"ar2diffusion={pt['ar2diffusion_ms']:.2f}ms")
-                logger.info("[OmniTiming] %s", " ".join(parts))
+            self._log_omni_timing(rid, e2e_evt, stage_evts)
 
             # === Stage table (columns = stage_id) ===
             # if any stage has diffusion_metrics, remove postprocess_time_ms field
@@ -987,7 +1014,7 @@ class OrchestratorAggregator:
 
             result_stage_table.append({"request_id": rid, "stages": stage_rows})
 
-            if stage_rows:
+            if log_tables and stage_rows:
                 # filter out all-zero fields for logging
                 all_value_fields = set()
                 for row in stage_rows:
@@ -1006,7 +1033,7 @@ class OrchestratorAggregator:
                         value_fields_list.append(field)
 
                 if value_fields_list:
-                    logger.info(
+                    logger.debug(
                         "\n%s",
                         _format_table(
                             f"StageRequestStats [request_id={rid}]",
@@ -1027,7 +1054,7 @@ class OrchestratorAggregator:
             ]
             result_trans_table.append({"request_id": rid, "transfers": transfer_rows})
 
-            if transfer_rows:
+            if log_tables and transfer_rows:
                 # filter out all-zero fields for logging
                 all_value_fields = set()
                 for row in transfer_rows:
@@ -1046,7 +1073,7 @@ class OrchestratorAggregator:
                         value_fields_list.append(field)
 
                 if value_fields_list:
-                    logger.info(
+                    logger.debug(
                         "\n%s",
                         _format_table(
                             f"TransferEdgeStats [request_id={rid}]",

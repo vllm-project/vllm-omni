@@ -519,6 +519,40 @@ async def test_async_chunk_prewarm_without_prompt_token_ids_fails_only_that_requ
             orchestrator_fixture.thread.join(timeout=5)
 
 
+@pytest.mark.asyncio
+async def test_streaming_input_to_mrv2_downstream_stage_fails_with_client_error(orchestrator_factory) -> None:
+    """A downstream MRv2 native-data-plane stage supports turn-based requests
+    only: a resumable (realtime) request must fail up front, not hang."""
+    stage0 = FakeStageClient(stage_type="llm", final_output=False)
+    stage1 = FakeStageClient(stage_type="llm", final_output=True)
+    v1 = SimpleNamespace(model_config=SimpleNamespace(max_model_len=64))
+    mrv2 = SimpleNamespace(
+        model_config=SimpleNamespace(max_model_len=64, use_v2_model_runner=True, supports_native_mrv2_data_plane=True)
+    )
+    fixture = orchestrator_factory([stage0, stage1], stage_vllm_configs=[v1, mrv2], async_chunk=True)
+
+    try:
+        await _enqueue_add_request(
+            fixture,
+            request_id="req-stream",
+            prompt=SimpleNamespace(request_id="req-stream", prompt_token_ids=[1, 2], resumable=True),
+            original_prompt={"prompt": "stream"},
+            sampling_params_list=[_sampling_params(), _sampling_params()],
+            final_stage_id=1,
+        )
+
+        error_msg = await _wait_for_error_message(fixture, request_id="req-stream")
+        assert error_msg.fatal is False
+        assert error_msg.status_code == 400
+        assert "stage 1 runs on model_runner v2" in error_msg.error
+        assert stage0.add_request_calls == [] and stage1.add_request_calls == []
+        assert fixture.thread.is_alive()
+    finally:
+        if fixture.thread.is_alive():
+            fixture.request_sync_q.put_nowait(ShutdownRequestMessage())
+            fixture.thread.join(timeout=5)
+
+
 # ───────── Direct unit tests for the fault-isolation helpers ─────────
 
 
@@ -1203,6 +1237,114 @@ async def test_rpc_failure_capture_is_limited_to_pause_and_resume() -> None:
 
         with pytest.raises(TimeoutError):
             await orchestrator._handle_collective_rpc(_msg("rpc-sleep", "sleep"))
+    finally:
+        for q in queues:
+            q.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["reset_mm_cache", "reset_encoder_cache", "reset_prefix_cache"])
+async def test_cache_reset_rpc_failure_is_nonfatal_and_visits_all_replicas(method):
+    clients = [FakeStageClient(stage_type="llm") for _ in range(2)]
+    setattr(clients[0], f"{method}_async", AsyncMock(side_effect=RuntimeError("reset failed")))
+    ok = AsyncMock(return_value=True)
+    setattr(clients[1], f"{method}_async", ok)
+    orchestrator, queues = _build_bare_orchestrator(_build_stage_pools([clients]))
+    try:
+        await orchestrator._handle_collective_rpc(
+            CollectiveRPCRequestMessage(rpc_id="reset", method=method, args=(), kwargs={}, stage_ids=[0], timeout=1.0)
+        )
+        result = queues[2].async_q.get_nowait()
+        assert result.results[0]["supported"] is False
+        assert "reset failed" in result.results[0]["error"]
+        assert result.results[1] is True
+        ok.assert_awaited_once_with()
+        # Errors before StagePool dispatch (e.g. a missing route) must also
+        # be serialized at the orchestrator boundary, then allow another RPC.
+        orchestrator.stage_pools[0].collective_rpc = AsyncMock(side_effect=RuntimeError("route failed"))
+        await orchestrator._handle_collective_rpc(
+            CollectiveRPCRequestMessage(rpc_id="route", method=method, args=(), kwargs={}, stage_ids=[0])
+        )
+        assert all("route failed" in r["error"] for r in queues[2].async_q.get_nowait().results)
+        orchestrator.stage_pools[0].collective_rpc = AsyncMock(return_value=True)
+        await orchestrator._handle_collective_rpc(
+            CollectiveRPCRequestMessage(rpc_id="next", method=method, args=(), kwargs={}, stage_ids=[0])
+        )
+        assert queues[2].async_q.get_nowait().results == [True, True]
+    finally:
+        for q in queues:
+            q.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "method, kwargs, clears",
+    [
+        ("reset_mm_cache", {}, True),
+        ("sleep", {}, True),
+        ("release_kv_cache_memory", {}, True),
+        ("pause_scheduler", {"clear_cache": True}, True),
+        ("pause_scheduler", {"clear_cache": False}, False),
+        ("reset_prefix_cache", {}, False),
+        ("reset_encoder_cache", {}, False),
+    ],
+)
+async def test_control_rpc_clears_only_selected_downstream_sender(method, kwargs, clears):
+    pools = _build_stage_pools([[FakeStageClient(stage_type="llm") for _ in range(2)] for _ in range(2)])
+    orchestrator, queues = _build_bare_orchestrator(pools)
+    events = []
+    renderers = [SimpleNamespace(clear_mm_cache_async=AsyncMock()) for _ in range(2)]
+    renderers[1].clear_mm_cache_async.side_effect = lambda: events.append("sender")
+    orchestrator._stage_input_processors = {i: SimpleNamespace(renderer=r) for i, r in enumerate(renderers)}
+
+    async def rpc(**kwargs):
+        events.append("receiver")
+        return True
+
+    pools[0].collective_rpc = AsyncMock()
+    pools[1].collective_rpc = AsyncMock(side_effect=rpc)
+    try:
+        await orchestrator._handle_collective_rpc(
+            CollectiveRPCRequestMessage(
+                rpc_id="reset", method=method, args=(), kwargs=kwargs, stage_ids=[1], timeout=1.0
+            )
+        )
+        renderers[0].clear_mm_cache_async.assert_not_awaited()
+        pools[0].collective_rpc.assert_not_awaited()
+        assert renderers[1].clear_mm_cache_async.await_count == int(clears)
+        assert events == (["sender"] if clears else []) + ["receiver", "receiver"]
+        assert queues[2].async_q.get_nowait().results == [True, True]
+    finally:
+        for q in queues:
+            q.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["error", "timeout"])
+async def test_downstream_sender_clear_failure_is_nonfatal(failure):
+    pools = _build_stage_pools([[FakeStageClient(stage_type="llm")]])
+    orchestrator, queues = _build_bare_orchestrator(pools)
+
+    async def clear():
+        if failure == "timeout":
+            await asyncio.Event().wait()
+        raise RuntimeError("sender cache failed")
+
+    renderer = SimpleNamespace(clear_mm_cache_async=AsyncMock(side_effect=clear))
+    orchestrator._stage_input_processors[0] = SimpleNamespace(renderer=renderer)
+    pools[0].collective_rpc = AsyncMock(return_value=None)
+    message = CollectiveRPCRequestMessage(
+        rpc_id="reset", method="reset_mm_cache", args=(), kwargs={}, stage_ids=[0], timeout=0.01
+    )
+    try:
+        await orchestrator._handle_collective_rpc(message)
+        result = queues[2].async_q.get_nowait().results[0]
+        assert result["supported"] is False
+        assert ("TimeoutError" if failure == "timeout" else "sender cache failed") in result["error"]
+        pools[0].collective_rpc.assert_not_awaited()
+        renderer.clear_mm_cache_async = AsyncMock()
+        await orchestrator._handle_collective_rpc(message)
+        assert queues[2].async_q.get_nowait().results == [None]
     finally:
         for q in queues:
             q.close()

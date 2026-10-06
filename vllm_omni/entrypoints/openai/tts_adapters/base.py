@@ -17,7 +17,11 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, ClassVar
 
+from vllm.logger import init_logger
+
 from vllm_omni.entrypoints.openai.tts_adapters.capabilities import load_codec_frame_rate, load_supported_speakers
+
+logger = init_logger(__name__)
 
 if TYPE_CHECKING:
     from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
@@ -54,7 +58,12 @@ def resolve_stage_model_path(engine_client: Any) -> str | None:
     return str(model_path) if model_path else None
 
 
-def conditioning_cache_salt(request: "OpenAICreateSpeechRequest", tts_params: dict | None = None) -> str:
+def conditioning_cache_salt(
+    request: "OpenAICreateSpeechRequest",
+    tts_params: dict | None = None,
+    *,
+    registered_voice: tuple[str, int] | None = None,
+) -> str:
     """Stable hash of the real Stage 0 conditioning for the prefix cache.
 
     The talker's vLLM prompt is placeholder token ids; the real inputs are
@@ -67,16 +76,29 @@ def conditioning_cache_salt(request: "OpenAICreateSpeechRequest", tts_params: di
     conditioning such as ``voice_created_at`` and content-aware ref-audio
     cache keys must also be folded in. This distinguishes delete/re-upload of
     the same voice and same-path local audio rewrites without hashing decoded
-    waveform arrays.
+    waveform arrays. An adapter may supply ``registered_voice=(name, created_at)``
+    only after verifying the uploaded voice and excluding inline audio overrides.
+    This replaces the uploaded data URI in the hash without changing the request.
     """
     h = hashlib.sha256()
+    ref_audio: str | list[str] | tuple[str, int] | None = request.ref_audio
+    if (
+        isinstance(ref_audio, str)
+        and len(ref_audio) > 256
+        and tts_params is not None
+        and tts_params.get("ref_audio_cache_key") is not None
+    ):
+        # The resolve key below is already a content-aware digest of this
+        # locator. Hashing a repr of a large inline data URI again dominates
+        # the per-request serving cost without adding information.
+        ref_audio = ("ref_audio_cache_key", len(ref_audio))
     for part in (
         request.input,
         request.task_type,
         request.language,
         request.voice,
         request.ref_text,
-        request.ref_audio,
+        registered_voice if registered_voice is not None else ref_audio,
         request.instructions,
         request.x_vector_only_mode,
         request.speaker_embedding,
@@ -179,6 +201,7 @@ class TTSCapabilities:
     supported_speakers: frozenset[str] = frozenset()
     supported_languages: frozenset[str] = DEFAULT_TTS_LANGUAGES
     codec_frame_rate: float | None = None
+    default_speaker: str | None = None
 
 
 class TTSModelAdapter(ABC):
@@ -308,6 +331,15 @@ class TTSModelAdapter(ABC):
         to unrelated TTS models.
         """
 
+    def collect_response_metadata(self, audio_output: Mapping[str, Any], collect: dict) -> None:
+        """Fold engine-side metadata from the mm payload into ``collect``.
+
+        Non-streaming only. The orchestrator surfaces select ``collect``
+        entries as response headers (precedent: ``word_timestamps`` ->
+        ``X-Word-Timestamps``, ``audio_truncated`` -> ``X-Audio-Truncated``);
+        adapters opt in by setting the keys it knows. Default: no-op.
+        """
+
     async def warmup(self) -> None:
         return
 
@@ -315,19 +347,25 @@ class TTSModelAdapter(ABC):
         return None
 
     def load_capabilities(self) -> TTSCapabilities:
+        speakers_list = list(self._load_supported_speakers())
+        default_speaker = speakers_list[0] if speakers_list else None
+        if default_speaker:
+            logger.info("Default speaker for CustomVoice task: %s", default_speaker)
         self.capabilities = TTSCapabilities(
             precomputed_speakers=self._load_precomputed_speakers(),
-            supported_speakers=frozenset(self._load_supported_speakers()),
+            supported_speakers=frozenset(speakers_list),
             supported_languages=self._load_supported_languages(),
             codec_frame_rate=self._load_codec_frame_rate(),
+            default_speaker=default_speaker,
         )
         return self.capabilities
 
     def _load_precomputed_speakers(self) -> dict[str, dict[str, Any]]:
         return {}
 
-    def _load_supported_speakers(self) -> set[str]:
+    def _load_supported_speakers(self) -> list[str]:
         # Preserve the legacy default path, which reads talker_config.
+        # Returns a list to preserve config order.
         return load_supported_speakers(self.ctx.engine_client)
 
     def _load_supported_languages(self) -> frozenset[str]:

@@ -32,6 +32,7 @@ from vllm_omni.benchmarks.data_modules.omniinteract_dataset import (
     OmniInteractCase,
     OmniInteractPreparedInput,
     case_manifest,
+    sampled_case_row,
 )
 
 # The duplex client library (vllm_omni.clients) is imported lazily inside the
@@ -48,7 +49,7 @@ PCM16_SAMPLE_RATE = 16_000
 PCM16_BYTES_PER_SAMPLE = 2
 OUTPUT_SAMPLE_RATE = 24_000
 SUCCESS_ARTIFACTS = (".done", "output.wav", "wav_transcript.json", "events.json", "result.json")
-BATCH_ARTIFACTS = ("batch_summary.json", "official_eval_manifest.jsonl")
+BATCH_ARTIFACTS = ("batch_summary.json", "official_eval_manifest.jsonl", "sampled_cases.jsonl")
 ARTIFACT_LOCK_FILE = ".omniinteract.lock"
 _INPUT_CHUNK_MS = 200
 # Minimum new played audio between two incremental playback.ack sends for one
@@ -816,6 +817,7 @@ def write_batch_artifacts(
         for case, result in zip(cases, results, strict=True)
         if result.success and result.eligible_for_official_eval
     ]
+    sampled_rows = [sampled_case_row(case) for case in cases]
     ineligible = [result for result in results if result.success and not result.eligible_for_official_eval]
     if ineligible:
         reasons = Counter(
@@ -830,6 +832,12 @@ def write_batch_artifacts(
     _atomic_write_text(
         root / "official_eval_manifest.jsonl",
         "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows),
+    )
+    # Every sampled case (including failed / ineligible) so official MiniCPM-o
+    # ``--video_list`` can replay the same video set without re-deriving ids.
+    _atomic_write_text(
+        root / "sampled_cases.jsonl",
+        "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in sampled_rows),
     )
 
 

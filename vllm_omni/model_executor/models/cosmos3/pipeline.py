@@ -1,21 +1,30 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Cosmos3 policy single-stage topology for online OpenPI serving.
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+"""Cosmos3 opt-in topologies for policy (OpenPI) and omni deploy YAML.
 
-Cosmos3 policy checkpoints (e.g. ``nvidia/Cosmos3-Nano-Policy-DROID``) are one
-diffusion stage: robot observation -> action chunk. They are
-registered in ``OMNI_PIPELINES`` because online OpenPI serving
-(``/v1/realtime/robot/openpi``) requires a registered pipeline so the deploy
-yaml's ``model_config.policy_server_config`` reaches the websocket handshake.
+Both topologies declare neither ``hf_architectures`` nor
+``diffusers_class_name``. Every Cosmos3 checkpoint (T2I, video, policy)
+shares HF metadata (``model_type=cosmos3_omni``, ``model_index.json``
+``_class_name=Cosmos3OmniDiffusersPipeline``). Auto-registering any of them
+under that metadata would capture the others. Select explicitly via a deploy
+yaml ``pipeline:`` key.
 
-This pipeline declares neither ``hf_architectures`` nor
-``diffusers_class_name``: policy checkpoints share their HF metadata
-(``model_type=cosmos3_omni``, ``model_index.json`` ``_class_name=
-Cosmos3OmniDiffusersPipeline``) with the T2I/video Cosmos3 checkpoints, which
-must keep resolving through the default single-stage diffusion fallback.
-Select this pipeline explicitly via a deploy yaml ``pipeline:`` key, e.g.
-``vllm serve nvidia/Cosmos3-Nano-Policy-DROID --omni --deploy-config
-/absolute/path/to/vllm-omni/vllm_omni/deploy/cosmos3_policy_droid.yaml``.
+Policy (``cosmos3_policy``)::
+
+    vllm serve nvidia/Cosmos3-Nano-Policy-DROID --omni \\
+      --deploy-config .../vllm_omni/deploy/cosmos3_policy_droid.yaml
+
+Omni deploy overlay (``cosmos3_omni_deploy``) — makes ``--deploy-config``
+apply stage / ``model_config`` (e.g. ``guardrails: false``) instead of being
+silently dropped (#6874). Same overlay works for Super / Nano (T2I and video).
+``final_output_type`` matches the CLI Cosmos3OmniDiffusersPipeline default
+(``video``)::
+
+    vllm serve nvidia/Cosmos3-Super --omni \\
+      --deploy-config .../vllm_omni/deploy/cosmos3_omni.yaml
+
+Without ``--deploy-config``, T2I/video keep the default single-stage
+diffusion CLI fallback. ``--no-guardrails`` remains the CLI-only path.
 """
 
 from vllm_omni.config.stage_config import (
@@ -35,6 +44,22 @@ COSMOS3_POLICY_PIPELINE = PipelineConfig(
             input_sources=(),
             final_output=True,
             final_output_type="action",
+            model_arch="Cosmos3OmniDiffusersPipeline",
+        ),
+    ),
+)
+
+COSMOS3_OMNI_DEPLOY_PIPELINE = PipelineConfig(
+    model_type="cosmos3_omni_deploy",
+    model_arch="Cosmos3OmniDiffusersPipeline",
+    stages=(
+        StagePipelineConfig(
+            stage_id=0,
+            model_stage="diffusion",
+            execution_type=StageExecutionType.DIFFUSION,
+            input_sources=(),
+            final_output=True,
+            final_output_type="video",
             model_arch="Cosmos3OmniDiffusersPipeline",
         ),
     ),

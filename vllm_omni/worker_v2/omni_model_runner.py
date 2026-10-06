@@ -9,6 +9,7 @@ import threading
 from typing import TYPE_CHECKING, Any, cast
 
 import torch
+from torch.utils._pytree import tree_flatten, tree_unflatten
 from vllm.config.compilation import CUDAGraphMode
 from vllm.forward_context import (
     set_forward_context,
@@ -55,6 +56,16 @@ def _needs_capture_tensor_unwrap(model: Any) -> bool:
     return bool(getattr(model, "_returns_tuple", False))
 
 
+def _supports_full_graph_aux_outputs(model: Any) -> bool:
+    """Tuple-returning model whose auxiliary output FULL graphs may replay.
+
+    The model declares ``supports_mrv2_full_graph_aux_outputs`` when its
+    auxiliary output is a tensor-only pytree with the same structure for every
+    batch shape and each leaf's leading dimension is the token axis.
+    """
+    return _needs_capture_tensor_unwrap(model) and bool(getattr(model, "supports_mrv2_full_graph_aux_outputs", False))
+
+
 class OmniGPUModelRunner(GPUModelRunner):
     """Thin layer over v2 ``GPUModelRunner`` for Omni lifecycle hooks."""
 
@@ -62,14 +73,48 @@ class OmniGPUModelRunner(GPUModelRunner):
     encoder_cache: EncoderCache | None
     _native_output_materializer: NativeOutputWorker | None
     model_state: OmniModelState
+    vocab_size: int
+    use_aux_hidden_state_outputs: bool
     _last_aux_output: Any
     _last_multimodal_outputs: dict[str, Any] | None
     _model_returns_tuple: bool
+    # FULL-graph aux-output contract (see _configure_cudagraph_output_contract).
+    _full_graph_aux_outputs = False
+    _aux_output_spec: Any = None
 
     def _configure_cudagraph_output_contract(self) -> None:
         """Select the CUDA graph output contract declared by the model."""
         self._model_returns_tuple = _needs_capture_tensor_unwrap(self.model)
-        self._exclude_full_graph = self._model_returns_tuple or hasattr(self.model, "_last_captured_layers")
+        # FULL replay returns what capture stored: the hidden states and, for a
+        # declared tuple model, its auxiliary pytree flattened to leaves.
+        self._full_graph_aux_outputs = _supports_full_graph_aux_outputs(self.model)
+        self._aux_output_spec = None
+        self._exclude_full_graph = (self._model_returns_tuple and not self._full_graph_aux_outputs) or hasattr(
+            self.model, "_last_captured_layers"
+        )
+
+    def _split_fullgraph_output(self, replayed: Any) -> tuple[Any, Any]:
+        """FULL replay output -> ``(hidden_states, aux pytree or None)``."""
+        if self._full_graph_aux_outputs and isinstance(replayed, tuple):
+            hidden, leaves = replayed
+            return hidden, tree_unflatten(list(leaves), self._aux_output_spec)
+        return replayed, None
+
+    def _flatten_capture_aux_output(self, model_output: Any) -> tuple[torch.Tensor, list[torch.Tensor]]:
+        """``(hidden, aux pytree)`` -> ``(hidden, leaves)`` for the graph manager's aux buffers."""
+        hidden, aux = model_output
+        leaves, spec = tree_flatten(aux)
+        num_tokens = hidden.shape[0]
+        if not leaves or any(not isinstance(leaf, torch.Tensor) or leaf.shape[:1] != (num_tokens,) for leaf in leaves):
+            raise RuntimeError(
+                f"{type(self.model).__name__} declares supports_mrv2_full_graph_aux_outputs, but its auxiliary "
+                "output is not a non-empty tensor pytree on the token axis"
+            )
+        if self._aux_output_spec is None:
+            self._aux_output_spec = spec
+        elif spec != self._aux_output_spec:
+            raise RuntimeError(f"{type(self.model).__name__} auxiliary output structure changed between captures")
+        return hidden, leaves
 
     @staticmethod
     def _prepare_cudagraph_capture_output(model_output: Any) -> Any:
@@ -171,10 +216,16 @@ class OmniGPUModelRunner(GPUModelRunner):
         # With no new requests, its UVA snapshots remain valid and immutable.
         # Keep the upstream path for custom/speculative samplers, whose staged
         # writes may have a different lifecycle.
-        if not scheduler_output.scheduled_new_reqs and type(getattr(self, "sampler", None)) is Sampler:
+        sampler = getattr(self, "sampler", None)
+        if not scheduler_output.scheduled_new_reqs and (
+            type(sampler) is Sampler or getattr(sampler, "omni_static_staged_writes", False)
+        ):
             return
         logits_processor = getattr(self.model, "logits_processor", None)
         logits_vocab = getattr(logits_processor, "vocab_size", None)
+        if logits_vocab is None:
+            # Narrow model heads without a vLLM LogitsProcessor (codec heads).
+            logits_vocab = getattr(self.model, "logits_vocab_size", None)
         if isinstance(logits_vocab, int) and logits_vocab > 0:
             for request_data in scheduler_output.scheduled_new_reqs:
                 sampling_params = request_data.sampling_params
@@ -186,6 +237,9 @@ class OmniGPUModelRunner(GPUModelRunner):
         super().add_requests(scheduler_output)
 
     def shutdown(self) -> None:
+        sender = getattr(getattr(self, "model_state", None), "_first_audio_sender", None)
+        if sender is not None:
+            sender.close()
         # Every owner must release its resources even if an earlier drain fails.
         try:
             worker = getattr(self, "_native_output_materializer", None)
@@ -286,9 +340,17 @@ class OmniGPUModelRunner(GPUModelRunner):
     def load_model(self, *args: Any, **kwargs: Any) -> None:
         import vllm.v1.worker.gpu.model_runner as _mr_module
 
+        def _init_model_state(vllm_config: Any, model: Any, encoder_cache: Any, device: Any) -> Any:
+            # Runs after the model is built and before the sampler is: a model
+            # whose logits head is narrower than its HF config reports (the
+            # MiniCPM-o codec Talker's config has no vocab_size at all) sizes
+            # the MRv2 sampler and request state by that head.
+            self._adopt_model_logits_vocab(model)
+            return init_omni_model_state(vllm_config, model, encoder_cache, device)
+
         with _model_state_patch_lock:
             _orig = _mr_module.init_model_state
-            _mr_module.init_model_state = init_omni_model_state
+            _mr_module.init_model_state = _init_model_state
             try:
                 super().load_model(*args, **kwargs)
             finally:
@@ -301,6 +363,18 @@ class OmniGPUModelRunner(GPUModelRunner):
         if getattr(self.model, "has_preprocess", False) and self.supports_mm_inputs:
             self.supports_mm_inputs = False
             self.encoder_cache = None
+
+    def _adopt_model_logits_vocab(self, model: Any) -> None:
+        vocab = getattr(model, "logits_vocab_size", None)
+        if not isinstance(vocab, int) or vocab <= 0 or vocab == self.vocab_size:
+            return
+        logger.info("Sizing the MRv2 sampler by the model's logits head: vocab %s -> %d", self.vocab_size, vocab)
+        self.vocab_size = vocab
+        self.req_states.vocab_size = vocab
+        # Kernel warmup sizes its structured-output bitmask from the config.
+        arch_config = getattr(self.model_config, "model_arch_config", None)
+        if arch_config is not None and getattr(arch_config, "vocab_size", vocab) != vocab:
+            arch_config.vocab_size = vocab
 
     # ------------------------------------------------------------------
     # CUDA Graph: conditionally exclude FULL mode
@@ -317,7 +391,7 @@ class OmniGPUModelRunner(GPUModelRunner):
         }
         logger.info("Excluded FULL CUDA graph capture for Omni model. PIECEWISE graphs will still be captured.")
 
-    def capture_model(self) -> int:
+    def capture_model(self, *, profile_only: bool = False) -> int:
         """Handle CUDA graph capture for Omni models.
 
         Tuple-returning models use PIECEWISE graphs; FULL replay requires
@@ -333,25 +407,45 @@ class OmniGPUModelRunner(GPUModelRunner):
             self._exclude_unsupported_full_graphs()
 
         # Wrap model forward during capture so tuple returns don't crash
-        # torch.empty_like() in the PIECEWISE warmup pass.
+        # torch.empty_like() in the PIECEWISE warmup pass. A model with the
+        # FULL aux-output contract instead hands the graph manager its leaves,
+        # which it keeps in persistent buffers and returns on replay.
         if self._model_returns_tuple:
             original_forward = self.model.forward
+            aux_outputs = self._full_graph_aux_outputs
 
             def _capture_forward(*args: Any, **kwargs: Any) -> Any:
                 output = original_forward(*args, **kwargs)
+                if aux_outputs:
+                    return self._flatten_capture_aux_output(output)
                 return self._prepare_cudagraph_capture_output(output)
 
             self.model.forward = _capture_forward  # type: ignore[assignment]
+            use_aux = self.use_aux_hidden_state_outputs
+            self.use_aux_hidden_state_outputs = use_aux or aux_outputs
             try:
-                result = super().capture_model()
+                result = super().capture_model(profile_only=profile_only)
             finally:
                 self.model.forward = original_forward  # type: ignore[assignment]
+                self.use_aux_hidden_state_outputs = use_aux
         else:
-            result = super().capture_model()
+            result = super().capture_model(profile_only=profile_only)
+
+        if profile_only:
+            # Upstream discards captures in its temporary profiling pool.
+            # Model-owned graphs must be recorded during the real capture.
+            return result
 
         capture_mtp = getattr(getattr(self, "model_state", None), "capture_mtp_graphs", None)
         if callable(capture_mtp):
             capture_mtp(self._dispatch_mtp_batch_descriptor)
+        capture_first_frame = getattr(self.model, "capture_first_frame_graphs", None)
+        if callable(capture_first_frame):
+            capture_first_frame()
+        capture_stream = getattr(self.model, "capture_stream_decode_graphs", None)
+        if callable(capture_stream):
+            sizes = [int(s) for s in self.model_state._get_mtp_capture_sizes()]
+            capture_stream(sorted(set(sizes + [1])))
         return result
 
     def _dispatch_mtp_batch_descriptor(self, num_mtp_reqs: int) -> Any:
@@ -405,6 +499,7 @@ class OmniGPUModelRunner(GPUModelRunner):
         is_profile: bool = False,
         context_len: int = 0,
         valid_dummy_state_slots: bool = False,
+        randomize_inputs: bool = False,
     ) -> Any:
         if not dummy_run:
             self._prepare_native_data_plane(scheduler_output)
@@ -414,6 +509,8 @@ class OmniGPUModelRunner(GPUModelRunner):
             self.update_requests(scheduler_output)
             self._sync_native_data_plane_payloads(scheduler_output)
             self.block_tables.apply_staged_writes()
+            if self.aux_output_connector is not None:
+                self.aux_output_connector.begin_step(scheduler_output.aux_output_connector_metadata)
             if scheduler_output.total_num_scheduled_tokens == 0:
                 empty_output = self.kv_connector.no_forward(scheduler_output)
                 return self._attach_native_data_plane_signals(
@@ -455,7 +552,7 @@ class OmniGPUModelRunner(GPUModelRunner):
 
         if not dummy_run:
             assert batch_req_state is not None
-            input_batch = self.prepare_inputs(scheduler_output, batch_req_state, batch_desc)
+            input_batch = self.prepare_inputs(scheduler_output, batch_req_state, batch_desc, num_active_loras)
             block_tables, slot_mappings = self.prepare_attn(input_batch)
             self.model_state.preprocess_state(
                 input_batch,
@@ -479,7 +576,10 @@ class OmniGPUModelRunner(GPUModelRunner):
                 batch_desc.num_tokens,
                 self.input_buffers,
                 max_query_len=batch_desc.max_query_len,
+                is_padding=not is_profile,
             )
+            if randomize_inputs:
+                input_batch.input_ids.random_(0, self.vocab_size)
             if not skip_attn_for_dummy_run:
                 block_tables, slot_mappings = self.prepare_dummy_attn(input_batch, valid_dummy_state_slots)
                 if context_len:
@@ -548,9 +648,9 @@ class OmniGPUModelRunner(GPUModelRunner):
             # inputs_embeds buffer above.
             assert self.cudagraph_manager is not None
             self.kv_connector.pre_forward(scheduler_output)
-            hidden_states = self.cudagraph_manager.run_fullgraph(batch_desc)
-            self._last_aux_output = None
+            replayed = self.cudagraph_manager.run_fullgraph(batch_desc)
             self._last_multimodal_outputs = None
+            hidden_states, self._last_aux_output = self._split_fullgraph_output(replayed)
             if hasattr(self.model, "_last_captured_layers"):
                 self.model._last_captured_layers = self._last_aux_output
         else:
@@ -596,11 +696,6 @@ class OmniGPUModelRunner(GPUModelRunner):
         if not dummy_run and isinstance(hidden_states, torch.Tensor):
             self.model_state.run_postprocess(hidden_states, input_batch)
 
-        routed_experts = None
-        if not dummy_run and (capturer := self.routed_experts_capturer) is not None:
-            assert slot_mappings is not None
-            routed_experts = capturer.get_routed_experts(slot_mappings, num_toks)
-
         self.execute_model_state = ExecuteModelState(
             input_batch=input_batch,
             attn_metadata=attn_metadata,
@@ -610,7 +705,6 @@ class OmniGPUModelRunner(GPUModelRunner):
             finished_req_ids=scheduler_output.finished_req_ids,
             dp_sync=dp_sync,
             ec_connector_output=ec_connector_output,
-            routed_experts=routed_experts,
             cudagraph_stats=None,
         )
 
@@ -661,7 +755,16 @@ class OmniGPUModelRunner(GPUModelRunner):
             # Request-owned state outlives generation slots and chunk boundaries.
             # Notify even if the last chunk already released its runner slot.
             on_finished(finished)
+        finish_state = getattr(self.model_state, "on_requests_finished", None)
+        if finished and callable(finish_state):
+            finish_state(finished)
         preempted = scheduler_output.preempted_req_ids
+        suspend_state = getattr(self.model_state, "on_request_preempted", None)
+        if preempted and callable(suspend_state):
+            for req_id in preempted - finished:
+                idx = self.req_states.req_id_to_index.get(req_id)
+                if idx is not None:
+                    suspend_state(req_id, idx)
         all_done = finished | preempted if preempted else finished
         for req_id in all_done:
             idx = self.req_states.req_id_to_index.get(req_id)

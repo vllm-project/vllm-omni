@@ -8,12 +8,17 @@ import numpy as np
 import pytest
 import torch
 
+from tests.model_executor.models.personaplex.test_prefill_embeddings import _make_talker, _reference_prefill
+from vllm_omni.model_executor.models.personaplex.configuration_personaplex import PersonaPlexConfig
 from vllm_omni.model_executor.models.personaplex.duplex.policy import (
     SILENCE_TOKENS,
     SINE_TOKENS,
 )
 from vllm_omni.model_executor.models.personaplex.duplex.stage0 import (
+    PersonaPlexStage0CapacityError,
     PersonaPlexStage0DuplexRuntime,
+    PersonaPlexStage0PreparedAppend,
+    PersonaPlexStage0StaleEpochError,
 )
 from vllm_omni.model_executor.models.personaplex.personaplex_talker import (
     PersonaPlexTalkerForConditionalGeneration,
@@ -23,20 +28,30 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 class _FakeCodec:
+    """Shared streaming encoder whose code for a row is that row's frame count."""
+
     def __init__(self) -> None:
         self.encode_calls = 0
-        self.reset_calls = 0
+        self.reset_slots: list[int] = []
+        self.frames: list[int] = []
 
     def streaming_init(self, batch_size: int) -> None:
-        assert batch_size == 1
+        self.frames = [0] * batch_size
 
-    def encode_frame(self, pcm: torch.Tensor) -> torch.Tensor:
-        assert pcm.shape == (1, 1920)
+    def encode_frame(self, pcm: torch.Tensor, active: torch.Tensor) -> torch.Tensor:
+        assert pcm.shape == (len(self.frames), 1920)
+        assert active.shape == (len(self.frames),)
         self.encode_calls += 1
-        return torch.full((1, 8), self.encode_calls, dtype=torch.long)
+        codes = torch.zeros((len(self.frames), 8), dtype=torch.long)
+        for row, is_active in enumerate(active.tolist()):
+            if is_active:
+                self.frames[row] += 1
+                codes[row] = self.frames[row]
+        return codes
 
-    def reset_streaming(self) -> None:
-        self.reset_calls += 1
+    def reset_slot(self, row: int) -> None:
+        self.reset_slots.append(row)
+        self.frames[row] = 0
 
 
 class _FakeTalker:
@@ -80,13 +95,12 @@ class _FakeTalker:
         return torch.full((1, 4), value, device=device)
 
 
-def _duplex_info(*, seq: int, session_id: str = "session", incarnation: int = 1):
+def _duplex_info(*, seq: int, session_id: str = "session", epoch: int = 0):
     pcm = np.zeros(1920, dtype="<f4")
     return {
         "data_plane": True,
         "session_id": session_id,
-        "incarnation": incarnation,
-        "epoch": 0,
+        "epoch": epoch,
         "seq": seq,
         "payload": {
             "format": "pcm_f32le",
@@ -101,20 +115,14 @@ def _duplex_info(*, seq: int, session_id: str = "session", incarnation: int = 1)
     }
 
 
-def _runtime(*codecs: _FakeCodec) -> PersonaPlexStage0DuplexRuntime:
+def _runtime(codec: _FakeCodec, max_sessions: int = 1) -> PersonaPlexStage0DuplexRuntime:
     voice_embeddings = torch.arange(8, dtype=torch.float32).reshape(2, 1, 1, 4)
-    codec_args = {"codec": codecs[0]}
-    if len(codecs) > 1:
-        available = iter(codecs)
-        codec_args = {
-            "codec_factory": lambda: next(available),
-            "max_sessions": len(codecs),
-        }
     return PersonaPlexStage0DuplexRuntime(
         _FakeTalker(),
         model_path="/unused",
         device="cpu",
-        **codec_args,
+        codec=codec,
+        max_sessions=max_sessions,
         tokenizer=lambda _text: [7, 8, 9],
         voice_loader=lambda _voice: {
             "embeddings": voice_embeddings,
@@ -139,6 +147,33 @@ def test_first_append_prepends_voice_and_persona_once() -> None:
     assert second.user_codes.shape == (2, 8)
     assert second.inputs_embeds.shape == (1, 4)
     assert codec.encode_calls == 2
+
+
+@torch.inference_mode()
+def test_first_append_uses_real_prefill_embeddings_once(monkeypatch, mocker) -> None:
+    runtime = _runtime(_FakeCodec())
+    device = torch.device("cpu")
+    talker = _make_talker(device, torch.float32, PersonaPlexConfig(temporal_config={"hidden_size": 4}))
+    prefill = mocker.spy(talker, "_build_prefill_embed")
+    # Exercise real prefill while retaining the codec/live-frame fixture.
+    monkeypatch.setattr(runtime.stage_model, "_build_prefill_embed", prefill)
+    first = runtime.prepare_append(_duplex_info(seq=1), prompt_len=18)
+    second = runtime.prepare_append(_duplex_info(seq=2), prompt_len=18)
+    expected = _reference_prefill(
+        talker,
+        torch.tensor([3] * 6 + [7, 8, 9] + [3] * 6),
+        0,
+        15,
+        device,
+        torch.tensor(SILENCE_TOKENS),
+        torch.tensor(SINE_TOKENS),
+    )
+    prefill.assert_called_once()
+    assert torch.equal(first.inputs_embeds[:2], torch.arange(8, dtype=torch.float32).reshape(2, 4))
+    assert torch.equal(first.inputs_embeds[2:17].view(torch.uint8), expected.view(torch.uint8))
+    assert first.inputs_embeds.shape == (18, 4)
+    assert second.inputs_embeds.shape == (1, 4)
+    assert second.prefill_applied is False
 
 
 @pytest.mark.parametrize(
@@ -248,24 +283,27 @@ def test_decoded_pcm_is_writable_for_torch_zero_copy() -> None:
 
 def _prepare_two_sessions(
     runtime: PersonaPlexStage0DuplexRuntime,
-) -> tuple[object, object, object, object]:
+) -> tuple[
+    PersonaPlexStage0PreparedAppend,
+    PersonaPlexStage0PreparedAppend,
+    PersonaPlexStage0PreparedAppend,
+    PersonaPlexStage0PreparedAppend,
+]:
     first_1 = runtime.prepare_append(_duplex_info(seq=1), prompt_len=18)
     second_1 = runtime.prepare_append(
-        _duplex_info(seq=1, session_id="other", incarnation=2),
+        _duplex_info(seq=1, session_id="other"),
         prompt_len=18,
     )
     first_2 = runtime.prepare_append(_duplex_info(seq=2), prompt_len=19)
     second_2 = runtime.prepare_append(
-        _duplex_info(seq=2, session_id="other", incarnation=2),
+        _duplex_info(seq=2, session_id="other"),
         prompt_len=19,
     )
     return first_1, second_1, first_2, second_2
 
 
 def test_live_sessions_keep_independent_streaming_encoders() -> None:
-    first_codec = _FakeCodec()
-    second_codec = _FakeCodec()
-    runtime = _runtime(first_codec, second_codec)
+    runtime = _runtime(_FakeCodec(), max_sessions=2)
 
     first_1, second_1, first_2, second_2 = _prepare_two_sessions(runtime)
 
@@ -276,28 +314,226 @@ def test_live_sessions_keep_independent_streaming_encoders() -> None:
 
 
 def test_stage0_session_capacity_fails_before_codec_state_is_shared() -> None:
-    runtime = _runtime(_FakeCodec(), _FakeCodec())
+    runtime = _runtime(_FakeCodec(), max_sessions=2)
     _prepare_two_sessions(runtime)
 
     with pytest.raises(RuntimeError, match="capacity 2"):
         runtime.prepare_append(
-            _duplex_info(seq=1, session_id="third", incarnation=3),
+            _duplex_info(seq=1, session_id="third"),
             prompt_len=18,
         )
 
 
-def test_close_session_resets_and_reuses_released_codec() -> None:
-    first_codec = _FakeCodec()
-    second_codec = _FakeCodec()
-    runtime = _runtime(first_codec, second_codec)
+def test_close_session_resets_only_its_row_and_reuses_it() -> None:
+    codec = _FakeCodec()
+    runtime = _runtime(codec, max_sessions=2)
     _prepare_two_sessions(runtime)
+    closed_slot = runtime.sessions[("session", 0)].slot
+    other_slot = runtime.sessions[("other", 0)].slot
 
-    runtime.close_session("session", 1)
+    runtime.close_session("session", 0)
 
-    assert first_codec.reset_calls == 1
-    assert second_codec.reset_calls == 0
+    assert codec.reset_slots == [closed_slot]
     replacement = runtime.prepare_append(
-        _duplex_info(seq=1, session_id="replacement", incarnation=4),
+        _duplex_info(seq=1, session_id="replacement"),
         prompt_len=18,
     )
-    assert replacement.user_codes[:, 0].tolist() == [3]
+    assert runtime.sessions[("replacement", 0)].slot == closed_slot
+    assert replacement.user_codes[:, 0].tolist() == [1]
+    assert codec.frames[other_slot] == 2
+
+
+def test_a_new_epoch_replays_the_prefill_and_recycles_the_codec() -> None:
+    codec = _FakeCodec()
+    runtime = _runtime(codec)
+    runtime.prepare_append(_duplex_info(seq=1), prompt_len=18, request_id="req-e0")
+    runtime.prepare_append(_duplex_info(seq=2), prompt_len=19, request_id="req-e0")
+
+    # A cancel advanced the fence: the next append is seq 1 of epoch 1 on a
+    # fresh Stage 0 request, so the voice/persona prefill is replayed and the
+    # earlier epoch's lockstep state is released first.
+    restarted = runtime.prepare_append(_duplex_info(seq=1, epoch=1), prompt_len=18, request_id="req-e1")
+
+    assert restarted.prefill_applied is True
+    assert restarted.prompt_offset == 0
+    assert restarted.user_codes.shape == (1, 8)
+    assert list(runtime.sessions) == [("session", 1)]
+    assert runtime.request_sessions == {"req-e1": ("session", 1)}
+    assert codec.reset_slots == [0]
+    assert runtime.sessions[("session", 1)].slot == 0
+
+
+def test_a_late_finish_of_the_old_epoch_request_does_not_close_the_new_state() -> None:
+    runtime = _runtime(_FakeCodec())
+    runtime.prepare_append(_duplex_info(seq=1), prompt_len=18, request_id="req-e0")
+    runtime.prepare_append(_duplex_info(seq=1, epoch=1), prompt_len=18, request_id="req-e1")
+
+    runtime.close_request("req-e0")
+
+    assert list(runtime.sessions) == [("session", 1)]
+    runtime.close_request("req-e1")
+    assert runtime.sessions == {}
+
+
+def test_stage0_capacity_counts_live_epochs_not_superseded_ones() -> None:
+    runtime = _runtime(_FakeCodec(), max_sessions=2)
+    runtime.prepare_append(_duplex_info(seq=1), prompt_len=18)
+    runtime.prepare_append(_duplex_info(seq=1, session_id="other"), prompt_len=18)
+
+    # Restarting one session must not need a third encoder row.
+    runtime.prepare_append(_duplex_info(seq=1, epoch=1), prompt_len=18)
+
+    assert sorted(runtime.sessions) == [("other", 0), ("session", 1)]
+
+
+def test_encode_appends_batches_sessions_into_one_encoder_call() -> None:
+    codec = _FakeCodec()
+    runtime = _runtime(codec, max_sessions=4)
+
+    runtime.encode_appends([_duplex_info(seq=1), _duplex_info(seq=1, session_id="other")])
+    first = runtime.prepare_append(_duplex_info(seq=1), prompt_len=18)
+    other = runtime.prepare_append(_duplex_info(seq=1, session_id="other"), prompt_len=18)
+
+    assert codec.encode_calls == 1
+    assert first.user_codes[:, 0].tolist() == [1]
+    assert other.user_codes[:, 0].tolist() == [1]
+
+
+def test_encode_appends_leaves_rows_without_a_new_append_untouched() -> None:
+    codec = _FakeCodec()
+    runtime = _runtime(codec, max_sessions=2)
+    runtime.prepare_append(_duplex_info(seq=1), prompt_len=18)
+    runtime.prepare_append(_duplex_info(seq=1, session_id="other"), prompt_len=18)
+    other_slot = runtime.sessions[("other", 0)].slot
+
+    runtime.encode_appends([_duplex_info(seq=2)])
+    runtime.prepare_append(_duplex_info(seq=2), prompt_len=19)
+
+    assert codec.frames[other_slot] == 1
+    assert runtime.sessions[("session", 0)].user_codes[:, 0].tolist() == [1, 2]
+
+
+def test_encode_appends_skips_an_identity_that_was_already_encoded_or_prepared() -> None:
+    codec = _FakeCodec()
+    runtime = _runtime(codec)
+
+    # A chunked first prefill puts the same append in two scheduler steps.
+    runtime.encode_appends([_duplex_info(seq=1)])
+    runtime.encode_appends([_duplex_info(seq=1)])
+    runtime.prepare_append(_duplex_info(seq=1), prompt_len=18)
+    runtime.encode_appends([_duplex_info(seq=1)])
+    retry = runtime.prepare_append(_duplex_info(seq=1), prompt_len=18)
+
+    assert codec.encode_calls == 1
+    assert retry.user_codes[:, 0].tolist() == [1]
+
+
+def test_encode_appends_leaves_over_capacity_appends_to_prepare_append() -> None:
+    codec = _FakeCodec()
+    runtime = _runtime(codec)
+
+    runtime.encode_appends([_duplex_info(seq=1), _duplex_info(seq=1, session_id="other")])
+
+    assert list(runtime.sessions) == [("session", 0)]
+    with pytest.raises(RuntimeError, match="capacity 1"):
+        runtime.prepare_append(_duplex_info(seq=1, session_id="other"), prompt_len=18)
+
+
+def _restart_overlap(runtime: PersonaPlexStage0DuplexRuntime) -> tuple[dict, dict]:
+    """Epoch 0 of a session is live, then a cancel restarts it as epoch 1 while
+    epoch 0's aborted request still has an append in the same scheduler step."""
+    runtime.prepare_append(_duplex_info(seq=1), prompt_len=18, request_id="req-e0")
+    runtime.prepare_append(_duplex_info(seq=2), prompt_len=19, request_id="req-e0")
+    return _duplex_info(seq=3), _duplex_info(seq=1, epoch=1)
+
+
+@pytest.mark.parametrize("max_sessions", [1, 2])
+@pytest.mark.parametrize("encode_old_first", [True, False])
+@pytest.mark.parametrize("prepare_old_first", [True, False])
+def test_cancel_overlap_full_processing_order_never_re_leases_the_aborted_epoch(
+    max_sessions: int, encode_old_first: bool, prepare_old_first: bool
+) -> None:
+    codec = _FakeCodec()
+    runtime = _runtime(codec, max_sessions=max_sessions)
+    old, new = _restart_overlap(runtime)
+
+    # One scheduler step: batched encode, then per-request prepare, then sampling.
+    runtime.encode_appends([old, new] if encode_old_first else [new, old])
+    order = [("req-e0", old, 19), ("req-e1", new, 18)]
+    restarted = None
+    for request_id, duplex, prompt_len in order if prepare_old_first else order[::-1]:
+        if request_id == "req-e0":
+            with pytest.raises(PersonaPlexStage0StaleEpochError):
+                runtime.prepare_append(duplex, prompt_len=prompt_len, request_id=request_id)
+        else:
+            restarted = runtime.prepare_append(duplex, prompt_len=prompt_len, request_id=request_id)
+    for request_id in ("req-e0", "req-e1"):
+        runtime.record_sample(request_id=request_id, text_token=5, agent_codes=list(range(8)))
+    runtime.close_request("req-e0")  # the engine's late finish of the aborted request
+
+    assert list(runtime.sessions) == [("session", 1)]
+    assert len(runtime._free_slots) == max_sessions - 1
+    assert restarted is not None and restarted.user_codes[:, 0].tolist() == [1]
+    assert codec.encode_calls == 3
+    assert runtime.sessions[("session", 1)].sampled_identity == (1, 1)
+
+
+def test_codec_init_failure_propagates_after_one_attempt() -> None:
+    attempts = 0
+
+    def failing_codec():
+        nonlocal attempts
+        attempts += 1
+        raise RuntimeError("CUDA out of memory while building the Mimi encoder")
+
+    runtime = PersonaPlexStage0DuplexRuntime(
+        _FakeTalker(),
+        model_path="/unused",
+        device="cpu",
+        codec_factory=failing_codec,
+        max_sessions=16,
+        tokenizer=lambda _text: [7, 8, 9],
+        voice_loader=lambda _voice: {},
+    )
+    appends = [_duplex_info(seq=1, session_id=f"s{i}") for i in range(16)]
+
+    with pytest.raises(RuntimeError, match="out of memory"):
+        runtime.encode_appends(appends)
+    assert attempts == 1
+    assert not runtime.sessions
+
+
+def test_capacity_error_is_a_dedicated_exception() -> None:
+    runtime = _runtime(_FakeCodec(), max_sessions=1)
+    runtime.prepare_append(_duplex_info(seq=1), prompt_len=18)
+
+    with pytest.raises(PersonaPlexStage0CapacityError, match="capacity 1"):
+        runtime.prepare_append(_duplex_info(seq=1, session_id="other"), prompt_len=18)
+
+
+def test_talker_gives_the_aborted_epoch_a_neutral_row_in_the_same_step() -> None:
+    codec = _FakeCodec()
+    runtime = _runtime(codec, max_sessions=1)
+    old, new = _restart_overlap(runtime)
+    talker = PersonaPlexTalkerForConditionalGeneration.__new__(PersonaPlexTalkerForConditionalGeneration)
+    torch.nn.Module.__init__(talker)
+    talker._personaplex_duplex_stage0_runtime = runtime
+    talker._dtype = torch.float32
+    talker.mtp_hidden_size = 4
+
+    infos = {
+        "req-e0": {"duplex": old, "request_id": "req-e0", "duplex_prompt_len": 19, "duplex_token_offset": 0},
+        "req-e1": {"duplex": new, "request_id": "req-e1", "duplex_prompt_len": 18, "duplex_token_offset": 0},
+    }
+    talker.preprocess_batch(req_ids=list(infos), model_intermediate_buffer=infos, device=torch.device("cpu"))
+    outs = {
+        req: talker.preprocess(torch.zeros(1, dtype=torch.long), None, _omni_is_prefill=True, **info)
+        for req, info in infos.items()
+    }
+
+    _, stale_embeds, stale_info = outs["req-e0"]
+    assert stale_info["duplex"] == {"stage0_stale": True}
+    assert torch.count_nonzero(stale_embeds) == 0
+    assert stale_info["pplex_depformer_audio_tokens"].numel() == 16
+    assert outs["req-e1"][2]["duplex"]["epoch"] == 1
+    assert list(runtime.sessions) == [("session", 1)]

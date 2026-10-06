@@ -102,7 +102,11 @@ def _make_state(request_id: str, model, branch, video_rows, audio_rows, sigmas_v
     state.latents = video_rows.clone()
     state.timesteps = torch.tensor([1.0 - sigma for sigma in sigmas_video[:-1]], dtype=torch.float32)
     state.step_index = 0
+    from vllm_omni.diffusion.models.minimax_h3.sampling import create_h3_sample_solver
+
     state.extra = {
+        mod._STEP_VIDEO_SOLVER: create_h3_sample_solver("euler", sigmas_video),
+        mod._STEP_AUDIO_SOLVER: create_h3_sample_solver("euler", sigmas_audio),
         mod._STEP_BRANCH: branch,
         # Co-batched requests must share one DiT instance, or denoise_step()
         # treats the batch as mixed-task and falls back to one forward each.
@@ -169,6 +173,41 @@ def test_step_execution_matches_request_mode_denoise_loop(num_steps, mocker):
     assert state.total_steps == steps
     torch.testing.assert_close(state.latents, reference_video)
     torch.testing.assert_close(state.extra[mod._STEP_AUDIO_ROWS], reference_audio)
+
+
+def test_request_mode_cancellation_stops_before_next_denoise_step(monkeypatch):
+    from vllm_omni.diffusion.cancellation import RequestCancellationRegistry, request_cancellation_scope
+    from vllm_omni.diffusion.data import DiffusionRequestAbortedError
+    from vllm_omni.diffusion.models.minimax_h3.denoise_loop import minimax_h3_denoise_loop
+    from vllm_omni.platforms import current_omni_platform
+
+    # This test runs real packing/Euler updates on CPU with the small DiT above.
+    monkeypatch.setattr(current_omni_platform, "synchronize", lambda: None)
+    branch, video_rows, audio_rows = _make_branch(text_len=9, latent_t=2, latent_h=4, latent_w=6, audio_t=3, seed=5)
+    registry = RequestCancellationRegistry()
+    signal = registry.create("request")
+    steps = []
+
+    def cancel_after_first_step(step, video, audio):
+        steps.append(step)
+        registry.cancel(["request"])
+
+    try:
+        with request_cancellation_scope([signal]), pytest.raises(DiffusionRequestAbortedError):
+            minimax_h3_denoise_loop(
+                model=_SegmentMeanModel(),
+                positive=branch,
+                initial_video_rows=video_rows,
+                initial_audio_rows=audio_rows,
+                keyframe_cond_rows=None,
+                sigmas_video=_sigmas(6, 12.0),
+                sigmas_audio=_sigmas(6, 3.0),
+                device=torch.device("cpu"),
+                on_step=cancel_after_first_step,
+            )
+    finally:
+        registry.close()
+    assert steps == [0]
 
 
 def test_step_execution_matches_request_mode_with_latent_edits():

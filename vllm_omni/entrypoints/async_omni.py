@@ -41,10 +41,13 @@ if TYPE_CHECKING:
     from vllm.tokenizers import TokenizerLike
     from vllm.v1.engine import PauseMode
     from vllm.v1.engine.input_processor import InputProcessor
+    from vllm.v1.kv_hints import KvHintsEnvelope
 
     from vllm_omni.inputs.data import OmniInteractionPrompt, OmniPromptType
 
 logger = init_logger(__name__)
+
+CACHE_RESET_TIMEOUT_S = 60.0
 
 
 class AsyncOmni(AsyncOmniBase, EngineClient):
@@ -123,9 +126,11 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         priority: int = 0,
         data_parallel_rank: int | None = None,
         session_id: str | None = None,
+        kv_hints: KvHintsEnvelope | None = None,
         reasoning_ended: bool | None = None,
         reasoning_parser_kwargs: dict[str, Any] | None = None,
         arrival_time: float | None = None,
+        submitted: asyncio.Future[None] | None = None,
     ) -> AsyncGenerator[OmniRequestOutput, None]:
         """Generate outputs for the given prompt(s) asynchronously.
 
@@ -275,6 +280,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
                     arrival_time=wall_start_ts,
                     lora_request=lora_request,
                     first_chunk_submitted=first_chunk_submitted,
+                    **({"kv_hints": kv_hints} if kv_hints is not None else {}),
                 )
                 await first_chunk_submitted
             else:
@@ -286,6 +292,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
                     final_output_stage_ids=final_output_stage_ids,
                     arrival_time=wall_start_ts,
                     lora_request=lora_request,
+                    **({"kv_hints": kv_hints} if kv_hints is not None else {}),
                 )
             submit_ts = time.time()
             stage_first_ts = cast(list[float | None], req_state.metrics.stage_first_ts)
@@ -294,6 +301,9 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
             if admitting:
                 await self._release_generate_admission()
                 admitting = False
+            # Callers wait on this before abort so Stage0 observes the sender cache.
+            if submitted is not None and not submitted.done():
+                submitted.set_result(None)
             # Refresh gauges on arrival.
             self._publish_request_gauges(len(self.request_states))
 
@@ -359,6 +369,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         arrival_time: float,
         lora_request: Any = None,
         first_chunk_submitted: asyncio.Future[None] | None = None,
+        kv_hints: KvHintsEnvelope | None = None,
     ) -> asyncio.Task:
         """Submit a streaming input generator as incremental stage-0 updates."""
         if not sampling_params_list:
@@ -369,6 +380,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         stage0_params = cast(SamplingParams, stage0_params)
         req_state = self.request_states[request_id]
         has_submitted_first_chunk = False
+        input_error_reported = False
 
         # NOTE: InputProcessor in vLLM should generally do this too, but for
         # now we do it defensively. TODO (Alex) ensure clones/copying are optimized
@@ -379,6 +391,21 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         def _mark_first_chunk_submitted() -> None:
             if first_chunk_submitted is not None and not first_chunk_submitted.done():
                 first_chunk_submitted.set_result(None)
+
+        async def _report_input_error(error: Exception) -> None:
+            nonlocal input_error_reported
+            if input_error_reported:
+                return
+            input_error_reported = True
+            status_code, error_type = client_error_metadata(error)
+            await req_state.queue.put(
+                ErrorMessage(
+                    request_id=request_id,
+                    error=str(error),
+                    status_code=status_code,
+                    error_type=error_type,
+                )
+            )
 
         async def handle_inputs() -> None:
             nonlocal has_submitted_first_chunk
@@ -404,6 +431,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
                                 arrival_time=arrival_time,
                                 lora_request=lora_request,
                                 resumable=True,
+                                **({"kv_hints": kv_hints} if kv_hints is not None else {}),
                             )
                         )
                         has_submitted_first_chunk = True
@@ -425,15 +453,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
             except (asyncio.CancelledError, GeneratorExit):
                 cancelled = True
             except Exception as error:
-                status_code, error_type = client_error_metadata(error)
-                await req_state.queue.put(
-                    ErrorMessage(
-                        request_id=request_id,
-                        error=str(error),
-                        status_code=status_code,
-                        error_type=error_type,
-                    )
-                )
+                await _report_input_error(error)
             finally:
                 try:
                     if not cancelled:
@@ -469,12 +489,15 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
                                     arrival_time=arrival_time,
                                     lora_request=lora_request,
                                     resumable=False,
+                                    **({"kv_hints": kv_hints} if kv_hints is not None else {}),
                                 )
                             )
                             has_submitted_first_chunk = True
+                except Exception as error:
+                    await _report_input_error(error)
                 finally:
                     # Unblock generate() even on cancel / empty stream / submit
-                    # failure so it can observe a terminal abort or empty result.
+                    # failure so it can observe the queued terminal result or error.
                     _mark_first_chunk_submitted()
 
         input_stream_task = asyncio.create_task(handle_inputs())
@@ -535,17 +558,15 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
             stage_ids=stage_ids,
         )
 
-        unsupported_stage_ids: list[int] = []
-        effective_stage_ids = stage_ids or list(range(len(results)))
-        for index, result in enumerate(results):
-            if isinstance(result, dict) and result.get("todo"):
-                unsupported_stage_ids.append(effective_stage_ids[index])
-
-        if unsupported_stage_ids:
+        unsupported_results = [
+            index for index, result in enumerate(results) if isinstance(result, dict) and result.get("todo")
+        ]
+        if unsupported_results:
             logger.warning(
-                "[AsyncOmni] collective_rpc(%s) has TODO support on stage(s): %s",
+                "[AsyncOmni] collective_rpc(%s) has TODO support in replica result(s) %s (requested stages: %s)",
                 method,
-                unsupported_stage_ids,
+                unsupported_results,
+                stage_ids,
             )
 
         return results
@@ -557,23 +578,28 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         stage_ids: list[int],
         args: tuple[Any, ...] = (),
         kwargs: dict[str, Any] | None = None,
+        timeout: float | None = None,
     ) -> list[Any]:
-        """Call an engine control helper via collective_rpc (orchestrator loop).
-
-        StagePool resolves ``{method}_async`` on the AR client when present
-        (vLLM AsyncMPClient convention); diffusion stages answer the same
-        method names inside DiffusionEngine. Raises if any replica reports
-        failure.
-        """
+        """Call EngineCore helpers and reject failures from any replica."""
+        timeout_kwargs = {"timeout": timeout} if timeout is not None else {}
         results = await self.collective_rpc(
             method=method,
             args=args,
             kwargs=kwargs,
             stage_ids=stage_ids,
+            **timeout_kwargs,
         )
+
+        def check_result(result: Any) -> None:
+            if isinstance(result, (list, tuple)):
+                for item in result:
+                    check_result(item)
+            elif isinstance(result, dict):
+                if result.get("error") or result.get("todo") or result.get("supported") is False:
+                    raise RuntimeError(f"{method} failed: {result}")
+
         for result in results:
-            if isinstance(result, dict) and result.get("error"):
-                raise RuntimeError(f"{method} failed: {result['error']}")
+            check_result(result)
         return results
 
     @staticmethod
@@ -768,13 +794,8 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
 
         # Frontend / sender-side cache clear (P0). EngineCore.pause_scheduler
         # already clears AR-side caches when clear_cache=True.
-        if clear_cache:
-            await self.reset_prefix_cache(
-                reset_running_requests=not wait_for_inflight_requests,
-                reset_connector=True,
-            )
-            await self.reset_mm_cache()
-            await self.reset_encoder_cache()
+        if clear_cache and 0 in ar_stage_ids:
+            await self._clear_frontend_mm_cache()
 
     async def resume_generation(self, stage_ids: list[int] | None = None) -> None:
         """Resume generation after :meth:`pause_generation`."""
@@ -835,34 +856,85 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         """
         return await self.collective_rpc(method="profile", args=(False, None), stage_ids=stages)
 
-    async def reset_mm_cache(self) -> None:
-        """Reset the frontend (P0) multimodal processor cache.
-
-        ``EngineCore.sleep(level>=1)`` already clears the P1 receiver cache.
-        Clearing P0 avoids hash-only follow-up requests after that reset.
-        """
+    async def _clear_frontend_mm_cache(self) -> None:
+        """Clear P0 through the renderer's serialized multimodal executor."""
         renderer = self.renderer
         if renderer is not None:
             await renderer.clear_mm_cache_async()
 
-    async def reset_encoder_cache(self) -> None:
-        """Reset the encoder cache for all stages.
+    async def reset_mm_cache(
+        self, *, stage_ids: list[int] | None = None, timeout: float = CACHE_RESET_TIMEOUT_S
+    ) -> None:
+        """Reset sender and receiver MM caches on selected AR stages.
 
-        TODO: Forward to Orchestrator process via message.
+        By default all AR stages are selected; diffusion stages are skipped.
+        Stage 0's sender is the frontend renderer. Downstream senders are
+        cleared by the orchestrator before resetting their engine cores.
+        Call while generation is paused to avoid racing new inputs.
         """
-        logger.warning("[AsyncOmni] reset_encoder_cache not yet supported with Orchestrator process")
+        ar_stage_ids, _ = self._split_stage_ids_by_type(stage_ids)
+        if 0 in ar_stage_ids:
+            await asyncio.wait_for(self._clear_frontend_mm_cache(), timeout=timeout)
+        if ar_stage_ids:
+            await self._engine_core_rpc("reset_mm_cache", stage_ids=ar_stage_ids, timeout=timeout)
+
+    async def reset_encoder_cache(
+        self, *, stage_ids: list[int] | None = None, timeout: float = CACHE_RESET_TIMEOUT_S
+    ) -> None:
+        """Reset encoder caches on selected AR stages (all by default).
+
+        Diffusion stages are skipped. RPC failures are raised to the caller.
+        """
+        ar_stage_ids, _ = self._split_stage_ids_by_type(stage_ids)
+        if ar_stage_ids:
+            await self._engine_core_rpc("reset_encoder_cache", stage_ids=ar_stage_ids, timeout=timeout)
 
     async def reset_prefix_cache(
         self,
         reset_running_requests: bool = False,
         reset_connector: bool = False,
+        *,
+        stage_ids: list[int] | None = None,
+        timeout: float = CACHE_RESET_TIMEOUT_S,
     ) -> bool:
-        """Reset the prefix cache for all stages.
+        """Reset prefix caches on selected AR stages (all by default).
 
-        TODO: Forward to Orchestrator process via message.
+        Diffusion stages are skipped. Return False if a stage cannot reset
+        its cache; unsupported operations and RPC failures raise instead of
+        silently retaining KV computed under previous model weights.
         """
-        logger.warning("[AsyncOmni] reset_prefix_cache not yet supported with Orchestrator process")
-        return True
+        ar_stage_ids, _ = self._split_stage_ids_by_type(stage_ids)
+        if not ar_stage_ids:
+            return True
+        results = await self._engine_core_rpc(
+            "reset_prefix_cache",
+            stage_ids=ar_stage_ids,
+            args=(reset_running_requests, reset_connector),
+            timeout=timeout,
+        )
+        return all(self._coerce_stage_bool(result) for result in results)
+
+    async def release_kv_cache_memory(
+        self, *, stage_ids: list[int] | None = None, timeout: float = CACHE_RESET_TIMEOUT_S
+    ) -> None:
+        """Discard AR-stage KV memory after a completed generation pause.
+
+        EngineCore checks that the scheduler is paused and all executor
+        memory is resident. Diffusion stages have no KV cache to release.
+        Restore KV memory with ``wake_up(tags=["kv_cache"])`` before resuming.
+        """
+        ar_stage_ids, _ = self._split_stage_ids_by_type(stage_ids)
+        if not ar_stage_ids:
+            return
+        async with self._pause_cond:
+            if not self._paused:
+                raise RuntimeError("release_kv_cache_memory() requires a completed pause first")
+            await self._pause_cond.wait_for(lambda: getattr(self, "_admitting", 0) == 0)
+        if 0 in ar_stage_ids:
+            await asyncio.wait_for(self._clear_frontend_mm_cache(), timeout=timeout)
+        await self._engine_core_rpc("release_kv_cache_memory", stage_ids=ar_stage_ids, timeout=timeout)
+        self._record_stage_sleep(ar_stage_ids, [CuMemTag.KV_CACHE.value])
+        self._hold_admission_until_resume = True
 
     async def sleep(
         self, stage_ids: list[int] | None = None, level: int = 2, mode: PauseMode = "abort"
@@ -887,6 +959,12 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         engines have no EngineCore pause to hold, so ``wake_up`` restores
         admission and ``sleep → wake → generate`` keeps working.
         """
+        # Validate before touching admission state. Raising after
+        # ``_paused = True`` would wedge generate() for good: nothing was
+        # slept, so wake_up() has no tags to restore and never reaches the
+        # block that clears ``_paused``.
+        ar_stage_ids, diffusion_stage_ids = self._split_stage_ids_by_type(stage_ids)
+
         # Block admission before any sleep RPC so generate() waits on
         # _pause_cond during the drain/offload window. Wait until generate()
         # coroutines that already passed the pause check have submitted (or
@@ -894,12 +972,12 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         async with self._pause_cond:
             self._paused = True
             await self._pause_cond.wait_for(lambda: getattr(self, "_admitting", 0) == 0)
-
-        # P0 sender cache must drop hashes before EngineCore.sleep clears P1.
-        await self.reset_mm_cache()
+        # EngineCore.sleep resets receiver caches itself; only clear P0 here.
+        if 0 in ar_stage_ids:
+            await self._clear_frontend_mm_cache()
 
         self._final_output_handler()
-        ar_stage_ids, diffusion_stage_ids = self._split_stage_ids_by_type(stage_ids)
+        sleep_tags = [CuMemTag.WEIGHTS.value, CuMemTag.KV_CACHE.value]
         final_acks: list[OmniACK] = []
         if ar_stage_ids:
             self._hold_admission_until_resume = True
@@ -928,16 +1006,23 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
                 )
                 for sid in ar_stage_ids
             )
+            self._record_stage_sleep(ar_stage_ids, sleep_tags)
+            if level == 2:
+                self._level2_sleeping = True
 
         if diffusion_stage_ids:
-            final_acks.extend(await self._sleep_diffusion(diffusion_stage_ids, level))
+            acks: list[OmniACK] = []
+            try:
+                acks = await self._sleep_diffusion(diffusion_stage_ids, level)
+            finally:
+                # A failed sleep may have released part of a stage, so wake_up must still reach it.
+                self._record_stage_sleep(diffusion_stage_ids, sleep_tags)
+                # Level 2 has discarded weights only where a replica finished its sleep.
+                if level == 2 and any(self._diffusion_ack_error(ack) is None for ack in acks):
+                    self._level2_sleeping = True
+            self._raise_on_diffusion_errors("handle_sleep_task", acks)
+            final_acks.extend(acks)
 
-        self._record_stage_sleep(
-            ar_stage_ids + diffusion_stage_ids,
-            [CuMemTag.WEIGHTS.value, CuMemTag.KV_CACHE.value],
-        )
-        if level == 2:
-            self._level2_sleeping = True
         return final_acks
 
     async def _sleep_diffusion(self, stage_ids: list[int], level: int) -> list[OmniACK]:
@@ -949,14 +1034,44 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         logger.info("[%s] Sleep (diffusion) initiated (Task: %s).", self._name, task_id)
         task = OmniSleepTask(level=level, task_id=task_id)
         rpc_results = await self.collective_rpc(method="handle_sleep_task", args=(task,), stage_ids=stage_ids)
+        return await self._resolve_diffusion_acks(rpc_results)
+
+    async def _resolve_diffusion_acks(self, rpc_results: list[Any]) -> list[OmniACK]:
+        """Resolve the ACKs of a diffusion worker RPC."""
         final_acks: list[OmniACK] = []
         for stage_res in rpc_results:
             worker_acks = stage_res if isinstance(stage_res, list) else [stage_res]
             for ack in worker_acks:
-                if ack is not None:
+                if ack is None:
+                    continue
+                # StagePool's result for a failed RPC has no task_id to resolve.
+                if not isinstance(ack, dict) or "task_id" in ack:
                     await self.event_resolver.resolve(ack)
-                    final_acks.append(ack)
+                final_acks.append(ack)
         return final_acks
+
+    @classmethod
+    def _raise_on_diffusion_errors(cls, method: str, acks: list[OmniACK]) -> None:
+        errors = [error for ack in acks if (error := cls._diffusion_ack_error(ack))]
+        if errors:
+            raise RuntimeError(f"{method} failed: {'; '.join(errors)}")
+
+    @staticmethod
+    def _diffusion_ack_error(ack: OmniACK | dict[str, Any]) -> str | None:
+        # In-process stages return OmniACK, subprocess stages return its dict form,
+        # and StagePool returns {"supported": False, "error": ...} when the RPC failed.
+        if isinstance(ack, dict):
+            status, error_msg, rpc_error = ack.get("status"), ack.get("error_msg"), ack.get("error")
+            # A subprocess RPC error arrives as {"error": True, "reason": ...}.
+            if rpc_error is True:
+                rpc_error = ack.get("reason") or "RPC failed"
+            if not rpc_error and (ack.get("todo") or ack.get("supported") is False):
+                rpc_error = str(ack)
+        else:
+            status, error_msg, rpc_error = getattr(ack, "status", None), getattr(ack, "error_msg", None), None
+        if status == "ERROR":
+            return error_msg or "worker reported ERROR"
+        return rpc_error
 
     async def wake_up(self, stage_ids: list[int] | None = None, tags: list[str] | None = None) -> list[OmniACK]:
         """Wake stages after sleep.
@@ -1012,11 +1127,14 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
                 )
                 for sid in ar_stage_ids
             )
+            self._clear_stage_sleep(ar_stage_ids, requested_tags)
 
+        for sid in diffusion_stage_ids:
+            final_acks.extend(await self._wake_diffusion([sid], requested_tags))
+            self._clear_stage_sleep([sid], requested_tags)
         if diffusion_stage_ids:
-            final_acks.extend(await self._wake_diffusion(diffusion_stage_ids, requested_tags))
+            await asyncio.sleep(0.1)
 
-        self._clear_stage_sleep(target_stage_ids, requested_tags)
         # Only clear the level-2 flag once all tags are warm, in case partial
         # wake support (e.g. tags=["kv_cache"] only) is added in the future.
         if not getattr(self, "_sleeping_tags", None):
@@ -1043,22 +1161,19 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         logger.info("[%s] Wake-up (diffusion) initiated (Task: %s).", self._name, task_id)
         task = OmniWakeTask(tags=requested_tags, task_id=task_id)
         rpc_results = await self.collective_rpc(method="handle_wake_task", args=(task,), stage_ids=stage_ids)
-        final_acks: list[OmniACK] = []
-        for stage_res in rpc_results:
-            worker_acks = stage_res if isinstance(stage_res, list) else [stage_res]
-            for ack in worker_acks:
-                if ack is not None:
-                    await self.event_resolver.resolve(ack)
-                    final_acks.append(ack)
-        await asyncio.sleep(0.1)
-        return final_acks
+        acks = await self._resolve_diffusion_acks(rpc_results)
+        self._raise_on_diffusion_errors("handle_wake_task", acks)
+        return acks
 
-    async def is_sleeping(self) -> bool:
-        """Return whether all stages are sleeping.
+    async def is_sleeping(self, stage_ids: list[int] | None = None) -> bool:
+        """Return whether all stages are sleeping, or with ``stage_ids``,
+        whether any of those stages is recorded as sleeping.
 
         TODO(AsyncOmni): query the orchestrator once all stage backends expose
         a real sleeping-state RPC. For now we track the requested state locally.
         """
+        if stage_ids is not None:
+            return bool(self._sleeping_tags_for_stages(stage_ids))
         return bool(getattr(self, "_sleeping_tags", None))
 
     async def add_lora(self, lora_request: LoRARequest) -> bool:

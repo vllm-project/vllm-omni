@@ -15,11 +15,12 @@ import pytest
 import torch
 from vllm.model_executor.models.utils import PPMissingLayer, make_empty_intermediate_tensors_factory, make_layers
 from vllm.sequence import IntermediateTensors
+from vllm.utils.network_utils import get_file_store_init_method
 from vllm.v1.worker.gpu_worker import AsyncIntermediateTensors
 
 import vllm_omni.diffusion.distributed.pipeline_parallel as pp_module
+from tests.helpers.distributed import collective_context, start_collective_workers
 from tests.helpers.mark import hardware_marks
-from tests.helpers.runtime import get_distributed_init_method
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.parallel_state import (
     destroy_distributed_env,
@@ -37,6 +38,25 @@ _L4_FOUR_GPU = hardware_marks(res={"cuda": ["L4", "B200"]}, num_cards=4)
 
 DeviceKind = Literal["cpu", "cuda"]
 _UNIT_MARKS = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
+
+
+@pytest.fixture(autouse=True)
+def _restore_collective_platforms():
+    """CPU baselines run in the parent process; retain its original platforms."""
+    import vllm.platforms
+
+    from vllm_omni.diffusion.distributed import comm, group_coordinator, parallel_state
+
+    original_platform = vllm.platforms.current_platform
+    original_omni_platforms = {
+        module: module.current_omni_platform for module in (comm, group_coordinator, parallel_state)
+    }
+    try:
+        yield
+    finally:
+        vllm.platforms.current_platform = original_platform
+        for module, platform in original_omni_platforms.items():
+            module.current_omni_platform = platform
 
 
 def _cleanup_distributed() -> None:
@@ -409,6 +429,10 @@ def init_dist(
     device = _worker_device(local_rank, device_kind)
     if device_kind == "cuda":
         current_omni_platform.set_device(device)
+    else:
+        from tests.helpers.distributed import configure_cpu_collective_worker
+
+        configure_cpu_collective_worker()
     backend = "gloo" if device_kind == "cpu" else None
     init_distributed_environment(
         world_size=world_size,
@@ -500,13 +524,14 @@ def isend_irecv_worker(
 
 
 def _run_isend_irecv(pp_size: int, device_kind: DeviceKind, init_method: str) -> None:
-    mp_context = torch.multiprocessing.get_context("spawn")
+    mp_context = collective_context(device_kind)
     manager = mp_context.Manager()
     q = manager.Queue()
-    torch.multiprocessing.spawn(
+    start_collective_workers(
         isend_irecv_worker,
         args=(pp_size, init_method, device_kind, q),
         nprocs=pp_size,
+        device_kind=device_kind,
     )
     results = {label: tensor for label, tensor in [q.get(), q.get()]}
     torch.testing.assert_close(
@@ -520,7 +545,7 @@ def _run_isend_irecv(pp_size: int, device_kind: DeviceKind, init_method: str) ->
 @pytest.mark.parametrize("pp_size", [2])
 def test_isend_irecv_tensor_dict(pp_size: int):
     """isend_tensor_dict / irecv_tensor_dict transfer a tensor dict without loss."""
-    _run_isend_irecv(pp_size, device_kind="cpu", init_method=get_distributed_init_method())
+    _run_isend_irecv(pp_size, device_kind="cpu", init_method=get_file_store_init_method())
 
 
 @pytest.mark.full_model
@@ -529,7 +554,7 @@ def test_isend_irecv_tensor_dict(pp_size: int):
 @pytest.mark.parametrize("pp_size", [pytest.param(2, marks=_L4_TWO_GPU)])
 def test_isend_irecv_tensor_dict_parity(pp_size: int):
     """Nightly: isend/irecv on real multi-GPU NCCL."""
-    _run_isend_irecv(pp_size, device_kind="cuda", init_method=get_distributed_init_method())
+    _run_isend_irecv(pp_size, device_kind="cuda", init_method=get_file_store_init_method())
 
 
 # ---------------------------------------------------------------------------
@@ -560,7 +585,7 @@ def compute_single_gpu_baseline(
     if key in _baseline_cache:
         return _baseline_cache[key]
 
-    device = init_dist(0, 1, get_distributed_init_method(), device_kind)
+    device = init_dist(0, 1, get_file_store_init_method(), device_kind)
     try:
         initialize_model_parallel(pipeline_parallel_size=1, backend=_mp_backend(device_kind))
 
@@ -656,15 +681,16 @@ def _run_predict_noise(
 
     baseline_out = compute_single_gpu_baseline(test_config, dtype, do_true_cfg, device_kind)
 
-    mp_context = torch.multiprocessing.get_context("spawn")
+    mp_context = collective_context(device_kind)
     manager = mp_context.Manager()
     pp_q = manager.Queue()
 
     world_size = pp_size * cfg_size
-    torch.multiprocessing.spawn(
+    start_collective_workers(
         predict_noise_worker,
         args=(world_size, init_method, pp_size, cfg_size, do_true_cfg, dtype, test_config, device_kind, pp_q),
         nprocs=world_size,
+        device_kind=device_kind,
     )
 
     pp_out = pp_q.get()
@@ -768,7 +794,7 @@ def test_predict_noise(pp_size, cfg_size, do_true_cfg, num_layers, input_seed, r
         rtol=rtol,
         atol=atol,
         device_kind="cpu",
-        init_method=get_distributed_init_method(),
+        init_method=get_file_store_init_method(),
     )
 
 
@@ -791,7 +817,7 @@ def test_predict_noise_parity(pp_size, cfg_size, do_true_cfg, dtype, num_layers,
         rtol=rtol,
         atol=atol,
         device_kind="cuda",
-        init_method=get_distributed_init_method(),
+        init_method=get_file_store_init_method(),
     )
 
 
@@ -806,7 +832,7 @@ def compute_scheduler_step_baseline(
     device_kind: DeviceKind,
 ) -> torch.Tensor:
     """Single-process reference: predict_noise + scheduler_step."""
-    device = init_dist(0, 1, get_distributed_init_method(), device_kind)
+    device = init_dist(0, 1, get_file_store_init_method(), device_kind)
     try:
         initialize_model_parallel(pipeline_parallel_size=1, backend=_mp_backend(device_kind))
 
@@ -900,15 +926,16 @@ def _run_scheduler_step(
 
     baseline = compute_scheduler_step_baseline(test_config, do_true_cfg, device_kind)
 
-    mp_context = torch.multiprocessing.get_context("spawn")
+    mp_context = collective_context(device_kind)
     manager = mp_context.Manager()
     q = manager.Queue()
 
     world_size = pp_size * cfg_size
-    torch.multiprocessing.spawn(
+    start_collective_workers(
         scheduler_step_worker,
         args=(world_size, init_method, pp_size, cfg_size, do_true_cfg, test_config, device_kind, q),
         nprocs=world_size,
+        device_kind=device_kind,
     )
 
     result = q.get()
@@ -939,7 +966,7 @@ def test_scheduler_step(pp_size, cfg_size, do_true_cfg, input_seed):
         do_true_cfg=do_true_cfg,
         input_seed=input_seed,
         device_kind="cpu",
-        init_method=get_distributed_init_method(),
+        init_method=get_file_store_init_method(),
     )
 
 
@@ -961,5 +988,5 @@ def test_scheduler_step_parity(pp_size, cfg_size, do_true_cfg, input_seed):
         do_true_cfg=do_true_cfg,
         input_seed=input_seed,
         device_kind="cuda",
-        init_method=get_distributed_init_method(),
+        init_method=get_file_store_init_method(),
     )

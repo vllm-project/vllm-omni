@@ -249,8 +249,11 @@ class _MimiStreamingTransformer(nn.Module):
         self._offset.zero_()
 
     def reset_slot(self, b: int) -> None:
+        # A recycled row restarts at position 0, exactly like a fresh stream,
+        # instead of carrying its predecessor's absolute RoPE positions.
         for kv in self._kv:
-            kv.reset_slot(b)
+            kv.reset_row(b)
+        self._offset[b] = 0
 
     def step(self, x: torch.Tensor, active: torch.Tensor) -> torch.Tensor:
         """``x`` is ``[B, T, dim]`` (T = positions this frame, typically 2)."""
@@ -418,7 +421,7 @@ class PersonaPlexMimiCodec(nn.Module):
         x = self._run_stages(x, self._enc_stages, active)
         x = self.encoder_transformer.step(x.transpose(1, 2), active).transpose(1, 2)
         x = self._downsample(x, active)
-        codes = self.model.quantizer.encode(x)  # [Q, B, T]
+        codes = self.model.quantizer.encode(x, num_quantizers=CODEBOOKS)  # [Q, B, T]
         return codes[:CODEBOOKS, :, 0].transpose(0, 1).contiguous()
 
     @torch.no_grad()

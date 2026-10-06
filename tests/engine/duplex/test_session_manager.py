@@ -25,13 +25,17 @@ from vllm_omni.engine.duplex.contracts import (
     DuplexStageSubmissionResult,
     duplex_resource_request_belongs_to_session,
 )
+from vllm_omni.engine.duplex.delivery import DuplexOutputBuffer
 from vllm_omni.engine.duplex.events import (
+    AudioDelta,
     DuplexEvent,
     ErrorEvent,
+    ResponseDone,
     SessionClosed,
     SessionCreated,
     SessionExpired,
     SessionHeartbeatAck,
+    TranscriptDelta,
 )
 from vllm_omni.engine.duplex.messages import (
     CloseDuplexSessionMessage,
@@ -296,6 +300,8 @@ class Harness:
     clock: FakeClock
     output_sink: asyncio.Queue = field(default_factory=asyncio.Queue)
     result_sink: asyncio.Queue = field(default_factory=asyncio.Queue)
+    _control_seq: int = 0
+    outputs: dict[str, DuplexOutputBuffer] = field(default_factory=dict)
 
     @classmethod
     def create(
@@ -329,11 +335,20 @@ class Harness:
         await self.manager.shutdown()
 
     async def open(self, session_id: str, config: DuplexSessionConfig | None = None) -> DuplexControlResultMessage:
+        limits = self.manager.runtime_config
+        output_buffer = self.outputs.setdefault(
+            session_id,
+            DuplexOutputBuffer(
+                max_bytes=limits.max_pending_output_bytes_per_session,
+                max_events=limits.max_pending_output_events_per_session,
+            ),
+        )
         await self.manager.handle(
             OpenDuplexSessionMessage(
                 control_id=f"open-{session_id}",
                 session_id=session_id,
                 session_config=config or DuplexSessionConfig(model="fake-model"),
+                output_buffer=output_buffer,
             )
         )
         return await self.result()
@@ -344,20 +359,30 @@ class Harness:
         )
         return await self.result()
 
-    async def resume(self, session_id: str, *, expected_lease_generation: int) -> DuplexControlResultMessage:
+    async def resume(
+        self, session_id: str, *, expected_lease_generation: int, control_id: str | None = None
+    ) -> DuplexControlResultMessage:
+        # Distinct by default: the engine answers a repeated control id as a
+        # replay of the same resume, which only the replay test wants.
+        self._control_seq += 1
         await self.manager.handle(
             ResumeDuplexSessionMessage(
-                control_id=f"resume-{session_id}-{expected_lease_generation}",
+                control_id=control_id or f"resume-{session_id}-{expected_lease_generation}-{self._control_seq}",
                 session_id=session_id,
                 expected_lease_generation=expected_lease_generation,
             )
         )
         return await self.result()
 
-    async def touch(self, session_id: str, activity: str) -> DuplexControlResultMessage:
+    async def touch(
+        self, session_id: str, activity: str, *, expected_lease_generation: int | None = None
+    ) -> DuplexControlResultMessage:
         await self.manager.handle(
             TouchDuplexSessionMessage(
-                control_id=f"touch-{session_id}-{activity}", session_id=session_id, activity=activity
+                control_id=f"touch-{session_id}-{activity}-{expected_lease_generation}",
+                session_id=session_id,
+                activity=activity,
+                expected_lease_generation=expected_lease_generation,
             )
         )
         return await self.result()
@@ -370,8 +395,14 @@ class Harness:
         assert isinstance(result, DuplexControlResultMessage)
         return result
 
-    def events(self, session_id: str | None = None) -> list[DuplexEvent]:
+    async def events(self, session_id: str | None = None) -> list[DuplexEvent]:
         events: list[DuplexEvent] = []
+        for identity, output in self.outputs.items():
+            while output.pending_events:
+                event = await output.get()
+                assert event is not None and event.session_id == identity
+                if output.is_valid(event) and (session_id is None or identity == session_id):
+                    events.append(event)
         while not self.output_sink.empty():
             message = self.output_sink.get_nowait()
             assert isinstance(message, DuplexSessionEventMessage)
@@ -384,6 +415,22 @@ class Harness:
         session = self.manager.get(session_id)
         assert session is not None
         return session
+
+    async def begin_output_response(self, session_id: str) -> str:
+        """Initialize real response, text and audio projection before filling output."""
+        runner = self.manager.runners[session_id]
+        response_id = runner.session.begin_response()
+        runner.session.append_assistant_text("abcdefghij")
+        payloads: list[dict[str, object]] = [
+            {"type": "response.created", "modalities": ["audio", "text"]},
+            {"type": "response.text.delta", "delta": "abcdefghij"},
+            {"type": "response.output_audio.delta", "audio": "AAAAAA==", "format": "pcm16"},
+        ]
+        for payload in payloads:
+            runner.emit({**payload, "response_id": response_id, "epoch": runner.session.epoch})
+            await self.events(session_id)
+        assert not runner.run.closing
+        return response_id
 
     def capture_submissions(self, session_id: str) -> list[DuplexCommand]:
         """Replace the runner mailbox with a list so admitted commands can be inspected."""
@@ -422,7 +469,7 @@ async def test_open_answers_with_capabilities_and_emits_session_created() -> Non
         assert result.public_session["voice"] == "test"
         assert result.error_code is None
 
-        events = harness.events("sid-open")
+        events = await harness.events("sid-open")
         assert isinstance(events[0], SessionCreated)
         assert events[0].epoch == 0
         assert events[0].session["id"] == "sid-open"
@@ -576,7 +623,7 @@ async def test_plugin_runtime_config_rejection_rolls_back_the_open(error: Except
         assert harness.manager.get("sid-runtime") is None
         assert harness.manager.active_count() == 0
         assert harness.stage_port.ensure_calls == []
-        assert harness.events() == []
+        assert await harness.events() == []
 
         # Nothing was registered under the rejected id and the slot is free again.
         plugin.runtime_config_error = None
@@ -592,7 +639,7 @@ async def test_command_for_unknown_session_emits_unknown_session_error() -> None
     async with Harness.create() as harness:
         harness.command("sid-missing", Heartbeat(event_id="evt-hb"))
 
-        events = harness.events("sid-missing")
+        events = await harness.events("sid-missing")
         assert len(events) == 1
         error = events[0]
         assert isinstance(error, ErrorEvent)
@@ -607,11 +654,11 @@ async def test_command_for_closed_session_emits_unknown_session_error() -> None:
     async with Harness.create() as harness:
         await harness.open("sid-closed")
         assert (await harness.close("sid-closed")).ok is True
-        harness.events()
+        await harness.events()
 
         harness.command("sid-closed", Heartbeat(event_id="evt-late"))
 
-        events = harness.events("sid-closed")
+        events = await harness.events("sid-closed")
         assert [type(event) for event in events] == [ErrorEvent]
         assert events[0].code == "unknown_session"
         assert events[0].related_event_id == "evt-late"
@@ -620,14 +667,14 @@ async def test_command_for_closed_session_emits_unknown_session_error() -> None:
 async def test_admitted_command_reaches_the_session_runner_in_order() -> None:
     async with Harness.create() as harness:
         await harness.open("sid-runner")
-        harness.events()
+        await harness.events()
         harness.clock.advance(5.0)
 
         harness.command("sid-runner", Heartbeat(event_id="evt-1"))
         harness.command("sid-runner", Heartbeat(event_id="evt-2"))
         await _settle()
 
-        events = harness.events("sid-runner")
+        events = await harness.events("sid-runner")
         assert [type(event) for event in events] == [SessionHeartbeatAck, SessionHeartbeatAck]
         assert all(event.epoch == 0 for event in events)
         assert harness.session("sid-runner").lease.last_activity == 5.0
@@ -636,7 +683,7 @@ async def test_admitted_command_reaches_the_session_runner_in_order() -> None:
 async def test_append_audio_is_backpressured_by_pending_input_bytes() -> None:
     async with Harness.create(max_pending_input_bytes_per_session=8) as harness:
         await harness.open("sid-bytes")
-        harness.events()
+        await harness.events()
         session = harness.session("sid-bytes")
         submitted = harness.capture_submissions("sid-bytes")
         assert session.reserve_input_bytes(6, limit=8)
@@ -644,7 +691,7 @@ async def test_append_audio_is_backpressured_by_pending_input_bytes() -> None:
         harness.command("sid-bytes", AppendAudio(audio=b"pcm", event_id="evt-over"))
         harness.command("sid-bytes", AppendAudio(audio=b"pc", event_id="evt-fits"))
 
-        events = harness.events("sid-bytes")
+        events = await harness.events("sid-bytes")
         assert len(events) == 1
         assert isinstance(events[0], ErrorEvent)
         assert events[0].code == "input_backpressure"
@@ -659,7 +706,7 @@ async def test_append_audio_is_backpressured_by_pending_input_bytes() -> None:
 async def test_commit_holds_a_pending_turn_reservation_until_the_runner_dequeues_it() -> None:
     async with Harness.create(max_pending_turns_per_session=1) as harness:
         await harness.open("sid-turns")
-        harness.events()
+        await harness.events()
         session = harness.session("sid-turns")
         submitted = harness.capture_submissions("sid-turns")
 
@@ -668,7 +715,7 @@ async def test_commit_holds_a_pending_turn_reservation_until_the_runner_dequeues
 
         assert [command.event_id for command in submitted] == ["evt-commit-1"]
         assert session.pending_input_turns == 1
-        events = harness.events("sid-turns")
+        events = await harness.events("sid-turns")
         assert len(events) == 1
         assert isinstance(events[0], ErrorEvent)
         assert events[0].code == "input_backpressure"
@@ -678,7 +725,7 @@ async def test_commit_holds_a_pending_turn_reservation_until_the_runner_dequeues
         session.release_pending_turn()
         harness.command("sid-turns", Commit(event_id="evt-commit-3"))
         assert [command.event_id for command in submitted] == ["evt-commit-1", "evt-commit-3"]
-        assert harness.events("sid-turns") == []
+        assert await harness.events("sid-turns") == []
 
 
 def test_accepts_only_duplex_message_types() -> None:
@@ -693,7 +740,14 @@ def test_accepts_only_duplex_message_types() -> None:
     )
     try:
         config = DuplexSessionConfig()
-        assert manager.accepts(OpenDuplexSessionMessage(control_id="c", session_id="s", session_config=config))
+        assert manager.accepts(
+            OpenDuplexSessionMessage(
+                control_id="c",
+                session_id="s",
+                session_config=config,
+                output_buffer=DuplexOutputBuffer(max_bytes=2 * 1024 * 1024, max_events=512),
+            )
+        )
         assert manager.accepts(CloseDuplexSessionMessage(control_id="c", session_id="s"))
         assert manager.accepts(ResumeDuplexSessionMessage(control_id="c", session_id="s", expected_lease_generation=0))
         assert manager.accepts(TouchDuplexSessionMessage(control_id="c", session_id="s", activity="heartbeat"))
@@ -718,7 +772,7 @@ def test_accepts_only_duplex_message_types() -> None:
 async def test_close_releases_stage_resources_and_is_idempotent() -> None:
     async with Harness.create() as harness:
         await harness.open("sid-close")
-        harness.events()
+        await harness.events()
         session = harness.session("sid-close")
         request_id = stage0_request_id("sid-close")
         session.bind_stage_request(0, request_id, fence=session.fence)
@@ -739,7 +793,7 @@ async def test_close_releases_stage_resources_and_is_idempotent() -> None:
         assert harness.manager.runner_for_request_id(request_id) is None
         assert harness.stage_port.cleanup_calls == [([request_id], True), ([reserved_context.request_id], False)]
         assert harness.plugin.data_plane.closed_sessions == ["sid-close"]
-        closed = [event for event in harness.events("sid-close") if isinstance(event, SessionClosed)]
+        closed = [event for event in await harness.events("sid-close") if isinstance(event, SessionClosed)]
         assert len(closed) == 1
         assert closed[0].reason == "client_close"
         assert closed[0].is_terminal is True
@@ -749,7 +803,7 @@ async def test_close_releases_stage_resources_and_is_idempotent() -> None:
         assert again.lease_generation is None
         assert again.public_session is None
         assert harness.stage_port.cleanup_calls[2:] == []
-        assert harness.events() == []
+        assert await harness.events() == []
 
 
 async def test_close_retains_the_admission_slot_until_stage_cleanup_succeeds() -> None:
@@ -847,7 +901,7 @@ async def test_reaper_expires_idle_sessions_and_emits_session_expired() -> None:
     async with Harness.create(idle_ttl_s=2.0, disconnect_grace_s=1.0) as harness:
         await harness.open("sid-idle")
         await harness.open("sid-active")
-        harness.events()
+        await harness.events()
         harness.clock.advance(1.0)
         assert (await harness.touch("sid-active", DuplexLeaseActivity.HEARTBEAT.value)).ok is True
         harness.clock.advance(1.1)
@@ -857,7 +911,7 @@ async def test_reaper_expires_idle_sessions_and_emits_session_expired() -> None:
         assert harness.manager.get("sid-idle") is None
         assert harness.manager.get("sid-active") is not None
         assert harness.manager.active_count() == 1
-        expired = harness.events("sid-idle")
+        expired = await harness.events("sid-idle")
         assert len(expired) == 1
         assert isinstance(expired[0], SessionExpired)
         assert expired[0].reason == "idle_ttl_expired"
@@ -867,7 +921,7 @@ async def test_reaper_expires_idle_sessions_and_emits_session_expired() -> None:
             "session_id": "sid-idle",
             "reason": "idle_ttl_expired",
         }
-        assert harness.events("sid-active") == []
+        assert await harness.events("sid-active") == []
         assert harness.stage_port.cleanup_calls == [([stage0_request_id("sid-idle")], False)]
         assert harness.result_sink.empty()
 
@@ -877,7 +931,7 @@ async def test_reaper_expires_idle_sessions_and_emits_session_expired() -> None:
 async def test_reaper_expires_detached_sessions_after_the_disconnect_grace() -> None:
     async with Harness.create(idle_ttl_s=300.0, disconnect_grace_s=1.0) as harness:
         await harness.open("sid-detached")
-        harness.events()
+        await harness.events()
         assert (await harness.touch("sid-detached", DuplexLeaseActivity.DETACH.value)).ok is True
         harness.clock.advance(0.5)
         assert await harness.manager.reap_expired() == 0
@@ -886,7 +940,7 @@ async def test_reaper_expires_detached_sessions_after_the_disconnect_grace() -> 
         assert await harness.manager.reap_expired() == 1
 
         assert harness.manager.get("sid-detached") is None
-        expired = harness.events("sid-detached")
+        expired = await harness.events("sid-detached")
         assert [type(event) for event in expired] == [SessionExpired]
         assert expired[0].reason == "disconnect_grace_expired"
         assert (await harness.resume("sid-detached", expected_lease_generation=0)).error_code == "unknown_session"
@@ -895,7 +949,7 @@ async def test_reaper_expires_detached_sessions_after_the_disconnect_grace() -> 
 async def test_session_closed_is_emitted_only_after_stage_cleanup_so_a_reopen_is_admitted() -> None:
     async with Harness.create(max_sessions=1) as harness:
         await harness.open("sid-closing")
-        harness.events()
+        await harness.events()
         session = harness.session("sid-closing")
         session.bind_stage_request(0, stage0_request_id("sid-closing"), fence=session.fence)
         harness.stage_port.cleanup_gate = asyncio.Event()
@@ -904,11 +958,11 @@ async def test_session_closed_is_emitted_only_after_stage_cleanup_so_a_reopen_is
         await asyncio.wait_for(harness.stage_port.cleanup_started.wait(), timeout=1.0)
         # The runner is gone but the stage request is still being aborted:
         # no session.closed yet, so a client cannot race the admission slot.
-        assert harness.events("sid-closing") == []
+        assert await harness.events("sid-closing") == []
 
         harness.stage_port.cleanup_gate.set()
         assert (await close_task).ok is True
-        events = harness.events("sid-closing")
+        events = await harness.events("sid-closing")
         assert [type(event) for event in events] == [SessionClosed]
         assert events[0].reason == "client_close"
         assert (await harness.open("sid-replacement")).ok is True
@@ -917,7 +971,7 @@ async def test_session_closed_is_emitted_only_after_stage_cleanup_so_a_reopen_is
 async def test_wire_close_command_frees_the_slot_before_session_closed() -> None:
     async with Harness.create(max_sessions=1) as harness:
         await harness.open("sid-wire-close")
-        harness.events()
+        await harness.events()
         session = harness.session("sid-wire-close")
         request_id = stage0_request_id("sid-wire-close")
         session.bind_stage_request(0, request_id, fence=session.fence)
@@ -926,7 +980,7 @@ async def test_wire_close_command_frees_the_slot_before_session_closed() -> None
         harness.command("sid-wire-close", CloseSession(reason="client_close"))
         await asyncio.wait_for(harness.stage_port.cleanup_started.wait(), timeout=1.0)
         assert harness.manager.get("sid-wire-close") is None
-        assert harness.events("sid-wire-close") == []
+        assert await harness.events("sid-wire-close") == []
 
         harness.stage_port.cleanup_gate.set()
         for _ in range(50):
@@ -934,7 +988,7 @@ async def test_wire_close_command_frees_the_slot_before_session_closed() -> None
                 break
             await asyncio.sleep(0.01)
         assert harness.stage_port.cleanup_calls == [([request_id], True)]
-        events = harness.events("sid-wire-close")
+        events = await harness.events("sid-wire-close")
         assert [type(event) for event in events] == [SessionClosed]
         assert events[0].reason == "client_close"
         assert (await harness.open("sid-replacement")).ok is True
@@ -943,7 +997,7 @@ async def test_wire_close_command_frees_the_slot_before_session_closed() -> None
 async def test_wire_close_stops_the_worker_and_refuses_later_control_ops() -> None:
     async with Harness.create(max_sessions=1) as harness:
         await harness.open("sid-wire")
-        harness.events()
+        await harness.events()
         runner = harness.manager.runners["sid-wire"]
         worker = runner._worker
         assert worker is not None
@@ -964,7 +1018,7 @@ async def test_wire_close_stops_the_worker_and_refuses_later_control_ops() -> No
                 break
             await asyncio.sleep(0.01)
         assert worker.done(), "the mailbox worker must exit after a wire close"
-        events = harness.events("sid-wire")
+        events = await harness.events("sid-wire")
         assert [type(event) for event in events] == [ErrorEvent, SessionClosed] or [
             type(event) for event in events
         ] == [SessionClosed, ErrorEvent]
@@ -992,7 +1046,7 @@ async def test_concurrent_opens_cannot_exceed_max_sessions() -> None:
 async def test_runtime_close_without_stage_requests_frees_the_slot() -> None:
     async with Harness.create(max_sessions=1) as harness:
         await harness.open("sid-runtime")
-        harness.events()
+        await harness.events()
         runner = harness.manager.runners["sid-runtime"]
         runner.session.release_all_requests()
 
@@ -1003,7 +1057,7 @@ async def test_runtime_close_without_stage_requests_frees_the_slot() -> None:
             await asyncio.sleep(0.01)
 
         assert harness.manager.get("sid-runtime") is None
-        assert [type(event) for event in harness.events("sid-runtime")] == [SessionClosed]
+        assert [type(event) for event in await harness.events("sid-runtime")] == [SessionClosed]
         assert (await harness.open("sid-next")).ok is True
 
 
@@ -1017,7 +1071,7 @@ async def test_close_of_a_forgotten_session_is_idempotent() -> None:
 async def test_append_bytes_are_reserved_at_admission_until_the_runner_dequeues() -> None:
     async with Harness.create(max_sessions=1, max_pending_input_bytes_per_session=8) as harness:
         await harness.open("sid-bytes")
-        harness.events()
+        await harness.events()
         session = harness.session("sid-bytes")
         runner = harness.manager.runners["sid-bytes"]
         # Park the worker so admitted commands stay in the mailbox.
@@ -1029,7 +1083,7 @@ async def test_append_bytes_are_reserved_at_admission_until_the_runner_dequeues(
         harness.command("sid-bytes", AppendAudio(audio=b"12345"))
         assert session.pending_input_bytes == 5
         harness.command("sid-bytes", AppendAudio(audio=b"12345"))
-        errors = [event for event in harness.events("sid-bytes") if isinstance(event, ErrorEvent)]
+        errors = [event for event in await harness.events("sid-bytes") if isinstance(event, ErrorEvent)]
         assert [error.code for error in errors] == ["input_backpressure"]
         gate.set()
 
@@ -1038,7 +1092,7 @@ async def test_append_admission_counts_audio_and_video_frame_bytes() -> None:
     """Manager reserves len(audio)+Σlen(frame); video bytes count toward the same limit."""
     async with Harness.create(max_sessions=1, max_pending_input_bytes_per_session=20) as harness:
         await harness.open("sid-av")
-        harness.events()
+        await harness.events()
         session = harness.session("sid-av")
         runner = harness.manager.runners["sid-av"]
         gate = asyncio.Event()
@@ -1061,7 +1115,7 @@ async def test_append_admission_counts_audio_and_video_frame_bytes() -> None:
             "sid-av",
             AppendAudio(audio=b"x" * 10, video_frames=("yyyyyyyyyy",), event_id="evt-over"),
         )
-        errors = [event for event in harness.events("sid-av") if isinstance(event, ErrorEvent)]
+        errors = [event for event in await harness.events("sid-av") if isinstance(event, ErrorEvent)]
         assert [error.code for error in errors] == ["input_backpressure"]
         assert errors[0].related_event_id == "evt-over"
         assert session.pending_input_bytes == expected
@@ -1071,7 +1125,7 @@ async def test_append_admission_counts_audio_and_video_frame_bytes() -> None:
 async def test_expired_session_retains_the_admission_slot_until_cleanup_succeeds() -> None:
     async with Harness.create(max_sessions=1, idle_ttl_s=1.0) as harness:
         await harness.open("sid-expired")
-        harness.events()
+        await harness.events()
         session = harness.session("sid-expired")
         request_id = stage0_request_id("sid-expired")
         session.bind_stage_request(0, request_id, fence=session.fence)
@@ -1082,14 +1136,14 @@ async def test_expired_session_retains_the_admission_slot_until_cleanup_succeeds
 
         assert harness.manager.get("sid-expired") is None
         assert session.state == DuplexSessionState.CLOSED
-        assert [type(event) for event in harness.events("sid-expired")] == [SessionExpired]
+        assert [type(event) for event in await harness.events("sid-expired")] == [SessionExpired]
         assert (await harness.open("sid-replacement")).error_code == "resource_exhausted"
 
         assert await harness.manager.reap_expired() == 1
 
         assert harness.stage_port.cleanup_calls == [([request_id], True)] * 2
         assert session.resource_request_ids() == []
-        assert harness.events("sid-expired") == []
+        assert await harness.events("sid-expired") == []
         assert (await harness.open("sid-replacement")).ok is True
 
 
@@ -1120,13 +1174,13 @@ async def test_expired_cleanup_failure_does_not_block_other_sessions() -> None:
     async with Harness.create(stage_port=OneStuckStagePort(), idle_ttl_s=1.0) as harness:
         await harness.open("sid-stuck")
         await harness.open("sid-fine")
-        harness.events()
+        await harness.events()
         harness.clock.advance(2.0)
 
         assert await harness.manager.reap_expired() == 1
 
         assert harness.manager.active_count() == 0
-        assert {type(event) for event in harness.events()} == {SessionExpired}
+        assert {type(event) for event in await harness.events()} == {SessionExpired}
         assert (await harness.open("sid-fine")).ok is True
         assert (await harness.open("sid-stuck")).error_code == "session_exists"
 
@@ -1139,7 +1193,7 @@ async def test_expired_cleanup_failure_does_not_block_other_sessions() -> None:
 async def test_close_sessions_for_request_ids_expires_the_owner_and_retries_cleanup() -> None:
     async with Harness.create(max_sessions=1) as harness:
         await harness.open("sid-request")
-        harness.events()
+        await harness.events()
         session = harness.session("sid-request")
         request_id = stage0_request_id("sid-request")
         session.bind_stage_request(0, request_id, fence=session.fence)
@@ -1151,7 +1205,7 @@ async def test_close_sessions_for_request_ids_expires_the_owner_and_retries_clea
         assert harness.manager.get("sid-request") is None
         assert session.lease.terminal_reason == "request_cleanup"
         await _settle()
-        expired = harness.events("sid-request")
+        expired = await harness.events("sid-request")
         assert [type(event) for event in expired] == [SessionExpired]
         assert expired[0].reason == "request_cleanup"
         assert session.state == DuplexSessionState.CLOSED
@@ -1245,7 +1299,12 @@ async def test_control_dispatch_is_ordered_per_session_without_blocking_other_se
         blocked_config = DuplexSessionConfig(model="fake-model", instructions="sid-blocked")
 
         manager.dispatch(
-            OpenDuplexSessionMessage(control_id="blocked-open", session_id="sid-blocked", session_config=blocked_config)
+            OpenDuplexSessionMessage(
+                control_id="blocked-open",
+                session_id="sid-blocked",
+                session_config=blocked_config,
+                output_buffer=DuplexOutputBuffer(max_bytes=2 * 1024 * 1024, max_events=512),
+            )
         )
         await asyncio.wait_for(plugin.runtime_config_started.wait(), timeout=1.0)
         manager.dispatch(
@@ -1260,6 +1319,7 @@ async def test_control_dispatch_is_ordered_per_session_without_blocking_other_se
                 control_id="independent-open",
                 session_id="sid-independent",
                 session_config=DuplexSessionConfig(model="fake-model"),
+                output_buffer=DuplexOutputBuffer(max_bytes=2 * 1024 * 1024, max_events=512),
             )
         )
         manager.dispatch(
@@ -1327,16 +1387,18 @@ async def test_shutdown_closes_every_runner_and_stops_dispatch_tasks() -> None:
     await harness.open("sid-a")
     await harness.open("sid-b")
     sessions = [harness.session("sid-a"), harness.session("sid-b")]
-    harness.events()
+    await harness.events()
 
     await harness.manager.shutdown()
 
     assert harness.manager.active_count() == 0
     assert harness.manager.runners == {}
+    assert harness.manager._outputs == {}
+    assert harness.manager._output_failed == set()
     assert all(session.state == DuplexSessionState.CLOSED for session in sessions)
     assert harness.manager.runner_for_request_id(stage0_request_id("sid-b")) is None
     # Shutdown is silent: no session.closed / session.expired is emitted.
-    assert harness.events() == []
+    assert await harness.events() == []
     assert harness.stage_port.cleanup_calls == []
 
 
@@ -1403,12 +1465,12 @@ async def test_expiry_emits_a_terminal_event_even_when_a_close_deferred_it() -> 
         runner = harness.manager.runners["sid-deferred"]
         # What the runner does for a wire close: tear down, defer the terminal.
         await runner.close("client_close", emit_closed=False)
-        harness.events("sid-deferred")
+        await harness.events("sid-deferred")
 
         await runner.expire("request_cleanup", emit_expired=True)
 
         terminal = [
-            event for event in harness.events("sid-deferred") if isinstance(event, SessionClosed | SessionExpired)
+            event for event in await harness.events("sid-deferred") if isinstance(event, SessionClosed | SessionExpired)
         ]
         assert len(terminal) == 1, terminal
         assert isinstance(terminal[0], SessionExpired)
@@ -1455,7 +1517,7 @@ async def test_a_runtime_close_racing_a_manager_close_still_emits_one_terminal()
     """
     async with Harness.create(max_sessions=1) as harness:
         await harness.open("sid-race")
-        harness.events()
+        await harness.events()
         session = harness.session("sid-race")
         session.bind_stage_request(0, stage0_request_id("sid-race"), fence=session.fence)
         runner = harness.manager.runners["sid-race"]
@@ -1475,7 +1537,9 @@ async def test_a_runtime_close_racing_a_manager_close_still_emits_one_terminal()
 
         await harness.close("sid-race")
 
-        terminal = [event for event in harness.events("sid-race") if isinstance(event, SessionClosed | SessionExpired)]
+        terminal = [
+            event for event in await harness.events("sid-race") if isinstance(event, SessionClosed | SessionExpired)
+        ]
         assert len(terminal) == 1, terminal
 
 
@@ -1487,7 +1551,9 @@ async def test_a_terminal_event_is_emitted_once_even_if_expiry_runs_twice() -> N
         await runner.expire("idle_ttl_expired", emit_expired=True)
         await runner.expire("idle_ttl_expired", emit_expired=True)
 
-        terminal = [event for event in harness.events("sid-once") if isinstance(event, SessionClosed | SessionExpired)]
+        terminal = [
+            event for event in await harness.events("sid-once") if isinstance(event, SessionClosed | SessionExpired)
+        ]
         assert len(terminal) == 1, terminal
 
 
@@ -1579,12 +1645,12 @@ async def test_wire_close_of_an_idle_session_still_emits_session_closed() -> Non
     """
     async with Harness.create(max_sessions=1) as harness:
         await harness.open("sid-idle-close")
-        harness.events()
+        await harness.events()
 
         harness.command("sid-idle-close", CloseSession(reason="client_close"))
         events: list[DuplexEvent] = []
         for _ in range(200):
-            events.extend(harness.events("sid-idle-close"))
+            events.extend(await harness.events("sid-idle-close"))
             if events:
                 break
             await asyncio.sleep(0.01)
@@ -1657,6 +1723,173 @@ async def test_reaper_loop_survives_one_cleanup_failure(first_cleanup_delay: flo
 
 
 # --------------------------------------------------------------------------- #
+# Cancelled open (#7636 Issue 1)                                              #
+# --------------------------------------------------------------------------- #
+
+
+class _BlockingResultSink(asyncio.Queue):
+    """A result sink whose ``put`` parks, so an open can be cancelled after it admitted the session."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.entered = asyncio.Event()
+        self.gate = asyncio.Event()
+
+    async def put(self, item: object) -> None:
+        self.entered.set()
+        await self.gate.wait()
+        await super().put(item)
+
+
+async def test_an_open_cancelled_while_awaiting_the_plugin_frees_the_admission_slot() -> None:
+    """``CancelledError`` is not an ``Exception``: the rollback used to be skipped.
+
+    Admission counts ``runners | closing | admitting``, so every open cancelled
+    mid-flight (engine teardown, task cancellation) burned one slot for good;
+    after ``max_sessions`` of them every new session was refused.
+    """
+    async with Harness.create(max_sessions=1) as harness:
+        harness.plugin.blocked_session_ids.add("blocked")
+        config = DuplexSessionConfig(model="fake-model", instructions="blocked")
+        open_task = asyncio.create_task(harness.open("sid-cancelled", config))
+        await asyncio.wait_for(harness.plugin.runtime_config_started.wait(), timeout=1.0)
+
+        open_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await open_task
+
+        assert harness.manager.get("sid-cancelled") is None
+        assert harness.manager.active_count() == 0
+        assert harness.result_sink.empty(), "a cancelled open answers nobody"
+        assert (await harness.open("sid-replacement")).ok is True
+
+
+async def test_an_open_cancelled_after_admission_releases_the_runner_and_its_stage_reservation() -> None:
+    """The worst landing spot for the cancel: the runner is registered and Stage0 is reserved.
+
+    Both have to be undone, or the runner stays in ``runners`` (one slot gone)
+    and the Stage0 request stays reserved in the orchestrator.
+    """
+    async with Harness.create(max_sessions=1) as harness:
+        sink = _BlockingResultSink()
+        original_sink = harness.manager._result_sink
+        harness.manager._result_sink = sink
+        open_task = asyncio.create_task(
+            harness.manager.handle(
+                OpenDuplexSessionMessage(
+                    control_id="open-cancelled",
+                    session_id="sid-cancelled",
+                    session_config=DuplexSessionConfig(model="fake-model"),
+                    output_buffer=DuplexOutputBuffer(max_bytes=2 * 1024 * 1024, max_events=512),
+                )
+            )
+        )
+        await asyncio.wait_for(sink.entered.wait(), timeout=1.0)
+        assert "sid-cancelled" in harness.manager.runners
+        assert "sid-cancelled" in harness.manager._outputs
+        assert [context.request_id for context in harness.stage_port.ensure_calls] == [
+            stage0_request_id("sid-cancelled")
+        ]
+
+        open_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await open_task
+        harness.manager._result_sink = original_sink
+
+        assert "sid-cancelled" not in harness.manager.runners
+        assert "sid-cancelled" not in harness.manager._outputs
+        assert harness.manager.active_count() == 0
+        assert harness.stage_port.cleanup_calls == [([stage0_request_id("sid-cancelled")], False)]
+        assert stage0_request_id("sid-cancelled") not in harness.manager._request_index
+        assert (await harness.open("sid-replacement")).ok is True
+
+
+async def test_an_open_cancelled_again_during_its_rollback_leaves_the_stage_cleanup_to_the_reaper() -> None:
+    """A second cancellation landing in the rollback's awaits must not orphan the Stage0 request.
+
+    The runner, the reservations and the request index are already gone by
+    then, so nothing would ever clean the orchestrator's request state up.
+    The rollback records the ids as a pending request cleanup before it
+    awaits anything, and the reaper's retry finishes the job.
+    """
+    async with Harness.create(max_sessions=1) as harness:
+        sink = _BlockingResultSink()
+        original_sink = harness.manager._result_sink
+        harness.manager._result_sink = sink
+        open_task = asyncio.create_task(
+            harness.manager.handle(
+                OpenDuplexSessionMessage(
+                    control_id="open-cancelled-twice",
+                    session_id="sid-cancelled",
+                    session_config=DuplexSessionConfig(model="fake-model"),
+                    output_buffer=DuplexOutputBuffer(max_bytes=2 * 1024 * 1024, max_events=512),
+                )
+            )
+        )
+        await asyncio.wait_for(sink.entered.wait(), timeout=1.0)
+        runner = harness.manager.runners["sid-cancelled"]
+        shutdown_started = asyncio.Event()
+
+        async def parked_shutdown() -> None:
+            shutdown_started.set()
+            await asyncio.Event().wait()
+
+        runner.shutdown = parked_shutdown  # type: ignore[method-assign]
+
+        open_task.cancel()
+        await asyncio.wait_for(shutdown_started.wait(), timeout=1.0)
+        assert "sid-cancelled" not in harness.manager._outputs
+        open_task.cancel()  # lands inside the rollback, before the stage cleanup
+        with pytest.raises(asyncio.CancelledError):
+            await open_task
+        harness.manager._result_sink = original_sink
+
+        assert "sid-cancelled" not in harness.manager.runners
+        assert harness.manager.active_count() == 0
+        assert harness.stage_port.cleanup_calls == [], "the cleanup await was never reached"
+        key = ("sid-cancelled", 0)
+        assert key in harness.manager._pending_request_cleanups
+
+        await harness.manager.reap_expired()
+        assert harness.stage_port.cleanup_calls == [([stage0_request_id("sid-cancelled")], False)]
+        assert key not in harness.manager._pending_request_cleanups
+        assert (await harness.open("sid-replacement")).ok is True
+
+
+# --------------------------------------------------------------------------- #
+# Detach fenced on the lease generation                                       #
+# --------------------------------------------------------------------------- #
+
+
+async def test_detach_is_refused_for_a_lease_the_caller_no_longer_holds() -> None:
+    """A connection giving up its lease must not start the grace for the lease a later resume owns.
+
+    Resume is a CAS on the lease generation; detach is now fenced the same
+    way, so a stale caller (its resume was superseded by another connection's)
+    is refused instead of detaching the winner.
+    """
+    async with Harness.create() as harness:
+        await harness.open("sid-fence")
+        session = harness.session("sid-fence")
+        assert (await harness.resume("sid-fence", expected_lease_generation=0)).ok is True
+        assert session.lease_generation == 1
+
+        stale = await harness.touch("sid-fence", "detach", expected_lease_generation=0)
+        assert stale.ok is False
+        assert stale.error_code == "session_resume_conflict"
+        assert session.lease.detached_at is None, "the current lease is untouched"
+
+        current = await harness.touch("sid-fence", "detach", expected_lease_generation=1)
+        assert current.ok is True
+        assert session.lease.detached_at is not None
+
+        # An unfenced detach keeps its meaning: whatever generation is current.
+        assert (await harness.resume("sid-fence", expected_lease_generation=1)).ok is True
+        assert (await harness.touch("sid-fence", "detach")).ok is True
+        assert session.lease.detached_at is not None
+
+
+# --------------------------------------------------------------------------- #
 # Cancellation waits                                                          #
 # --------------------------------------------------------------------------- #
 
@@ -1685,3 +1918,144 @@ async def test_cancel_append_tasks_absorbs_a_task_that_outlives_the_wait() -> No
     assert await tasks.cancel_append_tasks(timeout_s=0.05) is True
     assert tasks.append_tail is None
     await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), timeout=5.0)
+
+
+async def test_a_resume_replayed_under_its_control_id_reports_the_generation_it_produced() -> None:
+    """The client side of an abandoned resume: it lost the answer and asks again with the same id."""
+    async with Harness.create() as harness:
+        await harness.open("sid-replay")
+        session = harness.session("sid-replay")
+        first = await harness.resume("sid-replay", expected_lease_generation=0, control_id="rpc-a")
+        assert first.ok is True and first.lease_generation == 1
+
+        replay = await harness.resume("sid-replay", expected_lease_generation=0, control_id="rpc-a")
+        assert replay.ok is True
+        assert replay.lease_generation == 1
+        assert session.lease_generation == 1, "a replay does not resume again"
+
+        other = await harness.resume("sid-replay", expected_lease_generation=0, control_id="rpc-b")
+        assert other.ok is False and other.error_code == "session_resume_conflict"
+
+
+async def test_output_overflow_closes_only_its_session_and_releases_capacity(mocker) -> None:
+    async with Harness.create(max_sessions=2, max_pending_output_events_per_session=8) as harness:
+        assert (await harness.open("slow")).ok
+        assert (await harness.open("normal")).ok
+        await harness.events()
+        assert not harness.manager.runners["slow"].run.closing
+        assert not harness.manager.runners["normal"].run.closing
+        slow = harness.session("slow")
+        normal = harness.session("normal")
+        slow_response = await harness.begin_output_response("slow")
+        normal_response = normal.begin_response()
+        request_id = stage0_request_id("slow")
+        slow.bind_request(request_id)
+        slow.mark_audio_sent(1000)
+        slow.acknowledge_playback(500, 500)
+        close_stream = mocker.spy(harness.plugin.data_plane, "close_stream")
+
+        for _ in range(5):
+            harness.manager.runners["slow"].emit(
+                {
+                    "type": "response.output_audio.delta",
+                    "response_id": slow_response,
+                    "audio": "AAAAAA==",
+                    "format": "pcm16",
+                }
+            )
+        harness.manager.emit(normal, [AudioDelta(response_id=normal_response, delta="CCCC")])
+        await asyncio.wait_for(asyncio.gather(*tuple(harness.manager._dispatched_control_tasks)), timeout=2.0)
+
+        events = await harness.events()
+        failed = [event for event in events if event.session_id == "slow"]
+        # Queued transcript deltas remain ordered; stale audio and the failed
+        # response's undelivered completion markers are discarded.
+        assert [type(event) for event in failed] == [TranscriptDelta] * 4 + [ErrorEvent, ResponseDone, SessionClosed]
+        assert failed[-3].code == "output_backpressure"
+        done = failed[-2]
+        assert isinstance(done, ResponseDone)
+        assert done.response_id == slow_response and done.status == "failed"
+        metadata = done.response["metadata"]
+        assert isinstance(metadata, dict) and metadata["committed"] is False
+        assert failed[-1].reason == "output_backpressure"
+        assert slow.history == ()
+        assert slow.active_response_id is None
+        assert harness.stage_port.abort_calls == [[request_id]]
+        close_stream.assert_called_once_with(request_id)
+        delivered = [event for event in events if event.session_id == "normal"]
+        assert len(delivered) == 1 and isinstance(delivered[0], AudioDelta)
+        assert delivered[0].response_id == normal_response and delivered[0].delta == "CCCC"
+        assert harness.manager.get("slow") is None
+        assert harness.manager.get("normal") is normal
+        assert harness.manager.active_count() == 1
+        assert (await harness.open("replacement")).ok
+
+
+@pytest.mark.parametrize(
+    "capacity,end_before_emit,expected_status,closed",
+    [
+        (8, True, "failed", True),
+        (8, False, "failed", True),
+        (14, True, "completed", True),
+        (64, True, "completed", False),
+    ],
+    ids=["already-ended-overflow", "active-overflow", "overflow-after-ending", "sufficient-capacity"],
+)
+async def test_completion_projection_retains_exactly_one_response_done(
+    capacity: int, end_before_emit: bool, expected_status: str, closed: bool
+) -> None:
+    async with Harness.create(max_pending_output_events_per_session=capacity) as harness:
+        assert (await harness.open("completion")).ok
+        await harness.events()
+        response_id = await harness.begin_output_response("completion")
+        runner = harness.manager.runners["completion"]
+        for _ in range(4):
+            runner.emit(
+                {
+                    "type": "response.output_audio.delta",
+                    "response_id": response_id,
+                    "audio": "AAAAAA==",
+                    "format": "pcm16",
+                }
+            )
+        assert harness.outputs["completion"].pending_events == 8
+        runner.session.mark_audio_sent(1000)
+        runner.session.acknowledge_playback(500, 500)
+        if end_before_emit:
+            message = runner.session.end_response(commit_text=True)
+            assert message == {"role": "assistant", "content": "abcde"}
+            runner.session.register_history_item(f"item_{response_id}", message)
+            assert runner.session.history == (message,)
+
+        runner.emit(
+            {"type": "response.done", "response_id": response_id, "status": "completed", "committed": end_before_emit}
+        )
+        await asyncio.wait_for(asyncio.gather(*tuple(harness.manager._dispatched_control_tasks)), timeout=2.0)
+
+        events = await harness.events()
+        endings = [event for event in events if isinstance(event, ResponseDone)]
+        assert len(endings) == 1
+        assert endings[0].response_id == response_id and endings[0].status == expected_status
+        metadata = endings[0].response["metadata"]
+        assert isinstance(metadata, dict) and metadata["committed"] is (expected_status == "completed")
+        assert any(isinstance(event, SessionClosed) for event in events) is closed
+        if expected_status == "failed":
+            assert [type(event) for event in events] == [TranscriptDelta] * 4 + [
+                ErrorEvent,
+                ResponseDone,
+                SessionClosed,
+            ]
+            assert endings[0].response["status_details"] == {"type": "failed", "reason": "output_backpressure"}
+            assert runner.session.history == ()
+        else:
+            assert [type(event) for event in events[:8]] == [AudioDelta, TranscriptDelta] * 4
+            assert runner.session.history == ({"role": "assistant", "content": "abcde"},)
+            if closed:
+                # The ending was accepted; overflowing on rate_limits.updated
+                # must not replace it, emit a second ending or undo its history.
+                assert [type(event) for event in events[-3:]] == [ResponseDone, ErrorEvent, SessionClosed]
+                assert events[-3] is endings[0]
+            else:
+                assert not any(isinstance(event, ErrorEvent) for event in events)
+                assert events[-2] is endings[0]
+                assert events[-1].type == "rate_limits.updated"

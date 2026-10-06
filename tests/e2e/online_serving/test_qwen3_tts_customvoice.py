@@ -66,6 +66,53 @@ default_tts_server_params = [
     )
 ]
 
+# Exercise the throughput path in the existing L4 lane with smaller capacities.
+# The production H200 profile retains its own admission and graph buckets.
+_FAST_PATH_STAGE_CONFIG = modify_stage_config(
+    get_deploy_config_path("qwen3_tts_high_concurrency_mrv2_single_gpu.yaml"),
+    updates={
+        # The temporary overlay lives outside deploy/, so anchor its parent.
+        "base_config": get_deploy_config_path("qwen3_tts_high_concurrency_mrv2.yaml"),
+        "cuda_mps": False,
+        "connectors.connector_of_shared_memory.extra.decode_batch_max_size": 2,
+        "connectors.connector_of_shared_memory.extra.decode_cudagraph_batch_sizes": [1, 2],
+        "stages": {
+            0: {
+                "max_num_seqs": 4,
+                "max_num_batched_tokens": 128,
+                "compilation_config.cudagraph_capture_sizes": [1, 2, 4, 8, 16, 32, 64, 128],
+                "compilation_config.max_cudagraph_capture_size": 128,
+            },
+            1: {"max_num_seqs": 4},
+        },
+    },
+)
+
+
+@pytest.mark.core_model
+@pytest.mark.advanced_model
+@pytest.mark.tts
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@pytest.mark.parametrize(
+    "omni_server",
+    [OmniServerParams(model=MODEL, stage_config_path=_FAST_PATH_STAGE_CONFIG, server_args=["--trust-remote-code"])],
+    indirect=True,
+)
+def test_cached_predictor_streaming_audio(omni_server, online_client) -> None:
+    """Cover the optimized predictor, first audio and codec path with real weights at L3."""
+    online_client.send_audio_speech_request(
+        {
+            "model": omni_server.model,
+            "input": "The quick brown fox jumps over the lazy dog.",
+            "stream": True,
+            "stream_format": "audio",
+            "response_format": "wav",
+            "task_type": "CustomVoice",
+            "voice": "vivian",
+        },
+        request_num=4,
+    )
+
 
 @pytest.mark.core_model
 @pytest.mark.advanced_model

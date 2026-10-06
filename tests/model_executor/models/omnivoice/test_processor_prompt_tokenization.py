@@ -42,10 +42,26 @@ def _make_processor(monkeypatch: pytest.MonkeyPatch) -> OmniVoiceMultiModalProce
     return processor
 
 
+class _FakeProcessorItem:
+    def __init__(self, processor_data: dict[str, object]) -> None:
+        self._processor_data = processor_data
+
+    def get_processor_data(self) -> dict[str, object]:
+        return dict(self._processor_data)
+
+    def get_passthrough_data(self) -> dict[str, object]:
+        return {}
+
+
 def _items(counts: dict[str, int], mm_data: dict[str, object]) -> SimpleNamespace:
+    class _Selected:
+        @staticmethod
+        def values():
+            return [_FakeProcessorItem(mm_data)] if mm_data else []
+
     return SimpleNamespace(
         get_all_counts=lambda: counts,
-        select=lambda _keys: mm_data,
+        select=lambda _keys: _Selected(),
     )
 
 
@@ -75,9 +91,8 @@ def test_apply_tokenizes_the_prompt_once(monkeypatch: pytest.MonkeyPatch) -> Non
 def test_media_path_encodes_audio_without_retokenizing(monkeypatch: pytest.MonkeyPatch) -> None:
     processor = _make_processor(monkeypatch)
     audio = np.zeros(2400, dtype=np.float32)
-    monkeypatch.setattr(processor, "_get_hf_mm_data", lambda _items: ({"audios": [audio]}, {}))
 
-    out = processor._apply_hf_processor_main(_items({"audio": 1}, {}), {"ref_text": "reference"})
+    out = processor._apply_hf_processor_main(_items({"audio": 1}, {"audios": [audio]}), {"ref_text": "reference"})
 
     assert tuple(out["ref_audio_tokens"].shape) == (8, 4)
     assert list(out["ref_audio_len"]) == [4]
@@ -89,7 +104,6 @@ def test_media_path_encodes_audio_without_retokenizing(monkeypatch: pytest.Monke
 def test_media_path_with_no_audio_touches_no_tokenizer(monkeypatch: pytest.MonkeyPatch) -> None:
     """Text-only requests and fully cached audio both reach this path with empty items."""
     processor = _make_processor(monkeypatch)
-    monkeypatch.setattr(processor, "_get_hf_mm_data", lambda _items: ({}, {}))
 
     out = processor._apply_hf_processor_main(_items({}, {}), {"ref_text": "reference"})
 
@@ -99,4 +113,6 @@ def test_media_path_with_no_audio_touches_no_tokenizer(monkeypatch: pytest.Monke
 
 
 def test_legacy_call_hf_processor_is_gone() -> None:
-    assert not hasattr(OmniVoiceMultiModalProcessor, "_call_hf_processor")
+    # Upstream reintroduced a 2-arg `_call_hf_processor` on the base class; the
+    # omni-specific 4-arg hook must not be defined on the omni class itself.
+    assert "_call_hf_processor" not in OmniVoiceMultiModalProcessor.__dict__

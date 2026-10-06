@@ -678,6 +678,8 @@ class Qwen3OmniMoeThinkerProcessingInfo(Qwen2AudioProcessingInfo, Qwen2_5_VLProc
             spatial_merge_size=self.get_hf_config().vision_config.spatial_merge_size,
             target_sr=feature_extractor.sampling_rate,
             target_channels=1,
+            # Retain PyAV for long-audio latency after vLLM 0.30 changed the default.
+            audio_resample_method="pyav",
             expected_hidden_size=self._get_expected_hidden_size(),
         )
 
@@ -1141,10 +1143,17 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
 
             # register buffer for deepstack
             if self.use_deepstack:
+                # Create the buffers on the target device explicitly. They are
+                # built inside the `_mark_tower_model` block, which runs under
+                # vLLM's meta-device `no_init_weights` context when the image and
+                # video limits are both 0 (audio-only serving), so a bare
+                # torch.zeros(...) would stay on meta and the first profile_run
+                # fails with "Tensor on device meta is not on the expected device".
                 self.deepstack_input_embeds = [
                     torch.zeros(
                         vllm_config.scheduler_config.max_num_batched_tokens,
                         thinker_config.text_config.hidden_size,
+                        device=vllm_config.device_config.device,
                     )
                     for _ in range(self.deepstack_num_level)
                 ]

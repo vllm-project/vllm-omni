@@ -57,7 +57,9 @@ from vllm_omni.config.stage_config import (
     normalize_pipeline_cli_overrides,
     reconcile_diffusion_attention_overrides,
     resolve_stage_async_chunk,
-    validate_stage_async_chunk_edges,
+    resolve_stage_model_runner,
+    update_deploy_config_async_chunk_enabled,
+    validate_native_mrv2_session,
 )
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 
@@ -334,23 +336,6 @@ def _first_defined(*values: Any) -> Any:
     return None
 
 
-def _validate_async_chunk_support(pipeline: PipelineConfig, deploy: DeployConfig) -> None:
-    has_inter_stage_edges = any(stage.input_sources for stage in pipeline.stages)
-    if deploy.async_chunk and any(stage.engine_extras.get("kv_transfer_config") for stage in deploy.stages):
-        raise ValueError("Native AR-to-DiT KV transfer requires async_chunk=False.")
-    if (
-        deploy.async_chunk
-        and has_inter_stage_edges
-        and not any(stage.async_chunk_process_next_stage_input_func for stage in pipeline.stages)
-    ):
-        raise ValueError(
-            f"Pipeline {pipeline.model_type!r} has async_chunk=True in deploy but no stage "
-            "declares a dedicated async-chunk next-stage processor "
-            "(``async_chunk_process_next_stage_input_func``). "
-            "Either set async_chunk=False or implement an async-chunk producer on the pipeline."
-        )
-
-
 def _resolve_execution_mode(execution_type: StageExecutionType) -> tuple[StageType, str | None]:
     try:
         return _EXECUTION_TYPE_TO_STAGE_WORKER[execution_type]
@@ -497,6 +482,7 @@ class OmniStageModelConfig(_TrackExplicitConfigFields):
     interleave_mm_strings: bool | None = None
     media_io_kwargs: dict[str, Any] | None = None
     final_output: bool = False
+    supports_running_prefix_cache_reset: bool = True
     active_stream_window: int = Field(default=0, ge=0)
     session_mode: str = "turn"
     duplex_max_sessions: int = Field(default=1, ge=1)
@@ -629,6 +615,8 @@ class OmniStageConnectorConfig:
 class OmniStageRuntimeConfig:
     """Per-stage process placement and backend runtime behavior."""
 
+    cuda_mps: bool = False
+
     # LLM backend extensions; diffusion owns these in its config projection.
     additional_config: dict[str, Any] | None = None
     distributed_executor_backend: Any = None
@@ -733,11 +721,15 @@ class OmniStageDiffusionParallelConfig(OmniStageParallelConfig):
             raise ValueError("allgather_degree > 1 is mutually exclusive with ulysses_degree/ring_degree > 1")
         if self.ulysses_mode not in {"strict", "advanced_uaa"}:
             raise ValueError("ulysses_mode must be 'strict' or 'advanced_uaa'")
-        if self.vae_parallel_mode not in {"tile", "spatial_shard_height", "spatial_shard_width"}:
+        if self.vae_parallel_mode not in {"tile", "batch", "spatial_shard_height", "spatial_shard_width"}:
             raise ValueError(
-                "vae_parallel_mode must be one of {'tile', 'spatial_shard_height', 'spatial_shard_width'}, "
+                "vae_parallel_mode must be one of {'tile', 'batch', 'spatial_shard_height', 'spatial_shard_width'}, "
                 f"but got {self.vae_parallel_mode!r}."
             )
+        if self.vae_parallel_mode == "batch" and (
+            self.data_parallel_size != 1 or self.pipeline_parallel_size != 1 or self.cfg_parallel_size != 1
+        ):
+            raise ValueError("VAE batch parallel decode requires DP, PP, and CFG parallel sizes to be 1")
 
         other_parallel_world_size = (
             self.pipeline_parallel_size
@@ -830,6 +822,7 @@ class _DiffusionConfigProjection:
     prompt_embed_cache_size: int = Field(default=32, ge=1)
     enable_session_state_manager: bool = False
     diffusion_load_format: str = "default"
+    hsdp_weight_load_strategy: str = "full"
     diffusers_load_kwargs: dict[str, Any] = field(default_factory=dict)
     diffusers_call_kwargs: dict[str, Any] = field(default_factory=dict)
     diffusers_pipeline_cls: Any = None
@@ -1156,6 +1149,9 @@ _DIFFUSION_MOVED_SHARED_FIELDS = frozenset(
         "disable_autocast",
     }
 )
+# Runtime-populated OmniDiffusionConfig state (init=False) that is never
+# user-configurable and therefore not part of the projection.
+_DIFFUSION_INTERNAL_FIELDS = frozenset({"ray_worker_env"})
 
 
 _STAGE_DEPLOY_ENGINE_FIELDS: tuple[str, ...] = tuple(_STAGE_DEPLOY_FIELDS)
@@ -1337,6 +1333,7 @@ _DIFFUSION_STAGE_METADATA_FIELDS = frozenset(
         "model_arch",
         "model_stage",
         "retains_state_across_chunks",
+        "supports_running_prefix_cache_reset",
         "scheduler_cls",
         "stage_connector_spec",
         "worker_type",
@@ -1984,9 +1981,13 @@ def _build_model_config(
     if "active_stream_window" not in kwargs:
         kwargs["active_stream_window"] = _copy_value(deploy.active_stream_window)
     kwargs["final_output"] = topology.final_output
+    if not topology.supports_running_prefix_cache_reset:
+        kwargs["supports_running_prefix_cache_reset"] = False
     if "custom_voice_dir" not in kwargs and deploy.custom_voice_dir is not None:
         kwargs["custom_voice_dir"] = _copy_value(deploy.custom_voice_dir)
-    kwargs.setdefault("use_v2_model_runner", deploy.model_runner == "v2")
+    stage_runner = resolve_stage_model_runner(deploy, stage_deploy)
+    validate_native_mrv2_session(deploy, topology, stage_runner)
+    kwargs.setdefault("use_v2_model_runner", stage_runner == "v2")
     kwargs.setdefault(
         "supports_native_mrv2_data_plane",
         topology.supports_native_mrv2_data_plane,
@@ -2127,6 +2128,7 @@ def _build_runtime_config(
         kwargs["num_replicas"] = stage_deploy.num_replicas
     if "env" not in kwargs and stage_deploy is not None and stage_deploy.env is not None:
         kwargs["env"] = _copy_value(stage_deploy.env)
+    kwargs["cuda_mps"] = deploy.cuda_mps
     kwargs["num_gpus"] = parallel_config.world_size
     return OmniStageRuntimeConfig(**kwargs)
 
@@ -2238,23 +2240,21 @@ class VllmOmniConfig:
             deploy_config_path,
         )
 
-        if cli_overrides.get("async_chunk") is not None:
-            deploy.async_chunk = bool(cli_overrides["async_chunk"])
         for name in _PIPELINE_DEPLOY_CLI_FIELDS:
             if cli_overrides.get(name) is not None:
                 setattr(deploy, name, _copy_value(cli_overrides[name]))
 
         deploy = _apply_platform_overrides(deploy)
-        if len(pipeline_cfg.stages) <= 1:
-            deploy.async_chunk = False
-        _validate_async_chunk_support(pipeline_cfg, deploy)
-        validate_stage_async_chunk_edges(pipeline_cfg, deploy)
+
+        cli_async_chunk = cli_overrides.get("async_chunk")
+        if cli_async_chunk is not None:
+            deploy.async_chunk = bool(cli_async_chunk)
 
         strategy_result = None
         if strategy_specs:
             from vllm_omni.config.composable_parallel import apply_strategy_specs
 
-            strategy_stages = merge_pipeline_deploy(pipeline_cfg, copy.deepcopy(deploy), {})
+            strategy_stages = merge_pipeline_deploy(pipeline_cfg, copy.deepcopy(deploy))
             strategy_result = apply_strategy_specs(strategy_stages, strategy_specs)
             strategy_overrides: dict[str, Any] = {}
             axis_fields = {
@@ -2306,6 +2306,7 @@ class VllmOmniConfig:
                 cli_overrides["omni_lb_policy"] = strategy_result.omni_lb_policy
 
         deploy_by_id = {stage.stage_id: stage for stage in deploy.stages}
+        update_deploy_config_async_chunk_enabled(pipeline_cfg, deploy)
         model = cli_overrides.get("model")
 
         stage_configs = tuple(

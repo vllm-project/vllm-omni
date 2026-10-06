@@ -16,23 +16,26 @@ from vllm_omni.utils.speaker_cache import iter_custom_voice_profiles, load_valid
 logger = init_logger(__name__)
 
 
-def load_supported_speakers(engine_client: Any, config: Any = None) -> set[str]:
-    """Extract supported speaker names from a model configuration."""
+def load_supported_speakers(engine_client: Any, config: Any = None) -> list[str]:
+    """Extract supported speaker names from a model configuration.
+
+    Returns a list to preserve the order from the config file.
+    """
     try:
         if config is None:
             config = getattr(engine_client.model_config.hf_config, "talker_config", None)
             if config is None:
-                return set()
+                return []
 
         for attr_name in ("spk_id", "speaker_id"):
             speakers = config.get(attr_name) if isinstance(config, dict) else getattr(config, attr_name, None)
             if speakers and isinstance(speakers, dict):
-                return {speaker.lower() for speaker in speakers}
+                return [speaker.lower() for speaker in speakers]
 
         logger.warning("No speakers found in config (checked spk_id and speaker_id)")
     except Exception as exc:
         logger.warning("Could not load speakers from model config: %s", exc)
-    return set()
+    return []
 
 
 def load_codec_frame_rate(engine_client: Any) -> float | None:
