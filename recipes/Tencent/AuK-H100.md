@@ -107,6 +107,15 @@ Text-only instruct TTS passes `None` for the audio and must set `gen_seconds`.
 Editing and enhancement requests pass the source clip and may omit
 `gen_seconds` to keep the source length.
 
+For concurrent requests on an 80GB GPU, select the optional
+`vllm_omni/deploy/auk_batch.yaml` profile with `deploy_config` when creating
+`Omni`. It raises both stages' capacity to 128 and gives stage 1 a 200ms maximum
+admission window. Requests with the same target length and Euler schedule share
+a DiT/VAE pass; seeds, reference clips and output ordering remain request-local.
+The default Base/Flash sampling recipes and encoder settings are inherited from
+`auk.yaml`. Larger graph buckets cost startup time and GPU memory; uncaptured
+shapes can still pay a capture cost on their first request.
+
 ## Verification
 
 ```bash
