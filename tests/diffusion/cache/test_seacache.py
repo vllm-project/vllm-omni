@@ -391,7 +391,7 @@ def test_target_only_cfg_parallel_uneven_idle_ranks_and_intervals(world_size):
         result_queue = manager.Queue()
         torch.multiprocessing.spawn(
             _control_cfg_parallel_worker,
-            args=(world_size, get_distributed_init_method("seacache_target_cfg_"), result_queue),
+            args=(world_size, get_file_store_init_method(), result_queue),
             nprocs=world_size,
         )
         results = [result_queue.get(timeout=2) for _ in range(world_size)]
