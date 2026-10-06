@@ -10,10 +10,10 @@ async_chunk: false
 stages:
   # Stage 0: AR Model (GlmImageForConditionalGeneration)
   # Generates prior_token_ids for conditioning the diffusion process.
-  # max_tokens is set to the theoretical maximum (2048x2048 t2i ≈ 4353
-  # tokens). The AR model stops naturally at EOS (16385) well before
-  # this ceiling at lower resolutions. Do NOT override max_tokens per
-  # request — the actual resolution is communicated via target_h/w.
+  # max_tokens is the 2048x2048 ceiling (t2i ≈ 4353 tokens). Online serving
+  # overrides this with a resolution-aware budget from glm_image_ar_max_tokens()
+  # when height/width are known. Offline callers should set max_tokens via
+  # compute_max_tokens(height, width, is_i2i). target_h/w drive M-RoPE grids.
   - stage_id: 0
     max_num_seqs: 1
     gpu_memory_utilization: 0.6

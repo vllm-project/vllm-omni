@@ -30,7 +30,11 @@ from vllm.renderers.chat_utils import (
 )
 
 from vllm_omni.diffusion.utils.image_output import extract_images_from_outputs
-from vllm_omni.diffusion.utils.param_utils import apply_declared_extra_args, ar_grid_max_tokens
+from vllm_omni.diffusion.utils.param_utils import (
+    apply_declared_extra_args,
+    ar_grid_max_tokens,
+    glm_image_ar_max_tokens,
+)
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.openai.diffusion_request_utils import (
     apply_normalized_diffusion_request_extra_args,
@@ -954,12 +958,23 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 )
                 self._apply_text_chat_ar_task_mode(sampling_params_list, request)
                 # Apply user-specified overrides to diffusion stage(s) for image generation
+                explicit_fields = getattr(request, "model_fields_set", None)
+                if explicit_fields is None:
+                    explicit_fields = getattr(request, "__fields_set__", set())
                 for idx, sp in enumerate(sampling_params_list):
                     if idx == comprehension_idx:
                         extra_args = dict(getattr(sp, "extra_args", {}) or {})
                         extra_args["target_h"] = int(_image_gen_height)
                         extra_args["target_w"] = int(_image_gen_width)
                         sp.extra_args = extra_args
+                        self._apply_glm_image_ar_max_tokens_if_needed(
+                            self.engine_client.stage_configs[comprehension_idx],
+                            sp,
+                            int(_image_gen_height),
+                            int(_image_gen_width),
+                            is_i2i=is_img2img,
+                            user_set_max_tokens="max_tokens" in explicit_fields,
+                        )
                     if hasattr(sp, "height") and _image_gen_height is not None:
                         sp.height = _image_gen_height
                     if hasattr(sp, "width") and _image_gen_width is not None:
@@ -1446,6 +1461,26 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             if is_comprehension:
                 return idx
         raise ValueError("No comprehension stage (is_comprehension=True) found in stage configs")
+
+    def _apply_glm_image_ar_max_tokens_if_needed(
+        self,
+        stage_cfg: Any,
+        sampling_params: Any,
+        height: int,
+        width: int,
+        *,
+        is_i2i: bool,
+        user_set_max_tokens: bool = False,
+    ) -> None:
+        """Set a resolution-aware AR ``max_tokens`` budget for GLM-Image."""
+        if user_set_max_tokens:
+            return
+        model_arch, _ = self._stage_model_metadata(stage_cfg)
+        if model_arch != "GlmImageForConditionalGeneration":
+            return
+        budget = glm_image_ar_max_tokens(height, width, is_i2i=is_i2i)
+        if budget is not None and hasattr(sampling_params, "max_tokens"):
+            sampling_params.max_tokens = budget
 
     # OpenAI API standard sampling parameters that can be safely overridden.
     # These are the most commonly used parameters with compatible types
@@ -3417,7 +3452,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 default_stage_params.seed = seed
 
             # Inject target_h/w into AR stage for M-RoPE position pre-computation
-            # (e.g. GLM-Image). max_tokens comes from deploy YAML.
+            # (e.g. GLM-Image). GLM-Image also gets a resolution-aware max_tokens
+            # budget here so Stage 0 stops near EOS instead of at the deploy ceiling.
             if comprehension_idx is not None and idx == comprehension_idx and height is not None and width is not None:
                 extra_args = getattr(default_stage_params, "extra_args", None)
                 if extra_args is None:
@@ -3425,6 +3461,13 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     default_stage_params.extra_args = extra_args
                 extra_args["target_h"] = int(height)
                 extra_args["target_w"] = int(width)
+                self._apply_glm_image_ar_max_tokens_if_needed(
+                    stage_cfg,
+                    default_stage_params,
+                    int(height),
+                    int(width),
+                    is_i2i=bool(reference_images),
+                )
 
             if stage_type == "diffusion":
                 self._set_if_supported(
