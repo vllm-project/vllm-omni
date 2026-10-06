@@ -231,8 +231,8 @@ def test_larger_loop_entry_reuses_near_batch_and_rejects_tiny_batch() -> None:
     wrapper = AuKCUDAGraphWrapper(_make_dit("cpu"), enabled=False)
     fake128 = object()
     fake8 = object()
-    wrapper._loop_cache[(128, 160, 96, 0, True, 4)] = fake128  # type: ignore[assignment]
-    wrapper._loop_cache[(8, 160, 96, 0, True, 4)] = fake8  # type: ignore[assignment]
+    wrapper._loop_cache[(128, 160, 32, 0, True, 4)] = fake128  # type: ignore[assignment]
+    wrapper._loop_cache[(8, 160, 32, 0, True, 4)] = fake8  # type: ignore[assignment]
 
     _, entry = wrapper._larger_loop_entry(127, 160, 32, 0, True, 4)
     assert entry is fake128
@@ -241,6 +241,9 @@ def test_larger_loop_entry_reuses_near_batch_and_rejects_tiny_batch() -> None:
     _, entry = wrapper._larger_loop_entry(7, 160, 32, 0, True, 4)
     assert entry is fake8
     _, entry = wrapper._larger_loop_entry(127, 160, 32, 0, True, 32)
+    assert entry is None
+    # Reusing a longer conditioning sequence adds work and changes bf16 rounding.
+    _, entry = wrapper._larger_loop_entry(7, 160, 16, 0, True, 4)
     assert entry is None
 
 
