@@ -367,14 +367,22 @@ class ARDiffusionPagedForwardContext:
         """
         if self.frame_causal:
             return self._build_frame_causal_block_table(action_len=action_len, query_len=query_len, device=device)
-        video_blocks, video_len = self.video_block_table(device)
-        # Keep tensor shapes fixed for compile/CUDA graphs, including steps whose
-        # accumulated video length happens to be page-aligned.
-        if action_len and self.chunk_size % self.block_size:
-            block_ids = self._pack_auxiliary_tails([(video_blocks, video_len)], action_len, device)[0]
+        manager = self.kv_cache.manager.coordinator.single_type_managers[0]
+        grouped = (
+            self.kv_cache.spec.eviction_group_frames > 1
+            and self.chunk_size % self.block_size
+            and manager.get_num_skipped_tokens(int(self.adapter.num_computed_tokens)) > 0
+        )
+        if grouped:
+            block_ids, video_len = self._pack_grouped_window(action_len, device)
         else:
-            self.ensure_action_slots(action_len, device)
-            block_ids = video_blocks + self.action_scratch_block_ids
+            video_blocks, video_len = self.video_block_table(device)
+            # Keep tensor shapes fixed even when this step ends on a page boundary.
+            if action_len and self.chunk_size % self.block_size:
+                block_ids = self._pack_auxiliary_tails([(video_blocks, video_len)], action_len, device)[0]
+            else:
+                self.ensure_action_slots(action_len, device)
+                block_ids = video_blocks + self.action_scratch_block_ids
         if not block_ids:
             raise RuntimeError("AR-Diffusion paged attention needs at least current video KV blocks")
 
@@ -400,6 +408,40 @@ class ARDiffusionPagedForwardContext:
         query_start_loc = _to_device_async(torch.tensor([0, self.query_len], dtype=torch.int32), device)
         seq_lens = _to_device_async(torch.tensor([self.kv_len], dtype=torch.int32), device)
         return block_table, query_start_loc, seq_lens, self.query_len, max_seq_len
+
+    def _pack_grouped_window(self, action_len: int, device: torch.device) -> tuple[list[int], int]:
+        """Pack exact grouped history; boundary pages can contain evicted tokens."""
+        self.ensure_video_slots(device)
+        history = self._history_tokens
+        manager = self.kv_cache.manager.coordinator.single_type_managers[0]
+        skipped = manager.get_num_skipped_tokens(history)
+        sink = min(history, self.sink_tokens)
+        positions = torch.cat((torch.arange(sink), torch.arange(sink + skipped, history)))
+        table = self.kv_cache.block_table(self.adapter)
+        past = compute_slot_mapping(table, positions, self.block_size)
+        current = compute_slot_mapping(
+            self.current_video_block_ids,
+            torch.arange(self._current_offset, self._current_offset + self.seq_len),
+            self.block_size,
+        )
+        visible = torch.cat((past, current))
+        video_len = len(visible)
+        pages = -(-(self.max_video_tokens + action_len) // self.block_size)
+        private = self.kv_cache.scratch_block_ids(
+            self.kv_branch, self.kv_cache.scratch_blocks_per_kv_branch - pages, pages
+        )
+        # Fixed shapes keep compile/graph inputs stable while the window fills.
+        sources = torch.full((self.max_video_tokens,), self.kv_cache.null_block_id * self.block_size, dtype=torch.long)
+        sources[:video_len] = visible
+        self.tail_source_slots = _to_device_async(sources, device)
+        self.tail_destination_slots = _to_device_async(
+            compute_slot_mapping(private, torch.arange(self.max_video_tokens), self.block_size), device
+        )
+        self.action_slot_mapping = _to_device_async(
+            compute_slot_mapping(private, torch.arange(video_len, video_len + action_len), self.block_size), device
+        )
+        self._action_len = action_len
+        return private[: -(-(video_len + action_len) // self.block_size)], video_len
 
     def _pack_auxiliary_tails(
         self, views: list[tuple[list[int], int]], action_len: int, device: torch.device

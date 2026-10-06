@@ -204,6 +204,10 @@ def estimate_ar_diffusion_kv_cache_memory(
         scratch_frames * blocks_per_frame + extra_scratch_blocks,
         scratch_blocks_override,
     )
+    if spec.eviction_group_frames > 1 and spec.tokens_per_frame % block_size:
+        # Exact grouped windows may need repacking across unaligned page boundaries.
+        visible_tokens = (spec.window_frames + spec.sink_frames + scratch_frames) * spec.tokens_per_frame
+        scratch_blocks_per_local_branch += -(-(visible_tokens + spec.max_scratch_tokens_per_branch) // block_size)
     scratch_num_blocks = spec.num_local_kv_branches * scratch_blocks_per_local_branch
     scratch_reserved_bytes = scratch_num_blocks * page_size_bytes
     managed_num_blocks = (
@@ -309,6 +313,11 @@ class ARDiffusionKVCache:
     Build once per loaded model (dimensions known); then per request:
     ``begin_request`` → per chunk (``allocate_chunk`` → ``chunk_write_slots`` →
     [model writes K/V] → ``commit_chunk``) → ``end_request``.
+
+    ``eviction_group_frames`` counts consecutive KV frame blocks that must be
+    evicted together, independently of the forward's commit span. The default
+    is 1. See :class:`ARDiffusionKVCacheSpec` for the grouping policy and a
+    model-specific example.
     """
 
     def __init__(
@@ -331,6 +340,7 @@ class ARDiffusionKVCache:
         max_scratch_frames_per_branch: int | None = None,
         max_scratch_tokens_per_branch: int = 0,
         model_owned_state_bytes_per_session: int = 0,
+        eviction_group_frames: int = 1,
     ) -> None:
         if not config.enable:
             raise ValueError("ARDiffusionKVCache built with a disabled ARDiffusionKVConfig")
@@ -412,6 +422,7 @@ class ARDiffusionKVCache:
             window_chunks=config.window_chunks,
             sink_chunks=config.sink_chunks,
             reset_at_boundary=config.reset_at_boundary,
+            eviction_group_frames=eviction_group_frames,
         )
 
         override_blocks = ar_diffusion_scratch_blocks_override()
@@ -426,6 +437,7 @@ class ARDiffusionKVCache:
             window_frames=config.window_chunks,
             sink_frames=config.sink_chunks,
             reset_at_boundary=config.reset_at_boundary,
+            eviction_group_frames=eviction_group_frames,
             kv_branches=kv_branches,
             session_capacity=session_capacity,
             cross_attention=tuple(

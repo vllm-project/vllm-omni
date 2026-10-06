@@ -82,6 +82,19 @@ class ARDiffusionKVCacheSpec:
     recent sliding tail and ``sink_frames`` is the separately retained prefix;
     both are expressed in the same frame/block unit.
 
+    ``eviction_group_frames`` is the number of consecutive KV frame blocks
+    that must be evicted together. The default, 1, permits independent block
+    eviction. Larger values keep related history entries together: eviction
+    rounds up to whole groups, so the retained tail may be smaller than
+    ``window_frames``. The sink prefix must also contain whole groups. This
+    grouping is independent of how many blocks a forward commits at once.
+
+    For example, Cosmos Sim Transfer's chunk1 sliding history stores a control
+    latent block followed by a clean latent block for each temporal position.
+    It uses ``eviction_group_frames=2`` so eviction cannot leave half a pair.
+    The count refers to KV frame blocks, not output video frames; intermediate
+    noisy latents occupy scratch and are not part of the committed history.
+
     ``max_scratch_frames_per_branch`` is the maximum current-video span that a
     non-committing forward writes to scratch. It defaults to
     ``frames_per_block``. ``max_scratch_tokens_per_branch`` is the maximum
@@ -107,6 +120,8 @@ class ARDiffusionKVCacheSpec:
     kv_branches: tuple[ARDiffusionKVBranchSpec, ...]
     session_capacity: int
     sink_frames: int = 0
+    # Number of consecutive KV frame blocks evicted together; see the policy above.
+    eviction_group_frames: int = 1
     reset_at_boundary: bool = False
     cross_attention: tuple[ARDiffusionCrossAttentionKVSpec, ...] = ()
     # Initial vLLM storage horizon; extended to fit an in-flight span.
@@ -123,6 +138,7 @@ class ARDiffusionKVCacheSpec:
             "tokens_per_frame": self.tokens_per_frame,
             "frames_per_block": self.frames_per_block,
             "window_frames": self.window_frames,
+            "eviction_group_frames": self.eviction_group_frames,
             "session_capacity": self.session_capacity,
             "max_model_len": self.max_model_len,
         }
@@ -131,6 +147,12 @@ class ARDiffusionKVCacheSpec:
                 raise ValueError(f"AR-Diffusion {name} must be positive, got {value}")
         if self.sink_frames < 0:
             raise ValueError(f"AR-Diffusion sink_frames must be non-negative, got {self.sink_frames}")
+        if self.sink_frames % self.eviction_group_frames:
+            raise ValueError("AR-Diffusion sinks must contain complete eviction groups")
+        if self.window_frames < self.eviction_group_frames - 1:
+            raise ValueError("AR-Diffusion window must accommodate an incomplete eviction group")
+        if self.reset_at_boundary and self.eviction_group_frames != 1:
+            raise ValueError("Grouped eviction does not support reset_at_boundary")
         if self.max_scratch_frames_per_branch is not None and self.max_scratch_frames_per_branch < 0:
             raise ValueError(
                 "AR-Diffusion max_scratch_frames_per_branch must be non-negative, "

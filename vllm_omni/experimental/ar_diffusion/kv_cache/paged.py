@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Generic paging mechanics + chunk-window eviction spec for the AR-Diffusion engine.
 
 Engine-generic, model-agnostic primitives — the layer a second model (e.g. the
@@ -177,6 +178,7 @@ def chunk_window_skipped_tokens(
     sliding_window: int,
     sink_chunks: int,
     reset_at_boundary: bool,
+    eviction_group_frames: int = 1,
 ) -> int:
     """Tokens outside the resident chunk window, snapped to a chunk boundary.
 
@@ -185,16 +187,26 @@ def chunk_window_skipped_tokens(
 
     - ``reset_at_boundary``: at each chunk boundary everything past
       the sink is dropped.
-    - otherwise (VGGT-style sliding replace): keep the last ``window`` tokens
-      (plus the sink); the skip count snaps down to a chunk boundary so a chunk
-      is never half-evicted.
+    - otherwise: retain a sliding tail plus the sink, evicting only complete
+      chunks or complete groups of chunks.
+
+    ``eviction_group_frames`` groups consecutive chunks of ``chunk_size``
+    tokens. For sliding eviction, first count complete overflowing chunks,
+    then round that count up to a whole group. This can retain fewer tokens
+    than ``sliding_window``; group size 1 preserves ordinary chunk eviction.
+    The caller must provide a group-aligned sink and enough tail capacity for
+    an incomplete group (see :class:`ARDiffusionKVCacheSpec`).
     """
     sink = sink_chunks * chunk_size
     if reset_at_boundary:
         completed = (num_computed_tokens // chunk_size) * chunk_size
         return max(0, completed - sink)
     skipped = max(0, num_computed_tokens - sliding_window - sink)
-    return (skipped // chunk_size) * chunk_size
+    skipped_chunks = skipped // chunk_size
+    # Round eviction up to complete groups, preserving any incomplete group
+    # at the tail. Group size 1 preserves ordinary sliding-window eviction.
+    groups = (skipped_chunks + eviction_group_frames - 1) // eviction_group_frames
+    return groups * eviction_group_frames * chunk_size
 
 
 def visible_window_blocks(*, chunk_size: int, block_size: int, sink_tokens: int, window_tokens: int) -> int:
@@ -225,6 +237,7 @@ class ChunkWindowManager(SlidingWindowManager):
             sliding_window=self.sliding_window,
             sink_chunks=spec.sink_chunks,
             reset_at_boundary=spec.reset_at_boundary,
+            eviction_group_frames=spec.eviction_group_frames,
         )
 
     def compact_block_table(self, request_id: str) -> int:
@@ -251,7 +264,8 @@ class ChunkWindowManager(SlidingWindowManager):
         end = start
         while end < len(blocks) and blocks[end] == self._null_block:
             end += 1
-        blocks_per_step = spec.chunk_size // math.gcd(spec.chunk_size, self.block_size)
+        group_tokens = spec.chunk_size * spec.eviction_group_frames
+        blocks_per_step = group_tokens // math.gcd(group_tokens, self.block_size)
         end = start + (end - start) // blocks_per_step * blocks_per_step
         if end == start:
             return 0
@@ -308,9 +322,16 @@ class ChunkWindowSpec(SlidingWindowSpec):
     window_chunks: int
     sink_chunks: int = 0
     reset_at_boundary: bool = False
+    eviction_group_frames: int = 1
 
     def __post_init__(self):
         super().__post_init__()
+        if self.eviction_group_frames <= 0 or self.sink_chunks % self.eviction_group_frames:
+            raise ValueError("Eviction groups must be positive and divide the sink prefix")
+        if self.window_chunks < self.eviction_group_frames - 1:
+            raise ValueError("Window must accommodate an incomplete eviction group")
+        if self.reset_at_boundary and self.eviction_group_frames != 1:
+            raise ValueError("Grouped eviction does not support reset_at_boundary")
         if self.sliding_window != self.window_chunks * self.chunk_size:
             raise ValueError(
                 "ChunkWindowSpec.sliding_window must equal "
