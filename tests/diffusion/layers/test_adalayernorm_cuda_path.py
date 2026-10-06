@@ -54,6 +54,7 @@ def make_inputs(bs, seq, hidden, dtype, device, seed=0):
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("affine", [False, True])
 @pytest.mark.parametrize("bs,seq,hidden", [(1, 512, 3072), (2, 128, 1536), (1, 3, 1000)])
+@torch.no_grad()
 def test_fused_fast_path_matches_native(dtype, affine, bs, seq, hidden):
     # hidden=1000 exercises BLOCK_C masking (next_pow2(1000)=1024 > 1000)
     device = "cuda"
@@ -82,6 +83,51 @@ def test_fused_noncontiguous_x(dtype):
     out = m.forward_cuda(x, scale, shift)
     assert_close(out, m.forward_native(x, scale, shift), dtype)
     assert_close(out, fp32_reference(x.contiguous(), scale, shift, 1e-6), dtype, loose=True)
+
+
+def test_normalized_shape_mismatch_preserves_native_error():
+    m = AdaLayerNorm(16, elementwise_affine=False).cuda()
+    x = torch.randn(1, 2, 32, device="cuda")
+    scale = torch.zeros(32, device="cuda")
+    shift = torch.zeros_like(scale)
+    assert _adaln_fused_forward(m, x, scale, shift) is None
+    with pytest.raises(RuntimeError) as native_error:
+        m.forward_native(x, scale, shift)
+    with pytest.raises(RuntimeError) as cuda_error:
+        m.forward_cuda(x, scale, shift)
+    assert str(cuda_error.value) == str(native_error.value)
+
+
+@pytest.mark.parametrize("grad_target", ["x", "scale", "shift", "weight", "bias"])
+def test_grad_fallback_matches_native_backward(grad_target):
+    m = make_module(32, grad_target in ("weight", "bias"), 1e-6, "cuda", torch.float32)
+    m.requires_grad_(False)
+    x, scale, shift = make_inputs(1, 2, 32, torch.float32, "cuda", seed=12)
+    targets = {"x": x, "scale": scale, "shift": shift, "weight": m.layernorm.weight, "bias": m.layernorm.bias}
+    target = targets[grad_target]
+    target.requires_grad_(True)
+    with torch.enable_grad():
+        assert _adaln_fused_forward(m, x, scale, shift) is None
+        native = m.forward_native(x, scale, shift)
+        out = m.forward_cuda(x, scale, shift)
+        assert out.requires_grad
+        torch.testing.assert_close(out, native)
+        upstream = torch.randn_like(out)
+        native_grad = torch.autograd.grad(native, target, upstream)[0]
+        cuda_grad = torch.autograd.grad(out, target, upstream)[0]
+        torch.testing.assert_close(cuda_grad, native_grad)
+
+
+def test_no_grad_keeps_fused_path_for_grad_requiring_tensors():
+    m = make_module(32, True, 1e-6, "cuda", torch.float32)
+    x, scale, shift = make_inputs(1, 2, 32, torch.float32, "cuda", seed=14)
+    for tensor in (x, scale, shift):
+        tensor.requires_grad_(True)
+    with torch.no_grad():
+        fused = _adaln_fused_forward(m, x, scale, shift)
+        assert fused is not None
+        assert not fused.requires_grad
+        torch.testing.assert_close(fused, m.forward_native(x, scale, shift), atol=1e-3, rtol=1e-3)
 
 
 def test_1d_scale_shift_fast_path():

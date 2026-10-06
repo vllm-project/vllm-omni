@@ -91,6 +91,7 @@ def test_matrix_framewise_modulation(dtype, chunks, bs, frames, spatial):
 
 
 @pytest.mark.parametrize("shared_scale,shared_shift", [(False, True), (True, False), (True, True)])
+@torch.no_grad()
 def test_matrix_framewise_shared_modulation(shared_scale, shared_shift):
     dtype = torch.bfloat16
     hidden = 2240
@@ -141,6 +142,7 @@ def test_matrix_sana_patch_embed_reaches_framewise_fused_path(dtype):
 @pytest.mark.parametrize(
     "bs,seq,hidden", [(1, 4096, 3072), (2, 1024, 1536), (3, 128, 4096), (1, 1, 3072), (1, 8192, 1536)]
 )
+@torch.no_grad()
 def test_matrix_main(dtype, affine, bs, seq, hidden):
     device = "cuda"
     m = make_module(hidden, affine, 1e-6, device, dtype)
@@ -156,6 +158,7 @@ def test_matrix_main(dtype, affine, bs, seq, hidden):
 
 
 @pytest.mark.parametrize("dtype", DTYPES)
+@torch.no_grad()
 def test_matrix_weight_bias_nondefault(dtype):
     # weight/bias semantics with non-identity initialization:
     # out = (w * ln(x) + b) * (1 + scale) + shift

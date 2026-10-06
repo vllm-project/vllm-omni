@@ -125,7 +125,7 @@ if _HAS_TRITON:
             y = (t2.to(tl.float32) + sh).to(out_dtype)
         else:
             y = xn * (1.0 + s) + sh
-        # out 与输入形状相同，按连续行写入。
+        # Preserve the input shape and store output rows contiguously.
         tl.store(out_ptr + row * channels + cols, y.to(out_dtype), mask=mask)
 
     def _adaln_modulation_mode(t: torch.Tensor, x: torch.Tensor):
@@ -145,7 +145,7 @@ if _HAS_TRITON:
         if x.ndim == 3 and t.ndim == 3 and shape == (x.shape[0], 1, x.shape[-1]):
             return "per_sample"
         if x.ndim == 4 and t.ndim == 4 and shape == (x.shape[0], x.shape[1], 1, x.shape[-1]):
-            # batch/frame 必须能用单个 row stride 线性寻址；保留 chunk view。
+            # Batch/frame groups must be addressable with one row stride, including chunk views.
             if shape[0] > 1 and shape[1] > 1 and t.stride(0) != shape[1] * t.stride(1):
                 return None
             return "per_sample"
@@ -200,10 +200,16 @@ if _HAS_TRITON:
         if x.data_ptr() % 16 or scale.data_ptr() % 16 or shift.data_ptr() % 16:
             return None
         channels = x.shape[-1]
+        ln = module.layernorm
+        if tuple(ln.normalized_shape) != (channels,):
+            return None
+        if torch.is_grad_enabled() and any(
+            t is not None and t.requires_grad for t in (x, scale, shift, ln.weight, ln.bias)
+        ):
+            return None
         block_c = triton.next_power_of_2(channels)
         if block_c > _MAX_BLOCK_C:
             return None
-        ln = module.layernorm
         for p in (ln.weight, ln.bias):
             if p is not None and not _adaln_param_matches(x, p):
                 return None
@@ -233,7 +239,7 @@ if _HAS_TRITON:
             num_warps = 4 if block_c <= 1024 else (8 if block_c <= 4096 else 16)
             cfg = (block_c, num_warps)
             _ADALN_CONFIGS[block_c] = cfg
-        # F > 1 时按 frame 跨行；F = 1 时按 batch 跨行。
+        # Step across frames when F > 1, otherwise across batches.
         scale_row_stride = scale.stride(1) if scale.ndim == 4 and scale.shape[1] > 1 else scale.stride(0)
         shift_row_stride = shift.stride(1) if shift.ndim == 4 and shift.shape[1] > 1 else shift.stride(0)
         # Dummy pointer args for disabled branches: never dereferenced because
