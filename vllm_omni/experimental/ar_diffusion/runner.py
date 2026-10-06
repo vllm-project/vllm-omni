@@ -123,7 +123,6 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
     def __init__(self, vllm_config: object, od_config: OmniDiffusionConfig, device: torch.device) -> None:
         super().__init__(vllm_config, od_config, device)
         self.ar_diffusion_kv_config = resolve_ar_diffusion_kv_config(od_config)
-        self._ar_diffusion_kv_overrides = self.ar_diffusion_kv_config
         self.kv_cache: ARDiffusionKVCache | None = None
         self._ar_diffusion_capability: SupportsARDiffusionPipeline | None = None
         self._ar_diffusion_kv_cache_spec: ARDiffusionKVCacheSpec | None = None
@@ -178,13 +177,12 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
     ) -> tuple[ARDiffusionKVCacheSpec, ARDiffusionKVConfig]:
         """Apply runner overrides and validate the resulting structural contract."""
 
-        overrides = getattr(self, "_ar_diffusion_kv_overrides", self.ar_diffusion_kv_config)
         config = dataclasses.replace(
-            overrides,
+            self.ar_diffusion_kv_config,
             chunk_size=spec.tokens_per_frame,
-            window_chunks=overrides.window_chunks or spec.window_frames,
-            sink_chunks=overrides.sink_chunks or spec.sink_frames,
-            reset_at_boundary=overrides.reset_at_boundary or spec.reset_at_boundary,
+            window_chunks=self.ar_diffusion_kv_config.window_chunks or spec.window_frames,
+            sink_chunks=self.ar_diffusion_kv_config.sink_chunks or spec.sink_frames,
+            reset_at_boundary=self.ar_diffusion_kv_config.reset_at_boundary or spec.reset_at_boundary,
         )
         effective = dataclasses.replace(
             spec,

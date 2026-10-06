@@ -92,11 +92,12 @@ def runner(monkeypatch):
 
 
 def test_dynamic_window_does_not_become_a_deployment_override(runner):
-    runner._ar_diffusion_kv_overrides = runner.ar_diffusion_kv_config
     first = replace(runner.pipeline.spec, window_frames=53, sink_frames=6)
     effective, config = runner._effective_spec(runner.pipeline, first)
     assert effective.window_frames == 53
-    runner.ar_diffusion_kv_config = config
+    assert config.window_chunks == 53
+    assert runner.ar_diffusion_kv_config.window_chunks is None
+    assert runner.ar_diffusion_kv_config.sink_chunks == 0
     second = replace(first, window_frames=1, sink_frames=0)
     effective, _ = runner._effective_spec(runner.pipeline, second)
     assert effective.window_frames == 1
