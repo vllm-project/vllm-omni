@@ -398,6 +398,18 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         super().load_model(*args, **kwargs)
         self._resolve_duplex_sampling_hook(force=True)
 
+    def initialize_metadata_builders(self, kv_cache_config, kernel_block_sizes):
+        super().initialize_metadata_builders(kv_cache_config, kernel_block_sizes)
+        if (
+            self.model_config.single_stage_pipeline
+            and self.model_config.engine_output_type == "text"
+            and not self._client_multimodal_output_keys()
+        ):
+            # Native KV prefix reuse needs no hidden-output mirror when this
+            # text stage has no downstream stage or multimodal client output.
+            self._omni_prefix_cache_cfg = None
+            logger.info("Skipping unused Omni output mirror for single-stage text; KV prefix cache remains enabled")
+
     def _make_buffer(self, *size, dtype, numpy=True):
         # Prevent ray from pinning the buffer due to large size
         from vllm_omni.distributed.ray_utils.utils import (
