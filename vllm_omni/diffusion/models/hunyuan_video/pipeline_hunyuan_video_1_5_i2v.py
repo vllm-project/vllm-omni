@@ -34,6 +34,7 @@ from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch, prefetch_subfolders
 from vllm_omni.diffusion.models.hunyuan_video.hunyuan_video_15_transformer import HunyuanVideo15Transformer3DModel
+from vllm_omni.diffusion.models.utils import latent_channels_from_vae
 from vllm_omni.diffusion.models.hunyuan_video.pipeline_hunyuan_video_1_5 import (
     extract_glyph_texts,
     format_text_input,
@@ -225,7 +226,7 @@ class HunyuanVideo15I2VPipeline(
         self.vae_scale_factor_spatial = (
             self.vae.spatial_compression_ratio if hasattr(self.vae, "spatial_compression_ratio") else 16
         )
-        self.num_channels_latents = self.vae.config.latent_channels if hasattr(self.vae, "config") else 32
+        self.num_channels_latents = latent_channels_from_vae(self.vae, default=32)
 
         # fmt: off
         # NOTE: whitespace must match the diffusers reference exactly because

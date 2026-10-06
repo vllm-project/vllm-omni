@@ -40,6 +40,7 @@ from vllm_omni.diffusion.models.qwen_image.pipeline_qwen_image_edit import (
 from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import (
     QwenImageTransformer2DModel,
 )
+from vllm_omni.diffusion.models.utils import latent_channels_from_vae
 from vllm_omni.diffusion.models.qwen_image.rope_utils import txt_seq_lens_from_embeds
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
@@ -266,7 +267,7 @@ class QwenImageEditPlusPipeline(
         self.stage = None
 
         self.vae_scale_factor = 2 ** len(self.vae.temperal_downsample) if getattr(self, "vae", None) else 8
-        self.latent_channels = self.vae.config.z_dim if getattr(self, "vae", None) else 16
+        self.latent_channels = latent_channels_from_vae(getattr(self, "vae", None), config_key="z_dim")
         self.image_processor = VaeImageProcessor(vae_scale_factor=self.vae_scale_factor * 2, do_convert_rgb=True)
         self.tokenizer_max_length = 1024
         # Edit prompt template - different from generation template, supports multiple images

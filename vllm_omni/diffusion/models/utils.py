@@ -242,6 +242,28 @@ def create_transformers_model_with_vllm_linears(
     return model
 
 
+def latent_channels_from_vae(
+    vae,
+    *,
+    config_key: str = "latent_channels",
+    default: int = 16,
+) -> int:
+    """Read the number of latent channels from a VAE's config.
+
+    Handles both attribute-based and dict-like configs, with a consistent
+    fallback when the VAE is ``None`` or has no config.
+    """
+    if vae is None:
+        return default
+    config = getattr(vae, "config", None)
+    if config is None:
+        return default
+    value = getattr(config, config_key, None)
+    if value is None and hasattr(config, "get"):
+        value = config.get(config_key)
+    return value if value is not None else default
+
+
 def _load_json(model_path: str, filename: str, local_files_only: bool = True) -> dict:
     """Load a JSON config file from a local path or HuggingFace Hub repo."""
     if local_files_only:

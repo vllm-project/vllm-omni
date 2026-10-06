@@ -33,6 +33,7 @@ from vllm_omni.diffusion.models.flux import (
 from vllm_omni.diffusion.models.flux.flux_pipeline_mixin import FluxPipelineMixin
 from vllm_omni.diffusion.models.interface import SupportImageInput, SupportsComponentDiscovery
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
+from vllm_omni.diffusion.models.utils import latent_channels_from_vae
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
@@ -162,7 +163,7 @@ class FluxKontextPipeline(
         self._current_timestep = None
         self._interrupt = False
         self._callback_tensor_inputs = ["latents", "prompt_embeds"]
-        self.latent_channels = self.vae.config.latent_channels if hasattr(self.vae, "config") else 16
+        self.latent_channels = latent_channels_from_vae(self.vae)
 
         self.setup_diffusion_pipeline_profiler(
             enable_diffusion_pipeline_profiler=self.od_config.enable_diffusion_pipeline_profiler

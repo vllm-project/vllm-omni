@@ -35,6 +35,7 @@ from vllm_omni.diffusion.models.longcat_image.longcat_image_transformer import (
     LongCatImageTransformer2DModel,
 )
 from vllm_omni.diffusion.models.longcat_image.pipeline_longcat_image import calculate_shift
+from vllm_omni.diffusion.models.utils import latent_channels_from_vae
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.utils.size_utils import normalize_min_aligned_size
@@ -282,7 +283,7 @@ class LongCatImageEditPipeline(
         self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1) if getattr(self, "vae", None) else 8
         self.image_processor = VaeImageProcessor(vae_scale_factor=self.vae_scale_factor * 2)
         self.image_processor_vl = self.text_processor.image_processor
-        self.latent_channels = self.vae.config.get("latent_channels", 16)
+        self.latent_channels = latent_channels_from_vae(self.vae)
 
         self.image_token = "<|image_pad|>"
         self.prompt_template_encode_prefix = (
@@ -460,7 +461,7 @@ class LongCatImageEditPipeline(
         if image is not None:
             image = image.to(device=self.device, dtype=dtype)
 
-            if image.shape[1] != self.vae.config.latent_channels:
+            if image.shape[1] != self.latent_channels:
                 image_latents = self._encode_vae_image(image=image, generator=generator)
             else:
                 image_latents = image
