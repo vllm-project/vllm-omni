@@ -40,6 +40,11 @@ from vllm_omni.model_extras.hunyuan_image3 import build_x_to_text_prompt as buil
 from vllm_omni.model_extras.hunyuan_image3 import (
     validate_ar_tokenizer as validate_hunyuan_image3_ar_tokenizer,
 )
+from vllm_omni.model_extras.kandinsky6 import (
+    KANDINSKY6_EXTRA_BODY_PARAMS,
+    KANDINSKY6_EXTRA_OUTPUT_PARAMS,
+    get_kandinsky6_video_generation_defaults,
+)
 from vllm_omni.model_extras.lingbot_video import LINGBOT_VIDEO_EXTRA_BODY_PARAMS
 from vllm_omni.model_extras.ltx2 import (
     LTX_EXTRA_BODY_PARAMS,
@@ -240,6 +245,13 @@ _EXTRA_SPECS: dict[str, dict[str, Any]] = {
     "HeliosPipeline": {
         "extra_body_params": HELIOS_EXTRA_BODY_PARAMS,
         "extra_output_params": HELIOS_EXTRA_OUTPUT_PARAMS,
+    },
+    "Kandinsky6TI2VAPipeline": {
+        "extra_body_params": KANDINSKY6_EXTRA_BODY_PARAMS,
+        "extra_output_params": KANDINSKY6_EXTRA_OUTPUT_PARAMS,
+        "video_generation_defaults_builder": get_kandinsky6_video_generation_defaults,
+        # forward() returns uint8 frames already; declared for completeness.
+        "output_tensor_range": "zero_to_one",
     },
     "HeliosPyramidPipeline": {
         "extra_body_params": HELIOS_EXTRA_BODY_PARAMS,

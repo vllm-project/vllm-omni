@@ -459,16 +459,22 @@ class GlmImageMultiModalProcessor(BaseMultiModalProcessor[GlmImageProcessingInfo
     def _apply_hf_processor_main(
         self,
         mm_items: MultiModalDataItems,
-        hf_processor_mm_kwargs: Mapping[str, object],
+        hf_kwargs: Mapping[str, object],
     ) -> BatchFeature:
         """Process source images under vLLM's token-only prompt contract."""
         mm_counts = mm_items.get_all_counts()
         num_images = mm_counts.get("image", 0)
         if num_images == 0:
-            return BatchFeature({"mrope_image_grid_thw": self._build_generation_grids(hf_processor_mm_kwargs)})
+            return BatchFeature({"mrope_image_grid_thw": self._build_generation_grids(hf_kwargs)})
 
         valid_mm_items = mm_items.select({key for key, count in mm_counts.items() if count > 0})
-        processor_data, passthrough_data = self._get_hf_mm_data(valid_mm_items)
+        processor_data: dict[str, object] = {}
+        passthrough_data: dict[str, object] = {}
+        for items in valid_mm_items.values():
+            if not items:
+                continue
+            processor_data.update(items.get_processor_data())
+            passthrough_data.update(items.get_passthrough_data())
         images = processor_data.get("images")
         if not images:
             return BatchFeature(dict(passthrough_data))
@@ -483,7 +489,7 @@ class GlmImageMultiModalProcessor(BaseMultiModalProcessor[GlmImageProcessingInfo
             source_grid_thw = image_grid_thw[:num_images]
             image_inputs["image_grid_thw"] = source_grid_thw
 
-            target_grid = self._build_generation_grids(hf_processor_mm_kwargs)[:1].to(dtype=source_grid_thw.dtype)
+            target_grid = self._build_generation_grids(hf_kwargs)[:1].to(dtype=source_grid_thw.dtype)
             image_inputs["mrope_image_grid_thw"] = torch.cat(
                 [source_grid_thw, target_grid],
                 dim=0,

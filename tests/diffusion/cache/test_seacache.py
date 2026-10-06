@@ -9,8 +9,8 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from vllm.utils.network_utils import get_file_store_init_method
 
-from tests.helpers.runtime import get_distributed_init_method
 from vllm_omni.diffusion.cache.seacache import (
     SeaCacheBackend,
     SeaCacheConfig,
@@ -565,7 +565,9 @@ def _uneven_cfg_sharded_worker(
         init_method=init_method,
         rank=rank,
         world_size=4,
-        timeout=datetime.timedelta(seconds=10),
+        # Spawned workers import torch/vLLM before joining; allow startup
+        # skew without changing the collective deadlock checks below.
+        timeout=datetime.timedelta(seconds=60),
     )
     try:
         fs_groups = [
@@ -611,7 +613,7 @@ def test_parameter_sharded_hook_handles_uneven_cfg_branch_dispatch() -> None:
     result_queue = manager.Queue()
     torch.multiprocessing.spawn(
         _uneven_cfg_sharded_worker,
-        args=(get_distributed_init_method("seacache_uneven_cfg_"), result_queue),
+        args=(get_file_store_init_method(), result_queue),
         nprocs=4,
     )
 
@@ -688,7 +690,7 @@ def test_hook_synchronizes_full_hybrid_sequence_parallel_group() -> None:
     result_queue = manager.Queue()
     torch.multiprocessing.spawn(
         _hybrid_sp_worker,
-        args=(get_distributed_init_method("seacache_hybrid_sp_"), result_queue),
+        args=(get_file_store_init_method(), result_queue),
         nprocs=4,
     )
 

@@ -3,6 +3,7 @@
 """Regression tests for MiniMax H3's disaggregated encoder contract."""
 
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import Mock
 
 import numpy as np
@@ -164,6 +165,36 @@ def test_prepare_ref2va_keeps_original_text_and_exact_condition_order():
     assert media.task == "ref2va"
     assert len(media.images) == 1
     assert len(media.audios) == 1
+
+
+@pytest.mark.parametrize(
+    ("image_size", "output_size"),
+    [
+        ((1344, 768), (448, 256)),
+        ((1344, 768), (1344, 768)),
+        ((640, 384), (1344, 768)),
+    ],
+)
+def test_ref2va_reference_sizing_is_shared_by_qwen_and_vae(image_size, output_size):
+    from vllm_omni.model_executor.models.minimax_h3.encoder import MiniMaxH3Encoder
+    from vllm_omni.model_executor.models.minimax_h3.encoder_processing import prepare_encoder_inputs
+
+    images = [Image.new("RGB", image_size, color=color) for color in ("red", "green", "blue", "white")]
+    prompt = {"prompt": "Use all four references.", "multi_modal_data": {"image": images}}
+    sampling = OmniDiffusionSamplingParams(height=output_size[1], width=output_size[0], extra_args={"task": "ref2va"})
+
+    local = prepare_encoder_inputs(prompt, sampling)
+    transformed = prepare_encoder_prompt(prompt, [sampling])
+    media = MiniMaxH3Encoder._media_input(transformed["additional_information"])
+    qwen_images = transformed["multi_modal_data"]["image"]
+    assert len(qwen_images) == len(media.images) == 4
+    assert (media.width, media.height) == output_size
+    for index, qwen_image in enumerate(qwen_images):
+        assert qwen_image.size == image_size
+        np.testing.assert_array_equal(np.asarray(qwen_image), media.images[index].numpy())
+        np.testing.assert_array_equal(np.asarray(qwen_image), np.asarray(local.images[index]))
+        torch.testing.assert_close(media.images[index], local.media.images[index])
+    assert [image.size for image in images] == [image_size] * 4
 
 
 def _mock_ref2va_video_with_audio(monkeypatch, *, duration_seconds: float) -> None:
@@ -581,7 +612,7 @@ def test_full_payload_hook_skips_only_absent_output():
     ],
 )
 def test_encoder_handoff_rejects_invalid_full_payload(case, message, via_connector):
-    payload = _full_encoder_output()
+    payload: Any = _full_encoder_output()
     layout = payload["kv_metadata"][MINIMAX_H3_ENCODER_LAYOUT_KEY]
     if case == "not_mapping":
         payload = []
@@ -621,7 +652,7 @@ def test_encoder_handoff_cleans_media_without_mutating_prompt_or_stripping_outpu
     incoming = _full_encoder_output()
     retained_hidden = torch.ones(1)
     media = torch.zeros(2)
-    prompt = {
+    prompt: dict[str, Any] = {
         "prompt": "hello",
         "negative_prompt": "blur",
         "multi_modal_data": {"image": object(), "audio": object(), "video": object()},

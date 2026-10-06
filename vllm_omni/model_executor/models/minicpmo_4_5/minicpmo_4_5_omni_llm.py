@@ -55,6 +55,8 @@ from transformers.modeling_outputs import BaseModelOutput, BaseModelOutputWithPo
 from transformers.modeling_utils import PreTrainedModel
 from transformers.models.whisper.modeling_whisper import ACT2FN
 
+from vllm_omni.model_executor.models.minicpmo_4_5.encoder_cuda_graph import EncoderCudaGraph
+
 try:
     from transformers.models.whisper.modeling_whisper import WHISPER_ATTENTION_CLASSES
 except ImportError:
@@ -1580,12 +1582,25 @@ class SiglipVisionTransformer(SiglipPreTrainedModel):
         self.encoder = SiglipEncoder(config)
         self.post_layernorm = nn.LayerNorm(embed_dim, eps=config.layer_norm_eps)
         self._use_flash_attention_2 = config._attn_implementation == "flash_attention_2"
+        self._encoder_graph: EncoderCudaGraph | None = None
 
         # Initialize weights and apply final processing
         self.post_init()
 
     def get_input_embeddings(self) -> nn.Module:
         return self.embeddings.patch_embedding
+
+    def _encode_last_hidden_state(
+        self, hidden_states: torch.Tensor, attention_mask: torch.Tensor | None
+    ) -> torch.Tensor:
+        output = self.encoder(
+            inputs_embeds=hidden_states,
+            attention_mask=attention_mask,
+            output_attentions=False,
+            output_hidden_states=False,
+            return_dict=True,
+        )
+        return self.post_layernorm(output.last_hidden_state)
 
     @add_start_docstrings_to_model_forward(SIGLIP_VISION_INPUTS_DOCSTRING)
     @replace_return_docstrings(output_type=BaseModelOutputWithPooling, config_class=SiglipVisionConfig)
@@ -1635,6 +1650,21 @@ class SiglipVisionTransformer(SiglipPreTrainedModel):
                 if not self._use_flash_attention_2
                 else patch_attention_mask
             )
+
+        # Position/mask construction above performs host decisions. Capture
+        # only the transformer stack; padded FlashAttention unpadding also
+        # reads dynamic lengths on the host and remains eager.
+        if (
+            self._encoder_graph is not None
+            and not self.training
+            and not output_attentions
+            and not output_hidden_states
+            and not (self._use_flash_attention_2 and attention_mask is not None)
+        ):
+            last_hidden_state = self._encoder_graph(hidden_states, attention_mask)
+            if not return_dict:
+                return (last_hidden_state, None)
+            return BaseModelOutputWithPooling(last_hidden_state=last_hidden_state)
 
         encoder_outputs = self.encoder(
             inputs_embeds=hidden_states,
@@ -3473,19 +3503,25 @@ class MiniCPMO45OmniLLMMultiModalProcessor(BaseMultiModalProcessor[MiniCPMO45Omn
     def _apply_hf_processor_main(
         self,
         mm_items: MultiModalDataItems,
-        hf_processor_mm_kwargs: Mapping[str, object],
+        hf_kwargs: Mapping[str, object],
     ) -> BatchFeature:
         """
         Process each modality independently because the MiniCPM processor
         asserts that image tags and image sizes have matching lengths.
         """
         valid_mm_items = mm_items.select({key for key, count in mm_items.get_all_counts().items() if count > 0})
-        mm_data, passthrough_data = self._get_hf_mm_data(valid_mm_items)
+        mm_data: dict[str, object] = {}
+        passthrough_data: dict[str, object] = {}
+        for items in valid_mm_items.values():
+            if not items:
+                continue
+            mm_data.update(items.get_processor_data())
+            passthrough_data.update(items.get_passthrough_data())
 
         tokenizer = self.info.get_tokenizer()
         prompt_text = self.dummy_inputs.get_dummy_text(mm_items.get_all_counts())
         input_ids = torch.tensor([tokenizer.encode(prompt_text)])
-        mm_inputs = self.process_mm_inputs(mm_data, hf_processor_mm_kwargs)
+        mm_inputs = self.process_mm_inputs(mm_data, hf_kwargs)
         processed_data = BatchFeature(
             {
                 "input_ids": input_ids,
@@ -3909,6 +3945,18 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
 
         self.config = config
         self.multimodal_config = multimodal_config
+        # Model-local opt-out for A/B measurements; --enforce-eager always wins.
+        encoder_graphs = (
+            bool(getattr(config, "encoder_cuda_graph", True)) and not vllm_config.model_config.enforce_eager
+        )
+        # Per-encoder limits, configurable via --hf-overrides. No eviction:
+        # increasing the cap trades retained GPU memory for shape coverage.
+        encoder_graph_options = {
+            "max_graphs": getattr(config, "encoder_cuda_graph_max_graphs", 4),
+            "min_capture_calls": getattr(config, "encoder_cuda_graph_min_capture_calls", 2),
+            "min_free_bytes": getattr(config, "encoder_cuda_graph_min_free_bytes", 1 << 30),
+            "share_pools": getattr(config, "encoder_cuda_graph_share_pools", True),
+        }
 
         # Initialize image processor
         self.image_processor = MiniCPMVImageProcessor(
@@ -3928,6 +3976,10 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
                 config.vision_config._attn_implementation = "eager"
 
             self.vpm = SiglipVisionTransformer(config.vision_config)
+            if encoder_graphs:
+                self.vpm._encoder_graph = EncoderCudaGraph(
+                    self.vpm._encode_last_hidden_state, vllm_config, **encoder_graph_options
+                )
             # Drop last layer if configured
             if config.drop_vision_last_layer:
                 self.vpm.encoder.layers = self.vpm.encoder.layers[:-1]
@@ -3995,6 +4047,11 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
             self.audio_encoder_layer = None
             self.audio_past_key_values = None
 
+        self._audio_encoder_graph = (
+            EncoderCudaGraph(self._encode_audio_features, vllm_config, **encoder_graph_options)
+            if encoder_graphs
+            else None
+        )
         self.mm_token_ids = set[int]()
         self.make_empty_intermediate_tensors = self.llm.make_empty_intermediate_tensors
 
@@ -4418,6 +4475,36 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
             audio_attention_mask_ = torch.logical_or(audio_attention_mask_, torch.logical_not(chunk_mask))
 
         audio_attention_mask[audio_attention_mask_] = float("-inf")
+        graph = getattr(self, "_audio_encoder_graph", None)
+        if (
+            graph is not None
+            and not self.training
+            and self.audio_encoder_layer == -1
+            # Whisper's FP16 overflow guard reads tensor booleans on the host.
+            and self.apm.conv1.weight.dtype != torch.float16
+        ):
+            audio_embeds = graph(wavforms, audio_attention_mask)
+        else:
+            audio_embeds = self._encode_audio_features(wavforms, audio_attention_mask)
+
+        _, feature_lens_after_pooling = self._get_feat_extract_output_lengths(audio_feature_lens)
+
+        num_audio_tokens = feature_lens_after_pooling
+
+        final_audio_embeds = list[torch.Tensor]()
+        idx = 0
+        for i in range(len(audio_feature_lens_raw)):
+            target_audio_embeds_lst = list[torch.Tensor]()
+            for _ in range(len(audio_feature_lens_raw[i])):
+                target_audio_embeds_lst.append(audio_embeds[idx, : num_audio_tokens[idx], :])
+                idx += 1
+
+            final_audio_embeds.append(torch.cat(target_audio_embeds_lst))
+
+        return final_audio_embeds
+
+    def _encode_audio_features(self, wavforms: torch.Tensor, audio_attention_mask: torch.Tensor) -> torch.Tensor:
+        """Stateless audio encoder, projection and pooling (no streaming KV)."""
         selects_final_layer = self.audio_encoder_layer == -1
         audio_outputs = self.apm(
             wavforms,
@@ -4437,21 +4524,7 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
         audio_embeds = self.audio_avg_pooler(audio_embeds)
         audio_embeds = audio_embeds.transpose(1, 2)
 
-        _, feature_lens_after_pooling = self._get_feat_extract_output_lengths(audio_feature_lens)
-
-        num_audio_tokens = feature_lens_after_pooling
-
-        final_audio_embeds = list[torch.Tensor]()
-        idx = 0
-        for i in range(len(audio_feature_lens_raw)):
-            target_audio_embeds_lst = list[torch.Tensor]()
-            for _ in range(len(audio_feature_lens_raw[i])):
-                target_audio_embeds_lst.append(audio_embeds[idx, : num_audio_tokens[idx], :])
-                idx += 1
-
-            final_audio_embeds.append(torch.cat(target_audio_embeds_lst))
-
-        return final_audio_embeds
+        return audio_embeds
 
     def get_audio_embedding_streaming(
         self,

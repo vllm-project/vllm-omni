@@ -30,6 +30,7 @@ import torchvision.transforms as T
 from PIL import Image
 from transformers import AutoTokenizer
 from vllm.logger import init_logger
+from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
@@ -47,6 +48,7 @@ from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+from vllm_omni.quantization import resolve_component_quant_config
 from vllm_omni.transformers_utils.configs.sensenova_u1 import (
     SenseNovaU1Config,
 )
@@ -498,7 +500,9 @@ class SenseNovaU1Pipeline(
 
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = ""):
         super().__init__()
+        quant_config = resolve_component_quant_config(od_config.quantization_config, "language_model")
         self.od_config = od_config
+        self._unsupported_quant_methods_check(quant_config)
         self.device = get_local_device()
         model_path = od_config.model
         self.local_model_path = _resolve_model_path(model_path)
@@ -514,6 +518,7 @@ class SenseNovaU1Pipeline(
         # Language model (TP-aware)
         self.language_model = SenseNovaU1ForCausalLM(
             self.llm_cfg,
+            quant_config=quant_config,
             prefix="language_model",
         )
         # Cache-DiT hooks pipeline.transformer(.blocks), so it must point at the
@@ -590,6 +595,21 @@ class SenseNovaU1Pipeline(
     # -----------------------------------------------------------------------
     # Helpers
     # -----------------------------------------------------------------------
+
+    def _unsupported_quant_methods_check(self, quant_config: QuantizationConfig | None) -> None:
+        """Reject online FP8 combined with distilled LoRA."""
+        if (
+            quant_config is None
+            or quant_config.get_name() != "fp8"
+            or getattr(quant_config, "is_checkpoint_fp8_serialized", False)
+        ):
+            return
+
+        if self.od_config.lora_backend == "distill" and self.od_config.lora_path:
+            raise ValueError(
+                "SenseNova does not support online FP8 with distilled LoRA "
+                "Use BF16 without quantization for distilled LoRA, or omit the LoRA options for online FP8."
+            )
 
     def _extract_feature(self, pixel_values, gen_model=False, grid_hw=None):
         if gen_model:

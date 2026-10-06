@@ -11,6 +11,7 @@ import secrets
 import time
 from collections import deque
 from collections.abc import Awaitable, Callable, Mapping
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, field
 from types import MappingProxyType
 
@@ -291,6 +292,7 @@ class DuplexSessionAttachmentRegistry:
         *,
         journal: bool = True,
         on_accepted: Callable[[], None] | None = None,
+        event_guard: Callable[[], AbstractContextManager[bool]] | None = None,
     ) -> JournalEntry | None:
         """Sequence and dispatch one event to the current attachment.
 
@@ -309,9 +311,15 @@ class DuplexSessionAttachmentRegistry:
             async with self._lock:
                 if self._sessions.get(session_id) is not state:
                     raise KeyError(f"unknown duplex attachment session: {session_id}")
-                entry = state.journal.record(payload) if journal else None
-                attachment = state.attachment
-                wire_payload = dict(entry.payload) if entry is not None else dict(payload)
+                # The producer may invalidate held audio while this coroutine
+                # waits for an attachment lock. Commit order before sequencing;
+                # release the cross-thread guard before awaiting network I/O.
+                with event_guard() if event_guard is not None else nullcontext(True) as valid:
+                    if not valid:
+                        return None
+                    entry = state.journal.record(payload) if journal else None
+                    attachment = state.attachment
+                    wire_payload = dict(entry.payload) if entry is not None else dict(payload)
             if entry is not None and on_accepted is not None:
                 on_accepted()
             if attachment is not None:

@@ -37,11 +37,44 @@ steps:
       mirror_hardwares: [amdproduction]
       grade: Blocking
       timeout_in_minutes: 45
+      # Buildkite's status-based rule cannot prove every exit 134 is a GPU hang.
+      # It retries 134 once; the Kubernetes job retry starts a fresh pod.
+      # Assertions (1), timeouts (124), and OOMs (137) remain non-retryable.
+      retry:
+        automatic:
+          - exit_status: 134
+            limit: 1
       commands:
         - export VLLM_ROCM_USE_AITER=0
         # ignore test_teacache_extractors.py because it use rocm gemm kernel from vLLM
         # that is not supported on CPU
-        - "pytest -sv tests/diffusion -m 'core_model and cpu' --ignore=tests/diffusion/cache/test_teacache_extractors.py --num-shards=$$BUILDKITE_PARALLEL_JOB_COUNT --shard-id=$$BUILDKITE_PARALLEL_JOB"
+        # Keep multi-GPU tests out of this one-GPU pool even when their module
+        # also carries the cpu marker for unit tests.
+        - "pytest -sv tests/diffusion -m 'core_model and cpu and not (cards_2 or cards_3 or cards_4 or cards_5 or cards_6 or cards_7 or cards_8)' --ignore=tests/diffusion/cache/test_teacache_extractors.py --ignore=tests/diffusion/models/pi05/test_pi05_units.py --num-shards=$$BUILDKITE_PARALLEL_JOB_COUNT --shard-id=$$BUILDKITE_PARALLEL_JOB"
+    # This module takes about 22 minutes on MI300 and was consistently assigned to shard 4,
+    # pushing that shard to the 45-minute timeout. Keep its module-scoped fixture in one lane.
+    - label: "Simple · Pi0.5 CPU Test"
+      agent_pool: mi300_1
+      depends_on: amd-build
+      mirror_hardwares: [amdproduction]
+      grade: Blocking
+      timeout_in_minutes: 45
+      commands:
+        - export VLLM_ROCM_USE_AITER=0
+        - "pytest -sv tests/diffusion/models/pi05/test_pi05_units.py -m 'core_model and cpu'"
+
+    - label: "Diffusion · AuK VAE GPU Test"
+      agent_pool: mi300_1
+      depends_on: amd-build
+      mirror_hardwares: [amdproduction]
+      grade: Blocking
+      timeout_in_minutes: 40
+      commands:
+        - export VLLM_ROCM_USE_AITER=0
+        - >-
+          timeout --signal=TERM --kill-after=2m 35m
+          pytest -sv tests/diffusion/models/auk/test_auk_vae_fastpath.py
+          -m 'core_model and rocm and cards_1' --run-level core_model
 
     - label: "Simple · Engine&Entrypoints Test"
       agent_pool: mi300_1
@@ -65,6 +98,25 @@ steps:
 
 - group: ":card_index_dividers: Diffusion Test"
   steps:
+    # AR paged attention is real GPU work, including cold AITER compilation.
+    # Keep its complete numerical matrix out of the CPU-marked Simple shards.
+    - label: "ROCm · AR Diffusion Paged Attention GPU Test"
+      agent_pool: mi300_1
+      depends_on: amd-build
+      mirror_hardwares: [amdproduction]
+      grade: Blocking
+      timeout_in_minutes: 20
+      commands:
+        - export VLLM_ROCM_USE_AITER=1
+        - export VLLM_OMNI_AR_FA_REQUIRED=1
+        - export AITER_JIT_DIR="/tmp/vllm-omni-ar-aiter-$$BUILDKITE_JOB_ID"
+        - export TORCH_EXTENSIONS_DIR="/tmp/vllm-omni-ar-torch-extensions-$$BUILDKITE_JOB_ID"
+        - mkdir -p "$$AITER_JIT_DIR" "$$TORCH_EXTENSIONS_DIR"
+        - >-
+          timeout --signal=TERM --kill-after=2m 15m
+          pytest -sv tests/diffusion/ar_diffusion/test_paged_attention.py
+          -m 'core_model and rocm and MI325 and cards_1' --run-level core_model
+
     - label: "Diffusion · LoRA Test"
       agent_pool: mi300_1
       depends_on: amd-build
@@ -131,6 +183,11 @@ steps:
       grade: Blocking
       commands:
         - pytest -s -v tests/diffusion/distributed/test_tensor_parallel.py
+        - >-
+          timeout 20m pytest -s -v
+          tests/diffusion/attention/test_ulysses_uaa.py::test_ulysses_uaa_2d_mask_layout_matches_baseline
+          -m 'core_model and cards_2'
+          --run-level "core_model"
 
     - label: "Diffusion Model Test"
       agent_pool: mi300_1

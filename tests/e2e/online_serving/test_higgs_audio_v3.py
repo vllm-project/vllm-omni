@@ -315,3 +315,34 @@ class TestHiggsAudioV3OnlineVoiceClone:
                 "timeout": DEFAULT_SPEECH_TIMEOUT_S,
             }
         )
+
+
+@pytest.mark.core_model
+@pytest.mark.advanced_model
+@pytest.mark.tts
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@pytest.mark.parametrize(
+    "omni_server",
+    [
+        OmniServerParams(
+            model=MODEL,
+            stage_config_path=STAGE_CONFIG,
+            server_args=[*SERVER_ARGS, "--no-async-chunk"],
+            env_dict=SERVER_ENV,
+        )
+    ],
+    indirect=True,
+)
+def test_full_response_v1_preserves_audio(omni_server, online_client) -> None:
+    """Non-chunk V1 must retain codec rows through the terminal talker step."""
+    online_client.send_audio_speech_request(
+        {
+            "model": omni_server.model,
+            "input": "The quick brown fox jumps over the lazy dog.",
+            "stream": False,
+            "response_format": "wav",
+            "min_audio_bytes": _MIN_AUDIO_BYTES,
+            "timeout": DEFAULT_SPEECH_TIMEOUT_S,
+        },
+        request_num=3,
+    )

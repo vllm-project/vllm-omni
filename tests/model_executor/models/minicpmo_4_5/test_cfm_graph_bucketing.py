@@ -16,8 +16,14 @@ import torch
 
 from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import (
     _cfm_pad_frames,
-    _zero_padded_cnn_cache,
     _zero_padded_frames,
+)
+from vllm_omni.model_executor.models.minicpmo_4_5.cuda_graph_wrapper import (
+    _att_keep_ranges,
+    _build_capture_mask,
+    _capture_query_width,
+    _whole_euler_att_segments,
+    _zero_padded_cnn_cache,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -137,6 +143,75 @@ def test_varied_chunk_lengths_collapse_onto_few_widths():
     }
     assert len(padded) == 4, sorted(padded)  # 16 / 32 / 48 / 64
     assert len(padded) < len(varied)
+
+
+def test_capture_query_width_collapses_decode_grid_onto_one_bucket():
+    """Whole-Euler capture bucket is the #7416 pad helper with a 64-wide decode grid."""
+    assert _capture_query_width(16, 0) == 16
+    assert _capture_query_width(16, 1) == 16
+    assert {_capture_query_width(w, 64) for w in (16, 32, 48, 50, 64)} == {64}
+    assert _capture_query_width(304, 64) == 320
+    assert _capture_query_width(320, 64) == 320
+
+
+def test_att_keep_ranges_match_the_streaming_trim():
+    """Past ``prompt_len + 100`` frames the cache keeps its first ``prompt_len`` and last 100."""
+    assert _att_keep_ranges(368, (300, 100)) == [(0, 368)]
+    assert _att_keep_ranges(400, (300, 100)) == [(0, 400)]
+    assert _att_keep_ranges(464, (300, 100)) == [(0, 300), (364, 100)]
+    assert _att_keep_ranges(464, None) == [(0, 464)]
+
+
+def test_whole_euler_att_segments_skip_capture_padding():
+    # Steady chunk: capture width == chunk width, so only the trim applies.
+    assert _whole_euler_att_segments(mel_width=64, query_cap=64, offset=400, keep=(300, 100)) == [
+        (0, 300),
+        (364, 100),
+    ]
+    # A 32-wide chunk on the 64 capture: the graph wrote [current 64 | cache 400];
+    # frames 32:64 are capture padding and the cache starts at 64.
+    assert _whole_euler_att_segments(mel_width=32, query_cap=64, offset=400, keep=None) == [(0, 32), (64, 400)]
+    assert _whole_euler_att_segments(mel_width=32, query_cap=64, offset=400, keep=(300, 100)) == [
+        (0, 32),
+        (64, 268),
+        (364, 100),
+    ]
+    # First chunk: no cache, only the tail of the capture width is dropped.
+    assert _whole_euler_att_segments(mel_width=304, query_cap=320, offset=0, keep=None) == [(0, 304)]
+
+
+def test_capture_mask_moves_the_cache_block_past_capture_padding():
+    width, cap, offset, valid = 32, 64, 8, 30
+    caller = torch.ones(2, width, width + offset, dtype=torch.bool)
+    caller[:, :, valid:width] = False
+    mask = _build_capture_mask(
+        attn_mask=caller,
+        batch_size=1,
+        query_cap=cap,
+        offset=offset,
+        mel_width=width,
+        mel_frames=valid,
+        device=torch.device("cpu"),
+    )
+    assert mask.shape == (2, cap, cap + offset)
+    assert mask[:, :, :valid].all()
+    assert not mask[:, :, valid:cap].any()
+    assert mask[:, :, cap:].all()
+    # Capture-padding query rows are never empty, so SDPA cannot produce NaN there.
+    assert mask.any(dim=-1).all()
+
+    implicit = _build_capture_mask(
+        attn_mask=None,
+        batch_size=1,
+        query_cap=cap,
+        offset=offset,
+        mel_width=width,
+        mel_frames=width,
+        device=torch.device("cpu"),
+    )
+    assert implicit[:, :, :width].all()
+    assert not implicit[:, :, width:cap].any()
+    assert implicit[:, :, cap:].all()
 
 
 def test_zero_padded_frames_survives_an_integration_step():

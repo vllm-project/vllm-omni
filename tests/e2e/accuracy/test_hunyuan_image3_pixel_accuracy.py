@@ -89,7 +89,6 @@ _DEPLOY_CONFIG: dict[str, Any] = {
             "trust_remote_code": True,
             "devices": "0,1,2,3",  # set dynamically by _write_deploy_config
             "vae_use_slicing": False,
-            "moe_backend": "flashinfer_cutlass",
             "vae_use_tiling": False,
             "parallel_config": {
                 "pipeline_parallel_size": 1,
