@@ -19,16 +19,18 @@ For each stage, vLLM-Omni calculates the requested memory as:
 requested_memory = total_gpu_memory × gpu_memory_utilization
 ```
 
-When other stages already occupy the same GPU, Omni caps this requested budget:
+The system checks that:
 
 ```text
-requested_memory = min(requested_memory, free_memory)
+free_memory ≥ requested_memory
 ```
 
-The worker logs a warning when it caps the budget. Model and runtime allocations
-are subtracted from that budget when sizing the KV cache. Initialization can
-still fail if the remaining budget cannot hold the required cache. Raising
-`gpu_memory_utilization` does not increase a budget already capped to free memory.
+On discrete GPUs, autoregressive and generation workers cap the stage budget to
+the available free memory and log a warning when this condition is not met.
+On integrated GPUs, such as Jetson and DGX Spark, GPU memory is shared with the
+host. These workers instead fail to initialize with an error showing the memory
+requirements, rather than assigning all free system RAM to the stage. Reduce
+each stage's `gpu_memory_utilization` and leave room for the OS and other stages.
 
 ### Memory Components
 

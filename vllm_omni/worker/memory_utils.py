@@ -14,7 +14,9 @@ import math
 
 from vllm.config import CacheConfig
 from vllm.logger import init_logger
+from vllm.platforms import current_platform
 from vllm.utils.mem_utils import MemorySnapshot, format_gib
+from vllm.v1.worker.utils import request_memory
 
 logger = init_logger(__name__)
 
@@ -33,8 +35,12 @@ def request_memory_tolerant(
     budget when sizing the KV cache.
 
     Logs a warning when the budget is capped so operators can detect
-    under-provisioned GPU memory.
+    under-provisioned GPU memory. Integrated GPUs share memory with the host
+    and use upstream's strict validation instead of consuming all free RAM.
     """
+    if current_platform.is_integrated_gpu(init_snapshot.device_.index):
+        return request_memory(init_snapshot, cache_config)
+
     requested_memory = math.ceil(init_snapshot.total_memory * cache_config.gpu_memory_utilization)
 
     if init_snapshot.free_memory < requested_memory:
