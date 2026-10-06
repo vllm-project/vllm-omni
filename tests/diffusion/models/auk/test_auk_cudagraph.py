@@ -312,3 +312,56 @@ def test_loop_replay_updates_schedule_and_reuses_larger_batch(cfg_strength: floa
             )
     assert len(wrapper._loop_cache) == 1
     assert actual.dtype == torch.float32
+
+
+@torch.inference_mode()
+def test_text_only_eager_batch_with_unequal_lengths_matches_serial() -> None:
+    """Masking must prevent padded text positions from leaking into text-only attention."""
+    dit = _make_dit("cpu")
+    text1 = torch.randn(1, 7, 8)
+    text2 = torch.randn(1, 3, 8)
+    ref_empty = torch.zeros(1, 0, 4)
+    ref_mask_empty = torch.zeros(1, 0, dtype=torch.bool)
+
+    # 1. Serial execution of the short request
+    common = dict(
+        gen_frames=9,
+        t_grid=[0.0, 0.4, 1.0],
+        cfg_strength=2.0,
+        dtype=torch.float32,
+        ref=ref_empty,
+        ref_mask=ref_mask_empty,
+    )
+    expected_serial = sample_latents(
+        dit,
+        text=text2,
+        c_mask=torch.ones(1, 3, dtype=torch.bool),
+        generator=torch.Generator().manual_seed(11),
+        **common,
+    )
+
+    # 2. Batched execution alongside the longer request
+    padded_text = torch.zeros(2, 7, 8)
+    padded_text[0] = text1[0]
+    padded_text[1, :3] = text2[0]
+    c_mask = torch.tensor([[True] * 7, [True] * 3 + [False] * 4])
+    batched_ref = torch.zeros(2, 0, 4)
+    batched_ref_mask = torch.zeros(2, 0, dtype=torch.bool)
+
+    generators = [torch.Generator().manual_seed(7), torch.Generator().manual_seed(11)]
+    actual_batch = sample_latents(
+        dit,
+        text=padded_text,
+        c_mask=c_mask,
+        ref=batched_ref,
+        ref_mask=batched_ref_mask,
+        generator=generators,
+        gen_frames=9,
+        t_grid=[0.0, 0.4, 1.0],
+        cfg_strength=2.0,
+        dtype=torch.float32,
+    )
+
+    # Short request in the batch must match its serial execution with tight tolerance
+    actual_short = actual_batch[1:2]
+    torch.testing.assert_close(actual_short, expected_serial, atol=1e-5, rtol=1e-5)
