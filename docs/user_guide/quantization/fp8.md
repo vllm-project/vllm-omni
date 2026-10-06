@@ -108,7 +108,6 @@ warmup_quack_fp8([(14040, 2048, 6144), (14040, 2048, 2048)])
 | Cosmos3 | `nvidia/Cosmos3-Nano`, `nvidia/Cosmos3-Super` | Yes | Not validated | All layers | None | |
 | MiniMax-H3 | `MiniMaxAI/MiniMax-H3` (`FL2VA` / `Ref2VA`) | Yes | Not validated | `quantization="fp8"` quantizes eligible DiT and text-encoder linears; mixed-precision input/output heads stay FP32 | None | ✅︎ |
 | SenseNova-U1.5 | `sensenova/SenseNova-U1.5-8B-MoT` | Yes | Not validated | UND/GEN language-model linears only | None | |
-| MammothModa2 | `bytedance-research/MammothModa2-Preview` | Yes | Not validated | DiT stage only; keep the AR stage in BF16 | None | |
 
 ### Multi-Stage Omni/TTS Model (Qwen3-Omni, Qwen3-TTS)
 
@@ -120,12 +119,13 @@ warmup_quack_fp8([(14040, 2048, 6144), (14040, 2048, 2048)])
 Audio encoder, vision encoder, talker, and code2wav stay in BF16 unless a
 model-specific guide says otherwise.
 
-### Multi-Stage Diffusion Model (BAGEL, GLM-Image)
+### Multi-Stage Diffusion Model (BAGEL, GLM-Image, MammothModa2)
 
-| Model     | Scope                                    | Status        | Notes                                           |
-| --------- | ---------------------------------------- | ------------- | ----------------------------------------------- |
-| BAGEL     | Stage-specific transformer or DiT module | Not validated | Route FP8 to the intended stage before enabling |
-| GLM-Image | Stage-specific transformer or DiT module | Not validated | Validate quality against BF16 baseline          |
+| Model        | Scope                                    | Status               | Notes                                                                           |
+| ------------ | ---------------------------------------- | -------------------- | ------------------------------------------------------------------------------- |
+| BAGEL        | Stage-specific transformer or DiT module | Not validated        | Route FP8 to the intended stage before enabling                                 |
+| GLM-Image    | Stage-specific transformer or DiT module | Not validated        | Validate quality against BF16 baseline                                          |
+| MammothModa2 | DiT stage (`stage_id: 1`) only           | Validated online FP8 | Set `quantization: fp8` on stage 1 in the deploy YAML; keep the AR stage in BF16 |
 
 ## Configuration
 
