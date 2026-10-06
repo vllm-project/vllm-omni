@@ -563,7 +563,7 @@ class SanaWmPatchEmbedMS3D(nn.Module):
     def project_with_shape(self, latents: torch.Tensor) -> tuple[torch.Tensor, tuple[int, int, int]]:
         hidden_states = self.norm(self.proj(latents))
         _, _, frames, height, width = hidden_states.shape
-        # 入口统一为连续的 token/channel 布局，供逐帧 AdaLayerNorm 使用。
+        # Use a contiguous token/channel layout for framewise AdaLayerNorm.
         return hidden_states.flatten(2).transpose(1, 2).contiguous(), (frames, height, width)
 
     def forward(self, latents: torch.Tensor) -> torch.Tensor:

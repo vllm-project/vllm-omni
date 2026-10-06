@@ -78,7 +78,7 @@ def test_matrix_framewise_modulation(dtype, chunks, bs, frames, spatial):
     x = torch.randn(bs, frames, spatial, hidden, generator=g, device="cuda", dtype=dtype)
     modulation = torch.randn(bs, frames, chunks, hidden, generator=g, device="cuda", dtype=dtype)
     scale, shift = modulation.chunk(chunks, dim=2)[:2]
-    # Sana 的 block/final modulation 是跨帧的 chunk view。
+    # Sana's block/final modulation uses chunk views spanning frames.
     assert scale.shape == (bs, frames, 1, hidden)
     assert scale.stride(1) == chunks * hidden
     fused = _adaln_fused_forward(m, x, scale, shift)
