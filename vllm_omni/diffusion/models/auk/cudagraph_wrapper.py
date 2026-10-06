@@ -359,26 +359,20 @@ class AuKCUDAGraphWrapper:
         uses_cfg: bool,
         n_steps: int,
     ) -> tuple[tuple | None, _LoopGraphEntry | None]:
-        """Reuse a warmed loop graph that can hold this request with only a little padding.
+        """Reuse a nearby batch graph with the same sequence buckets.
 
         A 127-request wave pads into the B=128 serving graph instead of capturing
         on the first packet. Batch padding is limited to twice the requested size.
         """
-        best: tuple[tuple[int, int, int, int], tuple, _LoopGraphEntry] | None = None
+        best: tuple[int, tuple, _LoopGraphEntry] | None = None
         for cache_key, entry in self._loop_cache.items():
             cached_b, cached_f, cached_t, cached_r, cfg, steps = cache_key
-            if cfg != uses_cfg or steps != n_steps:
+            if (cached_f, cached_t, cached_r, cfg, steps) != (frames, text, ref, uses_cfg, n_steps):
                 continue
-            if cached_b < batch or cached_f < frames or cached_t < text or cached_r < ref:
+            if not batch <= cached_b <= batch * 2:
                 continue
-            extra_f = cached_f - frames
-            if cached_b > batch * 2:
-                continue
-            if extra_f and extra_f * 4 > cached_f:
-                continue
-            cost = (cached_b, cached_f, cached_t, cached_r)
-            if best is None or cost < best[0]:
-                best = (cost, cache_key, entry)
+            if best is None or cached_b < best[0]:
+                best = (cached_b, cache_key, entry)
         return (None, None) if best is None else (best[1], best[2])
 
     @staticmethod

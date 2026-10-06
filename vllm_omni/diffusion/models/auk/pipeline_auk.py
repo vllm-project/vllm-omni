@@ -177,6 +177,9 @@ class _RequestCondition:
 
 def _pad_conditions(tensors: list[torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
     """Pad request-local conditions and mask every padded token."""
+    if len(tensors) == 1:
+        batch = tensors[0].unsqueeze(0)
+        return batch, torch.ones(batch.shape[:2], dtype=torch.bool, device=batch.device)
     batch = pad_sequence(tensors, batch_first=True)
     lengths = torch.tensor([tensor.shape[0] for tensor in tensors], device=batch.device)
     mask = torch.arange(batch.shape[1], device=batch.device)[None, :] < lengths[:, None]
