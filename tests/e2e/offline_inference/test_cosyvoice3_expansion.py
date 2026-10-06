@@ -128,14 +128,13 @@ def _build_reference_inputs(prompt_audio: tuple[np.ndarray, int]) -> list[dict[s
 
 # (model, deploy_config_path, extra_omni_kwargs) for ``@pytest.mark.parametrize("omni_runner", ..., indirect=True)``
 _cosy_deployment = get_deploy_config_path("cosyvoice3.yaml")
-_cosy_model_path = str(_resolve_model_dir())
 _OMNI_RUNNER_PARAMS = [
     pytest.param(
-        (_cosy_model_path, _cosy_deployment, {"async_chunk": False}),
+        (MODEL, _cosy_deployment, {"async_chunk": False}),
         id="sync",
     ),
     pytest.param(
-        (_cosy_model_path, _cosy_deployment, {"async_chunk": True}),
+        (MODEL, _cosy_deployment, {"async_chunk": True}),
         id="async_chunk",
     ),
 ]
@@ -144,6 +143,17 @@ pytestmark = [
     pytest.mark.tts,
     pytest.mark.parametrize("omni_runner", _OMNI_RUNNER_PARAMS, indirect=True),
 ]
+
+
+@pytest.fixture(scope="module")
+def omni_runner(request: pytest.FixtureRequest, run_level: str):
+    """Resolve weights only when this E2E test runs, preserving the shared harness."""
+    from tests.helpers.fixtures.runtime import omni_fixture_lock
+    from tests.helpers.runtime import iter_omni_runner
+
+    _, deployment, kwargs = request.param
+    request.param = (str(_resolve_model_dir()), deployment, kwargs)
+    yield from iter_omni_runner(request, run_level, omni_fixture_lock)
 
 
 @hardware_test(res={"cuda": "L4"}, num_cards=1)

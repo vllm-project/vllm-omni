@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import copy
 from collections.abc import Mapping
-from dataclasses import InitVar, dataclass, field, fields
+from dataclasses import InitVar, dataclass, field, fields, replace
 from functools import wraps
 from inspect import Parameter, signature
 from pathlib import Path
@@ -1330,6 +1330,7 @@ _DIFFUSION_STAGE_METADATA_FIELDS = frozenset(
         "engine_output_type",
         "has_sampling_extra_args",
         "hf_config_name",
+        "inline_diffusion",
         "model_arch",
         "model_stage",
         "retains_state_across_chunks",
@@ -1930,6 +1931,14 @@ def _build_stage_config(
     *,
     model: str | None,
 ) -> StageConfigType:
+    if topology.execution_type == StageExecutionType.DIFFUSION and stage_deploy is not None:
+        inline_diffusion = stage_deploy.engine_extras.get("inline_diffusion")
+        if inline_diffusion is not None:
+            if not isinstance(inline_diffusion, bool):
+                raise ValueError(f"Stage {topology.stage_id} inline_diffusion must be a boolean")
+            # StageRuntime reads the resolved topology; retain the deploy
+            # override without mutating the shared registered pipeline.
+            topology = replace(topology, inline_diffusion=inline_diffusion)
     try:
         builder = _STAGE_CONFIG_BUILDERS[topology.execution_type]
     except KeyError as exc:

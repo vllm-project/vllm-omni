@@ -30,10 +30,13 @@ from diffusers.utils import logging
 from diffusers.utils.torch_utils import randn_tensor
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 from vllm.model_executor.models.utils import AutoWeightsLoader
+from vllm.sequence import IntermediateTensors
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl import DistributedAutoencoderKL
+from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
+from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.model_loader.hub_prefetch import prefetch_subfolders
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
@@ -161,7 +164,7 @@ def retrieve_timesteps(
     return timesteps, num_inference_steps
 
 
-class ZImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, SupportsComponentDiscovery):
+class ZImagePipeline(nn.Module, CFGParallelMixin, DiffusionPipelineProfilerMixin, SupportsComponentDiscovery):
     supports_request_batch = False
 
     _dit_modules: ClassVar[list[str]] = ["transformer"]
@@ -410,7 +413,180 @@ class ZImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, SupportsComponen
     def interrupt(self):
         return self._interrupt
 
+    def combine_cfg_noise(
+        self,
+        positive_noise_pred: torch.Tensor | tuple[torch.Tensor, ...],
+        negative_noise_pred: torch.Tensor | tuple[torch.Tensor, ...],
+        true_cfg_scale: float,
+        cfg_normalize: bool | float = False,
+        kwargs: dict[str, Any] | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, ...]:
+        """Combine Z-Image predictions while preserving its CFG contract.
+
+        Z-Image uses ``positive + scale * (positive - negative)`` (rather
+        than the common ``negative + scale * (positive - negative)`` form).
+        Its normalization is also a clamp against the original positive norm,
+        with ``cfg_normalize`` acting as the maximum norm multiplier.
+        """
+        del kwargs
+        if isinstance(positive_noise_pred, tuple):
+            if len(positive_noise_pred) != 1:
+                raise TypeError("Z-Image CFG expects a single transformer output tensor")
+            positive_noise_pred = positive_noise_pred[0]
+        if isinstance(negative_noise_pred, tuple):
+            if len(negative_noise_pred) != 1:
+                raise TypeError("Z-Image CFG expects a single transformer output tensor")
+            negative_noise_pred = negative_noise_pred[0]
+        positive_noise_pred = positive_noise_pred.float()
+        negative_noise_pred = negative_noise_pred.float()
+        pred = positive_noise_pred + true_cfg_scale * (positive_noise_pred - negative_noise_pred)
+        normalize = float(cfg_normalize or 0.0)
+        if normalize > 0.0:
+            positive_norm = torch.linalg.vector_norm(positive_noise_pred.flatten(1), dim=1, keepdim=True)
+            combined_norm = torch.linalg.vector_norm(pred.flatten(1), dim=1, keepdim=True)
+            max_norm = positive_norm * normalize
+            scale_shape = (pred.shape[0],) + (1,) * (pred.ndim - 1)
+            scale = torch.where(
+                combined_norm > max_norm,
+                (max_norm / combined_norm.clamp(min=1e-12)).to(pred.dtype),
+                pred.new_tensor(1.0),
+            ).reshape(scale_shape)
+            pred = pred * scale
+        return pred
+
+    def predict_noise(self, *args: Any, **kwargs: Any) -> torch.Tensor | IntermediateTensors:
+        """Adapt Z-Image's per-sample list output to the CFG framework."""
+        cfg_branch = kwargs.pop("_cfg_branch", None)
+        context = get_forward_context() if is_forward_context_available() else None
+        previous_branch = context.cfg_branch if context is not None else None
+        if context is not None:
+            context.cfg_branch = cfg_branch
+        try:
+            if getattr(self, "_uses_cudagraph_trees", False):
+                torch.compiler.cudagraph_mark_step_begin()
+            result = self.transformer(*args, **kwargs)
+        finally:
+            if context is not None:
+                context.cfg_branch = previous_branch
+        if isinstance(result, IntermediateTensors):
+            return result
+        if isinstance(result, tuple) and result and isinstance(result[0], list):
+            result = result[0]
+        if isinstance(result, list):
+            return torch.stack(result, dim=0)
+        return result[0]
+
+    def diffuse(
+        self,
+        prompt_embeds: list[torch.Tensor],
+        negative_prompt_embeds: list[torch.Tensor],
+        latents: torch.Tensor,
+        timesteps: torch.Tensor,
+        do_true_cfg: bool,
+        true_cfg_scale: float,
+        cfg_normalize: bool | float = False,
+        cfg_truncation: float | None = 1.0,
+        callback_on_step_end: Callable[[Any, int, torch.Tensor, dict[str, Any]], dict[str, Any]] | None = None,
+        callback_on_step_end_tensor_inputs: list[str] | None = None,
+    ) -> torch.Tensor:
+        """Run Z-Image denoising through the shared CFG execution path."""
+        callback_on_step_end_tensor_inputs = callback_on_step_end_tensor_inputs or ["latents"]
+        self._num_timesteps = len(timesteps)
+        timesteps_tensor = torch.as_tensor(timesteps, device=latents.device, dtype=torch.float32)
+        t_norm_list = ((1000 - timesteps_tensor) / 1000).cpu().tolist()
+        if not isinstance(t_norm_list, list):
+            t_norm_list = [t_norm_list]
+
+        for i, t in enumerate(timesteps):
+            if self.interrupt:
+                continue
+
+            timestep = ((1000 - t) / 1000).expand(latents.shape[0])
+            t_norm = t_norm_list[i]
+            current_guidance_scale = true_cfg_scale
+            if do_true_cfg and cfg_truncation is not None and float(cfg_truncation) <= 1:
+                if t_norm > float(cfg_truncation):
+                    current_guidance_scale = 0.0
+            apply_cfg = do_true_cfg and current_guidance_scale > 0
+            latents_typed = latents.to(self.od_config.dtype)
+            latent_model_input = latents_typed.unsqueeze(2) if latents_typed.ndim == 4 else latents_typed
+            latent_model_input_list = list(latent_model_input.unbind(dim=0))
+            positive_kwargs = {
+                "x": latent_model_input_list,
+                "t": timestep,
+                "cap_feats": prompt_embeds,
+                "_cfg_branch": "positive",
+            }
+            negative_kwargs = (
+                {
+                    "x": latent_model_input_list,
+                    "t": timestep,
+                    "cap_feats": negative_prompt_embeds,
+                    "_cfg_branch": "negative",
+                }
+                if apply_cfg
+                else None
+            )
+
+            noise_pred = self.predict_noise_maybe_with_cfg(
+                do_true_cfg=apply_cfg,
+                true_cfg_scale=current_guidance_scale,
+                positive_kwargs=positive_kwargs,
+                negative_kwargs=negative_kwargs,
+                cfg_normalize=cfg_normalize,
+            )
+            if isinstance(noise_pred, torch.Tensor) and latents.ndim == 4:
+                noise_pred = noise_pred.squeeze(2)
+            noise_pred = -noise_pred
+            latents = self.scheduler_step_maybe_with_cfg(noise_pred.to(torch.float32), t, latents, apply_cfg)
+            assert latents.dtype == torch.float32
+
+            if callback_on_step_end is not None:
+                step_locals = locals()
+                callback_kwargs = {name: step_locals[name] for name in callback_on_step_end_tensor_inputs}
+                callback_outputs = callback_on_step_end(self, i, t, callback_kwargs)
+                latents = callback_outputs.pop("latents", latents)
+                prompt_embeds = callback_outputs.pop("prompt_embeds", prompt_embeds)
+                negative_prompt_embeds = callback_outputs.pop("negative_prompt_embeds", negative_prompt_embeds)
+
+        return latents
+
     def forward(self, req: DiffusionRequestBatch) -> DiffusionOutput:
+        sampling_params_list = req.sampling_params_list
+        common_sampling_params = sampling_params_list[0]
+
+        def same_value(left: Any, right: Any) -> bool:
+            if isinstance(left, torch.Tensor) or isinstance(right, torch.Tensor):
+                if not isinstance(left, torch.Tensor) or not isinstance(right, torch.Tensor):
+                    return False
+                return torch.equal(left, right)
+            return left == right
+
+        def require_common(field: str) -> Any:
+            value = getattr(common_sampling_params, field)
+            if any(not same_value(getattr(params, field), value) for params in sampling_params_list[1:]):
+                raise ValueError(f"Z-Image request batch has incompatible {field}: {req.request_ids}")
+            return value
+
+        # These controls determine one shared scheduler/denoising trajectory.
+        # Generators and initial latents remain request-local and are collated.
+        for field in (
+            "height",
+            "width",
+            "num_inference_steps",
+            "sigmas",
+            "max_sequence_length",
+            "guidance_scale",
+            "num_outputs_per_prompt",
+            "cfg_normalize",
+            "output_type",
+            "strength",
+        ):
+            require_common(field)
+        cfg_truncations = [(params.extra_args or {}).get("cfg_truncation", 1.0) for params in sampling_params_list]
+        if any(value != cfg_truncations[0] for value in cfg_truncations[1:]):
+            raise ValueError(f"Z-Image request batch has incompatible cfg_truncation: {req.request_ids}")
+
         # TODO: In online mode, sometimes it receives [{"negative_prompt": None}, {...}], so cannot use .get("...", "")
         # TODO: May be some data formatting operations on the API side. Hack for now.
         prompt = [p if isinstance(p, str) else (p.get("prompt") or "") for p in req.prompts]
@@ -439,8 +615,8 @@ class ZImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, SupportsComponen
                     else:
                         image = PIL.Image.open(raw_image) if isinstance(raw_image, str) else raw_image
 
-        explicit_strength = req.sampling_params.strength is not None
-        strength = req.sampling_params.strength if explicit_strength else 0.6
+        explicit_strength = common_sampling_params.strength is not None
+        strength = common_sampling_params.strength if explicit_strength else 0.6
         if explicit_strength and image is None:
             logger.warning(
                 "strength parameter (%.2f) is only applicable for image-to-image (I2I) generation. "
@@ -451,24 +627,24 @@ class ZImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, SupportsComponen
         if image is not None and strength is not None and (strength < 0 or strength > 1):
             raise ValueError(f"The value of strength should be in [0.0, 1.0] but is {strength}")
 
-        height = req.sampling_params.height or 1024
-        width = req.sampling_params.width or 1024
-        num_inference_steps = req.sampling_params.num_inference_steps or 50
-        generator = req.sampling_params.generator
-        sigmas = req.sampling_params.sigmas
-        max_sequence_length = req.sampling_params.max_sequence_length or 512
-        guidance_scale = req.sampling_params.guidance_scale
+        height = common_sampling_params.height or 1024
+        width = common_sampling_params.width or 1024
+        num_inference_steps = common_sampling_params.num_inference_steps or 50
         num_images_per_prompt = (
-            req.sampling_params.num_outputs_per_prompt if req.sampling_params.num_outputs_per_prompt > 0 else 1
+            common_sampling_params.num_outputs_per_prompt if common_sampling_params.num_outputs_per_prompt > 0 else 1
         )
-        latents = req.sampling_params.latents
+        generator = req.collate_request_generators(num_images_per_prompt, None)
+        sigmas = common_sampling_params.sigmas
+        max_sequence_length = common_sampling_params.max_sequence_length or 512
+        guidance_scale = common_sampling_params.guidance_scale
+        latents = req.collate_request_tensors("latents", None)
 
-        cfg_normalization = req.sampling_params.cfg_normalize
-        cfg_truncation = req.sampling_params.extra_args.get("cfg_truncation", 1.0)
+        cfg_normalization = common_sampling_params.cfg_normalize
+        cfg_truncation = cfg_truncations[0]
         joint_attention_kwargs: dict[str, Any] | None = None
         callback_on_step_end: Callable[[int, int, dict], None] | None = None
         callback_on_step_end_tensor_inputs = ["latents"]
-        output_type = req.sampling_params.output_type or "pil"
+        output_type = common_sampling_params.output_type or "pil"
 
         vae_scale = self.vae_scale_factor * 2
         if height % vae_scale != 0:
@@ -580,11 +756,8 @@ class ZImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, SupportsComponen
             if self.do_classifier_free_guidance and negative_prompt_embeds:
                 negative_prompt_embeds = [npe for npe in negative_prompt_embeds for _ in range(num_images_per_prompt)]
 
-        actual_batch_size = batch_size * num_images_per_prompt
-
         # 5. Prepare timesteps
         if image is None:
-            # for both [B, C, H, W] and multi-layer/frame [B, C, F, H, W]
             image_seq_len = (latents.shape[-2] // 2) * (latents.shape[-1] // 2)
             mu = calculate_shift(
                 image_seq_len,
@@ -604,115 +777,22 @@ class ZImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, SupportsComponen
                 **scheduler_kwargs,
             )
 
-        num_warmup_steps = max(len(timesteps) - num_inference_steps * self.scheduler.order, 0)
         self._num_timesteps = len(timesteps)
 
-        # Precompute normalized timesteps once to avoid per-step GPU->CPU sync (.item() causes cudaStreamSynchronize)
-        if isinstance(timesteps, torch.Tensor):
-            timesteps_tensor = timesteps.to(device=device, dtype=torch.float32)
-        else:
-            timesteps_tensor = torch.as_tensor(timesteps, device=device, dtype=torch.float32)
-        norm_timesteps = (1000 - timesteps_tensor) / 1000
-        t_norm_list = norm_timesteps.cpu().tolist()
-        if not isinstance(t_norm_list, list):
-            t_norm_list = [t_norm_list]
-
-        # 6. Denoising loop
-        for i, t in enumerate(timesteps):
-            if self.interrupt:
-                continue
-
-            # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
-            timestep = t.expand(latents.shape[0])
-            timestep = (1000 - timestep) / 1000
-            # Normalized time for time-aware config (0 at start, 1 at end);
-            # use precomputed to avoid .item() sync per step
-            t_norm = t_norm_list[i]
-
-            # Handle cfg truncation
-            current_guidance_scale = self.guidance_scale
-            if (
-                self.do_classifier_free_guidance
-                and self._cfg_truncation is not None
-                and float(self._cfg_truncation) <= 1
-            ):
-                if t_norm > self._cfg_truncation:
-                    current_guidance_scale = 0.0
-
-            # Run CFG only if configured AND scale is non-zero
-            apply_cfg = self.do_classifier_free_guidance and current_guidance_scale > 0
-            latents_typed = latents.to(self.od_config.dtype)
-
-            if apply_cfg:
-                repeat_dims = (2,) + (1,) * (latents_typed.ndim - 1)
-                latent_model_input = latents_typed.repeat(*repeat_dims)
-                prompt_embeds_model_input = prompt_embeds + negative_prompt_embeds
-                timestep_model_input = timestep.repeat(2)
-            else:
-                latent_model_input = latents_typed
-                prompt_embeds_model_input = prompt_embeds
-                timestep_model_input = timestep
-
-            if latent_model_input.ndim == 4:
-                latent_model_input = latent_model_input.unsqueeze(2)
-            latent_model_input_list = list(latent_model_input.unbind(dim=0))
-
-            if getattr(self, "_uses_cudagraph_trees", False):
-                # check Ming-Image
-                torch.compiler.cudagraph_mark_step_begin()
-            model_out_list = self.transformer(
-                latent_model_input_list,
-                timestep_model_input,
-                prompt_embeds_model_input,
-            )[0]
-
-            if apply_cfg:
-                # Perform CFG
-                pos_out = model_out_list[:actual_batch_size]
-                neg_out = model_out_list[actual_batch_size:]
-
-                noise_pred = []
-                for j in range(actual_batch_size):
-                    pos = pos_out[j].float()
-                    neg = neg_out[j].float()
-
-                    pred = pos + current_guidance_scale * (pos - neg)
-
-                    # Renormalization (torch.where avoids GPU->CPU sync from Python if/scalar comparison)
-                    if self._cfg_normalization and float(self._cfg_normalization) > 0.0:
-                        ori_pos_norm = torch.linalg.vector_norm(pos)
-                        new_pos_norm = torch.linalg.vector_norm(pred)
-                        max_new_norm = ori_pos_norm * float(self._cfg_normalization)
-                        scale = torch.where(
-                            new_pos_norm > max_new_norm,
-                            (max_new_norm / new_pos_norm.clamp(min=1e-12)).to(pred.dtype),
-                            pred.new_tensor(1.0),
-                        )
-                        pred = pred * scale
-
-                    noise_pred.append(pred)
-
-                noise_pred = torch.stack(noise_pred, dim=0)
-            else:
-                noise_pred = torch.stack([t.float() for t in model_out_list], dim=0)
-
-            if latents.ndim == 4:
-                noise_pred = noise_pred.squeeze(2)
-            noise_pred = -noise_pred
-
-            # compute the previous noisy sample x_t -> x_t-1
-            latents = self.scheduler.step(noise_pred.to(torch.float32), t, latents, return_dict=False)[0]
-            assert latents.dtype == torch.float32
-
-            if callback_on_step_end is not None:
-                callback_kwargs = {}
-                for k in callback_on_step_end_tensor_inputs:
-                    callback_kwargs[k] = locals()[k]
-                callback_outputs = callback_on_step_end(self, i, t, callback_kwargs)
-
-                latents = callback_outputs.pop("latents", latents)
-                prompt_embeds = callback_outputs.pop("prompt_embeds", prompt_embeds)
-                negative_prompt_embeds = callback_outputs.pop("negative_prompt_embeds", negative_prompt_embeds)
+        # 6. Denoising loop.  ``diffuse`` owns per-step CFG dispatch so the
+        # same execution path works for sequential and CFG-parallel workers.
+        latents = self.diffuse(
+            prompt_embeds=prompt_embeds,
+            negative_prompt_embeds=negative_prompt_embeds,
+            latents=latents,
+            timesteps=timesteps,
+            do_true_cfg=self.do_classifier_free_guidance,
+            true_cfg_scale=self.guidance_scale,
+            cfg_normalize=self._cfg_normalization,
+            cfg_truncation=self._cfg_truncation,
+            callback_on_step_end=callback_on_step_end,
+            callback_on_step_end_tensor_inputs=callback_on_step_end_tensor_inputs,
+        )
 
         if output_type == "latent":
             image = latents

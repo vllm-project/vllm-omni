@@ -99,6 +99,48 @@ def test_formatter_preserves_single_video_audio_actions_and_metadata(
     }
 
 
+def test_formatter_routes_latent_payload_to_latents_field(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Regression: postprocessed raw latents must reach the API without becoming images.
+
+    Input source: Ming postprocess payload envelope.
+    Expected source: OmniRequestOutput.latents and metadata/trajectory contracts.
+    """
+    monkeypatch.setattr(output_formatter, "supports_audio_output", lambda _: False)
+    latents = torch.randn(1, 4, 8, 8)
+    trajectory = torch.ones(2, 1, 4, 8, 8)
+    postprocess_output = normalize_diffusion_postprocess_output(
+        {"payload": {"latents": latents}, "metadata": {"transfer": {"source": "ming"}}}
+    )
+
+    (result,) = format_diffusion_outputs(
+        request=_request("latent prompt"),
+        od_config=_config(),
+        diffusion_output=DiffusionOutput(output=latents, trajectory_latents=trajectory),
+        output_data=latents,
+        postprocess_output=postprocess_output,
+    )
+
+    assert result.images == []
+    assert result.latents is latents
+    assert result.final_output_type == "latents"
+    assert result.trajectory_latents is trajectory
+    assert result.multimodal_output["metadata"] == {"transfer": {"source": "ming"}}
+
+
+@pytest.mark.parametrize("invalid", [None, "invalid", [torch.ones(1), torch.ones(1)]])
+def test_formatter_rejects_malformed_latent_payload(monkeypatch, invalid):
+    """Regression: malformed producer payload must not silently become latents=None."""
+    monkeypatch.setattr(output_formatter, "supports_audio_output", lambda _: False)
+    with pytest.raises(TypeError, match="single batched Tensor"):
+        format_diffusion_outputs(
+            request=_request(),
+            od_config=_config(),
+            diffusion_output=DiffusionOutput(output=None),
+            output_data=None,
+            postprocess_output=normalize_diffusion_postprocess_output({"payload": {"latents": invalid}}),
+        )
+
+
 def test_formatter_normalizes_payload_metadata_envelope(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

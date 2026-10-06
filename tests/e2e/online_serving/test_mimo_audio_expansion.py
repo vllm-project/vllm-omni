@@ -41,25 +41,28 @@ def download_tokenizer():
     return local_path
 
 
-try:
-    stage_configs = [get_deploy_config_path("mimo_audio.yaml")]
-    tokenizer_path = download_tokenizer()
-    os.environ["MIMO_AUDIO_TOKENIZER_PATH"] = tokenizer_path
-
-    test_params = [
-        OmniServerParams(
-            model=model,
-            stage_config_path=stage_config,
-            server_args=["--chat-template", CHAT_TEMPLATE_PATH],
-        )
-        for model in models
-        for stage_config in stage_configs
-    ]
-except Exception as exc:
-    pytest.skip(
-        f"MiMo-Audio expansion tests skipped: module setup failed ({type(exc).__name__}: {exc})",
-        allow_module_level=True,
+stage_configs = [get_deploy_config_path("mimo_audio.yaml")]
+test_params = [
+    OmniServerParams(
+        model=model,
+        stage_config_path=stage_config,
+        server_args=["--chat-template", CHAT_TEMPLATE_PATH],
     )
+    for model in models
+    for stage_config in stage_configs
+]
+
+
+@pytest.fixture(scope="module", autouse=True)
+def tokenizer_path():
+    """Prepare weights before server startup, without downloads during collection."""
+    try:
+        local_path = download_tokenizer()
+    except Exception as exc:
+        pytest.skip(f"MiMo-Audio expansion tests skipped: module setup failed ({type(exc).__name__}: {exc})")
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setenv("MIMO_AUDIO_TOKENIZER_PATH", local_path)
+        yield
 
 
 def get_prompt(prompt_type="text_only"):

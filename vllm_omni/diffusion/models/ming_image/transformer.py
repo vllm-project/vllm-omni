@@ -29,12 +29,19 @@ class MingImageTransformer2DModel(ZImageTransformer2DModel):
         cap_feats_2 = None
         if is_forward_context_available():
             context = get_forward_context()
-            if context.ref_latent is not None:
-                ref_x = [item.to(device=x[0].device, dtype=x[0].dtype) for item in context.ref_latent.unbind(dim=0)]
-            if context.direct_condition is not None:
-                cap_feats_2 = [
-                    item.to(device=x[0].device, dtype=x[0].dtype) for item in context.direct_condition.unbind(dim=0)
-                ]
+            batch_size = len(x)
+            start = batch_size if context.cfg_branch == "negative" else 0
+            reference = context.ref_latent
+            direct = context.direct_condition
+            if context.cfg_branch is not None:
+                if reference is not None and reference.shape[0] == 2 * batch_size:
+                    reference = reference[start : start + batch_size]
+                if direct is not None and direct.shape[0] == 2 * batch_size:
+                    direct = direct[start : start + batch_size]
+            if reference is not None:
+                ref_x = [item.to(device=x[0].device, dtype=x[0].dtype) for item in reference.unbind(dim=0)]
+            if direct is not None:
+                cap_feats_2 = [item.to(device=x[0].device, dtype=x[0].dtype) for item in direct.unbind(dim=0)]
 
         output, metadata = super().forward(
             x,

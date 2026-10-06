@@ -7,6 +7,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, TypeGuard, cast
 
+import torch
+
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.io_support import get_diffusion_output_type, supports_audio_output
 from vllm_omni.diffusion.registry import DiffusionModelRegistry
@@ -63,7 +65,7 @@ def normalize_diffusion_postprocess_output(
 
     if isinstance(outputs, dict):
         payload = {key: value for key, value in outputs.items() if key not in {"audio_sample_rate", "fps"}}
-        metadata = _metadata_from_legacy_payload(outputs)
+        metadata = _metadata_from_legacy_payload(cast(dict[str, DiffusionPayloadValue], outputs))
         if "text" in payload and "text" not in metadata:
             metadata["text"] = {}
         if metadata:
@@ -92,7 +94,7 @@ def _metadata_from_legacy_payload(payload: dict[str, DiffusionPayloadValue]) -> 
 
 
 def _infer_primary_payload_key(payload: DiffusionPayload) -> str | None:
-    for key in ("video", "image", "text", "audio", "output"):
+    for key in ("video", "image", "latents", "text", "audio", "output"):
         if key in payload:
             return key
     if set(payload).issubset({"actions", "trajectory"}):
@@ -133,7 +135,7 @@ def format_diffusion_outputs(
 
     primary_payload = _primary_payload(postprocess_output)
     outputs = _ensure_list(primary_payload)
-    metrics = {
+    metrics: dict[str, object] = {
         "image_num": int(request.sampling_params.num_outputs_per_prompt),
         "resolution": (
             int(request.sampling_params.resolution) if request.sampling_params.resolution is not None else None
@@ -146,8 +148,9 @@ def format_diffusion_outputs(
     # Only the primary payload determines the response type. Some image models
     # include reasoning text in metadata, but their final output is still an image.
     is_text_output = postprocess_output.primary_key == "text"
+    is_latent_output = postprocess_output.primary_key == "latents"
 
-    is_audio_output = supports_audio_output(od_config.model_class_name)
+    is_audio_output = bool(od_config.model_class_name and supports_audio_output(od_config.model_class_name))
     final_output_type = (
         postprocess_output.primary_key
         if postprocess_output.primary_key in {"image", "video"}
@@ -173,6 +176,7 @@ def format_diffusion_outputs(
         metrics=metrics,
         postprocess_output=postprocess_output,
         is_text_output=is_text_output,
+        is_latent_output=is_latent_output,
         is_audio_output=is_audio_output,
         final_output_type=final_output_type,
         audio_sample_rate=audio_sample_rate,
@@ -279,6 +283,7 @@ def _format_single_prompt_output(
     metrics: dict[str, object],
     postprocess_output: DiffusionPostprocessOutput,
     is_text_output: bool,
+    is_latent_output: bool,
     is_audio_output: bool,
     final_output_type: str,
     audio_sample_rate: int | None,
@@ -303,6 +308,28 @@ def _format_single_prompt_output(
                 metrics=metrics,
                 multimodal_output=mm_output,
                 final_output_type="text",
+                stage_durations=diffusion_output.stage_durations,
+                peak_memory_mb=diffusion_output.peak_memory_mb,
+                finished=finished,
+            ),
+        ]
+
+    if is_latent_output:
+        if len(outputs) != 1 or not isinstance(outputs[0], torch.Tensor):
+            raise TypeError("Diffusion latent output must contain a single batched Tensor")
+        return [
+            OmniRequestOutput.from_diffusion(
+                request_id=request_id,
+                images=[],
+                prompt=prompt,
+                metrics=metrics,
+                latents=outputs[0],
+                trajectory_latents=trajectory_latents,
+                trajectory_timesteps=trajectory_timesteps,
+                trajectory_log_probs=trajectory_log_probs,
+                trajectory_decoded=trajectory_decoded,
+                multimodal_output=mm_output,
+                final_output_type="latents",
                 stage_durations=diffusion_output.stage_durations,
                 peak_memory_mb=diffusion_output.peak_memory_mb,
                 finished=finished,
@@ -361,6 +388,7 @@ def _trajectory_payload(
     diffusion_output: DiffusionOutput,
 ) -> DiffusionTrajectoryPayload:
     trajectory: DiffusionTrajectoryPayload = {}
+    trajectory_values = cast(dict[str, Any], trajectory)
     payload = postprocess_output.outputs.get("trajectory")
     if isinstance(payload, Mapping):
         for source_key, target_key in (
@@ -371,7 +399,7 @@ def _trajectory_payload(
         ):
             value = payload.get(source_key)
             if value is not None:
-                trajectory[target_key] = value
+                trajectory_values[target_key] = value
 
     fallback_fields = (
         ("latents", diffusion_output.trajectory_latents),
@@ -381,5 +409,5 @@ def _trajectory_payload(
     )
     for key, value in fallback_fields:
         if key not in trajectory and value is not None:
-            trajectory[key] = value
+            trajectory_values[key] = value
     return trajectory

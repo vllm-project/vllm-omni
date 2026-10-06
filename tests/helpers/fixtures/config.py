@@ -43,8 +43,10 @@ def default_vllm_config():
     Function-scoped autouse ran too late for ``OmniRunner`` setup and could
     desynchronize vLLM init vs request preprocessing (e.g. renderer state).
     """
-    # Use CPU device if no GPU is available (e.g., in CI environments)
-    if torch.cuda.is_available() and torch.accelerator.device_count() > 0:
+    # vLLM honors an explicit CPU target even on an accelerator host.
+    if os.environ.get("VLLM_TARGET_DEVICE") == "cpu":
+        device = "cpu"
+    elif torch.cuda.is_available() and torch.accelerator.device_count() > 0:
         device = "cuda"
     elif hasattr(torch, "npu") and torch.npu.is_available():
         device = "npu"

@@ -281,6 +281,7 @@ class ZImageAttention(nn.Module):
         self.total_num_kv_heads = num_kv_heads
         self.head_dim = dim // num_heads
         self.qk_norm = qk_norm
+        self._upcast_output = quant_config is None and torch.get_default_dtype() == torch.float16
 
         self.to_qkv = QKVParallelLinear(
             hidden_size=dim,
@@ -307,6 +308,8 @@ class ZImageAttention(nn.Module):
                     bias=False,
                     input_is_parallel=True,
                     return_bias=False,
+                    # Pre-normalization activations can exceed FP16's range.
+                    params_dtype=torch.float32 if self._upcast_output else None,
                     quant_config=quant_config,
                     prefix=_join_prefix(prefix, "to_out.0"),
                 )
@@ -364,6 +367,8 @@ class ZImageAttention(nn.Module):
         hidden_states = hidden_states.to(dtype)
 
         to_out_input = hidden_states
+        if self._upcast_output:
+            hidden_states = hidden_states.to(self.to_out[0].weight.dtype)
         hidden_states = self.to_out[0](hidden_states)
         hidden_states = _restore_linear_output_shape(hidden_states, to_out_input)
 
@@ -379,6 +384,7 @@ class FeedForward(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
+        self._upcast_output = quant_config is None and torch.get_default_dtype() == torch.float16
         self.w13 = MergedColumnParallelLinear(
             dim,
             [hidden_dim] * 2,
@@ -394,6 +400,7 @@ class FeedForward(nn.Module):
             bias=False,
             input_is_parallel=True,
             return_bias=False,
+            params_dtype=torch.float32 if self._upcast_output else None,
             quant_config=quant_config,
             prefix=_join_prefix(prefix, "w2"),
         )
@@ -401,7 +408,12 @@ class FeedForward(nn.Module):
     def forward(self, x):
         hidden_states = self.w13(x)
         hidden_states = _restore_linear_output_shape(hidden_states, x)
+        if self._upcast_output:
+            # The SiLU gate product may overflow before the output projection.
+            hidden_states = hidden_states.float()
         hidden_states = self.act(hidden_states)
+        if self._upcast_output:
+            hidden_states = hidden_states.to(self.w2.weight.dtype)
         hidden_states = self.w2(hidden_states)
         return _restore_linear_output_shape(hidden_states, x)
 
@@ -482,14 +494,14 @@ class ZImageTransformerBlock(nn.Module):
                 cos=cos,
                 sin=sin,
             )
-            x = x + gate_msa * self.attention_norm2(attn_out)
+            x = x + gate_msa * self.attention_norm2(attn_out).to(x.dtype)
 
             # FFN block
             x = x + gate_mlp * self.ffn_norm2(
                 self.feed_forward(
                     self.ffn_norm1(x) * scale_mlp,
                 )
-            )
+            ).to(x.dtype)
         else:
             # Attention block
             attn_out = self.attention(
@@ -498,14 +510,14 @@ class ZImageTransformerBlock(nn.Module):
                 cos=cos,
                 sin=sin,
             )
-            x = x + self.attention_norm2(attn_out)
+            x = x + self.attention_norm2(attn_out).to(x.dtype)
 
             # FFN block
             x = x + self.ffn_norm2(
                 self.feed_forward(
                     self.ffn_norm1(x),
                 )
-            )
+            ).to(x.dtype)
 
         return x
 

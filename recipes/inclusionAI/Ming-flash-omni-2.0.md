@@ -32,7 +32,6 @@ Use this recipe when you want a known-good starting point for serving
   `examples/offline_inference/text_to_speech/ming_flash_omni_tts/` and
   `examples/online_serving/text_to_speech/ming_flash_omni_tts/`.
 
-
 ## Hardware Support
 
 This recipe documents reference GPU configurations for the two-stage
@@ -178,6 +177,19 @@ vllm serve Jonathan1909/Ming-flash-omni-2.0 --omni \
 With fewer GPUs, copy the YAML and drop the thinker to TP=2 with the DiT on a
 free card.
 
+### Request/wave batching (opt-in)
+
+For compatible image requests arriving in a burst, use
+`vllm_omni/deploy/ming_flash_omni_image_high_throughput.yaml`. It keeps stage 0
+capacity for parent plus CFG companion requests, admits up to four compatible
+stage-1 requests, and sets `request_batch_max_wait_ms: 20`. The default image
+profile remains `max_num_seqs: 1` with no admission wait for low latency.
+
+Compatibility is explicit: requests with different resolution, denoise steps,
+CFG, output count, ByT5 structure, or reference-image mode are scheduled in
+separate waves. Reference images are kept request-local. Throughput and
+latency benchmarks are **待测** until a real server measurement is available.
+
 ### Online (text-to-image)
 
 Request image output with `"modalities": ["image"]`:
@@ -226,6 +238,24 @@ curl http://127.0.0.1:8091/v1/chat/completions \
   | jq -r '.choices[0].message.content[0].image_url.url | split(",")[1]' \
   | base64 -d > ming_imagegen_extra_body.png
 ```
+
+### Step-wise continuous batching (opt-in)
+
+For true continuous batching, use
+`vllm_omni/deploy/ming_flash_omni_image_stepwise.yaml`. Stage 1 sets
+`step_execution: true` and `max_num_seqs: 4`; each scheduler tick advances
+each active request by one Ming denoise step, so requests may join and leave a
+running batch at different step indices. The existing
+`ming_flash_omni_image_high_throughput.yaml` remains the request-level wave
+batching profile and is not step-wise execution.
+
+The step-wise profile supports T2I and negative-prompt conditioning. Ming
+img2img/reference-image requests are admitted in request-local groups as a
+conservative scheduler policy. The transformer concatenates `ref_latent[i]`
+onto request `i`; widening admission requires real model validation. Reference
+images condition an extra frame; `strength` is ignored with a warning and the
+full denoise schedule is used. GPU throughput and latency
+measurements are **待测**.
 
 **Full control — `sampling_params_list`** (one entry per stage: `[thinker, imagegen]`).
 Use this when you need to tune the thinker's own sampling (`temperature` / `top_p` / `top_k` / `max_tokens`), or to place knobs explicitly per stage.
@@ -279,7 +309,7 @@ curl http://127.0.0.1:8091/v1/chat/completions \
 | `steps` | 30 | Number of FlowMatchEuler denoise steps. |
 | `cfg` | 2.0 | Classifier-free guidance scale. |
 | `seed` | 42 | Per-request RNG seed. |
-| `byte5_text` | (auto) | Glyph text for ByT5 enhancement; raw strings are auto-wrapped to Ming's `Text "…". ` format. Auto-extracted from quoted spans in the prompt when omitted. |
+| `byte5_text` | (auto) | Glyph text for ByT5 enhancement; raw strings are auto-wrapped to Ming's `Text "…".` format (including the trailing space). Auto-extracted from quoted spans in the prompt when omitted. |
 | `negative_prompt` | (empty) | Real CFG negative conditioning. Spawns a CFG-text companion via `expand_cfg_prompts`; **online / text-to-image only** (offline uses Ming's default zero-negative). |
 
 For img2img, add an `image_url` content part to the user message (online) or pass `--image` (offline); the reference image is routed into the DiT stage as `extra[reference_image]`.
