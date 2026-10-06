@@ -27,7 +27,6 @@ from vllm_omni.diffusion.cache.cachedit import (
 from vllm_omni.diffusion.cache.magcache import MagCacheBackend
 from vllm_omni.diffusion.cache.selector import get_cache_backend
 from vllm_omni.diffusion.cache.teacache import TeaCacheBackend
-from vllm_omni.diffusion.cache.teacache.config import TeaCacheConfig
 from vllm_omni.diffusion.data import DiffusionCacheConfig
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -453,23 +452,6 @@ class TestTeaCacheBackend:
         backend = TeaCacheBackend(config)
         assert backend.config.rel_l1_thresh == 0.3
         assert backend.enabled is False
-
-    def test_ming_zimage_reports_uncalibrated_coefficients(self):
-        with pytest.raises(
-            ValueError,
-            match="TeaCache is not yet calibrated",
-        ):
-            TeaCacheConfig(transformer_type="MingZImageTransformer2DModel")
-
-    def test_ming_zimage_accepts_custom_coefficients(self):
-        coefficients = [1.0, -0.5, 0.1, -0.01, 0.001]
-
-        config = TeaCacheConfig(
-            transformer_type="MingZImageTransformer2DModel",
-            coefficients=coefficients,
-        )
-
-        assert config.coefficients == coefficients
 
     @patch("vllm_omni.diffusion.cache.teacache.backend.apply_teacache_hook")
     def test_enable(self, mock_apply_hook):

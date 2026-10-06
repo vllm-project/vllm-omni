@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from dataclasses import dataclass
 
@@ -108,10 +108,6 @@ _MODEL_DEFAULT_REL_L1_THRESH = {
     "MiniMaxH3DiTModel": 0.17,
 }
 
-_UNCALIBRATED_MODEL_TYPES = {
-    "MingZImageTransformer2DModel",
-}
-
 
 @dataclass
 class TeaCacheConfig:
@@ -149,12 +145,6 @@ class TeaCacheConfig:
         if self.coefficients is None:
             # Use model-specific coefficients, explicitly check if the type exists or not
             if self.transformer_type not in _MODEL_COEFFICIENTS:
-                if self.transformer_type in _UNCALIBRATED_MODEL_TYPES:
-                    raise ValueError(
-                        f"TeaCache is not yet calibrated for {self.transformer_type}. "
-                        "Disable TeaCache or provide exactly five custom coefficients "
-                        "in cache_config."
-                    )
                 raise KeyError(
                     f"Cannot find coefficients for {self.transformer_type}. "
                     f"Supported: {list(_MODEL_COEFFICIENTS.keys())}"
