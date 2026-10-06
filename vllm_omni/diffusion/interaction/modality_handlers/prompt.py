@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, ClassVar
 
 import torch
@@ -71,6 +71,9 @@ class PromptSession(InteractionSession):
     pending_event: QueuedPromptEvent | None = None
     active_event: QueuedPromptEvent | None = None
     version: int = 0
+    # Pending updates overwritten before a boundary (chunk-level LWW). They never
+    # start, but still receive a terminal ack at the next boundary.
+    superseded_pending_event_ids: list[str] = field(default_factory=list)
 
 
 def prompt_update_versions(states: Sequence[StepRequestState]) -> tuple[int, ...]:
@@ -145,7 +148,11 @@ class PromptInteractionHandler(InteractionHandler):
         payload: InteractionPayload,
         transition_chunks: int | None,
     ) -> None:
-        """Prompt updates are last-write-win and unbuffered at chunk boundary."""
+        """Prompt updates are last-write-win and unbuffered at chunk boundary.
+
+        An overwritten pending update is reported in ``completed_event_ids`` at
+        the next boundary so every queued event receives a terminal ack.
+        """
         self.validate_payload(
             state,
             event_id=event_id,
@@ -169,6 +176,9 @@ class PromptInteractionHandler(InteractionHandler):
         assert isinstance(session, PromptSession)
         with session.lock:
             # Chunk-level LWW: replace any prior pending event.
+            previous = session.pending_event
+            if previous is not None and previous.event_id != event_id:
+                session.superseded_pending_event_ids.append(previous.event_id)
             session.pending_event = QueuedPromptEvent(
                 event_id=event_id,
                 received_at=received_at,
@@ -206,6 +216,9 @@ class PromptInteractionHandler(InteractionHandler):
             pending_event = session.pending_event
             session.pending_event = None
             active_event = session.active_event
+            # Overwritten pending updates never started; ack them as terminal.
+            completed_event_ids.extend(session.superseded_pending_event_ids)
+            session.superseded_pending_event_ids.clear()
 
             # If current transition is not complete, advance it.
             # After completion, leave active_event in place (so a later pending
@@ -219,7 +232,13 @@ class PromptInteractionHandler(InteractionHandler):
                     active_event.advance_transition()
                     state.prompt_embeds = active_event.blended_prompt_embeds()
                     embeds_changed = True
-                    active_event_ids.append(active_event.event_id)
+                    superseded = pending_event is not None and pending_event.event_id != active_event.event_id
+                    if superseded and active_event.elapsed_transition_chunks < active_event.transition_chunks:
+                        # The pending update below replaces this unfinished
+                        # transition, so this boundary is its terminal ack.
+                        completed_event_ids.append(active_event.event_id)
+                    else:
+                        active_event_ids.append(active_event.event_id)
                     if active_event.elapsed_transition_chunks >= active_event.transition_chunks:
                         state.prompt_embeds = active_event.target_prompt_embeds
                         active_event.source_prompt_embeds = active_event.target_prompt_embeds

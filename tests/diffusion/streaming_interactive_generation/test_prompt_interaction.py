@@ -405,6 +405,104 @@ class TestPromptUpdateExecution:
         pipeline.apply_interaction_at_chunk_boundary(state)
         assert session.version == 3
 
+    def test_helios_prompt_update_superseded_mid_transition_is_acked_completed(self, pipeline: HeliosPipeline) -> None:
+        """A prompt update replaced mid-transition gets exactly one terminal ack."""
+        state = _make_diffusion_request_state(fps=None)
+        handler = PromptInteractionHandler.from_pipeline(pipeline)
+        handler.enqueue(
+            state,
+            event_id="ui-update-1",
+            received_at=0.0,
+            payload={"prompt": "new scene"},
+            transition_chunks=3,
+        )
+        pipeline.apply_interaction_at_chunk_boundary(state)
+
+        handler.enqueue(
+            state,
+            event_id="ui-update-2",
+            received_at=1.0,
+            payload={"prompt": "another scene"},
+            transition_chunks=2,
+        )
+        pipeline.apply_interaction_at_chunk_boundary(state)
+
+        meta = state.interaction_chunk_metadata
+        assert meta is not None
+        assert meta.started_event_ids == ["ui-update-2"]
+        assert meta.completed_event_ids == ["ui-update-1"]
+        session = state.interaction_sessions["prompt"]
+        assert isinstance(session, PromptSession)
+        assert session.active_event is not None
+        assert session.active_event.event_id == "ui-update-2"
+
+        completed_later: list[str] = []
+        for _ in range(3):
+            pipeline.apply_interaction_at_chunk_boundary(state)
+            assert state.interaction_chunk_metadata is not None
+            completed_later.extend(state.interaction_chunk_metadata.completed_event_ids)
+        assert completed_later == ["ui-update-2"]
+
+    def test_helios_prompt_update_overwritten_before_boundary_is_acked_completed(
+        self, pipeline: HeliosPipeline
+    ) -> None:
+        """A pending prompt update replaced before any boundary still gets a terminal ack."""
+        state = _make_diffusion_request_state(fps=None)
+        handler = PromptInteractionHandler.from_pipeline(pipeline)
+        for event_id in ("ui-update-1", "ui-update-2"):
+            handler.enqueue(
+                state,
+                event_id=event_id,
+                received_at=0.0,
+                payload={"prompt": event_id},
+                transition_chunks=2,
+            )
+
+        pipeline.apply_interaction_at_chunk_boundary(state)
+
+        assert state.interaction_chunk_metadata is not None
+        assert state.interaction_chunk_metadata.as_dict() == {
+            "started_event_ids": ["ui-update-2"],
+            "active_event_ids": ["ui-update-2"],
+            "completed_event_ids": ["ui-update-1"],
+        }
+
+        # The overwritten event is acked once, not again at later boundaries.
+        pipeline.apply_interaction_at_chunk_boundary(state)
+        assert state.interaction_chunk_metadata is not None
+        assert state.interaction_chunk_metadata.completed_event_ids == ["ui-update-2"]
+
+    def test_helios_prompt_update_replacing_finished_transition_does_not_reack(self, pipeline: HeliosPipeline) -> None:
+        """Replacing an already completed prompt update must not ack it a second time."""
+        state = _make_diffusion_request_state(fps=None)
+        handler = PromptInteractionHandler.from_pipeline(pipeline)
+        handler.enqueue(
+            state,
+            event_id="ui-update-1",
+            received_at=0.0,
+            payload={"prompt": "new scene"},
+            transition_chunks=1,
+        )
+        pipeline.apply_interaction_at_chunk_boundary(state)
+        assert state.interaction_chunk_metadata is not None
+        assert state.interaction_chunk_metadata.completed_event_ids == ["ui-update-1"]
+
+        handler.enqueue(
+            state,
+            event_id="ui-update-2",
+            received_at=1.0,
+            payload={"prompt": "another scene"},
+            transition_chunks=0,
+        )
+        pipeline.apply_interaction_at_chunk_boundary(state)
+
+        assert state.interaction_chunk_metadata is not None
+        assert state.interaction_chunk_metadata.as_dict() == {
+            "started_event_ids": ["ui-update-2"],
+            "active_event_ids": ["ui-update-2"],
+            "completed_event_ids": ["ui-update-2"],
+        }
+
     def test_stepwise_runner_applies_prompt_update_and_acks(
         self,
         monkeypatch: pytest.MonkeyPatch,
