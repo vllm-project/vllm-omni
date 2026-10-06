@@ -18,8 +18,7 @@ from vllm.entrypoints.openai.models.protocol import BaseModelPath
 
 from vllm_omni.config import stage_config
 from vllm_omni.config.config_factory import StageConfigFactory
-from vllm_omni.config.omni_config import VllmOmniConfig
-from vllm_omni.config.stage_config import DeployConfig, DuplexSessionRuntimeConfig, PipelineConfig, StagePipelineConfig
+from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig, PipelineConfig, StagePipelineConfig
 from vllm_omni.engine.duplex.config import DuplexCapabilities
 from vllm_omni.entrypoints.duplex.serving import OmniDuplexSessionHandler
 from vllm_omni.entrypoints.duplex_omni import DuplexOmni
@@ -58,14 +57,12 @@ _DUPLEX_APP_STATE_KEYS = {
     "openai_streaming_speech",
     "openai_streaming_video",
     "openai_streaming_video_output",
-    "openai_serving_realtime",
     "openai_serving_realtime_robot",
     "anthropic_serving_messages",
     "openai_serving_duplex",
     "enable_server_load_tracking",
     "server_load_metrics",
 }
-#: Every turn-based service, plus the Realtime route that is not the duplex one.
 #: ``openai_serving_chat`` is absent: a duplex engine also serves chat, through
 #: the ordinary turn-based service, because DuplexOmni extends AsyncOmni.
 #: ``online_renderer`` is absent for the same reason -- the chat service needs it.
@@ -370,9 +367,29 @@ def _duplex_app(handler: object) -> FastAPI:
     app = FastAPI()
     app.include_router(api_server.router)
     app.state.openai_serving_duplex = handler
-    # A duplex server serves no turn-based Realtime route.
-    app.state.openai_serving_realtime = None
     return app
+
+
+def _turn_based_realtime_app(handler: object | None, mocker) -> FastAPI:
+    app = _duplex_app(handler)
+    app.state.args = Namespace()
+    app.state.openai_serving_models = _FakeModels(
+        base_model_paths=[BaseModelPath(name="omni-model", model_path="omni-model")]
+    )
+    app.state.engine_client = mocker.Mock()
+    app.state.openai_serving_chat = mocker.Mock()
+    return app
+
+
+def _assert_openai_realtime_connection(client: TestClient, path: str) -> None:
+    with client.websocket_connect(path) as websocket:
+        assert websocket.receive_json()["type"] == "session.created"
+        assert websocket.receive_json()["type"] == "conversation.created"
+        websocket.send_json({"type": "unknown_event"})
+        error = websocket.receive_json()
+        assert error["type"] == "error"
+        assert error["error"]["type"] == "invalid_request_error"
+        assert error["error"]["code"] == "invalid_event"
 
 
 @pytest.mark.parametrize("path", ["/v1/duplex", "/v1/realtime?duplex=1"])
@@ -423,73 +440,21 @@ def test_realtime_without_a_duplex_flag_reaches_the_session_handler(query: str) 
 
 
 @pytest.mark.parametrize("query", ["?duplex=0", "?duplex=false", "?duplex=off"])
-def test_realtime_opted_out_of_duplex_falls_through_to_the_turn_based_route(query: str) -> None:
-    """An explicit opt-out selects the legacy handler, which a duplex server does not mount."""
+def test_realtime_opted_out_of_duplex_falls_through_to_the_turn_based_route(query: str, mocker) -> None:
     handler = _RecordingHandler()
+    app = _turn_based_realtime_app(handler, mocker)
 
-    with TestClient(_duplex_app(handler)) as client:
-        with client.websocket_connect(f"/v1/realtime{query}") as websocket:
-            assert websocket.receive_json() == {
-                "type": "error",
-                "error": "Realtime API is not available",
-                "code": "unsupported",
-            }
-            with pytest.raises(WebSocketDisconnect):
-                websocket.receive_text()
+    with TestClient(app) as client:
+        _assert_openai_realtime_connection(client, f"/v1/realtime{query}")
 
     assert handler.queries == []
 
 
-@pytest.fixture
-def qwen3_realtime_stages():
-    from vllm_omni.model_executor.models.qwen3_omni.pipeline import QWEN3_OMNI_PIPELINE
-
-    return VllmOmniConfig.from_pipeline_config(
-        QWEN3_OMNI_PIPELINE, user_deploy_config=DeployConfig(async_chunk=True)
-    ).stage_configs
-
-
-def test_qwen3_realtime_recognizes_typed_stages(qwen3_realtime_stages) -> None:
-    from vllm_omni.entrypoints.duplex.openai import supports_qwen3_omni_realtime
-
-    assert supports_qwen3_omni_realtime(qwen3_realtime_stages)
-
-
-@pytest.mark.parametrize("topology", ["missing-stage", "duplicate-stage", "other-architecture"])
-def test_qwen3_realtime_rejects_other_topologies(qwen3_realtime_stages, topology: str) -> None:
-    from vllm_omni.entrypoints.duplex.openai import supports_qwen3_omni_realtime
-
-    stages = list(qwen3_realtime_stages)
-    if topology == "missing-stage":
-        stages.pop()
-    elif topology == "duplicate-stage":
-        stages[-1] = stages[0]
-    else:
-        stages[0].model_config.model_arch = "Qwen2_5OmniForConditionalGeneration"
-
-    assert not supports_qwen3_omni_realtime(stages)
-
-
-def test_qwen3_turn_deployment_uses_conformant_realtime(qwen3_realtime_stages, mocker) -> None:
-    app = _duplex_app(None)
-    app.state.stage_configs = qwen3_realtime_stages
-    app.state.args = Namespace()
-    app.state.openai_serving_models = _FakeModels(
-        base_model_paths=[BaseModelPath(name="qwen3-omni", model_path="qwen3-omni")]
-    )
-    app.state.engine_client = mocker.Mock(
-        get_tokenizer=mocker.AsyncMock(return_value=mocker.Mock(chat_template="{{ messages }}"))
-    )
+def test_turn_based_deployment_uses_openai_realtime(mocker) -> None:
+    app = _turn_based_realtime_app(None, mocker)
 
     with TestClient(app) as client:
-        with client.websocket_connect("/v1/realtime?model=qwen3-omni") as websocket:
-            assert websocket.receive_json()["type"] == "session.created"
-            assert websocket.receive_json()["type"] == "conversation.created"
-            websocket.send_json({"type": "unknown_event"})
-            error = websocket.receive_json()
-            assert error["type"] == "error"
-            assert error["error"]["type"] == "invalid_request_error"
-            assert error["error"]["code"] == "invalid_event"
+        _assert_openai_realtime_connection(client, "/v1/realtime?model=omni-model")
 
 
 # --------------------------------------------------------------------------- #
@@ -560,8 +525,6 @@ def test_qwen_plugin_preserves_custom_turn_deployment_default(monkeypatch, tmp_p
 @pytest.mark.parametrize("flag", ["1", "true", "on"])
 def test_turn_deployment_rejects_explicit_duplex_without_falling_back_to_stt(flag: str) -> None:
     app = _duplex_app(None)
-    # Even an available STT service must not silently accept a duplex request.
-    app.state.openai_serving_realtime = object()
     with TestClient(app) as client:
         with client.websocket_connect(f"/v1/realtime?duplex={flag}") as websocket:
             assert websocket.receive_json() == {

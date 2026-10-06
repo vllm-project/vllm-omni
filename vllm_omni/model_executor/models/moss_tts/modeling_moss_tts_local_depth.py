@@ -197,7 +197,9 @@ class MossTTSLocalDepthTransformer(nn.Module):
         every cache position before reading it, including CUDA Graph replay.
     """
 
-    def __init__(self, gpt2_config, hidden_size: int | None = None) -> None:
+    def __init__(
+        self, gpt2_config, hidden_size: int | None = None, *, compile_audio_sampler: bool | None = None
+    ) -> None:
         super().__init__()
         self.hidden_size = int(hidden_size if hidden_size is not None else gpt2_config.n_embd)
         n_head = int(gpt2_config.n_head)
@@ -208,6 +210,7 @@ class MossTTSLocalDepthTransformer(nn.Module):
         self.ln_f = nn.LayerNorm(self.hidden_size, eps=eps)
         self._compiled_forward_prefix = None
         self._compiled_audio_sampler = None
+        self._compile_audio_sampler = compile_audio_sampler
 
     def _forward_prefix(
         self,
@@ -231,7 +234,10 @@ class MossTTSLocalDepthTransformer(nn.Module):
             dynamic=True,
             options={"epilogue_fusion": False},
         )
-        if os.environ.get("VLLM_OMNI_MOSS_LOCAL_COMPILE_AUDIO_SAMPLER", "0") == "1":
+        compile_sampler = self._compile_audio_sampler
+        if compile_sampler is None:
+            compile_sampler = os.environ.get("VLLM_OMNI_MOSS_LOCAL_COMPILE_AUDIO_SAMPLER", "0") == "1"
+        if compile_sampler:
             # Keep the existing top-k/top-p algorithm and torch RNG. Explicit
             # per-request generators use the original helper below. The
             # binary continue/stop head is deliberately unchanged.

@@ -1,6 +1,6 @@
 # Opt-in single-H200 native full-duplex codec profile (V1).
 # Inherits the native session/stage capacities, sampling and chunk sizes.
-# Uses the mainline Whole-Euler Flow and shared prompt-state implementation.
+# Enables all Stage 0 (multimodal duplex prefill) and Stage 2 (code2wav DiT) optimizations.
 # Ordinary TF32 for CFM DiT GEMMs (cuBLAS allow_tf32 + Triton tf32 dots).
 # HiFT stays IEEE FP32. Validate audio quality for your workload.
 base_config: minicpmo_4_5.yaml
@@ -9,3 +9,28 @@ connectors:
   connector_of_shared_memory:
     extra:
       token2wav_allow_tf32: true
+      # Stage 2: Fused DiT transformer body (LayerNorm + QKV + Residual)
+      cfm_fused_body: true
+      # Stage 2: Flow condition encoder CUDA graph
+      cfm_encoder_cuda_graph: true
+      # Stage 2: Pre-allocated persistent slot pool and row offset merging
+      cfm_slot_pool: true
+      cfm_row_offset_merge: true
+      # Stage 2: Compress DiT attention cache to bf16
+      code2wav_bfloat16_attention_cache: true
+
+stages:
+  - stage_id: 0
+    enforce_eager: false
+    hf_overrides:
+      # Stage 0: Incremental sliding window Fbank feature extraction
+      duplex_incremental_fbank: true
+      # Stage 0: Fused packed SigLIP encoder layers
+      vision_fused_layers: true
+      # Stage 0: Packed SigLIP tower & resampler CUDA graph
+      vision_cuda_graph: true
+      # Stage 0: Steady Whisper streaming audio encoder CUDA graph
+      duplex_audio_encoder_cuda_graph: true
+      duplex_audio_encoder_cuda_graph_batch_sizes_from_sessions: true
+      # Stage 0: Pinned memory async H2D copy for streaming audio chunks
+      duplex_audio_encoder_pinned_h2d: true

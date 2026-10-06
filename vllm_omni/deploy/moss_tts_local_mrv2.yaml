@@ -1,10 +1,11 @@
-# Opt-in CUDA MRV2 for MOSS-TTS-Local-Transformer-v1.5.
-# Keep the base profile's batching, chunk geometry and V1 default.
-base_config: moss_tts_local.yaml
-model_runner: v2
+# CUDA MRV2/C64 for MOSS-TTS-Local-Transformer-v1.5, without MPS.
+# Also selected automatically when nvidia-cuda-mps-control is unavailable.
+base_config: moss_tts_local_v1.yaml
+model_runner: v1
 
 platforms:
   cuda:
+    model_runner: v2
     stages:
       - stage_id: 0
         # Bound prefill work so new prompts do not monopolize streaming decode.

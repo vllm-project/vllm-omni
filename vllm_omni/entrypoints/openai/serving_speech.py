@@ -1698,7 +1698,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                         chunk_np = resampler.process(chunk_np)
                         if chunk_np.size == 0:
                             continue
-                    if self._tts_model_type in _AUDEX_NO_AUDIO_GUARD_MODEL_TYPES and int(np.size(chunk_np)) == 0:
+                    if int(np.size(chunk_np)) == 0:
                         # Zero-size chunks must not emit a WAV header or count
                         # as first audio; the post-loop guard below needs to
                         # see an audio-less stream to fail the request.
@@ -1762,6 +1762,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 # Audex contract: zero codec tokens must abort the stream, not
                 # complete it cleanly with zero audio bytes.
                 raise ValueError("Audex produced no audio (the thinker emitted zero or invalid codec tokens)")
+            if adapter is not None:
+                adapter.validate_stream_audio(has_audio=first_audio_chunk_s is not None)
             # Check before committing the reference-audio artifact or logging
             # success. Streaming protocols may already have emitted partial
             # bytes, but they must terminate as an error rather than cleanly.
