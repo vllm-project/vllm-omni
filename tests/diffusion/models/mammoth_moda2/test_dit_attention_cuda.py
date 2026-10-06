@@ -463,6 +463,7 @@ def test_model_prepares_three_rope_tables_with_one_threshold_lookup(monkeypatch,
         .to(torch.bfloat16)
         .eval()
     )
+    initialize_block_weights(model)
     hidden = torch.randn(2, 4, 4, 4, device="cuda", dtype=torch.bfloat16)
     text = torch.randn(2, 4, 32, device="cuda", dtype=torch.bfloat16)
     mask = torch.ones(2, 4, device="cuda", dtype=torch.bool)
