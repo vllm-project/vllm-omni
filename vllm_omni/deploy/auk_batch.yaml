@@ -5,6 +5,7 @@ base_config: auk.yaml
 
 stages:
   - stage_id: 0
+    model_runner: v2
     max_num_seqs: 128
     max_num_batched_tokens: 65536
   - stage_id: 1
