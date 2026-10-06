@@ -10,7 +10,6 @@ from diffusers.models.embeddings import TimestepEmbedding, Timesteps
 from diffusers.models.modeling_utils import ModelMixin
 from einops import rearrange
 from torch import nn
-
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
@@ -26,7 +25,6 @@ from vllm_omni.diffusion.layers.fused_qk_norm_rope import (
     fused_qk_norm_rope_min_tokens,
 )
 from vllm_omni.diffusion.layers.norm import RMSNorm
-
 from vllm_omni.model_executor.models.utils import maybe_prefix
 
 from .rope_real import RotaryPosEmbedReal, apply_real_rotary_emb
@@ -130,7 +128,6 @@ def _apply_qk_norm_rope(
         query = apply_real_rotary_emb(query, image_rotary_emb[0], image_rotary_emb[1])
         key = apply_real_rotary_emb(key, image_rotary_emb[0], image_rotary_emb[1])
     return query, key
-
 
 
 class LuminaRMSNormZero(nn.Module):
@@ -527,9 +524,10 @@ class TransformerBlock(nn.Module):
             return_bias=False,
         )
 
-        # 显式使用 transformers 的 Qwen2RMSNorm，避免依赖 diffusers 内部创建的 `RMSNorm` 再做递归替换。
-        self.attn.norm_q = Qwen2RMSNorm(self.head_dim, eps=1e-5)
-        self.attn.norm_k = Qwen2RMSNorm(self.head_dim, eps=1e-5)
+        # Set the QK norms here instead of letting diffusers build its own
+        # RMSNorm via qk_norm.
+        self.attn.norm_q = RMSNorm(self.head_dim, eps=1e-5)
+        self.attn.norm_k = RMSNorm(self.head_dim, eps=1e-5)
         # The kernel itself runs through the shared Omni attention layer: backend
         # selection, padding-mask handling and native grouped-query heads live
         # there. It owns no parameters, so checkpoint keys are unchanged. The
