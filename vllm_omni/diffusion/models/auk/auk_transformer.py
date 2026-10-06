@@ -621,12 +621,13 @@ class AuKTransformer(nn.Module):
                 c = torch.zeros_like(c)
             prompt = None if ref is None else self._embed_prompt(ref, ref_mask, drop_audio_cond)
 
+        device = c.device if ref is None else ref.device
+        if mask is None:
+            mask = torch.ones((batch, target_len), dtype=torch.bool, device=device)
         audio_mask = mask
-        if ref is not None and (mask is not None or ref_mask is not None):
-            if mask is None:
-                mask = torch.ones((batch, target_len), dtype=torch.bool, device=ref.device)
+        if ref is not None:
             if ref_mask is None:
-                ref_mask = torch.ones(ref.shape[:2], dtype=torch.bool, device=ref.device)
+                ref_mask = torch.ones(ref.shape[:2], dtype=torch.bool, device=device)
             audio_mask = torch.cat([ref_mask, mask], dim=1)
 
         branches = 2 if cfg_infer else 1
