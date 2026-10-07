@@ -321,6 +321,7 @@ class StagePool:
         task: Task | None = None,
         *,
         affinity_request_id: str | None = None,
+        sampling_params: Any = None,
     ) -> int:
         """Return a replica id for ``request_id``.
 
@@ -331,6 +332,10 @@ class StagePool:
 
         In non-distributed (legacy) mode: delegates to
         :meth:`select_replica_id`.
+
+        ``sampling_params`` (when provided and ``task`` is not) is embedded in
+        the :class:`Task` handed to the load balancer so stateful policies
+        such as cost-aware routing can estimate the request's relative work.
         """
         if self._hub is None or self._lb is None:
             return self.select_replica_id(request_id, affinity_request_id=affinity_request_id)
@@ -354,7 +359,11 @@ class StagePool:
                     return replica_id
 
         # 3. Fresh pick: poll hub + LB with bounded wait.
-        task = task or Task(request_id=request_id)
+        if task is None:
+            task = Task(request_id=request_id, sampling_params=sampling_params)
+        else:
+            task = task.copy()
+            task["request_id"] = request_id
         deadline = _time.monotonic() + self.DISPATCH_WAIT_TIMEOUT_S
         while True:
             candidates = self._collect_serviceable_replicas()
@@ -378,6 +387,7 @@ class StagePool:
         task: Task | None = None,
         *,
         affinity_request_id: str | None = None,
+        sampling_params: Any = None,
     ) -> int | None:
         """Synchronously pick and bind a replica before request preprocessing.
 
@@ -388,6 +398,9 @@ class StagePool:
         address in ``_affinity`` so the async submit path reuses the route. If
         no replica is currently serviceable, return ``None`` and let the async
         submit-time router wait without blocking the caller.
+
+        ``sampling_params`` is embedded in the :class:`Task` (when ``task`` is
+        not provided) so stateful balancers can estimate the request's cost.
         """
         if self._hub is None or self._lb is None:
             return self.select_replica_id(request_id, affinity_request_id=affinity_request_id)
@@ -407,7 +420,11 @@ class StagePool:
                     self._affinity[request_id] = parent_addr
                     return replica_id
 
-        task = task or Task(request_id=request_id)
+        if task is None:
+            task = Task(request_id=request_id, sampling_params=sampling_params)
+        else:
+            task = task.copy()
+            task["request_id"] = request_id
         candidates = self._collect_serviceable_replicas()
         if not candidates:
             return None
@@ -460,7 +477,7 @@ class StagePool:
         """Drop affinity rows pointing at ``input_addr``; return affected request ids."""
         affected: list[str] = [rid for rid, addr in self._affinity.items() if addr == input_addr]
         for rid in affected:
-            self._affinity.pop(rid, None)
+            self.release_binding(rid)
         return affected
 
     # ---- Legacy (non-distributed) route binding ----
@@ -532,6 +549,12 @@ class StagePool:
         self._non_empty_first_output_timestamps_by_request.pop(str(request_id), None)
         self._audio_frames_by_request.pop(str(request_id), None)
         self._audio_sample_rate_by_request.pop(str(request_id), None)
+        # Release the load balancer's reservation so the request's estimated
+        # cost no longer counts against its replica's effective load. The LB
+        # release is idempotent (pop with default), so calling this twice for
+        # the same request is safe.
+        if self._lb is not None:
+            self._lb.release(request_id)
 
     def release_bindings(self, request_ids: list[str]) -> None:
         """Drop route bindings for the given request ids in this stage."""
@@ -1014,14 +1037,20 @@ class StagePool:
             replica_id = await self._pick_or_select(
                 request_id,
                 affinity_request_id=affinity_request_id,
+                sampling_params=params,
             )
             client = self._diffusion_client(replica_id)
-            await client.add_request_async(request_id, request, params, **submit_kwargs)
+            try:
+                await client.add_request_async(request_id, request, params, **submit_kwargs)
+            except Exception:
+                self.release_binding(request_id)
+                raise
             return replica_id
 
         replica_id = await self._pick_or_select(
             request_id,
             affinity_request_id=affinity_request_id,
+            sampling_params=params,
         )
         client = self.clients[replica_id]
         if client is None:
@@ -1071,8 +1100,9 @@ class StagePool:
         if self.stage_type == "diffusion":
             params = OmniDiffusionSamplingParams.from_params(params)
         replica_id = self.get_bound_replica_id(request_id)
-        if replica_id is None or self.clients[replica_id] is None:
-            replica_id = await self._pick_or_select(request_id)
+        new_binding = replica_id is None or self.clients[replica_id] is None
+        if new_binding:
+            replica_id = await self._pick_or_select(request_id, sampling_params=params)
 
         client = self.clients[replica_id]
         if client is None:
@@ -1084,7 +1114,12 @@ class StagePool:
                     "Diffusion list-prompt batch requests are no longer supported. "
                     "Submit multiple independent requests to use scheduler batching."
                 )
-            await self._diffusion_client(replica_id).add_request_async(request_id, request, params, **submit_kwargs)
+            try:
+                await self._diffusion_client(replica_id).add_request_async(request_id, request, params, **submit_kwargs)
+            except Exception:
+                if new_binding:
+                    self.release_binding(request_id)
+                raise
         else:
             # Refresh the shared output-processor state before yielding to the
             # stage client so streaming segments are merged against the latest
@@ -1099,6 +1134,8 @@ class StagePool:
                 )
                 await self._llm_client(replica_id).add_request_async(request, **submit_kwargs)
             except Exception:
+                if new_binding:
+                    self.release_binding(request_id)
                 rollback = getattr(self.output_processor, "remove_request", None)
                 if callable(rollback):
                     try:
@@ -1136,10 +1173,15 @@ class StagePool:
         request_id: str,
         *,
         affinity_request_id: str | None = None,
+        sampling_params: Any = None,
     ) -> int:
         """Bridge to ``pick`` in distributed mode or ``select_replica_id`` legacy."""
         if self.is_distributed:
-            return await self.pick(request_id, affinity_request_id=affinity_request_id)
+            return await self.pick(
+                request_id,
+                affinity_request_id=affinity_request_id,
+                sampling_params=sampling_params,
+            )
         return self.select_replica_id(request_id, affinity_request_id=affinity_request_id)
 
     # ---- Stage-local polling ----
