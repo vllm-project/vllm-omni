@@ -24,8 +24,8 @@ from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 from PIL import Image
 from pytest_mock import MockerFixture
-from vllm import envs
 
+from vllm import envs
 from vllm_omni.diffusion.data import DIFFUSION_REQUEST_LIFECYCLE_KEY, DIFFUSION_REQUEST_STARTED
 from vllm_omni.diffusion.utils.media_utils import mux_video_audio_bytes
 from vllm_omni.entrypoints.openai import api_server, video_api_utils
@@ -2269,6 +2269,27 @@ def test_h3_multipart_maps_pillow_pixel_limit_error(field, test_client, monkeypa
 
     assert response.status_code == 400
     assert "decoder pixel limit" in response.json()["detail"]
+
+
+def test_cosmos3_multiview_upload_rejects_shared_negative_prompt(test_client):
+    test_client.app.state.openai_serving_video._engine_client.model_class_name = "Cosmos3MultiviewPipeline"
+    extra_params = {
+        "multiview": {
+            "views": [
+                {"camera_key": "camera_front_wide_120fov", "prompt": "A car drives.", "control_reference_index": 0}
+            ]
+        },
+        "wsm": {},
+    }
+
+    response = test_client.post(
+        "/v1/videos/sync",
+        data={"prompt": "Driving.", "negative_prompt": "Blurry.", "extra_params": json.dumps(extra_params)},
+        files=[("input_references", ("front.mp4", b"front-control", "video/mp4"))],
+    )
+
+    assert response.status_code == 400
+    assert "does not support request.negative_prompt" in response.json()["detail"]
 
 
 @pytest.mark.asyncio

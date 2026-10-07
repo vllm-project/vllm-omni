@@ -111,10 +111,16 @@ from .transfer import (
     transfer_max_frames_from_extra_args,
     uint8_cthw_to_normalized_5d,
 )
-from .transformer_cosmos3 import Cosmos3VFMTransformer, _tf_config_get, resolve_sound_gen
+from .transformer_cosmos3 import (
+    COSMOS3_MULTIVIEW_BACKBONE_TYPE,
+    Cosmos3VFMTransformer,
+    _tf_config_get,
+    resolve_sound_gen,
+)
 from .transformer_cosmos3_edge import COSMOS3_EDGE_BACKBONE_TYPE, Cosmos3EdgeVFMTransformer
 from .utils import (
     COSMOS3_DEFAULT_CONDITION_FRAME_INDEXES_VISION,
+    COSMOS3_TRANSFER_CONTROL_DIRECTIVE_TEMPLATE,
     COSMOS3_VAE_TEMPORAL_COMPRESSION,
     ROBOLAB_CONCAT_VIEW_DESCRIPTION,
     ROBOLAB_DEFAULT_ACTION_CHUNK_SIZE,
@@ -171,10 +177,6 @@ COSMOS3_T2I_SYSTEM_PROMPT = "You are a helpful assistant who will generate image
 COSMOS3_TRANSFER_SYSTEM_PROMPT = (
     "You are a helpful assistant that generates images or videos following the user's instructions"
     " and control signals (edge maps, blur, depth, or segmentation)."
-)
-COSMOS3_TRANSFER_CONTROL_DIRECTIVE_TEMPLATE = (
-    "Follow the {hint_names} control video precisely: shape, contour, silhouette, position, and motion of every "
-    "visible structure must align with the {hint_names} signal at every frame."
 )
 
 COSMOS3_T2V_DEFAULT_HEIGHT = 720
@@ -300,6 +302,10 @@ def resolve_cosmos3_transformer_cls(model_config: Any) -> type[Cosmos3VFMTransfo
         return Cosmos3VFMTransformer
     if backbone_type == COSMOS3_EDGE_BACKBONE_TYPE:
         return Cosmos3EdgeVFMTransformer
+    if backbone_type == COSMOS3_MULTIVIEW_BACKBONE_TYPE:
+        from .transformer_cosmos3_multiview import Cosmos3MultiviewVFMTransformer
+
+        return Cosmos3MultiviewVFMTransformer
     raise ValueError(f"Unsupported Cosmos3 transformer backbone_type={backbone_type!r}.")
 
 
@@ -1191,6 +1197,9 @@ class Cosmos3OmniDiffusersPipeline(
             (
                 "proj_in.",
                 "proj_out.",
+                "lidar_proj_in.",
+                "lidar_proj_out.",
+                "rig_view_embed.",
                 "time_embedder.",
                 "audio_proj_in.",
                 "audio_proj_out.",
@@ -2012,9 +2021,14 @@ class Cosmos3OmniDiffusersPipeline(
         duration_template: str | None = COSMOS3_DURATION_TEMPLATE,
         resolution_template: str | None = COSMOS3_RESOLUTION_TEMPLATE,
         force_duration_template: bool = False,
+        truncate_duration: bool = False,
     ) -> str:
         """
         Append duration and resolution metadata to a prompt.
+
+        ``truncate_duration`` writes whole seconds, as multiview per-camera
+        caption training and reference inference do (201 frames at 30 FPS is
+        "6.0", not "6.7").
         """
         prompt = prompt.strip()
         if duration_template is None and resolution_template is None:
@@ -2026,6 +2040,8 @@ class Cosmos3OmniDiffusersPipeline(
             parts.append(head)
         if duration_template is not None and (num_frames > 1 or force_duration_template):
             duration = num_frames / frame_rate
+            if truncate_duration:
+                duration = int(duration)
             parts.append(duration_template.format(duration=duration, fps=frame_rate).rstrip("."))
         if resolution_template is not None:
             parts.append(resolution_template.format(height=height, width=width).rstrip("."))
@@ -2283,6 +2299,7 @@ class Cosmos3OmniDiffusersPipeline(
         use_resolution_template: bool | None = None,
         negative_metadata_mode: str | None = None,
         aspect_ratio_override: str | None = None,
+        truncate_duration: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Format prompts with metadata templates and tokenize.
 
@@ -2363,6 +2380,7 @@ class Cosmos3OmniDiffusersPipeline(
                 width,
                 duration_template=dur_tmpl,
                 resolution_template=res_tmpl,
+                truncate_duration=truncate_duration,
             )
         if prompt_suffix:
             prompt = f"{prompt.rstrip()} {prompt_suffix.lstrip()}".strip()
@@ -2392,6 +2410,7 @@ class Cosmos3OmniDiffusersPipeline(
             duration_template=negative_dur_tmpl,
             resolution_template=negative_res_tmpl,
             force_duration_template=negative_metadata_mode == "inverse",
+            truncate_duration=truncate_duration,
         )
 
         if system_prompt is None:
@@ -3219,6 +3238,20 @@ class Cosmos3OmniDiffusersPipeline(
                     return detected
         return None
 
+    def _mask_transfer_noise(
+        self, noise: torch.Tensor, velocity_mask: torch.Tensor, shared_kwargs: dict[str, Any]
+    ) -> torch.Tensor:
+        return noise * velocity_mask
+
+    def _apply_transfer_condition(
+        self,
+        latents: torch.Tensor,
+        velocity_mask: torch.Tensor,
+        condition_latents: torch.Tensor,
+        shared_kwargs: dict[str, Any],
+    ) -> torch.Tensor:
+        return velocity_mask * latents + (1.0 - velocity_mask) * condition_latents
+
     def diffuse_transfer(
         self,
         latents: torch.Tensor,
@@ -3238,6 +3271,9 @@ class Cosmos3OmniDiffusersPipeline(
         condition_latents: torch.Tensor,
         guidance_interval: tuple[float, float] | None = None,
         generator: torch.Generator | None = None,
+        normalize_cfg: bool = False,
+        open_guidance_interval: bool = False,
+        text_cfg_below_one: bool = False,
     ) -> torch.Tensor:
         if getattr(self, "_use_session_state", False):
             raise NotImplementedError(
@@ -3251,7 +3287,7 @@ class Cosmos3OmniDiffusersPipeline(
                 return True
             t_scalar = float(t.item()) if torch.is_tensor(t) else float(t)
             lo, hi = interval
-            return lo <= t_scalar <= hi
+            return lo < t_scalar < hi if open_guidance_interval else lo <= t_scalar <= hi
 
         self.transformer.reset_cache()
         self._cosmos3_branch_caches = {}
@@ -3262,9 +3298,12 @@ class Cosmos3OmniDiffusersPipeline(
                 timestep = t.unsqueeze(0)
                 step_guidance = guidance_scale if _active_at(t, guidance_interval) else 1.0
                 step_control = control_guidance if _active_at(t, control_guidance_interval) else 1.0
-                needs_text_cfg = step_guidance > 1.0
+                # Guidance <= 1 disables text CFG, as in diffuse(). Callers that
+                # follow a reference which skips it only at exactly 1 opt in.
+                needs_text_cfg = step_guidance != 1.0 if text_cfg_below_one else step_guidance > 1.0
                 needs_control_cfg = step_control != 1.0
 
+                branches_kwargs = None
                 cond_full_kwargs = dict(
                     _cache_context="cond",
                     hidden_states=latents,
@@ -3310,7 +3349,7 @@ class Cosmos3OmniDiffusersPipeline(
                             "control_guidance": step_control,
                         },
                         branches_kwargs=branches_kwargs,
-                        cfg_normalize=False,
+                        cfg_normalize=normalize_cfg,
                     )
                 elif needs_control_cfg:
                     branches_kwargs = [
@@ -3334,7 +3373,7 @@ class Cosmos3OmniDiffusersPipeline(
                             "control_guidance": step_control,
                         },
                         branches_kwargs=branches_kwargs,
-                        cfg_normalize=False,
+                        cfg_normalize=normalize_cfg,
                     )
                 elif needs_text_cfg:
                     branches_kwargs = [
@@ -3359,13 +3398,16 @@ class Cosmos3OmniDiffusersPipeline(
                             "guidance_scale": step_guidance,
                         },
                         branches_kwargs=branches_kwargs,
-                        cfg_normalize=False,
+                        cfg_normalize=normalize_cfg,
                     )
                 else:
                     noise_pred = self.predict_noise(**cond_full_kwargs)
+                # CFG argument dictionaries otherwise retain the previous
+                # sample during the next transformer call.
+                del cond_full_kwargs, branches_kwargs
                 if isinstance(noise_pred, tuple):
                     raise ValueError("Cosmos3 transfer diffusion expects video-only tensor predictions.")
-                noise_pred = noise_pred * velocity_mask
+                noise_pred = self._mask_transfer_noise(noise_pred, velocity_mask, shared_kwargs)
                 latents = self.scheduler.step(
                     noise_pred,
                     t,
@@ -3373,8 +3415,13 @@ class Cosmos3OmniDiffusersPipeline(
                     generator=generator,
                     return_dict=False,
                 )[0]
-                latents = velocity_mask * latents + (1.0 - velocity_mask) * condition_latents
+                del noise_pred
+                latents = self._apply_transfer_condition(latents, velocity_mask, condition_latents, shared_kwargs)
         finally:
+            # Transfer runs to completion here. The solver's previous samples
+            # must not overlap VAE decoding (also release them on failure).
+            if isinstance(self.scheduler, FlowUniPCMultistepScheduler):
+                self.scheduler.clear_history()
             self._clear_denoise_step_metadata()
             self._reset_mixed_precision()
             self._cosmos3_branch_caches = None
