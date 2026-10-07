@@ -30,6 +30,16 @@ QWEN_IMAGE_EDIT_PLUS_MAX_INPUT_IMAGES = 4
 HUNYUAN_IMAGE3_MAX_INPUT_IMAGES = 3
 # Boogu-Image editing (TI2I) supports a single reference image for now.
 BOOGU_IMAGE_MAX_INPUT_IMAGES = 1
+# SenseNova-U1.5 MoT editing accepts multiple reference images: the pipeline
+# expands per-image ``<image>`` placeholders (Image-N prefixes) and folds every
+# grid row into the vision embedding / MoT routing. The pipeline splits a global
+# 4096x4096 px budget across the references (``max_pixels_per_image =
+# min(2048*2048, 4096*4096 // num_images)``), so the vision token count
+# saturates at ~16k and the LLM sequence stays roughly flat as the count grows;
+# the Qwen3 backbone context (262144) is not the binding limit. Cap 128 set per
+# requirement; E2E verified with 8/16/32/64/128 references at 2560x2048
+# (74/76/83/94/119 s per 50-step edit), 129 rejected by admission.
+SENSENOVA_U1_MAX_INPUT_IMAGES = 128
 
 
 _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
@@ -52,6 +62,10 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
     "BooguImagePipeline": DiffusionModelMetadata(
         supports_multimodal_inputs=True,
         max_multimodal_image_inputs=BOOGU_IMAGE_MAX_INPUT_IMAGES,
+    ),
+    "SenseNovaU1Pipeline": DiffusionModelMetadata(
+        supports_multimodal_inputs=True,
+        max_multimodal_image_inputs=SENSENOVA_U1_MAX_INPUT_IMAGES,
     ),
     "MiniMaxH3Pipeline": DiffusionModelMetadata(
         supports_multimodal_inputs=True,
