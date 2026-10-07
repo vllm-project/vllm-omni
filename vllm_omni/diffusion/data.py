@@ -1096,6 +1096,8 @@ class OmniDiffusionConfig:
     # str is resolved to {"method": <str>} internally.
     # Per-component: {"transformer": {"method": "fp8"}, "vae": None}
     quantization_config: str | QuantizationConfig | dict[str, Any] | None = None
+    # vLLM kernel backend used by quantized diffusion linears.
+    linear_backend: str = "auto"
     # Internal provenance, retained across config projection and worker transport.
     quantization_config_is_auto_detected: bool = False
     # Explicit runtime override for ModelOpt FP8 diffusion checkpoints. This

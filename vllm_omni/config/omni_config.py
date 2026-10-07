@@ -887,6 +887,7 @@ class _DiffusionConfigProjection:
     enable_stage_verification: bool = True
     prompt_file_path: str | None = None
     quantization_config: _QuantizationConfigType = None
+    linear_backend: str = "auto"
     # Internal provenance, retained across config projection and worker transport.
     quantization_config_is_auto_detected: bool = False
     extras: dict[str, Any] = field(default_factory=dict)

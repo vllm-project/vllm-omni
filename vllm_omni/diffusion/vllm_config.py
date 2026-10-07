@@ -220,6 +220,7 @@ def configure_diffusion_vllm_config(vllm_config: VllmConfig, od_config: OmniDiff
     vllm_config.model_config = _make_diffusion_vllm_model_config(od_config)  # type: ignore[assignment]
     vllm_config.quant_config = od_config.quantization_config
     vllm_config.profiler_config = od_config.profiler_config
+    vllm_config.kernel_config.linear_backend = getattr(od_config, "linear_backend", "auto")
     if (
         getattr(od_config, "diffusion_kv_mode", DiffusionKVCacheMode.DENSE_LEGACY)
         is DiffusionKVCacheMode.PAGED_SCHEDULER

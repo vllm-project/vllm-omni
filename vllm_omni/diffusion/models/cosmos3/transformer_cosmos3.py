@@ -204,8 +204,9 @@ def _validate_mixed_precision_runtime(
 ) -> None:
     if config is None:
         return
-    if get_tensor_model_parallel_world_size() != 1:
-        raise ValueError("Cosmos3 mixed precision currently supports tensor parallel size 1 only")
+    # The policy resolver validates serialized ModelOpt FP8/NVFP4 configs,
+    # including homogeneous modelopt_mixed configs. A16 uses each linear's
+    # local weight partition; Column/RowParallelLinear owns TP communication.
     if int(getattr(od_config, "max_num_seqs", 1)) != 1:
         raise ValueError("Cosmos3 mixed precision currently supports one active request per worker")
     if resolve_offload_strategy(od_config) is OffloadStrategy.DISTRIBUTED_LAYER_WISE:
@@ -215,7 +216,8 @@ def _validate_mixed_precision_runtime(
         )
     parallel_config = getattr(od_config, "parallel_config", None)
     if bool(getattr(parallel_config, "use_hsdp", False)):
-        raise ValueError("Cosmos3 mixed precision has not validated live backend weights under HSDP")
+        if resolve_offload_strategy(od_config) is not OffloadStrategy.NONE:
+            raise ValueError("Cosmos3 mixed precision with HSDP does not support CPU offload")
 
 
 def _as_bool(value: Any) -> bool:
