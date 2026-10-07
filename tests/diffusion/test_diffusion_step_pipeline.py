@@ -46,7 +46,7 @@ from vllm_omni.diffusion.sched.interface import (
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
 from vllm_omni.diffusion.worker.diffusion_worker import DiffusionWorker
 from vllm_omni.diffusion.worker.input_batch import InputBatch
-from vllm_omni.diffusion.worker.utils import RunnerOutput, StepRequestState
+from vllm_omni.diffusion.worker.utils import BatchRunnerOutput, RunnerOutput, StepRequestState
 from vllm_omni.errors import OmniClientError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.platforms import current_omni_platform
@@ -239,8 +239,8 @@ class _AutoDenoiseProfilerPipeline(DiffusionPipelineProfilerMixin):
 class _InterruptingStepPipeline(_StepPipeline):
     interrupt = True
 
-    def denoise_step(self, state, **kwargs):
-        del state, kwargs
+    def denoise_step(self, input_batch, **kwargs):
+        del input_batch, kwargs
         self.denoise_calls += 1
         return None
 
@@ -414,6 +414,7 @@ def _make_runner(
     runner.cache_backend = None
     runner.offload_backend = None
     runner.state_cache = {}
+    runner.input_batch = None
     runner.kv_transfer_manager = SimpleNamespace(
         receive_multi_kv_cache_distributed=lambda req, cfg_kv_collect_func=None, target_device=None: None
     )
@@ -434,6 +435,7 @@ def _make_distributed_runner(mode: str, device: torch.device):
     runner.cache_backend = None
     runner.offload_backend = None
     runner.state_cache = {}
+    runner.input_batch = None
     runner.kv_transfer_manager = SimpleNamespace(
         receive_multi_kv_cache_distributed=lambda req, cfg_kv_collect_func=None, target_device=None: None
     )
@@ -652,7 +654,7 @@ class TestRunner:
     ):
         runner = _make_runner(diffusion_kv_mode)
         cleanup = mocker.patch.object(runner, "remove_diffusion_kv_requests")
-        expected_output = object()
+        expected_output = BatchRunnerOutput(runner_outputs=[])
         mocker.patch.object(runner, "_execute_stepwise_core", return_value=expected_output)
         scheduler_output = DiffusionSchedulerOutput(
             step_id=1,
@@ -1097,6 +1099,8 @@ class TestRunner:
         kv_payload = object()
 
         class _CapturingStepPipeline(_StepPipeline):
+            device: torch.device
+
             def prepare_encode(self, state, **kwargs):
                 captured["past_key_values"] = getattr(state.sampling, "past_key_values", None)
                 return super().prepare_encode(state, **kwargs)
@@ -1215,7 +1219,10 @@ def _make_step_worker(lora_manager=None, *, expected_output=None):
     worker.lora_manager = lora_manager
     worker._step_lora_state = {}
     output = expected_output if expected_output is not None else RunnerOutput(request_id="req-1")
-    worker.model_runner = SimpleNamespace(execute_stepwise=lambda arg: output)
+    worker.model_runner = SimpleNamespace(
+        execute_stepwise=lambda arg: output,
+        release_step_requests=lambda request_ids: 0,
+    )
     return worker
 
 

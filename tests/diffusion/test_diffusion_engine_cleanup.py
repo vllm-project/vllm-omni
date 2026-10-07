@@ -34,7 +34,7 @@ def _make_engine() -> DiffusionEngine:
     engine.od_config = SimpleNamespace(distributed_executor_backend=None)
     engine.scheduler = RequestScheduler()
     engine.scheduler.initialize(SimpleNamespace())
-    engine.executor = SimpleNamespace(shutdown=Mock())
+    engine.executor = SimpleNamespace(shutdown=Mock(), release_step_requests=Mock())
     engine._rpc_lock = threading.RLock()
     engine._cv = threading.Condition(engine._rpc_lock)
     engine._out_streams = {}
@@ -95,7 +95,7 @@ def _make_kv_cleanup_engine(mode: DiffusionKVCacheMode) -> tuple[DiffusionEngine
     engine = DiffusionEngine.__new__(DiffusionEngine)
     engine.od_config = SimpleNamespace(diffusion_kv_mode=mode)
     cleanup = Mock()
-    engine.executor = SimpleNamespace(remove_diffusion_kv_requests=cleanup)
+    engine.executor = SimpleNamespace(remove_diffusion_kv_requests=cleanup, release_step_requests=Mock())
     return engine, cleanup
 
 
@@ -128,11 +128,28 @@ def test_dense_terminal_and_abort_paths_skip_worker_row_cleanup() -> None:
     engine._finalize_finished_request = lambda request_id, *_args: request_id
     engine._put_output = lambda *_args: None
     engine.scheduler = SimpleNamespace(get_request_state=lambda _request_id: None)
+    engine.execution_mode = DiffusionExecutionMode.REQUEST_BATCH
 
     engine._emit_finished_outputs({"req-0"})
     engine._abort_requests(["req-idle"])
 
     cleanup.assert_not_called()
+    engine.executor.release_step_requests.assert_not_called()
+
+
+def test_step_abort_state_cleanup_failure_fails_the_engine() -> None:
+    engine = _make_engine()
+    engine.execution_mode = DiffusionExecutionMode.STEP_BATCH
+    request_id = engine.scheduler.add_request(_make_request("abort-cleanup-failure"))
+    error = RuntimeError("step retirement failed on a Worker")
+    engine.executor.release_step_requests.side_effect = error
+    engine._fail_engine = Mock()
+
+    with pytest.raises(RuntimeError, match="step retirement failed"):
+        engine._abort_requests([request_id])
+
+    engine.executor.release_step_requests.assert_called_once_with([request_id])
+    engine._fail_engine.assert_called_once_with(error)
 
 
 def test_init_accepts_custom_scheduler(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -253,11 +270,12 @@ def test_paged_init_profiles_before_scheduler_initialization(monkeypatch: pytest
         "_init_executor",
         lambda self, config: setattr(self, "executor", fake_executor),
     )
-    monkeypatch.setattr(
-        DiffusionEngine,
-        "_prepare_diffusion_kv_profile_requests",
-        lambda self: events.append("prepare-profile") or expected_profile_requests,
-    )
+
+    def prepare_profile_requests(self) -> list[object]:
+        events.append("prepare-profile")
+        return expected_profile_requests
+
+    monkeypatch.setattr(DiffusionEngine, "_prepare_diffusion_kv_profile_requests", prepare_profile_requests)
 
     def initialize(executor, config, *, profile_requests):
         events.append("profile-workers")

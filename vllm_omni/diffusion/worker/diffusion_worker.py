@@ -567,6 +567,13 @@ class DiffusionWorker:
         assert self.model_runner is not None, "Model runner not initialized"
         return self.model_runner.remove_diffusion_kv_requests(request_ids)
 
+    def release_step_requests(self, request_ids: list[str]) -> int:
+        """Release step state and LoRA identities without touching native KV."""
+        assert self.model_runner is not None, "Model runner not initialized"
+        for request_id in request_ids:
+            self._step_lora_state.pop(request_id, None)
+        return self.model_runner.release_step_requests(request_ids)
+
     def prepare_kv_for_forward(self, scheduler_output: DiffusionSchedulerOutput):
         return _run_and_gather_rank_values(
             "Diffusion KV receive",
@@ -739,14 +746,24 @@ class DiffusionWorker:
     def execute_stepwise(self, scheduler_output: DiffusionSchedulerOutput) -> BaseRunnerOutput:
         """Execute one diffusion step by delegating to the model runner."""
         assert self.model_runner is not None, "Model runner not initialized"
-        self._activate_step_lora(scheduler_output)
-        profiler = self._get_profiler()
-        ctx = profiler.annotate_context_manager("diffusion_step") if profiler else nullcontext()
-        with ctx:
-            output = self.model_runner.execute_stepwise(scheduler_output)
-        if profiler:
-            profiler.step()
-        return output
+        try:
+            self._activate_step_lora(scheduler_output)
+            profiler = self._get_profiler()
+            ctx = profiler.annotate_context_manager("diffusion_step") if profiler else nullcontext()
+            with ctx:
+                output = self.model_runner.execute_stepwise(scheduler_output)
+            terminal_ids = [
+                request_id
+                for request_id in scheduler_output.scheduled_request_ids
+                if (request_output := output.get_request_output(request_id)) is not None and request_output.finished
+            ]
+            self.release_step_requests(terminal_ids)
+            if profiler:
+                profiler.step()
+            return output
+        except Exception:
+            self.release_step_requests(scheduler_output.scheduled_request_ids)
+            raise
 
     def _activate_step_lora(self, scheduler_output: DiffusionSchedulerOutput) -> None:
         """Activate the LoRA adapter for the scheduled step batch.
