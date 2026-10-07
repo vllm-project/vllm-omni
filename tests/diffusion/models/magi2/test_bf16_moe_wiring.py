@@ -488,7 +488,8 @@ def test_bf16_forward_matches_reference_routes_and_fp32_reduction(
     moe.triton_mh_moe_forward(x, gather_ids, sorted_probs, offsets, gate, up, down, deterministic=True)
     actual = moe._bf16_fused_moe_forward(x, probabilities, indices, moe._pack_bf16_w13(gate, up), down).cpu()
     assert len(reference_routes) == len(new_routes) == 1
-    flat_experts = (inputs[2] + torch.arange(num_heads).view(-1, 1, 1) * num_experts).reshape(-1)
+    # The fused path stores its routes token-major.
+    flat_experts = (inputs[2] + torch.arange(num_heads).view(-1, 1, 1) * num_experts).transpose(0, 1).reshape(-1)
     order = flat_experts.argsort(stable=True)
     new_sorted = new_routes[0].index_select(0, order)
     scatter_ids = gather_ids.cpu().long() * num_heads + flat_experts[order] // num_experts

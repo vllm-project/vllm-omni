@@ -84,26 +84,25 @@ def _align_bf16_routes(
 
     flat_ids = route_ids.reshape(-1).to(torch.int32)
     route_count = flat_ids.numel()
-    order = torch.argsort(flat_ids)
-    sorted_experts = flat_ids[order]
-    # Count in int32 and widen once: MUSA's int64 scatter_add_ is far slower than its int32 one.
-    counts = torch.zeros(num_experts, device=flat_ids.device, dtype=torch.int32)
-    counts.scatter_add_(0, flat_ids.long(), torch.ones_like(flat_ids))
-    counts = counts.long()
+    # One sort yields both the route order and the sorted expert ids.
+    sorted_experts, order = torch.sort(flat_ids)
+    sorted_experts = sorted_experts.long()
+    # Expert e owns sorted positions [begins[e], begins[e + 1]), found without atomics.
+    expert_bounds = torch.arange(num_experts + 1, device=flat_ids.device, dtype=torch.int64)
+    begins = torch.searchsorted(sorted_experts, expert_bounds)
+    counts = begins[1:] - begins[:-1]
     padded_counts = ((counts + block_size - 1) // block_size) * block_size
-    starts = torch.cumsum(padded_counts, 0) - padded_counts
-    ends = torch.cumsum(counts, 0)
-    begins = ends - counts
+    padded_ends = torch.cumsum(padded_counts, 0)
     positions = torch.arange(route_count, device=flat_ids.device, dtype=torch.int64)
-    destinations = starts[sorted_experts.long()] + positions - begins[sorted_experts.long()]
+    destinations = (padded_ends - padded_counts - begins[:-1])[sorted_experts] + positions
     if buffers is None:
         buffers = _allocate_bf16_route_buffers(route_count, num_experts, block_size, flat_ids.device)
     sorted_ids, expert_ids, num_padded = buffers
     sorted_ids.fill_(route_count)
     sorted_ids[destinations] = order.to(torch.int32)
-    block_starts = torch.arange(expert_ids.numel(), device=flat_ids.device) * block_size
-    expert_ids.copy_(torch.searchsorted(padded_counts.cumsum(0), block_starts, right=True))
-    num_padded.copy_(padded_counts.sum().reshape(1))
+    block_starts = torch.arange(0, expert_ids.numel() * block_size, block_size, device=flat_ids.device)
+    expert_ids.copy_(torch.searchsorted(padded_ends, block_starts, right=True))
+    num_padded.copy_(padded_ends[-1:])
     return sorted_ids, expert_ids, num_padded
 
 
@@ -158,17 +157,18 @@ def _bf16_fused_moe_forward(
     experts_per_head = num_experts // num_heads
     if num_tokens == 0:
         return torch.zeros_like(x_heads)
-    head_offsets = (
-        torch.arange(num_heads, device=x_heads.device, dtype=torch.int32).view(num_heads, 1, 1) * experts_per_head
-    )
-    route_ids = (indices.to(torch.int32) + head_offsets).reshape(num_heads * num_tokens, top_k)
-    route_weights = probabilities.reshape(num_heads * num_tokens, top_k).contiguous()
+    # Routes are token-major (token * heads + head), so the GEMMs read x_heads
+    # and write the output in its [tokens, heads] layout without permute copies.
+    head_offsets = torch.arange(0, num_experts, experts_per_head, device=x_heads.device, dtype=torch.int32)
+    token_major_ids = indices.transpose(0, 1).to(torch.int32, memory_format=torch.contiguous_format)
+    route_ids = (token_major_ids + head_offsets.view(1, num_heads, 1)).view(num_tokens * num_heads, top_k)
+    route_weights = probabilities.transpose(0, 1).reshape(num_tokens * num_heads, top_k).contiguous()
     sorted_ids, expert_ids, num_padded = _align_bf16_routes(route_ids, num_experts, 128, route_buffers)
 
-    hidden = x_heads.permute(1, 0, 2).contiguous().reshape(num_heads * num_tokens, hidden_size)
+    hidden = x_heads.reshape(num_tokens * num_heads, hidden_size)
     intermediate_size = packed_w13.shape[1] // 2
     intermediate = torch.empty(
-        (num_heads * num_tokens * top_k, intermediate_size), device=x_heads.device, dtype=x_heads.dtype
+        (num_tokens * num_heads * top_k, intermediate_size), device=x_heads.device, dtype=x_heads.dtype
     )
     # CUDA/H20 benefits from the pre-Blackwell tile found by the MAGI-2 BF16
     # sweep (smaller K/warp count and deeper pipelining reduce register
@@ -195,7 +195,7 @@ def _bf16_fused_moe_forward(
         config=config,
         fuse_swiglu=True,
     )
-    route_output = torch.empty((num_heads * num_tokens, top_k, hidden_size), device=x_heads.device, dtype=x_heads.dtype)
+    route_output = torch.empty((num_tokens * num_heads, top_k, hidden_size), device=x_heads.device, dtype=x_heads.dtype)
     invoke_fused_moe_bf16(
         intermediate,
         w_down.transpose(1, 2),
@@ -208,7 +208,7 @@ def _bf16_fused_moe_forward(
         config=config,
         fuse_swiglu=False,
     )
-    return route_output.sum(dim=1).reshape(num_heads, num_tokens, hidden_size).permute(1, 0, 2)
+    return route_output.sum(dim=1).view(num_tokens, num_heads, hidden_size)
 
 
 @dataclass(frozen=True)
@@ -460,7 +460,9 @@ class Magi2MultiHeadMoE(nn.Module):
 
     def _route(self, x_heads: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         gate = self.gate.view(self.local_num_heads, self.num_experts, self.d_head).float()
-        logits = torch.einsum("shd,hed->hse", x_heads.float(), gate)
+        # The router bmm reads a contiguous head-major operand; cast and permute in one copy.
+        x_route = x_heads.transpose(0, 1).to(torch.float32, memory_format=torch.contiguous_format)
+        logits = torch.einsum("hsd,hed->hse", x_route, gate)
         bias_source = (os.environ.get("MAGI2_ROUTER_BIAS_SOURCE") or "ema").strip().lower()
         bias_tensor = self.router.expert_bias if bias_source == "main" else self.router.expert_bias_ema
         bias = bias_tensor.view(self.local_num_heads, self.num_experts)
