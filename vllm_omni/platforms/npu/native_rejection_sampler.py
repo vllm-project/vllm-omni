@@ -26,6 +26,7 @@ without the Talker ``speculative_config`` keeps its sampler byte-for-byte.
 
 import importlib.util
 import logging
+from typing import Any
 
 from vllm_omni.platforms.npu.ascend_warmup_patch import _kstep_armed, _probe_soc_name
 
@@ -39,19 +40,24 @@ _RESTORE_SOC_PREFIXES = ("ascend910_93", "ascend910c")
 _KSTEP_SOC_PREFIXES = ("ascend910b",)
 
 
-def _target_soc() -> bool:
+def _target_soc(vllm_config: Any = None) -> bool:
     name = _probe_soc_name().strip().lower()
     if any(name.startswith(prefix) for prefix in _RESTORE_SOC_PREFIXES):
         return True
-    return any(name.startswith(prefix) for prefix in _KSTEP_SOC_PREFIXES) and _kstep_armed()
+    return any(name.startswith(prefix) for prefix in _KSTEP_SOC_PREFIXES) and _kstep_armed(vllm_config)
 
 
-def restore_native_rejection_sampler() -> None:
-    """Point vllm's rejection_sampler module back at its torch functions."""
+def restore_native_rejection_sampler(vllm_config: Any = None) -> None:
+    """Point vllm's rejection_sampler module back at its torch functions.
+
+    ``vllm_config`` is the runner's own config; pass it so the K-step gate
+    does not depend on an engine context that has already been popped by the
+    time the runner calls this (after ``load_model``).
+    """
     global _RESTORED
     if _RESTORED:
         return
-    if not _target_soc():
+    if not _target_soc(vllm_config):
         # Latch only on a confirmed non-target SoC: "probe once" describes a
         # real part. An empty probe result is "unknown", not "non-target" --
         # leaving _RESTORED False here lets the next call retry instead of

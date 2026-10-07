@@ -77,29 +77,31 @@ def _probe_soc_name() -> str:
         return ""
 
 
-def _kstep_armed() -> bool:
+def _kstep_armed(vllm_config: Any = None) -> bool:
     """Whether this worker runs the Talker multi-frame decode.
 
-    Prefers the engine's speculative_config. The warmup guard runs before the
-    engine hands the runner that config, so fall back to the deploy layer.
+    Callers inside the worker (the model runner) pass the config they were
+    built with, which is the only source that is guaranteed to be populated:
+    the engine's ``set_current_vllm_config`` context wraps vLLM's own
+    ``load_model`` call, so by the time a caller sits *after*
+    ``model_runner.load_model()`` the context has already exited and
+    ``get_current_vllm_config_or_none()`` reads None. A context lookup is kept
+    as a fallback for callers that run inside that window.
     """
-    try:
-        from vllm.config import get_current_vllm_config_or_none
+    cfg = vllm_config
+    if cfg is None:
+        try:
+            from vllm.config import get_current_vllm_config_or_none
 
-        cfg = get_current_vllm_config_or_none()
-    except Exception:
-        cfg = None
+            cfg = get_current_vllm_config_or_none()
+        except Exception:
+            cfg = None
     spec = getattr(cfg, "speculative_config", None) if cfg is not None else None
-    if spec is not None:
-        method = getattr(spec, "method", None)
-        num_spec = getattr(spec, "num_speculative_tokens", 0) or 0
-        return method == "ngram" and num_spec > 0
-    try:
-        from vllm_omni.config.deploy_runtime_state import talker_frames_per_step
-
-        return talker_frames_per_step() > 1
-    except Exception:
+    if spec is None:
         return False
+    method = getattr(spec, "method", None)
+    num_spec = getattr(spec, "num_speculative_tokens", 0) or 0
+    return method == "ngram" and num_spec > 0
 
 
 def _skipped_names() -> set[str]:

@@ -836,11 +836,6 @@ def load_deploy_config(path: str | Path) -> DeployConfig:
     if not isinstance(speech_cache, dict):
         raise ValueError("speech_cache must be a mapping")
     stages = [_parse_stage_deploy(s) for s in raw_dict.get("stages", [])]
-    # Deploy-resolved runtime facts for spawned stage workers (kept out of
-    # this module so it stays model-agnostic; see deploy_runtime_state).
-    from vllm_omni.config.deploy_runtime_state import record_talker_frames
-
-    record_talker_frames(stages, raw_dict.get("platforms"))
 
     model_runner = raw_dict.get("model_runner", "v1")
     if model_runner not in ("v1", "v2"):

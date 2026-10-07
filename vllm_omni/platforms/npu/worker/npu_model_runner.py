@@ -86,8 +86,10 @@ class OmniNPUModelRunner(OmniGPUModelRunner, NPUModelRunner):
         # Before the first request verifies a draft: on 910_93 the patched
         # Triton rejection kernels fault their warmup (skipped) and would be
         # JIT-compiled mid-request otherwise, stalling every stage. See
-        # native_rejection_sampler for the chain.
-        restore_native_rejection_sampler()
+        # native_rejection_sampler for the chain. The runner's own config is
+        # passed because vLLM's set_current_vllm_config context only wraps
+        # its own load_model call, which has already returned here.
+        restore_native_rejection_sampler(self.vllm_config)
         # Initialize enable_sp cache to avoid get_current_vllm_config() error
         # in _pad_for_sequence_parallelism during execute_model.
         # This is a workaround for vllm-ascend not passing vllm_config to enable_sp().
