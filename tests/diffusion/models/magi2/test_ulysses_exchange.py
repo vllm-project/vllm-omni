@@ -3,14 +3,28 @@
 """The Ulysses exchanges must hand every rank the same bytes as the concatenating reference."""
 
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
 
-from vllm_omni.diffusion.models.magi2 import parallel
+from vllm_omni.diffusion.models.magi2 import attention, modeling_magi2, parallel
+from vllm_omni.diffusion.models.magi2.attention import VarlenHandler
+from vllm_omni.diffusion.models.magi2.configuration_magi2 import Magi2PreviewConfig
+from vllm_omni.diffusion.models.magi2.layers import ModalityDispatcher
+from vllm_omni.diffusion.models.magi2.modeling_magi2 import Magi2Attention
 from vllm_omni.diffusion.models.magi2.parallel import Magi2ParallelGroup, balanced_split_sizes
 
 pytestmark = [pytest.mark.diffusion, pytest.mark.core_model]
+
+
+@pytest.fixture(autouse=True)
+def _deterministic_inductor(monkeypatch):
+    # Reduction configs are otherwise benchmarked per compile, which can change the bits.
+    # Dynamo resets ``deterministic`` after every traced frame; the config filter stays on.
+    monkeypatch.setattr(torch._inductor.config, "deterministic", True)
+    monkeypatch.setattr(torch._inductor.config.test_configs, "force_filter_reduction_configs", True)
+
 
 _BITS = {torch.float32: torch.int32, torch.bfloat16: torch.int16, torch.float16: torch.int16}
 
@@ -42,6 +56,30 @@ def _reference_scatter_heads_gather_seqlen(tensors, split_sizes, group):
         group=group.group,
     )
     return list(torch.split(output, local_head_counts, dim=1))
+
+
+def _reference_scatter_seqlen_gather_heads(tensor, split_sizes, group):
+    """The output exchange that copied the received head shards to ``[S_rank, world*H, D]``."""
+    if group.world_size == 1:
+        return tensor
+    local_tokens = split_sizes[group.rank]
+    output = torch.empty(
+        (group.world_size * local_tokens, tensor.shape[1], tensor.shape[2]),
+        dtype=tensor.dtype,
+        device=tensor.device,
+    )
+    parallel.dist.all_to_all_single(
+        output,
+        tensor,
+        output_split_sizes=[local_tokens] * group.world_size,
+        input_split_sizes=split_sizes,
+        group=group.group,
+    )
+    return (
+        output.view(group.world_size, local_tokens, tensor.shape[1], tensor.shape[2])
+        .permute(1, 0, 2, 3)
+        .reshape(local_tokens, group.world_size * tensor.shape[1], tensor.shape[2])
+    )
 
 
 class _Exchange:
@@ -180,3 +218,159 @@ def test_qkv_exchange_keeps_input_validation():
         parallel.scatter_heads_gather_seqlen([q, torch.randn(3, 4, 8, device="meta")], [3, 3], group)
     single = Magi2ParallelGroup(None, 1, 0)
     assert parallel.scatter_heads_gather_seqlen([q], [3], single)[0] is q
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("world_size", [2, 4, 8])
+@pytest.mark.parametrize("split_index", [0, 1, 2])
+@pytest.mark.parametrize("dtype,local_heads", [(torch.bfloat16, 3), (torch.bfloat16, 6), (torch.float32, 1)])
+def test_output_exchange_matches_reference_and_hands_back_a_view(
+    monkeypatch, world_size, split_index, dtype, local_heads
+):
+    split_sizes = _SPLITS[world_size][split_index]
+    head_dim = 16
+    generator = torch.Generator().manual_seed(2000 * world_size + 10 * split_index + local_heads)
+    # Every rank attended over all tokens with its own head shard.
+    attended = [_global_tensor(sum(split_sizes), local_heads, head_dim, dtype, generator) for _ in range(world_size)]
+
+    def run(function):
+        return _Exchange(world_size).run(
+            monkeypatch,
+            lambda rank: function(attended[rank], split_sizes, Magi2ParallelGroup(None, world_size, rank)),
+        )
+
+    shards = run(parallel.scatter_seqlen_gather_head_shards)
+    flattened = run(parallel.scatter_seqlen_gather_heads)
+    expected = run(_reference_scatter_seqlen_gather_heads)
+    for rank, tokens in enumerate(split_sizes):
+        start = sum(split_sizes[:rank])
+        assert shards[rank].shape == (tokens, world_size, local_heads, head_dim)
+        # The [world, S_rank, H, D] receive buffer itself, read token-major.
+        receive = torch.empty(world_size, tokens, local_heads, head_dim).permute(1, 0, 2, 3)
+        assert _layout(shards[rank]) == _layout(receive)
+        _assert_bitwise_equal(shards[rank].flatten(1, 2), expected[rank])
+        _assert_bitwise_equal(flattened[rank], expected[rank])
+        # Head shard s of this rank's tokens is what rank s computed for them.
+        heads = torch.cat([output[start : start + tokens] for output in attended], dim=1)
+        _assert_bitwise_equal(expected[rank].contiguous(), heads)
+
+
+@pytest.mark.cpu
+def test_single_rank_output_exchange_is_a_view():
+    tensor = torch.randn(5, 3, 8)
+    single = Magi2ParallelGroup(None, 1, 0)
+    assert parallel.scatter_seqlen_gather_heads(tensor, [5], single) is tensor
+    shards = parallel.scatter_seqlen_gather_head_shards(tensor, [5], single)
+    assert shards.shape == (5, 1, 3, 8) and shards.data_ptr() == tensor.data_ptr()
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("head_shard_output", [False, True])
+def test_kernel_hands_back_head_shards_only_on_request(monkeypatch, head_shard_output):
+    group = Magi2ParallelGroup(None, 2, 1)
+    monkeypatch.setattr(attention, "get_magi2_ulysses_group", lambda: group)
+    monkeypatch.setattr(attention, "scatter_heads_gather_seqlen", lambda tensors, split_sizes, group: list(tensors))
+    attended = torch.randn(6, 2, 8)
+    monkeypatch.setattr(attention, "packed_attention_with_sink", lambda *args, **kwargs: attended)
+    shards, flat = torch.empty(3, 2, 2, 8), torch.empty(3, 4, 8)
+    gather_shards = Mock(return_value=shards)
+    gather_flat = Mock(return_value=flat)
+    monkeypatch.setattr(attention, "scatter_seqlen_gather_head_shards", gather_shards)
+    monkeypatch.setattr(attention, "scatter_seqlen_gather_heads", gather_flat)
+
+    q = torch.randn(3, 4, 8)
+    cu = torch.tensor([0, 6], dtype=torch.int32)
+    output = attention.ulysses_packed_attention_with_sink(
+        q, q, q, VarlenHandler(cu, cu, 6, 6), [3, 3], group=group, head_shard_output=head_shard_output
+    )
+
+    called, idle = (gather_shards, gather_flat) if head_shard_output else (gather_flat, gather_shards)
+    assert output is (shards if head_shard_output else flat)
+    called.assert_called_once()
+    idle.assert_not_called()
+    assert called.call_args.args[0] is attended and called.call_args.args[1:] == ([3, 3], group)
+
+
+def _attention_config(params_dtype):
+    # Eight query and KV heads divide across 2, 4 and 8 Ulysses ranks.
+    return Magi2PreviewConfig(
+        num_layers=1,
+        hidden_size=64,
+        head_dim=8,
+        num_query_groups=8,
+        multimodal_layers=(0,),
+        params_dtype=params_dtype,
+    )
+
+
+def _initialized(module, seed):
+    generator = torch.Generator().manual_seed(seed)
+    with torch.no_grad():
+        for parameter in module.parameters():
+            parameter.copy_(torch.randn(parameter.shape, generator=generator) * 0.05)
+    return module
+
+
+def _modality_dispatcher(tokens, num_modality, generator, device="cpu"):
+    mapping = torch.randint(0, num_modality, (tokens,), generator=generator)
+    return ModalityDispatcher(mapping.to(device), num_modality)
+
+
+def _head_shards(tensor, world_size):
+    """``[T, world*H, D]`` as the ``[T, world, H, D]`` view of a ``[world, T, H, D]`` receive buffer."""
+    tokens, heads, head_dim = tensor.shape
+    receive = tensor.view(tokens, world_size, heads // world_size, head_dim).transpose(0, 1).contiguous()
+    return receive.transpose(0, 1)
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("musa", [False, True])
+def test_attention_requests_head_shards_on_musa(monkeypatch, musa):
+    monkeypatch.setattr(modeling_magi2, "current_omni_platform", SimpleNamespace(is_musa=lambda: musa))
+    module = Magi2Attention(_attention_config(torch.float32), num_modality=1)
+    assert module.packed_attention.attention.head_shard_output is musa
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("world_size", [2, 4, 8])
+@pytest.mark.parametrize("num_modality", [1, 3])
+@pytest.mark.parametrize("params_dtype", [torch.float32, torch.bfloat16])
+def test_output_projection_of_head_shards_is_bitwise_unchanged(world_size, num_modality, params_dtype):
+    module = _initialized(Magi2Attention(_attention_config(params_dtype), num_modality=num_modality), 7)
+    generator = torch.Generator().manual_seed(17 * world_size + num_modality)
+    tokens = 13
+    dispatcher = _modality_dispatcher(tokens, num_modality, generator)
+    attended = torch.randn(tokens, module.num_heads_q, module.head_dim, generator=generator).to(params_dtype)
+    gates = torch.randn(tokens, module.num_heads_q, 1, generator=generator).to(params_dtype)
+
+    with torch.inference_mode():
+        expected = module.output(attended, gates, dispatcher)
+        actual = module.output(_head_shards(attended, world_size), gates, dispatcher)
+    _assert_bitwise_equal(actual, expected)
+
+
+def _musa_available():
+    return hasattr(torch, "musa") and torch.musa.is_available()
+
+
+@pytest.mark.musa
+@pytest.mark.parametrize("tokens,world_size", [(3702, 8), (3651, 4), (14, 8)])
+@pytest.mark.parametrize("num_modality", [1, 3])
+def test_real_musa_compiled_output_projection_of_head_shards_is_bitwise_unchanged(tokens, world_size, num_modality):
+    if not _musa_available():
+        pytest.skip("requires a MUSA device")
+    config = Magi2PreviewConfig()
+    module = _initialized(Magi2Attention(config, num_modality=num_modality), 23).to("musa")
+    generator = torch.Generator().manual_seed(tokens + num_modality)
+    dispatcher = _modality_dispatcher(tokens, num_modality, generator, device="musa")
+    attended = torch.randn(tokens, module.num_heads_q, module.head_dim, generator=generator)
+    attended = attended.to(device="musa", dtype=config.params_dtype)
+    gates = torch.randn(tokens, module.num_heads_q, 1, generator=generator).to(device="musa", dtype=config.params_dtype)
+
+    torch._dynamo.reset()
+    # The production regions compile statically with emulated precision casts.
+    output = torch.compile(module.output, fullgraph=True, dynamic=False, options={"emulate_precision_casts": True})
+    with torch.inference_mode():
+        expected = output(attended, gates, dispatcher)
+        actual = output(_head_shards(attended, world_size), gates, dispatcher)
+    _assert_bitwise_equal(actual.cpu(), expected.cpu())
