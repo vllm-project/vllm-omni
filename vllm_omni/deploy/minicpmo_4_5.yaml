@@ -181,9 +181,25 @@ platforms:
         # estimator kernels through the NPU platform patch.
         additional_config:
           code2wav_enable_npu_graph: true
-          # NPU graph pool raised from 32 to 64. Once the 32 captured shapes are
-          # exhausted, later shapes permanently degrade to eager. The CFM mel
-          # bucketing already present in main (cfm_graph_bucket_frames: 16) keeps
-          # the captured shape count at 19, which is what makes a pool this size
-          # sustainable.
-          code2wav_max_npu_graphs: 64
+          # Batch sizes round up to the next bucket before capture, so the
+          # captured shape space becomes (#buckets x #mel buckets) instead of
+          # one entry per observed batch size. Padded slots are all-zero
+          # inputs and caches whose outputs are dropped; live slots keep their
+          # own math, so this is a capture-key optimization only. Unset keeps
+          # exact-batch capture.
+          cfm_graph_batch_buckets: [1, 2, 4, 8]
+          # Pool stays at 32. The CFM mel bucketing
+          # (cfm_graph_bucket_frames: 16) only aligns the mel-frame dimension;
+          # the capture key carries the full tensor shape
+          # (NPUExactGraphRunner._tensor_signature), so the batch dimension
+          # multiplies the shape space -- an 8-way concurrent stage-2 run
+          # reaches 61 distinct shapes, not 19. Captured graph buffers are
+          # allocated outside vLLM's gpu_memory_utilization budget, and this
+          # profile co-locates three stages on one card (0.55 + 0.15 + 0.18),
+          # so a 64-entry pool OOMs the card at 128/8 while 32 completes all
+          # three tiers. cfm_graph_batch_buckets above is what makes 32
+          # sufficient: it collapses the batch axis so the 8-way shape space
+          # fits inside the pool instead of overflowing it into eager replay.
+          # It buys shape-space coverage, not graph memory -- both settings
+          # capture up to the pool limit.
+          code2wav_max_npu_graphs: 32

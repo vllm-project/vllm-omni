@@ -232,13 +232,19 @@ class TestDeployTopology:
         expected_graph_mode = "FULL_DECODE_ONLY" if filename == "minicpmo_4_5.yaml" else "PIECEWISE"
         assert stages[1].yaml_engine_args["compilation_config"]["cudagraph_mode"] == expected_graph_mode
         assert stages[2].yaml_engine_args["enforce_eager"] is True
-        # Only the single-card deploy raises the Code2Wav graph pool; the
-        # multi-card variants keep the base value.
-        expected_graph_pool = 64 if filename == "minicpmo_4_5.yaml" else 32
-        assert stages[2].yaml_engine_args["additional_config"] == {
+        # Every variant keeps the Code2Wav graph pool at 32: a larger pool OOMs
+        # the single-card deploy at 8-way concurrency, because captured graph
+        # buffers sit outside the gpu_memory_utilization budget. The single-card
+        # deploy is the only one that rounds batches up to a capture bucket, so
+        # 32 entries cover its shape space; the multi-card variants leave the
+        # buckets unset.
+        expected_graph_config = {
             "code2wav_enable_npu_graph": True,
-            "code2wav_max_npu_graphs": expected_graph_pool,
+            "code2wav_max_npu_graphs": 32,
         }
+        if filename == "minicpmo_4_5.yaml":
+            expected_graph_config["cfm_graph_batch_buckets"] = [1, 2, 4, 8]
+        assert stages[2].yaml_engine_args["additional_config"] == expected_graph_config
 
     def test_pipeline_exposes_full_and_async_payload_hooks(self) -> None:
         pipeline = OMNI_PIPELINES[_PIPELINE_KEY]

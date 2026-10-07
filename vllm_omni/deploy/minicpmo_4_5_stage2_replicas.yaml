@@ -63,12 +63,14 @@ platforms:
 
       - stage_id: 2
         # One pool entry per captured shape. With two stage-2 replicas the pool
-        # is per replica, and the CFM mel bucketing above
-        # (cfm_graph_bucket_frames: 16) keeps the captured shape count near 31,
-        # so 32 covers it; 64 per replica would only add graph memory that is
-        # never replayed. Both keys are spelled out: stage fields merge by
-        # replacement, so a partial additional_config would drop the base
-        # enable flag.
+        # is per replica. The CFM mel bucketing above
+        # (cfm_graph_bucket_frames: 16) only aligns the mel dimension; batch
+        # shapes enter the capture key, so a busy stage-2 replica can exceed
+        # 32 distinct shapes and fall back to eager for the tail. Holding the
+        # pool at 32 keeps the per-replica graph memory bounded, which matters
+        # because the replicas share one card with the other stages. Both keys
+        # are spelled out: stage fields merge by replacement, so a partial
+        # additional_config would drop the base enable flag.
         additional_config:
           code2wav_enable_npu_graph: true
           code2wav_max_npu_graphs: 32
