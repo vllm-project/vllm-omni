@@ -232,6 +232,11 @@ ignore = [
 # F-correctness rules still apply.
 "vllm_omni/model_executor/models/nemotron_voicechat/nemo_vendored/**" = ["E501", "E721", "E741", "F401", "F841", "I001", "N803", "N814", "UP006", "UP007", "UP008", "UP011", "UP032", "UP035", "W291", "W293"]
 "vllm_omni/experimental/fullduplex/joyvl/decision/prompts.py" = ["E501"]  # System/summarizer prompts are long prose lines
+# Kandinsky 6 keeps native/BigVGAN names (T/H/W, `l`) and NVIDIA vocoder
+# docstring length so the port stays diffable against the source modules.
+"vllm_omni/diffusion/models/kandinsky6/kandinsky6_transformer.py" = ["N803", "E741"]
+"vllm_omni/diffusion/models/kandinsky6/pipeline_kandinsky6.py" = ["N803"]
+"vllm_omni/diffusion/models/kandinsky6/modeling_kandinsky6_audio.py" = ["E501", "E741", "N803", "UP008"]
 
 [tool.ruff.lint.flake8-tidy-imports.banned-api]
 "librosa".msg = "The librosa module is banned, use vllm.multimodal helpers instead"
@@ -364,6 +369,8 @@ extend-ignore-identifiers-re = [
     # (output feature dim), not "doubt".
     ".*dout.*",
     ".*DOUT.*",
+    # Kandinsky nabla threshold argument (`thr`), not the word "the".
+    "^thr$",
 ]
 extend-ignore-re = [
     "\\.\\.\\.n,d->\\.\\.\\.nd",
@@ -404,3 +411,8 @@ IY = "IY"
 # Speech DAC codec identifiers (convnet_type, transconvnet_type) and is not a
 # typo of "convent".
 convnet = "convnet"
+# Upstream Kandinsky system prompt. "promt" and "scren" are part of the
+# conditioning text and must not be corrected.
+thr = "thr"
+promt = "promt"
+scren = "scren"

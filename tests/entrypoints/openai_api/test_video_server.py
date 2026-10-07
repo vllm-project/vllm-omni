@@ -1004,6 +1004,38 @@ def test_magi2_serving_applies_native_defaults_and_rejects_explicit_frame_mismat
         )
 
 
+def test_kandinsky6_serving_applies_defaults_but_allows_explicit_frame_count():
+    """Kandinsky 6 publishes Pro-geometry defaults (480x864, 125 frames, 50
+    steps) but is not a fixed-duration model: an explicit ``num_frames``
+    must be honoured rather than rejected."""
+    engine = FakeAsyncOmni()
+    engine.model_class_name = "Kandinsky6TI2VAPipeline"
+    handler = OmniOpenAIServingVideo.for_diffusion(
+        diffusion_engine=engine,
+        model_name="kandinsky6-bundle",
+    )
+
+    asyncio.run(handler._run_and_extract(VideoGenerationRequest(prompt="A dog runs on a beach"), "defaults"))
+    sampling = engine.captured_sampling_params_list[0]
+    assert (sampling.width, sampling.height) == (864, 480)
+    assert sampling.num_frames == 125
+    assert sampling.num_inference_steps == 50
+    assert sampling.fps == 24.0
+
+    asyncio.run(
+        handler._run_and_extract(
+            VideoGenerationRequest(
+                prompt="A dog runs on a beach", width=512, height=320, num_frames=25, num_inference_steps=10
+            ),
+            "explicit",
+        )
+    )
+    sampling = engine.captured_sampling_params_list[-1]
+    assert (sampling.width, sampling.height) == (512, 320)
+    assert sampling.num_frames == 25
+    assert sampling.num_inference_steps == 10
+
+
 def test_i2v_video_generation_with_image_reference_form(test_client, mocker: MockerFixture):
     mocker.patch(
         "vllm_omni.entrypoints.openai.serving_video._encode_video_bytes",

@@ -8,6 +8,8 @@ import numpy as np
 import pytest
 import torch
 
+from tests.model_executor.models.personaplex.test_prefill_embeddings import _make_talker, _reference_prefill
+from vllm_omni.model_executor.models.personaplex.configuration_personaplex import PersonaPlexConfig
 from vllm_omni.model_executor.models.personaplex.duplex.policy import (
     SILENCE_TOKENS,
     SINE_TOKENS,
@@ -145,6 +147,33 @@ def test_first_append_prepends_voice_and_persona_once() -> None:
     assert second.user_codes.shape == (2, 8)
     assert second.inputs_embeds.shape == (1, 4)
     assert codec.encode_calls == 2
+
+
+@torch.inference_mode()
+def test_first_append_uses_real_prefill_embeddings_once(monkeypatch, mocker) -> None:
+    runtime = _runtime(_FakeCodec())
+    device = torch.device("cpu")
+    talker = _make_talker(device, torch.float32, PersonaPlexConfig(temporal_config={"hidden_size": 4}))
+    prefill = mocker.spy(talker, "_build_prefill_embed")
+    # Exercise real prefill while retaining the codec/live-frame fixture.
+    monkeypatch.setattr(runtime.stage_model, "_build_prefill_embed", prefill)
+    first = runtime.prepare_append(_duplex_info(seq=1), prompt_len=18)
+    second = runtime.prepare_append(_duplex_info(seq=2), prompt_len=18)
+    expected = _reference_prefill(
+        talker,
+        torch.tensor([3] * 6 + [7, 8, 9] + [3] * 6),
+        0,
+        15,
+        device,
+        torch.tensor(SILENCE_TOKENS),
+        torch.tensor(SINE_TOKENS),
+    )
+    prefill.assert_called_once()
+    assert torch.equal(first.inputs_embeds[:2], torch.arange(8, dtype=torch.float32).reshape(2, 4))
+    assert torch.equal(first.inputs_embeds[2:17].view(torch.uint8), expected.view(torch.uint8))
+    assert first.inputs_embeds.shape == (18, 4)
+    assert second.inputs_embeds.shape == (1, 4)
+    assert second.prefill_applied is False
 
 
 @pytest.mark.parametrize(

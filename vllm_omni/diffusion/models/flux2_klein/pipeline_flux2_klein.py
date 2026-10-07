@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 #
 # Copyright 2025 Black Forest Labs and The HuggingFace Team. All rights reserved.
 #
@@ -36,6 +36,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_flux2 import DistributedAutoencoderKLFlux2
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
@@ -247,8 +248,13 @@ class Flux2KleinPipeline(
             subfolder="tokenizer",
             local_files_only=local_files_only,
         )
+        vae_class = (
+            DistributedAutoencoderKLFlux2
+            if od_config.parallel_config.vae_parallel_mode == "batch"
+            else AutoencoderKLFlux2
+        )
         self.vae = from_pretrained_with_prefetch(
-            AutoencoderKLFlux2.from_pretrained,
+            vae_class.from_pretrained,
             model,
             subfolder="vae",
             prefetch_list=flux2_subfolders,

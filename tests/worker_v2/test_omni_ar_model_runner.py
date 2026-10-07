@@ -52,7 +52,7 @@ def _async_output(req_ids=("req-0",), **overrides) -> OmniAsyncOutput:
 
 
 @pytest.mark.parametrize("compact_width", [1, 2])
-def test_async_output_blocking_event_and_routing_masks(monkeypatch, compact_width) -> None:
+def test_async_output_blocking_event_preserves_masks_and_aux_output(monkeypatch, compact_width) -> None:
     event_kwargs = []
     monkeypatch.setattr(torch.cuda, "set_stream", lambda _stream: None)
 
@@ -68,7 +68,7 @@ def test_async_output_blocking_event_and_routing_masks(monkeypatch, compact_widt
         vocab_size=4,
     )
     sampler_output = SamplerOutput(
-        torch.tensor([[2], [0]]), None, None, torch.tensor([1, 0]), torch.tensor([0, 0]), masks
+        torch.tensor([[2], [0]]), None, None, torch.tensor([1, 0]), torch.tensor([2, 0]), masks
     )
     copied: list[tuple[np.ndarray, np.ndarray]] = []
 
@@ -98,7 +98,9 @@ def test_async_output_blocking_event_and_routing_masks(monkeypatch, compact_widt
     np.testing.assert_array_equal(output.aux_output_connector_output["prefill"].rows, [[4, 5]])
     assert output.aux_output_connector_output["decode"].token_start == 0
     np.testing.assert_array_equal(output.sampling_masks.token_ids, [0, 2])
-    assert len(copied) == 1 and copied[0][0].tolist() == [1, 0]
+    assert len(copied) == 1
+    np.testing.assert_array_equal(copied[0][0], [1, 0])
+    np.testing.assert_array_equal(copied[0][1], [2, 0])
 
 
 @pytest.mark.parametrize("needs_history", [False, True])

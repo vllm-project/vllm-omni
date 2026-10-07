@@ -37,6 +37,13 @@ steps:
       mirror_hardwares: [amdproduction]
       grade: Blocking
       timeout_in_minutes: 45
+      # Buildkite's status-based rule cannot prove every exit 134 is a GPU hang.
+      # It retries 134 once; the Kubernetes job retry starts a fresh pod.
+      # Assertions (1), timeouts (124), and OOMs (137) remain non-retryable.
+      retry:
+        automatic:
+          - exit_status: 134
+            limit: 1
       commands:
         - export VLLM_ROCM_USE_AITER=0
         # ignore test_teacache_extractors.py because it use rocm gemm kernel from vLLM

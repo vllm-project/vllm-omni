@@ -83,6 +83,15 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
         max_multimodal_image_inputs=1,
         final_output_type="video",
     ),
+    # Joint text/image-to-video-and-audio, same shape as MiniMaxH3Pipeline
+    # above (an MP4 with both tracks) — declared "video" for the same reason:
+    # the final container is a video file, so /v1/videos* is the right API
+    # surface even though the model also produces audio.
+    "Kandinsky6TI2VAPipeline": DiffusionModelMetadata(
+        supports_multimodal_inputs=True,
+        max_multimodal_image_inputs=1,
+        final_output_type="video",
+    ),
     "WanPipeline": DiffusionModelMetadata(
         attention_mask_free=True,
         final_output_type="video",

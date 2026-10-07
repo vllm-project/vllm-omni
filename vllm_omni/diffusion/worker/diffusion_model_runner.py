@@ -1275,7 +1275,8 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                     new_req.request_id,
                     exc_info=True,
                 )
-                result = DiffusionOutput(error=str(exc))
+                # Keep client-error metadata, matching the stepwise path below.
+                result = DiffusionOutput.from_exception(exc)
 
             step_index = getattr(new_req.req.sampling_params, "step_index", None)
             runner_outputs.append(

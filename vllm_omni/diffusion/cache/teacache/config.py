@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from dataclasses import dataclass
 
@@ -8,6 +8,15 @@ from dataclasses import dataclass
 # Source: TeaCache paper and ComfyUI-TeaCache empirical tuning
 _MODEL_COEFFICIENTS = {
     # FLUX transformer coefficients from TeaCache paper
+    # Uncalibrated stand-in so Kandinsky 6 TeaCache can be enabled.
+    # Copied from Qwen-Image; refit before treating skips as quality-neutral.
+    "Kandinsky6Transformer3DModel": [
+        -4.50000000e02,
+        2.80000000e02,
+        -4.50000000e01,
+        3.20000000e00,
+        -2.00000000e-02,
+    ],
     "FluxTransformer2DModel": [
         4.98651651e02,
         -2.83781631e02,

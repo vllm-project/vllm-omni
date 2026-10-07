@@ -354,6 +354,28 @@ def test_sleep_waits_for_in_flight_generate_admission():
 
 
 @pytest.mark.cpu
+def test_sleep_rejects_invalid_stage_ids_without_blocking_admission():
+    """Invalid stage_ids must raise before _paused is set.
+
+    Raising afterwards leaves no sleeping tags behind, so wake_up() early-returns
+    "already warm" and nothing ever clears _paused: generate() hangs forever.
+    """
+
+    async def run() -> None:
+        omni = _make_omni(stage_types=["llm", "diffusion"])
+
+        with pytest.raises(ValueError, match=r"Invalid stage_ids \[99\]"):
+            await omni.sleep(stage_ids=[99], level=1, mode="abort")
+
+        assert omni._paused is False
+        assert omni._hold_admission_until_resume is False
+        omni._clear_frontend_mm_cache.assert_not_awaited()
+        omni.collective_rpc.assert_not_awaited()
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
 def test_wake_up_routes_ar_via_collective_rpc_and_diffusion_to_worker_rpc():
     async def run() -> None:
         omni = _make_omni(stage_types=["llm", "diffusion"])

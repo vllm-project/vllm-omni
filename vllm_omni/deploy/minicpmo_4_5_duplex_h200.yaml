@@ -1,7 +1,8 @@
 # Opt-in single-H200 native full-duplex codec profile (V1).
 # Inherits the native session/stage capacities, sampling and chunk sizes.
 # Uses the mainline Whole-Euler Flow and shared prompt-state implementation.
-# TF32 changes FP32 GEMM rounding; validate audio quality for your workload.
+# Ordinary TF32 for CFM DiT GEMMs (cuBLAS allow_tf32 + Triton tf32 dots).
+# HiFT stays IEEE FP32. Validate audio quality for your workload.
 base_config: minicpmo_4_5.yaml
 
 connectors:
