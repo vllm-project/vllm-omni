@@ -87,3 +87,30 @@ def test_runtime_checkable_protocol_agrees():
 def test_sample_eligibility_flag():
     assert requires_request_sample_eligibility(SimpleNamespace(requires_request_sample_eligibility=True)) is True
     assert requires_request_sample_eligibility(SimpleNamespace()) is False
+
+
+def test_stop_logits_reader_and_definition_agree():
+    """The stop-row holder is read by name from the runner.
+
+    Renaming the model's attribute without the runner's read site makes the
+    lookup return None forever -- the gate then hands over
+    ``text_hidden_states`` and the two-wide stop row never reaches the request.
+    Pin both ends: the attribute exists only under the public name, and no
+    reader still spells the old one.
+    """
+    from pathlib import Path
+
+    import vllm_omni
+
+    root = Path(vllm_omni.__file__).parent
+    talker_src = (root / "model_executor/models/minicpmo_4_5/minicpmo_4_5_omni_tts.py").read_text()
+    # The holder is an instance attribute assigned in __init__ / set_batch_stop_logits.
+    assert "self.batch_stop_logits" in talker_src
+    assert "self._batch_stop_logits" not in talker_src
+
+    stale = [
+        str(path.relative_to(root))
+        for path in root.rglob("*.py")
+        if '"_batch_stop_logits"' in path.read_text() or "'_batch_stop_logits'" in path.read_text()
+    ]
+    assert not stale, f"readers still use the private name: {stale}"

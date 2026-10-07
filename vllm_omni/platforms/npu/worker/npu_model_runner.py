@@ -551,7 +551,7 @@ class OmniNPUModelRunner(OmniGPUModelRunner, NPUModelRunner):
             # does. The gate takes only "not None" from this argument: the width
             # it writes is the two-wide stop row, never the width of whatever
             # tensor it is handed.
-            stop_rows = getattr(self.model, "_batch_stop_logits", None)
+            stop_rows = getattr(self.model, "batch_stop_logits", None)
             talker_multiframe.ensure_stop_token_vocab(
                 self,
                 stop_rows if stop_rows is not None else model_output.text_hidden_states,
