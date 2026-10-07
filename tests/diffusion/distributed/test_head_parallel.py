@@ -11,6 +11,7 @@ import torch.multiprocessing as mp
 
 from vllm_omni.diffusion.distributed.head_parallel import (
     HeadParallelLayout,
+    replica_token_counts,
     scatter_heads_gather_tokens,
     scatter_tokens_gather_heads,
 )
@@ -112,6 +113,110 @@ def test_explicit_layout_uses_token_counts_not_route_counts(monkeypatch):
     }
 
 
+@pytest.mark.cpu
+@pytest.mark.parametrize(
+    "replica_counts",
+    [
+        (),
+        ((1,),),
+        ((1, 0), (2,)),
+        ((1, 0), [2, 0]),
+        ((1, 0), (1, 0)),
+        ((2, -1), (2, 0)),
+        ((1, 0, 0), (2, 0, 0)),
+        ((), ()),
+    ],
+)
+def test_invalid_replica_counts(replica_counts):
+    with pytest.raises(ValueError):
+        HeadParallelLayout((1, 2), 0, replica_counts)
+
+
+@pytest.mark.cpu
+def test_one_part_per_rank_keeps_the_unreplicated_layout():
+    layout = HeadParallelLayout((2, 5), 1, ((2,), (5,)))
+    assert layout.replicas == 1 and layout.shards == 2
+    assert layout.owned_counts == layout.token_counts
+    assert layout.owned_tokens == layout.total_tokens == 7
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize(
+    "counts,replicas",
+    [
+        ((3702,) * 8, 2),
+        ((3703, 3702, 3702, 3702, 3701, 3701, 3701, 3701), 2),
+        ((3701,) * 8, 2),
+        ((0, 0, 0, 0, 5, 5, 5, 5), 2),
+        ((7, 0, 1, 9, 2, 2, 0, 4), 2),
+        ((5, 1, 0, 3, 8, 2), 3),
+        ((1, 2, 3, 4), 4),
+        ((4, 4), 1),
+    ],
+)
+def test_replica_token_counts_give_owners_their_run_totals(counts, replicas):
+    parts = replica_token_counts(counts, replicas)
+    shards = len(counts) // replicas
+    assert len(parts) == len(counts)
+    assert all(len(rank_parts) == replicas and min(rank_parts) >= 0 for rank_parts in parts)
+    assert [sum(rank_parts) for rank_parts in parts] == list(counts)
+    # Every owner receives exactly what an exchange within its own run gives it.
+    for replica in range(replicas):
+        assert sum(rank_parts[replica] for rank_parts in parts) == sum(
+            counts[replica * shards : (replica + 1) * shards]
+        )
+    HeadParallelLayout(counts, 0, parts)
+
+
+@pytest.mark.cpu
+def test_replica_token_counts_split_balanced_counts_in_halves():
+    assert replica_token_counts((3702,) * 8, 2) == ((1851, 1851),) * 8
+    assert replica_token_counts((3702,) * 8, 2) is replica_token_counts((3702,) * 8, 2)
+    with pytest.raises(ValueError):
+        replica_token_counts((1, 2, 3), 2)
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("rank,local,owned", [(0, [2, 2], [2, 3, 0, 1]), (3, [1, 0], [2, 1, 2, 0])])
+def test_replicated_layout_split_sizes(monkeypatch, rank, local, owned):
+    group = _mock_group(monkeypatch, 4, rank)
+    collective = Mock()
+    monkeypatch.setattr(dist, "all_to_all_single", collective)
+    counts, parts = (4, 4, 2, 1), ((2, 2), (3, 1), (0, 2), (1, 0))
+    layout = HeadParallelLayout(counts, rank, parts)
+    assert (layout.replicas, layout.shards, list(layout.owned_counts)) == (2, 2, owned)
+    row = 3 * 4
+    dispatched = scatter_heads_gather_tokens(torch.zeros(counts[rank], 6, 4), group, layout)
+    assert dispatched.shape == (sum(owned), 3, 4)
+    assert collective.call_args.kwargs == {
+        "output_split_sizes": [count * row for count in owned],
+        "input_split_sizes": [count * row for count in local for _ in range(2)],
+        "group": group,
+    }
+    restored = scatter_tokens_gather_heads(dispatched, group, layout)
+    assert restored.shape == (counts[rank], 6, 4)
+    assert collective.call_args.kwargs == {
+        "output_split_sizes": [count * row for count in local for _ in range(2)],
+        "input_split_sizes": [count * row for count in owned],
+        "group": group,
+    }
+
+
+@pytest.mark.cpu
+def test_replicated_layout_checks_shapes_before_collective(monkeypatch):
+    group = _mock_group(monkeypatch, 4, 0)
+    collective = Mock()
+    monkeypatch.setattr(dist, "all_to_all_single", collective)
+    layout = HeadParallelLayout((2, 2, 2, 2), 0, ((1, 1),) * 4)
+    with pytest.raises(ValueError):
+        # Three heads cannot form two shards.
+        scatter_heads_gather_tokens(torch.empty(2, 3, 4), group, layout)
+    with pytest.raises(ValueError):
+        # The owner holds 4 tokens, not the 8 a whole-group exchange would give it.
+        scatter_tokens_gather_heads(torch.empty(8, 2, 4), group, layout)
+    collective.assert_not_called()
+
+
 def _rank_tensor(rank: int, tokens: int, heads: int, dim: int) -> torch.Tensor:
     # Noncontiguous packed view; values encode source rank and element position.
     return (
@@ -148,6 +253,51 @@ def _check_group(group: dist.ProcessGroup, ranks: tuple[int, ...], counts: tuple
         torch.testing.assert_close(ep_undispatch(inferred, magi_group).cpu(), inputs[rank], rtol=0, atol=0)
 
 
+def _check_replicated_exchange(rank: int, backend: str, device: str) -> None:
+    """Exchange over four ranks where ranks r and r + 2 own the same head shard.
+
+    The result after an owner-side transform must equal the exchange inside
+    the runs (0, 1) and (2, 3), bit for bit, because each owner applies the
+    same per-token function to the same rows; only which owner sees a row and
+    in which order changes.
+    """
+    runs = ((0, 1), (2, 3))
+    run_groups = [dist.new_group(ranks=list(run), backend=backend, timeout=timedelta(seconds=60)) for run in runs]
+    run_index, shard = rank // 2, rank % 2
+    heads, dim = 6, 4
+    for counts in ((4, 4, 4, 4), (5, 3, 3, 3), (3, 0, 1, 6), (1, 1, 1, 1), (0, 0, 0, 0)):
+        inputs = [_rank_tensor(source, count, heads, dim) for source, count in enumerate(counts)]
+        local = inputs[rank].to(device)
+        parts = replica_token_counts(counts, 2)
+        layout = HeadParallelLayout(counts, rank, parts)
+
+        dispatched = scatter_heads_gather_tokens(local, dist.group.WORLD, layout)
+        rows = []
+        for source, source_parts in enumerate(parts):
+            start = sum(source_parts[:run_index])
+            rows.append(inputs[source][start : start + source_parts[run_index], shard * 3 : (shard + 1) * 3])
+        torch.testing.assert_close(dispatched.cpu(), torch.cat(rows), rtol=0, atol=0)
+        assert dispatched.shape[0] == sum(counts[run_index * 2 : run_index * 2 + 2])
+
+        def owner_transform(tensor: torch.Tensor) -> torch.Tensor:
+            # Per-token and per-shard, identical on both owners of a shard.
+            return tensor * 3 - tensor.roll(1, dims=-1) + shard
+
+        restored = scatter_tokens_gather_heads(owner_transform(dispatched), dist.group.WORLD, layout)
+        run_layout = HeadParallelLayout(counts[run_index * 2 : run_index * 2 + 2], shard)
+        run_group = run_groups[run_index]
+        expected = scatter_tokens_gather_heads(
+            owner_transform(scatter_heads_gather_tokens(local, run_group, run_layout)), run_group, run_layout
+        )
+        assert torch.equal(restored, expected)
+        assert torch.equal(
+            scatter_tokens_gather_heads(dispatched, dist.group.WORLD, layout).cpu(), inputs[rank].contiguous()
+        )
+    dist.barrier()
+    for group in run_groups:
+        dist.destroy_process_group(group)
+
+
 def _worker(rank: int, rendezvous: str, world_size: int, backend: str, device_type: str) -> None:
     torch.set_num_threads(1)
     if device_type != "cpu":
@@ -169,6 +319,7 @@ def _worker(rank: int, rendezvous: str, world_size: int, backend: str, device_ty
                             _check_group(group, members, counts, device)
                         dist.destroy_process_group(group)
                 dist.barrier()
+            _check_replicated_exchange(rank, backend, device)
     finally:
         dist.destroy_process_group()
 
