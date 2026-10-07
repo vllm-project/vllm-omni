@@ -10,9 +10,9 @@ import torch
 
 from vllm_omni.diffusion.models.magi2 import attention, modeling_magi2, parallel
 from vllm_omni.diffusion.models.magi2.attention import VarlenHandler
-from vllm_omni.diffusion.models.magi2.configuration_magi2 import Magi2PreviewConfig
+from vllm_omni.diffusion.models.magi2.configuration_magi2 import Magi2MoEConfig, Magi2PreviewConfig
 from vllm_omni.diffusion.models.magi2.layers import ModalityDispatcher
-from vllm_omni.diffusion.models.magi2.modeling_magi2 import Magi2Attention
+from vllm_omni.diffusion.models.magi2.modeling_magi2 import Magi2Attention, Magi2TransformerLayer
 from vllm_omni.diffusion.models.magi2.parallel import Magi2ParallelGroup, balanced_split_sizes
 
 pytestmark = [pytest.mark.diffusion, pytest.mark.core_model]
@@ -127,6 +127,11 @@ def _assert_bitwise_equal(actual, expected):
     assert torch.equal(actual.view(_BITS[actual.dtype]), expected.view(_BITS[expected.dtype]))
 
 
+def _heads_flattened(view):
+    # With one head per rank the flattened view needs no copy and keeps the send-buffer strides.
+    return view.flatten(1, 2).contiguous()
+
+
 def _global_tensor(tokens, heads, head_dim, dtype, generator):
     tensor = torch.randn(tokens, heads, head_dim, generator=generator)
     flat = tensor.view(-1)
@@ -218,6 +223,114 @@ def test_qkv_exchange_keeps_input_validation():
         parallel.scatter_heads_gather_seqlen([q, torch.randn(3, 4, 8, device="meta")], [3, 3], group)
     single = Magi2ParallelGroup(None, 1, 0)
     assert parallel.scatter_heads_gather_seqlen([q], [3], single)[0] is q
+
+
+def _rank_inputs(tensors, split_sizes, rank):
+    return [_shards(tensor, split_sizes, rank) for tensor in tensors]
+
+
+def _run_reference(monkeypatch, tensors, split_sizes, world_size):
+    exchange = _Exchange(world_size)
+    outputs = exchange.run(
+        monkeypatch,
+        lambda rank: _reference_scatter_heads_gather_seqlen(
+            _rank_inputs(tensors, split_sizes, rank), split_sizes, Magi2ParallelGroup(None, world_size, rank)
+        ),
+    )
+    return exchange, outputs
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("world_size", [2, 4, 8])
+@pytest.mark.parametrize("split_index", [0, 1, 2])
+@pytest.mark.parametrize("local_heads", [(3, 3, 3), (6, 6, 6), (1, 3, 2)])
+def test_packed_head_shards_are_sent_in_place(monkeypatch, world_size, split_index, local_heads):
+    split_sizes = _SPLITS[world_size][split_index]
+    head_dim = 16
+    generator = torch.Generator().manual_seed(3000 * world_size + 10 * split_index + local_heads[1])
+    tensors = [
+        _global_tensor(sum(split_sizes), world_size * heads, head_dim, torch.bfloat16, generator)
+        for heads in local_heads
+    ]
+    packed: dict[int, list[torch.Tensor]] = {}
+
+    def step(rank):
+        views = parallel.pack_ulysses_head_shards(_rank_inputs(tensors, split_sizes, rank), world_size)
+        # Keep the first pass's views alive so its send-buffer address stays unique.
+        packed.setdefault(rank, views)
+        return parallel.scatter_heads_gather_seqlen(views, split_sizes, Magi2ParallelGroup(None, world_size, rank))
+
+    exchange = _Exchange(world_size)
+    outputs = exchange.run(monkeypatch, step)
+    reference, expected = _run_reference(monkeypatch, tensors, split_sizes, world_size)
+
+    for rank in range(world_size):
+        views = packed[rank]
+        for view, tensor, heads in zip(views, _rank_inputs(tensors, split_sizes, rank), local_heads, strict=True):
+            assert view.shape == (split_sizes[rank], world_size, heads, head_dim)
+            _assert_bitwise_equal(_heads_flattened(view), tensor)
+        # The exchange sent the packed buffer itself, and its bytes are the reference's.
+        if split_sizes[rank]:
+            assert exchange.sent[rank][2] == views[0].data_ptr()
+        _assert_bitwise_equal(exchange.sent[rank][0], reference.sent[rank][0])
+        assert exchange.sent[rank][1] == reference.sent[rank][1]
+        for actual, wanted in zip(outputs[rank], expected[rank], strict=True):
+            _assert_bitwise_equal(actual, wanted)
+
+
+def _separate_head_shards(tensors, world_size):
+    return [tensor.view(tensor.shape[0], world_size, -1, tensor.shape[2]) for tensor in tensors]
+
+
+def _reordered_pack(tensors, world_size):
+    k, q, v = parallel.pack_ulysses_head_shards([tensors[1], tensors[0], tensors[2]], world_size)
+    return [q, k, v]
+
+
+def _pack_for_two_ranks(tensors, world_size):
+    return parallel.pack_ulysses_head_shards(tensors, 2)
+
+
+def _pack_with_autograd(tensors, world_size):
+    with torch.enable_grad():
+        leaves = [tensor.detach().clone().requires_grad_() for tensor in tensors]
+        return parallel.pack_ulysses_head_shards(leaves, world_size)
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize(
+    "make_inputs", [_separate_head_shards, _reordered_pack, _pack_for_two_ranks, _pack_with_autograd]
+)
+def test_head_shards_that_do_not_tile_one_send_buffer_are_copied(monkeypatch, make_inputs):
+    world_size, split_sizes, head_dim = 4, [5, 4, 4, 4], 8
+    generator = torch.Generator().manual_seed(41)
+    tensors = [_global_tensor(sum(split_sizes), 8, head_dim, torch.float32, generator) for _ in range(3)]
+    inputs: dict[int, list[torch.Tensor]] = {}
+
+    def step(rank):
+        views = make_inputs(_rank_inputs(tensors, split_sizes, rank), world_size)
+        inputs.setdefault(rank, views)
+        with torch.enable_grad():
+            return parallel.scatter_heads_gather_seqlen(views, split_sizes, Magi2ParallelGroup(None, world_size, rank))
+
+    exchange = _Exchange(world_size)
+    outputs = exchange.run(monkeypatch, step)
+    reference, expected = _run_reference(monkeypatch, tensors, split_sizes, world_size)
+    for rank in range(world_size):
+        assert exchange.sent[rank][2] != inputs[rank][0].data_ptr()
+        _assert_bitwise_equal(exchange.sent[rank][0].detach(), reference.sent[rank][0])
+        for actual, wanted in zip(outputs[rank], expected[rank], strict=True):
+            _assert_bitwise_equal(actual.detach(), wanted)
+
+
+@pytest.mark.cpu
+def test_single_rank_exchange_flattens_head_shards():
+    generator = torch.Generator().manual_seed(43)
+    tensors = [torch.randn(5, 4, 8, generator=generator) for _ in range(3)]
+    views = parallel.pack_ulysses_head_shards(tensors, 2)
+    flattened = parallel.scatter_heads_gather_seqlen(views, [5], Magi2ParallelGroup(None, 1, 0))
+    for actual, tensor in zip(flattened, tensors, strict=True):
+        _assert_bitwise_equal(actual, tensor)
 
 
 @pytest.mark.cpu
@@ -374,3 +487,86 @@ def test_real_musa_compiled_output_projection_of_head_shards_is_bitwise_unchange
         expected = output(attended, gates, dispatcher)
         actual = output(_head_shards(attended, world_size), gates, dispatcher)
     _assert_bitwise_equal(actual.cpu(), expected.cpu())
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize(
+    "musa,world_size,expected",
+    [(False, 4, 1), (True, 1, 1), (True, 4, 4), (True, 8, 8), (True, 3, 1)],
+)
+def test_projection_packs_head_shards_on_musa(monkeypatch, musa, world_size, expected):
+    monkeypatch.setattr(modeling_magi2, "current_omni_platform", SimpleNamespace(is_musa=lambda: musa))
+    monkeypatch.setattr(modeling_magi2, "get_magi2_ulysses_group", lambda: Magi2ParallelGroup(None, world_size, 0))
+    module = Magi2Attention(_attention_config(torch.float32), num_modality=1)
+    assert module.ulysses_head_shards == expected
+
+
+def _projection_inputs(module, tokens, num_modality, generator, device="cpu"):
+    hidden = torch.randn(tokens, module.config.hidden_size, generator=generator).to(module.config.params_dtype)
+    rope = torch.randn(tokens, module.head_dim, generator=generator)
+    dispatcher = _modality_dispatcher(tokens, num_modality, generator, device)
+    return hidden.to(device), rope.to(device), dispatcher
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("world_size", [2, 4, 8])
+@pytest.mark.parametrize("num_modality", [1, 3])
+@pytest.mark.parametrize("params_dtype", [torch.float32, torch.bfloat16])
+def test_projection_head_shards_are_bitwise_unchanged(world_size, num_modality, params_dtype):
+    module = _initialized(Magi2Attention(_attention_config(params_dtype), num_modality=num_modality), 5)
+    generator = torch.Generator().manual_seed(19 * world_size + num_modality)
+    inputs = _projection_inputs(module, 11, num_modality, generator)
+
+    with torch.inference_mode():
+        module.ulysses_head_shards = 1
+        expected = module.project(*inputs)
+        module.ulysses_head_shards = world_size
+        actual = module.project(*inputs)
+
+    for view, tensor in zip(actual[:3], expected[:3], strict=True):
+        assert view.shape == (tensor.shape[0], world_size, tensor.shape[1] // world_size, tensor.shape[2])
+        _assert_bitwise_equal(_heads_flattened(view), tensor)
+    _assert_bitwise_equal(actual[3], expected[3])
+    assert parallel._packed_head_shards(list(actual[:3]), world_size) is not None
+
+
+def _dense_layer(num_modality):
+    # Production widths; layer 0 is multimodal and layer 1 single-modality, both dense.
+    config = Magi2PreviewConfig(num_layers=2, multimodal_layers=(0,), moe=Magi2MoEConfig(layers=()))
+    return _initialized(Magi2TransformerLayer(config, 0 if num_modality == 3 else 1), 29).to("musa")
+
+
+@pytest.mark.musa
+@pytest.mark.parametrize("tokens,world_size", [(3702, 8), (3651, 4), (14, 8)])
+@pytest.mark.parametrize("num_modality", [1, 3])
+def test_real_musa_compiled_attention_input_head_shards_are_bitwise_unchanged(tokens, world_size, num_modality):
+    if not _musa_available():
+        pytest.skip("requires a MUSA device")
+    layer = _dense_layer(num_modality)
+    generator = torch.Generator().manual_seed(tokens * num_modality)
+    width = layer.config.mhc.num_streams * layer.config.hidden_size
+    hidden = torch.randn(tokens, width, generator=generator).to(device="musa", dtype=layer.config.params_dtype)
+    rope = torch.randn(tokens, layer.config.head_dim, generator=generator).to("musa")
+    dispatcher = _modality_dispatcher(tokens, num_modality, generator, device="musa")
+
+    def compiled_region(head_shards):
+        torch._dynamo.reset()
+        layer.attention.ulysses_head_shards = head_shards
+        # The production regions compile statically with emulated precision casts.
+        region = torch.compile(
+            layer._attention_input, fullgraph=True, dynamic=False, options={"emulate_precision_casts": True}
+        )
+        with torch.inference_mode():
+            return region(hidden, rope, dispatcher)
+
+    expected_streams, expected_logits, *expected_qkv, expected_gates = compiled_region(1)
+    streams, logits, *packed_qkv, gates = compiled_region(world_size)
+    for view, tensor in zip(packed_qkv, expected_qkv, strict=True):
+        _assert_bitwise_equal(view.flatten(1, 2).cpu(), tensor.cpu())
+    # The rest of the region, the mHC norm and logits included, is unchanged too.
+    for actual, expected in zip(
+        (streams, *logits, gates), (expected_streams, *expected_logits, expected_gates), strict=True
+    ):
+        _assert_bitwise_equal(actual.cpu(), expected.cpu())
+    # The compiled region hands back views of one send buffer, sent without a copy.
+    assert parallel._packed_head_shards(packed_qkv, world_size) is not None

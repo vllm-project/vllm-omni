@@ -128,6 +128,7 @@ def _patched_groups(
         stack.enter_context(patch.object(mh_moe_module, "get_magi2_ep_group", return_value=ep_group))
         stack.enter_context(patch.object(parallel_module, "get_magi2_ulysses_group", return_value=sp_group))
         stack.enter_context(patch.object(attention_module, "get_magi2_ulysses_group", return_value=sp_group))
+        stack.enter_context(patch.object(modeling_module, "get_magi2_ulysses_group", return_value=sp_group))
         yield
 
 
