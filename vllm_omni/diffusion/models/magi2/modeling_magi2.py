@@ -13,10 +13,11 @@ preserving the released checkpoint module names and tensor layouts.
 from __future__ import annotations
 
 import os
+from collections import OrderedDict
 from collections.abc import Iterable
 from enum import IntEnum
 from functools import partial
-from typing import Any
+from typing import Any, NamedTuple
 
 import torch
 import torch.nn as nn
@@ -661,6 +662,38 @@ class Magi2TransformerBlock(nn.Module):
         return modality_dispatcher.inverse_permute(hidden_states)
 
 
+class _SequenceLayout(NamedTuple):
+    """Rope and modality metadata for one rank's packed token layout."""
+
+    rope: torch.Tensor
+    modality_dispatcher: ModalityDispatcher
+    video_indices: torch.Tensor
+    audio_indices: torch.Tensor
+    text_indices: torch.Tensor
+
+
+# A rank runs at most one layout per CFG branch.
+_MAX_SEQUENCE_LAYOUTS = 2
+_INTEGER_VIEWS = {1: torch.uint8, 2: torch.int16, 4: torch.int32, 8: torch.int64}
+
+
+def _integer_view(tensor: torch.Tensor) -> torch.Tensor:
+    return tensor.view(_INTEGER_VIEWS[tensor.element_size()]) if tensor.is_floating_point() else tensor
+
+
+def _same_bits(current: tuple[torch.Tensor, ...], cached: tuple[torch.Tensor, ...]) -> bool:
+    """Compare tensors bit for bit with a single device-to-host read."""
+
+    device = current[0].device
+    pairs = tuple(zip(current, cached, strict=True))
+    if any(
+        new.shape != old.shape or new.dtype != old.dtype or new.device != device or old.device != device
+        for new, old in pairs
+    ):
+        return False
+    return bool(torch.stack([(_integer_view(new) == _integer_view(old)).all() for new, old in pairs]).all())
+
+
 def _is_magi2_transformer_layer(_name: str, module: nn.Module) -> bool:
     """Shard one Preview layer at a time under the shared FSDP2/HSDP path."""
 
@@ -699,6 +732,9 @@ class Magi2PreviewTransformer(nn.Module):
             for index, layer in enumerate(self.block.layers)
             if isinstance(layer.mlp, Magi2MultiHeadMoELayer)
         ]
+        self._sequence_layouts: OrderedDict[tuple[Any, ...], tuple[tuple[torch.Tensor, ...], _SequenceLayout]] = (
+            OrderedDict()
+        )
 
     @property
     def layers(self) -> nn.ModuleList:
@@ -732,13 +768,9 @@ class Magi2PreviewTransformer(nn.Module):
         assert dispatcher.split_sizes is not None
         cp_split_sizes = dispatcher.split_sizes
 
-        rope = self.pre_adapter.rope(coords_mapping)
-        time_mask = modality_mapping == int(Modality.TIME)
-        modality_mapping = torch.where(time_mask, int(Modality.TEXT), modality_mapping)
-        modality_dispatcher = ModalityDispatcher(modality_mapping, 3)
-        video_indices = torch.nonzero(modality_mapping == int(Modality.VIDEO)).flatten()
-        audio_indices = torch.nonzero(modality_mapping == int(Modality.AUDIO)).flatten()
-        text_indices = torch.nonzero(modality_mapping == int(Modality.TEXT)).flatten()
+        rope, modality_dispatcher, video_indices, audio_indices, text_indices = self._sequence_layout(
+            coords_mapping, modality_mapping
+        )
 
         hidden_states = self.pre_adapter(x, video_indices, audio_indices, text_indices)
         if time_token_sequence is not None and time_token_sequence.shape[-1] > 0:
@@ -752,6 +784,50 @@ class Magi2PreviewTransformer(nn.Module):
         )
         output = self.post_adapter(hidden_states, video_indices, audio_indices)
         return dispatcher.undispatch(output)
+
+    def _sequence_layout(self, coords_mapping: torch.Tensor, modality_mapping: torch.Tensor) -> _SequenceLayout:
+        """Return the rope and modality metadata for this rank's tokens.
+
+        The packed coordinates and modalities are rebuilt for every denoising
+        step but stay fixed within a request, so forwards without autograd
+        reuse the metadata while this rank's coordinates, modalities and rope
+        bands are bitwise unchanged.
+        """
+
+        if torch.is_grad_enabled():
+            return self._build_sequence_layout(coords_mapping, modality_mapping)
+        inputs = (coords_mapping, modality_mapping, self.pre_adapter.rope.bands)
+        # Inference-mode tensors are only handed back to inference-mode forwards.
+        key = (
+            torch.is_inference_mode_enabled(),
+            coords_mapping.device,
+            coords_mapping.dtype,
+            tuple(coords_mapping.shape),
+            modality_mapping.dtype,
+            tuple(modality_mapping.shape),
+        )
+        cached = self._sequence_layouts.get(key)
+        if cached is not None and _same_bits(inputs, cached[0]):
+            self._sequence_layouts.move_to_end(key)
+            return cached[1]
+        layout = self._build_sequence_layout(coords_mapping, modality_mapping)
+        self._sequence_layouts[key] = (tuple(tensor.detach().clone() for tensor in inputs), layout)
+        self._sequence_layouts.move_to_end(key)
+        while len(self._sequence_layouts) > _MAX_SEQUENCE_LAYOUTS:
+            self._sequence_layouts.popitem(last=False)
+        return layout
+
+    def _build_sequence_layout(self, coords_mapping: torch.Tensor, modality_mapping: torch.Tensor) -> _SequenceLayout:
+        rope = self.pre_adapter.rope(coords_mapping)
+        time_mask = modality_mapping == int(Modality.TIME)
+        modality_mapping = torch.where(time_mask, int(Modality.TEXT), modality_mapping)
+        return _SequenceLayout(
+            rope=rope,
+            modality_dispatcher=ModalityDispatcher(modality_mapping, 3),
+            video_indices=torch.nonzero(modality_mapping == int(Modality.VIDEO)).flatten(),
+            audio_indices=torch.nonzero(modality_mapping == int(Modality.AUDIO)).flatten(),
+            text_indices=torch.nonzero(modality_mapping == int(Modality.TEXT)).flatten(),
+        )
 
     def _moe_for_weight(self, name: str) -> Magi2MultiHeadMoE | None:
         if ".moe_mlp." not in name:
