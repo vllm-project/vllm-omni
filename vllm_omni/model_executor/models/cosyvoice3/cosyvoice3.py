@@ -745,6 +745,13 @@ class CosyVoice3Model(
     _sampling_eps = 1e-5
 
     @property
+    def owns_generation_output_storage(self) -> bool:
+        """Expose the codec's ownership contract on the model seen by the runner."""
+        return self.model_stage == "cosyvoice3_code2wav" and (
+            getattr(self.code2wav, "owns_generation_output_storage", False) is True
+        )
+
+    @property
     def logits_vocab_size(self) -> int | None:
         """Width of the logits ``compute_logits`` returns (the speech head).
 
