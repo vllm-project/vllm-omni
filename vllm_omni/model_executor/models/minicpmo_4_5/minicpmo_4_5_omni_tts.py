@@ -686,7 +686,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         # sampling graph, one Generator and one device-side conversation state
         # per in-flight request; _flush_deferred_cleanup drops them when the
         # engine reports the request finished.
-        self._batch_stop_logits: torch.Tensor | None = None
+        self.batch_stop_logits: torch.Tensor | None = None
         self._request_generators: dict[str, torch.Generator] = {}
         self._request_audio_states: dict[str, dict[str, Any]] = {}
         self._request_codec_device_states: dict[str, TalkerCodecDeviceState] = {}
@@ -1603,7 +1603,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             terminal_flags.append(flag_true if finished else flag_false)
             stop_rows.append(row_stop if finished else row_continue)
 
-        self._batch_stop_logits = torch.stack(stop_rows, dim=0) if stop_rows else hidden.new_empty((0, 2))
+        self.batch_stop_logits = torch.stack(stop_rows, dim=0) if stop_rows else hidden.new_empty((0, 2))
         # Lists are deliberate: the runner routes element i to request i,
         # preserving compaction alignment while emitting only this step's code.
         meta_outputs = {"finished": terminal_flags}
@@ -1639,8 +1639,8 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         them, and hand the merged tensor back through
         ``set_batch_stop_logits``.
         """
-        logits = self._batch_stop_logits
-        self._batch_stop_logits = None
+        logits = self.batch_stop_logits
+        self.batch_stop_logits = None
         return logits
 
     def merge_frame_outputs(
@@ -2002,7 +2002,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         return cache[1]
 
     def set_batch_stop_logits(self, logits: torch.Tensor | None) -> None:
-        self._batch_stop_logits = logits
+        self.batch_stop_logits = logits
 
     @staticmethod
     def _merge_frame_finished(flags: list[torch.Tensor]) -> torch.Tensor:
@@ -2247,15 +2247,15 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             # the stage's ``stop_token_ids: [1]`` names. merge_frame_outputs
             # publishes this step's rows in logits_indices order; a step with
             # none gets zeros, whose argmax is 0 and therefore "continue".
-            if self._batch_stop_logits is None:
+            if self.batch_stop_logits is None:
                 return torch.zeros(
                     hidden_states.shape[0],
                     2,
                     device=hidden_states.device,
                     dtype=torch.float32,
                 )
-            logits = self._batch_stop_logits
-            self._batch_stop_logits = None
+            logits = self.batch_stop_logits
+            self.batch_stop_logits = None
             return logits
         if hidden_states.numel() == 0:
             return hidden_states.new_empty((0, int(self._num_audio_tokens)))

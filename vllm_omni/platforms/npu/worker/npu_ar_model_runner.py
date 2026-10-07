@@ -48,6 +48,7 @@ from vllm_omni.data_entry_keys import flatten_payload
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
 from vllm_omni.distributed.omni_connectors.utils.config import stage_sends_async_output
 from vllm_omni.model_executor.duplex_sampling import DuplexSamplingRunnerMixin
+from vllm_omni.model_executor.models.interfaces import supports_multi_frame_decode
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.platforms.npu.worker.npu_model_runner import OmniNPUModelRunner
 from vllm_omni.utils.mm_outputs import build_mm_cpu, partition_payload_list, to_payload_element
@@ -1089,7 +1090,7 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             # not control -- a request whose count never advances can never
             # stop. The model already masks the codec EOS by its own frame count
             # (talker_codec_sample), so the vLLM-level layer is redundant here.
-            if getattr(self.model, "supports_multi_frame_decode", False) and int(
+            if supports_multi_frame_decode(self.model) and int(
                 getattr(self, "num_spec_tokens", 0) or 0
             ) > 0:
                 from vllm_omni.platforms.npu.worker import talker_multiframe

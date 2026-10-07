@@ -68,6 +68,8 @@ from typing import Any
 import torch
 from vllm.logger import init_logger
 
+from vllm_omni.model_executor.models.interfaces import supports_multi_frame_decode
+
 logger = init_logger(__name__)
 
 _LOGGED_ENGAGE = False
@@ -183,7 +185,7 @@ def applies(model: Any, model_kwargs_extra: dict[str, Any]) -> int:
     stream and the scheduler's accounting alike. `_model_forward` turns those
     into an error rather than letting them run.
     """
-    if not getattr(model, "supports_multi_frame_decode", False):
+    if not supports_multi_frame_decode(model):
         # Every other stage: not a refusal, just not this model.
         return 0
     spans = model_kwargs_extra.get("request_token_spans")
@@ -227,7 +229,7 @@ def is_multi_token_decode(model: Any, model_kwargs_extra: dict[str, Any]) -> boo
     schedules multi-token decode steps of its own, which vLLM handles perfectly
     well -- it is only the Talker's one-frame-per-position sampler that cannot.
     """
-    if not getattr(model, "supports_multi_frame_decode", False):
+    if not supports_multi_frame_decode(model):
         return False
     spans = model_kwargs_extra.get("request_token_spans")
     infos = model_kwargs_extra.get("model_intermediate_buffer")
@@ -298,7 +300,7 @@ def narrow_replay_enabled(runner: Any) -> bool:
     if not _narrow_soc_allows():
         return False
     model = getattr(runner, "model", None)
-    if not getattr(model, "supports_multi_frame_decode", False):
+    if not supports_multi_frame_decode(model):
         return False
     return int(getattr(runner, "num_spec_tokens", 0) or 0) > 0
 
@@ -561,7 +563,7 @@ def drafts_this_step(runner: Any) -> int:
     writes into. Nothing about it is speculative: the drafts are always
     `continue`, and the frames are generated sequentially rather than verified.
     """
-    if not getattr(getattr(runner, "model", None), "supports_multi_frame_decode", False):
+    if not supports_multi_frame_decode(getattr(runner, "model", None)):
         return 0
     num_spec = int(getattr(runner, "num_spec_tokens", 0) or 0)
     if num_spec <= 0:
@@ -660,7 +662,7 @@ def ensure_stop_token_vocab(runner: Any, logits: Any) -> None:
     row does not survive into the request's token list and the request runs to
     `max_tokens`.
     """
-    if logits is None or not getattr(runner.model, "supports_multi_frame_decode", False):
+    if logits is None or not supports_multi_frame_decode(runner.model):
         return
     batch = getattr(runner, "input_batch", None)
     width = STOP_ROW_WIDTH

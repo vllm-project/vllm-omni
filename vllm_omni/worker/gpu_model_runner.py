@@ -38,6 +38,7 @@ from vllm_omni.core.prefix_cache.runner_mixin import PrefixCacheRunnerMixin
 from vllm_omni.data_entry_keys import OmniPayload
 from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.model_executor.layers.rotary_embedding.mrope import OmniMRotaryEmbedding as MRotaryEmbedding
+from vllm_omni.model_executor.models.interfaces import requires_request_sample_eligibility
 from vllm_omni.model_executor.models.model_local_kv import collect_model_local_kv_specs
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.platforms import current_omni_platform
@@ -1451,7 +1452,7 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
         if nstp is not None and len(nstp) == len(self.input_batch.req_ids):
             try:
                 model_kwargs_extra["request_token_spans"] = self._compute_request_token_spans(nstp)
-                if getattr(self.model, "requires_request_sample_eligibility", False):
+                if requires_request_sample_eligibility(self.model):
                     model_kwargs_extra["request_sample_eligible"] = [
                         bool(
                             (req := self.requests.get(req_id)) is not None

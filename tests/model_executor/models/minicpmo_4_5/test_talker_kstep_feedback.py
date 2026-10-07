@@ -271,7 +271,7 @@ def test_talker_stop_token_ids_match_the_multi_frame_head():
 def test_multiframe_gate_matrix():
     from vllm_omni.platforms.npu.worker import talker_multiframe
 
-    model = SimpleNamespace(supports_multi_frame_decode=True)
+    model = _contract_stub(armed=True)
     state = {"step": 5}
 
     # Uniform K-row decode: the loop engages with K=8.
@@ -392,9 +392,24 @@ def test_constant_drafts_fold_a_mixed_drafted_and_undrafted_batch():
     assert drafts == [[], []]
 
 
+def _contract_stub(*, armed: bool):
+    """Minimal model that satisfies the multi-frame runner contract.
+
+    The gate helpers verify the contract members whenever the flag is on, so a
+    stub that only sets the flag is no longer a valid stand-in for the wrapper.
+    """
+    return SimpleNamespace(
+        supports_multi_frame_decode=armed,
+        batch_stop_logits=None,
+        take_batch_stop_logits=lambda: None,
+        set_batch_stop_logits=lambda logits: None,
+        merge_frame_outputs=lambda frame_outputs, frame_stop_logits: frame_outputs,
+    )
+
+
 def _vocab_runner(*, supports_multi_frame: bool, vocab_size: int):
     return SimpleNamespace(
-        model=SimpleNamespace(supports_multi_frame_decode=supports_multi_frame),
+        model=_contract_stub(armed=supports_multi_frame),
         input_batch=SimpleNamespace(vocab_size=vocab_size),
     )
 

@@ -781,7 +781,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
     #   * missing supports_multi_frame_decode -> the check silently reads False,
     #     the multi-frame loop never runs and no reason is logged;
     #   * missing take/set_batch_stop_logits -> per-frame stop rows unavailable;
-    #   * missing _batch_stop_logits -> the runner's gate probe reads None and
+    #   * missing batch_stop_logits -> the runner's gate probe reads None and
     #     always falls back to text_hidden_states;
     #   * missing merge_frame_outputs -> multi-frame results cannot be merged.
     # The speculative config alone is not enough: the runner-side loop and its
@@ -797,13 +797,13 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         return self.model_stage == "tts"
 
     @property
-    def _batch_stop_logits(self):
+    def batch_stop_logits(self):
         # The runner probes this attribute on the registered architecture
         # (getattr in npu_model_runner); without the forward it reads None and
         # the gate always falls back to text_hidden_states.
         if self.model_stage != "tts":
             return None
-        return self.talker._batch_stop_logits
+        return self.talker.batch_stop_logits
 
     def take_batch_stop_logits(self):
         if self.model_stage != "tts":
