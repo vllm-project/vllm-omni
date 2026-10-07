@@ -437,6 +437,7 @@ async def omni_run_server_worker(
                 excluded_urls="health,healthz,metrics",
             )
         app.state.api_server_count = api_server_count
+        app.state.supported_tasks = supported_tasks
 
         # OMNI: Remove upstream routes that we override with omni-specific handlers
         remove_route_from_app(app, "/v1/chat/completions", {"POST"})
@@ -2310,6 +2311,16 @@ async def generate_images(
     Raises:
         HTTPException: For validation errors, missing engine, or generation failures
     """
+    # Check if x2i in list of supported tasks before calling _get_engine_and_model
+    # to throw a more descriptive error
+    # _get_engine_and_model throws misleading errors for multistage models without a diffusion stage
+    supported_tasks = getattr(raw_request.app.state, "supported_tasks")
+
+    if "x2i" not in supported_tasks:
+        raise HTTPException(
+            status_code=HTTPStatus.SERVICE_UNAVAILABLE.value, detail="The model does not support image generation"
+        )
+
     request_timestamp = float(getattr(raw_request.state, "request_timestamp", time.time()))
     # Get engine client (AsyncOmni) from app state
     engine_client, model_name, stage_configs = _get_engine_and_model(raw_request)
@@ -2575,6 +2586,14 @@ async def edit_images(
     """
     OpenAI-compatible image edit endpoint.
     """
+
+    # prereq: check if model supports x2i tasks
+    supported_tasks = getattr(raw_request.app.state, "supported_tasks")
+
+    if "x2i" not in supported_tasks:
+        raise HTTPException(
+            status_code=HTTPStatus.SERVICE_UNAVAILABLE.value, detail="The model does not support image generation"
+        )
 
     # 1. get engine and model
     request_timestamp = float(getattr(raw_request.state, "request_timestamp", time.time()))

@@ -1200,6 +1200,7 @@ def test_images_generation_without_engine_preserves_service_unavailable_error() 
     capability signal when bootstrap failed.
     """
     app = FastAPI()
+    app.state.supported_tasks = "x2i"
     raw_request = _request_for(app, method="POST", path="/v1/images/generations")
     request = api_server.ImageGenerationRequest(prompt="a cat", model="demo-model")
 
@@ -1224,6 +1225,7 @@ def test_images_generation_without_multistage_chat_handler_preserves_unavailable
     app.state.openai_serving_models = SimpleNamespace(base_model_paths=[SimpleNamespace(name="demo-model")])
     app.state.openai_serving_chat = None
     app.state.args = SimpleNamespace(max_generated_image_size=None)
+    app.state.supported_tasks = "x2i"
 
     raw_request = _request_for(app, method="POST", path="/v1/images/generations")
     request = api_server.ImageGenerationRequest(prompt="a cat", model="demo-model")
