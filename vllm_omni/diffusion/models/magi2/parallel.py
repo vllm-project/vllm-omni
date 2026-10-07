@@ -251,6 +251,64 @@ def scatter_seqlen_gather_head_shards(
     return output.view(group.world_size, local_tokens, tensor.shape[1], tensor.shape[2]).permute(1, 0, 2, 3)
 
 
+def pack_ulysses_head_shards(tensors: Iterable[torch.Tensor], world_size: int) -> list[torch.Tensor]:
+    """Lay ``[S_rank, world*H_i, D]`` inputs out as one Ulysses send buffer.
+
+    Returns ``[S_rank, world, H_i, D]`` views of a single
+    ``[world, S_rank, sum(H_i), D]`` buffer, destination rank first, which
+    :func:`scatter_heads_gather_seqlen` sends without another copy. Flattening
+    dimensions 1 and 2 of a view gives back its input.
+    """
+
+    tensors = list(tensors)
+    shards = [
+        tensor.view(tensor.shape[0], world_size, tensor.shape[1] // world_size, tensor.shape[2]) for tensor in tensors
+    ]
+    packed = torch.cat([shard.transpose(0, 1) for shard in shards], dim=2)
+    views = []
+    start = 0
+    for shard in shards:
+        views.append(packed[:, :, start : start + shard.shape[2]].transpose(0, 1))
+        start += shard.shape[2]
+    return views
+
+
+def _packed_head_shards(tensors: list[torch.Tensor], world_size: int) -> torch.Tensor | None:
+    """Return the ``[world*S_rank, sum(H_i), D]`` buffer that ``tensors`` tile.
+
+    :func:`pack_ulysses_head_shards` views cover consecutive head slices of
+    every row of one destination-rank-major buffer. Returns ``None`` for any
+    other inputs, while compiling, and when autograd tracks an input.
+    """
+
+    if (
+        torch.compiler.is_compiling()
+        or any(t.ndim != 4 for t in tensors)
+        or (torch.is_grad_enabled() and any(t.requires_grad for t in tensors))
+    ):
+        return None
+    first = tensors[0]
+    tokens, head_dim = first.shape[0], first.shape[3]
+    heads = sum(t.shape[2] for t in tensors)
+    strides = (heads * head_dim, tokens * heads * head_dim, head_dim, 1)
+    storage = first.untyped_storage().data_ptr()
+    offset = first.storage_offset()
+    for tensor in tensors:
+        if (
+            tensor.shape[:2] != (tokens, world_size)
+            or tensor.shape[3] != head_dim
+            or tensor.dtype != first.dtype
+            or tensor.device != first.device
+            or tensor.untyped_storage().data_ptr() != storage
+            or tensor.storage_offset() != offset
+            # Strides of size-0/1 dimensions never address an element.
+            or any(size > 1 and stride != want for size, stride, want in zip(tensor.shape, tensor.stride(), strides))
+        ):
+            return None
+        offset += tensor.shape[2] * head_dim
+    return first.as_strided((world_size * tokens, heads, head_dim), (heads * head_dim, head_dim, 1))
+
+
 def scatter_heads_gather_seqlen(
     tensors: Iterable[torch.Tensor],
     split_sizes: list[int],
@@ -258,22 +316,24 @@ def scatter_heads_gather_seqlen(
 ) -> list[torch.Tensor]:
     """Inverse batched Ulysses exchange for Q/K/V.
 
-    Each input is ``[S_rank, world*H_i, D]`` and each output is
-    ``[sum(S_r), H_i, D]``.  Fusing Q/K/V into one all-to-all preserves the
-    reference communication ordering and avoids three independent collectives.
-    Each input is copied once, straight into its head slice of the send buffer.
+    Each input is ``[S_rank, world*H_i, D]`` or its ``[S_rank, world, H_i, D]``
+    head-shard view, and each output is ``[sum(S_r), H_i, D]``.  Fusing Q/K/V
+    into one all-to-all preserves the reference communication ordering and
+    avoids three independent collectives. Views from
+    :func:`pack_ulysses_head_shards` are sent in place; any other input is
+    copied once, straight into its head slice of the send buffer.
     """
 
     group = group or get_magi2_ulysses_group()
     tensors = list(tensors)
     if group.world_size == 1:
-        return tensors
+        return [t.flatten(1, 2) if t.ndim == 4 else t for t in tensors]
     if not tensors:
         return []
     local_tokens = split_sizes[group.rank]
     if len(split_sizes) != group.world_size:
         raise ValueError("split_sizes length must equal the Ulysses world size")
-    if any(t.ndim != 3 or t.shape[0] != local_tokens for t in tensors):
+    if any(t.ndim not in (3, 4) or t.shape[0] != local_tokens for t in tensors):
         raise ValueError("all Ulysses inputs must be [local_tokens, heads, dim]")
     if any(t.device != tensors[0].device for t in tensors):
         raise ValueError("all Ulysses inputs must be on the same device")
@@ -281,25 +341,28 @@ def scatter_heads_gather_seqlen(
     local_head_counts: list[int] = []
     head_dim = tensors[0].shape[-1]
     for tensor in tensors:
-        if tensor.shape[-1] != head_dim or tensor.shape[1] % group.world_size:
+        heads = tensor.shape[1:-1].numel()
+        if tensor.shape[-1] != head_dim or heads % group.world_size:
             raise ValueError("attention heads must divide evenly across Ulysses ranks")
-        local_head_counts.append(tensor.shape[1] // group.world_size)
+        local_head_counts.append(heads // group.world_size)
 
-    # Destination rank first; each row holds that rank's head shard of every
-    # input in order, in the inputs' promoted dtype.
-    fused_heads = sum(local_head_counts)
-    fused = torch.empty(
-        (group.world_size, local_tokens, fused_heads, head_dim),
-        dtype=functools.reduce(torch.promote_types, (t.dtype for t in tensors)),
-        device=tensors[0].device,
-    )
-    start = 0
-    for tensor, local_heads in zip(tensors, local_head_counts, strict=True):
-        fused[:, :, start : start + local_heads].copy_(
-            tensor.view(local_tokens, group.world_size, local_heads, head_dim).transpose(0, 1)
+    fused = _packed_head_shards(tensors, group.world_size)
+    if fused is None:
+        # Destination rank first; each row holds that rank's head shard of
+        # every input in order, in the inputs' promoted dtype.
+        fused_heads = sum(local_head_counts)
+        fused = torch.empty(
+            (group.world_size, local_tokens, fused_heads, head_dim),
+            dtype=functools.reduce(torch.promote_types, (t.dtype for t in tensors)),
+            device=tensors[0].device,
         )
-        start += local_heads
-    fused = fused.view(group.world_size * local_tokens, fused_heads, head_dim)
+        start = 0
+        for tensor, local_heads in zip(tensors, local_head_counts, strict=True):
+            fused[:, :, start : start + local_heads].copy_(
+                tensor.reshape(local_tokens, group.world_size, local_heads, head_dim).transpose(0, 1)
+            )
+            start += local_heads
+        fused = fused.view(group.world_size * local_tokens, fused_heads, head_dim)
     output = torch.empty(
         (sum(split_sizes), fused.shape[1], head_dim),
         dtype=fused.dtype,
