@@ -235,7 +235,17 @@ def format_cosmos3_nano_sim_transfer_prompt(
         frame_rate=prompt_fps,
         height=height,
         width=width,
-        aspect_ratio=_json_object_aspect_ratio(prompt),
+        # Caption metadata can describe the source video rather than the
+        # selected output canvas. Use the same canonical ratio as the preset.
+        aspect_ratio=next(
+            (
+                ratio
+                for sizes in VIDEO_RES_SIZE_INFO.values()
+                for ratio, size in sizes.items()
+                if tuple(size) == (width, height)
+            ),
+            _json_object_aspect_ratio(prompt),
+        ),
     )
     if formatted is None:
         formatted = prompt.strip()
