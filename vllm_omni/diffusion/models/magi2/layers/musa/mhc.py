@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import torch
+from vllm.triton_utils import HAS_TRITON
 
 from ..native.mhc import MHCHandler as NativeMHCHandler
 
@@ -30,6 +31,9 @@ class MHCHandler(NativeMHCHandler):
             dtype=dtype,
         )
         self.fp32_stream_contractions = True
+        # Inductor emits one kernel per Sinkhorn half-iteration, so MUSA runs
+        # the iterations of the four-stream matrix in a single Triton kernel.
+        self.fused_sinkhorn = num_streams == 4 and HAS_TRITON
 
 
 __all__ = ["MHCHandler"]
