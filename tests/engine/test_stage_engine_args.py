@@ -20,6 +20,7 @@ from vllm.config import ParallelConfig as VllmParallelConfig
 from vllm.config import ProfilerConfig as VllmProfilerConfig
 from vllm.config import SchedulerConfig as VllmSchedulerConfig
 from vllm.engine.arg_utils import EngineArgs
+from vllm.model_executor.models.utils import extract_layer_index
 
 from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
 from vllm_omni.config.omni_config import (
@@ -96,7 +97,6 @@ _OMNI_ONLY_LLM_STAGE_ENGINE_FIELDS = frozenset(
         "enable_multithread_weight_load",
         "env",
         "has_sampling_extra_args",
-        "log_level",
         "log_stats",
         "model_arch",
         "model_subdir",
@@ -226,7 +226,7 @@ def _engine_arg_inputs(tmp_path: Path) -> tuple[PipelineConfig, DeployConfig, st
                 execution_type=StageExecutionType.LLM_AR,
                 requires_multimodal_data=True,
                 hf_config_name="thinker_config",
-                engine_output_type="hidden_states",
+                engine_output_type="latent",
                 model_arch="Qwen3OmniMoeForConditionalGeneration",
                 model_subdir="ar-model",
                 tokenizer_subdir="ar-tokenizer",
@@ -238,7 +238,7 @@ def _engine_arg_inputs(tmp_path: Path) -> tuple[PipelineConfig, DeployConfig, st
                 model_stage="talker",
                 execution_type=StageExecutionType.LLM_GENERATION,
                 input_sources=(0,),
-                engine_output_type="audio_tokens",
+                engine_output_type="latent",
             ),
             StagePipelineConfig(
                 stage_id=2,
@@ -404,7 +404,9 @@ def test_mammoth_fp8_kv_deploy_projects_only_ar_stage(monkeypatch):
     )
 
     assert deploy.stages[0].engine_extras["kv_cache_dtype"] == "fp8_e4m3"
+    assert deploy.stages[0].engine_extras["kv_cache_dtype_skip_layers"] == ["0"]
     assert "kv_cache_dtype" not in deploy.stages[1].engine_extras
+    assert "kv_cache_dtype_skip_layers" not in deploy.stages[1].engine_extras
 
     legacy_args = [build_legacy_engine_args_dict(stage, "test-model") for stage in legacy_stages]
     typed_args = [
@@ -420,14 +422,22 @@ def test_mammoth_fp8_kv_deploy_projects_only_ar_stage(monkeypatch):
 
     assert ar_stage.stage_pipeline_config.execution_type == StageExecutionType.LLM_AR
     assert legacy_args[0]["kv_cache_dtype"] == "fp8_e4m3"
+    assert legacy_args[0]["kv_cache_dtype_skip_layers"] == ["0"]
     assert ar_stage.cache_config.cache_dtype == "fp8_e4m3"
+    assert ar_stage.cache_config.kv_cache_dtype_skip_layers == ["0"]
     assert "cache_dtype" in ar_stage.cache_config._omni_explicit_fields
     assert typed_args[0]["kv_cache_dtype"] == "fp8_e4m3"
+    assert typed_args[0]["kv_cache_dtype_skip_layers"] == ["0"]
+    # vLLM matches the list against the index it parses from each attention prefix.
+    assert str(extract_layer_index("ar.language_model.layers.0.self_attn.attn")) == "0"
 
     assert "kv_cache_dtype" not in legacy_args[1]
+    assert "kv_cache_dtype_skip_layers" not in legacy_args[1]
     assert dit_stage.cache_config.cache_dtype == "auto"
+    assert dit_stage.cache_config.kv_cache_dtype_skip_layers == []
     assert "cache_dtype" not in dit_stage.cache_config._omni_explicit_fields
     assert "kv_cache_dtype" not in typed_args[1]
+    assert "kv_cache_dtype_skip_layers" not in typed_args[1]
 
 
 def test_typed_llm_projection_rejects_explicit_fields_owned_by_another_boundary():

@@ -25,6 +25,9 @@ pytestmark = [pytest.mark.diffusion, pytest.mark.cpu, pytest.mark.core_model]
 # for adding a new tiny model builder and corresponding entry in DIFFUSION_TEST_SETTINGS.
 EXCLUDED_MODELS = [
     "QwenImageLayeredPipeline",
+    # Dedicated CPU/unit coverage in tests/diffusion/models/qwen_image_21/.
+    # Tiny-model offline suite is not wired yet (2.1 transformer/VAE configs).
+    "QwenImage21Pipeline",
     "GlmImagePipeline",
     "ZImagePipeline",
     "OvisImagePipeline",
@@ -32,6 +35,8 @@ EXCLUDED_MODELS = [
     # dedicated MammothModa2 bridge/pipeline tests and real-checkpoint E2E.
     "MammothModa2DiTPipeline",
     "WanPipeline",
+    # Uses a full checkpoint and video input; covered by its checkpoint-gated E2E test.
+    "SeedVR2Pipeline",
     "WanDMDPipeline",
     "WanVACEPipeline",
     "LTX2TwoStagePipeline",
@@ -56,12 +61,10 @@ EXCLUDED_MODELS = [
     "MingImageDiffusionPipeline",
     "MingImageLayeredDiffusionPipeline",
     "InternVLAA1Pipeline",
-    "StableDiffusion3Pipeline",
     "HunyuanImage3ForCausalMM",
     "ErnieImagePipeline",
     "NextStep11Pipeline",
     "FluxDMD2Pipeline",
-    "Krea2Pipeline",
     "QwenImageDMD2Pipeline",
     "OmniGen2Pipeline",
     "HeliosPipeline",
@@ -76,6 +79,9 @@ EXCLUDED_MODELS = [
     # The 270+ GiB multimodal checkpoint needs 4/8-way native sequence/head
     # parallel execution; covered by focused native contract and GPU tests.
     "Magi2Pipeline",
+    # Pro DiT is ~56 GiB bf16 and the Hub checkpoint is gated. Covered by
+    # tests/diffusion/models/kandinsky6 and the real-checkpoint E2E smoke.
+    "Kandinsky6TI2VAPipeline",
     "OmniVoicePipeline",
     "OmniVoice",
     "Cosmos3OmniDiffusersPipeline",

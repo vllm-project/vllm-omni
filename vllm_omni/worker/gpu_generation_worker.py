@@ -126,4 +126,5 @@ class GPUGenerationWorker(OmniWorkerMixin, OmniGPUWorkerBase):
 
         start = time.perf_counter()
         self.model_runner.profile_run()
+        self._capture_auxiliary_graphs()
         return CompilationTimes(language_model=time.perf_counter() - start, encoder=0.0)

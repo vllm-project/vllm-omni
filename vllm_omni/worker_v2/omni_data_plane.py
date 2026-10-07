@@ -38,6 +38,30 @@ class _NativeRequestState:
     resumable: bool = False
     output_token_ids: list[int] = field(default_factory=list)
     finished: bool = False
+    output_stopped: bool = False
+
+    def accept_tokens(self, token_ids: list[int]) -> None:
+        """Fence publications past the sampled stop, before scheduler ACK.
+
+        Async scheduling may already have executed another step when the
+        scheduler consumes EOS. Keep the terminating step's payload, but do
+        not publish the later steps while lifecycle reservations drain.
+        Resumable requests keep their segment boundaries owned by the scheduler.
+        """
+        params = self.sampling_params
+        stop_ids = set(getattr(params, "stop_token_ids", None) or ())
+        if not getattr(params, "ignore_eos", False):
+            stop_ids.update(getattr(params, "_all_stop_token_ids", ()) or ())
+        min_tokens = getattr(params, "min_tokens", 0) or 0
+        max_tokens = getattr(params, "max_tokens", None)
+        for token_id in token_ids:
+            self.output_token_ids.append(int(token_id))
+            if not self.resumable and (
+                (len(self.output_token_ids) >= min_tokens and token_id in stop_ids)
+                or (max_tokens is not None and len(self.output_token_ids) >= max_tokens)
+            ):
+                self.output_stopped = True
+                break
 
     def snapshot(self, *, include_token_history: bool) -> SimpleNamespace:
         prompt = list(self.prompt_token_ids) if include_token_history else []
@@ -51,6 +75,7 @@ class _NativeRequestState:
             output_token_ids=output,
             all_token_ids=prompt + output,
             output_token_count=len(self.output_token_ids),
+            last_output_token_id=self.output_token_ids[-1] if self.output_token_ids else None,
             additional_information=self.additional_information,
             sampling_params=self.sampling_params,
             num_computed_tokens=self.num_computed_tokens,
@@ -83,6 +108,11 @@ class OmniRunnerDataPlane(OmniConnectorModelRunnerMixin):
         self._native_send_lock = threading.Lock()
         self._native_outputs_in_flight: dict[str, int] = defaultdict(int)
         self._native_terminal_pending: set[str] = set()
+        # Stage payload builders read the stage config through
+        # ``_get_model_config()`` (e.g. Qwen3-Omni's Thinker reads
+        # ``hf_config.talker_config.accept_hidden_layer``).
+        self.vllm_config = vllm_config
+        self.model_config = model_config
         self.init_omni_connectors(model_config=model_config)
         self._delivery_manager = OmniDeliveryManager(
             delivery_timeout_s=self._connector_delivery_timeout(),
@@ -394,7 +424,9 @@ class OmniRunnerDataPlane(OmniConnectorModelRunnerMixin):
                 for qual, qval in value.items():
                     if qual in span_handled:
                         continue
-                    if key == "meta" and qual == "finished":
+                    if key == "meta":
+                        # Per-chunk state (``finished``, the V1 sender's
+                        # ``is_segment_finished`` flag, ...), not rows.
                         merged_sub[qual] = qval
                         continue
                     if (key, qual) in override_keys:
@@ -498,9 +530,15 @@ class OmniRunnerDataPlane(OmniConnectorModelRunnerMixin):
             state = self._native_requests.get(req_id)
             if state is None:
                 continue
-            state.output_token_ids.extend(int(token_id) for token_id in sampled_by_req.get(req_id, []))
             state.finished = req_id in terminal_req_ids
-            payload = payload_by_req.get(req_id)
+            # Native transport runs ahead of scheduler consumption. Its
+            # terminal notification fences resource cleanup, not the sampled
+            # token boundary: a later in-flight frame must not reach the codec.
+            if state.output_stopped:
+                payload = None
+            else:
+                state.accept_tokens(sampled_by_req.get(req_id, []))
+                payload = payload_by_req.get(req_id)
             if not self._async_chunk:
                 # Full-payload consumers execute once, after the producer has
                 # finished. Reuse V1's concat/replace contract for flat outputs
@@ -563,6 +601,7 @@ class OmniRunnerDataPlane(OmniConnectorModelRunnerMixin):
         self._delivery_manager.shutdown(RuntimeError("MRv2 connector shutdown"))
         self._stop_event.set()
         self._work_available.set()
+        self._save_work_available.set()
 
         close_errors: list[BaseException] = []
         connector = getattr(self, "_omni_connector", None)

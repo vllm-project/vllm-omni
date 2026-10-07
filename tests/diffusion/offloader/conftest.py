@@ -7,14 +7,14 @@ import gc
 
 import pytest
 import torch.distributed as dist
+from vllm.utils.network_utils import get_file_store_init_method
 
-from tests.helpers.runtime import get_distributed_init_method
 from vllm_omni.platforms import current_omni_platform
 
 
 @pytest.fixture(scope="module")
 def dist_group():
-    dist.init_process_group("gloo", rank=0, world_size=1, init_method=get_distributed_init_method())
+    dist.init_process_group("gloo", rank=0, world_size=1, init_method=get_file_store_init_method())
     try:
         yield
     finally:

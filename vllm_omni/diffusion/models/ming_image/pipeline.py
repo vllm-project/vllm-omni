@@ -107,6 +107,11 @@ class MingImageDiffusionPipeline(ZImagePipeline):
     _encoder_modules: ClassVar[list[str]] = ["conditioning"]
     _vae_modules: ClassVar[list[str]] = ["vae"]
 
+    @property
+    def do_classifier_free_guidance(self) -> bool:
+        # The vendor Ming-Image pipeline only enables CFG above 1.0
+        return self._guidance_scale > 1
+
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = "") -> None:
         del prefix
         nn.Module.__init__(self)
@@ -190,6 +195,7 @@ class MingImageDiffusionPipeline(ZImagePipeline):
         self.image_processor = VaeImageProcessor(
             vae_scale_factor=self.vae_scale_factor * 2,
             do_convert_rgb=False,
+            resample="bilinear",
         )
         self.setup_diffusion_pipeline_profiler(
             enable_diffusion_pipeline_profiler=od_config.enable_diffusion_pipeline_profiler
@@ -314,18 +320,10 @@ class MingImageDiffusionPipeline(ZImagePipeline):
 
         height = int(extra_args.get("height") or sampling.height or 1024)
         width = int(extra_args.get("width") or sampling.width or 1024)
-        steps = int(extra_args.get("steps") or sampling.num_inference_steps or self.default_num_inference_steps)
-        cfg = float(
-            extra_args["cfg"]
-            if extra_args.get("cfg") is not None
-            else sampling.guidance_scale
-            if sampling.guidance_scale is not None
-            else self.default_guidance_scale
-        )
+        steps = int(sampling.num_inference_steps or self.default_num_inference_steps)
+        cfg = float(sampling.guidance_scale if sampling.guidance_scale is not None else self.default_guidance_scale)
         seed = extra_args.get("seed", sampling.seed)
-        generator = (
-            torch.Generator(device=self.device).manual_seed(int(seed)) if seed is not None else sampling.generator
-        )
+        generator = torch.Generator(device="cpu").manual_seed(int(seed)) if seed is not None else sampling.generator
 
         ref_latent = self._encode_reference(reference, height, width)
         positive = [item for item in cap_feats]
@@ -333,7 +331,7 @@ class MingImageDiffusionPipeline(ZImagePipeline):
         self._pending_prompt_embeds = positive
         self._pending_negative_prompt_embeds = negative
 
-        apply_cfg = cfg > 0
+        apply_cfg = cfg > 1
         context_direct = (
             torch.cat([direct_condition, torch.zeros_like(direct_condition)], dim=0) if apply_cfg else direct_condition
         )

@@ -26,6 +26,7 @@ _CLASS_TO_MODULE: dict[str, str] = {
     "VoxtralTTSConfig": "vllm_omni.transformers_utils.configs.voxtral_tts",
     "CosyVoice3Config": "vllm_omni.transformers_utils.configs.cosyvoice3",
     "MiniMaxMusic3Config": "vllm_omni.transformers_utils.configs.minimax_music3",
+    "Yue2Config": "vllm_omni.transformers_utils.configs.yue2",
     "OmniVoiceConfig": "vllm_omni.transformers_utils.configs.omnivoice",
     "BailingMoeV2Config": "vllm_omni.transformers_utils.configs.ming_flash_omni",
     "BailingMM2Config": "vllm_omni.transformers_utils.configs.ming_flash_omni",
@@ -35,6 +36,7 @@ _CLASS_TO_MODULE: dict[str, str] = {
     "WhisperEncoderConfig": "vllm_omni.transformers_utils.configs.ming_flash_omni",
     "AuKConfig": "vllm_omni.transformers_utils.configs.auk",
     "SenseNovaU1Config": "vllm_omni.transformers_utils.configs.sensenova_u1",
+    "SenseNovaU1MoELLMConfig": "vllm_omni.transformers_utils.configs.sensenova_u1",
 }
 
 __all__ = [
@@ -55,6 +57,7 @@ __all__ = [
     "VoxtralTTSConfig",
     "CosyVoice3Config",
     "MiniMaxMusic3Config",
+    "Yue2Config",
     "OmniVoiceConfig",
     "BailingMoeV2Config",
     "BailingMM2Config",
@@ -63,6 +66,7 @@ __all__ = [
     "Qwen3VLMoeVisionConfig",
     "WhisperEncoderConfig",
     "SenseNovaU1Config",
+    "SenseNovaU1MoELLMConfig",
 ]
 
 
@@ -94,3 +98,4 @@ from vllm_omni.transformers_utils.configs import omnivoice as _omnivoice  # noqa
 from vllm_omni.transformers_utils.configs import sensenova_u1 as _sensenova_u1  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import voxcpm2 as _voxcpm2  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import voxtral_tts as _voxtral_tts  # noqa: F401, E402
+from vllm_omni.transformers_utils.configs import yue2 as _yue2  # noqa: F401, E402

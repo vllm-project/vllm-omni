@@ -332,6 +332,36 @@ def _resolve_num_warmups(params: dict[str, Any], *, default: int) -> int:
     return value
 
 
+def _assert_fixed_stage_workloads(result: dict[str, Any], params: dict[str, Any], num_prompts: int) -> None:
+    """Reject successful responses that did less work than a fixed-length benchmark requested."""
+    extra_body = params.get("extra_body") or params.get("extra-body") or {}
+    fixed_lengths = {
+        str(stage): sampling["max_tokens"]
+        for stage, sampling in enumerate(extra_body.get("sampling_params_list", []))
+        if isinstance(sampling, dict)
+        and isinstance(sampling.get("max_tokens"), int)
+        and sampling["max_tokens"] > 0
+        and sampling.get("min_tokens") == sampling["max_tokens"]
+    }
+    if not fixed_lengths:
+        return
+
+    snapshots = result.get("request_stage_metrics")
+    assert isinstance(snapshots, list) and len(snapshots) == num_prompts, (
+        "Fixed stage workload: missing per-request stage metrics"
+    )
+    for request_index, snapshot in enumerate(snapshots):
+        for stage, expected in fixed_lengths.items():
+            metrics = snapshot.get(stage) if isinstance(snapshot, dict) else None
+            actual = metrics.get("num_tokens_out") if isinstance(metrics, dict) else None
+            assert actual == expected, (
+                f"Fixed stage workload: request {request_index}, stage {stage}: "
+                f"expected {expected} output tokens, got {actual!r}"
+            )
+    stages = ", ".join(f"stage {stage}={expected}" for stage, expected in fixed_lengths.items())
+    print(f"Fixed stage workload OK: {num_prompts} requests, num_tokens_out {stages}")
+
+
 def _is_finite_number(value: object) -> bool:
     return isinstance(value, int | float) and not isinstance(value, bool) and math.isfinite(value)
 
@@ -448,6 +478,7 @@ def _maybe_assert_aggregate_ia_qtf1(params: dict[str, object], acc_summary: dict
 
 def assert_result(result, params, num_prompt) -> None:
     assert result["completed"] == num_prompt, "Request failures exist"
+    _assert_fixed_stage_workloads(result, params, num_prompt)
     if params.get("dataset_name") == "omniinteract":
         summary = result.get("omniinteract")
         assert isinstance(summary, dict), "OmniInteract summary is missing"

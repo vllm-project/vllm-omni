@@ -5,20 +5,27 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from vllm.multimodal.processing import ProcessorInputs
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.models.ming_image.pipeline import (
     MingImageDiffusionPipeline,
     _validate_variant_config,
 )
+from vllm_omni.diffusion.models.z_image.pipeline_z_image import ZImagePipeline
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.model_executor.models.ming_flash_omni.ming_flash_omni_thinker import (
     MingFlashOmniThinkerForConditionalGeneration,
+    MingFlashOmniThinkerMultiModalProcessor,
 )
 from vllm_omni.model_executor.models.ming_image import checkpoint
-from vllm_omni.model_executor.models.ming_image.model import MingImageForConditionalGeneration
+from vllm_omni.model_executor.models.ming_image.model import (
+    MingImageForConditionalGeneration,
+    MingImageMultiModalProcessor,
+)
 from vllm_omni.model_executor.models.ming_image.pipeline import MING_IMAGE_PIPELINE
 from vllm_omni.model_executor.stage_input_processors.ming_image import thinker2image
 from vllm_omni.model_extras import (
@@ -26,6 +33,7 @@ from vllm_omni.model_extras import (
     should_init_extra_args_for_non_diffusion_stages,
 )
 from vllm_omni.transformers_utils.configs.ming_flash_omni import BailingMM2Config
+from vllm_omni.transformers_utils.processors.ming import MingImageProcessor
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -119,6 +127,21 @@ def test_pipeline_rejects_multiple_outputs_per_prompt():
         pipeline.forward(request)
 
 
+@pytest.mark.parametrize(
+    ("guidance_scale", "ming_expected", "z_image_expected"),
+    ((0.0, False, False), (1.0, False, True), (1.0001, True, True), (2.0, True, True)),
+)
+def test_ming_cfg_is_only_enabled_above_one(guidance_scale, ming_expected, z_image_expected):
+    # Ming-Image follows the vendor threshold; the shared Z-Image base keeps diffusers semantics.
+    ming_pipeline = MingImageDiffusionPipeline.__new__(MingImageDiffusionPipeline)
+    ming_pipeline._guidance_scale = guidance_scale
+    z_image_pipeline = ZImagePipeline.__new__(ZImagePipeline)
+    z_image_pipeline._guidance_scale = guidance_scale
+
+    assert ming_pipeline.do_classifier_free_guidance is ming_expected
+    assert z_image_pipeline.do_classifier_free_guidance is z_image_expected
+
+
 def _source_output(prefix_len: int = 4):
     prompt_ids = [11] * prefix_len + [157158] + [157157] * 256 + [157159]
     length = len(prompt_ids)
@@ -157,6 +180,78 @@ def test_bridge_rejects_text_negative_condition():
         )
 
 
+def test_image_generation_template_matches_upstream_layout():
+    processor = MingImageProcessor.__new__(MingImageProcessor)
+    processor.tokenizer = SimpleNamespace(eos_token="<eos>")
+
+    text = processor._apply_image_generation_template("draw a cabin")
+    assert text == (
+        "<role>SYSTEM</role>你是一个友好的AI助手。\n\ndetailed thinking off"
+        "<eos><role>HUMAN</role>draw a cabin"
+        "<eos><role>ASSISTANT</role>"
+    )
+    assert processor._apply_image_generation_template(text) == text
+    assert "<role>HUMAN</role><IMAGE>edit this image<eos>" in processor._apply_image_generation_template(
+        "edit this image",
+        has_reference_image=True,
+    )
+
+
+def test_multimodal_processor_applies_generation_template(monkeypatch: pytest.MonkeyPatch):
+    template_calls = []
+
+    def _format(prompt, *, has_reference_image):
+        template_calls.append((prompt, has_reference_image))
+        return "formatted prompt"
+
+    tokenizer = SimpleNamespace(
+        decode=lambda token_ids, **kwargs: "edit this image",
+        encode=lambda text, **kwargs: [101, 102],
+    )
+    processor = MingImageMultiModalProcessor.__new__(MingImageMultiModalProcessor)
+    processor.info = SimpleNamespace(
+        get_tokenizer=lambda: tokenizer,
+        get_hf_processor=lambda: SimpleNamespace(_apply_image_generation_template=_format),
+    )
+    captured = {}
+
+    def _parent_apply(_self, inputs, timing_ctx):
+        captured["inputs"] = inputs
+        return "processed"
+
+    monkeypatch.setattr(MingFlashOmniThinkerMultiModalProcessor, "apply", _parent_apply)
+    inputs = ProcessorInputs(
+        prompt=[11, 12],
+        mm_data_items=None,
+        hf_processor_mm_kwargs={"modalities": ["img2img"]},
+    )
+
+    assert processor.apply(inputs, None) == "processed"
+    assert template_calls == [("edit this image", True)]
+    assert captured["inputs"].prompt == [101, 102]
+    assert captured["inputs"].hf_processor_mm_kwargs["modalities"] == ["image"]
+
+
+@pytest.mark.parametrize(
+    ("pipeline_config", "expected_class_name"),
+    ((MING_IMAGE_PIPELINE, "MingImageDiffusionPipeline"), (None, None)),
+)
+def test_engine_od_config_falls_back_to_registered_pipeline_class(monkeypatch, pipeline_config, expected_class_name):
+    # Ming-Image ships neither a root config.json nor model_index.json for now,
+    # so class-name resolution returns None; serving must still find the extras (e.g. num_layers).
+    monkeypatch.setattr("vllm_omni.diffusion.data.resolve_model_class_name", lambda model, **kwargs: None)
+    engine = object.__new__(AsyncOmniEngine)
+    engine.model = "inclusionAI/Ming-Image-0.1-Design-Layer"
+    engine.pipeline_config = pipeline_config
+    engine._diffusion_od_config_view = None
+
+    od_config = engine.get_diffusion_od_config()
+
+    assert od_config.model_class_name == expected_class_name
+    assert ("num_layers" in get_extra_body_params(od_config.model_class_name)) is (expected_class_name is not None)
+    assert engine.get_diffusion_od_config() is od_config
+
+
 def test_two_stage_topology_and_request_metadata():
     assert MING_IMAGE_PIPELINE.model_type == "ming_image"
     assert [stage.model_stage for stage in MING_IMAGE_PIPELINE.stages] == ["mllm", "dit"]
@@ -168,6 +263,8 @@ def test_two_stage_topology_and_request_metadata():
     assert MING_IMAGE_PIPELINE.hf_architectures == ("MingImageForConditionalGeneration",)
     for class_name in MING_IMAGE_PIPELINE.diffusers_class_aliases + (MING_IMAGE_PIPELINE.diffusers_class_name,):
         assert "num_layers" in get_extra_body_params(class_name)
+        assert "steps" not in get_extra_body_params(class_name)
+        assert "cfg" not in get_extra_body_params(class_name)
         assert should_init_extra_args_for_non_diffusion_stages(class_name)
 
 

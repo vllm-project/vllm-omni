@@ -1889,10 +1889,11 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         skipped_allgather = bool(allgather_hooks) and not restore_allgather_weights
         if skipped_allgather:
             # Startup rollback cannot safely enter a collective that a failed
-            # peer may never reach. Those blocks cannot be reconstructed, so
-            # make accidental reuse explicit instead of accepting zero weights.
+            # peer may never reach, and shutdown has no later user. Those blocks
+            # cannot be reconstructed, so make accidental reuse explicit
+            # instead of accepting zero weights.
             self._poisoned_reason = (
-                "Distributed layerwise offload startup skipped AllGather weight restoration; "
+                "Distributed layerwise offload skipped AllGather weight restoration; "
                 "recreate the backend and reload the pipeline before retrying"
             )
 
@@ -1980,6 +1981,11 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
 
     def disable(self) -> None:
         self._disable(restore_allgather_weights=True)
+
+    def shutdown(self) -> None:
+        # Restoring AllGather blocks rebuilds the full DiT in every rank's host
+        # memory, which can outlast the executor's shutdown grace period.
+        self._disable(restore_allgather_weights=False)
 
     @staticmethod
     def _allocate_shared_buffers(

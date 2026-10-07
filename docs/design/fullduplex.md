@@ -220,6 +220,7 @@ vllm_omni/
 │       │                            DUPLEX_REALTIME_CAPABILITIES, duplex_response_format
 │       ├── events.py                re-export shim (DuplexEvent = RealtimeEvent) + the runner's
 │       │                            epoch-filter sets DOMAIN_TERMINAL_EVENTS / MODEL_OUTPUT_EVENTS
+│       ├── delivery.py              DuplexOutputBuffer (bounded output shared with the session handle)
 │       ├── realtime_events.py       RealtimeProjectionState: internal event -> typed events
 │       ├── messages.py              queue envelopes (Open/Close/Resume/Touch/Command/Result/Event), DuplexSessionError
 │       ├── config.py                DuplexSessionConfig, DuplexCapabilities, ResponseCreateOptions
@@ -242,10 +243,12 @@ vllm_omni/
 │           └── overlap_policy.py / commit_policy.py / playback_ledger.py
 ├── config/stage_config.py           PipelineConfig.duplex_plugin; DuplexSessionRuntimeConfig
 ├── model_executor/models/minicpmo_4_5/duplex/plugin.py   MiniCPMO45DuplexPlugin (+ data_plane, input, policy, ...)
+├── model_executor/models/nemotron_voicechat/duplex/plugin.py   NemotronVoiceChatDuplexPlugin (+ data_plane, input, capabilities)
 └── clients/
     ├── duplex.py                    DuplexClientBase (ABC), DuplexClient (websocket), client-side events
     ├── inline_duplex.py             InlineDuplexClient (in-process, over DuplexOmni)
     ├── minicpmo_4_5.py              MiniCPM-o 4.5 session preset
+    ├── nemotron_voicechat.py        Nemotron VoiceChat session preset
     └── personaplex.py               PersonaPlex session preset
 ```
 
@@ -282,9 +285,15 @@ command  handle.submit(DuplexCommand)
          -> engine.submit_command_async -> DuplexSessionCommandMessage on the request queue [one-way]
          -> DuplexSessionManager.dispatch: unknown_session / input_backpressure checks, then runner mailbox
 output   DuplexOrchestrator._intercept_stage_output -> runner.on_stage_output -> mailbox -> typed events
-         -> output_sink (DuplexSessionEventMessage) -> DuplexOmni._route_engine_message -> handle.events()
-detach   DuplexOmni.detach_session -> touch(DETACH): engine-owned disconnect grace; expiry -> SessionExpired
-resume   DuplexOmni.resume_session(expected_lease_generation) -> lease CAS; the existing handle is re-entered
+         -> session's bounded output buffer -> handle.events(); closure and errors without a live session
+            use output_sink (DuplexSessionEventMessage) -> DuplexOmni._route_engine_message
+detach   DuplexOmni.detach_session(expected_lease_generation) -> touch(DETACH): engine-owned disconnect
+         grace, refused for a lease newer than the one the caller held; expiry -> SessionExpired
+resume   DuplexOmni.resume_session(expected_lease_generation) -> lease CAS keyed by the control id (a replay
+         answers with the generation it produced); the existing handle is re-entered. A caller cancelled
+         mid-RPC observes the outcome afterwards (replaying until the engine answers) and settles a landed
+         resume: the generation goes to the resume waiting to activate, else to the connection still
+         attached, else the lease is detached again
 close    DuplexOmni.close_session -> close RPC; the manager tears the runner down, then the stage cleanup
          (abort submitted requests, release reserved ids), then SessionClosed, then the RPC result.
          SessionClosed is emitted after the cleanup attempt (in a finally), so it is also sent when the
@@ -296,7 +305,9 @@ reap     DuplexSessionManager.reaper_loop: idle TTL / disconnect grace expiry, c
 
 ### Concurrency and ordering model of the runner
 
-Everything below runs on the orchestrator asyncio loop; there is no lock.
+The runner's session state is owned by the orchestrator asyncio loop and
+needs no lock. The output buffer shared with the caller thread uses a lock
+for queue updates and the final validity check before delivery.
 
 - **Single writer per session.** `DuplexEngineSession` is mutated only by its
   runner. Inputs reach the runner through one mailbox in this order: client
@@ -325,13 +336,15 @@ Everything below runs on the orchestrator asyncio loop; there is no lock.
   on one loop in program order, nothing can be emitted for an old epoch after
   its terminal event; `runner.emit()` still drops a terminal carrying a stale
   epoch and stamps `epoch` on every event for clients that filter
-  defensively. This is a statement about order, not about latency: the engine
-  output queue and each `DuplexSessionHandle` outbox are unbounded and FIFO,
-  so a cancellation is delivered behind whatever audio was already emitted for
-  the response it cancels. A client that must stop quickly cancels its own
-  playback on `response.done` / `audio.cancelled` rather than waiting for the
-  stream to drain. Bounding those buffers and letting an accepted invalidation
-  skip undelivered media is left to the follow-up RFC.
+  defensively. In this experimental follow-up, public output goes directly to
+  one bounded buffer shared by the engine and `DuplexSessionHandle`. Accepted
+  cancellation removes queued `AudioDelta` events for that response through
+  the cancelled epoch. Text increments, audio/transcript completion markers,
+  other responses and normal completion retain FIFO order. The consumer also
+  checks an event already taken from the buffer: WebSocket delivery repeats
+  that check under the connection lock, before sequencing and journaling.
+  Already sequenced replay entries are unchanged; already delivered audio
+  still requires the client to stop its own playback.
 - **Backpressure before the mailbox.** `DuplexSessionManager.dispatch`
   checks `max_pending_input_bytes_per_session` and reserves a pending turn for
   `Commit` before the put; a rejected command is answered with
@@ -341,6 +354,46 @@ Everything below runs on the orchestrator asyncio loop; there is no lock.
   accumulates the snapshot into the active response, so
   `ResponseDone.stage_metrics` and `metadata.vllm_omni.stage_metrics` on the
   wire keep their meaning.
+
+### Experimental output limits
+
+`max_pending_output_bytes_per_session` defaults to 2 MiB and
+`max_pending_output_events_per_session` to 512. The byte limit counts compact
+Realtime JSON, including base64 audio, not decoded PCM or Python object
+overhead. Audio is already base64-encoded by the producer; counting its length
+avoids serializing or decoding that large field again. Neither default has
+been tuned from a performance study.
+
+Errors and response endings have an additional 64 KiB / eight-event reserve
+and retain FIFO order. One final session-closure notification has an independent
+slot, so an exhausted reserve cannot prevent closure or break delivery to
+other sessions. If that reserve also fills, an error or response-ending
+notification may be omitted; the final session-closure notification still
+has its independent slot. Oversized close details (over 4 KiB with generated identity)
+are replaced by a compact reason, preserving terminal type and identity.
+Late writes after closure are ignored; a locally ended iterator is not reopened
+by a late terminal, and a failed open closes the abandoned handle. Events other
+than errors are not forwarded once their session's buffer has been removed.
+One event held by the consumer is outside the queued budget.
+
+The overflow policy fails the active response without committing its partial
+text to history and closes only the affected session. If overflow occurs while
+a completion batch is being delivered, its not-yet-queued `ResponseDone` is
+converted to failure with its identity and output preserved; any history entry
+for that response is removed. An ending already accepted by the buffer is not
+replaced or followed by a second ending. After overflow, newly
+emitted ordinary events are suppressed, including text/audio completion,
+content-part and output-item completion markers. Previously queued non-audio
+events retain FIFO order; error and failed response-ending notifications may
+use the reserve before the independent closure notification. This differs from
+accepted cancellation, which removes only matching audio. See the
+[public error and closure fields](../serving/realtime_duplex_api.md#output-limits-and-slow-consumers).
+Response-only recovery is not implemented. These limits do not bound the runner's raw stage
+output mailbox, replay journal, or client playback queues. The shared buffer
+requires the current same-process, separate-thread engine arrangement; it is
+not a cross-process delivery protocol. Direct handle iteration and WebSocket
+delivery share buffer validity, but end-to-end client behavior still needs
+independent real-model verification.
 
 ## Orchestrator seams
 
@@ -383,7 +436,7 @@ policy that used to be two separately configured objects:
 | Half | Members |
 | --- | --- |
 | engine policy | `configure_sampling_params(runtime_config, defaults)`, `plan_append(...) -> DuplexAppendPlan` (the resumable Stage0 prompt for one unit), `decide_output(...) -> DuplexOutputDecision \| None` (e.g. the listen decision on a finished Stage0 segment) |
-| session policy | `capabilities(max_sessions)`, `validate_client_extra_body`, `prepare_runtime_config(config, model_config)` (server-owned runtime keys, reference audio resolution), `runtime_config_for_update`, `runtime_config_for_function_output`, `create_session_state() -> DuplexModelSessionState`, `data_plane: DuplexDataPlane` (projects raw stage outputs into internal events), `data_plane_context(...)` |
+| session policy | `capabilities(max_sessions)`, `validate_client_extra_body`, `prepare_runtime_config(config, model_config)` (server-owned runtime keys, reference audio resolution), `runtime_config_for_update`, `runtime_config_for_function_output`, `runtime_config_after_model_output` (consumption acknowledgement), `create_session_state() -> DuplexModelSessionState`, `data_plane: DuplexDataPlane` (projects raw stage outputs into internal events), `data_plane_context(...)` |
 
 `DuplexOmniEngine._validate_deployment` loads the plugin before any stage
 starts; `DuplexSessionManager.__init__` validates it against the stage
@@ -391,12 +444,12 @@ sampling defaults once the stage pools exist. Plugin hooks that may block
 (`prepare_runtime_config` fetching `ref_audio`) are awaited in `open()` and
 offloaded from the loop.
 
-The MiniCPM-o 4.5 plugin (`model_executor/models/minicpmo_4_5/duplex/plugin.py`)
-is the only integration in this framework version. PersonaPlex and Nemotron
-VoiceChat still carry their pre-framework duplex code (runtime extension plus
-serving adapter) and are therefore not served over this framework yet: their
-pipelines declare no `duplex_plugin`, so they run turn-based until the
-follow-up PRs port them (RFC vllm-omni#7181, PR 2/3).
+Frame-based plugins use `engine/duplex/intermediate.py::build_duplex_append_prompt`
+for the shared request identity, sequencing and config snapshots. Token budgets,
+PCM framing and model-specific worker fields remain in the plugins.
+
+See [supported models and deployments](../serving/full_duplex_api.md#enable-full-duplex)
+for the current plugin integrations and deployment configurations.
 
 ## Serving
 
