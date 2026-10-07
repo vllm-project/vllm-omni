@@ -23,6 +23,7 @@ These helpers intentionally do not create or own process groups.
 
 from __future__ import annotations
 
+import functools
 from collections.abc import Iterable
 from dataclasses import dataclass
 
@@ -247,6 +248,7 @@ def scatter_heads_gather_seqlen(
     Each input is ``[S_rank, world*H_i, D]`` and each output is
     ``[sum(S_r), H_i, D]``.  Fusing Q/K/V into one all-to-all preserves the
     reference communication ordering and avoids three independent collectives.
+    Each input is copied once, straight into its head slice of the send buffer.
     """
 
     group = group or get_magi2_ulysses_group()
@@ -260,22 +262,31 @@ def scatter_heads_gather_seqlen(
         raise ValueError("split_sizes length must equal the Ulysses world size")
     if any(t.ndim != 3 or t.shape[0] != local_tokens for t in tensors):
         raise ValueError("all Ulysses inputs must be [local_tokens, heads, dim]")
+    if any(t.device != tensors[0].device for t in tensors):
+        raise ValueError("all Ulysses inputs must be on the same device")
 
-    reshaped: list[torch.Tensor] = []
     local_head_counts: list[int] = []
     head_dim = tensors[0].shape[-1]
     for tensor in tensors:
         if tensor.shape[-1] != head_dim or tensor.shape[1] % group.world_size:
             raise ValueError("attention heads must divide evenly across Ulysses ranks")
-        local_heads = tensor.shape[1] // group.world_size
-        local_head_counts.append(local_heads)
-        reshaped.append(
-            tensor.view(local_tokens, group.world_size, local_heads, head_dim)
-            .permute(1, 0, 2, 3)
-            .reshape(group.world_size * local_tokens, local_heads, head_dim)
-        )
+        local_head_counts.append(tensor.shape[1] // group.world_size)
 
-    fused = torch.cat(reshaped, dim=1).contiguous()
+    # Destination rank first; each row holds that rank's head shard of every
+    # input in order, in the inputs' promoted dtype.
+    fused_heads = sum(local_head_counts)
+    fused = torch.empty(
+        (group.world_size, local_tokens, fused_heads, head_dim),
+        dtype=functools.reduce(torch.promote_types, (t.dtype for t in tensors)),
+        device=tensors[0].device,
+    )
+    start = 0
+    for tensor, local_heads in zip(tensors, local_head_counts, strict=True):
+        fused[:, :, start : start + local_heads].copy_(
+            tensor.view(local_tokens, group.world_size, local_heads, head_dim).transpose(0, 1)
+        )
+        start += local_heads
+    fused = fused.view(group.world_size * local_tokens, fused_heads, head_dim)
     output = torch.empty(
         (sum(split_sizes), fused.shape[1], head_dim),
         dtype=fused.dtype,
