@@ -23,6 +23,7 @@ import torch.nn as nn
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention
+from vllm_omni.platforms import current_omni_platform
 
 from .attention import Magi2PackedAttentionKernel, VarlenHandler, apply_rotary_emb
 from .configuration_magi2 import Magi2PreviewConfig
@@ -111,6 +112,8 @@ class Magi2Attention(nn.Module):
         # uneven Ulysses splits require a model kernel. Route it through the
         # framework Attention layer so compile/dispatch ownership remains
         # shared while the model kernel owns its specialized communication.
+        # On MUSA the kernel returns its Ulysses output as [T, world, H, D]
+        # head shards, which the compiled output() gathers in place.
         self.packed_attention = Attention(
             num_heads=self.num_heads_q,
             num_kv_heads=self.num_heads_kv,
@@ -120,7 +123,10 @@ class Magi2Attention(nn.Module):
             qkv_layout="THD",
             skip_sequence_parallel=True,
             disable_kv_quant=True,
-            custom_attention=Magi2PackedAttentionKernel(config.attention_softcap),
+            custom_attention=Magi2PackedAttentionKernel(
+                config.attention_softcap,
+                head_shard_output=current_omni_platform.is_musa(),
+            ),
         )
 
     def _shard_sinks(self, checkpoint_tensor: torch.Tensor) -> torch.Tensor:
@@ -189,6 +195,9 @@ class Magi2Attention(nn.Module):
         modality_dispatcher: ModalityDispatcher,
     ) -> torch.Tensor:
         output = modality_dispatcher.permute(attention)
+        if output.ndim == 4:
+            # [T, world, H, D] Ulysses head shards, in head order.
+            output = output.flatten(1, 2)
         output = output * torch.sigmoid(gates)
         output = output.reshape(-1, self.q_size).to(self.config.params_dtype)
         return self.linear_proj(output, modality_dispatcher)
