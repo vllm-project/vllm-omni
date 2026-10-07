@@ -266,6 +266,37 @@ class CostAwareBalancer(LoadBalancer):
         self._lock = threading.Lock()
         # request_id -> (replica input_addr, estimated_cost)
         self._reservations: dict[str, tuple[str, float]] = {}
+        self._request_ids_by_addr: dict[str, set[str]] = {}
+        self._work_by_addr: dict[str, float] = {}
+        self._count_by_addr: dict[str, int] = {}
+        self._total_work = 0.0
+        self._total_count = 0
+
+    def _drop_reservation_locked(self, request_id: str) -> None:
+        reservation = self._reservations.pop(request_id, None)
+        if reservation is None:
+            return
+        addr, cost = reservation
+        request_ids = self._request_ids_by_addr[addr]
+        request_ids.remove(request_id)
+        count = self._count_by_addr[addr]
+        if count == 1:
+            self._request_ids_by_addr.pop(addr)
+            self._work_by_addr.pop(addr)
+            self._count_by_addr.pop(addr)
+        else:
+            self._work_by_addr[addr] -= cost
+            self._count_by_addr[addr] = count - 1
+        self._total_work -= cost
+        self._total_count -= 1
+
+    def _reserve_locked(self, request_id: str, addr: str, cost: float) -> None:
+        self._reservations[request_id] = (addr, cost)
+        self._request_ids_by_addr.setdefault(addr, set()).add(request_id)
+        self._work_by_addr[addr] = self._work_by_addr.get(addr, 0.0) + cost
+        self._count_by_addr[addr] = self._count_by_addr.get(addr, 0) + 1
+        self._total_work += cost
+        self._total_count += 1
 
     def select(self, task: Task, replicas: list[ReplicaInfo]) -> int:
         if not replicas:
@@ -282,32 +313,26 @@ class CostAwareBalancer(LoadBalancer):
         with self._lock:
             # Idempotent re-selection: drop any prior reservation for this id.
             if request_id is not None:
-                self._reservations.pop(request_id, None)
+                self._drop_reservation_locked(request_id)
 
             # Prune reservations for replicas that are no longer present.
             present_addrs = {rep.input_addr for rep in replicas}
-            stale_ids = [rid for rid, (addr, _) in self._reservations.items() if addr not in present_addrs]
-            for rid in stale_ids:
-                self._reservations.pop(rid, None)
-
-            # Aggregate locally tracked work and request count per replica.
-            local_work: dict[str, float] = {}
-            local_count: dict[str, int] = {}
-            for addr, c in self._reservations.values():
-                local_work[addr] = local_work.get(addr, 0.0) + c
-                local_count[addr] = local_count.get(addr, 0) + 1
+            stale_addrs = set(self._request_ids_by_addr).difference(present_addrs)
+            for addr in stale_addrs:
+                for stale_id in tuple(self._request_ids_by_addr[addr]):
+                    self._drop_reservation_locked(stale_id)
 
             # Representative cost for coordinator-reported unknown work.
-            if self._reservations:
-                representative_cost = sum(c for _, c in self._reservations.values()) / len(self._reservations)
+            if self._total_count:
+                representative_cost = self._total_work / self._total_count
             else:
                 representative_cost = cost
 
             effective_loads: list[float] = []
             for rep in replicas:
                 addr = rep.input_addr
-                tracked_work = local_work.get(addr, 0.0)
-                tracked_count = local_count.get(addr, 0)
+                tracked_work = self._work_by_addr.get(addr, 0.0)
+                tracked_count = self._count_by_addr.get(addr, 0)
                 unknown_count = max(rep.queue_length - tracked_count, 0)
                 effective_loads.append(tracked_work + unknown_count * representative_cost)
 
@@ -322,13 +347,13 @@ class CostAwareBalancer(LoadBalancer):
 
             chosen = random.choice(candidates)
             if request_id is not None:
-                self._reservations[request_id] = (replicas[chosen].input_addr, cost)
+                self._reserve_locked(request_id, replicas[chosen].input_addr, cost)
             return chosen
 
     def release(self, request_id: str) -> None:
         """Forget the reservation for ``request_id`` (no-op if unknown)."""
         with self._lock:
-            self._reservations.pop(request_id, None)
+            self._drop_reservation_locked(request_id)
 
 
 __all__ = [

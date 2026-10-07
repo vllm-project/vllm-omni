@@ -393,6 +393,11 @@ def test_cost_aware_release_removes_reservation():
     balancer.select({"request_id": "r1", "estimated_cost": 100.0}, replicas)
     balancer.release("r1")
     assert "r1" not in balancer._reservations
+    assert balancer._request_ids_by_addr == {}
+    assert balancer._work_by_addr == {}
+    assert balancer._count_by_addr == {}
+    assert balancer._total_work == 0.0
+    assert balancer._total_count == 0
 
 
 def test_cost_aware_reselection_is_idempotent():
@@ -411,6 +416,8 @@ def test_cost_aware_does_not_reserve_without_request_id():
     replicas = [_replica("a"), _replica("b")]
     balancer.select({"estimated_cost": 10.0}, replicas)
     assert balancer._reservations == {}
+    assert balancer._total_work == 0.0
+    assert balancer._total_count == 0
 
 
 def test_cost_aware_prunes_disappeared_replicas(monkeypatch):
