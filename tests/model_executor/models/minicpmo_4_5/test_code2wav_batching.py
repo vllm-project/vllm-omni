@@ -173,6 +173,36 @@ def _config(minimum: int = 1, initial: int = 0, *, runtime_prompt_cache_size: in
 
 
 @pytest.mark.parametrize(
+    ("cuda", "extra", "env", "expected"),
+    [
+        (True, {}, None, True),
+        (False, {}, None, False),
+        (True, {"cfm_fused_body": False}, None, False),
+        (True, {"token2wav_allow_tf32": False}, None, False),
+        (True, {"code2wav_allow_tf32": False}, None, False),
+        (True, {}, "off", False),
+        (True, {"token2wav_allow_tf32": False}, "tf32", True),
+        (True, {"cfm_fused_body": True, "token2wav_allow_tf32": False}, None, True),
+    ],
+)
+def test_cfm_fused_body_default_respects_platform_and_precision(monkeypatch, cuda, extra, env, expected):
+    from vllm_omni.platforms import current_omni_platform
+
+    monkeypatch.setattr(current_omni_platform, "is_cuda", lambda: cuda)
+    monkeypatch.delenv("MINICPMO_CODE2WAV_TF32", raising=False)
+    if env is not None:
+        monkeypatch.setenv("MINICPMO_CODE2WAV_TF32", env)
+    config = _config()
+    config.model_config.stage_connector_config["extra"].update(extra)
+
+    model = MiniCPMO45Code2Wav(vllm_config=config)
+
+    assert model._cfm_graph_config["fused_body"] is expected
+    assert model._cfm_graph_config["slot_pool"] is False
+    assert model._cfm_graph_config["row_offset_merge"] is False
+
+
+@pytest.mark.parametrize(
     ("extra", "max_num_seqs", "micro"),
     [
         ({}, 6, 6),

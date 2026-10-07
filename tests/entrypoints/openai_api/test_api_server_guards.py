@@ -1053,7 +1053,8 @@ async def test_pure_diffusion_speech_forwards_media_access_args(monkeypatch, tmp
 
 
 @pytest.mark.asyncio
-async def test_multistage_app_state_key_snapshot(monkeypatch, tmp_path) -> None:
+@pytest.mark.parametrize("supported_tasks", [("generate",), ("embed",)])
+async def test_multistage_app_state_key_snapshot(monkeypatch, mocker, tmp_path, supported_tasks) -> None:
     """Lock multi-stage ``app.state`` keys after init, including live vs None.
 
     Fails if chat/speech/video/realtime/tokenization keys disappear or are
@@ -1068,6 +1069,7 @@ async def test_multistage_app_state_key_snapshot(monkeypatch, tmp_path) -> None:
             parallel_config=SimpleNamespace(_api_process_rank=0),
         ),
     )
+    mocker.patch.object(engine, "get_supported_tasks", return_value=supported_tasks)
 
     class _FakeModels:
         def __init__(self, *args, **kwargs):
@@ -1078,10 +1080,12 @@ async def test_multistage_app_state_key_snapshot(monkeypatch, tmp_path) -> None:
 
     class _FakeCtor:
         def __init__(self, *args, **kwargs):
-            pass
+            self.args = args
+            self.kwargs = kwargs
+            self.warmup_calls = 0
 
         def warmup(self):
-            return None
+            self.warmup_calls += 1
 
     deploy = tmp_path / "deploy.yaml"
     deploy.write_text("speech_cache:\n  resolve_max_bytes: 1024\n  speaker_max_bytes: 8\n")
@@ -1119,17 +1123,33 @@ async def test_multistage_app_state_key_snapshot(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(api_server, "OmniOpenAIServingVideo", _FakeCtor)
 
     state = State()
-    await api_server.omni_init_app_state(engine, state, _minimal_args())
+    await api_server.omni_init_app_state(engine, state, _minimal_args(log_error_stack=True))
     assert speech_kwargs["speech_cache_config"].resolve_max_bytes == 1024
     assert speech_kwargs["speech_cache_config"].resolve_max_entries == 2048
     assert speech_kwargs["speech_cache_config"].speaker_max_bytes == 8
 
+    disabled = (
+        set()
+        if "generate" in supported_tasks
+        else {"openai_serving_chat", "openai_serving_chat_batch", "openai_streaming_video"}
+    )
     _assert_app_state_snapshot(
         state,
         expected_keys=_MULTISTAGE_APP_STATE_KEYS,
-        must_be_wired=_MULTISTAGE_MUST_BE_WIRED,
-        must_be_none=_MULTISTAGE_MUST_BE_NONE,
+        must_be_wired=_MULTISTAGE_MUST_BE_WIRED - disabled,
+        must_be_none=_MULTISTAGE_MUST_BE_NONE | disabled,
     )
+    assert state.online_renderer.kwargs["log_error_stack"] is True
+    assert state.online_renderer.warmup_calls == 1
+    for service in (state.openai_serving_chat, state.openai_serving_chat_batch):
+        if "generate" in supported_tasks:
+            assert service.kwargs["online_renderer"] is state.online_renderer
+        else:
+            assert service is None
+    if "generate" in supported_tasks:
+        assert state.openai_serving_responses.args[2] is state.online_renderer
+    else:
+        assert state.openai_serving_responses is None
 
 
 @pytest.mark.parametrize("count", [None, 0, -1, "2", True])

@@ -23,3 +23,14 @@ performance or interruption correctness.
 The shared asynchronous output snapshot and batched Talker preprocessing also
 apply to V1 when async chunking/scheduling is enabled. Default V1 behavior must
 therefore be included in end-to-end regression validation.
+
+CFM graph execution defaults to the fused DiT body on CUDA when TF32 is
+allowed. NVIDIA SM80+ uses tiled TF32 attention; older CUDA devices use the
+fused body's SDPA fallback. Unsupported DiT layouts or non-FP32 attention
+caches retain the original body. Other platforms retain their existing default.
+Set `cfm_fused_body: false` in connector `extra` to restore the original body.
+Disabling TF32 with `token2wav_allow_tf32: false` or
+`MINICPMO_CODE2WAV_TF32=off` also disables the default fusion choice; an explicit
+`cfm_fused_body: true` overrides that choice and may use TF32 attention.
+Slot pooling and row-offset merging remain opt-in. Fusion changes floating-point
+rounding and does not promise identical waveforms.
