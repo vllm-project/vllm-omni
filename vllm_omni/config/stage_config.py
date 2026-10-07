@@ -340,6 +340,7 @@ class PipelineConfig:
     # Bundled deploy defaults for this concrete pipeline topology. The file is
     # loaded from vllm_omni/deploy; None uses DeployConfig defaults.
     default_deploy_config_name: str | None = None
+    chat_template: str | None = None
     # Global CLI spelling -> (stage id, stage-local spelling).
     stage_cli_aliases: dict[str, tuple[int, str]] = field(default_factory=dict)
 

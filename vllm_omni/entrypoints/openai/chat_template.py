@@ -53,3 +53,23 @@ def _load_model_chat_template_json(model: str) -> str | None:
 
     logger.info("Loaded chat template from %s", template_path)
     return template
+
+
+def load_pipeline_chat_template(
+    model: str,
+    *,
+    trust_remote_code: bool = False,
+    deploy_config_path: str | None = None,
+) -> str | None:
+    from vllm_omni.config.config_factory import StageConfigFactory
+
+    try:
+        pipeline_config = StageConfigFactory.get_pipeline_config(
+            model=model,
+            trust_remote_code=trust_remote_code,
+            deploy_config_path=deploy_config_path,
+        )
+    except Exception as exc:
+        logger.debug("Could not resolve a pipeline chat template for %s: %s", model, exc)
+        return None
+    return getattr(pipeline_config, "chat_template", None)
