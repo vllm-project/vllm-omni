@@ -14,6 +14,7 @@ portable reference and the MUSA fallback.
 from __future__ import annotations
 
 import os
+import weakref
 from dataclasses import dataclass
 from functools import cache
 
@@ -112,16 +113,25 @@ def apply_rotary_emb(
     return torch.cat((rotated, x[..., rotary_dim:]), dim=-1)
 
 
+def _sink_lse(sink: torch.Tensor) -> torch.Tensor:
+    """Return the FP32 ``[1,H]`` log-sum-exp of sink logits ``[num_sink,H]``."""
+
+    return torch.logsumexp(sink.float(), dim=0).unsqueeze(0)
+
+
 def correct_out_lse_with_sink(
     out: torch.Tensor,
     lse: torch.Tensor,
     sink: torch.Tensor | None,
+    *,
+    sink_lse: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Add zero-valued attention sinks to an already-computed softmax.
 
     FlashAttention returns ``out[T,H,D]`` and conventionally ``lse[H,T]``.
     A MAGI sink contains additional logits ``[num_sink,H]`` whose values are
-    zero vectors, so only the denominator and LSE change.
+    zero vectors, so only the denominator and LSE change. ``sink_lse``, when
+    given, must be ``_sink_lse(sink)`` computed for this same sink.
     """
 
     if sink is None or sink.numel() == 0:
@@ -132,14 +142,75 @@ def correct_out_lse_with_sink(
             f"{tuple(out.shape)}, {tuple(lse.shape)}, {tuple(sink.shape)}"
         )
     old_lse = lse.float().transpose(0, 1)
-    sink_lse = torch.logsumexp(sink.float(), dim=0).unsqueeze(0)
+    if sink_lse is None:
+        sink_lse = _sink_lse(sink)
     if old_lse.shape[-1] != sink_lse.shape[-1]:
         raise ValueError("attention sink and FlashAttention head counts differ")
     new_lse = torch.logaddexp(old_lse, sink_lse)
     delta = old_lse - new_lse
-    delta = torch.where(torch.isfinite(delta), delta, torch.full_like(delta, -torch.inf))
+    if delta.requires_grad:
+        delta = torch.where(torch.isfinite(delta), delta, torch.full_like(delta, -torch.inf))
+    else:
+        # The same select in one kernel: NaN and infinite deltas become -inf. The
+        # token-major output lets the multiply below read the scale without a copy.
+        delta = torch.nan_to_num(
+            delta, nan=-torch.inf, posinf=-torch.inf, neginf=-torch.inf, out=delta.new_empty(delta.shape)
+        )
     corrected = out * torch.exp(delta).unsqueeze(-1).to(out.dtype)
     return corrected, new_lse.transpose(0, 1).contiguous()
+
+
+def _rank_sink(sink: torch.Tensor, group: Magi2ParallelGroup) -> torch.Tensor:
+    """Select this rank's sink heads after the Ulysses head exchange."""
+
+    if group.world_size == 1:
+        return sink
+    if sink.shape[-1] % group.world_size:
+        raise ValueError("attention sink heads must divide across Ulysses ranks")
+    return torch.chunk(sink, group.world_size, dim=-1)[group.rank].contiguous()
+
+
+class _SinkLseCache:
+    """One layer's rank-local sink log-sum-exp, reused across forward calls.
+
+    The entry is reused only for the same sink tensor with an unchanged version
+    counter, storage, layout, device and Ulysses rank. It holds a weak reference
+    to the sink. Inference tensors have no version counter, so for them the
+    storage stands in for it. Writes that bypass the version counter, through
+    ``.data`` or in place on an inference tensor, are not detected. ``get``
+    returns ``None`` (compute per call) while compiling, for tensor subclasses
+    and while grad mode is enabled.
+    """
+
+    def __init__(self) -> None:
+        self._sink: weakref.ReferenceType[torch.Tensor] | None = None
+        self._key: tuple | None = None
+        self._sink_lse: torch.Tensor | None = None
+
+    def get(self, sink: torch.Tensor | None, group: Magi2ParallelGroup) -> torch.Tensor | None:
+        if (
+            sink is None
+            or sink.numel() == 0
+            or torch.compiler.is_compiling()
+            or type(sink) not in (torch.Tensor, nn.Parameter)
+            or torch.is_grad_enabled()
+        ):
+            return None
+        key = (
+            None if sink.is_inference() else sink._version,
+            sink.data_ptr(),
+            sink.device,
+            sink.dtype,
+            tuple(sink.shape),
+            sink.stride(),
+            group.rank,
+            group.world_size,
+        )
+        if self._sink is None or self._sink() is not sink or self._key != key:
+            self._sink_lse = _sink_lse(_rank_sink(sink, group))
+            self._sink = weakref.ref(sink)
+            self._key = key
+        return self._sink_lse
 
 
 def _repeat_kv_heads(tensor: torch.Tensor, query_heads: int) -> torch.Tensor:
@@ -208,8 +279,13 @@ def packed_attention_with_sink(
     *,
     softcap: float = -1.0,
     sink: torch.Tensor | None = None,
+    sink_lse: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Run packed attention on one rank after Ulysses head exchange."""
+    """Run packed attention on one rank after Ulysses head exchange.
+
+    ``sink_lse`` optionally carries ``_sink_lse(sink)`` for the FlashAttention
+    sink correction; the Torch reference reads ``sink`` directly.
+    """
 
     bounds_q, bounds_k, max_q, max_k = varlen.resolved(q.shape[0], k.shape[0])
     cu_q = bounds_q.to(device=q.device, dtype=torch.int32).contiguous()
@@ -227,7 +303,7 @@ def packed_attention_with_sink(
             deterministic=os.environ.get("MAGI2_DETERMINISTIC", "0") == "1",
             fa_version=_resolve_flash_attn_version(),
         )
-        return correct_out_lse_with_sink(out, lse, sink)[0]
+        return correct_out_lse_with_sink(out, lse, sink, sink_lse=sink_lse)[0]
     if (
         current_omni_platform.is_musa()
         and q.device.type == current_omni_platform.device_type
@@ -253,7 +329,7 @@ def packed_attention_with_sink(
             # Correct the learned sinks in FP32; FA3 itself runs in the activation dtype.
             if sink is not None:
                 out = out.float()
-            return correct_out_lse_with_sink(out, lse, sink)[0].to(q.dtype)
+            return correct_out_lse_with_sink(out, lse, sink, sink_lse=sink_lse)[0].to(q.dtype)
         logger.warning_once(
             "MAGI-2 FlashAttention-3 is unavailable on MUSA; using Torch reference attention: %s", unsupported
         )
@@ -279,8 +355,12 @@ def ulysses_packed_attention_with_sink(
     softcap: float = -1.0,
     sink: torch.Tensor | None = None,
     group: Magi2ParallelGroup | None = None,
+    sink_lse: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """MAGI-2 attention with overlapping Ulysses CP/head exchange."""
+    """MAGI-2 attention with overlapping Ulysses CP/head exchange.
+
+    ``sink_lse`` optionally carries this rank's ``_sink_lse`` of ``sink``.
+    """
 
     group = group or get_magi2_ulysses_group()
     if isinstance(split_sizes, torch.Tensor):
@@ -288,10 +368,8 @@ def ulysses_packed_attention_with_sink(
     if group.world_size > 1:
         q, k, v = scatter_heads_gather_seqlen((q, k, v), split_sizes, group)
         if sink is not None:
-            if sink.shape[-1] % group.world_size:
-                raise ValueError("attention sink heads must divide across Ulysses ranks")
-            sink = torch.chunk(sink, group.world_size, dim=-1)[group.rank].contiguous()
-    output = packed_attention_with_sink(q, k, v, varlen, softcap=softcap, sink=sink)
+            sink = _rank_sink(sink, group)
+    output = packed_attention_with_sink(q, k, v, varlen, softcap=softcap, sink=sink, sink_lse=sink_lse)
     if group.world_size > 1:
         output = scatter_seqlen_gather_heads(output.contiguous(), split_sizes, group)
         assert isinstance(output, torch.Tensor)
@@ -304,6 +382,7 @@ class Magi2PackedAttentionKernel(nn.Module):
     def __init__(self, softcap: float) -> None:
         super().__init__()
         self.softcap = softcap
+        self._sink_lse_cache = _SinkLseCache()
 
     def forward(
         self,
@@ -323,6 +402,7 @@ class Magi2PackedAttentionKernel(nn.Module):
             raise TypeError("magi2_split_sizes must be a list or tensor")
         if sink is not None and not isinstance(sink, torch.Tensor):
             raise TypeError("magi2_sink must be a tensor or None")
+        group = get_magi2_ulysses_group()
         return ulysses_packed_attention_with_sink(
             query,
             key,
@@ -331,6 +411,8 @@ class Magi2PackedAttentionKernel(nn.Module):
             split_sizes,
             softcap=self.softcap,
             sink=sink,
+            group=group,
+            sink_lse=self._sink_lse_cache.get(sink, group),
         )
 
 
