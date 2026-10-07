@@ -615,3 +615,101 @@ def test_text_encoder_tp_size_reaches_default_diffusion_parallel_config():
 
     parallel_config = stage_cfg["engine_args"]["parallel_config"]
     assert parallel_config["text_encoder_tp_size"] == 2
+
+
+# For https://github.com/vllm-project/vllm-omni/issues/8503
+# The non-parallel diffusion engine args the serve CLI registers on
+# OrchestratorArgs and the stage engine consumes. Values differ from the
+# OmniDiffusionConfig defaults so a silently reset field fails the check.
+DIFFUSION_NON_PARALLEL_ENGINE_ARGS = [
+    ("num_gpus", 4),
+    ("model_class_name", "WanPipeline"),
+    ("hsdp_weight_load_strategy", "shard"),
+    ("diffusion_load_format", "dummy"),
+    ("lora_path", ["./lora.safetensors"]),
+    ("lora_backend", "distill"),
+    ("lora_scale", 0.5),
+    ("diffusers_load_kwargs", '{"local_files_only": true}'),
+    ("diffusers_call_kwargs", '{"num_inference_steps": 20}'),
+    ("diffusion_quantization_config", "fp8"),
+    ("diffusion_attention_backend", "SDPA"),
+    ("fastvideo_vsa_topk", 96),
+    ("diffusion_attention_config", '{"default": {"backend": "SDPA"}}'),
+    ("diffusion_compile_granularity", "whole"),
+    ("diffusion_compile_dynamic", False),
+    ("cache_backend", "tea_cache"),
+    ("cache_config", '{"steps": [1, 2]}'),
+    ("video_output_transport", {"backend": "zmq"}),
+    ("enable_cache_dit_summary", True),
+    ("step_execution", True),
+    ("vae_use_slicing", True),
+    ("vae_use_tiling", True),
+    ("vae_fast_path", "channels_last"),
+    ("enable_multithread_weight_load", False),
+    ("enable_broadcast_weight_load", True),
+    ("num_weight_load_threads", 8),
+    ("diffusion_offload_config", {"transformer": "cpu"}),
+    ("enable_cpu_offload", True),
+    ("enable_layerwise_offload", True),
+    ("enable_distributed_layerwise_offload", True),
+    ("dlo_use_allgather", False),
+    ("dlo_resident_layers", 2),
+    ("host_weight_runtime_mode", "preferred"),
+    ("host_weight_runtime_root", "/tmp/hwr"),
+    ("dlo_host_registration_limit_gib", 4.0),
+    ("boundary_ratio", 0.875),
+    ("flow_shift", 12.0),
+    ("diffusion_kv_cache_dtype", "fp8_e4m3"),
+    ("diffusion_kv_cache_skip_steps", "0-9"),
+    ("diffusion_kv_cache_skip_layers", "25-30"),
+    ("default_sampling_params", '{"0": {"guidance_scale": 5.0}}'),
+    ("max_generated_image_size", 1048576),
+    ("tts_max_instructions_length", 1000),
+    ("enable_diffusion_pipeline_profiler", True),
+    ("auxiliary_text_encoder", "/models/extras-llama"),
+]
+
+
+# For https://github.com/vllm-project/vllm-omni/issues/8503
+def test_from_cli_args_preserves_non_parallel_diffusion_engine_args():
+    """Every non-parallel diffusion engine arg must survive from_cli_args.
+
+    ``OmniEngineArgs.from_cli_args`` keeps only dataclass fields, so an arg
+    the dataclass does not declare is silently dropped on the library path
+    (#7652 covered ``text_encoder_tp_size``; the parallel knobs of #8037 are
+    covered separately).
+    """
+    for knob, value in DIFFUSION_NON_PARALLEL_ENGINE_ARGS:
+        engine_args = OmniEngineArgs.from_cli_args(SimpleNamespace(**{knob: value}))
+        assert getattr(engine_args, knob) == value, f"{knob} was dropped"
+
+
+# For https://github.com/vllm-project/vllm-omni/issues/8503
+def test_non_parallel_diffusion_engine_args_reach_default_diffusion_config():
+    """The preserved values must land where the diffusion stage reads them.
+
+    Forward the explicit overrides to the generic diffusion fallback:
+    ``cache_backend``/``step_execution``/``flow_shift`` are direct
+    ``OmniDiffusionConfig`` fields, ``num_gpus`` resolves the data-parallel
+    degree, and ``auxiliary_text_encoder`` lands in ``extras``.
+    """
+    from vllm_omni.config.config_factory import StageConfigFactory
+
+    overrides = {
+        "cache_backend": "tea_cache",
+        "step_execution": True,
+        "flow_shift": 12.0,
+        "num_gpus": 2,
+        "auxiliary_text_encoder": "/models/extras-llama",
+    }
+    engine_args = OmniEngineArgs.from_cli_args(SimpleNamespace(**overrides))
+    stage_cfg = StageConfigFactory.create_default_diffusion(
+        {name: getattr(engine_args, name) for name in overrides},
+    )[0]
+
+    resolved = stage_cfg["engine_args"]
+    assert resolved["cache_backend"] == "tea_cache"
+    assert resolved["step_execution"] is True
+    assert resolved["flow_shift"] == 12.0
+    assert resolved["parallel_config"]["data_parallel_size"] == 2
+    assert resolved["extras"]["auxiliary_text_encoder"] == "/models/extras-llama"
