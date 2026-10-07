@@ -13,6 +13,7 @@ from vllm_omni.engine.duplex.contracts import (
     duplex_resource_request_belongs_to_session,
 )
 from vllm_omni.engine.duplex.plugin import DuplexDataPlane, DuplexDataPlaneContext
+from vllm_omni.model_executor.models.minicpmo_4_5.duplex.policy import MiniCPMO45DuplexPolicy
 from vllm_omni.outputs.duplex import get_duplex_output_decision
 
 logger = init_logger(__name__)
@@ -638,8 +639,12 @@ def _native_decision(
         return None
     if mm_output.get("duplex_native_decision") == "listen" or mm_output.get("model_listen") is True:
         return "listen"
-    listen_id = _special_token_ids(mm_output).get("listen_token_id")
+    special_token_ids = _special_token_ids(mm_output)
+    listen_id = special_token_ids.get("listen_token_id")
     if listen_id is None:
+        return None
+    unit_ids = max(token_ids, _coerce_int_list(getattr(completion, "cumulative_token_ids", None)), key=len)
+    if MiniCPMO45DuplexPolicy.speech_unit_closed_by_listen(unit_ids, special_token_ids):
         return None
     stop_reason = getattr(completion, "stop_reason", None) if completion is not None else None
     if coerce_int(stop_reason) == listen_id:

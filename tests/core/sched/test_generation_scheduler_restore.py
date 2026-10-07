@@ -11,7 +11,9 @@ from types import SimpleNamespace
 import pytest
 import torch
 from vllm import SamplingParams
+from vllm.distributed.aux_output_connector.connector import AuxOutputSchedulerConnector
 from vllm.v1.core.sched.interface import PauseState
+from vllm.v1.core.sched.output import CachedRequestData
 from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
 from vllm.v1.request import Request, RequestStatus
 
@@ -25,8 +27,8 @@ class FakeAdapter:
     """Minimal mock of OmniChunkTransferAdapter tracking restore calls."""
 
     def __init__(self):
-        self.waiting_for_chunk_waiting_requests = deque()
-        self.waiting_for_chunk_running_requests = deque()
+        self.waiting_for_chunk_waiting_requests: deque = deque()
+        self.waiting_for_chunk_running_requests: deque = deque()
         self.restore_called = False
         self.done_request_ids = set()
 
@@ -53,12 +55,14 @@ class FakeAdapter:
 def _make_generation_scheduler(waiting_request, *, use_v2_model_runner=False):
     scheduler = OmniGenerationScheduler.__new__(OmniGenerationScheduler)
     scheduler.max_num_scheduled_tokens = 8
+    scheduler.max_num_active_reqs = 1
     scheduler.max_num_running_reqs = 1
     scheduler._pause_state = PauseState.UNPAUSED
     scheduler.running = []
     scheduler.waiting = create_request_queue(SchedulingPolicy.FCFS)
     scheduler.waiting.add_request(waiting_request)
-    scheduler.skipped_waiting = create_request_queue(SchedulingPolicy.FCFS)
+    scheduler.kv_holding_waiting = create_request_queue(SchedulingPolicy.FCFS)
+    scheduler.deferred_waiting = set()
     scheduler.requests = {waiting_request.request_id: waiting_request}
     scheduler.policy = SchedulingPolicy.FCFS
     scheduler.chunk_transfer_adapter = FakeAdapter()
@@ -86,6 +90,7 @@ def _make_generation_scheduler(waiting_request, *, use_v2_model_runner=False):
         get_manager_metadata=lambda: None,
     )
     scheduler.connector = None
+    scheduler.aux_output_connector = None
     scheduler.ec_connector = None
     scheduler.prev_step_scheduled_req_ids = set()
     scheduler._pending_finish_reqs = []
@@ -103,6 +108,45 @@ def _make_generation_scheduler(waiting_request, *, use_v2_model_runner=False):
     scheduler._update_after_schedule = lambda output: None
     scheduler._wrap_omni_scheduler_output = lambda output: output
     return scheduler
+
+
+def test_generation_scheduler_preserves_auxiliary_output_metadata() -> None:
+    request = Request("aux-contract", [1, 2], SamplingParams(max_tokens=2), pooling_params=None)
+    request.block_hashes.append(b"block-hash")
+    scheduler = _make_generation_scheduler(request, use_v2_model_runner=True)
+    scheduler.aux_output_connector = AuxOutputSchedulerConnector()
+
+    output = scheduler._build_generation_scheduler_output(
+        new_reqs_data=[],
+        cached_reqs_data=CachedRequestData.make_empty(),
+        num_scheduled_tokens={request.request_id: 1},
+        scheduled_spec_decode_tokens={},
+        scheduled_encoder_inputs={},
+        num_common_prefix_blocks=[0],
+    )
+
+    metadata = output.aux_output_connector_metadata
+    assert metadata is not None
+    assert metadata.requests == {request.request_id: 0}
+    assert list(metadata.block_hashes[request.request_id]) == request.block_hashes
+
+
+@pytest.mark.parametrize(("runner_slots", "active_limit"), [(1, 2), (2, 1)])
+def test_generation_admits_kv_holder_before_fresh_requests(runner_slots, active_limit) -> None:
+    fresh = Request("fresh", [1, 2], SamplingParams(max_tokens=2), pooling_params=None)
+    holding = Request("holding", [3, 4], SamplingParams(max_tokens=2), pooling_params=None)
+    holding.num_computed_tokens = 1
+    scheduler = _make_generation_scheduler(fresh)
+    scheduler.max_num_running_reqs = runner_slots
+    scheduler.max_num_active_reqs = active_limit
+    scheduler.requests[holding.request_id] = holding
+    scheduler.kv_holding_waiting.add_request(holding)
+
+    output = scheduler.schedule()
+
+    assert set(output.num_scheduled_tokens) == {holding.request_id}
+    assert list(scheduler.waiting) == [fresh]
+    assert list(scheduler.kv_holding_waiting) == []
 
 
 def _chunk_request(request_id, **kwargs):
@@ -123,7 +167,13 @@ def _chunk_request(request_id, **kwargs):
         record_event=lambda *args, **kwargs: None,
     )
     defaults.update(kwargs)
-    return SimpleNamespace(**defaults)
+    return _HashableChunkRequest(**defaults)
+
+
+class _HashableChunkRequest(SimpleNamespace):
+    # Deferred queues require identity hashing; SimpleNamespace types it as None.
+    __hash__ = object.__hash__  # type: ignore[assignment]
+    __eq__ = object.__eq__
 
 
 def test_chunk_lifecycle_no_resubmit_and_state_survives_requeue(monkeypatch) -> None:
@@ -138,7 +188,8 @@ def test_chunk_lifecycle_no_resubmit_and_state_survives_requeue(monkeypatch) -> 
     )
     scheduler.running = []
     scheduler.waiting = create_request_queue(scheduler.policy)
-    scheduler.skipped_waiting = create_request_queue(scheduler.policy)
+    scheduler.kv_holding_waiting = create_request_queue(scheduler.policy)
+    scheduler.deferred_waiting = set()
 
     completed = Request("completed", [1, 2], SamplingParams(max_tokens=4), pooling_params=None)
     completed.status = RequestStatus.RUNNING
@@ -249,3 +300,104 @@ class TestRestoreQueuesOnError:
 
         assert adapter.restore_called is True
         assert "req-B" in running
+
+
+def test_first_chunk_express_slack_guard_tracks_emitted_audio(monkeypatch):
+    """Express steps wait while a ready later chunk's stream is close to underrun."""
+    import vllm_omni.core.sched.omni_generation_scheduler as module
+
+    scheduler = OmniGenerationScheduler.__new__(OmniGenerationScheduler)
+    scheduler._first_chunk_express = True
+    scheduler._express_min_slack_s = 0.5
+    scheduler._express_skipped_for_slack = 0
+    scheduler._stream_audio = {}
+    scheduler._chunk_started = {"started", "idle"}
+    ready = SimpleNamespace(
+        request_id="started", num_in_flight_tokens=0, prompt_token_ids=[0] * 28, num_computed_tokens=0
+    )
+    # Started, but no chunk to decode now: never blocks an express step.
+    idle = SimpleNamespace(request_id="idle", num_in_flight_tokens=0, prompt_token_ids=[0] * 28, num_computed_tokens=28)
+    scheduler.running = [ready, idle]
+    scheduler.waiting = []
+    clock = [100.0]
+    monkeypatch.setattr(module.time, "monotonic", lambda: clock[0])
+
+    # No measured audio credit: do not delay the ready stream.
+    assert not scheduler._continuations_have_slack()
+    # 1 s of audio at t=100; at t=100.2 it holds 0.8 s, at t=100.7 only 0.3 s.
+    scheduler._record_stream_audio("started", {"model_outputs": torch.zeros(24000), "sr": torch.tensor(24000)})
+    scheduler._record_stream_audio("started", {"model_outputs": torch.zeros(0), "sr": torch.tensor(24000)})
+    clock[0] = 100.2
+    assert scheduler._continuations_have_slack()
+    clock[0] = 100.7
+    assert not scheduler._continuations_have_slack()
+    # Another second emitted: slack is back to 1.3 s.
+    scheduler._record_stream_audio("started", {"model_outputs": torch.zeros(24000), "sr": torch.tensor(24000)})
+    assert scheduler._continuations_have_slack()
+    assert scheduler._stream_audio["started"] == [100.0, 2.0]
+
+
+def _express_scheduler():
+    continuation = Request("continuation", [1, 2], SamplingParams(max_tokens=4), pooling_params=None)
+    first = Request("first", [1], SamplingParams(max_tokens=4), pooling_params=None)
+    scheduler = _make_generation_scheduler(continuation, use_v2_model_runner=True)
+    scheduler.waiting.add_request(first)
+    scheduler.requests[first.request_id] = first
+    scheduler.max_num_active_reqs = 4
+    scheduler.max_num_running_reqs = 4
+    scheduler._native_data_plane = True
+    scheduler.chunk_transfer_adapter = None
+    scheduler.input_coordinator = SimpleNamespace(
+        _async_chunk=True, finished_requests=set(), restore_queues=lambda *args, **kwargs: None
+    )
+    scheduler._first_chunk_express = True
+    scheduler._last_step_express = False
+    scheduler._chunk_started = {"continuation"}
+    scheduler._express_min_slack_s = 0
+    scheduler._stream_audio = {}
+    return scheduler, continuation, first
+
+
+def test_express_schedules_only_first_chunks_then_allows_continuations():
+    scheduler, continuation, first = _express_scheduler()
+    output = scheduler.schedule()
+    assert output.num_scheduled_tokens == {"first": 1}
+    assert scheduler._last_step_express
+    assert continuation in list(scheduler.waiting)
+    # Another first chunk arrives before the continuation runs.
+    first.num_computed_tokens = len(first.prompt_token_ids)
+    second = Request("second", [1], SamplingParams(max_tokens=4), pooling_params=None)
+    scheduler.waiting.add_request(second)
+    scheduler.requests[second.request_id] = second
+    output = scheduler.schedule()
+    assert not scheduler._last_step_express
+    assert "continuation" in output.num_scheduled_tokens
+
+
+def test_express_does_not_delay_continuation_for_unready_first_chunk():
+    scheduler, continuation, first = _express_scheduler()
+    first.num_in_flight_tokens = 1
+    output = scheduler.schedule()
+    assert not scheduler._last_step_express
+    assert output.num_scheduled_tokens == {"continuation": 2}
+
+
+def test_express_slack_guard_is_used_by_schedule():
+    scheduler, continuation, first = _express_scheduler()
+    scheduler._express_min_slack_s = 0.5
+    scheduler._express_skipped_for_slack = 0
+    output = scheduler.schedule()
+    assert not scheduler._last_step_express
+    assert "continuation" in output.num_scheduled_tokens
+
+
+def test_express_cancel_cleans_playback_state(monkeypatch):
+    from vllm.v1.core.sched.scheduler import Scheduler
+
+    scheduler, continuation, _ = _express_scheduler()
+    scheduler.input_coordinator = None
+    scheduler._stream_audio["continuation"] = [1.0, 2.0]
+    monkeypatch.setattr(Scheduler, "_free_request", lambda *args: (None, None))
+    scheduler._free_request(continuation)
+    assert "continuation" not in scheduler._chunk_started
+    assert "continuation" not in scheduler._stream_audio

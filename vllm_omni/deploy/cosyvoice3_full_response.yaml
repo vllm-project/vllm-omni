@@ -1,0 +1,62 @@
+# Opt-in single-Hopper full-response throughput profile (not streaming TTFP).
+# Stage 1 selects the packed backend through its environment below.
+# The 4096-frame internal boundary exceeds this profile's 2048-token output cap.
+async_chunk: true
+connectors:
+  connector_of_shared_memory:
+    extra:
+      codec_chunk_frames: 4096
+      codec_left_context_frames: 25
+      codec_streaming: true
+      codec_vocab_size: 6561
+      connector_get_max_wait: 300
+      connector_get_max_wait_first_chunk: 3000
+      connector_get_sleep_s: 0.01
+    name: SharedMemoryConnector
+cuda_mps: true
+pipeline: cosyvoice3
+stages:
+- default_sampling_params:
+    max_tokens: 2048
+    repetition_penalty: 1.0001
+    temperature: 1.0
+    top_k: 25
+    top_p: 0.8
+  devices: '0'
+  disable_hybrid_kv_cache_manager: true
+  # Prompt embedding rearrangement requires the complete prefill block.
+  enable_chunked_prefill: false
+  enable_prefix_caching: false
+  enforce_eager: false
+  gpu_memory_utilization: 0.4
+  max_num_batched_tokens: 32768
+  max_num_seqs: 64
+  mm_processor_cache_gb: 0
+  # The talker runs on Model Runner V2 (both RAS and standard sampling);
+  # set model_runner: v1 to fall back. The codec stage stays on V1.
+  model_runner: v2
+  output_connectors:
+    to_stage_1: connector_of_shared_memory
+  skip_mm_profiling: true
+  stage_id: 0
+  trust_remote_code: true
+- default_sampling_params:
+    max_tokens: 2048
+  devices: '0'
+  disable_hybrid_kv_cache_manager: true
+  enable_prefix_caching: false
+  enforce_eager: true
+  gpu_memory_utilization: 0.25
+  input_connectors:
+    from_stage_0: connector_of_shared_memory
+  max_model_len: 32768
+  max_num_batched_tokens: 32768
+  max_num_seqs: 8
+  skip_mm_profiling: true
+  stage_id: 1
+  env:
+    COSYVOICE3_TRT: "0"
+    COSYVOICE3_BATCH_FLOW: "1"
+    COSYVOICE3_FULL_RESPONSE_OPTIMIZATIONS: "1"
+    COSYVOICE3_PACKED_STREAMING: "0"
+  trust_remote_code: true

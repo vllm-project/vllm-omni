@@ -1,12 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""The exact Wan decoder fast path must be bit-identical to the plain streaming decode.
+"""Numerical contracts for the Wan decoder streaming fast paths.
 
 Two decoders are driven frame by frame through ``WanStreamingDecoder`` over two chunks of one session and
 a fresh session (the persistent buffers' causal front frames go zeros -> cache -> zeros), on CPU: plain
 diffusers modules in one process, and the spatially sharded wrappers across two gloo ranks with real halo
-exchange, each in fp32 and under bf16 autocast (where the parameter cast applies). Every output must
-``torch.equal`` the untouched decoder's on every rank.
+exchange, each in fp32 and under bf16 autocast (where the parameter cast applies). The exact level must be
+bit-identical to the untouched decoder on every rank. The fused level deliberately rounds each fused
+norm-SiLU result to the activation dtype before the next convolution, so its bf16 contract bounds both the
+worst output error and the aggregate RMS error instead.
 """
 
 from __future__ import annotations
@@ -19,9 +21,14 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
-from diffusers.models.autoencoders.autoencoder_kl_wan import WanCausalConv3d, WanDecoder3d
+from diffusers.models.autoencoders.autoencoder_kl_wan import (
+    WanCausalConv3d,
+    WanDecoder3d,
+)
 
-from vllm_omni.diffusion.distributed.autoencoders.wan_decoder_fast_path import install_wan_decoder_fast_path
+from vllm_omni.diffusion.distributed.autoencoders.wan_decoder_fast_path import (
+    install_wan_decoder_fast_path,
+)
 from vllm_omni.diffusion.distributed.autoencoders.wan_spatial_shard import (
     WanDistCausalConv3d,
     WanDistConv2d,
@@ -39,7 +46,11 @@ def _make_vae(seed: int = 0) -> SimpleNamespace:
         p.data.uniform_(-0.5, 0.5)
     decoder.eval()
     count = sum(1 for m in decoder.modules() if m.__class__.__name__ == "WanCausalConv3d")
-    return SimpleNamespace(decoder=decoder, post_quant_conv=post_quant_conv, _cached_conv_counts={"decoder": count})
+    return SimpleNamespace(
+        decoder=decoder,
+        post_quant_conv=post_quant_conv,
+        _cached_conv_counts={"decoder": count},
+    )
 
 
 def _run(vae, latents: list[torch.Tensor], autocast: bool) -> list[torch.Tensor]:
@@ -57,7 +68,29 @@ def _run(vae, latents: list[torch.Tensor], autocast: bool) -> list[torch.Tensor]
 
 def _latents() -> list[torch.Tensor]:
     torch.manual_seed(1)
-    return [torch.randn(1, 4, 2, 6, 10), torch.randn(1, 4, 1, 6, 10), torch.randn(1, 4, 2, 6, 10)]
+    return [
+        torch.randn(1, 4, 2, 6, 10),
+        torch.randn(1, 4, 1, 6, 10),
+        torch.randn(1, 4, 2, 6, 10),
+    ]
+
+
+def _assert_fused_output_close(expected: torch.Tensor, actual: torch.Tensor, autocast: bool) -> None:
+    if not autocast:
+        torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-4)
+        return
+
+    # FusedWanRMSNormSiLU returns the activation dtype immediately, whereas the eager Wan norm's fp32
+    # affine result stays fp32 through SiLU and is rounded by the following convolution. Those intentional
+    # bf16 boundaries accumulate across the decoder, so a per-element relative tolerance is misleading near
+    # zero. Keep a strict quality budget on both the worst pixel and the output as a whole. Decoder outputs
+    # are tanh-bounded to [-1, 1], making these absolute limits directly meaningful.
+    error = (actual - expected).abs()
+    eps = torch.finfo(torch.bfloat16).eps
+    max_error = error.amax().item()
+    rms_error = error.square().mean().sqrt().item()
+    assert max_error <= 4 * eps, f"fused bf16 max error {max_error} exceeds {4 * eps}"
+    assert rms_error <= eps, f"fused bf16 RMS error {rms_error} exceeds {eps}"
 
 
 def _check_pair(reference, candidate, autocast: bool, sharded: bool, level: str = "exact") -> None:
@@ -90,11 +123,7 @@ def _check_pair(reference, candidate, autocast: bool, sharded: bool, level: str 
         if level == "exact":
             assert torch.equal(e, a)
         else:
-            # The fused level changes layouts only on CPU (the kernels need CUDA); the eager norm's reduction
-            # order may differ with the layout, so the outputs are close, not identical.
-            assert torch.allclose(e, a, atol=1e-2 if autocast else 1e-5, rtol=1e-2 if autocast else 1e-4), (
-                (e - a).abs().max()
-            )
+            _assert_fused_output_close(e, a, autocast)
     if sharded:
         bufs = [m._input_buf for m in candidate.decoder.modules() if isinstance(m, WanDistCausalConv3d | WanDistConv2d)]
         assert all(b is not None for b in bufs)
@@ -124,7 +153,12 @@ def _swap_norms_to_rmsnorm_vae(vae) -> int:
                 continue
             if child.__class__.__name__ == "WanRMS_norm":
                 images = child.gamma.dim() == 3  # (dim, 1, 1) for the attention block's 4D norm
-                norm = RMSNormVAE(child.gamma.shape[0], channel_first=child.channel_first, images=images, bias=False)
+                norm = RMSNormVAE(
+                    child.gamma.shape[0],
+                    channel_first=child.channel_first,
+                    images=images,
+                    bias=False,
+                )
                 norm.gamma.data.copy_(child.gamma.data.reshape(norm.gamma.shape))
                 setattr(module, name, norm)
                 count += 1
@@ -143,7 +177,14 @@ def test_fused_level_plumbing_on_cpu(autocast: bool, norm: str) -> None:
     _check_pair(reference, candidate, autocast, sharded=False, level="fused")
 
 
-def _sharded_worker(rank: int, world_size: int, port: str, autocast: bool, return_dict, level: str = "exact") -> None:
+def _sharded_worker(
+    rank: int,
+    world_size: int,
+    port: str,
+    autocast: bool,
+    return_dict,
+    level: str = "exact",
+) -> None:
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = port
     dist.init_process_group("gloo", rank=rank, world_size=world_size)
@@ -170,7 +211,12 @@ def test_sharded_fast_path_on_every_rank(autocast: bool, level: str) -> None:
     manager = mp.get_context("spawn").Manager()
     return_dict = manager.dict()
     port = str(29610 + int(autocast) + 2 * (level == "fused"))
-    mp.spawn(_sharded_worker, args=(2, port, autocast, return_dict, level), nprocs=2, join=True)
+    mp.spawn(
+        _sharded_worker,
+        args=(2, port, autocast, return_dict, level),
+        nprocs=2,
+        join=True,
+    )
     for rank in range(2):
         assert return_dict.get(rank) == "ok", f"rank {rank}: {return_dict.get(rank)}"
 

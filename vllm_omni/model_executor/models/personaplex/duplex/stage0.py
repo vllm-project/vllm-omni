@@ -9,9 +9,10 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
+from vllm.logger import init_logger
 
 from vllm_omni.model_executor.common.audio.pcm import pcm_f32le_samples
 from vllm_omni.model_executor.common.duplex.payload import decode_pcm_f32le_payload
@@ -24,7 +25,20 @@ from vllm_omni.model_executor.models.personaplex.duplex.policy import (
     wrap_with_system_tags,
 )
 
+if TYPE_CHECKING:
+    import torch
+
 _FRAME_SAMPLES = FRAME_SIZE
+
+logger = init_logger(__name__)
+
+
+class PersonaPlexStage0CapacityError(RuntimeError):
+    """Every streaming encoder row is leased by a live session."""
+
+
+class PersonaPlexStage0StaleEpochError(RuntimeError):
+    """The append belongs to an epoch that a newer epoch of the same session has superseded."""
 
 
 @dataclass(slots=True)
@@ -35,6 +49,9 @@ class PersonaPlexStage0PreparedAppend:
     info_update: dict[str, Any]
     prefill_applied: bool
     prompt_offset: int
+    # Device copies of the depformer teacher-forcing state (batched path only).
+    depformer_audio_tokens_device: torch.Tensor | None = None
+    depformer_audio_provided_device: torch.Tensor | None = None
 
 
 @dataclass(slots=True)
@@ -52,7 +69,13 @@ class PersonaPlexStage0SessionState:
     prepared: PersonaPlexStage0PreparedAppend | None = None
     last_seq: int = 0
     request_ids: set[str] = field(default_factory=set)
-    codec: Any | None = None
+    slot: int | None = None
+    encoded_identity: tuple[int, int] | None = None
+    encoded_frame: Any | None = None
+    # Device copies of the encoded frame and of the last two consumed user
+    # frames (newest last), so live appends are built without host round trips.
+    encoded_frame_device: torch.Tensor | None = None
+    user_history_device: list[torch.Tensor] = field(default_factory=list)
 
 
 def _tokenizer_path(model_path: str) -> Path:
@@ -124,7 +147,13 @@ def personaplex_prefill_slots(model_path: str, voice: str, persona: str) -> int:
 
 
 class PersonaPlexStage0DuplexRuntime:
-    """Own per-session streaming Mimi encoders and first-append prefill."""
+    """Own the shared streaming Mimi encoder and each session's first-append prefill.
+
+    One encoder holds ``max_sessions`` streaming rows; a live ``(session, epoch)``
+    leases one row for its lifetime. ``encode_appends`` encodes every new append
+    of a scheduler step in one batched call (rows without a new append are
+    inactive and keep their state), and ``prepare_append`` consumes the result.
+    """
 
     def __init__(
         self,
@@ -135,6 +164,7 @@ class PersonaPlexStage0DuplexRuntime:
         codec: Any | None = None,
         codec_factory: Callable[[], Any] | None = None,
         max_sessions: int = 1,
+        codec_cuda_graphs: bool = False,
         tokenizer=None,
         voice_loader=None,
     ) -> None:
@@ -145,14 +175,63 @@ class PersonaPlexStage0DuplexRuntime:
         self.device = device
         self.max_sessions = max_sessions
         self._codec_factory = codec_factory
-        self._free_codecs: list[Any] = []
+        self._codec_cuda_graphs = codec_cuda_graphs
+        self._codec: Any | None = None
+        self._free_slots: list[int] = list(reversed(range(max_sessions)))
         self._tokenizer = tokenizer
         self._voice_loader = voice_loader
         self.sessions: dict[tuple[str, int], PersonaPlexStage0SessionState] = {}
         self.request_sessions: dict[str, tuple[str, int]] = {}
+        # Requests of a superseded epoch that still reached this step; they are
+        # finished by the engine and must not lease a row or record a sample.
+        self._stale_requests: set[str] = set()
+        self._constants_cache: dict[str, torch.Tensor] | None = None
         if codec is not None:
-            codec.streaming_init(1)
-            self._free_codecs.append(codec)
+            codec.streaming_init(max_sessions)
+            self._codec = codec
+
+    def encode_appends(self, appends: list[dict[str, Any]]) -> None:
+        """Encode the new user frame of each append in one batched encoder call.
+
+        Called once per scheduler step before the per-request ``prepare_append``
+        calls. An append whose ``(epoch, seq)`` is already encoded or prepared
+        (a chunked first prefill spans several steps) is skipped, so a row's
+        streaming state advances exactly once per frame. Appends that cannot be
+        admitted are left for ``prepare_append`` to reject.
+        """
+        parsed: list[tuple[str, int, int, dict[str, Any]]] = []
+        for duplex in appends:
+            try:
+                parsed.append((*_append_identity(duplex), duplex))
+            except ValueError:
+                continue
+        # A cancel can put a session's aborted epoch and its restarted epoch in
+        # one step. Only the newest epoch is live: admitting it closes the old
+        # one, so the old append must neither be encoded nor re-leased.
+        newest: dict[str, int] = {}
+        for session_id, epoch, _, _ in parsed:
+            newest[session_id] = max(epoch, newest.get(session_id, epoch))
+        for session_id, epoch in self.sessions:
+            if session_id in newest:
+                newest[session_id] = max(epoch, newest[session_id])
+        rows: list[tuple[PersonaPlexStage0SessionState, tuple[int, int], np.ndarray]] = []
+        for session_id, epoch, seq, duplex in parsed:
+            if epoch != newest[session_id]:
+                continue
+            try:
+                state = self._session_state(session_id, epoch)
+            except PersonaPlexStage0CapacityError:
+                # Left for prepare_append to reject. Any other error (e.g. the
+                # shared codec failing to initialize) propagates immediately.
+                continue
+            identity = (epoch, seq)
+            if identity in (state.prepared_identity, state.encoded_identity) or seq <= state.last_seq:
+                continue
+            if any(row[0] is state for row in rows):
+                continue
+            rows.append((state, identity, self._decode_pcm(duplex.get("payload"))))
+        if rows:
+            self._encode_rows(rows)
 
     def prepare_append(
         self,
@@ -163,49 +242,37 @@ class PersonaPlexStage0DuplexRuntime:
     ) -> PersonaPlexStage0PreparedAppend:
         import torch
 
-        session_id = duplex.get("session_id")
-        if not isinstance(session_id, str) or not session_id:
-            raise ValueError("PersonaPlex duplex append requires session_id")
-        epoch = _coerce_non_negative_int(duplex.get("epoch"), "epoch")
-        seq = _coerce_positive_int(duplex.get("seq"), "seq")
+        session_id, epoch, seq = _append_identity(duplex)
         identity = (epoch, seq)
         key = (session_id, epoch)
-
-        state = self.sessions.get(key)
-        if state is None:
-            # A newer epoch supersedes the session's earlier lockstep state:
-            # the engine aborted that request, but its finish notification
-            # may still be in flight, so release it here rather than let the
-            # two epochs share the codec budget.
-            for stale_key in [k for k in self.sessions if k[0] == session_id and k[1] < epoch]:
-                self.close_session(*stale_key)
-            if len(self.sessions) >= self.max_sessions:
-                raise RuntimeError(f"PersonaPlex Stage 0 session capacity {self.max_sessions} is exhausted")
-            state = PersonaPlexStage0SessionState(
-                session_id=session_id,
-                epoch=epoch,
-                codec=self._acquire_codec(),
-            )
-            self.sessions[key] = state
+        try:
+            state = self._session_state(session_id, epoch)
+        except PersonaPlexStage0StaleEpochError:
+            if request_id:
+                self._stale_requests.add(request_id)
+            raise
         if request_id:
             state.request_ids.add(request_id)
             self.request_sessions[request_id] = key
         if state.prepared_identity == identity and state.prepared is not None:
-            return state.prepared
+            prepared = state.prepared
+            if prepared.prompt_offset < 0:
+                prepared.prompt_offset = int(prompt_len) - int(prepared.inputs_embeds.shape[0])
+                if prepared.prompt_offset < 0:
+                    raise ValueError(
+                        "PersonaPlex scheduler prompt reservation mismatch: "
+                        f"reserved={prompt_len}, prepared={prepared.inputs_embeds.shape[0]}"
+                    )
+            return prepared
         if seq <= state.last_seq:
             raise ValueError(f"PersonaPlex duplex append seq must increase: last={state.last_seq}, got={seq}")
 
-        pcm = self._decode_pcm(duplex.get("payload"))
-        codec = state.codec
-        if codec is None:
-            raise RuntimeError("PersonaPlex Stage 0 session has no streaming encoder")
-        encoded = codec.encode_frame(torch.from_numpy(pcm).reshape(1, _FRAME_SAMPLES))
-        user_frame = encoded.detach().to(dtype=torch.long, device="cpu").reshape(1, -1)
-        if user_frame.shape[1] < 8:
-            raise RuntimeError(
-                f"PersonaPlex Mimi encoder returned {user_frame.shape[1]} codebooks, expected at least 8"
-            )
-        user_frame = user_frame[:, :8].contiguous()
+        if state.encoded_identity != identity:
+            self._encode_rows([(state, identity, self._decode_pcm(duplex.get("payload")))])
+        user_frame = state.encoded_frame
+        self._push_user_history(state)
+        state.encoded_identity = None
+        state.encoded_frame = None
         state.user_codes = user_frame if state.user_codes is None else torch.cat([state.user_codes, user_frame], dim=0)
 
         runtime_config = duplex.get("runtime_config")
@@ -302,46 +369,192 @@ class PersonaPlexStage0DuplexRuntime:
                 f"PersonaPlex scheduler prompt reservation mismatch: reserved={prompt_len}, prepared={prepared_len}"
             )
         input_ids = torch.zeros((prepared_len,), dtype=torch.long, device=device)
-        info_update = {
+        info_update = self._prepared_info_update(
+            state, seq, silence=silence.detach().cpu(), prefill_applied=first_append
+        )
+        # This path has no device teacher-forcing copies, so the talker reads
+        # these host tensors from the request information.
+        info_update["pplex_depformer_audio_tokens"] = depformer_audio_tokens.detach().cpu()
+        info_update["pplex_depformer_audio_provided"] = depformer_audio_provided.detach().cpu()
+        return self._store_prepared(
+            state,
+            seq,
+            PersonaPlexStage0PreparedAppend(
+                input_ids=input_ids,
+                inputs_embeds=full_embeds,
+                user_codes=state.user_codes,
+                info_update=info_update,
+                prefill_applied=first_append,
+                prompt_offset=prompt_offset,
+            ),
+        )
+
+    @staticmethod
+    def _prepared_info_update(
+        state: PersonaPlexStage0SessionState,
+        seq: int,
+        *,
+        silence: torch.Tensor,
+        prefill_applied: bool,
+    ) -> dict[str, Any]:
+        """Request-information update shared by the per-request and batched append paths."""
+        return {
             "pplex_user_codes": state.user_codes,
-            "pplex_silence_codes": silence.detach().cpu(),
-            "pplex_depformer_audio_tokens": depformer_audio_tokens.detach().cpu(),
-            "pplex_depformer_audio_provided": depformer_audio_provided.detach().cpu(),
+            "pplex_silence_codes": silence,
             "meta": {
                 "pplex_frame": state.prefill_slots + int(state.user_codes.shape[0]),
                 "pplex_prefill_len": state.prefill_slots,
             },
             "duplex": {
                 "stage0_prepared": True,
-                "prefill_applied": first_append,
-                "session_id": session_id,
-                "epoch": epoch,
+                "prefill_applied": prefill_applied,
+                "session_id": state.session_id,
+                "epoch": state.epoch,
                 "seq": seq,
             },
         }
-        prepared = PersonaPlexStage0PreparedAppend(
-            input_ids=input_ids,
-            inputs_embeds=full_embeds,
-            user_codes=state.user_codes,
-            info_update=info_update,
-            prefill_applied=first_append,
-            prompt_offset=prompt_offset,
-        )
-        state.prepared_identity = identity
+
+    @staticmethod
+    def _store_prepared(
+        state: PersonaPlexStage0SessionState,
+        seq: int,
+        prepared: PersonaPlexStage0PreparedAppend,
+    ) -> PersonaPlexStage0PreparedAppend:
+        """Record ``prepared`` as the session's current append and advance its sequence."""
+        state.prepared_identity = (state.epoch, seq)
         state.prepared = prepared
         state.last_seq = seq
         return prepared
+
+    @staticmethod
+    def _push_user_history(state: PersonaPlexStage0SessionState) -> None:
+        """Move the consumed encoded frame into the device history (last two frames)."""
+        if state.encoded_frame_device is None:
+            raise RuntimeError("PersonaPlex Stage 0 append has no encoded user frame")
+        state.user_history_device.append(state.encoded_frame_device)
+        del state.user_history_device[:-2]
+        state.encoded_frame_device = None
+
+    def _constants(self) -> dict[str, torch.Tensor]:
+        """Live-append constant frames on the device (plus host silence), built once."""
+        if self._constants_cache is not None:
+            return self._constants_cache
+        import torch
+
+        device, _ = self._model_device_dtype()
+        silence = torch.tensor(SILENCE_TOKENS, dtype=torch.long)
+        self._constants_cache = {
+            "silence": silence,
+            "silence_device": silence.to(device),
+            "sine_device": torch.tensor(SINE_TOKENS, dtype=torch.long, device=device),
+            "live_provided_device": torch.tensor([False] * 8 + [True] * 8, dtype=torch.bool, device=device),
+            "zero_text_device": torch.tensor([ZERO_TEXT_TOKEN], dtype=torch.long, device=device),
+        }
+        return self._constants_cache
+
+    def prepare_live_appends(self, appends: list[dict[str, Any]]) -> int:
+        """Prepare every one-frame live append of this step with one batched embedding call.
+
+        Only appends whose frame was encoded this step and that are not the
+        first append of their epoch (which carries the voice/persona prefill)
+        take this path; the rest are left to :meth:`prepare_append`. Results are
+        stored exactly as :meth:`prepare_append` stores them, so its per-request
+        call returns the cached preparation. Returns the number prepared.
+        """
+        import torch
+
+        batch: dict[tuple[str, int], tuple[PersonaPlexStage0SessionState, int]] = {}
+        for duplex in appends:
+            try:
+                session_id, epoch, seq = _append_identity(duplex)
+            except ValueError:
+                continue
+            key = (session_id, epoch)
+            state = self.sessions.get(key)
+            # Only an append encoded in this step and not yet consumed: its seq
+            # is past last_seq, so it has not been prepared either.
+            if state is None or state.last_seq == 0 or seq <= state.last_seq or key in batch:
+                continue
+            if state.encoded_identity != (epoch, seq):
+                continue
+            batch[key] = (state, seq)
+        if not batch:
+            return 0
+        c = self._constants()
+        device, dtype = self._model_device_dtype()
+        sine_d, silence_d = c["sine_device"], c["silence_device"]
+        texts, agents, d0s, d1s, currents = [], [], [], [], []
+        for state, _ in batch.values():
+            history = state.user_history_device  # consumed frames, newest last
+            texts.append(
+                state.last_text_token.reshape(1) if state.last_text_token is not None else c["zero_text_device"]
+            )
+            agents.append(state.last_agent_codes[:8] if state.last_agent_codes is not None else silence_d)
+            # The frame being appended is not in the history yet: user cb0 reads
+            # the previous frame and user cb1..7 the one before it.
+            d0s.append(history[-1] if len(history) >= 1 else sine_d)
+            d1s.append(history[-2] if len(history) >= 2 else sine_d)
+            currents.append(state.encoded_frame_device)
+        n = len(batch)
+        text = torch.stack(texts)
+        agent = torch.stack(agents)
+        user_d0 = torch.stack(d0s)
+        user_d1 = torch.stack(d1s)
+        current = torch.stack(currents)
+        stack = torch.cat([text, agent, user_d0[:, :1], user_d1[:, 1:8]], dim=1).unsqueeze(-1)
+        embeds = self.stage_model.input_embeddings(stack).reshape(n, 1, -1).to(dtype=dtype)
+        dep_tokens_device = torch.cat([silence_d.expand(n, 8), current[:, :1], user_d0[:, 1:8]], dim=1)
+        input_ids = torch.zeros((n, 1), dtype=torch.long, device=device)
+        for row, (state, seq) in enumerate(batch.values()):
+            user_frame = state.encoded_frame
+            self._push_user_history(state)
+            state.encoded_identity = None
+            state.encoded_frame = None
+            state.user_codes = torch.cat([state.user_codes, user_frame], dim=0)
+            # The talker reads teacher forcing from the device copies below, so
+            # no host tokens or mask are built for these appends.
+            self._store_prepared(
+                state,
+                seq,
+                PersonaPlexStage0PreparedAppend(
+                    input_ids=input_ids[row],
+                    inputs_embeds=embeds[row],
+                    user_codes=state.user_codes,
+                    info_update=self._prepared_info_update(state, seq, silence=c["silence"], prefill_applied=False),
+                    prefill_applied=False,
+                    # Resolved by prepare_append from the scheduler's prompt length.
+                    prompt_offset=-1,
+                    depformer_audio_tokens_device=dep_tokens_device[row],
+                    depformer_audio_provided_device=c["live_provided_device"],
+                ),
+            )
+        return n
+
+    def prepared_depformer_state(self, request_id: str) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """Device teacher-forcing tensors of the request's current append, when prepared on the device."""
+        key = self.request_sessions.get(request_id)
+        state = self.sessions.get(key) if key is not None else None
+        prepared = state.prepared if state is not None else None
+        if prepared is None or prepared.depformer_audio_tokens_device is None:
+            return None
+        return prepared.depformer_audio_tokens_device, prepared.depformer_audio_provided_device
 
     def record_sample(
         self,
         *,
         request_id: str,
         text_token: Any,
-        agent_codes: Any,
+        effective_codes: Any,
     ) -> None:
-        """Commit one sampled temporal frame for the next live append."""
+        """Commit one sampled temporal frame for the next live append.
+
+        ``effective_codes`` are the frame's eight agent codes with the append's
+        depformer teacher forcing already applied, which the next append reads.
+        """
         import torch
 
+        if request_id in self._stale_requests:
+            return
         key = self.request_sessions.get(request_id)
         if key is None:
             raise KeyError(f"PersonaPlex Stage 0 request is not attached to a live session: {request_id}")
@@ -352,30 +565,17 @@ class PersonaPlexStage0DuplexRuntime:
             return
 
         text = torch.as_tensor(text_token, device=self._model_device_dtype()[0], dtype=torch.long).reshape(-1)
-        codes = torch.as_tensor(agent_codes, device=text.device, dtype=torch.long).reshape(-1)
+        codes = torch.as_tensor(effective_codes, device=text.device, dtype=torch.long).reshape(-1)
         if text.numel() != 1:
             raise ValueError(f"PersonaPlex Stage 0 expected one sampled text token, got {text.numel()}")
-        if codes.numel() < 8:
-            raise ValueError(f"PersonaPlex Stage 0 expected at least 8 agent codes, got {codes.numel()}")
-
-        effective_codes = codes[:8].clone()
-        prepared = state.prepared
-        if prepared is None:
-            raise RuntimeError(f"PersonaPlex Stage 0 request has no prepared payload: {request_id}")
-        target = prepared.info_update.get("pplex_depformer_audio_tokens")
-        provided = prepared.info_update.get("pplex_depformer_audio_provided")
-        if not isinstance(target, torch.Tensor) or not isinstance(provided, torch.Tensor):
-            raise RuntimeError("PersonaPlex Stage 0 prepared payload has no depformer teacher-forcing state")
-        target = target.reshape(-1).to(device=effective_codes.device, dtype=torch.long)
-        provided = provided.reshape(-1).to(device=effective_codes.device, dtype=torch.bool)
-        if target.numel() < 8 or provided.numel() < 8:
-            raise RuntimeError("PersonaPlex Stage 0 depformer teacher-forcing state is shorter than one agent frame")
-        effective_codes = torch.where(provided[:8], target[:8], effective_codes)
-        state.last_agent_codes = effective_codes.detach()
+        if codes.numel() != 8:
+            raise ValueError(f"PersonaPlex Stage 0 expected 8 effective agent codes, got {codes.numel()}")
+        state.last_agent_codes = codes.detach()
         state.last_text_token = text.detach()
         state.sampled_identity = state.prepared_identity
 
     def close_request(self, request_id: str) -> None:
+        self._stale_requests.discard(request_id)
         key = self.request_sessions.pop(request_id, None)
         if key is None:
             return
@@ -393,28 +593,86 @@ class PersonaPlexStage0DuplexRuntime:
             return
         for request_id in state.request_ids:
             self.request_sessions.pop(request_id, None)
-        if state.codec is not None:
-            state.codec.reset_streaming()
-            self._free_codecs.append(state.codec)
-            state.codec = None
+        if state.slot is not None:
+            self._shared_codec().reset_slot(state.slot)
+            self._free_slots.append(state.slot)
+            state.slot = None
 
-    def _acquire_codec(self):
-        if self._free_codecs:
-            return self._free_codecs.pop()
+    def _session_state(self, session_id: str, epoch: int) -> PersonaPlexStage0SessionState:
+        key = (session_id, epoch)
+        state = self.sessions.get(key)
+        if state is not None:
+            return state
+        # A newer epoch supersedes the session's earlier lockstep state: the
+        # engine aborted that request, but its finish notification may still
+        # be in flight, so release it here rather than let the two epochs share
+        # the encoder budget.
+        # The reverse also holds: once a newer epoch is live, an append of an
+        # older epoch is a leftover of the aborted request and must not re-lease
+        # a row (at capacity it would fail the whole step).
+        newer = [k[1] for k in self.sessions if k[0] == session_id and k[1] > epoch]
+        if newer:
+            raise PersonaPlexStage0StaleEpochError(
+                f"PersonaPlex Stage 0 epoch {epoch} of session {session_id} is superseded by epoch {max(newer)}"
+            )
+        for stale_key in [k for k in self.sessions if k[0] == session_id and k[1] < epoch]:
+            self.close_session(*stale_key)
+        if len(self.sessions) >= self.max_sessions or not self._free_slots:
+            raise PersonaPlexStage0CapacityError(
+                f"PersonaPlex Stage 0 session capacity {self.max_sessions} is exhausted"
+            )
+        self._shared_codec()
+        state = PersonaPlexStage0SessionState(session_id=session_id, epoch=epoch, slot=self._free_slots.pop())
+        self.sessions[key] = state
+        return state
+
+    def _encode_rows(self, rows: list[tuple[PersonaPlexStage0SessionState, tuple[int, int], np.ndarray]]) -> None:
+        import torch
+
+        codec = self._shared_codec()
+        pcm = torch.zeros((self.max_sessions, _FRAME_SAMPLES), dtype=torch.float32)
+        active = torch.zeros((self.max_sessions,), dtype=torch.bool)
+        for state, _, samples in rows:
+            assert state.slot is not None
+            pcm[state.slot] = torch.from_numpy(samples)
+            active[state.slot] = True
+        encoded = codec.encode_frame(pcm, active)
+        codes_device = encoded.detach()[:, :8].to(dtype=torch.long)
+        # One device-to-host copy per step, whatever the number of sessions.
+        codes = encoded.detach().to(dtype=torch.long, device="cpu")
+        if codes.shape[-1] < 8:
+            raise RuntimeError(f"PersonaPlex Mimi encoder returned {codes.shape[-1]} codebooks, expected at least 8")
+        for state, identity, _ in rows:
+            state.encoded_frame = codes[state.slot : state.slot + 1, :8].clone()
+            state.encoded_frame_device = codes_device[state.slot]
+            state.encoded_identity = identity
+
+    def _shared_codec(self):
+        if self._codec is not None:
+            return self._codec
         if self._codec_factory is not None:
             codec = self._codec_factory()
-            codec.streaming_init(1)
-            return codec
-        from vllm_omni.model_executor.models.personaplex.personaplex_mimi import (
-            PersonaPlexMimiCodec,
-        )
+        else:
+            from vllm_omni.model_executor.models.personaplex.personaplex_mimi import (
+                PersonaPlexMimiCodec,
+            )
 
-        checkpoint = Path(self.model_path) / "tokenizer-e351c8d8-checkpoint125.safetensors"
-        codec = PersonaPlexMimiCodec(
-            checkpoint=str(checkpoint) if checkpoint.is_file() else None,
-            device=self.device,
-        )
-        codec.streaming_init(1)
+            checkpoint = Path(self.model_path) / "tokenizer-e351c8d8-checkpoint125.safetensors"
+            codec = PersonaPlexMimiCodec(
+                checkpoint=str(checkpoint) if checkpoint.is_file() else None,
+                device=self.device,
+            )
+        codec.streaming_init(self.max_sessions)
+        if self._codec_cuda_graphs:
+            # Rows are leased and recycled in place, so one graph at
+            # max_sessions with the active mask as input serves every step.
+            captured = codec.capture_cuda_graphs(encode=True, decode_frame_counts=())
+            logger.info(
+                "PersonaPlex Stage 0 Mimi encoder %s at %d rows",
+                "replays a CUDA graph" if captured else "runs eagerly",
+                self.max_sessions,
+            )
+        self._codec = codec
         return codec
 
     def _load_tokenizer(self):
@@ -451,6 +709,15 @@ class PersonaPlexStage0DuplexRuntime:
             model="PersonaPlex Stage 0",
         )
         return pcm_f32le_samples(raw)
+
+
+def _append_identity(duplex: dict[str, Any]) -> tuple[str, int, int]:
+    session_id = duplex.get("session_id")
+    if not isinstance(session_id, str) or not session_id:
+        raise ValueError("PersonaPlex duplex append requires session_id")
+    epoch = _coerce_non_negative_int(duplex.get("epoch"), "epoch")
+    seq = _coerce_positive_int(duplex.get("seq"), "seq")
+    return session_id, epoch, seq
 
 
 def _coerce_non_negative_int(value: object, name: str) -> int:

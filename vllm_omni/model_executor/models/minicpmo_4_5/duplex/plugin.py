@@ -186,16 +186,21 @@ def duplex_first_append_unit_count(payload: object) -> int | None:
     return max(1, sample_count // _DUPLEX_CHUNK_SAMPLES - 1)
 
 
-def duplex_scheduler_token_budget(payload: object, *, default: int = 64, tile_pixels: int | None = None) -> int:
-    vision_tokens = _duplex_vision_tokens(payload, tile_pixels=tile_pixels)
+def _duplex_audio_token_budget(payload: object, *, default: int = 64) -> int:
     sample_count = _duplex_pcm_sample_count(payload)
     if sample_count is None:
-        return max(1, int(default)) + vision_tokens
+        return max(1, int(default))
     sample_count = max(1, sample_count)
     if sample_count % _DUPLEX_CHUNK_SAMPLES == 0:
         units = sample_count // _DUPLEX_CHUNK_SAMPLES
-        return units * (2 + _DUPLEX_CHUNK_SAMPLES // _DUPLEX_SAMPLES_PER_AUDIO_TOKEN) + vision_tokens
-    return max(16, min(768, sample_count // _DUPLEX_SAMPLES_PER_AUDIO_TOKEN + 8)) + vision_tokens
+        return units * (2 + _DUPLEX_CHUNK_SAMPLES // _DUPLEX_SAMPLES_PER_AUDIO_TOKEN)
+    return max(16, min(768, sample_count // _DUPLEX_SAMPLES_PER_AUDIO_TOKEN + 8))
+
+
+def duplex_scheduler_token_budget(payload: object, *, default: int = 64, tile_pixels: int | None = None) -> int:
+    return _duplex_audio_token_budget(payload, default=default) + _duplex_vision_tokens(
+        payload, tile_pixels=tile_pixels
+    )
 
 
 def duplex_first_append_context_reserve(runtime_config: object) -> int:
@@ -235,14 +240,14 @@ def build_duplex_data_plane_prompt(
     payload: object,
     final: bool,
 ) -> dict[str, object]:
-    tile_pixels = _duplex_vision_tile_pixels(runtime_config)
-    token_budget = duplex_scheduler_token_budget(payload, tile_pixels=tile_pixels)
+    # Computed once: with a known tile this decodes the stacked pair's first frame.
+    vision_tokens = _duplex_vision_tokens(payload, tile_pixels=_duplex_vision_tile_pixels(runtime_config))
+    token_budget = _duplex_audio_token_budget(payload) + vision_tokens
     if seq <= 1:
         context_reserve = duplex_first_append_context_reserve(runtime_config)
         token_budget += context_reserve
         first_units = duplex_first_append_unit_count(payload)
         if first_units is not None:
-            vision_tokens = _duplex_vision_tokens(payload, tile_pixels=tile_pixels)
             token_budget = context_reserve + first_units * 12 - 1 + vision_tokens
     if seq > 1 and duplex_payload_is_exact_chunks(payload):
         token_budget += 1
@@ -479,23 +484,31 @@ def _apply_first_append_context_tokens(
 
 
 def _model_vision_tile_pixels(model_config: ModelConfig | None) -> int | None:
-    """Area of one normalization tile, from the checkpoint that will do the slicing.
+    """Area of one normalization tile, as the processor that does the slicing sees it.
 
-    ``MiniCPMVImageProcessor`` is built with ``scale_resolution=config.image_size``
-    and Stage0 loads the checkpoint's own processor, so this is per-checkpoint
-    configuration. ``None`` when it cannot be read, which keeps the reservation
-    at the sliced count.
+    Stage0 slices with the checkpoint's own processor
+    (``MiniCPMO45Stage0DuplexRuntime._load_processor_from_path``), whose
+    ``MiniCPMVImageProcessor`` takes ``scale_resolution`` from the checkpoint's
+    image-processor config: a nested ``image_processor`` entry in
+    ``processor_config.json`` if there is one, else ``preprocessor_config.json``.
+    ``get_image_processor_dict`` is that lookup. ``hf_config`` has its own
+    ``slice_config.scale_resolution`` and ``image_size``; they agree on the
+    released checkpoint, but reading them here would under-reserve as soon as
+    one side changes alone (``--hf-overrides`` reaches only ``hf_config``).
+    Local files only, like ``_load_tokenizer``. ``None`` when it cannot be
+    read, which keeps the reservation at the sliced count.
     """
-    hf_config = getattr(model_config, "hf_config", None)
-    if hf_config is None:
+    model_path = getattr(model_config, "model", None)
+    if not isinstance(model_path, str) or not model_path:
         return None
-    slice_config = getattr(hf_config, "slice_config", None)
-    side = getattr(slice_config, "scale_resolution", None)
-    if not isinstance(side, int):
-        side = slice_config.get("scale_resolution") if isinstance(slice_config, dict) else None
-    if not isinstance(side, int):
-        side = getattr(hf_config, "image_size", None)
-    if not isinstance(side, int) or side <= 0:
+    try:
+        from transformers.image_processing_base import ImageProcessingMixin
+
+        processor_dict, _ = ImageProcessingMixin.get_image_processor_dict(model_path, local_files_only=True)
+        side = processor_dict.get("scale_resolution")
+    except Exception:
+        return None
+    if not isinstance(side, int) or isinstance(side, bool) or side <= 0:
         return None
     return side * side
 
@@ -638,6 +651,14 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
         stop_reason = getattr(completion, "stop_reason", None) if completion is not None else None
         token_ids = _completion_token_ids(completion) or list(segment_token_ids)
         if _coerce_int(stop_reason) != listen_id and (not token_ids or token_ids[-1] != listen_id):
+            return None
+        unit_ids = max(
+            (token_ids, _coerce_int_list(getattr(completion, "cumulative_token_ids", None)), list(segment_token_ids)),
+            key=len,
+        )
+        if MiniCPMO45DuplexPolicy.speech_unit_closed_by_listen(unit_ids, special_token_ids):
+            # The unit's final speech and <|turn_eos|> must reach the Talker,
+            # or the response never ends.
             return None
 
         metadata = dict(output_metadata)

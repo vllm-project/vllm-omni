@@ -725,6 +725,9 @@ curl -sS -X POST "${API_URL}" \
 ### 3. Ref2VA: image-only, image/audio, or mixed references
 
 Run these requests against the combined service or a Ref2VA-only service.
+Reference images keep their original resolution, with dimensions aligned to
+32 pixels. No additional request or server setting is needed.
+
 Image-only Ref2VA omits `audio_reference`; adding one or more audio references
 is optional. The typed fields accept one object or an ordered JSON list.
 `audio_reference` accepts an HTTP(S) URL or a `data:` URL. In one terminal,
@@ -782,6 +785,9 @@ Run this request against the combined service. Repeat the
 `input_references` multipart field once per source video. H3 consumes the
 videos in form order and preserves their original soundtracks during
 conditioning.
+Small reference videos retain their original size; larger videos are scaled
+down to the reference canvas. Dimensions are aligned to 32 pixels. No
+additional request or server setting is needed.
 
 ```bash
 export SUBJECT_VIDEO=/path/to/green_screen_subject.mp4
@@ -981,6 +987,42 @@ the trajectories differ by design. Report the tested commit, checkpoint, hardwar
 settings, and both videos with any comparison; the command alone is not quality
 evidence. A matching seed does not imply matching noise over differently sized
 full and windowed latents.
+
+## Request-scoped sampler
+
+H3 supports `euler` (the default) and `res_multistep`. Select the sampler per
+request; it applies to both video and audio, using their separate sigma schedules.
+For the HTTP examples above, set `num_inference_steps=20` and add
+`"sampler":"res_multistep"` to the existing `extra_params` object. For example,
+the T2VA fields become:
+
+```bash
+-F 'num_inference_steps=20' \
+-F 'extra_params={"task":"t2va","duration":8.7,"audio_flow_shift":3.0,"sampler":"res_multistep"}'
+```
+
+For the offline Python API, use `extra_args`:
+
+```python
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+sampling_params = OmniDiffusionSamplingParams(
+    num_inference_steps=20,
+    seed=42,
+    extra_args={"task": "t2va", "sampler": "res_multistep"},
+)
+```
+
+Both samplers use one DiT evaluation per step in request mode and step execution.
+`res_multistep` retains the previous denoised prediction independently for each
+request and each stream; its first and final updates use Euler. Omitting `sampler`
+or selecting `euler` preserves the existing Euler update. Reducing the step count
+reduces model evaluations, but quality depends on the prompt and configuration;
+20 RES steps are a candidate to compare against an Euler-50 reference.
+
+Requests using a fixed distilled `base_schedule` from a checkpoint or adapter
+must keep `sampler="euler"`. RES sampling with those schedules has not been
+validated and is rejected with `ValueError`.
 
 ## Request-scoped quality
 
@@ -1402,6 +1444,7 @@ four-step adapter keeps its original sampling and fixed-top-k behavior.
 | `duration` | Workload-specific | Decimal seconds in `extra_params`; converted to H3-compatible frame count |
 | `fps` | `24` | H3 output FPS is fixed |
 | `num_inference_steps` | `50` | Matches the reference accuracy workloads |
+| `extra_params.sampler` | `euler` | Per-request `euler` or `res_multistep` for both streams; fixed distilled schedules require Euler |
 | `flow_shift` | `12` | Video sigma shift |
 | `audio_flow_shift` | `3` | Audio sigma shift, passed in `extra_params` |
 | `seed` | Task-specific | Use a fixed value for reproducibility |
@@ -1509,9 +1552,184 @@ vllm serve "${MODEL_ROOT}/FL2VA" \
   --cache-config '{"rel_l1_thresh":0.17}'
 ```
 
+## Latent super-resolution
+
+H3's video VAE is a ~5B-parameter model, so the usual way to raise output
+resolution -- decode, upscale in pixel space, re-encode -- pays for that VAE
+twice. The community
+[Minimax H3 latent upscaler](https://huggingface.co/LBH-123-AI/Minimax_h3_latent_Upscaler)
+is a learned 3D-convolutional resizer trained on H3's 24-channel latents: it
+runs between the denoise loop and the VAE, so the clip is decoded once, at the
+larger size. Unlike bilinear or bicubic interpolation of a latent, it does not
+introduce ghosting or double-image artifacts.
+
+The network runs one normalization below the pipeline latent: an H3 latent in
+vLLM-Omni is already normalized, and the upscaler was trained on that tensor
+normalized again by the VAE's `latents_mean` / `latents_std`. The stage applies
+and undoes that itself, so nothing about a request changes -- but a port that
+skips it inflates the latent about 5x and decodes as a magenta grid at one tile
+per latent cell.
+
+The checkpoint is optional and is not part of the H3 release. Download one file
+from that repository (`minimax_h3_latent_upscaler_3d_bf16.safetensors`, 691 MB)
+and name it at startup:
+
+```bash
+vllm serve "${MODEL_ROOT}/FL2VA" \
+  --omni \
+  --trust-remote-code \
+  --additional-config '{"latent_upscaler_path":"/models/minimax_h3_latent_upscaler_3d_bf16.safetensors"}'
+```
+
+A request then asks for a size. The three modes are mutually exclusive and all
+resolve to the same 16-pixel latent grid, so the three requests below are the
+same 960x544 -> 1920x1088 upscale:
+
+```bash
+curl -sS -X POST "${API_URL}" \
+  -F 'prompt=...' \
+  -F 'width=960' -F 'height=544' -F 'fps=24' \
+  -F 'extra_params={"task":"t2va","duration":8.7,"latent_upscale":2.0}' \
+  -o t2va_1080p.mp4
+
+# or name the output size in pixels
+#   "latent_upscale":{"width":1920,"height":1088}
+# or name a pixel budget and keep the aspect ratio
+#   "latent_upscale":{"megapixels":2.0}
+```
+
+Over HTTP the field is `extra_params`: the videos request model declares that
+name and nothing else, so an `extra_args` form field is dropped without an
+error and the request silently returns the un-upscaled size. Offline, the same
+value goes in `extra_args`:
+
+```python
+omni = Omni(
+    model=os.path.join(os.environ["MODEL_ROOT"], "FL2VA"),
+    trust_remote_code=True,
+    additional_config={"latent_upscaler_path": "/models/minimax_h3_latent_upscaler_3d_bf16.safetensors"},
+)
+outputs = omni.generate(
+    "A quiet cinematic night scene with matching ambient sound.",
+    OmniDiffusionSamplingParams(
+        height=544,
+        width=960,
+        fps=24,
+        num_inference_steps=50,
+        seed=42,
+        extra_args={"task": "t2va", "duration": 8.7, "latent_upscale": 2.0},
+    ),
+)
+```
+
+### The hi-res route: generate small, refine large
+
+Upscaling alone decodes the enlarged latent directly, which is fast but can
+only interpolate detail the first pass never generated. Adding `latent_refine`
+resumes the denoise schedule at the new size, so the DiT puts real detail back:
+
+1. generate at a cheap size -- far fewer DiT tokens,
+2. upscale the latent,
+3. re-noise it and run the tail of the schedule at the target size.
+
+```bash
+curl -sS -X POST "${API_URL}" \
+  -F 'prompt=...' \
+  -F 'width=960' -F 'height=544' -F 'fps=24' \
+  -F 'num_inference_steps=50' \
+  -F 'extra_params={"task":"t2va","duration":8.7,"latent_upscale":2.0,"latent_refine":0.4}' \
+  -o t2va_1080p.mp4
+```
+
+`latent_refine` is the fraction of the request's steps the second pass re-runs,
+the img2img convention, so it sets both how much the pass may change and what
+it costs: `0.4` of `num_inference_steps=50` is 50 cheap steps followed by 20
+expensive ones. Low values stay close to the first pass and mostly sharpen;
+high values re-generate and may drift from it. `1.0` re-runs the whole schedule
+from noise, which discards the first pass entirely.
+
+Detail does not keep climbing with strength. Measured on a 15s 2688x1536 clip,
+six frames apart, against the same seed and prompt: 0.5 returned 0.98x the
+high-frequency energy of 0.35 and 0.65 returned 0.92x, while the mean per-pixel
+drift from the 0.35 result rose from 6.3 to 12.6 (0-255). What caps detail is
+what the DiT can resolve at the target size, not how noisy a start it is given;
+past that, a higher strength only erases more of the first pass and re-imagines
+it from less. On this checkpoint 0.35 was the best of the three -- treat higher
+values as "re-generate", not as "sharpen".
+
+Why this is faster than generating at the target size: the DiT cost follows the
+video token count, which is quadratic in the latent area for attention. The
+example above is 31,620 video tokens at 960x544 against 126,480 at 1920x1088 --
+4x the tokens, so roughly 4x the linear cost and up to 16x the attention cost
+per step. Paying that on 20 steps instead of 50 is where the saving comes from.
+The gain therefore depends on the resolutions, the strength, and how
+attention-bound the shape is; measure it on your own workload.
+
+Audio is re-noised and refined alongside the video at the same schedule
+position. The two modalities are shifted apart (`flow_shift` 12.0 against
+`audio_flow_shift` 3.0), so each resumes at its own sigma for that position --
+the state the first pass actually passed through, which is what keeps the pass
+in distribution.
+
+`latent_refine` works without `latent_upscale` too, as a plain detail pass at
+the generated size. For FL2VA, the keyframe condition is pinned to the output
+latent size, so a refine after an upscale re-encodes the keyframes from the
+originals at the new size; REF2VA references carry their own shapes and are
+reused as they are.
+
+### Options
+
+| `--additional-config` key | Default | Meaning |
+| --- | --- | --- |
+| `latent_upscaler_path` | unset | Checkpoint file, or a directory holding exactly one. Unset disables the stage and loads no extra weights. |
+| `latent_upscaler_dtype` | the engine dtype | `bf16`, `fp16` or `fp32`. |
+| `latent_upscaler_chunk_frames` | `0` | `0` runs the whole clip in one pass; a positive value bounds activation memory with approximate temporal chunking. |
+| `latent_upscaler_resident` | `false` | Keep the ~700 MB of weights on the GPU between requests instead of in host memory. |
+| `latent_refine_max_tokens_per_rank` | `65536` | Reject larger refine layouts before denoising. Set `0` only after validating a larger deployment. |
+| `latent_upscale` | unset | A default target applied to every request, in the request's own format. A request overrides it, and `false` opts out. |
+| `latent_refine` | unset | A default refine strength applied to every request. A request overrides it, and `false` opts out. |
+
+The `latent_upscale` request value is a multiplier (`2.0`), `false`, or an
+object naming one mode: `{"scale": 2.0}`, `{"width": …, "height": …}` or
+`{"megapixels": …}`, each accepting an `align` (default `32` pixels). The
+checkpoint was trained between 1.0x and 4.0x and only upscales; a smaller
+target is rejected, and `scale` 1.0 is a no-op that skips the stage. The
+`latent_refine` value is a strength in `(0, 1]`, `false`, or
+`{"strength": 0.4}`; it needs no checkpoint of its own.
+
+When `latent_refine` is enabled, both resolved output dimensions must be
+divisible by 32 pixels for the DiT's spatial patches. A custom `align` that
+produces an incompatible target is rejected before denoising; upscale-only
+requests can still use the VAE's 16-pixel grid. Numeric upscale fields must be
+positive and finite, and `width`, `height`, and `align` must be integers.
+
+Temporal chunking can bound activation memory on long clips -- a 15-second clip is
+102 latent frames, more than three 32-frame chunks. It is an approximation rather than a
+partition: the network's GroupNorms pool statistics over whatever clip they are
+handed, so a chunked pass can differ from a single pass across the whole output
+and not only at the chunk seams. How much that costs in practice was not
+measured here; the default single pass buys the exact result for the
+memory a full-length activation volume takes (10.1 GiB against 5.6 GiB at
+2688x1536 for 15 seconds, measured on one B300). Set
+`latent_upscaler_chunk_frames: 32` explicitly if that memory cost is too high.
+
 ## Known limitations
 
 - TeaCache is calibrated for FL2VA only; Ref2VA requests run uncached.
+- The latent upscaler is a community checkpoint, not part of the H3 release,
+  and is unavailable unless `latent_upscaler_path` names one. It runs
+  replicated on every DiT rank rather than sharded.
+- `latent_refine` is request-mode only. It is a second denoise loop with its
+  own resolution and its own truncated schedule, and the step contract carries
+  one schedule per request, so step execution rejects it. `latent_upscale`
+  without `latent_refine` works in both modes.
+- Large refine layouts can abort workers with `CUDA error: an illegal memory
+  access was encountered`. On B300, observed video token counts of 54,144 per
+  rank complete while 108,288 and 109,360 abort. The preflight limit of 65,536
+  counts the full padded layout, including text, audio, and visual references,
+  per Ulysses rank. It rejects the observed failing sizes before the base pass.
+  This is an empirical B300 guard, not a proven kernel limit on every device;
+  deployments with different hardware can adjust the limit after validation.
 - Combined serving requires sibling `FL2VA` and `Ref2VA` directories, loads
   both task-specific DiTs, and loads shared components once from `FL2VA`.
 - Request mode executes one generation request per diffusion batch. Use

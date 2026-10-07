@@ -120,6 +120,8 @@ def _make_finish_sched(request: Request) -> MagicMock:
     """MagicMock scheduler driving the real ``update_from_output`` through a
     finishing request; ``_free_request`` reports EC transfer params."""
     sched = MagicMock()
+    sched._first_chunk_express = False
+    sched._express_min_slack_s = 0.0
     sched.requests = {request.request_id: request}
     sched.perf_metrics = None
     sched.defer_block_free = False

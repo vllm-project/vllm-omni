@@ -19,7 +19,9 @@ import functools
 import math
 from collections.abc import Callable
 from contextlib import contextmanager
-from typing import Any, Concatenate
+from typing import Any
+
+from typing_extensions import Concatenate
 
 import torch
 from omegaconf import DictConfig
