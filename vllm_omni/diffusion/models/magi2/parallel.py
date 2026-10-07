@@ -32,6 +32,7 @@ import torch.distributed as dist
 
 from vllm_omni.diffusion.distributed.head_parallel import (
     HeadParallelLayout,
+    replica_token_counts,
     scatter_heads_gather_tokens,
     scatter_tokens_gather_heads,
 )
@@ -194,6 +195,34 @@ def get_magi2_ep_split_indices(ep_group: Magi2ParallelGroup, sp_group: Magi2Para
         return tuple(sp_ranks.index(rank) for rank in ep_ranks)
     except ValueError as exc:
         raise ValueError("MAGI-2 head-EP group must be contained in its SP group") from exc
+
+
+def get_magi2_ep_replicas(ep_group: Magi2ParallelGroup, sp_group: Magi2ParallelGroup) -> int:
+    """Count the head-EP groups that tile the SP group in rank order, else 1.
+
+    When the SP ranks split into consecutive head-EP groups of size ``E``, SP
+    rank ``s`` owns the same head shard as SP rank ``s % E`` of every other
+    group, so one head exchange over the SP group can send each owner part of
+    every rank's tokens.
+    """
+    if ep_group.replicated_sequence or ep_group.group is None or sp_group.group is None:
+        return 1
+    size = ep_group.world_size
+    if size <= 1 or sp_group.world_size <= size or sp_group.world_size % size:
+        return 1
+    from vllm_omni.diffusion.distributed.parallel_state import get_expert_parallel_group_ranks
+
+    try:
+        ep_group_ranks = get_expert_parallel_group_ranks()
+    except AssertionError:
+        return 1
+    sp_ranks = dist.get_process_group_ranks(sp_group.group)
+    runs = [list(sp_ranks[start : start + size]) for start in range(0, len(sp_ranks), size)]
+    if any(run not in ep_group_ranks for run in runs):
+        return 1
+    if list(dist.get_process_group_ranks(ep_group.group)) != runs[sp_group.rank // size]:
+        raise ValueError("MAGI-2 head-EP group does not match its run of SP ranks")
+    return len(runs)
 
 
 def get_magi2_tp_group() -> Magi2ParallelGroup:
@@ -388,19 +417,34 @@ def scatter_heads_gather_seqlen(
     return list(torch.split(output, local_head_counts, dim=1))
 
 
+def _ep_layout(sequence_split_sizes: list[int], rank: int, replicas: int) -> HeadParallelLayout:
+    token_counts = tuple(sequence_split_sizes)
+    if replicas == 1:
+        return HeadParallelLayout(token_counts, rank)
+    return HeadParallelLayout(token_counts, rank, replica_token_counts(token_counts, replicas))
+
+
 def ep_dispatch(
     tensor: torch.Tensor,
     group: Magi2ParallelGroup | None = None,
     sequence_split_sizes: list[int] | None = None,
+    replicas: int = 1,
 ) -> torch.Tensor:
-    """Dispatch ``[S,H,D]`` so each rank evaluates a contiguous head shard."""
+    """Dispatch ``[S,H,D]`` so each rank evaluates a contiguous head shard.
+
+    With ``replicas`` > 1, ``group`` is that many consecutive runs of head-EP
+    ranks, and every rank's tokens are split between the owners of each shard.
+    """
 
     group = group or get_magi2_ep_group()
     if group.world_size == 1:
         return tensor
-    if tensor.ndim != 3 or tensor.shape[1] % group.world_size:
+    if replicas < 1 or group.world_size % replicas:
+        raise ValueError(f"EP replicas {replicas} must divide the exchange group size {group.world_size}")
+    shards = group.world_size // replicas
+    if tensor.ndim != 3 or tensor.shape[1] % shards:
         raise ValueError(
-            f"MoE head count {tensor.shape[1] if tensor.ndim >= 2 else '?'} must divide by EP size {group.world_size}"
+            f"MoE head count {tensor.shape[1] if tensor.ndim >= 2 else '?'} must divide by EP size {shards}"
         )
     sequence = tensor.shape[0]
     if sequence_split_sizes is None:
@@ -410,7 +454,7 @@ def ep_dispatch(
         sequence_split_sizes = [int(size.item()) for size in gathered_sizes]
     if len(sequence_split_sizes) != group.world_size:
         raise ValueError("EP sequence split sizes do not describe the local tensor")
-    layout = HeadParallelLayout(tuple(sequence_split_sizes), group.rank)
+    layout = _ep_layout(sequence_split_sizes, group.rank, replicas)
     return scatter_heads_gather_tokens(tensor, group.group, layout)
 
 
@@ -418,6 +462,7 @@ def ep_undispatch(
     tensor: torch.Tensor,
     group: Magi2ParallelGroup | None = None,
     sequence_split_sizes: list[int] | None = None,
+    replicas: int = 1,
 ) -> torch.Tensor:
     """Undo :func:`ep_dispatch` and restore the complete MoE head axis."""
 
@@ -427,12 +472,12 @@ def ep_undispatch(
     if tensor.ndim != 3:
         raise ValueError("EP-dispatched tensor must be [global_tokens,local_heads,dim]")
     if sequence_split_sizes is None:
-        if tensor.shape[0] % group.world_size:
-            raise ValueError("uneven EP sequence requires explicit split sizes")
+        if replicas != 1 or tensor.shape[0] % group.world_size:
+            raise ValueError("uneven or replicated EP sequence requires explicit split sizes")
         sequence_split_sizes = [tensor.shape[0] // group.world_size] * group.world_size
     if len(sequence_split_sizes) != group.world_size:
         raise ValueError("EP sequence split sizes do not partition the global tensor")
-    layout = HeadParallelLayout(tuple(sequence_split_sizes), group.rank)
+    layout = _ep_layout(sequence_split_sizes, group.rank, replicas)
     return scatter_tokens_gather_heads(tensor, group.group, layout)
 
 
