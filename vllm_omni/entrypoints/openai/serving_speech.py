@@ -26,6 +26,7 @@ import soundfile as sf
 import torch
 from fastapi import HTTPException, Request, UploadFile
 from fastapi.responses import Response, StreamingResponse
+from fastapi.sse import EventSourceResponse, format_sse_event
 from vllm.entrypoints.generate.base.protocol import RequestResponseMetadata
 from vllm.entrypoints.generate.base.serving import GenerateBaseServing as OpenAIServing
 from vllm.entrypoints.launchers.launcher import terminate_if_errored
@@ -226,6 +227,15 @@ class _SpeechStreamingResponse(StreamingResponse):
         finally:
             # A disconnect during send leaves the iterator suspended at yield.
             # Close it explicitly, even inside Starlette's cancelled scope.
+            with anyio.CancelScope(shield=True):
+                await cast(Any, self.body_iterator).aclose()
+
+
+class _SpeechEventSourceResponse(EventSourceResponse):
+    async def stream_response(self, send) -> None:
+        try:
+            await super().stream_response(send)
+        finally:
             with anyio.CancelScope(shield=True):
                 await cast(Any, self.body_iterator).aclose()
 
@@ -1902,14 +1912,14 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     }
                     data = json.dumps(payload, separators=(",", ":"))
                     emitted_audio = True
-                    yield f"event: speech.audio.delta\ndata: {data}\n\n"
+                    yield format_sse_event(data_str=data, event="speech.audio.delta")
             done_payload: dict[str, Any] = {"type": "speech.audio.done"}
             if request is not None:
                 # Streaming path: output_tokens = sum of stage-0 deltas.
                 usage = self._build_speech_usage(request, tts_params or {}, usage_acc.total())
                 done_payload["usage"] = usage.model_dump()
             done = json.dumps(done_payload, separators=(",", ":"))
-            yield f"event: speech.audio.done\ndata: {done}\n\n"
+            yield format_sse_event(data_str=done, event="speech.audio.done")
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -1926,7 +1936,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 "error": error,
             }
             data = json.dumps(error_payload, separators=(",", ":"))
-            yield f"event: speech.audio.error\ndata: {data}\n\n"
+            yield format_sse_event(data_str=data, event="speech.audio.error")
 
     @staticmethod
     def _is_timestamps_output(res) -> bool:
@@ -2661,7 +2671,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     request_id=request_id,
                     arrival_time=request_arrival_ts,
                 )
-                return _SpeechStreamingResponse(
+                return _SpeechEventSourceResponse(
                     self._generate_audio_sse_events(
                         generator,
                         request_id,
@@ -2672,7 +2682,6 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                         request=request,
                         tts_params=sse_tts_params,
                     ),
-                    media_type="text/event-stream",
                 )
 
             collect: dict = {}

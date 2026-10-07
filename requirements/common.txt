@@ -47,3 +47,5 @@ cosmos-guardrail>=0.3.1
 # these are long-stable APIs with no version-specific need for 1.18.
 scipy>=1.11.0
 s3tokenizer==0.3.0
+# Required for fastapi.sse.EventSourceResponse
+fastapi[standard] >= 0.135.0
