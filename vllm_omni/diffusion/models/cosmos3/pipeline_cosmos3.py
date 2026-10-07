@@ -41,6 +41,7 @@ from typing import Any, ClassVar
 import numpy as np
 import PIL.Image
 import torch
+from diffusers.configuration_utils import FrozenDict
 from diffusers.utils.torch_utils import randn_tensor
 from diffusers.video_processor import VideoProcessor
 from torch import nn
@@ -928,6 +929,16 @@ class Cosmos3OmniDiffusersPipeline(
 
     support_image_input: ClassVar[bool] = True
     color_format: ClassVar[str] = "RGB"
+    #: Which MoT towers this pipeline's transformer allocates. ``None`` is the
+    #: co-located default (both). A tower-split stage names the single tower it
+    #: owns, so the other one is never constructed -- allocating both and pruning
+    #: afterwards would still pay the full peak, because the loader builds the
+    #: pipeline under the device context (see ``pipeline_cosmos3_disagg``).
+    cosmos3_owned_towers: ClassVar[tuple[str, ...] | None] = None
+    #: Whether this pipeline loads the VAE weights. A stage that never encodes or
+    #: decodes pixels (the tower-split reasoner) sets this ``False`` and reads only
+    #: the VAE config, which is all it needs for the latent scale factors.
+    cosmos3_loads_vae: ClassVar[bool] = True
     _dit_modules: ClassVar[list[str]] = ["transformer.language_model", "transformer"]
     _encoder_modules: ClassVar[list[str]] = []
     _vae_modules: ClassVar[list[str]] = ["vae"]
@@ -1011,20 +1022,31 @@ class Cosmos3OmniDiffusersPipeline(
         )
 
         # --- VAE ---
-        self.vae = DistributedAutoencoderKLWan.from_pretrained(
-            model_path,
-            subfolder="vae",
-            torch_dtype=self.dtype,
-            local_files_only=local_files_only,
-        ).to(self.device)
+        if self.cosmos3_loads_vae:
+            self.vae = DistributedAutoencoderKLWan.from_pretrained(
+                model_path,
+                subfolder="vae",
+                torch_dtype=self.dtype,
+                local_files_only=local_files_only,
+            ).to(self.device)
+            vae_config = self.vae.config
+        else:
+            self.vae = None
+            vae_config = FrozenDict(
+                DistributedAutoencoderKLWan.load_config(
+                    model_path,
+                    subfolder="vae",
+                    local_files_only=local_files_only,
+                )
+            )
 
-        if not hasattr(self.vae.config, "scale_factor_temporal"):
+        if not hasattr(vae_config, "scale_factor_temporal"):
             raise ValueError(
                 "Cosmos3 Diffusers VAE config must define scale_factor_temporal "
                 "so transformer mRoPE temporal positions can be computed correctly."
             )
-        self.vae_scale_factor_temporal = int(self.vae.config.scale_factor_temporal)
-        self.vae_scale_factor_spatial = getattr(self.vae.config, "scale_factor_spatial", 16)
+        self.vae_scale_factor_temporal = int(vae_config.scale_factor_temporal)
+        self.vae_scale_factor_spatial = getattr(vae_config, "scale_factor_spatial", 16)
 
         sound_gen = resolve_sound_gen(od_config)
         sound_dim = None
@@ -1043,6 +1065,7 @@ class Cosmos3OmniDiffusersPipeline(
             sound_gen=sound_gen,
             sound_dim=sound_dim,
             sound_latent_fps=sound_latent_fps,
+            owned_towers=self.cosmos3_owned_towers,
         )
         self.is_edge_model = transformer_cls is Cosmos3EdgeVFMTransformer
 
@@ -1151,7 +1174,8 @@ class Cosmos3OmniDiffusersPipeline(
                 "Cosmos3 model offload uses reasoner/generator topology and does not support "
                 "the dit/text_encoder offload_components selector"
             )
-        self.vae.to(device, non_blocking=True)
+        if self.vae is not None:
+            self.vae.to(device, non_blocking=True)
         if isinstance(self._sound_tokenizer, nn.Module):
             self._sound_tokenizer.to(device)
         self.transformer.enable_model_cpu_offload(
@@ -1471,6 +1495,47 @@ class Cosmos3OmniDiffusersPipeline(
         if val is not None:
             return val
         return default
+
+    # -- Shared text-conditioning parameter resolution -----------------------
+    #
+    # ``forward`` below and ``Cosmos3ReasonerPipeline.encode_prompt_to_kv`` in
+    # ``pipeline_cosmos3_disagg`` must resolve these identically. The
+    # disaggregated topology tokenizes the prompt on *both* stages -- the
+    # reasoner to compute the UND K/V, the generator to look that K/V up by a
+    # fingerprint of the token ids -- so any divergence in a value that reaches
+    # the tokenizer turns into a replay-table miss at runtime. Resolving them in
+    # one place is what makes that agreement structural instead of a comment.
+
+    def _resolve_t2i_geometry(self, sp: OmniDiffusionSamplingParams) -> tuple[int, int]:
+        """Resolve the (height, width) a T2I request will be generated at.
+
+        Read from ``sp`` directly rather than through ``_get_sp_param``: the
+        image-generation path always fills these in from the request size.
+        """
+        height = int(
+            sp.height or (COSMOS3_EDGE_T2I_DEFAULT_HEIGHT if self.is_edge_model else COSMOS3_T2I_DEFAULT_HEIGHT)
+        )
+        width = int(sp.width or (COSMOS3_EDGE_T2I_DEFAULT_WIDTH if self.is_edge_model else COSMOS3_T2I_DEFAULT_WIDTH))
+        return height, width
+
+    def _resolve_text_encode_params(
+        self,
+        sp: OmniDiffusionSamplingParams,
+        *,
+        default_use_system_prompt: bool,
+    ) -> tuple[int, bool, float]:
+        """Resolve the tokenization knobs: (max_sequence_length, use_system_prompt, frame_rate).
+
+        ``default_use_system_prompt`` is ``is_v2v`` on the co-located path and
+        ``False`` for T2I, which is the only mode the tower split supports.
+        """
+        max_sequence_length = int(
+            self._get_sp_param(sp, "max_sequence_length", COSMOS3_DEFAULT_MAX_SEQUENCE_LENGTH)
+            or COSMOS3_DEFAULT_MAX_SEQUENCE_LENGTH
+        )
+        use_system_prompt = bool(self._get_sp_param(sp, "use_system_prompt", default_use_system_prompt))
+        frame_rate = self._get_sp_param(sp, "resolved_frame_rate") or self._get_sp_param(sp, "frame_rate") or 24.0
+        return max_sequence_length, use_system_prompt, float(frame_rate)
 
     def _get_robolab_transform(self, *, format_prompt_as_json: bool = False):
         transforms = getattr(self, "_robolab_transforms", None)
@@ -3824,10 +3889,9 @@ class Cosmos3OmniDiffusersPipeline(
         #        Edge guidance=5, shift=3;
         #        no guidance interval
         if is_t2i:
-            height = sp.height or (
-                COSMOS3_EDGE_T2I_DEFAULT_HEIGHT if self.is_edge_model else COSMOS3_T2I_DEFAULT_HEIGHT
-            )
-            width = sp.width or (COSMOS3_EDGE_T2I_DEFAULT_WIDTH if self.is_edge_model else COSMOS3_T2I_DEFAULT_WIDTH)
+            # Shared with the disaggregated reasoner stage; see
+            # _resolve_t2i_geometry.
+            height, width = self._resolve_t2i_geometry(sp)
             num_frames = 1
             num_inference_steps = sp.num_inference_steps or COSMOS3_T2I_DEFAULT_NUM_INFERENCE_STEPS
             guidance_scale = self._resolve_guidance_scale(sp, COSMOS3_T2I_DEFAULT_GUIDANCE_SCALE)
@@ -3898,12 +3962,12 @@ class Cosmos3OmniDiffusersPipeline(
         flow_shift_target = float(self._get_sp_param(sp, "flow_shift", default_flow_shift))
         guidance_interval = self._get_sp_param(sp, "guidance_interval", default_guidance_interval)
 
-        frame_rate = self._get_sp_param(sp, "resolved_frame_rate") or self._get_sp_param(sp, "frame_rate") or 24.0
-        max_sequence_length = (
-            self._get_sp_param(sp, "max_sequence_length", COSMOS3_DEFAULT_MAX_SEQUENCE_LENGTH)
-            or COSMOS3_DEFAULT_MAX_SEQUENCE_LENGTH
+        # Shared with the disaggregated reasoner stage; see
+        # _resolve_text_encode_params.
+        max_sequence_length, use_system_prompt, frame_rate = self._resolve_text_encode_params(
+            sp,
+            default_use_system_prompt=is_v2v,
         )
-        use_system_prompt = bool(self._get_sp_param(sp, "use_system_prompt", is_v2v))
 
         if action_enabled and action_video_tensor is None:
             extra_action_video = self._get_sp_param(sp, "action_video", None)

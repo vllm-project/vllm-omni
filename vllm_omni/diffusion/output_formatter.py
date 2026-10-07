@@ -26,6 +26,36 @@ from vllm_omni.outputs.output_metadata import (
     validate_public_diffusion_metadata,
 )
 
+#: Prompt key that stage input processors (``model_executor/stage_input_processors``)
+#: use to hand one stage's output to the next. It is internal plumbing -- for some
+#: models whole tensors, e.g. Cosmos3's per-layer UND K/V -- and is not a declared
+#: prompt field, so it is dropped from the prompt echoed back on the output.
+_STAGE_HANDOFF_PROMPT_KEY = "extra"
+
+
+def _has_handoff_payload(item: object) -> bool:
+    return isinstance(item, Mapping) and _STAGE_HANDOFF_PROMPT_KEY in item
+
+
+def _without_handoff_payload(item: Any) -> Any:
+    if not _has_handoff_payload(item):
+        return item
+    return {key: value for key, value in item.items() if key != _STAGE_HANDOFF_PROMPT_KEY}
+
+
+def _public_prompt(prompt: OmniPromptType) -> OmniPromptType:
+    """Return ``prompt`` without its stage-handoff payload, leaving the request intact.
+
+    A stage input processor may return several prompts; the orchestrator unwraps
+    only a single-element list, so each prompt dict of a list is stripped. Prompts
+    with nothing to strip -- including token-id lists -- are returned as-is.
+    """
+    if isinstance(prompt, list):
+        if not any(_has_handoff_payload(item) for item in prompt):
+            return prompt
+        return cast(OmniPromptType, [_without_handoff_payload(item) for item in prompt])
+    return cast(OmniPromptType, _without_handoff_payload(prompt))
+
 
 @dataclass(frozen=True)
 class DiffusionPostprocessOutput:
@@ -112,7 +142,7 @@ def format_empty_diffusion_outputs(
         OmniRequestOutput.from_diffusion(
             request_id=request.request_id,
             images=[],
-            prompt=request.prompt,
+            prompt=_public_prompt(request.prompt),
             metrics={},
             latents=None,
             custom_output=custom_output,
@@ -167,7 +197,7 @@ def format_diffusion_outputs(
 
     return _format_single_prompt_output(
         request=request,
-        prompt=request.prompt,
+        prompt=_public_prompt(request.prompt),
         diffusion_output=diffusion_output,
         outputs=outputs,
         metrics=metrics,

@@ -454,3 +454,71 @@ def test_format_empty_diffusion_outputs_preserves_custom_output() -> None:
 
     assert result.custom_output == {"lifecycle": "started"}
     assert result.finished is False
+
+
+def test_formatter_drops_the_stage_handoff_payload_from_the_echoed_prompt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``prompt["extra"]`` carries stage-to-stage tensors (e.g. Cosmos3's UND K/V);
+    it must not be echoed to the caller, but the request itself keeps it."""
+    monkeypatch.setattr(output_formatter, "supports_audio_output", lambda _: False)
+    kv = torch.zeros(1, 2, 2, 4)
+    prompt = {
+        "prompt": "a red car",
+        "negative_prompt": "blurry",
+        "modalities": ["image"],
+        "extra": {"cosmos3_und_kv": {"branch": [(kv, kv)]}},
+    }
+    request = _request(prompt)
+
+    [result] = format_diffusion_outputs(
+        request=request,
+        od_config=_config(),
+        diffusion_output=DiffusionOutput(output=None),
+        output_data={"image": ["image-0"]},
+        postprocess_output=normalize_diffusion_postprocess_output({"image": ["image-0"]}),
+    )
+
+    assert result.prompt == {"prompt": "a red car", "negative_prompt": "blurry", "modalities": ["image"]}
+    assert "extra" in request.prompt
+
+
+def test_format_empty_diffusion_outputs_drops_the_stage_handoff_payload() -> None:
+    [result] = format_empty_diffusion_outputs(_request({"prompt": "p", "extra": {"k": torch.zeros(1)}}))
+
+    assert result.prompt == {"prompt": "p"}
+
+
+def test_formatter_leaves_prompts_without_a_handoff_payload_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(output_formatter, "supports_audio_output", lambda _: False)
+    prompt = {"prompt": "p", "modalities": ["image"]}
+
+    [result] = format_diffusion_outputs(
+        request=_request(prompt),
+        od_config=_config(),
+        diffusion_output=DiffusionOutput(output=None),
+        output_data={"image": ["image-0"]},
+        postprocess_output=normalize_diffusion_postprocess_output({"image": ["image-0"]}),
+    )
+
+    assert result.prompt is prompt
+
+
+def test_format_empty_diffusion_outputs_strips_each_prompt_of_a_list() -> None:
+    """A processor returning several prompts reaches the stage as a list."""
+    prompts = [{"prompt": "a", "extra": {"k": torch.zeros(1)}}, {"prompt": "b"}]
+
+    [result] = format_empty_diffusion_outputs(_request(prompts))
+
+    assert result.prompt == [{"prompt": "a"}, {"prompt": "b"}]
+    assert "extra" in prompts[0]
+
+
+def test_format_empty_diffusion_outputs_leaves_token_id_prompts_alone() -> None:
+    token_ids = [1, 2, 3]
+
+    [result] = format_empty_diffusion_outputs(_request(token_ids))
+
+    assert result.prompt is token_ids
