@@ -270,6 +270,11 @@ class MiniCPMO45Code2Wav(nn.Module):
     has_preprocess = False
     has_postprocess = False
 
+    # Returned CUDA payloads own their storage (including HiFT graph results).
+    # Subsequent forwards/state updates never mutate it; the runner can retain
+    # the tensors and copy to host without taking another device snapshot.
+    owns_generation_output_storage = True
+
     def __init__(
         self,
         *,
