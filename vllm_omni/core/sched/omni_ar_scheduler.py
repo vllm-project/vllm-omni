@@ -372,6 +372,35 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             cache = self._omni_talker_kstep_cache = is_talker and is_ngram and num_spec > 0
         return cache
 
+    def _talker_waiting_prefill_may_run(self) -> bool:
+        """Whether a waiting request can be admitted into the current step.
+
+        vLLM drains the waiting queue first and stops admitting as soon as
+        ``len(self.running) + self.num_waiting_for_streaming_input`` reaches
+        ``max_num_running_reqs`` (vllm v1/core/sched/scheduler.py:864) -- the
+        same guard covers the skipped-waiting queue, so a full running batch
+        means nothing new joins this step.
+
+        That distinction matters under sustained load: a busy stream keeps a
+        request queued almost every step, and clearing the Talker's
+        continuation drafts on all of them turns most decode steps into
+        single-frame steps, which is exactly the K-step speedup this path
+        exists to provide. When the waiting request cannot be admitted, the
+        step is a pure decode batch and its spans stay uniform, so the
+        drafts are kept.
+        """
+        if not self.waiting:
+            return False
+        max_running = getattr(self, "max_num_running_reqs", None)
+        if max_running is None:
+            # Unknown capacity: assume the waiting request joins (the
+            # pre-existing behaviour, which is the safe direction -- an
+            # uneven batch is dropped a step later instead of being fed to
+            # the runner as a mixed span).
+            return True
+        num_running = len(self.running) + int(getattr(self, "num_waiting_for_streaming_input", 0) or 0)
+        return num_running < int(max_running)
+
     def _drop_talker_drafts_if_prefill_pending(self) -> None:
         """Keep the Talker's K-frame decode out of steps with uneven spans.
 
@@ -402,7 +431,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             max_len = int(max_len) if max_len is not None else None
         except (TypeError, ValueError):
             max_len = None
-        prefill_pending = bool(self.waiting)
+        prefill_pending = self._talker_waiting_prefill_may_run()
         widths: set[int] = set()
         for req in self.running:
             computed = int(req.num_computed_tokens)
@@ -701,7 +730,11 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 # (the base token stays advanced).
                 # A pure-decode row that came back empty rolls the base token
                 # back too -- schedule() optimistically advanced all scheduled
-                # tokens and not one of them produced output.
+                # tokens and not one of them produced output. A *short* row is
+                # not this branch: a step the multi-frame loop declined emits
+                # one accepted token through the branch above, where the
+                # engine's own accounting (``num_accepted = len(generated) -
+                # 1``) keeps the base token and rolls back only the drafts.
                 _drafts = len(scheduled_spec_token_ids)
                 _scheduled = num_tokens_scheduled
                 _prev_computed = request.num_computed_tokens - _scheduled
