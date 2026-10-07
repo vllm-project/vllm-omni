@@ -618,6 +618,8 @@ class DeployConfig:
     data_parallel_size: int | None = None
     pipeline_parallel_size: int | None = None
     custom_voice_dir: str | None = None
+    default_resolution: list[int] | tuple[int, int] | None = None
+    max_pixels: int | None = None
 
 
 _STAGE_RESERVED_KEYS = frozenset(
@@ -651,6 +653,8 @@ PIPELINE_WIDE_ENGINE_FIELDS: tuple[str, ...] = (
     "pipeline_parallel_size",
     "active_stream_window",
     "custom_voice_dir",
+    "default_resolution",
+    "max_pixels",
 )
 
 

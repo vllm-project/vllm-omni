@@ -103,6 +103,10 @@ _LEGACY_STAGE_METADATA_EXTRA_FIELDS = frozenset(
 _QuantizationConfigType: TypeAlias = QuantizationConfig | str | Mapping[str, Any] | None
 
 _DIFFUSION_SHARED_ONLY_ENGINE_FIELDS = frozenset({"kv_cache_dtype", "seed"})
+# Global CLI inputs that are not EngineArgs/deploy fields but still target the
+# stages that own them (``--no-guardrails`` rides on ``model_config``). Stages
+# that do not own them skip them silently instead of rejecting the flag.
+_OWNER_ONLY_GLOBAL_STAGE_CLI_FIELDS = frozenset({"model_config"})
 
 
 class _QuantizationEngineOverrides(TypedDict, total=False):
@@ -367,7 +371,7 @@ def _stage_cli_overrides(
             **stage_scoped,
         }
     runtime_overrides = build_stage_runtime_overrides(stage_id, dict(cli_overrides))
-    global_stage_fields = _global_stage_cli_fields()
+    global_stage_fields = _global_stage_cli_fields() | _OWNER_ONLY_GLOBAL_STAGE_CLI_FIELDS
     owned_fields = None if execution_type is None else _STAGE_ENGINE_FIELDS_BY_EXECUTION_TYPE[execution_type]
     result: dict[str, Any] = {}
     for key, value in runtime_overrides.items():
@@ -809,6 +813,8 @@ class _DiffusionConfigProjection:
     port: int | None = None
     model_config: dict[str, Any] = field(default_factory=dict)
     tf_model_config: Any = None
+    default_resolution: list[int] | tuple[int, int] | None = None
+    max_pixels: int | None = None
     diffusion_attention_config: Any = None
     cache_strategy: str = "none"
     cache_backend: str = "none"

@@ -172,6 +172,38 @@ def test_paged_context_allocates_lazily_and_commits_after_forward():
 
 
 @pytest.mark.cpu
+@pytest.mark.parametrize("chunk_size", [BLOCK, 2 * BLOCK, 3 * BLOCK])
+def test_frame_causal_refresh_groups_and_commits_all_blocks_in_each_frame(chunk_size):
+    kv, st = make_state(chunk_size=chunk_size)
+    try:
+        ctx = st.get_kv_caches(
+            POS,
+            seq_len=2 * chunk_size,
+            commit_current=True,
+            extra_visible_tokens=chunk_size,
+            frame_causal=True,
+        )[0].forward_ctx
+        ctx.prepare(device=torch.device("cpu"), action_len=3, query_len=2 * chunk_size)
+        assert ctx.block_table.shape[0] == 2
+        assert ctx.query_start_loc.tolist() == [0, chunk_size, 2 * chunk_size]
+        assert ctx.seq_lens.tolist() == [chunk_size + 3, 2 * chunk_size + 3]
+        assert ctx.max_query_len == chunk_size
+        assert ctx.action_scratch_block_ids == kv.scratch_block_ids(POS, 2 * chunk_size // BLOCK, 1)
+        keys = torch.randn(2 * chunk_size, N_HEADS, HEAD_DIM)
+        values = torch.randn_like(keys)
+        kv._k_pools[0][ctx.current_video_slot_mapping] = keys
+        kv._v_pools[0][ctx.current_video_slot_mapping] = values
+        assert st.adapter(POS).completed_chunks == 0
+        st.commit_paged_context(POS)
+        assert st.adapter(POS).completed_chunks == 2
+        blocks = kv.window_block_ids(st.adapter(POS))
+        torch.testing.assert_close(kv.key_cache(0)[blocks].flatten(0, 1), keys)
+        torch.testing.assert_close(kv.value_cache(0)[blocks].flatten(0, 1), values)
+    finally:
+        st.close()
+
+
+@pytest.mark.cpu
 def test_scratch_video_and_action_blocks_do_not_commit():
     kv, st = make_state()
 
@@ -225,7 +257,8 @@ def test_paged_attention_matches_dense_reference_cpu(history_chunks, action_len,
         history_k_parts.append(k)
         history_v_parts.append(v)
 
-    ctx = st.get_kv_caches(POS, seq_len=BLOCK, commit_current=commit_current)[0].forward_ctx
+    layer_ctx = st.get_kv_caches(POS, seq_len=BLOCK, commit_current=commit_current)[0]
+    ctx = layer_ctx.forward_ctx
     ctx.ensure_video_slots(device)
     current_k = torch.randn(1, BLOCK, N_HEADS, HEAD_DIM, dtype=dtype, device=device)
     current_v = torch.randn(1, BLOCK, N_HEADS, HEAD_DIM, dtype=dtype, device=device)
@@ -274,9 +307,65 @@ def test_paged_attention_matches_dense_reference_cpu(history_chunks, action_len,
 
     torch.testing.assert_close(paged, ref, rtol=1e-5, atol=1e-5)
 
+    ctx.prepare(device=device, action_len=action_len, query_len=query.shape[1])
+    fused = paged_write_attn(
+        layer_ctx.to_layer_inputs(),
+        query[0],
+        current_k[0],
+        current_v[0],
+        action_k[0] if action_len else None,
+        action_v[0] if action_len else None,
+        HEAD_DIM**-0.5,
+    ).unsqueeze(0)
+    torch.testing.assert_close(fused, ref, rtol=1e-5, atol=1e-5)
+
     before = st.adapter(POS).completed_chunks
     st.commit_paged_context(POS)
     assert st.adapter(POS).completed_chunks == before + (1 if commit_current else 0)
+
+
+def test_extra_visible_tokens_keeps_the_history_window_in_addition_to_current():
+    torch.manual_seed(0)
+    device = torch.device("cpu")
+    kv, st = make_state(window_chunks=2, device=device)
+    committed = [
+        _commit_video_span(
+            kv,
+            st,
+            kv_branch=POS,
+            n_chunks=1,
+            dtype=torch.float32,
+            device=device,
+        )
+        for _ in range(3)
+    ]
+
+    layer_ctx = st.get_kv_caches(
+        POS,
+        seq_len=BLOCK,
+        commit_current=False,
+        extra_visible_tokens=BLOCK,
+    )[0]
+    current_k = torch.randn(BLOCK, N_HEADS, HEAD_DIM)
+    current_v = torch.randn_like(current_k)
+    text_k = torch.randn(3, N_HEADS, HEAD_DIM)
+    text_v = torch.randn_like(text_k)
+    query = torch.randn(BLOCK, N_HEADS, HEAD_DIM)
+    layer_ctx.forward_ctx.prepare(device=device, action_len=text_k.shape[0], query_len=query.shape[0])
+
+    paged = paged_write_attn(
+        layer_ctx.to_layer_inputs(),
+        query,
+        current_k,
+        current_v,
+        text_k,
+        text_v,
+        HEAD_DIM**-0.5,
+    ).unsqueeze(0)
+    dense_k = torch.cat([committed[-2][0], committed[-1][0], current_k.unsqueeze(0), text_k.unsqueeze(0)], dim=1)
+    dense_v = torch.cat([committed[-2][1], committed[-1][1], current_v.unsqueeze(0), text_v.unsqueeze(0)], dim=1)
+
+    torch.testing.assert_close(paged, _dense_attention(query.unsqueeze(0), dense_k, dense_v))
 
 
 @pytest.mark.parametrize("history_chunks", [0, 1, 2, 3])
@@ -957,20 +1046,60 @@ def test_history_staging_holds_a_ragged_window_and_restages_it_whole(monkeypatch
         st.commit_paged_context(POS)
 
 
-@pytest.mark.parametrize("commit_current", [False, True])
 @pytest.mark.cpu
-def test_action_tokens_after_a_partly_written_video_block_are_refused(commit_current):
-    """Action K/V follows the video blocks in the table, and the kernel reads it as one run.
+@pytest.mark.parametrize("frame_tokens", [24, 394, 924])
+@pytest.mark.parametrize("commit_current,frame_causal", [(False, False), (True, False), (True, True)])
+def test_partial_video_pages_with_text_match_dense(frame_tokens, commit_current, frame_causal):
+    from vllm_omni.experimental.ar_diffusion.kv_cache.paged_attention import paged_write_attn
 
-    A 24-token chunk from an empty history ends 8 slots into its second 16-token
-    block, so the run would read those 8 unwritten slots as the first action
-    tokens and never reach the last ones. Every shape stays right, which is why
-    this is refused rather than computed.
-    """
-    _, st = make_state(window_chunks=2, chunk_size=RAGGED_CHUNK)
-    ctx = st.get_kv_caches(POS, seq_len=RAGGED_CHUNK, commit_current=commit_current)[0].forward_ctx
-    with pytest.raises(ValueError, match="partly written video block"):
-        ctx.build_block_table(action_len=3, query_len=RAGGED_CHUNK + 3, device=torch.device("cpu"))
+    torch.manual_seed(7)
+    kv, st = make_state(chunk_size=frame_tokens, window_chunks=8)
+    try:
+        history_k, history_v = _commit_video_span(
+            kv,
+            st,
+            kv_branch=POS,
+            n_chunks=1,
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+            chunk_size=frame_tokens,
+        )
+        count = 2 * frame_tokens
+        ctx = st.get_kv_caches(
+            POS,
+            seq_len=count,
+            commit_current=commit_current,
+            frame_causal=frame_causal,
+            extra_visible_tokens=frame_tokens,
+        )[0].forward_ctx
+        ctx.prepare(torch.device("cpu"), action_len=13, query_len=count)
+        q, k, v = [torch.randn(count, N_HEADS, HEAD_DIM) for _ in range(3)]
+        kt, vt = [torch.randn(13, N_HEADS, HEAD_DIM) for _ in range(2)]
+        inputs = ctx.layer_inputs(0)
+        actual = paged_write_attn(inputs, q, k, v, kt, vt, HEAD_DIM**-0.5, framewise_attention=frame_causal)
+        for frame in range(2 if frame_causal else 1):
+            end = (frame + 1) * frame_tokens if frame_causal else count
+            start = frame * frame_tokens if frame_causal else 0
+            keys = torch.cat([history_k.flatten(0, 1), k[:end], kt]).unsqueeze(0)
+            values = torch.cat([history_v.flatten(0, 1), v[:end], vt]).unsqueeze(0)
+            expected = _dense_attention(q[start:end].unsqueeze(0), keys, values)[0]
+            torch.testing.assert_close(actual[start:end], expected)
+        if frame_causal:
+            poisoned = v.clone()
+            poisoned[frame_tokens:] = 1000
+            again = paged_write_attn(inputs, q, k, poisoned, kt, vt, HEAD_DIM**-0.5, framewise_attention=True)
+            torch.testing.assert_close(again[:frame_tokens], actual[:frame_tokens], rtol=0, atol=0)
+            paged_write_attn(inputs, q, k, v, kt, vt, HEAD_DIM**-0.5, framewise_attention=True)
+        st.commit_paged_context(POS)
+        if commit_current:
+            table = kv.block_table(st.adapter(POS))
+            from vllm_omni.experimental.ar_diffusion.kv_cache.paged import compute_slot_mapping
+
+            slots = compute_slot_mapping(table, torch.arange(3 * frame_tokens), BLOCK)
+            torch.testing.assert_close(kv._k_pools[0][slots], torch.cat([history_k.flatten(0, 1), k]))
+            torch.testing.assert_close(kv._v_pools[0][slots], torch.cat([history_v.flatten(0, 1), v]))
+    finally:
+        st.close()
 
 
 @pytest.mark.cpu
@@ -1291,3 +1420,47 @@ def test_contiguous_kv_gather_path_matches_paged_path_gpu(monkeypatch, history_c
     assert torch.isfinite(gathered).all()
     # Same kernel family on the same K/V: only accumulation order differs.
     torch.testing.assert_close(gathered, paged, rtol=2e-3, atol=2e-3)
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("sink", [0, 1])
+@pytest.mark.parametrize("reset", [False, True])
+def test_ragged_batched_refresh_matches_sequential_after_eviction(sink, reset):
+    from vllm_omni.experimental.ar_diffusion.kv_cache.paged_attention import paged_write_attn
+
+    torch.manual_seed(11)
+    frame = 24
+    states = [
+        make_state(chunk_size=frame, window_chunks=2, sink_chunks=sink, reset_at_boundary=reset)[1] for _ in range(2)
+    ]
+    try:
+        for tick in range(10):
+            q, k, v = [torch.randn(2 * frame, N_HEADS, HEAD_DIM) for _ in range(3)]
+            kt, vt = [torch.randn(3, N_HEADS, HEAD_DIM) for _ in range(2)]
+            outputs = []
+            for state, batched in zip(states, [True, False]):
+                parts = []
+                for start in range(0, 2 * frame, 2 * frame if batched else frame):
+                    end = 2 * frame if batched else start + frame
+                    ctx = state.get_kv_caches(
+                        POS, seq_len=end - start, commit_current=True, frame_causal=batched, extra_visible_tokens=frame
+                    )[0].forward_ctx
+                    ctx.prepare(torch.device("cpu"), action_len=3, query_len=end - start)
+                    parts.append(
+                        paged_write_attn(
+                            ctx.layer_inputs(0),
+                            q[start:end],
+                            k[start:end],
+                            v[start:end],
+                            kt,
+                            vt,
+                            HEAD_DIM**-0.5,
+                            framewise_attention=batched,
+                        )
+                    )
+                    state.commit_paged_context(POS)
+                outputs.append(torch.cat(parts))
+            torch.testing.assert_close(outputs[0], outputs[1], msg=f"tick {tick}")
+    finally:
+        for state in states:
+            state.close()
