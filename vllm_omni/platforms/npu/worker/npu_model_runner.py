@@ -26,6 +26,7 @@ from vllm_omni.core.prefix_cache import stage_prefix_cache_config
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.platforms.npu._310p import is_310p
 from vllm_omni.platforms.npu.native_rejection_sampler import restore_native_rejection_sampler
+from vllm_omni.platforms.npu.worker.aux_output import NPUAuxOutputMixin
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
 
 logger = init_logger(__name__)
@@ -37,7 +38,7 @@ else:
     from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 
 
-class OmniNPUModelRunner(OmniGPUModelRunner, NPUModelRunner):
+class OmniNPUModelRunner(NPUAuxOutputMixin, OmniGPUModelRunner, NPUModelRunner):
     def initialize_kv_cache(
         self, kv_cache_config, kv_cache_allocation_context: AbstractContextManager | None = None
     ) -> None:
@@ -52,6 +53,7 @@ class OmniNPUModelRunner(OmniGPUModelRunner, NPUModelRunner):
             kv_cache_config,
             **({"kv_cache_allocation_context": kv_cache_allocation_context} if accepts_ctx else {}),
         )
+        self._init_omni_aux_output(kv_cache_config)
         if getattr(self, "_omni_prefix_cache_cfg", None) is None:
             # Same gate as the GPU runner (pooling stage, kv_consumer /
             # kv_both, hybrid kv groups). Read the config back off

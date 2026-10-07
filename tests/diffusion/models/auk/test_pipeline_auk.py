@@ -291,6 +291,18 @@ class TestRequestParsing:
         with pytest.raises(ValueError, match="AuK max_dit_graphs must be a positive integer"):
             build_pipeline(model_config={"max_dit_graphs": max_dit_graphs})
 
+    @pytest.mark.parametrize(
+        "model_config, expected", [({}, 16), ({"auk_ref_cache_size": 0}, 0), ({"auk_ref_cache_size": 4}, 4)]
+    )
+    def test_ref_cache_size_is_taken_from_model_config(self, build_pipeline, model_config, expected):
+        pipeline, _ = build_pipeline(model_config=model_config)
+        assert pipeline._ref_cache_size == expected
+
+    @pytest.mark.parametrize("size", [-1, 1.9, True, False, "4", None])
+    def test_invalid_ref_cache_size_is_rejected(self, build_pipeline, size):
+        with pytest.raises(ValueError, match="AuK auk_ref_cache_size must be a non-negative integer"):
+            build_pipeline(model_config={"auk_ref_cache_size": size})
+
     def test_pipeline_declares_audio_output(self, build_pipeline):
         pipeline, _ = build_pipeline()
 
@@ -424,24 +436,56 @@ class TestRequestParsing:
     def test_setup_compile_warms_the_decode_buckets_on_the_pipeline_device(self, build_pipeline, mocker):
         pipeline, _ = build_pipeline()
         warmup = mocker.patch.object(pipeline.vae_decode, "warmup")
-        compile_dit = mocker.patch.object(pipeline.dit, "compile")
+        regional = mocker.patch.object(pipeline_auk, "regionally_compile")
+        mocker.patch.object(pipeline, "_warmup_dit")
 
         pipeline.setup_compile()
 
         warmup.assert_called_once_with(pipeline.device)
-        # Regional is the default and a no-op for the DiT, which has no repeated blocks.
-        compile_dit.assert_not_called()
+        # Regional is the default: the DiT's repeated blocks are compiled.
+        regional.assert_called_once_with(pipeline.dit, dynamic=pipeline.od_config.diffusion_compile_dynamic)
 
     def test_setup_compile_honours_full_dit_granularity(self, build_pipeline, mocker):
         pipeline, _ = build_pipeline()
         pipeline.od_config.diffusion_compile_granularity = "full"
         pipeline.od_config.diffusion_compile_dynamic = False
         mocker.patch.object(pipeline.vae_decode, "warmup")
-        compile_dit = mocker.patch.object(pipeline.dit, "compile")
+        mocker.patch.object(pipeline, "_warmup_dit")
+        step = mocker.Mock()
+        pipeline.dit.step = step
+        compile_fn = mocker.patch.object(pipeline_auk.torch, "compile", side_effect=lambda fn, **_: fn)
 
         pipeline.setup_compile()
 
-        compile_dit.assert_called_once_with(dynamic=False)
+        # The samplers call step() directly, so that is what gets compiled.
+        compile_fn.assert_called_once_with(step, dynamic=False)
+
+    @pytest.mark.parametrize("variant, cfg", [("base", 2.0), ("flash", 0.0)])
+    def test_setup_compile_warms_the_dit_graph_buckets(self, build_pipeline, mocker, variant, cfg):
+        pipeline, _ = build_pipeline(variant)
+        mocker.patch.object(pipeline.vae_decode, "warmup")
+        mocker.patch.object(pipeline_auk, "regionally_compile")
+        wrapper = mocker.Mock(enabled=True)
+        pipeline.cudagraph_wrapper = wrapper
+
+        pipeline.setup_compile()
+
+        shapes = [(call.kwargs["x"].shape[1], call.kwargs["ref"].shape[1]) for call in wrapper.call_args_list]
+        assert shapes == [(150, 0), (300, 0), (600, 0), (150, 150), (300, 150), (600, 150)]
+        for call in wrapper.call_args_list:
+            assert call.kwargs["cfg_strength"] == cfg
+            assert call.kwargs["new_request"] is True
+            assert call.kwargs["text"].shape == (1, 96, TEXT_HIDDEN_DIM)
+
+    @pytest.mark.parametrize("model_config, enabled", [({"auk_dit_warmup_frames": []}, True), ({}, False)])
+    def test_dit_warmup_can_be_skipped(self, build_pipeline, mocker, model_config, enabled):
+        pipeline, _ = build_pipeline(model_config=model_config)
+        wrapper = mocker.Mock(enabled=enabled)
+        pipeline.cudagraph_wrapper = wrapper
+
+        pipeline._warmup_dit()
+
+        wrapper.assert_not_called()
 
     def test_latent_output_type_skips_the_decoder(self, build_pipeline):
         pipeline, _ = build_pipeline()
@@ -459,6 +503,40 @@ class TestRequestParsing:
         call = pipeline.vae.encode_calls[0]
         assert call["sample"] is True
         assert isinstance(call["generator"], torch.Generator)
+
+    def test_reference_latents_are_cached_by_content(self, build_pipeline):
+        pipeline, calls = build_pipeline()
+        clip = _silence(1.0)
+
+        for _ in range(3):
+            pipeline.forward(_batch(_prompt(audio=clip, knobs={"gen_seconds": 1.0}), seed=1))
+        # A different clip is a new entry, the first one still hits.
+        other = (np.full_like(clip[0], 0.25), clip[1])
+        pipeline.forward(_batch(_prompt(audio=other, knobs={"gen_seconds": 1.0}), seed=1))
+        pipeline.forward(_batch(_prompt(audio=clip, knobs={"gen_seconds": 1.0}), seed=1))
+
+        assert len(pipeline.vae.encode_calls) == 2
+        assert calls[0]["ref"] is calls[1]["ref"] is calls[4]["ref"]
+
+    def test_posterior_draws_and_disabled_cache_always_encode(self, build_pipeline):
+        pipeline, _ = build_pipeline()
+        for _ in range(2):
+            pipeline.forward(
+                _batch(_prompt(audio=_silence(1.0), knobs={"gen_seconds": 1.0, "vae_sample": True}), seed=1)
+            )
+        assert len(pipeline.vae.encode_calls) == 2
+
+        pipeline, _ = build_pipeline(model_config={"auk_ref_cache_size": 0})
+        for _ in range(2):
+            pipeline.forward(_batch(_prompt(audio=_silence(1.0), knobs={"gen_seconds": 1.0}), seed=1))
+        assert len(pipeline.vae.encode_calls) == 2
+
+    def test_reference_cache_is_bounded(self, build_pipeline):
+        pipeline, _ = build_pipeline(model_config={"auk_ref_cache_size": 2})
+        for level in (0.1, 0.2, 0.3):
+            clip = (np.full(SAMPLE_RATE, level, dtype=np.float32), SAMPLE_RATE)
+            pipeline.forward(_batch(_prompt(audio=clip, knobs={"gen_seconds": 1.0}), seed=1))
+        assert len(pipeline._ref_cache) == 2
 
     def test_one_request_per_forward(self, build_pipeline):
         pipeline, _ = build_pipeline()

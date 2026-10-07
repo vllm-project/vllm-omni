@@ -2,11 +2,16 @@
 # kernels==0.16.1 requires the LayerRepository version=/revision= integration
 # introduced in transformers 5.13. Keep the tested upper bound: 5.15 has
 # a reported model-construction regression; later versions need validation.
-# This range also satisfies vLLM 0.30.0's transformers>=5.10.4 requirement.
+# This range also satisfies vLLM 0.31.0's transformers>=5.10.4,<5.18.0 requirement.
 # MOSS-TTS-Nano's list/set weight-loading compatibility is handled by
 # transformers_keys_to_ignore_compat in model_executor/models/utils.py.
 transformers >= 5.13.0, < 5.15
 av>=14.0.0
+# typing_extensions.Concatenate accepts a trailing `...` on 3.10 only from
+# 4.13 (older 4.12.x re-export typing.Concatenate, which rejects it). The
+# Nemotron VoiceChat codec annotates `Concatenate[int, ...]`, so pin the
+# floor instead of relying on the version vLLM/torch pull transitively.
+typing_extensions>=4.13
 omegaconf>=2.3.0
 diffusers==0.40.0
 # Hub kernels, including LTX-2.5 NATTEN. 0.16+ resolves torch-stable-abi*

@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Bit-exact replacement forwards for the diffusers Wan VAE decoder modules.
+"""Replacement forwards for the diffusers Wan VAE decoder modules.
 
 Each function below is bound per module instance (``types.MethodType``) by
 :mod:`.install`; the diffusers classes themselves are never modified. Every
-function reproduces the diffusers 0.40 operation order exactly and only
-differs in how the bytes move:
+function at the ``lossless`` level reproduces the diffusers 0.40 operation
+order exactly and only differs in how the bytes move:
 
 * ``WanRMS_norm``: fp32 ``vector_norm`` straight from the low-precision tensor
   plus one fused Triton epilogue (see :mod:`.triton_rms_norm`), optionally with
@@ -22,8 +22,10 @@ differs in how the bytes move:
   :mod:`.triton_upsample`); it only replicates values, so the upstream fp32
   round trip is the identity and is skipped.
 
-Whenever a kernel declines an input, the code falls through to the reference
-expression, so the result is identical on every path.
+The opt-in ``channels_last`` level also changes convolution and normalization
+arithmetic. Its first-frame causal Conv3d uses the mathematically equivalent
+Conv2d when there is no history; floating-point outputs need not be bit-exact.
+Whenever a kernel declines an input, the reference expression is used.
 """
 
 from __future__ import annotations
@@ -310,6 +312,42 @@ def _layout_tag(x: torch.Tensor) -> str:
     return "channels_last" if x.shape[1] > 1 and x.stride(1) == 1 else "channels_first"
 
 
+def _first_frame_conv2d(
+    conv: WanCausalConv3d, x: torch.Tensor, bias: torch.Tensor | None
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Convolve ``[0, 0, x]`` with the last temporal weight slice, retaining the cache.
+
+    Called only for CUDA inference without history. The identity holds for
+    finite operands, but Conv2d may round differently, so only the tolerance-
+    based channels_last level uses it.
+    """
+    cfg = getattr(conv, CFG_ATTR, None)
+    if (
+        cfg is None
+        or not cfg.channels_last
+        or x.shape[2] != 1
+        or x.dtype not in _NORM_DTYPES
+        or conv.kernel_size not in ((3, 3, 3), (3, 1, 1))
+        or conv.stride != (1, 1, 1)
+        or conv.dilation != (1, 1, 1)
+        or conv.groups != 1
+        or conv.padding != (0, 0, 0)
+        or conv.padding_mode != "zeros"
+        or tuple(conv._padding) != ((1, 1, 1, 1, 2, 0) if conv.kernel_size == (3, 3, 3) else (0, 0, 0, 0, 2, 0))
+    ):
+        return None
+    pair = dm.cat_time_5d(x, None, conv._padding[4], keep_cache_frames=CACHE_T)
+    if pair is None:
+        return None
+    _, next_cache = pair
+    # Materialize only the current weight slice; retaining a packed copy could
+    # become stale after weight loading or keep offloaded weights on the GPU.
+    weight = conv.weight[:, :, 2].contiguous(memory_format=torch.channels_last)
+    image = x[:, :, 0].contiguous(memory_format=torch.channels_last)
+    out = F.conv2d(image, weight, bias, padding=(conv._padding[2], conv._padding[0]))
+    return out.unsqueeze(2), next_cache
+
+
 def _run_cached_causal_conv(
     conv: nn.Module,
     x: torch.Tensor,
@@ -348,6 +386,12 @@ def _run_cached_causal_conv(
     ):
         fold_bias = return_bias and conv.bias is not None
         bias = None if fold_bias else conv.bias
+
+        if payload is None:
+            first_frame = _first_frame_conv2d(conv, x, bias)
+            if first_frame is not None:
+                out, cache_list[index] = first_frame
+                return (out, _deferred_conv_bias(conv, out)) if return_bias else out
 
         # Preferred: temporal concat only (aligned plane copies) + cuDNN spatial
         # padding, once verified bitwise for this (conv, shape).

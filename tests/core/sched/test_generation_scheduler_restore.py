@@ -11,7 +11,9 @@ from types import SimpleNamespace
 import pytest
 import torch
 from vllm import SamplingParams
+from vllm.distributed.aux_output_connector.connector import AuxOutputSchedulerConnector
 from vllm.v1.core.sched.interface import PauseState
+from vllm.v1.core.sched.output import CachedRequestData
 from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
 from vllm.v1.request import Request, RequestStatus
 
@@ -53,12 +55,14 @@ class FakeAdapter:
 def _make_generation_scheduler(waiting_request, *, use_v2_model_runner=False):
     scheduler = OmniGenerationScheduler.__new__(OmniGenerationScheduler)
     scheduler.max_num_scheduled_tokens = 8
+    scheduler.max_num_active_reqs = 1
     scheduler.max_num_running_reqs = 1
     scheduler._pause_state = PauseState.UNPAUSED
     scheduler.running = []
     scheduler.waiting = create_request_queue(SchedulingPolicy.FCFS)
     scheduler.waiting.add_request(waiting_request)
-    scheduler.skipped_waiting = create_request_queue(SchedulingPolicy.FCFS)
+    scheduler.kv_holding_waiting = create_request_queue(SchedulingPolicy.FCFS)
+    scheduler.deferred_waiting = set()
     scheduler.requests = {waiting_request.request_id: waiting_request}
     scheduler.policy = SchedulingPolicy.FCFS
     scheduler.chunk_transfer_adapter = FakeAdapter()
@@ -86,6 +90,7 @@ def _make_generation_scheduler(waiting_request, *, use_v2_model_runner=False):
         get_manager_metadata=lambda: None,
     )
     scheduler.connector = None
+    scheduler.aux_output_connector = None
     scheduler.ec_connector = None
     scheduler.prev_step_scheduled_req_ids = set()
     scheduler._pending_finish_reqs = []
@@ -103,6 +108,45 @@ def _make_generation_scheduler(waiting_request, *, use_v2_model_runner=False):
     scheduler._update_after_schedule = lambda output: None
     scheduler._wrap_omni_scheduler_output = lambda output: output
     return scheduler
+
+
+def test_generation_scheduler_preserves_auxiliary_output_metadata() -> None:
+    request = Request("aux-contract", [1, 2], SamplingParams(max_tokens=2), pooling_params=None)
+    request.block_hashes.append(b"block-hash")
+    scheduler = _make_generation_scheduler(request, use_v2_model_runner=True)
+    scheduler.aux_output_connector = AuxOutputSchedulerConnector()
+
+    output = scheduler._build_generation_scheduler_output(
+        new_reqs_data=[],
+        cached_reqs_data=CachedRequestData.make_empty(),
+        num_scheduled_tokens={request.request_id: 1},
+        scheduled_spec_decode_tokens={},
+        scheduled_encoder_inputs={},
+        num_common_prefix_blocks=[0],
+    )
+
+    metadata = output.aux_output_connector_metadata
+    assert metadata is not None
+    assert metadata.requests == {request.request_id: 0}
+    assert list(metadata.block_hashes[request.request_id]) == request.block_hashes
+
+
+@pytest.mark.parametrize(("runner_slots", "active_limit"), [(1, 2), (2, 1)])
+def test_generation_admits_kv_holder_before_fresh_requests(runner_slots, active_limit) -> None:
+    fresh = Request("fresh", [1, 2], SamplingParams(max_tokens=2), pooling_params=None)
+    holding = Request("holding", [3, 4], SamplingParams(max_tokens=2), pooling_params=None)
+    holding.num_computed_tokens = 1
+    scheduler = _make_generation_scheduler(fresh)
+    scheduler.max_num_running_reqs = runner_slots
+    scheduler.max_num_active_reqs = active_limit
+    scheduler.requests[holding.request_id] = holding
+    scheduler.kv_holding_waiting.add_request(holding)
+
+    output = scheduler.schedule()
+
+    assert set(output.num_scheduled_tokens) == {holding.request_id}
+    assert list(scheduler.waiting) == [fresh]
+    assert list(scheduler.kv_holding_waiting) == []
 
 
 def _chunk_request(request_id, **kwargs):
@@ -123,7 +167,13 @@ def _chunk_request(request_id, **kwargs):
         record_event=lambda *args, **kwargs: None,
     )
     defaults.update(kwargs)
-    return SimpleNamespace(**defaults)
+    return _HashableChunkRequest(**defaults)
+
+
+class _HashableChunkRequest(SimpleNamespace):
+    # Deferred queues require identity hashing; SimpleNamespace types it as None.
+    __hash__ = object.__hash__  # type: ignore[assignment]
+    __eq__ = object.__eq__
 
 
 def test_chunk_lifecycle_no_resubmit_and_state_survives_requeue(monkeypatch) -> None:
@@ -138,7 +188,8 @@ def test_chunk_lifecycle_no_resubmit_and_state_survives_requeue(monkeypatch) -> 
     )
     scheduler.running = []
     scheduler.waiting = create_request_queue(scheduler.policy)
-    scheduler.skipped_waiting = create_request_queue(scheduler.policy)
+    scheduler.kv_holding_waiting = create_request_queue(scheduler.policy)
+    scheduler.deferred_waiting = set()
 
     completed = Request("completed", [1, 2], SamplingParams(max_tokens=4), pooling_params=None)
     completed.status = RequestStatus.RUNNING
@@ -292,6 +343,7 @@ def _express_scheduler():
     scheduler = _make_generation_scheduler(continuation, use_v2_model_runner=True)
     scheduler.waiting.add_request(first)
     scheduler.requests[first.request_id] = first
+    scheduler.max_num_active_reqs = 4
     scheduler.max_num_running_reqs = 4
     scheduler._native_data_plane = True
     scheduler.chunk_transfer_adapter = None

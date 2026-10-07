@@ -1050,6 +1050,7 @@ def test_sub_config_fields_match_structured_scopes():
         "interleave_mm_strings",
         "media_io_kwargs",
         "final_output",
+        "supports_running_prefix_cache_reset",
         "active_stream_window",
         "session_mode",
         "duplex_max_sessions",
@@ -1890,7 +1891,7 @@ def test_from_pipeline_config_rejects_reserved_diffusion_kv_mode(tmp_path):
 
 @pytest.mark.parametrize("source", ["default", "topology", "deploy", "stage-cli"])
 @pytest.mark.parametrize("key_container", [list, tuple])
-def test_diffusion_stage_payload_keys_roundtrip(source, key_container):
+def test_diffusion_stage_payload_keys_roundtrip(source, key_container, tmp_path):
     from vllm_omni.diffusion.data import OmniDiffusionConfig
     from vllm_omni.engine.stage_init_utils import build_engine_args_dict_from_omni_stage_config
 
@@ -1923,7 +1924,7 @@ def test_diffusion_stage_payload_keys_roundtrip(source, key_container):
     legacy_stage = merge_pipeline_deploy(pipeline, deploy)[0]
     legacy_args = {**legacy_stage.yaml_engine_args, **(override_keys if source == "stage-cli" else {})}
     restored_stage = ForkingPickler.loads(ForkingPickler.dumps(stage))
-    engine_args = build_engine_args_dict_from_omni_stage_config(restored_stage, model="test-model")
+    engine_args = build_engine_args_dict_from_omni_stage_config(restored_stage, model=str(tmp_path))
     diffusion_kwargs = omni_config_module.extract_diffusion_stage_config_kwargs(
         engine_args, stage_id=restored_stage.stage_id, include_engine_adapter_metadata=True
     )
@@ -1951,7 +1952,9 @@ def test_diffusion_config_field_classification_covers_current_fields():
 
     assert classified_fields == {f.name for f in fields(omni_config_module._DiffusionConfigProjection)}
     assert {f.name for f in fields(OmniDiffusionConfig)} <= (
-        classified_fields | omni_config_module._DIFFUSION_MOVED_SHARED_FIELDS
+        classified_fields
+        | omni_config_module._DIFFUSION_MOVED_SHARED_FIELDS
+        | omni_config_module._DIFFUSION_INTERNAL_FIELDS
     )
     assert {
         "enable_prompt_embed_cache",

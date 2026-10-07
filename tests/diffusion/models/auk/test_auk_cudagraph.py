@@ -29,13 +29,14 @@ def _make_dit(device: str) -> AuKTransformer:
     )
 
 
-def _sample_inputs(device: str, offset: float = 0.0) -> dict[str, torch.Tensor]:
+def _sample_inputs(device: str, offset: float = 0.0, ref_frames: int = 4) -> dict[str, torch.Tensor]:
+    """``ref_frames=0`` is the text-only (instruct TTS) request shape."""
     generator = torch.Generator(device=device).manual_seed(42)
     return {
         "text": torch.randn(1, 7, 8, generator=generator, device=device) + offset,
         "c_mask": torch.ones(1, 7, dtype=torch.bool, device=device),
-        "ref": torch.randn(1, 4, 4, generator=generator, device=device) - offset,
-        "ref_mask": torch.ones(1, 4, dtype=torch.bool, device=device),
+        "ref": (torch.randn(1, 4, 4, generator=generator, device=device) - offset)[:, :ref_frames],
+        "ref_mask": torch.ones(1, ref_frames, dtype=torch.bool, device=device),
     }
 
 
@@ -44,8 +45,8 @@ def _sample_inputs(device: str, offset: float = 0.0) -> dict[str, torch.Tensor]:
 def test_single_request_graph_wrapper_cpu_falls_back_to_eager(cfg_strength: float, mocker) -> None:
     dit = _make_dit("cpu")
     wrapper = AuKCUDAGraphWrapper(dit)
-    run_spy = mocker.spy(wrapper, "_run")
-    run_cfg_spy = mocker.spy(wrapper, "_run_cfg")
+    prepare_spy = mocker.spy(wrapper, "_prepare")
+    step_spy = mocker.spy(wrapper, "_step")
     capture_spy = mocker.spy(wrapper, "_capture")
     inputs = _sample_inputs("cpu")
     common = dict(
@@ -58,13 +59,13 @@ def test_single_request_graph_wrapper_cpu_falls_back_to_eager(cfg_strength: floa
     graph = sample_latents(dit, **common, generator=torch.Generator().manual_seed(7), sampler=wrapper)
     torch.testing.assert_close(graph, eager)
 
-    if cfg_strength >= 1e-5:
-        run_spy.assert_not_called()
-        assert run_cfg_spy.call_count == 2
-    else:
-        assert run_spy.call_count == 2
-        run_cfg_spy.assert_not_called()
-
+    # The conditioning is prepared once per request and reused by every step.
+    assert prepare_spy.call_count == 1
+    # _prepare(x, x_mask, text, c_mask, ref, ref_mask, uses_cfg, timesteps)
+    assert prepare_spy.call_args.args[6] is (cfg_strength >= 1e-5)
+    # The time grid reaches prepare, so the adaLN modulations are computed once.
+    assert prepare_spy.call_args.args[7].numel() == 2
+    assert step_spy.call_count == 2
     capture_spy.assert_not_called()
     assert not wrapper._cache
 
@@ -79,14 +80,15 @@ def test_graph_inputs_use_bounded_length_buckets() -> None:
 
     padded = wrapper._bucket_inputs(x, text, c_mask, ref, ref_mask)
 
-    assert padded[0].shape == (1, 128, 4)
-    assert padded[1].shape == (1, 128)
-    assert padded[2].shape == (1, 128, 8)
-    assert padded[3].shape == (1, 128)
+    assert padded[0].shape == (1, 96, 4)
+    assert padded[1].shape == (1, 96)
+    assert padded[2].shape == (1, 96, 8)
+    assert padded[3].shape == (1, 96)
     assert padded[4].shape == (1, 100, 4)
     assert padded[5].shape == (1, 100)
     assert [mask.sum().item() for mask in (padded[1], padded[3], padded[5])] == [65, 65, 51]
-    assert wrapper._key(padded[0], padded[2], padded[4], False) == (128, 128, 100, False)
+    assert wrapper._key(padded[0], padded[2], padded[4], False) == (96, 96, 100, False, 0)
+    assert wrapper._key(padded[0], padded[2], padded[4], False, 32) == (96, 96, 100, False, 32)
     assert wrapper.max_graphs == 32
 
 
@@ -105,43 +107,24 @@ def test_full_graph_cache_retires_as_one_generation() -> None:
 
 
 @torch.inference_mode()
+@pytest.mark.parametrize("ref_frames", [0, 4])
 @pytest.mark.parametrize("cfg_strength", [0.0, 2.0])
-def test_bucket_padding_preserves_real_frame_outputs(cfg_strength: float) -> None:
+def test_bucket_padding_preserves_real_frame_outputs(cfg_strength: float, ref_frames: int) -> None:
     dit = _make_dit("cpu")
     wrapper = AuKCUDAGraphWrapper(dit)
-    inputs = _sample_inputs("cpu")
+    inputs = _sample_inputs("cpu", ref_frames=ref_frames)
     x = torch.randn(1, 9, 4)
     timestep = torch.tensor(0.4)
     cfg = torch.tensor(cfg_strength)
-    if cfg_strength >= 1e-5:
-        eager = wrapper._run_cfg(
-            x,
-            None,
-            inputs["text"],
-            inputs["c_mask"],
-            inputs["ref"],
-            inputs["ref_mask"],
-            timestep,
-            cfg_strength=cfg,
-        )
-    else:
-        eager = wrapper._run(
-            x,
-            None,
-            inputs["text"],
-            inputs["c_mask"],
-            inputs["ref"],
-            inputs["ref_mask"],
-            timestep,
-        )
-    dit.clear_cache()
+    uses_cfg = cfg_strength >= 1e-5
+    text, c_mask, ref, ref_mask = inputs["text"], inputs["c_mask"], inputs["ref"], inputs["ref_mask"]
 
-    bucketed = wrapper._bucket_inputs(x, inputs["text"], inputs["c_mask"], inputs["ref"], inputs["ref_mask"])
-    if cfg_strength >= 1e-5:
-        padded = wrapper._run_cfg(*bucketed, timestep, cfg_strength=cfg)
-    else:
-        padded = wrapper._run(*bucketed, timestep)
-    dit.clear_cache()
+    ctx = wrapper._prepare(x, None, text, c_mask, ref, ref_mask, uses_cfg)
+    eager = wrapper._step(x, timestep, ctx, cfg)
+
+    bucketed = wrapper._bucket_inputs(x, text, c_mask, ref, ref_mask)
+    padded_ctx = wrapper._prepare(*bucketed, uses_cfg)
+    padded = wrapper._step(bucketed[0], timestep, padded_ctx, cfg)
 
     torch.testing.assert_close(padded[:, : x.shape[1]], eager)
 
@@ -149,13 +132,14 @@ def test_bucket_padding_preserves_real_frame_outputs(cfg_strength: float) -> Non
 @pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graph replay requires CUDA")
 @torch.inference_mode()
+@pytest.mark.parametrize("ref_frames", [0, 4])
 @pytest.mark.parametrize("cfg_strength", [0.0, 2.0])
-def test_single_request_graph_replay_matches_eager_and_updates_inputs(cfg_strength: float) -> None:
+def test_single_request_graph_replay_matches_eager_and_updates_inputs(cfg_strength: float, ref_frames: int) -> None:
     dit = _make_dit("cuda")
     wrapper = AuKCUDAGraphWrapper(dit)
 
     for offset in (0.0, 0.25):
-        inputs = _sample_inputs("cuda", offset)
+        inputs = _sample_inputs("cuda", offset, ref_frames=ref_frames)
         common = dict(
             **inputs,
             gen_frames=9,
@@ -173,16 +157,21 @@ def test_single_request_graph_replay_matches_eager_and_updates_inputs(cfg_streng
             inputs["ref"],
             inputs["ref_mask"],
         )
-        key = wrapper._key(bucketed[0], bucketed[2], bucketed[4], cfg_strength >= 1e-5)
+        # sample_latents passes the grid, so the key carries its step count (two steps here).
+        key = wrapper._key(bucketed[0], bucketed[2], bucketed[4], cfg_strength >= 1e-5, 2)
         assert key in wrapper._cache
 
+        # The static context was refreshed for this request's conditioning.
         entry = wrapper._cache[key]
-        torch.testing.assert_close(entry.static_x_mask, bucketed[1])
-        torch.testing.assert_close(entry.static_text, bucketed[2])
-        torch.testing.assert_close(entry.static_c_mask, bucketed[3])
-        torch.testing.assert_close(entry.static_ref, bucketed[4])
-        torch.testing.assert_close(entry.static_ref_mask, bucketed[5])
+        grid = torch.tensor([0.0, 0.4], device="cuda")
+        fresh = wrapper._prepare(*bucketed, cfg_strength >= 1e-5, grid)
+        for static, want in zip(entry.static_ctx.tensors(), fresh.tensors(), strict=True):
+            if want is None:
+                assert static is None
+            else:
+                torch.testing.assert_close(static, want)
         torch.testing.assert_close(entry.static_timestep, torch.tensor(0.4, device="cuda"))
+        assert int(entry.static_step) == 1
 
     assert len(wrapper._cache) == 1
 
@@ -194,7 +183,7 @@ def test_graph_capture_failure_is_propagated(mocker) -> None:
     dit = _make_dit("cuda")
     wrapper = AuKCUDAGraphWrapper(dit)
     capture = mocker.patch.object(wrapper, "_capture", side_effect=RuntimeError("capture failed"))
-    eager = mocker.spy(wrapper, "_run")
+    eager = mocker.spy(wrapper, "_step")
     inputs = _sample_inputs("cuda")
     common = dict(
         **inputs,

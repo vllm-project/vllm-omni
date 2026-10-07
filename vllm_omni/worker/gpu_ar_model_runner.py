@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import gc
 import threading
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import nullcontext
 from copy import copy
 from dataclasses import replace
@@ -182,6 +182,10 @@ def _snapshot_tensor_payload_to_cpu_async(
     with torch.cuda.stream(copy_stream):
         copy_stream.wait_stream(source_stream)
         cpu_payload = _copy_tensor_payload_to_cpu(cloned, pin_memory)
+        # An executor may discard an unconsumed output (e.g. cancellation).
+        # Keep the allocator from reusing its source storage before D2H ends.
+        for source in cuda_sources:
+            source.record_stream(copy_stream)
         ready_event.record(copy_stream)
     return _AsyncCPUPayloadSnapshot(cpu_payload, ready_event, cuda_sources)
 
@@ -206,7 +210,6 @@ class OmniAsyncGPUModelRunnerOutput(AsyncGPUModelRunnerOutput):
         invalid_req_indices = kwargs.pop("invalid_req_indices")
         async_output_copy_stream = kwargs.pop("async_output_copy_stream")
         vocab_size = kwargs.pop("vocab_size")
-        routed_experts = kwargs.pop("routed_experts", None)
         num_nans = kwargs.pop("num_nans", None)
         # Upstream AsyncGPUModelRunnerOutput added check_ep_fault / _has_fault
         # for EP all2all fault tolerance (PR #43637). Omni doesn't use this
@@ -223,7 +226,6 @@ class OmniAsyncGPUModelRunnerOutput(AsyncGPUModelRunnerOutput):
         self._sampled_token_ids = sampled_token_ids
         self.vocab_size = vocab_size
         self._logprobs_tensors = logprobs_tensors
-        self._routed_experts = routed_experts
         self._has_fault: torch.Tensor | None = None
         # Upstream b1e12d142d (PR #51304) added device-side NaN-in-logits
         # counts (num_nans) to AsyncGPUModelRunnerOutput. Omni keeps the
@@ -240,9 +242,6 @@ class OmniAsyncGPUModelRunnerOutput(AsyncGPUModelRunnerOutput):
             # output asynchronously.
             self.sampled_token_ids_cpu = self._sampled_token_ids.to("cpu", non_blocking=True)
             self._logprobs_tensors_cpu = self._logprobs_tensors.to_cpu_nonblocking() if self._logprobs_tensors else None
-            self._routed_experts_cpu = (
-                self._routed_experts.to_cpu_nonblocking() if self._routed_experts is not None else None
-            )
             self._num_nans_cpu = self._num_nans.to("cpu", non_blocking=True) if self._num_nans is not None else None
             self.async_copy_ready_event.record()
 
@@ -893,6 +892,44 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             merged[req_id] = data
         return merged
 
+    def _call_prepare_runner_inputs(
+        self,
+        prepare_runner_inputs: Callable[..., tuple[torch.Tensor, torch.Tensor]],
+        *,
+        req_ids: list[str],
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        inputs_embeds: torch.Tensor | None,
+        num_computed_tokens: np.ndarray,
+        num_scheduled_tokens: np.ndarray,
+        input_ids_buffer: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Keep opt-in request metadata outside captured model forwards."""
+        if getattr(self.model, "accepts_runner_sampling_extra_args", False):
+            return prepare_runner_inputs(
+                input_ids=input_ids,
+                positions=positions,
+                inputs_embeds=inputs_embeds,
+                req_ids=req_ids,
+                num_computed_tokens=num_computed_tokens,
+                num_scheduled_tokens=num_scheduled_tokens,
+                input_ids_buffer=input_ids_buffer,
+                sampling_extra_args=[
+                    params.extra_args if params and params.extra_args else {}
+                    for params in (self.requests[rid].sampling_params for rid in req_ids)
+                ],
+                discard_mask=self.discard_request_mask.np[: len(req_ids)],
+            )
+        return prepare_runner_inputs(
+            input_ids=input_ids,
+            positions=positions,
+            inputs_embeds=inputs_embeds,
+            req_ids=req_ids,
+            num_computed_tokens=num_computed_tokens,
+            num_scheduled_tokens=num_scheduled_tokens,
+            input_ids_buffer=input_ids_buffer,
+        )
+
     @torch.inference_mode()
     def execute_model(
         self,
@@ -901,9 +938,6 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
     ) -> OmniModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors | None:
         if self.execute_model_state is not None:
             raise RuntimeError("State error: sample_tokens() must be called after execute_model() returns None.")
-
-        if self.routed_experts_initialized:
-            self.routed_experts_capturer.clear_buffer()
 
         if not getattr(self, "_warmup_state_cleared", False):
             self._warmup_state_cleared = True
@@ -935,11 +969,6 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                 flush_ids.update({rid for rid in self._pending_full_payload_send if rid not in self.requests})
                 if flush_ids:
                     self.flush_full_payload_outputs(flush_ids)
-
-        if self.routed_experts_initialized:
-            capturer = self.routed_experts_capturer
-            if capturer is not None and hasattr(capturer, "finalize_pending_copy"):
-                capturer.finalize_pending_copy()
 
         # If ngram_gpu is used, we need to copy the scheduler_output to avoid
         # the modification has influence on the scheduler_output in engine core process.
@@ -1150,11 +1179,12 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         # for multimodal position detection, fix decode position offsets).
         prepare_runner_inputs = getattr(self.model, "prepare_runner_inputs", None)
         if callable(prepare_runner_inputs):
-            input_ids, positions = prepare_runner_inputs(
+            input_ids, positions = self._call_prepare_runner_inputs(
+                prepare_runner_inputs,
+                req_ids=req_ids[:num_reqs],
                 input_ids=input_ids,
                 positions=positions,
                 inputs_embeds=inputs_embeds,
-                req_ids=req_ids[:num_reqs],
                 num_computed_tokens=self.input_batch.num_computed_tokens_cpu[:num_reqs],
                 num_scheduled_tokens=num_scheduled_tokens_np[:num_reqs],
                 input_ids_buffer=self.input_ids.gpu[:num_tokens_padded],
@@ -1331,9 +1361,6 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
 
         if deferred_state_corrections_fn:
             deferred_state_corrections_fn()
-
-        if self._should_return_omni_routed_experts() and hasattr(self, "_positions_cpu"):
-            self._omni_routed_experts_d2h(scheduler_output)
 
         return None
 
@@ -1557,10 +1584,12 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             return None
         return wire_payloads
 
-    def _snapshot_query_start_loc_cpu(self) -> Any:
+    def _get_query_start_loc_cpu(self, *, snapshot: bool) -> Any:
         query_start_loc_cpu = self.query_start_loc.cpu
         if callable(query_start_loc_cpu):
             query_start_loc_cpu = query_start_loc_cpu()
+        if not snapshot:
+            return query_start_loc_cpu
         if isinstance(query_start_loc_cpu, torch.Tensor):
             return query_start_loc_cpu.detach().cpu().clone()
         if isinstance(query_start_loc_cpu, np.ndarray):
@@ -1586,14 +1615,6 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             return replace(scheduler_output, **updates)
         except TypeError:
             return scheduler_output
-
-    def _should_return_omni_routed_experts(self) -> bool:
-        model_config = getattr(self, "model_config", None)
-        if model_config is None:
-            model_config = getattr(getattr(self, "vllm_config", None), "model_config", None)
-        return bool(getattr(model_config, "enable_return_routed_experts", False)) and bool(
-            getattr(self, "routed_experts_initialized", False)
-        )
 
     @staticmethod
     def _model_omni_flag(model: Any, name: str, default: bool = False) -> bool:
@@ -1655,9 +1676,9 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         model_config = getattr(self, "model_config", None)
         if model_config is None:
             model_config = getattr(getattr(self, "vllm_config", None), "model_config", None)
-        if not bool(getattr(model_config, "async_chunk", False)):
-            return False
-        if bool(getattr(model_config, "enable_return_routed_experts", False)):
+        if not bool(getattr(model_config, "async_chunk", False)) and not self._model_omni_flag(
+            getattr(self, "model", None), "supports_async_whole_payload"
+        ):
             return False
 
         model = getattr(self, "model", None)
@@ -1847,7 +1868,18 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         # OmniModelRunnerOutput.pooler_output (which is set to None below).
         # The actual multimodal wire transport uses multimodal_outputs instead.
         pooler_output: list[dict[str, object]] | None = None
-        if needs_pooler_payload:
+        # Token-only steps have no pooler payload to construct. Keep the full
+        # path for cached payloads and model postprocess, even without MM input.
+        has_mm_payload = multimodal_outputs is not None and (
+            not isinstance(multimodal_outputs, Mapping) or len(multimodal_outputs) > 0
+        )
+        needs_payload_work = (
+            include_hidden_payload
+            or has_mm_payload
+            or self.omni_prefix_cache is not None
+            or (not postprocess_already_applied and self._runner_model_omni_flag("has_postprocess"))
+        )
+        if needs_pooler_payload and needs_payload_work:
             hidden_seq_len = int(hidden_states.shape[0])
             scheduled_seq_len = int(scheduler_output.total_num_scheduled_tokens)
             mm_cpu = None
@@ -1943,9 +1975,6 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             )
 
         with record_function_or_nullcontext("gpu_model_runner: ModelRunnerOutput"):
-            routed_experts_lists = None
-            if self._should_return_omni_routed_experts():
-                routed_experts_lists = self._omni_extract_routed_experts(scheduler_output)
             output = OmniModelRunnerOutput(
                 req_ids=req_ids_output_copy,
                 req_id_to_index=req_id_to_index_output_copy,
@@ -1961,7 +1990,6 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                 cudagraph_stats=cudagraph_stats,
             )
             output.kv_extracted_req_ids = kv_extracted_req_ids
-            output.routed_experts = routed_experts_lists
         return output
 
     @torch.inference_mode()
@@ -2110,6 +2138,14 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                 scheduler_output.total_num_scheduled_tokens,
             )
 
+        post_sample_mm = getattr(getattr(self, "model", None), "post_sample_multimodal_outputs", None)
+        if callable(post_sample_mm):
+            multimodal_outputs = post_sample_mm(
+                req_ids=req_ids_output_copy,
+                invalid_req_indices=invalid_req_indices,
+                multimodal_outputs=multimodal_outputs,
+            )
+
         multimodal_outputs = self._run_post_sample_talker_mtp(
             req_ids=req_ids_output_copy,
             valid_sampled_token_ids=valid_sampled_token_ids,
@@ -2137,6 +2173,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         kv_connector_output = self.kv_connector_output
         self.kv_connector_output = None
 
+        use_async_omni_output = self._should_use_async_omni_output()
         num_scheduled_tokens_np = getattr(self, "_omni_num_scheduled_tokens_np", None)
         if num_scheduled_tokens_np is None:
             num_scheduled_tokens_np = np.array(
@@ -2144,20 +2181,29 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                 dtype=np.int32,
             )
         else:
-            num_scheduled_tokens_np = np.asarray(num_scheduled_tokens_np, dtype=np.int32).copy()
+            num_scheduled_tokens_np = np.asarray(num_scheduled_tokens_np, dtype=np.int32)
+            if use_async_omni_output:
+                num_scheduled_tokens_np = num_scheduled_tokens_np.copy()
 
-        query_start_loc_cpu = self._snapshot_query_start_loc_cpu()
-        scheduler_output_snapshot = self._snapshot_scheduler_output_for_async_omni_output(scheduler_output)
-        req_ids_output_snapshot = list(req_ids_output_copy)
-        req_id_to_index_output_snapshot = dict(req_id_to_index_output_copy)
-        valid_sampled_token_ids_snapshot = [list(token_ids) for token_ids in valid_sampled_token_ids]
-        logprobs_lists_snapshot = copy(logprobs_lists) if logprobs_lists is not None else None
-        prompt_logprobs_dict_snapshot = dict(prompt_logprobs_dict) if prompt_logprobs_dict is not None else {}
-        num_nans_in_logits_snapshot = (
-            dict(num_nans_in_logits) if isinstance(num_nans_in_logits, dict) else num_nans_in_logits
-        )
-
-        use_async_omni_output = self._should_use_async_omni_output()
+        # Inline materialization finishes before the next execute_model can
+        # mutate step metadata. Only the background builder needs snapshots.
+        query_start_loc_cpu = self._get_query_start_loc_cpu(snapshot=use_async_omni_output)
+        scheduler_output_snapshot = scheduler_output
+        valid_sampled_token_ids_snapshot = valid_sampled_token_ids
+        logprobs_lists_snapshot = logprobs_lists
+        prompt_logprobs_dict_snapshot = prompt_logprobs_dict
+        num_nans_in_logits_snapshot = num_nans_in_logits
+        if use_async_omni_output:
+            scheduler_output_snapshot = self._snapshot_scheduler_output_for_async_omni_output(scheduler_output)
+            valid_sampled_token_ids_snapshot = [list(token_ids) for token_ids in valid_sampled_token_ids]
+            logprobs_lists_snapshot = copy(logprobs_lists) if logprobs_lists is not None else None
+            prompt_logprobs_dict_snapshot = dict(prompt_logprobs_dict) if prompt_logprobs_dict is not None else {}
+            num_nans_in_logits_snapshot = (
+                dict(num_nans_in_logits) if isinstance(num_nans_in_logits, dict) else num_nans_in_logits
+            )
+        # _bookkeeping_sync already detached these from the mutable input batch.
+        req_ids_output_snapshot = req_ids_output_copy
+        req_id_to_index_output_snapshot = req_id_to_index_output_copy
         omni_postprocess_already_applied = False
         if use_async_omni_output:
             omni_postprocess_already_applied = self._maybe_run_eager_omni_postprocess_before_async_output(
@@ -2184,12 +2230,18 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             if output_tensor_snapshot.async_payload is not None:
                 with record_function_or_nullcontext("omni_async_output:wait_cpu_payload"):
                     output_tensor_snapshot.async_payload.wait()
+            mm_snapshot = output_tensor_snapshot.multimodal_outputs
+            finalize_snapshot = getattr(
+                getattr(self, "model", None), "finalize_multimodal_outputs_from_cpu_snapshot", None
+            )
+            if callable(finalize_snapshot):
+                mm_snapshot = finalize_snapshot(mm_snapshot)
             with record_function_or_nullcontext("omni_output_builder:total"):
                 output = self._build_omni_model_runner_output_from_snapshot(
                     scheduler_output=scheduler_output_snapshot,
                     hidden_states=output_tensor_snapshot.hidden_states,
                     staged_hidden_states_cpu=output_tensor_snapshot.staged_hidden_states_cpu,
-                    multimodal_outputs=output_tensor_snapshot.multimodal_outputs,
+                    multimodal_outputs=mm_snapshot,
                     req_ids_output_copy=req_ids_output_snapshot,
                     req_id_to_index_output_copy=req_id_to_index_output_snapshot,
                     valid_sampled_token_ids=valid_sampled_token_ids_snapshot,
