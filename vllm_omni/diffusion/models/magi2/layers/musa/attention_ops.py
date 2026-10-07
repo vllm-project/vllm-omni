@@ -34,6 +34,7 @@ def varlen_attention_with_sink(
     max_seqlen_k: int | None = None,
     softcap: float = -1.0,
     sink: torch.Tensor | None = None,
+    sink_lse: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Preserve MUSA eligibility, provider-failure propagation and sink precision."""
 
@@ -66,7 +67,7 @@ def varlen_attention_with_sink(
             # Correct the learned sinks in FP32; FA3 itself runs in the activation dtype.
             if sink is not None:
                 out = out.float()
-            return correct_out_lse_with_sink(out, lse, sink)[0].to(q.dtype)
+            return correct_out_lse_with_sink(out, lse, sink, sink_lse=sink_lse)[0].to(q.dtype)
         logger.warning_once(
             "MAGI-2 FlashAttention-3 is unavailable on MUSA; using Torch reference attention: %s", unsupported
         )

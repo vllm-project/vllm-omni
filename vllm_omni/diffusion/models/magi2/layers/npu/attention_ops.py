@@ -23,6 +23,7 @@ def varlen_attention_with_sink(
     max_seqlen_k: int | None = None,
     softcap: float = -1.0,
     sink: torch.Tensor | None = None,
+    sink_lse: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run Ascend fused-infer-attention-v2 with MAGI-2 sink semantics."""
 
@@ -38,8 +39,9 @@ def varlen_attention_with_sink(
             max_seqlen_k=max_seqlen_k,
             softcap=softcap,
             sink=sink,
+            sink_lse=sink_lse,
         )
-    del max_seqlen_q, max_seqlen_k
+    del max_seqlen_q, max_seqlen_k, sink_lse
     if q.ndim != 3 or k.ndim != 3 or v.ndim != 3:
         raise ValueError("packed attention expects q/k/v shaped [tokens,heads,dim]")
     if cu_seqlens_q.numel() != cu_seqlens_k.numel():
