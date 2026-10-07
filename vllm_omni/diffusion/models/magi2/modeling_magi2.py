@@ -23,6 +23,7 @@ import torch.nn as nn
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention
+from vllm_omni.platforms import current_omni_platform
 
 from .attention import Magi2PackedAttentionKernel, VarlenHandler
 from .common_layers import (
@@ -42,6 +43,7 @@ from .layers import (
 )
 from .parallel import (
     Magi2SequenceDispatcher,
+    get_magi2_ep_replicas,
     get_magi2_ep_split_indices,
     get_magi2_expert_parallel_config,
     get_magi2_ulysses_group,
@@ -283,7 +285,12 @@ class Magi2MultiHeadMoELayer(nn.Module):
         if parallel is not None:
             sp_group = get_magi2_ulysses_group()
             self._sp_world_size = sp_group.world_size
-            self._ep_split_indices = get_magi2_ep_split_indices(self.moe_mlp.ep_group, sp_group)
+            # MUSA: every GPU pair has its own link, so exchanging the MoE heads
+            # over all SP ranks uses more links than exchanging within one
+            # head-EP group.  Each owner still receives the same token count.
+            if current_omni_platform.is_musa() and get_magi2_ep_replicas(self.moe_mlp.ep_group, sp_group) > 1:
+                self.moe_mlp.set_dispatch_group(sp_group)
+            self._ep_split_indices = get_magi2_ep_split_indices(self.moe_mlp.dispatch_group, sp_group)
         self.merge_linear = make_grouped_linear(
             config.hidden_size,
             config.hidden_size,
