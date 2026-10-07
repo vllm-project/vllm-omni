@@ -1181,6 +1181,7 @@ def _build_multi_api_stage_runtime(args: TrackingNamespace, num_api_servers: int
         async_chunk=async_chunk,
         tokenizer=getattr(args, "tokenizer", None),
         log_stats=not bool(getattr(args, "disable_log_stats", False)),
+        omni_lb_policy=str(getattr(args, "omni_lb_policy", "random")),
     )
 
 

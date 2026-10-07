@@ -176,6 +176,7 @@ class StageRuntime:
         tokenizer: str | None = None,
         parallel_stage_init: bool = False,
         log_stats: bool = False,
+        omni_lb_policy: str = "random",
         client_config: OmniClientConfig | None = None,
     ) -> None:
         self._stage_configs = stage_configs
@@ -190,6 +191,7 @@ class StageRuntime:
         # keeps the legacy per-device LOCK_EX serialization.
         self._parallel_stage_init = parallel_stage_init
         self._log_stats = log_stats
+        self._omni_lb_policy = omni_lb_policy
         self._num_stages = len(stage_configs)
         self._client_count = int((client_config or {}).get("client_count", 1))
         self._client_index = int((client_config or {}).get("client_index", 0))
@@ -1304,6 +1306,11 @@ class StageRuntime:
     ) -> list[StagePool]:
         """Assemble logical stage pools."""
         stage_pools: list[StagePool] = []
+        local_lb_factory = (
+            _build_load_balancer_factory(self._omni_lb_policy)
+            if LoadBalancingPolicy(self._omni_lb_policy) is LoadBalancingPolicy.COST_AWARE
+            else None
+        )
 
         for plan in stage_plans:
             replica_clients = initialized_clients_by_stage[plan.stage_idx]
@@ -1324,14 +1331,15 @@ class StageRuntime:
                     log_stats=self._log_stats,
                 )
 
-            stage_pools.append(
-                StagePool(
-                    plan.stage_idx,
-                    clients,
-                    output_processor=output_processor,
-                    stage_vllm_config=stage_vllm_config,
-                )
+            pool = StagePool(
+                plan.stage_idx,
+                clients,
+                output_processor=output_processor,
+                stage_vllm_config=stage_vllm_config,
             )
+            if local_lb_factory is not None:
+                pool.attach_load_balancer(local_lb_factory())
+            stage_pools.append(pool)
 
         return stage_pools
 
@@ -1737,5 +1745,6 @@ def create_stage_runtime(
         tokenizer=tokenizer,
         parallel_stage_init=parallel_stage_init,
         log_stats=log_stats,
+        omni_lb_policy=omni_lb_policy,
         client_config=client_config,
     )

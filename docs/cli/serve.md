@@ -79,11 +79,11 @@ degrades to queue-length balancing for workloads without a usable estimate.
 Existing random, round-robin, and least-queue-length policies are unchanged.
 
 The policy tracks exact costs only for outstanding assignments made by the
-current head. Coordinator `queue_length` still accounts for requests routed by
-other heads; those unknown requests use the mean cost of the current head's
-active assignments, or the incoming request's cost when no local assignment is
-active. This makes the policy useful with multiple heads without claiming a
-globally exact work ledger.
+current head. In coordinator-backed deployments, `queue_length` also accounts
+for requests routed by other heads; those unknown requests use the mean cost of
+the current head's active assignments, or the incoming request's cost when no
+local assignment is active. A local replica pool uses its head-local bindings
+as the queue snapshot. Neither mode claims a globally exact work ledger.
 
 ## Stage-based CLI quickstart
 

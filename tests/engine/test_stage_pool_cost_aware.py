@@ -73,6 +73,12 @@ def _make_distributed_pool(
     return pool
 
 
+def _make_local_pool(balancer: CostAwareBalancer, addrs: list[str]) -> StagePool:
+    pool = StagePool(0, [_FakeStageClient(addr) for addr in addrs])  # type: ignore[arg-type]
+    pool.attach_load_balancer(balancer)
+    return pool
+
+
 @pytest.mark.asyncio
 async def test_pick_forwards_sampling_params_to_cost_aware_balancer():
     balancer = CostAwareBalancer()
@@ -141,6 +147,29 @@ async def test_explicit_task_overrides_sampling_params():
     )
 
     assert balancer._reservations["r1"][1] == 99.0
+
+
+@pytest.mark.asyncio
+async def test_local_pool_routes_by_projected_cost(monkeypatch):
+    monkeypatch.setattr(
+        "vllm_omni.distributed.omni_coordinator.load_balancer.random.choice",
+        lambda candidates: candidates[0],
+    )
+    pool = _make_local_pool(CostAwareBalancer(), ["a", "b"])
+
+    heavy = await pool.pick("heavy", task={"estimated_cost": 100.0})
+    light_1 = await pool.pick("light-1", task={"estimated_cost": 1.0})
+    light_2 = await pool.pick("light-2", task={"estimated_cost": 1.0})
+
+    assert heavy == 0
+    assert light_1 == light_2 == 1
+
+
+def test_local_pool_without_attached_balancer_keeps_legacy_round_robin():
+    pool = StagePool(0, [_FakeStageClient("a"), _FakeStageClient("b")])  # type: ignore[arg-type]
+
+    assert pool.select_replica_id("r1") == 0
+    assert pool.select_replica_id("r2") == 1
 
 
 @pytest.mark.asyncio
