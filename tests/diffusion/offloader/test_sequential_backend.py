@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """Unit tests for SequentialOffloadBackend."""
 
@@ -364,12 +364,9 @@ class TestMoveParamsPinMemory:
         )
         assert not tracker["called"], "pin_memory should not be called for DTensor"
 
-    def test_regular_tensor_calls_pin_memory(self, accelerator_device, monkeypatch: pytest.MonkeyPatch):
-        """Regular tensor should call pin_memory when moving to CPU."""
+    def test_regular_tensor_is_pinned(self, accelerator_device):
+        """CPU-offloaded weights must be pinned regardless of allocation strategy."""
         module = _create_simple_module().to(accelerator_device)
-        tracker, mock_pin = _track_pin_memory_calls()
-
-        monkeypatch.setattr(torch.Tensor, "pin_memory", mock_pin)
         hook = SequentialOffloadHook(
             offload_targets=[],
             device=accelerator_device,
@@ -382,7 +379,7 @@ class TestMoveParamsPinMemory:
             non_blocking=False,
             pin_memory=True,
         )
-        assert tracker["called"], "pin_memory should be called for regular tensors"
+        assert all(tensor.is_pinned() for tensor in module.parameters())
 
     def test_pin_memory_skipped_when_disabled(self, accelerator_device, monkeypatch: pytest.MonkeyPatch):
         """pin_memory should not be called when pin_memory=False."""
