@@ -5,14 +5,14 @@
 
 A session opts in with ``extra_body.clock == "input"`` at creation (on a model
 whose plugin sets ``DuplexModelPlugin.supports_input_clock``). The server then
-never invents input of its own (no silence continuation; the idle window
-defaults to 10 minutes) and acknowledges every client input that can advance
-the model and reaches the session -- each ``input_audio_buffer.append``,
-``input_audio_buffer.commit`` and ``response.create`` -- with exactly one
-``input_audio_buffer.processed`` event, in input order, sent only once every
-output that input caused has been sent. A client can therefore step the model as fast as acknowledgements come
-back, or pause between inputs while it thinks, and always knows which outputs
-belong to which input position.
+never invents input of its own (no silence continuation) and acknowledges
+every client input that can advance the model and reaches the session -- each
+``input_audio_buffer.append``, ``input_audio_buffer.commit`` and
+``response.create`` -- with exactly one ``input_audio_buffer.processed`` event,
+in input order, sent only once every output that input caused has been sent.
+A client can therefore step the model as fast as acknowledgements come back,
+or pause between inputs (within the session's usual idle window), and always
+knows which outputs belong to which input position.
 
 How "every output that input caused" is known, without model specifics:
 
@@ -86,7 +86,7 @@ from typing import TypeGuard
 
 from vllm.logger import init_logger
 
-from vllm_omni.engine.duplex.config import INPUT_CLOCK_IDLE_TIMEOUT_S, INPUT_CLOCK_KEY, input_clocked
+from vllm_omni.engine.duplex.config import INPUT_CLOCK_KEY, input_clocked
 from vllm_omni.engine.duplex.contracts import DuplexOutputContext, DuplexOutputDecision
 from vllm_omni.engine.duplex.plugin import (
     DuplexModelPlugin,
@@ -184,19 +184,6 @@ def check_input_clock_unchanged(current: Mapping[str, object], candidate: Mappin
                 f"session.update cannot change extra_body.{key}: the input clock is fixed at session creation",
                 code="input_clock_update_unsupported",
             )
-
-
-def input_clock_lease_idle_s(session_idle_s: float, deploy_idle_ttl_s: float | None) -> float | None:
-    """Engine lease idle window of an input-clocked session.
-
-    The session's own window (``idle_timeout_s``, default 10 minutes), capped
-    at the deploy's ``idle_ttl_s`` or 10 minutes, whichever is longer, so a
-    client cannot hold its admission slot and stage state indefinitely. A
-    deploy without an idle TTL (``None``) expires no session for idleness.
-    """
-    if deploy_idle_ttl_s is None:
-        return None
-    return min(session_idle_s, max(deploy_idle_ttl_s, INPUT_CLOCK_IDLE_TIMEOUT_S))
 
 
 @dataclass(frozen=True, slots=True)
@@ -965,7 +952,6 @@ __all__ = [
     "StageProgress",
     "check_input_clock_supported",
     "check_input_clock_unchanged",
-    "input_clock_lease_idle_s",
     "input_clocked",
     "unit_max_age_s",
     "unit_timeout_s",

@@ -110,10 +110,6 @@ class DuplexLeaseState:
             self.terminal_reason is None and not self.active_operations and expires_at is not None and now >= expires_at
         )
 
-    def idle_expired_after(self, now: float, idle_s: float) -> bool:
-        """Idle expiry with a per-session window instead of the configured TTL."""
-        return self.terminal_reason is None and not self.active_operations and now >= self.last_activity + idle_s
-
     def mark_terminal(self, reason: str) -> bool:
         if self.terminal_reason is not None:
             return False
