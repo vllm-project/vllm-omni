@@ -569,7 +569,7 @@ class QwenImagePipelineWithLogProbForTest(QwenImagePipeline):
         generator = sp.generator or generator
         if generator is None and sp.seed is not None:
             generator = torch.Generator(device=self.device).manual_seed(sp.seed)
-        true_cfg_scale = sp.true_cfg_scale or true_cfg_scale
+        true_cfg_scale = sp.resolve_true_cfg_scale(true_cfg_scale)
         req_num_outputs = getattr(sp, "num_outputs_per_prompt", None)
         if req_num_outputs and req_num_outputs > 0:
             num_images_per_prompt = req_num_outputs

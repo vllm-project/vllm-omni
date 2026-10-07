@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import json
 import logging
@@ -520,7 +520,7 @@ class FluxPipeline(
         num_inference_steps = common_sampling_params.num_inference_steps or 28
         sigmas = common_sampling_params.sigmas
         guidance_scale = common_sampling_params.guidance_scale
-        true_cfg_scale = common_sampling_params.true_cfg_scale or 1.0
+        true_cfg_scale = common_sampling_params.resolve_true_cfg_scale(1.0)
         num_images_per_prompt = (
             common_sampling_params.num_outputs_per_prompt if common_sampling_params.num_outputs_per_prompt > 0 else 1
         )

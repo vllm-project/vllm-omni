@@ -3177,7 +3177,9 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         num_inference_steps = extra_body.get("num_inference_steps")
         quality = extra_body.get("quality")
         guidance_scale = extra_body.get("guidance_scale")
-        true_cfg_scale = extra_body.get("true_cfg_scale") or extra_body.get("cfg_scale")
+        true_cfg_scale = extra_body.get("true_cfg_scale")
+        if true_cfg_scale is None:
+            true_cfg_scale = extra_body.get("cfg_scale")
         negative_prompt = extra_body.get("negative_prompt")
         num_frames = extra_body.get("num_frames")
         guidance_scale_2 = extra_body.get("guidance_scale_2")
@@ -3456,13 +3458,16 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             num_outputs_per_prompt=num_outputs_per_prompt,
             seed=seed,
         )
+        true_cfg_scale = extra_body.get("true_cfg_scale")
+        if true_cfg_scale is None:
+            true_cfg_scale = extra_body.get("cfg_scale")
         self._set_if_supported(
             gen_params,
             generator_device=generator_device,
             quality=extra_body.get("quality"),
             num_inference_steps=extra_body.get("num_inference_steps"),
             guidance_scale=extra_body.get("guidance_scale"),
-            true_cfg_scale=extra_body.get("true_cfg_scale") or extra_body.get("cfg_scale"),
+            true_cfg_scale=true_cfg_scale,
             num_frames=extra_body.get("num_frames"),
             guidance_scale_2=extra_body.get("guidance_scale_2"),
             layers=extra_body.get("layers"),

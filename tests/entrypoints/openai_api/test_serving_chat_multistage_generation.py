@@ -95,6 +95,43 @@ def test_build_multistage_generation_inputs_applies_stage_specific_overrides(ser
     assert engine.default_sampling_params_list[2].lora_request is None
 
 
+@pytest.mark.parametrize("extra_body", [{"true_cfg_scale": 0.0}, {"cfg_scale": 0.0}])
+def test_build_multistage_generation_inputs_preserves_zero_true_cfg_scale(serving_chat, extra_body):
+    from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
+
+    engine = SimpleNamespace(
+        stage_configs=[SimpleNamespace(stage_type="diffusion", is_comprehension=False)],
+        default_sampling_params_list=[OmniDiffusionSamplingParams()],
+    )
+
+    _, sampling_params_list = OmniOpenAIServingChat._build_multistage_generation_inputs(
+        serving_chat,
+        engine=engine,
+        prompt="draw a robot",
+        extra_body=extra_body,
+        reference_images=[],
+        gen_params=OmniDiffusionSamplingParams(),
+    )
+
+    assert sampling_params_list[0].true_cfg_scale == 0.0
+
+
+@pytest.mark.parametrize("extra_body", [{"true_cfg_scale": 0.0}, {"cfg_scale": 0.0}])
+def test_prepare_diffusion_image_request_preserves_zero_true_cfg_scale(serving_chat, extra_body):
+    from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
+
+    serving_chat.engine_client = SimpleNamespace()
+
+    result = OmniOpenAIServingChat._prepare_diffusion_image_request(
+        serving_chat,
+        prompt="draw a robot",
+        extra_body=extra_body,
+    )
+
+    _, _, sampling_params, _ = result
+    assert sampling_params.true_cfg_scale == 0.0
+
+
 @pytest.mark.parametrize("extra_body", [{}, {"bot_task": "think"}])
 def test_build_multistage_generation_inputs_leaves_mm_uuids_to_content_hash(serving_chat, extra_body):
     """Fixed image UUIDs collide across requests with the same processor kwargs.

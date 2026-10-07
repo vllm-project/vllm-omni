@@ -799,7 +799,7 @@ class QwenImagePipeline(
             guidance_scale=sampling.guidance_scale if sampling.guidance_scale_provided else 1.0,
             num_images_per_prompt=sampling.num_outputs_per_prompt if sampling.num_outputs_per_prompt > 0 else 1,
             generator=sampling.generator,
-            true_cfg_scale=sampling.true_cfg_scale or 4.0,
+            true_cfg_scale=sampling.resolve_true_cfg_scale(4.0),
             max_sequence_length=sampling.max_sequence_length or self.tokenizer_max_length,
             attention_kwargs=kwargs.get("attention_kwargs"),
         )
@@ -1038,7 +1038,7 @@ class QwenImagePipeline(
             prompt = None
         if negative_prompt_embeds is not None:
             negative_prompt = None
-        true_cfg_scale = common_sampling_params.true_cfg_scale or 4.0
+        true_cfg_scale = common_sampling_params.resolve_true_cfg_scale(4.0)
         if common_sampling_params.guidance_scale_provided:
             guidance_scale = common_sampling_params.guidance_scale
         else:
