@@ -19,17 +19,15 @@ connectors:
       connector_get_sleep_s: 0.01
       connector_get_max_wait_first_chunk: 3000
       connector_get_max_wait: 300
-      # Steady-state payload length in codec frames.
-      codec_chunk_frames: 75
-      # Smaller first payload so the first audio packet is emitted earlier.
-      # Takes effect only when initial < codec_chunk_frames; values far below
-      # the steady-state chunk length add a seam between chunks and hurt WER.
-      initial_codec_chunk_frames: 25
+      # Payload length in codec frames, the same for every payload. A smaller
+      # first window used to be configured separately (initial_codec_chunk_frames)
+      # so the first audio packet arrived earlier; with the steady window itself
+      # at 25 frames that split only added a seam between the first chunk and
+      # the rest, so there is one window size now.
+      codec_chunk_frames: 25
       codec_left_context_frames: 3
       # HiFT capture buckets are derived from codec_chunk_frames and
       # codec_left_context_frames. (#5869)
-      # A future initial_codec_chunk_frames shape will use lazy capture unless
-      # HiFTGraphWrapper.derive_capture_bucket_size explicitly includes it.
       enable_hift_graph: true
       enable_cfm_graph: true
       # Whole-Euler CUDA graphs exist for batch 1, 2, 4, ... up to

@@ -170,11 +170,10 @@ class TestDeployTopology:
         assert stages[2].yaml_extras["input_connectors"]["from_stage_1"] == "connector_of_shared_memory"
         connector = deploy.connectors["connector_of_shared_memory"]
         assert connector["name"] == "SharedMemoryConnector"
-        # The single-card deploy raises the steady chunk to 75 so
-        # initial_codec_chunk_frames: 25 can take effect; multi-card variants
-        # keep the base value.
-        expected_chunk_frames = 75 if filename == "minicpmo_4_5.yaml" else 25
-        assert connector["extra"]["codec_chunk_frames"] == expected_chunk_frames
+        # One payload window for every chunk: the single-card deploy no longer
+        # raises the steady chunk so a smaller first window can take effect.
+        assert connector["extra"]["codec_chunk_frames"] == 25
+        assert "initial_codec_chunk_frames" not in connector["extra"]
         assert connector["extra"]["codec_left_context_frames"] == 3
         assert connector["extra"]["enable_hift_graph"] is True
         assert connector["extra"]["connector_get_max_wait_first_chunk"] == 3000
