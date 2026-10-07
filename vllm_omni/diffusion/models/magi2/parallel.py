@@ -212,6 +212,24 @@ def scatter_seqlen_gather_heads(
     group = group or get_magi2_ulysses_group()
     if group.world_size == 1:
         return tensor
+    return scatter_seqlen_gather_head_shards(tensor, split_sizes, group).flatten(1, 2)
+
+
+def scatter_seqlen_gather_head_shards(
+    tensor: torch.Tensor,
+    split_sizes: list[int],
+    group: Magi2ParallelGroup | None = None,
+) -> torch.Tensor:
+    """Ulysses ``[sum(S_r), H, D] -> [S_rank, world, H, D]`` exchange.
+
+    The result is a view of the receive buffer whose ``[:, r]`` slice is rank
+    ``r``'s head shard, so flattening dimensions 1 and 2 gives the
+    :func:`scatter_seqlen_gather_heads` result.
+    """
+
+    group = group or get_magi2_ulysses_group()
+    if group.world_size == 1:
+        return tensor.unsqueeze(1)
     if tensor.ndim != 3 or not tensor.is_contiguous():
         raise ValueError("Ulysses attention input must be contiguous [S,H,D]")
     if len(split_sizes) != group.world_size or sum(split_sizes) != tensor.shape[0]:
@@ -230,12 +248,7 @@ def scatter_seqlen_gather_heads(
         input_split_sizes=split_sizes,
         group=group.group,
     )
-    output = (
-        output.view(group.world_size, local_tokens, tensor.shape[1], tensor.shape[2])
-        .permute(1, 0, 2, 3)
-        .reshape(local_tokens, group.world_size * tensor.shape[1], tensor.shape[2])
-    )
-    return output
+    return output.view(group.world_size, local_tokens, tensor.shape[1], tensor.shape[2]).permute(1, 0, 2, 3)
 
 
 def scatter_heads_gather_seqlen(
