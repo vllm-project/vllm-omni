@@ -10,25 +10,25 @@ The recommended way to use vLLM-Omni on NPU is through the vLLM-Ascend pre-built
 === "A2"
 
     ```bash
-    export IMAGE=quay.io/atlas-ci/vllm-ascend:v0.30.0
+    export IMAGE=quay.io/atlas-ci/vllm-ascend:v0.31.0
     ```
 
 === "A3"
 
     ```bash
-    export IMAGE=quay.io/atlas-ci/vllm-ascend:v0.30.0-a3
+    export IMAGE=quay.io/atlas-ci/vllm-ascend:v0.31.0-a3
     ```
 
 === "A5"
 
     ```bash
-    export IMAGE=quay.io/atlas-ci/vllm-ascend:v0.30.0-a5
+    export IMAGE=quay.io/atlas-ci/vllm-ascend:v0.31.0-a5
     ```
 
 === "310P (Experimental)"
 
     ```bash
-    export IMAGE=quay.io/atlas-ci/vllm-ascend:v0.30.0-310p
+    export IMAGE=quay.io/atlas-ci/vllm-ascend:v0.31.0-310p
     ```
 
 ```bash
