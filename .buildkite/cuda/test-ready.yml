@@ -105,7 +105,7 @@ steps:
 
       - label: "Diffusion · Other Test"
         commands:
-          - timeout 15m pytest -sv tests/diffusion/*.py tests/diffusion/ar_diffusion -m 'core_model and cuda' --run-level "core_model"
+          - timeout 15m pytest -sv tests/diffusion/*.py tests/diffusion/ar_diffusion tests/diffusion/layers/test_adalayernorm_*.py -m 'core_model and cuda' --run-level "core_model"
         mirror_hardwares: l4_1
 
   - group: ":card_index_dividers: Tiny Model Tests [Single GPU]"
@@ -122,7 +122,7 @@ steps:
     commands:
       - |
         timeout 15m bash -c "
-                  pytest -sv tests/engine/ tests/model_executor/ tests/worker/test_batched_omni_output.py tests/worker_v2/ -m 'core_model and cuda' --run-level 'core_model'
+                  pytest -sv tests/engine/ tests/model_executor/ tests/worker/test_batched_omni_output.py tests/worker/test_gpu_generation_async_output.py tests/worker_v2/ -m 'core_model and cuda' --run-level 'core_model'
         "
     mirror_hardwares: l4_1
 

@@ -802,6 +802,7 @@ class MossTTSCodecDecoder(nn.Module):
                 sample_rate=self._sr_tensor,
                 device=next(self._codec.parameters()).device,
                 gate_main=bool(self._connector_int("codec_first_chunk_gate", default=0)),
+                max_active_streams=self._connector_int("codec_first_chunk_max_active_streams", default=0),
             )
             logger.info(
                 "MOSS-TTS codec first-chunk fast path ready: B=%s T=%d",

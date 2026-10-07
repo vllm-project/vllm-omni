@@ -482,6 +482,10 @@ class StageDeployConfig:
     # Diffusion execution, cache, and VAE behavior.
     diffusion_compile_granularity: str | None = None
     diffusion_compile_dynamic: bool | None = None
+    # CUDA graph capture of fixed-shape KV-cache decode steps (Qwen-Image-2.1
+    # today). Independent of compilation_config.cudagraph_mode;
+    # enforce_eager=True also disables it.
+    enable_cuda_graph_decode: bool | None = None
     fa_deterministic: bool | None = None
     cache_backend: str | None = None
     cache_config: dict[str, Any] | None = None
@@ -916,6 +920,11 @@ def _apply_platform_overrides(
         device_name = current_omni_platform.device_name
         platform = device_name.lower() if device_name is not None else None
     platform_section = (deploy.platforms or {}).get(platform) if platform is not None else None
+    if platform_section is not None and "cuda_mps" in platform_section:
+        cuda_mps = platform_section["cuda_mps"]
+        if not isinstance(cuda_mps, bool):
+            raise ValueError("platform cuda_mps must be a boolean")
+        deploy.cuda_mps = cuda_mps
     if platform_section is not None and "model_runner" in platform_section:
         model_runner = platform_section["model_runner"]
         if model_runner not in ("v1", "v2"):

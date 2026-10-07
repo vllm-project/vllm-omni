@@ -50,18 +50,9 @@ steps:
         # that is not supported on CPU
         # Keep multi-GPU tests out of this one-GPU pool even when their module
         # also carries the cpu marker for unit tests.
+        # Keep π0.5 CPU units out of these shards: CUDA READY/MERGE already run
+        # the same suite mandatorily, and AMD covers it non-blocking in nightly.
         - "pytest -sv tests/diffusion -m 'core_model and cpu and not (cards_2 or cards_3 or cards_4 or cards_5 or cards_6 or cards_7 or cards_8)' --ignore=tests/diffusion/cache/test_teacache_extractors.py --ignore=tests/diffusion/models/pi05/test_pi05_units.py --num-shards=$$BUILDKITE_PARALLEL_JOB_COUNT --shard-id=$$BUILDKITE_PARALLEL_JOB"
-    # This module takes about 22 minutes on MI300 and was consistently assigned to shard 4,
-    # pushing that shard to the 45-minute timeout. Keep its module-scoped fixture in one lane.
-    - label: "Simple · Pi0.5 CPU Test"
-      agent_pool: mi300_1
-      depends_on: amd-build
-      mirror_hardwares: [amdproduction]
-      grade: Blocking
-      timeout_in_minutes: 45
-      commands:
-        - export VLLM_ROCM_USE_AITER=0
-        - "pytest -sv tests/diffusion/models/pi05/test_pi05_units.py -m 'core_model and cpu'"
 
     - label: "Diffusion · AuK VAE GPU Test"
       agent_pool: mi300_1
@@ -135,6 +126,7 @@ steps:
       commands:
         - export VLLM_LOGGING_LEVEL=DEBUG
         - export VLLM_WORKER_MULTIPROC_METHOD=spawn
+        - export DIFFUSION_ATTENTION_BACKEND=TORCH_SDPA
         - pytest -s -v tests/diffusion/offloader/test_diffusion_cpu_offload.py
         - >-
           pytest -s -v tests/diffusion/offloader/test_diffusion_layerwise_offload.py

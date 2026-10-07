@@ -43,6 +43,7 @@ from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineL
 from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch, prefetch_subfolders
 from vllm_omni.diffusion.models.flux2_klein.flux2_klein_transformer import (
     Flux2Transformer2DModel,
+    _use_local_single_stream_tp,
 )
 from vllm_omni.diffusion.models.interface import SupportImageInput, SupportsComponentDiscovery
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
@@ -262,7 +263,11 @@ class Flux2KleinPipeline(
         ).to(self._execution_device)
 
         transformer_kwargs = get_transformer_config_kwargs(od_config.tf_model_config, Flux2Transformer2DModel)
-        self.transformer = Flux2Transformer2DModel(quant_config=od_config.quantization_config, **transformer_kwargs)
+        self.transformer = Flux2Transformer2DModel(
+            quant_config=od_config.quantization_config,
+            local_tp=_use_local_single_stream_tp(od_config),
+            **transformer_kwargs,
+        )
 
         self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1) if getattr(self, "vae", None) else 8
         self.latent_channels = self.vae.config.latent_channels if hasattr(self.vae, "config") else 16

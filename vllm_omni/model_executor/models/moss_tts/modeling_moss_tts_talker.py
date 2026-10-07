@@ -1349,7 +1349,11 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
             [nn.Linear(hidden_size, self.audio_vocab_size, bias=False) for _ in range(self.n_vq)]
         )
         self.local_text_lm_head = nn.Linear(hidden_size, 2, bias=False)
-        self.local_transformer = MossTTSLocalDepthTransformer(self.config.gpt2_config, hidden_size=hidden_size)
+        self.local_transformer = MossTTSLocalDepthTransformer(
+            self.config.gpt2_config,
+            hidden_size=hidden_size,
+            compile_audio_sampler=getattr(self.config, "local_compile_audio_sampler", None),
+        )
 
         self._batch_state: list[dict[str, Any]] | None = None
         # Stacked embedding cache built after load_weights() for vectorised
@@ -1520,16 +1524,18 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
             embeds = self.model.embed_tokens(input_ids)
 
             ref_codes = (info_dict.get("codes", {}) or {}).get("ref")
-            ref_offset = int(info_dict.get("ref_offset", 0))
+            # Cached prompt tokens already consumed their reference rows even
+            # though this request's preprocessing hook never saw those tokens.
+            ref_offset = int(info_dict.get("_omni_num_computed_tokens", info_dict.get("ref_offset", 0)))
             if isinstance(ref_codes, torch.Tensor) and ref_codes.numel() > 0:
                 if ref_codes.dim() == 1 and ref_codes.numel() % self.n_vq == 0:
                     ref_codes = ref_codes.view(-1, self.n_vq)
                 if isinstance(ref_codes, torch.Tensor) and ref_codes.dim() == 2:
                     end_off = ref_offset + span_len
                     chunk = ref_codes[ref_offset:end_off]
-                    if chunk.numel() > 0 and chunk.shape[0] == span_len:
+                    if chunk.numel() > 0:
                         codes = chunk.to(device=device, dtype=torch.long)
-                        embeds = embeds + self._audio_embed(codes)
+                        embeds[: chunk.shape[0]] += self._audio_embed(codes)
 
             info_update: dict[str, Any] = {
                 "audio_state": {"is_stopping": False},
@@ -1700,6 +1706,10 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
     def mtp_graph_safe(self) -> bool:
         """Honor the same platform graph-safety override as the V1 runner."""
         return self.talker_mtp_graph_safe
+
+    @property
+    def mtp_accepts_per_row_generators(self) -> bool:
+        return self.talker_mtp_accepts_per_row_generators
 
     # Package runner-generated audio frames
     # ------------------------------------------------------------------

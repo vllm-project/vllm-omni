@@ -122,6 +122,8 @@ def _make_codec_stub(mocker: MockerFixture) -> PersonaPlexMimiCodec:
         num_quantizers, x.shape[0], x.shape[-1], dtype=torch.long
     )
     quantizer.decode.side_effect = lambda codes: torch.zeros(codes.shape[0], 1, codes.shape[-1])
+    # The codec decodes through its own RVQ sum; route it to the stub.
+    codec._quantizer_decode = quantizer.decode
 
     codec.device = torch.device("cpu")
     codec.dtype = torch.float32

@@ -523,6 +523,35 @@ def test_compile_transformer_regionally_compiles_blocks(monkeypatch, use_hsdp):
 
 @pytest.mark.core_model
 @pytest.mark.cpu
+def test_compile_transformer_scopes_inductor_cudagraphs_to_decode_graph(monkeypatch):
+    model = SimpleNamespace(enable_cuda_graph_decode=True)
+    runner = _make_compile_runner(model)
+    compile_calls = []
+
+    def _regionally_compile(target, *args, **kwargs):
+        compile_calls.append(kwargs)
+        return target
+
+    monkeypatch.setattr(model_runner_module, "regionally_compile", _regionally_compile)
+    import torch._inductor.config as inductor_config
+
+    before = inductor_config.triton.cudagraphs
+    DiffusionModelRunner._compile_transformer(runner, "transformer")
+
+    assert inductor_config.triton.cudagraphs == before
+    assert compile_calls == [
+        {
+            "dynamic": True,
+            "options": {
+                "triton.cudagraphs": False,
+                "triton.cudagraph_trees": False,
+            },
+        }
+    ]
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
 def test_compile_transformer_uses_regional_dynamic_false_config(monkeypatch):
     model = _CompileTrackingModel()
     runner = _make_compile_runner(model, compile_dynamic=False)
