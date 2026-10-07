@@ -9,16 +9,25 @@ from __future__ import annotations
 import torch
 
 
+def _sink_lse(sink: torch.Tensor) -> torch.Tensor:
+    """Return the FP32 ``[1,H]`` log-sum-exp of sink logits ``[num_sink,H]``."""
+
+    return torch.logsumexp(sink.float(), dim=0).unsqueeze(0)
+
+
 def correct_out_lse_with_sink(
     out: torch.Tensor,
     lse: torch.Tensor,
     sink: torch.Tensor | None,
+    *,
+    sink_lse: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Add zero-valued attention sinks to an already-computed softmax.
 
     FlashAttention returns ``out[T,H,D]`` and conventionally ``lse[H,T]``.
     A MAGI sink contains additional logits ``[num_sink,H]`` whose values are
-    zero vectors, so only the denominator and LSE change.
+    zero vectors, so only the denominator and LSE change. ``sink_lse``, when
+    given, must be ``_sink_lse(sink)`` computed for this same sink.
     """
 
     if sink is None or sink.numel() == 0:
@@ -29,12 +38,20 @@ def correct_out_lse_with_sink(
             f"{tuple(out.shape)}, {tuple(lse.shape)}, {tuple(sink.shape)}"
         )
     old_lse = lse.float().transpose(0, 1)
-    sink_lse = torch.logsumexp(sink.float(), dim=0).unsqueeze(0)
+    if sink_lse is None:
+        sink_lse = _sink_lse(sink)
     if old_lse.shape[-1] != sink_lse.shape[-1]:
         raise ValueError("attention sink and FlashAttention head counts differ")
     new_lse = torch.logaddexp(old_lse, sink_lse)
     delta = old_lse - new_lse
-    delta = torch.where(torch.isfinite(delta), delta, torch.full_like(delta, -torch.inf))
+    if delta.requires_grad:
+        delta = torch.where(torch.isfinite(delta), delta, torch.full_like(delta, -torch.inf))
+    else:
+        # The same select in one kernel: NaN and infinite deltas become -inf. The
+        # token-major output lets the multiply below read the scale without a copy.
+        delta = torch.nan_to_num(
+            delta, nan=-torch.inf, posinf=-torch.inf, neginf=-torch.inf, out=delta.new_empty(delta.shape)
+        )
     corrected = out * torch.exp(delta).unsqueeze(-1).to(out.dtype)
     return corrected, new_lse.transpose(0, 1).contiguous()
 
@@ -108,10 +125,11 @@ def varlen_attention_with_sink(
     max_seqlen_k: int | None = None,
     softcap: float = -1.0,
     sink: torch.Tensor | None = None,
+    sink_lse: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Platform-neutral reference fallback with host sequence bounds."""
 
-    del max_seqlen_q, max_seqlen_k
+    del max_seqlen_q, max_seqlen_k, sink_lse
     return torch_varlen_attention_with_sink(
         q,
         k,
