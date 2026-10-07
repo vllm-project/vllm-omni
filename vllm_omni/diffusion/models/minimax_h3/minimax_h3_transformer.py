@@ -890,13 +890,17 @@ class MiniMaxH3DiTBlock(nn.Module):
         *,
         prefix: str,
         adaln_cache: MiniMaxH3RuntimeAdalnCache | None = None,
+        attention_cls: type[MiniMaxH3Attention] = MiniMaxH3Attention,
     ) -> None:
         super().__init__()
         self.norm1 = _norm(arch.hidden_size, eps=arch.norm_eps)
         self.norm2 = _norm(arch.hidden_size, eps=arch.norm_eps)
         # The prefix also carries the block index that block-sparse attention
         # backends match against their skip_layers selector.
-        self.attn = MiniMaxH3Attention(
+        # ``attention_cls`` lets a derived model (for example the TaoMate-H3
+        # streaming variant) swap in a subclass of ``MiniMaxH3Attention`` that
+        # keeps the checkpoint layout but changes the attention kernel path.
+        self.attn = attention_cls(
             arch,
             quant_config,
             prefix=f"{prefix}.attn",
@@ -1163,6 +1167,7 @@ class MiniMaxH3DiTModel(nn.Module):
         quant_config: QuantizationConfig | None = None,
         *,
         diffusers_weights: bool | None = None,
+        attention_cls: type[MiniMaxH3Attention] = MiniMaxH3Attention,
     ) -> None:
         super().__init__()
         tf_config = od_config.tf_model_config
@@ -1253,6 +1258,7 @@ class MiniMaxH3DiTModel(nn.Module):
                     quant_config,
                     prefix=f"blocks.{i}",
                     adaln_cache=self.adaln_cache,
+                    attention_cls=attention_cls,
                 )
                 for i in range(arch.num_layers)
             ]
