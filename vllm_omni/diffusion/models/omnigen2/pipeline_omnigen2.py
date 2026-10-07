@@ -34,6 +34,7 @@ from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch, prefetch_subfolders
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
+from vllm_omni.diffusion.models.utils import prepare_latents as _prepare_latents
 from vllm_omni.diffusion.models.omnigen2.omnigen2_transformer import (
     OmniGen2RotaryPosEmbed,
     OmniGen2Transformer2DModel,
@@ -725,32 +726,13 @@ class OmniGen2Pipeline(CFGParallelMixin, nn.Module, SupportsComponentDiscovery):
         generator: torch.Generator | None,
         latents: torch.FloatTensor | None = None,
     ) -> torch.FloatTensor:
-        """
-        Prepare the initial latents for the diffusion process.
-
-        Args:
-            batch_size: The number of images to generate.
-            num_channels_latents: The number of channels in the latent space.
-            height: The height of the generated image.
-            width: The width of the generated image.
-            dtype: The data type of the latents.
-            device: The device to place the latents on.
-            generator: The random number generator to use.
-            latents: Optional pre-computed latents to use instead of random initialization.
-
-        Returns:
-            torch.FloatTensor: The prepared latents tensor.
-        """
-        height = int(height) // self.vae_scale_factor
-        width = int(width) // self.vae_scale_factor
-
-        shape = (batch_size, num_channels_latents, height, width)
-
-        if latents is None:
-            latents = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
-        else:
-            latents = latents.to(device)
-        return latents
+        shape = (
+            batch_size,
+            num_channels_latents,
+            int(height) // self.vae_scale_factor,
+            int(width) // self.vae_scale_factor,
+        )
+        return _prepare_latents(shape, dtype=dtype, device=device, generator=generator, latents=latents)
 
     def encode_vae(self, img: torch.FloatTensor) -> torch.FloatTensor:
         """

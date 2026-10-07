@@ -47,6 +47,7 @@ from vllm_omni.diffusion.models.glm_image.glm_image_transformer import (
     GlmImageTransformer2DModel,
 )
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
+from vllm_omni.diffusion.models.utils import prepare_latents as _prepare_latents
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
@@ -461,20 +462,13 @@ class GlmImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, SupportsCompon
         generator: torch.Generator | None,
         latents: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Prepare random noise latents."""
-        if latents is not None:
-            return latents.to(device)
-
         shape = (
             batch_size,
             num_channels_latents,
             int(height) // self.vae_scale_factor,
             int(width) // self.vae_scale_factor,
         )
-        if isinstance(generator, list) and len(generator) != batch_size:
-            raise ValueError(f"Passed {len(generator)} generators but batch size is {batch_size}.")
-        latents = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
-        return latents
+        return _prepare_latents(shape, dtype=dtype, device=device, generator=generator, latents=latents)
 
     def diffuse(
         self,

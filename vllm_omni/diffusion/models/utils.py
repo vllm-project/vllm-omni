@@ -242,6 +242,32 @@ def create_transformers_model_with_vllm_linears(
     return model
 
 
+def prepare_latents(
+    shape: tuple[int, ...],
+    *,
+    dtype: torch.dtype,
+    device: torch.device | str,
+    generator: torch.Generator | list[torch.Generator] | None = None,
+    latents: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Prepare initial noise latents for diffusion.
+
+    If *latents* is provided, cast it to the target device/dtype and return.
+    Otherwise sample from ``randn_tensor`` with the given *shape*.  Validates
+    that a generator list matches the batch dimension of *shape*.
+    """
+    if latents is not None:
+        return latents.to(device=device, dtype=dtype)
+
+    from diffusers.utils.torch_utils import randn_tensor
+
+    if isinstance(generator, list) and len(generator) != shape[0]:
+        raise ValueError(
+            f"Generator list length {len(generator)} does not match batch size {shape[0]}."
+        )
+    return randn_tensor(shape, generator=generator, device=device, dtype=dtype)
+
+
 def _load_json(model_path: str, filename: str, local_files_only: bool = True) -> dict:
     """Load a JSON config file from a local path or HuggingFace Hub repo."""
     if local_files_only:

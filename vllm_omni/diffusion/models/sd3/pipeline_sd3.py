@@ -22,6 +22,7 @@ from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch, prefetch_subfolders
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
+from vllm_omni.diffusion.models.utils import prepare_latents as _prepare_latents
 from vllm_omni.diffusion.models.sd3.sd3_transformer import (
     SD3Transformer2DModel,
 )
@@ -503,25 +504,15 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin, DiffusionPipelinePro
         generator,
         latents=None,
     ) -> torch.Tensor:
-        if latents is not None:
-            return latents.to(device=self.device, dtype=self.od_config.dtype)
-
         shape = (
             batch_size,
             num_channels_latents,
             int(height) // self.vae_scale_factor,
             int(width) // self.vae_scale_factor,
         )
-
-        if isinstance(generator, list) and len(generator) != batch_size:
-            raise ValueError(
-                f"You have passed a list of generators of length {len(generator)}, but requested an effective batch"
-                f" size of {batch_size}. Make sure the batch size matches the length of the generators."
-            )
-
-        latents = randn_tensor(shape, generator=generator, device=self.device, dtype=self.od_config.dtype)
-
-        return latents
+        return _prepare_latents(
+            shape, dtype=self.od_config.dtype, device=self.device, generator=generator, latents=latents,
+        )
 
     def prepare_timesteps(self, num_inference_steps, sigmas, image_seq_len):
         scheduler_kwargs = {}
