@@ -971,6 +971,10 @@ def test_vllm_omni_stage_config_public_fields_use_typed_stage_realizations():
         "compilation_config",
         "profiler_config",
         "quantization_config",
+        # Stage-level speculative_config is passed straight through to the
+        # engine: the Talker K-step block is read by the engine, not unpacked
+        # structurally like the other stage configs.
+        "speculative_config",
     }
     assert "diffusion_config" not in public_fields
     assert {f.name for f in fields(VllmOmniDiffusionStageConfig)} == public_fields | {"diffusion_config"}

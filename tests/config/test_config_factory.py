@@ -1557,7 +1557,10 @@ class TestDeployConfigLoading:
             # The armed head ends on 1; the union keeps the codec EOS inert
             # (the collapsed head cannot sample it).
             assert stages[1].yaml_extras["default_sampling_params"]["stop_token_ids"] == [1, 6561]
-            assert stages[0].yaml_engine_args["enable_prefix_caching"] is True
+            # The duplex KV-window contract requires prefix caching off, and the
+            # NPU overlay states that explicitly so a stage-level value can
+            # never turn it back on for this stage.
+            assert stages[0].yaml_engine_args.get("enable_prefix_caching") is not True
             assert stages[1].yaml_engine_args["speculative_config"] == {
                 "method": "ngram",
                 "num_speculative_tokens": 7,
@@ -1577,7 +1580,9 @@ class TestDeployConfigLoading:
             assert stages[0].yaml_engine_args.get("enable_prefix_caching") is not True
             assert "speculative_config" not in stages[1].yaml_engine_args
             assert stages[1].yaml_engine_args["async_scheduling"] is True
-            assert [stage.yaml_engine_args["max_num_seqs"] for stage in stages] == [4, 4, 4]
+            # Base concurrency stays 16; only the NPU overlay lowers it to 8,
+            # so a CUDA deployment keeps the pipeline default.
+            assert [stage.yaml_engine_args["max_num_seqs"] for stage in stages] == [16, 16, 16]
 
     @pytest.mark.parametrize(
         ("filename", "stage0_devices", "stage1_devices", "stage2_devices", "stage1_replicas"),

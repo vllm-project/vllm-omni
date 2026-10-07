@@ -20,6 +20,8 @@ import torch
 
 from vllm_omni.platforms.npu.models import minicpmo_4_5_code2wav as npu_patch
 
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
 
 class TestBatchBucket:
     def test_rounds_up_to_next_bucket(self):
