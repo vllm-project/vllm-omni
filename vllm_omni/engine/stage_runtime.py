@@ -24,6 +24,7 @@ from vllm_omni.distributed.omni_connectors.utils.initialization import (
     resolve_omni_kv_config_for_stage,
 )
 from vllm_omni.distributed.omni_coordinator import (
+    CostAwareBalancer,
     LeastQueueLengthBalancer,
     LoadBalancer,
     LoadBalancingPolicy,
@@ -147,6 +148,8 @@ def _build_load_balancer_factory(policy: str) -> Callable[[], LoadBalancer]:
         return RoundRobinBalancer
     if normalized is LoadBalancingPolicy.LEAST_QUEUE_LENGTH:
         return LeastQueueLengthBalancer
+    if normalized is LoadBalancingPolicy.COST_AWARE:
+        return CostAwareBalancer
     raise ValueError(f"unhandled load balancing policy {normalized!r}")
 
 

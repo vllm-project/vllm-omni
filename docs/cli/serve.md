@@ -62,6 +62,29 @@ multi-API throughput gain. The multi-replica workload in
 [#4680](https://github.com/vllm-project/vllm-omni/issues/4680) remains a relevant
 validation target.
 
+## Cost-aware replica routing
+
+For replica-DP diffusion stages with heterogeneous image or video shapes, use
+`--omni-lb-policy cost-aware` to balance projected work instead of request
+count alone:
+
+```bash
+vllm serve MODEL --omni --omni-lb-policy cost-aware
+```
+
+The head estimates relative request work as spatial area (normalized to
+512x512) multiplied by frame count, inference steps, and outputs per prompt.
+Missing or invalid request metadata has unit cost, so the policy safely
+degrades to queue-length balancing for workloads without a usable estimate.
+Existing random, round-robin, and least-queue-length policies are unchanged.
+
+The policy tracks exact costs only for outstanding assignments made by the
+current head. Coordinator `queue_length` still accounts for requests routed by
+other heads; those unknown requests use the mean cost of the current head's
+active assignments, or the incoming request's cost when no local assignment is
+active. This makes the policy useful with multiple heads without claiming a
+globally exact work ledger.
+
 ## Stage-based CLI quickstart
 
 The stage-based CLI is designed for deployments that require launching each pipeline stage in an isolated process
