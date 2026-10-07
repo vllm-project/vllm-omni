@@ -279,17 +279,23 @@ class MultiModalityRMSNorm(nn.Module):
         tensor: torch.Tensor,
         modality_dispatcher: ModalityDispatcher | None = None,
     ) -> torch.Tensor:
+        """Normalize the last dimension, or the last two when they split ``dim`` features."""
         original_dtype = tensor.dtype
+        split = tensor.shape[-1] != self.dim
+        if split and (tensor.ndim < 2 or tensor.shape[-2] * tensor.shape[-1] != self.dim or self.num_patterns != 1):
+            raise ValueError(f"cannot normalize a {tuple(tensor.shape)} tensor over {self.dim} features")
+        feature_shape = tuple(tensor.shape[-2:]) if split else (self.num_patterns, self.dim)
         normalized = tensor.float()
-        normalized = normalized * torch.rsqrt(normalized.square().mean(dim=-1, keepdim=True) + self.eps)
+        reduce_dims = (-2, -1) if split else -1
+        normalized = normalized * torch.rsqrt(normalized.square().mean(dim=reduce_dims, keepdim=True) + self.eps)
         if self.num_modality == 1:
-            weight = self.weight.view(self.num_patterns, self.dim) + 1.0
+            weight = self.weight.view(feature_shape) + 1.0
             result = normalized * weight
         else:
             if modality_dispatcher is None:
                 raise ValueError("modality_dispatcher is required for multimodal RMSNorm")
             inputs = modality_dispatcher.dispatch(normalized)
-            weights = self.weight.view(self.num_modality, self.num_patterns, self.dim)
+            weights = self.weight.view(self.num_modality, *feature_shape)
             result = modality_dispatcher.undispatch(
                 *(part * (weights[index] + 1.0) for index, part in enumerate(inputs))
             )
@@ -385,20 +391,41 @@ class MHCHandler:
     ) -> MHCTensorTuple:
         if flattened.ndim != 2 or flattened.shape[-1] != self.num_streams * self.hidden_size:
             raise ValueError("invalid flattened mHC shape")
-        normed = norm(flattened).to(self.dtype)
         if self.fp32_stream_contractions:
             fused = torch.bmm(
-                normed.reshape(-1, self.num_streams, self.hidden_size).transpose(0, 1),
+                self._stream_major_normed(flattened, norm),
                 phi_fused.reshape(self.num_streams, self.hidden_size, -1),
             ).sum(0)
         else:
-            fused = normed @ phi_fused
+            fused = norm(flattened).to(self.dtype) @ phi_fused
         pre, post, residual = torch.split(
             fused,
             (self.num_streams, self.num_streams, self.num_streams**2),
             dim=-1,
         )
         return pre, post, residual.view(-1, self.num_streams, self.num_streams)
+
+    def _stream_major_normed(
+        self,
+        flattened: torch.Tensor,
+        norm: Callable[[torch.Tensor], torch.Tensor],
+    ) -> torch.Tensor:
+        """Normalize the streams into a dense [streams, tokens, hidden] bmm operand.
+
+        MUSA bmm copies a batch-strided operand before its GEMM. Compiled, the norm receives the
+        [tokens, streams, hidden] view and its kernel stores this layout directly; eager copies once.
+        """
+        tokens = flattened.shape[0]
+        if not torch.compiler.is_compiling():
+            normed = norm(flattened).to(self.dtype)
+            return normed.reshape(tokens, self.num_streams, self.hidden_size).transpose(0, 1).contiguous()
+        # Reducing over (streams, hidden) reads the streams with the same index form as the
+        # stream-major store, so Inductor keeps a producing hyper-connection mix in the norm kernel.
+        normed = norm(flattened.reshape(tokens, self.num_streams, self.hidden_size)).to(self.dtype)
+        stream_major = normed.new_empty_strided(normed.shape, (self.hidden_size, tokens * self.hidden_size, 1))
+        stream_major.copy_(normed)
+        # Inductor keeps the strides of an as_strided input, so the norm kernel stores stream-major.
+        return stream_major.as_strided(stream_major.shape, stream_major.stride()).transpose(0, 1)
 
     def apply_pre(
         self,
