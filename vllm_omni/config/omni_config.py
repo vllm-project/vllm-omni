@@ -235,6 +235,7 @@ class _SchedulerEngineOverrides(TypedDict, total=False):
     max_model_len: int
     enable_chunked_prefill: bool
     async_scheduling: bool
+    kv_events_config: dict[str, Any]
 
 
 class _RuntimeEngineOverrides(TypedDict, total=False):
@@ -369,6 +370,9 @@ def _stage_cli_overrides(
     runtime_overrides = build_stage_runtime_overrides(stage_id, dict(cli_overrides))
     global_stage_fields = _global_stage_cli_fields()
     owned_fields = None if execution_type is None else _STAGE_ENGINE_FIELDS_BY_EXECUTION_TYPE[execution_type]
+    if owned_fields is not None:
+        # Stage-scoped-only inputs must not fan out from a global flag.
+        owned_fields = owned_fields - _STAGE_SCOPED_ONLY_ENGINE_FIELDS
     result: dict[str, Any] = {}
     for key, value in runtime_overrides.items():
         stage_key = f"stage_{stage_id}_{key}"
@@ -402,6 +406,12 @@ def _stage_cli_overrides(
     return result
 
 
+# Engine inputs meaningful per stage only: a global value would fan every
+# LLM_AR stage out to one ZMQ publisher socket with incompatible block-key
+# spaces. Configure per stage (--stage-overrides / stages[].kv_events_config).
+_STAGE_SCOPED_ONLY_ENGINE_FIELDS = frozenset({"kv_events_config"})
+
+
 def _validate_global_stage_cli_ownership(
     pipeline: PipelineConfig,
     cli_overrides: Mapping[str, Any],
@@ -413,15 +423,26 @@ def _validate_global_stage_cli_ownership(
     owned_fields = {
         field for stage in pipeline.stages for field in _STAGE_ENGINE_FIELDS_BY_EXECUTION_TYPE[stage.execution_type]
     }
-    unowned_fields = explicit_global_fields - owned_fields
+    # Stage-scoped-only inputs stay rejected as globals (would fan out).
+    unowned_fields = (explicit_global_fields - owned_fields) | (
+        explicit_global_fields & _STAGE_SCOPED_ONLY_ENGINE_FIELDS
+    )
     if any(stage.execution_type == StageExecutionType.DIFFUSION for stage in pipeline.stages):
         # Mixed engine ingress accepts these shared globals, but diffusion
         # stages deliberately leave them outside their terminal config.
         unowned_fields -= _DIFFUSION_SHARED_ONLY_ENGINE_FIELDS
     if unowned_fields:
         names = ", ".join(sorted(unowned_fields))
+        hint = ""
+        if unowned_fields & _STAGE_SCOPED_ONLY_ENGINE_FIELDS:
+            hint = (
+                " (stage-scoped only: pass per stage via --stage-overrides "
+                '\'{"<stage_id>": {"kv_events_config": {...}}}\' or deploy '
+                "stages[].kv_events_config, publishing from the entry stage only)"
+            )
         raise ValueError(
             f"Pipeline {pipeline.model_type!r} has explicit engine argument(s) with no structured config owner: {names}"
+            f"{hint}"
         )
 
 
@@ -577,6 +598,7 @@ class OmniStageSchedulerConfig(_TrackExplicitConfigFields, VllmSchedulerConfig):
     is_encoder_decoder: InitVar[bool] = False  # type: ignore[assignment]
     enable_chunked_prefill: bool | None = None
     async_scheduling: bool | None = None
+    kv_events_config: dict[str, Any] | None = None
 
     def __post_init__(self, is_encoder_decoder: bool = False) -> None:
         # Upstream initializes these derived fields in its terminal post-init.
@@ -1195,6 +1217,12 @@ _SCHEDULER_CONFIG_ENGINE_FIELD_MAP = _upstream_engine_field_map(
         }
     ),
 )
+# Top-level VllmConfig input upstream, invisible to the SchedulerConfig
+# auto-map: project explicitly so it reaches EngineArgs/stage VllmConfig.
+_SCHEDULER_CONFIG_ENGINE_FIELD_MAP = {
+    **_SCHEDULER_CONFIG_ENGINE_FIELD_MAP,
+    "kv_events_config": "kv_events_config",
+}
 _PARALLEL_CONFIG_ENGINE_FIELD_MAP = _upstream_engine_field_map(
     VllmParallelConfig,
     aliases={"data_parallel_master_ip": "data_parallel_address"},

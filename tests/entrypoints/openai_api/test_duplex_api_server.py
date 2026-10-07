@@ -62,6 +62,7 @@ _DUPLEX_APP_STATE_KEYS = {
     "openai_serving_duplex",
     "enable_server_load_tracking",
     "server_load_metrics",
+    "serving_render",
 }
 #: ``openai_serving_chat`` is absent: a duplex engine also serves chat, through
 #: the ordinary turn-based service, because DuplexOmni extends AsyncOmni.

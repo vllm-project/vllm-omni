@@ -59,6 +59,8 @@ from vllm.entrypoints.pooling.classify.serving import ServingClassification
 from vllm.entrypoints.pooling.embed.serving import ServingEmbedding as OpenAIServingEmbedding
 from vllm.entrypoints.pooling.pooling.serving import ServingPooling
 from vllm.entrypoints.pooling.scoring.serving import ServingScores
+from vllm.entrypoints.scale_out.render.api_router import router as render_router
+from vllm.entrypoints.scale_out.render.serving import ServingRender
 from vllm.entrypoints.scale_out.token_in_token_out.serving import ServingTokens
 from vllm.entrypoints.serve.engine.protocol import ErrorResponse
 
@@ -379,6 +381,11 @@ async def omni_run_server_worker(
             from vllm_omni.diffusion.models.seedvr2.long_video import register_routes
 
             register_routes(app, args.port)
+        # Tokenizer/render routes (upstream /v1/*/render) backed by
+        # state.serving_render above; 501 where unavailable (pure diffusion,
+        # duplex). Mounted for all LLM pipelines so prefix-aware routers can
+        # tokenize against the serving engine instead of a sidecar pool.
+        app.include_router(render_router)
 
         # OMNI: Override upstream exception handlers with Omni-aware versions
         # that understand the multi-stage orchestrator lifecycle.
@@ -675,6 +682,9 @@ async def _init_duplex_app_state(
     state.serving_tokens = None
     # Replaced by the chat init below when the model serves chat.
     state.online_renderer = None
+    # No tokenizer/render surface on duplex sessions: streaming turns have no
+    # prefix-cache meaning. The render routes below 501 via getattr default.
+    state.serving_render = None
     for attribute in (
         "openai_serving_chat_batch",
         "openai_serving_completion",
@@ -905,6 +915,8 @@ async def omni_init_app_state(
 
         state.enable_server_load_tracking = getattr(args, "enable_server_load_tracking", False)
         state.server_load_metrics = 0
+        # Diffusion stages have no token stream to render for prefix routing.
+        state.serving_render = None
         logger.info("Pure diffusion API server initialized for model: %s", model_name)
         return
 
@@ -1071,6 +1083,21 @@ async def omni_init_app_state(
     # Upstream f5ffc59b6a removed OpenAIServingChat.warmup() and moved the
     # warmup onto the renderer (OnlineRenderer.warmup()); mirror upstream.
     state.online_renderer.warmup()
+
+    # Tokenizer/render surface for prefix-aware routing: reuse the
+    # entry-stage OnlineRenderer so rendered IDs match the engine. Mirrors
+    # upstream init_scale_out_state, render half only. Unavailable without
+    # "generate".
+    state.serving_render = (
+        ServingRender(
+            state.openai_serving_models,
+            state.online_renderer,
+            request_logger=request_logger,
+            tool_server=tool_server,
+        )
+        if "generate" in supported_tasks
+        else None
+    )
 
     state.openai_serving_completion = (
         OpenAIServingCompletion(

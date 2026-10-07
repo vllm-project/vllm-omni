@@ -381,6 +381,43 @@ def test_from_pipeline_config_rejects_unowned_deploy_engine_extras(engine_extras
         VllmOmniConfig.from_pipeline_config(pipeline, user_deploy_config=deploy)
 
 
+_KV_EVENTS_CONFIG = {
+    "enable_kv_cache_events": True,
+    "publisher": "zmq",
+    "endpoint": "tcp://*:5556",
+    "replay_endpoint": "tcp://*:5559",
+    "topic": "kv@test:8000@model",
+}
+
+
+def test_stage_deploy_kv_events_config_owned_by_llm_stage():
+    deploy = DeployConfig(stages=[StageDeployConfig(stage_id=0, kv_events_config=dict(_KV_EVENTS_CONFIG))])
+    config = VllmOmniConfig.from_pipeline_config(_resolve_pipeline_or_skip("qwen3_tts"), user_deploy_config=deploy)
+
+    assert config.stage_by_id(0).scheduler_config.kv_events_config == _KV_EVENTS_CONFIG
+    # Entry stage publishes; downstream stages stay silent.
+    assert config.stage_by_id(1).scheduler_config.kv_events_config is None
+
+
+def test_stage_cli_kv_events_config_owned_by_llm_stage():
+    config = _from_pipeline_key("qwen3_tts", cli_overrides={"stage_0_kv_events_config": dict(_KV_EVENTS_CONFIG)})
+
+    assert config.stage_by_id(0).scheduler_config.kv_events_config == _KV_EVENTS_CONFIG
+
+
+def test_global_kv_events_config_rejected_with_stage_scoped_hint():
+    with pytest.raises(ValueError) as exc_info:
+        _from_pipeline_key("qwen3_tts", cli_overrides={"kv_events_config": dict(_KV_EVENTS_CONFIG)})
+
+    message = str(exc_info.value)
+    assert "no structured config owner: kv_events_config" in message
+    assert "stage-scoped only" in message
+
+
+def test_kv_events_config_projects_to_engine_args():
+    assert omni_config_module._SCHEDULER_CONFIG_ENGINE_FIELD_MAP["kv_events_config"] == "kv_events_config"
+
+
 _MODEL_CLI_FLAGS = {
     "served_model_name": "omni",
     "allowed_local_media_path": "/data",
