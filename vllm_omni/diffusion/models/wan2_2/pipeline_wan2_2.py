@@ -217,8 +217,14 @@ def create_transformer_from_config(
     prefix: str = "",
     *,
     component: str = "transformer",
+    layer_pp_rank: int | None = None,
+    layer_pp_world: int | None = None,
 ) -> WanTransformer3DModel:
-    """Create WanTransformer3DModel from config dict."""
+    """Create WanTransformer3DModel from config dict.
+
+    ``layer_pp_rank`` / ``layer_pp_world`` optionally override Omni's live PP
+    group when slicing DiT blocks (WaveServe Noisy PP layer groups ``G``).
+    """
     kwargs: dict = {}
 
     if "patch_size" in config:
@@ -257,6 +263,9 @@ def create_transformer_from_config(
         kwargs["quant_config"] = quant_config
     if prefix:
         kwargs["prefix"] = prefix
+    if layer_pp_world is not None:
+        kwargs["layer_pp_rank"] = 0 if layer_pp_rank is None else layer_pp_rank
+        kwargs["layer_pp_world"] = layer_pp_world
 
     return WanTransformer3DModel(**kwargs)
 

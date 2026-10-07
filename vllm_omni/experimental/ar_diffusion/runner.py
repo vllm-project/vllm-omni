@@ -5,14 +5,15 @@ from __future__ import annotations
 import dataclasses
 import time
 from collections import OrderedDict
-from collections.abc import Iterator, Sequence
-from contextlib import contextmanager
-from typing import TYPE_CHECKING
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import AbstractContextManager, contextmanager
+from typing import TYPE_CHECKING, Any
 
 import torch
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.diffusion_kv.metadata import DiffusionKVMetadata
 from vllm_omni.diffusion.models.interface import supports_step_execution
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import CachedRequestData, DiffusionSchedulerOutput, KVPrefetchJob
@@ -20,12 +21,14 @@ from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunn
 from vllm_omni.diffusion.worker.utils import BatchRunnerOutput
 from vllm_omni.experimental.ar_diffusion.capability import (
     ARDiffusionKVCacheSpec,
+    SupportsARDiffusionChunkPipeline,
     SupportsARDiffusionPipeline,
     SupportsARDiffusionWarmup,
     supports_chunk_step_grouping,
 )
 from vllm_omni.experimental.ar_diffusion.kv_cache.config import ARDiffusionKVConfig
 from vllm_omni.experimental.ar_diffusion.kv_cache.manager import ARDiffusionKVCache
+from vllm_omni.experimental.ar_diffusion.kv_cache.noisy import NoisyKVCache, NoisyKVState
 from vllm_omni.experimental.ar_diffusion.kv_cache.state import ARDiffusionKVState
 from vllm_omni.experimental.ar_diffusion.tick_protocol import ARDiffusionTickRequest
 from vllm_omni.platforms import current_omni_platform
@@ -116,7 +119,9 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         super().__init__(vllm_config, od_config, device)
         self.ar_diffusion_kv_config = resolve_ar_diffusion_kv_config(od_config)
         self.kv_cache: ARDiffusionKVCache | None = None
+        self.noisy_kv_cache: NoisyKVCache | None = None
         self._ar_diffusion_capability: SupportsARDiffusionPipeline | None = None
+        self._ar_diffusion_chunk_capability: SupportsARDiffusionChunkPipeline | None = None
         self._ar_diffusion_kv_cache_spec: ARDiffusionKVCacheSpec | None = None
         self._sessions: OrderedDict[str, ARDiffusionKVState] = OrderedDict()
         self._session_capacity = 0
@@ -138,8 +143,17 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
             )
         return pipeline
 
-    def load_model(self, *args: object, **kwargs: object) -> None:
-        super().load_model(*args, **kwargs)
+    def load_model(
+        self,
+        memory_pool_context_fn: Callable[[str], AbstractContextManager[Any]] | None = None,
+        load_format: str = "default",
+        custom_pipeline_name: str | None = None,
+    ) -> None:
+        super().load_model(
+            memory_pool_context_fn=memory_pool_context_fn,
+            load_format=load_format,
+            custom_pipeline_name=custom_pipeline_name,
+        )
         if self.pipeline is None:
             return
         self._preallocate_kv_cache()
@@ -151,6 +165,48 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
             raise RuntimeError("AR-Diffusion KV preallocation requires an initialized device")
         return current_omni_platform.get_free_memory(torch.device(self.device))
 
+    def _stage_config(self) -> dict:
+        raw = getattr(self.od_config, "ar_diffusion_stage_config", None)
+        if raw is None:
+            model_config = getattr(self.od_config, "model_config", None)
+            if isinstance(model_config, dict):
+                raw = model_config.get("ar_diffusion_stage_config")
+        return dict(raw) if isinstance(raw, dict) else {}
+
+    def _preallocate_noisy_kv(
+        self, capability: SupportsARDiffusionChunkPipeline, *, available_bytes: int | None = None
+    ) -> None:
+        spec = capability.ar_diffusion_noisy_kv_spec()
+        stage_cfg = self._stage_config()
+        stages = int(stage_cfg.get("stage_parallel_size", 1) or 1)
+        pp_world = int(getattr(getattr(self.od_config, "parallel_config", None), "pipeline_parallel_size", 1) or 1)
+        if stages < 1 or pp_world % stages != 0:
+            raise ValueError(f"pipeline_parallel_size={pp_world} must be divisible by stage_parallel_size={stages}")
+        layer_groups = pp_world // stages
+        max_batch_size = int(stage_cfg.get("max_batch_size", 1) or 1)
+        self._ar_diffusion_chunk_capability = capability
+        avail = self._available_memory_bytes() if available_bytes is None else available_bytes
+        self.noisy_kv_cache = NoisyKVCache(
+            spec,
+            dtype=self.od_config.dtype,
+            device=self.device,
+            layer_groups=layer_groups,
+            max_batch_size=max_batch_size,
+            stages=stages,
+            gpu_memory_fraction=float(stage_cfg.get("gpu_memory_fraction", 1.0)),
+            available_bytes=avail,
+        )
+        logger.info(
+            "AR-Diffusion noisy KV: capacity=%d reserved_bytes=%d layers=%d H=%d G=%d R=%d S=%d",
+            self.noisy_kv_cache.capacity,
+            self.noisy_kv_cache.reserved_bytes,
+            spec.num_layers,
+            spec.max_history_chunks,
+            layer_groups,
+            max_batch_size,
+            stages,
+        )
+
     def _preallocate_kv_cache(self, *, available_bytes: int | None = None) -> None:
         """Build pools solely from the pipeline capability and runner config."""
         if bool(getattr(self.od_config, "step_execution", False)) and not supports_step_execution(self.pipeline):
@@ -158,6 +214,9 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
                 "ARDiffusionModelRunner currently supports request-mode execution only; "
                 "step_execution=True would bypass per-request AR session binding."
             )
+        if isinstance(self.pipeline, SupportsARDiffusionChunkPipeline):
+            self._preallocate_noisy_kv(self.pipeline, available_bytes=available_bytes)
+            return
         max_num_seqs = int(getattr(self.od_config, "max_num_seqs", 1) or 1)
         if max_num_seqs > 1:
             raise ValueError(
@@ -363,13 +422,55 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
                     suppress_errors=True,
                 )
 
+    def _make_chunk_context(self):
+        from vllm_omni.experimental.ar_diffusion.chunk_executor import (
+            ARDiffusionChunkContext,
+            ChunkRunSpec,
+            ChunkTopology,
+            resolve_pp_rank_and_group,
+        )
+
+        if self.noisy_kv_cache is None:
+            raise RuntimeError("noisy KV cache is not initialized")
+        stage_cfg = self._stage_config()
+        stages = int(stage_cfg.get("stage_parallel_size", 1) or 1)
+        pp_world = int(getattr(getattr(self.od_config, "parallel_config", None), "pipeline_parallel_size", 1) or 1)
+        topology = ChunkTopology(stages=stages, layer_groups=max(1, pp_world // max(1, stages)))
+        rank, pp_group = resolve_pp_rank_and_group()
+        return ARDiffusionChunkContext(
+            spec=ChunkRunSpec(
+                topology=topology,
+                max_batch_size=int(stage_cfg.get("max_batch_size", 1) or 1),
+                rank=rank,
+                pp_group=pp_group,
+            ),
+            kv=NoisyKVState(self.noisy_kv_cache),
+        )
+
     def execute_model(
         self,
         req: OmniDiffusionRequest,
         kv_prefetch_job: KVPrefetchJob | None = None,
+        diffusion_kv_metadata: DiffusionKVMetadata | None = None,
     ) -> DiffusionOutput:
+        if self.noisy_kv_cache is not None and self._ar_diffusion_chunk_capability is not None:
+            started = time.perf_counter()
+            ctx = self._make_chunk_context()
+            try:
+                with self._ar_diffusion_chunk_capability.bind_ar_diffusion_chunk_context(ctx):
+                    output = super().execute_model(
+                        req, kv_prefetch_job=kv_prefetch_job, diffusion_kv_metadata=diffusion_kv_metadata
+                    )
+            except Exception:
+                ctx.kv.reset_all()
+                logger.warning("AR-Diffusion chunk forward failed; NoisyKV versions were released fail-closed")
+                raise
+            self._perf_e2e_times.append(time.perf_counter() - started)
+            return output
         if self.kv_cache is None:
-            return super().execute_model(req, kv_prefetch_job=kv_prefetch_job)
+            return super().execute_model(
+                req, kv_prefetch_job=kv_prefetch_job, diffusion_kv_metadata=diffusion_kv_metadata
+            )
         if self._ar_diffusion_capability is None:
             raise RuntimeError("AR-Diffusion capability missing after KV cache initialization")
 
@@ -380,7 +481,9 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
             self.reset_session(session_id)
         started = time.perf_counter()
         with self._bound_ar_session(session_id, description="forward"):
-            output = super().execute_model(req, kv_prefetch_job=kv_prefetch_job)
+            output = super().execute_model(
+                req, kv_prefetch_job=kv_prefetch_job, diffusion_kv_metadata=diffusion_kv_metadata
+            )
         self._perf_e2e_times.append(time.perf_counter() - started)
         if close_session:
             self.close_session(session_id)
@@ -391,7 +494,16 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         scheduler_output: DiffusionSchedulerOutput,
         od_config: OmniDiffusionConfig,
     ) -> BatchRunnerOutput:
-        """Reject request batching until batch-aware AR state binding exists."""
+        """Noisy PP chunk path may micro-batch requests; paged timeline KV stays single-seq."""
+        if self.noisy_kv_cache is not None and self._ar_diffusion_chunk_capability is not None:
+            ctx = self._make_chunk_context()
+            try:
+                with self._ar_diffusion_chunk_capability.bind_ar_diffusion_chunk_context(ctx):
+                    return super().execute_model_batch(scheduler_output, od_config)
+            except Exception:
+                ctx.kv.reset_all()
+                logger.warning("AR-Diffusion chunk batch failed; NoisyKV versions were released fail-closed")
+                raise
         raise RuntimeError(
             "ARDiffusionModelRunner does not support request-batch execution; use request mode with max_num_seqs=1."
         )
