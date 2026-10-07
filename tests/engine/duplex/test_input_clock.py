@@ -25,7 +25,6 @@ from vllm_omni.engine.duplex.session.input_clock import (
     StageProgress,
     check_input_clock_supported,
     check_input_clock_unchanged,
-    input_clock_lease_idle_s,
     input_clocked,
     unit_max_age_s,
     unit_timeout_s,
@@ -218,14 +217,6 @@ def test_the_clock_and_its_timeouts_are_fixed_at_creation() -> None:
         with pytest.raises(DuplexRuntimeConfigError) as excinfo:
             check_input_clock_unchanged(current, candidate)
         assert excinfo.value.code == "input_clock_update_unsupported"
-
-
-def test_the_engine_lease_idle_window_is_capped() -> None:
-    assert input_clock_lease_idle_s(600.0, 300.0) == 600.0
-    assert input_clock_lease_idle_s(30.0, 300.0) == 30.0
-    assert input_clock_lease_idle_s(86_400.0, 300.0) == 600.0, "a client cannot hold its slot for a day"
-    assert input_clock_lease_idle_s(86_400.0, 3600.0) == 3600.0, "a deploy may allow longer"
-    assert input_clock_lease_idle_s(600.0, None) is None, "a deploy without idle expiry expires nothing"
 
 
 def test_the_acknowledgement_has_only_its_own_wire_fields() -> None:

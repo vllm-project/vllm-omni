@@ -25,7 +25,7 @@ from tests.engine.duplex.test_session_runner import (
     types,
 )
 from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
-from vllm_omni.engine.duplex.config import INPUT_CLOCK_IDLE_TIMEOUT_S, DuplexSessionConfig
+from vllm_omni.engine.duplex.config import DuplexSessionConfig
 from vllm_omni.engine.duplex.messages import CloseDuplexSessionMessage, ResumeDuplexSessionMessage
 from vllm_omni.engine.duplex.plugin import DuplexUnitDecision
 from vllm_omni.engine.duplex.session import runner as runner_module
@@ -855,7 +855,6 @@ async def test_an_idle_expiry_flushes_the_owed_acknowledgement_before_session_ex
         clock=lambda: lease_clock["now"],
     )
     try:
-        h.session.config.idle_timeout_s = 5.0
         await _speaking_unit(h)
         lease_clock["now"] += 10.0
 
@@ -1351,9 +1350,8 @@ async def test_a_session_update_that_keeps_the_clock_is_accepted() -> None:
 
 
 @pytest.mark.usefixtures("input_clock_model")
-async def test_an_input_clocked_session_expires_only_after_its_own_idle_window() -> None:
-    """The lease TTL (1 s here) does not apply; the session's idle window (default 10 min) does."""
-    assert INPUT_CLOCK_IDLE_TIMEOUT_S == 600.0
+async def test_an_input_clocked_session_expires_on_the_deploy_idle_ttl_like_any_session() -> None:
+    """No clock-specific idle window: the lease's ``idle_ttl_s`` applies, whatever ``idle_timeout_s`` says."""
     clock = {"now": 100.0}
     h = await open_harness(
         extra_body=INPUT_CLOCK,
@@ -1361,12 +1359,11 @@ async def test_an_input_clocked_session_expires_only_after_its_own_idle_window()
         clock=lambda: clock["now"],
     )
     try:
-        h.session.config.idle_timeout_s = 5.0
+        h.session.config.idle_timeout_s = 86_400.0
         await h.run(append_audio(samples=3200))
-        clock["now"] += 4.0
-        assert await h.manager.reap_expired() == 0, "a client pausing inside its window keeps the session"
-        assert SESSION_ID in h.manager.runners
-        clock["now"] += 2.0
+        clock["now"] += 0.5
+        assert await h.manager.reap_expired() == 0
+        clock["now"] += 1.0
         assert await h.manager.reap_expired() == 1
         expired = [event for event in await h.settle() if event.type == "session.expired"]
         assert [event.reason for event in expired] == ["idle_ttl_expired"]
@@ -1374,52 +1371,8 @@ async def test_an_input_clocked_session_expires_only_after_its_own_idle_window()
         await close_harness(h)
 
 
-@pytest.mark.usefixtures("input_clock_model")
-async def test_a_long_client_idle_window_is_capped_on_the_engine_lease() -> None:
-    clock = {"now": 100.0}
-    h = await open_harness(
-        extra_body=INPUT_CLOCK,
-        runtime_config=DuplexSessionRuntimeConfig(idle_ttl_s=300.0),
-        clock=lambda: clock["now"],
-    )
-    try:
-        h.session.config.idle_timeout_s = 86_400.0
-        await h.run(append_audio(samples=3200))
-        clock["now"] += INPUT_CLOCK_IDLE_TIMEOUT_S - 1
-        assert await h.manager.reap_expired() == 0
-        clock["now"] += 2.0
-        assert await h.manager.reap_expired() == 1, "max(idle_ttl_s, 600 s) caps the client's window"
-    finally:
-        await close_harness(h)
-
-
-@pytest.mark.usefixtures("input_clock_model")
-async def test_a_disconnected_input_clocked_session_is_still_reaped_after_the_disconnect_grace() -> None:
-    """Only the idle expiry of a connected session is skipped: a client that went away releases its slot."""
-    clock = {"now": 100.0}
-    h = await open_harness(
-        extra_body=INPUT_CLOCK,
-        runtime_config=DuplexSessionRuntimeConfig(idle_ttl_s=1.0, disconnect_grace_s=2.0),
-        clock=lambda: clock["now"],
-    )
-    try:
-        await h.run(append_audio(samples=3200))
-        h.session.detach_lease()  # what the serving layer does when a resumable session's socket drops
-        clock["now"] += 1.5
-        assert await h.manager.reap_expired() == 0, "neither the idle window nor the grace has run out"
-        clock["now"] += 1.0
-        assert await h.manager.reap_expired() == 1
-        assert SESSION_ID not in h.manager.runners
-        expired = [event for event in await h.settle() if event.type == "session.expired"]
-        assert [event.reason for event in expired] == ["disconnect_grace_expired"]
-    finally:
-        await close_harness(h)
-
-
-def test_a_realtime_session_with_the_input_clock_gets_a_ten_minute_idle_window() -> None:
+def test_an_input_clocked_session_gets_the_default_idle_window() -> None:
     explicit = DuplexSessionConfig.from_realtime({"idle_timeout_s": 30, "extra_body": {"clock": "input"}})
     assert explicit.idle_timeout_s == 30.0
-    config = DuplexSessionConfig.from_realtime({"extra_body": {"clock": "input"}})
-    assert config.idle_timeout_s == INPUT_CLOCK_IDLE_TIMEOUT_S
-    assert DuplexSessionConfig.from_realtime({}).idle_timeout_s == 300.0
-    assert DuplexSessionConfig.from_event({"session": {"extra_body": {"clock": "input"}}}).idle_timeout_s == 600.0
+    assert DuplexSessionConfig.from_realtime({"extra_body": {"clock": "input"}}).idle_timeout_s == 300.0
+    assert DuplexSessionConfig.from_event({"session": {"extra_body": {"clock": "input"}}}).idle_timeout_s == 300.0

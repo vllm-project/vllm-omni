@@ -476,13 +476,11 @@ session) gives that contract:
 
 - The server never invents input: silence continuation is off. If the client
   sends nothing, nothing happens.
-- The session's idle window (`idle_timeout_s`, the socket read timeout)
-  defaults to 10 minutes (600 s) instead of the usual 300 s, so a client can
-  pause between inputs while it thinks; an explicit `idle_timeout_s` wins.
-  The engine lease of the session expires after the same window, capped at
-  the deploy's `idle_ttl_s` or 600 s, whichever is longer (a deploy without
-  an idle TTL expires no session for idleness). A client that sends nothing
-  for longer is released like any idle session.
+- Idle handling and resources are those of any duplex session: the same
+  idle window (`idle_timeout_s`, default 300 s) and engine lease
+  (`idle_ttl_s`), and a client that pauses longer than that between inputs
+  is released like any idle session. The clock adds no resource handling of
+  its own.
 - A client that disconnects releases its session as usual: it is closed at
   once, or, for a model that supports session resume, expired after the
   deploy's `disconnect_grace_s`. Close the session (`session.close`) when an
@@ -710,6 +708,14 @@ and the server logs a warning naming the unit. A cancel (`response.cancel`,
 or a barge-in) recovers from this state: it starts a new epoch, settles the
 open units of the old one as `cancelled`, and the units after it are no
 longer queued behind the missing output. No other event signals the state.
+
+The timeouts only settle units, which releases acknowledgements; they free no
+resources. A Stage-0 submission that stalls keeps holding its session's
+resources and engine lease exactly as in a session without the clock (the
+lease's idle expiry does not run while a submission is in flight). They are
+reclaimed by the existing session-level paths: `session.close`, or a
+disconnect (including the socket's `idle_timeout_s`) and, for a resumable
+model, its `disconnect_grace_s`.
 
 A commit or `session.update` is applied only after the appends sent before
 it, and the session handles nothing else (a cancel included) while it waits.

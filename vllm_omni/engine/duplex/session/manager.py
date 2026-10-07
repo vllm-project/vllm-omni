@@ -57,7 +57,7 @@ from vllm_omni.engine.duplex.messages import (
 )
 from vllm_omni.engine.duplex.plugin import DuplexModelPlugin, DuplexRuntimeConfigError, validate_duplex_plugin_sampling
 from vllm_omni.engine.duplex.session.engine_session import DuplexEngineSession, DuplexFenceMismatchError
-from vllm_omni.engine.duplex.session.input_clock import check_input_clock_supported, input_clock_lease_idle_s
+from vllm_omni.engine.duplex.session.input_clock import check_input_clock_supported
 from vllm_omni.engine.duplex.session.lease import DuplexLeaseActivity, DuplexLeaseConfig, DuplexLeaseState
 from vllm_omni.engine.duplex.turn_detection import SileroVADBackendProvider
 
@@ -914,14 +914,6 @@ class DuplexSessionManager:
             lease = runner.session.lease
             if lease.disconnect_grace_expired(effective_now):
                 reason = "disconnect_grace_expired"
-            elif runner.input_clocked:
-                # An input-clocked client may pause between inputs while it
-                # thinks: its idle window is the session's (default 10 min),
-                # capped at max(idle_ttl_s, 10 min).
-                idle_s = input_clock_lease_idle_s(runner.session.config.idle_timeout_s, lease.config.idle_ttl_s)
-                if idle_s is None or not lease.idle_expired_after(effective_now, idle_s):
-                    continue
-                reason = "idle_ttl_expired"
             elif lease.idle_expired(effective_now):
                 reason = "idle_ttl_expired"
             else:

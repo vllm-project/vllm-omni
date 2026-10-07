@@ -243,7 +243,7 @@ class SessionControl:
         try:
             check_input_clock_supported(self._ctx.plugin, candidate_config.extra_body)
             # The clock mode and its timeouts are fixed at creation, like the
-            # idle window and the acknowledgements they decide.
+            # acknowledgements they decide.
             check_input_clock_unchanged(session.config.extra_body, candidate_config.extra_body)
         except DuplexRuntimeConfigError as exc:
             self._out.emit_error(exc.code, str(exc), event_id=realtime_event_id)
