@@ -37,7 +37,7 @@ from .layers import (
     swiglu7,
 )
 from .mh_moe import Magi2MultiHeadMoE, Magi2MultiHeadMoEConfig
-from .parallel import Magi2SequenceDispatcher
+from .parallel import Magi2SequenceDispatcher, get_magi2_ulysses_group, pack_ulysses_head_shards
 
 
 class Modality(IntEnum):
@@ -95,6 +95,11 @@ class Magi2Attention(nn.Module):
         self.num_heads_kv = config.num_heads_kv // self.tp_group.world_size
         self.q_size = self.num_heads_q * self.head_dim
         self.kv_size = self.num_heads_kv * self.head_dim
+        # On MUSA project() returns Q/K/V as head-shard views of one Ulysses
+        # send buffer, so the compiled projection stores them in send order.
+        ulysses_size = get_magi2_ulysses_group().world_size if current_omni_platform.is_musa() else 1
+        divisible = self.num_heads_q % ulysses_size == 0 and self.num_heads_kv % ulysses_size == 0
+        self.ulysses_head_shards = ulysses_size if divisible else 1
         self.sinks = nn.Parameter(torch.empty(config.attention_sink_tokens, self.num_heads_q, dtype=torch.float32))
         if self.tp_group.world_size > 1:
             self.sinks.checkpoint_weight_transform = self._shard_sinks
@@ -165,6 +170,8 @@ class Magi2Attention(nn.Module):
         q = apply_rotary_emb(q, cos, sin).squeeze(0).to(self.config.params_dtype)
         k = apply_rotary_emb(k, cos, sin).squeeze(0).to(self.config.params_dtype)
         v = v.squeeze(0).to(self.config.params_dtype)
+        if self.ulysses_head_shards > 1:
+            q, k, v = pack_ulysses_head_shards((q, k, v), self.ulysses_head_shards)
         return q, k, v, gates
 
     def attend(
