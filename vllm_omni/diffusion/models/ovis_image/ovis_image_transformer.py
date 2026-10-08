@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 # Copyright 2025 Alibaba Ovis-Image Team and The HuggingFace. All rights reserved.
 #
@@ -32,9 +32,22 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.layers.fused_qk_norm_rope import (
+    QK_NORM_ROPE_TABLE_KEY,
+    _fused_cuda_supported,
+    fused_joint_qkv_norm_rope,
+    fused_qk_norm_rope,
+    pack_qk_norm_rope_table,
+)
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 
 logger = init_logger(__name__)
+
+# Joint-sequence token count (B * (txt + img)) below which the attention
+# blocks keep their eager RMSNorm -> cat -> RoPE chain; fuse by default (the
+# fused path won at every size measured on H200 for this chain, see Flux.2)
+# and keep the gate for VLLM_OMNI_FUSED_QK_NORM_ROPE_MIN_TOKENS overrides.
+_FUSED_MIN_TOKENS = 0
 
 
 class OvisImageAttention(nn.Module):
@@ -120,8 +133,16 @@ class OvisImageAttention(nn.Module):
         key = key.unflatten(-1, (self.heads, -1))
         value = value.unflatten(-1, (self.heads, -1))
 
-        query = self.norm_q(query)
-        key = self.norm_k(key)
+        # Fused RMSNorm (+ text/image cat) + RoPE in one launch when the
+        # forward supplied the packed table and the CUDA kernel accepts the
+        # geometry; otherwise the original eager chain.
+        qk_norm_rope_table = kwargs.get(QK_NORM_ROPE_TABLE_KEY)
+        use_fused_qk_norm_rope = qk_norm_rope_table is not None and _fused_cuda_supported(
+            query, key, self.head_dim, qk_norm_rope_table.shape[-1], interleaved=True
+        )
+        if not use_fused_qk_norm_rope:
+            query = self.norm_q(query)
+            key = self.norm_k(key)
 
         if self.added_kv_proj_dim is not None:
             encoder_qkv, _ = self.add_kv_proj(encoder_hidden_states)
@@ -131,14 +152,44 @@ class OvisImageAttention(nn.Module):
             encoder_key = encoder_key.unflatten(-1, (self.heads, -1))
             encoder_value = encoder_value.unflatten(-1, (self.heads, -1))
 
-            encoder_query = self.norm_added_q(encoder_query)
-            encoder_key = self.norm_added_k(encoder_key)
+            if use_fused_qk_norm_rope:
+                # One launch writes joint Q/K/V in attention's input layout.
+                query, key, value = fused_joint_qkv_norm_rope(
+                    encoder_query,
+                    encoder_key,
+                    encoder_value,
+                    query,
+                    key,
+                    value,
+                    self.norm_added_q.weight,
+                    self.norm_added_k.weight,
+                    self.norm_q.weight,
+                    self.norm_k.weight,
+                    qk_norm_rope_table,
+                    self.norm_q.variance_epsilon,
+                )
+            else:
+                encoder_query = self.norm_added_q(encoder_query)
+                encoder_key = self.norm_added_k(encoder_key)
 
-            query = torch.cat([encoder_query, query], dim=1)
-            key = torch.cat([encoder_key, key], dim=1)
-            value = torch.cat([encoder_value, value], dim=1)
+                query = torch.cat([encoder_query, query], dim=1)
+                key = torch.cat([encoder_key, key], dim=1)
+                value = torch.cat([encoder_value, value], dim=1)
+        elif use_fused_qk_norm_rope:
+            batch_size, seq_len, num_heads, head_dim = query.shape
+            query, key = fused_qk_norm_rope(
+                query.reshape(batch_size * seq_len, num_heads, head_dim),
+                key.reshape(batch_size * seq_len, num_heads, head_dim),
+                self.norm_q.weight,
+                self.norm_k.weight,
+                qk_norm_rope_table,
+                self.norm_q.variance_epsilon,
+                interleaved=True,
+            )
+            query = query.view(batch_size, seq_len, num_heads, head_dim)
+            key = key.view(batch_size, seq_len, num_heads, head_dim)
 
-        if image_rotary_emb is not None:
+        if image_rotary_emb is not None and not use_fused_qk_norm_rope:
             cos, sin = image_rotary_emb  # [S, D/2]
             cos = cos.to(query.dtype)
             sin = sin.to(query.dtype)
@@ -479,6 +530,19 @@ class OvisImageTransformer2DModel(nn.Module):
             image_rotary_emb = (freqs_cos.npu(), freqs_sin.npu())
         else:
             image_rotary_emb = self.pos_embed(ids)
+        # One packed [cos | sin] table per forward for the fused QK RMSNorm +
+        # RoPE of every block (double: joint text/image op; single: joint
+        # sequence), in the activation dtype like the eager chain's cos/sin.
+        joint_attention_kwargs = None
+        qk_norm_rope_table = pack_qk_norm_rope_table(
+            image_rotary_emb[0],
+            image_rotary_emb[1],
+            hidden_states.shape[0],
+            dtype=hidden_states.dtype,
+            min_tokens=_FUSED_MIN_TOKENS,
+        )
+        if qk_norm_rope_table is not None:
+            joint_attention_kwargs = {QK_NORM_ROPE_TABLE_KEY: qk_norm_rope_table}
 
         for index_block, block in enumerate(self.transformer_blocks):
             encoder_hidden_states, hidden_states = block(
@@ -486,6 +550,7 @@ class OvisImageTransformer2DModel(nn.Module):
                 encoder_hidden_states=encoder_hidden_states,
                 temb=temb,
                 image_rotary_emb=image_rotary_emb,
+                joint_attention_kwargs=joint_attention_kwargs,
             )
 
         for index_block, block in enumerate(self.single_transformer_blocks):
@@ -494,6 +559,7 @@ class OvisImageTransformer2DModel(nn.Module):
                 encoder_hidden_states=encoder_hidden_states,
                 temb=temb,
                 image_rotary_emb=image_rotary_emb,
+                joint_attention_kwargs=joint_attention_kwargs,
             )
 
         hidden_states = self.norm_out(hidden_states, temb)
