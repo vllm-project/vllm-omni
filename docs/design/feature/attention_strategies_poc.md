@@ -45,7 +45,7 @@ per-executor preparation bookkeeping and prepares new geometries on first use.
 
 ## Usage
 
-Pass [cosmos3-subblock-strategy.json](../../../recipes/attention/cosmos3-subblock-strategy.json)
+Pass [cosmos3-subblock-strategy.json](https://github.com/rahul-steiger-nv/vllm-omni/blob/a16c015e17981a4a42179b44247df65beca16f48/recipes/attention/cosmos3-subblock-strategy.json)
 as `diffusion_attention_config`. It keeps ten iterations dense, then uses sparse
 attention in 28 of 36 generation layers; understanding and multi-control stay dense.
 The presets are `fa3_dense` (dense FlashAttention-3) and `fa4_subblock`
@@ -57,7 +57,7 @@ checks the resolved dense implementation is FA3. Sparse execution uses the
 separate FA4 adapter; its `implementation: auto` is required by that API.
 
 For a uniform switch in every generation layer after ten dense iterations, use
-[cosmos3-dense-to-sparse-strategy.json](../../../recipes/attention/cosmos3-dense-to-sparse-strategy.json).
+[cosmos3-dense-to-sparse-strategy.json](https://github.com/rahul-steiger-nv/vllm-omni/blob/a16c015e17981a4a42179b44247df65beca16f48/recipes/attention/cosmos3-dense-to-sparse-strategy.json).
 Understanding and multi-control attention remain FA3 dense in both recipes.
 
 For a dense → mixed → dense schedule, keep the first recipe's presets/layouts
