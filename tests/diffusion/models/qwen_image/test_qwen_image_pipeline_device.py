@@ -89,8 +89,11 @@ def _run_pipeline_init(monkeypatch, *, enable_cpu_offload, loader_device, diffus
         classmethod(lambda cls, *a, **k: MagicMock()),
     )
 
+    load_calls: list[tuple[str, dict]] = []
+
     def _prefetch(factory, *args, **kwargs):
         subfolder = kwargs.get("subfolder")
+        load_calls.append((subfolder, kwargs))
         if subfolder == "text_encoder":
             return enc
         if subfolder == "vae":
@@ -114,13 +117,25 @@ def _run_pipeline_init(monkeypatch, *, enable_cpu_offload, loader_device, diffus
         enable_diffusion_pipeline_profiler=False,
         dtype=torch.bfloat16,
     )
-    return QwenImagePipeline(od_config=od_config)
+    return QwenImagePipeline(od_config=od_config), load_calls
+
+
+def _assert_text_encoder_dtype_forwarded(load_calls: list[tuple[str, dict]]) -> None:
+    """The text encoder must be loaded with the configured dtype.
+
+    Without the explicit ``dtype=`` kwarg, transformers falls back to the
+    checkpoint config dtype (typically bfloat16), whose hidden states then
+    clash with a ``--dtype float16`` transformer on GPUs without bf16
+    support (e.g. sm70/V100).
+    """
+    te_kwargs = next(kwargs for subfolder, kwargs in load_calls if subfolder == "text_encoder")
+    assert te_kwargs.get("dtype") is torch.bfloat16
 
 
 @pytest.mark.parametrize("compact", [False, True])
 def test_pipeline_cpu_offload_parks_encoder_vae_on_cpu(monkeypatch, compact):
     """#7555: cpu_offload keeps BF16 encoder/VAE off the GPU during DiT init."""
-    pipe = _run_pipeline_init(
+    pipe, load_calls = _run_pipeline_init(
         monkeypatch,
         enable_cpu_offload=not compact,
         loader_device="cuda",
@@ -129,11 +144,13 @@ def test_pipeline_cpu_offload_parks_encoder_vae_on_cpu(monkeypatch, compact):
     assert pipe.text_encoder.placed_device.type == "cpu"
     assert pipe.vae.placed_device.type == "cpu"
     assert pipe.transformer.probe_device_type == "cuda"
+    _assert_text_encoder_dtype_forwarded(load_calls)
 
 
 def test_pipeline_dit_follows_loader_cpu_without_override(monkeypatch):
     """Layerwise / HSDP: DiT must not be forced onto CUDA by the pipeline."""
-    pipe = _run_pipeline_init(monkeypatch, enable_cpu_offload=False, loader_device="cpu")
+    pipe, load_calls = _run_pipeline_init(monkeypatch, enable_cpu_offload=False, loader_device="cpu")
     assert pipe.transformer.probe_device_type == "cpu"
     assert pipe.text_encoder.placed_device.type == "cuda"
     assert pipe.vae.placed_device.type == "cuda"
+    _assert_text_encoder_dtype_forwarded(load_calls)
