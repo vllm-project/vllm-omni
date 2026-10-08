@@ -730,6 +730,10 @@ def test_pipeline_loads_task_selected_components_with_encoder_ownership(
         fake_download,
     )
 
+    # The pipeline download is mocked above; config normalization must not
+    # independently resolve the gated repository through the local HF cache.
+    monkeypatch.setattr("vllm_omni.diffusion.data.get_model_path", lambda model, revision: model)
+
     od_config = OmniDiffusionConfig(
         model="MiniMaxAI/MiniMax-H3",
         trust_remote_code=trust_remote_code,
@@ -3551,7 +3555,7 @@ def test_request_cancellation_at_prepare_and_decode_boundaries(preencode, cancel
     def prepare(*args):
         if cancel_phase == "prepare":
             registry.cancel(["request"])
-        return {"num_outputs": 1, "seed": 1101, "preencode_mp4": preencode}
+        return {"num_outputs": 1, "seed": 1101, "preencode_mp4": preencode, "height": 2, "width": 2}
 
     def diffuse(**kwargs):
         registry.cancel(["request"])

@@ -6,7 +6,7 @@
 The runner is driven exactly the way ``DuplexOrchestrator`` drives it: typed
 commands go through ``DuplexSessionManager.dispatch``, stage outputs are pushed
 with ``runner.on_stage_output`` and everything the session says is read back
-from the manager's output sink as typed events. The stage port is a recording
+from the session's output buffer as typed events. The stage port is a recording
 fake; the model plugin is the real MiniCPM-o 4.5 one so append planning and
 output projection are exercised end to end.
 """
@@ -38,7 +38,8 @@ from vllm_omni.engine.duplex.contracts import (
     DuplexStageSubmissionResult,
     duplex_resource_request_id,
 )
-from vllm_omni.engine.duplex.events import DuplexEvent
+from vllm_omni.engine.duplex.delivery import DuplexOutputBuffer
+from vllm_omni.engine.duplex.events import AudioDelta, DuplexEvent
 from vllm_omni.engine.duplex.messages import (
     CloseDuplexSessionMessage,
     DuplexControlResultMessage,
@@ -72,6 +73,8 @@ class RecordingStagePort(DuplexStagePort):
         self.submissions: list[DuplexStageSubmission] = []
         self.cleanups: list[tuple[list[str], bool]] = []
         self.aborts: list[list[str]] = []
+        self.abort_started = asyncio.Event()
+        self.abort_gate: asyncio.Event | None = None
         self.fail_submit: Exception | None = None
         #: When set, ``submit`` parks on it after signalling ``submit_started``.
         self.submit_gate: asyncio.Event | None = None
@@ -105,6 +108,9 @@ class RecordingStagePort(DuplexStagePort):
 
     async def abort_requests(self, request_ids: list[str]) -> None:
         self.aborts.append(list(request_ids))
+        self.abort_started.set()
+        if self.abort_gate is not None:
+            await self.abort_gate.wait()
 
 
 def _fake_encode_audio(audio: object, sample_rate_hz: int, response_format: str, speed: float | None) -> str | None:
@@ -120,6 +126,7 @@ class Harness:
     manager: DuplexSessionManager
     port: RecordingStagePort
     output: asyncio.Queue[Any]
+    output_buffer: DuplexOutputBuffer
     results: asyncio.Queue[Any]
     runner: DuplexSessionRunner
     events: list[DuplexEvent] = field(default_factory=list)
@@ -139,6 +146,12 @@ class Harness:
         collected: list[DuplexEvent] = []
         while True:
             drained = False
+            while self.output_buffer.pending_events:
+                event = await self.output_buffer.get()
+                assert event is not None
+                if self.output_buffer.is_valid(event):
+                    collected.append(event)
+                drained = True
             while not self.output.empty():
                 message = self.output.get_nowait()
                 if isinstance(message, DuplexSessionEventMessage):
@@ -215,12 +228,17 @@ async def open_harness(
     port = RecordingStagePort(stage_count=stage_count)
     output: asyncio.Queue[Any] = asyncio.Queue()
     results: asyncio.Queue[Any] = asyncio.Queue()
+    limits = runtime_config or DuplexSessionRuntimeConfig()
+    output_buffer = DuplexOutputBuffer(
+        max_bytes=limits.max_pending_output_bytes_per_session,
+        max_events=limits.max_pending_output_events_per_session,
+    )
     manager = DuplexSessionManager(
         plugin=plugin,
         stage_port=port,
         output_sink=output,
         result_sink=results,
-        runtime_config=runtime_config or DuplexSessionRuntimeConfig(),
+        runtime_config=limits,
         model_config=None,
         log_stats=log_stats,
         clock=clock,
@@ -232,10 +250,21 @@ async def open_harness(
         instructions="You are a concise assistant.",
         extra_body=body,
     )
-    await manager.handle(OpenDuplexSessionMessage(control_id="c-open", session_id=SESSION_ID, session_config=config))
+    await manager.handle(
+        OpenDuplexSessionMessage(
+            control_id="c-open", session_id=SESSION_ID, session_config=config, output_buffer=output_buffer
+        )
+    )
     result = await asyncio.wait_for(results.get(), timeout=2.0)
     assert isinstance(result, DuplexControlResultMessage) and result.ok, result
-    harness = Harness(manager=manager, port=port, output=output, results=results, runner=manager.runners[SESSION_ID])
+    harness = Harness(
+        manager=manager,
+        port=port,
+        output=output,
+        output_buffer=output_buffer,
+        results=results,
+        runner=manager.runners[SESSION_ID],
+    )
     await harness.settle()
     return harness
 
@@ -710,6 +739,8 @@ async def test_stale_epoch_output_is_dropped_after_barge_in() -> None:
 
 async def test_barge_in_aborts_draining_tts_as_well_as_the_active_request() -> None:
     h = await open_harness()
+    release_abort = asyncio.Event()
+    h.port.abort_gate = release_abort
     try:
         await h.run(append_audio())
         request_id = h.stage0_request_id()
@@ -730,7 +761,24 @@ async def test_barge_in_aborts_draining_tts_as_well_as_the_active_request() -> N
         h.session.request_resources[(1, "still-live")] = DuplexRequestResource(
             stage_id=1, request_id="still-live", fence=older, submitted=True
         )
-        events = await h.run(commands.BargeIn())
+        h.manager.emit(
+            h.session,
+            [
+                AudioDelta(response_id="resp-old", delta="AAAA"),
+                AudioDelta(response_id="resp-old", delta="BBBB"),
+                AudioDelta(response_id=h.session.active_response_id, delta="CCCC"),
+            ],
+        )
+        held = await h.output_buffer.get()
+        assert held is not None and h.output_buffer.is_valid(held)
+        h.submit(commands.BargeIn())
+        await asyncio.wait_for(h.port.abort_started.wait(), timeout=2.0)
+        # Both queued audio and an event held by the consumer become stale
+        # before the stage abort can yield, including the older draining turn.
+        assert not h.output_buffer.is_valid(held)
+        assert h.output_buffer.pending_events == 0
+        release_abort.set()
+        events = await h.settle()
         assert h.port.aborts == [[request_id, "duplex-drain-tts"]]
         assert not h.session.is_draining_request("duplex-drain-tts")
         done_ids = [
@@ -744,6 +792,36 @@ async def test_barge_in_aborts_draining_tts_as_well_as_the_active_request() -> N
         assert (0, request_id) not in h.session.request_resources
         assert (1, "still-live") in h.session.request_resources
     finally:
+        release_abort.set()
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_close_invalidates_draining_audio_before_stage_abort_finishes() -> None:
+    h = await open_harness()
+    release_abort = asyncio.Event()
+    h.port.abort_gate = release_abort
+    try:
+        h.session.bind_draining_request("duplex-drain-tts", "resp-old")
+        h.manager.emit(
+            h.session,
+            [AudioDelta(response_id="resp-old", delta="AAAA"), AudioDelta(response_id="resp-old", delta="BBBB")],
+        )
+        held = await h.output_buffer.get()
+        assert held is not None and h.output_buffer.is_valid(held)
+        h.submit(commands.CloseSession())
+        await asyncio.wait_for(h.port.abort_started.wait(), timeout=2.0)
+        # Session close suppresses audio.cancelled notifications; it must still
+        # invalidate the pending output without relying on those later events.
+        assert not h.output_buffer.is_valid(held)
+        assert h.output_buffer.pending_events == 0
+        assert h.port.aborts == [["duplex-drain-tts"]]
+        release_abort.set()
+        events = await h.settle()
+        assert "session.closed" in types(events)
+        assert h.manager.active_count() == 0
+    finally:
+        release_abort.set()
         await close_harness(h)
 
 

@@ -18,6 +18,7 @@ from fastapi import WebSocketDisconnect
 from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
 from vllm_omni.engine.duplex import commands
 from vllm_omni.engine.duplex.config import DuplexCapabilities
+from vllm_omni.engine.duplex.delivery import DuplexOutputBuffer
 from vllm_omni.engine.duplex.events import AudioDelta, DuplexEvent, SessionClosed, SessionCreated
 from vllm_omni.engine.duplex.messages import DuplexSessionError
 from vllm_omni.entrypoints.duplex.realtime_input import RealtimeEnvelope, parse_resume_request
@@ -94,10 +95,13 @@ class FakeHandle:
         self.closed = False
         self.close_reasons: list[str] = []
         self.commands: list[commands.DuplexCommand] = []
-        self._outbox: asyncio.Queue[DuplexEvent] = asyncio.Queue()
+        self._outbox = DuplexOutputBuffer(max_bytes=2 * 1024 * 1024, max_events=512)
 
     def deliver(self, event: DuplexEvent) -> None:
-        self._outbox.put_nowait(event)
+        self._outbox.put(event)
+
+    def output_guard(self, event: DuplexEvent):
+        return self._outbox.guard(event)
 
     async def submit(self, command: commands.DuplexCommand) -> None:
         if self.closed:
@@ -107,6 +111,10 @@ class FakeHandle:
     async def events(self):
         while True:
             event = await self._outbox.get()
+            if event is None:
+                return
+            if not self._outbox.is_valid(event):
+                continue
             yield event
             if event.is_terminal:
                 return

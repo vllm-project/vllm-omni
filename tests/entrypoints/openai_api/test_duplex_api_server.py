@@ -14,6 +14,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from starlette.datastructures import State
 from starlette.websockets import WebSocketDisconnect
+from vllm.entrypoints.openai.models.protocol import BaseModelPath
 
 from vllm_omni.config import stage_config
 from vllm_omni.config.config_factory import StageConfigFactory
@@ -56,14 +57,12 @@ _DUPLEX_APP_STATE_KEYS = {
     "openai_streaming_speech",
     "openai_streaming_video",
     "openai_streaming_video_output",
-    "openai_serving_realtime",
     "openai_serving_realtime_robot",
     "anthropic_serving_messages",
     "openai_serving_duplex",
     "enable_server_load_tracking",
     "server_load_metrics",
 }
-#: Every turn-based service, plus the Realtime route that is not the duplex one.
 #: ``openai_serving_chat`` is absent: a duplex engine also serves chat, through
 #: the ordinary turn-based service, because DuplexOmni extends AsyncOmni.
 #: ``online_renderer`` is absent for the same reason -- the chat service needs it.
@@ -167,6 +166,7 @@ def _minimal_args(**overrides) -> SimpleNamespace:
         enable_force_include_usage=False,
         enable_log_outputs=False,
         enable_log_deltas=False,
+        log_error_stack=False,
     )
     for key, value in overrides.items():
         setattr(args, key, value)
@@ -317,7 +317,8 @@ def test_minicpmo_serving_profiles(monkeypatch, deploy_name, expected):
 
 
 @pytest.mark.asyncio
-async def test_duplex_app_state_wires_only_the_session_surfaces(monkeypatch) -> None:
+@pytest.mark.parametrize("log_error_stack", [False, True])
+async def test_duplex_app_state_wires_only_the_session_surfaces(monkeypatch, mocker, log_error_stack) -> None:
     """Lock the duplex ``app.state``: the two session-backed surfaces are live, every turn-based service is None.
 
     Fails if a turn-based service is wired into a duplex server (its route
@@ -327,12 +328,12 @@ async def test_duplex_app_state_wires_only_the_session_surfaces(monkeypatch) -> 
     the turn-based chat service.
     """
     monkeypatch.setattr(api_server, "OpenAIServingModels", _FakeModels)
-    monkeypatch.setattr(api_server, "OnlineRenderer", lambda **kwargs: SimpleNamespace(**kwargs))
+    renderer_ctor = mocker.patch.object(api_server, "OnlineRenderer")
     monkeypatch.setattr(api_server, "OmniOpenAIServingChat", lambda **kwargs: SimpleNamespace(**kwargs))
     engine = _FakeDuplexOmni()
     state = State()
 
-    await api_server.omni_init_app_state(engine, state, _minimal_args())
+    await api_server.omni_init_app_state(engine, state, _minimal_args(log_error_stack=log_error_stack))
 
     present = {key for key in _DUPLEX_APP_STATE_KEYS if hasattr(state, key)}
     assert present == _DUPLEX_APP_STATE_KEYS
@@ -342,6 +343,10 @@ async def test_duplex_app_state_wires_only_the_session_surfaces(monkeypatch) -> 
     assert not unexpectedly_set, f"turn-based services wired into a duplex server: {unexpectedly_set}"
     assert isinstance(state.openai_serving_duplex, OmniDuplexSessionHandler)
     assert state.openai_serving_chat is not None
+    renderer_ctor.assert_called_once()
+    assert renderer_ctor.call_args.kwargs["log_error_stack"] is log_error_stack
+    assert state.openai_serving_chat.online_renderer is state.online_renderer is renderer_ctor.return_value
+    state.online_renderer.warmup.assert_called_once_with()
     assert state.engine_client is engine
     assert state.vllm_config is engine._vllm_config
 
@@ -368,9 +373,29 @@ def _duplex_app(handler: object) -> FastAPI:
     app = FastAPI()
     app.include_router(api_server.router)
     app.state.openai_serving_duplex = handler
-    # A duplex server serves no turn-based Realtime route.
-    app.state.openai_serving_realtime = None
     return app
+
+
+def _turn_based_realtime_app(handler: object | None, mocker) -> FastAPI:
+    app = _duplex_app(handler)
+    app.state.args = Namespace()
+    app.state.openai_serving_models = _FakeModels(
+        base_model_paths=[BaseModelPath(name="omni-model", model_path="omni-model")]
+    )
+    app.state.engine_client = mocker.Mock()
+    app.state.openai_serving_chat = mocker.Mock()
+    return app
+
+
+def _assert_openai_realtime_connection(client: TestClient, path: str) -> None:
+    with client.websocket_connect(path) as websocket:
+        assert websocket.receive_json()["type"] == "session.created"
+        assert websocket.receive_json()["type"] == "conversation.created"
+        websocket.send_json({"type": "unknown_event"})
+        error = websocket.receive_json()
+        assert error["type"] == "error"
+        assert error["error"]["type"] == "invalid_request_error"
+        assert error["error"]["code"] == "invalid_event"
 
 
 @pytest.mark.parametrize("path", ["/v1/duplex", "/v1/realtime?duplex=1"])
@@ -421,21 +446,21 @@ def test_realtime_without_a_duplex_flag_reaches_the_session_handler(query: str) 
 
 
 @pytest.mark.parametrize("query", ["?duplex=0", "?duplex=false", "?duplex=off"])
-def test_realtime_opted_out_of_duplex_falls_through_to_the_turn_based_route(query: str) -> None:
-    """An explicit opt-out selects the legacy handler, which a duplex server does not mount."""
+def test_realtime_opted_out_of_duplex_falls_through_to_the_turn_based_route(query: str, mocker) -> None:
     handler = _RecordingHandler()
+    app = _turn_based_realtime_app(handler, mocker)
 
-    with TestClient(_duplex_app(handler)) as client:
-        with client.websocket_connect(f"/v1/realtime{query}") as websocket:
-            assert websocket.receive_json() == {
-                "type": "error",
-                "error": "Realtime API is not available",
-                "code": "unsupported",
-            }
-            with pytest.raises(WebSocketDisconnect):
-                websocket.receive_text()
+    with TestClient(app) as client:
+        _assert_openai_realtime_connection(client, f"/v1/realtime{query}")
 
     assert handler.queries == []
+
+
+def test_turn_based_deployment_uses_openai_realtime(mocker) -> None:
+    app = _turn_based_realtime_app(None, mocker)
+
+    with TestClient(app) as client:
+        _assert_openai_realtime_connection(client, "/v1/realtime?model=omni-model")
 
 
 # --------------------------------------------------------------------------- #
@@ -479,16 +504,27 @@ async def test_warmup_gate_lets_the_warmup_connection_and_plain_servers_through(
 
 
 @pytest.mark.asyncio
-async def test_a_model_that_does_not_declare_chat_completions_does_not_get_the_route(monkeypatch) -> None:
-    """The decision stays the model's: no capability, no chat service, and the route says so."""
+@pytest.mark.parametrize(
+    "supports_chat, supported_tasks", [(False, ("generate",)), (True, ())], ids=["no-capability", "no-generation"]
+)
+async def test_duplex_chat_initialization_respects_model_gates(
+    monkeypatch, mocker, supports_chat, supported_tasks
+) -> None:
+    """Neither gate may construct or warm up a chat renderer."""
     monkeypatch.setattr(api_server, "OpenAIServingModels", _FakeModels)
+    renderer_ctor = mocker.patch.object(api_server, "OnlineRenderer")
+    chat_ctor = mocker.patch.object(api_server, "OmniOpenAIServingChat")
     engine = _FakeDuplexOmni()
-    engine._capabilities = DuplexCapabilities(supports_chat_completions=False)
+    engine._capabilities = DuplexCapabilities(supports_chat_completions=supports_chat)
+    mocker.patch.object(engine, "get_supported_tasks", return_value=supported_tasks)
     state = State()
 
     await api_server.omni_init_app_state(engine, state, _minimal_args())
 
     assert state.openai_serving_chat is None
+    assert state.openai_serving_chat_batch is None
+    renderer_ctor.assert_not_called()
+    chat_ctor.assert_not_called()
     assert isinstance(state.openai_serving_duplex, OmniDuplexSessionHandler)
 
 
@@ -506,8 +542,6 @@ def test_qwen_plugin_preserves_custom_turn_deployment_default(monkeypatch, tmp_p
 @pytest.mark.parametrize("flag", ["1", "true", "on"])
 def test_turn_deployment_rejects_explicit_duplex_without_falling_back_to_stt(flag: str) -> None:
     app = _duplex_app(None)
-    # Even an available STT service must not silently accept a duplex request.
-    app.state.openai_serving_realtime = object()
     with TestClient(app) as client:
         with client.websocket_connect(f"/v1/realtime?duplex={flag}") as websocket:
             assert websocket.receive_json() == {
@@ -518,3 +552,31 @@ def test_turn_deployment_rejects_explicit_duplex_without_falling_back_to_stt(fla
             with pytest.raises(WebSocketDisconnect) as exc:
                 websocket.receive_text()
             assert exc.value.code == 1008
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "explicit_template, tokenizer_template, tokenizer_error, expected",
+    [
+        ("explicit", None, False, "explicit"),
+        (None, "tokenizer", False, None),
+        (None, None, False, "model-json"),
+        (None, None, True, "model-json"),
+    ],
+)
+async def test_shared_chat_template_resolution(
+    mocker, explicit_template, tokenizer_template, tokenizer_error, expected
+):
+    engine = _FakeDuplexOmni()
+    tokenizer = mocker.patch.object(
+        engine,
+        "get_tokenizer",
+        return_value=SimpleNamespace(chat_template=tokenizer_template),
+        side_effect=RuntimeError("tokenizer unavailable") if tokenizer_error else None,
+    )
+    mocker.patch.object(api_server, "load_chat_template", return_value=explicit_template)
+    model_template = mocker.patch.object(api_server, "_load_model_chat_template_json", return_value="model-json")
+
+    assert await api_server._resolve_chat_template(engine, _minimal_args()) == expected
+    assert tokenizer.call_count == (0 if explicit_template is not None else 1)
+    assert model_template.call_count == (1 if expected == "model-json" else 0)

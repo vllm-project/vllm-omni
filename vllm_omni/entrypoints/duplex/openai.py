@@ -4,34 +4,17 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Mapping
-from typing import Any
 
 from fastapi import WebSocket
 from vllm.logger import init_logger
 from vllm.utils import random_uuid
 
 from vllm_omni.entrypoints.duplex.warmup import DUPLEX_WARMUP_CLIENT_WAIT_S
-from vllm_omni.entrypoints.openai.realtime.connection import OpenAIFullDuplexConnection
-from vllm_omni.entrypoints.openai.realtime_connection import RealtimeConnection
 
 logger = init_logger(__name__)
 
-_QWEN3_OMNI_REALTIME_ARCH = "Qwen3OmniMoeForConditionalGeneration"
-_QWEN3_OMNI_REALTIME_STAGES = {"thinker", "talker", "code2wav"}
-
-
-def supports_qwen3_omni_realtime(stage_configs: Any) -> bool:
-    def stage_arg(stage: Any, name: str) -> Any:
-        engine_args = getattr(stage, "engine_args", None)
-        return engine_args.get(name) if isinstance(engine_args, Mapping) else getattr(engine_args, name, None)
-
-    stages = stage_configs or ()
-    return (
-        len(stages) == len(_QWEN3_OMNI_REALTIME_STAGES)
-        and all(stage_arg(stage, "model_arch") == _QWEN3_OMNI_REALTIME_ARCH for stage in stages)
-        and {stage_arg(stage, "model_stage") for stage in stages} == _QWEN3_OMNI_REALTIME_STAGES
-    )
+# Keep OpenAI connection imports in the handlers: openai/__init__.py imports
+# api_server, which imports this module.
 
 
 async def reject_realtime_websocket(websocket: WebSocket, message: str) -> None:
@@ -52,25 +35,21 @@ async def reject_realtime_websocket(websocket: WebSocket, message: str) -> None:
     await websocket.close(code=1008)
 
 
-async def dispatch_generic_realtime_websocket(websocket: WebSocket) -> None:
-    """Fall back to the generic OpenAI Realtime API for non-Qwen3-Omni models."""
-    serving = getattr(websocket.app.state, "openai_serving_realtime", None)
-    if serving is None:
-        await websocket.accept()
-        await websocket.send_json({"type": "error", "error": "Realtime API is not available", "code": "unsupported"})
-        await websocket.close()
-        return
-    connection = RealtimeConnection(websocket, serving)
-    await connection.handle_connection()
+async def _reject_unavailable_realtime_websocket(websocket: WebSocket) -> None:
+    await websocket.accept()
+    await websocket.send_json({"type": "error", "error": "Realtime API is not available", "code": "unsupported"})
+    await websocket.close()
 
 
 async def dispatch_realtime_websocket(websocket: WebSocket) -> None:
-    """Handle Realtime sessions not already routed to the proprietary duplex
-    handler by the caller: Qwen3-Omni gets a conformant full-duplex connection,
-    everything else falls back to the generic turn-based Realtime API."""
+    """Route a turn-based Realtime session to the OpenAI connection handler."""
     state = websocket.app.state
-    if not supports_qwen3_omni_realtime(getattr(state, "stage_configs", None)):
-        await dispatch_generic_realtime_websocket(websocket)
+    if (
+        getattr(state, "diffusion_engine", None) is not None
+        or getattr(state, "engine_client", None) is None
+        or getattr(state, "openai_serving_chat", None) is None
+    ):
+        await _reject_unavailable_realtime_websocket(websocket)
         return
 
     model_name = state.openai_serving_models.base_model_paths[0].name
@@ -93,12 +72,13 @@ async def dispatch_realtime_websocket(websocket: WebSocket) -> None:
                 DUPLEX_WARMUP_CLIENT_WAIT_S,
             )
 
-    tokenizer = await state.engine_client.get_tokenizer()
+    from vllm_omni.entrypoints.openai.realtime.connection import OpenAIFullDuplexConnection
+
     connection = OpenAIFullDuplexConnection(
         websocket=websocket,
         engine=state.engine_client,
         model_name=model_name,
-        tokenizer=tokenizer,
+        chat_handler=state.openai_serving_chat,
         tool_call_parser=getattr(state.args, "tool_call_parser", None),
         enable_auto_tool_choice=getattr(state.args, "enable_auto_tool_choice", False),
     )

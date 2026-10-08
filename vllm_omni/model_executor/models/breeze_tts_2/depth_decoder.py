@@ -16,6 +16,14 @@ from vllm.platforms import current_platform
 from vllm_omni.platforms import current_omni_platform
 
 
+def _depth_layer_compile_options() -> dict[str, bool]:
+    """Keep ROCm away from the unstable Triton GEMM autotune path."""
+    return {
+        "epilogue_fusion": False,
+        "max_autotune": not current_platform.is_rocm(),
+    }
+
+
 def sample_logits(
     logits: torch.Tensor,
     temperature: float,
@@ -283,7 +291,7 @@ class BreezeDepthDecoder(nn.Module):
                     BreezeDepthLayer.forward,
                     fullgraph=True,
                     dynamic=True,
-                    options={"epilogue_fusion": False, "max_autotune": True},
+                    options=_depth_layer_compile_options(),
                 )
                 self._compiled_sampler = torch.compile(sample_graph_logits, fullgraph=True, dynamic=False)
             entry = BreezeDepthGraph(

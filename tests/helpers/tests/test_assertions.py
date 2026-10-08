@@ -2,7 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import io
+import json
 import wave
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import numpy as np
@@ -247,6 +249,85 @@ def test_pcm_transcript_escalation_uses_same_valid_wav_and_rejects_two_wrong_tra
     ]
     for wav_bytes, _, _ in transcriptions:
         _assert_wav_wraps_pcm(wav_bytes, pcm_bytes, 24_000)
+
+
+@pytest.mark.parametrize("response_format", ["wav", "pcm"])
+@pytest.mark.parametrize("escalation_model", [None, "large-v3"])
+def test_failed_speech_capture_retains_exact_asr_input_and_original_failure(
+    monkeypatch, tmp_path, response_format, escalation_model
+):
+    pcm_bytes = _pcm_sine()
+    wav = io.BytesIO()
+    with wave.open(wav, "wb") as writer:
+        writer.setnchannels(1)
+        writer.setsampwidth(2)
+        writer.setframerate(24_000)
+        writer.writeframes(pcm_bytes)
+    audio_bytes = wav.getvalue() if response_format == "wav" else pcm_bytes
+    transcribed = []
+
+    def transcribe(audio_bytes, **kwargs):
+        transcribed.append(audio_bytes)
+        return "this is unrelated speech"
+
+    directory = tmp_path / "failed_audio"
+    monkeypatch.setenv("VLLM_OMNI_FAILED_SPEECH_AUDIO_DIR", str(directory))
+    monkeypatch.setattr(assertions, "convert_audio_bytes_to_text", transcribe)
+    config = {
+        "input": "please read this requested sentence accurately",
+        "response_format": response_format,
+        "transcript_pcm_sample_rate": 24_000,
+        "transcript_escalation_model": escalation_model,
+    }
+    response = OmniResponse(success=True, audio_bytes=audio_bytes, audio_format=f"audio/{response_format}")
+    with pytest.raises(AssertionError, match="Transcript doesn't match input") as error:
+        assert_audio_speech_response(response, config, "full_model")
+
+    clips = list(directory.glob("*.wav"))
+    assert len(clips) == 1
+    assert all(clip == clips[0].read_bytes() for clip in transcribed)
+    _assert_wav_wraps_pcm(clips[0].read_bytes(), pcm_bytes, 24_000)
+    metadata = json.loads(clips[0].with_suffix(".json").read_text())
+    assert metadata["expected_text"] == config["input"]
+    assert metadata["transcript"] == "this is unrelated speech"
+    assert metadata["assertion"] == str(error.value)
+
+
+@pytest.mark.parametrize("capture_enabled", [False, True])
+@pytest.mark.parametrize("content_failure", [False, True])
+def test_speech_capture_is_opt_in_and_does_not_write_successes(monkeypatch, tmp_path, capture_enabled, content_failure):
+    directory = tmp_path / "failed_audio"
+    if capture_enabled:
+        monkeypatch.setenv("VLLM_OMNI_FAILED_SPEECH_AUDIO_DIR", str(directory))
+    else:
+        monkeypatch.delenv("VLLM_OMNI_FAILED_SPEECH_AUDIO_DIR", raising=False)
+    expected = "please read this requested sentence accurately"
+    monkeypatch.setattr(
+        assertions,
+        "convert_audio_bytes_to_text",
+        lambda *_args, **_kwargs: "this is unrelated speech" if content_failure else expected,
+    )
+    with pytest.raises(AssertionError, match="Transcript doesn't match input") if content_failure else nullcontext():
+        assert_audio_speech_response(
+            OmniResponse(success=True, audio_bytes=b"audio", audio_format="audio/wav"),
+            {"input": expected, "response_format": "wav"},
+            "full_model",
+        )
+    assert directory.exists() is (capture_enabled and content_failure)
+    assert len(list(tmp_path.rglob("*.wav"))) == int(capture_enabled and content_failure)
+
+
+def test_speech_capture_io_failure_does_not_mask_content_failure(monkeypatch, tmp_path):
+    directory = tmp_path / "blocked"
+    directory.write_text("a file cannot be an output directory")
+    monkeypatch.setenv("VLLM_OMNI_FAILED_SPEECH_AUDIO_DIR", str(directory))
+    monkeypatch.setattr(assertions, "convert_audio_bytes_to_text", lambda *_args, **_kwargs: "this is unrelated speech")
+    with pytest.raises(AssertionError, match="Transcript doesn't match input"):
+        assert_audio_speech_response(
+            OmniResponse(success=True, audio_bytes=b"audio", audio_format="audio/wav"),
+            {"input": "please read this requested sentence accurately", "response_format": "wav"},
+            "full_model",
+        )
 
 
 @pytest.mark.parametrize(

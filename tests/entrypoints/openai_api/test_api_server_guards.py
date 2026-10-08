@@ -58,7 +58,6 @@ from starlette.requests import Request
 from starlette.websockets import WebSocketDisconnect
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 
-from vllm_omni.entrypoints.duplex import openai as duplex_openai
 from vllm_omni.entrypoints.openai import api_server
 from vllm_omni.entrypoints.serve.utils import errors as serve_errors
 
@@ -671,17 +670,15 @@ async def test_realtime_route_defaults_to_configured_duplex_handler(
         async def handle_realtime_session(self, _websocket) -> None:
             calls.append("duplex")
 
-    class _LegacyConnection:
-        async def handle_connection(self) -> None:
-            calls.append("legacy")
+    async def _dispatch_turn_based(_websocket) -> None:
+        calls.append("legacy")
 
-    monkeypatch.setattr(duplex_openai, "RealtimeConnection", lambda _websocket, _serving: _LegacyConnection())
+    monkeypatch.setattr(api_server, "dispatch_realtime_websocket", _dispatch_turn_based)
     query_params = {} if duplex_query is None else {"duplex": duplex_query}
     websocket = SimpleNamespace(
         app=SimpleNamespace(
             state=SimpleNamespace(
                 openai_serving_duplex=_DuplexHandler(),
-                openai_serving_realtime=object(),
             )
         ),
         query_params=query_params,
@@ -1056,7 +1053,8 @@ async def test_pure_diffusion_speech_forwards_media_access_args(monkeypatch, tmp
 
 
 @pytest.mark.asyncio
-async def test_multistage_app_state_key_snapshot(monkeypatch, tmp_path) -> None:
+@pytest.mark.parametrize("supported_tasks", [("generate",), ("embed",)])
+async def test_multistage_app_state_key_snapshot(monkeypatch, mocker, tmp_path, supported_tasks) -> None:
     """Lock multi-stage ``app.state`` keys after init, including live vs None.
 
     Fails if chat/speech/video/realtime/tokenization keys disappear or are
@@ -1071,6 +1069,7 @@ async def test_multistage_app_state_key_snapshot(monkeypatch, tmp_path) -> None:
             parallel_config=SimpleNamespace(_api_process_rank=0),
         ),
     )
+    mocker.patch.object(engine, "get_supported_tasks", return_value=supported_tasks)
 
     class _FakeModels:
         def __init__(self, *args, **kwargs):
@@ -1081,10 +1080,12 @@ async def test_multistage_app_state_key_snapshot(monkeypatch, tmp_path) -> None:
 
     class _FakeCtor:
         def __init__(self, *args, **kwargs):
-            pass
+            self.args = args
+            self.kwargs = kwargs
+            self.warmup_calls = 0
 
         def warmup(self):
-            return None
+            self.warmup_calls += 1
 
     deploy = tmp_path / "deploy.yaml"
     deploy.write_text("speech_cache:\n  resolve_max_bytes: 1024\n  speaker_max_bytes: 8\n")
@@ -1122,17 +1123,33 @@ async def test_multistage_app_state_key_snapshot(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(api_server, "OmniOpenAIServingVideo", _FakeCtor)
 
     state = State()
-    await api_server.omni_init_app_state(engine, state, _minimal_args())
+    await api_server.omni_init_app_state(engine, state, _minimal_args(log_error_stack=True))
     assert speech_kwargs["speech_cache_config"].resolve_max_bytes == 1024
     assert speech_kwargs["speech_cache_config"].resolve_max_entries == 2048
     assert speech_kwargs["speech_cache_config"].speaker_max_bytes == 8
 
+    disabled = (
+        set()
+        if "generate" in supported_tasks
+        else {"openai_serving_chat", "openai_serving_chat_batch", "openai_streaming_video"}
+    )
     _assert_app_state_snapshot(
         state,
         expected_keys=_MULTISTAGE_APP_STATE_KEYS,
-        must_be_wired=_MULTISTAGE_MUST_BE_WIRED,
-        must_be_none=_MULTISTAGE_MUST_BE_NONE,
+        must_be_wired=_MULTISTAGE_MUST_BE_WIRED - disabled,
+        must_be_none=_MULTISTAGE_MUST_BE_NONE | disabled,
     )
+    assert state.online_renderer.kwargs["log_error_stack"] is True
+    assert state.online_renderer.warmup_calls == 1
+    for service in (state.openai_serving_chat, state.openai_serving_chat_batch):
+        if "generate" in supported_tasks:
+            assert service.kwargs["online_renderer"] is state.online_renderer
+        else:
+            assert service is None
+    if "generate" in supported_tasks:
+        assert state.openai_serving_responses.args[2] is state.online_renderer
+    else:
+        assert state.openai_serving_responses is None
 
 
 @pytest.mark.parametrize("count", [None, 0, -1, "2", True])

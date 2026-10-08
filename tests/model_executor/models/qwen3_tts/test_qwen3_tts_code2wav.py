@@ -293,6 +293,31 @@ def test_request_aware_forward_passes_only_delta_frames_to_decoder():
     ]
 
 
+def test_forward_reports_the_codec_frames_past_the_left_context():
+    model = _make_model()
+
+    out = model.forward(
+        input_ids=torch.arange(12, dtype=torch.long),
+        runtime_additional_information=[{"meta": {"left_context_size": 2}}],
+    )
+
+    # Codebook-major ids [[0..5], [6..11]]: the four frames after the two context
+    # frames, one row of codebooks per frame.
+    frames = out.multimodal_outputs["codec_frames"][0]
+    torch.testing.assert_close(frames, torch.tensor([[2, 8], [3, 9], [4, 10], [5, 11]]))
+
+
+def test_request_aware_forward_reports_each_delta_frame():
+    model = _make_model(async_chunk=True)
+    info = [{"meta": {"request_id": "rid", "left_context_size": 0}}]
+
+    first = model.forward(input_ids=torch.arange(6, dtype=torch.long), runtime_additional_information=info)
+    second = model.forward(input_ids=torch.arange(4, dtype=torch.long), runtime_additional_information=info)
+
+    torch.testing.assert_close(first.multimodal_outputs["codec_frames"][0], torch.tensor([[0, 3], [1, 4], [2, 5]]))
+    torch.testing.assert_close(second.multimodal_outputs["codec_frames"][0], torch.tensor([[0, 2], [1, 3]]))
+
+
 def test_four_frame_first_chunk_uses_configured_initial_size_without_ramp():
     model = _make_model(
         async_chunk=True,

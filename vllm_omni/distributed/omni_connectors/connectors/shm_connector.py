@@ -2,9 +2,14 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import fcntl
+import glob
+import hashlib
 import os
+import select
+import stat
 import threading
 import time
+import uuid
 from collections import OrderedDict
 from multiprocessing import shared_memory as shm_pkg
 from typing import Any
@@ -17,6 +22,15 @@ from .base import OmniConnectorBase
 logger = get_connector_logger(__name__)
 
 
+def _wakeup_enabled() -> bool:
+    return os.environ.get("VLLM_OMNI_SHM_WAKEUP", "1") == "1"
+
+
+def _wakeup_directory() -> str:
+    # Stage engine processes of one deployment share their launching parent.
+    return f"/dev/shm/omni_shm_wake_{os.getuid()}_{os.getppid()}"
+
+
 class SharedMemoryConnector(OmniConnectorBase):
     """Key-addressed local shared-memory connector.
 
@@ -25,6 +39,12 @@ class SharedMemoryConnector(OmniConnectorBase):
     remote-transport metadata such as ``source_host`` / ``source_port``
     (that is the RDMA connector's job).  When such metadata is passed in,
     the connector silently falls back to key-based lookup.
+
+    Arrival wakeups: each receiving connector owns a unique named FIFO. A
+    ``put`` broadcasts one byte to every FIFO for the destination stage, so the receive loop blocks in
+    ``wait_for_change`` until data arrives instead of re-polling on a fixed
+    interval. Wakeups are hints: a stage that cannot reach the FIFO (another
+    deployment layout, or ``VLLM_OMNI_SHM_WAKEUP=0``) keeps the timed poll.
     """
 
     def get_with_deadline(self, from_stage, to_stage, get_key, metadata=None, *, deadline):
@@ -35,6 +55,12 @@ class SharedMemoryConnector(OmniConnectorBase):
     def __init__(self, config: dict[str, Any]):
         self.config = config
         self.stage_id = config.get("stage_id", -1)
+        scope = config.get("extra", {}).get("wakeup_scope")
+        self._wake_directory = (
+            f"/dev/shm/omni_shm_wake_{os.getuid()}_{hashlib.sha256(str(scope).encode()).hexdigest()[:24]}"
+            if scope is not None
+            else _wakeup_directory()
+        )
         self._pending_keys: OrderedDict[str, None] = OrderedDict()
         self._pending_keys_lock = threading.Lock()
         self._metrics = {
@@ -42,6 +68,129 @@ class SharedMemoryConnector(OmniConnectorBase):
             "gets": 0,
             "bytes_transferred": 0,
         }
+        # Receiver side: FIFO read end (plus a write end of our own, so the
+        # FIFO never reports EOF when no sender has it open) and a counter of
+        # drained wakeups. Each receiver owns its path, including across restarts.
+        self._wake_lock = threading.Lock()
+        self._wake_read_fd: int | None = None
+        self._wake_hold_fd: int | None = None
+        self._wake_path: str | None = None
+        self._wake_generation = 0
+        self._wake_closed = False
+
+    def _open_wakeup_receiver(self) -> bool:
+        if self._wake_closed:
+            return False
+        if self._wake_read_fd is not None:
+            return True
+        if not _wakeup_enabled():
+            return False
+        try:
+            if int(self.stage_id) < 0:
+                return False
+            path = f"{self._wake_directory}/{int(self.stage_id)}_{uuid.uuid4().hex}"
+        except (TypeError, ValueError):
+            return False
+        read_fd = hold_fd = None
+        created = False
+        try:
+            os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+            os.mkfifo(path, 0o600)
+            created = True
+            read_fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+            hold_fd = os.open(path, os.O_WRONLY | os.O_NONBLOCK)
+        except OSError as e:
+            for fd in (read_fd, hold_fd):
+                if fd is not None:
+                    os.close(fd)
+            if created:
+                try:
+                    os.unlink(path)
+                except FileNotFoundError:
+                    pass
+            logger.debug("SHM wakeup FIFO unavailable at %s: %s", path, e)
+            return False
+        self._wake_read_fd, self._wake_hold_fd, self._wake_path = read_fd, hold_fd, path
+        return True
+
+    def get_wakeup_generation(self) -> int | None:
+        """Snapshot before polling; a later arrival changes it (see ``wait_for_change``).
+
+        ``None`` when this stage has no wakeup FIFO: the caller keeps its timed poll.
+        """
+        with self._wake_lock:
+            return self._wake_generation if self._open_wakeup_receiver() else None
+
+    def wait_for_change(self, generation: int, *, timeout: float) -> bool:
+        """Block until a ``put`` to this stage since ``generation``, or ``timeout``."""
+        with self._wake_lock:
+            read_fd = self._wake_read_fd
+            if self._wake_closed or read_fd is None:
+                return False
+        if self._wake_generation == generation:
+            try:
+                readable, _, _ = select.select([read_fd], [], [], timeout)
+            except (OSError, ValueError):
+                return False
+            if not readable:
+                return False
+            with self._wake_lock:
+                if self._wake_closed or self._wake_read_fd != read_fd:
+                    return False
+                try:
+                    while os.read(read_fd, 4096):
+                        pass
+                except BlockingIOError:
+                    pass
+                except OSError:
+                    return False
+                self._wake_generation += 1
+        return self._wake_generation != generation
+
+    def _wake_receiver(self, to_stage: Any) -> None:
+        if not _wakeup_enabled():
+            return
+        try:
+            pattern = f"{self._wake_directory}/{int(to_stage)}_*"
+        except (TypeError, ValueError):
+            return  # non-numeric stage names use the ordinary polling path
+        with self._wake_lock:
+            if self._wake_closed:
+                return
+            # Discover every replica, including newly restarted receivers. Do
+            # not cache writers across receiver lifetimes or unlink peers' paths.
+            for path in glob.iglob(pattern):
+                fd = None
+                try:
+                    fd = os.open(path, os.O_WRONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+                    if stat.S_ISFIFO(os.fstat(fd).st_mode):
+                        os.write(fd, b"\0")
+                except OSError:
+                    # Missing reader/file or full pipe: timed polling remains
+                    # the correctness fallback. A full FIFO already has hints.
+                    pass
+                finally:
+                    if fd is not None:
+                        os.close(fd)
+
+    def _close_wakeups(self) -> None:
+        with self._wake_lock:
+            self._wake_closed = True
+            for fd in (self._wake_read_fd, self._wake_hold_fd):
+                if fd is not None:
+                    os.close(fd)
+            self._wake_read_fd = self._wake_hold_fd = None
+            if self._wake_path is not None:
+                try:
+                    os.unlink(self._wake_path)
+                except FileNotFoundError:
+                    pass
+                self._wake_path = None
+                try:
+                    os.rmdir(self._wake_directory)
+                except OSError:
+                    # Other receivers may still own FIFOs in this deployment.
+                    pass
 
     def put(
         self,
@@ -51,7 +200,9 @@ class SharedMemoryConnector(OmniConnectorBase):
         data: Any,
     ) -> tuple[bool, int, dict[str, Any] | None]:
         try:
-            self.reap_consumed()
+            # Keep per-send housekeeping small when unread chunks accumulate.
+            # Explicit sweeps retain a larger budget to drain stale records.
+            self.reap_consumed(max_keys=4)
             payload = self.serialize_obj(data)
             size = len(payload)
 
@@ -65,6 +216,7 @@ class SharedMemoryConnector(OmniConnectorBase):
             metadata = {"shm": meta, "size": size}
             with self._pending_keys_lock:
                 self._pending_keys[put_key] = None
+            self._wake_receiver(to_stage)
 
             self._metrics["puts"] += 1
             self._metrics["bytes_transferred"] += size
@@ -157,9 +309,13 @@ class SharedMemoryConnector(OmniConnectorBase):
             self._metrics["gets"] += 1
         return result
 
-    def cleanup(self, request_id: str) -> None:
-        """Unlink the exact key passed to ``put()``, never a request-id prefix."""
+    def cleanup(self, request_id: str) -> bool:
+        """Unlink the exact key passed to ``put()``, never a request-id prefix.
+
+        Returns True when an unconsumed segment was actually unlinked.
+        """
         key = request_id
+        unlinked = False
         with self._pending_keys_lock:
             self._pending_keys.pop(key, None)
             try:
@@ -167,6 +323,7 @@ class SharedMemoryConnector(OmniConnectorBase):
                 seg.close()
                 seg.unlink()
                 logger.debug("cleanup: unlinked unconsumed SHM segment %s", key)
+                unlinked = True
             except FileNotFoundError:
                 pass
             except Exception as e:
@@ -177,6 +334,18 @@ class SharedMemoryConnector(OmniConnectorBase):
                     os.remove(lock_file)
                 except OSError:
                     pass
+        return unlinked
+
+    def cleanup_prefix(self, key_prefix: str) -> int:
+        """Unlink every tracked key of the form ``{key_prefix}{chunk_id}``.
+
+        Only keys still in ``_pending_keys`` are considered, and the suffix
+        must be a bare integer chunk id, so another request whose id merely
+        shares the prefix is never matched. Returns the unlinked count.
+        """
+        with self._pending_keys_lock:
+            keys = [k for k in self._pending_keys if k.startswith(key_prefix) and k[len(key_prefix) :].isdigit()]
+        return sum(self.cleanup(key) for key in keys)
 
     def close(self) -> None:
         """Unlink all remaining tracked SHM segments."""
@@ -184,11 +353,12 @@ class SharedMemoryConnector(OmniConnectorBase):
             keys = list(self._pending_keys)
         for key in keys:
             self.cleanup(key)
+        self._close_wakeups()
 
-    def reap_consumed(self) -> None:
+    def reap_consumed(self, *, max_keys: int = 64) -> None:
         """Bounded round-robin sweep; receivers unlink SHM in another process."""
         with self._pending_keys_lock:
-            for _ in range(min(64, len(self._pending_keys))):
+            for _ in range(min(max_keys, len(self._pending_keys))):
                 key, _ = self._pending_keys.popitem(last=False)
                 if os.path.exists(f"/dev/shm/{key}"):
                     self._pending_keys[key] = None
