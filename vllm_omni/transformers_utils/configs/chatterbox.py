@@ -1,0 +1,77 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+"""Chatterbox TTS configuration (Turbo defaults).
+
+The Hub repo ships no ``config.json``, so every constant lives here. Values
+come from upstream ``chatterbox`` 0.1.7: ``GPT2_MEDIUM_CONFIG`` in
+``models/t3/llama_configs.py``, the ``T3Config`` overrides in
+``ChatterboxTurboTTS.from_local``, and ``models/s3gen``.
+"""
+
+from transformers.configuration_utils import PretrainedConfig
+
+
+class ChatterboxConfig(PretrainedConfig):
+    """Constants for both Chatterbox stages."""
+
+    model_type = "chatterbox"
+
+    def __init__(self, variant: str = "turbo", **kwargs):
+        kwargs.setdefault("eos_token_id", 6562)
+        super().__init__(**kwargs)
+        self.variant = variant
+
+        # The sampler works over the text vocabulary the stage's tokenizer
+        # owns; only the first ``speech_vocab_size`` logits are ever finite.
+        self.vocab_size = 50276
+        self.speech_vocab_size = 6563
+        # Ids at or above this are control tokens the decoder must never see.
+        self.speech_token_limit = 6561
+        self.start_speech_token = 6561
+        self.stop_speech_token = 6562
+
+        # T3 backbone (GPT-2 medium).
+        self.hidden_size = 1024
+        self.num_hidden_layers = 24
+        self.num_attention_heads = 16
+        self.num_key_value_heads = 16
+        self.intermediate_size = 4096
+        self.max_position_embeddings = 8196
+        self.layer_norm_epsilon = 1e-5
+        self.activation_function = "gelu_new"
+        self.max_new_tokens = 1000
+
+        # Reference conditioning.
+        self.speaker_embed_size = 256
+        self.cond_prompt_len = 375
+        self.enc_cond_seconds = 15
+        self.dec_cond_seconds = 10
+        self.min_ref_seconds = 5.0
+        self.loudness_target_lufs = -27.0
+        self.s3_tokenizer_name = "speech_tokenizer_v2_25hz"
+
+        # Speech tokens and audio.
+        self.s3_sample_rate = 16000
+        self.sample_rate = 24000
+        self.token_rate = 25
+        self.token_mel_ratio = 2
+        self.pre_lookahead_len = 3
+        self.mel = {
+            "n_fft": 1920,
+            "num_mels": 80,
+            "sampling_rate": 24000,
+            "hop_size": 480,
+            "win_size": 1920,
+            "fmin": 0,
+            "fmax": 8000,
+            "center": False,
+        }
+        self.silence_token = 4299
+        self.n_silence_tokens = 3
+        self.meanflow = True
+        self.n_cfm_timesteps = 2
+
+        # Checkpoint files inside the Hub repo.
+        self.t3_weights = "t3_turbo_v1.safetensors"
+        self.s3gen_weights = "s3gen_meanflow.safetensors"
+        self.ve_weights = "ve.safetensors"

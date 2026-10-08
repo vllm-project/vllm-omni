@@ -23,6 +23,7 @@ logger = init_logger(__name__)
 # Maps model architecture names to their HuggingFace model_type values.
 # Used when auto-injecting hf_overrides for models with missing config.json.
 _ARCH_TO_MODEL_TYPE: dict[str, str] = {
+    "ChatterboxForConditionalGeneration": "chatterbox",
     "CosyVoice3Model": "cosyvoice3",
     "GLMTTSForConditionalGeneration": "glm_tts",
     "IndexTTS2S2MelDecoder": "indextts2",
@@ -42,6 +43,11 @@ _ARCH_TO_MODEL_TYPE: dict[str, str] = {
     "NemotronVoiceChatCode2Wav": "nemotron_voicechat",
     "VoxCPM2TalkerForConditionalGeneration": "voxcpm2",
 }
+
+# Model types whose official checkpoint ships no config.json at all, as a Hub
+# id or a local directory. ``_patch_empty_hf_config`` writes one for these
+# instead of letting transformers fail on the missing file.
+_CONFIG_LESS_MODEL_TYPES: frozenset[str] = frozenset({"indextts2_5", "chatterbox"})
 
 # Maps model architecture names to tokenizer subfolder paths within HF repos.
 _TOKENIZER_SUBFOLDER_MAP: dict[str, str] = {
@@ -76,6 +82,7 @@ def _register_omni_hf_configs() -> None:
         from vllm_omni.model_executor.models.qwen3_tts.configuration_qwen3_tts import (
             Qwen3TTSConfig,
         )
+        from vllm_omni.transformers_utils.configs.chatterbox import ChatterboxConfig
         from vllm_omni.transformers_utils.configs.cosyvoice3 import CosyVoice3Config
         from vllm_omni.transformers_utils.configs.glm_tts import GLMTTSConfig
         from vllm_omni.transformers_utils.configs.omnivoice import OmniVoiceConfig
@@ -107,6 +114,7 @@ def _register_omni_hf_configs() -> None:
         ("glm_tts", GLMTTSConfig),
         ("omnivoice", OmniVoiceConfig),
         ("voxcpm2", VoxCPM2Config),
+        ("chatterbox", ChatterboxConfig),
     ]:
         try:
             AutoConfig.register(model_type, config_cls)
@@ -294,13 +302,12 @@ class OmniEngineArgs(EngineArgs):
             if config_dict.get("model_type"):
                 return  # config.json already has model_type, no patching needed
         except Exception:
-            # The official IndexTTS 2.5 bundle has no HuggingFace config.json.
-            # Keep this exception model-scoped so other loader failures retain
-            # vLLM's normal error path.
-            if model_type != "indextts2_5" or not os.path.isdir(self.model):
+            # Keep this model-scoped so other loader failures retain vLLM's
+            # normal error path. Checkpoints in _CONFIG_LESS_MODEL_TYPES have
+            # no config.json, whether named by Hub id or local directory.
+            if model_type not in _CONFIG_LESS_MODEL_TYPES:
                 return
-            config_path = os.path.join(self.model, "config.json")
-            if os.path.lexists(config_path):
+            if os.path.isdir(self.model) and os.path.lexists(os.path.join(self.model, "config.json")):
                 return
             config_dict = {}
 
