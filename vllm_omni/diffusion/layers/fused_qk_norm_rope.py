@@ -130,7 +130,8 @@ if HAS_TRITON:
         eps: tl.constexpr,
         heads_per_program: tl.constexpr,
     ):
-        token = tl.program_id(0)
+        # Long-video Q/K views can span more than 2**31 elements of fused QKV storage.
+        token = tl.program_id(0).to(tl.int64)
         head_group = tl.program_id(1)
         heads = head_group * heads_per_program + tl.arange(0, heads_per_program)
         dims = tl.arange(0, head_dim)
@@ -293,7 +294,8 @@ if HAS_TRITON:
         with the two-stream kernel. Beyond the rotary width (partial rotary
         or lane padding) the output is the normalized value unchanged.
         """
-        token = tl.program_id(0)
+        # Long-video Q/K views can span more than 2**31 elements of fused QKV storage.
+        token = tl.program_id(0).to(tl.int64)
         head_group = tl.program_id(1)
         dims = tl.arange(0, padded_dim)
         dim_mask = dims < head_dim
@@ -424,7 +426,8 @@ if HAS_TRITON:
         the row selects its stream's pointer, weights and strides.
         ``rope_table`` is indexed by the joint output row.
         """
-        token = tl.program_id(0)
+        # Preserve 64-bit addressing when a stream's projection view spans 2**31 elements.
+        token = tl.program_id(0).to(tl.int64)
         head_group = tl.program_id(1)
         seq_total = seq_len_0 + seq_len_1
         batch = token // seq_total
