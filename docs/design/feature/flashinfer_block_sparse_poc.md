@@ -31,6 +31,18 @@ configuration option as JSON. It selects sparse MiniMax DiT with dense
 
 ## Validation
 
+Rebased onto the shared foundation at `3afc47b12`, which includes `main` at
+`a3d7a0444`. The foundation's FA4 Ulysses/offload results do not establish these
+combinations for this provider; provider-specific distributed/offload validation
+remains pending.
+
+Post-rebase GH200 validation: **65 passed, 0 skipped**, using the vLLM-Omni
+`0.31.0rc1` ARM64 image, PyTorch `2.13.0+cu130`, FA4 `4.0.0b33`, FlashInfer
+`0.7.0.post1`, and CuTe DSL `4.7.1`. The commands below cover real provider
+execution and compilation as well as shared platform/FA4 regressions.
+
+### Earlier validation
+
 GH200 validation uses the vLLM-Omni 0.30.0
 image, PyTorch `2.13.0+cu130`, FA4 `4.0.0b33` and CuTe DSL `4.7.1`.
 FlashInfer is `0.6.18.post1`.
