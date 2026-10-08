@@ -3103,8 +3103,10 @@ td.oi-followup-cell[data-oi-state="set"] .oi-followup-select {
 /* -----------------------------------------------------------------------
  * Resource Usage Analysis — manual-entry editor block (multi-module)
  * The editor lives inside the collapsible section body and holds a list of
- * modules (each with its own editable title + body textarea). Clicking the
- * module title (or the caret toggle) collapses / expands the module body.
+ * modules (each with its own editable title + rich-text body editor —
+ * contenteditable + B/I/H3/H4/list/Clear toolbar, mirroring the
+ * metric-analysis editor). Clicking the module title (or the caret toggle)
+ * collapses / expands the module body.
  * Persistence: localStorage['resource-usage-analysis'] + data-uri-value.
  * ----------------------------------------------------------------------- */
 .resource-usage-block {
@@ -3229,7 +3231,32 @@ td.oi-followup-cell[data-oi-state="set"] .oi-followup-select {
 .resource-usage-module[data-collapsed="true"] .resource-usage-module-body {
   display: none;
 }
-.resource-usage-module-textarea {
+.resource-usage-module-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+}
+.ru-btn {
+  font: inherit;
+  font-size: 0.8rem;
+  font-weight: 600;
+  min-width: 1.8rem;
+  padding: 0.22rem 0.55rem;
+  border-radius: 6px;
+  border: 1px solid color-mix(in srgb, var(--accent) 35%, transparent);
+  background: color-mix(in srgb, var(--accent) 6%, transparent);
+  color: var(--dashboard-text);
+  cursor: pointer;
+  line-height: 1.3;
+}
+.ru-btn:hover {
+  background: color-mix(in srgb, var(--accent) 16%, transparent);
+  border-color: var(--accent);
+}
+.ru-btn:active {
+  background: color-mix(in srgb, var(--accent) 26%, transparent);
+}
+.resource-usage-module-editor {
   font: inherit;
   font-size: 0.95rem;
   line-height: 1.6;
@@ -3240,20 +3267,51 @@ td.oi-followup-cell[data-oi-state="set"] .oi-followup-select {
   border: 1px solid color-mix(in srgb, var(--accent) 35%, transparent);
   background: var(--dashboard-panel-bg);
   color: var(--dashboard-text);
-  resize: vertical;
   box-sizing: border-box;
-  /* Allow the textarea to grow with content; the `rows` attribute already
-     sets the empty-state visible height, this just caps runaway growth. */
+  overflow-y: auto;
+  /* Cap runaway growth (the rich body has no native resize handle). */
   max-height: 60vh;
 }
-.resource-usage-module-textarea::placeholder {
-  color: color-mix(in srgb, var(--dashboard-muted) 80%, transparent);
-  font-style: italic;
-}
-.resource-usage-module-textarea:focus {
+.resource-usage-module-editor:focus {
   outline: none;
   border-color: var(--accent);
   box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 22%, transparent);
+}
+/* contenteditable has no native placeholder; show hint via :empty:before */
+.resource-usage-module-editor:empty:before {
+  content: attr(data-placeholder);
+  color: color-mix(in srgb, var(--dashboard-muted) 80%, transparent);
+  font-style: italic;
+}
+.resource-usage-module-editor h3 {
+  font-size: 1.02rem;
+  font-weight: 700;
+  margin: 0.6rem 0 0.3rem;
+  line-height: 1.35;
+}
+.resource-usage-module-editor h4 {
+  font-size: 0.95rem;
+  font-weight: 600;
+  margin: 0.5rem 0 0.25rem;
+  line-height: 1.35;
+  color: color-mix(in srgb, var(--dashboard-text) 90%, transparent);
+}
+.resource-usage-module-editor p {
+  margin: 0.3rem 0;
+}
+.resource-usage-module-editor ul,
+.resource-usage-module-editor ol {
+  margin: 0.3rem 0;
+  padding-left: 1.5rem;
+}
+.resource-usage-module-editor ul {
+  list-style: disc;
+}
+.resource-usage-module-editor ol {
+  list-style: decimal;
+}
+.resource-usage-module-editor li {
+  margin: 0.15rem 0;
 }
 .resource-usage-module-footer {
   display: flex;

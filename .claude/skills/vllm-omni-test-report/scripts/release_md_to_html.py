@@ -2385,6 +2385,12 @@ def _upgrade_resource_usage_block(html_fragment: str) -> str:
       Page As* download captures the analysis into the saved HTML) and
       ``localStorage['resource-usage-analysis']`` (so reloads on http(s)
       origins keep the value).
+    * Each module body is a **rich-text** editor (``contenteditable`` + a
+      B/I/H3/H4/list/Clear formatting toolbar, mirroring the
+      ``metric-analysis`` editor). The ``body`` field therefore stores
+      **HTML**; plain-text bodies saved by the older ``<textarea>`` version
+      are detected at render time and converted (escapes, newlines →
+      ``<br>``) so pre-existing analyses keep their line breaks.
 
     Note: the report's custom Markdown converter wraps every paragraph in a
     ``<p>``, so the substituted block ends up inside ``<p><div …></div></p>``.
@@ -3020,12 +3026,39 @@ _RESOURCE_USAGE_SCRIPT = """<script>
       .replace(/&/g, "&amp;").replace(/"/g, "&quot;")
       .replace(/</g, "&lt;").replace(/>/g, "&gt;");
   }
+  // Rich-text body helpers. The module body is stored as an HTML string
+  // written by the contenteditable editor; bodies saved by the older
+  // plain-<textarea> version are plain text and are converted on render.
+  var RICH_TAGS = ["<b>", "<strong", "<i>", "<em", "<u>", "<div", "<br", "<p>", "<p ", "<h3", "<h4", "<ul", "<ol", "<li", "<span", "<blockquote", "<a "];
+  function isRichHtml(s) {
+    for (var i = 0; i < RICH_TAGS.length; i++) {
+      if (s.indexOf(RICH_TAGS[i]) !== -1) return true;
+    }
+    return false;
+  }
+  function storedToHtml(body) {
+    if (!body) return "";
+    if (isRichHtml(body)) return body;
+    // Legacy plain text: escape HTML chars, keep line breaks as <br>.
+    return body
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .split(String.fromCharCode(10))
+      .join("<br>");
+  }
+  function bodyHasContent(b) {
+    if (!b) return false;
+    // Strip every tag (covers <br>, <br/>, <div>, …) then unescape nbsp.
+    var s = b.replace(/<[^>]*>/g, "").replace(/&nbsp;/g, " ");
+    return s.trim().length > 0;
+  }
   function renderModule(m) {
     var node = document.createElement("div");
     node.className = "resource-usage-module";
     node.setAttribute("data-module-id", m.id);
     node.setAttribute("data-collapsed", m.collapsed ? "true" : "false");
-    if (!m.title && !m.body) node.classList.add("resource-usage-module-empty");
+    if (!m.title && !bodyHasContent(m.body)) node.classList.add("resource-usage-module-empty");
     node.innerHTML =
       '<div class="resource-usage-module-header" role="button" tabindex="0" aria-expanded="' + (m.collapsed ? "false" : "true") + '">'
       + '<button type="button" class="resource-usage-toggle" aria-label="Collapse / expand module">' + (m.collapsed ? "▸" : "▾") + '</button>'
@@ -3033,11 +3066,24 @@ _RESOURCE_USAGE_SCRIPT = """<script>
       + '<button type="button" class="resource-usage-delete" aria-label="Delete module" title="Delete module">×</button>'
       + '</div>'
       + '<div class="resource-usage-module-body">'
-      + '<textarea class="resource-usage-module-textarea" rows="14" placeholder="Module body — describe the observation, peak/avg figures, follow-up actions…">' + escapeAttr(m.body) + '</textarea>'
+      + '<div class="resource-usage-module-toolbar" role="toolbar" aria-label="Formatting">'
+      + '<button type="button" class="ru-btn" data-ru-cmd="bold" title="Bold (Ctrl+B)"><b>B</b></button>'
+      + '<button type="button" class="ru-btn" data-ru-cmd="italic" title="Italic (Ctrl+I)"><i>I</i></button>'
+      + '<button type="button" class="ru-btn" data-ru-cmd="formatBlock" data-ru-value="h3" title="Sub-heading">H3</button>'
+      + '<button type="button" class="ru-btn" data-ru-cmd="formatBlock" data-ru-value="h4" title="Sub-sub-heading">H4</button>'
+      + '<button type="button" class="ru-btn" data-ru-cmd="insertUnorderedList" title="Bullet list">• List</button>'
+      + '<button type="button" class="ru-btn" data-ru-cmd="insertOrderedList" title="Numbered list">1. List</button>'
+      + '<button type="button" class="ru-btn" data-ru-cmd="removeFormat" title="Clear formatting">Clear</button>'
+      + '</div>'
+      + '<div class="resource-usage-module-editor" contenteditable="true" spellcheck="false" data-placeholder="Module body — describe the observation, peak/avg figures, follow-up actions…"></div>'
       + '<div class="resource-usage-module-footer">'
       + '<span class="resource-usage-module-status" data-resource-usage-state="saved">Saved</span>'
       + '</div>'
       + '</div>';
+    // Rich body goes in via innerHTML after assembly (it is authored HTML,
+    // not an attribute value); legacy plain-text bodies convert on render.
+    var ed = node.querySelector(".resource-usage-module-editor");
+    if (ed) ed.innerHTML = storedToHtml(m.body);
     return node;
   }
 
@@ -3055,7 +3101,7 @@ _RESOURCE_USAGE_SCRIPT = """<script>
     var total = list.length;
     var saved = 0;
     for (var i = 0; i < total; i++) {
-      if (list[i].title || list[i].body) saved++;
+      if (list[i].title || bodyHasContent(list[i].body)) saved++;
     }
     var raw = readRaw();
     block.setAttribute("data-uri-value", raw || "");
@@ -3119,7 +3165,7 @@ _RESOURCE_USAGE_SCRIPT = """<script>
         footer.setAttribute("data-resource-usage-state", "saved");
         footer.textContent = "Saved";
       }
-      if (m.title || m.body) node.classList.remove("resource-usage-module-empty");
+      if (m.title || bodyHasContent(m.body)) node.classList.remove("resource-usage-module-empty");
       else node.classList.add("resource-usage-module-empty");
     }
   }
@@ -3195,7 +3241,9 @@ _RESOURCE_USAGE_SCRIPT = """<script>
     }
   });
 
-  // Title / body input persistence + caret click.
+  // Title / body input persistence + caret click. The rich body is read
+  // from the contenteditable editor's innerHTML (input fires per keystroke
+  // and on paste / execCommand mutations).
   document.addEventListener("input", function (ev) {
     var target = ev.target;
     if (!target || !target.classList) return;
@@ -3206,9 +3254,28 @@ _RESOURCE_USAGE_SCRIPT = """<script>
     var id = moduleIdFromNode(mod);
     if (target.classList.contains("resource-usage-module-title")) {
       updateModule(block, id, { title: target.value });
-    } else if (target.classList.contains("resource-usage-module-textarea")) {
-      updateModule(block, id, { body: target.value });
+    } else if (target.classList.contains("resource-usage-module-editor")) {
+      updateModule(block, id, { body: target.innerHTML });
     }
+  });
+
+  // Formatting toolbar (mousedown + preventDefault keeps the editor's text
+  // selection alive so execCommand acts on the selection rather than
+  // collapsing it when the toolbar button receives focus).
+  document.addEventListener("mousedown", function (ev) {
+    var target = ev.target;
+    if (!target || !target.classList || !target.classList.contains("ru-btn")) return;
+    ev.preventDefault();
+    var mod = findModule(target);
+    if (!mod) return;
+    var editor = mod.querySelector(".resource-usage-module-editor");
+    if (!editor) return;
+    editor.focus();
+    var cmd = target.getAttribute("data-ru-cmd");
+    var val = target.getAttribute("data-ru-value") || null;
+    try { document.execCommand(cmd, false, val); } catch (err) { /* ignore */ }
+    var block = mod.closest(".resource-usage-block");
+    if (block) updateModule(block, moduleIdFromNode(mod), { body: editor.innerHTML });
   });
 
   // Keyboard: Enter on the title collapses the module; Esc on title / body blurs.
@@ -3227,7 +3294,9 @@ _RESOURCE_USAGE_SCRIPT = """<script>
         ev.preventDefault();
         target.blur();
       }
-    } else if (target.classList.contains("resource-usage-module-textarea")) {
+    } else if (target.classList.contains("resource-usage-module-editor")) {
+      // Enter stays native inside the rich editor (inserts a newline);
+      // only Esc is intercepted to leave the editor.
       if (ev.key === "Escape") {
         ev.preventDefault();
         target.blur();

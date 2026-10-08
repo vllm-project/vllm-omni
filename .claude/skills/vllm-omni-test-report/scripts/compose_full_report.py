@@ -636,7 +636,9 @@ def render_resource_usage_section() -> str:
     marker is substituted by ``release_md_to_html._upgrade_resource_usage_block``
     with an ``+ Add module`` toolbar plus a container that the JS handler
     fills with one card per module. Each module has its own editable title
-    input and body textarea; clicking the module title (or the caret toggle,
+    input and a **rich-text body editor** (contenteditable, with a
+    Bold / Italic / H3 / H4 / bullet list / numbered list / Clear formatting
+    toolbar); clicking the module title (or the caret toggle,
     or pressing Enter while the title is focused) collapses the body so the
     module can be used as a section heading.
 
@@ -645,7 +647,9 @@ def render_resource_usage_section() -> str:
     * in-memory DOM attribute ``data-uri-value`` (so browser *Save As* captures
       the user's analysis into the saved HTML file);
     * ``localStorage['resource-usage-analysis']`` holding a JSON array of
-      ``{id, title, body, collapsed}`` modules (survives reload on
+      ``{id, title, body, collapsed}`` modules — ``body`` is **HTML** written
+      by the contenteditable editor; plain-text bodies from the older
+      textarea version are converted at render time (survives reload on
       ``http(s)://`` origins; degrades to in-memory only on ``file://`` where
       Chrome blocks localStorage).
 
