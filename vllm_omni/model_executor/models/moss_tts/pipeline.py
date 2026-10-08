@@ -6,6 +6,11 @@
 # Licensed under the Apache License, Version 2.0 (the "License").
 """Pipeline topology for all MOSS-TTS variants (2-stage: talker → codec)."""
 
+import shutil
+from dataclasses import replace
+
+from transformers import PretrainedConfig
+from vllm.logger import init_logger
 from vllm.sampling_params import RequestOutputKind
 
 from vllm_omni.config.stage_config import (
@@ -13,8 +18,10 @@ from vllm_omni.config.stage_config import (
     StageExecutionType,
     StagePipelineConfig,
 )
+from vllm_omni.model_executor.models.moss_tts.configuration_moss_tts import MossTTSLocalConfig
 
 _PROC = "vllm_omni.model_executor.stage_input_processors.moss_tts"
+logger = init_logger(__name__)
 
 # ---------------------------------------------------------------------------
 # Shared 2-stage pipeline (used by all 5 MOSS-TTS variants)
@@ -135,4 +142,40 @@ MOSS_TTS_LOCAL_PIPELINE = PipelineConfig(
 # they have different talker architectures from the delay variant
 # (MossTTSRealtime / MossTTSLocalModel vs MossTTSDelayModel).
 
-__all__ = ["MOSS_TTS_PIPELINE", "MOSS_TTS_REALTIME_PIPELINE", "MOSS_TTS_LOCAL_PIPELINE"]
+
+def resolve_moss_tts_local_pipeline(hf_config: PretrainedConfig | None = None) -> PipelineConfig | None:
+    """Select CUDA MRV2, with the C128 system profile when prerequisites are met.
+
+    The platform memory query uses NVML, avoiding CUDA initialization before
+    workers spawn. Explicit deploy configs override this pipeline default.
+    """
+    from vllm.platforms import current_platform
+
+    from vllm_omni.platforms import current_omni_platform
+
+    if hf_config is not None and not isinstance(hf_config, MossTTSLocalConfig):
+        return None
+    if current_omni_platform.device_name != "cuda":
+        return replace(MOSS_TTS_LOCAL_PIPELINE, default_deploy_config_name="moss_tts_local_v1.yaml")
+    if shutil.which("nvidia-cuda-mps-control") is None:
+        logger.info("MOSS Local defaults to CUDA MRV2/C64 without MPS: nvidia-cuda-mps-control is unavailable")
+        return replace(MOSS_TTS_LOCAL_PIPELINE, default_deploy_config_name="moss_tts_local_mrv2.yaml")
+    try:
+        memory_bytes = current_platform.get_device_total_memory()
+    except Exception as exc:
+        logger.warning("Cannot query CUDA memory for MOSS Local; using MRV2/C64 with MPS: %s", exc)
+        return MOSS_TTS_LOCAL_PIPELINE
+    if memory_bytes >= 140 * 1024**3:
+        return replace(
+            MOSS_TTS_LOCAL_PIPELINE,
+            default_deploy_config_name="moss_tts_local_mrv2_optimized.yaml",
+        )
+    return MOSS_TTS_LOCAL_PIPELINE
+
+
+__all__ = [
+    "MOSS_TTS_PIPELINE",
+    "MOSS_TTS_REALTIME_PIPELINE",
+    "MOSS_TTS_LOCAL_PIPELINE",
+    "resolve_moss_tts_local_pipeline",
+]

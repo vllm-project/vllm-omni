@@ -64,6 +64,7 @@ class MossFirstChunkFastPath:
         sample_rate: torch.Tensor,
         device: torch.device,
         gate_main: bool = False,
+        max_active_streams: int = 0,
         handoff_timeout_s: float = 30.0,
     ) -> None:
         if not math.isfinite(handoff_timeout_s) or handoff_timeout_s <= 0:
@@ -74,6 +75,7 @@ class MossFirstChunkFastPath:
         # before its next replay, so the small first-chunk graph runs mostly
         # uncontended instead of interleaving with a large regular replay.
         self._gate_main = bool(gate_main)
+        self._max_active_streams = max(0, int(max_active_streams))
         self._inflight: torch.cuda.Event | None = None
         self._wrapper = wrapper
         self._n_vq = int(n_vq)
@@ -154,6 +156,7 @@ class MossFirstChunkFastPath:
                 or self._thread is None
                 or not self._thread.is_alive()
                 or request_key in req_slots
+                or (self._max_active_streams and len(req_slots) >= self._max_active_streams)
             ):
                 return False
             delivery = self._sink.prepare([request_id])

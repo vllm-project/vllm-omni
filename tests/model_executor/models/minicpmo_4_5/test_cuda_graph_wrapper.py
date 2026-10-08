@@ -103,6 +103,7 @@ def _fake_wrapper(monkeypatch: pytest.MonkeyPatch) -> HiFTGraphWrapper:
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     wrapper = object.__new__(HiFTGraphWrapper)
     wrapper.capture_batch_sizes = [1]
+    wrapper._legit_shapes = {(7, 0), (9, 0)}
     wrapper.graph = {}
     wrapper.static_speech_inputs = {}
     wrapper.static_cache_source_inputs = {}
@@ -880,7 +881,7 @@ def test_whole_euler_graph_with_padding_matches_eager(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_whole_euler_cache_flushes_whole_generation(
+def test_whole_euler_graph_boundary_enforces_budget_and_falls_back_to_eager(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(current_platform, "get_global_graph_pool", lambda: torch.cuda.graph_pool_handle())
@@ -903,7 +904,8 @@ def test_whole_euler_cache_flushes_whole_generation(
             att_cache=None,
         )
 
-    _call(10)
+    res10 = _call(10)
+    assert res10 is not None
     assert len(wrapper._cache) == 1
     assert wrapper._stats["captures"] == 1
 
@@ -912,46 +914,110 @@ def test_whole_euler_cache_flushes_whole_generation(
     assert wrapper._stats["hits"] == 1
 
     # Second distinct shape fills cache to max_graphs=2
-    _call(12)
+    res12 = _call(12)
+    assert res12 is not None
     assert len(wrapper._cache) == 2
     assert wrapper._stats["captures"] == 2
     assert wrapper._stats["flushes"] == 0
 
-    # Third distinct shape exceeds max_graphs and triggers whole-generation flush
-    _call(14)
-    assert wrapper._stats["flushes"] == 1
-    assert len(wrapper._cache) == 1
-    assert wrapper._stats["captures"] == 3
+    # A third distinct shape exceeds max_graphs=2: falls back to eager (replay returns None) without expanding budget
+    res14 = _call(14)
+    assert res14 is None
+    assert wrapper._stats["flushes"] == 0
+    assert len(wrapper._cache) == 2
+    assert wrapper.max_graphs == 2
+    assert wrapper._stats["captures"] == 2
 
-    # Replay evicted shape 10 and assert numerical match with eager
-    torch.manual_seed(42)
-    x10 = torch.randn(1, 4, 10, device="cuda")
-    mu10 = torch.randn(2, 4, 10, device="cuda")
-    spk10 = torch.randn(2, 4, device="cuda")
-    cond10 = torch.randn(2, 4, 10, device="cuda")
-    res10 = wrapper.replay(
-        x=x10.clone(),
-        mu_cfg=mu10.clone(),
-        speakers_cfg=spk10.clone(),
-        cond_cfg=cond10.clone(),
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_whole_euler_precapture_enforces_budget_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(current_platform, "get_global_graph_pool", lambda: torch.cuda.graph_pool_handle())
+
+    torch.manual_seed(0)
+    estimator = _WholeEulerDiT().eval().cuda()
+    # Configure max_graphs=1 with query_bucket_frames=16
+    wrapper = WholeEulerCFMGraphWrapper(
+        estimator=estimator,
+        n_timesteps=10,
+        max_graphs=1,
+        max_graph_batch=2,
+        micro_batch_size=2,
+        query_bucket_frames=16,
+    )
+
+    count = wrapper.precapture(
+        offsets=[0, 16, 32],
+        steady=32,
+        channels=4,
+        spk_dim=4,
+    )
+    # Must capture at most 1 graph and strictly respect max_graphs=1
+    assert count <= 1
+    assert wrapper.max_graphs == 1
+    assert len(wrapper._cache) <= 1
+
+    # An uncached shape falls back to eager (None) because max_graphs=1 is already exhausted
+    x_uncached = torch.randn(1, 4, 10, device="cuda")
+    mu_uncached = torch.randn(2, 4, 10, device="cuda")
+    spk_uncached = torch.randn(2, 4, device="cuda")
+    cond_uncached = torch.randn(2, 4, 10, device="cuda")
+    res_uncached = wrapper.replay(
+        x=x_uncached,
+        mu_cfg=mu_uncached,
+        speakers_cfg=spk_uncached,
+        cond_cfg=cond_uncached,
         cnn_cache=None,
         att_cache=None,
     )
-    assert res10 is not None
-    eager_x10, _, _ = _eager_solve_euler(
-        estimator,
-        x10.clone(),
-        mu10.clone(),
-        spk10.clone(),
-        cond10.clone(),
-        None,
-        None,
-        None,
-        wrapper.timeline,
-        mel_frames=10,
-        pad_frames=0,
+    assert res_uncached is None  # Eager fallback
+    assert wrapper.max_graphs == 1
+    assert len(wrapper._cache) == 1
+    wrapper._flush()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_whole_euler_slot_entry_enforces_budget_boundary(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(current_platform, "get_global_graph_pool", lambda: torch.cuda.graph_pool_handle())
+    torch.manual_seed(0)
+    estimator = _WholeEulerDiT().eval().cuda()
+    wrapper = WholeEulerCFMGraphWrapper(
+        estimator=estimator,
+        n_timesteps=10,
+        max_graphs=2,
+        att_slots=2,
+        ragged_body=Mock(),
+        modulation_fn=lambda t: t,
+        query_bucket_frames=16,
     )
-    torch.testing.assert_close(res10[0], eager_x10, rtol=1e-4, atol=1e-5)
+    # `_record` returns (statics, x, cnn, att, graph); `_retire` calls entry[4].reset().
+    monkeypatch.setattr(wrapper, "_record", lambda key, *args, **kwargs: (Mock(), Mock(), Mock(), Mock(), Mock()))
+    pool = wrapper._ensure_slot_pool((0, 4))
+    assert pool is not None
+
+    fill = wrapper._precapture_fill
+    # Capture 1 slot graph
+    entry1 = wrapper._slot_entry(graph_batch=1, query_cap=10, channels=4, spk_dim=4, fill=fill)
+    assert entry1 is not None
+    assert len(wrapper._slot_graphs) == 1
+    assert wrapper.stats_snapshot()["cache_size"] == 1
+
+    # Capture 1 arena graph
+    x = torch.empty((1, 4, 1), device="cuda", dtype=torch.float32)
+    entry2 = wrapper._entry(graph_batch=1, query_cap=12, offset=0, x=x, spk_dim=4, fill=fill)
+    assert entry2 is not None
+    assert len(wrapper._cache) == 1
+    assert wrapper.stats_snapshot()["cache_size"] == 2
+
+    # A 3rd graph (slot or arena) exceeds max_graphs=2: falls back to eager (returns None)
+    entry3_slot = wrapper._slot_entry(graph_batch=1, query_cap=14, channels=4, spk_dim=4, fill=fill)
+    assert entry3_slot is None
+
+    entry3_arena = wrapper._entry(graph_batch=1, query_cap=16, offset=0, x=x, spk_dim=4, fill=fill)
+    assert entry3_arena is None
+
+    assert wrapper.stats_snapshot()["cache_size"] == 2
     wrapper._flush()
 
 
@@ -2128,7 +2194,16 @@ def test_whole_euler_disabled_via_serving_config() -> None:
 
 def _tiny_upstream_dit() -> nn.Module:
     """The shipped DiT architecture at toy width, so ``_blocks_forward_chunk_ragged`` runs as in serving."""
-    decoder_dit = pytest.importorskip("stepaudio2.cosyvoice2.flow.decoder_dit")
+    for name in ("cosyvoice2.flow.decoder_dit", "stepaudio2.cosyvoice2.flow.decoder_dit"):
+        try:
+            import importlib
+
+            decoder_dit = importlib.import_module(name)
+            break
+        except ImportError:
+            pass
+    else:
+        decoder_dit = pytest.importorskip("cosyvoice2.flow.decoder_dit")
     torch.manual_seed(0)
     estimator = decoder_dit.DiT(in_channels=16, out_channels=4, depth=2, num_heads=2, head_dim=8, hidden_size=16)
     with torch.no_grad():
@@ -2315,7 +2390,7 @@ def test_whole_euler_request_caches_grow_and_update_in_place(monkeypatch: pytest
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_whole_euler_groups_are_acquired_again_after_a_flush(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_whole_euler_groups_are_acquired_again_after_a_flush() -> None:
     """Capturing a later group can retire an earlier one; no group replays until all are held at once."""
     wrapper = WholeEulerCFMGraphWrapper(estimator=_tiny_upstream_dit(), n_timesteps=10, max_graphs=8)
     calls: list[int] = []
@@ -2326,13 +2401,12 @@ def test_whole_euler_groups_are_acquired_again_after_a_flush(monkeypatch: pytest
             wrapper._stats["flushes"] += 1
         return ("entry", graph_batch, len(calls))
 
-    monkeypatch.setattr(wrapper, "_entry", entry)
     flush_always = False
     groups, fills = [(16, 16), (1, 1)], [None, None]
-    assert wrapper._group_entries(groups, fills) == [("entry", 16, 3), ("entry", 1, 4)]
+    assert wrapper._group_entries(entry, groups, fills) == [("entry", 16, 3), ("entry", 1, 4)]
     assert calls == [16, 1, 16, 1]
     flush_always = True
-    assert wrapper._group_entries(groups, fills) is None
+    assert wrapper._group_entries(entry, groups, fills) is None
 
 
 @pytest.mark.parametrize("fail", [False, True])

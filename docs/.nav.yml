@@ -96,6 +96,7 @@ nav:
         - Dense Backends: user_guide/diffusion/attention_backends/dense_backends.md
         - TRTLLM: user_guide/diffusion/attention_backends/trtllm.md
         - SageAttention: user_guide/diffusion/attention_backends/sage.md
+        - FastVideo VSA: user_guide/diffusion/attention_backends/fastvideo_vsa.md
         - Hugging Face Hub: user_guide/diffusion/attention_backends/huggingface_hub.md
         - RainFusion: user_guide/diffusion/attention_backends/rainfusion.md
       - Regional Compilation: user_guide/diffusion/regional_compilation.md

@@ -334,7 +334,12 @@ class OmniOpenAIServingVideo:
             )
             vp.width = vp.width or video_defaults.width
             vp.height = vp.height or video_defaults.height
-            if num_frames_provided and vp.num_frames != video_defaults.num_frames:
+            # Only fixed-duration pipelines (those declaring
+            # ``duration_seconds``, e.g. MAGI-2) pin the frame count; models
+            # that merely publish serving defaults (e.g. Kandinsky 6, any
+            # 4k+1 frame count) still accept an explicit ``num_frames``.
+            fixed_frame_count = video_defaults.duration_seconds is not None
+            if fixed_frame_count and num_frames_provided and vp.num_frames != video_defaults.num_frames:
                 raise HTTPException(
                     status_code=HTTPStatus.BAD_REQUEST.value,
                     detail=(f"This diffusion model requires {video_defaults.num_frames} frames; got {vp.num_frames}."),

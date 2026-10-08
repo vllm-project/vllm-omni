@@ -14,9 +14,11 @@ connectors:
   connector_of_shared_memory:
     extra:
       hift_graph_capture_batch_sizes: [1, 2, 4, 8]
-      # TF32 tensor cores for the vocoder's fp32 flow GEMMs: ~25% less GPU
-      # time per chunk (batch 1-8). A numerics change: the HiFT input mel moves
-      # by ~3e-4 relative L2; dev-short WER/UTMOS unchanged (64 prompts).
+      # Ordinary TF32 for CFM DiT GEMMs (~25% less GPU time per chunk at
+      # batch 1-8): cuBLAS allow_tf32 on dense QKV/MLP and Triton
+      # input_precision=tf32 on tiled attention. HiFT stays IEEE FP32.
+      # Numerics: HiFT input mel moves by ~3e-4 relative L2; dev-short
+      # WER/UTMOS unchanged.
       token2wav_allow_tf32: true
 
 stages:

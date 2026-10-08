@@ -29,9 +29,11 @@ th {
 | `QwenImagePipeline` | Qwen-Image | `Qwen/Qwen-Image` | ✅︎ | | | ✅︎ | [Published](https://recipes.vllm.ai/Qwen/Qwen-Image) |
 | `QwenImagePipeline` | Qwen-Image-2512 | `Qwen/Qwen-Image-2512` | ✅︎ | | | ✅︎ | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/Qwen/Qwen-Image-2512.md) |
 | `QwenImageEditPipeline` | Qwen-Image-Edit | `Qwen/Qwen-Image-Edit` | ✅︎ | ✅︎ | ✅︎ | ✅︎ | — |
+| `JoyImageEditPipeline` | JoyAI-Image-Edit | `jdopensource/JoyAI-Image-Edit-Diffusers` | ✅︎ | | | | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/JD/JoyAI-Image-Edit.md) |
 | `QwenImageEditPlusPipeline` | Qwen-Image-Edit-2509 | `Qwen/Qwen-Image-Edit-2509` | ✅︎ | ✅︎ | ✅︎ | ✅︎ | — |
 | `QwenImageLayeredPipeline` | Qwen-Image-Layered | `Qwen/Qwen-Image-Layered` | ✅︎ | ✅︎ | ✅︎ | ✅︎ | — |
 | `QwenImageEditPlusPipeline` | Qwen-Image-Edit-2511 | `Qwen/Qwen-Image-Edit-2511` | ✅︎ | ✅︎ | ✅︎ | ✅︎ | — |
+| `QwenImage21Pipeline` | Qwen-Image-2.1 (T2I + image-conditioned generation, up to 4 condition images) | `Qwen/Qwen-Image-2.1` | ✅︎ | | | | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/Qwen/Qwen-Image-2.1.md) |
 | `GlmImagePipeline` | GLM-Image | `zai-org/GLM-Image` | ✅︎ | ✅︎ | | | — |
 | `ZImagePipeline` | Z-Image | `Tongyi-MAI/Z-Image-Turbo` | ✅︎ | ✅︎ | ✅︎ | ✅︎ | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/Tongyi-MAI/Z-Image-Turbo.md) |
 | `Krea2Pipeline` | Krea 2 (Raw + Turbo) | `krea/Krea-2-Raw`, `krea/Krea-2-Turbo` | ✅︎ | | | ✅︎ | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/krea/Krea-2.md) |
@@ -54,12 +56,12 @@ th {
 | `LingBotVideoPipeline` | LingBot-Video dense and MoE T2I, T2V, TI2V | `robbyant/lingbot-video-dense-1.3b`, `robbyant/lingbot-video-moe-30b-a3b` | ✅︎ | | | | — |
 | `SanaVideoPipeline` | SANA-Video-2B T2V (native 480p/720p; Diffusers adapter validated at both resolutions) | `Efficient-Large-Model/SANA-Video_2B_480p_diffusers`, `Efficient-Large-Model/SANA-Video_2B_720p_diffusers` | ✅︎ | | | ✅︎ | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/NVIDIA/SANA-Video-2B.md) |
 | `SanaImageToVideoPipeline` | SANA-Video-2B I2V (native and Diffusers adapter validated at 480p/720p) | `Efficient-Large-Model/SANA-Video_2B_480p_diffusers`, `Efficient-Large-Model/SANA-Video_2B_720p_diffusers` | ✅︎ | | | | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/NVIDIA/SANA-Video-2B.md) |
-| `SeedVR2Pipeline` | [SeedVR2 3B](seedvr2.md) video restoration | `ByteDance-Seed/SeedVR2-3B` | ✅︎ | | | | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/ByteDance/SeedVR2-RTX-5090.md) |
+| `SeedVR2Pipeline` | [SeedVR2 3B](seedvr2.md) video restoration | `ByteDance-Seed/SeedVR2-3B` | ✅︎ | | | ✅︎ | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/ByteDance/SeedVR2-RTX-5090.md) |
 | `MiniMaxH3Pipeline` | MiniMax H3 T2VA, first/last-keyframe FL2VA, and mixed-reference Ref2VA | `MiniMaxAI/MiniMax-H3` | ✅︎ | ✅︎ | | | [Published](https://recipes.vllm.ai/MiniMaxAI/MiniMax-H3) |
 | `Magi2Pipeline` | MAGI-2 native Preview-stage T2VA and I2VA (272p/540p) | `sand-ai/MAGI-2-preview` | ✅︎ | | | | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/SandAI/MAGI-2-preview-L20X.md) |
 | `DreamZeroPipeline` | DreamZero-DROID | `GEAR-Dreams/DreamZero-DROID` | ✅︎ | ✅︎ | ✅︎ | ✅︎ | — |
 | `Pi0Pipeline` | π0 (Pi-Zero) VLA | `lerobot/pi0_base` | ✅︎ | | | | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/lerobot/Pi0.md) |
-| `Pi05Pipeline` | π0.5 VLA | `lerobot/pi05_base` | ✅︎ | | | | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/lerobot/Pi05.md) |
+| `Pi05Pipeline` | π0.5 VLA | `lerobot/pi05_base` | ✅︎ | | | ✅︎ | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/lerobot/Pi05.md) |
 | `HeliosPipeline`, `HeliosPyramidPipeline` | Helios | `BestWishYsh/Helios-Base`, `BestWishYsh/Helios-Mid`, `BestWishYsh/Helios-Distilled` | ✅︎ | ✅︎ | ✅︎ | | — |
 | `OvisImagePipeline` | Ovis-Image | `OvisAI/Ovis-Image` | ✅︎ | ✅︎ | | ✅︎ | — |
 | `LongcatImagePipeline` | LongCat-Image | `meituan-longcat/LongCat-Image` | ✅︎ | ✅︎ | ✅︎ | ✅︎ | — |
@@ -70,7 +72,7 @@ th {
 | `StableDiffusionXLPipeline` | Stable-Diffusion-XL | `stabilityai/stable-diffusion-xl-base-1.0` | ✅︎ | ✅︎ | ✅︎ | ✅︎ | — |
 | `StableDiffusion3Pipeline` | Stable-Diffusion-3 | `stabilityai/stable-diffusion-3.5-medium` | ✅︎ | ✅︎ | | ✅︎ | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/StabilityAI/Stable-Diffusion-3.5.md) |
 | `CosyVoice3Model` | CosyVoice3 | `FunAudioLLM/Fun-CosyVoice3-0.5B-2512` | ✅︎ | ✅︎ | | ✅︎ | — |
-| `AuKForConditionalGeneration` | AuK / AuK-Flash (instruction-driven speech generation and editing) | `tencent/AuK`, `tencent/AuK-Flash` (with `Qwen/Qwen2.5-Omni-3B`; assemble with `tools/prepare_auk_checkpoint.py`) | ✅︎ | | | | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/Tencent/AuK-H100.md) |
+| `AuKForConditionalGeneration` | AuK / AuK-Flash (instruction-driven speech generation and editing) | `tencent/AuK`, `tencent/AuK-Flash` (with `Qwen/Qwen2.5-Omni-3B`; assemble with `tools/prepare_auk_checkpoint.py`) | ✅︎ | | | ✅︎ | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/Tencent/AuK-H100.md) |
 | `OmniVoiceModel` | OmniVoice | `k2-fsa/OmniVoice` | ✅︎ | | | ✅︎ | — |
 | `VoxCPM2TalkerForConditionalGeneration` | VoxCPM2 | `openbmb/VoxCPM2` | ✅︎ | | | ✅︎ | — |
 | `BreezeForConditionalGeneration` | Breeze-TTS-2 (voice design, voice clone, voice direction, CFG) | `BreezeBlue/Breeze-TTS-2` | ✅︎ | | | | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/BreezeBlue/Breeze-TTS-2.md) |
@@ -82,8 +84,8 @@ th {
 | `FluxPipeline` | FLUX.1-schnell | `black-forest-labs/FLUX.1-schnell` | ✅︎ | ✅︎ | | ✅︎ | — |
 | `OmniGen2Pipeline` | OmniGen2 | `OmniGen2/OmniGen2` | ✅︎ | ✅︎ | | ✅︎ | — |
 | `StableAudioPipeline` | Stable-Audio-Open | `stabilityai/stable-audio-open-1.0` | ✅︎ | ✅︎ | | ✅︎ | — |
-| `MiniMaxMusic3ForConditionalGeneration` | MiniMax Music 3 (text-to-music) | `MiniMaxAI/MiniMax-Music3` | ✅︎ | | | | — |
-| `Yue2ForCausalLM` | YuE2-3B (text-to-music with ABC plan) | `m-a-p/YuE2-3B` | ✅︎ | | | | [Recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/m-a-p/YuE2-3B.md) / [Audio-to-score](https://github.com/vllm-project/vllm-omni/blob/main/recipes/m-a-p/SheetSage2-H200.md) |
+| `MiniMaxMusic3ForConditionalGeneration` | MiniMax Music 3 (text-to-music) | `MiniMaxAI/MiniMax-Music3` | ✅︎ | | | ✅︎ | — |
+| `Yue2ForCausalLM` | YuE2-3B (text-to-music with ABC plan) | `m-a-p/YuE2-3B` | ✅︎ | | | ✅︎ | [Recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/m-a-p/YuE2-3B.md) / [Audio-to-score](https://github.com/vllm-project/vllm-omni/blob/main/recipes/m-a-p/SheetSage2-H200.md) |
 | `Qwen3TTSForConditionalGeneration` | Qwen3-TTS-12Hz-1.7B-CustomVoice | `Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice` | ✅︎ | | | ✅︎ | [Published](https://recipes.vllm.ai/Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice) |
 | `Qwen3TTSForConditionalGeneration` | Qwen3-TTS-12Hz-1.7B-VoiceDesign | `Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign` | ✅︎ | ✅︎ | ✅︎ | ✅︎ | — |
 | `Qwen3TTSForConditionalGeneration` | Qwen3-TTS-12Hz-1.7B-Base | `Qwen/Qwen3-TTS-12Hz-1.7B-Base` | ✅︎ | ✅︎ | ✅︎ | ✅︎ | — |
@@ -93,7 +95,7 @@ th {
 | `MossTTSDelayModel` | MOSS-TTS, MOSS-TTSD, MOSS-SoundEffect, MOSS-VoiceGenerator | `OpenMOSS-Team/MOSS-VoiceGenerator` | ✅︎ | | | | — |
 | `MossTTSRealtime` | MOSS-TTS-Realtime | `OpenMOSS-Team/MOSS-TTS-Realtime` | ✅︎ | | | | — |
 | `HiggsAudioV2ForConditionalGeneration` | Higgs-Audio v2 | `bosonai/higgs-audio-v2-generation-3B-base` | ✅︎ | | | | — |
-| `HiggsMultimodalQwen3ForConditionalGeneration` | Higgs-Audio v3 (TTS) | `bosonai/higgs-audio-v3-tts-4b` | ✅︎ | | | | [Published](https://recipes.vllm.ai/bosonai/higgs-audio-v3-tts-4b) |
+| `HiggsMultimodalQwen3ForConditionalGeneration` | Higgs-Audio v3 (TTS) | `bosonai/higgs-audio-v3-tts-4b` | ✅︎ | | | ✅︎ | [Published](https://recipes.vllm.ai/bosonai/higgs-audio-v3-tts-4b) |
 | `IndexTTS2TalkerForConditionalGeneration` | IndexTTS-2 | `IndexTeam/IndexTTS-2` | ✅︎ | | | | — |
 | `IndexTTS25TalkerForConditionalGeneration` | IndexTTS-2.5 | native `checkpoints/` bundle | ✅︎ | | | | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/IndexTeam/IndexTTS-2_5.md) |
 | `NextStep11Pipeline` | NextStep-1.1 | `stepfun-ai/NextStep-1.1` | ✅︎ | ✅︎ | | ✅︎ | — |
@@ -106,6 +108,7 @@ th {
 | `SenseNovaU1Pipeline` | SenseNova-U1-A3B (MoE) | `sensenova/SenseNova-U1-A3B-MoT` | ✅︎ | | | | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/SenseNova/SenseNova-U1.md#a3b-moe-variant) |
 | `LancePipeline` | Lance | `bytedance-research/Lance` | ✅︎ | | | | — |
 | `HunyuanVideo15Pipeline` | HunyuanVideo-1.5-T2V | `hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_t2v`, `hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-720p_t2v` | ✅︎ | ✅︎ | | ✅︎ | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/Tencent/HunyuanVideo-1.5.md) |
+| `Kandinsky6TI2VAPipeline` | Kandinsky 6 TI2VA | `kandinskylab/Kandinsky-6.0-Pro-5s-Diffusers` | ✅︎ | | | | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/Kandinsky/Kandinsky6-TI2VA.md) |
 | `HunyuanVideo15ImageToVideoPipeline` | HunyuanVideo-1.5-I2V | `hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_i2v`, `hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-720p_i2v` | ✅︎ | ✅︎ | | ✅︎ | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/Tencent/HunyuanVideo-1.5.md) |
 | `VoxtralTTSForConditionalGeneration` | Voxtral TTS | `mistralai/Voxtral-4B-TTS-2603` | ✅︎ | ✅︎ | | | — |
 | `CovoAudioForConditionalGeneration` | Covo-Audio-Chat | `tencent/Covo-Audio-Chat` | ✅︎ | | | | — |
@@ -115,7 +118,7 @@ th {
 | `GepardTalkerForConditionalGeneration` | Gepard-1.0 | `nineninesix/gepard-1.0` | ✅︎ | | | ✅︎ | — |
 | `HiDreamImagePipeline` | HiDream-I1-Full | `HiDream-ai/HiDream-I1-Full` | ✅︎ | ✅︎ | | | — |
 | `HiDreamO1ImagePipeline` | HiDream-O1-Image | `HiDream-ai/HiDream-O1-Image` | ✅︎ | | | | — |
-| `AnimaPipeline` | Anima | `circlestone-labs/Anima` | ✅︎ | ✅︎ | | | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/circlestone-labs/Anima.md) |
+| `AnimaPipeline` | Anima | `circlestone-labs/Anima` | ✅︎ | ✅︎ | | ✅︎ | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/circlestone-labs/Anima.md) |
 
 The `Recipe` column links the corresponding deployment recipe. `Published` is
 preferred when a corresponding `recipes.vllm.ai` page exists; otherwise the
