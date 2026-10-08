@@ -62,7 +62,8 @@ def prefill_embeds(
 ) -> torch.Tensor:
     """Embed one request's prompt the way ``T3.prepare_input_embeds`` does.
 
-    Turbo has no learned positional embeddings and no perceiver, so the
+    Turbo has no perceiver and none of T3's separate text and speech position
+    embeddings (the GPT-2 backbone applies its own ``wpe``), so the
     conditioning is the projected speaker embedding followed by the prompt
     tokens through ``speech_emb``; the text follows, then the start-of-speech
     token ``inference_turbo`` appends.
@@ -97,7 +98,10 @@ def prefill_slice(
 
     Slicing by computed progress is what the preprocess phase contract
     prescribes; it is correct however the scheduler splits the prompt,
-    including a one-token tail.
+    including a one-token tail. A span that runs past the end of the prompt
+    (a preempted request recomputed from zero, whose span also covers the
+    tokens it had generated) gets only the prompt's rows; the caller embeds
+    the rest.
 
     Args:
         heads: The loaded heads.
@@ -110,7 +114,8 @@ def prefill_slice(
         span: Tokens scheduled this step.
 
     Returns:
-        Shape (span, H).
+        Shape (n, H) with ``n <= span``: ``span`` rows, or the remaining
+        prompt rows when the span runs past the prompt.
 
     Raises:
         RuntimeError: If the prompt and its embeddings differ in length. A
@@ -229,8 +234,10 @@ class ChatterboxT3ForConditionalGeneration(nn.Module, SupportsPP):
     ) -> tuple[torch.Tensor, torch.Tensor, dict]:
         """Embed one request's scheduled tokens.
 
-        A prefill span is replaced by its rows of the real prompt embedding;
-        a decode span is one sampled speech id.
+        A prefill span is replaced by its rows of the real prompt embedding.
+        When vLLM recomputes a preempted request the span also covers the
+        speech ids already generated; those are embedded as a decode step
+        would. A decode span is one sampled speech id.
 
         Args:
             input_ids: The scheduled ids for this request.
@@ -252,7 +259,8 @@ class ChatterboxT3ForConditionalGeneration(nn.Module, SupportsPP):
         if not _omni_is_prefill:
             return input_ids, self.embed_input_ids(input_ids), {}
         device, dtype = input_ids.device, self.heads.text_emb.weight.dtype
-        embeds = prefill_slice(
+        in_prompt = min(input_ids.shape[0], _omni_prompt_len - _omni_num_computed_tokens)
+        prompt_rows = prefill_slice(
             self.heads,
             self.config,
             torch.tensor(ids["prompt"], dtype=torch.long, device=device),
@@ -260,8 +268,9 @@ class ChatterboxT3ForConditionalGeneration(nn.Module, SupportsPP):
             embed["voice"].to(device=device, dtype=dtype),
             _omni_prompt_len,
             _omni_num_computed_tokens,
-            input_ids.shape[0],
+            in_prompt,
         )
+        embeds = torch.cat([prompt_rows, self.embed_input_ids(input_ids[in_prompt:])])
         return input_ids, embeds, {}
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:

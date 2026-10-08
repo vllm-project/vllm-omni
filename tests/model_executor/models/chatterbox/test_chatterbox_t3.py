@@ -4,6 +4,7 @@ import pytest
 import torch
 
 from vllm_omni.model_executor.models.chatterbox.chatterbox_t3 import (
+    ChatterboxT3ForConditionalGeneration,
     T3Heads,
     prefill_embeds,
     prefill_slice,
@@ -63,6 +64,52 @@ def test_prefill_split_with_one_token_tail_matches_one_call_001(heads: T3Heads, 
     assert torch.equal(tail[0], heads.speech_emb.weight[config.start_speech_token])
 
 
+def test_prefill_span_past_the_prompt_returns_only_the_prompt_rows_001(
+    heads: T3Heads, config: ChatterboxConfig
+) -> None:
+    """A preempted request is recomputed from zero with its generated tokens in the span."""
+    text_ids = torch.tensor([5, 6, 7])
+    cond_tokens = torch.randint(0, 6561, (375,))
+    speaker = torch.randn(1, 256)
+    whole = prefill_embeds(heads, text_ids, cond_tokens, speaker, config.start_speech_token)
+    total = whole.shape[0]
+
+    from_zero = prefill_slice(heads, config, text_ids, cond_tokens, speaker, total, 0, total + 2)
+    inside = prefill_slice(heads, config, text_ids, cond_tokens, speaker, total, total - 3, 5)
+
+    assert torch.equal(from_zero, whole)
+    assert torch.equal(inside, whole[-3:])
+
+
+def test_preprocess_embeds_the_generated_tokens_after_the_prompt_001(heads: T3Heads, config: ChatterboxConfig) -> None:
+    """The rows past the prompt are speech ids, embedded as a decode step would."""
+    # Bypass __init__, which needs a vLLM config and builds the backbone; preprocess only reads these two.
+    model = object.__new__(ChatterboxT3ForConditionalGeneration)
+    torch.nn.Module.__init__(model)
+    model.config, model.heads = config, heads
+    text_ids = [5, 6, 7]
+    cond_tokens = torch.randint(0, 6561, (375,))
+    speaker = torch.randn(1, 256)
+    whole = prefill_embeds(heads, torch.tensor(text_ids), cond_tokens, speaker, config.start_speech_token)
+    total = whole.shape[0]
+    generated = torch.tensor([11, 12])
+    input_ids = torch.cat([torch.full((total,), config.start_speech_token), generated])
+
+    _, embeds, _ = model.preprocess(
+        input_ids,
+        None,
+        _omni_is_prefill=True,
+        _omni_prompt_len=total,
+        _omni_num_computed_tokens=0,
+        ids={"prompt": text_ids, "speech_token": cond_tokens.tolist()},
+        embed={"voice": speaker},
+    )
+
+    assert embeds.shape == (total + 2, config.hidden_size)
+    assert torch.equal(embeds[:total], whole)
+    assert torch.equal(embeds[total:], heads.speech_emb(generated))
+
+
 def test_prefill_refuses_a_prompt_of_the_wrong_length_001(heads: T3Heads, config: ChatterboxConfig) -> None:
     """A placeholder span longer than the embeddings would zero-pad the prompt."""
     text_ids = torch.tensor([5, 6, 7])
@@ -79,9 +126,9 @@ def test_logits_are_padded_to_the_text_vocab_with_the_start_token_masked_001(
 
     assert logits.shape == (2, config.vocab_size)
     assert torch.isfinite(logits[:, : config.start_speech_token]).all()
-    assert torch.isinf(logits[:, config.start_speech_token]).all()
+    assert (logits[:, config.start_speech_token] == float("-inf")).all()
     assert torch.isfinite(logits[:, config.stop_speech_token]).all()
-    assert torch.isinf(logits[:, config.speech_vocab_size :]).all()
+    assert (logits[:, config.speech_vocab_size :] == float("-inf")).all()
 
 
 def test_weight_routing_sends_the_backbone_to_vllm_and_the_rest_to_the_heads_001() -> None:
