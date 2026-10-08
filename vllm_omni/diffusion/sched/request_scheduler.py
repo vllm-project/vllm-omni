@@ -20,10 +20,11 @@ if TYPE_CHECKING:
     from vllm_omni.diffusion.worker.utils import BaseRunnerOutput
 
 # LoRA identity is derived from `sampling.lora_request`, not a same-named field
-# on sampling params, so it must be resolved separately from the bulk lookup.
+# on sampling params, and the attention schedule is normalized first, so both
+# must be resolved separately from the bulk lookup.
 _REQUEST_BATCH_SAMPLING_PARAMS_KEY_FIELD_NAMES = frozenset(
     field.name for field in fields(RequestBatchSamplingParamsKey)
-) - {"condition_key", "flow_shift", "lora_int_id", "sample_solver"}
+) - {"attention_schedule", "condition_key", "flow_shift", "lora_int_id", "sample_solver"}
 
 
 def _normalize_explicit_sample_solver(value: object | None) -> str | None:
@@ -54,7 +55,10 @@ def build_request_batch_sampling_params_key(request: OmniDiffusionRequest) -> Re
     key_kwargs["flow_shift"] = _normalize_explicit_flow_shift(extra_args.get("flow_shift"))
     key_kwargs["condition_key"] = getattr(request, "batch_compatibility_key", None)
     key_kwargs["lora_int_id"] = lora_request.lora_int_id if lora_request is not None else None
-    return RequestBatchSamplingParamsKey(**key_kwargs)
+    from vllm_omni.diffusion.attention.schedule import parse_attention_schedule
+
+    attention_schedule = parse_attention_schedule(getattr(sampling, "attention_schedule", None))
+    return RequestBatchSamplingParamsKey(attention_schedule=attention_schedule, **key_kwargs)
 
 
 class RequestScheduler(BaseScheduler):
