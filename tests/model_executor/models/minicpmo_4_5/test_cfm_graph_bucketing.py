@@ -19,6 +19,7 @@ from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import (
     _zero_padded_frames,
 )
 from vllm_omni.model_executor.models.minicpmo_4_5.cuda_graph_wrapper import (
+    WholeEulerCFMGraphWrapper,
     _att_keep_ranges,
     _build_capture_mask,
     _capture_query_width,
@@ -302,3 +303,44 @@ def test_zero_padded_cnn_cache_uniform_blocks_use_one_write():
     assert cache._version - version == 1
     assert torch.equal(cache[..., :3], torch.ones(16, 2, 3, 3))
     assert torch.count_nonzero(cache[..., 3:]) == 0
+
+
+@pytest.mark.parametrize("max_graphs", [15, 32])
+def test_precapture_covers_final_chunk_without_displacing_steady_graphs(monkeypatch, max_graphs):
+    from vllm_omni.model_executor.models.minicpmo_4_5 import cuda_graph_wrapper as graph_module
+
+    captured = []
+    stats = {"captures": 0}
+
+    def entry(*, graph_batch, query_cap, offset, **kwargs):
+        captured.append((graph_batch, query_cap, offset))
+        stats["captures"] += 1
+        return ()
+
+    wrapper = SimpleNamespace(
+        enabled=True,
+        att_slots=0,
+        _att_capacity=0,
+        offset_bucket_frames=50,
+        query_widths=(50,),
+        _graph_batches=lambda: [1, 2, 4, 8, 16],
+        max_graphs=max_graphs,
+        _cache={},
+        _slot_graphs={},
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        _entry=entry,
+        _precapture_fill=lambda statics: None,
+        _stats=stats,
+        arena=SimpleNamespace(att_bytes=lambda: 0),
+    )
+    monkeypatch.setattr(graph_module, "_memory_snapshot", lambda device: None)
+    count = WholeEulerCFMGraphWrapper.precapture(
+        wrapper, offsets=range(300, 401), steady=400, channels=4, spk_dim=4, tail_frames=6
+    )
+    assert captured[:15] == [(b, 50, o) for b in [16, 8, 4, 2, 1] for o in [400, 350, 300]]
+    assert count == min(max_graphs, 30)
+    assert wrapper.query_widths == (50,)
+    if max_graphs == 32:
+        assert (1, 100, 350) in captured
+        assert captured[15:] == [(b, 100, o) for b in [16, 8, 4, 2, 1] for o in [400, 350, 300]]
