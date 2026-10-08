@@ -53,6 +53,20 @@ def test_a_local_chatterbox_directory_without_config_gets_one_written_001(monkey
         }
 
 
+def test_a_local_chatterbox_directory_with_a_config_is_left_alone_001(monkeypatch, tmp_path) -> None:
+    def no_config(*args, **kwargs):
+        raise OSError("config.json cannot be loaded")
+
+    (tmp_path / "config.json").write_text("{}")
+    monkeypatch.setattr(PretrainedConfig, "get_config_dict", no_config)
+    args = OmniEngineArgs(model=str(tmp_path), model_arch="ChatterboxForConditionalGeneration")
+    args.hf_config_path = None
+
+    args._patch_empty_hf_config("chatterbox")
+
+    assert args.hf_config_path is None
+
+
 def test_an_unlisted_model_type_is_left_alone_001(monkeypatch) -> None:
     def no_config(*args, **kwargs):
         raise OSError("no config.json")

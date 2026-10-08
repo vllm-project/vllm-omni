@@ -304,13 +304,14 @@ class OmniEngineArgs(EngineArgs):
         except Exception:
             # The official IndexTTS 2.5 bundle has no HuggingFace config.json.
             # Keep this exception model-scoped so other loader failures retain
-            # vLLM's normal error path. Chatterbox (_CONFIG_LESS_MODEL_TYPES)
-            # also has none as a Hub id.
-            if model_type not in _CONFIG_LESS_MODEL_TYPES and not (
-                model_type == "indextts2_5" and os.path.isdir(self.model)
-            ):
+            # vLLM's normal error path.
+            # Chatterbox's Hub repo has no config.json either, so its Hub id
+            # is patched as well as a local directory.
+            config_less_hub_repo = model_type in _CONFIG_LESS_MODEL_TYPES
+            if not config_less_hub_repo and (model_type != "indextts2_5" or not os.path.isdir(self.model)):
                 return
-            if os.path.isdir(self.model) and os.path.lexists(os.path.join(self.model, "config.json")):
+            config_path = os.path.join(self.model, "config.json")
+            if os.path.lexists(config_path):
                 return
             config_dict = {}
 
