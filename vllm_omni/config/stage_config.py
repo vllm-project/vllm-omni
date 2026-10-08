@@ -234,7 +234,9 @@ class DiffusionStageRole(str, Enum):
 _MODEL_STAGE_TO_ROLE: dict[str, DiffusionStageRole] = {
     "text_encode": DiffusionStageRole.ENCODE,
     "encode": DiffusionStageRole.ENCODE,
-    "dit": DiffusionStageRole.DENOISE_DECODE,
+    # Legacy single-stage configs (e.g. wan2_2_ti2v) use "dit" for the whole
+    # pipeline; disaggregated topologies set ``stage_role`` explicitly.
+    "dit": DiffusionStageRole.FULL,
     "denoise": DiffusionStageRole.DENOISE,
     "denoise_decode": DiffusionStageRole.DENOISE_DECODE,
     "decode": DiffusionStageRole.DECODE,
