@@ -2090,3 +2090,46 @@ def test_training_bypasses_both_graphs_and_preserves_gradients(training):
     torch.testing.assert_close(x.grad, x.detach().cos())
     pre.run.assert_not_called()
     dynamic.assert_not_called()
+
+
+@pytest.mark.parametrize("ragged", [False, True])
+@pytest.mark.parametrize("autocast_enabled", [False, True])
+def test_decode_replays_encoder_graph_in_capture_autocast(monkeypatch, ragged, autocast_enabled):
+    adapter = BatchedToken2Wav(_FakeToken2Wav())
+    adapter.flow.eval()
+    _enable_fake_ragged_kernel(adapter)
+    prompt = adapter.prepare_prompt("shared", "/fake/prompt.wav")
+    states = adapter.setup_batch(prompt, 2)
+    # Exercise the decode entry points on CPU with the same context-matching
+    # contract as FlowEncoderGraphs.run, without requiring CUDA graph hardware.
+    monkeypatch.setattr(
+        adapter, "_autocast", lambda device: torch.autocast("cpu", dtype=torch.float16, enabled=autocast_enabled)
+    )
+    with adapter._autocast(torch.device("cpu")):
+        capture_amp = (torch.is_autocast_enabled("cpu"), torch.get_autocast_dtype("cpu"))
+    encode = adapter._encode_chunk
+    replays = []
+
+    def replay(tokens, cnn, att):
+        if (torch.is_autocast_enabled("cpu"), torch.get_autocast_dtype("cpu")) != capture_amp:
+            return None
+        replays.append(int(tokens.shape[0]))
+        return encode(
+            tokens,
+            last_chunk=False,
+            cnn_cache=torch.cat(cnn, dim=0),
+            att_cache=torch.cat(att, dim=1),
+            precaptured_checked=True,
+        )
+
+    monkeypatch.setattr(adapter, "_encoder_graphs", SimpleNamespace(run=replay))
+    monkeypatch.setattr(adapter, "_encode_chunk", Mock(side_effect=AssertionError("unexpected eager fallback")))
+    tokens = torch.tensor([[10, 11], [20, 21]])
+    with torch.inference_mode():
+        if ragged:
+            audios, next_states = adapter.decode_ragged_batch(list(tokens), prompt, states, last_chunks=[False, False])
+        else:
+            audios, next_states = adapter.decode_batch(tokens, prompt, states, last_chunk=False)
+    assert replays == [2]
+    assert len(audios) == len(next_states) == 2
+    assert all(audio.numel() > 0 for audio in audios)

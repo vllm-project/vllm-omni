@@ -1805,15 +1805,16 @@ class BatchedToken2Wav(nn.Module):
         # Whole-Euler reads and writes each request's estimator cache directly,
         # so the batch never holds a stacked copy of it.
         per_request_att = self._whole_euler_active()
-        # A captured encoder graph stacks the conformer caches into its own inputs.
-        graphed = None if last_chunk or flush_encoder else self._graph_encode(tokens, states)
-        flow_cache = self._stack_flow_cache(
-            states, include_estimator_att=not per_request_att, include_conformer=graphed is None
-        )
         prompt_len = int(features.mels.shape[1])
         att_keep = (prompt_len, _CACHE_TRIM_SUFFIX)
         speakers = features.speaker_embedding.expand(batch_size, -1)
         with self._autocast(tokens.device):
+            # Replay must use the same autocast context as startup capture.
+            # A captured encoder graph stacks the conformer caches into its own inputs.
+            graphed = None if last_chunk or flush_encoder else self._graph_encode(tokens, states)
+            flow_cache = self._stack_flow_cache(
+                states, include_estimator_att=not per_request_att, include_conformer=graphed is None
+            )
             # A graph's shared results are read below and copied per row by _split_flow_cache.
             hidden, conformer_cnn, conformer_att = graphed or self._encode_chunk(
                 tokens,
@@ -1960,11 +1961,13 @@ class BatchedToken2Wav(nn.Module):
         for (*_, last_chunk), rows in encoder_groups.items():
             group_states = [states[row] for row in rows]
             group_tokens = torch.stack([tokens[row] for row in rows], dim=0)
-            # With several groups the next replay rewrites the shared graph results, so they are copied.
-            graphed = None if last_chunk else self._graph_encode(group_tokens, group_states, len(encoder_groups) > 1)
-            # The encoder reads only the conformer caches.
-            group_cache = {} if graphed else self._stack_flow_cache(group_states, include_estimator_att=False)
             with self._autocast(group_tokens.device):
+                # With several groups the next replay rewrites the shared graph results, so they are copied.
+                graphed = (
+                    None if last_chunk else self._graph_encode(group_tokens, group_states, len(encoder_groups) > 1)
+                )
+                # The encoder reads only the conformer caches.
+                group_cache = {} if graphed else self._stack_flow_cache(group_states, include_estimator_att=False)
                 hidden, conformer_cnn, conformer_att = graphed or self._encode_chunk(
                     group_tokens,
                     last_chunk=last_chunk,
