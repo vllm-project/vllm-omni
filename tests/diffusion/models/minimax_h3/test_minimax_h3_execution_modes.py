@@ -213,6 +213,7 @@ def test_mixed_reference_conditioning_matches_stage_zero_handoff(pipeline, monke
     )
     monkeypatch.setattr(processing, "load_video_audio", Mock(return_value=(torch.full((64000,), 3.0), 32000)))
     pipeline.video_vae.encode_video.return_value = (torch.full((1, 96), 2.0), (1, 2, 2))
+    pipeline.video_vae.predict_video_latent_shape.return_value = (1, 2, 2)
 
     def encode_audio(waveform, sample_rate):
         length = round(waveform.shape[-1] / sample_rate * 40)
@@ -263,10 +264,18 @@ def test_mixed_reference_conditioning_matches_stage_zero_handoff(pipeline, monke
     pipeline.forward(SimpleNamespace(prompts=[bridged], sampling_params=request.sampling_params))
     external_kwargs = pipeline.diffuse.call_args.kwargs
     for key, value in local_kwargs.items():
+        if key in {"precomputed_initial_noise", "precomputed_visual_condition_noise"}:
+            assert value is not None
+            assert external_kwargs[key] is None
+            continue
         if isinstance(value, torch.Tensor):
             torch.testing.assert_close(value, external_kwargs[key])
         else:
             assert value == external_kwargs[key]
+    local_inputs = pipeline._build_denoise_inputs(**local_kwargs)
+    external_inputs = pipeline._build_denoise_inputs(**external_kwargs)
+    for key in ("video_rows", "audio_rows", "cond_anchor", "audio_anchor"):
+        assert torch.equal(local_inputs[key], external_inputs[key])
     pipeline.encode_prompt.assert_not_called()
     pipeline.video_vae.encode_image.assert_not_called()
     pipeline.video_vae.encode_video.assert_not_called()
