@@ -1796,33 +1796,52 @@ class PoolStats:
 JOB_RECORD_PER_POOL_CAP = 2000
 
 
-def _determine_ci_category(branch: str | None, source: str | None, created_at: datetime | None) -> str:
+def _determine_ci_category(
+    branch: str | None,
+    source: str | None,
+    created_at: datetime | None,
+    message: str | None = None,
+) -> str:
     """Map a Buildkite build to one of ``ready`` / ``merge`` / ``nightly`` / ``weekly``.
 
-    Heuristic:
+    Heuristic (keyword-first, weekday fallback):
       • non-main branch → ``ready`` (PR / pre-merge testing)
       • main + non-scheduled source → ``merge`` (push to main, not on a schedule)
       • main + scheduled:
-          - created on a Sunday (CST) → ``weekly``
-          - otherwise → ``nightly``
+          - message contains ``weekly`` → ``weekly`` (checked BEFORE nightly —
+            the scheduled builds are titled ``Scheduled weekly build`` /
+            ``Scheduled nightly build`` / ``AMD nightly``)
+          - message contains ``nightly`` → ``nightly``
+          - message carries no keyword → fall back to the calendar rule:
+            created on a Sunday (CST) → ``weekly``, otherwise ``nightly``
 
-    The weekly-day assumption is encoded in ``_WEEKLY_WEEKDAY`` (Sunday by
-    default, matching the vllm-omni pipeline).  If the pipeline schedule
-    changes, this is the one constant to update.
+    The message keyword is authoritative because the weekly schedule does
+    NOT land on a fixed CST weekday — it fires Saturday 12:00 UTC = Saturday
+    20:00 CST (verified 2026-10-03: build #16624 "Scheduled weekly build"
+    was created Sat 2026-10-03T12:00Z and the old Sunday-CST-only rule
+    misclassified it — and its Reliability Test jobs — as ``nightly``).
+    The weekday rule in ``_WEEKLY_WEEKDAY`` only covers message-less
+    scheduled builds and stays as a defensive default.
     """
     if branch and branch.strip() and branch.strip() != "main":
         return "ready"
     if source and source.strip().lower() == "schedule":
+        msg = (message or "").lower()
+        if "weekly" in msg:
+            return "weekly"
+        if "nightly" in msg:
+            return "nightly"
         if created_at is not None:
             cst_weekday = created_at.astimezone(CST).weekday()
-            # Python: Monday=0 … Sunday=6.  Weekly runs on Sunday by default.
+            # Python: Monday=0 … Sunday=6. Fallback only (message-less builds).
             if cst_weekday == _WEEKLY_WEEKDAY:
                 return "weekly"
         return "nightly"
     return "merge"
 
 
-# Sunday (Python weekday 6) — vllm-omni weekly schedule lands here.
+# Sunday (Python weekday 6) — fallback weekday for message-less scheduled
+# builds; the real weekly schedule fires Saturday 12:00 UTC (see docstring).
 _WEEKLY_WEEKDAY = 6
 
 
@@ -2278,7 +2297,9 @@ def compute_pool_stats(
         b_branch = (b.get("branch") or "").strip()
         b_source = (b.get("source") or "").strip()
         b_created_at = parse_buildkite_time(b.get("created_at"))
-        ci_category = _determine_ci_category(b_branch, b_source, b_created_at)
+        ci_category = _determine_ci_category(
+            b_branch, b_source, b_created_at, b.get("message")
+        )
         if verbose:
             bnum = b.get("number", "?")
             bstate = (b.get("state") or "").strip()
