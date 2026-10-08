@@ -30,7 +30,7 @@ from tests.e2e.online_serving.run_minicpmo_realtime_duplex_soft_interrupt import
     run_soft_interrupt,
 )
 from tests.helpers.mark import hardware_test
-from vllm_omni.entrypoints.duplex.server_vad import (
+from vllm_omni.engine.duplex.vad import (
     SILERO_VAD_FILENAME,
     SILERO_VAD_REPO_ID,
     SILERO_VAD_REVISION,

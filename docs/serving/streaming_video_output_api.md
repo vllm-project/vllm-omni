@@ -41,7 +41,7 @@ bytes.
 | Server to client | `video.start` | Confirms the request ID, format, and accepted configuration |
 | Server to client | `video.chunk_metadata` | Describes the next binary media frame |
 | Server to client | Binary frame | Carries one fragmented MP4 chunk |
-| Client to server | `session.interaction` | Queues an optional prompt update during generation |
+| Client to server | `session.interaction` | Queues an optional interaction (e.g., prompt. camera action) during generation |
 | Server to client | `session.interaction.queued` | Confirms that an interaction was queued |
 | Client to server | `session.ping` | Refreshes the stall clock |
 | Server to client | `session.pong` | Acknowledges a ping |
@@ -83,10 +83,39 @@ Models that implement interaction updates can change the active prompt:
 }
 ```
 
+Models that register the camera modality (for example LingBot-World) also
+accept structural SE3 payloads on `event.multi_modal_data.camera`. Coordinates
+follow Unity semantics (`+X` right, `+Y` up, `+Z` forward; same as LingBot's
+native camera frame). WASD key tokens are not admitted by the engine:
+
+```json
+{
+  "type": "session.interaction",
+  "interaction": {
+    "event_id": "forward-1",
+    "event": {
+      "multi_modal_data": {
+        "camera": {
+          "mode": "velocity",
+          "data": {
+            "translation": [0.0, 0.0, 0.05],
+            "rotation": [0.0, 0.0, 0.0, 1.0]
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+`mode` is `target` (lerp to an absolute pose over `transition_chunks`) or
+`velocity` (hold a per-frame SE3 delta until replaced). Prompt and camera may
+be combined in one interaction event.
+
 This feature is pipeline-dependent. An enabled endpoint does not imply that
-the loaded model supports midway prompt updates.
+the loaded model supports midway prompt or camera updates.
 
 The default start timeout is 10 seconds and the server reports a stall after
 about 60 seconds without generation progress or a `session.ping`. See the
 [streaming video generation example](https://github.com/vllm-project/vllm-omni/tree/main/examples/online_serving/streaming_video_generation)
-for prompt-update scheduling and browser playback.
+for prompt/camera-update scheduling and browser playback.

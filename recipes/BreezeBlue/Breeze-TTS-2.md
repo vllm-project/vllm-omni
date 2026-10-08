@@ -1,193 +1,307 @@
 # Breeze-TTS-2
 
-> Text-to-speech serving (plain / voice design / voice clone / voice direction)
+[Breeze-TTS-2](https://huggingface.co/BreezeBlue/Breeze-TTS-2) generates 24 kHz
+English and Chinese speech. The integration supports Voice Design from text
+instructions, Voice Clone from a reference recording and transcript, and
+Voice Direction combining reference conditioning with instructions.
 
-## Summary
+## Installation and serving
 
-- Vendor: BreezeBlue
-- Model: `BreezeBlue/Breeze-TTS-2` (`BreezeForConditionalGeneration`)
-- Task: Text-to-speech with speaker tags, natural-language style instructions, single-reference voice cloning, and reference+instruction "voice direction"
-- Mode: Online serving with the OpenAI-compatible `/v1/audio/speech` API (streaming and non-streaming); offline `Omni` example
-- Hardware: 1x NVIDIA L20 48GB (CUDA)
-- Maintainer: Community
-
-## When to use this recipe
-
-Use this recipe when you want a known-good starting point for serving
-Breeze-TTS-2 with vLLM-Omni. Breeze-TTS-2 is a two-stage AR TTS pipeline:
-
-| Stage | Components | Output |
-| ----- | ---------- | ------ |
-| 0 (talker, `LLM_AR`) | T5Gemma2 text encoder + Qwen3 backbone + 2052-way codebook-0 head + 12-layer depth decoder | 16-codebook codec frames |
-| 1 (codec, `LLM_GENERATION`) | Bundled Qwen3-TTS audio tokenizer decoder (Mimi fallback) | 24 kHz mono waveform |
-
-Four prompt modes are selected automatically from the request fields:
-
-| Mode | Trigger | Fields |
-| ---- | ------- | ------ |
-| `tts_plain` | only `input` (default `voice=S0`) | `input`, `voice` |
-| `tts_instruction` (voice design) | `input` + `instructions` | style/emotion/pace directives, not spoken |
-| `ref_clone_tata` (clone) | `ref_audio` + `ref_text` + `input` | reference clip and its exact transcript |
-| `ref_edit_tata` (voice direction) | reference trio + `instructions` | keep the reference timbre, direct the delivery |
-
-Current scope: greedy sampling with `cfg_scale=1.0`; CFG ≠ 1.0 and
-`negative_prompt` are rejected with explicit client errors until companion
-request support lands.
-
-## Supported model contract
-
-| Item | Value |
-| ---- | ----- |
-| Tasks | Text-to-speech through `/v1/audio/speech` (online) and the offline `Omni` example |
-| Modes | plain, voice design (`instructions`), voice clone (`ref_audio` + `ref_text`), voice direction (reference + `instructions`) |
-| Languages | English and Chinese (model card) |
-| Reference audio | exactly one clip per request with its exact transcript; encoded by the bundled Qwen3-TTS tokenizer to 16 codebooks at 12.5 Hz |
-| Output | 24 kHz mono; `wav` or `pcm`; streaming SSE `speech.audio.delta` |
-| Length | prompt bounded by stage-0 `max_model_len=4096`; synthesis bounded by `max_new_tokens` codec frames (default 2048, about 164 s) |
-| Sampling | greedy (`temperature=0`) with `cfg_scale=1.0`; other guidance values and `negative_prompt` are rejected |
-| Deployment profile | `vllm_omni/deploy/breeze_tts_2.yaml`: two stages on one GPU, async-chunk streaming with 8-frame codec chunks, stage 0 `gpu_memory_utilization=0.80`, stage 1 `0.15` |
-
-## References
-
-- Issue: [#6656 [New Model]: Breeze TTS 2](https://github.com/vllm-project/vllm-omni/issues/6656)
-- Related examples under `examples/`:
-  [`examples/online_serving/text_to_speech/breeze_tts_2/`](../../examples/online_serving/text_to_speech/breeze_tts_2/),
-  [`examples/offline_inference/text_to_speech/breeze_tts_2/`](../../examples/offline_inference/text_to_speech/breeze_tts_2/)
-
-## Hardware
-
-- Accelerator model and per-device memory: 1x NVIDIA L20 48GB
-- Number of devices: 1 (both stages are placed on device 0)
-- Device interconnect: not applicable (single device)
-- Host memory: no special requirement; per-request codec state is small
-- Qualification scope: functional serving of all four prompt modes, streaming PCM, and 4 concurrent mixed-mode requests (greedy, `cfg_scale=1.0`). No other accelerator is qualified by this recipe.
-
-## Software environment
-
-- OS: Linux
-- Python: 3.12.12
-- Driver / runtime: NVIDIA driver 580.82.07, CUDA 13.0 (PyTorch 2.13.0+cu130)
-- vLLM version: 0.28.0
-- vLLM-Omni version or commit: the commit that introduced this recipe (branch based on `main` @ `67ef0b64`)
-- Transformers: 5.14.1
-
-## Command
-
-Start the server from the repository root. The deploy config
-(`vllm_omni/deploy/breeze_tts_2.yaml`, async chunk streaming by default)
-auto-loads from the checkpoint's `model_type`; pass it explicitly if you
-customized it:
+Follow the project's source installation guide for vLLM and vLLM-Omni.
+The integration loads the released checkpoint directly. The original Breeze
+repository and the `qwen-tts` package are not required. The common requirements
+include `soxr` to reproduce reference-audio resampling.
 
 ```bash
-vllm serve BreezeBlue/Breeze-TTS-2 \
-    --deploy-config vllm_omni/deploy/breeze_tts_2.yaml \
-    --omni --port 8091
+vllm-omni serve BreezeBlue/Breeze-TTS-2 --omni --host 127.0.0.1 --port 8091
 ```
 
-## Verification
+The default configuration uses one CUDA GPU, BF16 generation and codec
+computation, and FP32 reference encoding. Decoded waveform tensors are converted
+to FP32 before response formatting. It targets GPUs with at least 16 GiB
+available for the deployment; other workloads consume additional memory.
 
-Plain synthesis (speaker tag `S0`..`S9`, default `S0`):
+On WSL2, set vLLM's supported pinned-memory option before starting the server:
 
 ```bash
-curl -X POST http://localhost:8091/v1/audio/speech \
-    -H "Content-Type: application/json" \
-    -d '{
-        "model": "BreezeBlue/Breeze-TTS-2",
-        "input": "Hello, this is Breeze TTS 2 running on vLLM-Omni.",
-        "voice": "S0",
-        "response_format": "wav",
-        "sample_rate": 24000
-    }' --output breeze_plain.wav
+export VLLM_WSL2_ENABLE_PIN_MEMORY=1
 ```
 
-Voice design (instruction only, no reference audio):
+Native Linux enables pinned memory by default. Startup warmup exercises plain
+generation, CFG, reference conditioning and two-request batches. New text
+lengths or batch sizes can require additional graph
+capture or compilation; warm the workload before measuring steady performance.
+
+## Voice Design
 
 ```bash
-curl -X POST http://localhost:8091/v1/audio/speech \
-    -H "Content-Type: application/json" \
-    -d '{
-        "input": "[laughs] Welcome to tonight's story time.",
-        "instructions": "A warm young woman, clear voice, lively delivery.",
-        "response_format": "wav"
-    }' --output breeze_design.wav
+curl --fail http://127.0.0.1:8091/v1/audio/speech \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "BreezeBlue/Breeze-TTS-2",
+    "input": "你好，欢迎使用语音合成系统。",
+    "instructions": "年轻女性，声音温暖自然，使用标准普通话。",
+    "extra_params": {"guidance_scale": 4.0},
+    "response_format": "wav",
+    "seed": 42,
+    "max_new_tokens": 250
+  }' --output breeze.wav
 ```
 
-Voice cloning (`ref_audio` and `ref_text` must be provided together):
+The `voice` field selects a speaker tag, such as `S0` or `[S0]`; omitting it
+uses `[S0]`. These are checkpoint prompt tags, not a catalog of named voices.
+Omitting `instructions` uses `Speak clearly and naturally.`. An explicitly
+empty instruction remains empty. Vocal-event tokens, including `(laughs)`
+and `[笑]`, are passed to the checkpoint unchanged.
+
+## Voice Clone and Voice Direction
+
+Add `ref_audio` and its exact `ref_text` transcript. Reference audio accepts the
+shared speech API's audio URLs and base64 data URLs, either as a string or
+a one-item list. The shared resolver's
+format, duration and local-file access restrictions apply.
+
+```json
+{
+  "model": "BreezeBlue/Breeze-TTS-2",
+  "input": "Please read this new sentence clearly and naturally.",
+  "ref_audio": "data:audio/wav;base64,<base64-encoded-reference>",
+  "ref_text": "The words actually spoken in the reference recording.",
+  "instructions": "Keep the reference voice. Speak gently and calmly.",
+  "extra_params": {"guidance_scale": 4.0},
+  "response_format": "wav",
+  "seed": 42
+}
+```
+
+Use `guidance_scale: 1.0` with the default instruction for ordinary cloning.
+Reference audio plus a delivery instruction and CFG provides Voice Direction.
+When explicitly specified, `task_type` is `Base` for reference conditioning
+and `VoiceDesign` without reference audio. The legacy `CustomVoice` value
+also remains accepted.
+
+Stereo references are averaged to mono and resampled to 24 kHz with soxr HQ.
+Reference text is encoded independently from the target text. The reference
+codec preserves full causal attention during offline encoding, as used by the
+released Breeze runtime; newer Transformers sliding-window defaults would
+change long references. Reference convolution uses full FP32 precision.
+
+## Sampling and output
+
+Supported `extra_params`:
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `guidance_scale` | 1.0 | Any finite positive value; values other than 1 use two CFG branches |
+| `temperature` | 0.9 | Zero selects greedy generation |
+| `top_k` | 50 | Zero or -1 disables top-k filtering |
+| `top_p` | 1.0 | Nucleus sampling probability in (0, 1] |
+| `repetition_penalty` | 1.1 | Positive penalty applied to the first codebook's generated history |
+
+`cfg_scale` remains an alias for `guidance_scale`; `guidance_scale` takes
+precedence when both are supplied.
+
+CFG combines conditional and unconditional logits in the Qwen3 output head
+and all 15 remaining depth codebooks. Both branches retain reference audio
+and reference text; the unconditional branch removes only target instructions.
+
+`max_new_tokens` limits generated audio frames, including EOS. Each frame is
+80 ms; the default is 1500 tokens, subject to the remaining 2048-token context.
+Both CFG branches stop at the same generation limit despite unequal prompts.
+Each request owns its seed, generator, audio-code history and codec state.
+Different GPU kernels and batch shapes can still change sampled outputs.
+
+For streamed PCM, use `"stream": true`, `"stream_format": "audio"`, and
+`"response_format": "pcm"`. Output is mono signed 16-bit little-endian PCM at
+24 kHz. Complete WAV responses accumulate the same internal streaming output.
+With the default deployment, the first chunks contain 1, 2, 4 and 5 codec
+frames, then remain at 5 frames.
+
+## Non-streaming throughput profile
+
+For concurrent complete responses, select the throughput deployment from the
+repository root.
 
 ```bash
-curl -X POST http://localhost:8091/v1/audio/speech \
-    -H "Content-Type: application/json" \
-    -d '{
-        "input": "This is new text spoken in the cloned voice.",
-        "ref_audio": "file:///path/to/reference.wav",
-        "ref_text": "The exact transcript of the reference audio.",
-        "response_format": "wav"
-    }' --output breeze_clone.wav
+vllm-omni serve BreezeBlue/Breeze-TTS-2 --omni \
+  --deploy-config vllm_omni/deploy/breeze_tts_2_throughput.yaml \
+  --host 127.0.0.1 --port 8091
 ```
 
-Voice direction (reference + instruction):
+Request a complete WAV with `"stream": false` and omit `stream_format`.
+Setting `"stream_format": "audio"` enables streaming even when `stream` is false.
 
 ```bash
-curl -X POST http://localhost:8091/v1/audio/speech \
-    -H "Content-Type: application/json" \
-    -d '{
-        "input": "We need to discuss what happened last night.",
-        "ref_audio": "file:///path/to/reference.wav",
-        "ref_text": "The exact transcript of the reference audio.",
-        "instructions": "Speak slowly with a restrained, serious tone.",
-        "response_format": "wav"
-    }' --output breeze_direction.wav
+curl --fail http://127.0.0.1:8091/v1/audio/speech \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "BreezeBlue/Breeze-TTS-2",
+    "input": "Hello, welcome to the speech synthesis demonstration.",
+    "stream": false,
+    "response_format": "wav",
+    "seed": 42,
+    "max_new_tokens": 250
+  }' --output breeze-complete.wav
 ```
 
-Streaming PCM (SSE `speech.audio.delta` events):
+The profile was tested on one H100 80 GB. It sets `max_num_seqs: 32` on both
+stages and reserves 8 GiB of stage-0 KV cache for thirty-two 2048-token contexts.
+These are physical sequence slots: stage 0 can run up to thirty-two plain
+requests (`guidance_scale: 1.0`) or sixteen
+CFG requests, since each CFG request occupies two slots. Mixed workloads share
+the same limit; additional requests queue. The default deployment's memory
+target does not apply to this larger profile.
+
+The internal codec uses fixed 16-frame chunks from the first chunk onward,
+with a shorter final chunk when needed. `cfg_prefill_delay_tokens: 0` removes
+the default eight-frame admission delay, so waiting requests can enter as soon
+as scheduling and KV capacity permit. The stateful codec still requires
+`async_chunk: true` for these complete HTTP responses. Warm the expected text
+lengths and concurrency before measuring the profile.
+
+The shared benchmark defaults to streaming. Override both `stream` and
+`stream_format` to measure complete responses, and set the generation limit
+explicitly in the request body:
 
 ```bash
-curl -N -X POST http://localhost:8091/v1/audio/speech \
-    -H "Content-Type: application/json" \
-    -d '{
-        "input": "Streaming output from Breeze TTS 2.",
-        "stream": true,
-        "stream_format": "audio",
-        "response_format": "pcm",
-        "sample_rate": 24000
-    }' --output breeze_stream.pcm
+python benchmarks/tts/bench_tts.py \
+  --model BreezeBlue/Breeze-TTS-2 --task default_voice --locale en \
+  --dataset-path benchmarks/build_dataset/seed_tts_smoke \
+  --host 127.0.0.1 --port 8091 --concurrency 1 2 4 8 16 32 64 \
+  --num-prompts 128 --num-warmups 64 \
+  --output-dir results/breeze-nonstream -- \
+  --extra-body '{"stream":false,"stream_format":null,"response_format":"pcm","max_new_tokens":384,"seed":42,"extra_params":{"temperature":0.9,"top_k":50,"top_p":1,"repetition_penalty":1.1,"guidance_scale":1}}'
 ```
 
-Expected results: finite, non-silent 24 kHz mono WAV files; streaming requests
-return incremental PCM deltas. On 1x L20 (greedy, single request after
-warm-up) a few seconds of speech completes in roughly 3.4–3.8 s wall time.
+Use the same dataset and sampling settings when comparing deployment profiles.
+Verify completed and failed request counts in each result. For complete
+responses, compare throughput and RTF; first-response timing represents
+completion latency. Run ASR separately: the benchmark's WER mode forces streaming.
 
-## Notes
+## Pipeline and optimization
 
-- **Sample rate**: only `24000` is accepted; other values fail validation
-  before inference.
-- **Speed / seeds / multi-reference**: `speed` must be `1.0`;
-  `task_type=VoiceDesign`, `ref_audio_2`, and speaker embeddings are not
-  supported yet.
-- **CFG**: `guidance_scale`/`cfg_scale` must be `1.0`. Non-1.0 values and
-  `negative_prompt` return a client error.
-- **Length budget**: prompt length is bounded by stage 0 `max_model_len=4096`;
-  synthesis length by `max_new_tokens` (default 2048 frames ≈ 164 s at the
-  12.5 Hz codec frame rate) — set `max_new_tokens` for shorter caps.
-- **Checkpoint layout**: the checkpoint must contain the `audio_tokenizer/`
-  subdirectory (bundled Qwen3-TTS codec) for the default streaming path; the
-  Mimi fallback is used only when that directory is absent and does not
-  support async-chunk streaming.
-- **License**: the reference inference code is Apache 2.0; the checkpoints are
-  distributed under the separate BreezeBlue Research and Non-Commercial
-  License. Commercial use requires written authorization from BreezeBlue.
+Stage 0 batches T5Gemma2 text encoding, optional reference-audio encoding,
+vLLM's native Qwen3 backbone with paged KV caching, and Breeze's Llama depth
+decoder. Text segments up to 128 tokens use padded CUDA Graphs with separate
+attention masks. Longer segments use dynamically compiled encoder layers
+without retaining a separate graph workspace for each input length.
+The depth decoder uses fused QKV/MLP projections, compiled layer kernels,
+fixed frame-local KV buffers and a CUDA Graph covering all 15 depth steps.
+Graphs pad requests to power-of-two buckets, keeping CFG branches separate.
+Compiled layers reuse kernels across batch sizes, avoiding a new compilation
+for every shrinking batch. Only real requests advance their random state,
+and returned tensors exclude padded rows.
+Positive temperature, top-k and top-p are mutable GPU inputs to the captured
+sampler. Changing those settings, or changing a positive CFG scale within the
+paired path, reuses the graph. Greedy decoding uses a separate graph that skips
+sorting and random sampling. Each request owns its random-number generator.
 
-## Supported features
+Reference encoding uses dynamic-shape compilation with CUDA Graphs disabled
+for that path, so large reference-convolution workspaces remain reusable by
+the allocator. Every convolution retains each recording's actual boundary;
+the final downsampler repeats its last valid state for partial frames, matching
+independent encoding. Static convolution metadata removes GPU-to-CPU padding
+calculations. Startup compiles reference batches of one and two.
+Waveform storage is aligned to 1920-sample frames, with that frame width
+marked static for compilation. Actual sample lengths still govern every
+convolution boundary. This avoids nested dynamic ceil/mod expressions that
+otherwise make compiler tiling spend minutes simplifying reference shapes.
 
-| Feature | Status | Notes |
-| ------- | ------ | ----- |
-| Streaming output | ✓ | `async_chunk: true`, 8-frame inter-stage chunks, SSE `speech.audio.delta` PCM |
-| Voice cloning | ✓ | one reference clip plus transcript per request |
-| Voice design / voice direction | ✓ | `instructions` field, with or without a reference |
-| Classifier-free guidance | ✗ | `cfg_scale` must be `1.0`; `negative_prompt` rejected (follow-up) |
-| Non-greedy sampling | ✗ | greedy decoding only |
-| Prefix caching | ✗ | disabled in the deploy config |
-| Tensor / pipeline parallelism | untested | single-GPU profile only |
-| Quantization | ✗ | not supported in this release |
-| CUDA graphs | not tuned | depth decoder and stage-1 codec run eagerly |
-| Platforms | CUDA | qualified on 1x NVIDIA L20 |
+Stage 1 reuses Qwen3-TTS's stateful codec and its CUDA Graph decoder with the
+checkpoint's `audio_tokenizer/` weights. Shared-memory chunks connect stages.
+Only the generated-code decode path is captured: reference conditioning was
+already consumed in stage 0, so the Qwen ICL reference-prefix graphs and their
+large convolution workspaces are unnecessary for Breeze.
+
+The Qwen3 backbone uses compiled piecewise prefill and full decode graphs.
+Stage 0 uses synchronous scheduling to keep CFG branches at the same
+generation step; stage 1 uses asynchronous scheduling. CFG admission reserves
+enough KV pages for both branches' complete generation and preserves their
+actual position IDs. Cancellation finishes both branches.
+
+The default admission policy lets active requests produce eight audio frames
+before adding another prefill. This gives playback a buffer before text and
+reference encoding share the device with an existing stream. It increases a
+queued request's first-audio latency; benchmark it separately from an idle server.
+
+The default `max_num_seqs: 2` counts physical branches: it permits two plain
+requests or one CFG request at a time. Additional CFG requests queue.
+Prefix caching and chunked prefill are disabled because prompt token IDs
+reserve positions for externally encoded embeddings. The deployment requires
+`async_chunk: true`, including for complete HTTP responses.
+
+The accelerated implementation retains the `breeze_tts_2` model package,
+`breeze_tts_2` and `breeze_tts_2_codec` stage names, and default
+`breeze_tts_2.yaml` deployment. The shorter `breeze_tts.yaml` and
+`breeze_tts_throughput.yaml` deployment filenames remain compatibility aliases.
+For a copied custom configuration, use the current `breeze_tts_2.yaml` as
+the starting point: codec chunk controls use `codec_chunk_frames`,
+`initial_codec_chunk_frames` and `codec_chunk_ramp`.
+Defaults now use a 2048-token context and temperature 0.9; set temperature
+to zero explicitly when comparing greedy generation with the earlier runtime.
+
+The supported execution scope is one CUDA GPU, TP=1, PP=1 and unquantized
+released weights. Named voices, speaker embeddings, dual CFG and multiple
+reference recordings are not supported. The original public fast runtime
+also does not expose dual CFG.
+
+## Offline inference and validation
+
+`vllm_omni.model_executor.models.breeze_tts_2.prompt.build_breeze_prompt`
+accepts a checkpoint tokenizer, text, instructions, sampling parameters,
+and optional `ref_audio=(waveform, sample_rate)` plus `ref_text`. Pass its
+result to `Omni.generate()` using the default Breeze deployment. Waveform
+arrays use soundfile's `(samples, channels)` convention.
+
+CPU tests compare cached depth attention and CFG against Hugging Face Llama
+and cover request-owned sampling, payload transport, chunk delivery and CFG
+admission. GPU tests compare padded batched text graphs with independent
+eager encoders and exercise depth graphs across CFG scales and batch shapes.
+
+```bash
+pytest -v tests/model_executor/models/test_breeze_tts_2.py \
+  tests/model_executor/models/test_breeze_tts_2_registration.py \
+  tests/core/sched/test_omni_cfg_ar_scheduler.py -m 'core_model and cpu'
+pytest -v tests/model_executor/models/test_breeze_tts_2_graphs.py -m 'core_model and cuda'
+pytest -v tests/e2e/online_serving/test_breeze_tts_2.py \
+  -m 'core_model and tts' --run-level=core_model
+pytest -v tests/e2e/online_serving/test_breeze_tts_2.py \
+  -m 'advanced_model and tts' --run-level=advanced_model
+```
+
+Serving tests use the shared client for Chinese CFG design, English PCM,
+concurrent CFG requests, reference cloning and direction. Core tests use dummy
+weights and eight-frame requests; advanced tests use real weights and the
+shared content checks. These checks do not establish perceptual quality parity.
+The Chinese content check uses Whisper large-v3 as its primary transcriber:
+small misrecognizes homophones on the fixed test clip. The expected text and
+shared similarity threshold are unchanged; there is no failed-check retry.
+Ensure enough host memory and disk space for the large-v3 test model when
+Whisper runs on CPU alongside the serving process.
+
+The English PCM test uses a 0 dB harmonic-to-noise floor because the original
+eager runtime scores 0.56 dB on that same prompt and seed, below the shared
+1 dB floor. Raw PCM is not transcribed by the shared helper. Separate matched
+evaluations must retain audio and compare intelligibility, speaker similarity,
+instruction effects, first audio, RTF and playback underruns.
+
+The shared serving benchmark supports default speech, Voice Design and
+Voice Clone. For Voice Design:
+
+```bash
+python benchmarks/tts/bench_tts.py \
+  --model BreezeBlue/Breeze-TTS-2 --task voice_design --locale en \
+  --host 127.0.0.1 --port 8091 --concurrency 1 2 \
+  --num-prompts 4 --num-warmups 1 --request-seed 42 --output-len 250 \
+  --output-dir results/breeze
+```
+
+For a local model path, add `--served-model-name /path/to/Breeze-TTS-2`.
+For cloning, select `--task voice_clone --dataset-path /path/to/seed-tts-eval`
+with the desired locale. Reference conditioning with instructions and other
+CFG scales also require identical requests and sampling settings in the
+reference runtime and this deployment.
+
+The reference source and released weights have separate licenses. Consult
+the [reference repository](https://github.com/breezeblue-ai/breeze-tts) and
+checkpoint model card.

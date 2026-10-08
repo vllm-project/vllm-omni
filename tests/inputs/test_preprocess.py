@@ -8,7 +8,9 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 import torch
-from vllm.inputs import tokens_input
+from vllm.exceptions import VLLMValidationError
+from vllm.inputs import mm_input, tokens_input
+from vllm.multimodal.inputs import PlaceholderRange
 from vllm.pooling_params import PoolingParams
 from vllm.renderers import BaseRenderer
 from vllm.renderers.params import TokenizeParams
@@ -113,6 +115,35 @@ def test_omni_renderer_is_a_real_subclass_created_once():
     instance = cls()
     assert isinstance(instance, _Renderer)
     assert not hasattr(instance, "_renderer")
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+@pytest.mark.parametrize("no_media_kwargs", [False, True])
+@pytest.mark.parametrize("limit", [2, 4])
+def test_renderer_applies_expanded_prompt_bound_without_splitting_media(renderer, async_mode, no_media_kwargs, limit):
+    renderer._process_multimodal.return_value = mm_input(
+        list(range(6)), {}, {"image": ["hash"]}, {"image": [PlaceholderRange(offset=1, length=2)]}
+    )
+    prompt = {"prompt_token_ids": [1, 2, 3], "additional_information": {"speaker": 1}}
+    if no_media_kwargs:
+        prompt["mm_processor_kwargs"] = {"target_h": 512}
+    else:
+        prompt["multi_modal_data"] = {"image": "image"}
+    params = TokenizeParams(max_total_tokens=128, truncate_prompt_tokens=limit, truncation_side="right")
+
+    def render():
+        if async_mode:
+            return asyncio.run(renderer.render_cmpl_async([prompt], params))
+        return renderer.render_cmpl([prompt], params)
+
+    if limit == 2:
+        with pytest.raises(VLLMValidationError, match="would split or drop"):
+            render()
+    else:
+        (result,) = render()
+        assert result["prompt_token_ids"] == [0, 1, 2, 3]
+        assert result["mm_placeholders"]["image"] == [PlaceholderRange(offset=1, length=2)]
+        assert result["additional_information"] == {"speaker": 1}
 
 
 def test_concrete_renderer_overrides_are_not_suppressed():

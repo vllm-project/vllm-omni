@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """
 vLLM-Omni: Multi-modality models inference and serving with
 non-autoregressive structures.
@@ -37,6 +40,10 @@ except ModuleNotFoundError as exc:  # pragma: no cover - optional dependency
     pass
 
 from .config import OmniModelConfig
+
+# Apply the process-wide default at vllm_omni import; later backend policies
+# take precedence.
+from . import env_override as _env_override  # isort:skip # noqa: F401, E402
 
 
 def __getattr__(name: str):

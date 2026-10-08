@@ -21,7 +21,7 @@ import pytest
 
 from vllm_omni.engine.cfg_companion_tracker import CfgCompanionTracker
 from vllm_omni.engine.messages import AbortRequestMessage, ErrorMessage
-from vllm_omni.engine.orchestrator import Orchestrator
+from vllm_omni.engine.orchestrator import Orchestrator, OrchestratorRequestState
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -92,6 +92,9 @@ class _FakePool:
         self.aborted.append(list(request_ids))
 
     def release_bindings(self, request_ids):
+        pass
+
+    async def release_request_resources(self, request_ids):
         pass
 
 
@@ -223,8 +226,8 @@ async def test_expired_companion_wait_fails_parent_and_cleans_bundle():
     orch._cfg_tracker = CfgCompanionTracker(clock=lambda: 100.0)
     orch._cfg_companion_timeout_s = 10.0
     orch._cfg_tracker.register_companion("p", "neg", "p__neg")
-    orch.request_states["p"] = _req_state()
-    orch.request_states["p__neg"] = _req_state(final_stage_id=0)
+    orch.request_states["p"] = OrchestratorRequestState(request_id="p", final_stage_id=1)
+    orch.request_states["p__neg"] = OrchestratorRequestState(request_id="p__neg", final_stage_id=0)
     orch._cfg_tracker.defer_parent("p", {"parent": True}, stage_id=0)
 
     assert await orch._reap_expired_cfg_parents(now=110.0) == 1

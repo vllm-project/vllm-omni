@@ -70,3 +70,42 @@ as safety checks or audio/video packaging.
 
 See [RFC #6541](https://github.com/vllm-project/vllm-omni/issues/6541) for the
 contract, lifecycle, batching rules, and migration plan.
+
+## Experimental registered-SHM video transport
+
+`video_output_transport.enable_registered_shm` is a separate, default-off option
+for CUDA request-mode workers. It copies eligible video tensors directly into
+CUDA-registered shared memory and returns borrowed CPU views, removing the
+intermediate pinned-to-SHM and SHM-to-consumer host copies. The D2H transfer still
+occurs.
+
+`video_output_transport.enable_borrowed_frames` independently enables borrowed
+RGB AVFrames in the Videos API MP4 response encoder, removing the third host
+copy into PyAV frame buffers. It also defaults to false. Eligible uint8 RGB
+frames are wrapped with `VideoFrame.from_numpy_buffer`; other dtypes/layouts use
+the existing encoder path. Color conversion, compression and muxing still occur.
+
+Enable it through the same CLI, Python or deploy-stage configuration:
+
+```bash
+--video-output-transport '{"enable_registered_shm": true, "enable_borrowed_frames": true}'
+```
+
+Registered SHM applies only to prepared typed video media (currently WAN2.2) and
+explicitly marked legacy video outputs (currently MiniMax-H3). H3 marks the video
+entry of its `(video, audio)` output; audio, trajectory data, images and unmarked
+legacy outputs keep their existing transport. Device-side postprocessing is
+independent and does not need to be enabled for registered SHM.
+Pre-encoded MP4 outputs bypass raw-frame transport and API-side encoding.
+
+The existing SHM routing threshold is unchanged: the tensor or its backing
+storage must exceed 1,000,000 bytes. This is not a measured performance crossover.
+SHM is allocated and registered on every transfer, without pooling; small outputs
+can regress and registration latency can vary. Benchmark representative output
+sizes before opting in. CPU outputs, non-CUDA backends, and synchronous/step-mode
+transfers keep their existing path.
+
+Borrowed views keep the unlinked mapping alive until their last user releases
+it. CUDA registration/copy failures fail the request; if CUDA cleanup cannot be
+confirmed, the worker retains the mapping for safety and must be restarted before
+further registered-SHM transfers.

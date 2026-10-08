@@ -90,6 +90,7 @@ def _get_function_source(source: str, class_name: str | None, func_name: str) ->
     Args:
         source: Full file source code.
         class_name: Enclosing class name, or None for module-level functions.
+            The method may be inherited from a base class defined in the same file.
         func_name: Function/method name.
 
     Returns:
@@ -97,13 +98,24 @@ def _get_function_source(source: str, class_name: str | None, func_name: str) ->
     """
     tree = ast.parse(source)
     if class_name is not None:
-        for node in ast.walk(tree):
-            if isinstance(node, ast.ClassDef) and node.name == class_name:
-                for item in node.body:
-                    if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)) and item.name == func_name:
-                        result = ast.get_source_segment(source, item)
-                        assert result is not None, f"{class_name}.{func_name} source not found"
-                        return result
+        # Follow the bases: ``Orchestrator`` inherits its loops and helpers from
+        # ``OrchestratorBase`` in the same module, and the lookup stays anchored
+        # on the public class rather than on where the split happens to fall.
+        classes = {node.name: node for node in ast.walk(tree) if isinstance(node, ast.ClassDef)}
+        pending = [class_name]
+        seen: set[str] = set()
+        while pending:
+            name = pending.pop(0)
+            if name in seen or name not in classes:
+                continue
+            seen.add(name)
+            node = classes[name]
+            for item in node.body:
+                if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)) and item.name == func_name:
+                    result = ast.get_source_segment(source, item)
+                    assert result is not None, f"{class_name}.{func_name} source not found"
+                    return result
+            pending.extend(base.id for base in node.bases if isinstance(base, ast.Name))
     else:
         for node in ast.walk(tree):
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == func_name:

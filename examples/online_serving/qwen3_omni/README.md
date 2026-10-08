@@ -14,6 +14,17 @@ Please refer to [README.md](../../../README.md)
 vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091
 ```
 
+For a local deployment with multiple API frontend processes sharing one set
+of stage engines, add `--api-server-count`:
+
+```bash
+vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --api-server-count 2 --port 8091
+```
+
+This mode currently supports local EngineCore stages. It is not available
+with headless or remote stage deployments, and pure diffusion stages remain
+single-frontend.
+
 The default deployment configuration, situated at `vllm_omni/deploy/qwen3_omni_moe.yaml`, is resolved and loaded
 automatically via the model registry, obviating the `--deploy-config` flag in standard deployment topologies.
 Asynchronous chunk streaming operates as **enabled by default** within this bundled configuration.
@@ -156,7 +167,7 @@ parser defaults). If you don't pass a flag, the YAML value wins.
 > chunked vs end-to-end modes (e.g. qwen3_tts code2wav) dispatch
 > automatically based on that bool — no extra flag or variant yaml is
 > needed.
-
+>
 > ⚠️ **For multi-stage models that share GPUs (qwen3_omni_moe by default
 > shares cuda:1 between stages 1 and 2), avoid using global memory flags.**
 > A global `--gpu-memory-utilization 0.85` would apply to every stage and
@@ -266,68 +277,6 @@ cd examples/online_serving/qwen3_omni
 python examples/online_serving/openai_chat_completion_client_for_multimodal_generation.py --model Qwen/Qwen3-Omni-30B-A3B-Instruct --query-type use_image --port 8091 --host "localhost"
 ```
 
-#### Realtime WebSocket client (`openai_realtime_client.py`)
-
-[`openai_realtime_client.py`](./openai_realtime_client.py) connects to **`ws://<host>:<port>/v1/realtime`**, streams a local WAV as **PCM16 mono @ 16 kHz** in fixed-size chunks, and receives **`response.output_audio.*`**, **`response.output_text.*`**, and transcript events. By default it uses explicit `input_audio_buffer.commit`; pass **`--server-vad`** to let the server detect speech endpoints and commit the turn automatically. The client concatenates audio deltas and writes **`--output-wav`** (model output is typically **24 kHz**). Optional **`--delta-dump-dir`** saves each delta as `delta_000001.wav`, … for debugging.
-
-Streaming input works well for translation-style use cases; if the Thinker runs while input is still incomplete, consider limiting **`max_tokens`** in your session / server defaults to avoid over-generation.
-
-**Dependencies:**
-
-```bash
-pip install websockets
-```
-
-**From this directory** (`examples/online_serving/qwen3_omni`):
-
-```bash
-python openai_realtime_client.py \
-  --url ws://localhost:8091/v1/realtime \
-  --model Qwen/Qwen3-Omni-30B-A3B-Instruct \
-  --input-wav /path/to/input_16k_mono.wav \
-  --output-wav realtime_output.wav \
-  --server-vad \
-  --delta-dump-dir ./rt_delta_wavs
-```
-
-**Arguments:**
-
-| Flag | Default | Description |
-| ------ | --------- | ------------- |
-| `--url` | `ws://localhost:8091/v1/realtime` | Full WebSocket URL including path |
-| `--model` | `Qwen/Qwen3-Omni-30B-A3B-Instruct` | Must match the served model (sent in `session.update`) |
-| `--input-wav` | *(required)* | Input WAV: mono, 16-bit PCM, **16 kHz** |
-| `--output-wav` | `realtime_output.wav` | Output path for concatenated reply audio |
-| `--output-text` | *(optional)* | If set, write final transcription text to this path |
-| `--chunk-ms` | `200` | Size of each uploaded audio chunk (milliseconds of audio) |
-| `--send-delay-ms` | `0` | Delay between chunk sends (simulate realtime upload) |
-| `--delta-dump-dir` | *(optional)* | Directory to write per-`response.output_audio.delta` WAV files |
-| `--server-vad` | disabled | Enable server-side Silero VAD instead of sending explicit commits |
-| `--num-requests` | `1` | Number of sequential sessions (see `--concurrency`) |
-| `--concurrency` | `1` | Max concurrent WebSocket sessions when `--num-requests` > 1 |
-
-Server VAD uses the pinned Silero v6.2 ONNX artifact from `istupakov/silero-vad-onnx` and never downloads model files while processing a session. Make the artifact available in the Hugging Face cache before startup, or configure a local artifact in the deployment YAML:
-
-```yaml
-duplex_session:
-  server_vad_model_path: /models/silero_vad.onnx
-```
-
-Start from the bundled Qwen3-Omni deployment YAML, add the fields above at the top level, and serve that complete configuration:
-
-```bash
-cp vllm_omni/deploy/qwen3_omni_moe.yaml /path/to/qwen3_omni_server_vad.yaml
-# Edit /path/to/qwen3_omni_server_vad.yaml and add duplex_session.
-vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct \
-  --omni \
-  --port 8091 \
-  --deploy-config /path/to/qwen3_omni_server_vad.yaml
-```
-
-Keep Qwen's default `session_mode: turn`; `duplex_session` enables the Realtime handler without changing scheduler
-semantics. Bare `/v1/realtime` selects that handler. The client uses `?duplex=0` only for the existing non-Server-VAD
-wire flow; `?duplex=1` remains a supported compatibility alias.
-
 The Python client supports the following command-line arguments:
 
 - `--query-type` (or `-q`): Query type (default: `use_video`). Options: `text`, `use_audio`, `use_image`, `use_video`
@@ -353,6 +302,13 @@ python examples/online_serving/openai_chat_completion_client_for_multimodal_gene
 ```bash
 bash run_curl_multimodal_generation.sh use_image
 ```
+
+### Realtime WebSocket
+
+The [shared Realtime UI](../realtime_web/README.md#qwen3-explicit-turn-realtime)
+supports explicit turns through `/v1/realtime?duplex=0`. The
+[Server VAD setup](../realtime_web/README.md#qwen3-with-server-vad-automatic-turns)
+uses the duplex endpoint.
 
 ### FAQ
 
@@ -573,3 +529,31 @@ The gradio script supports the following arguments:
 - `--ip`: Host/IP for Gradio server (default: 127.0.0.1)
 - `--port`: Port for Gradio server (default: 7861)
 - `--share`: Share the Gradio demo publicly (creates a public link)
+
+## Browser voice call (shared realtime UI)
+
+Run these commands from the repository root with the vLLM-Omni environment activated.
+
+### With VAD: automatically submit after silence
+
+Start the backend with a Server VAD deployment overlay and a compatible Silero
+ONNX artifact, following the
+[complete VAD setup](../realtime_web/README.md#qwen3-with-server-vad-automatic-turns).
+After its health check succeeds, start the UI:
+
+```bash
+python -m examples.online_serving.realtime_web --profile qwen3-turn \
+    --backend ws://127.0.0.1:8091 --vad --port 7863
+```
+
+Speak and pause for 500 ms to submit automatically. `--vad` configures the client;
+it does not load a VAD model or change the backend deployment by itself.
+
+VAD mode keeps uploading audio during replies and supports speech interruption.
+The engine-owned Qwen duplex plugin maintains conversation history and tracks
+played replies through playback acknowledgements. Each committed utterance starts
+a new generation request; the model does not use native streaming-input KV decoding.
+In VAD mode, click **Camera** to upload sampled frames with your spoken question;
+see [camera setup and limits](../realtime_web/README.md#qwen-vad-camera-input).
+For explicit turns, use `--manual` with the shared UI as described in the
+[shared UI guide](../realtime_web/README.md#qwen3-explicit-turn-realtime).

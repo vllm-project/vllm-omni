@@ -16,7 +16,10 @@ from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
-from vllm_omni.diffusion.diffusion_kv.layout import resolve_diffusion_kv_cache_layout
+from vllm_omni.diffusion.diffusion_kv.layout import (
+    get_connector_required_kv_cache_layout,
+    resolve_diffusion_kv_cache_layout,
+)
 from vllm_omni.diffusion.vllm_config import create_diffusion_vllm_config
 from vllm_omni.platforms import current_omni_platform
 
@@ -49,6 +52,7 @@ def build_native_kv_cache_configs(
     layout = resolve_diffusion_kv_cache_layout(
         vllm_config,
         indexes_kv_by_block_stride=indexes_kv_by_block_stride,
+        required_layout=get_connector_required_kv_cache_layout(vllm_config),
     )
     single_type_kv_cache_manager.register_all_kvcache_specs(vllm_config)
     worker_configs = get_kv_cache_configs(vllm_config, worker_specs, available_memory)

@@ -42,6 +42,7 @@ import torch
 from safetensors import safe_open
 from vllm.logger import init_logger
 
+from vllm_omni.diffusion.offloader.config import offload_enabled, resolve_offload_strategy
 from vllm_omni.diffusion.sched.sigma_schedule import DMD2SigmaSchedule
 from vllm_omni.errors import OmniClientError
 from vllm_omni.platforms import current_omni_platform
@@ -102,6 +103,7 @@ _MODEL_LEVEL_TARGETS = {
     "time_embedder.linear_2": "time_embedder.proj_out",
     "norm_out.linear": "final_layer.adaln_proj.linear",
     "norm_out.norm": "final_layer.norm",
+    "token_refiner.final_norm": "token_refiner.final_norm",
 }
 
 # Per-block adapter suffix -> (native suffix, how a delta enters the native
@@ -115,6 +117,8 @@ _BLOCK_TARGETS = {
     "attn.to_v": ("attn.qkv_proj", _QKV_V),
     "attn.to_out.0": ("attn.out_proj", _PLAIN),
     "attn.to_gate_compress": ("attn.to_gate_compress", _PLAIN),
+    "attn.norm_q": ("attn.q_norm", _PLAIN),
+    "attn.norm_k": ("attn.k_norm", _PLAIN),
     "ff.net.0.proj": ("mlp.fc1", _SWAP_HALVES),
     "ff.net.2": ("mlp.fc2", _PLAIN),
     "adaln_proj.linear": ("adaln_proj.linear", _PLAIN),
@@ -605,19 +609,14 @@ class FastH3WeightFusion:
         """Hold a starting server to the ladder this student was trained on."""
         if partition == "ref2va":
             raise ValueError("FastH3 preview v1 distills T2VA only, so it cannot serve a Ref2VA partition")
-        offloads = [
-            flag
-            for flag in ("enable_cpu_offload", "enable_layerwise_offload", "enable_distributed_layerwise_offload")
-            if getattr(od_config, flag, False)
-        ]
-        if offloads:
+        if offload_enabled(od_config):
             # A host-weight plan installs the transformer without going through
             # load_weights(), which is where the fusion and its completeness
             # check live. Serving base H3 weights under a four-step schedule
             # would otherwise degrade output with nothing to signal it.
             raise ValueError(
-                f"FastH3 is fused while the checkpoint streams in, so it cannot be combined with "
-                f"{sorted(offloads)}. Serve it without offload."
+                "FastH3 is fused while the checkpoint streams in, so it cannot be combined with "
+                f"{resolve_offload_strategy(od_config).value} offload. Serve it without offload."
             )
         if self.requires_vsa:
             backend = _resolve_dit_attention_backend(od_config)

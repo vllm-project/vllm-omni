@@ -14,12 +14,10 @@ from pathlib import Path
 
 import soundfile as sf
 import torch
-from transformers import AutoConfig
+from transformers import AutoTokenizer
 
 from vllm_omni import Omni
-from vllm_omni.model_executor.models.breeze_tts_2.prompt_builder import (
-    BreezeTTS2PromptBuilder,
-)
+from vllm_omni.model_executor.models.breeze_tts_2.prompt import DEFAULT_INSTRUCTION, build_breeze_prompt
 from vllm_omni.utils.tracking_parser import TrackingArgumentParser
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
@@ -95,8 +93,7 @@ def resolve_template(args) -> str:
 def reference_payload(ref_audio_path: str | None) -> dict:
     """Load the reference clip into the payload keys the prompt builder reads.
 
-    ``BreezeTTS2PromptBuilder`` consumes ``ref_audio`` (a waveform) plus
-    ``ref_audio_sample_rate``; a bare path field is not read.
+    The prompt helper consumes a waveform and its sample rate.
     """
     if ref_audio_path is None:
         return {}
@@ -107,36 +104,17 @@ def reference_payload(ref_audio_path: str | None) -> dict:
 
 
 def build_prompt(args) -> dict:
-    config = AutoConfig.from_pretrained(args.model, trust_remote_code=True)
-    reference_encoder = None
-    if args.ref_audio is not None:
-        from vllm_omni.model_executor.models.breeze_tts_2.audio_tokenizer import (
-            BreezeReferenceAudioTokenizer,
-        )
-
-        reference_encoder = BreezeReferenceAudioTokenizer.from_pretrained(
-            args.model,
-            num_codebooks=int(getattr(config, "num_codebooks", 16)),
-            device_map="cpu",
-        )
-    builder = BreezeTTS2PromptBuilder.from_pretrained(
-        args.model,
-        config,
-        reference_audio_encoder=reference_encoder,
+    tokenizer = AutoTokenizer.from_pretrained(args.model)
+    payload = reference_payload(args.ref_audio)
+    reference = (payload["ref_audio"], payload["ref_audio_sample_rate"]) if payload else None
+    return build_breeze_prompt(
+        tokenizer,
+        args.text,
+        DEFAULT_INSTRUCTION if args.instruction is None else args.instruction,
+        speaker=args.voice,
+        ref_audio=reference,
+        ref_text=args.ref_text,
     )
-    payload = {
-        "text": args.text,
-        "speaker": args.voice,
-        **reference_payload(args.ref_audio),
-    }
-    if args.instruction:
-        payload["instruction"] = args.instruction
-    if args.ref_text:
-        payload["ref_text"] = args.ref_text
-    prompt = builder.build(payload, template=resolve_template(args))
-    if args.max_new_tokens is not None:
-        prompt["additional_information"]["breeze_max_new_frames"] = int(args.max_new_tokens)
-    return prompt
 
 
 def extract_audio(multimodal_output: dict) -> torch.Tensor:
@@ -180,7 +158,12 @@ def main():
     print(f"Prompt len  : {len(prompt['prompt_token_ids'])} tokens")
 
     t_start = time.perf_counter()
-    outputs = engine.generate([prompt])
+    if args.max_new_tokens is not None:
+        sampling = [params.clone() for params in engine.resolve_sampling_params_list(None)]
+        sampling[0].max_tokens = args.max_new_tokens
+        outputs = engine.generate([prompt], sampling_params_list=sampling)
+    else:
+        outputs = engine.generate([prompt])
     elapsed = time.perf_counter() - t_start
 
     request_output = outputs[0]
