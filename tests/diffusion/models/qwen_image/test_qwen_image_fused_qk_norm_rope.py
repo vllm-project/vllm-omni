@@ -265,7 +265,7 @@ def _joint_reference(txt: QwenImageQKInput, img: QwenImageQKInput, *, use_fused:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("txt_len,img_len", [(512, 4096), (77, 1024)])
-def test_joint_launch_matches_per_stream_then_cat(txt_len, img_len):
+def test_joint_launch_matches_per_stream_then_cat(txt_len, img_len, force_always_fuse):
     """The joint op replaces two per-stream launches plus three cats; its Q/K
     must equal the per-stream fused path's, bitwise."""
     from vllm_omni.diffusion.layers.fused_qk_norm_rope import fused_joint_qkv_norm_rope
