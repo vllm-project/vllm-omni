@@ -12,7 +12,12 @@ from vllm.inputs import EmbedsPrompt, PromptType, TextPrompt, TokensPrompt
 from vllm.inputs.engine import TokensInput
 from vllm.sampling_params import SamplingParams
 
-from vllm_omni.diffusion.attention.schedule import AttentionSchedule, parse_attention_schedule
+from vllm_omni.diffusion.attention.schedule import (
+    AttentionSchedule,
+    AttentionSigmaSchedule,
+    parse_attention_schedule,
+    parse_attention_sigma_schedule,
+)
 from vllm_omni.lora.request import LoRARequest
 
 DIFFUSION_QUALITY_LEVELS: tuple[str, ...] = ("lossless", "high")
@@ -274,6 +279,7 @@ class OmniDiffusionSamplingParams:
     boundary_ratio: float | None = None
     # None inherits the service default; an empty schedule disables it.
     attention_schedule: AttentionSchedule | list[dict[str, Any]] | None = None
+    attention_sigma_schedule: AttentionSigmaSchedule | list[dict[str, Any]] | None = None
 
     # Scheduler parameters – ``None`` means "not explicitly set by the caller";
     # each pipeline's ``forward()`` decides its own model-specific default.
@@ -361,6 +367,7 @@ class OmniDiffusionSamplingParams:
         if self.quality is not None and self.quality not in DIFFUSION_QUALITY_LEVELS:
             raise ValueError(f"quality must be one of {list(DIFFUSION_QUALITY_LEVELS)}, got {self.quality!r}")
         self.attention_schedule = parse_attention_schedule(self.attention_schedule)
+        self.attention_sigma_schedule = parse_attention_sigma_schedule(self.attention_sigma_schedule)
         absorb_attention_schedule_extra_args(self)
 
     @property
@@ -434,18 +441,31 @@ def absorb_attention_schedule_extra_args(params: OmniDiffusionSamplingParams, *,
     A null value means the same as leaving the key out, so the typed field keeps its value.
     """
     extra = getattr(params, "extra_args", None) or {}
-    if "attention_schedule" not in extra:
-        return
-    extra_schedule = parse_attention_schedule(extra["attention_schedule"])
-    schedule = getattr(params, "attention_schedule", None)
-    if extra_schedule is not None:
-        if not override:
-            current = parse_attention_schedule(schedule)
-            if current is not None and current != extra_schedule:
-                raise ValueError("conflicting attention_schedule values in sampling params and extra_args")
-        schedule = extra_schedule
-    params.attention_schedule = schedule
-    params.extra_args = {key: value for key, value in extra.items() if key != "attention_schedule"}
+    consumed = set()
+    if "attention_schedule" in extra:
+        extra_schedule = parse_attention_schedule(extra["attention_schedule"])
+        schedule = getattr(params, "attention_schedule", None)
+        if extra_schedule is not None:
+            if not override:
+                current = parse_attention_schedule(schedule)
+                if current is not None and current != extra_schedule:
+                    raise ValueError("conflicting attention_schedule values in sampling params and extra_args")
+            schedule = extra_schedule
+        params.attention_schedule = schedule
+        consumed.add("attention_schedule")
+    if "attention_sigma_schedule" in extra:
+        extra_sigma = parse_attention_sigma_schedule(extra["attention_sigma_schedule"])
+        sigma = getattr(params, "attention_sigma_schedule", None)
+        if extra_sigma is not None:
+            if not override:
+                current_sigma = parse_attention_sigma_schedule(sigma)
+                if current_sigma is not None and current_sigma != extra_sigma:
+                    raise ValueError("conflicting attention_sigma_schedule values in sampling params and extra_args")
+            sigma = extra_sigma
+        params.attention_sigma_schedule = sigma
+        consumed.add("attention_sigma_schedule")
+    if consumed:
+        params.extra_args = {key: value for key, value in extra.items() if key not in consumed}
 
 
 OmniSamplingParams: TypeAlias = SamplingParams | OmniDiffusionSamplingParams

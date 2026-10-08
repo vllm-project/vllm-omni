@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import importlib
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -13,10 +13,20 @@ import vllm_omni.diffusion.attention.layer as layer_mod
 from tests.diffusion.attention.test_attention_schedule_candidates import _fake_resolve, _FakeImpl, _make_config
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.attention.parallel.base import NoParallelAttention
-from vllm_omni.diffusion.attention.schedule import AttentionScheduleRange, InvalidAttentionScheduleError
+from vllm_omni.diffusion.attention.schedule import (
+    AttentionScheduleRange,
+    AttentionSigmaWindow,
+    InvalidAttentionScheduleError,
+)
 from vllm_omni.diffusion.config import set_current_diffusion_config
 from vllm_omni.diffusion.data import AttentionConfig, AttentionScheduleConfig, AttentionSpec
-from vllm_omni.diffusion.forward_context import bind_attention_schedule, get_forward_context, set_forward_context
+from vllm_omni.diffusion.forward_context import (
+    bind_attention_schedule,
+    bind_attention_sigma_schedule,
+    get_forward_context,
+    is_forward_context_available,
+    set_forward_context,
+)
 from vllm_omni.diffusion.media import VideoTensorEncoding, VideoTensorLayout, VideoValueRange
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import Wan22Pipeline, build_wan_scheduler
 from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import WanSelfAttention
@@ -742,10 +752,15 @@ class _StubDMDScheduler:
         return clean_sample + 10.0
 
 
-def test_diffuse_dmd_predicts_clean_and_renoises_between_steps(monkeypatch) -> None:
+@pytest.mark.parametrize("scope", ["no-context", "unbound", "disabled", "step-only", "sigma"])
+def test_diffuse_dmd_predicts_clean_and_renoises_between_steps(monkeypatch, scope) -> None:
     pipeline = _make_pipeline()
     pipeline.is_dmd = True
     pipeline.scheduler = _StubDMDScheduler()
+    # Only sigma scheduling needs a training-time scale. All other paths must
+    # retain C1 behavior with this scheduler, which deliberately has no config.
+    if scope == "sigma":
+        pipeline.scheduler.config = SimpleNamespace(num_train_timesteps=1000)  # type: ignore[attr-defined]
     latents = torch.zeros((1, 1, 1, 1, 1), dtype=torch.float32)
     timesteps = torch.tensor([1000.0, 757.0, 522.0])
 
@@ -755,18 +770,34 @@ def test_diffuse_dmd_predicts_clean_and_renoises_between_steps(monkeypatch) -> N
         lambda *args, **kwargs: torch.full(args[0], 2.0, dtype=kwargs["dtype"]),
     )
 
-    result = pipeline.diffuse(
-        latents=latents,
-        timesteps=timesteps,
-        prompt_embeds=torch.zeros(1, 8),
-        negative_prompt_embeds=None,
-        guidance_low=1.0,
-        guidance_high=1.0,
-        boundary_timestep=None,
-        dtype=torch.float32,
-        attention_kwargs={},
-        generator=torch.Generator(device="cpu").manual_seed(1),
-    )
+    published = []
+
+    def predict(**kwargs):
+        published.append(get_forward_context().denoise_sigma if is_forward_context_available() else None)
+        return torch.ones_like(latents)
+
+    pipeline.predict_noise_maybe_with_cfg = predict
+    with (
+        set_forward_context() if scope != "no-context" else nullcontext(),
+        bind_attention_sigma_schedule((AttentionSigmaWindow(0.0, 1.0, "p"),))
+        if scope == "sigma"
+        else (bind_attention_sigma_schedule(()) if scope == "disabled" else nullcontext()),
+        bind_attention_schedule((AttentionScheduleRange(0, None, "p"),)) if scope == "step-only" else nullcontext(),
+    ):
+        result = pipeline.diffuse(
+            latents=latents,
+            timesteps=timesteps,
+            prompt_embeds=torch.zeros(1, 8),
+            negative_prompt_embeds=None,
+            guidance_low=1.0,
+            guidance_high=1.0,
+            boundary_timestep=None,
+            dtype=torch.float32,
+            attention_kwargs={},
+            generator=torch.Generator(device="cpu").manual_seed(1),
+        )
+    expected_sigmas: list[float | None] = [1.0, 0.757, 0.522] if scope == "sigma" else [None] * 3
+    assert published == expected_sigmas
 
     assert pipeline.scheduler.predict_clean_calls == [
         (1.0, 0.0, 1000.0),

@@ -82,6 +82,7 @@ from vllm_omni.diffusion.forward_context import (
     get_paged_kv_computed_tokens,
     is_forward_context_available,
     paged_kv_prefill,
+    set_forward_context_denoise_sigma,
     set_forward_context_denoise_step_idx,
 )
 from vllm_omni.diffusion.layers.fused_moe import FusedMoE
@@ -2683,13 +2684,13 @@ def _clear_denoise_progress_on_exit():
     restore assigns the values those fields already hold.
     """
     ctx = get_forward_context() if is_forward_context_available() else None
-    previous = (ctx.denoise_timestep, ctx.total_denoise_steps) if ctx is not None else (None, None)
+    previous = (ctx.denoise_timestep, ctx.total_denoise_steps, ctx.denoise_sigma) if ctx is not None else (None,) * 3
     try:
         yield
     finally:
         set_forward_context_denoise_step_idx(None)
         if ctx is not None:
-            ctx.denoise_timestep, ctx.total_denoise_steps = previous
+            ctx.denoise_timestep, ctx.total_denoise_steps, ctx.denoise_sigma = previous
 
 
 class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
@@ -3319,6 +3320,7 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
             for i, t in enumerate(timesteps):
                 if scheduled_total is None:
                     set_forward_context_denoise_step_idx(i)
+                    set_forward_context_denoise_sigma(None)
                 else:
                     self.model.record_denoise_step(i, t, scheduler=self.scheduler, total_steps=scheduled_total)
                 if cfg_parallel_ready:

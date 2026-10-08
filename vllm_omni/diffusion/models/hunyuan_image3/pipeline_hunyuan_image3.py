@@ -2375,7 +2375,8 @@ class HunyuanImage3Pipeline(
             )
         # A bound schedule selects attention from each request's own step and total, so requests
         # run one at a time and the batch-wide backend check, which reads the baseline config, is skipped.
-        scheduled = is_forward_context_available() and bool(get_forward_context().attention_schedule)
+        ctx = get_forward_context() if is_forward_context_available() else None
+        scheduled = bool(getattr(ctx, "attention_schedule", None) or getattr(ctx, "attention_sigma_schedule", None))
         if scheduled:
             groups = [[state] for state in states]
         else:
@@ -2400,7 +2401,11 @@ class HunyuanImage3Pipeline(
             float(cast(torch.Tensor, state.current_timestep))
             / cast(FlowMatchEulerDiscreteScheduler, state.scheduler).config.num_train_timesteps
         )
-        return request_denoise_progress(state.step_index, state.total_steps, timestep)
+        from vllm_omni.diffusion.attention.schedule import normalized_sigma
+
+        sigmas = getattr(state.scheduler, "sigmas", None)
+        sigma = normalized_sigma(float(sigmas[state.step_index]), float(sigmas[0])) if sigmas is not None else None
+        return request_denoise_progress(state.step_index, state.total_steps, timestep, sigma=sigma)
 
     def step_scheduler(
         self,

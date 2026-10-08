@@ -29,6 +29,7 @@ from vllm_omni.diffusion import envs
 from vllm_omni.diffusion.attention.schedule import (
     InvalidAttentionScheduleError,
     require_request_attention_schedule_fits,
+    validate_request_attention_sigma_schedule,
 )
 from vllm_omni.diffusion.cache.cachedit import (
     CacheDiTBackend,
@@ -3016,6 +3017,9 @@ class MiniMaxH3Pipeline(
         attention_schedule = require_request_attention_schedule_fits(
             SimpleNamespace(sampling_params=sampling), self.od_config, num_steps
         )
+        sigma_schedule = validate_request_attention_sigma_schedule(
+            SimpleNamespace(sampling_params=sampling), self.od_config
+        )
         transformer = getattr(
             self, "transformers_ref" if task == "ref2va" and hasattr(self, "transformers_ref") else "transformer", None
         )
@@ -3042,12 +3046,13 @@ class MiniMaxH3Pipeline(
         )
         if continuation is not None and quality_plan.cache_dit is not None:
             raise OmniClientError("MiniMax H3 continuation requires uncached denoising; set quality=lossless")
-        if attention_schedule and quality_plan.cache_dit is not None:
+        if (attention_schedule or sigma_schedule) and quality_plan.cache_dit is not None:
             # Cache-DiT reuses transformer outputs across steps, so a cached residual can come from a step
             # that ran a different attention profile. Reject before its hooks are installed.
+            field = "attention_sigma_schedule" if sigma_schedule else "attention_schedule"
             raise InvalidAttentionScheduleError(
-                "attention_schedule cannot be combined with MiniMax H3 Cache-DiT (quality=high, or an omitted "
-                "quality on a server started with Cache-DiT); send quality=lossless or attention_schedule=[]"
+                f"{field} cannot be combined with MiniMax H3 Cache-DiT (quality=high, or an omitted "
+                f"quality on a server started with Cache-DiT); send quality=lossless or {field}=[]"
             )
         if attention_schedule and self._resolve_latent_refine(extra) is not None:
             # latent_refine runs a second denoise sequence over the tail of the sigma list. It publishes step
@@ -3466,7 +3471,8 @@ class MiniMaxH3Pipeline(
         ]
         progress = set(request_progress)
         minimax_h3_publish_denoise_progress(*(progress.pop() if len(progress) == 1 else (None, None, None)))
-        scheduled = is_forward_context_available() and bool(getattr(get_forward_context(), "attention_schedule", None))
+        ctx = get_forward_context() if is_forward_context_available() else None
+        scheduled = bool(getattr(ctx, "attention_schedule", None) or getattr(ctx, "attention_sigma_schedule", None))
 
         if len(batch_states) > 1 and (
             scheduled or mixed_transformers or not self._packed_batch_supported(transformers[0])
@@ -3519,7 +3525,11 @@ class MiniMaxH3Pipeline(
                 # backend isolates packed requests. The batch-level progress published
                 # above is restored after each forward, including when it raises.
                 step, sigma_video, total_steps = request_progress[index]
-                with request_denoise_progress(step, total_steps, sigma_video) if scheduled else nullcontext():
+                with (
+                    request_denoise_progress(step, total_steps, sigma_video, sigma=sigma_video)
+                    if scheduled
+                    else nullcontext()
+                ):
                     request_video, request_audio = transformers[index](**forward_kwargs)
                 video_parts.append(request_video)
                 audio_parts.append(request_audio)

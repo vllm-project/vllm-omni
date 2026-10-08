@@ -14,9 +14,16 @@ from tests.diffusion.attention.test_attention_schedule_candidates import _make_m
 from vllm_omni.diffusion.attention.schedule import (
     AttentionScheduleRange,
     InvalidAttentionScheduleError,
+    parse_attention_sigma_schedule,
 )
 from vllm_omni.diffusion.data import AttentionConfig, AttentionSpec
-from vllm_omni.diffusion.forward_context import bind_attention_schedule, get_forward_context, set_forward_context
+from vllm_omni.diffusion.forward_context import (
+    bind_attention_schedule,
+    bind_attention_sigma_schedule,
+    get_forward_context,
+    set_forward_context,
+    set_forward_context_denoise_sigma,
+)
 from vllm_omni.diffusion.models.hunyuan_image3.hunyuan_image3_tokenizer import TokenizerEncodeOutput
 from vllm_omni.diffusion.models.hunyuan_image3.hunyuan_image3_transformer import (
     HunyuanImage3Text2ImagePipeline,
@@ -671,6 +678,33 @@ def test_scheduled_step_restores_context_when_second_request_fails(monkeypatch):
     assert after == (None, 99, 0.9, False)
 
 
+def test_equal_step_requests_publish_their_own_scheduler_noise(monkeypatch):
+    records: list = []
+    pipeline = _recording_step_pipeline(monkeypatch, records)
+    low = _scheduled_state("req-low", 1, 4, 1.0)
+    high = _scheduled_state("req-high", 1, 4, 2.0)
+    low.scheduler.sigmas = [1.0, 0.2, 0.0]
+    high.scheduler.sigmas = [1.0, 0.8, 0.0]
+    windows = parse_attention_sigma_schedule([{"low": 0.0, "high": 1.0, "profile": "all"}])
+
+    def capture(images, first_step):
+        del first_step
+        ctx = get_forward_context()
+        records.append((ctx.denoise_step_idx, ctx.denoise_sigma, ctx.denoise_timestep))
+        return {"diffusion_prediction": images * 10.0}
+
+    pipeline.forward_call = capture
+    with set_forward_context(), bind_attention_sigma_schedule(windows):
+        ctx = get_forward_context()
+        set_forward_context_denoise_sigma(0.9)
+        out = pipeline.denoise_step(InputBatch.make_batch([high, low]))
+        assert ctx.denoise_sigma == 0.9
+        assert ctx.denoise_step_idx is None
+
+    assert records == [(1, 0.8, 0.3), (1, 0.2, 0.3)]
+    torch.testing.assert_close(out, torch.tensor([[20.0], [10.0]]))
+
+
 class _FakeFlowScheduler:
     order = 1
     config = SimpleNamespace(num_train_timesteps=1000)
@@ -756,6 +790,36 @@ def test_request_loop_publishes_actual_total_and_timestep_when_scheduled(monkeyp
         ("forward", 3, 4, 0.1, True, False),
     ]
     assert after == (None, None, None, False)
+
+
+def test_request_loop_publishes_scheduler_noise_independently_of_timestep(monkeypatch):
+    events: list = []
+    published: list = []
+    pipe = _request_mode_pipeline(monkeypatch, num_steps=4, events=events)
+    pipe.scheduler.sigmas = [1.0, 0.8, 0.2, 0.0]
+    windows = parse_attention_sigma_schedule([{"low": 0.0, "high": 1.0, "profile": "all"}])
+
+    def capture(images, first_step):
+        del first_step
+        ctx = get_forward_context()
+        published.append((ctx.denoise_step_idx, ctx.denoise_sigma, ctx.denoise_timestep))
+        if ctx.denoise_step_idx == 1:
+            raise RuntimeError("forward failed")
+        return {"diffusion_prediction": torch.zeros_like(images)}
+
+    pipe.model.forward_call = capture
+    with set_forward_context(), bind_attention_sigma_schedule(windows):
+        ctx = get_forward_context()
+        set_forward_context_denoise_sigma(0.9)
+        with pytest.raises(RuntimeError, match="forward failed"):
+            _run_request_loop(pipe)
+        assert ctx.denoise_sigma == 0.9
+        assert ctx.denoise_step_idx is None
+
+    # The fixture records setup events in events. Noise publication is separate.
+    assert events[:2] == ["prepare_latents", "ar_kv_reuse"]
+    # Timesteps are 0.4 then 0.3; noise comes from scheduler.sigmas, not that fraction.
+    assert published == [(0, 1.0, 0.4), (1, 0.8, 0.3)]
 
 
 def test_request_loop_rejects_schedule_past_actual_steps_before_any_forward(monkeypatch):
