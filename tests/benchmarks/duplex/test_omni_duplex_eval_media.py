@@ -93,7 +93,7 @@ class TestVideoThreadType:
         """HEVC selects SLICE; a non-HEVC stream keeps AUTO."""
         mpeg4_path = tmp_path / "mpeg4.mp4"
         mpeg4_path.write_bytes(_make_synthetic_mp4())
-        hevc_path = Path(__file__).resolve().parent / "data" / "hevc_3frame.mp4"
+        hevc_path = Path(__file__).resolve().parent / "hevc_3frame.mp4"
 
         with av.open(str(mpeg4_path)) as container:
             mpeg4_stream = container.streams.video[0]
