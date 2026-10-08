@@ -45,8 +45,10 @@ logger = init_logger(__name__)
 BatchSamplingParamsKey = StepBatchSamplingParamsKey | RequestBatchSamplingParamsKey
 
 # LoRA identity and execution mode are request-owned rather than same-named
-# sampling-param fields, so they must be resolved separately from the bulk lookup.
+# sampling-param fields, and the attention schedule is normalized first, so
+# they must be resolved separately from the bulk lookup.
 _STEP_BATCH_SAMPLING_PARAMS_KEY_FIELD_NAMES = frozenset(field.name for field in fields(StepBatchSamplingParamsKey)) - {
+    "attention_schedule",
     "condition_key",
     "lora_int_id",
     "use_step_execution",
@@ -154,6 +156,22 @@ class BaseScheduler(ABC):
         return self._add_request_with_request_id(request.request_id, request)
 
     def _add_request_with_request_id(self, request_id: str, request: OmniDiffusionRequest) -> str:
+        from vllm_omni.diffusion.attention.schedule import (
+            InvalidAttentionScheduleError,
+            validate_request_attention_schedule,
+        )
+        from vllm_omni.inputs.data import absorb_attention_schedule_extra_args
+
+        try:
+            # A schedule written into extra_args after construction reaches here unabsorbed on the
+            # inline stage client, whose clone() does not re-run __post_init__; the subprocess client
+            # rebuilds the params and absorbs it. Normalize here so topology cannot change the result.
+            sampling = getattr(request, "sampling_params", None)
+            if sampling is not None:
+                absorb_attention_schedule_extra_args(sampling)
+            validate_request_attention_schedule(request, getattr(self, "od_config", None))
+        except (TypeError, ValueError) as exc:
+            raise InvalidAttentionScheduleError(str(exc)) from exc
         if request_id in self._request_states or request_id in self._kv_draining_requests:
             raise ValueError(f"request_id {request_id!r} is already active.")
         state = self._make_request_state(request_id, request)
@@ -728,11 +746,16 @@ class BaseScheduler(ABC):
         sampling = request.sampling_params
         # LoRA identity is optional on sampling params (and on test stubs).
         lora_request = getattr(sampling, "lora_request", None)
+        from vllm_omni.diffusion.attention.schedule import parse_attention_schedule
+
+        key_kwargs = {name: getattr(sampling, name) for name in _STEP_BATCH_SAMPLING_PARAMS_KEY_FIELD_NAMES}
+        attention_schedule = parse_attention_schedule(getattr(sampling, "attention_schedule", None))
         return StepBatchSamplingParamsKey(
             condition_key=getattr(request, "batch_compatibility_key", None),
             lora_int_id=lora_request.lora_int_id if lora_request is not None else None,
             use_step_execution=getattr(request, "use_step_execution", True),
-            **{name: getattr(sampling, name) for name in _STEP_BATCH_SAMPLING_PARAMS_KEY_FIELD_NAMES},
+            attention_schedule=attention_schedule,
+            **key_kwargs,
         )
 
 

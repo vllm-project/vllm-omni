@@ -12,6 +12,7 @@ from vllm.inputs import EmbedsPrompt, PromptType, TextPrompt, TokensPrompt
 from vllm.inputs.engine import TokensInput
 from vllm.sampling_params import SamplingParams
 
+from vllm_omni.diffusion.attention.schedule import AttentionSchedule, parse_attention_schedule
 from vllm_omni.lora.request import LoRARequest
 
 DIFFUSION_QUALITY_LEVELS: tuple[str, ...] = ("lossless", "high")
@@ -271,6 +272,8 @@ class OmniDiffusionSamplingParams:
     timestep: torch.Tensor | float | int | None = None
     step_index: int | None = None
     boundary_ratio: float | None = None
+    # None inherits the service default; an empty schedule disables it.
+    attention_schedule: AttentionSchedule | list[dict[str, Any]] | None = None
 
     # Scheduler parameters – ``None`` means "not explicitly set by the caller";
     # each pipeline's ``forward()`` decides its own model-specific default.
@@ -357,6 +360,8 @@ class OmniDiffusionSamplingParams:
     def __post_init__(self) -> None:
         if self.quality is not None and self.quality not in DIFFUSION_QUALITY_LEVELS:
             raise ValueError(f"quality must be one of {list(DIFFUSION_QUALITY_LEVELS)}, got {self.quality!r}")
+        self.attention_schedule = parse_attention_schedule(self.attention_schedule)
+        absorb_attention_schedule_extra_args(self)
 
     @property
     def batch_size(self):
@@ -417,6 +422,30 @@ class OmniDiffusionSamplingParams:
             "Diffusion stage requires OmniDiffusionSamplingParams or vllm.SamplingParams, "
             f"got {type(params).__name__!r}."
         )
+
+
+def absorb_attention_schedule_extra_args(params: OmniDiffusionSamplingParams, *, override: bool = False) -> None:
+    """Move an extra_args schedule onto the typed field without dropping other extra args.
+
+    ``__post_init__`` calls this at construction; ``clone()`` and pickling do not re-run it, so a
+    value written into ``extra_args`` afterwards needs another call. Entrypoints pass
+    ``override=True``: the request value then replaces a schedule that stage default sampling params
+    put on the typed field. Without it both values come from one caller, so a mismatch is rejected.
+    A null value means the same as leaving the key out, so the typed field keeps its value.
+    """
+    extra = getattr(params, "extra_args", None) or {}
+    if "attention_schedule" not in extra:
+        return
+    extra_schedule = parse_attention_schedule(extra["attention_schedule"])
+    schedule = getattr(params, "attention_schedule", None)
+    if extra_schedule is not None:
+        if not override:
+            current = parse_attention_schedule(schedule)
+            if current is not None and current != extra_schedule:
+                raise ValueError("conflicting attention_schedule values in sampling params and extra_args")
+        schedule = extra_schedule
+    params.attention_schedule = schedule
+    params.extra_args = {key: value for key, value in extra.items() if key != "attention_schedule"}
 
 
 OmniSamplingParams: TypeAlias = SamplingParams | OmniDiffusionSamplingParams
