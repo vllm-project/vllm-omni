@@ -19,11 +19,12 @@ python benchmarks/pi05/e2e_latency_pi05.py --host 127.0.0.1 --port 8000 --views 
 ```
 
 ## Model-level latency
+
 Pass `--enforce-eager` to the server to measure the eager baseline.
+
 ```bash
 python benchmarks/pi05/bench_pi05.py --bs 1 --views 3 --warmup 5 --iters 30 --out pi05_bench/
 ```
-
 
 ## Reference results
 
@@ -46,4 +47,3 @@ RTX 5080 16 GB, batch size 1, 3 cameras, 10 steps, 5 warmup:
 | --- | ---: | ---: |
 | float32 | 260.4 ms | 237.7 ms |
 | bfloat16 | 168.3 ms | 114.0 ms |
-
