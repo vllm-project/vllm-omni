@@ -27,6 +27,17 @@ def test_fastvideo_vsa_backend_is_registered():
     assert DiffusionAttentionBackendEnum.FASTVIDEO_VSA.get_path().endswith("fastvideo_vsa.FastVideoVSABackend")
 
 
+def test_auto_keeps_wan_tile256_on_fastvideo(monkeypatch):
+    from vllm_omni.diffusion.attention.ops import flashinfer_block_sparse
+
+    def fail(*args):
+        raise AssertionError("Wan must not probe the FlashInfer tile64 kernel")
+
+    monkeypatch.setattr(flashinfer_block_sparse, "require_flashinfer_sparse", fail)
+    impl = FastVideoVSAImpl(num_heads=2, head_size=128, softmax_scale=128**-0.5)
+    assert impl.provider == "fastvideo" and impl.precision == "bf16"
+
+
 def test_fastvideo_vsa_reports_missing_optional_kernel(monkeypatch):
     monkeypatch.setattr("importlib.util.find_spec", lambda name: None)
     with pytest.raises(ImportError, match="fastvideo-kernel"):
