@@ -87,34 +87,13 @@ def _make_synthetic_ogg(duration: float = 1.0, sample_rate: int = 16000) -> byte
     return buf.getvalue()
 
 
-def _make_synthetic_hevc() -> bytes:
-    """Return a one-frame HEVC MP4 so thread-type tests can open a real stream.
-
-    One 64x64 frame with the ultrafast preset stays under a second on CPU.
-    """
-    buf = io.BytesIO()
-    with av.open(buf, mode="w", format="mp4") as container:
-        stream = container.add_stream("libx265", rate=10)
-        stream.width = 64
-        stream.height = 64
-        stream.pix_fmt = "yuv420p"
-        stream.options = {"preset": "ultrafast", "x265-params": "log-level=error"}
-        frame = av.VideoFrame.from_ndarray(np.zeros((64, 64, 3), dtype=np.uint8), format="rgb24")
-        for packet in stream.encode(frame):
-            container.mux(packet)
-        for packet in stream.encode():
-            container.mux(packet)
-    return buf.getvalue()
-
-
 class TestVideoThreadType:
     @staticmethod
     def test_hevc_uses_slice_and_other_codecs_keep_auto(tmp_path: Path) -> None:
         """HEVC selects SLICE; a non-HEVC stream keeps AUTO."""
         mpeg4_path = tmp_path / "mpeg4.mp4"
-        hevc_path = tmp_path / "hevc.mp4"
         mpeg4_path.write_bytes(_make_synthetic_mp4())
-        hevc_path.write_bytes(_make_synthetic_hevc())
+        hevc_path = Path(__file__).resolve().parent / "data" / "hevc_3frame.mp4"
 
         with av.open(str(mpeg4_path)) as container:
             mpeg4_stream = container.streams.video[0]
