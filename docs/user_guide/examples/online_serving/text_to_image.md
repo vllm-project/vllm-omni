@@ -2,7 +2,6 @@
 
 Source <https://github.com/vllm-project/vllm-omni/tree/main/examples/online_serving/text_to_image>.
 
-
 This example demonstrates how to deploy Qwen-Image model for online image generation service using vLLM-Omni.
 
 ## Start Server
@@ -12,6 +11,7 @@ This example demonstrates how to deploy Qwen-Image model for online image genera
 ```bash
 vllm serve Qwen/Qwen-Image --omni --port 8091
 ```
+
 !!! note
     If you encounter Out-of-Memory (OOM) issues or have limited GPU memory, you can enable VAE slicing and tiling to reduce memory usage, --vae-use-slicing --vae-use-tiling
 
@@ -172,7 +172,7 @@ curl -X POST http://localhost:8091/v1/images/generations \
 
 LoRA adapters must be in PEFT (Parameter-Efficient Fine-Tuning) format. A typical LoRA adapter directory structure:
 
-```
+```text
 lora_adapter/
 ├── adapter_config.json
 └── adapter_model.safetensors

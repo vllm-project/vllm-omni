@@ -20,12 +20,13 @@ from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.openai.api_server import router
 from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+from vllm_omni.outputs import OmniRequestOutput
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 class _DiffusionEngine(AsyncOmni):
-    def __init__(self, output: SimpleNamespace) -> None:
+    def __init__(self, output: OmniRequestOutput) -> None:
         self.engine = SimpleNamespace(
             stage_configs=[SimpleNamespace(stage_type="diffusion")],
             default_sampling_params_list=[OmniDiffusionSamplingParams()],
@@ -33,14 +34,15 @@ class _DiffusionEngine(AsyncOmni):
         self.default_sampling_params_list = self.engine.default_sampling_params_list
         self.output = output
 
-    async def generate(self, **kwargs: Any) -> AsyncGenerator[SimpleNamespace, None]:
+    async def generate(self, **kwargs: Any) -> AsyncGenerator[OmniRequestOutput, None]:
         yield self.output
 
 
 @pytest.fixture(params=["image", "text", "audio"])
 def diffusion_client(request: pytest.FixtureRequest) -> Iterator[TestClient]:
     modality = request.param
-    output = SimpleNamespace(
+    output = OmniRequestOutput.from_diffusion(
+        request_id="test-diffusion",
         final_output_type=modality,
         images=[Image.new("RGB", (16, 16), "blue")] if modality == "image" else [],
         stage_durations={},
@@ -50,7 +52,6 @@ def diffusion_client(request: pytest.FixtureRequest) -> Iterator[TestClient]:
             "audio": torch.zeros(1, 480),
             "sample_rate": 24000,
         },
-        request_output=None,
     )
     engine = _DiffusionEngine(output=output)
     app = FastAPI()
