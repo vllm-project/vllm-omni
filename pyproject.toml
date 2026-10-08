@@ -111,6 +111,11 @@ longcat-video-avatar = [
     "soundfile>=0.13.1",
 ]
 
+# Chatterbox normalizes its reference clip to -27 LUFS, as upstream does.
+chatterbox = [
+    "pyloudnorm==0.1.1",
+]
+
 # Optional Blackwell-only fused-bias FP8 GEMM; package is `quack-kernels` (imported
 # as `quack`), not the unrelated `quack`. See docs/user_guide/quantization/fp8.md.
 quack = [
@@ -231,6 +236,12 @@ ignore = [
 # legacy typing, whitespace, unused-import shims) is exempted. TID251 and the
 # F-correctness rules still apply.
 "vllm_omni/model_executor/models/nemotron_voicechat/nemo_vendored/**" = ["E501", "E721", "E741", "F401", "F841", "I001", "N803", "N814", "UP006", "UP007", "UP008", "UP011", "UP032", "UP035", "W291", "W293"]
+# Chatterbox S3Gen inference modules vendored from resemble-ai/chatterbox
+# (MIT; CosyVoice, ESPnet, Matcha-TTS and 3D-Speaker pieces Apache-2.0). Kept
+# close to upstream so they stay diffable; TID251 and the F-correctness rules
+# still apply.
+"vllm_omni/model_executor/models/chatterbox/s3gen_core/**" = ["E501", "E721", "E741", "F401", "F841", "I001", "N801", "N802", "N803", "N806", "N812", "N814", "UP006", "UP007", "UP008", "UP011", "UP031", "UP032", "UP035", "W291", "W293"]
+"vllm_omni/model_executor/models/chatterbox/voice_encoder.py" = ["E501", "E741", "N803", "N806", "UP006", "UP007", "UP035"]
 "vllm_omni/experimental/fullduplex/joyvl/decision/prompts.py" = ["E501"]  # System/summarizer prompts are long prose lines
 # Kandinsky 6 keeps native/BigVGAN names (T/H/W, `l`) and NVIDIA vocoder
 # docstring length so the port stays diffable against the source modules.
