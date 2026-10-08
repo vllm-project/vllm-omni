@@ -28,7 +28,6 @@ implementation contract; it is not, by itself, a general support claim.
 - [Automatic Prefix Caching in Omni Models](feature/prefix_caching.md)
 - [Model-local KV Caches](feature/model_local_kv_caches.md)
 - [Realtime AR-Diffusion Sessions](feature/realtime_ar_diffusion.md)
-- [Independent Stage Execution](feature/independent_stage_execution.md)
 
 ### Communication
 
