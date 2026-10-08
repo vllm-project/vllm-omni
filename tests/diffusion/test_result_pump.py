@@ -938,3 +938,71 @@ class TestShutdownClearsCompletedOutputs:
         executor.shutdown()
 
         assert executor._completed_outputs == {}
+
+
+@pytest.mark.parametrize("status_code,error_type", [(400, "BadRequestError"), (422, "ScheduleError"), (None, None)])
+def test_async_request_output_preserves_error_metadata(status_code, error_type):
+    executor = _make_executor()
+    output = DiffusionOutput(error="request rejected", error_status_code=status_code, error_type=error_type)
+    message = AsyncDiffusionOutput(
+        kind=AsyncOutputKind.OUTPUT_READY,
+        async_output_id="rejected-request",
+        output=output,
+    )
+    future = executor.wait_output_ready("rejected-request")
+
+    _feed_one_msg_to_pump(executor, message)
+
+    result = future.result(timeout=1)
+    assert result.error == output.error
+    assert result.error_status_code == status_code
+    assert result.error_type == error_type
+
+
+@pytest.mark.parametrize("dp_wave", [False, True])
+@pytest.mark.parametrize("status_code", [400, 422, None])
+def test_request_rpc_exception_keeps_metadata_for_every_request(monkeypatch, mocker, dp_wave, status_code):
+    import vllm_omni.diffusion.executor.multiproc_executor as executor_module
+    from vllm_omni.diffusion.request import OmniDiffusionRequest
+    from vllm_omni.diffusion.sched.interface import CachedRequestData, DiffusionSchedulerOutput, NewRequestData
+    from vllm_omni.errors import OmniClientError
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+    executor = _make_executor()
+    monkeypatch.setattr(executor_module, "any_selected_component_uses_allgather", lambda config: dp_wave)
+    monkeypatch.setattr(executor_module, "_uses_text_encoder_allgather", lambda config: False)
+    error = (
+        OmniClientError("invalid schedule", status_code=status_code, error_type="ScheduleError")
+        if status_code is not None
+        else RuntimeError("worker failed")
+    )
+    executor.collective_rpc = mocker.Mock(side_effect=error)
+    new_reqs = [
+        NewRequestData(
+            request_id=name,
+            req=OmniDiffusionRequest(
+                request_id=name,
+                prompt={"prompt": "a test"},
+                sampling_params=OmniDiffusionSamplingParams(num_inference_steps=4),
+            ),
+        )
+        for name in ("first", "second")
+    ]
+    sched = DiffusionSchedulerOutput(
+        step_id=0,
+        scheduled_new_reqs=new_reqs,
+        scheduled_cached_reqs=CachedRequestData.make_empty(),
+        finished_req_ids=set(),
+        num_running_reqs=len(new_reqs),
+        num_waiting_reqs=0,
+    )
+
+    result = executor.execute_request(sched)
+
+    assert [item.request_id for item in result.runner_outputs] == ["first", "second"]
+    for item in result.runner_outputs:
+        assert item.finished is True
+        assert item.result.error == str(error)
+        assert item.result.error_status_code == status_code
+        assert item.result.error_type == ("ScheduleError" if status_code is not None else None)
+    assert executor.collective_rpc.call_count == (1 if dp_wave else 2)
