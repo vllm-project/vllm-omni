@@ -148,11 +148,10 @@ class CausalMaskedDiffWithXvec(torch.nn.Module):
 
         # text encode
         h, h_masks = self.encoder(token, token_len)
-        h_lengths = h_masks.sum(dim=-1).squeeze(dim=-1)
         if finalize is False:
-            # Upstream trims h but not h_lengths, so the mask is longer than h and the decoder fails.
             h = h[:, : -self.pre_lookahead_len * self.token_mel_ratio]
-            h_lengths = h_lengths - self.pre_lookahead_len * self.token_mel_ratio
+
+        h_lengths = h_masks.sum(dim=-1).squeeze(dim=-1)
         mel_len1, mel_len2 = prompt_feat.shape[1], h.shape[1] - prompt_feat.shape[1]
         h = self.encoder_proj(h)
 

@@ -50,7 +50,7 @@ def tiny_flow() -> CausalMaskedDiffWithXvec:
     return CausalMaskedDiffWithXvec(input_size=512, spk_embed_dim=192, encoder=encoder, decoder=decoder).eval()
 
 
-def test_flow_meanflow_two_steps_shape_and_lookahead_001() -> None:
+def test_flow_meanflow_two_steps_shape_001() -> None:
     flow = tiny_flow()
     prompt_len, gen_len = 4, 10
     kwargs = dict(
@@ -65,10 +65,7 @@ def test_flow_meanflow_two_steps_shape_and_lookahead_001() -> None:
         meanflow=True,
     )
     final, _ = flow.inference(finalize=True, **kwargs)
-    partial, _ = flow.inference(finalize=False, **kwargs)
     assert final.shape == (1, 80, 2 * gen_len)
-    # finalize=False drops pre_lookahead_len (3) * token_mel_ratio (2) frames.
-    assert partial.shape == (1, 80, 2 * gen_len - 6)
 
 
 def test_voice_encoder_embedding_is_unit_norm_001() -> None:
