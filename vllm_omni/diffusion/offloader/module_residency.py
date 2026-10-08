@@ -199,9 +199,15 @@ class PinnedModuleStager:
         )
 
     def _bind(self, storages: list[torch.Tensor]) -> None:
+        # Staging commonly runs inside inference_mode. Assigning an inference
+        # tensor to Parameter.data would turn the parameter into an inference
+        # tensor too, silently disabling version increments on later edits.
+        # Preserve each target's original semantics. An inference parameter
+        # cannot acquire a version counter by rebinding its storage either.
         for storage, group in zip(storages, self._groups):
             for binding in group.bindings:
-                set_tensor_storage(binding.target, self._view(storage, binding))
+                with torch.inference_mode(self._local_tensor(binding.target).is_inference()):
+                    set_tensor_storage(binding.target, self._view(storage, binding))
 
     def _restore_masters(self) -> None:
         self._bind([group.master for group in self._groups])
