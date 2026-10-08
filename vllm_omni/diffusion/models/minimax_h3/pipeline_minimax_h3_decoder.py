@@ -26,24 +26,27 @@ from .pipeline_minimax_h3 import (
 from .vae import MiniMaxH3AudioVAE, MiniMaxH3VideoVAE
 
 
-def _resolve_decoder_model_path(od_config: OmniDiffusionConfig) -> Path:
-    model = str(od_config.model)
-    partition = resolve_minimax_h3_partition(model, od_config.task_type, auto_partition="fl2va")
+def resolve_minimax_h3_decoder_model_path(
+    model: str,
+    revision: str | None,
+    task_type: str | None,
+) -> str:
+    partition = resolve_minimax_h3_partition(model, task_type, auto_partition="fl2va")
     subdir = "Ref2VA" if partition == "ref2va" else "FL2VA"
     path = Path(model)
     if path.is_dir():
         if path.name in {"FL2VA", "Ref2VA"}:
             path = path.parent
-        return path / subdir
+        return str(path / subdir)
     # Decoder-only deployment downloads native VAE assets, without DiT or text weights.
     snapshot = download_weights_from_hf_specific(
         model_name_or_path=model,
         cache_dir=None,
         allow_patterns=[f"{subdir}/video_vae/**", f"{subdir}/audio_vae/**"],
-        revision=od_config.revision,
+        revision=revision,
         require_all=True,
     )
-    return Path(snapshot) / subdir
+    return str(Path(snapshot) / subdir)
 
 
 class MiniMaxH3DecoderPipeline(
@@ -71,7 +74,9 @@ class MiniMaxH3DecoderPipeline(
         self.od_config = od_config
         self.parallel_config = od_config.parallel_config
         self.device = get_local_device()
-        model_path = _resolve_decoder_model_path(od_config)
+        model_path = Path(
+            resolve_minimax_h3_decoder_model_path(str(od_config.model), od_config.revision, od_config.task_type)
+        )
         self.video_vae = MiniMaxH3VideoVAE(
             str(model_path / "video_vae"),
             device=self.device,
