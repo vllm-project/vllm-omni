@@ -2,11 +2,14 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """The Ulysses exchanges must hand every rank the same bytes as the concatenating reference."""
 
+import re
 from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
 import torch
+from torch._inductor.utils import run_and_get_code
+from torch.fx.experimental.symbolic_shapes import is_concrete_int
 
 from vllm_omni.diffusion.models.magi2 import attention, modeling_magi2, parallel
 from vllm_omni.diffusion.models.magi2.attention import VarlenHandler
@@ -466,12 +469,50 @@ def _musa_available():
     return hasattr(torch, "musa") and torch.musa.is_available()
 
 
-@pytest.mark.musa
-@pytest.mark.parametrize("tokens,world_size", [(3702, 8), (3651, 4), (14, 8)])
-@pytest.mark.parametrize("num_modality", [1, 3])
-def test_real_musa_compiled_output_projection_of_head_shards_is_bitwise_unchanged(tokens, world_size, num_modality):
-    if not _musa_available():
-        pytest.skip("requires a MUSA device")
+@pytest.mark.cpu
+@pytest.mark.parametrize("world_size,module_shards", [(2, 2), (4, 4), (8, 8), (4, 1)])
+def test_dynamic_compile_of_head_shard_output_keeps_only_the_token_count_symbolic(world_size, module_shards):
+    module = _initialized(Magi2Attention(_attention_config(torch.bfloat16), num_modality=1), 7)
+    module.ulysses_head_shards = module_shards
+    graphs = []
+
+    def backend(gm, example_inputs):
+        graphs.append(gm)
+        return gm.forward
+
+    output = torch.compile(module.output, backend=backend, fullgraph=True, dynamic=True)
+    for tokens in (13, 11):
+        generator = torch.Generator().manual_seed(tokens + world_size)
+        dispatcher = _modality_dispatcher(tokens, 3, generator)
+        attended = torch.randn(tokens, module.num_heads_q, module.head_dim, generator=generator).to(torch.bfloat16)
+        gates = torch.randn(tokens, module.num_heads_q, 1, generator=generator).to(torch.bfloat16)
+        with torch.inference_mode():
+            expected = module.output(attended, gates, dispatcher)
+            actual = output(_head_shards(attended, world_size), gates, dispatcher)
+        _assert_bitwise_equal(actual, expected)
+
+    # One graph serves every token count.
+    assert len(graphs) == 1
+    (shards,) = (
+        node.meta["example_value"]
+        for node in graphs[0].graph.find_nodes(op="placeholder")
+        if isinstance(node.meta.get("example_value"), torch.Tensor) and node.meta["example_value"].ndim == 4
+    )
+    assert not is_concrete_int(shards.shape[0])
+    if world_size != module_shards:
+        # Shards from another group are gathered with a symbolic head layout.
+        assert not is_concrete_int(shards.shape[1])
+        return
+    # The module's own head shards have their head layout as constants.
+    assert all(is_concrete_int(size) for size in shards.shape[1:])
+    assert tuple(int(size) for size in shards.shape[1:]) == (
+        world_size,
+        module.num_heads_q // world_size,
+        module.head_dim,
+    )
+
+
+def _real_musa_output_inputs(tokens, num_modality):
     config = Magi2PreviewConfig()
     module = _initialized(Magi2Attention(config, num_modality=num_modality), 23).to("musa")
     generator = torch.Generator().manual_seed(tokens + num_modality)
@@ -479,13 +520,58 @@ def test_real_musa_compiled_output_projection_of_head_shards_is_bitwise_unchange
     attended = torch.randn(tokens, module.num_heads_q, module.head_dim, generator=generator)
     attended = attended.to(device="musa", dtype=config.params_dtype)
     gates = torch.randn(tokens, module.num_heads_q, 1, generator=generator).to(device="musa", dtype=config.params_dtype)
+    return module, attended, gates, dispatcher
+
+
+@pytest.mark.musa
+@pytest.mark.parametrize("dynamic", [False, True])
+@pytest.mark.parametrize("tokens,world_size", [(3702, 8), (3651, 4), (14, 8)])
+@pytest.mark.parametrize("num_modality", [1, 3])
+def test_real_musa_compiled_output_projection_of_head_shards_is_bitwise_unchanged(
+    dynamic, tokens, world_size, num_modality
+):
+    if not _musa_available():
+        pytest.skip("requires a MUSA device")
+    module, attended, gates, dispatcher = _real_musa_output_inputs(tokens, num_modality)
+    module.ulysses_head_shards = world_size
 
     torch._dynamo.reset()
-    # The production regions compile statically with emulated precision casts.
-    output = torch.compile(module.output, fullgraph=True, dynamic=False, options={"emulate_precision_casts": True})
+    # The production regions compile with emulated precision casts.
+    output = torch.compile(module.output, fullgraph=True, dynamic=dynamic, options={"emulate_precision_casts": True})
     with torch.inference_mode():
         expected = output(attended, gates, dispatcher)
         actual = output(_head_shards(attended, world_size), gates, dispatcher)
+    _assert_bitwise_equal(actual.cpu(), expected.cpu())
+
+
+def _compiled_triton_kernels(fn, *args, dynamic):
+    torch._dynamo.reset()
+    compiled = torch.compile(fn, fullgraph=True, dynamic=dynamic, options={"emulate_precision_casts": True})
+    with torch.inference_mode(), torch._inductor.config.patch(force_disable_caches=True):
+        result, codes = run_and_get_code(compiled, *args)
+    kernels = dict(re.findall(r"async_compile\.triton\('(\w+)', '''(.*?)'''", "\n".join(codes), re.DOTALL))
+    return result, kernels
+
+
+@pytest.mark.musa
+@pytest.mark.parametrize("world_size", [8, 4])
+@pytest.mark.parametrize("num_modality", [1, 3])
+def test_real_musa_dynamic_compile_indexes_head_shards_without_runtime_division(world_size, num_modality):
+    if not _musa_available():
+        pytest.skip("requires a MUSA device")
+    module, attended, gates, dispatcher = _real_musa_output_inputs(3702, num_modality)
+    module.ulysses_head_shards = world_size
+    shards = _head_shards(attended, world_size)
+
+    expected, static_kernels = _compiled_triton_kernels(module.output, shards, gates, dispatcher, dynamic=False)
+    actual, kernels = _compiled_triton_kernels(module.output, shards, gates, dispatcher, dynamic=True)
+    gathers = [source for name, source in kernels.items() if "index_select" in name]
+    # The gated product feeds the projection directly, as under static compile.
+    assert len(gathers) == 1, sorted(kernels)
+    assert len(kernels) == len(static_kernels), (sorted(kernels), sorted(static_kernels))
+    # Symbolic sizes reach Triton as 64-bit arguments. Only the token count is
+    # symbolic, so no index is divided by one.
+    assert not re.search(r"(//|%)\s*\(?ks\d", gathers[0]), gathers[0]
     _assert_bitwise_equal(actual.cpu(), expected.cpu())
 
 
@@ -552,7 +638,7 @@ def test_real_musa_compiled_attention_input_head_shards_are_bitwise_unchanged(to
     def compiled_region(head_shards):
         torch._dynamo.reset()
         layer.attention.ulysses_head_shards = head_shards
-        # The production regions compile statically with emulated precision casts.
+        # The production regions compile with emulated precision casts.
         region = torch.compile(
             layer._attention_input, fullgraph=True, dynamic=False, options={"emulate_precision_casts": True}
         )
