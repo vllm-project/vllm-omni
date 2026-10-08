@@ -1041,11 +1041,12 @@ class TestAttentionInitUsesCurrentDiffusionConfig:
             sdpa_fallback=SimpleNamespace(
                 forward=lambda *args: pytest.fail("unexpected SDPA fallback"),
             ),
-            _assert_metadata_compatible=lambda metadata: None,
+            _assert_metadata_compatible=lambda metadata, **kwargs: None,
             _has_custom_attention=False,
             _scheduler_paged_kv=False,
             paged_kv_cache_role=None,
         )
+        fake_attention.effective_attention = lambda: (fake_attention.attention, None, None)
         query = torch.randn(1, 2, 4, 8, dtype=torch.float32)
 
         output = Attention._run_local_attention(fake_attention, query, query, query, None)
