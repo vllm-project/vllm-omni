@@ -13,14 +13,16 @@ from vllm_omni.diffusion.models.magi2.modeling_magi2 import Magi2MultiHeadMoELay
 
 pytestmark = [pytest.mark.diffusion, pytest.mark.core_model]
 
-
-@pytest.fixture(autouse=True)
-def _deterministic_inductor(monkeypatch):
-    # Reduction configs are otherwise benchmarked per compile, which can change the bits.
-    # Dynamo resets ``deterministic`` after every traced frame; the config filter stays on.
-    monkeypatch.setattr(torch._inductor.config, "deterministic", True)
-    monkeypatch.setattr(torch._inductor.config.test_configs, "force_filter_reduction_configs", True)
-
+# Every compile, recompiles included, runs Inductor in deterministic mode. Otherwise each compile
+# picks GEMM shape padding and reduction configs by benchmarking, so two compiled forms can round
+# differently. The flag goes in the compile options because Dynamo resets Inductor's global
+# deterministic flag after every traced frame, so setting that flag directly reaches only the
+# first compile.
+COMPILE_OPTIONS = {
+    "fullgraph": True,
+    "dynamic": False,
+    "options": {"emulate_precision_casts": True, "deterministic": True},
+}
 
 GROUP_SIZES = [(7, 4, 3), (1, 0, 0), (0, 0, 1), (0, 0, 0), (5, 0, 2), (0, 6, 0), (13, 1, 9)]
 
@@ -126,18 +128,24 @@ def test_musa_device_shared_experts_match_the_concatenated_activation_bitwise(co
     layer = _moe_layer(torch.bfloat16).to("musa")
     shared_experts, concatenated = layer._shared_experts, _concatenated_shared_experts
     if compiled:
-        options = {"fullgraph": True, "dynamic": False, "options": {"emulate_precision_casts": True}}
-        shared_experts, concatenated = torch.compile(shared_experts, **options), torch.compile(concatenated, **options)
+        shared_experts = torch.compile(shared_experts, **COMPILE_OPTIONS)
+        concatenated = torch.compile(concatenated, **COMPILE_OPTIONS)
 
-    for group_sizes in ((29, 0, 0), (0, 0, 31), (13, 4, 9)):
-        normalized, dispatcher = _inputs(group_sizes, layer.config.hidden_size, torch.bfloat16)
-        normalized = normalized.to("musa")
-        dispatcher = ModalityDispatcher(dispatcher.modality_mapping.to("musa"), dispatcher.num_modalities)
-        with torch.no_grad():
-            expected = concatenated(layer, normalized, dispatcher)
-            actual = shared_experts(normalized, dispatcher)
-        assert torch.equal(actual.cpu().view(torch.int16), expected.cpu().view(torch.int16))
-    torch._dynamo.reset()
+    try:
+        for group_sizes in ((29, 0, 0), (0, 0, 31), (13, 4, 9)):
+            normalized, dispatcher = _inputs(group_sizes, layer.config.hidden_size, torch.bfloat16)
+            normalized = normalized.to("musa")
+            dispatcher = ModalityDispatcher(dispatcher.modality_mapping.to("musa"), dispatcher.num_modalities)
+            with torch.no_grad():
+                expected = concatenated(layer, normalized, dispatcher)
+                actual = shared_experts(normalized, dispatcher)
+            actual_bits, expected_bits = actual.cpu().view(torch.int16), expected.cpu().view(torch.int16)
+            mismatches = int((actual_bits != expected_bits).sum())
+            assert torch.equal(actual_bits, expected_bits), (
+                f"group sizes {group_sizes}: {mismatches} of {expected_bits.numel()} BF16 results differ"
+            )
+    finally:
+        torch._dynamo.reset()
 
 
 @pytest.mark.musa
@@ -156,11 +164,13 @@ def test_musa_device_swiglu7_splits_at_production_widths(compiled):
         return swiglu7(shared), swiglu7(modality)
 
     if compiled:
-        options = {"fullgraph": True, "dynamic": False, "options": {"emulate_precision_casts": True}}
-        concatenated, separate = torch.compile(concatenated, **options), torch.compile(separate, **options)
-    with torch.no_grad():
-        expected = concatenated(shared, modality)
-        actual = separate(shared, modality)
-    for actual_part, expected_part in zip(actual, expected, strict=True):
-        assert torch.equal(actual_part.cpu().view(torch.int16), expected_part.cpu().view(torch.int16))
-    torch._dynamo.reset()
+        concatenated = torch.compile(concatenated, **COMPILE_OPTIONS)
+        separate = torch.compile(separate, **COMPILE_OPTIONS)
+    try:
+        with torch.no_grad():
+            expected = concatenated(shared, modality)
+            actual = separate(shared, modality)
+        for name, actual_part, expected_part in zip(("shared", "modality"), actual, expected, strict=True):
+            assert torch.equal(actual_part.cpu().view(torch.int16), expected_part.cpu().view(torch.int16)), name
+    finally:
+        torch._dynamo.reset()
