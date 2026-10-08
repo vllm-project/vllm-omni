@@ -1330,6 +1330,7 @@ def test_omni_attention_wraps_paged_kernel_with_sp_hooks() -> None:
 
     class Strategy:
         name = "ulysses"
+        enabled = True
 
         def pre_attention(self, query, key, value, metadata):
             events.append("pre")
@@ -1379,6 +1380,7 @@ def test_omni_attention_strips_paged_ulysses_padding_around_kernel() -> None:
 
     class Strategy:
         name = "ulysses"
+        enabled = True
 
         def pre_attention(self, query, key, value, metadata):
             return query, key, value, metadata, SimpleNamespace(joint_len=0, joint_strategy="front")
@@ -1448,6 +1450,7 @@ def test_omni_attention_keeps_dense_kernel_without_active_adapter() -> None:
 
     class Strategy:
         name = "ulysses"
+        enabled = True
 
         def pre_attention(self, query, key, value, metadata):
             events.append("pre")
