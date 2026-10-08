@@ -824,10 +824,11 @@ class _Tiles:
     num_stages: int = 3
 
 
-# GEMMs run in Triton, with their epilogues fused in, only for 16-bit weights:
-# Triton's IEEE float32 ``tl.dot`` runs on FMA units at about a third of
-# cuBLAS's SIMT speed on these shapes. float32 keeps cuBLAS for every GEMM and
-# runs the same epilogues after it (``FUSED_GEMM=False``).
+# In the action expert, GEMMs run in Triton, with their epilogues fused in, only
+# for 16-bit weights: Triton's IEEE float32 ``tl.dot`` runs on FMA units at about
+# a third of cuBLAS's SIMT speed on these shapes. float32 keeps cuBLAS for every
+# GEMM and runs the same epilogues after it (``FUSED_GEMM=False``), as the prefix
+# does in either dtype.
 _FUSED_DTYPES = (torch.float32, torch.bfloat16)
 _TRITON_GEMM_DTYPES = (torch.bfloat16,)
 
@@ -1208,10 +1209,12 @@ def _fused_denoise_forward(
 ) -> torch.Tensor:
     """The suffix pass and output head of ``denoise_step``, batch 1, with fused kernels.
 
-    Per layer: AdaRMS norm, fused QKV projection + RoPE writing the suffix
-    K/V behind the cached prefix, fused attention over the whole cache row,
-    and fused GEMMs with their gated residuals and GELU; then the final AdaRMS
-    norm fused with ``action_out_proj``. Returns ``v_t``.
+    Per layer: AdaRMS norm, QKV projection + RoPE writing the suffix K/V
+    behind the cached prefix, attention over the whole cache row, and the
+    ``o_proj`` and MLP GEMMs with their gated residuals and GELU; then the final
+    AdaRMS norm fused with ``action_out_proj``. In bfloat16 the GEMMs run in
+    Triton with what follows them fused in; in float32 they stay on cuBLAS and
+    only what follows them is fused. Returns ``v_t``.
     """
     expert = gemma_expert.model
     x_in = suffix_embs[0]
