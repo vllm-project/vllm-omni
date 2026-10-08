@@ -128,6 +128,7 @@ from vllm_omni.entrypoints.openai.protocol import OmniChatCompletionStreamRespon
 from vllm_omni.entrypoints.openai.protocol.audio import (
     DEFAULT_AUDIO_FORMAT,
     SUPPORTED_CHAT_AUDIO_FORMATS,
+    AudioChunkMetadata,
     AudioResponse,
     CreateAudio,
 )
@@ -3039,7 +3040,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
     def _create_image_choice(
         self, omni_outputs: OmniRequestOutput, role: str, request: ChatCompletionRequest, stream: bool = False
-    ):
+    ) -> list[ChatCompletionResponseChoice]:
         """Create chat completion response choices for image output.
 
         Converts image tensor or PIL Image output from diffusion models
@@ -3065,7 +3066,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
         # First check omni_outputs.images directly (for diffusion mode via from_diffusion)
         if omni_outputs.images:
-            images = omni_outputs.images
+            images = self._flatten_diffusion_images(omni_outputs.images)
         # Fall back to completion outputs for pipeline mode (multimodal_output
         # is attached to CompletionOutput by AR stages).
         elif omni_outputs.outputs:
@@ -3743,13 +3744,74 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 flat_images.append(item)
         return flat_images
 
+    async def _diffusion_chat_completion_stream_generator(
+        self,
+        *,
+        request: ChatCompletionRequest,
+        response: OmniChatCompletionResponse,
+        modality: str,
+        audio_metadata: AudioChunkMetadata | None = None,
+    ) -> AsyncGenerator[str, None]:
+        """Emit completed diffusion output using the multi-stage chat chunk format."""
+        choices: list[ChatCompletionResponseStreamChoice] = []
+        for choice in response.choices:
+            delta = DeltaMessage.model_construct(role=choice.message.role)
+            content = choice.message.audio.data if choice.message.audio is not None else choice.message.content
+            object.__setattr__(delta, "content", content)
+            delta.__pydantic_fields_set__.add("content")
+            stream_choice: ChatCompletionResponseStreamChoice
+            if modality == "audio":
+                stream_choice = OmniChatCompletionResponseStreamChoice(
+                    index=choice.index,
+                    delta=delta,
+                    audio_metadata=audio_metadata,
+                    logprobs=None,
+                    finish_reason=choice.finish_reason,
+                    stop_reason=choice.stop_reason,
+                )
+            else:
+                stream_choice = ChatCompletionResponseStreamChoice(
+                    index=choice.index,
+                    delta=delta,
+                    logprobs=None,
+                    finish_reason=choice.finish_reason,
+                    stop_reason=choice.stop_reason,
+                )
+            choices.append(stream_choice)
+
+        include_usage, include_continuous_usage = should_include_usage(request.stream_options, False)
+        chunk = OmniChatCompletionStreamResponse(
+            id=response.id,
+            object="chat.completion.chunk",
+            created=response.created,
+            model=response.model,
+            choices=choices,
+            modality=modality,
+            metrics=response.metrics,
+        )
+        if include_continuous_usage:
+            chunk.usage = response.usage
+        yield f"data: {chunk.model_dump_json(exclude_unset=True)}\n\n"
+        if include_usage:
+            usage_chunk = OmniChatCompletionStreamResponse(
+                id=response.id,
+                object="chat.completion.chunk",
+                created=response.created,
+                model=response.model,
+                choices=[],
+                usage=response.usage,
+                metrics=response.metrics,
+            )
+            yield f"data: {usage_chunk.model_dump_json(exclude_unset=True, exclude_none=True)}\n\n"
+        yield "data: [DONE]\n\n"
+
     async def _create_diffusion_chat_completion(
         self,
         request: ChatCompletionRequest,
         normalized_extra_args: dict[str, object],
         diffusion_request_args: dict[str, Any],
         raw_request: Request | None = None,
-    ) -> ChatCompletionResponse | ErrorResponse:
+    ) -> AsyncGenerator[str, None] | ChatCompletionResponse | ErrorResponse:
         """Generate images via chat completion interface for diffusion models.
 
         Args:
@@ -3974,6 +4036,10 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     request_id,
                     len(text_body),
                 )
+                if request.stream:
+                    return self._diffusion_chat_completion_stream_generator(
+                        request=request, response=response, modality="text"
+                    )
                 return response
 
             # Image output path (text2img / img2img)
@@ -3982,6 +4048,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             multimodal_output = getattr(result, "multimodal_output", {}) or {}
             stage_durations = result.stage_durations
             peak_memory_mb = result.peak_memory_mb
+            audio_metadata: AudioChunkMetadata | None = None
 
             if final_output_type == "audio":
                 sample_rate = 48000
@@ -4030,6 +4097,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     base64_encode=True,
                 )
                 audio_response: AudioResponse = self.create_audio(audio_obj)
+                audio_metadata = audio_response.audio_metadata
                 audio_base64 = audio_response.audio_data
                 audio_id = f"audio-{uuid.uuid4().hex[:16]}"
                 expires_at = int((datetime.now(timezone.utc) + timedelta(hours=24)).timestamp())
@@ -4042,6 +4110,10 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                         transcript="",
                     ),
                 )
+            elif request.stream:
+                message = self._create_image_choice(
+                    omni_outputs=result, role="assistant", request=request, stream=True
+                )[0].message
             else:
                 # Convert images to base64 content
                 image_contents: list[dict[str, Any]] = []
@@ -4114,6 +4186,13 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 len(images),
             )
 
+            if request.stream:
+                return self._diffusion_chat_completion_stream_generator(
+                    request=request,
+                    response=response,
+                    modality=final_output_type,
+                    audio_metadata=audio_metadata,
+                )
             return response
 
         except OmniClientError as e:

@@ -58,9 +58,7 @@ def diffusion_client(request: pytest.FixtureRequest) -> Iterator[TestClient]:
     init_exception_handler(app)
     app.state.engine_client = engine
     app.state.args = Namespace(log_error_stack=False)
-    app.state.openai_serving_chat = OmniOpenAIServingChat.for_diffusion(
-        diffusion_engine=engine, model_name="m"
-    )
+    app.state.openai_serving_chat = OmniOpenAIServingChat.for_diffusion(diffusion_engine=engine, model_name="m")
     app.state.test_modality = modality
     with TestClient(app, raise_server_exceptions=False) as client:
         yield client
@@ -89,9 +87,7 @@ def test_diffusion_chat_nonstream_remains_json(diffusion_client: TestClient) -> 
 
 
 @pytest.mark.parametrize("include_usage", [False, True])
-def test_diffusion_chat_stream_emits_sse(
-    diffusion_client: TestClient, include_usage: bool
-) -> None:
+def test_diffusion_chat_stream_emits_sse(diffusion_client: TestClient, include_usage: bool) -> None:
     body = _request_body(client=diffusion_client, stream=True)
     body["stream_options"] = {"include_usage": include_usage}
     response = diffusion_client.post(url="/v1/chat/completions", json=body)
@@ -130,9 +126,7 @@ def test_openai_sdk_receives_diffusion_chunks(diffusion_client: TestClient) -> N
         response = diffusion_client.post(
             url=request.url.path, content=request.content, headers={"content-type": "application/json"}
         )
-        return httpx.Response(
-            status_code=response.status_code, headers=response.headers, content=response.content
-        )
+        return httpx.Response(status_code=response.status_code, headers=response.headers, content=response.content)
 
     with httpx.Client(transport=httpx.MockTransport(handler=forward)) as http_client:
         with openai.OpenAI(api_key="x", base_url="http://omni.local/v1", http_client=http_client) as client:
@@ -144,3 +138,31 @@ def test_openai_sdk_receives_diffusion_chunks(diffusion_client: TestClient) -> N
     assert chunks[0].choices[0].delta.role == "assistant"
     assert chunks[0].choices[0].delta.content
     assert chunks[0].choices[0].finish_reason == "stop"
+
+
+@pytest.mark.parametrize("diffusion_client", ["image"], indirect=True)
+def test_diffusion_chat_stream_uses_image_choice_for_layered_images(diffusion_client: TestClient, mocker: Any) -> None:
+    serving = diffusion_client.app.state.openai_serving_chat
+    image_choice = mocker.spy(serving, "_create_image_choice")
+    output = diffusion_client.app.state.engine_client.output
+    output.images = [[Image.new("RGB", (16, 16), color) for color in ("red", "blue")]]
+    response = diffusion_client.post(
+        url="/v1/chat/completions", json=_request_body(client=diffusion_client, stream=True)
+    )
+    assert response.status_code == 200, response.text
+    event = response.text.splitlines()[0].removeprefix("data: ")
+    content = json.loads(event)["choices"][0]["delta"]["content"]
+    assert len(content) == 2
+    image_choice.assert_called_once()
+    assert image_choice.call_args.kwargs["stream"] is True
+
+
+@pytest.mark.parametrize("diffusion_client", ["audio"], indirect=True)
+def test_diffusion_chat_stream_preserves_missing_audio_error(diffusion_client: TestClient) -> None:
+    diffusion_client.app.state.engine_client.output.multimodal_output.pop("audio")
+    response = diffusion_client.post(
+        url="/v1/chat/completions", json=_request_body(client=diffusion_client, stream=True)
+    )
+    assert response.status_code == 400, response.text
+    assert response.headers["content-type"] == "application/json"
+    assert "no audio was produced" in response.json()["error"]["message"]
