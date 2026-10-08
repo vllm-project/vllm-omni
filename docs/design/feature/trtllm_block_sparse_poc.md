@@ -29,6 +29,19 @@ with dense `FLASH_ATTN` for other roles.
 
 ## Validation
 
+Rebased onto the shared foundation at `3afc47b12`, which includes `main` at
+`a3d7a0444`. The foundation's FA4 Ulysses/offload results do not establish these
+combinations for this provider; provider-specific distributed/offload validation
+remains pending.
+
+Post-rebase GH200 validation: **117 passed, 13 Blackwell-only skips**, using the
+vLLM-Omni `0.31.0rc1` ARM64 image, PyTorch `2.13.0+cu130`, FA4 `4.0.0b33`,
+FlashInfer `0.7.0.post1`, and CuTe DSL `4.7.1`. Sparse tests use a reference
+provider on GH200. The suite also covers the upstream dense execution contract.
+Native GB200 execution was not rerun after this rebase.
+
+### Earlier validation
+
 Native GB200 validation uses FlashInfer Python/cubin `0.7.0` and JIT cache
 `0.7.0+cu130`. Both runs use the vLLM-Omni 0.30.0 image, PyTorch
 `2.13.0+cu130`, FA4 `4.0.0b33` and CuTe DSL `4.7.1`.
@@ -47,7 +60,8 @@ python -m pytest -q \
   tests/diffusion/attention/test_block_sparse_adapters.py \
   tests/diffusion/attention/test_trtllm_sparse_adapter.py \
   tests/diffusion/attention/test_trtllm_attn.py \
-  tests/diffusion/attention/test_trtllm_calibration.py
+  tests/diffusion/attention/test_trtllm_calibration.py \
+  tests/diffusion/attention/test_trtllm_contract.py
 ```
 
 These results do not establish checkpoint quality or end-to-end speedups.
