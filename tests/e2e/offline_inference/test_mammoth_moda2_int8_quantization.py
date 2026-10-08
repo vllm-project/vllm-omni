@@ -2,14 +2,14 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """GPU end-to-end INT8 W8A8 A/B gates for the MammothModa2 AR stage.
 
-Unlike the FP8 gate (``test_mammoth_moda2_fp8_quantization.py``), which applies
-vLLM's *runtime* W8A8 quantization to the BF16 ``MammothModa2-Dev`` checkpoint,
-the INT8 W8A8 path here loads a *serialized* ``compressed-tensors`` checkpoint
-(``MammothModa2-Dev-W8A8``, produced by llm-compressor with SmoothQuant +
-GPTQModifier, scheme ``W8A8``). The A/B gate therefore compares two checkpoints:
-
-* ``bf16`` — ``MammothModa2-Dev`` (no quantization).
-* ``int8`` — ``MammothModa2-Dev-W8A8`` (``quantization: compressed-tensors``).
+The INT8 path loads serialized ``compressed-tensors`` W8A8 checkpoints.
+Preview (Qwen2.5-VL) and Dev (Qwen3-VL) run as independent BF16/INT8 pairs.
+The official BF16 checkpoints are pinned below. Configure the published INT8
+checkpoints with ``MAMMOTH_MODA2_{PREVIEW,DEV}_INT8_MODEL`` and
+``MAMMOTH_MODA2_{PREVIEW,DEV}_INT8_REVISION`` (full Hub commit SHA). Local
+checkpoint directories are also supported and do not require a revision.
+BF16 overrides use ``MAMMOTH_MODA2_{PREVIEW,DEV}_MODEL`` and ``*_REVISION``.
+Missing checkpoint configuration or download errors fail the gates.
 
 Coverage:
 
@@ -29,42 +29,124 @@ Coverage:
   activations), carries a finite, positive per-channel ``weight_scale`` for
   every quantized layer, and keeps the ignored generation experts in BF16.
 
-The CPU-only structural unit tests live in
-``tests/model_executor/models/mammoth_moda2/test_mammoth_moda2_quantization.py``.
+Checkpoint metadata checks run on CPU, using the same snapshots as inference.
 """
 
 from __future__ import annotations
 
+import json
 import os
+import re
+from functools import lru_cache
+from pathlib import Path
 
 import pytest
 import torch
+
+from tests.helpers.mark import hardware_test
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
-# BF16 baseline checkpoint (same one the FP8 A/B gate uses).
-MODEL_PATH = os.environ.get("MAMMOTH_MODA2_MODEL", "bytedance-research/MammothModa2-Dev")
-
-# Serialized INT8 W8A8 checkpoint (compressed-tensors). Override via env for CI
-# or hub ids; the default points at the locally produced llm-compressor
-# checkpoint.
-INT8_MODEL_PATH = os.environ.get("MAMMOTH_MODA2_INT8_MODEL", "wenjyanasd/MammothModa2-Dev-W8A8")
+# Immutable official BF16 baselines. Published INT8 IDs/revisions must be
+# supplied explicitly until both validated artifacts are available.
+_BF16_CHECKPOINTS = {
+    "preview": (
+        "bytedance-research/MammothModa2-Preview",
+        "ef5a5e41dbf0de1ef6275586b7580f0d4248b4c6",
+    ),
+    "dev": (
+        "bytedance-research/MammothModa2-Dev",
+        "461ad0d7d846bd5fa944619b08213a936eee2e30",
+    ),
+}
+_MODEL_VERSIONS = [pytest.param("preview", id="preview"), pytest.param("dev", id="dev")]
 # The checkpoint's ``config.json`` declares ``quant_method: compressed-tensors``;
 # setting the same stage key makes the A/B arm explicit and deterministic
 # instead of relying on auto-detection.
 INT8_QUANTIZATION = "compressed-tensors"
 
-# A/B cases: (checkpoint path, quantization stage key).
+# Each version runs both arms against its own architecture's baseline.
 QUANTIZATION_CASES = [
-    pytest.param(MODEL_PATH, None, id="bf16"),
-    pytest.param(INT8_MODEL_PATH, INT8_QUANTIZATION, id="int8"),
+    pytest.param(None, id="bf16"),
+    pytest.param(INT8_QUANTIZATION, id="int8"),
 ]
 
-# Hardware gate: any CUDA GPU. ``@hardware_test`` pins specific SKUs, so use a
-# plain skip so local workstation cards can run the A/B gate too.
-_CUDA_ONLY = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA GPU")
+# The CI lane uses one H100 (80 GiB). Keep local Ada/Hopper runs possible,
+# while rejecting ROCm and Blackwell, which this W8A8 backend cannot run.
+_INT8_CUDA_ONLY = pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.version.hip is not None,
+    reason="requires an NVIDIA CUDA GPU",
+)
+
+
+@pytest.fixture
+def int8_cuda_device():
+    capability = torch.cuda.get_device_capability()
+    if not (75 <= capability[0] * 10 + capability[1] < 100):
+        pytest.skip(f"INT8 W8A8 requires SM75-SM90; got compute capability {capability}")
+
+
+@lru_cache(maxsize=None)
+def _checkpoint_dir(version: str, quantization: str | None) -> Path:
+    """Resolve local paths or pinned Hub snapshots for both inference and metadata."""
+    prefix = f"MAMMOTH_MODA2_{version.upper()}"
+    if quantization is not None:
+        prefix += "_INT8"
+    default_model, default_revision = _BF16_CHECKPOINTS[version] if quantization is None else (None, None)
+    model = os.environ.get(f"{prefix}_MODEL", default_model)
+    revision = os.environ.get(f"{prefix}_REVISION")
+    # Preserve the existing Dev workstation overrides.
+    if version == "dev":
+        legacy = "MAMMOTH_MODA2_INT8" if quantization is not None else "MAMMOTH_MODA2"
+        model = os.environ.get(f"{prefix}_MODEL", os.environ.get(f"{legacy}_MODEL", default_model))
+        revision = os.environ.get(f"{prefix}_REVISION", os.environ.get(f"{legacy}_REVISION"))
+    assert model, f"Set {prefix}_MODEL to the published checkpoint ID or a local directory"
+    path = Path(model)
+    if path.is_dir():
+        return path
+    if revision is None and model == default_model:
+        revision = default_revision
+    assert revision and re.fullmatch(r"[0-9a-fA-F]{40}", revision), (
+        f"Set {prefix}_REVISION to the full commit SHA for {model!r}"
+    )
+    from vllm_omni.transformers_utils.repo_utils import hf_api
+
+    # snapshot_download reuses the loader's Hub cache. No skip on cache misses,
+    # missing files, permission errors or network failures.
+    return Path(hf_api().snapshot_download(repo_id=model, revision=revision))
+
+
+@pytest.fixture(params=_MODEL_VERSIONS, scope="module")
+def checkpoint_pair(request) -> tuple[str, str]:
+    version = request.param
+    int8 = _checkpoint_dir(version, INT8_QUANTIZATION)
+    bf16 = _checkpoint_dir(version, None)
+    configs = [json.loads((path / "config.json").read_text(encoding="utf-8")) for path in (bf16, int8)]
+    for config in configs:
+        _assert_model_version(config, version)
+    # Ignore serialization-only fields (dtype, _name_or_path, etc.) while
+    # requiring the same language architecture, vocabulary and routing setup.
+    ar_configs = [config["llm_config"] for config in configs]
+    assert ar_configs[0]["model_type"] == ar_configs[1]["model_type"]
+    text_configs = [config.get("text_config", config) for config in ar_configs]
+    for key in (
+        "num_hidden_layers",
+        "hidden_size",
+        "intermediate_size",
+        "num_attention_heads",
+        "num_key_value_heads",
+        "vocab_size",
+        "gen_vocab_size",
+        "gen_vocab_start_index",
+        "moe_type",
+    ):
+        bf16_value = text_configs[0].get(key, ar_configs[0].get(key))
+        int8_value = text_configs[1].get(key, ar_configs[1].get(key))
+        assert bf16_value == int8_value, f"{version}: AR config mismatch for {key}"
+    assert not configs[0].get("quantization_config"), f"{version}: BF16 baseline is quantized"
+    return str(bf16), str(int8)
 
 
 # NOTE: provisional — will be finalized from the value measured on the target
@@ -167,21 +249,27 @@ def _mean_abs_diff(a: list[float], b: list[float]) -> float:
     return float((a_t - b_t).abs().mean())
 
 
-@_CUDA_ONLY
+@_INT8_CUDA_ONLY
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@pytest.mark.usefixtures("int8_cuda_device")
 @pytest.mark.omni
-@pytest.mark.parametrize(("model", "quantization"), QUANTIZATION_CASES)
-def test_ar_generation_smoke(model: str, quantization: str | None):
+@pytest.mark.parametrize("quantization", QUANTIZATION_CASES)
+def test_ar_generation_smoke(checkpoint_pair: tuple[str, str], quantization: str | None):
     """Each supported format loads and produces a non-empty greedy sequence."""
+    model = checkpoint_pair[quantization is not None]
     token_ids, _ = _generate(model, quantization)
     assert token_ids, f"no tokens generated for model={model!r} quantization={quantization!r}"
 
 
-@_CUDA_ONLY
+@_INT8_CUDA_ONLY
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@pytest.mark.usefixtures("int8_cuda_device")
 @pytest.mark.omni
-def test_bf16_vs_int8_generation_consistency():
+def test_bf16_vs_int8_generation_consistency(checkpoint_pair: tuple[str, str]):
     """A/B: BF16 vs INT8 — report token agreement + logprob similarity + MAE."""
-    bf16_ids, bf16_lp = _generate(MODEL_PATH, None)
-    int8_ids, int8_lp = _generate(INT8_MODEL_PATH, INT8_QUANTIZATION)
+    bf16_model, int8_model = checkpoint_pair
+    bf16_ids, bf16_lp = _generate(bf16_model, None)
+    int8_ids, int8_lp = _generate(int8_model, INT8_QUANTIZATION)
 
     assert bf16_ids, "BF16 baseline produced no tokens"
     assert int8_ids, "INT8 run produced no tokens"
@@ -234,7 +322,7 @@ def test_bf16_vs_int8_generation_consistency():
 # stage to emit visual tokens, exercising the generation experts and the extra
 # vocabulary/head under INT8 end to end. In the serialized W8A8 checkpoint the
 # generation experts are listed under ``ignore`` (kept BF16) while the extra
-# generation head carries its own scale — the image A/B covers both.
+# generation head either stays BF16 or carries its own scale.
 
 _AR_PATCH_SIZE = 16
 
@@ -248,35 +336,38 @@ _VISION_END_TOKEN_ID = 151653
 _T2I_GEN_CONFIG_FILE = "t2i_generation_config.json"
 
 
-def _load_t2i_gen_config(model: str) -> dict:
+def _load_t2i_gen_config(model: str, baseline_model: str) -> dict:
     """Load ``t2i_generation_config.json`` from a local dir or hub id.
 
     The t2i generation constants are model-family level, not weight level, and
     the serialized W8A8 checkpoint directory may omit this file, so fall back to
-    the BF16 baseline checkpoint. Only the single config file is fetched from the
-    Hub (``hf_hub_download``), never a whole snapshot: the runner loads the
-    weights itself, so a ``snapshot_download`` here would pull a second copy of
-    a multi-GB checkpoint just to read a few constants.
+    the matching BF16 baseline checkpoint. The normal callers pass resolved
+    snapshot directories. If a Hub ID is supplied, only this single file is
+    fetched; config lookup never downloads model weights.
     """
-    import json
-    from pathlib import Path
-
-    for candidate in (model, MODEL_PATH):
-        local = Path(candidate) / _T2I_GEN_CONFIG_FILE
-        if local.exists():
-            return json.loads(local.read_text(encoding="utf-8"))
+    from huggingface_hub.errors import RemoteEntryNotFoundError
 
     from vllm_omni.transformers_utils.repo_utils import hf_api
 
-    for candidate in (model, MODEL_PATH):
+    missing = []
+    for candidate in dict.fromkeys((model, baseline_model)):
+        local_dir = Path(candidate)
+        if local_dir.is_dir():
+            cfg_path = local_dir / _T2I_GEN_CONFIG_FILE
+            if cfg_path.is_file():
+                return json.loads(cfg_path.read_text(encoding="utf-8"))
+            missing.append(str(cfg_path))
+            continue
         try:
             cfg_path = Path(hf_api().hf_hub_download(repo_id=candidate, filename=_T2I_GEN_CONFIG_FILE))
-        except Exception:
+        except RemoteEntryNotFoundError as exc:
+            # Only a genuinely absent file permits the matching BF16 fallback.
+            # Authentication, repository, revision and network errors propagate.
+            missing.append(f"{candidate}: {exc}")
             continue
-        if cfg_path.exists():
-            return json.loads(cfg_path.read_text(encoding="utf-8"))
+        return json.loads(cfg_path.read_text(encoding="utf-8"))
 
-    pytest.skip(f"t2i_generation_config.json not found for {model!r} or {MODEL_PATH!r}")
+    raise FileNotFoundError(f"Required {_T2I_GEN_CONFIG_FILE} missing from both checkpoints: {missing}")
 
 
 def _format_t2i_prompt(user_prompt: str, ar_width: int, ar_height: int) -> str:
@@ -298,18 +389,21 @@ def _t2i_stage_config(quantization: str | None) -> str:
 
     base = get_deploy_config_path("mammoth_moda2.yaml")
     stage_updates = dict(_AR_STAGE_OVERRIDES)
-    if quantization is not None:
-        stage_updates["quantization"] = quantization
+    if quantization is None:
+        return modify_stage_config(
+            base, updates={"stages": {0: stage_updates}}, deletes={"stages": {0: ["quantization"]}}
+        )
+    stage_updates["quantization"] = quantization
     return modify_stage_config(base, updates={"stages": {0: stage_updates}})
 
 
-def _generate_t2i_image(model: str, quantization: str | None) -> torch.Tensor:
+def _generate_t2i_image(model: str, quantization: str | None, baseline_model: str) -> torch.Tensor:
     """Run t2i (AR→DiT) and return the decoded image tensor."""
     from vllm.sampling_params import SamplingParams
 
     from tests.helpers.runtime import OmniRunner
 
-    gen_cfg = _load_t2i_gen_config(model)
+    gen_cfg = _load_t2i_gen_config(model, baseline_model)
     eol_token_id = int(gen_cfg["eol_token_id"])
     visual_start = int(gen_cfg["visual_token_start_id"])
     visual_end = int(gen_cfg["visual_token_end_id"])
@@ -359,10 +453,19 @@ def _generate_t2i_image(model: str, quantization: str | None) -> torch.Tensor:
             )
         )
 
-    return _extract_image_tensor(outputs)
+    return _extract_image_tensor(outputs, expected_count=1, expected_size=(width, height))
 
 
-def _extract_image_tensor(outputs) -> torch.Tensor:
+def _assert_finite_image_payload(payload) -> None:
+    """Reject NaN/Inf before the image helper clamps and casts tensors to uint8."""
+    if isinstance(payload, torch.Tensor):
+        assert torch.isfinite(payload).all(), "raw image tensor contains non-finite values"
+    elif isinstance(payload, (list, tuple)):
+        for item in payload:
+            _assert_finite_image_payload(item)
+
+
+def _extract_image_tensor(outputs, *, expected_count: int, expected_size: tuple[int, int]) -> torch.Tensor:
     """Extract the decoded image as a ``(C, H, W)`` float tensor in ``[0, 1]``.
 
     Reuses the official ``extract_images_from_outputs`` helper, which knows all
@@ -371,16 +474,23 @@ def _extract_image_tensor(outputs) -> torch.Tensor:
     """
     import numpy as np
 
-    from vllm_omni.diffusion.utils.image_output import extract_images_from_outputs
+    from vllm_omni.diffusion.utils.image_output import (
+        _iter_multimodal_image_payloads,
+        extract_images_from_outputs,
+    )
 
-    images = extract_images_from_outputs(outputs)
-    if not images:
-        debug = [
-            f"{type(out).__name__}(images={getattr(out, 'images', None)!r}, "
-            f"mm={getattr(out, 'multimodal_output', None)!r})"
-            for out in outputs
-        ]
-        raise AssertionError(f"no image tensor found in pipeline output; outputs={debug}")
+    images = []
+    for output in outputs:
+        _assert_finite_image_payload(getattr(output, "images", None))
+        for payload in _iter_multimodal_image_payloads(output):
+            _assert_finite_image_payload(payload)
+        # Collect across outputs instead of letting the helper return only the
+        # first request's images. Alternative payload aliases are not counted twice.
+        images.extend(extract_images_from_outputs(output))
+    assert len(images) == expected_count, f"expected {expected_count} image(s), got {len(images)}"
+    for image in images:
+        assert image.size == expected_size, f"expected image size {expected_size}, got {image.size}"
+        assert image.mode == "RGB", f"expected RGB image, got mode {image.mode!r}"
 
     arr = np.asarray(images[0], dtype=np.float32) / 255.0  # (H, W, C)
     return torch.from_numpy(arr).permute(2, 0, 1)  # (C, H, W)
@@ -414,12 +524,15 @@ def _image_metrics(a: torch.Tensor, b: torch.Tensor) -> dict[str, float]:
     }
 
 
-@_CUDA_ONLY
+@_INT8_CUDA_ONLY
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@pytest.mark.usefixtures("int8_cuda_device")
 @pytest.mark.diffusion
-def test_bf16_vs_int8_t2i_image_consistency():
+def test_bf16_vs_int8_t2i_image_consistency(checkpoint_pair: tuple[str, str]):
     """A/B: BF16 vs INT8 t2i — decoded image must match (gen experts + head OK)."""
-    bf16_img = _generate_t2i_image(MODEL_PATH, None)
-    int8_img = _generate_t2i_image(INT8_MODEL_PATH, INT8_QUANTIZATION)
+    bf16_model, int8_model = checkpoint_pair
+    bf16_img = _generate_t2i_image(bf16_model, None, bf16_model)
+    int8_img = _generate_t2i_image(int8_model, INT8_QUANTIZATION, bf16_model)
 
     assert bf16_img.shape == int8_img.shape, (bf16_img.shape, int8_img.shape)
 
@@ -445,12 +558,70 @@ def test_bf16_vs_int8_t2i_image_consistency():
 # ---------------------------------------------------------------------------
 
 
-def _local_checkpoint_dir(model: str):
-    """Return the local checkpoint directory for *model*, or ``None``."""
-    from pathlib import Path
+def _assert_model_version(config: dict, version: str) -> None:
+    assert "mammoth" in config["model_type"].lower(), "expected a MammothModa2 checkpoint"
+    model_type = config["llm_config"]["model_type"].lower()
+    assert ("qwen3" in model_type) == (version == "dev"), f"{version}: unexpected AR architecture {model_type!r}"
 
-    path = Path(model)
-    return path if path.is_dir() else None
+
+def _tensor_metadata(ckpt_dir: Path, weight_map: dict[str, str]) -> dict[str, tuple[str, list[int]]]:
+    """Read dtype/shape from shard headers without materializing model weights."""
+    from safetensors import safe_open
+
+    metadata = {}
+    shards: dict[str, list[str]] = {}
+    for key, shard in weight_map.items():
+        shards.setdefault(shard, []).append(key)
+    for shard, keys in shards.items():
+        with safe_open(str(ckpt_dir / shard), framework="pt") as handle:
+            for key in keys:
+                tensor = handle.get_slice(key)
+                metadata[key] = (tensor.get_dtype(), tensor.get_shape())
+    return metadata
+
+
+def _matches_module(module: str, target: str) -> bool:
+    return re.match(target[3:], module) is not None if target.startswith("re:") else module == target
+
+
+def _quantized_weight_keys(quant_config: dict, metadata: dict[str, tuple[str, list[int]]]) -> set[str]:
+    """Match checkpoint targets/ignore entries against MammothModa2 linear weights.
+
+    In these architectures matrix-shaped module weights are Linear or Embedding;
+    embedding leaves are excluded from the Linear class target. Exact names and
+    ``re:`` patterns are supported alongside the recipe's ``Linear`` target.
+    Unknown class targets fail rather than silently losing coverage.
+    """
+    embedding_leaves = {
+        "embed_tokens",
+        "gen_embed_tokens",
+        "position_embedding",
+        "position_embeddings",
+        "pos_embed",
+        "embed_positions",
+        "word_embeddings",
+        "token_embedding",
+        "embedding",
+        "embeddings",
+    }
+    targets = [target for group in quant_config["config_groups"].values() for target in group["targets"]]
+    assert targets, "no quantization targets declared"
+    for target in targets:
+        assert target == "Linear" or target.startswith("re:") or "." in target, (
+            f"unsupported quantization target class {target!r}"
+        )
+    quantized = set()
+    for key, (_, shape) in metadata.items():
+        if not key.endswith(".weight"):
+            continue
+        module = key.removesuffix(".weight")
+        if any(_matches_module(module, ignored) for ignored in quant_config.get("ignore", [])):
+            continue
+        is_linear = len(shape) == 2 and module.rsplit(".", 1)[-1] not in embedding_leaves
+        if any((target == "Linear" and is_linear) or _matches_module(module, target) for target in targets):
+            quantized.add(key)
+    assert quantized, "no checkpoint weights match the declared quantization targets"
+    return quantized
 
 
 def _read_tensor(ckpt_dir, weight_map: dict[str, str], key: str) -> torch.Tensor:
@@ -460,24 +631,32 @@ def _read_tensor(ckpt_dir, weight_map: dict[str, str], key: str) -> torch.Tensor
         return handle.get_tensor(key)
 
 
-def _assert_int8_weight_and_scale(ckpt_dir, weight_map: dict[str, str], weight_key: str, scale_key: str) -> None:
+def _assert_int8_weight_and_scale(
+    ckpt_dir: Path,
+    weight_map: dict[str, str],
+    metadata: dict[str, tuple[str, list[int]]],
+    weight_key: str,
+    scale_key: str,
+) -> None:
     """Quantized weights are int8 and carry a finite, positive per-channel scale."""
-    from safetensors import safe_open
-
-    with safe_open(str(ckpt_dir / weight_map[weight_key]), framework="pt") as handle:
-        dtype = handle.get_slice(weight_key).get_dtype()
+    assert weight_key in weight_map, f"missing quantized weight {weight_key}"
+    assert scale_key in weight_map, f"missing per-channel scale {scale_key}"
+    dtype, weight_shape = metadata[weight_key]
     assert dtype == "I8", f"{weight_key} must be int8, got {dtype}"
+    assert len(weight_shape) == 2, f"{weight_key} must be a matrix, got {weight_shape}"
 
     scale = _read_tensor(ckpt_dir, weight_map, scale_key)
-    assert scale.ndim == 2 and scale.shape[-1] == 1, (
-        f"{scale_key} must be a per-channel [out_features, 1] scale, got {tuple(scale.shape)}"
+    assert scale.is_floating_point(), f"{scale_key} must have a floating-point dtype, got {scale.dtype}"
+    assert tuple(scale.shape) == (weight_shape[0], 1), (
+        f"{scale_key} must have shape {(weight_shape[0], 1)}, got {tuple(scale.shape)}"
     )
     assert torch.isfinite(scale).all(), f"{scale_key} contains non-finite values"
     assert (scale > 0).all(), f"{scale_key} contains non-positive values"
 
 
 @pytest.mark.cpu
-def test_int8_checkpoint_quantization_scales():
+@pytest.mark.parametrize("version", _MODEL_VERSIONS)
+def test_int8_checkpoint_quantization_scales(version: str):
     """Serialized INT8 W8A8 checkpoint: scheme metadata + per-channel scales.
 
     Validates that the checkpoint the A/B gate loads is a genuine W8A8
@@ -486,42 +665,51 @@ def test_int8_checkpoint_quantization_scales():
     BF16, and the extra generation head is either BF16 or backed by a valid
     per-channel scale.
     """
-    import json
-
-    ckpt_dir = _local_checkpoint_dir(INT8_MODEL_PATH)
-    if ckpt_dir is None:
-        pytest.skip(f"INT8 W8A8 checkpoint not available locally: {INT8_MODEL_PATH}")
+    ckpt_dir = _checkpoint_dir(version, INT8_QUANTIZATION)
 
     config = json.loads((ckpt_dir / "config.json").read_text(encoding="utf-8"))
+    _assert_model_version(config, version)
     quant_config = config.get("quantization_config")
-    assert quant_config is not None, f"{INT8_MODEL_PATH}/config.json has no quantization_config"
+    assert quant_config is not None, f"{ckpt_dir}/config.json has no quantization_config"
     assert quant_config["quant_method"] == "compressed-tensors"
     assert quant_config["quantization_status"] == "compressed"
 
-    group = next(iter(quant_config["config_groups"].values()))
-    weights, activations = group["weights"], group["input_activations"]
-    # W8A8: 8-bit int weights (per-channel, symmetric) + 8-bit int activations
-    # (dynamic per-token, symmetric).
-    assert (weights["type"], weights["num_bits"]) == ("int", 8)
-    assert weights["strategy"] == "channel" and weights["symmetric"] is True
-    assert (activations["type"], activations["num_bits"]) == ("int", 8)
-    assert activations["dynamic"] is True and activations["strategy"] == "token"
+    assert quant_config["config_groups"], "no quantization scheme groups declared"
+    for name, group in quant_config["config_groups"].items():
+        weights, activations = group["weights"], group["input_activations"]
+        assert (weights["type"], weights["num_bits"]) == ("int", 8), name
+        assert weights["strategy"] == "channel" and weights["symmetric"] is True, name
+        assert weights["dynamic"] is False, name
+        assert (activations["type"], activations["num_bits"]) == ("int", 8), name
+        assert activations["dynamic"] is True and activations["strategy"] == "token", name
+        assert activations["symmetric"] is True, name
 
     weight_map = json.loads((ckpt_dir / "model.safetensors.index.json").read_text(encoding="utf-8"))["weight_map"]
 
-    # 1. Quantized base linear layers carry a per-channel weight_scale.
-    base_proj = "llm_model.model.language_model.layers.0.mlp.gate_proj"
-    assert f"{base_proj}.weight" in weight_map
-    assert f"{base_proj}.weight_scale" in weight_map
-    _assert_int8_weight_and_scale(ckpt_dir, weight_map, f"{base_proj}.weight", f"{base_proj}.weight_scale")
+    metadata = _tensor_metadata(ckpt_dir, weight_map)
+    quantized_keys = _quantized_weight_keys(quant_config, metadata)
+    # Validate every declared target, including missing scales and weights that
+    # were incorrectly saved in full precision; checking only I8 keys misses those.
+    for weight_key in sorted(quantized_keys):
+        scale_key = weight_key.removesuffix(".weight") + ".weight_scale"
+        _assert_int8_weight_and_scale(ckpt_dir, weight_map, metadata, weight_key, scale_key)
+    # Check the reverse direction as well: no undeclared INT8 weight or orphan
+    # scale is allowed, even if a target/ignore entry accidentally excluded it.
+    int8_keys = {key for key, (dtype, _) in metadata.items() if key.endswith(".weight") and dtype == "I8"}
+    assert int8_keys == quantized_keys, f"INT8 weights do not match declared targets: {int8_keys ^ quantized_keys}"
+    expected_scales = {key.removesuffix(".weight") + ".weight_scale" for key in quantized_keys}
+    actual_scales = {key for key in weight_map if key.endswith(".weight_scale")}
+    assert actual_scales == expected_scales, f"scale coverage mismatch: {actual_scales ^ expected_scales}"
 
     # 2. Generation experts (gen_mlp) are ignored and therefore stay BF16:
     #    weights present, no quantization scale.
-    gen_expert_weights = sorted(key for key in weight_map if ".gen_mlp." in key)
+    gen_expert_weights = sorted(key for key in weight_map if ".gen_mlp." in key and key.endswith(".weight"))
     assert gen_expert_weights, "no generation-expert weights found in the checkpoint"
-    assert not any(key.endswith(".weight_scale") for key in gen_expert_weights), (
+    assert not any(".gen_mlp." in key and key.endswith(".weight_scale") for key in weight_map), (
         "generation experts must stay unquantized (listed under quant ignore)"
     )
+    for key in gen_expert_weights:
+        assert metadata[key][0] == "BF16", f"{key} must remain BF16, got {metadata[key][0]}"
 
     # 3. Extra vocabulary/head: gen_embed_tokens stays BF16 (embeddings are not
     #    quant targets). gen_head must be either kept in BF16 (the recipe lists
@@ -531,6 +719,7 @@ def test_int8_checkpoint_quantization_scales():
     embed_key = "llm_model.model.language_model.gen_embed_tokens.weight"
     assert embed_key in weight_map
     assert not any("gen_embed_tokens" in key and key.endswith(".weight_scale") for key in weight_map)
+    assert metadata[embed_key][0] == "BF16", f"{embed_key} must remain BF16, got {metadata[embed_key][0]}"
     assert "llm_model.gen_head.weight" in weight_map
 
     gen_head_scale_key = "llm_model.gen_head.weight_scale"
@@ -538,6 +727,10 @@ def test_int8_checkpoint_quantization_scales():
         _assert_int8_weight_and_scale(
             ckpt_dir,
             weight_map,
+            metadata,
             "llm_model.gen_head.weight",
             gen_head_scale_key,
         )
+    else:
+        head_key = "llm_model.gen_head.weight"
+        assert metadata[head_key][0] == "BF16", f"{head_key} must remain BF16, got {metadata[head_key][0]}"

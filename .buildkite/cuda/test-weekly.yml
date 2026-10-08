@@ -23,6 +23,23 @@ steps:
         exit $$EXIT
     mirror_hardwares: l4_1
 
+  - group: "MammothModa2 INT8 W8A8"
+    depends_on: upload-weekly-pipeline
+    if: build.env("WEEKLY") == "1" || build.pull_request.labels includes "weekly-test"
+    steps:
+      - label: "MammothModa2 · Preview/Dev INT8 A/B · H100 · Single-GPU"
+        key: weekly-mammoth-moda2-int8
+        timeout_in_minutes: 180
+        commands:
+          # Both published INT8 IDs and immutable revisions are supplied by CI:
+          # MAMMOTH_MODA2_PREVIEW_INT8_MODEL / MAMMOTH_MODA2_PREVIEW_INT8_REVISION
+          # MAMMOTH_MODA2_DEV_INT8_MODEL / MAMMOTH_MODA2_DEV_INT8_REVISION
+          - >-
+            pytest -sv tests/e2e/offline_inference/test_mammoth_moda2_int8_quantization.py
+            -m "slow and (cpu or (cuda and H100 and cards_1))"
+            --run-level "full_model"
+        mirror_hardwares: h100_1
+
   - group: "Reliability Test"
     depends_on: upload-weekly-pipeline
     if: build.env("WEEKLY") == "1" || build.pull_request.labels includes "weekly-test"
