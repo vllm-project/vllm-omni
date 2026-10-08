@@ -295,3 +295,14 @@ steps:
               pytest -s -v tests/e2e/online_serving/test_lingbot_video.py -m 'core_model and cuda' --run-level 'core_model'
             "
         mirror_hardwares: h100_1
+
+  - label: "TTS · ZONOS2 · core_model"
+    depends_on: upload-ready-pipeline
+    source_file_dependencies: zonos2_core
+    timeout_in_minutes: 20
+    env:
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+    commands:
+      - uv pip install --system -r requirements/zonos2.txt --overrides requirements/zonos2-overrides.txt
+      - pytest -sv tests/model_executor/models/zonos2 -m 'core_model and cuda and (L4 or B200) and cards_1' --run-level core_model

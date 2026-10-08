@@ -1887,6 +1887,23 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
                 # Seed, so a model that samples inside forward() can be
                 # reproducible: vLLM's own sampler seeding does not reach it.
                 req_infos["_omni_seed"] = getattr(sampling_params, "seed", None)
+                if getattr(self.model, "requires_request_sampling_params", False):
+                    req_infos["_omni_req_id"] = req_id
+                    req_infos["_omni_output_token_ids"] = list(getattr(req_state, "output_token_ids", ()))
+                    req_infos["_omni_sampling_params"] = {
+                        key: getattr(sampling_params, key, None)
+                        for key in (
+                            "temperature",
+                            "top_k",
+                            "top_p",
+                            "min_p",
+                            "seed",
+                            "max_tokens",
+                            "ignore_eos",
+                            "repetition_penalty",
+                            "extra_args",
+                        )
+                    }
                 if callable(batch_decode_preprocess) and span_len == 1 and not is_prefill:
                     decode_batch_items.append((req_id, s, req_infos))
                     continue

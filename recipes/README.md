@@ -42,6 +42,7 @@ recipes/
 
 | Recipe | Task | Hardware |
 | -------- | ------ | ---------- |
+| [Zyphra/ZONOS2-A40.md](./Zyphra/ZONOS2-A40.md) | Native offline/API TTS, streaming; B1 recommended | 1x NVIDIA A40 48GB |
 | [`Baidu/ERNIE-Image.md`](./Baidu/ERNIE-Image.md) | Text-to-image online serving (ERNIE-Image 8B) | 1x or 2x RTX 4090 24GB |
 | [`Bagel/BAGEL-7B-MoT.md`](./Bagel/BAGEL-7B-MoT.md) | Text-to-image with shared online/offline examples | 1x A100 80GB / 2x CUDA GPUs |
 | [`black-forest-labs/FLUX.1-schnell.md`](./black-forest-labs/FLUX.1-schnell.md) | Offline text-to-image generation with CPU offload | 1x NVIDIA GeForce RTX 5090 32GB |

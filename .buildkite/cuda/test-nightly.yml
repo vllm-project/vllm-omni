@@ -558,3 +558,21 @@ steps:
       - python tools/nightly/send_nightly_email.py --report-file "tests/dfx/perf/results/*.xlsx, tests/dfx/perf/results/*.html"
     agents:
       queue: "cpu_queue_premerge"
+
+  - label: "TTS · ZONOS2 · full_model"
+    depends_on: upload-nightly-pipeline
+    source_file_dependencies: zonos2_function
+    timeout_in_minutes: 60
+    env:
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+    commands:
+      - uv pip install --system -r requirements/zonos2.txt --overrides requirements/zonos2-overrides.txt
+      # Explicit preparation may download pinned assets; the test stays offline.
+      # An owned cache and preprovisioned paths can be supplied by the agent.
+      - |
+        set -eu
+        ASSET_ROOT="$${ZONOS2_CI_ASSET_ROOT:-$$(mktemp -d -t zonos2-ci-XXXXXX)}"
+        python tools/prepare_zonos2_ci.py --asset-root "$$ASSET_ROOT" --env-file "$$ASSET_ROOT/asset.env"
+        . "$$ASSET_ROOT/asset.env"
+        pytest -sv tests/e2e/zonos2 -m 'full_model and cuda and (H100 or B200) and cards_1' --run-level full_model
