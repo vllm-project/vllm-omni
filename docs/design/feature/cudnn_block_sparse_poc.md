@@ -45,6 +45,18 @@ Actual model geometry must pass provider preparation.
 
 ## Validation
 
+Rebased onto the shared foundation at `3afc47b12`, which includes `main` at
+`a3d7a0444`. The foundation's FA4 Ulysses/offload results do not establish these
+combinations for this provider; provider-specific distributed/offload validation
+remains pending.
+
+Post-rebase GH200 validation: **78 passed, 0 skipped**, using the vLLM-Omni
+`0.31.0rc1` ARM64 image, PyTorch `2.13.0+cu130`, FA4 `4.0.0b33`, cuDNN frontend
+`1.30.0`, FlashInfer `0.7.0.post1`, and CuTe DSL `4.7.1`. The commands below
+include dense cuDNN regressions alongside real sparse execution and compilation.
+
+### Earlier validation
+
 GH200 validation uses the vLLM-Omni 0.30.0
 image, PyTorch `2.13.0+cu130`, FA4 `4.0.0b33` and CuTe DSL `4.7.1`.
 cuDNN frontend is `1.29.0`.
@@ -55,7 +67,8 @@ cuDNN frontend is `1.29.0`.
 python -m pytest -q \
   tests/diffusion/attention/test_selector.py \
   tests/diffusion/attention/test_block_sparse_adapters.py \
-  tests/diffusion/attention/test_cudnn_sparse_adapter.py
+  tests/diffusion/attention/test_cudnn_sparse_adapter.py \
+  tests/diffusion/attention/test_cudnn_attn.py
 ```
 
 Real-kernel tests cover selected-key numerics, changing patterns and shapes,
