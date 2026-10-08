@@ -169,6 +169,7 @@ source_file_dependencies:
   diffusion_distributed_attention:
     - tests/diffusion/distributed/
     - tests/diffusion/attention/test_attention_sp.py
+    - tests/diffusion/attention/test_ulysses_uaa.py
     - vllm_omni/diffusion/distributed/
     - vllm_omni/diffusion/attention/
     - vllm_omni/diffusion/data.py

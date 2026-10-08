@@ -53,14 +53,49 @@ def test_ar_paged_attention_gpu_lane_is_blocking_and_pinned() -> None:
         assert step["timeout_in_minutes"] == 20
         assert "export VLLM_OMNI_AR_FA_REQUIRED=1" in step["commands"]
 
-        pytest_command = next(command for command in step["commands"] if "pytest" in command)
-        argv = split(pytest_command)
+        pytest_commands = [command for command in step["commands"] if "pytest" in command]
+        assert len(pytest_commands) == 2
+
+        argv = split(pytest_commands[0])
         assert argv[:4] == ["timeout", "--signal=TERM", "--kill-after=2m", "15m"]
         assert "tests/diffusion/ar_diffusion/test_paged_attention.py" in argv
         assert argv[argv.index("-m") + 1] == AR_PAGED_ATTENTION_MARKERS
         assert argv[argv.index("--run-level") + 1] == "core_model"
 
+        transfer_argv = split(pytest_commands[1])
+        assert transfer_argv[:2] == ["timeout", "5m"]
+        assert "tests/diffusion/utils/test_chunked_transfer.py" in transfer_argv
+        assert transfer_argv[transfer_argv.index("-m") + 1] == AR_PAGED_ATTENTION_MARKERS
+        assert transfer_argv[transfer_argv.index("--run-level") + 1] == "core_model"
+
     assert lane_definitions[0] == lane_definitions[1]
+
+
+@pytest.mark.parametrize("label", ["Diffusion · Batch Test", "Diffusion · Offloader Test", "Diffusion · Cache Test"])
+def test_ready_diffusion_gpu_lanes_select_rocm_variants(label: str) -> None:
+    step = _find_step(label, AMD_READY_PIPELINE)
+    pytest_command = next(command for command in step["commands"] if "pytest" in command)
+    argv = split(pytest_command)
+
+    assert argv[argv.index("-m") + 1] == "core_model and rocm and MI325 and cards_1"
+
+
+@pytest.mark.parametrize(
+    ("label", "pipeline", "cards"),
+    [
+        ("ROCm · Ulysses UAA Attention · 2-GPU", AMD_READY_PIPELINE, "cards_2"),
+        ("ROCm · Ulysses UAA Attention · 4-GPU", AMD_MERGE_PIPELINE, "cards_4"),
+    ],
+)
+def test_amd_ulysses_lanes_cover_uaa_and_attention_sp(label: str, pipeline: Path, cards: str) -> None:
+    step = _find_step(label, pipeline)
+    pytest_commands = [command for command in step["commands"] if "pytest" in command]
+
+    assert step["grade"] == "Blocking"
+    assert len(pytest_commands) == 2
+    assert "tests/diffusion/attention/test_ulysses_uaa.py" in pytest_commands[0]
+    assert "tests/diffusion/attention/test_attention_sp.py" in pytest_commands[1]
+    assert all(f"core_model and rocm and MI325 and {cards}" in command for command in pytest_commands)
 
 
 def test_qwen3_tts_base_preserves_advanced_model_arguments() -> None:

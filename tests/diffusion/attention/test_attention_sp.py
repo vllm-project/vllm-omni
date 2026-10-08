@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """Tests for Ulysses + Ring sequence-parallel attention correctness.
 
@@ -31,7 +31,7 @@ import tempfile
 import pytest
 import torch
 
-from tests.helpers.mark import hardware_test
+from tests.helpers.mark import hardware_marks
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata, QueryRange
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.attention.parallel.allgather_kv import (
@@ -50,7 +50,7 @@ from vllm_omni.diffusion.distributed.parallel_state import (
 from vllm_omni.diffusion.forward_context import set_forward_context
 from vllm_omni.platforms import current_omni_platform
 
-pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
+pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
 
 
 def update_environment_variables(envs_dict: dict[str, str]):
@@ -178,6 +178,7 @@ class _MockAllGatherSPGroup:
         return torch.cat(chunks, dim=dim)
 
 
+@pytest.mark.cpu
 def test_allgather_kv_slices_full_dense_mask_to_local_query_rows():
     rank = 1
     joint_len = 1
@@ -231,6 +232,7 @@ def test_allgather_kv_slices_full_dense_mask_to_local_query_rows():
     assert torch.equal(metadata_local.attn_mask, expected_rows)
 
 
+@pytest.mark.cpu
 def test_allgather_kv_slices_rear_joint_dense_mask():
     rank = 1
     joint_len = 1
@@ -268,6 +270,7 @@ def test_allgather_kv_slices_rear_joint_dense_mask():
     assert torch.equal(metadata_local.attn_mask, expected_rows)
 
 
+@pytest.mark.cpu
 def test_allgather_kv_rejects_invalid_joint_strategy():
     chunks = [[torch.zeros((1, 2, 1, 1)) for _ in range(2)] for _ in range(2)]
     strategy = AllGatherKVParallelAttention(_MockAllGatherSPGroup(rank=0, gather_chunks=chunks))
@@ -283,6 +286,7 @@ def test_allgather_kv_rejects_invalid_joint_strategy():
         strategy.pre_attention(torch.zeros((1, 2, 1, 1)), chunks[0][0], chunks[1][0], metadata)
 
 
+@pytest.mark.cpu
 def test_allgather_kv_preserves_global_spans_and_sets_query_ranges():
     strategy = AllGatherKVParallelAttention(
         _MockAllGatherSPGroup(
@@ -319,6 +323,7 @@ def test_allgather_kv_preserves_global_spans_and_sets_query_ranges():
     )
 
 
+@pytest.mark.cpu
 def test_allgather_kv_query_ranges_include_reused_prefix_offset():
     strategy = AllGatherKVParallelAttention(
         _MockAllGatherSPGroup(
@@ -357,6 +362,7 @@ def test_allgather_kv_query_ranges_include_reused_prefix_offset():
     assert torch.equal(metadata_out.attn_mask, expected_mask)
 
 
+@pytest.mark.cpu
 def test_allgather_kv_allows_empty_full_attn_spans():
     strategy = AllGatherKVParallelAttention(
         _MockAllGatherSPGroup(
@@ -379,6 +385,7 @@ def test_allgather_kv_allows_empty_full_attn_spans():
     assert metadata_out.query_ranges == (QueryRange(0, 2, 0),)
 
 
+@pytest.mark.cpu
 def test_allgather_kv_keeps_gathered_kv_compressed_for_gqa():
     rank = 0
     img_seq_local = 2
@@ -410,7 +417,6 @@ def test_allgather_kv_keeps_gathered_kv_compressed_for_gqa():
     torch.testing.assert_close(v_full, expected_value)
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=4)
 @pytest.mark.parametrize(
     "test_model_cls",
     [
@@ -420,10 +426,38 @@ def test_allgather_kv_keeps_gathered_kv_compressed_for_gqa():
 @pytest.mark.parametrize(
     ("ulysses_degree", "ring_degree", "allgather_degree", "num_kv_heads"),
     [
-        pytest.param(2, 2, 1, None, id="ulysses-ring"),
-        pytest.param(1, 1, 2, None, id="allgather-kv"),
-        pytest.param(1, 2, 1, 2, id="ring-gqa"),
-        pytest.param(1, 2, 1, 1, id="ring-mqa"),
+        pytest.param(
+            2,
+            2,
+            1,
+            None,
+            id="ulysses-ring",
+            marks=hardware_marks(res={"cuda": "L4", "rocm": "MI325"}, num_cards=4),
+        ),
+        pytest.param(
+            1,
+            1,
+            2,
+            None,
+            id="allgather-kv",
+            marks=hardware_marks(res={"cuda": "L4", "rocm": "MI325"}, num_cards=2),
+        ),
+        pytest.param(
+            1,
+            2,
+            1,
+            2,
+            id="ring-gqa",
+            marks=hardware_marks(res={"cuda": "L4", "rocm": "MI325"}, num_cards=2),
+        ),
+        pytest.param(
+            1,
+            2,
+            1,
+            1,
+            id="ring-mqa",
+            marks=hardware_marks(res={"cuda": "L4", "rocm": "MI325"}, num_cards=2),
+        ),
     ],
 )
 @pytest.mark.parametrize("batch_size", [2])
@@ -460,14 +494,14 @@ def test_sequence_parallel(
         pytest.skip(f"Test requires {sequence_parallel_size} GPUs but only {available_gpus} available")
 
     # Create temporary files to share results between processes
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".pkl") as f:
-        baseline_output_file = f.name
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".pkl") as f:
-        sp_output_file = f.name
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".pkl") as f:
-        model_state_file = f.name
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".pkl") as f:
-        input_data_file = f.name
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pkl") as tmp_file:
+        baseline_output_file = tmp_file.name
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pkl") as tmp_file:
+        sp_output_file = tmp_file.name
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pkl") as tmp_file:
+        model_state_file = tmp_file.name
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pkl") as tmp_file:
+        input_data_file = tmp_file.name
 
     try:
         # Step 1: Run without SP (baseline with ulysses_degree=1, ring_degree=1)
@@ -534,8 +568,8 @@ def test_sequence_parallel(
         # Step 3: Verify input consistency and compare outputs
         print(f"\n{'=' * 80}")
         print("Verifying input data consistency...")
-        with open(input_data_file, "rb") as f:
-            input_data = pickle.load(f)
+        with open(input_data_file, "rb") as input_stream:
+            input_data = pickle.load(input_stream)
         input_checksum = hash(input_data.tobytes())
         print(f"  Input data shape: {input_data.shape}")
         print(f"  Input data checksum: {input_checksum}")
@@ -543,10 +577,10 @@ def test_sequence_parallel(
 
         print(f"\n{'=' * 80}")
         print("Comparing outputs between baseline and SP...")
-        with open(baseline_output_file, "rb") as f:
-            baseline_output = pickle.load(f)
-        with open(sp_output_file, "rb") as f:
-            sp_output = pickle.load(f)
+        with open(baseline_output_file, "rb") as baseline_stream:
+            baseline_output = pickle.load(baseline_stream)
+        with open(sp_output_file, "rb") as sp_stream:
+            sp_output = pickle.load(sp_stream)
 
         # Convert to tensors for comparison
         baseline_tensor = torch.tensor(baseline_output)
@@ -597,9 +631,9 @@ def test_sequence_parallel(
 
     finally:
         # Clean up temporary files
-        for f in [baseline_output_file, sp_output_file, model_state_file, input_data_file]:
-            if os.path.exists(f):
-                os.remove(f)
+        for path in [baseline_output_file, sp_output_file, model_state_file, input_data_file]:
+            if os.path.exists(path):
+                os.remove(path)
 
 
 def ulysses_attention_on_test_model(

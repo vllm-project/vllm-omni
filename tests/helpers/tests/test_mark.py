@@ -85,6 +85,27 @@ def test_same_count_multi_platform_stays_one_item():
     assert "MI325" in names
 
 
+def test_rocm_multicard_marks_skip_an_undersized_rocm_worker(monkeypatch):
+    import vllm.platforms
+
+    class UndersizedRocmPlatform:
+        @staticmethod
+        def is_rocm() -> bool:
+            return True
+
+        @staticmethod
+        def device_count() -> int:
+            return 1
+
+    monkeypatch.setattr(vllm.platforms, "current_platform", UndersizedRocmPlatform())
+
+    marks = hardware_marks(res={"rocm": "MI325"}, num_cards=2)
+    skip = next(mark for mark in marks if mark.name == "skipif")
+
+    assert skip.args == (True,)
+    assert skip.kwargs == {"reason": "Need at least 2 ROCm GPUs to run the test."}
+
+
 def test_hardware_test_decorator_applies_cards_mark():
     @hardware_test(res={"cuda": "H100"}, num_cards=2)
     def _probe():
