@@ -932,6 +932,17 @@ def install_wan_spatial_shard_decode(
             out = orig_forward(x, feat_cache=feat_cache, feat_idx=feat_idx, first_chunk=first_chunk)
         finally:
             _SPATIAL_SHARD_CONTEXT.reset(token)
+        from vllm_omni.diffusion.layers.lingbot_pixel_output import current_pixel_output_policy, gather_final_pixels
+
+        pixel_policy = current_pixel_output_policy()
+        if pixel_policy is not None:
+            if pixel_policy.group is not group or (pixel_policy.rank, pixel_policy.world_size) != (rank, world_size):
+                raise RuntimeError("Pixel output policy owner/group changed during VAE execution")
+            if pixel_policy.planar_uint8:
+                return gather_final_pixels(
+                    out, policy=pixel_policy, split_dim=split_dim, expected_extent=expected_extent
+                )
+            return gather_and_trim_extent(out, expected_extent=expected_extent, split_dim=split_dim, group=group, dst=0)
         return gather_and_trim_extent(out, expected_extent=expected_extent, split_dim=split_dim, group=group, dst=dst)
 
     decoder.forward = MethodType(_forward, decoder)

@@ -73,6 +73,56 @@ This experimental mode stores the final noisy probe's KV rather than clean
 `x0` KV, so generated outputs can differ. The four denoising steps, chunk
 boundaries, and paged-context finalization remain the same.
 
+## Experimental Ascend SP8 output paths
+
+Two independent, default-disabled options are available for the eight-rank
+streaming path. They are candidates for device validation and do not establish
+a measured speedup or realtime acceptance. A working NPU attention backend is
+a prerequisite; the NPU enablement work is tracked in
+[#8112](https://github.com/vllm-project/vllm-omni/pull/8112).
+
+Set these on the streaming stage's `model_config`, rather than per-request
+`extra_args`:
+
+```yaml
+model_config:
+  lingbot_npu_pixel_output_mode: native
+  lingbot_npu_leased_post_attention: false
+```
+
+`lingbot_npu_pixel_output_mode` accepts:
+
+| Mode | Final output behavior |
+| --- | --- |
+| `native` | Existing floating-point All-Gather and pixel conversion on every rank. |
+| `root_float` | Preserve the floating-point All-Gather; only group rank zero assembles, converts and copies pixels to CPU. |
+| `root_uint8_allgather` | Convert each spatial shard to uint8 before the final All-Gather; rank zero assembles and copies the result. |
+| `root_uint8_p2p` | Convert each shard to uint8, then use batched point-to-point send/receive to collect only on rank zero. |
+
+The non-native modes require eight-rank NPU width sharding, an unpatched
+streaming VAE and a request-owned decode cache. Unsupported geometry selects
+the native path before decoder execution. Every rank still runs the complete
+local decoder, halo exchange and temporal-cache update. Non-output ranks
+return chunk metadata without a video payload. VAE attention collectives,
+frame counts, encoding FPS and camera sampling stay on their existing paths.
+Pixel conversion retains the original clamp, decoder-precision arithmetic,
+FP32 scaling and rounding order.
+
+`lingbot_npu_leased_post_attention: true` requires SP8, TP1 and the native
+BF16 `self.o` projection. It captures projection, residual, camera affine and
+normalization using two independent buffer slots and graph pools. The reverse
+All-to-All reassembly writes the fixed projection input; cross-attention reads
+borrowed graph outputs until its residual has been submitted. Completion events
+prevent slot reuse while any consumer remains in flight. The graph does not
+capture communication, KV writeback or VAE-cache advancement.
+
+Changed parameter owners or an execution failure abort the candidate; there
+is no mid-execution fallback. The launch-owned optional fatal-receipt channel
+retains active owners and reports that all eight workers must be restarted.
+These experimental modes require eight-rank correctness, paired model timing
+and lifecycle validation before enabling them in a serving deployment. CPU
+ownership tests alone do not provide that acceptance.
+
 ## Realtime in-process generation (deprecated)
 
 Prefer [Streaming video serving](#streaming-video-serving) for mid-session
