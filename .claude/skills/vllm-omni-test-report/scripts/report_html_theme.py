@@ -2160,19 +2160,6 @@ RELEASE_MARKDOWN_DOC_CSS = """
   letter-spacing: 0.02em;
 }
 
-/* Development-report Metrics overview: highlight at-risk snapshot rows in red.
-   Used by compose_full_report.py --kind development when the helper wraps an
-   alert-bearing cell in <span class="dev-snapshot-alert">…</span>. */
-.release-doc .dev-snapshot-alert {
-  display: inline-block;
-  padding: 0.05em 0.55em;
-  border-radius: 6px;
-  background: color-mix(in srgb, var(--dashboard-alert-bg, rgba(209,67,67,0.11)) 88%,
-    var(--dashboard-panel-bg, #ffffff));
-  color: var(--dashboard-alert, #d14343);
-  font-weight: 700;
-}
-
 /* UT coverage editable cell — sits inline inside the Result column of the
    Development Metrics overview. The cell renders **only the value** (no
    inline editor / reset / saved-hint buttons) so the row reads the same

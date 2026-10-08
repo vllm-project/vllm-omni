@@ -673,141 +673,75 @@ def render_resource_usage_section() -> str:
     )
 
 
-def _dev_alert_cell(value: str, alert: bool) -> str:
-    """Wrap a snapshot cell value in ``<span class=\"dev-snapshot-alert\">`` when alert=True.
+def _development_snapshot_table_md() -> str:
+    """The Development **Metrics overview** snapshot table + detail bullets.
 
-    In the rendered HTML this is colored red via the CSS rule in
-    ``RELEASE_MARKDOWN_DOC_CSS`` (``.release-doc .dev-snapshot-alert``).
-    When alert=False the raw value is returned unchanged; the Markdown stays
-    plain ``**value**`` (no inline HTML).
+    Two operator-editable rows — **UT coverage** and **Device-Hours / Build**.
+    Both cells ship as marker placeholders that the HTML conversion step
+    (:func:`release_md_to_html.convert_release_report_markdown`) substitutes
+    with click-to-edit inputs persisted via ``localStorage``:
+
+    | Row | Control |
+    |-----|---------|
+    | UT coverage | ``@@UT_CELL_INSERTION_POINT@@`` → editable cell (value persists in ``localStorage``) |
+    | Device-Hours / Build | ``@@DEVICE_HOURS_PER_BUILD_CELL@@`` → editable ``<input>`` (:func:`release_md_to_html._upgrade_device_hours_cell`; persists in ``localStorage['device-hours-per-build']`` — the same control as the release Metrics overview row) |
+
+    Shared by the live path (:func:`render_development_metrics_overview`) and
+    ``render_development_report_markdown_preview`` so the two never drift.
     """
-    if not alert:
-        return value
-    return f'<span class="dev-snapshot-alert">{value}</span>'
-
-
-def render_development_metrics_overview(
-    token: str,
-    gh_token: str | None,
-    *,
-    now: datetime | None = None,
-) -> tuple[str, int, int, list[dict], dict[str, bool]]:
-    """
-    Markdown body for the **Development** report's ``## Metrics overview`` section.
-
-    Layout (per spec for ``--kind development``):
-
-      A. **Key snapshot table** — 2 rows, each row turns red via
-         ``<span class="dev-snapshot-alert">…</span>`` when its threshold is breached:
-
-         | Row label | Alert condition (red) |
-         |-----------|-----------------------|
-         | Outstanding DI | DI > 30 (i.e. ``total_tenths > BUG_DI_THRESHOLD_TENTHS``) |
-         | Open Critical Issue | open critical issues > 0 |
-
-      B. **DI Top10** — top-10 DI issues (SLO-escalating model).
-
-    Returns ``(markdown, combined_count, critical_count, di_per_issue, alerts)``
-    where ``alerts`` maps row key → bool (True ⇔ red).
-
-    ``now`` is forwarded to :func:`_compute_di_top10_slo` so the snapshot and
-    the Top10 sub-table stay on the same time base as any other report (notably
-    nightly Daily focus) generated in the same batch.
-    """
-    # 1) Outstanding DI: total from ALL open label:bug issues using the
-    #    SLO-escalating model (same model as DI Top10).
-    di_total, di_per_issue = _compute_di_top10_slo(gh_token, now=now)
-    di_tenths = int(round(di_total * 10)) if di_total is not None else None
-    di_detail_parts = []
-    if di_tenths is not None:
-        n_issues = len(di_per_issue) if di_per_issue else 0
-        di_detail_parts.append(f"SLO-escalating Outstanding DI={_format_di_tenths(di_tenths)} ({n_issues} open bugs)")
-    di_detail = "; ".join(di_detail_parts) if di_detail_parts else "Unable to compute"
-    di_alert = bool(di_tenths is not None and di_tenths > BUG_DI_THRESHOLD_TENTHS)
-    di_value = f"**{_format_di_tenths(di_tenths)}**" if di_tenths is not None else "*N/A*"
-    di_cell = _dev_alert_cell(di_value + (f" — {di_detail}" if di_detail else ""), di_alert)
-    if di_tenths is None:
-        di_cell = _dev_alert_cell(f"*N/A* ({di_detail})", False)
-
-    # 2) Open critical issues (alert when count > 0)
-    crit_n, crit_detail = open_critical_labeled_issue_count(gh_token)
-    crit_alert = bool(crit_n and crit_n > 0)
-    if crit_n is None:
-        crit_value = f"*N/A* ({crit_detail})"
-    elif crit_n == 0:
-        crit_value = "**0** (no open critical issues)"
-    else:
-        crit_value = f"**{crit_n}** (open): {crit_detail.split('Open issues with labels `bug` + `critical`: ', 1)[-1]}"
-    crit_cell = _dev_alert_cell(crit_value, crit_alert)
-
-    di_top10_n = min(10, len(di_per_issue))
-
     snapshot_header = ["Metric (Development)", "Result"]
-    # Build the snapshot as a regular Markdown table so it survives the
-    # markdown-to-HTML pass cleanly. The UT coverage row uses the
-    # ``<!--UT-CELL-INSERTION-POINT-->`` placeholder, which
-    # ``release_md_to_html`` substitutes with the editable raw HTML cell
-    # (registered via ``_ut_coverage_submit_script``).
     snapshot_rows = [
-        ["**Outstanding DI** (all open `label:bug`, weighted by priority)", di_cell],
-        ["**Open Critical Issue** (labels `bug` + `critical`, open)", crit_cell],
         [
             "**UT coverage** (Unit Test coverage; click the cell to edit & persist locally)",
             "@@UT_CELL_INSERTION_POINT@@",
         ],
+        [
+            "**Device-Hours / Build** (compute burn; click the cell to edit & persist locally)",
+            DEVICE_HOURS_PER_BUILD_MARKER,
+        ],
     ]
     snapshot_table = render_markdown_table(snapshot_header, snapshot_rows)
 
-    detail_lines: list[str] = []
-    if di_tenths is not None and di_detail:
-        detail_lines.append(f"- DI detail: {di_detail}")
-    if crit_n:
-        detail_lines.append(
-            "- Critical list source: [open critical](https://github.com/vllm-project/vllm-omni/issues?q=is%3Aissue+state%3Aopen+label%3Acritical)."
-        )
-    detail_lines.append(
-        "- DI Top10 uses the SLO-escalating model (same as nightly Daily focus): `DI = base × ⌈days_open / slo_days⌉`."
-    )
-    detail_lines.append(
-        "- Red highlight rules: DI > 30 => red; open critical issue > 0 => red"
-        " (see ``references/development-metrics-alerts.md``)."
-    )
-    snapshot_md = (
-        "**Quick Overview (Development report only — red highlight indicates alert)**\n\n"
+    detail_lines = [
+        "- Both cells are operator-editable and persist locally: UT coverage via the "
+        "editable cell, Device-Hours / Build via ``localStorage['device-hours-per-build']`` "
+        "(the same editable control as the release Metrics overview row).",
+        "- The former auto-fetched rows (Outstanding DI, Open Critical Issue) were "
+        "removed per operator request; the DI ladder remains visible in the "
+        "**nightly** report's Daily focus card and the issue-monitor report.",
+    ]
+    return (
+        "**Quick Overview (Development report only — both cells are click-to-edit "
+        "and persisted locally)**\n\n"
         f"{snapshot_table}\n\n" + "\n".join(detail_lines)
     )
 
-    # NOTE: The Development report intentionally omits the per-issue "Top DI
-    # Contributors" table. The full ranked table (with editable Assignee /
-    # Maintainer / Bugfix cells) lives in the **nightly** focus card; for the
-    # development audience only the cumulative 2-row snapshot above is needed.
-    # Callers that still need the ranked list should query
-    # :func:`_compute_di_top10_slo` directly (it's used internally for the
-    # Outstanding DI total above). The 2-row snapshot keeps its red-alert rules
-    # (DI > 30 ⇒ red; open critical > 0 ⇒ red).
 
+def render_development_metrics_overview() -> str:
+    """
+    Markdown body for the **Development** report's ``## Metrics overview`` section.
+
+    Layout (per spec for ``--kind development``): a key snapshot table with two
+    operator-editable rows — **UT coverage** and **Device-Hours / Build**. No
+    network calls are made from this section; both cells are marker placeholders
+    upgraded by the HTML conversion into click-to-edit inputs that persist via
+    ``localStorage``. (The former auto-fetched Outstanding DI / Open Critical
+    Issue rows were removed per operator request; the DI ladder lives in the
+    nightly report's Daily focus card and the issue-monitor report.)
+    """
+    snapshot_md = _development_snapshot_table_md()
     section_md = (
         f"## Metrics overview\n\n"
         f"Source: `scripts/compose_full_report.py --kind development`; "
         f"Based on the release report layout, the **Test conclusion** "
-        f"section is removed, and this section is expanded to "
-        f"reflect outstanding development-side issues "
-        f"(2-row snapshot). The full per-issue ranked table is intentionally "
-        f"not rendered here — see the **nightly** report's "
-        f'"Top DI Contributors" section for the editable top-N table.\n\n'
+        f"section is removed, and this section carries the operator-editable "
+        f"snapshot (**UT coverage** · **Device-Hours / Build**). Both cells "
+        f"are click-to-edit and persist locally; no metric is auto-fetched "
+        f"here — the DI ladder lives in the **nightly** report's Daily focus "
+        f"card and the issue-monitor report.\n\n"
         f"{snapshot_md}\n"
     )
-    alerts = {
-        "di": di_alert,
-        "critical": crit_alert,
-    }
-    return (
-        section_md,
-        di_top10_n,
-        (crit_n if crit_n is not None else 0),
-        di_per_issue,
-        alerts,
-    )
+    return section_md
 
 
 def render_development_report_markdown_preview(
@@ -821,54 +755,14 @@ def render_development_report_markdown_preview(
     Same layout as the live **development** report, but no network / subprocess calls.
     Used by ``--preview --kind development``.
     """
-    # Preview snapshot rows demonstrate red-alert conditions for the first two rows.
-    snapshot_rows = [
-        [
-            "**Outstanding DI** (all open `label:bug`, weighted by priority)",
-            _dev_alert_cell("**42.3** *(Preview: intentionally > 30, demonstrating red highlight)*", True),
-        ],
-        [
-            "**Open Critical Issue** (labels `bug` + `critical`, open)",
-            _dev_alert_cell(
-                "**1** open: [#10077](https://github.com/vllm-project/vllm-omni/issues/10077)",
-                True,
-            ),
-        ],
-    ]
-    snapshot_table = render_markdown_table(["Metric (Development)", "Result"], snapshot_rows)
-
-    di_top10_preview = render_markdown_table(
-        ["#", "Title", "Priority", "Days", "DI", "Assignee", "Bugfix"],
-        [
-            [
-                "[#10055](https://github.com/vllm-project/vllm-omni/issues/10055)",
-                "OOM when loading Qwen-Omni with FP8 on 40GB *(example)*",
-                "high priority",
-                "14",
-                "8.4",
-                "—",
-                "—",
-            ],
-            [
-                "[#10030](https://github.com/vllm-project/vllm-omni/issues/10030)",
-                "Inference timeout on large batch *(example)*",
-                "critical",
-                "3",
-                "30",
-                "@alice",
-                "[#10040](https://github.com/vllm-project/vllm-omni/pull/10040)",
-            ],
-        ],
-    )
-
+    # Preview snapshot mirrors the live development snapshot exactly (shared
+    # builder) so the two never drift: UT coverage + Device-Hours / Build,
+    # both marker placeholders upgraded by the HTML conversion step.
     metrics_block = (
         "## Metrics overview\n\n"
         "*This section uses **preview placeholder data**: `compose_full_report.py --kind development` "
         "was not run; values below are layout demos only.*\n\n"
-        "**Quick Overview (Development report only — red highlight indicates alert)**\n\n"
-        f"{snapshot_table}\n\n"
-        "### DI Top10 (SLO-escalating: `DI = base × ⌈days_open / slo_days⌉`)\n\n"
-        f"{di_top10_preview}\n"
+        f"{_development_snapshot_table_md()}\n"
     )
 
     # 1) Test Result: Overall test execution summary table + per-GPU nightly
@@ -951,10 +845,10 @@ def render_development_report_markdown_preview(
 - **Skip Test Case Monitoring:** top-level section; one hardcoded 5-row preview
    (no AST scan, no `git pull`, no GitHub API call). Two preview rows share one
    issue number so the per-issue collapsible grouping is visible.
-- **Metrics overview:** GitHub REST
-   (`label:bug`, `label:bug+critical` AND filter, DI Top10 SLO-escalating model).
-   2-row snapshot; each row turns red via `<span class="dev-snapshot-alert">` when
-   threshold breached.
+- **Metrics overview:** operator-editable 2-row snapshot (**UT coverage** ·
+   **Device-Hours / Build**). Both cells are click-to-edit inputs persisted via
+   `localStorage` (Device-Hours / Build reuses the release Metrics overview
+   control, `localStorage['device-hours-per-build']`). No GitHub REST calls.
 - **Outstanding Items:** Manual-entry action table with Add Item
    capability (HTML only; persisted via localStorage).
 - Live report: `buildkite_build_stats`, GitHub REST
@@ -987,10 +881,6 @@ OPEN_ISSUE_ACTION_CELLS: list[str] = ["\u2014", "\u2014"]
 #: is not in this set \u2014 ``low priority``, ``invalid``, or
 #: unlabelled-priority bugs \u2014 are dropped by
 #: :func:`github_open_bug_rows_in_range` when ``priority_filter=`` is set.
-#: The Development variant is unaffected (it uses ``all_open=True`` which
-#: goes through a different code path and is intentionally left
-#: unfiltered so the Outstanding DI / DI Top10 / CI-Failure snapshot
-#: sees the full backlog).
 OPEN_ISSUES_RELEASE_PRIORITIES: frozenset[str] = frozenset(
     {"critical", "high priority", "medium priority"}
 )
@@ -2833,9 +2723,9 @@ def main() -> None:
             "Quality Defense Radar (per-model 7-axis coverage across 10 flagship models). "
             "``development`` — same Test Result layout as release, but **Test conclusion** and "
             "**Open issues** sections are omitted and **Metrics overview** is replaced with "
-            "a Development-flavored 2-row snapshot (Outstanding DI · Open Critical Issue). "
-            'Each row turns red via ``<span class="dev-snapshot-alert">`` '
-            "when its threshold is breached: DI>30, open critical issue>0."
+            "a Development-flavored 2-row operator-editable snapshot "
+            "(UT coverage · Device-Hours / Build); both cells are click-to-edit "
+            "and persisted via ``localStorage``."
         ),
     )
     parser.add_argument(
@@ -3131,11 +3021,10 @@ def main() -> None:
             include_b200=False,
         )
 
-        dev_metrics_md, combined_n, critical_n, di_per_issue, _alerts = render_development_metrics_overview(
-            token, gh_token, now=report_now
-        )
+        dev_metrics_md = render_development_metrics_overview()
         # open_issues_block is intentionally omitted from the development variant
-        # (DI Top10 is shown in Metrics overview instead).
+        # (Metrics overview is fully operator-editable; the DI ladder lives in
+        # the nightly report's Daily focus card + the issue-monitor report).
 
         # Next Steps (Outstanding Items): manual-entry action table
         next_steps_block = render_next_steps_section()
@@ -3175,15 +3064,11 @@ def main() -> None:
 ## Data source
 
 - **Kind:** `compose_full_report.py --kind development`
-- **Metrics overview (Development, key 2 items + red threshold):**
-  - Outstanding DI = SLO-escalating model: `DI = base × ⌈days_open / slo_days⌉` for **all** open `label:bug`
-    (no stats-window filter; snapshot at report time). **Red threshold:** > 30.
-  - Open Critical Issue = GitHub REST `GET /repos/vllm-project/vllm-omni/issues?state=open&labels=bug,critical`
-    (AND filter — only issues with both `bug` AND `critical` labels; RFC / Feature tickets tagged
-    only `critical` are excluded). **Red threshold:** count > 0.
-- **Red highlight implementation:** Row cells are wrapped in
-  `<span class="dev-snapshot-alert">…</span>`; see CSS in
-  `release_html_theme.RELEASE_MARKDOWN_DOC_CSS` for `.release-doc .dev-snapshot-alert`.
+- **Metrics overview (Development, 2 operator-editable rows):**
+  - UT coverage — click-to-edit cell; value persists locally via `localStorage`.
+  - Device-Hours / Build — click-to-edit input; value persists via
+    `localStorage['device-hours-per-build']` (the same editable control as the
+    release Metrics overview row). No metric is auto-fetched in this section.
 - **Test Result:** Common stack from `references/local-test-matrix.md`; H200/H800/A100/A3 via
   `--log-dir-h200` / `--log-dir-h800` / `--log-dir-a100` / `--log-dir-a3`. **The H100
   (CI — Buildkite scheduled nightly) chapter is intentionally omitted from the
@@ -3211,8 +3096,8 @@ def main() -> None:
   sharing an issue under **one collapsible group row** (click the row or its
   caret to expand; *Expand all* / *Collapse all* buttons sit above the table).
   Markdown output keeps the flat, Issue-#-first table.
-- **Open issues:** This section is **omitted** from the development variant (the key data
-  is already shown in the DI Top10 sub-table within Metrics overview).
+- **Open issues:** This section is **omitted** from the development variant (the DI ladder
+  lives in the nightly report's Daily focus card and the issue-monitor report).
 """
         out_path.write_text(
             convert_release_report_markdown(
@@ -3220,7 +3105,7 @@ def main() -> None:
                 l2_l3_row_ok=True,
                 l2_l3_row_detail="",
                 di_row_ok=True,
-                di_row_detail="(Development: Test conclusion omitted; DI still accessible via Metrics overview)",
+                di_row_detail="(Development: Test conclusion omitted)",
                 critical_row_ok=True,
                 critical_row_detail="",
             ),
