@@ -1889,3 +1889,30 @@ memory a full-length activation volume takes (10.1 GiB against 5.6 GiB at
 - [Supported models](../../docs/models/supported_models.md)
 - [Video API](../../docs/serving/videos_api.md)
 - [Diffusion parallelism](../../docs/user_guide/diffusion/parallelism/overview.md)
+
+### Exact output dimensions
+
+Set `extra_args.exact_output_size` to `true` with explicit even `width` and
+`height` to preserve the requested output dimensions. For example:
+
+```json
+{
+  "prompt": "A red sailboat crosses a calm lake at sunrise.",
+  "width": 1920,
+  "height": 1080,
+  "num_inference_steps": 50,
+  "extra_args": {"task": "t2va", "aspect_ratio": "16:9", "exact_output_size": true}
+}
+```
+
+H3 denoises on the next 32-aligned canvas (1920×1088 here), then center-crops
+4 pixels from each vertical edge during tensor or chunked MP4 decoding. It
+produces 1920×1080 frames without resizing; portrait 1080×1920 works the same
+way. Without this option, the existing rounding-down behavior is unchanged.
+
+This option supports full-mode generation, including image and reference
+conditioning. It rejects editing inputs, continuation mode, `latent_refine`,
+and `latent_upscale`; those paths need their own coordinate handling. Width
+and height must be even and at least 32, with aspect ratio in [1:4, 4:1].
+Existing task requirements, such as T2VA’s named `aspect_ratio`, still apply.
+It does not establish model quality or performance at that resolution.
