@@ -18,12 +18,24 @@ The generic example formats the AR prompt, drives the AR → DiT stage pipeline,
 and forwards MammothModa2-specific generation parameters through the
 pipeline-declared `extra_body` contract.
 
-MammothModa2's DiT stage runs in the shared diffusion runtime in request mode.
-The first integration intentionally supports one request and one image per
-forward only (`max_num_seqs: 1`, `num_outputs_per_prompt: 1`). Request-level
-batching, step execution, continuous batching, cache acceleration,
-compilation, quantization, parallelism, and offload are not enabled by this
-recipe.
+MammothModa2's DiT stage runs in the shared diffusion runtime. The default
+`mammoth_moda2.yaml` uses request-level batching with up to eight compatible
+requests (`max_num_seqs: 8`) and one image per request
+(`num_outputs_per_prompt: 1`). TeaCache and Cache-DiT are optional alternative
+cache backends in request mode. Enable TeaCache with `--cache-backend tea_cache`
+as shown below, or enable Cache-DiT using the commented settings in that YAML.
+Compilation, DiT quantization, parallelism, and offload are not enabled by
+these presets.
+
+To use step execution and continuous batching, select
+[`mammoth_moda2_step.yaml`](../../vllm_omni/deploy/mammoth_moda2_step.yaml)
+with `--deploy-config vllm_omni/deploy/mammoth_moda2_step.yaml` in the
+text-to-image commands below. This preset inherits the same stage placement
+and capacity, enables step execution for Stage 1, and disables request-batch
+admission waiting and diffusion cache acceleration. Compatible requests can
+join between denoising steps and finish independently, including requests
+with different inference-step counts. Step mode cannot be combined with
+TeaCache, Cache-DiT, or other diffusion cache backends.
 
 Image size, seed, guidance, and denoising steps use the standard diffusion
 request fields. `cfg_range` remains a MammothModa2-specific `extra_body`
@@ -59,7 +71,9 @@ the measured results are summarized below.
 ### Optional FP8 AR KV cache
 
 For CUDA deployments, `mammoth_moda2_fp8_kv.yaml` is an opt-in preset that
-stores the Stage 0 AR KV cache as FP8 E4M3. Stage 1 remains on
+keeps the Stage 0 AR KV cache of decoder layer 0 in BF16 and stores the other
+27 layers as FP8 E4M3 (`kv_cache_dtype_skip_layers: ["0"]`; write the layer
+indices as quoted strings). Stage 1 remains on
 `kv_cache_dtype=auto`; its DiT execution is unaffected. This setting quantizes
 only the autoregressive KV cache. It is neither FP8 weight/activation
 quantization nor vLLM-Omni diffusion KV-cache quantization.
@@ -78,9 +92,9 @@ python examples/offline_inference/text_to_image/text_to_image.py \
   --output mammoth_t2i.png
 ```
 
-The preset was validated on one NVIDIA H800 80GB with CUDA and
-FlashAttention 3. The native and FP8 runs used the same model, code revision,
-and downstream configuration.
+The preset was first validated on one NVIDIA H800 80GB with CUDA and
+FlashAttention 3, with every layer in FP8. The native and FP8 runs used the
+same model, code revision, and downstream configuration.
 
 | Metric | Native BF16 (`kv_cache_dtype=auto`) | FP8 E4M3 (`fp8_e4m3`) | Change |
 | --- | ---: | ---: | ---: |
@@ -97,9 +111,30 @@ twice as many tokens because FP8 reduces the bytes per cached token. This is a
 capacity/concurrency tradeoff: the measured AR and end-to-end latencies were
 higher than the native-BF16 baseline.
 
-1024x1024 fixed-seed smoke test completed successfully with no obvious visual
-failure. FP8 is lossy, so numerical or image-quality equivalence with BF16 is
-not implied.
+On H800, a 1024x1024 fixed-seed smoke test with every layer in FP8 completed
+successfully with no obvious visual failure. FP8 is lossy, so numerical or
+image-quality equivalence with BF16 is not implied.
+
+On one A800 80GB (vLLM 0.30.0), FP8 KV layers run on FlashInfer and BF16 layers
+on FlashAttention 2. Text-to-image at 1024x1024, 50 steps, guidance 4.0, seeds 42
+and 1-5, with a studio tabby cat prompt and a peephole-view Samoyed prompt;
+an image counts when it shows the prompted subject and scene.
+
+| Stage 0 KV cache | GPU KV cache size | Cat images that follow the prompt | Samoyed images that follow the prompt |
+| --- | ---: | ---: | ---: |
+| BF16 on all 28 layers (`auto`) | 147,408 tokens | 6/6 | 6/6 |
+| FP8 E4M3 on all 28 layers | 294,816 tokens | 1/6 | 0/6 |
+| Layer 0 BF16, other 27 layers FP8 E4M3 (this preset) | 284,640 tokens | 6/6 | 6/6 |
+
+The KV cache sizes above still count the 28 attention layers of the replaced
+Qwen-VL language model, which #8095 removes: with it, BF16 goes from 147,408 to
+294,816 tokens and all-FP8 from 294,816 to 589,632. The prompt-following
+columns do not depend on it.
+
+With all 28 layers in FP8, most cat images become a framed print on a wall.
+Keeping layer 0 in BF16 restores them; keeping only layer 27, which has the
+largest key magnitude, does not. The H800 numbers above were measured with all 28
+layers in FP8; this preset has been run on A800 only.
 
 ### 1x L40S 48GB
 
@@ -153,7 +188,30 @@ sets the relative step range `[start, end]` over which CFG is applied (default
 `[0.0, 1.0]`). For compatibility, `text_guidance_scale` and
 `num_inference_steps` remain accepted `extra_body` aliases and, when non-null,
 take precedence over the standard request fields. Model extras are filtered
-against the declared `extra_body_params` (see
+against the declared `extra_body_params`.
+
+TeaCache can be enabled for the DiT stage with the same user-facing sampling
+parameters:
+
+```bash
+python examples/offline_inference/text_to_image/text_to_image.py \
+  --model ./MammothModa2-Preview \
+  --deploy-config vllm_omni/deploy/mammoth_moda2.yaml \
+  --prompt "A stylish woman riding a motorcycle in NYC, movie poster style" \
+  --height 1024 \
+  --width 1024 \
+  --guidance-scale 4.0 \
+  --num-inference-steps 50 \
+  --cache-backend tea_cache \
+  --extra-body '{"cfg_range": [0.0, 1.0]}' \
+  --output mammoth_t2i_teacache.png
+```
+
+The bundled TeaCache coefficients were fitted from MammothModa2 full-compute
+traces. MammothModa2 uses the model-specific default `rel_l1_thresh=0.075`,
+selected for the evaluated 1024x1024, 50-step configuration.
+
+The model-specific keys are declared in
 [`vllm_omni/model_extras/mammothmodal2_preview.py`](../../vllm_omni/model_extras/mammothmodal2_preview.py)),
 so unknown MammothModa2 extras may be dropped.
 
@@ -264,7 +322,54 @@ python3 examples/offline_inference/text_to_image/text_to_image.py \
 
 The first request took 85.224 seconds. The AR stage generated 4,161 visual tokens in 72.996 seconds, and the DiT stage took 12.163 seconds. AR weight loading used 21.4 GiB and took 8.250 seconds. DiT weight loading used 5.49 GiB and took 1.824 seconds. The largest one second whole device memory sample was 106.57 GiB, including the AR KV cache reserved by the 0.5 memory setting.
 
+### 1x A800 80GB, MammothModa2 Preview (serving)
+
+#### Environment
+
+- OS: Linux, x86_64
+- CPU: 18 cores
+- GPU: one NVIDIA A800-SXM4-80GB
+- Deploy config: `vllm_omni/deploy/mammoth_moda2.yaml` (default split: AR `gpu_memory_utilization` 0.5, DiT 0.3)
+- vLLM-Omni version or commit: use the commit you are deploying from
+
+#### Serving Commands
+
+```bash
+vllm-omni serve bytedance-research/MammothModa2-Preview --omni \
+    --port 8091 \
+    --trust-remote-code
+
+python benchmarks/diffusion/diffusion_benchmark_serving.py \
+    --model bytedance-research/MammothModa2-Preview \
+    --endpoint /v1/images/generations \
+    --host 127.0.0.1 --port 8091 \
+    --height 1024 --width 1024 --num-inference-steps 50 \
+    --extra-body '{"text_guidance_scale": 9.0, "cfg_range": [0.0, 1.0]}' \
+    --num-prompts 8 --seed 142 --warmup-requests 0 \
+    --output-file mm2_1024_s50_c1.json
+```
+
+#### Verification
+
+On 1024x1024 / 50 steps, single-concurrency end-to-end mean latency is ~96 s
+(P99 ~101 s) per image and concurrency-4 mean is ~151 s (~0.024 img/s);
+steady-state combined GPU memory is ~50.4 GiB (AR ~39.2 GiB, DiT ~11.1 GiB).
+The AR stage dominates (~77 s of a ~96 s request) because it decodes a fixed
+4,161-token visual grid per image, so latency is insensitive to prompt length
+and scales only partially with DiT step count. See the
+[serving performance dashboard](../../benchmarks/diffusion/performance_dashboard/mammoth_moda2_serving_performance.md)
+for the full sweep, peak-memory, and component-attribution data.
+
 The output was a valid 1024 by 1024 RGB PNG.
+
+### Startup benchmark
+
+The [startup benchmark](../../benchmarks/mammoth_moda2/README.md) provides
+commands, measurement boundaries and a single-A800 eager baseline. On that
+16-CPU-quota machine, parallel stage initialization and 16 CPU threads reduced
+`Omni()` initialization from about 60 s to 37 s. See the benchmark for the
+configuration and limitations; CUDA-graph mode needs separate memory and
+quality validation.
 
 ## MammothModa2-Dev unified inference
 

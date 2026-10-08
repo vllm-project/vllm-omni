@@ -187,3 +187,69 @@ def test_empty_text_stream_skips_the_kernel(monkeypatch, with_mask):
         image_rotary_emb=(angles.cos(), angles.sin()),
     )
     assert out.shape == (BATCH, 0, DIM)
+
+
+def test_model_owns_repeated_pair_rope_contract():
+    from vllm_omni.diffusion.models.mammoth_moda2.mammothmoda2_dit_model import Transformer2DModel
+    from vllm_omni.diffusion.models.mammoth_moda2.rope_real import RotaryPosEmbedReal
+
+    with set_current_diffusion_config(_SDPA_CONFIG):
+        model = Transformer2DModel(
+            hidden_size=48,
+            num_attention_heads=6,
+            num_kv_heads=2,
+            num_layers=1,
+            num_refiner_layers=1,
+            multiple_of=8,
+            ffn_dim_multiplier=1.0,
+            axes_dim_rope=(2, 2, 4),
+            axes_lens=(8, 8, 8),
+            text_feat_dim=32,
+        )
+    for blocks in (model.layers, model.noise_refiner, model.ref_image_refiner, model.context_refiner):
+        assert all(block.attn.processor.rope_repeats_pairs for block in blocks)
+    assert not _block(2).attn.processor.rope_repeats_pairs
+    freqs = RotaryPosEmbedReal.get_freqs_real((2, 2, 4), (8, 8, 8), 10000)
+    ids = torch.tensor([[[0, 1, 2], [3, 4, 5]], [[1, 0, 3], [2, 5, 4]]])
+    cos, sin = model.rope_embedder._get_freqs_real(freqs, ids)
+    for table in (cos, sin):
+        torch.testing.assert_close(table[..., 0::2], table[..., 1::2], atol=0, rtol=0)
+    assert not torch.equal(cos[0], cos[1])
+
+
+def test_embedding_preparation_preserves_stubbed_rope_tables(monkeypatch):
+    from types import SimpleNamespace
+
+    from torch import nn
+
+    import vllm_omni.diffusion.models.mammoth_moda2.mammothmoda2_dit_model as mammoth_dit
+
+    # Embedding-only tests can stub the RoPE producer without constructing
+    # attention layers or supplying full transformer configuration.
+    model = object.__new__(mammoth_dit.Transformer2DModel)
+    nn.Module.__init__(model)
+    object.__setattr__(model, "_internal_dict", SimpleNamespace(patch_size=2))
+
+    class CaptionEmbedding(nn.Module):
+        def forward(self, timestep, text, dtype):
+            return torch.zeros(2, 8), text
+
+    model.time_caption_embed = CaptionEmbedding()
+    model.x_embedder = nn.Identity()
+    model.rope_embedder = lambda *args: (None, None, None, None, [4, 4], [8, 8])
+
+    def forbid_gate(*args):
+        raise AssertionError("Embedding preparation must not resolve the fusion token gate")
+
+    monkeypatch.setattr(mammoth_dit, "fused_qk_norm_rope_min_tokens", forbid_gate)
+    prepared = model._prepare_embeddings(
+        torch.zeros(2, 4, 4, 4),
+        torch.ones(2),
+        torch.zeros(2, 4, 8),
+        torch.ones(2, 4, dtype=torch.bool),
+        torch.zeros(1),
+        2,
+        4,
+        4,
+    )
+    assert prepared[6:9] == (None, None, None)

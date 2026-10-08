@@ -8,11 +8,9 @@ history stays honest, and a dropped connection can resume the same session.
 This page covers how to run a duplex deployment, how to drive it from Python
 with `vllm_omni.clients.duplex.DuplexClient`, and the complete wire contract.
 
-The endpoint is served for models that ship a duplex plugin — including
-MiniCPM-o 4.5 and Qwen3-Omni — and just for deploy configurations that declare
-`session_mode: duplex`. PersonaPlex and Nemotron VoiceChat are ported to the
-plugin contract in follow-up PRs and are not served over this endpoint yet. The runtime architecture
-is described in [Full-Duplex Runtime (MiniCPM-o 4.5)](../design/fullduplex.md).
+The endpoint requires a duplex plugin and a deployment with `session_mode: duplex`.
+See [supported models and deployments](full_duplex_api.md#enable-full-duplex)
+and the [runtime architecture](../design/fullduplex.md).
 
 ## Qwen3-Omni conversation history
 
@@ -56,7 +54,7 @@ vllm-omni serve openbmb/MiniCPM-o-4_5 \
 ```
 
 `vllm_omni/deploy/minicpmo_4_5.yaml` declares `session_mode: duplex` and
-`duplex_session.max_sessions: 4`. Because the MiniCPM-o 4.5 pipeline declares a
+`duplex_session.max_sessions: 16`. Because the MiniCPM-o 4.5 pipeline declares a
 `duplex_plugin`, `vllm-omni serve` runs it through `DuplexOmni`: the server
 mounts `ws://<host>:8099/v1/realtime?duplex=1` (this page; `ws://<host>:8099/v1/duplex`
 is an alias of the same route), `POST /v1/chat/completions`, `/v1/models` and
@@ -252,6 +250,40 @@ call; transport failures raise `DuplexConnectionError`; a session that ends
 while you are awaiting it raises `DuplexSessionClosedError`. All three derive
 from `DuplexClientError`.
 
+### Output limits and slow consumers
+
+Deployment settings under `duplex_session` bound each session's pending
+output: `max_pending_output_bytes_per_session` defaults to 2 MiB and
+`max_pending_output_events_per_session` to 512 events. Bytes count compact
+Realtime JSON, including base64 audio, not decoded audio. The limits apply
+to both WebSocket delivery and direct Python handles, not to replay journals
+or client playback queues.
+
+Exceeding a limit fails the active response without committing its partial
+text to history, then closes only that session. If overflow occurs while a
+completion is being queued, its not-yet-queued `response.done` becomes failed
+with the same identity and output, and its response history entry is removed.
+An ending already accepted by the buffer is not replaced or followed by a
+second ending. Open a new session to continue; the closed session cannot be
+resumed. The notifications use these fields:
+
+| Event | Field values |
+| --- | --- |
+| `error` | `error.type: "rate_limit_error"`, `error.code: "output_backpressure"` |
+| `response.done` (active response or not-yet-queued ending) | `response.status: "failed"`, `response.status_details: {"type": "failed", "reason": "output_backpressure"}` |
+| `session.closed` | `reason: "output_backpressure"` |
+
+Queued audio for the affected response is removed. Previously queued non-audio
+events retain their order, but newly emitted ordinary events, including
+audio/text, content-part and output-item completion markers, are suppressed.
+Clients must therefore handle closure without waiting for every completion
+marker. Errors and response endings have an extra 64 KiB / eight-event reserve;
+if that also fills, either notification may be omitted. Closure has its own
+independent slot. A closure notification exceeding 4 KiB is compacted to
+`reason: "close_details_exceed_output_limit"` with empty details, preserving
+the event type and identity. One event held by the consumer is outside the
+queued budget; audio already sent still requires the client to stop playback.
+
 ### Measure latency
 
 `EventCollector` accumulates events for assertions and metrics:
@@ -317,6 +349,8 @@ single-consumer async iterator that ends after `session.closed` /
 `session.expired`; rejected commands come back as `ErrorEvent`s on it.
 Every event renders the wire JSON with `to_realtime()`, so anything written
 against the WebSocket protocol works unchanged on the typed stream.
+If opening fails, the abandoned handle is closed. Late engine events do not
+reopen a locally closed handle.
 
 `vllm_omni.clients.inline_duplex.InlineDuplexClient` wraps a `DuplexOmni`
 behind the `DuplexClient` API, so the same application code runs in-process
@@ -386,9 +420,9 @@ with no OpenAI counterpart.
 
 The event vocabulary is uniform, but several surfaces are gated by the
 `capabilities` object the server returns in `session.created`; a client must
-branch on those flags rather than on the model name. MiniCPM-o 4.5 is the
-only model on the plugin contract today; the other two columns record what
-their integrations advertise once the follow-up PRs port them:
+branch on those flags rather than on the model name. MiniCPM-o 4.5 and
+PersonaPlex are on the plugin contract today; the Nemotron VoiceChat column
+records what its integration advertises once the follow-up PR ports it:
 
 | Capability | MiniCPM-o 4.5 | PersonaPlex | Nemotron VoiceChat | Gated surface |
 | --- | --- | --- | --- | --- |
@@ -403,7 +437,11 @@ their integrations advertise once the follow-up PRs port them:
 Everything else in the catalogue — session lifecycle, heartbeat and event
 acknowledgement, append/commit/clear, the response envelope, playback
 acknowledgement, and the error envelope — behaves identically for every
-model.
+model. Two PersonaPlex specifics follow from its capabilities rather than from
+special-casing: a model with `supports_client_commit=false` auto-responds
+without `extra_body.auto_response`, and `response.cancel` /
+`output_audio_buffer.clear` restart its conversation context (a new Stage 0
+request replays the voice/persona prefill).
 
 ### Compatibility with the OpenAI Realtime protocol
 
@@ -571,7 +609,7 @@ formats (`pcm16`, `pcm_s16le`, `s16le`, `pcm_f32le`, `g711_ulaw`,
 | `session.created` | 2 | Session opened. OpenAI name; adds `attachment_generation`, `resume_token` and vLLM-Omni keys inside `session` (`id` is the server-allocated session id, `epoch`, `turn_id`, `playback`, `capabilities`, ...). |
 | `session.updated` | 2 | Echo of the effective session config after every `session.update` (same extended `session` object). |
 | `session.heartbeat_ack` | 3 | Reply to `session.heartbeat`. |
-| `session.closed` | 3 | Last event on the socket, emitted once the engine released the session; `reason` ∈ `client_close`, `disconnect`, `timeout`, `transport_error`, `shutdown`, ... |
+| `session.closed` | 3 | Last event on the socket, emitted once the engine released the session; `reason` ∈ `client_close`, `disconnect`, `timeout`, `transport_error`, `shutdown`, `output_backpressure`, `close_details_exceed_output_limit`, ... |
 | `session.resumed` | 3 | Resume accepted; carries the new `attachment_generation` and rotated `resume_token`; journaled events are replayed after it. |
 | `session.replaced` | 3 | Sent to the superseded socket when another socket resumes the session. |
 | `session.expired` | 3 | Engine lease reaped (`disconnect_grace_expired`, `idle_ttl_expired`); socket closes after it. |
@@ -1340,9 +1378,6 @@ them out into typed events before they reach a client.
 
 ## Known Limitations
 
-- Only MiniCPM-o 4.5 is served over this endpoint today; PersonaPlex and
-  Nemotron VoiceChat arrive with the follow-up PRs that port them to the
-  plugin contract.
 - Several surfaces are capability-gated per model (see *Capability
   negotiation by model* above): PersonaPlex does not support session resume,
   barge-in, or audio truncation; Nemotron VoiceChat does not support barge-in

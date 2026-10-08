@@ -523,6 +523,35 @@ def test_compile_transformer_regionally_compiles_blocks(monkeypatch, use_hsdp):
 
 @pytest.mark.core_model
 @pytest.mark.cpu
+def test_compile_transformer_scopes_inductor_cudagraphs_to_decode_graph(monkeypatch):
+    model = SimpleNamespace(enable_cuda_graph_decode=True)
+    runner = _make_compile_runner(model)
+    compile_calls = []
+
+    def _regionally_compile(target, *args, **kwargs):
+        compile_calls.append(kwargs)
+        return target
+
+    monkeypatch.setattr(model_runner_module, "regionally_compile", _regionally_compile)
+    import torch._inductor.config as inductor_config
+
+    before = inductor_config.triton.cudagraphs
+    DiffusionModelRunner._compile_transformer(runner, "transformer")
+
+    assert inductor_config.triton.cudagraphs == before
+    assert compile_calls == [
+        {
+            "dynamic": True,
+            "options": {
+                "triton.cudagraphs": False,
+                "triton.cudagraph_trees": False,
+            },
+        }
+    ]
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
 def test_compile_transformer_uses_regional_dynamic_false_config(monkeypatch):
     model = _CompileTrackingModel()
     runner = _make_compile_runner(model, compile_dynamic=False)
@@ -1411,3 +1440,68 @@ def test_vllm_set_forward_context_implementation(monkeypatch):
             ),
         ),
     ], ERROR_MESSAGE
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+@pytest.mark.parametrize("cancel_all", [False, True])
+def test_execute_model_batch_cancellation_preserves_live_peer(monkeypatch, cancel_all):
+    from vllm_omni.diffusion.cancellation import (
+        RequestCancellationRegistry,
+        check_request_cancellation,
+    )
+    from vllm_omni.platforms import current_omni_platform
+
+    monkeypatch.setattr(current_omni_platform, "synchronize", lambda: None)
+
+    class CancellableBatchPipeline(_BatchPipeline):
+        supports_request_cancellation = True
+
+        def forward(self, batch):
+            check_request_cancellation()
+            return super().forward(batch)
+
+    monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+    monkeypatch.setattr(model_runner_module, "current_omni_platform", _fake_platform_for_peak_memory())
+    pipeline = CancellableBatchPipeline(outputs=[DiffusionOutput(output="a"), DiffusionOutput(output="b")])
+    runner = _make_batch_runner(pipeline)
+    sched = _make_scheduler_output(num_reqs=2)
+    registry = RequestCancellationRegistry()
+    try:
+        for entry in sched.scheduled_new_reqs:
+            entry.req.cancellation_signal = registry.create(entry.request_id)
+        registry.cancel(["req-0", "req-1"] if cancel_all else ["req-0"])
+        result = runner.execute_model_batch(sched, runner.od_config)
+        assert len(result.runner_outputs) == 2
+        assert [output.result.aborted for output in result.runner_outputs] == [cancel_all, cancel_all]
+        if not cancel_all:
+            assert result.runner_outputs[1].request_id == "req-1"
+            assert result.runner_outputs[1].result.output == "b"
+        else:
+            assert pipeline.last_batch is None
+    finally:
+        registry.close()
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_non_step_fallback_keeps_client_error_status():
+    """Step mode's full-forward fallback must not drop a request error's 4xx status."""
+    from vllm_omni.errors import OmniClientError
+
+    runner = _make_runner(cache_backend=None, cache_backend_name="none")
+    runner.execute_model = Mock(side_effect=OmniClientError("bad request option", status_code=400))
+    request = _make_request()
+    scheduler_output = SimpleNamespace(
+        scheduled_new_reqs=[SimpleNamespace(request_id=request.request_id, req=request, diffusion_kv_metadata=None)],
+        scheduled_cached_reqs=SimpleNamespace(request_ids=[]),
+        kv_prefetch_job=None,
+    )
+
+    result = DiffusionModelRunner._execute_non_step_requests(runner, scheduler_output)
+
+    output = result.get_request_output(request.request_id)
+    assert output.finished is True
+    assert output.result.error == "bad request option"
+    assert output.result.error_status_code == 400
+    assert output.result.error_type == "BadRequestError"

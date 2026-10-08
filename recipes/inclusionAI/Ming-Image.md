@@ -27,7 +27,7 @@ For Design-Layer, the first returned image is the reconstructed composite and th
 - Python: 3.10+
 - CUDA: 13.0
 - vLLM version: 0.29.0
-- vLLM-Omni version or commit: 59db6a428
+- vLLM-Omni version or commit: 6daf5b30f
 - 2x H100 80GB (1xH100 to be validated)
 
 ### Commands
@@ -52,7 +52,7 @@ curl -s http://127.0.0.1:8091/v1/chat/completions \
     "modalities": ["image"],
     "extra_body": {
       "height": 1024, "width": 1024,
-      "steps": 12, "cfg": 1.0, "seed": 42
+      "num_inference_steps": 12, "guidance_scale": 1.0, "seed": 42
     }
   }' \
   | jq -r '.choices[0].message.content[0].image_url.url | split(",")[1]' \
@@ -79,7 +79,7 @@ jq -n \
     modalities: ["image"],
     extra_body: {
       height: 1024, width: 1024,
-      steps: 12, cfg: 1.0, seed: 42
+      num_inference_steps: 12, guidance_scale: 1.0, seed: 42
     }
   }' |
 curl -sS http://127.0.0.1:8091/v1/chat/completions \
@@ -97,7 +97,7 @@ Note that the prompt should better depict each layer to be decomposed, we will r
 ```bash
 MODEL=inclusionAI/Ming-Image-0.1-Design-Layer
 INPUT_IMAGE=/path/to/input.png
-PROMPT="Decompose this design into editable visual layers"
+PROMPT="Decompose this image into 6 layers with the following specifications: Number of layers: 6 \nLayer 1: Central text ... Layer 2: ... Layer 6: ..."
 
 jq -n \
   --arg model "$MODEL" \
@@ -113,7 +113,7 @@ jq -n \
     extra_body: {
       num_layers: 6,
       height: 1024, width: 1024,
-      steps: 12, cfg: 2.0, seed: 42
+      num_inference_steps: 12, guidance_scale: 2.0, seed: 42
     }
   }' |
 curl -sS http://127.0.0.1:8091/v1/chat/completions \

@@ -35,6 +35,7 @@ from vllm_omni.benchmarks.patch.patch import (
     _iter_image_reference_inputs,
     _iter_video_reference_inputs,
     _omni_request_timeout_s,
+    async_request_openai_audio_speech,
     async_request_openai_chat_omni_completions,
     async_request_openai_image_edits_omni,
     async_request_openai_image_generations_omni,
@@ -472,6 +473,48 @@ async def test_streaming_error_chunk_marks_request_failed(mocker: MockerFixture)
 
     assert output.success is False
     assert output.error == "EngineCore encountered an issue"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("headers", "env", "expected_duration_s"),
+    [
+        # Server-stated format wins over the env fallback.
+        ({"X-Audio-Sample-Rate": "48000", "X-Audio-Channels": "2"}, {}, 1.0),
+        ({"X-Audio-Sample-Rate": "48000", "X-Audio-Channels": "2"}, {"rate": "24000", "channels": "1"}, 1.0),
+        # Older servers send no headers: the env (default 24 kHz mono) applies.
+        ({}, {}, 4.0),
+        ({}, {"rate": "48000", "channels": "2"}, 1.0),
+    ],
+)
+async def test_audio_speech_stream_uses_server_pcm_format(
+    mocker: MockerFixture, monkeypatch: pytest.MonkeyPatch, headers, env, expected_duration_s
+):
+    from vllm_omni.metrics import definitions as defs
+
+    for key, var in (("rate", defs.AUDIO_SAMPLE_RATE_ENV), ("channels", defs.AUDIO_CHANNELS_ENV)):
+        if key in env:
+            monkeypatch.setenv(var, env[key])
+        else:
+            monkeypatch.delenv(var, raising=False)
+    request_input = RequestFuncInput(
+        model="test-model",
+        model_name="test-model",
+        prompt="test prompt",
+        api_url="http://test.com/v1/audio/speech",
+        prompt_len=10,
+        output_len=20,
+    )
+    # 1 s of 48 kHz stereo s16le = 192000 bytes.
+    mock_response = MockResponse(200, [b"\x00" * 96000, b"\x00" * 96000])
+    mock_response.headers = headers
+    mock_session = mocker.AsyncMock()
+    mock_session.post = mocker.MagicMock(return_value=mock_response)
+
+    output = await async_request_openai_audio_speech(request_input, mock_session)
+
+    assert output.success is True
+    assert output.audio_duration == pytest.approx(expected_duration_s)
 
 
 @pytest.mark.asyncio
@@ -2045,3 +2088,79 @@ def test_get_samples_forwards_upstream_multimodal_backends_kwarg(mocker: MockerF
     # No upstream kwargs: unchanged legacy delegate call.
     assert patch.get_samples(args, sentinel) == ["delegated"]
     assert calls[-1] == (args, sentinel, {})
+
+
+@pytest.mark.asyncio
+async def test_benchmark_preserves_stage_metrics_request_order_and_missing_snapshots(monkeypatch):
+    """Persist compact formal-request snapshots in input order, excluding warmups and retaining gaps."""
+    second_finished = asyncio.Event()
+    completion_order = []
+    # Request 1 carries the empty dict that openai-chat-omni initializes before any SSE merge.
+    snapshots = [
+        {"1": {"num_tokens_out": 1536, "finish_reason": "length", "vllm_itls_ms": [8.0, 9.0]}},
+        {},
+        {"1": {"num_tokens_out": 486, "finish_reason": "stop"}, "2": {"audio_frames": 24000, "audio_duration_s": 1.0}},
+    ]
+    expected = [
+        {"1": {"num_tokens_out": 1536, "finish_reason": "length"}},
+        None,
+        {"1": {"num_tokens_out": 486, "finish_reason": "stop"}, "2": {"audio_frames": 24000, "audio_duration_s": 1.0}},
+    ]
+
+    async def request_func(request_func_input, session, pbar=None):
+        request_id = request_func_input.request_id
+        if not request_id:
+            return MixRequestFuncOutput(success=True, stage_metrics={"1": {"num_tokens_out": 999}})
+        index = int(request_id)
+        if index == 0:
+            await second_finished.wait()
+        elif index == 1:
+            second_finished.set()
+        completion_order.append(index)
+        return MixRequestFuncOutput(
+            success=index != 1,
+            stage_metrics=snapshots[index],
+            prompt_len=1,
+            output_tokens=900,
+            ttft=0.01,
+            text_latency=0.1,
+            latency=0.1,
+        )
+
+    monkeypatch.setitem(patch.ASYNC_REQUEST_FUNCS, "test-stage-metrics", request_func)
+    result = await patch.benchmark(
+        task_type=patch.TaskType.GENERATION,
+        endpoint_type="test-stage-metrics",
+        api_url="http://unused/v1/chat/completions",
+        base_url="http://unused",
+        model_id="test-model",
+        model_name="test-model",
+        tokenizer=None,
+        input_requests=[
+            patch.SampleRequest(prompt="hello", prompt_len=1, expected_output_len=900, request_id=str(i))
+            for i in range(3)
+        ],
+        logprobs=None,
+        request_rate=float("inf"),
+        burstiness=1.0,
+        disable_tqdm=True,
+        num_warmups=2,
+        profile=False,
+        selected_percentile_metrics=[],
+        selected_percentiles=[],
+        ignore_eos=True,
+        goodput_config_dict={},
+        max_concurrency=3,
+        lora_modules=None,
+        extra_headers=None,
+        extra_body={"return_stage_metrics": True},
+        ready_check_timeout_sec=0,
+    )
+    assert completion_order.index(1) < completion_order.index(0)
+    assert result["request_stage_metrics"] == expected
+
+
+@pytest.mark.parametrize("snapshot", [None, {}, "not-a-dict"])
+def test_compact_request_stage_metrics_drops_empty_snapshots(snapshot):
+    """Empty chat-omni snapshots must not make every result persist request_stage_metrics."""
+    assert patch._compact_request_stage_metrics(snapshot) is None

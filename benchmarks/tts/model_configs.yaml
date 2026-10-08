@@ -7,6 +7,22 @@
 # is tracked here.
 
 models:
+  tencent/AuK: &auk
+    supported_tasks: [default_voice, voice_clone]
+    backend: openai-audio-speech
+    endpoint: /v1/audio/speech
+    trust_remote_code: true
+    task_extra_body:
+      default_voice:
+        duration_seconds: 5.0
+        voice: default
+        task_type: CustomVoice
+      voice_clone:
+        duration_seconds: 5.0
+        voice: default
+        task_type: Base
+  tencent/AuK-Flash: *auk
+
   BreezeBlue/Breeze-TTS-2:
     supported_tasks: [default_voice, voice_design, voice_clone]
     backend: openai-audio-speech

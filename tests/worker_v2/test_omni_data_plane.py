@@ -11,6 +11,7 @@ from typing import Any
 
 import pytest
 import torch
+from vllm import SamplingParams
 
 from vllm_omni.worker_v2.delivery import DeliveryCancelledError, DeliveryState, OmniDeliveryManager
 from vllm_omni.worker_v2.native_output_worker import NativeOutputWorker
@@ -126,6 +127,60 @@ def test_full_payload_abort_discards_partial_and_late_outputs(plane):
     assert not plane._pending_full_payload_send
 
 
+@pytest.mark.parametrize("async_chunk", [False, True])
+@pytest.mark.parametrize("stop", ["token", "length"])
+def test_non_resumable_output_stops_before_scheduler_terminal(plane, async_chunk, stop):
+    plane._async_chunk = async_chunk
+    plane._full_payload_replace_keys_cached = frozenset()
+    request = _new_request()
+    request.resumable = False
+    request.sampling_params = SamplingParams(stop_token_ids=[2150], max_tokens=2 if stop == "length" else 10)
+    plane.register_request(request)
+    first, last, stale = (torch.tensor([[value]]) for value in (1, 2, 99))
+    plane.reserve_outputs(["internal"])
+    _complete(plane, [{"codes.audio": first}], token=21)
+    plane.reserve_outputs(["internal"])
+    _complete(plane, [{"codes.audio": last}], token=2150 if stop == "token" else 22)
+    plane.reserve_outputs(["internal"])
+    assert plane.request_terminal({"internal"}) == 0
+    _complete(plane, [{"codes.audio": stale}], token=23)
+
+    payloads = [
+        payload["codes"]["audio"] if async_chunk else payload["codes.audio"]
+        for batch in plane.record.batches
+        for _, payload in batch
+        if payload
+    ]
+    torch.testing.assert_close(torch.cat(payloads), torch.cat([first, last]))
+    terminal, _ = plane.record.batches[-1][0]
+    assert terminal.is_finished()
+    assert terminal.output_token_count == 2
+    assert plane.record.cleaned == ["internal"]
+    assert not plane._native_outputs_in_flight and not plane._native_terminal_pending
+
+
+@pytest.mark.parametrize("ignore_eos", [False, True])
+def test_native_output_honors_ignore_eos_and_min_tokens(plane, ignore_eos):
+    request = _new_request()
+    request.resumable = False
+    request.sampling_params = SamplingParams(ignore_eos=ignore_eos, min_tokens=2, max_tokens=10)
+    request.sampling_params.update_from_generation_config({}, eos_token_id=99)
+    plane.register_request(request)
+    for token in (99, 99, 21):
+        _complete(plane, [{"codes.audio": torch.tensor([[token]])}], token=token)
+    state = plane._native_requests["internal"]
+    assert state.output_token_ids == ([99, 99, 21] if ignore_eos else [99, 99])
+    assert len(plane.record.batches) == (3 if ignore_eos else 2)
+
+
+def test_resumable_output_keeps_scheduler_owned_segment_boundary(plane):
+    plane.register_request(_new_request())
+    for token in (21, 2150, 22):
+        _complete(plane, [{"codes.audio": torch.tensor([[token]])}], token=token)
+    assert plane._native_requests["internal"].output_token_ids == [21, 2150, 22]
+    assert len(plane.record.batches) == 3
+
+
 def test_full_payload_qwen_builder_receives_complete_codec(raw_plane, monkeypatch):
     from vllm_omni.model_executor.stage_input_processors.qwen3_tts import talker2code2wav_full_payload
 
@@ -185,6 +240,7 @@ def _start_save_thread(plane, connector):
         _send_side_request_payload={},
         _code_prompt_token_ids=defaultdict(list),
         _work_available=threading.Event(),
+        _save_work_available=threading.Event(),
         _stop_event=threading.Event(),
         _MAX_SEND_RETRIES=0,
         _can_send=True,
@@ -199,7 +255,7 @@ def _start_save_thread(plane, connector):
 
 def _stop_save_thread(plane):
     plane._stop_event.set()
-    plane._work_available.set()
+    plane._save_work_available.set()
     plane._save_thread.join(timeout=2)
     assert not plane._save_thread.is_alive()
 
@@ -551,3 +607,71 @@ def test_abort_before_first_chunk_cleans_receiver_state():
     assert plane.abort_requests({"r"}) == 0
     assert plane.abort_requests({"r"}) == 0
     assert not plane._pending_load_reqs and not plane._request_ids_mapping and not plane._local_stage_payload_cache
+
+
+def test_ar_receiver_accumulates_rows_and_replaces_chunk_metadata():
+    # A V1 upstream sender stamps scalar flags on every chunk; they describe
+    # the latest chunk and must not be concatenated like decode rows.
+    plane = _bare_plane()
+    plane._send_side_request_payload = {}
+
+    def chunk(rows, finished):
+        return {
+            "embed": {"decode": torch.ones((rows, 2))},
+            "meta": {"finished": torch.tensor(finished), "is_segment_finished": torch.tensor(False)},
+        }
+
+    plane._accumulate_payload("ext", chunk(1, False))
+    merged = plane._accumulate_payload("ext", chunk(2, True))
+
+    assert merged["embed"]["decode"].shape == (3, 2)
+    assert merged["meta"]["finished"].item() is True
+    assert merged["meta"]["is_segment_finished"].ndim == 0
+
+
+def test_terminal_without_processor_payload_still_sends_finish_marker(raw_plane, monkeypatch):
+    # Qwen3-Omni's Talker processor returns None on the terminal call when the
+    # last frames ended exactly on a chunk boundary; Code2Wav must still learn
+    # that the stream finished, as with the V1 chunk adapter.
+    raw_plane._async_chunk = True
+    raw_plane._omni_connector = object()
+    raw_plane._request_ids_mapping = {}
+    raw_plane._custom_process_func = lambda transfer_manager, multimodal_output, request, is_finished=False: None
+    raw_plane._custom_process_batch_func = None
+    monkeypatch.setattr(raw_plane, "is_data_transfer_rank", lambda: True)
+    enqueued = []
+
+    def enqueue(request, payload, **_kw):
+        enqueued.append((request.request_id, payload))
+        return True, None
+
+    monkeypatch.setattr(raw_plane, "_enqueue_chunk_payload", enqueue)
+    raw_plane.register_request(_new_request())
+
+    _complete(raw_plane, [{"codes": {"audio": torch.ones((1, 16))}}])
+    assert enqueued == []  # a non-terminal None payload sends nothing
+    assert raw_plane.request_terminal({"internal"}) == 1
+    [(req_id, payload)] = enqueued
+    assert req_id == "internal"
+    assert payload["meta"]["finished"].item() is True
+
+
+def test_payload_builders_see_stage_model_config(monkeypatch):
+    # Producer-side builders (Qwen3-Omni's Thinker reads
+    # hf_config.talker_config.accept_hidden_layer) resolve the stage config
+    # through _get_model_config(), as they do on the V1 runner mixin.
+    from vllm_omni.model_executor.stage_input_processors.qwen3_omni import _get_accept_hidden_layer_index
+
+    def init_connectors(self, *, model_config):
+        self._async_chunk = True
+        self._custom_process_func = None
+
+    monkeypatch.setattr(OmniRunnerDataPlane, "init_omni_connectors", init_connectors)
+    monkeypatch.setattr(OmniRunnerDataPlane, "_start_output_worker", lambda self, **_kw: None)
+    model_config = SimpleNamespace(hf_config=SimpleNamespace(talker_config=SimpleNamespace(accept_hidden_layer=24)))
+    vllm_config = SimpleNamespace(model_config=model_config)
+
+    plane = OmniRunnerDataPlane(vllm_config, model_config)
+
+    assert plane._get_model_config() is model_config
+    assert _get_accept_hidden_layer_index(plane) == 24

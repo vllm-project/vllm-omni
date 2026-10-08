@@ -118,8 +118,12 @@ def _make_codec_stub(mocker: MockerFixture) -> PersonaPlexMimiCodec:
     nn.Module.__init__(codec)
 
     quantizer = mocker.Mock(spec=["encode", "decode"])
-    quantizer.encode.side_effect = lambda x: torch.zeros(8, x.shape[0], x.shape[-1], dtype=torch.long)
+    quantizer.encode.side_effect = lambda x, num_quantizers=8: torch.zeros(
+        num_quantizers, x.shape[0], x.shape[-1], dtype=torch.long
+    )
     quantizer.decode.side_effect = lambda codes: torch.zeros(codes.shape[0], 1, codes.shape[-1])
+    # The codec decodes through its own RVQ sum; route it to the stub.
+    codec._quantizer_decode = quantizer.decode
 
     codec.device = torch.device("cpu")
     codec.dtype = torch.float32
@@ -367,3 +371,30 @@ def test_mimi_conv_carries_preserve_inactive_rows(kind: str) -> None:
             else:
                 assert torch.equal(_stream_carry(batched)[row], carry_before[row])
                 assert torch.equal(batched._fresh[row], fresh_before[row])
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_recycled_mimi_transformer_row_matches_a_fresh_stream():
+    from vllm_omni.model_executor.models.personaplex.personaplex_mimi import _MimiStreamingTransformer
+
+    torch.manual_seed(0)
+    used = _MimiStreamingTransformer(num_layers=2, dim=16, num_heads=2, context=8)
+    for param in used.parameters():
+        torch.nn.init.normal_(param, std=0.1)
+    fresh = _MimiStreamingTransformer(num_layers=2, dim=16, num_heads=2, context=8)
+    fresh.load_state_dict(used.state_dict())
+    used.streaming_init(2)
+    fresh.streaming_init(2)
+    both = torch.tensor([True, True])
+
+    # Wrap row 0's ring (6 frames x 2 positions > context 8) before recycling it.
+    for _ in range(6):
+        used.step(torch.randn(2, 2, 16), both)
+    used.reset_slot(0)
+
+    frames = [torch.randn(2, 2, 16) for _ in range(5)]
+    for x in frames:
+        recycled = used.step(x, both)
+        expected = fresh.step(x, both)
+        torch.testing.assert_close(recycled[0], expected[0], rtol=0, atol=0)

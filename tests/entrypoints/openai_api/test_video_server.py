@@ -151,6 +151,48 @@ def test_raw_and_base64_encoders_receive_persistent_converter(mocker: MockerFixt
     handler.shutdown()
 
 
+@pytest.mark.parametrize("typed_stage", [False, True], ids=["legacy", "typed"])
+def test_remote_diffusion_stage_enables_borrowed_frames_for_both_video_responses(
+    mocker: MockerFixture, typed_stage: bool
+):
+    from vllm_omni.config.config_factory import StageConfigFactory
+
+    options = {
+        "model_class_name": "MiniMaxH3Pipeline",
+        "video_output_transport": {"enable_borrowed_frames": True},
+    }
+    stage = (
+        StageConfigFactory.create_typed_default_diffusion("test-model", options).stage_configs[0]
+        if typed_stage
+        else StageConfigFactory.create_default_diffusion(options)[0]
+    )
+    # Like StageDiffusionClient, this frontend engine exposes metadata but no
+    # worker od_config. The effective setting is available in stage_configs.
+    engine = FakeAsyncOmni()
+    engine.stage_configs = [stage]
+    handler = OmniOpenAIServingVideo.for_diffusion(engine, model_name="test-model", stage_configs=engine.stage_configs)
+    raw_encoder = mocker.patch(
+        "vllm_omni.entrypoints.openai.serving_video._encode_video_bytes",
+        return_value=b"encoded-video",
+    )
+    base64_encoder = mocker.patch(
+        "vllm_omni.entrypoints.openai.serving_video.encode_video_base64",
+        return_value="encoded-video",
+    )
+    try:
+
+        async def generate_both():
+            request = VideoGenerationRequest(prompt="test prompt")
+            await handler.generate_video_bytes(request, "raw-request")
+            await handler.generate_videos(request, "base64-request")
+
+        asyncio.run(generate_both())
+        assert raw_encoder.call_args.kwargs["enable_borrowed_frames"] is True
+        assert base64_encoder.call_args.kwargs["enable_borrowed_frames"] is True
+    finally:
+        handler.shutdown()
+
+
 @pytest.mark.parametrize("batch_frames", [0, -1, True, 1.5, "17", None])
 def test_preencode_rejects_invalid_batch_frames_before_generation(batch_frames):
     engine = FakeAsyncOmni()
@@ -388,8 +430,13 @@ def isolated_video_backends(tmp_path, monkeypatch):
     return store, tasks, storage
 
 
+@pytest.mark.parametrize("model_class_name", [None, "SeedVR2Pipeline", "auto"])
 @pytest.mark.asyncio
-async def test_server_worker_keeps_engine_alive_until_http_shutdown(monkeypatch):
+async def test_server_worker_keeps_engine_alive_until_http_shutdown(monkeypatch, model_class_name):
+    # Resolve imports outside the timed server-lifecycle assertions.
+    from vllm_omni.diffusion.models.seedvr2 import long_video  # noqa: F401
+
+    app = FastAPI()
     events: list[str] = []
     serve_started = asyncio.Event()
     http_shutdown = asyncio.Event()
@@ -398,6 +445,11 @@ async def test_server_worker_keeps_engine_alive_until_http_shutdown(monkeypatch)
 
     class FakeEngine:
         stage_configs = []
+
+        def get_diffusion_od_config(self):
+            if model_class_name == "auto":
+                return SimpleNamespace(model_class_name="SeedVR2Pipeline")
+            return None
 
         async def get_supported_tasks(self):
             return ("generate",)
@@ -435,7 +487,7 @@ async def test_server_worker_keeps_engine_alive_until_http_shutdown(monkeypatch)
         events.append("init_app_state")
 
     monkeypatch.setattr(api_server, "build_async_omni", fake_build_async_omni)
-    monkeypatch.setattr(api_server, "build_openai_app", lambda args, supported_tasks: FastAPI())
+    monkeypatch.setattr(api_server, "build_openai_app", lambda args, supported_tasks: app)
     monkeypatch.setattr(api_server, "serve_http", fake_serve_http)
     monkeypatch.setattr(api_server.STORAGE_MANAGER, "start", fake_storage_start)
     monkeypatch.setattr(api_server.openai_app_state, "_get_vllm_config", fake_get_vllm_config)
@@ -461,9 +513,16 @@ async def test_server_worker_keeps_engine_alive_until_http_shutdown(monkeypatch)
         h11_max_header_count=None,
     )
 
+    if model_class_name != "auto" and model_class_name is not None:
+        args.model_class_name = model_class_name
+
     worker_task = asyncio.create_task(api_server.omni_run_server_worker("127.0.0.1:0", sock, args))
     await asyncio.wait_for(serve_started.wait(), timeout=2)
 
+    route_paths = app.openapi()["paths"]
+    assert ("/v1/seedvr2/restore-long" in route_paths) == (model_class_name is not None)
+    if model_class_name is not None:
+        assert app.state.seedvr2_long_port == args.port
     assert not engine_context_exited.is_set()
 
     http_shutdown.set()
@@ -938,6 +997,38 @@ def test_magi2_serving_applies_native_defaults_and_rejects_explicit_frame_mismat
                 "bad-frames",
             )
         )
+
+
+def test_kandinsky6_serving_applies_defaults_but_allows_explicit_frame_count():
+    """Kandinsky 6 publishes Pro-geometry defaults (480x864, 125 frames, 50
+    steps) but is not a fixed-duration model: an explicit ``num_frames``
+    must be honoured rather than rejected."""
+    engine = FakeAsyncOmni()
+    engine.model_class_name = "Kandinsky6TI2VAPipeline"
+    handler = OmniOpenAIServingVideo.for_diffusion(
+        diffusion_engine=engine,
+        model_name="kandinsky6-bundle",
+    )
+
+    asyncio.run(handler._run_and_extract(VideoGenerationRequest(prompt="A dog runs on a beach"), "defaults"))
+    sampling = engine.captured_sampling_params_list[0]
+    assert (sampling.width, sampling.height) == (864, 480)
+    assert sampling.num_frames == 125
+    assert sampling.num_inference_steps == 50
+    assert sampling.fps == 24.0
+
+    asyncio.run(
+        handler._run_and_extract(
+            VideoGenerationRequest(
+                prompt="A dog runs on a beach", width=512, height=320, num_frames=25, num_inference_steps=10
+            ),
+            "explicit",
+        )
+    )
+    sampling = engine.captured_sampling_params_list[-1]
+    assert (sampling.width, sampling.height) == (512, 320)
+    assert sampling.num_frames == 25
+    assert sampling.num_inference_steps == 10
 
 
 def test_i2v_video_generation_with_image_reference_form(test_client, mocker: MockerFixture):
@@ -2646,6 +2737,7 @@ def test_extra_params_merged_into_extra_args(test_client, mocker: MockerFixture)
         "pyramid_num_stages": 3,
         "pyramid_num_inference_steps_list": [1, 1, 1],
         "use_cfg_zero_star": True,
+        "color_correction_method": "wavelet",
     }
     response = test_client.post(
         "/v1/videos",
@@ -2664,6 +2756,7 @@ def test_extra_params_merged_into_extra_args(test_client, mocker: MockerFixture)
     assert captured.extra_args["pyramid_num_stages"] == 3
     assert captured.extra_args["pyramid_num_inference_steps_list"] == [1, 1, 1]
     assert captured.extra_args["use_cfg_zero_star"] is True
+    assert captured.extra_args["color_correction_method"] == "wavelet"
 
 
 def test_extra_params_none_by_default(test_client, mocker: MockerFixture):

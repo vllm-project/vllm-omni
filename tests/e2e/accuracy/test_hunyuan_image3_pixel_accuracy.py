@@ -42,6 +42,7 @@ WIDTH = 1024
 PROMPT = "A brown and white dog is running on the grass."
 MEAN_THRESHOLD = 3e-2
 P99_THRESHOLD = 3e-1
+PSNR_THRESHOLD_ROCM = 29.0
 PSNR_THRESHOLD_NPU = 26.0
 
 # Per-device SSIM/PSNR for online/offline vs baseline. Unlisted devices use ``default``.
@@ -56,6 +57,8 @@ def _psnr_threshold(thresholds: SimilarityThresholds | None = None) -> float:
 
     if current_omni_platform.is_npu():
         return PSNR_THRESHOLD_NPU
+    if current_omni_platform.is_rocm():
+        return PSNR_THRESHOLD_ROCM
     if thresholds is None:
         thresholds = resolve_similarity_thresholds(SIMILARITY_THRESHOLDS_BY_DEVICE)
     return thresholds.psnr
@@ -89,7 +92,6 @@ _DEPLOY_CONFIG: dict[str, Any] = {
             "trust_remote_code": True,
             "devices": "0,1,2,3",  # set dynamically by _write_deploy_config
             "vae_use_slicing": False,
-            "moe_backend": "flashinfer_cutlass",
             "vae_use_tiling": False,
             "parallel_config": {
                 "pipeline_parallel_size": 1,
@@ -112,6 +114,14 @@ _DEPLOY_CONFIG: dict[str, Any] = {
         },
     ],
     "platforms": {
+        "rocm": {
+            "stages": [
+                {
+                    "stage_id": 0,
+                    "moe_backend": "auto",
+                },
+            ],
+        },
         "npu": {
             "stages": [
                 {
@@ -311,7 +321,7 @@ def test_hunyuan_image3_pixel_accuracy_online(accuracy_artifact_root: Path) -> N
 
 
 @pytest.mark.full_model
-@hardware_test(res={"cuda": ["H100", "B200"], "npu": "A3"}, num_cards=4)
+@hardware_test(res={"cuda": ["H100", "B200"], "rocm": "MI325", "npu": "A3"}, num_cards=4)
 def test_hunyuan_image3_pixel_accuracy_offline(accuracy_artifact_root: Path) -> None:
     model = _model_name()
     output_dir = model_output_dir(accuracy_artifact_root, MODEL_NAME)
