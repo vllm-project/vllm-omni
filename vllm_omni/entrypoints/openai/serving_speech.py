@@ -2538,15 +2538,23 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     value = extra["num_inference_steps"]
                     try:
                         sampling.num_inference_steps = int(value)
-                    except (TypeError, ValueError) as exc:
+                    except (TypeError, ValueError, OverflowError) as exc:
                         raise ValueError("num_inference_steps must be an integer") from exc
+                    if (
+                        isinstance(value, bool)
+                        or sampling.num_inference_steps <= 0
+                        or (isinstance(value, float) and value != sampling.num_inference_steps)
+                    ):
+                        raise ValueError("num_inference_steps must be a positive integer")
 
                 if "guidance_scale" in extra:
                     value = extra["guidance_scale"]
                     try:
                         sampling.guidance_scale = float(value)
-                    except (TypeError, ValueError) as exc:
+                    except (TypeError, ValueError, OverflowError) as exc:
                         raise ValueError("guidance_scale must be a number") from exc
+                    if isinstance(value, bool) or not math.isfinite(sampling.guidance_scale):
+                        raise ValueError("guidance_scale must be a finite number")
 
                 logger.info("Applied extra_params to diffusion: %s", extra)
 
