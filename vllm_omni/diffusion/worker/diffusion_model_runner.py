@@ -25,6 +25,12 @@ from vllm.utils.mem_utils import DeviceMemoryProfiler, GiB_bytes
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 
 from vllm_omni.diffusion.attention.layer import Attention
+from vllm_omni.diffusion.attention.schedule import (
+    AttentionSchedule,
+    require_denoise_progress_publisher,
+    require_no_cache_backend,
+    resolve_batch_attention_schedule,
+)
 from vllm_omni.diffusion.cache.cachedit import CacheDiTBackend, cache_summary
 from vllm_omni.diffusion.cache.prompt_embed_cache import (
     install_prompt_embed_cache,
@@ -42,7 +48,7 @@ from vllm_omni.diffusion.diffusion_kv.paged_attention_adapter import (
     DiffusionPagedAttentionRow,
 )
 from vllm_omni.diffusion.distributed.parallel_state import get_classifier_free_guidance_rank
-from vllm_omni.diffusion.forward_context import set_forward_context
+from vllm_omni.diffusion.forward_context import bind_attention_schedule, set_forward_context
 from vllm_omni.diffusion.interaction.coordinator import InteractionCoordinator
 from vllm_omni.diffusion.interaction.types import InteractionPayload
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
@@ -155,6 +161,13 @@ def _normalize_pipeline_outputs(
         )
 
     return outputs
+
+
+def _attention_schedule_scope(schedule: AttentionSchedule) -> AbstractContextManager[Any]:
+    """Bind a non-empty schedule; an unscheduled batch leaves the forward context untouched."""
+    if not schedule:
+        return nullcontext()
+    return bind_attention_schedule(schedule)
 
 
 class DiffusionModelRunner(DiffusionStagePayloadMixin):
@@ -458,7 +471,40 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         if hasattr(self.pipeline, "_interaction_coordinator"):
             self.pipeline._interaction_coordinator = self._interaction_coordinator
 
+        self._validate_service_attention_schedule()
         logger.info("Model runner: Initialization complete.")
+
+    def _validate_service_attention_schedule(self) -> None:
+        """Fail startup when configured profiles can never run on this service.
+
+        Every scheduled request is rejected before denoise on a pipeline that does not publish denoise
+        progress, and while ``od_config.cache_backend`` names a cache backend, including one the pipeline
+        adopts per request (request-scoped Cache-DiT). Configured profiles fail startup in both cases,
+        even with an empty default, because they would still make each attention layer call an eager
+        boundary while compiling, which a ``fullgraph=True`` compile cannot contain. A non-empty
+        default needs profiles, so this also covers every request inheriting the default. Runs after the
+        cache backend is final, because a model without cache acceleration clears
+        ``od_config.cache_backend``. Otherwise an empty default keeps loading: requests can still opt in
+        and are then checked per request.
+        """
+        service = getattr(self.od_config, "diffusion_attention_schedule", None)
+        profiles = getattr(service, "profiles", None)
+        if not profiles:
+            return
+        configured = f"diffusion_attention_schedule configures profile(s) {', '.join(repr(p) for p in profiles)}"
+        if not callable(getattr(self.pipeline, "record_denoise_step", None)):
+            raise ValueError(
+                f"{configured}, but {type(self.pipeline).__name__} never publishes denoise progress via "
+                "record_denoise_step, so every scheduled request would be rejected. Remove the schedule from "
+                "this model's config."
+            )
+        cache_backend = getattr(self.od_config, "cache_backend", None)
+        if cache_backend not in (None, "none"):
+            raise ValueError(
+                f"{configured}, but cache_backend={cache_backend!r} reuses or skips transformer evaluations "
+                "across denoise steps, so every scheduled request would be rejected. Disable the cache backend "
+                "or remove the schedule."
+            )
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         """Collect native specs from cache-enabled loaded attention modules."""
@@ -790,6 +836,9 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                 raise ValueError("Cannot execute model with empty prompt")
         if require_request_batch_support and not getattr(self.pipeline, "supports_request_batch", False):
             raise RuntimeError(f"{type(self.pipeline).__name__} does not support request-batch forward.")
+        attention_schedule = resolve_batch_attention_schedule(reqs, od_config)
+        require_denoise_progress_publisher(self.pipeline, attention_schedule)
+        require_no_cache_backend(od_config, attention_schedule)
 
         # Use no_grad() for HSDP compatibility, inference_mode() otherwise for
         # better perf. HSDP2's fully_shard pre-forward hooks need tensor version
@@ -870,6 +919,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                     [getattr(req, "cancellation_signal", None) for req in reqs],
                     enabled=getattr(self.pipeline, "supports_request_cancellation", False) is True,
                 ),
+                _attention_schedule_scope(attention_schedule),
             ):
                 with record_function(record_name):
                     try:
@@ -1388,6 +1438,9 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
             assert pipeline is not None, "Model not loaded. Call load_model() first."
             had_active_states = bool(self.state_cache)
             states, new_request_ids = self._update_states(scheduler_output)
+            # Reject before pre-encode, so a scheduled request never starts on a pipeline without progress.
+            attention_schedule = resolve_batch_attention_schedule(states, self.od_config)
+            require_denoise_progress_publisher(pipeline, attention_schedule)
             is_primary = not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
             if (
                 record_output_peak_memory
@@ -1412,7 +1465,8 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                 in_diffusion_kv_memory_profile=in_diffusion_kv_memory_profile,
             ):
                 clear_pipeline_stage_durations(pipeline)
-                noise_pred = pipeline.denoise_step(input_batch, states=states)
+                with _attention_schedule_scope(attention_schedule):
+                    noise_pred = pipeline.denoise_step(input_batch, states=states)
                 denoise_stage_durations = consume_pipeline_stage_durations(pipeline)
                 for state in states:
                     merge_stage_durations(

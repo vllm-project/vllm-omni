@@ -29,6 +29,7 @@ from vllm_omni.diffusion.distributed.parallel_state import (
     initialize_model_parallel,
 )
 from vllm_omni.diffusion.executor.multiproc_executor import MultiprocDiffusionExecutor
+from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
 from vllm_omni.diffusion.ipc import (
     pack_diffusion_output_shm,
     unpack_diffusion_output_shm,
@@ -739,6 +740,27 @@ class TestRunner:
         assert runner.pipeline.denoise_calls == 2
         assert runner.pipeline.scheduler_calls == 2
         assert runner.pipeline.decode_calls == 1
+
+    def test_unscheduled_step_leaves_attention_schedule_unbound(self):
+        """Without a service schedule, the real forward context carries no schedule during denoise."""
+        runner = _make_runner()
+        runner.vllm_config = None
+        seen: list[tuple[object, bool]] = []
+
+        class _ContextRecordingStepPipeline(_StepPipeline):
+            def denoise_step(self, input_batch, **kwargs):
+                ctx = get_forward_context()
+                seen.append((ctx.attention_schedule, ctx.attention_schedule_denoise_active))
+                return super().denoise_step(input_batch, **kwargs)
+
+        runner.pipeline = _ContextRecordingStepPipeline()
+
+        DiffusionModelRunner.execute_stepwise(runner, _make_scheduler_output(_make_step_request(), step_id=0))
+        DiffusionModelRunner.execute_stepwise(runner, _make_cached_scheduler_output(step_id=1))
+
+        assert seen == [(None, False), (None, False)]
+        assert "req-1" not in runner.state_cache
+        assert is_forward_context_available() is False
 
     @staticmethod
     def _make_grouping_runner(pipeline, *, grouping: bool):

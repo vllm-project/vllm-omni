@@ -100,6 +100,7 @@ nav:
         - Hugging Face Hub: user_guide/diffusion/attention_backends/huggingface_hub.md
         - RainFusion: user_guide/diffusion/attention_backends/rainfusion.md
         - VDN-H3 Hybrid Attention: user_guide/diffusion/attention_backends/vdnh3_attn.md
+        - Attention Schedules: user_guide/diffusion/attention_backends/schedules.md
       - Regional Compilation: user_guide/diffusion/regional_compilation.md
       - Wan VAE Decoder Fast Path: user_guide/diffusion/vae_fast_path.md
       - Frame Interpolation: user_guide/diffusion/frame_interpolation.md
