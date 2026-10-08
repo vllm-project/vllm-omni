@@ -312,6 +312,23 @@ class AuKCUDAGraphWrapper:
             x, text, c_mask, ref, ref_mask
         )
         key = (x_buck.shape[0], x_buck.shape[1], text_buck.shape[1], ref_buck.shape[1], uses_cfg, n_steps)
+        if getattr(self, "_uncapturable_loop_keys", None) and key in self._uncapturable_loop_keys:
+            for i in range(n_steps):
+                vel = self(
+                    x=x,
+                    text=text,
+                    c_mask=c_mask,
+                    ref=ref,
+                    ref_mask=ref_mask,
+                    timestep=timesteps[i],
+                    cfg_strength=cfg_strength,
+                    new_request=i == 0,
+                    timesteps=timesteps[:-1],
+                    step_index=i,
+                )
+                dt = (timesteps[i + 1] - timesteps[i]).to(x.device, x.dtype)
+                x = x + dt * vel
+            return x
         entry = self._loop_cache.get(key)
         hit_key = key if entry is not None else None
         if entry is None:
@@ -323,13 +340,39 @@ class AuKCUDAGraphWrapper:
             ctx = self._prepare(
                 x_buck, x_mask, text_buck, c_mask_buck, ref_buck, ref_mask_buck, uses_cfg, timesteps[:-1]
             )
-            entry = self._capture_loop(
-                x_buck,
-                ctx,
-                timesteps=timesteps,
-                cfg_strength=cfg_strength,
-            )
-            self._loop_cache[key] = entry
+            try:
+                entry = self._capture_loop(
+                    x_buck,
+                    ctx,
+                    timesteps=timesteps,
+                    cfg_strength=cfg_strength,
+                )
+                self._loop_cache[key] = entry
+            except Exception:
+                logger.warning(
+                    "AuK DiT multi-step CUDA graph capture failed for key=%s; falling back to eager loop.",
+                    key,
+                    exc_info=True,
+                )
+                if not hasattr(self, "_uncapturable_loop_keys"):
+                    self._uncapturable_loop_keys = set()
+                self._uncapturable_loop_keys.add(key)
+                for i in range(n_steps):
+                    vel = self(
+                        x=x,
+                        text=text,
+                        c_mask=c_mask,
+                        ref=ref,
+                        ref_mask=ref_mask,
+                        timestep=timesteps[i],
+                        cfg_strength=cfg_strength,
+                        new_request=i == 0,
+                        timesteps=timesteps[:-1],
+                        step_index=i,
+                    )
+                    dt = (timesteps[i + 1] - timesteps[i]).to(x.device, x.dtype)
+                    x = x + dt * vel
+                return x
         else:
             assert hit_key is not None
             self._loop_cache.move_to_end(hit_key)
