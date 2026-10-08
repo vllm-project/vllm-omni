@@ -462,7 +462,7 @@ def test_patch_valid_hf_config_without_model_type_preserves_keys(tmp_path):
 
 
 def test_remote_hf_config_error_reaches_parent_loader(monkeypatch):
-    """Remote resolution failures for a model type with a config.json must stay on vLLM's normal error path."""
+    """Remote resolution failures must stay on vLLM's normal error path."""
     loader_error = OSError("remote config resolution failed")
     parent_inputs = {}
 
@@ -481,7 +481,7 @@ def test_remote_hf_config_error_reaches_parent_loader(monkeypatch):
 
     args = OmniEngineArgs(
         model="remote/model",
-        model_arch="CosyVoice3Model",
+        model_arch="IndexTTS25TalkerForConditionalGeneration",
     )
 
     with pytest.raises(OSError) as exc_info:

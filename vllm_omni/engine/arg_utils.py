@@ -44,10 +44,10 @@ _ARCH_TO_MODEL_TYPE: dict[str, str] = {
     "VoxCPM2TalkerForConditionalGeneration": "voxcpm2",
 }
 
-# Model types whose official checkpoint ships no config.json at all, as a Hub
-# id or a local directory. ``_patch_empty_hf_config`` writes one for these
-# instead of letting transformers fail on the missing file.
-_CONFIG_LESS_MODEL_TYPES: frozenset[str] = frozenset({"indextts2_5", "chatterbox"})
+# Model types whose official Hub repo ships no config.json, so
+# ``_patch_empty_hf_config`` writes one for a Hub id as well as for a local
+# directory instead of letting transformers fail on the missing file.
+_CONFIG_LESS_MODEL_TYPES: frozenset[str] = frozenset({"chatterbox"})
 
 # Maps model architecture names to tokenizer subfolder paths within HF repos.
 _TOKENIZER_SUBFOLDER_MAP: dict[str, str] = {
@@ -302,10 +302,13 @@ class OmniEngineArgs(EngineArgs):
             if config_dict.get("model_type"):
                 return  # config.json already has model_type, no patching needed
         except Exception:
-            # Keep this model-scoped so other loader failures retain vLLM's
-            # normal error path. Checkpoints in _CONFIG_LESS_MODEL_TYPES have
-            # no config.json, whether named by Hub id or local directory.
-            if model_type not in _CONFIG_LESS_MODEL_TYPES:
+            # The official IndexTTS 2.5 bundle has no HuggingFace config.json.
+            # Keep this exception model-scoped so other loader failures retain
+            # vLLM's normal error path. Chatterbox (_CONFIG_LESS_MODEL_TYPES)
+            # also has none as a Hub id.
+            if model_type not in _CONFIG_LESS_MODEL_TYPES and not (
+                model_type == "indextts2_5" and os.path.isdir(self.model)
+            ):
                 return
             if os.path.isdir(self.model) and os.path.lexists(os.path.join(self.model, "config.json")):
                 return
