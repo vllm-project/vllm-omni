@@ -69,6 +69,7 @@ The design contracts separate selection mechanics from backend algorithms:
 
 - [Attention Backend Selection](feature/attention_backend_selection.md)
 - [Attention Execution Contract PoC](feature/attention_execution_contract_poc.md)
+- [MiniMax H3 Attention Strategies](feature/minimax_h3_attention_strategies.md)
 - [Skip-Softmax](feature/skip_softmax.md)
 
 #### CPU offloading

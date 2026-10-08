@@ -1,0 +1,53 @@
+{
+  "presets": {
+    "fa3_dense": {
+      "backend": "FLASH_ATTN"
+    },
+    "fa4_subblock": {
+      "name": "block_sparse",
+      "config": {
+        "block_size": [
+          64,
+          64
+        ],
+        "selection": {
+          "name": "block_topk",
+          "config": {
+            "target_sparsity": 0.75
+          }
+        },
+        "backend": {
+          "require": "FLASH_ATTN",
+          "implementation": "auto"
+        }
+      }
+    }
+  },
+  "layouts": {
+    "dense": {
+      "default": "fa3_dense"
+    },
+    "sparse": {
+      "default": "fa4_subblock",
+      "overrides": [
+        {
+          "attention_role": "minimax_h3.token_refiner",
+          "use": "fa3_dense"
+        }
+      ]
+    }
+  },
+  "schedule": {
+    "coordinate": "step_index",
+    "phases": [
+      {
+        "until": 20,
+        "layout": "dense"
+      },
+      {
+        "until": null,
+        "layout": "sparse"
+      }
+    ]
+  }
+}

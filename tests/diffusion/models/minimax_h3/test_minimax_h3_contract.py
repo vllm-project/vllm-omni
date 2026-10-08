@@ -14,12 +14,23 @@ import pytest
 import torch
 import torch.nn as nn
 
+from vllm_omni.diffusion.attention.contracts import LEGACY_EXECUTION
 from vllm_omni.diffusion.models.minimax_h3.lora import TurboSpec, parse_turbo_filename
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
 _ItemT = TypeVar("_ItemT")
 _ResultT = TypeVar("_ResultT")
+
+
+class _LegacyAttentionStub(torch.nn.Module):
+    """Shared public executor contract for the packed-attention test doubles."""
+
+    attention_execution = LEGACY_EXECUTION
+
+    def for_layout(self, layout=None):
+        assert layout is None
+        return self
 
 
 def _append_and_return(items: list[_ItemT], item: _ItemT, result: _ResultT) -> _ResultT:
@@ -1156,7 +1167,7 @@ def test_cudnn_packed_attention_uses_python_length_without_padding_mask():
         def supports_packed_mask_free(cls) -> bool:
             return False
 
-    class FakeAttention(torch.nn.Module):
+    class FakeAttention(_LegacyAttentionStub):
         attn_backend = FakeBackend
 
         def __init__(self):
@@ -1208,7 +1219,7 @@ def test_packed_attention_skips_mask_for_packed_mask_free_backend():
         def supports_packed_mask_free(cls) -> bool:
             return True
 
-    class FakeAttention(torch.nn.Module):
+    class FakeAttention(_LegacyAttentionStub):
         attn_backend = FakeBackend
 
         def __init__(self):
@@ -1270,7 +1281,7 @@ def test_packed_attention_keeps_padding_mask_for_other_backends():
         def supports_packed_mask_free(cls) -> bool:
             return False
 
-    class FakeAttention(torch.nn.Module):
+    class FakeAttention(_LegacyAttentionStub):
         attn_backend = FakeBackend
 
         def __init__(self):
@@ -1386,7 +1397,7 @@ def _fake_packed_attention(
         def supports_packed_mask_free(cls) -> bool:
             return False
 
-    class FakeAttention(torch.nn.Module):
+    class FakeAttention(_LegacyAttentionStub):
         attn_backend = FakeBackend
 
         def __init__(self):
@@ -1459,7 +1470,7 @@ def test_rainfusion_packed_padding_stays_mask_free_on_unaligned_lengths():
         MiniMaxH3Attention,
     )
 
-    class FakeAttention(torch.nn.Module):
+    class FakeAttention(_LegacyAttentionStub):
         attn_backend = RainFusionAttentionBackend
 
         def __init__(self):
@@ -3656,8 +3667,9 @@ def test_unpadded_sage_token_refiner_preserves_legacy_dispatch(monkeypatch):
 
 
 @pytest.mark.cuda
+@pytest.mark.parametrize("scheduled", [False, True])
 @torch.inference_mode()
-def test_minimax_sparse_recipe_constructs_model_and_dispatches(monkeypatch):
+def test_minimax_sparse_recipe_constructs_model_and_dispatches(monkeypatch, scheduled):
     from pathlib import Path
 
     from vllm.model_executor import parameter
@@ -3674,6 +3686,7 @@ def test_minimax_sparse_recipe_constructs_model_and_dispatches(monkeypatch):
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (9, 0):
         pytest.skip("Requires Hopper SM90 and FA4")
     pytest.importorskip("flash_attn.cute")
+    monkeypatch.setattr("vllm.distributed.get_tensor_model_parallel_world_size", lambda: 1)
     monkeypatch.setattr(linear, "get_tensor_model_parallel_rank", lambda: 0)
     monkeypatch.setattr(linear, "get_tensor_model_parallel_world_size", lambda: 1)
     monkeypatch.setattr(parameter, "get_tensor_model_parallel_rank", lambda: 0)
@@ -3683,6 +3696,10 @@ def test_minimax_sparse_recipe_constructs_model_and_dispatches(monkeypatch):
     recipe = json.loads(
         (Path(__file__).resolve().parents[4] / "recipes/attention/minimax-h3-fa4-subblock.json").read_text()
     )
+    if scheduled:
+        recipe = json.loads(
+            (Path(__file__).resolve().parents[4] / "recipes/attention/minimax-h3-subblock-strategy.json").read_text()
+        )
     cfg = SimpleNamespace(
         tf_model_config={
             "num_layers": 1,
@@ -3719,11 +3736,13 @@ def test_minimax_sparse_recipe_constructs_model_and_dispatches(monkeypatch):
     refiner = model.token_refiner.blocks[0].attn
     assert dit.attention.role == "minimax_h3.dit" and dit.attention.role_category == "self"
     assert refiner.attention.role == "minimax_h3.token_refiner" and refiner.attention.role_category == "self"
-    assert isinstance(dit.attention.attention, BlockSparseAttention)
-    assert dit.attention.attn_backend is BlockSparseBackend
-    assert not isinstance(refiner.attention.attention, BlockSparseAttention)
-    assert refiner.attention.attn_backend.get_name() == "FLASH_ATTN"
-    assert not transformer._attention_isolates_packed_requests(dit.attention)
+    sparse_attention = dit.attention.for_layout(1) if scheduled else dit.attention
+    assert isinstance(sparse_attention.attention, BlockSparseAttention)
+    assert sparse_attention.attn_backend is BlockSparseBackend
+    refiner_attention = refiner.attention.for_layout(0) if scheduled else refiner.attention
+    assert not isinstance(refiner_attention.attention, BlockSparseAttention)
+    assert refiner_attention.attn_backend.get_name() == "FLASH_ATTN"
+    assert not transformer._attention_isolates_packed_requests(sparse_attention)
     calls = []
     real_length = 1089
 
@@ -3742,8 +3761,8 @@ def test_minimax_sparse_recipe_constructs_model_and_dispatches(monkeypatch):
         torch.testing.assert_close(output[:, :real_length].float(), reference, atol=0.004, rtol=0.02)
         assert torch.count_nonzero(output[:, real_length:]) == 0 and output.is_contiguous()
 
-    dit.attention.register_forward_hook(check_sparse_dispatch)
-    refiner.attention.register_forward_hook(lambda layer, args, output: calls.append(layer.role))
+    sparse_attention.register_forward_hook(check_sparse_dispatch)
+    refiner_attention.register_forward_hook(lambda layer, args, output: calls.append(layer.role))
     text = torch.randn(97, 256, device="cuda", dtype=cfg.dtype)
     refined = model.token_refiner(
         text,
@@ -3755,10 +3774,123 @@ def test_minimax_sparse_recipe_constructs_model_and_dispatches(monkeypatch):
     hidden[real_length:] = float("nan")
     cu = torch.tensor([0, real_length, hidden.shape[0]], device=hidden.device, dtype=torch.int32)
     calls.clear()
-    actual = dit(hidden, rope_table=None, cu_seqlens=cu, max_seqlen=real_length)
+    actual = dit(
+        hidden, rope_table=None, cu_seqlens=cu, max_seqlen=real_length, attention_layout=1 if scheduled else None
+    )
     assert calls == ["minimax_h3.dit"] and actual.shape == hidden.shape
     hidden[real_length:] = 10000
-    repeated = dit(hidden, rope_table=None, cu_seqlens=cu, max_seqlen=real_length)
+    repeated = dit(
+        hidden, rope_table=None, cu_seqlens=cu, max_seqlen=real_length, attention_layout=1 if scheduled else None
+    )
     torch.testing.assert_close(repeated[:real_length], actual[:real_length], atol=0, rtol=0)
     with pytest.raises(ValueError, match="does not isolate multi-document"):
-        dit(hidden, rope_table=None, cu_seqlens=cu, max_seqlen=real_length, num_requests=2)
+        dit(
+            hidden,
+            rope_table=None,
+            cu_seqlens=cu,
+            max_seqlen=real_length,
+            num_requests=2,
+            attention_layout=1 if scheduled else None,
+        )
+
+    if scheduled:
+        from vllm_omni.diffusion.forward_context import ForwardContext, override_forward_context
+        from vllm_omni.diffusion.models.minimax_h3.denoise_loop import MiniMaxH3DenoiseBranch
+        from vllm_omni.diffusion.models.minimax_h3.packed_sequence import minimax_h3_packed_sequence
+
+        sparse_attention._forward_hooks.clear()
+        refiner_attention._forward_hooks.clear()
+        packed = minimax_h3_packed_sequence(
+            text_len=97, latent_t=1, latent_h=32, latent_w=32, audio_t=8, include_keyframe_cond=False
+        )
+        branch = MiniMaxH3DenoiseBranch(
+            packed=packed, text_embeddings=text, token_tags=packed["token_tags"], device=hidden.device
+        )
+        kwargs = branch.forward_kwargs(
+            video_rows=torch.randn(branch.img_pos.shape[0], 96, device=hidden.device),
+            audio_rows=torch.randn(branch.audio_pos.shape[0], 32, device=hidden.device),
+            t_video=0.5,
+            t_audio=0.5,
+            imgvid_cond_timestep=0.5,
+            audio_ref_cond_timestep=0.5,
+        )
+        # The fixture uses two latent channels; keep the production packing geometry.
+        kwargs["x"] = kwargs["x"][..., :2].contiguous()
+        kwargs["audio_x"] = kwargs["audio_x"][..., :2].contiguous()
+        references = {}
+        for step in (19, 20):
+            with override_forward_context(ForwardContext(denoise_step_idx=step, total_denoise_steps=50)):
+                references[step] = model(**kwargs)
+        model._attention_strategy_runner.compile(dynamic=True)
+        for step in (19, 20, 19, 20):
+            with override_forward_context(ForwardContext(denoise_step_idx=step, total_denoise_steps=50)):
+                torch.testing.assert_close(model(**kwargs), references[step], atol=0.02, rtol=0.02)
+
+
+@pytest.mark.parametrize("ordinary_quality", [None, "lossless"])
+def test_strategy_rejects_resolved_quality_cache_before_hooks_and_next_request_works(monkeypatch, ordinary_quality):
+    from vllm_omni.diffusion.cache.cachedit import runtime
+    from vllm_omni.diffusion.data import AttentionConfig
+    from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
+    from vllm_omni.diffusion.models.minimax_h3.quality_policy import MiniMaxH3QualityPolicy
+    from vllm_omni.diffusion.request import OmniDiffusionRequest
+    from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+    pipeline = object.__new__(MiniMaxH3Pipeline)
+    torch.nn.Module.__init__(pipeline)
+    pipeline.load_text_encoder = pipeline.load_vae_encoder = False
+    pipeline.partition = "fl2va"
+    pipeline.supported_tasks = frozenset({"t2va"})
+    pipeline.default_video_shift, pipeline.default_audio_shift = 12.0, 3.0
+    pipeline.device = torch.device("cpu")
+    pipeline.od_config = SimpleNamespace(
+        cache_backend="none",
+        diffusion_attention_config=AttentionConfig(presets={"dense": "FLASH_ATTN"}, layout={"default": "dense"}),
+    )
+    pipeline._quality_policy = MiniMaxH3QualityPolicy(pipeline.od_config)
+    pipeline._cache_dit_runtime = runtime.RequestScopedCacheDiTRuntime(pipeline)
+    pipeline.transformer = torch.nn.Linear(2, 2)
+    backend = Mock()
+    monkeypatch.setattr(runtime, "CacheDiTBackend", backend)
+    pipeline.diffuse = Mock(return_value=(torch.zeros(1), torch.zeros(1)))
+    pipeline.decode = Mock(return_value=(torch.zeros(1, 3, 1, 1, 1), torch.zeros(1)))
+    original_forward = pipeline.transformer.forward
+    hooks = dict(pipeline.transformer._forward_hooks)
+
+    def request(quality):
+        return DiffusionRequestBatch(
+            [
+                OmniDiffusionRequest(
+                    prompt=_encoder_prompt("quality isolation"),
+                    sampling_params=OmniDiffusionSamplingParams(
+                        quality=quality,
+                        width=1344,
+                        height=768,
+                        fps=24,
+                        num_frames=124,
+                        num_inference_steps=50,
+                        extra_args={"task": "t2va", "aspect_ratio": "16:9"},
+                    ),
+                    request_id=f"quality-{quality}",
+                )
+            ]
+        )
+
+    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import OmniClientError
+
+    with pytest.raises(OmniClientError, match="attention strategies.*request cache acceleration"):
+        pipeline.forward(request("high"))
+    backend.assert_not_called()
+    pipeline.diffuse.assert_not_called()
+    pipeline.decode.assert_not_called()
+    assert not pipeline._cache_dit_runtime.is_enabled
+    assert pipeline.transformer.forward == original_forward
+    assert dict(pipeline.transformer._forward_hooks) == hooks
+    output = pipeline.forward(request(ordinary_quality))
+    assert output.output[0].shape == (1, 1, 1, 1, 3)
+    pipeline.diffuse.assert_called_once()
+    backend.assert_not_called()
+    assert not pipeline._cache_dit_runtime.is_enabled
+    assert pipeline.transformer.forward == original_forward
+    assert dict(pipeline.transformer._forward_hooks) == hooks

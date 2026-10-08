@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import json
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -217,3 +218,21 @@ def test_vdn_checkpoint_dir_resolution(tmp_path, monkeypatch):
     monkeypatch.setattr(vdnh3.hf_api(), "snapshot_download", lambda **_: str(release))
     assert _checkpoint_dir("OpenVDN/vdn-minimax-h3", from_hub=True) == release / VDN_CHECKPOINT
     assert prefetched == [("OpenVDN/vdn-minimax-h3", [VDN_CHECKPOINT])]
+
+
+def test_strategy_config_does_not_resolve_a_single_vdn_backend(monkeypatch):
+    from vllm_omni.diffusion.data import AttentionConfig
+
+    config = SimpleNamespace(
+        diffusion_attention_config=AttentionConfig(
+            presets={"dense": {"backend": "FLASH_ATTN"}}, layout={"default": "dense"}
+        ),
+        lora_path=None,
+    )
+    transformer = SimpleNamespace(arch=SimpleNamespace(attention_head_dim=128))
+    assert VDNCheckpoint.from_od_config(config, transformer) is None
+    config.lora_path = "local-vdn-checkpoint"
+    monkeypatch.setattr(vdnh3, "_checkpoint_dir", lambda *args, **kwargs: "local-vdn-checkpoint")
+    monkeypatch.setattr(VDNCheckpoint, "from_path", lambda *args, **kwargs: object())
+    with pytest.raises(ValueError, match="VDN-H3 checkpoints do not support attention strategies"):
+        VDNCheckpoint.from_od_config(config, transformer)

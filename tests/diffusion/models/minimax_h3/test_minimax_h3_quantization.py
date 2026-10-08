@@ -82,7 +82,7 @@ def test_fp8_scope_and_prefix_propagation(monkeypatch):
     monkeypatch.setattr(h3, "MergedColumnParallelLinear", _FakeLinear)
     monkeypatch.setattr(h3, "QKVParallelLinear", _FakeLinear)
     monkeypatch.setattr(h3, "RowParallelLinear", _FakeLinear)
-    monkeypatch.setattr(h3, "Attention", _FakeAttention)
+    monkeypatch.setattr(h3, "build_attention", _FakeAttention)
     monkeypatch.setattr(h3, "get_tensor_model_parallel_world_size", lambda: 1)
 
     ignored_layers = {
@@ -143,7 +143,7 @@ def test_explicit_native_weight_format_overrides_diffusers_class_name(monkeypatc
     monkeypatch.setattr(h3, "MergedColumnParallelLinear", _FakeLinear)
     monkeypatch.setattr(h3, "QKVParallelLinear", _FakeLinear)
     monkeypatch.setattr(h3, "RowParallelLinear", _FakeLinear)
-    monkeypatch.setattr(h3, "Attention", _FakeAttention)
+    monkeypatch.setattr(h3, "build_attention", _FakeAttention)
     monkeypatch.setattr(h3, "get_tensor_model_parallel_world_size", lambda: 1)
 
     model = h3.MiniMaxH3DiTModel(
@@ -220,7 +220,7 @@ def test_loader_adapter_declares_equivalent_direct_mmap_transform(monkeypatch):
 
     monkeypatch.setattr(h3, "QKVParallelLinear", _FakeLinear)
     monkeypatch.setattr(h3, "RowParallelLinear", _FakeLinear)
-    monkeypatch.setattr(h3, "Attention", _FakeAttention)
+    monkeypatch.setattr(h3, "build_attention", _FakeAttention)
 
     arch = h3.MiniMaxH3DiTArchConfig(
         hidden_size=1,
