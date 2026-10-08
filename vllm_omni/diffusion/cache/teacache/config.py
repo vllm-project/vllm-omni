@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from dataclasses import dataclass
 
@@ -8,6 +8,15 @@ from dataclasses import dataclass
 # Source: TeaCache paper and ComfyUI-TeaCache empirical tuning
 _MODEL_COEFFICIENTS = {
     # FLUX transformer coefficients from TeaCache paper
+    # Uncalibrated stand-in so Kandinsky 6 TeaCache can be enabled.
+    # Copied from Qwen-Image; refit before treating skips as quality-neutral.
+    "Kandinsky6Transformer3DModel": [
+        -4.50000000e02,
+        2.80000000e02,
+        -4.50000000e01,
+        3.20000000e00,
+        -2.00000000e-02,
+    ],
     "FluxTransformer2DModel": [
         4.98651651e02,
         -2.83781631e02,
@@ -83,6 +92,15 @@ _MODEL_COEFFICIENTS = {
     ],
     # LongCat Image transformer coefficients
     "LongCatImageTransformer2DModel": [652.5980, -424.1615, 84.5526, -4.5923, 0.1694],
+    # MammothModa2 DiT coefficients fitted from full-compute traces
+    # at 1024x1024 with 50 denoising steps.
+    "MammothModa2Transformer2DModel": [
+        -1761.242764481119,
+        859.398730831851,
+        -126.78044436937441,
+        9.16173963457422,
+        -0.1102826051200547,
+    ],
     # MiniMax-H3 FL2VA coefficients.
     "MiniMaxH3DiTModel": [
         2.283704065852778e03,
@@ -95,6 +113,7 @@ _MODEL_COEFFICIENTS = {
 
 _DEFAULT_REL_L1_THRESH = 0.2
 _MODEL_DEFAULT_REL_L1_THRESH = {
+    "MammothModa2Transformer2DModel": 0.075,
     "MiniMaxH3DiTModel": 0.17,
 }
 

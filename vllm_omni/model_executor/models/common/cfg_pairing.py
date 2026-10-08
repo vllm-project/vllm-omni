@@ -89,14 +89,12 @@ def _cfg_extra(request: Any, key: str) -> Any:
 
 
 def _wait_queues(scheduler: Any) -> list[Any]:
-    # Divergence from the official (vLLM 0.20-era) file: vLLM 0.24 parks
-    # structurally not-ready requests in a second ``skipped_waiting`` queue;
-    # pair-hold must cover both queues or a lone member parked there would
-    # be admitted without its partner.
+    # Pair holding must cover requests that retain KV blocks as well as
+    # fresh requests, or a lone member can be admitted without its partner.
     queues = [scheduler.waiting]
-    skipped = getattr(scheduler, "skipped_waiting", None)
-    if skipped is not None:
-        queues.append(skipped)
+    kv_holding = getattr(scheduler, "kv_holding_waiting", None)
+    if kv_holding is not None:
+        queues.append(kv_holding)
     return queues
 
 
@@ -108,7 +106,7 @@ def _pair_complete(scheduler: Any, request_id: str, blocked_ids: set[str] | None
     if len(roles) != 2 or not all(rid in scheduler.requests for rid in roles.values()):
         return False
     if blocked_ids:
-        # A partner parked in skipped_waiting (e.g. waiting for remote KVs)
+        # A deferred partner (e.g. waiting for remote KVs)
         # may fail promotion this step while this member gets scheduled from
         # waiting; hold this member until the partner is schedulable.
         for rid in roles.values():
@@ -149,14 +147,14 @@ def _hold_incomplete_pairs(scheduler: Any) -> list[tuple[Any, Any]]:
     hold_counts: dict[str, int] = getattr(scheduler, "_cfg_hold_counts", None) or {}
     scheduler._cfg_hold_counts = hold_counts
 
-    skipped = getattr(scheduler, "skipped_waiting", None)
-    blocked_ids = {req.request_id for req in list(skipped)} if skipped is not None else set()
+    kv_holding = getattr(scheduler, "kv_holding_waiting", None)
+    blocked_ids = {req.request_id for req in getattr(scheduler, "deferred_waiting", ())}
 
     held: list[tuple[Any, Any]] = []
     for queue in _wait_queues(scheduler):
         # A member is only "blocked" for its partner's sake when it sits in
         # the OTHER queue; members of the queue being scanned move together.
-        partner_blockers = blocked_ids if queue is not skipped else set()
+        partner_blockers = blocked_ids if queue is not kv_holding else set()
         held_here = []
         for request in list(queue):
             if _pair_complete(scheduler, request.request_id, partner_blockers):
@@ -181,8 +179,12 @@ def _release_held(held: list[tuple[Any, Any]]) -> None:
 
 
 def _reorder_waiting_for_cfg(scheduler: Any) -> None:
-    """Move CFG pair partners adjacent in the FCFS waiting queue."""
-    waiting = scheduler.waiting
+    """Move CFG pair partners adjacent in each FCFS waiting queue."""
+    for waiting in _wait_queues(scheduler):
+        _reorder_cfg_queue(scheduler, waiting)
+
+
+def _reorder_cfg_queue(scheduler: Any, waiting: Any) -> None:
     # Only the FCFS queue (a deque) has caller-controlled ordering; priority
     # queues order themselves and pair sync then relies on hold + equalize.
     if not isinstance(waiting, deque) or len(waiting) < 2:

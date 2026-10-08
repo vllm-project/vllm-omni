@@ -48,6 +48,8 @@ steps:
       - label: ":full_moon: Omni · Doc Test with H100 · 2-GPU"
         source_file_dependencies: omni_qwen3_omni_doc
         timeout_in_minutes: 90
+        artifact_paths:
+          - audio_*.wav
         commands:
           - pytest -s -v tests/examples/ -m "full_model and omni and H100 and B200 and cards_2" --run-level "full_model"
 
@@ -156,6 +158,11 @@ steps:
       - label: ":full_moon: TTS · Function Test with L4"
         source_file_dependencies: tts_qwen3_tts_function
         timeout_in_minutes: 120
+        env:
+          VLLM_OMNI_FAILED_SPEECH_AUDIO_DIR: .
+        artifact_paths:
+          - failed_speech_*.wav
+          - failed_speech_*.json
         commands:
           - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
           - export VLLM_USE_DEEP_GEMM="0"
@@ -260,6 +267,12 @@ steps:
           - export VLLM_HTTP_TIMEOUT_KEEP_ALIVE=120
           - pytest -s -v tests/e2e/accuracy/test_qwen_image.py -m "H100 and B200 and cards_1" --run-level full_model
           - pytest -s -v tests/e2e/accuracy/test_diffusers_backend_similarity.py -k '2i_matches_diffusers' -m "full_model and H100 and B200 and cards_1" --run-level full_model
+
+      - label: ":full_moon: JoyAI-Image-Edit · Accuracy Test"
+        source_file_dependencies: diffusion_joy_image_accuracy
+        timeout_in_minutes: 180
+        commands:
+          - pytest -s -v tests/e2e/accuracy/test_joy_image_edit.py -m "full_model and diffusion and H100 and B200 and cards_1" --run-level full_model
 
       - label: ":full_moon: HunyuanImage3-DIT · Accuracy Test"
         source_file_dependencies: diffusion_hunyuan_image3_accuracy

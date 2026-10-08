@@ -1282,6 +1282,7 @@ async def test_cache_reset_rpc_failure_is_nonfatal_and_visits_all_replicas(metho
     [
         ("reset_mm_cache", {}, True),
         ("sleep", {}, True),
+        ("release_kv_cache_memory", {}, True),
         ("pause_scheduler", {"clear_cache": True}, True),
         ("pause_scheduler", {"clear_cache": False}, False),
         ("reset_prefix_cache", {}, False),

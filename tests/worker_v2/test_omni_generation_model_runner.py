@@ -4,18 +4,31 @@
 """OmniGenerationModelRunner contracts: empty-step lifecycle, output partition,
 CPU-sync vs CUDA-async dispatch, and async-chunk slot recycling."""
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
 import torch
+from vllm.distributed.aux_output_connector.connector import AuxRequestOutput
 
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.worker_v2.omni_generation_model_runner import OmniGenerationModelRunner, check_exact_input_shape
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+@pytest.mark.parametrize("randomize_inputs", [False, True])
+def test_profile_run_accepts_release_flag_without_running_codec(monkeypatch, randomize_inputs):
+    runner = object.__new__(OmniGenerationModelRunner)
+    runner.model = MagicMock(side_effect=AssertionError("profiling ran codec model"))
+    synchronize = MagicMock()
+    monkeypatch.setattr(torch.accelerator, "synchronize", synchronize)
+    runner.profile_run(randomize_inputs=randomize_inputs)
+    synchronize.assert_called_once_with()
+    runner.model.assert_not_called()
 
 
 class _FakeStagedField:
@@ -45,6 +58,7 @@ def _make_runner(model_output, num_reqs=1, prompt_len=10):
     runner.execute_model_state = SimpleNamespace(finished_req_ids={"finished"}, ec_connector_output=None)
     runner.kv_connector = SimpleNamespace(post_forward=MagicMock(return_value=None))
     runner.check_ep_fault = False
+    runner.aux_output_connector = None
     runner.req_states = MagicMock(
         prompt_len=SimpleNamespace(np=np.full(num_reqs, prompt_len, dtype=np.int32)),
         num_computed_tokens=_FakeStagedField(np.zeros(num_reqs, dtype=np.int32)),
@@ -52,7 +66,8 @@ def _make_runner(model_output, num_reqs=1, prompt_len=10):
     return runner
 
 
-def test_control_only_step_keeps_lifecycle_and_skips_input_construction():
+@pytest.mark.parametrize("aux_enabled", [False, True])
+def test_control_only_step_keeps_lifecycle_and_skips_input_construction(aux_enabled):
     runner = object.__new__(OmniGenerationModelRunner)
     order = []
     for name in (
@@ -68,8 +83,13 @@ def test_control_only_step_keeps_lifecycle_and_skips_input_construction():
     runner.kv_connector = SimpleNamespace(no_forward=lambda _s: output)
     runner._merge_ec_connector_no_forward = lambda _s, value: value
     runner._attach_native_data_plane_signals = lambda value: value
+    metadata = object()
+    runner.aux_output_connector = SimpleNamespace(begin_step=MagicMock()) if aux_enabled else None
     scheduler_output = SimpleNamespace(
-        total_num_scheduled_tokens=0, scheduled_new_reqs=[], scheduled_cached_reqs=SimpleNamespace(req_ids=[])
+        total_num_scheduled_tokens=0,
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=SimpleNamespace(req_ids=[]),
+        aux_output_connector_metadata=metadata,
     )
     assert runner.execute_model(scheduler_output) is output
     assert order == [
@@ -78,6 +98,9 @@ def test_control_only_step_keeps_lifecycle_and_skips_input_construction():
         "free_states",
         "_apply_block_table_staged_writes_if_available",
     ]
+    if aux_enabled:
+        assert runner.aux_output_connector is not None
+        runner.aux_output_connector.begin_step.assert_called_once_with(metadata)
 
 
 def test_released_chunk_reuses_scheduler_output_and_slot_recycle_clears_state():
@@ -182,6 +205,72 @@ def test_sample_tokens_uses_async_output_for_cuda_and_snapshots_req_ids(monkeypa
     output_req_ids = captured["model_runner_output"].req_ids
     input_batch.req_ids[0] = "reused"  # snapshot must insulate the published output
     assert output_req_ids == ["req-0"]
+
+
+def test_generation_aux_output_copies_and_materializes_without_sampling(monkeypatch):
+    from vllm_omni.worker_v2 import omni_generation_model_runner as module
+
+    events = []
+
+    class PendingOutput:
+        def enqueue_cpu_copy(self, *, num_sampled, num_rejected):
+            np.testing.assert_array_equal(num_sampled, [0])
+            np.testing.assert_array_equal(num_rejected, [0])
+            events.append("copy")
+
+        def process_output(self):
+            assert events == ["copy", "record", "synchronize"]
+            return {"req-0": AuxRequestOutput(0, np.array([[2, 3]], dtype=np.uint8))}
+
+    class CopyEvent:
+        def record(self, stream):
+            events.append("record")
+
+        def synchronize(self):
+            events.append("synchronize")
+
+    monkeypatch.setattr(torch.cuda, "Event", lambda **kw: CopyEvent())
+    monkeypatch.setattr(torch.cuda, "stream", lambda stream: nullcontext())
+    monkeypatch.setattr(module, "_async_copy_mm", lambda *a, **kw: {})
+    output = OmniModelRunnerOutput(["req-0"], {"req-0": 0}, [[]])
+    result = module.OmniGenerationAsyncOutput(
+        model_runner_output=output,
+        multimodal_outputs={},
+        num_reqs=1,
+        main_stream=object(),
+        copy_stream=SimpleNamespace(wait_stream=lambda stream: None),
+        pending_aux_output=PendingOutput(),
+    ).get_output()
+
+    assert result.sampled_token_ids == [[]]
+    np.testing.assert_array_equal(result.aux_output_connector_output["req-0"].rows, [[2, 3]])
+
+
+def test_pending_aux_output_forces_async_delivery_without_cuda_payload(monkeypatch):
+    from vllm_omni.worker_v2 import omni_generation_model_runner as module
+
+    runner = _make_runner(OmniOutput(text_hidden_states=torch.empty(0), multimodal_outputs={}))
+    runner.device = SimpleNamespace(type="cuda")
+    runner.main_stream = object()
+    runner.output_copy_stream = object()
+    pending = object()
+    runner.aux_output_connector = SimpleNamespace(prepare_output=MagicMock(return_value=pending))
+    runner._reserve_native_data_plane_outputs = MagicMock()
+    runner._release_generation_slots = MagicMock()
+    runner._finalize_native_data_plane_output = MagicMock()
+    captured = {}
+
+    class AsyncOutput:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(module, "OmniGenerationAsyncOutput", AsyncOutput)
+    input_batch = runner._gen_input_batch
+    result = runner.sample_tokens()
+
+    assert isinstance(result, AsyncOutput)
+    runner.aux_output_connector.prepare_output.assert_called_once_with(input_batch)
+    assert captured["pending_aux_output"] is pending
 
 
 @pytest.mark.parametrize("exact", [True, False])

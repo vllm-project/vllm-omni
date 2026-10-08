@@ -52,7 +52,7 @@ class OmniRenderer:
     def _routes_no_media_kwargs(prompt) -> bool:
         return "prompt_embeds" not in prompt and "mm_processor_kwargs" in prompt and not prompt.get("multi_modal_data")
 
-    def _process_singleton(self, prompt, *, skip_mm_cache: bool = False):
+    def _process_singleton(self, prompt, *, skip_mm_cache: bool = False, tok_params=None):
         renderer = cast(BaseRenderer, self)
         if self._routes_no_media_kwargs(prompt):
             inputs = renderer._process_multimodal(
@@ -62,11 +62,14 @@ class OmniRenderer:
                 mm_uuids=prompt.get("multi_modal_uuids"),
                 skip_mm_cache=skip_mm_cache,
             )
+            renderer._truncate_expanded_prompt(inputs, tok_params)
         else:
-            inputs = cast(BaseRenderer, super())._process_singleton(prompt, skip_mm_cache=skip_mm_cache)
+            inputs = cast(BaseRenderer, super())._process_singleton(
+                prompt, skip_mm_cache=skip_mm_cache, tok_params=tok_params
+            )
         return self._with_omni_extras(inputs, prompt)
 
-    async def _process_singleton_async(self, prompt, *, skip_mm_cache: bool = False):
+    async def _process_singleton_async(self, prompt, *, skip_mm_cache: bool = False, tok_params=None):
         renderer = cast(BaseRenderer, self)
         if self._routes_no_media_kwargs(prompt):
             inputs = await renderer._process_multimodal_async(
@@ -76,8 +79,11 @@ class OmniRenderer:
                 mm_uuids=prompt.get("multi_modal_uuids"),
                 skip_mm_cache=skip_mm_cache,
             )
+            renderer._truncate_expanded_prompt(inputs, tok_params)
         else:
-            inputs = await cast(BaseRenderer, super())._process_singleton_async(prompt, skip_mm_cache=skip_mm_cache)
+            inputs = await cast(BaseRenderer, super())._process_singleton_async(
+                prompt, skip_mm_cache=skip_mm_cache, tok_params=tok_params
+            )
         return self._with_omni_extras(inputs, prompt)
 
 
