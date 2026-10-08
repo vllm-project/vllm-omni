@@ -100,29 +100,6 @@ hardware.
 
 ---
 
-### Cosmos3 MAPS checkpoints
-
-Cosmos3 MAPS supports HSDP with ModelOpt FP8 and NVFP4 checkpoints using the
-standard HSDP flags. Validated configurations include standalone HSDP,
-HSDP + Ulysses SP (SP sizes 2 and 4), and HSDP + CFG (CFG size 2).
-Combined HSDP + Ulysses SP + CFG has passed generation checks on four B200
-GPUs for FP8 and native or emulated NVFP4, with `hsdp_replicate_size=1`,
-`hsdp_shard_size=4`, `ulysses_degree=2`, and `cfg_parallel_size=2`.
-HSDP + Ring and HSDP + AllGather-KV remain pending validation. Attention
-backend restrictions still apply.
-
-Standalone HSDP with `hsdp_replicate_size=2` and `hsdp_shard_size=2` is also
-validated on four B200 GPUs for FP8 and native or emulated NVFP4 MAPS.
-Replication combined with SP or CFG remains pending validation.
-
-This requires one active request and no CPU offload. The general HSDP
-parallelism restrictions apply.
-
-For NVFP4, packed weights remain replicated, so weight memory does not
-decrease proportionally with the shard count.
-
----
-
 ## Example Script
 
 ### Offline Inference
