@@ -143,6 +143,27 @@ def validate_request_attention_schedule(request: Any, od_config: Any) -> Attenti
     return resolve_attention_schedule(request_schedule, default, profiles=profiles)
 
 
+def require_request_attention_schedule_fits(request: Any, od_config: Any, total_steps: int) -> AttentionSchedule:
+    """Step-mode form of require_attention_schedule_fits for one request or runner state.
+
+    Step-mode preparation runs before the runner opens the forward context, so the bound schedule is
+    not available there; this resolves the request's own schedule against the service default.
+    """
+    schedule = validate_request_attention_schedule(SimpleRequest(request), od_config)
+    if schedule:
+        require_attention_schedule_fits(schedule, total_steps)
+    return schedule
+
+
+class SimpleRequest:
+    """Adapter so a runner state with ``sampling`` satisfies the request validator."""
+
+    def __init__(self, state: Any) -> None:
+        self.sampling_params = getattr(state, "sampling_params", None)
+        if self.sampling_params is None:
+            self.sampling_params = getattr(state, "sampling", None)
+
+
 def select_attention_profile(schedule: AttentionSchedule, step_index: int, *, total_steps: int) -> str | None:
     """Return the selected name, or None for the original configuration in gaps."""
     _validate_step(total_steps, "total_steps", minimum=1)
