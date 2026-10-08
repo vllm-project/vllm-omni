@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-import pickle
-
 import pytest
 import torch
 from vllm import SamplingParams
@@ -13,6 +11,7 @@ from vllm_omni.diffusion.output_formatter import (
     normalize_diffusion_postprocess_output,
 )
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.distributed.omni_connectors.utils.serialization import OmniSerializer
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.model_executor.models.minimax_h3.conditioning import MINIMAX_H3_ENCODER_REQUEST_KEY
 from vllm_omni.model_executor.stage_input_processors.minimax_h3 import (
@@ -34,8 +33,6 @@ def _format_denoise_output(video_latents, audio_latents, metadata, *, finished=T
         to_cpu=True,
         finished=finished,
     )
-    # Serialization and formatting must preserve both video and audio latents.
-    output = pickle.loads(pickle.dumps(output))
     [formatted] = format_diffusion_outputs(
         request=OmniDiffusionRequest(
             prompt="A bird sings beside a river.",
@@ -47,8 +44,11 @@ def _format_denoise_output(video_latents, audio_latents, metadata, *, finished=T
         output_data=output.output,
         postprocess_output=normalize_diffusion_postprocess_output(output.output),
     )
-    assert isinstance(formatted, OmniRequestOutput)
-    return pickle.loads(pickle.dumps(formatted))
+    # Roundtrip the same result envelope used by StageDiffusionProc.
+    wire = OmniSerializer.serialize({"type": "result", "output": formatted})
+    restored = OmniSerializer.deserialize(wire)["output"]
+    assert isinstance(restored, OmniRequestOutput)
+    return restored
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
@@ -97,7 +97,7 @@ def test_decoder_handoff_preserves_latent_lists_and_decode_parameters(dtype, pre
     assert "encoder_output" in original_info
     assert prompt["multi_modal_data"] is original_media
 
-    decoder_prompt = pickle.loads(pickle.dumps(decoder_prompt))
+    decoder_prompt = OmniSerializer.deserialize(OmniSerializer.serialize(decoder_prompt))
     handoff = decoder_prompt["additional_information"]["minimax_h3_decode"]
     assert {key: handoff[key] for key in decode_parameters} == decode_parameters
     for name, expected in (("video_latents", video_latents), ("audio_latents", audio_latents)):

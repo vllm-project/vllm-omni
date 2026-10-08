@@ -209,7 +209,7 @@ def diffusion2decoder(
         raise RuntimeError("MiniMax H3 DiT returned no decoder latent payload")
     payload = {**options, "video_latents": latents["video"], "audio_latents": latents["audio"]}
     # DiT has consumed source media and conditioning; pass only latents and decode options.
-    additional_information = {"minimax_h3_decode": payload}
+    additional_information: dict[str, Any] = {"minimax_h3_decode": payload}
     if expected_request_id is not None:
         additional_information["global_request_id"] = expected_request_id
     decoder_prompt["additional_information"] = additional_information

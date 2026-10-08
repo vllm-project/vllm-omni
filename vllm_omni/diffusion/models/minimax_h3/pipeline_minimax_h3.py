@@ -165,7 +165,7 @@ from .time_request import (
     MINIMAX_H3_SHAPE_PLANNER,
     minimax_h3_time_shift_sigmas,
 )
-from .vae import MiniMaxH3AudioVAE, MiniMaxH3VideoVAE, _VideoVAEPartProxy
+from .vae import MiniMaxH3AudioVAE, MiniMaxH3VideoVAE, _load_component_config, _VideoVAEPartProxy
 from .vdnh3 import VDNCheckpoint
 
 if TYPE_CHECKING:
@@ -1129,18 +1129,20 @@ class MiniMaxH3Pipeline(
             )
         # Registry-side VAE patch-parallel discovery uses ``pipeline.vae``.
         self.vae = self.video_vae
+
         # Optional learned latent super-resolution, run between the denoise
         # loop and the VAE. Absent unless --additional-config names a
         # checkpoint, so a plain H3 deployment carries none of its weights.
         # The upscaler works one normalization below the pipeline latent, so it
         # needs the same per-channel statistics the VAE denormalizes with.
+        def _upscaler_latent_stats() -> tuple[list[float], list[float]]:
+            config = _load_component_config(os.path.join(vae_model_path, "video_vae"))
+            return config["latents_mean"], config["latents_std"]
+
         self.latent_upscaler = resolve_minimax_h3_latent_upscaler(
             od_config,
             device=self.device,
-            latent_stats=lambda: (
-                self.video_vae.config_dict["latents_mean"],
-                self.video_vae.config_dict["latents_std"],
-            ),
+            latent_stats=_upscaler_latent_stats,
         )
 
         self._dlo_component_cache = None
