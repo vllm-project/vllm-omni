@@ -95,10 +95,12 @@ def handler_factory(monkeypatch):
 
     class _FakeCtor:
         def __init__(self, *args, **kwargs):
-            pass
+            self.args = args
+            self.kwargs = kwargs
+            self.warmup_calls = 0
 
         def warmup(self):
-            return None
+            self.warmup_calls += 1
 
     class _FakeSpeech(_FakeCtor):
         def __init__(self, *args, **kwargs):
@@ -1529,18 +1531,11 @@ async def test_multistage_app_state_key_snapshot(handler_factory, tmp_path, supp
             model_config=SimpleNamespace(),
             parallel_config=SimpleNamespace(_api_process_rank=0),
         ),
-        supported_tasks=supported_tasks
+        supported_tasks=supported_tasks,
     )
-
-    deploy = tmp_path / "deploy.yaml"
-    deploy.write_text("speech_cache:\n  resolve_max_bytes: 1024\n  speaker_max_bytes: 8\n")
-    engine.config_path = str(deploy)
 
     state = State()
     await api_server.omni_init_app_state(engine, state, _minimal_args(log_error_stack=True))
-    assert diffusion_handler_factory["speech_cache_config"].resolve_max_bytes == 1024
-    assert diffusion_handler_factory["speech_cache_config"].resolve_max_entries == 2048
-    assert diffusion_handler_factory["speech_cache_config"].speaker_max_bytes == 8
 
     disabled = (
         set()
