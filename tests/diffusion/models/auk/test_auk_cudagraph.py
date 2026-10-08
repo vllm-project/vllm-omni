@@ -182,7 +182,7 @@ def test_single_request_graph_replay_matches_eager_and_updates_inputs(cfg_streng
 @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graph replay requires CUDA")
 @torch.inference_mode()
-def test_graph_capture_failure_is_propagated(mocker) -> None:
+def test_graph_capture_failure_falls_back_to_eager(mocker) -> None:
     dit = _make_dit("cuda")
     wrapper = AuKCUDAGraphWrapper(dit)
     capture = mocker.patch.object(wrapper, "_capture_loop", side_effect=RuntimeError("capture failed"))
@@ -194,23 +194,26 @@ def test_graph_capture_failure_is_propagated(mocker) -> None:
         cfg_strength=0.0,
     )
 
-    with pytest.raises(RuntimeError, match="capture failed"):
-        sample_latents(
-            dit,
-            **common,
-            generator=torch.Generator(device="cuda").manual_seed(7),
-            sampler=wrapper,
-        )
-    with pytest.raises(RuntimeError, match="capture failed"):
-        sample_latents(
-            dit,
-            **common,
-            generator=torch.Generator(device="cuda").manual_seed(7),
-            sampler=wrapper,
-        )
+    # First attempt: capture fails, warning logged, falls back to eager execution.
+    res1 = sample_latents(
+        dit,
+        **common,
+        generator=torch.Generator(device="cuda").manual_seed(7),
+        sampler=wrapper,
+    )
+    assert res1 is not None
+
+    # Second attempt: key is uncapturable, bypasses capture immediately and runs eagerly.
+    res2 = sample_latents(
+        dit,
+        **common,
+        generator=torch.Generator(device="cuda").manual_seed(7),
+        sampler=wrapper,
+    )
+    assert res2 is not None
 
     assert wrapper.enabled
-    assert capture.call_count == 2
+    assert capture.call_count == 1
     assert not wrapper._loop_cache
 
 

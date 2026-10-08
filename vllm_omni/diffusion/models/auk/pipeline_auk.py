@@ -498,8 +498,8 @@ class AuKPipeline(nn.Module, SupportAudioInput, SupportAudioOutput, SupportsComp
                 f"AuK advertises {self.audio_sample_rate} Hz output but the checkpoint is {self.sample_rate} Hz."
             )
 
-    def _resolve_generator(self, sampling_params: Any) -> torch.Generator | None:
-        """Per-request generator; the process-global RNG is never seeded."""
+    def _resolve_generator(self, sampling_params: Any) -> torch.Generator:
+        """Per-request generator; unseeded requests draw deterministically in request order."""
 
         generator = sampling_params.generator
         if isinstance(generator, list):
@@ -508,8 +508,14 @@ class AuKPipeline(nn.Module, SupportAudioInput, SupportAudioOutput, SupportsComp
                     "AuKPipeline runs one request per forward; using the first of %d generators", len(generator)
                 )
             generator = generator[0] if generator else None
-        if generator is None and sampling_params.seed is not None:
-            generator = torch.Generator(device=self.device).manual_seed(int(sampling_params.seed))
+        if generator is None:
+            if sampling_params.seed is not None:
+                seed = int(sampling_params.seed)
+            else:
+                # Draw seed in request arrival order before schedule grouping so
+                # unseeded requests draw independent noise regardless of schedule order.
+                seed = int(torch.empty((), dtype=torch.int64).random_().item()) & 0x7FFFFFFFFFFFFFFF
+            generator = torch.Generator(device=self.device).manual_seed(seed)
         return generator
 
     def _prepare_waveform(self, audio: Any) -> torch.Tensor:
