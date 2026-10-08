@@ -12,7 +12,6 @@ import torch
 import torch.nn as nn
 from vllm.platforms import current_platform
 
-from vllm_omni.model_executor.models.personaplex.personaplex_code2wav import _MIMI_DECODE_BATCH_FRAMES
 from vllm_omni.model_executor.models.personaplex.personaplex_mimi import (
     CODEBOOKS,
     FRAME_SIZE,
@@ -223,7 +222,7 @@ def test_multi_frame_decode_graph_matches_eager_chunks(batch_size: int) -> None:
     # Code2Wav records the first single-frame delta and the full chunk, on one
     # B=1 decoder per session. B=3 runs the same graphs on shared rows, where
     # every call carries all rows and only some are active.
-    chunk = _MIMI_DECODE_BATCH_FRAMES
+    chunk = 5  # Exercise multi-frame graphs independently of the shared decoder batching policy.
     partial = chunk - 2
     assert partial not in (1, chunk)
     device = torch.device("cuda")
@@ -336,7 +335,7 @@ class _RecordingCodec:
     def __init__(self) -> None:
         self.calls: list[tuple[str, object]] = []
 
-    def streaming_init(self, batch_size: int) -> None:
+    def streaming_init(self, batch_size: int, *, decode: bool = True) -> None:
         self.calls.append(("streaming_init", batch_size))
 
     def capture_cuda_graphs(self, *, encode: bool, decode_frame_counts: tuple[int, ...]) -> list[str]:

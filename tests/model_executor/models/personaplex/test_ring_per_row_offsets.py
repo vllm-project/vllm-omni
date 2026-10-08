@@ -117,17 +117,15 @@ def _make_codec_stub(mocker: MockerFixture) -> PersonaPlexMimiCodec:
     codec = PersonaPlexMimiCodec.__new__(PersonaPlexMimiCodec)
     nn.Module.__init__(codec)
 
-    quantizer = mocker.Mock(spec=["encode", "decode"])
-    quantizer.encode.side_effect = lambda x, num_quantizers=8: torch.zeros(
-        num_quantizers, x.shape[0], x.shape[-1], dtype=torch.long
+    quantizer = mocker.Mock(spec=["encode"])
+    quantizer.encode.side_effect = lambda x, num_quantizers=None: torch.zeros(
+        8 if num_quantizers is None else num_quantizers, x.shape[0], x.shape[-1], dtype=torch.long
     )
-    quantizer.decode.side_effect = lambda codes: torch.zeros(codes.shape[0], 1, codes.shape[-1])
-    # The codec decodes through its own RVQ sum; route it to the stub.
-    codec._quantizer_decode = quantizer.decode
 
     codec.device = torch.device("cpu")
     codec.dtype = torch.float32
     codec.model = SimpleNamespace(quantizer=quantizer)
+    codec._dequantize = lambda codes: torch.zeros(codes.shape[0], 1, codes.shape[-1])
     codec._enc_stages = []
     codec._dec_stages = []
     codec._downsample = _make_passthrough_stage(mocker)

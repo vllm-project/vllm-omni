@@ -10,19 +10,14 @@
 #     first-chunk latency (not correctness).
 #   * Stage 1 (code2wav) wraps the external Mimi codec. Each codec frame is
 #     8 active codebooks (cb 0..7) -> 1920 PCM samples @ 24 kHz / 12.5 Hz.
-#   * Stage 0 runs cudagraph by default; Stage 1 (Mimi) runs with
-#     enforce_eager because the external decoder performs host-to-device copies
-#     that the runner cannot capture. The streaming Mimi encode (Stage 0) and
-#     decode (Stage 1) frame steps instead replay model-local CUDA graphs
-#     (hf_overrides.mimi_cuda_graphs), bitwise equal to eager. The graphs add
-#     about 80 MiB on Stage 0 and 5 MiB per decoder slot on Stage 1.
+#   * Stage 0 runs cudagraph by default. Stage 1 (Mimi) keeps enforce_eager,
+#     since vLLM's own capture records nothing for it; both stages replay their
+#     streaming Mimi codec from model-local CUDA graphs (mimi_cuda_graphs).
 #   * Each live session holds one 3000-frame KV window (~1.5 GiB) on Stage 0.
 #     To serve more sessions, raise duplex_session.max_sessions and both stages'
-#     max_num_seqs together, and size Stage 0 gpu_memory_utilization for
-#     N x 1.5 GiB of KV: on a 141 GB card, utilization 0.75 holds about 60 full
-#     windows. Measured there (Stage 1 at 0.15), 64 concurrent 30 s sessions
-#     (375 frames each) stayed realtime. Longer sessions also cost more per
-#     step as their context fills.
+#     max_num_seqs together (Stage 0's to a cudagraph capture size, e.g. a
+#     multiple of 8), and size Stage 0 gpu_memory_utilization for the KV;
+#     on a 141 GB card, 16 sessions at Stage 0 utilization 0.75 stay realtime.
 pipeline: personaplex
 session_mode: duplex
 duplex_session:
@@ -35,14 +30,19 @@ connectors:
     name: SharedMemoryConnector
     extra:
       codec_streaming: true
-      # Mimi runs at 12.5 Hz (80 ms / frame). Stream a few frames per chunk.
+      # Mimi runs at 12.5 Hz (80 ms / frame). Stream a few frames per chunk:
+      # at 16 sessions, 1-frame chunks spend more on per-chunk transfer and
+      # scheduling than the shared decode saves.
       codec_chunk_frames: 5
       # Emit only the first audio chunk early, then return to codec_chunk_frames.
       initial_codec_chunk_frames: 1
 
 stages:
   - stage_id: 0
-    max_num_seqs: 10
+    # Keep max_num_seqs one of vLLM's cudagraph capture sizes (1, 2, 4, then
+    # multiples of 8 by default): a step with more rows than the largest size
+    # at or below it runs Helium and the depformer without graphs.
+    max_num_seqs: 8
     gpu_memory_utilization: 0.4
     trust_remote_code: true
     skip_tokenizer_init: true
@@ -59,8 +59,12 @@ stages:
     # Temporal transformer sliding_window is 3000 frames; keep model len within.
     max_model_len: 3000
     devices: "0"
+    # Replay each step's streaming Mimi encode (all max_sessions rows) and its
+    # post-sample depformer (per padded batch size) from model-local CUDA
+    # graphs captured at load.
     hf_overrides:
       mimi_cuda_graphs: true
+      depformer_cuda_graphs: true
     output_connectors:
       to_stage_1: connector_of_shared_memory
     default_sampling_params:
@@ -75,6 +79,7 @@ stages:
       repetition_penalty: 1.0
 
   - stage_id: 1
+    # Sessions run as codec rows in the shared Mimi decoder pass, not independent vLLM engine sequences.
     max_num_seqs: 10
     gpu_memory_utilization: 0.3
     enforce_eager: true
@@ -86,6 +91,9 @@ stages:
     max_num_batched_tokens: 65536
     max_model_len: 65536
     devices: "0"
+    # Replay each frame's streaming Mimi decode (all sessions plus a scratch
+    # row) from a model-local CUDA graph captured at load. Decoder GEMMs use
+    # TF32 (mimi_decode_tf32, default on); weights stay float32.
     hf_overrides:
       mimi_cuda_graphs: true
     input_connectors:

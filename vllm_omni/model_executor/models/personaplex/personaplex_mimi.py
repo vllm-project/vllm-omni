@@ -29,6 +29,8 @@ codec composes with elastic slot recycling in batched duplex serving.
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
@@ -43,9 +45,29 @@ from vllm_omni.model_executor.models.personaplex.personaplex_temporal import (
     _rope_tables,
 )
 
+logger = init_logger(__name__)
+
+if TYPE_CHECKING:
+    from vllm_omni.model_executor.models.personaplex.personaplex_mimi_cudagraph import MimiFrameGraph
+
 DEFAULT_HF_REPO = "kyutai/mimi"
 FRAME_SIZE = 1920
 CODEBOOKS = 8
+_GRAPH_WARMUP_ITERS = 2
+_GRAPH_STREAMS: dict[int, torch.cuda.Stream] = {}
+
+
+def graph_stream() -> torch.cuda.Stream:
+    """One capture stream per device so warmup allocations and the cuBLAS workspace share a segment."""
+    device = torch.accelerator.current_device_index()
+    stream = _GRAPH_STREAMS.get(device)
+    if stream is None:
+        stream = torch.cuda.Stream()
+        with torch.cuda.stream(stream):
+            torch.cuda.current_blas_handle()  # allocates the stream's cuBLAS workspace
+        _GRAPH_STREAMS[device] = stream
+    return stream
+
 
 logger = init_logger(__name__)
 
@@ -54,10 +76,9 @@ if TYPE_CHECKING:
 
 
 def _normalize_active(active: torch.Tensor | None, all_active: torch.Tensor) -> torch.Tensor:
-    # Stage 0 shares one codec with a row per session slot and passes bool[B]:
-    # True advances that row's streaming state; False keeps an absent or padded
-    # row's offsets and convolution carries unchanged. Code2Wav leases one B=1
-    # codec per request and omits `active`, which means all rows are active.
+    # None treats all rows as active. The shared Stage 0 and Code2Wav codecs
+    # pass bool[B]: True advances that row's streaming state; False keeps an
+    # absent or padded row's offsets and convolution carries unchanged.
     if active is None:
         return all_active
     if active.shape != all_active.shape:
@@ -117,9 +138,7 @@ class _StreamConv1d:
     (``constant``); the down/upsample resamplers use ``replicate`` (the first
     real sample), marked per row so elastic slot recycling re-primes correctly.
 
-    The carry and the fresh-row flags are allocated once in ``reset`` and only
-    ever updated in place, so a CUDA graph recorded over ``__call__`` keeps
-    reading and writing the live state across frames, row resets and sessions.
+    The carry and the fresh-row flags are updated in place, so CUDA graph replays advance them.
     """
 
     def __init__(self, conv: nn.Conv1d, pad_mode: str = "constant") -> None:
@@ -140,11 +159,15 @@ class _StreamConv1d:
         self._fresh.fill_(True)
 
     def reset_slot(self, b: int) -> None:
+        # In-place fills: assigning a Python scalar would sync the host.
         self.prev[b].zero_()
-        self._fresh[b] = True
+        self._fresh[b].fill_(True)
+
+    def reset_all_slots(self) -> None:
+        self.prev.zero_()
+        self._fresh.fill_(True)
 
     def __call__(self, x: torch.Tensor, active: torch.Tensor) -> torch.Tensor:
-        active_view = active.view(-1, 1, 1)
         if self.pad_mode == "replicate":
             pad = self.prev.shape[-1]
             edge = x[..., 0:1].expand(-1, -1, pad)
@@ -154,7 +177,8 @@ class _StreamConv1d:
         x = torch.cat([self.prev, x], dim=-1)
         t = x.shape[-1]
         num_frames = max(0, (t - self.kernel) // self.stride + 1)
-        self.prev.copy_(torch.where(active_view, x[..., num_frames * self.stride :], self.prev))
+        prev = x[..., num_frames * self.stride :]
+        self.prev.copy_(torch.where(active.view(-1, 1, 1), prev, self.prev))
         if num_frames == 0:
             return x.new_zeros(x.shape[0], self.conv.out_channels, 0)
         return self.conv(x[..., : (num_frames - 1) * self.stride + self.kernel])
@@ -185,7 +209,11 @@ class _StreamConvTr1d:
 
     def reset_slot(self, b: int) -> None:
         self.partial[b].zero_()
-        self._fresh[b] = True
+        self._fresh[b].fill_(True)
+
+    def reset_all_slots(self) -> None:
+        self.partial.zero_()
+        self._fresh.fill_(True)
 
     def __call__(self, x: torch.Tensor, active: torch.Tensor) -> torch.Tensor:
         out = self.conv(x)
@@ -197,9 +225,8 @@ class _StreamConvTr1d:
             # The carried tail already includes the bias; the fresh output adds
             # it again, so subtract one copy -- except on a row's very first
             # frame, where the carry is zeros by construction.
-            merge = merge - self.conv.bias[:, None]
-            first = (self._fresh & active).view(-1, 1, 1)
-            merge = torch.where(first, torch.zeros_like(merge), merge)
+            fresh = (self._fresh & active).view(-1, 1, 1)
+            merge = torch.where(fresh, 0.0, merge - self.conv.bias[:, None])
             self._fresh.logical_and_(~active)
         out[..., :pt] += merge
         self.partial.copy_(torch.where(active.view(-1, 1, 1), out[..., length - tail :], self.partial))
@@ -279,7 +306,7 @@ class _MimiStreamingTransformer(nn.Module):
         # instead of carrying its predecessor's absolute RoPE positions.
         for kv in self._kv:
             kv.reset_row(b)
-        self._offset[b] = 0
+        self._offset[b].zero_()
 
     def step(self, x: torch.Tensor, active: torch.Tensor) -> torch.Tensor:
         """``x`` is ``[B, T, dim]`` (T = positions this frame, typically 2)."""
@@ -339,6 +366,47 @@ def _walk_seanet(layers) -> list[tuple[str, object]]:
     return stages
 
 
+def _seanet_conv_states(stages) -> list[_StreamConv1d | _StreamConvTr1d]:
+    """The streaming conv states of a ``_walk_seanet`` stage list."""
+    states = []
+    for _, stage in stages:
+        if isinstance(stage, (_StreamConv1d, _StreamConvTr1d)):
+            states.append(stage)
+        elif isinstance(stage, tuple):
+            states += [stage[1], stage[3]]
+    return states
+
+
+def _residual_decode(rvq: nn.Module, codes: torch.Tensor) -> torch.Tensor:
+    """``MimiResidualVectorQuantizer.decode`` of ``[B, K, T]`` codes, summed from the first codebook.
+
+    Transformers seeds the sum with ``torch.tensor(0.0, device=...)``, a copy a CUDA graph cannot capture.
+    """
+    per_codebook = codes.transpose(0, 1)
+    out = rvq.layers[0].decode(per_codebook[0])
+    for layer, indices in zip(rvq.layers[1:], per_codebook[1:]):
+        out = out + layer.decode(indices)
+    if rvq.output_proj is not None:
+        out = rvq.output_proj(out)
+    return out
+
+
+@dataclass
+class _CodecGraph:
+    """One codec call over every streaming row, captured into a CUDA graph."""
+
+    graph: torch.cuda.CUDAGraph
+    inputs: torch.Tensor
+    active: torch.Tensor
+    output: torch.Tensor
+
+    def replay(self, inputs: torch.Tensor, active: torch.Tensor) -> torch.Tensor:
+        self.inputs.copy_(inputs.reshape(self.inputs.shape))
+        self.active.copy_(active)
+        self.graph.replay()
+        return self.output.clone()
+
+
 class PersonaPlexMimiCodec(nn.Module):
     """Streaming Mimi encode/decode at one 80 ms frame per call (moshi-free)."""
 
@@ -362,7 +430,12 @@ class PersonaPlexMimiCodec(nn.Module):
                 "tokenizer-e351c8d8-checkpoint125.safetensors",
             )
         sd = load_file(checkpoint, device=str(self.device))
-        self.model = MimiModel(MimiConfig())
+        orig_default_dtype = torch.get_default_dtype()
+        try:
+            torch.set_default_dtype(torch.float32)
+            self.model = MimiModel(MimiConfig())
+        finally:
+            torch.set_default_dtype(orig_default_dtype)
         codec_state = _map_moshi_codec_weights(sd)
         incompatible = self.model.load_state_dict(codec_state, strict=False)
         expected_missing = {
@@ -388,6 +461,7 @@ class PersonaPlexMimiCodec(nn.Module):
         n_dec = self.decoder_transformer.load_weights(sd, "decoder_transformer")
         assert n_enc == n_dec == 80, (n_enc, n_dec)
         del sd
+
         self._init_streaming_stages()
 
     def _init_streaming_stages(self) -> None:
@@ -397,56 +471,211 @@ class PersonaPlexMimiCodec(nn.Module):
         self._upsample = _StreamConvTr1d(m.upsample.conv)
         self._dec_stages = _walk_seanet(m.decoder.layers)
         self._batch_size: int | None = None
-        self._cuda_graphs: dict[str, MimiFrameGraph] = {}
+        # The halves streaming_init allocated rows for: Stage 0 only encodes, Stage 1 only decodes.
+        self._halves = {"encode": False, "decode": False}
         self._all_active: torch.Tensor
+        self._encode_graph: _CodecGraph | None = None
+        self._decode_graph: _CodecGraph | None = None
 
     # -- streaming state ------------------------------------------------------
 
-    def _conv_states(self):
-        for _, stage in (*self._enc_stages, *self._dec_stages):
-            if isinstance(stage, (_StreamConv1d, _StreamConvTr1d)):
-                yield stage
-            elif isinstance(stage, tuple):
-                yield stage[1]
-                yield stage[3]
-        yield self._downsample
-        yield self._upsample
+    def _half_state(self, half: str) -> tuple[list, _MimiStreamingTransformer]:
+        """The conv states and the transformer that carry the ``"encode"`` or ``"decode"`` half's stream."""
+        if half == "encode":
+            return [*_seanet_conv_states(self._enc_stages), self._downsample], self.encoder_transformer
+        return [self._upsample, *_seanet_conv_states(self._dec_stages)], self.decoder_transformer
 
-    def streaming_init(self, batch_size: int) -> None:
-        # Re-initializing at the same batch size resets in place: the state
-        # tensors keep their storage, so captured frame graphs stay valid.
-        if getattr(self, "_batch_size", None) == batch_size:
+    def _allocated_halves(self) -> list[tuple[list, _MimiStreamingTransformer]]:
+        return [self._half_state(half) for half, allocated in self._halves.items() if allocated]
+
+    def _conv_states(self):
+        for convs, _ in self._allocated_halves():
+            yield from convs
+
+    def _require(self, half: str) -> None:
+        if not self._halves[half]:
+            raise RuntimeError(
+                f"PersonaPlex Mimi has no {half} streaming state; call streaming_init(batch_size, {half}=True) first"
+            )
+
+    def streaming_init(self, batch_size: int, *, encode: bool = True, decode: bool = True) -> None:
+        """Allocate ``batch_size`` streaming rows of the encoder half, the decoder half, or both.
+
+        A half left out (Stage 0 never decodes, Stage 1 never encodes) gets no conv carries and no
+        transformer ring KV, and calling into it raises.
+        """
+        if not (encode or decode):
+            raise ValueError("PersonaPlex Mimi streaming_init needs encode=True, decode=True or both")
+        halves = {"encode": encode, "decode": decode}
+        if getattr(self, "_batch_size", None) == batch_size and getattr(self, "_halves", None) == halves:
             self.reset_streaming()
             return
         if getattr(self, "_cuda_graphs", None):
-            # The state is reallocated below, so graphs recorded at the old
-            # batch size would read stale tensors; drop them and say so.
             logger.warning(
                 "PersonaPlex Mimi stream resized from %s to %d rows; dropping its CUDA graphs (%s)",
                 self._batch_size,
                 batch_size,
                 "/".join(sorted(self._cuda_graphs)),
             )
-        self._batch_size = batch_size
         self._cuda_graphs = {}
+        # New state buffers invalidate a graph captured over the old ones.
+        self._encode_graph = None
+        self._decode_graph = None
+        self._batch_size = batch_size
+        self._halves = {"encode": encode, "decode": decode}
         self._all_active = torch.ones(batch_size, dtype=torch.bool, device=self.device)
-        for s in self._conv_states():
-            s.reset(batch_size, self.device, self.dtype)
-        self.encoder_transformer.streaming_init(batch_size)
-        self.decoder_transformer.streaming_init(batch_size)
+        for convs, transformer in self._allocated_halves():
+            for state in convs:
+                state.reset(batch_size, self.device, self.dtype)
+            transformer.streaming_init(batch_size)
 
     def reset_streaming(self) -> None:
         assert self._batch_size is not None
-        for state in self._conv_states():
-            state.reset_all()
-        self.encoder_transformer.reset_streaming()
-        self.decoder_transformer.reset_streaming()
+        for convs, transformer in self._allocated_halves():
+            for state in convs:
+                state.reset_all_slots()
+            transformer.reset_streaming()
 
     def reset_slot(self, b: int) -> None:
-        for s in self._conv_states():
-            s.reset_slot(b)
-        self.encoder_transformer.reset_slot(b)
-        self.decoder_transformer.reset_slot(b)
+        for convs, transformer in self._allocated_halves():
+            for state in convs:
+                state.reset_slot(b)
+            transformer.reset_slot(b)
+
+    # -- per-frame codec -------------------------------------------------------
+
+    @staticmethod
+    def _run_stages(x: torch.Tensor, stages, active: torch.Tensor) -> torch.Tensor:
+        for kind, stage in stages:
+            if kind == "res":
+                act0, conv1, act2, conv3 = stage
+                x = x + conv3(act2(conv1(act0(x), active)), active)
+            else:
+                x = stage(x, active) if kind in {"conv", "convtr"} else stage(x)
+        return x
+
+    def _dequantize(self, codes: torch.Tensor) -> torch.Tensor:
+        """``[B, 8, T]`` codes -> latents, the same sum as ``quantizer.decode`` but capturable."""
+        quantizer = self.model.quantizer
+        semantic = quantizer.num_semantic_quantizers
+        out = _residual_decode(quantizer.semantic_residual_vector_quantizer, codes[:, :semantic])
+        if codes.shape[1] > semantic:
+            out = out + _residual_decode(quantizer.acoustic_residual_vector_quantizer, codes[:, semantic:])
+        return out
+
+    # -- CUDA graphs ------------------------------------------------------------
+
+    @torch.no_grad()
+    def _capture(
+        self,
+        kind: str,
+        run: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
+        shape: tuple[int, ...],
+        dtype: torch.dtype,
+    ) -> _CodecGraph | None:
+        """Capture ``run(inputs, active)`` over every streaming row; None (run eagerly) off CUDA or on failure.
+
+        Warmup advances every row's streaming state, so all rows are reset
+        afterwards; the graph keeps the addresses of the state buffers, which
+        are only ever updated in place.
+        """
+        if self._batch_size is None:
+            raise RuntimeError("PersonaPlex Mimi streaming_init must run before capturing a graph")
+        if self.device.type != "cuda":
+            return None
+        inputs = torch.zeros(self._batch_size, *shape, device=self.device, dtype=dtype)
+        active = torch.ones_like(self._all_active)
+        try:
+            stream = graph_stream()
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
+                for _ in range(_GRAPH_WARMUP_ITERS):
+                    run(inputs, active)
+            torch.cuda.current_stream().wait_stream(stream)
+            graph = torch.cuda.CUDAGraph()
+            # A private pool: the codec replays between the stage's other
+            # graphs in an order unrelated to their capture order.
+            with torch.cuda.graph(
+                graph,
+                pool=torch.cuda.graph_pool_handle(),
+                stream=stream,
+                capture_error_mode="thread_local",
+            ):
+                output = run(inputs, active)
+        except Exception:
+            logger.warning("PersonaPlex Mimi CUDA graph capture failed; the codec runs eagerly", exc_info=True)
+            return None
+        finally:
+            self.reset_streaming()
+        logger.info("Captured the PersonaPlex Mimi %s CUDA graph for %d streaming rows", kind, self._batch_size)
+        return _CodecGraph(graph=graph, inputs=inputs, active=active, output=output)
+
+    def capture_encode_graph(self) -> bool:
+        """Replay full-batch ``encode_frame`` calls from a CUDA graph; returns whether one is in use."""
+        self._require("encode")
+        if self._encode_graph is None:
+            self._encode_graph = self._capture("encoder", self._encode_frame, (FRAME_SIZE,), self.dtype)
+        return self._encode_graph is not None
+
+    def capture_decode_graph(self) -> bool:
+        """Replay full-batch ``decode_frame`` calls (not ``decode_frames``) from a CUDA graph."""
+        self._require("decode")
+        if self._decode_graph is None:
+            self._decode_graph = self._capture("decoder", self._decode_frame, (CODEBOOKS,), torch.long)
+        return self._decode_graph is not None
+
+    # -- per-frame codec -------------------------------------------------------
+
+    @torch.no_grad()
+    def encode_frame(self, pcm: torch.Tensor, active: torch.Tensor | None = None) -> torch.Tensor:
+        """``[B, frame_size]`` float PCM -> ``[B, 8]`` codes."""
+        self._require("encode")
+        active = _normalize_active(active, self._all_active)
+        graph = self._frame_graph("encode")
+        if graph is not None:
+            return graph.replay(pcm.reshape(-1, FRAME_SIZE), active)
+        graph = self._encode_graph
+        if graph is not None and pcm.shape[0] == self._batch_size and not torch.cuda.is_current_stream_capturing():
+            return graph.replay(pcm, active)
+        return self._encode_frame(pcm, active)
+
+    def _encode_frame(self, pcm: torch.Tensor, active: torch.Tensor) -> torch.Tensor:
+        x = pcm.to(self.device, self.dtype).view(-1, 1, FRAME_SIZE)
+        x = self._run_stages(x, self._enc_stages, active)
+        x = self.encoder_transformer.step(x.transpose(1, 2), active).transpose(1, 2)
+        x = self._downsample(x, active)
+        codes = self.model.quantizer.encode(x, num_quantizers=CODEBOOKS)  # [Q, B, T]
+        return codes[:CODEBOOKS, :, 0].transpose(0, 1).contiguous()
+
+    @torch.no_grad()
+    def decode_frame(self, codes: torch.Tensor, active: torch.Tensor | None = None) -> torch.Tensor:
+        """``[B, 8]`` codes -> ``[B, frame_size]`` float PCM."""
+        self._require("decode")
+        active = _normalize_active(active, self._all_active)
+        graph = self._frame_graph("decode_f1")
+        if graph is not None:
+            return graph.replay(codes.reshape(-1, CODEBOOKS, 1), active)
+        graph = self._decode_graph
+        if graph is not None and codes.shape[0] == self._batch_size and not torch.cuda.is_current_stream_capturing():
+            return graph.replay(codes, active)
+        return self._decode_frame(codes, active)
+
+    def _decode_frame(self, codes: torch.Tensor, active: torch.Tensor) -> torch.Tensor:
+        emb = self._dequantize(codes.to(self.device).view(-1, CODEBOOKS, 1))
+        emb = self._upsample(emb, active)
+        emb = self.decoder_transformer.step(emb.transpose(1, 2), active).transpose(1, 2)
+        x = self._run_stages(emb, self._dec_stages, active)
+        return x[:, 0, :]
+
+    @torch.no_grad()
+    def decode_frames(self, codes: torch.Tensor, active: torch.Tensor | None = None) -> torch.Tensor:
+        """``[B, 8, F]`` codes -> ``[B, F * frame_size]`` float PCM."""
+        self._require("decode")
+        active = _normalize_active(active, self._all_active)
+        graph = self._frame_graph(f"decode_f{codes.shape[-1]}")
+        if graph is not None:
+            return graph.replay(codes, active)
+        return self._decode_frames_eager(codes, active)
 
     def capture_cuda_graphs(
         self,
@@ -484,77 +713,11 @@ class PersonaPlexMimiCodec(nn.Module):
         )
         return sorted(self._cuda_graphs)
 
-    # -- per-frame codec -------------------------------------------------------
-
-    @staticmethod
-    def _run_stages(x: torch.Tensor, stages, active: torch.Tensor) -> torch.Tensor:
-        for kind, stage in stages:
-            if kind == "res":
-                act0, conv1, act2, conv3 = stage
-                x = x + conv3(act2(conv1(act0(x), active)), active)
-            else:
-                x = stage(x, active) if kind in {"conv", "convtr"} else stage(x)
-        return x
-
     def _frame_graph(self, name: str) -> MimiFrameGraph | None:
-        graph = self._cuda_graphs.get(name)
+        graph = getattr(self, "_cuda_graphs", {}).get(name)
         if graph is None or torch.cuda.is_current_stream_capturing():
             return None
         return graph
-
-    @torch.no_grad()
-    def encode_frame(self, pcm: torch.Tensor, active: torch.Tensor | None = None) -> torch.Tensor:
-        """``[B, frame_size]`` float PCM -> ``[B, 8]`` codes."""
-        active = _normalize_active(active, self._all_active)
-        graph = self._frame_graph("encode")
-        if graph is not None:
-            return graph.replay(pcm.reshape(-1, FRAME_SIZE), active)
-        return self._encode_frame_eager(pcm, active)
-
-    def _encode_frame_eager(self, pcm: torch.Tensor, active: torch.Tensor) -> torch.Tensor:
-        x = pcm.to(self.device, self.dtype).view(-1, 1, FRAME_SIZE)
-        x = self._run_stages(x, self._enc_stages, active)
-        x = self.encoder_transformer.step(x.transpose(1, 2), active).transpose(1, 2)
-        x = self._downsample(x, active)
-        codes = self.model.quantizer.encode(x, num_quantizers=CODEBOOKS)  # [Q, B, T]
-        return codes[:CODEBOOKS, :, 0].transpose(0, 1).contiguous()
-
-    def _quantizer_decode(self, codes: torch.Tensor) -> torch.Tensor:
-        """``MimiSplitResidualVectorQuantizer.decode`` without its host-side scalar.
-
-        The Hugging Face RVQ decode seeds its sum with ``torch.tensor(0.0)``, a
-        host-to-device copy that cannot be recorded in a CUDA graph. This
-        seeds it with an on-device zero instead; the arithmetic is unchanged.
-        """
-        quantizer = self.model.quantizer
-        split = quantizer.num_semantic_quantizers
-
-        def rvq_decode(rvq, rvq_codes: torch.Tensor) -> torch.Tensor:
-            out = torch.zeros((), device=rvq_codes.device)
-            for layer, indices in zip(rvq.layers, rvq_codes.transpose(0, 1)):
-                out = out + layer.decode(indices)
-            if rvq.output_proj is not None:
-                out = rvq.output_proj(out)
-            return out
-
-        out = rvq_decode(quantizer.semantic_residual_vector_quantizer, codes[:, :split])
-        if codes.shape[1] > split:
-            out += rvq_decode(quantizer.acoustic_residual_vector_quantizer, codes[:, split:])
-        return out
-
-    @torch.no_grad()
-    def decode_frame(self, codes: torch.Tensor, active: torch.Tensor | None = None) -> torch.Tensor:
-        """``[B, 8]`` codes -> ``[B, frame_size]`` float PCM."""
-        return self.decode_frames(codes.reshape(-1, CODEBOOKS, 1), active)
-
-    @torch.no_grad()
-    def decode_frames(self, codes: torch.Tensor, active: torch.Tensor | None = None) -> torch.Tensor:
-        """``[B, 8, F]`` codes -> ``[B, F * frame_size]`` float PCM."""
-        active = _normalize_active(active, self._all_active)
-        graph = self._frame_graph(f"decode_f{codes.shape[-1]}")
-        if graph is not None:
-            return graph.replay(codes, active)
-        return self._decode_frames_eager(codes, active)
 
     def _decode_frames_eager(self, codes: torch.Tensor, active: torch.Tensor) -> torch.Tensor:
         emb = self._quantizer_decode(codes.to(self.device))
@@ -562,3 +725,9 @@ class PersonaPlexMimiCodec(nn.Module):
         emb = self.decoder_transformer.step(emb.transpose(1, 2), active).transpose(1, 2)
         x = self._run_stages(emb, self._dec_stages, active)
         return x[:, 0, :]
+
+    def _encode_frame_eager(self, pcm: torch.Tensor, active: torch.Tensor) -> torch.Tensor:
+        return self._encode_frame(pcm, active)
+
+    def _quantizer_decode(self, codes: torch.Tensor) -> torch.Tensor:
+        return self._dequantize(codes)

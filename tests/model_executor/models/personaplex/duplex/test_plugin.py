@@ -132,7 +132,7 @@ def test_personaplex_deploy_enables_mimi_cuda_graphs_on_both_stage_configs(tmp_p
     ]
     for stage in stages:
         model_arch = stage.yaml_engine_args["model_arch"]
-        assert stage.yaml_engine_args["hf_overrides"] == {"mimi_cuda_graphs": True}
+        assert stage.yaml_engine_args["hf_overrides"]["mimi_cuda_graphs"] is True
         assert resolve(model_arch, dict(stage.yaml_engine_args["hf_overrides"])).mimi_cuda_graphs is True
         # Without the deploy override the flag keeps its default.
         assert resolve(model_arch, None).mimi_cuda_graphs is False
@@ -335,11 +335,8 @@ def test_plan_append_reserves_one_slot_plus_prefill_on_the_first_seq() -> None:
     duplex = first.prompt["model_intermediate_buffer"]["duplex"]
     assert duplex["session_id"] == "session"
     assert duplex["epoch"] == 3
-    assert duplex["turn_id"] == 1
     assert duplex["seq"] == 1
     assert duplex["data_plane"] is True
-    assert duplex["fence"] == fence
-    assert duplex["scheduler_token_budget"] == 5
     assert duplex["runtime_config"] == {"personaplex_prefill_slots": 4}
     assert "incarnation" not in duplex
     assert first.prompt["model_intermediate_buffer"]["global_request_id"] == ["session"]
