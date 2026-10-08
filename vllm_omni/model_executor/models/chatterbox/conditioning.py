@@ -4,7 +4,9 @@
 
 ``VoiceConditioner`` mirrors ``ChatterboxTurboTTS.prepare_conditionals``
 (chatterbox 0.1.7) step for step, without ``librosa`` and without the model
-object it hangs off upstream. The result travels with the request in
+object it hangs off upstream, with one deliberate difference: the decoder's
+prompt mel is cut to exactly two frames per prompt token (see
+``VoiceConditioner.from_resampled``). The result travels with the request in
 ``additional_information``: stage 0 reads ``ids.prompt``, ``ids.speech_token``
 and ``embed.voice`` in its ``preprocess``; stage 1 reads ``embed.speech_token``,
 ``embed.speech_feat`` and ``embed.embedding``, the names the CosyVoice3
@@ -100,9 +102,7 @@ def trim_silence(wav: np.ndarray, top_db: float = 20.0) -> np.ndarray:
     """
     frame_length, hop_length = 2048, 512
     padded = np.pad(wav, frame_length // 2, mode="constant")
-    n_frames = 1 + (len(padded) - frame_length) // hop_length
-    index = np.arange(frame_length)[None, :] + hop_length * np.arange(n_frames)[:, None]
-    power = np.mean(padded[index] ** 2, axis=1)
+    power = np.lib.stride_tricks.sliding_window_view(padded**2, frame_length)[::hop_length].mean(axis=1)
     decibels = 10.0 * np.log10(np.maximum(power, 1e-10) / max(power.max(), 1e-10))
     loud = np.flatnonzero(decibels > -top_db)
     if loud.size == 0:
@@ -237,9 +237,11 @@ class VoiceConditioner:
             The five tensors, on the CPU.
 
         Raises:
-            ValueError: If the clip is not longer than five seconds, the
-                bound upstream asserts.
+            ValueError: If ``wav`` is not one-dimensional, or the clip is not
+                longer than five seconds, the bound upstream asserts.
         """
+        if wav.ndim != 1:
+            raise ValueError(f"Chatterbox needs a mono reference clip of shape (samples,), got shape {wav.shape}")
         config = self.config
         wav24 = self.to_24k.resample(np.asarray(wav, dtype=np.float32), orig_sr=sample_rate).astype(np.float32)
         seconds = len(wav24) / config.sample_rate
@@ -276,6 +278,11 @@ class VoiceConditioner:
         decoder_clip_16 = torchaudio.functional.resample(decoder_clip, config.sample_rate, config.s3_sample_rate)
         prompt_token = self.tokenize(decoder_clip_16, None)
         prompt_feat = mel_spectrogram(decoder_clip.unsqueeze(0), **config.mel).transpose(1, 2)
+        # The one deliberate difference from S3Gen.embed_ref, which cuts only
+        # the tokens when the mel is not twice their length and keeps the mel
+        # whole. The decoder lays each row out as [prompt | generated] with
+        # exactly token_mel_ratio mel frames per prompt token, so a leftover
+        # prompt frame would sit over the first generated token's position.
         frames = min(prompt_feat.shape[1] // config.token_mel_ratio, prompt_token.shape[1])
         embedding = self.campplus.inference([decoder_clip_16.to(self.device)])
 
