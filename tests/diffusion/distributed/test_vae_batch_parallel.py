@@ -52,6 +52,7 @@ def _make_vae(vae_type=DistributedAutoencoderKLFlux2, dtype=torch.float32):
 @dataclass
 class _WorldGroup:
     device_group: dist.ProcessGroup
+    cpu_group: dist.ProcessGroup
 
 
 def _batch_worker(rank, rendezvous):
@@ -59,7 +60,7 @@ def _batch_worker(rank, rendezvous):
     dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=4, timeout=timedelta(seconds=60))
     try:
         with pytest.MonkeyPatch.context() as patch:
-            patch.setattr(executor_module, "get_world_group", lambda: _WorldGroup(dist.group.WORLD))
+            patch.setattr(executor_module, "get_world_group", lambda: _WorldGroup(dist.group.WORLD, dist.group.WORLD))
             for name in (
                 "get_data_parallel_world_size",
                 "get_pipeline_parallel_world_size",

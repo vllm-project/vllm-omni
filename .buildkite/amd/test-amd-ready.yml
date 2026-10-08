@@ -260,7 +260,7 @@ steps:
 #     - export VLLM_WORKER_MULTIPROC_METHOD=spawn
 #     - timeout 20m pytest -s -v tests/e2e/offline_inference/test_stable_audio_expansion.py -m "advanced_model and diffusion and L4" --run-level advanced_model
 
-- label: "ROCm · Engine & Model Executor GPU Coverage (R2-01)"
+- label: "ROCm · Model Executor GPU Coverage (R2-01)"
   agent_pool: mi300_1
   depends_on: amd-build
   mirror_hardwares: [amdproduction]
@@ -273,18 +273,17 @@ steps:
     # artifacts relative to its checkout directory.
     - export R2_01_ARTIFACT_DIR="$$BUILDKITE_BUILD_CHECKOUT_PATH/artifacts/rocm-r2-01"
     - mkdir -p "$$R2_01_ARTIFACT_DIR"
+    # The dedicated Engine Test below owns the only selected tests/engine case;
+    # do not duplicate its model startup in this time-bounded coverage lane.
     # The CUDA ready job also covers tests/worker/test_batched_omni_output.py.
-    # Keep the initial ROCm burn-in scoped to the requested directories.
+    # Keep the initial ROCm burn-in scoped to tests/model_executor/.
     # Verbose pytest output and JUnit retain node IDs without a second
     # collection-only pass over the same GPU-backed test tree.
-    # The CUDA/L4-only CosyVoice3 ragged-flow parity test cold-JITs multiple
-    # AITER kernels on ROCm and is covered by the CUDA ready lane.
     - >-
       pytest -s -v -ra
-      tests/engine/ tests/model_executor/
-      -m 'core_model and cuda and not
+      tests/model_executor/
+      -m 'core_model and cuda and not nvidia_only and not
       (cards_2 or cards_3 or cards_4 or cards_5 or cards_6 or cards_7 or cards_8)'
-      -k 'not test_code2wav_streaming_batch_matches_ragged_flow_numerics'
       --run-level "core_model"
       --durations=0
       --junitxml="$$R2_01_ARTIFACT_DIR/pytest.xml"
