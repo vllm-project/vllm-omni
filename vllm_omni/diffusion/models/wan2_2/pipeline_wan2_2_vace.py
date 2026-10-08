@@ -24,6 +24,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.forward_context import begin_scheduled_denoise
 from vllm_omni.diffusion.models.interface import SupportImageInput
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import (
     Wan22Pipeline,
@@ -232,10 +233,13 @@ class Wan22VACEPipeline(Wan22Pipeline, SupportImageInput):
     ) -> torch.Tensor:
         if attention_kwargs is None:
             attention_kwargs = {}
+        # Checks a bound attention schedule against the actual sequence and returns its length; None
+        # without a schedule, so unscheduled runs publish no total.
+        total_steps = begin_scheduled_denoise(len(timesteps))
         with self.progress_bar(total=len(timesteps)) as pbar:
             for step_idx, t in enumerate(timesteps):
                 self._current_timestep = t
-                self.record_denoise_step(step_idx, t)
+                self.record_denoise_step(step_idx, t, total_steps=total_steps)
 
                 if boundary_timestep is not None and t < boundary_timestep and self.transformer_2 is not None:
                     current_model = self.transformer_2
@@ -283,6 +287,9 @@ class Wan22VACEPipeline(Wan22Pipeline, SupportImageInput):
                 latents = self.scheduler_step_maybe_with_cfg(noise_pred, t, latents, do_true_cfg)
                 pbar.update()
 
+        if total_steps is not None:
+            # Work after the loop, such as VAE decode, runs outside the denoise schedule.
+            self.record_denoise_step(None)
         return latents
 
     def check_inputs(
