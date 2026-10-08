@@ -1073,6 +1073,42 @@ def _stage0_vision_runtime():
     return runtime
 
 
+def test_gander_seeded_text_is_in_first_input_unit_and_retry_does_not_repeat_it():
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import _MiniCPMO45Stage0SessionState
+
+    runtime = _stage0_vision_runtime()
+    runtime.stage_model.config = SimpleNamespace(gander_unit8=True)
+    convert = runtime.tokenizer.convert_tokens_to_ids
+    from vllm_omni.model_executor.models.minicpmo_4_5.gander import CONTROL_TOKENS
+
+    controls = {token: 30 + index for index, token in enumerate(CONTROL_TOKENS.values())}
+    runtime.tokenizer.convert_tokens_to_ids = lambda token: controls.get(token, convert(token))
+    initial_text = "Please say hello."
+    encoded_texts = []
+
+    def encode(text, add_special_tokens=False):
+        encoded_texts.append(text)
+        return [220, 221] if text == initial_text else [201, 202]
+
+    runtime.tokenizer.encode = encode
+    state = _MiniCPMO45Stage0SessionState(session_id="gander-seed")
+    runtime._prepare_session_context(
+        state, {}, runtime_config={"gander_enabled": True, "initial_user_text": initial_text}
+    )
+    assert all(initial_text not in text and "<|im_start|>assistant" not in text for text in encoded_texts)
+    payload = {"type": "text", "token_ids": runtime.tokenizer.encode(initial_text), "context_version": 0}
+    first = runtime._stage_control_embeddings(state, payload, epoch=0, seq=1)
+    assert first["success"] is True
+    assert first["input_token_ids"] == [201, 202, 201, 202, 1, 220, 221]
+    retry = runtime._stage_control_embeddings(state, payload, epoch=0, seq=1)
+    assert retry["input_token_ids"] == first["input_token_ids"]
+    following = runtime._stage_prefill_embeddings_only(state, np.zeros(4, dtype=np.float32), epoch=0, seq=2)
+    assert following["input_token_ids"] == [2, 1, 11]
+    assert encoded_texts.count(initial_text) == 1
+    assert state.audio_chunk_idx == 1
+    assert state.gander_unit_count == 2
+
+
 def _minicpmo_seeded_silence_sampling_case(initial_user_text: str | None, *, force_listen_count: int = 0):
     from vllm_omni.engine.duplex.contracts import DuplexFence
     from vllm_omni.model_executor.models.minicpmo_4_5.duplex.plugin import build_duplex_data_plane_prompt

@@ -94,7 +94,14 @@ class _MiniCPMO45Stage0SessionState:
     pending_speech_context: bool = False
     pending_speech_append_identity: tuple[int | None, int] | None = None
     pending_speech_response_open: bool = False
+    pending_turn_end_identity: tuple[int | None, int | None] | None = None
+    pending_post_turn_eos_chunk: bool = False
+    last_final_append_identity: tuple[int | None, int] | None = None
     generated_tokens: list[int] = field(default_factory=list)
+    gander_tools_enabled: bool = False
+    gander_tool_active: bool = False
+    gander_context_version: int = 0
+    gander_unit_count: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -130,7 +137,7 @@ class MiniCPMO45Stage0DuplexRuntime:
         self.stage_model = stage_model
         self.model_path = model_path
         self.device = device
-        self.sessions: dict[tuple[str, int], _MiniCPMO45Stage0SessionState] = {}
+        self.sessions: dict[str, _MiniCPMO45Stage0SessionState] = {}
         # (session_id, epoch, seq) -> (frame payload, per-frame embeddings) of this runner step.
         self._prefetched_vision: dict[tuple[str, int | None, int], tuple[tuple[object, ...], list[Any]]] = {}
         self.thinker = getattr(stage_model, "thinker", None) or getattr(stage_model, "model", None) or stage_model
@@ -272,11 +279,18 @@ class MiniCPMO45Stage0DuplexRuntime:
         # only present when reference audio is embedded between them. The
         # template is shared with the serving adapter so the first-append
         # scheduler reserve can count these tokens exactly.
+        runtime_config = runtime_config or {}
+        state.gander_tools_enabled = bool(runtime_config.get("gander_tools")) and (
+            runtime_config.get("gander_tool_choice", "auto") != "none"
+        )
+        state.gander_context_version = int((runtime_config or {}).get("gander_context_version", 0))
         initial_user_text = (runtime_config or {}).get("initial_user_text")
+        user_text_in_unit = bool(runtime_config.get("gander_enabled"))
         prefix, suffix = MiniCPMO45DuplexPolicy.session_context_texts(
-            session_config.get("instructions"),
+            (runtime_config or {}).get("gander_instructions", session_config.get("instructions")),
             ref_audio is not None,
             initial_user_text,
+            user_text_in_unit=user_text_in_unit,
         )
         for token_id in self._encode_text(prefix):
             embed = self._embed_token(token_id)
@@ -382,6 +396,7 @@ class MiniCPMO45Stage0DuplexRuntime:
         video_frames: list[Image.Image] | None = None,
         encoded_frames: list[list[torch.Tensor]] | None = None,
         epoch: int | None = None,
+        turn_id: int | None = None,
         seq: int | None = None,
         is_speech: bool = False,
         final: bool = False,
@@ -403,6 +418,13 @@ class MiniCPMO45Stage0DuplexRuntime:
             and state.prepared_append_identity == append_identity
             and state.prepared_inputs_embeds is not None
         ):
+            self._update_turn_end_fence(
+                state,
+                epoch=epoch,
+                turn_id=turn_id,
+                append_identity=append_identity,
+                final=final,
+            )
             result = dict(state.prepared_result)
             result["inputs_embeds"] = state.prepared_inputs_embeds
             result["input_token_ids"] = list(state.prepared_input_token_ids)
@@ -460,7 +482,8 @@ class MiniCPMO45Stage0DuplexRuntime:
 
         embed_parts: list[torch.Tensor] = []
         token_ids: list[int] = []
-        if state.audio_chunk_idx == 0 and state.context_embeds:
+        gander = bool(getattr(getattr(getattr(self, "stage_model", None), "config", None), "gander_unit8", False))
+        if (state.gander_unit_count == 0 if gander else state.audio_chunk_idx == 0) and state.context_embeds:
             embed_parts.extend(state.context_embeds)
             token_ids.extend(state.context_token_ids)
 
@@ -493,7 +516,7 @@ class MiniCPMO45Stage0DuplexRuntime:
                 chunk_size,
                 processor=processor,
             )
-            if state.audio_chunk_idx > 0:
+            if state.gander_unit_count > 0 if gander else state.audio_chunk_idx > 0:
                 # Official duplex closes every unit (finalize_unit feeds the
                 # sampled terminator + </unit>) before the next <unit> opens.
                 # The scheduler session update discards the previous segment's
@@ -545,6 +568,8 @@ class MiniCPMO45Stage0DuplexRuntime:
             )
             state.audio_buffer = state.audio_buffer[consumed_samples:]
             state.audio_chunk_idx += 1
+            if gander:
+                state.gander_unit_count += 1
             units_built += 1
             if state.window_enabled:
                 if state.pending_window_unit is None:
@@ -557,6 +582,8 @@ class MiniCPMO45Stage0DuplexRuntime:
         # re-opened the turn each chunk -> degenerate repetition. tts_bos/listen/turn_eos are
         # model-generated and tracked via current_turn_ended (mirrors streaming_generate).
         prompt_suffix_len = 0
+        if units_built == 0:
+            return self._stage_prefill_result(False, start_time, "no model unit built for this append")
 
         import torch
 
@@ -581,12 +608,106 @@ class MiniCPMO45Stage0DuplexRuntime:
         if is_speech and (append_identity is None or state.pending_speech_append_identity != append_identity):
             state.pending_speech_context = True
             state.pending_speech_append_identity = append_identity
+        self._update_turn_end_fence(
+            state,
+            epoch=epoch,
+            turn_id=turn_id,
+            append_identity=append_identity,
+            final=final,
+        )
         if append_identity is not None:
             state.prepared_append_identity = append_identity
             state.prepared_inputs_embeds = inputs_embeds
             state.prepared_input_token_ids = list(token_ids)
             state.prepared_result = {k: v for k, v in result.items() if k not in {"inputs_embeds", "input_token_ids"}}
         return result
+
+    def _stage_control_embeddings(self, state, payload, *, epoch, seq):
+        import torch
+
+        identity = (epoch, seq)
+        if state.prepared_append_identity == identity and state.prepared_inputs_embeds is not None:
+            return {
+                **state.prepared_result,
+                "inputs_embeds": state.prepared_inputs_embeds,
+                "input_token_ids": list(state.prepared_input_token_ids),
+            }
+        replay = payload.get("gander_replay") is True
+        wake = payload.get("gander_wake") is True
+        text_unit = payload.get("type") == "text"
+        first = state.gander_unit_count == 0 and (replay or text_unit)
+        if text_unit and not replay and not first:
+            raise ValueError("Opening text must precede audio input")
+        if state.audio_chunk_idx == 0 and state.gander_unit_count == 0 and not replay and not text_unit:
+            raise ValueError("Gander context input requires an initialized audio session")
+        token_ids = payload.get("token_ids")
+        if (
+            not isinstance(token_ids, list)
+            or (not token_ids and not replay and not wake)
+            or (not text_unit and len(token_ids) > 1500)
+            or any(type(token) is not int or token < 0 for token in token_ids)
+        ):
+            raise ValueError("Invalid Gander context token input")
+        version = payload.get("context_version")
+        expected_version = state.gander_context_version if wake or text_unit else state.gander_context_version + 1
+        if type(version) is not int or (not replay and version != expected_version):
+            raise ValueError("Gander context version is stale or skipped")
+        terminator = state.pending_terminator_token
+        if terminator is None:
+            terminator = self.chunk_eos_token_id
+        ids = (
+            [self.unit_token_id, *token_ids]
+            if first
+            else [terminator, self.unit_end_token_id, self.unit_token_id, *token_ids]
+        )
+        parts = [self._as_2d_tensor(self._embed_token(token)) for token in ids]
+        if first:
+            parts = [self._as_2d_tensor(x) for x in state.context_embeds] + parts
+            ids = list(state.context_token_ids) + ids
+        embeds = torch.cat(parts, dim=0)
+        state.gander_unit_count += 1
+        state.pending_terminator_token = None
+        state.gander_context_version = version
+        result = self._stage_prefill_result(True, time.time())
+        result.update(
+            inputs_embeds=embeds,
+            input_token_ids=ids,
+            special_token_ids=self._special_token_ids(),
+            num_input_tokens=len(ids),
+            prompt_suffix_len=0,
+            uses_model_runner_scheduler=True,
+            runner_kv_backed=True,
+            runtime_impl="scheduler_data_plane",
+        )
+        state.prepared_append_identity = identity
+        state.prepared_inputs_embeds = embeds
+        state.prepared_input_token_ids = ids
+        state.prepared_result = {k: v for k, v in result.items() if k not in {"inputs_embeds", "input_token_ids"}}
+        return result
+
+    @staticmethod
+    def _update_turn_end_fence(
+        state: _MiniCPMO45Stage0SessionState,
+        *,
+        epoch: int | None,
+        turn_id: int | None,
+        append_identity: tuple[int | None, int] | None,
+        final: bool,
+    ) -> None:
+        turn_identity = (epoch, turn_id)
+        if state.pending_turn_end_identity is not None and state.pending_turn_end_identity != turn_identity:
+            # A late/stale final marker must never terminate a later model
+            # turn.  Normal silence continuations retain the same identity, so
+            # they keep the pending fence until the model reaches an empty
+            # chunk boundary.
+            state.pending_turn_end_identity = None
+        if final and (append_identity is None or state.last_final_append_identity != append_identity):
+            # Commit the user turn only after this append produced a real
+            # scheduler prefill.  Buffering/failed appends must not arm a turn
+            # boundary, and an identical prefill retry must not re-arm one
+            # after the sampler has consumed it.
+            state.pending_turn_end_identity = turn_identity
+            state.last_final_append_identity = append_identity
 
     def _finalize_window_unit(
         self,
@@ -1167,7 +1288,7 @@ class MiniCPMO45Stage0DuplexRuntime:
         return []
 
     def _special_token_ids(self) -> dict[str, int]:
-        return {
+        result = {
             name: value
             for name, value in {
                 "unit_token_id": self.unit_token_id,
@@ -1183,6 +1304,13 @@ class MiniCPMO45Stage0DuplexRuntime:
             }.items()
             if isinstance(value, int) and value >= 0
         }
+
+        if getattr(getattr(getattr(self, "stage_model", None), "config", None), "gander_unit8", False):
+            from vllm_omni.model_executor.models.minicpmo_4_5.gander import control_token_ids
+
+            result.update(control_token_ids(self.tokenizer))
+            result["gander_speech_tokens"] = 50
+        return result
 
     @staticmethod
     def _load_processor_from_path(model_path: str | None) -> Any | None:  # Any: remote-code AutoProcessor

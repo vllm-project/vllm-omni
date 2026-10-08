@@ -18,7 +18,7 @@ from base64 import b64decode
 from binascii import Error as BinasciiError
 from collections.abc import Mapping
 from copy import deepcopy
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 from numpy.typing import NDArray
@@ -90,10 +90,23 @@ PRIVATE_RUNTIME_CONFIG_KEYS = frozenset(
         "duplex_scheduler_token_id",
         "duplex_vision_tile_pixels",
         "duplex_first_append_context_tokens",
+        "duplex_initial_user_text_token_ids",
         "ref_audio_data",
         "ref_audio_format",
         "ref_audio_sample_rate_hz",
         "initial_user_text",
+        "gander_enabled",
+        "gander_tools",
+        "gander_tool_choice",
+        "gander_instructions",
+        "gander_tokenizer_path",
+        "duplex_context_version",
+        "gander_replacements",
+        "gander_initial_slate",
+        "gander_calls",
+        "gander_context_receipts",
+        "gander_context_version",
+        "gander_slate_version",
         "duplex_window_config",
         "duplex_window_prefix_tokens",
         "duplex_window_suffix_token_ids",
@@ -233,17 +246,36 @@ def build_duplex_data_plane_prompt(
     *,
     request_id: str,
     fence: DuplexFence,
-    session_config: dict[str, object],
-    runtime_config: dict[str, object],
+    session_config: dict[str, Any],
+    runtime_config: dict[str, Any],
     seq: int,
     turn_seq: int,
     payload: object,
     final: bool,
 ) -> dict[str, object]:
-    # Computed once: with a known tile this decodes the stacked pair's first frame.
-    vision_tokens = _duplex_vision_tokens(payload, tile_pixels=_duplex_vision_tile_pixels(runtime_config))
-    token_budget = _duplex_audio_token_budget(payload) + vision_tokens
-    if seq <= 1:
+    control = isinstance(payload, dict) and payload.get("gander_control") is True
+    text_unit = isinstance(payload, dict) and payload.get("type") == "text"
+    if control or text_unit:
+        ids = payload.get("token_ids")
+        replay = payload.get("gander_replay") is True
+        wake = payload.get("gander_wake") is True
+        if text_unit and not runtime_config.get("gander_enabled"):
+            raise ValueError("Native text units require Gander")
+        if text_unit and not replay and seq != 1:
+            raise ValueError("Opening text must precede audio input")
+        if (
+            not isinstance(ids, list)
+            or (not text_unit and len(ids) > 1500)
+            or (not replay and ((not ids and not wake) or (not text_unit and seq <= 1)))
+        ):
+            raise ValueError("Gander context append requires initialized session and bounded token ids")
+        token_budget = len(ids) + (1 if seq == 1 else 3)
+        if seq == 1:
+            token_budget += duplex_first_append_context_reserve(runtime_config)
+    else:
+        vision_tokens = _duplex_vision_tokens(payload, tile_pixels=_duplex_vision_tile_pixels(runtime_config))
+        token_budget = _duplex_audio_token_budget(payload) + vision_tokens
+    if not control and not text_unit and seq <= 1:
         context_reserve = duplex_first_append_context_reserve(runtime_config)
         token_budget += context_reserve
         first_units = duplex_first_append_unit_count(payload)
@@ -251,8 +283,11 @@ def build_duplex_data_plane_prompt(
             token_budget = context_reserve + first_units * 12 - 1 + vision_tokens
     if seq > 1 and duplex_payload_is_exact_chunks(payload):
         token_budget += 1
-        # Serving already pads the final residual audio. Stage0 does not
-        # append another silent unit, so final must not reserve extra slots.
+    if isinstance(payload, dict) and payload.get("gander_replay"):
+        token_budget += max(0, len(payload.get("gander_replay_output_ids", [])) - 1)
+    # final arms the model's turn-end fence; it does not build another audio
+    # unit. Reserving an extra 12 slots here used to execute phantom padding
+    # before every committed tail (25 scheduled tokens for 13 real embeddings).
     extra_body = session_config.get("extra_body")
     raw_token_id = runtime_config.get("duplex_scheduler_token_id")
     try:
@@ -277,7 +312,11 @@ def build_duplex_data_plane_prompt(
         payload=payload,
         final=final,
         prompt_token_ids=[token_id] * token_budget,
-        model_fields={"scheduler_token_id": token_id},
+        model_fields={
+            "scheduler_token_id": token_id,
+            "gander_unit_id": (payload.get("gander_unit_id") if isinstance(payload, dict) else None)
+            or f"u{fence.epoch}-{seq}",
+        },
     )
 
 
@@ -298,7 +337,12 @@ def _special_token_ids(metadata: dict[str, object]) -> dict[str, int]:
         if not isinstance(source, dict):
             continue
         for key, value in source.items():
-            token_id = _coerce_int(value)
+            if isinstance(key, str) and key.startswith("gander_"):
+                from ..gander_tools import latest_int
+
+                token_id = latest_int(value)
+            else:
+                token_id = _coerce_int(value)
             if isinstance(key, str) and token_id is not None and token_id >= 0:
                 token_ids[key] = token_id
     return token_ids
@@ -459,18 +503,27 @@ def _apply_first_append_context_tokens(
     """
     if "duplex_first_append_context_tokens" in runtime_config or tokenizer is None:
         return
+    user_text_in_unit = bool(runtime_config.get("gander_enabled"))
     prefix, suffix = MiniCPMO45DuplexPolicy.session_context_texts(
-        instructions,
+        runtime_config.get("gander_instructions", instructions),
         ref_sample_count is not None,
         initial_user_text,
+        user_text_in_unit=user_text_in_unit,
     )
     try:
         prefix_ids = tokenizer.encode(prefix, add_special_tokens=False)
         suffix_ids = tokenizer.encode(suffix, add_special_tokens=False)
+        user_ids = (
+            tokenizer.encode(initial_user_text, add_special_tokens=False)
+            if user_text_in_unit and isinstance(initial_user_text, str)
+            else []
+        )
     except Exception:
         return
     ref_tokens = MiniCPMO45DuplexPolicy.audio_token_count(ref_sample_count or 0)
     runtime_config["duplex_first_append_context_tokens"] = len(prefix_ids) + ref_tokens + len(suffix_ids)
+    if user_text_in_unit:
+        runtime_config["duplex_initial_user_text_token_ids"] = [int(token_id) for token_id in user_ids]
     runtime_config["duplex_window_prefix_tokens"] = len(prefix_ids) + ref_tokens
     runtime_config["duplex_window_suffix_token_ids"] = [int(token_id) for token_id in suffix_ids]
     marker_ids = tokenizer.encode("\n\nprevious: ", add_special_tokens=False)
@@ -521,6 +574,8 @@ def _apply_default_scheduler_policy(
     model_config: ModelConfig | None = None,
 ) -> None:
     stage0_max_tokens = config.max_tokens if isinstance(config.max_tokens, int) and config.max_tokens > 0 else 20
+    if runtime_config.get("gander_tools"):
+        stage0_max_tokens = max(stage0_max_tokens, 256)
     runtime_config["duplex_stage_max_tokens"] = {"0": stage0_max_tokens, "1": 8192}
     stage0_params: dict[str, object] = {
         "temperature": config.temperature if config.temperature is not None else 0.7,
@@ -529,6 +584,12 @@ def _apply_default_scheduler_policy(
         "repetition_penalty": 1.05,
     }
     stop_token_ids = _stage0_stop_token_ids(tokenizer)
+    if runtime_config.get("gander_enabled"):
+        interrupt_id = _convert_token_to_id(tokenizer, "<|interrupt|>")
+        if interrupt_id is None:
+            raise ValueError("Gander tokenizer is missing <|interrupt|>")
+        turn_eos_id = _convert_token_to_id(tokenizer, "<|turn_eos|>")
+        stop_token_ids = [t for t in stop_token_ids if t != turn_eos_id] + [interrupt_id]
     if stop_token_ids:
         stage0_params["stop_token_ids"] = stop_token_ids
     # Stage 1 keeps the deploy YAML's codec knobs, minus upstream's
@@ -600,6 +661,14 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
             configured.append(params)
         return tuple(configured)
 
+    def initial_input_payload(self, *, runtime_config: Mapping[str, object]) -> dict[str, object] | None:
+        if not runtime_config.get("gander_enabled"):
+            return None
+        ids = runtime_config.get("duplex_initial_user_text_token_ids")
+        if not isinstance(ids, list) or not ids:
+            return None
+        return {"type": "text", "token_ids": list(ids), "context_version": 0}
+
     def plan_append(
         self,
         *,
@@ -634,7 +703,7 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
         final_stage_id: int,
         segment_finished: bool,
         segment_token_ids: tuple[int, ...],
-        segment_output_metadata: dict[str, object],
+        segment_output_metadata: dict[str, Any],
         output: object,
     ) -> DuplexOutputDecision | None:
         if stage_id >= final_stage_id or not segment_finished:
@@ -644,13 +713,48 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
         output_metadata = _multimodal_output(output, completion)
         special_token_ids = _special_token_ids(segment_output_metadata)
         special_token_ids.update(_special_token_ids(output_metadata))
+        if "tool_call_token_id" in special_token_ids:
+            from vllm_omni.model_executor.models.minicpmo_4_5.gander_tools import current_unit
+
+            # A DELTA completion / segment may contain only the final token.
+            # Tool parsing needs the whole current unit, including its opener.
+            candidates = [list(segment_token_ids), _completion_token_ids(completion)]
+            candidates.append(_coerce_int_list(getattr(completion, "cumulative_token_ids", None)))
+            tokens = current_unit(max(candidates, key=len), special_token_ids, finished=True)
+            if tokens and tokens[0] == special_token_ids["tool_call_token_id"]:
+                tokenizer = getattr(self, "_gander_tokenizer", None)
+                if tokenizer is None:
+                    raise RuntimeError("Gander tool output tokenizer is unavailable")
+                raw = tokenizer.decode(tokens, skip_special_tokens=False)
+                import hashlib
+
+                identity = f"{getattr(output, 'request_id', '')}:{special_token_ids.get('gander_append_seq')}:{raw}"
+                return DuplexOutputDecision(
+                    action=DuplexOutputAction.DIRECT_RESPONSE,
+                    ends_model_turn=True,
+                    # Serving ends the turn for silent tool units as well.
+                    # Advance before already-queued input can produce speech.
+                    metadata={
+                        **output_metadata,
+                        **{f"meta.{k}": v for k, v in special_token_ids.items()},
+                        "duplex_direct_response": True,
+                        "gander_tool_text": raw,
+                        "gander_call_id": "call_" + hashlib.sha256(identity.encode()).hexdigest()[:24],
+                    },
+                )
+
         listen_id = special_token_ids.get("listen_token_id")
         if listen_id is None:
             return None
 
         stop_reason = getattr(completion, "stop_reason", None) if completion is not None else None
         token_ids = _completion_token_ids(completion) or list(segment_token_ids)
-        if _coerce_int(stop_reason) != listen_id and (not token_ids or token_ids[-1] != listen_id):
+        final_token = _coerce_int(stop_reason)
+        if final_token is None and token_ids:
+            final_token = token_ids[-1]
+        interrupt_id = special_token_ids.get("interrupt_token_id")
+        interrupted = interrupt_id is not None and final_token == interrupt_id
+        if final_token != listen_id and not interrupted:
             return None
         unit_ids = max(
             (token_ids, _coerce_int_list(getattr(completion, "cumulative_token_ids", None)), list(segment_token_ids)),
@@ -667,7 +771,7 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
         metadata.update(
             {
                 "duplex_direct_response": True,
-                "duplex_native_decision": "listen",
+                "duplex_native_decision": "interrupt" if interrupted else "listen",
                 "model_listen": True,
                 "listen_source": "model_listen",
             }
@@ -675,7 +779,15 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
         return DuplexOutputDecision(
             action=DuplexOutputAction.DIRECT_RESPONSE,
             metadata=metadata,
+            ends_model_turn=interrupted,
         )
+
+    def context_policy(self, runtime_config):
+        if not runtime_config.get("gander_enabled"):
+            return None
+        from ..gander_context import GanderContextPolicy
+
+        return GanderContextPolicy()
 
     # ---- session policy ----
 
@@ -703,8 +815,47 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
                 code="unsupported_ref_audio_path",
             )
         runtime_config: dict[str, object] = {"instructions": config.instructions}
-        window_config = self._pop_window_config(extra_body) or MiniCPMO45DuplexWindowConfig()
-        runtime_config["duplex_window_config"] = window_config.as_dict()
+        if getattr(getattr(model_config, "hf_config", None), "gander_unit8", False):
+            from vllm_omni.model_executor.models.minicpmo_4_5.gander_context import window_config
+            from vllm_omni.model_executor.models.minicpmo_4_5.gander_tools import (
+                instructions_with_tools,
+                normalize_tool_choice,
+                normalize_tools,
+            )
+
+            history = deepcopy(extra_body.get("gander_history", {}))
+            window_config({"gander_history": history})
+            runtime_config["gander_history"] = history
+            runtime_config["duplex_context_version"] = 0
+            tokenizer = await self._tokenizer_for(model_config)
+            self._gander_tokenizer = tokenizer
+            tools = normalize_tools(extra_body.get("realtime_tools"), tokenizer)
+            slate = extra_body.get("gander_task_slate", "")
+            if not isinstance(slate, str) or len(tokenizer.encode(slate, add_special_tokens=False)) > 256:
+                raise MiniCPMO45ClientRuntimeConfigError("Initial task slate must be a string of at most 256 tokens")
+            runtime_config.update(
+                {
+                    "gander_enabled": True,
+                    "gander_tools": tools,
+                    "gander_tool_choice": normalize_tool_choice(extra_body.get("realtime_tool_choice")),
+                    "gander_instructions": instructions_with_tools(config.instructions, tools, slate),
+                    "gander_tokenizer_path": model_config.model,
+                    "gander_task_slate": slate,
+                    "gander_initial_slate": slate,
+                    "gander_slate_version": 0,
+                }
+            )
+        elif extra_body.get("realtime_tools") or extra_body.get("gander_task_slate"):
+            raise MiniCPMO45ClientRuntimeConfigError("Tools/task slate require Gander")
+        duplex_window_config = self._pop_window_config(extra_body)
+        if runtime_config.get("gander_enabled"):
+            if duplex_window_config is not None:
+                raise MiniCPMO45ClientRuntimeConfigError(
+                    "MiniCPM sliding-window options are not supported by Gander; use gander_history",
+                    code="unsupported_sliding_window_config",
+                )
+        else:
+            runtime_config["duplex_window_config"] = (duplex_window_config or MiniCPMO45DuplexWindowConfig()).as_dict()
         # ``duplex_initial_user_text`` is the older extra_body spelling and
         # still works; the session field is the framework-level one.
         initial_user_text = extra_body.pop("duplex_initial_user_text", None)
@@ -774,6 +925,11 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
         extra_body = dict(config.extra_body)
         requested_window = self._pop_window_config(extra_body)
         if requested_window is not None:
+            if runtime_config.get("gander_enabled"):
+                raise MiniCPMO45ClientRuntimeConfigError(
+                    "MiniCPM sliding-window options are not supported by Gander; use gander_history",
+                    code="unsupported_sliding_window_config",
+                )
             reject_changed_runtime_value(
                 requested_window.as_dict(),
                 runtime_config.get("duplex_window_config"),
@@ -794,6 +950,36 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
         stage_max_tokens["0"] = (
             config.max_tokens if isinstance(config.max_tokens, int) and config.max_tokens > 0 else 20
         )
+        if runtime_config.get("gander_enabled"):
+            if config.extra_body.get("gander_history", {}) != runtime_config.get("gander_history", {}):
+                raise MiniCPMO45ClientRuntimeConfigError("History window policy cannot change within a session")
+            from vllm_omni.model_executor.models.minicpmo_4_5.gander_tools import (
+                normalize_tool_choice,
+                normalize_tools,
+                tokenizer_for,
+            )
+
+            reject_changed_runtime_value(
+                normalize_tool_choice(config.extra_body.get("realtime_tool_choice")),
+                runtime_config.get("gander_tool_choice", "auto"),
+                message="tool_choice cannot change within a Gander session",
+                code="tool_choice_update_unsupported",
+                error_cls=MiniCPMO45ClientRuntimeConfigError,
+            )
+
+            tools = normalize_tools(
+                config.extra_body.get("realtime_tools"), tokenizer_for(str(runtime_config["gander_tokenizer_path"]))
+            )
+            if tools != runtime_config.get("gander_tools", []):
+                raise MiniCPMO45ClientRuntimeConfigError(
+                    "Tools cannot change within a session", code="tools_update_unsupported"
+                )
+            if config.extra_body.get("gander_task_slate", "") != runtime_config.get(
+                "gander_initial_slate", runtime_config.get("gander_task_slate", "")
+            ):
+                raise MiniCPMO45ClientRuntimeConfigError("Use input.context.append for task slate updates")
+            if tools:
+                stage_max_tokens["0"] = max(int(stage_max_tokens["0"]), 256)
         stage_max_tokens.setdefault("1", 8192)
         runtime_config["duplex_stage_max_tokens"] = stage_max_tokens
 

@@ -8,7 +8,7 @@ import time
 from collections.abc import Mapping
 from copy import copy
 from dataclasses import replace
-from typing import Any, NamedTuple
+from typing import Any, NamedTuple, cast
 
 import numpy as np
 import torch
@@ -113,6 +113,10 @@ class ExecuteModelState(NamedTuple):
 
 class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, DuplexSamplingRunnerMixin):
     """Autoregressive NPU model runner that returns hidden states per request."""
+
+    execute_model_state: ExecuteModelState | None
+    kv_extracted_req_ids: list[str] | None
+    sampling_done_event: Any
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -608,6 +612,12 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                 intermediate_tensors,
             )
 
+            input_errors = getattr(scheduler_output, "model_input_errors", {})
+            if input_errors:
+                slots = {gid: self.input_batch.block_table[gid].slot_mapping.gpu
+                         for gid in range(len(self.kv_cache_config.kv_cache_groups))}
+                self._mask_failed_input_kv_slots(input_errors, req_ids[:num_reqs], slots)
+
             #  -------------------------------------- Omni-new -------------------------------------------------
             if hasattr(self.model, "prepare_runner_inputs"):
                 input_ids, positions = self.model.prepare_runner_inputs(
@@ -797,6 +807,7 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
     ):
         sampling_metadata = self.input_batch.sampling_metadata
         if spec_decode_metadata is None:
+            self._mask_failed_input_logits(logits)
             model_sample = getattr(self.model, "sample", None)
             self.input_batch.update_async_output_token_ids()
             if logits is not None and callable(model_sample) and getattr(self.model, "prefer_model_sampler", False):
@@ -844,7 +855,7 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         self.kv_extracted_req_ids = None
         combined_hidden_states = None
         combined_multimodal_outputs = None
-        mm_cpu = {}
+        mm_cpu: dict[str, object] | None = {}
         #  -------------------------------------- Omni-new -------------------------------------------------
 
 
@@ -1016,6 +1027,11 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
 
         #  -------------------------------------- Omni-new -------------------------------------------------
         engine_output_type, downstream_req_ids = self._resolve_pooler_payload_req_ids(req_ids_output_copy)
+        input_errors = dict(getattr(scheduler_output, "model_input_errors", {}) or {})
+        downstream_req_ids = [rid for rid in downstream_req_ids if rid not in input_errors]
+        self._suppress_failed_input_samples(
+            input_errors, req_id_to_index_output_copy, valid_sampled_token_ids, invalid_req_indices,
+        )
         sparse_mm_req_ids = self._sparse_mm_req_ids(multimodal_outputs)
         sparse_mm_index = {rid: i for i, rid in enumerate(sparse_mm_req_ids or [])}
         if engine_output_type == "audio" and sparse_mm_req_ids is not None:
@@ -1033,6 +1049,7 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         if not needs_pooler_payload and prefix_cache_step_id is not None:
             # No consumer for this step's merge: consume the step context by
             # id (exactly-once contract). The cache write still lands.
+            assert self.omni_prefix_cache is not None
             self.omni_prefix_cache.discard_step(prefix_cache_step_id)
             prefix_cache_step_id = None
         if needs_scheduled_hidden_payload:
@@ -1134,6 +1151,7 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                         for mm_key in combined_multimodal_outputs.keys():
                             mm_payload[mm_key] = _unwrap_lists(combined_multimodal_outputs[mm_key][rid])
                     else:
+                        assert mm_cpu is not None
                         for mm_key, mm_val in mm_cpu.items():
                             if mm_key in {"meta.req_id", "meta.sparse_audio"}:
                                 continue
@@ -1166,6 +1184,7 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                     payload.update(mm_payload)
                 pooler_output.append(flatten_payload(payload))
 
+        pooler_client: list[dict[str, object] | None] | None
         pooler_output = pooler_output or []
         if self._async_chunk and stage_sends_async_output(self.model_config):
             pooler_inter, pooler_client = partition_payload_list(pooler_output)
@@ -1173,7 +1192,8 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             # Non-async-chunk ships the full payload to the next stage via
             # inter_stage_outputs (the NPU runner has no separate full-payload
             # accumulate). #4527's (None, pooler_output) starved it. (PR #4792)
-            pooler_inter, pooler_client = pooler_output, pooler_output
+            pooler_inter = cast(list[dict[str, object] | None], pooler_output)
+            pooler_client = pooler_inter
 
         # [Omni] Full-payload send-side accumulation. Mirrors gpu_ar_model_runner.py.
         if pooler_inter and self._should_accumulate_full_payload_output():
@@ -1199,6 +1219,7 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             kv_connector_output=kv_connector_output,
             ec_connector_output=ec_connector_output if self.supports_mm_inputs else None,
             cudagraph_stats=cudagraph_stats,
+            model_input_errors=input_errors,
             num_nans_in_logits=num_nans_in_logits,
         )
         model_runner_output.kv_extracted_req_ids = kv_extracted_req_ids

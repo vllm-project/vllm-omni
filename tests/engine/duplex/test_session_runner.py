@@ -273,6 +273,26 @@ async def close_harness(harness: Harness) -> None:
     await harness.manager.shutdown()
 
 
+@pytest.mark.asyncio
+async def test_native_opening_input_precedes_and_preserves_first_microphone_append(monkeypatch):
+    monkeypatch.setattr(
+        MiniCPMO45DuplexPlugin,
+        "initial_input_payload",
+        lambda self, **kwargs: {"type": "native-opening", "token_ids": [21, 22]},
+    )
+    harness = await open_harness()
+    try:
+        assert len(harness.port.submissions) == 1
+        await harness.run(append_audio(value=0.25))
+        metadata = [p.prompt["model_intermediate_buffer"]["duplex"] for p in harness.port.submissions]
+        assert [p["seq"] for p in metadata] == [1, 2]
+        assert metadata[0]["payload"] == {"type": "native-opening", "token_ids": [21, 22]}
+        assert base64.b64decode(metadata[1]["payload"]["audio"]) == pcm_f32(16000, value=0.25)
+        assert not [e for e in harness.events if e.type == "error"]
+    finally:
+        await close_harness(harness)
+
+
 # --------------------------------------------------------------------------- #
 # Payload / output builders                                                   #
 # --------------------------------------------------------------------------- #
@@ -1558,7 +1578,7 @@ async def test_duplex_stage_request_stamps_wall_clock_request_timestamp() -> Non
         await orchestrator.session_manager.shutdown()
 
 
-def _response_request_metrics_of(event: object) -> dict[str, object]:
+def _response_request_metrics_of(event: DuplexEvent) -> dict[str, object]:
     """Server request-start clocks as the client reads them off one wire event."""
     payload = event.to_realtime()
     metadata = payload.get("metadata")

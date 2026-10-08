@@ -6,9 +6,9 @@
 from __future__ import annotations
 
 import asyncio
-import base64
 import json
 from pathlib import Path
+from typing import cast
 
 import pytest
 import websockets
@@ -23,13 +23,16 @@ from tests.e2e.online_serving.helpers.minicpmo_4_5_duplex import (
     validated_input_wav,
 )
 from tests.e2e.online_serving.helpers.minicpmo_realtime_duplex_scenarios import (
+    _receive_protocol_events,
     _ref_audio_data_url,
+    _run_protocol_smoke,
     run_demo,
 )
 from tests.e2e.online_serving.run_minicpmo_realtime_duplex_multi_session import (
     run_multi_session,
 )
 from tests.helpers.mark import hardware_test
+from tests.helpers.runtime import run_duplex_seeded_text_to_audio as _run_seeded_text_to_audio
 from vllm_omni.clients.duplex import build_realtime_url, metric_mean
 from vllm_omni.experimental.fullduplex.video_stacking import concat_frames_b64
 
@@ -65,53 +68,6 @@ def _assert_session_metrics(metrics: object, *, expected_count: int) -> None:
     assert ttft_ms is not None and ttft_ms >= 0
     assert ttfp_ms is not None and ttfp_ms >= 0
     assert rtf is not None and rtf >= 0
-
-
-async def _receive_protocol_events(ws, required_types: set[str], *, timeout_s: float) -> list[dict[str, object]]:
-    async def receive() -> list[dict[str, object]]:
-        events: list[dict[str, object]] = []
-        seen: set[str] = set()
-        while not required_types.issubset(seen):
-            raw = await ws.recv()
-            if not isinstance(raw, str):
-                continue
-            event = json.loads(raw)
-            if not isinstance(event, dict):
-                continue
-            events.append(event)
-            event_type = event.get("type")
-            if event_type == "error":
-                raise AssertionError(f"WebSocket protocol smoke received an error: {event}")
-            if isinstance(event_type, str):
-                seen.add(event_type)
-        return events
-
-    return await asyncio.wait_for(receive(), timeout=timeout_s)
-
-
-async def _run_protocol_smoke(*, url: str, model: str, ref_audio: Path) -> list[dict[str, object]]:
-    websocket_url = build_realtime_url(url, model, autostart=False)
-    async with websockets.connect(websocket_url, max_size=64 * 1024 * 1024) as ws:
-        await ws.send(
-            json.dumps(
-                {
-                    "type": "session.update",
-                    "session": {
-                        "model": model,
-                        "modalities": ["audio", "text"],
-                        "ref_audio": _ref_audio_data_url(str(ref_audio)),
-                    },
-                }
-            )
-        )
-        events = await _receive_protocol_events(
-            ws,
-            {"session.created", "session.updated"},
-            timeout_s=60,
-        )
-        await ws.send(json.dumps({"type": "session.close"}))
-        events.extend(await _receive_protocol_events(ws, {"session.closed"}, timeout_s=60))
-    return events
 
 
 async def _run_text_only_response_create(
@@ -172,110 +128,6 @@ async def _run_text_only_response_create(
                     return event
 
         return await asyncio.wait_for(receive_outcome(), timeout=timeout_s)
-
-
-async def _run_seeded_text_to_audio(
-    *,
-    url: str,
-    model: str,
-    ref_audio: Path | None,
-    text: str,
-    modalities: tuple[str, ...] = ("audio", "text"),
-    silence_seconds: float = 12.0,
-    timeout_s: float = 180.0,
-) -> dict[str, object]:
-    """Speak a seeded text: the duplex route's text-to-speech shape.
-
-    A model-native session takes its text once, in the session context
-    (``duplex_initial_user_text``), and then generates per audio unit. Silence
-    carries no content of its own, so it only advances the clock and lets the
-    model answer the seeded turn.
-    """
-    websocket_url = build_realtime_url(url, model, autostart=False)
-    audio_bytes = 0
-    transcript: list[str] = []
-    output_text: list[str] = []
-    seen: list[str] = []
-    session_payload: dict[str, object] = {
-        "model": model,
-        "modalities": list(modalities),
-        "input_audio_format": "pcm16",
-        "output_audio_format": "pcm16",
-        "turn_detection": None,
-        "temperature": 0.0,
-        "extra_body": {
-            "auto_response": True,
-            "force_listen_count": 0,
-            "duplex_initial_user_text": text,
-        },
-    }
-    if ref_audio is not None:
-        session_payload["ref_audio"] = _ref_audio_data_url(str(ref_audio))
-    async with websockets.connect(websocket_url, max_size=64 * 1024 * 1024) as ws:
-        await ws.send(json.dumps({"type": "session.update", "session": session_payload}))
-
-        async def reader() -> None:
-            nonlocal audio_bytes
-            while True:
-                raw = await ws.recv()
-                if not isinstance(raw, str):
-                    continue
-                event = json.loads(raw)
-                if not isinstance(event, dict):
-                    continue
-                event_type = event.get("type")
-                if isinstance(event_type, str):
-                    seen.append(event_type)
-                delta = event.get("delta")
-                if event_type == "response.output_audio.delta" and isinstance(delta, str):
-                    audio_bytes += len(base64.b64decode(delta))
-                elif event_type == "response.output_audio_transcript.delta" and isinstance(delta, str):
-                    transcript.append(delta)
-                elif event_type == "response.output_text.delta" and isinstance(delta, str):
-                    output_text.append(delta)
-                elif event_type == "error":
-                    raise AssertionError(f"seeded text turn received an error: {event}")
-
-        reader_task = asyncio.create_task(reader())
-        silence = bytes(2 * 16_000 * 200 // 1000)
-        sent_ms = 0
-        try:
-            while sent_ms < silence_seconds * 1000 and "response.done" not in seen:
-                sent_ms += 200
-                await ws.send(
-                    json.dumps(
-                        {
-                            "type": "input_audio_buffer.append",
-                            "audio": base64.b64encode(silence).decode("ascii"),
-                            "input_audio_format": "pcm16",
-                            "sample_rate_hz": 16_000,
-                            "duration_ms": 200,
-                            "audio_end_ms": sent_ms,
-                        }
-                    )
-                )
-                await asyncio.sleep(0.2)
-            loop = asyncio.get_running_loop()
-            deadline = loop.time() + timeout_s
-            while loop.time() < deadline and "response.done" not in seen:
-                await asyncio.sleep(0.5)
-            if reader_task.done():
-                await reader_task
-            # Close explicitly. Dropping the socket parks the session in its
-            # disconnect grace, where it keeps holding an admission slot and
-            # starves the tests that follow.
-            await ws.send(json.dumps({"type": "session.close"}))
-            deadline = loop.time() + 30
-            while loop.time() < deadline and "session.closed" not in seen:
-                await asyncio.sleep(0.25)
-        finally:
-            reader_task.cancel()
-    return {
-        "audio_bytes": audio_bytes,
-        "transcript": "".join(transcript),
-        "output_text": "".join(output_text),
-        "event_types": seen,
-    }
 
 
 @pytest.mark.core_model
@@ -386,8 +238,8 @@ def test_duplex_seeded_text_to_audio(omni_server, locale: str, text: str) -> Non
         )
     )
 
-    assert "response.done" in result["event_types"], result["event_types"]
-    assert int(result["audio_bytes"]) > 0, f"{locale} seeded text produced no audio"
+    assert "response.done" in cast(list[str], result["event_types"]), result["event_types"]
+    assert cast(int, result["audio_bytes"]) > 0, f"{locale} seeded text produced no audio"
     assert str(result["transcript"]).strip(), f"{locale} seeded text produced audio with no transcript"
 
 
@@ -413,7 +265,7 @@ def test_duplex_seeded_text_to_text_needs_no_reference_voice(omni_server) -> Non
         )
     )
 
-    assert "response.done" in result["event_types"], result["event_types"]
+    assert "response.done" in cast(list[str], result["event_types"]), result["event_types"]
     produced_text = str(result["output_text"]) or str(result["transcript"])
     assert produced_text.strip(), f"text-only session produced nothing: {result['event_types']}"
 
@@ -439,10 +291,10 @@ def test_duplex_seeded_text_to_long_audio_output(omni_server) -> None:
         )
     )
 
-    assert "response.done" in result["event_types"], result["event_types"]
+    assert "response.done" in cast(list[str], result["event_types"]), result["event_types"]
     # 24 kHz mono pcm16: 2 s of speech is 96000 bytes, comfortably more than a
     # single Code2Wav frame and well under a 40-word answer.
-    assert int(result["audio_bytes"]) > 96_000, f"expected a long answer, got {result['audio_bytes']} bytes"
+    assert cast(int, result["audio_bytes"]) > 96_000, f"expected a long answer, got {result['audio_bytes']} bytes"
     assert str(result["transcript"]).strip()
 
 
@@ -462,8 +314,8 @@ def test_duplex_seeded_long_form_generation(omni_server) -> None:
         )
     )
 
-    assert "response.done" in result["event_types"], result["event_types"]
-    assert int(result["audio_bytes"]) > 96_000, f"expected long-form audio, got {result['audio_bytes']} bytes"
+    assert "response.done" in cast(list[str], result["event_types"]), result["event_types"]
+    assert cast(int, result["audio_bytes"]) > 96_000, f"expected long-form audio, got {result['audio_bytes']} bytes"
     assert str(result["transcript"]).strip()
 
 
@@ -495,8 +347,8 @@ def test_duplex_sequential_sessions_are_independent(omni_server) -> None:
     )
 
     for result in (first, second):
-        assert "response.done" in result["event_types"], result["event_types"]
-        assert int(result["audio_bytes"]) > 0
+        assert "response.done" in cast(list[str], result["event_types"]), result["event_types"]
+        assert cast(int, result["audio_bytes"]) > 0
         assert str(result["transcript"]).strip()
 
     # Different prompts must not produce the same answer: that would mean the
@@ -586,12 +438,13 @@ def test_duplex_two_sessions_resume_and_takeover(omni_server, tmp_path: Path) ->
     )
     assert result["ok"] is True
     assert result["session_count"] == 2
-    assert result["resume"]["ok"] is True
-    assert result["takeover"]["ok"] is True
+    assert cast(dict[str, object], result["resume"])["ok"] is True
+    assert cast(dict[str, object], result["takeover"])["ok"] is True
     assert not result["failures"]
-    assert all(session["audio_delta_count"] > 0 for session in result["sessions"])
-    assert all(session["done_count"] == 1 for session in result["sessions"])
-    assert all(session["error_count"] == 0 for session in result["sessions"])
-    for session in result["sessions"]:
+    sessions = cast(list[dict[str, object]], result["sessions"])
+    assert all(cast(int, session["audio_delta_count"]) > 0 for session in sessions)
+    assert all(session["done_count"] == 1 for session in sessions)
+    assert all(session["error_count"] == 0 for session in sessions)
+    for session in sessions:
         _assert_request_metrics(session["request_metrics"], expected_count=1)
         _assert_session_metrics(session["session_metrics"], expected_count=1)

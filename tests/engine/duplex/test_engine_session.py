@@ -511,7 +511,7 @@ def test_commit_append_rejects_stale_reservation():
         session.prepare_append(DuplexFence("sid-other", epoch=0, turn_id=0))
 
 
-def test_cancel_fence_releases_stage_requests_and_advances_identity():
+def test_cancellation_keeps_stage_requests_until_explicit_release():
     session = _session("sid-cancel")
     cancelled = session.fence
     session.reserve_stage_request(0, "req-a", fence=cancelled)
@@ -520,16 +520,19 @@ def test_cancel_fence_releases_stage_requests_and_advances_identity():
     assert session.stage_request_submitted(0, "req-a") is False
     next_fence = DuplexFence("sid-cancel", epoch=1, turn_id=0)
 
-    stale = session.cancel_fence(cancelled, next_fence)
+    stale = session.prepare_cancel_fence(cancelled, next_fence)
+    assert session.accepted_fence == next_fence
+    assert session.resource_request_ids(cancelled) == stale
+    session.release_fence(cancelled)
 
     assert stale == ["req-a", "req-b"]
     assert session.resource_request_ids() == []
     assert session.accepted_fence == next_fence
 
     with pytest.raises(DuplexFenceMismatchError):
-        session.cancel_fence(next_fence, DuplexFence("sid-cancel", epoch=1, turn_id=1))
+        session.prepare_cancel_fence(next_fence, DuplexFence("sid-cancel", epoch=1, turn_id=1))
     with pytest.raises(DuplexFenceMismatchError):
-        session.cancel_fence(DuplexFence("sid-other", epoch=1, turn_id=0), DuplexFence("sid-cancel", epoch=2))
+        session.prepare_cancel_fence(DuplexFence("sid-other", epoch=1, turn_id=0), DuplexFence("sid-cancel", epoch=2))
 
 
 def test_request_resource_keys_are_stage_id_and_request_id():
@@ -895,7 +898,12 @@ def test_end_response_logs_pending_and_active_stage_request_stats(monkeypatch: p
 
 def test_end_response_prints_one_column_per_stage(monkeypatch: pytest.MonkeyPatch):
     logged: list[OrchestratorAggregator] = []
-    monkeypatch.setattr(OrchestratorAggregator, "build_and_log_summary", lambda self: logged.append(self) or {})
+
+    def capture_summary(aggregator: OrchestratorAggregator) -> dict[str, object]:
+        logged.append(aggregator)
+        return {}
+
+    monkeypatch.setattr(OrchestratorAggregator, "build_and_log_summary", capture_summary)
     session = _session(num_stages=3, log_stats=True)
     session.observe_stage_request_stats(0, _stage_stats(stage_id=0, num_tokens_out=3, vllm_ttft_ms=40.0))
     response_id = session.begin_response()
@@ -965,7 +973,12 @@ def test_logged_e2e_includes_wait_before_first_output(monkeypatch: pytest.Monkey
     wall = {"t": 1_000.0}
     monkeypatch.setattr(time, "time", lambda: wall["t"])
     logged: list[OrchestratorAggregator] = []
-    monkeypatch.setattr(OrchestratorAggregator, "build_and_log_summary", lambda self: logged.append(self) or {})
+
+    def capture_summary(aggregator: OrchestratorAggregator) -> dict[str, object]:
+        logged.append(aggregator)
+        return {}
+
+    monkeypatch.setattr(OrchestratorAggregator, "build_and_log_summary", capture_summary)
     session = _session(log_stats=True, clock=lambda: mono["t"])
     session.mark_model_turn_request_started(0, 100.0)
 
@@ -985,7 +998,12 @@ def test_logged_e2e_includes_wait_before_first_output(monkeypatch: pytest.Monkey
 
 def test_logged_tpot_matches_client_weighted_aggregation(monkeypatch: pytest.MonkeyPatch) -> None:
     logged: list[OrchestratorAggregator] = []
-    monkeypatch.setattr(OrchestratorAggregator, "build_and_log_summary", lambda self: logged.append(self) or {})
+
+    def capture_summary(aggregator: OrchestratorAggregator) -> dict[str, object]:
+        logged.append(aggregator)
+        return {}
+
+    monkeypatch.setattr(OrchestratorAggregator, "build_and_log_summary", capture_summary)
     session = _session(log_stats=True)
     response_id = session.begin_response()
     session.observe_stage_request_stats(0, _stage_stats(stage_id=0, num_tokens_out=11, vllm_tpot_ms=10.0))

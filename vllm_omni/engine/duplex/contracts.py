@@ -42,6 +42,7 @@ class DuplexOutputDecision:
     action: DuplexOutputAction
     metadata: Mapping[str, object] = field(default_factory=dict)
     final_output_type: str = "text"
+    ends_model_turn: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "metadata", MappingProxyType(dict(self.metadata)))
@@ -241,6 +242,8 @@ def duplex_resource_request_belongs_to_session(request_id: str, session_id: str)
 __all__ = [
     "DuplexFence",
     "DuplexAppendPlan",
+    "DuplexContextPlan",
+    "DuplexContextUnit",
     "DuplexOutputAction",
     "DuplexOutputContext",
     "DuplexOutputDecision",
@@ -257,3 +260,20 @@ __all__ = [
     "duplex_same_turn_request_ids",
     "duplex_session_id_from_request_id",
 ]
+
+
+@dataclass(frozen=True)
+class DuplexContextUnit:
+    """One model-owned prompt to replay through the standard stage port."""
+
+    unit_id: str
+    prompt: Mapping[str, object]
+
+
+@dataclass(frozen=True)
+class DuplexContextPlan:
+    """Validated ordered history replacement; no physical KV handles."""
+
+    units: tuple[DuplexContextUnit, ...]
+    retained_unit_ids: tuple[str, ...]
+    dropped_unit_ids: tuple[str, ...]

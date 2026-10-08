@@ -448,6 +448,47 @@ Frame-based plugins use `engine/duplex/intermediate.py::build_duplex_append_prom
 for the shared request identity, sequencing and config snapshots. Token budgets,
 PCM framing and model-specific worker fields remain in the plugins.
 
+### Editable context ownership
+
+The engine owns `DuplexContextHistory`, input completion waiters, the prompt
+journal, reconstruction ordering and epoch changes. The model plugin provides
+the context policy: Gander selects units and protected regions, validates edits
+and computes replay budgets. Gander history reconstruction and MiniCPM's native
+sliding-window/Re-RoPE policy are separate model policies; only one owns a
+session's history.
+
+An `input.context.appended` event confirms queueing. `input.context.applied`
+confirms completion of that input unit, including an empty-output LISTEN unit.
+`input.context.replaced` is emitted after reconstruction succeeds and carries
+the new epoch. The Realtime projection prefixes these custom event types with
+`duplex.` and nests the domain payload under `event`.
+
+Replacement first validates the complete edit plan and budget. Invalid edits
+preserve the existing request, KV and append receipts. A valid plan retires the
+old epoch, rebuilds scheduler-owned KV from selected inputs and completed
+assistant tokens, then permits new input. Replay cannot emit old audio or
+execute tools again. Repeated committed event IDs with identical content are
+deduplicated; conflicting content is rejected. Failure after reconstruction
+begins fails pending operations and closes the session.
+
+Acceptance is based on epoch, not turn equality: an output request from a
+previous turn may still be draining in the current epoch. Request-error
+reporting checks its stage fence before and after awaiting the shared error
+reporter. A retired epoch cannot fail the current journal, while current-epoch
+errors remain terminal. Physical request state and retained input embeddings
+are released through normal request cleanup.
+
+A successful replacement invalidates reconnect replay from before the
+replacement boundary. A client whose cursor precedes that boundary must
+resynchronize; an identical duplicate replacement does not invalidate newer
+replay. Pending tool results are accepted immediately after resume, before
+new audio, using the current epoch and stable call/event IDs.
+
+Gander bounds its journal at 256 MiB, registered calls at 64 and context
+receipts at 128. These are hard limits; no TTL or timeout-recovery policy is
+implied. Native tool timeout/cancel recovery remains under discussion in
+[RFC #8542](https://github.com/vllm-project/vllm-omni/issues/8542).
+
 See [supported models and deployments](../serving/full_duplex_api.md#enable-full-duplex)
 for the current plugin integrations and deployment configurations.
 

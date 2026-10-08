@@ -11,7 +11,7 @@ from typing import Any
 
 import yaml
 
-from vllm_omni.config.stage_config import load_deploy_config
+from vllm_omni.config.stage_config import load_deploy_config, resolve_deploy_yaml
 
 
 def modify_stage_config(
@@ -50,8 +50,9 @@ def modify_stage_config(
         raise FileNotFoundError(f"yaml does not exist: {path}")
 
     try:
-        with open(yaml_path, encoding="utf-8") as f:
-            config = yaml.safe_load(f) or {}
+        # Materialize inheritance before moving the modified YAML to a temporary
+        # directory, where a relative base_config would no longer resolve.
+        config = resolve_deploy_yaml(yaml_path)
     except Exception as e:
         raise ValueError(f"Cannot parse YAML file: {e}")
 
@@ -717,8 +718,7 @@ def get_deploy_duplex_max_sessions(rel_path: str) -> int:
 
 def _stage_ids_from_deploy_yaml(stage_config_path: str) -> list[int]:
     """Return ``stage_id`` values from a new-schema deploy YAML (``stages``)."""
-    with open(stage_config_path, encoding="utf-8") as f:
-        cfg = yaml.safe_load(f) or {}
+    cfg = resolve_deploy_yaml(stage_config_path)
     try:
         return load_stage_ids(cfg)
     except ValueError as exc:
@@ -746,8 +746,7 @@ def _delete_dummy_load_format(
     """For ``advanced_model`` / ``full_model``, strip ``load_format: dummy`` so real weights load."""
     if run_level not in {"advanced_model", "full_model"} or stage_config_path is None:
         return stage_config_path
-    with open(stage_config_path, encoding="utf-8") as f:
-        cfg = yaml.safe_load(f) or {}
+    cfg = resolve_deploy_yaml(stage_config_path)
     try:
         stages = get_stage_entries(cfg)
     except ValueError as exc:

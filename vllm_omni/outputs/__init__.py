@@ -61,6 +61,7 @@ class OmniModelRunnerOutput(ModelRunnerOutput):
     # The Scheduler can safely free the block tables for these requests.
     kv_extracted_req_ids: list[str] | None = None
     omni_connector_output: OmniConnectorOutput | None = None
+    model_input_errors: dict[str, str] = field(default_factory=dict)
     # True when sampled_token_ids has already been materialized on the host.
     # MRv2 consumers must treat the value as immutable and must not perform
     # another device-to-host conversion or rebuild it from sampler tensors.

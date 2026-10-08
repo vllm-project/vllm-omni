@@ -1175,6 +1175,10 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                 ec_connector_output,
             ) = self._preprocess(scheduler_output, num_tokens_padded, intermediate_tensors)
 
+        input_errors = getattr(scheduler_output, "model_input_errors", {})
+        if input_errors and slot_mappings_by_group is not None:
+            self._mask_failed_input_kv_slots(input_errors, req_ids[:num_reqs], slot_mappings_by_group)
+
         # Let the model adjust inputs before forward (e.g. restore input_ids
         # for multimodal position detection, fix decode position offsets).
         prepare_runner_inputs = getattr(self.model, "prepare_runner_inputs", None)
@@ -1381,6 +1385,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         """
         sampling_metadata = self.input_batch.sampling_metadata
         if spec_decode_metadata is None:
+            self._mask_failed_input_logits(logits)
             model_sample = getattr(self.model, "sample", None)
             self.input_batch.update_async_output_token_ids()
             if logits is not None and callable(model_sample) and getattr(self.model, "prefer_model_sampler", False):
@@ -1603,7 +1608,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         scheduler_output: SchedulerOutput,
     ) -> SchedulerOutput:
         updates: dict[str, Any] = {}
-        for attr in ("num_scheduled_tokens", "scheduled_spec_decode_tokens"):
+        for attr in ("num_scheduled_tokens", "scheduled_spec_decode_tokens", "model_input_errors"):
             val = getattr(scheduler_output, attr, None)
             if isinstance(val, dict):
                 updates[attr] = val.copy()
@@ -1771,6 +1776,8 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             return False
 
         _, downstream_req_ids = self._resolve_pooler_payload_req_ids(req_ids_output_copy)
+        failures = getattr(scheduler_output, "model_input_errors", {})
+        downstream_req_ids = [rid for rid in downstream_req_ids if rid not in failures]
         if not downstream_req_ids:
             return False
 
@@ -1821,6 +1828,8 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         combined_multimodal_outputs = None
 
         engine_output_type, downstream_req_ids = self._resolve_pooler_payload_req_ids(req_ids_output_copy)
+        input_errors = dict(getattr(scheduler_output, "model_input_errors", {}) or {})
+        downstream_req_ids = [rid for rid in downstream_req_ids if rid not in input_errors]
         downstream_req_ids, sparse_mm_index, audio_sparse_output = resolve_sparse_mm_routing(
             engine_output_type=engine_output_type,
             req_ids_output_copy=req_ids_output_copy,
@@ -1988,6 +1997,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                 ec_connector_output=ec_connector_output if self.supports_mm_inputs else None,
                 num_nans_in_logits=num_nans_in_logits,
                 cudagraph_stats=cudagraph_stats,
+                model_input_errors=input_errors,
             )
             output.kv_extracted_req_ids = kv_extracted_req_ids
         return output
@@ -2138,6 +2148,12 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                 scheduler_output.total_num_scheduled_tokens,
             )
 
+        self._suppress_failed_input_samples(
+            getattr(scheduler_output, "model_input_errors", {}),
+            req_id_to_index_output_copy,
+            valid_sampled_token_ids,
+            invalid_req_indices,
+        )
         post_sample_mm = getattr(getattr(self, "model", None), "post_sample_multimodal_outputs", None)
         if callable(post_sample_mm):
             multimodal_outputs = post_sample_mm(

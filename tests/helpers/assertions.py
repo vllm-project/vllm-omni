@@ -9,6 +9,7 @@ import io
 import json
 import math
 import os
+import re
 import tempfile
 import threading
 import wave
@@ -21,6 +22,7 @@ from typing import TYPE_CHECKING, Any, Literal, TypeVar
 
 if TYPE_CHECKING:
     from tests.helpers.client import DiffusionResponse
+    from vllm_omni.clients.duplex import EventCollector
 
 import av
 import numpy as np
@@ -47,6 +49,58 @@ _GENDER_PIPELINE_LOCK = threading.Lock()
 AUDIO_MISMATCH_MESSAGE = "The audio content is not same as the text"
 GENDER_MISMATCH_MESSAGE = "estimated gender is"
 _QUALITY_FAILURE_MESSAGES = (AUDIO_MISMATCH_MESSAGE, GENDER_MISMATCH_MESSAGE)
+
+
+def assert_duplex_multimodal_response(result, *, expected_text_pattern=None, forbidden_text_pattern=None):
+    assert result["ok"], result
+    assert result["done_count"] == 1 and result["playback_ack_count"] == 1, result
+    assert result["audio_delta_count"] > 0 and result["error_count"] == 0, result
+    assert result["all_audio_responses_have_transcript"] and result["transcript_delta_done_ok"], result
+    assert result["continuous_input_ok"] and result["stale_audio_delta_count"] == 0, result
+    text = result["transcript_integrity"][0]["transcript"]
+    if expected_text_pattern is not None:
+        assert re.search(expected_text_pattern, text, re.IGNORECASE), text
+    if forbidden_text_pattern is not None:
+        assert re.search(forbidden_text_pattern, text, re.IGNORECASE) is None, text
+
+
+def assert_duplex_client_session(summary):
+    assert summary["decision"] == "speak", summary
+    assert isinstance(summary["audio_chunks"], int) and summary["audio_chunks"] > 0, summary
+    assert isinstance(summary["played_ms"], int | float) and summary["played_ms"] > 0, summary
+    assert summary["transcript"], summary
+    assert summary["resume_token_issued"] is True, summary
+    assert summary["resumed_session_id"] == summary["session_id"], summary
+    assert summary["post_resume_heartbeat_ok"] is True, summary
+    assert summary["closed_cleanly"] is True, summary
+    assert summary["error_events"] == [], summary
+
+
+def assert_duplex_seeded_text_response(result, *, require_audio, expected_text_pattern):
+    assert "response.done" in result["event_types"], result
+    assert "session.closed" in result["event_types"], result
+    assert "error" not in result["event_types"], result
+    if require_audio:
+        assert result["audio_bytes"] > 0 and str(result["transcript"]).strip(), result
+    text = str(result["output_text"]) or str(result["transcript"])
+    assert re.search(expected_text_pattern, text, re.IGNORECASE), text
+
+
+def assert_duplex_response_audio(
+    collector: "EventCollector", response_done: dict[str, object], *, min_epoch: int
+) -> str:
+    """Require completed audio from this response after a context transition."""
+    response_id = collector.response_id(response_done)
+    assert response_id, "completed response has no identity"
+    response = response_done.get("response")
+    response = response if isinstance(response, dict) else {}
+    assert response_done.get("status", response.get("status")) == "completed", response_done
+    metadata = response.get("metadata")
+    metadata = metadata if isinstance(metadata, dict) else {}
+    epoch = response_done.get("epoch", metadata.get("epoch"))
+    assert isinstance(epoch, int) and epoch >= min_epoch, response_done
+    assert collector.audio_bytes(response_id), "inference after context rollover produced no new response audio"
+    return response_id
 
 
 @dataclass(frozen=True)

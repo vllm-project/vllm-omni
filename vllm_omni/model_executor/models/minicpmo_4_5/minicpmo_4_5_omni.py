@@ -19,7 +19,7 @@
 
 from collections.abc import Callable, Iterable
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import cached_property
 from typing import Any
 
@@ -43,7 +43,7 @@ from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_llm import (
     MiniCPMO45OmniLLMProcessingInfo,
     MiniCPMOConfig,
 )
-from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.model_executor.models.output_templates import ModelInputError, OmniOutput
 from vllm_omni.model_executor.models.utils import add_prefix_to_loaded_weights
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.utils.device_copy import index_to_device, to_device_nonblocking
@@ -254,6 +254,13 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
 
         return Sampler()
 
+    @property
+    def omni_pooler_payload_include_hidden(self) -> bool:
+        # Thinker hidden states condition the Talker. Code2Wav consumes only
+        # Talker codec IDs and metadata, so its handoff needs no hidden D2H.
+        # This does not remove the device hidden states used to sample logits.
+        return self.model_stage != "tts"
+
     def apply_duplex_kv_reanchor(self, runner: Any, scheduler_output: Any = None) -> None:
         """Apply in-place Stage-0 KV reanchor and rotation on worker before model forward."""
         from vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_kv import (
@@ -273,23 +280,38 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         # The previous step's deferred decisions update the session state read below.
         self._commit_minicpmo45_duplex_pending_samples()
         self._minicpmo45_active_duplex_rows = [row.row_idx for row in rows]
+        closed_units = getattr(self, "_minicpmo45_closed_duplex_units", {})
+        self._minicpmo45_duplex_row_units = {row.row_idx: (row.request_id, row.seq) for row in rows}
+        self._minicpmo45_discarded_duplex_rows = {
+            row.row_idx
+            for row in rows
+            if not row.sampling_enabled or (row.seq is not None and closed_units.get(row.request_id) == row.seq)
+        }
+        gander = bool(getattr(getattr(self, "config", None), "gander_unit8", False))
         self._minicpmo45_duplex_row_sampling_host = {
             row.row_idx: (row.temperature, row.top_k, row.top_p)
             for row in rows
             if row.temperature is not None and row.top_k is not None and row.top_p is not None
         }
         self._minicpmo45_duplex_row_sessions = {
-            row.row_idx: row.session_id for row in rows if row.session_id is not None
+            row.row_idx: (row.request_id if gander else row.session_id) for row in rows if row.session_id is not None
         }
         request_sessions = getattr(self, "_minicpmo45_duplex_request_sessions", None)
         if not isinstance(request_sessions, dict):
             request_sessions = {}
             self._minicpmo45_duplex_request_sessions = request_sessions
-        request_sessions.update({row.request_id: row.session_id for row in rows if row.session_id is not None})
+        request_sessions.update(
+            {
+                row.request_id: (row.request_id if gander else row.session_id)
+                for row in rows
+                if row.session_id is not None
+            }
+        )
         self._minicpmo45_duplex_row_payloads = {row.row_idx: row.payload for row in rows if row.payload is not None}
         self._minicpmo45_duplex_row_max_tokens = {
             row.row_idx: row.max_tokens for row in rows if row.max_tokens is not None
         }
+        self._minicpmo45_duplex_row_sampling = {row.row_idx: (row.temperature, row.top_k, row.top_p) for row in rows}
         if self.model_stage != "llm" or not rows or logits.ndim != 2:
             return
 
@@ -310,6 +332,8 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         helper = getattr(self, "_minicpmo45_duplex_data_plane_helper", None)
         helper_sessions = getattr(helper, "sessions", None) if helper is not None else None
         for row in rows:
+            if row.row_idx in self._minicpmo45_discarded_duplex_rows:
+                continue
             row_idx = row.row_idx
             if row_idx < 0 or row_idx >= logits.shape[0]:
                 continue
@@ -320,7 +344,11 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             is_speech = payload.get("is_speech")
             segment_key = (row.request_id, row.seq if row.seq is not None else -1)
             session_key = row.session_id
-            if turn_eos_id >= 0 and session_key is not None:
+            if (
+                turn_eos_id >= 0
+                and session_key is not None
+                and not getattr(getattr(self, "config", None), "gander_unit8", False)
+            ):
                 state = helper_sessions.get(session_key) if isinstance(helper_sessions, dict) else None
                 pending_speech_context = (
                     bool(getattr(state, "pending_speech_context", False)) if state is not None else False
@@ -449,23 +477,113 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         session_id = str(duplex.get("session_id") or "")
         payload = duplex.get("payload")
         if not session_id or not isinstance(payload, dict):
-            embeds = input_embeds if input_embeds is not None else self.get_input_embeddings(input_ids)
-            return input_ids, embeds, {"duplex": {"prefill_success": False, "reason": "bad_duplex_payload"}}
+            raise ModelInputError("native_duplex_prefill_failed: bad_duplex_payload")
 
-        # A deferred sample of this session updates the latches its append reads.
-        self._commit_minicpmo45_duplex_pending_samples(session_ids={session_id})
-        state = self._minicpmo45_duplex_session_state(helper, session_id, duplex)
-        prefill_kwargs = self._minicpmo45_duplex_prefill_kwargs(duplex, payload)
-        seq = prefill_kwargs["seq"]
-        result = helper.take_staged_prefill(state, prefill_kwargs["epoch"], seq)
-        if result is None:  # not built by this step's preprocess_batch
-            audio_waveform = helper._decode_audio_payload(payload)
+        gander = bool(getattr(getattr(self, "config", None), "gander_unit8", False))
+        if gander:
+            physical_owner = str(kwargs.get("request_id") or f"{session_id}:{duplex.get('epoch', 0)}")
+            state = self._minicpmo45_duplex_session_state(helper, session_id, duplex, state_key=physical_owner)
+
             try:
-                prefill_kwargs.update(helper.frame_kwargs(duplex, payload))
+                audio_waveform = (
+                    None
+                    if payload.get("gander_control") is True or payload.get("type") == "text"
+                    else helper._decode_audio_payload(payload)
+                )
             except ValueError as exc:
-                embeds = input_embeds if input_embeds is not None else self.get_input_embeddings(input_ids)
-                return input_ids, embeds, {"duplex": {"prefill_success": False, "reason": str(exc)}}
-            result = helper._stage_prefill_embeddings_only(state, audio_waveform, **prefill_kwargs)
+                raise ModelInputError(f"native_duplex_prefill_failed: {exc}") from exc
+            seq = duplex.get("seq")
+            try:
+                seq = int(seq) if seq is not None else None
+            except (TypeError, ValueError):
+                seq = None
+            epoch = duplex.get("epoch")
+            try:
+                epoch = int(epoch) if epoch is not None else None
+            except (TypeError, ValueError):
+                epoch = None
+            turn_id = duplex.get("turn_id")
+            try:
+                turn_id = int(turn_id) if turn_id is not None else None
+            except (TypeError, ValueError):
+                turn_id = None
+            if payload.get("gander_control") is True or payload.get("type") == "text":
+                if not getattr(self.config, "gander_unit8", False):
+                    raise ModelInputError("native_duplex_prefill_failed: Gander context payload on a non-Gander model")
+                try:
+                    result = helper._stage_control_embeddings(state, payload, epoch=epoch, seq=seq)
+                except ValueError as exc:
+                    raise ModelInputError(f"native_duplex_prefill_failed: {exc}") from exc
+            else:
+                result = helper.take_staged_prefill(state, epoch, seq)
+                if result is None:
+                    try:
+                        frame_kwargs = helper.frame_kwargs(duplex, payload)
+                    except ValueError as exc:
+                        raise ModelInputError(f"native_duplex_prefill_failed: {exc}") from exc
+                    result = helper._stage_prefill_embeddings_only(
+                        state,
+                        audio_waveform,
+                        epoch=epoch,
+                        turn_id=turn_id,
+                        seq=seq,
+                        is_speech=bool(payload.get("is_speech", False)),
+                        final=bool(duplex.get("final")),
+                        **frame_kwargs,
+                    )
+            if payload.get("gander_replay") and result.get("success") and not result.get("gander_history_embedded"):
+                from .gander import REPLAY_SAMPLED_KEY
+
+                history = payload.get("gander_replay_output_ids", [])
+                if history:
+                    past_ids = list(history[:-1])
+                    if past_ids:
+                        past_embeds = torch.cat([helper._as_2d_tensor(helper._embed_token(t)) for t in past_ids], dim=0)
+                        result["inputs_embeds"] = torch.cat([result["inputs_embeds"], past_embeds], dim=0)
+                        result["input_token_ids"] = [*result["input_token_ids"], *past_ids]
+                        result["num_input_tokens"] = len(result["input_token_ids"])
+                    state.current_turn_ended = any(
+                        t in history
+                        for t in (
+                            helper.turn_eos_token_id,
+                            helper.listen_token_id,
+                            helper._special_token_ids().get("tool_call_token_id"),
+                        )
+                    )
+                    if payload.get(REPLAY_SAMPLED_KEY, True):
+                        # Rebuild decoder history from retained sampled outputs,
+                        # once per prefill. Forced LISTEN and chunk boundaries
+                        # bypass the released decoder's repetition history.
+                        state.generated_tokens.extend(t for t in history if t != helper.chunk_eos_token_id)
+                        del state.generated_tokens[: -MiniCPMO45DuplexPolicy.REPETITION_HISTORY_SIZE]
+                result["gander_history_embedded"] = True
+                state.prepared_inputs_embeds = result["inputs_embeds"]
+                state.prepared_input_token_ids = list(result["input_token_ids"])
+                state.prepared_result = {
+                    k: v for k, v in result.items() if k not in {"inputs_embeds", "input_token_ids"}
+                }
+            if getattr(getattr(self, "config", None), "gander_unit8", False) and result.get("success"):
+                result["special_token_ids"].update(
+                    gander_append_seq=seq or 0,
+                    gander_context_version=state.gander_context_version,
+                    gander_control_input=int(payload.get("gander_control") is True),
+                )
+        else:
+            # A deferred sample of this session updates the latches its append reads.
+            self._commit_minicpmo45_duplex_pending_samples(session_ids={session_id})
+            state = self._minicpmo45_duplex_session_state(helper, session_id, duplex)
+            prefill_kwargs = self._minicpmo45_duplex_prefill_kwargs(duplex, payload)
+            seq = prefill_kwargs["seq"]
+            result = helper.take_staged_prefill(state, prefill_kwargs["epoch"], seq)
+            if result is None:  # not built by this step's preprocess_batch
+                audio_waveform = helper._decode_audio_payload(payload)
+                try:
+                    prefill_kwargs.update(helper.frame_kwargs(duplex, payload))
+                except ValueError as exc:
+                    embeds = input_embeds if input_embeds is not None else self.get_input_embeddings(input_ids)
+                    return input_ids, embeds, {"duplex": {"prefill_success": False, "reason": str(exc)}}
+                result = helper._stage_prefill_embeddings_only(state, audio_waveform, **prefill_kwargs)
+            epoch = prefill_kwargs["epoch"]
         update_result = dict(result)
         if result.get("stage0_window_replaced") is True:
             window = duplex.get("stage0_window", {})
@@ -478,8 +596,10 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             )
         update_result.pop("inputs_embeds", None)
         if result.get("success") is not True:
-            embeds = input_embeds if input_embeds is not None else self.get_input_embeddings(input_ids)
-            return input_ids, embeds, {"duplex": update_result}
+            # Sub-chunk residuals are padded by the serving buffer before they
+            # reach Stage0; a failed prefill is always a real input error, so
+            # isolate it to this request instead of decoding placeholder ids.
+            raise ModelInputError(f"native_duplex_prefill_failed: {result.get('reason', 'no prepared model unit')}")
 
         target_dtype = (
             input_embeds.dtype if input_embeds is not None else self.get_input_embeddings(input_ids[:1]).dtype
@@ -491,63 +611,109 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             prompt_len = int(prompt_len) if prompt_len is not None else int(full_req_embeds.shape[0])
         except (TypeError, ValueError):
             prompt_len = int(full_req_embeds.shape[0])
-        pad_token_id = helper.stage_padding_token_id()
-        if prompt_len > int(full_req_embeds.shape[0]):
-            pad_len = prompt_len - int(full_req_embeds.shape[0])
-            pad_ids = torch.full(
-                (pad_len,),
-                pad_token_id,
-                dtype=input_ids.dtype,
-                device=input_ids.device,
-            )
-            pad_embeds = self.get_input_embeddings(pad_ids).to(dtype=full_req_embeds.dtype)
-            # The appended duplex tokens occupy the tail of the request prompt
-            # and the runner schedules the span [num_computed_tokens, prompt_len).
-            # Padding must therefore sit in front of the real chunk embeddings;
-            # otherwise the audio lands outside the scheduled span, is never
-            # forwarded, and generation runs on pad tokens only. Keeping the
-            # embeddings last also places the decode position directly after the
-            # final audio embedding, matching the official listen/speak decision
-            # point.
-            full_req_embeds = torch.cat([pad_embeds, full_req_embeds], dim=0)
-            full_input_token_ids = [pad_token_id] * pad_len + full_input_token_ids
-        elif prompt_len < int(full_req_embeds.shape[0]):
-            logger.warning(
-                "MiniCPM-o duplex append produced %d embeddings but the scheduler "
-                "reserved only %d prompt slots; the tail will be truncated. "
-                "Increase the duplex scheduler token budget.",
-                int(full_req_embeds.shape[0]),
-                prompt_len,
-            )
-
-        span_len = int(input_ids.shape[0])
         token_offset = kwargs.get("duplex_token_offset", 0)
         try:
             token_offset = max(0, int(token_offset))
         except (TypeError, ValueError):
             token_offset = 0
-        req_embeds = full_req_embeds[token_offset : token_offset + span_len]
-        if req_embeds.shape[0] < span_len:
-            pad_ids = torch.full(
-                (span_len - req_embeds.shape[0],),
-                pad_token_id,
-                dtype=input_ids.dtype,
-                device=input_ids.device,
-            )
-            pad_embeds = self.get_input_embeddings(pad_ids).to(dtype=req_embeds.dtype)
-            req_embeds = torch.cat([req_embeds, pad_embeds], dim=0)
-        elif req_embeds.shape[0] > span_len:
-            req_embeds = req_embeds[:span_len]
+        if not gander and state.window_enabled:
+            pad_token_id = helper.stage_padding_token_id()
+            if prompt_len > int(full_req_embeds.shape[0]):
+                pad_len = prompt_len - int(full_req_embeds.shape[0])
+                pad_ids = torch.full(
+                    (pad_len,),
+                    pad_token_id,
+                    dtype=input_ids.dtype,
+                    device=input_ids.device,
+                )
+                pad_embeds = self.get_input_embeddings(pad_ids).to(dtype=full_req_embeds.dtype)
+                # The appended duplex tokens occupy the tail of the request prompt
+                # and the runner schedules the span [num_computed_tokens, prompt_len).
+                # Padding must therefore sit in front of the real chunk embeddings;
+                # otherwise the audio lands outside the scheduled span, is never
+                # forwarded, and generation runs on pad tokens only. Keeping the
+                # embeddings last also places the decode position directly after the
+                # final audio embedding, matching the official listen/speak decision
+                # point.
+                full_req_embeds = torch.cat([pad_embeds, full_req_embeds], dim=0)
+                full_input_token_ids = [pad_token_id] * pad_len + full_input_token_ids
+            elif prompt_len < int(full_req_embeds.shape[0]):
+                logger.warning(
+                    "MiniCPM-o duplex append produced %d embeddings but the scheduler "
+                    "reserved only %d prompt slots; the tail will be truncated. "
+                    "Increase the duplex scheduler token budget.",
+                    int(full_req_embeds.shape[0]),
+                    prompt_len,
+                )
 
-        input_token_ids = full_input_token_ids[token_offset : token_offset + span_len]
-        if len(input_token_ids) < span_len:
-            input_token_ids.extend([pad_token_id] * (span_len - len(input_token_ids)))
-        if input_token_ids:
-            # Pinned + non-blocking: a pageable copy would wait for all queued GPU work.
-            req_input_ids = index_to_device(input_token_ids, input_ids.device, input_ids.dtype)
-            update_result["duplex_prompt_token_ids"] = full_input_token_ids
+            span_len = int(input_ids.shape[0])
+            token_offset = kwargs.get("duplex_token_offset", 0)
+            try:
+                token_offset = max(0, int(token_offset))
+            except (TypeError, ValueError):
+                token_offset = 0
+            req_embeds = full_req_embeds[token_offset : token_offset + span_len]
+            if req_embeds.shape[0] < span_len:
+                pad_ids = torch.full(
+                    (span_len - req_embeds.shape[0],),
+                    pad_token_id,
+                    dtype=input_ids.dtype,
+                    device=input_ids.device,
+                )
+                pad_embeds = self.get_input_embeddings(pad_ids).to(dtype=req_embeds.dtype)
+                req_embeds = torch.cat([req_embeds, pad_embeds], dim=0)
+            elif req_embeds.shape[0] > span_len:
+                req_embeds = req_embeds[:span_len]
+
+            input_token_ids = full_input_token_ids[token_offset : token_offset + span_len]
+            if len(input_token_ids) < span_len:
+                input_token_ids.extend([pad_token_id] * (span_len - len(input_token_ids)))
+            if input_token_ids:
+                # Pinned + non-blocking: a pageable copy would wait for all queued GPU work.
+                req_input_ids = index_to_device(input_token_ids, input_ids.device, input_ids.dtype)
+                update_result["duplex_prompt_token_ids"] = full_input_token_ids
+            else:
+                req_input_ids = torch.full_like(input_ids, helper._required_token_id("unit_token_id"))
+            return req_input_ids, req_embeds, {"duplex": update_result}
+
+        from vllm_omni.model_executor.models.minicpmo_4_5.duplex.input_history import DuplexPromptHistory
+
+        request_id = str(kwargs.get("request_id") or f"{session_id}:{epoch}")
+        histories = getattr(self, "_minicpmo45_duplex_input_histories", None)
+        if histories is None:
+            histories = self._minicpmo45_duplex_input_histories = {}
+        history = histories.get(request_id)
+        if history is None:
+            model_config = getattr(getattr(self, "vllm_config", None), "model_config", None)
+            max_tokens = min(40960, int(getattr(model_config, "max_model_len", 40960)))
+            history = histories[request_id] = DuplexPromptHistory(max_tokens=max_tokens)
+        history.append(
+            prompt_len=prompt_len,
+            embeddings=full_req_embeds,
+            token_ids=full_input_token_ids,
+            identity=(epoch, seq, prompt_len),
+        )
+        # Generated-token gaps use normal token lookup; actual multimodal
+        # spans come from the owned recovery history. Keep the same path for
+        # live append and historical preemption recomputation.
+        # Overlay patches scheduler-owned IDs, so it needs request-local storage.
+        req_input_ids = input_ids.clone()
+        req_embeds = self.get_input_embeddings(req_input_ids).to(dtype=target_dtype).clone()
+        history.overlay(offset=token_offset, input_ids=req_input_ids, embeddings=req_embeds)
+        # The llm->tts handoff needs the full prompt ids. A first append larger
+        # than one scheduling quantum arrives chunked: accumulate per-chunk ids
+        # and publish them when the final chunk completes the prompt.
+        chunk_acc = getattr(self, "_minicpmo45_duplex_chunked_token_ids", None)
+        if chunk_acc is None:
+            chunk_acc = self._minicpmo45_duplex_chunked_token_ids = {}
+        collected = [] if token_offset == 0 else chunk_acc.get(request_id, [])
+        collected.extend(req_input_ids.tolist())
+        if token_offset + input_ids.shape[0] >= prompt_len:
+            chunk_acc.pop(request_id, None)
+            if len(collected) == prompt_len:
+                update_result["duplex_prompt_token_ids"] = collected
         else:
-            req_input_ids = torch.full_like(input_ids, helper._required_token_id("unit_token_id"))
+            chunk_acc[request_id] = collected
         return req_input_ids, req_embeds, {"duplex": update_result}
 
     def preprocess_batch(
@@ -566,11 +732,23 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         del device
         if self.model_stage != "llm":
             return
-        infos = [model_intermediate_buffer.get(req_id) for req_id in req_ids]
-        duplexes = [info.get("duplex") for info in infos if isinstance(info, dict)]
-        appends = [duplex for duplex in duplexes if isinstance(duplex, dict) and duplex.get("data_plane") is True]
+        gander = bool(getattr(getattr(self, "config", None), "gander_unit8", False))
+        appends = []
+        for request_id in req_ids:
+            info = model_intermediate_buffer.get(request_id)
+            duplex = info.get("duplex") if isinstance(info, dict) else None
+            if not isinstance(duplex, dict) or duplex.get("data_plane") is not True:
+                continue
+            payload = duplex.get("payload")
+            if isinstance(payload, dict) and (
+                payload.get("gander_control") or payload.get("gander_replay") or payload.get("type") == "text"
+            ):
+                continue  # Control and journal replay retain their ordered single-request path.
+            appends.append((request_id, duplex))
         helper = getattr(self, "_minicpmo45_duplex_data_plane_helper", None)
-        frame_appends = [d for d in appends if isinstance(d.get("payload"), dict) and d["payload"].get("video_frames")]
+        frame_appends = [
+            d for _, d in appends if isinstance(d.get("payload"), dict) and d["payload"].get("video_frames")
+        ]
         if len(frame_appends) >= 2:
             try:
                 helper = self._duplex_data_plane_helper()
@@ -583,7 +761,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             return
         candidates: list[tuple[str, dict[str, Any], dict[str, Any], dict[str, Any]]] = []
         seen: set[str] = set()
-        for duplex in appends:
+        for request_id, duplex in appends:
             session_id = str(duplex.get("session_id") or "")
             payload = duplex.get("payload")
             repeated = session_id in seen
@@ -591,32 +769,39 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             if not session_id or not isinstance(payload, dict) or repeated:
                 continue  # a second append of one session keeps its order: preprocess
             kwargs = self._minicpmo45_duplex_prefill_kwargs(duplex, payload)
-            if helper.needs_prefill(helper.sessions.get(session_id), kwargs["epoch"], kwargs["seq"]):
-                candidates.append((session_id, duplex, payload, kwargs))
+            state_key = request_id if gander else session_id
+            if helper.needs_prefill(helper.sessions.get(state_key), kwargs["epoch"], kwargs["seq"]):
+                candidates.append((state_key, duplex, payload, kwargs))
         if len(candidates) < 2:
             return
         self._commit_minicpmo45_duplex_pending_samples(session_ids={candidate[0] for candidate in candidates})
         staged = []
-        for session_id, duplex, payload, kwargs in candidates:
+        for state_key, duplex, payload, kwargs in candidates:
             try:
                 audio_waveform = helper._decode_audio_payload(payload)
                 kwargs.update(helper.frame_kwargs(duplex, payload))
             except ValueError:
                 continue
-            staged.append((self._minicpmo45_duplex_session_state(helper, session_id, duplex), audio_waveform, kwargs))
+            state = self._minicpmo45_duplex_session_state(
+                helper, str(duplex["session_id"]), duplex, state_key=state_key
+            )
+            staged.append((state, audio_waveform, kwargs))
         if len(staged) >= 2:
             helper.stage_prefill_batch(staged)
 
-    def _minicpmo45_duplex_session_state(self, helper, session_id: str, duplex: dict[str, Any]):
-        """The Stage-0 state of ``session_id``, created with its session context on first use."""
-        state = helper.sessions.get(session_id)
+    def _minicpmo45_duplex_session_state(
+        self, helper, session_id: str, duplex: dict[str, Any], *, state_key: str | None = None
+    ):
+        """Initialize Stage-0 context under the model's cache owner (physical request for replay)."""
+        state_key = state_key or session_id
+        state = helper.sessions.get(state_key)
         if state is None:
             from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import (
                 _MiniCPMO45Stage0SessionState,
             )
 
             state = _MiniCPMO45Stage0SessionState(session_id=session_id)
-            helper.sessions[session_id] = state
+            helper.sessions[state_key] = state
             session_config = duplex.get("session_config")
             session_config = dict(session_config) if isinstance(session_config, dict) else {}
             runtime_config = duplex.get("runtime_config")
@@ -635,6 +820,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         window, reanchor = duplex.get("stage0_window"), duplex.get("stage0_reanchor")
         return {
             "epoch": _optional_int(duplex.get("epoch")),
+            "turn_id": _optional_int(duplex.get("turn_id")),
             "seq": _optional_int(duplex.get("seq")),
             "is_speech": bool(payload.get("is_speech", False)),
             "final": bool(duplex.get("final")),
@@ -859,6 +1045,14 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         return self.model.compute_logits(hidden_states)
 
     def on_requests_finished(self, finished_req_ids: set[str] | list[str]) -> None:
+        histories = getattr(self, "_minicpmo45_duplex_input_histories", {})
+        closed_units = getattr(self, "_minicpmo45_closed_duplex_units", {})
+        chunked_ids = getattr(self, "_minicpmo45_duplex_chunked_token_ids", None)
+        for request_id in finished_req_ids:
+            histories.pop(request_id, None)
+            closed_units.pop(request_id, None)
+            if isinstance(chunked_ids, dict):
+                chunked_ids.pop(request_id, None)
         request_sessions = getattr(self, "_minicpmo45_duplex_request_sessions", None)
         helper = getattr(self, "_minicpmo45_duplex_data_plane_helper", None)
         sessions = getattr(helper, "sessions", None) if helper is not None else None
@@ -911,8 +1105,54 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             logits.shape[0],
             duplex_rows=duplex_rows,
         )
-        if not native_rows or len(native_rows) != logits.shape[0]:
+        if not native_rows:
             return None
+        native_rows = sorted(set(native_rows))
+
+        standard_output = None
+        if len(native_rows) != logits.shape[0]:
+            # Chat and native requests share this Stage0 scheduler. Preserve
+            # the standard sampler (including its logprobs for chat rows),
+            # but never let a mixed batch bypass MiniCPM's native unit policy.
+            # Its unused native samples must not advance request-owned RNG.
+            native_set = set(native_rows)
+            standard_metadata = replace(
+                sampling_metadata,
+                generators={
+                    row: generator.clone_state() if row in native_set else generator
+                    for row, generator in sampling_metadata.generators.items()
+                },
+            )
+            # The standard sampler mutates logits; native rows below still need the originals.
+            standard_output = self.sampler(logits.clone(), standard_metadata)
+
+        if getattr(getattr(self, "config", None), "gander_unit8", False):
+            sampled_ids: list[int] = []
+            for row_idx in native_rows:
+                if row_idx in getattr(self, "_minicpmo45_discarded_duplex_rows", ()):
+                    # Partial prefills (including KV recomputation) have no
+                    # delivered sample. Do not advance session policy or RNG for
+                    # a token the runner will discard.
+                    sampled_ids.append(0)
+                    continue
+                # The grammar sampler clones before masking; keep this slice
+                # as a view to avoid a second vocabulary-sized copy per row.
+                row_logits = logits[row_idx : row_idx + 1]
+                sampled = self._sample_gander_dialogue_row(
+                    row_logits,
+                    sampling_metadata,
+                    row_idx=row_idx,
+                    token_ids=token_ids,
+                )
+                self._record_minicpmo45_duplex_terminator(row_idx, sampled, token_ids)
+                sampled_ids.append(sampled)
+            native_ids = torch.tensor(sampled_ids, device=logits.device, dtype=torch.int32).unsqueeze(-1)
+            if standard_output is not None:
+                standard_output.sampled_token_ids[native_rows] = native_ids
+                # Native requests do not request standard LM logprobs; chat rows
+                # retain the untouched logprob tensors returned by vLLM.
+                return standard_output
+            return SamplerOutput(sampled_token_ids=native_ids, logprobs_tensors=None)
 
         chunk_terminators = self._minicpmo45_chunk_terminator_token_ids(token_ids)
         output_token_ids = getattr(sampling_metadata, "output_token_ids", None) or []
@@ -922,7 +1162,10 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         # Lookahead after a chunk terminator: re-emit it and skip sampling.
         sampled_ids: list[int] = [-1] * num_rows
         pending_rows: list[int] = []
-        for row_idx in range(num_rows):
+        for row_idx in native_rows:
+            if row_idx in getattr(self, "_minicpmo45_discarded_duplex_rows", ()):
+                sampled_ids[row_idx] = 0
+                continue
             accepted = output_token_ids[row_idx] if row_idx < len(output_token_ids) else []
             last_accepted = next((int(t) for t in reversed(accepted) if isinstance(t, int) and t >= 0), None)
             if last_accepted in chunk_terminators:
@@ -936,16 +1179,20 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             if deferred is not None:
                 sampled = index_to_device(sampled_ids, logits.device, torch.int32)
                 sampled[index_to_device(pending_rows, logits.device)] = deferred.to(torch.int32)
+                if standard_output is not None:
+                    standard_output.sampled_token_ids[native_rows] = sampled[native_rows].unsqueeze(-1)
+                    return standard_output
                 return SamplerOutput(sampled_token_ids=sampled.unsqueeze(-1), logprobs_tensors=None)
             synchronous = self._sample_minicpmo45_native_duplex_rows(logits, sampling_metadata, **kwargs)
             for row_idx, sampled in zip(pending_rows, synchronous, strict=True):
                 sampled_ids[row_idx] = sampled
                 self._record_minicpmo45_duplex_terminator(row_idx, sampled, token_ids)
 
-        return SamplerOutput(
-            sampled_token_ids=index_to_device(sampled_ids, logits.device, torch.int32).unsqueeze(-1),
-            logprobs_tensors=None,
-        )
+        sampled = index_to_device(sampled_ids, logits.device, torch.int32).unsqueeze(-1)
+        if standard_output is not None:
+            standard_output.sampled_token_ids[native_rows] = sampled[native_rows]
+            return standard_output
+        return SamplerOutput(sampled_token_ids=sampled, logprobs_tensors=None)
 
     def _minicpmo45_duplex_row_params(
         self,
@@ -954,6 +1201,8 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
     ) -> list[tuple[float, float, float]]:
         """Every row's (temperature, top_k, top_p): host copies when present, else one device read per parameter."""
         host = getattr(self, "_minicpmo45_duplex_row_sampling_host", None) or {}
+        if host.keys() >= set(range(num_rows)):
+            return [tuple(float(v) for v in host[row]) for row in range(num_rows)]
         columns = []
         for column, (name, default) in enumerate((("temperature", 0.7), ("top_k", 100), ("top_p", 0.8))):
             value = getattr(sampling_metadata, name, None)
@@ -1096,13 +1345,10 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         forbidden_index = self._minicpmo45_duplex_forbidden_index(token_ids, vocab, device)
         if forbidden_index is not None:
             stage2_logits.index_fill_(1, forbidden_index, float("-inf"))
-        history_size = MiniCPMO45DuplexPolicy.REPETITION_HISTORY_SIZE
         penalty_rows: list[int] = []
         penalty_cols: list[int] = []
         for local_idx, row_idx in enumerate(rows):
-            state = self._minicpmo45_duplex_state_for_row(row_idx)
-            repetition_tokens = getattr(state, "generated_tokens", None) or recent[row_idx]
-            penalized = [token_id for token_id in set(repetition_tokens[-history_size:]) if 0 <= token_id < vocab]
+            penalized = self._minicpmo45_duplex_repetition_tokens(row_idx, recent[row_idx], vocab)
             penalty_rows.extend([local_idx] * len(penalized))
             penalty_cols.extend(penalized)
         if penalty_rows:
@@ -1310,6 +1556,87 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         finally:
             self._minicpmo45_duplex_row_sessions, self._minicpmo45_duplex_row_payloads = saved
 
+    def _sample_gander_dialogue_row(self, logits, sampling_metadata, *, row_idx, token_ids):
+        payload = self._minicpmo45_duplex_payload_for_row(row_idx)
+        if isinstance(payload, dict) and payload.get("gander_replay"):
+            history = payload.get("gander_replay_output_ids", [])
+            return int(history[-1]) if history else token_ids["listen_token_id"]
+        from vllm_omni.model_executor.models.minicpmo_4_5.gander_tools import current_unit, tool_constraint
+
+        history = getattr(sampling_metadata, "output_token_ids", None) or []
+        row_history = list(history[row_idx]) if row_idx < len(history) else []
+        recent = current_unit(row_history, token_ids)
+        state = self._minicpmo45_duplex_state_for_row(row_idx)
+        allow, constrained = tool_constraint(
+            recent, token_ids, enabled=bool(getattr(state, "gander_tools_enabled", False))
+        )
+        # This row is a view of batch logits; grammar masking must stay local.
+        logits = logits.clone()
+        if allow:
+            masked = torch.full_like(logits, float("-inf"))
+            masked[:, list(constrained)] = logits[:, list(constrained)]
+            logits = masked
+        else:
+            logits[:, list(constrained)] = float("-inf")
+        eos_id = getattr(self._minicpmo45_tokenizer(), "eos_token_id", None)
+        if isinstance(eos_id, int) and 0 <= eos_id < logits.shape[-1]:
+            logits[:, eos_id] = float("-inf")
+        host_params = (getattr(self, "_minicpmo45_duplex_row_sampling_host", None) or {}).get(row_idx)
+        temperature = float(
+            host_params[0]
+            if host_params is not None
+            else self._sampling_metadata_value(sampling_metadata, "temperature", row_idx, 0.7)
+        )
+        greedy = bool(getattr(sampling_metadata, "all_greedy", False)) or temperature <= 0
+        generator = getattr(sampling_metadata, "generators", {}).get(row_idx)
+        chunk_eos_id = token_ids["chunk_eos_token_id"]
+        boundary_allowed = chunk_eos_id in constrained if allow else chunk_eos_id not in constrained
+        if boundary_allowed:
+            # The released decoder decides the boundary before repetition,
+            # temperature or nucleus filtering, using the grammar-masked logits.
+            if greedy:
+                boundary = int(logits.argmax(dim=-1).item()) == chunk_eos_id
+            else:
+                boundary = bool(
+                    (
+                        torch.rand((), generator=generator, device=logits.device)
+                        < self._duplex_boundary_chunk_eos_probs(logits, chunk_eos_id)[0]
+                    ).item()
+                )
+            if boundary:
+                return chunk_eos_id
+        logits[:, chunk_eos_id] = float("-inf")
+        # Gander keeps decoder history in the state, including across replay.
+        # Scheduler output also contains forced LISTEN units, so it cannot
+        # supply a fallback when no token has been sampled yet.
+        penalized = self._minicpmo45_duplex_repetition_tokens(row_idx, [], logits.shape[-1])
+        if penalized:
+            logits[:, penalized] /= 1.05
+        if greedy:
+            sampled = int(logits.argmax(dim=-1).item())
+        else:
+            logits = self._top_k_top_p_filter(
+                logits / temperature,
+                top_k=int(
+                    host_params[1]
+                    if host_params is not None
+                    else self._sampling_metadata_value(sampling_metadata, "top_k", row_idx, 20)
+                ),
+                top_p=float(
+                    host_params[2]
+                    if host_params is not None
+                    else self._sampling_metadata_value(sampling_metadata, "top_p", row_idx, 0.8)
+                ),
+            )
+            sampled = int(torch.multinomial(F.softmax(logits, dim=-1), 1, generator=generator).item())
+        self._record_minicpmo45_duplex_generation_token(row_idx, sampled)
+        return sampled
+
+    def _minicpmo45_duplex_repetition_tokens(self, row_idx: int, recent: list[int], vocab: int) -> list[int]:
+        state = self._minicpmo45_duplex_state_for_row(row_idx)
+        history = getattr(state, "generated_tokens", None) or recent
+        return [t for t in set(history[-MiniCPMO45DuplexPolicy.REPETITION_HISTORY_SIZE :]) if 0 <= t < vocab]
+
     def _maybe_cut_minicpmo45_native_duplex_text_chunk(
         self,
         sampled: int,
@@ -1438,21 +1765,69 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         boundary, and the model's listen/speak policy depends on seeing its own
         past decisions. Text clears the turn-ended latch; <|turn_eos|> sets it
         without becoming pending, because it was forwarded in this unit."""
+        unit = getattr(self, "_minicpmo45_duplex_row_units", {}).get(row_idx)
+        chunk_terminators = self._minicpmo45_chunk_terminator_token_ids(token_ids)
+        if getattr(getattr(self, "config", None), "gander_unit8", False):
+            chunk_terminators.add(token_ids.get("interrupt_token_id", -1))
+        if unit is not None and unit[1] is not None and sampled in chunk_terminators:
+            if not hasattr(self, "_minicpmo45_closed_duplex_units"):
+                self._minicpmo45_closed_duplex_units = {}
+            self._minicpmo45_closed_duplex_units[unit[0]] = unit[1]
         state = self._minicpmo45_duplex_state_for_row(row_idx)
         if state is None:
             return
         payload = self._minicpmo45_duplex_payload_for_row(row_idx)
+        if getattr(getattr(self, "config", None), "gander_unit8", False):
+            if isinstance(payload, dict) and payload.get("gander_replay"):
+                state.pending_terminator_token = int(sampled)
+                state.last_terminator_token = int(sampled)
+                return
+            if isinstance(payload, dict) and payload.get("gander_control") and payload.get("force_listen"):
+                # A slate changes model context, not the active speech turn.
+                state.pending_terminator_token = int(sampled)
+                state.last_terminator_token = int(sampled)
+                return
+            if sampled == token_ids.get("tool_call_token_id"):
+                state.gander_tool_active = True
+            if getattr(state, "gander_tool_active", False):
+                state.current_turn_ended = True
+                if sampled == token_ids.get("chunk_eos_token_id"):
+                    state.gander_tool_active = False
+                    state.pending_terminator_token = sampled
+                    state.last_terminator_token = sampled
+                return
+        chunk_eos_id = token_ids.get("chunk_eos_token_id", -1)
         force_listen = isinstance(payload, dict) and payload.get("force_listen") is True
         listen_id = token_ids.get("listen_token_id", -1)
         tts_bos_id = token_ids.get("tts_bos_token_id", -1)
         turn_eos_id = token_ids.get("turn_eos_token_id", -1)
-        if sampled in self._minicpmo45_chunk_terminator_token_ids(token_ids):
+        interrupt_id = (
+            token_ids.get("interrupt_token_id", -1)
+            if getattr(getattr(self, "config", None), "gander_unit8", False)
+            else -1
+        )
+        terminators = self._minicpmo45_chunk_terminator_token_ids(token_ids)
+        if getattr(getattr(self, "config", None), "gander_unit8", False):
+            terminators |= {turn_eos_id, interrupt_id}
+        if sampled in terminators:
             state.pending_terminator_token = int(sampled)
             state.last_terminator_token = int(sampled)
-            if sampled == listen_id and force_listen:
+            if sampled in {turn_eos_id, interrupt_id} or (sampled == listen_id and force_listen):
                 state.current_turn_ended = True
                 with suppress(Exception):
                     state.pending_speech_response_open = False
+                    state.pending_turn_end_identity = None
+                    state.pending_post_turn_eos_chunk = True
+            elif sampled == chunk_eos_id and getattr(state, "pending_post_turn_eos_chunk", False):
+                # Consume the second half of the deterministic
+                # <|turn_eos|>, <|chunk_eos|> close sequence without reopening
+                # the completed turn.
+                state.pending_post_turn_eos_chunk = False
+            elif sampled == listen_id and force_listen:
+                state.current_turn_ended = True
+                with suppress(Exception):
+                    state.pending_speech_response_open = False
+                    state.pending_turn_end_identity = None
             return
         if sampled == turn_eos_id:
             # Official streaming_generate feeds <|turn_eos|> like text (its
@@ -1525,6 +1900,10 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             return cached
         tokenizer = self._minicpmo45_tokenizer()
         cached = MiniCPMO45DuplexPolicy.token_ids_from_tokenizer(tokenizer)
+        if getattr(getattr(self, "config", None), "gander_unit8", False):
+            from vllm_omni.model_executor.models.minicpmo_4_5.gander import control_token_ids
+
+            cached.update(control_token_ids(tokenizer))
         self._minicpmo45_native_duplex_token_ids_cache = cached
         return cached
 

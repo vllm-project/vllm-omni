@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from vllm.logger import init_logger
+from vllm.v1.engine import FinishReason
 
 from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
 from vllm_omni.engine import OmniEngineCoreRequest
@@ -188,6 +189,41 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
             stage_metrics,
             request_id=request_id,
             context=context,
+        )
+
+    async def _report_duplex_session_request_error(
+        self,
+        stage_id: int,
+        replica_id: int | None,
+        eco: Any,
+        req_state: OrchestratorRequestState,
+    ) -> None:
+        if not req_state.session_owned:
+            return
+        if getattr(eco, "finish_reason", None) != FinishReason.ERROR:
+            return
+        if getattr(eco, "is_segment_finished", False):
+            return
+        runner = self.session_manager.runner_for_request_id(req_state.request_id)
+        fence = (
+            req_state.stage_fences.get(stage_id, req_state.fence)
+            if isinstance(req_state, DuplexOrchestratorRequestState)
+            else None
+        )
+        if runner is not None and fence is not None and fence.epoch != runner.session.epoch:
+            return
+        await super()._report_duplex_session_request_error(stage_id, replica_id, eco, req_state)
+        if runner is None:
+            return
+        # Reporting can yield while cancellation or reconstruction advances the
+        # session. A retired request must never fail its successor's journal.
+        if fence is not None and fence.epoch != runner.session.epoch:
+            return
+        stop_reason = getattr(eco, "stop_reason", None)
+        runner.on_request_error(
+            stage_id,
+            req_state.request_id,
+            stop_reason if isinstance(stop_reason, str) and stop_reason else "duplex session request failed",
         )
 
     async def _handle_forward_failure(
