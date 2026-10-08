@@ -309,6 +309,10 @@ def _ensure_tensor_values(payload: dict[str, object]) -> dict[str, torch.Tensor]
     """
     result: dict[str, torch.Tensor] = {}
     for key, val in payload.items():
+        # Sparse per-request conditioning uses None for requests with no
+        # update. Absence is expected, not an unsupported wire value.
+        if val is None:
+            continue
         if isinstance(val, torch.Tensor):
             result[key] = val
         elif isinstance(val, (int, float, bool)):
@@ -1817,6 +1821,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         if not needs_pooler_payload and prefix_cache_step_id is not None:
             # No consumer for this step's merge: consume the step context by
             # id (exactly-once contract). The cache write still lands.
+            assert self.omni_prefix_cache is not None
             self.omni_prefix_cache.discard_step(prefix_cache_step_id)
             prefix_cache_step_id = None
         if self.omni_prefix_cache is None and needs_scheduled_hidden_payload and not audio_sparse_output:

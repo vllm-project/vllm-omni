@@ -224,7 +224,7 @@ def test_streaming_payload_can_replace_placeholder_prompt(mocker: MockerFixture)
 
 def test_turn_start_replacement_ignores_accumulated_prompt_capacity(mocker: MockerFixture) -> None:
     request = _streaming_request(mocker, num_computed_tokens=4064)
-    payload = {
+    payload: dict = {
         "ids": {"prompt": [1]},
         "meta": {
             "replace_streaming_prompt": True,
@@ -336,7 +336,7 @@ def test_streaming_window_builds_one_chunk_recompute_recipe(mocker: MockerFixtur
         num_output_placeholders=1,
         update_block_hashes=mocker.Mock(),
     )
-    payload = {
+    payload: dict = {
         "ids": {"prompt": [1]},
         "meta": {
             "next_stage_prompt_len": 10,
@@ -406,7 +406,7 @@ def test_streaming_window_appends_until_capacity_then_recomputes(mocker: MockerF
         num_output_placeholders=0,
         update_block_hashes=mocker.Mock(),
     )
-    second = {
+    second: dict = {
         "ids": {"prompt": [1]},
         "meta": {
             "next_stage_prompt_len": 12,
@@ -432,7 +432,7 @@ def test_streaming_window_appends_until_capacity_then_recomputes(mocker: MockerF
     request._all_token_ids.extend([201, 202, 203])
     request._output_token_ids.extend([201, 202, 203])
     request.num_computed_tokens = 4017
-    third = {
+    third: dict = {
         "ids": {"prompt": [2]},
         "meta": {
             "next_stage_prompt_len": 60,
@@ -458,7 +458,7 @@ def test_streaming_window_appends_until_capacity_then_recomputes(mocker: MockerF
     request._all_token_ids.extend([301])
     request._output_token_ids.extend([301])
     request.num_computed_tokens = 76
-    fourth = {
+    fourth: dict = {
         "ids": {"prompt": [3]},
         "meta": {
             "next_stage_prompt_len": 8,
@@ -1806,7 +1806,7 @@ def test_sender_only_adapter_does_not_park_or_clear_requests(build_adapter):
     request = _req("req-1", RequestStatus.WAITING)
     request.additional_information = {"tts_token_ids": torch.tensor([1])}
     waiting_queue = DummyWaitingQueue([request])
-    running_queue = []
+    running_queue: list = []
 
     adapter.load_async(request)
     adapter.process_pending_chunks(
@@ -1846,7 +1846,7 @@ def test_fifo_promotion(build_adapter):
     adapter, _ = build_adapter(stage_id=1, model_mode="generation", max_num_seqs=2, active_stream_window=2)
     reqs = [_req(f"req-{idx}", RequestStatus.WAITING) for idx in range(1, 5)]
     waiting_queue = DummyWaitingQueue(reqs)
-    running_queue = []
+    running_queue: list = []
 
     adapter.process_pending_chunks(waiting_queue, running_queue)
 
@@ -1876,7 +1876,7 @@ def test_non_active_waiting_request_is_held_off_scheduler(build_adapter):
     active = _req("req-active", RequestStatus.WAITING)
     non_active = _req("req-non-active", RequestStatus.WAITING)
     waiting_queue = DummyWaitingQueue([active, non_active])
-    running_queue = []
+    running_queue: list = []
 
     adapter.process_pending_chunks(waiting_queue, running_queue)
 
@@ -1911,7 +1911,7 @@ def test_finished_releases_slot(build_adapter):
     req_1 = _req("req-1", RequestStatus.WAITING)
     req_2 = _req("req-2", RequestStatus.WAITING)
     waiting_queue = DummyWaitingQueue([req_1, req_2])
-    running_queue = []
+    running_queue: list = []
 
     adapter.process_pending_chunks(waiting_queue, running_queue)
     assert list(adapter._active_streams) == ["req-1"]
@@ -2004,7 +2004,7 @@ def test_cleanup_receiver_releases_multiple_slots_in_sequence(build_adapter):
     adapter, _ = build_adapter(stage_id=1, model_mode="generation", max_num_seqs=2, active_stream_window=2)
     reqs = [_req(f"req-{idx}", RequestStatus.WAITING) for idx in range(1, 5)]
     waiting_queue = DummyWaitingQueue(reqs)
-    running_queue = []
+    running_queue: list = []
 
     adapter.process_pending_chunks(waiting_queue, running_queue)
     assert list(adapter._active_streams) == ["req-1", "req-2"]
@@ -2364,7 +2364,7 @@ def test_finish_requests_releases_active_stream_slot(build_adapter):
     aborted = _req("req-aborted", RequestStatus.RUNNING)
     waiting = _req("req-waiting", RequestStatus.WAITING)
     waiting_queue = DummyWaitingQueue([waiting])
-    running_queue = []
+    running_queue: list = []
     adapter._active_streams[aborted.request_id] = aborted
     adapter._held_non_active.append(aborted)
 
@@ -2488,7 +2488,7 @@ def test_restore_queues_skips_requests_missing_from_scheduler_requests(build_ada
     zombie = _req("req-zombie", RequestStatus.WAITING_FOR_CHUNK)
     live = _req("req-live", RequestStatus.WAITING_FOR_CHUNK)
     waiting_queue = DummyWaitingQueue()
-    running_queue = []
+    running_queue: list = []
     adapter.waiting_for_chunk_waiting_requests = deque([zombie, live])
     adapter.waiting_for_chunk_running_requests = deque([zombie, live])
 
@@ -2522,7 +2522,7 @@ class _HashableRequest(SimpleNamespace):
     # double needs it too.
     num_stale_output_tokens = 0
 
-    def __hash__(self):
+    def __hash__(self):  # type: ignore[override]  # Test requests are hashable by request ID.
         return hash(self.request_id)
 
     def __eq__(self, other):
@@ -2540,6 +2540,8 @@ def test_generation_scheduler_calls_cleanup_on_finished(monkeypatch, mocker: Moc
     from vllm_omni.core.sched.omni_generation_scheduler import OmniGenerationScheduler
 
     scheduler = mocker.MagicMock()
+    scheduler._first_chunk_express = False
+    scheduler._express_min_slack_s = 0.0
     scheduler.chunk_transfer_adapter = adapter_mock
     scheduler.connector = None
     scheduler.ec_connector = None

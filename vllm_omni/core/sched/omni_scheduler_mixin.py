@@ -8,7 +8,7 @@ import os
 import queue
 import time
 from collections.abc import Iterable, Iterator
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 from vllm.compilation.cuda_graph import CUDAGraphStat
@@ -44,6 +44,7 @@ from vllm_omni.core.sched.output import (
 from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter import (
     OmniChunkTransferAdapter,
 )
+from vllm_omni.distributed.omni_connectors.utils.config import stage_receives_chunks
 from vllm_omni.engine import OmniEngineCoreOutput
 from vllm_omni.engine.serialization import serialize_additional_information
 from vllm_omni.outputs import OmniConnectorOutput
@@ -104,7 +105,13 @@ elif DEFAULT_INPUT_WAIT_TIMEOUT_S == 0:
     )
 
 
-class OmniSchedulerMixin:
+if TYPE_CHECKING:
+    from vllm.v1.core.sched.scheduler import Scheduler as _SchedulerMixinBase
+else:
+    _SchedulerMixinBase = object
+
+
+class OmniSchedulerMixin(_SchedulerMixinBase):
     """Shared scheduler helpers for omni-specific request handling."""
 
     # Provided by the concrete vLLM scheduler.
@@ -127,17 +134,12 @@ class OmniSchedulerMixin:
 
     def _init_omni_io_scheduling_state(self) -> None:
         """Initialize scheduler state shared by AR and generation stages."""
-        # Every omni worker forces the v1 model runner (the v2 runner carries no
-        # omni hooks), so the scheduler has to agree or the two disagree about
-        # what the SchedulerOutput carries. vLLM 0.29 defaults this to v2 where
-        # 0.28 did not, so the scheduler took its v2 fast path -- the one that
-        # deliberately omits resumed-request token ids -- while the v1 runner
-        # still read them, and resuming a request raised ``KeyError: <req_id>``
-        # in ``_update_states``.
-        if getattr(self, "use_v2_model_runner", False):
-            logger.warning("OMNI scheduler forces v1 model runner for omni hooks.")
-            self.use_v2_model_runner = False
-
+        # The scheduler must agree with the stage's worker about which runner
+        # consumes its SchedulerOutput: vLLM's own default (v2 since 0.29) would
+        # take the v2 fast path, which omits resumed-request token ids, while a
+        # v1 omni runner still reads them (``KeyError: <req_id>`` in
+        # ``_update_states``). The stage's model config carries the choice
+        # (deploy ``model_runner``, optionally per stage).
         model_config = self.vllm_config.model_config
         self.use_v2_model_runner = bool(getattr(model_config, "use_v2_model_runner", False))
         self._native_data_plane = uses_native_mrv2_data_plane(
@@ -150,7 +152,14 @@ class OmniSchedulerMixin:
             else None
         )
         self.input_coordinator: OmniSchedulingCoordinator | None = None
-        if self._native_data_plane and getattr(model_config, "async_chunk", False):
+        if (
+            self._native_data_plane
+            and getattr(model_config, "async_chunk", False)
+            # A downstream sender-only stage (e.g. MiniCPM-o's Talker, fed by
+            # the orchestrator) has no connector input to wait for; parking
+            # its requests for chunks would never release them.
+            and (getattr(model_config, "stage_id", 0) == 0 or stage_receives_chunks(model_config))
+        ):
             self.input_coordinator = OmniSchedulingCoordinator(
                 scheduler_max_num_seqs=self.vllm_config.scheduler_config.max_num_seqs,
                 stage_id=getattr(model_config, "stage_id", 0),
@@ -825,6 +834,8 @@ class OmniSchedulerMixin:
     def _resume_downstream_chunk_receiver(self, request: Request) -> None:
         """Resume duplex connector polling without an external update."""
         adapter = self.chunk_transfer_adapter
+        if adapter is None:
+            return
         adapter.segment_finished_requests.discard(request.request_id)
         if (
             not adapter.receives_chunks
