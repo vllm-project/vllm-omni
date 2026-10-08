@@ -484,7 +484,10 @@ class CudaOmniPlatform(OmniPlatform, CudaPlatformBase):
         current_platform.import_ir_kernels()
         op = IrOp.registry.get(op_name)
         if op is None:
-            return list(providers)
+            # Unknown op: passing `providers` through unfiltered would
+            # reintroduce the unregistered-provider assert downstream, so
+            # fall back to the always-registered `native`.
+            return ["native"]
         registered = [p for p in providers if p in op.impls]
         if not registered:
             # `native` is always registered; it is the dispatch fallback.

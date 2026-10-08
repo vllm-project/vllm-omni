@@ -117,3 +117,16 @@ def test_cuda_default_ir_op_priority_drops_unregistered_providers(monkeypatch: p
     # every field against the patched (vllm_c-less) registry.
     with priority.set_priority():
         pass
+
+
+def test_registered_only_unknown_op_falls_back_to_native(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An op missing from the registry must not pass providers through.
+
+    Returning the unfiltered list for an unknown op would reintroduce the
+    unregistered-provider assert in ``IrOp._filter_priority_impls``; the
+    fallback must be ``native`` only.
+    """
+    from vllm.ir.op import IrOp
+
+    monkeypatch.setattr(IrOp, "registry", {k: v for k, v in IrOp.registry.items() if k != "rms_norm"})
+    assert CudaOmniPlatform._registered_only(["vllm_c", "native"], "rms_norm") == ["native"]
