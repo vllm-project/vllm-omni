@@ -203,7 +203,7 @@ python -m pytest -v -s --tb=short \
   tests/diffusion/models/cosmos3/test_cosmos3_strategy_ulysses.py -m cpu
 ```
 
-Validation on two Hopper GPUs passed all three strategy CUDA cases: Ulysses
+Before the foundation rebase, validation on two Hopper GPUs passed all three strategy CUDA cases: Ulysses
 without CPU offload, with model-level offload, and with layerwise offload.
 Shared sparse head-shard and padding coverage lives in
 `tests/diffusion/models/cosmos3/test_cosmos3_sparse_ulysses.py`.
@@ -212,3 +212,8 @@ execution, output parity, and graph reuse after warmup. The CuTe `AuxData`
 argument warning and PyTorch collective deprecation warnings did not prevent
 these checks from passing; this does not establish full-checkpoint generation
 quality or throughput.
+
+The foundation rebase preserves Cosmos3 sharding before the generation stack,
+including ownership of the rank-local embeddings. Post-rebase validation uses
+a single GH200 with vLLM 0.31.0 and FA4 `4.0.0b33`; two-GPU CUDA cases
+and full-checkpoint generation benchmarks have not been rerun after this rebase.
