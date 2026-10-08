@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from types import SimpleNamespace
-
 import pytest
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionImpl, AttentionMetadata
@@ -14,6 +12,7 @@ from vllm_omni.diffusion.attention.backends.trtllm_calibration import (
     resolve_layer_calibration,
     select_expert,
 )
+from vllm_omni.diffusion.attention.layer import _PreparedCandidate
 from vllm_omni.diffusion.data import AttentionSpec
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
@@ -160,8 +159,8 @@ class _FakeImpl(AttentionImpl[AttentionMetadata]):
         self.stamped = (a, b)
 
 
-def _candidate(impl: _FakeImpl, spec: AttentionSpec | None = None) -> SimpleNamespace:
-    return SimpleNamespace(
+def _candidate(impl: _FakeImpl, spec: AttentionSpec | None = None) -> _PreparedCandidate:
+    return _PreparedCandidate(
         backend_cls=TrtllmAttentionBackend,
         spec=spec,
         impl_cls=_FakeImpl,
