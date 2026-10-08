@@ -197,6 +197,8 @@ def test_bf16_vs_fp8_generation_consistency():
 # vocabulary/head under FP8 end to end.
 
 _AR_PATCH_SIZE = 16
+_T2I_IMAGE_SIZE = (256, 256)  # PIL (width, height)
+_T2I_IMAGE_COUNT = 1
 
 # Dev (Qwen3-VL) and Preview (Qwen2.5-VL) share the same vision token ids.
 _IMAGE_TOKEN_ID = 151655
@@ -251,7 +253,7 @@ def _generate_t2i_image(model: str, quantization: str | None) -> torch.Tensor:
     visual_start = int(gen_cfg["visual_token_start_id"])
     visual_end = int(gen_cfg["visual_token_end_id"])
 
-    height, width = 256, 256  # small for CI speed
+    width, height = _T2I_IMAGE_SIZE  # small for CI speed
     ar_height, ar_width = height // _AR_PATCH_SIZE, width // _AR_PATCH_SIZE
     expected_grid_tokens = ar_height * (ar_width + 1)
 
@@ -296,30 +298,74 @@ def _generate_t2i_image(model: str, quantization: str | None) -> torch.Tensor:
             )
         )
 
-    return _extract_image_tensor(outputs)
+    return _extract_image_tensor(outputs, expected_size=(width, height))
 
 
-def _extract_image_tensor(outputs) -> torch.Tensor:
-    """Extract the decoded image as a ``(C, H, W)`` float tensor in ``[0, 1]``.
+def _assert_finite_image_payload(payload, context: str) -> None:
+    """Reject non-finite raw image tensors before PIL conversion can mask them."""
+    if isinstance(payload, torch.Tensor):
+        assert bool(torch.isfinite(payload).all()), (
+            f"non-finite values (NaN/Inf) in {context}"
+        )
+    elif isinstance(payload, (list, tuple)):
+        for index, item in enumerate(payload):
+            _assert_finite_image_payload(item, f"{context}[{index}]")
 
-    Reuses the official ``extract_images_from_outputs`` helper, which knows all
-    the payload shapes (``OmniRequestOutput.images`` plus the ``"image"`` /
-    ``"images"`` / ``"model_outputs"`` multimodal keys).
+
+def _check_raw_image_tensors(outputs) -> None:
+    """Inspect the image-bearing fields handled by the official image helper."""
+    from collections.abc import Mapping
+
+    def check_multimodal(value, context: str) -> None:
+        if hasattr(value, "to_dict") and callable(value.to_dict):
+            value = value.to_dict()
+        if isinstance(value, Mapping):
+            for key in ("image", "images", "model_outputs"):
+                if key in value:
+                    _assert_finite_image_payload(value[key], f"{context}.{key}")
+
+    for index, output in enumerate(outputs):
+        # OmniRequestOutput.images is the first source used by the helper.
+        _assert_finite_image_payload(
+            getattr(output, "images", None), f"outputs[{index}].images"
+        )
+        check_multimodal(
+            getattr(output, "multimodal_output", None),
+            f"outputs[{index}].multimodal_output",
+        )
+        for completion_index, completion in enumerate(getattr(output, "outputs", None) or []):
+            check_multimodal(
+                getattr(completion, "multimodal_output", None),
+                f"outputs[{index}].outputs[{completion_index}].multimodal_output",
+            )
+
+
+def _extract_image_tensor(
+    outputs, expected_size: tuple[int, int] = _T2I_IMAGE_SIZE
+) -> torch.Tensor:
+    """Validate one RGB image of requested size and return CHW floats in [0, 1].
+
+    Validate raw tensor finiteness *before* the official helper converts image
+    tensors to uint8 PIL images (which could otherwise mask NaN/Inf values).
     """
     import numpy as np
 
     from vllm_omni.diffusion.utils.image_output import extract_images_from_outputs
 
+    _check_raw_image_tensors(outputs)
     images = extract_images_from_outputs(outputs)
-    if not images:
-        debug = [
-            f"{type(out).__name__}(images={getattr(out, 'images', None)!r}, "
-            f"mm={getattr(out, 'multimodal_output', None)!r})"
-            for out in outputs
-        ]
-        raise AssertionError(f"no image tensor found in pipeline output; outputs={debug}")
+    assert len(images) == _T2I_IMAGE_COUNT, (
+        f"expected {_T2I_IMAGE_COUNT} generated image(s), got {len(images)}"
+    )
 
-    arr = np.asarray(images[0], dtype=np.float32) / 255.0  # (H, W, C)
+    image = images[0]
+    assert image.size == expected_size, (
+        f"expected image size {expected_size}, got {image.size}"
+    )
+    assert image.mode == "RGB", f"expected RGB image, got {image.mode}"
+
+    arr = np.asarray(image, dtype=np.float32) / 255.0  # (H, W, C)
+    assert np.isfinite(arr).all(), "decoded image contains NaN/Inf"
     return torch.from_numpy(arr).permute(2, 0, 1)  # (C, H, W)
 
 
@@ -359,7 +405,12 @@ def test_bf16_vs_fp8_t2i_image_consistency():
     bf16_img = _generate_t2i_image(MODEL_PATH, None)
     fp8_img = _generate_t2i_image(MODEL_PATH, "fp8")
 
-    assert bf16_img.shape == fp8_img.shape, (bf16_img.shape, fp8_img.shape)
+    expected_shape = (3, _T2I_IMAGE_SIZE[1], _T2I_IMAGE_SIZE[0])
+    for name, image in (("BF16", bf16_img), ("FP8", fp8_img)):
+        assert image.shape == expected_shape, (
+            f"{name} produced shape {tuple(image.shape)}, expected {expected_shape}"
+        )
+        assert bool(torch.isfinite(image).all()), f"{name} image contains NaN/Inf"
 
     metrics = _image_metrics(bf16_img, fp8_img)
 
