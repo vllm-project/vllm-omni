@@ -1,6 +1,38 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import pytest
+import torch
+from torch import nn
+
+from vllm_omni.model_executor.models.qwen2_5_omni.qwen2_5_omni_token2wav import (
+    Qwen2_5OmniToken2WavForConditionalGenerationVLLM,
+)
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+class _BufferModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.state_dict_calls = 0
+        self.register_buffer("persistent", torch.ones(1))
+        self.register_buffer("temporary", torch.ones(1), persistent=False)
+        self.child = nn.Module()
+        self.child.register_buffer("persistent", torch.ones(1))
+
+    def state_dict(self, *args, **kwargs):
+        self.state_dict_calls += 1
+        return super().state_dict(*args, **kwargs)
+
+
+def test_token2wav_buffer_discovery_avoids_state_dict():
+    model = _BufferModel()
+
+    buffers = Qwen2_5OmniToken2WavForConditionalGenerationVLLM.find_all_registers(model)
+
+    assert set(buffers) == {"persistent", "child.persistent"}
+    assert model.state_dict_calls == 0
 
 
 class TestQwen2_5OmniWeightLoading:

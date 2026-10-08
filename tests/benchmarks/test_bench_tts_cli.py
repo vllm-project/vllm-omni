@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Tests for the universal benchmarks/tts/bench_tts.py CLI."""
 
 from __future__ import annotations
@@ -49,6 +52,73 @@ def test_load_model_configs(model_configs_path: Path) -> None:
     assert "test/ModelA" in configs
     assert "test/ModelB" in configs
     assert configs["test/ModelA"]["supported_tasks"] == ["voice_clone", "default_voice"]
+
+
+@pytest.mark.parametrize("model", ["tencent/AuK", "tencent/AuK-Flash"])
+@pytest.mark.parametrize("task", ["default_voice", "voice_clone"])
+def test_auk_benchmark_duration_and_local_bundle(model, task):
+    config = bench_tts.load_model_configs(bench_tts._DEFAULT_MODEL_CONFIGS)[model]
+    cmd = bench_tts.build_bench_args(
+        host="localhost",
+        port=8000,
+        model=model,
+        task=task,
+        model_cfg=config,
+        locale="en",
+        num_prompts=20,
+        concurrency=8,
+        dataset_path="/data/seed-tts",
+        wer_eval=False,
+        output_dir=None,
+        result_filename=None,
+        extra_cli_args=[],
+        served_model_name="/models/auk",
+        duration_seconds=3.5,
+        request_seed=7,
+    )
+    assert cmd[cmd.index("--model") + 1] == "/models/auk"
+    body = json.loads(cmd[cmd.index("--extra-body") + 1])
+    assert body == {
+        "voice": "default",
+        "duration_seconds": 3.5,
+        "seed": 7,
+        "task_type": "CustomVoice" if task == "default_voice" else "Base",
+    }
+    assert config["task_extra_body"][task]["duration_seconds"] == 5.0
+
+
+@pytest.mark.parametrize(
+    ("task", "expected_task_type"),
+    [
+        ("default_voice", "CustomVoice"),
+        ("voice_clone", "Base"),
+    ],
+)
+def test_auk_task_type_survives_served_model_alias(task, expected_task_type):
+    model = "tencent/AuK-Flash"
+    served_model = "models/flash"
+    config = bench_tts.load_model_configs(bench_tts._DEFAULT_MODEL_CONFIGS)[model]
+    cmd = bench_tts.build_bench_args(
+        host="localhost",
+        port=8000,
+        model=model,
+        task=task,
+        model_cfg=config,
+        locale="en",
+        num_prompts=1,
+        concurrency=1,
+        dataset_path="/data/seed-tts",
+        wer_eval=False,
+        output_dir=None,
+        result_filename=None,
+        extra_cli_args=[],
+        served_model_name=served_model,
+    )
+
+    assert cmd[cmd.index("--model") + 1] == served_model
+    extra_body = json.loads(cmd[cmd.index("--extra-body") + 1])
+    assert extra_body["task_type"] == expected_task_type
+    assert "_vllm_omni_benchmark_model" not in extra_body
 
 
 def test_indextts25_is_registered_in_shared_model_configs() -> None:
@@ -173,3 +243,20 @@ def test_unsupported_task_exits(model_configs_path: Path, capsys: pytest.Capture
     )
     with pytest.raises(SystemExit):
         bench_tts.main()
+
+
+def test_summary_table_includes_task_type(capsys: pytest.CaptureFixture) -> None:
+    bench_tts.print_summary_table(
+        [
+            {
+                "_task": "voice_clone",
+                "_task_type": "Base",
+                "_concurrency": 1,
+            }
+        ]
+    )
+
+    output = capsys.readouterr().out
+    assert "Task Type" in output
+    assert "voice_clone" in output
+    assert "Base" in output

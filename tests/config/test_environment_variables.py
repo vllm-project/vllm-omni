@@ -164,12 +164,12 @@ def test_inventory_matches_reviewed_snapshot_counts():
     """Make an inventory expansion an explicit review decision."""
     category_counts = Counter(item.category for item in ENVIRONMENT_VARIABLE_INVENTORY.values())
     assert category_counts == {
-        EnvironmentVariableCategory.PUBLIC_OMNI: 24,
+        EnvironmentVariableCategory.PUBLIC_OMNI: 32,
         EnvironmentVariableCategory.INHERITED_VLLM: 20,
-        EnvironmentVariableCategory.PLATFORM_EXTERNAL: 27,
-        EnvironmentVariableCategory.MODEL_SPECIFIC: 62,
-        EnvironmentVariableCategory.BENCHMARK_TRANSITIONAL: 20,
-        EnvironmentVariableCategory.INTERNAL: 2,
+        EnvironmentVariableCategory.PLATFORM_EXTERNAL: 29,
+        EnvironmentVariableCategory.MODEL_SPECIFIC: 96,
+        EnvironmentVariableCategory.BENCHMARK_TRANSITIONAL: 21,
+        EnvironmentVariableCategory.INTERNAL: 7,
     }
 
     disposition_counts = Counter(
@@ -178,11 +178,11 @@ def test_inventory_matches_reviewed_snapshot_counts():
         if item.category is EnvironmentVariableCategory.MODEL_SPECIFIC
     )
     assert {disposition: disposition_counts[disposition] for disposition in ModelEnvironmentVariableDisposition} == {
-        ModelEnvironmentVariableDisposition.PROMOTE: 37,
-        ModelEnvironmentVariableDisposition.REQUEST_SCOPE: 7,
+        ModelEnvironmentVariableDisposition.PROMOTE: 67,
+        ModelEnvironmentVariableDisposition.REQUEST_SCOPE: 5,
         ModelEnvironmentVariableDisposition.EXTERNAL: 0,
-        ModelEnvironmentVariableDisposition.INTERNALIZE: 13,
-        ModelEnvironmentVariableDisposition.DEPRECATE_REMOVE: 5,
+        ModelEnvironmentVariableDisposition.INTERNALIZE: 17,
+        ModelEnvironmentVariableDisposition.DEPRECATE_REMOVE: 7,
     }
 
 
@@ -190,6 +190,7 @@ def test_new_public_omni_names_use_project_prefix():
     """Grandfather legacy names without allowing more prefix exceptions."""
     legacy_public_names = {
         "DIFFUSION_ATTENTION_BACKEND",
+        "DIFFUSION_ATTENTION_QUANT",
         "DIFFUSION_CACHE_ADAPTER",
         "DIFFUSION_CACHE_BACKEND",
         "OMNI_DIFFUSION_PROMPT_EMBED_CACHE",

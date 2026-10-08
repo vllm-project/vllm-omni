@@ -62,6 +62,27 @@ def _aliased_modules() -> tuple[nn.Module, nn.Module]:
     return left, right
 
 
+@pytest.mark.parametrize("inference_parameter", [False, True])
+def test_inference_staging_preserves_parameter_version_tracking(patched_runtime, mocker, inference_parameter):
+    with torch.inference_mode(inference_parameter):
+        module = nn.Linear(4, 2)
+    with torch.inference_mode():
+        stager = PinnedModuleStager(
+            module, torch.device("cpu"), pin_memory=False, cache_retention=mocker.Mock(spec=BoundedAllocatorCache)
+        )
+        for transition in (stager.load, stager.offload):
+            transition()
+            assert module.weight.is_inference() == inference_parameter
+            assert torch.isfinite(module(torch.ones(1, 4))).all()
+        if inference_parameter:
+            with pytest.raises(RuntimeError, match="version counter"):
+                _ = module.weight._version
+        else:
+            version = module.weight._version
+            module.weight.add_(1)
+            assert module.weight._version == version + 1
+
+
 def test_module_group_preserves_parameter_and_buffer_storage_aliases(patched_runtime, mocker):
     left, right = _aliased_modules()
     expected_left_weight = left.weight.detach().clone()

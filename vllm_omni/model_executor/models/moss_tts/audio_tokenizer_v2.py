@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 # Copyright 2026 OpenMOSS and the HuggingFace Inc. team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -536,11 +539,15 @@ class RingKVCache:
             end_offset = self.end_offset.index_select(0, slots)
             row_cache = self.cache.index_select(1, slots)
 
-            indexes = torch.arange(T, device=end_offset.device, dtype=end_offset.dtype)
+            # Upsampling can make a chunk longer than the ring. Only the last
+            # capacity tokens survive; writing all T tokens gives scatter_
+            # duplicate destinations and nondeterministic cache contents.
+            write_length = min(T, self.capacity)
+            indexes = torch.arange(T - write_length, T, device=end_offset.device, dtype=end_offset.dtype)
             indexes = (indexes + end_offset.view(-1, 1)) % self.capacity
-            scatter_indexes = indexes.view(B, 1, T, 1).expand(-1, H, T, D)
-            row_cache[0].scatter_(2, scatter_indexes, k)
-            row_cache[1].scatter_(2, scatter_indexes, v)
+            scatter_indexes = indexes.view(B, 1, write_length, 1).expand(-1, H, write_length, D)
+            row_cache[0].scatter_(2, scatter_indexes, k[:, :, -write_length:])
+            row_cache[1].scatter_(2, scatter_indexes, v[:, :, -write_length:])
             # Live and graph-padding rows always map to distinct slots. The
             # latter map only to scratch state, so this write cannot corrupt a
             # request even though dense graph operators still execute it.
@@ -726,7 +733,13 @@ class MossAudioTokenizerMultiheadAttention(StreamingModule):
         if self.context is None:
             capacity = self.weights_per_step if self.weights_per_step else 1024
         else:
-            capacity = self.context
+            # RingKVCache.complete writes a whole chunk before attending, so a
+            # ring of exactly ``context`` entries lets a T-token chunk evict up
+            # to T tokens of history that the chunk's own queries should still
+            # see (and, for T > context, evict part of the chunk itself).
+            # ``_ring_headroom`` (max chunk tokens at this layer) keeps every
+            # in-window key resident; 0 preserves the legacy truncation.
+            capacity = self.context + int(getattr(self, "_ring_headroom", 0))
 
         kv_cache = RingKVCache(
             batch_size,
@@ -788,20 +801,63 @@ class MossAudioTokenizerMultiheadAttention(StreamingModule):
         if self.rope:
             q, k = self.rope(q, k, offset, time_before_heads=False)
 
-        k, v, pos_k = self._complete_kv(k, v, execution_context)
-        pos_k = pos_k[:, None]
-
-        if self.causal:
-            pos_q = offset.view(-1, 1, 1) + torch.arange(T, device=q.device, dtype=torch.long).view(-1, 1)
-            delta = pos_q - pos_k
-            attn_bias = (pos_k >= 0) & (delta >= 0)
-            if self.context is not None:
-                attn_bias = attn_bias & (delta < self.context)
-            attn_bias = attn_bias[:, None]
+        slot_attention = getattr(self, "_slot_attention", None)
+        slot_attention_rows = getattr(self, "_slot_attention_rows", None)
+        advance_kv_offset = False
+        slot_path = state is not None and execution_context is not None and self.causal
+        if slot_path and slot_attention_rows is not None:
+            # One launch: the gathered MHA offset equals the ring's end_offset
+            # for every slot, and both advance together below.
+            valid_lengths = execution_context.valid_rows.to(dtype=torch.int32) * T
+            x = slot_attention_rows(
+                q,
+                k,
+                v,
+                state.kv_cache.cache,
+                offset,
+                execution_context.state_slot_ids,
+                valid_lengths,
+                self.context if self.context is not None else -1,
+            )
+            advance_kv_offset = True
+        elif slot_attention is not None and slot_path:
+            # Current streaming batches use one exact T. Padding rows own
+            # scratch slots and must not advance persistent attention state.
+            valid_lengths = execution_context.valid_rows.to(dtype=torch.int32) * T
+            x = slot_attention(
+                q,
+                k,
+                v,
+                state.kv_cache.cache,
+                state.kv_cache.end_offset,
+                execution_context.state_slot_ids,
+                valid_lengths,
+                self.context if self.context is not None else -1,
+            )
         else:
-            attn_bias = None
+            k, v, pos_k = self._complete_kv(k, v, execution_context)
+            pos_k = pos_k[:, None]
 
-        x = F.scaled_dot_product_attention(q, k, v, attn_bias, dropout_p=0.0)
+            if self.causal:
+                pos_q = offset.view(-1, 1, 1) + torch.arange(T, device=q.device, dtype=torch.long).view(-1, 1)
+                delta = pos_q - pos_k
+                attn_bias = (pos_k >= 0) & (delta >= 0)
+                if self.context is not None:
+                    attn_bias = attn_bias & (delta < self.context)
+                attn_bias = attn_bias[:, None]
+            else:
+                attn_bias = None
+
+            streaming_attention = getattr(self, "_streaming_attention", None)
+            if (
+                streaming_attention is not None
+                and attn_bias is not None
+                and q.dtype == torch.bfloat16
+                and q.shape[-1] == 64
+            ):
+                x = streaming_attention(q, k, v, attn_bias)
+            else:
+                x = F.scaled_dot_product_attention(q, k, v, attn_bias, dropout_p=0.0)
         x = x.transpose(1, 2).reshape(B, T, self.embed_dim)
         x = apply_weights_per_step(self.out_projs, self.weights_per_step_schedule, x, offset_cpu)
 
@@ -812,6 +868,8 @@ class MossAudioTokenizerMultiheadAttention(StreamingModule):
             else:
                 next_offset = torch.where(execution_context.valid_rows, offset + T, offset)
                 state.offset.index_copy_(0, execution_context.state_slot_ids, next_offset)
+                if advance_kv_offset:
+                    state.kv_cache.end_offset.index_copy_(0, execution_context.state_slot_ids, next_offset)
         return x
 
 
@@ -1612,6 +1670,7 @@ class MossAudioTokenizerModel(MossAudioTokenizerPreTrainedModel):
         decoder_kwargs_list = copy.deepcopy(config.decoder_kwargs)
         self.decoder = nn.ModuleList()
 
+        decoder_input_frame_rate = current_frame_rate
         for decoder_kwargs_i in decoder_kwargs_list:
             decoder_kwargs_i = dict(decoder_kwargs_i)
             if decoder_kwargs_i["module_type"] == "PatchedPretransform":
@@ -1625,6 +1684,11 @@ class MossAudioTokenizerModel(MossAudioTokenizerPreTrainedModel):
                         **decoder_kwargs_i,
                         context=int(round(current_frame_rate * context_duration)),
                     )
+                )
+                # Tokens this transformer sees per input code frame. Streaming
+                # ring headroom is sized from it (see initialize_decoder_state_pool).
+                self.decoder[-1].tokens_per_input_frame = max(
+                    1, int(round(current_frame_rate / decoder_input_frame_rate))
                 )
             current_frame_rate *= self.decoder[-1].downsample_ratio
 
@@ -1719,10 +1783,29 @@ class MossAudioTokenizerModel(MossAudioTokenizerPreTrainedModel):
         self._decoder_state_capacity = 0
         self._decoder_slot_offsets = None
 
-    def initialize_decoder_state_pool(self, state_capacity: int, scratch_capacity: int = 0) -> None:
-        """Allocate persistent decoder state independently of execution B."""
-        if state_capacity <= 0 or scratch_capacity < 0:
-            raise ValueError(f"Invalid decoder state capacities: state={state_capacity}, scratch={scratch_capacity}.")
+    def initialize_decoder_state_pool(
+        self, state_capacity: int, scratch_capacity: int = 0, chunk_frames: int = 0
+    ) -> None:
+        """Allocate persistent decoder state independently of execution B.
+
+        ``chunk_frames`` > 0 sizes every decoder attention ring as
+        ``context + chunk_frames * tokens_per_input_frame`` so that a chunk of
+        up to ``chunk_frames`` code frames never evicts keys inside its own
+        causal window; chunked streaming then matches whole-sequence decoding.
+        ``chunk_frames`` = 0 keeps the legacy ``context``-sized rings.
+        """
+        if state_capacity <= 0 or scratch_capacity < 0 or chunk_frames < 0:
+            raise ValueError(
+                "Invalid decoder state capacities: "
+                f"state={state_capacity}, scratch={scratch_capacity}, chunk_frames={chunk_frames}."
+            )
+        for module in self.decoder:
+            if not isinstance(module, MossAudioTokenizerProjectedTransformer):
+                continue
+            tokens_per_frame = int(getattr(module, "tokens_per_input_frame", 1))
+            for attention in module.modules():
+                if isinstance(attention, MossAudioTokenizerMultiheadAttention):
+                    attention._ring_headroom = chunk_frames * tokens_per_frame
         self._start_streaming(state_capacity + scratch_capacity, decoder_only=True)
         self._decoder_state_capacity = state_capacity + scratch_capacity
 
