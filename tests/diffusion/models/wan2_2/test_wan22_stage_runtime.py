@@ -397,6 +397,18 @@ def test_decode_batch_owner_and_non_owner(output_type, non_owner):
             assert output.output is None
 
 
+def test_decode_batch_rejects_preencode_mp4_before_vae(monkeypatch):
+    pipeline = _make_pipeline()
+    batch = _requests(2)
+    for request in batch.requests:
+        request.prompt = {"latents": torch.ones(1, 4, 2, 2, 4)}
+        request.sampling_params.output_type = "np"
+    batch.requests[1].sampling_params.extra_args["preencode_mp4"] = True
+    monkeypatch.setattr(pipeline, "_decode_latents", lambda *args: pytest.fail("VAE must not run"))
+    with pytest.raises(ValueError, match="preencode_mp4 is not supported"):
+        pipeline.decode_batch(batch)
+
+
 @pytest.mark.parametrize("role", list(DiffusionStageRole))
 @pytest.mark.parametrize("expand", [True, False])
 def test_constructor_role_modules_and_weight_sources(monkeypatch, tmp_path, role, expand):

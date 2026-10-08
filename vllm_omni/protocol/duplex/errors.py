@@ -45,6 +45,7 @@ REALTIME_ERROR_TYPES_BY_CODE: dict[str, str] = {
     "runtime_touch_failed": "server_error",
     "engine_error": "server_error",
     "input_backpressure": "rate_limit_error",
+    "output_backpressure": "rate_limit_error",
     "response_already_active": "invalid_request_error",
     "response_not_active": "invalid_request_error",
     "response_create_without_input": "invalid_request_error",

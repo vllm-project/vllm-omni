@@ -57,9 +57,11 @@ class _FakeKVTransferManager:
         self.sender_info_calls.append((sender_info, sender_stage_id))
 
 
-def _make_runner(connector, *, payload_keys=("text_encoder_output",), recv_stages=("0", "1")):
+def _make_runner(connector, *, payload_keys=("text_encoder_output",), optional_keys=(), recv_stages=("0", "1")):
     runner = object.__new__(DiffusionModelRunner)
-    runner.od_config = SimpleNamespace(stage_input_payload_keys=payload_keys, stage_id=1)
+    runner.od_config = SimpleNamespace(
+        stage_input_payload_keys=payload_keys, stage_input_optional_payload_keys=optional_keys, stage_id=1
+    )
     runner.device = torch.device("cpu")
     runner._local_rank = 0
     runner.pipeline = None
@@ -203,7 +205,11 @@ def test_wan_transport_requires_embeddings_but_defers_conditioning_validation(wi
     if with_metadata:
         payload["wan_conditioning_metadata"] = {"has_image": False}
     connector = _FakeConnector(payload)
-    runner = _make_runner(connector, payload_keys=WAN2_2_EG_PIPELINE.stages[1].stage_input_payload_keys)
+    runner = _make_runner(
+        connector,
+        payload_keys=WAN2_2_EG_PIPELINE.stages[1].stage_input_payload_keys,
+        optional_keys=WAN2_2_EG_PIPELINE.stages[1].stage_input_optional_payload_keys,
+    )
     req = _make_request({"prompt": "a cat"})
 
     if not with_embeddings:
@@ -214,6 +220,29 @@ def test_wan_transport_requires_embeddings_but_defers_conditioning_validation(wi
         additional = req.prompt["additional_information"]
         torch.testing.assert_close(additional["prompt_embeds"], payload["prompt_embeds"])
         assert ("wan_conditioning_metadata" in additional) is with_metadata
+
+
+@pytest.mark.parametrize("optional_keys", [(), ("metadata",)])
+def test_transport_optional_keys_are_explicit_and_model_independent(optional_keys):
+    runner = _make_runner(
+        _FakeConnector({"embedding": torch.zeros(2)}),
+        payload_keys=("embedding", "metadata"),
+        optional_keys=optional_keys,
+    )
+    request = _make_request({"prompt": "test"})
+    if optional_keys:
+        runner._maybe_recv_stage_payload(request)
+    else:
+        with pytest.raises(RuntimeError, match="metadata"):
+            runner._maybe_recv_stage_payload(request)
+
+
+def test_wan_named_payload_keys_are_required_without_optional_declaration():
+    runner = _make_runner(
+        _FakeConnector({"prompt_embeds": torch.zeros(2)}), payload_keys=("prompt_embeds", "wan_conditioning_metadata")
+    )
+    with pytest.raises(RuntimeError, match="wan_conditioning_metadata"):
+        runner._maybe_recv_stage_payload(_make_request({"prompt": "test"}))
 
 
 def test_handle_path_uses_its_own_key_and_metadata():
@@ -561,7 +590,12 @@ def test_native_kv_runner_keeps_synchronous_payload_transport(monkeypatch):
 
     connector = _FakeConnector(_conditioning())
     manager = _FakeKVTransferManager(connector)
-    config = SimpleNamespace(stage_input_payload_keys=("text_encoder_output",), stage_id=1, kv_transfer_config=object())
+    config = SimpleNamespace(
+        stage_input_payload_keys=("text_encoder_output",),
+        stage_input_optional_payload_keys=(),
+        stage_id=1,
+        kv_transfer_config=object(),
+    )
     monkeypatch.setattr(runner_module.OmniKVTransferManager, "from_od_config", lambda config: manager)
     monkeypatch.setattr(runner_module, "DiffusionKVModelRunnerBackend", Mock())
     runner = DiffusionModelRunner(SimpleNamespace(), config, torch.device("cpu"))
@@ -699,7 +733,11 @@ def test_wan_conditioning_and_metadata_share_connector_lifecycle(has_image):
     assert isinstance(sent, dict)
     assert set(sent) == set(payload)
     assert set(output.custom_output) == {HANDLE_KEY}
-    receiver = _make_runner(_FakeConnector(sent), payload_keys=keys)
+    receiver = _make_runner(
+        _FakeConnector(sent),
+        payload_keys=keys,
+        optional_keys=WAN2_2_EGD_PIPELINE.stages[1].stage_input_optional_payload_keys,
+    )
     request = _make_request({"prompt": "a cat", HANDLE_KEY: output.custom_output[HANDLE_KEY]})
     receiver._maybe_recv_stage_payload(request)
     received = request.prompt["additional_information"]

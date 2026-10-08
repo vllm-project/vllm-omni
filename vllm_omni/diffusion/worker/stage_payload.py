@@ -91,12 +91,8 @@ class DiffusionStagePayloadMixin(OmniConnectorModelRunnerMixin):
                 if not expected_keys or name in expected_keys:
                     additional[name] = _to_device(value, target_device)
         required_keys = expected_keys or (handle.get("payload_keys", ()) if isinstance(handle, dict) else ())
-        if "wan_conditioning_metadata" in required_keys:
-            required_keys = tuple(
-                name
-                for name in required_keys
-                if name not in ("negative_prompt_embeds", "wan_image_condition", "wan_conditioning_metadata")
-            )
+        optional_keys = set(self.od_config.stage_input_optional_payload_keys or ())
+        required_keys = tuple(name for name in required_keys if name not in optional_keys)
         missing = [name for name in required_keys if additional.get(name) is None]
         if missing or (isinstance(handle, dict) and not required_keys and not isinstance(payload, dict)):
             raise RuntimeError(f"Stage payload unavailable for {req.request_id}; missing keys: {missing}")

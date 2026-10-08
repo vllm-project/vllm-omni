@@ -16,7 +16,7 @@ import diffusers
 import huggingface_hub
 import torch
 from PIL import Image
-from pydantic import Field, model_validator
+from pydantic import model_validator
 from typing_extensions import Self
 from vllm.config.utils import config
 from vllm.logger import init_logger
@@ -317,6 +317,8 @@ class DiffusionParallelConfig:
 
     - "tile": Patch/tile parallel decode (default). Each rank decodes a subset
       of spatial tiles and the results are stitched on rank 0.
+    - "batch": Decode complete images on different ranks, preserving their
+      batch order. Requires AutoencoderKL/Flux2 and DP/PP/CFG sizes of 1.
     - "spatial_shard_height": Spatially-sharded decode that splits decoder
       feature maps along height and exchanges halo rows around spatial
       convolutions.
@@ -357,10 +359,14 @@ class DiffusionParallelConfig:
         assert self.allgather_degree > 0, "AllGather degree must be > 0"
         assert self.cfg_parallel_size > 0, "CFG parallel size must be > 0"
         assert self.vae_patch_parallel_size > 0, "VAE patch parallel size must be > 0"
-        assert self.vae_parallel_mode in {"tile", "spatial_shard_height", "spatial_shard_width"}, (
-            "vae_parallel_mode must be one of {'tile', 'spatial_shard_height', 'spatial_shard_width'}, "
+        assert self.vae_parallel_mode in {"tile", "batch", "spatial_shard_height", "spatial_shard_width"}, (
+            "vae_parallel_mode must be one of {'tile', 'batch', 'spatial_shard_height', 'spatial_shard_width'}, "
             f"but got {self.vae_parallel_mode!r}."
         )
+        if self.vae_parallel_mode == "batch" and (
+            self.data_parallel_size not in (None, 1) or self.pipeline_parallel_size != 1 or self.cfg_parallel_size != 1
+        ):
+            raise ValueError("VAE batch parallel decode requires DP, PP, and CFG parallel sizes to be 1")
         if self.allgather_degree > 1:
             assert self.ulysses_degree == 1 and self.ring_degree == 1, (
                 "AllGather-KV (allgather_degree>1) is mutually exclusive with Ulysses/Ring in v1. "
@@ -478,6 +484,8 @@ class DiffusionParallelConfig:
         if world_size % non_dp_size != 0:
             raise ValueError(f"WORLD size ({world_size}) must be divisible by non-DP parallel size ({non_dp_size})")
         inferred_data_parallel_size = world_size // non_dp_size
+        if self.vae_parallel_mode == "batch" and inferred_data_parallel_size != 1:
+            raise ValueError("VAE batch parallel decode requires DP, PP, and CFG parallel sizes to be 1")
         if self.data_parallel_size is not None and self.data_parallel_size != inferred_data_parallel_size:
             raise ValueError(
                 f"data_parallel_size ({self.data_parallel_size}) does not match WORLD-derived value "
@@ -807,10 +815,16 @@ def uses_diffusers_adapter(od_config: object) -> bool:
 @dataclass
 class VideoOutputTransportConfig:
     enable_device_postprocess: bool = False
+    enable_registered_shm: bool = False
+    enable_borrowed_frames: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.enable_device_postprocess, bool):
             raise TypeError("enable_device_postprocess must be a bool")
+        if not isinstance(self.enable_registered_shm, bool):
+            raise TypeError("enable_registered_shm must be a bool")
+        if not isinstance(self.enable_borrowed_frames, bool):
+            raise TypeError("enable_borrowed_frames must be a bool")
 
 
 @dataclass
@@ -980,6 +994,19 @@ class OmniDiffusionConfig:
 
     # Compilation
     enforce_eager: bool = False
+    # Capture fixed-shape KV-cache decode (denoising) steps into CUDA graphs.
+    # Currently only Qwen-Image-2.1's transformer implements this; other models
+    # ignore the flag. This is a per-model diffusion path, independent of the
+    # AR engine's ``compilation_config.cudagraph_mode`` (which does not apply
+    # to diffusion stages). It stacks with ``diffusion_compile_granularity``:
+    # the DiT blocks are still torch.compile'd and graph capture records the
+    # compiled (fused) kernels, while inductor's own cudagraphs stay off.
+    # ``enforce_eager=True`` forces eager decode and
+    # disables capture regardless of this flag; unsupported configurations
+    # (SP/TP, ring, HSDP, dynamic LoRA, padded masks, quantized prefix KV, or
+    # a second in-flight request aliasing the same graph key) log and fall
+    # back to eager decode.
+    enable_cuda_graph_decode: bool = True
     # Controls the generic compilation path used when a pipeline does not
     # provide its own setup_compile() implementation.
     diffusion_compile_granularity: str = "regional"
@@ -989,6 +1016,9 @@ class OmniDiffusionConfig:
     enable_multithread_weight_load: bool = True
     enable_broadcast_weight_load: bool = False
     num_weight_load_threads: int = 4
+
+    # Shard meta parameters before reading rank-local HF safetensors slices.
+    hsdp_weight_load_strategy: str = "full"
 
     # Enable sleep mode
     enable_sleep_mode: bool = False
@@ -1008,6 +1038,9 @@ class OmniDiffusionConfig:
 
     # Worker extension class for custom functionality
     worker_extension_cls: str | None = None
+
+    # Internal transport of explicit stage runtime.env to remote Ray actors.
+    ray_worker_env: dict[str, str] = field(default_factory=dict, init=False, repr=False)
 
     # Custom pipeline arguments for custom pipelines
     custom_pipeline_args: dict[str, Any] | None = None
@@ -1080,6 +1113,7 @@ class OmniDiffusionConfig:
     # rather than carried inline through the orchestrator. Empty disables the
     # worker-side connector receive path.
     stage_input_payload_keys: tuple[str, ...] = ()
+    stage_input_optional_payload_keys: tuple[str, ...] = ()
 
     # Keys handed to the next stage over the omni connector. Empty disables the
     # worker-side connector send path.
@@ -1133,7 +1167,7 @@ class OmniDiffusionConfig:
     request_batch_max_wait_ms: float = 0.0
 
     # Supplementary model specific parameters
-    extras: dict[str, Any] = Field(default_factory=dict)
+    extras: dict[str, Any] = field(default_factory=dict)
 
     @property
     def is_moe(self) -> bool:
@@ -1203,12 +1237,17 @@ class OmniDiffusionConfig:
         )
 
     def __post_init__(self):
+        if self.hsdp_weight_load_strategy not in {"full", "pre_sharded"}:
+            raise ValueError(
+                f"hsdp_weight_load_strategy must be 'full' or 'pre_sharded', got {self.hsdp_weight_load_strategy!r}"
+            )
         from vllm_omni.diffusion.offloader.config import (
             OffloadStrategy,
             materialize_legacy_offload_flags,
         )
 
         self.stage_input_payload_keys = tuple(self.stage_input_payload_keys)
+        self.stage_input_optional_payload_keys = tuple(self.stage_input_optional_payload_keys)
         self.stage_output_payload_keys = tuple(self.stage_output_payload_keys)
         if self.vae_fast_path not in VAE_FAST_PATH_LEVELS:
             raise ValueError(f"vae_fast_path must be one of {list(VAE_FAST_PATH_LEVELS)}, got {self.vae_fast_path!r}")
@@ -1841,10 +1880,15 @@ class DiffusionOutput:
     # Internal control-plane event emitted on first scheduler admission.
     request_started: bool = False
 
-    # Typed video-media contract. Declared last so the pre-existing positional
+    # Typed video-media contract. Appended so the pre-existing positional
     # constructor order (output, trajectory_timesteps, ...) that out-of-tree
     # pipelines rely on is preserved. Mutually exclusive with ``output``.
     media: DiffusionMediaOutput | None = None
+
+    # Compatibility adapter for joint (video, audio) outputs that have not
+    # migrated to typed media. Only this tuple entry is eligible for video
+    # transport optimizations; unmarked legacy outputs retain their old path.
+    video_output_index: int | None = None
 
     def __post_init__(self) -> None:
         if self.media is not None and not isinstance(self.media, DiffusionMediaOutput):

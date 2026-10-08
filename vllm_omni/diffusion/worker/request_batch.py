@@ -51,6 +51,7 @@ def split_diffusion_output_by_request(
 
     return [
         DiffusionOutput(
+            video_output_index=result.video_output_index,
             output=_slice_request_output(
                 result.output,
                 idx * num_outputs_per_prompt,

@@ -206,7 +206,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         self.kv_transfer_manager = (
             payload_transfer_manager if getattr(od_config, "kv_transfer_config", None) is None else None
         )
-        self.init_omni_connectors(od_config, payload_transfer_manager, synchronous=True)
+        self.init_omni_connectors(od_config, payload_transfer_manager, synchronous=True)  # type: ignore[arg-type]
         self._kv_connector = None
         from vllm_omni.diffusion.diffusion_kv.kv_connector import KVReceiveProgress, native_prefetch_enabled
 
@@ -250,14 +250,25 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         if model is None:
             return
 
+        compile_kwargs: dict[str, Any] = {"dynamic": self.od_config.diffusion_compile_dynamic}
+        if getattr(model, "enable_cuda_graph_decode", False):
+            # Decode-graph models still compile their blocks: graph capture
+            # records the compiled (fused) kernels. Scope inductor cudagraphs
+            # to this compile so the two graph layers never stack, without
+            # changing torch.compile for every other model in the process.
+            compile_kwargs["options"] = {
+                "triton.cudagraphs": False,
+                "triton.cudagraph_trees": False,
+            }
+            logger.info("Model runner: %s combines CUDA graph decode with torch.compile.", attr_name)
+
         compile_granularity = self.od_config.diffusion_compile_granularity
-        compile_dynamic = self.od_config.diffusion_compile_dynamic
         try:
             if compile_granularity == "full":
-                model.compile(dynamic=compile_dynamic)
+                model.compile(**compile_kwargs)
                 compiled_model = model
             else:
-                compiled_model = regionally_compile(model, dynamic=compile_dynamic)
+                compiled_model = regionally_compile(model, **compile_kwargs)
             setattr(self.pipeline, attr_name, compiled_model)
         except Exception as e:
             logger.warning(
@@ -275,7 +286,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
             "compilation errors may surface on the first request.",
             attr_name,
             compile_granularity,
-            compile_dynamic,
+            compile_kwargs["dynamic"],
         )
 
     def load_model(
@@ -1279,7 +1290,8 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                     new_req.request_id,
                     exc_info=True,
                 )
-                result = DiffusionOutput(error=str(exc))
+                # Keep client-error metadata, matching the stepwise path below.
+                result = DiffusionOutput.from_exception(exc)
 
             step_index = getattr(new_req.req.sampling_params, "step_index", None)
             runner_outputs.append(
@@ -1457,7 +1469,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                                 else req.denoise_completed
                             )
                             if finished and result is not None:
-                                self._maybe_send_stage_payload([req], [result])
+                                self._maybe_send_stage_payload([req], [result])  # type: ignore[list-item]
                             runner_output_list.append(
                                 RunnerOutput(
                                     request_id=req.request_id,

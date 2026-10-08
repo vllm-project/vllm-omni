@@ -54,7 +54,7 @@ from vllm_omni.model_executor.models.cosmos3.pipeline import (
     COSMOS3_OMNI_DEPLOY_PIPELINE,
     COSMOS3_POLICY_PIPELINE,
 )
-from vllm_omni.model_executor.models.cosyvoice3.pipeline import COSYVOICE3_PIPELINE
+from vllm_omni.model_executor.models.cosyvoice3.pipeline import resolve_cosyvoice3_pipeline
 from vllm_omni.model_executor.models.covo_audio.pipeline import COVO_AUDIO_PIPELINE
 from vllm_omni.model_executor.models.dreamzero.pipeline import DREAMZERO_PIPELINE
 from vllm_omni.model_executor.models.fish_speech.pipeline import FISH_SPEECH_PIPELINE
@@ -99,9 +99,9 @@ from vllm_omni.model_executor.models.minicpmo_4_5.pipeline import MINICPMO_4_5_P
 from vllm_omni.model_executor.models.minimax_h3.pipeline import MINIMAX_H3_PIPELINE
 from vllm_omni.model_executor.models.minimax_music3.pipeline import MINIMAX_MUSIC3_PIPELINE
 from vllm_omni.model_executor.models.moss_tts.pipeline import (
-    MOSS_TTS_LOCAL_PIPELINE,
     MOSS_TTS_PIPELINE,
     MOSS_TTS_REALTIME_PIPELINE,
+    resolve_moss_tts_local_pipeline,
 )
 from vllm_omni.model_executor.models.moss_tts_nano.pipeline import MOSS_TTS_NANO_PIPELINE
 from vllm_omni.model_executor.models.nemotron_voicechat.pipeline import (
@@ -117,7 +117,7 @@ from vllm_omni.model_executor.models.qwen3_omni.pipeline import (
     QWEN3_OMNI_THINKER_ONLY_PIPELINE,
     resolve_qwen3_omni_pipeline,
 )
-from vllm_omni.model_executor.models.qwen3_tts.pipeline import QWEN3_TTS_PIPELINE
+from vllm_omni.model_executor.models.qwen3_tts.pipeline import QWEN3_TTS_FUSED_PIPELINE, QWEN3_TTS_PIPELINE
 from vllm_omni.model_executor.models.step_audio2.pipeline import (
     STEP_AUDIO2_ASR_PIPELINE,
     STEP_AUDIO2_PIPELINE,
@@ -130,6 +130,7 @@ from vllm_omni.model_executor.models.wan2_2.pipeline import (
     WAN2_2_PIPELINE,
     WAN2_2_TI2V_PIPELINE,
 )
+from vllm_omni.model_executor.models.yue2.pipeline import YUE2_PIPELINE
 
 logger = init_logger(__name__)
 
@@ -154,7 +155,7 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     # key (see deploy/cosmos3_policy_droid.yaml and deploy/cosmos3_omni.yaml).
     "cosmos3_omni_deploy": COSMOS3_OMNI_DEPLOY_PIPELINE,
     "cosmos3_policy": COSMOS3_POLICY_PIPELINE,
-    "cosyvoice3": COSYVOICE3_PIPELINE,
+    "cosyvoice3": resolve_cosyvoice3_pipeline,
     "covo_audio": COVO_AUDIO_PIPELINE,
     "dreamzero": DREAMZERO_PIPELINE,
     "fish_qwen3_omni": FISH_SPEECH_PIPELINE,
@@ -187,7 +188,7 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "minimax_h3_disaggregated": MINIMAX_H3_PIPELINE,
     "minimax_music3": MINIMAX_MUSIC3_PIPELINE,
     "moss_tts_delay": MOSS_TTS_PIPELINE,
-    "moss_tts_local": MOSS_TTS_LOCAL_PIPELINE,
+    "moss_tts_local": resolve_moss_tts_local_pipeline,
     "moss_tts_nano": MOSS_TTS_NANO_PIPELINE,
     "moss_tts_realtime": MOSS_TTS_REALTIME_PIPELINE,
     # Alias: the Nemotron-Labs-Audex-2B repo-root config.json reports
@@ -208,6 +209,7 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "qwen3_omni_moe": resolve_qwen3_omni_pipeline,
     "qwen3_omni_moe_thinker_only": QWEN3_OMNI_THINKER_ONLY_PIPELINE,
     "qwen3_tts": QWEN3_TTS_PIPELINE,
+    "qwen3_tts_fused": QWEN3_TTS_FUSED_PIPELINE,
     "step_audio_2": STEP_AUDIO2_PIPELINE,
     "step_audio_2_asr": STEP_AUDIO2_ASR_PIPELINE,
     "voxcpm2": VOXCPM2_PIPELINE,
@@ -217,6 +219,7 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "wan2_2_eg": WAN2_2_EG_PIPELINE,
     "wan2_2_egd": WAN2_2_EGD_PIPELINE,
     "wan2_2_ti2v": WAN2_2_TI2V_PIPELINE,
+    "yue2": YUE2_PIPELINE,
 }
 
 

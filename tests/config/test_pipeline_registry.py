@@ -47,7 +47,9 @@ def test_wan_deploy_transport_is_explicit_opt_in(topology, ports, nixl):
             assert edge.extra["lease_seconds"] == 300
             assert edge.extra["transfer_timeout_s"] == 300
         else:
-            assert not edge.extra
+            assert set(edge.extra) == {"wakeup_scope"}
+            assert isinstance(edge.extra["wakeup_scope"], str)
+            assert edge.extra["wakeup_scope"]
 
 
 def build_fake_pipeline_config(model_type: str) -> PipelineConfig:
@@ -128,7 +130,12 @@ def test_wan_eg_preserves_fused_denoise_decode_role():
         DiffusionStageRole.ENCODE,
         DiffusionStageRole.DENOISE_DECODE,
     ]
-    assert resolve_diffusion_stage_role(None, "dit") is DiffusionStageRole.DENOISE_DECODE
+    assert resolve_diffusion_stage_role(None, "dit") is DiffusionStageRole.FULL
+    assert resolve_diffusion_stage_role("denoise_decode", "dit") is DiffusionStageRole.DENOISE_DECODE
+    assert (
+        resolve_diffusion_stage_role(None, OMNI_PIPELINES["wan2_2_ti2v"].stages[0].model_stage)
+        is DiffusionStageRole.FULL
+    )
     assert stage_component_groups("denoise") == frozenset({"dit"})
     assert stage_component_groups("denoise_decode") == frozenset({"dit", "vae"})
 

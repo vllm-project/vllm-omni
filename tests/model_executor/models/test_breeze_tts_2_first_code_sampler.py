@@ -4,6 +4,7 @@
 
 import pytest
 import torch
+from vllm.platforms import current_platform
 
 from tests.helpers.mark import hardware_test
 from vllm_omni.model_executor.models.breeze_tts_2.depth_decoder import sample_logits
@@ -14,6 +15,10 @@ pytestmark = [pytest.mark.core_model]
 PARAMETERS = (0.9, 50, 1.0)
 VOCAB = 2052
 EOS = 2051
+
+
+def _captured_generator_state_supported() -> bool:
+    return current_platform.is_cuda() and hasattr(torch.cuda.CUDAGraph, "register_generator_state")
 
 
 def _logits(count: int, *, device: str, seed: int = 100, vocab: int = VOCAB) -> list[torch.Tensor]:
@@ -164,6 +169,14 @@ def test_cuda_replay_preserves_tokens_rng_and_owned_outputs(monkeypatch) -> None
                     right[codebook].exponential_(generator=live_expected[index])
                 torch.testing.assert_close(left, right, atol=0, rtol=0)
             _assert_states(actual_generators, expected_generators)
+    if not _captured_generator_state_supported():
+        # ROCm deliberately uses the eager sampler because CUDA graph generator-state registration is an
+        # NVIDIA-only path. The loop above still verifies GPU tokens and every request-owned RNG stream.
+        assert not sampler._graphs
+        for value, expected in retained:
+            torch.testing.assert_close(value, expected, atol=0, rtol=0)
+        torch.testing.assert_close(torch.cuda.get_rng_state(), global_state, atol=0, rtol=0)
+        return
     # B1/3/16/17/31/32 must use exactly buckets 1/4/16/32.
     assert len(sampler._graphs) == 4
     rows = _logits(3, device="cuda", seed=2026)
@@ -189,6 +202,7 @@ def test_cuda_replay_preserves_tokens_rng_and_owned_outputs(monkeypatch) -> None
 @torch.inference_mode()
 def test_cuda_parameters_vocab_and_missing_graph_api(monkeypatch) -> None:
     sampler = BreezeFirstCodeSampler()
+    captures_generator_state = _captured_generator_state_supported()
     actual_generators = _generators([42, 43, 44], "cuda")
     expected_generators = _generators([42, 43, 44], "cuda")
     cases = ((0.9, 50, 1.0), (0.7, 100, 0.8), (1.2, 0, 0.95), (1.0, 1, 1.0), (1.0, 0, 0.5))
@@ -201,12 +215,12 @@ def test_cuda_parameters_vocab_and_missing_graph_api(monkeypatch) -> None:
         expected = _reference(rows, parameters, expected_generators)
         _assert_outputs(sampler.sample(rows, parameters, actual_generators), expected, rows)
         _assert_states(actual_generators, expected_generators)
-    assert len(sampler._graphs) == len(cases)
+    assert len(sampler._graphs) == (len(cases) if captures_generator_state else 0)
     rows = _logits(3, device="cuda", vocab=17)
     expected = _reference(rows, PARAMETERS, expected_generators)
     _assert_outputs(sampler.sample(rows, PARAMETERS, actual_generators), expected, rows)
     _assert_states(actual_generators, expected_generators)
-    assert len(sampler._graphs) == len(cases) + 1
+    assert len(sampler._graphs) == (len(cases) + 1 if captures_generator_state else 0)
 
     class UnavailableGraph:
         def __init__(self, *_args, **_kwargs):
@@ -243,7 +257,7 @@ def test_cuda_shared_generator_uses_sequential_eager_fallback(monkeypatch) -> No
     # The duplicate-generator guard must precede lookup of an existing graph.
     sampler.sample(rows, PARAMETERS, _generators([100, 101, 102], "cuda"))
     cached = dict(sampler._graphs)
-    assert len(cached) == 1
+    assert len(cached) == (1 if _captured_generator_state_supported() else 0)
     actual = torch.Generator(device="cuda").manual_seed(2**64 - 23)
     reference = torch.Generator(device="cuda").manual_seed(2**64 - 23)
     multinomial = torch.multinomial
@@ -270,6 +284,7 @@ def test_cuda_shared_generator_uses_sequential_eager_fallback(monkeypatch) -> No
 @torch.inference_mode()
 def test_cuda_cache_limit_falls_back_without_evicting_warmed_graphs(monkeypatch) -> None:
     sampler = BreezeFirstCodeSampler()
+    captures_generator_state = _captured_generator_state_supported()
     rows = _logits(1, device="cuda")
     actual_generators = _generators([42], "cuda")
     expected_generators = _generators([42], "cuda")
@@ -279,7 +294,7 @@ def test_cuda_cache_limit_falls_back_without_evicting_warmed_graphs(monkeypatch)
         _assert_outputs(sampler.sample(rows, parameters, actual_generators), expected, rows)
         _assert_states(actual_generators, expected_generators)
     cached = dict(sampler._graphs)
-    assert len(cached) == 32
+    assert len(cached) == (32 if captures_generator_state else 0)
     parameters = (0.9, 33, 1.0)
     expected = _reference(rows, parameters, expected_generators)
     multinomial = torch.multinomial
@@ -297,6 +312,11 @@ def test_cuda_cache_limit_falls_back_without_evicting_warmed_graphs(monkeypatch)
     assert set(sampler._graphs) == set(cached)
     assert all(sampler._graphs[key] is value for key, value in cached.items())
     expected = _reference(rows, (0.9, 1, 1.0), expected_generators)
+
+    if not captures_generator_state:
+        _assert_outputs(sampler.sample(rows, (0.9, 1, 1.0), actual_generators), expected, rows)
+        _assert_states(actual_generators, expected_generators)
+        return
 
     def unexpected_multinomial(*_args, **_kwargs):
         raise AssertionError("Cache exhaustion must retain existing captured entries")

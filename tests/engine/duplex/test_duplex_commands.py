@@ -451,3 +451,20 @@ def test_a_hint_survives_when_its_typed_field_is_unset():
     command = AppendAudio(audio=b"\x00\x00" * 8, hints={"is_speech": True})
 
     assert command.payload()["is_speech"] is True
+
+
+def test_duplex_command_mixin_keeps_empty_slots():
+    """The concrete commands combine ``DuplexCommand`` with a slotted wire command.
+
+    On Python 3.10 ``dataclass(slots=True)`` repeats the inherited fields in
+    ``__slots__`` (fixed in 3.11), so a slotted ``DuplexCommand`` gives every
+    concrete command two slotted bases and the module does not import (#7475).
+    The mixin spells out empty slots instead; instances stay ``__dict__``-free
+    on every version.
+    """
+    # ``__dataclass_params__`` only records ``slots`` from Python 3.12 on; an
+    # older interpreter proves the same thing by importing the module at all.
+    params = getattr(DuplexCommand, "__dataclass_params__")
+    assert getattr(params, "slots", False) is False, "slots=True on DuplexCommand breaks the import on Python 3.10"
+    assert DuplexCommand.__slots__ == ()
+    assert not hasattr(AppendAudio(audio=b"\x00\x00" * 8), "__dict__")

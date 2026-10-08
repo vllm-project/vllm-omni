@@ -57,7 +57,7 @@ class _MockRequest:
 
 @pytest.fixture(autouse=True)
 def _mock_cuda_graph_platform(monkeypatch) -> None:
-    monkeypatch.setattr(voxcpm2_scheduler_mod.current_omni_platform, "is_cuda", lambda: True)
+    monkeypatch.setattr(voxcpm2_scheduler_mod.omni_platform.current_omni_platform, "is_cuda", lambda: True)
 
 
 def _make_scheduler(
@@ -79,16 +79,19 @@ def _make_scheduler(
         else:
             hf_config.voxcpm2_runtime_config = runtime_config
     sched.vllm_config = SimpleNamespace(model_config=model_config)
-    # Upstream ``Scheduler.__init__`` always creates ``skipped_waiting``; the
+    # Upstream ``Scheduler.__init__`` always creates ``kv_holding_waiting``; the
     # abort sweep at the top of ``schedule()`` reads it.
-    sched.skipped_waiting = _MockQueue()
+    sched.kv_holding_waiting = _MockQueue()
+    sched.deferred_waiting = set()
     return sched
 
 
-def test_voxcpm2_unified_decode_graph_defers_waiting_when_decode_ready() -> None:
+@pytest.mark.parametrize("queue_name", ["waiting", "kv_holding_waiting"])
+def test_voxcpm2_unified_decode_graph_defers_waiting_when_decode_ready(queue_name) -> None:
     scheduler = _make_scheduler()
     scheduler.running = [_MockRequest("decode")]
-    scheduler.waiting = _MockQueue([_MockRequest("prefill", status=RequestStatus.WAITING)])
+    scheduler.waiting = _MockQueue()
+    setattr(scheduler, queue_name, _MockQueue([_MockRequest("prefill", status=RequestStatus.WAITING)]))
 
     assert scheduler._should_defer_waiting_for_unified_decode_graph()
 
@@ -134,7 +137,7 @@ def test_voxcpm2_unified_decode_graph_does_not_defer_with_deterministic_noise() 
 
 
 def test_voxcpm2_unified_decode_graph_does_not_defer_without_cuda_graph(monkeypatch) -> None:
-    monkeypatch.setattr(voxcpm2_scheduler_mod.current_omni_platform, "is_cuda", lambda: False)
+    monkeypatch.setattr(voxcpm2_scheduler_mod.omni_platform.current_omni_platform, "is_cuda", lambda: False)
     scheduler = _make_scheduler()
     scheduler.running = [_MockRequest("decode")]
     scheduler.waiting = _MockQueue([_MockRequest("prefill", status=RequestStatus.WAITING)])
@@ -144,12 +147,17 @@ def test_voxcpm2_unified_decode_graph_does_not_defer_without_cuda_graph(monkeypa
 
 def test_unified_decode_graph_deferral_restores_waiting_queue(monkeypatch) -> None:
     scheduler = _make_scheduler()
+    scheduler.max_num_active_reqs = 8
     scheduler.max_num_running_reqs = 8
     scheduler.running = [_MockRequest("decode")]
     original_waiting_req = _MockRequest("waiting", status=RequestStatus.WAITING)
     deferred_by_upstream = _MockRequest("deferred-by-upstream", status=RequestStatus.WAITING)
     original_waiting = _MockQueue([original_waiting_req])
     scheduler.waiting = original_waiting
+    kv_holder = _MockRequest("kv-holder", status=RequestStatus.WAITING)
+    original_kv_holding = _MockQueue([kv_holder])
+    scheduler.kv_holding_waiting = original_kv_holding
+    preempted_by_upstream = _MockRequest("preempted-by-upstream", status=RequestStatus.PREEMPTED)
     scheduler.policy = "fcfs"
     scheduler.chunk_transfer_adapter = None
     scheduler.input_coordinator = None
@@ -160,7 +168,10 @@ def test_unified_decode_graph_deferral_restores_waiting_queue(monkeypatch) -> No
     def fake_upstream_schedule(self, throttle_prefills: bool = False):
         assert self.waiting is not original_waiting
         assert not self.waiting
+        assert self.kv_holding_waiting is not original_kv_holding
+        assert not self.kv_holding_waiting
         self.waiting.add_request(deferred_by_upstream)
+        self.kv_holding_waiting.add_request(preempted_by_upstream)
         raise RuntimeError("stop before output wrapping")
 
     monkeypatch.setattr(scheduler_mod.VLLMScheduler, "schedule", fake_upstream_schedule)
@@ -169,3 +180,6 @@ def test_unified_decode_graph_deferral_restores_waiting_queue(monkeypatch) -> No
         scheduler.schedule()
 
     assert scheduler.waiting._items == [deferred_by_upstream, original_waiting_req]
+    assert scheduler.waiting is original_waiting
+    assert scheduler.kv_holding_waiting is original_kv_holding
+    assert scheduler.kv_holding_waiting._items == [preempted_by_upstream, kv_holder]

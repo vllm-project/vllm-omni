@@ -73,14 +73,13 @@ from vllm.entrypoints.serve.utils.api_utils import (
 )
 from vllm.entrypoints.serve.utils.orca_metrics import metrics_header
 from vllm.entrypoints.serve.utils.request_logger import RequestLogger
-from vllm.entrypoints.speech_to_text.realtime.serving import OpenAIServingRealtime
 from vllm.entrypoints.speech_to_text.transcription.serving import (
     OpenAIServingTranscription,
 )
 from vllm.entrypoints.speech_to_text.translation.serving import (
     OpenAIServingTranslation,
 )
-from vllm.logger import init_logger
+from vllm.logger import configure_logging_from_args, init_logger
 from vllm.renderers.online_renderer import OnlineRenderer
 from vllm.tasks import POOLING_TASKS
 from vllm.tool_parsers import ToolParserManager
@@ -249,6 +248,33 @@ async def omni_run_server(args, **uvicorn_kwargs) -> None:
     await omni_run_server_worker(listen_address, sock, args, **uvicorn_kwargs)
 
 
+def _own_reuseport_socket(sock: socket.socket, client_count: int) -> socket.socket:
+    """Give this API server its own SO_REUSEPORT listener on the shared address.
+
+    All API servers accepting from the one inherited socket lets whichever
+    wakes first take a whole burst of connections (the event loop accepts
+    in a loop), and keep-alive then pins that imbalance for the connections'
+    lifetime. Separate reuseport listeners let the kernel spread connections
+    by hash. The inherited socket is bound but never listened on, so it
+    receives nothing.
+    """
+    if client_count <= 1:
+        return sock
+    if sock.family not in (socket.AF_INET, socket.AF_INET6):
+        return sock
+    try:
+        if not sock.getsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT):
+            return sock
+        own = socket.socket(family=sock.family, type=socket.SOCK_STREAM)
+        own.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        own.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+        own.bind(sock.getsockname()[:2])
+    except OSError as e:
+        logger.warning("Per-server reuseport listener unavailable (%s); sharing the inherited socket", e)
+        return sock
+    return own
+
+
 def run_omni_api_server_worker_proc(
     listen_address: str,
     sock: socket.socket,
@@ -278,6 +304,7 @@ def run_omni_api_server_worker_proc(
 
     set_process_title("APIServer", str(client_index))
     decorate_logs("APIServer", skip_if_decorated=True)
+    sock = _own_reuseport_socket(sock, int(omni_client_config["client_count"]))
     uvloop.run(
         omni_run_server_worker(
             listen_address,
@@ -345,6 +372,13 @@ async def omni_run_server_worker(
         remove_route_from_app(app, "/v1/models", {"GET"})  # Remove upstream /v1/models to use omni's handler
         remove_route_from_app(app, "/health", {"GET"})
         app.include_router(router)
+        get_od_config = getattr(engine_client, "get_diffusion_od_config", None)
+        od_config = get_od_config() if callable(get_od_config) else None
+        model_class_name = getattr(od_config, "model_class_name", None) or getattr(args, "model_class_name", None)
+        if model_class_name == "SeedVR2Pipeline":
+            from vllm_omni.diffusion.models.seedvr2.long_video import register_routes
+
+            register_routes(app, args.port)
 
         # OMNI: Override upstream exception handlers with Omni-aware versions
         # that understand the multi-stage orchestrator lifecycle.
@@ -505,7 +539,7 @@ async def build_async_omni(
     # Ensures everything is shutdown and cleaned up on error/exit
     async with build_async_omni_from_stage_config(
         args,
-        disable_frontend_multiprocessing=disable_frontend_multiprocessing,
+        disable_frontend_multiprocessing=bool(disable_frontend_multiprocessing),
         client_config=client_config,
     ) as async_omni:
         yield async_omni
@@ -657,7 +691,6 @@ async def _init_duplex_app_state(
         "openai_streaming_speech",
         "openai_streaming_video",
         "openai_streaming_video_output",
-        "openai_serving_realtime",
         "openai_serving_realtime_robot",
         "anthropic_serving_messages",
     ):
@@ -704,16 +737,37 @@ async def _init_duplex_chat(
     if "generate" not in supported_tasks:
         return None
 
+    resolved_chat_template = await _resolve_chat_template(engine_client, args)
+    _init_chat_services(
+        engine_client, state, args, request_logger, resolved_chat_template, enable_chat=True, enable_batch=False
+    )
+    return state.openai_serving_chat
+
+
+async def _resolve_chat_template(engine_client: EngineClient, args: Namespace) -> str | None:
     resolved_chat_template = load_chat_template(args.chat_template)
     if resolved_chat_template is None:
         try:
             tokenizer = await engine_client.get_tokenizer()
         except Exception as exc:
-            logger.debug("Could not inspect tokenizer chat_template before duplex chat init: %s", exc)
+            logger.debug("Could not inspect tokenizer chat_template before serving init: %s", exc)
             tokenizer = None
         if tokenizer is None or getattr(tokenizer, "chat_template", None) is None:
             resolved_chat_template = _load_model_chat_template_json(args.model)
+    return resolved_chat_template
 
+
+def _init_chat_services(
+    engine_client: EngineClient,
+    state: State,
+    args: Namespace,
+    request_logger: RequestLogger | None,
+    resolved_chat_template: str | None,
+    *,
+    enable_chat: bool,
+    enable_batch: bool,
+) -> None:
+    """Share chat setup while callers retain capability and endpoint gating."""
     state.online_renderer = OnlineRenderer(
         model_config=engine_client.model_config,
         renderer=engine_client.renderer,
@@ -726,8 +780,9 @@ async def _init_duplex_chat(
         tool_parser=args.tool_call_parser,
         reasoning_parser=args.structured_outputs_config.reasoning_parser,
         default_chat_template_kwargs=args.default_chat_template_kwargs,
+        log_error_stack=args.log_error_stack,
     )
-    return OmniOpenAIServingChat(
+    chat_kwargs = dict(
         engine_client=engine_client,
         models=state.openai_serving_models,
         response_role=args.response_role,
@@ -747,6 +802,12 @@ async def _init_duplex_chat(
         enable_log_outputs=args.enable_log_outputs,
         enable_log_deltas=args.enable_log_deltas,
     )
+    state.openai_serving_chat = OmniOpenAIServingChat(**chat_kwargs) if enable_chat else None
+    state.openai_serving_chat_batch = (
+        OmniOpenAIServingChatBatch(**chat_kwargs) if enable_chat and enable_batch else None
+    )
+    # Warm up template processing, not model inference, before serving requests.
+    state.online_renderer.warmup()
 
 
 async def omni_init_app_state(
@@ -892,15 +953,7 @@ async def omni_init_app_state(
         supported_tasks = set(await engine_client.get_supported_tasks())
     logger.info("Supported tasks: %s", supported_tasks)
 
-    resolved_chat_template = load_chat_template(args.chat_template)
-    if resolved_chat_template is None:
-        try:
-            tokenizer = await engine_client.get_tokenizer()
-        except Exception as exc:
-            logger.debug("Could not inspect tokenizer chat_template before serving init: %s", exc)
-            tokenizer = None
-        if tokenizer is None or getattr(tokenizer, "chat_template", None) is None:
-            resolved_chat_template = _load_model_chat_template_json(args.model)
+    resolved_chat_template = await _resolve_chat_template(engine_client, args)
 
     chat_template_config = ChatTemplateConfig(
         chat_template=resolved_chat_template,
@@ -972,21 +1025,14 @@ async def omni_init_app_state(
     )
     await state.openai_serving_models.init_static_loras()
 
-    # NOTE: kept aligned with upstream `init_app_state`:
-    # Use OnlineRenderer (replaced OpenAIServingRender which was removed upstream).
-    state.online_renderer = OnlineRenderer(
-        model_config=engine_client.model_config,
-        renderer=engine_client.renderer,
-        request_logger=request_logger,
-        chat_template=resolved_chat_template,
-        chat_template_content_format=args.chat_template_content_format,
-        trust_request_chat_template=args.trust_request_chat_template,
-        enable_auto_tools=args.enable_auto_tool_choice,
-        exclude_tools_when_tool_choice_none=args.exclude_tools_when_tool_choice_none,
-        tool_parser=args.tool_call_parser,
-        reasoning_parser=args.structured_outputs_config.reasoning_parser,
-        default_chat_template_kwargs=args.default_chat_template_kwargs,
-        log_error_stack=args.log_error_stack,
+    _init_chat_services(
+        engine_client,
+        state,
+        args,
+        request_logger,
+        resolved_chat_template,
+        enable_chat="generate" in supported_tasks,
+        enable_batch=True,
     )
 
     state.openai_serving_responses = (
@@ -1009,37 +1055,6 @@ async def omni_init_app_state(
         if "generate" in supported_tasks
         else None
     )
-
-    _chat_kwargs = dict(
-        engine_client=engine_client,
-        models=state.openai_serving_models,
-        response_role=args.response_role,
-        online_renderer=state.online_renderer,
-        request_logger=request_logger,
-        chat_template=resolved_chat_template,
-        chat_template_content_format=args.chat_template_content_format,
-        default_chat_template_kwargs=args.default_chat_template_kwargs,
-        trust_request_chat_template=args.trust_request_chat_template,
-        return_tokens_as_token_ids=args.return_tokens_as_token_ids,
-        enable_auto_tools=args.enable_auto_tool_choice,
-        exclude_tools_when_tool_choice_none=args.exclude_tools_when_tool_choice_none,
-        tool_parser=args.tool_call_parser,
-        reasoning_parser=args.structured_outputs_config.reasoning_parser,
-        enable_prompt_tokens_details=args.enable_prompt_tokens_details,
-        enable_force_include_usage=args.enable_force_include_usage,
-        enable_log_outputs=args.enable_log_outputs,
-        enable_log_deltas=args.enable_log_deltas,
-    )
-
-    state.openai_serving_chat = OmniOpenAIServingChat(**_chat_kwargs) if "generate" in supported_tasks else None
-    state.openai_serving_chat_batch = (
-        OmniOpenAIServingChatBatch(**_chat_kwargs) if "generate" in supported_tasks else None
-    )
-
-    # Warm up chat template processing to avoid first-request latency
-    # Upstream f5ffc59b6a removed OpenAIServingChat.warmup() and moved the
-    # warmup onto the renderer (OnlineRenderer.warmup()); mirror upstream.
-    state.online_renderer.warmup()
 
     state.openai_serving_completion = (
         OpenAIServingCompletion(
@@ -1194,12 +1209,6 @@ async def omni_init_app_state(
         else None
     )
     state.openai_serving_duplex = None
-    state.openai_serving_realtime = OpenAIServingRealtime(
-        engine_client=engine_client,
-        models=state.openai_serving_models,
-        request_logger=request_logger,
-    )
-
     state.openai_serving_video = OmniOpenAIServingVideo(
         engine_client,
         model_name=served_model_names[0] if served_model_names else None,
@@ -2134,6 +2143,8 @@ async def generate_images(
                 extra_body["system_prompt"] = request.system_prompt
             if request.return_stage_metrics is not None:
                 extra_body["return_stage_metrics"] = request.return_stage_metrics
+            for extra_key, extra_value in (request.model_extra or {}).items():
+                extra_body.setdefault(extra_key, extra_value)
 
             generation_result = await chat_handler.generate_diffusion_images(
                 prompt=request.prompt,
@@ -2270,6 +2281,7 @@ async def generate_images(
 
 @router.post(
     "/v1/images/edits",
+    response_model=None,
     responses={
         HTTPStatus.OK.value: {"model": ImageGenerationResponse},
         HTTPStatus.BAD_REQUEST.value: {"model": ErrorResponse},
@@ -2277,6 +2289,7 @@ async def generate_images(
         HTTPStatus.INTERNAL_SERVER_ERROR.value: {"model": ErrorResponse},
     },
 )
+@with_cancellation
 async def edit_images(
     raw_request: Request,
     image: list[UploadFile] | None = File(None),
@@ -2393,18 +2406,20 @@ async def edit_images(
         # 3.0 Init with system default values
         app_state_args = getattr(raw_request.app.state, "args", None)
         default_sample_param = getattr(app_state_args, "default_sampling_params", None)
-        # Currently only have one diffusion stage.
-        diffusion_stage_ids = [i for i, cfg in enumerate(stage_configs) if get_stage_type(cfg) == "diffusion"]
-        if not diffusion_stage_ids:
+        # Image edits (img2img) remain gated to classical diffusion stages;
+        # MammothModa2 is rejected at route level by its pipeline's endpoint
+        # restrictions (test_mammoth_moda2_shared_runtime.py).
+        image_stage_ids = [i for i, cfg in enumerate(stage_configs) if get_stage_type(cfg) == "diffusion"]
+        if not image_stage_ids:
             raise HTTPException(
                 status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
                 detail="No diffusion stage found in multi-stage pipeline.",
             )
-        diffusion_stage_id = diffusion_stage_ids[0]
+        image_stage_id = image_stage_ids[0]
         apply_stage_default_sampling_params(
             default_sample_param,
             gen_params,
-            str(diffusion_stage_id),
+            str(image_stage_id),
         )
         _update_if_not_none(gen_params, "num_outputs_per_prompt", n)
         # 3.1 Parse per-request LoRA (compatible with chat's extra_body.lora shape).
@@ -3025,6 +3040,8 @@ async def omni_sleep(request: OmniSleepRequest, raw_request: Request):
         raise HTTPException(status_code=501, detail="Engine does not support sleep")
     try:
         acks = await engine_client.sleep(stage_ids=request.stage_ids, level=request.level)
+    except ValueError as e:
+        raise HTTPException(status_code=HTTPStatus.BAD_REQUEST.value, detail=str(e)) from e
     except RuntimeError as e:
         raise HTTPException(status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value, detail=f"Failed to sleep: {e}") from e
     finally:
@@ -3049,6 +3066,8 @@ async def omni_wakeup(request: OmniWakeupRequest, raw_request: Request):
         acks = await engine_client.wake_up(stage_ids=request.stage_ids)
     except NotImplementedError:
         raise
+    except ValueError as e:
+        raise HTTPException(status_code=HTTPStatus.BAD_REQUEST.value, detail=str(e)) from e
     except RuntimeError as e:
         raise HTTPException(status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value, detail=f"Failed to wake up: {e}") from e
     for sid in request.stage_ids:
@@ -3068,6 +3087,7 @@ if __name__ == "__main__":
     # when __main__ is called, i.e., --omni is only used when called through the entrypoints.
     parser.add_argument("--omni", action="store_true", default=False)
     args = parser.parse_args()
+    configure_logging_from_args(args)
     # sync args.model to model_tag, because if we pass the model positionally,
     # args.model will be the default from vLLM's ModelConfig (currently
     # Qwen/Qwen3-0.6B) and crash cryptically.

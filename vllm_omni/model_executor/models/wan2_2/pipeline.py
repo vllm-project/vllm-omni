@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Wan2.x diffusion pipeline topologies (frozen).
 
 Wan runs as a single-stage diffusion model by default (text-encode + DiT
@@ -92,6 +92,11 @@ WAN2_2_EG_PIPELINE = PipelineConfig(
             execution_type=StageExecutionType.DIFFUSION,
             stage_role=DiffusionStageRole.DENOISE_DECODE,
             stage_input_payload_keys=_ENCODE_PAYLOAD_KEYS,
+            stage_input_optional_payload_keys=(
+                "negative_prompt_embeds",
+                "wan_image_condition",
+                "wan_conditioning_metadata",
+            ),
             input_sources=(0,),
             final_output=True,
             final_output_type="video",
@@ -126,6 +131,11 @@ WAN2_2_EGD_PIPELINE = PipelineConfig(
             execution_type=StageExecutionType.DIFFUSION,
             stage_role=DiffusionStageRole.DENOISE,
             stage_input_payload_keys=_ENCODE_PAYLOAD_KEYS,
+            stage_input_optional_payload_keys=(
+                "negative_prompt_embeds",
+                "wan_image_condition",
+                "wan_conditioning_metadata",
+            ),
             stage_output_payload_keys=_DENOISE_PAYLOAD_KEYS,
             input_sources=(0,),
             final_output=False,

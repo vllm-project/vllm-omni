@@ -853,6 +853,8 @@ class Wan22Pipeline(
                 raise ValueError(f"Wan decode expects 5-D BCTHW latents, got shape {tuple(latents.shape)}.")
             latents_per_request.append(latents)
             output_types.append(getattr(req.sampling_params, "output_type", None) or "np")
+            if resolve_wan_preencode_mp4(req.sampling_params, output_type=output_types[-1]):
+                raise ValueError("preencode_mp4 is not supported by the Wan EGD decode stage yet.")
 
         if not latents_per_request:
             return []

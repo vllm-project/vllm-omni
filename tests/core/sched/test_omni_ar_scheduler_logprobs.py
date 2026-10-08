@@ -11,12 +11,14 @@ from types import MethodType, SimpleNamespace
 
 import numpy as np
 import pytest
+import torch
 from vllm.v1.engine import FinishReason
 from vllm.v1.outputs import LogprobsLists
 from vllm.v1.request import RequestStatus
 
 from vllm_omni.core.sched.omni_ar_scheduler import OmniARScheduler, _slice_sampled_logprobs
 from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin
+from vllm_omni.outputs import OmniModelRunnerOutput
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -132,11 +134,13 @@ def _make_scheduler_stub(requests: list[_Request]) -> SimpleNamespace:
     scheduler = SimpleNamespace(
         perf_metrics=None,
         connector=None,
+        aux_output_connector=None,
         chunk_transfer_adapter=None,
         requests={request.request_id: request for request in requests},
         running=list(requests),
         waiting=_RequestQueue(),
-        skipped_waiting=_RequestQueue(),
+        kv_holding_waiting=_RequestQueue(),
+        deferred_waiting=set(),
         structured_output_manager=SimpleNamespace(accept_tokens=lambda _request, _token_ids: True),
         transfer_triggered_requests=set(),
         active_kv_transfers=set(),
@@ -290,6 +294,36 @@ def test_invalid_logprobs_finish_only_the_affected_scheduler_request() -> None:
     assert output_by_id["bad"].new_token_ids == []
     assert output_by_id["good"].new_token_ids == [8]
     np.testing.assert_array_equal(output_by_id["good"].new_logprobs.logprob_token_ids[:, 0], [8])
+
+
+@pytest.mark.parametrize("scored", [False, True])
+def test_fixed_token_scores_reach_engine_output(scored) -> None:
+    request = _Request("req")
+    request.sampling_params.num_logprobs = None
+    scheduler = _make_scheduler_stub([request])
+    _bind_request_lifecycle(scheduler, update_request=lambda req, tokens: (tokens, False))
+    scheduler_output = SimpleNamespace(
+        num_scheduled_tokens={"req": 3},
+        scheduled_spec_decode_tokens={},
+        num_invalid_spec_tokens=0,
+    )
+    scores = torch.tensor([[-0.5, -1.5], [-0.2, -2.2]])
+    model_runner_output = OmniModelRunnerOutput(
+        req_ids=["req"],
+        req_id_to_index={"req": 0},
+        sampled_token_ids=[[7]],
+        prompt_logprobs_dict={},
+        prompt_token_id_logprobs_dict={"req": scores} if scored else {},
+    )
+
+    outputs = OmniARScheduler.update_from_output(scheduler, scheduler_output, model_runner_output)
+    (output,) = outputs[0].outputs
+
+    assert output.new_token_ids == [7]
+    if scored:
+        torch.testing.assert_close(output.prompt_token_id_logprobs, scores)
+    else:
+        assert output.prompt_token_id_logprobs is None
 
 
 def _pooling_model_runner_output(pooler_tensor) -> SimpleNamespace:
