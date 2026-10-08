@@ -1,11 +1,13 @@
 # --8<-- [start:requirements]
 
-- GPU: compute capability 7.0 or higher (e.g., V100, T4, RTX20xx, A100, L4, H100, etc.)
+- GPU: compute capability 7.5 or higher (e.g., T4, RTX20xx, A100, L4, H100, etc.)
 
 # --8<-- [end:requirements]
 # --8<-- [start:set-up-using-python]
 
-vLLM-Omni depends on the matching major/minor release of vLLM. The vLLM-Omni 0.28.x release line uses vLLM 0.28.x.
+vLLM-Omni depends on the matching major/minor release of vLLM. This source
+checkout targets vLLM 0.31.0. The pre-built Omni wheel instructions below install
+the published 0.30.0 release with its matching vLLM dependency.
 
 !!! note
     PyTorch installed via `conda` will statically link `NCCL` library, which can cause issues when vLLM tries to use `NCCL`. See <gh-issue:8420> for more details.
@@ -18,20 +20,22 @@ Therefore, it is recommended to install vLLM and vLLM-Omni with a **fresh new** 
 
 #### Installation of vLLM
 
+These pre-built wheel instructions install the published vLLM-Omni 0.30.0 release.
+
 vLLM-Omni is built based on vLLM. Please install it with command below.
 ```bash
-uv pip install vllm==0.28.0 --torch-backend=auto
+uv pip install vllm==0.30.0 --torch-backend=auto
 ```
 
 #### Installation of vLLM-Omni
 
 ```bash
-uv pip install vllm-omni
+uv pip install vllm-omni==0.30.0
 ```
 
 To run Gradio demos, also install the optional extras:
 ```bash
-uv pip install 'vllm-omni[demo]'
+uv pip install 'vllm-omni[demo]==0.30.0'
 ```
 
 # --8<-- [end:pre-built-wheels]
@@ -39,13 +43,17 @@ uv pip install 'vllm-omni[demo]'
 # --8<-- [start:build-wheel-from-source]
 
 #### Installation of vLLM
-If you do not need to modify source code of vLLM, you can directly install the stable 0.28.0 release version of the library
+If you do not need to modify source code of vLLM, install the final 0.31.0
+release wheel from its commit-pinned index:
 
 ```bash
-uv pip install vllm==0.28.0 --torch-backend=auto
+uv pip install vllm==0.31.0 --torch-backend=auto \
+  --extra-index-url https://wheels.vllm.ai/db9527a46873454610df6dbedf79a36d6bf1a7f6
 ```
 
-The 0.28.0 release of vLLM ships CUDA 13.0-compatible binaries by default. If you need a different CUDA variant or want to reuse an existing PyTorch installation, build vLLM from source instead.
+The default 0.31.0 wheel contains CUDA 12.9 binaries. If you need a different
+CUDA variant or want to reuse an existing PyTorch installation, build vLLM
+from source instead.
 
 #### Installation of vLLM-Omni
 Since vllm-omni is rapidly evolving, it's recommended to install it from source
@@ -66,16 +74,16 @@ If you want to check, modify or debug with source code of vLLM, install the libr
 ```bash
 git clone https://github.com/vllm-project/vllm.git
 cd vllm
-git checkout v0.28.0
+git checkout v0.31.0
 ```
 Set up environment variables to get pre-built wheels. If there are internet problems, just download the whl file manually. And set `VLLM_PRECOMPILED_WHEEL_LOCATION` as your local absolute path of whl file.
 ```bash
-#For CUDA 13.0 (the default for v0.28.0; the wheel filename has no `+cu130` suffix)
-export VLLM_PRECOMPILED_WHEEL_LOCATION=https://github.com/vllm-project/vllm/releases/download/v0.28.0/vllm-0.28.0-cp38-abi3-manylinux_2_28_x86_64.whl
+# Default CUDA 12.9 wheel for v0.31.0 on x86_64
+export VLLM_PRECOMPILED_WHEEL_LOCATION=https://wheels.vllm.ai/db9527a46873454610df6dbedf79a36d6bf1a7f6/vllm-0.31.0-cp38-abi3-manylinux_2_28_x86_64.whl
 ```
 Install vllm with command below (If you have no existing PyTorch).
 ```bash
-uv pip install --editable .
+VLLM_USE_PRECOMPILED=1 uv pip install --editable . --torch-backend=auto
 ```
 Install vllm with command below (If you already have PyTorch).
 ```bash
@@ -109,7 +117,7 @@ docker run --runtime nvidia --gpus 2 \
     --env "HF_TOKEN=$HF_TOKEN" \
     -p 8091:8091 \
     --ipc=host \
-    vllm/vllm-omni:v0.28.0 \
+    vllm/vllm-omni:v0.30.0 \
     vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091
 ```
 
@@ -126,12 +134,13 @@ docker run --runtime nvidia --gpus 2 \
 DOCKER_BUILDKIT=1 docker build -f docker/Dockerfile.cuda -t vllm-omni-cuda .
 ```
 
-If you want to specify the base vLLM version:
+The source build defaults to `vllm/vllm-openai:v0.31.0`. To select that
+upstream release image explicitly:
 
 ```bash
 DOCKER_BUILDKIT=1 docker build \
   -f docker/Dockerfile.cuda \
-  --build-arg BASE_IMAGE=vllm/vllm-openai:v0.28.0 \
+  --build-arg BASE_IMAGE=vllm/vllm-openai:v0.31.0 \
   -t vllm-omni-cuda .
 ```
 

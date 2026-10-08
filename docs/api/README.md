@@ -5,6 +5,9 @@
 Main entry points for vLLM-Omni inference and serving.
 
 - [vllm_omni.entrypoints.async_omni.AsyncOmni][]
+- [vllm_omni.entrypoints.async_omni_base.AsyncOmniBase][]
+- [vllm_omni.entrypoints.duplex_omni.DuplexOmni][]
+- [vllm_omni.entrypoints.duplex_omni.DuplexSessionHandle][]
 - [vllm_omni.engine.cfg_companion_tracker.CfgCompanionTracker][]
 - [vllm_omni.entrypoints.cli.benchmark.base.OmniBenchmarkSubcommandBase][]
 - [vllm_omni.entrypoints.cli.benchmark.main.OmniBenchmarkSubcommand][]
@@ -17,12 +20,13 @@ Main entry points for vLLM-Omni inference and serving.
 
 ## Clients
 
-Client libraries that talk to a running vLLM-Omni server (the full-duplex Realtime client and its per-model session presets).
+Client libraries for full-duplex sessions: the Realtime WebSocket client, the in-process client over `DuplexOmni`, and the per-model session presets.
 
 - [vllm_omni.clients.duplex.AudioDelta][]
 - [vllm_omni.clients.duplex.AudioFormat][]
 - [vllm_omni.clients.duplex.ConnectionResumed][]
 - [vllm_omni.clients.duplex.DuplexClient][]
+- [vllm_omni.clients.duplex.DuplexClientBase][]
 - [vllm_omni.clients.duplex.DuplexClientError][]
 - [vllm_omni.clients.duplex.DuplexConnectionError][]
 - [vllm_omni.clients.duplex.DuplexEvent][]
@@ -44,6 +48,7 @@ Client libraries that talk to a running vLLM-Omni server (the full-duplex Realti
 - [vllm_omni.clients.duplex.TextDelta][]
 - [vllm_omni.clients.duplex.TranscriptDelta][]
 - [vllm_omni.clients.duplex.WebSocketTransport][]
+- [vllm_omni.clients.inline_duplex.InlineDuplexClient][]
 
 ## Inputs
 

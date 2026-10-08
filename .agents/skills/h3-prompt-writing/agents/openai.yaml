@@ -1,0 +1,4 @@
+interface:
+  display_name: "H3 Prompt Writing"
+  short_description: "Write structured H3 prompts for each input mode"
+  default_prompt: "Use $h3-prompt-writing to prepare the requested H3 prompts or video with the available tools."

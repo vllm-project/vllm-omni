@@ -3,8 +3,10 @@
 
 """WebSocket handler for streaming text input TTS.
 
-Accepts text incrementally via WebSocket, buffers it until input.done, and
-generates audio once for the buffered input using the existing TTS pipeline.
+Accepts text incrementally via WebSocket. By default (split_granularity=none)
+it buffers until input.done and generates audio once for the buffered input.
+Opting into split_granularity=sentence or clause emits a TTS request at each
+detected boundary so incremental STT/LLM clients can hear audio before flush.
 
 input.done is a flush, not a close: it ends the current utterance and the
 connection stays open, so the next utterance reuses the same connection
@@ -13,9 +15,10 @@ session.close, on the idle timeout, or when the client closes the socket.
 The session config is sticky across flushes and can be replaced by sending
 another session.config between utterances.
 
-"Utterance" here names the flush unit rather than any linguistic unit: it is
-whatever text the client had buffered when it sent input.done, from a word to
-several paragraphs, synthesized as a single request.
+"Utterance" here names the flush unit. With split_granularity=none it is
+whatever text was buffered when input.done arrived, synthesized as one
+request. With sentence/clause splitting it is still one input.done cycle,
+but sentence_index counts linguistic units inside that flush.
 
 Protocol:
     Client -> Server:
@@ -27,16 +30,18 @@ Protocol:
     Server -> Client (default, word_timestamps=false):
         {"type": "audio.start", "utterance_index": 0, "sentence_index": 0,
          "sentence_text": "...", "format": "wav"}
+        # With stream_audio=true, audio.start is sent with the first audio
+        # chunk; for format "pcm" it also carries that audio's "sample_rate"
+        # and "channels" (s16le, interleaved, model-native).
         <binary frame: audio bytes>
         ...
         {"type": "audio.done", "utterance_index": 0, "sentence_index": 0}
         {"type": "session.done", "utterance_index": 0, "total_sentences": N}
         {"type": "error", "message": "..."}
-        # session.done ends the flushed utterance, not the connection. An
-        # utterance is just the flush unit: whatever text was buffered when
-        # input.done arrived, of any length. utterance_index counts those
-        # flushes across the connection, while sentence_index counts within
-        # one of them and so pairs with total_sentences.
+        # session.done ends the flushed utterance, not the connection.
+        # utterance_index counts input.done flushes. sentence_index counts
+        # TTS requests inside one flush (always 0 of 1 when split_granularity
+        # is none; 0..N-1 when sentence/clause splitting is enabled).
 
     Server -> Client (when word_timestamps=true):
         {"type": "audio.start", "utterance_index": 0, "sentence_index": 0,
@@ -53,6 +58,8 @@ Protocol:
 import asyncio
 import base64
 import json
+import time
+from collections.abc import Awaitable, Callable
 from contextlib import aclosing
 
 from fastapi import WebSocket, WebSocketDisconnect
@@ -64,6 +71,7 @@ from vllm_omni.entrypoints.openai.protocol.audio import (
     StreamingSpeechSessionConfig,
 )
 from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
+from vllm_omni.entrypoints.openai.speech_text_splitter import SpeechTextSplitter
 from vllm_omni.utils.forced_aligner import extract_word_timestamps
 
 logger = init_logger(__name__)
@@ -71,7 +79,7 @@ logger = init_logger(__name__)
 _DEFAULT_IDLE_TIMEOUT = 30.0  # seconds
 _DEFAULT_CONFIG_TIMEOUT = 10.0  # seconds
 _PCM_SAMPLE_RATE = 24000
-_BYTES_PER_SAMPLE = 2  # 16-bit mono PCM
+_BYTES_PER_SAMPLE = 2  # 16-bit PCM, per channel
 _MAX_CONFIG_MESSAGE_SIZE = 4 * 1024 * 1024  # allow large ref_audio payloads
 _MAX_INPUT_TEXT_MESSAGE_SIZE = 128 * 1024
 
@@ -79,11 +87,10 @@ _MAX_INPUT_TEXT_MESSAGE_SIZE = 128 * 1024
 class OmniStreamingSpeechHandler:
     """Handles WebSocket sessions for streaming text-input TTS.
 
-    A connection carries one or more utterances. Text arrives incrementally,
-    is buffered until input.done, and audio is generated once for the
-    buffered input using the existing OmniOpenAIServingSpeech pipeline. The
-    connection outlives each utterance so a client can keep synthesizing on
-    it without reconnecting.
+    A connection carries one or more utterances. Text arrives incrementally.
+    With split_granularity=none it is buffered until input.done and synthesized
+    as one request. sentence/clause modes emit a request at each boundary,
+    including before input.done. The connection outlives each utterance.
 
     Args:
         speech_service: The existing TTS serving instance (reused for
@@ -105,17 +112,20 @@ class OmniStreamingSpeechHandler:
     async def handle_session(self, websocket: WebSocket) -> None:
         """Main loop for a single WebSocket connection.
 
-        Serves any number of utterances: text is buffered until input.done,
-        which flushes it as one TTS request and then leaves the connection
-        open for the next one. Rejecting a message is only fatal before the
-        first valid session.config; afterwards the error is reported and the
-        connection survives.
+        Serves any number of utterances. input.done always ends a flush;
+        split_granularity controls whether that flush is one TTS request or
+        several sentence/clause requests.
         """
         await websocket.accept()
 
         config: StreamingSpeechSessionConfig | None = None
-        text_parts: list[str] = []
+        splitter = SpeechTextSplitter("none")
         utterance_index = 0
+        sentence_index = 0
+        # An utterance is in progress from the first input.text until the next
+        # input.done. Buffered text is not enough to detect it: sentence/clause
+        # splitting can leave the buffer empty after emitting a unit.
+        utterance_open = False
 
         try:
             while True:
@@ -140,10 +150,10 @@ class OmniStreamingSpeechHandler:
                 msg_type = msg.get("type")
 
                 if msg_type == "session.config":
-                    if text_parts:
+                    if utterance_open:
                         await self._send_error(
                             websocket,
-                            "session.config cannot be applied while input is buffered; send input.done first",
+                            "session.config cannot be applied while an utterance is in progress; send input.done first",
                         )
                         continue
                     new_config = await self._build_config(websocket, msg)
@@ -152,6 +162,7 @@ class OmniStreamingSpeechHandler:
                             return  # Error already sent, connection closing
                         continue  # Keep serving with the previous config
                     config = new_config
+                    splitter = SpeechTextSplitter(config.split_granularity)
 
                 elif config is None:
                     await self._send_error(
@@ -165,32 +176,39 @@ class OmniStreamingSpeechHandler:
                     if not isinstance(text, str):
                         await self._send_error(websocket, "input.text requires a string value")
                         continue
-                    text_parts.append(text)
-
-                elif msg_type == "input.done":
-                    full_text = "".join(text_parts).strip()
-                    text_parts.clear()
-                    total_sentences = 0
-                    if full_text:
-                        # However long the buffered text is, the pipeline takes
-                        # it as one request, so every flush is sentence 0 of 1.
+                    if text:
+                        utterance_open = True
+                    for unit in splitter.feed(text):
                         await self._generate_and_send(
                             websocket,
                             config,
-                            full_text,
+                            unit,
                             utterance_index=utterance_index,
-                            sentence_index=0,
+                            sentence_index=sentence_index,
                         )
-                        total_sentences = 1
+                        sentence_index += 1
+
+                elif msg_type == "input.done":
+                    for unit in splitter.flush():
+                        await self._generate_and_send(
+                            websocket,
+                            config,
+                            unit,
+                            utterance_index=utterance_index,
+                            sentence_index=sentence_index,
+                        )
+                        sentence_index += 1
 
                     await websocket.send_json(
                         {
                             "type": "session.done",
                             "utterance_index": utterance_index,
-                            "total_sentences": total_sentences,
+                            "total_sentences": sentence_index,
                         }
                     )
                     utterance_index += 1
+                    sentence_index = 0
+                    utterance_open = False
 
                 elif msg_type == "session.close":
                     await websocket.close()
@@ -271,6 +289,8 @@ class OmniStreamingSpeechHandler:
         ``utterance_index`` identifies the flush this sentence belongs to and
         ``sentence_index`` its position inside that flush.
         """
+        request_arrival_ts = time.time()
+        request_start_s = time.perf_counter()
         response_format = config.response_format or "wav"
 
         # Reject unmet word-timestamps preconditions early with a clear reason.
@@ -310,6 +330,7 @@ class OmniStreamingSpeechHandler:
             speaker_embedding=config.speaker_embedding,
             stream=config.stream_audio,
             word_timestamps=config.word_timestamps,
+            seed=config.seed,
         )
 
         start_payload = {
@@ -319,20 +340,38 @@ class OmniStreamingSpeechHandler:
             "sentence_text": sentence_text,
             "format": response_format,
         }
-        if config.stream_audio and response_format == "pcm":
-            # Nominal stream rate; each audio.chunk carries the authoritative
-            # per-chunk sample_rate.
-            start_payload["sample_rate"] = _PCM_SAMPLE_RATE
         if config.word_timestamps:
             start_payload["word_timestamps"] = True
-        await websocket.send_json(start_payload)
+        # Streamed pcm is model-native s16le. Its rate and channel count are
+        # known once the first chunk is encoded, so for pcm audio.start is
+        # deferred to that point and states them; it is sent bare if no audio
+        # arrives. Non-streamed responses still send it before generation.
+        describe_pcm = config.stream_audio and response_format == "pcm"
+        audio_format: dict[str, int] = {}
+        start_sent = False
+
+        async def send_start() -> None:
+            nonlocal start_sent
+            if start_sent:
+                return
+            start_sent = True
+            if describe_pcm and audio_format:
+                start_payload["sample_rate"] = audio_format["sample_rate"]
+                start_payload["channels"] = audio_format["channels"]
+            await websocket.send_json(start_payload)
+
+        if not describe_pcm:
+            await send_start()
 
         total_bytes = 0
         generation_failed = False
         request_id = None
         try:
             if config.stream_audio:
-                request_id, generator, tts_params = await self._speech_service._prepare_speech_generation(request)
+                request_id, generator, tts_params = await self._speech_service._prepare_speech_generation(
+                    request,
+                    arrival_time=request_arrival_ts,
+                )
                 if config.word_timestamps:
                     total_bytes = await self._stream_audio_with_alignments(
                         websocket=websocket,
@@ -342,21 +381,32 @@ class OmniStreamingSpeechHandler:
                         utterance_index=utterance_index,
                         sentence_index=sentence_index,
                         language=config.language,
+                        request_start_s=request_start_s,
+                        request_arrival_ts=request_arrival_ts,
                         tts_params=tts_params,
+                        audio_format=audio_format,
+                        send_start=send_start,
                     )
                 else:
                     async with aclosing(
                         self._speech_service._generate_pcm_chunks(
                             generator,
                             request_id,
+                            request_start_s=request_start_s,
+                            request_arrival_ts=request_arrival_ts,
                             tts_params=tts_params,
+                            audio_format=audio_format,
                         )
                     ) as stream:
                         async for chunk in stream:
+                            await send_start()
                             total_bytes += len(chunk)
                             await websocket.send_bytes(chunk)
             else:
-                audio_bytes, _ = await self._speech_service._generate_audio_bytes(request)
+                audio_bytes, _ = await self._speech_service._generate_audio_bytes(
+                    request,
+                    request_arrival_ts=request_arrival_ts,
+                )
                 total_bytes = len(audio_bytes)
                 await websocket.send_bytes(audio_bytes)
         except WebSocketDisconnect:
@@ -374,6 +424,10 @@ class OmniStreamingSpeechHandler:
                 sentence_index,
                 e,
             )
+            try:
+                await send_start()
+            except Exception:
+                logger.debug("Failed to send audio.start for sentence %d", sentence_index, exc_info=True)
             await self._send_error(
                 websocket,
                 f"Generation failed for utterance {utterance_index}, sentence {sentence_index}: {e}",
@@ -381,6 +435,9 @@ class OmniStreamingSpeechHandler:
             )
         finally:
             try:
+                if not start_sent:
+                    # Keep audio.start/audio.done paired when no audio was produced.
+                    await send_start()
                 await websocket.send_json(
                     {
                         "type": "audio.done",
@@ -402,8 +459,12 @@ class OmniStreamingSpeechHandler:
         sentence_text: str,
         utterance_index: int,
         sentence_index: int,
+        request_start_s: float,
+        request_arrival_ts: float,
         language: str | None = None,
         tts_params: dict | None = None,
+        audio_format: dict[str, int] | None = None,
+        send_start: Callable[[], Awaitable[None]] | None = None,
     ) -> int:
         """Stream PCM as JSON ``audio.chunk`` frames, aligned per sentence.
 
@@ -421,6 +482,10 @@ class OmniStreamingSpeechHandler:
         chunk_id = 0
         # Receives the aligner stage's pooling output from the generator.
         collect: dict = {}
+        audio_format = audio_format if audio_format is not None else {}
+
+        def frame_bytes() -> int:
+            return _BYTES_PER_SAMPLE * int(audio_format.get("channels", 1))
 
         async def send_chunk(
             chunk: bytes,
@@ -430,6 +495,8 @@ class OmniStreamingSpeechHandler:
             chunk_end_ms: int,
         ) -> None:
             nonlocal chunk_id
+            if send_start is not None:
+                await send_start()
             await websocket.send_json(
                 {
                     "type": "audio.chunk",
@@ -439,6 +506,7 @@ class OmniStreamingSpeechHandler:
                     "chunk_start_ms": chunk_start_ms,
                     "chunk_end_ms": chunk_end_ms,
                     "sample_rate": chunk_sample_rate,
+                    "channels": int(audio_format.get("channels", 1)),
                     "audio_b64": base64.b64encode(chunk).decode("ascii"),
                     "timestamps": timestamps_payload,
                 }
@@ -449,16 +517,20 @@ class OmniStreamingSpeechHandler:
             self._speech_service._generate_pcm_chunks(
                 generator,
                 request_id,
+                request_start_s=request_start_s,
+                request_arrival_ts=request_arrival_ts,
                 include_sample_rate=True,
                 tts_params=tts_params,
                 collect=collect,
+                cumulative_audio=True,
+                audio_format=audio_format,
             )
         ) as stream:
             async for chunk, chunk_sample_rate in stream:
                 sample_rate = chunk_sample_rate
-                chunk_start_ms = int(round((audio_bytes_seen / _BYTES_PER_SAMPLE / sample_rate) * 1000.0))
+                chunk_start_ms = int(round((audio_bytes_seen / frame_bytes() / sample_rate) * 1000.0))
                 audio_bytes_seen += len(chunk)
-                chunk_end_ms = int(round((audio_bytes_seen / _BYTES_PER_SAMPLE / sample_rate) * 1000.0))
+                chunk_end_ms = int(round((audio_bytes_seen / frame_bytes() / sample_rate) * 1000.0))
                 total_bytes += len(chunk)
                 # Audio first, timestamps after the whole sentence is aligned.
                 await send_chunk(chunk, chunk_sample_rate, None, chunk_start_ms, chunk_end_ms)
@@ -470,7 +542,7 @@ class OmniStreamingSpeechHandler:
         timestamps_payload = (
             extract_word_timestamps(aligner_res, sentence_text, language) if aligner_res is not None else None
         )
-        sentence_end_ms = int(round((audio_bytes_seen / _BYTES_PER_SAMPLE / sample_rate) * 1000.0))
+        sentence_end_ms = int(round((audio_bytes_seen / frame_bytes() / sample_rate) * 1000.0))
         await send_chunk(b"", sample_rate, timestamps_payload, 0, sentence_end_ms)
 
         return total_bytes

@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Run two MiniCPM-o Realtime duplex demo processes concurrently.
 
 This E2E driver covers the same process boundary users exercise manually:
@@ -14,13 +17,12 @@ import hashlib
 import io
 import json
 import sys
-import uuid
 import wave
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 DEMO_PATH = REPO_ROOT / "examples/online_serving/minicpmo/realtime_duplex_demo.py"
-AUDIO_DELTA_EVENTS = {"response.audio.delta", "response.output_audio.delta"}
+AUDIO_DELTA_EVENTS = {"response.output_audio.delta"}
 
 
 def _canonical_path(path: str) -> Path:
@@ -263,8 +265,6 @@ async def _run_demo_process(
         str(args.chunk_ms),
         "--timeout-s",
         str(args.timeout_s),
-        "--session-id",
-        f"duplex-pair-{label}-{uuid.uuid4().hex}",
     ]
     if args.no_realtime_pacing:
         command.append("--no-realtime-pacing")

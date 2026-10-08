@@ -48,6 +48,11 @@ from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_p
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.models.utils import _load_json
+from vllm_omni.diffusion.offloader.config import (
+    OffloadStrategy,
+    offload_enabled,
+    resolve_offload_strategy,
+)
 from vllm_omni.diffusion.postprocess import interpolate_video_tensor
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import resolve_video_num_frames
@@ -273,24 +278,20 @@ def retrieve_timesteps(
 
 
 def _validate_cache_offload_parallelism(od_config: OmniDiffusionConfig) -> None:
-    cache_backend = od_config.cache_backend
+    # Treat None like "none", matching the other pipelines' cache checks.
+    cache_backend = od_config.cache_backend or "none"
     if cache_backend not in ("none", "cache_dit"):
         raise NotImplementedError(
             f"Cache backend {cache_backend!r} is not supported by the native SANA-Video pipeline; "
             "use 'cache_dit' or 'none'."
         )
-    if cache_backend == "cache_dit" and od_config.enable_distributed_layerwise_offload:
+    if cache_backend == "cache_dit" and resolve_offload_strategy(od_config) is OffloadStrategy.DISTRIBUTED_LAYER_WISE:
         raise NotImplementedError(
             "SANA-Video does not support Cache-DiT with distributed layerwise offload; "
             "per-rank cache skips desynchronize the weight AllGather."
         )
 
-    offload_enabled = (
-        od_config.enable_cpu_offload
-        or od_config.enable_layerwise_offload
-        or od_config.enable_distributed_layerwise_offload
-    )
-    if cache_backend == "none" and not offload_enabled:
+    if cache_backend == "none" and not offload_enabled(od_config):
         return
 
     parallel_config = od_config.parallel_config

@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """
 L4 expansion coverage for ``robbyant/lingbot-video-dense-1.3b``.
 
-This file remains dense-only. Basic T2I/T2V/TI2V serving for both dense and MoE
-checkpoints is covered by ``test_lingbot_video.py`` and
-``test_lingbot_video_moe.py``. Distributed feature rows belong in follow-up
+This file remains dense-only. Baseline T2I/T2V/TI2V for the dense checkpoint
+lives in ``test_lingbot_video.py`` (L2/L3). MoE smoke stays in
+``test_lingbot_video_moe.py`` (L4). Distributed feature rows belong in follow-up
 PRs.
 """
 
@@ -26,10 +26,11 @@ MODEL = "robbyant/lingbot-video-dense-1.3b"
 PROMPT = "a robotic arm picks up a red block"
 NEGATIVE_PROMPT = "low quality, blurry, watermark, text"
 
-SINGLE_CARD_FEATURE_MARKS = hardware_marks(res={"cuda": "H100"})
+SINGLE_CARD_FEATURE_MARKS = hardware_marks(res={"cuda": ["H100", "B200"]})
+CFG_OFF_SINGLE_CARD_FEATURE_MARKS = hardware_marks(res={"cuda": ["H100", "B200"], "rocm": "MI325"})
 
 
-def _get_diffusion_feature_cases(model: str):
+def _get_diffusion_feature_cases(model: str, marks):
     return [
         pytest.param(
             OmniServerParams(
@@ -37,12 +38,16 @@ def _get_diffusion_feature_cases(model: str):
                 server_args=["--model-class-name", "LingBotVideoPipeline"],
             ),
             id="default",
-            marks=SINGLE_CARD_FEATURE_MARKS,
+            marks=marks,
         ),
     ]
 
 
-@pytest.mark.parametrize("omni_server", _get_diffusion_feature_cases(MODEL), indirect=True)
+@pytest.mark.parametrize(
+    "omni_server",
+    _get_diffusion_feature_cases(MODEL, CFG_OFF_SINGLE_CARD_FEATURE_MARKS),
+    indirect=True,
+)
 def test_cfg_off(omni_server: OmniServer, openai_client: OpenAIClientHandler) -> None:
     request_config = {
         "model": omni_server.model,
@@ -62,7 +67,11 @@ def test_cfg_off(omni_server: OmniServer, openai_client: OpenAIClientHandler) ->
     openai_client.send_video_diffusion_request(request_config)
 
 
-@pytest.mark.parametrize("omni_server", _get_diffusion_feature_cases(MODEL), indirect=True)
+@pytest.mark.parametrize(
+    "omni_server",
+    _get_diffusion_feature_cases(MODEL, SINGLE_CARD_FEATURE_MARKS),
+    indirect=True,
+)
 def test_batch_cfg_extra_params(omni_server: OmniServer, openai_client: OpenAIClientHandler) -> None:
     request_config = {
         "model": omni_server.model,

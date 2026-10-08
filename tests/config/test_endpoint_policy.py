@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Tests for endpoint restrictions logic."""
 
 import pytest
@@ -42,6 +42,32 @@ def test_restricted_completions_returns_400():
     body = resp.json()
     assert body["error"]["message"] == REJECTION_REASON
     assert body["error"]["type"] == "BadRequestError"
+
+
+def test_restricted_image_edits_returns_400():
+    """Ensure pipelines can reject image edits independently of generation."""
+    app = FastAPI()
+
+    @app.post("/v1/images/edits")
+    async def existing_handler():
+        return {"ok": True}
+
+    @app.post("/v1/images/generations")
+    async def generations_handler():
+        return {"ok": True}
+
+    restrictions = (EndpointRestriction(OmniServingCapability.IMAGE_EDITS, REJECTION_REASON),)
+    shutdown_unsupported_routes(app, restrictions)
+
+    client = TestClient(app)
+    resp = client.post("/v1/images/edits")
+    assert resp.status_code == 400
+    assert resp.json()["error"]["message"] == REJECTION_REASON
+
+    # The restriction is endpoint-specific and must not remove generations.
+    resp = client.post("/v1/images/generations")
+    assert resp.status_code == 200
+    assert resp.json() == {"ok": True}
 
 
 def test_unrestricted_completions_not_blocked():

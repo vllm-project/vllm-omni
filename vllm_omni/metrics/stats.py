@@ -3,9 +3,11 @@
 
 from __future__ import annotations
 
+import copy
+import logging
 import time
 from collections import defaultdict
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -13,7 +15,7 @@ from typing import TYPE_CHECKING, Any
 from vllm.logger import init_logger
 
 from vllm_omni.metrics import definitions as defs
-from vllm_omni.metrics.utils import _build_field_defs, _build_row, _format_table
+from vllm_omni.metrics.utils import _as_float, _as_float_list, _as_int, _build_field_defs, _build_row, _format_table
 
 if TYPE_CHECKING:
     from vllm_omni.metrics.transfer import OmniTransferMetrics
@@ -48,7 +50,7 @@ class StageRequestStats:
     finish_reason: str | None = None
     request_id: str | None = None
     postprocess_time_ms: float = 0.0
-    diffusion_metrics: dict[str, float] = None
+    diffusion_metrics: dict[str, float] | None = None
     audio_generated_frames: int = 0
     audio_sample_rate: int = 0
     audio_duration_s: float = 0.0
@@ -130,6 +132,11 @@ STAGE_EXCLUDE = {
     "finish_reason",
     "pipeline_timings",
 }
+# Duplex logs one StageRequestStats table per response. Chunk submits refresh
+# ``request_timestamp``, so serving_time_to_first_output_ms is often a clamped
+# 0 on the audio column and is not a useful TTFP. HTTP ``--print-stage`` keeps
+# the row.
+DUPLEX_STAGE_TABLE_EXCLUDE = frozenset({defs.SERVING_TIME_TO_FIRST_OUTPUT_MS})
 TRANSFER_EXCLUDE = {"from_stage", "to_stage", "request_id", "used_shm"}
 E2E_EXCLUDE = {"request_id"}
 
@@ -138,6 +145,86 @@ OVERALL_FIELDS: list[str] | None = None
 STAGE_FIELDS = _build_field_defs(StageRequestStats, STAGE_EXCLUDE, FIELD_TRANSFORMS)
 TRANSFER_FIELDS = _build_field_defs(TransferEdgeStats, TRANSFER_EXCLUDE, FIELD_TRANSFORMS)
 E2E_FIELDS = _build_field_defs(RequestE2EStats, E2E_EXCLUDE, FIELD_TRANSFORMS)
+
+
+def _tpot_interval_weight(token_count: object) -> int:
+    if isinstance(token_count, int | float) and not isinstance(token_count, bool):
+        return max(int(token_count) - 1, 1)
+    return 1
+
+
+def _weighted_tpot_ms(events: Sequence[StageRequestStats]) -> float | None:
+    weighted_ms = 0.0
+    weight = 0
+    for event in events:
+        tpot_ms = float(event.vllm_tpot_ms)
+        if tpot_ms <= 0:
+            continue
+        chunk_weight = _tpot_interval_weight(event.num_tokens_out)
+        weighted_ms += tpot_ms * chunk_weight
+        weight += chunk_weight
+    if weight <= 0:
+        return None
+    return weighted_ms / float(weight)
+
+
+def _apply_merged_stage_stats(template: StageRequestStats, merged: dict[str, object]) -> StageRequestStats:
+    """Write one ``_merge_stage_metric_event`` snapshot back onto a stats row."""
+    stats = copy.copy(template)
+    stats.stage_id = _as_int(merged.get("stage_id"), default=template.stage_id or 0)
+    stats.final_output_type = (
+        str(merged["final_output_type"])
+        if isinstance(merged.get("final_output_type"), str)
+        else template.final_output_type
+    )
+    stats.finish_reason = str(merged["finish_reason"]) if isinstance(merged.get("finish_reason"), str) else None
+    stats.num_tokens_in = _as_int(merged.get(defs.NUM_TOKENS_IN))
+    stats.num_tokens_out = _as_int(merged.get(defs.NUM_TOKENS_OUT))
+    stats.stage_gen_time_ms = _as_float(merged.get(defs.STAGE_GEN_TIME_MS))
+    stats.postprocess_time_ms = _as_float(merged.get(defs.POSTPROCESS_TIME_MS))
+    stats.audio_generated_frames = _as_int(merged.get(defs.AUDIO_FRAMES))
+    stats.audio_sample_rate = _as_int(merged.get(defs.AUDIO_SAMPLE_RATE))
+    stats.audio_duration_s = _as_float(merged.get(f"{defs.AUDIO_DURATION}_s"))
+    stats.image_pixels = _as_int(merged.get(defs.IMAGE_PIXELS))
+    stats.denoise_step_latency_ms = _as_float(merged.get(defs.DENOISE_STEP_LATENCY_MS))
+    stats.output_unit_type = (
+        str(merged["output_unit_type"])
+        if isinstance(merged.get("output_unit_type"), str)
+        else template.output_unit_type
+    )
+    stats.output_unit_count = _as_int(merged.get(defs.OUTPUT_UNIT_COUNT))
+    stats.serving_time_to_first_output_ms = _as_float(merged.get(defs.SERVING_TIME_TO_FIRST_OUTPUT_MS))
+    stats.image_time_to_first_output_ms = _as_float(merged.get(defs.IMAGE_TIME_TO_FIRST_OUTPUT_MS))
+    stats.time_per_output_unit_ms = _as_float(merged.get(defs.TIME_PER_OUTPUT_UNIT_MS))
+    stats.inter_output_latencies_ms = _as_float_list(merged.get(defs.INTER_OUTPUT_LATENCIES_MS))
+    stats.inter_output_latency_ms = _as_float(merged.get(defs.INTER_OUTPUT_LATENCY_MS))
+    stats.vllm_ttft_ms = _as_float(merged.get(defs.VLLM_TTFT_MS))
+    stats.vllm_tpot_ms = _as_float(merged.get(defs.VLLM_TPOT_MS))
+    stats.vllm_itls_ms = _as_float_list(merged.get(defs.VLLM_ITLS_MS))
+    stats.vllm_itl_ms = _as_float(merged.get(defs.VLLM_ITL_MS))
+    return stats
+
+
+def _one_row_per_stage(events: list[StageRequestStats]) -> list[StageRequestStats]:
+    """Fold chunk snapshots so the logger table has one column per stage."""
+    merged_by_stage: dict[int, dict[str, object]] = {}
+    templates: dict[int, StageRequestStats] = {}
+    chunks_by_stage: dict[int, list[StageRequestStats]] = {}
+    for evt in events:
+        if evt.stage_id is None:
+            continue
+        sid = int(evt.stage_id)
+        templates.setdefault(sid, evt)
+        chunks_by_stage.setdefault(sid, []).append(evt)
+        merged_by_stage[sid] = OrchestratorAggregator._merge_stage_metric_event(merged_by_stage.get(sid), evt)
+    rows: list[StageRequestStats] = []
+    for sid in sorted(merged_by_stage):
+        merged = merged_by_stage[sid]
+        tpot_ms = _weighted_tpot_ms(chunks_by_stage[sid])
+        if tpot_ms is not None:
+            merged[defs.VLLM_TPOT_MS] = tpot_ms
+        rows.append(_apply_merged_stage_stats(templates[sid], merged))
+    return rows
 
 
 class OrchestratorAggregator:
@@ -150,10 +237,12 @@ class OrchestratorAggregator:
         *,
         transfer_emitter: OmniTransferMetrics | None = None,
         replica_resolver: Callable[[int, str], int | None] | None = None,
+        stage_table_exclude: frozenset[str] = frozenset(),
     ) -> None:
         self.num_stages = int(num_stages)
         self.log_stats = bool(log_stats)
         self.final_stage_id_for_e2e = final_stage_id_for_e2e
+        self.stage_table_exclude = frozenset(stage_table_exclude)
         self.init_run_state(wall_start_ts)
         self.stage_events: dict[str, list[StageRequestStats]] = {}
         self.transfer_events: dict[
@@ -181,11 +270,11 @@ class OrchestratorAggregator:
         self.e2e_total_ms = 0.0
         self.e2e_total_tokens = 0
         self.e2e_count = 0
-        self.e2e_done = set()
+        self.e2e_done: set[str] = set()
         self.wall_start_ts = float(wall_start_ts)
         self.last_finish_ts = float(wall_start_ts)
-        self.stage_first_ts = [None for _ in range(self.num_stages)]
-        self.stage_last_ts = [None for _ in range(self.num_stages)]
+        self.stage_first_ts: list[float | None] = [None for _ in range(self.num_stages)]
+        self.stage_last_ts: list[float | None] = [None for _ in range(self.num_stages)]
         self.accumulated_gen_time_ms: defaultdict[str, defaultdict[int, float]] = defaultdict(
             lambda: defaultdict(float)
         )  # {request_id: {stage_id:accumulated_gen_time_ms}}
@@ -618,6 +707,7 @@ class OrchestratorAggregator:
         final_output_type: str | None = None,
     ) -> None:
         stats = self._as_stage_request_stats(stage_id, req_id, metrics, final_output_type)
+        assert stats.stage_id is not None
         self.stage_total_tokens[stats.stage_id] += int(stats.num_tokens_out)
         if stats.stage_id == 0:
             self.stage_total_tokens[stats.stage_id] += int(stats.num_tokens_in)
@@ -656,6 +746,7 @@ class OrchestratorAggregator:
     _MS_TO_S: dict[str, str] = {
         "preprocess_time_ms": "preprocess_time_s",
         "diffusion_engine_exec_time_ms": "diffusion_engine_exec_time_s",
+        "output_ready_wait_time_ms": "output_ready_wait_time_s",
         "postprocess_time_ms": "postprocess_time_s",
         "vae_decode_time_ms": "vae_decode_time_s",
         "forward_time_ms": "forward_time_s",
@@ -761,9 +852,62 @@ class OrchestratorAggregator:
             for cached_key in [k for k in self._replica_cache if k[1] == rid_key]:
                 self._replica_cache.pop(cached_key, None)
 
+    def log_timing_summary(self) -> None:
+        """Emit only the concise per-request ``[OmniTiming]`` lines.
+
+        The serving path uses this unless DEBUG tables are requested; it skips
+        the table rows that ``build_and_log_summary`` builds for its result.
+        """
+        if not self.log_stats:
+            return
+        if logger.isEnabledFor(logging.DEBUG):
+            self.build_and_log_summary()
+            return
+        for rid in sorted(set(self.stage_events.keys()) | {e.request_id for e in self.e2e_events}):
+            e2e_evt = next((e for e in self.e2e_events if e.request_id == rid), None)
+            stage_evts = sorted(
+                self.stage_events.get(rid, []),
+                key=lambda e: e.stage_id if e.stage_id is not None else -1,
+            )
+            self._log_omni_timing(rid, e2e_evt, stage_evts)
+
+    def _log_omni_timing(self, rid: str, e2e_evt: RequestE2EStats | None, stage_evts: list[StageRequestStats]) -> None:
+        pt: dict[str, float] = {}
+        if stage_evts:
+            pt = stage_evts[-1].pipeline_timings or {}
+        if pt or e2e_evt:
+            parts = [f"req={rid}"]
+            if e2e_evt:
+                parts.append(f"total={e2e_evt.e2e_total_ms / 1000.0:.2f}s")
+            if "preprocess_ms" in pt:
+                parts.append(f"preprocess={pt['preprocess_ms'] / 1000.0:.2f}s")
+            if e2e_evt:
+                engine_ms = e2e_evt.e2e_total_ms - pt.get("preprocess_ms", 0.0)
+                parts.append(f"engine={engine_ms / 1000.0:.2f}s")
+            stage_parts = []
+            for evt in stage_evts:
+                sid = evt.stage_id if evt.stage_id is not None else "?"
+                t = evt.stage_gen_time_ms / 1000.0
+                stage_parts.append(f"{sid}:{t:.2f}s")
+            if stage_parts:
+                parts.append(f"stages=[{','.join(stage_parts)}]")
+            transfer_parts = []
+            for te in self.transfer_events.values():
+                if te.request_id == rid:
+                    transfer_parts.append(f"{te.from_stage}->{te.to_stage}={te.tx_time_ms:.2f}ms")
+            if transfer_parts:
+                parts.append(f"transfers=[{','.join(transfer_parts)}]")
+            if "ar2diffusion_ms" in pt:
+                parts.append(f"ar2diffusion={pt['ar2diffusion_ms']:.2f}ms")
+            logger.info("[OmniTiming] %s", " ".join(parts))
+
     def build_and_log_summary(self) -> dict[str, Any]:
         if not self.log_stats:
             return {}
+        # Per-request tables are diagnostic. Formatting them on the serving
+        # event loop costs more than the request's own bookkeeping, so they
+        # are emitted at DEBUG; the concise [OmniTiming] line stays at INFO.
+        log_tables = logger.isEnabledFor(logging.DEBUG)
         wall_time_ms = max(0.0, (self.last_finish_ts - self.wall_start_ts) * 1000.0)
         e2e_avg_req = (wall_time_ms / self.e2e_count) if self.e2e_count > 0 else 0.0
         e2e_avg_tok = (self.e2e_total_tokens * 1000.0 / wall_time_ms) if wall_time_ms > 0 else 0.0
@@ -774,10 +918,8 @@ class OrchestratorAggregator:
             final_stage_id_map = self.final_stage_id_for_e2e
 
         stage_wall_time_ms = [
-            ((self.stage_last_ts[i] - self.stage_first_ts[i]) * 1000.0)
-            if (self.stage_first_ts[i] is not None and self.stage_last_ts[i] is not None)
-            else 0.0
-            for i in range(self.num_stages)
+            ((last - first) * 1000.0) if first is not None and last is not None else 0.0
+            for first, last in zip(self.stage_first_ts, self.stage_last_ts, strict=True)
         ]
 
         overall_summary = {
@@ -807,8 +949,8 @@ class OrchestratorAggregator:
             v = overall_summary.get(k, None)
             if v not in (0, 0.0, 0.000, None, ""):
                 overall_fields.append(k)
-        if overall_fields:
-            logger.info(
+        if log_tables and overall_fields:
+            logger.debug(
                 "\n%s",
                 _format_table("Overall Summary", overall_summary, overall_fields),
             )
@@ -833,8 +975,8 @@ class OrchestratorAggregator:
                         nonzero_e2e_fields.add(k)
                 value_fields_e2e = sorted(nonzero_e2e_fields)
 
-                if value_fields_e2e:
-                    logger.info(
+                if log_tables and value_fields_e2e:
+                    logger.debug(
                         "\n%s",
                         _format_table(
                             f"RequestE2EStats [request_id={rid}]",
@@ -848,39 +990,13 @@ class OrchestratorAggregator:
                 self.stage_events.get(rid, []),
                 key=lambda e: e.stage_id if e.stage_id is not None else -1,
             )
-            pt = {}
-            if stage_evts:
-                pt = stage_evts[-1].pipeline_timings or {}
-            if pt or e2e_evt:
-                parts = [f"req={rid}"]
-                if e2e_evt:
-                    parts.append(f"total={e2e_evt.e2e_total_ms / 1000.0:.2f}s")
-                if "preprocess_ms" in pt:
-                    parts.append(f"preprocess={pt['preprocess_ms'] / 1000.0:.2f}s")
-                if e2e_evt:
-                    engine_ms = e2e_evt.e2e_total_ms - pt.get("preprocess_ms", 0.0)
-                    parts.append(f"engine={engine_ms / 1000.0:.2f}s")
-                stage_parts = []
-                for evt in stage_evts:
-                    sid = evt.stage_id if evt.stage_id is not None else "?"
-                    t = evt.stage_gen_time_ms / 1000.0
-                    stage_parts.append(f"{sid}:{t:.2f}s")
-                if stage_parts:
-                    parts.append(f"stages=[{','.join(stage_parts)}]")
-                transfer_parts = []
-                for te in self.transfer_events.values():
-                    if te.request_id == rid:
-                        transfer_parts.append(f"{te.from_stage}->{te.to_stage}={te.tx_time_ms:.2f}ms")
-                if transfer_parts:
-                    parts.append(f"transfers=[{','.join(transfer_parts)}]")
-                if "ar2diffusion_ms" in pt:
-                    parts.append(f"ar2diffusion={pt['ar2diffusion_ms']:.2f}ms")
-                logger.info("[OmniTiming] %s", " ".join(parts))
+            self._log_omni_timing(rid, e2e_evt, stage_evts)
 
             # === Stage table (columns = stage_id) ===
             # if any stage has diffusion_metrics, remove postprocess_time_ms field
             # because it is already included in diffusion_metrics
-            local_exclude = STAGE_EXCLUDE.copy()
+            local_exclude: set[str] = set(STAGE_EXCLUDE)
+            local_exclude.update(self.stage_table_exclude)
             has_diffusion_metrics = any(getattr(evt, "diffusion_metrics", None) for evt in stage_evts)
             if has_diffusion_metrics:
                 local_exclude.add("postprocess_time_ms")
@@ -898,7 +1014,7 @@ class OrchestratorAggregator:
 
             result_stage_table.append({"request_id": rid, "stages": stage_rows})
 
-            if stage_rows:
+            if log_tables and stage_rows:
                 # filter out all-zero fields for logging
                 all_value_fields = set()
                 for row in stage_rows:
@@ -917,7 +1033,7 @@ class OrchestratorAggregator:
                         value_fields_list.append(field)
 
                 if value_fields_list:
-                    logger.info(
+                    logger.debug(
                         "\n%s",
                         _format_table(
                             f"StageRequestStats [request_id={rid}]",
@@ -938,7 +1054,7 @@ class OrchestratorAggregator:
             ]
             result_trans_table.append({"request_id": rid, "transfers": transfer_rows})
 
-            if transfer_rows:
+            if log_tables and transfer_rows:
                 # filter out all-zero fields for logging
                 all_value_fields = set()
                 for row in transfer_rows:
@@ -957,7 +1073,7 @@ class OrchestratorAggregator:
                         value_fields_list.append(field)
 
                 if value_fields_list:
-                    logger.info(
+                    logger.debug(
                         "\n%s",
                         _format_table(
                             f"TransferEdgeStats [request_id={rid}]",
