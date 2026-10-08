@@ -33,6 +33,7 @@ implementation contract; it is not, by itself, a general support claim.
 
 #### OmniConnector implementations
 
+- [CUDA IPC Connector](feature/omni_connectors/cuda_ipc_connector.md)
 - [Mooncake Store Connector](feature/omni_connectors/mooncake_store_connector.md)
 - [Mooncake Transfer Engine Connector](feature/omni_connectors/mooncake_transfer_engine_connector.md)
 - [Mori Transfer Engine Connector](feature/omni_connectors/mori_transfer_engine_connector.md)

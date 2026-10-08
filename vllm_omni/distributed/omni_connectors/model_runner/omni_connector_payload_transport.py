@@ -52,6 +52,23 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
 
     _full_payload_replace_keys_cached: frozenset[str]
 
+    def _snapshot_task_payload(self, payload: Any) -> tuple[Any, torch.cuda.Event | None]:
+        """Isolate CUDA tensors of a payload a raw-data connector will move.
+
+        Such a connector (``supports_raw_data``) reads the tensors from the
+        save-loop thread, by which time CUDA-graph static buffers or reused
+        runner inputs may hold the next step's data; its
+        ``snapshot_for_transport`` clones them on the model thread now.
+        Connectors without the method keep the untouched payload.
+        """
+        connector = self._omni_connector
+        snapshot = None
+        if connector is not None and getattr(connector, "supports_raw_data", False):
+            snapshot = getattr(connector, "snapshot_for_transport", None)
+        if snapshot is None:
+            return payload, None
+        return snapshot(payload)
+
     # ------------------------------------------------------------------ #
     #  Local payload cache (RFC §2.4 – Model Runner ownership)
     # ------------------------------------------------------------------ #
@@ -812,12 +829,14 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
                 connector_put_key,
                 next_stage_id,
             )
+            payload, ready_event = self._snapshot_task_payload(payload)
             task = {
                 "stage_id": self._stage_id,
                 "next_stage_id": next_stage_id,
                 "put_key": connector_put_key,
                 "data": payload,
                 "request_id": req_id,
+                "ready_event": ready_event,
             }
             with self._lock:
                 self._pending_save_reqs.setdefault(req_id, deque()).append(task)
@@ -1393,6 +1412,12 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
             self._decrement_pending_save_count(request_id)
             return True
 
+        ready_event = task.get("ready_event")
+        if ready_event is not None:
+            # The payload's tensors were cloned/staged on the model thread's
+            # stream; put() reads them from this thread.
+            ready_event.synchronize()
+
         success, _size, _metadata = connector.put(
             from_stage=str(task["stage_id"]),
             to_stage=str(task["next_stage_id"]),
@@ -1581,6 +1606,7 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
                 connector_put_key,
             )
 
+        payload_data, ready_event = self._snapshot_task_payload(payload_data)
         task = {
             "stage_id": self._stage_id,
             "next_stage_id": next_stage_id,
@@ -1588,6 +1614,7 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
             "data": payload_data,
             "request_id": request_id,
             "completion": completion,
+            "ready_event": ready_event,
         }
         with self._lock:
             self._pending_save_reqs.setdefault(request_id, deque()).append(task)

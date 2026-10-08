@@ -1,0 +1,18 @@
+# MiniCPM-o 4.5 single-GPU layout with the GPU-direct stage payload edge.
+#
+# All three stages share GPU 0, so the stage 1->2 payload edge names
+# CudaIpcConnector: large tensors travel by CUDA IPC between the two stage
+# processes on that GPU instead of staging through host memory. All codec
+# knob extras are inherited from the base file via the connectors deep-merge.
+base_config: minicpmo_4_5.yaml
+
+connectors:
+  connector_of_shared_memory:
+    name: CudaIpcConnector
+    extra:
+      # The Thinker->Talker handoff rides this connector as well: llm2tts (in
+      # the orchestrator) puts the Thinker hidden states and the Talker request
+      # carries only a key, replacing the per-request float-list conversion.
+      # The Talker claims the payload at its first prefill; a handoff nobody
+      # consumed is reaped after thinker_talker_handoff_ttl_s (default 600).
+      thinker_talker_handoff: true
