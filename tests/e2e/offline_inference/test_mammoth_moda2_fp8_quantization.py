@@ -304,9 +304,7 @@ def _generate_t2i_image(model: str, quantization: str | None) -> torch.Tensor:
 def _assert_finite_image_payload(payload, context: str) -> None:
     """Reject non-finite raw image tensors before PIL conversion can mask them."""
     if isinstance(payload, torch.Tensor):
-        assert bool(torch.isfinite(payload).all()), (
-            f"non-finite values (NaN/Inf) in {context}"
-        )
+        assert bool(torch.isfinite(payload).all()), f"non-finite values (NaN/Inf) in {context}"
     elif isinstance(payload, (list, tuple)):
         for index, item in enumerate(payload):
             _assert_finite_image_payload(item, f"{context}[{index}]")
@@ -326,9 +324,7 @@ def _check_raw_image_tensors(outputs) -> None:
 
     for index, output in enumerate(outputs):
         # OmniRequestOutput.images is the first source used by the helper.
-        _assert_finite_image_payload(
-            getattr(output, "images", None), f"outputs[{index}].images"
-        )
+        _assert_finite_image_payload(getattr(output, "images", None), f"outputs[{index}].images")
         check_multimodal(
             getattr(output, "multimodal_output", None),
             f"outputs[{index}].multimodal_output",
@@ -340,9 +336,7 @@ def _check_raw_image_tensors(outputs) -> None:
             )
 
 
-def _extract_image_tensor(
-    outputs, expected_size: tuple[int, int] = _T2I_IMAGE_SIZE
-) -> torch.Tensor:
+def _extract_image_tensor(outputs, expected_size: tuple[int, int] = _T2I_IMAGE_SIZE) -> torch.Tensor:
     """Validate one RGB image of requested size and return CHW floats in [0, 1].
 
     Validate raw tensor finiteness *before* the official helper converts image
@@ -354,14 +348,10 @@ def _extract_image_tensor(
 
     _check_raw_image_tensors(outputs)
     images = extract_images_from_outputs(outputs)
-    assert len(images) == _T2I_IMAGE_COUNT, (
-        f"expected {_T2I_IMAGE_COUNT} generated image(s), got {len(images)}"
-    )
+    assert len(images) == _T2I_IMAGE_COUNT, f"expected {_T2I_IMAGE_COUNT} generated image(s), got {len(images)}"
 
     image = images[0]
-    assert image.size == expected_size, (
-        f"expected image size {expected_size}, got {image.size}"
-    )
+    assert image.size == expected_size, f"expected image size {expected_size}, got {image.size}"
     assert image.mode == "RGB", f"expected RGB image, got {image.mode}"
 
     arr = np.asarray(image, dtype=np.float32) / 255.0  # (H, W, C)
@@ -407,9 +397,7 @@ def test_bf16_vs_fp8_t2i_image_consistency():
 
     expected_shape = (3, _T2I_IMAGE_SIZE[1], _T2I_IMAGE_SIZE[0])
     for name, image in (("BF16", bf16_img), ("FP8", fp8_img)):
-        assert image.shape == expected_shape, (
-            f"{name} produced shape {tuple(image.shape)}, expected {expected_shape}"
-        )
+        assert image.shape == expected_shape, f"{name} produced shape {tuple(image.shape)}, expected {expected_shape}"
         assert bool(torch.isfinite(image).all()), f"{name} image contains NaN/Inf"
 
     metrics = _image_metrics(bf16_img, fp8_img)
