@@ -4,6 +4,7 @@
 import logging
 import os
 from collections.abc import Iterable
+from typing import ClassVar
 
 import torch
 from diffusers.image_processor import VaeImageProcessor
@@ -43,10 +44,10 @@ def get_sdxl_image_post_process_func(od_config: OmniDiffusionConfig):
 class StableDiffusionXLPipeline(
     nn.Module, CFGParallelMixin, DiffusionPipelineProfilerMixin, SupportsComponentDiscovery
 ):
-    _dit_modules: list[str] = ["unet"]
-    _encoder_modules: list[str] = ["text_encoder", "text_encoder_2"]
-    _vae_modules: list[str] = ["vae"]
-    _resident_modules: list[str] = []
+    _dit_modules: ClassVar[list[str]] = ["unet"]
+    _encoder_modules: ClassVar[list[str]] = ["text_encoder", "text_encoder_2"]
+    _vae_modules: ClassVar[list[str]] = ["vae"]
+    _resident_modules: ClassVar[list[str]] = []
 
     def __init__(
         self,

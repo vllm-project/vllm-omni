@@ -6,7 +6,7 @@ import json
 import math
 import os
 from collections.abc import Callable, Iterable
-from typing import Any
+from typing import Any, ClassVar
 
 import numpy as np
 import torch
@@ -33,6 +33,7 @@ from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch, prefetch_subfolders
 from vllm_omni.diffusion.models.hidream_image import HiDreamImageTransformer2DModel
+from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
@@ -144,7 +145,22 @@ def retrieve_timesteps(
     return timesteps, num_inference_steps
 
 
-class HiDreamImagePipeline(nn.Module, CFGParallelMixin, DiffusionPipelineProfilerMixin, ProgressBarMixin):
+class HiDreamImagePipeline(
+    nn.Module,
+    CFGParallelMixin,
+    DiffusionPipelineProfilerMixin,
+    ProgressBarMixin,
+    SupportsComponentDiscovery,
+):
+    _dit_modules: ClassVar[list[str]] = ["transformer"]
+    _encoder_modules: ClassVar[list[str]] = [
+        "text_encoder",
+        "text_encoder_2",
+        "text_encoder_3",
+        "text_encoder_4",
+    ]
+    _vae_modules: ClassVar[list[str]] = ["vae"]
+
     def __init__(
         self,
         *,

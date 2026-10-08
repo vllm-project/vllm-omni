@@ -52,6 +52,7 @@ from vllm_omni.diffusion.model_loader.host_weight_plan import (
     has_online_quantization,
 )
 from vllm_omni.diffusion.models.diffusers_adapter.pipeline_diffusers_adapter import DiffusersAdapterPipeline
+from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.offloader.component_utils import encoder_component_type
 from vllm_omni.diffusion.offloader.config import (
     DIT_COMPONENT,
@@ -1813,11 +1814,16 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         # torch.unique in ModelOpt NVFP4) that do not support DTensor inputs.
         self._process_weights_after_loading(model, target_device)
 
-        # Discover pipeline components (DiT, encoders, VAEs) via
-        # ModuleDiscovery, which consults SupportsComponentDiscovery
-        # when available and falls back to well-known attribute names.
-        # This supports nested pipelines (e.g. LTX2DistilledPipeline
-        # where the transformer lives at "pipe.transformer").
+        # HSDP device placement requires explicit component declarations.
+        if not isinstance(model, SupportsComponentDiscovery):
+            raise TypeError(
+                f"{type(model).__name__} does not implement "
+                "SupportsComponentDiscovery, required for HSDP device placement."
+            )
+
+        # Discover pipeline components (DiT, encoders, VAEs) via ModuleDiscovery.
+        # This supports nested pipelines (e.g. LTX2DistilledPipeline where the
+        # transformer lives at "pipe.transformer").
         discovered_modules = ModuleDiscovery.discover(model)
 
         # Shard only the outermost DiTs. A pipeline may list a DiT and one of its
