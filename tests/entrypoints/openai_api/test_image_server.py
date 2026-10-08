@@ -1130,6 +1130,32 @@ def test_generate_images_max_size_rejected(async_omni_test_client):
     assert response.status_code == 400
 
 
+@pytest.mark.parametrize("quality", ["auto", "hd"])
+def test_generate_images_multistage_rejects_unsupported_quality(
+    async_omni_test_client: TestClient, quality: str
+) -> None:
+    """OpenAI quality values outside the diffusion levels get a 400 before any stage runs."""
+    response = async_omni_test_client.post(
+        "/v1/images/generations",
+        json={"prompt": "a cat", "quality": quality},
+    )
+
+    assert response.status_code == 400
+    assert f"got {quality!r}" in response.json()["detail"]
+    assert async_omni_test_client.app.state.engine_client.captured_sampling_params_list is None
+
+
+def test_generate_images_multistage_forwards_supported_quality(async_omni_test_client: TestClient) -> None:
+    """A supported quality level still reaches the diffusion stage params."""
+    response = async_omni_test_client.post(
+        "/v1/images/generations",
+        json={"prompt": "a cat", "quality": "high"},
+    )
+
+    assert response.status_code == 200
+    assert async_omni_test_client.app.state.engine_client.captured_sampling_params_list[1].quality == "high"
+
+
 def test_generate_multiple_images(test_client):
     """Test generating multiple images"""
     response = test_client.post(
