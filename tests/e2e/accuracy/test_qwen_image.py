@@ -32,9 +32,9 @@ HEIGHT = 512
 NUM_INFERENCE_STEPS = 20
 TRUE_CFG_SCALE = 4.0
 SEED = 42
-SSIM_THRESHOLD = 0.94
-# With --fa-deterministic, H100 nightlies stably land near SSIM 0.958 / PSNR 27.8
-# vs Diffusers on the FA3 hub path (see #5734 / #5963 / #6971).
+# H100 nightly after RotaryEmbedding CUDA RoPE: SSIM 0.978375 / PSNR 31.83
+# vs Diffusers (Buildkite #15339). SSIM 0.97 so a drop is visible.
+SSIM_THRESHOLD = 0.97
 PSNR_THRESHOLD = 27.0
 
 MODEL_2512_ID = "Qwen/Qwen-Image-2512"
@@ -233,7 +233,7 @@ def _run_diffusers_qwen_image_2512(*, model: str, output_path: Path) -> Image.Im
 
 
 @pytest.mark.benchmark
-@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=1)
 def test_qwen_image_matches_diffusers(accuracy_artifact_root: Path) -> None:
     model = _model_name()
     output_dir = model_output_dir(accuracy_artifact_root, MODEL_ID)
@@ -253,7 +253,7 @@ def test_qwen_image_matches_diffusers(accuracy_artifact_root: Path) -> None:
 
 
 @pytest.mark.benchmark
-@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=1)
 def test_qwen_image_2512_matches_diffusers_pixelwise(accuracy_artifact_root: Path) -> None:
     model = _model_2512_name()
     output_dir = model_output_dir(accuracy_artifact_root, MODEL_2512_ID)

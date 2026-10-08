@@ -1,18 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Unit tests for MossReferenceEncoder: content-addressed caching,
 single-flight, and micro-batched encoding."""
 
 import asyncio
 import threading
 import time
+from tempfile import TemporaryDirectory
 
 import pytest
 import torch
 
 from vllm_omni.model_executor.models.moss_tts.reference_encoder import (
     MossReferenceEncoder,
+    _prep_wav_sync,
     _RefEncodeBatcher,
+    _reference_resampler,
     build_reference_encoder,
     encode_request_references,
 )
@@ -534,3 +537,301 @@ async def test_encode_request_references_keys_second_speaker_by_slot(make_encode
     assert proc.total_items == 2
     # Concurrent, so both clips shared one batch window.
     assert proc.attempt_sizes == [2]
+
+
+@pytest.mark.parametrize("sr", [24000, 48000])
+def test_numeric_waveform_prep_matches_list_and_does_not_mutate_cache(sr):
+    import numpy as np
+
+    from vllm_omni.model_executor.models.moss_tts.reference_encoder import _prep_wav_sync
+
+    waveform = np.linspace(-1, 1, sr, dtype=np.float32)
+    expected = waveform.copy()
+    tensor = _prep_wav_sync(waveform, sr, 24000)
+    assert torch.equal(tensor, _prep_wav_sync(waveform.tolist(), sr, 24000))
+    tensor.zero_()
+    np.testing.assert_array_equal(waveform, expected)
+
+
+@pytest.mark.asyncio
+async def test_idle_batcher_releases_all_completed_waveforms():
+    import weakref
+
+    import numpy as np
+
+    batcher = _RefEncodeBatcher(
+        lambda payload: [torch.zeros((1, 4), dtype=torch.long) for _ in payload],
+        window_ms=0,
+        max_batch=8,
+    )
+    refs = []
+
+    async def submit_one():
+        waveform = np.zeros(24000, dtype=np.float32)
+        refs.append(weakref.ref(waveform))
+        await batcher.submit(waveform, 24000)
+
+    try:
+        await asyncio.gather(submit_one(), submit_one())
+
+        # Future completion can race the executor releasing its work item.
+        # Wait without forcing GC or overwriting first/jobs with a new batch.
+        async def wait_for_release():
+            while any(ref() is not None for ref in refs):
+                await asyncio.sleep(0.001)
+
+        await asyncio.wait_for(wait_for_release(), timeout=2.0)
+        assert batcher._drainer is not None and not batcher._drainer.done()
+    finally:
+        await batcher.aclose()
+
+
+def test_reference_resampler_is_cached_and_matches_functional_resample():
+    import torchaudio
+
+    _reference_resampler.cache_clear()
+    try:
+        waveform = torch.rand((1, 4800), generator=torch.Generator().manual_seed(123))
+        expected = torchaudio.functional.resample(waveform, 48000, _SR)
+        torch.testing.assert_close(_prep_wav_sync(waveform.numpy(), 48000, _SR), expected, rtol=0, atol=0)
+        torch.testing.assert_close(_prep_wav_sync(waveform.numpy(), 48000, _SR), expected, rtol=0, atol=0)
+        info = _reference_resampler.cache_info()
+        assert info.misses == 1 and info.hits == 1
+    finally:
+        _reference_resampler.cache_clear()
+
+
+# --------------------------------------------------------------------------- #
+# Inline data: URI fast path                                                  #
+# --------------------------------------------------------------------------- #
+
+
+class _DigestAudio(_FakeAudio):
+    """Resolver whose key for data: URIs is the SHA-1 digest, like serving."""
+
+    def __init__(self, *, digest_keys=True):
+        super().__init__()
+        self._digest_keys = digest_keys
+
+    async def resolve(self, ref_str):
+        wav_list, sr, _ = await super().resolve(ref_str)
+        if not self._digest_keys:
+            return wav_list, sr, "rk:" + ref_str
+        import hashlib
+
+        return wav_list, sr, hashlib.sha1(ref_str.encode("utf-8")).hexdigest()
+
+    def artifact_key(self, cache_key):
+        return None
+
+
+async def test_inline_reference_skips_repeat_resolution(make_encoder):
+    proc, audio = _FakeProcessor(), _DigestAudio()
+    ref = "data:audio/wav;base64,QUJD"
+    audio.register(ref, 5)
+    enc = make_encoder(proc)
+
+    first, key1 = await enc.encode(ref, resolve_ref_audio=audio.resolve, get_artifact_key=audio.artifact_key)
+    first.fill_(0)  # callers own their copy
+    second, key2 = await enc.encode(ref, resolve_ref_audio=audio.resolve, get_artifact_key=audio.artifact_key)
+
+    assert audio.resolve_calls == [ref]
+    assert key1 == key2
+    assert torch.equal(second, torch.full((3, _N_VQ), 5, dtype=torch.long))
+
+
+async def test_inline_index_requires_matching_resolve_key(make_encoder):
+    proc, audio = _FakeProcessor(), _DigestAudio(digest_keys=False)
+    ref = "data:audio/wav;base64,REVG"
+    audio.register(ref, 6)
+    enc = make_encoder(proc)
+
+    for _ in range(2):
+        await enc.encode(ref, resolve_ref_audio=audio.resolve, get_artifact_key=audio.artifact_key)
+    assert audio.resolve_calls == [ref, ref]
+
+
+async def test_inline_reference_shared_across_encoders(make_encoder, monkeypatch):
+    # Keep the AF_UNIX socket path independent of pytest's nested base path.
+    with TemporaryDirectory(prefix="moss-ref-") as shared_dir:
+        monkeypatch.setenv("VLLM_OMNI_MOSS_REF_CODES_SHARED_DIR", shared_dir)
+        ref = "data:audio/wav;base64,R0hJ"
+        first_audio, second_audio = _DigestAudio(), _DigestAudio()
+        first_audio.register(ref, 9)
+        second_audio.register(ref, 9)
+        first, second = make_encoder(_FakeProcessor()), make_encoder(_FakeProcessor())
+
+        a, key_a = await first.encode(
+            ref, resolve_ref_audio=first_audio.resolve, get_artifact_key=first_audio.artifact_key
+        )
+        b, key_b = await second.encode(
+            ref, resolve_ref_audio=second_audio.resolve, get_artifact_key=second_audio.artifact_key
+        )
+
+        assert first_audio.resolve_calls == [ref] and second_audio.resolve_calls == []
+        assert key_a == key_b and torch.equal(a, b)
+
+
+# --------------------------------------------------------------------------- #
+# Reference-encoder CUDA graphs: selection and processor-equivalent prep      #
+# --------------------------------------------------------------------------- #
+
+
+class _GraphsStub:
+    def __init__(self, result):
+        self.result = result
+        self.calls: list[list[torch.Tensor]] = []
+
+    def encode(self, wavs):
+        self.calls.append(wavs)
+        return self.result
+
+
+class _LoudnessProcessor(_FakeProcessor):
+    @staticmethod
+    def loudness_normalize(wav):
+        return wav * 2.0
+
+
+async def test_encode_prepared_prefers_graphs_and_falls_back_to_processor(make_encoder):
+    proc = _LoudnessProcessor()
+    enc = make_encoder(proc)
+    graphs_codes = [torch.full((3, _N_VQ), 7, dtype=torch.long)]
+    enc._graphs_enabled, enc._graphs = True, _GraphsStub(graphs_codes)
+    prepared = [torch.ones(1, 100)]
+    assert enc._encode_prepared(prepared) is graphs_codes and proc.attempt_sizes == []
+    enc._graphs = _GraphsStub([None])  # no graph fits this clip
+    out = enc._encode_prepared(prepared)
+    assert proc.attempt_sizes == [1] and out[0].tolist() == [[1] * _N_VQ] * 3
+
+
+async def test_processor_prepare_matches_processor_channel_and_loudness_handling(make_encoder):
+    enc = make_encoder(_LoudnessProcessor())
+    mono = enc._processor_prepare(torch.ones(100))
+    assert mono.shape == (2, 100) and torch.equal(mono, torch.full((2, 100), 2.0))
+    many = enc._processor_prepare(torch.arange(3 * 4, dtype=torch.float32).reshape(3, 4))
+    assert torch.equal(many, torch.arange(8, dtype=torch.float32).reshape(2, 4) * 2.0)
+
+
+async def test_processor_prepare_resamples_to_the_tokenizer_rate(make_encoder):
+    torchaudio = pytest.importorskip("torchaudio")
+    proc = _LoudnessProcessor(sampling_rate=48000)
+    enc = make_encoder(proc)  # works at 24 kHz, the Local-v1.5 reference rate
+    wav = torch.randn(1, 2400)
+    expected = torchaudio.functional.resample(wav.repeat(2, 1), 24000, 48000) * 2.0
+    # The encoder resamples the mono clip before duplicating it. Some CPU conv
+    # kernels round a one-row batch differently from a two-row one, so the two
+    # orders agree to float32 precision, not bit for bit.
+    torch.testing.assert_close(enc._processor_prepare(wav), expected, rtol=0, atol=1e-5)
+
+
+@pytest.mark.parametrize("role", ["", "host", "client"])
+async def test_prepare_captures_graphs_or_starts_the_shared_host(make_encoder, monkeypatch, tmp_path, role):
+    from types import SimpleNamespace
+
+    from vllm_omni.model_executor.models.moss_tts import reference_encoder as re_mod
+
+    enc = make_encoder(_FakeProcessor())
+    enc._shares_encoder, enc._shared_codes_dir = True, str(tmp_path)
+    monkeypatch.setattr(re_mod, "shared_encoder_role", lambda: role)
+    captured, hosts, ready = [], [], []
+    monkeypatch.setattr(enc, "_reference_graphs", lambda: captured.append(True))
+    monkeypatch.setattr(enc, "_host_workers", lambda: [])
+    helper = SimpleNamespace(wait_until_ready=lambda: ready.append(True))
+
+    def make_host(*args, **kwargs):
+        hosts.append(args)
+        return helper
+
+    monkeypatch.setattr(re_mod, "SharedReferenceEncoderHost", make_host)
+    monkeypatch.setattr(re_mod, "SharedReferenceEncoderClient", lambda *args: helper)
+    enc.prepare()
+    enc.prepare()
+    # Every API process waits for the shared host before startup completes.
+    assert (len(captured), len(hosts)) == {"": (2, 0), "host": (0, 1), "client": (0, 0)}[role]
+    assert len(ready) == (2 if role else 0)
+
+
+async def test_clips_reach_the_encoder_at_the_tokenizer_rate(make_encoder, monkeypatch):
+    torchaudio = pytest.importorskip("torchaudio")
+    proc = _LoudnessProcessor(sampling_rate=48000)
+    enc = make_encoder(proc)  # works at 24 kHz
+    sent = []
+
+    def record_prepared(prepared):
+        sent.extend(prepared)
+        return [None] * len(prepared)
+
+    monkeypatch.setattr(enc, "_encode_shared_or_local", record_prepared)
+    wav = [float(v) for v in torch.randn(2400)]
+    enc._encode_batch_sync([(wav, _SR)])
+    # Resampled where the request arrived (a shared encoder receives it this way); still one channel.
+    expected = torchaudio.functional.resample(torch.tensor(wav)[None], 24000, 48000)
+    torch.testing.assert_close(sent[0], expected, rtol=0, atol=0)
+    # The eager path is told the clip is already at the tokenizer rate.
+    calls = []
+
+    def record_encoding(wavs, sampling_rate, n_vq=None):
+        calls.append(sampling_rate)
+        return [None]
+
+    monkeypatch.setattr(proc, "encode_audios_from_wav", record_encoding)
+    enc._graphs_enabled = False
+    enc._encode_prepared(sent)
+    assert calls == [48000]
+
+
+async def test_batcher_runs_up_to_max_inflight_batches_at_once():
+    inside = threading.Barrier(2, timeout=5)
+    seen: list[int] = []
+
+    def encode_batch(payload):
+        inside.wait()  # two batches are encoding at the same time
+        seen.append(len(payload))
+        return [torch.zeros(1) for _ in payload]
+
+    batcher = _RefEncodeBatcher(encode_batch, window_ms=0.0, max_batch=8, max_inflight=2)
+    try:
+        first = asyncio.ensure_future(batcher.submit([1.0], _SR))
+        await asyncio.sleep(0.05)  # the first batch is in flight before the second clip arrives
+        await asyncio.gather(first, batcher.submit([2.0], _SR))
+    finally:
+        await batcher.aclose()
+    assert seen == [1, 1]
+
+
+def test_reference_stream_priority(monkeypatch):
+    from vllm_omni.model_executor.models.moss_tts import reference_encoder as re_mod
+
+    monkeypatch.delenv(re_mod._REF_ENCODE_PRIORITY_ENV, raising=False)
+    assert re_mod.reference_stream_priority() == 0
+    monkeypatch.setenv(re_mod._REF_ENCODE_PRIORITY_ENV, "high")
+    expected = torch.cuda.Stream.priority_range()[1] if torch.cuda.is_available() else 0
+    assert re_mod.reference_stream_priority() == expected
+
+
+async def test_device_prep_resamples_on_the_tokenizer_device(make_encoder, monkeypatch):
+    torchaudio = pytest.importorskip("torchaudio")
+    from vllm_omni.model_executor.models.moss_tts import reference_encoder as re_mod
+
+    proc = _LoudnessProcessor(sampling_rate=48000)
+    monkeypatch.setattr(proc, "audio_tokenizer", torch.nn.Linear(1, 1), raising=False)  # CPU placement
+    enc = make_encoder(proc)
+    enc._gpu_prep = True
+    wav = torch.randn(1, 2400)
+    clip = enc._encoder_input(wav)
+    assert clip.shape == (1, 2400)  # left at the working rate for the encoder's device
+    expected = torchaudio.functional.resample(wav, 24000, 48000).repeat(2, 1) * 2.0
+    torch.testing.assert_close(enc._finish_prepare(clip), expected, rtol=1e-5, atol=1e-6)
+    # The eager fallback is told the clip's own rate.
+    calls = []
+
+    def record_encoding(wavs, sampling_rate, n_vq=None):
+        calls.append(sampling_rate)
+        return [None]
+
+    monkeypatch.setattr(proc, "encode_audios_from_wav", record_encoding)
+    enc._graphs_enabled = False
+    enc._encode_prepared([clip])
+    assert calls == [24000]
+    assert re_mod._REF_ENCODE_GPU_PREP_ENV == "VLLM_OMNI_MOSS_REF_GPU_PREP"

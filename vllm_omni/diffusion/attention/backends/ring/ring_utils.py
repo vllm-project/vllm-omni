@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # Copyright (c) 2024, Jiarui Fang.
 # Adapted from https://github.com/feifeibear/long-context-attention
 
@@ -9,7 +10,33 @@ import torch.nn.functional as F
 
 LseLayout = Literal["bhs", "bsh"]
 
-__all__ = ["update_out_and_lse", "flatten_varlen_lse", "unflatten_varlen_lse"]
+__all__ = [
+    "ring_kv_block_valid_length",
+    "update_out_and_lse",
+    "flatten_varlen_lse",
+    "unflatten_varlen_lse",
+]
+
+
+def ring_kv_block_valid_length(
+    valid_kv_length: int | None,
+    block_size: int,
+    block_rank: int,
+    world_size: int,
+) -> int:
+    """Return the valid prefix length in one globally ordered ring K/V block."""
+    if valid_kv_length is None:
+        return block_size
+    if isinstance(valid_kv_length, bool) or not isinstance(valid_kv_length, int):
+        raise ValueError("valid_kv_length must be a Python integer")
+    total_length = block_size * world_size
+    if not 0 < valid_kv_length <= total_length:
+        raise ValueError(
+            "valid_kv_length must be within the global ring K/V sequence, "
+            f"got {valid_kv_length} for length {total_length}"
+        )
+    block_start = block_rank * block_size
+    return max(0, min(block_size, valid_kv_length - block_start))
 
 
 def _normalize_lse(block_lse: torch.Tensor, block_out: torch.Tensor, lse_layout: LseLayout) -> torch.Tensor:

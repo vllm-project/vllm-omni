@@ -6,27 +6,94 @@ Both variants share the same build/validate flow (``_build_moss_tts_params``
 handles each); they are registered under distinct model-type names.
 """
 
-from typing import TYPE_CHECKING, Any
+import asyncio
+import threading
+from typing import TYPE_CHECKING, Any, cast
 
+from transformers import AutoModel, AutoTokenizer
+from transformers.dynamic_module_utils import get_class_from_dynamic_module
 from vllm.inputs import tokens_input
+from vllm.logger import init_logger
 
+from vllm_omni.entrypoints.openai.protocol.audio import RegisteredVoiceReference
 from vllm_omni.entrypoints.openai.tts_adapters import register_tts_adapter
 from vllm_omni.entrypoints.openai.tts_adapters.base import (
     ARTTSAdapter,
+    OutputPolicy,
     PreparedRequest,
+    TTSGenerationError,
     apply_max_new_tokens,
     conditioning_cache_salt,
 )
+from vllm_omni.model_executor.models.moss_tts.realtime_prompt import build_realtime_prompt
 
 if TYPE_CHECKING:
     from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
 
+logger = init_logger(__name__)
+
+
+def _local_continuation_prompt(proc: Any, user_kwargs: dict[str, Any], reference: Any) -> tuple[list[int], Any] | None:
+    """Build the Local-v1.5 continuation prompt without the generic processor call.
+
+    Mirrors ``_build_continuation_codes`` of the model's processor: every
+    template segment is encoded separately there, so the constant segments
+    (keyed by ``language``) are cached and only the request text is
+    tokenized. Returns ``(text_ids, audio_codes)`` equal to
+    ``unified[:, 0].tolist()`` / ``unified[:, 1:]``, or ``None`` when the
+    request or processor does not match that exact layout.
+    """
+    import torch
+
+    if set(user_kwargs) - {"text", "language"}:
+        return None
+    if not isinstance(reference, list) or len(reference) != 1 or not isinstance(reference[0], torch.Tensor):
+        return None
+    cfg = getattr(proc, "model_config", None)
+    n_vq = getattr(cfg, "n_vq", None)
+    if cfg is None or not isinstance(n_vq, int) or n_vq <= 0:
+        return None
+    codes = reference[0]
+    if codes.ndim != 2 or int(codes.shape[1]) != n_vq or codes.shape[0] == 0:
+        return None
+    required = (
+        "_user_prompt_prefix_ids",
+        "_encode_text",
+        "_user_prompt_after_reference_ids",
+        "_assistant_prompt_prefix_ids",
+    )
+    if not all(callable(getattr(proc, name, None)) for name in required):
+        return None
+    language = user_kwargs.get("language")
+    cache = proc.__dict__.setdefault("_vllm_omni_continuation_segments", {})
+    segments = cache.get(language)
+    if segments is None:
+        fields = {} if language is None else {"language": language}
+        head = (
+            proc._user_prompt_prefix_ids()
+            + proc._encode_text("None")
+            + proc._user_prompt_after_reference_ids(language, fields)
+        )
+        tail = proc._assistant_prompt_prefix_ids() + [int(cfg.audio_start_token_id)]
+        segments = cache[language] = ([int(t) for t in head], [int(t) for t in tail])
+    head, tail = segments
+    text = user_kwargs.get("text")
+    prompt_ids = head + [int(t) for t in proc._encode_text("" if text is None else str(text))] + tail
+    num_audio = int(codes.shape[0])
+    text_ids = prompt_ids + [int(cfg.audio_assistant_slot_token_id)] * num_audio
+    audio_codes = torch.full((len(text_ids), n_vq), int(cfg.audio_pad_token_id), dtype=torch.int64)
+    audio_codes[len(prompt_ids) :] = codes.to(dtype=torch.int64, device="cpu")
+    return text_ids, audio_codes
+
 
 class _MossTTSAdapterBase(ARTTSAdapter):
+    accumulate_nonstreaming: bool = False
+
     def __init__(self, ctx) -> None:
         super().__init__(ctx)
         self._moss_variant = None if self.name == "moss_tts_nano" else self._detect_moss_variant()
         self._moss_processor_cache = None
+        self._moss_realtime_components_lock = threading.Lock()
 
     @property
     def engine_client(self):
@@ -41,7 +108,9 @@ class _MossTTSAdapterBase(ARTTSAdapter):
         return self.ctx.server._speaker_cache
 
     async def _resolve_ref_audio(self, ref_audio: str):
-        return await self.ctx.server._resolve_ref_audio(ref_audio)
+        if self._moss_variant is None:  # Nano sends lists through engine IPC.
+            return await self.ctx.server._resolve_ref_audio(ref_audio)
+        return await self.ctx.server._resolve_ref_audio_array(ref_audio)
 
     def _voice_created_at(self, voice: str) -> int:
         return self.ctx.server._voice_created_at(voice)
@@ -60,12 +129,34 @@ class _MossTTSAdapterBase(ARTTSAdapter):
         # inside the model package; this layer only supplies the processor and
         # the process-wide speaker cache.
         encoder = build_reference_encoder(
-            self._get_moss_processor(),
-            variant=self._moss_variant,
+            self._get_moss_realtime_components()[2] if self._moss_variant == "realtime" else self._get_moss_processor(),
+            variant=cast(str, self._moss_variant),
             speaker_cache=self._speaker_cache,
         )
         self._moss_ref_encoder = encoder
         return encoder
+
+    async def warmup(self) -> None:
+        """Set up the reference encoder at startup, not on the first cloning request.
+
+        Its CUDA graph capture takes seconds per API process (about a minute for
+        a shared encoder's workers).
+        """
+        if self._moss_variant not in ("tts", "local", "ttsd"):
+            return
+        from vllm_omni.model_executor.models.moss_tts.reference_encoder import reference_graphs_enabled
+        from vllm_omni.model_executor.models.moss_tts.shared_reference_encoder import SharedReferenceEncoderStartupError
+
+        if not reference_graphs_enabled():
+            return
+        try:
+            await asyncio.to_thread(self._get_moss_ref_encoder().prepare)
+        except SharedReferenceEncoderStartupError:
+            # Do not advertise readiness and trigger concurrent local captures
+            # while the shared host is still compiling or has failed startup.
+            raise
+        except Exception:  # noqa: BLE001 - requests still encode (and capture) on demand
+            logger.warning("MOSS reference encoder warmup failed", exc_info=True)
 
     async def _encode_moss_references(
         self,
@@ -89,25 +180,60 @@ class _MossTTSAdapterBase(ARTTSAdapter):
         """
         from vllm_omni.model_executor.models.moss_tts.reference_encoder import encode_request_references
 
-        # Named-voice caching is only valid for uploaded speakers without an
-        # inline ref_audio: ``request.voice`` plus a file/URL would otherwise
-        # key on (name, created_at=0) and skip the content-aware resolve.
-        raw_voice = getattr(request, "voice", None)
-        raw_voice = raw_voice.strip() if isinstance(raw_voice, str) else ""
-        voice_lower = raw_voice.lower()
-        use_named_voice = bool(voice_lower) and voice_lower in self.uploaded_speakers and not has_inline_ref_audio
-        voice = voice_lower if use_named_voice else ""
-        voice_created = self._voice_created_at(voice) if voice else 0
+        snapshot = request._registered_voice_reference if not has_inline_ref_audio else None
+        ref_str = cast(str, request.ref_audio)
+        resolver = self._resolve_ref_audio
+        if snapshot is not None:
+            # This key never enters URI validation. Only a cache miss loads the
+            # immutable generation's file; speaker 2 keeps the ordinary resolver.
+            ref_str = f"registered:{snapshot.name}:{snapshot.created_at}"
 
-        return await encode_request_references(
+            async def resolve_registered(ref_audio: str):
+                if ref_audio == ref_str:
+                    waveform, sr = await asyncio.to_thread(self.ctx.server._load_registered_reference, snapshot)
+                    return waveform, sr, ref_str
+                return await self._resolve_ref_audio(ref_audio)
+
+            resolver = resolve_registered
+
+        references, resolve_keys = await encode_request_references(
             self._get_moss_ref_encoder(),
-            request.ref_audio,
+            ref_str,
             request.ref_audio_2 if two_speaker else None,
-            resolve_ref_audio=self._resolve_ref_audio,
+            resolve_ref_audio=resolver,
             get_artifact_key=self._get_resolved_ref_audio_artifact_key,
-            voice_name=voice or None,
-            voice_created_at=voice_created,
+            voice_name=snapshot.name if snapshot is not None else None,
+            voice_created_at=snapshot.created_at if snapshot is not None else 0,
         )
+        if snapshot is not None:
+            # The generation identifies slot 0 on both cold and hot requests.
+            # Do not let a cold-only resolve key change its prefix-cache salt.
+            resolve_keys.pop(0, None)
+        return references, resolve_keys
+
+    def _bind_registered_reference(self, request: "OpenAICreateSpeechRequest") -> str | None:
+        if request._registered_voice_reference is not None:
+            return None
+        voice = (request.voice or "").strip().lower()
+        if not voice:
+            return None
+        info = self.uploaded_speakers.get(voice)
+        if info is None:
+            return None
+        if info.get("embedding_source") != "audio":
+            return f"Uploaded voice '{voice}' must contain reference audio for MOSS-TTS."
+        created_at = int(info.get("created_at", 0))
+        if created_at <= 0:
+            return f"Uploaded voice '{voice}' has no valid generation. Re-upload the voice."
+        request._registered_voice_reference = RegisteredVoiceReference(
+            name=voice,
+            created_at=created_at,
+            file_path=info["file_path"],
+            ref_text=info.get("ref_text"),
+        )
+        if not request.ref_text or not request.ref_text.strip():
+            request.ref_text = request._registered_voice_reference.ref_text
+        return None
 
     def _detect_moss_variant(self) -> str:
         """Sub-classify a ``moss_tts``-stage server into the actual MOSS-TTS
@@ -134,13 +260,81 @@ class _MossTTSAdapterBase(ARTTSAdapter):
             return "voice_generator"
         return "tts"
 
+    def _codec_stage_devices(self) -> str | None:
+        """Read the runtime ``devices`` entry of this pipeline's codec stage.
+
+        The codec (code2wav) stage is the final stage of every MOSS pipeline
+        (``moss_tts_local_codec`` / ``moss_tts_codec``); prefer a stage whose
+        ``model_stage`` mentions "codec", else anchor on the last stage. The
+        runtime mapping accepts the resolved ``runtime_config`` object, the
+        omegaconf ``runtime`` mapping, and the legacy ``yaml_runtime`` dict.
+        """
+        stages = list(getattr(self.engine_client, "stage_configs", None) or ())
+        if not stages:
+            return None
+        codec_stages = [s for s in stages if "codec" in str(getattr(s, "model_stage", "") or "")]
+        anchor = codec_stages[-1] if codec_stages else stages[-1]
+        for attr in ("runtime_config", "runtime", "yaml_runtime"):
+            runtime_cfg = getattr(anchor, attr, None)
+            if runtime_cfg is None:
+                continue
+            devices = (
+                runtime_cfg.get("devices") if hasattr(runtime_cfg, "get") else getattr(runtime_cfg, "devices", None)
+            )
+            if devices is not None and str(devices).strip():
+                return str(devices)
+        devices = getattr(anchor, "devices", None)
+        return str(devices) if devices is not None and str(devices).strip() else None
+
+    def _resolve_ref_encoder_device(self):
+        """Pick the device of the API-process reference-audio encoder.
+
+        The encoder follows the code2wav stage onto its first GPU: the stage
+        worker remaps its ``devices`` entry through ``CUDA_VISIBLE_DEVICES``
+        and sees it as logical index 0, while replica launch restores the
+        parent environment, so the same index names the same physical GPU in
+        this process. When the stage pins no devices the stage worker and the
+        encoder both default to the first visible GPU. Falls back to CPU when
+        CUDA is unavailable or the stage device is not parseable.
+        """
+        import torch  # local to avoid pulling torch at module import time
+
+        if not torch.cuda.is_available():
+            return torch.device("cpu")
+        devices_str = self._codec_stage_devices()
+        if devices_str is None:
+            # No explicit pinning: the stage worker lands on the first visible
+            # GPU (vLLM picks cuda:0 of the un-remapped environment).
+            return torch.device("cuda", 0)
+        first = devices_str.split(",")[0].strip()
+        if not first:
+            return torch.device("cuda", 0)
+        if first == "cpu":
+            return torch.device("cpu")
+        if not first.isdigit():
+            logger.warning("MOSS ref encoder: codec stage devices %r not parseable; keeping CPU", devices_str)
+            return torch.device("cpu")
+        index = int(first)
+        device_count = torch.accelerator.device_count()
+        if index >= device_count:
+            logger.warning(
+                "MOSS ref encoder: codec stage device cuda:%d out of range (%d visible); keeping CPU",
+                index,
+                device_count,
+            )
+            return torch.device("cpu")
+        return torch.device("cuda", index)
+
     def _get_moss_processor(self):
         """Lazily load the upstream MOSS-TTS processor once per server.
 
         Cached on ``self._moss_processor_cache``. The processor owns its own
-        audio_tokenizer (~1.6 B params); we keep it on CPU so it doesn't
-        compete with the talker (~8 GiB) and codec (~7 GiB) for our 96 GiB
-        GPU — per-request ref-audio encoding is fast enough on CPU.
+        audio_tokenizer (~1.6 B params) used for per-request reference-audio
+        encoding; it is placed on the code2wav stage's GPU (see
+        ``_resolve_ref_encoder_device``) so cold encodes run on device instead
+        of paying a CPU forward per request. Note this memory is charged to
+        the API process, outside each stage's ``gpu_memory_utilization``
+        budget — keep some headroom on the codec GPU.
         """
         cached = getattr(self, "_moss_processor_cache", None)
         if cached is not None:
@@ -150,9 +344,55 @@ class _MossTTSAdapterBase(ARTTSAdapter):
         model_id = self.engine_client.model_config.model
         proc = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
         if hasattr(proc, "audio_tokenizer"):
-            proc.audio_tokenizer = proc.audio_tokenizer.to("cpu").eval()
+            device = self._resolve_ref_encoder_device()
+            proc._vllm_omni_ref_encoder_device = device
+            from vllm_omni.model_executor.models.moss_tts.reference_encoder import shared_encoder_role
+
+            if shared_encoder_role() == "client":
+                # Another API process hosts the shared encoder on the GPU.
+                proc.audio_tokenizer = proc.audio_tokenizer.eval()
+                logger.info("MOSS reference-audio encoder: using the shared encoder of another API process")
+            else:
+                proc.audio_tokenizer = proc.audio_tokenizer.to(device).eval()
+                logger.info("MOSS reference-audio encoder (audio_tokenizer) placed on %s", device)
         self._moss_processor_cache = proc
         return proc
+
+    def _get_moss_realtime_components(self):
+        with self._moss_realtime_components_lock:
+            cached = getattr(self, "_moss_realtime_components", None)
+            if cached is not None:
+                return cached
+
+            model_id = self.engine_client.model_config.model
+            processor_cls = get_class_from_dynamic_module(
+                "processing_mossttsrealtime.MossTTSRealtimeProcessor",
+                model_id,
+            )
+            tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+            processor = processor_cls(tokenizer=tokenizer)
+            hf_config = self.engine_client.model_config.hf_config
+            codec_path = str(
+                getattr(
+                    hf_config,
+                    "codec_model_name_or_path",
+                    getattr(
+                        hf_config,
+                        "audio_tokenizer_name_or_path",
+                        "OpenMOSS-Team/MOSS-Audio-Tokenizer",
+                    ),
+                )
+            )
+            codec = AutoModel.from_pretrained(
+                codec_path,
+                trust_remote_code=True,
+            )
+            # Reference encoding runs in the API process; follow the codec
+            # (code2wav) stage's GPU like the processor path above.
+            codec = codec.to(self._resolve_ref_encoder_device()).eval()
+            cached = (tokenizer, processor, codec)
+            self._moss_realtime_components = cached
+            return cached
 
     async def _build_moss_tts_params(
         self,
@@ -179,37 +419,32 @@ class _MossTTSAdapterBase(ARTTSAdapter):
 
         v = self._moss_variant
 
+        params: dict[str, Any]
         # ---- Legacy nano path (unchanged) ----
         if v is None:  # moss_tts_nano
-            params: dict[str, Any] = {
+            params = {
                 "text": [request.input or ""],
                 "mode": ["voice_clone"],
             }
             if request.max_new_tokens is not None:
                 params["max_new_frames"] = [request.max_new_tokens]
-            wav_list, sr, cache_key = await self._resolve_ref_audio(request.ref_audio)
+            wav_list, sr, cache_key = await self._resolve_ref_audio(cast(str, request.ref_audio))
             params["prompt_audio_array"] = [[wav_list, sr]]
             params["ref_audio_cache_key"] = cache_key
             return params
 
-        # ---- MOSS-TTS-Realtime: keep the old prompt_audio_array path ----
-        # ``AutoProcessor.from_pretrained`` doesn't auto-discover
-        # ``MossTTSRealtimeProcessor`` (no ``processor_config.json`` in the
-        # snapshot), and Realtime's prompt format diverges from MossTTSDelay
-        # (16-channel grid, separate per-step text feed). The
-        # ``prompt_audio_array`` shape lines up well enough with what the
-        # talker reads for short prompts; full Realtime support needs a
-        # separate processor.from_module path which we don't wire here.
         if v == "realtime":
-            params: dict[str, Any] = {
-                "text": [request.input or ""],
-                "mode": ["voice_clone"],
-            }
+            tokenizer, processor, _ = await asyncio.to_thread(self._get_moss_realtime_components)
+            references, realtime_resolve_keys = await self._encode_moss_references(
+                request,
+                has_inline_ref_audio=has_inline_ref_audio,
+                two_speaker=False,
+            )
+            params = build_realtime_prompt(tokenizer, processor, request.input or "", references[0])
             if request.max_new_tokens is not None:
                 params["max_new_frames"] = [request.max_new_tokens]
-            wav_list, sr, cache_key = await self._resolve_ref_audio(request.ref_audio)
-            params["prompt_audio_array"] = [[wav_list, sr]]
-            params["ref_audio_cache_key"] = cache_key
+            if 0 in realtime_resolve_keys:
+                params["ref_audio_cache_key"] = realtime_resolve_keys[0]
             return params
 
         # ---- MossTTSDelay family (tts/ttsd/sound_effect/voice_generator)
@@ -254,13 +489,26 @@ class _MossTTSAdapterBase(ARTTSAdapter):
         # Build the unified-codes prompt: (L, 1+n_vq) where col 0 is text/special
         # tokens and cols 1..n_vq are the delay-pattern audio code grid (mostly
         # audio_pad_code outside the reference block).
-        user_msg = proc.build_user_message(**user_kwargs)
-        batch = proc(conversations=[[user_msg]], mode="generation")
-        unified = batch["input_ids"][0]  # torch.LongTensor (L, 1+n_vq)
-        text_ids: list[int] = unified[:, 0].tolist()
-        audio_codes: torch.Tensor = unified[:, 1:].contiguous().to(torch.int64)
+        fast = None
+        if v == "local" and request.ref_text and request.ref_text.strip():
+            reference = user_kwargs.pop("reference")
+            user_kwargs["text"] = request.ref_text.strip() + " " + (request.input or "")
+            fast = _local_continuation_prompt(proc, user_kwargs, reference)
+            if fast is None:
+                user_msg = proc.build_user_message(**user_kwargs)
+                assistant_msg = proc.build_assistant_message(audio_codes_list=reference)
+                batch = proc(conversations=[[user_msg, assistant_msg]], mode="continuation")
+        else:
+            user_msg = proc.build_user_message(**user_kwargs)
+            batch = proc(conversations=[[user_msg]], mode="generation")
+        if fast is not None:
+            text_ids, audio_codes = fast
+        else:
+            unified = batch["input_ids"][0]  # torch.LongTensor (L, 1+n_vq)
+            text_ids = unified[:, 0].tolist()
+            audio_codes = unified[:, 1:].contiguous().to(torch.int64)
 
-        params: dict[str, Any] = {
+        params = {
             "prompt_token_ids": text_ids,
             "codes": {"ref": audio_codes},
         }
@@ -271,6 +519,11 @@ class _MossTTSAdapterBase(ARTTSAdapter):
         if 1 in resolve_keys:
             params["ref_audio_2_cache_key"] = resolve_keys[1]
         return params
+
+    def validate_stream_audio(self, *, has_audio: bool) -> None:
+        # Local's sampled binary gate can stop before its first codec frame.
+        if self._moss_variant == "local" and not has_audio:
+            raise TTSGenerationError("MOSS-TTS Local produced no audio output.")
 
     def validate(self, request: "OpenAICreateSpeechRequest") -> str | None:
         """Validate any MOSS-TTS-family request (nano + 5 full variants).
@@ -285,7 +538,12 @@ class _MossTTSAdapterBase(ARTTSAdapter):
             we fall through to the original nano contract (ref_audio only).
         """
         server = self.ctx.server
-        err = server._apply_uploaded_speaker(request)
+        if self._moss_variant is None:
+            err = server._apply_uploaded_speaker(request)
+        elif request.ref_audio is None:
+            err = self._bind_registered_reference(request)
+        else:
+            err = None
         if err:
             return err
 
@@ -296,7 +554,7 @@ class _MossTTSAdapterBase(ARTTSAdapter):
 
         v = self._moss_variant
         if v in (None, "tts", "realtime", "local"):
-            if request.ref_audio is None:
+            if request.ref_audio is None and request._registered_voice_reference is None:
                 label = (
                     "MOSS-TTS-Nano"
                     if v is None
@@ -307,12 +565,12 @@ class _MossTTSAdapterBase(ARTTSAdapter):
                     )
                 )
                 return f"{label} requires 'ref_audio' (reference audio for voice cloning)."
-            return server._validate_ref_audio_format(request.ref_audio)
+            return server._validate_ref_audio_format(request.ref_audio) if request.ref_audio is not None else None
 
         if v == "ttsd":
-            if request.ref_audio is None:
+            if request.ref_audio is None and request._registered_voice_reference is None:
                 return "MOSS-TTSD requires 'ref_audio' (speaker 1 reference)."
-            fmt_err = server._validate_ref_audio_format(request.ref_audio)
+            fmt_err = server._validate_ref_audio_format(request.ref_audio) if request.ref_audio is not None else None
             if fmt_err:
                 return fmt_err
             if request.ref_audio_2 is not None:
@@ -341,12 +599,26 @@ class _MossTTSAdapterBase(ARTTSAdapter):
         self, request: "OpenAICreateSpeechRequest", sampling_params_list: list, has_inline_ref_audio: bool
     ) -> PreparedRequest:
         server = self.ctx.server
+        if self._moss_variant is not None and not has_inline_ref_audio:
+            error = self._bind_registered_reference(request)
+            if error:
+                raise ValueError(error)
+        snapshot = request._registered_voice_reference if not has_inline_ref_audio else None
         tts_params = await self._build_moss_tts_params(request, has_inline_ref_audio=has_inline_ref_audio)
-        if request.voice:
+        registered_voice = None
+        if snapshot is not None:
+            tts_params["voice_name"] = [snapshot.name]
+            tts_params["voice_created_at"] = [snapshot.created_at]
+            registered_voice = (snapshot.name, snapshot.created_at)
+        elif self._moss_variant is None and request.voice and not has_inline_ref_audio:
+            # Nano retains its existing waveform-based uploaded-voice path.
             voice_lower = request.voice.lower()
-            if voice_lower in server.uploaded_speakers and not has_inline_ref_audio:
+            if voice_lower in server.uploaded_speakers:
+                created_at = server._voice_created_at(voice_lower)
                 tts_params["voice_name"] = [voice_lower]
-                tts_params["voice_created_at"] = [server._voice_created_at(voice_lower)]
+                tts_params["voice_created_at"] = [created_at]
+                if created_at > 0:
+                    registered_voice = (voice_lower, created_at)
         # MOSS samples internally from additional_information. build() runs
         # before the shared path applies request.seed to SamplingParams.
         seed = request.seed
@@ -360,8 +632,13 @@ class _MossTTSAdapterBase(ARTTSAdapter):
         else:
             prompt = tokens_input(prompt_token_ids=[1])
         prompt["additional_information"] = tts_params
-        prompt["cache_salt"] = conditioning_cache_salt(request, tts_params)
-        return PreparedRequest(prompt=prompt, tts_params=tts_params, model_type=self.name)
+        prompt["cache_salt"] = conditioning_cache_salt(request, tts_params, registered_voice=registered_voice)
+        return PreparedRequest(
+            prompt=prompt,
+            tts_params=tts_params,
+            model_type=self.name,
+            output_policy=OutputPolicy(accumulate_nonstreaming=self.accumulate_nonstreaming),
+        )
 
     def apply_sampling_overrides(
         self,
@@ -377,6 +654,7 @@ class _MossTTSAdapterBase(ARTTSAdapter):
 class MossTTSNanoAdapter(_MossTTSAdapterBase):
     stage_keys = frozenset({"moss_tts_nano"})
     name = "moss_tts_nano"
+    accumulate_nonstreaming = True
 
 
 @register_tts_adapter

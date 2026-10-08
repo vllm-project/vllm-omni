@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Base worker class for vLLM-Omni with device-level GPU memory profiling."""
 
 from __future__ import annotations
@@ -10,6 +13,7 @@ from contextlib import AbstractContextManager, nullcontext
 import torch
 from vllm.logger import init_logger
 from vllm.utils.mem_utils import format_gib, memory_profiling
+from vllm.v1.worker.gpu_worker import CompilationTimes
 from vllm.v1.worker.gpu_worker import Worker as GPUWorker
 
 from vllm_omni.diffusion.data import (
@@ -36,6 +40,17 @@ class OmniGPUWorkerBase(GPUWorker):
     for custom trace naming, background gzip, and trace path collection.
     """
 
+    def _capture_auxiliary_graphs(self) -> None:
+        """Let opt-in models warm valid inputs before the worker becomes ready."""
+        capture = getattr(self.model_runner.model, "capture_auxiliary_graphs", None)
+        if callable(capture):
+            capture()
+
+    def compile_or_warm_up_model(self) -> CompilationTimes:
+        result = super().compile_or_warm_up_model()
+        self._capture_auxiliary_graphs()
+        return result
+
     def load_model(self, *args, **kwargs):
         with self._maybe_get_memory_pool_context("weights"):
             res = super().load_model(*args, **kwargs)
@@ -58,6 +73,13 @@ class OmniGPUWorkerBase(GPUWorker):
                 worker_name=worker_name,
                 local_rank=self.local_rank,
             )
+        elif profiler_config and profiler_config.profiler == "cuda":
+            # OmniGPUWorkerBase replaces vLLM's torch profiler above; keep the
+            # native CUDA profiler wrapper available for Nsight Systems capture
+            # through the /start_profile and /stop_profile endpoints as well.
+            from vllm.profiler.wrapper import CudaProfilerWrapper
+
+            self.profiler = CudaProfilerWrapper(profiler_config)
 
     def profile(self, is_start: bool = True, profile_prefix: str | None = None):
         """Override to set trace filename before starting the profiler.
@@ -215,7 +237,7 @@ class OmniGPUWorkerBase(GPUWorker):
         logger.info(f"[LLM Worker {self.rank}] Wake-up complete.")
         return True
 
-    def handle_sleep_task(self, task: OmniSleepTask) -> OmniACK:
+    def handle_sleep_task(self, task: OmniSleepTask) -> OmniACK | None:
         "Handle deterministic Sleep command from the main process"
         try:
             if isinstance(task, dict):
@@ -269,7 +291,7 @@ class OmniGPUWorkerBase(GPUWorker):
                     pass
             return OmniACK(task_id=task.task_id, status="ERROR", error_msg=str(e))
 
-    def handle_wake_task(self, task: OmniWakeTask) -> OmniACK:
+    def handle_wake_task(self, task: OmniWakeTask) -> OmniACK | None:
         "Handle deterministic Wakeup command from the main process"
         try:
             if isinstance(task, dict):
@@ -308,3 +330,16 @@ class OmniGPUWorkerBase(GPUWorker):
                     pass
             tid = task.task_id if hasattr(task, "task_id") else "unknown"
             return OmniACK(task_id=tid, status="ERROR", error_msg=str(e))
+
+    def encoder_loaded(self) -> bool:
+        """Check if encoder weights are loaded in the model.
+
+        This method is exposed via collective_rpc to check encoder availability
+        for models that support voice cloning with reference audio.
+
+        Returns:
+            bool: True if encoder weights are available, False otherwise.
+        """
+        if hasattr(self.model_runner, "model") and hasattr(self.model_runner.model, "encoder_loaded"):
+            return self.model_runner.model.encoder_loaded()
+        return False

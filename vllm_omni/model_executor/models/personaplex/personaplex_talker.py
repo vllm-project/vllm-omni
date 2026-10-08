@@ -30,7 +30,7 @@ encode of the input WAV (built in ``preprocess``); live duplex is Phase 2.
 from __future__ import annotations
 
 from collections.abc import Iterable
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 from torch import nn
@@ -53,6 +53,11 @@ from vllm_omni.model_executor.models.personaplex.personaplex_depformer import (
 from vllm_omni.model_executor.models.personaplex.personaplex_embeddings import (
     PersonaPlexInputEmbeddings,
 )
+
+if TYPE_CHECKING:
+    from vllm_omni.model_executor.models.personaplex.duplex.stage0 import (
+        PersonaPlexStage0DuplexRuntime,
+    )
 
 __all__ = ["PersonaPlexTalkerForConditionalGeneration"]
 
@@ -173,7 +178,9 @@ class PersonaPlexTalkerForConditionalGeneration(nn.Module):
         if not audio_codes_list:
             return OmniOutput(text_hidden_states=hidden, multimodal_outputs={})
         audio_codes = torch.cat(audio_codes_list, dim=0)
-        hidden = hidden[: int(audio_codes.shape[0])]
+        # Keep every token row: the runner indexes this tensor with token-space
+        # logits indices, and a step can mix a new session's multi-row prefill
+        # with one-row live appends, so the audio row count is not the token count.
         return OmniOutput(text_hidden_states=hidden, multimodal_outputs={"codes": {"audio": audio_codes}})
 
     # ------------------------------------------------------------------
@@ -254,19 +261,16 @@ class PersonaPlexTalkerForConditionalGeneration(nn.Module):
             if isinstance(user_sine, torch.Tensor) and user_sine.numel() >= n_user
             else sil
         )
-        total = int(prefill_text.numel())
-        rows = []
-        for i in range(span):
-            pos = offset + i
-            text_tok = int(prefill_text[pos].item()) if pos < total else zero_text
-            stack = torch.zeros((1, 1 + n_q, 1), dtype=torch.long, device=device)
-            stack[:, 0] = text_tok
-            if sil is not None:
-                stack[0, 1 : 1 + n_user, 0] = sil[:n_user]  # agent rows = encoded silence
-            if user is not None:
-                stack[0, 1 + n_user : 1 + 2 * n_user, 0] = user[:n_user]
-            rows.append(self.input_embeddings(stack).reshape(1, -1))
-        return torch.cat(rows, dim=0)  # [span, hidden]
+
+        stack = torch.zeros((1, 1 + n_q, span), dtype=torch.long, device=device)
+        stack[:, 0] = zero_text
+        text = prefill_text[offset : offset + span]
+        stack[0, 0, : text.numel()] = text.to(device)
+        if sil is not None:
+            stack[0, 1 : 1 + n_user] = sil[:n_user, None]
+        if user is not None:
+            stack[0, 1 + n_user : 1 + 2 * n_user] = user[:n_user, None]
+        return self.input_embeddings(stack).reshape(span, -1)  # [span, hidden]
 
     @staticmethod
     def _user_frame(info: dict[str, Any], frame_idx: int) -> torch.Tensor | None:
@@ -323,11 +327,18 @@ class PersonaPlexTalkerForConditionalGeneration(nn.Module):
                 prompt_len = int(prompt_len_raw)
             except (TypeError, ValueError):
                 prompt_len = span
-            prepared = self._duplex_stage0_runtime().prepare_append(
-                duplex,
-                prompt_len=prompt_len,
-                request_id=(str(info_dict["request_id"]) if isinstance(info_dict.get("request_id"), str) else None),
+            from vllm_omni.model_executor.models.personaplex.duplex.stage0 import (
+                PersonaPlexStage0StaleEpochError,
             )
+
+            try:
+                prepared = self._duplex_stage0_runtime().prepare_append(
+                    duplex,
+                    prompt_len=prompt_len,
+                    request_id=(str(info_dict["request_id"]) if isinstance(info_dict.get("request_id"), str) else None),
+                )
+            except PersonaPlexStage0StaleEpochError:
+                return self._stale_append_passthrough(input_ids, span)
             offset_raw = info_dict.get("duplex_token_offset", 0)
             try:
                 offset = max(0, int(offset_raw))
@@ -431,9 +442,58 @@ class PersonaPlexTalkerForConditionalGeneration(nn.Module):
             model_path=model_path,
             device=device,
             max_sessions=int(getattr(self.vllm_config.model_config, "duplex_max_sessions", 1)),
+            codec_cuda_graphs=bool(getattr(self.config, "mimi_cuda_graphs", False)),
         )
         self._personaplex_duplex_stage0_runtime = runtime
         return runtime
+
+    def _stale_append_passthrough(
+        self, input_ids: torch.Tensor, span: int
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
+        """Neutral inputs for a request of a superseded epoch that is still in this step.
+
+        The engine already aborted it and discards its output; it only has to keep
+        the batch shapes valid without touching the live session's encoder row.
+        """
+        from vllm_omni.model_executor.models.personaplex.duplex.policy import SILENCE_TOKENS
+
+        device = input_ids.device
+        silence = torch.tensor(SILENCE_TOKENS, dtype=torch.long)
+        embeds = torch.zeros((span, self.mtp_hidden_size), device=device, dtype=self._dtype)
+        return (
+            input_ids,
+            embeds,
+            {
+                "pplex_depformer_audio_tokens": torch.cat([silence, silence]),
+                "pplex_depformer_audio_provided": torch.zeros(2 * silence.numel(), dtype=torch.bool),
+                "duplex": {"stage0_stale": True},
+            },
+        )
+
+    def preprocess_batch(
+        self,
+        *,
+        req_ids: list[str],
+        model_intermediate_buffer: dict[str, dict[str, Any]],
+        device: torch.device,
+    ) -> None:
+        """Encode every live duplex append of this step in one shared-encoder call."""
+        del device
+        appends: list[dict[str, Any]] = []
+        for req_id in req_ids:
+            info = model_intermediate_buffer.get(req_id)
+            if not isinstance(info, dict):
+                continue
+            duplex = info.get("duplex")
+            if not isinstance(duplex, dict):
+                additional = info.get("additional_information")
+                duplex = additional.get("duplex") if isinstance(additional, dict) else None
+            if isinstance(duplex, dict) and duplex.get("data_plane") is True:
+                appends.append(duplex)
+        if appends:
+            runtime = self._duplex_stage0_runtime()
+            runtime.encode_appends(appends)
+            runtime.prepare_live_appends(appends)
 
     def on_requests_finished(self, finished_req_ids: set[str] | list[str]) -> None:
         runtime = getattr(self, "_personaplex_duplex_stage0_runtime", None)
@@ -499,9 +559,48 @@ class PersonaPlexTalkerForConditionalGeneration(nn.Module):
             )
         text_token = input_ids.reshape(bsz).to(torch.long)
         hidden = hidden_states.reshape(bsz, 1, -1).to(self._dtype)
-        audio_tokens: list[torch.Tensor] = []
-        audio_provided: list[torch.Tensor] = []
-        for info in req_infos:
+        runtime = self._duplex_stage0_runtime()
+        audio_tokens, audio_provided = self._depformer_teacher_forcing(runtime, req_ids, req_infos, hidden.device)
+        codes = self.depformer(
+            text_token,
+            hidden,
+            audio_tokens=audio_tokens,
+            audio_provided=audio_provided,
+            num_steps=self.num_active_codebooks,
+        ).to(torch.long)
+        # The next append reads the agent frame with the teacher-forced
+        # codebooks applied; merge it once for the whole batch.
+        effective = torch.where(audio_provided[:, :8], audio_tokens[:, :8], codes[:, :8])
+        for row, request_id in enumerate(req_ids):
+            runtime.record_sample(
+                request_id=request_id,
+                text_token=text_token[row],
+                effective_codes=effective[row],
+            )
+        return codes
+
+    @staticmethod
+    def _depformer_teacher_forcing(
+        runtime: PersonaPlexStage0DuplexRuntime,
+        req_ids: list[str],
+        req_infos: list[dict[str, Any]],
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Stack each request's depformer teacher-forcing tokens and mask on ``device``.
+
+        Live appends batched in ``preprocess_batch`` already hold device copies.
+        The rest (first appends, aborted epochs) carry host tensors in their
+        request information and are moved in one copy.
+        """
+        tokens_rows: list[torch.Tensor] = []
+        provided_rows: list[torch.Tensor] = []
+        host_rows: list[int] = []
+        for row, (request_id, info) in enumerate(zip(req_ids, req_infos)):
+            prepared = runtime.prepared_depformer_state(request_id)
+            if prepared is not None:
+                tokens_rows.append(prepared[0])
+                provided_rows.append(prepared[1])
+                continue
             tokens = info.get("pplex_depformer_audio_tokens")
             provided = info.get("pplex_depformer_audio_provided")
             if not isinstance(tokens, torch.Tensor) or not isinstance(provided, torch.Tensor):
@@ -513,28 +612,18 @@ class PersonaPlexTalkerForConditionalGeneration(nn.Module):
                     "PersonaPlex depformer teacher-forcing token/mask shapes differ: "
                     f"{tuple(tokens.shape)} != {tuple(provided.shape)}"
                 )
-            audio_tokens.append(tokens)
-            audio_provided.append(provided)
-        codes = self.depformer(
-            text_token,
-            hidden,
-            audio_tokens=torch.stack(audio_tokens).to(
-                device=hidden.device,
-                dtype=torch.long,
-            ),
-            audio_provided=torch.stack(audio_provided).to(
-                device=hidden.device,
-                dtype=torch.bool,
-            ),
-        ).to(torch.long)
-        runtime = self._duplex_stage0_runtime()
-        for row, request_id in enumerate(req_ids):
-            runtime.record_sample(
-                request_id=request_id,
-                text_token=text_token[row],
-                agent_codes=codes[row],
-            )
-        return codes
+            host_rows.append(row)
+            tokens_rows.append(tokens)
+            provided_rows.append(provided)
+        if host_rows:
+            host_tokens = torch.stack([tokens_rows[row] for row in host_rows]).to(device=device, dtype=torch.long)
+            host_provided = torch.stack([provided_rows[row] for row in host_rows]).to(device=device, dtype=torch.bool)
+            if len(host_rows) == len(req_ids):
+                return host_tokens, host_provided
+            for index, row in enumerate(host_rows):
+                tokens_rows[row] = host_tokens[index]
+                provided_rows[row] = host_provided[index]
+        return torch.stack(tokens_rows), torch.stack(provided_rows)
 
     # ------------------------------------------------------------------
     # Weight loading

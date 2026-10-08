@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
 Cache module for diffusion model inference acceleration.
 
@@ -12,6 +12,7 @@ Cache backends are instantiated directly via their constructors and configured v
 """
 
 from vllm_omni.diffusion.cache.base import CacheBackend
+from vllm_omni.diffusion.cache.exact_projection_cache import ExactProjectionCache
 from vllm_omni.diffusion.cache.prompt_embed_cache import (
     PromptEmbedCache,
     install_prompt_embed_cache,
@@ -27,6 +28,7 @@ from vllm_omni.diffusion.cache.teacache.backend import TeaCacheBackend
 
 __all__ = [
     "CacheBackend",
+    "ExactProjectionCache",
     "CacheContext",
     "TeaCacheBackend",
     "TeaCacheConfig",

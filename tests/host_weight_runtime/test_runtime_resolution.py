@@ -4,6 +4,10 @@
 
 from __future__ import annotations
 
+import multiprocessing as mp
+import threading
+import time
+from multiprocessing.connection import Connection
 from pathlib import Path
 from typing import cast
 
@@ -15,6 +19,7 @@ from vllm_omni.host_weight_runtime import (
     CanonicalJson,
     ComponentIdentity,
     FailureCode,
+    HostWeightError,
     HostWeightFailure,
     HostWeightLease,
     HostWeightLeaseCarrier,
@@ -40,12 +45,14 @@ from vllm_omni.host_weight_runtime import (
     StoreStatus,
     TensorWriteSpec,
     ValidationLevel,
+    WaitPolicy,
     WeightArtifactIdentity,
     WeightProductionSpec,
     WeightRepresentation,
     WeightSourceIdentity,
 )
 from vllm_omni.host_weight_runtime.filesystem import FilesystemHostWeightStore, detect_storage_class
+from vllm_omni.host_weight_runtime.filesystem.locks import FileLock, lock_is_active
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -516,6 +523,107 @@ def test_retryable_store_initialization_failure_obeys_runtime_mode(
     assert resolution.report.attempts[0].failure is not None
     assert resolution.report.attempts[0].failure.code.value == "domain_unavailable"
     assert resolution.report.attempts[0].failure.retryable
+
+
+def _initialize_contended_runtime(config: HostWeightRuntimeConfig, output: Connection) -> None:
+    try:
+        output.send("starting")
+        started = time.monotonic()
+        runtime = HostWeightRuntime.from_config(config)
+        resolution = runtime.resolve(_identity())
+        try:
+            output.send((time.monotonic() - started, resolution.report))
+        finally:
+            if resolution.lease is not None:
+                resolution.lease.close()
+    finally:
+        output.close()
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected"),
+    [
+        (RuntimeMode.PREFERRED, ResolutionOutcome.CANONICAL_FALLBACK),
+        (RuntimeMode.REQUIRED, ResolutionOutcome.FAILED),
+    ],
+)
+def test_domain_lock_timeout_and_fresh_runtime_recovery(
+    tmp_path: Path, mode: RuntimeMode, expected: ResolutionOutcome
+) -> None:
+    config = HostWeightRuntimeConfig(mode=mode, domain=_domain(tmp_path), wait=WaitPolicy(0.1))
+    initial = HostWeightRuntime.from_config(config)
+    built = initial.resolve(_identity(), producer=CountingProducer(_identity()))
+    assert built.lease is not None
+    built.lease.close()
+    metadata = {name: (tmp_path / name).read_bytes() for name in ("domain.json", "domain-policy.json")}
+    lock_path = tmp_path / "locks" / "domain-init.lock"
+    ctx = mp.get_context("spawn")
+    reader, writer = ctx.Pipe(duplex=False)
+    process = ctx.Process(target=_initialize_contended_runtime, args=(config, writer))
+
+    with FileLock(lock_path, exclusive=True, deadline=None):
+        process.start()
+        writer.close()
+        try:
+            # Import/bootstrap is outside the short coordination budget.
+            assert reader.poll(60), "waiter did not start"
+            assert reader.recv() == "starting"
+            assert reader.poll(5), "domain initialization did not respect the coordination timeout"
+            elapsed, report = reader.recv()
+            assert 0.1 <= elapsed < 5
+            assert report.outcome is expected
+            failure = report.attempts[0].failure
+            assert failure is not None
+            assert failure.stage is ResolutionStage.DOMAIN
+            assert failure.code is FailureCode.DOMAIN_UNAVAILABLE
+            assert failure.retryable
+            assert "timed out waiting for" in failure.message
+            assert "domain-init.lock" in failure.message
+            assert lock_is_active(lock_path), "waiter must not unlock the owner"
+            process.join(5)
+            assert process.exitcode == 0
+        finally:
+            if process.is_alive():
+                process.kill()
+            process.join(5)
+            process.close()
+            reader.close()
+
+    assert {name: (tmp_path / name).read_bytes() for name in metadata} == metadata
+    recovered = HostWeightRuntime.from_config(config).resolve(_identity())
+    assert recovered.report.outcome is ResolutionOutcome.LOCAL_HIT
+    assert recovered.lease is not None
+    recovered.lease.close()
+
+
+def test_direct_store_waits_for_domain_lock_released_before_deadline(tmp_path: Path) -> None:
+    config = HostWeightRuntimeConfig(mode=RuntimeMode.PREFERRED, domain=_domain(tmp_path))
+    assert config.domain is not None
+    initial = HostWeightRuntime.from_config(config)
+    assert initial.store is not None
+    lock_path = tmp_path / "locks" / "domain-init.lock"
+    with FileLock(lock_path, exclusive=True, deadline=None) as owner:
+        release = threading.Timer(0.1, owner.close)
+        release.start()
+        try:
+            store = FilesystemHostWeightStore(config.domain, config.capacity, config.integrity, wait=WaitPolicy(5))
+        finally:
+            release.join(5)
+    assert store.root == tmp_path
+
+
+def test_direct_store_domain_timeout_is_typed(tmp_path: Path) -> None:
+    config = HostWeightRuntimeConfig(mode=RuntimeMode.PREFERRED, domain=_domain(tmp_path))
+    assert config.domain is not None
+    HostWeightRuntime.from_config(config)
+    lock_path = tmp_path / "locks" / "domain-init.lock"
+    with FileLock(lock_path, exclusive=True, deadline=None):
+        with pytest.raises(HostWeightError) as caught:
+            FilesystemHostWeightStore(config.domain, config.capacity, config.integrity, wait=WaitPolicy(0.01))
+        assert caught.value.failure.code is FailureCode.DOMAIN_UNAVAILABLE
+        assert caught.value.failure.retryable
+        assert lock_is_active(lock_path)
+    assert not lock_is_active(lock_path)
 
 
 @pytest.mark.parametrize(

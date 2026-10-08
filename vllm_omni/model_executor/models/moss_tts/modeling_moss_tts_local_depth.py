@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # Copyright 2026 OpenMOSS and the vLLM-Omni team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License").
@@ -18,6 +20,9 @@ checkpoint 1:1 so ``load_weights()`` needs no remapping.
 """
 
 from __future__ import annotations
+
+import os
+from collections.abc import Callable, Sequence
 
 import torch
 import torch.nn as nn
@@ -48,6 +53,7 @@ class _MossTTSLocalAttention(nn.Module):
         self.n_head = n_head
         self.head_dim = hidden_size // n_head
         self.embed_dim = hidden_size
+        self._short_attention = os.environ.get("VLLM_OMNI_MOSS_LOCAL_SHORT_ATTN", "0") == "1"
         self.c_attn = nn.Linear(hidden_size, 3 * hidden_size, bias=True)
         self.c_proj = nn.Linear(hidden_size, hidden_size, bias=True)
         inv_freq = 1.0 / (rope_base ** (torch.arange(0, self.head_dim, 2, dtype=torch.float32) / self.head_dim))
@@ -101,8 +107,13 @@ class _MossTTSLocalAttention(nn.Module):
         odd = x[..., 1::2]
         return torch.stack((-odd, even), dim=-1).reshape_as(x)
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """``hidden_states``: ``(B, S, H)``. Re-prefills with a fresh causal mask over ``[0, S)`` every call."""
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        kv_cache: tuple[torch.Tensor, torch.Tensor] | None = None,
+        position: int = 0,
+    ) -> torch.Tensor:
+        """Run a causal prefix, or one new token using frame-local K/V."""
         batch_size, seq_len, _ = hidden_states.shape
         qkv = self.c_attn(hidden_states)
         query, key, value = qkv.split(self.embed_dim, dim=-1)
@@ -110,14 +121,34 @@ class _MossTTSLocalAttention(nn.Module):
         key = key.view(batch_size, seq_len, self.n_head, self.head_dim)
         value = value.view(batch_size, seq_len, self.n_head, self.head_dim)
 
-        cos, sin = self._rope_cos_sin(seq_len, hidden_states.device, hidden_states.dtype)
+        cos, sin = self._rope_cos_sin(position + seq_len, hidden_states.device, hidden_states.dtype)
+        cos, sin = cos[:, position:], sin[:, position:]
         query = query * cos + self._rotate_half(query) * sin
         key = key * cos + self._rotate_half(key) * sin
 
         query = query.transpose(1, 2)
         key = key.transpose(1, 2)
         value = value.transpose(1, 2)
-        attn_output = F.scaled_dot_product_attention(query, key, value, is_causal=True)
+        if kv_cache is not None:
+            assert seq_len == 1, "Cached Local Depth execution consumes one token at a time"
+            k_cache, v_cache = kv_cache
+            k_cache[:, :, position : position + 1].copy_(key)
+            v_cache[:, :, position : position + 1].copy_(value)
+            key = k_cache[:, :, : position + 1]
+            value = v_cache[:, :, : position + 1]
+        if (
+            self._short_attention
+            and kv_cache is not None
+            and query.is_cuda
+            and query.dtype == torch.bfloat16
+            and self.head_dim <= 128
+            and key.shape[2] <= 16
+        ):
+            from vllm_omni.model_executor.models.moss_tts.local_short_attention import local_short_attention
+
+            attn_output = local_short_attention(query, key, value)
+        else:
+            attn_output = F.scaled_dot_product_attention(query, key, value, is_causal=kv_cache is None)
         attn_output = attn_output.transpose(1, 2).reshape(batch_size, seq_len, self.embed_dim)
         return self.c_proj(attn_output)
 
@@ -141,8 +172,13 @@ class _MossTTSLocalBlock(nn.Module):
         self.ln_2 = nn.LayerNorm(hidden_size, eps=eps)
         self.mlp = _MossTTSLocalMLP(hidden_size, inner_size)
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        hidden_states = hidden_states + self.attn(self.ln_1(hidden_states))
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        kv_cache: tuple[torch.Tensor, torch.Tensor] | None = None,
+        position: int = 0,
+    ) -> torch.Tensor:
+        hidden_states = hidden_states + self.attn(self.ln_1(hidden_states), kv_cache, position)
         hidden_states = hidden_states + self.mlp(self.ln_2(hidden_states))
         return hidden_states
 
@@ -156,14 +192,14 @@ class MossTTSLocalDepthTransformer(nn.Module):
         and codebook-0's head (``audio_lm_heads[0]``) simultaneously.
       - codebooks 1..n_vq-1 are sampled sequentially: each sampled code is
         re-embedded (``audio_embeddings[c]``) and appended as the next
-        position, re-prefilling the block over the growing (<=n_vq) sequence
-        with a fresh causal mask each call -- mathematically identical to
-        incremental KV-cache decoding since attention is strictly causal and
-        only the last position is ever read, but avoids any cache plumbing
-        given the trivially short sequence length.
+        position. K/V for earlier positions are reused within the frame, so
+        each position's projections and MLP run once. A new frame overwrites
+        every cache position before reading it, including CUDA Graph replay.
     """
 
-    def __init__(self, gpt2_config, hidden_size: int | None = None) -> None:
+    def __init__(
+        self, gpt2_config, hidden_size: int | None = None, *, compile_audio_sampler: bool | None = None
+    ) -> None:
         super().__init__()
         self.hidden_size = int(hidden_size if hidden_size is not None else gpt2_config.n_embd)
         n_head = int(gpt2_config.n_head)
@@ -173,12 +209,16 @@ class MossTTSLocalDepthTransformer(nn.Module):
         self.h = nn.ModuleList([_MossTTSLocalBlock(self.hidden_size, n_head, inner_size, rope_base, eps)])
         self.ln_f = nn.LayerNorm(self.hidden_size, eps=eps)
         self._compiled_forward_prefix = None
+        self._compiled_audio_sampler = None
+        self._compile_audio_sampler = compile_audio_sampler
 
-    def _forward_prefix(self, seq_embeds: torch.Tensor) -> torch.Tensor:
-        hidden_states = seq_embeds
-        for block in self.h:
-            hidden_states = block(hidden_states)
-        return self.ln_f(hidden_states)
+    def _forward_prefix(
+        self,
+        seq_embeds: torch.Tensor,
+        kv_cache: tuple[torch.Tensor, torch.Tensor] | None = None,
+        position: int = 0,
+    ) -> torch.Tensor:
+        return self.ln_f(self.h[0](seq_embeds, kv_cache, position))
 
     def setup_compile(self) -> None:
         if self._compiled_forward_prefix is not None:
@@ -189,14 +229,68 @@ class MossTTSLocalDepthTransformer(nn.Module):
             return
         self._compiled_forward_prefix = torch.compile(
             self._forward_prefix,
-            dynamic=False,
+            # Share batch/position shapes instead of exhausting Dynamo's
+            # recompilation budget while warming request-size graph buckets.
+            dynamic=True,
             options={"epilogue_fusion": False},
         )
-        logger.info("MOSS-TTS local depth prefix enabled with torch.compile")
+        compile_sampler = self._compile_audio_sampler
+        if compile_sampler is None:
+            compile_sampler = os.environ.get("VLLM_OMNI_MOSS_LOCAL_COMPILE_AUDIO_SAMPLER", "0") == "1"
+        if compile_sampler:
+            # Keep the existing top-k/top-p algorithm and torch RNG. Explicit
+            # per-request generators use the original helper below. The
+            # binary continue/stop head is deliberately unchanged.
+            self._compiled_audio_sampler = torch.compile(
+                _sample_token, fullgraph=True, dynamic=True, options={"fallback_random": True}
+            )
+            logger.info("MOSS-TTS Local compiled audio-channel sampler enabled")
+        logger.info("MOSS-TTS local depth frame-local KV execution enabled with torch.compile")
 
-    def _run_prefix(self, seq_embeds: torch.Tensor) -> torch.Tensor:
+    def _run_prefix(
+        self, seq_embeds: torch.Tensor, kv_cache: tuple[torch.Tensor, torch.Tensor], position: int
+    ) -> torch.Tensor:
         forward_prefix = self._compiled_forward_prefix or self._forward_prefix
-        return forward_prefix(seq_embeds)
+        return forward_prefix(seq_embeds, kv_cache, position)
+
+    @staticmethod
+    def _sample_channel(
+        audio_lm_heads: nn.ModuleList,
+        local_hidden: torch.Tensor,
+        codes: torch.Tensor,
+        *,
+        channel_index: int,
+        repetition_penalty: float,
+        history_per_codebook: list[list[int]] | None,
+        temperature: float,
+        top_k: int,
+        top_p: float,
+        do_sample: bool,
+        generator: torch.Generator | None,
+        generators: Sequence[torch.Generator | None] | None = None,
+        sample_token: Callable[..., torch.Tensor] | None = None,
+    ) -> torch.Tensor:
+        """Compute channel logits, apply repetition penalty, sample, store."""
+        channel_logits = audio_lm_heads[channel_index](local_hidden).float()
+        if repetition_penalty != 1.0 and history_per_codebook is not None and channel_index < len(history_per_codebook):
+            hist = history_per_codebook[channel_index]
+            if hist:
+                hist_t = torch.tensor(hist, dtype=torch.long, device=channel_logits.device)
+                sel = channel_logits.index_select(-1, hist_t)
+                pos = sel > 0
+                sel = torch.where(pos, sel / repetition_penalty, sel * repetition_penalty)
+                channel_logits.index_copy_(-1, hist_t, sel)
+        channel_token = (sample_token or _sample_token)(
+            channel_logits,
+            temperature,
+            top_k,
+            top_p,
+            do_sample,
+            generator=generator,
+            generators=generators,
+        )
+        codes[:, channel_index] = channel_token
+        return channel_token
 
     @torch.no_grad()
     def generate_frame(
@@ -217,6 +311,7 @@ class MossTTSLocalDepthTransformer(nn.Module):
         repetition_penalty: float = 1.0,
         history_per_codebook: list[list[int]] | None = None,
         generator: torch.Generator | None = None,
+        generators: Sequence[torch.Generator | None] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Generate one audio frame for batch B.
 
@@ -240,9 +335,13 @@ class MossTTSLocalDepthTransformer(nn.Module):
         for block in self.h:
             block.attn.prepare_rope_cache(n_vq, backbone_last_hidden.device, dtype)
 
-        embeds = backbone_last_hidden.new_zeros((batch_size, n_vq, self.hidden_size), dtype=dtype)
-        embeds[:, 0, :] = backbone_last_hidden.to(dtype)
-        hidden = self._run_prefix(embeds[:, :1, :])
+        attn = self.h[0].attn
+        cache_shape = (batch_size, attn.n_head, n_vq, attn.head_dim)
+        kv_cache = (
+            backbone_last_hidden.new_empty(cache_shape, dtype=dtype),
+            backbone_last_hidden.new_empty(cache_shape, dtype=dtype),
+        )
+        hidden = self._run_prefix(backbone_last_hidden[:, None, :].to(dtype), kv_cache, 0)
         local_hidden = hidden[:, 0, :]
 
         binary_logits = local_text_lm_head(local_hidden).float()
@@ -255,6 +354,7 @@ class MossTTSLocalDepthTransformer(nn.Module):
             text_top_p,
             do_sample,
             generator=generator,
+            generators=generators,
         )
         should_continue = binary_choice.eq(0)
         import os as _os
@@ -268,33 +368,26 @@ class MossTTSLocalDepthTransformer(nn.Module):
 
         codes = backbone_last_hidden.new_zeros((batch_size, n_vq), dtype=torch.long)
         for channel_index in range(n_vq):
-            channel_logits = audio_lm_heads[channel_index](local_hidden).float()
-            if (
-                repetition_penalty != 1.0
-                and history_per_codebook is not None
-                and channel_index < len(history_per_codebook)
-            ):
-                hist = history_per_codebook[channel_index]
-                if hist:
-                    hist_t = torch.tensor(hist, dtype=torch.long, device=channel_logits.device)
-                    sel = channel_logits.index_select(-1, hist_t)
-                    pos = sel > 0
-                    sel = torch.where(pos, sel / repetition_penalty, sel * repetition_penalty)
-                    channel_logits.index_copy_(-1, hist_t, sel)
-            channel_token = _sample_token(
-                channel_logits,
-                temperature,
-                top_k,
-                top_p,
-                do_sample,
+            channel_token = self._sample_channel(
+                audio_lm_heads,
+                local_hidden,
+                codes,
+                channel_index=channel_index,
+                repetition_penalty=repetition_penalty,
+                history_per_codebook=history_per_codebook,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                do_sample=do_sample,
                 generator=generator,
+                generators=generators,
+                sample_token=self._compiled_audio_sampler if generator is None and generators is None else None,
             )
-            codes[:, channel_index] = channel_token
 
             if channel_index + 1 < n_vq:
-                embeds[:, channel_index + 1, :] = audio_embeddings[channel_index](channel_token).to(dtype)
-                hidden = self._run_prefix(embeds[:, : channel_index + 2, :])
-                local_hidden = hidden[:, channel_index + 1, :]
+                embeds = audio_embeddings[channel_index](channel_token).to(dtype)[:, None, :]
+                hidden = self._run_prefix(embeds, kv_cache, channel_index + 1)
+                local_hidden = hidden[:, 0, :]
 
         return should_continue, codes
 

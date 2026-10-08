@@ -64,17 +64,26 @@ The lifecycle labels used below are:
 | Name | Type and default | Applies to and read time | Precedence and invalid values | Lifecycle |
 | --- | --- | --- | --- | --- |
 | `DIFFUSION_ATTENTION_BACKEND` | Backend name or `auto`; default `auto` (platform selection) | Diffusion stages; read when `OmniDiffusionConfig` is constructed | `diffusion_attention_config.default` wins. An unknown backend fails during backend resolution. | Stable fallback |
+| `DIFFUSION_ATTENTION_QUANT` | `<dtype_qk>:<dtype_vo>[:<q_block_size>:<k_block_size>]`; default unset | Diffusion stages; read when `OmniDiffusionConfig` is constructed | Used only when `DIFFUSION_ATTENTION_BACKEND` sets a non-`auto` backend and no explicit attention default exists. Quantization support varies by backend. Malformed fields raise `ValueError`. | Stable fallback |
 | `DIFFUSION_CACHE_BACKEND` | `none`, `cache_dit`, `tea_cache`, `mag_cache`, `step_cache`, `stepcache`, or `step_cache_dit`; default `none` | Diffusion runner startup | Explicit `cache_backend` in config wins. Otherwise this name wins over the deprecated alias. Unsupported values raise `ValueError` during runner setup. | Stable fallback |
 | `DIFFUSION_CACHE_ADAPTER` | Same values as `DIFFUSION_CACHE_BACKEND`; default `none` | Diffusion runner startup | Used only when neither explicit `cache_backend` nor `DIFFUSION_CACHE_BACKEND` is set. Unsupported values raise `ValueError`. | Deprecated; use `DIFFUSION_CACHE_BACKEND` |
 | `OMNI_DIFFUSION_PROMPT_EMBED_CACHE` | Boolean: `1`, `true`, `yes`, `on`, `0`, `false`, `no`, or `off`; default disabled | Each diffusion runner; resolved during model setup | A recognized environment value overrides the explicit enable setting. An unrecognized value is ignored. | Experimental |
 | `OMNI_DIFFUSION_PROMPT_EMBED_CACHE_SIZE` | Positive integer; default `32` entries | Each diffusion runner; resolved during model setup | A valid environment value overrides the explicit cache size. A non-integer logs a warning; a non-positive value is ignored. | Experimental |
 | `OMNI_DIFFUSION_SESSION_STATE_MANAGER` | Boolean with the same accepted spellings as the prompt cache; default disabled | Experimental diffusion session manager; model setup | A recognized environment value overrides the explicit enable setting. An unrecognized value is ignored. | Experimental |
 | `OMNI_DIFFUSION_SESSION_STATE_MANAGER_MAX_SESSIONS` | Positive integer; default `64` | Experimental diffusion session manager; model setup | A valid environment value overrides the explicit maximum. A non-integer logs a warning; a non-positive value is ignored. | Experimental |
+| `VLLM_OMNI_AR_DIFFUSION_KV_GATHER` | `1` enables; default `0` (off) | AR-diffusion KV manager at allocation and attention at dispatch; set before worker startup | Only the exact value `1` enables contiguous KV gathering. History staging additionally requires `ARDiffusionKVConfig.reuse_history_staging`. | Experimental |
 
 Backend names for `DIFFUSION_ATTENTION_BACKEND` are the members of
 `DiffusionAttentionBackendEnum`, such as `FLASH_ATTN`, `TORCH_SDPA`,
 `SAGE_ATTN`, `FLASHINFER_ATTN`, and `TRTLLM_ATTN`. Platform support still
 depends on the installed kernels and model path.
+
+For `DIFFUSION_ATTENTION_QUANT`, the dtype fields accept `float16`,
+`bfloat16`, `int8`, or `fp8_e4m3`; the selected backend may support only a
+subset. For example, `DIFFUSION_ATTENTION_BACKEND=TRTLLM_ATTN` with
+`DIFFUSION_ATTENTION_QUANT=int8:bfloat16:1:16` selects INT8 Q/K SageAttention.
+Explicit `diffusion_attention_config.default` takes precedence over both
+environment variables.
 
 ### Serving and runtime
 
@@ -82,13 +91,22 @@ depends on the installed kernels and model path.
 | --- | --- | --- | --- | --- |
 | `SPEAKER_SAMPLES_DIR` | Filesystem path; default `~/.cache/vllm-omni/speakers` | Speech server; read when speaker storage initializes | Environment-only setting. The directory is created; filesystem errors propagate. | Stable |
 | `SPEAKER_MAX_UPLOADED` | Integer; default `1000` | Speech server; read when speaker storage initializes | Environment-only setting. A non-integer logs a warning and uses `1000`; range is not otherwise validated. | Stable |
+| `VLLM_OMNI_ABORT_TIMEOUT` | Float seconds; default `2` | Engine abort wait for Videos DELETE and `generate()` cancel/error cleanup; read when `async_omni` imports | Environment-only setting. A non-float raises `ValueError` during import. | Experimental |
 | `VLLM_OMNI_ASYNC_OUTPUT_TIMEOUT` | Float seconds; default `600` | Diffusion engine async-output wait in `step_streaming`; resolved per call on the request path, not at import | Environment-only setting. A non-float or `<=0` value warns once and uses the default. | Experimental |
-| `VLLM_OMNI_EVENT_DRIVEN_ORCH` | `1`, `true`, `yes` or `on` enables; default `0` (off) | Orchestration loop and the serving-side final-output drain; read once when the `Orchestrator` is constructed | Environment-only setting. Values are stripped and case-normalized; any unrecognized value leaves the legacy poll loop selected. | Experimental |
+| `VLLM_OMNI_EVENT_DRIVEN_ORCH` | `1`, `true`, `yes` or `on` enables; defaults to on for Qwen3-TTS and off for other pipelines | Pipeline default computed from `pipeline_config.model_type` at engine initialization; env override resolved at `Orchestrator` construction and separately when the serving-side final-output drain starts | An explicit env value wins; otherwise both consumers use the engine's pipeline default. Values are stripped and case-normalized; any unrecognized value selects the legacy poll loop. Set before server startup. | Experimental |
 | `VLLM_OMNI_INPUT_WAIT_TIMEOUT_S` | Float seconds; default `600`; `<=0` disables | Full-payload input coordinator, not async-chunk transfer; read when the scheduler module imports in each worker | Environment-only setting. A non-float logs a warning and uses `600`. | Stable operational control |
 | `VLLM_OMNI_ORCH_MONITOR_PATH` | Filesystem path; default `<current-working-directory>/vllm_omni_orch_monitor_<timestamp>.json` | Orchestrator monitor enabled by `--enable-orch-monitor`; read when the monitor is created | Environment-only path override. Parent directories are created; write errors are logged. | Diagnostic |
+| `VLLM_OMNI_SPEAKER_REGISTRATION_POLICY` | `overwrite` or `immutable`; default `overwrite` | Speech server; read when speaker storage initializes | Environment-only setting. `immutable` rejects re-registering an existing uploaded voice name until it is deleted; any other value raises `ValueError` at startup. | Experimental |
 | `VLLM_OMNI_VIDEO_SYNC_TIMEOUT` | Float seconds; default `600` | Synchronous Videos API; read when the API server module imports | Environment-only setting. A non-float raises `ValueError` during import. | Experimental |
 | `VLLM_VIDEO_ASYNC_CHUNK` | `on` or `off`; default `on` | Streaming video output; read on attribute access | Environment-only setting. Values are trimmed and case-normalized; an invalid value warns once and uses `on`. | Experimental |
 | `VLLM_VIDEO_AUDIO_DELTA_MODE` | `fast` or `slow`; default `fast` | Streaming video audio deltas; read on attribute access | Environment-only setting. Values are trimmed and case-normalized; an invalid value warns once and uses `fast`. | Experimental |
+
+### NIXL stage transfer
+
+| Name | Type and default | Applies to and read time | Precedence and invalid values | Lifecycle |
+| --- | --- | --- | --- | --- |
+| `VLLM_OMNI_NIXL_LEASE_S` | Float seconds; default `3600` | Unclaimed producer payload expiry; connector construction | Nonempty environment value overrides `lease_seconds`; empty falls back to config/default. Invalid floats raise `ValueError`. Claimed READ allocations never expire by time. | Experimental |
+| `VLLM_OMNI_NIXL_XFER_TIMEOUT_S` | Float seconds; default `300` | Receiver READ wait; connector construction | Nonempty environment value overrides `transfer_timeout_s`; empty falls back to config/default. Invalid floats raise `ValueError`. Timeout does not cancel DMA or release active allocations. | Experimental |
 
 ### Server storage
 
@@ -112,12 +130,29 @@ settings.
 
 | Name | Type and default | Applies to and read time | Precedence and invalid values | Lifecycle |
 | --- | --- | --- | --- | --- |
+| `VLLM_OMNI_FUSED_QK_NORM_ROPE_MIN_TOKENS` | Non-negative integer; unset or empty means each consumer's own default (Boogu-Image: `2048`; MammothModa2: `0`) | Token gate of the shared `fused_qk_norm_rope` op: a rotary table is packed for the fused kernel only when it spans at least this many positions (`B*S`); read at forward time | Environment-only. `0` = always fuse; a very large value disables the fused path. Any other value raises `ValueError` on the first forward. The crossover is host-dependent; re-benchmark before overriding. | Experimental performance control |
 | `VLLM_OMNI_SKIP_NVFP4_NAN_CLAMP` | Boolean truthy spellings: `1`, `true`, `yes`, `on`; default false | ModelOpt NVFP4 compatibility patch; read when `vllm_omni.patch` imports | Environment-only escape hatch. Any other value means false. Set only to diagnose the upstream NaN-scale issue. | Diagnostic and temporary |
 | `VLLM_OMNI_USE_QUACK_FP8` | Boolean truthy spellings: `1`, `true`, `yes`, `on`; unset means hardware auto-detection | FP8 scaled matrix multiplication; evaluated when quack capability is selected | A set value overrides auto-detection. Any non-truthy value forces quack off. If quack cannot load, vLLM-Omni warns and falls back to FlashInfer. | Experimental performance control |
 
 `QUACK_CACHE_DIR` is owned by the external quack library and is not an
 Omni-owned variable, even though vLLM-Omni supplies a persistent default when
 it is unset.
+
+### Torch compilation
+
+| Name | Type and default | Applies to and read time | Precedence and invalid values | Lifecycle |
+| --- | --- | --- | --- | --- |
+| `VLLM_OMNI_TORCH_DYNAMO_RECOMPILE_LIMIT` | Positive integer; unset preserves the current Torch setting | Process default for Torch Dynamo; read when `vllm_omni` is imported | Sets `torch._dynamo.config.recompile_limit` to the requested value. A non-positive or non-integer value raises `ValueError`. Later backend-specific overrides still take precedence. | Diagnostic |
+
+Set this variable before launching Omni, for example:
+
+```bash
+export VLLM_OMNI_TORCH_DYNAMO_RECOMPILE_LIMIT=64
+```
+
+The setting applies across model families and platforms. vLLM compilation
+contexts and backends can subsequently apply their own limits; this variable
+does not replace those backend-specific policies.
 
 ## Per-stage environment
 
@@ -151,7 +186,7 @@ their keys only.
 ## Inherited vLLM variables
 
 vLLM-Omni also reads variables through its aligned vLLM dependency. Refer to
-the [vLLM 0.28 environment-variable reference](https://docs.vllm.ai/en/v0.28.0/configuration/env_vars.html)
+the [vLLM 0.31 environment-variable reference](https://docs.vllm.ai/en/v0.31.0/configuration/env_vars.html)
 for their definitions. This includes vLLM launch, cache, logging, plugin, ROCm,
 XPU, ModelScope, and FlashInfer workspace settings.
 
@@ -179,7 +214,7 @@ collection, examples, bug reports, or logs.
 
 ## Model-specific variables
 
-The audit found 58 variables read by a single model or pipeline family. They are
+The inventory includes 93 variables read by a single model or pipeline family. They are
 not listed as public usage options here because doing so would turn implementation
 escape hatches into an accidental compatibility contract.
 
@@ -188,11 +223,11 @@ Every audited model-specific name has a migration disposition in the
 
 | Disposition | Count | Required outcome |
 | --- | ---: | --- |
-| Promote | 35 | Move a stable setting into typed stage or model configuration. |
-| Request scope | 6 | Move request-varying behavior into a declared request-option schema. |
+| Promote | 64 | Move a stable setting into typed stage or model configuration. |
+| Request scope | 5 | Move request-varying behavior into a declared request-option schema. |
 | External | 0 | Retain only when a supported third-party library owns the contract. |
-| Internalize | 11 | Keep a debug or diagnostic switch out of public documentation and configuration. |
-| Deprecate/remove | 6 | Remove a compatibility escape hatch that has no continuing contract. |
+| Internalize | 17 | Keep a debug or diagnostic switch out of public documentation and configuration. |
+| Deprecate/remove | 7 | Remove a compatibility escape hatch that has no continuing contract. |
 
 The disposition is a migration target, not a statement that the existing
 environment switch is stable. Promote or request-scope work should land in

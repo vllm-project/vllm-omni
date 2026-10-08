@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Regression tests for ``Qwen3OmniMoeCode2Wav.chunked_decode_streaming``.
 
 Background
@@ -210,26 +210,50 @@ def test_no_shift_when_decoder_returns_nominal_length():
     torch.testing.assert_close(streamed, gt)
 
 
-def test_batched_streaming_only_shifts_the_boundary_row():
-    """Per-row tail: in a shared window the shorter row had right context from
-    the longer row's frames, so it lost nothing (tail==0, no shift); only the
-    row at the decoded boundary (code_seq_len == window length) is shifted."""
-    model = _ShortTrimDecoder()
-    # One window of W=30 frames, two rows. codes[:, 0, :] are absolute indices.
-    idx = torch.arange(30, dtype=torch.long)
-    window = idx.view(1, 1, 30).expand(2, _Q, 30).contiguous()
+@pytest.mark.parametrize("cudagraph", [False, True])
+@pytest.mark.parametrize("trim", [_TRIM, 0])
+@pytest.mark.parametrize("short_frames,left_context", [(1, 0), (4, 0), (29, 4), (26, 25), (37, 25)])
+@pytest.mark.parametrize("reverse", [False, True])
+def test_streaming_batch_matches_independent_requests(cudagraph, trim, short_frames, left_context, reverse):
+    """Padding a request beside a longer one cannot supply valid future codec frames.
 
-    long_frames, short_frames = 30, 20  # row0 spans the full window, row1 is shorter
-    lc = 5
-    out = Qwen3OmniMoeCode2Wav.chunked_decode_streaming(
+    Compare values as well as lengths: an incorrect start and end can shift
+    the whole chunk while preserving its duration. The independent request
+    is the oracle, rather than another copy of the slicing arithmetic.
+    """
+    model = _ShortTrimDecoder(trim=trim, cudagraph=cudagraph)
+    short = _make_codes(short_frames)
+    long = _make_codes(50) + 100
+    windows = [(short, left_context), (long, 25)]
+    if reverse:
+        windows.reverse()
+    batch = torch.zeros(2, _Q, 50, dtype=torch.long)
+    for i, (window, _) in enumerate(windows):
+        batch[i, :, : window.shape[-1]] = window[0]
+    actual = Qwen3OmniMoeCode2Wav.chunked_decode_streaming(
         model,
-        window,
-        left_context_size=[lc, lc],
-        seq_token_counts=[long_frames * _Q, short_frames * _Q],
+        batch,
+        left_context_size=[lc for _, lc in windows],
+        seq_token_counts=[window.numel() for window, _ in windows],
     )
+    assert len(actual) == len(windows)
+    for output, (window, lc) in zip(actual, windows):
+        expected = _decode_chunk(model, window, lc)
+        torch.testing.assert_close(output.reshape(-1), expected, rtol=0, atol=0)
 
-    batch_len = 30 * _UP - _TRIM  # actual decoder output width
-    # Row 0 (boundary row): tail == TRIM -> start = lc*up - TRIM
-    assert out[0].shape[-1] == batch_len - (lc * _UP - _TRIM)
-    # Row 1 (shorter): code_seq_len*up < batch_len -> tail == 0 -> start = lc*up
-    assert out[1].shape[-1] == short_frames * _UP - lc * _UP
+
+@pytest.mark.parametrize("cudagraph", [False, True])
+def test_streaming_preserves_samples_when_batch_composition_changes(cudagraph):
+    """A singleton -> mixed batch -> singleton stream cannot skip then repeat samples."""
+    model = _ShortTrimDecoder(cudagraph=cudagraph)
+    codes = _make_codes(54)
+    first = _decode_chunk(model, codes[:, :, :4], 0)
+    middle_batch = torch.zeros(2, _Q, 50, dtype=torch.long)
+    middle_batch[0, :, :29] = codes[0, :, :29]
+    middle_batch[1] = _make_codes(50)[0] + 100
+    middle = Qwen3OmniMoeCode2Wav.chunked_decode_streaming(
+        model, middle_batch, left_context_size=[4, 25], seq_token_counts=[29 * _Q, 50 * _Q]
+    )[0].reshape(-1)
+    last = _decode_chunk(model, codes[:, :, 4:54], 25)
+    streamed = torch.cat((first, middle, last))
+    torch.testing.assert_close(streamed, _single_shot(model, codes), rtol=0, atol=0)
