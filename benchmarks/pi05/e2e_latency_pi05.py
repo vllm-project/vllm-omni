@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Client-side E2E latency for a running π0.5 OpenPI policy server.
 
 Times the full round trip a robot actually sees: msgpack pack, websocket send,
@@ -43,9 +44,7 @@ STATE_DIM = 32
 def make_obs(*, views: int, prompt: str, session_id: str, rng: np.random.Generator) -> dict:
     """One observation with ``views`` cameras. Random pixels, so no codec path is
     accidentally measured on constant data."""
-    obs: dict = {
-        cam: rng.integers(0, 256, (IMAGE_SIZE, IMAGE_SIZE, 3), dtype=np.uint8) for cam in CAMERA_KEYS[:views]
-    }
+    obs: dict = {cam: rng.integers(0, 256, (IMAGE_SIZE, IMAGE_SIZE, 3), dtype=np.uint8) for cam in CAMERA_KEYS[:views]}
     obs["state"] = rng.standard_normal(STATE_DIM).astype(np.float32)
     obs["prompt"] = prompt
     obs["session_id"] = session_id

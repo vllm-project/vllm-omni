@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """π0.5 eager-mode functional + latency sweep over batch size × camera views.
 
 Runs the real ``lerobot/pi05_base`` weights on GPU and, for every
@@ -96,20 +97,20 @@ def time_cell(model, batch_size: int, num_views: int, device: str, warmup: int, 
     )
 
     if device.startswith("cuda"):
-        torch.cuda.reset_peak_memory_stats()
+        torch.accelerator.reset_peak_memory_stats()
 
     with torch.no_grad():
         for _ in range(warmup):
             actions = model.sample_actions(**kwargs)
         if device.startswith("cuda"):
-            torch.cuda.synchronize()
+            torch.accelerator.synchronize()
 
         latencies = []
         for _ in range(iters):
             start = time.perf_counter()
             actions = model.sample_actions(**kwargs)
             if device.startswith("cuda"):
-                torch.cuda.synchronize()
+                torch.accelerator.synchronize()
             latencies.append((time.perf_counter() - start) * 1000.0)
 
     expected = (batch_size, ACTION_HORIZON, ACTION_DIM)
@@ -131,7 +132,9 @@ def time_cell(model, batch_size: int, num_views: int, device: str, warmup: int, 
         "min_ms": round(latencies[0], 2),
         "max_ms": round(latencies[-1], 2),
         "ms_per_sample": round(statistics.fmean(latencies) / batch_size, 2),
-        "peak_mem_gb": (round(torch.cuda.max_memory_allocated() / 2**30, 2) if device.startswith("cuda") else None),
+        "peak_mem_gb": (
+            round(torch.accelerator.max_memory_allocated() / 2**30, 2) if device.startswith("cuda") else None
+        ),
     }
 
 
@@ -157,7 +160,7 @@ def environment(device: str) -> dict:
     }
     if device.startswith("cuda"):
         info["gpu"] = torch.cuda.get_device_name(0)
-        info["capability"] = "sm_%d%d" % torch.cuda.get_device_capability(0)
+        info["capability"] = "sm_{}{}".format(*torch.cuda.get_device_capability(0))
     return info
 
 
@@ -233,7 +236,7 @@ def main() -> int:
                     "peak_mem_gb": None,
                 }
                 if args.device.startswith("cuda"):
-                    torch.cuda.empty_cache()
+                    torch.accelerator.empty_cache()
             print(f"{label:22s} {row['status']:12s} p50={row['p50_ms']} ms  peak={row['peak_mem_gb']} GB")
             rows.append(row)
 
