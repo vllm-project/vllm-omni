@@ -31,10 +31,10 @@ from vllm_omni.distributed.omni_connectors.utils.config import ConnectorSpec
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-@pytest.fixture
-def shm_sender(build_adapter):
+@pytest.fixture(params=[0, 4 << 20], ids=["per-key-shm", "host-ring"])
+def shm_sender(build_adapter, request):
     adapter, _ = build_adapter(stage_id=0)
-    connector = SharedMemoryConnector({"stage_id": 0})
+    connector = SharedMemoryConnector({"stage_id": 0, "host_ring_bytes": request.param})
     adapter.connector = connector
     adapter.custom_process_next_stage_input_func = lambda **kwargs: OmniPayloadStruct(
         codes=CodesStruct(audio=torch.tensor([1], dtype=torch.long))
@@ -111,13 +111,14 @@ def test_shm_release_reclaims_undrained_chunks_after_finish(shm_sender):
 
     adapter.release_shm_resources(ext_id)
     # The release is queued behind sends; nothing is unlinked on the caller.
-    assert f"{ext_id}_0_1" in connector._pending_keys
+    assert adapter._reclaimed_shm_total == 0
     while adapter._pending_save_reqs:
         adapter._send_single_request(adapter._pending_save_reqs.popleft())
 
     assert adapter._reclaimed_shm_total == 2
     assert not any(k.startswith(f"{ext_id}_0_") for k in connector._pending_keys)
     assert connector.get("0", "1", f"{ext_id}_0_1") is None
+    assert connector.get("0", "1", f"{ext_id}_0_2") is None
     assert connector.get("0", "1", sibling_key)[0] == "sibling"
 
 

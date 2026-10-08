@@ -19,7 +19,9 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 @pytest.fixture()
 def connector():
-    c = SharedMemoryConnector({})
+    # These cases inspect the per-key segment/lock protocol. The enabled ring
+    # protocol and its pressure fallback are covered in test_shm_ring.py.
+    c = SharedMemoryConnector({"host_ring_bytes": 0})
     yield c
     c.close()
 
