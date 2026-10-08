@@ -11,7 +11,7 @@ requirements still apply; selecting a profile does not prevent kernel fallbacks.
 
 ## Format
 
-The server configuration contains `profiles` and `default`:
+The server configuration contains `profiles`, `default` and optional `sigma`:
 
 - `profiles` maps names to complete attention configurations with `default`
   and optional `per_role` specs, as in `--diffusion-attention-config`.
@@ -36,6 +36,42 @@ Ranges are not clipped: they must fit the actual timestep sequence, which may
 differ from `num_inference_steps`. CFG evaluations share one step index.
 Each S2V clip and each H3 seed/continuation window restarts at step 0.
 Prompt encoding and decoding run with the base configuration.
+
+## Sigma windows
+
+Sigma schedules use the same prepared profiles, selected by normalized scheduler
+noise rather than step index or raw model timestep. MiniMax-H3 publishes its
+shifted rectified-flow video sigma. Wan2.2 and HunyuanImage-3.0 publish
+`scheduler.sigmas[i] / scheduler.sigmas[0]`; Wan DMD uses its fixed flow
+timestep divided by the training timestep scale. Missing or invalid sigma fails
+rather than silently selecting the base backend.
+
+Each window has exactly `low`, `high` and `profile`. Bounds must be finite
+numbers with `0 <= low < high <= 1`. Windows are ordered, non-overlapping and
+half-open `[low, high)`, except an end at `1.0` includes `1.0`. Adjacent windows
+are allowed; gaps use the base configuration. Thresholds refer to the actual
+shifted trajectory: changing step count or flow shift changes when a threshold
+is crossed, not the threshold itself.
+
+Set service defaults with `sigma` instead of `default` in the existing flag:
+
+```bash
+--diffusion-attention-schedule '{
+  "profiles": {"flash": {"default": "FLASH_ATTN"}},
+  "sigma": [{"low": 0.3, "high": 1.0, "profile": "flash"}]
+}'
+```
+
+The dotted flag is `--diffusion-attention-schedule.sigma`; deploy YAML uses
+`diffusion_attention_schedule.sigma`. CLI lists replace the corresponding
+stage list. There is no separate sigma flag or environment variable.
+
+Use `attention_sigma_schedule` in the same request extras or offline sampling
+parameters as `attention_schedule`. Omitted or `null` inherits, `[]` disables,
+and non-empty windows replace defaults. Both effective schedules cannot be
+non-empty, including inherited defaults. To replace a step default with sigma
+windows, also send `attention_schedule: []` (or clear the CLI `default` list).
+Request and step modes validate the resolved schedules before denoising.
 
 ## Server configuration
 
@@ -105,8 +141,11 @@ schedule request handling.
 
 Requests co-batch only with equal normalized request schedules after stage
 defaults. Omitted schedules and explicit server-equivalent ranges remain
-distinct batch keys. Scheduled H3 and Hunyuan step batches run one transformer
-forward per request so each uses its own progress.
+distinct batch keys. Sigma windows also participate in batch keys. Scheduled
+H3 and Hunyuan step batches run one transformer
+forward per request so each uses its own progress. Sigma-scheduled step
+batches are isolated even at equal step indices: model-private noise
+trajectories can select different profiles.
 
 Malformed or unknown-profile schedules return HTTP 400 before dispatch.
 Out-of-bounds ranges fail before denoising and retain the client error through

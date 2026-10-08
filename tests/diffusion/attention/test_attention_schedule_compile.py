@@ -30,7 +30,11 @@ import vllm_omni.diffusion.attention.layer as layer_mod
 from vllm_omni.diffusion.attention.backends.trtllm_attn import TrtllmAttentionBackend, TrtllmAttentionImpl
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.attention.parallel.base import NoParallelAttention
-from vllm_omni.diffusion.attention.schedule import AttentionScheduleRange
+from vllm_omni.diffusion.attention.schedule import (
+    AttentionScheduleRange,
+    parse_attention_sigma_schedule,
+    select_attention_profile_by_sigma,
+)
 from vllm_omni.diffusion.compile import regionally_compile
 from vllm_omni.diffusion.config import set_current_diffusion_config
 from vllm_omni.diffusion.data import (
@@ -44,6 +48,7 @@ from vllm_omni.diffusion.forward_context import (
     DenoiseProgressMixin,
     begin_scheduled_denoise,
     bind_attention_schedule,
+    bind_attention_sigma_schedule,
     set_forward_context,
 )
 
@@ -239,6 +244,8 @@ class _ToyPipeline(DenoiseProgressMixin):
         grad_enabled=False,
         inference_mode=False,
         timesteps=_TIMESTEPS,
+        sigma_schedule=None,
+        sigmas=None,
     ):
         """One request with the given request schedule; returns what each step ran."""
         assert not (grad_enabled and inference_mode)
@@ -247,11 +254,17 @@ class _ToyPipeline(DenoiseProgressMixin):
             torch.inference_mode() if inference_mode else torch.set_grad_enabled(grad_enabled),
             set_forward_context(omni_diffusion_config=self.config),
             bind_attention_schedule(schedule),
+            bind_attention_sigma_schedule(sigma_schedule),
         ):
             latents = torch.randn(1, _SEQ, _HIDDEN, generator=torch.Generator().manual_seed(_LATENT_SEED))
             total = begin_scheduled_denoise(len(timesteps))
             for step_idx, timestep in enumerate(timesteps):
-                self.record_denoise_step(step_idx, timestep, total_steps=total)
+                self.record_denoise_step(
+                    step_idx,
+                    timestep,
+                    total_steps=total,
+                    normalized_sigma=None if sigmas is None else sigmas[step_idx],
+                )
                 trace_start = len(_TRACE)
                 before = list(self.counter.executions)
                 compiles_before = _frame_compiles()
@@ -435,4 +448,59 @@ def test_private_timestep_gate_runs_inside_the_scheduled_range(compile_env, disa
     assert [step.graphs for step in steps] == [steps[0].graphs] * len(_TIMESTEPS)
     _require_compiled_steps(pipeline.counter, steps)
     _require_no_compile_after_first_step([steps])
+    _require_attention_outside_graphs(pipeline.counter)
+
+
+def _equivalent_step_schedule(windows, sigmas):
+    """Represent exactly the same profile choices as integer step ranges."""
+    names = [select_attention_profile_by_sigma(windows, sigma) for sigma in sigmas]
+    entries = []
+    start = 0
+    for end in range(1, len(names) + 1):
+        if end == len(names) or names[end] != names[start]:
+            if names[start] is not None:
+                entries.append((start, end, names[start]))
+            start = end
+    return _ranges(*entries)
+
+
+@pytest.mark.parametrize("dynamic,inference_mode", [(False, False), (True, True)])
+def test_sigma_values_windows_counts_and_flow_shifts_do_not_recompile(compile_env, dynamic, inference_mode):
+    # Both profiles use TRT, with distinct prepared configs; one keeps the real
+    # private timestep gate. This is CPU math, not a TRT kernel/capture test.
+    config = AttentionScheduleConfig(profiles={"approx": _trtllm(0.5), "gated": _trtllm(0.25, 0.6)})
+    pipeline = _pipeline(config, dynamic=dynamic)
+    requests = []
+    window_sets = [
+        [(0.0, 0.2, "gated"), (0.4, 0.8, "approx")],
+        [(0.1, 0.6, "approx"), (0.7, 1.0, "gated")],
+        [(0.0, 0.35, "approx"), (0.35, 1.0, "gated")],
+    ]
+    for count, shift, entries in zip((37, 21, 43), (1.0, 3.0, 7.0), window_sets):
+        windows = parse_attention_sigma_schedule(
+            [{"low": low, "high": high, "profile": name} for low, high, name in entries]
+        )
+        noise = [1.0 - i / (count - 1) for i in range(count)]
+        sigmas = [shift * s / (1.0 + (shift - 1.0) * s) for s in noise]
+        timesteps = _timesteps(count)
+        steps = pipeline.run(
+            None, sigma_schedule=windows, sigmas=sigmas, timesteps=timesteps, inference_mode=inference_mode
+        )
+        requests.append(steps)
+        _require_compiled_steps(pipeline.counter, steps)
+
+        # Real tensor trajectories, not only selection traces, agree with the
+        # equivalent step-index schedule and with an eager sigma execution.
+        eager = _pipeline(config, compiled=False)
+        by_step = eager.run(
+            _equivalent_step_schedule(windows, sigmas), timesteps=timesteps, inference_mode=inference_mode
+        )
+        by_sigma = eager.run(
+            None, sigma_schedule=windows, sigmas=sigmas, timesteps=timesteps, inference_mode=inference_mode
+        )
+        for compiled_step, step_step, sigma_step in zip(steps, by_step, by_sigma):
+            torch.testing.assert_close(compiled_step.latents, step_step.latents)
+            torch.testing.assert_close(compiled_step.latents, sigma_step.latents)
+            assert compiled_step.trace == step_step.trace == sigma_step.trace
+    _require_no_compile_after_first_step(requests)
     _require_attention_outside_graphs(pipeline.counter)

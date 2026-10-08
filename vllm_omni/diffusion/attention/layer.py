@@ -43,6 +43,7 @@ from vllm_omni.diffusion.forward_context import (
 from vllm_omni.platforms import current_omni_platform
 
 if TYPE_CHECKING:
+    from vllm_omni.diffusion.attention.schedule import AttentionSchedule, AttentionSigmaSchedule
     from vllm_omni.diffusion.data import AttentionScheduleConfig, AttentionSpec
 
 logger = init_logger(__name__)
@@ -920,15 +921,30 @@ class Attention(nn.Module):
             return impl, backend, spec
         ctx = get_forward_context()
         schedule = getattr(ctx, "attention_schedule", None)
-        if not schedule or not getattr(ctx, "attention_schedule_denoise_active", False):
-            return impl, backend, spec
-        step_idx = ctx.denoise_step_idx
-        total_steps = ctx.total_denoise_steps
-        if step_idx is None or total_steps is None:
-            raise RuntimeError("active denoise attention schedule requires denoise_step_idx and total_denoise_steps")
-        from vllm_omni.diffusion.attention.schedule import select_attention_profile
+        sigma_schedule = getattr(ctx, "attention_sigma_schedule", None)
+        step_active = bool(schedule) and getattr(ctx, "attention_schedule_denoise_active", False)
+        sigma_active = bool(sigma_schedule) and getattr(ctx, "attention_sigma_schedule_active", False)
+        if step_active and sigma_active:
+            raise RuntimeError("a request cannot combine attention_schedule with attention_sigma_schedule")
+        if sigma_active:
+            sigma = getattr(ctx, "denoise_sigma", None)
+            if sigma is None:
+                raise RuntimeError("active sigma attention schedule requires denoise_sigma")
+            from vllm_omni.diffusion.attention.schedule import select_attention_profile_by_sigma
 
-        name = select_attention_profile(schedule, step_idx, total_steps=total_steps)
+            name = select_attention_profile_by_sigma(cast("AttentionSigmaSchedule", sigma_schedule), sigma)
+        elif step_active:
+            step_idx = ctx.denoise_step_idx
+            total_steps = ctx.total_denoise_steps
+            if step_idx is None or total_steps is None:
+                raise RuntimeError(
+                    "active denoise attention schedule requires denoise_step_idx and total_denoise_steps"
+                )
+            from vllm_omni.diffusion.attention.schedule import select_attention_profile
+
+            name = select_attention_profile(cast("AttentionSchedule", schedule), step_idx, total_steps=total_steps)
+        else:
+            return impl, backend, spec
         if name is None:
             return impl, backend, spec
         record = self._schedule_candidates.get(name)

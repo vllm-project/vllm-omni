@@ -18,6 +18,7 @@ import torch
 from vllm_omni.diffusion.attention.backends.abstract import VideoTokenLayout, VideoTokenSpan
 from vllm_omni.diffusion.cancellation import check_request_cancellation
 from vllm_omni.diffusion.forward_context import (
+    set_forward_context_denoise_sigma,
     set_forward_context_denoise_step_idx,
     set_forward_context_denoise_timestep,
     set_forward_context_denoise_total_steps,
@@ -50,6 +51,8 @@ def minimax_h3_publish_denoise_progress(
     and the total step count enables the ``end_step`` tail fallback.
     """
     set_forward_context_denoise_step_idx(step)
+    # H3's shifted rectified-flow video sigma is already normalized noise.
+    set_forward_context_denoise_sigma(sigma_video)
     set_forward_context_denoise_timestep(sigma_video)
     set_forward_context_denoise_total_steps(total_steps)
 
