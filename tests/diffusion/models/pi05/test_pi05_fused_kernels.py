@@ -17,8 +17,9 @@ reduction:
 
 * It does not: bit-exact. That is the GELU, the residual sums, and every
   epilogue a GEMM feeds (RoPE and the K/V slot writes, the gated residual, the
-  GELU product) when the GEMM is cuBLAS's: float32 serves that way, and
-  bfloat16 is run that way here too to pin its rounding points.
+  GELU product) when the GEMM is cuBLAS's: float32 and the bfloat16 prefix
+  serve that way, and the bfloat16 action expert is run that way here too to
+  pin its rounding points.
 * It does (a Triton GEMM's accumulation, the RMS variance, softmax sums): the
   result may differ where the reordering flips a rounding, and must be as
   accurate as eager against a float64 evaluation of the same math: within
@@ -192,8 +193,9 @@ def _rms_norm_reference(x: torch.Tensor, eps: float, weight=None, scale=None, sh
 @pytest.mark.parametrize("dtype", DTYPES, ids=_dtype_id)
 @pytest.mark.parametrize("residual_add", [False, True], ids=["norm", "residual_add_norm"])
 def test_rms_norm_matches_gemma_rms_norm(dtype, residual_add):
-    """``_match(norm([sublayer_out +] residual), next_proj)`` in the prefix: the
-    residual sum is bit-exact, the norm as accurate as eager's."""
+    """``_match(norm([sublayer_out +] residual), next_proj)`` at the prefix's
+    shape (the served prefix keeps eager's norm): the residual sum is
+    bit-exact, the norm as accurate as eager's."""
     tokens, width, _ = SHAPES["prefix"]
     norm = _randomize(GemmaRMSNorm(width), seed=3).to(DEVICE)  # float32 in both layouts
     residual = _randn(tokens, width, scale=4.0, seed=4)
@@ -215,7 +217,8 @@ def test_rms_norm_matches_gemma_rms_norm(dtype, residual_add):
 
 @pytest.mark.parametrize("dtype", DTYPES, ids=_dtype_id)
 def test_final_rms_norm_keeps_the_residual_dtype(dtype):
-    """The prefix's final norm returns the residual stream's dtype, as eager's does."""
+    """The final Gemma norm at the prefix's shape returns the residual stream's
+    dtype, as eager's does (the served prefix keeps eager's final norm)."""
     tokens, width, _ = SHAPES["prefix"]
     norm = _randomize(GemmaRMSNorm(width), seed=6).to(DEVICE)
     residual = _randn(tokens, width, scale=4.0, seed=7)
@@ -373,9 +376,10 @@ def test_linear_gelu_mul_matches_gemma_mlp_input(gemm, dtype, tokens):
 @pytest.mark.parametrize("dtype", DTYPES, ids=_dtype_id)
 @pytest.mark.parametrize("part", SHAPES, ids=str)
 def test_attention_matches_eager_attend(dtype, part):
-    """``_attend`` over one KV head with eager's float mask: the prefix's
-    bidirectional mask with padded (fully masked) query rows, and a denoising
-    step's queries over the ``[prefix | suffix]`` cache row."""
+    """``_attend`` over one KV head with eager's float mask: a prefix-shaped
+    bidirectional mask with padded (fully masked) query rows (the served prefix
+    keeps eager's ``_attend``), and a denoising step's queries over the
+    ``[prefix | suffix]`` cache row."""
     tokens = SHAPES[part][0]
     prefix_pad = _prefix_pad_masks(SHAPES["prefix"][0])
     if part == "prefix":
