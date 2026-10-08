@@ -96,7 +96,8 @@ class Magi2Attention(nn.Module):
         self.q_size = self.num_heads_q * self.head_dim
         self.kv_size = self.num_heads_kv * self.head_dim
         # On MUSA project() returns Q/K/V as head-shard views of one Ulysses
-        # send buffer, so the compiled projection stores them in send order.
+        # send buffer, so the compiled projection stores them in send order,
+        # and output() receives the attention output in the same head shards.
         ulysses_size = get_magi2_ulysses_group().world_size if current_omni_platform.is_musa() else 1
         divisible = self.num_heads_q % ulysses_size == 0 and self.num_heads_kv % ulysses_size == 0
         self.ulysses_head_shards = ulysses_size if divisible else 1
@@ -201,6 +202,12 @@ class Magi2Attention(nn.Module):
         gates: torch.Tensor,
         modality_dispatcher: ModalityDispatcher,
     ) -> torch.Tensor:
+        if attention.ndim == 4 and attention.shape[1] == self.ulysses_head_shards:
+            # [T, world, H, D] head shards from this module's Ulysses group.
+            # Only the token count varies between calls; pinning the head layout
+            # lets a dynamic-shape compile index the receive buffer with constants.
+            torch._check(attention.shape[2] == self.num_heads_q // self.ulysses_head_shards)
+            torch._check(attention.shape[3] == self.head_dim)
         output = modality_dispatcher.permute(attention)
         if output.ndim == 4:
             # [T, world, H, D] Ulysses head shards, in head order.
