@@ -385,7 +385,10 @@ def get_wan22_pre_process_func(
                 if getattr(request.sampling_params, dimension) is None:
                     setattr(request.sampling_params, dimension, value)
             has_image = metadata["has_image"]
-        request.batch_compatibility_key = ("wan22_image_condition", has_image)
+        # Parsed at admission so a malformed value is rejected here. Carried in the batch key so requests
+        # with different intervals never share a request batch.
+        guidance_interval = resolve_wan_guidance_interval(request)
+        request.batch_compatibility_key = ("wan22_image_condition", has_image, guidance_interval)
         if isinstance(prompt, str):
             prompt = OmniTextPrompt(prompt=prompt)
         if "additional_information" not in prompt:
@@ -715,6 +718,12 @@ class Wan22Pipeline(
     ) -> torch.Tensor | AsyncLatents:
         if attention_kwargs is None:
             attention_kwargs = {}
+        # Decide CFG per step from the schedule once, with one host transfer, instead of syncing on
+        # float(t) every step. A Python bool also keeps CFG-parallel ranks on the same branch.
+        guided_steps = None
+        if guidance_interval is not None:
+            lo, hi = guidance_interval
+            guided_steps = [lo <= t <= hi for t in timesteps.tolist()]
         with self.progress_bar(total=len(timesteps)) as pbar:
             for step_idx, t in enumerate(timesteps):
                 self._current_timestep = t
@@ -765,7 +774,7 @@ class Wan22Pipeline(
                     timestep = t.expand(latents.shape[0])
 
                 do_true_cfg = current_guidance_scale > 1.0 and negative_prompt_embeds is not None
-                if guidance_interval is not None and not guidance_interval[0] <= float(t) <= guidance_interval[1]:
+                if guided_steps is not None and not guided_steps[step_idx]:
                     # Unguided step. cache-dit tells the cond/uncond passes apart by parity, so with it active
                     # keep both passes and neutralize guidance instead of skipping the negative one.
                     current_guidance_scale = 1.0

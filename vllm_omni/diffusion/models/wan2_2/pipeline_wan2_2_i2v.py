@@ -132,6 +132,12 @@ def get_wan22_i2v_pre_process_func(
     """Pre-process function for I2V: load and resize input image."""
 
     def pre_process_func(request: OmniDiffusionRequest) -> OmniDiffusionRequest:
+        extra_args = getattr(request.sampling_params, "extra_args", None) or {}
+        if extra_args.get("guidance_interval") is not None:
+            raise ValueError(
+                "guidance_interval is implemented for Wan text-to-video (WanPipeline) only; "
+                "the image-to-video route (WanImageToVideoPipeline) does not support it."
+            )
         prompt = request.prompt
         multi_modal_data = prompt.get("multi_modal_data", {}) if not isinstance(prompt, str) else None
         raw_image = multi_modal_data.get("image", None) if multi_modal_data is not None else None

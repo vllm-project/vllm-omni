@@ -355,7 +355,13 @@ Outside the interval, the negative-prompt pass is skipped. With the default 40 s
 and `flow_shift` 5, `[600, 1000]` skips the last 9 negative-prompt passes; other
 schedules skip a different number. The saving applies to sequential CFG. With `--cfg-parallel-size 2`
 each rank still runs one pass per step. With cache-dit, both passes run and guidance
-is set to 1.0 outside the interval. TI2V checkpoints reject the argument.
+is set to 1.0 outside the interval.
+
+The option applies to Wan2.1 and Wan2.2 text-to-video (`WanPipeline`, served by
+`Wan22Pipeline`). TI2V checkpoints (`expand_timesteps`) reject it, and so does the
+image-to-video route (`WanImageToVideoPipeline`), which also serves TI2V-5B. The VACE and
+speech-to-video routes ignore it, as every pipeline ignores options it does not implement. A malformed value is rejected when
+the request is admitted.
 
 ```bash
 curl -s http://localhost:8091/v1/videos/sync \

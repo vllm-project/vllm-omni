@@ -14,9 +14,15 @@ import vllm_omni.diffusion.cache.cachedit.model_specific as cd_model_specific
 from vllm_omni.config.stage_config import DiffusionStageRole
 from vllm_omni.diffusion.data import DiffusionCacheConfig
 from vllm_omni.diffusion.media import VideoTensorEncoding, VideoTensorLayout, VideoValueRange
-from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import Wan22Pipeline, build_wan_scheduler
+from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import (
+    Wan22Pipeline,
+    build_wan_scheduler,
+    get_wan22_pre_process_func,
+)
 from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import WanSelfAttention
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.sched.request_scheduler import RequestScheduler
+from vllm_omni.diffusion.utils.param_utils import parse_guidance_interval
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
@@ -801,6 +807,26 @@ def test_diffuse_guidance_interval_keeps_paired_cfg_when_cache_dit_active() -> N
     assert _run_diffuse_with_interval(pipeline, (600.0, 1000.0)) == [(True, 4.0), (True, 4.0), (True, 1.0)]
 
 
+def test_diffuse_guidance_interval_reads_the_schedule_once_without_per_step_sync(monkeypatch) -> None:
+    # One host read of the schedule before the loop; never float(t) or t.item() per step.
+    host_reads: list[str] = []
+    original_tolist = torch.Tensor.tolist
+
+    def _counting_tolist(self):
+        host_reads.append("tolist")
+        return original_tolist(self)
+
+    def _forbidden_per_step_sync(self):
+        raise AssertionError("device-to-host sync inside the denoising loop")
+
+    monkeypatch.setattr(torch.Tensor, "tolist", _counting_tolist)
+    monkeypatch.setattr(torch.Tensor, "__float__", _forbidden_per_step_sync)
+    monkeypatch.setattr(torch.Tensor, "item", _forbidden_per_step_sync)
+
+    assert _run_diffuse_with_interval(_make_pipeline(), (600.0, 1000.0)) == [(True, 4.0), (True, 4.0), (False, 1.0)]
+    assert host_reads == ["tolist"]
+
+
 def _forward_with_extra_args(pipeline, extra_args):
     captured: dict[str, object] = {}
 
@@ -831,14 +857,64 @@ def test_forward_resolves_guidance_interval_from_extra_args() -> None:
     assert captured["guidance_interval"] == (600.0, 1000.0)
 
 
-@pytest.mark.parametrize("bad", [[1000, 600], [600], [float("nan"), 1000], "69", {"lo": 600, "hi": 1000}])
-def test_forward_rejects_malformed_guidance_interval(bad) -> None:
-    with pytest.raises(ValueError, match="guidance_interval"):
-        _forward_with_extra_args(_make_pipeline(), {"guidance_interval": bad})
-
-
 def test_forward_rejects_guidance_interval_on_expand_timesteps_checkpoints() -> None:
     pipeline = _make_pipeline()
     pipeline.expand_timesteps = True
     with pytest.raises(ValueError, match="expand_timesteps"):
         _forward_with_extra_args(pipeline, {"guidance_interval": [600, 1000]})
+
+
+def _pre_process_with_extra_args(extra_args, *, request_id="test-req"):
+    pre_process = get_wan22_pre_process_func(SimpleNamespace())
+    return pre_process(
+        OmniDiffusionRequest(
+            prompt="prompt",
+            request_id=request_id,
+            sampling_params=OmniDiffusionSamplingParams(num_inference_steps=2, extra_args=extra_args),
+        )
+    )
+
+
+def test_pre_process_carries_guidance_interval_in_the_batch_key() -> None:
+    assert _pre_process_with_extra_args({}).batch_compatibility_key == ("wan22_image_condition", False, None)
+    with_interval = _pre_process_with_extra_args({"guidance_interval": [600, 1000]})
+    assert with_interval.batch_compatibility_key == ("wan22_image_condition", False, (600.0, 1000.0))
+
+
+@pytest.mark.parametrize("bad", [[1000, 600], [600], [float("nan"), 1000], "69", {"lo": 600, "hi": 1000}])
+def test_pre_process_rejects_malformed_guidance_interval_at_admission(bad) -> None:
+    with pytest.raises(ValueError, match="guidance_interval"):
+        _pre_process_with_extra_args({"guidance_interval": bad})
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [[True, 1000], [600, False], [600, float("inf")], [float("-inf"), 1000], [float("nan"), 1000], [600, float("nan")]],
+)
+def test_parse_guidance_interval_rejects_bool_and_non_finite_endpoints(bad) -> None:
+    with pytest.raises(ValueError, match="guidance_interval"):
+        parse_guidance_interval(bad)
+
+
+def _schedule_two_pre_processed_requests(first_extra_args, second_extra_args) -> list[str]:
+    scheduler = RequestScheduler()
+    scheduler.initialize(SimpleNamespace(max_num_seqs=2))
+    scheduler.add_request(_pre_process_with_extra_args(first_extra_args, request_id="a"))
+    scheduler.add_request(_pre_process_with_extra_args(second_extra_args, request_id="b"))
+    return [req.request_id for req in scheduler.schedule().scheduled_new_reqs]
+
+
+@pytest.mark.parametrize(
+    ("first_extra_args", "second_extra_args"),
+    [
+        ({"guidance_interval": [600, 1000]}, {"guidance_interval": [400, 1000]}),
+        ({"guidance_interval": [600, 1000]}, {}),
+    ],
+)
+def test_requests_with_different_guidance_intervals_never_share_a_batch(first_extra_args, second_extra_args) -> None:
+    assert _schedule_two_pre_processed_requests(first_extra_args, second_extra_args) == ["a"]
+
+
+def test_requests_with_equivalent_guidance_intervals_share_a_batch() -> None:
+    first, second = {"guidance_interval": [600, 1000]}, {"guidance_interval": (600.0, 1000.0)}
+    assert _schedule_two_pre_processed_requests(first, second) == ["a", "b"]
