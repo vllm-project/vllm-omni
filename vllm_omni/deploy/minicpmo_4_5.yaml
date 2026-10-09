@@ -55,8 +55,9 @@ connectors:
 stages:
   - stage_id: 0
     max_num_seqs: 16
-    # Leave headroom on the shared GPU for Talker KV + concurrent Code2Wav.
-    gpu_memory_utilization: 0.55
+    # 0.50 keeps stage-0 KV at 4.7GiB and leaves headroom on the shared GPU
+    # for Talker KV + concurrent Code2Wav; 0.55 starved stage 2 into OOM.
+    gpu_memory_utilization: 0.50
     enforce_eager: false
     # Stage-level prefix caching is NPU-only (see platforms.npu below): in the
     # platform-shared block it killed the stage-1 replica on CUDA (empty tts
@@ -92,8 +93,9 @@ stages:
     max_num_seqs: 16
     # Preserve the checkpoint's full-attention Talker prompt while it fits;
     # native duplex rolls over to a one-chunk window at context capacity.
-    # Leave device-level headroom for the colocated HiFi-GAN cuDNN workspace.
-    gpu_memory_utilization: 0.15
+    # 0.10 keeps 5.2GiB of Talker KV with device-level headroom left for the
+    # colocated HiFi-GAN cuDNN workspace.
+    gpu_memory_utilization: 0.10
     enforce_eager: false
     max_num_batched_tokens: 8192
     # Talker context is 4096 (tts_config.max_position_embeddings).
@@ -120,7 +122,9 @@ stages:
 
   - stage_id: 2
     max_num_seqs: 16
-    gpu_memory_utilization: 0.18
+    # 0.22 covers the 64k-token Code2Wav budget; this is the headroom that
+    # survived a full three-tier concurrency sweep with 0.50/0.10 upstream.
+    gpu_memory_utilization: 0.22
     enforce_eager: true
     enable_chunked_prefill: false
     max_num_batched_tokens: 65536
