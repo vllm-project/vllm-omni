@@ -146,10 +146,9 @@ class RequestBatchSamplingParamsKey:
     quality: str | None = None
 
     # Wan scheduler structure is carried through extra_args. Requests using
-    # different solvers, flow shifts or guidance intervals must not share a request batch.
+    # different solvers or flow shifts must not share a request batch.
     sample_solver: str | None = None
     flow_shift: float | None = None
-    guidance_interval: tuple[float, float] | None = None
 
     # Pipeline-specific condition structure populated during preprocessing.
     # It prevents independently valid requests with incompatible conditions
