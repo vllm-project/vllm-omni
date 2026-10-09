@@ -37,7 +37,7 @@ from __future__ import annotations
 import json
 import os
 import re
-from functools import lru_cache
+from functools import cache
 from pathlib import Path
 
 import pytest
@@ -99,7 +99,7 @@ def int8_cuda_device():
         pytest.skip(f"INT8 W8A8 requires SM75-SM90; got compute capability {capability}")
 
 
-@lru_cache(maxsize=None)
+@cache
 def _checkpoint_dir(version: str, quantization: str | None) -> Path:
     """Resolve local paths or pinned Hub snapshots for both inference and metadata."""
     prefix = f"MAMMOTH_MODA2_{version.upper()}"
@@ -688,13 +688,14 @@ def _matches_module(module: str, target: str) -> bool:
 
 
 def _quantized_weight_keys(quant_config: dict, metadata: dict[str, tuple[str, list[int]]]) -> set[str]:
-    """Match checkpoint targets/ignore entries against MammothModa2 weights.
+    """Match checkpoint targets/ignore entries against MammothModa2 AR weights.
 
-    Matrix-shaped module weights are Linear, Embedding, or ParallelLMHead;
-    embedding leaves and output heads are excluded from the Linear class target.
-    Exact names and ``re:`` patterns are supported alongside the ``Linear`` and
-    ``ParallelLMHead`` class targets. Unknown classes fail rather than silently
-    losing coverage.
+    Quantization applies only to ``llm_model.*``, matching the AR loader's scope.
+    The checkpoint also stores the BF16 DiT and image tokenizer; their Linear
+    modules are not targets of the AR recipe. Within the AR stage, embedding
+    leaves and output heads are excluded from the Linear class target. Exact
+    names and ``re:`` patterns are supported alongside ``Linear`` and
+    ``ParallelLMHead``. Unknown classes fail rather than losing coverage.
     """
     embedding_leaves = {
         "embed_tokens",
@@ -718,7 +719,7 @@ def _quantized_weight_keys(quant_config: dict, metadata: dict[str, tuple[str, li
         )
     quantized = set()
     for key, (_, shape) in metadata.items():
-        if not key.endswith(".weight"):
+        if not key.startswith("llm_model.") or not key.endswith(".weight"):
             continue
         module = key.removesuffix(".weight")
         if any(_matches_module(module, ignored) for ignored in quant_config.get("ignore", [])):
@@ -754,6 +755,13 @@ def test_quantization_target_classes(targets: list[str], ignore: list[str], expe
         "llm_model.model.language_model.embed_tokens.weight": ("BF16", [32, 8]),
         "llm_model.lm_head.weight": ("BF16", [32, 8]),
         "llm_model.gen_head.weight": ("BF16", [32, 8]),
+        # These matrix-shaped weights belong to other stages, so the AR
+        # recipe's Linear class target must not require INT8 weights/scales.
+        "gen_transformer.time_caption_embed.image_embedder.layers.0.cross_attn.out_proj.weight": (
+            "BF16",
+            [16, 8],
+        ),
+        "gen_tokenizer.image_tokenizer.decoder.adaptive.0.gamma.weight": ("BF16", [16, 8]),
     }
     config = {"config_groups": {"group_0": {"targets": targets}}, "ignore": ignore}
     assert _quantized_weight_keys(config, metadata) == {f"{module}.weight" for module in expected_modules}
@@ -823,8 +831,8 @@ def test_int8_checkpoint_quantization_scales(version: str):
 
     metadata = _tensor_metadata(ckpt_dir, weight_map)
     quantized_keys = _quantized_weight_keys(quant_config, metadata)
-    # Validate every declared target, including missing scales and weights that
-    # were incorrectly saved in full precision; checking only I8 keys misses those.
+    # Validate every declared AR target, including missing scales and weights
+    # incorrectly saved in full precision; checking only I8 keys misses those.
     for weight_key in sorted(quantized_keys):
         scale_key = weight_key.removesuffix(".weight") + ".weight_scale"
         _assert_int8_weight_and_scale(ckpt_dir, weight_map, metadata, weight_key, scale_key)
