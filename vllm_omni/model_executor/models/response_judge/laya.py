@@ -74,6 +74,19 @@ class LayaDecisionPooler(Pooler):
         return outputs
 
 
+def laya_question_type(config: object) -> str | int:
+    """The question type the head scores, from ``laya_question_type`` or the
+    ``response_judge.question_type`` the prompt is built with; they must agree."""
+    model_qtype = getattr(config, "laya_question_type", None)
+    judge = getattr(config, "response_judge", None)
+    judge_qtype = judge.get("question_type") if isinstance(judge, dict) else None
+    if model_qtype is not None and judge_qtype is not None and str(model_qtype) != str(judge_qtype):
+        raise ValueError(
+            f"laya_question_type={model_qtype!r} does not match response_judge.question_type={judge_qtype!r}"
+        )
+    return model_qtype if model_qtype is not None else (judge_qtype or "choice")
+
+
 @attn_type("encoder_only")
 @default_pooling_type(seq_pooling_type="CLS")
 class LayaDecisionModel(nn.Module):
@@ -83,7 +96,7 @@ class LayaDecisionModel(nn.Module):
         super().__init__()
         config = vllm_config.model_config.hf_config
         self.encoder = ModernBertModel(vllm_config=vllm_config, prefix=maybe_prefix(prefix, "encoder"))
-        qtype = getattr(config, "laya_question_type", "choice")
+        qtype = laya_question_type(config)
         self.pooler = LayaDecisionPooler(
             config.hidden_size,
             int(getattr(config, "laya_head_layers", 2)),

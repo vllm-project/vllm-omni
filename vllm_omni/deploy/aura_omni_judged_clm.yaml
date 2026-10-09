@@ -5,8 +5,9 @@
 # (clm_head.safetensors), and config.json with architectures:
 # [ClmDecisionModel] and the matching response_judge options.
 #
-# The encoder is Qwen3-8B (about 16 GB of weights): place stage 1 on a GPU
-# with room for it, e.g. a second card.
+# The encoder is Qwen3-8B (about 16 GB of weights). gpu_memory_utilization
+# below is sized for an 80 GB GPU shared with the other stages; on a smaller
+# GPU, raise it or place stage 1 on its own card (devices).
 base_config: aura_omni_judged.yaml
 pipeline: aura_omni_judged
 

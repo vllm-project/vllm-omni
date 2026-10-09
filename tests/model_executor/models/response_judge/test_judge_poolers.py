@@ -12,7 +12,7 @@ import torch
 import torch.nn.functional as F
 
 from vllm_omni.model_executor.models.response_judge.clm import ClmDecisionPooler, ClmHead
-from vllm_omni.model_executor.models.response_judge.laya import LayaDecisionPooler
+from vllm_omni.model_executor.models.response_judge.laya import LayaDecisionPooler, laya_question_type
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -100,3 +100,20 @@ def test_clm_pooler_scores_a_prefix_cache_hit_at_the_prompts_last_token():
     [out] = pooler(hidden, md)
     zs = F.normalize(pooler.state_head(F.normalize(hidden[15], dim=-1)), dim=-1)
     torch.testing.assert_close(out, pooler.scale * (F.normalize(pooler.option_proj, dim=-1) @ zs))
+
+
+@pytest.mark.parametrize(
+    ("model_qtype", "judge_qtype", "expected"),
+    [(None, None, "choice"), ("score", None, "score"), (None, "score", "score"), ("choice", "choice", "choice")],
+)
+def test_laya_question_type_has_one_value(model_qtype, judge_qtype, expected):
+    config = SimpleNamespace(response_judge={} if judge_qtype is None else {"question_type": judge_qtype})
+    if model_qtype is not None:
+        config.laya_question_type = model_qtype
+    assert laya_question_type(config) == expected
+
+
+def test_laya_question_types_that_disagree_fail_at_load():
+    config = SimpleNamespace(laya_question_type="choice", response_judge={"question_type": "score"})
+    with pytest.raises(ValueError, match="does not match"):
+        laya_question_type(config)

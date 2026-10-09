@@ -76,6 +76,15 @@ class _PendingTurn:
     spec: JudgeSpec | None
     transcript: str
     source_output: Any
+    # The ASR stage's token decoder, which the orchestrator swaps for the
+    # judge's while it forwards the judge output.
+    source_token_decoder: Any = None
+    # A streaming request forwards one finished judge output twice (update,
+    # then terminal); both forwards must get the same answer. The decision is
+    # kept with the output it was made for, so a different judge output (e.g.
+    # an earlier turn of the same request id arriving late) is judged on its own.
+    decided_for: Any = None
+    rejected: bool = False
 
 
 _PENDING: WeakValueDictionary[str, _PendingTurn] = WeakValueDictionary()
@@ -103,13 +112,12 @@ def _peek(request_id: str) -> _PendingTurn | None:
         return _PENDING.get(request_id)
 
 
-def _pop(request_id: str, streaming_context: Any) -> _PendingTurn | None:
+def _owned_turn(request_id: str, streaming_context: Any) -> _PendingTurn | None:
+    # The turn stays with its request until the request ends (or the next turn
+    # of the same request replaces it), so a repeated forward still finds it.
     owned = _owned(streaming_context)
     with _LOCK:
-        pending = owned.pop(request_id, None)
-        if pending is not None and _PENDING.get(request_id) is pending:
-            _PENDING.pop(request_id, None)
-        return pending
+        return owned.get(request_id)
 
 
 # --------------------------------------------------------------------------- #
@@ -208,7 +216,8 @@ def _laya_prompt(spec: JudgeSpec, transcript: str, model_config: Any) -> dict[st
 
     tok = cached_tokenizer_from_config(model_config)
     opts = spec.options
-    qtype = str(opts.get("question_type", "choice"))
+    # The model's head scores this question type too (laya_question_type).
+    qtype = str(opts.get("question_type", getattr(model_config.hf_config, "laya_question_type", "choice")))
     max_len = int(opts.get("max_len", 1024))
     head_max_len = int(opts.get("head_max_len", 256))
     mask = tok.mask_token
@@ -250,7 +259,16 @@ def _option_scores_reject(spec: JudgeSpec, output: Any) -> bool:
     keys = list(spec.options.get("option_keys") or (spec.options.get("options") or {"yes": None, "no": None}))
     reply = spec.options.get("reply_option", keys[0])
     reply_keys = [str(k) for k in (reply if isinstance(reply, list) else [reply])]
-    probs = torch.softmax(torch.as_tensor(logits).float().flatten(), dim=-1).tolist()
+    scores = torch.as_tensor(logits)
+    if scores.dim() == 2 and scores.shape[0] == 1:
+        scores = scores[0]
+    # One finite real score per option; anything else is unreadable.
+    if scores.dim() != 1 or scores.dtype == torch.bool or scores.is_complex():
+        return False
+    scores = scores.float()
+    if not bool(torch.isfinite(scores).all()):
+        return False
+    probs = torch.softmax(scores, dim=-1).tolist()
     if len(probs) != len(keys) or not reply_keys or any(k not in keys for k in reply_keys):
         return False
     p_reply = sum(probs[keys.index(k)] for k in reply_keys)
@@ -323,8 +341,11 @@ def judge_input(
         for idx, source_output in enumerate(source_outputs):
             request_id = str(getattr(source_output, "request_id", idx))
             transcript = transcript_fn(source_output, prompts.get(request_id, {}))
-            _remember(request_id, _PendingTurn(spec, transcript, source_output), streaming_context)
-            next_inputs.append(build(spec, transcript, target_model_config))
+            # Build first: a prompt that cannot be built must not leave a turn behind.
+            next_input = build(spec, transcript, target_model_config)
+            decoder = getattr(streaming_context, "source_token_decoder", None)
+            _remember(request_id, _PendingTurn(spec, transcript, source_output, decoder), streaming_context)
+            next_inputs.append(next_input)
         return next_inputs
 
     return asr2judge
@@ -354,19 +375,32 @@ def after_judge(bridge: Callable[..., list[Any]]) -> Callable[..., list[Any]]:
     @functools.wraps(bridge)
     def judged(source_outputs, prompt=None, requires_multimodal_data=False, streaming_context=None, **kwargs):
         asr_outputs = []
+        asr_decoder = None
         for idx, judge_output in enumerate(source_outputs):
             request_id = str(getattr(judge_output, "request_id", idx))
-            pending = _pop(request_id, streaming_context)
+            pending = _owned_turn(request_id, streaming_context)
             if pending is None:
                 raise RuntimeError(f"response judge has no ASR output for request {request_id}")
-            if _rejects(pending, judge_output):
+            if pending.decided_for is not judge_output:
+                pending.rejected = _rejects(pending, judge_output)
+                pending.decided_for = judge_output
+            if pending.rejected:
                 continue
             asr_outputs.append(pending.source_output)
+            asr_decoder = asr_decoder or pending.source_token_decoder
         if not asr_outputs:
             return []
-        if wants_context:
+        if not wants_context:
+            return bridge(asr_outputs, prompt, requires_multimodal_data, **kwargs)
+        # The wrapped bridge reads ASR outputs, so it gets the ASR decoder back.
+        judge_decoder = getattr(streaming_context, "source_token_decoder", None)
+        if asr_decoder is not None:
+            streaming_context.source_token_decoder = asr_decoder
+        try:
             return bridge(asr_outputs, prompt, requires_multimodal_data, streaming_context, **kwargs)
-        return bridge(asr_outputs, prompt, requires_multimodal_data, **kwargs)
+        finally:
+            if asr_decoder is not None:
+                streaming_context.source_token_decoder = judge_decoder
 
     judged.__signature__ = signature.replace(parameters=params)  # type: ignore[attr-defined]
     return judged

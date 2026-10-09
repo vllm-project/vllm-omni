@@ -121,7 +121,68 @@ def test_after_judge_forwards_the_asr_output_and_drops_rejected_turns(monkeypatc
 
     rj.asr2judge([_asr("r2", "嗯嗯")], None, False, owner, target_model_config=config)
     assert judged([_judge_text("r2", "NO")], None, True, owner) == []
-    assert owner.bridge_states["response_judge"] == {}
+    assert len(seen) == 1
+
+
+def test_a_repeated_forward_of_one_judge_output_gets_the_same_answer(monkeypatch):
+    """Streaming requests forward a finished output twice (update, then terminal).
+
+    Both calls must see the turn: the host bridge runs twice on the original
+    ASR output, exactly as it would without a judge, and a rejected turn stays
+    rejected.
+    """
+    config = _model_config({"format": "chat_yes_no"}, _ChatTokenizer(), monkeypatch)
+    calls = []
+
+    def asr2main(source_outputs, prompt=None, requires_multimodal_data=False):
+        calls.append(source_outputs)
+        return [{"prompt": source_outputs[0].outputs[0].text}]
+
+    judged = rj.after_judge(asr2main)
+    owner = _owner()
+    asr = _asr("r1", "今天天气怎么样")
+    rj.asr2judge([asr], None, False, owner, target_model_config=config)
+    for _ in range(2):
+        assert judged([_judge_text("r1", "YES")], None, False, owner) == [{"prompt": "今天天气怎么样"}]
+    assert calls == [[asr], [asr]]
+
+    rj.asr2judge([_asr("r2", "嗯嗯")], None, False, owner, target_model_config=config)
+    for _ in range(2):
+        assert judged([_judge_text("r2", "NO")], None, False, owner) == []
+    assert len(calls) == 2
+
+
+def test_the_wrapped_bridge_decodes_with_the_asr_decoder(monkeypatch):
+    """The orchestrator swaps in the judge's decoder to forward the judge output;
+    the wrapped bridge reads ASR outputs and must see the ASR decoder."""
+    config = _model_config({"format": "chat_yes_no"}, _ChatTokenizer(), monkeypatch)
+
+    def asr_decode(ids):
+        return "asr"
+
+    def judge_decode(ids):
+        return "judge"
+
+    seen = []
+
+    def bridge(source_outputs, prompt=None, requires_multimodal_data=False, streaming_context=None):
+        seen.append(streaming_context.source_token_decoder([1]))
+        return [source_outputs[0].outputs[0].text]
+
+    owner = SimpleNamespace(bridge_states={}, source_token_decoder=asr_decode)
+    rj.asr2judge([_asr("r1", "今天天气怎么样")], None, False, owner, target_model_config=config)
+    owner.source_token_decoder = judge_decode
+    assert rj.after_judge(bridge)([_judge_text("r1", "YES")], None, False, owner) == ["今天天气怎么样"]
+    assert seen == ["asr"]
+    assert owner.source_token_decoder is judge_decode
+
+
+def test_laya_prompt_follows_the_model_question_type(monkeypatch):
+    tok = _LayaTokenizer()
+    monkeypatch.setattr("vllm.tokenizers.cached_tokenizer_from_config", lambda config: tok)
+    config = SimpleNamespace(hf_config=SimpleNamespace(response_judge={"format": "laya"}, laya_question_type="score"))
+    [judge_input] = rj.asr2judge([_asr("r1", "hi")], None, False, _owner(), target_model_config=config)
+    assert judge_input["prompt_token_ids"][1] == tok.vocab["score"]
 
 
 def test_after_judge_keeps_the_wrapped_signature_for_extra_context():
@@ -137,6 +198,37 @@ def test_after_judge_without_a_judged_turn_raises():
     judged = rj.after_judge(lambda source_outputs, prompt=None, requires_multimodal_data=False: [])
     with pytest.raises(RuntimeError, match="no ASR output"):
         judged([_judge_text("missing", "YES")], None, False, _owner())
+
+
+def test_a_cached_decision_belongs_to_its_judge_output(monkeypatch):
+    """Overlapping turns of one request id: ASR 1, ASR 2, judge 1 (YES), judge 2 (NO).
+
+    A request id carries one turn at a time, so judge 1 decides the turn it
+    finds (ASR 2). Judge 2 is a different output and gets its own decision
+    instead of reusing judge 1's.
+    """
+    config = _model_config({"format": "chat_yes_no"}, _ChatTokenizer(), monkeypatch)
+    judged = rj.after_judge(
+        lambda source_outputs, prompt=None, requires_multimodal_data=False: [
+            o.outputs[0].text for o in source_outputs
+        ]
+    )
+    owner = _owner()
+    rj.asr2judge([_asr("r1", "第一句")], None, False, owner, target_model_config=config)
+    rj.asr2judge([_asr("r1", "嗯嗯")], None, False, owner, target_model_config=config)
+    assert judged([_judge_text("r1", "YES")], None, False, owner) == ["嗯嗯"]
+    no = _judge_text("r1", "NO")
+    assert judged([no], None, False, owner) == []
+    assert judged([no], None, False, owner) == []
+
+
+def test_a_prompt_that_cannot_be_built_records_no_turn(monkeypatch):
+    config = _model_config({"format": "clm", "state_template": "User: {missing}"}, _ChatTokenizer(), monkeypatch)
+    owner = _owner()
+    with pytest.raises(KeyError):
+        rj.asr2judge([_asr("r-bad", "hi")], None, False, owner, target_model_config=config)
+    assert rj._peek("r-bad") is None
+    assert owner.bridge_states.get("response_judge", {}) == {}
 
 
 def test_pending_turn_is_released_with_the_request_owner(monkeypatch):
@@ -197,6 +289,29 @@ def test_unreadable_pooling_output_is_let_through(monkeypatch):
     rj.asr2judge([_asr("r1", "嗯嗯")], None, False, owner, target_model_config=config)
     assert rj._peek("r1") is not None
     assert rj.judge_rejects(SimpleNamespace(request_id="r1", outputs=[SimpleNamespace(text="")])) is False
+
+
+@pytest.mark.parametrize(
+    "logits",
+    [
+        torch.tensor([float("nan"), 3.0]),
+        torch.tensor([0.0, float("inf")]),
+        torch.tensor([[0.0], [3.0]]),
+        torch.tensor([0.0, 3.0], dtype=torch.complex64),
+        torch.tensor([False, True]),
+    ],
+    ids=["nan", "inf", "column", "complex", "bool"],
+)
+def test_pooled_scores_that_cannot_be_read_let_the_turn_through(monkeypatch, logits):
+    config = _model_config(
+        {"format": "laya", "options": {"yes": "reply", "no": "quiet"}, "reply_option": "yes"},
+        _LayaTokenizer(),
+        monkeypatch,
+    )
+    owner = _owner()
+    rj.asr2judge([_asr("r1", "嗯嗯")], None, False, owner, target_model_config=config)
+    output = SimpleNamespace(request_id="r1", finished=True, outputs=SimpleNamespace(data=logits))
+    assert rj.judge_rejects(output) is False
 
 
 def test_clm_prompt_is_context_blank_line_question(monkeypatch):

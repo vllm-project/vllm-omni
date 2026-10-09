@@ -8,8 +8,11 @@ reply and TTS speaks it.
 A **response judge** is an optional stage placed right after the ASR stage. A
 small judge model reads the ASR transcript and decides whether the turn needs
 a reply. A turn that does not ends at the judge, and the main model and TTS
-are not run. Any judge model can be used: a chat model that answers with one
-token, or a pooling (decision / scoring) model.
+are not run. Any judge model can be integrated through the stage's model and
+decision interfaces, including chat models that answer with one token and
+pooling (decision / scoring) models. Already integrated judges are selected
+through deployment configuration; new models require adapter code as
+described under "Adding a judge".
 
 ```text
 Audio -> VAD commit -> ASR -> response judge -+-> reply needed:    main model -> TTS
@@ -58,7 +61,8 @@ Options per format:
   `reject_label`. The chat template is rendered with thinking disabled, so
   the first generated token is the answer.
 - `laya`: `question_type`, `instructions`, `options` (key -> description),
-  `reply_option`, `threshold` and `state_template`.
+  `reply_option`, `threshold` and `state_template`. `question_type` defaults
+  to the model's `laya_question_type`; if both are set they must agree.
 - `clm`: the option projections are fixed when the model directory is
   prepared, and that directory's `config.json` carries the matching
   `response_judge` options (`option_keys`, `reply_option`, `threshold`,
@@ -66,6 +70,16 @@ Options per format:
 
 `reply_option` may be a list; the probabilities of the listed options are
 added.
+
+The pooling judges load from a directory prepared for vLLM:
+
+- **LAYA:** the checkpoint's weights, `config.json` with
+  `architectures: [LayaDecisionModel]` and `laya_question_type`, and the
+  tokenizer files at the top level of the directory.
+- **CLM:** the Qwen3 encoder weights, `clm_head.safetensors` with the state
+  head, the option projections (computed once from the option texts) and the
+  logit scale, and `config.json` with `architectures: [ClmDecisionModel]`,
+  `clm_head`, `clm_num_options` and the `response_judge` options.
 
 ## Example: AURA
 
@@ -137,7 +151,7 @@ profile, one session at a time), most of its time was the model call, so:
   `aura_omni_judged_clm.yaml` therefore set
   `compilation_config.cudagraph_capture_sizes`. With it the LAYA forward pass
   dropped from about 18 ms to about 8 ms in the pipeline; a standalone CLM
-  call after an idle gap dropped from about 39 ms to about 31 ms. For the
+  forward pass after an idle gap dropped from about 39 ms to about 31 ms. For the
   Qwen3 judge, larger capture sizes showed no gain in a standalone test, so
   `aura_omni_judged.yaml` keeps the defaults.
 - **Poll stage outputs event-driven.** `VLLM_OMNI_EVENT_DRIVEN_ORCH=1` lets
@@ -161,7 +175,13 @@ went from 43.0 and 44.5 ms to 26.1 and 28.5 ms p50 in two repeats.
 - Judge quality depends on the model and the prompt. Zero-shot decision
   models (LAYA, CLM) are weak at "does this need a reply"; fine-tuning their
   heads is future work.
-- Short answers to the assistant's question ("seven", "tomorrow") and
-  interruptions ("wait") look like backchannels without the assistant's
-  last turn. The LAYA example prompt still rejects some of them.
+- Short answers to a question from the previous turn ("seven", "tomorrow")
+  and interruptions ("wait") look like backchannels without the previous
+  turn. The LAYA example prompt still rejects some of them.
+- A request id carries one judged turn at a time; a request must not send a
+  new transcript to the judge before the previous one has been decided.
+- In an auto-response duplex session, a turn that follows a terminal listen
+  (a judge rejection, or the model's own silence) may only get
+  `response.listen`. This is a session issue outside the judge; a fix is
+  tracked separately.
 - The judge adds its own latency and GPU memory to every committed turn.
