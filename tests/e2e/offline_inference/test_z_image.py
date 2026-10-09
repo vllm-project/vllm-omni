@@ -6,6 +6,7 @@ import pytest
 from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OfflineOmniClient
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+from vllm_omni.platforms import current_omni_platform
 
 MODEL = "Tongyi-MAI/Z-Image-Turbo"
 PROMPT = "A high-detail studio photo of an orange tabby cat sitting on a laptop keyboard."
@@ -14,7 +15,20 @@ PROMPT = "A high-detail studio photo of an orange tabby cat sitting on a laptop 
 @pytest.mark.slow
 @pytest.mark.diffusion
 @hardware_test(res={"cuda": "L4", "rocm": "MI325", "xpu": "B60"}, num_cards={"cuda": 1, "rocm": 1, "xpu": 2})
-@pytest.mark.parametrize("omni_runner", [(MODEL, None)], indirect=True)
+@pytest.mark.parametrize(
+    "omni_runner",
+    [
+        (
+            MODEL,
+            None,
+            # Main build 13005 exhausted the inner 1800s budget during cold
+            # AITER compilation. Leave ten minutes inside the AMD 55m process
+            # deadline for generation and cleanup after a 45m initialization.
+            {"init_timeout": 2700} if current_omni_platform.is_rocm() else {},
+        )
+    ],
+    indirect=True,
+)
 def test_zimage(offline_client: OfflineOmniClient):
     # high resolution may cause OOM on L4
     sampling = OmniDiffusionSamplingParams(
