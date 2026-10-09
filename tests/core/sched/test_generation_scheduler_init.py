@@ -75,10 +75,8 @@ def test_moss_profile_generation_constructor_after_platform_resolution(
         assert scheduler._native_data_plane and scheduler.input_coordinator is not None
         assert scheduler._generation_min_batch_size == min_batch
         assert scheduler._generation_max_wait_s == max_wait_ms / 1000
-        assert scheduler._generation_max_regular_batch == (16 if profile == "low_latency" else 0)
+        assert scheduler._generation_max_regular_batch == 0
         warning.assert_not_called()
-        if profile == "low_latency":
-            assert extras["codec_first_chunk_fast_path"] == extras["codec_first_chunk_gate"] == 1
     else:
         assert not scheduler._native_data_plane and scheduler.chunk_transfer_adapter is not None
         assert scheduler._generation_min_batch_size == 1

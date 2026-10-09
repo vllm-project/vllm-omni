@@ -105,7 +105,6 @@ from vllm.parser.mistral import MistralToolCall
 from vllm.reasoning import ReasoningParser
 from vllm.renderers import BaseRenderer, merge_kwargs
 from vllm.renderers.inputs import TokPrompt
-from vllm.renderers.params import TokenizeParams
 from vllm.sampling_params import RequestOutputKind, SamplingParams
 from vllm.tokenizers import TokenizerLike
 from vllm.tokenizers import TokenizerLike as AnyTokenizer
@@ -977,7 +976,6 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         continue_final_message: bool = False,
         documents: list[dict[str, str]] | None = None,
         add_special_tokens: bool = False,
-        tok_params: TokenizeParams | None = None,
         skip_mm_cache: bool = False,
     ) -> tuple[list[ConversationMessage], list[TokPrompt]]:
         if renderer is None:
@@ -997,8 +995,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             ),
         )
 
-        if tok_params is None:
-            tok_params = request.build_tok_params(self.model_config)
+        tok_params = request.build_tok_params(self.model_config)
         mm_config = self.model_config.multimodal_config
         chat_params = request.build_chat_params(
             default_template,
