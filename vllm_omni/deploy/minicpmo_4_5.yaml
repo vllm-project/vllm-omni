@@ -19,11 +19,12 @@ connectors:
       connector_get_sleep_s: 0.01
       connector_get_max_wait_first_chunk: 3000
       connector_get_max_wait: 300
-      # Payload length in codec frames, the same for every payload. A smaller
-      # first window used to be configured separately (initial_codec_chunk_frames)
-      # so the first audio packet arrived earlier; with the steady window itself
-      # at 25 frames that split only added a seam between the first chunk and
-      # the rest, so there is one window size now.
+      # Payload length in codec frames, the same for every payload. The
+      # request-level initial_codec_chunk_frames parameter still exists for a
+      # smaller first packet; this profile no longer splits the first window at
+      # the deploy level -- with the steady window itself at 25 frames a
+      # separate first chunk only added a seam between the first chunk and the
+      # rest.
       codec_chunk_frames: 25
       codec_left_context_frames: 3
       # HiFT capture buckets are derived from codec_chunk_frames and
@@ -55,9 +56,9 @@ connectors:
 stages:
   - stage_id: 0
     max_num_seqs: 16
-    # 0.50 keeps stage-0 KV at 4.7GiB and leaves headroom on the shared GPU
-    # for Talker KV + concurrent Code2Wav; 0.55 starved stage 2 into OOM.
-    gpu_memory_utilization: 0.50
+    # Leave headroom on the shared GPU for Talker KV + concurrent Code2Wav.
+    # The NPU block below overrides this with measured single-card budgets.
+    gpu_memory_utilization: 0.55
     enforce_eager: false
     # Stage-level prefix caching is NPU-only (see platforms.npu below): in the
     # platform-shared block it killed the stage-1 replica on CUDA (empty tts
@@ -93,9 +94,8 @@ stages:
     max_num_seqs: 16
     # Preserve the checkpoint's full-attention Talker prompt while it fits;
     # native duplex rolls over to a one-chunk window at context capacity.
-    # 0.10 keeps 5.2GiB of Talker KV with device-level headroom left for the
-    # colocated HiFi-GAN cuDNN workspace.
-    gpu_memory_utilization: 0.10
+    # Leave device-level headroom for the colocated HiFi-GAN cuDNN workspace.
+    gpu_memory_utilization: 0.15
     enforce_eager: false
     max_num_batched_tokens: 8192
     # Talker context is 4096 (tts_config.max_position_embeddings).
@@ -122,9 +122,7 @@ stages:
 
   - stage_id: 2
     max_num_seqs: 16
-    # 0.22 covers the 64k-token Code2Wav budget; this is the headroom that
-    # survived a full three-tier concurrency sweep with 0.50/0.10 upstream.
-    gpu_memory_utilization: 0.22
+    gpu_memory_utilization: 0.18
     enforce_eager: true
     enable_chunked_prefill: false
     max_num_batched_tokens: 65536
@@ -156,7 +154,11 @@ platforms:
         # Keep the three stages' concurrency caps aligned so the top tier is
         # not gated by a single stage.
         max_num_seqs: 8
-        # 32768 leaves no KV cache on 910B1 at gpu_memory_utilization 0.55.
+        # Measured single-card co-location budget (910B1): 0.50 keeps stage-0
+        # KV at 4.7GiB and leaves headroom for Talker KV + concurrent
+        # Code2Wav; at 0.55 stage 2 starved into OOM.
+        gpu_memory_utilization: 0.50
+        # 32768 leaves no KV cache on 910B1 at the colocated budgets above.
         # Audio Conv1d stays eager; the transformer stack is what this graph replays.
         additional_config:
           encoder_enable_npu_graph: true
@@ -179,6 +181,9 @@ platforms:
         # Concurrency cap raised from 4 to 8; the override block only covered
         # stages 0 and 2, so stage 1 kept the base value of 4.
         max_num_seqs: 8
+        # 0.10 keeps 5.2GiB of Talker KV (measured on 910B1) with
+        # device-level headroom for the colocated HiFi-GAN cuDNN workspace.
+        gpu_memory_utilization: 0.10
         max_num_batched_tokens: 8192
         # Multi-frame decode: 8 codec frames per step. NPU-only -- only the NPU
         # worker intercepts the step and injects the constant continue drafts,
@@ -198,6 +203,10 @@ platforms:
           cudagraph_mode: FULL_DECODE_ONLY
       - stage_id: 2
         max_num_seqs: 8
+        # 0.22 covers the 64k-token Code2Wav budget; the headroom that
+        # survived a full three-tier concurrency sweep with 0.50/0.10
+        # upstream (measured on 910B1).
+        gpu_memory_utilization: 0.22
         # Stage 2 stays outer-eager and captures only exact-shape CFM DiT
         # estimator kernels through the NPU platform patch.
         additional_config:
@@ -216,7 +225,7 @@ platforms:
           # multiplies the shape space -- an 8-way concurrent stage-2 run
           # reaches 61 distinct shapes, not 19. Captured graph buffers are
           # allocated outside vLLM's gpu_memory_utilization budget, and this
-          # profile co-locates three stages on one card (0.55 + 0.15 + 0.18),
+          # profile co-locates three stages on one card (0.50 + 0.10 + 0.22),
           # so a 64-entry pool OOMs the card at 128/8 while 32 completes all
           # three tiers. cfm_graph_batch_buckets above is what makes 32
           # sufficient: it collapses the batch axis so the 8-way shape space
