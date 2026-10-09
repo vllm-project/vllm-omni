@@ -1004,6 +1004,7 @@ class MTPState:
             "temperature": sampling_params.get("temperature"),
             "top_k": sampling_params.get("top_k"),
             "top_p": sampling_params.get("top_p"),
+            "repetition_penalty": sampling_params.get("repetition_penalty"),
         }
 
     def _get_mtp_sampling_kwargs(

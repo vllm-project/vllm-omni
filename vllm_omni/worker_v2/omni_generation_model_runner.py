@@ -649,10 +649,15 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
         so each value is a ``list`` with ``len == num_reqs``.
         """
         mm = model_output.multimodal_outputs
+        if mm is None:
+            # Model produced no multimodal output (e.g. multi_decoder given a
+            # request with no visual/audio codes to decode) -- no-op per
+            # request rather than treating this as an error.
+            return [None] * num_reqs
         if not isinstance(mm, dict):
             logger.warning(
                 "Unexpected multimodal_outputs type: %s; returning empty pooler_output",
-                type(mm).__name__ if mm is not None else "None",
+                type(mm).__name__,
             )
             return [None] * num_reqs
 

@@ -91,6 +91,10 @@ from vllm_omni.model_executor.models.lance.pipeline import LANCE_PIPELINE
 from vllm_omni.model_executor.models.lfm3_audio.pipeline import LFM3_AUDIO_PIPELINE, LFM3_AUDIO_TEXT_PIPELINE
 from vllm_omni.model_executor.models.lfm3_omni.pipeline import LFM3_OMNI_PIPELINE, LFM3_OMNI_TEXT_PIPELINE
 from vllm_omni.model_executor.models.lingbot_world.pipeline import LINGBOT_WORLD_PIPELINE
+from vllm_omni.model_executor.models.longcat_next.pipeline import (
+    LONGCAT_NEXT_THINKER_MULTI_DECODER_PIPELINE,
+    LONGCAT_NEXT_THINKER_ONLY_PIPELINE,
+)
 from vllm_omni.model_executor.models.mammoth_moda2.pipeline import (
     MAMMOTH_MODA2_AR_PIPELINE,
     MAMMOTH_MODA2_PIPELINE,
@@ -208,6 +212,8 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "lingbot_world": LINGBOT_WORLD_PIPELINE,
     # Public Ming-3.0-tts-tiny still serializes the former config name.
     "lingv3_tts": MING3_TTS_PIPELINE,
+    "longcat_next_thinker_multi_decoder": LONGCAT_NEXT_THINKER_MULTI_DECODER_PIPELINE,
+    "longcat_next_thinker_only": LONGCAT_NEXT_THINKER_ONLY_PIPELINE,
     "mammoth_moda2": MAMMOTH_MODA2_PIPELINE,
     "mammoth_moda2_ar": MAMMOTH_MODA2_AR_PIPELINE,
     "mimo_audio": MIMO_AUDIO_PIPELINE,

@@ -308,6 +308,13 @@ class OmniARModelRunner(OmniGPUModelRunner):
                     - self.req_states.prompt_len.gpu[input_batch.idx_mapping]
                 ),
             )
+        if getattr(self.model, "accepts_logits_row_req_ids", False):
+            # compute_logits receives one hidden-state row per scheduled
+            # request, in persistent-batch order. Models whose per-request gen
+            # state must force specific rows (e.g. LongCat-Next audio/visual
+            # gen) read this stash to map rows to requests even when gen and
+            # plain-text requests share a step.
+            self.model._logits_row_req_ids = list(input_batch.req_ids)
         with sampling_context:
             sampling_output = sample_with_output(
                 self.sampler, self.sample, text_hidden, input_batch, self.req_states, grammar_output

@@ -22,6 +22,7 @@ _CLIENT_MM_ROOT_KEYS: frozenset[str] = frozenset(
         "audio",
         # The codec frames a code2wav stage decoded, beside the audio they cover.
         "codec_frames",
+        "codes",
         "image",
         "images",
         "video",
