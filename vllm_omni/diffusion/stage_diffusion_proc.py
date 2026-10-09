@@ -168,17 +168,6 @@ class StageDiffusionProc:
     # Request processing
     # ------------------------------------------------------------------
 
-    def _reconstruct_sampling_params(self, sampling_params_dict: dict) -> OmniDiffusionSamplingParams:
-        """Reconstruct OmniDiffusionSamplingParams from a dict, handling LoRA."""
-        lora_req = sampling_params_dict.get("lora_request")
-        if lora_req is not None:
-            from vllm.lora.request import LoRARequest
-
-            if not isinstance(lora_req, LoRARequest):
-                sampling_params_dict["lora_request"] = msgspec.convert(lora_req, LoRARequest)
-
-        return OmniDiffusionSamplingParams(**sampling_params_dict)
-
     async def _process_request(
         self,
         request_id: str,
@@ -190,7 +179,7 @@ class StageDiffusionProc:
         payload_sender_info: dict[str, Any] | None = None,
     ) -> OmniRequestOutput:
         """Build a diffusion request and consume DiffusionEngine.step_streaming() to completion."""
-        sampling_params = self._reconstruct_sampling_params(sampling_params_dict)
+        sampling_params = OmniDiffusionSamplingParams.from_dict(sampling_params_dict)
 
         request = OmniDiffusionRequest(
             prompt=prompt,
@@ -228,7 +217,7 @@ class StageDiffusionProc:
         payload_sender_info: dict[str, Any] | None = None,
     ) -> AsyncGenerator[OmniRequestOutput, None]:
         """Process a streaming diffusion request and yield the results from DiffusionEngine.step_streaming()."""
-        sampling_params = self._reconstruct_sampling_params(sampling_params_dict)
+        sampling_params = OmniDiffusionSamplingParams.from_dict(sampling_params_dict)
 
         request = OmniDiffusionRequest(
             prompt=prompt,

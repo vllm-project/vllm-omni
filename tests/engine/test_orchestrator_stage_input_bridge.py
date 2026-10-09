@@ -57,6 +57,9 @@ class FakeStageClient:
         except queue.Empty:
             return SimpleNamespace(outputs=[])
 
+    def get_payload_sender_info(self) -> dict[str, Any] | None:
+        return None
+
     def process_engine_inputs(self, _source_outputs, prompt=None, streaming_context=None):
         decoder = getattr(streaming_context, "source_token_decoder", None)
         if callable(decoder):
@@ -102,9 +105,11 @@ class FakePrewarmPool:
     """Single-replica pool double that binds requests only on submission."""
 
     stage_type = "llm"
+    get_payload_sender_info = StagePool.get_payload_sender_info
 
     def __init__(self, role: str) -> None:
-        self.stage_client = SimpleNamespace()
+        self.stage_client = SimpleNamespace(get_payload_sender_info=lambda: None)
+        self._stage_payloads: dict[str, bytes] = {}
         self._bound_request_ids: set[str] = set()
         self.stage_vllm_config = SimpleNamespace(
             model_config=SimpleNamespace(
@@ -260,7 +265,9 @@ async def test_async_prewarm_skips_stage_with_custom_process_input_func() -> Non
     orchestrator = object.__new__(DuplexOrchestrator)
     stage0 = FakePrewarmPool("sender")
     stage1 = FakePrewarmPool("receiver")  # would receive chunks if role alone decided
-    stage1.stage_client = SimpleNamespace(custom_process_input_func=lambda *a, **k: None)
+    stage1.stage_client = SimpleNamespace(
+        custom_process_input_func=lambda *a, **k: None, get_payload_sender_info=lambda: None
+    )
     stage2 = FakePrewarmPool("receiver")
     orchestrator.stage_pools = [stage0, stage1, stage2]
     orchestrator._emit_tx_edge = lambda **_kwargs: None

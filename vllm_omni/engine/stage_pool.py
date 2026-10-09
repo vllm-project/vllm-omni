@@ -15,6 +15,7 @@ from vllm.logger import init_logger
 from vllm.v1.engine import EngineCoreOutputs
 from vllm.v1.metrics.stats import IterationStats
 
+from vllm_omni.core.sched.omni_scheduling_coordinator import uses_full_payload_input_coordinator
 from vllm_omni.data_entry_keys import flatten_payload
 from vllm_omni.distributed.omni_coordinator import (
     LoadBalancer,
@@ -23,6 +24,7 @@ from vllm_omni.distributed.omni_coordinator import (
     ReplicaStatus,
 )
 from vllm_omni.distributed.omni_coordinator.load_balancer import Task
+from vllm_omni.engine import OmniEngineCoreOutputs, PayloadSenderInfo
 from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.engine.stage_client import (
     StagePoolClient,
@@ -149,6 +151,8 @@ class StagePool:
         self._non_empty_first_output_timestamps_by_request: dict[str, float] = {}
         self._audio_frames_by_request: dict[str, int] = {}
         self._audio_sample_rate_by_request: dict[str, int] = {}
+        # Run requests' stage payloads that came back on the stage output instead of a connector.
+        self._stage_payloads: dict[str, bytes] = {}
 
         # Distributed-mode state. Populated by add_client / remove_client.
         self._addr_to_replica_id: dict[str, int] = {}
@@ -209,6 +213,14 @@ class StagePool:
     @property
     def stage_vllm_config(self) -> Any:
         return self._stage_vllm_config
+
+    @property
+    def takes_full_payload_input(self) -> bool:
+        """Whether this stage receives each request's input as one full payload from the previous stage."""
+        # Diffusion stages have no vllm config.
+        return self._stage_vllm_config is not None and uses_full_payload_input_coordinator(
+            self._stage_vllm_config.model_config
+        )
 
     @property
     def output_processor(self) -> Any:
@@ -532,6 +544,23 @@ class StagePool:
         self._non_empty_first_output_timestamps_by_request.pop(str(request_id), None)
         self._audio_frames_by_request.pop(str(request_id), None)
         self._audio_sample_rate_by_request.pop(str(request_id), None)
+        self._stage_payloads.pop(str(request_id), None)
+
+    def get_payload_sender_info(self, request_id: str) -> PayloadSenderInfo | None:
+        """Tell the next stage where to get this request's payload."""
+        # For run requests, the payload is stored directly as bytes under the request ID
+        if request_id in self._stage_payloads:
+            return self._stage_payloads[request_id]
+
+        # Otherwise, for LLM stages, get the stage client and fetch the payload send info
+        if self.stage_type == "llm":
+            if (sender_client := self.get_bound_client(request_id)) is None:
+                sender_client = self.stage_client
+
+            if sender_client is not None:
+                sender_client = cast(StagePoolLLMClient, sender_client)
+                return sender_client.get_payload_sender_info()
+        return None
 
     def release_bindings(self, request_ids: list[str]) -> None:
         """Drop route bindings for the given request ids in this stage."""
@@ -1180,7 +1209,7 @@ class StagePool:
     async def process_llm_raw_outputs(
         self,
         replica_id: int,
-        raw_outputs: EngineCoreOutputs,
+        raw_outputs: OmniEngineCoreOutputs,
         iteration_stats: IterationStats | None = None,
     ) -> list[Any]:
         """Run the shared LLM output processor on one raw poll result."""
@@ -1188,6 +1217,10 @@ class StagePool:
         if raw_client is None:
             return []
         client = cast(StagePoolLLMClient, raw_client)
+        for eco in raw_outputs.outputs:
+            # A payload can arrive after its request was cleaned up (e.g. aborted); don't keep it then.
+            if eco.stage_payload is not None and self.get_bound_replica_id(eco.request_id) is not None:
+                self._stage_payloads[eco.request_id] = eco.stage_payload
         processor = self.output_processor
         processed = processor.process_outputs(
             raw_outputs.outputs,

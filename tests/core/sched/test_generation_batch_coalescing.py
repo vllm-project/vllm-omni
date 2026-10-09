@@ -97,6 +97,7 @@ def scheduler(monkeypatch, initial=(), delayed=()):
         requests_with_ready_chunks=set(), finished_requests=set(), input_terminal_req_ids=set()
     )
     s._latest_omni_connector_output = None
+    s._outputs_awaiting_stage_payload = {}
     s._omni_connector_output_inbox = Inbox(clock, initial, delayed)
     return s, clock
 
@@ -167,7 +168,7 @@ def test_deadline_is_new_for_each_batch_not_extended_by_arrivals(monkeypatch):
 
 def test_cancelled_notification_is_filtered_before_coordinator(monkeypatch, mocker):
     event = notification("0", "cancelled")
-    event.request_metadata = {"0": {"code_predictor_codes": [7]}, "cancelled": {"code_predictor_codes": [9]}}
+    event.request_metadata = {"0": {"codes": {"audio": [7]}}, "cancelled": {"codes": {"audio": [9]}}}
     s, _ = scheduler(monkeypatch, [event])
     s._generation_max_wait_s = 0
     s.waiting = []
@@ -177,7 +178,7 @@ def test_cancelled_notification_is_filtered_before_coordinator(monkeypatch, mock
     s.input_coordinator.process_pending_chunks = mocker.Mock()
     s._consume_pending_connector_output("generation")
     s.input_coordinator.update_request_metadata.assert_called_once_with(
-        s.requests, {"0": {"code_predictor_codes": [7]}}, model_mode="generation"
+        s.requests, {"0": {"codes": {"audio": [7]}}}, model_mode="generation"
     )
     s.input_coordinator.process_pending_chunks.assert_called_once()
     waiting, running, ready, finished = s.input_coordinator.process_pending_chunks.call_args.args

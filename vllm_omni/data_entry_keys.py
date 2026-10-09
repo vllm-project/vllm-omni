@@ -18,12 +18,18 @@ from typing import TYPE_CHECKING, Any, TypedDict
 import msgspec
 import numpy as np
 import torch
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
 
 # Internal output routing markers shared by first-frame producers and orchestration.
 FIRST_AUDIO_KEY = "_omni_first_audio"
 FIRST_AUDIO_REQUIRED_KEY = "_omni_first_audio_required"
 
 REQUEST_ARTIFACT_DIRS_KEY = "_omni_request_artifact_dirs"
+# Routing tag: the stage returns its full payload on its output instead of sending it to the
+# next stage. Set on run requests whose next stage takes a full payload.
+RETURN_STAGE_PAYLOAD_KEY = "omni_return_stage_payload"
 TRANSFORM_OWNED_META_KEYS = frozenset({"minimax_h3_prepared_reference_videos"})
 
 if TYPE_CHECKING:
@@ -475,3 +481,49 @@ def deserialize_payload(
             flat[key] = entry.scalar_data
 
     return unflatten_payload(flat)  # type: ignore[return-value]
+
+
+def payload_finished(payload: OmniPayload) -> bool:
+    """Return whether the payload marks its producer's output as finished (`meta.finished`)."""
+    # Some async-chunk callers pass untyped connector results.
+    if not isinstance(payload, dict):
+        logger.warning_once("payload_finished expected an OmniPayload dict, got %s", type(payload).__name__)
+        return False
+    if "finished" in payload:
+        logger.warning_once("legacy flat 'finished' key in payload; expected 'meta.finished'")
+    meta = payload.get("meta")
+    if not isinstance(meta, dict) or "finished" not in meta:
+        return False
+    flag = meta["finished"]
+    if isinstance(flag, torch.Tensor):
+        return flag.numel() == 1 and bool(flag.item())
+    return bool(flag)
+
+
+def payload_audio_codes(payload: OmniPayload) -> torch.Tensor | None:
+    """Return the payload's audio codes (`codes.audio`), or None if it has none."""
+    # Some async-chunk callers pass untyped connector results.
+    if not isinstance(payload, dict):
+        logger.warning_once("payload_audio_codes expected an OmniPayload dict, got %s", type(payload).__name__)
+        return None
+    if "code_predictor_codes" in payload:
+        logger.warning_once("legacy flat 'code_predictor_codes' key in payload; expected 'codes.audio'")
+    codes = payload.get("codes")
+    if isinstance(codes, dict):
+        return codes.get("audio")
+    return None
+
+
+def returns_stage_payload(tags: Mapping[str, object] | AdditionalInformationPayload | None) -> bool:
+    """Return whether a request's routing tags ask its stage to return its full payload.
+
+    NOTE: Currently we support reading the serialized or deserialized format for compatibility
+    with both model runner v1 & v2.
+    """
+    if tags is None:
+        return False
+    if isinstance(tags, Mapping):
+        return bool(tags.get(RETURN_STAGE_PAYLOAD_KEY))
+    # Serialized tags: read the one scalar without decoding the payload's tensors.
+    entry = tags.entries.get(RETURN_STAGE_PAYLOAD_KEY)
+    return entry is not None and bool(entry.scalar_data)

@@ -26,6 +26,7 @@ import vllm_omni.core.sched.omni_ar_scheduler as ar_sched_mod
 import vllm_omni.core.sched.omni_generation_scheduler as gen_sched_mod
 from vllm_omni.core.sched.omni_ar_scheduler import OmniARScheduler
 from vllm_omni.core.sched.omni_generation_scheduler import OmniGenerationScheduler
+from vllm_omni.engine import OmniEngineCoreOutput
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -57,6 +58,7 @@ def _make_scheduler(scheduler_cls, *, requests, running, waiting):
     scheduler.waiting = waiting
     scheduler.kv_holding_waiting = []
     scheduler.deferred_waiting = set()
+    scheduler._outputs_awaiting_stage_payload = {}
     return scheduler
 
 
@@ -230,3 +232,23 @@ def test_finish_requests_does_not_reopen_off_queue_deferred_free_terminal(schedu
     assert scheduler_cls.finish_requests(scheduler, [terminal.request_id], RequestStatus.FINISHED_ABORTED) == []
     assert scheduler.requests == {terminal.request_id: terminal}
     assert terminal.status == RequestStatus.FINISHED_STOPPED
+
+
+# None finishes every request (abort-all pause, fault recovery).
+@pytest.mark.parametrize("request_ids", [["run"], None])
+@pytest.mark.parametrize(("scheduler_cls", "scheduler_mod"), _SCHEDULER_PARAMS)
+def test_finish_requests_drops_the_held_output_of_a_run_request(
+    monkeypatch: pytest.MonkeyPatch,
+    scheduler_cls,
+    scheduler_mod,
+    request_ids: list[str] | None,
+) -> None:
+    """Ensure aborting a run request whose finished output waits for its stage payload drops that output."""
+    # The run request already finished and was freed; only its output is held.
+    scheduler = _make_scheduler(scheduler_cls, requests={}, running=[], waiting=[])
+    scheduler._outputs_awaiting_stage_payload = {"run": (0, OmniEngineCoreOutput(request_id="run", new_token_ids=[]))}
+    monkeypatch.setattr(scheduler_mod.VLLMScheduler, "finish_requests", lambda self, request_ids, finished_status: [])
+
+    scheduler_cls.finish_requests(scheduler, request_ids, RequestStatus.FINISHED_ABORTED)
+
+    assert scheduler._outputs_awaiting_stage_payload == {}

@@ -13,6 +13,7 @@ import pytest
 import torch
 from vllm import SamplingParams
 
+from vllm_omni.core.sched.output import OmniChunkRecvHandle
 from vllm_omni.worker_v2.delivery import DeliveryCancelledError, DeliveryState, OmniDeliveryManager
 from vllm_omni.worker_v2.native_output_worker import NativeOutputWorker
 from vllm_omni.worker_v2.omni_data_plane import OmniRunnerDataPlane
@@ -601,7 +602,7 @@ def test_abort_before_first_chunk_cleans_receiver_state():
         "_async_chunk_updated_req_ids",
     ):
         setattr(plane, name, set())
-    plane.register_receivers([SimpleNamespace(request_id="r", external_req_id="external")])
+    plane.register_receivers([OmniChunkRecvHandle(request_id="r", external_req_id="external")])
     plane._local_stage_payload_cache["r"] = {"codes": torch.ones(1)}
     assert "r" in plane._pending_load_reqs and plane._request_ids_mapping["r"] == "external"
     assert plane.abort_requests({"r"}) == 0

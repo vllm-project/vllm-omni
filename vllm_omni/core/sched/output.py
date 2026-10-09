@@ -6,7 +6,7 @@ from dataclasses import dataclass, field, fields
 from vllm.v1.core.sched.output import CachedRequestData, NewRequestData, SchedulerOutput
 from vllm.v1.request import Request
 
-from vllm_omni.engine import AdditionalInformationPayload
+from vllm_omni.engine import AdditionalInformationPayload, PayloadSenderInfo
 
 
 @dataclass
@@ -108,7 +108,7 @@ class OmniChunkRecvHandle:
 
     request_id: str
     external_req_id: str | None = None
-    payload_sender_info: dict[str, object] | None = None
+    payload_sender_info: PayloadSenderInfo | None = None
 
 
 @dataclass

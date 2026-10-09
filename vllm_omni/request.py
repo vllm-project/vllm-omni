@@ -3,7 +3,7 @@
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
@@ -14,7 +14,12 @@ from vllm.v1.request import Request
 if TYPE_CHECKING:
     from vllm.v1.core.kv_cache_utils import BlockHash
 
-from vllm_omni.engine import AdditionalInformationPayload, OmniEngineCoreRequest, PromptEmbedsPayload
+from vllm_omni.engine import (
+    AdditionalInformationPayload,
+    OmniEngineCoreRequest,
+    PayloadSenderInfo,
+    PromptEmbedsPayload,
+)
 
 
 class OmniRequest(Request):
@@ -39,7 +44,7 @@ class OmniRequest(Request):
         external_req_id: str | None = None,
         additional_information: AdditionalInformationPayload | None = None,
         model_intermediate_buffer: dict | None = None,
-        payload_sender_info: dict[str, Any] | None = None,
+        payload_sender_info: PayloadSenderInfo | None = None,
         **kwargs,
     ):
         if prompt_embeds is not None:
@@ -59,8 +64,8 @@ class OmniRequest(Request):
         self.additional_information: AdditionalInformationPayload | None = additional_information
         # Runner-owned runtime payload.
         self.model_intermediate_buffer: dict | None = model_intermediate_buffer
-        # Sender's connector address for this request's stage payload.
-        self.payload_sender_info: dict[str, Any] | None = payload_sender_info
+        # Sender's connector address for this request's stage payload
+        self.payload_sender_info: PayloadSenderInfo | None = payload_sender_info
 
     @staticmethod
     def _maybe_decode_prompt_embeds(

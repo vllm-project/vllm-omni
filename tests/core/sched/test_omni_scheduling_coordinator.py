@@ -21,9 +21,11 @@ from vllm import SamplingParams
 import vllm_omni.core.sched.omni_scheduling_coordinator as coord_mod
 from vllm_omni.core.sched.omni_scheduling_coordinator import (
     OmniSchedulingCoordinator,
+    payload_for_scheduler,
     uses_native_mrv2_data_plane,
 )
 from vllm_omni.core.sched.output import OmniChunkRecvHandle
+from vllm_omni.data_entry_keys import Codes, HiddenStates, OmniPayload, OmniPayloadMeta
 from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter import _LoadEntry
 from vllm_omni.engine.orchestrator import build_engine_core_request_from_tokens
 from vllm_omni.request import OmniRequest
@@ -154,7 +156,7 @@ class TestChunkCoordinatorUpdateRequestMetadata(unittest.TestCase):
         requests = {"r1": req}
 
         # Only scheduling metadata is passed now (full payload stays in model runner)
-        request_metadata = {"r1": {"next_stage_prompt_len": 50}}
+        request_metadata = {"r1": OmniPayload(meta=OmniPayloadMeta(next_stage_prompt_len=50))}
 
         coord.update_request_metadata(requests, request_metadata, model_mode="ar")
 
@@ -175,11 +177,7 @@ class TestChunkCoordinatorUpdateRequestMetadata(unittest.TestCase):
         req._output_token_ids = [99]
         requests = {"r1": req}
 
-        request_metadata = {
-            "r1": {
-                "code_predictor_codes": [10, 20, 30],
-            }
-        }
+        request_metadata = {"r1": OmniPayload(codes=Codes(audio=torch.tensor([10, 20, 30])))}
 
         coord.update_request_metadata(requests, request_metadata, model_mode="generation")
 
@@ -202,7 +200,7 @@ class TestChunkCoordinatorUpdateRequestMetadata(unittest.TestCase):
 
         coord.update_request_metadata(
             requests,
-            {"r1": {"code_predictor_codes": torch.tensor([[1, 2, 3]], dtype=torch.long)}},
+            {"r1": OmniPayload(codes=Codes(audio=torch.tensor([[1, 2, 3]], dtype=torch.long)))},
             model_mode="generation",
         )
 
@@ -223,7 +221,8 @@ class TestChunkCoordinatorUpdateRequestMetadata(unittest.TestCase):
 
         coord.update_request_metadata(
             requests,
-            {"r1": {"code_predictor_codes": [[1, 2], [3, 4]]}},
+            # Off-schema on purpose: older connectors deliver codes as nested lists.
+            {"r1": {"codes": {"audio": [[1, 2], [3, 4]]}}},
             model_mode="generation",
         )
 
@@ -231,6 +230,18 @@ class TestChunkCoordinatorUpdateRequestMetadata(unittest.TestCase):
         self.assertEqual(req.num_prompt_tokens, 4)
         self.assertEqual(req._all_token_ids, [1, 2, 3, 4])
         self.assertEqual(req._output_token_ids, [])
+
+
+def test_payload_for_scheduler_keeps_only_what_the_scheduler_reads():
+    """Ensure the scheduler gets a full payload's codes and scheduling meta, not its other (large) fields."""
+    codes = torch.tensor([1, 2])
+    meta = OmniPayloadMeta(next_stage_prompt_len=4, left_context_size=2, finished=torch.tensor(True))
+    payload = OmniPayload(
+        codes=Codes(audio=codes),
+        meta=OmniPayloadMeta(**meta, num_processed_tokens=3),
+        hidden_states=HiddenStates(output=codes),
+    )
+    assert payload_for_scheduler(payload) == OmniPayload(codes=Codes(audio=codes), meta=meta)
 
 
 class TestWaitingForInputTransition(unittest.TestCase):

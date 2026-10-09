@@ -1,12 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 from pytest_mock import MockerFixture
 from vllm.sampling_params import SamplingParams
 from vllm.v1.engine import EngineCoreRequest
 
+from vllm_omni.data_entry_keys import returns_stage_payload
 from vllm_omni.distributed.omni_coordinator import ReplicaInfo, ReplicaStatus
 from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine, StageRuntimeInfo
@@ -371,6 +374,41 @@ def _replica(input_addr: str) -> ReplicaInfo:
         last_heartbeat=0.0,
         registered_at=0.0,
     )
+
+
+@pytest.mark.parametrize(
+    ("stage1_vllm_config", "returns_payload"),
+    [
+        (None, False),  # Currently this is the case for diffusion
+        (SimpleNamespace(model_config=SimpleNamespace(stage_id=1, requires_full_payload_input=True)), True),
+    ],
+)
+def test_run_request_entry_stage_returns_payload_only_for_a_full_payload_next_stage(
+    mocker: MockerFixture, stage1_vllm_config: SimpleNamespace | None, returns_payload: bool
+):
+    """Ensure a run request's entry stage returns its payload only when the next stage takes a full payload."""
+    engine = object.__new__(AsyncOmniEngine)
+    params = SamplingParams(max_tokens=8)
+    engine.default_sampling_params_list = [params, params]
+    engine.stage_metadata = [StageRuntimeInfo(final_output=False, final_output_type=None, stage_type="llm")]
+    engine.supported_tasks = ("generate",)
+    engine.stage_pools = [
+        StagePool(0, [_FakeStageClient()]),
+        StagePool(1, [_FakeStageClient()], stage_vllm_config=stage1_vllm_config),
+    ]
+    input_processor = mocker.Mock()
+    input_processor.process_inputs.return_value = _make_engine_core_request()
+    engine.input_processor = input_processor
+
+    msg = engine._build_add_request_message(
+        request_id="req-1",
+        prompt={"prompt_token_ids": [1, 1, 1]},
+        sampling_params_list=[params, params],
+        final_stage_id=1,
+        yield_stage_id=0,
+    )
+
+    assert returns_stage_payload(msg.prompt.additional_information) is returns_payload
 
 
 def test_build_add_request_message_scopes_mm_uuids_to_selected_stage0_replica(mocker: MockerFixture):

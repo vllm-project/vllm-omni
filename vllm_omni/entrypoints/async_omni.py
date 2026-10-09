@@ -14,9 +14,11 @@ import asyncio
 import time
 import uuid
 from collections.abc import AsyncGenerator, Iterable, Mapping, Sequence
+from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any, cast
 
 import anyio
+import msgspec
 from vllm import TokensPrompt
 from vllm.engine.protocol import EngineClient, StreamingInput
 from vllm.logger import init_logger
@@ -29,9 +31,10 @@ from vllm.tasks import SupportedTask
 
 from vllm_omni.diffusion.data import CuMemTag, OmniACK, OmniSleepTask, OmniWakeTask
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
-from vllm_omni.engine.messages import ErrorMessage
+from vllm_omni.engine.messages import ErrorMessage, NextStageInputMessage, OutputMessage
 from vllm_omni.entrypoints.async_omni_base import ABORT_TIMEOUT_S, AsyncOmniBase
 from vllm_omni.entrypoints.client_request_state import ClientRequestState
+from vllm_omni.entrypoints.omni_base import OmniEngineDeadError
 from vllm_omni.errors import client_error_metadata
 from vllm_omni.inputs.data import OmniSamplingParams
 from vllm_omni.metrics.stats import OrchestratorAggregator as OrchestratorMetrics
@@ -516,6 +519,82 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
                 "Input streaming is currently supported only for SamplingParams "
                 "with n == 1, output_kind != FINAL_ONLY, and without stop strings."
             )
+
+    async def run_entry_stage(
+        self, prompt: OmniPromptType, sampling_params_list: Sequence[OmniSamplingParams], *, request_id: str
+    ) -> NextStageInputMessage | OutputMessage:
+        """Run the entry stage as its own request.
+
+        Returns the next stage's input, or the raw output if the entry stage is the final stage.
+        """
+        final_stage_id = self.num_stages - 1
+        async with self._stage_request(request_id, stage_id=0) as req_state:
+            await self.engine.add_request_async(
+                request_id=req_state.request_id,
+                prompt=prompt,
+                sampling_params_list=sampling_params_list,
+                final_stage_id=final_stage_id,
+                final_output_stage_ids=[final_stage_id],
+                yield_stage_id=0 if final_stage_id > 0 else None,
+            )
+            return await self._stage_response(req_state)
+
+    async def run_downstream_stage(
+        self,
+        stage_input: NextStageInputMessage,
+        sampling_params_list: Sequence[OmniSamplingParams],
+        *,
+        request_id: str,
+    ) -> NextStageInputMessage | OutputMessage:
+        """Run the receiver stage of a next stage input as its own request."""
+        async with self._stage_request(request_id, stage_id=stage_input.receiver_stage_id) as req_state:
+            await self.engine.add_next_stage_input_async(
+                msgspec.structs.replace(
+                    stage_input, request_id=req_state.request_id, sampling_params_list=list(sampling_params_list)
+                )
+            )
+            return await self._stage_response(req_state)
+
+    @asynccontextmanager
+    async def _stage_request(
+        self, external_request_id: str, *, stage_id: int
+    ) -> AsyncGenerator[ClientRequestState, None]:
+        """Track one stage call; abort it if the caller is cancelled and always drop its state."""
+        request_id = f"{self._get_unique_request_id(external_request_id)}-{stage_id}"
+        req_state = ClientRequestState(request_id, external_request_id=external_request_id)
+        self.request_states[request_id] = req_state
+        self._final_output_handler()
+        try:
+            yield req_state
+        except asyncio.CancelledError:
+            with anyio.CancelScope(shield=True):
+                await self._abort_internal_requests(request_id, timeout=ABORT_TIMEOUT_S)
+            raise
+        finally:
+            self.request_states.pop(request_id, None)
+
+    async def _stage_response(self, req_state: ClientRequestState) -> NextStageInputMessage | OutputMessage:
+        """Wait for a stage call's response: the next stage input, or the finished output.
+
+        A final stage that decodes emits an unfinished output per step; those are skipped.
+        """
+        # This is analogous to _process_orchestrator_results.
+        while True:
+            response = await req_state.queue.get()
+            if isinstance(response, ErrorMessage):
+                if response.fatal:
+                    raise OmniEngineDeadError(response.error, error_stage_id=response.stage_id)
+                self._raise_nonfatal_error_message(response)
+            if not isinstance(response, OutputMessage) or response.finished:
+                return response
+
+    def _route_engine_message(self, msg: Any) -> bool:
+        if not isinstance(msg, NextStageInputMessage):
+            return False
+        req_state = self.request_states.get(msg.request_id)
+        if req_state is not None:
+            req_state.queue.put_nowait(msg)
+        return True
 
     async def encode(
         self,

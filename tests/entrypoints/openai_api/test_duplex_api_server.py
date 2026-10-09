@@ -60,6 +60,7 @@ _DUPLEX_APP_STATE_KEYS = {
     "openai_serving_realtime_robot",
     "anthropic_serving_messages",
     "openai_serving_duplex",
+    "run_serving",
     "enable_server_load_tracking",
     "server_load_metrics",
 }
@@ -77,6 +78,7 @@ _DUPLEX_MUST_BE_NONE = _DUPLEX_APP_STATE_KEYS - {
     "openai_serving_duplex",
     "openai_serving_chat",
     "online_renderer",
+    "run_serving",
     "enable_server_load_tracking",
     "server_load_metrics",
 }

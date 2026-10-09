@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Stateless request and shutdown helpers for :mod:`async_omni_engine`."""
 
 from __future__ import annotations
@@ -10,6 +13,7 @@ import torch
 from vllm.logger import init_logger
 from vllm.v1.engine import EngineCoreRequest
 
+from vllm_omni.data_entry_keys import RETURN_STAGE_PAYLOAD_KEY
 from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.engine.messages import EngineQueueMessage, ShutdownRequestMessage
 from vllm_omni.engine.rpc_result_router import CorrelatedRpcClient
@@ -97,12 +101,14 @@ def apply_omni_final_stage_metadata(
     final_stage_id: int,
     *,
     force_kv_transfer: bool = False,
+    return_stage_payload: bool = False,
 ) -> EngineCoreRequest:
-    """Tag a request with its final stage and optional KV-transfer override."""
+    """Tag a request with its final stage, optional KV-transfer override and whether to return its stage payload."""
     merged: dict[str, Any] = {}
     if isinstance(request, OmniEngineCoreRequest) and request.additional_information is not None:
         merged = deserialize_additional_information(request.additional_information)
     merged["omni_final_stage_id"] = final_stage_id
+    merged[RETURN_STAGE_PAYLOAD_KEY] = return_stage_payload
     merged.pop("omni_force_kv_transfer", None)
     if force_kv_transfer:
         merged["omni_force_kv_transfer"] = True

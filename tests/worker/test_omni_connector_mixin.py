@@ -18,6 +18,8 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
+from vllm_omni.core.sched.output import OmniChunkRecvHandle
+from vllm_omni.data_entry_keys import OmniPayload, OmniPayloadMeta
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import (
     OmniKVTransferManager,
 )
@@ -26,6 +28,7 @@ from vllm_omni.distributed.omni_connectors.utils.config import ConnectorSpec
 from vllm_omni.distributed.omni_connectors.utils.initialization import (
     resolve_connector_spec,
 )
+from vllm_omni.distributed.omni_connectors.utils.serialization import OmniSerializer
 from vllm_omni.outputs import OmniConnectorOutput
 from vllm_omni.worker.omni_connector_model_runner_mixin import (
     OmniConnectorModelRunnerMixin,
@@ -89,6 +92,7 @@ def _make_request(req_id: str, external_req_id: str | None = None):
     r = SimpleNamespace(
         request_id=req_id,
         external_req_id=external_req_id or req_id,
+        payload_sender_info=None,
         additional_information=None,
         prompt_token_ids=[],
         num_computed_tokens=0,
@@ -1143,6 +1147,21 @@ class TestLocalPayloadCacheLifecycle(unittest.TestCase):
         self.assertEqual(tp_group.broadcast_inputs, [None])
         host.shutdown_omni_connectors()
 
+    def test_tp_follower_leaves_inline_payload_to_leader_broadcast(self):
+        """Ensure a TP follower doesn't stage an inline payload (e.g., for run requests) since it gets it
+        from the leader's broadcast."""
+        host = self._make_host()
+        host._stage_id = 1
+        host._local_rank = 1
+        handle = OmniChunkRecvHandle(request_id="r1", payload_sender_info=OmniSerializer.serialize(OmniPayload()))
+
+        with patch.object(host, "_get_local_tp_group", return_value=_FakeTPGroup(world_size=2, rank_in_group=1)):
+            host.register_chunk_recv(handle)
+
+        self.assertNotIn("r1", host._pending_load_reqs)
+        self.assertNotIn("r1", host._local_stage_payload_cache)
+        host.shutdown_omni_connectors()
+
 
 class TestTPAsyncChunkFanout(unittest.TestCase):
     def _make_host(self, rank: int) -> MixinHost:
@@ -1411,7 +1430,10 @@ class TestAsyncPayloadLifecycle(unittest.TestCase):
         host._poll_single_request("r1")
         output2 = host.get_omni_connector_output()
         self.assertEqual(output2.chunk_ready_req_ids, set())
-        self.assertEqual(output2.request_metadata, {"r1": {"next_stage_prompt_len": 7}})
+        self.assertEqual(
+            output2.request_metadata,
+            {"r1": OmniPayload(meta=OmniPayloadMeta(next_stage_prompt_len=7, finished=torch.tensor(False)))},
+        )
 
         host.shutdown_omni_connectors()
 

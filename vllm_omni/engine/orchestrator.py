@@ -30,15 +30,20 @@ from vllm.logger import init_logger
 from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import RequestOutputKind, SamplingParams
-from vllm.v1.engine import EngineCoreOutputs, FinishReason
+from vllm.v1.engine import EngineCoreOutputs, EngineCoreRequest, FinishReason
 from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.metrics.stats import IterationStats
 
 from vllm_omni.core.sched.omni_scheduling_coordinator import uses_native_mrv2_data_plane
-from vllm_omni.data_entry_keys import FIRST_AUDIO_KEY, FIRST_AUDIO_REQUIRED_KEY
+from vllm_omni.data_entry_keys import FIRST_AUDIO_KEY, FIRST_AUDIO_REQUIRED_KEY, RETURN_STAGE_PAYLOAD_KEY
 from vllm_omni.diffusion.data import is_diffusion_request_started_output
 from vllm_omni.distributed.omni_connectors.utils.config import stage_receives_chunks
-from vllm_omni.engine import OmniEngineCoreRequest
+from vllm_omni.engine import (
+    AdditionalInformationEntry,
+    AdditionalInformationPayload,
+    OmniEngineCoreRequest,
+    PayloadSenderInfo,
+)
 from vllm_omni.engine.cfg_companion_tracker import CfgCompanionTracker
 from vllm_omni.engine.errors import NativeKVHandoffError
 from vllm_omni.engine.membership_controller import MembershipController
@@ -51,6 +56,7 @@ from vllm_omni.engine.messages import (
     EngineQueueMessage,
     ErrorMessage,
     InteractionMessage,
+    NextStageInputMessage,
     OutputMessage,
     RegisterRemoteReplicaMessage,
     ShutdownRequestMessage,
@@ -62,6 +68,7 @@ from vllm_omni.engine.orchestrator_monitor import create_orch_monitor, replica_k
 from vllm_omni.engine.serialization import serialize_additional_information
 from vllm_omni.engine.stage_pool import StagePool, StageUnavailableError
 from vllm_omni.errors import DEFAULT_CLIENT_ERROR_TYPE, OmniClientError
+from vllm_omni.inputs.data import OmniPromptType, OmniSamplingParams
 from vllm_omni.metrics import definitions as metric_defs
 from vllm_omni.metrics.prometheus import OmniRequestCounter
 from vllm_omni.metrics.stat_logger import OmniPrometheusStatLogger
@@ -86,6 +93,8 @@ def cleanup_request_artifact_dirs(artifact_dirs: set[str] | list[str]) -> None:
 # own AsyncLLM output handler uses — and feeds a single serial dispatch queue.
 # Default is off except for pipelines with an explicit validated default.
 _EVENT_DRIVEN_ORCH_ENV = "VLLM_OMNI_EVENT_DRIVEN_ORCH"
+
+_RUN_STAGE_ASYNC_CHUNK_ERROR = "Async chunking is not supported for individual stage processing"
 
 # How often the event-driven loop reconciles its reader-task set against
 # `available_replica_ids()` (elastic membership, replica eviction) while idle.
@@ -195,6 +204,22 @@ def build_engine_core_request_from_tokens(
     )
 
 
+def _update_stale_request_metadata(
+    requests: list[OmniEngineCoreRequest], request_id: str, *, return_stage_payload: bool
+) -> None:
+    """Give requests built by an earlier request the new request's id, a fresh arrival time and payload routing."""
+    arrival_time = _time.time()
+    return_stage_payload_entry = AdditionalInformationEntry(scalar_data=return_stage_payload)
+    for request in requests:
+        request.request_id = request_id
+        request.external_req_id = request_id
+        request.arrival_time = arrival_time
+        if request.additional_information is None:
+            request.additional_information = AdditionalInformationPayload(entries={})
+        # Written raw so the request's other tensors are not decoded.
+        request.additional_information.entries[RETURN_STAGE_PAYLOAD_KEY] = return_stage_payload_entry
+
+
 @dataclass
 class OrchestratorRequestState:
     """Per-request bookkeeping inside the Orchestrator."""
@@ -204,6 +229,8 @@ class OrchestratorRequestState:
     sampling_params_list: list[Any] = field(default_factory=list)
     final_stage_id: int = -1
     final_output_stage_ids: set[int] = field(default_factory=set)
+    yield_stage_id: int | None = None
+    yield_stage_output: OmniRequestOutput | None = None
     finished_final_output_stage_ids: set[int] = field(default_factory=set)
     finished_stage_ids: set[int] = field(default_factory=set)
     pending_final_output: OutputMessage | None = None
@@ -1869,6 +1896,13 @@ class OrchestratorBase:
         if req_state.session_owned:
             # Session-owned outputs are delivered through the session interceptor.
             pass
+        elif self.stage_pools[stage_id].final_output and stage_id == req_state.yield_stage_id:
+            # If we have a yield stage ID, stages are independent and are using the run entrypoint.
+            #
+            # NOTE: yielded stages are not the last stage, but they may emit outputs in cases like
+            # qwen3omni, where the thinker produces the text in the first stage. In such cases, we
+            # forward so that the last stage call can emit the full response.
+            req_state.yield_stage_output = output
         elif self.stage_pools[stage_id].final_output:
             message = OutputMessage(
                 request_id=req_id,
@@ -1988,7 +2022,9 @@ class OrchestratorBase:
             self._stage_input_processors[stage_id] = processor
         return processor
 
-    def _upgrade_processed_stage_request(self, request: Any, raw_prompt: Any) -> Any:
+    def _upgrade_processed_stage_request(
+        self, request: EngineCoreRequest, raw_prompt: dict[str, Any]
+    ) -> EngineCoreRequest:
         prompt_embeds = getattr(request, "prompt_embeds", None)
         additional_information = None
 
@@ -2018,13 +2054,13 @@ class OrchestratorBase:
         self,
         req_id: str,
         next_stage_id: int,
-        next_input: Any,
+        next_input: dict[str, Any],
         params: SamplingParams | PoolingParams,
         *,
         mm_features: list | None = None,
         resumable: bool = False,
-        payload_sender_info: dict[str, Any] | None = None,
-    ) -> Any:
+        payload_sender_info: PayloadSenderInfo | None = None,
+    ) -> EngineCoreRequest:
         next_pool = self.stage_pools[next_stage_id]
         if self._next_stage_input_is_tokens(next_input):
             request = build_engine_core_request_from_tokens(
@@ -2144,6 +2180,9 @@ class OrchestratorBase:
             req_id = raw_output.request_id
             req_state = self.request_states.get(req_id)
             if req_state is None:
+                continue
+            if req_state.yield_stage_id == stage_id:
+                # A yielding request returns the next stage input once its stage finishes.
                 continue
             if self._cfg_tracker.is_companion(req_id):
                 # kv_ready only says the companion's KV hit the connector; its
@@ -2428,33 +2467,17 @@ class OrchestratorBase:
             payload_sender_info = self._build_payload_sender_info(src_stage_id, request_id=req_id)
             if payload_sender_info is not None:
                 submit_kwargs["payload_sender_info"] = payload_sender_info
-            if already_submitted:
-                replica_id = await next_pool.submit_update(
-                    req_id, req_state, diffusion_prompt, submit_kwargs=submit_kwargs
-                )
-            else:
-                replica_id = await next_pool.submit_initial(
-                    req_id,
-                    req_state,
-                    diffusion_prompt,
-                    submit_kwargs=submit_kwargs,
-                    params_override=self._maybe_clone_diffusion_params_for_cfg(req_id, params),
-                )
-            self._on_stage_submitted(
-                next_logical,
+            await self._submit_to_stage(
                 req_id,
-                replica_id,
                 req_state,
-            )
-            req_state.stage_submit_ts[next_logical] = _time.time()
-            _tx_ms = (_time.perf_counter() - _t_submit_start) * 1000.0
-            self._emit_tx_edge(
-                from_stage=src_stage_id,
-                from_replica=src_replica_id if src_replica_id is not None else 0,
-                to_stage=next_logical,
-                to_pool=next_pool,
-                request_id=req_id,
-                tx_ms=_tx_ms,
+                [diffusion_prompt],
+                source_stage_id=src_stage_id,
+                source_replica_id=src_replica_id,
+                receiver_stage_id=next_logical,
+                already_submitted=already_submitted,
+                t_submit_start=_t_submit_start,
+                submit_kwargs=submit_kwargs,
+                params_override=self._maybe_clone_diffusion_params_for_cfg(req_id, params),
             )
             return
 
@@ -2479,6 +2502,7 @@ class OrchestratorBase:
                     )
                 decode_inputs.append({"prompt_token_ids": list(prompt_token_ids)})
 
+            decode_requests = []
             for decode_input in decode_inputs:
                 request = build_engine_core_request_from_tokens(
                     request_id=req_id,
@@ -2489,26 +2513,17 @@ class OrchestratorBase:
                     resumable=next_stage_resumable,
                 )
                 request.external_req_id = request.request_id
-                if already_submitted:
-                    replica_id = await next_pool.submit_update(req_id, req_state, request)
-                else:
-                    replica_id = await next_pool.submit_initial(req_id, req_state, request, prompt_text=None)
-                self._on_stage_submitted(
-                    next_logical,
-                    req_id,
-                    replica_id,
-                    req_state,
-                )
+                decode_requests.append(request)
 
-            req_state.stage_submit_ts[next_logical] = _time.time()
-            _tx_ms = (_time.perf_counter() - _t_submit_start) * 1000.0
-            self._emit_tx_edge(
-                from_stage=src_stage_id,
-                from_replica=src_replica_id if src_replica_id is not None else 0,
-                to_stage=next_logical,
-                to_pool=next_pool,
-                request_id=req_id,
-                tx_ms=_tx_ms,
+            await self._submit_to_stage(
+                req_id,
+                req_state,
+                decode_requests,
+                source_stage_id=src_stage_id,
+                source_replica_id=src_replica_id,
+                receiver_stage_id=next_logical,
+                already_submitted=already_submitted,
+                t_submit_start=_t_submit_start,
             )
             return
 
@@ -2599,6 +2614,7 @@ class OrchestratorBase:
             return
 
         # Build and submit requests for each input
+        next_requests = []
         for next_input in next_inputs:
             # Only AR thinker stages consume encoder mm_features; downstream
             # (talker/code2wav/…) must not see them (avoids encoder-cache misses).
@@ -2613,27 +2629,91 @@ class OrchestratorBase:
                 resumable=next_stage_resumable,
                 payload_sender_info=self._build_payload_sender_info(src_stage_id, request_id=req_id),
             )
+            next_requests.append(request)
 
-            if already_submitted:
-                replica_id = await next_pool.submit_update(req_id, req_state, request)
-            else:
-                replica_id = await next_pool.submit_initial(req_id, req_state, request, prompt_text=None)
-            self._on_stage_submitted(
-                next_logical,
+        await self._submit_to_stage(
+            req_id,
+            req_state,
+            next_requests,
+            source_stage_id=src_stage_id,
+            source_replica_id=src_replica_id,
+            receiver_stage_id=next_logical,
+            already_submitted=already_submitted,
+            t_submit_start=_t_submit_start,
+        )
+
+    async def _submit_to_stage(
+        self,
+        req_id: str,
+        req_state: OrchestratorRequestState,
+        requests: list[EngineCoreRequest] | list[OmniPromptType],
+        *,
+        source_stage_id: int,
+        source_replica_id: int | None,
+        receiver_stage_id: int,
+        already_submitted: bool,
+        t_submit_start: float,
+        submit_kwargs: dict[str, Any] | None = None,
+        params_override: OmniSamplingParams | None = None,
+    ) -> None:
+        """Submit requests built from the source stage's output to the receiver stage."""
+        if req_state.yield_stage_id == source_stage_id:
+            await self._return_next_stage_input_to_caller(
                 req_id,
-                replica_id,
                 req_state,
+                requests,
+                source_stage_id=source_stage_id,
+                receiver_stage_id=receiver_stage_id,
+                submit_kwargs=submit_kwargs,
             )
+            return
+        to_pool = self.stage_pools[receiver_stage_id]
+        update_kwargs: dict[str, Any] = {} if submit_kwargs is None else {"submit_kwargs": submit_kwargs}
+        initial_kwargs = dict(update_kwargs)
+        if params_override is not None:
+            initial_kwargs["params_override"] = params_override
+        for request in requests:
+            if already_submitted:
+                replica_id = await to_pool.submit_update(req_id, req_state, request, **update_kwargs)
+            else:
+                replica_id = await to_pool.submit_initial(req_id, req_state, request, **initial_kwargs)
+            self._on_stage_submitted(receiver_stage_id, req_id, replica_id, req_state)
 
-        req_state.stage_submit_ts[next_logical] = _time.time()
-        _tx_ms = (_time.perf_counter() - _t_submit_start) * 1000.0
+        req_state.stage_submit_ts[receiver_stage_id] = _time.time()
         self._emit_tx_edge(
-            from_stage=src_stage_id,
-            from_replica=src_replica_id if src_replica_id is not None else 0,
-            to_stage=next_logical,
-            to_pool=next_pool,
+            from_stage=source_stage_id,
+            from_replica=source_replica_id if source_replica_id is not None else 0,
+            to_stage=receiver_stage_id,
+            to_pool=to_pool,
             request_id=req_id,
-            tx_ms=_tx_ms,
+            tx_ms=(_time.perf_counter() - t_submit_start) * 1000.0,
+        )
+
+    async def _return_next_stage_input_to_caller(
+        self,
+        req_id: str,
+        req_state: OrchestratorRequestState,
+        requests: list[EngineCoreRequest] | list[OmniPromptType],
+        *,
+        source_stage_id: int,
+        receiver_stage_id: int,
+        submit_kwargs: dict[str, Any] | None,
+    ) -> None:
+        """End a request at its yielded stage and return the next stage's input to the caller."""
+        await self._cleanup_request_ids([req_id])
+        await self.output_async_queue.put(
+            NextStageInputMessage(
+                request_id=req_id,
+                source_stage_id=source_stage_id,
+                receiver_stage_id=receiver_stage_id,
+                requests=requests,
+                submit_kwargs=submit_kwargs,
+                stage_output=req_state.yield_stage_output,
+                # The caller sends the sampling params on every call.
+                sampling_params_list=[],
+                final_stage_id=req_state.final_stage_id,
+                final_output_stage_ids=list(req_state.final_output_stage_ids),
+            )
         )
 
     async def _prewarm_async_chunk_stages(
@@ -2897,18 +2977,13 @@ class OrchestratorBase:
         self,
         sender_stage_id: int,
         *,
-        request_id: str | None = None,
-    ) -> dict[str, Any] | None:
+        request_id: str,
+    ) -> PayloadSenderInfo | None:
         if sender_stage_id < 0 or sender_stage_id >= len(self.stage_pools):
             return None
         sender_pool = self.stage_pools[sender_stage_id]
-        sender_stage = sender_pool.get_bound_client(request_id) if request_id is not None else None
-        if sender_stage is None:
-            sender_stage = sender_pool.stage_client
-        get_sender_info = getattr(sender_stage, "get_payload_sender_info", None)
-        if not callable(get_sender_info):
-            return None
-        return get_sender_info()
+        # NOTE: we return a dict in the common case, or raw bytes in the run case
+        return sender_pool.get_payload_sender_info(request_id)
 
     # ---- Shutdown / lifecycle ----
 
@@ -2938,9 +3013,66 @@ class Orchestrator(OrchestratorBase):
             await self._handle_add_companion(msg)
         elif msg_type == "interaction":
             await self._handle_interaction(msg)
+        elif msg_type == "next_stage_input":
+            await self._handle_next_stage_input(msg)
         else:
             return False
         return True
+
+    async def _fail_if_cannot_submit(self, req_id: str, stage_id: int, *, is_run_request: bool) -> bool:
+        """Fail the request if it can't be submitted to `stage_id`; return whether it failed."""
+        if not self.stage_pools[stage_id].live_replica_ids():
+            # The stage lost all replicas between the HTTP-layer errored check and
+            # dispatch. Runs before request state / running counter registration,
+            # so the helper's cleanup is a no-op here.
+            await self._fail_request_dead_stage(req_id, stage_id)
+            return True
+        if is_run_request and self.async_chunk:
+            await self._fail_request_client_error(req_id, stage_id, _RUN_STAGE_ASYNC_CHUNK_ERROR)
+            return True
+        return False
+
+    async def _handle_next_stage_input(self, msg: NextStageInputMessage) -> None:
+        """Submit a next stage input returned by an earlier request as a new request at its receiver stage."""
+        req_id = msg.request_id
+        receiver_stage_id = msg.receiver_stage_id
+        if await self._fail_if_cannot_submit(req_id, receiver_stage_id, is_run_request=True):
+            return
+
+        yield_stage_id = receiver_stage_id if receiver_stage_id < msg.final_stage_id else None
+        req_state = OrchestratorRequestState(
+            request_id=req_id,
+            sampling_params_list=msg.sampling_params_list,
+            final_stage_id=msg.final_stage_id,
+            final_output_stage_ids=set(msg.final_output_stage_ids),
+            yield_stage_id=yield_stage_id,
+            request_timestamp=_time.time(),
+        )
+        self.request_states[req_id] = req_state
+        self._register_running_request(req_state)
+        # Ensure LLM stages update core engine request metadata that's now stale
+        if self.stage_pools[receiver_stage_id].stage_type == "llm":
+            # Like the entry stage, a yielding stage returns its payload when the next stage takes a full payload.
+            return_stage_payload = (
+                yield_stage_id is not None and self.stage_pools[yield_stage_id + 1].takes_full_payload_input
+            )
+            _update_stale_request_metadata(msg.requests, req_id, return_stage_payload=return_stage_payload)
+        await self._dispatch_or_fail_request(
+            lambda: self._submit_to_stage(
+                req_id,
+                req_state,
+                msg.requests,
+                source_stage_id=msg.source_stage_id,
+                source_replica_id=None,
+                receiver_stage_id=receiver_stage_id,
+                already_submitted=False,
+                t_submit_start=_time.perf_counter(),
+                submit_kwargs=msg.submit_kwargs,
+            ),
+            req_id=req_id,
+            stage_id=receiver_stage_id,
+            operation="next_stage_input",
+        )
 
     def _native_mrv2_receiver_stage(self, final_stage_id: int) -> int | None:
         """First downstream stage up to ``final_stage_id`` that receives on MRv2's native data plane."""
@@ -2966,11 +3098,7 @@ class Orchestrator(OrchestratorBase):
         final_stage_id = msg.final_stage_id
         final_output_stage_ids = set(msg.final_output_stage_ids or [final_stage_id])
 
-        if not self.stage_pools[stage_id].live_replica_ids():
-            # Stage 0 lost all replicas between the HTTP-layer errored check and
-            # dispatch. Runs before request state / running counter registration,
-            # so the helper's cleanup is a no-op here.
-            await self._fail_request_dead_stage(request_id, stage_id)
+        if await self._fail_if_cannot_submit(request_id, stage_id, is_run_request=msg.yield_stage_id is not None):
             return
 
         if getattr(prompt, "resumable", False):
@@ -3005,6 +3133,7 @@ class Orchestrator(OrchestratorBase):
             sampling_params_list=sampling_params_list,
             final_stage_id=final_stage_id,
             final_output_stage_ids=final_output_stage_ids,
+            yield_stage_id=msg.yield_stage_id,
             request_timestamp=float(msg.request_timestamp or _time.time()),
             mm_features=getattr(prompt, "mm_features", None),
             request_artifact_dirs=set(msg.request_artifact_dirs or ()),

@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from vllm_omni.core.sched.omni_scheduling_coordinator import OmniSchedulingCoordinator
+from vllm_omni.core.sched.omni_scheduling_coordinator import OmniSchedulingCoordinator, payload_for_scheduler
 from vllm_omni.data_entry_keys import to_dict
 from vllm_omni.distributed.omni_connectors.model_runner.omni_connector_payload_transport import (
     _OmniConnectorPayloadTransportMixin as Transport,
@@ -51,7 +51,7 @@ def test_empty_terminal_clears_native_codec_prompt(after_audio):
     )
     payload = to_dict(terminal)
     assert not Transport._payload_is_consumable(payload)
-    metadata = Transport._extract_scheduling_metadata(payload)
+    metadata = payload_for_scheduler(payload)
     receiver = _request(previous)
     coordinator = OmniSchedulingCoordinator(stage_id=1)
     coordinator.update_request_metadata({"r": receiver}, {"r": metadata}, model_mode="generation")
@@ -69,14 +69,14 @@ def test_explicit_empty_codes_clear_generation_prompt(empty):
     request.num_computed_tokens = 3
     coordinator = OmniSchedulingCoordinator(stage_id=1)
     coordinator.update_request_metadata(
-        {"r": request}, {"r": {"code_predictor_codes": empty, "input_terminal": True}}, model_mode="generation"
+        {"r": request}, {"r": {"codes": {"audio": empty}, "meta": {"finished": True}}}, model_mode="generation"
     )
     assert request.prompt_token_ids == request._all_token_ids == request._output_token_ids == []
     assert request.num_prompt_tokens == request.num_computed_tokens == 0
     assert "r" in coordinator.input_terminal_req_ids
 
 
-@pytest.mark.parametrize("metadata", [{"input_terminal": True}, {"code_predictor_codes": None}])
+@pytest.mark.parametrize("metadata", [{"meta": {"finished": True}}, {"codes": {"audio": None}}])
 def test_absent_codes_preserve_generation_prompt(metadata):
     request = _request([17, 18, 19])
     coordinator = OmniSchedulingCoordinator(stage_id=1)
@@ -88,6 +88,6 @@ def test_ar_prompt_is_not_replaced_by_empty_audio_codes():
     request = _request([17, 18, 19])
     coordinator = OmniSchedulingCoordinator(stage_id=1)
     coordinator.update_request_metadata(
-        {"r": request}, {"r": {"code_predictor_codes": [], "input_terminal": True}}, model_mode="ar"
+        {"r": request}, {"r": {"codes": {"audio": []}, "meta": {"finished": True}}}, model_mode="ar"
     )
     assert request.prompt_token_ids == request._all_token_ids == [17, 18, 19]

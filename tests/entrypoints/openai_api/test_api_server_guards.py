@@ -151,6 +151,7 @@ _EXPECTED_ROUTER_ROUTES = {
     ("WEBSOCKET", "/v1/realtime"),
     ("WEBSOCKET", "/v1/realtime/robot/openpi"),
     ("WEBSOCKET", "/v1/duplex"),
+    ("POST", "/v1/run"),
     ("POST", "/v1/realtime/sessions"),
     ("POST", "/v1/realtime/sessions/{session_id}/step"),
     ("POST", "/v1/realtime/sessions/{session_id}/reset"),
@@ -197,6 +198,7 @@ _DIFFUSION_APP_STATE_KEYS = {
     "openai_streaming_video",
     "openai_serving_realtime_robot",
     "rl_rollout_serving",
+    "run_serving",
     "enable_server_load_tracking",
     "server_load_metrics",
 }
@@ -228,6 +230,7 @@ _MULTISTAGE_APP_STATE_KEYS = {
     "openai_serving_video",
     "openai_serving_realtime_robot",
     "rl_rollout_serving",
+    "run_serving",
     "enable_server_load_tracking",
     "server_load_metrics",
 }

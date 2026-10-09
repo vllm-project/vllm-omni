@@ -11,15 +11,30 @@ import os
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
-import pytest
+import io
+import json
 
+import pytest
+import requests
+import soundfile as sf
+from huggingface_hub import hf_hub_download
+from transformers import AutoTokenizer
+
+from tests.helpers.assertions import assert_audio_speech_response
+from tests.helpers.client import OmniResponse
 from tests.helpers.mark import hardware_test
+from tests.helpers.media import concat_audio
 from tests.helpers.runtime import OmniServerParams
 from tests.helpers.stage_config import (
     get_deploy_config_path,
     get_deploy_config_stage,
     modify_stage_config,
 )
+from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
+from vllm_omni.entrypoints.openai.serving_run import decode_output
+from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
+from vllm_omni.entrypoints.openai.tts_adapters.base import conditioning_cache_salt
+from vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder import Qwen3TTSPromptEmbedsBuilder
 
 MODEL = "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
 
@@ -186,3 +201,61 @@ def test_text_to_audio_002(omni_server, online_client) -> None:
     }
 
     online_client.send_audio_speech_request(request_config)
+
+
+### Tests for /v1/run
+def _stage0_input(text: str, speaker: str) -> dict:
+    """Build the talker's input as the speech endpoint does."""
+    tts_params = {"text": [text], "task_type": ["CustomVoice"], "language": ["Auto"], "speaker": [speaker]}
+    tokenizer = AutoTokenizer.from_pretrained(MODEL, trust_remote_code=True, padding_side="left")
+    with open(hf_hub_download(MODEL, "config.json")) as f:
+        talker_config = json.load(f)["talker_config"]
+    prompt_len = Qwen3TTSPromptEmbedsBuilder.estimate_prompt_len_from_additional_information(
+        additional_information=tts_params,
+        task_type="CustomVoice",
+        tokenize_prompt=lambda prompt: tokenizer(prompt, padding=False)["input_ids"],
+        codec_language_id=talker_config.get("codec_language_id"),
+        spk_is_dialect=talker_config.get("spk_is_dialect"),
+    )
+    cache_salt = conditioning_cache_salt(OpenAICreateSpeechRequest(input=text, voice=speaker), tts_params)
+    return {"prompt_token_ids": [1] * prompt_len, "additional_information": tts_params, "cache_salt": cache_salt}
+
+
+def _output_to_wav(output: str) -> bytes:
+    """Decode a /v1/run final output into WAV bytes."""
+    audio_output, audio_key = OmniOpenAIServingSpeech._extract_audio_output(decode_output(output))
+    wav = io.BytesIO()
+    sf.write(wav, concat_audio(audio_output[audio_key]), int(audio_output["sr"]), format="WAV")
+    return wav.getvalue()
+
+
+@pytest.mark.core_model
+@pytest.mark.advanced_model
+@pytest.mark.tts
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@pytest.mark.parametrize(
+    "omni_server",
+    # /v1/run rejects async_chunk, so we need to run this test without it.
+    [
+        OmniServerParams(
+            model=MODEL, stage_config_path=_STAGE_CONFIG, server_args=["--trust-remote-code", "--no-async-chunk"]
+        )
+    ],
+    indirect=True,
+)
+def test_run_stage_chain_returns_speech(omni_server, run_level: str) -> None:
+    """Ensure calling /v1/run once per stage, posting each response as the next request, returns the speech."""
+    request_config = {"input": get_prompt(), "voice": "vivian", "response_format": "wav"}
+    url = f"http://{omni_server.host}:{omni_server.port}/v1/run"
+
+    first = requests.post(
+        url, json={"stage_input": _stage0_input(request_config["input"], request_config["voice"])}, timeout=300
+    )
+    first.raise_for_status()
+    next_request = first.json()
+    assert next_request["stage_id"] == 1
+
+    final = requests.post(url, json=next_request, timeout=300)
+    final.raise_for_status()
+    response = OmniResponse(success=True, audio_bytes=_output_to_wav(final.json()["output"]), audio_format="audio/wav")
+    assert_audio_speech_response(response, request_config, run_level)

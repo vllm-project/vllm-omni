@@ -19,6 +19,7 @@ an implementation contract has a user-facing workflow.
 | --- | --- | --- |
 | Choose serial, batched, step-wise, or streaming diffusion execution | [Execution Modes and Streaming](../user_guide/diffusion/execution_modes.md) | [Diffusion Continuous Batching](../design/feature/diffusion_continuous_batching.md), [Async Diffusion Output](../design/feature/async_diffusion_output.md) |
 | Reclaim stage memory without restarting the server | [Sleep Mode](sleep_mode.md) | Runtime lifecycle behavior is documented in the user guide |
+| Run and route each stage independently (experimental) | [Independent Stage Execution](independent_stage_execution.md) | See user guide |
 
 The [Prefill-Decode Disaggregation design reference](pd_disaggregation.md)
 describes the experimental Qwen3-Omni runtime topology and its current

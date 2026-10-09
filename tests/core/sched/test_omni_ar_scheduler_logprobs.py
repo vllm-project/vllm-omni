@@ -108,6 +108,7 @@ class _Request:
         self.stop_reason = None
         self.trace_headers = None
         self.num_nans_in_logits = 0
+        self.additional_information = None
 
     def is_finished(self) -> bool:
         return RequestStatus.is_finished(self.status)
@@ -148,6 +149,7 @@ def _make_scheduler_stub(requests: list[_Request]) -> SimpleNamespace:
         waiting_for_transfer_free=set(),
         _new_prompt_len_snapshot={},
         _pooling_output_decoder=None,
+        _outputs_awaiting_stage_payload={},
         finished_req_ids=set(),
         finished_req_ids_dict=defaultdict(set),
         kv_cache_manager=SimpleNamespace(take_events=lambda: None),

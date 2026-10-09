@@ -76,6 +76,10 @@ def orchestrator_factory(monkeypatch):
 
 _PARITY_TESTS = [
     legacy.test_run_two_stage_llm,
+    legacy.test_run_yield_stage_forwards_final_output_in_next_stage_input,
+    legacy.test_run_chain_yields_at_each_stage_until_final_output,
+    legacy.test_run_yield_waits_for_cfg_companions,
+    legacy.test_run_yield_waits_for_stage_finish_not_kv_ready,
     legacy.test_run_single_stage_diffusion,
     legacy.test_run_single_stage_diffusion_streaming_forwards_intermediate_chunks,
     legacy.test_run_llm_to_diffusion,
