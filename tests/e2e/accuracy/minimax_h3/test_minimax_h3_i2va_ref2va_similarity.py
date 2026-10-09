@@ -100,6 +100,7 @@ REF2VA_DURATION_SECONDS = 5.0
 SEED = 0
 SSIM_THRESHOLD = 0.97
 PSNR_THRESHOLD = 34.0
+# The worker RPC spans the full generation and shares the HTTP request budget.
 REQUEST_TIMEOUT_SECONDS = 60 * 60
 
 
@@ -256,6 +257,7 @@ def test_minimax_h3_i2va_matches_official_reference(
         "FLASHINFER_DISABLE_VERSION_CHECK": "1",
         "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
         "VLLM_OMNI_VIDEO_SYNC_TIMEOUT": str(REQUEST_TIMEOUT_SECONDS),
+        "VLLM_OMNI_DLO_DP_WAVE_TIMEOUT": str(REQUEST_TIMEOUT_SECONDS),
         "VLLM_OMNI_STORAGE_PATH": str(output_dir / "storage"),
     }
     request_data = {
@@ -339,6 +341,7 @@ def test_minimax_h3_ref2va_matches_official_reference(
         "FLASHINFER_DISABLE_VERSION_CHECK": "1",
         "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
         "VLLM_OMNI_VIDEO_SYNC_TIMEOUT": str(REQUEST_TIMEOUT_SECONDS),
+        "VLLM_OMNI_DLO_DP_WAVE_TIMEOUT": str(REQUEST_TIMEOUT_SECONDS),
         "VLLM_OMNI_STORAGE_PATH": str(output_dir / "storage"),
     }
     request_data = {
