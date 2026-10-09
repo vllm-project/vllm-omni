@@ -315,7 +315,11 @@ def test_projection_of_the_main_internal_event_sequence():
     assert audio_delta[0].format == "pcm16"
     assert audio_delta[0].item_id == "item_resp_1"
     assert audio_delta[1].text == "hi"
-    assert state.conversation_items["item_resp_1"]["content"][0]["transcript"] == "hi"
+    # Deltas accumulate in the projection; the stored item is materialized at
+    # retrieval boundaries, not on every delta.
+    assert state.conversation_items["item_resp_1"]["content"] == []
+    retrieved = retrieve_item_events(state, {"item_id": "item_resp_1"})[0].to_realtime()
+    assert retrieved["item"]["content"][0]["transcript"] == "hi"
 
     done = project_internal_event(state, {"type": "response.done", "response_id": "resp_1"})
     assert _types(done) == [
@@ -479,6 +483,108 @@ def test_one_truncate_command_truncates_retrieved_transcript_once():
     assert retrieved["item"]["content"][0]["transcript"] == "abcd"
     # Keep the cursor: later output must not restore the untruncated item.
     assert state.item_truncation_cursors["item_resp_1"] == (0, 4_000)
+
+
+def test_response_history_materializes_only_at_retrieval_boundary():
+    state = RealtimeProjectionState(session_id="duplex-lazy")
+    pcm = base64.b64encode(b"\x00\x10" * 8).decode("ascii")
+    project_internal_event(state, {"type": "response.created", "response_id": "resp_1"})
+    for text in ("brave", " new", " world"):
+        project_internal_event(
+            state,
+            {"type": "response.output_audio.delta", "response_id": "resp_1", "audio": pcm, "text": text},
+        )
+        # Deltas accumulate in the projection without rebuilding the stored copy.
+        assert state.conversation_items["item_resp_1"]["content"] == []
+
+    retrieved = retrieve_item_events(state, {"item_id": "item_resp_1"})[0].to_realtime()
+    assert retrieved["item"]["content"][0]["transcript"] == "brave new world"
+    retrieved_again = retrieve_item_events(state, {"item_id": "item_resp_1"})[0].to_realtime()
+    assert retrieved_again["item"] == retrieved["item"]
+
+
+def test_text_deltas_materialize_output_text_part_at_retrieval():
+    state = RealtimeProjectionState(session_id="duplex-lazy-text")
+    project_internal_event(state, {"type": "response.created", "response_id": "resp_1", "modalities": ["text"]})
+    for piece in ("foo", "bar", "baz"):
+        project_internal_event(state, {"type": "response.text.delta", "response_id": "resp_1", "delta": piece})
+        assert state.conversation_items["item_resp_1"]["content"] == []
+
+    retrieved = retrieve_item_events(state, {"item_id": "item_resp_1"})[0].to_realtime()
+    assert retrieved["item"]["content"] == [{"type": "output_text", "text": "foobarbaz"}]
+
+
+def test_audio_text_marks_dedupe_and_sort_once_per_boundary():
+    state = RealtimeProjectionState(session_id="duplex-marks")
+    pcm = base64.b64encode(b"\x00\x10" * 8).decode("ascii")
+    project_internal_event(state, {"type": "response.created", "response_id": "resp_1"})
+    deltas = [
+        ("ab", [{"text_chars": 2, "audio_end_ms": 100}]),
+        ("cd", [{"text_chars": 4, "audio_end_ms": 50}]),  # out of order across deltas
+        ("ef", [{"text_chars": 2, "audio_end_ms": 100}, {"text_chars": 6, "audio_end_ms": 200}]),
+    ]
+    for text, marks in deltas:
+        project_internal_event(
+            state,
+            {
+                "type": "response.output_audio.delta",
+                "response_id": "resp_1",
+                "audio": pcm,
+                "text": text,
+                "audio_text_marks": marks,
+            },
+        )
+        assert state.conversation_items["item_resp_1"]["content"] == []
+
+    expected_marks = [
+        {"text_chars": 4, "audio_end_ms": 50},
+        {"text_chars": 2, "audio_end_ms": 100},
+        {"text_chars": 6, "audio_end_ms": 200},
+    ]
+    retrieved = retrieve_item_events(state, {"item_id": "item_resp_1"})[0].to_realtime()
+    assert retrieved["item"]["content"][0]["audio_text_marks"] == expected_marks
+
+    done = project_internal_event(state, {"type": "response.done", "response_id": "resp_1"})
+    assert done[4].item["content"][0]["audio_text_marks"] == expected_marks
+    assert done[4].item["content"][0]["transcript"] == "abcdef"
+
+
+def test_truncate_command_validates_against_materialized_in_progress_item():
+    state = RealtimeProjectionState(session_id="duplex-truncate-live")
+    pcm = base64.b64encode(b"\x00\x10" * 8).decode("ascii")
+    project_internal_event(state, {"type": "response.created", "response_id": "resp_1"})
+    project_internal_event(
+        state,
+        {
+            "type": "response.output_audio.delta",
+            "response_id": "resp_1",
+            "audio": pcm,
+            "text": "abcdefghij",
+            "audio_duration_ms": 10_000,
+            "audio_text_marks": [{"text_chars": 10, "audio_end_ms": 10_000}],
+        },
+    )
+    assert state.conversation_items["item_resp_1"]["content"] == []
+
+    rejected = resolve_truncate_item(state, TruncateItem(item_id="item_resp_1", audio_end_ms=20_000))
+    assert rejected.payloads == []
+    assert len(rejected.events) == 1
+
+    accepted = resolve_truncate_item(state, TruncateItem(item_id="item_resp_1", audio_end_ms=4_000))
+    assert accepted.events == []
+    assert accepted.payloads[0]["event"] == "conversation.item.truncate"
+
+    retrieved = retrieve_item_events(state, {"item_id": "item_resp_1"})[0].to_realtime()
+    assert retrieved["item"]["content"][0]["transcript"] == "abcd"
+    # The engine acknowledgement must not cut the materialized item a second time.
+    project_internal_event(
+        state, {"type": "conversation.item.truncated", "item_id": "item_resp_1", "audio_end_ms": 4_000}
+    )
+    retrieved = retrieve_item_events(state, {"item_id": "item_resp_1"})[0].to_realtime()
+    assert retrieved["item"]["content"][0]["transcript"] == "abcd"
+    # The cursor survives retrieval so the terminal item stays truncated.
+    done = project_internal_event(state, {"type": "response.done", "response_id": "resp_1"})
+    assert done[4].item["content"][0]["transcript"] == "abcd"
 
 
 def test_projection_leaves_error_to_typed_emit_sites():
