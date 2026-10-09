@@ -8,6 +8,7 @@ CosyVoice, ESPnet, Matcha-TTS and 3D-Speaker files under Apache-2.0. Import
 paths were rewritten and training-only code removed (plus a demo block, a
 duplicate logger line and a missing `import logging`); the code then follows
 this repository's conventions (absolute imports, lint, Google-style
-docstrings) without changing any computation. Numeric parity against the
-source package, not textual closeness, is what is checked.
+docstrings, plain torch operations in place of einops, no unreachable code)
+without changing any computation. Numeric parity against the source package,
+not textual closeness, is what is checked.
 """

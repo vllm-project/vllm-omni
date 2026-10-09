@@ -66,30 +66,11 @@ class ConditionalCFM(BASECFM):
             flow_cache (torch.Tensor, optional): Noise and encoder output cached from the previous call.
                 shape: (1, n_feats, cache_size, 2)
 
-        Returns:
-            output (tuple[torch.Tensor, torch.Tensor]): The generated mel-spectrogram, shape
-                (batch_size, n_feats, mel_timesteps), and the updated flow cache.
-
         Raises:
             NotImplementedError: Always; this path is unused and was not updated for the meanflow model.
         """
 
         raise NotImplementedError("unused, needs updating for meanflow model")
-
-        z = torch.randn_like(mu).to(mu.device).to(mu.dtype) * temperature
-        cache_size = flow_cache.shape[2]
-        # fix prompt and overlap part mu and z
-        if cache_size != 0:
-            z[:, :, :cache_size] = flow_cache[:, :, :, 0]
-            mu[:, :, :cache_size] = flow_cache[:, :, :, 1]
-        z_cache = torch.concat([z[:, :, :prompt_len], z[:, :, -34:]], dim=2)
-        mu_cache = torch.concat([mu[:, :, :prompt_len], mu[:, :, -34:]], dim=2)
-        flow_cache = torch.stack([z_cache, mu_cache], dim=-1)
-
-        t_span = torch.linspace(0, 1, n_timesteps + 1, device=mu.device, dtype=mu.dtype)
-        if self.t_scheduler == "cosine":
-            t_span = 1 - torch.cos(t_span * 0.5 * torch.pi)
-        return self.solve_euler(z, t_span=t_span, mu=mu, mask=mask, spks=spks, cond=cond), flow_cache
 
     def solve_euler(self, x, t_span, mu, mask, spks, cond, meanflow=False):
         """
