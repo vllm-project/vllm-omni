@@ -61,6 +61,11 @@ from vllm_omni.diffusion.offloader.config import (
     resolve_offload,
     resolve_offload_strategy,
 )
+from vllm_omni.diffusion.pid import (
+    decode_stepwise_output,
+    maybe_pid_passthrough,
+    stepwise_pid_active,
+)
 from vllm_omni.diffusion.postprocess.device_reduction import prepare_diffusion_media_for_transport
 from vllm_omni.diffusion.registry import _NO_CACHE_ACCELERATION
 from vllm_omni.diffusion.request import OmniDiffusionRequest
@@ -807,6 +812,10 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
 
             self._refresh_cache_for_requests(reqs, od_config=od_config)
 
+            pid_passthrough = maybe_pid_passthrough(self.pipeline, reqs, od_config)
+            if pid_passthrough is not None:
+                pid_passthrough.force_latent_output(reqs)
+
             batch = DiffusionRequestBatch(requests=reqs)
             is_primary = not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
             if is_primary and record_output_peak_memory:
@@ -888,11 +897,18 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                             [req.request_id for req in reqs],
                         )
                         outputs = [DiffusionOutput(aborted=True, abort_message=str(exc)) for _ in reqs]
+                    finally:
+                        if pid_passthrough is not None:
+                            pid_passthrough.restore_output_type(reqs)
                 with record_function("prepare_output_for_transport"):
                     outputs = [
                         self._prepare_output_for_transport(output, req.sampling_params)
                         for req, output in zip(reqs, outputs, strict=True)
                     ]
+
+            if pid_passthrough is not None:
+                with record_function(f"{record_name}_pid_decode"):
+                    outputs = pid_passthrough.decode_outputs(outputs, reqs)
 
             if is_primary and outputs and record_output_peak_memory:
                 batch_peak_memory_mb = self._sample_peak_memory_mb()
@@ -1443,7 +1459,14 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
 
                             if should_decode:
                                 clear_pipeline_stage_durations(pipeline)
-                                result = pipeline.post_decode(req)
+                                if stepwise_pid_active(pipeline, req):
+                                    # PiD: fetch raw latents from the pipeline's
+                                    # latent branch, then super-resolve with PiD.
+                                    result = pipeline.post_decode(req, output_type="latent")
+                                    if result is not None:
+                                        result = decode_stepwise_output(pipeline, req, result)
+                                else:
+                                    result = pipeline.post_decode(req)
                                 if result is not None:
                                     result = self._prepare_output_for_transport(result, req.sampling)
                                     self._attach_stepwise_metadata(
