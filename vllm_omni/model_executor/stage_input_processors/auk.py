@@ -76,7 +76,14 @@ def _extract_text_cond(ar_output: Any) -> Any:
 
 
 def _to_cpu_tensor(text_cond: Any) -> torch.Tensor:
-    """Coerce the emitted condition to a single 2-D CPU tensor."""
+    """Coerce the emitted condition to a CPU tensor.
+
+    Restores the AuK-wide semantics that the shared ``_common.to_cpu_tensor``
+    (glm_tts-narrow) does not provide: a list of segments is recursively
+    converted and concatenated along ``dim=0``, an empty list raises
+    ``ValueError``, and numpy / array-like inputs are converted via
+    ``torch.as_tensor``. The 2-D shape check lives at the call site.
+    """
     if isinstance(text_cond, list):
         if not text_cond:
             raise ValueError("AuK encoder emitted an empty text condition list")
@@ -87,10 +94,7 @@ def _to_cpu_tensor(text_cond: Any) -> torch.Tensor:
     else:
         # numpy array or any array-like the connector round-tripped.
         tensor = torch.as_tensor(text_cond)
-    tensor = tensor.detach().cpu()
-    if tensor.ndim != 2:
-        raise ValueError(f"AuK text condition must be [tokens, hidden]; got shape {tuple(tensor.shape)}")
-    return tensor
+    return tensor.detach().cpu()
 
 
 def encoder2dit(
@@ -119,6 +123,10 @@ def encoder2dit(
             "stage 1 cannot run without the fused thinker hidden states"
         )
     prompt_embeds = _to_cpu_tensor(text_cond)
+    if prompt_embeds is None:
+        raise ValueError("AuK encoder emitted no text condition tensor for stage 1")
+    if prompt_embeds.ndim != 2:
+        raise ValueError(f"AuK text condition must be [tokens, hidden]; got shape {tuple(prompt_embeds.shape)}")
 
     original = _as_dict(prompt)
     original_knobs = original.get("additional_information") or {}

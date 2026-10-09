@@ -6,7 +6,8 @@
 2. [Performance](#performance)
 3. [Architecture](#architecture)
 4. [Configuration](#configuration)
-5. [Related Files](#related-files)
+5. [Stage Input Processor Contract](#stage-input-processor-contract)
+6. [Related Files](#related-files)
 
 ## Overview
 
@@ -15,14 +16,16 @@ The `async_chunk` feature enables asynchronous, chunked processing of data acros
 **Chunk Size Definition**
 
 - **Prefill Phase**: `chunk_size = num_scheduled_tokens` for chunked prefill processing
-- **Decode Phase**: `chunk_size = num_scheduled_tokens = 1 ` for per-token streaming
+- **Decode Phase**: `chunk_size = num_scheduled_tokens = 1` for per-token streaming
 
 For qwen3-omni:
+
 - **Thinker → Talker**: Per decode step (typically chunk_size=1)
 - **Talker → Code2Wav**: Accumulated to `codec_chunk_frames` (default=25) before sending. During the initial phase, a dynamic initial chunk size (IC) is automatically selected based on server load to reduce TTFP. Use the per-request `initial_codec_chunk_frames` API field to override.
 - **Code2Wav**: Streaming decode with code2wav chunk_size
 
 With `async_chunk`:
+
 - Stages can start processing as soon as chunks are available
 - Overlapping execution across stages
 - Reduced latency and improved throughput
@@ -30,6 +33,7 @@ With `async_chunk`:
 - Async scheduling: Chunk IO (get/put) overlaps with compute via background threads so the scheduler is not blocked waiting for chunks
 
 ## Performance
+
 1. **Reduced Latency**: Next stage can start processing immediately
 2. **Streaming Support**: Enables streaming for audio generation
 3. **IO-Compute Overlap**: Chunk retrieval happens asynchronously while other requests compute
@@ -47,7 +51,6 @@ With `async_chunk`:
 | text 100  | text 100+audio   | True                | 1                   | 1              | 50      | 6179.79    | 44.58      | 8.69      | 522.99      | 0.22     | 8.60     |
 | text 100  | text 100+audio   | True                | 1                   | 4              | 50      | 7692.69    | 103.96     | 10.22     | 785.85      | 0.29     | 10.12    |
 | text 100  | text 100+audio   | True                | 1                   | 10             | 50      | 11152.71   | 685.60     | 17.64     | 1628.88     | 0.41     | 17.62    |
-
 
 Performance data collected on H800 GPUs through comprehensive benchmarking with cudagraph enabled. text input uses random dataset.
 
@@ -90,7 +93,7 @@ The following diagram illustrates the **Async Chunk Architecture** for multi-sta
 **Diagram Legend:**
 
 | Step | Stage Type | Description |
-|------|-----------|------------|
+| ------ | ----------- | ------------ |
 | `prefill` | Initialization | Context processing, KV cache initialization |
 | `decode` | Autoregressive | Token-by-token generation in AR stages |
 | `codes` | Audio Encoding | RVQ codec codes from Talker stage |
@@ -99,14 +102,16 @@ The following diagram illustrates the **Async Chunk Architecture** for multi-sta
 ### Data Flow
 
 #### Stage 0: Thinker (Multimodal Understanding + Text Generation)
+
 - **Prefill**: Processes multimodal input (text/image/audio/video), initializes KV cache
 - **Decode Loop**: Generates text tokens autoregressively
 - **Chunk Triggers**: Each decode step (typically `chunk_size=1`) can trigger downstream processing
 - **Dual Output**:
-  - **Text Stream**: `text_0`, `text_1`, `text_2`... `text_n` streamed to output
-  - **Hidden States**: Passed to Talker stage for audio synthesis
+    - **Text Stream**: `text_0`, `text_1`, `text_2`... `text_n` streamed to output
+    - **Hidden States**: Passed to Talker stage for audio synthesis
 
 #### Stage 1: Talker (Text → RVQ Audio Codes)
+
 - **Prefill**: Receives hidden states from Thinker as semantic condition
 - **Decode Loop**: Generates RVQ codec codes autoregressively
 - **Accumulation**: Codes accumulate to `codec_chunk_frames` (default=25) before forwarding
@@ -114,12 +119,14 @@ The following diagram illustrates the **Async Chunk Architecture** for multi-sta
 - **Output**: `codes` blocks (chunk 0, 1, ... n) sent to Code2Wav
 
 #### Stage 2: Code2Wav (Vocoder Decoder)
+
 - **Non-Autoregressive**: Processes RVQ codes in parallel batches
 - **Streaming Decode**: Converts codes to audio waveforms chunk-by-chunk
 - **Batching**: Supports batched inference for multiple concurrent requests
 - **Output**: Audio segments `audio_0`, `audio_1`, ... `audio_n`
 
 #### Stage 3: Output (Dual Stream)
+
 - **Text Streaming**: `text_0` → `text_1` → `text_2` → ... (user sees response in real-time)
 - **Audio Streaming**: `audio_0` → `audio_1` → ... (user hears audio progressively)
 
@@ -144,6 +151,7 @@ Total: ~3.5s, TTFP: ~0.5s
 ```
 
 #### Sequential Flow (for comparison)
+
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" src="https://raw.githubusercontent.com/vllm-project/vllm-omni/refs/heads/main/docs/source/architecture/qwen3-omni-non-async-chunk.png">
@@ -154,13 +162,13 @@ Total: ~3.5s, TTFP: ~0.5s
 In sequential mode, each stage must wait for the previous stage to complete entirely before starting.
 
 ### Async Chunk System Architecture
+
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" src="https://raw.githubusercontent.com/vllm-project/vllm-omni/refs/heads/main/docs/source/architecture/async-chunk-architecture.png">
     <img alt="Async Chunk Architecture" src="https://raw.githubusercontent.com/vllm-project/vllm-omni/refs/heads/main/docs/source/architecture/async-chunk-architecture.png" width=100%>
   </picture>
 </p>
-
 
 ### Key Components
 
@@ -256,6 +264,174 @@ stages:
     devices: "1"
     max_num_seqs: 64  # Enables batched audio generation
 ```
+
+## Stage Input Processor Contract
+
+RFC #4872 standardized the per-model builders that convert one stage's outputs
+into the next stage's inputs. Each builder belongs to exactly one *role*
+(consumer-side vs producer-side) and is dispatched by the runtime according to
+the `async_chunk` mode. The naming convention and the validation rules below
+are load-bearing: the processor registry infers a builder's kind from its name
+suffix and enforces the matching signature at startup.
+
+### Naming convention and roles
+
+| Suffix | Registry kind | Runs where | Role |
+| -------- | --------------- | ------------ | ------ |
+| `*_full_payload` | `producer_full_payload` | Worker (producer-side) | Packs the accumulated stage output into an `OmniPayload` and ships it through the connector (`FullPayloadProducer`) |
+| `*_async_chunk` | `producer_async_chunk` | Scheduler (producer-side) | Streams one chunk per call while `async_chunk` is enabled (`AsyncChunkProducer`) |
+| `*_token_only` | `placeholder_prompt_builder` | Orchestrator (consumer-side) | Allocates downstream KV slots only; bulk tensors arrive via the connector (`PlaceholderPromptBuilder`) |
+| (no suffix, legacy) | `legacy_orchestrator_builder` | Orchestrator (consumer-side) | Legacy sync builder — a placeholder or diffusion input builder, adapted through `wrap_orchestrator_processor` |
+
+Diffusion-stage edges use dedicated suffixes
+(`ar2diffusion` / `ar2dit` / `thinker2imagegen` / ...) mapped to
+`diffusion_input_builder`, and `moss_tts.talker2codec` keeps the legacy
+`legacy_multi_source` shape. The canonical naming documentation lives in the
+`vllm_omni/model_executor/stage_input_processors/__init__.py` module docstring.
+
+### Minimal processor set per edge
+
+A new model that must work in **both** modes implements, for each inter-stage
+edge, the three processors below:
+
+| Mode | Producer-side | Consumer-side (orchestrator) |
+|------|---------------|------------------------------|
+| `async_chunk=false` | `*_full_payload` (`FullPayloadProducer`) | `*_token_only` (`PlaceholderPromptBuilder`) |
+| `async_chunk=true` | `*_async_chunk` (`AsyncChunkProducer`) | `*_token_only` (prewarm via `build_prewarm_placeholder`) |
+
+The minimal union set is `*_full_payload`, `*_async_chunk` and `*_token_only`.
+The `*_token_only` placeholder builder is required in both modes: in non-async
+mode it builds the forward placeholder, and in async mode the orchestrator
+reuses it to prewarm the downstream stage.
+
+### OrchestratorInputContext and the C1 contract
+
+Every orchestrator-facing builder is invoked under the fixed C1 contract
+`(source_outputs, ctx)`:
+
+```python
+from vllm_omni.model_executor.stage_input_processors import OrchestratorInputContext
+
+
+def my_token_only(
+    source_outputs: list[Any],
+    ctx: OrchestratorInputContext,
+) -> list[OmniTokensPrompt]:
+    """Upstream outputs -> next-stage token prompts (C1 contract)."""
+    ...
+```
+
+`OrchestratorInputContext` carries the transition metadata and deliberately has
+no `model_config` field (a processor that needs the model config reads it
+through the upstream stage closure, never through this context):
+
+```python
+@dataclass(frozen=True)
+class OrchestratorInputContext:
+    prompt: Any | None = None
+    requires_multimodal_data: bool = False
+    streaming_context: Any | None = None
+    sampling_params: Any | None = None
+```
+
+Processors that already accept `ctx` are used unchanged. Legacy positional
+shapes (C0 3-arg, C2 placeholder with `streaming_context`, C3 diffusion with
+`sampling_params`, C4 `moss_tts.talker2codec` multi-source) are adapted by
+`wrap_orchestrator_processor` / `invoke_orchestrator_processor` and emit a
+`DeprecationWarning`.
+
+### Registry and startup validation
+
+The registry performs **signature-level structural checks only** — it never
+executes processor logic and never loads model weights. Kind inference is
+name-driven (suffix-based):
+
+- `register_processor(path, kind)` — manual kind override for names that do not
+  follow the suffix convention (escape hatch; overrides are validated eagerly).
+- `infer_kind(fn, *, path)` — suffix rules: `_token_only` ->
+  `placeholder_prompt_builder`, `_full_payload` / `_batch` ->
+  `producer_full_payload`, `_async_chunk` -> `producer_async_chunk`, diffusion
+  suffixes -> `diffusion_input_builder`, no suffix ->
+  `legacy_orchestrator_builder`, `moss_tts.talker2codec` ->
+  `legacy_multi_source`.
+- `validate_processor(fn, *, kind, path, stage_config=None)` — hard contract
+  violations raise `ProcessorValidationError`; soft mismatches emit a
+  `RuntimeWarning`.
+- `resolve_processor(path, *, expected_kind=None, stage_config=None)` — the
+  drop-in replacement for the legacy `getattr(importlib.import_module(...), ...)`
+  lookups: imports, infers, validates, optionally checks `expected_kind`, and
+  returns a `ProcessorSpec` whose `fn` is the same callable the legacy lookup
+  produced.
+
+### Dual entry: forward and prewarm placeholders
+
+The `*_token_only` placeholder builder is exposed through two entry points so
+the sync forward path and the async-chunk prewarm path share the same `_common`
+length / packing helpers:
+
+- `build_forward_placeholder(source_outputs, ctx)` — the non-async forward
+  path. One placeholder `OmniTokensPrompt` per upstream output, sized by
+  `_common.compute_placeholder_prompt_len(mode="full")`.
+- `build_prewarm_placeholder(*, stage0_prompt, ctx, downstream_stage_id)` —
+  async-chunk mode has no upstream `source_outputs` yet at prewarm time, so the
+  length is a best-effort estimate from the stage-0 input prompt
+  (`mode="stage0_only"`, i.e. `len(stage0_prompt)`). The connector fixup path
+  (`adapter.construct_next_stage_streaming_input_prompt`) replaces the estimate
+  with the real length once the upstream chunk arrives.
+
+The orchestrator routes prewarm through `_prewarm_async_chunk_stages`, which
+reads `build_prewarm_placeholder` off the resolved `*_token_only` function
+object (both builders are attached as attributes on the exported function).
+
+### Three-state async gate
+
+The orchestrator only forwards via `process_engine_inputs` when the transition
+is not served by the async-chunk data plane:
+
+```python
+if (
+    (finished or segment_finished)
+    and stage_id < req_state.final_stage_id
+    and (not self.async_chunk or not self._stage_receives_async_chunks(stage_id + 1))
+    and (not self._next_stage_already_submitted(stage_id, req_state) or req_state.streaming.enabled)
+):
+```
+
+`_stage_receives_async_chunks(stage_id)` reports whether a stage's connector
+supplies its runtime inputs. When `async_chunk=true` and the downstream stage
+receives async chunks, the orchestrator skips `process_engine_inputs` for that
+transition, so the corresponding input processor may be dead for the duration
+of the request. `dead_processor_hint` is a pure decision helper (for warnings
+and tests only); the runtime is warn-first in the M0 phase.
+
+### Producer keyword contract
+
+Producer-side builders never receive an `OrchestratorInputContext`; their
+keyword-only parameters are load-bearing parts of the connector data plane and
+must not be renamed or made positional:
+
+```python
+def my_full_payload(
+    *,
+    transfer_manager: Any,
+    pooling_output: Any,
+    request: Any,
+    is_finished: bool = ...,  # optional: the worker retries without it
+) -> Any: ...
+
+
+def my_async_chunk(
+    *,
+    transfer_manager: Any,
+    multimodal_output: Any,
+    request: Any,
+    is_finished: bool = False,  # required: the scheduler always passes it
+) -> Any: ...
+```
+
+`pooling_output` (full payload) and `multimodal_output` (async chunk) are
+cross-checked by `validate_processor`; using the wrong keyword name for a kind
+is flagged as a structural warning.
 
 ## Related Files
 

@@ -22,6 +22,10 @@ from vllm_omni.distributed.omni_connectors.utils.config import (
 )
 from vllm_omni.distributed.omni_connectors.utils.initialization import resolve_connector_spec
 from vllm_omni.distributed.omni_connectors.utils.kv_utils import get_local_tp_rank, get_omni_replica_id
+from vllm_omni.model_executor.stage_input_processors import (
+    ProcessorValidationError,
+    resolve_processor,
+)
 from vllm_omni.outputs import OmniConnectorOutput
 
 logger = init_logger("vllm_omni.worker.omni_connector_model_runner_mixin")
@@ -609,6 +613,14 @@ class _OmniConnectorRuntimeMixin:
         ``custom_process_input_func`` (for example ``thinker2talker``), while the
         connector payload builder lives beside it as ``thinker2talker_full_payload``.
         In that case, derive the full_payload_mode builder path automatically.
+
+        The loader accepts both supported payload contracts: full-payload
+        builders name their runner payload ``pooling_output`` while async-chunk
+        builders name it ``multimodal_output`` (see
+        :meth:`_connector_payload_kwarg`).  The acceptance gate is the mixin's
+        structural validator, not the registry's name-driven kind inference, so
+        an explicitly configured, structurally compatible hook is never
+        rejected solely because of its name.
         """
         candidates: list[str] = []
 
@@ -636,18 +648,26 @@ class _OmniConnectorRuntimeMixin:
                 continue
             tried.add(func_path)
             try:
-                module_path, func_name = func_path.rsplit(".", 1)
-                module = importlib.import_module(module_path)
-                func = getattr(module, func_name, None)
-                if callable(func):
-                    if not cls._is_connector_payload_builder(func):
-                        logger.debug(
-                            "Skipping incompatible connector payload hook %s; signature=%s",
-                            func_path,
-                            inspect.signature(func),
-                        )
-                        continue
-                    return func_path, func
+                # Resolve + run the registry's structural validation.  No
+                # expected_kind is passed: a caller-configured hook may carry
+                # any name, and the payload-contract check below is the
+                # authoritative acceptance gate.
+                spec = resolve_processor(func_path)
+                if not cls._is_connector_payload_builder(spec.fn):
+                    logger.debug(
+                        "Skipping incompatible connector payload hook %s; signature=%s",
+                        func_path,
+                        inspect.signature(spec.fn),
+                    )
+                    continue
+                return spec.path, spec.fn
+            except ProcessorValidationError as exc:
+                logger.debug(
+                    "Skipping incompatible connector payload hook %s: %s",
+                    func_path,
+                    exc,
+                )
+                continue
             except Exception:
                 logger.warning("Failed to load custom func: %s", func_path, exc_info=True)
 

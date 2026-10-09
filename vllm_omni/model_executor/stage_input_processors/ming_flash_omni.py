@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # Copyright 2025 The vLLM-Omni team.
 """Stage input processors for Ming-flash-omni-2.0 multi-stage pipeline."""
 
@@ -13,6 +14,7 @@ import torch
 from vllm.inputs import TextPrompt
 
 from vllm_omni.inputs.data import OmniTokensPrompt
+from vllm_omni.model_executor.stage_input_processors import _common
 
 logger = logging.getLogger(__name__)
 
@@ -204,14 +206,11 @@ def _resolve_image_patch_token_id(stage: Any) -> int:
 
 
 def _ensure_list(x) -> list[int]:
-    """Convert ConstantList / tensor-like to plain list."""
-    if hasattr(x, "_x"):
-        return list(x._x)
-    if isinstance(x, list):
-        return x
-    if hasattr(x, "tolist"):
-        return x.tolist()
-    return list(x)
+    """Convert ConstantList / tensor-like to plain list.
+
+    Delegates to the canonical ``_common.ensure_list_strict``.
+    """
+    return _common.ensure_list_strict(x)
 
 
 def _slice_patch_hidden(
@@ -242,7 +241,7 @@ def _slice_patch_hidden(
         logger.warning("[thinker2imagegen] %s: missing final_hidden_states (keys=%s)", tag, list(mm_out.keys()))
         return None
 
-    prompt_ids = _ensure_list(thinker_output.prompt_token_ids)
+    prompt_ids = _common.ensure_list_strict(thinker_output.prompt_token_ids)
     prompt_ids_t = torch.tensor(prompt_ids, dtype=torch.long, device=full_hidden.device)
     patch_indices = (prompt_ids_t == image_patch_token_id).nonzero(as_tuple=False).squeeze(-1)
     total_patches = int(patch_indices.numel())

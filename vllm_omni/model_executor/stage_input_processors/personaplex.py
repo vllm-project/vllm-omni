@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Talker -> Code2Wav input processors for PersonaPlex.
 
 The talker (stage 0) emits, per frame, the ``dep_q`` depformer audio codes under
@@ -130,8 +130,6 @@ def talker2code2wav_full_payload(
         getattr(request, "additional_information_cpu", None),
         pooling_output,
         # Temporary compatibility shim for the two producer call contracts.
-        # Remove after https://github.com/vllm-project/vllm-omni/issues/4872
-        # provides validated full-payload and async-chunk processor protocols.
         kwargs.get("multimodal_output"),
     ):
         audio = _codes_from(source)
