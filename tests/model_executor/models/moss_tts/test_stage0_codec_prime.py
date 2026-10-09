@@ -75,14 +75,15 @@ def test_trim_only_delivered_frame_without_losing_causal_history(first):
     d = decoder()
     first_output = call(d, "a", [1, 2], first=first)
     expected = torch.tensor([[3.0], [3.0]])[:, 1:] if first else torch.tensor([[3.0], [3.0]])
-    torch.testing.assert_close(first_output["model_outputs"][0], expected)
+    assert first_output["audio_channels_last"]
+    torch.testing.assert_close(first_output["model_outputs"][0], expected.T)
     rest = call(d, "a", [2, 3], finished=True)
-    torch.testing.assert_close(rest["model_outputs"][0], torch.tensor([[8.0], [8.0]]))
+    torch.testing.assert_close(rest["model_outputs"][0], torch.tensor([[8.0, 8.0]]))
     if first:
         assert bool(rest[FIRST_AUDIO_REQUIRED_KEY][0])
     assert not d._stream_req_slots and not d._stream_first_audio_requests
     reused = call(d, "new", [1, 2], finished=True)
-    torch.testing.assert_close(reused["model_outputs"][0], torch.tensor([[3.0], [3.0]]))
+    torch.testing.assert_close(reused["model_outputs"][0], torch.tensor([[3.0, 3.0]]))
 
 
 def test_empty_terminal_keeps_ordering_promise_until_cleanup():

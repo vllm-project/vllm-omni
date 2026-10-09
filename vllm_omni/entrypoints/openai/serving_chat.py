@@ -155,7 +155,7 @@ from vllm_omni.errors import OmniClientError
 from vllm_omni.lora.request import LoRARequest
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.outputs.output_metadata import DiffusionMetadataMapping, DiffusionMetadataValue
-from vllm_omni.utils.audio import audio_chunk_pcm_bytes, audio_chunk_sample_rate
+from vllm_omni.utils.audio import audio_channels_first, audio_chunk_pcm_bytes, audio_chunk_sample_rate
 
 logger = init_logger(__name__)
 
@@ -2937,7 +2937,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         # back to the no-audio error response instead of an AttributeError 500
         # when the pipeline produced no audio for this request.
         mm_output = getattr(final_res.outputs[0], "multimodal_output", None) or {}
-        audio_data = mm_output.get("audio")
+        audio_data = audio_channels_first(mm_output.get("audio"), mm_output.get("audio_channels_last", False))
         if isinstance(audio_data, list):
             if not audio_data:
                 audio_tensor = None

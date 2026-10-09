@@ -130,6 +130,10 @@ def test_submit_reports_only_requests_with_a_prepared_route(monkeypatch, client_
     # Exercise the routing contract without allocating CUDA or pinned memory.
     original_empty = torch.empty
     monkeypatch.setattr(torch, "empty", lambda *args, pin_memory=False, **kwargs: original_empty(*args, **kwargs))
+    original_empty_like = torch.empty_like
+    monkeypatch.setattr(
+        torch, "empty_like", lambda *args, pin_memory=False, **kwargs: original_empty_like(*args, **kwargs)
+    )
     monkeypatch.setattr(torch.cuda, "Event", _DoneEvent)
     output_queue: queue.Queue = queue.Queue()
     sender = FirstAudioSender(engine_output_queue_sink(output_queue, _scheduler(kept=client_index)))
@@ -154,6 +158,7 @@ def test_submit_without_any_route_leaves_audio_to_the_codec(monkeypatch):
         pytest.fail("No delivery is possible; do not start a device copy")
 
     monkeypatch.setattr(torch, "empty", unexpected_copy)
+    monkeypatch.setattr(torch, "empty_like", unexpected_copy)
     monkeypatch.setattr(torch.cuda, "Event", unexpected_copy)
     output_queue: queue.Queue = queue.Queue()
     sender = FirstAudioSender(engine_output_queue_sink(output_queue, _scheduler()))

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """Audio utility functions shared across models and entrypoints."""
 
@@ -9,6 +9,17 @@ from torchaudio.functional import melscale_fbanks
 
 from vllm_omni.metrics import definitions as _metric_defs
 from vllm_omni.outputs import OmniRequestOutput
+
+
+def audio_channels_first(
+    audio: torch.Tensor | np.ndarray | list | None, channels_last: bool = False
+) -> torch.Tensor | np.ndarray | list | None:
+    """Restore the waveform convention from interleaved transport using views."""
+    if not channels_last:
+        return audio
+    if isinstance(audio, list):
+        return [audio_channels_first(chunk, True) for chunk in audio]
+    return audio.swapaxes(-1, -2) if audio is not None and audio.ndim == 2 else audio
 
 
 def mel_filter_bank(

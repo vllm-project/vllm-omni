@@ -368,3 +368,48 @@ def test_float32_pcm_fast_path_matches_soundfile(channels):
         expected = buffer.getvalue()
     assert _float32_to_pcm16_bytes(audio) == expected
     np.testing.assert_array_equal(audio, original)
+
+
+@pytest.mark.parametrize("frames", [1, 7, 3840])
+def test_interleaved_codec_audio_survives_transport_and_accumulation(frames):
+    import queue
+    from types import SimpleNamespace
+
+    from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
+
+    from vllm_omni.engine import OmniEngineCoreOutputs
+    from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
+    from vllm_omni.model_executor.models.moss_tts.audio_tokenizer_v2 import MossAudioTokenizerModel
+    from vllm_omni.outputs.output_modality import OutputModality
+    from vllm_omni.worker_v2.first_audio_sender import engine_output_queue_sink
+
+    raw = torch.linspace(-1.2, 1.2, 2 * frames).reshape(1, 1, -1)
+    codec = SimpleNamespace(number_channels=2, enable_channel_interleave=True)
+    audio, _ = MossAudioTokenizerModel._restore_channels_from_codec(codec, raw, torch.tensor([2 * frames]))
+    assert audio[0].T.is_contiguous()
+    queue_out: queue.Queue = queue.Queue()
+    scheduler = SimpleNamespace(requests={"a": SimpleNamespace(client_index=0)})
+    sink = engine_output_queue_sink(queue_out, scheduler)
+    sink.prepare(["a"])(["a"], [audio[0]], torch.tensor(48000))
+    _, outputs = queue_out.get_nowait()
+    decoded = MsgpackDecoder(OmniEngineCoreOutputs).decode(MsgpackEncoder().encode(outputs))
+    payload = decoded.outputs[0].multimodal_output
+    assert payload["model_outputs"].is_contiguous()
+    accumulated = MultimodalPayload()
+    for _ in range(2):
+        accumulated = accumulated.merged_with(MultimodalPayload.from_raw(payload, "audio"))
+    accumulated.consolidate_tensors(OutputModality.AUDIO)
+    completion = MultimodalCompletionOutput(
+        multimodal_output=accumulated, index=0, text="", token_ids=[], cumulative_logprob=None, logprobs=None
+    )
+    mm, key = OmniOpenAIServingSpeech._extract_audio_output(completion)
+    waveform = mm[key].numpy()
+    assert waveform.shape == (2, 2 * frames)
+    assert waveform.T.flags.c_contiguous
+    result = AudioMixin().create_audio(
+        CreateAudio(audio_tensor=waveform, sample_rate=48000, response_format="pcm", base64_encode=False)
+    )
+    expected = raw.reshape(frames, 2).repeat(2, 1).numpy()
+    with BytesIO() as buffer:
+        soundfile.write(buffer, expected, 48000, format="RAW", subtype="PCM_16")
+        assert result.audio_data == buffer.getvalue()

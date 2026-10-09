@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Offline inference example for MOSS-TTS variants.
 
 Covers six models:
@@ -26,6 +29,8 @@ import sys
 
 import soundfile as sf
 import torch
+
+from vllm_omni.utils.audio import audio_channels_first
 
 
 def _load_ref_audio(path: str, target_sr: int = 24000) -> torch.Tensor:
@@ -321,6 +326,7 @@ def run_tts(args: argparse.Namespace) -> None:
             wav = mm.get("model_outputs")
         if wav is None:
             continue
+        wav = audio_channels_first(wav, mm.get("audio_channels_last", False))
         # Local-v1.5's codec emits stereo chunks shaped (C, T); keep the
         # channel axis intact (don't flatten) so concatenation below stays
         # along the time axis. Mono variants stay (T,) as before.

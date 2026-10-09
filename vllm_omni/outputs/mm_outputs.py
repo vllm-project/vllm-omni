@@ -29,7 +29,7 @@ logger = init_logger(__name__)
 # arrive as 0-d torch.Tensors — from_dict routes all tensors into .tensors,
 # so we relocate them to .metadata before consolidation to avoid a bogus
 # torch.cat attempt and its warn-and-keep-last fallback.
-_METADATA_TENSOR_KEYS: frozenset[str] = frozenset({"sr", "sample_rate", "audio_sample_rate"})
+_METADATA_TENSOR_KEYS: frozenset[str] = frozenset({"sr", "sample_rate", "audio_sample_rate", "audio_channels_last"})
 
 
 def _cat_tensors(
@@ -198,6 +198,8 @@ class MultimodalPayload(Mapping):
         for key, value in list(self.tensors.items()):
             if _is_tensor_list(value):
                 strategy = get_accumulation_strategy(modality, key)
+                if key in ("audio", "model_outputs") and self.metadata.get("audio_channels_last", False):
+                    strategy = TensorAccumulationStrategy.CONCAT_DIM0
                 self.tensors[key] = _consolidate_tensor_list(key, value, strategy)
 
     def consolidate_metadata(self) -> None:

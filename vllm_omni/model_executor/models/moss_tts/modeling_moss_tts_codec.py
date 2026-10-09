@@ -451,7 +451,8 @@ class _MossCodecStreamSession:
                     row += 1
                     continue
                 end = row + 1
-                if end < len(slots) and destination.is_contiguous():
+                dense = destination.is_contiguous() or (destination.ndim == 2 and destination.T.is_contiguous())
+                if end < len(slots) and dense:
                     storage = destination.untyped_storage().data_ptr()
                     offset = destination.storage_offset()
                     row_elements = destination.numel()
@@ -462,7 +463,7 @@ class _MossCodecStreamSession:
                             and following.shape == destination.shape
                             and following.dtype == destination.dtype
                             and following.device == destination.device
-                            and following.is_contiguous()
+                            and following.stride() == destination.stride()
                             and following.untyped_storage().data_ptr() == storage
                             and following.storage_offset() == offset + (end - row) * row_elements
                         ):
@@ -496,7 +497,7 @@ class _MossCodecStreamSession:
         out: dict[int, torch.Tensor] = {}
         for row, slot in enumerate(slots):
             audio_length = int(slot_codes[slot].shape[1]) * self._samples_per_frame
-            out[slot] = audio[row, ..., :audio_length].contiguous()
+            out[slot] = audio[row, ..., :audio_length]
         return out
 
 
@@ -676,8 +677,9 @@ class MossTTSCodecDecoder(nn.Module):
         Returns
         -------
         OmniOutput with:
-          multimodal_outputs["model_outputs"] — list of (T_wav,) float32 tensors
+          multimodal_outputs["model_outputs"] — list of (T_wav,) or (T_wav, C) float32 tensors
           multimodal_outputs["sr"]            — list of scalar int32 tensors
+          multimodal_outputs["audio_channels_last"] — true for this transport layout
         """
         sr_tensor = self._sr_tensor
         empty = self._empty_audio()
@@ -689,19 +691,13 @@ class MossTTSCodecDecoder(nn.Module):
             logger.warning("MossTTSCodecDecoder called before load_weights(); returning silence.")
             return OmniOutput(
                 text_hidden_states=None,
-                multimodal_outputs={
-                    "model_outputs": [empty] * num_req,
-                    "sr": [sr_tensor] * num_req,
-                },
+                multimodal_outputs=self._audio_payload([empty] * num_req, [sr_tensor] * num_req, first_audio_flags),
             )
 
         if self._async_chunk and runtime_additional_information is None:
             return OmniOutput(
                 text_hidden_states=None,
-                multimodal_outputs={
-                    "model_outputs": [empty] * num_req,
-                    "sr": [sr_tensor] * num_req,
-                },
+                multimodal_outputs=self._audio_payload([empty] * num_req, [sr_tensor] * num_req, first_audio_flags),
             )
 
         audios: list[torch.Tensor] = [empty] * num_req
@@ -712,11 +708,7 @@ class MossTTSCodecDecoder(nn.Module):
         if input_ids is None or input_ids.numel() == 0:
             return OmniOutput(
                 text_hidden_states=None,
-                multimodal_outputs={
-                    "model_outputs": audios,
-                    "sr": srs,
-                    **self._first_audio_metadata(first_audio_flags),
-                },
+                multimodal_outputs=self._audio_payload(audios, srs, first_audio_flags),
             )
 
         # ``input_ids`` is concatenated across all requests. vLLM-Omni runners
@@ -840,8 +832,10 @@ class MossTTSCodecDecoder(nn.Module):
                     for output_index, _, codes_nq_t, _ in streaming_work:
                         samples = int(codes_nq_t.shape[1]) * self._codec.downsample_rate
                         elements = samples * (self._n_channels if self._n_channels > 1 else 1)
-                        shape = (self._n_channels, samples) if self._n_channels > 1 else (samples,)
-                        stream_output_buffers[output_index] = stream_output_slab.narrow(0, offset, elements).view(shape)
+                        buffer = stream_output_slab.narrow(0, offset, elements)
+                        stream_output_buffers[output_index] = (
+                            buffer.view(samples, self._n_channels).T if self._n_channels > 1 else buffer
+                        )
                         offset += elements
             for i, wav in self._decode_streaming_batch(
                 streaming_work,
@@ -851,7 +845,7 @@ class MossTTSCodecDecoder(nn.Module):
                     wav = wav[..., int(self._codec.downsample_rate) :]
                 audios[i] = wav.reshape(-1) if wav.ndim == 1 or int(wav.shape[0]) == 1 else wav
 
-        payload = {"model_outputs": audios, "sr": srs, **self._first_audio_metadata(first_audio_flags)}
+        payload = self._audio_payload(audios, srs, first_audio_flags)
         if self._gpu_stream_output and device.type == "cuda":
             # One transfer per dtype/device preserves ragged request lengths
             # without issuing one D2H per waveform. A fresh slot owns each
@@ -860,6 +854,18 @@ class MossTTSCodecDecoder(nn.Module):
             if packed is not None:
                 payload = packed
         return OmniOutput(text_hidden_states=None, multimodal_outputs=payload)
+
+    def _audio_payload(
+        self, audios: list[torch.Tensor], sample_rates: list[torch.Tensor], first_audio_flags: list[bool]
+    ) -> dict[str, torch.Tensor | list[torch.Tensor]]:
+        # IPC serializes tensors in row-major order. Send time-major views so
+        # the decoder's interleaved storage survives packing and serialization.
+        return {
+            "model_outputs": [audio.T if audio.ndim == 2 else audio for audio in audios],
+            "sr": sample_rates,
+            "audio_channels_last": torch.tensor(True),
+            **self._first_audio_metadata(first_audio_flags),
+        }
 
     def _first_audio_flags(self, infos):
         flags = []

@@ -69,6 +69,7 @@ from vllm_omni.entrypoints.openai.tts_adapters import (
 from vllm_omni.entrypoints.utils import coerce_param_message_types
 from vllm_omni.metrics.modality import observe_audio_first_packet, observe_audio_streaming_finalize
 from vllm_omni.outputs import OmniRequestOutput
+from vllm_omni.utils.audio import audio_channels_first
 from vllm_omni.utils.speaker_cache import get_speaker_cache
 
 logger = init_logger(__name__)
@@ -1969,7 +1970,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 )
             ) as chunks:
                 async for chunk in chunks:
-                    payload = {
+                    payload: dict[str, str | int] = {
                         "type": "speech.audio.delta",
                         "audio": base64.b64encode(chunk).decode("ascii"),
                         "response_format": response_format,
@@ -2039,6 +2040,12 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         if not mm:
             return None, None
         key = "audio" if "audio" in mm else ("model_outputs" if "model_outputs" in mm else None)
+        if key is not None and mm.get("audio_channels_last", False):
+            # Keep the existing channel-first processing contract as a view;
+            # create_audio's transpose recovers contiguous interleaved input.
+            mm = dict(mm)
+            mm[key] = audio_channels_first(mm[key], True)
+            mm.pop("audio_channels_last")
         return mm, key
 
     async def _prepare_speech_generation(

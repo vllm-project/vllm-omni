@@ -2126,12 +2126,13 @@ class MossAudioTokenizerModel(MossAudioTokenizerPreTrainedModel):
         if self.number_channels == 1 or not self.enable_channel_interleave:
             return output_values.float(), output_lengths
 
+        # Preserve the interleaved storage while exposing the channel-first
+        # waveform contract; transport can recover time-major contiguous views.
         output_values = (
             output_values.squeeze(1)
             .contiguous()
             .view(output_values.shape[0], -1, self.number_channels)
             .transpose(1, 2)
-            .contiguous()
             .float()
         )
         output_lengths = torch.div(output_lengths, self.number_channels, rounding_mode="floor")

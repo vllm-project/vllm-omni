@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """stage input processor for a forced-aligner stage.
 
 Bridges a Code2Wav (audio) stage to a pooling forced-aligner stage:
@@ -88,11 +88,14 @@ def decode_pooling_output(logits: Any, request: Any, hf_config: Any) -> Any:
 
 def _extract_waveform(multimodal_output: dict[str, Any]) -> tuple[np.ndarray, int]:
     """Pull a mono float32 waveform + sample rate from a Code2Wav output."""
+    from vllm_omni.utils.audio import audio_channels_first
+
     wav = multimodal_output.get("audio")
     if wav is None:
         wav = multimodal_output.get("model_outputs")
     if isinstance(wav, list):
         wav = wav[0] if wav else None
+    wav = audio_channels_first(wav, multimodal_output.get("audio_channels_last", False))
     if isinstance(wav, torch.Tensor):
         wav_np = wav.detach().cpu().to(torch.float32).flatten().numpy()
     elif isinstance(wav, np.ndarray):

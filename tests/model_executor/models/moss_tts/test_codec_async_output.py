@@ -190,7 +190,9 @@ def test_replays_terminal_tails_and_slot_reuse_preserve_pending_waveforms(v2, ch
             expected = 2 * value * torch.arange(1, frames + 1, dtype=torch.float32)
             if channels > 1:
                 expected = expected[None] * torch.arange(1, channels + 1)[:, None]
+                expected = expected.T
             torch.testing.assert_close(rows[index]["model_outputs"], expected, rtol=0, atol=0)
+            assert rows[index]["audio_channels_last"]
             assert rows[index]["sr"].item() == 48_000
 
 
@@ -210,9 +212,9 @@ def test_owned_input_copy_clamps_entire_ragged_batch():
     cpu = _async_copy_mm(output.multimodal_outputs, 0, pin_memory=True)
     torch.accelerator.synchronize()
     expected = torch.tensor([[0.0, 1025.0, 2049.0], [0.0, 2050.0, 4098.0]])
-    torch.testing.assert_close(cpu["model_outputs"][0], expected, rtol=0, atol=0)
+    torch.testing.assert_close(cpu["model_outputs"][0], expected.T, rtol=0, atol=0)
     assert cpu["model_outputs"][1].numel() == 0
-    torch.testing.assert_close(cpu["model_outputs"][2], torch.tensor([[1023.0], [2046.0]]), rtol=0, atol=0)
+    torch.testing.assert_close(cpu["model_outputs"][2], torch.tensor([[1023.0, 2046.0]]), rtol=0, atol=0)
     decoder.on_requests_finished(["a", "b"])
 
 
@@ -306,14 +308,18 @@ def test_short_terminal_row_crops_each_channel_into_output_slab(channels):
 
 @pytest.mark.cuda
 @pytest.mark.parametrize("channels", [1, 2])
-@pytest.mark.parametrize("layout", ["adjacent", "strided", "gapped"])
+@pytest.mark.parametrize("layout", ["adjacent", "strided", "gapped", "interleaved"])
 @torch.no_grad()
 def test_batched_output_copy_preserves_rows_and_slab_ownership(channels, layout):
     decoder = make_decoder(device="cuda", channels=channels)
     session = decoder._ensure_stream_session()
     slots = [session.acquire() for _ in range(4)]
     slab = torch.full((6 if layout == "gapped" else 4, channels, 6), -1.0, device="cuda")
-    if layout == "gapped":
+    if layout == "interleaved":
+        slab = slab.view(4, 6, channels).transpose(1, 2)
+        buffers = {slot: slab[row] for row, slot in enumerate(slots)}
+        frames = 6
+    elif layout == "gapped":
         buffers = {slot: slab[row] for row, slot in zip([0, 1, 3, 4], slots, strict=True)}
         frames = 6
     elif layout == "adjacent":

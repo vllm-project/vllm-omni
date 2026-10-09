@@ -76,7 +76,7 @@ class FirstAudioSender:
         accepted = list(delivery.routes)
         if not accepted:
             return []
-        host = torch.empty(pcm.shape, dtype=pcm.dtype, pin_memory=True)
+        host = torch.empty_like(pcm, device="cpu", pin_memory=True)
         host.copy_(pcm, non_blocking=True)
         host_valid = None
         if valid is not None:
@@ -143,6 +143,9 @@ class _EngineOutputSink:
             if request_id not in routes:
                 continue
             payload = {"model_outputs": pcm, "sr": sample_rate, FIRST_AUDIO_KEY: torch.tensor(True)}
+            if pcm.ndim == 2:
+                payload["model_outputs"] = pcm.T
+                payload["audio_channels_last"] = torch.tensor(True)
             by_client.setdefault(routes[request_id], []).append(
                 OmniEngineCoreOutput(
                     request_id=request_id,
