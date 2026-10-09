@@ -24,8 +24,10 @@ requests (`max_num_seqs: 8`) and one image per request
 (`num_outputs_per_prompt: 1`). TeaCache and Cache-DiT are optional alternative
 cache backends in request mode. Enable TeaCache with `--cache-backend tea_cache`
 as shown below, or enable Cache-DiT using the commented settings in that YAML.
-Compilation, DiT quantization, parallelism, and offload are not enabled by
-these presets.
+To compile the DiT blocks with regional `torch.compile`, set Stage 1
+`enforce_eager: false` in that YAML (see the commented line next to the
+Cache-DiT settings); it can be combined with Cache-DiT. DiT quantization,
+parallelism, and offload are not enabled by these presets.
 
 To use step execution and continuous batching, select
 [`mammoth_moda2_step.yaml`](../../vllm_omni/deploy/mammoth_moda2_step.yaml)
