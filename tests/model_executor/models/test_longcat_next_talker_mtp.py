@@ -63,7 +63,9 @@ class _StubModel(nn.Module):
     _sample_depth_codes = M._sample_depth_codes
     _sample_depth_head = M._sample_depth_head
     _sample_cfg_visual_codes = M._sample_cfg_visual_codes
-    _append_past_code = M._append_past_code
+    # M._append_past_code is a @staticmethod: binding it as a plain class
+    # attribute would re-wrap it as an instance method (self injected twice).
+    _append_past_code = staticmethod(M._append_past_code)
     _ensure_replicated_audio_code_embedding = M._ensure_replicated_audio_code_embedding
     _ensure_audio_code_embed_module = M._ensure_audio_code_embed_module
     _ensure_replicated_visual_code_embedding = M._ensure_replicated_visual_code_embedding
@@ -961,6 +963,9 @@ class _LogitsModel:
     __init__ signature must match what the test calls (no args for fixture).
     """
 
+    # compute_logits delegates row forcing to the real method.
+    _force_gen_row = mln.LongcatNextForCausalLM._force_gen_row
+
     def __init__(self):
         self._audio_gen: dict = {}
         self._visual_gen: dict = {}
@@ -1085,3 +1090,53 @@ class TestComputeLogits:
         assert out[0, logits_model._eos_id] == float("-inf")
         assert out[0, _AUDIOGEN_END_TOKEN_ID] == 0.0
         assert out[1, logits_model._eos_id] == float("-inf")  # active: suppressed
+
+    # -- _logits_row_req_ids: authoritative row -> request map ------------- #
+
+    def test_stashed_row_order_forces_only_gen_rows_in_mixed_batch(self, logits_model):
+        """A gen request can share a decode step with a plain-text request.
+
+        The runner stashes the batch's row order in _logits_row_req_ids;
+        compute_logits must force only the gen request's row and leave the
+        plain-text row's EOS alone (gen-dict insertion order alone would
+        misforce row 0 here, killing the text request's EOS).
+        """
+        _add_audio_state(logits_model, "gen")  # dict insertion order puts "gen" first
+        logits_model._logits_row_req_ids = ["plain", "gen"]
+        hidden = torch.zeros(2, 4096)
+        out = M.compute_logits(logits_model, hidden)
+        assert out[0, logits_model._eos_id] != float("-inf")  # plain row untouched
+        assert out[1, logits_model._eos_id] == float("-inf")  # gen row suppressed
+
+    def test_stashed_row_order_ignores_dict_insertion_order(self, logits_model):
+        """Row forcing follows the stash, not _audio_gen insertion order."""
+        _add_audio_state(logits_model, "r_a")
+        _add_audio_state(logits_model, "r_b", terminal=True)
+        logits_model._logits_row_req_ids = ["r_b", "r_a"]  # reverse of dict order
+        hidden = torch.zeros(2, 4096)
+        out = M.compute_logits(logits_model, hidden)
+        assert out[0, _AUDIOGEN_END_TOKEN_ID] == 0.0  # terminal r_b is row 0
+        assert (out[0, :] == float("-inf")).sum() >= self.VOCAB - 2
+        # active r_a is row 1: EOS-only suppression, rest of the row untouched
+        assert out[1, logits_model._eos_id] == float("-inf")
+        assert (out[1, :] == float("-inf")).sum() < 10
+
+    def test_mismatched_stash_length_falls_back_to_gen_only(self, logits_model):
+        """Stale/foreign-length stash (e.g. prefill-shaped call) must not be
+        trusted: fall back to the conservative gen-only path."""
+        _add_audio_state(logits_model, "r0")
+        _add_audio_state(logits_model, "r1")
+        logits_model._logits_row_req_ids = ["r0"]  # wrong length on purpose
+        hidden = torch.zeros(2, 4096)
+        out = M.compute_logits(logits_model, hidden)
+        assert out[0, logits_model._eos_id] == float("-inf")
+        assert out[1, logits_model._eos_id] == float("-inf")
+
+    def test_visual_state_forced_via_stash(self, logits_model):
+        logits_model._visual_gen["vis"] = {"terminal": False, "ext_id": 131108}
+        logits_model._logits_row_req_ids = ["plain", "vis"]
+        hidden = torch.zeros(2, 4096)
+        out = M.compute_logits(logits_model, hidden)
+        assert out[1, 131108] == 0.0
+        assert (out[1, :] == float("-inf")).sum() >= self.VOCAB - 2
+        assert out[0, logits_model._eos_id] != float("-inf")

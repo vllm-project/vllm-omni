@@ -179,37 +179,6 @@ def _build_terminal_empty_output(
     )
 
 
-def _coerce_int_scalar(value: Any) -> int:
-    if value is None:
-        return 0
-    if isinstance(value, (list, tuple)):
-        for item in value:
-            coerced = _coerce_int_scalar(item)
-            if coerced > 0:
-                return coerced
-        return 0
-    if hasattr(value, "item"):
-        value = value.item()
-    try:
-        coerced = int(value)
-    except (TypeError, ValueError):
-        return 0
-    return coerced if coerced > 0 else 0
-
-
-def _infer_stage_audio_sample_rate(stage_pool: StagePool, default: int = 24000) -> int:
-    """Infer the final audio stage sample rate from stage metadata when possible."""
-    sample_rate_attrs = ("audio_sample_rate", "sample_rate", "sampling_rate", "output_sample_rate", "sr")
-    stage_client = getattr(stage_pool, "stage_client", None)
-    stage_config = getattr(stage_pool, "_stage_vllm_config", None)
-    for source in (stage_client, stage_config):
-        for attr in sample_rate_attrs:
-            sample_rate = _coerce_int_scalar(getattr(source, attr, None))
-            if sample_rate > 0:
-                return sample_rate
-    return default
-
-
 def _remaining_max_tokens(
     model_config: ModelConfig,
     prompt_token_ids: list[int],

@@ -15,7 +15,7 @@ KV cache and fused MoE all apply. On top of that:
   <longcat_audiogen_start> is seen, the runner calls talker_mtp() per decode
   step, which runs the 8-level audio_head (rank 0 + broadcast, since the
   checkpoint hardcodes cuda:0) and accumulates codes into
-  model_intermediate_buffer["codes"]["audio"]. EOS suppression / forced
+  `model_intermediate_buffer["codes"]["audio"]`. EOS suppression / forced
   tokens live in compute_logits to work on the async-scheduling path.
 """
 
@@ -104,6 +104,11 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
     # n-gram hashing needs raw token ids, not embeddings -- upstream's
     # _prepare_mm_inputs otherwise sets input_ids=None on the mm path.
     requires_raw_input_tokens = True
+    # compute_logits needs the authoritative logits-row -> request map (the
+    # runner stashes it as _logits_row_req_ids before sampling): a decode step
+    # can batch a gen request with a plain-text request, and gen-dict
+    # insertion order is not batch row order.
+    accepts_logits_row_req_ids = True
 
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:
@@ -1449,48 +1454,58 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
         logits = self.logits_processor(self.lm_head, hidden_states)
         if logits is None or not (self._audio_gen or self._visual_gen):
             return logits
-        # Suppress EOS and force visible tokens during audio/image-gen. Skip
-        # in prefill (logits has many rows but at most 1 active-gen request)
-        # to avoid misaligning row 0. A request is in at most one of the two
-        # dicts, so dict union order gives an unambiguous row->request map.
-        req_ids = list(self._audio_gen.keys()) + list(self._visual_gen.keys())
-        if not req_ids:
-            return logits
+        # Suppress EOS and force visible tokens during audio/image-gen. The
+        # runner stashes the batch's logits-row order in _logits_row_req_ids
+        # (one row per scheduled request), so gen rows are forced and
+        # plain-text rows sharing the same decode step are left untouched.
         num_logits = logits.shape[0]
-        if num_logits != len(req_ids):
+        row_req_ids = getattr(self, "_logits_row_req_ids", None)
+        if row_req_ids is not None and len(row_req_ids) == num_logits:
+            for row, req_id in enumerate(row_req_ids):
+                self._force_gen_row(logits, row, req_id)
             return logits
-        for row in range(num_logits):
-            req_id = req_ids[row]
-            audio_state = self._audio_gen.get(req_id)
-            visual_state = self._visual_gen.get(req_id)
-            if audio_state is not None:
-                if audio_state.get("terminal"):
-                    # Force the closing tag instead of leaving EOS unbanned
-                    # with no replacement, which would end the whole request
-                    # instead of just closing this audio segment.
-                    if self._eos_id < logits.shape[-1]:
-                        logits[row, self._eos_id] = float("-inf")
-                    forced_id = audio_state.get("ext_id", AUDIOGEN_END_TOKEN_ID)
-                    logits[row, :] = float("-inf")
-                    logits[row, forced_id] = 0.0
-                    continue
-                # Ban EOS so it never terminates generation during audio
+        # Fallback when the row order is unknown (no runner stash, or a
+        # prefill-shaped call whose rows are not one-per-request): only safe
+        # when every row is a gen request and gen-dict order matches batch
+        # order, so bail out otherwise instead of misforcing a row.
+        req_ids = list(self._audio_gen.keys()) + list(self._visual_gen.keys())
+        if not req_ids or num_logits != len(req_ids):
+            return logits
+        for row, req_id in enumerate(req_ids):
+            self._force_gen_row(logits, row, req_id)
+        return logits
+
+    def _force_gen_row(self, logits: torch.Tensor, row: int, req_id: str) -> None:
+        """EOS-ban / force the visible-token stream on one gen request's row."""
+        audio_state = self._audio_gen.get(req_id)
+        visual_state = self._visual_gen.get(req_id)
+        if audio_state is not None:
+            if audio_state.get("terminal"):
+                # Force the closing tag instead of leaving EOS unbanned
+                # with no replacement, which would end the whole request
+                # instead of just closing this audio segment.
                 if self._eos_id < logits.shape[-1]:
                     logits[row, self._eos_id] = float("-inf")
-                if audio_state.get("text_end"):
-                    logits[row, :] = float("-inf")
-                    logits[row, AUDIOTEXT_PAD_TOKEN_ID] = 0.0
-            elif visual_state is not None:
-                # Image gen has no unforced phase: every GEN_IMAGE_STAGE step
-                # is forced (IMAGE_PAD/NEWLINE/END). The terminal grid-end step
-                # carries ext_id=IMAGE_END, closing the image with
-                # <longcat_img_end>, which pops the state next step.
-                if self._eos_id < logits.shape[-1]:
-                    logits[row, self._eos_id] = float("-inf")
-                forced_id = visual_state.get("ext_id", IMG_PAD_TOKEN_ID)
+                forced_id = audio_state.get("ext_id", AUDIOGEN_END_TOKEN_ID)
                 logits[row, :] = float("-inf")
                 logits[row, forced_id] = 0.0
-        return logits
+                return
+            # Ban EOS so it never terminates generation during audio
+            if self._eos_id < logits.shape[-1]:
+                logits[row, self._eos_id] = float("-inf")
+            if audio_state.get("text_end"):
+                logits[row, :] = float("-inf")
+                logits[row, AUDIOTEXT_PAD_TOKEN_ID] = 0.0
+        elif visual_state is not None:
+            # Image gen has no unforced phase: every GEN_IMAGE_STAGE step
+            # is forced (IMAGE_PAD/NEWLINE/END). The terminal grid-end step
+            # carries ext_id=IMAGE_END, closing the image with
+            # <longcat_img_end>, which pops the state next step.
+            if self._eos_id < logits.shape[-1]:
+                logits[row, self._eos_id] = float("-inf")
+            forced_id = visual_state.get("ext_id", IMG_PAD_TOKEN_ID)
+            logits[row, :] = float("-inf")
+            logits[row, forced_id] = 0.0
 
     def get_expert_mapping(self):
         return self.model.get_expert_mapping()

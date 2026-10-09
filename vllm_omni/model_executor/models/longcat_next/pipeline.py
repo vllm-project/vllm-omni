@@ -8,6 +8,7 @@ _PROC = "vllm_omni.model_executor.stage_input_processors.longcat_next"
 
 LONGCAT_NEXT_THINKER_ONLY_PIPELINE = PipelineConfig(
     model_type="longcat_next_thinker_only",
+    default_deploy_config_name="longcat_next_thinker_only.yaml",
     model_arch="LongcatNextForCausalLM",
     stages=(
         StagePipelineConfig(
@@ -43,6 +44,7 @@ LONGCAT_NEXT_THINKER_ONLY_PIPELINE = PipelineConfig(
 # real modality is decided by the prompt's trigger token, not this field.
 LONGCAT_NEXT_THINKER_MULTI_DECODER_PIPELINE = PipelineConfig(
     model_type="longcat_next_thinker_multi_decoder",
+    default_deploy_config_name="longcat_next_4gpu_80gb_multi_decoder.yaml",
     model_arch="LongcatNextForCausalLM",
     stages=(
         StagePipelineConfig(

@@ -57,6 +57,12 @@ def partition_flat_payload(
         root = key.split(".", 1)[0]
         if root in _CLIENT_MM_ROOT_KEYS:
             client_mm[key] = value
+            if root == "codes":
+                # codes.* must also ride the inter-stage channel: async_chunk
+                # code2wav/decoder stages (MOSS-TTS, MiniCPM-o-4.5, ...) read
+                # codes from the inter-stage payload, so routing them
+                # client-only would starve the downstream stage.
+                inter_stage[key] = value
         elif root == "meta" and "." in key and key.split(".", 1)[1] in _CLIENT_MM_META_KEYS:
             # Small final-output metadata needed by serving (for example
             # transcript text attached to audio) must ride with client MM
