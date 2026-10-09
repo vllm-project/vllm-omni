@@ -8,8 +8,8 @@ from dataclasses import replace
 import pytest
 
 from vllm_omni.engine.duplex.delivery import DuplexOutputBuffer, DuplexOutputOverflowError
-from vllm_omni.engine.duplex.events import AudioDelta, ResponseDone, SessionClosed, TranscriptDelta
-from vllm_omni.engine.duplex.realtime_events import RealtimeProjectionState, project_internal_event
+from vllm_omni.engine.duplex.projection import RealtimeProjectionState, project_internal_event
+from vllm_omni.protocol.duplex.events import AudioDelta, ResponseDone, SessionClosed, TranscriptDelta
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -25,7 +25,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 async def test_queued_response_creation_keeps_payload_and_byte_count(event_type, delta_field, content_field):
     state = RealtimeProjectionState(session_id="s")
     events = project_internal_event(state, {"type": "response.created", "response_id": "r", "modalities": ["text"]})
-    payloads = [event.to_realtime() for event in events]
+    payloads = [event.to_wire() for event in events]
     byte_count = sum(
         len(json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode()) for payload in payloads
     )
@@ -40,7 +40,7 @@ async def test_queued_response_creation_keeps_payload_and_byte_count(event_type,
     assert item["content"][0][content_field] == text
     assert output.pending_bytes == byte_count
     delivered = [await output.get() for _ in events]
-    assert [event.to_realtime() for event in delivered] == payloads
+    assert [event.to_wire() for event in delivered] == payloads
     assert output.pending_events == output.pending_bytes == 0
 
 

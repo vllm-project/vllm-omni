@@ -19,7 +19,6 @@ from tests.engine.duplex.test_session_runner import (
     types,
 )
 from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
-from vllm_omni.engine.duplex import commands
 from vllm_omni.engine.duplex.config import DuplexSessionConfig
 from vllm_omni.engine.duplex.delivery import DuplexOutputBuffer
 from vllm_omni.engine.duplex.messages import OpenDuplexSessionMessage
@@ -30,6 +29,7 @@ from vllm_omni.model_executor.models.nemotron_voicechat.nemotron_voicechat_think
     NemotronVoiceChatThinkerForConditionalGeneration as Thinker,
 )
 from vllm_omni.model_executor.models.nemotron_voicechat.pipeline import NEMOTRON_VOICECHAT_PIPELINE
+from vllm_omni.protocol.duplex import commands
 from vllm_omni.protocol.realtime.items import normalize_conversation_item
 from vllm_omni.utils.mm_outputs import build_mm_cpu
 from vllm_omni.worker.output.payload_build import build_omni_mm_payload

@@ -6,7 +6,7 @@ import base64
 import numpy as np
 import pytest
 
-from vllm_omni.engine.duplex.audio import convert_input_audio_with_rate
+from vllm_omni.protocol.duplex import convert_input_audio_with_rate
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 

@@ -12,7 +12,6 @@ from typing import Any
 
 import pytest
 
-from vllm_omni.engine.duplex.commands import Heartbeat
 from vllm_omni.engine.duplex.config import DuplexCapabilities, DuplexSessionConfig
 from vllm_omni.engine.duplex.delivery import DuplexOutputBuffer
 from vllm_omni.engine.duplex.messages import (
@@ -25,6 +24,7 @@ from vllm_omni.engine.duplex.messages import (
     TouchDuplexSessionMessage,
 )
 from vllm_omni.engine.duplex_omni_engine import DuplexOmniEngine
+from vllm_omni.protocol.duplex.commands import Heartbeat
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 

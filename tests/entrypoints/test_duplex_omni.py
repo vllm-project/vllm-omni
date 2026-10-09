@@ -13,16 +13,8 @@ import pytest
 
 from tests.entrypoints.test_omni_entrypoints import FakeAsyncOmniEngine
 from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
-from vllm_omni.engine.duplex import commands
 from vllm_omni.engine.duplex.config import DuplexCapabilities, DuplexSessionConfig
 from vllm_omni.engine.duplex.delivery import DuplexOutputBuffer
-from vllm_omni.engine.duplex.events import (
-    AudioDelta,
-    DuplexEvent,
-    SessionClosed,
-    SessionCreated,
-    SessionExpired,
-)
 from vllm_omni.engine.duplex.messages import (
     DuplexControlResultMessage,
     DuplexSessionError,
@@ -30,6 +22,14 @@ from vllm_omni.engine.duplex.messages import (
 )
 from vllm_omni.engine.messages import ErrorMessage
 from vllm_omni.entrypoints.duplex_omni import DuplexOmni, DuplexSessionHandle
+from vllm_omni.protocol.duplex import commands
+from vllm_omni.protocol.duplex.events import (
+    AudioDelta,
+    DuplexEvent,
+    SessionClosed,
+    SessionCreated,
+    SessionExpired,
+)
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 

@@ -21,7 +21,6 @@ from vllm_omni.engine.duplex.config import (
     ResponseCreateOptions,
 )
 from vllm_omni.engine.duplex.contracts import DuplexFence
-from vllm_omni.engine.duplex.events import TurnEvent
 from vllm_omni.engine.duplex.session.engine_session import (
     RESPONSE_REQUEST_MEASUREMENT_ORIGIN,
     DuplexEngineSession,
@@ -32,6 +31,7 @@ from vllm_omni.metrics.stats import DUPLEX_STAGE_TABLE_EXCLUDE, OrchestratorAggr
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.capabilities import (
     minicpmo45_native_capabilities,
 )
+from vllm_omni.protocol.duplex.events import TurnEvent
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -326,12 +326,12 @@ def test_unaligned_response_keeps_empty_turn_before_later_user_input(audio_compl
     assert session.history == (first.message, empty_answer, second.message)
 
     ack = apply_playback_ack(session, {"response_id": response_id, "played_ms": 6_981})
-    assert ack[0].to_realtime()["event"]["history_committed"] is False
+    assert ack[0].to_wire()["event"]["history_committed"] is False
     assert session.history == (first.message, empty_answer, second.message)
 
     if audio_complete:
         ack = apply_playback_ack(session, {"response_id": response_id, "played_ms": 10_000})
-        assert ack[0].to_realtime()["event"]["history_committed"] is True
+        assert ack[0].to_wire()["event"]["history_committed"] is True
         assert session.history == (
             first.message,
             {"role": "assistant", "content": "An answer the user has only partly heard"},
@@ -374,11 +374,11 @@ def test_removing_one_empty_assistant_preserves_the_other_turn_boundary(operatio
         # A full ACK releases the pending snapshot. Truncation then edits the
         # stored message into another empty dict before removing that item.
         ack = apply_playback_ack(session, {"response_id": response_ids[1], "played_ms": 10_000})
-        assert ack[0].to_realtime()["event"]["history_committed"] is True
+        assert ack[0].to_wire()["event"]["history_committed"] is True
         assert session.truncate_history_item(item_id, audio_end_ms=0, hard=True) is True
     assert session.history == (user_inputs[0], {"role": "assistant", "content": ""}, user_inputs[1])
     ack = apply_playback_ack(session, {"response_id": response_ids[1], "played_ms": 10_000})
-    assert ack[0].to_realtime()["error"]["code"] == "playback_item_not_found"
+    assert ack[0].to_wire()["error"]["code"] == "playback_item_not_found"
     assert session.history == (user_inputs[0], {"role": "assistant", "content": ""}, user_inputs[1])
 
 
@@ -423,7 +423,7 @@ def test_signal_turn_transitions_and_returns_typed_turn_event(event_type, turn_s
 
     assert isinstance(event, TurnEvent)
     assert session.turn_state == turn_state
-    wire = event.to_realtime()
+    wire = event.to_wire()
     assert wire["type"] == "turn.event"
     assert wire["event"] == event_type.value
     assert wire["turn_state"] == turn_state.value
@@ -1000,8 +1000,8 @@ def test_logged_tpot_matches_client_weighted_aggregation(monkeypatch: pytest.Mon
 
 
 def test_draining_response_stays_ack_admissible_after_next_begin_response() -> None:
-    from vllm_omni.engine.duplex.events import ErrorEvent
     from vllm_omni.engine.duplex.session.playback_ledger import apply_playback_ack
+    from vllm_omni.protocol.duplex.events import ErrorEvent
 
     session = _session()
     first = session.begin_response(turn_id=1)
@@ -1028,8 +1028,8 @@ def test_draining_response_stays_ack_admissible_after_next_begin_response() -> N
 
 
 def test_finished_drain_keeps_sent_audio_ackable() -> None:
-    from vllm_omni.engine.duplex.events import ErrorEvent
     from vllm_omni.engine.duplex.session.playback_ledger import apply_playback_ack
+    from vllm_omni.protocol.duplex.events import ErrorEvent
 
     session = _session()
     first = session.begin_response(turn_id=1)

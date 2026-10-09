@@ -18,10 +18,10 @@ prompted with, whether a turn is over, or where committed audio goes. Those are
 runtime decisions, and after PR #7413 a duplex session's runtime decisions all
 belong to ``vllm_omni.engine.duplex`` --- the session runner, the typed
 ``DuplexCommand`` / ``DuplexEvent`` boundary and the ``DuplexModelPlugin`` seam.
-This package sits *under* that: the duplex engine binds the codec to its own
-command and event vocabulary in
-``vllm_omni.engine.duplex.realtime_commands`` and
-``vllm_omni.engine.duplex.realtime_events``.
+This package sits *under* that: ``vllm_omni.protocol.duplex`` extends it with
+the full-duplex vocabulary, and the duplex engine binds that to its own
+runtime in ``vllm_omni.engine.duplex.mailbox`` (intake, mailbox rendering) and
+``vllm_omni.engine.duplex.projection`` (the per-session projection state).
 
 Why it is separate (RFC #6592, P0a)
 -----------------------------------

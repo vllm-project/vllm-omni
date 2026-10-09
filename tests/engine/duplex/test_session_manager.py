@@ -14,7 +14,6 @@ from typing import Any
 import pytest
 
 from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
-from vllm_omni.engine.duplex.commands import AppendAudio, CloseSession, Commit, DuplexCommand, Heartbeat
 from vllm_omni.engine.duplex.config import DuplexCapabilities, DuplexSessionConfig, DuplexSessionState
 from vllm_omni.engine.duplex.contracts import (
     DuplexAppendPlan,
@@ -26,17 +25,6 @@ from vllm_omni.engine.duplex.contracts import (
     duplex_resource_request_belongs_to_session,
 )
 from vllm_omni.engine.duplex.delivery import DuplexOutputBuffer
-from vllm_omni.engine.duplex.events import (
-    AudioDelta,
-    DuplexEvent,
-    ErrorEvent,
-    ResponseDone,
-    SessionClosed,
-    SessionCreated,
-    SessionExpired,
-    SessionHeartbeatAck,
-    TranscriptDelta,
-)
 from vllm_omni.engine.duplex.messages import (
     CloseDuplexSessionMessage,
     DuplexControlResultMessage,
@@ -60,6 +48,18 @@ from vllm_omni.engine.duplex.session.engine_session import DuplexEngineSession
 from vllm_omni.engine.duplex.session.lease import DuplexLeaseActivity
 from vllm_omni.engine.duplex.session.manager import DuplexSessionManager
 from vllm_omni.engine.duplex.session.runner import _Internal
+from vllm_omni.protocol.duplex.commands import AppendAudio, CloseSession, Commit, DuplexCommand, Heartbeat
+from vllm_omni.protocol.duplex.events import (
+    AudioDelta,
+    DuplexEvent,
+    ErrorEvent,
+    ResponseDone,
+    SessionClosed,
+    SessionCreated,
+    SessionExpired,
+    SessionHeartbeatAck,
+    TranscriptDelta,
+)
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -473,7 +473,7 @@ async def test_open_answers_with_capabilities_and_emits_session_created() -> Non
         assert isinstance(events[0], SessionCreated)
         assert events[0].epoch == 0
         assert events[0].session["id"] == "sid-open"
-        wire = events[0].to_realtime()
+        wire = events[0].to_wire()
         assert wire["type"] == "session.created"
         assert "incarnation" not in wire and "incarnation" not in wire["session"]
 
@@ -647,7 +647,7 @@ async def test_command_for_unknown_session_emits_unknown_session_error() -> None
         assert error.related_event_id == "evt-hb"
         assert error.session_id == "sid-missing"
         assert error.epoch is None
-        assert error.to_realtime()["error"]["code"] == "unknown_session"
+        assert error.to_wire()["error"]["code"] == "unknown_session"
 
 
 async def test_command_for_closed_session_emits_unknown_session_error() -> None:
@@ -915,7 +915,7 @@ async def test_reaper_expires_idle_sessions_and_emits_session_expired() -> None:
         assert len(expired) == 1
         assert isinstance(expired[0], SessionExpired)
         assert expired[0].reason == "idle_ttl_expired"
-        assert expired[0].to_realtime() == {
+        assert expired[0].to_wire() == {
             "type": "session.expired",
             "event_id": expired[0].event_id,
             "session_id": "sid-idle",

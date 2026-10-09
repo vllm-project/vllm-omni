@@ -151,7 +151,7 @@ but never the reverse, and a Tier 1 class MUST NOT carry a vLLM-Omni extension
 field; and each protocol/codec behavior MUST have exactly one
 implementation that every consumer uses. A wire type MUST NOT carry a
 consumer's internal representation: the duplex mailbox rendering
-(`DuplexCommand.payload()`, whose channel differs from the client event for
+(`mailbox_payload()` in `engine/duplex/mailbox.py`, whose channel differs from the client event for
 `session.update` and the `conversation.item.*` commands) stays engine-side.
 A duplex consumer (`engine/duplex/**`, `entrypoints/duplex/**`, the duplex
 clients) MUST import `vllm_omni.protocol.duplex` and MUST NOT import

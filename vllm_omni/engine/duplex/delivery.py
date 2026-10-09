@@ -24,7 +24,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 
-from vllm_omni.engine.duplex.events import AudioDelta, DuplexEvent, ErrorEvent, ResponseDone, SessionClosed
+from vllm_omni.protocol.duplex.events import AudioDelta, DuplexEvent, ErrorEvent, ResponseDone, SessionClosed
 
 _MAX_TERMINAL_BYTES = 4096
 
@@ -95,7 +95,7 @@ class DuplexOutputBuffer:
         if isinstance(event, SessionClosed):
             self.close(event)
             return True
-        payload = event.to_realtime()
+        payload = event.to_wire()
         audio_size = 0
         if isinstance(event, AudioDelta):
             # The producer has already encoded this as base64 ASCII. Count it
@@ -213,7 +213,7 @@ class DuplexOutputBuffer:
         shutdown that already ended consumption without a session event.
         """
         if event is not None:
-            size = len(json.dumps(event.to_realtime(), ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+            size = len(json.dumps(event.to_wire(), ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
             if size > _MAX_TERMINAL_BYTES:
                 event = replace(event, reason="close_details_exceed_output_limit", details={})
         with self._lock:

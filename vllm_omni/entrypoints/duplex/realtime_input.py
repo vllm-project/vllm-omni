@@ -3,15 +3,14 @@
 
 """Thin OpenAI Realtime wire envelope for one websocket connection.
 
-Everything that needed session state now lives engine-side
-(``vllm_omni.engine.duplex.realtime_commands`` for the command mapping,
-``vllm_omni.engine.duplex.realtime_events`` for the projection state), and the
-model-agnostic parsing both of those build on lives in
-``vllm_omni.protocol.realtime``. What is
-left here is the per-connection handshake policy (query-param defaults,
-autostart / resume-only rules, ``session.resume`` parsing), the wire defaults
-used to translate appends, and error rendering through the typed
-:class:`~vllm_omni.engine.duplex.events.ErrorEvent`.
+Everything that needs session state lives engine-side (the projection state
+in ``vllm_omni.engine.duplex.projection``), and the wire decoding lives in
+``vllm_omni.protocol.duplex`` (bound to the engine's capabilities by
+``vllm_omni.engine.duplex.mailbox.command_from_realtime``). What is left here
+is the per-connection handshake policy (query-param defaults, autostart /
+resume-only rules, ``session.resume`` parsing), the wire defaults used to
+translate appends, and error rendering through the typed
+:class:`~vllm_omni.protocol.duplex.events.ErrorEvent`.
 """
 
 from __future__ import annotations
@@ -20,10 +19,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
-from vllm_omni.engine.duplex.commands import DuplexCommand, DuplexCommandError
-from vllm_omni.engine.duplex.events import error_event
-from vllm_omni.engine.duplex.realtime_commands import translate_realtime_command
-from vllm_omni.protocol.duplex import RealtimeInputDefaults
+from vllm_omni.engine.duplex.mailbox import command_from_realtime
+from vllm_omni.protocol.duplex import DuplexCommand, RealtimeInputDefaults, RealtimeProtocolError, error_event
 
 if TYPE_CHECKING:
     from starlette.websockets import WebSocket
@@ -154,12 +151,12 @@ class RealtimeEnvelope:
         return payload.get("type") in ENVELOPE_EVENT_TYPES
 
     def translate(self, payload: Mapping[str, object]) -> DuplexCommand:
-        """Wire event -> command (raises :class:`DuplexCommandError`)."""
+        """Wire event -> command (raises :class:`RealtimeProtocolError`)."""
         if payload.get("type") == "session.update":
             session = payload.get("session")
             if isinstance(session, dict):
                 self.note_session_payload(session)
-        return translate_realtime_command(payload, defaults=self.defaults)
+        return command_from_realtime(payload, defaults=self.defaults)
 
     # ---- outbound helpers ----
 
@@ -172,8 +169,8 @@ class RealtimeEnvelope:
         param: object | None = None,
     ) -> dict[str, object]:
         """Wire JSON of a transport-level error (derived from the typed ``ErrorEvent``)."""
-        return error_event(code, message, event_id=event_id, param=param).to_realtime()
+        return error_event(code, message, event_id=event_id, param=param).to_wire()
 
     @staticmethod
-    def command_error_payload(exc: DuplexCommandError) -> dict[str, object]:
-        return error_event(exc.code, str(exc), event_id=exc.event_id).to_realtime()
+    def command_error_payload(exc: RealtimeProtocolError) -> dict[str, object]:
+        return error_event(exc.code, str(exc), event_id=exc.event_id).to_wire()

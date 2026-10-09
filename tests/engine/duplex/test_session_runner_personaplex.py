@@ -32,7 +32,6 @@ from tests.engine.duplex.test_session_runner import (
     types,
 )
 from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
-from vllm_omni.engine.duplex import commands
 from vllm_omni.engine.duplex.config import DuplexSessionConfig
 from vllm_omni.engine.duplex.delivery import DuplexOutputBuffer
 from vllm_omni.engine.duplex.messages import DuplexControlResultMessage, OpenDuplexSessionMessage
@@ -40,6 +39,7 @@ from vllm_omni.engine.duplex.session.manager import DuplexSessionManager
 from vllm_omni.model_executor.models.personaplex.duplex import stage0
 from vllm_omni.model_executor.models.personaplex.duplex.config import FRAME_SIZE, SAMPLE_RATE
 from vllm_omni.model_executor.models.personaplex.duplex.plugin import PersonaPlexDuplexPlugin
+from vllm_omni.protocol.duplex import commands
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 

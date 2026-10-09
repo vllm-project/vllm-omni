@@ -20,7 +20,7 @@ interface over the same responsibility is exactly the fork this layer exists to
 prevent.
 
 The duplex binding of this object is
-``vllm_omni.engine.duplex.realtime_commands.DUPLEX_REALTIME_CAPABILITIES``.
+``vllm_omni.engine.duplex.mailbox.DUPLEX_REALTIME_CAPABILITIES``.
 """
 
 from __future__ import annotations
@@ -54,7 +54,7 @@ class RealtimeProtocolCapabilities:
     ``turn_detection`` the session object carries --- including values it cannot
     actually serve, such as ``semantic_vad``. A consumer that supports only some
     turn-detection modes (or none) must supply its own validator; see
-    ``vllm_omni.engine.duplex.realtime_commands.DUPLEX_REALTIME_CAPABILITIES``.
+    ``vllm_omni.engine.duplex.mailbox.DUPLEX_REALTIME_CAPABILITIES``.
     """
 
     input_audio_formats: frozenset[str] = field(default_factory=lambda: frozenset(REALTIME_INPUT_AUDIO_FORMATS))

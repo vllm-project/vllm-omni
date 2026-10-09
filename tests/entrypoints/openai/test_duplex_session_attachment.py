@@ -10,7 +10,6 @@ import json
 import pytest
 
 from vllm_omni.engine.duplex.delivery import DuplexOutputBuffer
-from vllm_omni.engine.duplex.events import AudioDelta, ResponseDone
 from vllm_omni.entrypoints.duplex.session_attachment import (
     DuplexEventJournal,
     DuplexJournalGapError,
@@ -20,6 +19,7 @@ from vllm_omni.entrypoints.duplex.session_attachment import (
     InvalidResumeTokenError,
     ResumeToken,
 )
+from vllm_omni.protocol.duplex.events import AudioDelta, ResponseDone
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -40,7 +40,7 @@ async def test_audio_invalidated_while_waiting_for_send_is_not_sequenced_or_jour
     async with state.outbound_lock:
         delivery = asyncio.create_task(
             registry.send_event(
-                "s", audio.to_realtime(), journal=journal, on_accepted=accepted, event_guard=lambda: output.guard(audio)
+                "s", audio.to_wire(), journal=journal, on_accepted=accepted, event_guard=lambda: output.guard(audio)
             )
         )
         await asyncio.sleep(0)
@@ -49,7 +49,7 @@ async def test_audio_invalidated_while_waiting_for_send_is_not_sequenced_or_jour
     assert await delivery is None
     accepted.assert_not_called()
     done = ResponseDone(response_id="r", response={"status": "cancelled"})
-    await registry.send_event("s", done.to_realtime())
+    await registry.send_event("s", done.to_wire())
     assert [(entry["type"], entry["server_event_seq"]) for entry in sent] == [("response.done", 1)]
     assert [entry.payload["event_id"] for entry in state.journal.replay_after(0)] == [done.event_id]
 
