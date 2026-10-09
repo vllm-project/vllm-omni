@@ -7,7 +7,9 @@
 # https://github.com/feifeibear/long-context-attention/blob/main/yunchang/attention/layer.py
 
 
+import itertools
 import json
+import weakref
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, cast
@@ -79,6 +81,79 @@ def _attention_identity(backend_cls: type[AttentionBackend] | None, backend_expl
         bool(backend_explicit),
         _canonical_json(spec.backend_kwargs() if spec is not None else None),
     )
+
+
+# Layers built with a startup schedule, keyed by the integer id the scheduled-attention op carries.
+# Weak values, so the registry never keeps a dropped model alive.
+_SCHEDULED_ATTENTION_LAYERS: "weakref.WeakValueDictionary[int, Attention]" = weakref.WeakValueDictionary()
+_SCHEDULED_ATTENTION_IDS = itertools.count()
+
+# AttentionMetadata fields that must hold their default (None) for a compiled call to use the
+# scheduled-attention op. The op carries only attn_mask; any other metadata keeps the eager boundary.
+_SCHEDULED_OP_NONE_FIELDS = (
+    "joint_attn_mask",
+    "joint_query",
+    "joint_key",
+    "joint_value",
+    "full_attn_spans",
+    "query_ranges",
+    "video_layout",
+    "packed_padding",
+)
+
+
+def _run_scheduled_attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attn_mask: torch.Tensor | None,
+    layer_id: torch.Tensor,
+    has_metadata: bool,
+) -> torch.Tensor:
+    """Eager body of ``vllm_omni::scheduled_attention``: the layer's full ``_forward_impl``.
+
+    Candidate selection, capability checks, backend-private gates and the parallel strategy run
+    here at execution time, exactly as behind ``_forward_schedule_compile_boundary``, so the step,
+    sigma and timestep never reach Dynamo.
+    """
+    layer = _SCHEDULED_ATTENTION_LAYERS.get(int(layer_id))
+    if layer is None:
+        raise RuntimeError(f"scheduled attention layer {int(layer_id)} is not registered")
+    metadata = AttentionMetadata(attn_mask=attn_mask) if has_metadata else None
+    out = layer._forward_impl(query, key, value, metadata)
+    expected = (*query.shape[:-1], value.shape[-1])
+    if tuple(out.shape) != expected or out.dtype != query.dtype or out.device != query.device:
+        raise RuntimeError(
+            f"scheduled attention on layer {layer.prefix!r} returned {tuple(out.shape)} {out.dtype} on {out.device}; "
+            f"the compiled graph expects {expected} {query.dtype} on {query.device}"
+        )
+    # Compiled code relies on the fake's contiguous strides, and a custom op may not return a view
+    # of one of its inputs.
+    out = out.contiguous()
+    if any(out.untyped_storage().data_ptr() == t.untyped_storage().data_ptr() for t in (query, key, value)):
+        out = out.clone()
+    return out
+
+
+if not hasattr(torch.ops.vllm_omni, "scheduled_attention"):
+
+    @torch.library.custom_op("vllm_omni::scheduled_attention", mutates_args=())
+    def _scheduled_attention_op(
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_mask: torch.Tensor | None,
+        layer_id: torch.Tensor,
+        has_metadata: bool,
+    ) -> torch.Tensor:
+        return _run_scheduled_attention(query, key, value, attn_mask, layer_id, has_metadata)
+
+    @_scheduled_attention_op.register_fake
+    def _scheduled_attention_fake(query, key, value, attn_mask, layer_id, has_metadata):
+        return query.new_empty((*query.shape[:-1], value.shape[-1]))
+
+
+_scheduled_attention_op = torch.ops.vllm_omni.scheduled_attention
 
 
 def _try_extract_layer_index(prefix: str) -> int | None:
@@ -181,6 +256,8 @@ class Attention(nn.Module):
         # diffusion config, and such a layer legitimately prepares no candidates, so startup
         # validation must not report it as a missing profile.
         self._schedule_configured: bool = False
+        # Id the compiled scheduled-attention op uses to find this layer (see _register_scheduled_op).
+        self._schedule_op_id: torch.Tensor | None = None
         # Model-owned requirements on every candidate of this layer (add_schedule_candidate_check).
         self._schedule_candidate_checks: list[Callable[[_PreparedCandidate], str | None]] = []
 
@@ -305,6 +382,7 @@ class Attention(nn.Module):
             schedule_config = getattr(config, "diffusion_attention_schedule", None) if config is not None else None
             if schedule_config is not None:
                 self._schedule_configured = True
+                self._register_scheduled_op()
                 self._prepare_schedule_candidates(
                     schedule_config,
                     role=role,
@@ -614,6 +692,17 @@ class Attention(nn.Module):
             # timestep. Traced, those values would become guards and each new step or range
             # boundary would recompile the enclosing graph. The decision uses only the
             # construction-time flag, so a layer without a startup schedule adds no boundary.
+            if self._schedule_op_eligible(query, key, value, attn_metadata):
+                # One opaque node: the enclosing block stays a single graph, and the selection
+                # runs when the op executes.
+                return _scheduled_attention_op(
+                    query,
+                    key,
+                    value,
+                    None if attn_metadata is None else attn_metadata.attn_mask,
+                    self._schedule_op_id,
+                    attn_metadata is not None,
+                )
             return self._forward_schedule_compile_boundary(query, key, value, attn_metadata)
         if torch.compiler.is_compiling() and self._uses_hsdp_compile_boundary():
             # Keep HSDP/FSDP2 parameter all-gather outside Inductor's
@@ -622,6 +711,46 @@ class Attention(nn.Module):
             return self._forward_hsdp_compile_boundary(query, key, value, attn_metadata)
 
         return self._forward_impl(query, key, value, attn_metadata)
+
+    def _register_scheduled_op(self) -> None:
+        """Give this layer the id the compiled scheduled-attention op carries.
+
+        The id is a plain CPU tensor attribute, not a buffer: ``Module.to()`` leaves it on the CPU,
+        so reading it never synchronizes a device, and ``state_dict`` is unchanged. Dynamo passes it
+        as a graph input, so repeated blocks share one graph instead of guarding on a per-layer
+        constant (a string or int attribute would recompile once per block).
+        """
+        op_id = next(_SCHEDULED_ATTENTION_IDS)
+        _SCHEDULED_ATTENTION_LAYERS[op_id] = self
+        self._schedule_op_id = torch.tensor(op_id, dtype=torch.int64)
+
+    def _schedule_op_eligible(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata: AttentionMetadata | None,
+    ) -> bool:
+        """Whether a compiled call can use the scheduled-attention op instead of the eager boundary.
+
+        Evaluated while tracing, on structure only (never on the step). The op carries Q/K/V and an
+        optional ``attn_mask``; anything else keeps ``_forward_schedule_compile_boundary``: other
+        metadata, HSDP (its own boundary), Scheduler-managed paged KV (writes cache state the op
+        does not declare), and autograd (the op has no backward).
+        """
+        if getattr(self, "_schedule_op_id", None) is None or self._uses_hsdp_compile_boundary():
+            return False
+        if self._scheduler_paged_kv and self.paged_kv_cache_role is not None:
+            return False
+        if torch.is_grad_enabled() and (query.requires_grad or key.requires_grad or value.requires_grad):
+            return False
+        if attn_metadata is None:
+            return True
+        if type(attn_metadata) is not AttentionMetadata or attn_metadata.extra:
+            return False
+        if attn_metadata.joint_strategy != "front":
+            return False
+        return all(getattr(attn_metadata, name) is None for name in _SCHEDULED_OP_NONE_FIELDS)
 
     def _uses_hsdp_compile_boundary(self) -> bool:
         if self._hsdp_compile_boundary_enabled:

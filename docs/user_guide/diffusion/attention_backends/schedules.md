@@ -155,8 +155,11 @@ errors on the job record rather than the creation response.
 ## Compatibility limits
 
 - Full compile scope and configured cache backends are rejected with profiles,
-  even with empty default ranges. Regional compilation keeps attention eager
-  on every request, including `[]`; other block operations remain compiled.
+  even with empty default ranges. Under regional compilation each attention
+  call is one opaque op inside the block graph, on every request including
+  `[]`; the op picks the profile when it runs, so the block stays one graph.
+  Calls with metadata beyond `attn_mask`, HSDP, scheduler-managed paged KV and
+  autograd keep an eager boundary that splits the block around attention.
   Different candidate output layouts may trigger recompilation.
 - H3 rejects non-empty schedules with request-scoped Cache-DiT (`quality=high`)
   or `latent_refine`. Disable the schedule or the conflicting option.

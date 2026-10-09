@@ -27,6 +27,7 @@ from torch import nn
 from torch._dynamo.utils import counters as dynamo_counters
 
 import vllm_omni.diffusion.attention.layer as layer_mod
+from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.backends.trtllm_attn import TrtllmAttentionBackend, TrtllmAttentionImpl
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.attention.parallel.base import NoParallelAttention
@@ -334,10 +335,20 @@ def _require_no_compile_after_first_step(requests, also_allowed=()):
 
 
 def _require_attention_outside_graphs(counter, graphs=2):
+    """The eager boundary: each block splits around attention and no graph holds the kernel."""
     assert len(counter.graphs) == graphs, counter.graphs
     for calls in counter.graphs:
         assert "scaled_dot_product_attention" not in calls, calls
+        assert "scheduled_attention" not in calls, calls
         assert not {"sin", "cos"} <= calls, calls
+
+
+def _require_one_graph_with_scheduled_op(counter):
+    """Every block shares one graph that holds the opaque op, so the selection still runs outside Dynamo."""
+    assert len(counter.graphs) == 1, counter.graphs
+    calls = counter.graphs[0]
+    assert {"sin", "scheduled_attention", "cos"} <= calls, calls
+    assert "scaled_dot_product_attention" not in calls, calls
 
 
 def _expected(labels, entries, blocks=_BLOCKS):
@@ -371,7 +382,7 @@ def test_unseen_boundaries_across_requests_add_no_graph(compile_env):
         assert [step.graphs for step in steps] == [graphs] * len(labels), schedule
         _require_compiled_steps(pipeline.counter, steps)
     _require_no_compile_after_first_step([steps for _schedule, steps in results])
-    _require_attention_outside_graphs(pipeline.counter)
+    _require_one_graph_with_scheduled_op(pipeline.counter)
 
 
 def test_dense_approximate_dense_keeps_the_prefix_and_routes_back(compile_env):
@@ -391,7 +402,7 @@ def test_dense_approximate_dense_keeps_the_prefix_and_routes_back(compile_env):
     assert [step.graphs for step in scheduled + dense] == [scheduled[0].graphs] * (2 * len(_TIMESTEPS))
     _require_compiled_steps(pipeline.counter, scheduled + dense)
     _require_no_compile_after_first_step([scheduled, dense])
-    _require_attention_outside_graphs(pipeline.counter)
+    _require_one_graph_with_scheduled_op(pipeline.counter)
 
 
 def test_same_backend_candidates_run_their_own_parameters(compile_env):
@@ -408,10 +419,10 @@ def test_same_backend_candidates_run_their_own_parameters(compile_env):
     assert [step.graphs for step in steps] == [steps[0].graphs] * len(_TIMESTEPS)
     _require_compiled_steps(pipeline.counter, steps)
     _require_no_compile_after_first_step([steps])
-    _require_attention_outside_graphs(pipeline.counter)
+    _require_one_graph_with_scheduled_op(pipeline.counter)
 
 
-def test_fullgraph_compile_cannot_contain_the_schedule_boundary(compile_env):
+def test_fullgraph_compile_contains_the_scheduled_op(compile_env):
     pipeline = _pipeline(None, fullgraph=True)
 
     steps = pipeline.run(None)
@@ -425,11 +436,11 @@ def test_fullgraph_compile_cannot_contain_the_schedule_boundary(compile_env):
     torch._dynamo.reset()
     scheduled = _pipeline(AttentionScheduleConfig(profiles={"approx": _trtllm(0.5)}), fullgraph=True)
     schedule = _ranges((2, 5, "approx"))
-    with pytest.raises(torch._dynamo.exc.Unsupported, match="disable"):
-        scheduled.run(schedule)
+    steps = scheduled.run(schedule)
 
-    assert scheduled.counter.graphs == []
-    assert _TRACE == []
+    assert [step.trace for step in steps] == _expected("DDAAADDD", {"D": _DENSE, "A": _APPROX})
+    _require_compiled_steps(scheduled.counter, steps)
+    _require_one_graph_with_scheduled_op(scheduled.counter)
 
 
 @pytest.mark.parametrize(
@@ -448,7 +459,7 @@ def test_private_timestep_gate_runs_inside_the_scheduled_range(compile_env, disa
     assert [step.graphs for step in steps] == [steps[0].graphs] * len(_TIMESTEPS)
     _require_compiled_steps(pipeline.counter, steps)
     _require_no_compile_after_first_step([steps])
-    _require_attention_outside_graphs(pipeline.counter)
+    _require_one_graph_with_scheduled_op(pipeline.counter)
 
 
 def _equivalent_step_schedule(windows, sigmas):
@@ -503,4 +514,131 @@ def test_sigma_values_windows_counts_and_flow_shifts_do_not_recompile(compile_en
             torch.testing.assert_close(compiled_step.latents, sigma_step.latents)
             assert compiled_step.trace == step_step.trace == sigma_step.trace
     _require_no_compile_after_first_step(requests)
-    _require_attention_outside_graphs(pipeline.counter)
+    _require_one_graph_with_scheduled_op(pipeline.counter)
+
+
+class _MetadataBlock(_Block):
+    """A block whose attention call carries metadata the scheduled-attention op cannot represent."""
+
+    def forward(self, hidden_states):
+        batch, seq, _ = hidden_states.shape
+        qkv = torch.sin(self.to_qkv(hidden_states)).view(batch, seq, 3, _HEADS, _HEAD_SIZE)
+        query, key, value = qkv.unbind(2)
+        out = self.attn(query, key, value, AttentionMetadata(extra={"backend_private": 1}))
+        return hidden_states + torch.cos(self.to_out(out.reshape(batch, seq, _HIDDEN)))
+
+
+class _MetadataModel(_Model):
+    _repeated_blocks = ["_MetadataBlock"]
+
+    def __init__(self, blocks=_BLOCKS):
+        nn.Module.__init__(self)
+        self.blocks = nn.ModuleList(_MetadataBlock(index) for index in range(blocks))
+
+
+class _InductorCounting(_CountingBackend):
+    """``_CountingBackend`` that compiles each graph with Inductor."""
+
+    def __call__(self, gm, example_inputs):
+        from torch._inductor.compile_fx import compile_fx
+
+        index = len(self.graphs)
+        self.graphs.append({_call_name(node) for node in gm.graph.nodes if node.op.startswith("call_")})
+        self.executions.append(0)
+        compiled = compile_fx(gm, example_inputs)
+
+        def run(*args):
+            self.executions[index] += 1
+            return compiled(*args)
+
+        return run
+
+
+def test_metadata_the_op_cannot_carry_keeps_the_eager_boundary(compile_env):
+    config = _config(AttentionScheduleConfig(profiles={"approx": _trtllm(0.5)}))
+    with set_current_diffusion_config(config):
+        torch.manual_seed(_WEIGHT_SEED)
+        model = _MetadataModel()
+    counter = _CountingBackend()
+    regionally_compile(model, backend=counter)
+    pipeline = _ToyPipeline(model, config, counter)
+
+    steps = pipeline.run(_ranges((2, 5, "approx")))
+
+    assert [step.trace for step in steps] == _expected("DDAAADDD", {"D": _DENSE, "A": _APPROX})
+    _require_compiled_steps(counter, steps)
+    _require_attention_outside_graphs(counter)
+
+
+def test_autograd_keeps_the_eager_boundary(compile_env):
+    pipeline = _pipeline(AttentionScheduleConfig(profiles={"approx": _trtllm(0.5)}))
+
+    steps = pipeline.run(_ranges((2, 5, "approx")), grad_enabled=True)
+
+    assert [step.trace for step in steps] == _expected("DDAAADDD", {"D": _DENSE, "A": _APPROX})
+    _require_compiled_steps(pipeline.counter, steps)
+    # Step 0 compiles for a leaf latent; later steps see latents that require grad and compile once more.
+    _require_attention_outside_graphs(pipeline.counter, graphs=4)
+
+
+def test_repeated_blocks_share_one_graph_under_dynamic_shapes(compile_env):
+    pipeline = _pipeline(AttentionScheduleConfig(profiles={"approx": _trtllm(0.5)}), dynamic=True, blocks=6)
+
+    first = pipeline.run(_ranges((2, 5, "approx")))
+    with torch._dynamo.config.patch(error_on_recompile=True):
+        second = pipeline.run(_ranges((0, 3, "approx")))
+
+    assert [step.trace for step in first] == _expected("DDAAADDD", {"D": _DENSE, "A": _APPROX}, blocks=6)
+    assert [step.trace for step in second] == _expected("AAADDDDD", {"D": _DENSE, "A": _APPROX}, blocks=6)
+    _require_compiled_steps(pipeline.counter, first + second, blocks=6)
+    _require_no_compile_after_first_step([first, second])
+    _require_one_graph_with_scheduled_op(pipeline.counter)
+
+
+def test_dense_request_matches_a_service_without_a_schedule_bit_for_bit(compile_env):
+    plain = _pipeline(None, backend=_InductorCounting(), dynamic=True)
+    plain_steps = plain.run(None)
+    scheduled = _pipeline(
+        AttentionScheduleConfig(profiles={"approx": _trtllm(0.5)}), backend=_InductorCounting(), dynamic=True
+    )
+    dense_steps = scheduled.run(())
+
+    for index, (expected, actual) in enumerate(zip(plain_steps, dense_steps)):
+        assert torch.equal(expected.latents, actual.latents), index
+    _require_one_graph_with_scheduled_op(scheduled.counter)
+    assert "scaled_dot_product_attention" in plain.counter.graphs[0]
+
+
+def test_scheduled_op_id_is_a_cpu_attribute_outside_the_state_dict(compile_env):
+    pipeline = _pipeline(AttentionScheduleConfig(profiles={"approx": _trtllm(0.5)}), compiled=False)
+    model = pipeline.model.to(torch.float64)
+    ids = set()
+    for block in model.blocks:
+        op_id = block.attn._schedule_op_id
+        assert op_id.device.type == "cpu" and op_id.dtype == torch.int64
+        assert layer_mod._SCHEDULED_ATTENTION_LAYERS[int(op_id)] is block.attn
+        ids.add(int(op_id))
+    assert len(ids) == len(model.blocks)
+    assert not any("schedule_op_id" in name for name in model.state_dict())
+    assert _pipeline(None, compiled=False).model.blocks[0].attn._schedule_op_id is None
+
+
+def test_scheduled_op_returns_a_fresh_contiguous_tensor_and_rejects_a_wrong_shape(compile_env, monkeypatch):
+    pipeline = _pipeline(AttentionScheduleConfig(profiles={"approx": _trtllm(0.5)}), compiled=False)
+    attn = pipeline.model.blocks[0].attn
+    query = torch.randn(1, _SEQ, _HEADS, _HEAD_SIZE)
+
+    monkeypatch.setattr(attn, "_forward_impl", lambda q, k, v, md=None: q)
+    out = layer_mod._scheduled_attention_op(query, query, query, None, attn._schedule_op_id, False)
+    assert torch.equal(out, query) and out.untyped_storage().data_ptr() != query.untyped_storage().data_ptr()
+
+    monkeypatch.setattr(attn, "_forward_impl", lambda q, k, v, md=None: q.transpose(1, 2))
+    with pytest.raises(RuntimeError, match="compiled graph expects"):
+        layer_mod._scheduled_attention_op(query, query, query, None, attn._schedule_op_id, False)
+
+
+def test_op_metadata_rule_covers_every_attention_metadata_field():
+    from dataclasses import fields
+
+    carried_or_checked = {"attn_mask", "extra", "joint_strategy"}
+    assert {f.name for f in fields(AttentionMetadata)} - carried_or_checked == set(layer_mod._SCHEDULED_OP_NONE_FIELDS)
