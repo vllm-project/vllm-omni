@@ -235,6 +235,12 @@ class MiMoLocalDecodeCudaGraph:
         batch_size: int = 1,
         eager_run_first: bool = True,
     ) -> "MiMoLocalDecodeCudaGraph":
+        # The vLLM loader only calls model.eval() after weight loading, but
+        # these graphs are captured in the model constructor. Both configs set
+        # attention_dropout, so a training-mode module records dropout into
+        # the graph and every replay samples differently, breaking output
+        # determinism for identical requests (#8601).
+        model.local_transformer.eval()
         input_tensor, sampler = buffer.inputs(batch_size)
 
         cuda_graph = torch.cuda.CUDAGraph()
@@ -312,6 +318,9 @@ class MiMoInputLocalTransformerCudaGraph:
         batch_size: int,
         eager_run_first: bool = True,
     ) -> "MiMoInputLocalTransformerCudaGraph":
+        # Same dropout-during-capture hazard as MiMoLocalDecodeCudaGraph.capture
+        # above; see the comment there.
+        model.input_local_transformer.eval()
         input_tensor = buffer.inputs(batch_size)
 
         cuda_graph = torch.cuda.CUDAGraph()
