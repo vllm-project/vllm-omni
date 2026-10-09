@@ -19,18 +19,18 @@ SPEECH_TOKEN_LIMIT = ChatterboxConfig().speech_token_limit
 
 def t3_to_s3gen(
     source_outputs: list,
-    prompt: dict | list[dict],
+    prompt: dict,
     _requires_multimodal_data: bool = False,
 ) -> list[OmniTokensPrompt]:
     """Build stage 1's input from stage 0's finished output.
 
-    The payload is shaped as a stream of one final chunk, so stage 1 has a
-    single input contract in both modes.
+    The orchestrator calls this once per request, with that request's stage 0
+    output and its own prompt. The payload is shaped as a stream of one final
+    chunk, so stage 1 has a single input contract in both modes.
 
     Args:
-        source_outputs: Stage 0's request outputs.
-        prompt: The request's own prompt, or one per source output, each
-            from ``conditioning.build_prompt``.
+        source_outputs: Stage 0's output for the request.
+        prompt: The request's own prompt, from ``conditioning.build_prompt``.
         _requires_multimodal_data: Unused; part of the processor signature.
 
     Returns:
@@ -38,11 +38,11 @@ def t3_to_s3gen(
         request's reference and the stream metadata.
 
     Raises:
-        RuntimeError: If stage 0 produced no speech tokens for a request.
+        RuntimeError: If stage 0 produced no speech tokens for the request.
     """
-    prompts = prompt if isinstance(prompt, list) else [prompt] * len(source_outputs)
+    reference = prompt["additional_information"]["embed"]
     stage_inputs: list[OmniTokensPrompt] = []
-    for source_output, request_prompt in zip(source_outputs, prompts, strict=True):
+    for source_output in source_outputs:
         if not source_output.finished:
             continue
         # Drops the stop token, and the placeholder prompt ids should an
@@ -50,7 +50,6 @@ def t3_to_s3gen(
         codes = [token for token in source_output.outputs[0].cumulative_token_ids if token < SPEECH_TOKEN_LIMIT]
         if not codes:
             raise RuntimeError(f"Chatterbox T3 produced no speech tokens for request {source_output.request_id}")
-        reference = request_prompt["additional_information"]["embed"]
         stage_inputs.append(
             OmniTokensPrompt(
                 prompt_token_ids=codes,

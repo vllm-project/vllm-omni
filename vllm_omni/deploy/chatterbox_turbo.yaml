@@ -30,10 +30,6 @@ connectors:
   connector_of_shared_memory:
     name: SharedMemoryConnector
     extra:
-      codec_streaming: true
-      connector_get_sleep_s: 0.01
-      connector_get_max_wait_first_chunk: 3000
-      connector_get_max_wait: 300
       codec_chunk_frames: 15
       codec_pre_lookahead_frames: 3
       codec_max_chunk_frames: 60
@@ -42,15 +38,21 @@ connectors:
 
 stages:
   - stage_id: 0
+    # Halves the backbone's weights. Its logits are only sampled from, and
+    # the end-to-end transcripts pass with it.
     dtype: bfloat16
     max_num_seqs: 8
+    # The longest prompt (speaker slot, 375 prompt tokens, up to 671 text
+    # tokens, the start token) and the 1000-token output cap.
     max_model_len: 2048
+    # One step can prefill a whole prompt. A smaller budget splits the
+    # prefill over steps, which stage 0 handles: later first token, steadier
+    # decode steps for the requests already speaking.
     max_num_batched_tokens: 2048
     gpu_memory_utilization: 0.35
     enforce_eager: false
     enable_prefix_caching: false
     skip_tokenizer_init: true
-    disable_hybrid_kv_cache_manager: true
     devices: "0"
     output_connectors:
       to_stage_1: connector_of_shared_memory
@@ -64,15 +66,16 @@ stages:
   - stage_id: 1
     dtype: float32
     max_num_seqs: 8
+    # At least the 1000 tokens one utterance can reach: each step hands the
+    # stage the whole utterance so far.
     max_model_len: 4096
+    # At least max_num_seqs utterances of that length. A new request the
+    # step's budget cannot cover is scheduled with part of its tokens, and
+    # the decoder would take that part for the utterance.
     max_num_batched_tokens: 16384
     gpu_memory_utilization: 0.15
     enforce_eager: true
-    enable_prefix_caching: false
     skip_tokenizer_init: true
-    disable_hybrid_kv_cache_manager: true
     devices: "0"
     input_connectors:
       from_stage_0: connector_of_shared_memory
-    default_sampling_params:
-      max_tokens: 4096

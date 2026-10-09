@@ -55,12 +55,6 @@ def test_payload_is_one_final_chunk_in_the_requests_own_voice_001() -> None:
     assert payload.embed.voice is None and payload.ids is None
 
 
-def test_each_request_gets_its_own_prompt_001() -> None:
-    prompts = [request_prompt(250), request_prompt(202)]
-    inputs = t3_to_s3gen([talker_output([1, 6562]), talker_output([2, 6562])], prompts)
-    assert [i["additional_information"]["embed"]["speech_token"].shape[1] for i in inputs] == [250, 202]
-
-
 def test_unfinished_outputs_are_skipped_001() -> None:
     assert t3_to_s3gen([talker_output([10, 20], finished=False)], request_prompt(250)) == []
 

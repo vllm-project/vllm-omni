@@ -71,7 +71,10 @@ def test_deploy_file_agrees_with_the_model_constants_001(deploy: dict) -> None:
     }
     # Longest prompt (speaker, 375 prompt tokens, text, start) plus the output cap.
     assert talker["max_model_len"] >= 1 + config.cond_prompt_len + 400 + 1 + config.max_new_tokens
+    # Stage 1 is handed the whole utterance so far, for every request of a
+    # step; a budget short of that gives a new request part of its tokens.
     assert decoder["max_model_len"] >= config.max_new_tokens
+    assert decoder["max_num_batched_tokens"] >= decoder["max_num_seqs"] * config.max_new_tokens
     # The prompt is placeholder ids; a prefix cache would match any two
     # requests of equal length regardless of voice or text.
     assert talker["enable_prefix_caching"] is False
