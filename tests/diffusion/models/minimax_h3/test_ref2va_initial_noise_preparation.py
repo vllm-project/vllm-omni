@@ -1,16 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import weakref
 from concurrent.futures import ThreadPoolExecutor
+from threading import Event
 
 import pytest
 import torch
+from PIL import Image
 
+from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.models.minimax_h3.condition_noise import minimax_h3_imgvid_cond_noise_rows
 from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import (
     _MINIMAX_H3_DENOISE_INPUT_KEYS,
     MiniMaxH3Pipeline,
 )
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
@@ -107,3 +112,84 @@ def test_shared_denoise_kwargs_exclude_first_seed_noise(pipeline):
     assert kwargs["latent_h"] == 4
     assert kwargs["latent_w"] == 6
     assert kwargs["audio_t"] == 3
+
+
+def test_consumed_host_noise_is_released_before_denoising(pipeline, monkeypatch):
+    kwargs = _ref2va_kwargs(42)
+    noise = pipeline._initial_noise(seed=42, latent_t=2, latent_h=4, latent_w=6, audio_t=3)
+    visual_noise = minimax_h3_imgvid_cond_noise_rows(
+        condition_shapes=[kwargs["visual_condition_shape"]], target_latent_t=2, imgvid_cond_num_frames=1, seed=42
+    )
+    references = [weakref.ref(tensor) for tensor in (*noise, visual_noise)]
+    context = {"precomputed_initial_noise": noise, "precomputed_visual_condition_noise": visual_noise}
+    del noise, visual_noise
+    # Real CPU-to-meta copies have distinct storage without loading model weights.
+    pipeline.device = torch.device("meta")
+
+    def stop_before_denoising(task):
+        assert all(reference() is None for reference in references)
+        raise RuntimeError("checked noise lifetime")
+
+    monkeypatch.setattr(pipeline, "_transformer_for_task", stop_before_denoising)
+    with pytest.raises(RuntimeError, match="checked noise lifetime"):
+        pipeline.diffuse(
+            **kwargs,
+            request_context=context,
+        )
+
+
+@pytest.mark.parametrize("failure_stage", ["text", "media"])
+def test_encoder_failure_cancels_pending_noise_and_joins_worker(pipeline, monkeypatch, failure_stage):
+    from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as module
+
+    pool = ThreadPoolExecutor(max_workers=1)
+    release = Event()
+    started = Event()
+    futures = []
+    submit = pool.submit
+    shutdown = pool.shutdown
+
+    def hold_worker():
+        started.set()
+        assert release.wait(10)
+
+    blocker = submit(hold_worker)
+    assert started.wait(10)
+
+    def record_submit(*args, **kwargs):
+        future = submit(*args, **kwargs)
+        futures.append(future)
+        return future
+
+    def release_and_shutdown(*, wait=True, cancel_futures=False):
+        shutdown(wait=False, cancel_futures=cancel_futures)
+        release.set()
+        shutdown(wait=wait)
+
+    def encode_prompt(prepared):
+        if failure_stage == "text":
+            raise RuntimeError("text encoder failed")
+        return torch.zeros(2, 4), torch.ones(2, dtype=torch.long)
+
+    def fail_media(media):
+        raise RuntimeError("media encoder failed")
+
+    pipeline._fasth3 = None
+    pipeline.supported_tasks = ("ref2va",)
+    pipeline.od_config = OmniDiffusionConfig()
+    monkeypatch.setattr(pool, "submit", record_submit)
+    monkeypatch.setattr(pool, "shutdown", release_and_shutdown)
+    monkeypatch.setattr(module, "ThreadPoolExecutor", lambda **kwargs: pool)
+    monkeypatch.setattr(pipeline, "encode_prompt", encode_prompt)
+    monkeypatch.setattr(pipeline, "_encode_local_media", fail_media)
+    sampling = OmniDiffusionSamplingParams(height=64, width=64, seed=42, extra_args={"task": "ref2va", "duration": 4.4})
+    prompt = {"prompt": "reference", "multi_modal_data": {"image": Image.new("RGB", (256, 256))}}
+    try:
+        with pytest.raises(RuntimeError, match=f"{failure_stage} encoder failed"):
+            pipeline._prepare_local_conditioning(prompt, sampling, request_context={})
+        assert len(futures) == 2
+        assert all(future.cancelled() for future in futures)
+        assert blocker.done()
+    finally:
+        release.set()
+        shutdown(wait=True, cancel_futures=True)

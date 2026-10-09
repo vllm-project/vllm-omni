@@ -2069,9 +2069,10 @@ class MiniMaxH3Pipeline(
         sampler: str = "euler",
         init_latents: tuple[torch.Tensor, torch.Tensor] | None = None,
         refine: MiniMaxH3LatentRefineSpec | None = None,
-        precomputed_initial_noise: tuple[torch.Tensor, torch.Tensor] | None = None,
-        precomputed_visual_condition_noise: torch.Tensor | None = None,
+        request_context: dict[str, Any] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        # Consume request-owned noise here so caller keyword dictionaries cannot
+        # keep the host buffers alive throughout denoising.
         inputs = self._build_denoise_inputs(
             sampler=sampler,
             task=task,
@@ -2107,8 +2108,12 @@ class MiniMaxH3Pipeline(
             audio_edit_restore_mask_rows=audio_edit_restore_mask_rows,
             init_latents=init_latents,
             refine=refine,
-            precomputed_initial_noise=precomputed_initial_noise,
-            precomputed_visual_condition_noise=precomputed_visual_condition_noise,
+            precomputed_initial_noise=(
+                None if request_context is None else request_context.pop("precomputed_initial_noise", None)
+            ),
+            precomputed_visual_condition_noise=(
+                None if request_context is None else request_context.pop("precomputed_visual_condition_noise", None)
+            ),
         )
         branch = inputs["branch"]
         transformer = self._transformer_for_task(task)
@@ -2730,13 +2735,13 @@ class MiniMaxH3Pipeline(
         if world_size > 1:
             dist.broadcast_object_list(header, src=0, group=group)
         reuse_text, initial_noise_params, visual_noise_params = header[0]
-        executor_context = (
+        executor = (
             ThreadPoolExecutor(max_workers=1, thread_name_prefix="minimax_h3_initial_noise")
             if initial_noise_params is not None
-            else nullcontext()
+            else None
         )
         # Independent CPU generators preserve sampling; join the worker on request exit.
-        with executor_context as executor:
+        try:
             initial_noise = (
                 executor.submit(self._initial_noise, **initial_noise_params)
                 if initial_noise_params is not None
@@ -2782,6 +2787,9 @@ class MiniMaxH3Pipeline(
             return MiniMaxH3EncoderConditioning.from_components(
                 MiniMaxH3TextConditioning(hidden, tags), media
             ), window_text
+        finally:
+            if executor is not None:
+                executor.shutdown(wait=True, cancel_futures=True)
 
     def _prepare_request_inputs(self, raw_prompt: Any, sampling: Any) -> dict[str, Any]:
         if (getattr(sampling, "extra_args", None) or {}).get(
@@ -3088,8 +3096,7 @@ class MiniMaxH3Pipeline(
             if context.get("continuation") is None:
                 video_latent, audio_latent = self.diffuse(
                     **output_kwargs,
-                    precomputed_initial_noise=context.pop("precomputed_initial_noise", None),
-                    precomputed_visual_condition_noise=context.pop("precomputed_visual_condition_noise", None),
+                    request_context=context,
                 )
             else:
                 window_frames, overlap_frames = context["continuation"]
