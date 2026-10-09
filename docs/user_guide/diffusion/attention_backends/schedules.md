@@ -158,8 +158,11 @@ errors on the job record rather than the creation response.
   even with empty default ranges. Under regional compilation each attention
   call is one opaque op inside the block graph, on every request including
   `[]`; the op picks the profile when it runs, so the block stays one graph.
-  Calls with metadata beyond `attn_mask`, HSDP, scheduler-managed paged KV and
-  autograd keep an eager boundary that splits the block around attention.
+  The op carries `attn_mask`, a `video_layout` without video spans and `extra`
+  entries holding None, bools, ints or int tuples (Wan's grid). Other metadata
+  (tensors, floats or strings in `extra`, joint tensors, video spans), HSDP,
+  scheduler-managed paged KV and autograd keep an eager boundary that splits
+  the block around attention.
   Different candidate output layouts may trigger recompilation.
 - H3 rejects non-empty schedules with request-scoped Cache-DiT (`quality=high`)
   or `latent_refine`. Disable the schedule or the conflicting option.
