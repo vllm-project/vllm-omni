@@ -1620,6 +1620,12 @@ class OmniDiffusionConfig:
                         self.model_class_name = "DiffusersAdapterPipeline"
                 self.update_multimodal_support()
 
+                # Model-level sampling grid (e.g. Qwen-Image-2.1-Turbo; see
+                # diffusers PR #14950). An explicit extras value wins.
+                sample_sigmas = config_dict.get("sample_sigmas")
+                if sample_sigmas is not None and self.extras.get("sample_sigmas") is None:
+                    self.extras["sample_sigmas"] = sample_sigmas
+
                 # Skip transformer config loading for diffusers adapter
                 # (non-DiT models don't have a separate transformer folder/config)
                 if self.diffusion_load_format == "diffusers":

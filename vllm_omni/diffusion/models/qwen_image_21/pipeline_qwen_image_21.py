@@ -162,6 +162,7 @@ def get_qwen_image_21_pre_process_func(
     # The Qwen-Image 2.1 VAE is RGBA (in/out_channels=4): condition images get an
     # opaque alpha channel unless the input already carries one.
     vae_image_processor = VaeImageProcessor(vae_scale_factor=vae_scale_factor)
+    sample_sigmas = (getattr(od_config, "extras", None) or {}).get("sample_sigmas")
 
     def _to_pil(image: Any) -> PIL.Image.Image:
         if isinstance(image, PIL.Image.Image):
@@ -188,6 +189,12 @@ def get_qwen_image_21_pre_process_func(
         request.allow_mixed_step_phases = False
         if request.sampling_params.true_cfg_scale is None:
             request.sampling_params.true_cfg_scale = 1.0
+        # Inject the model-level sampling grid as request sigmas so the
+        # step scheduler and cache refresh resolve the total step count from
+        # len(sigmas). prepare_timesteps applies the same grid as a fallback
+        # for paths that bypass this hook; request-level sigmas always win.
+        if request.sampling_params.sigmas is None and sample_sigmas:
+            request.sampling_params.sigmas = list(sample_sigmas)
         prompt = request.prompt
         multi_modal_data = prompt.get("multi_modal_data", {}) if not isinstance(prompt, str) else None
         raw_image = multi_modal_data.get("image", None) if multi_modal_data is not None else None
@@ -315,6 +322,11 @@ class QwenImage21Pipeline(
         super().__init__()
         self.od_config = od_config
         self.parallel_config = od_config.parallel_config
+        # Model-level sampling grid from model_index.json (diffusers PR
+        # 14950): when the request carries no explicit sigmas, this grid
+        # drives the schedule and its length decides the step count.
+        sample_sigmas = od_config.extras.get("sample_sigmas")
+        self.sample_sigmas = [float(s) for s in sample_sigmas] if sample_sigmas else None
         self.weights_sources = [
             DiffusersPipelineLoader.ComponentSource(
                 model_or_path=od_config.model,
@@ -822,7 +834,10 @@ class QwenImage21Pipeline(
         return latents, image_latents
 
     def prepare_timesteps(self, num_inference_steps, sigmas, image_seq_len):
-        sigmas = np.linspace(1.0, 1 / num_inference_steps, num_inference_steps) if sigmas is None else sigmas
+        if sigmas is None:
+            sigmas = getattr(self, "sample_sigmas", None)
+        if sigmas is None:
+            sigmas = np.linspace(1.0, 1 / num_inference_steps, num_inference_steps)
         mu = calculate_shift(
             image_seq_len,
             self.scheduler.config.get("base_image_seq_len", 256),
@@ -842,6 +857,18 @@ class QwenImage21Pipeline(
     @property
     def attention_kwargs(self):
         return self._attention_kwargs
+
+    @property
+    def default_num_inference_steps(self):
+        """Step count implied by the model-level sampling grid, when present.
+
+        The model runner falls back to this when the request carries neither
+        num_inference_steps, timesteps, nor sigmas.
+        """
+        sample_sigmas = getattr(self, "sample_sigmas", None)
+        if sample_sigmas is not None:
+            return len(sample_sigmas)
+        return None
 
     @property
     def num_timesteps(self):
