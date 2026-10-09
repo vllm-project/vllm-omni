@@ -9,7 +9,11 @@ import pytest
 
 from vllm_omni.engine.duplex.delivery import DuplexOutputBuffer, DuplexOutputOverflowError
 from vllm_omni.engine.duplex.events import AudioDelta, ResponseDone, SessionClosed, TranscriptDelta
-from vllm_omni.engine.duplex.realtime_events import RealtimeProjectionState, project_internal_event
+from vllm_omni.engine.duplex.realtime_events import (
+    RealtimeProjectionState,
+    project_internal_event,
+    retrieve_item_events,
+)
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -36,7 +40,7 @@ async def test_queued_response_creation_keeps_payload_and_byte_count(event_type,
 
     text = "Growing response. " * 512
     project_internal_event(state, {"type": event_type, "response_id": "r", delta_field: text})
-    item = next(iter(state.conversation_items.values()))
+    item = retrieve_item_events(state, {"item_id": "item_r"})[0].item
     assert item["content"][0][content_field] == text
     assert output.pending_bytes == byte_count
     delivered = [await output.get() for _ in events]
@@ -121,3 +125,70 @@ async def test_cancelled_waiter_can_be_replaced_and_woken_from_another_thread():
     await asyncio.sleep(0)
     await asyncio.to_thread(output.close)
     assert await asyncio.wait_for(closing, timeout=2) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("completed", [False, True])
+async def test_queued_history_keeps_payload_and_byte_count_after_truncate(completed):
+    state = RealtimeProjectionState(session_id="s")
+    project_internal_event(state, {"type": "response.created", "response_id": "r"})
+    project_internal_event(
+        state,
+        {
+            "type": "response.output_audio.delta",
+            "response_id": "r",
+            "audio": "AAAA",
+            "text": "abcdefghij",
+            "audio_duration_ms": 10000,
+            "audio_text_marks": [{"audio_end_ms": 4000, "text_chars": 4}, {"audio_end_ms": 10000, "text_chars": 10}],
+        },
+    )
+    events = project_internal_event(state, {"type": "response.done", "response_id": "r"}) if completed else []
+    events.extend(retrieve_item_events(state, {"item_id": "item_r"}))
+    payloads = [event.to_realtime() for event in events]
+    byte_count = sum(
+        len(json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode()) for payload in payloads
+    )
+    output = DuplexOutputBuffer(max_bytes=byte_count, max_events=len(events))
+    for event in events:
+        output.put(event)
+    project_internal_event(
+        state, {"type": "conversation.item.truncated", "item_id": "item_r", "content_index": 0, "audio_end_ms": 4000}
+    )
+    assert retrieve_item_events(state, {"item_id": "item_r"})[0].item["content"][0]["transcript"] == "abcd"
+    assert output.pending_bytes == byte_count
+    delivered = [await output.get() for _ in events]
+    assert [event.to_realtime() for event in delivered] == payloads
+    assert output.pending_events == output.pending_bytes == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("audio", [False, True])
+async def test_queued_retrieval_keeps_payload_and_byte_count_as_history_grows(audio):
+    state = RealtimeProjectionState(session_id="s")
+    project_internal_event(
+        state, {"type": "response.created", "response_id": "r", "modalities": ["audio" if audio else "text"]}
+    )
+    for index in range(1, 3):
+        if audio:
+            delta = {
+                "type": "response.output_audio.delta",
+                "response_id": "r",
+                "audio": "AAAA",
+                "text": "hi",
+                "audio_text_marks": [{"audio_end_ms": index * 80, "text_chars": index * 2}],
+            }
+        else:
+            delta = {"type": "response.text.delta", "response_id": "r", "delta": "hi"}
+        project_internal_event(state, delta)
+        event = retrieve_item_events(state, {"item_id": "item_r"})[0]
+        if index == 1:
+            payload = event.to_realtime()
+            byte_count = len(json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode())
+            output = DuplexOutputBuffer(max_bytes=byte_count, max_events=1)
+            output.put(event)
+        else:
+            assert event.item["content"][0]["transcript" if audio else "text"] == "hihi"
+    assert output.pending_bytes == byte_count
+    assert (await output.get()).to_realtime() == payload
+    assert output.pending_events == output.pending_bytes == 0

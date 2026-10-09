@@ -315,7 +315,8 @@ def test_projection_of_the_main_internal_event_sequence():
     assert audio_delta[0].format == "pcm16"
     assert audio_delta[0].item_id == "item_resp_1"
     assert audio_delta[1].text == "hi"
-    assert state.conversation_items["item_resp_1"]["content"][0]["transcript"] == "hi"
+    retrieved = retrieve_item_events(state, {"item_id": "item_resp_1"})[0]
+    assert retrieved.item["content"][0]["transcript"] == "hi"
 
     done = project_internal_event(state, {"type": "response.done", "response_id": "resp_1"})
     assert _types(done) == [
@@ -576,3 +577,172 @@ def test_text_then_audio_projects_ttft_on_transcript_and_ttfp_on_audio_delta():
     audio_metrics = audio_delta.to_realtime()["metadata"]["vllm_omni"]["response_request_metrics"]
     assert audio_metrics["ttft_ms"] == 200.0
     assert audio_metrics["ttfp_ms"] == 400.0
+
+
+@pytest.mark.parametrize("mode", ["text", "audio", "audio_text", "mixed"])
+def test_in_progress_history_is_materialized_on_retrieval(mode):
+    state = RealtimeProjectionState(session_id="history")
+    project_internal_event(
+        state, {"type": "response.created", "response_id": "r", "modalities": ["text" if mode == "text" else "audio"]}
+    )
+    for index in range(1, 4):
+        if mode != "text":
+            project_internal_event(
+                state,
+                {
+                    "type": "response.output_audio.delta",
+                    "response_id": "r",
+                    "audio": "AAAA",
+                    "text": "hi" if mode != "audio" else "",
+                    "audio_duration_ms": index * 80,
+                    "audio_text_marks": [{"audio_end_ms": index * 80, "text_chars": index * 2}],
+                },
+            )
+        if mode in {"text", "mixed"}:
+            project_internal_event(state, {"type": "response.text.delta", "response_id": "r", "delta": "ok"})
+    # Delta projection must not rebuild cumulative content that nobody reads.
+    assert state.conversation_items["item_r"]["content"] == []
+    item = retrieve_item_events(state, {"item_id": "item_r"})[0].item
+    assert item["status"] == "in_progress"
+    if mode != "text":
+        assert item["content"][0] == {
+            "type": "output_audio",
+            "transcript": "hihihi" if mode != "audio" else "",
+            "audio_duration_ms": 240,
+            "audio_text_marks": [{"audio_end_ms": i * 80, "text_chars": i * 2} for i in range(1, 4)],
+        }
+    if mode in {"text", "mixed"}:
+        assert item["content"][-1] == {"type": "output_text", "text": "okokok"}
+    done = project_internal_event(state, {"type": "response.done", "response_id": "r"})
+    completed = next(event for event in done if isinstance(event, ItemDone)).item
+    assert completed["content"] == item["content"]
+    assert completed["status"] == "completed"
+    assert item["status"] == "in_progress"
+
+
+def test_audio_marks_keep_normalization_order_and_deduplication():
+    state = RealtimeProjectionState(session_id="marks")
+    project_internal_event(state, {"type": "response.created", "response_id": "r"})
+    batches: list[list[object]] = [
+        [{"audio_end_ms": 80, "text_chars": 1}],
+        [{"audio_end_ms": 160, "text_chars": 2}],
+        [{"audio_end_ms": 160, "text_chars": 2}],  # Duplicate tail.
+        [{"audio_ms": 40.9, "text_chars": 1.9}],  # Legacy key, out of order.
+        [
+            {"audio_end_ms": 160, "text_chars": 3},
+            {"audio_end_ms": 80, "text_chars": 1},
+            {"audio_end_ms": -1, "text_chars": -2},
+            {"audio_end_ms": "bad", "text_chars": 1},
+            None,
+        ],
+        [{"audio_end_ms": 160, "text_chars": 4}],  # Same time, increasing text.
+    ]
+    for marks in batches:
+        project_internal_event(
+            state,
+            {"type": "response.output_audio.delta", "response_id": "r", "audio": "AAAA", "audio_text_marks": marks},
+        )
+    item = retrieve_item_events(state, {"item_id": "item_r"})[0].item
+    assert item["content"][0]["audio_text_marks"] == [
+        {"audio_end_ms": ms, "text_chars": chars}
+        for ms, chars in [(0, 0), (40, 1), (80, 1), (160, 2), (160, 3), (160, 4)]
+    ]
+    # Projection owns normalized marks rather than the producer's dictionaries.
+    first_mark = batches[0][0]
+    assert isinstance(first_mark, dict)
+    first_mark["text_chars"] = 1000
+    assert retrieve_item_events(state, {"item_id": "item_r"})[0].item == item
+
+
+@pytest.mark.parametrize("with_marks", [False, True])
+@pytest.mark.parametrize("resolve_first", [False, True])
+def test_truncate_materializes_live_audio_once_and_survives_later_output(with_marks, resolve_first):
+    state = RealtimeProjectionState(session_id="truncate")
+    project_internal_event(state, {"type": "response.created", "response_id": "r"})
+    delta = {
+        "type": "response.output_audio.delta",
+        "response_id": "r",
+        "audio": "AAAA",
+        "text": "abcdefghij",
+        "audio_duration_ms": 10000,
+    }
+    if with_marks:
+        delta["audio_text_marks"] = [{"audio_end_ms": 4000, "text_chars": 4}, {"audio_end_ms": 10000, "text_chars": 10}]
+    project_internal_event(state, delta)
+    command = TruncateItem(item_id="item_r", content_index=0, audio_end_ms=4000)
+    if resolve_first:
+        resolved = resolve_truncate_item(state, command)
+        assert not resolved.events
+        assert len(resolved.payloads) == 2
+    project_internal_event(state, {**command.payload()["payload"], "type": "conversation.item.truncated"})
+    for _ in range(2):
+        assert retrieve_item_events(state, {"item_id": "item_r"})[0].item["content"][0]["transcript"] == "abcd"
+    delta.update(text="klmnopqrst", audio_duration_ms=20000)
+    if with_marks:
+        delta["audio_text_marks"] = [{"audio_end_ms": 20000, "text_chars": 20}]
+    project_internal_event(state, delta)
+    done = project_internal_event(state, {"type": "response.done", "response_id": "r"})
+    item = next(event for event in done if isinstance(event, ItemDone)).item
+    assert item["content"][0]["transcript"] == "abcd"
+    assert retrieve_item_events(state, {"item_id": "item_r"})[0].item == item
+
+
+@pytest.mark.parametrize(("content_index", "audio_end_ms"), [(0, 1001), (1, 500)])
+def test_truncate_validates_materialized_live_content(content_index, audio_end_ms):
+    state = RealtimeProjectionState(session_id="truncate-validation")
+    project_internal_event(state, {"type": "response.created", "response_id": "r"})
+    project_internal_event(
+        state, {"type": "response.output_audio.delta", "response_id": "r", "audio": "AAAA", "audio_duration_ms": 1000}
+    )
+    resolved = resolve_truncate_item(
+        state, TruncateItem(item_id="item_r", content_index=content_index, audio_end_ms=audio_end_ms)
+    )
+    assert not resolved.payloads
+    assert _types(resolved.events) == ["error"]
+    assert not state.item_truncation_cursors
+
+
+@pytest.mark.parametrize("committed_ms", [0, 4000])
+def test_cancel_materializes_latest_history_at_playback_cursor(committed_ms):
+    state = RealtimeProjectionState(session_id="cancel-history")
+    project_internal_event(state, {"type": "response.created", "response_id": "r"})
+    project_internal_event(
+        state,
+        {
+            "type": "response.output_audio.delta",
+            "response_id": "r",
+            "audio": "AAAA",
+            "text": "abcdefghij",
+            "audio_duration_ms": 10000,
+        },
+    )
+    events = project_internal_event(
+        state, {"type": "audio.cancelled", "response_id": "r", "committed_ms": committed_ms, "reason": "barge_in"}
+    )
+    item = next(event for event in events if isinstance(event, ItemDone)).item
+    assert item["status"] == "cancelled"
+    assert item["content"][0]["transcript"] == ("abcd" if committed_ms else "")
+    assert retrieve_item_events(state, {"item_id": "item_r"})[0].item == item
+
+
+@pytest.mark.parametrize("modalities", [["audio"], ["text"], ["audio", "text"]])
+def test_retrieve_before_first_delta_preserves_empty_item(modalities):
+    state = RealtimeProjectionState(session_id="empty")
+    project_internal_event(state, {"type": "response.created", "response_id": "r", "modalities": modalities})
+    assert retrieve_item_events(state, {"item_id": "item_r"})[0].item["content"] == []
+
+
+def test_materialization_does_not_create_projections_or_restore_deleted_items():
+    state = RealtimeProjectionState(session_id="item-ownership")
+    item = {"id": "item_external", "type": "function_call", "status": "in_progress", "arguments": "{}"}
+    project_internal_event(state, {"type": "conversation.item.created", "item": item})
+    assert retrieve_item_events(state, {"item_id": "item_external"})[0].item == item
+    assert not state.response_states
+    for response_id in ("first", "second"):
+        project_internal_event(state, {"type": "response.created", "response_id": response_id, "modalities": ["text"]})
+        project_internal_event(state, {"type": "response.text.delta", "response_id": response_id, "delta": response_id})
+    assert retrieve_item_events(state, {"item_id": "item_first"})[0].item["content"][0]["text"] == "first"
+    assert retrieve_item_events(state, {"item_id": "item_second"})[0].item["content"][0]["text"] == "second"
+    project_internal_event(state, {"type": "conversation.item.deleted", "item_id": "item_first"})
+    assert _types(retrieve_item_events(state, {"item_id": "item_first"})) == ["error"]
+    assert "item_first" not in state.conversation_items

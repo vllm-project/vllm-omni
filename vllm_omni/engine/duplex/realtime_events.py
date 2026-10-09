@@ -339,49 +339,25 @@ def _response_done_output_item(
     return item
 
 
-def _refresh_in_progress_response_item(state: RealtimeProjectionState, response_id: object) -> None:
-    if not isinstance(response_id, str) or not response_id:
-        return
-    item_id = _response_item_id(state, response_id)
+def _refresh_in_progress_response_item(state: RealtimeProjectionState, item_id: str) -> bool:
+    """Materialize live response content only when a history consumer needs it.
+
+    Replace the stored item so earlier events retain their construction-time
+    payload, including when they are still waiting in the delivery queue.
+    """
     item = state.conversation_items.get(item_id)
-    if not isinstance(item, dict):
-        return
-    content = item.get("content")
-    if not isinstance(content, list):
-        content = []
-        item["content"] = content
-    projection = _response_state(state, response_id)
+    if item is None or item.get("status") != "in_progress" or not item_id.startswith("item_"):
+        return False
+    response_id = item_id.removeprefix("item_")
+    projection = _response_state(state, response_id, create=False)
     if projection is None:
-        return
-    transcript = projection.transcript
-    audio_duration_ms = projection.audio_duration_ms
-    audio_text_marks = projection.audio_text_marks
-    has_audio = projection.audio_part_added or bool(transcript) or audio_duration_ms is not None
-    if has_audio:
-        audio_part = _response_item_content_part(
-            transcript=transcript,
-            audio_duration_ms=audio_duration_ms,
-            audio_text_marks=audio_text_marks,
-        )
-        if content and isinstance(content[0], dict) and content[0].get("type") in {"audio", "output_audio"}:
-            content[0] = audio_part
-        else:
-            content.insert(0, audio_part)
-    text = projection.text
-    if text:
-        text_index = (
-            1 if content and isinstance(content[0], dict) and content[0].get("type") in {"audio", "output_audio"} else 0
-        )
-        text_part = _response_item_text_content_part(text=text)
-        if (
-            len(content) > text_index
-            and isinstance(content[text_index], dict)
-            and content[text_index].get("type") in {"text", "output_text"}
-        ):
-            content[text_index] = text_part
-        else:
-            content.insert(text_index, text_part)
-    _apply_pending_item_truncation(state, item)
+        return False
+    if not (projection.audio_delta_emitted or projection.transcript_parts or projection.text_parts):
+        # response.created announces an audio part but its item is still empty.
+        return False
+    snapshot = _response_done_output_item(state, response_id, status="in_progress")
+    state.conversation_items[item_id] = {**item, "content": snapshot["content"]}
+    return True
 
 
 def _append_response_transcript(state: RealtimeProjectionState, response_id: object, text: str) -> None:
@@ -444,6 +420,17 @@ def _remember_response_audio_metadata(
         if not isinstance(text_chars, int | float) or not isinstance(audio_end_ms, int | float):
             continue
         clean_marks.append({"text_chars": max(0, int(text_chars)), "audio_end_ms": max(0, int(audio_end_ms))})
+    if len(clean_marks) == 1:
+        mark = clean_marks[0]
+        previous = projection.audio_text_marks[-1] if projection.audio_text_marks else None
+        key = (mark["audio_end_ms"], mark["text_chars"])
+        previous_key = (previous["audio_end_ms"], previous["text_chars"]) if previous is not None else None
+        # Streaming producers normally append one ordered mark per chunk.
+        # Avoid copying and sorting the entire history for this common case.
+        if previous_key is None or key >= previous_key:
+            if key != previous_key:
+                projection.audio_text_marks.append(mark)
+            return
     if clean_marks:
         merged = list(projection.audio_text_marks)
         merged.extend(clean_marks)
@@ -804,8 +791,8 @@ def _project(state: RealtimeProjectionState, event: dict[str, object]) -> list[D
             "status": "in_progress",
             "content": [],
         }
-        # Later deltas grow the state item. Keep creation events independent
-        # so their queued payloads retain the size measured at admission.
+        # Keep creation events independent of materialized history so queued
+        # payloads retain the size measured at admission.
         state.conversation_items[item_id] = {**item, "content": []}
         events = [
             _response_created_event(event),
@@ -838,13 +825,11 @@ def _project(state: RealtimeProjectionState, event: dict[str, object]) -> list[D
         if isinstance(audio, str) and audio:
             events.extend(_ensure_response_audio_part_added(state, response_id))
             events.extend(_realtime_audio_delta_events(state, event, response_id, audio))
-            _refresh_in_progress_response_item(state, response_id)
         text = event.get("text")
         has_text = isinstance(text, str) and bool(text)
         has_audio_delta = isinstance(audio, str) and bool(audio)
         if has_text:
             _append_response_transcript(state, response_id, cast("str", text))
-            _refresh_in_progress_response_item(state, response_id)
         # Keep the audio.delta + transcript.delta pair invariant even for
         # text-less units so clients that treat the pair as unit-complete work.
         if has_text or has_audio_delta:
@@ -874,7 +859,6 @@ def _project(state: RealtimeProjectionState, event: dict[str, object]) -> list[D
         projection = _response_state(state, response_id)
         if projection is not None and isinstance(text, str) and text:
             projection.text_parts.append(text)
-            _refresh_in_progress_response_item(state, response_id)
         events = _ensure_response_text_part_added(state, response_id)
         events.append(
             TextDelta(
@@ -993,9 +977,7 @@ def _project(state: RealtimeProjectionState, event: dict[str, object]) -> list[D
             item_id = _response_item_id(state, response_id)
             committed_audio_ms = max(0, int(committed_ms))
             state.item_truncation_cursors[item_id] = (0, committed_audio_ms)
-            cancelled_item = state.conversation_items.get(item_id)
-            if cancelled_item is not None:
-                truncate_realtime_item_content(cancelled_item, content_index=0, audio_end_ms=committed_audio_ms)
+            # Terminal projection below builds a fresh item at this cursor.
         events.extend(_realtime_audio_done_events(state, event, response_id))
         events.extend(
             _realtime_response_terminal_events(
@@ -1034,14 +1016,22 @@ def _project(state: RealtimeProjectionState, event: dict[str, object]) -> list[D
         truncated_item_id = event.get("item_id")
         audio_end_ms = event.get("audio_end_ms")
         content_index = event.get("content_index", 0)
-        if isinstance(truncated_item_id, str):
-            truncated_item = state.conversation_items.get(truncated_item_id)
-            if truncated_item is not None:
+        if isinstance(truncated_item_id, str) and truncated_item_id in state.conversation_items:
+            state.item_truncation_cursors[truncated_item_id] = (_int_or(content_index), _int_or(audio_end_ms))
+            # A live snapshot applies the cursor once to the full transcript.
+            if not _refresh_in_progress_response_item(state, truncated_item_id):
+                truncated_item = dict(state.conversation_items[truncated_item_id])
+                content = truncated_item.get("content")
+                if isinstance(content, list):
+                    # Truncation only writes the part's transcript. Detach the
+                    # parts to preserve queued retrieval and terminal events.
+                    truncated_item["content"] = [dict(part) if isinstance(part, dict) else part for part in content]
                 truncate_realtime_item_content(
                     truncated_item,
                     content_index=_int_or(content_index),
                     audio_end_ms=_int_or(audio_end_ms),
                 )
+                state.conversation_items[truncated_item_id] = truncated_item
         return [
             ItemTruncated(
                 item_id=_str_or_none(truncated_item_id),
@@ -1147,6 +1137,7 @@ def retrieve_item_events(state: RealtimeProjectionState, payload: Mapping[str, o
     item_id = payload.get("item_id")
     if not isinstance(item_id, str) or not item_id:
         return [error_event("missing_item_id", "conversation.item.retrieve requires item_id", event_id=event_id)]
+    _refresh_in_progress_response_item(state, item_id)
     item = state.conversation_items.get(item_id)
     if item is None:
         return [error_event("item_not_found", f"Conversation item not found: {item_id}", event_id=event_id)]
@@ -1399,6 +1390,7 @@ def resolve_delete_item(state: RealtimeProjectionState, command: DeleteItem) -> 
 
 
 def resolve_truncate_item(state: RealtimeProjectionState, command: TruncateItem) -> ResolvedControl:
+    _refresh_in_progress_response_item(state, command.item_id)
     item = state.conversation_items.get(command.item_id)
     if not isinstance(item, dict):
         return ResolvedControl(
