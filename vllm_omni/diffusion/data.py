@@ -1096,7 +1096,35 @@ class OmniDiffusionConfig:
     # str is resolved to {"method": <str>} internally.
     # Per-component: {"transformer": {"method": "fp8"}, "vae": None}
     quantization_config: str | QuantizationConfig | dict[str, Any] | None = None
-    # vLLM kernel backend used by quantized diffusion linears.
+    # Linear GEMM backend forwarded to vllm.config.KernelConfig.linear_backend;
+    # this selects kernels, not the checkpoint's quantization format or MAPS
+    # precision schedule. The installed vLLM version defines the available names.
+    # In vLLM 0.31.0:
+    # - "auto": use vLLM's kernel priority for the layer format and hardware.
+    # - "cutlass": vLLM's CUTLASS GEMMs for supported INT8/FP8/FP4 formats.
+    # - "flashinfer_cutlass": FlashInfer's CUTLASS-based quantized GEMMs.
+    # - "flashinfer_cutedsl": FlashInfer's CuTe-DSL GEMMs, including native
+    #   NVFP4 W4A4 and NVFP4 W4A16 implementations.
+    # - "flashinfer_trtllm": FlashInfer's TensorRT-LLM FP4/FP8 GEMMs.
+    # - "flashinfer_cudnn": FlashInfer's cuDNN NVFP4 GEMMs.
+    # - "flashinfer_b12x": FlashInfer's NVFP4 GEMMs for SM120+ GPUs.
+    # - "b12x": native B12X FP8/FP4 GEMMs for SM12x GPUs.
+    # - "marlin": Marlin GEMMs, including kernels that repack low-bit weights.
+    # - "humming": Humming GEMMs for supported integer, FP8, microscaling,
+    #   and mixed-precision formats.
+    # - "triton": Triton GEMMs for supported INT8/FP8 and W4A16 formats.
+    # - "deep_gemm": DeepGEMM block-scaled FP8 and MXFP8 batched GEMMs.
+    # - "torch": PyTorch native scaled-matmul kernels for supported formats.
+    # - "aiter": AMD AITer quantized GEMMs on ROCm.
+    # - "machete", "conch", "exllama": the respective mixed-precision
+    #   GEMM implementations for supported packed-weight formats.
+    # - "fbgemm": FBGEMM NVFP4 GEMMs.
+    # - "emulation": dequantize supported low-precision operands to BF16
+    #   for BF16 GEMM; useful without native FP4 support, but slower.
+    # - "xpu": Intel XPU FP8 GEMMs; "xpu_woq": XPU weight-only GEMMs.
+    # Selection is per layer and depends on hardware and installed libraries.
+    # vLLM may use automatic selection for a layer format that has no kernel
+    # in the requested backend.
     linear_backend: str = "auto"
     # Internal provenance, retained across config projection and worker transport.
     quantization_config_is_auto_detected: bool = False
