@@ -124,6 +124,14 @@ _MODEL_COEFFICIENTS = {
         -4.232669906169421e00,
         2.173782527946167e-01,
     ],
+    # SD3 / SD3.5 coefficients (estimated for SD3.5).
+    "SD3Transformer2DModel": [
+        -4.277698959844608e03,
+        5.002450261031280e02,
+        5.621228389518113e01,
+        -1.353017614952596e00,
+        3.800369667338725e-02,
+    ],
 }
 
 _DEFAULT_REL_L1_THRESH = 0.2
