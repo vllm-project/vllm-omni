@@ -118,14 +118,14 @@ class Upsample1D(nn.Module):
     """A 1D upsampling layer with an optional convolution.
 
     Args:
-        channels (`int`):
-            number of channels in the inputs and outputs.
-        use_conv (`bool`, default `False`):
-            option to use a convolution.
-        use_conv_transpose (`bool`, default `False`):
-            option to use a convolution transpose.
-        out_channels (`int`, optional):
-            number of output channels. Defaults to `channels`.
+        channels (int): Number of channels in the inputs.
+        use_conv (bool): Whether to convolve after nearest-neighbour upsampling. Has no effect when
+            ``use_conv_transpose`` is set. Defaults to False.
+        use_conv_transpose (bool): Whether to upsample with a transposed convolution instead of
+            nearest-neighbour interpolation. Defaults to True.
+        out_channels (int, optional): Number of channels either convolution outputs. Defaults to
+            ``channels``.
+        name (str): Stored as ``name``; nothing reads it. Defaults to "conv".
     """
 
     def __init__(self, channels, use_conv=False, use_conv_transpose=True, out_channels=None, name="conv"):

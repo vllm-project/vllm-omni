@@ -34,7 +34,8 @@ class PositionalEncoding(torch.nn.Module):
         d_model (int): embedding dim
         dropout_rate (float): dropout rate
         max_len (int): maximum input length
-        reverse (bool): whether to build the table in reverse position order
+        reverse (bool): never read: the table is built in forward position order whatever is passed
+            (``RelPositionalEncoding`` passes True)
     """
 
     def __init__(self, d_model: int, dropout_rate: float, max_len: int = 5000, reverse: bool = False):
