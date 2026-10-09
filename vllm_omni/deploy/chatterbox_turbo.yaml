@@ -68,13 +68,14 @@ stages:
   - stage_id: 1
     dtype: float32
     max_num_seqs: 8
-    # At least stage 0's max_model_len, which bounds an utterance whatever
-    # max_tokens a request asks for: each step hands the stage the whole
-    # utterance so far.
-    max_model_len: 4096
-    # At least max_num_seqs utterances of that length (8 * 2048). A new
-    # request the step's budget cannot cover is scheduled with part of its
-    # tokens, and the decoder would take that part for the utterance.
+    # Stage 0's max_model_len, which bounds an utterance whatever max_tokens
+    # a request asks for: each step hands the stage the whole utterance so
+    # far. Keep the two equal.
+    max_model_len: 2048
+    # At least max_num_seqs * max_model_len (8 * 2048); the stage refuses to
+    # start with less. A new request the step's budget cannot cover is
+    # scheduled with part of its tokens, and the decoder would take that
+    # part for the utterance.
     max_num_batched_tokens: 16384
     gpu_memory_utilization: 0.15
     enforce_eager: true

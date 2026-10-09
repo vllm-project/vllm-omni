@@ -24,7 +24,6 @@ class VoiceEncConfig:
     preemphasis = 0.0
     mel_power = 2.0
     mel_type = "amp"
-    normalized_mels = False
     ve_partial_frames = 160
     ve_final_relu = True
     stft_magnitude_min = 1e-4
@@ -167,13 +166,7 @@ class VoiceEncoder(nn.Module):
         Returns:
             embeds (torch.Tensor): The embeddings as a float32 tensor of shape (B, E) where E is
                 hp.speaker_embed_size. Embeddings are L2-normed and thus lay in the range [-1, 1].
-
-        Raises:
-            Exception: If the mels are normalized and fall outside [0, 1].
         """
-        if self.hp.normalized_mels and (mels.min() < 0 or mels.max() > 1):
-            raise Exception(f"Mels outside [0, 1]. Min={mels.min()}, Max={mels.max()}")
-
         # Pass the input through the LSTM layers
         _, (hidden, _) = self.lstm(mels)
 

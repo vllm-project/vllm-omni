@@ -13,6 +13,7 @@ from vllm_omni.model_executor.models.chatterbox.chatterbox_t3 import (
     speech_logits,
     split_t3_weights,
 )
+from vllm_omni.model_executor.models.chatterbox.conditioning import VoiceConditioning, build_prompt
 from vllm_omni.transformers_utils.configs.chatterbox import ChatterboxConfig
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -66,8 +67,8 @@ def test_prefill_split_with_one_token_tail_matches_one_call_001(heads: T3Heads, 
     whole = prefill_embeds(heads, text_ids, cond_tokens, speaker, config.start_speech_token)
     total = whole.shape[0]
 
-    head = prefill_slice(heads, config, text_ids, cond_tokens, speaker, total, 0, total - 1)
-    tail = prefill_slice(heads, config, text_ids, cond_tokens, speaker, total, total - 1, 1)
+    head = prefill_slice(heads, config, text_ids, cond_tokens, speaker, 0, total - 1)
+    tail = prefill_slice(heads, config, text_ids, cond_tokens, speaker, total - 1, 1)
 
     assert torch.equal(torch.cat([head, tail]), whole)
     # The one-token tail is the prompt's last row, not the embedding a decode
@@ -85,8 +86,8 @@ def test_prefill_span_past_the_prompt_returns_only_the_prompt_rows_001(
     whole = prefill_embeds(heads, text_ids, cond_tokens, speaker, config.start_speech_token)
     total = whole.shape[0]
 
-    from_zero = prefill_slice(heads, config, text_ids, cond_tokens, speaker, total, 0, total + 2)
-    inside = prefill_slice(heads, config, text_ids, cond_tokens, speaker, total, total - 3, 5)
+    from_zero = prefill_slice(heads, config, text_ids, cond_tokens, speaker, 0, total + 2)
+    inside = prefill_slice(heads, config, text_ids, cond_tokens, speaker, total - 3, 5)
 
     assert torch.equal(from_zero, whole)
     assert torch.equal(inside, whole[-3:])
@@ -119,12 +120,38 @@ def test_preprocess_embeds_the_generated_tokens_after_the_prompt_001(
     assert torch.equal(embeds[total:], heads.speech_emb(generated))
 
 
-def test_prefill_refuses_a_prompt_of_the_wrong_length_001(heads: T3Heads, config: ChatterboxConfig) -> None:
-    """A placeholder span longer than the embeddings would zero-pad the prompt."""
-    text_ids = torch.tensor([5, 6, 7])
-    cond_tokens = torch.randint(0, 6561, (375,))
-    with pytest.raises(RuntimeError, match="prompt of 381 tokens"):
-        prefill_slice(heads, config, text_ids, cond_tokens, torch.randn(1, 256), 381, 0, 381)
+@pytest.mark.parametrize("text_len", [1, 3, 671])
+@pytest.mark.parametrize("cond_len", [125, 150, 375])
+def test_the_placeholder_prompt_is_as_long_as_its_embeddings_001(
+    heads: T3Heads, config: ChatterboxConfig, cond_len: int, text_len: int
+) -> None:
+    """``build_prompt`` counts the placeholders, ``prefill_embeds`` builds what replaces them.
+
+    A longer placeholder span would be filled past the prompt with the
+    start token's embedding, a shorter one would drop the start-of-speech
+    slot; either ends generation wrongly with no error. Nothing checks it
+    at run time, so the two are pinned to each other here, through the
+    request payload ``preprocess`` is handed.
+    """
+    conditioning = VoiceConditioning(
+        cond_tokens=torch.randint(0, 6561, (1, cond_len)),
+        speaker_emb=torch.randn(1, 256),
+        prompt_token=torch.randint(0, 6561, (1, 250)),
+        prompt_feat=torch.randn(1, 500, 80),
+        embedding=torch.randn(1, 192),
+    )
+    prompt = build_prompt(list(range(text_len)), conditioning, config)
+    info = prompt["additional_information"]
+
+    embeds = prefill_embeds(
+        heads,
+        torch.tensor(info["ids"]["prompt"]),
+        torch.tensor(info["ids"]["speech_token"]),
+        info["embed"]["voice"],
+        config.start_speech_token,
+    )
+
+    assert len(prompt["prompt_token_ids"]) == embeds.shape[0]
 
 
 def test_batched_decode_embedding_matches_per_request_preprocess_001(

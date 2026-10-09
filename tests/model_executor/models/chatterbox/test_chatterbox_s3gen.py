@@ -471,7 +471,7 @@ def stage_config(
 ) -> SimpleNamespace:
     """The fields of the engine's config that the stage reads."""
     return SimpleNamespace(
-        model_config=SimpleNamespace(hf_config=ChatterboxConfig()),
+        model_config=SimpleNamespace(hf_config=ChatterboxConfig(), max_model_len=2048),
         scheduler_config=SimpleNamespace(
             max_num_seqs=max_num_seqs,
             max_num_batched_tokens=max_num_batched_tokens,
@@ -483,9 +483,9 @@ def stage_config(
 @pytest.mark.parametrize(
     ("max_num_batched_tokens", "max_num_scheduled_tokens", "names"),
     [
-        (7999, None, "max_num_batched_tokens >= max_num_seqs (8) * 1000 = 8000, got 7999"),
-        (16384, 4096, "max_num_scheduled_tokens >= max_num_seqs (8) * 1000 = 8000, got 4096"),
-        (16384, 0, "max_num_scheduled_tokens >= max_num_seqs (8) * 1000 = 8000, got 0"),
+        (16383, None, "max_num_batched_tokens >= max_num_seqs (8) * max_model_len (2048) = 16384, got 16383"),
+        (16384, 8000, "max_num_scheduled_tokens >= max_num_seqs (8) * max_model_len (2048) = 16384, got 8000"),
+        (16384, 0, "max_num_scheduled_tokens >= max_num_seqs (8) * max_model_len (2048) = 16384, got 0"),
     ],
     ids=["batched tokens", "scheduled tokens", "scheduled tokens set to 0"],
 )
@@ -494,9 +494,11 @@ def test_a_step_budget_that_can_split_an_utterance_is_refused_at_startup_001(
 ) -> None:
     """A new request the step's budget cannot cover is scheduled with part of its tokens.
 
-    The decoder would take that part for the whole utterance. Eight slots of
-    1000 tokens need 8000. The scheduler's budget is its scheduled-token limit
-    whenever one is set, 0 included, and the message names the field it read.
+    The decoder would take that part for the whole utterance. An utterance is
+    at most the stage's own context long, so eight slots of a 2048-token
+    context need 16384, whatever ``max_tokens`` a request asks for. The
+    scheduler's budget is its scheduled-token limit whenever one is set, 0
+    included, and the message names the field it read.
     """
     with pytest.raises(ValueError, match=re.escape(names)):
         ChatterboxS3Gen(vllm_config=stage_config(8, max_num_batched_tokens, max_num_scheduled_tokens))
@@ -504,7 +506,9 @@ def test_a_step_budget_that_can_split_an_utterance_is_refused_at_startup_001(
 
 def test_the_stage_builds_with_the_deploy_files_budget_001() -> None:
     decoder = yaml.safe_load(Path(get_deploy_config_path("chatterbox_turbo.yaml")).read_text())["stages"][1]
+    config = stage_config(decoder["max_num_seqs"], decoder["max_num_batched_tokens"])
+    config.model_config.max_model_len = decoder["max_model_len"]
 
-    stage = ChatterboxS3Gen(vllm_config=stage_config(decoder["max_num_seqs"], decoder["max_num_batched_tokens"]))
+    stage = ChatterboxS3Gen(vllm_config=config)
 
     assert stage.allow_patterns_overrides == [ChatterboxConfig().s3gen_weights]

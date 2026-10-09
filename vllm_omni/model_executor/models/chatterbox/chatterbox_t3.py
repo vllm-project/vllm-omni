@@ -90,7 +90,6 @@ def prefill_slice(
     text_ids: torch.Tensor,
     cond_tokens: torch.Tensor,
     speaker_emb: torch.Tensor,
-    prompt_len: int,
     num_computed: int,
     span: int,
 ) -> torch.Tensor:
@@ -109,25 +108,14 @@ def prefill_slice(
         text_ids: Shape (T,), GPT-2 ids of the normalized text.
         cond_tokens: Shape (C,), S3 tokens of the reference clip.
         speaker_emb: Shape (1, 256), the voice encoder's embedding.
-        prompt_len: The request's prompt length, ``_omni_prompt_len``.
         num_computed: Tokens computed before this step, ``_omni_num_computed_tokens``.
         span: Tokens scheduled this step.
 
     Returns:
         Shape (n, H) with ``n <= span``: ``span`` rows, or the remaining
         prompt rows when the span runs past the prompt.
-
-    Raises:
-        RuntimeError: If the prompt and its embeddings differ in length. A
-            longer placeholder span would zero-pad the prompt and end
-            generation early, with no other symptom.
     """
     embeds = prefill_embeds(heads, text_ids, cond_tokens, speaker_emb, config.start_speech_token)
-    if embeds.shape[0] != prompt_len:
-        raise RuntimeError(
-            f"prompt of {prompt_len} tokens but {embeds.shape[0]} prompt embeddings; "
-            "build the prompt with conditioning.build_prompt"
-        )
     return embeds[num_computed : num_computed + span]
 
 
@@ -268,7 +256,6 @@ class ChatterboxT3ForConditionalGeneration(nn.Module, SupportsPP):
             torch.tensor(ids["prompt"], dtype=torch.long, device=device),
             torch.tensor(ids["speech_token"], dtype=torch.long, device=device),
             embed["voice"].to(device=device, dtype=dtype),
-            _omni_prompt_len,
             _omni_num_computed_tokens,
             in_prompt,
         )

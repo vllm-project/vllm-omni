@@ -63,9 +63,9 @@ def test_forward_passes_runner_keywords_through_001(unified: ChatterboxForCondit
     assert unified(torch.zeros(1), torch.zeros(1), seq_token_counts=[1]) == {"seq_token_counts": [1]}
 
 
-def test_unknown_stage_is_refused_001() -> None:
+def test_unknown_stage_is_refused_by_name_001() -> None:
     config = SimpleNamespace(model_config=SimpleNamespace(model_stage="chatterbox_vocoder"))
-    with pytest.raises(ValueError, match="chatterbox_vocoder"):
+    with pytest.raises(KeyError, match="chatterbox_vocoder"):
         ChatterboxForConditionalGeneration(vllm_config=config)
 
 

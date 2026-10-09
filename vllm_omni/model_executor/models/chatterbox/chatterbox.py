@@ -39,10 +39,9 @@ class ChatterboxForConditionalGeneration(nn.Module, SupportsPP):
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
-        stage = vllm_config.model_config.model_stage
-        if stage not in STAGES:
-            raise ValueError(f"unknown Chatterbox model_stage {stage!r}; expected one of {sorted(STAGES)}")
-        self.model = STAGES[stage](vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model"))
+        self.model = STAGES[vllm_config.model_config.model_stage](
+            vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
+        )
 
     def __getattr__(self, name: str) -> object:
         try:

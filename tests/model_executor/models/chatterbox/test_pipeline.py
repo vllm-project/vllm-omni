@@ -77,9 +77,10 @@ def test_deploy_file_agrees_with_the_model_constants_001(deploy: dict) -> None:
     # Stage 1 is handed the whole utterance so far, for every request of a
     # step; a budget short of that gives a new request part of its tokens.
     # A request may raise max_tokens up to what stage 0's context allows, so
-    # that context, not the default cap, bounds an utterance here.
-    assert decoder["max_model_len"] >= talker["max_model_len"]
-    assert decoder["max_num_batched_tokens"] >= decoder["max_num_seqs"] * talker["max_model_len"]
+    # that context, not the default cap, bounds an utterance. Stage 1 checks
+    # its budget against its own max_model_len, which must therefore be stage 0's.
+    assert decoder["max_model_len"] == talker["max_model_len"]
+    assert decoder["max_num_batched_tokens"] >= decoder["max_num_seqs"] * decoder["max_model_len"]
     # The prompt is placeholder ids; a prefix cache would match any two
     # requests of equal length regardless of voice or text.
     assert talker["enable_prefix_caching"] is False
