@@ -134,12 +134,19 @@ class ZImageAdapter(DefaultAdapter):
     model_class_name = "ZImagePipeline"
 
 
+class SD3Adapter(DefaultAdapter):
+    """Adapter for Stable Diffusion 3 / 3.5 coefficient estimation."""
+
+    model_class_name = "StableDiffusion3Pipeline"
+
+
 _MODEL_ADAPTERS: dict[str, type[DefaultAdapter]] = {
     "Bagel": BagelAdapter,
     "StableAudio": StableAudioAdapter,
     "Flux2": Flux2Adapter,
     "LongCat": LongCatAdapter,
     "ZImage": ZImageAdapter,
+    "SD3": SD3Adapter,
 }
 
 _EPSILON = 1e-6
