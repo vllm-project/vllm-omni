@@ -71,7 +71,8 @@ def test_deploy_file_agrees_with_the_model_constants_001(deploy: dict) -> None:
     }
     # What stage 0's context leaves for text once the speaker slot, the
     # longest reference, the start token and the output cap are taken. The
-    # deploy file's comment states this number; longer text is refused.
+    # deploy file's comment states this number; longer text has less room
+    # for output.
     assert talker["max_model_len"] - (1 + config.cond_prompt_len + 1 + config.max_new_tokens) == 671
     # Stage 1 is handed the whole utterance so far, for every request of a
     # step; a budget short of that gives a new request part of its tokens.

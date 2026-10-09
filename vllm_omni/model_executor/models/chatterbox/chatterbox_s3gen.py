@@ -637,15 +637,17 @@ class ChatterboxS3Gen(S3GenDecoder):
         config: ChatterboxConfig = vllm_config.model_config.hf_config
         # The scheduler gives a new request what is left of the step's token
         # budget, and the decoder cannot tell part of an utterance from one.
+        # That budget is the field vLLM's scheduler reads: the scheduled-token
+        # limit whenever one is set, 0 included.
         scheduler = vllm_config.scheduler_config
-        budget = scheduler.max_num_scheduled_tokens
-        if budget is None:
-            budget = scheduler.max_num_batched_tokens
-        if budget < scheduler.max_num_seqs * config.max_new_tokens:
+        field = "max_num_batched_tokens" if scheduler.max_num_scheduled_tokens is None else "max_num_scheduled_tokens"
+        budget = getattr(scheduler, field)
+        needed = scheduler.max_num_seqs * config.max_new_tokens
+        if budget < needed:
             raise ValueError(
-                f"chatterbox_s3gen needs a step token budget of at least max_num_seqs ({scheduler.max_num_seqs}) "
-                f"* {config.max_new_tokens} tokens, got {budget}: raise max_num_batched_tokens, or an utterance "
-                "scheduled in part would be decoded as a whole one"
+                f"chatterbox_s3gen needs {field} >= max_num_seqs ({scheduler.max_num_seqs}) * "
+                f"{config.max_new_tokens} = {needed}, got {budget}: an utterance scheduled in part would be "
+                "decoded as a whole one"
             )
         super().__init__(config)
         # The repo holds other checkpoints too; this stage loads its own.

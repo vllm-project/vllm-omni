@@ -42,8 +42,10 @@ stages:
     # the end-to-end transcripts pass with it.
     dtype: bfloat16
     max_num_seqs: 8
-    # 1 speaker slot + 375 prompt tokens + text + 1 start token + 1000
-    # output tokens: room for 671 text tokens. Longer text is refused.
+    # 1 speaker slot + up to 375 prompt tokens + text + 1 start token + 1000
+    # output tokens: a text of up to 671 tokens has the full 1000-token
+    # output. A longer text is accepted and ends at whatever the 2048 leave
+    # for output; the engine refuses a prompt of 2048 tokens or more.
     max_model_len: 2048
     # One step can prefill a whole prompt. A smaller budget splits the
     # prefill over steps, which stage 0 handles: later first token, steadier

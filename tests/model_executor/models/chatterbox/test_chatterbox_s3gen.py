@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+import re
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -480,20 +481,24 @@ def stage_config(
 
 
 @pytest.mark.parametrize(
-    ("max_num_batched_tokens", "max_num_scheduled_tokens", "budget"),
-    [(7999, None, 7999), (16384, 4096, 4096)],
-    ids=["batched tokens", "scheduled tokens"],
+    ("max_num_batched_tokens", "max_num_scheduled_tokens", "names"),
+    [
+        (7999, None, "max_num_batched_tokens >= max_num_seqs (8) * 1000 = 8000, got 7999"),
+        (16384, 4096, "max_num_scheduled_tokens >= max_num_seqs (8) * 1000 = 8000, got 4096"),
+        (16384, 0, "max_num_scheduled_tokens >= max_num_seqs (8) * 1000 = 8000, got 0"),
+    ],
+    ids=["batched tokens", "scheduled tokens", "scheduled tokens set to 0"],
 )
 def test_a_step_budget_that_can_split_an_utterance_is_refused_at_startup_001(
-    max_num_batched_tokens: int, max_num_scheduled_tokens: int | None, budget: int
+    max_num_batched_tokens: int, max_num_scheduled_tokens: int | None, names: str
 ) -> None:
     """A new request the step's budget cannot cover is scheduled with part of its tokens.
 
     The decoder would take that part for the whole utterance. Eight slots of
-    1000 tokens need 8000; the scheduler's budget is its scheduled-token limit
-    when one is set.
+    1000 tokens need 8000. The scheduler's budget is its scheduled-token limit
+    whenever one is set, 0 included, and the message names the field it read.
     """
-    with pytest.raises(ValueError, match=rf"max_num_seqs \(8\) \* 1000 tokens, got {budget}"):
+    with pytest.raises(ValueError, match=re.escape(names)):
         ChatterboxS3Gen(vllm_config=stage_config(8, max_num_batched_tokens, max_num_scheduled_tokens))
 
 
