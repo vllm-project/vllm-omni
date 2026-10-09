@@ -1830,6 +1830,13 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
             [e.weight.detach() for e in self.audio_embeddings], dim=0
         )  # (n_vq, audio_vocab_size, hidden_size)
 
+        # Build derived tables after loading, before compiling/capturing MTP.
+        # Other devices and FP32 retain the existing frame-local KV path.
+        if current_omni_platform.is_cuda() and self.local_transformer.ln_f.weight.dtype in (
+            torch.bfloat16,
+            torch.float16,
+        ):
+            self.local_transformer.prepare_qkv_lookup(self.audio_embeddings, self.n_vq)
         if not self.vllm_config.model_config.enforce_eager:
             self.local_transformer.setup_compile()
 

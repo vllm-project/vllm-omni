@@ -25,6 +25,9 @@ pytestmark = [pytest.mark.diffusion, pytest.mark.cpu, pytest.mark.core_model]
 # for adding a new tiny model builder and corresponding entry in DIFFUSION_TEST_SETTINGS.
 EXCLUDED_MODELS = [
     "QwenImageLayeredPipeline",
+    # Uses a custom multi-image editing contract; covered by the dedicated
+    # JoyImage tiny-pipeline tests and real-checkpoint E2E accuracy test.
+    "JoyImageEditPipeline",
     # Dedicated CPU/unit coverage in tests/diffusion/models/qwen_image_21/.
     # Tiny-model offline suite is not wired yet (2.1 transformer/VAE configs).
     "QwenImage21Pipeline",

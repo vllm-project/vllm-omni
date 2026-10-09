@@ -282,6 +282,7 @@ markers = [
     "parallel: Parallelism/distributed tests",
     "sp: Sequence parallelism tests",
     "example: Doc example code tests",
+    "nvidia_only: Tests that require NVIDIA CUDA and must not run on ROCm",
     # platform markers
     # Tag with [hardware-platform] for tests.helpers.mark.get_supported_platforms().
     # Add [gpu] on accelerator platforms that should also get pytest.mark.gpu.

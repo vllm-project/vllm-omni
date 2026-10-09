@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 import torch.nn as nn
+from vllm.platforms import current_platform
 
 from vllm_omni.model_executor.models.personaplex.personaplex_code2wav import _MIMI_DECODE_BATCH_FRAMES
 from vllm_omni.model_executor.models.personaplex.personaplex_mimi import (
@@ -70,6 +71,21 @@ def _state_tensors(codec: PersonaPlexMimiCodec) -> list[torch.Tensor]:
 
 def _snapshot(codec: PersonaPlexMimiCodec) -> list[torch.Tensor]:
     return [tensor.clone() for tensor in _state_tensors(codec)]
+
+
+def _assert_waveform_matches(actual: torch.Tensor, expected: torch.Tensor) -> None:
+    if not current_platform.is_rocm():
+        assert torch.equal(actual, expected)
+        return
+
+    # ROCm convolution kernels can accumulate low-order FP32 differences
+    # between eager execution and CUDA graph replay. Keep token outputs exact,
+    # and bound both the peak and aggregate waveform error here.
+    error = (actual - expected).abs()
+    rms = error.square().mean().sqrt().item()
+    print(f"PersonaPlex Mimi ROCm graph parity: max_abs={error.max().item():.9g}, rms={rms:.9g}")
+    torch.testing.assert_close(actual, expected, atol=1e-3, rtol=1e-4)
+    assert rms <= 1e-4, rms
 
 
 @pytest.mark.cpu
@@ -189,14 +205,14 @@ def test_graph_replay_is_bitwise_equal_to_eager_across_recycle() -> None:
     assert codec._cuda_graphs["decode_f1"].replays == 12
     assert graph_inactive_ok
     assert torch.equal(graph_codes, eager_codes)
-    assert torch.equal(graph_pcm, eager_pcm)
+    _assert_waveform_matches(graph_pcm, eager_pcm)
 
     # A full reset in place (a new stream on the same codec) replays the same
     # frames from a fresh state.
     codec.streaming_init(3)
     again_codes, again_pcm, _ = _drive(codec, frames=12, recycle_at=7, device=device)
     assert torch.equal(again_codes, eager_codes)
-    assert torch.equal(again_pcm, eager_pcm)
+    _assert_waveform_matches(again_pcm, eager_pcm)
     assert pointers == [tensor.data_ptr() for tensor in _state_tensors(codec)]
 
 
@@ -235,7 +251,7 @@ def test_multi_frame_decode_graph_matches_eager_chunks(batch_size: int) -> None:
     for (frames, active), expected, actual in zip(steps, eager, graphed):
         assert actual.shape == (batch_size, frames * FRAME_SIZE)
         rows = slice(None) if active is None else active
-        assert torch.equal(actual[rows], expected[rows])
+        _assert_waveform_matches(actual[rows], expected[rows])
 
 
 @pytest.mark.cuda
@@ -277,7 +293,7 @@ def test_failed_capture_warns_with_the_error_and_stays_eager(monkeypatch: pytest
     assert not kwargs
     # The warmup frames are rolled back, so the eager codec starts a fresh stream.
     assert torch.equal(codec.encode_frame(pcm), expected_codes)
-    assert torch.equal(codec.decode_frame(expected_codes), expected_pcm)
+    _assert_waveform_matches(codec.decode_frame(expected_codes), expected_pcm)
 
 
 @pytest.mark.cuda
