@@ -209,9 +209,7 @@ def test_a_cached_decision_belongs_to_its_judge_output(monkeypatch):
     """
     config = _model_config({"format": "chat_yes_no"}, _ChatTokenizer(), monkeypatch)
     judged = rj.after_judge(
-        lambda source_outputs, prompt=None, requires_multimodal_data=False: [
-            o.outputs[0].text for o in source_outputs
-        ]
+        lambda source_outputs, prompt=None, requires_multimodal_data=False: [o.outputs[0].text for o in source_outputs]
     )
     owner = _owner()
     rj.asr2judge([_asr("r1", "第一句")], None, False, owner, target_model_config=config)
