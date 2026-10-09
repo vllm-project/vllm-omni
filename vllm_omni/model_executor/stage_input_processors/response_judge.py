@@ -31,9 +31,7 @@ import functools
 import inspect
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from threading import Lock
 from typing import Any
-from weakref import WeakValueDictionary
 
 from vllm.logger import init_logger
 
@@ -60,19 +58,57 @@ class JudgeSpec:
     format: str
     options: Mapping[str, Any]
 
+    def __post_init__(self) -> None:
+        if self.format not in _FORMATS:
+            raise ValueError(f"unknown response_judge format {self.format!r}; expected one of {sorted(_FORMATS)}")
+        if self.format not in ("laya", "clm"):
+            return
+        opts = dict(self.options)
+        options = opts.get("options", {"yes": None, "no": None})
+        if not isinstance(options, Mapping) or not options:
+            raise ValueError("response_judge.options must be a non-empty mapping")
+        # Prepared CLM directories name their fixed projections with option_keys.
+        keys = opts.get("option_keys", list(options))
+        if not isinstance(keys, (list, tuple)) or not keys:
+            raise ValueError("response_judge.option_keys must be a non-empty list")
+        reply = opts.get("reply_option", keys[0])
+        reply_keys = [str(k) for k in (reply if isinstance(reply, list) else [reply])]
+        if (
+            not reply_keys
+            or any(k not in keys for k in reply_keys)
+            or ("options" in opts and any(k not in options for k in reply_keys))
+        ):
+            raise ValueError("response_judge.reply_option must name one or more configured options")
+        threshold = opts.get("threshold", 0.5)
+        try:
+            value = float(threshold)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("response_judge.threshold must be finite and in [0, 1]") from exc
+        if not 0.0 <= value <= 1.0:
+            raise ValueError(f"response_judge.threshold must be finite and in [0, 1]; got {threshold!r}")
+        opts["threshold"] = value
+        object.__setattr__(self, "options", opts)
+
     @classmethod
     def from_hf_config(cls, hf_config: Any) -> JudgeSpec:
         raw = getattr(hf_config, RESPONSE_JUDGE_CONFIG_KEY, None)
         raw = dict(raw) if isinstance(raw, Mapping) else {}
         fmt = str(raw.pop("format", "chat_yes_no"))
-        if fmt not in _FORMATS:
-            raise ValueError(f"unknown response_judge format {fmt!r}; expected one of {sorted(_FORMATS)}")
         return cls(format=fmt, options=raw)
+
+    @classmethod
+    def for_model_config(cls, model_config: Any) -> JudgeSpec:
+        # OmniModelConfig constructs this at startup; bridges reuse it for
+        # the deployment's lifetime instead of validating every transcript.
+        spec = getattr(model_config, "_response_judge_spec", None)
+        if spec is None:
+            spec = cls.from_hf_config(model_config.hf_config)
+            model_config._response_judge_spec = spec
+        return spec
 
 
 @dataclass
 class _PendingTurn:
-    # No slots: weak references must also work on Python 3.10.
     spec: JudgeSpec | None
     transcript: str
     source_output: Any
@@ -87,10 +123,6 @@ class _PendingTurn:
     rejected: bool = False
 
 
-_PENDING: WeakValueDictionary[str, _PendingTurn] = WeakValueDictionary()
-_LOCK = Lock()
-
-
 def _owned(streaming_context: Any) -> dict[str, _PendingTurn]:
     bridge_states = getattr(streaming_context, "bridge_states", None)
     if not isinstance(bridge_states, dict):
@@ -99,25 +131,14 @@ def _owned(streaming_context: Any) -> dict[str, _PendingTurn]:
 
 
 def _remember(request_id: str, pending: _PendingTurn, streaming_context: Any) -> None:
-    # The request's bridge state owns the entry; the index only holds a weak
-    # reference, so cancel / failure / close release it with the request.
-    owned = _owned(streaming_context)
-    with _LOCK:
-        owned[request_id] = pending
-        _PENDING[request_id] = pending
-
-
-def _peek(request_id: str) -> _PendingTurn | None:
-    with _LOCK:
-        return _PENDING.get(request_id)
+    # The request owns its turn; cancel / failure / close release them together.
+    _owned(streaming_context)[request_id] = pending
 
 
 def _owned_turn(request_id: str, streaming_context: Any) -> _PendingTurn | None:
     # The turn stays with its request until the request ends (or the next turn
     # of the same request replaces it), so a repeated forward still finds it.
-    owned = _owned(streaming_context)
-    with _LOCK:
-        return owned.get(request_id)
+    return _owned(streaming_context).get(request_id)
 
 
 # --------------------------------------------------------------------------- #
@@ -269,10 +290,10 @@ def _option_scores_reject(spec: JudgeSpec, output: Any) -> bool:
     if not bool(torch.isfinite(scores).all()):
         return False
     probs = torch.softmax(scores, dim=-1).tolist()
-    if len(probs) != len(keys) or not reply_keys or any(k not in keys for k in reply_keys):
+    if len(probs) != len(keys):
         return False
     p_reply = sum(probs[keys.index(k)] for k in reply_keys)
-    return p_reply < float(spec.options.get("threshold", 0.5))
+    return p_reply < spec.options["threshold"]
 
 
 def _clm_prompt(spec: JudgeSpec, transcript: str, model_config: Any) -> dict[str, Any]:
@@ -311,13 +332,13 @@ def _rejects(pending: _PendingTurn | None, output: Any) -> bool:
         return False
 
 
-def judge_rejects(output: Any) -> bool:
+def judge_rejects(output: Any, streaming_context: Any) -> bool:
     """True only when the judge clearly said this turn needs no reply.
 
-    Called by the engine on a finished ``response_judge`` stage output.
+    Called by the engine with the output's request-owned streaming state.
     """
     request_id = getattr(output, "request_id", None)
-    return _rejects(_peek(request_id) if isinstance(request_id, str) else None, output)
+    return _rejects(_owned_turn(request_id, streaming_context) if isinstance(request_id, str) else None, output)
 
 
 def judge_input(
@@ -334,7 +355,7 @@ def judge_input(
         target_model_config: Any,
     ) -> list[dict[str, Any]]:
         del requires_multimodal_data
-        spec = JudgeSpec.from_hf_config(target_model_config.hf_config)
+        spec = JudgeSpec.for_model_config(target_model_config)
         build = _FORMATS[spec.format][0]
         prompts = _prompt_for(source_outputs, prompt)
         next_inputs = []

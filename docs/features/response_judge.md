@@ -71,6 +71,11 @@ Options per format:
 `reply_option` may be a list; the probabilities of the listed options are
 added.
 
+For `laya` and `clm`, the server refuses to start if `options` is empty,
+`reply_option` names an option that is not configured, or `threshold` is not
+a number in [0, 1]. Loading also fails if a judge head weight does not have
+exactly the shape the model expects.
+
 The pooling judges load from a directory prepared for vLLM:
 
 - **LAYA:** the checkpoint's weights, `config.json` with

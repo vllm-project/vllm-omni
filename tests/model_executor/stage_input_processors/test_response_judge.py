@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import gc
 import inspect
+import weakref
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -60,7 +62,7 @@ def _owner():
     return SimpleNamespace(bridge_states={})
 
 
-def test_unknown_format_is_rejected_at_prompt_time():
+def test_unknown_format_is_rejected_when_the_spec_is_constructed():
     with pytest.raises(ValueError, match="unknown response_judge format"):
         rj.JudgeSpec.from_hf_config(SimpleNamespace(response_judge={"format": "nope"}))
 
@@ -68,6 +70,90 @@ def test_unknown_format_is_rejected_at_prompt_time():
 def test_default_format_is_a_one_token_chat_judge():
     spec = rj.JudgeSpec.from_hf_config(SimpleNamespace())
     assert spec.format == "chat_yes_no"
+
+
+def _startup_model_config(response_judge, monkeypatch, model_stage=rj.RESPONSE_JUDGE_STAGE):
+    from vllm_omni.config.model import OmniModelConfig
+
+    # The HF config is already loaded; avoid unrelated text-config/model inspection.
+    monkeypatch.setattr(OmniModelConfig, "_maybe_override_text_config", lambda self: None)
+    base = SimpleNamespace(hf_config=SimpleNamespace(response_judge=response_judge))
+    return OmniModelConfig.from_vllm_model_config(base, model_stage=model_stage, model_arch="ClmDecisionModel")
+
+
+@pytest.mark.parametrize(
+    ("raw", "error"),
+    [
+        ({"format": "clm", "threshold": 0}, None),
+        ({"format": "clm", "threshold": 1}, None),
+        ({"format": "clm", "threshold": "0.0173"}, None),
+        ({"format": "chat_yes_no"}, None),
+        ({"format": "clm", "threshold": 1.01}, "threshold"),
+        ({"format": "clm", "threshold": float("nan")}, "threshold"),
+        ({"format": "clm", "threshold": "invalid"}, "threshold"),
+        ({"format": "clm", "options": {}}, "options"),
+        ({"format": "clm", "option_keys": []}, "option_keys"),
+        ({"format": "clm", "reply_option": "missing"}, "reply_option"),
+        ({"format": "clm", "reply_option": []}, "reply_option"),
+    ],
+)
+def test_judge_configuration_is_checked_at_startup(monkeypatch, raw, error):
+    if error is None:
+        _startup_model_config(raw, monkeypatch)
+        return
+    with pytest.raises(ValueError, match=f"response_judge.{error}"):
+        _startup_model_config(raw, monkeypatch)
+
+
+def test_startup_spec_is_reused_for_later_transcripts(monkeypatch):
+    config = _startup_model_config({"format": "clm", "option_keys": ["request", "quiet"]}, monkeypatch)
+    spec = rj.JudgeSpec.for_model_config(config)
+
+    def unexpected_reload(cls, hf_config):
+        pytest.fail("judge configuration must be validated at startup, not per transcript")
+
+    monkeypatch.setattr(rj.JudgeSpec, "from_hf_config", classmethod(unexpected_reload))
+    owner = _owner()
+    for request_id in ("first", "second"):
+        rj.asr2judge([_asr(request_id, "hi")], None, False, owner, target_model_config=config)
+        assert rj._owned_turn(request_id, owner).spec is spec
+
+
+def test_other_stages_do_not_load_judge_configuration(monkeypatch):
+    config = _startup_model_config({"format": "clm", "threshold": 2}, monkeypatch, model_stage="other")
+    assert not hasattr(config, "_response_judge_spec")
+
+
+@pytest.fixture
+def prepared_clm_options():
+    # response_judge from a prepared CLM directory's config.json.
+    return {
+        "format": "clm",
+        "instructions": "What should the voice assistant do next?",
+        "option_keys": ["answer", "act", "ack", "other", "noise"],
+        "reply_option": ["answer", "act"],
+        "threshold": 0.300773,
+        "state_template": "{transcript}",
+    }
+
+
+@pytest.mark.parametrize(
+    ("name", "fmt"),
+    [("aura_omni_judged", "chat_yes_no"), ("aura_omni_judged_laya", "laya"), ("aura_omni_judged_clm", "clm")],
+)
+def test_example_deploy_judge_overrides_remain_valid(monkeypatch, prepared_clm_options, name, fmt):
+    import yaml
+
+    path = Path(rj.__file__).parents[2] / "deploy" / f"{name}.yaml"
+    deploy = yaml.safe_load(path.read_text())
+    stage = next(s for s in deploy["stages"] if s["stage_id"] == 1)
+    raw = stage["hf_overrides"].get("response_judge", prepared_clm_options)
+    config = _startup_model_config(raw, monkeypatch)
+    spec = rj.JudgeSpec.for_model_config(config)
+    assert spec.format == fmt
+    if fmt == "clm":
+        assert spec.options["option_keys"] == ["answer", "act", "ack", "other", "noise"]
+        assert spec.options["reply_option"] == ["answer", "act"]
 
 
 @pytest.mark.parametrize(
@@ -79,7 +165,7 @@ def test_chat_judge_rejects_only_a_clear_no(monkeypatch, answer, rejected):
     owner = _owner()
     [judge_input] = rj.asr2judge([_asr("r1", "嗯嗯")], None, False, owner, target_model_config=config)
     assert "用户刚刚说：「嗯嗯」" in judge_input["prompt"]
-    assert rj.judge_rejects(_judge_text("r1", answer)) is rejected
+    assert rj.judge_rejects(_judge_text("r1", answer), owner) is rejected
 
 
 def test_chat_judge_uses_configured_prompts(monkeypatch):
@@ -96,12 +182,24 @@ def test_empty_transcript_is_never_rejected(monkeypatch):
     config = _model_config({"format": "chat_yes_no"}, _ChatTokenizer(), monkeypatch)
     owner = _owner()
     rj.asr2judge([_asr("r1", "   ")], None, False, owner, target_model_config=config)
-    assert rj._peek("r1") is not None
-    assert rj.judge_rejects(_judge_text("r1", "NO")) is False
+    assert rj._owned_turn("r1", owner) is not None
+    assert rj.judge_rejects(_judge_text("r1", "NO"), owner) is False
 
 
 def test_unknown_request_is_let_through():
-    assert rj.judge_rejects(_judge_text("never-judged", "NO")) is False
+    assert rj.judge_rejects(_judge_text("never-judged", "NO"), _owner()) is False
+
+
+def test_judge_decisions_do_not_cross_request_owners_with_the_same_id(monkeypatch):
+    config = _model_config({"format": "chat_yes_no"}, _ChatTokenizer(), monkeypatch)
+    owner, other = _owner(), _owner()
+    rj.asr2judge([_asr("same", "嗯嗯")], None, False, owner, target_model_config=config)
+    # An empty transcript must pass through even when another owner records NO.
+    rj.asr2judge([_asr("same", "")], None, False, other, target_model_config=config)
+    output = _judge_text("same", "NO")
+    assert rj.judge_rejects(output, owner) is True
+    assert rj.judge_rejects(output, other) is False
+    assert rj.judge_rejects(output, _owner()) is False
 
 
 def test_after_judge_forwards_the_asr_output_and_drops_rejected_turns(monkeypatch):
@@ -225,7 +323,7 @@ def test_a_prompt_that_cannot_be_built_records_no_turn(monkeypatch):
     owner = _owner()
     with pytest.raises(KeyError):
         rj.asr2judge([_asr("r-bad", "hi")], None, False, owner, target_model_config=config)
-    assert rj._peek("r-bad") is None
+    assert rj._owned_turn("r-bad", owner) is None
     assert owner.bridge_states.get("response_judge", {}) == {}
 
 
@@ -233,16 +331,22 @@ def test_pending_turn_is_released_with_the_request_owner(monkeypatch):
     config = _model_config({"format": "chat_yes_no"}, _ChatTokenizer(), monkeypatch)
     owner = _owner()
     rj.asr2judge([_asr("r-owned", "嗯嗯")], None, False, owner, target_model_config=config)
-    assert rj.judge_rejects(_judge_text("r-owned", "NO")) is True
+    assert rj.judge_rejects(_judge_text("r-owned", "NO"), owner) is True
+    pending = weakref.ref(rj._owned_turn("r-owned", owner))
     del owner
     gc.collect()
-    assert rj.judge_rejects(_judge_text("r-owned", "NO")) is False
+    assert pending() is None
 
 
 def test_judge_requires_request_owned_bridge_state(monkeypatch):
     config = _model_config({"format": "chat_yes_no"}, _ChatTokenizer(), monkeypatch)
     with pytest.raises(RuntimeError, match="bridge state"):
         rj.asr2judge([_asr("r1", "hi")], None, False, None, target_model_config=config)
+
+
+def test_judge_decision_requires_request_owned_bridge_state():
+    with pytest.raises(RuntimeError, match="bridge state"):
+        rj.judge_rejects(_judge_text("r1", "NO"), None)
 
 
 def test_laya_prompt_follows_the_laya_sequence_layout(monkeypatch):
@@ -277,16 +381,16 @@ def test_laya_judge_rejects_when_the_reply_option_is_unlikely(monkeypatch, logit
     )
     owner = _owner()
     rj.asr2judge([_asr("r1", "嗯嗯")], None, False, owner, target_model_config=config)
-    assert rj._peek("r1") is not None
-    assert rj.judge_rejects(_judge_pooled("r1", logits)) is rejected
+    assert rj._owned_turn("r1", owner) is not None
+    assert rj.judge_rejects(_judge_pooled("r1", logits), owner) is rejected
 
 
 def test_unreadable_pooling_output_is_let_through(monkeypatch):
     config = _model_config({"format": "laya"}, _LayaTokenizer(), monkeypatch)
     owner = _owner()
     rj.asr2judge([_asr("r1", "嗯嗯")], None, False, owner, target_model_config=config)
-    assert rj._peek("r1") is not None
-    assert rj.judge_rejects(SimpleNamespace(request_id="r1", outputs=[SimpleNamespace(text="")])) is False
+    assert rj._owned_turn("r1", owner) is not None
+    assert rj.judge_rejects(SimpleNamespace(request_id="r1", outputs=[SimpleNamespace(text="")]), owner) is False
 
 
 @pytest.mark.parametrize(
@@ -309,7 +413,7 @@ def test_pooled_scores_that_cannot_be_read_let_the_turn_through(monkeypatch, log
     owner = _owner()
     rj.asr2judge([_asr("r1", "嗯嗯")], None, False, owner, target_model_config=config)
     output = SimpleNamespace(request_id="r1", finished=True, outputs=SimpleNamespace(data=logits))
-    assert rj.judge_rejects(output) is False
+    assert rj.judge_rejects(output, owner) is False
 
 
 def test_clm_prompt_is_context_blank_line_question(monkeypatch):
@@ -337,7 +441,7 @@ def test_several_reply_options_add_up(monkeypatch, logits, rejected):
     )
     owner = _owner()
     rj.asr2judge([_asr("r1", "好的")], None, False, owner, target_model_config=config)
-    assert rj.judge_rejects(_judge_pooled("r1", logits)) is rejected
+    assert rj.judge_rejects(_judge_pooled("r1", logits), owner) is rejected
 
 
 def test_multimodal_carrier_with_one_tensor_is_read(monkeypatch):
@@ -347,7 +451,7 @@ def test_multimodal_carrier_with_one_tensor_is_read(monkeypatch):
     output = SimpleNamespace(
         request_id="r1", outputs=[SimpleNamespace(text="")], multimodal_output={"text": torch.tensor([0.0, 3.0])}
     )
-    assert rj.judge_rejects(output) is True
+    assert rj.judge_rejects(output, owner) is True
 
 
 def _call_like_the_engine(processor, source_outputs, prompt, owner, **extras):

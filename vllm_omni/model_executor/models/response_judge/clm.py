@@ -101,8 +101,13 @@ class ClmDecisionModel(as_embedding_model(ResponseJudgeQwen3ForCausalLM)):  # ty
         for name, tensor in weights:
             if name.startswith("clm."):
                 key = name[len("clm.") :]
+                param = head_params[key]
+                if tensor.shape != param.shape:
+                    raise ValueError(
+                        f"CLM judge weight {name!r} has shape {tuple(tensor.shape)}; expected {tuple(param.shape)}"
+                    )
                 with torch.no_grad():
-                    head_params[key].copy_(tensor.to(head_params[key].dtype).reshape(head_params[key].shape))
+                    param.copy_(tensor.to(param.dtype))
                 loaded.add(f"pooler.{key}")
             else:
                 backbone.append((name, tensor))

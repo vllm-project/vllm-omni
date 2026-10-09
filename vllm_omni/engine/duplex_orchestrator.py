@@ -256,7 +256,9 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
             segment_token_ids=tuple(segment.token_ids),
             segment_output_metadata=segment.output_metadata,
             perf_chunks=self._take_perf_chunks(req_state, stage_id),
-            response_judge_rejected=finished and self._is_response_judge_stage(stage_id) and judge_rejects(output),
+            response_judge_rejected=(
+                finished and self._is_response_judge_stage(stage_id) and judge_rejects(output, req_state.streaming)
+            ),
         )
         return runner.on_stage_output(
             stage_id,

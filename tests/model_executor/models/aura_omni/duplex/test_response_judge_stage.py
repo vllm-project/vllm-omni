@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import importlib
+import weakref
 from types import SimpleNamespace
 
 import pytest
@@ -85,6 +86,7 @@ async def test_judge_no_ends_the_turn_through_the_native_listen_path(auto_respon
     try:
         assert (await _open(orchestrator, rpc_q, extra_body={"auto_response": auto_response})).ok
         request_id = await _pending_judge(orchestrator)
+        pending = weakref.ref(rj._owned_turn(request_id, orchestrator.request_states[request_id].streaming))
         session = orchestrator.session_manager.get(SESSION_ID)
         session.bind_request(request_id)
         session.bind_response_turn(session.turn_id)
@@ -95,7 +97,7 @@ async def test_judge_no_ends_the_turn_through_the_native_listen_path(auto_respon
         assert consumed
         await _settle(orchestrator)
         assert request_id not in orchestrator.request_states
-        assert rj.judge_rejects(_judge_output(request_id, "NO")) is False  # released with the request
+        assert pending() is None  # released with the request
         assert clients[2].add_request_calls == []
         assert clients[3].add_request_calls == []
         events = [output_q.get_nowait().event for _ in range(output_q.qsize())]
@@ -186,14 +188,17 @@ async def test_native_terminal_paths_release_the_pending_turn(terminal):
     try:
         assert (await _open(orchestrator, rpc_q)).ok
         request_id = await _pending_judge(orchestrator)
-        assert rj.judge_rejects(_judge_output(request_id, "NO")) is True
+        pending = weakref.ref(rj._owned_turn(request_id, orchestrator.request_states[request_id].streaming))
+        assert (
+            rj.judge_rejects(_judge_output(request_id, "NO"), orchestrator.request_states[request_id].streaming) is True
+        )
         if terminal == "cancel":
             await _submit(orchestrator, commands.BargeIn())
         else:
             assert (await _close(orchestrator, rpc_q)).ok
         await _settle(orchestrator)
         assert request_id not in orchestrator.request_states
-        assert rj.judge_rejects(_judge_output(request_id, "NO")) is False
+        assert pending() is None
         assert clients[2].add_request_calls == []
     finally:
         await orchestrator.session_manager.shutdown()

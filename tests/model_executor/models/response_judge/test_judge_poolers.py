@@ -11,8 +11,12 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from vllm_omni.model_executor.models.response_judge.clm import ClmDecisionPooler, ClmHead
-from vllm_omni.model_executor.models.response_judge.laya import LayaDecisionPooler, laya_question_type
+from vllm_omni.model_executor.models.response_judge.clm import ClmDecisionModel, ClmDecisionPooler, ClmHead
+from vllm_omni.model_executor.models.response_judge.laya import (
+    LayaDecisionModel,
+    LayaDecisionPooler,
+    laya_question_type,
+)
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -47,6 +51,77 @@ def test_clm_pooler_matches_the_reference_contrastive_score():
 def test_clm_head_parameter_names_match_the_checkpoint_layout():
     names = set(dict(ClmHead(hidden=8, width=4, depth=3, layernorm=True).named_parameters()))
     assert {"inp.weight", "hidden.0.weight", "norms.0.weight", "out.weight"} <= names
+
+
+def _weight_loader(kind, monkeypatch):
+    backbone_calls = []
+
+    def load_backbone(weights):
+        weights = list(weights)
+        backbone_calls.append(weights)
+        return {name for name, _ in weights}
+
+    if kind == "clm":
+        model = object.__new__(ClmDecisionModel)
+        torch.nn.Module.__init__(model)
+        model.pooler = ClmDecisionPooler({"hidden": 8, "width": 4, "depth": 3, "proj": 4, "layernorm": True}, 2)
+        # Exercise the real head loader without constructing the Qwen backbone.
+        monkeypatch.setattr(ClmDecisionModel.__mro__[1], "load_weights", lambda self, weights: load_backbone(weights))
+    else:
+        model = object.__new__(LayaDecisionModel)
+        torch.nn.Module.__init__(model)
+        model.pooler = LayaDecisionPooler(hidden_size=64, head_layers=1, mask_token_id=4, qtype=0)
+        model.encoder = SimpleNamespace(load_weights=load_backbone)
+    return model, backbone_calls
+
+
+@pytest.mark.parametrize("kind", ["clm", "laya"])
+def test_judge_loaders_copy_exact_shapes_and_forward_backbone_weights(monkeypatch, kind):
+    model, backbone_calls = _weight_loader(kind, monkeypatch)
+    params = dict(model.pooler.named_parameters())
+    expected = {
+        name: torch.full(param.shape, i + 1.0, dtype=torch.float64) for i, (name, param) in enumerate(params.items())
+    }
+    prefix = "clm." if kind == "clm" else ""
+    backbone = torch.ones(2, 2)
+    weights = [(prefix + name, tensor) for name, tensor in expected.items()]
+    weights.append(("encoder.layer.weight", backbone))
+    loaded = model.load_weights(iter(weights))
+    assert loaded == {f"pooler.{name}" for name in params} | {"encoder.layer.weight"}
+    expected_backbone_name = "encoder.layer.weight" if kind == "clm" else "layer.weight"
+    assert len(backbone_calls) == 1
+    [(name, tensor)] = backbone_calls[0]
+    assert name == expected_backbone_name and tensor is backbone
+    for name, param in params.items():
+        torch.testing.assert_close(param, expected[name].to(param.dtype))
+    if kind == "clm":
+        # The preparation script writes clm.scale as torch.tensor(scale), shape ().
+        assert model.pooler.scale.shape == torch.Size([])
+
+
+@pytest.mark.parametrize(
+    ("kind", "name", "shape"),
+    [
+        ("clm", "state_head.inp.weight", (8, 4)),
+        ("clm", "scale", (1,)),
+        ("laya", "type_emb.weight", (1, 64)),
+        ("laya", "scorer.3.bias", ()),
+    ],
+)
+def test_judge_loaders_reject_reshaped_or_broadcastable_head_weights(monkeypatch, kind, name, shape):
+    model, backbone_calls = _weight_loader(kind, monkeypatch)
+    param = dict(model.pooler.named_parameters())[name]
+    before = param.detach().clone()
+    weight_name = f"clm.{name}" if kind == "clm" else name
+    tensor = torch.ones(shape)
+    with pytest.raises(ValueError) as exc:
+        model.load_weights(iter([(weight_name, tensor)]))
+    message = str(exc.value)
+    assert weight_name in message
+    assert f"has shape {shape}" in message
+    assert f"expected {tuple(param.shape)}" in message
+    torch.testing.assert_close(param, before)
+    assert backbone_calls == []
 
 
 def test_laya_pooler_scores_each_request_at_its_own_mask_markers():

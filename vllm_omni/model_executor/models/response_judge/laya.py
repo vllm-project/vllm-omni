@@ -126,8 +126,13 @@ class LayaDecisionModel(nn.Module):
             if name.startswith("encoder."):
                 encoder_weights.append((name[len("encoder.") :], tensor))
             elif name in head_params:
+                param = head_params[name]
+                if tensor.shape != param.shape:
+                    raise ValueError(
+                        f"LAYA judge weight {name!r} has shape {tuple(tensor.shape)}; expected {tuple(param.shape)}"
+                    )
                 with torch.no_grad():
-                    head_params[name].copy_(tensor.to(head_params[name].dtype))
+                    param.copy_(tensor.to(param.dtype))
                 loaded.add(f"pooler.{name}")
             # act_head.* and the temperature buffer are not used by the judge.
         loaded |= {f"encoder.{n}" for n in self.encoder.load_weights(encoder_weights)}
