@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Utilities for handling multimodal outputs / building multimodal output
 payloads, most of which are shared by the prefix cache / no prefix cache path.
 """
@@ -17,6 +20,8 @@ _CLIENT_MM_ROOT_KEYS: frozenset[str] = frozenset(
         "model_outputs",
         "sr",
         "audio",
+        # The codec frames a code2wav stage decoded, beside the audio they cover.
+        "codec_frames",
         "image",
         "images",
         "video",
@@ -30,6 +35,7 @@ _CLIENT_MM_META_KEYS: frozenset[str] = frozenset(
     {
         "audio_text_total_chars",
         "duplex_epoch",
+        "duplex_generated_seq",
         "duplex_turn_id",
         "llm_output_text_utf8",
         "segment_end",

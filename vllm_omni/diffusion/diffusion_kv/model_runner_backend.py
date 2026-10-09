@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import copy
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -154,6 +154,7 @@ class DiffusionKVModelRunnerBackend:
 
         if attention_geometry is not None:
             num_heads, num_kv_heads, head_size = attention_geometry
+            assert callable(set_attention_geometry)
             try:
                 set_attention_geometry(
                     num_heads=num_heads,
@@ -189,6 +190,10 @@ class DiffusionKVModelRunnerBackend:
                 f"Diffusion paged attention currently supports only strict Ulysses; got ulysses_mode={ulysses_mode!r}"
             )
         return ulysses_degree
+
+    @property
+    def kv_caches_by_layer(self) -> dict[str, torch.Tensor]:
+        return {name: layer.kv_cache for name, layer in self._kv_cache_layer_adapters.items()}
 
     def _get_max_rows_per_request(self) -> int:
         max_rows = getattr(self.od_config, "diffusion_kv_max_rows_per_request", None)
@@ -245,7 +250,9 @@ class DiffusionKVModelRunnerBackend:
             for capacity, block_size in zip(unaligned_max_num_blocks_per_group, block_sizes, strict=True)
         ]
 
-        max_num_reqs = max_num_seqs * max_rows_per_request
+        max_num_reqs = max_num_seqs
+        if max_num_reqs % max_rows_per_request:
+            raise ValueError("scheduler_config.max_num_seqs must be a multiple of diffusion_kv_max_rows_per_request")
         max_num_batched_tokens = getattr(scheduler_config, "max_num_batched_tokens", None)
         if type(max_num_batched_tokens) is not int or max_num_batched_tokens <= 0:
             raise ValueError("scheduler_config.max_num_batched_tokens must be a positive integer")
@@ -254,10 +261,6 @@ class DiffusionKVModelRunnerBackend:
         cp_rank = get_dcp_group().rank_in_group if cp_size > 1 else 0
         cp_interleave = parallel_config.cp_kv_cache_interleave_size
 
-        # Native metadata builders size per-row buffers from max_num_seqs.
-        # A diffusion public request can occupy several sequence/context rows.
-        scheduler_config.max_num_seqs = max_num_reqs
-        kv_caches: list[torch.Tensor | list[torch.Tensor]] = []
         previous_adapter_caches = {
             layer_name: adapter.kv_cache for layer_name, adapter in self._kv_cache_layer_adapters.items()
         }
@@ -289,21 +292,21 @@ class DiffusionKVModelRunnerBackend:
                     layers=self._kv_cache_layer_adapters,
                     resolve_row=self._resolve_paged_attention_row,
                 )
-                # vLLM 0.29 reads the resolved physical layout when allocating,
-                # and dropped attn_groups/cache_dtype from the signature.
+                # f2aad6aa70 (#56888): first arg is forward_context; caches
+                # are returned as a dict instead of appended to a runner list.
                 adopt_kv_cache_layout(self.vllm_config, kv_cache_config)
                 for layer_adapter in self._kv_cache_layer_adapters.values():
                     assert_backend_layout_supported(self.vllm_config, getattr(layer_adapter, "attn_backend", None))
-                init_kv_cache(
-                    kv_caches,
+                kv_caches_dict = init_kv_cache(
                     self.vllm_config.compilation_config.static_forward_context,
                     kv_cache_config,
                     self.device,
                     kernel_block_sizes,
                     self.vllm_config,
+                    block_tables=block_tables,
                 )
+                kv_caches = list(kv_caches_dict.values())
         except Exception:
-            scheduler_config.max_num_seqs = max_num_seqs
             for layer_name, previous_cache in previous_adapter_caches.items():
                 self._kv_cache_layer_adapters[layer_name].kv_cache = previous_cache
             raise
@@ -394,6 +397,15 @@ class DiffusionKVModelRunnerBackend:
         for sequence in metadata.sequences:
             if type(sequence.sequence_id) is not int or sequence.sequence_id < 0:
                 raise ValueError(f"Diffusion KV sequence_id must be a non-negative integer: {sequence.sequence_id!r}")
+            if (
+                type(sequence.cached_prefix_len) is not int
+                or sequence.cached_prefix_len < 0
+                or sequence.cached_prefix_len > sequence.prefix_len
+            ):
+                raise ValueError(
+                    "Diffusion KV cached_prefix_len must lie within the stable prefix: "
+                    f"cached={sequence.cached_prefix_len!r}, prefix={sequence.prefix_len!r}"
+                )
             sequence_identity = (metadata.request_id, sequence.sequence_id, None)
             sequence_install = self._validate_row(
                 identity=sequence_identity,
@@ -408,6 +420,7 @@ class DiffusionKVModelRunnerBackend:
                     sequence.prefix_len,
                     sequence.target_len,
                     sequence.seq_len,
+                    sequence.cached_prefix_len,
                     sequence_install.block_ids,
                     sequence.context_ids,
                 )
@@ -591,7 +604,7 @@ class DiffusionKVModelRunnerBackend:
                     )
         raise RuntimeError(f"Diffusion KV request state is missing logical length for {identity!r}")
 
-    def remove_diffusion_kv_requests(self, request_ids: list[str]) -> int:
+    def remove_diffusion_kv_requests(self, request_ids: Sequence[str | tuple[str, int]]) -> int:
         """Retire Worker rows without logically freeing Scheduler-owned blocks."""
         if (
             not is_scheduler_paged_kv_mode(
@@ -600,11 +613,25 @@ class DiffusionKVModelRunnerBackend:
             or self.block_tables is None
         ):
             return 0
-        request_id_set = set(request_ids)
+        request_generations = {
+            request_id: generation
+            for item in request_ids
+            if isinstance(item, tuple)
+            for request_id, generation in (item,)
+            if isinstance(request_id, str) and type(generation) is int
+        }
+        request_id_set = {item if isinstance(item, str) else item[0] for item in request_ids}
         identities_and_rows = [
             (identity, row)
             for identity, row in self._diffusion_kv_identity_to_row.items()
             if identity[0] in request_id_set
+            and (
+                identity[0] not in request_generations
+                or (
+                    (request_state := self._diffusion_kv_request_states.get(identity[0])) is not None
+                    and request_state.generation == request_generations[identity[0]]
+                )
+            )
         ]
         rows = [row for _, row in identities_and_rows]
         if rows:
@@ -620,9 +647,10 @@ class DiffusionKVModelRunnerBackend:
             ]
             self._apply_rows(rows, installs)
 
+        removed_request_ids = {identity[0] for identity, _ in identities_and_rows}
         for identity, _ in identities_and_rows:
             del self._diffusion_kv_identity_to_row[identity]
-        for request_id in request_id_set:
+        for request_id in removed_request_ids:
             self._diffusion_kv_request_states.pop(request_id, None)
         self._diffusion_kv_free_rows.extend(rows)
         self._diffusion_kv_free_rows.sort(reverse=True)

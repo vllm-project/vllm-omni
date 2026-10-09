@@ -19,6 +19,8 @@ from vllm_omni.diffusion.data import OmniDiffusionConfig
 if TYPE_CHECKING:
     import torch
 
+    from vllm_omni.diffusion.diffusion_kv.paged_attention_adapter import DiffusionPagedAttentionRuntime
+
 
 @dataclass
 class ForwardContext:
@@ -32,7 +34,10 @@ class ForwardContext:
     # Runner-owned paged execution metadata/runtime. Attention resolves the
     # active Worker adapter from it; model code must not construct BlockTable
     # rows or activate the runtime directly.
-    paged_kv_runtime: object | None = None
+    paged_kv_runtime: DiffusionPagedAttentionRuntime | None = None
+    # Block-aligned prefix already resident in Scheduler-owned pages for the
+    # active request-level prefill. Zero keeps the cold/full-prefill path.
+    paged_kv_cached_prefix_len: int = 0
     # Active Worker-side paged KV adapter.  The adapter is installed only for
     # the duration of a paged forward; dense forwards leave this as ``None``.
     # Keep the field opaque here to avoid coupling the common context module to
@@ -48,6 +53,8 @@ class ForwardContext:
     total_denoise_steps: int | None = None
     # Per-request reference latent for img2img DiT models (e.g. Ming)
     ref_latent: torch.Tensor | None = None
+    # Per-request projected direct-VLM condition (e.g., Ming-Image). For now for bsz 1.
+    direct_condition: torch.Tensor | None = None
     # whether to split the text embed in sequence parallel, if True, the text embed will be split in sequence parallel
 
     # Sequence Parallel padding support
@@ -57,6 +64,10 @@ class ForwardContext:
     sp_padding_size: int = 0
     # Original sequence length before padding (for removing padding in gather)
     sp_original_seq_len: int | None = None
+    # Pre-padding global sequence length per SequenceParallelInput shard_group,
+    # for models that auto-pad several independent sequences in one boundary.
+    # The singleton fields above remain for single-sequence models.
+    sp_shard_metadata: dict[str, int] = field(default_factory=dict)
 
     # Set by registry when _sp_plan hooks are applied.
     # When True, sp_active is determined by _sp_shard_depth (for _sp_plan hooks)
@@ -120,6 +131,13 @@ def is_forward_context_available() -> bool:
     return _forward_context is not None
 
 
+def get_sp_shard_original_seq_len(shard_group: str) -> int | None:
+    """Pre-padding global length of `shard_group`, or None if it was not split."""
+    if not is_forward_context_available():
+        return None
+    return get_forward_context().sp_shard_metadata.get(shard_group)
+
+
 def build_local_sp_padding_mask(
     batch_size: int,
     local_seq_len: int,
@@ -175,7 +193,8 @@ def create_forward_context(
     vllm_config: VllmConfig | None = None,
     omni_diffusion_config: OmniDiffusionConfig | None = None,
     attn_metadata: dict[str, AttentionMetadata] | list[dict[str, AttentionMetadata]] | None = None,
-    paged_kv_runtime: object | None = None,
+    paged_kv_runtime: DiffusionPagedAttentionRuntime | None = None,
+    paged_kv_cached_prefix_len: int = 0,
     in_diffusion_kv_memory_profile: bool = False,
     split_text_embed_in_sp: bool = False,
     denoise_step_idx: int | None = None,
@@ -185,6 +204,7 @@ def create_forward_context(
         omni_diffusion_config=omni_diffusion_config,
         attn_metadata=attn_metadata,
         paged_kv_runtime=paged_kv_runtime,
+        paged_kv_cached_prefix_len=paged_kv_cached_prefix_len,
         in_diffusion_kv_memory_profile=in_diffusion_kv_memory_profile,
         split_text_embed_in_sp=split_text_embed_in_sp,
         denoise_step_idx=denoise_step_idx,
@@ -211,7 +231,8 @@ def set_forward_context(
     vllm_config: VllmConfig | None = None,
     omni_diffusion_config: OmniDiffusionConfig | None = None,
     attn_metadata: dict[str, AttentionMetadata] | list[dict[str, AttentionMetadata]] | None = None,
-    paged_kv_runtime: object | None = None,
+    paged_kv_runtime: DiffusionPagedAttentionRuntime | None = None,
+    paged_kv_cached_prefix_len: int = 0,
     in_diffusion_kv_memory_profile: bool = False,
     split_text_embed_in_sp: bool = False,
     denoise_step_idx: int | None = None,
@@ -225,6 +246,7 @@ def set_forward_context(
         omni_diffusion_config=omni_diffusion_config,
         attn_metadata=attn_metadata,
         paged_kv_runtime=paged_kv_runtime,
+        paged_kv_cached_prefix_len=paged_kv_cached_prefix_len,
         in_diffusion_kv_memory_profile=in_diffusion_kv_memory_profile,
         split_text_embed_in_sp=split_text_embed_in_sp,
         denoise_step_idx=denoise_step_idx,
@@ -282,6 +304,47 @@ def set_forward_context_denoise_step_idx(step_idx: int | None) -> None:
                 ensure_active(step_idx)
 
 
+def get_paged_kv_computed_tokens() -> tuple[int, ...]:
+    runtime = _forward_context.paged_kv_runtime if _forward_context is not None else None
+    if runtime is None:
+        return ()
+    return tuple(row.kv_start_pos for row in runtime.metadata.prefill_rows)
+
+
+@contextmanager
+def paged_kv_prefill(sequence_id: int, num_tokens: int):
+    from dataclasses import replace
+
+    runtime = get_forward_context().paged_kv_runtime
+    if runtime is None:
+        raise RuntimeError("Paged KV prefill requires an active runtime")
+    rows = runtime.metadata.prefill_rows
+    matching_rows = [row for row in rows if row.sequence_id == sequence_id]
+    if len(matching_rows) != 1:
+        raise ValueError(
+            f"Paged KV prefill requires exactly one active row for sequence {sequence_id}; found {len(matching_rows)}"
+        )
+    row = matching_rows[0]
+    if type(num_tokens) is not int or not row.kv_start_pos < num_tokens <= row.seq_len:
+        raise ValueError(
+            "Paged KV prefill target must extend the active prefix without exceeding its allocation: "
+            f"start={row.kv_start_pos}, target={num_tokens!r}, allocated={row.seq_len}"
+        )
+    prefill = replace(row, query_len=num_tokens - row.kv_start_pos, seq_len=num_tokens)
+    batch = runtime.adapter.prepare_batch((prefill,))
+    with runtime.adapter.activate(batch):
+        yield
+    runtime.metadata = replace(
+        runtime.metadata,
+        prefill_rows=tuple(
+            replace(item, kv_start_pos=num_tokens, query_len=item.seq_len - num_tokens)
+            if item.sequence_id == sequence_id
+            else item
+            for item in rows
+        ),
+    )
+
+
 def set_forward_context_denoise_timestep(timestep: float | None) -> None:
     """Set the normalized (descending, 1 -> 0) denoise timestep.
 
@@ -336,3 +399,9 @@ def set_forward_context_ref_latent(ref_latent: torch.Tensor | None) -> None:
     """
     if _forward_context is not None:
         _forward_context.ref_latent = ref_latent
+
+
+def set_forward_context_direct_condition(direct_condition: torch.Tensor | None) -> None:
+    """Set the projected direct-VLM condition on the active context."""
+    if _forward_context is not None:
+        _forward_context.direct_condition = direct_condition

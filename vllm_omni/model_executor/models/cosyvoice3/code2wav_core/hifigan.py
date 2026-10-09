@@ -6,13 +6,17 @@
 
 """HIFI-GAN"""
 
+import math
+import os
+
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from scipy.signal import get_window
 from torch.nn import Conv1d, ConvTranspose1d
-from torch.nn.utils import remove_weight_norm
+from torch.nn.utils import parametrize
+from torch.nn.utils import remove_weight_norm as remove_legacy_weight_norm
+from torch.nn.utils.weight_norm import WeightNorm
 
 try:
     from torch.nn.utils.parametrizations import weight_norm
@@ -39,6 +43,44 @@ def init_weights(m, mean=0.0, std=0.01):
 
 def get_padding(kernel_size, dilation=1):
     return int((kernel_size * dilation - dilation) / 2)
+
+
+def _normalize_folded_weight(module: nn.Module, name: str = "weight") -> None:
+    """Keep ordinary Parameters; replace plain or inference tensors.
+
+    In inference_mode, the legacy API can leave an inference Parameter,
+    while the parametrization API can leave a plain inference tensor.
+    Rebuild those outside inference_mode so they remain usable afterward.
+    """
+    weight = getattr(module, name)
+    if isinstance(weight, nn.Parameter) and not weight.is_inference():
+        return
+    with torch.inference_mode(False):
+        frozen = nn.Parameter(weight.detach().clone(), requires_grad=False)
+    delattr(module, name)
+    module.register_parameter(name, frozen)
+
+
+def _fold_weight_norm(module: nn.Module) -> int:
+    """Fold one weight-normalized layer into a plain ``weight``, in place.
+
+    Supports both APIs: the modern ``torch.nn.utils.parametrizations`` API
+    (what this module is built with when torch provides it) and the legacy
+    ``WeightNorm`` forward-pre-hook. Returns 1 when a weight norm was
+    folded and 0 when there was nothing to fold (e.g. on a second call).
+    """
+    if parametrize.is_parametrized(module, "weight"):
+        # Removes every parametrization registered on "weight"; only
+        # weight_norm is applied to the layers in this module.
+        parametrize.remove_parametrizations(module, "weight", leave_parametrized=True)
+        _normalize_folded_weight(module)
+        return 1
+    for hook in list(module._forward_pre_hooks.values()):
+        if isinstance(hook, WeightNorm):
+            remove_legacy_weight_norm(module, name=hook.name)
+            _normalize_folded_weight(module, hook.name)
+            return 1
+    return 0
 
 
 class ResBlock(torch.nn.Module):
@@ -92,10 +134,100 @@ class ResBlock(torch.nn.Module):
             x = xt + x
         return x
 
-    def remove_weight_norm(self):
+    def remove_weight_norm(self) -> int:
+        """Fold this block's conv weight norms; returns the folded count."""
+        folded = 0
         for idx in range(len(self.convs1)):
-            remove_weight_norm(self.convs1[idx])
-            remove_weight_norm(self.convs2[idx])
+            folded += _fold_weight_norm(self.convs1[idx])
+            folded += _fold_weight_norm(self.convs2[idx])
+        return folded
+
+
+def _istft_envelope(window: torch.Tensor, n_fft: int, hop_length: int, n_frames: int) -> torch.Tensor:
+    """Trimmed overlap-add window envelope that ``torch.istft`` divides by.
+
+    Built with the same ops as ``at::native::istft`` (squared window folded by
+    ``unfold_backward``, centre padding trimmed). ``torch.istft`` also checks
+    here that no sample has a vanishing envelope, which reads the result back
+    to the host; the envelope only depends on the window and the frame count,
+    so the check runs once per shape instead of once per call.
+    """
+    expected_len = n_fft + hop_length * (n_frames - 1)
+    squared = window.pow(2).expand(1, n_frames, n_fft)
+    envelope = torch.ops.aten.unfold_backward(squared, [1, expected_len], 1, n_fft, hop_length)
+    envelope = envelope[:, n_fft // 2 : expected_len - n_fft // 2]
+    if bool(envelope.abs().min().lt(1e-11)):
+        raise RuntimeError("window overlap add min: True")
+    return envelope
+
+
+def _istft_without_host_sync(
+    spec: torch.Tensor,
+    n_fft: int,
+    hop_length: int,
+    window: torch.Tensor,
+    envelopes: dict[tuple, torch.Tensor],
+) -> torch.Tensor:
+    """``torch.istft(spec, n_fft, hop_length, n_fft, window=window)`` without a host sync.
+
+    Mirrors ``at::native::istft`` for this call (``center=True``, one-sided,
+    unnormalized, ``win_length == n_fft``, no ``length``): the same inverse
+    real FFT, window product, ``unfold_backward`` overlap-add, trim and
+    division, so the waveform is bitwise identical. The envelope, and with it
+    the only device-to-host read, comes from ``envelopes`` after the first
+    call for a frame count.
+    """
+    batch, _, n_frames = spec.shape
+    key = (n_frames, n_fft, hop_length, window.device, window.dtype, window.data_ptr())
+    envelope = envelopes.get(key)
+    if envelope is None:
+        envelope = _istft_envelope(window, n_fft, hop_length, n_frames)
+        envelopes[key] = envelope
+    frames = torch.fft.irfft(spec.transpose(1, 2), n=n_fft, dim=-1)
+    frames = frames * window.view(1, 1, n_fft)
+    expected_len = n_fft + hop_length * (n_frames - 1)
+    signal = torch.ops.aten.unfold_backward(frames, [batch, expected_len], 1, n_fft, hop_length)
+    return signal[:, n_fft // 2 : expected_len - n_fft // 2] / envelope
+
+
+def _carry_phase_at_boundary(
+    cum_total: torch.Tensor,
+    phase_acc: torch.Tensor | None,
+    next_overlap: int,
+    *,
+    dim: int,
+    trim: int = 0,
+) -> torch.Tensor | None:
+    """Accumulated phase (mod 1) carried into the next streaming window.
+
+    Shared by SineGen and SineGen2 so harmonic phase stays continuous across
+    chunk boundaries when HiFT runs over a bounded mel window. ``cum_total``
+    must already include ``phase_acc``; falls back to it unchanged if
+    ``next_overlap`` (+ ``trim``) covers the whole window.
+    """
+    length = cum_total.shape[dim]
+    if next_overlap >= length + trim:
+        return phase_acc
+    idx = length + trim - next_overlap - 1
+    return cum_total.narrow(dim, idx, 1) % 1
+
+
+def _wrapped_slice(buf: torch.Tensor, offset: int, length: int, dim: int = 1) -> torch.Tensor:
+    """``length`` elements of ``buf`` along ``dim`` starting at ``offset``,
+    wrapping (mod ``buf.shape[dim]``) instead of running past the end and
+    coming back short. Shared by SineGen/SineGen2/SourceModuleHnNSF's
+    position-indexed noise buffers, now that streams can outlast their 300s.
+    """
+    n = buf.shape[dim]
+    start = offset % n
+    parts = []
+    remaining = length
+    while remaining > 0:
+        take = min(remaining, n - start)
+        parts.append(buf.narrow(dim, start, take))
+        remaining -= take
+        start = 0
+    return parts[0] if len(parts) == 1 else torch.cat(parts, dim=dim)
 
 
 class SineGen(torch.nn.Module):
@@ -114,13 +246,24 @@ class SineGen(torch.nn.Module):
         segment is always sin(np.pi) or cos(0)
     """
 
-    def __init__(self, samp_rate, harmonic_num=0, sine_amp=0.1, noise_std=0.003, voiced_threshold=0):
+    def __init__(self, samp_rate, harmonic_num=0, sine_amp=0.1, noise_std=0.003, voiced_threshold=0, causal=False):
         super().__init__()
         self.sine_amp = sine_amp
         self.noise_std = noise_std
         self.harmonic_num = harmonic_num
         self.sampling_rate = samp_rate
         self.voiced_threshold = voiced_threshold
+        self.causal = causal
+        # Fixed per model instance like SineGen2's rand_ini, not redrawn per
+        # call, or each harmonic jumps to a new random phase every window.
+        self.phase_vec = Uniform(low=-np.pi, high=np.pi).sample(sample_shape=(1, harmonic_num + 1, 1))
+        self.phase_vec[:, 0, :] = 0
+        if causal:
+            self.register_buffer(
+                "noise_buf",
+                torch.randn(1, 300 * 24000, harmonic_num + 1),
+                persistent=False,
+            )
 
     def _f02uv(self, f0):
         # generate uv signal
@@ -128,22 +271,32 @@ class SineGen(torch.nn.Module):
         return uv
 
     @torch.no_grad()
-    def forward(self, f0):
+    def forward(self, f0, phase_acc=None, next_overlap=0, trim=0, noise_offset=0):
         """sine_tensor, uv = forward(f0)
         input F0: tensor(batchsize=1, dim=1, length)
                   f0 for unvoiced steps should be 0
         output sine_tensor: tensor(batchsize=1, length, dim)
         output uv: tensor(batchsize=1, length, 1)
+
+        ``next_overlap`` and ``trim`` are sample-indexed here (``f0`` arrives
+        post-``f0_upsamp``), unlike SineGen2 which downsamples to mel rate
+        before its own cumsum -- callers must scale both by samples-per-mel.
         """
         f0 = f0.transpose(1, 2)
-        F_mat = torch.zeros((f0.size(0), self.harmonic_num + 1, f0.size(-1))).to(f0.device)
+        F_mat = f0.new_zeros((f0.size(0), self.harmonic_num + 1, f0.size(-1)))
         for i in range(self.harmonic_num + 1):
             F_mat[:, i : i + 1, :] = f0 * (i + 1) / self.sampling_rate
 
-        theta_mat = 2 * np.pi * (torch.cumsum(F_mat, dim=-1) % 1)
-        u_dist = Uniform(low=-np.pi, high=np.pi)
-        phase_vec = u_dist.sample(sample_shape=(f0.size(0), self.harmonic_num + 1, 1)).to(F_mat.device)
-        phase_vec[:, 0, :] = 0
+        cum = torch.cumsum(F_mat, dim=-1)
+        cum_total = cum if phase_acc is None else phase_acc + cum
+        theta_mat = 2 * np.pi * (cum_total % 1)
+        new_phase_acc = _carry_phase_at_boundary(cum_total, phase_acc, next_overlap, dim=-1, trim=trim)
+        if self.causal:
+            phase_vec = self.phase_vec.to(F_mat.device)
+        else:
+            u_dist = Uniform(low=-np.pi, high=np.pi)
+            phase_vec = u_dist.sample(sample_shape=(f0.size(0), self.harmonic_num + 1, 1)).to(F_mat.device)
+            phase_vec[:, 0, :] = 0
 
         # generate sine waveforms
         sine_waves = self.sine_amp * torch.sin(theta_mat + phase_vec)
@@ -155,11 +308,16 @@ class SineGen(torch.nn.Module):
         #        std = self.sine_amp/3 -> max value ~ self.sine_amp
         # .       for voiced regions is self.noise_std
         noise_amp = uv * self.noise_std + (1 - uv) * self.sine_amp / 3
-        noise = noise_amp * torch.randn_like(sine_waves)
+        if self.training is False and self.causal is True:
+            noise = noise_amp * _wrapped_slice(self.noise_buf, noise_offset, sine_waves.shape[-1]).transpose(1, 2)
+        else:
+            noise = noise_amp * torch.randn_like(sine_waves)
 
         # first: set the unvoiced part to 0 by uv
         # then: additive noise
         sine_waves = sine_waves * uv + noise
+        if self.causal:
+            return sine_waves.transpose(1, 2), uv.transpose(1, 2), noise, new_phase_acc
         return sine_waves.transpose(1, 2), uv.transpose(1, 2), noise
 
 
@@ -215,7 +373,7 @@ class SineGen2(torch.nn.Module):
         uv = (f0 > self.voiced_threshold).type(torch.float32)
         return uv
 
-    def _f02sine(self, f0_values):
+    def _f02sine(self, f0_values, phase_acc=None, next_overlap=0, trim=0):
         """f0_values: (batchsize, length, dim)
         where dim indicates fundamental tone and overtones
         """
@@ -223,9 +381,12 @@ class SineGen2(torch.nn.Module):
         # because 2 * np.pi * n doesn't affect phase
         rad_values = (f0_values / self.sampling_rate) % 1
 
-        # initial phase noise (no noise for fundamental component)
+        # initial phase noise (no noise for fundamental component). Only applied
+        # on the genuine first chunk of a stream (see rationale above the class);
+        # phase_acc is None exactly when there is no carried-forward phase yet.
         if self.training is False and self.causal is True:
-            rad_values[:, 0, :] = rad_values[:, 0, :] + self.rand_ini.to(rad_values.device)
+            if phase_acc is None:
+                rad_values[:, 0, :] = rad_values[:, 0, :] + self.rand_ini.to(rad_values.device)
         else:
             rand_ini = torch.rand(f0_values.shape[0], f0_values.shape[2], device=f0_values.device)
             rand_ini[:, 0] = 0
@@ -237,7 +398,10 @@ class SineGen2(torch.nn.Module):
                 rad_values.transpose(1, 2), scale_factor=1 / self.upsample_scale, mode="linear"
             ).transpose(1, 2)
 
-            phase = torch.cumsum(rad_values, dim=1) * 2 * np.pi
+            cum = torch.cumsum(rad_values, dim=1)
+            phase = cum if phase_acc is None else cum + phase_acc
+            new_phase_acc = _carry_phase_at_boundary(phase, phase_acc, next_overlap, dim=1, trim=trim)
+            phase = phase * 2 * np.pi
             phase = torch.nn.functional.interpolate(
                 phase.transpose(1, 2) * self.upsample_scale,
                 scale_factor=self.upsample_scale,
@@ -272,9 +436,10 @@ class SineGen2(torch.nn.Module):
 
             # get the sines
             sines = torch.cos(i_phase * 2 * np.pi)
-        return sines
+            new_phase_acc = None
+        return (sines, new_phase_acc) if self.causal else sines
 
-    def forward(self, f0):
+    def forward(self, f0, phase_acc=None, next_overlap=0, trim=0, noise_offset=0):
         """sine_tensor, uv = forward(f0)
         input F0: tensor(batchsize=1, length, dim=1)
                   f0 for unvoiced steps should be 0
@@ -284,8 +449,12 @@ class SineGen2(torch.nn.Module):
         # fundamental component
         fn = torch.multiply(f0, self.harmonic_ids)
 
-        # generate sine waveforms
-        sine_waves = self._f02sine(fn) * self.sine_amp
+        if self.causal:
+            sine_waves, new_phase_acc = self._f02sine(fn, phase_acc, next_overlap, trim)
+        else:
+            sine_waves = self._f02sine(fn)
+            new_phase_acc = None
+        sine_waves = sine_waves * self.sine_amp
 
         # generate uv signal
         uv = self._f02uv(f0)
@@ -295,14 +464,15 @@ class SineGen2(torch.nn.Module):
         # .       for voiced regions is self.noise_std
         noise_amp = uv * self.noise_std + (1 - uv) * self.sine_amp / 3
         if self.training is False and self.causal is True:
-            noise = noise_amp * self.sine_waves[:, : sine_waves.shape[1]].to(sine_waves.device)
+            # indexed by absolute sample position, not window-relative position
+            noise = noise_amp * _wrapped_slice(self.sine_waves, noise_offset, sine_waves.shape[1]).to(sine_waves.device)
         else:
             noise = noise_amp * torch.randn_like(sine_waves)
 
         # first: set the unvoiced part to 0 by uv
         # then: additive noise
         sine_waves = sine_waves * uv + noise
-        return sine_waves, uv, noise
+        return (sine_waves, uv, noise, new_phase_acc) if self.causal else (sine_waves, uv, noise)
 
 
 class SourceModuleHnNSF(torch.nn.Module):
@@ -338,10 +508,13 @@ class SourceModuleHnNSF(torch.nn.Module):
 
         self.sine_amp = sine_amp
         self.noise_std = add_noise_std
+        self.upsample_scale = upsample_scale
 
         # to produce sine waveforms
         if sinegen_type == "1":
-            self.l_sin_gen = SineGen(sampling_rate, harmonic_num, sine_amp, add_noise_std, voiced_threshold)
+            self.l_sin_gen = SineGen(
+                sampling_rate, harmonic_num, sine_amp, add_noise_std, voiced_threshold, causal=causal
+            )
         else:
             self.l_sin_gen = SineGen2(
                 sampling_rate, upsample_scale, harmonic_num, sine_amp, add_noise_std, voiced_threshold, causal=causal
@@ -354,24 +527,38 @@ class SourceModuleHnNSF(torch.nn.Module):
         if causal is True:
             self.uv = torch.rand(1, 300 * 24000, 1)
 
-    def forward(self, x):
+    def forward(self, x, phase_acc=None, uv_offset=0, next_overlap=0, trim=0):
         """
         Sine_source, noise_source = SourceModuleHnNSF(F0_sampled)
         F0_sampled (batchsize, length, 1)
         Sine_source (batchsize, length, 1)
         noise_source (batchsize, length 1)
         """
-        # source for harmonic branch
         with torch.no_grad():
-            sine_wavs, uv, _ = self.l_sin_gen(x)
+            if not self.causal:
+                sine_wavs, uv, _ = self.l_sin_gen(x)
+                new_phase_acc = None
+            elif isinstance(self.l_sin_gen, SineGen):
+                # next_overlap/trim arrive in mel frames; SineGen needs samples.
+                sine_wavs, uv, _, new_phase_acc = self.l_sin_gen(
+                    x,
+                    phase_acc,
+                    next_overlap * self.upsample_scale,
+                    trim * self.upsample_scale,
+                    noise_offset=uv_offset,
+                )
+            else:
+                sine_wavs, uv, _, new_phase_acc = self.l_sin_gen(
+                    x, phase_acc, next_overlap, trim, noise_offset=uv_offset
+                )
         sine_merge = self.l_tanh(self.l_linear(sine_wavs))
 
         # source for noise branch, in the same shape as uv
         if self.training is False and self.causal is True:
-            noise = self.uv[:, : uv.shape[1]] * self.sine_amp / 3
+            noise = _wrapped_slice(self.uv, uv_offset, uv.shape[1]) * self.sine_amp / 3
         else:
             noise = torch.randn_like(uv) * self.sine_amp / 3
-        return sine_merge, noise, uv
+        return sine_merge, noise, uv, new_phase_acc
 
 
 class HiFTGenerator(nn.Module):
@@ -412,9 +599,10 @@ class HiFTGenerator(nn.Module):
         self.num_kernels = len(resblock_kernel_sizes)
         self.num_upsamples = len(upsample_rates)
         # NOTE in CosyVoice2, we use the original SineGen implementation
+        scale = int(math.prod(upsample_rates) * istft_params["hop_len"])
         self.m_source = SourceModuleHnNSF(
             sampling_rate=sampling_rate,
-            upsample_scale=np.prod(upsample_rates) * istft_params["hop_len"],
+            upsample_scale=scale,
             harmonic_num=nb_harmonics,
             sine_amp=nsf_alpha,
             add_noise_std=nsf_sigma,
@@ -422,7 +610,7 @@ class HiFTGenerator(nn.Module):
             sinegen_type="1" if self.sampling_rate == 22050 else "2",
             causal=False,
         )
-        self.f0_upsamp = torch.nn.Upsample(scale_factor=np.prod(upsample_rates) * istft_params["hop_len"])
+        self.f0_upsamp = torch.nn.Upsample(scale_factor=scale)
 
         self.conv_pre = weight_norm(Conv1d(in_channels, base_channels, 7, 1, padding=3))
 
@@ -445,7 +633,11 @@ class HiFTGenerator(nn.Module):
         self.source_downs = nn.ModuleList()
         self.source_resblocks = nn.ModuleList()
         downsample_rates = [1] + upsample_rates[::-1][:-1]
-        downsample_cum_rates = np.cumprod(downsample_rates)
+        downsample_cum_rates = []
+        cur = 1
+        for r in downsample_rates:
+            cur *= r
+            downsample_cum_rates.append(cur)
         for i, (u, k, d) in enumerate(
             zip(downsample_cum_rates[::-1], source_resblock_kernel_sizes, source_resblock_dilation_sizes)
         ):
@@ -470,25 +662,38 @@ class HiFTGenerator(nn.Module):
         self.reflection_pad = nn.ReflectionPad1d((1, 0))
         self.register_buffer(
             "stft_window",
-            torch.from_numpy(get_window("hann", istft_params["n_fft"], fftbins=True).astype(np.float32)),
+            torch.hann_window(istft_params["n_fft"], periodic=True, dtype=torch.float32),
             persistent=False,
         )
         self.f0_predictor = f0_predictor
 
-    def remove_weight_norm(self):
+    def enable_cached_istft(self) -> None:
+        """Opt into CUDA ISTFT with a cached overlap envelope."""
+        self._use_cached_istft = True
+
+    def remove_weight_norm(self) -> int:
+        """Fold the generator's frozen weight norms into plain weights.
+
+        Returns how many convolutions were folded. ``source_downs`` and
+        ``m_source`` carry no weight norm. ``f0_predictor`` is excluded:
+        causal inference runs it on CPU for precision, and folding it is
+        tracked separately in RFC #6870 (C5).
+        """
+        folded = 0
         for layer in self.ups:
-            remove_weight_norm(layer)
+            folded += _fold_weight_norm(layer)
         for block in self.resblocks:
-            block.remove_weight_norm()
-        remove_weight_norm(self.conv_pre)
-        remove_weight_norm(self.conv_post)
-        self.m_source.remove_weight_norm()
-        for layer in self.source_downs:
-            remove_weight_norm(layer)
+            folded += block.remove_weight_norm()
+        folded += _fold_weight_norm(self.conv_pre)
+        folded += _fold_weight_norm(self.conv_post)
         for block in self.source_resblocks:
-            block.remove_weight_norm()
+            folded += block.remove_weight_norm()
+        return folded
 
     def _stft(self, x):
+        if x.device.type == "npu":
+            return self._stft_on_cpu(x)
+
         spec = torch.stft(
             x,
             self.istft_params["n_fft"],
@@ -500,18 +705,65 @@ class HiFTGenerator(nn.Module):
         spec = torch.view_as_real(spec)  # [B, F, TT, 2]
         return spec[..., 0], spec[..., 1]
 
-    def _istft(self, magnitude, phase):
-        magnitude = torch.clip(magnitude, max=1e2)
-        real = magnitude * torch.cos(phase)
-        img = magnitude * torch.sin(phase)
-        inverse_transform = torch.istft(
-            torch.complex(real, img),
+    def _stft_on_cpu(self, x):
+        target_device = x.device
+        target_dtype = x.dtype
+        spec = torch.stft(
+            x.float().cpu(),
             self.istft_params["n_fft"],
             self.istft_params["hop_len"],
             self.istft_params["n_fft"],
-            window=self._get_stft_window(magnitude),
+            window=self.stft_window.float().cpu(),
+            return_complex=True,
         )
-        return inverse_transform
+        spec = torch.view_as_real(spec).to(device=target_device, dtype=target_dtype)
+        return spec[..., 0], spec[..., 1]
+
+    def _istft(self, magnitude, phase):
+        if magnitude.device.type == "npu":
+            return self._istft_on_cpu(magnitude, phase)
+
+        magnitude = torch.clip(magnitude, max=1e2)
+        real = magnitude * torch.cos(phase)
+        imag = magnitude * torch.sin(phase)
+        spec = torch.complex(real, imag)
+        window = self._get_stft_window(magnitude)
+        if (
+            not getattr(self, "_use_cached_istft", False)
+            or spec.dim() != 3
+            or window.dim() != 1
+            or window.shape[0] != self.istft_params["n_fft"]
+        ):
+            return torch.istft(
+                spec,
+                self.istft_params["n_fft"],
+                self.istft_params["hop_len"],
+                self.istft_params["n_fft"],
+                window=window,
+            )
+        envelopes = self.__dict__.setdefault("_istft_envelopes", {})
+        return _istft_without_host_sync(
+            spec,
+            self.istft_params["n_fft"],
+            self.istft_params["hop_len"],
+            window,
+            envelopes,
+        )
+
+    def _istft_on_cpu(self, magnitude, phase):
+        target_device = magnitude.device
+        target_dtype = magnitude.dtype
+        magnitude = torch.clip(magnitude, max=1e2)
+        real = magnitude * torch.cos(phase)
+        imag = magnitude * torch.sin(phase)
+        waveform = torch.istft(
+            torch.complex(real.float().cpu(), imag.float().cpu()),
+            self.istft_params["n_fft"],
+            self.istft_params["hop_len"],
+            self.istft_params["n_fft"],
+            window=self.stft_window.float().cpu(),
+        )
+        return waveform.to(device=target_device, dtype=target_dtype)
 
     def _get_stft_window(self, tensor: torch.Tensor) -> torch.Tensor:
         if self.stft_window.device != tensor.device:
@@ -572,7 +824,7 @@ class HiFTGenerator(nn.Module):
         f0 = self.f0_predictor(speech_feat)
         # f0->source
         s = self.f0_upsamp(f0[:, None]).transpose(1, 2)  # bs,n,t
-        s, _, _ = self.m_source(s)
+        s, _, _, _ = self.m_source(s)
         s = s.transpose(1, 2)
         # mel+source->speech
         generated_speech = self.decode(x=speech_feat, s=s)
@@ -588,7 +840,7 @@ class HiFTGenerator(nn.Module):
         f0 = self.f0_predictor(speech_feat)
         # f0->source
         s = self.f0_upsamp(f0[:, None]).transpose(1, 2)  # bs,n,t
-        s, _, _ = self.m_source(s)
+        s, _, _, _ = self.m_source(s)
         s = s.transpose(1, 2)
         # use cache_source to avoid glitch
         if cache_source.shape[2] != 0:
@@ -641,9 +893,10 @@ class CausalHiFTGenerator(HiFTGenerator):
 
         self.num_kernels = len(resblock_kernel_sizes)
         self.num_upsamples = len(upsample_rates)
+        scale = int(math.prod(upsample_rates) * istft_params["hop_len"])
         self.m_source = SourceModuleHnNSF(
             sampling_rate=sampling_rate,
-            upsample_scale=np.prod(upsample_rates) * istft_params["hop_len"],
+            upsample_scale=scale,
             harmonic_num=nb_harmonics,
             sine_amp=nsf_alpha,
             add_noise_std=nsf_sigma,
@@ -652,7 +905,7 @@ class CausalHiFTGenerator(HiFTGenerator):
             causal=True,
         )
         self.upsample_rates = upsample_rates
-        self.f0_upsamp = torch.nn.Upsample(scale_factor=np.prod(upsample_rates) * istft_params["hop_len"])
+        self.f0_upsamp = torch.nn.Upsample(scale_factor=scale)
 
         self.conv_pre = weight_norm(
             CausalConv1d(in_channels, base_channels, conv_pre_look_right + 1, 1, causal_type="right")
@@ -676,7 +929,11 @@ class CausalHiFTGenerator(HiFTGenerator):
         self.source_downs = nn.ModuleList()
         self.source_resblocks = nn.ModuleList()
         downsample_rates = [1] + upsample_rates[::-1][:-1]
-        downsample_cum_rates = np.cumprod(downsample_rates)
+        downsample_cum_rates = []
+        cur = 1
+        for r in downsample_rates:
+            cur *= r
+            downsample_cum_rates.append(cur)
         for i, (u, k, d) in enumerate(
             zip(downsample_cum_rates[::-1], source_resblock_kernel_sizes, source_resblock_dilation_sizes)
         ):
@@ -703,20 +960,33 @@ class CausalHiFTGenerator(HiFTGenerator):
         self.reflection_pad = nn.ReflectionPad1d((1, 0))
         self.register_buffer(
             "stft_window",
-            torch.from_numpy(get_window("hann", istft_params["n_fft"], fftbins=True).astype(np.float32)),
+            torch.hann_window(istft_params["n_fft"], periodic=True, dtype=torch.float32),
             persistent=False,
         )
         self.conv_pre_look_right = conv_pre_look_right
         self.f0_predictor = f0_predictor
 
+    def enable_decode_graphs(self) -> None:
+        """Opt into exact-shape CUDA replay after frozen weights are loaded."""
+        from .hift_graph import HiFTDecodeGraphs
+
+        self.enable_cached_istft()
+        self._decode_graphs = HiFTDecodeGraphs(self._decode_eager)
+
     def decode(self, x: torch.Tensor, s: torch.Tensor = torch.zeros(1, 1, 0), finalize: bool = True) -> torch.Tensor:
+        runner = getattr(self, "_decode_graphs", None)
+        if runner is not None:
+            return runner.run(x, s, finalize)
+        return self._decode_eager(x, s, finalize=finalize)
+
+    def _decode_eager(self, x: torch.Tensor, s: torch.Tensor, finalize: bool = True) -> torch.Tensor:
         s_stft_real, s_stft_imag = self._stft(s.squeeze(1))
         if finalize is True:
             x = self.conv_pre(x)
         else:
             x = self.conv_pre(x[:, :, : -self.conv_pre_look_right], x[:, :, -self.conv_pre_look_right :])
-            s_stft_real = s_stft_real[:, :, : -int(np.prod(self.upsample_rates) * self.conv_pre_look_right)]
-            s_stft_imag = s_stft_imag[:, :, : -int(np.prod(self.upsample_rates) * self.conv_pre_look_right)]
+            s_stft_real = s_stft_real[:, :, : -int(math.prod(self.upsample_rates) * self.conv_pre_look_right)]
+            s_stft_imag = s_stft_imag[:, :, : -int(math.prod(self.upsample_rates) * self.conv_pre_look_right)]
         s_stft = torch.cat([s_stft_real, s_stft_imag], dim=1)
 
         for i in range(self.num_upsamples):
@@ -746,19 +1016,53 @@ class CausalHiFTGenerator(HiFTGenerator):
 
         x = self._istft(magnitude, phase)
         if finalize is False:
-            x = x[:, : -int(np.prod(self.upsample_rates) * self.istft_params["hop_len"])]
+            x = x[:, : -int(math.prod(self.upsample_rates) * self.istft_params["hop_len"])]
         x = torch.clamp(x, -self.audio_limit, self.audio_limit)
         return x
 
     @torch.inference_mode()
-    def inference(self, speech_feat: torch.Tensor, finalize: bool = True) -> torch.Tensor:
-        # mel->f0 NOTE f0_predictor precision is crucial for causal inference, move
-        # self.f0_predictor to cpu if necessary
-        self.f0_predictor.to("cpu")
-        f0 = self.f0_predictor(speech_feat.cpu(), finalize=finalize).to(speech_feat)
+    def inference(
+        self,
+        speech_feat: torch.Tensor,
+        finalize: bool = True,
+        phase_acc: torch.Tensor | None = None,
+        uv_offset: int = 0,
+        next_overlap: int = 0,
+        trim: int = 0,
+        f0_margin: int = 0,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        # mel->f0
+        # By default keep f0_predictor on the same device as speech_feat (GPU) in FP32
+        # with TF32 disabled to prevent causal drift while avoiding CPU syncs and transfers.
+        # COSYVOICE3_F0_ON_CPU=1 forces CPU reference execution.
+        f0_on_cpu = os.getenv("COSYVOICE3_F0_ON_CPU", "0") == "1"
+        if speech_feat.device.type == "cuda" and not f0_on_cpu:
+            p = next(self.f0_predictor.parameters(), None)
+            if p is not None and p.device != speech_feat.device:
+                self.f0_predictor.to(device=speech_feat.device, dtype=torch.float32)
+            orig_matmul_tf32 = torch.backends.cuda.matmul.allow_tf32
+            orig_cudnn_tf32 = torch.backends.cudnn.allow_tf32
+            try:
+                torch.backends.cuda.matmul.allow_tf32 = False
+                torch.backends.cudnn.allow_tf32 = False
+                f0 = self.f0_predictor(speech_feat.float(), finalize=finalize).to(dtype=speech_feat.dtype)
+            finally:
+                torch.backends.cuda.matmul.allow_tf32 = orig_matmul_tf32
+                torch.backends.cudnn.allow_tf32 = orig_cudnn_tf32
+        else:
+            p = next(self.f0_predictor.parameters(), None)
+            if p is not None and p.device.type != "cpu":
+                self.f0_predictor.to("cpu")
+            f0 = self.f0_predictor(speech_feat.cpu().float(), finalize=finalize).to(speech_feat)
+
+        if f0_margin > 0:
+            f0 = f0[:, f0_margin:]
+            speech_feat = speech_feat[:, :, f0_margin:]
         # f0->source
         s = self.f0_upsamp(f0[:, None]).transpose(1, 2)  # bs,n,t
-        s, _, _ = self.m_source(s)
+        s, _, _, new_phase_acc = self.m_source(
+            s, phase_acc=phase_acc, uv_offset=uv_offset, next_overlap=next_overlap, trim=trim
+        )
         s = s.transpose(1, 2)
         if finalize is True:
             generated_speech = self.decode(x=speech_feat, s=s, finalize=finalize)
@@ -766,7 +1070,7 @@ class CausalHiFTGenerator(HiFTGenerator):
             generated_speech = self.decode(
                 x=speech_feat[:, :, : -self.f0_predictor.condnet[0].causal_padding], s=s, finalize=finalize
             )
-        return generated_speech, s
+        return generated_speech, s, new_phase_acc
 
 
 class CausalConv1dUpsample(torch.nn.Conv1d):
@@ -888,10 +1192,10 @@ class CausalConv1d(torch.nn.Conv1d):
         assert causal_type in ["left", "right"]
         self.causal_type = causal_type
 
-    def forward(self, x: torch.Tensor, cache: torch.Tensor = torch.zeros(0, 0, 0)) -> tuple[torch.Tensor]:
+    def forward(self, x: torch.Tensor, cache: torch.Tensor | None = None) -> torch.Tensor:
         input_timestep = x.shape[2]
-        if cache.size(2) == 0:
-            cache = torch.zeros(x.shape[0], x.shape[1], self.causal_padding).to(x)
+        if cache is None or cache.size(2) == 0:
+            cache = x.new_zeros(x.shape[0], x.shape[1], self.causal_padding)
         assert cache.size(2) == self.causal_padding
         if self.causal_type == "left":
             x = torch.concat([cache, x], dim=2)
@@ -920,6 +1224,19 @@ class CausalConvRNNF0Predictor(nn.Module):
             nn.ELU(),
         )
         self.classifier = nn.Linear(in_features=cond_channels, out_features=self.num_class)
+        self.left_context_frames = sum(
+            layer.causal_padding
+            for layer in self.condnet
+            if isinstance(layer, CausalConv1d) and layer.causal_type == "left"
+        )
+
+    def remove_weight_norm(self) -> int:
+        """Fold the five F0 convolutions after loading on the execution device.
+
+        Repeated calls are no-ops. Load original checkpoints into a fresh
+        predictor, before folding changes the state-dict keys.
+        """
+        return sum(_fold_weight_norm(layer) for layer in self.condnet)
 
     def forward(self, x: torch.Tensor, finalize: bool = True) -> torch.Tensor:
         if finalize is True:

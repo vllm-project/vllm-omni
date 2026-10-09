@@ -14,9 +14,9 @@ from dataclasses import dataclass
 import pytest
 import torch
 import torch.distributed as dist
+from vllm.utils.network_utils import get_file_store_init_method
 
 from tests.helpers.mark import hardware_test
-from tests.helpers.runtime import get_distributed_init_method
 from vllm_omni.diffusion.attention.parallel.ulysses import (
     _all_gather_int,
     _ulysses_all_to_all_any_o,
@@ -62,7 +62,7 @@ def test_ulysses_advanced_uaa_comm_overhead(case: _PerfCase) -> None:
     if available_gpus < case.world_size:
         pytest.skip(f"Requires {case.world_size} GPUs, got {available_gpus}")
 
-    init_method = get_distributed_init_method()
+    init_method = get_file_store_init_method()
     torch.multiprocessing.spawn(
         _perf_worker,
         args=(case.world_size, init_method, case.ulysses_degree, case.ring_degree),

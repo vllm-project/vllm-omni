@@ -1,15 +1,13 @@
 # MiniCPM-o 4.5 three-stage deploy on one large-memory GPU.
 pipeline: minicpmo_4_5
 async_chunk: true
-# Native full-duplex shares this profile with /v1/chat/completions. Every other
-# duplex_session knob keeps its runtime default.
+# Use minicpmo_4_5_turn.yaml to select the ordinary turn-based serving engine.
 session_mode: duplex
 # Keep the active window aligned with the session and stage capacities below.
 # A smaller window serializes first-packet generation for concurrent chat turns.
-active_stream_window: 4
 duplex_session:
   # Matches Stage 0/1 max_num_seqs below.
-  max_sessions: 4
+  max_sessions: 16
 
 trust_remote_code: true
 enable_prefix_caching: false
@@ -28,12 +26,32 @@ connectors:
       # A future initial_codec_chunk_frames shape will use lazy capture unless
       # HiFTGraphWrapper.derive_capture_bucket_size explicitly includes it.
       enable_hift_graph: true
+      # Capture batch-1 continuation/tail shapes without padding: with the
+      # 8-frame mel cache these codec widths cover 16-64 mel frames.
+      hift_graph_continuation_frames: [4, 28]
+      hift_graph_exact_batch_sizes: [1]
       enable_cfm_graph: true
+      # Exact continuation batches 1..16 share one startup arena; no padding.
+      # Uncaptured shapes stay eager without request-time eviction/recapture.
+      enable_code2wav_encoder_graph: true
+      # An integer selects every batch up to this limit; a list selects exact batches.
+      code2wav_encoder_graph_rows: 16
+      # Three reachable default-prompt cache lengths per batch. Other lengths stay eager.
+      code2wav_encoder_max_graphs: 48
+      # Used only when startup precapture installs nothing and capture falls
+      # back to the request path. A full cache still stays eager.
+      code2wav_encoder_capture_after: 8
+      # Whole-Euler CUDA graphs exist for batch 1, 2, 4, ... up to
+      # micro_batch_size, which defaults to Stage 2 max_num_seqs: all graphs
+      # share one attention-cache arena of that many requests (~0.6 GiB each
+      # in fp32, 10 GiB at 16). Larger batches replay micro-batches;
+      # B > max_graph_batch runs eager.
+      max_graph_batch: 16
       cfm_max_graphs: 32
 
 stages:
   - stage_id: 0
-    max_num_seqs: 4
+    max_num_seqs: 16
     # Leave headroom on the shared GPU for Talker KV + concurrent Code2Wav.
     gpu_memory_utilization: 0.55
     enforce_eager: false
@@ -48,7 +66,7 @@ stages:
         fps: 1
         num_frames: 128
     limit_mm_per_prompt:
-      # Daily-Omni MiniCPM pack: up to 64 interleaved image/audio pairs (1fps).
+      # Daily-Omni: up to 64 interleaved image/audio pairs (1fps).
       image: 64
       audio: 64
       video: 1
@@ -63,7 +81,7 @@ stages:
       repetition_penalty: 1.0
 
   - stage_id: 1
-    max_num_seqs: 4
+    max_num_seqs: 16
     # Preserve the checkpoint's full-attention Talker prompt while it fits;
     # native duplex rolls over to a one-chunk window at context capacity.
     # Leave device-level headroom for the colocated HiFi-GAN cuDNN workspace.
@@ -93,7 +111,7 @@ stages:
       detokenize: false
 
   - stage_id: 2
-    max_num_seqs: 4
+    max_num_seqs: 16
     gpu_memory_utilization: 0.18
     enforce_eager: true
     enable_chunked_prefill: false
@@ -114,14 +132,20 @@ platforms:
     stages:
       - stage_id: 1
         # Full-attention occupancy is bounded by max_num_seqs * max_model_len
-        # (4 * 4096 = 16384 tokens). Keep the reported CUDA KV token capacity
-        # above that bound because physical-preemption replay is unsupported.
-        # The explicit cap leaves device headroom for concurrent Stage 2.
-        kv_cache_memory_bytes: 2147483648  # 2 GiB
+        # (16 * 4096 = 65536 tokens). Keep the reported CUDA KV token capacity
+        # above that bound because physical-preemption replay is unsupported
+        # (2 GiB holds ~35k tokens). The explicit cap leaves device headroom
+        # for concurrent Stage 2.
+        kv_cache_memory_bytes: 4294967296  # 4 GiB
 
   npu:
     stages:
       - stage_id: 0
+        # 32768 leaves no KV cache on 910B1 at gpu_memory_utilization 0.55.
+        # Audio Conv1d stays eager; the transformer stack is what this graph replays.
+        additional_config:
+          encoder_enable_npu_graph: true
+          encoder_max_npu_graphs: 4  # Per encoder (vision/audio).
         max_num_batched_tokens: 8192
         compilation_config:
           cudagraph_mode: PIECEWISE

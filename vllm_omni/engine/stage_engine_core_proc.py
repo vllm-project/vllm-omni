@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """
 Stage Core Process for vLLM-Omni V1 architecture.
 
@@ -10,10 +13,13 @@ from __future__ import annotations
 import contextlib
 import os
 import signal
+from collections.abc import Callable
+from concurrent.futures import Future
 from typing import Any
 
 import vllm.v1.engine.core as _vllm_engine_core_module
-from vllm.logger import init_logger
+from vllm.config import VllmConfig
+from vllm.logger import configure_logging, init_logger
 from vllm.transformers_utils.config import (
     maybe_register_config_serialize_by_value,
 )
@@ -27,6 +33,7 @@ from vllm.v1.engine.utils import (
     EngineZmqAddresses,
     SignalCallback,
 )
+from vllm.v1.executor.uniproc_executor import UniProcExecutor
 
 from vllm_omni.distributed.omni_coordinator import create_stage_coord_client
 from vllm_omni.engine import OmniEngineCoreRequest
@@ -75,6 +82,58 @@ def _signal_exit_code(signum: int) -> int:
     return _SIGNAL_EXIT_BASE + signum
 
 
+def _bind_first_audio_sink(model_executor: Any, output_queue: Any, scheduler: Any) -> bool:
+    """Bind in-process first audio to the generic engine output sink."""
+    if not isinstance(model_executor, UniProcExecutor):
+        return False
+    parallel_config = model_executor.vllm_config.parallel_config
+    if parallel_config.tensor_parallel_size != 1 or parallel_config.pipeline_parallel_size != 1:
+        return False
+    worker = getattr(getattr(model_executor, "driver_worker", None), "worker", None)
+    model_runner = getattr(worker, "model_runner", None)
+    model_state = getattr(model_runner, "model_state", None)
+    model = getattr(model_runner, "model", None)
+    decodes_audio = getattr(model, "first_frame_decoder", None) is not None or (
+        getattr(model, "stream_decoder", None) is not None and bool(getattr(model, "stream_first_audio", False))
+    )
+    from vllm_omni.worker_v2.first_audio_sender import engine_output_queue_sink
+
+    if decodes_audio and hasattr(model_state, "set_first_audio_sink"):
+        assert model_state is not None
+        model_state.set_first_audio_sink(engine_output_queue_sink(output_queue, scheduler))
+        return True
+    data_plane = getattr(model_runner, "_omni_data_plane", None)
+    get_model = getattr(model_runner, "get_model", None)
+    if data_plane is None or not callable(get_model):
+        return False
+    bind = getattr(get_model(), "bind_first_chunk_fast_path", None)
+    if not callable(bind):
+        return False
+    hook = bind(engine_output_queue_sink(output_queue, scheduler, upstream_first_audio=False))
+    if hook is None:
+        return False
+    data_plane.set_first_chunk_hook(hook)
+    return True
+
+
+def _bind_native_data_plane_ready_sink(model_executor: Any, scheduler: Any) -> bool:
+    """Bind the TP1 in-process runner control plane directly to its scheduler."""
+    if not isinstance(model_executor, UniProcExecutor):
+        return False
+    parallel_config = model_executor.vllm_config.parallel_config
+    if parallel_config.tensor_parallel_size != 1 or parallel_config.pipeline_parallel_size != 1:
+        return False
+    driver_worker = getattr(model_executor, "driver_worker", None)
+    worker = getattr(driver_worker, "worker", None)
+    model_runner = getattr(worker, "model_runner", None)
+    data_plane = getattr(model_runner, "_omni_data_plane", None)
+    sink = getattr(scheduler, "enqueue_omni_connector_output", None)
+    if data_plane is None or not callable(sink):
+        return False
+    data_plane.set_omni_connector_output_sink(sink)
+    return True
+
+
 class StageEngineCoreProc(EngineCoreProc):
     """Stage-specific engine core process for vLLM-Omni.
 
@@ -83,12 +142,65 @@ class StageEngineCoreProc(EngineCoreProc):
     ``EngineCoreProc.run_engine_core()``.
     """
 
+    _omni_shutdown_signal_handler: Callable[[int, Any], None] | None = None
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        _bind_first_audio_sink(self.model_executor, self.output_queue, self.scheduler)
+        if _bind_native_data_plane_ready_sink(self.model_executor, self.scheduler):
+            logger.info("Bound native MRv2 connector readiness directly to the scheduler inbox.")
+
+    def _process_input_queue(self) -> None:
+        # Native JIT compilers can restore the same handler with SA_RESTART
+        # enabled. Restore our interruptible shutdown policy before the next
+        # idle wait; Python's cached handler identity alone misses that change.
+        handler = self._omni_shutdown_signal_handler
+        if handler is not None and hasattr(signal, "siginterrupt"):
+            for signum in (signal.SIGTERM, signal.SIGINT):
+                if signal.getsignal(signum) is handler:
+                    signal.siginterrupt(signum, True)
+        super()._process_input_queue()
+
+    def omni_release_request_resources(self, request_ids: list[str]) -> None:
+        """Release this stage's inter-stage transfer resources for *request_ids*.
+
+        Invoked over the UTILITY channel by the orchestrator once every stage
+        has finished with the request. Idempotent and safe for unknown ids.
+        """
+        adapter = getattr(getattr(self, "scheduler", None), "chunk_transfer_adapter", None)
+        if adapter is None:
+            return
+        for request_id in request_ids or ():
+            try:
+                adapter.release_shm_resources(request_id)
+            except Exception as e:
+                logger.debug("omni_release_request_resources(%s) failed: %s", request_id, e)
+
+    def omni_flush_codec_prefix(self, external_req_id: str, prefix: int) -> Future[int]:
+        """UTILITY control for the scheduler-owned V1 codec send queue.
+
+        EngineCore's existing Future handling keeps the busy loop responsive.
+        Never route this to a worker: V1's processor buffer lives in the
+        scheduler adapter. This is not an acoustic or client-playback ACK.
+        """
+        adapter = getattr(self.scheduler, "chunk_transfer_adapter", None)
+        if adapter is None:
+            raise RuntimeError("This stage has no scheduler codec send queue")
+        requests = [
+            request
+            for request in self.scheduler.requests.values()
+            if getattr(request, "external_req_id", None) == external_req_id
+        ]
+        if len(requests) != 1:
+            raise RuntimeError("Codec prefix request is unknown or ambiguous")
+        return adapter.flush_prefix_async(requests[0], prefix)
+
     def preprocess_add_request(self, request: OmniEngineCoreRequest) -> tuple[Any, int]:
         """Preserve omni payloads when vLLM builds its scheduler request."""
         scheduler_request, current_wave = super().preprocess_add_request(request)
         scheduler_request.additional_information = request.additional_information
         scheduler_request.external_req_id = getattr(request, "external_req_id", request.request_id)
-        scheduler_request.payload_sender_info = request.payload_sender_info
+        scheduler_request.payload_sender_info = getattr(request, "payload_sender_info", None)
         return scheduler_request, current_wave
 
     @staticmethod
@@ -118,6 +230,10 @@ class StageEngineCoreProc(EngineCoreProc):
             logging / metrics only.
         """
         signal_callback: SignalCallback | None = None
+        vllm_config: VllmConfig = kwargs["vllm_config"]
+        if logging_config := getattr(vllm_config, "logging_config", None):
+            configure_logging(logging_config)
+
         maybe_register_config_serialize_by_value()
 
         # Register vllm-omni reasoning parsers (e.g. step_audio) in this
@@ -220,6 +336,7 @@ class StageEngineCoreProc(EngineCoreProc):
 
             signal.signal(signal.SIGTERM, signal_handler)
             signal.signal(signal.SIGINT, signal_handler)
+            engine_core._omni_shutdown_signal_handler = signal_handler
 
             engine_core.run_busy_loop()
 

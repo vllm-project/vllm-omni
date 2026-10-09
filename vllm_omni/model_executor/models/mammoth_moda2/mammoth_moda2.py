@@ -1,5 +1,9 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from __future__ import annotations
 
+import gc
 from collections.abc import Callable, Iterable, Mapping
 from itertools import islice
 from typing import Any
@@ -8,8 +12,10 @@ import torch
 from torch import nn
 from transformers import Qwen2Config, Qwen3VLProcessor
 from transformers.models.qwen2_5_vl.processing_qwen2_5_vl import Qwen2_5_VLProcessor
-from vllm.config import CacheConfig, VllmConfig
+from vllm.compilation.wrapper import TorchCompileWithNoGuardsWrapper
+from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.distributed import get_pp_group
+from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
@@ -40,6 +46,7 @@ from vllm.model_executor.models.qwen3_vl import (
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
     PPMissingLayer,
+    StageMissingLayer,
     WeightsMapper,
     init_vllm_registered_model,
     is_pp_missing_parameter,
@@ -56,6 +63,8 @@ from vllm.transformers_utils.config import (
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.model_executor.models.utils import add_prefix_to_loaded_weights, is_interleaved
 from vllm_omni.transformers_utils.configs.mammoth_moda2 import Mammothmoda2Config
+
+logger = init_logger(__name__)
 
 
 def _runtime_meta(runtime_info: dict[str, Any]) -> dict[str, Any]:
@@ -623,6 +632,42 @@ class MammothModa2Qwen3ForCausalLM(MammothModa2Qwen2ForCausalLM):
         )
 
 
+def _drop_parent_language_model(model: nn.Module, prefix: str) -> None:
+    """Unregister and release the language model built by the Qwen-VL parent ``__init__``.
+
+    The parent builds a stock Qwen LM whose attention layers register in the static
+    forward context as ``{prefix}.language_model.model.layers.*``. MammothModa2 replaces
+    it with its own LM (``{prefix}.language_model.layers.*``); without this, both sets of
+    layers are counted when the KV cache is sized and each gets its own KV blocks.
+    """
+    old = model.language_model
+    if isinstance(old, StageMissingLayer):  # mm_encoder_only
+        old = old.__dict__["module"]
+    ctx = get_current_vllm_config().compilation_config.static_forward_context
+    owned = set(old.modules())
+    dropped = [name for name, layer in ctx.items() if layer in owned]
+    for name in dropped:
+        del ctx[name]
+    stale = [name for name in ctx if name.startswith(maybe_prefix(prefix, "language_model."))]
+    # A later pipeline rank may hold none of the parent's layers, so only the first
+    # rank has to find some; no rank may leave any behind.
+    pp_group = get_pp_group()
+    must_drop = pp_group.world_size == 1 or pp_group.is_first_rank
+    if (must_drop and not dropped) or stale:
+        raise RuntimeError(
+            f"Unexpected attention registry for the parent language model (dropped {len(dropped)}, left {stale}); "
+            "check the Qwen-VL __init__."
+        )
+    # With torch.compile, the compile wrapper's bytecode hook would keep the module alive.
+    for module in owned:
+        if isinstance(module, TorchCompileWithNoGuardsWrapper):
+            module.cleanup()
+    logger.debug("Dropped %d attention layers of the parent language model.", len(dropped))
+    del model.language_model, old, owned
+    gc.collect()
+    torch.accelerator.empty_cache()
+
+
 @MULTIMODAL_REGISTRY.register_processor(
     MammothModa2ARMultiModalProcessor,
     info=MammothModa2ARProcessingInfo,
@@ -656,6 +701,7 @@ class MammothModa2ARForConditionalGeneration(Qwen2_5_VLForConditionalGeneration)
         ar_vllm_config = vllm_config.with_hf_config(ar_hf_config, architectures=vllm_config.model_config.architectures)
         # Initialize multi-modal components like the vision tower first.
         super().__init__(vllm_config=ar_vllm_config, prefix=prefix)
+        _drop_parent_language_model(self, prefix)
         # Replace with the custom MoE language model.
         lm_hf_config = getattr(
             ar_vllm_config.model_config.hf_config, "text_config", ar_vllm_config.model_config.hf_config
@@ -824,6 +870,7 @@ class MammothModa2Qwen3ARForConditionalGeneration(Qwen3VLForConditionalGeneratio
             architectures=vllm_config.model_config.architectures,
         )
         super().__init__(vllm_config=ar_vllm_config, prefix=prefix)
+        _drop_parent_language_model(self, prefix)
         text_config = ar_hf_config.text_config
         self.language_model = MammothModa2Qwen3ForCausalLM(
             vllm_config=ar_vllm_config.with_hf_config(text_config),

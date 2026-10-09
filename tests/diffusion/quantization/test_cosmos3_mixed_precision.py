@@ -406,28 +406,38 @@ def test_runtime_allows_standard_offload_and_rejects_distributed(monkeypatch) ->
         "get_tensor_model_parallel_world_size",
         lambda: 1,
     )
-    od_config = SimpleNamespace(
-        enable_cpu_offload=True,
-        enable_layerwise_offload=True,
-        enable_distributed_layerwise_offload=False,
-        parallel_config=SimpleNamespace(use_hsdp=False),
-    )
+
+    def offload_config(**overrides: object) -> SimpleNamespace:
+        config = SimpleNamespace(
+            diffusion_offload_config=None,
+            enable_cpu_offload=False,
+            enable_layerwise_offload=True,
+            enable_distributed_layerwise_offload=False,
+            dlo_use_allgather=True,
+            dlo_resident_layers=0,
+            dlo_host_registration_limit_gib=0.0,
+            host_weight_runtime_mode="disabled",
+            pin_cpu_memory=True,
+            max_num_seqs=1,
+            parallel_config=SimpleNamespace(data_parallel_size=1, use_hsdp=False),
+        )
+        for name, value in overrides.items():
+            setattr(config, name, value)
+        return config
+
     transformer_cosmos3._validate_mixed_precision_runtime(
         Cosmos3MixedPrecisionConfig(),
-        od_config,
+        offload_config(),
     )
-    od_config.enable_distributed_layerwise_offload = True
     with pytest.raises(ValueError, match="distributed layer-wise offload"):
         transformer_cosmos3._validate_mixed_precision_runtime(
             Cosmos3MixedPrecisionConfig(),
-            od_config,
+            offload_config(enable_distributed_layerwise_offload=True),
         )
-    od_config.enable_distributed_layerwise_offload = False
-    od_config.max_num_seqs = 2
     with pytest.raises(ValueError, match="one active request"):
         transformer_cosmos3._validate_mixed_precision_runtime(
             Cosmos3MixedPrecisionConfig(),
-            od_config,
+            offload_config(max_num_seqs=2),
         )
 
 

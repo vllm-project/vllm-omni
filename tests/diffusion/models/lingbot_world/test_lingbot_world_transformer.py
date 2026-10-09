@@ -35,11 +35,15 @@ def _tiny_model(
     num_layers: int = 2,
     num_frames_per_block: int = 1,
     sliding_window_num_frames: int = 3,
+    quant_config=None,
+    prefix: str = "",
+    attention_head_dim: int = 2,
+    rope_max_seq_len: int = 16,
 ):
     return module.CausalLingBotWorldTransformer3DModel(
         patch_size=(1, 2, 2),
         num_attention_heads=2,
-        attention_head_dim=2,
+        attention_head_dim=attention_head_dim,
         in_channels=36,
         out_channels=2,
         text_dim=6,
@@ -48,11 +52,13 @@ def _tiny_model(
         num_layers=num_layers,
         cross_attn_norm=True,
         eps=1e-6,
-        rope_max_seq_len=16,
+        rope_max_seq_len=rope_max_seq_len,
         sink_size=1,
         num_frames_per_block=num_frames_per_block,
         sliding_window_num_frames=sliding_window_num_frames,
         local_attn_size=-1,
+        quant_config=quant_config,
+        prefix=prefix,
     )
 
 
@@ -121,7 +127,8 @@ def _assert_self_cache_unchanged(cache, snapshot) -> None:
 
 
 @pytest.mark.cpu
-def test_tiny_transformer_runs_four_chunks_with_explicit_cache_commit_and_camera_path() -> None:
+@pytest.mark.parametrize("num_chunks", [4, 18])
+def test_tiny_transformer_runs_contiguous_chunks_with_explicit_cache_commit_and_camera_path(num_chunks) -> None:
     torch.manual_seed(7)
     module = attention_tests._load_module()
     model = _tiny_model(module).eval()
@@ -135,7 +142,7 @@ def test_tiny_transformer_runs_four_chunks_with_explicit_cache_commit_and_camera
     assert model.patch_embedding.in_channels == 36
     assert model.patch_embedding_wancamctrl.in_features == 6 * 8 * 8 * 1 * 2 * 2
 
-    for start_frame in range(4):
+    for start_frame in range(num_chunks):
         hidden_states = torch.randn(1, 36, 1, 4, 4)
         timestep = torch.tensor([float(start_frame + 1)])
         snapshot = _self_cache_snapshot(cache)
@@ -169,7 +176,7 @@ def test_tiny_transformer_runs_four_chunks_with_explicit_cache_commit_and_camera
         expected_token_end = (start_frame + 1) * 2 * 2
         assert all(layer_cache.absolute_end == expected_token_end for layer_cache in cache.self_attention)
 
-    assert len(outputs) == 4
+    assert len(outputs) == num_chunks
     assert all(len(outputs) == 1 for outputs in cross_key_outputs)
     assert len(text_projection_outputs) == 1
 
@@ -482,11 +489,52 @@ def test_constructor_rejects_non_null_image_embedding_fields(field: str) -> None
 
 
 @pytest.mark.cpu
-def test_constructor_rejects_unsupported_quantization_with_runtime_error() -> None:
+@pytest.mark.parametrize("prefix", ["", "transformer"])
+@pytest.mark.parametrize("quantized", [False, True])
+def test_constructor_propagates_quantization_to_parallel_linears(prefix: str, quantized: bool) -> None:
     module = attention_tests._load_module()
+    quant_config = object() if quantized else None
+    model = _tiny_model(module, num_layers=1, quant_config=quant_config, prefix=prefix)
+    block = model.blocks[0]
+    quantized_linears = [
+        model.c2ws_hidden_states_layer1,
+        model.c2ws_hidden_states_layer2,
+        block.self_attn.qkv,
+        block.self_attn.o,
+        block.cross_attn.q,
+        block.cross_attn.k,
+        block.cross_attn.v,
+        block.cross_attn.o,
+        block.ffn[0],
+        block.ffn[2],
+        block.cam_injector_layer1,
+        block.cam_injector_layer2,
+    ]
 
-    with pytest.raises(RuntimeError, match="quant_config.*not supported"):
-        module.CausalLingBotWorldTransformer3DModel(quant_config=object())
+    assert len(quantized_linears) == 12
+    assert all(layer.quant_config is quant_config for layer in quantized_linears)
+    expected_names = {
+        "c2ws_hidden_states_layer1",
+        "c2ws_hidden_states_layer2",
+        *(
+            f"blocks.0.{name}"
+            for name in (
+                "self_attn.qkv",
+                "self_attn.o",
+                "cross_attn.q",
+                "cross_attn.k",
+                "cross_attn.v",
+                "cross_attn.o",
+                "ffn.0",
+                "ffn.2",
+                "cam_injector_layer1",
+                "cam_injector_layer2",
+            )
+        ),
+    }
+    assert {layer.prefix for layer in quantized_linears} == {
+        f"{prefix}.{name}" if prefix else name for name in expected_names
+    }
 
 
 @pytest.mark.cpu
@@ -834,6 +882,9 @@ def _rollout(model, mode, dtype, batch):
             frames_per_block=_FRAMES,
             max_scratch_tokens_per_branch=_FRAMES * _TOKENS_PER_FRAME,
             cross_attention_lengths={"text": 5},
+            # Cross-attention keeps every local head on every SP rank, so its pool is wider than the
+            # self-attention share above.
+            cross_attention_kv_heads={"text": model.blocks[0].cross_attn.num_local_heads},
             device=device,
         )
         state = ARDiffusionKVState(kv, "numeric", {"main": kv.begin_request("numeric")}, num_layers=_LAYERS)
@@ -893,7 +944,6 @@ def _worker(rank, world_size, sp_size, tp_size, mode, dtype, batch, rendezvous):
     from vllm_omni.diffusion.distributed.parallel_state import (
         destroy_distributed_env,
         destroy_model_parallel,
-        get_sp_group,
         init_distributed_environment,
         initialize_model_parallel,
     )
@@ -945,11 +995,10 @@ def _worker(rank, world_size, sp_size, tp_size, mode, dtype, batch, rendezvous):
                         bound = 1e-5 if dtype == torch.float32 else 1e-2
                         error = (result - expected).double().norm() / expected.double().norm()
                         assert error <= bound, f"rank={rank}, TP{tp} SP{sp}: relative L2 {error.item():.3g} > {bound}"
-                        local_heads = _HEADS // tp // sp
-                        first = (
-                            get_tensor_model_parallel_rank() * (_HEADS // tp)
-                            + get_sp_group().ulysses_rank * local_heads
-                        )
+                        # Cross-attention K/V is replicated across the Ulysses group, not split over it, so
+                        # every SP rank holds its whole TP shard of heads. Only TP slices the cache now.
+                        local_heads = _HEADS // tp
+                        first = get_tensor_model_parallel_rank() * local_heads
                         for (k, v), (ek, ev) in zip(cross, expected_cross, strict=True):
                             tolerance = 1e-5 if dtype == torch.float32 else 2e-2
                             torch.testing.assert_close(
@@ -991,3 +1040,95 @@ def test_sp4_direct_matches_sp1_bf16(tmp_path):
 @hardware_test(res={"cuda": "L4"}, num_cards=4)
 def test_tp2_sp2_paged_matches_sp1_bf16(tmp_path):
     _run(tmp_path, 2, 2, "paged", torch.bfloat16, 1)
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("start_frame", [0, 1021, 1023, 1024, 21600])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_temporal_rope_matches_absolute_positions_without_growing_cache(start_frame, dtype):
+    module = attention_tests._load_module()
+    model = _tiny_model(module, num_layers=1, attention_head_dim=128, rope_max_seq_len=1024).to(dtype)
+    buffers = {name: (value.data_ptr(), value.shape) for name, value in model.named_buffers()}
+    cosine, sine = model._rotary_embedding(
+        frames=3, height=2, width=3, start_frame=start_frame, dtype=dtype, device=torch.device("cpu")
+    )
+    # Independent complex-valued reference uses absolute (time, height, width)
+    # coordinates, including blocks crossing the original precomputed table.
+    grids = torch.meshgrid(
+        torch.arange(start_frame, start_frame + 3, dtype=torch.float64),
+        torch.arange(2, dtype=torch.float64),
+        torch.arange(3, dtype=torch.float64),
+        indexing="ij",
+    )
+    reference = []
+    for positions, dim in zip(grids, (44, 42, 42), strict=True):
+        frequencies = 1.0 / 10000 ** (torch.arange(0, dim, 2, dtype=torch.float64) / dim)
+        phase = positions.flatten()[:, None] * frequencies[None, :]
+        reference.append(torch.polar(torch.ones_like(phase), phase))
+    expected = torch.cat(reference, dim=-1)
+    torch.testing.assert_close(cosine, expected.real.float().to(dtype), rtol=0, atol=0)
+    torch.testing.assert_close(sine, expected.imag.float().to(dtype), rtol=0, atol=0)
+    assert {name: (value.data_ptr(), value.shape) for name, value in model.named_buffers()} == buffers
+
+
+@pytest.mark.cpu
+def test_temporal_rope_extension_keeps_spatial_limit():
+    module = attention_tests._load_module()
+    model = _tiny_model(module, num_layers=1)
+    with pytest.raises(ValueError, match="Spatial RoPE"):
+        model._rotary_embedding(
+            frames=3, height=17, width=1, start_frame=16, dtype=torch.float32, device=torch.device("cpu")
+        )
+
+
+@pytest.mark.cpu
+def test_the_camera_injector_runs_once_per_held_cache_and_gives_the_same_output() -> None:
+    """Two forwards sharing one caller-held cache: the injector runs once per block, outputs unchanged."""
+    module = attention_tests._load_module()
+    model = _tiny_model(module, num_layers=2).eval()
+    hidden_states = torch.randn(1, 36, 1, 4, 4)
+    timestep = torch.tensor([1.0])
+    encoder_hidden_states = torch.randn(1, 3, 6)
+    camera_hidden_states = torch.randn(1, 6 * 8 * 8, 1, 4, 4)
+
+    def run(cache, camera_cache=None):
+        return model(
+            hidden_states,
+            timestep,
+            encoder_hidden_states,
+            camera_hidden_states,
+            cache=cache,
+            start_frame=0,
+            update_cache=False,
+            camera_modulation_cache=camera_cache,
+        )
+
+    # Baseline: no cache, so every forward rebuilds the injector in every block.
+    uncached_first = run(_cache(module, model))
+    uncached_second = run(_cache(module, model))
+    injector_calls = [attention_tests._record_outputs(block.cam_injector_layer1) for block in model.blocks]
+    held = module.CameraModulationCache()
+    cached_first = run(_cache(module, model), held)
+    cached_second = run(_cache(module, model), held)
+
+    # One build per block for both forwards, instead of one per block per forward.
+    assert [len(calls) for calls in injector_calls] == [1, 1]
+    torch.testing.assert_close(cached_first, uncached_first, rtol=0, atol=0)
+    torch.testing.assert_close(cached_second, uncached_second, rtol=0, atol=0)
+
+
+@pytest.mark.cpu
+def test_timestep_projection_is_staged_into_one_static_buffer_per_shape() -> None:
+    """Two forwards' projections land in the same buffer; the blocks never see the fresh per-forward tensor."""
+    module = attention_tests._load_module()
+    model = _tiny_model(module, num_layers=1).eval()
+    first = torch.randn(1, 8, 6, model.dim)
+    second = torch.randn(1, 8, 6, model.dim)
+
+    staged_first = model._stage_timestep_projection(first)
+    assert staged_first is not first and torch.equal(staged_first, first)
+    staged_second = model._stage_timestep_projection(second)
+    assert staged_second is staged_first and torch.equal(staged_second, second)
+    # A different shape gets its own buffer; the first one is kept.
+    other = model._stage_timestep_projection(torch.randn(1, 4, 6, model.dim))
+    assert other is not staged_first and len(model._timestep_projection_buffers) == 2

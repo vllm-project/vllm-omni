@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from __future__ import annotations
 
 from contextlib import contextmanager
@@ -33,7 +36,7 @@ class StubScheduler:
         self.config = SimpleNamespace(num_train_timesteps=1000)
         self.set_timesteps_calls: list[tuple[int, torch.device]] = []
 
-    def set_timesteps(self, num_steps: int, device: torch.device) -> None:
+    def set_timesteps(self, num_steps: int, device: torch.device, shift: float | None = None) -> None:
         self.set_timesteps_calls.append((num_steps, device))
 
 

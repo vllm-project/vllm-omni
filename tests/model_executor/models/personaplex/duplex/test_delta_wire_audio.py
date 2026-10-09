@@ -13,12 +13,12 @@ from vllm.sampling_params import RequestOutputKind
 from vllm.v1.engine import FinishReason
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
 
-from tests.model_executor.models.personaplex.duplex.test_delta_output import _state
+from tests.engine.test_output_metadata_snapshots import _state as _metadata_state
 from vllm_omni.engine import OmniEngineCoreOutput, OmniEngineCoreOutputs
-from vllm_omni.entrypoints.duplex.runtime_bridge import NativeRuntimeBridgeMixin
+from vllm_omni.engine.duplex.plugin import DuplexDataPlaneContext
+from vllm_omni.entrypoints.duplex.audio_encoding import encode_audio
 from vllm_omni.entrypoints.openai.audio_utils_mixin import AudioMixin
 from vllm_omni.model_executor.models.personaplex.duplex.data_plane import (
-    PersonaPlexDataPlaneContext,
     PersonaPlexDataPlaneSession,
 )
 from vllm_omni.outputs.output_modality import OutputModality
@@ -27,11 +27,11 @@ from vllm_omni.outputs.output_processor import MultimodalOutputProcessor
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-class _EncodingBridge(NativeRuntimeBridgeMixin):
-    def __init__(self) -> None:
-        # Only bind the real audio service needed by this production method;
-        # no model, HTTP handler or mocked encoder is constructed.
-        self._chat_service = AudioMixin()
+def _state(kind: RequestOutputKind, request_id: str = "audio"):
+    state = _metadata_state(kind)
+    state.request_id = request_id
+    state.external_req_id = request_id
+    return state
 
 
 def _pcm_bytes(event: dict[str, object], response_format: str) -> bytes:
@@ -57,9 +57,8 @@ def test_wire_to_encoded_audio_preserves_interleaved_streams(sessions, response_
     for state in states:
         processor.request_states[state.request_id] = state
         processor.external_req_ids[state.external_req_id] = [state.request_id]
-    bridge = _EncodingBridge()
-    projector = PersonaPlexDataPlaneSession(bridge._encode_native_data_plane_audio)
-    context = PersonaPlexDataPlaneContext(response_format=response_format)
+    projector = PersonaPlexDataPlaneSession(encode_audio)
+    context = DuplexDataPlaneContext(response_format=response_format)
     generator = torch.Generator().manual_seed(127)
     expected: dict[str, list[bytes]] = {state.request_id: [] for state in states}
     actual: dict[str, list[bytes]] = {state.request_id: [] for state in states}
@@ -120,10 +119,9 @@ def test_wire_to_encoded_audio_preserves_interleaved_streams(sessions, response_
 @pytest.mark.parametrize("response_format", ["pcm", "wav"])
 @pytest.mark.parametrize("text", ["", "first transcript"])
 def test_empty_audio_does_not_invoke_encoder_or_lose_text(response_format, text, mocker):
-    bridge = _EncodingBridge()
-    encode_spy = mocker.spy(bridge._chat_service, "create_audio")
-    projector = PersonaPlexDataPlaneSession(bridge._encode_native_data_plane_audio)
-    context = PersonaPlexDataPlaneContext(response_format=response_format)
+    encode_spy = mocker.spy(AudioMixin, "create_audio")
+    projector = PersonaPlexDataPlaneSession(encode_audio)
+    context = DuplexDataPlaneContext(response_format=response_format)
     state = _state(RequestOutputKind.DELTA)
     state.add_multimodal_tensor({"model_outputs": torch.empty(0), "sr": torch.tensor(24000)}, "audio")
     output = state.make_request_output([], None, None, None)
@@ -142,18 +140,17 @@ def test_empty_audio_does_not_invoke_encoder_or_lose_text(response_format, text,
 
 
 def test_production_encoding_failure_is_not_a_successful_projection(monkeypatch):
-    bridge = _EncodingBridge()
-    projector = PersonaPlexDataPlaneSession(bridge._encode_native_data_plane_audio)
+    projector = PersonaPlexDataPlaneSession(encode_audio)
     output = _state(RequestOutputKind.DELTA)
     output.add_multimodal_tensor({"model_outputs": torch.ones(1920), "sr": torch.tensor(24000)}, "audio")
     emitted = output.make_request_output([], None, None, None)
     assert emitted is not None
 
-    def fail_encoding(_audio_obj):
+    def fail_encoding(self, _audio_obj):
         raise ValueError("test codec failure")
 
-    monkeypatch.setattr(bridge._chat_service, "create_audio", fail_encoding)
-    # The production bridge catches codec exceptions and returns None; the
+    monkeypatch.setattr(AudioMixin, "create_audio", fail_encoding)
+    # The production encoder catches codec exceptions and returns None; the
     # model projector must still reject nonempty audio rather than lose it.
     with pytest.raises(RuntimeError, match="could not encode a nonempty audio delta"):
         list(projector.project({"data_plane_outputs": [emitted]}))

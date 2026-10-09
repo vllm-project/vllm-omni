@@ -27,6 +27,7 @@ from upload_pipeline import (  # noqa: E402
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 CUDA_BOOTSTRAP_STEPS = Path(".buildkite/cuda/bootstrap-upload-steps.yml")
+NIGHTLY_YAML = Path(".buildkite/cuda/test-nightly.yml")
 BOOTSTRAP_STEPS_TEMPLATE = """steps:
   - key: image-build
   - key: upload-ready-pipeline
@@ -171,7 +172,11 @@ def test_mirror_hardwares_l4_1_expands_to_agents_and_plugins(monkeypatch: pytest
     env_names = {item["name"] for item in container["env"]}
     assert "VLLM_CI_HF_TOKEN" in env_names
     assert "HF_TOKEN" not in env_names
-    assert step["commands"] == [CUDA_HF_TOKEN_EXPORT, "pytest -sv tests/example"]
+    assert step["commands"] == [
+        CUDA_HF_TOKEN_EXPORT,
+        "python3 .buildkite/cuda/scripts/check_vllm_runtime.py",
+        "pytest -sv tests/example",
+    ]
 
 
 def test_mirror_hardwares_l4_preserves_explicit_retry() -> None:
@@ -238,6 +243,10 @@ def test_all_cuda_mirror_hardwares_restore_hf_token_at_runtime() -> None:
         assert "VLLM_CI_HF_TOKEN" in env_names
         assert "HF_TOKEN" not in env_names
         assert step["commands"][0] == CUDA_HF_TOKEN_EXPORT
+        assert step["commands"][1:] == [
+            "python3 .buildkite/cuda/scripts/check_vllm_runtime.py",
+            "pytest -sv tests/example",
+        ]
 
 
 def _gpu_limit(step: dict) -> int:
@@ -364,8 +373,54 @@ def test_mirror_hardwares_inferred_missing_preset_is_rejected(monkeypatch: pytes
 
 
 def test_cpu_step_without_mirror_hardwares_is_unchanged() -> None:
-    step = {"label": "CPU report", "commands": ["echo ok"], "agents": {"queue": "cpu_queue_premerge"}}
+    step = {"label": "CPU report", "commands": ["echo ok"], "agents": {"queue": "medium_cpu_queue_premerge"}}
     assert _expand_mirror_hardwares(step) is step
+
+
+def _leaf_steps(steps: list) -> list[dict]:
+    leaves: list[dict] = []
+    for step in steps:
+        if not isinstance(step, dict):
+            continue
+        nested = step.get("steps")
+        if nested is not None:
+            leaves.extend(_leaf_steps(nested))
+        else:
+            leaves.append(step)
+    return leaves
+
+
+def test_nightly_yaml_infers_h100_l4_and_b200(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Nightly inferred jobs share card counts across H100/L4 and B200 mirrors."""
+    src = yaml.safe_load(NIGHTLY_YAML.read_text(encoding="utf-8"))
+    pytest_leaves = [step for step in _leaf_steps(src["steps"]) if "pytest" in str(step.get("commands"))]
+    inferred_leaves = [step for step in pytest_leaves if "mirror_hardwares" not in step]
+    pinned_leaves = [step for step in pytest_leaves if "mirror_hardwares" in step]
+    assert inferred_leaves
+
+    monkeypatch.setattr("upload_pipeline._get_mirror_hw_selector", lambda: "")
+    default_by_label = {
+        step["label"]: step for step in _leaf_steps(_render_test_pipeline(src, changed_files=None)["steps"])
+    }
+
+    monkeypatch.setattr("upload_pipeline._get_mirror_hw_selector", lambda: "b200")
+    b200_src = yaml.safe_load(NIGHTLY_YAML.read_text(encoding="utf-8"))
+    b200_by_label = {
+        step["label"]: step for step in _leaf_steps(_render_test_pipeline(b200_src, changed_files=None)["steps"])
+    }
+
+    pytest_labels = {step["label"] for step in inferred_leaves}
+    pinned_labels = {step["label"] for step in pinned_leaves}
+    assert pinned_labels <= set(default_by_label)
+    assert pinned_labels.isdisjoint(b200_by_label)
+    assert pytest_labels <= set(default_by_label)
+    assert pytest_labels <= set(b200_by_label)
+    for label in pytest_labels:
+        default_step = default_by_label[label]
+        b200_step = b200_by_label[label]
+        assert default_step["agents"]["queue"] in {"mithril-h100-pool", "l4-k8s"}
+        assert b200_step["agents"]["queue"] == "b200-k8s"
+        assert _gpu_limit(default_step) == _gpu_limit(b200_step)
 
 
 @pytest.mark.parametrize(("raw", "expected"), [("", ""), ("  ", ""), ("b200", "b200"), ("B200", "b200")])

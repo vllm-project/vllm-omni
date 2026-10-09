@@ -24,10 +24,9 @@ Examples::
 
 ``--action-script`` is a JSON list with one camera action list per AR block,
 for example ``[[["w"], ["w"], ["w"]], [["a"], [], []]]`` for a checkpoint that
-generates three latent frames per block. The frames per block, the temporal
-compression and the number of blocks that fit the condition horizon are read
-off the checkpoint rather than assumed, so the script can be repointed with
-``--model``.
+generates three latent frames per block. The frames per block and temporal
+compression are read off the checkpoint rather than assumed, so the script
+can be repointed with ``--model``.
 """
 
 from __future__ import annotations
@@ -49,9 +48,6 @@ if TYPE_CHECKING:
     import numpy as np
 
 _MODEL = "robbyant/lingbot-world-v2-14b-causal-fast-diffusers"
-# Mirrors _MAX_RAW_FRAMES in vllm_omni/diffusion/models/lingbot_world/pipeline.py:
-# the image-condition horizon is the pipeline's constant, not the checkpoint's.
-_MAX_RAW_FRAMES = 117
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -67,8 +63,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--action-script",
         required=True,
         help=(
-            "JSON file holding one camera action list per AR block. Both the per-block frame count "
-            "and the number of blocks that fit are read off the checkpoint, not assumed."
+            "JSON file holding one camera action list per AR block. "
+            "The per-block frame count is read off the checkpoint, not assumed."
         ),
     )
     parser.add_argument("--output-dir", required=True, help="Directory for decoded frames and metadata.")
@@ -154,12 +150,6 @@ def _validate_against_checkpoint(
                 f"--action-script block {block_index} holds {len(block)} frame action lists, but this "
                 f"checkpoint generates {frames_per_block} latent frames per AR block."
             )
-    max_chunks = ((_MAX_RAW_FRAMES - 1) // temporal_compression + 1) // frames_per_block
-    if len(script) > max_chunks:
-        raise ValueError(
-            f"--action-script holds {len(script)} blocks, but this checkpoint's "
-            f"{_MAX_RAW_FRAMES}-frame image-condition horizon fits at most {max_chunks}."
-        )
     return (len(script) * frames_per_block - 1) * temporal_compression + 1
 
 
