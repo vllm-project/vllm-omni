@@ -618,6 +618,10 @@ class ChatterboxS3Gen(S3GenDecoder):
         vllm_config: The engine's config; its ``hf_config`` is the
             checkpoint's ``ChatterboxConfig``.
         prefix: vLLM's module prefix, unused: the stage is the root module.
+
+    Raises:
+        ValueError: If one step's token budget cannot hold every slot's
+            longest utterance.
     """
 
     # Without this the runner discards OmniOutput.multimodal_outputs.
@@ -631,6 +635,18 @@ class ChatterboxS3Gen(S3GenDecoder):
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         config: ChatterboxConfig = vllm_config.model_config.hf_config
+        # The scheduler gives a new request what is left of the step's token
+        # budget, and the decoder cannot tell part of an utterance from one.
+        scheduler = vllm_config.scheduler_config
+        budget = scheduler.max_num_scheduled_tokens
+        if budget is None:
+            budget = scheduler.max_num_batched_tokens
+        if budget < scheduler.max_num_seqs * config.max_new_tokens:
+            raise ValueError(
+                f"chatterbox_s3gen needs a step token budget of at least max_num_seqs ({scheduler.max_num_seqs}) "
+                f"* {config.max_new_tokens} tokens, got {budget}: raise max_num_batched_tokens, or an utterance "
+                "scheduled in part would be decoded as a whole one"
+            )
         super().__init__(config)
         # The repo holds other checkpoints too; this stage loads its own.
         self.allow_patterns_overrides = [config.s3gen_weights]

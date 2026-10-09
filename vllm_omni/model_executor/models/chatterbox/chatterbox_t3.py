@@ -192,6 +192,11 @@ class ChatterboxT3ForConditionalGeneration(nn.Module, SupportsPP):
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
+        if vllm_config.cache_config.enable_prefix_caching:
+            raise ValueError(
+                "Chatterbox T3 requires enable_prefix_caching=False: its placeholder prompts would share "
+                "cache entries across voices and texts"
+            )
         config: ChatterboxConfig = vllm_config.model_config.hf_config
         self.config = config
         backbone = GPT2Config(

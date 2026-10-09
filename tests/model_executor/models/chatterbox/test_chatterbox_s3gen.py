@@ -1,14 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 from dataclasses import replace
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
+import yaml
 
+from tests.helpers.stage_config import get_deploy_config_path
 from vllm_omni.model_executor.models.chatterbox.chatterbox_s3gen import (
     LEFT_CONTEXT_TOKENS,
     SAMPLES_PER_FRAME,
     SOURCE_CACHE_SAMPLES,
+    ChatterboxS3Gen,
     Chunk,
     Reference,
     S3GenDecoder,
@@ -458,3 +463,43 @@ def test_token_offset_and_stream_state_must_agree_001(decoder: S3GenDecoder, ref
         decoder.decode_step(tokens[:23], [23], [stream_payload(references[0], False, 0)], ["restarted"])
     decoder.on_requests_finished({"restarted"})
     assert decoder.streams == {}
+
+
+def stage_config(
+    max_num_seqs: int, max_num_batched_tokens: int, max_num_scheduled_tokens: int | None = None
+) -> SimpleNamespace:
+    """The fields of the engine's config that the stage reads."""
+    return SimpleNamespace(
+        model_config=SimpleNamespace(hf_config=ChatterboxConfig()),
+        scheduler_config=SimpleNamespace(
+            max_num_seqs=max_num_seqs,
+            max_num_batched_tokens=max_num_batched_tokens,
+            max_num_scheduled_tokens=max_num_scheduled_tokens,
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    ("max_num_batched_tokens", "max_num_scheduled_tokens", "budget"),
+    [(7999, None, 7999), (16384, 4096, 4096)],
+    ids=["batched tokens", "scheduled tokens"],
+)
+def test_a_step_budget_that_can_split_an_utterance_is_refused_at_startup_001(
+    max_num_batched_tokens: int, max_num_scheduled_tokens: int | None, budget: int
+) -> None:
+    """A new request the step's budget cannot cover is scheduled with part of its tokens.
+
+    The decoder would take that part for the whole utterance. Eight slots of
+    1000 tokens need 8000; the scheduler's budget is its scheduled-token limit
+    when one is set.
+    """
+    with pytest.raises(ValueError, match=rf"max_num_seqs \(8\) \* 1000 tokens, got {budget}"):
+        ChatterboxS3Gen(vllm_config=stage_config(8, max_num_batched_tokens, max_num_scheduled_tokens))
+
+
+def test_the_stage_builds_with_the_deploy_files_budget_001() -> None:
+    decoder = yaml.safe_load(Path(get_deploy_config_path("chatterbox_turbo.yaml")).read_text())["stages"][1]
+
+    stage = ChatterboxS3Gen(vllm_config=stage_config(decoder["max_num_seqs"], decoder["max_num_batched_tokens"]))
+
+    assert stage.allow_patterns_overrides == [ChatterboxConfig().s3gen_weights]

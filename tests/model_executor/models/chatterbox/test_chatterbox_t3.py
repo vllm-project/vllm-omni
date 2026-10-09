@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -191,3 +193,10 @@ def test_weight_routing_sends_the_backbone_to_vllm_and_the_rest_to_the_heads_001
 def test_weight_routing_rejects_a_key_it_does_not_know_001() -> None:
     with pytest.raises(KeyError, match="cond_enc.perceiver.weight"):
         split_t3_weights(iter([("cond_enc.perceiver.weight", torch.zeros(1))]))
+
+
+def test_prefix_caching_is_refused_at_startup_001() -> None:
+    """Every prompt is the same placeholder id, so a cache would match on length alone."""
+    vllm_config = SimpleNamespace(cache_config=SimpleNamespace(enable_prefix_caching=True))
+    with pytest.raises(ValueError, match="enable_prefix_caching=False"):
+        ChatterboxT3ForConditionalGeneration(vllm_config=vllm_config)
