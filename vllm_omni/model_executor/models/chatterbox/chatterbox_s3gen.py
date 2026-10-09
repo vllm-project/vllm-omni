@@ -14,15 +14,34 @@ streaming branch sizes the decoder mask from the uncropped encoder length.
 ``CausalMaskedDiffWithXvec.inference`` (0.1.7) for a batch, with each row's
 mask built from its own cropped length.
 
-Seams follow CosyVoice 2's ``token2wav``. The flow's encoder attends over
-its whole input, so frames already played move a little when more tokens
-arrive. A chunk is therefore decoded from the last ``LEFT_CONTEXT_TOKENS`` of
-context plus its own tokens, the frames before the offset are dropped, the
-previous chunk's last eight mel frames are vocoded again, and the overlap is
-cross-faded with a Hamming window. Bounding the context keeps a chunk's cost
-constant instead of growing with the sentence.
+Seams follow CosyVoice 2's ``token2wav``. A chunk is decoded from the last
+``LEFT_CONTEXT_TOKENS`` of context plus its own tokens, the frames before the
+offset are dropped, the previous chunk's last eight mel frames are vocoded
+again, and the overlap is cross-faded with a Hamming window. Bounding the
+context keeps a chunk's cost constant instead of growing with the sentence.
+
+The flow attends over its whole input, so a frame's mel depends on the
+tokens decoded with it and on the noise the flow starts from. Upstream draws
+that noise once per utterance. Drawing it per chunk would make every chunk a
+different sample of the utterance, and the context a chunk decodes again
+would disagree with the audio already played. The decoder instead takes the
+noise by position from one fixed buffer, so a mel frame starts from the same
+noise every time it is decoded, whichever chunk it falls in. The flow is
+therefore deterministic for a given token sequence and voice, where upstream
+gives a new sample on every call; the vocoder's source module still draws
+its own phase and noise per call.
+
+Measured with the Turbo checkpoint on six sentences: audio decoded in chunks
+is 0.4 to 0.7 times as far, in mean log-mel distance, from the same tokens
+decoded as one chunk as two noise draws are from each other. Chunks
+still differ from the one-chunk decode, because a chunk is decoded before
+the tokens that follow it exist and from a bounded context: the mel step
+across a seam is 1.1 to 2.9 times the step at the same frames of the
+one-chunk decode, median 1.3 (median 1.7 when every chunk drew its own
+noise).
 """
 
+import math
 from collections.abc import Iterable
 from dataclasses import dataclass
 
@@ -50,6 +69,8 @@ SAMPLES_PER_FRAME = 480
 SOURCE_CACHE_SAMPLES = MEL_CACHE_FRAMES * SAMPLES_PER_FRAME
 # Tokens of already-played context a chunk is decoded with (two seconds).
 LEFT_CONTEXT_TOKENS = 50
+# Seed of the flow-noise buffer: fixed, so every process draws the same one.
+NOISE_SEED = 0
 # The checkpoint also holds the reference encoders, which run in the API
 # process (conditioning.VoiceConditioner), not in this stage.
 REFERENCE_ENCODER_PREFIXES = ("tokenizer.", "speaker_encoder.")
@@ -194,9 +215,10 @@ def flow_mels(
             plain Euler steps) or the standard one (Euler steps with the
             flow's own classifier-free guidance, on a cosine schedule).
         noise: Shape (B, 80, F) covering the last F mel frames of the flow's
-            input; the flow draws the frames before them. None, the serving
-            case, lets it draw them all, which is the distribution upstream's
-            ``flow_inference`` samples from. Tests pin the whole input.
+            input; the flow draws the frames before them. None lets it draw
+            them all, which is the distribution upstream's ``flow_inference``
+            samples from. ``S3GenDecoder`` passes the whole input, taken by
+            position from its buffer.
 
     Returns:
         B mels of shape (1, 80, F_i) with ``F_i = 2 * N_i``, minus the
@@ -243,6 +265,11 @@ class S3GenDecoder(nn.Module):
     """S3Gen's flow and vocoder with a batched, streaming decode.
 
     Parameter names match the checkpoint (``flow.*``, ``mel2wav.*``).
+
+    The flow never draws noise here: every mel frame starts from the noise
+    at its own position in ``flow_noise``, so a frame decoded again in a
+    later chunk, or in another batch, starts from the same noise. The same
+    tokens and voice always give the same mel.
     """
 
     def __init__(self, config: ChatterboxConfig) -> None:
@@ -307,6 +334,22 @@ class S3GenDecoder(nn.Module):
             "silence", torch.full((config.n_silence_tokens,), config.silence_token, dtype=torch.long), persistent=False
         )
 
+        # The flow's noise by position: the reference prompt's frames, then
+        # the utterance's. Sized for the longest of each the config allows.
+        ratio = config.token_mel_ratio
+        self.prompt_noise_frames = config.dec_cond_seconds * config.token_rate * ratio
+        utterance_frames = (config.max_new_tokens + config.n_silence_tokens) * ratio
+        self.register_buffer(
+            "flow_noise",
+            torch.randn(
+                1,
+                config.mel["num_mels"],
+                self.prompt_noise_frames + utterance_frames,
+                generator=torch.Generator().manual_seed(NOISE_SEED),
+            ),
+            persistent=False,
+        )
+
         # One entry per request mid-stream, keyed by the scheduler's request
         # id. No lock: forward and on_requests_finished run on one thread.
         self.streams: dict[str, StreamState] = {}
@@ -337,9 +380,68 @@ class S3GenDecoder(nn.Module):
         )
 
     @torch.inference_mode()
-    def chunked_decode_streaming(
-        self, chunks: list[Chunk], noise: torch.Tensor | None = None
-    ) -> list[tuple[torch.Tensor, StreamState | None]]:
+    def chunk_mels(self, chunks: list[Chunk]) -> list[torch.Tensor]:
+        """Every chunk's new mel frames, from one flow call.
+
+        Row ``i`` of the flow's noise is ``[prompt region, its first 2 * P_i
+        frames | utterance region, the frames of the row's tokens by their
+        position in the utterance | zero padding]``. The appended silence
+        tokens continue the positions.
+
+        Args:
+            chunks: The step's chunks, one per request.
+
+        Returns:
+            Per chunk, in order: shape (1, 80, F), the frames after the
+            chunk's token offset.
+
+        Raises:
+            RuntimeError: If a non-final chunk brings fewer new frames than
+                the mel cache holds, or a reference or an utterance is longer
+                than the noise buffer.
+        """
+        ratio = self.config.token_mel_ratio
+        rows: list[torch.Tensor] = []
+        offsets: list[int] = []
+        noise: list[torch.Tensor] = []
+        for chunk in chunks:
+            kept, offset = window(chunk.tokens, chunk.token_offset)
+            new_frames = (kept.numel() - offset - self.config.pre_lookahead_len) * ratio
+            if not chunk.finalize and new_frames < MEL_CACHE_FRAMES:
+                raise RuntimeError(
+                    f"chatterbox_s3gen got a non-final chunk of {new_frames} new mel frames; the cross-fade "
+                    f"needs {MEL_CACHE_FRAMES}: codec_chunk_frames must be at least "
+                    f"{math.ceil(MEL_CACHE_FRAMES / ratio)}"
+                )
+            row = torch.cat([kept, self.silence]) if chunk.finalize else kept
+            prompt_frames = chunk.reference.prompt_token.shape[1] * ratio
+            # ``kept`` is the tail of the utterance so far.
+            start = self.prompt_noise_frames + (chunk.tokens.numel() - kept.numel()) * ratio
+            end = start + row.numel() * ratio
+            if prompt_frames > self.prompt_noise_frames or end > self.flow_noise.shape[2]:
+                raise RuntimeError(
+                    f"chatterbox_s3gen got {(end - self.prompt_noise_frames) // ratio} speech tokens after a "
+                    f"{prompt_frames // ratio}-token reference; the noise buffer holds "
+                    f"{(self.flow_noise.shape[2] - self.prompt_noise_frames) // ratio} and "
+                    f"{self.prompt_noise_frames // ratio}"
+                )
+            rows.append(row)
+            offsets.append(offset)
+            # (F_i, 80), the layout pad_sequence pads.
+            noise.append(torch.cat([self.flow_noise[0, :, :prompt_frames], self.flow_noise[0, :, start:end]], dim=1).T)
+        mels = flow_mels(
+            self.flow,
+            rows,
+            [chunk.reference for chunk in chunks],
+            [chunk.finalize for chunk in chunks],
+            self.config.n_cfm_timesteps,
+            self.config.meanflow,
+            nn.utils.rnn.pad_sequence(noise, batch_first=True).transpose(1, 2),
+        )
+        return [mel[:, :, offset * ratio :] for mel, offset in zip(mels, offsets, strict=True)]
+
+    @torch.inference_mode()
+    def chunked_decode_streaming(self, chunks: list[Chunk]) -> list[tuple[torch.Tensor, StreamState | None]]:
         """Decode every chunk's new audio in one pass.
 
         Rows carrying a source cache and first chunks are vocoded separately,
@@ -348,28 +450,12 @@ class S3GenDecoder(nn.Module):
 
         Args:
             chunks: The step's chunks, one per request.
-            noise: Flow noise, see ``flow_mels``.
 
         Returns:
             Per chunk, in order: the new audio of shape (1, n) at 24 kHz and
             the state for the request's next chunk (None after the last).
         """
-        ratio = self.config.token_mel_ratio
-        rows = [window(chunk.tokens, chunk.token_offset) for chunk in chunks]
-        tokens = [
-            torch.cat([kept, self.silence]) if chunk.finalize else kept
-            for (kept, _), chunk in zip(rows, chunks, strict=True)
-        ]
-        mels = flow_mels(
-            self.flow,
-            tokens,
-            [chunk.reference for chunk in chunks],
-            [chunk.finalize for chunk in chunks],
-            self.config.n_cfm_timesteps,
-            self.config.meanflow,
-            noise,
-        )
-        mels = [mel[:, :, offset * ratio :] for mel, (_, offset) in zip(mels, rows, strict=True)]
+        mels = self.chunk_mels(chunks)
 
         speech: dict[int, torch.Tensor] = {}
         source: dict[int, torch.Tensor] = {}

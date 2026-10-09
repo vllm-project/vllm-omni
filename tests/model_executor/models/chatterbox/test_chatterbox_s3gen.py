@@ -229,3 +229,109 @@ def test_batch_mode_payload_decodes_the_whole_utterance_001(decoder: S3GenDecode
     (audio,) = decoder.decode_step(torch.randint(0, 6561, (40,)), [40], [payload], ["x"])
     assert audio.shape == (2 * (40 + 3) * SAMPLES_PER_FRAME,)
     assert decoder.streams == {}
+
+
+def test_decoding_a_chunk_twice_gives_the_same_mel_001(decoder: S3GenDecoder, references: list[Reference]) -> None:
+    """The flow draws nothing: its noise comes by position from a fixed buffer.
+
+    The audio is the same only once the vocoder's own draw is pinned: HiFT's
+    source module draws phase and noise on every call, as upstream's does.
+    """
+    chunk = Chunk(torch.randint(0, 6561, (53,)), 20, references[0], None, False)
+    (first,) = decoder.chunk_mels([chunk])
+    (again,) = decoder.chunk_mels([chunk])
+    assert first.shape == (1, 80, 60)
+    assert torch.equal(first, again)
+
+    audio = []
+    for _ in range(2):
+        torch.manual_seed(3)
+        ((piece, _),) = decoder.chunked_decode_streaming([chunk])
+        audio.append(piece)
+    assert torch.equal(audio[0], audio[1])
+
+
+def test_a_row_does_not_depend_on_its_batch_001(decoder: S3GenDecoder, references: list[Reference]) -> None:
+    """Nothing is pinned here: each row's noise is fixed by its own positions."""
+    tokens = torch.randint(0, 6561, (113,))
+    chunks = [
+        Chunk(tokens[:53], 20, references[0], None, False),
+        Chunk(tokens, 50, references[1], None, True),
+        Chunk(tokens[:23], 0, references[0], None, False),
+    ]
+    batched = decoder.chunk_mels(chunks)
+    assert [mel.shape[2] for mel in batched] == [60, 2 * (63 + 3), 40]
+    for chunk, mel in zip(chunks, batched, strict=True):
+        (alone,) = decoder.chunk_mels([chunk])
+        assert torch.allclose(mel, alone, atol=1e-3, rtol=1e-3), (mel - alone).abs().max()
+
+
+def test_noise_is_taken_by_position_for_every_prompt_length_001(
+    decoder: S3GenDecoder, references: list[Reference]
+) -> None:
+    """A row is the prompt region from frame 0, then the tokens' own frames."""
+    tokens = torch.randint(0, 6561, (113,))
+    # Seventy tokens played: the window keeps tokens[20:], fifty of them context.
+    kept = tokens[20:]
+    start = decoder.prompt_noise_frames + 2 * 20
+    for ref in references:
+        prompt = 2 * ref.prompt_token.shape[1]
+        (mel,) = decoder.chunk_mels([Chunk(tokens, 70, ref, None, False)])
+
+        def decoded_from(utterance_start: int) -> torch.Tensor:
+            noise = torch.cat(
+                [
+                    decoder.flow_noise[:, :, :prompt],
+                    decoder.flow_noise[:, :, utterance_start : utterance_start + 2 * kept.numel()],
+                ],
+                dim=2,
+            )
+            (whole,) = flow_mels(decoder.flow, [kept], [ref], [False], 2, True, noise)
+            return whole[:, :, 2 * LEFT_CONTEXT_TOKENS :]
+
+        assert torch.equal(mel, decoded_from(start))
+        # Not vacuous: the same row placed at the start of the utterance differs.
+        assert not torch.allclose(mel, decoded_from(decoder.prompt_noise_frames), atol=1e-2)
+
+
+def test_chunked_mel_is_closer_to_one_chunk_than_a_noise_redraw_001(
+    decoder: S3GenDecoder, references: list[Reference]
+) -> None:
+    """Chunks and one final chunk share noise, so they differ by context only."""
+    tokens = torch.randint(0, 6561, (140,))
+    (whole,) = decoder.chunk_mels([Chunk(tokens, 0, references[0], None, True)])
+    stitched = torch.cat(
+        [
+            decoder.chunk_mels([Chunk(tokens[:prefix], offset, references[0], None, finalize)])[0]
+            for prefix, offset, finalize in chunk_plan(140)
+        ],
+        dim=2,
+    )
+    assert stitched.shape == whole.shape == (1, 80, 2 * (140 + 3))
+
+    (redrawn,) = flow_mels(
+        decoder.flow,
+        [torch.cat([tokens, decoder.silence])],
+        [references[0]],
+        [True],
+        2,
+        True,
+        torch.randn(1, 80, 2 * (references[0].prompt_token.shape[1] + 140 + 3)),
+    )
+    assert (stitched - whole).abs().mean() < (redrawn - whole).abs().mean()
+
+
+def test_a_non_final_chunk_shorter_than_the_mel_cache_is_refused_001(
+    decoder: S3GenDecoder, references: list[Reference]
+) -> None:
+    """Three new tokens are six mel frames, and the cross-fade caches eight."""
+    tokens = torch.randint(0, 6561, (3 + LOOKAHEAD,))
+    with pytest.raises(RuntimeError, match="codec_chunk_frames must be at least 4"):
+        decoder.chunked_decode_streaming([Chunk(tokens, 0, references[0], None, False)])
+
+
+def test_tokens_past_the_noise_buffer_are_refused_001(decoder: S3GenDecoder, references: list[Reference]) -> None:
+    """The buffer covers ``max_new_tokens`` and the silence; nothing wraps."""
+    tokens = torch.randint(0, 6561, (1001,))
+    with pytest.raises(RuntimeError, match="1004 speech tokens after a 20-token reference.*holds 1003 and 250"):
+        decoder.chunked_decode_streaming([Chunk(tokens, 960, references[0], None, True)])
