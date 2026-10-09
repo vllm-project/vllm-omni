@@ -26,6 +26,7 @@ from vllm_omni.config.pipeline_registry import resolve_pipeline_config
 from vllm_omni.config.stage_config import load_deploy_config, resolve_deploy_yaml
 from vllm_omni.engine.duplex import commands
 from vllm_omni.engine.duplex.contracts import DuplexOutputAction, duplex_resource_request_belongs_to_session
+from vllm_omni.engine.duplex.delivery import DuplexOutputBuffer
 from vllm_omni.engine.duplex.session.model_channel import ModelChannel
 from vllm_omni.model_executor.models.aura_omni.duplex.plugin import (
     AURA_SILENT_TOKEN_ID,
@@ -82,9 +83,12 @@ def _judge_output(request_id: str, text: str):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("auto_response", [True, False])
 async def test_judge_no_ends_the_turn_through_the_native_listen_path(auto_response):
-    orchestrator, clients, rpc_q, output_q = _judged_orchestrator()
+    orchestrator, clients, rpc_q, _ = _judged_orchestrator()
+    output_buffer = DuplexOutputBuffer(max_bytes=2 * 1024 * 1024, max_events=512)
     try:
-        assert (await _open(orchestrator, rpc_q, extra_body={"auto_response": auto_response})).ok
+        assert (
+            await _open(orchestrator, rpc_q, extra_body={"auto_response": auto_response}, output_buffer=output_buffer)
+        ).ok
         request_id = await _pending_judge(orchestrator)
         pending = weakref.ref(rj._owned_turn(request_id, orchestrator.request_states[request_id].streaming))
         session = orchestrator.session_manager.get(SESSION_ID)
@@ -100,7 +104,7 @@ async def test_judge_no_ends_the_turn_through_the_native_listen_path(auto_respon
         assert pending() is None  # released with the request
         assert clients[2].add_request_calls == []
         assert clients[3].add_request_calls == []
-        events = [output_q.get_nowait().event for _ in range(output_q.qsize())]
+        events = [await output_buffer.get() for _ in range(output_buffer.pending_events)]
         types = [event.type for event in events]
         assert "error" not in types
         assert "response.listen" in types
@@ -117,9 +121,10 @@ async def test_judge_no_ends_the_turn_through_the_native_listen_path(auto_respon
 @pytest.mark.asyncio
 async def test_aura_silence_reports_its_own_listen_source():
     """Without a judge, AURA's own <|silent|> reaches the client as "aura_silent", not "response_judge"."""
-    orchestrator, clients, rpc_q, output_q = _build(stages=4, plugin=AuraDuplexPlugin(_encode_audio))
+    orchestrator, clients, rpc_q, _ = _build(stages=4, plugin=AuraDuplexPlugin(_encode_audio))
+    output_buffer = DuplexOutputBuffer(max_bytes=2 * 1024 * 1024, max_events=512)
     try:
-        assert (await _open(orchestrator, rpc_q)).ok
+        assert (await _open(orchestrator, rpc_q, output_buffer=output_buffer)).ok
         aura = AURA_STAGE_LAYOUT.aura
         request_id = await _pending_at(orchestrator, aura)
         silent = SimpleNamespace(
@@ -131,7 +136,7 @@ async def test_aura_silence_reports_its_own_listen_source():
             aura, 0, silent, orchestrator.request_states[request_id], None, None
         )
         await _settle(orchestrator)
-        events = [output_q.get_nowait().event for _ in range(output_q.qsize())]
+        events = [await output_buffer.get() for _ in range(output_buffer.pending_events)]
         listen = next(event for event in events if event.type == "response.listen").to_realtime()
         assert listen["response"]["metadata"]["vllm_omni"]["listen_source"] == "aura_silent"
     finally:
