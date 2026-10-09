@@ -30,6 +30,7 @@ from vllm.model_executor.models.llama import LlamaModel
 from vllm.model_executor.models.utils import maybe_prefix
 from vllm.sampling_params import SamplingParams
 from vllm.v1.sample.sampler import Sampler
+from vllm.v1.worker.gpu.sample.logits_processor import LogitsContext, LogitsProcessor
 
 from vllm_omni.engine.duplex.intermediate import get_tts_handoff
 from vllm_omni.model_executor.models.minicpmo_4_5 import (
@@ -204,13 +205,17 @@ def _apply_codec_window_penalty_gpu(
     logits.copy_(torch.where(logits < 0, logits * alpha, logits / alpha))
 
 
-class _CodecWindowPenaltiesState:
+class _CodecWindowPenaltiesState(LogitsProcessor):
     """MRv2 sampler penalties for the MiniCPM-o Talker.
 
     Replaces the sampler's presence-based repetition penalty (whole prompt and
     output) with MiniCPMTTS's frequency penalty over the last 16 codes, scored
     on the device. Frequency and presence penalties, if a request sets them,
     still go through the upstream state, which keeps the output bin counts.
+
+    The MRv2 sampler runs the processors in ``sampler.logits_processors``, so
+    ``_install_mrv2_talker_sampler`` puts this state in the stock penalty
+    state's slot of that pipeline.
     """
 
     def __init__(self, base: Any, *, window_size: int) -> None:
@@ -230,11 +235,11 @@ class _CodecWindowPenaltiesState:
     def output_bin_counts(self) -> torch.Tensor:
         return self.base.output_bin_counts
 
-    def add_request(self, req_idx: int, sampling_params: Any) -> None:
+    def add_request(self, req_idx: int, sampling_params: Any) -> bool:
         repetition = float(getattr(sampling_params, "repetition_penalty", 1.0))
         self.repetition_penalty.np[req_idx] = repetition
         self.use_window[req_idx] = repetition != 1.0
-        self.base.add_request(
+        base_applies = self.base.add_request(
             req_idx,
             SimpleNamespace(
                 repetition_penalty=1.0,
@@ -242,31 +247,25 @@ class _CodecWindowPenaltiesState:
                 presence_penalty=float(getattr(sampling_params, "presence_penalty", 0.0)),
             ),
         )
-        self.use_penalty[req_idx] = bool(self.use_window[req_idx] or self.base.use_penalty[req_idx])
+        self.use_penalty[req_idx] = bool(self.use_window[req_idx] or base_applies)
+        return bool(self.use_penalty[req_idx])
 
     def apply_staged_writes(self) -> None:
         self.repetition_penalty.copy_to_uva()
         self.base.apply_staged_writes()
 
-    def apply_penalties(
-        self,
-        logits: torch.Tensor,
-        expanded_idx_mapping: torch.Tensor,
-        idx_mapping_np: np.ndarray,
-        input_ids: torch.Tensor,
-        expanded_local_pos: torch.Tensor,
-    ) -> None:
-        if np.any(self.use_window[idx_mapping_np]):
+    def apply(self, logits: torch.Tensor, ctx: LogitsContext) -> torch.Tensor:
+        if np.any(self.use_window[ctx.idx_mapping_np]):
             _apply_codec_window_penalty_gpu(
                 logits,
-                expanded_idx_mapping,
+                ctx.expanded_idx_mapping,
                 self.req_states.all_token_ids.gpu,
                 self.req_states.total_len.gpu,
                 self.req_states.prompt_len.gpu,
                 self.repetition_penalty.gpu,
                 window_size=self.window_size,
             )
-        self.base.apply_penalties(logits, expanded_idx_mapping, idx_mapping_np, input_ids, expanded_local_pos)
+        return self.base.apply(logits, ctx)
 
 
 def _install_mrv2_talker_sampler(sampler: Any, talker: "MiniCPMO45OmniTTSForConditionalGeneration") -> Any:
@@ -279,7 +278,16 @@ def _install_mrv2_talker_sampler(sampler: Any, talker: "MiniCPMO45OmniTTSForCond
     where V1's ``_force_eos_on_sampled_ids`` does.
     """
 
-    sampler.penalties_state = _CodecWindowPenaltiesState(sampler.penalties_state, window_size=_CODEC_PENALTY_WINDOW)
+    stock = sampler.penalties_state
+    processors = sampler.logits_processors
+    slot = next((i for i, processor in enumerate(processors) if processor is stock), None)
+    if slot is None:
+        raise RuntimeError("MiniCPM-o Talker: MRv2 sampler has no penalty stage in logits_processors")
+    window = _CodecWindowPenaltiesState(stock, window_size=_CODEC_PENALTY_WINDOW)
+    # The sampler applies (and registers requests with) the list entries;
+    # ``penalties_state`` is still read by the runner for output bin counts.
+    processors[slot] = window
+    sampler.penalties_state = window
     talker._mrv2_empty_speech = torch.zeros(
         int(sampler.req_states.max_num_reqs), dtype=torch.bool, device=sampler.req_states.device
     )

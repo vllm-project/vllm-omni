@@ -9,6 +9,7 @@ import pytest
 import torch
 
 import vllm_omni.model_executor.models.minicpmo_4_5.flow_encoder_graph as graph_module
+from tests.helpers.mark import hardware_test
 from vllm_omni.model_executor.models.minicpmo_4_5.flow_encoder_graph import (
     FlowEncoderGraphs,
     reachable_conformer_cache_frames,
@@ -19,6 +20,17 @@ pytestmark = [pytest.mark.core_model]
 _DEPTH, _HEADS, _WIDTH, _HIDDEN = 2, 2, 4, 8
 _CNN = (3, 2)
 _LOOKAHEAD = 1
+_requires_nvidia_capture = pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.version.hip is not None,
+    reason="Exact-shape capture requires NVIDIA CUDA streams",
+)
+
+
+@pytest.fixture
+def mock_nvidia_platform(monkeypatch: pytest.MonkeyPatch) -> None:
+    # These CPU tests simulate CUDA eligibility; the host's HIP build must
+    # not bypass their mocked capture/admission path.
+    monkeypatch.setattr(torch.version, "hip", None)
 
 
 def _encode(tokens, *, cnn_cache, att_cache, weight):
@@ -180,7 +192,7 @@ def test_explicit_shared_batches_bypass_opportunistic_capture_cutoff(fake_captur
 
 
 @pytest.mark.cpu
-def test_startup_precapture_uses_shared_arena_and_freezes_admission(fake_capture):
+def test_startup_precapture_uses_shared_arena_and_freezes_admission(fake_capture, mock_nvidia_platform):
     from contextlib import nullcontext
 
     from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import BatchedToken2Wav
@@ -232,7 +244,8 @@ def test_legacy_graph_options_share_one_owner():
 
 
 @pytest.mark.cuda
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.nvidia_only
+@_requires_nvidia_capture
 @torch.inference_mode()
 def test_exact_precapture_failure_blocks_retry(monkeypatch):
     graph = FlowEncoderGraphs(lambda x, **kwargs: (x, x, x))
@@ -327,12 +340,53 @@ def test_cpu_fallback_and_capacity():
 @pytest.mark.cpu
 @torch.inference_mode()
 def test_rocm_cuda_devices_fall_back_before_nvidia_stream_creation(monkeypatch):
+    from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import BatchedToken2Wav
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("ROCm fallback must not create or capture NVIDIA streams")
+
     monkeypatch.setattr(torch.version, "hip", "test-rocm")
+    monkeypatch.setattr(graph_module, "_new_capture_stream", forbidden)
+    monkeypatch.setattr(FlowEncoderGraphs, "_capture", forbidden)
     token = SimpleNamespace(device=SimpleNamespace(type="cuda"))
     wrapper = FlowEncoderGraphs(lambda x, **kwargs: (x, x, x))
     assert wrapper(token, last_chunk=False, cnn_cache=None, att_cache=None) == (token, token, token)
     assert wrapper.stats["ineligible"] == 1
     assert not wrapper.exact_graphs
+    backend = SimpleNamespace(_chunk_encoder_graph=wrapper, _flow_on_cuda=lambda: True)
+    assert BatchedToken2Wav.precapture_chunk_encoder(backend, object()) == 0
+    assert not wrapper.graphs
+
+
+@pytest.mark.cuda
+@hardware_test(res={"rocm": "MI325"}, num_cards=1)
+@pytest.mark.skipif(torch.version.hip is None or not torch.cuda.is_available(), reason="ROCm GPU required")
+@torch.inference_mode()
+def test_rocm_eager_chunks_preserve_outputs_and_cache(monkeypatch):
+    from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import BatchedToken2Wav
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("ROCm eager chunks must not enter NVIDIA capture")
+
+    monkeypatch.setattr(graph_module, "_new_capture_stream", forbidden)
+    monkeypatch.setattr(FlowEncoderGraphs, "_capture", forbidden)
+    weight = torch.randn(_HIDDEN, _HIDDEN, device="cuda")
+    encode = functools.partial(_encode, weight=weight)
+    wrapper = FlowEncoderGraphs(lambda tokens, last_chunk, **kwargs: encode(tokens, **kwargs))
+    backend = SimpleNamespace(_chunk_encoder_graph=wrapper, _flow_on_cuda=lambda: True)
+    assert BatchedToken2Wav.precapture_chunk_encoder(backend, object()) == 0
+    tokens, cnn, att = _inputs(1, 6, 8, "cuda")
+    cnn, att = cnn[0], att[0]
+    for _ in range(3):
+        expected = encode(tokens, cnn_cache=cnn, att_cache=att)
+        actual = wrapper(tokens, last_chunk=False, cnn_cache=cnn, att_cache=att)
+        for value, reference in zip(actual, expected, strict=True):
+            torch.testing.assert_close(value, reference)
+        _, cnn, att = actual
+        tokens = (tokens + 1) % 50
+    assert wrapper.stats["ineligible"] == 3
+    assert wrapper.stats["captures"] == 0
+    assert not wrapper.graphs and not wrapper.exact_graphs
 
 
 @pytest.mark.cpu
@@ -518,7 +572,8 @@ def test_npu_position_table_replacement_captures_new_graph(simulated_npu):
 
 
 @pytest.mark.cuda
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.nvidia_only
+@_requires_nvidia_capture
 @torch.inference_mode()
 def test_configurable_admission_avoids_short_lived_shape_capture():
     wrapper = FlowEncoderGraphs(lambda x, **kw: (x + 1, x + 2, x + 3), capture_after=4)
@@ -536,7 +591,8 @@ def test_configurable_admission_avoids_short_lived_shape_capture():
 
 
 @pytest.mark.cuda
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.nvidia_only
+@_requires_nvidia_capture
 @pytest.mark.parametrize("amp", [False, True])
 @torch.inference_mode()
 def test_real_conformer_chunks_replay_and_preserve_state(amp):
@@ -597,7 +653,8 @@ def test_real_conformer_chunks_replay_and_preserve_state(amp):
 
 
 @pytest.mark.cuda
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.nvidia_only
+@_requires_nvidia_capture
 @torch.inference_mode()
 def test_stream_isolation_cache_refresh_and_capacity():
     def forward(x, *, last_chunk, cnn_cache, att_cache):
@@ -626,7 +683,8 @@ def test_stream_isolation_cache_refresh_and_capacity():
 
 
 @pytest.mark.cuda
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.nvidia_only
+@_requires_nvidia_capture
 @torch.inference_mode()
 def test_overlapping_replays_use_independent_scratch_pools():
     def forward(x, **kwargs):
@@ -660,7 +718,7 @@ def test_overlapping_replays_use_independent_scratch_pools():
 
 @pytest.mark.cpu
 @torch.inference_mode()
-def test_failed_capture_blocks_even_eager_retry(monkeypatch):
+def test_failed_capture_blocks_even_eager_retry(monkeypatch, mock_nvidia_platform):
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     monkeypatch.setattr(torch.cuda, "current_stream", lambda device: SimpleNamespace(cuda_stream=1))
     wrapper = FlowEncoderGraphs(lambda x, **kw: (x, x, x))
@@ -680,7 +738,8 @@ def test_failed_capture_blocks_even_eager_retry(monkeypatch):
 
 
 @pytest.mark.cuda
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.nvidia_only
+@_requires_nvidia_capture
 @torch.inference_mode()
 def test_full_cache_preserves_graphs_outputs_and_bounded_metadata():
     weight = torch.randn(32, 32, device="cuda")
@@ -724,7 +783,7 @@ def test_full_cache_preserves_graphs_outputs_and_bounded_metadata():
 
 @pytest.mark.cpu
 @torch.inference_mode()
-def test_large_batch_and_frozen_wrapper_stay_eager(monkeypatch):
+def test_large_batch_and_frozen_wrapper_stay_eager(monkeypatch, mock_nvidia_platform):
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     monkeypatch.setattr(torch.cuda, "current_stream", lambda device: SimpleNamespace(cuda_stream=1))
     calls = []
@@ -748,7 +807,8 @@ def test_large_batch_and_frozen_wrapper_stay_eager(monkeypatch):
 
 
 @pytest.mark.cuda
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.nvidia_only
+@_requires_nvidia_capture
 @torch.inference_mode()
 def test_capture_streams_are_not_reused_by_torch_pool():
     # Retaining torch.cuda.Stream objects does not reserve their underlying
@@ -777,7 +837,8 @@ def test_capture_streams_are_not_reused_by_torch_pool():
 
 
 @pytest.mark.cuda
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.nvidia_only
+@_requires_nvidia_capture
 @torch.inference_mode()
 def test_precision_change_recaptures_instead_of_reusing_previous_gemm():
     x = torch.randn(128, 128, device="cuda")
