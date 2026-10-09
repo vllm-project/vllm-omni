@@ -1,0 +1,64 @@
+# TaoMate-H3 realtime streaming on four GPUs: pure Ulysses sequence parallel
+# (USP4), tensor parallel 1, AR-Diffusion stepwise engine, streaming output.
+#
+# Serve (under a GPU reservation on the shared machine):
+#
+#   gpu run --gpus 4 --timeout 4h --note "taomate-h3 usp4" -- \
+#     vllm serve /path/to/MiniMax-H3/FL2VA --omni --trust-remote-code \
+#       --deploy-config vllm_omni/deploy/taomate_h3_usp4_realtime.yaml \
+#       --lora-path /path/to/TaoMate-H3 --port 8000
+#
+# `--model` is the FL2VA/ partition of the MiniMax-H3 snapshot; `--lora-path`
+# is the TaoLiveAIGC/TaoMate-H3 adapter directory (adapter_model.safetensors +
+# config.json). `devices` is the rank -> card mapping inside the reservation.
+#
+# Clients open WS /v1/realtime/video with `session.start` (prompt, width,
+# height, seed, num_frames) and switch the prompt of the next five-second
+# request with `session.interaction` {"event": {"prompt": "..."}}. Each
+# streamed chunk is one 34/34/34/17-frame phase with its aligned audio.
+
+pipeline: taomate_h3
+async_chunk: false
+distributed_executor_backend: mp
+dtype: bfloat16
+
+stages:
+  - stage_id: 0
+    devices: "0,1,2,3"
+    max_num_seqs: 1
+    # Eager runs at the same steady-state speed as regional torch.compile here
+    # (about 4.1 s per 4.958 s request at 480x864 on 4x H200-class GPUs) and
+    # avoids Dynamo recompiles across prompt lengths. For compiled runs set
+    # enforce_eager: false, model_config.taomate_h3_pad_text_tokens (fixed
+    # packed shapes) and VLLM_OMNI_TORCH_DYNAMO_RECOMPILE_LIMIT=64.
+    enforce_eager: true
+    model_class_name: TaoMateH3Pipeline
+    engine_backend: vllm_omni.experimental.ar_diffusion.engine.ARDiffusionEngine
+    step_execution: true
+    streaming_output: true
+    parallel_config:
+      tensor_parallel_size: 1
+      sequence_parallel_size: 4
+      ulysses_degree: 4
+      ring_degree: 1
+      text_encoder_tp_size: 4
+      vae_patch_parallel_size: 4
+      vae_parallel_mode: tile
+    default_sampling_params:
+      num_inference_steps: 3
+      output_type: np
+      fps: 24
+    model_config:
+      taomate_h3_width: 480
+      taomate_h3_height: 864
+      taomate_h3_seed: 8301
+      taomate_h3_audio_kv_reset_requests: 12
+      # taomate_h3_pad_text_tokens: 256   # fixed packed lengths (compiled runs)
+      ar_diffusion_kv_config:
+        # The persistent clean AV KV is model-owned (dense); the paged pool is
+        # only the runner's bookkeeping, so keep its share of free memory small.
+        gpu_memory_fraction: 0.02
+        # One throwaway five-second request at load time (the pipeline opts
+        # into it in eager mode too): the first chunk of a session then takes
+        # about 3 s instead of 17-20 s on a cold server.
+        warmup_cudagraph: true
