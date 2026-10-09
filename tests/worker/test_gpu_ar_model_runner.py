@@ -22,7 +22,7 @@ from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker import gpu_input_batch
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 
-from vllm_omni.core.prefix_cache import ModelCachePolicy
+from vllm_omni.core.prefix_cache import ModelCachePolicy, StageCacheOutputs
 from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
 from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
 from vllm_omni.entrypoints.openai.tts_adapters.base import PreparedRequest
@@ -1030,6 +1030,78 @@ def test_build_omni_output_falls_back_to_mm_cpu_without_prefix_merge(monkeypatch
     assert torch.equal(output.inter_stage_outputs[0]["codes.audio"], codes[0:1])
     assert torch.equal(output.inter_stage_outputs[1]["codes.audio"], codes[1:2])
     assert output.multimodal_outputs is None
+
+
+@pytest.mark.parametrize("written_in_sample", [True, False])
+def test_build_omni_output_uses_live_mm_when_model_writes_it_in_sample(monkeypatch, written_in_sample):
+    """YuE2 appends the song in sample(), after the prefix-cache step snapshot.
+
+    The snapshot still holds the empty per-request lists from make_omni_output,
+    so merging it drops the song; the opted-in model gets the live outputs.
+    """
+    runner = _make_async_output_runner(engine_output_type="audio")
+    runner._async_chunk = False
+    runner._pooler_payload_include_hidden_flag = False
+
+    class Model:
+        requires_full_prefix_cached_hidden_states = False
+        mm_outputs_written_in_sample = written_in_sample
+
+    runner._omni_cache_policy = ModelCachePolicy.from_model(Model())
+    calls: list[tuple[str, int]] = []
+
+    class StepCache:
+        def discard_step(self, step_id):
+            calls.append(("discard", step_id))
+
+        def materialize(self, step_id, req_ids):
+            calls.append(("materialize", step_id))
+            stale = {
+                "model_outputs": {rid: [] for rid in req_ids},
+                "sr": {rid: [] for rid in req_ids},
+                "meta.req_id": {rid: [] for rid in req_ids},
+                "meta.sparse_audio": {rid: ["1"] for rid in req_ids},
+            }
+            return StageCacheOutputs(hidden_states=None, mm_outputs=stale)
+
+    runner.omni_prefix_cache = StepCache()
+    monkeypatch.setattr("vllm_omni.worker.gpu_ar_model_runner.get_pp_group", lambda: SimpleNamespace(is_last_rank=True))
+    monkeypatch.setattr(GPUARModelRunner, "_resolve_pooler_payload_req_ids", lambda self, req_ids: ("audio", req_ids))
+    monkeypatch.setattr(GPUARModelRunner, "_process_additional_information_updates", lambda *args, **kwargs: None)
+    monkeypatch.setattr(GPUARModelRunner, "_should_accumulate_full_payload_output", lambda self: False)
+    monkeypatch.setattr(GPUARModelRunner, "get_omni_connector_output", lambda self: None)
+
+    song = torch.ones(2, 8)
+    output = GPUARModelRunner._build_omni_model_runner_output_from_snapshot(
+        runner,
+        scheduler_output=SimpleNamespace(total_num_scheduled_tokens=2, num_scheduled_tokens={"r1": 1, "r2": 1}),
+        hidden_states=torch.zeros(2, 4),
+        staged_hidden_states_cpu=None,
+        multimodal_outputs={
+            "model_outputs": [song],
+            "sr": [torch.tensor(48000)],
+            "meta": {"req_id": ["r2"], "sparse_audio": ["1"]},
+        },
+        req_ids_output_copy=["r1", "r2"],
+        req_id_to_index_output_copy={"r1": 0, "r2": 1},
+        valid_sampled_token_ids=[[], []],
+        logprobs_lists=None,
+        prompt_logprobs_dict={},
+        num_nans_in_logits=None,
+        kv_connector_output=None,
+        ec_connector_output=None,
+        cudagraph_stats=None,
+        kv_extracted_req_ids=None,
+        num_scheduled_tokens_np=np.array([1, 1], dtype=np.int32),
+        query_start_loc_cpu=torch.tensor([0, 1], dtype=torch.long),
+        prefix_cache_step_id=7,
+    )
+
+    if written_in_sample:
+        assert calls == [("discard", 7)]
+        assert torch.equal(output.multimodal_outputs[1]["model_outputs"], song)
+    else:
+        assert calls == [("materialize", 7)]
 
 
 # --- builder gap-fill: contract corners not covered by the tests above ---

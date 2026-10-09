@@ -207,6 +207,32 @@ def _pcm_s16le_to_seed_tts_wer_bytes(
     return (pcm_f32 * 32767).astype(np.int16).tobytes()
 
 
+def _stream_pcm_format_from_headers(
+    headers: Mapping[str, str],
+    sample_rate: int,
+    channels: int,
+) -> tuple[int, int]:
+    """Prefer the server's ``X-Audio-Sample-Rate``/``X-Audio-Channels`` headers.
+
+    Raw PCM has no self-describing header; the server states the model-native
+    format. ``sample_rate``/``channels`` (env-configured) remain the fallback.
+    """
+    resolved = []
+    for name, fallback in (("X-Audio-Sample-Rate", sample_rate), ("X-Audio-Channels", channels)):
+        raw = headers.get(name)
+        value = fallback
+        if raw:
+            try:
+                value = int(raw)
+            except ValueError:
+                logger.warning("Ignoring invalid %s header %r; using %d", name, raw, fallback)
+            else:
+                if value != fallback:
+                    logger.debug("Streamed PCM %s=%d from server header (configured %d)", name, value, fallback)
+        resolved.append(max(value, 1))
+    return resolved[0], resolved[1]
+
+
 get_samples_old = datasets.get_samples
 
 _DEFAULT_DAILY_OMNI_REPO = "liarliar/Daily-Omni"
@@ -2610,6 +2636,7 @@ async def async_request_openai_audio_speech(
     output.prompt_len = request_func_input.prompt_len
 
     # PCM format: 16-bit signed; sample_rate/channels are model-dependent.
+    # The env vars are a fallback for servers that do not send format headers.
     sample_rate, channels = defs.stream_pcm_format_from_env()
     sample_width = defs.DEFAULT_AUDIO_SAMPLE_WIDTH
 
@@ -2623,6 +2650,7 @@ async def async_request_openai_audio_speech(
     try:
         async with session.post(url=api_url, json=payload, headers=headers) as response:
             if response.status == 200:
+                sample_rate, channels = _stream_pcm_format_from_headers(response.headers, sample_rate, channels)
                 async for chunk in response.content.iter_any():
                     if not chunk:
                         continue

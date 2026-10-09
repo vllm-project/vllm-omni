@@ -182,7 +182,11 @@ def test_mimi_full_stream_reset_reuses_all_state_storage_and_clears_offsets() ->
     assert all(state._fresh.all() for state in conv_states)
 
 
-def _model(*, max_sessions: int = 1) -> tuple[PersonaPlexCode2Wav, _FakeStreamingMimi]:
+def _model(
+    *,
+    max_sessions: int = 1,
+    async_chunk: bool = True,
+) -> tuple[PersonaPlexCode2Wav, _FakeStreamingMimi]:
     mimi_config = SimpleNamespace(num_codebooks=2, sample_rate=24000, samples_per_frame=4, mimi_name=None)
     config = SimpleNamespace(mimi_config=mimi_config, mimi_name=None)
     vllm_config = SimpleNamespace(
@@ -190,6 +194,7 @@ def _model(*, max_sessions: int = 1) -> tuple[PersonaPlexCode2Wav, _FakeStreamin
             model="/unused",
             hf_config=config,
             duplex_max_sessions=max_sessions,
+            async_chunk=async_chunk,
         ),
         device_config=SimpleNamespace(device="cpu"),
     )
@@ -208,12 +213,71 @@ def _audio(output) -> torch.Tensor:
     return output.multimodal_outputs["model_outputs"][0]
 
 
-@pytest.mark.parametrize("second_codes", [_codes(3), _codes(1, start=100)])
-def test_resumable_codes_emit_only_new_pcm(second_codes: torch.Tensor) -> None:
+def test_delta_codes_skip_cpu_history(mocker) -> None:
+    model, _ = _model()
+    chunks = [_codes(1, start=frame) for frame in range(1000)]
+    decode = mocker.patch.object(
+        model,
+        "_decode_streaming_frames",
+        return_value=torch.empty(0),
+    )
+    try:
+        for chunk in chunks:
+            model(input_ids=chunk, request_ids=["req"])
+    finally:
+        model.on_requests_finished({"req"})
+
+    assert decode.call_count == 1000
+    assert all(call.args[1].shape == (2, 1) for call in decode.call_args_list)
+
+
+def test_identical_consecutive_delta_frames_are_both_decoded() -> None:
+    model, mimi = _model()
+    chunk = _codes(1)
+
+    first = model(input_ids=chunk, request_ids=["req"])
+    second = model(input_ids=chunk, request_ids=["req"])
+
+    assert _audio(first).numel() == 4
+    assert _audio(second).numel() == 4
+    assert mimi.decode_frame_calls == 2
+
+
+def test_full_payload_is_consumed_once_across_forwards() -> None:
+    model, mimi = _model(async_chunk=False)
+    runtime_info = [{"codes": {"audio": _codes(2)}}]
+
+    first = model(
+        input_ids=torch.zeros(2, dtype=torch.long),
+        request_ids=["req"],
+        runtime_additional_information=runtime_info,
+    )
+    second = model(
+        input_ids=torch.zeros(2, dtype=torch.long),
+        request_ids=["req"],
+        runtime_additional_information=runtime_info,
+    )
+
+    assert _audio(first).numel() == 8
+    assert _audio(second).numel() == 0
+    assert mimi.decode_frame_calls == 2
+
+    model.on_requests_finished({"req"})
+    reused = model(
+        input_ids=torch.zeros(2, dtype=torch.long),
+        request_ids=["req"],
+        runtime_additional_information=runtime_info,
+    )
+
+    assert _audio(reused).numel() == 8
+    assert mimi.decode_frame_calls == 4
+
+
+def test_resumable_delta_codes_emit_only_new_pcm() -> None:
     model, mimi = _model()
 
     first = model(input_ids=_codes(2), request_ids=["req"])
-    second = model(input_ids=second_codes, request_ids=["req"])
+    second = model(input_ids=_codes(1, start=100), request_ids=["req"])
 
     assert _audio(first).numel() == 8
     assert _audio(second).numel() == 4
@@ -276,9 +340,10 @@ def test_request_id_falls_back_to_runtime_information() -> None:
     info = [{"request_id": "runtime-req"}]
 
     model(input_ids=_codes(2), runtime_additional_information=info)
-    second = model(input_ids=_codes(3), runtime_additional_information=info)
+    second = model(input_ids=_codes(1, start=100), runtime_additional_information=info)
 
     assert _audio(second).numel() == 4
+    assert model._request_codec_slots == {"runtime-req": 0}
 
 
 def test_decoder_slot_lifecycle_isolated_capacity_and_reuse() -> None:

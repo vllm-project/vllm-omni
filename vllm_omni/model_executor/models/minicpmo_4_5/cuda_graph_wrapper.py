@@ -21,26 +21,6 @@ from vllm_omni.utils.device_copy import index_to_device, to_device_nonblocking
 logger = init_logger(__name__)
 
 
-def _euler_step(
-    cur_x: torch.Tensor,
-    estimate: torch.Tensor,
-    dt: float,
-    inference_cfg_rate: float,
-    batch_size: int,
-) -> torch.Tensor:
-    """One Euler step of the CFG-guided flow: ``cur_x + dt * ((1 + cfg) * cond - cfg * uncond)``."""
-    conditional, unconditional = estimate.split(batch_size, dim=0)
-    velocity = (1.0 + inference_cfg_rate) * conditional - inference_cfg_rate * unconditional
-    return cur_x + dt * velocity
-
-
-def _euler_timeline(n_timesteps: int, device: torch.device, dtype: torch.dtype) -> tuple[torch.Tensor, list[float]]:
-    """The cosine Euler timeline and its step sizes, read to the host once."""
-    t = torch.linspace(0, 1, n_timesteps + 1, device=device, dtype=dtype)
-    timeline = 1 - torch.cos(t * 0.5 * torch.pi)
-    return timeline, (timeline[1:] - timeline[:-1]).tolist()
-
-
 def codec_frame_range(value, *, name: str) -> range:
     """An inclusive ``[first, last]`` codec-frame range from the connector extra (empty: off)."""
     if value is None or (isinstance(value, (list, tuple)) and len(value) == 0):
@@ -56,11 +36,73 @@ def empty_hift_outputs(speech_feat: torch.Tensor) -> tuple[torch.Tensor, torch.T
     return speech_feat.new_empty((batch_size, 0)), speech_feat.new_empty((batch_size, 1, 0))
 
 
+def _tensor_signature(value: torch.Tensor | None) -> tuple:
+    if value is None:
+        return (None,)
+    return tuple(value.shape), str(value.dtype), str(value.device)
+
+
+def _memory_snapshot(device: torch.device) -> tuple[int, int] | None:
+    """(allocated, reserved) bytes, or None when the device cannot report them.
+
+    Capture draws on the caching allocator, so these are the numbers that say
+    what a capture cost. Free device memory is not: the allocator serves a
+    capture out of memory it has already reserved, which is most of the device
+    on a normally configured worker.
+    """
+    if device.type != "cuda":
+        return None
+    try:
+        return int(torch.accelerator.memory_allocated(device)), int(torch.accelerator.memory_reserved(device))
+    except Exception:
+        return None
+
+
+def _memory_peak(device: torch.device) -> tuple[int, int] | None:
+    """Return allocator peak (allocated, reserved) bytes when available.
+
+    A before/after delta misses transient capture workspaces.  Peak counters
+    are the useful signal for deciding whether another graph bucket is safe;
+    they are sampled without synchronizing and are therefore cheap enough for
+    capture telemetry.
+    """
+    if device.type != "cuda":
+        return None
+    try:
+        return (
+            int(torch.accelerator.max_memory_allocated(device)),
+            int(torch.accelerator.max_memory_reserved(device)),
+        )
+    except Exception:
+        return None
+
+
+def _format_memory_delta(before: tuple[int, int] | None, after: tuple[int, int] | None) -> str:
+    if before is None or after is None:
+        return ""
+    mib = 1024 * 1024
+    return (
+        f" [allocated {after[0] / mib:.1f} MiB (+{(after[0] - before[0]) / mib:.1f}), "
+        f"reserved {after[1] / mib:.1f} MiB (+{(after[1] - before[1]) / mib:.1f})]"
+    )
+
+
+def _align_up(n: int, bucket: int) -> int:
+    if n <= 0 or bucket <= 1:
+        return max(0, n)
+    return ((n + bucket - 1) // bucket) * bucket
+
+
 class HiFTGraphWrapper:
     def __init__(self, token2wav, connector_config, capture_batch_sizes, max_serial_batch: int | None = None):
         self.decode_fn = token2wav.hift.inference
         self.graph_fn = token2wav.hift._inference_pre_istft
         self.finalize_fn = token2wav.hift._finalize_decode
+        # torch.istft reads the overlap envelope back on the caller stream
+        # (aten::equal → item → cudaStreamSynchronize) after every chunk.
+        enable_cached_istft = getattr(token2wav.hift, "enable_cached_istft", None)
+        if callable(enable_cached_istft):
+            enable_cached_istft()
         self.codec_chunk_frames = connector_config["codec_chunk_frames"]
         self.initial_codec_chunk_frames = int(connector_config.get("initial_codec_chunk_frames", 0))
         self.codec_left_context_frames = connector_config["codec_left_context_frames"]
@@ -146,8 +188,6 @@ class HiFTGraphWrapper:
         before, started, memory_before = len(self.graph), time.perf_counter(), _memory_snapshot(self.device)
         for key in self._exact_keys:
             self._capture(*key)
-            # Builds the ISTFT window state before the first replay needs it.
-            self.finalize_fn(self.static_magnitude_outputs[key][:1], self.static_phase_outputs[key][:1])
         if self._exact_keys:
             logger.info(
                 "Captured %d exact-shape HiFT CUDA Graphs in %.1f s%s",
@@ -196,6 +236,17 @@ class HiFTGraphWrapper:
         self.static_magnitude_outputs[key] = static_magnitude_output
         self.static_phase_outputs[key] = static_phase_output
         self.static_cache_source_outputs[key] = static_cache_source_output
+        # The cached ISTFT still synchronizes the first time it sees a frame
+        # count: once for the envelope check, and once inside cuFFT while it
+        # builds the plan for that length. Do both here, off the request path,
+        # so replay of this shape does not drain kernels already queued on
+        # the caller stream.
+        # Capture records kernels without executing them; populate the outputs
+        # before running the eager ISTFT. Replay slices to the actual batch,
+        # and cuFFT plans include the batch dimension, so prime every slice.
+        graph.replay()
+        for rows in range(1, batch_size + 1):
+            self.finalize_fn(static_magnitude_output[:rows], static_phase_output[:rows])
         logger.info("Captured HiFT CUDA Graph for shape %s", key)
 
     def replay(self, speech_feat, cache_source):
@@ -248,9 +299,14 @@ class HiFTGraphWrapper:
     def _replay_key(self, key, speech_feat, cache_source):
         """Replay the captured graph ``key`` on a batch of at most ``key[0]`` rows."""
         batch_size = speech_feat.shape[0]
-        static_speech_inputs = self.static_speech_inputs[key].zero_()
+        static_speech_inputs = self.static_speech_inputs[key]
+        static_cache_sources = self.static_cache_source_inputs[key]
+        # Every live row is overwritten below; only padded rows need clearing
+        # when replaying a larger capture bucket after a fuller batch.
+        if batch_size < key[0]:
+            static_speech_inputs[batch_size:].zero_()
+            static_cache_sources[batch_size:].zero_()
         static_speech_inputs[:batch_size].copy_(speech_feat)
-        static_cache_sources = self.static_cache_source_inputs[key].zero_()
         static_cache_sources[:batch_size].copy_(cache_source)
 
         self.graph[key].replay()
@@ -258,73 +314,38 @@ class HiFTGraphWrapper:
         static_phase_output = self.static_phase_outputs[key]
         static_cache_source_output = self.static_cache_source_outputs[key]
         cache_source = static_cache_source_output[:batch_size].clone()
-        speech = self.finalize_fn(static_magnitude_output[:batch_size], static_phase_output[:batch_size]).clone()
+        # The eager ISTFT/clamp finalizer returns owned storage. The source
+        # cache above is a captured output and still needs its own copy.
+        speech = self.finalize_fn(static_magnitude_output[:batch_size], static_phase_output[:batch_size])
         return speech, cache_source
 
 
-def _tensor_signature(value: torch.Tensor | None) -> tuple:
-    if value is None:
-        return (None,)
-    return tuple(value.shape), str(value.dtype), str(value.device)
+def _euler_step(
+    cur_x: torch.Tensor,
+    estimate: torch.Tensor,
+    dt: float,
+    inference_cfg_rate: float,
+    batch_size: int,
+) -> torch.Tensor:
+    """One Euler step of the CFG-guided flow: ``cur_x + dt * ((1 + cfg) * cond - cfg * uncond)``."""
+    conditional, unconditional = estimate.split(batch_size, dim=0)
+    velocity = (1.0 + inference_cfg_rate) * conditional - inference_cfg_rate * unconditional
+    return cur_x + dt * velocity
+
+
+def _euler_timeline(n_timesteps: int, device: torch.device, dtype: torch.dtype) -> tuple[torch.Tensor, list[float]]:
+    """The cosine Euler timeline and its step sizes, read to the host once."""
+    t = torch.linspace(0, 1, n_timesteps + 1, device=device, dtype=dtype)
+    timeline = 1 - torch.cos(t * 0.5 * torch.pi)
+    return timeline, (timeline[1:] - timeline[:-1]).tolist()
 
 
 _DTYPE_MAP = {str(dtype): dtype for dtype in (torch.float32, torch.float16, torch.bfloat16, torch.float64, torch.bool)}
 
 
-def _memory_snapshot(device: torch.device) -> tuple[int, int] | None:
-    """(allocated, reserved) bytes, or None when the device cannot report them.
-
-    Capture draws on the caching allocator, so these are the numbers that say
-    what a capture cost. Free device memory is not: the allocator serves a
-    capture out of memory it has already reserved, which is most of the device
-    on a normally configured worker.
-    """
-    if device.type != "cuda":
-        return None
-    try:
-        return int(torch.accelerator.memory_allocated(device)), int(torch.accelerator.memory_reserved(device))
-    except Exception:
-        return None
-
-
-def _memory_peak(device: torch.device) -> tuple[int, int] | None:
-    """Return allocator peak (allocated, reserved) bytes when available.
-
-    A before/after delta misses transient capture workspaces.  Peak counters
-    are the useful signal for deciding whether another graph bucket is safe;
-    they are sampled without synchronizing and are therefore cheap enough for
-    capture telemetry.
-    """
-    if device.type != "cuda":
-        return None
-    try:
-        return (
-            int(torch.accelerator.max_memory_allocated(device)),
-            int(torch.accelerator.max_memory_reserved(device)),
-        )
-    except Exception:
-        return None
-
-
-def _format_memory_delta(before: tuple[int, int] | None, after: tuple[int, int] | None) -> str:
-    if before is None or after is None:
-        return ""
-    mib = 1024 * 1024
-    return (
-        f" [allocated {after[0] / mib:.1f} MiB (+{(after[0] - before[0]) / mib:.1f}), "
-        f"reserved {after[1] / mib:.1f} MiB (+{(after[1] - before[1]) / mib:.1f})]"
-    )
-
-
 # Frame granularity of the shared attention cache storage.
 _ATT_FRAME_ALIGN = 16
 _minus_ones = functools.partial(torch.full, fill_value=-1)
-
-
-def _align_up(n: int, bucket: int) -> int:
-    if n <= 0 or bucket <= 1:
-        return max(0, n)
-    return ((n + bucket - 1) // bucket) * bucket
 
 
 def _capture_query_width(mel_width: int, bucket: int | tuple[int, ...]) -> int:
@@ -1447,6 +1468,7 @@ class WholeEulerCFMGraphWrapper:
         initial_x = static_x.clone()
         loop_args = (statics, out_cnn_cache, out_att_cache)
         memory_before = _memory_snapshot(self.device)
+        warmup_started = time.perf_counter()
         try:
             current_stream = torch.cuda.current_stream(self.device)
             warmup_stream = torch.cuda.Stream(device=self.device)
@@ -1456,10 +1478,13 @@ class WholeEulerCFMGraphWrapper:
                     static_x.copy_(initial_x)
                     self._run_euler_loop(*loop_args, batch_size=graph_batch)
             current_stream.wait_stream(warmup_stream)
+            warmup_host_s = time.perf_counter() - warmup_started
             static_x.copy_(initial_x)
             graph = CUDAGraph()
+            capture_started = time.perf_counter()
             with torch.no_grad(), torch.cuda.graph(graph, pool=current_platform.get_global_graph_pool()):
                 static_final_x = self._run_euler_loop(*loop_args, batch_size=graph_batch)
+            capture_host_s = time.perf_counter() - capture_started
         except Exception:
             self._disable("capture failed", key)
             return None
@@ -1467,12 +1492,15 @@ class WholeEulerCFMGraphWrapper:
         self._stats["captures"] += 1
         self._record_peak()
         logger.info(
-            "Captured Whole-Euler CFM CUDA Graph for shape %s (cache=%d/%d, %s, stats=%s)%s",
+            "Captured Whole-Euler CFM CUDA Graph for shape %s "
+            "(cache=%d/%d, %s, stats=%s, warmup_host_s=%.3f, capture_host_s=%.3f)%s",
             key,
             len(self._cache) + len(self._slot_graphs) + 1,
             self.max_graphs,
             where,
             self.stats_snapshot(),
+            warmup_host_s,
+            capture_host_s,
             _format_memory_delta(memory_before, _memory_snapshot(self.device)),
         )
         return (statics, static_final_x, out_cnn_cache, out_att_cache, graph)
@@ -1781,6 +1809,7 @@ class WholeEulerCFMGraphWrapper:
         spk_dim: int,
         max_graph_bytes: int = 1 << 30,
         keep: tuple[int, int] | None = None,
+        tail_frames: int = 0,
     ) -> int:
         """Capture Whole-Euler graphs for one prompt before serving. Returns the capture count."""
         if not self.enabled:
@@ -1793,6 +1822,14 @@ class WholeEulerCFMGraphWrapper:
         if not widths:
             return 0
         keys = [(b, w, o) for b in sorted(self._graph_batches(), reverse=True) for w in widths for o in grid]
+        # Final chunks include lookahead (50 + 6 -> 100). Warm their
+        # existing replay buckets before serving, after the steady graphs
+        # so a tight cache budget still prioritizes the common shapes.
+        if tail_frames > 0:
+            tail_widths = sorted({_capture_query_width(w + tail_frames, widths) for w in widths} - set(widths))
+            keys.extend(
+                (b, w, o) for b in sorted(self._graph_batches(), reverse=True) for w in tail_widths for o in grid
+            )
         room = self.max_graphs - (len(self._cache) + len(self._slot_graphs))
         if len(keys) > room:
             logger.warning(
