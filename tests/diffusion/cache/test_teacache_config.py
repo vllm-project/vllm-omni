@@ -8,10 +8,11 @@ import pytest
 from vllm_omni.diffusion.cache.teacache.coefficient_estimator import (
     _MODEL_ADAPTERS,
     DataCollectionHook,
+    SD3Adapter,
     ZImageAdapter,
 )
 from vllm_omni.diffusion.cache.teacache.config import _MODEL_COEFFICIENTS, TeaCacheConfig
-from vllm_omni.diffusion.cache.teacache.extractors import extract_zimage_context
+from vllm_omni.diffusion.cache.teacache.extractors import extract_sd3_context, extract_zimage_context
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -42,3 +43,11 @@ def test_data_collection_hook_resolves_extractor_at_init():
 
     with pytest.raises(ValueError, match="Unknown model type"):
         DataCollectionHook("NotARegisteredTransformer")
+
+
+def test_sd3_estimator_adapter_registered():
+    assert _MODEL_ADAPTERS["SD3"] is SD3Adapter
+    assert SD3Adapter.model_class_name == "StableDiffusion3Pipeline"
+    assert SD3Adapter.uses_tf_config is True
+    assert DataCollectionHook("SD3Transformer2DModel").extractor_fn is extract_sd3_context
+
