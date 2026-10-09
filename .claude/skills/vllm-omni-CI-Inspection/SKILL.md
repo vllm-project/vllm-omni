@@ -666,11 +666,27 @@ Use these rules when running CI triage on a **cron schedule** so output format, 
 
 ### Scheduled Task Configuration
 
-| Task | Cron | Trigger time | Buildkite pipeline | CI type |
+All cron expressions are **UTC** (container timezone); trigger times below
+are CST (UTC+8). Verify with `cc-connect cron list` — the live config is
+authoritative if this table drifts.
+
+| Task | Cron (UTC) | Trigger time (CST) | Buildkite pipeline | CI type |
 |------|------|--------------|-------------------|---------|
-| READY CI | `0 9,11,17,19 * * *` | 09:00 / 11:00 / 17:00 / 19:00 | vllm-omni | Ready CI |
-| NPU READY CI | `10 9,11,17,19 * * *` | 09:10 / 11:10 / 17:10 / 19:10 | vllm-omni-npu-ci | Ready CI |
-| MERGE CI | `20 9,11,17,19 * * *` | 09:20 / 11:20 / 17:20 / 19:20 | vllm-omni | Merge CI |
+| READY CI | `0 22,3,9,11 * * *` | 06:00 / 11:00 / 17:00 / 19:00 | vllm-omni | Ready CI |
+| NPU READY CI | `10 22,3,9,11 * * *` | 06:10 / 11:10 / 17:10 / 19:10 | vllm-omni-npu-ci | Ready CI |
+| MERGE CI | `20 22,3,9,11 * * *` | 06:20 / 11:20 / 17:20 / 19:20 | vllm-omni | Merge CI |
+| AFD READY CI | `0 2,8,10 * * *` | 10:00 / 16:00 / 18:30 | afd-plugin | Ready CI |
+| AFD MERGE CI | `15 2,8,10 * * *` | 10:15 / 16:15 / 18:45 | afd-plugin | Merge CI |
+| ROUTER MERGE CI | `30 2 * * *` | 10:30 daily (24h window) | router | Merge CI |
+
+Pipeline-specific merge-CI filtering (scheduled-build exclusions differ per repo):
+- **vllm-omni / afd-plugin** merge CI: exclude builds whose message is
+  `Scheduled nightly build` / `Scheduled weekly build`.
+- **router** merge CI: exclude builds whose message **starts with `Nightly`**
+  (e.g. `Nightly ROCm MoRI XGMI/RDMA validation on 2×MI300X`); merge builds
+  carry PR-title + `Signed-off-by` messages. Router is a Rust+Python repo —
+  read cargo/pytest/shell output as-is instead of forcing vllm-omni's
+  pytest-node-id shape.
 
 - **session_mode**: `new-per-run`
 - **timeout_mins**: 60
@@ -722,6 +738,14 @@ creation is manual, human-initiated, via the button.
 - **afd-plugin** tasks (AFD READY / AFD MERGE): button URL targets
   `vllm-project/afd-plugin` with template `500-ci-failure.yml` — **not** the
   vllm-omni `400-bug-report.yml` (the skill default is wrong for this repo).
+- **router** tasks (ROUTER MERGE): button URL targets
+  `vllm-project/router` with template `200-bug-report.yml`; labels must be
+  repo-existing `bug,High Priority` (router has **no** `ci-failure` /
+  lowercase `high priority` labels — wrong-cased labels are silently dropped).
+  The template's form fields define **no `id:` attributes**, so the URL can
+  only prefill `title` + `labels` params — do not emit
+  `current-environment`/`code-version`/`bug-description` id-params for this
+  repo (they are silently ignored); the human fills the body manually.
 
 > If a prompt explicitly re-enables auto-filing for a specific one-off run
 > (rare, human-requested), that prompt wins for that run only. The default
@@ -758,6 +782,7 @@ caught the bug:
 | Merge CI (vllm-omni pipeline, main branch) | `MERGE` | `[Bug]: MERGE CI failed - tests/...::test_xxx - ...` |
 | AFD Ready CI (afd-plugin pipeline, non-main branch) | `AFD READY` | `[Bug]: AFD READY CI failed - tests/...::test_xxx - ...` |
 | AFD Merge CI (afd-plugin pipeline, main branch) | `AFD MERGE` | `[Bug]: AFD MERGE CI failed - tests/...::test_xxx - ...` |
+| Router Merge CI (router pipeline, main branch) | `ROUTER MERGE` | `[Bug]: ROUTER MERGE CI failed - <cargo test / pytest node> - ...` |
 | Nightly build (legacy / generic) | `Nightly` | `[Bug]: Nightly CI failed - tests/...::test_xxx - ...` |
 
 Rules for the `<CI type>` segment:
@@ -900,13 +925,19 @@ The summary table is the **single source of truth**: it is produced once, alread
 
 If filtering removes every row (all failures were PR-introduced), **send nothing** to the alert group (stay silent).
 
-**Format — do not use markdown tables.** Feishu splits long messages into multiple bubbles; table headers and rows land in separate bubbles and become unreadable. Use one record per line, fields separated by `|`, each line self-contained:
+**Format — markdown table (user-approved 2026-10-09).** Per-build rows go in ONE markdown table; the title/window header block above and the root-cause / verification / recommendation sections below stay plain text. cc-connect delivers via Feishu interactive cards, which render the table as a single block (the old "no tables, one pipe-separated record per line" rule was for the pre-card plain-text era and is obsolete):
 
 ```
-📋 CI Triage Summary
+📋 CI Triage Summary — <CI type> (CST <window>)
 
-Build#11824 | https://buildkite.com/... | Simple · Diffusion Test | test_xxx | 🔴 Product code defect | 🟡 Pre-existing | AssertionError: ... | Hypothesis 1 | [File issue](https://github.com/vllm-project/vllm-omni/issues/new?template=400-bug-report.yml&labels=bug,ci-failure,high%20priority&title=...&current-environment=...&code-version=...&bug-description=...)
-Build#11825 | https://buildkite.com/... | Engine Test | test_yyy | 🟢 Infrastructure | 🔵 Infra/env | OOM killed | Hypothesis 2 | [File issue](https://github.com/vllm-project/vllm-omni/issues/new?template=400-bug-report.yml&labels=bug,ci-failure,high%20priority&title=...&current-environment=...&code-version=...&bug-description=...)
+窗口: CST <window> | pipeline: <pipeline> | <scope> | PR去重后 N 个失败build / M 个失败job (<cluster info>)
+
+| Build | 失败 Job | 失败测试 | 诊断 | 归因 | 首个错误 | 根因假设 | 处置 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| [Build#11824](https://buildkite.com/...) | Simple · Diffusion Test | test_xxx | 🔴 Product code defect | 🟡 Pre-existing | AssertionError: ... | Hypothesis 1 | [File issue](https://github.com/vllm-project/vllm-omni/issues/new?template=400-bug-report.yml&labels=bug,ci-failure,high%20priority&title=...&current-environment=...&code-version=...&bug-description=...) |
+| [Build#11825](https://buildkite.com/...) | Engine Test | test_yyy | 🟢 Infrastructure | 🔵 Infra/env | OOM killed | Hypothesis 2 | [File issue](https://github.com/vllm-project/vllm-omni/issues/new?template=400-bug-report.yml&labels=bug,ci-failure,high%20priority&title=...&current-environment=...&code-version=...&bug-description=...) |
+
+🔍 根因 / 受影响job / ✅ 最小验证 / 处置建议 — keep as plain-text sections below the table
 ```
 
 > Every `[File issue]` link uses the **same** URL shape as the
@@ -915,24 +946,45 @@ Build#11825 | https://buildkite.com/... | Engine Test | test_yyy | 🟢 Infrastr
 > `code-version`, `bug-description`) so the GitHub issue form auto-fills
 > identically whether the alert or the report fires it.
 
-**Column order**:
-1. Failed build number
-2. Build URL
-3. Failed job name
-4. Failed test case (pytest node id)
-5. Diagnosis (root-cause taxonomy above)
-6. Attribution (🔴 PR-introduced / 🟡 Pre-existing / 🔵 Infra/env / 🟠 PR worsens existing / ⚪ Uncertain)
-7. First error summary (≤120 chars)
-8. Top hypothesis (one sentence)
-9. File issue (clickable link or `N/A`)
+**Table columns** (8; build number + URL merged into one clickable cell):
+1. Build — `[Build#N](build URL)` clickable link
+2. 失败 Job — failed job name; collapse jobs with an identical signature into one row (e.g. `READY 14/14 jobs 全灭 (collection阶段)`), never one row per identical job
+3. 失败测试 — pytest node id / fixture path
+4. 诊断 — root-cause taxonomy above
+5. 归因 — 🔴 PR-introduced / 🟡 Pre-existing / 🔵 Infra/env / 🟠 PR worsens existing / ⚪ Uncertain
+6. 首个错误 — first error summary (≤120 chars)
+7. 根因假设 — top hypothesis (one sentence)
+8. 处置 — `[File issue](...)` clickable link, existing-issue link for dup-guard rows, or `N/A`
 
-**Alert-group forwarding** — forward the (already-filtered) summary table + per-job details directly:
+**Table mechanics (Feishu card rendering)**:
+- Each table row MUST stay on a single line — no newlines inside a row.
+- Cell text must not contain a literal `|` (breaks the table) — use `/` or `·` instead, or escape as `\|`.
+- Long cells (首个错误 / 根因假设) wrap inside the card; keep them within the length budgets above.
+
+**Alert-group forwarding** — send TWO messages to the alert group (E5 format, user-confirmed 2026-10-09):
 
 ```bash
+# Message 1 — @ routing: at-tags + one-line headline (plain-text mode; pings the responsible people)
+cc-connect send -s "feishu:oc_929f070b14744291bef4150c0d62deb0:ou_b5fe2c5e00ae0619cf6ae7e0c21321e1" --stdin <<EOF
+<at-tags from the routing table below> 📋 <CI type> <window>: <one-line failure headline> — full table in the next message 👇
+EOF
+
+# Message 2 — full alert: summary table + per-job details, with NO at-tags anywhere (card mode; table renders)
 cc-connect send -s "feishu:oc_929f070b14744291bef4150c0d62deb0:ou_b5fe2c5e00ae0619cf6ae7e0c21321e1" --stdin <<EOF
 <filtered summary table and per-job analysis>
 EOF
 ```
+
+**Why two messages:** any `<at ...>` tag in the message body downgrades the whole message from Feishu interactive card to plain text, destroying the markdown table (E2/E3, 2026-10-09); and the `--at-users` flag — though it worked on a small test — stopped delivering the @ at full alert size (2026-10-09 final test with real 9.7KB content + 3 IDs: table rendered, @ never arrived). So mentions and tables must ride in separate messages.
+
+**@-mention routing (user-set 2026-10-09)** — at-tags go in Message 1 ONLY:
+
+| Alert type | At-tags for Message 1 |
+|---|---|
+| ROUTER MERGE / AFD READY / AFD MERGE | `<at user_id="ou_b0910cfdc8cbb8901afde1d406c62265"></at>` (王语) |
+| All others (READY / NPU READY / MERGE on vllm-omni) | `<at user_id="ou_f8547e27fe2edc35fb519fc1845d0b92"></at>` (王伟) + `<at user_id="ou_e2899f46b8e5cee8a3cf8ec346d5b462"></at>` (朱铭觉) + `<at user_id="ou_b5fe2c5e00ae0619cf6ae7e0c21321e1"></at>` (朱铭觉 second ID) |
+
+朱铭觉 has two valid open_ids (both confirmed by the user); include both so the ping reaches whichever account is active. If one is later found dead (renders blank), drop it. Message 2 must contain NO at-tags — even one breaks the table.
 
 No second filtering pass at forward time — filtering already happened when the summary table was built. If the filtered table is empty, send nothing.
 
