@@ -411,8 +411,8 @@ async def omni_run_server_worker(
             logger.warning(
                 "VLLM_TORCH_PROFILER_DIR is set but is ignored: it was removed in "
                 "vLLM v0.16.0 when profiling moved to ProfilerConfig. Profiler "
-                "endpoints are registered from engine_args.profiler_config.profiler, "
-                "and no stage declares it, so /start_profile and /stop_profile were "
+                "endpoints are registered from a stage's profiler_config, and no "
+                "stage declares one, so /start_profile and /stop_profile were "
                 'NOT registered. Use --profiler-config \'{"profiler": "torch", '
                 '"torch_profiler_dir": "..."}\' or add a profiler_config block to a '
                 "stage in your deploy YAML. See docs/contributing/profiling.md."
