@@ -76,7 +76,7 @@ def test_cosmos3_forward_capture_and_reuse(monkeypatch, model_name, device, comp
     model.reset_cache()
     changed = {**inputs, "text_ids": torch.ones_like(inputs["text_ids"])}
     args, prepared = model.prepare_attention_strategy_inputs((), changed)
-    expected = model._attention_strategy_runner._eager_forwards[1](*args, **prepared)
+    expected = model.forward_with_attention_layout(*args, attention_layout=1, **prepared)
     with override_forward_context(ForwardContext(denoise_step_idx=1, total_denoise_steps=len(steps))):
         torch.testing.assert_close(model(**changed), expected, **tolerances)
     assert len(graphs) == compiled_count

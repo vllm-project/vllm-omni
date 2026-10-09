@@ -654,13 +654,14 @@ class DiffusionWorker:
         return self._run_ar_diffusion_session_lifecycle("close_session", session_id)
 
     def _attention_strategy_runners(self):
+        from vllm_omni.diffusion.attention.strategy import iter_attention_strategy_runners
+
         assert self.model_runner is not None
-        pipeline = self.model_runner.pipeline
-        for name in getattr(pipeline, "attention_strategy_components", ()):
-            model = getattr(pipeline, name, None)
-            runner = getattr(model, "_attention_strategy_runner", None)
-            if runner is not None:
-                yield name, runner
+        return (
+            (name, runner)
+            for name, runner in iter_attention_strategy_runners(self.model_runner.pipeline)
+            if runner is not None
+        )
 
     def attention_strategy_status(self):
         """Read-only evidence; compiled activation alone is not warmup readiness."""

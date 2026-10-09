@@ -398,7 +398,10 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                 f"{self.od_config.model_class_name} does not support that contract."
             )
 
-        from vllm_omni.diffusion.attention.strategy import validate_pipeline_attention_strategy
+        from vllm_omni.diffusion.attention.strategy import (
+            iter_attention_strategy_runners,
+            validate_pipeline_attention_strategy,
+        )
 
         validate_pipeline_attention_strategy(self.pipeline, self.od_config)
 
@@ -447,12 +450,8 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                 )
 
         if active_strategy and not self.od_config.enforce_eager:
-            runners = [
-                module._attention_strategy_runner
-                for module in self.pipeline.modules()
-                if hasattr(module, "_attention_strategy_runner")
-            ]
-            if not runners or any(not runner.compiled for runner in runners):
+            runners = [runner for _, runner in iter_attention_strategy_runners(self.pipeline)]
+            if not runners or any(runner is None or not runner.compiled for runner in runners):
                 raise ValueError("Every strategy transformer must activate its configured compilation mode")
 
         # Setup cache backend

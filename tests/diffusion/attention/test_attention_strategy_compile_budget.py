@@ -26,7 +26,7 @@ def make_runner(layouts):
     graphs = []
 
     class Model(torch.nn.Module):
-        def forward(self, x, *, attention_layout, tag="0"):
+        def forward_with_attention_layout(self, x, *, attention_layout, tag="0"):
             if not torch.compiler.is_compiling():
                 eager_calls.append("entry")
             x = x + attention_layout

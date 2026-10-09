@@ -51,6 +51,11 @@ class AttentionExecutionEnvironment:
     def local_tensor_forward(self):
         return self.strategy_enabled
 
+    @property
+    def single_device_strategy(self) -> bool:
+        """Whether strategy execution bypasses sequence-parallel coordination."""
+        return self.strategy_enabled and self.ulysses_degree == 1
+
     @classmethod
     def for_model(cls, config, support):
         validate_strategy_parallel(config)

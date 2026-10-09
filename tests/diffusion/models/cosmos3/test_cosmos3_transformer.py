@@ -661,6 +661,10 @@ def test_sp_attention_masks_padded_gen_and_joint_und_keys() -> None:
             super().__init__()
             self.metadata: Any | None = None
 
+        def for_layout(self, layout=None):
+            assert layout is None
+            return self
+
         def forward(self, query, key, value, metadata):
             del key, value
             self.metadata = metadata

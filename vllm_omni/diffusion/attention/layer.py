@@ -371,9 +371,7 @@ class Attention(nn.Module):
         (e.g., in noise_refiner/context_refiner before unified_prepare in Z-Image).
         This avoids unnecessary SP communication for layers not covered by _sp_plan.
         """
-        if self.skip_sequence_parallel or (
-            self.attention_execution.local_tensor_forward and self.attention_execution.ulysses_degree == 1
-        ):
+        if self.skip_sequence_parallel or self.attention_execution.single_device_strategy:
             return self._no_parallel_strategy
         if is_forward_context_available():
             ctx = get_forward_context()

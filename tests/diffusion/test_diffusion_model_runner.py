@@ -622,7 +622,7 @@ def test_compile_strategy_respects_granularity(monkeypatch, granularity):
                 self, ForwardStrategyPlan(("dense", "sparse"), None, ())
             )
 
-        def forward(self, *args, **kwargs):
+        def forward_with_attention_layout(self, *args, **kwargs):
             return None
 
     model = StrategyTrackingModel()
