@@ -3,6 +3,7 @@
 
 import pytest
 import torch
+from vllm.platforms import current_platform
 
 from vllm_omni.attention import fish_kvcache_attn, fish_kvcache_backend
 
@@ -111,6 +112,15 @@ def test_fish_kvcache_enabled_by_default(monkeypatch):
     assert fish_kvcache_attn.is_fish_kvcache_attn_enabled()
     assert fish_kvcache_backend._fish_kvcache_enabled()
     assert not fish_kvcache_attn.is_fish_kvcache_attn_required()
+
+
+def test_fish_kvcache_fast_path_is_unavailable_off_cuda(monkeypatch):
+    monkeypatch.setattr(current_platform, "is_cuda", lambda: False)
+    monkeypatch.setattr(
+        fish_kvcache_attn, "_triton_backend", lambda: pytest.fail("Triton backend must not load off CUDA")
+    )
+
+    assert not fish_kvcache_attn.is_available()
 
 
 @pytest.mark.parametrize("value", ["", "1", "true", "yes", "on", "required"])

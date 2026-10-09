@@ -16,6 +16,12 @@ Validated on:
   50 steps, text-encoder TP2, and DiT USP2
 - Common sampling settings: `flow_shift=12`, `seed=1101`
 
+The commands and measurements below describe this pinned revision. Newer
+versions have changed the scope of `--quantization fp8`; see
+[Online FP8 quantization](MiniMax-H3.md#online-fp8-quantization) for the current
+component selection and offload support. Re-qualify memory, output, and latency
+on GB10 before comparing results across revisions.
+
 ## Capacity requirements
 
 | Resource | DGX Spark (GB10) |
@@ -40,8 +46,10 @@ math relative to the RTX and datacenter recipes:
 - **Do not use `--enable-cpu-offload`.** Moving weights from "VRAM" to "host RAM"
   frees nothing here.
 - **`--quantization fp8` is mandatory.** A BF16 partition is 135 GiB and does not
-  fit in 121 GiB. Online FP8 quantizes the DiT only (62 GiB to ~31 GiB); the
-  Qwen3-VL text encoder and both VAEs stay BF16.
+  fit in 121 GiB. At the validated revision, online FP8 quantizes the DiT only
+  (62 GiB to ~31 GiB); the Qwen3-VL text encoder and both VAEs stay BF16.
+  Current versions also quantize eligible text-decoder linears by default, so
+  the same flag does not imply the same quantization scope across revisions.
 
 With ~97.7 GiB of the pool held by the allocator at peak, T2VA leaves roughly
 23 GiB of headroom for the OS, page cache, and any other process on the box.
@@ -295,6 +303,8 @@ shorter than a 50-step Ref2VA run.
 - Ref2VA requires a vLLM-Omni build newer than `v0.26.0`. See the version note
   under **Validated on**: FP8 weight loading and image-only Ref2VA are both
   broken on `release/v0.26.0`. The suggested version is `v0.26.1`.
-- Online FP8 is incompatible with layerwise offload — the offload path produces a
-  weight stride the Cutlass FP8 kernel rejects. This is not a practical
-  restriction here since offload is unusable on GB10 anyway.
+- At the validated revision, online FP8 with layerwise offload produced a weight
+  stride the Cutlass FP8 kernel rejected. Current H3 supports online FP8 with
+  layerwise offload and both DLO transfer paths; see the linked FP8 section
+  above. This does not change the GB10 capacity guidance: offload uses the same
+  unified-memory pool and is not enabled in this recipe.

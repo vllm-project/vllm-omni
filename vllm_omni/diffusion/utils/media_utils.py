@@ -7,14 +7,55 @@ from __future__ import annotations
 import io
 import queue
 import threading
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable, Mapping
 from fractions import Fraction
-from typing import Any, cast
+from typing import Any, NamedTuple, cast
 
 import av
 import numpy as np
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
 
 _CHUNKED_MP4_DONE = object()
+
+
+class _QueuedChunk(NamedTuple):
+    """One queued chunk plus the callback that returns its buffer to its owner."""
+
+    frames: np.ndarray
+    on_consumed: Callable[[], None] | None
+
+
+def _release_chunk(on_consumed: Callable[[], None] | None) -> None:
+    """Hand a chunk's buffer back, never letting the callback wedge the worker."""
+    if on_consumed is None:
+        return
+    try:
+        on_consumed()
+    except BaseException:  # noqa: BLE001
+        logger.exception("Chunked MP4 encoder failed to release a consumed chunk")
+
+
+def normalize_preencode_batch_frames(value: Any) -> int:
+    """Validate the request's MP4 transfer/encoding batch threshold."""
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError("preencode_batch_frames must be a positive integer")
+    return value
+
+
+def normalize_video_codec_options(value: Any) -> dict[str, str] | None:
+    """Coerce a request's ``video_codec_options`` into PyAV's str->str contract.
+
+    The value reaches a worker straight from ``extra_params``, so reject a
+    non-mapping here rather than letting it fail inside the encoder after the
+    decode has already run.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        raise ValueError("video_codec_options must be a JSON object of encoder option names to values")
+    return {str(key): str(item) for key, item in value.items()}
 
 
 def _validate_video_chunk(chunk: np.ndarray, *, width: int, height: int) -> None:
@@ -30,8 +71,11 @@ def _validate_video_chunk(chunk: np.ndarray, *, width: int, height: int) -> None
 class ChunkedMP4Encoder:
     """Encode temporal video chunks while the producer is still decoding.
 
-    A bounded queue and one muxing worker provide ordered backpressure while
-    keeping host memory bounded by ``max_pending`` chunks. Chunks use the same
+    A bounded queue and one muxing worker provide ordered backpressure. What
+    that bounds is pending raw-frame memory: at most ``max_pending`` chunks wait
+    to be encoded, so the bound is in chunks rather than bytes and a taller
+    frame or a longer chunk raises it. The muxed container is not bounded -- it
+    accumulates in memory and grows with output duration. Chunks use the same
     ``(T, H, W, 3)`` uint8 contract as :func:`mux_video_audio_bytes`.
     """
 
@@ -64,9 +108,10 @@ class ChunkedMP4Encoder:
         self._state_lock = threading.Lock()
 
         def run() -> None:
+            frames = self._frames()
             try:
                 self._result = mux_av_video_audio_bytes(
-                    self._frames(),
+                    frames,
                     width=self.width,
                     height=self.height,
                     audio_waveform=audio_waveform,
@@ -79,6 +124,11 @@ class ChunkedMP4Encoder:
                 )
             except BaseException as exc:
                 self._error = exc
+                # Closing is what runs the generator's cleanup and releases the
+                # chunk it was mid-way through. Waiting for collection would
+                # never get there: the traceback just stored on this encoder
+                # keeps the abandoned generator alive for the process's life.
+                frames.close()
                 self._drain_until_done()
 
         self._thread = threading.Thread(target=run, name="chunked-mp4", daemon=True)
@@ -86,19 +136,29 @@ class ChunkedMP4Encoder:
 
     def _drain_until_done(self) -> None:
         # A flush/mux failure can occur after _frames consumed the sentinel.
-        if not self._input_done:
-            while self._queue.get() is not _CHUNKED_MP4_DONE:
-                pass
+        if self._input_done:
+            return
+        while True:
+            entry = self._queue.get()
+            if entry is _CHUNKED_MP4_DONE:
+                return
+            _release_chunk(cast(_QueuedChunk, entry).on_consumed)
 
     def _frames(self):
         while True:
-            chunk = self._queue.get()
-            if chunk is _CHUNKED_MP4_DONE:
+            entry = self._queue.get()
+            if entry is _CHUNKED_MP4_DONE:
                 self._input_done = True
                 return
-            assert isinstance(chunk, np.ndarray)
-            for frame_data in chunk:
-                yield av.VideoFrame.from_ndarray(frame_data, format="rgb24")
+            assert isinstance(entry, _QueuedChunk)
+            try:
+                for frame_data in entry.frames:
+                    yield av.VideoFrame.from_ndarray(frame_data, format="rgb24")
+            finally:
+                # Also runs when the muxer raises part-way through this chunk
+                # and abandons the generator, so a lent buffer is never
+                # stranded in the encoder.
+                _release_chunk(entry.on_consumed)
 
     def _validate_chunk(self, chunk: np.ndarray) -> None:
         _validate_video_chunk(chunk, width=self.width, height=self.height)
@@ -109,11 +169,22 @@ class ChunkedMP4Encoder:
         if self._closed:
             raise RuntimeError("ChunkedMP4Encoder is already closed")
 
-    def push(self, chunk: np.ndarray) -> None:
-        """Queue a chunk; asynchronous failures surface here or at finish()."""
-        self._validate_chunk(chunk)
-        self._raise_if_failed()
-        self._queue.put(chunk)
+    def push(self, chunk: np.ndarray, *, on_consumed: Callable[[], None] | None = None) -> None:
+        """Queue a chunk; asynchronous failures surface here or at finish().
+
+        ``on_consumed`` fires exactly once after this encoder has read
+        ``chunk``, including when the chunk is discarded by an abort or by a
+        failed encode. Ownership transfers on call: whether this returns or
+        raises, the callback is this encoder's responsibility, so a caller
+        lending a pooled host buffer never compensates on the error path.
+        """
+        try:
+            self._validate_chunk(chunk)
+            self._raise_if_failed()
+        except BaseException:
+            _release_chunk(on_consumed)
+            raise
+        self._queue.put(_QueuedChunk(chunk, on_consumed))
         self._raise_if_failed()
 
     def _send_done(self) -> None:
@@ -144,9 +215,11 @@ class ChunkedMP4Encoder:
                 self._aborted = True
                 while True:
                     try:
-                        self._queue.get_nowait()
+                        entry = self._queue.get_nowait()
                     except queue.Empty:
                         break
+                    if entry is not _CHUNKED_MP4_DONE:
+                        _release_chunk(cast(_QueuedChunk, entry).on_consumed)
                 self._send_done()
         self._thread.join()
 
@@ -231,6 +304,18 @@ class FragmentedMP4Muxer:
         self._buf.seek(0)
         self._buf.truncate()
         return chunk
+
+
+def count_mp4_frames(video_bytes: bytes) -> int | None:
+    """Read an MP4's frame count from its sample table, without decoding it."""
+    if not video_bytes:
+        return None
+    try:
+        with cast(Any, av.open(io.BytesIO(video_bytes), format="mp4")) as container:
+            frames = int(container.streams.video[0].frames)
+    except Exception:
+        return None
+    return frames or None
 
 
 def finalize_streaming_video_bytes(

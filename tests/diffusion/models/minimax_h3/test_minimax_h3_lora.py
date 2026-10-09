@@ -545,13 +545,13 @@ def test_h3_turbo_requires_all_loaded_targets_to_bind():
 @pytest.mark.parametrize(
     ("num_inference_steps", "extra_args", "error"),
     [
-        (None, {"flow_shift": 6.0, "audio_flow_shift": 3.0}, "num_inference_steps=5"),
-        (4, {"flow_shift": 6.0, "audio_flow_shift": 3.0}, "num_inference_steps=5"),
-        ("5", {"flow_shift": 6.0, "audio_flow_shift": 3.0}, "num_inference_steps=5"),
-        (5, {"flow_shift": 7.0, "audio_flow_shift": 3.0}, "flow_shift=6"),
-        (5, {"flow_shift": "bad", "audio_flow_shift": 3.0}, "flow_shift=6"),
-        (5, {"flow_shift": 6.0, "audio_flow_shift": 4.0}, "audio_flow_shift=3"),
-        (5, {"flow_shift": 6.0, "audio_flow_shift": []}, "audio_flow_shift=3"),
+        (None, {"flow_shift": 6.0, "audio_flow_shift": 3.0}, "num_inference_steps=4"),
+        (5, {"flow_shift": 6.0, "audio_flow_shift": 3.0}, "num_inference_steps=4"),
+        ("5", {"flow_shift": 6.0, "audio_flow_shift": 3.0}, "num_inference_steps=4"),
+        (4, {"flow_shift": 7.0, "audio_flow_shift": 3.0}, "flow_shift=6"),
+        (4, {"flow_shift": "bad", "audio_flow_shift": 3.0}, "flow_shift=6"),
+        (4, {"flow_shift": 6.0, "audio_flow_shift": 4.0}, "audio_flow_shift=3"),
+        (4, {"flow_shift": 6.0, "audio_flow_shift": []}, "audio_flow_shift=3"),
     ],
 )
 def test_h3_turbo_rejects_unsupported_sampling(num_inference_steps, extra_args, error):
@@ -569,7 +569,7 @@ def test_h3_turbo_rejects_unsupported_sampling(num_inference_steps, extra_args, 
         pipeline._validate_turbo_sampling(sampling, _spec())
 
 
-def test_h3_turbo_accepts_five_sigma_points_for_four_nfe():
+def test_h3_turbo_accepts_four_steps_for_four_nfe():
     from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
 
     pipeline = object.__new__(MiniMaxH3Pipeline)
@@ -577,7 +577,7 @@ def test_h3_turbo_accepts_five_sigma_points_for_four_nfe():
     pipeline.default_audio_shift = 3.0
     pipeline._validate_turbo_sampling(
         SimpleNamespace(
-            num_inference_steps=5,
+            num_inference_steps=4,
             extra_args={"flow_shift": 6.0, "audio_flow_shift": 3.0},
         ),
         _spec(),

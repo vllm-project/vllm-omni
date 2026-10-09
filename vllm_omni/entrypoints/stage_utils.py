@@ -1,7 +1,11 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from __future__ import annotations
 
 import logging
 import os
+from dataclasses import asdict, is_dataclass
 from multiprocessing import shared_memory as _shm
 from typing import Any
 
@@ -274,6 +278,8 @@ def _to_dict(x: Any) -> dict[str, Any]:
     try:
         if isinstance(x, dict):
             return dict(x)
+        if is_dataclass(x) and not isinstance(x, type):
+            return asdict(x)
         return _omega_to_dict(x)
     except Exception:
         try:

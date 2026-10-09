@@ -58,6 +58,12 @@ from vllm.sequence import IntermediateTensors
 from vllm.utils.tensor_schema import TensorSchema
 
 from vllm_omni.model_executor.models.mimo_audio.config_mimo_audio import MiMoAudioConfig
+from vllm_omni.model_executor.models.model_local_kv import (
+    ModelLocalKVScope,
+    ModelLocalKVSpec,
+    RowDriver,
+    spec_from_hf_config,
+)
 from vllm_omni.platforms import current_omni_platform
 
 logger = logging.getLogger(__name__)
@@ -390,25 +396,21 @@ class MimoAudioDummyInputsBuilder(BaseDummyInputsBuilder[MimoAudioProcessingInfo
 
 
 class MimoAudioMultiModalProcessor(BaseMultiModalProcessor[MimoAudioProcessingInfo]):
-    def _preprocess_hf_mm_data(
+    def _get_hf_mm_inputs(
         self,
-        mm_data: Mapping[str, object],
-        hf_processor_mm_kwargs: Mapping[str, object],
-    ) -> tuple[Mapping[str, object], Mapping[str, object]]:
-        mm_data, hf_processor_mm_kwargs = super()._preprocess_hf_mm_data(
-            mm_data,
-            hf_processor_mm_kwargs,
-        )
-        mm_data = dict(mm_data)
-        audios = mm_data.pop("audios", [])
-        if audios:
-            mm_data["audio"] = audios
-            feature_extractor = self.info.get_feature_extractor(**hf_processor_mm_kwargs)
-            hf_processor_mm_kwargs = {
-                **hf_processor_mm_kwargs,
-                "sampling_rate": feature_extractor.sampling_rate,
-            }
-        return mm_data, hf_processor_mm_kwargs
+        mm_items: MultiModalDataItems,
+        hf_kwargs: Mapping[str, object],
+    ):
+        hf_inputs = super()._get_hf_mm_inputs(mm_items, hf_kwargs)
+        if hf_inputs.hf_data.get("audio"):
+            feature_extractor = self.info.get_feature_extractor(**hf_kwargs)
+            hf_inputs = hf_inputs._replace(
+                hf_kwargs={
+                    **hf_kwargs,
+                    "sampling_rate": feature_extractor.sampling_rate,
+                },
+            )
+        return hf_inputs
 
     def _get_mm_fields_config(
         self,
@@ -743,6 +745,67 @@ class MiMoAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
 
     def get_language_model(self) -> torch.nn.Module:
         return self.model
+
+    def model_local_kv_specs(self) -> list[ModelLocalKVSpec]:
+        """Declare the local transformer's decode cache and its graph copies.
+
+        The cache is created per call inside ``base_local_forward`` and is
+        bounded by the decode loop, not by sequence length: the loop runs
+        ``group_size + max(delay_pattern)`` steps regardless of how long the
+        utterance is.
+
+        The second entry is the one that matters. ``base_local_forward`` runs
+        inside ``torch.cuda.graph`` during capture, so each captured bucket
+        leaves a cache's worth of tensors pinned in the graph pool for the
+        process lifetime. There is no Python object left to inspect -- the
+        cache is a local in the captured frame -- so the width comes from the
+        buckets that captured successfully, which is why it reads
+        ``local_forward_cg_by_bs`` rather than MIMO_CUDAGRAPH_BATCH_SIZES: a
+        bucket whose capture raised is logged and skipped.
+
+        Both entries are declared, and summing them over-states a single step:
+        a given call either replays a captured bucket or runs eagerly, never
+        both. The graph pool is resident regardless, so the sum is the right
+        ceiling for the process and the wrong number for one request.
+        """
+        delay_iters = self.group_size + max(self.delay_pattern)
+        dtype = next(self.local_transformer.parameters()).dtype
+        bound = f"group_size({self.group_size}) + max(delay_pattern)({max(self.delay_pattern)})"
+        specs = [
+            spec_from_hf_config(
+                self.local_config,
+                name="local_transformer",
+                dtype=dtype,
+                physical_capacity_positions=delay_iters,
+                capacity_source=bound,
+                scope=ModelLocalKVScope.INVOCATION,
+                # One cache, B rows wide -- not B caches. base_local_forward
+                # builds a single DynamicCache whose batch dimension is the
+                # number of requests in the group.
+                rows=RowDriver.MAX_NUM_SEQS,
+                allocation_note="one batched allocation per eager call; graph replay uses the pool entry instead",
+            )
+        ]
+        captured_rows = sum(self.local_forward_cg_by_bs)
+        if captured_rows:
+            specs.append(
+                spec_from_hf_config(
+                    self.local_config,
+                    name="local_transformer_graph_pool",
+                    dtype=dtype,
+                    physical_capacity_positions=delay_iters,
+                    capacity_source=bound,
+                    scope=ModelLocalKVScope.MODEL,
+                    rows=RowDriver.FIXED,
+                    rows_fixed=captured_rows,
+                    rows_reason=f"sum of captured buckets {sorted(self.local_forward_cg_by_bs)}",
+                    allocation_note=(
+                        "pinned in the CUDA graph pool; capture is gated only on cuda.is_available(), "
+                        "so this stays resident under enforce_eager too"
+                    ),
+                )
+            )
+        return specs
 
     def embed_multimodal(self, **kwargs: object) -> MultiModalEmbeddings:
         if kwargs.get("modality_preprocess") is None:
