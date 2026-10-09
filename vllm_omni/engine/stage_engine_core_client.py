@@ -63,11 +63,12 @@ def _default_process_engine_inputs(
     ]
 
 
-class StageEngineCoreClientBase(StageClientBase):
+class StageEngineCoreClientBase(StageClientBase, AsyncMPClient):
     """Shared stage-aware behavior for async EngineCore clients.
 
-    The concrete transport/load-balancing behavior is supplied by the
-    multiprocessing client subclass in the MRO.
+    The common async transport is declared here for typing. The concrete
+    DP subclass still places DPLBAsyncMPClient before AsyncMPClient in the
+    cooperative MRO, supplying its existing load-balancing behavior.
 
     Fully reuses the underlying vLLM async MP client ``__init__`` for:
     - ZMQ setup, sockets
@@ -187,9 +188,9 @@ class StageEngineCoreClientBase(StageClientBase):
         )
 
         try:
-            # Concrete clients place AsyncMPClient next in the cooperative MRO;
-            # the mixin's declared base exposes only object.__init__ to mypy.
-            super().__init__(  # type: ignore[call-arg]
+            # The cooperative MRO reaches the concrete DP constructor first,
+            # or AsyncMPClient directly for the single-engine client.
+            super().__init__(
                 vllm_config,
                 executor_class,
                 log_stats=log_stats,
@@ -258,6 +259,10 @@ class StageEngineCoreClientBase(StageClientBase):
         await super().add_request_async(request)
 
     # ==================== Stage Methods ====================
+
+    async def flush_codec_prefix_async(self, request_id: str, sequence: int) -> int:
+        """Scheduler control; the single-engine client already owns the route."""
+        return await self.call_utility_async("omni_flush_codec_prefix", request_id, sequence)
 
     @staticmethod
     def _detect_local_ip() -> str | None:
@@ -538,3 +543,15 @@ class StageEngineCoreClient(StageEngineCoreClientBase, AsyncMPClient):
 
 class DPLBStageEngineCoreClient(StageEngineCoreClientBase, DPLBAsyncMPClient):
     """Stage async client backed by vLLM's ``DPLBAsyncMPClient``."""
+
+    async def flush_codec_prefix_async(self, request_id: str, sequence: int) -> int:
+        # DPLB call_utility_async broadcasts and returns the first result. A
+        # codec buffer belongs to one request's assigned EngineCore, so use
+        # the existing request route and never load-balance this control.
+        engine = self.reqs_in_flight.get(request_id)
+        if engine is None:
+            raise RuntimeError(f"codec flush has no bound DP engine: {request_id}")
+        result = await self._call_utility_async("omni_flush_codec_prefix", request_id, sequence, engine=engine)
+        if self.reqs_in_flight.get(request_id) != engine:
+            raise RuntimeError(f"codec flush DP binding was invalidated: {request_id}")
+        return result

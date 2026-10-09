@@ -303,6 +303,44 @@ close    DuplexOmni.close_session -> close RPC; the manager tears the runner dow
 reap     DuplexSessionManager.reaper_loop: idle TTL / disconnect grace expiry, cleanup retries
 ```
 
+### Server-side acoustic completion (opt-in)
+
+`DuplexSessionHandle.drain_audio(timeout=...)` freezes the accepted acoustic
+prefix after preceding append submissions settle. Partial, unsubmitted input
+is excluded; later input does not enlarge the target. The session remains open.
+Only plugins that provide accepted-input, generation-progress, and codec-prefix
+hooks can support this operation; other plugins reject it rather than treating
+close or projection as completion. The model-specific frame alignment lives in
+[PersonaPlex acoustic delivery](fullduplex-personaplex.md).
+
+Accepted input, generated frames, projected PCM, successful transport sends,
+and client playback are separate facts. Drain waits for generation through the
+frozen prefix, its nonterminal codec flush, and successful sends covering the
+resulting PCM prefix. A flush uses the scheduler-owned FIFO send queue; it does
+not fabricate EOF or end the stage request.
+
+Keep an output consumer running concurrently with drain. A Python transport
+calls `handle.confirm_output_sent(event)` only after successfully sending the
+currently held event, before advancing its event iterator. The WebSocket
+handler does this after `attachment.send` returns and after rechecking the
+current attachment and output validity. Receipts are event-specific,
+request/epoch-fenced and idempotent: dequeue, encoding, journaling, blocked or
+failed sends, detachment, and invalidated output do not earn send credit.
+Playback ACK and the playback ledger are unchanged.
+
+The correlated drain control schedules its wait outside the session mailbox
+and per-session control tail, so cancellation and close remain responsive.
+Timeout, cancellation, and close fail or abandon the pending wait; none is
+evidence that the acoustic prefix was sent. Ordinary input/output backpressure
+limits still apply. Closing a session performs lifecycle cleanup, not drain;
+a replacement uses a new session id and starts with independent counters.
+The caller's deadline bounds nonblocking request admission and correlated
+result waiting. Drain uses the request queue's thread-safe sync face and
+awaits a router-owned future, without holding a default-executor worker needed
+by send-completion commands. A full request queue fails admission with a
+retryable engine_backpressure error. Expiry or cancellation retires the
+frontend waiter; an already admitted backend control is not retracted.
+
 ### Concurrency and ordering model of the runner
 
 The runner's session state is owned by the orchestrator asyncio loop and

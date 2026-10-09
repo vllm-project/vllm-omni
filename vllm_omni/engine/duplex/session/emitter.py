@@ -21,6 +21,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import replace
 
 from vllm_omni.engine.duplex.config import DuplexSessionState
+from vllm_omni.engine.duplex.delivery import AudioSampleWatermark
 from vllm_omni.engine.duplex.events import (
     DOMAIN_TERMINAL_EVENTS,
     MODEL_OUTPUT_EVENTS,
@@ -162,7 +163,12 @@ class SessionEmitter:
                 self._ctx.manager.invalidate_output(
                     self._ctx.session.session_id, response_id, through_epoch=cancelled_epoch
                 )
-        self.emit_events(project_internal_event(self.require_projector(), payload))
+        watermark = payload.get("_audio_send_watermark")
+        self._ctx.manager.emit(
+            self._ctx.session,
+            project_internal_event(self.require_projector(), payload),
+            audio_watermark=watermark if isinstance(watermark, AudioSampleWatermark) else None,
+        )
         if deferred_overlap_payload is not None and not self._ctx.run.closing:
             precreate_response = self._ctx.model_state.deferred_precreate_response
             self._ctx.model_state.deferred_precreate_response = False

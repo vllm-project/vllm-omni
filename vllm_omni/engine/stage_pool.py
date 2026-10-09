@@ -835,7 +835,7 @@ class StagePool:
 
     def _infer_audio_sample_rate(
         self,
-        mm_output: dict[str, Any] | None = None,
+        mm_output: Mapping[str, Any] | None = None,
         *,
         use_default: bool = True,
     ) -> int:
@@ -1015,8 +1015,8 @@ class StagePool:
                 request_id,
                 affinity_request_id=affinity_request_id,
             )
-            client = self._diffusion_client(replica_id)
-            await client.add_request_async(request_id, request, params, **submit_kwargs)
+            diffusion_client = self._diffusion_client(replica_id)
+            await diffusion_client.add_request_async(request_id, request, params, **submit_kwargs)
             return replica_id
 
         replica_id = await self._pick_or_select(
@@ -1309,6 +1309,27 @@ class StagePool:
                     commit(replica_request_ids, internal=False)
 
         return abort_outputs
+
+    async def flush_codec_prefix(self, request_id: str, sequence: int) -> int:
+        """Send scheduler control to the live bound replica, never rebalance.
+
+        Broadcasting or choosing a fresh replica would address a different
+        codec buffer. Revalidate the route after the deferred utility result.
+        """
+        replica_id = self.get_bound_replica_id(request_id)
+        if replica_id is None or not self.is_replica_available(replica_id):
+            raise RuntimeError(f"no live bound replica for codec flush: {request_id}")
+        client = self._llm_client(replica_id)
+        result = await client.flush_codec_prefix_async(request_id, sequence)
+        if (
+            self.get_bound_replica_id(request_id) != replica_id
+            or not self.is_replica_available(replica_id)
+            or self.clients[replica_id] is not client
+        ):
+            raise RuntimeError(f"codec flush binding was invalidated: {request_id}")
+        if isinstance(result, bool) or not isinstance(result, int) or result != sequence:
+            raise RuntimeError(f"invalid codec flush result for {request_id}: {result!r}")
+        return result
 
     async def release_request_resources(self, request_ids: list[str]) -> None:
         """Ask every live replica to drop transfer resources for *request_ids*.

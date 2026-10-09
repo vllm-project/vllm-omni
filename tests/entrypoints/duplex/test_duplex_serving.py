@@ -103,6 +103,11 @@ class FakeHandle:
     def output_guard(self, event: DuplexEvent):
         return self._outbox.guard(event)
 
+    async def confirm_output_sent(self, event: DuplexEvent) -> None:
+        receipt = self._outbox.send_receipt(event)
+        if receipt is not None:
+            await self.submit(commands.AudioSendCompleted(receipt=receipt))
+
     async def submit(self, command: commands.DuplexCommand) -> None:
         if self.closed:
             raise DuplexSessionError("closed", code="session_closed", session_id=self.session_id)

@@ -15,7 +15,7 @@ selected by `PipelineConfig.duplex_plugin`. The serving path is:
        plugin.plan_append: one 80 ms frame -> one resumable Stage 0 append
   -> PersonaPlex Talker (Stage 0, lockstep temporal transformer + depformer)
   -> streaming PersonaPlex Code2Wav (Stage 1, Mimi)
-  -> plugin.data_plane: cumulative audio/text -> deltas
+  -> plugin.data_plane: PCM DELTA + cumulative text -> wire deltas
   -> response.output_audio.delta + response.output_audio_transcript.delta
 ```
 
@@ -62,6 +62,68 @@ propagates it to every stage as `duplex_max_sessions`, and both Mimi pools
 capability payload derives `supports_multi_session` /
 `supports_multi_session_same_replica` from it.
 
+## Accepted-prefix acoustic drain
+
+`DuplexSessionHandle.drain_audio(timeout=...)` is a server-side, bounded
+control operation, not a new Realtime client command. Keep the output consumer
+running concurrently; it must report each successful transport send through
+`confirm_output_sent`. A consumer that only dequeues or journals events cannot
+satisfy this drain. The shared runner owns the wait, outside its mailbox, so
+input, cancellation and close remain serviceable.
+
+The target is frozen in command order after preceding appends finish:
+
+1. An append counts only after `stage_port.submit` succeeds and
+   `session.commit_append` commits its epoch-qualified request and sequence.
+   A partial buffered frame does not count; an accepted silence frame does.
+2. The PersonaPlex plugin converts accepted sequence `A` to
+   `max(A - 1, 0) * 1920` expected PCM samples. Codebook 0 from row `t`
+   combines with codebooks 1–7 from row `t + 1`; the missing successor is not
+   synthesized at EOF.
+3. Generated-sequence receipts must reach the accepted target before the
+   runner asks Stage 0 to flush that codec prefix. The utility runs on the
+   already bound replica and EngineCore, never by DP broadcast or worker
+   collective RPC. It shares the codec adapter's FIFO, submits a pending
+   partial chunk, and retains the successor and later rows for continuation.
+   Connector submission is not PCM decode or socket completion.
+4. PCM totals advance only after encoding succeeds. Completed samples advance
+   only for that event's request/epoch/sample watermark after a successful
+   send on the current attachment with a still-valid output guard. Duplicate
+   receipts, failed or blocked sends, detached-only journaling and stale audio
+   cannot credit newer output or another epoch.
+
+Later accepted input does not grow a frozen target. A zero-append target
+requires no codec utility. One drain may be pending per session; a timed-out
+prefix barrier behind a blocked submit stays bounded and prevents another
+barrier until it settles. Timeout, close and relevant output cancellation
+reject the wait rather than declaring completion. This does not change
+client playback ACKs, close behavior, or PersonaPlex's unsupported resume and
+barge-in capabilities. Aborting Stage 0 and emptying a terminal output pump
+are not an acoustic drain.
+
+If the engine request queue is full, drain rejects admission immediately with
+the retryable `engine_backpressure` session error, rather than blocking before
+the RPC result timeout starts. No drain target is admitted in that case.
+The caller's timeout covers nonblocking admission and correlated result
+waiting. Drain awaits a thread-safe router future rather than occupying a
+default-executor worker, so the successful-send receipt can use the existing
+one-way command path. Only the remaining budget reaches the RPC and backend
+drain; result registration and admission do not restart that timeout.
+Cancelling a Python await does not cancel an already admitted backend control;
+that one wait remains bounded by its supplied timeout, or can be invalidated by
+closing/cancelling the session. It does not establish acoustic completion.
+
+The design implements the delivery boundary discussed in
+[#7530](https://github.com/vllm-project/vllm-omni/pull/7530#issuecomment-6004402442)
+under [RFC #7389](https://github.com/vllm-project/vllm-omni/issues/7389).
+CPU composition tests use the real shared runner, codec adapter, serving
+guard and receipts, with synthetic model/decoder outputs and transport
+doubles. They do not certify Mimi decoding, live EngineCore deployment,
+GPU serving or audible playback.
+`tests/engine/duplex/test_audio_drain_transport.py` additionally runs native
+Janus queues and correlated RPC across separate frontend/backend event loops;
+it still uses synthetic stage output and a recording socket.
+
 ## Components and ownership
 
 ### The plugin (engine side)
@@ -70,8 +132,9 @@ capability payload derives `supports_multi_session` /
 
 Engine policy:
 
-- `configure_sampling_params`: Stage 0 greedy (`temperature=0`, `top_k=1`,
-  `max_tokens=1`), other stages untouched.
+- `configure_sampling_params`: clone Stage 0 defaults and select greedy
+  sampling (`temperature=0`, `top_k=1`, `max_tokens=1`); clone Stage 1 defaults
+  and select PCM DELTA output. Original defaults remain unchanged.
 - `plan_append`: validates exactly one 1920-sample 24 kHz `pcm_f32le` frame
   (through `model_executor/common/duplex/payload.py`) and reserves one
   scheduler slot per frame plus, on the first append of an epoch (`seq == 1`),
@@ -106,6 +169,10 @@ Session policy:
 Because `supports_client_commit` is off, the session auto-responds without
 `extra_body.auto_response`: a stock Realtime client streams audio and hears
 the model without any vendor flag.
+
+The plugin clones Stage 1 sampling defaults and selects
+`RequestOutputKind.DELTA` for the native duplex path, leaving turn-based
+defaults unchanged.
 
 ### Input framing
 
@@ -173,10 +240,10 @@ retain the final raw code frame needed to de-delay the next chunk.
 
 ### Data-plane projector
 
-`PersonaPlexDataPlaneSession` is the `CumulativeAudioTextDataPlane` of
-`model_executor/common/duplex/data_plane.py` with a 24 kHz default rate. It
-keeps one audio/text cursor per request so cumulative Stage 1 output cannot
-replay old audio, and yields one internal result per new suffix:
+`PersonaPlexDataPlaneSession` specializes `CumulativeAudioTextDataPlane` with
+a 24 kHz default rate and consumes Stage 1 PCM deltas and cumulative text.
+The framework retains request lifetime and terminal-state management, while
+the model projector yields one internal result per new PCM emission:
 
 ```python
 {
@@ -194,12 +261,31 @@ replay old audio, and yields one internal result per new suffix:
 }
 ```
 
-The runner turns each result into the Realtime
-`response.output_audio.delta` / `response.output_audio_transcript.delta` pair
-under one `response_id`. PersonaPlex keeps one visible response open while
-continuous output arrives; session close or cancellation terminates it through
-the generic Realtime lifecycle. A codec segment finishing is not a
-conversational turn boundary.
+The Stage 1 output processor drains audio payloads at each emission instead of
+retaining the complete call history. The data-plane projector forwards each
+nonempty PCM delta, including equal-size or identical consecutive chunks;
+it does not slice those deltas with a cumulative sample offset. Deferred chunks
+are coalesced only within one emission. Empty PCM does not invoke the encoder
+or emit a header-only WAV, but any new transcript is still delivered.
+
+The per-request text cursor advances only after any nonempty audio has been
+successfully encoded; text-only output does not need audio encoding.
+Failure to encode nonempty PCM raises rather than silently consuming output.
+Projection is not server-send completion or client playback acknowledgement.
+The shared output accumulator retains sample-rate metadata as latest-value
+snapshots; ordinary cumulative output remains available to other callers.
+
+The generic projector turns each native result into the Realtime
+`response.output_audio.delta` / `response.output_audio_transcript.delta` pair (and
+`response.output_text.delta` for text) under one `response_id`; the full
+mapping is the name map in the
+[Realtime Duplex API](../serving/realtime_duplex_api.md) serving guide.
+PersonaPlex keeps one visible response open while continuous output arrives.
+Session close or cancellation terminates that response through the generic
+Realtime lifecycle; a codec segment finishing is not a conversational turn
+boundary. PersonaPlex advertises `supports_barge_in=false` and
+`supports_session_resume=false`, so `barge_in`, `turn_detection.server_vad`,
+and `session.resume` are rejected on this model.
 
 ## Error and lifecycle contracts
 
@@ -233,8 +319,8 @@ conversational turn boundary.
   restart and late finish of a superseded request.
 - `tests/engine/duplex/test_session_runner_personaplex.py`: the session
   runner with the real plugin -- one submission per frame, prefill on the
-  first append only, half frames buffered, wrong rate refused, cumulative
-  Code2Wav output projected as 24 kHz deltas, cancel restarting the epoch,
+  first append only, half frames buffered, wrong rate refused, Code2Wav PCM
+  DELTA and cumulative text projected as 24 kHz wire deltas, cancel restarting the epoch,
   close aborting the request.
 - `tests/model_executor/executor_common/`: the shared toolbox (PCM helpers, payload
   validation, fixed-frame buffer, cumulative data plane, request-output

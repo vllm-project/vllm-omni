@@ -333,6 +333,7 @@ class ModelChannel:
                     raise DuplexFenceMismatchError(session.fence, fence)
                 update = session.commit_append(reservation)
                 session.bind_stage_request(stage_id, request_id, fence=fence)
+                session.accept_audio_append(request_id, epoch=fence.epoch, sequence=update.seq)
             except BaseException:
                 try:
                     await self._ctx.stage_port.cleanup([request_id])
@@ -1056,6 +1057,9 @@ class ModelChannel:
                 {"text_chars": max(0, int(mark_text_chars)), "audio_end_ms": max(0, int(mark_duration_ms))}
             ]
         payload["playback"] = session.playback_for_response(target_id).as_dict()
+        source_samples = model_result.get("audio_sample_count")
+        if isinstance(source_samples, int) and not isinstance(source_samples, bool) and source_samples > 0 and audio:
+            payload["_audio_send_watermark"] = session.project_audio_samples(source_samples)
         sample_rate_hz = model_result.get("sample_rate_hz") or model_result.get("audio_sample_rate_hz")
         if isinstance(sample_rate_hz, int | float) and int(sample_rate_hz) > 0:
             payload["sample_rate_hz"] = int(sample_rate_hz)

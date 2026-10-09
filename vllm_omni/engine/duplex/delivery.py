@@ -34,10 +34,33 @@ class DuplexOutputOverflowError(RuntimeError):
 
 
 @dataclass(frozen=True, slots=True)
+class AudioSampleWatermark:
+    """Source PCM interval, captured at projection rather than send completion.
+
+    ``samples`` is the exclusive endpoint; ``start_samples`` identifies the
+    exact delta so a later send cannot acknowledge an earlier unsent interval.
+    """
+
+    request_id: str
+    epoch: int
+    samples: int
+    start_samples: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class AudioSendReceipt:
+    """Internal receipt for one immutable event; never a client playback ACK."""
+
+    event_id: str
+    watermark: AudioSampleWatermark
+
+
+@dataclass(frozen=True, slots=True)
 class _PendingEvent:
     event: DuplexEvent
     size: int
     reserved: bool
+    receipt: AudioSendReceipt | None = None
 
 
 class DuplexOutputBuffer:
@@ -68,6 +91,7 @@ class DuplexOutputBuffer:
         self._bytes = 0
         self._reserved_bytes = self._reserved_events = 0
         self._held: DuplexEvent | None = None
+        self._held_receipt: AudioSendReceipt | None = None
         self._waiter: tuple[asyncio.AbstractEventLoop, asyncio.Future[None]] | None = None
         self._closed = False
         self._terminal: SessionClosed | None = None
@@ -82,7 +106,7 @@ class DuplexOutputBuffer:
         with self._lock:
             return len(self._pending)
 
-    def put(self, event: DuplexEvent) -> bool:
+    def put(self, event: DuplexEvent, *, audio_watermark: AudioSampleWatermark | None = None) -> bool:
         """Append without blocking; overflow leaves the queue unchanged.
 
         Return false for late output after closure. A session terminal closes
@@ -115,7 +139,15 @@ class DuplexOutputBuffer:
                 or self._reserved_events >= self._reserve_events
             ):
                 raise DuplexOutputOverflowError("duplex session pending output limit exceeded")
-            self._pending.append(_PendingEvent(event=event, size=size, reserved=reserved))
+            receipt = None
+            if isinstance(event, AudioDelta) and audio_watermark is not None:
+                if (
+                    audio_watermark.epoch != event.epoch
+                    or not 0 <= audio_watermark.start_samples < audio_watermark.samples
+                ):
+                    raise ValueError("audio watermark does not match its event")
+                receipt = AudioSendReceipt(event_id=event.event_id, watermark=audio_watermark)
+            self._pending.append(_PendingEvent(event=event, size=size, reserved=reserved, receipt=receipt))
             if reserved:
                 self._reserved_bytes += size
                 self._reserved_events += 1
@@ -152,6 +184,17 @@ class DuplexOutputBuffer:
             self._pending = kept
             if self._held is not None and self._matches(self._held, response_id, through_epoch):
                 self._held = None
+                self._held_receipt = None
+
+    def send_receipt(self, event: DuplexEvent) -> AudioSendReceipt | None:
+        """Read only the still-valid consumer-held event's fixed watermark.
+
+        The caller must invoke this after its transport send succeeds. Merely
+        reading a receipt does not acknowledge anything. No event history or
+        waveform history is retained after the next consumer ``get()``.
+        """
+        with self._lock:
+            return self._held_receipt if event is self._held else None
 
     def _is_valid(self, event: DuplexEvent) -> bool:
         return not isinstance(event, AudioDelta) or event is self._held
@@ -179,12 +222,14 @@ class DuplexOutputBuffer:
         loop = asyncio.get_running_loop()
         with self._lock:
             self._held = None
+            self._held_receipt = None
         while True:
             with self._lock:
                 if self._pending:
                     pending = self._pending.popleft()
                     self._release(pending)
                     self._held = pending.event
+                    self._held_receipt = pending.receipt
                     return pending.event
                 if self._closed:
                     if self._terminal is not None:

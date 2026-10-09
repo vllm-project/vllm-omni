@@ -37,6 +37,7 @@ from vllm_omni.engine.duplex.config import (
     ResponseCreateOptions,
 )
 from vllm_omni.engine.duplex.contracts import DuplexFence
+from vllm_omni.engine.duplex.delivery import AudioSampleWatermark, AudioSendReceipt
 from vllm_omni.engine.duplex.events import TurnEvent
 from vllm_omni.engine.duplex.session.lease import (
     DuplexLeaseActivity,
@@ -129,6 +130,18 @@ class PlaybackLedger:
 
 
 @dataclass
+class AudioDeliveryState:
+    """Sample counters for one accepted request/epoch, separate from playback."""
+
+    request_id: str
+    epoch: int
+    accepted_seq: int = 0
+    generated_seq: int = 0
+    projected_samples: int = 0
+    completed_samples: int = 0
+
+
+@dataclass
 class ConversationHistory:
     messages: list[dict[str, object]] = field(default_factory=list)
     #: User items added by ``conversation.item.create`` that no response has
@@ -217,6 +230,7 @@ class DuplexEngineSession:
     #: and folded into the first response that opens after them.
     _pending_stage_metrics: list[dict[str, dict[str, object]]] = field(default_factory=list, repr=False)
     _playback: PlaybackLedger = field(default_factory=PlaybackLedger, repr=False)
+    audio_delivery: AudioDeliveryState | None = field(default=None, repr=False)
     _conversation: ConversationHistory = field(default_factory=ConversationHistory, repr=False)
     model_state: DuplexModelSessionState | None = field(default=None, repr=False)
     projector: RealtimeProjectionState | None = field(default=None, repr=False)
@@ -375,6 +389,56 @@ class DuplexEngineSession:
         self.input_turn_seq = reservation.update.turn_seq
         self._append_turn_key = (reservation.fence.epoch, reservation.fence.turn_id, 0)
         return reservation.update
+
+    def accept_audio_append(self, request_id: str, *, epoch: int, sequence: int) -> None:
+        """Called only after stage submission and append commit have succeeded."""
+        state = self.audio_delivery
+        if state is None or (state.request_id, state.epoch) != (request_id, epoch):
+            state = self.audio_delivery = AudioDeliveryState(request_id=request_id, epoch=epoch)
+        state.accepted_seq = max(state.accepted_seq, sequence)
+
+    def project_audio_samples(self, samples: int) -> AudioSampleWatermark | None:
+        """Capture a successfully encoded delta's source-sample endpoint."""
+        state = self.audio_delivery
+        if state is None or state.epoch != self.epoch or state.request_id != self.active_request_id:
+            return None
+        start_samples = state.projected_samples
+        state.projected_samples += samples
+        return AudioSampleWatermark(
+            request_id=state.request_id, epoch=state.epoch, samples=state.projected_samples, start_samples=start_samples
+        )
+
+    def complete_audio_generation(self, request_id: str, *, epoch: int, sequence: int) -> None:
+        """Credit only the next accepted frame of this request's current epoch.
+
+        A gap does not prove the missing frames generated. Duplicate, stale,
+        unrelated or not-yet-accepted output must not advance the prefix.
+        """
+        state = self.audio_delivery
+        if state is None or epoch != self.epoch or self.state != DuplexSessionState.OPEN:
+            return
+        if (request_id, epoch) != (state.request_id, state.epoch):
+            return
+        if sequence == state.generated_seq + 1 and sequence <= state.accepted_seq:
+            state.generated_seq = sequence
+
+    def complete_audio_send(self, receipt: AudioSendReceipt) -> None:
+        """Advance only a continuous sent prefix; duplicates and gaps are inert.
+
+        An endpoint alone does not prove earlier PCM was sent. The exact
+        event interval must start at the completed prefix of this epoch.
+        """
+        state = self.audio_delivery
+        watermark = receipt.watermark
+        if state is None or watermark.epoch != self.epoch:
+            return
+        if (watermark.request_id, watermark.epoch) != (state.request_id, state.epoch):
+            return
+        if not receipt.event_id or not 0 <= watermark.start_samples < watermark.samples <= state.projected_samples:
+            return
+        if watermark.start_samples != state.completed_samples:
+            return
+        state.completed_samples = watermark.samples
 
     # ---- cancel / close of stage resources ----
 

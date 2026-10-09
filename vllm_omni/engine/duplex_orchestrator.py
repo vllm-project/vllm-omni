@@ -424,6 +424,18 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
             replica_id=replica_id,
         )
 
+    async def flush_audio_prefix(self, request_id: str, *, epoch: int, sequence: int) -> int:
+        state = self.request_states.get(request_id)
+        if not isinstance(state, DuplexOrchestratorRequestState):
+            raise RuntimeError(f"codec flush has no duplex request: {request_id}")
+        fence = state.stage_fences.get(0)
+        if fence is None or fence.epoch != epoch:
+            raise RuntimeError(f"codec flush epoch was invalidated: {request_id}")
+        result = await self.stage_pools[0].flush_codec_prefix(request_id, sequence)
+        if self.request_states.get(request_id) is not state or state.stage_fences.get(0) != fence:
+            raise RuntimeError(f"codec flush request was invalidated: {request_id}")
+        return result
+
     async def _route_output(
         self,
         stage_id: int,

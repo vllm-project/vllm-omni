@@ -35,6 +35,7 @@ from vllm_omni.protocol.duplex import commands as _duplex_wire
 from vllm_omni.protocol.duplex.commands import RealtimeCommand
 
 if TYPE_CHECKING:
+    from vllm_omni.engine.duplex.delivery import AudioSendReceipt
     from vllm_omni.protocol.duplex import RealtimeInputDefaults
 
 
@@ -93,7 +94,8 @@ class UpdateSession(DuplexCommand, _duplex_wire.UpdateSession):
     def payload(self) -> dict[str, object]:
         data = DuplexCommand.payload(self)
         data["event"] = "session.update"
-        data["payload"] = dict(data.pop("patch", {}) or {})
+        data.pop("patch", None)
+        data["payload"] = dict(self.patch or {})
         return data
 
 
@@ -170,7 +172,8 @@ class CreateItem(DuplexCommand, _duplex_wire.CreateItem):
     def payload(self) -> dict[str, object]:
         data = DuplexCommand.payload(self)
         data["event"] = "conversation.item.create"
-        payload: dict[str, object] = {"item": dict(data.pop("item"))}
+        data.pop("item")
+        payload: dict[str, object] = {"item": dict(self.item)}
         previous = data.pop("previous_item_id", None)
         if previous is not None:
             payload["previous_item_id"] = previous
@@ -237,6 +240,14 @@ class SignalTurn(DuplexCommand, _duplex_wire.SignalTurn):
 @dataclass(frozen=True, slots=True, kw_only=True)
 class AckPlayback(DuplexCommand, _duplex_wire.AckPlayback):
     type: ClassVar[str] = "playback.ack"
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class AudioSendCompleted(DuplexCommand):
+    """Server-only completion, not decoded by ``command_from_realtime``."""
+
+    type: ClassVar[str] = "transport.audio_send_completed"
+    receipt: AudioSendReceipt
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
