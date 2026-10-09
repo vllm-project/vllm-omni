@@ -10,6 +10,7 @@ layout.
 from __future__ import annotations
 
 import math
+from bisect import bisect_left
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -31,6 +32,7 @@ from vllm_omni.diffusion.attention.backends.abstract import (
     AttentionMetadata,
     PackedPaddingMetadata,
     VideoTokenLayout,
+    VideoTokenSpan,
 )
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.cache.cachedit import CacheDiTAdapterConfig
@@ -53,6 +55,10 @@ from vllm_omni.diffusion.layers.indexed_modulation import (
 from vllm_omni.diffusion.layers.norm import RMSNorm
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 from vllm_omni.diffusion.models.host_weight_contract import FinalLayoutModelContract
+from vllm_omni.diffusion.models.minimax_h3.reference_kv_cachedit import (
+    MiniMaxH3CachedAdapter,
+    iter_minimax_h3_blocks,
+)
 from vllm_omni.diffusion.models.minimax_h3.reference_kv_tier1 import (
     MiniMaxH3ReferenceKVTier1State,
 )
@@ -101,7 +107,7 @@ def _attention_isolates_packed_requests(attention_layer: Any) -> bool:
 
 def _supports_reference_kv_compaction(blocks: nn.ModuleList) -> bool:
     """Whether the configured attention path accepts target-only queries."""
-    for block in blocks:
+    for block in iter_minimax_h3_blocks(blocks):
         attention_layer = block.attn.attention
         if _ring_sequence_parallel_is_active(attention_layer):
             return False
@@ -109,6 +115,45 @@ def _supports_reference_kv_compaction(blocks: nn.ModuleList) -> bool:
         if backend is None or backend.get_name() == "FASTVIDEO_VSA":
             return False
     return True
+
+
+def _compact_reference_video_layout(
+    layout: VideoTokenLayout,
+    reference_positions: torch.Tensor,
+    used_length: int,
+) -> VideoTokenLayout | None:
+    """Map the surviving video frames to the target-only query layout."""
+    positions = reference_positions.detach().cpu().tolist()
+    spans = layout.video_spans
+    if not spans:
+        if layout.prefix_len is None or layout.latent_grid is None:
+            return None
+        spans = (VideoTokenSpan(start=layout.prefix_len, latent_grid=layout.latent_grid, role="target"),)
+    targets = []
+    for span in spans:
+        if span.role != "target":
+            continue
+        frames, height, width = span.latent_grid
+        frame_rows = height * width
+        surviving_frames = []
+        for frame in range(frames):
+            start = span.start + frame * frame_rows
+            removed = bisect_left(positions, start + frame_rows) - bisect_left(positions, start)
+            if removed == 0:
+                surviving_frames.append(frame)
+            elif removed != frame_rows:
+                return None
+        if not surviving_frames or surviving_frames != list(range(surviving_frames[0], surviving_frames[-1] + 1)):
+            return None
+        start = span.start + surviving_frames[0] * frame_rows
+        compact_start = start - bisect_left(positions, start)
+        grid = (len(surviving_frames), height, width)
+        if compact_start < 0 or compact_start + math.prod(grid) > used_length:
+            return None
+        targets.append(VideoTokenSpan(start=compact_start, latent_grid=grid, role="target"))
+    if len(targets) != 1:
+        return None
+    return VideoTokenLayout(used_len=used_length, video_spans=tuple(targets))
 
 
 def _local_compact_positions(
@@ -645,6 +690,8 @@ class MiniMaxH3Attention(nn.Module):
             extra["gate_compress"] = gate_compress.unsqueeze(0)
             if video_layout is not None and video_layout.video_spans:
                 extra["vsa_h3_prefix_segments"] = vsa_prefix_segments
+        if reference_kv_compact:
+            extra["minimax_h3_compact_reference_rows"] = reference_rows
         if post_parallel_reference_kv:
             extra["minimax_h3_reference_kv_post_parallel"] = (
                 reference_kv_tier1_state,
@@ -1139,6 +1186,7 @@ class MiniMaxH3DiTModel(nn.Module):
         block_forward_patterns={"blocks": ForwardPattern.Pattern_3},
         # H3 is CFG-distilled and performs one transformer forward per step.
         has_separate_cfg=False,
+        cached_adapter_cls=MiniMaxH3CachedAdapter,
         check_forward_pattern=False,
     )
     _repeated_blocks = ["MiniMaxH3DiTBlock"]
@@ -1655,7 +1703,7 @@ class MiniMaxH3DiTModel(nn.Module):
         device: torch.device,
     ) -> MiniMaxH3ReferenceKVTier1State | None:
         return MiniMaxH3ReferenceKVTier1State.from_environment(
-            num_layers=len(self.blocks),
+            num_layers=sum(1 for _ in iter_minimax_h3_blocks(self.blocks)),
             global_reference_rows=global_reference_rows,
             device=device,
         )
@@ -1852,6 +1900,18 @@ class MiniMaxH3DiTModel(nn.Module):
                 )
             reference_kv_tier1_state.set_local_reference_mask(reference_mask)
 
+        block_video_layout = video_layout
+        if compact_reference:
+            block_video_layout = None
+            if video_layout is not None:
+                if not hasattr(reference_kv_tier1_state, "_compact_video_layout"):
+                    reference_kv_tier1_state._compact_video_layout = _compact_reference_video_layout(
+                        video_layout,
+                        reference_kv_tier1_state.global_reference_positions,
+                        block_max_seqlen,
+                    )
+                block_video_layout = reference_kv_tier1_state._compact_video_layout
+
         for block in self.blocks:
             hidden = block(
                 hidden,
@@ -1862,7 +1922,7 @@ class MiniMaxH3DiTModel(nn.Module):
                 max_seqlen=block_max_seqlen,
                 packed_total=block_packed_total,
                 num_requests=num_requests,
-                video_layout=None if compact_reference else video_layout,
+                video_layout=block_video_layout,
                 vsa_prefix_segments=(() if compact_reference else vsa_prefix_segments),
                 reference_kv_tier1_state=reference_kv_tier1_state,
                 reference_kv_compact=compact_reference,

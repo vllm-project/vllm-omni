@@ -109,6 +109,7 @@ def _observer_intervals_from_env() -> tuple[int, ...]:
 
 @dataclass
 class MiniMaxH3ReferenceKVTier1Stats:
+    block_cached_layers: int = 0
     refresh_steps: int = 0
     h2d_steps: int = 0
     captured_layers: int = 0
@@ -309,6 +310,32 @@ class MiniMaxH3ReferenceKVTier1State:
     @property
     def current_step(self) -> int | None:
         return self._step
+
+    @property
+    def reference_epoch(self) -> int:
+        if self._step is None:
+            raise RuntimeError("no active reference-KV step")
+        return self._step // self.refresh_interval if self.refresh_interval > 0 else 0
+
+    @property
+    def is_reference_refresh_step(self) -> bool:
+        return self._step is not None and self._global_refresh
+
+    @property
+    def supports_block_cache_reuse(self) -> bool:
+        return True
+
+    def mark_block_cache_skipped(self, layer_indices: list[int]) -> None:
+        """Account for a Cache-DiT middle span without reading its reference KV."""
+        if self._step is None or self._global_refresh or not self.supports_block_cache_reuse:
+            raise RuntimeError("block cache skips are only allowed on reference-KV reuse steps")
+        next_layer = len(self._layers_seen)
+        if layer_indices != list(range(next_layer, next_layer + len(layer_indices))):
+            raise RuntimeError("block cache skips must follow the executed layers in order")
+        if any(index >= self.num_layers for index in layer_indices):
+            raise IndexError("block cache skip exceeds reference-KV layer count")
+        self._layers_seen.update(layer_indices)
+        self.stats.block_cached_layers += len(layer_indices)
 
     def set_global_reference_mask(self, reference_mask: torch.Tensor) -> None:
         """Cache the request-wide target row indices once, before SP sharding."""
@@ -591,7 +618,7 @@ class MiniMaxH3ReferenceKVTier1State:
         self._device_pool = None
         _log.info(
             "MiniMax-H3 reference-KV Tier1 summary: host_bytes=%d, "
-            "refresh_steps=%d, h2d_steps=%d, captured_layers=%d, "
+            "refresh_steps=%d, h2d_steps=%d, captured_layers=%d, block_cached_layers=%d, "
             "substituted_layers=%d, h2d_bytes=%d, "
             "projection_skipped_layers=%d, projection_skipped_rows=%d, "
             "projection_total_rows=%d",
@@ -599,6 +626,7 @@ class MiniMaxH3ReferenceKVTier1State:
             self.stats.refresh_steps,
             self.stats.h2d_steps,
             self.stats.captured_layers,
+            self.stats.block_cached_layers,
             self.stats.substituted_layers,
             self.stats.h2d_bytes,
             self.stats.projection_skipped_layers,
@@ -1060,6 +1088,14 @@ class MiniMaxH3ReferenceKVTier2State(MiniMaxH3ReferenceKVTier1State):
             self.ring_size,
         )
 
+    def mark_block_cache_skipped(self, layer_indices: list[int]) -> None:
+        super().mark_block_cache_skipped(layer_indices)
+        next_layer = len(self._layers_seen)
+        if not self._inactive and next_layer < self.num_layers:
+            slot = next_layer % self.ring_size
+            if self._slot_layers[slot] != next_layer:
+                self._prefetch_layer(next_layer)
+
     def take_cached_reference_layer(
         self,
         layer_index: int,
@@ -1187,7 +1223,7 @@ class MiniMaxH3ReferenceKVTier2State(MiniMaxH3ReferenceKVTier1State):
         _log.info(
             "MiniMax-H3 reference-KV Tier2 summary: host_bytes=%d, "
             "device_staging_bytes=%d, refresh_steps=%d, h2d_steps=%d, "
-            "captured_layers=%d, substituted_layers=%d, "
+            "captured_layers=%d, substituted_layers=%d, block_cached_layers=%d, "
             "prefetched_layers=%d, ready_wait_layers=%d, h2d_bytes=%d, "
             "projection_skipped_layers=%d, projection_skipped_rows=%d, "
             "projection_total_rows=%d, inactive=%s, cache_layout=post_ulysses, "
@@ -1199,6 +1235,7 @@ class MiniMaxH3ReferenceKVTier2State(MiniMaxH3ReferenceKVTier1State):
             self.stats.h2d_steps,
             self.stats.captured_layers,
             self.stats.substituted_layers,
+            self.stats.block_cached_layers,
             self.stats.prefetched_layers,
             self.stats.ready_wait_layers,
             self.stats.h2d_bytes,
@@ -1311,6 +1348,11 @@ class MiniMaxH3ReferenceKVObserverState(MiniMaxH3ReferenceKVTier1State):
                 }
             ]
         )
+
+    @property
+    def supports_block_cache_reuse(self) -> bool:
+        # Observations need fresh KV from every physical layer on every step.
+        return False
 
     def _resolve_output_path(self, raw_path: str) -> Path:
         base = Path(raw_path)
