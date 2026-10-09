@@ -144,6 +144,14 @@ except (ImportError, ModuleNotFoundError):
 logger = init_logger(__name__)
 
 PP_CAPTURE_PREFIX = "capture_"
+# Capture index of the word embeddings, i.e. the input to decoder layer 0.
+_EMBEDDING_LAYER_INDEX = 0
+
+
+def _get_capture_key(layer_idx: int) -> str:
+    """Return the IntermediateTensors key that carries a layer capture across PP ranks."""
+    return f"{PP_CAPTURE_PREFIX}{layer_idx}"
+
 
 _THINKER_ARCHITECTURE = "Qwen3OmniMoeThinkerForConditionalGeneration"
 
@@ -574,7 +582,7 @@ class Qwen3MoeLLMModel(_Qwen3MoeLLMModel):
                     hs = captured_hidden_states.setdefault("hidden_states", {})
                     layers = hs.setdefault("layers", {})
                     # Receive buffers are reused on the next step; retain an independent snapshot.
-                    layers[layer_idx] = intermediate_tensors[f"{PP_CAPTURE_PREFIX}{layer_idx}"].clone()
+                    layers[layer_idx] = intermediate_tensors[_get_capture_key(layer_idx)].clone()
 
         for layer_idx, layer in enumerate(self.layers[self.start_layer : self.end_layer]):
             layer_idx = layer_idx + self.start_layer
@@ -602,7 +610,7 @@ class Qwen3MoeLLMModel(_Qwen3MoeLLMModel):
             if captured_hidden_states:
                 tensors.update(
                     {
-                        f"{PP_CAPTURE_PREFIX}{index}": value
+                        _get_capture_key(index): value
                         for index, value in captured_hidden_states["hidden_states"]["layers"].items()
                     }
                 )
@@ -1405,6 +1413,19 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
         else:
             deepstack_input_embeds = None
 
+        # HACK: Snapshot the embedding capture here, before calling the compiled language model.
+        # This is needed for TP > 1, because vLLM's compile integration currently removes the
+        # clone on the graph input since it's read only, and enables kernels which write the
+        # residual in place, thereby causing the audio output to become corrupted.
+        embedding_capture = None
+        if (
+            return_hidden_states
+            and inputs_embeds is not None
+            and _EMBEDDING_LAYER_INDEX in (capture_layer_indices or ())
+        ):
+            embedding_capture = inputs_embeds.clone()
+            capture_layer_indices = [index for index in capture_layer_indices if index != _EMBEDDING_LAYER_INDEX]
+
         model_output = self.language_model.model(
             input_ids,
             positions,
@@ -1419,8 +1440,15 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
         if inputs_embeds is not None and get_pp_group().is_first_rank:
             self._clear_deepstack_input_embeds(inputs_embeds.size(0))
 
+        if embedding_capture is not None:
+            # If we externally captured the embeddings for correct compile behavior, we need to rewrite the correct
+            # value back to the corresponding location to ensure read-only clone removal doesn't corrupt values
+            if isinstance(model_output, IntermediateTensors):
+                model_output[_get_capture_key(_EMBEDDING_LAYER_INDEX)] = embedding_capture
+            else:
+                model_output[-1]["hidden_states"]["layers"][_EMBEDDING_LAYER_INDEX] = embedding_capture
+
         if isinstance(model_output, IntermediateTensors):
-            # Non-last PP rank: forward the intermediate tensors as-is.
             return model_output
         hidden_states, captured_hidden_states = model_output
         if capture_layer_indices is None and not return_hidden_states:

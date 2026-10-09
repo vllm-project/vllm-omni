@@ -225,6 +225,11 @@ class SequenceParallelInput:
             ForwardContext so models can construct attention masks when needed.
             Note: Ring attention does not support attention mask, so auto_pad
             should only be used with Ulysses SP.
+        clone_shard: If True, give a sharded tensor its own contiguous storage
+            so it does not retain the full input allocation. Applies to both
+            padded and unpadded splits; a single-rank input is returned unchanged.
+            Memory savings require the caller to drop its reference to the full
+            tensor; any other references to its storage also keep it allocated.
         shard_group: Optional key shared by tensors representing the same global
             sequence. Keyed groups track independent padding metadata; omitting
             it preserves the legacy single-sequence padding behavior.
@@ -244,13 +249,15 @@ class SequenceParallelInput:
     expected_dims: int | None = None
     split_output: bool = False
     auto_pad: bool = False
+    clone_shard: bool = False
     shard_group: str | None = None
 
     def __repr__(self) -> str:
         return (
             f"SequenceParallelInput(split_dim={self.split_dim}, "
             f"expected_dims={self.expected_dims}, split_output={self.split_output}, "
-            f"auto_pad={self.auto_pad}, shard_group={self.shard_group!r})"
+            f"auto_pad={self.auto_pad}, clone_shard={self.clone_shard}, "
+            f"shard_group={self.shard_group!r})"
         )
 
 
