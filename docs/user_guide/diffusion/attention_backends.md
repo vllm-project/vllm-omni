@@ -21,6 +21,7 @@ For the internal selector, registry, and platform contract, see
 | Match training or rollout kernels loaded from Hugging Face | [Hugging Face Hub Backends](attention_backends/huggingface_hub.md) |
 | Use block-sparse video attention on Ascend NPU | [RainFusion](attention_backends/rainfusion.md) |
 | Use FastVideo VSA with FastWan2.2-TI2V-5B or FastH3 MiniMax-H3 on CUDA | [FastVideo VSA](attention_backends/fastvideo_vsa.md) |
+| Run VDN-H3 (Video DeltaNet MiniMax-H3) hybrid-attention checkpoints on CUDA | [VDN-H3 Hybrid Attention](attention_backends/vdnh3_attn.md) |
 
 ## Backend options
 
@@ -37,6 +38,7 @@ For the internal selector, registry, and platform contract, see
 | `FLASH_ATTN_3_HUB` | Hub kernel | FlashAttention 3 from Hugging Face `kernels` on Hopper or newer | [Hugging Face Hub Backends](attention_backends/huggingface_hub.md) |
 | `RAINFUSION_ATTN` | Block sparse | MindIE-SD RainFusion video attention on Ascend NPU | [RainFusion](attention_backends/rainfusion.md) |
 | `FASTVIDEO_VSA` | Block sparse | FastVideo variable sparse self-attention for FastWan2.2-TI2V-5B and FastH3 MiniMax-H3 on CUDA | [FastVideo VSA](attention_backends/fastvideo_vsa.md) |
+| `VDNH3_ATTN` | Hybrid window | Frame-window softmax of VDN-H3 hybrid attention; the model adds the linear branch | [VDN-H3 Hybrid Attention](attention_backends/vdnh3_attn.md) |
 
 ## Configuration
 
