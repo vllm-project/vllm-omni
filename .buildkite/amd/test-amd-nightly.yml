@@ -126,6 +126,24 @@ steps:
           - export VLLM_ROCM_USE_AITER=0
           - "pytest -sv tests/diffusion/models/pi05/test_pi05_units.py -m 'core_model and cpu'"
 
+  # READY/MERGE retain a two-repository smoke for the ROCm-only local
+  # metadata-snapshot path. Run the complete 12-case, 32-batch correctness
+  # matrix here with timing artifacts so it does not dominate the PR gate.
+  - group: ":robot_face: Omni Processor Nightly"
+    steps:
+      - label: "Simple · Omni Processor Test"
+        agent_pool: mi300_1
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 60
+        env:
+          VLLM_OMNI_AMD_PROCESSOR_TIMING: "1"
+        artifact_paths:
+          - "artifacts/omni-processor/**/*"
+        commands:
+          - export VLLM_ROCM_USE_AITER=0
+          - bash .buildkite/amd/scripts/run-omni-processor-test.sh
+
   - group: ":full_moon: LingBot-Video MI300 Nightly"
     steps:
       - label: "LingBot-Video Dense CFG-off Smoke"

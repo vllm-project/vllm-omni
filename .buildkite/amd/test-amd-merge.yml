@@ -20,15 +20,19 @@ steps:
         # that is not supported on CPU
         - "pytest -sv tests/model_executor -m 'core_model and cpu and not omni' --num-shards=$$BUILDKITE_PARALLEL_JOB_COUNT --shard-id=$$BUILDKITE_PARALLEL_JOB"
 
-    - label: "Simple · Omni Processor Test"
+    - label: "Simple · Omni Processor Snapshot Smoke"
       agent_pool: mi300_1
       depends_on: amd-build
       mirror_hardwares: [amdproduction]
       grade: Blocking
-      timeout_in_minutes: 60
+      timeout_in_minutes: 10
       commands:
         - export VLLM_ROCM_USE_AITER=0
-        - "pytest -sv tests/model_executor/models/test_omni_processing.py -m 'core_model and cpu and omni'"
+        - >-
+          timeout --signal=TERM --kill-after=1m 8m
+          pytest -sv
+          tests/model_executor/models/test_omni_processing.py::test_rocm_processor_snapshot_smoke
+          -m 'core_model and cpu and omni' --durations=0
 
     - label: "Simple · Diffusion Test · Shard %N/%t"
       agent_pool: mi300_1

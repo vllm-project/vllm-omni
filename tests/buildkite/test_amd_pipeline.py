@@ -14,6 +14,9 @@ AMD_MERGE_PIPELINE = Path(".buildkite/amd/test-amd-merge.yml")
 AMD_NIGHTLY_PIPELINE = Path(".buildkite/amd/test-amd-nightly.yml")
 AMD_READY_PIPELINE = Path(".buildkite/amd/test-amd-ready.yml")
 AMD_TEMPLATE = Path(".buildkite/amd/test-template-amd-omni.j2")
+AMD_OMNI_PROCESSOR_RUNNER = Path(".buildkite/amd/scripts/run-omni-processor-test.sh")
+CUDA_MERGE_PIPELINE = Path(".buildkite/cuda/test-merge.yml")
+CUDA_READY_PIPELINE = Path(".buildkite/cuda/test-ready.yml")
 AR_PAGED_ATTENTION_LABEL = "ROCm · AR Diffusion Paged Attention GPU Test"
 DIFFUSION_GROUP = ":card_index_dividers: Diffusion Test"
 AR_PAGED_ATTENTION_MARKERS = "core_model and rocm and MI325 and cards_1"
@@ -23,6 +26,10 @@ DIFFUSION_CPU_MARKERS = (
     "core_model and cpu and not (cards_2 or cards_3 or cards_4 or cards_5 or cards_6 or cards_7 or cards_8)"
 )
 DIFFUSION_CPU_ARTIFACTS = "artifacts/amd-diffusion-cpu-shards/*.xml"
+OMNI_PROCESSOR_FULL_LABEL = "Simple · Omni Processor Test"
+OMNI_PROCESSOR_SMOKE_LABEL = "Simple · Omni Processor Snapshot Smoke"
+OMNI_PROCESSOR_TEST = "tests/model_executor/models/test_omni_processing.py"
+OMNI_PROCESSOR_TIMING_ENV = "VLLM_OMNI_AMD_PROCESSOR_TIMING"
 
 
 def _find_step(label: str, pipeline_path: Path = AMD_MERGE_PIPELINE) -> dict:
@@ -48,6 +55,12 @@ def _find_group(label: str, pipeline_path: Path) -> dict:
     return group
 
 
+def _walk_steps(steps: list[dict]):
+    for step in steps:
+        yield step
+        yield from _walk_steps(step.get("steps", []))
+
+
 def _find_diffusion_cpu_shard_step(pipeline_path: Path) -> dict:
     pipeline = yaml.safe_load(pipeline_path.read_text(encoding="utf-8"))
     matches = []
@@ -65,6 +78,93 @@ def _find_diffusion_cpu_shard_step(pipeline_path: Path) -> dict:
     walk(pipeline.get("steps", []))
     assert len(matches) == 1, f"expected one diffusion CPU shard step in {pipeline_path}"
     return matches[0]
+
+
+def test_omni_processor_full_matrix_moves_to_nightly_with_blocking_rocm_smoke() -> None:
+    smoke_definitions = []
+    for pipeline_path in (AMD_READY_PIPELINE, AMD_MERGE_PIPELINE):
+        pipeline = yaml.safe_load(pipeline_path.read_text(encoding="utf-8"))
+        steps = list(_walk_steps(pipeline["steps"]))
+
+        assert all(step.get("label") != OMNI_PROCESSOR_FULL_LABEL for step in steps)
+        assert all(step.get("env", {}).get(OMNI_PROCESSOR_TIMING_ENV) != "1" for step in steps)
+
+        smoke = _find_step(OMNI_PROCESSOR_SMOKE_LABEL, pipeline_path)
+        smoke_definitions.append(smoke)
+        assert smoke["agent_pool"] == "mi300_1"
+        assert smoke["depends_on"] == "amd-build"
+        assert smoke["mirror_hardwares"] == ["amdproduction"]
+        assert smoke["grade"] == "Blocking"
+        assert smoke["timeout_in_minutes"] == 10
+        assert smoke["commands"][0] == "export VLLM_ROCM_USE_AITER=0"
+
+        argv = split(smoke["commands"][1])
+        assert argv[:4] == ["timeout", "--signal=TERM", "--kill-after=1m", "8m"]
+        assert f"{OMNI_PROCESSOR_TEST}::test_rocm_processor_snapshot_smoke" in argv
+        assert argv[argv.index("-m") + 1] == "core_model and cpu and omni"
+        assert "--durations=0" in argv
+        assert "-k" not in argv
+
+        model_executor_step = next(
+            step for step in steps if step.get("label", "").startswith("Simple · Model Executor Test")
+        )
+        pytest_command = next(command for command in model_executor_step["commands"] if "pytest" in command)
+        assert "core_model and cpu and not omni" in pytest_command
+
+    assert smoke_definitions[0] == smoke_definitions[1]
+
+    nightly = yaml.safe_load(AMD_NIGHTLY_PIPELINE.read_text(encoding="utf-8"))
+    nightly_steps = list(_walk_steps(nightly["steps"]))
+    lane_definitions = [step for step in nightly_steps if step.get("label") == OMNI_PROCESSOR_FULL_LABEL]
+    assert len(lane_definitions) == 1
+
+    step = lane_definitions[0]
+    assert step["agent_pool"] == "mi300_1"
+    assert step["mirror_hardwares"] == ["amdproduction"]
+    assert step["grade"] == "NonBlocking"
+    assert step["timeout_in_minutes"] == 60
+    assert step["env"] == {OMNI_PROCESSOR_TIMING_ENV: "1"}
+    assert step["artifact_paths"] == ["artifacts/omni-processor/**/*"]
+    assert step["commands"] == [
+        "export VLLM_ROCM_USE_AITER=0",
+        "bash .buildkite/amd/scripts/run-omni-processor-test.sh",
+    ]
+    assert [
+        candidate["label"]
+        for candidate in nightly_steps
+        if candidate.get("env", {}).get(OMNI_PROCESSOR_TIMING_ENV) == "1"
+    ] == [OMNI_PROCESSOR_FULL_LABEL]
+
+    runner = AMD_OMNI_PROCESSOR_RUNNER.read_text(encoding="utf-8")
+    assert runner.count("\npytest -s -v \\\n") == 1
+    assert OMNI_PROCESSOR_TEST in runner
+    assert "-m 'core_model and cpu and omni'" in runner
+    assert "--durations=0" in runner
+    assert '--junitxml="${artifact_root}/pytest.xml"' in runner
+    assert 'tee "${artifact_root}/pytest.log"' in runner
+    assert "record_cpu_context before" in runner
+    assert "record_cpu_context after" in runner
+    assert "pytest_status=${pipeline_status[0]}" in runner
+    assert "tee_status=${pipeline_status[1]}" in runner
+    assert 'exit "${pytest_status}"' in runner
+
+
+@pytest.mark.parametrize(
+    "pipeline_path",
+    [CUDA_READY_PIPELINE, CUDA_MERGE_PIPELINE],
+    ids=["ready", "merge"],
+)
+def test_cuda_pr_gates_retain_full_omni_processor_coverage(pipeline_path: Path) -> None:
+    step = _find_step("Simple · Model Executor Test", pipeline_path)
+    assert "source_file_dependencies" not in step
+
+    pytest_command = next(command for command in step["commands"] if "pytest" in command)
+    argv = split(pytest_command)
+    marker_expression = argv[argv.index("-m") + 1]
+
+    assert "tests/model_executor" in argv
+    assert marker_expression == "core_model and cpu"
+    assert "not omni" not in marker_expression
 
 
 def test_ar_paged_attention_gpu_lane_is_blocking_and_pinned() -> None:
