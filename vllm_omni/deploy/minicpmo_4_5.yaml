@@ -26,7 +26,21 @@ connectors:
       # A future initial_codec_chunk_frames shape will use lazy capture unless
       # HiFTGraphWrapper.derive_capture_bucket_size explicitly includes it.
       enable_hift_graph: true
+      # Capture batch-1 continuation/tail shapes without padding: with the
+      # 8-frame mel cache these codec widths cover 16-64 mel frames.
+      hift_graph_continuation_frames: [4, 28]
+      hift_graph_exact_batch_sizes: [1]
       enable_cfm_graph: true
+      # Exact continuation batches 1..16 share one startup arena; no padding.
+      # Uncaptured shapes stay eager without request-time eviction/recapture.
+      enable_code2wav_encoder_graph: true
+      # An integer selects every batch up to this limit; a list selects exact batches.
+      code2wav_encoder_graph_rows: 16
+      # Three reachable default-prompt cache lengths per batch. Other lengths stay eager.
+      code2wav_encoder_max_graphs: 48
+      # Used only when startup precapture installs nothing and capture falls
+      # back to the request path. A full cache still stays eager.
+      code2wav_encoder_capture_after: 8
       # Whole-Euler CUDA graphs exist for batch 1, 2, 4, ... up to
       # micro_batch_size, which defaults to Stage 2 max_num_seqs: all graphs
       # share one attention-cache arena of that many requests (~0.6 GiB each
@@ -127,6 +141,11 @@ platforms:
   npu:
     stages:
       - stage_id: 0
+        # 32768 leaves no KV cache on 910B1 at gpu_memory_utilization 0.55.
+        # Audio Conv1d stays eager; the transformer stack is what this graph replays.
+        additional_config:
+          encoder_enable_npu_graph: true
+          encoder_max_npu_graphs: 4  # Per encoder (vision/audio).
         max_num_batched_tokens: 8192
         compilation_config:
           cudagraph_mode: PIECEWISE
