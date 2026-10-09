@@ -1606,8 +1606,6 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         # Lists are deliberate: the runner routes element i to request i,
         # preserving compaction alignment while emitting only this step's code.
         meta_outputs = {"finished": terminal_flags}
-        if gpu_rows:
-            meta_outputs["codec_frame_valid"] = frame_valid
         if emit_duplex_metadata:
             meta_outputs.update(
                 {
