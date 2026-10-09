@@ -4,10 +4,10 @@
 
 The INT8 path loads serialized ``compressed-tensors`` W8A8 checkpoints.
 Preview (Qwen2.5-VL) and Dev (Qwen3-VL) run as independent BF16/INT8 pairs.
-The official BF16 checkpoints are pinned below. Configure the published INT8
-checkpoints with ``MAMMOTH_MODA2_{PREVIEW,DEV}_INT8_MODEL`` and
-``MAMMOTH_MODA2_{PREVIEW,DEV}_INT8_REVISION`` (full Hub commit SHA). Local
-checkpoint directories are also supported and do not require a revision.
+The official BF16 and user-published INT8 checkpoints are pinned below for both
+versions. INT8 overrides use ``MAMMOTH_MODA2_{PREVIEW,DEV}_INT8_MODEL`` and
+``*_INT8_REVISION`` (full Hub commit SHA). Local checkpoint directories are
+also supported and do not require a revision.
 BF16 overrides use ``MAMMOTH_MODA2_{PREVIEW,DEV}_MODEL`` and ``*_REVISION``.
 Missing checkpoint configuration or download errors fail the gates.
 
@@ -49,8 +49,7 @@ from tests.helpers.mark import hardware_test
 # Constants
 # ---------------------------------------------------------------------------
 
-# Immutable official BF16 baselines. Published INT8 IDs/revisions must be
-# supplied explicitly until both validated artifacts are available.
+# Immutable official BF16 baselines, stored as (repository ID, commit SHA).
 _BF16_CHECKPOINTS = {
     "preview": (
         "bytedance-research/MammothModa2-Preview",
@@ -59,6 +58,18 @@ _BF16_CHECKPOINTS = {
     "dev": (
         "bytedance-research/MammothModa2-Dev",
         "461ad0d7d846bd5fa944619b08213a936eee2e30",
+    ),
+}
+# Immutable user-published W8A8 artifacts. Both pinned revisions contain the
+# model config, safetensors weight index and all five weight shards.
+_INT8_CHECKPOINTS = {
+    "preview": (
+        "wenjyanasd/MammothModa2-Preview-W8A8",
+        "a745b457de0738524e4939a38fb3376a5cd03958",
+    ),
+    "dev": (
+        "wenjyanasd/MammothModa2-Dev-W8A8",
+        "17e114cdff9648d64c5d6dee19c134c320699d5a",
     ),
 }
 _MODEL_VERSIONS = [pytest.param("preview", id="preview"), pytest.param("dev", id="dev")]
@@ -94,7 +105,8 @@ def _checkpoint_dir(version: str, quantization: str | None) -> Path:
     prefix = f"MAMMOTH_MODA2_{version.upper()}"
     if quantization is not None:
         prefix += "_INT8"
-    default_model, default_revision = _BF16_CHECKPOINTS[version] if quantization is None else (None, None)
+    checkpoints = _BF16_CHECKPOINTS if quantization is None else _INT8_CHECKPOINTS
+    default_model, default_revision = checkpoints[version]
     model = os.environ.get(f"{prefix}_MODEL", default_model)
     revision = os.environ.get(f"{prefix}_REVISION")
     # Preserve the existing Dev workstation overrides.
@@ -468,25 +480,59 @@ def _assert_finite_image_payload(payload) -> None:
 def _extract_image_tensor(outputs, *, expected_count: int, expected_size: tuple[int, int]) -> torch.Tensor:
     """Extract the decoded image as a ``(C, H, W)`` float tensor in ``[0, 1]``.
 
-    Reuses the official ``extract_images_from_outputs`` helper, which knows all
-    the payload shapes (``OmniRequestOutput.images`` plus the ``"image"`` /
-    ``"images"`` / ``"model_outputs"`` multimodal keys).
+    Count every completion and request-level image before selecting the single
+    requested image. Shared payload objects exposed through multiple aliases
+    are counted once; repeated images within a batch or separate completions
+    still count as separate outputs.
     """
     import numpy as np
 
     from vllm_omni.diffusion.utils.image_output import (
-        _iter_multimodal_image_payloads,
-        extract_images_from_outputs,
+        _coerce_images,
+        _image_values_from_mapping_like,
     )
 
+    assert expected_count == 1, "this A/B helper compares exactly one requested image"
     images = []
     for output in outputs:
-        _assert_finite_image_payload(getattr(output, "images", None))
-        for payload in _iter_multimodal_image_payloads(output):
+        completion_payload_ids: set[int] = set()
+
+        def collect(payload, seen: set[int]) -> set[int]:
             _assert_finite_image_payload(payload)
-        # Collect across outputs instead of letting the helper return only the
-        # first request's images. Alternative payload aliases are not counted twice.
-        images.extend(extract_images_from_outputs(output))
+            # Compare with earlier aliases, not earlier positions in this batch:
+            # [image, image] explicitly contains two requested outputs.
+            previous = seen.copy()
+            found: set[int] = set()
+
+            def visit(value) -> None:
+                if isinstance(value, (list, tuple)):
+                    for item in value:
+                        visit(item)
+                elif value is not None:
+                    found.add(id(value))
+                    if id(value) not in previous:
+                        decoded = _coerce_images(value)
+                        assert decoded, f"unsupported image payload: {type(value).__name__}"
+                        images.extend(decoded)
+
+            visit(payload)
+            seen.update(found)
+            return found
+
+        for completion in getattr(output, "outputs", None) or []:
+            seen: set[int] = set()
+            for payload in _image_values_from_mapping_like(getattr(completion, "multimodal_output", None)):
+                completion_payload_ids.update(collect(payload, seen))
+
+        # OmniRequestOutput.multimodal_output returns only the first completion's
+        # payload when present, so inspect its stored request-level mapping too.
+        root_mapping = getattr(output, "_multimodal_output", None)
+        if root_mapping is None:
+            root_mapping = getattr(output, "multimodal_output", None)
+        root_seen = completion_payload_ids.copy()
+        collect(getattr(output, "images", None), root_seen)
+        for payload in _image_values_from_mapping_like(root_mapping):
+            collect(payload, root_seen)
     assert len(images) == expected_count, f"expected {expected_count} image(s), got {len(images)}"
     for image in images:
         assert image.size == expected_size, f"expected image size {expected_size}, got {image.size}"
@@ -494,6 +540,64 @@ def _extract_image_tensor(outputs, *, expected_count: int, expected_size: tuple[
 
     arr = np.asarray(images[0], dtype=np.float32) / 255.0  # (H, W, C)
     return torch.from_numpy(arr).permute(2, 0, 1)  # (C, H, W)
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("location", ["requests", "completions", "batch"])
+def test_image_output_contract_rejects_extra_images(location: str):
+    from types import SimpleNamespace
+
+    from PIL import Image
+
+    # Even identical image objects count twice when returned as two outputs.
+    image = Image.new("RGB", (8, 8))
+    completion = SimpleNamespace(multimodal_output={"image": image})
+    if location == "requests":
+        outputs = [SimpleNamespace(images=[image]), SimpleNamespace(images=[image])]
+    elif location == "completions":
+        outputs = [SimpleNamespace(outputs=[completion, completion])]
+    else:
+        outputs = [SimpleNamespace(images=[image, image])]
+    with pytest.raises(AssertionError, match=r"expected 1 image\(s\), got 2"):
+        _extract_image_tensor(outputs, expected_count=1, expected_size=(8, 8))
+
+
+@pytest.mark.cpu
+def test_image_output_contract_counts_aliases_once():
+    from types import SimpleNamespace
+
+    from PIL import Image
+
+    image = Image.new("RGB", (8, 8))
+    payload = {"image": image, "images": [image], "model_outputs": [image]}
+    output = SimpleNamespace(
+        images=[image],
+        outputs=[SimpleNamespace(multimodal_output=payload)],
+        _multimodal_output=payload,
+    )
+    tensor = _extract_image_tensor([output], expected_count=1, expected_size=(8, 8))
+    assert tensor.shape == (3, 8, 8)
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("invalid", ["size", "mode", "nan", "inf"])
+def test_image_output_contract_rejects_invalid_payload(invalid: str):
+    from types import SimpleNamespace
+
+    from PIL import Image
+
+    if invalid in {"nan", "inf"}:
+        image = torch.zeros(3, 8, 8)
+        image[0, 0, 0] = float(invalid)
+        message = "raw image tensor contains non-finite values"
+    elif invalid == "size":
+        image = Image.new("RGB", (4, 8))
+        message = "expected image size"
+    else:
+        image = Image.new("L", (8, 8))
+        message = "expected RGB image"
+    with pytest.raises(AssertionError, match=message):
+        _extract_image_tensor([SimpleNamespace(images=[image])], expected_count=1, expected_size=(8, 8))
 
 
 def _image_rel_l2(a: torch.Tensor, b: torch.Tensor) -> float:
@@ -542,9 +646,8 @@ def test_bf16_vs_int8_t2i_image_consistency(checkpoint_pair: tuple[str, str]):
     for name in ("psnr_db", "mae", "max_abs", "cosine", "rel_l2", "pixel_match"):
         print(f"  {name:12s} = {metrics[name]:.6f}")
 
-    # Same seed + greedy AR + deterministic DiT: a correctly quantized
-    # gen_head plus the BF16 gen_mlp/gen_embed_tokens must reproduce the same
-    # visual tokens, hence the image.
+    # Compare decoded images under the same seed and greedy AR sampling.
+    # INT8 can change visual tokens, so exact token/pixel identity is not gated.
     assert metrics["cosine"] >= MIN_IMAGE_COSINE, (
         f"BF16/INT8 t2i images diverge too much: cosine={metrics['cosine']:.6f} < {MIN_IMAGE_COSINE}"
     )
@@ -585,12 +688,13 @@ def _matches_module(module: str, target: str) -> bool:
 
 
 def _quantized_weight_keys(quant_config: dict, metadata: dict[str, tuple[str, list[int]]]) -> set[str]:
-    """Match checkpoint targets/ignore entries against MammothModa2 linear weights.
+    """Match checkpoint targets/ignore entries against MammothModa2 weights.
 
-    In these architectures matrix-shaped module weights are Linear or Embedding;
-    embedding leaves are excluded from the Linear class target. Exact names and
-    ``re:`` patterns are supported alongside the recipe's ``Linear`` target.
-    Unknown class targets fail rather than silently losing coverage.
+    Matrix-shaped module weights are Linear, Embedding, or ParallelLMHead;
+    embedding leaves and output heads are excluded from the Linear class target.
+    Exact names and ``re:`` patterns are supported alongside the ``Linear`` and
+    ``ParallelLMHead`` class targets. Unknown classes fail rather than silently
+    losing coverage.
     """
     embedding_leaves = {
         "embed_tokens",
@@ -604,10 +708,12 @@ def _quantized_weight_keys(quant_config: dict, metadata: dict[str, tuple[str, li
         "embedding",
         "embeddings",
     }
+    # Both output heads are ParallelLMHead in Mammoth2ForCausalLM.
+    lm_head_modules = {"llm_model.lm_head", "llm_model.gen_head"}
     targets = [target for group in quant_config["config_groups"].values() for target in group["targets"]]
     assert targets, "no quantization targets declared"
     for target in targets:
-        assert target == "Linear" or target.startswith("re:") or "." in target, (
+        assert target in {"Linear", "ParallelLMHead"} or target.startswith("re:") or "." in target, (
             f"unsupported quantization target class {target!r}"
         )
     quantized = set()
@@ -617,11 +723,40 @@ def _quantized_weight_keys(quant_config: dict, metadata: dict[str, tuple[str, li
         module = key.removesuffix(".weight")
         if any(_matches_module(module, ignored) for ignored in quant_config.get("ignore", [])):
             continue
-        is_linear = len(shape) == 2 and module.rsplit(".", 1)[-1] not in embedding_leaves
-        if any((target == "Linear" and is_linear) or _matches_module(module, target) for target in targets):
+        is_lm_head = module in lm_head_modules
+        is_linear = len(shape) == 2 and module.rsplit(".", 1)[-1] not in embedding_leaves and not is_lm_head
+        if any(
+            (target == "Linear" and is_linear)
+            or (target == "ParallelLMHead" and is_lm_head)
+            or _matches_module(module, target)
+            for target in targets
+        ):
             quantized.add(key)
     assert quantized, "no checkpoint weights match the declared quantization targets"
     return quantized
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize(
+    "targets,ignore,expected_modules",
+    [
+        (["Linear"], [], {"llm_model.model.language_model.layers.0.mlp.gate_proj"}),
+        (["ParallelLMHead"], [], {"llm_model.lm_head", "llm_model.gen_head"}),
+        (["ParallelLMHead"], ["llm_model.gen_head"], {"llm_model.lm_head"}),
+        (["re:llm_model\\..*_head"], [], {"llm_model.lm_head", "llm_model.gen_head"}),
+    ],
+)
+def test_quantization_target_classes(targets: list[str], ignore: list[str], expected_modules: set[str]):
+    # Target discovery must not depend on the saved dtype: a declared target
+    # incorrectly saved as BF16 still needs to reach the dtype/scale checks.
+    metadata = {
+        "llm_model.model.language_model.layers.0.mlp.gate_proj.weight": ("BF16", [16, 8]),
+        "llm_model.model.language_model.embed_tokens.weight": ("BF16", [32, 8]),
+        "llm_model.lm_head.weight": ("BF16", [32, 8]),
+        "llm_model.gen_head.weight": ("BF16", [32, 8]),
+    }
+    config = {"config_groups": {"group_0": {"targets": targets}}, "ignore": ignore}
+    assert _quantized_weight_keys(config, metadata) == {f"{module}.weight" for module in expected_modules}
 
 
 def _read_tensor(ckpt_dir, weight_map: dict[str, str], key: str) -> torch.Tensor:
