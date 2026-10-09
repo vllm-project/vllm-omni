@@ -179,8 +179,13 @@ def resolve_minimax_h3_shape(
         requested_frames = int(sampling.num_frames)
     else:
         requested_frames = 124 if task == "ref2va" else 209
-    if not MINIMAX_H3_MIN_OUTPUT_SECONDS <= requested_frames / fps <= max_seconds:
-        raise OmniClientError(f"MiniMax H3 output duration must be {duration_range}, got {requested_frames / fps:.3f}")
+    # Cap on the 17n+5 grid so num_frames accepts what the same duration aligns to.
+    max_frames = minimax_h3_align_frame_count(int(max_seconds * fps))
+    if requested_frames / fps < MINIMAX_H3_MIN_OUTPUT_SECONDS or requested_frames > max_frames:
+        raise OmniClientError(
+            f"MiniMax H3 output duration must be {duration_range} (at most {max_frames} frames), "
+            f"got {requested_frames / fps:.3f}"
+        )
     num_frames = minimax_h3_align_frame_count(requested_frames)
 
     height = getattr(sampling, "height", None)
