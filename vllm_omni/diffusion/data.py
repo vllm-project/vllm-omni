@@ -16,7 +16,7 @@ import diffusers
 import huggingface_hub
 import torch
 from PIL import Image
-from pydantic import Field, model_validator
+from pydantic import model_validator
 from typing_extensions import Self
 from vllm.config.utils import config
 from vllm.logger import init_logger
@@ -981,6 +981,19 @@ class OmniDiffusionConfig:
 
     # Compilation
     enforce_eager: bool = False
+    # Capture fixed-shape KV-cache decode (denoising) steps into CUDA graphs.
+    # Currently only Qwen-Image-2.1's transformer implements this; other models
+    # ignore the flag. This is a per-model diffusion path, independent of the
+    # AR engine's ``compilation_config.cudagraph_mode`` (which does not apply
+    # to diffusion stages). It stacks with ``diffusion_compile_granularity``:
+    # the DiT blocks are still torch.compile'd and graph capture records the
+    # compiled (fused) kernels, while inductor's own cudagraphs stay off.
+    # ``enforce_eager=True`` forces eager decode and
+    # disables capture regardless of this flag; unsupported configurations
+    # (SP/TP, ring, HSDP, dynamic LoRA, padded masks, quantized prefix KV, or
+    # a second in-flight request aliasing the same graph key) log and fall
+    # back to eager decode.
+    enable_cuda_graph_decode: bool = True
     # Controls the generic compilation path used when a pipeline does not
     # provide its own setup_compile() implementation.
     diffusion_compile_granularity: str = "regional"
@@ -1170,7 +1183,7 @@ class OmniDiffusionConfig:
     request_batch_max_wait_ms: float = 0.0
 
     # Supplementary model specific parameters
-    extras: dict[str, Any] = Field(default_factory=dict)
+    extras: dict[str, Any] = field(default_factory=dict)
 
     @property
     def is_moe(self) -> bool:
@@ -2089,6 +2102,8 @@ class AttentionSpec:
     skip_softmax: SkipSoftmaxSpec | None = None
     quant: AttnQuantSpec | None = None
     fastvideo_vsa_topk: int | None = None
+    fastvideo_vsa_provider: str = "auto"
+    fastvideo_vsa_precision: str = "bf16"
     block_sparse: BlockSparseSpec | None = None
     skip_calibration: dict | None = field(default=None, repr=False)
 
@@ -2108,6 +2123,16 @@ class AttentionSpec:
                 f"quant is only supported by the TRTLLM_ATTN and FLASHINFER_ATTN backends, but "
                 f"backend={self.backend!r}. Remove quant or set a supported backend."
             )
+        if self.fastvideo_vsa_provider not in ("auto", "fastvideo", "flashinfer"):
+            raise ValueError("fastvideo_vsa_provider must be auto, fastvideo or flashinfer")
+        if self.fastvideo_vsa_precision not in ("bf16", "sage"):
+            raise ValueError("fastvideo_vsa_precision must be bf16 or sage")
+        if self.fastvideo_vsa_precision == "sage" and self.fastvideo_vsa_provider == "fastvideo":
+            raise ValueError("Sage VSA precision requires the FlashInfer provider")
+        if self.backend.upper() != "FASTVIDEO_VSA" and (
+            self.fastvideo_vsa_provider not in ("auto", "fastvideo") or self.fastvideo_vsa_precision != "bf16"
+        ):
+            raise ValueError("VSA provider/precision require the FASTVIDEO_VSA backend")
         if self.fastvideo_vsa_topk is not None:
             if self.backend.upper() != "FASTVIDEO_VSA":
                 raise ValueError("fastvideo_vsa_topk is only supported by the FASTVIDEO_VSA backend.")
@@ -2134,6 +2159,10 @@ class AttentionSpec:
     def backend_kwargs(self) -> dict[str, Any] | None:
         """Serialize typed backend config into the kwargs dict the backend impl consumes."""
         kw: dict[str, Any] = {}
+        if self.backend.upper() == "FASTVIDEO_VSA" and self.fastvideo_vsa_provider != "auto":
+            kw["provider"] = self.fastvideo_vsa_provider
+        if self.fastvideo_vsa_precision != "bf16":
+            kw["precision"] = self.fastvideo_vsa_precision
         if self.skip_softmax is not None:
             ss = self.skip_softmax
             if ss.threshold is not None:
@@ -2235,7 +2264,15 @@ class AttentionConfig:
             normalized[role] = node
             return
 
-        spec_keys = {"backend", "skip_softmax", "quant", "fastvideo_vsa_topk", "block_sparse"}
+        spec_keys = {
+            "backend",
+            "skip_softmax",
+            "quant",
+            "fastvideo_vsa_topk",
+            "fastvideo_vsa_provider",
+            "fastvideo_vsa_precision",
+            "block_sparse",
+        }
         node_dict = dict(node)
         node_keys = set(node_dict)
         if node_keys & spec_keys:

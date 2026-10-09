@@ -51,10 +51,20 @@ _DIFFUSION_MODELS = {
         "pipeline_qwen_image_edit_plus",
         "QwenImageEditPlusPipeline",
     ),
+    "JoyImageEditPipeline": (
+        "joy_image",
+        "pipeline_joy_image_edit",
+        "JoyImageEditPipeline",
+    ),
     "QwenImageLayeredPipeline": (
         "qwen_image",
         "pipeline_qwen_image_layered",
         "QwenImageLayeredPipeline",
+    ),
+    "QwenImage21Pipeline": (
+        "qwen_image_21",
+        "pipeline_qwen_image_21",
+        "QwenImage21Pipeline",
     ),
     "GlmImagePipeline": (
         "glm_image",
@@ -135,6 +145,11 @@ _DIFFUSION_MODELS = {
         "minimax_h3",
         "pipeline_minimax_h3",
         "MiniMaxH3Pipeline",
+    ),
+    "MiniMaxH3DecoderPipeline": (
+        "minimax_h3",
+        "pipeline_minimax_h3_decoder",
+        "MiniMaxH3DecoderPipeline",
     ),
     "AuKPipeline": (
         "auk",
@@ -426,6 +441,10 @@ _NO_CACHE_ACCELERATION = {
     "Pi0Pipeline",
     "Pi05Pipeline",
     "LingBotWorldCausalDMDPipeline",
+    # Qwen-Image 2.1's transformer carries its own prefix KV cache (keyed by CFG
+    # branch) across denoising steps, which conflicts with cache_dit / tea_cache
+    # step-skipping hooks.
+    "QwenImage21Pipeline",
 }
 
 
@@ -651,6 +670,8 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "AnimaPipeline": "get_anima_post_process_func",
     "QwenImageEditPipeline": "get_qwen_image_edit_post_process_func",
     "QwenImageEditPlusPipeline": "get_qwen_image_edit_plus_post_process_func",
+    "JoyImageEditPipeline": "get_joy_image_edit_post_process_func",
+    "QwenImage21Pipeline": "get_qwen_image_21_post_process_func",
     "GlmImagePipeline": "get_glm_image_post_process_func",
     "ZImagePipeline": "get_post_process_func",
     "OvisImagePipeline": "get_ovis_image_post_process_func",
@@ -669,6 +690,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "LTX2I2VDMD2Pipeline": "get_ltx2_post_process_func",
     "MiniMaxH3Pipeline": "get_minimax_h3_post_process_func",
     "MiniMaxH3ModularPipeline": "get_minimax_h3_post_process_func",
+    "MiniMaxH3DecoderPipeline": "get_minimax_h3_post_process_func",
     "AuKPipeline": "get_auk_post_process_func",
     "StableAudioPipeline": "get_stable_audio_post_process_func",
     "WanImageToVideoPipeline": "get_wan22_i2v_post_process_func",
@@ -740,6 +762,8 @@ _DIFFUSION_PRE_PROCESS_FUNCS = {
     "BooguImageTurboPipeline": "get_boogu_image_pre_process_func",
     "QwenImageEditPipeline": "get_qwen_image_edit_pre_process_func",
     "QwenImageEditPlusPipeline": "get_qwen_image_edit_plus_pre_process_func",
+    "JoyImageEditPipeline": "get_joy_image_edit_pre_process_func",
+    "QwenImage21Pipeline": "get_qwen_image_21_pre_process_func",
     "LongCatImageEditPipeline": "get_longcat_image_edit_pre_process_func",
     "LongCatVideoAvatarPipeline": "get_longcat_video_avatar_pre_process_func",
     "QwenImageLayeredPipeline": "get_qwen_image_layered_pre_process_func",

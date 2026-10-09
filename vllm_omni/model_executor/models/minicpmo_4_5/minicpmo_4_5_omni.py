@@ -31,6 +31,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.models.interfaces import SupportsMRoPE, SupportsMultiModal, SupportsPP
 from vllm.model_executor.models.utils import init_vllm_registered_model, maybe_prefix
 from vllm.multimodal import MULTIMODAL_REGISTRY
+from vllm.sampling_params import SamplingParams
 from vllm.sequence import IntermediateTensors
 from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
@@ -120,6 +121,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         patch_minicpmo_remote_config(config)
 
         self.model_stage = vllm_config.model_config.model_stage
+        self.model_sampler_wants_sampling_params = self.model_stage == "tts"
         self._use_v2_model_runner = bool(getattr(vllm_config.model_config, "use_v2_model_runner", False))
         if (
             self.model_stage == "llm"
@@ -879,6 +881,8 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         self,
         logits: torch.Tensor,
         sampling_metadata: SamplingMetadata,
+        *,
+        per_req_sampling_params: list[SamplingParams | None] | None = None,
     ) -> SamplerOutput | None:
         native_duplex = self._sample_minicpmo45_native_duplex_stage0(
             logits,
@@ -888,7 +892,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         if native_duplex is not None:
             return native_duplex
         if self.model_stage == "tts":
-            return self.model.sample(logits, sampling_metadata)
+            return self.model.sample(logits, sampling_metadata, per_req_sampling_params=per_req_sampling_params)
         return None
 
     def _sample_minicpmo45_native_duplex_stage0(

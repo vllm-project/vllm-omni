@@ -7,6 +7,7 @@ import sys
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -24,6 +25,26 @@ from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_code2wav import (
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+def test_encoder_precapture_failure_is_not_reported_as_lazy_fallback():
+    graph = SimpleNamespace(_failed=False)
+
+    def fail(features):
+        graph._failed = True
+        raise RuntimeError("encoder capture failed")
+
+    backend = SimpleNamespace(
+        _chunk_encoder_graph=graph,
+        precapture_hift=lambda: 0,
+        prepare_prompt=lambda *args: object(),
+        precapture_whole_euler=lambda features: 0,
+        precapture_flow_encoder=lambda features: 0,
+        precapture_chunk_encoder=fail,
+    )
+    model = SimpleNamespace(backend=backend, _normalized_default_prompt=lambda: (None, "prompt"))
+    with pytest.raises(RuntimeError, match="encoder capture failed"):
+        MiniCPMO45Code2Wav._precapture_default_prompt(model)
 
 
 class _FakeEncoder(nn.Module):
@@ -173,6 +194,36 @@ def _config(minimum: int = 1, initial: int = 0, *, runtime_prompt_cache_size: in
 
 
 @pytest.mark.parametrize(
+    ("cuda", "extra", "env", "expected"),
+    [
+        (True, {}, None, True),
+        (False, {}, None, False),
+        (True, {"cfm_fused_body": False}, None, False),
+        (True, {"token2wav_allow_tf32": False}, None, False),
+        (True, {"code2wav_allow_tf32": False}, None, False),
+        (True, {}, "off", False),
+        (True, {"token2wav_allow_tf32": False}, "tf32", True),
+        (True, {"cfm_fused_body": True, "token2wav_allow_tf32": False}, None, True),
+    ],
+)
+def test_cfm_fused_body_default_respects_platform_and_precision(monkeypatch, cuda, extra, env, expected):
+    from vllm_omni.platforms import current_omni_platform
+
+    monkeypatch.setattr(current_omni_platform, "is_cuda", lambda: cuda)
+    monkeypatch.delenv("MINICPMO_CODE2WAV_TF32", raising=False)
+    if env is not None:
+        monkeypatch.setenv("MINICPMO_CODE2WAV_TF32", env)
+    config = _config()
+    config.model_config.stage_connector_config["extra"].update(extra)
+
+    model = MiniCPMO45Code2Wav(vllm_config=config)
+
+    assert model._cfm_graph_config["fused_body"] is expected
+    assert model._cfm_graph_config["slot_pool"] is False
+    assert model._cfm_graph_config["row_offset_merge"] is False
+
+
+@pytest.mark.parametrize(
     ("extra", "max_num_seqs", "micro"),
     [
         ({}, 6, 6),
@@ -191,6 +242,63 @@ def test_whole_euler_micro_batch_defaults_to_stage_concurrency(extra, max_num_se
     assert model._cfm_graph_config["micro_batch_size"] == micro
     if "max_graph_batch" in extra:
         assert model._cfm_graph_config["max_graph_batch"] == extra["max_graph_batch"]
+
+
+@pytest.mark.parametrize("rows,expected", [(16, list(range(1, 9))), ([1, 3, 8, 16], [1, 3, 8])])
+def test_encoder_capture_batches_are_exact_and_capped_by_stage_concurrency(rows, expected):
+    config = _config()
+    config.scheduler_config = SimpleNamespace(max_num_seqs=8)
+    config.model_config.stage_connector_config["extra"].update(
+        enable_code2wav_encoder_graph=True, code2wav_encoder_graph_rows=rows
+    )
+    model = MiniCPMO45Code2Wav(vllm_config=config)
+    assert model._chunk_encoder_graph_config["rows"] == expected
+    backend = BatchedToken2Wav(_FakeToken2Wav(), chunk_encoder_graph_config=model._chunk_encoder_graph_config)
+    assert backend._chunk_encoder_graph.rows == tuple(expected)
+
+
+@pytest.mark.parametrize("rows", [0, -1, [], [0, 1]])
+def test_encoder_capture_batches_reject_invalid_configuration(rows):
+    config = _config()
+    config.model_config.stage_connector_config["extra"]["code2wav_encoder_graph_rows"] = rows
+    with pytest.raises(ValueError, match="code2wav_encoder_graph_rows"):
+        MiniCPMO45Code2Wav(vllm_config=config)
+
+
+@pytest.mark.parametrize("chunk_enabled,flow_enabled", [(False, True), (True, False), (True, True)])
+def test_encoder_graph_configs_remain_independent(monkeypatch, chunk_enabled, flow_enabled):
+    config = _config()
+    config.scheduler_config = SimpleNamespace(max_num_seqs=3)
+    config.model_config.stage_connector_config["extra"].update(
+        enable_code2wav_encoder_graph=chunk_enabled,
+        code2wav_encoder_max_graphs=2,
+        code2wav_encoder_capture_after=4,
+        cfm_encoder_cuda_graph=flow_enabled,
+        cfm_encoder_graph_rows=[1, 2, 4],
+        micro_batch_size=2,
+    )
+    model = MiniCPMO45Code2Wav(vllm_config=config)
+    flow_config = model._encoder_graph_config
+    chunk_config = model._chunk_encoder_graph_config
+    assert flow_config["enabled"] is flow_enabled
+    assert flow_config["rows"] == [1, 2]
+    sentinel = object()
+    seen = []
+
+    def build(self, options, connector):
+        seen.append(options)
+        return sentinel if options["enabled"] else None
+
+    monkeypatch.setattr(BatchedToken2Wav, "_build_encoder_graphs", build)
+    backend = BatchedToken2Wav(
+        _FakeToken2Wav(), encoder_graph_config=flow_config, chunk_encoder_graph_config=chunk_config
+    )
+    assert seen == [flow_config]
+    assert backend._encoder_graphs is (sentinel if flow_enabled else None)
+    assert (backend._chunk_encoder_graph is not None) is chunk_enabled
+    if chunk_enabled:
+        assert backend._chunk_encoder_graph.max_graphs == 2
+        assert backend._chunk_encoder_graph.capture_after == 4
 
 
 def _model(initial: int = 0, minimum: int = 1, *, runtime_prompt_cache_size: int = 4, setup_cache_size: int = 1):
@@ -1916,3 +2024,112 @@ def test_tf32_mode_reads_shipped_yaml_key(monkeypatch):
     assert _tf32_mode({}) == "tf32"
     monkeypatch.setenv("MINICPMO_CODE2WAV_TF32", "tf32x3")
     assert _tf32_mode({}) == "tf32"
+
+
+def _encoder_dispatch_backend(eager, precaptured, dynamic):
+    return SimpleNamespace(
+        flow=SimpleNamespace(training=False),
+        _ensure_relpos_pe=Mock(),
+        _encoder_graphs=precaptured,
+        _chunk_encoder_graph=dynamic,
+        _encoder_position_tables=lambda: ("pe",),
+        _encode_chunk_eager=eager,
+    )
+
+
+@torch.inference_mode()
+def test_continuation_precedes_dynamic_and_returns_owned_state():
+    tokens = torch.ones(2, 4, dtype=torch.long)
+    cnn, att = torch.ones(2, 3, 2), torch.ones(1, 2, 1, 4, 2)
+    outputs = (torch.ones(2, 8, 3), cnn.clone(), att.clone())
+    pre = Mock()
+    pre.run.return_value = outputs
+    eager, dynamic = Mock(), Mock()
+    graph = _encoder_dispatch_backend(eager, pre, dynamic)
+    tables = Mock(side_effect=AssertionError("precaptured hit must not build dynamic PE signature"))
+    graph._encoder_position_tables = tables
+    result = BatchedToken2Wav._encode_chunk(graph, tokens, last_chunk=False, cnn_cache=cnn, att_cache=att)
+    eager.assert_not_called()
+    dynamic.assert_not_called()
+    assert len(pre.run.call_args.args[1]) == len(pre.run.call_args.args[2]) == 2
+    for value in outputs:
+        value.zero_()
+    for value in result:
+        assert torch.all(value == 1)
+    states = [SimpleNamespace(flow_cache={"conformer_cnn_cache": cnn, "conformer_att_cache": att})]
+    borrowed = BatchedToken2Wav._graph_encode(graph, tokens, states)
+    assert borrowed is outputs
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize("last_chunk", [False, True])
+def test_precapture_miss_or_final_chunk_uses_dynamic(last_chunk):
+    pre = Mock()
+    pre.run.return_value = None
+    dynamic = Mock(return_value=(1, 2, 3))
+    graph = _encoder_dispatch_backend(Mock(), pre, dynamic)
+    result = BatchedToken2Wav._encode_chunk(
+        graph,
+        torch.ones(1, 4),
+        last_chunk=last_chunk,
+        cnn_cache=torch.ones(1, 2, 2),
+        att_cache=torch.ones(1, 1, 1, 4, 2),
+    )
+    assert result == (1, 2, 3)
+    assert pre.run.call_count == (0 if last_chunk else 1)
+    assert dynamic.call_args.kwargs["position_tables"] == ("pe",)
+
+
+@pytest.mark.parametrize("training", [False, True])
+def test_training_bypasses_both_graphs_and_preserves_gradients(training):
+    x = torch.ones(1, 4, requires_grad=True)
+    pre, dynamic = Mock(), Mock()
+    graph = _encoder_dispatch_backend(lambda tokens, **kw: (tokens.sin(), None, None), pre, dynamic)
+    graph.flow.training = training
+    BatchedToken2Wav._encode_chunk(graph, x, last_chunk=False, cnn_cache=x, att_cache=x)[0].sum().backward()
+    torch.testing.assert_close(x.grad, x.detach().cos())
+    pre.run.assert_not_called()
+    dynamic.assert_not_called()
+
+
+@pytest.mark.parametrize("ragged", [False, True])
+@pytest.mark.parametrize("autocast_enabled", [False, True])
+def test_decode_replays_encoder_graph_in_capture_autocast(monkeypatch, ragged, autocast_enabled):
+    adapter = BatchedToken2Wav(_FakeToken2Wav())
+    adapter.flow.eval()
+    _enable_fake_ragged_kernel(adapter)
+    prompt = adapter.prepare_prompt("shared", "/fake/prompt.wav")
+    states = adapter.setup_batch(prompt, 2)
+    # Exercise the decode entry points on CPU with the same context-matching
+    # contract as FlowEncoderGraphs.run, without requiring CUDA graph hardware.
+    monkeypatch.setattr(
+        adapter, "_autocast", lambda device: torch.autocast("cpu", dtype=torch.float16, enabled=autocast_enabled)
+    )
+    with adapter._autocast(torch.device("cpu")):
+        capture_amp = (torch.is_autocast_enabled("cpu"), torch.get_autocast_dtype("cpu"))
+    encode = adapter._encode_chunk
+    replays = []
+
+    def replay(tokens, cnn, att):
+        if (torch.is_autocast_enabled("cpu"), torch.get_autocast_dtype("cpu")) != capture_amp:
+            return None
+        replays.append(int(tokens.shape[0]))
+        return encode(
+            tokens,
+            last_chunk=False,
+            cnn_cache=torch.cat(cnn, dim=0),
+            att_cache=torch.cat(att, dim=1),
+            precaptured_checked=True,
+        )
+
+    monkeypatch.setattr(adapter, "_encoder_graphs", SimpleNamespace(run=replay))
+    monkeypatch.setattr(adapter, "_encode_chunk", Mock(side_effect=AssertionError("unexpected eager fallback")))
+    tokens = torch.tensor([[10, 11], [20, 21]])
+    with torch.inference_mode():
+        if ragged:
+            audios, next_states = adapter.decode_ragged_batch(list(tokens), prompt, states, last_chunks=[False, False])
+        else:
+            audios, next_states = adapter.decode_batch(tokens, prompt, states, last_chunk=False)
+    assert replays == [2]
+    assert len(audios) == len(next_states) == 2
+    assert all(audio.numel() > 0 for audio in audios)

@@ -526,12 +526,26 @@ class OmniDuplexSessionHandler:
 
     async def _send_event(self, session_id: str, event: DuplexEvent, *, handle: DuplexSessionHandle) -> None:
         payload = event.to_realtime()
+        is_handshake = isinstance(event, SessionCreated)
+        # ``SessionCreated`` is unjournaled. ``on_accepted`` then runs only after
+        # a successful transport send, not when a detached session merely returns.
+        # Journal acceptance (replay recorded, socket already gone) is not delivery.
         journal = not isinstance(event, _UNJOURNALED_EVENTS) and session_id not in self._resync_required_sessions
+        transport_delivered = False
+
+        def mark_transport_delivered() -> None:
+            nonlocal transport_delivered
+            transport_delivered = True
+
         event_guard = partial(handle.output_guard, event)
         try:
             try:
                 await self._attachment_registry.send_event(
-                    session_id, payload, journal=journal, event_guard=event_guard
+                    session_id,
+                    payload,
+                    journal=journal,
+                    on_accepted=mark_transport_delivered if is_handshake else None,
+                    event_guard=event_guard,
                 )
             except DuplexJournalOverflowError:
                 first_overflow = session_id not in self._resync_required_sessions
@@ -541,16 +555,46 @@ class OmniDuplexSessionHandler:
                     await self._attachment_registry.send_event(session_id, resync.to_realtime(), journal=False)
                 await self._attachment_registry.send_event(session_id, payload, journal=False, event_guard=event_guard)
         except KeyError:
-            # Attachment already closed (takeover or teardown); the journal is gone.
-            pass
+            # Attachment registry already torn down. A handshake that never left
+            # the process still has to release the engine session.
+            if is_handshake:
+                await self._close_undeliverable_session(session_id)
+            return
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            # The socket died mid-send. The session is alive in the engine:
-            # treat it as a disconnect of the current attachment (the pump
-            # keeps journaling for a resume) instead of tearing the session down.
+            # The socket died mid-send. Usual case: keep the engine session for
+            # resume (detach the current attachment; the pump keeps journaling).
+            # Exception: ``session.created`` itself never reached the client, so
+            # nobody has the session id / resume token -- detach would burn an
+            # admission slot until idle expiry. Close instead (#7636 issue 9).
+            # An in-flight send that then raises takes this path; one that
+            # completes has already set ``transport_delivered`` and must not.
             logger.info("Duplex transport send failed for %s: %s", session_id, exc)
+            if is_handshake:
+                await self._close_undeliverable_session(session_id)
+                return
             await self._detach_current_attachment(session_id)
+            return
+        if is_handshake and not transport_delivered:
+            # Reader detached before the pump reached ``session.created``.
+            # ``send_event`` returns without raising when there is no attachment
+            # and the event is not journaled.
+            await self._close_undeliverable_session(session_id)
+
+    async def _close_undeliverable_session(self, session_id: str) -> None:
+        """Tear down a session whose ``session.created`` never reached the client.
+
+        Covers a raised send and a detach that happens before the send.
+        Production admission frees after ``handle.close`` waits for
+        ``session.closed`` (manager cleanup). If close raises, the handle is
+        already marked closed and we must not detach.
+        """
+        handle = self._omni.get_session(session_id)
+        if handle is None or handle.closed:
+            return
+        with suppress(DuplexSessionError):
+            await handle.close(reason="session_created_undelivered")
 
     async def _detach_current_attachment(self, session_id: str) -> None:
         """Disconnect semantics for the socket currently attached to ``session_id``.

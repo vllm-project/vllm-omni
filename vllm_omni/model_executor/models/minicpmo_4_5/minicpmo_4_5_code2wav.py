@@ -270,6 +270,11 @@ class MiniCPMO45Code2Wav(nn.Module):
     has_preprocess = False
     has_postprocess = False
 
+    # Returned CUDA payloads own their storage (including HiFT graph results).
+    # Subsequent forwards/state updates never mutate it; the runner can retain
+    # the tensors and copy to host without taking another device snapshot.
+    owns_generation_output_storage = True
+
     def __init__(
         self,
         *,
@@ -288,6 +293,8 @@ class MiniCPMO45Code2Wav(nn.Module):
         self._runtime_prompt_dir = tempfile.TemporaryDirectory(
             prefix="minicpmo45-runtime-prompts-",
         )
+        from vllm_omni.platforms import current_omni_platform
+
         extra = self._extra_config()
         self._runtime_prompt_cache_size = int(extra.get("token2wav_runtime_prompt_cache_size", 4))
         if self._runtime_prompt_cache_size < 0:
@@ -323,14 +330,27 @@ class MiniCPMO45Code2Wav(nn.Module):
         enable_whole_euler = extra.get("enable_whole_euler")
         max_graph_batch_raw = extra.get("max_graph_batch")
         max_graph_batch = int(max_graph_batch_raw) if max_graph_batch_raw is not None else None
+        max_num_seqs = getattr(getattr(vllm_config, "scheduler_config", None), "max_num_seqs", None)
         micro_batch_size_raw = extra.get("micro_batch_size")
         if micro_batch_size_raw is not None:
             micro_batch_size = int(micro_batch_size_raw)
         else:
             # The Whole-Euler arena reserves one attention cache per micro-batch
             # row, so size it for the most requests this stage ever batches.
-            max_num_seqs = getattr(getattr(vllm_config, "scheduler_config", None), "max_num_seqs", None)
             micro_batch_size = min(int(max_num_seqs), max_graph_batch or 16) if max_num_seqs else None
+        encoder_rows = extra.get("code2wav_encoder_graph_rows", 1)
+        if isinstance(encoder_rows, (list, tuple)):
+            encoder_rows = sorted({int(row) for row in encoder_rows})
+        else:
+            encoder_rows = list(range(1, int(encoder_rows) + 1))
+        if not encoder_rows or any(row < 1 for row in encoder_rows):
+            raise ValueError("MiniCPM-o code2wav_encoder_graph_rows must be positive")
+        self._chunk_encoder_graph_config = {
+            "enabled": bool(extra.get("enable_code2wav_encoder_graph", False)),
+            "max_graphs": int(extra.get("code2wav_encoder_max_graphs", 8)),
+            "capture_after": int(extra.get("code2wav_encoder_capture_after", 2)),
+            "rows": [row for row in encoder_rows if not max_num_seqs or row <= int(max_num_seqs)],
+        }
         self._cfm_graph_config = {
             "enabled": bool(extra.get("enable_cfm_graph", False)),
             "max_graphs": int(extra.get("cfm_max_graphs", 32)),
@@ -342,7 +362,11 @@ class MiniCPMO45Code2Wav(nn.Module):
             "max_graph_batch": max_graph_batch,
             "micro_batch_size": micro_batch_size,
             "pad_max_rows": extra.get("whole_euler_pad_max_rows"),
-            "fused_body": bool(extra.get("cfm_fused_body", False)),
+            # The fused body uses tiled TF32 attention on NVIDIA SM80+;
+            # older CUDA devices retain its SDPA fallback. Respect TF32 opt-out.
+            "fused_body": bool(
+                extra.get("cfm_fused_body", current_omni_platform.is_cuda() and _tf32_mode(extra) != "off")
+            ),
             "slot_pool": bool(extra.get("cfm_slot_pool", False)),
             "row_offset_merge": extra.get("cfm_row_offset_merge", False) is True,
         }
@@ -1250,6 +1274,7 @@ class MiniCPMO45Code2Wav(nn.Module):
             connector_config=self._connector_config,
             hift_graph_config=self._hift_graph_config,
             cfm_graph_config=self._cfm_graph_config,
+            chunk_encoder_graph_config=self._chunk_encoder_graph_config,
             bfloat16_attention_cache=bool(extra.get("code2wav_bfloat16_attention_cache", False)),
             setup_cache_size=self._setup_cache_size,
             cfm_tf32=tf32_mode != "off",
@@ -1286,6 +1311,14 @@ class MiniCPMO45Code2Wav(nn.Module):
             try:
                 captured = capture()
             except Exception:
+                # Encoder capture failures poison their CUDA/NPU wrapper.
+                # Fail startup rather than promise lazy capture and fail the
+                # first user request with a restart-required error.
+                if any(
+                    getattr(getattr(backend, attr, None), "_failed", False)
+                    for attr in ("_encoder_graphs", "_chunk_encoder_graph")
+                ):
+                    raise
                 logger.warning("MiniCPM-o Code2Wav: %s precapture failed; graphs capture lazily", name, exc_info=True)
                 return False
             if captured:
@@ -1302,3 +1335,4 @@ class MiniCPMO45Code2Wav(nn.Module):
             return
         if precapture("Whole-Euler", partial(backend.precapture_whole_euler, features)):
             precapture("flow encoder", partial(backend.precapture_flow_encoder, features))
+        precapture("chunk encoder", partial(backend.precapture_chunk_encoder, features))

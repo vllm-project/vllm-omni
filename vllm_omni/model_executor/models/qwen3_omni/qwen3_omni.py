@@ -26,6 +26,7 @@ from vllm.model_executor.models.interfaces import (
     SupportsPP,
     SupportsQuant,
     SupportsRealtime,
+    supports_encoder_cudagraph,
 )
 from vllm.model_executor.models.qwen3_asr_realtime import Qwen3ASRRealtimeBuffer
 from vllm.model_executor.models.qwen3_omni_moe_thinker import (
@@ -66,6 +67,20 @@ from vllm_omni.model_executor.stage_input_processors.chunk_size_utils import par
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.utils.device_copy import to_device_nonblocking
 
+# Voice used when a request names no speaker. Matches the reference
+# ``Qwen3OmniMoeForConditionalGeneration.generate(speaker="Ethan")``; the
+# checkpoint's ``talker_config.speaker_id`` lists "chelsie" first, so taking the
+# first key would silently switch the default to a different (female) voice.
+DEFAULT_SPEAKER = "ethan"
+
+
+def resolve_default_speaker(speaker_token_ids: dict[str, int]) -> str:
+    """Return the speaker key used for requests that do not name one."""
+    if DEFAULT_SPEAKER in speaker_token_ids:
+        return DEFAULT_SPEAKER
+    return next(iter(speaker_token_ids))
+
+
 # Special token IDs for Qwen3 Omni MoE
 # Reference: https://huggingface.co/Qwen/Qwen3-Omni-30B-A3B-Instruct/blob/main/tokenizer_config.json
 
@@ -89,6 +104,24 @@ TALKER_CODEC_THINK_BOS_ID = 4204  # Think mode start
 TALKER_CODEC_THINK_EOS_ID = 4205  # Think mode end
 
 logger = init_logger(__name__)
+
+# The encoder CUDA graph protocol, forwarded from the thinker to the stage
+# wrapper that the runner inspects.
+_THINKER_ENCODER_CUDAGRAPH_MEMBERS = (
+    "supports_encoder_cudagraph",
+    "encoder_cudagraph_single_replay",
+    "get_encoder_cudagraph_config",
+    "get_input_modality",
+    "get_max_frames_per_video",
+    "get_encoder_cudagraph_budget_range",
+    "get_encoder_cudagraph_item_specs",
+    "select_encoder_cudagraph_items",
+    "prepare_encoder_cudagraph_capture_inputs",
+    "prepare_encoder_cudagraph_replay_buffers",
+    "encoder_cudagraph_forward",
+    "encoder_eager_forward",
+    "postprocess_encoder_output",
+)
 
 
 def _cpu_long(values: Any) -> torch.Tensor:
@@ -221,6 +254,12 @@ class Qwen3OmniMoeForConditionalGeneration(
             self.model = self.thinker
             self.talker = None
             self.code2wav = None
+            if supports_encoder_cudagraph(self.thinker):
+                # Expose the protocol on this stage instance only. Defining
+                # these methods on the shared class also advertises an encoder
+                # for talker/code2wav under runtime structural protocol checks.
+                for name in _THINKER_ENCODER_CUDAGRAPH_MEMBERS:
+                    setattr(self, name, getattr(self.thinker, name))
             self.tts_tokens = torch.tensor(
                 [[self.config.tts_bos_token_id, self.config.tts_eos_token_id, self.config.tts_pad_token_id]],
                 device=self._module_device(self.thinker),
@@ -527,7 +566,7 @@ class Qwen3OmniMoeForConditionalGeneration(
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
         generate_audio: bool = True,
-        voice_type: str = "ethan",
+        voice_type: str = DEFAULT_SPEAKER,
         codec: torch.Tensor | None = None,
         sampling_metadata: SamplingMetadata | None = None,
         logits_index: int | None = None,
@@ -938,7 +977,7 @@ class Qwen3OmniMoeForConditionalGeneration(
                 "prefix_caching": talker_hf_config.audio_start_token_id,
             }
 
-        self.default_tts_text_spk_type = list(self.tts_text_spk_token_ids.keys())[0]
+        self.default_tts_text_spk_type = resolve_default_speaker(self.tts_text_spk_token_ids)
 
         return set(["thinker_embedding.weight", "talker_embedding.weight"])
 
