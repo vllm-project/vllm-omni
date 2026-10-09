@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # Adapted from https://github.com/CorentinJ/Real-Time-Voice-Cloning
 # MIT License
-from typing import List, Union
 
 import numpy as np
 import torch
@@ -36,11 +35,14 @@ def pack(arrays, seq_len: int = None, pad_value=0):
     Given a list of length B of array-like objects of shapes (Ti, ...), packs them in a single tensor of
     shape (B, T, ...) by padding each individual array on the right.
 
-    :param arrays: a list of array-like objects of matching shapes except for the first axis.
-    :param seq_len: the value of T. It must be the maximum of the lengths Ti of the arrays at
-    minimum. Will default to that value if None.
-    :param pad_value: the value to pad the arrays with.
-    :return: a (B, T, ...) tensor
+    Args:
+        arrays (list): A list of array-like objects of matching shapes except for the first axis.
+        seq_len (int): The value of T. It must be the maximum of the lengths Ti of the arrays at
+            minimum. Will default to that value if None.
+        pad_value (float): The value to pad the arrays with.
+
+    Returns:
+        packed (torch.Tensor): A (B, T, ...) tensor.
     """
     if seq_len is None:
         seq_len = max(len(array) for array in arrays)
@@ -158,10 +160,16 @@ class VoiceEncoder(nn.Module):
         """
         Computes the embeddings of a batch of partial utterances.
 
-        :param mels: a batch of unscaled mel spectrograms of same duration as a float32 tensor
-        of shape (B, T, M) where T is hp.ve_partial_frames
-        :return: the embeddings as a float32 tensor of shape (B, E) where E is
-        hp.speaker_embed_size. Embeddings are L2-normed and thus lay in the range [-1, 1].
+        Args:
+            mels: A batch of unscaled mel spectrograms of same duration as a float32 tensor
+                of shape (B, T, M) where T is hp.ve_partial_frames.
+
+        Returns:
+            embeds (torch.Tensor): The embeddings as a float32 tensor of shape (B, E) where E is
+                hp.speaker_embed_size. Embeddings are L2-normed and thus lay in the range [-1, 1].
+
+        Raises:
+            Exception: If the mels are normalized and fall outside [0, 1].
         """
         if self.hp.normalized_mels and (mels.min() < 0 or mels.max() > 1):
             raise Exception(f"Mels outside [0, 1]. Min={mels.min()}, Max={mels.max()}")
@@ -183,14 +191,26 @@ class VoiceEncoder(nn.Module):
         """
         Computes the embeddings of a batch of full utterances with gradients.
 
-        :param mels: (B, T, M) unscaled mels
-        :return: (B, E) embeddings on CPU
+        Args:
+            mels: (B, T, M) unscaled mels.
+            mel_lens (torch.Tensor | list[int]): Length of each mel in `mels`, as a tensor or a list.
+            overlap (float): Fraction of a partial utterance shared with the next one.
+            rate: If given, the step between partial utterances is derived from it and the sample rate
+                instead of from `overlap`.
+            min_coverage (float): Minimum fraction of one more partial utterance that the leftover frames must cover
+                for it to be kept.
+            batch_size (int | None): Number of partial utterances embedded per forward pass, or None for all at once.
+
+        Returns:
+            embeds (torch.Tensor): (B, E) embeddings on CPU.
         """
         mel_lens = mel_lens.tolist() if torch.is_tensor(mel_lens) else mel_lens
 
         # Compute where to split the utterances into partials
         frame_step = get_frame_step(overlap, rate, self.hp)
-        n_partials, target_lens = zip(*(get_num_wins(l, frame_step, min_coverage, self.hp) for l in mel_lens))
+        n_partials, target_lens = zip(
+            *(get_num_wins(mel_len, frame_step, min_coverage, self.hp) for mel_len in mel_lens)
+        )
 
         # Possibly pad the mels to reach the target lengths
         len_diff = max(target_lens) - mels.size(1)
@@ -238,21 +258,22 @@ class VoiceEncoder(nn.Module):
         embeds_y = embeds_y if embeds_y.ndim == 1 else VoiceEncoder.utt_to_spk_embed(embeds_y)
         return embeds_x @ embeds_y
 
-    def embeds_from_mels(
-        self, mels: Union[Tensor, List[np.ndarray]], mel_lens=None, as_spk=False, batch_size=32, **kwargs
-    ):
+    def embeds_from_mels(self, mels: Tensor | list[np.ndarray], mel_lens=None, as_spk=False, batch_size=32, **kwargs):
         """
         Convenience function for deriving utterance or speaker embeddings from mel spectrograms.
 
-        :param mels: unscaled mels strictly within [0, 1] as either a (B, T, M) tensor or a list of (Ti, M) arrays.
-        :param mel_lens: if passing mels as a tensor, individual mel lengths
-        :param as_spk: whether to return utterance embeddings or a single speaker embedding
-        :param kwargs: args for inference()
+        Args:
+            mels: Unscaled mels strictly within [0, 1] as either a (B, T, M) tensor or a list of (Ti, M) arrays.
+            mel_lens (list[int] | None): If passing mels as a tensor, individual mel lengths.
+            as_spk (bool): Whether to return utterance embeddings or a single speaker embedding.
+            batch_size (int): Number of partial utterances embedded per forward pass.
+            **kwargs (dict): Args for inference().
 
-        :returns: embeds as a (B, E) float32 numpy array if <as_spk> is False, else as a (E,) array
+        Returns:
+            embeds (np.ndarray): Embeds as a (B, E) float32 array if `as_spk` is False, else as a (E,) array.
         """
         # Load mels in memory and pack them
-        if isinstance(mels, List):
+        if isinstance(mels, list):
             mels = [np.asarray(mel) for mel in mels]
             assert all(m.shape[1] == mels[0].shape[1] for m in mels), "Mels aren't in (B, T, M) format"
             mel_lens = [mel.shape[0] for mel in mels]

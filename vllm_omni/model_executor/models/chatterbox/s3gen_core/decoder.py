@@ -18,10 +18,17 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import pack, rearrange, repeat
 
-from .mask import add_optional_chunk_mask
-from .matcha_decoder import SinusoidalPosEmb, Block1D, ResnetBlock1D, Downsample1D, TimestepEmbedding, Upsample1D
-from .matcha_transformer import BasicTransformerBlock
-from .intmeanflow import get_intmeanflow_time_mixer
+from vllm_omni.model_executor.models.chatterbox.s3gen_core.intmeanflow import get_intmeanflow_time_mixer
+from vllm_omni.model_executor.models.chatterbox.s3gen_core.mask import add_optional_chunk_mask
+from vllm_omni.model_executor.models.chatterbox.s3gen_core.matcha_decoder import (
+    Block1D,
+    Downsample1D,
+    ResnetBlock1D,
+    SinusoidalPosEmb,
+    TimestepEmbedding,
+    Upsample1D,
+)
+from vllm_omni.model_executor.models.chatterbox.s3gen_core.matcha_transformer import BasicTransformerBlock
 
 
 def mask_to_bias(mask: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
@@ -48,7 +55,7 @@ class Transpose(torch.nn.Module):
 
 class CausalBlock1D(Block1D):
     def __init__(self, dim: int, dim_out: int):
-        super(CausalBlock1D, self).__init__(dim, dim_out)
+        super().__init__(dim, dim_out)
         self.block = torch.nn.Sequential(
             CausalConv1d(dim, dim_out, 3),
             Transpose(1, 2),
@@ -64,7 +71,7 @@ class CausalBlock1D(Block1D):
 
 class CausalResnetBlock1D(ResnetBlock1D):
     def __init__(self, dim: int, dim_out: int, time_emb_dim: int, groups: int = 8):
-        super(CausalResnetBlock1D, self).__init__(dim, dim_out, time_emb_dim, groups)
+        super().__init__(dim, dim_out, time_emb_dim, groups)
         self.block1 = CausalBlock1D(dim, dim_out)
         self.block2 = CausalBlock1D(dim_out, dim_out)
 
@@ -83,7 +90,7 @@ class CausalConv1d(torch.nn.Conv1d):
         device=None,
         dtype=None,
     ) -> None:
-        super(CausalConv1d, self).__init__(
+        super().__init__(
             in_channels,
             out_channels,
             kernel_size,
@@ -101,7 +108,7 @@ class CausalConv1d(torch.nn.Conv1d):
 
     def forward(self, x: torch.Tensor):
         x = F.pad(x, self.causal_padding)
-        x = super(CausalConv1d, self).forward(x)
+        x = super().forward(x)
         return x
 
 
@@ -146,9 +153,9 @@ class ConditionalDecoder(nn.Module):
         self.static_chunk_size = 0
 
         output_channel = in_channels
-        for i in range(len(channels)):  # pylint: disable=consider-using-enumerate
+        for i, channel in enumerate(channels):
             input_channel = output_channel
-            output_channel = channels[i]
+            output_channel = channel
             is_last = i == len(channels) - 1
             resnet = (
                 CausalResnetBlock1D(dim=input_channel, dim_out=output_channel, time_emb_dim=time_embed_dim)
@@ -269,19 +276,16 @@ class ConditionalDecoder(nn.Module):
         """Forward pass of the UNet1DConditional model.
 
         Args:
-            x: (B, 80, T)
-            mask (_type_)
-            t (_type_): shape (batch_size)
-            spks (_type_, optional) Defaults to None.
-            cond (_type_, optional)
-            r: end time for meanflow mode (shape (1,) tensor)
-
-        Raises:
-            ValueError: _description_
-            ValueError: _description_
+            x (torch.Tensor): Noisy mel sample, shape (B, 80, T).
+            mask (torch.Tensor): Frame mask, shape (B, 1, T).
+            mu (torch.Tensor): Encoder output the sample is conditioned on, shape (B, 80, T).
+            t (torch.Tensor): Diffusion time, shape (B,).
+            spks (torch.Tensor, optional): Speaker embedding, shape (B, spk_emb_dim). Defaults to None.
+            cond (torch.Tensor, optional): Conditioning mel, shape (B, 80, T). Defaults to None.
+            r (torch.Tensor, optional): End time for meanflow mode, shape (1,). Defaults to None.
 
         Returns:
-            _type_: _description_
+            output (torch.Tensor): The predicted velocity, shape (B, 80, T), masked by `mask`.
         """
         t = self.time_embeddings(t).to(t.dtype)
         t = self.time_mlp(t)

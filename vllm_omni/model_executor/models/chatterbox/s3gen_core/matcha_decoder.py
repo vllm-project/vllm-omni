@@ -1,15 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 import math
-from typing import Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from diffusers.models.activations import get_activation
-from einops import pack, rearrange, repeat
-
-from .matcha_transformer import BasicTransformerBlock
 
 
 class SinusoidalPosEmb(torch.nn.Module):
@@ -121,7 +117,7 @@ class TimestepEmbedding(nn.Module):
 class Upsample1D(nn.Module):
     """A 1D upsampling layer with an optional convolution.
 
-    Parameters:
+    Args:
         channels (`int`):
             number of channels in the inputs and outputs.
         use_conv (`bool`, default `False`):

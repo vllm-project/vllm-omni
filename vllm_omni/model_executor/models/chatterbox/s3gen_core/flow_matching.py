@@ -14,9 +14,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import torch
-import torch.nn.functional as F
-from .matcha_flow_matching import BASECFM
-from .configs import CFM_PARAMS
+
+from vllm_omni.model_executor.models.chatterbox.s3gen_core.configs import CFM_PARAMS
+from vllm_omni.model_executor.models.chatterbox.s3gen_core.matcha_flow_matching import BASECFM
 
 
 def cast_all(*args, dtype):
@@ -61,11 +61,17 @@ class ConditionalCFM(BASECFM):
             temperature (float, optional): temperature for scaling noise. Defaults to 1.0.
             spks (torch.Tensor, optional): speaker ids. Defaults to None.
                 shape: (batch_size, spk_emb_dim)
-            cond: Not used but kept for future purposes
+            cond (torch.Tensor, optional): Not used but kept for future purposes.
+            prompt_len (int, optional): Number of prompt frames kept in the flow cache. Defaults to 0.
+            flow_cache (torch.Tensor, optional): Noise and encoder output cached from the previous call.
+                shape: (1, n_feats, cache_size, 2)
 
         Returns:
-            sample: generated mel-spectrogram
-                shape: (batch_size, n_feats, mel_timesteps)
+            output (tuple[torch.Tensor, torch.Tensor]): The generated mel-spectrogram, shape
+                (batch_size, n_feats, mel_timesteps), and the updated flow cache.
+
+        Raises:
+            NotImplementedError: Always; this path is unused and was not updated for the meanflow model.
         """
 
         raise NotImplementedError("unused, needs updating for meanflow model")
@@ -177,14 +183,15 @@ class CausalConditionalCFM(ConditionalCFM):
             temperature (float, optional): temperature for scaling noise. Defaults to 1.0.
             spks (torch.Tensor, optional): speaker ids. Defaults to None.
                 shape: (batch_size, spk_emb_dim)
-            cond: Not used but kept for future purposes
-            noised_mels: gt mels noised a time t
+            cond (torch.Tensor, optional): Not used but kept for future purposes.
+            noised_mels (torch.Tensor, optional): gt mels noised a time t.
+            meanflow (bool, optional): Whether the estimator is a meanflow model. Defaults to False.
+
         Returns:
-            sample: generated mel-spectrogram
-                shape: (batch_size, n_feats, mel_timesteps)
+            output (tuple[torch.Tensor, None]): The generated mel-spectrogram, shape
+                (batch_size, n_feats, mel_timesteps), and None.
         """
 
-        B = mu.size(0)
         z = torch.randn_like(mu)
 
         if noised_mels is not None:

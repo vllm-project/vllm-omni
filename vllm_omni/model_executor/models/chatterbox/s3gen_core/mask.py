@@ -104,7 +104,7 @@ def add_optional_chunk_mask(
 
     Args:
         xs (torch.Tensor): padded input, (B, L, D), L for max length
-        mask (torch.Tensor): mask for xs, (B, 1, L)
+        masks (torch.Tensor): mask for xs, (B, 1, L)
         use_dynamic_chunk (bool): whether to use dynamic chunk or not
         use_dynamic_left_chunk (bool): whether to use dynamic left chunk for
             training.
@@ -124,7 +124,7 @@ def add_optional_chunk_mask(
             False: chunk size ~ U[1, 25]
 
     Returns:
-        torch.Tensor: chunk mask of the input xs.
+        chunk_masks (torch.Tensor): chunk mask of the input xs.
     """
     # Whether to use chunk mask or not
     if use_dynamic_chunk:
@@ -161,7 +161,8 @@ def add_optional_chunk_mask(
     assert chunk_masks.dtype == torch.bool
     if (chunk_masks.sum(dim=-1) == 0).sum().item() != 0:
         logging.warning(
-            "get chunk_masks all false at some timestep, force set to true, make sure they are masked in futuer computation!"
+            "get chunk_masks all false at some timestep, force set to true, "
+            "make sure they are masked in futuer computation!"
         )
         chunk_masks[chunk_masks.sum(dim=-1) == 0] = True
     return chunk_masks

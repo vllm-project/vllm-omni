@@ -18,37 +18,29 @@
 # Modified from ESPnet(https://github.com/espnet/espnet)
 """Encoder definition."""
 
-from typing import Tuple
-
 import torch
 from torch import nn
 from torch.nn import functional as F
 
-from .convolution import ConvolutionModule
-from .encoder_layer import ConformerEncoderLayer
-from .positionwise_feed_forward import PositionwiseFeedForward
-from .class_utils import (
+from vllm_omni.model_executor.models.chatterbox.s3gen_core.class_utils import (
+    COSYVOICE_ACTIVATION_CLASSES,
+    COSYVOICE_ATTENTION_CLASSES,
     COSYVOICE_EMB_CLASSES,
     COSYVOICE_SUBSAMPLE_CLASSES,
-    COSYVOICE_ATTENTION_CLASSES,
-    COSYVOICE_ACTIVATION_CLASSES,
 )
-from .mask import make_pad_mask
-from .mask import add_optional_chunk_mask
+from vllm_omni.model_executor.models.chatterbox.s3gen_core.convolution import ConvolutionModule
+from vllm_omni.model_executor.models.chatterbox.s3gen_core.encoder_layer import ConformerEncoderLayer
+from vllm_omni.model_executor.models.chatterbox.s3gen_core.mask import add_optional_chunk_mask, make_pad_mask
+from vllm_omni.model_executor.models.chatterbox.s3gen_core.positionwise_feed_forward import PositionwiseFeedForward
 
 
 class Upsample1D(nn.Module):
     """A 1D upsampling layer with an optional convolution.
 
-    Parameters:
-        channels (`int`):
-            number of channels in the inputs and outputs.
-        use_conv (`bool`, default `False`):
-            option to use a convolution.
-        use_conv_transpose (`bool`, default `False`):
-            option to use a convolution transpose.
-        out_channels (`int`, optional):
-            number of output channels. Defaults to `channels`.
+    Args:
+        channels (int): Number of channels in the inputs.
+        out_channels (int): Number of channels in the outputs.
+        stride (int): Upsampling factor. Defaults to 2.
     """
 
     def __init__(self, channels: int, out_channels: int, stride: int = 2):
@@ -244,8 +236,12 @@ class UpsampleConformerEncoder(torch.nn.Module):
         xs_lens: torch.Tensor,
         decoding_chunk_size: int = 0,
         num_decoding_left_chunks: int = -1,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Embed positions in tensor.
+
+        We pass the `__call__` method of the modules instead of `forward` to the
+        checkpointing API because `__call__` attaches all the hooks of the module.
+        https://discuss.pytorch.org/t/any-different-between-model-input-and-model-forward-input/3690/2
 
         Args:
             xs: padded input tensor (B, T, D)
@@ -255,18 +251,13 @@ class UpsampleConformerEncoder(torch.nn.Module):
                 <0: for decoding, use full chunk.
                 >0: for decoding, use fixed chunk size as set.
             num_decoding_left_chunks: number of left chunks, this is for decoding,
-            the chunk size is decoding_chunk_size.
+                the chunk size is decoding_chunk_size.
                 >=0: use num_decoding_left_chunks
                 <0: use all left chunks
+
         Returns:
-            encoder output tensor xs, and subsampled masks
             xs: padded output tensor (B, T' ~= T/subsample_rate, D)
-            masks: torch.Tensor batch padding mask after subsample
-                (B, 1, T' ~= T/subsample_rate)
-        NOTE(xcsong):
-            We pass the `__call__` method of the modules instead of `forward` to the
-            checkpointing API because `__call__` attaches all the hooks of the module.
-            https://discuss.pytorch.org/t/any-different-between-model-input-and-model-forward-input/3690/2
+            masks: batch padding mask after subsampling (B, 1, T' ~= T/subsample_rate)
         """
         T = xs.size(1)
         masks = ~make_pad_mask(xs_lens, T).unsqueeze(1)  # (B, 1, T)

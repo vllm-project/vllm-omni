@@ -3,7 +3,6 @@
 from abc import ABC
 
 import torch
-import torch.nn.functional as F
 
 
 class BASECFM(torch.nn.Module, ABC):
@@ -39,11 +38,10 @@ class BASECFM(torch.nn.Module, ABC):
             temperature (float, optional): temperature for scaling noise. Defaults to 1.0.
             spks (torch.Tensor, optional): speaker ids. Defaults to None.
                 shape: (batch_size, spk_emb_dim)
-            cond: Not used but kept for future purposes
+            cond (torch.Tensor, optional): Not used but kept for future purposes.
 
         Returns:
-            sample: generated mel-spectrogram
-                shape: (batch_size, n_feats, mel_timesteps)
+            sample (torch.Tensor): The generated mel-spectrogram, shape (batch_size, n_feats, mel_timesteps).
         """
         z = torch.randn_like(mu) * temperature
         t_span = torch.linspace(0, 1, n_timesteps + 1, device=mu.device)

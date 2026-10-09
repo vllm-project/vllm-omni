@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-from .attr_dict import AttrDict
+from vllm_omni.model_executor.models.chatterbox.s3gen_core.attr_dict import AttrDict
 
 CFM_PARAMS = AttrDict(
     {

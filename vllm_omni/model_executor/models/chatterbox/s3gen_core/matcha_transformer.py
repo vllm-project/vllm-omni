@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-from typing import Any, Dict, Optional
+from typing import Any
 
 import torch
 import torch.nn as nn
@@ -12,17 +12,15 @@ from torch.nn import Linear as LoRACompatibleLinear
 
 
 class SnakeBeta(nn.Module):
-    """
-    A modified Snake function which uses separate parameters for the magnitude of the periodic components
-    Shape:
-        - Input: (B, C, T)
-        - Output: (B, C, T), same shape as the input
-    Parameters:
-        - alpha - trainable parameter that controls frequency
-        - beta - trainable parameter that controls magnitude
-    References:
-        - This activation function is a modified version based on this paper by Liu Ziyin, Tilman Hartwig, Masahito Ueda:
-        https://arxiv.org/abs/2006.08195
+    """A modified Snake function which uses separate parameters for the magnitude of the periodic components.
+
+    The input has shape (B, C, T) and the output has the same shape. This activation function is a modified version
+    based on the paper by Liu Ziyin, Tilman Hartwig and Masahito Ueda: https://arxiv.org/abs/2006.08195
+
+    Attributes:
+        alpha: Trainable parameter that controls frequency.
+        beta: Trainable parameter that controls magnitude.
+
     Examples:
         >>> a1 = snakebeta(256)
         >>> x = torch.randn(256)
@@ -30,15 +28,18 @@ class SnakeBeta(nn.Module):
     """
 
     def __init__(self, in_features, out_features, alpha=1.0, alpha_trainable=True, alpha_logscale=True):
-        """
-        Initialization.
-        INPUT:
-            - in_features: shape of the input
-            - alpha - trainable parameter that controls frequency
-            - beta - trainable parameter that controls magnitude
-            alpha is initialized to 1 by default, higher values = higher-frequency.
-            beta is initialized to 1 by default, higher values = higher-magnitude.
-            alpha will be trained along with the rest of your model.
+        """Initialize the activation.
+
+        Alpha is initialized to 1 by default, higher values = higher-frequency.
+        Beta is initialized to 1 by default, higher values = higher-magnitude.
+        Alpha will be trained along with the rest of your model.
+
+        Args:
+            in_features (int): Shape of the input.
+            out_features (int): Number of output features of the input projection.
+            alpha (float): Initial value of the trainable parameters alpha and beta.
+            alpha_trainable (bool): Whether alpha and beta are trained.
+            alpha_logscale (bool): Whether alpha and beta are kept on a log scale.
         """
         super().__init__()
         self.in_features = out_features if isinstance(out_features, list) else [out_features]
@@ -81,7 +82,7 @@ class FeedForward(nn.Module):
     r"""
     A feed-forward layer.
 
-    Parameters:
+    Args:
         dim (`int`): The number of channels in the input.
         dim_out (`int`, *optional*): The number of channels in the output. If not given, defaults to `dim`.
         mult (`int`, *optional*, defaults to 4): The multiplier to use for the hidden dimension.
@@ -136,7 +137,7 @@ class BasicTransformerBlock(nn.Module):
     r"""
     A basic Transformer block.
 
-    Parameters:
+    Args:
         dim (`int`): The number of channels in the input and output.
         num_attention_heads (`int`): The number of heads to use for multi-head attention.
         attention_head_dim (`int`): The number of channels in each head.
@@ -147,10 +148,10 @@ class BasicTransformerBlock(nn.Module):
         double_self_attention (`bool`, *optional*):
             Whether to use two self-attention layers. In this case no cross attention layers are used.
         activation_fn (`str`, *optional*, defaults to `"geglu"`): Activation function to be used in feed-forward.
-        num_embeds_ada_norm (:
-            obj: `int`, *optional*): The number of diffusion steps used during training. See `Transformer2DModel`.
-        attention_bias (:
-            obj: `bool`, *optional*, defaults to `False`): Configure if the attentions should contain a bias parameter.
+        num_embeds_ada_norm (`int`, *optional*): The number of diffusion steps used during training.
+            See `Transformer2DModel`.
+        attention_bias (`bool`, *optional*, defaults to `False`): Configure if the attentions should contain a bias
+            parameter.
     """
 
     def __init__(
@@ -244,7 +245,7 @@ class BasicTransformerBlock(nn.Module):
         encoder_hidden_states: torch.FloatTensor | None = None,
         encoder_attention_mask: torch.FloatTensor | None = None,
         timestep: torch.LongTensor | None = None,
-        cross_attention_kwargs: Dict[str, Any] = None,
+        cross_attention_kwargs: dict[str, Any] = None,
         class_labels: torch.LongTensor | None = None,
     ):
         # Notice that normalization is always applied before the real computation in the following blocks.
@@ -294,7 +295,9 @@ class BasicTransformerBlock(nn.Module):
             # "feed_forward_chunk_size" can be used to save memory
             if norm_hidden_states.shape[self._chunk_dim] % self._chunk_size != 0:
                 raise ValueError(
-                    f"`hidden_states` dimension to be chunked: {norm_hidden_states.shape[self._chunk_dim]} has to be divisible by chunk size: {self._chunk_size}. Make sure to set an appropriate `chunk_size` when calling `unet.enable_forward_chunking`."
+                    f"`hidden_states` dimension to be chunked: {norm_hidden_states.shape[self._chunk_dim]} has to be "
+                    f"divisible by chunk size: {self._chunk_size}. Make sure to set an appropriate `chunk_size` when "
+                    "calling `unet.enable_forward_chunking`."
                 )
 
             num_chunks = norm_hidden_states.shape[self._chunk_dim] // self._chunk_size

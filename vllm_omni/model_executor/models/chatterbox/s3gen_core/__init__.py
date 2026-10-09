@@ -4,8 +4,10 @@
 
 Source: https://github.com/resemble-ai/chatterbox at commit
 5de7a54aa4e5e2baadb0182dde554908b48b85c2 (package version 0.1.7), MIT, with
-CosyVoice, ESPnet, Matcha-TTS and 3D-Speaker files under Apache-2.0. Only
-import paths were rewritten and training-only code removed (plus a demo block,
-a duplicate logger line and a missing `import logging`); see the pull
-request that added this directory for the exact edits.
+CosyVoice, ESPnet, Matcha-TTS and 3D-Speaker files under Apache-2.0. Import
+paths were rewritten and training-only code removed (plus a demo block, a
+duplicate logger line and a missing `import logging`); the code then follows
+this repository's conventions (absolute imports, lint, Google-style
+docstrings) without changing any computation. Numeric parity against the
+source package, not textual closeness, is what is checked.
 """

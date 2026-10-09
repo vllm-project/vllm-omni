@@ -17,8 +17,6 @@
 # Modified from ESPnet(https://github.com/espnet/espnet)
 """ConvolutionModule definition."""
 
-from typing import Tuple
-
 import torch
 from torch import nn
 
@@ -96,7 +94,7 @@ class ConvolutionModule(nn.Module):
         x: torch.Tensor,
         mask_pad: torch.Tensor = torch.ones((0, 0, 0), dtype=torch.bool),
         cache: torch.Tensor = torch.zeros((0, 0, 0)),
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Compute convolution module.
         Args:
             x (torch.Tensor): Input tensor (#batch, time, channels).

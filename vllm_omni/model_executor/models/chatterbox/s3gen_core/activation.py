@@ -19,7 +19,7 @@
 """Swish() activation function for Conformer."""
 
 import torch
-from torch import nn, sin, pow
+from torch import nn, pow, sin
 from torch.nn import Parameter
 
 
@@ -34,16 +34,14 @@ class Swish(torch.nn.Module):
 # Implementation adapted from https://github.com/EdwardDixon/snake under the MIT license.
 #   LICENSE is in incl_licenses directory.
 class Snake(nn.Module):
-    """
-    Implementation of a sine-based periodic activation function
-    Shape:
-        - Input: (B, C, T)
-        - Output: (B, C, T), same shape as the input
-    Parameters:
-        - alpha - trainable parameter
-    References:
-        - This activation function is from this paper by Liu Ziyin, Tilman Hartwig, Masahito Ueda:
-        https://arxiv.org/abs/2006.08195
+    """Implementation of a sine-based periodic activation function.
+
+    The input has shape (B, C, T) and the output has the same shape. This activation function is from the paper by
+    Liu Ziyin, Tilman Hartwig and Masahito Ueda: https://arxiv.org/abs/2006.08195
+
+    Attributes:
+        alpha: Trainable parameter.
+
     Examples:
         >>> a1 = snake(256)
         >>> x = torch.randn(256)
@@ -51,15 +49,18 @@ class Snake(nn.Module):
     """
 
     def __init__(self, in_features, alpha=1.0, alpha_trainable=True, alpha_logscale=False):
+        """Initialize the activation.
+
+        Alpha is initialized to 1 by default, higher values = higher-frequency.
+        Alpha will be trained along with the rest of your model.
+
+        Args:
+            in_features (int): Shape of the input.
+            alpha (float): Initial value of the trainable parameter.
+            alpha_trainable (bool): Whether alpha is trained.
+            alpha_logscale (bool): Whether alpha is kept on a log scale.
         """
-        Initialization.
-        INPUT:
-            - in_features: shape of the input
-            - alpha: trainable parameter
-            alpha is initialized to 1 by default, higher values = higher-frequency.
-            alpha will be trained along with the rest of your model.
-        """
-        super(Snake, self).__init__()
+        super().__init__()
         self.in_features = in_features
 
         # initialize alpha

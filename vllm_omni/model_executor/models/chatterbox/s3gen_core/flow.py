@@ -14,28 +14,26 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import logging
-from typing import Dict, Optional
 
 import torch
 import torch.nn as nn
-from torch.nn import functional as F
-from .mask import make_pad_mask
-from .configs import CFM_PARAMS
 from omegaconf import DictConfig
+from torch.nn import functional as F
 
+from vllm_omni.model_executor.models.chatterbox.s3gen_core.mask import make_pad_mask
 
 logger = logging.getLogger(__name__)
 
 
-def _repeat_batch_dim(tnsr, B, ndim):
+def _repeat_batch_dim(tnsr, batch_size, ndim):
     "repeat batch dimension if it's equal to 1"
     if tnsr is not None:
         # add missing batch dim if needed
         while tnsr.ndim < ndim:
             tnsr = tnsr[None]
         # repeat batch dim as needed
-        if B > 1 and tnsr.size(0) == 1:
-            tnsr = tnsr.repeat(B, *([1] * (ndim - 1)))
+        if batch_size > 1 and tnsr.size(0) == 1:
+            tnsr = tnsr.repeat(batch_size, *([1] * (ndim - 1)))
         assert tnsr.ndim == ndim, f"Expected {ndim=}, got {tnsr.ndim=}"
     return tnsr
 
@@ -54,7 +52,7 @@ class CausalMaskedDiffWithXvec(torch.nn.Module):
         pre_lookahead_len: int = 3,
         encoder: torch.nn.Module = None,
         decoder: torch.nn.Module = None,
-        decoder_conf: Dict = {
+        decoder_conf: dict = {
             "in_channels": 240,
             "out_channel": 80,
             "spk_emb_dim": 80,
@@ -79,7 +77,7 @@ class CausalMaskedDiffWithXvec(torch.nn.Module):
                 "act_fn": "gelu",
             },
         },
-        mel_feat_conf: Dict = {
+        mel_feat_conf: dict = {
             "n_fft": 1024,
             "num_mels": 80,
             "sampling_rate": 22050,

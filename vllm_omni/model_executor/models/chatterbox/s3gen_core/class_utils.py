@@ -16,26 +16,28 @@
 # limitations under the License.
 import torch
 
-from .activation import Swish
-from .subsampling import (
-    LinearNoSubsampling,
-    EmbedinigNoSubsampling,
+from vllm_omni.model_executor.models.chatterbox.s3gen_core.activation import Swish
+from vllm_omni.model_executor.models.chatterbox.s3gen_core.attention import (
+    MultiHeadedAttention,
+    RelPositionMultiHeadedAttention,
+)
+from vllm_omni.model_executor.models.chatterbox.s3gen_core.embedding import (
+    EspnetRelPositionalEncoding,
+    LearnablePositionalEncoding,
+    NoPositionalEncoding,
+    PositionalEncoding,
+    RelPositionalEncoding,
+    WhisperPositionalEncoding,
+)
+from vllm_omni.model_executor.models.chatterbox.s3gen_core.subsampling import (
     Conv1dSubsampling2,
     Conv2dSubsampling4,
     Conv2dSubsampling6,
     Conv2dSubsampling8,
+    EmbedinigNoSubsampling,
+    LegacyLinearNoSubsampling,
+    LinearNoSubsampling,
 )
-from .embedding import (
-    PositionalEncoding,
-    RelPositionalEncoding,
-    WhisperPositionalEncoding,
-    LearnablePositionalEncoding,
-    NoPositionalEncoding,
-)
-from .attention import MultiHeadedAttention, RelPositionMultiHeadedAttention
-from .embedding import EspnetRelPositionalEncoding
-from .subsampling import LegacyLinearNoSubsampling
-
 
 COSYVOICE_ACTIVATION_CLASSES = {
     "hardtanh": torch.nn.Hardtanh,
