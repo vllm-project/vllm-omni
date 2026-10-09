@@ -30,13 +30,8 @@ steps:
       - label: "MammothModa2 · Preview/Dev INT8 A/B · H100 · Single-GPU"
         key: weekly-mammoth-moda2-int8
         timeout_in_minutes: 180
-        env:
-          MAMMOTH_MODA2_PREVIEW_INT8_MODEL: wenjyanasd/MammothModa2-Preview-W8A8
-          MAMMOTH_MODA2_PREVIEW_INT8_REVISION: a745b457de0738524e4939a38fb3376a5cd03958
-          MAMMOTH_MODA2_DEV_INT8_MODEL: wenjyanasd/MammothModa2-Dev-W8A8
-          MAMMOTH_MODA2_DEV_INT8_REVISION: 17e114cdff9648d64c5d6dee19c134c320699d5a
         commands:
-          # Use the same immutable INT8 artifacts as the test module defaults.
+          # Use the immutable checkpoints pinned in the test module.
           - >-
             pytest -sv tests/e2e/offline_inference/test_mammoth_moda2_int8_quantization.py
             -m "slow and (cpu or (cuda and H100 and cards_1))"
