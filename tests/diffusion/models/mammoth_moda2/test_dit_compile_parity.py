@@ -73,6 +73,15 @@ def _call(model: Transformer2DModel, hidden_states, timestep, text_hidden_states
         )
 
 
+@pytest.fixture(autouse=True)
+def _fresh_dynamo():
+    """Cases compile the same ``TransformerBlock.forward``; without a reset a later
+    case reuses an earlier case's Dynamo cache and the compile counter sees nothing."""
+    torch._dynamo.reset()
+    yield
+    torch._dynamo.reset()
+
+
 class _CompileCounter:
     """Count Dynamo frame compilations."""
 
