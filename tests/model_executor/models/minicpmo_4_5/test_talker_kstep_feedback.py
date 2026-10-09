@@ -160,8 +160,9 @@ def _make_scheduler(*, num_spec: int, waiting=(), running=(), stage: str = "tts"
     return sched
 
 
-def _req(*, computed: int, prompt: int, spec: list[int], total: int | None = None):
+def _req(*, computed: int, prompt: int, spec: list[int], total: int | None = None, req_id: str = "r0"):
     return SimpleNamespace(
+        request_id=req_id,
         num_computed_tokens=computed,
         prompt_token_ids=[0] * prompt,
         # num_tokens is prompt + generated; the guard reads the difference to
@@ -169,6 +170,179 @@ def _req(*, computed: int, prompt: int, spec: list[int], total: int | None = Non
         num_tokens=prompt if total is None else total,
         spec_token_ids=list(spec),
     )
+
+
+def test_buffer_alignment_clears_a_stale_short_buffer():
+    """A request whose draft buffer survived from an earlier state (a duplex
+    takeover snapshot, a step whose schedule clipped it mid-batch) sits next
+    to neighbours with full buffers; the next ``schedule()`` would book 8-
+    and 4-wide spans in one step and the runner dies on the refusal. The
+    alignment pass must clear every buffer so the step schedules a uniform
+    padded single-frame span, from which the K-step resumes on its own."""
+    good = _req(computed=100, prompt=100, spec=[0] * 7, total=108, req_id="good")
+    stale = _req(computed=100, prompt=100, spec=[0] * 3, total=104, req_id="stale")
+    sched = _make_scheduler(num_spec=7, waiting=[], running=[good, stale])
+
+    sched.update_draft_token_ids(SimpleNamespace(req_ids=[], draft_token_ids=[]))
+    assert good.spec_token_ids == []
+    assert stale.spec_token_ids == []
+
+
+def test_buffer_alignment_clears_a_zero_and_full_mix():
+    """A full buffer next to an empty one is itself uneven: the next
+    ``schedule()`` books a 1+num_spec-wide row for the full buffer next to
+    a 1-wide row for the prefill chunk's empty one. The alignment pass must
+    clear the full buffer so the step stays uniform."""
+    good = _req(computed=100, prompt=100, spec=[0] * 7, total=108, req_id="good")
+    chunk = _req(computed=50, prompt=100, spec=[], total=107, req_id="chunk")
+    sched = _make_scheduler(num_spec=7, waiting=[], running=[good, chunk])
+
+    sched.update_draft_token_ids(SimpleNamespace(req_ids=[], draft_token_ids=[]))
+    assert good.spec_token_ids == []
+    assert chunk.spec_token_ids == []
+
+
+def test_buffer_alignment_keeps_a_single_value_batch():
+    """Every buffer holding the same length -- all full, or all empty -- is
+    uniform and must be left untouched."""
+    full_a = _req(computed=100, prompt=100, spec=[0] * 7, total=108, req_id="a")
+    full_b = _req(computed=110, prompt=100, spec=[0] * 7, total=118, req_id="b")
+    sched = _make_scheduler(num_spec=7, waiting=[], running=[full_a, full_b])
+    sched.update_draft_token_ids(SimpleNamespace(req_ids=[], draft_token_ids=[]))
+    assert full_a.spec_token_ids == [0] * 7
+    assert full_b.spec_token_ids == [0] * 7
+
+    empty_a = _req(computed=100, prompt=100, spec=[], total=101, req_id="a")
+    empty_b = _req(computed=110, prompt=100, spec=[], total=111, req_id="b")
+    sched = _make_scheduler(num_spec=7, waiting=[], running=[empty_a, empty_b])
+    sched.update_draft_token_ids(SimpleNamespace(req_ids=[], draft_token_ids=[]))
+    assert empty_a.spec_token_ids == []
+    assert empty_b.spec_token_ids == []
+
+
+def _sched_out(num_scheduled: dict, spec: dict):
+    return SimpleNamespace(
+        num_scheduled_tokens=num_scheduled,
+        scheduled_spec_decode_tokens=spec,
+        total_num_scheduled_tokens=sum(num_scheduled.values()),
+    )
+
+
+def test_enforce_drops_uneven_decode_spans_to_single_frame():
+    """The live repro: five decode requests leave upstream schedule() with
+    span widths 4/5/5/6/6 (per-request spec frame counts 3/4/4/5/5 derived
+    from each request's own token budget). The static-shape decode backend
+    has no graph for a narrower K-step (10-09: a uniform 3-frame rewrite
+    stalled the runner silently; stage 2 then waited 600s for chunks that
+    never came), so the batch drops to a single-frame step -- the shape the
+    backend ran at warmup -- and constant_drafts re-arms the K-step on the
+    next draftless step."""
+    reqs = {f"r{i}": r for i, r in enumerate([
+        _req(computed=100, prompt=100, spec=[0] * 3, total=104, req_id="r0"),
+        _req(computed=100, prompt=100, spec=[0] * 4, total=105, req_id="r1"),
+        _req(computed=100, prompt=100, spec=[0] * 4, total=105, req_id="r2"),
+        _req(computed=100, prompt=100, spec=[0] * 5, total=106, req_id="r3"),
+        _req(computed=100, prompt=100, spec=[0] * 5, total=106, req_id="r4"),
+    ])}
+    sched = _make_scheduler(num_spec=5, waiting=[], running=list(reqs.values()))
+    out = _sched_out(
+        {"r0": 4, "r1": 5, "r2": 5, "r3": 6, "r4": 6},
+        {"r0": [0] * 3, "r1": [0] * 4, "r2": [0] * 4, "r3": [0] * 5, "r4": [0] * 5},
+    )
+
+    sched._enforce_kstep_span_uniformity(out)
+
+    assert out.num_scheduled_tokens == {r: 1 for r in reqs}
+    # The dict itself must be emptied, not just the per-request lists: a
+    # non-empty dict still builds spec-decode metadata and sends the
+    # draftless step through the rejection sampler, which faults on NPU
+    # (10-09: temp_q.exponential_ crash -> EngineDeadError).
+    assert out.scheduled_spec_decode_tokens == {}
+    assert out.total_num_scheduled_tokens == 5
+
+
+def test_enforce_drops_drafts_when_a_plain_row_joins():
+    """A width-1 decode row (cold or drained buffer) booked next to drafted
+    rows is still uneven; the whole batch goes single-frame."""
+    cold = _req(computed=100, prompt=100, spec=[], total=101, req_id="cold")
+    armed_req = _req(computed=100, prompt=100, spec=[0] * 4, total=105, req_id="armed")
+    sched = _make_scheduler(num_spec=4, waiting=[], running=[cold, armed_req])
+    out = _sched_out({"cold": 1, "armed": 5}, {"armed": [0] * 4})
+
+    sched._enforce_kstep_span_uniformity(out)
+
+    assert out.num_scheduled_tokens == {"cold": 1, "armed": 1}
+    assert out.scheduled_spec_decode_tokens == {}
+    assert out.total_num_scheduled_tokens == 2
+
+
+def test_enforce_drops_drafts_in_a_mixed_extend_step():
+    """A streaming extend row (width > 1, no drafts) only tolerates
+    single-frame decode rows beside it."""
+    extend = _req(computed=100, prompt=100, spec=[], total=104, req_id="extend")
+    armed_req = _req(computed=100, prompt=100, spec=[0] * 4, total=105, req_id="armed")
+    sched = _make_scheduler(num_spec=4, waiting=[], running=[extend, armed_req])
+    out = _sched_out({"extend": 4, "armed": 5}, {"armed": [0] * 4})
+
+    sched._enforce_kstep_span_uniformity(out)
+
+    assert out.num_scheduled_tokens == {"extend": 4, "armed": 1}
+    assert out.scheduled_spec_decode_tokens == {}
+    assert out.total_num_scheduled_tokens == 5
+
+
+def test_enforce_keeps_a_uniform_batch_untouched():
+    """A batch that already books uniform spans must pass through with no
+    rewrite at all (no trim, no re-summary)."""
+    reqs = [_req(computed=100 + i, prompt=100, spec=[0] * 4, total=105 + i, req_id=f"r{i}") for i in range(3)]
+    sched = _make_scheduler(num_spec=4, waiting=[], running=reqs)
+    out = _sched_out(
+        {"r0": 5, "r1": 5, "r2": 5},
+        {"r0": [0] * 4, "r1": [0] * 4, "r2": [0] * 4},
+    )
+
+    sched._enforce_kstep_span_uniformity(out)
+
+    assert out.num_scheduled_tokens == {"r0": 5, "r1": 5, "r2": 5}
+    assert out.total_num_scheduled_tokens == 15
+    assert all(len(v) == 4 for v in out.scheduled_spec_decode_tokens.values())
+
+
+def test_enforce_noop_when_not_armed():
+    """Off the talker stage the pass must not rewrite upstream's output."""
+    a = _req(computed=100, prompt=100, spec=[0] * 4, total=105, req_id="a")
+    b = _req(computed=100, prompt=100, spec=[0] * 2, total=103, req_id="b")
+    sched = _make_scheduler(num_spec=4, waiting=[], running=[a, b], stage="thinker")
+    out = _sched_out({"a": 5, "b": 3}, {"a": [0] * 4, "b": [0] * 2})
+
+    sched._enforce_kstep_span_uniformity(out)
+
+    assert out.num_scheduled_tokens == {"a": 5, "b": 3}
+    assert out.total_num_scheduled_tokens == 8
+
+
+def test_guard_finishes_a_request_the_padded_width_cannot_fit():
+    """A request too close to max_model_len to carry the padded 1+num_spec
+    width schedules 1 row against the neighbours' 1+num_spec -- and padding
+    does not depend on the drafts, so dropping drafts cannot defuse that
+    mix; the runner would die on the refusal anyway. The starved request is
+    within a handful of single-frame steps of the engine's own
+    FINISHED_LENGTH_CAPPED, so the guard finishes it and the rest of the
+    batch schedules a uniform span."""
+    healthy = _req(computed=100, prompt=100, spec=[0] * 7, total=101, req_id="healthy")
+    # 4090 + 1 + 7 + 1 > 4096: the padded width does not fit.
+    starved = _req(computed=4090, prompt=100, spec=[0] * 7, total=4091, req_id="starved")
+    sched = _make_scheduler(num_spec=7, waiting=[], running=[healthy, starved])
+    sched.max_model_len = 4096
+    finished = []
+    sched.finish_requests = lambda ids, status: finished.append((ids, status))
+
+    sched._drop_talker_drafts_if_prefill_pending()
+    assert finished and finished[0][0] == ("starved",)
+    assert starved not in sched.running
+    # Only the starved request left: the batch is uniform again, so the
+    # healthy request keeps its drafts and the K-step resumes.
+    assert healthy.spec_token_ids == [0] * 7
 
 
 def test_guard_drops_drafts_when_waiting_request_pending():
@@ -313,7 +487,15 @@ def test_constant_drafts_fold_when_a_stop_truncates_a_row():
     than the step ran; its next-step schedule is short the same way, so the
     batch folds and the whole step takes the single-frame path instead of
     scheduling a non-uniform span set that ``applies`` would refuse (and
-    ``_model_forward`` would turn into a fatal error)."""
+    ``_model_forward`` would turn into a fatal error).
+
+    The fold is decided by the caller: only a request that already ran the
+    multi-frame loop -- tracked per-request in the runner's
+    ``_kstep_drafted_reqs`` -- turns ``fold_short_rows`` on. With the flag
+    off (the default) the same shape keeps drafting, which is the caller's
+    way of saying the short row belongs to a request that has never
+    multi-framed and must re-arm the K-step.
+    """
     from vllm_omni.platforms.npu.worker import talker_multiframe
 
     # Five staggered codecs, K=6: one stopped at frame 3 (4 tokens), three
@@ -329,9 +511,33 @@ def test_constant_drafts_fold_when_a_stop_truncates_a_row():
     ]
     scheduled = [5, 5, 5, 5, 5]
     assert (
-        talker_multiframe.constant_drafts(sampled, frames=6, num_reqs=5, scheduled_draft_counts=scheduled)
+        talker_multiframe.constant_drafts(
+            sampled, frames=6, num_reqs=5, scheduled_draft_counts=scheduled, fold_short_rows=True
+        )
         == [[] for _ in range(5)]
     )
+    # Default keeps the caller-decides contract: no fold without the flag.
+    assert talker_multiframe.constant_drafts(sampled, frames=6, num_reqs=5, scheduled_draft_counts=scheduled) == [
+        [talker_multiframe.CONTINUE_TOKEN_ID] * 5 for _ in range(5)
+    ]
+
+
+def test_constant_drafts_cold_start_short_row_still_drafts():
+    """A short row from a request that never multi-framed must draft even
+    with ``fold_short_rows`` on, or the K-step deadlocks on "no drafts
+    emitted": the step after a fold schedules one token per request again,
+    so every row looks short, and folding those too would starve the loop
+    forever (the three-tier bench stall, 31/32 requests)."""
+    from vllm_omni.platforms.npu.worker import talker_multiframe
+
+    # Both rows sat on a draftless step (scheduled=0): one produced one
+    # token, the other a full-width row. Neither is a stop truncation.
+    sampled = [[5], [1, 2, 3, 4, 5, 6]]
+    scheduled = [0, 0]
+    drafts = talker_multiframe.constant_drafts(
+        sampled, frames=6, num_reqs=2, scheduled_draft_counts=scheduled, fold_short_rows=True
+    )
+    assert drafts == [[talker_multiframe.CONTINUE_TOKEN_ID] * 5 for _ in range(2)]
 
 
 def test_constant_drafts_fold_when_a_row_samples_nothing():

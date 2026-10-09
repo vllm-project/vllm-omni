@@ -576,6 +576,7 @@ def constant_drafts(
     frames: int,
     num_reqs: int,
     scheduled_draft_counts: list[int] | None = None,
+    fold_short_rows: bool = False,
 ) -> list[list[int]]:
     """`continue` repeated -- for the whole batch, or for none of it.
 
@@ -589,10 +590,16 @@ def constant_drafts(
     authoritative split between the two one-token shapes that must not be
     confused:
 
-    * a row of length < ``frames`` on a step that *did* carry drafts is a
-      stop row firing mid-span: the rejection sampler truncated it to the
-      frames it accepted, so its next-step schedule is j+1 wide against the
-      neighbours' K -- non-uniform, fold the batch;
+    * a row shorter than the step's own schedule (1 sampled +
+      ``scheduled`` drafts) on a step that *did* carry drafts is a stop
+      row firing mid-span: the rejection sampler truncated it to the
+      frames it accepted, so its next-step schedule is j+1 wide against
+      the neighbours' K -- non-uniform, fold the batch. A row exactly as
+      wide as the step scheduled is *not* a stop even below ``frames``:
+      the scheduler itself shortened the span (the uniform rewrite in
+      ``omni_ar_scheduler``), and this step must emit drafts or the
+      scheduler's booked frames never reach stage 2 and the requests
+      starve;
     * a row of length 1 on a step that carried *no* drafts is the expected
       shape of a prefill result or of an ordinary one-frame step (an
       intentional single-frame fallback, or the step right after such a
@@ -604,6 +611,15 @@ def constant_drafts(
 
     Mixed batches -- some requests drafted, some not -- cannot share a span
     and fold. So: every request drafts, or nobody does.
+
+    ``fold_short_rows`` gates the stop-truncated-row folding above. The
+    caller (``npu_ar_model_runner.propose``) is the only place that can tell
+    a *live* short row -- a request that already ran multi-frame and fired
+    its codec stop mid-span, which must fold or the neighbours schedule
+    against a dead speaker -- from a row that merely looks short because its
+    step's drafts were scheduler padding: that request re-drafted is what
+    keeps the K-step alive across the padding step. Passing the flag False
+    keeps the pre-split behaviour of never folding on row length.
 
     When ``scheduled_draft_counts`` is None the caller predates the scheduler
     split and every row is assumed to sit on a drafted step.
@@ -619,7 +635,16 @@ def constant_drafts(
             return [[] for _ in range(num_reqs)]
         scheduled = scheduled_draft_counts[index] if scheduled_draft_counts is not None else frames - 1
         if scheduled > 0:
-            if isinstance(sampled, list) and len(sampled) < frames:
+            # Width test against the step's own schedule, not against
+            # ``frames``: a row of exactly ``scheduled + 1`` sampled ids is a
+            # step the scheduler itself shortened to a uniform sub-``frames``
+            # span (the non-uniform rewrite) -- folding it starves the
+            # pipeline (the scheduler booked ``scheduled`` frames the runner
+            # then never emits; stage 2 waits 600s and errors the requests,
+            # observed 10-09: rewrite to a uniform 3-frame batch, rows len 4
+            # against frames=8, folded, 4 requests dead). Only a row shorter
+            # than the step scheduled is a real codec stop.
+            if fold_short_rows and isinstance(sampled, list) and len(sampled) < scheduled + 1:
                 _log_block_once("a request stopped mid-step, short of its drafts; no drafts this step")
                 return [[] for _ in range(num_reqs)]
             saw_drafted = True

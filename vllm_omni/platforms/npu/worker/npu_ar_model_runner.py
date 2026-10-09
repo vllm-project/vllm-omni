@@ -246,6 +246,34 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             scheduled = getattr(scheduler_output, "scheduled_spec_decode_tokens", None) or {}
             req_ids = list(getattr(self.input_batch, "req_ids", []) or [])
             scheduled_draft_counts = [len(scheduled.get(req_id, ())) for req_id in req_ids[: self.input_batch.num_reqs]]
+            # Fold a short row only on a request that has already run the
+            # multi-frame loop, tracked per-request in `_kstep_drafted_reqs`.
+            # A cold-start row -- length 1, the request never multi-frame --
+            # must draft or the K-step deadlocks on "no drafts emitted"; a
+            # short row on a *live* multi-frame request is a codec stop fired
+            # mid-span and must fold, or the step that re-drafts it walks the
+            # dead speaker through frames that no longer belong to its audio.
+            # One batch can mix both kinds of row, which is why the flag is
+            # per-request history and not a batch-level toggle: a batch flag
+            # either deadlocks the cold start or re-drafts a live short row
+            # the step after a fold (observed 09-30: spans 4,5,5,5,6 refused
+            # as non-uniform right after a fold cleared the flag).
+            drafted_reqs = getattr(self, "_kstep_drafted_reqs", None)
+            if drafted_reqs is None:
+                drafted_reqs = self._kstep_drafted_reqs = set()
+            # A finished request leaves req_ids; drop it here. Without this a
+            # stop-truncated step would leave its request in the set forever,
+            # but re-drafting is deferred only while live short rows remain,
+            # so the non-uniform raise stays unreachable.
+            drafted_reqs.intersection_update(req_ids)
+            rows = valid_sampled_token_ids if isinstance(valid_sampled_token_ids, list) else []
+            has_live_short_row = any(
+                count > 0
+                and isinstance(row, list)
+                and len(row) < frames
+                and req_id in drafted_reqs
+                for count, row, req_id in zip(scheduled_draft_counts, rows, req_ids)
+            )
             if not isinstance(valid_sampled_token_ids, list):
                 # The padded-drafter branch passes the verify output tensor;
                 # `constant_drafts` can only read list rows, so if we ever
@@ -268,7 +296,13 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                 frames,
                 self.input_batch.num_reqs,
                 scheduled_draft_counts,
+                fold_short_rows=has_live_short_row,
             )
+            if any(drafts):
+                # This batch just booked a multi-frame step: every request in
+                # it has now run multi-frame, so a later short row on any of
+                # them must fold until it drains (see the note above).
+                drafted_reqs.update(req_ids)
             if not any(drafts):
                 # Dump the rows as they were seen. An all-empty batch here is
                 # the stall signature: name WHICH request and what shape the
