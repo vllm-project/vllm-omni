@@ -524,7 +524,7 @@ class _MetadataBlock(_Block):
         batch, seq, _ = hidden_states.shape
         qkv = torch.sin(self.to_qkv(hidden_states)).view(batch, seq, 3, _HEADS, _HEAD_SIZE)
         query, key, value = qkv.unbind(2)
-        out = self.attn(query, key, value, AttentionMetadata(extra={"backend_private": 1}))
+        out = self.attn(query, key, value, AttentionMetadata(extra={"backend_private": torch.ones(1)}))
         return hidden_states + torch.cos(self.to_out(out.reshape(batch, seq, _HIDDEN)))
 
 
@@ -629,16 +629,59 @@ def test_scheduled_op_returns_a_fresh_contiguous_tensor_and_rejects_a_wrong_shap
     query = torch.randn(1, _SEQ, _HEADS, _HEAD_SIZE)
 
     monkeypatch.setattr(attn, "_forward_impl", lambda q, k, v, md=None: q)
-    out = layer_mod._scheduled_attention_op(query, query, query, None, attn._schedule_op_id, False)
+    out = layer_mod._scheduled_attention_op(query, query, query, None, attn._schedule_op_id, "-", [])
     assert torch.equal(out, query) and out.untyped_storage().data_ptr() != query.untyped_storage().data_ptr()
 
     monkeypatch.setattr(attn, "_forward_impl", lambda q, k, v, md=None: q.transpose(1, 2))
     with pytest.raises(RuntimeError, match="compiled graph expects"):
-        layer_mod._scheduled_attention_op(query, query, query, None, attn._schedule_op_id, False)
+        layer_mod._scheduled_attention_op(query, query, query, None, attn._schedule_op_id, "-", [])
 
 
 def test_op_metadata_rule_covers_every_attention_metadata_field():
     from dataclasses import fields
 
-    carried_or_checked = {"attn_mask", "extra", "joint_strategy"}
+    carried_or_checked = {"attn_mask", "extra", "joint_strategy", "video_layout"}
     assert {f.name for f in fields(AttentionMetadata)} - carried_or_checked == set(layer_mod._SCHEDULED_OP_NONE_FIELDS)
+
+
+def test_op_metadata_round_trips_layouts_and_scalar_extras():
+    from vllm_omni.diffusion.attention.backends.abstract import VideoTokenLayout
+
+    mask = torch.ones(1, 4, dtype=torch.bool)
+    metadata = AttentionMetadata(
+        attn_mask=mask,
+        extra={"vsa_dit_seq_shape": (3, 8, 8), "preserve_vsa_all_blocks": True, "valid_kv_length": 5, "ids": [1, 2]},
+        video_layout=VideoTokenLayout(prefix_len=0, latent_grid=(3, 8, 8), used_len=192),
+    )
+    spec, ints = layer_mod._encode_scheduled_op_metadata(metadata)
+    assert spec == "M;Liig;Xids=l2;Xpreserve_vsa_all_blocks=b1;Xvalid_kv_length=i;Xvsa_dit_seq_shape=t3"
+    assert ints == [0, 192, 3, 8, 8, 1, 2, 5, 3, 8, 8]
+    decoded = layer_mod._decode_scheduled_op_metadata(mask, spec, ints)
+    assert decoded == metadata and decoded.extra is not metadata.extra
+    assert layer_mod._encode_scheduled_op_metadata(None) == ("-", [])
+    assert layer_mod._decode_scheduled_op_metadata(None, "-", []) is None
+    empty = layer_mod._encode_scheduled_op_metadata(AttentionMetadata())
+    assert layer_mod._decode_scheduled_op_metadata(None, *empty) == AttentionMetadata()
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        AttentionMetadata(extra={"gate_compress": torch.ones(1)}),
+        AttentionMetadata(extra={"scale": 0.5}),
+        AttentionMetadata(extra={"kv_cache_dtype": "fp8"}),
+        AttentionMetadata(joint_query=torch.ones(1)),
+        AttentionMetadata(joint_strategy="rear"),
+    ],
+    ids=["tensor", "float", "string", "joint", "rear"],
+)
+def test_op_metadata_it_cannot_carry_returns_none(metadata):
+    assert layer_mod._encode_scheduled_op_metadata(metadata) is None
+
+
+def test_op_metadata_with_video_spans_keeps_the_boundary():
+    from vllm_omni.diffusion.attention.backends.abstract import VideoTokenLayout, VideoTokenSpan
+
+    span = VideoTokenSpan(start=0, latent_grid=(1, 2, 2), role="target")
+    metadata = AttentionMetadata(video_layout=VideoTokenLayout(used_len=4, video_spans=(span,)))
+    assert layer_mod._encode_scheduled_op_metadata(metadata) is None

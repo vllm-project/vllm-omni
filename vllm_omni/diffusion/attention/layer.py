@@ -7,6 +7,7 @@
 # https://github.com/feifeibear/long-context-attention/blob/main/yunchang/attention/layer.py
 
 
+import functools
 import itertools
 import json
 import weakref
@@ -21,7 +22,12 @@ from vllm.logger import init_logger
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheSpec
 
-from vllm_omni.diffusion.attention.backends.abstract import AttentionBackend, AttentionImpl, AttentionMetadata
+from vllm_omni.diffusion.attention.backends.abstract import (
+    AttentionBackend,
+    AttentionImpl,
+    AttentionMetadata,
+    VideoTokenLayout,
+)
 from vllm_omni.diffusion.attention.backends.sdpa import SDPABackend, SDPAImpl
 from vllm_omni.diffusion.attention.capabilities import (
     ExecutionContext,
@@ -89,7 +95,8 @@ _SCHEDULED_ATTENTION_LAYERS: "weakref.WeakValueDictionary[int, Attention]" = wea
 _SCHEDULED_ATTENTION_IDS = itertools.count()
 
 # AttentionMetadata fields that must hold their default (None) for a compiled call to use the
-# scheduled-attention op. The op carries only attn_mask; any other metadata keeps the eager boundary.
+# scheduled-attention op. The op carries attn_mask, plain-integer video_layout and plain-scalar extra
+# entries (see _encode_scheduled_op_metadata); any other metadata keeps the eager boundary.
 _SCHEDULED_OP_NONE_FIELDS = (
     "joint_attn_mask",
     "joint_query",
@@ -97,9 +104,137 @@ _SCHEDULED_OP_NONE_FIELDS = (
     "joint_value",
     "full_attn_spans",
     "query_ranges",
-    "video_layout",
     "packed_padding",
 )
+# Spec of a call without metadata; any other spec starts with "M".
+_NO_METADATA_SPEC = "-"
+
+
+def _is_op_int(value: Any) -> bool:
+    # A bool is an int subclass; bools travel in the spec instead.
+    return (isinstance(value, int) and not isinstance(value, bool)) or isinstance(value, torch.SymInt)
+
+
+def _encode_scheduled_op_metadata(attn_metadata: AttentionMetadata | None) -> tuple[str, list[Any]] | None:
+    """Split metadata into a structure string and its integers for ``vllm_omni::scheduled_attention``.
+
+    Runs while tracing. The string holds only names, types and booleans, which are the same on every
+    call from one call site, so it never adds a guard that a new shape or step would fail. The
+    integers may be symbolic sizes; they become ``SymInt[]`` operands, so a new resolution does not
+    recompile the block either. ``attn_mask`` travels as its own tensor operand.
+
+    Carried: ``video_layout`` with plain ``prefix_len``/``latent_grid``/``used_len`` and no
+    ``video_spans``, and ``extra`` entries whose values are None, a bool, an int or a tuple/list of
+    ints. Returns None for anything else (tensors, floats or strings in ``extra``, video spans, joint
+    tensors, packed padding, ranges, a non-default ``joint_strategy``, a metadata subclass), which
+    keeps the eager boundary.
+    """
+    if attn_metadata is None:
+        return _NO_METADATA_SPEC, []
+    if type(attn_metadata) is not AttentionMetadata or attn_metadata.joint_strategy != "front":
+        return None
+    for name in _SCHEDULED_OP_NONE_FIELDS:
+        if getattr(attn_metadata, name) is not None:
+            return None
+    spec = "M"
+    ints: list[Any] = []
+    layout = attn_metadata.video_layout
+    if layout is not None:
+        if type(layout) is not VideoTokenLayout or layout.video_spans:
+            return None
+        spec += ";L"
+        for field_value in (layout.prefix_len, layout.used_len):
+            if field_value is None:
+                spec += "n"
+            elif _is_op_int(field_value):
+                spec += "i"
+                ints.append(field_value)
+            else:
+                return None
+        grid = layout.latent_grid
+        if grid is None:
+            spec += "n"
+        elif isinstance(grid, tuple) and len(grid) == 3 and all(_is_op_int(dim) for dim in grid):
+            spec += "g"
+            ints.extend(grid)
+        else:
+            return None
+    for key in sorted(attn_metadata.extra):
+        if not isinstance(key, str) or not key or ";" in key or "=" in key:
+            return None
+        value = attn_metadata.extra[key]
+        if value is None:
+            kind = "n"
+        elif isinstance(value, bool):
+            kind = "b1" if value else "b0"
+        elif _is_op_int(value):
+            kind = "i"
+            ints.append(value)
+        elif isinstance(value, (tuple, list)) and all(_is_op_int(item) for item in value):
+            kind = ("t" if isinstance(value, tuple) else "l") + str(len(value))
+            ints.extend(value)
+        else:
+            return None
+        spec += ";X" + key + "=" + kind
+    return spec, ints
+
+
+@functools.lru_cache(maxsize=256)
+def _parse_scheduled_op_spec(spec: str) -> tuple[tuple[str, ...] | None, tuple[tuple[str, str, int], ...]]:
+    """Parse a spec from ``_encode_scheduled_op_metadata`` once per call site.
+
+    Returns the layout field codes (or None) and, per ``extra`` key, ``(key, kind, int count)``.
+    """
+    if not spec.startswith("M"):
+        raise RuntimeError(f"malformed scheduled attention metadata spec {spec!r}")
+    layout: tuple[str, ...] | None = None
+    extra: list[tuple[str, str, int]] = []
+    for part in spec[1:].split(";")[1:]:
+        if part.startswith("L") and len(part) == 4 and layout is None:
+            layout = tuple(part[1:])
+            continue
+        key, sep, kind = part[1:].partition("=")
+        if not part.startswith("X") or not sep:
+            raise RuntimeError(f"malformed scheduled attention metadata spec {spec!r}")
+        if kind == "i":
+            count = 1
+        elif kind[:1] in ("t", "l"):
+            count = int(kind[1:])
+        else:
+            count = 0
+        extra.append((key, kind, count))
+    return layout, tuple(extra)
+
+
+def _decode_scheduled_op_metadata(
+    attn_mask: torch.Tensor | None, spec: str, ints: list[int]
+) -> AttentionMetadata | None:
+    """Rebuild the metadata ``_encode_scheduled_op_metadata`` split, with fresh containers."""
+    if spec == _NO_METADATA_SPEC:
+        return None
+    layout_codes, extra_codes = _parse_scheduled_op_spec(spec)
+    values = iter(ints)
+    video_layout = None
+    if layout_codes is not None:
+        prefix_code, used_code, grid_code = layout_codes
+        prefix_len = next(values) if prefix_code == "i" else None
+        used_len = next(values) if used_code == "i" else None
+        grid = (next(values), next(values), next(values)) if grid_code == "g" else None
+        video_layout = VideoTokenLayout(prefix_len=prefix_len, latent_grid=grid, used_len=used_len)
+    extra: dict[str, Any] = {}
+    for key, kind, count in extra_codes:
+        if kind == "n":
+            extra[key] = None
+        elif kind in ("b0", "b1"):
+            extra[key] = kind == "b1"
+        elif kind == "i":
+            extra[key] = next(values)
+        else:
+            items = [next(values) for _ in range(count)]
+            extra[key] = tuple(items) if kind[0] == "t" else items
+    if next(values, None) is not None:
+        raise RuntimeError(f"scheduled attention metadata spec {spec!r} does not match {len(ints)} integers")
+    return AttentionMetadata(attn_mask=attn_mask, extra=extra, video_layout=video_layout)
 
 
 def _run_scheduled_attention(
@@ -108,7 +243,8 @@ def _run_scheduled_attention(
     value: torch.Tensor,
     attn_mask: torch.Tensor | None,
     layer_id: torch.Tensor,
-    has_metadata: bool,
+    metadata_spec: str,
+    metadata_ints: list[int],
 ) -> torch.Tensor:
     """Eager body of ``vllm_omni::scheduled_attention``: the layer's full ``_forward_impl``.
 
@@ -119,7 +255,7 @@ def _run_scheduled_attention(
     layer = _SCHEDULED_ATTENTION_LAYERS.get(int(layer_id))
     if layer is None:
         raise RuntimeError(f"scheduled attention layer {int(layer_id)} is not registered")
-    metadata = AttentionMetadata(attn_mask=attn_mask) if has_metadata else None
+    metadata = _decode_scheduled_op_metadata(attn_mask, metadata_spec, metadata_ints)
     out = layer._forward_impl(query, key, value, metadata)
     expected = (*query.shape[:-1], value.shape[-1])
     if tuple(out.shape) != expected or out.dtype != query.dtype or out.device != query.device:
@@ -144,12 +280,13 @@ if not hasattr(torch.ops.vllm_omni, "scheduled_attention"):
         value: torch.Tensor,
         attn_mask: torch.Tensor | None,
         layer_id: torch.Tensor,
-        has_metadata: bool,
+        metadata_spec: str,
+        metadata_ints: list[int],
     ) -> torch.Tensor:
-        return _run_scheduled_attention(query, key, value, attn_mask, layer_id, has_metadata)
+        return _run_scheduled_attention(query, key, value, attn_mask, layer_id, metadata_spec, metadata_ints)
 
     @_scheduled_attention_op.register_fake
-    def _scheduled_attention_fake(query, key, value, attn_mask, layer_id, has_metadata):
+    def _scheduled_attention_fake(query, key, value, attn_mask, layer_id, metadata_spec, metadata_ints):
         return query.new_empty((*query.shape[:-1], value.shape[-1]))
 
 
@@ -692,7 +829,10 @@ class Attention(nn.Module):
             # timestep. Traced, those values would become guards and each new step or range
             # boundary would recompile the enclosing graph. The decision uses only the
             # construction-time flag, so a layer without a startup schedule adds no boundary.
-            if self._schedule_op_eligible(query, key, value, attn_metadata):
+            encoded = (
+                _encode_scheduled_op_metadata(attn_metadata) if self._schedule_op_eligible(query, key, value) else None
+            )
+            if encoded is not None:
                 # One opaque node: the enclosing block stays a single graph, and the selection
                 # runs when the op executes.
                 return _scheduled_attention_op(
@@ -701,7 +841,7 @@ class Attention(nn.Module):
                     value,
                     None if attn_metadata is None else attn_metadata.attn_mask,
                     self._schedule_op_id,
-                    attn_metadata is not None,
+                    *encoded,
                 )
             return self._forward_schedule_compile_boundary(query, key, value, attn_metadata)
         if torch.compiler.is_compiling() and self._uses_hsdp_compile_boundary():
@@ -724,33 +864,19 @@ class Attention(nn.Module):
         _SCHEDULED_ATTENTION_LAYERS[op_id] = self
         self._schedule_op_id = torch.tensor(op_id, dtype=torch.int64)
 
-    def _schedule_op_eligible(
-        self,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        attn_metadata: AttentionMetadata | None,
-    ) -> bool:
-        """Whether a compiled call can use the scheduled-attention op instead of the eager boundary.
+    def _schedule_op_eligible(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor) -> bool:
+        """Whether this layer and call can use the scheduled-attention op instead of the eager boundary.
 
-        Evaluated while tracing, on structure only (never on the step). The op carries Q/K/V and an
-        optional ``attn_mask``; anything else keeps ``_forward_schedule_compile_boundary``: other
-        metadata, HSDP (its own boundary), Scheduler-managed paged KV (writes cache state the op
-        does not declare), and autograd (the op has no backward).
+        Evaluated while tracing, on structure only (never on the step). HSDP (its own boundary),
+        Scheduler-managed paged KV (writes cache state the op does not declare) and autograd (the op
+        has no backward) keep ``_forward_schedule_compile_boundary``, as does metadata that
+        ``_encode_scheduled_op_metadata`` cannot carry.
         """
         if getattr(self, "_schedule_op_id", None) is None or self._uses_hsdp_compile_boundary():
             return False
         if self._scheduler_paged_kv and self.paged_kv_cache_role is not None:
             return False
-        if torch.is_grad_enabled() and (query.requires_grad or key.requires_grad or value.requires_grad):
-            return False
-        if attn_metadata is None:
-            return True
-        if type(attn_metadata) is not AttentionMetadata or attn_metadata.extra:
-            return False
-        if attn_metadata.joint_strategy != "front":
-            return False
-        return all(getattr(attn_metadata, name) is None for name in _SCHEDULED_OP_NONE_FIELDS)
+        return not (torch.is_grad_enabled() and (query.requires_grad or key.requires_grad or value.requires_grad))
 
     def _uses_hsdp_compile_boundary(self) -> bool:
         if self._hsdp_compile_boundary_enabled:
