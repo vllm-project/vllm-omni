@@ -16,6 +16,7 @@ Currently implemented:
 - TestFlux2Extractor: Flux2 model extractor
 - TestFluxExtractor: Flux model extractor
 - TestMiniMaxH3Extractor: MiniMaxH3DiTModel extractor
+- TestSD3Extractor: SD3Transformer2DModel extractor
 """
 
 import math
@@ -36,6 +37,7 @@ from vllm_omni.diffusion.cache.teacache.extractors import (
     extract_flux_context,
     extract_mammoth_moda2_context,
     extract_minimax_h3_context,
+    extract_sd3_context,
     extract_zimage_context,
 )
 from vllm_omni.diffusion.cache.teacache.hook import apply_teacache_hook
@@ -50,6 +52,7 @@ from vllm_omni.diffusion.models.mammoth_moda2.mammothmoda2_dit_model import (
 )
 from vllm_omni.diffusion.models.mammoth_moda2.pipeline_mammothmoda2_dit import MammothModa2DiTPipeline
 from vllm_omni.diffusion.models.mammoth_moda2.rope_real import RotaryPosEmbedReal
+from vllm_omni.diffusion.models.sd3.sd3_transformer import SD3Transformer2DModel
 
 pytestmark = [pytest.mark.core_model]
 
@@ -302,6 +305,166 @@ class TestMammothModa2Extractor(BaseExtractorTest):
 
         should_compute_full.assert_called_once()
         torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.cpu
+class TestSD3Extractor(BaseExtractorTest):
+    """Test extract_sd3_context against a tiny SD3Transformer2DModel."""
+
+    @pytest.fixture(autouse=True)
+    def cpu_vllm_config(self):
+        """Force CPU custom-op dispatch for this test class."""
+        from vllm.config import DeviceConfig, VllmConfig, set_current_vllm_config
+
+        with set_current_vllm_config(VllmConfig(device_config=DeviceConfig(device="cpu"))):
+            yield
+
+    @pytest.fixture(autouse=True)
+    def sdpa_attention_backend(self):
+        """Use the SDPA backend so SD3 can be instantiated in CPU tests."""
+        from vllm_omni.diffusion.attention.backends.sdpa import SDPABackend
+
+        with patch(
+            "vllm_omni.diffusion.attention.layer.get_attn_backend_for_role",
+            return_value=(SDPABackend, None),
+        ):
+            yield
+
+    @pytest.fixture(autouse=True)
+    def single_rank_groups(self):
+        """Run as a single TP rank without an initialized CFG process group."""
+        tp_group = MagicMock(world_size=1, rank_in_group=0)
+        with (
+            patch("vllm.distributed.parallel_state.get_tp_group", return_value=tp_group),
+            patch(
+                "vllm_omni.diffusion.cache.teacache.hook.get_classifier_free_guidance_world_size",
+                return_value=1,
+            ),
+        ):
+            yield
+
+    def get_extractor(self):
+        return extract_sd3_context
+
+    @pytest.fixture
+    def sd3_module(self):
+        # Same layout as SD3.5-Medium (dual attention in the first block, last
+        # block is context_pre_only), shrunk to 2 blocks with inner_dim=16.
+        tf_config = SimpleNamespace(
+            num_layers=2,
+            sample_size=8,
+            in_channels=4,
+            out_channels=4,
+            num_attention_heads=2,
+            attention_head_dim=8,
+            caption_projection_dim=16,
+            pooled_projection_dim=8,
+            joint_attention_dim=12,
+            patch_size=2,
+            dual_attention_layers=[0],
+            qk_norm="rms_norm",
+            pos_embed_max_size=16,
+        )
+        od_config = SimpleNamespace(tf_model_config=tf_config, parallel_config=SimpleNamespace())
+        torch.manual_seed(0)
+        module = SD3Transformer2DModel(od_config=od_config)
+        # vLLM linear layers allocate uninitialized weights; give every parameter real values.
+        with torch.no_grad():
+            for param in module.parameters():
+                param.normal_(std=0.02)
+        return module.eval()
+
+    def get_module(self, sd3_module):
+        return sd3_module
+
+    @pytest.fixture
+    def sample_inputs(self):
+        generator = torch.Generator().manual_seed(0)
+        return {
+            "hidden_states": torch.randn(1, 4, 8, 8, generator=generator),
+            "encoder_hidden_states": torch.randn(1, 5, 12, generator=generator),
+            "pooled_projections": torch.randn(1, 8, generator=generator),
+            "timestep": torch.tensor([500.0]),
+            "return_dict": False,
+        }
+
+    def get_sample_inputs(self, sample_inputs):
+        return sample_inputs
+
+    @staticmethod
+    def _negative_inputs(sample_inputs):
+        generator = torch.Generator().manual_seed(1)
+        return {
+            **sample_inputs,
+            "encoder_hidden_states": torch.randn(1, 5, 12, generator=generator),
+            "pooled_projections": torch.zeros(1, 8),
+        }
+
+    def test_context_shapes_and_postprocess(self, sd3_module, sample_inputs):
+        with torch.no_grad():
+            context = extract_sd3_context(sd3_module, **sample_inputs)
+            context.validate()
+            # 8x8 latent with patch_size 2 -> 16 image tokens of width inner_dim=16.
+            assert context.modulated_input.shape == (1, 16, 16)
+            assert context.hidden_states.shape == (1, 16, 16)
+            # Only the image stream is cached; the text stream is not part of the output.
+            assert context.encoder_hidden_states is None
+
+            (hidden_states,) = context.run_transformer_blocks()
+            output = context.postprocess(hidden_states)
+
+        assert isinstance(output, tuple)
+        assert output[0].shape == (1, 4, 8, 8)
+
+    @pytest.mark.parametrize("return_dict", [False, True])
+    def test_forced_full_compute_matches_original_forward(self, sd3_module, sample_inputs, monkeypatch, return_dict):
+        inputs = {**sample_inputs, "return_dict": return_dict}
+        with torch.no_grad():
+            expected = sd3_module(**inputs)
+
+        config = TeaCacheConfig(transformer_type="SD3Transformer2DModel", rel_l1_thresh=0.1)
+        apply_teacache_hook(sd3_module, config)
+        hook = sd3_module._hook_registry.get_hook("teacache")
+        should_compute_full = Mock(return_value=True)
+        monkeypatch.setattr(hook, "_should_compute_full_transformer", should_compute_full)
+
+        with torch.no_grad():
+            actual = sd3_module(**inputs)
+
+        should_compute_full.assert_called_once()
+        assert type(actual) is type(expected)
+        torch.testing.assert_close(actual[0], expected[0])
+
+    def test_cfg_branches_keep_separate_state(self, sd3_module, sample_inputs, monkeypatch):
+        # Zero coefficients make every step after the first a cache hit, so the
+        # number of full computations equals the number of branch states.
+        config = TeaCacheConfig(
+            transformer_type="SD3Transformer2DModel",
+            coefficients=[0, 0, 0, 0, 0],
+            rel_l1_thresh=999.0,
+        )
+        apply_teacache_hook(sd3_module, config)
+        first_block = sd3_module.transformer_blocks[0]
+        block_forward = Mock(wraps=first_block.forward)
+        monkeypatch.setattr(first_block, "forward", block_forward)
+
+        # StableDiffusion3Pipeline.diffuse sets this flag; sequential CFG then
+        # alternates positive and negative calls.
+        sd3_module.do_true_cfg = True
+        negative_inputs = self._negative_inputs(sample_inputs)
+        with torch.no_grad():
+            sd3_module(**sample_inputs)
+            sd3_module(**negative_inputs)
+            assert block_forward.call_count == 2
+
+            positive_cached = sd3_module(**sample_inputs)
+            negative_cached = sd3_module(**negative_inputs)
+            assert block_forward.call_count == 2
+
+        hook = sd3_module._hook_registry.get_hook("teacache")
+        assert set(hook.state_manager._states) == {"teacache_positive", "teacache_negative"}
+        # Each branch replays its own residual, so the two cached outputs differ.
+        assert not torch.allclose(positive_cached[0], negative_cached[0])
 
 
 class TestFlux2KleinExtractor(BaseExtractorTest):
