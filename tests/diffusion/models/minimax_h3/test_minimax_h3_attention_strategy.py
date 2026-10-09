@@ -224,7 +224,7 @@ def test_minimax_forward_capture_and_reuse(monkeypatch, request, device, compile
         )
         resized_references = {}
         for step in steps:
-            resized_references[step] = model._attention_strategy_runner._eager_forwards[step](**resized)
+            resized_references[step] = model.forward_with_attention_layout(attention_layout=step, **resized)
             with override_forward_context(ForwardContext(denoise_step_idx=step, total_denoise_steps=len(steps))):
                 torch.testing.assert_close(model(**resized), resized_references[step], **tolerances)
         warmed_count = len(graphs)

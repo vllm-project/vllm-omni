@@ -1832,9 +1832,7 @@ class MiniMaxH3DiTModel(nn.Module):
         if inverse_indices.shape[0] != seq_len:
             raise ValueError(f"inverse_indices must be [{seq_len}], got {list(inverse_indices.shape)}")
         device = x.device
-        single_device_strategy = (
-            self.attention_execution.local_tensor_forward and self.attention_execution.ulysses_degree == 1
-        )
+        single_device_strategy = self.attention_execution.single_device_strategy
         local_span = (0, seq_len) if single_device_strategy else self._rope_local_span(seq_len)
         local_start, local_len = local_span
         rope_table = kwargs.get("rope_table")

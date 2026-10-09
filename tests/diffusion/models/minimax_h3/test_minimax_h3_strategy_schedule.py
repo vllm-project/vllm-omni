@@ -31,9 +31,7 @@ def test_minimax_recipe_schedule_and_dense_refiner():
     strategy.validate_inventory(operations)
     for total in (4, 20, 21, 35, 50):
         for step in range(total):
-            layout = next(
-                index for end, index in ForwardStrategyPlan.from_strategy(strategy).resolve_steps(total) if step < end
-            )
+            layout = ForwardStrategyPlan.from_strategy(strategy).layout_for_step(step, total)
             for operation in operations:
                 selected = strategy.assignments(operation)[layout]
                 assert (getattr(selected, "name", None) == "block_sparse") == (
@@ -42,9 +40,7 @@ def test_minimax_recipe_schedule_and_dense_refiner():
                 if operation.role == "minimax_h3.token_refiner":
                     assert selected.backend == "FLASH_ATTN"
     restored = AttentionConfig(**asdict(config))
-    assert ForwardStrategyPlan.from_strategy(restored.strategy).resolve_steps(35) == ForwardStrategyPlan.from_strategy(
-        strategy
-    ).resolve_steps(35)
+    assert ForwardStrategyPlan.from_strategy(restored.strategy) == ForwardStrategyPlan.from_strategy(strategy)
 
 
 def test_minimax_exception_clears_strategy_progress():
@@ -56,7 +52,6 @@ def test_minimax_exception_clears_strategy_progress():
 
     def interrupted_model(**kwargs):
         assert context.denoise_step_idx == 0 and context.total_denoise_steps == 2
-        context.attention_strategy_schedule = (object(), 2, ((2, 0),))
         raise RuntimeError("interrupted")
 
     with override_forward_context(context), pytest.raises(RuntimeError, match="interrupted"):
@@ -71,4 +66,3 @@ def test_minimax_exception_clears_strategy_progress():
             device=torch.device("cpu"),
         )
     assert context.denoise_step_idx is None and context.total_denoise_steps is None
-    assert context.attention_strategy_schedule is None
