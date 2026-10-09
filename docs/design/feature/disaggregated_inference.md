@@ -9,6 +9,7 @@ Backend-specific setup lives in separate docs:
 - [MooncakeStoreConnector](omni_connectors/mooncake_store_connector.md)
 - [MooncakeTransferEngineConnector](omni_connectors/mooncake_transfer_engine_connector.md)
 - [MoriTransferEngineConnector](omni_connectors/mori_transfer_engine_connector.md)
+- [NixlConnector](omni_connectors/nixl_connector.md)
 - [YuanrongConnector](omni_connectors/yuanrong_connector.md)
 - [YuanrongTransferEngineConnector](omni_connectors/yuanrong_transfer_engine_connector.md)
 
@@ -25,6 +26,7 @@ Current connectors operate in D2H2D (device to host to device) mode.
 | Multi node (Mooncake Store) | MooncakeStoreConnector | TCP-based, requires Mooncake Master + metadata server. |
 | Multi node (Mooncake RDMA) | MooncakeTransferEngineConnector | RDMA/TCP direct transfer with managed memory pool. Fastest. |
 | Multi node (Mori RDMA) | MoriTransferEngineConnector | RDMA direct transfer via Mori IOEngine. |
+| Multi node (NIXL) | NixlConnector | NIXL `READ` over UCX; the only backend covering Intel XPU. |
 | Multi node (Yuanrong) | YuanrongConnector | Requires Yuanrong Datasystem + etcd. |
 | Ascend NPU P2P (Yuanrong TE) | YuanrongTransferEngineConnector | Uses Yuanrong TransferEngine directly. Configure NPU device IPv4 and `memory_pool_device: "npu"`. |
 

@@ -322,6 +322,11 @@ def is_pipeline_last_stage():
 
 
 # CFG
+def is_cfg_group_initialized() -> bool:
+    """Return whether the classifier-free-guidance group has been created."""
+    return _CFG is not None
+
+
 def get_cfg_group() -> GroupCoordinator:
     assert _CFG is not None, "classifier_free_guidance parallel group is not initialized"
     return _CFG
@@ -432,6 +437,17 @@ def init_distributed_environment(
         assert _WORLD.world_size == torch.distributed.get_world_size(), (
             "world group already initialized with a different world size"
         )
+
+    # Now, initialize vLLM's distributed environment; we need to do this before initializing
+    # model parallel in Omni. Otherwise, if we use vLLM's native coordinator, we may run into
+    # issues with _NODE_COUNT / _WORLD (in vLLM, not the Omni _WORLD var above) being unset.
+    vllm_parallel_state.init_distributed_environment(
+        world_size=world_size,
+        rank=rank,
+        distributed_init_method=distributed_init_method,
+        local_rank=local_rank,
+        backend=backend,
+    )
 
 
 def model_parallel_is_initialized():
@@ -1056,8 +1072,8 @@ def destroy_distributed_environment():
     if _WORLD:
         _WORLD.destroy()
     _WORLD = None
-    if torch.distributed.is_initialized():
-        torch.distributed.destroy_process_group()
+    # We only need to destroy / clear the Omni world; this takes care of the torch process groups
+    vllm_parallel_state.destroy_distributed_environment()
 
 
 def destroy_distributed_env():

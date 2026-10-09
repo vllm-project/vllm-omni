@@ -49,14 +49,13 @@ def create_diffusion_client(
     od_config: OmniDiffusionConfig,
     metadata: StageMetadata,
     stage_init_timeout: int,
-    batch_size: int = 1,
     use_inline: bool = False,
 ) -> Any:
     """Factory to create either an inline or out-of-process diffusion client."""
     if use_inline:
         from vllm_omni.diffusion.inline_stage_diffusion_client import InlineStageDiffusionClient
 
-        return InlineStageDiffusionClient(model, od_config, metadata, batch_size=batch_size)
+        return InlineStageDiffusionClient(model, od_config, metadata)
     proc_manager = StageDiffusionProcManager(
         model=model,
         od_config=od_config,
@@ -67,7 +66,6 @@ def create_diffusion_client(
         request_address=proc_manager.addresses.inputs[0],
         response_address=proc_manager.addresses.outputs[0],
         proc_manager=proc_manager,
-        batch_size=batch_size,
     )
 
 
@@ -91,14 +89,12 @@ class StageDiffusionClient(StageClientBase):
         response_address: str,
         *,
         proc_manager: StageDiffusionProcManager | None = None,
-        batch_size: int = 1,
     ) -> None:
         self._initialize_client(
             metadata,
             request_address,
             response_address,
             proc_manager=proc_manager,
-            batch_size=batch_size,
         )
 
     @classmethod
@@ -109,7 +105,6 @@ class StageDiffusionClient(StageClientBase):
         response_address: str,
         *,
         proc_manager: StageDiffusionProcManager | None = None,
-        batch_size: int = 1,
     ) -> StageDiffusionClient:
         """Create a client for an already-running diffusion subprocess."""
         return cls(
@@ -117,7 +112,6 @@ class StageDiffusionClient(StageClientBase):
             request_address,
             response_address,
             proc_manager=proc_manager,
-            batch_size=batch_size,
         )
 
     def _initialize_client(
@@ -127,7 +121,6 @@ class StageDiffusionClient(StageClientBase):
         response_address: str,
         *,
         proc_manager: StageDiffusionProcManager | None = None,
-        batch_size: int,
     ) -> None:
         self._set_stage_metadata(metadata)
         self._proc_manager = proc_manager
@@ -144,11 +137,10 @@ class StageDiffusionClient(StageClientBase):
             self._start_proc_monitor()
 
         logger.info(
-            "[StageDiffusionClient] stage-%s [rep-%s] initialized (owns_process=%s, batch_size=%d)",
+            "[StageDiffusionClient] stage-%s [rep-%s] initialized (owns_process=%s)",
             self.stage_id,
             self.replica_id,
             self._proc_manager is not None,
-            batch_size,
         )
 
     def _set_stage_metadata(self, metadata: StageMetadata) -> None:
@@ -347,6 +339,8 @@ class StageDiffusionClient(StageClientBase):
         prompt: OmniPromptType,
         sampling_params: OmniDiffusionSamplingParams,
         kv_sender_info: dict[int, dict[str, Any]] | None = None,
+        kv_transfer_params: dict[str, Any] | None = None,
+        payload_sender_info: dict[str, Any] | None = None,
     ) -> None:
         if self._engine_dead:
             raise EngineDeadError()
@@ -356,7 +350,7 @@ class StageDiffusionClient(StageClientBase):
             self.replica_id,
             request_id,
         )
-        self._request_socket.send(
+        self._send_request(
             self._encoder.encode(
                 {
                     "type": "add_request",
@@ -364,9 +358,23 @@ class StageDiffusionClient(StageClientBase):
                     "prompt": prompt,
                     "sampling_params": self._sampling_params_to_dict(sampling_params),
                     "kv_sender_info": kv_sender_info,
+                    "kv_transfer_params": kv_transfer_params,
+                    "payload_sender_info": payload_sender_info,
                 }
             )
         )
+
+    def _send_request(self, data: bytes) -> None:
+        # The subprocess can die before _engine_dead is set, and a blocking send to it never returns.
+        while True:
+            try:
+                self._request_socket.send(data, flags=zmq.NOBLOCK)
+                return
+            except zmq.Again:
+                if self._proc_manager is not None and not self._proc_manager.proc.is_alive():
+                    self._engine_dead = True
+                    raise EngineDeadError() from None
+                self._request_socket.poll(100, zmq.POLLOUT)
 
     def get_diffusion_output_nowait(self) -> OmniRequestOutput | None:
         self._drain_responses()
@@ -399,14 +407,21 @@ class StageDiffusionClient(StageClientBase):
             return None
 
     async def abort_requests_async(self, request_ids: list[str]) -> None:
-        self._request_socket.send(
-            self._encoder.encode(
-                {
-                    "type": "abort",
-                    "request_ids": list(request_ids),
-                }
+        if self._engine_dead:
+            return
+        try:
+            # The subprocess can die before _engine_dead is set, and a blocking send to it never returns.
+            self._request_socket.send(
+                self._encoder.encode(
+                    {
+                        "type": "abort",
+                        "request_ids": list(request_ids),
+                    }
+                ),
+                flags=zmq.NOBLOCK,
             )
-        )
+        except zmq.Again:
+            pass
 
     async def submit_interaction_async(
         self,
@@ -447,9 +462,7 @@ class StageDiffusionClient(StageClientBase):
 
         kwargs = kwargs or {}
         rpc_id = uuid.uuid4().hex
-        self._pending_rpcs.add(rpc_id)
-
-        self._request_socket.send(
+        self._send_request(
             self._encoder.encode(
                 {
                     "type": "collective_rpc",
@@ -461,6 +474,7 @@ class StageDiffusionClient(StageClientBase):
                 }
             )
         )
+        self._pending_rpcs.add(rpc_id)
 
         deadline = time.monotonic() + timeout if timeout else None
         # Wait for the matching RPC response, buffering result messages.
@@ -510,13 +524,28 @@ class StageDiffusionClient(StageClientBase):
 
     def shutdown(self) -> None:
         self._shutting_down = True
+        shutdown_requested = False
         try:
-            self._request_socket.send(self._encoder.encode({"type": "shutdown"}))
+            # A blocking send never returns once the subprocess is gone.
+            self._request_socket.send(self._encoder.encode({"type": "shutdown"}), flags=zmq.NOBLOCK)
+            shutdown_requested = True
         except Exception:
             pass
 
         if self._proc_manager is not None and self._proc_manager.proc.is_alive():
-            self._proc_manager.shutdown(timeout=10)
+            if self._proc_manager.distributed_executor_backend == "ray":
+                # Let the subprocess kill its remote actors before terminating it.
+                stopped = shutdown_requested and self._proc_manager.wait_for_shutdown(timeout=10.0)
+                if not stopped:
+                    logger.warning(
+                        "Stage-%d Ray diffusion subprocess did not stop within %.1fs; "
+                        "falling back to signal-based shutdown",
+                        self.stage_id,
+                        10.0,
+                    )
+                    self._proc_manager.shutdown(timeout=10.0)
+            else:
+                self._proc_manager.shutdown(timeout=10.0)
 
         self._request_socket.close(linger=0)
         self._response_socket.close(linger=0)

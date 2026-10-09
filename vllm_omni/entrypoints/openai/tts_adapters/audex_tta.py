@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Audex (Nemotron-Labs-Audex-2B) text-to-audio serving adapter.
 
 Caption → general audio through the ``audex_tta`` pipeline.
@@ -8,6 +9,7 @@ completes the sampling parameters with the RVQ phase-mask contract
 scale 3.0 — guidance is effectively mandatory for TTA quality).
 """
 
+import os
 from typing import TYPE_CHECKING, Any
 
 from vllm_omni.entrypoints.openai.tts_adapters import register_tts_adapter
@@ -31,6 +33,27 @@ class AudexTTAAdapter(ARTTSAdapter):
 
     stage_keys = frozenset({"audex_tta_thinker"})
     name = "audex_tta"
+
+    def __init__(self, ctx) -> None:
+        super().__init__(ctx)
+        self._tokenizer = None
+        self._tta_rvq = None
+
+    def _get_tokenizer(self):
+        """Load and cache the tokenizer used only by the Audex TTA adapter."""
+        if self._tokenizer is None:
+            from transformers import AutoTokenizer
+
+            from vllm_omni.model_executor.models.audex.checkpoint import ensure_audex_snapshot
+
+            model_path = os.path.normpath(self.ctx.engine_client.model_config.model)
+            root = (
+                os.path.dirname(model_path)
+                if os.path.basename(model_path).startswith("checkpoint_folder")
+                else ensure_audex_snapshot(model_path, profile="tta")
+            )
+            self._tokenizer = AutoTokenizer.from_pretrained(os.path.join(root, "checkpoint_folder_audiogen"))
+        return self._tokenizer
 
     def validate(self, request: "OpenAICreateSpeechRequest") -> str | None:
         if not request.input or not request.input.strip():
@@ -95,7 +118,6 @@ class AudexTTAAdapter(ARTTSAdapter):
         state (``cfg_pair_id``/``cfg_null_prompt``) into it would race
         concurrent requests and leak stale CFG metadata into later ones.
         """
-        server = self.ctx.server
         import copy
 
         from vllm_omni.model_executor.models.audex.prompt import build_tta_null_prompt
@@ -106,10 +128,10 @@ class AudexTTAAdapter(ARTTSAdapter):
             raise ValueError("Audex TTA requires the adapter-built caption prompt")
 
         stage0_params = copy.deepcopy(stage0_params)
-        tokenizer = server._get_audex_tokenizer()
-        if server._audex_tta_rvq is None:
+        tokenizer = self._get_tokenizer()
+        if self._tta_rvq is None:
             phase_token_ids, start_tid, end_tid = build_tta_phase_token_ids(tokenizer)
-            server._audex_tta_rvq = {
+            self._tta_rvq = {
                 "phase_token_ids": phase_token_ids,
                 "start_tid": start_tid,
                 "end_tid": end_tid,
@@ -123,7 +145,7 @@ class AudexTTAAdapter(ARTTSAdapter):
         if extra_args is None:
             extra_args = {}
             stage0_params.extra_args = extra_args
-        extra_args["tta_rvq"] = server._audex_tta_rvq
+        extra_args["tta_rvq"] = self._tta_rvq
 
         cfg_scale = extra_args.get("cfg_scale")
         cfg_scale = 3.0 if cfg_scale is None else float(cfg_scale)

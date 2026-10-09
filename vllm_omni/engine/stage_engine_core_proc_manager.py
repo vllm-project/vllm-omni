@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """Process manager for omni stage engine subprocesses.
 
@@ -31,7 +31,7 @@ from vllm.platforms import current_platform
 from vllm.utils import numa_utils
 from vllm.utils.system_utils import get_mp_context
 from vllm.v1.engine.utils import CoreEngineProcManager
-from vllm.v1.executor import Executor
+from vllm.v1.executor import Executor, UniProcExecutor
 from vllm.v1.utils import shutdown
 
 from vllm_omni.engine.stage_engine_core_proc import StageEngineCoreProc
@@ -75,12 +75,19 @@ class StageEngineCoreProcManager(CoreEngineProcManager):
         omni_replica_base_id: int = 0,
         client_handshake_address: str | None = None,
         tensor_queue: Queue | None = None,
+        omni_parallel_stage_init: bool = False,
     ) -> None:
         # NOTE: we intentionally do not call ``super().__init__`` — the
         # parent's body hardcodes the wrong target. We re-implement it here
         # while reusing the parent's instance methods (shutdown, monitor).
         if local_engine_count <= 0:
             raise ValueError(f"local_engine_count must be > 0, got {local_engine_count}")
+
+        # Mirrors the vLLM 0.29 parent __init__: the inherited shutdown() reads
+        # this to bound how long in-flight requests may drain. Omitting it makes
+        # shutdown raise AttributeError, which leaves the engine core
+        # subprocesses alive and hangs interpreter exit until the job timeout.
+        self._request_shutdown_timeout = vllm_config.shutdown_timeout
 
         context = get_mp_context()
         common_kwargs: dict[str, object] = {
@@ -92,6 +99,7 @@ class StageEngineCoreProcManager(CoreEngineProcManager):
             "tensor_queue": tensor_queue,
             "omni_stage_id": int(omni_stage_id),
             "omni_coordinator_address": omni_coordinator_address,
+            "omni_parallel_stage_init": bool(omni_parallel_stage_init),
         }
 
         if client_handshake_address:
@@ -147,11 +155,13 @@ class StageEngineCoreProcManager(CoreEngineProcManager):
 
                 with (
                     device_control_context,
+                    # UniProcExecutor runs its worker in this process, so its
+                    # worker CPU list must apply at the EngineCore spawn.
                     numa_utils.configure_subprocess(
                         vllm_config,
                         local_rank=0,
                         dp_local_rank=local_dp_rank,
-                        process_kind="EngineCore",
+                        process_kind="worker" if issubclass(executor_class, UniProcExecutor) else "EngineCore",
                     ),
                 ):
                     proc.start()

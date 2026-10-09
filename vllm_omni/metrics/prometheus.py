@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from prometheus_client import Counter, Gauge, Histogram
 
 from vllm_omni.metrics import definitions as defs
@@ -72,7 +75,7 @@ _image_pixels_family = Histogram(
     labelnames=_labelnames,
 )
 _peak_memory_family = Gauge(
-    defs.PEAK_MEMORY_MB,
+    defs.PEAK_MEMORY_MB_METRIC,
     "Peak GPU memory in MB observed during a stage's generation.",
     labelnames=list(defs.DIFFUSION_LABELS),
 )

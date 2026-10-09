@@ -1,0 +1,46 @@
+# Ming-Image Design and Design-Layer two-stage deployment.
+pipeline: ming_image
+async_chunk: false
+
+trust_remote_code: false
+distributed_executor_backend: mp
+dtype: bfloat16
+enable_prefix_caching: false
+
+stages:
+  - stage_id: 0
+    enforce_eager: true
+    tensor_parallel_size: 1
+    devices: "0"
+    gpu_memory_utilization: 0.55
+    max_num_seqs: 1
+    output_connectors:
+      to_stage_1: shared_memory_connector
+    default_sampling_params:
+      max_tokens: 1
+      temperature: 0
+      seed: 42
+
+  - stage_id: 1
+    enforce_eager: false
+    diffusion_compile_granularity: regional
+    diffusion_compile_dynamic: true
+    tensor_parallel_size: 1
+    devices: "1"
+    max_num_seqs: 1
+    input_connectors:
+      from_stage_0: shared_memory_connector
+    default_sampling_params:
+      seed: 42
+
+connectors:
+  shared_memory_connector:
+    name: SharedMemoryConnector
+
+edges:
+  - from: 0
+    to: 1
+    window_size: -1
+    max_inflight: 1
+
+platforms: {}

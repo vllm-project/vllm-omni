@@ -91,7 +91,11 @@ def _minimal_model(mocker: MockerFixture):
         decoder=decoder,
         config=SimpleNamespace(avg_pooler=2, stride_size=2, hop_length=240),
     )
-    model._tokenizer_service = SimpleNamespace(audio_tokenizer=audio_tok, cuda_graph_wrapper=None)
+    model._tokenizer_service = SimpleNamespace(
+        audio_tokenizer=audio_tok,
+        cuda_graph_wrapper=None,
+        device="cpu",
+    )
     return model, audio_tok
 
 

@@ -9,13 +9,22 @@ import pytest
 import torch
 from torch import nn
 
-from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import Wan22Pipeline
+from vllm_omni.diffusion.media import VideoTensorEncoding, VideoTensorLayout, VideoValueRange
+from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import Wan22Pipeline, build_wan_scheduler
 from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import WanSelfAttention
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
+
+
+@pytest.fixture(autouse=True)
+def _cpu_pipeline_runtime(monkeypatch):
+    # These lightweight pipelines have no accelerator or distributed groups.
+    module = importlib.import_module("vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2")
+    monkeypatch.setattr(module.current_omni_platform, "is_available", lambda: False)
+    monkeypatch.setattr("vllm_omni.diffusion.distributed.parallel_state._PP", SimpleNamespace(world_size=1))
 
 
 class _StubTransformer(nn.Module):
@@ -30,14 +39,30 @@ class _StubTextEncoder(nn.Module):
         return torch.float32
 
 
+class _StubVaeConfig:
+    latents_mean = [0.0, 0.0, 0.0, 0.0]
+    latents_std = [1.0, 1.0, 1.0, 1.0]
+    z_dim = 4
+
+
+class _StubVae(nn.Module):
+    dtype = torch.float32
+    config = _StubVaeConfig()
+
+    def decode(self, latents, return_dict=False):
+        del return_dict
+        batch, _, frames, height, width = latents.shape
+        return (torch.zeros(batch, 3, frames, height, width),)
+
+
 class _StubScheduler:
     def __init__(self, timesteps: list[int]) -> None:
         self.timesteps = torch.tensor(timesteps, dtype=torch.int64)
         self.config = SimpleNamespace(num_train_timesteps=1000)
-        self.set_timesteps_calls: list[tuple[int, torch.device]] = []
+        self.set_timesteps_calls: list[tuple[int, torch.device, float | None]] = []
 
-    def set_timesteps(self, num_steps: int, device: torch.device) -> None:
-        self.set_timesteps_calls.append((num_steps, device))
+    def set_timesteps(self, num_steps: int, device: torch.device, shift: float | None = None) -> None:
+        self.set_timesteps_calls.append((num_steps, device, shift))
 
 
 @contextmanager
@@ -75,6 +100,7 @@ def _make_pipeline() -> Wan22Pipeline:
     pipeline.transformer = _StubTransformer()
     pipeline.transformer_2 = None
     pipeline.text_encoder = _StubTextEncoder()
+    pipeline.vae = _StubVae()
     pipeline.transformer_config = SimpleNamespace(patch_size=(1, 2, 2), in_channels=4, out_channels=4)
     pipeline.scheduler = _StubScheduler([9, 5])
     pipeline.od_config = SimpleNamespace(flow_shift=5.0)
@@ -166,7 +192,24 @@ def test_forward_delegates_denoising_to_diffuse(
     assert captured["boundary_timestep"] == pytest.approx(875.0)
     assert captured["latent_condition"] is None
     assert captured["first_frame_mask"] is None
-    assert pipeline.scheduler.set_timesteps_calls == [(2, torch.device("cpu"))]
+    assert pipeline.scheduler.set_timesteps_calls == [(2, torch.device("cpu"), 5.0)]
+
+
+@pytest.mark.parametrize("solver", ["unipc", "euler"])
+def test_forward_passes_request_shift_without_mutating_scheduler_config(solver: str) -> None:
+    pipeline = _make_pipeline()
+    pipeline.diffuse = lambda **kwargs: kwargs["latents"]
+    for shift in (3.0, 12.0, 5.0):
+        sampling = _make_sampling(num_inference_steps=5, extra_args={"sample_solver": solver, "flow_shift": shift})
+        request = OmniDiffusionRequest(prompt="prompt", request_id="schedule", sampling_params=sampling)
+        pipeline.forward(DiffusionRequestBatch(requests=[request]))
+        reference = build_wan_scheduler(solver, shift)
+        if solver == "unipc":
+            reference.set_timesteps(5, device="cpu", shift=shift)
+            assert pipeline.scheduler.config.shift == pipeline.scheduler.config["shift"] == 1.0
+        else:
+            reference.set_timesteps(5, device="cpu")
+        torch.testing.assert_close(pipeline.scheduler.sigmas, reference.sigmas, rtol=0, atol=0)
 
 
 def test_forward_batches_text_generators_latents_and_splits_outputs() -> None:
@@ -225,6 +268,99 @@ def test_forward_batches_text_generators_latents_and_splits_outputs() -> None:
     assert len(outputs) == 2
     torch.testing.assert_close(outputs[0].output, latents_a)
     torch.testing.assert_close(outputs[1].output, latents_b)
+
+
+def test_forward_emits_request_local_typed_media_after_vae_decode() -> None:
+    pipeline = _make_pipeline()
+
+    def _fake_diffuse(
+        *,
+        latents,
+        timesteps,
+        prompt_embeds,
+        negative_prompt_embeds,
+        guidance_low,
+        guidance_high,
+        boundary_timestep,
+        dtype,
+        attention_kwargs,
+        latent_condition,
+        first_frame_mask,
+        generator,
+    ):
+        del (
+            timesteps,
+            prompt_embeds,
+            negative_prompt_embeds,
+            guidance_low,
+            guidance_high,
+            boundary_timestep,
+            dtype,
+            attention_kwargs,
+            latent_condition,
+            first_frame_mask,
+            generator,
+        )
+        return torch.zeros_like(latents)
+
+    pipeline.diffuse = _fake_diffuse  # type: ignore[method-assign]
+    batch = DiffusionRequestBatch(
+        requests=[
+            OmniDiffusionRequest(
+                prompt="prompt",
+                request_id="request-0",
+                sampling_params=OmniDiffusionSamplingParams(
+                    num_frames=1,
+                    num_inference_steps=2,
+                    max_sequence_length=32,
+                    output_type="np",
+                ),
+            )
+        ]
+    )
+
+    outputs = pipeline.forward(batch)
+
+    assert len(outputs) == 1
+    assert outputs[0].output is None
+    assert outputs[0].media is not None
+    assert outputs[0].media.prepared_for_transport is False
+    assert outputs[0].media.video.tensor.shape == (1, 3, 1, 8, 8)
+    assert outputs[0].media.video.spec.layout is VideoTensorLayout.BCTHW
+    assert outputs[0].media.video.spec.encoding is VideoTensorEncoding.NORMALIZED_FLOAT
+    assert outputs[0].media.video.spec.value_range is VideoValueRange.NEGATIVE_ONE_TO_ONE
+
+
+def test_forward_keeps_legacy_output_on_non_owner_vae_rank() -> None:
+    # Distributed VAE decode uses broadcast_result=False, so non-owner ranks get
+    # an empty placeholder instead of the full video. Wrapping that as typed media
+    # would fail split_diffusion_output_by_request's batch check on every non-owner
+    # rank, so the pipeline must keep the placeholder on the legacy output field.
+    pipeline = _make_pipeline()
+    pipeline.vae.decode = lambda latents, return_dict=False: (torch.empty(0),)  # type: ignore[assignment]
+    pipeline.diffuse = lambda **kwargs: torch.zeros_like(kwargs["latents"])  # type: ignore[method-assign]
+
+    batch = DiffusionRequestBatch(
+        requests=[
+            OmniDiffusionRequest(
+                prompt="prompt",
+                request_id="request-0",
+                sampling_params=OmniDiffusionSamplingParams(
+                    num_frames=1,
+                    num_inference_steps=2,
+                    max_sequence_length=32,
+                    output_type="np",
+                ),
+            )
+        ]
+    )
+
+    outputs = pipeline.forward(batch)
+
+    assert len(outputs) == 1
+    assert outputs[0].media is None
+    assert outputs[0].output is not None
+    assert outputs[0].output.numel() == 0
 
 
 def test_forward_batches_precomputed_prompt_embeddings() -> None:
@@ -341,6 +477,100 @@ def test_diffuse_runs_prediction_and_scheduler_for_each_timestep() -> None:
         (3.0, 3, 28.0, False),
     ]
     assert torch.equal(result, torch.full_like(latents, 10.0))
+
+
+@pytest.mark.parametrize("fail_first_request", [False, True])
+def test_runner_publishes_wan_step_context_across_requests(fail_first_request, monkeypatch):
+    from vllm_omni.diffusion.data import OmniDiffusionConfig
+    from vllm_omni.diffusion.forward_context import (
+        ForwardContext,
+        get_forward_context,
+        is_forward_context_available,
+        override_forward_context,
+    )
+    from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
+    from vllm_omni.quantization.mxfp4_config import _is_w4a8_fallback_step
+
+    contexts: list[ForwardContext] = []
+    events = []
+
+    class InjectedPredictionError(Exception):
+        pass
+
+    class RecordingTransformer(_StubTransformer):
+        def __init__(self, expert):
+            super().__init__()
+            self.expert = expert
+
+        def forward(self, hidden_states, encoder_hidden_states, **kwargs):
+            context = get_forward_context()
+            assert context is contexts[-1]
+            request_index = len(contexts) - 1
+            step = context.denoise_step_idx
+            positive = bool(encoder_hidden_states[0, 0, 0] > 0)
+            events.append((request_index, step, self.expert, positive, _is_w4a8_fallback_step([0, 2])))
+            if fail_first_request and request_index == 0 and step == 1 and not positive:
+                raise InjectedPredictionError
+            return (torch.ones_like(hidden_states) * (1 if positive else -1),)
+
+    def encode_prompt(**kwargs):
+        context = get_forward_context()
+        assert context.denoise_step_idx is None
+        contexts.append(context)
+        embeds = torch.ones(1, 8, 8)
+        return embeds, -embeds
+
+    pipeline = _make_pipeline()
+    pipeline.transformer = RecordingTransformer("high")
+    pipeline.transformer_2 = RecordingTransformer("low")
+    pipeline.scheduler = _StubScheduler([900, 500, 100])
+    monkeypatch.setattr(pipeline, "encode_prompt", encode_prompt)
+    monkeypatch.setattr(pipeline, "scheduler_step_maybe_with_cfg", lambda pred, t, latents, cfg: latents)
+
+    # Use the real runner context manager, Wan forward/diffuse, and CFG
+    # dispatch. Only model computation, scheduler math and unrelated KV I/O
+    # are replaced; no test code publishes a denoise step.
+    runner = object.__new__(DiffusionModelRunner)
+    runner.pipeline = pipeline
+    runner.od_config = OmniDiffusionConfig(model="", dtype=torch.float32)
+    runner.vllm_config = None
+    runner.cache_backend = None
+    monkeypatch.setattr(runner, "_prepare_request_for_forward", lambda *args, **kwargs: None)
+    with override_forward_context(None):
+        for request_index in range(2):
+            request = OmniDiffusionRequest(
+                prompt="a fox walks",
+                request_id=f"request-{request_index}",
+                sampling_params=OmniDiffusionSamplingParams(
+                    num_frames=1, num_inference_steps=3, guidance_scale=2.0, output_type="latent"
+                ),
+            )
+
+            def execute():
+                return runner._execute_request_list(
+                    [request],
+                    od_config=runner.od_config,
+                    allow_single_output=True,
+                    require_request_batch_support=False,
+                    record_name="test_wan_step_context",
+                    record_output_peak_memory=False,
+                )
+
+            if fail_first_request and request_index == 0:
+                with pytest.raises(InjectedPredictionError):
+                    execute()
+            else:
+                execute()
+            assert not is_forward_context_available()
+
+    assert len(contexts) == 2 and contexts[0] is not contexts[1]
+    expected = [
+        (request, step, "high" if step == 0 else "low", positive, step in (0, 2))
+        for request in range(2)
+        for step in range(2 if fail_first_request and request == 0 else 3)
+        for positive in (True, False)
+    ]
+    assert events == expected
 
 
 class _StubDMDScheduler:

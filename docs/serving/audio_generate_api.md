@@ -4,14 +4,14 @@ vLLM-Omni provides an API for text-to-audio generation using diffusion-based mod
 
 Unlike the [Speech API](speech_api.md) which targets text-to-speech synthesis, the Audio Generate API is designed for general-purpose audio generation from text descriptions (sound effects, music, ambient soundscapes, etc.).
 
-Each server instance runs a single model (specified at startup via `vllm-omni serve <model> --omni`).
+Each server instance runs a single model (specified at startup via `vllm serve <model> --omni`).
 
 ## Quick Start
 
 ### Start the Server
 
 ```bash
-vllm-omni serve stabilityai/stable-audio-open-1.0 \
+vllm serve stabilityai/stable-audio-open-1.0 \
     --host 0.0.0.0 \
     --port 8091 \
     --gpu-memory-utilization 0.9 \
@@ -55,7 +55,7 @@ with open("cat.wav", "wb") as f:
 
 ### Endpoint
 
-```
+```text
 POST /v1/audio/generate
 Content-Type: application/json
 ```
@@ -63,7 +63,7 @@ Content-Type: application/json
 ### Request Parameters
 
 | Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
+| ----------- | ------ | --------- | ------------- |
 | `input` | string | **required** | Text prompt describing the audio to generate |
 | `model` | string | server's model | Model to use (optional, should match server if specified) |
 | `response_format` | string | "wav" | Audio format: wav, mp3, flac, pcm, opus |
@@ -72,7 +72,7 @@ Content-Type: application/json
 #### Diffusion Parameters
 
 | Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
+| ----------- | ------ | --------- | ------------- |
 | `audio_length` | float | null | Audio duration in seconds (default value is the max ~47s for `stable-audio-open-1.0`) |
 | `audio_start` | float | 0.0 | Audio start time in seconds |
 | `negative_prompt` | string | null | Text describing what to avoid in generation |
@@ -85,7 +85,7 @@ Content-Type: application/json
 Returns binary audio data with the appropriate `Content-Type` header:
 
 | `response_format` | Content-Type |
-|--------------------|--------------|
+| -------------------- | -------------- |
 | `wav` | `audio/wav` |
 | `mp3` | `audio/mpeg` |
 | `flac` | `audio/flac` |
@@ -210,7 +210,7 @@ with open("thunder.wav", "wb") as f:
 Controls how closely the generated audio follows the text prompt.
 
 | Range | Behaviour |
-|-------|-----------|
+| ------- | ----------- |
 | 3 - 5 | More creative / varied output |
 | 7 (default) | Balanced adherence |
 | 10+ | Strict adherence to the prompt |
@@ -220,7 +220,7 @@ Controls how closely the generated audio follows the text prompt.
 Controls the number of denoising steps in the diffusion process.
 
 | Steps | Quality | Speed | Use Case |
-|-------|---------|-------|----------|
+| ------- | --------- | ------- | ---------- |
 | 50 | Good | Fast | Quick previews |
 | 100 | Very Good | Medium | General purpose |
 | 150+ | Excellent | Slow | Final / critical audio |
@@ -240,7 +240,7 @@ Describes characteristics to avoid. Common negative prompts include:
 ## Supported Models
 
 | Model | Description |
-|-------|-------------|
+| ----- | ----------- |
 | `stabilityai/stable-audio-open-1.0` | Open-source audio generation model, up to ~47 seconds, 44.1 kHz stereo |
 
 ## Error Responses
@@ -326,7 +326,7 @@ curl http://localhost:8091/health
 Enable debug logging:
 
 ```bash
-vllm-omni serve stabilityai/stable-audio-open-1.0 \
+vllm serve stabilityai/stable-audio-open-1.0 \
     --host 0.0.0.0 \
     --port 8091 \
     --gpu-memory-utilization 0.9 \

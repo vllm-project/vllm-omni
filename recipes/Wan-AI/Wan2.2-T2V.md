@@ -85,13 +85,77 @@ For online serving client examples and request formats, see
 #### Notes
 
 - **Key flags:**
-  - `--omni` — enables vLLM-Omni diffusion serving.
-  - `--use-hsdp` — Hybrid Sharded Data Parallelism for the 14B DiT weights.
-  - `--usp <N>` — Unified (Ulysses) Sequence Parallelism degree.
-  - `--cfg-parallel-size <N>` — CFG parallelism; set to 2 for the official model,
+    - `--omni` — enables vLLM-Omni diffusion serving.
+    - `--use-hsdp` — Hybrid Sharded Data Parallelism for the 14B DiT weights.
+    - `--usp <N>` — Unified (Ulysses) Sequence Parallelism degree.
+    - `--cfg-parallel-size <N>` — CFG parallelism; set to 2 for the official model,
     omit for distilled checkpoints.
-  - `--vae-patch-parallel-size 8` / `--vae-use-tiling` — parallel + tiled VAE
+    - `--vae-patch-parallel-size 8` / `--vae-use-tiling` — parallel + tiled VAE
     decoding; disabling patch parallelism can significantly increase VAE latency.
+
+## XPU
+
+### 1x Intel Arc Pro B70 (32 GB)
+
+Offline text-to-video at a reduced 576x320, 17-frame shape. Layerwise offload
+streams the two 14B expert transformers; VAE slicing bounds the decode
+activations.
+
+#### Environment
+
+- OS: Linux
+- Python: 3.10+
+- torch: 2.13.0+xpu
+- vLLM: 0.29.0 (`98dff2a8`)
+- vLLM-Omni: `main` at `4c7a98c2`
+
+#### Command
+
+```bash
+python examples/offline_inference/text_to_video/text_to_video.py \
+  --model Wan-AI/Wan2.2-T2V-A14B-Diffusers \
+  --prompt "A serene lakeside sunrise with mist over the water." \
+  --negative-prompt "blurry, noisy, artifacts, distorted, low quality, streaks, sparkles, blocky, pixelated" \
+  --height 320 --width 576 --num-frames 17 \
+  --num-inference-steps 60 \
+  --guidance-scale 4.0 \
+  --flow-shift 5.0 \
+  --boundary-ratio 0.875 \
+  --enable-layerwise-offload \
+  --vae-use-slicing \
+  --enforce-eager \
+  --seed 12345 \
+  --output wan22_t2v_output.mp4
+```
+
+Given spare cards, `--enable-cpu-offload` shards the two expert transformers
+instead of streaming them, which nearly halves the denoise loop. Four is the
+fastest count; eight is slower.
+
+```bash
+  --tensor-parallel-size 4 \
+  --enable-cpu-offload
+```
+
+| Offload | Cards | Peak VRAM | Denoise |
+| --- | ---: | ---: | ---: |
+| `--enable-layerwise-offload` | 1 | 9.9 GiB | 160 s |
+| `--enable-cpu-offload` | 2 | 18.9 GiB | 113 s |
+| `--enable-cpu-offload` | 4 | 12.4 GiB | 86 s |
+
+#### Verification
+
+Confirm `wan22_t2v_output.mp4` decodes and that frame 0 is clean.
+
+#### Notes
+
+- Key flags: `--boundary-ratio 0.875` sets the high-noise to low-noise expert
+  switch. `--flow-shift 5.0` with `--guidance-scale 4.0` over 60 steps clears
+  the frame-0 VAE corruption seen at the stock 50-step, `flow_shift=12.0`
+  settings.
+- Known limitations: only offline T2V at 576x320 was qualified. Larger shapes,
+  TI2V, HSDP, CFG parallelism, and online serving are out of scope for this
+  profile.
 
 ## Accelerating with TRTLLM_ATTN + Skip-Softmax (datacenter Blackwell)
 
@@ -153,7 +217,7 @@ instead of `target_sparsity`):
 ### Skip-Softmax controls
 
 | Key | Valid values | Meaning |
-|---|---|---|
+| --- | --- | --- |
 | `target_sparsity` | finite, `[0, 1]` | Operating point on the checkpoint's calibrated curve (`a·exp(b·s)`). |
 | `threshold` | finite, `≥ 0` | Direct skip threshold, no calibration needed. Mutually exclusive with `target_sparsity`. |
 | `disabled_until_timestep` | finite, `[0, 1]` | Keeps early, high-noise steps dense; skip turns on once the normalized timestep `t ≤ D`. |
@@ -169,7 +233,7 @@ Measured on B300 / SM103, 1280×720 / 81f / 50 steps, torch.compile, official
 ModelOpt calibration (speedup and divergence relative to dense):
 
 | config | speedup | LPIPS (divergence vs dense) |
-|---|---|---|
+| --- | --- | --- |
 | dense | 1.000x | - |
 | `s=0.65, D=0.86` | 1.062x | 0.041 |
 | `s=0.75, D=1.00` | 1.181x | 0.377 |
@@ -181,6 +245,6 @@ ModelOpt calibration (speedup and divergence relative to dense):
   `flashinfer`. Elsewhere, or without FlashInfer, selecting `TRTLLM_ATTN` raises
   rather than silently degrading.
 - **Known limitations:**
-  - Skip-Softmax is not supported under ring sequence parallelism; use Ulysses SP
+    - Skip-Softmax is not supported under ring sequence parallelism; use Ulysses SP
     (`--usp`), or run Skip-Softmax without ring.
-  - `TRTLLM_ATTN` is BF16-only (no attention-level quantization).
+    - `TRTLLM_ATTN` is BF16-only (no attention-level quantization).

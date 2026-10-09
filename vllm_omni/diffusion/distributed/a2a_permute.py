@@ -172,7 +172,9 @@ def ulysses_qkv_fwd(x: torch.Tensor, group_name: str, world_size: int) -> torch.
     rows = B * s_local
     symm_in = _get_symm_buffer((rows, p, lc), x.dtype, x.device, group_name)
     # (B, S_local, H, D) -> (rows, p, lc); H is row-major so column block r = heads [r*Hl:(r+1)*Hl]
-    symm_in.copy_(x.reshape(rows, p, lc))
+    # Fused QKV projections produce row-strided views. Stage complete rows with
+    # the copy engine instead of materializing the view with TensorIterator.
+    torch.ops.a2ap.copy_rows(x.view(rows, p, lc), symm_in)
     out = torch.empty(p, rows, lc, device=x.device, dtype=x.dtype)
     torch.ops.a2ap.all_to_all_permute(symm_in, out, 1, 0, group_name)
     # (p, rows, lc) -> (B, S_global, H_local, D), sequence ordered rank-major
