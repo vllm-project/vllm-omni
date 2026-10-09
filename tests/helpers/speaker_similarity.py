@@ -20,6 +20,8 @@ An output is labelled:
   only failing class. One embedder alone can be fooled by a mostly non-speech
   output, so a leak needs agreement.
 * ``disagree``: anything else. Logged, not failing.
+* ``unscorable``: the clip is shorter than ``MIN_SCORABLE_S`` or silent. It is not
+  embedded and not a leak; it is a content problem.
 
 ``score(..., window=2.0)`` repeats the check on the first two seconds only, which
 is where a leak that affects only the start of an utterance shows up.
@@ -42,6 +44,12 @@ SAMPLE_RATE = 16000
 LABEL_CORRECT = "correct"
 LABEL_WRONG_BOTH_AGREE = "wrong_both_agree"
 LABEL_DISAGREE = "disagree"
+LABEL_UNSCORABLE = "unscorable"
+
+# Clips shorter than this, or quieter than this RMS, are not embedded: the embedders
+# raise on very short input and a silent clip says nothing about the voice.
+MIN_SCORABLE_S = 0.5
+MIN_SCORABLE_RMS = 1e-3
 
 WAVLM_SV_MODEL = "microsoft/wavlm-base-plus-sv"
 
@@ -178,6 +186,13 @@ def classify(voice: str, argmax: Mapping[str, str]) -> tuple[str, str | None]:
     return LABEL_DISAGREE, None
 
 
+def is_scorable(clip: np.ndarray) -> bool:
+    """Whether ``clip`` is long and loud enough to carry a speaker embedding."""
+    if len(clip) / SAMPLE_RATE < MIN_SCORABLE_S:
+        return False
+    return float(np.sqrt(np.mean(np.square(clip, dtype=np.float64)))) >= MIN_SCORABLE_RMS
+
+
 def crop_window(wav16: np.ndarray, window: float | None) -> tuple[np.ndarray, bool]:
     """Return the first ``window`` seconds, and whether the clip was too short for it."""
     if window is None:
@@ -219,6 +234,22 @@ def score(
         sims: dict[str, list[float]] = {}
         argmax: dict[str, str] = {}
         margin: dict[str, float] = {}
+        if not is_scorable(clip):
+            results.append(
+                OutputScore(
+                    idx=idx,
+                    voice=voice,
+                    duration_s=len(wav) / SAMPLE_RATE,
+                    scored_s=len(clip) / SAMPLE_RATE,
+                    window_short=short,
+                    voices=voices,
+                    sims=sims,
+                    argmax=argmax,
+                    margin={e.name: float("nan") for e in embedders},
+                    label=LABEL_UNSCORABLE,
+                )
+            )
+            continue
         for emb in embedders:
             vec = emb.embed(clip)
             cos = [float(vec @ reference_embeddings[emb.name][v]) for v in voices]
@@ -271,9 +302,17 @@ def wrong_both_agree(results: Sequence[OutputScore]) -> list[OutputScore]:
 
 
 def min_margins(results: Sequence[OutputScore]) -> dict[str, float]:
-    """Smallest own-minus-best-other margin per embedder (negative means a wrong argmax)."""
-    names = results[0].margin.keys() if results else []
-    return {n: min(r.margin[n] for r in results) for n in names}
+    """Smallest own-minus-best-other margin per embedder (negative means a wrong argmax).
+
+    NaN margins (unscorable clips, a single reference) are ignored; an embedder with no
+    finite margin reports NaN.
+    """
+    names = list(dict.fromkeys(n for r in results for n in r.margin))
+    out = {}
+    for n in names:
+        vals = [r.margin[n] for r in results if not math.isnan(r.margin.get(n, float("nan")))]
+        out[n] = min(vals) if vals else float("nan")
+    return out
 
 
 def format_table(
@@ -288,8 +327,8 @@ def format_table(
     rows = [head]
     for i, (a, b) in enumerate(zip(full, first)):
         row = [str(a.idx), a.voice, str(texts_len[i]) if texts_len else "-", f"{a.duration_s:.2f}"]
-        row += [a.argmax[n] for n in names] + [f"{a.margin[n]:+.3f}" for n in names] + [a.label]
-        row += [b.argmax[n] for n in names] + [f"{b.margin[n]:+.3f}" for n in names]
+        row += [a.argmax.get(n, "-") for n in names] + [f"{a.margin[n]:+.3f}" for n in names] + [a.label]
+        row += [b.argmax.get(n, "-") for n in names] + [f"{b.margin[n]:+.3f}" for n in names]
         row += [b.label + ("*" if b.window_short else "")]
         rows.append(row)
     widths = [max(len(r[c]) for r in rows) for c in range(len(head))]

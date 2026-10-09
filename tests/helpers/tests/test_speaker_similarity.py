@@ -10,11 +10,13 @@ import pytest
 from tests.helpers.speaker_similarity import (
     LABEL_CORRECT,
     LABEL_DISAGREE,
+    LABEL_UNSCORABLE,
     LABEL_WRONG_BOTH_AGREE,
     SAMPLE_RATE,
     FailureReport,
     classify,
     crop_window,
+    format_table,
     min_margins,
     retain_failed_voice_isolation,
     score,
@@ -39,6 +41,15 @@ class _ToneEmbedder:
         out = np.zeros(len(self.freqs), dtype=np.float32)
         out[k] = 1.0
         return out
+
+
+class _NeverEmbedder:
+    """Raises if called, like a real embedder given a clip it cannot handle."""
+
+    name = "never"
+
+    def embed(self, wav16: np.ndarray) -> np.ndarray:
+        raise AssertionError("embed() must not be called for an unscorable clip")
 
 
 def _tone(freq: float, seconds: float = 3.0) -> np.ndarray:
@@ -110,6 +121,41 @@ def test_min_margins_per_embedder():
     outputs = [("v0", REFS["v0"]), ("v1", REFS["v2"])]
     results = score(outputs, REFS, [_ToneEmbedder("a", FREQS)])
     assert min_margins(results) == {"a": pytest.approx(-1.0)}
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_score_marks_short_and_silent_clips_unscorable_without_embedding():
+    outputs = [("v0", _tone(300.0, 0.2)), ("v1", np.zeros(3 * SAMPLE_RATE, dtype=np.float32))]
+    ref_emb = {"never": {v: np.ones(2, dtype=np.float32) for v in REFS}}
+    results = score(outputs, REFS, [_NeverEmbedder()], reference_embeddings=ref_emb)
+    assert [r.label for r in results] == [LABEL_UNSCORABLE, LABEL_UNSCORABLE]
+    assert results[0].scored_s == pytest.approx(0.2) and results[1].scored_s == pytest.approx(3.0)
+    for r in results:
+        assert r.sims == {} and r.argmax == {} and r.wrong_voice is None
+        assert np.isnan(r.margin["never"])
+    assert not wrong_both_agree(results)
+    # The reporting helpers keep working on these rows.
+    json.dumps([r.to_dict() for r in results])
+    assert LABEL_UNSCORABLE in format_table(results, results)
+    # A clip that is long enough in total but cropped below the minimum by the window is not scored either.
+    windowed = score([("v0", _tone(300.0, 3.0))], REFS, [_NeverEmbedder()], window=0.3, reference_embeddings=ref_emb)
+    assert windowed[0].label == LABEL_UNSCORABLE
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_min_margins_ignores_unscorable_rows():
+    outputs = [
+        ("v1", _tone(600.0, 0.2)),
+        ("v0", REFS["v0"]),
+        ("v1", REFS["v2"]),
+        ("v2", np.zeros(3 * SAMPLE_RATE, dtype=np.float32)),
+    ]
+    results = score(outputs, REFS, [_ToneEmbedder("a", FREQS)])
+    assert [r.label for r in results] == [LABEL_UNSCORABLE, LABEL_CORRECT, LABEL_WRONG_BOTH_AGREE, LABEL_UNSCORABLE]
+    assert min_margins(results) == {"a": pytest.approx(-1.0)}
+    assert np.isnan(min_margins(results[:1])["a"])
 
 
 @pytest.mark.core_model

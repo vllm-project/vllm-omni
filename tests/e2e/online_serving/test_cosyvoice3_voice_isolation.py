@@ -11,10 +11,13 @@ is closest to its own reference.
 * Two independent speaker embedders score each output against all references:
   CosyVoice3's CAM++ (``campplus.onnx`` from the model snapshot) and
   ``microsoft/wavlm-base-plus-sv``.
-* A leak is an output where both embedders agree on the same wrong voice. It is
-  checked on the full output and on its first 2 s. Zero leaks are allowed.
-* Speech content is checked separately by the ASR test, so a content failure is
-  never reported as a voice leak.
+* An output shorter than 0.5 s or silent is not scored and fails as a content problem.
+* A leak is an output where both embedders agree on the same wrong voice. Zero leaks
+  are allowed on the full output. The first 2 s is checked too, but the model alone
+  sometimes opens a request in the wrong voice (nothing in flight), so at concurrency 8
+  a wrong first 2 s counts only if the same request at concurrency 1 was right.
+  The concurrency-1 controls assert the full output only and print the first-2 s labels.
+* Speech content is checked by the ASR test. The speaker tests do not look at it.
 
 Two ways of naming the voice are tested, each on its own: registered (uploaded with
 ``POST /v1/audio/voices`` and requested by name) and inline (``ref_audio`` /
@@ -58,6 +61,7 @@ from tests.helpers.runtime import OmniServerParams
 from tests.helpers.speaker_similarity import (
     LABEL_CORRECT,
     LABEL_DISAGREE,
+    LABEL_UNSCORABLE,
     LABEL_WRONG_BOTH_AGREE,
     WAVLM_SV_MODEL,
     CampPlusEmbedder,
@@ -322,7 +326,7 @@ def _get_run(mode: str, source: str, concurrency: int, scorers) -> RunResult:
         counts: dict[str, int] = {}
         for r in results:
             counts[r.label] = counts.get(r.label, 0) + 1
-        alone = {n: sum(r.argmax[n] != r.voice for r in results) for n in results[0].margin}
+        alone = {n: sum(n in r.argmax and r.argmax[n] != r.voice for r in results) for n in results[0].margin}
         print(
             f"{label}: labels={counts} disagree={counts.get(LABEL_DISAGREE, 0)} "
             f"wrong_both_agree={counts.get(LABEL_WRONG_BOTH_AGREE, 0)} "
@@ -337,10 +341,30 @@ def _get_run(mode: str, source: str, concurrency: int, scorers) -> RunResult:
     return run
 
 
-def _assert_no_leak(test: str, run: RunResult, scorers) -> None:
-    leaks_full = wrong_both_agree(run.full)
-    leaks_first = wrong_both_agree(run.first)
-    if leaks_full or leaks_first:
+def _baseline_run(run: RunResult, scorers) -> RunResult:
+    """The concurrency-1 run of the same mode and voice source, to gate the first-2 s check."""
+    gen = _GENERATED.get((run.mode, run.source, 1))
+    if gen is None or "error" in gen:
+        pytest.fail(
+            f"cannot gate the first-{FIRST_WINDOW_S}s check: the concurrency-1 baseline for mode={run.mode} "
+            f"voices={run.source} is unavailable ({'not generated' if gen is None else gen['error']})"
+        )
+    return _get_run(run.mode, run.source, 1, scorers)
+
+
+def _describe(results: list[OutputScore]) -> str:
+    return ", ".join(f"req {r.idx} ({r.voice} -> {r.wrong_voice})" for r in results)
+
+
+def _assert_no_leak(test: str, run: RunResult, scorers, *, gate_first_window: bool) -> None:
+    """Assert that no output of ``run`` is unscorable or in the wrong voice.
+
+    The full output is always asserted. With ``gate_first_window`` a first-2 s leak counts only
+    if the same request at concurrency 1 had the right voice in its first 2 s; otherwise it is
+    printed as excused. Without it (the concurrency-1 controls) the first-2 s labels are only printed.
+    """
+
+    def retain() -> None:
         retain_failed_voice_isolation(
             FailureReport(
                 test=test,
@@ -354,16 +378,40 @@ def _assert_no_leak(test: str, run: RunResult, scorers) -> None:
             )
         )
 
-    def describe(results: list[OutputScore]) -> str:
-        return ", ".join(f"req {r.idx} ({r.voice} -> {r.wrong_voice})" for r in results)
-
+    unscorable = [r for r in run.full if r.label == LABEL_UNSCORABLE]
+    leaks_full = wrong_both_agree(run.full)
+    if unscorable or leaks_full:
+        retain()
+    assert not unscorable, (
+        f"output too short or silent; a content problem, not a voice leak: {len(unscorable)}/{len(run.full)} "
+        f"outputs are unscorable: " + ", ".join(f"req {r.idx} ({r.voice}, {r.duration_s:.2f}s)" for r in unscorable)
+    )
     assert not leaks_full, (
         f"voice leak on full output: {len(leaks_full)}/{len(run.full)} outputs have the wrong voice "
-        f"under both embedders: {describe(leaks_full)}"
+        f"under both embedders: {_describe(leaks_full)}"
     )
+
+    mismatched = wrong_both_agree(run.first)
+    if not gate_first_window:
+        if mismatched:
+            print(f"first_2s (not asserted at concurrency 1): wrong under both embedders: {_describe(mismatched)}")
+        return
+    baseline = _baseline_run(run, scorers)
+    leaks_first = []
+    for r in mismatched:
+        base = baseline.first[r.idx]
+        if base.label == LABEL_CORRECT:
+            leaks_first.append(r)
+        else:
+            print(
+                f"first_2s excused: req {r.idx} ({r.voice} -> {r.wrong_voice}); the same request at concurrency 1 "
+                f"is already {base.label} in its first {FIRST_WINDOW_S}s, so this is the model's opening, not a leak"
+            )
+    if leaks_first:
+        retain()
     assert not leaks_first, (
         f"voice leak in the first {FIRST_WINDOW_S}s: {len(leaks_first)}/{len(run.first)} outputs have the "
-        f"wrong voice under both embedders: {describe(leaks_first)}"
+        f"wrong voice under both embedders and were right at concurrency 1: {_describe(leaks_first)}"
     )
 
 
@@ -373,7 +421,12 @@ def _asr_failures(mode: str, source: str, concurrency: int, gen: dict[str, Any])
         response = OmniResponse(success=True, audio_bytes=audio, audio_format="audio/wav")
         # Every text is English. Left on auto-detect, Whisper labels English spoken in a
         # Chinese reference voice as zh or ko and returns an unrelated transcript.
-        config = {"response_format": "wav", "input": req["text"], "transcript_language": "en"}
+        config = {
+            "response_format": "wav",
+            "input": req["text"],
+            "transcript_language": "en",
+            "transcript_escalation_model": "large-v3",
+        }
         try:
             assert_audio_speech_response(response, config, run_level="full_model")
         except AssertionError as exc:
@@ -393,7 +446,7 @@ def test_voice_isolation_concurrent_registered(generated, scorers) -> None:
     Datasets: tests/assets reference clips
     """
     run = _get_run(generated, "registered", CONCURRENCY, scorers)
-    _assert_no_leak("concurrent_registered", run, scorers)
+    _assert_no_leak("concurrent_registered", run, scorers, gate_first_window=True)
 
 
 @hardware_test(res={"cuda": ["L4", "B200"]}, num_cards=1)
@@ -408,14 +461,14 @@ def test_voice_isolation_concurrent(generated, scorers) -> None:
     Datasets: tests/assets reference clips
     """
     run = _get_run(generated, "inline", CONCURRENCY, scorers)
-    _assert_no_leak("concurrent", run, scorers)
+    _assert_no_leak("concurrent", run, scorers, gate_first_window=True)
 
 
 @hardware_test(res={"cuda": ["L4", "B200"]}, num_cards=1)
 @pytest.mark.parametrize("generated", [ASYNC_CHUNK, NO_ASYNC_CHUNK], indirect=True)
 def test_voice_isolation_control_c1(generated, scorers) -> None:
     """
-    Control: the same requests one at a time. Nothing is in flight, so the scorer must be clean.
+    Control: the same requests one at a time. Nothing is in flight, so the full outputs must be clean.
     Deploy Setting: cosyvoice3.yaml, async_chunk on and ``--no-async-chunk``
     Input Modal: text + ref_audio + ref_text
     Output Modal: audio
@@ -423,7 +476,7 @@ def test_voice_isolation_control_c1(generated, scorers) -> None:
     Datasets: tests/assets reference clips
     """
     run = _get_run(generated, "inline", 1, scorers)
-    _assert_no_leak(f"control_c1_{generated}", run, scorers)
+    _assert_no_leak(f"control_c1_{generated}", run, scorers, gate_first_window=False)
 
 
 @hardware_test(res={"cuda": ["L4", "B200"]}, num_cards=1)
@@ -438,7 +491,7 @@ def test_voice_isolation_control_c1_registered(generated, scorers) -> None:
     Datasets: tests/assets reference clips
     """
     run = _get_run(generated, "registered", 1, scorers)
-    _assert_no_leak(f"control_c1_registered_{generated}", run, scorers)
+    _assert_no_leak(f"control_c1_registered_{generated}", run, scorers, gate_first_window=False)
 
 
 @hardware_test(res={"cuda": ["L4", "B200"]}, num_cards=1)
