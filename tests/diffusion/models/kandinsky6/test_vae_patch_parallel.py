@@ -89,7 +89,7 @@ def _patch_parallel_worker(rank: int, port: str, shapes: dict) -> None:
     try:
         import vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor as executor_mod
 
-        world = SimpleNamespace(device_group=dist.group.WORLD)
+        world = SimpleNamespace(device_group=dist.group.WORLD, cpu_group=dist.group.WORLD)
         executor_mod.get_world_group = lambda: world
 
         vae = _stub_vae()

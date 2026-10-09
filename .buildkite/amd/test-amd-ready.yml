@@ -20,23 +20,29 @@ steps:
         # that is not supported on CPU
         - "pytest -sv tests/model_executor -m 'core_model and cpu and not omni' --num-shards=$$BUILDKITE_PARALLEL_JOB_COUNT --shard-id=$$BUILDKITE_PARALLEL_JOB"
 
-    - label: "Simple · Omni Processor Test"
+    - label: "Simple · Omni Processor Snapshot Smoke"
       agent_pool: mi300_1
+      depends_on: amd-build
+      mirror_hardwares: [amdproduction]
+      grade: Blocking
+      timeout_in_minutes: 10
+      commands:
+        - export VLLM_ROCM_USE_AITER=0
+        - >-
+          timeout --signal=TERM --kill-after=1m 8m
+          pytest -sv
+          tests/model_executor/models/test_omni_processing.py::test_rocm_processor_snapshot_smoke
+          -m 'core_model and cpu and omni' --durations=0
+
+    - label: "Simple · Diffusion Test · Shard %N/%t"
+      agent_pool: mi300_1
+      parallelism: 5
       depends_on: amd-build
       mirror_hardwares: [amdproduction]
       grade: Blocking
       timeout_in_minutes: 60
-      commands:
-        - export VLLM_ROCM_USE_AITER=0
-        - "pytest -sv tests/model_executor/models/test_omni_processing.py -m 'core_model and cpu and omni'"
-
-    - label: "Simple · Diffusion Test · Shard %N/%t"
-      agent_pool: mi300_1
-      parallelism: 4
-      depends_on: amd-build
-      mirror_hardwares: [amdproduction]
-      grade: Blocking
-      timeout_in_minutes: 45
+      artifact_paths:
+        - "artifacts/amd-diffusion-cpu-shards/*.xml"
       # Buildkite's status-based rule cannot prove every exit 134 is a GPU hang.
       # It retries 134 once; the Kubernetes job retry starts a fresh pod.
       # Assertions (1), timeouts (124), and OOMs (137) remain non-retryable.
@@ -46,13 +52,23 @@ steps:
             limit: 1
       commands:
         - export VLLM_ROCM_USE_AITER=0
+        - export DIFFUSION_CPU_ARTIFACT_DIR="$$BUILDKITE_BUILD_CHECKOUT_PATH/artifacts/amd-diffusion-cpu-shards"
+        - mkdir -p "$$DIFFUSION_CPU_ARTIFACT_DIR"
         # ignore test_teacache_extractors.py because it use rocm gemm kernel from vLLM
         # that is not supported on CPU
         # Keep multi-GPU tests out of this one-GPU pool even when their module
         # also carries the cpu marker for unit tests.
         # Keep π0.5 CPU units out of these shards: CUDA READY/MERGE already run
         # the same suite mandatorily, and AMD covers it non-blocking in nightly.
-        - "pytest -sv tests/diffusion -m 'core_model and cpu and not (cards_2 or cards_3 or cards_4 or cards_5 or cards_6 or cards_7 or cards_8)' --ignore=tests/diffusion/cache/test_teacache_extractors.py --ignore=tests/diffusion/models/pi05/test_pi05_units.py --num-shards=$$BUILDKITE_PARALLEL_JOB_COUNT --shard-id=$$BUILDKITE_PARALLEL_JOB"
+        - >-
+          pytest -sv tests/diffusion
+          -m 'core_model and cpu and not (cards_2 or cards_3 or cards_4 or cards_5 or cards_6 or cards_7 or cards_8)'
+          --ignore=tests/diffusion/cache/test_teacache_extractors.py
+          --ignore=tests/diffusion/models/pi05/test_pi05_units.py
+          --num-shards=$$BUILDKITE_PARALLEL_JOB_COUNT
+          --shard-id=$$BUILDKITE_PARALLEL_JOB
+          --durations=50
+          --junitxml="$$DIFFUSION_CPU_ARTIFACT_DIR/pytest-$${BUILDKITE_PARALLEL_JOB}-of-$${BUILDKITE_PARALLEL_JOB_COUNT}.xml"
 
     - label: "Diffusion · AuK VAE GPU Test"
       agent_pool: mi300_1
@@ -220,10 +236,12 @@ steps:
       commands:
         # Preserve legacy one-GPU tests without cards_1 while excluding every
         # registered multi-GPU marker from this one-GPU job.
+        # JoyImage's nonblocking nightly lane owns its cold AITER builds.
         - >-
           timeout 15m pytest -sv tests/diffusion/models/
           --ignore=tests/diffusion/models/auk/test_auk_vae_fastpath.py
           --ignore=tests/diffusion/models/mammoth_moda2/test_dit_attention_cuda.py
+          --ignore=tests/diffusion/models/joy_image/test_joy_image_gpu.py
           -m 'core_model and cuda and not
           (cards_2 or cards_3 or cards_4 or cards_5 or cards_6 or cards_7 or cards_8)'
           --run-level "core_model"
@@ -260,7 +278,7 @@ steps:
 #     - export VLLM_WORKER_MULTIPROC_METHOD=spawn
 #     - timeout 20m pytest -s -v tests/e2e/offline_inference/test_stable_audio_expansion.py -m "advanced_model and diffusion and L4" --run-level advanced_model
 
-- label: "ROCm · Engine & Model Executor GPU Coverage (R2-01)"
+- label: "ROCm · Model Executor GPU Coverage (R2-01)"
   agent_pool: mi300_1
   depends_on: amd-build
   mirror_hardwares: [amdproduction]
@@ -273,18 +291,17 @@ steps:
     # artifacts relative to its checkout directory.
     - export R2_01_ARTIFACT_DIR="$$BUILDKITE_BUILD_CHECKOUT_PATH/artifacts/rocm-r2-01"
     - mkdir -p "$$R2_01_ARTIFACT_DIR"
+    # The dedicated Engine Test below owns the only selected tests/engine case;
+    # do not duplicate its model startup in this time-bounded coverage lane.
     # The CUDA ready job also covers tests/worker/test_batched_omni_output.py.
-    # Keep the initial ROCm burn-in scoped to the requested directories.
+    # Keep the initial ROCm burn-in scoped to tests/model_executor/.
     # Verbose pytest output and JUnit retain node IDs without a second
     # collection-only pass over the same GPU-backed test tree.
-    # The CUDA/L4-only CosyVoice3 ragged-flow parity test cold-JITs multiple
-    # AITER kernels on ROCm and is covered by the CUDA ready lane.
     - >-
       pytest -s -v -ra
-      tests/engine/ tests/model_executor/
-      -m 'core_model and cuda and not
+      tests/model_executor/
+      -m 'core_model and cuda and not nvidia_only and not
       (cards_2 or cards_3 or cards_4 or cards_5 or cards_6 or cards_7 or cards_8)'
-      -k 'not test_code2wav_streaming_batch_matches_ragged_flow_numerics'
       --run-level "core_model"
       --durations=0
       --junitxml="$$R2_01_ARTIFACT_DIR/pytest.xml"

@@ -39,6 +39,8 @@ from vllm.logger import init_logger
 from vllm_omni.model_executor.models.personaplex.personaplex_temporal import (
     _apply_rope,
     _RingKV,
+    _ringkv_positions,
+    _rope_tables,
 )
 
 DEFAULT_HF_REPO = "kyutai/mimi"
@@ -228,14 +230,16 @@ class _MimiTransformerLayer(nn.Module):
         offset: torch.Tensor,
         context: int,
         active: torch.Tensor,
+        rope: tuple[torch.Tensor, torch.Tensor],
+        ring: tuple[torch.Tensor, torch.Tensor],
     ) -> torch.Tensor:
         B, T, _ = x.shape
         h = self.norm1(x)
         qkv = F.linear(h, self.in_proj_weight)
         qkv = qkv.view(B, T, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]
-        q, k = _apply_rope(q, k, offset)
-        keys, values, pos_k = kv.complete(k, v, active=active)
+        q, k = _apply_rope(q, k, *rope)
+        keys, values, pos_k = kv.complete(k, v, active, *ring)
         pos_k = pos_k.view(pos_k.shape[0], 1, pos_k.shape[1])
         pos_q = offset.view(-1, 1, 1) + torch.arange(T, device=q.device, dtype=torch.long).view(1, -1, 1)
         delta = pos_q - pos_k
@@ -279,8 +283,12 @@ class _MimiStreamingTransformer(nn.Module):
 
     def step(self, x: torch.Tensor, active: torch.Tensor) -> torch.Tensor:
         """``x`` is ``[B, T, dim]`` (T = positions this frame, typically 2)."""
+        T = x.shape[1]
+        # Offset-pure tables, identical for every layer: build once per step.
+        rope = _rope_tables(self._offset, T, self.layers[0].head_dim)
+        ring = _ringkv_positions(self._offset, T, self.context, active)
         for layer, kv in zip(self.layers, self._kv):
-            x = layer(x, kv, self._offset, self.context, active)
+            x = layer(x, kv, self._offset, self.context, active, rope, ring)
         self._offset.add_(x.shape[1] * active.to(self._offset.dtype))
         return x
 
