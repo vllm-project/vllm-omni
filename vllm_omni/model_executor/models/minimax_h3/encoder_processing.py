@@ -9,6 +9,7 @@ import os
 import subprocess
 import tempfile
 from collections.abc import Callable, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from typing import Any
@@ -585,31 +586,11 @@ def prepare_encoder_inputs(
                         workdir=workdir,
                         start_time_seconds=extra_args.get("start_time_seconds"),
                     )
-                for item in prepared_videos:
-                    full_frames = load_video_frames(item["prepared_path"])
-                    encoded_video_inputs.append(_frames_to_tensor(full_frames))
-                    sampled = sample_reference_video_frames(
-                        item["prepared_path"],
-                        decoded_frames=full_frames,
-                    )
-                    video_timestamps.append(sampled["block_timestamps"])
-                    frames = np.stack(sampled["frames"])
-                    frame_count = int(frames.shape[0])
-                    qwen_video_inputs.append(
-                        (
-                            frames,
-                            {
-                                "total_num_frames": frame_count,
-                                "fps": MINIMAX_H3_QWEN_VIDEO_SAMPLE_FPS,
-                                "duration": frame_count / MINIMAX_H3_QWEN_VIDEO_SAMPLE_FPS,
-                                "video_backend": "minimax_h3",
-                                "frames_indices": list(range(frame_count)),
-                                "do_sample_frames": False,
-                            },
-                        )
-                    )
-                    if item["input_has_audio"]:
-                        waveform, sample_rate = load_video_audio(
+                audio_pool = ThreadPoolExecutor(max_workers=1)
+                try:
+                    audio_futures = [
+                        audio_pool.submit(
+                            load_video_audio,
                             item["original_path"],
                             start_time_seconds=float(item.get("start_time_seconds", 0.0)),
                             duration_seconds=item.get(
@@ -617,9 +598,40 @@ def prepare_encoder_inputs(
                                 item.get("duration_seconds"),
                             ),
                         )
-                        video_audio_inputs.append((waveform.float().contiguous(), int(sample_rate)))
-                    else:
-                        video_audio_inputs.append(None)
+                        if item["input_has_audio"]
+                        else None
+                        for item in prepared_videos
+                    ]
+                    for item, audio_future in zip(prepared_videos, audio_futures):
+                        full_frames = load_video_frames(item["prepared_path"])
+                        encoded_video_inputs.append(_frames_to_tensor(full_frames))
+                        sampled = sample_reference_video_frames(
+                            item["prepared_path"],
+                            decoded_frames=full_frames,
+                        )
+                        video_timestamps.append(sampled["block_timestamps"])
+                        frames = np.stack(sampled["frames"])
+                        frame_count = int(frames.shape[0])
+                        qwen_video_inputs.append(
+                            (
+                                frames,
+                                {
+                                    "total_num_frames": frame_count,
+                                    "fps": MINIMAX_H3_QWEN_VIDEO_SAMPLE_FPS,
+                                    "duration": frame_count / MINIMAX_H3_QWEN_VIDEO_SAMPLE_FPS,
+                                    "video_backend": "minimax_h3",
+                                    "frames_indices": list(range(frame_count)),
+                                    "do_sample_frames": False,
+                                },
+                            )
+                        )
+                        if audio_future is not None:
+                            waveform, sample_rate = audio_future.result()
+                            video_audio_inputs.append((waveform.float().contiguous(), int(sample_rate)))
+                        else:
+                            video_audio_inputs.append(None)
+                finally:
+                    audio_pool.shutdown(wait=True, cancel_futures=True)
         audio_index = 0
         for video_index, item in enumerate(prepared_videos, start=1):
             if item["input_has_audio"]:

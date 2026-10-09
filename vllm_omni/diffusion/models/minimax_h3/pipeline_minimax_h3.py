@@ -165,7 +165,7 @@ from .time_request import (
     MINIMAX_H3_SHAPE_PLANNER,
     minimax_h3_time_shift_sigmas,
 )
-from .vae import MiniMaxH3AudioVAE, MiniMaxH3VideoVAE, _VideoVAEPartProxy
+from .vae import MiniMaxH3AudioVAE, MiniMaxH3VideoVAE, _load_component_config, _VideoVAEPartProxy
 from .vdnh3 import VDNCheckpoint
 
 if TYPE_CHECKING:
@@ -636,6 +636,7 @@ class MiniMaxH3Pipeline(
     """CFG-distilled joint video/audio generation for MiniMax H3."""
 
     supports_step_execution: ClassVar[bool] = True
+    load_vae_decoder: bool = True
     supports_request_cancellation: ClassVar[bool] = True
 
     _dit_modules: ClassVar[list[str]] = ["transformer", "transformers_ref"]
@@ -871,6 +872,11 @@ class MiniMaxH3Pipeline(
         self.device = get_local_device()
         self.load_text_encoder = od_config.model_loaded.get("text_encoder", True)
         self.load_vae_encoder = od_config.model_loaded.get("vae_encoder", True)
+        self.load_vae_decoder = od_config.model_loaded.get("vae_decoder", True)
+        if not self.load_vae_decoder and self.load_vae_encoder:
+            raise ValueError(
+                "MiniMax H3 external decoding requires vae_encoder=false and external encoder conditioning"
+            )
         if self.load_vae_encoder is False and self.load_text_encoder is True:
             raise ValueError(
                 "MiniMax H3 does not support local text encoding with external media conditioning; "
@@ -884,6 +890,14 @@ class MiniMaxH3Pipeline(
         on_demand_component_paths = set(self._offload_plan.on_demand_component_paths)
         if not self.load_text_encoder:
             on_demand_component_paths.discard("text_encoder")
+        if not self.load_vae_decoder:
+            on_demand_component_paths.difference_update(("video_vae", "audio_vae"))
+            self._vae_modules = []
+            self._PROFILER_TARGETS = [
+                name
+                for name in self._PROFILER_TARGETS
+                if name not in {"decode", "video_vae.decode_latent", "audio_vae.decode_latent"}
+            ]
         self._offload_plan = replace(
             self._offload_plan,
             encoder_block_attrs=encoder_block_attrs,
@@ -1096,34 +1110,39 @@ class MiniMaxH3Pipeline(
         # deliberately limits explicit component selection to dit/text_encoder,
         # so VAEs stay resident for new configurations.
         component_load_device = torch.device("cpu") if legacy_manual_components else self.device
-        self.video_vae = MiniMaxH3VideoVAE(
-            os.path.join(vae_model_path, "video_vae"),
-            device=self.device,
-            load_device=component_load_device,
-            decode_only=not self.load_vae_encoder,
-            trust_remote_code=od_config.trust_remote_code,
-        )
-        self.audio_vae = MiniMaxH3AudioVAE(
-            os.path.join(vae_model_path, "audio_vae"),
-            device=self.device,
-            load_device=component_load_device,
-            decode_only=not self.load_vae_encoder,
-            trust_remote_code=od_config.trust_remote_code,
-        )
+        self.video_vae = None
+        self.audio_vae = None
+        if self.load_vae_decoder:
+            self.video_vae = MiniMaxH3VideoVAE(
+                os.path.join(vae_model_path, "video_vae"),
+                device=self.device,
+                load_device=component_load_device,
+                decode_only=not self.load_vae_encoder,
+                trust_remote_code=od_config.trust_remote_code,
+            )
+            self.audio_vae = MiniMaxH3AudioVAE(
+                os.path.join(vae_model_path, "audio_vae"),
+                device=self.device,
+                load_device=component_load_device,
+                decode_only=not self.load_vae_encoder,
+                trust_remote_code=od_config.trust_remote_code,
+            )
         # Registry-side VAE patch-parallel discovery uses ``pipeline.vae``.
         self.vae = self.video_vae
+
         # Optional learned latent super-resolution, run between the denoise
         # loop and the VAE. Absent unless --additional-config names a
         # checkpoint, so a plain H3 deployment carries none of its weights.
         # The upscaler works one normalization below the pipeline latent, so it
         # needs the same per-channel statistics the VAE denormalizes with.
+        def _upscaler_latent_stats() -> tuple[list[float], list[float]]:
+            config = _load_component_config(os.path.join(vae_model_path, "video_vae"))
+            return config["latents_mean"], config["latents_std"]
+
         self.latent_upscaler = resolve_minimax_h3_latent_upscaler(
             od_config,
             device=self.device,
-            latent_stats=lambda: (
-                self.video_vae.config_dict["latents_mean"],
-                self.video_vae.config_dict["latents_std"],
-            ),
+            latent_stats=_upscaler_latent_stats,
         )
 
         self._dlo_component_cache = None
@@ -3037,6 +3056,10 @@ class MiniMaxH3Pipeline(
                     context=context,
                     seed=output_seed,
                 )
+            if not self.load_vae_decoder:
+                videos.append(video_latent)
+                audios.append(audio_latent)
+                continue
             if context["preencode_mp4"]:
                 videos.append(
                     self.decode_to_mp4(
@@ -3069,6 +3092,8 @@ class MiniMaxH3Pipeline(
                 del video
                 self._release_stage_cache()
                 audios.append(audio)
+        if not self.load_vae_decoder:
+            return self._decoder_stage_output(videos, audios, {**context, "height": height, "width": width})
         if videos and isinstance(videos[0], bytes):
             video = videos[0] if len(videos) == 1 else videos
             audio = None
@@ -3079,6 +3104,29 @@ class MiniMaxH3Pipeline(
             output=(video, audio),
             video_output_index=0 if isinstance(video, torch.Tensor) else None,
             post_process_func=get_minimax_h3_post_process_func(self.od_config),
+            stage_durations=(self.stage_durations if hasattr(self, "_stage_durations") else {}),
+        )
+
+    def _decoder_stage_output(
+        self,
+        video_latents: list[torch.Tensor],
+        audio_latents: list[torch.Tensor],
+        shape: dict[str, Any],
+    ) -> DiffusionOutput:
+        # Move latents to CPU at the process boundary; the decoder owns its parallel group.
+        decode_options = {
+            "height": shape["height"],
+            "width": shape["width"],
+            "preencode_mp4": shape.get("preencode_mp4", False),
+            "video_codec_options": shape.get("video_codec_options"),
+            "preencode_batch_frames": shape.get("preencode_batch_frames", 17),
+        }
+        return DiffusionOutput(
+            output={
+                "payload": {"trajectory": {"latents": {"video": video_latents, "audio": audio_latents}}},
+                "metadata": {"minimax_h3_decode": decode_options},
+            },
+            to_cpu=True,
             stage_durations=(self.stage_durations if hasattr(self, "_stage_durations") else {}),
         )
 
@@ -3428,6 +3476,10 @@ class MiniMaxH3Pipeline(
         if upscale_target is not None:
             video_latent = self._upscaled_latent(video_latent, upscale_target)
         height, width = _minimax_h3_output_canvas(shape, upscale_target)
+        if not self.load_vae_decoder:
+            return self._decoder_stage_output(
+                [video_latent], [audio_latent], {**shape, "height": height, "width": width}
+            )
         if shape.get("preencode_mp4", False):
             video = self.decode_to_mp4(
                 video_latent,
