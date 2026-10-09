@@ -222,8 +222,17 @@ def test_mixed_reference_conditioning_matches_stage_zero_handoff(pipeline, monke
     pipeline.audio_vae.encode_waveform.side_effect = encode_audio
     request = _request("ref2va")
     request.prompts[0]["multi_modal_data"].update(video="original.mp4", audio=(torch.full((192000,), 4.0), 32000))
+
+    def capture_denoise_kwargs():
+        kwargs = pipeline.diffuse.call_args.kwargs.copy()
+        context = kwargs.pop("request_context")
+        # Mirror diffuse's consumption of request-owned noise at the mocked boundary.
+        for key in ("precomputed_initial_noise", "precomputed_visual_condition_noise"):
+            kwargs[key] = context.pop(key, None)
+        return kwargs
+
     pipeline.forward(request)
-    local_kwargs = pipeline.diffuse.call_args.kwargs
+    local_kwargs = capture_denoise_kwargs()
 
     transformed = prepare_encoder_prompt(request.prompts[0], [request.sampling_params])
     stage_zero = object.__new__(MiniMaxH3Encoder)
@@ -262,7 +271,7 @@ def test_mixed_reference_conditioning_matches_stage_zero_handoff(pipeline, monke
     pipeline.video_vae.encode_image.reset_mock()
     pipeline.video_vae.encode_video.reset_mock()
     pipeline.forward(SimpleNamespace(prompts=[bridged], sampling_params=request.sampling_params))
-    external_kwargs = pipeline.diffuse.call_args.kwargs
+    external_kwargs = capture_denoise_kwargs()
     for key, value in local_kwargs.items():
         if key in {"precomputed_initial_noise", "precomputed_visual_condition_noise"}:
             assert value is not None
