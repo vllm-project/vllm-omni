@@ -34,7 +34,6 @@ connectors:
       codec_pre_lookahead_frames: 3
       codec_max_chunk_frames: 60
       codec_stream_scale_factor: 2
-      codec_vocab_size: 6561
 
 stages:
   - stage_id: 0

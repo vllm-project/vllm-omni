@@ -60,7 +60,15 @@ def test_deploy_file_agrees_with_the_model_constants_001(deploy: dict) -> None:
 
     assert deploy["pipeline"] == "chatterbox_turbo"
     assert deploy["async_chunk"] is True
-    assert extra["codec_vocab_size"] == config.speech_token_limit
+    # The chunk processor reads exactly these four and has no default for any.
+    assert set(extra) == {
+        "codec_chunk_frames",
+        "codec_pre_lookahead_frames",
+        "codec_max_chunk_frames",
+        "codec_stream_scale_factor",
+    }
+    # The flow reads this many tokens ahead and stage 1 does not play them:
+    # a chunk that waited for fewer would lose the difference.
     assert extra["codec_pre_lookahead_frames"] == config.pre_lookahead_len
     assert talker["default_sampling_params"] == {
         "temperature": 0.8,

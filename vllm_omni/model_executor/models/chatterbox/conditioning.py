@@ -9,9 +9,9 @@ prompt mel is cut to exactly two frames per prompt token (see
 ``VoiceConditioner.from_resampled``). The result travels with the request in
 ``additional_information``: stage 0 reads ``ids.prompt``, ``ids.speech_token``
 and ``embed.voice`` in its ``preprocess``; stage 1 reads ``embed.speech_token``,
-``embed.speech_feat`` and ``embed.embedding``, the names the CosyVoice3
-async-chunk processor forwards. The serving adapter and offline callers both
-build prompts with ``build_prompt``.
+``embed.speech_feat`` and ``embed.embedding``, which the stage handoff
+(``stage_input_processors.chatterbox``) forwards to it. The serving adapter
+and offline callers both build prompts with ``build_prompt``.
 """
 
 import math

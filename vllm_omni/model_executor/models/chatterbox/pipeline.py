@@ -6,8 +6,8 @@ Stage 0: T3     - text and reference conditioning to S3 speech tokens.
 Stage 1: S3Gen  - S3 speech tokens to 24 kHz audio.
 
 With ``async_chunk: true`` stage 0 streams token chunks to stage 1 through
-the shared-memory connector (CosyVoice3's processor; the codec is the same).
-With ``async_chunk: false`` stage 1 receives the finished utterance from
+the shared-memory connector (``t3_to_s3gen_async_chunk``). With
+``async_chunk: false`` stage 1 receives the finished utterance from
 ``t3_to_s3gen``.
 
 The key is ``chatterbox_turbo``, not ``chatterbox``: the checkpoint has no
@@ -33,7 +33,7 @@ CHATTERBOX_TURBO_PIPELINE = PipelineConfig(
             input_sources=(),
             owns_tokenizer=True,
             engine_output_type="latent",
-            async_chunk_process_next_stage_input_func=f"{_PROC}.cosyvoice3.talker2code2wav_async_chunk",
+            async_chunk_process_next_stage_input_func=f"{_PROC}.chatterbox.t3_to_s3gen_async_chunk",
             sampling_constraints={
                 "stop_token_ids": [ChatterboxConfig().stop_speech_token],
                 # Speech ids mean nothing to the text tokenizer.
