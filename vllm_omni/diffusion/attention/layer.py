@@ -17,9 +17,11 @@ from typing import TYPE_CHECKING, Any, cast
 
 import torch
 import torch.nn as nn
+from torch.library import Library
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.logger import init_logger
 from vllm.model_executor.models.utils import extract_layer_index
+from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheSpec
 
 from vllm_omni.diffusion.attention.backends.abstract import (
@@ -271,23 +273,31 @@ def _run_scheduled_attention(
     return out
 
 
+def _scheduled_attention_fake(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attn_mask: torch.Tensor | None,
+    layer_id: torch.Tensor,
+    metadata_spec: str,
+    metadata_ints: list[int],
+) -> torch.Tensor:
+    return query.new_empty((*query.shape[:-1], value.shape[-1]))
+
+
+# direct_register_custom_op skips torch.library.custom_op's Python dispatch (~21us/call).
+# CompositeExplicitAutograd stays device-agnostic (CPU layer id beside device Q/K/V).
+# No autograd formula; Attention._schedule_op_eligible keeps gradient calls eager.
+_SCHEDULED_ATTENTION_LIB = Library("vllm_omni", "FRAGMENT")
 if not hasattr(torch.ops.vllm_omni, "scheduled_attention"):
-
-    @torch.library.custom_op("vllm_omni::scheduled_attention", mutates_args=())
-    def _scheduled_attention_op(
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        attn_mask: torch.Tensor | None,
-        layer_id: torch.Tensor,
-        metadata_spec: str,
-        metadata_ints: list[int],
-    ) -> torch.Tensor:
-        return _run_scheduled_attention(query, key, value, attn_mask, layer_id, metadata_spec, metadata_ints)
-
-    @_scheduled_attention_op.register_fake
-    def _scheduled_attention_fake(query, key, value, attn_mask, layer_id, metadata_spec, metadata_ints):
-        return query.new_empty((*query.shape[:-1], value.shape[-1]))
+    direct_register_custom_op(
+        op_name="scheduled_attention",
+        op_func=_run_scheduled_attention,
+        mutates_args=[],
+        fake_impl=_scheduled_attention_fake,
+        target_lib=_SCHEDULED_ATTENTION_LIB,
+        dispatch_key="CompositeExplicitAutograd",
+    )
 
 
 _scheduled_attention_op = torch.ops.vllm_omni.scheduled_attention
