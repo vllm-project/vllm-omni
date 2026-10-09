@@ -48,7 +48,6 @@ _DENOISE_PAYLOAD_KEYS = ("latents",)
 WAN2_2_PIPELINE = PipelineConfig(
     model_type="wan2_2",
     model_arch=_WAN_MODEL_ARCH,
-    diffusers_class_name="WanPipeline",
     default_deploy_config_name="wan2_2.yaml",
     stages=(
         StagePipelineConfig(
@@ -70,7 +69,6 @@ WAN2_2_PIPELINE = PipelineConfig(
 WAN2_2_EG_PIPELINE = PipelineConfig(
     model_type="wan2_2_eg",
     model_arch=_WAN_MODEL_ARCH,
-    diffusers_class_name="WanPipeline",
     default_deploy_config_name="wan2_2_eg.yaml",
     stages=(
         StagePipelineConfig(
@@ -111,7 +109,6 @@ WAN2_2_EG_PIPELINE = PipelineConfig(
 WAN2_2_EGD_PIPELINE = PipelineConfig(
     model_type="wan2_2_egd",
     model_arch=_WAN_MODEL_ARCH,
-    diffusers_class_name="WanPipeline",
     default_deploy_config_name="wan2_2_egd.yaml",
     stages=(
         StagePipelineConfig(

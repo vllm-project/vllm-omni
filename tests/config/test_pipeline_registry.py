@@ -122,6 +122,15 @@ def test_minimax_h3_disaggregation_is_explicit_opt_in():
     assert pipeline.model_type == "minimax_h3_disaggregated"
 
 
+@pytest.mark.parametrize("model_type", ["wan2_2", "wan2_2_eg", "wan2_2_egd"])
+def test_wan_explicit_topologies_do_not_shadow_ti2v_discovery(model_type):
+    pipeline = OMNI_PIPELINES[model_type]
+
+    assert pipeline.diffusers_class_name is None
+    assert pipeline.diffusers_class_aliases == ()
+    assert OMNI_PIPELINES["wan2_2_ti2v"].diffusers_class_name == "WanPipeline"
+
+
 def test_wan_eg_preserves_fused_denoise_decode_role():
     pipeline = OMNI_PIPELINES["wan2_2_eg"]
 
