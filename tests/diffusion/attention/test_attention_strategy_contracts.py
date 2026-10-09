@@ -15,6 +15,7 @@ from vllm_omni.diffusion.attention.parallel.base import NoParallelAttention
 from vllm_omni.diffusion.attention.strategy import (
     AttentionOperation,
     finalize_attention_strategy,
+    iter_attention_strategy_runners,
     validate_pipeline_attention_strategy,
 )
 from vllm_omni.diffusion.config import set_current_diffusion_config
@@ -61,6 +62,28 @@ def configuration(**options):
         parallel_config=SimpleNamespace(ring_degree=1),
         diffusion_kv_cache_dtype=None,
     )
+
+
+@pytest.mark.parametrize("missing_forward", [False, True])
+def test_failed_finalization_preserves_execution_environment(local_attention, missing_forward, monkeypatch):
+    config = configuration(presets={"base": "FLASH_ATTN"}, layout={"default": "base"})
+    with set_current_diffusion_config(config):
+        model = NewlySupportedTransformer("first")
+        environments = [
+            (module, module.attention_execution) for module in model.modules() if hasattr(module, "attention_execution")
+        ]
+        runner = model._attention_strategy_runner
+        if missing_forward:
+            del model._attention_strategy_runner
+            monkeypatch.setattr(model, "forward_with_attention_layout", None)
+        message = "forward_with_attention_layout" if missing_forward else "already finalized"
+        with pytest.raises(ValueError, match=message):
+            finalize_attention_strategy(model)
+        assert all(module.attention_execution is environment for module, environment in environments)
+        if missing_forward:
+            assert not hasattr(model, "_attention_strategy_runner")
+        else:
+            assert model._attention_strategy_runner is runner
 
 
 def test_component_scoped_inventory_is_complete_and_not_shared_mutable_state(local_attention):
@@ -303,3 +326,16 @@ def test_strategy_admits_pure_ulysses(enforce_eager):
     config.diffusion_compile_granularity = "full"
     with pytest.raises(ValueError, match="regional compilation or eager"):
         validate_strategy_parallel(config)
+
+
+def test_discovery_uses_declared_components_and_preserves_unfinalized_ones():
+    runner = object()
+    pipeline = SimpleNamespace(
+        attention_strategy_components=("optional", "ready", "unfinished"),
+        optional=None,
+        ready=SimpleNamespace(_attention_strategy_runner=runner),
+        unfinished=SimpleNamespace(),
+        undeclared=SimpleNamespace(_attention_strategy_runner=object()),
+    )
+    assert list(iter_attention_strategy_runners(pipeline)) == [("ready", runner), ("unfinished", None)]
+    assert list(iter_attention_strategy_runners(SimpleNamespace())) == []

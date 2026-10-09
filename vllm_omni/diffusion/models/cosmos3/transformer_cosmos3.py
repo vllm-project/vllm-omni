@@ -891,7 +891,7 @@ class Cosmos3CrossAttention(nn.Module):
             joint_strategy="front",
             extra={"protected_kv_prefix": k_und.shape[1], "ulysses_sp_padding": sparse_sp_padding},
         )
-        attention = self.attn if attention_layout is None else self.attn.for_layout(attention_layout)
+        attention = self.attn.for_layout(attention_layout)
         out = attention(q, k, v, attn_metadata)
         return out.reshape(B, S_gen, -1)
 
@@ -1005,9 +1005,7 @@ class Cosmos3CrossAttention(nn.Module):
                 control_weights,
                 attention_layout,
             )
-        elif (
-            not self.attention_execution.local_tensor_forward or self.attention_execution.ulysses_degree > 1
-        ) and _is_sp_active():
+        elif not self.attention_execution.single_device_strategy and _is_sp_active():
             out = self._forward_sp(q, k, v, k_und, v_und, attention_layout)
         else:
             out = self._forward_local(q, k, v, k_und, v_und, attention_layout)
@@ -2246,9 +2244,7 @@ class Cosmos3VFMTransformer(nn.Module):
         freqs = self.cached_freqs_gen if attention_context is None else attention_context.freqs_gen
         if freqs is None:
             raise RuntimeError("Cosmos3 GEN cache was not initialized before running GEN layers.")
-        if prep.use_multi_control_attention or (
-            self.attention_execution.local_tensor_forward and self.attention_execution.ulysses_degree == 1
-        ):
+        if prep.use_multi_control_attention or self.attention_execution.single_device_strategy:
             # Multi-control and single-device strategy execution need no SP hooks.
             return prep._replace(freqs_gen=freqs)
         hidden_gen, freqs_cos, freqs_sin = self.gen_sp_prepare(prep.hidden_gen, *freqs)
@@ -2687,7 +2683,7 @@ class Cosmos3VFMTransformer(nn.Module):
             prep.hidden_gen,
             freqs_gen=prep.freqs_gen,
             gather_output=not prep.use_multi_control_attention and not prep.defer_gen_gather
-            and (not self.attention_execution.local_tensor_forward or self.attention_execution.ulysses_degree > 1),
+            and (not self.attention_execution.single_device_strategy),
             control_token_sizes=prep.multi_control_token_sizes,
             control_weights=prep.multi_control_weights,
             attention_layout=attention_layout,

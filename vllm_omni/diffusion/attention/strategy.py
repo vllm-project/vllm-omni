@@ -78,66 +78,70 @@ class AttentionStrategy:
             raw_layouts = layouts
         if not isinstance(raw_layouts, Mapping):
             raise ValueError("layouts must be a mapping")
-        self.layouts = {}
-        for name, raw in raw_layouts.items():
-            if not isinstance(name, str) or not name:
-                raise ValueError("Layout names must be nonempty strings")
-            _mapping(raw, {"default", "overrides"}, "layout")
-            default = raw.get("default")
-            self._preset(default)
-            rules = []
-            raw_rules = raw.get("overrides", [])
-            if not isinstance(raw_rules, list):
-                raise ValueError("overrides must be a list")
-            for rule in raw_rules:
-                _mapping(rule, {"layers", "attention_role", "use", "component"}, "override")
-                self._preset(rule.get("use"))
-                layers = rule.get("layers")
-                if layers is not None and (
-                    not isinstance(layers, list)
-                    or not layers
-                    or any(type(i) is not int or i < 0 for i in layers)
-                    or len(set(layers)) != len(layers)
-                ):
-                    raise ValueError("layers must be distinct nonnegative integer indices")
-                role = rule.get("attention_role")
-                if role is not None and (not isinstance(role, str) or not role):
-                    raise ValueError("attention_role must be a nonempty string")
-                component = rule.get("component")
-                if component is not None and (not isinstance(component, str) or not component):
-                    raise ValueError("component must be a nonempty string")
-                rules.append(Override(None if layers is None else tuple(layers), role, rule["use"], component))
-            self.layouts[name] = Layout(default, tuple(rules))
-        self.coordinate = None
-        self.phases: tuple[tuple[int | float | None, str], ...] = ()
-        if schedule is not None:
-            _mapping(schedule, {"coordinate", "phases"}, "schedule")
-            self.coordinate = schedule.get("coordinate")
-            if self.coordinate not in ("step_index", "step_fraction"):
-                raise ValueError("schedule.coordinate must be step_index or step_fraction")
-            phases = schedule.get("phases")
-            if not isinstance(phases, list) or not phases:
-                raise ValueError("schedule.phases must be a nonempty list")
-            parsed = []
-            previous = 0
-            for index, phase in enumerate(phases):
-                _mapping(phase, {"until", "layout"}, "phase")
-                if "until" not in phase or phase.get("layout") not in self.layouts:
-                    raise ValueError("Each phase needs until and a known layout")
-                until = phase["until"]
-                final = index == len(phases) - 1
-                if self.coordinate == "step_index":
-                    valid = until is None if final else type(until) is int and until > previous
-                else:
-                    valid = type(until) in (int, float) and isfinite(until) and previous < until <= 1
-                    valid = valid and (not final or until == 1)
-                if not valid:
-                    raise ValueError("Phase boundaries must increase; end at null (step_index) or 1 (step_fraction)")
-                parsed.append((until, phase["layout"]))
-                previous = until
-            self.phases = tuple(parsed)
+        if any(not isinstance(name, str) or not name for name in raw_layouts):
+            raise ValueError("Layout names must be nonempty strings")
+        self.layouts = {name: self._parse_layout(raw) for name, raw in raw_layouts.items()}
+        self.coordinate, self.phases = self._parse_schedule(schedule)
+        if self.phases:
             reachable = {name for _, name in self.phases}
             self.layouts = {name: layout for name, layout in self.layouts.items() if name in reachable}
+
+    def _parse_layout(self, raw) -> Layout:
+        _mapping(raw, {"default", "overrides"}, "layout")
+        default = raw.get("default")
+        self._preset(default)
+        rules = []
+        raw_rules = raw.get("overrides", [])
+        if not isinstance(raw_rules, list):
+            raise ValueError("overrides must be a list")
+        for rule in raw_rules:
+            _mapping(rule, {"layers", "attention_role", "use", "component"}, "override")
+            self._preset(rule.get("use"))
+            layers = rule.get("layers")
+            if layers is not None and (
+                not isinstance(layers, list)
+                or not layers
+                or any(type(i) is not int or i < 0 for i in layers)
+                or len(set(layers)) != len(layers)
+            ):
+                raise ValueError("layers must be distinct nonnegative integer indices")
+            role = rule.get("attention_role")
+            if role is not None and (not isinstance(role, str) or not role):
+                raise ValueError("attention_role must be a nonempty string")
+            component = rule.get("component")
+            if component is not None and (not isinstance(component, str) or not component):
+                raise ValueError("component must be a nonempty string")
+            rules.append(Override(None if layers is None else tuple(layers), role, rule["use"], component))
+        return Layout(default, tuple(rules))
+
+    def _parse_schedule(self, schedule) -> tuple[str | None, tuple[tuple[int | float | None, str], ...]]:
+        if schedule is None:
+            return None, ()
+        _mapping(schedule, {"coordinate", "phases"}, "schedule")
+        coordinate = schedule.get("coordinate")
+        if coordinate not in ("step_index", "step_fraction"):
+            raise ValueError("schedule.coordinate must be step_index or step_fraction")
+        phases = schedule.get("phases")
+        if not isinstance(phases, list) or not phases:
+            raise ValueError("schedule.phases must be a nonempty list")
+        parsed = []
+        previous = 0
+        for index, phase in enumerate(phases):
+            _mapping(phase, {"until", "layout"}, "phase")
+            if "until" not in phase or phase.get("layout") not in self.layouts:
+                raise ValueError("Each phase needs until and a known layout")
+            until = phase["until"]
+            final = index == len(phases) - 1
+            if coordinate == "step_index":
+                valid = until is None if final else type(until) is int and until > previous
+            else:
+                valid = type(until) in (int, float) and isfinite(until) and previous < until <= 1
+                valid = valid and (not final or until == 1)
+            if not valid:
+                raise ValueError("Phase boundaries must increase; end at null (step_index) or 1 (step_fraction)")
+            parsed.append((until, phase["layout"]))
+            previous = until
+        return coordinate, tuple(parsed)
 
     def _preset(self, name):
         if not isinstance(name, str) or name not in self.presets:
@@ -163,8 +167,6 @@ class AttentionStrategy:
                 matched = [op for op in operations if rule.matches(op)]
                 if not matched or (rule.layers is not None and set(rule.layers) - {op.layer for op in matched}):
                     raise ValueError(f"Unknown layers or empty attention selector: {rule}")
-            for operation in operations:
-                layout.assignment(operation)
         for operation in operations:
             self.assignments(operation)
         return operations
@@ -190,6 +192,18 @@ def validate_strategy_runtime(config):
         raise ValueError("Attention strategies do not support: " + ", ".join(unsupported))
 
 
+def iter_attention_strategy_runners(pipeline):
+    """Yield declared, present components and their possibly unfinalized runner.
+
+    Missing optional components are skipped. A present component without a
+    runner yields None so startup validation can distinguish the two cases.
+    """
+    for name in getattr(pipeline, "attention_strategy_components", ()) or ():
+        model = getattr(pipeline, name, None)
+        if model is not None:
+            yield name, getattr(model, "_attention_strategy_runner", None)
+
+
 def validate_pipeline_attention_strategy(pipeline, config):
     """Validate all declared components together; never mutate shared configuration."""
     strategy = getattr(getattr(config, "diffusion_attention_config", None), "strategy", None)
@@ -200,11 +214,7 @@ def validate_pipeline_attention_strategy(pipeline, config):
         raise ValueError("Pipeline must declare its attention_strategy_components contract")
     operations = []
     found = set()
-    for name in components:
-        model = getattr(pipeline, name, None)
-        if model is None:
-            continue  # A declared optional component may be absent.
-        runner = getattr(model, "_attention_strategy_runner", None)
+    for name, runner in iter_attention_strategy_runners(pipeline):
         if runner is None:
             raise ValueError(f"Pipeline component {name!r} did not finalize an attention strategy")
         owned = {op.component for op in runner.plan.operations}
@@ -242,20 +252,20 @@ def finalize_attention_strategy(model):
         raise ValueError("A transformer forward must own exactly one attention component")
     if len({operation.identity for operation in operations}) != len(operations):
         raise ValueError("Attention operation identities must be unique within each component")
-    environment = AttentionExecutionEnvironment.for_model(config, support)
-    bind_attention_execution(model, environment)
     if hasattr(model, "_attention_strategy_runner"):
         raise ValueError("Attention strategy is already finalized; rebuild the model to change it")
     plan = ForwardStrategyPlan.from_strategy(strategy, operations=operations)
     if not callable(getattr(model, "forward_with_attention_layout", None)):
         raise ValueError("Strategy models must implement forward_with_attention_layout and dispatch from forward")
+    environment = AttentionExecutionEnvironment.for_model(config, support)
     runner = AttentionStrategyRunner(model, plan)
+    bind_attention_execution(model, environment)
     model._attention_strategy_runner = runner
 
 
 @dataclass(frozen=True)
 class ForwardStrategyPlan:
-    """Startup snapshot; only the request's schedule cursor changes at runtime."""
+    """Immutable startup snapshot; select layouts from logical request progress."""
 
     layout_names: tuple[str, ...]
     coordinate: str | None
@@ -269,23 +279,18 @@ class ForwardStrategyPlan:
             names, strategy.coordinate, tuple((until, names.index(name)) for until, name in strategy.phases), operations
         )
 
-    def resolve_steps(self, total):
-        if type(total) is not int or total < 1:
-            raise ValueError("Attention schedules require a positive logical iteration count")
+    def layout_for_step(self, step: int | None, total: int | None) -> int:
+        if type(step) is not int or type(total) is not int or not 0 <= step < total:
+            raise ValueError("Scheduled attention requires valid logical denoising progress")
         if self.coordinate is None:
-            return ((total, 0),)
-        resolved = []
-        previous = 0
+            return 0
         for until, layout in self.phases:
-            end = (
-                total
-                if until is None
-                else (min(int(until), total) if self.coordinate == "step_index" else ceil(until * total))
-            )
-            if end > previous:
-                resolved.append((end, layout))
-                previous = end
-        return tuple(resolved)
+            if until is None:
+                return layout
+            end = ceil(until * total) if self.coordinate == "step_fraction" else until
+            if step < end:
+                return layout
+        raise ValueError("Attention schedule does not cover the requested step")
 
     def current_layout(self):
         """Called once at the eager transformer boundary, never by compiled attention."""
@@ -296,14 +301,7 @@ class ForwardStrategyPlan:
         if not is_forward_context_available():
             raise ValueError("Scheduled attention requires logical denoising progress")
         context = get_forward_context()
-        step, total = context.denoise_step_idx, context.total_denoise_steps
-        if type(step) is not int or type(total) is not int or not 0 <= step < total:
-            raise ValueError("Scheduled attention requires valid logical denoising progress")
-        cached = context.attention_strategy_schedule
-        if cached is None or cached[0] is not self or cached[1] != total:
-            cached = (self, total, self.resolve_steps(total))
-            context.attention_strategy_schedule = cached
-        return next(layout for end, layout in cached[2] if step < end)
+        return self.layout_for_step(context.denoise_step_idx, context.total_denoise_steps)
 
 
 class AttentionStrategyRunner:
@@ -317,15 +315,15 @@ class AttentionStrategyRunner:
         self.plan = plan
         self._model = model
         self.prepare_inputs = getattr(model, "prepare_attention_strategy_inputs", None)
-        forward = getattr(model, "forward_with_attention_layout", model.forward)
-        self._eager_forwards = tuple(
-            partial(forward, attention_layout=layout) for layout in range(len(plan.layout_names))
-        )
-        self._forwards = self._eager_forwards
-        self.compiled = False
+        forward = model.forward_with_attention_layout
+        self._forwards = tuple(partial(forward, attention_layout=layout) for layout in range(len(plan.layout_names)))
         self.compile_granularity: str | None = None
         self.warming = False
         self._warmed_layouts: set[int] = set()
+
+    @property
+    def compiled(self) -> bool:
+        return self.compile_granularity is not None
 
     def __getstate__(self):
         if self.compiled:
@@ -368,29 +366,22 @@ class AttentionStrategyRunner:
                 recompile_limit=recompile_limit,
                 isolate_recompiles=True,
             )
-            self.compile_granularity = granularity
-            self.compiled = True
-            self._warmed_layouts.clear()
-            return
-        # Partials share a code object. Isolate each layout's guard budget,
-        # without multiplying the global limit by layout count. Keep Dynamo's
-        # aggregate cap intact.
-        # Allocate before activation; tracing remains lazy.
-        forwards = tuple(
-            torch.compile(
-                forward,
-                backend=backend,
-                fullgraph=False,
-                dynamic=dynamic,
-                recompile_limit=recompile_limit,
-                isolate_recompiles=True,
+        else:
+            # Partials share a code object. Isolate each layout's guard budget
+            # while keeping Dynamo's aggregate cap intact. Tracing remains lazy.
+            self._forwards = tuple(
+                torch.compile(
+                    forward,
+                    backend=backend,
+                    fullgraph=False,
+                    dynamic=dynamic,
+                    recompile_limit=recompile_limit,
+                    isolate_recompiles=True,
+                )
+                for forward in self._forwards
             )
-            for forward in self._eager_forwards
-        )
-        self._forwards = forwards
         self.compile_granularity = granularity
         self._warmed_layouts.clear()
-        self.compiled = True
 
     def warmup_status(self):
         return {
@@ -413,11 +404,11 @@ class AttentionStrategyRunner:
             args, kwargs = self.prepare_inputs(args, kwargs)
         # Explicit warmup exercises every layout even when a short denoising
         # schedule would never select it. Return only the scheduled result.
-        layouts = range(len(self._forwards)) if self.warming else (layout,)
-        for index in layouts:
-            result = self._forwards[index](*args, **kwargs)
+        if not self.warming:
+            return self._forwards[layout](*args, **kwargs)
+        for index, forward in enumerate(self._forwards):
+            result = forward(*args, **kwargs)
             if index == layout:
                 output = result
-            if self.warming:
-                self._warmed_layouts.add(index)
+            self._warmed_layouts.add(index)
         return output
