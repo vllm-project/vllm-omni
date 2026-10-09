@@ -237,13 +237,18 @@ def test_enforce_drops_uneven_decode_spans_to_single_frame():
     never came), so the batch drops to a single-frame step -- the shape the
     backend ran at warmup -- and constant_drafts re-arms the K-step on the
     next draftless step."""
-    reqs = {f"r{i}": r for i, r in enumerate([
-        _req(computed=100, prompt=100, spec=[0] * 3, total=104, req_id="r0"),
-        _req(computed=100, prompt=100, spec=[0] * 4, total=105, req_id="r1"),
-        _req(computed=100, prompt=100, spec=[0] * 4, total=105, req_id="r2"),
-        _req(computed=100, prompt=100, spec=[0] * 5, total=106, req_id="r3"),
-        _req(computed=100, prompt=100, spec=[0] * 5, total=106, req_id="r4"),
-    ])}
+    reqs = {
+        f"r{i}": r
+        for i, r in enumerate(
+            [
+                _req(computed=100, prompt=100, spec=[0] * 3, total=104, req_id="r0"),
+                _req(computed=100, prompt=100, spec=[0] * 4, total=105, req_id="r1"),
+                _req(computed=100, prompt=100, spec=[0] * 4, total=105, req_id="r2"),
+                _req(computed=100, prompt=100, spec=[0] * 5, total=106, req_id="r3"),
+                _req(computed=100, prompt=100, spec=[0] * 5, total=106, req_id="r4"),
+            ]
+        )
+    }
     sched = _make_scheduler(num_spec=5, waiting=[], running=list(reqs.values()))
     out = _sched_out(
         {"r0": 4, "r1": 5, "r2": 5, "r3": 6, "r4": 6},
@@ -510,12 +515,9 @@ def test_constant_drafts_fold_when_a_stop_truncates_a_row():
         [1, 2, 3, 4, 5, 6],
     ]
     scheduled = [5, 5, 5, 5, 5]
-    assert (
-        talker_multiframe.constant_drafts(
-            sampled, frames=6, num_reqs=5, scheduled_draft_counts=scheduled, fold_short_rows=True
-        )
-        == [[] for _ in range(5)]
-    )
+    assert talker_multiframe.constant_drafts(
+        sampled, frames=6, num_reqs=5, scheduled_draft_counts=scheduled, fold_short_rows=True
+    ) == [[] for _ in range(5)]
     # Default keeps the caller-decides contract: no fold without the flag.
     assert talker_multiframe.constant_drafts(sampled, frames=6, num_reqs=5, scheduled_draft_counts=scheduled) == [
         [talker_multiframe.CONTINUE_TOKEN_ID] * 5 for _ in range(5)
@@ -545,10 +547,9 @@ def test_constant_drafts_fold_when_a_row_samples_nothing():
 
     sampled = [[1, 2, 3, 4, 5, 6], [], [1, 2, 3, 4, 5, 6]]
     scheduled = [5, 5, 5]
-    assert (
-        talker_multiframe.constant_drafts(sampled, frames=6, num_reqs=3, scheduled_draft_counts=scheduled)
-        == [[] for _ in range(3)]
-    )
+    assert talker_multiframe.constant_drafts(sampled, frames=6, num_reqs=3, scheduled_draft_counts=scheduled) == [
+        [] for _ in range(3)
+    ]
 
 
 def test_constant_drafts_keep_drafts_when_every_row_is_full():

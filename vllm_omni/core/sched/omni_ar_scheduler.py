@@ -612,10 +612,9 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 min_frames = 0
         elif spec_tokens:
             num_spec_tokens = int(getattr(self, "num_spec_tokens", 0) or 0)
-            uniform_full = (
-                len(spec_tokens) == len(num_scheduled_tokens)
-                and {len(v) for v in spec_tokens.values()} == {num_spec_tokens}
-            )
+            uniform_full = len(spec_tokens) == len(num_scheduled_tokens) and {len(v) for v in spec_tokens.values()} == {
+                num_spec_tokens
+            }
             if not uniform_full:
                 # A narrower K-step is not executable: the static-shape decode
                 # backend has no graph for q_len in (1, 1+num_spec), so a

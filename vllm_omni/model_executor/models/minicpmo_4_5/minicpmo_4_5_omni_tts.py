@@ -595,10 +595,10 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         self._mask_eos_rows: list[bool] | None = None
         self._pending_force_eos_rows: list[bool] | None = None
         self._penalty_histories: list[torch.Tensor] | torch.Tensor | None = None
-        # Host copies of this step's decode input ids, keyed by request
-        # id: make_omni_output reads them for EOS detection and penalty
-        # history.
-        self._decode_codec_ids: dict[str, tuple[_HostCodecIds, int]] = {}
+        # Device snapshots of this step's decode input ids, keyed by
+        # request id: make_omni_output reads them for EOS detection and
+        # penalty history.
+        self._decode_codec_ids: dict[str, tuple[torch.Tensor, int]] = {}
         self._request_audio_states: dict[str, dict[str, Any]] = {}
         # Mirrors upstream TTSStreamingGenerator._chunk_info: one committed
         # condition plus, during a rollover, one immutable recompute recipe.
@@ -2348,9 +2348,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             and per_req_sampling_params is not None
             and len(per_req_sampling_params) == logits.shape[0]
             and all(
-                isinstance(params, SamplingParams)
-                and params.frequency_penalty == 0
-                and params.presence_penalty == 0
+                isinstance(params, SamplingParams) and params.frequency_penalty == 0 and params.presence_penalty == 0
                 for params in per_req_sampling_params
             )
         )
