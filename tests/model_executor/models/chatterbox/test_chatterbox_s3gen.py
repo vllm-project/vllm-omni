@@ -294,6 +294,15 @@ def test_noise_is_taken_by_position_for_every_prompt_length_001(
         assert not torch.allclose(mel, decoded_from(decoder.prompt_noise_frames), atol=1e-2)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_noise_is_the_same_draw_when_built_on_a_default_device_001(decoder: S3GenDecoder) -> None:
+    """vLLM builds the stage inside a default-device context."""
+    with torch.device("cuda"):
+        built = S3GenDecoder(ChatterboxConfig())
+    assert built.flow_noise.device.type == built.trim_fade.device.type == "cuda"
+    assert torch.equal(built.flow_noise.cpu(), decoder.flow_noise)
+
+
 def test_chunked_mel_is_closer_to_one_chunk_than_a_noise_redraw_001(
     decoder: S3GenDecoder, references: list[Reference]
 ) -> None:

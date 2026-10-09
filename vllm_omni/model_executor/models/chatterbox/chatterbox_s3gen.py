@@ -336,6 +336,9 @@ class S3GenDecoder(nn.Module):
 
         # The flow's noise by position: the reference prompt's frames, then
         # the utterance's. Sized for the longest of each the config allows.
+        # Drawn on the CPU and then moved: vLLM builds the stage inside a
+        # default-device context, where a CPU generator cannot fill the
+        # tensor and a device generator would draw different noise.
         ratio = config.token_mel_ratio
         self.prompt_noise_frames = config.dec_cond_seconds * config.token_rate * ratio
         utterance_frames = (config.max_new_tokens + config.n_silence_tokens) * ratio
@@ -346,7 +349,8 @@ class S3GenDecoder(nn.Module):
                 config.mel["num_mels"],
                 self.prompt_noise_frames + utterance_frames,
                 generator=torch.Generator().manual_seed(NOISE_SEED),
-            ),
+                device="cpu",
+            ).to(trim_fade.device),
             persistent=False,
         )
 
