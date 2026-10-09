@@ -9,6 +9,7 @@ A tiny ``WanTransformer3DModel`` runs its real ``forward``: every block gets the
 """
 
 import socket
+from typing import Any
 
 import pytest
 import torch
@@ -16,6 +17,7 @@ from torch._dynamo.utils import counters as dynamo_counters
 
 import vllm_omni.diffusion.attention.layer as layer_mod
 import vllm_omni.diffusion.models.wan2_2.wan2_2_transformer as wan_mod
+from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.backends.sdpa import SDPABackend, SDPAImpl
 from vllm_omni.diffusion.attention.parallel.base import NoParallelAttention
 from vllm_omni.diffusion.attention.schedule import AttentionScheduleRange
@@ -36,7 +38,7 @@ _STEPS = 3
 # Latents [batch, channels, frames, height, width]; patch (1, 2, 2) gives grid (3, 8, 8), 192 tokens.
 _SHAPE = (1, 4, 3, 16, 16)
 _OTHER_SHAPE = (1, 4, 2, 12, 20)
-_SEEN: list[tuple[str, object]] = []
+_SEEN: list[tuple[str, AttentionMetadata | None]] = []
 
 
 @pytest.fixture
@@ -120,7 +122,7 @@ class _Pipeline(DenoiseProgressMixin):
     pass
 
 
-def _service(schedule_config):
+def _service(schedule_config: AttentionScheduleConfig | None) -> tuple[Any, Any, _CountingInductor]:
     # Dynamo keeps automatic-dynamic state per code object, so start each service from scratch.
     torch._dynamo.reset()
     config = OmniDiffusionConfig(diffusion_attention_schedule=schedule_config)
@@ -151,7 +153,13 @@ def _service(schedule_config):
     return model, config, counter
 
 
-def _run(model, config, counter, schedule, shape=_SHAPE):
+def _run(
+    model: Any,
+    config: Any,
+    counter: _CountingInductor,
+    schedule: tuple[AttentionScheduleRange, ...] | None,
+    shape: tuple[int, int, int, int, int] = _SHAPE,
+) -> tuple[list[Any], list[Any]]:
     """One request of ``_STEPS`` steps; returns each step's output and graph executions per block."""
     generator = torch.Generator().manual_seed(1)
     latents = torch.randn(shape, generator=generator).to(torch.bfloat16)
