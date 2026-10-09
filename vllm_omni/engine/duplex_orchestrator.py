@@ -49,6 +49,10 @@ from vllm_omni.engine.orchestrator import (
 )
 from vllm_omni.engine.stage_pool import StageUnavailableError
 from vllm_omni.tracing import RequestTrace
+from vllm_omni.model_executor.stage_input_processors.response_judge import (
+    RESPONSE_JUDGE_STAGE,
+    judge_rejects,
+)
 
 if TYPE_CHECKING:
     from vllm.config import ModelConfig
@@ -252,6 +256,7 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
             segment_token_ids=tuple(segment.token_ids),
             segment_output_metadata=segment.output_metadata,
             perf_chunks=self._take_perf_chunks(req_state, stage_id),
+            response_judge_rejected=finished and self._is_response_judge_stage(stage_id) and judge_rejects(output),
         )
         return runner.on_stage_output(
             stage_id,
@@ -330,6 +335,11 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
         # ErrorMessage. Close a resident session before another append can recreate
         # its finished stage request without the model's voice/persona prefill.
         return await self._handle_forward_failure(req_state.request_id, stage_id, req_state, RuntimeError(error))
+
+    def _is_response_judge_stage(self, stage_id: int) -> bool:
+        stage_vllm_config = getattr(self.stage_pools[stage_id], "stage_vllm_config", None)
+        model_config = getattr(stage_vllm_config, "model_config", None)
+        return getattr(model_config, "model_stage", None) == RESPONSE_JUDGE_STAGE
 
     async def _handle_forward_failure(
         self,

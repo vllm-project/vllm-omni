@@ -21,6 +21,7 @@ an implementation contract has a user-facing workflow.
 | Reclaim stage memory without restarting the server | [Sleep Mode](sleep_mode.md) | Runtime lifecycle behavior is documented in the user guide |
 | Run and route each stage independently (experimental) | [Independent Stage Execution](independent_stage_execution.md) | See user guide |
 | Make the Qwen3-Omni thinker's log-probs bitwise reproducible by an HF trainer for RL | [HF Numerics for RL Rollouts](hf_numerics.md) | Numerics contract is documented in the user guide |
+| Skip the main model and TTS for turns that need no reply (backchannels, noise) | [Response Judge Stage](response_judge.md) | Behavior is documented in the user guide |
 
 The [Prefill-Decode Disaggregation design reference](pd_disaggregation.md)
 describes the experimental Qwen3-Omni runtime topology and its current

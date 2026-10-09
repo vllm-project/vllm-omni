@@ -1,0 +1,37 @@
+# aura_omni_judged.yaml with the LAYA decision model as the response judge.
+# Only stage 1 changes: LAYA is an encoder with a decision head, served with
+# the pooling runner; it scores the listed options at their [MASK] markers
+# and the turn is let through when P(reply_option) >= threshold.
+#
+# LAYA checkpoints keep config.json and the tokenizer in subfolders; `model`
+# is a directory laid out for vLLM (config.json with
+# architectures: [LayaDecisionModel], the weights, tokenizer files).
+base_config: aura_omni_judged.yaml
+pipeline: aura_omni_judged
+
+stages:
+  - stage_id: 1
+    model: /path/to/laya-multilingual-vllm
+    model_arch: LayaDecisionModel
+    runner: pooling
+    # Pooling is one forward pass: sync scheduler, no prefix cache (encoder-only).
+    async_scheduling: false
+    enable_prefix_caching: false
+    max_model_len: 1024
+    max_num_batched_tokens: 8192
+    default_pooling_params:
+      task: classify
+    hf_overrides:
+      laya_question_type: choice
+      # Prompt and threshold chosen on the author's small tune set (zero-shot
+      # LAYA is weak at "does this need a reply"; fine-tuning is future work).
+      response_judge:
+        format: laya
+        question_type: choice
+        instructions: Does the assistant need to answer?
+        options:
+          "yes": yes, answer the user
+          "no": no, just keep listening
+        reply_option: "yes"
+        threshold: 0.633
+        state_template: "The user just said to the voice assistant: \"{transcript}\""

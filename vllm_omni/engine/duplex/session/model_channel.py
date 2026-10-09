@@ -665,6 +665,11 @@ class ModelChannel:
         self, stage_id: int, output: RequestOutput, context: DuplexOutputContext
     ) -> DuplexOutputDecision | None:
         """Pure plugin decision (no session mutation: this runs inline on the orchestrator loop)."""
+        if context.response_judge_rejected:
+            decision = self._ctx.plugin.response_judge_decision()
+            if not isinstance(decision, DuplexOutputDecision):
+                raise TypeError("duplex plugin response_judge_decision() must return DuplexOutputDecision")
+            return decision
         decision = self._ctx.plugin.decide_output(
             stage_id=stage_id,
             final_stage_id=context.final_stage_id,
@@ -689,6 +694,9 @@ class ModelChannel:
         self, stage_id: int, output: RequestOutput, context: DuplexOutputContext
     ) -> bool:
         """Ask the plugin whether the next commit may start while TTS drains."""
+        if context.response_judge_rejected:
+            # A rejected turn never reaches the main model or TTS.
+            return True
         return self._ctx.plugin.release_concurrent_turn_requests(
             stage_id=stage_id,
             segment_finished=context.segment_finished,

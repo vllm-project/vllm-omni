@@ -1,0 +1,130 @@
+# Response Judge Stage
+
+In a realtime voice pipeline, VAD commits a turn at every pause. A
+backchannel ("uh-huh", "okay"), a cough, noise or speech addressed to someone
+else then runs the whole downstream pipeline: the main model generates a
+reply and TTS speaks it.
+
+A **response judge** is an optional stage placed right after the ASR stage. A
+small judge model reads the ASR transcript and decides whether the turn needs
+a reply. A turn that does not ends at the judge, and the main model and TTS
+are not run. Any judge model can be used: a chat model that answers with one
+token, or a pooling (decision / scoring) model.
+
+```text
+Audio -> VAD commit -> ASR -> response judge -+-> reply needed:    main model -> TTS
+                                              +-> no reply needed: turn ends
+```
+
+## Behavior
+
+- **Opt-in.** Only pipelines that declare a `response_judge` stage run it.
+  The judged pipeline is a separate deploy config; the original one is
+  unchanged and loads no judge model.
+- **Reuses the existing no-reply paths.** In a duplex session a rejected turn
+  takes the model's existing listen decision: the client receives
+  `response.listen`, prewarmed downstream requests are aborted and released,
+  and the turn ends. In turn-based serving the judge's bridge yields no input
+  and the request finishes through the orchestrator's existing empty-output
+  path, which also aborts any downstream stage that async-chunk already
+  prewarmed.
+- **Lets the turn through when unsure.** An empty transcript or an answer
+  that cannot be read lets the turn through with the original transcript. A
+  failing judge stage uses the existing stage failure handling.
+- **The main model sees the ASR output unchanged.** The judge's own output is
+  never passed downstream.
+- **The judge reads only the current transcript**, not the conversation
+  history. A rejected turn is not added to the model's history.
+
+## Judge models
+
+The judge is configured on its own stage in the deploy config, under
+`hf_overrides.response_judge`:
+
+| `format` | Model | Runner | Decision |
+| --- | --- | --- | --- |
+| `chat_yes_no` | Any chat model; `ResponseJudgeQwen3ForCausalLM` for Qwen3 | generate (`max_tokens: 1`) | Rejects only when the answer is exactly `reject_label` (default `NO`) |
+| `laya` | LAYA decision models, `LayaDecisionModel` | pooling (`task: classify`) | Rejects when P(`reply_option`) < `threshold` |
+| `clm` | Contrastive-LM (CLM) encoder + heads, `ClmDecisionModel` | pooling (`task: classify`) | Rejects when P(`reply_option`) < `threshold` |
+
+Options per format:
+
+- `chat_yes_no`: `system_prompt`, `user_template` (with `{transcript}`), and
+  `reject_label`. The chat template is rendered with thinking disabled, so
+  the first generated token is the answer.
+- `laya`: `question_type`, `instructions`, `options` (key -> description),
+  `reply_option`, `threshold` and `state_template`.
+- `clm`: the option projections are fixed when the model directory is
+  prepared, and that directory's `config.json` carries the matching
+  `response_judge` options (`option_keys`, `reply_option`, `threshold`,
+  `instructions` and `state_template`).
+
+`reply_option` may be a list; the probabilities of the listed options are
+added.
+
+## Example: AURA
+
+`vllm_omni/deploy/aura_omni_judged.yaml` serves the `aura_omni_judged`
+pipeline:
+
+```text
+Qwen3-ASR -> response judge -> AURA -> Qwen3-TTS Talker -> Code2Wav
+```
+
+It uses Qwen3-1.7B as the judge:
+
+```yaml
+  - stage_id: 1
+    model: Qwen/Qwen3-1.7B
+    hf_overrides:
+      response_judge:
+        format: chat_yes_no
+    default_sampling_params:
+      temperature: 0.0
+      max_tokens: 1
+```
+
+`aura_omni_judged_laya.yaml` and `aura_omni_judged_clm.yaml` inherit it with
+`base_config` and replace only stage 1 with a pooling judge. Serve
+`aura_omni.yaml` to run AURA without a judge.
+
+## Adding a judge
+
+- **Another chat model:** the `aura_omni_judged` pipeline defaults stage 1
+  to `model_arch: ResponseJudgeQwen3ForCausalLM`, so a non-Qwen3 judge must
+  also set `model_arch`. The omni runner passes extra keyword arguments to
+  `forward` and `compute_logits`; a model class that does not accept them
+  needs a thin subclass like `ResponseJudgeQwen3ForCausalLM`, registered in
+  `vllm_omni/model_executor/models/registry.py`:
+
+    ```yaml
+      - stage_id: 1
+        model: <chat model>
+        model_arch: <registered judge class>
+        hf_overrides:
+          response_judge:
+            format: chat_yes_no
+            system_prompt: "..."
+        default_sampling_params:
+          temperature: 0.0
+          max_tokens: 1
+    ```
+
+- **Another pooling model:** add a pooling model class that returns one logit
+  per option, and a format entry in
+  `vllm_omni/model_executor/stage_input_processors/response_judge.py` that
+  builds its prompt and reads its decision.
+- **Another pipeline:** add a stage with `model_stage="response_judge"` right
+  after the ASR stage. Build its input with `judge_input(...)`, and wrap the
+  pipeline's original ASR -> main-model bridge with `after_judge(...)`. A
+  duplex plugin that addresses stages by number must account for the extra
+  stage (AURA uses a role-based stage layout).
+
+## Limitations
+
+- The judge only sees the transcript, so it cannot use acoustic cues such as
+  laughter or who is speaking.
+- Judge quality depends on the model and the prompt. Zero-shot decision
+  models (LAYA, CLM) are weak at "does this need a reply"; fine-tuning their
+  heads is future work.
+- The judge adds its own latency and GPU memory to every committed turn.
