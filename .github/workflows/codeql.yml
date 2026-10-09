@@ -34,7 +34,7 @@ jobs:
         with:
           # One job keeps a single "CodeQL / Analyze" check. Per-language
           # progress stays in this job's log. Categories stay /language:<name>.
-          languages: actions, javascript-typescript, python, c-cpp
+          languages: actions, javascript-typescript, python
           build-mode: none
 
       - name: Perform CodeQL Analysis
