@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+from dataclasses import replace
+
 import pytest
 import torch
 
@@ -344,3 +346,115 @@ def test_tokens_past_the_noise_buffer_are_refused_001(decoder: S3GenDecoder, ref
     tokens = torch.randint(0, 6561, (1001,))
     with pytest.raises(RuntimeError, match="1004 speech tokens after a 20-token reference.*holds 1003 and 250"):
         decoder.chunked_decode_streaming([Chunk(tokens, 960, references[0], None, True)])
+
+
+def test_a_row_is_vocoded_as_it_is_alone_whatever_shares_the_step_001(decoder: S3GenDecoder) -> None:
+    """Rows of unequal length never share a vocoder call, so no row is padded.
+
+    Seeded because HiFT's source module draws on every call. The first row's
+    call comes first either way, so it sees the same draw.
+    """
+    short, longer = torch.randn(1, 80, 40), torch.randn(1, 80, 68)
+    torch.manual_seed(5)
+    (alone,), (alone_source,) = decoder.vocode([short], torch.zeros(1, 1, 0))
+    torch.manual_seed(5)
+    wavs, sources = decoder.vocode([short, longer], torch.zeros(2, 1, 0))
+    assert torch.equal(wavs[0], alone)
+    assert torch.equal(sources[0], alone_source)
+    assert wavs[1].shape == (1, 68 * SAMPLES_PER_FRAME)
+    assert sources[1].shape == (1, 1, 68 * SAMPLES_PER_FRAME)
+
+
+def test_rows_of_equal_length_share_one_vocoder_call_001(decoder: S3GenDecoder) -> None:
+    """Nothing is padded between them, so batching them costs no independence."""
+    mels = [torch.randn(1, 80, 68), torch.randn(1, 80, 40), torch.randn(1, 80, 68)]
+    cache = torch.randn(3, 1, SOURCE_CACHE_SAMPLES)
+    torch.manual_seed(5)
+    wavs, sources = decoder.vocode(mels, cache)
+    torch.manual_seed(5)
+    speech, source = decoder.mel2wav.inference(speech_feat=torch.cat([mels[0], mels[2]]), cache_source=cache[[0, 2]])
+    assert torch.equal(torch.cat([wavs[0], wavs[2]]), speech)
+    assert torch.equal(torch.cat([sources[0], sources[2]]), source)
+    # Each row keeps its own source cache.
+    assert all(torch.equal(sources[i][:, :, :SOURCE_CACHE_SAMPLES], cache[i : i + 1]) for i in range(3))
+
+
+def test_two_live_streams_in_one_step_use_their_own_state_001(
+    decoder: S3GenDecoder, references: list[Reference]
+) -> None:
+    """Cached mel, source cache and cross-fade tail are paired with their row.
+
+    The tails are constants of opposite sign: a cross-fade starts at 0.08 of
+    the new audio, which HiFT clamps below 1, plus all of the tail, so a
+    row's first sample has its own tail's sign. Then one row's cached mel
+    and source are changed under a pinned vocoder draw: that row's audio
+    must change and the other row's must not.
+    """
+    tokens = [torch.randint(0, 6561, (53,)) for _ in range(2)]
+    refs = [references[0], references[1]]
+    states = []
+    for row, ref, level in zip(tokens, refs, (0.5, -0.5), strict=True):
+        ((_, state),) = decoder.chunked_decode_streaming([Chunk(row[:23], 0, ref, None, False)])
+        states.append(replace(state, speech=torch.full((1, SOURCE_CACHE_SAMPLES), level)))
+
+    def step(state_a: StreamState, state_b: StreamState) -> list[torch.Tensor]:
+        torch.manual_seed(7)
+        results = decoder.chunked_decode_streaming(
+            [Chunk(tokens[0], 20, refs[0], state_a, False), Chunk(tokens[1], 20, refs[1], state_b, False)]
+        )
+        return [piece for piece, _ in results]
+
+    a, b = step(states[0], states[1])
+    assert a.shape == b.shape == (1, (8 + 60) * SAMPLES_PER_FRAME - SOURCE_CACHE_SAMPLES)
+    assert a[0, 0] > 0.4
+    assert b[0, 0] < -0.4
+
+    other = [replace(state, mel=state.mel.flip(2), source=-state.source) for state in states]
+    changed_a, same_b = step(other[0], states[1])
+    assert torch.equal(same_b, b)
+    assert not torch.allclose(changed_a[:, :SOURCE_CACHE_SAMPLES], a[:, :SOURCE_CACHE_SAMPLES], atol=1e-3)
+    same_a, changed_b = step(states[0], other[1])
+    assert torch.equal(same_a, a)
+    assert not torch.allclose(changed_b[:, :SOURCE_CACHE_SAMPLES], b[:, :SOURCE_CACHE_SAMPLES], atol=1e-3)
+
+
+def test_a_live_stream_and_a_first_chunk_in_one_step_001(decoder: S3GenDecoder, references: list[Reference]) -> None:
+    """The first chunk gets the fade-in and no cross-fade; the live stream the reverse."""
+    tokens = torch.randint(0, 6561, (53,))
+    ((_, state),) = decoder.chunked_decode_streaming([Chunk(tokens[:23], 0, references[0], None, False)])
+    state = replace(state, speech=torch.full((1, SOURCE_CACHE_SAMPLES), 0.5))
+    (first, first_state), (live, live_state) = decoder.chunked_decode_streaming(
+        [Chunk(tokens[:23], 0, references[1], None, False), Chunk(tokens, 20, references[0], state, False)]
+    )
+    assert first.shape == (1, 40 * SAMPLES_PER_FRAME - SOURCE_CACHE_SAMPLES)
+    assert live.shape == (1, (8 + 60) * SAMPLES_PER_FRAME - SOURCE_CACHE_SAMPLES)
+    # Upstream's trim: the first 20 ms of an utterance are silenced.
+    assert torch.count_nonzero(first[0, :SAMPLES_PER_FRAME]) == 0
+    assert live[0, 0] > 0.4
+    assert first_state is not None and live_state is not None
+    assert first_state.speech.shape == live_state.speech.shape == (1, SOURCE_CACHE_SAMPLES)
+
+
+def test_tokens_with_an_empty_payload_are_refused_001(decoder: S3GenDecoder) -> None:
+    """What the runner passes for a request it holds no payload for."""
+    with pytest.raises(RuntimeError, match="23 tokens for request x without a reference or stream metadata"):
+        decoder.decode_step(torch.randint(0, 6561, (23,)), [23], [{}], ["x"])
+
+
+def test_tokens_without_a_payload_list_are_refused_001(decoder: S3GenDecoder) -> None:
+    """Only the profiling run, which has no request ids, comes without payloads."""
+    with pytest.raises(RuntimeError, match="23 tokens for request x without a reference or stream metadata"):
+        decoder.decode_step(torch.randint(0, 6561, (23,)), [23], None, ["x"])
+
+
+def test_token_offset_and_stream_state_must_agree_001(decoder: S3GenDecoder, references: list[Reference]) -> None:
+    """Either mismatch would play a chunk with the wrong seam and no error."""
+    tokens = torch.randint(0, 6561, (53,))
+    with pytest.raises(RuntimeError, match="token offset 20 for request lost, which has no earlier chunk"):
+        decoder.decode_step(tokens, [53], [stream_payload(references[0], False, 20)], ["lost"])
+
+    decoder.decode_step(tokens[:23], [23], [stream_payload(references[0], False, 0)], ["restarted"])
+    with pytest.raises(RuntimeError, match="token offset 0 for request restarted, which already has an earlier chunk"):
+        decoder.decode_step(tokens[:23], [23], [stream_payload(references[0], False, 0)], ["restarted"])
+    decoder.on_requests_finished({"restarted"})
+    assert decoder.streams == {}

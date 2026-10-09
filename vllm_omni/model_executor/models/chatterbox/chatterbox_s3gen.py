@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Stage 1 of Chatterbox Turbo: S3 speech tokens to 24 kHz audio.
+"""Stage 1 of Chatterbox: S3 speech tokens to audio.
 
 Every step, the stage is handed the chunk of every request that has one
-ready. All of them go through one flow call and at most two vocoder calls,
-one row per request, so requests are the batch dimension here as they are in
-stage 0.
+ready. All of them go through one flow call, one row per request, so
+requests are the batch dimension here as they are in stage 0. The vocoder
+batches the rows whose mels are equally long and never pads one, so the
+audio a request plays does not depend on what shares its step.
 
 Upstream ships S3Gen with the streaming hooks of the CosyVoice 2 decoder it
 is derived from but not the loop that uses them, and its flow's own
@@ -29,16 +30,9 @@ noise by position from one fixed buffer, so a mel frame starts from the same
 noise every time it is decoded, whichever chunk it falls in. The flow is
 therefore deterministic for a given token sequence and voice, where upstream
 gives a new sample on every call; the vocoder's source module still draws
-its own phase and noise per call.
-
-Measured with the Turbo checkpoint on six sentences: audio decoded in chunks
-is 0.4 to 0.7 times as far, in mean log-mel distance, from the same tokens
-decoded as one chunk as two noise draws are from each other. Chunks
-still differ from the one-chunk decode, because a chunk is decoded before
-the tokens that follow it exist and from a bounded context: the mel step
-across a seam is 1.1 to 2.9 times the step at the same frames of the
-one-chunk decode, median 1.3 (median 1.7 when every chunk drew its own
-noise).
+its own phase and noise per call. Chunks still differ from a one-chunk
+decode of the same tokens, because a chunk is decoded before the tokens
+that follow it exist and from a bounded context.
 """
 
 import math
@@ -82,7 +76,7 @@ class Reference:
 
     Attributes:
         prompt_token: Shape (1, P), S3 tokens of the reference clip.
-        prompt_feat: Shape (1, 2P, 80), its 24 kHz mel.
+        prompt_feat: Shape (1, 2P, 80), its mel at the output sample rate.
         embedding: Shape (1, 192), its x-vector.
     """
 
@@ -202,8 +196,9 @@ def flow_mels(
     """Mels for a batch of token rows in one flow call.
 
     Row ``i`` is laid out ``[prompt_i | tokens_i | padding]``. Prompts differ
-    in length between requests (a reference clip shorter than ten seconds
-    gives fewer than 250 tokens), so every length here is per row.
+    in length between requests (a reference clip shorter than the
+    conditioning window gives a shorter prompt), so every length here is
+    per row.
 
     Args:
         flow: The loaded flow.
@@ -211,9 +206,9 @@ def flow_mels(
         references: B voices.
         finalize: Per row, whether the lookahead frames are kept.
         n_timesteps: Flow steps.
-        meanflow: Whether the checkpoint is the distilled meanflow model (Turbo:
-            plain Euler steps) or the standard one (Euler steps with the
-            flow's own classifier-free guidance, on a cosine schedule).
+        meanflow: Whether the checkpoint is a distilled meanflow model (plain
+            Euler steps) or a standard one (Euler steps with the flow's own
+            classifier-free guidance, on a cosine schedule).
         noise: Shape (B, 80, F) covering the last F mel frames of the flow's
             input; the flow draws the frames before them. None lets it draw
             them all, which is the distribution upstream's ``flow_inference``
@@ -270,6 +265,10 @@ class S3GenDecoder(nn.Module):
     at its own position in ``flow_noise``, so a frame decoded again in a
     later chunk, or in another batch, starts from the same noise. The same
     tokens and voice always give the same mel.
+
+    Args:
+        config: The checkpoint's constants; the flow's variant, its step
+            count and the silence tokens all come from it.
     """
 
     def __init__(self, config: ChatterboxConfig) -> None:
@@ -359,12 +358,13 @@ class S3GenDecoder(nn.Module):
         self.streams: dict[str, StreamState] = {}
 
     def vocode(self, mels: list[torch.Tensor], cache: torch.Tensor) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
-        """One HiFT call over B mels of unequal length.
+        """HiFT over B mels, one call per mel length.
 
-        A shorter row is zero-padded, so the vocoder's convolutions see
-        silence past its end and its last few frames differ slightly from a
-        call with that row alone. For a non-final chunk those frames are
-        the held-back overlap, vocoded again with the next chunk.
+        Rows are never padded to share a call. HiFT and its F0 predictor are
+        not causal: padding reaches the last twelve frames of the row before
+        it, whether the padding is zeros or the row's last frame repeated,
+        and a non-final chunk holds back only eight. Rows of equal length
+        share a call, which leaves each as it is alone.
 
         Args:
             mels: B mels of shape (1, 80, F_i).
@@ -374,14 +374,17 @@ class S3GenDecoder(nn.Module):
         Returns:
             B waveforms of shape (1, F_i * 480) and B sources (1, 1, F_i * 480).
         """
-        longest = max(mel.shape[2] for mel in mels)
-        batch = torch.cat([nn.functional.pad(mel, (0, longest - mel.shape[2])) for mel in mels])
-        speech, source = self.mel2wav.inference(speech_feat=batch, cache_source=cache)
-        samples = [mel.shape[2] * SAMPLES_PER_FRAME for mel in mels]
-        return (
-            [speech[i : i + 1, :n] for i, n in enumerate(samples)],
-            [source[i : i + 1, :, :n] for i, n in enumerate(samples)],
-        )
+        frames = [mel.shape[2] for mel in mels]
+        speech: dict[int, torch.Tensor] = {}
+        source: dict[int, torch.Tensor] = {}
+        for length in dict.fromkeys(frames):
+            rows = [i for i, n in enumerate(frames) if n == length]
+            wavs, sources = self.mel2wav.inference(
+                speech_feat=torch.cat([mels[i] for i in rows]), cache_source=cache[rows]
+            )
+            for k, i in enumerate(rows):
+                speech[i], source[i] = wavs[k : k + 1], sources[k : k + 1]
+        return [speech[i] for i in range(len(mels))], [source[i] for i in range(len(mels))]
 
     @torch.inference_mode()
     def chunk_mels(self, chunks: list[Chunk]) -> list[torch.Tensor]:
@@ -450,14 +453,14 @@ class S3GenDecoder(nn.Module):
 
         Rows carrying a source cache and first chunks are vocoded separately,
         because HiFT writes the cache over the first samples of every row it
-        is given.
+        is given; within each, see ``vocode``.
 
         Args:
             chunks: The step's chunks, one per request.
 
         Returns:
-            Per chunk, in order: the new audio of shape (1, n) at 24 kHz and
-            the state for the request's next chunk (None after the last).
+            Per chunk, in order: the new audio of shape (1, n) and the state
+            for the request's next chunk (None after the last).
         """
         mels = self.chunk_mels(chunks)
 
@@ -515,35 +518,38 @@ class S3GenDecoder(nn.Module):
             input_ids: The step's flat token ids; per request, every valid
                 speech token of the utterance so far.
             counts: Tokens per request, in batch order.
-            payloads: Per request, the merged inter-stage payload. None on
-                the engine's profiling run.
+            payloads: Per request, the merged inter-stage payload; empty for
+                a request the runner holds none for.
             request_ids: Per request, the scheduler's id. None on the
-                profiling run.
+                engine's profiling run, and only then.
 
         Returns:
-            Per request, 1-D float32 audio at 24 kHz: only the samples new
-            in this step, empty when the request had nothing to decode.
+            Per request, 1-D float32 audio: only the samples new in this
+            step, empty when the request had nothing to decode.
 
         Raises:
-            RuntimeError: If a request has tokens but no reference or stream
-                metadata. Decoding such a chunk as a whole utterance would
-                play wrong audio with no error.
+            RuntimeError: If a request has tokens but no payload, reference
+                or stream metadata: decoding such a chunk as a whole
+                utterance would play wrong audio with no error. Also if its
+                token offset and its stored stream state disagree, where a
+                first chunk would be cross-faded or a later one faded in.
         """
         device = self.trim_fade.device
         audios = [torch.zeros(0, device=input_ids.device)] * len(counts)
-        if payloads is None or request_ids is None:
+        if request_ids is None:
             return audios
 
         flat = input_ids.reshape(-1)
         chunks: list[Chunk] = []
         owners: list[tuple[int, str]] = []
         start = 0
-        for idx, (count, raw, request_id) in enumerate(zip(counts, payloads, request_ids, strict=True)):
+        for idx, (count, raw, request_id) in enumerate(
+            zip(counts, payloads or [{}] * len(counts), request_ids, strict=True)
+        ):
             tokens = flat[start : start + count].long()
             start += count
-            # A request the runner holds no payload for, or the async
-            # processor's terminal payload, which carries no tokens.
-            if count == 0 or not raw:
+            # The async processor's terminal payload carries no tokens.
+            if count == 0:
                 continue
             payload = to_struct(raw)
             meta, embed = payload.meta, payload.embed
@@ -560,6 +566,12 @@ class S3GenDecoder(nn.Module):
                     f"chatterbox_s3gen got {count} tokens for request {request_id} "
                     "without a reference or stream metadata"
                 )
+            state = self.streams.get(request_id)
+            if (state is None) != (meta.left_context_size == 0):
+                raise RuntimeError(
+                    f"chatterbox_s3gen got token offset {meta.left_context_size} for request {request_id}, "
+                    f"which {'has no' if state is None else 'already has an'} earlier chunk"
+                )
             chunks.append(
                 Chunk(
                     tokens=tokens.to(device),
@@ -569,7 +581,7 @@ class S3GenDecoder(nn.Module):
                         prompt_feat=embed.speech_feat.to(device=device, dtype=self.trim_fade.dtype),
                         embedding=embed.embedding.to(device=device, dtype=self.trim_fade.dtype),
                     ),
-                    state=self.streams.get(request_id),
+                    state=state,
                     finalize=bool(meta.stream_finished),
                 )
             )
@@ -591,13 +603,22 @@ class S3GenDecoder(nn.Module):
         The runner calls this every step with the scheduler's finished ids,
         aborts included. An aborted stream never sends a final chunk, so
         this is the only place its state is freed.
+
+        Args:
+            finished_req_ids: The scheduler's ids of the requests that ended.
         """
         for request_id in finished_req_ids:
             self.streams.pop(request_id, None)
 
 
 class ChatterboxS3Gen(S3GenDecoder):
-    """``S3GenDecoder`` as a vLLM-Omni generation stage."""
+    """``S3GenDecoder`` as a vLLM-Omni generation stage.
+
+    Args:
+        vllm_config: The engine's config; its ``hf_config`` is the
+            checkpoint's ``ChatterboxConfig``.
+        prefix: vLLM's module prefix, unused: the stage is the root module.
+    """
 
     # Without this the runner discards OmniOutput.multimodal_outputs.
     have_multimodal_outputs = True
@@ -611,7 +632,7 @@ class ChatterboxS3Gen(S3GenDecoder):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         config: ChatterboxConfig = vllm_config.model_config.hf_config
         super().__init__(config)
-        # The repo also holds the T3 weights and the 10-step S3Gen weights.
+        # The repo holds other checkpoints too; this stage loads its own.
         self.allow_patterns_overrides = [config.s3gen_weights]
 
     def forward(
@@ -628,8 +649,21 @@ class ChatterboxS3Gen(S3GenDecoder):
     ) -> OmniOutput:
         """Decode the step's tokens. Emits delta audio, see ``decode_step``.
 
-        The runner passes ``seq_token_counts`` on every call; the payloads
-        and request ids are absent only on its profiling run.
+        Args:
+            input_ids: The step's flat token ids.
+            positions: Unused; the stage has no positional state.
+            intermediate_tensors: Unused; the stage is not pipeline-parallel.
+            inputs_embeds: Unused; the tokens are decoded as ids.
+            seq_token_counts: Tokens per request, in batch order.
+            model_intermediate_buffer: Per request, the merged inter-stage
+                payload.
+            request_ids: Per request, the scheduler's id. Absent only on the
+                runner's profiling run.
+            **runner_kwargs: Whatever else the runner passes to every model.
+
+        Returns:
+            ``multimodal_outputs`` with, per request, ``audio`` (1-D float32,
+            the samples new in this step) and ``sr`` (int32 scalar).
         """
         audios = self.decode_step(input_ids, seq_token_counts, model_intermediate_buffer, request_ids)
         rate = torch.tensor(self.config.sample_rate, dtype=torch.int32)
@@ -640,6 +674,10 @@ class ChatterboxS3Gen(S3GenDecoder):
 
         Strict: a key this stage does not own, or a parameter the file does
         not fill, fails the load instead of leaving random weights behind.
+
+        Args:
+            weights: The checkpoint's tensors by name, the reference
+                encoders' included.
 
         Returns:
             The names of every parameter filled, as vLLM requires.
