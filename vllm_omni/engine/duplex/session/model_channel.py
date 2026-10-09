@@ -1695,6 +1695,9 @@ class ModelChannel:
             value = model_result.get(name)
             if isinstance(value, bool):
                 metadata[name] = value
+        listen_source = model_result.get("listen_source")
+        if isinstance(listen_source, str) and listen_source:
+            metadata["listen_source"] = listen_source
         effective_stage_metrics = stage_metrics if stage_metrics is not None else model_result.get("stage_metrics")
         if isinstance(effective_stage_metrics, Mapping):
             metadata["stage_metrics"] = {

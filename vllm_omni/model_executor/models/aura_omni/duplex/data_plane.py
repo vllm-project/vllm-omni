@@ -268,6 +268,7 @@ class AuraDataPlaneSession(DuplexDataPlane):
             state.silent = True
             # DIRECT_RESPONSE skips aura2tts. The session runner commits
             # model context from model_context_text; this projector does not.
+            listen_source = metadata.get("listen_source")
             yield _event(
                 stage_role="thinker",
                 is_listen=True,
@@ -279,6 +280,8 @@ class AuraDataPlaneSession(DuplexDataPlane):
                 # Prewarm already reserved Stage2/3 on Stage0 submit. Silent
                 # short-circuit never feeds codec chunks; abort frees those seats.
                 abort_data_plane_request=True,
+                # Who decided to listen (e.g. "aura_silent", "response_judge").
+                **({"listen_source": listen_source} if isinstance(listen_source, str) and listen_source else {}),
             )
             state.terminal = True
             return
@@ -376,6 +379,7 @@ class AuraDataPlaneSession(DuplexDataPlane):
                 silent=True,
                 model_context_text=SILENT_TEXT,
                 abort_data_plane_request=True,
+                listen_source="aura_silent",
             )
             state.terminal = True
 

@@ -25,7 +25,12 @@ from vllm_omni.config.pipeline_registry import resolve_pipeline_config
 from vllm_omni.config.stage_config import load_deploy_config, resolve_deploy_yaml
 from vllm_omni.engine.duplex import commands
 from vllm_omni.engine.duplex.contracts import DuplexOutputAction, duplex_resource_request_belongs_to_session
-from vllm_omni.model_executor.models.aura_omni.duplex.plugin import AuraDuplexPlugin, AuraJudgedDuplexPlugin
+from vllm_omni.engine.duplex.session.model_channel import ModelChannel
+from vllm_omni.model_executor.models.aura_omni.duplex.plugin import (
+    AURA_SILENT_TOKEN_ID,
+    AuraDuplexPlugin,
+    AuraJudgedDuplexPlugin,
+)
 from vllm_omni.model_executor.models.aura_omni.duplex.stages import AURA_JUDGED_STAGE_LAYOUT, AURA_STAGE_LAYOUT
 from vllm_omni.model_executor.models.aura_omni.pipeline import AURA_OMNI_JUDGED_PIPELINE, AURA_OMNI_PIPELINE
 from vllm_omni.model_executor.models.registry import OmniModelRegistry
@@ -60,6 +65,15 @@ async def _pending_judge(orchestrator):
     return request_id
 
 
+async def _pending_at(orchestrator, stage_id):
+    request_id = next(iter(orchestrator.request_states))
+    state = orchestrator.request_states[request_id]
+    request = SimpleNamespace(request_id=request_id, prompt_token_ids=[1], resumable=False)
+    replica_id = await orchestrator.stage_pools[stage_id].submit_initial(request_id, state, request)
+    orchestrator._on_stage_submitted(stage_id, request_id, replica_id, state)
+    return request_id
+
+
 def _judge_output(request_id: str, text: str):
     return SimpleNamespace(request_id=request_id, finished=True, outputs=[SimpleNamespace(text=text, token_ids=[1])])
 
@@ -88,11 +102,53 @@ async def test_judge_no_ends_the_turn_through_the_native_listen_path(auto_respon
         types = [event.type for event in events]
         assert "error" not in types
         assert "response.listen" in types
+        listen = next(event for event in events if event.type == "response.listen").to_realtime()
+        # Clients can tell a judge rejection from AURA's own <|silent|>.
+        assert listen["response"]["metadata"]["vllm_omni"]["listen_source"] == "response_judge"
         done = [event for event in events if event.type == "response.done"]
         assert [event.response_id for event in done] == [response_id]
         assert session.active_response_id is None
     finally:
         await orchestrator.session_manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_aura_silence_reports_its_own_listen_source():
+    """Without a judge, AURA's own <|silent|> reaches the client as "aura_silent", not "response_judge"."""
+    orchestrator, clients, rpc_q, output_q = _build(stages=4, plugin=AuraDuplexPlugin(_encode_audio))
+    try:
+        assert (await _open(orchestrator, rpc_q)).ok
+        aura = AURA_STAGE_LAYOUT.aura
+        request_id = await _pending_at(orchestrator, aura)
+        silent = SimpleNamespace(
+            request_id=request_id,
+            finished=True,
+            outputs=[SimpleNamespace(text="<|silent|>", token_ids=[AURA_SILENT_TOKEN_ID])],
+        )
+        assert await orchestrator._intercept_stage_output(
+            aura, 0, silent, orchestrator.request_states[request_id], None, None
+        )
+        await _settle(orchestrator)
+        events = [output_q.get_nowait().event for _ in range(output_q.qsize())]
+        listen = next(event for event in events if event.type == "response.listen").to_realtime()
+        assert listen["response"]["metadata"]["vllm_omni"]["listen_source"] == "aura_silent"
+    finally:
+        await orchestrator.session_manager.shutdown()
+
+
+@pytest.mark.parametrize(
+    ("model_result", "expected"),
+    [
+        ({"listen_source": "response_judge"}, "response_judge"),
+        ({}, None),
+        ({"listen_source": ""}, None),
+        ({"listen_source": 1}, None),
+    ],
+)
+def test_runtime_metadata_forwards_only_a_named_listen_source(model_result, expected):
+    payload: dict[str, object] = {}
+    ModelChannel._attach_runtime_metadata(payload, {"model_turn_id": 1, **model_result})
+    assert payload["vllm_omni"].get("listen_source") == expected
 
 
 @pytest.mark.asyncio
@@ -201,6 +257,8 @@ def test_laya_overlay_only_changes_the_judge_stage():
     assert judge["model_arch"] == "LayaDecisionModel"
     assert judge["runner"] == "pooling"
     assert judge["hf_overrides"]["response_judge"]["format"] == "laya"
+    # Capture sizes reach past the measured judge prompts (40-80 tokens), not only decode-sized batches.
+    assert max(judge["compilation_config"]["cudagraph_capture_sizes"]) >= 128
 
 
 def test_clm_overlay_only_changes_the_judge_stage():
@@ -211,6 +269,8 @@ def test_clm_overlay_only_changes_the_judge_stage():
     assert judge["model_arch"] == "ClmDecisionModel"
     assert judge["runner"] == "pooling"
     assert judge["default_pooling_params"] == {"task": "classify"}
+    # Capture sizes reach past the measured CLM prompts (about 36 tokens).
+    assert max(judge["compilation_config"]["cudagraph_capture_sizes"]) >= 64
     # The prepared model directory's config.json carries format=clm; the base
     # file's chat_yes_no options must not be inherited on top of it.
     assert judge["hf_overrides"] == {}

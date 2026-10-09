@@ -19,6 +19,13 @@ stages:
     enable_prefix_caching: false
     max_model_len: 1024
     max_num_batched_tokens: 8192
+    # Without a prefix cache every judge call is one prefill of the whole
+    # prompt (40-80 tokens with this prompt on the test transcripts). vLLM's
+    # default capture sizes stop at 2 * max_num_seqs (16 here), so a prompt
+    # like that would run without CUDA graphs. Batches larger than the largest
+    # size still run, without graphs.
+    compilation_config:
+      cudagraph_capture_sizes: [16, 32, 48, 64, 96, 128, 192, 256]
     default_pooling_params:
       task: classify
     hf_overrides:

@@ -20,6 +20,10 @@ stages:
     gpu_memory_utilization: 0.25
     max_model_len: 2048
     max_num_batched_tokens: 2048
+    # CLM state prompts are a few dozen tokens (about 36 on the test
+    # transcripts), above vLLM's default capture sizes (up to 2 * max_num_seqs).
+    compilation_config:
+      cudagraph_capture_sizes: [16, 32, 48, 64, 96, 128, 192, 256]
     default_pooling_params:
       task: classify
     # Clear the base file's chat_yes_no options: the prepared model

@@ -24,7 +24,12 @@ Audio -> VAD commit -> ASR -> response judge -+-> reply needed:    main model ->
 - **Reuses the existing no-reply paths.** In a duplex session a rejected turn
   takes the model's existing listen decision: the client receives
   `response.listen`, prewarmed downstream requests are aborted and released,
-  and the turn ends. In turn-based serving the judge's bridge yields no input
+  and the turn ends. The event carries
+  `response.metadata.vllm_omni.listen_source: "response_judge"`, so a client
+  can tell a judge rejection from the model's own decision to stay silent
+  (AURA reports `"aura_silent"`). The field is optional and its value is an
+  open string set by the plugin; clients should ignore values they do not
+  know. In turn-based serving the judge's bridge yields no input
   and the request finishes through the orchestrator's existing empty-output
   path, which also aborts any downstream stage that async-chunk already
   prewarmed.
@@ -119,6 +124,35 @@ It uses Qwen3-1.7B as the judge:
   pipeline's original ASR -> main-model bridge with `after_judge(...)`. A
   duplex plugin that addresses stages by number must account for the extra
   stage (AURA uses a role-based stage layout).
+
+## Latency
+
+The judge runs once per committed turn, on the critical path before the main
+model. Measured on AURA with the LAYA judge (one RTX 4080 SUPER, compact
+profile, one session at a time), most of its time was the model call, so:
+
+- **Give the judge CUDA graphs that cover its prompt.** vLLM's default capture
+  sizes stop at `2 * max_num_seqs`, while a judge prompt without a prefix cache
+  is one prefill of tens of tokens. `aura_omni_judged_laya.yaml` and
+  `aura_omni_judged_clm.yaml` therefore set
+  `compilation_config.cudagraph_capture_sizes`. With it the LAYA forward pass
+  dropped from about 18 ms to about 8 ms in the pipeline; a standalone CLM
+  call after an idle gap dropped from about 39 ms to about 31 ms. For the
+  Qwen3 judge, larger capture sizes showed no gain in a standalone test, so
+  `aura_omni_judged.yaml` keeps the defaults.
+- **Poll stage outputs event-driven.** `VLLM_OMNI_EVENT_DRIVEN_ORCH=1` lets
+  the orchestrator pick up each stage's output as it arrives instead of on a
+  1 ms poll of every stage (this applies to all stages, not only the judge).
+  It cut the judge stage's output pickup from about 4 ms to about 1 ms.
+- **Expect host effects after idle gaps.** On a host with the `powersave` CPU
+  governor, a judge call after a pause in the conversation was slower than
+  back to back: about 1.4x for CLM, 3x for Qwen3 and up to 4x for LAYA. This
+  is consistent with the CPU clocking back up; it was not compared against
+  another governor.
+
+With the first two settings, the added latency (from forwarding the ASR
+output to submitting the main model, judge on vs. off, 16 questions per arm)
+went from 43.0 and 44.5 ms to 26.1 and 28.5 ms p50 in two repeats.
 
 ## Limitations
 
