@@ -94,6 +94,38 @@ def test_hift_graph_replay_matches_eager_for_uncached_and_cached_shapes() -> Non
             torch.testing.assert_close(actual_source, expected_source, rtol=1e-4, atol=1e-5)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@torch.inference_mode()
+def test_hift_capture_primes_every_replay_batch_before_live_requests():
+    hift = _small_hift()
+    wrapper = HiFTGraphWrapper(
+        SimpleNamespace(
+            hift=hift,
+            flow=SimpleNamespace(encoder=SimpleNamespace(), token_mel_ratio=2),
+            mel_cache_len=2,
+            source_cache_len=960,
+        ),
+        connector_config={"codec_chunk_frames": 2, "codec_left_context_frames": 3},
+        capture_batch_sizes=[4],
+    )
+    finalize = Mock(wraps=wrapper.finalize_fn)
+    wrapper.finalize_fn = finalize
+    wrapper.capture()
+    assert [call.args[0].shape[0] for call in finalize.call_args_list] == [1, 2, 3, 4] * 2
+    # First live request uses an intermediate batch; its FFT plan must already exist.
+    mel = torch.randn(2, 80, 4, device="cuda")
+    source = torch.zeros(2, 1, 0, device="cuda")
+    torch.accelerator.synchronize()
+    torch.cuda._sleep(200_000_000)
+    queued = torch.cuda.Event()
+    queued.record()
+    speech, actual_source = wrapper.replay(mel, source)
+    assert not queued.query()
+    expected_speech, expected_source = hift.inference(mel, source)
+    torch.testing.assert_close(speech, expected_speech, rtol=1e-4, atol=1e-5)
+    torch.testing.assert_close(actual_source, expected_source, rtol=1e-4, atol=1e-5)
+
+
 class _FakeGraph:
     def replay(self) -> None:
         return None
@@ -165,6 +197,34 @@ def test_multibatch_serial_replay_with_batch1_graph(monkeypatch: pytest.MonkeyPa
     assert speech.shape == (3, 1, 7)
     assert source.shape == (3, 1, 7)
     wrapper.decode_fn.assert_not_called()
+
+
+def test_hift_replay_clears_padding_and_preserves_previous_outputs(monkeypatch):
+    wrapper = _fake_wrapper(monkeypatch)
+    key = (4, 7, 8)
+    wrapper._capture(*key)
+    wrapper.static_cache_source_outputs[key] = torch.empty(4, 1, 8)
+
+    def replay():
+        wrapper.static_magnitude_outputs[key].copy_(wrapper.static_speech_inputs[key][:, :1])
+        wrapper.static_cache_source_outputs[key].copy_(wrapper.static_cache_source_inputs[key])
+
+    wrapper.graph[key] = SimpleNamespace(replay=replay)
+    wrapper.static_phase_outputs[key].zero_()
+    saved = []
+    # Full -> smaller -> growing -> full exercises stale padding and ownership.
+    for value, batch in enumerate((4, 1, 3, 4), start=1):
+        mel = torch.full((batch, 80, 7), float(value))
+        cache = torch.full((batch, 1, 8), float(value))
+        speech, source = wrapper._replay_key(key, mel, cache)
+        torch.testing.assert_close(wrapper.static_speech_inputs[key][:batch], mel, rtol=0, atol=0)
+        torch.testing.assert_close(wrapper.static_cache_source_inputs[key][:batch], cache, rtol=0, atol=0)
+        assert not wrapper.static_speech_inputs[key][batch:].count_nonzero()
+        assert not wrapper.static_cache_source_inputs[key][batch:].count_nonzero()
+        saved.append((value, speech, source))
+    for value, speech, source in saved:
+        assert torch.all(speech == value)
+        assert torch.all(source == value)
 
 
 # ---------------------------------------------------------------------------
@@ -356,6 +416,7 @@ def _cfm_mock_wrapper(monkeypatch: pytest.MonkeyPatch, *, max_graphs: int = 1) -
     return wrapper
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_cfm_unseen_shape_is_lazily_captured(monkeypatch: pytest.MonkeyPatch) -> None:
     wrapper = _cfm_mock_wrapper(monkeypatch)
 
@@ -366,6 +427,7 @@ def test_cfm_unseen_shape_is_lazily_captured(monkeypatch: pytest.MonkeyPatch) ->
     wrapper.graph_fn.assert_called_once()
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_cfm_returning_no_entry_falls_back_to_eager(monkeypatch: pytest.MonkeyPatch) -> None:
     """A capture that yields no entry must still serve the request eagerly.
 

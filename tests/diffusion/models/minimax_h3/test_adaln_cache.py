@@ -219,6 +219,173 @@ def test_native_constructor_enables_cache_by_default(monkeypatch, tp_size):
     assert disabled.adaln_cache.max_bytes == 0
 
 
+@pytest.fixture
+def offload_model_config(monkeypatch):
+    from tests.diffusion.models.minimax_h3.test_minimax_h3_quantization import (
+        _FakeAttention,
+        _FakeLinear,
+        _small_od_config,
+    )
+
+    for name in ("ColumnParallelLinear", "RowParallelLinear"):
+        monkeypatch.setattr(h3, name, _FakeLinear)
+    for name in ("ColumnParallelLinear", "RowParallelLinear", "MergedColumnParallelLinear", "QKVParallelLinear"):
+        monkeypatch.setattr(blocks, name, _FakeLinear)
+    monkeypatch.setattr(blocks, "Attention", _FakeAttention)
+    monkeypatch.setattr(h3, "get_tensor_model_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(h3.current_omni_platform, "is_cuda", lambda: True)
+    monkeypatch.setattr(torch.accelerator, "current_device_index", lambda: 3)
+    monkeypatch.setattr(h3.current_omni_platform, "get_device_capability", lambda device_id: (12, 0))
+    config = _small_od_config()
+    config.enforce_eager = True
+    config.cache_config = {"minimax_h3_adaln_offload": True}
+    return config
+
+
+def test_compiled_h3_projection_keeps_cache_and_tensor_graphs(monkeypatch, mocker):
+    class Linear(torch.nn.Linear):
+        def __init__(self, in_features, out_features, *, params_dtype, bias=True, **kwargs):
+            super().__init__(in_features, out_features, bias=bias, dtype=params_dtype)
+
+        def forward(self, x):
+            return super().forward(x), None
+
+    monkeypatch.setattr(blocks, "ColumnParallelLinear", Linear)
+    arch = h3.MiniMaxH3DiTArchConfig(hidden_size=8, time_embed_dim=4)
+    cache = MiniMaxH3RuntimeAdalnCache()
+    proj = h3.MiniMaxH3AdalnProj(
+        arch,
+        18 * arch.hidden_size,
+        None,
+        expand_ratio=6,
+        modality_num=3,
+        prefix="blocks.0.adaln_proj",
+        adaln_cache=cache,
+    )
+    calls = mocker.spy(proj.linear, "forward")
+    graphs = []
+
+    def backend(graph, inputs):
+        graphs.append(graph)
+        return graph.forward
+
+    def run(embedding):
+        # Include prepare in the compiled function to exercise full-model as
+        # well as regional compilation's projection boundary.
+        cache.prepare(embedding)
+        return proj(embedding)[0].sin() + 1
+
+    compiled = torch.compile(run, backend=backend, dynamic=True)
+    embedding = torch.randn(2, arch.time_embed_dim)
+    with torch.no_grad():
+        expected = run(embedding)
+        cache.clear()
+        calls.reset_mock()
+        first = compiled(embedding)
+        graph_count = len(graphs)
+        second = compiled(embedding.clone())
+        assert graph_count > 0 and len(graphs) == graph_count
+        assert calls.call_count == 1 and cache.hits == 1
+        assert torch.equal(first, expected) and torch.equal(second, expected)
+        proj.linear.weight.add_(0.125)
+        changed = compiled(embedding)
+        assert calls.call_count == 2
+        cache.clear()
+        assert torch.equal(changed, run(embedding))
+
+
+@pytest.mark.parametrize("enforce_eager", [False, True], ids=["compiled", "eager"])
+@pytest.mark.parametrize("explicit", [False, True], ids=["default", "explicit"])
+@pytest.mark.parametrize("config_type", [dict, SimpleNamespace], ids=["mapping", "attributes"])
+def test_adaln_offload_allocates_only_projection_weights_on_host(
+    offload_model_config, explicit, config_type, enforce_eager
+):
+    offload_model_config.enforce_eager = enforce_eager
+    offload_model_config.cache_config = config_type(**({"minimax_h3_adaln_offload": True} if explicit else {}))
+    # A non-CPU construction context reproduces how the loader allocates the
+    # model, without requiring a large checkpoint or a GPU in this CPU test.
+    with torch.device("meta"):
+        model = h3.MiniMaxH3DiTModel(offload_model_config)
+    for name, parameter in model.named_parameters():
+        assert parameter.device.type == ("cpu" if ".adaln_proj.linear." in name else "meta")
+    assert model.adaln_cache.offload_weights
+    assert model.adaln_cache.max_bytes > 0
+
+
+@pytest.mark.parametrize("config_type", [dict, SimpleNamespace], ids=["mapping", "attributes"])
+def test_adaln_offload_can_be_disabled_without_disabling_cache(offload_model_config, config_type):
+    offload_model_config.cache_config = config_type(minimax_h3_adaln_offload=False)
+    with torch.device("meta"):
+        model = h3.MiniMaxH3DiTModel(offload_model_config)
+    assert all(p.device.type == "meta" for p in model.parameters())
+    assert not model.adaln_cache.offload_weights
+    assert model.adaln_cache.max_bytes > 0
+
+
+@pytest.mark.parametrize("explicit", [False, True], ids=["default", "explicit"])
+@pytest.mark.parametrize("setting", ["module", "layer", "hsdp", "quantized", "non_cuda"])
+def test_adaln_offload_preserves_incompatible_modes(offload_model_config, monkeypatch, setting, explicit):
+    config = offload_model_config
+    config.cache_config = {"minimax_h3_adaln_offload": True} if explicit else {}
+    quant = None
+    if setting in {"module", "layer"}:
+        config.diffusion_offload_config = {"mode": setting, "components": ["dit"]}
+    elif setting == "hsdp":
+        config.parallel_config.use_hsdp = True
+    elif setting == "non_cuda":
+        monkeypatch.setattr(h3.current_omni_platform, "is_cuda", lambda: False)
+    else:
+        quant = object()
+    if explicit:
+        with pytest.raises(ValueError, match="[Aa]da[Ll][Nn]|adaln"):
+            h3.MiniMaxH3DiTModel(config, quant_config=quant)
+    else:
+        model = h3.MiniMaxH3DiTModel(config, quant_config=quant)
+        assert not model.adaln_cache.offload_weights
+        assert model.adaln_cache.max_bytes > 0
+
+
+@pytest.mark.parametrize("value", ["true", None, 1])
+def test_adaln_offload_requires_boolean(offload_model_config, value):
+    offload_model_config.cache_config["minimax_h3_adaln_offload"] = value
+    with pytest.raises(ValueError, match="minimax_h3_adaln_offload must be a boolean"):
+        h3.MiniMaxH3DiTModel(offload_model_config)
+
+
+def test_adaln_offload_keeps_text_encoder_offload_independent(offload_model_config):
+    offload_model_config.cache_config = {}
+    offload_model_config.diffusion_offload_config = {"mode": "module", "components": ["text_encoder"]}
+    model = h3.MiniMaxH3DiTModel(offload_model_config)
+    assert model.adaln_cache.offload_weights
+
+
+@pytest.mark.parametrize("capability", [(8, 0), (9, 0), (10, 0), (12, 0), (12, 1), None])
+@pytest.mark.parametrize("explicit", [False, True], ids=["default", "explicit"])
+def test_adaln_offload_default_is_limited_to_worker_sm120(offload_model_config, monkeypatch, capability, explicit):
+    seen = []
+
+    def get_capability(device_id):
+        seen.append(device_id)
+        return capability
+
+    monkeypatch.setattr(h3.current_omni_platform, "get_device_capability", get_capability)
+    offload_model_config.cache_config = {"minimax_h3_adaln_offload": True} if explicit else {}
+    with torch.device("meta"):
+        model = h3.MiniMaxH3DiTModel(offload_model_config)
+    expected = explicit or capability == (12, 0)
+    assert model.adaln_cache.offload_weights is expected
+    assert seen == [3]
+    assert model.blocks[0].adaln_proj.linear.weight.device.type == ("cpu" if expected else "meta")
+    assert model.adaln_cache.max_bytes > 0
+
+
+def test_disabling_adaln_cache_keeps_weights_resident_by_default(offload_model_config):
+    offload_model_config.cache_config = {"minimax_h3_adaln_cache": False}
+    model = h3.MiniMaxH3DiTModel(offload_model_config)
+    assert not model.adaln_cache.offload_weights
+    assert model.adaln_cache.max_bytes == 0
+
+
 def test_optional_sidecar_seeds_runtime_projection(tmp_path, mocker):
     arch, weights, payload, _, path = _fixture(tmp_path)
     sidecar = _ready(arch, weights, path)
@@ -407,7 +574,7 @@ def test_runtime_projection_matches_sidecar_using_actual_h3_forwards(tmp_path, m
     "key,mode",
     [("minimax_h3_adaln_cache_path", "t2va"), ("minimax_h3_ref_adaln_cache_path", "ref2va-mixed")],
 )
-def test_optional_sidecar_requires_eager_before_reading_payload(tmp_path, mocker, enforce_eager, key, mode):
+def test_optional_sidecar_supports_eager_and_compiled_execution(tmp_path, mocker, enforce_eager, key, mode):
     import vllm_omni.diffusion.models.minimax_h3.adaln_cache as cache_module
 
     arch, _, _, manifest, path = _fixture(tmp_path, mode=mode)
@@ -419,16 +586,9 @@ def test_optional_sidecar_requires_eager_before_reading_payload(tmp_path, mocker
 
     pipeline._configure_adaln_sidecar(transformer, key, manifest["model_variant"], None, eligible=True)
 
-    if enforce_eager:
-        open_sidecar.assert_called_once()
-        assert isinstance(transformer._adaln_sidecar_candidate, MiniMaxH3AdalnCache)
-        assert transformer._adaln_sidecar_candidate.path == str(path)
-    else:
-        open_sidecar.assert_not_called()
-        assert not hasattr(transformer, "_adaln_sidecar_candidate")
-        # The normal load completion must not install or move a skipped payload.
-        pipeline._finish_adaln_sidecar(transformer)
-        assert transformer.adaln_cache.sidecar is None
+    open_sidecar.assert_called_once()
+    assert isinstance(transformer._adaln_sidecar_candidate, MiniMaxH3AdalnCache)
+    assert transformer._adaln_sidecar_candidate.path == str(path)
     assert transformer.adaln_cache.max_bytes > 0
 
 

@@ -24,6 +24,8 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
+from vllm_omni.diffusion.attention.backends.abstract import VideoTokenLayout
+from vllm_omni.diffusion.attention.backends.vdnh3_attn import VDNLayout
 from vllm_omni.diffusion.cache.cachedit import CacheDiTAdapterConfig
 from vllm_omni.diffusion.distributed.sp_plan import (
     SequenceParallelInput,
@@ -31,6 +33,7 @@ from vllm_omni.diffusion.distributed.sp_plan import (
 )
 from vllm_omni.diffusion.layers.indexed_modulation import indexed_scale_shift_
 from vllm_omni.diffusion.models.host_weight_contract import FinalLayoutModelContract
+from vllm_omni.diffusion.offloader.config import DIT_COMPONENT, OffloadStrategy, resolve_offload
 from vllm_omni.platforms import current_omni_platform
 
 from .adaln_cache import MiniMaxH3RuntimeAdalnCache
@@ -47,6 +50,7 @@ from .minimax_h3_blocks import (
     MiniMaxH3MLP,
     _norm,
 )
+from .vdnh3 import VDNConfig
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import (
@@ -484,6 +488,8 @@ class MiniMaxH3DiTModel(nn.Module):
     )
     _repeated_blocks = ["MiniMaxH3DiTBlock"]
     _layerwise_offload_blocks_attrs = ["blocks"]
+    # Set by enable_vdn for a VDN-H3 checkpoint.
+    vdn_config: VDNConfig | None = None
 
     @staticmethod
     def _is_transformer_block(name: str, module: nn.Module) -> bool:
@@ -591,7 +597,38 @@ class MiniMaxH3DiTModel(nn.Module):
         )
         if type(enabled) is not bool:
             raise ValueError("minimax_h3_adaln_cache must be a boolean")
-        self.adaln_cache = MiniMaxH3RuntimeAdalnCache(max_bytes=256 * 1024**2 if enabled else 0)
+        offload = resolve_offload(od_config)
+        conflicting_offload = (
+            offload.strategy is not OffloadStrategy.NONE and offload.offloads(DIT_COMPONENT)
+        ) or getattr(od_config.parallel_config, "use_hsdp", False)
+        # Limit automatic offload to the validated SM120 deployment. Other
+        # CUDA architectures keep their resident weights unless opted in.
+        # Use the worker's current device, not logical device zero.
+        default_offload_adaln = (
+            enabled
+            and current_omni_platform.is_cuda()
+            and quant_config is None
+            and not conflicting_offload
+            and current_omni_platform.get_device_capability(torch.accelerator.current_device_index()) == (12, 0)
+        )
+        offload_adaln = (
+            cache_config.get("minimax_h3_adaln_offload", default_offload_adaln)
+            if isinstance(cache_config, Mapping)
+            else getattr(cache_config, "minimax_h3_adaln_offload", default_offload_adaln)
+        )
+        if type(offload_adaln) is not bool:
+            raise ValueError("minimax_h3_adaln_offload must be a boolean")
+        if offload_adaln:
+            if not current_omni_platform.is_cuda():
+                raise ValueError("MiniMax H3 AdaLN offload requires CUDA")
+            if quant_config is not None:
+                raise ValueError("MiniMax H3 AdaLN offload requires unquantized BF16 weights")
+            if conflicting_offload:
+                raise ValueError("MiniMax H3 AdaLN offload cannot be combined with DiT offload or HSDP")
+            logger.info("MiniMax H3 AdaLN weights remain on CPU; projections stage on cache misses only")
+        self.adaln_cache = MiniMaxH3RuntimeAdalnCache(
+            max_bytes=256 * 1024**2 if enabled else 0, offload_weights=offload_adaln
+        )
         self.od_config = od_config
         self.parallel_config = od_config.parallel_config
         self.hidden_size = arch.hidden_size
@@ -691,6 +728,28 @@ class MiniMaxH3DiTModel(nn.Module):
             if sparsity is not None:
                 block.attn.to_gate_compress.weight.missing_param_init = "error"
         self.vsa_gates_enabled = True
+
+    def enable_vdn(self, config: VDNConfig) -> None:
+        """Convert every DiT block to VDN-H3 hybrid attention before loading.
+
+        The token refiner attends over text only and stays dense.
+        """
+        for block in self.blocks:
+            block.attn.enable_vdn(config)
+        self.vdn_config = config
+        self._mark_missing_params_required()
+
+    def vdn_parameter_names(self) -> set[str]:
+        """VDN parameters the checkpoint supplies; quantization fills its scales after loading."""
+        return {name for name, _ in self.named_parameters() if ".attn.vdn." in name and not name.endswith("_scale")}
+
+    def _vdn_window(self, layout: VideoTokenLayout | None, *, text_len: int, num_requests: int) -> VDNLayout:
+        if num_requests != 1 or layout is None or layout.used_len is None:
+            raise ValueError("VDN-H3 attention needs one packed request with its video layout per forward")
+        target = next(span for span in reversed(layout.video_spans) if span.role == "target")
+        return self.vdn_config.window(
+            used=layout.used_len, text_len=text_len, video_start=target.start, grid=target.latent_grid
+        )
 
     def _mark_missing_params_required(self) -> None:
         for _, param in self.named_parameters():
@@ -1001,6 +1060,10 @@ class MiniMaxH3DiTModel(nn.Module):
         refiner_cu = self._psp_field(refiner_psp, "refiner_packed_seq_params", "cu_seqlens_q").to(torch.int32)
         refiner_max = int(self._psp_field(refiner_psp, "refiner_packed_seq_params", "max_seqlen_q"))
         video_layout = kwargs.get("video_token_layout")
+        vdn_window = None
+        if self.vdn_config is not None:
+            # Text rows lead the packed document.
+            vdn_window = self._vdn_window(video_layout, text_len=int(text_pos.shape[0]), num_requests=num_requests)
 
         if x.dim() != 3 or x.shape[0] != 1:
             raise ValueError(f"x must be [1, S, C], got {list(x.shape)}")
@@ -1110,6 +1173,7 @@ class MiniMaxH3DiTModel(nn.Module):
                 num_requests=num_requests,
                 video_layout=video_layout,
                 vsa_prefix_segments=vsa_prefix_segments,
+                vdn_window=vdn_window,
             )
             if block_index in hints:
                 hidden = hidden + hints.pop(block_index) * control_scale

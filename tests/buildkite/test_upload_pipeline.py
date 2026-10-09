@@ -373,7 +373,7 @@ def test_mirror_hardwares_inferred_missing_preset_is_rejected(monkeypatch: pytes
 
 
 def test_cpu_step_without_mirror_hardwares_is_unchanged() -> None:
-    step = {"label": "CPU report", "commands": ["echo ok"], "agents": {"queue": "cpu_queue_premerge"}}
+    step = {"label": "CPU report", "commands": ["echo ok"], "agents": {"queue": "medium_cpu_queue_premerge"}}
     assert _expand_mirror_hardwares(step) is step
 
 

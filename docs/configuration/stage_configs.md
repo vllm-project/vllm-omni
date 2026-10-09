@@ -161,6 +161,34 @@ RAY_ADDRESS=10.0.0.1:6379 vllm serve MODEL --omni --deploy-config my_deploy.yaml
 Omni creates actors on the resources of that cluster; it does not start Ray
 on additional machines.
 
+### Stage CPU placement
+
+On Linux, stages can use vLLM's NUMA settings to select CPU lists. Add the
+settings to the existing stage entries in your deploy configuration:
+
+```yaml
+stages:
+  - stage_id: 0
+    numa_bind: true
+    numa_bind_nodes: [0]
+    numa_bind_cpus: ["2-3"]
+  - stage_id: 1
+    numa_bind: true
+    numa_bind_nodes: [0]
+    numa_bind_cpus: ["4-7"]
+```
+
+These CPU and NUMA indices are examples; choose indices available to the
+process or container. Use one CPU-list entry per visible GPU.
+Binding requires `numactl` and
+`VLLM_WORKER_MULTIPROC_METHOD=spawn`.
+
+With an in-process executor (`uni`), the worker's CPU list applies to the
+stage EngineCore itself. With a multiprocess executor (`mp`), workers use
+their CPU lists and EngineCore retains its wider NUMA-node binding. Choose
+CPU sets away from competing workloads; affinity does not reserve CPUs
+exclusively.
+
 ### Stage-level runner selection
 
 `model_runner: v1` or `v2` at the deploy level sets the default runner.
