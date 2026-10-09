@@ -257,8 +257,10 @@ def test_laya_overlay_only_changes_the_judge_stage():
     assert judge["model_arch"] == "LayaDecisionModel"
     assert judge["runner"] == "pooling"
     assert judge["hf_overrides"]["response_judge"]["format"] == "laya"
-    # Capture sizes reach past the measured judge prompts (40-80 tokens), not only decode-sized batches.
-    assert max(judge["compilation_config"]["cudagraph_capture_sizes"]) >= 128
+    # Capture sizes reach past the measured judge prompts (up to about 170 tokens), not only decode-sized batches.
+    assert max(judge["compilation_config"]["cudagraph_capture_sizes"]) >= 192
+    options = judge["hf_overrides"]["response_judge"]
+    assert options["reply_option"] in options["options"]
 
 
 def test_clm_overlay_only_changes_the_judge_stage():

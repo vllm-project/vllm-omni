@@ -161,4 +161,7 @@ went from 43.0 and 44.5 ms to 26.1 and 28.5 ms p50 in two repeats.
 - Judge quality depends on the model and the prompt. Zero-shot decision
   models (LAYA, CLM) are weak at "does this need a reply"; fine-tuning their
   heads is future work.
+- Short answers to the assistant's question ("seven", "tomorrow") and
+  interruptions ("wait") look like backchannels without the assistant's
+  last turn. The LAYA example prompt still rejects some of them.
 - The judge adds its own latency and GPU memory to every committed turn.
