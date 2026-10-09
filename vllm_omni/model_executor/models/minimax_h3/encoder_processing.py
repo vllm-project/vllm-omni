@@ -583,7 +583,8 @@ def prepare_encoder_inputs(
                         workdir=workdir,
                         start_time_seconds=extra_args.get("start_time_seconds"),
                     )
-                with ThreadPoolExecutor(max_workers=1) as audio_pool:
+                audio_pool = ThreadPoolExecutor(max_workers=1)
+                try:
                     audio_futures = [
                         audio_pool.submit(
                             load_video_audio,
@@ -626,6 +627,8 @@ def prepare_encoder_inputs(
                             video_audio_inputs.append((waveform.float().contiguous(), int(sample_rate)))
                         else:
                             video_audio_inputs.append(None)
+                finally:
+                    audio_pool.shutdown(wait=True, cancel_futures=True)
         audio_index = 0
         for video_index, item in enumerate(prepared_videos, start=1):
             if item["input_has_audio"]:
