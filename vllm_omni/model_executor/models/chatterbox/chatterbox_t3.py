@@ -5,8 +5,8 @@
 vLLM runs the backbone (``tfmr.*`` in the checkpoint) with paged attention and
 continuous batching. Everything T3 adds around it is here: the text and speech
 embeddings, the speech head, the speaker projection, the prompt layout
-``[speaker | prompt tokens | text | start-of-speech]`` and the mapping from
-speech logits to the width vLLM's sampler expects.
+``[speaker | prompt tokens | text | start-of-speech]`` and the start-token
+mask on the speech logits vLLM samples from.
 
 Mirrors ``chatterbox/models/t3/t3.py`` (0.1.7): ``T3.__init__`` for the
 modules, ``prepare_input_embeds`` and ``inference_turbo`` for the layout.
@@ -47,7 +47,7 @@ class T3Heads(nn.Module):
 
     def __init__(self, config: ChatterboxConfig) -> None:
         super().__init__()
-        self.text_emb = nn.Embedding(config.vocab_size, config.hidden_size)
+        self.text_emb = nn.Embedding(config.text_vocab_size, config.hidden_size)
         self.speech_emb = nn.Embedding(config.speech_vocab_size, config.hidden_size)
         self.speech_head = nn.Linear(config.hidden_size, config.speech_vocab_size, bias=True)
         self.spkr_enc = nn.Linear(config.speaker_embed_size, config.hidden_size)
@@ -132,11 +132,11 @@ def prefill_slice(
 
 
 def speech_logits(heads: T3Heads, hidden: torch.Tensor, config: ChatterboxConfig) -> torch.Tensor:
-    """Map hidden states to logits over the vocabulary vLLM samples from.
+    """Map hidden states to the speech logits vLLM samples from.
 
-    Only the speech ids are live; the rest are ``-inf``, as is the start
-    token, which upstream never masks but never wants sampled either and
-    which every placeholder prompt id relies on being unreachable.
+    The start token is ``-inf``: upstream never masks it but never wants it
+    sampled either, and every placeholder prompt id relies on it being
+    unreachable.
 
     Args:
         heads: The loaded heads.
@@ -144,11 +144,11 @@ def speech_logits(heads: T3Heads, hidden: torch.Tensor, config: ChatterboxConfig
         config: The model config.
 
     Returns:
-        Shape (N, ``config.vocab_size``).
+        Shape (N, ``config.speech_vocab_size``).
     """
     logits = heads.speech_head(hidden)
     logits[:, config.start_speech_token] = float("-inf")
-    return nn.functional.pad(logits, (0, config.vocab_size - config.speech_vocab_size), value=float("-inf"))
+    return logits
 
 
 def split_t3_weights(
@@ -180,25 +180,22 @@ def split_t3_weights(
 
 
 class ChatterboxT3ForConditionalGeneration(nn.Module, SupportsPP):
-    """T3: text and reference conditioning in, S3 speech tokens out.
-
-    ``omni_pooler_payload_include_hidden`` is deliberately left at the
-    framework default: the per-step hidden states are what make the step's
-    inter-stage payload non-empty, and without them the scheduler does not
-    call the async-chunk processor until the request finishes.
-    """
+    """T3: text and reference conditioning in, S3 speech tokens out."""
 
     # The runner replaces the placeholder prompt's embeddings through preprocess.
     has_preprocess = True
     # Without this the runner discards OmniOutput.multimodal_outputs.
     have_multimodal_outputs = True
+    # Stage 1 reads the sampled ids, never the hidden states. The chunk
+    # processor is still called every step: it sets ``requires_token_updates``.
+    omni_pooler_payload_include_hidden = False
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
         config: ChatterboxConfig = vllm_config.model_config.hf_config
         self.config = config
         backbone = GPT2Config(
-            vocab_size=config.vocab_size,
+            vocab_size=config.text_vocab_size,
             n_positions=config.max_position_embeddings,
             n_embd=config.hidden_size,
             n_layer=config.num_hidden_layers,
@@ -273,8 +270,26 @@ class ChatterboxT3ForConditionalGeneration(nn.Module, SupportsPP):
         embeds = torch.cat([prompt_rows, self.embed_input_ids(input_ids[in_prompt:])])
         return input_ids, embeds, {}
 
+    def preprocess_decode_batch(
+        self, *, input_ids: torch.Tensor, req_infos: list[dict]
+    ) -> tuple[torch.Tensor, torch.Tensor, list[dict]]:
+        """Embed a step's decode rows in one lookup.
+
+        The runner calls this in place of ``preprocess`` for the rows that
+        are one decode token each.
+
+        Args:
+            input_ids: Shape (N,), one sampled speech id per request.
+            req_infos: Per request, the fields ``preprocess`` is given.
+
+        Returns:
+            The ids, their embeddings of shape (N, H), and no payload update
+            for any request.
+        """
+        return input_ids, self.embed_input_ids(input_ids), [{} for _ in req_infos]
+
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Speech logits over the sampler's vocabulary."""
+        """Speech logits with the start token masked."""
         return speech_logits(self.heads, hidden_states, self.config)
 
     def forward(

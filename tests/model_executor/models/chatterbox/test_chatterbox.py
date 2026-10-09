@@ -15,9 +15,10 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 class StubStage(nn.Module):
-    """A stage with one parameter, one runner flag and one hook."""
+    """A stage with one parameter, two runner flags and two hooks."""
 
     has_preprocess = True
+    omni_pooler_payload_include_hidden = False
 
     def __init__(self, *, vllm_config: SimpleNamespace, prefix: str = "") -> None:
         super().__init__()
@@ -26,6 +27,9 @@ class StubStage(nn.Module):
 
     def forward(self, input_ids, positions, intermediate_tensors=None, inputs_embeds=None, **runner_kwargs):
         return runner_kwargs
+
+    def preprocess_decode_batch(self, *, input_ids, req_infos):
+        return input_ids, input_ids, req_infos
 
     def load_weights(self, weights):
         return {"weight"}
@@ -42,9 +46,12 @@ def test_stage_attributes_resolve_on_the_stage_001(unified: ChatterboxForConditi
     """The runner probes the registered class for flags and hooks the stage owns."""
     assert unified.has_preprocess is True
     assert unified.model.prefix == "model"
+    # The runner reads both of these on the registered class, and without
+    # them falls back to shipping hidden states and to one embedding call per row.
+    assert getattr(unified, "omni_pooler_payload_include_hidden", True) is False
+    assert getattr(unified, "preprocess_decode_batch", None) == unified.model.preprocess_decode_batch
     # What a stage does not define stays undefined, so runner defaults apply.
     assert not hasattr(unified, "on_requests_finished")
-    assert getattr(unified, "omni_pooler_payload_include_hidden", True) is True
 
 
 def test_loaded_names_carry_the_wrapper_prefix_001(unified: ChatterboxForConditionalGeneration) -> None:

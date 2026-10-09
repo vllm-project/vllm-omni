@@ -29,6 +29,15 @@ def heads(config: ChatterboxConfig) -> T3Heads:
     return T3Heads(config)
 
 
+@pytest.fixture(scope="module")
+def talker(heads: T3Heads, config: ChatterboxConfig) -> ChatterboxT3ForConditionalGeneration:
+    """The stage without its backbone: __init__ needs a vLLM config, the embedding hooks only these two."""
+    model = object.__new__(ChatterboxT3ForConditionalGeneration)
+    torch.nn.Module.__init__(model)
+    model.config, model.heads = config, heads
+    return model
+
+
 @pytest.mark.parametrize("cond_len", [150, 375])
 def test_prefill_layout_follows_the_conditioning_length_001(
     heads: T3Heads, config: ChatterboxConfig, cond_len: int
@@ -81,12 +90,10 @@ def test_prefill_span_past_the_prompt_returns_only_the_prompt_rows_001(
     assert torch.equal(inside, whole[-3:])
 
 
-def test_preprocess_embeds_the_generated_tokens_after_the_prompt_001(heads: T3Heads, config: ChatterboxConfig) -> None:
+def test_preprocess_embeds_the_generated_tokens_after_the_prompt_001(
+    talker: ChatterboxT3ForConditionalGeneration, heads: T3Heads, config: ChatterboxConfig
+) -> None:
     """The rows past the prompt are speech ids, embedded as a decode step would."""
-    # Bypass __init__, which needs a vLLM config and builds the backbone; preprocess only reads these two.
-    model = object.__new__(ChatterboxT3ForConditionalGeneration)
-    torch.nn.Module.__init__(model)
-    model.config, model.heads = config, heads
     text_ids = [5, 6, 7]
     cond_tokens = torch.randint(0, 6561, (375,))
     speaker = torch.randn(1, 256)
@@ -95,7 +102,7 @@ def test_preprocess_embeds_the_generated_tokens_after_the_prompt_001(heads: T3He
     generated = torch.tensor([11, 12])
     input_ids = torch.cat([torch.full((total,), config.start_speech_token), generated])
 
-    _, embeds, _ = model.preprocess(
+    _, embeds, _ = talker.preprocess(
         input_ids,
         None,
         _omni_is_prefill=True,
@@ -118,17 +125,40 @@ def test_prefill_refuses_a_prompt_of_the_wrong_length_001(heads: T3Heads, config
         prefill_slice(heads, config, text_ids, cond_tokens, torch.randn(1, 256), 381, 0, 381)
 
 
-def test_logits_are_padded_to_the_text_vocab_with_the_start_token_masked_001(
-    heads: T3Heads, config: ChatterboxConfig
+def test_batched_decode_embedding_matches_per_request_preprocess_001(
+    talker: ChatterboxT3ForConditionalGeneration, config: ChatterboxConfig
 ) -> None:
-    """The sampler is sized by the tokenizer's vocabulary; only speech ids are live."""
+    """The runner hands a step's one-token decode rows to one call instead of one call each."""
+    input_ids = torch.tensor([11, 6560, 0])
+    req_infos = [
+        {
+            "_omni_is_prefill": False,
+            "_omni_prompt_len": 381,
+            "_omni_num_computed_tokens": 381 + row,
+            "ids": {},
+            "embed": {},
+        }
+        for row in range(3)
+    ]
+
+    ids, embeds, updates = talker.preprocess_decode_batch(input_ids=input_ids, req_infos=req_infos)
+
+    each = [talker.preprocess(input_ids[row : row + 1], None, **info) for row, info in enumerate(req_infos)]
+    assert ids is input_ids
+    assert embeds.shape == (3, config.hidden_size)
+    assert torch.equal(embeds, torch.cat([row_embeds for _, row_embeds, _ in each]))
+    assert updates == [update for _, _, update in each] == [{}, {}, {}]
+
+
+def test_logits_are_the_speech_heads_with_the_start_token_masked_001(heads: T3Heads, config: ChatterboxConfig) -> None:
+    """The sampler's vocabulary is the speech head's; the text vocabulary only sizes the text embedding."""
     logits = speech_logits(heads, torch.randn(2, config.hidden_size), config)
 
-    assert logits.shape == (2, config.vocab_size)
+    assert logits.shape == (2, config.vocab_size) == (2, heads.speech_head.out_features)
+    assert heads.text_emb.num_embeddings == config.text_vocab_size
     assert torch.isfinite(logits[:, : config.start_speech_token]).all()
     assert (logits[:, config.start_speech_token] == float("-inf")).all()
     assert torch.isfinite(logits[:, config.stop_speech_token]).all()
-    assert (logits[:, config.speech_vocab_size :] == float("-inf")).all()
 
 
 def test_weight_routing_sends_the_backbone_to_vllm_and_the_rest_to_the_heads_001() -> None:

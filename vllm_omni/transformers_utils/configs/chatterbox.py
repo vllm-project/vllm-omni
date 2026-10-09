@@ -21,10 +21,13 @@ class ChatterboxConfig(PretrainedConfig):
         super().__init__(**kwargs)
         self.variant = variant
 
-        # The sampler works over the text vocabulary the stage's tokenizer
-        # owns; only the first ``speech_vocab_size`` logits are ever finite.
-        self.vocab_size = 50276
+        # The engine sizes its sampler by ``vocab_size``. No tokenizer is
+        # loaded for these stages, so that is the speech head's vocabulary,
+        # not the text one; the text vocabulary only sizes the text
+        # embedding and the backbone's idle ``wte``.
+        self.vocab_size = 6563
         self.speech_vocab_size = 6563
+        self.text_vocab_size = 50276
         # Ids at or above this are control tokens the decoder must never see.
         self.speech_token_limit = 6561
         self.start_speech_token = 6561

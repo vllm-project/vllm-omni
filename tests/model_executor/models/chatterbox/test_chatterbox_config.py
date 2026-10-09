@@ -10,8 +10,9 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 def test_token_space_001() -> None:
     cfg = ChatterboxConfig()
     assert cfg.model_type == "chatterbox"
-    assert cfg.vocab_size == 50276
-    assert cfg.speech_vocab_size == 6563
+    # No tokenizer is loaded, so the sampler's vocabulary is the speech head's.
+    assert cfg.vocab_size == cfg.speech_vocab_size == 6563
+    assert cfg.text_vocab_size == 50276
     assert cfg.speech_token_limit == cfg.start_speech_token == 6561
     assert cfg.eos_token_id == cfg.stop_speech_token == 6562
 
@@ -43,5 +44,5 @@ def test_survives_a_config_json_round_trip_001() -> None:
     cfg = ChatterboxConfig.from_dict(
         {"model_type": "chatterbox", "architectures": ["ChatterboxForConditionalGeneration"]}
     )
-    assert cfg.vocab_size == 50276
+    assert (cfg.vocab_size, cfg.text_vocab_size) == (6563, 50276)
     assert cfg.architectures == ["ChatterboxForConditionalGeneration"]

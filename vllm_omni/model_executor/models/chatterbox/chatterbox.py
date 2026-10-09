@@ -7,6 +7,7 @@ stage class it wraps. What vLLM inspects on the registered class itself
 (``embed_input_ids``, ``compute_logits``, ``forward``, ``load_weights``,
 ``make_empty_intermediate_tensors``) is defined here and delegates. Every
 other attribute the runner probes for (``has_preprocess``, ``preprocess``,
+``preprocess_decode_batch``, ``omni_pooler_payload_include_hidden``,
 ``have_multimodal_outputs``, ``enable_update_additional_information``,
 ``requires_request_ids``, ``allow_patterns_overrides``,
 ``on_requests_finished``) resolves on the stage through ``__getattr__``, so
