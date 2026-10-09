@@ -89,7 +89,6 @@ class ForwardContext:
     # every scheduled layer in one step reads it instead of selecting again.
     _attention_profile_key: tuple[AttentionSchedule, int, int] | tuple[AttentionSigmaSchedule, float] | None = None
     _attention_profile: str | None = None
-    attention_strategy_schedule: tuple | None = None
     # Per-request reference latent for img2img DiT models (e.g. Ming)
     ref_latent: torch.Tensor | None = None
     # Per-request projected direct-VLM condition (e.g., Ming-Image). For now for bsz 1.
@@ -400,8 +399,6 @@ def set_forward_context_denoise_step_idx(step_idx: int | None) -> None:
     """Set the current diffusion denoise step on the active ForwardContext."""
     if _forward_context is not None:
         _forward_context.denoise_step_idx = step_idx
-        if step_idx in (None, 0):
-            _forward_context.attention_strategy_schedule = None
         if step_idx is not None:
             paged_kv_runtime = getattr(_forward_context, "paged_kv_runtime", None)
             ensure_active = getattr(paged_kv_runtime, "ensure_active", None)

@@ -20,7 +20,7 @@ def test_two_step_warmup_exercises_late_layout_and_reuses_all_graphs():
         graphs.append(graph)
         return graph.forward
 
-    model = SimpleNamespace(forward=lambda x, *, attention_layout: x + attention_layout)
+    model = SimpleNamespace(forward_with_attention_layout=lambda x, *, attention_layout: x + attention_layout)
     plan = ForwardStrategyPlan(("dense", "mixed", "sparse"), "step_index", ((10, 0), (20, 1), (None, 2)))
     runner = AttentionStrategyRunner(model, plan)
     torch._dynamo.reset()
@@ -50,7 +50,7 @@ def test_failed_layout_is_not_reported_as_exercised():
         return x
 
     runner = AttentionStrategyRunner(
-        SimpleNamespace(forward=forward), ForwardStrategyPlan(("dense", "sparse"), None, ())
+        SimpleNamespace(forward_with_attention_layout=forward), ForwardStrategyPlan(("dense", "sparse"), None, ())
     )
     runner.set_warmup(True)
     with pytest.raises(RuntimeError, match="warmup failed"):
@@ -61,7 +61,7 @@ def test_failed_layout_is_not_reported_as_exercised():
 
 def test_eager_warmup_does_not_claim_compiled_readiness():
     runner = AttentionStrategyRunner(
-        SimpleNamespace(forward=lambda x, *, attention_layout: x + 1),
+        SimpleNamespace(forward_with_attention_layout=lambda x, *, attention_layout: x + 1),
         ForwardStrategyPlan(("dense",), None, ()),
     )
     runner.set_warmup(True)
@@ -77,7 +77,7 @@ def test_worker_reports_unexercised_component():
 
     def make_runner():
         return AttentionStrategyRunner(
-            SimpleNamespace(forward=lambda x, *, attention_layout: x + attention_layout),
+            SimpleNamespace(forward_with_attention_layout=lambda x, *, attention_layout: x + attention_layout),
             ForwardStrategyPlan(("dense", "sparse"), None, ()),
         )
 

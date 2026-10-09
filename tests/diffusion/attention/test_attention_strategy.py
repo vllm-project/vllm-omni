@@ -52,9 +52,7 @@ def test_recipe_preserves_historical_assignments():
     strategy.validate_inventory(operations)
     for total in (4, 10, 11, 35, 50):
         for step in range(total):
-            layout = next(
-                index for end, index in ForwardStrategyPlan.from_strategy(strategy).resolve_steps(total) if step < end
-            )
+            layout = ForwardStrategyPlan.from_strategy(strategy).layout_for_step(step, total)
             for operation in operations:
                 selected = strategy.assignments(operation)[layout]
                 expected_sparse = (
@@ -65,9 +63,7 @@ def test_recipe_preserves_historical_assignments():
                 assert (getattr(selected, "name", None) == "block_sparse") == expected_sparse
     # Configuration serialization excludes compiled plans and mutable request state.
     restored = AttentionConfig(**asdict(config))
-    assert ForwardStrategyPlan.from_strategy(restored.strategy).resolve_steps(35) == ForwardStrategyPlan.from_strategy(
-        strategy
-    ).resolve_steps(35)
+    assert ForwardStrategyPlan.from_strategy(restored.strategy) == ForwardStrategyPlan.from_strategy(strategy)
 
 
 def test_static_fractional_and_environment_compatibility(monkeypatch):
@@ -81,12 +77,13 @@ def test_static_fractional_and_environment_compatibility(monkeypatch):
         ],
     }
     config = AttentionConfig(**raw)
-    assert ForwardStrategyPlan.from_strategy(config.strategy).resolve_steps(30) == ((9, 0), (24, 1), (30, 0))
-    assert ForwardStrategyPlan.from_strategy(config.strategy).resolve_steps(1) == ((1, 0),)
+    plan = ForwardStrategyPlan.from_strategy(config.strategy)
+    assert [plan.layout_for_step(step, 30) for step in range(30)] == [0] * 9 + [1] * 15 + [0] * 6
+    assert plan.layout_for_step(0, 1) == 0
     monkeypatch.setenv("DIFFUSION_ATTENTION_BACKEND", "INVALID_PROVIDER")
     assert build_attention_config(raw).default is None
     static = {"presets": raw["presets"], "layout": raw["layouts"]["mixed"]}
-    assert ForwardStrategyPlan.from_strategy(AttentionConfig(**static).strategy).resolve_steps(35) == ((35, 0),)
+    assert ForwardStrategyPlan.from_strategy(AttentionConfig(**static).strategy).layout_for_step(34, 35) == 0
     with pytest.raises(ValueError, match="mutually exclusive"):
         parse_attention_config(raw, attention_backend="auto")
     monkeypatch.setenv("DIFFUSION_ATTENTION_BACKEND", "TORCH_SDPA")
@@ -125,7 +122,7 @@ def test_invalid_configuration(change):
         ([{"layers": [36], "attention_role": "cosmos3.gen", "use": "fa4_subblock"}], "Unknown layers"),
         (
             [
-                {"layers": [0], "attention_role": "self", "use": "fa4_subblock"},
+                {"layers": [0], "attention_role": "cosmos3.gen", "use": "fa4_subblock"},
                 {"layers": [0], "attention_role": "cosmos3.gen", "use": "fa3_dense"},
             ],
             "Overlapping",
@@ -135,7 +132,7 @@ def test_invalid_configuration(change):
 )
 def test_inventory_rejects_ambiguous_or_incompatible_assignments(rules, match):
     raw = recipe()
-    raw["layouts"]["mixed"]["overrides"] = rules
+    raw["layouts"]["mixed"] = {"default": "fa3_dense", "overrides": rules}
     with pytest.raises(ValueError, match=match):
         AttentionConfig(**raw).strategy.validate_inventory(inventory())
 
@@ -154,7 +151,6 @@ def test_request_progress_isolation_and_missing_metadata():
         assert plan.current_layout() == 1
         first.total_denoise_steps = 11
         assert plan.current_layout() == 1
-        assert first.attention_strategy_schedule[1] == 11
     with override_forward_context(ForwardContext()):
         with pytest.raises(ValueError, match="progress"):
             plan.current_layout()
@@ -345,7 +341,7 @@ def test_unused_layout_does_not_prepare_or_constrain_operations():
     strategy = AttentionConfig(**raw).strategy
     strategy.validate_inventory(inventory())
     assert tuple(strategy.layouts) == ("dense",)
-    assert ForwardStrategyPlan.from_strategy(strategy).resolve_steps(35) == ((35, 0),)
+    assert ForwardStrategyPlan.from_strategy(strategy).layout_for_step(34, 35) == 0
     assert all(len(strategy.assignments(op)) == 1 for op in inventory())
 
 
@@ -390,4 +386,21 @@ def test_static_layout_needs_no_denoising_progress():
         AttentionConfig(presets={"base": "TORCH_SDPA"}, layout={"default": "base"}).strategy
     )
     with override_forward_context(ForwardContext()):
+        assert plan.current_layout() == 0
+
+
+@pytest.mark.parametrize("total,expected", [(1, [0]), (2, [0, 1]), (3, [0, 1, 2]), (10, [0] * 3 + [1] * 3 + [2] * 4)])
+def test_fractional_schedule_rounding_and_collapsed_phases(total, expected):
+    plan = ForwardStrategyPlan(("a", "b", "c"), "step_fraction", ((0.3, 0), (0.6, 1), (1.0, 2)))
+    assert [plan.layout_for_step(step, total) for step in range(total)] == expected
+
+
+def test_fractional_schedule_uses_current_total_without_request_state():
+    plan = ForwardStrategyPlan(("a", "b"), "step_fraction", ((0.5, 0), (1.0, 1)))
+    context = ForwardContext(denoise_step_idx=4, total_denoise_steps=10)
+    with override_forward_context(context):
+        assert plan.current_layout() == 0
+        context.total_denoise_steps = 8
+        assert plan.current_layout() == 1
+        context.total_denoise_steps = 10
         assert plan.current_layout() == 0

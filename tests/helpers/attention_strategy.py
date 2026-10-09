@@ -47,40 +47,31 @@ def configure_strategy_test(monkeypatch, device, role):
             },
         }
     )
-    attention_config = AttentionConfig(
-        presets={"dense": {"backend": "FLASH_ATTN"}, "alternate": alternate},
-        layouts={
-            "dense": {"default": "dense"},
-            "mixed": {"default": "dense", "overrides": [{"attention_role": role, "use": "alternate"}]},
-        },
-        schedule={
-            "coordinate": "step_index",
-            "phases": [{"until": 1, "layout": "dense"}, {"until": None, "layout": "mixed"}],
-        },
-    )
-    steps: tuple[int, ...] = (0, 1)
+    mixed_override: dict[str, Any] = {"attention_role": role, "use": "alternate"}
+    layouts = {
+        "dense": {"default": "dense"},
+        "mixed": {"default": "dense", "overrides": [mixed_override]},
+    }
     if device == "cuda":
         # Three complete forwards: dense, one sparse block, both sparse blocks.
-        attention_config = AttentionConfig(
-            presets={"dense": {"backend": "FLASH_ATTN"}, "alternate": alternate},
-            layouts={
-                "dense": {"default": "dense"},
-                "mixed": {
-                    "default": "dense",
-                    "overrides": [{"attention_role": role, "layers": [0], "use": "alternate"}],
-                },
-                "sparse": {"default": "dense", "overrides": [{"attention_role": role, "use": "alternate"}]},
-            },
-            schedule={
-                "coordinate": "step_index",
-                "phases": [
-                    {"until": 1, "layout": "dense"},
-                    {"until": 2, "layout": "mixed"},
-                    {"until": None, "layout": "sparse"},
-                ],
-            },
-        )
-        steps = (0, 1, 2)
+        mixed_override["layers"] = [0]
+        layouts["sparse"] = {
+            "default": "dense",
+            "overrides": [{"attention_role": role, "use": "alternate"}],
+        }
+    names = tuple(layouts)
+    steps = tuple(range(len(names)))
+    attention_config = AttentionConfig(
+        presets={"dense": {"backend": "FLASH_ATTN"}, "alternate": alternate},
+        layouts=layouts,
+        schedule={
+            "coordinate": "step_index",
+            "phases": [
+                {"until": index + 1 if index < len(names) - 1 else None, "layout": name}
+                for index, name in enumerate(names)
+            ],
+        },
+    )
     common = dict(
         diffusion_attention_config=attention_config,
         parallel_config=SimpleNamespace(ring_degree=1, ulysses_degree=1),
