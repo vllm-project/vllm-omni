@@ -838,6 +838,7 @@ class _DiffusionConfigProjection:
     max_cpu_loras: int | None = None
     output_type: str = "pil"
     diffusion_offload_config: dict[str, Any] | None = None
+    kv_offload_config: dict[str, Any] | None = None
     # Compatibility aliases for existing callers and model-specific stage
     # lifecycles that are broader than the compact dit/text_encoder selector.
     enable_cpu_offload: bool = False
@@ -915,6 +916,9 @@ class _DiffusionConfigProjection:
         # Validate before stage construction while retaining the raw mapping
         # needed by dataclass/config serialization across process boundaries.
         parse_diffusion_offload_config(normalized.get("diffusion_offload_config"))
+        from vllm_omni.diffusion.kv_offload_config import parse_reference_kv_config
+
+        parse_reference_kv_config(normalized.get("kv_offload_config"))
         return cls(**{name: value for name, value in normalized.items() if value is not None})
 
     def __post_init__(self) -> None:

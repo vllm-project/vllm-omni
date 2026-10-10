@@ -6,7 +6,8 @@ import json
 import pytest
 import torch
 
-from vllm_omni.diffusion.models.minimax_h3.reference_kv_tier1 import (
+from vllm_omni.diffusion.kv_offload_config import parse_reference_kv_config
+from vllm_omni.diffusion.models.minimax_h3.reference_kv_cache import (
     MiniMaxH3ReferenceKVObserverState,
     MiniMaxH3ReferenceKVTier1State,
     MiniMaxH3ReferenceKVTier2State,
@@ -209,20 +210,16 @@ def test_tier2_zero_reference_rank_is_inactive() -> None:
     assert state.stats.prefetched_layers == 0
 
 
-def test_environment_selects_tier2(monkeypatch) -> None:
-    monkeypatch.delenv("VLLM_OMNI_MINIMAX_H3_REF_KV_OBSERVER", raising=False)
-    monkeypatch.delenv("VLLM_OMNI_MINIMAX_H3_REF_KV_TIER1", raising=False)
-    monkeypatch.setenv("VLLM_OMNI_MINIMAX_H3_REF_KV_TIER2", "1")
-    monkeypatch.setenv("VLLM_OMNI_MINIMAX_H3_REF_KV_RING_SIZE", "3")
-    monkeypatch.setenv("VLLM_OMNI_MINIMAX_H3_REF_KV_SKIP_PROJECTION", "1")
-    state = MiniMaxH3ReferenceKVTier1State.from_environment(
+def test_config_selects_tier2() -> None:
+    state = MiniMaxH3ReferenceKVTier1State.from_config(
+        config=parse_reference_kv_config({"mode": "tier2", "skip_reference_projection": True}),
         num_layers=4,
         global_reference_rows=2,
         device=torch.device("cpu"),
     )
 
     assert isinstance(state, MiniMaxH3ReferenceKVTier2State)
-    assert state.ring_size == 3
+    assert state.ring_size == 2
     assert state.skip_reference_projection
 
 
@@ -309,32 +306,24 @@ def test_observer_zero_reference_rank_is_inactive(tmp_path) -> None:
     assert end["metric_records"] == 0
 
 
-def test_environment_observer_takes_precedence(monkeypatch, tmp_path) -> None:
-    monkeypatch.setenv("VLLM_OMNI_MINIMAX_H3_REF_KV_OBSERVER", "1")
-    monkeypatch.setenv("VLLM_OMNI_MINIMAX_H3_REF_KV_TIER1", "1")
-    monkeypatch.setenv("VLLM_OMNI_MINIMAX_H3_REF_KV_TIER2", "1")
-    monkeypatch.setenv("VLLM_OMNI_MINIMAX_H3_REF_KV_SKIP_PROJECTION", "1")
-    monkeypatch.setenv("VLLM_OMNI_MINIMAX_H3_REF_KV_REFRESH_INTERVAL", "invalid")
-    monkeypatch.setenv("VLLM_OMNI_MINIMAX_H3_REF_KV_OBSERVER_INTERVALS", "4,2")
-    monkeypatch.setenv("VLLM_OMNI_MINIMAX_H3_REF_KV_OBSERVER_ROWS", "3")
-    monkeypatch.setenv("VLLM_OMNI_MINIMAX_H3_REF_KV_OBSERVER_HEADS", "1")
-    monkeypatch.setenv(
-        "VLLM_OMNI_MINIMAX_H3_REF_KV_OBSERVER_OUTPUT",
-        str(tmp_path / "observer.jsonl"),
+def test_config_defaults_off_and_rejects_invalid_options() -> None:
+    assert (
+        MiniMaxH3ReferenceKVTier1State.from_config(
+            config=None, num_layers=2, global_reference_rows=2, device=torch.device("cpu")
+        )
+        is None
     )
-
-    state = MiniMaxH3ReferenceKVTier1State.from_environment(
-        num_layers=2,
-        global_reference_rows=2,
-        device=torch.device("cpu"),
-    )
-
-    assert isinstance(state, MiniMaxH3ReferenceKVObserverState)
-    assert state.intervals == (2, 4)
-    assert state.sample_rows == 3
-    assert state.sample_heads == 1
-    assert not state.skip_reference_projection
-    state.close()
+    for value in (
+        {},
+        {"mode": "tier3"},
+        {"mode": "tier2", "kv_refresh_interval": True},
+        {"mode": "tier2", "kv_refresh_interval": -1},
+        {"mode": "tier1", "kv_host_quantization": "int8"},
+        {"mode": "tier2", "skip_reference_projection": 1},
+        {"mode": "tier2", "ring_size": 3},
+    ):
+        with pytest.raises(ValueError):
+            parse_reference_kv_config(value)
 
 
 def _post_ulysses_kv(layer: int, base: float) -> tuple[torch.Tensor, torch.Tensor]:
@@ -445,12 +434,9 @@ def test_tier2_post_ulysses_int8_host_quantization() -> None:
     assert state.stats.h2d_bytes == quantized_host_bytes
 
 
-def test_environment_selects_tier2_host_quantization(monkeypatch) -> None:
-    monkeypatch.delenv("VLLM_OMNI_MINIMAX_H3_REF_KV_OBSERVER", raising=False)
-    monkeypatch.delenv("VLLM_OMNI_MINIMAX_H3_REF_KV_TIER1", raising=False)
-    monkeypatch.setenv("VLLM_OMNI_MINIMAX_H3_REF_KV_TIER2", "1")
-    monkeypatch.setenv("VLLM_OMNI_MINIMAX_H3_REF_KV_HOST_QUANTIZATION", "int8")
-    state = MiniMaxH3ReferenceKVTier1State.from_environment(
+def test_config_selects_tier2_host_quantization() -> None:
+    state = MiniMaxH3ReferenceKVTier1State.from_config(
+        config=parse_reference_kv_config({"mode": "tier2", "kv_host_quantization": "int8"}),
         num_layers=2,
         global_reference_rows=2,
         device=torch.device("cpu"),

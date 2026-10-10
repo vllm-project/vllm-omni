@@ -158,3 +158,15 @@ def test_unmarked_rectangular_attention_stays_dense(monkeypatch):
     impl.dense_fallback.forward_npu = mock.Mock(return_value=q)
     assert impl.forward_npu(q, k, v, metadata) is q
     impl.dense_fallback.forward_npu.assert_called_once_with(q, k, v, metadata)
+
+
+def test_non_reference_rainfusion_never_enters_new_hybrid_path(monkeypatch):
+    impl, metadata, q, _k, _v = _make_reuse(monkeypatch)
+    metadata.extra.pop("minimax_h3_compact_reference_rows")
+    monkeypatch.setattr(impl, "_resolve_plan", lambda metadata: types.SimpleNamespace(used_len=q.shape[1]))
+    impl._forward_sparse_npu = mock.Mock(return_value=q)
+    impl._forward_hybrid_npu = mock.Mock(side_effect=AssertionError("hybrid path must stay opt-in"))
+
+    assert impl.forward_npu(q, q, q, metadata) is q
+    impl._forward_sparse_npu.assert_called_once()
+    impl._forward_hybrid_npu.assert_not_called()

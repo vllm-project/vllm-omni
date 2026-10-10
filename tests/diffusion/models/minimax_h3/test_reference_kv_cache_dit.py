@@ -11,15 +11,15 @@ from cache_dit.caching.block_adapters import FakeDiffusionPipeline
 from torch import nn
 
 from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import _supports_reference_kv_compaction
-from vllm_omni.diffusion.models.minimax_h3.reference_kv_cachedit import (
-    MiniMaxH3CachedAdapter,
-    MiniMaxH3CachedBlocks,
-    iter_minimax_h3_blocks,
-)
-from vllm_omni.diffusion.models.minimax_h3.reference_kv_tier1 import (
+from vllm_omni.diffusion.models.minimax_h3.reference_kv_cache import (
     MiniMaxH3ReferenceKVObserverState,
     MiniMaxH3ReferenceKVTier1State,
     MiniMaxH3ReferenceKVTier2State,
+)
+from vllm_omni.diffusion.models.minimax_h3.reference_kv_cache_dit import (
+    MiniMaxH3CachedAdapter,
+    MiniMaxH3CachedBlocks,
+    iter_minimax_h3_blocks,
 )
 
 

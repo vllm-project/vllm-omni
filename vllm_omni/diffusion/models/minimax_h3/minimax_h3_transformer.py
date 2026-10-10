@@ -34,6 +34,7 @@ from vllm_omni.diffusion.attention.backends.abstract import (
     VideoTokenLayout,
     VideoTokenSpan,
 )
+from vllm_omni.diffusion.attention.backends.flash_attn import FlashAttentionBackend
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.cache.cachedit import CacheDiTAdapterConfig
 from vllm_omni.diffusion.distributed.sp_plan import (
@@ -55,12 +56,12 @@ from vllm_omni.diffusion.layers.indexed_modulation import (
 from vllm_omni.diffusion.layers.norm import RMSNorm
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 from vllm_omni.diffusion.models.host_weight_contract import FinalLayoutModelContract
-from vllm_omni.diffusion.models.minimax_h3.reference_kv_cachedit import (
+from vllm_omni.diffusion.models.minimax_h3.reference_kv_cache import (
+    MiniMaxH3ReferenceKVTier1State,
+)
+from vllm_omni.diffusion.models.minimax_h3.reference_kv_cache_dit import (
     MiniMaxH3CachedAdapter,
     iter_minimax_h3_blocks,
-)
-from vllm_omni.diffusion.models.minimax_h3.reference_kv_tier1 import (
-    MiniMaxH3ReferenceKVTier1State,
 )
 from vllm_omni.platforms import current_omni_platform
 
@@ -641,6 +642,13 @@ class MiniMaxH3Attention(nn.Module):
             else:
                 k, v = reference_kv_tier1_state.process_layer(reference_kv_layer_index, k, v)
 
+        if reference_kv is not None and not self.attention._get_active_parallel_strategy().enabled:
+            # Without SP there is no Ulysses strategy to consume the cached
+            # K/V metadata. Reconstitute the full keys locally instead.
+            k = torch.cat((reference_kv[0], k), dim=0)
+            v = torch.cat((reference_kv[1], v), dim=0)
+            reference_kv = None
+
         kv_total = packed_total + reference_rows
         kv_max_seqlen = max_seqlen + reference_rows
         if reference_rows:
@@ -666,7 +674,14 @@ class MiniMaxH3Attention(nn.Module):
         else:
             used_q = min(max_seqlen, packed_total)
             used_kv = min(kv_max_seqlen, kv_total)
-            mask_free_packed_padding = not use_ring and self.attention.attn_backend.supports_packed_mask_free()
+            mask_free_packed_padding = not use_ring and (
+                self.attention.attn_backend.supports_packed_mask_free()
+                or (
+                    reference_kv_compact
+                    and self.attention.attn_backend.get_name() == "RAINFUSION_ATTN"
+                    and FlashAttentionBackend.supports_packed_mask_free()
+                )
+            )
             no_mask = not use_ring and (
                 self.attention.attn_backend.supports_prefix_kv_slicing or mask_free_packed_padding
             )
@@ -704,6 +719,7 @@ class MiniMaxH3Attention(nn.Module):
                 reference_kv[1].unsqueeze(0),
             )
             extra["reference_kv_global_rows"] = reference_rows
+            extra["reference_kv_request_id"] = reference_kv_tier1_state.request_token
 
         metadata = AttentionMetadata(
             attn_mask=attn_mask,
@@ -1702,7 +1718,13 @@ class MiniMaxH3DiTModel(nn.Module):
         global_reference_rows: int,
         device: torch.device,
     ) -> MiniMaxH3ReferenceKVTier1State | None:
-        return MiniMaxH3ReferenceKVTier1State.from_environment(
+        from vllm_omni.diffusion.kv_offload_config import parse_reference_kv_config
+
+        config = parse_reference_kv_config(getattr(self.od_config, "kv_offload_config", None))
+        if config is None:
+            return None
+        return MiniMaxH3ReferenceKVTier1State.from_config(
+            config=config,
             num_layers=sum(1 for _ in iter_minimax_h3_blocks(self.blocks)),
             global_reference_rows=global_reference_rows,
             device=device,

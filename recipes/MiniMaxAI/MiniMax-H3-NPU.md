@@ -367,6 +367,35 @@ recommended lossy configuration. Memory figures are per device.
 These numbers describe the validated shapes rather than a general throughput
 guarantee.
 
+## Experimental reference-KV offload
+
+MiniMax-H3 can periodically reuse visual-reference K/V on intermediate denoise
+steps. This is opt-in and lossy because its bidirectional attention makes the
+reference K/V change as target tokens evolve. Omit `--kv-offload-config` for the
+existing full-compute path. For an experiment with the two-layer staging ring:
+
+```bash
+vllm serve /path/to/MiniMax-H3 --omni --task-type ref2va \
+  --kv-offload-config '{"mode":"tier2","kv_refresh_interval":8,"kv_host_quantization":"int8","skip_reference_projection":true}'
+```
+
+The JSON object accepts four keys:
+
+| Key | Values | Default | Meaning |
+| --- | --- | --- | --- |
+| `mode` | `tier1`, `tier2` | required | Tier1 stages the full host cache each reuse step; Tier2 prefetches post-Ulysses layers into a fixed two-slot device ring. |
+| `kv_refresh_interval` | integer >= 0 | `2` | Refresh every N denoise steps. `0` populates only at step 0 and has the highest quality risk. |
+| `kv_host_quantization` | `none`, `fp8`, `int8` | `none` | Host-cache storage format; quantization requires Tier2 and may fall back at runtime. |
+| `skip_reference_projection` | JSON boolean | `false` | Omit reference-token QKV projection and reference-query attention on reuse steps. This is lossy. |
+
+The former MiniMax-H3 reference-KV and RainFusion hybrid environment variables
+are no longer used. The experimental RainFusion hybrid uses its validated BSA
+kernel and FP16 kernel input only on compact reference-KV reuse steps; the
+ordinary RainFusion path is unchanged when reference-KV offload is disabled.
+Warm up each configuration before comparing timings and inspect per-request
+reference row counts, refresh counts, and effective host quantization in worker
+logs. A successful HTTP response alone does not prove the cache was used.
+
 ## Known limitations
 
 - Task serving is partitioned by `--task-type`: T2VA/FL2VA and Ref2VA load

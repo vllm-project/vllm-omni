@@ -1875,6 +1875,21 @@ def test_global_diffusion_offload_config_targets_only_diffusion_stages():
     assert config.stage_by_id(1).diffusion_config.diffusion_offload_config == compact_config
 
 
+def test_global_reference_kv_offload_config_reaches_diffusion_stage():
+    cache_config = {
+        "mode": "tier2",
+        "kv_refresh_interval": 8,
+        "kv_host_quantization": "int8",
+        "skip_reference_projection": True,
+    }
+    config = _from_pipeline_key(
+        "minimax_h3_disaggregated",
+        cli_overrides={"kv_offload_config": cache_config},
+    )
+
+    assert config.stage_by_id(1).diffusion_config.kv_offload_config == cache_config
+
+
 def test_explicit_llm_stage_diffusion_offload_override_is_rejected():
     with pytest.raises(ValueError, match="no structured config owner: diffusion_offload_config"):
         _from_pipeline_key(

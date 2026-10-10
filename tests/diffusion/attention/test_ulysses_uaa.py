@@ -285,6 +285,7 @@ def test_uaa_prepends_kv_only_reference_rows(monkeypatch: pytest.MonkeyPatch) ->
         ring_world_size = 1
 
     calls = []
+    reference_gathers = []
 
     def fake_all_to_all(pg, tensor, **kwargs):
         calls.append((tensor.clone(), kwargs["padded_head_cnt"]))
@@ -292,18 +293,22 @@ def test_uaa_prepends_kv_only_reference_rows(monkeypatch: pytest.MonkeyPatch) ->
 
     monkeypatch.setattr(ulysses, "_ulysses_all_to_all_any_qkv", fake_all_to_all)
     monkeypatch.setattr(ulysses, "get_ulysses_mode", lambda **kwargs: "advanced_uaa")
-    monkeypatch.setattr(
-        ulysses,
-        "_all_gather_int",
-        lambda pg, value, **kwargs: [value, value],
-    )
+
+    def fake_gather(pg, value, **kwargs):
+        if value == 1:
+            reference_gathers.append(value)
+        return [value, value]
+
+    monkeypatch.setattr(ulysses, "_all_gather_int", fake_gather)
     strategy = ulysses.UlyssesParallelAttention(FakeGroup(), scatter_idx=2, gather_idx=1, use_sync=False)
     reference_k = torch.full((1, 1, 4, 2), 9.0)
     reference_v = torch.full((1, 1, 4, 2), 7.0)
+    request_id = object()
     metadata = AttentionMetadata(
         extra={
             "ulysses_reference_kv": (reference_k, reference_v),
             "reference_kv_global_rows": 2,
+            "reference_kv_request_id": request_id,
         }
     )
 
@@ -322,6 +327,27 @@ def test_uaa_prepends_kv_only_reference_rows(monkeypatch: pytest.MonkeyPatch) ->
     torch.testing.assert_close(value[:, :1], reference_v)
     assert len(calls) == 4
     assert calls[-1][0].shape[0] == 2
+    assert len(reference_gathers) == 1
+
+    # Even if this rank's local reference count stays unchanged, a new
+    # request forces all ranks back through the same collective sequence.
+    with set_forward_context():
+        strategy.pre_attention(
+            torch.zeros(1, 3, 4, 2),
+            torch.ones(1, 3, 4, 2),
+            torch.ones(1, 3, 4, 2),
+            metadata,
+        )
+    assert len(reference_gathers) == 1
+    metadata.extra["reference_kv_request_id"] = object()
+    with set_forward_context():
+        strategy.pre_attention(
+            torch.zeros(1, 3, 4, 2),
+            torch.ones(1, 3, 4, 2),
+            torch.ones(1, 3, 4, 2),
+            metadata,
+        )
+    assert len(reference_gathers) == 2
 
 
 @pytest.mark.core_model

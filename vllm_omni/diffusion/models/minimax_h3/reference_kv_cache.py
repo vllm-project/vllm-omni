@@ -24,87 +24,10 @@ import torch
 from torch.profiler import record_function
 from vllm.logger import init_logger
 
+from vllm_omni.diffusion.kv_offload_config import ReferenceKVConfig
 from vllm_omni.platforms import current_omni_platform
 
 _log = init_logger(__name__)
-
-_ENABLE_ENV = "VLLM_OMNI_MINIMAX_H3_REF_KV_TIER1"
-_TIER2_ENABLE_ENV = "VLLM_OMNI_MINIMAX_H3_REF_KV_TIER2"
-_SKIP_PROJECTION_ENV = "VLLM_OMNI_MINIMAX_H3_REF_KV_SKIP_PROJECTION"
-_OBSERVER_ENABLE_ENV = "VLLM_OMNI_MINIMAX_H3_REF_KV_OBSERVER"
-_REFRESH_ENV = "VLLM_OMNI_MINIMAX_H3_REF_KV_REFRESH_INTERVAL"
-_RING_SIZE_ENV = "VLLM_OMNI_MINIMAX_H3_REF_KV_RING_SIZE"
-_HOST_QUANTIZATION_ENV = "VLLM_OMNI_MINIMAX_H3_REF_KV_HOST_QUANTIZATION"
-_OBSERVER_INTERVALS_ENV = "VLLM_OMNI_MINIMAX_H3_REF_KV_OBSERVER_INTERVALS"
-_OBSERVER_ROWS_ENV = "VLLM_OMNI_MINIMAX_H3_REF_KV_OBSERVER_ROWS"
-_OBSERVER_HEADS_ENV = "VLLM_OMNI_MINIMAX_H3_REF_KV_OBSERVER_HEADS"
-_OBSERVER_OUTPUT_ENV = "VLLM_OMNI_MINIMAX_H3_REF_KV_OBSERVER_OUTPUT"
-
-
-def _env_enabled(name: str) -> bool:
-    value = os.getenv(name, "").strip().lower()
-    return value in {"1", "true", "yes", "on"}
-
-
-def _refresh_interval_from_env() -> int:
-    raw = os.getenv(_REFRESH_ENV, "2").strip()
-    try:
-        interval = int(raw)
-    except ValueError as exc:
-        raise ValueError(f"{_REFRESH_ENV} must be an integer, got {raw!r}") from exc
-    if interval < 0:
-        raise ValueError(f"{_REFRESH_ENV} must be >= 0, got {interval}")
-    return interval
-
-
-def _ring_size_from_env() -> int:
-    raw = os.getenv(_RING_SIZE_ENV, "2").strip()
-    try:
-        ring_size = int(raw)
-    except ValueError as exc:
-        raise ValueError(f"{_RING_SIZE_ENV} must be an integer, got {raw!r}") from exc
-    if not 2 <= ring_size <= 3:
-        raise ValueError(f"{_RING_SIZE_ENV} must be 2 or 3, got {ring_size}")
-    return ring_size
-
-
-def _host_quantization_from_env() -> str:
-    raw = os.getenv(_HOST_QUANTIZATION_ENV, "none").strip().lower()
-    aliases = {"": "none", "off": "none", "false": "none", "0": "none"}
-    mode = aliases.get(raw, raw)
-    if mode not in {"none", "fp8", "int8"}:
-        raise ValueError(f"{_HOST_QUANTIZATION_ENV} must be one of none, fp8, int8, got {raw!r}")
-    return mode
-
-
-def _positive_int_from_env(name: str, default: int) -> int:
-    raw = os.getenv(name, str(default)).strip()
-    try:
-        value = int(raw)
-    except ValueError as exc:
-        raise ValueError(f"{name} must be an integer, got {raw!r}") from exc
-    if value <= 0:
-        raise ValueError(f"{name} must be > 0, got {value}")
-    return value
-
-
-def _observer_intervals_from_env() -> tuple[int, ...]:
-    raw = os.getenv(_OBSERVER_INTERVALS_ENV, "2,3,4,6,8")
-    intervals: set[int] = set()
-    for item in raw.split(","):
-        item = item.strip()
-        if not item:
-            continue
-        try:
-            interval = int(item)
-        except ValueError as exc:
-            raise ValueError(f"{_OBSERVER_INTERVALS_ENV} must be comma-separated integers, got {raw!r}") from exc
-        if interval <= 1:
-            raise ValueError(f"{_OBSERVER_INTERVALS_ENV} values must be > 1, got {interval}")
-        intervals.add(interval)
-    if not intervals:
-        raise ValueError(f"{_OBSERVER_INTERVALS_ENV} must not be empty")
-    return tuple(sorted(intervals))
 
 
 @dataclass
@@ -167,6 +90,9 @@ class MiniMaxH3ReferenceKVTier1State:
         if host_quantization not in {"none", "fp8", "int8"}:
             raise ValueError(f"host_quantization must be one of none, fp8, int8, got {host_quantization!r}")
         self.host_quantization = host_quantization
+        # A lightweight per-request identity for collective-order-safe
+        # Ulysses metadata caching. Do not retain the full cache state there.
+        self.request_token = object()
         self.effective_host_quantization = host_quantization
         self.stats = MiniMaxH3ReferenceKVTier1Stats()
 
@@ -187,19 +113,18 @@ class MiniMaxH3ReferenceKVTier1State:
         self._layers_seen: set[int] = set()
 
     @classmethod
-    def from_environment(
+    def from_config(
         cls,
         *,
+        config: ReferenceKVConfig | None,
         num_layers: int,
         global_reference_rows: int,
         device: torch.device,
     ) -> MiniMaxH3ReferenceKVTier1State | None:
-        observer_enabled = _env_enabled(_OBSERVER_ENABLE_ENV)
-        tier2_enabled = _env_enabled(_TIER2_ENABLE_ENV)
-        tier1_enabled = _env_enabled(_ENABLE_ENV)
-        if not observer_enabled and not tier1_enabled and not tier2_enabled:
+        if config is None:
             return None
-        tier_name = "Observer" if observer_enabled else "Tier2" if tier2_enabled else "Tier1"
+        tier2_enabled = config.mode == "tier2"
+        tier_name = "Tier2" if tier2_enabled else "Tier1"
         if global_reference_rows <= 0:
             _log.info(
                 "MiniMax-H3 reference-KV %s skipped: request has no visual "
@@ -207,39 +132,8 @@ class MiniMaxH3ReferenceKVTier1State:
                 tier_name,
             )
             return None
-        if observer_enabled:
-            if tier1_enabled or tier2_enabled:
-                _log.warning(
-                    "MiniMax-H3 reference-KV Observer takes precedence over "
-                    "Tier1/Tier2 and will not substitute cached K/V"
-                )
-            observer_state = MiniMaxH3ReferenceKVObserverState(
-                num_layers=num_layers,
-                global_reference_rows=global_reference_rows,
-                device=device,
-                intervals=_observer_intervals_from_env(),
-                sample_rows=_positive_int_from_env(_OBSERVER_ROWS_ENV, 32),
-                sample_heads=_positive_int_from_env(_OBSERVER_HEADS_ENV, 8),
-                output_path=os.getenv(
-                    _OBSERVER_OUTPUT_ENV,
-                    "/tmp/minimax_h3_reference_kv_drift.jsonl",
-                ),
-            )
-            _log.info(
-                "MiniMax-H3 reference-KV Observer enabled: layers=%d, "
-                "global_ref_rows=%d, intervals=%s, sample_rows=%d, "
-                "sample_heads=%d, device=%s, output=%s",
-                num_layers,
-                global_reference_rows,
-                observer_state.intervals,
-                observer_state.sample_rows,
-                observer_state.sample_heads,
-                device,
-                observer_state.output_path,
-            )
-            return observer_state
-        interval = _refresh_interval_from_env()
-        skip_projection = _env_enabled(_SKIP_PROJECTION_ENV)
+        interval = config.kv_refresh_interval
+        skip_projection = config.skip_reference_projection
         if interval == 0:
             _log.warning(
                 "MiniMax-H3 reference-KV %s strict populate-once mode is "
@@ -256,9 +150,9 @@ class MiniMaxH3ReferenceKVTier1State:
                 global_reference_rows=global_reference_rows,
                 device=device,
                 refresh_interval=interval,
-                ring_size=_ring_size_from_env(),
+                ring_size=2,
                 skip_reference_projection=skip_projection,
-                host_quantization=_host_quantization_from_env(),
+                host_quantization=config.kv_host_quantization,
             )
             state = tier2_state
             details = (

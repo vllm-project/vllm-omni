@@ -368,7 +368,7 @@ def minimax_h3_denoise_loop(
     create_reference_kv_state = getattr(model, "create_reference_kv_tier1_state", None)
     if callable(create_reference_kv_state):
         reference_kv_state = create_reference_kv_state(
-            global_reference_rows=positive.num_visual_reference_rows,
+            global_reference_rows=int((~positive.update_mask).sum()),
             device=device,
         )
     if reference_kv_state is not None:

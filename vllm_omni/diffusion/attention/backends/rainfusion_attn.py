@@ -6,7 +6,6 @@ from __future__ import annotations
 import functools
 import inspect
 import math
-import os
 from dataclasses import dataclass, replace
 from typing import Any
 
@@ -144,12 +143,6 @@ class RainFusionAttentionBackend(AttentionBackend):
     supports_prefix_kv_slicing: bool = True
 
     @classmethod
-    def supports_packed_mask_free(cls) -> bool:
-        # Dense fallback uses Flash's packed path; sparse dispatch slices to
-        # the valid sequence before invoking MindIE-SD.
-        return FlashAttentionBackend.supports_packed_mask_free()
-
-    @classmethod
     def validate_available(cls) -> None:
         from importlib.util import find_spec
 
@@ -207,14 +200,6 @@ class RainFusionAttentionImpl(AttentionImpl):
         self.causal = causal
         self.softmax_scale = softmax_scale
         self.qkv_layout = qkv_layout
-        self.hybrid_enabled = os.environ.get("VLLM_OMNI_MINIMAX_H3_RAINFUSION_HYBRID", "1") != "0"
-        self.hybrid_kernel_dtype = os.environ.get("VLLM_OMNI_MINIMAX_H3_RAINFUSION_KERNEL_DTYPE", "fp16")
-        if self.hybrid_kernel_dtype not in ("fp16", "bf16"):
-            raise ValueError("VLLM_OMNI_MINIMAX_H3_RAINFUSION_KERNEL_DTYPE must be fp16 or bf16")
-        self.hybrid_kernel = os.environ.get("VLLM_OMNI_MINIMAX_H3_RAINFUSION_KERNEL", "bsa")
-        if self.hybrid_kernel not in ("bsa", "rf2"):
-            raise ValueError("VLLM_OMNI_MINIMAX_H3_RAINFUSION_KERNEL must be bsa or rf2")
-
         self.rainfusion = RainFusionConfig.from_backend_kwargs(backend_kwargs)
         self.layer_idx = _try_extract_layer_index(prefix)
 
@@ -344,19 +329,17 @@ class RainFusionAttentionImpl(AttentionImpl):
             return self.dense_fallback.forward_npu(query, key, value, attn_metadata)
         if query.ndim != 4 or key.shape != query.shape or value.shape != query.shape or plan.used_len > query.shape[1]:
             raise ValueError("RainFusion video geometry must fit identical full-sequence BSND Q/K/V tensors.")
-        if self._can_use_hybrid(query, attn_metadata):
-            return self._forward_hybrid_npu(query, key, value, attn_metadata, plan, 0)
         return self._forward_sparse_npu(query, key, value, plan, attn_metadata)
 
     def _can_use_hybrid(self, query: torch.Tensor, metadata: AttentionMetadata | None) -> bool:
         if (
-            not self.hybrid_enabled
+            metadata is None
+            or not metadata.extra.get("minimax_h3_compact_reference_rows", 0)
             or query.device.type != "npu"
             or query.ndim != 4
             or query.shape[0] != 1
             or self.qkv_layout != _INPUT_LAYOUT
             or self.rainfusion.precision != "bf16"
-            or metadata is None
             or metadata.attn_mask is not None
             or metadata.extra.get("kv_cache_dtype", "bf16") not in ("float", "bf16")
             or not metadata.extra.get("npu_attn_varlen", False)
@@ -407,8 +390,8 @@ class RainFusionAttentionImpl(AttentionImpl):
             plan.dense_query_rows,
             plan.sparse_query_rows,
             plan.key_rows,
-            self.hybrid_kernel,
-            self.hybrid_kernel_dtype,
+            "bsa",
+            "fp16",
         )
         if reference_rows:
             logger.info_once(
@@ -426,9 +409,9 @@ class RainFusionAttentionImpl(AttentionImpl):
             sparsity=self.rainfusion.sparsity,
             scale=self.softmax_scale,
             inner_precise=_INNER_PRECISE,
-            kernel_dtype=self.hybrid_kernel_dtype,
+            kernel_dtype="fp16",
             input_scale=float(metadata.extra.get("laser_input_scale", 256.0)),
-            kernel=self.hybrid_kernel,
+            kernel="bsa",
         )
         if used_q == query.shape[1]:
             return out

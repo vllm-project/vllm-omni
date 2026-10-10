@@ -254,7 +254,7 @@ class UlyssesParallelAttention:
         self._gather_idx = gather_idx
         self._use_sync = use_sync
         self._ulysses_a2a_permute = ulysses_a2a_permute
-        self._reference_seq_lens_cache: tuple[int, int, tuple[int, ...]] | None = None
+        self._reference_seq_lens_cache: tuple[object, tuple[int, ...]] | None = None
         if _a2a_permute_enabled(
             ulysses_a2a_permute,
             scatter_idx,
@@ -285,6 +285,7 @@ class UlyssesParallelAttention:
         gate_compress = None
         reference_key_local = reference_value_local = None
         reference_global_rows = 0
+        reference_request_id = None
         if attn_metadata is not None:
             candidate = attn_metadata.extra.get("gate_compress")
             if isinstance(candidate, torch.Tensor):
@@ -317,6 +318,7 @@ class UlyssesParallelAttention:
                         f"{reference_key_local.shape} vs {key.shape}"
                     )
                 reference_global_rows = int(attn_metadata.extra.get("reference_kv_global_rows", 0))
+                reference_request_id = attn_metadata.extra.get("reference_kv_request_id")
                 if reference_global_rows <= 0:
                     raise ValueError("reference_kv_global_rows must be positive")
 
@@ -584,7 +586,9 @@ class UlyssesParallelAttention:
                 raise NotImplementedError("compacted MiniMax-H3 reference KV currently requires ring_degree=1")
             local_reference_rows = int(reference_key_local.shape[1])
             cache = self._reference_seq_lens_cache
-            if cache is None or cache[0] != reference_global_rows or cache[1] != local_reference_rows:
+            # Request identity changes on every rank together. Local row counts
+            # alone are unsafe: only some ranks may otherwise enter this gather.
+            if reference_request_id is None or cache is None or cache[0] is not reference_request_id:
                 reference_seq_lens = _all_gather_int(
                     self._ulysses_pg,
                     local_reference_rows,
@@ -595,12 +599,11 @@ class UlyssesParallelAttention:
                         f"distributed reference KV row count mismatch: {reference_seq_lens} != {reference_global_rows}"
                     )
                 self._reference_seq_lens_cache = (
-                    reference_global_rows,
-                    local_reference_rows,
+                    reference_request_id,
                     tuple(reference_seq_lens),
                 )
             else:
-                reference_seq_lens = list(cache[2])
+                reference_seq_lens = list(cache[1])
 
             padded_reference_heads = (
                 _ceil_div(int(reference_key_local.shape[2]), ulysses_world_size) * ulysses_world_size

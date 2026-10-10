@@ -870,6 +870,15 @@ class OmniServeCommand(CLISubcommand):
             "resident_layers (DiT only).",
         )
         omni_config_group.add_argument(
+            "--kv-offload-config",
+            type=json.loads,
+            default=None,
+            help="MiniMax-H3 reference-KV cache as JSON: mode=tier1|tier2, "
+            "kv_refresh_interval (default 2), kv_host_quantization=none|fp8|int8 "
+            "(Tier2 only), skip_reference_projection (default false). "
+            "Omit to keep the existing attention path.",
+        )
+        omni_config_group.add_argument(
             "--enable-cpu-offload",
             action="store_true",
             help="Compatibility alias for model-level CPU offload. New integrations should use "

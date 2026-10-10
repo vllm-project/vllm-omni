@@ -104,7 +104,7 @@ def test_reference_kv_compaction_allows_flash_with_unused_vsa_gates():
 
 
 def test_reference_kv_compaction_records_uniform_projection_reduction():
-    from vllm_omni.diffusion.models.minimax_h3.reference_kv_tier1 import (
+    from vllm_omni.diffusion.models.minimax_h3.reference_kv_cache import (
         MiniMaxH3ReferenceKVTier1State,
     )
 
@@ -232,11 +232,14 @@ def test_h3_prepared_rope_table_is_rank_local_and_validated(monkeypatch):
 
 
 def test_denoise_branch_prepares_rope_table_once_per_npu_run(monkeypatch: pytest.MonkeyPatch):
+    from types import SimpleNamespace
+
     from vllm_omni.diffusion.models.minimax_h3 import denoise_loop
     from vllm_omni.diffusion.models.minimax_h3.denoise_loop import (
         MiniMaxH3DenoiseBranch,
         minimax_h3_denoise_loop,
     )
+    from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import MiniMaxH3DiTModel
 
     monkeypatch.setattr(denoise_loop.current_omni_platform, "is_npu", lambda: True)
 
@@ -259,7 +262,10 @@ def test_denoise_branch_prepares_rope_table_once_per_npu_run(monkeypatch: pytest
     )
 
     class Model:
+        create_reference_kv_tier1_state = MiniMaxH3DiTModel.create_reference_kv_tier1_state
+
         def __init__(self):
+            self.od_config = SimpleNamespace(kv_offload_config=None)
             self.rope_table = torch.zeros(3, 6, dtype=torch.bfloat16)
             self.prepare_calls = 0
             self.forward_calls = 0
@@ -289,6 +295,52 @@ def test_denoise_branch_prepares_rope_table_once_per_npu_run(monkeypatch: pytest
 
     assert model.prepare_calls == 1
     assert model.forward_calls == 2
+
+
+def test_reference_kv_compact_prepends_cached_keys_without_sp():
+    from types import SimpleNamespace
+
+    from vllm_omni.diffusion.attention.backends.flash_attn import FlashAttentionBackend
+    from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import MiniMaxH3Attention
+
+    class Capture(nn.Module):
+        use_ring = False
+        attn_backend = FlashAttentionBackend
+
+        def _get_active_parallel_strategy(self):
+            return SimpleNamespace(enabled=False)
+
+        def forward(self, q, k, v, metadata):
+            self.key, self.value, self.metadata = k, v, metadata
+            return q
+
+    class State:
+        post_parallel_cache = False
+        global_reference_rows = 2
+
+        def take_cached_reference_layer(self, layer_index, like):
+            assert layer_index == 0
+            return like.new_full((2, *like.shape[1:]), 7), like.new_full((2, *like.shape[1:]), 9)
+
+    attn = MiniMaxH3Attention.__new__(MiniMaxH3Attention)
+    nn.Module.__init__(attn)
+    attn.attention = Capture()
+    target = torch.ones(4, 2, 4)
+    attn._run_packed_attention(
+        target,
+        target,
+        target,
+        cu_seqlens=torch.tensor([0, 4, 4], dtype=torch.int32),
+        max_seqlen=4,
+        packed_total=4,
+        reference_kv_tier1_state=State(),
+        reference_kv_layer_index=0,
+        reference_kv_compact=True,
+    )
+    torch.testing.assert_close(attn.attention.key[0, :2], torch.full((2, 2, 4), 7.0))
+    torch.testing.assert_close(attn.attention.value[0, :2], torch.full((2, 2, 4), 9.0))
+    assert attn.attention.key.shape[1] == 6
+    assert "ulysses_reference_kv" not in attn.attention.metadata.extra
 
 
 def test_denoise_branch_keeps_rope_construction_on_the_reference_path_off_npu(
