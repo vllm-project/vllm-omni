@@ -54,10 +54,29 @@ def _as_float_list(value: object) -> list[float]:
     return [item for item in value if isinstance(item, int | float) and not isinstance(item, bool)]
 
 
-def extract_queue_wait_s(pipeline_timings: Mapping[str, float] | None) -> float | None:
-    if pipeline_timings is None or "queue_wait_ms" not in pipeline_timings:
-        return None
-    return float(pipeline_timings["queue_wait_ms"] or 0.0) / 1000.0
+def extract_queue_wait_s(
+    pipeline_timings: Mapping[str, float] | None,
+    diffusion_metrics: Mapping[str, float] | None = None,
+) -> float | None:
+    """Return the time a request waited before entering model execution.
+
+    Pipeline queueing is measured by the orchestrator in milliseconds.
+    Diffusion stages may add another wait inside their scheduler, reported in
+    seconds. These waits happen sequentially and are both part of the request's
+    queue time, so include every available measurement.
+    """
+    queue_wait_s = 0.0
+    has_measurement = False
+
+    if pipeline_timings is not None and "queue_wait_ms" in pipeline_timings:
+        queue_wait_s += float(pipeline_timings["queue_wait_ms"] or 0.0) / 1000.0
+        has_measurement = True
+
+    if diffusion_metrics is not None and "scheduler_queue_wait_s" in diffusion_metrics:
+        queue_wait_s += float(diffusion_metrics["scheduler_queue_wait_s"] or 0.0)
+        has_measurement = True
+
+    return queue_wait_s if has_measurement else None
 
 
 def observe_stage_workload_metrics(
