@@ -411,14 +411,20 @@ def init_distributed_environment(
             "distributed_init_method must be provided when initializing distributed environment"
         )
         # this backend is used for WORLD
+        # Bind this rank's device BEFORE the group exists. symmetric-memory (used by
+        # the fused permute-free Ulysses exchange) resolves the group's host
+        # communicator on the current device; a group created first makes that lookup
+        # fail with "NCCL host communicator for group N not found".
+        device_id = rank % current_omni_platform.get_device_count()
+        torch_device = current_omni_platform.get_torch_device(device_id)
+        current_omni_platform.set_device(torch_device)
         torch.distributed.init_process_group(
             backend=backend,
             init_method=distributed_init_method,
             world_size=world_size,
             rank=rank,
+            device_id=torch_device,
         )
-        device_id = torch.distributed.get_rank() % current_omni_platform.get_device_count()
-        current_omni_platform.set_device(current_omni_platform.get_torch_device(device_id))
     # set the local rank
     # local_rank is not available in torch ProcessGroup,
     # see https://github.com/pytorch/pytorch/issues/122816
