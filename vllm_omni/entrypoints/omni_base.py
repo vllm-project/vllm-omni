@@ -449,6 +449,8 @@ class OmniBase(PDDisaggregationMixin):
                 request_id,
             )
         finally:
+            if req_state is not None:
+                req_state.release_stream_edge_metrics()
             self.request_states.pop(request_id, None)
             # Republish gauges so any stale value left by the per-stage
             # publish in _process_single_result (which runs while the request
@@ -729,6 +731,11 @@ class OmniBase(PDDisaggregationMixin):
         self._publish_request_gauges(max(0, len(self.request_states) - (1 if is_finalizing else 0)))
 
         response_metrics: dict[str, Any] = {}
+        req_state = self.request_states.get(req_id)
+        if req_state is not None and req_state.stream_edge_events is not None:
+            edge_snapshot = req_state.stream_edge_events.snapshot()
+            if edge_snapshot:
+                response_metrics["stream_edge_metrics"] = edge_snapshot
         stage_metrics: dict[str, dict[str, Any]] = {}
         rid_key = str(req_id)
         for evt in metrics.stage_events.get(rid_key, [])[stage_event_cursor:]:

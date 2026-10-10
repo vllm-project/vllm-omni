@@ -4,6 +4,7 @@
 import asyncio
 
 from vllm_omni.metrics import OrchestratorAggregator
+from vllm_omni.metrics.stream_edge import RequestStreamEdgeEvents
 
 
 class ClientRequestState:
@@ -51,3 +52,18 @@ class ClientRequestState:
         # the request state (not a class-level dict) so it is released with
         # the state — see #6462 / #6561.
         self.consumed_metric_message_ids: set[int] = set()
+        self.stream_edge_events: RequestStreamEdgeEvents | None = None
+        self._stream_edge_metrics_closed = False
+
+    def enable_stream_edge_metrics(self) -> RequestStreamEdgeEvents:
+        """Opt in at an instrumented producer boundary for this request instance."""
+        if self._stream_edge_metrics_closed:
+            raise RuntimeError("Request stream-edge metrics have been released")
+        if self.stream_edge_events is None:
+            self.stream_edge_events = RequestStreamEdgeEvents()
+        return self.stream_edge_events
+
+    def release_stream_edge_metrics(self) -> None:
+        self._stream_edge_metrics_closed = True
+        if self.stream_edge_events is not None:
+            self.stream_edge_events.close()
