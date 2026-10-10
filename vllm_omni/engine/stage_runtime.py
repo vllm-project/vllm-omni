@@ -135,6 +135,12 @@ class StageEngineLaunch:
                     logger.warning("[StageEngineLaunch] resource shutdown failed", exc_info=True)
 
 
+def _runtime_cfg_devices(runtime_cfg: Any) -> str | int | None:
+    if runtime_cfg is None:
+        return None
+    return runtime_cfg.get("devices") if hasattr(runtime_cfg, "get") else getattr(runtime_cfg, "devices", None)
+
+
 def _build_load_balancer_factory(policy: str) -> Callable[[], LoadBalancer]:
     try:
         normalized = LoadBalancingPolicy(policy)
@@ -599,6 +605,7 @@ class StageRuntime:
         )
         self._validate_mps_topology(stage_plans)
         self._validate_native_kv_topology(stage_plans)
+        self._validate_local_devices(stage_plans)
         return stage_plans
 
     def _finalize_initialized_stages(
@@ -618,12 +625,9 @@ class StageRuntime:
         self._close_mps_servers()
 
     def _resolve_replica_physical_devices(self, stage_id: int, runtime_cfg: Any) -> str | None:
-        if runtime_cfg is None:
-            runtime_cfg = {}
-        devices = runtime_cfg.get("devices") if hasattr(runtime_cfg, "get") else getattr(runtime_cfg, "devices", None)
         physical = resolve_stage_physical_devices(
             stage_id,
-            devices,
+            _runtime_cfg_devices(runtime_cfg),
             visible_baseline=self._init_visible_devices_baseline,
         )
         if self._mps_enabled(runtime_cfg) and (physical is None or not physical.isdigit()):
@@ -631,6 +635,32 @@ class StageRuntime:
         return physical
 
     # ---- Internal methods ----
+
+    def _validate_local_devices(self, plans: Sequence[LogicalStageInitPlan]) -> None:
+        """Reject local stages placed on devices that do not exist before launching any Worker."""
+        # With a device-control env var set, logical IDs are remapped onto the visible devices instead.
+        if os.environ.get(current_omni_platform.device_control_env_var) is not None:
+            return
+        num_devices = current_omni_platform.get_device_count()
+        if num_devices == 0:
+            return  # No devices detected (e.g. CPU platform), nothing to validate against.
+        for plan in plans:
+            for replica in plan.replicas:
+                if replica.launch_mode != "local":
+                    continue
+                stage_id = replica.metadata.stage_id
+                devices = _runtime_cfg_devices(replica.metadata.runtime_cfg)
+                physical = parse_physical_device_ids(
+                    resolve_stage_physical_devices(stage_id, devices, visible_baseline=None)
+                )
+                missing = sorted(device for device in physical or () if device >= num_devices)
+                if missing:
+                    raise ValueError(
+                        f"Stage {stage_id} is placed on device(s) {missing} (devices={devices!r}), but only "
+                        f"{num_devices} device(s) are available. Point the stage at an available device, e.g. "
+                        f'--stage-overrides \'{{"{stage_id}": {{"devices": "0"}}}}\', and lower '
+                        "gpu_memory_utilization for stages that share a device."
+                    )
 
     def _validate_native_kv_topology(self, plans: list[LogicalStageInitPlan]) -> None:
         """Reject unsupported native AR->DiT graphs before launching any Worker."""
