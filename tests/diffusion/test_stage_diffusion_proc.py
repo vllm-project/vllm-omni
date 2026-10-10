@@ -29,6 +29,40 @@ BASE_INFER_STEPS = 10
 DELAY_BASE = 0.01
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("codec", ["OmniMsgpackEncoder", "OmniMsgpackDecoder"])
+async def test_run_loop_cleans_up_when_initialization_fails(mocker, codec):
+    """Initialization errors must notify the client and release ZMQ resources."""
+    import zmq
+    import zmq.asyncio
+
+    client_ctx = zmq.asyncio.Context()
+    request_socket = client_ctx.socket(zmq.PUSH)
+    response_socket = client_ctx.socket(zmq.PULL)
+    request_port = request_socket.bind_to_random_port("tcp://127.0.0.1")
+    response_port = response_socket.bind_to_random_port("tcp://127.0.0.1")
+    proc_ctx = zmq.asyncio.Context()
+    mocker.patch.object(stage_diffusion_proc.zmq.asyncio, "Context", return_value=proc_ctx)
+    mocker.patch.object(stage_diffusion_proc, codec, side_effect=RuntimeError("initialization failed"))
+    stage_proc = StageDiffusionProc.__new__(StageDiffusionProc)
+    try:
+        with pytest.raises(RuntimeError, match="initialization failed"):
+            await asyncio.wait_for(
+                stage_proc.run_loop(f"tcp://127.0.0.1:{request_port}", f"tcp://127.0.0.1:{response_port}"),
+                timeout=5,
+            )
+        assert proc_ctx.closed
+        assert stage_proc._active_tasks is None
+        assert stage_proc._fatal_event is None
+        assert await asyncio.wait_for(response_socket.recv(), timeout=5) == StageDiffusionProc.DIFFUSION_PROC_DEAD
+    finally:
+        # Release leaked sockets even when the regression runs against old code.
+        proc_ctx.destroy(linger=0)
+        request_socket.close(linger=0)
+        response_socket.close(linger=0)
+        client_ctx.term()
+
+
 def test_run_diffusion_proc_sets_lifecycle_before_loading_plugins(monkeypatch: pytest.MonkeyPatch) -> None:
     events: list[str] = []
 

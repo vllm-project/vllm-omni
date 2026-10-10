@@ -357,12 +357,34 @@ class StageDiffusionProc:
     ) -> None:
         """Async event loop handling ZMQ messages from StageDiffusionClient."""
         ctx = zmq.asyncio.Context()
-
         request_socket = ctx.socket(zmq.PULL)
-        request_socket.connect(request_address)
-
         response_socket = ctx.socket(zmq.PUSH)
-        response_socket.connect(response_address)
+
+        try:
+            request_socket.connect(request_address)
+            response_socket.connect(response_address)
+            await self._run_loop(request_socket, response_socket)
+        except Exception:
+            # Include loop initialization failures in client death notification.
+            try:
+                response_socket.setsockopt(zmq.LINGER, 4000)
+                await response_socket.send(StageDiffusionProc.DIFFUSION_PROC_DEAD)
+            except Exception:
+                logger.warning("Failed to send DIFFUSION_PROC_DEAD sentinel to client.")
+            raise
+        finally:
+            self._active_tasks = None
+            self._fatal_event = None
+            request_socket.close()
+            response_socket.close()
+            ctx.term()
+
+    async def _run_loop(
+        self,
+        request_socket: zmq.asyncio.Socket,
+        response_socket: zmq.asyncio.Socket,
+    ) -> None:
+        """Initialize and dispatch requests within the transport lifetime."""
 
         encoder = OmniMsgpackEncoder()
         decoder = OmniMsgpackDecoder()
@@ -541,27 +563,11 @@ class StageDiffusionProc:
                 elif msg_type == "shutdown":
                     break
 
-        except Exception:
-            # Send the death sentinel so the client can detect the
-            # fatal failure promptly (mirrors EngineCoreProc._send_engine_dead).
-            try:
-                response_socket.setsockopt(zmq.LINGER, 4000)
-                await response_socket.send(StageDiffusionProc.DIFFUSION_PROC_DEAD)
-            except Exception:
-                logger.warning("Failed to send DIFFUSION_PROC_DEAD sentinel to client.")
-            raise
-
         finally:
             for task in tasks.values():
                 task.cancel()
             if tasks:
                 await asyncio.gather(*tasks.values(), return_exceptions=True)
-
-            self._active_tasks = None
-            self._fatal_event = None
-            request_socket.close()
-            response_socket.close()
-            ctx.term()
 
     # ------------------------------------------------------------------
     # Lifecycle
