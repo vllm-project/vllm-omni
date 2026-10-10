@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import inspect
 import json
@@ -670,7 +670,7 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
         num_inference_steps = req.sampling_params.num_inference_steps or 50
         sigmas = req.sampling_params.sigmas
         generator = req.sampling_params.generator
-        true_cfg_scale = req.sampling_params.true_cfg_scale or 4.0
+        true_cfg_scale = req.sampling_params.resolve_true_cfg_scale(4.0)
         guidance_scale = None
         if req.sampling_params.guidance_scale_provided:
             guidance_scale = req.sampling_params.guidance_scale

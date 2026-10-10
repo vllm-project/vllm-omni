@@ -421,7 +421,9 @@ def _prepare_cfg_scalars(
     states: Sequence[StepRequestState],
 ) -> tuple[bool, float, bool]:
     def _cfg_scalars(state: StepRequestState) -> tuple[bool, float, bool]:
-        true_cfg_scale = getattr(state.sampling, "true_cfg_scale", None) or 4.0
+        true_cfg_scale = getattr(state.sampling, "true_cfg_scale", None)
+        if true_cfg_scale is None:
+            true_cfg_scale = 4.0
         cfg_normalize = bool(getattr(state.sampling, "cfg_normalize", False))
         return state.do_true_cfg, true_cfg_scale, cfg_normalize
 

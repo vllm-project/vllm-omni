@@ -568,6 +568,17 @@ def test_input_batch_cached_repack_refreshes_state_references_without_prompt_emb
 
 
 @pytest.mark.cpu
+@pytest.mark.parametrize(("value", "expected"), [(None, 4.0), (0.0, 0.0)])
+def test_input_batch_true_cfg_scale_only_defaults_none(value, expected):
+    state = _make_input_batch_state("req-1", 1.0)
+    state.sampling.true_cfg_scale = value
+
+    batch = InputBatch.make_batch([state])
+
+    assert batch.true_cfg_scale == expected
+
+
+@pytest.mark.cpu
 def test_input_batch_cached_repack_keeps_static_prompt_fields_for_same_composition():
     first_state = _make_input_batch_state("req-1", 1.0)
     first_state.prompt_embeds = torch.ones(1, 2, 3)
