@@ -1,12 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from functools import wraps
-from typing import Any
+from typing import Any, cast
 
 import torch
 from vllm.v1.worker.gpu_worker import AsyncIntermediateTensors
 
+from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.parallel_state import (
     get_cfg_group,
     get_classifier_free_guidance_rank,
@@ -196,6 +197,9 @@ class PipelineParallelMixin:
             CFGParallelMixin.predict_noise_maybe_with_cfg exactly.
           - PP only, no CFG: cond branch only.
 
+        Also sets ``self.transformer.do_true_cfg`` (via CFGParallelMixin) before
+        predicting, matching the non-PP CFG helper path for TeaCache.
+
         Returns:
             noise_pred on the last PP rank (all CFG ranks when CFG-parallel is active).
             None on all other ranks.
@@ -205,6 +209,8 @@ class PipelineParallelMixin:
                 do_true_cfg, true_cfg_scale, positive_kwargs, negative_kwargs, cfg_normalize, output_slice
             )
 
+        CFGParallelMixin._set_transformer_do_true_cfg(self, do_true_cfg)
+
         self._sync_pp_send()
 
         pp_group = get_pp_group()
@@ -213,9 +219,11 @@ class PipelineParallelMixin:
         if cfg_parallel_ready:
             # Each PP pipeline carries exactly one CFG branch determined by cfg_rank.
             all_kwargs = [positive_kwargs if get_classifier_free_guidance_rank() == 0 else negative_kwargs]
+            branches = ["positive" if get_classifier_free_guidance_rank() == 0 else "negative"]
         else:
             # Sequential CFG (or no CFG): this PP pipeline handles all branches.
             all_kwargs = [positive_kwargs] + ([negative_kwargs] if do_true_cfg else [])
+            branches = ["positive"] + (["negative"] if do_true_cfg else [])
 
         # Non-first ranks receive intermediate tensors asynchronously
         n = len(all_kwargs)
@@ -226,13 +234,20 @@ class PipelineParallelMixin:
 
         if not pp_group.is_last_rank:
             # First / middle rank: run partial forwards and propagate ITs downstream.
-            for kwargs, it in zip(all_kwargs, its):
-                result = self.predict_noise(**kwargs, intermediate_tensors=it)
+            for branch, kwargs, it in zip(branches, all_kwargs, its):
+                result = CFGParallelMixin._predict_noise_for_cfg_branch(
+                    cast(CFGParallelMixin, self), branch, {**cast(dict[str, Any], kwargs), "intermediate_tensors": it}
+                )
                 self._pp_send_work.extend(pp_group.isend_tensor_dict(result.tensors))
             return None
 
         # Last rank: run full forward
-        noise_preds = [self.predict_noise(**kwargs, intermediate_tensors=it) for kwargs, it in zip(all_kwargs, its)]
+        noise_preds = [
+            CFGParallelMixin._predict_noise_for_cfg_branch(
+                cast(CFGParallelMixin, self), branch, {**cast(dict[str, Any], kwargs), "intermediate_tensors": it}
+            )
+            for branch, kwargs, it in zip(branches, all_kwargs, its)
+        ]
 
         if cfg_parallel_ready:
             # All-gather the single-branch prediction across the CFG group and combine

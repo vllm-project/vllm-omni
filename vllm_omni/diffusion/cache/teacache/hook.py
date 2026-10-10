@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """
 Hook-based TeaCache implementation for vLLM-Omni.
@@ -24,6 +24,7 @@ from vllm_omni.diffusion.distributed.parallel_state import (
     get_classifier_free_guidance_rank,
     get_classifier_free_guidance_world_size,
     get_sp_group,
+    is_cfg_group_initialized,
     model_parallel_is_initialized,
 )
 from vllm_omni.diffusion.hooks import HookRegistry, ModelHook, StateManager
@@ -140,29 +141,19 @@ class TeaCacheHook(ModelHook):
         # ============================================================================
         # GENERIC CACHING LOGIC (works for all models)
         # ============================================================================
-        # Set context based on CFG branch for separate state tracking
-        # With CFG-parallel, each rank processes only one branch:
-        #   - cfg_rank 0: positive branch
-        #   - cfg_rank > 0: negative branch
-        # Without CFG-parallel, branches alternate within a single rank
-        branch_hint = None
-        if getattr(ctx, "extra_states", None):
-            branch_hint = ctx.extra_states.get("teacache_branch")
-
-        if branch_hint is not None:
-            if branch_hint not in ("positive", "negative"):
-                raise ValueError(f"Invalid teacache_branch={branch_hint!r}; expected 'positive' or 'negative'.")
-            cache_branch = branch_hint
-        elif getattr(module, "do_true_cfg", False):
-            cfg_parallel_size = get_classifier_free_guidance_world_size()
-            if cfg_parallel_size > 1:
-                cfg_rank = get_classifier_free_guidance_rank()
-                cache_branch = "negative" if cfg_rank > 0 else "positive"
-            else:
-                # No CFG-parallel: use forward counter to alternate branches
-                cache_branch = "negative" if self._forward_cnt % 2 == 1 else "positive"
-        else:
-            cache_branch = "positive"
+        # Set context based on CFG branch for separate state tracking.
+        # Explicit sources win, most specific first:
+        #   1. the extractor's per-call hint, ctx.extra_states["teacache_branch"]
+        #      (MammothModa2 passes it through its forward kwargs);
+        #   2. module.cfg_branch, stamped by CFGParallelMixin on every call it
+        #      makes, which stays correct when non-CFG forwards are interleaved
+        #      (step execution).
+        # Callers that provide neither fall back to the inferred branch:
+        #   - CFG-parallel: cfg_rank 0 is positive, cfg_rank > 0 negative
+        #   - otherwise branches are assumed to alternate on this rank
+        cache_branch = self._explicit_cfg_branch(module, ctx)
+        if cache_branch is None:
+            cache_branch = self._infer_cfg_branch(module)
 
         context_name = f"teacache_{cache_branch}"
         self.state_manager.set_context(context_name)
@@ -227,6 +218,26 @@ class TeaCacheHook(ModelHook):
         # POSTPROCESSING (model-specific, via callable)
         # ============================================================================
         return ctx.postprocess(output)
+
+    @staticmethod
+    def _explicit_cfg_branch(module: torch.nn.Module, ctx: Any) -> str | None:
+        """Branch named by the extractor hint or the caller's stamp, if any."""
+        extra_states = getattr(ctx, "extra_states", None) or {}
+        source, branch = "teacache_branch", extra_states.get("teacache_branch")
+        if branch is None:
+            source, branch = "cfg_branch", getattr(module, "cfg_branch", None)
+        if branch is not None and branch not in ("positive", "negative"):
+            raise ValueError(f"Invalid {source}={branch!r}; expected 'positive' or 'negative'.")
+        return branch
+
+    def _infer_cfg_branch(self, module: torch.nn.Module) -> str:
+        """Fallback branch for callers that don't stamp ``module.cfg_branch``."""
+        if not getattr(module, "do_true_cfg", False):
+            return "positive"
+        if is_cfg_group_initialized() and get_classifier_free_guidance_world_size() > 1:
+            return "negative" if get_classifier_free_guidance_rank() > 0 else "positive"
+        # Sequential CFG without a stamp: assume calls alternate on this rank.
+        return "negative" if self._forward_cnt % 2 == 1 else "positive"
 
     def _should_compute_full_transformer(self, state: TeaCacheState, modulated_inp: torch.Tensor) -> bool:
         """

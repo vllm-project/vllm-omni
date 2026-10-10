@@ -172,6 +172,70 @@ class MockPipelineParallel(PipelineParallelMixin, CFGParallelMixin):
         return x
 
 
+@pytest.mark.core_model
+@pytest.mark.diffusion
+@pytest.mark.cpu
+def test_pp_predict_noise_sets_transformer_do_true_cfg(monkeypatch: pytest.MonkeyPatch) -> None:
+    """PP>1 path sets ``transformer.do_true_cfg`` before each ``predict_noise`` call."""
+
+    class _StubPPGroup:
+        is_first_rank = True
+        is_last_rank = True
+
+        def irecv_tensor_dict(self):
+            raise AssertionError("unexpected recv in stub last rank")
+
+        def isend_tensor_dict(self, *args, **kwargs):
+            return []
+
+    class _FlagTransformer(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.seen_at_predict: list[bool | None] = []
+            self.seen_branches: list[str | None] = []
+
+    class _MiniPPPipeline(PipelineParallelMixin, CFGParallelMixin):
+        def __init__(self) -> None:
+            self.transformer = _FlagTransformer()
+
+        def predict_noise(self, **kwargs) -> torch.Tensor:
+            self.transformer.seen_at_predict.append(getattr(self.transformer, "do_true_cfg", None))
+            self.transformer.seen_branches.append(getattr(self.transformer, "cfg_branch", None))
+            return torch.ones(2, 4)
+
+    monkeypatch.setattr(pp_module, "get_pipeline_parallel_world_size", lambda: 2)
+    monkeypatch.setattr(pp_module, "get_pp_group", lambda: _StubPPGroup())
+    monkeypatch.setattr(pp_module, "get_classifier_free_guidance_world_size", lambda: 1)
+
+    pipeline = _MiniPPPipeline()
+    positive_kwargs = {"x": torch.zeros(2, 4)}
+    negative_kwargs = {"x": torch.ones(2, 4)}
+
+    with torch.inference_mode():
+        pipeline.predict_noise_maybe_with_cfg(
+            do_true_cfg=True,
+            true_cfg_scale=4.0,
+            positive_kwargs=positive_kwargs,
+            negative_kwargs=negative_kwargs,
+            cfg_normalize=False,
+        )
+        assert pipeline.transformer.seen_at_predict == [True, True]
+        assert pipeline.transformer.do_true_cfg is True
+
+        pipeline.predict_noise_maybe_with_cfg(
+            do_true_cfg=False,
+            true_cfg_scale=1.0,
+            positive_kwargs=positive_kwargs,
+            negative_kwargs=None,
+            cfg_normalize=False,
+        )
+
+    assert pipeline.transformer.seen_at_predict[-1] is False
+    assert pipeline.transformer.do_true_cfg is False
+    assert pipeline.transformer.seen_branches == ["positive", "negative", "positive"]
+    assert pipeline.transformer.cfg_branch is None
+
+
 # ---------------------------------------------------------------------------
 # 1.  AsyncLatents – unit tests (no distributed env required)
 # ---------------------------------------------------------------------------

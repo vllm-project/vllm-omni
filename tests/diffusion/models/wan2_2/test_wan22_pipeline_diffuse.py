@@ -331,13 +331,14 @@ def test_forward_emits_request_local_typed_media_after_vae_decode() -> None:
     assert outputs[0].media.video.spec.value_range is VideoValueRange.NEGATIVE_ONE_TO_ONE
 
 
-def test_forward_keeps_legacy_output_on_non_owner_vae_rank() -> None:
+@pytest.mark.parametrize("placeholder", [None, torch.empty(0)], ids=["pipeline-parallel", "distributed-vae"])
+def test_forward_keeps_legacy_output_on_non_owner_vae_rank(placeholder) -> None:
     # Distributed VAE decode uses broadcast_result=False, so non-owner ranks get
     # an empty placeholder instead of the full video. Wrapping that as typed media
     # would fail split_diffusion_output_by_request's batch check on every non-owner
     # rank, so the pipeline must keep the placeholder on the legacy output field.
     pipeline = _make_pipeline()
-    pipeline.vae.decode = lambda latents, return_dict=False: (torch.empty(0),)  # type: ignore[assignment]
+    pipeline.vae.decode = lambda latents, return_dict=False: (placeholder,)  # type: ignore[assignment]
     pipeline.diffuse = lambda **kwargs: torch.zeros_like(kwargs["latents"])  # type: ignore[method-assign]
 
     batch = DiffusionRequestBatch(
@@ -359,8 +360,10 @@ def test_forward_keeps_legacy_output_on_non_owner_vae_rank() -> None:
 
     assert len(outputs) == 1
     assert outputs[0].media is None
-    assert outputs[0].output is not None
-    assert outputs[0].output.numel() == 0
+    if placeholder is None:
+        assert outputs[0].output is None
+    else:
+        torch.testing.assert_close(outputs[0].output, placeholder)
 
 
 def test_forward_batches_precomputed_prompt_embeddings() -> None:

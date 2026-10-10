@@ -1073,6 +1073,20 @@ class WanTransformer3DModel(nn.Module):
         return_dict: bool = True,
         attention_kwargs: dict[str, Any] | None = None,
     ) -> torch.Tensor | Transformer2DModelOutput | IntermediateTensors:
+        hidden_states, temb, block_kwargs, output_shape = self._prepare_forward(
+            hidden_states, timestep, encoder_hidden_states, encoder_hidden_states_image, intermediate_tensors
+        )
+        hidden_states = self._run_local_blocks(hidden_states, **block_kwargs)
+        return self._finish_forward(hidden_states, temb, output_shape, return_dict)
+
+    def _prepare_forward(
+        self,
+        hidden_states: torch.Tensor,
+        timestep: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        encoder_hidden_states_image: torch.Tensor | None = None,
+        intermediate_tensors: IntermediateTensors | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, dict, tuple[int, ...]]:
         batch_size, num_channels, num_frames, height, width = hidden_states.shape
         p_t, p_h, p_w = self.config.patch_size
         post_patch_num_frames = num_frames // p_t
@@ -1152,10 +1166,25 @@ class WanTransformer3DModel(nn.Module):
                 parallel_config.sequence_parallel_size,
             )
 
-        # Transformer blocks
-        # Preserve the post-patch (T, H, W) grid so VSA can partition
-        # the flattened DiT sequence into spatiotemporal blocks.
-        vsa_dit_seq_shape = (post_patch_num_frames, post_patch_height, post_patch_width)
+        block_kwargs = dict(
+            encoder_hidden_states=encoder_hidden_states,
+            timestep_proj=timestep_proj,
+            rotary_emb=rotary_emb,
+            hidden_states_mask=hidden_states_mask,
+            vsa_dit_seq_shape=(post_patch_num_frames, post_patch_height, post_patch_width),
+        )
+        output_shape = (batch_size, post_patch_num_frames, post_patch_height, post_patch_width, p_t, p_h, p_w)
+        return hidden_states, temb, block_kwargs, output_shape
+
+    def _run_local_blocks(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        timestep_proj: torch.Tensor,
+        rotary_emb: tuple[torch.Tensor, torch.Tensor],
+        hidden_states_mask: torch.Tensor | None,
+        vsa_dit_seq_shape: tuple[int, int, int],
+    ) -> torch.Tensor:
         for block in self.blocks[self.start_layer : self.end_layer]:
             hidden_states = block(
                 hidden_states,
@@ -1167,6 +1196,12 @@ class WanTransformer3DModel(nn.Module):
                 self.preserve_vsa_all_blocks,
             )
 
+        return hidden_states
+
+    def _finish_forward(
+        self, hidden_states: torch.Tensor, temb: torch.Tensor, output_shape: tuple[int, ...], return_dict: bool
+    ) -> torch.Tensor | Transformer2DModelOutput | IntermediateTensors:
+        batch_size, post_patch_num_frames, post_patch_height, post_patch_width, p_t, p_h, p_w = output_shape
         if not is_pipeline_last_stage():
             # Non-last PP stage: hand the token sequence to the caller via IntermediateTensors.
             # predict_noise will broadcast it to the next stage before calling that stage's forward.

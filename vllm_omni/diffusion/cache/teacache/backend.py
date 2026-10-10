@@ -161,7 +161,51 @@ def enable_kandinsky6_teacache(pipeline: Any, config: DiffusionCacheConfig) -> N
     )
 
 
+def enable_wan_teacache(pipeline: Any, config: DiffusionCacheConfig) -> None:
+    """Enable experimental stage-local caching for Wan 1.3B T2V."""
+    import torch
+
+    parallel = pipeline.od_config.parallel_config
+    transformer = pipeline.transformer
+    if transformer is None:
+        raise ValueError("Wan TeaCache is limited to the single-expert Wan2.1 T2V 1.3B architecture")
+    model_config = transformer.config
+    if (
+        pipeline.has_transformer_2
+        or pipeline.expand_timesteps
+        or pipeline.is_dmd
+        or model_config.in_channels != 16
+        or model_config.num_layers != 30
+        or model_config.num_attention_heads != 12
+        or model_config.attention_head_dim != 128
+    ):
+        raise ValueError("Wan TeaCache is limited to the single-expert Wan2.1 T2V 1.3B architecture")
+    if (
+        parallel.pipeline_parallel_size not in (1, 2)
+        or parallel.cfg_parallel_size not in (1, 2)
+        or parallel.tensor_parallel_size != 1
+        or parallel.sequence_parallel_size != 1
+        or getattr(pipeline.od_config, "quantization_config", None) is not None
+        or getattr(pipeline.od_config, "quantization", None) is not None
+        or transformer.dtype != torch.bfloat16
+    ):
+        raise ValueError("Wan TeaCache requires BF16, PP/CFG sizes 1 or 2, TP=SP=1 and no quantization")
+    if config.coefficients is None:
+        raise ValueError(
+            "Wan TeaCache has no qualified default profile; explicit experimental coefficients are required"
+        )
+    apply_teacache_hook(
+        transformer,
+        TeaCacheConfig(
+            transformer_type="WanTransformer3DModel",
+            rel_l1_thresh=config.rel_l1_thresh,
+            coefficients=config.coefficients,
+        ),
+    )
+
+
 CUSTOM_TEACACHE_ENABLERS = {
+    "Wan22Pipeline": enable_wan_teacache,
     "BagelPipeline": enable_bagel_teacache,
     "Flux2KleinPipeline": enable_flux2_klein_teacache,
     "HunyuanImage3Pipeline": enable_hunyuan_image3_teacache,

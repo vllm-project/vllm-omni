@@ -994,7 +994,7 @@ class Wan22Pipeline(
                 # owning rank and keep the placeholder on the legacy output field, so
                 # the media batch-dimension check in split_diffusion_output_by_request
                 # does not trip on every non-owner rank.
-                if decoded.dim() == 5:
+                if decoded is not None and decoded.dim() == 5:
                     output = None
                     media = DiffusionMediaOutput(
                         video=VideoMediaOutput(
