@@ -1,7 +1,7 @@
 [
   {
     "test_name": "test_minicpmo_4_5",
-    "description": "H100 baseline refreshed 2026-09-29: equal-weight nightly means for 2026-09-22 through 2026-09-28 (7 runs each for C1/P32, C4/P64, C8/P128), rounded to 4 decimals without an added margin. Uses request reference audio after #6628; duplex_seed_tts excluded. A3 unchanged.",
+    "description": "H100 baselines refreshed from Buildkite build 17017 (2026-10-10, commit c5e0bd7c2c3dd297adfbf36a40f3b7a19bf94d24): each configured metric equals the measured result multiplied by 1.10, rounded to 4 decimals. This includes request_throughput (+10%, a stricter target). A3 baselines are unchanged; C16/C32 remain temporary placeholders. Source: https://buildkite.com/vllm/vllm-omni/builds/17017/canvas?sid=01a124b0-a8d2-4e87-9c9e-6f92ef5c251e",
     "mark": [
       {
         "hardware_marks": {
@@ -32,12 +32,16 @@
         "num_prompts": [
           32,
           64,
-          128
+          128,
+          256,
+          512
         ],
         "max_concurrency": [
           1,
           4,
-          8
+          8,
+          16,
+          32
         ],
         "no_oversample": true,
         "disable_shuffle": true,
@@ -57,56 +61,76 @@
         "baseline": {
           "H100": {
             "request_throughput": [
-              0.9615,
-              1.4882,
-              1.6245
+              1.7754,
+              3.72,
+              4.4721,
+              4.411,
+              4.6593
             ],
             "mean_ttft_ms": [
-              156.5006,
-              272.8529,
-              283.2613
+              132.5259,
+              242.7693,
+              292.364,
+              348.5606,
+              398.8221
             ],
             "mean_e2el_ms": [
-              1042.7617,
-              2669.8806,
-              4882.2845
+              681.0111,
+              1274.9608,
+              2149.7346,
+              4364.1781,
+              8260.9541
             ],
             "mean_audio_ttfp_ms": [
-              585.7387,
-              1396.1575,
-              2508.4384
+              364.2452,
+              810.0895,
+              1233.9697,
+              1832.5383,
+              3193.5749
             ],
             "mean_audio_rtf": [
-              0.2504,
-              0.6281,
-              1.1787
+              0.162,
+              0.3049,
+              0.5181,
+              0.9997,
+              1.8129
             ]
           },
           "A3": {
             "request_throughput": [
               0.4813,
               0.6381,
-              0.8728
+              0.8728,
+              0.001,
+              0.001
             ],
             "mean_ttft_ms": [
               328.182,
               470.0053,
-              506.3193
+              506.3193,
+              60000,
+              60000
             ],
             "mean_e2el_ms": [
               2086.7028,
               6480.6866,
-              9103.7395
+              9103.7395,
+              600000,
+              600000
             ],
             "mean_audio_ttfp_ms": [
               1023.3301,
               2734.1486,
-              3151.4020
+              3151.4020,
+              60000,
+              60000
             ],
             "mean_audio_rtf": [
               0.4659,
               1.4737,
-              2.1758
+              2.1758,
+              100,
+              100
             ]
           }
         }

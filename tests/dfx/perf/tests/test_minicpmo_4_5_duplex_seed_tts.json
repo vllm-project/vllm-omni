@@ -1,6 +1,7 @@
 [
   {
     "test_name": "test_minicpmo_4_5_duplex_seed_tts",
+    "description": "H100 baselines refreshed from Buildkite build 17017 (2026-10-10, commit c5e0bd7c2c3dd297adfbf36a40f3b7a19bf94d24): each configured metric equals the measured result multiplied by 1.10, rounded to 4 decimals. B200 and A3 remain temporary placeholders pending measurements. Source: https://buildkite.com/vllm/vllm-omni/builds/17017/canvas?sid=01a124b0-a8de-4765-861b-f1d69ae0548b",
     "mark": [
       {
         "hardware_marks": {
@@ -29,21 +30,94 @@
         "backend": "openai-realtime-tts",
         "endpoint": "/v1/realtime",
         "num_prompts": [
-          1
+          4,
+          16,
+          32
         ],
         "max_concurrency": [
-          1
+          1,
+          4,
+          8
         ],
         "no_oversample": true,
         "disable_shuffle": true,
         "trust_remote_code": true,
         "seed_tts_locale": "en",
+        "seed_tts_wer_eval": true,
         "seed_tts_turns_per_session": 4,
         "expected_duplex_audio_turns_per_session": 4,
         "extra_body": {
           "save_duplex_request_metrics": true
         },
-        "percentile-metrics": "ttft,tpot,itl,e2el,audio_ttfp,audio_rtf,audio_duration"
+        "percentile-metrics": "ttft,tpot,itl,e2el,audio_ttfp,audio_rtf,audio_duration",
+        "baseline": {
+          "H100": {
+            "mean_ttft_ms": [
+              322.2417,
+              408.3143,
+              668.0144
+            ],
+            "mean_e2el_ms": [
+              19218.0923,
+              19008.5836,
+              18894.4847
+            ],
+            "mean_audio_ttfp_ms": [
+              322.2417,
+              408.3143,
+              668.0144
+            ],
+            "mean_audio_rtf": [
+              1.1491,
+              1.1585,
+              1.2367
+            ]
+          },
+          "B200": {
+            "mean_ttft_ms": [
+              60000,
+              60000,
+              60000
+            ],
+            "mean_e2el_ms": [
+              600000,
+              600000,
+              600000
+            ],
+            "mean_audio_ttfp_ms": [
+              60000,
+              60000,
+              60000
+            ],
+            "mean_audio_rtf": [
+              100,
+              100,
+              100
+            ]
+          },
+          "A3": {
+            "mean_ttft_ms": [
+              60000,
+              60000,
+              60000
+            ],
+            "mean_e2el_ms": [
+              600000,
+              600000,
+              600000
+            ],
+            "mean_audio_ttfp_ms": [
+              60000,
+              60000,
+              60000
+            ],
+            "mean_audio_rtf": [
+              100,
+              100,
+              100
+            ]
+          }
+        }
       }
     ]
   }
