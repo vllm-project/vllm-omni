@@ -1451,13 +1451,14 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         getattr(self, "_inflight_prefills", set()).discard(request)
 
         # 1. Standard cleanup parts from base _free_request
-        status = getattr(request, "status", None)
-        transfer_params = getattr(request, "kv_transfer_params", None)
+        status = request.status
+        transfer_params = request.kv_transfer_params
+        kv_config = self.vllm_config.kv_transfer_config
         native_transfer = (
             transfer_params
             and transfer_params.get("do_remote_decode")
-            and getattr(getattr(self.vllm_config, "kv_transfer_config", None), "kv_connector", None)
-            == "MooncakeConnector"
+            and kv_config is not None
+            and kv_config.kv_connector in {"MooncakeConnector", "OmniNixlKVConnector"}
         )
         if native_transfer and status == RequestStatus.FINISHED_STOPPED:
             request.status = RequestStatus.FINISHED_LENGTH_CAPPED

@@ -46,7 +46,9 @@ from vllm_omni.config.omni_config import (
     _PARALLEL_CONFIG_ENGINE_FIELD_MAP,
     _SCHEDULER_STAGE_ENGINE_FIELD_MAP,
     BaseVllmOmniStageConfig,
+    VllmOmniARStageConfig,
     VllmOmniDiffusionStageConfig,
+    VllmOmniGenerationStageConfig,
 )
 from vllm_omni.config.stage_config import StageType
 from vllm_omni.diffusion.data import OmniDiffusionConfig
@@ -1173,6 +1175,13 @@ def _project_omni_stage_engine_args(
         value = getattr(stage_config, name)
         if value is not None:
             engine_args[name] = copy.deepcopy(value)
+
+    if isinstance(stage_config, (VllmOmniARStageConfig, VllmOmniGenerationStageConfig)):
+        offload = stage_config.offload_config
+        if offload is not None:
+            engine_args["offload_backend"] = offload.offload_backend
+            engine_args.update(_project_omni_config_fields(offload.uva))
+            engine_args.update(_project_omni_config_fields(offload.prefetch))
 
     # The legacy builder always emits this key, including for pipelines such
     # as Audex that intentionally defer architecture discovery to HF config.

@@ -25,6 +25,7 @@ from vllm.config import CacheConfig as VllmCacheConfig
 from vllm.config import CompilationConfig as VllmCompilationConfig
 from vllm.config import KVTransferConfig
 from vllm.config import LoadConfig as VllmLoadConfig
+from vllm.config import OffloadConfig as VllmOffloadConfig
 from vllm.config import ParallelConfig as VllmParallelConfig
 from vllm.config import ProfilerConfig as VllmProfilerConfig
 from vllm.config import SchedulerConfig as VllmSchedulerConfig
@@ -295,6 +296,7 @@ class _StageEngineValues:
     diffusion: _DiffusionEngineOverrides
     compilation_config: Mapping[str, Any] | VllmCompilationConfig | None
     profiler_config: Mapping[str, Any] | VllmProfilerConfig | None
+    offload_config: Mapping[str, object] | VllmOffloadConfig | None
 
 
 @dataclass(frozen=True)
@@ -1251,7 +1253,7 @@ _LLM_STAGE_ENGINE_FIELDS = (
     | _LLM_SCHEDULER_ENGINE_FIELDS
     | _LLM_PARALLEL_CONFIG_ENGINE_FIELDS
     | _POOLING_ENGINE_FIELDS
-    | {"parallel_config"}
+    | {"parallel_config", "offload_config"}
 )
 _DIFFUSION_OWNED_STAGE_ENGINE_FIELDS = (
     _COMMON_STAGE_ENGINE_FIELDS
@@ -1585,6 +1587,7 @@ def _stage_engine_values(
         diffusion=_DiffusionEngineOverrides(_select_engine_overrides(diffusion_kwargs, _DIFFUSION_STAGE_ENGINE_FIELDS)),
         compilation_config=_copy_value(engine.get("compilation_config")),
         profiler_config=_copy_value(engine.get("profiler_config")),
+        offload_config=_copy_value(engine.get("offload_config")),
     )
 
 
@@ -1745,10 +1748,14 @@ class BaseVllmOmniStageConfig:
 class VllmOmniARStageConfig(BaseVllmOmniStageConfig):
     """Structured config for autoregressive LLM stages."""
 
+    offload_config: VllmOffloadConfig | None = None
+
 
 @config(config=ConfigDict(arbitrary_types_allowed=True))
 class VllmOmniGenerationStageConfig(BaseVllmOmniStageConfig):
     """Structured config for generation LLM stages."""
+
+    offload_config: VllmOffloadConfig | None = None
 
 
 @config(config=ConfigDict(arbitrary_types_allowed=True))
@@ -1851,7 +1858,7 @@ def _build_ar_stage_config(
     return cast(
         VllmOmniARStageConfig,
         _with_resolved_processors(
-            VllmOmniARStageConfig(**common_kwargs),
+            VllmOmniARStageConfig(**common_kwargs, offload_config=_copy_value(engine.offload_config)),
             input_proc,
             next_stage_proc,
         ),
@@ -1878,7 +1885,7 @@ def _build_generation_stage_config(
     return cast(
         VllmOmniGenerationStageConfig,
         _with_resolved_processors(
-            VllmOmniGenerationStageConfig(**common_kwargs),
+            VllmOmniGenerationStageConfig(**common_kwargs, offload_config=_copy_value(engine.offload_config)),
             input_proc,
             next_stage_proc,
         ),
