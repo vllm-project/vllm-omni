@@ -24,6 +24,20 @@ from vllm_omni.model_extras.cosmos3 import (
     COSMOS3_EXTRA_BODY_PARAMS,
     COSMOS3_EXTRA_OUTPUT_PARAMS,
 )
+from vllm_omni.model_extras.dreamzero import (
+    DREAMZERO_EXTRA_BODY_PARAMS,
+    DREAMZERO_EXTRA_OUTPUT_PARAMS,
+    DREAMZERO_WORKER_EXTENSION_CLS,
+)
+from vllm_omni.model_extras.dreamzero import (
+    build_observations as build_dreamzero_observations,
+)
+from vllm_omni.model_extras.dreamzero import (
+    finalize as finalize_dreamzero_robot_run,
+)
+from vllm_omni.model_extras.dreamzero import (
+    process_robot_actions as process_dreamzero_robot_actions,
+)
 from vllm_omni.model_extras.helios import (
     HELIOS_EXTRA_BODY_PARAMS,
     HELIOS_EXTRA_OUTPUT_PARAMS,
@@ -152,6 +166,11 @@ class TransformerConfigSubfolderResolver(Protocol):
     ) -> str: ...
 
 
+RobotObsBuilder = Callable[..., tuple[list[dict[str, Any]] | dict[str, Any], dict[str, Any]]]
+ActionOutputProcessor = Callable[..., dict[str, Any]]
+RobotPolicyFinalizer = Callable[..., Any | None]
+
+
 def default_x_to_text_prompt(
     model: str,
     prompt: str,
@@ -237,6 +256,14 @@ _EXTRA_SPECS: dict[str, dict[str, Any]] = {
         "extra_body_params": COSMOS3_EXTRA_BODY_PARAMS,
         "extra_output_params": COSMOS3_EXTRA_OUTPUT_PARAMS,
         # The shared T2I example already supplies modalities=["image"].
+    },
+    "DreamZeroPipeline": {
+        "extra_body_params": DREAMZERO_EXTRA_BODY_PARAMS,
+        "extra_output_params": DREAMZERO_EXTRA_OUTPUT_PARAMS,
+        "worker_extension_cls": DREAMZERO_WORKER_EXTENSION_CLS,
+        "robot_obs_builder": build_dreamzero_observations,
+        "action_output_processor": process_dreamzero_robot_actions,
+        "robot_policy_finalizer": finalize_dreamzero_robot_run,
     },
     "Cosmos3OmniPipeline": {
         "extra_body_params": COSMOS3_EXTRA_BODY_PARAMS,
@@ -440,6 +467,11 @@ def should_preserve_reference_image_size(
     return bool(resolver and resolver(model=model, revision=revision))
 
 
+def get_worker_extension_class(model_class_name: str | None) -> str | None:
+    spec = _get_spec(model_class_name)
+    return spec.get("worker_extension_cls", None) if spec is not None else None
+
+
 def should_init_extra_args_for_non_diffusion_stages(model_class_name: str | None) -> bool:
     spec = _get_spec(model_class_name)
     return bool(spec and spec.get("init_extra_args_for_non_diffusion_stages", False))
@@ -530,3 +562,44 @@ def build_image_to_video_prompt(
         width,
         num_frames,
     )
+
+
+def build_robot_observations(
+    model_class_name: str | None,
+    model_dir: str,
+    task: str,
+    data_dir: str,
+    **extra_params,
+) -> tuple[list[dict[str, Any]] | dict[str, Any], dict[str, Any]]:
+    spec = _get_spec(model_class_name)
+    builder: RobotObsBuilder | None = spec.get("robot_obs_builder") if spec is not None else None
+    if builder is None:
+        raise NotImplementedError(
+            f"Model '{model_class_name}' has no robot_obs_builder registered; "
+            "it cannot run through the shared robot_policy example."
+        )
+    return builder(model_dir, task, data_dir, **extra_params)
+
+
+def process_robot_actions(
+    model_class_name: str | None,
+    output,
+    **metadata,
+) -> dict[str, Any]:
+    spec = _get_spec(model_class_name)
+    processor: ActionOutputProcessor | None = spec.get("action_output_processor") if spec is not None else None
+    if processor is None:
+        raise NotImplementedError(
+            f"Model '{model_class_name}' has no action_output_processor registered; "
+            "it cannot run through the shared robot_policy example."
+        )
+    return processor(output, **metadata)
+
+
+def finalize_robot_run(model_class_name: str, omni, results: list[dict], output_path):
+    spec = _get_spec(model_class_name)
+    finalizer: RobotPolicyFinalizer | None = spec.get("robot_policy_finalizer") if spec is not None else None
+    if finalizer is None:
+        print(f"No post-process procedures for {model_class_name}.")
+        return
+    return finalizer(omni, results, output_path)

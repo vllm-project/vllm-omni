@@ -53,6 +53,7 @@ from vllm_omni.diffusion.models.dreamzero.utils import (
     DEFAULT_SEED,
     DEFAULT_SIGMA_SHIFT,
 )
+from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.models.schedulers.scheduling_flow_unipc_multistep import FlowUniPCMultistepScheduler
 from vllm_omni.diffusion.offloader.config import (
     OffloadStrategy,
@@ -116,7 +117,7 @@ class VideoActionScheduler:
 # ---------------------------------------------------------------------------
 
 
-class DreamZeroPipeline(nn.Module, CFGParallelMixin):
+class DreamZeroPipeline(nn.Module, CFGParallelMixin, SupportsComponentDiscovery):
     """DreamZero world model pipeline.
 
     Multi-output: predict_noise() returns (video_pred, action_pred).
@@ -129,6 +130,11 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
     # Generic warmup cannot synthesize robot observations. AR-Diffusion uses
     # ar_diffusion_warmup_requests() for model-specific warmup instead.
     dummy_run_num_frames: ClassVar[int] = 0
+
+    _dit_modules: ClassVar[list[str]] = ["transformer"]
+    _encoder_modules: ClassVar[list[str]] = ["text_encoder", "image_encoder"]
+    _vae_modules: ClassVar[list[str]] = ["vae"]
+    _resident_modules: ClassVar[list[str]] = []
 
     _POSITIVE_BRANCH = "positive"
     _NEGATIVE_BRANCH = "negative"
