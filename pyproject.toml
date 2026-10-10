@@ -387,6 +387,9 @@ fullset = "fullset"
 Vai = "Vai"
 tockens = "tockens"
 CANN = "CANN"
+# Ascend TBE (Tensor Boost Engine), the CANN operator compiler — an
+# abbreviation, not a typo of "the".
+TBE = "TBE"
 # Step-Audio reasoning parser streams `</think>` tokens split across chunks
 # (e.g. "</" + "thi" + "nk>"). The fragment "thi" appears literally in its
 # parser logic and tests and is not a typo of "the"/"this".

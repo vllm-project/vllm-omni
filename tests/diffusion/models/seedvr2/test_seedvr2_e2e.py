@@ -130,7 +130,7 @@ def test_seedvr2_long_video_route_e2e(tmp_path: Path, degree: int) -> None:
     import torch
 
     if torch.accelerator.device_count() < degree:
-        pytest.skip(f"SeedVR2 USP={degree} requires {degree} CUDA devices")
+        pytest.skip(f"SeedVR2 USP={degree} requires {degree} accelerator devices")
 
     from tests.helpers.runtime import OmniServer
     from vllm_omni.diffusion.models.seedvr2.long_video import MAX_FRAMES
@@ -193,7 +193,7 @@ def test_seedvr2_long_video_route_e2e(tmp_path: Path, degree: int) -> None:
         for invalid in ("{", "[]", '{"color_correction_method":"invalid"}'):
             assert submit(extra_params=invalid).status_code == 400
         with source.open("rb") as upload:
-            invalid = requests.post(
+            response = requests.post(
                 f"http://{server.host}:{server.port}/v1/videos/sync",
                 data={
                     "prompt": " ",
@@ -205,7 +205,7 @@ def test_seedvr2_long_video_route_e2e(tmp_path: Path, degree: int) -> None:
                 files={"input_references": ("input.mp4", upload, "video/mp4")},
                 timeout=120,
             )
-        assert invalid.status_code == 400, invalid.text
+        assert response.status_code == 400, response.text
         accepted = submit(extra_params='{"color_correction_method":"wavelet"}')
         assert accepted.status_code == 202, accepted.text
         job_id = accepted.json()["id"]
