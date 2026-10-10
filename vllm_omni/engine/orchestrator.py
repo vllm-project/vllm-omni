@@ -574,6 +574,9 @@ class OrchestratorBase:
             elif isinstance(msg, ShutdownRequestMessage):
                 logger.info("[Orchestrator] Received shutdown signal")
                 self._shutdown_event.set()
+                if self._membership is not None:
+                    # Avoids a deadlock with membership_watcher.
+                    self._membership.shutdown()
                 # Pre-mark stage clients as shutting down to prevent
                 # proc_monitor daemon threads from flagging normal
                 # process exit as EngineDeadError during teardown.
