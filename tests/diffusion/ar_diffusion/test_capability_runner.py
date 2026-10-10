@@ -11,6 +11,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from vllm_omni.diffusion.data import AttentionConfig, AttentionScheduleConfig, AttentionSpec
+from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import CachedRequestData, DiffusionSchedulerOutput
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
 from vllm_omni.experimental.ar_diffusion.capability import (
@@ -21,6 +23,7 @@ from vllm_omni.experimental.ar_diffusion.capability import (
 from vllm_omni.experimental.ar_diffusion.kv_cache import ARDiffusionKVConfig
 from vllm_omni.experimental.ar_diffusion.runner import ARDiffusionModelRunner
 from vllm_omni.experimental.ar_diffusion.tick_protocol import ARDiffusionTickRequest
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 BLOCK = 16
 POS = "positive"
@@ -488,6 +491,56 @@ def test_synchronize_exception_uses_forward_cleanup_path(monkeypatch):
     assert not kv._adapters
     assert not runner._perf_e2e_times
     assert kv.manager.block_pool.get_num_free_blocks() == free_total
+
+
+class PublishingCapablePipeline(CapablePipeline):
+    def record_denoise_step(self, step_idx, **kwargs) -> None:
+        del step_idx, kwargs
+
+
+@pytest.mark.parametrize(
+    ("pipeline_cls", "cache_backend", "message"),
+    [
+        (CapablePipeline, None, "publishes denoise progress"),
+        (PublishingCapablePipeline, "tea_cache", "cache_backend='tea_cache'"),
+    ],
+    ids=["no_progress_publisher", "cache_backend"],
+)
+def test_attention_schedule_rejection_keeps_existing_session_kv(monkeypatch, pipeline_cls, cache_backend, message):
+    # The base runner rejects these requests before forward, but inside _bound_ar_session that
+    # rejection would release KV that earlier valid ticks built. The AR runner checks first.
+    pipeline = pipeline_cls(lingbot_like_spec())
+    runner = make_runner(pipeline)
+    runner.od_config.cache_backend = cache_backend
+    runner.od_config.diffusion_attention_schedule = AttentionScheduleConfig(
+        profiles={"dense": AttentionConfig(default=AttentionSpec(backend="FLASH_ATTN"))},
+        default=[],
+    )
+    kv = runner.kv_cache
+    assert kv is not None
+    session = commit_one_frame(runner, "s1", "main")
+    free_before = kv.manager.block_pool.get_num_free_blocks()
+
+    def base_forward(self, req, kv_prefetch_job=None):
+        raise AssertionError("a rejected request must not reach the base runner")
+
+    monkeypatch.setattr(DiffusionModelRunner, "execute_model", base_forward)
+    request = OmniDiffusionRequest(
+        prompt="scheduled request",
+        request_id="scheduled-request",
+        sampling_params=OmniDiffusionSamplingParams(
+            extra_args={"session_id": "s1"},
+            attention_schedule=[{"start": 0, "end": 1, "profile": "dense"}],
+        ),
+    )
+
+    with pytest.raises(ValueError, match=message):
+        runner.execute_model(request)
+
+    assert runner._sessions["s1"] is session
+    assert pipeline.binds == []
+    assert pipeline.closes == []
+    assert kv.manager.block_pool.get_num_free_blocks() == free_before
 
 
 def test_ar_runner_rejects_step_and_request_batch_modes():

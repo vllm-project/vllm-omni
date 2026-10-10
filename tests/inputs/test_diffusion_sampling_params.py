@@ -3,8 +3,12 @@
 
 from __future__ import annotations
 
+import copy
+import json
+from dataclasses import asdict
 from typing import Any
 
+import msgspec
 import pytest
 from vllm.sampling_params import SamplingParams
 
@@ -82,3 +86,66 @@ def test_from_params_preserves_unknown_extra_args() -> None:
 def test_from_params_rejects_unsupported_types() -> None:
     with pytest.raises(TypeError, match="Diffusion stage requires OmniDiffusionSamplingParams"):
         OmniDiffusionSamplingParams.from_params({"height": 512})
+
+
+@pytest.mark.parametrize("schedule", [None, [], [{"start": 3, "end": None, "profile": "quantized"}]])
+def test_attention_schedule_typed_and_extra_args_inputs_match(schedule):
+    typed = OmniDiffusionSamplingParams(attention_schedule=copy.deepcopy(schedule))
+    extra = {"attention_schedule": copy.deepcopy(schedule), "pipeline_specific": "kept"}
+    saved = copy.deepcopy(extra)
+    nested = OmniDiffusionSamplingParams(extra_args=extra)
+    plain = OmniDiffusionSamplingParams.from_params(_sampling_params(extra_args=extra))
+
+    assert typed.attention_schedule == nested.attention_schedule == plain.attention_schedule
+    assert nested.extra_args == plain.extra_args == {"pipeline_specific": "kept"}
+    assert extra == saved
+    assert (typed.attention_schedule is None) == (schedule is None)
+    if schedule == []:
+        assert typed.attention_schedule == ()
+
+
+def test_attention_schedule_copies_input_and_survives_transport():
+    source = [{"start": 3, "end": 6, "profile": "sparse"}]
+    params = OmniDiffusionSamplingParams(attention_schedule=source)
+    source[0]["start"] = 0
+    source.clear()
+
+    assert params.attention_schedule[0].start == 3
+    for restored in (
+        params.clone(),
+        OmniDiffusionSamplingParams(**msgspec.msgpack.decode(msgspec.msgpack.encode(params))),
+        OmniDiffusionSamplingParams(**json.loads(json.dumps(asdict(params)))),
+    ):
+        assert restored.attention_schedule == params.attention_schedule
+        assert restored is not params
+
+
+def test_attention_schedule_accepts_equal_duplicate_sources():
+    source = [{"start": 3, "end": 6, "profile": "sparse"}]
+    params = OmniDiffusionSamplingParams(attention_schedule=source, extra_args={"attention_schedule": source})
+    assert params.attention_schedule[0].profile == "sparse"
+    assert "attention_schedule" not in params.extra_args
+
+
+def test_attention_schedule_rejects_conflicting_duplicate_sources():
+    extra = {"attention_schedule": [{"start": 3, "end": 6, "profile": "sparse"}]}
+    with pytest.raises(ValueError, match="conflicting.*attention_schedule"):
+        OmniDiffusionSamplingParams(attention_schedule=[], extra_args=extra)
+
+
+@pytest.mark.parametrize(
+    "typed", [None, [], [{"start": 3, "end": 6, "profile": "sparse"}]], ids=["inherit", "disabled", "ranges"]
+)
+def test_null_extra_args_schedule_keeps_the_typed_value(typed):
+    # null means the same as an omitted key: it neither conflicts with nor clears the typed value.
+    params = OmniDiffusionSamplingParams(
+        attention_schedule=copy.deepcopy(typed), extra_args={"attention_schedule": None, "other": 1}
+    )
+
+    assert params.attention_schedule == OmniDiffusionSamplingParams(attention_schedule=typed).attention_schedule
+    assert params.extra_args == {"other": 1}
+
+
+def test_attention_schedule_rejects_request_profile_definitions():
+    with pytest.raises(TypeError, match="attention_schedule"):
+        OmniDiffusionSamplingParams(extra_args={"attention_schedule": {"profiles": {"new": {}}}})

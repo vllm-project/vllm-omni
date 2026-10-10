@@ -602,7 +602,8 @@ class OmniServeCommand(CLISubcommand):
             help=(
                 "Compilation scope for the generic diffusion model runner. "
                 "'regional' compiles repeated blocks (default); 'full' compiles the whole transformer and is "
-                "incompatible with HSDP, sequence parallelism, CPU offload, and layerwise offload."
+                "incompatible with HSDP, sequence parallelism, CPU offload, layerwise offload, and "
+                "--diffusion-attention-schedule profiles."
             ),
         )
         omni_config_group.add_argument(
@@ -784,6 +785,19 @@ class OmniServeCommand(CLISubcommand):
             "--diffusion-attention-config.per_role.cross.backend SAGE_ATTN, "
             '--diffusion-attention-config \'{"default": {"backend": "FLASH_ATTN"}, '
             '"per_role": {"cross": {"backend": "SAGE_ATTN"}}}\'.',
+        )
+
+        omni_config_group.add_argument(
+            "--diffusion-attention-schedule",
+            type=_json_object,
+            default=None,
+            help="Startup attention profiles with either default step ranges or sigma noise windows, as JSON "
+            "or dotted flags. Each profile is an independent attention config. Step ranges use zero-based "
+            "[start, end), with null end meaning the actual sequence end. Sigma windows use normalized "
+            "[low, high) noise in [0, 1]; a high of 1 includes 1. Non-empty default and sigma lists "
+            "are mutually exclusive. "
+            'Example: \'{"profiles": {"dense": {"default": "TORCH_SDPA"}}, '
+            '"default": [{"start": 3, "end": null, "profile": "dense"}]}\'.',
         )
 
         # Cache optimization parameters

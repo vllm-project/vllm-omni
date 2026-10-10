@@ -39,7 +39,11 @@ from vllm_omni.entrypoints.openai.video_api_utils import (
     _PlanarFrameConverter,
     encode_video_base64,
 )
-from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
+from vllm_omni.inputs.data import (
+    OmniDiffusionSamplingParams,
+    OmniTextPrompt,
+    absorb_attention_schedule_extra_args,
+)
 from vllm_omni.metrics import count_video_frames
 from vllm_omni.model_extras import get_video_generation_defaults, should_preserve_reference_image_size
 from vllm_omni.model_extras.video_generation import VideoGenerationDefaults
@@ -476,6 +480,11 @@ class OmniOpenAIServingVideo:
                     raise HTTPException(status_code=HTTPStatus.BAD_REQUEST.value, detail=str(exc)) from exc
             # Merge extra_params into extra_args
             gen_params.extra_args.update(request.extra_params)
+            try:
+                # The request value replaces a schedule the stage default sampling params carried.
+                absorb_attention_schedule_extra_args(gen_params, override=True)
+            except (TypeError, ValueError) as exc:
+                raise HTTPException(status_code=HTTPStatus.BAD_REQUEST.value, detail=str(exc)) from exc
 
             # Redact inline arrays when logging so RoboLab policy requests do
             # not flood the server log with image/state payloads.

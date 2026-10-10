@@ -12,6 +12,11 @@ from typing import TYPE_CHECKING
 import torch
 from vllm.logger import init_logger
 
+from vllm_omni.diffusion.attention.schedule import (
+    require_denoise_progress_publisher,
+    require_no_cache_backend,
+    resolve_batch_attention_schedule,
+)
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.models.interface import supports_step_execution
 from vllm_omni.diffusion.request import OmniDiffusionRequest
@@ -374,6 +379,12 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
             raise RuntimeError("AR-Diffusion capability missing after KV cache initialization")
 
         session_id, extra_args, tick = self._request_session(req)
+        # The base runner repeats these request checks before forward, but inside
+        # _bound_ar_session a rejection would release KV that earlier valid ticks built
+        # for this session. Reject before touching the session.
+        attention_schedule = resolve_batch_attention_schedule([req], self.od_config)
+        require_denoise_progress_publisher(self.pipeline, attention_schedule)
+        require_no_cache_backend(self.od_config, attention_schedule)
         reset = tick.reset if tick is not None else bool(extra_args.get("reset", False))
         close_session = tick.close_session if tick is not None else bool(extra_args.get("close_session", False))
         if reset:

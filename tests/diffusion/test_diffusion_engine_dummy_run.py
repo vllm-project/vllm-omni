@@ -167,6 +167,20 @@ def test_explicit_profile_frames_preserve_warmup_skip(monkeypatch):
     assert len(request.prompt["multi_modal_data"]["image"]) == 3
 
 
+def test_dummy_request_disables_attention_schedule(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Warmup and KV-profile requests run a fixed short step count, so they opt out of the service schedule."""
+    engine = object.__new__(DiffusionEngine)
+    engine.od_config = OmniDiffusionConfig.__new__(OmniDiffusionConfig)
+    engine.od_config.model_class_name = "mock_model"
+    monkeypatch.setattr("vllm_omni.diffusion.diffusion_engine.supports_multimodal_input", lambda _: (False, False))
+
+    request = engine._make_dummy_request(height=64, width=64, guidance_scale=1.0, num_frames=1)
+
+    assert request is not None
+    assert request.sampling_params.attention_schedule == ()
+    assert request.sampling_params.attention_sigma_schedule == ()
+
+
 @pytest.mark.parametrize(
     ("execution_mode", "uses_dlo_dp", "max_num_seqs", "expected_profile_requests"),
     [
