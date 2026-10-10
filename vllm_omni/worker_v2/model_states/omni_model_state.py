@@ -104,6 +104,7 @@ class OmniModelState(DefaultModelState):
     _first_audio_stream: torch.cuda.Stream | None = None
     # Set by the stage engine process when it can take one-request outputs directly.
     _first_audio_sender: Any = None
+    _supports_prefill_token_mask = False
 
     def __init__(
         self,
@@ -149,6 +150,7 @@ class OmniModelState(DefaultModelState):
         self.has_preprocess: bool = getattr(model, "has_preprocess", False)
         self.has_postprocess: bool = getattr(model, "has_postprocess", False)
         self.have_multimodal_outputs: bool = getattr(model, "have_multimodal_outputs", False)
+        self._supports_prefill_token_mask = bool(getattr(model, "supports_prefill_token_mask", False))
         self._decode_preprocess = self._resolve_decode_preprocess(model)
         self._decode_preprocess_is_identity = bool(getattr(model, "mrv2_decode_preprocess_is_identity", False))
         self._mtp_generators: dict[str, torch.Generator | None] = {}
@@ -476,6 +478,38 @@ class OmniModelState(DefaultModelState):
             model_specific_attn_metadata=model_specific_attn_metadata,
         )
 
+    @staticmethod
+    def _build_prefill_token_mask(input_batch: InputBatch) -> bool | torch.Tensor:
+        """Use CPU phase metadata, including one-token and resumed prefills.
+
+        Query boundaries describe the actual flattened tokens, unlike scheduled
+        counts which can be upper bounds under adaptive verification. Tokens
+        within each row must be contiguous; sparse scheduling needs an explicit
+        token-position-aligned mask instead.
+        """
+        if not input_batch.has_prefill:
+            return False
+        # These CPU arrays are already reordered into batch order. prefill_len
+        # also includes safe codec output tokens replayed after preemption.
+        starts = input_batch.query_start_loc_np[: input_batch.num_reqs + 1]
+        counts = np.diff(starts)
+        num_prefill = np.minimum(
+            np.maximum(
+                input_batch.prefill_len_np[: input_batch.num_reqs]
+                - input_batch.num_computed_prefill_tokens_np[: input_batch.num_reqs],
+                0,
+            ),
+            counts,
+        )
+        if not np.any(num_prefill):
+            return False
+        if np.array_equal(num_prefill, counts):
+            return True
+        mask = np.zeros(input_batch.num_tokens, dtype=np.bool_)
+        for start, count in zip(starts[:-1], num_prefill):
+            mask[start : start + count] = True
+        return torch.from_numpy(mask).to(device=input_batch.input_ids.device)
+
     def prepare_inputs_embeds(
         self,
         scheduled_encoder_inputs: dict[str, list[int]],
@@ -493,6 +527,8 @@ class OmniModelState(DefaultModelState):
         self.execute_mm_encoder(scheduled_encoder_inputs)
         mm_embeds, is_mm_embed = self.gather_mm_embeddings(input_batch)
         kwargs: dict[str, Any] = {"multimodal_embeddings": mm_embeds, "is_multimodal": is_mm_embed}
+        if self._supports_prefill_token_mask:
+            kwargs["prefill_token_mask"] = self._build_prefill_token_mask(input_batch)
         if mm_embeds:
             kwargs["query_start_loc"] = input_batch.query_start_loc_np[: input_batch.num_reqs + 1].tolist()
         embeds = self.model.embed_input_ids(input_batch.input_ids[: input_batch.num_tokens], **kwargs)

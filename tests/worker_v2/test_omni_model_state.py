@@ -5,7 +5,7 @@ graph/eager paths with per-request seed independence, async snapshot ownership."
 
 from contextlib import nullcontext
 from dataclasses import replace
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -817,3 +817,151 @@ def test_mm_embeddings_exclude_zero_length_graph_padding_rows():
     result = state.prepare_inputs_embeds({}, batch, MagicMock(spec=RequestState))
     torch.testing.assert_close(result[:5], torch.arange(5).float()[:, None].expand(-1, 2))
     assert result.shape == (8, 2)
+
+
+def _prefill_mask_batch(counts, prefill_lens, computed, input_ids=None):
+    num_reqs = len(counts)
+    num_tokens = sum(counts)
+    buffers = InputBuffers(num_reqs + 1, num_tokens + 2, torch.device("cpu"))
+    starts = np.concatenate(([0], np.cumsum(counts))).astype(np.int32)
+    prefill_lens = np.array(prefill_lens, dtype=np.int32)
+    computed = np.array(computed, dtype=np.int32)
+    return replace(
+        InputBatch.make_dummy(num_reqs, num_tokens, buffers),
+        num_reqs_after_padding=num_reqs + 1,
+        num_tokens_after_padding=num_tokens + 2,
+        num_scheduled_tokens=np.array(counts, dtype=np.int32),
+        query_start_loc_np=np.append(starts, num_tokens),
+        # Request slots are not necessarily in flattened batch order.
+        idx_mapping_np=np.arange(num_reqs)[::-1],
+        prefill_len_np=prefill_lens,
+        num_computed_prefill_tokens_np=computed,
+        is_prefilling_np=computed < prefill_lens,
+        has_prefill=bool(np.any(computed < prefill_lens)),
+        input_ids=torch.tensor((input_ids or [3] * num_tokens) + [0, 0]),
+    )
+
+
+@pytest.mark.parametrize(
+    ("counts", "prefill_lens", "computed", "expected"),
+    [
+        pytest.param([1, 1], [4, 8], [4, 8], False, id="decode-only"),
+        pytest.param([1], [1], [0], True, id="single-token-prefill"),
+        pytest.param([1], [8], [7], True, id="last-prompt-token"),
+        pytest.param([2], [8], [3], True, id="chunked-prefill"),
+        pytest.param([1, 2], [4, 2], [4, 0], [False, True, True], id="decode-before-prefill"),
+        pytest.param([2, 1], [2, 4], [0, 4], [True, True, False], id="prefill-before-decode"),
+        pytest.param([1, 2, 1], [4, 2, 1], [4, 0, 0], [False, True, True, True], id="different-prefill-lengths"),
+        pytest.param([3], [8], [7], [True, False, False], id="prefill-remainder-and-decode"),
+        pytest.param([2, 1], [10, 4], [8, 4], [True, True, False], id="resumed-prefill"),
+    ],
+)
+def test_v2_prefill_mask_matches_flattened_tokens(counts, prefill_lens, computed, expected):
+    batch = _prefill_mask_batch(counts, prefill_lens, computed)
+    mask = OmniModelState._build_prefill_token_mask(batch)
+    if isinstance(expected, bool):
+        assert mask is expected
+    else:
+        assert mask.dtype == torch.bool
+        assert mask.shape == (batch.num_tokens,)
+        assert mask.tolist() == expected
+
+
+def test_v2_prefill_mask_uses_actual_queries_not_scheduled_upper_bounds():
+    batch = _prefill_mask_batch([1, 2], [4, 1], [4, 0])
+    batch = replace(batch, num_scheduled_tokens=np.array([1, 4], dtype=np.int32))
+    mask = OmniModelState._build_prefill_token_mask(batch)
+    assert mask.shape == (batch.num_tokens,)
+    assert mask.tolist() == [False, True, False]
+
+
+def _cosy_embedding_state(mocker):
+    from vllm_omni.model_executor.models.cosyvoice3.cosyvoice3 import CosyVoice3Model
+
+    model = SimpleNamespace(
+        model_stage="cosyvoice3_talker",
+        supports_prefill_token_mask=CosyVoice3Model.supports_prefill_token_mask,
+        supports_embed_input_ids_query_start_loc=True,
+        model=SimpleNamespace(
+            speech_embedding=torch.nn.Embedding(10, 4),
+            llm=SimpleNamespace(model=SimpleNamespace(embed_tokens=torch.nn.Embedding(32, 4))),
+            sos=8,
+            task_id=9,
+        ),
+    )
+    model.embed_input_ids = MethodType(CosyVoice3Model.embed_input_ids, model)
+
+    def init_default(state, *_args, **_kwargs):
+        state.scheduler_config = SimpleNamespace(max_num_seqs=4)
+        state.model = model
+
+    mocker.patch.object(DefaultModelState, "__init__", init_default)
+    state = OmniModelState(SimpleNamespace(), model, None, torch.device("cpu"))
+    state.supports_mm_inputs = True
+    state.mm_pruner = None
+    state.prompt_embeds_state = None
+    state.encoder_runner = SimpleNamespace(inputs_embeds=torch.zeros(32, 4))
+    state.execute_mm_encoder = mocker.Mock()
+    state.gather_mm_embeddings = mocker.Mock(return_value=([], None))
+    return state
+
+
+def test_v2_decode_bypasses_cosyvoice3_validation(mocker):
+    import vllm_omni.model_executor.models.cosyvoice3.cosyvoice3 as cosyvoice3
+
+    state = _cosy_embedding_state(mocker)
+    # The capability is cached at initialization, not re-read on every step.
+    del state.model.supports_prefill_token_mask
+    guard = mocker.patch.object(
+        cosyvoice3, "_validate_speech_token_ids", side_effect=AssertionError("decode validated")
+    )
+    batch = _prefill_mask_batch([1, 1], [4, 8], [4, 8], [3, 5])
+    result = state.prepare_inputs_embeds({}, batch, SimpleNamespace())
+    guard.assert_not_called()
+    torch.testing.assert_close(result[:2], state.model.model.speech_embedding.weight[batch.input_ids[:2]])
+
+
+def test_v2_single_token_prefill_rejects_out_of_range_id(mocker):
+    state = _cosy_embedding_state(mocker)
+    batch = _prefill_mask_batch([1], [1], [0], [10])
+    with pytest.raises(ValueError, match="out of range"):
+        state.prepare_inputs_embeds({}, batch, SimpleNamespace())
+
+
+def test_v2_mixed_batch_validates_only_prefill_tokens(mocker):
+    import vllm_omni.model_executor.models.cosyvoice3.cosyvoice3 as cosyvoice3
+
+    state = _cosy_embedding_state(mocker)
+    guard = mocker.spy(cosyvoice3, "_validate_speech_token_ids")
+    batch = _prefill_mask_batch([1, 3], [4, 8], [4, 7], [3, 4, 5, 6])
+    state.prepare_inputs_embeds({}, batch, SimpleNamespace())
+    guard.assert_called_once()
+    assert guard.call_args.args[0].tolist() == [4]
+
+
+@pytest.mark.parametrize("decode_first", [True, False], ids=["decode-before-audio", "decode-after-audio"])
+def test_v2_mixed_audio_prefill_excludes_decode_from_validation(mocker, decode_first):
+    import vllm_omni.model_executor.models.cosyvoice3.cosyvoice3 as cosyvoice3
+
+    state = _cosy_embedding_state(mocker)
+    counts, prefill_lens, computed = ([1, 4], [8, 4], [8, 0]) if decode_first else ([4, 1], [4, 8], [0, 8])
+    ids = [3, 0, 1, 2, 20] if decode_first else [0, 1, 2, 20, 3]
+    mm_mask = [False, True, True, True, False] if decode_first else [True, True, True, False, False]
+    state.gather_mm_embeddings.return_value = ([torch.ones(1, 4)], torch.tensor(mm_mask))
+    batch = _prefill_mask_batch(counts, prefill_lens, computed, ids)
+    guard = mocker.spy(cosyvoice3, "_validate_speech_token_ids")
+    result = state.prepare_inputs_embeds({}, batch, SimpleNamespace())
+    assert result.shape == (batch.num_tokens_after_padding, 4)
+    # The multimodal branch may call the helper on an empty slice, which
+    # returns before any device reduction. It must never validate decode ids.
+    assert all(call.args[0].numel() == 0 for call in guard.call_args_list)
+
+
+def test_v2_models_without_prefill_mask_keep_embedding_contract(mocker):
+    state = _cosy_embedding_state(mocker)
+    state._supports_prefill_token_mask = False
+    state.model.embed_input_ids = mocker.Mock(return_value=torch.zeros(1, 4))
+    builder = mocker.patch.object(state, "_build_prefill_token_mask", side_effect=AssertionError("unexpected mask"))
+    state.prepare_inputs_embeds({}, _prefill_mask_batch([1], [4], [4]), SimpleNamespace())
+    builder.assert_not_called()
+    assert "prefill_token_mask" not in state.model.embed_input_ids.call_args.kwargs
