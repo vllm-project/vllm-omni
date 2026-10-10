@@ -46,6 +46,10 @@ from vllm_omni.model_extras.kandinsky6 import (
     get_kandinsky6_video_generation_defaults,
 )
 from vllm_omni.model_extras.lingbot_video import LINGBOT_VIDEO_EXTRA_BODY_PARAMS
+from vllm_omni.model_extras.longcat_video_avatar import (
+    LONGCAT_VIDEO_AVATAR_EXTRA_BODY_PARAMS,
+    LONGCAT_VIDEO_AVATAR_EXTRA_OUTPUT_PARAMS,
+)
 from vllm_omni.model_extras.ltx2 import (
     LTX_EXTRA_BODY_PARAMS,
     LTX_EXTRA_OUTPUT_PARAMS,
@@ -268,6 +272,10 @@ _EXTRA_SPECS: dict[str, dict[str, Any]] = {
         "output_tensor_range": "zero_to_one",
         # Shared T2I/I2V envelopes select the output modality. LingBot's
         # pipeline owns model-specific validation and normalization.
+    },
+    "LongCatVideoAvatarPipeline": {
+        "extra_body_params": LONGCAT_VIDEO_AVATAR_EXTRA_BODY_PARAMS,
+        "extra_output_params": LONGCAT_VIDEO_AVATAR_EXTRA_OUTPUT_PARAMS,
     },
     **{
         model_class_name: {
