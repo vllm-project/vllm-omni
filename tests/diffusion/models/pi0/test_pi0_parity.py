@@ -46,9 +46,10 @@ pytestmark = [pytest.mark.local_model, pytest.mark.diffusion]
 
 
 # ─── Config (fixed; matches LeRobot defaults for ``lerobot/pi0_base``) ──
-DEVICE = "cpu"
+DEVICE = os.environ.get("PI_PARITY_DEVICE", "cpu")
 DTYPE_STR = "float32"
 ATOL = 1e-4
+BF16_ATOL = 5e-2
 NUM_STEPS = 10
 BATCH_SIZE = 2
 ACTION_DIM = 32
@@ -59,6 +60,7 @@ MAX_TOKEN_LEN = 48
 # The only knob: point at a local pi0_base dir (LeRobot format) to skip the HF
 # download; defaults to the HF repo id.
 MODEL_PATH = os.environ.get("PI0_PARITY_MODEL_PATH", "lerobot/pi0_base")
+CAMERAS = ("base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb")
 
 
 def _resolve_checkpoint_dir() -> str:
@@ -97,43 +99,50 @@ def _dummy_dataset_stats() -> dict:
     }
 
 
-def _create_dummy_batch(batch_size: int = BATCH_SIZE, device: str = DEVICE) -> dict:
+def _create_dummy_batch(batch_size: int = BATCH_SIZE, device: str = DEVICE, num_views: int = 3) -> dict:
     """Reproducible dummy inputs — identical across both implementations."""
     g = torch.Generator(device="cpu").manual_seed(0)
     prompt = "Pick up the red block and place it in the bin"
-    return {
+    batch = {
         "observation.state": torch.randn(batch_size, STATE_DIM, generator=g, dtype=torch.float32).to(device),
         "action": torch.randn(batch_size, ACTION_HORIZON, ACTION_DIM, generator=g, dtype=torch.float32).to(device),
-        "observation.images.base_0_rgb": torch.rand(batch_size, 3, 224, 224, generator=g, dtype=torch.float32).to(
-            device
-        ),
-        "observation.images.left_wrist_0_rgb": torch.rand(batch_size, 3, 224, 224, generator=g, dtype=torch.float32).to(
-            device
-        ),
-        "observation.images.right_wrist_0_rgb": torch.rand(
-            batch_size, 3, 224, 224, generator=g, dtype=torch.float32
-        ).to(device),
         "task": [prompt for _ in range(batch_size)],
     }
+    for camera in CAMERAS[:num_views]:
+        batch[f"observation.images.{camera}"] = torch.rand(
+            batch_size, 3, 224, 224, generator=g, dtype=torch.float32
+        ).to(device)
+    return batch
 
 
 # ─── LeRobot instantiation ────────────────────────────────────────────
-def _instantiate_lerobot():
+def _instantiate_lerobot(dtype: str = DTYPE_STR):
     from lerobot.policies.pi0 import PI0Policy
     from lerobot.policies.pi0.processor_pi0 import make_pi0_pre_post_processors
 
-    policy = PI0Policy.from_pretrained(MODEL_PATH, strict=True)
+    config = PI0Policy.config_class.from_pretrained(MODEL_PATH)
+    config.dtype = dtype
+    config.device = DEVICE
+    policy = PI0Policy.from_pretrained(MODEL_PATH, config=config, strict=True)
     policy.to(DEVICE)
     policy.config.device = DEVICE
     policy.eval()
+
+    reference_q_dtype = policy.model.paligemma_with_expert.paligemma.model.language_model.layers[
+        0
+    ].self_attn.q_proj.weight.dtype
+    assert reference_q_dtype == getattr(torch, dtype), (
+        f"LeRobot reference requested {dtype}, but layer-0 Q projection uses {reference_q_dtype}."
+    )
 
     pre, post = make_pi0_pre_post_processors(config=policy.config, dataset_stats=_dummy_dataset_stats())
     return policy, pre, post
 
 
 # ─── vllm-omni instantiation ──────────────────────────────────────────
-def _instantiate_vllm_omni():
+def _instantiate_vllm_omni(dtype: str = DTYPE_STR):
     """Build the vllm-omni π0 model in isolation (no pipeline, no engine)."""
+    from vllm_omni.diffusion.models.pi.common import inference_dtype
     from vllm_omni.diffusion.models.pi0 import Pi0Config, Pi0ForActionPrediction
 
     cfg = Pi0Config(
@@ -141,10 +150,11 @@ def _instantiate_vllm_omni():
         max_state_dim=STATE_DIM,
         chunk_size=ACTION_HORIZON,
         num_inference_steps=NUM_STEPS,
-        dtype=DTYPE_STR,
+        dtype=dtype,
     )
     model = Pi0ForActionPrediction(cfg)
-    model.to(DEVICE).eval()
+    inference_dtype.apply_pi_inference_dtype(model, getattr(torch, dtype))
+    model.to(device=DEVICE).eval()
     _load_lerobot_weights(model)
     return model
 
@@ -268,6 +278,46 @@ def test_pi0_vllm_omni_vs_lerobot():
 
 
 # ─── Per-stage divergence diagnostics ─────────────────────────────────
+@pytest.mark.skipif(not _HAS_LEROBOT, reason="lerobot not installed (run in a lerobot venv).")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Pi0 BF16 reference parity requires CUDA.")
+@pytest.mark.parametrize("num_views", [1, 2, 3])
+def test_pi0_bfloat16_matches_lerobot_bfloat16(num_views):
+    """Compare the shared mixed-BF16 implementation under fixed noise."""
+    lerobot_policy, lerobot_pre, _ = _instantiate_lerobot(dtype="bfloat16")
+    omni_model = _instantiate_vllm_omni(dtype="bfloat16")
+
+    raw_batch = _create_dummy_batch(num_views=num_views)
+    processed_batch = lerobot_pre(copy.deepcopy(raw_batch))
+    images, img_masks, lang_tokens, lang_masks, state = _extract_lerobot_model_inputs(lerobot_policy, processed_batch)
+    noise = _make_fixed_noise(raw_batch["observation.state"].shape[0], DEVICE)
+
+    with torch.no_grad():
+        lerobot_actions = lerobot_policy.model.sample_actions(
+            images,
+            img_masks,
+            lang_tokens,
+            lang_masks,
+            state,
+            noise=noise,
+            num_steps=NUM_STEPS,
+        )
+        omni_actions = omni_model.sample_actions(
+            images=images,
+            image_masks=img_masks,
+            lang_tokens=lang_tokens,
+            lang_masks=lang_masks,
+            state=state,
+            noise=noise,
+            num_steps=NUM_STEPS,
+        )
+
+    diff = (lerobot_actions.float() - omni_actions.float()).abs()
+    print(f"[parity] bfloat16 views={num_views} |Δ| max={diff.max().item():.2e} mean={diff.mean().item():.2e}")
+    assert torch.allclose(lerobot_actions.float(), omni_actions.float(), atol=BF16_ATOL), (
+        f"bfloat16 actions differ beyond atol={BF16_ATOL}; max_diff={diff.max().item():.2e}"
+    )
+
+
 @torch.no_grad()
 def _diagnose_divergence(
     lerobot_flow_model,
@@ -293,8 +343,17 @@ def _diagnose_divergence(
     lr_prefix_embs, lr_prefix_pad, lr_prefix_att = lerobot_flow_model.embed_prefix(
         images, img_masks, lang_tokens, lang_masks
     )
-    sg_prefix_embs, sg_prefix_pad, sg_prefix_att = omni_model.embed_prefix(images, img_masks, lang_tokens, lang_masks)
+    from vllm_omni.diffusion.models.pi.common import backbone
+
+    sg_prefix_embs, sg_prefix_pad, sg_prefix_att = backbone.embed_multimodal_prefix(
+        images,
+        img_masks,
+        lang_tokens,
+        lang_masks,
+        paligemma=omni_model.paligemma_with_expert.paligemma,
+    )
     total_diff = (lr_prefix_embs.float() - sg_prefix_embs.float()).abs().max().item()
+    diagnostics = {"prefix_max_abs": total_diff}
     print(f"[diag] prefix_embs max |Δ| = {total_diff:.2e}   (shape={tuple(sg_prefix_embs.shape)})")
     print(f"[diag] prefix_pad_masks equal: {torch.equal(lr_prefix_pad, sg_prefix_pad)}")
     print(f"[diag] prefix_att_masks equal: {torch.equal(lr_prefix_att.bool(), sg_prefix_att.bool())}")
@@ -348,9 +407,29 @@ def _diagnose_divergence(
     try:
         lr_k, lr_v = _layer0_kv(lr_kv)
         sg_k, sg_v = _layer0_kv(sg_kv)
-        dk = (lr_k.float() - sg_k.float()).abs().max().item()
-        dv = (lr_v.float() - sg_v.float()).abs().max().item()
+        key_delta = (lr_k.float() - sg_k.float()).abs()
+        value_delta = (lr_v.float() - sg_v.float()).abs()
+        valid = sg_prefix_pad[:, None, :, None].expand_as(key_delta)
+        masked = ~valid
+        dk = key_delta.max().item()
+        dv = value_delta.max().item()
+        dk_valid = key_delta.masked_select(valid).max().item()
+        dv_valid = value_delta.masked_select(valid).max().item()
+        dk_masked = key_delta.masked_select(masked).max().item() if masked.any() else 0.0
+        dv_masked = value_delta.masked_select(masked).max().item() if masked.any() else 0.0
         print(f"[diag] prefix KV layer0  K max|Δ|={dk:.2e}  V max|Δ|={dv:.2e}")
+        print(
+            f"[diag]   valid tokens  K max|Δ|={dk_valid:.2e}  V max|Δ|={dv_valid:.2e}; "
+            f"masked tokens K max|Δ|={dk_masked:.2e}  V max|Δ|={dv_masked:.2e}"
+        )
+        diagnostics["layer0_kv"] = {
+            "key_max_abs": dk,
+            "value_max_abs": dv,
+            "valid_key_max_abs": dk_valid,
+            "valid_value_max_abs": dv_valid,
+            "masked_key_max_abs": dk_masked,
+            "masked_value_max_abs": dv_masked,
+        }
     except Exception as e:  # noqa: BLE001
         print(f"[diag] could not extract prefix KV for comparison: {e}")
 
@@ -359,7 +438,10 @@ def _diagnose_divergence(
     t = torch.ones(bsize, dtype=torch.float32, device=state.device)
     lr_vt = lerobot_flow_model.denoise_step(state, sg_prefix_pad, lr_kv, noise, t)
     sg_vt = omni_model.denoise_step(state, sg_prefix_pad, sg_kv, noise, t)
-    print(f"[diag] denoise_step(t=1) v_t max|Δ| = {(lr_vt.float() - sg_vt.float()).abs().max().item():.2e}")
+    denoise_max_abs = (lr_vt.float() - sg_vt.float()).abs().max().item()
+    diagnostics["denoise_t1_max_abs"] = denoise_max_abs
+    print(f"[diag] denoise_step(t=1) v_t max|Δ| = {denoise_max_abs:.2e}")
+    return diagnostics
 
 
 if __name__ == "__main__":
