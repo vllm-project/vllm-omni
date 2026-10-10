@@ -32,9 +32,11 @@ if TYPE_CHECKING:
 
 @register_tts_adapter
 class Audio8TTSAdapter(ARTTSAdapter):
-    """Audio8 TTS Preview 0.6B: text-only synthesis and zero-shot voice cloning."""
+    """Audio8 TTS Preview (0.6B and 0.1B): text-only synthesis and zero-shot
+    voice cloning. Both variants share the serving path (same prompt tokens and
+    44.1 kHz codec); only the Slow AR backbone differs."""
 
-    stage_keys = frozenset({"audio8_tts_slow_ar"})
+    stage_keys = frozenset({"audio8_tts_slow_ar", "audio8_tts_01b_slow_ar"})
     name = "audio8_tts"
 
     def __init__(self, ctx: Any) -> None:
