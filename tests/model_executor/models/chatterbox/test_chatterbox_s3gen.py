@@ -151,6 +151,31 @@ def test_batch_rows_match_single_rows_with_different_references_001(
     assert not torch.allclose(other_voice, batched[0], atol=1e-2)
 
 
+@torch.inference_mode()
+def test_complete_flow_matches_reference_inference(decoder: S3GenDecoder, references: list[Reference]) -> None:
+    """The batched production path preserves the reference flow's numerical result."""
+    generator = torch.Generator().manual_seed(17)
+    tokens = torch.randint(0, 6561, (23,), generator=generator)
+    ref = references[0]
+    prompt_length = ref.prompt_token.shape[1]
+    noise = torch.randn(1, 80, 2 * (prompt_length + tokens.numel()), generator=generator)
+    expected, _ = decoder.flow.inference(
+        token=tokens[None, :],
+        token_len=torch.tensor([tokens.numel()]),
+        prompt_token=ref.prompt_token,
+        prompt_token_len=torch.tensor([prompt_length]),
+        prompt_feat=ref.prompt_feat,
+        prompt_feat_len=torch.tensor([2 * prompt_length]),
+        embedding=ref.embedding,
+        finalize=True,
+        n_timesteps=2,
+        noised_mels=noise,
+        meanflow=True,
+    )
+    (actual,) = flow_mels(decoder.flow, [tokens], [ref], [True], 2, True, noise)
+    torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
+
+
 def test_non_final_chunk_holds_back_the_overlap_001(decoder: S3GenDecoder, references: list[Reference]) -> None:
     tokens = torch.randint(0, 6561, (23,))
     ((piece, state),) = decoder.chunked_decode_streaming([Chunk(tokens, 0, references[0], None, False)])

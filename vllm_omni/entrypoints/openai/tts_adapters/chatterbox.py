@@ -56,6 +56,10 @@ class ChatterboxAdapter(ARTTSAdapter):
             return "Chatterbox Turbo supports English only"
         if request.instructions:
             return "Chatterbox Turbo does not support instructions"
+        if request.task_type == "VoiceDesign":
+            return "Chatterbox Turbo does not support VoiceDesign"
+        if request.x_vector_only_mode:
+            return "Chatterbox Turbo requires full reference conditioning"
         if request.ref_audio_2 is not None or request.speaker_embedding is not None:
             return "Chatterbox Turbo accepts one reference recording"
         if request.ref_audio is None:
@@ -79,7 +83,8 @@ class ChatterboxAdapter(ARTTSAdapter):
             raise ValueError("Chatterbox requires a stage model path")
         with self.conditioning_lock:
             if self.tokenizer is None:
-                self.tokenizer = AutoTokenizer.from_pretrained(model)
+                # This checkpoint has tokenizer metadata but no config.json.
+                self.tokenizer = AutoTokenizer.from_pretrained(model, tokenizer_type="gpt2")
             if reference is None:
                 if self.builtin_voice is None:
                     self.builtin_voice = VoiceConditioning.from_builtin(model)

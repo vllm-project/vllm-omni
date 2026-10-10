@@ -29,7 +29,7 @@ RUNNERS = [
 @pytest.mark.parametrize("omni_runner", RUNNERS, indirect=True)
 def test_text_to_audio_001(omni_runner):
     """A batch returns full 24 kHz waveforms, including every streamed chunk."""
-    tokenizer = AutoTokenizer.from_pretrained(MODEL)
+    tokenizer = AutoTokenizer.from_pretrained(MODEL, tokenizer_type="gpt2")
     voice = VoiceConditioning.from_builtin(MODEL)
     prompts = [
         build_prompt(tokenizer.encode(punc_norm(text), add_special_tokens=False), voice, ChatterboxConfig())

@@ -38,6 +38,8 @@ def test_entry_stage_selects_chatterbox():
         ({"input": "  "}, "empty"),
         ({"language": "French"}, "English"),
         ({"instructions": "Whisper"}, "instructions"),
+        ({"task_type": "VoiceDesign"}, "VoiceDesign"),
+        ({"x_vector_only_mode": True}, "full reference"),
         ({"voice": "alloy"}, "default"),
         ({"ref_audio": ["a", "b"]}, "one reference"),
         ({"ref_audio_2": "a"}, "one reference"),
