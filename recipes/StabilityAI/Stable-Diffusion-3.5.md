@@ -146,7 +146,7 @@ print('saved output.png')
 - Python: 3.12
 - Driver / runtime: NVIDIA driver 580.173.02, CUDA 13.2
 - vLLM version: 0.31.0
-- vLLM-Omni version or commit: `main` at `4c5541c2` plus the SD3.5 TeaCache change
+- vLLM-Omni version or commit: `main` at `4c5541cf` plus the SD3.5 TeaCache change
 
 #### Command
 
