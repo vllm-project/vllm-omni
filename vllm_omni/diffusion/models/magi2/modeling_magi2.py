@@ -815,6 +815,12 @@ class Magi2PreviewTransformer(nn.Module):
             self._sequence_layouts.popitem(last=False)
         return layout
 
+    def _apply(self, fn, recurse: bool = True):
+        # ``.to()`` does not walk the cached layouts, so drop them rather than
+        # keep them on the device the parameters are leaving.
+        self._sequence_layouts.clear()
+        return super()._apply(fn, recurse=recurse)
+
     def _build_sequence_layout(self, coords_mapping: torch.Tensor, modality_mapping: torch.Tensor) -> _SequenceLayout:
         rope = self.pre_adapter.rope(coords_mapping)
         time_mask = modality_mapping == int(Modality.TIME)
