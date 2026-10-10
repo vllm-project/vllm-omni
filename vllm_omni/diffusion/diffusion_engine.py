@@ -1647,6 +1647,15 @@ class DiffusionEngine:
         for request_id in request_ids:
             if self.scheduler.get_request_state(request_id) is not None:
                 self.scheduler.finish_requests(request_id, DiffusionRequestStatus.FINISHED_ABORTED)
+        # Abort queues are drained only before a wave starts or after the
+        # synchronous execute call returns. No Worker still uses these states,
+        # and a last-request abort must not wait for another scheduling wave.
+        if getattr(self, "execution_mode", None) == DiffusionExecutionMode.STEP_BATCH and request_ids:
+            try:
+                self.executor.release_step_requests(request_ids)
+            except Exception as exc:
+                self._fail_engine(exc)
+                raise
         self._remove_diffusion_kv_requests(request_ids)
 
     def _finalize_finished_request(

@@ -114,7 +114,23 @@ supports request-level execution only. See the
 [Scheduler-Managed Paged KV Cache guide](paged_kv_cache.md) for its required
 backend and configuration. Helios supports single-request step
 execution only: use
-`--step-execution --max-num-seqs 1` for Helios. MiniMax H3 supports step-wise
+`--step-execution --max-num-seqs 1` for Helios. SenseNova-U1 and U1.5 support
+step execution for image, editing and text requests, with step-wise continuous
+batching for the denoise phase: their think and text decode loops run one token
+per scheduler step, a text request finishes inside the prepare phase, and
+`--max-num-seqs >1` admits several requests whose denoise steps share one wave.
+The model-local paged decode cache still holds one sequence, so the pipeline
+serializes the decode phases instead: at most one think or text loop is live at
+a time and a request that arrives while another one is decoding keeps its whole
+prepare phase queued, while requests past their prepare phase keep denoising.
+Waves are conservative — every request keeps its own prefix KV caches and CFG
+branches (t2i and it2i differ in both), so each wave runs one transformer
+forward per request instead of a packed forward. Batching therefore interleaves
+concurrent requests' denoise steps, admits new requests mid-denoise, and cancels
+aborted ones at the next wave, but per-step kernel efficiency does not improve —
+prefer `--max-num-seqs 1` for pure throughput and raise it when you need
+mid-flight admission or wave-boundary cancellation. Step execution cannot be
+combined with a diffusion cache backend. MiniMax H3 supports step-wise
 continuous batching by packing co-batched requests into one sequence that keeps
 a separate attention document per request; that layout needs a backend which
 honors the packed `cu_seqlens` metadata, so run it with
