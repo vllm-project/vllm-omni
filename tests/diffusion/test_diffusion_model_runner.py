@@ -25,6 +25,7 @@ from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import CachedRequestData, DiffusionSchedulerOutput, NewRequestData
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch, split_diffusion_output_by_request
+from vllm_omni.errors import OmniClientError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.diffusion]
@@ -1505,3 +1506,40 @@ def test_non_step_fallback_keeps_client_error_status():
     assert output.result.error == "bad request option"
     assert output.result.error_status_code == 400
     assert output.result.error_type == "BadRequestError"
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+@pytest.mark.parametrize("batch_size", [1, 2])
+@pytest.mark.parametrize("status_code", [400, 422])
+def test_request_runner_preserves_client_error_before_rpc(monkeypatch, batch_size, status_code):
+    error = OmniClientError("request rejected", status_code=status_code, error_type="ScheduleError")
+
+    class RejectingPipeline:
+        supports_request_batch = True
+
+        def forward(self, batch):
+            raise error
+
+    monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+    monkeypatch.setattr(model_runner_module, "current_omni_platform", _fake_platform_for_peak_memory())
+    runner = _make_runner(cache_backend=None, cache_backend_name="none")
+    runner.pipeline = RejectingPipeline()
+    sched = _make_scheduler_output(batch_size)
+
+    if batch_size == 1:
+        outputs = [runner.execute_model(sched.scheduled_new_reqs[0].req)]
+    else:
+        result = runner.execute_model_batch(sched, runner.od_config)
+        assert [item.request_id for item in result.runner_outputs] == ["req-0", "req-1"]
+        outputs = [item.result for item in result.runner_outputs]
+
+    assert len({id(output) for output in outputs}) == batch_size
+    for output in outputs:
+        assert output.error == "request rejected"
+        assert output.error_status_code == status_code
+        assert output.error_type == "ScheduleError"
+        assert output.aborted is False
+
+    runner.pipeline = _DummyPipeline(output=DiffusionOutput(output="next request"))
+    assert runner.execute_model(_make_request()).output == "next request"
