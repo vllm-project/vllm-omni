@@ -1204,6 +1204,11 @@ class OmniEngineBase:
                 logger.exception("[OmniEngine] Failed to shutdown StageRuntime")
         elif hasattr(self, "_runtime") and self._runtime is not None:
             logger.warning("[OmniEngine] Deferring StageRuntime shutdown until the Orchestrator exits")
+            cancel_initialization = getattr(self._runtime, "cancel_initialization", None)
+            if callable(cancel_initialization):
+                # The orchestrator thread may still be initializing stages; make
+                # sure it launches no further replicas while we wait for it.
+                cancel_initialization()
             threading.Thread(
                 target=shutdown_runtime_after_orchestrator,
                 args=(self.orchestrator_thread, self._runtime),

@@ -29,7 +29,6 @@ from vllm.v1.engine.utils import (
     CoreEngine,
     CoreEngineLaunch,
     EngineZmqAddresses,
-    wait_for_engine_startup,
 )
 from vllm.v1.utils import shutdown
 
@@ -44,6 +43,7 @@ from vllm_omni.distributed.omni_connectors.utils.serialization import (
     OmniMsgpackEncoder,
 )
 from vllm_omni.distributed.omni_coordinator import OmniCoordClientForStage
+from vllm_omni.engine.stage_init_deadline import wait_for_engine_startup_with_deadline
 from vllm_omni.engine.stage_init_utils import set_death_signal
 from vllm_omni.errors import client_error_metadata
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
@@ -827,7 +827,7 @@ class StageDiffusionProcManager:
     def _wait_until_started(self, handshake_address: str, stage_init_timeout: int) -> None:
         try:
             with zmq_socket_ctx(handshake_address, zmq.ROUTER, bind=True) as handshake_socket:
-                wait_for_engine_startup(
+                wait_for_engine_startup_with_deadline(
                     handshake_socket,
                     [CoreEngine(index=0, local=True)],
                     SimpleNamespace(
@@ -848,6 +848,9 @@ class StageDiffusionProcManager:
                         # during handshake is still detected.
                         watched_frontend_processes=[self.proc],
                     ),
+                    timeout=stage_init_timeout,
+                    kill_processes=lambda: shutdown([self.proc]),
+                    stage_label=f"Diffusion stage process {self.proc.name}",
                 )
         except Exception:
             shutdown([self.proc])

@@ -34,10 +34,12 @@ from vllm.v1.engine.utils import (
     wait_for_engine_startup,
 )
 from vllm.v1.executor import Executor
+from vllm.v1.utils import shutdown
 
 from vllm_omni.config.omni_config import BaseVllmOmniStageConfig
 from vllm_omni.distributed.omni_connectors.utils import initialization
 from vllm_omni.engine import stage_init_utils
+from vllm_omni.engine.stage_init_deadline import wait_for_engine_startup_with_deadline
 from vllm_omni.engine.stage_init_utils import (
     acquire_device_locks,
     build_diffusion_config,
@@ -1141,6 +1143,7 @@ def launch_stage_replica(
     omni_parallel_stage_init: bool = False,
     num_api_servers: int = 1,
     watched_frontend_processes: list[BaseProcess] | None = None,
+    stage_init_timeout: int | None = None,
 ) -> Iterator[StageReplicaResources]:
     """Launch a local LLM stage replica.
 
@@ -1219,13 +1222,16 @@ def launch_stage_replica(
         )
         if watched_frontend_processes is not None:
             engine_launch.watched_frontend_processes = watched_frontend_processes
-        wait_for_engine_startup(
+        wait_for_engine_startup_with_deadline(
             handshake_socket,
             engines_to_handshake,
             vllm_config.parallel_config,
             False,  # coordinated_dp
             vllm_config.cache_config,
             engine_launch,
+            timeout=stage_init_timeout,
+            kill_processes=lambda: shutdown(engine_manager.processes),
+            stage_label=f"LLM stage-{stage_id} replica-{replica_id}",
         )
 
 

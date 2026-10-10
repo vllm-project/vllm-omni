@@ -179,6 +179,8 @@ class StageRuntime:
         self._model = model
         self._config_path = config_path
         self._stage_init_timeout = stage_init_timeout
+        # Set by shutdown()/cancel_initialization(): stop launching further replicas.
+        self._init_cancelled = threading.Event()
         self._async_chunk = async_chunk
         self._tokenizer = tokenizer
         # When True, same-device stages initialize concurrently, coordinated by
@@ -441,6 +443,7 @@ class StageRuntime:
                         omni_parallel_stage_init=self._parallel_stage_init,
                         num_api_servers=num_api_servers,
                         watched_frontend_processes=watched_frontend_processes if num_api_servers > 1 else None,
+                        stage_init_timeout=timeout,
                     )
                     # Environment overlays are process-global. Serialize spawn;
                     # parallel initialization waits for READY outside this lock.
@@ -570,7 +573,12 @@ class StageRuntime:
             else:
                 del self._mps_servers[uuid]
 
+    def cancel_initialization(self) -> None:
+        """Stop launching replicas that have not started yet (e.g. after an init timeout)."""
+        self._init_cancelled.set()
+
     def shutdown(self) -> None:
+        self._init_cancelled.set()
         for pool in self.stage_pools:
             for client in pool.clients:
                 if client is not None and hasattr(client, "shutdown"):
@@ -900,6 +908,13 @@ class StageRuntime:
             """Initialize replicas in one scheduling group sequentially."""
             nonlocal primary_exc
             for stage_idx, replica in group:
+                if self._init_cancelled.is_set():
+                    logger.warning(
+                        "[StageRuntime] Initialization cancelled; not launching stage-%s replica-%s",
+                        stage_idx,
+                        replica.replica_id,
+                    )
+                    return
                 with init_state_lock:
                     if primary_exc is not None:
                         return
