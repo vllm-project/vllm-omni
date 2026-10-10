@@ -553,6 +553,7 @@ class OrchestratorArgs:
 
     # === Observability ===
     log_stats: bool = False
+    collect_stage_metrics: bool = True
     enable_orch_monitor: bool = False
 
     # === Headless Mode (also forwarded to engine — see SHARED_FIELDS) ===

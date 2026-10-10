@@ -638,7 +638,10 @@ async def build_async_omni_from_stage_config(
         # This controls only the API-process WebSocket and is not an AsyncOmni option.
         kwargs.pop("robot_openpi_idle_timeout", None)
         model = kwargs.pop("model", None) or args.model
-        kwargs.setdefault("log_stats", not args.disable_log_stats)
+        if args.disable_log_stats:
+            kwargs["log_stats"] = False
+        else:
+            kwargs.setdefault("log_stats", True)
         if client_config is not None:
             kwargs["client_config"] = client_config
         if _should_serve_duplex(model, kwargs):

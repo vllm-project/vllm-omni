@@ -107,6 +107,41 @@ def _parse_serve_args(argv: list[str]) -> TrackingNamespace:
     return parser.parse_args(argv)
 
 
+@pytest.mark.parametrize(
+    "flags",
+    [
+        [],
+        ["--log-stats"],
+        ["--api-server-count", "2"],
+    ],
+)
+def test_serve_rejects_log_stats_without_stage_metrics(flags: list[str]) -> None:
+    args = _parse_serve_args(["serve", "fake-model", "--omni", "--no-collect-stage-metrics", *flags])
+
+    with pytest.raises(ValueError, match="--no-collect-stage-metrics requires --disable-log-stats"):
+        OmniServeCommand().validate(args)
+
+
+@pytest.mark.parametrize(
+    "flags",
+    [
+        ["--disable-log-stats"],
+        ["--log-stats", "--disable-log-stats"],
+        ["--headless"],
+        ["--headless", "--log-stats"],
+        ["--headless", "--log-stats", "--disable-log-stats"],
+    ],
+)
+def test_serve_accepts_disabled_stage_metrics_when_logging_is_disabled_or_headless(
+    flags: list[str], mocker: MockerFixture
+) -> None:
+    mocker.patch("vllm_omni.diffusion.utils.hf_utils.is_diffusion_model", return_value=False)
+    mocker.patch("vllm_omni.entrypoints.cli.serve.validate_parsed_serve_args")
+    args = _parse_serve_args(["serve", "fake-model", "--omni", "--no-collect-stage-metrics", *flags])
+
+    OmniServeCommand().validate(args)
+
+
 def test_no_guardrails_is_only_forwarded_as_model_config(mocker: MockerFixture) -> None:
     """The CLI alias must not reach the strict diffusion config validator."""
     parser = TrackingArgumentParser()

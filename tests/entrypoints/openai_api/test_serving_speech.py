@@ -29,11 +29,13 @@ from pydantic import ValidationError
 from pytest_mock import MockerFixture
 from vllm.entrypoints.serve import create_error_response
 from vllm.entrypoints.serve.engine.protocol import ErrorInfo, ErrorResponse
+from vllm.outputs import CompletionOutput
 
 from vllm_omni.config.stage_config import StagePipelineConfig
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.request_scheduler import RequestScheduler
 from vllm_omni.diffusion.sched.step_scheduler import StepScheduler
+from vllm_omni.engine.stage_pool import StagePool
 from vllm_omni.entrypoints.omni_base import OmniEngineDeadError
 from vllm_omni.entrypoints.openai import api_server as api_server_module
 from vllm_omni.entrypoints.openai import serving_speech as serving_speech_module
@@ -66,6 +68,7 @@ from vllm_omni.entrypoints.openai.tts_adapters.qwen3_tts import Qwen3TTSAdapter,
 from vllm_omni.entrypoints.openai.tts_adapters.voxtral import VoxtralTTSAdapter
 from vllm_omni.entrypoints.serve.utils import errors as serve_errors
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+from vllm_omni.metrics.stats import OrchestratorAggregator
 from vllm_omni.model_executor.models.fish_speech.prompt_utils import (
     FISH_TEXT_ONLY_SYSTEM_PROMPT,
     build_fish_voice_clone_prompt_ids,
@@ -79,6 +82,7 @@ from vllm_omni.model_executor.models.ming_tts.constants import (
     TEXT_EOS_TOKEN_ID,
 )
 from vllm_omni.outputs import OmniRequestOutput
+from vllm_omni.outputs.output_processor import MultimodalOutputProcessor
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -5512,6 +5516,42 @@ class TestTTSAsyncOffloading:
         yield server
         server.shutdown()
 
+    @pytest.fixture(params=[True, False], ids=["stage-metrics-on", "stage-metrics-off"])
+    def qwen3_stage_output(self, request, mocker: MockerFixture):
+        """Use the real stage-stat builder and merge, not hand-written usage metadata."""
+        collect_stage_metrics = request.param
+
+        def make_output(request_id: str, finish_reason: str, output_tokens: int = 191) -> OmniRequestOutput:
+            processor = mocker.Mock(spec=MultimodalOutputProcessor)
+            processor.pop_native_text_metrics.return_value = {"num_generation_tokens": output_tokens}
+            pool = StagePool(0, [mocker.Mock(final_output_type="text")], output_processor=processor)
+            pool.collect_stage_metrics = collect_stage_metrics
+            talker_output = OmniRequestOutput(
+                request_id=request_id,
+                prompt_token_ids=[1, 2],
+                outputs=[
+                    CompletionOutput(
+                        index=0,
+                        text="",
+                        token_ids=[3],
+                        cumulative_logprob=None,
+                        logprobs=None,
+                        finish_reason=finish_reason,
+                    )
+                ],
+            )
+            stats = pool.build_stage_metrics([talker_output], submit_ts=1.0, request_timestamp=1.0, replica_id=0)
+            aggregator = OrchestratorAggregator(2, False, 0.0, 1)
+            aggregator.on_stage_metrics(0, request_id, stats, "text")
+            stage_metadata = aggregator._merge_stage_metric_event(
+                None, stats, collect_stage_metrics=collect_stage_metrics
+            )
+            output = create_mock_audio_output_for_test(request_id, metrics={"stage_metrics": {"0": stage_metadata}})
+            output.stage_id = 1
+            return output
+
+        return make_output
+
     def test_voxtral_loads_supported_speakers(self, mocker: MockerFixture):
         engine_client = mocker.MagicMock()
         engine_client.model_config.hf_config.audio_config = {
@@ -5960,19 +6000,11 @@ class TestTTSAsyncOffloading:
         assert ("artifact-fail", False) not in qwen3_tts_server._ref_audio_model_artifact_ready
 
     @pytest.mark.asyncio
-    async def test_generate_audio_chunks_rejects_qwen3_codec_limit_before_success(self, qwen3_tts_server):
+    async def test_generate_audio_chunks_rejects_qwen3_codec_limit_before_success(
+        self, qwen3_tts_server, qwen3_stage_output
+    ):
         async def length_limited_generator():
-            yield SimpleNamespace(
-                multimodal_output={"audio": torch.zeros(16, dtype=torch.float32), "sr": 24000},
-                metrics={
-                    "stage_metrics": {
-                        "0": {
-                            "num_tokens_out": 191,
-                            "finish_reason": "length",
-                        }
-                    }
-                },
-            )
+            yield qwen3_stage_output("req-codec-limit", "length")
 
         chunks = qwen3_tts_server._generate_audio_chunks(
             length_limited_generator(),
@@ -5984,19 +6016,9 @@ class TestTTSAsyncOffloading:
                 pass
 
     @pytest.mark.asyncio
-    async def test_sse_codec_limit_marks_partial_audio_for_discard(self, qwen3_tts_server):
+    async def test_sse_codec_limit_marks_partial_audio_for_discard(self, qwen3_tts_server, qwen3_stage_output):
         async def length_limited_generator():
-            yield SimpleNamespace(
-                multimodal_output={"audio": torch.zeros(16, dtype=torch.float32), "sr": 24000},
-                metrics={
-                    "stage_metrics": {
-                        "0": {
-                            "num_tokens_out": 191,
-                            "finish_reason": "length",
-                        }
-                    }
-                },
-            )
+            yield qwen3_stage_output("req-sse-codec-limit", "length")
 
         events = [
             event
@@ -6013,6 +6035,61 @@ class TestTTSAsyncOffloading:
         payload = json.loads(next(line for line in error_event.splitlines() if line.startswith("data: "))[6:])
         assert payload["error"]["partial_audio"] is True
         assert payload["error"]["action"] == "discard"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("finish_reason", ["length", "stop"])
+    async def test_qwen3_tts_base_nonstream_completion_and_usage(
+        self, qwen3_tts_server, qwen3_stage_output, mocker: MockerFixture, finish_reason: str
+    ):
+        async def generator():
+            yield qwen3_stage_output("req-base-usage", finish_reason)
+
+        params = {"task_type": ["Base"], "_qwen3_tts_effective_max_tokens": [192]}
+        mocker.patch.object(
+            qwen3_tts_server, "_prepare_speech_generation", return_value=("req-base-usage", generator(), params)
+        )
+        mocker.patch.object(qwen3_tts_server, "_count_usage_text_tokens", return_value=2)
+        usage: list[SpeechTokenUsage] = []
+        request = OpenAICreateSpeechRequest(input="Hello", task_type="Base")
+
+        if finish_reason == "length":
+            with pytest.raises(Qwen3TTSCodecLimitError, match="191/192"):
+                await qwen3_tts_server._generate_audio_bytes(request, usage_out=usage)
+            assert usage == []
+        else:
+            audio, media_type = await qwen3_tts_server._generate_audio_bytes(request, usage_out=usage)
+            assert audio
+            assert media_type == "audio/wav"
+            assert len(usage) == 1
+            assert usage[0].output_tokens == 191
+            assert usage[0].input_tokens == 2
+            assert usage[0].total_tokens == 193
+
+    @pytest.mark.asyncio
+    async def test_qwen3_tts_base_sse_completion_usage(
+        self, qwen3_tts_server, qwen3_stage_output, mocker: MockerFixture
+    ):
+        async def generator():
+            yield qwen3_stage_output("req-base-sse-usage", "stop")
+
+        mocker.patch.object(qwen3_tts_server, "_count_usage_text_tokens", return_value=2)
+        events = [
+            event
+            async for event in qwen3_tts_server._generate_audio_sse_events(
+                generator(),
+                "req-base-sse-usage",
+                request=OpenAICreateSpeechRequest(input="Hello", task_type="Base"),
+                tts_params={"task_type": ["Base"], "_qwen3_tts_effective_max_tokens": [192]},
+            )
+        ]
+
+        assert any("event: speech.audio.delta" in event for event in events)
+        assert not any("event: speech.audio.error" in event for event in events)
+        done_event = next(event for event in events if "event: speech.audio.done" in event)
+        payload = json.loads(next(line for line in done_event.splitlines() if line.startswith("data: "))[6:])
+        assert payload["usage"]["output_tokens"] == 191
+        assert payload["usage"]["input_tokens"] == 2
+        assert payload["usage"]["total_tokens"] == 193
 
     @pytest.mark.asyncio
     async def test_sse_error_before_audio_is_not_marked_partial(self, qwen3_tts_server):

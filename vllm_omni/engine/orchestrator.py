@@ -337,6 +337,7 @@ class OrchestratorBase:
     _prom_metrics: Any = None
     _stat_logger: OmniPrometheusStatLogger | None = None
     _transfer_release_tasks: set[asyncio.Task] = set()
+    collect_stage_metrics: bool = True
 
     def __init__(
         self,
@@ -353,6 +354,7 @@ class OrchestratorBase:
         transfer_emitter: Any = None,
         prom_metrics: Any = None,
         log_stats: bool = False,
+        collect_stage_metrics: bool = True,
         enable_orch_monitor: bool = False,
         event_driven_orch_default: bool = False,
     ) -> None:
@@ -364,6 +366,11 @@ class OrchestratorBase:
         self.num_stages = len(stage_pools)
         self.stage_pools: list[StagePool] = stage_pools
         self.log_stats = log_stats
+        if log_stats and not collect_stage_metrics:
+            raise ValueError("log_stats=True requires collect_stage_metrics=True")
+        self.collect_stage_metrics = collect_stage_metrics
+        for pool in self.stage_pools:
+            pool.collect_stage_metrics = collect_stage_metrics
         self._prom_metrics = prom_metrics
         self._stage_replica_waiting: dict[tuple[int, int], int] = {}
         self._orch_monitor = create_orch_monitor(
@@ -1396,7 +1403,8 @@ class OrchestratorBase:
                     replica_id=replica_id,
                     sampling_params=req_state.sampling_params_list[stage_id],
                 )
-                stage_metrics.pipeline_timings = dict(req_state.pipeline_timings)
+                if self.collect_stage_metrics:
+                    stage_metrics.pipeline_timings = dict(req_state.pipeline_timings)
 
             await self._route_output(stage_id, replica_id, output, req_state, stage_metrics)
 

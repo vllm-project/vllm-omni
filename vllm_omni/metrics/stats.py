@@ -558,7 +558,10 @@ class OrchestratorAggregator:
     def _merge_stage_metric_event(
         current: dict[str, Any] | None,
         evt: StageRequestStats,
+        *,
+        collect_stage_metrics: bool = True,
     ) -> dict[str, Any]:
+        """Merge completion/usage and, optionally, diagnostic metrics."""
         sid = int(evt.stage_id) if evt.stage_id is not None else -1
         if current is None:
             current = {
@@ -567,31 +570,39 @@ class OrchestratorAggregator:
                 "finish_reason": evt.finish_reason,
                 defs.NUM_TOKENS_IN: int(evt.num_tokens_in),
                 defs.NUM_TOKENS_OUT: int(evt.num_tokens_out),
-                defs.STAGE_GEN_TIME_MS: float(evt.stage_gen_time_ms),
-                defs.POSTPROCESS_TIME_MS: float(evt.postprocess_time_ms),
-                defs.AUDIO_FRAMES: int(evt.audio_generated_frames),
-                defs.AUDIO_SAMPLE_RATE: int(evt.audio_sample_rate),
-                f"{defs.AUDIO_DURATION}_s": float(evt.audio_duration_s),
-                defs.IMAGE_PIXELS: int(evt.image_pixels),
-                defs.DENOISE_STEP_LATENCY_MS: float(evt.denoise_step_latency_ms),
-                "output_unit_type": evt.output_unit_type,
-                defs.OUTPUT_UNIT_COUNT: int(evt.output_unit_count),
-                defs.SERVING_TIME_TO_FIRST_OUTPUT_MS: float(evt.serving_time_to_first_output_ms),
-                defs.IMAGE_TIME_TO_FIRST_OUTPUT_MS: float(evt.image_time_to_first_output_ms),
-                defs.TIME_PER_OUTPUT_UNIT_MS: float(evt.time_per_output_unit_ms),
-                defs.INTER_OUTPUT_LATENCY_MS: float(evt.inter_output_latency_ms),
-                defs.INTER_OUTPUT_LATENCIES_MS: list(evt.inter_output_latencies_ms or []),
-                defs.VLLM_TTFT_MS: float(evt.vllm_ttft_ms),
-                defs.VLLM_TPOT_MS: float(evt.vllm_tpot_ms),
-                defs.VLLM_ITL_MS: float(evt.vllm_itl_ms),
-                defs.VLLM_ITLS_MS: list(evt.vllm_itls_ms or []),
             }
+            if not collect_stage_metrics:
+                return current
+            current.update(
+                {
+                    defs.STAGE_GEN_TIME_MS: float(evt.stage_gen_time_ms),
+                    defs.POSTPROCESS_TIME_MS: float(evt.postprocess_time_ms),
+                    defs.AUDIO_FRAMES: int(evt.audio_generated_frames),
+                    defs.AUDIO_SAMPLE_RATE: int(evt.audio_sample_rate),
+                    f"{defs.AUDIO_DURATION}_s": float(evt.audio_duration_s),
+                    defs.IMAGE_PIXELS: int(evt.image_pixels),
+                    defs.DENOISE_STEP_LATENCY_MS: float(evt.denoise_step_latency_ms),
+                    "output_unit_type": evt.output_unit_type,
+                    defs.OUTPUT_UNIT_COUNT: int(evt.output_unit_count),
+                    defs.SERVING_TIME_TO_FIRST_OUTPUT_MS: float(evt.serving_time_to_first_output_ms),
+                    defs.IMAGE_TIME_TO_FIRST_OUTPUT_MS: float(evt.image_time_to_first_output_ms),
+                    defs.TIME_PER_OUTPUT_UNIT_MS: float(evt.time_per_output_unit_ms),
+                    defs.INTER_OUTPUT_LATENCY_MS: float(evt.inter_output_latency_ms),
+                    defs.INTER_OUTPUT_LATENCIES_MS: list(evt.inter_output_latencies_ms or []),
+                    defs.VLLM_TTFT_MS: float(evt.vllm_ttft_ms),
+                    defs.VLLM_TPOT_MS: float(evt.vllm_tpot_ms),
+                    defs.VLLM_ITL_MS: float(evt.vllm_itl_ms),
+                    defs.VLLM_ITLS_MS: list(evt.vllm_itls_ms or []),
+                }
+            )
             return current
 
         current[defs.NUM_TOKENS_IN] = int(current.get(defs.NUM_TOKENS_IN, 0)) + int(evt.num_tokens_in)
         current[defs.NUM_TOKENS_OUT] = int(current.get(defs.NUM_TOKENS_OUT, 0)) + int(evt.num_tokens_out)
         if evt.finish_reason is not None:
             current["finish_reason"] = evt.finish_reason
+        if not collect_stage_metrics:
+            return current
         current[defs.STAGE_GEN_TIME_MS] = float(current.get(defs.STAGE_GEN_TIME_MS, 0.0)) + float(evt.stage_gen_time_ms)
         current[defs.POSTPROCESS_TIME_MS] = float(current.get(defs.POSTPROCESS_TIME_MS, 0.0)) + float(
             evt.postprocess_time_ms
