@@ -12,7 +12,6 @@ import msgspec
 import torch
 
 from vllm_omni.data_entry_keys import CodesStruct, MetaStruct, OmniPayloadStruct
-from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.errors import OmniClientError
 from vllm_omni.model_executor.models.kimi_audio.prompt import KimiAudioPreparedInput, KimiAudioSpecialTokens
 from vllm_omni.model_executor.models.kimi_audio.sampling import KimiAudioSamplingParams
@@ -107,10 +106,11 @@ def prepare_kimi_audio_request(prompt: dict[str, Any], sampling_params_list: Seq
     if caller_salt is not None and not isinstance(caller_salt, str):
         raise OmniClientError("Kimi-Audio cache_salt must be a string")
     cache_salt = hashlib.sha256(msgspec.msgpack.encode((info["kimi_audio_input"], caller_salt))).hexdigest()
-    # Downstream conversion receives the original prompt. Omni copies processed
-    # additional_information.meta back to it, but not model_intermediate_buffer.
     # Resolve an omitted seed once: None is dropped on the wire and would leave
     # a stale audio_seed when a caller reuses a previously submitted prompt.
+    # The complete handoff receives the original prompt, to which Omni copies
+    # processed additional_information.meta but not model_intermediate_buffer;
+    # the async-chunk handoff reads the stage-0 request's buffer.
     audio_seed = params.seed if params.seed is not None else secrets.randbits(63)
     return {
         **prompt,
@@ -119,6 +119,7 @@ def prepare_kimi_audio_request(prompt: dict[str, Any], sampling_params_list: Seq
         "model_intermediate_buffer": {
             **info,
             "kimi_audio_request_validated": True,
+            "kimi_audio_seed": audio_seed,
         },
     }
 
@@ -197,13 +198,11 @@ def kimi_audio_to_decoder_async_chunk(
             prepared = KimiAudioPreparedInput.from_wire(request.model_intermediate_buffer["kimi_audio_input"])
             if prepared.output_type != "both":
                 raise ValueError("Kimi-Audio audio streaming requires output_type='both'")
-            # Use the seed resolved at admission, as the complete handoff does;
-            # sampling_params.seed stays None when the caller omitted it.
-            info = deserialize_additional_information(getattr(request, "additional_information", None))
             state["kimi_audio"] = {
                 "offset": prepared.audio_token_offset,
                 "vocab_size": prepared.audio_vocab_size,
-                "audio_seed": info["meta"]["audio_seed"],
+                # Resolved at admission; sampling_params.seed stays None when omitted.
+                "audio_seed": request.model_intermediate_buffer["kimi_audio_seed"],
                 "chunk_seq": 0,
             }
         state = state["kimi_audio"]

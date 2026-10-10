@@ -9,7 +9,6 @@ import pytest
 import torch
 from vllm.sampling_params import SamplingParams
 
-from vllm_omni.engine.serialization import serialize_additional_information
 from vllm_omni.model_executor.models.kimi_audio.audio_processing import prepare_kimi_audio_inputs
 from vllm_omni.model_executor.models.kimi_audio.prompt import KimiAudioPromptBuilder, KimiAudioSpecialTokens
 from vllm_omni.model_executor.stage_input_processors.kimi_audio import (
@@ -82,7 +81,6 @@ def test_stream_transfer_emits_each_code_once_and_flushes_final_chunk(prompt_bui
     request = SimpleNamespace(
         request_id="internal-request",
         external_req_id="request",
-        additional_information=serialize_additional_information(prompt["additional_information"]),
         model_intermediate_buffer=prompt["model_intermediate_buffer"],
         sampling_params=params,
         is_finished=lambda: False,
@@ -107,5 +105,6 @@ def test_stream_transfer_emits_each_code_once_and_flushes_final_chunk(prompt_bui
     assert torch.cat([chunk.codes.audio for chunk in chunks]).flatten().tolist() == list(range(code_count))
     assert [chunk.meta.chunk_seq for chunk in chunks] == list(range(len(chunks)))
     audio_seed = prompt["additional_information"]["meta"]["audio_seed"]
+    assert prompt["model_intermediate_buffer"]["kimi_audio_seed"] == audio_seed
     assert all(chunk.meta.audio_seed == audio_seed for chunk in chunks)
     assert transfer.code_prompt_token_ids[request.external_req_id] == []
