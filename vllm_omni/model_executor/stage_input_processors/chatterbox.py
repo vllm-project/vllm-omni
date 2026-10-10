@@ -167,11 +167,10 @@ def t3_to_s3gen(
         _requires_multimodal_data: Unused; part of the processor signature.
 
     Returns:
-        One prompt per finished output: the valid speech tokens, with the
-        request's reference and the stream metadata.
-
-    Raises:
-        RuntimeError: If stage 0 produced no speech tokens for the request.
+        One prompt per finished output that has speech tokens: the valid
+        ones, with the request's reference and the stream metadata. None for
+        an utterance without any, which the orchestrator then ends with
+        empty audio, as streaming ends it.
     """
     reference = prompt["additional_information"]["embed"]
     stage_inputs: list[OmniTokensPrompt] = []
@@ -182,7 +181,7 @@ def t3_to_s3gen(
         # engine version report the prompt in the output history.
         codes = [token for token in source_output.outputs[0].cumulative_token_ids if token < SPEECH_TOKEN_LIMIT]
         if not codes:
-            raise RuntimeError(f"Chatterbox T3 produced no speech tokens for request {source_output.request_id}")
+            continue
         stage_inputs.append(
             OmniTokensPrompt(
                 prompt_token_ids=codes,

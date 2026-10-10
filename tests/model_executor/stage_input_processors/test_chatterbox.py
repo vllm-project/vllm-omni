@@ -69,9 +69,13 @@ def test_unfinished_outputs_are_skipped_001() -> None:
     assert t3_to_s3gen([talker_output([10, 20], finished=False)], request_prompt(250)) == []
 
 
-def test_an_utterance_with_no_speech_tokens_is_an_error_001() -> None:
-    with pytest.raises(RuntimeError, match="no speech tokens"):
-        t3_to_s3gen([talker_output([6562])], request_prompt(250))
+def test_an_utterance_with_no_speech_tokens_gets_no_stage_1_request_001() -> None:
+    """The orchestrator ends a request that has no next-stage input with empty audio.
+
+    Raising here instead stops the orchestrator, and with it every other
+    request; streaming ends the same utterance with an empty final chunk.
+    """
+    assert t3_to_s3gen([talker_output([6562])], request_prompt(250)) == []
 
 
 @pytest.fixture(scope="module")
