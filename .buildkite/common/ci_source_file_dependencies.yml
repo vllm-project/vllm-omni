@@ -246,6 +246,15 @@ source_file_dependencies:
     - *qwen3_omni
     - tests/e2e/accuracy/qwen3_omni/
 
+  omni_socialomni:
+    - *qwen3_omni
+    - tests/e2e/accuracy/test_qwen3_omni_socialomni_expansion.py
+    - benchmarks/socialomni/client.py
+    - benchmarks/socialomni/dataset.py
+    - benchmarks/socialomni/evaluate.py
+    - benchmarks/socialomni/metrics.py
+    - benchmarks/socialomni/protocol.py
+
   omni_qwen3_omni_perf:
     - *qwen3_omni
     - tests/dfx/perf/scripts/run_benchmark.py

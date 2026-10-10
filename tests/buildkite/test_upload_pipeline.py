@@ -470,6 +470,24 @@ def _surviving_labels(
     return labels
 
 
+@pytest.mark.parametrize(
+    ("changed", "socialomni", "accuracy"),
+    [
+        ("benchmarks/socialomni/protocol.py", True, False),
+        ("benchmarks/socialomni/metrics.py", True, False),
+        ("tests/e2e/accuracy/test_qwen3_omni_socialomni_expansion.py", True, False),
+        ("tests/e2e/accuracy/qwen3_omni/test_qwen3_omni.py", False, True),
+        ("vllm_omni/model_executor/models/qwen3_omni/qwen3_omni.py", True, True),
+        ("benchmarks/socialomni/README.md", False, False),
+        ("tests/benchmarks/test_socialomni_protocol.py", False, False),
+    ],
+)
+def test_socialomni_nightly_source_filter(changed: str, socialomni: bool, accuracy: bool) -> None:
+    labels = _surviving_labels(yaml.safe_load(NIGHTLY_YAML.read_text()), [changed], pipeline_path=NIGHTLY_YAML)
+    assert (":full_moon: Omni · SocialOmni Mini · 2-GPU" in labels) is socialomni
+    assert (":full_moon: Omni · Accuracy Test" in labels) is accuracy
+
+
 def _iter_steps(doc: dict):
     def walk(steps: list | None):
         for step in steps or []:
