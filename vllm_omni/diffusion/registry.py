@@ -336,6 +336,12 @@ _DIFFUSION_MODELS = {
         "pipeline_hunyuan_video_1_5_i2v",
         "HunyuanVideo15I2VPipeline",
     ),
+    # PAN2 checkpoints are Modular Diffusers repositories: `modular_model_index.json` declares this class.
+    "PAN2ModularPipeline": (
+        "pan2",
+        "pipeline_pan2",
+        "PAN2Pipeline",
+    ),
     "LingBotVideoPipeline": (
         "lingbot_video",
         "pipeline_lingbot_video",
@@ -722,6 +728,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "Flux2Pipeline": "get_flux2_post_process_func",
     "HunyuanVideo15Pipeline": "get_hunyuan_video_15_post_process_func",
     "HunyuanVideo15ImageToVideoPipeline": "get_hunyuan_video_15_i2v_post_process_func",
+    "PAN2ModularPipeline": "get_pan2_post_process_func",
     "HunyuanImage3Pipeline": "get_hunyuan_image3_post_process_func",
     "LingBotVideoPipeline": "get_lingbot_video_post_process_func",
     "SanaVideoPipeline": "get_sana_video_post_process_func",
@@ -787,6 +794,7 @@ _DIFFUSION_PRE_PROCESS_FUNCS = {
     "Cosmos3OmniPipeline": "get_cosmos3_pre_process_func",
     "MammothModa2DiTPipeline": "get_mammoth_moda2_pre_process_func",
     "Kandinsky6TI2VAPipeline": "get_kandinsky6_pre_process_func",
+    "PAN2ModularPipeline": "get_pan2_pre_process_func",
 }
 
 

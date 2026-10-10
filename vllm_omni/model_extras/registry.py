@@ -278,6 +278,10 @@ _EXTRA_SPECS: dict[str, dict[str, Any]] = {
             "MiniMaxH3ModularPipeline",
         )
     },
+    # PAN2 scales and center crops the first frame to the requested size itself.
+    "PAN2ModularPipeline": {
+        "reference_image_size_resolver": _always_preserve_reference_image_size,
+    },
     **{
         model_class_name: {
             "extra_body_params": LTX_EXTRA_BODY_PARAMS,

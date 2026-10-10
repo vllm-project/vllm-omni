@@ -1071,13 +1071,13 @@ class OmniServeCommand(CLISubcommand):
             help="Maximum length for TTS voice style instructions (overrides the pipeline default, default: 500).",
         )
 
-        # Disable safety guardrails for this server (currently only applicable for Cosmos3)
+        # Disable safety guardrails for this server (currently only applicable for Cosmos3 and PAN2)
         # TODO: drop once --model-config-override lands (3/N config refactor)
         omni_config_group.add_argument(
             "--no-guardrails",
             dest="no_guardrails",
             action="store_true",
-            help="Disable Cosmos3 text/video safety guardrails for this server.",
+            help="Disable Cosmos3 and PAN2 text/video safety guardrails for this server.",
         )
         omni_config_group.add_argument(
             "--robot-openpi-idle-timeout",
