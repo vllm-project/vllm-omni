@@ -12,6 +12,7 @@ from typing import Any
 
 import numpy as np
 import pytest
+from vllm.v1.engine import FinishReason
 from vllm.v1.engine.exceptions import EngineDeadError
 
 from tests.engine.test_orchestrator import (
@@ -21,6 +22,7 @@ from tests.engine.test_orchestrator import (
     _build_stage_pools,
 )
 from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
+from vllm_omni.engine import OmniEngineCoreOutput, OmniEngineCoreOutputs
 from vllm_omni.engine.duplex import commands
 from vllm_omni.engine.duplex.config import DuplexSessionConfig, DuplexSessionState
 from vllm_omni.engine.duplex.contracts import DuplexFence, duplex_resource_request_id
@@ -404,6 +406,47 @@ async def test_session_owned_outputs_reach_the_runner_and_never_the_client_queue
     )
     assert await orchestrator._intercept_stage_output(1, 0, _tts_output(orphan.request_id), orphan, None, None)
     await orchestrator.session_manager.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage_id", [0, 1])
+async def test_terminal_stage_error_closes_session_before_another_append(mocker, stage_id) -> None:
+    orchestrator, clients, rpc_q, output_q = _build(stages=2)
+    output_buffer = DuplexOutputBuffer(max_bytes=2 * 1024 * 1024, max_events=512)
+    await _open(orchestrator, rpc_q, output_buffer=output_buffer)
+    request_id = _stage0_request_id()
+    await _submit(orchestrator, _append_audio())
+    session = orchestrator.session_manager.get(SESSION_ID)
+    reason = "context_length_exceeded: streaming session prompt would grow to 3000 tokens"
+    output = OmniEngineCoreOutput(
+        request_id=request_id,
+        finish_reason=FinishReason.ERROR,
+        stop_reason=reason,
+        is_segment_finished=False,
+        new_token_ids=[],
+    )
+    mocker.patch.object(orchestrator, "_handle_kv_ready_raw_outputs", new_callable=mocker.AsyncMock)
+    mocker.patch.object(
+        orchestrator.stage_pools[stage_id], "process_llm_raw_outputs", new_callable=mocker.AsyncMock, return_value=[]
+    )
+    try:
+        await orchestrator._process_llm_stage_outputs(stage_id, 0, OmniEngineCoreOutputs(outputs=[output]), set())
+        await _settle(orchestrator)
+        assert request_id not in orchestrator.request_states
+        assert clients[0].abort_calls == [[request_id]]
+        assert SESSION_ID not in orchestrator.session_manager.runners
+        assert session.state == DuplexSessionState.CLOSED
+        assert orchestrator.session_manager.active_count() == 0
+        events = [await output_buffer.get() for _ in range(output_buffer.pending_events)]
+        events.extend(output_q.get_nowait().event for _ in range(output_q.qsize()))
+        types = [event.type for event in events]
+        assert types.index("error") < types.index("session.expired")
+        assert types[-1] == "session.expired"
+        # A request-local failure must release admission without evicting the replica.
+        result = await _open(orchestrator, rpc_q)
+        assert result.ok
+    finally:
+        await orchestrator.session_manager.shutdown()
 
 
 @pytest.mark.asyncio

@@ -1338,6 +1338,29 @@ def test_stage0_streaming_update_that_overflows_max_model_len_finishes_the_sessi
     assert _run_idle_step(sched) == {}
 
 
+def test_late_append_cannot_recreate_an_overflowed_session_before_abort() -> None:
+    sched = _make_live_session_scheduler(max_model_len=8)
+    sched.spec_decode_metrics_level = "none"
+    session = _make_request()
+    _park_session(sched, session)
+    sched._update_request_as_session(session, _make_update([10, 20, 30]))
+    _run_idle_step(sched)
+    assert sched._streaming_context_overflow == {}
+
+    # The error is already on its way to the owner, while more input is in flight.
+    late = _make_request()
+    late.resumable = True
+    sched.add_request(late)
+    assert session.request_id not in sched.requests
+    assert len(sched.waiting) == 0
+
+    # Owner cleanup acknowledges termination; no unbounded request-ID tombstones.
+    sched.finish_requests([session.request_id], RequestStatus.FINISHED_ABORTED)
+    replacement = _make_request()
+    sched.add_request(replacement)
+    assert sched.requests[session.request_id] is replacement
+
+
 def test_stage0_streaming_update_that_fills_max_model_len_exactly_finishes_the_session() -> None:
     """An exactly full prompt leaves no room for the token every duplex step
     samples: upstream's running budget drops to -1, which ``schedule()`` does
