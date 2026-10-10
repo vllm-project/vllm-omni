@@ -159,6 +159,39 @@ def add_omniinteract_cli_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def add_duplex_eval_cli_args(parser: argparse.ArgumentParser) -> None:
+    group = parser.add_argument_group("Omni-DuplexEval Benchmark Options")
+    group.add_argument("--duplex-eval-split", default="all")
+    group.add_argument("--duplex-eval-family", choices=("all", "rtd", "pr"), default="all")
+    group.add_argument("--duplex-eval-ids", nargs="+")
+    group.add_argument("--duplex-eval-media-root", type=Path)
+    group.add_argument("--duplex-eval-ref-audio", type=_existing_file)
+    group.add_argument("--duplex-eval-fps", type=_positive_finite_float, default=1.0)
+    group.add_argument(
+        "--duplex-eval-response-root",
+        type=Path,
+        default=Path("omni-duplex-eval-output"),
+        help="Parent directory for artifacts; each invocation creates a new run subdirectory.",
+    )
+    group.add_argument(
+        "--duplex-eval-evaluate",
+        action="store_true",
+        help="Run the existing Omni-DuplexEval judge after performance timing and print accuracy scores.",
+    )
+    group.add_argument(
+        "--duplex-eval-judge-base-url",
+        default="http://127.0.0.1:8001/v1",
+        help="Base URL of an already-running OpenAI-compatible judge server.",
+    )
+    group.add_argument("--duplex-eval-judge-model", help="Model name exposed by the judge server.")
+    group.add_argument("--duplex-eval-judge-api-key", default="EMPTY")
+    group.add_argument("--duplex-eval-judge-timeout-s", type=_positive_finite_float, default=600.0)
+    group.add_argument("--duplex-eval-judge-video-mode", choices=("video_url", "frame-sample"), default="video_url")
+    group.add_argument("--duplex-eval-judge-fps", type=_positive_int, default=2)
+    group.add_argument("--duplex-eval-window-size", type=_positive_finite_float, default=10.0)
+    group.add_argument("--duplex-eval-eval-workers", type=_positive_int, default=1)
+
+
 def add_multi_stage_cli_args(parser: argparse.ArgumentParser) -> None:
     """Add CLI arguments for vLLM-Omni multi-stage benchmarks."""
     group = parser.add_argument_group("vLLM-Omni Multi-stage Benchmark Options")
@@ -414,6 +447,7 @@ def add_seed_tts_cli_args(parser: argparse.ArgumentParser) -> None:
 _OMNI_BENCH_DATASET_CHOICES = (
     "daily-omni",
     "omniinteract",
+    "omni-duplex-eval",
     "seed-tts",
     "seed-tts-text",
     "seed-tts-design",
@@ -488,6 +522,7 @@ def add_omni_args(parser: argparse.ArgumentParser) -> None:
     add_daily_omni_cli_args(parser)
     add_videomme_cli_args(parser)
     add_omniinteract_cli_args(parser)
+    add_duplex_eval_cli_args(parser)
     add_seed_tts_cli_args(parser)
     add_multi_stage_cli_args(parser)
     add_diffusion_cli_args(parser)
@@ -495,6 +530,24 @@ def add_omni_args(parser: argparse.ArgumentParser) -> None:
 
 def preprocess_serve_args(args: argparse.Namespace) -> None:
     """Apply serving benchmark CLI transformations after parsing."""
+    if getattr(args, "dataset_name", None) == "omni-duplex-eval":
+        if args.backend != "openai-realtime-duplex" or args.endpoint != "/v1/realtime":
+            raise ValueError("Omni-DuplexEval requires --backend openai-realtime-duplex --endpoint /v1/realtime")
+        if not args.duplex_eval_ref_audio:
+            raise ValueError("Omni-DuplexEval requires --duplex-eval-ref-audio")
+        if args.duplex_eval_evaluate and not args.duplex_eval_judge_model:
+            raise ValueError("Omni-DuplexEval evaluation requires --duplex-eval-judge-model")
+        for name in ("ignore_eos", "profile", "skip_tokenizer_init", "probe_request_rate"):
+            if getattr(args, name, False):
+                raise ValueError(f"Omni-DuplexEval does not support --{name.replace('_', '-')}")
+        if "num_prompts" not in getattr(args, "explicit_keys", ()):
+            args.num_prompts = 3
+        if args.num_prompts < 0:
+            raise ValueError("Omni-DuplexEval --num-prompts must be non-negative (0 selects all)")
+        if args.max_concurrency is None:
+            args.max_concurrency = 1
+        elif args.max_concurrency <= 0:
+            raise ValueError("Omni-DuplexEval requires positive --max-concurrency")
     if getattr(args, "dataset_name", None) == "omniinteract":
         if getattr(args, "backend", None) != "openai-realtime-duplex":
             raise ValueError("OmniInteract requires --backend openai-realtime-duplex")

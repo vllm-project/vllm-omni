@@ -279,6 +279,113 @@ We use audio generation time / audio duration to calculate RTF.
 
 </details>
 
+### Omni-DuplexEval Realtime Benchmark
+
+Omni-DuplexEval uses the same serving-benchmark lifecycle as OmniInteract. Each
+selected video is one session/request, not one request per model response:
+
+```bash
+vllm bench serve --omni \
+  --backend openai-realtime-duplex \
+  --dataset-name omni-duplex-eval \
+  --dataset-path Hothan/Omni-DuplexEval \
+  --model openbmb/MiniCPM-o-4_5 \
+  --base-url http://127.0.0.1:8000 --endpoint /v1/realtime \
+  --duplex-eval-ref-audio /path/to/reference.wav \
+  --duplex-eval-response-root ./duplex-eval-runs \
+  --duplex-eval-split PR_correction \
+  --num-prompts 3 --disable-shuffle --max-concurrency 1 --num-warmups 0 \
+  --ready-check-timeout-sec 0 --save-result
+```
+
+`--dataset-path` accepts the existing loader's HF dataset ID, local dataset mirror,
+Parquet file or JSON/JSONL manifest. It defaults to `Hothan/Omni-DuplexEval`.
+Use `--duplex-eval-family`, `--duplex-eval-ids` and `--duplex-eval-media-root` for
+filtering and local media. The default is three samples and single concurrency;
+`--num-prompts 0` selects all, and oversized counts use every available sample
+without repeating it. `--seed` controls shuffling; `--disable-shuffle` preserves
+dataset order.
+
+Inputs retain the standalone runner's real-time pacing, question audio, media
+clock and 1 FPS default (`--duplex-eval-fps`). Selected media is decoded before
+benchmark timing and held in client memory; concurrency does not bound this
+memory, so select a suitable sample count. `--omni-request-timeout-s` bounds each
+complete session (default 900 seconds). Readiness and warmups replay complete
+sessions but do not contribute metrics or judge artifacts; the example disables
+both to avoid that extra runtime.
+
+The terminal and `--save-result` output report standard serving metrics plus the
+shared `duplex_request_metrics`, `duplex_session_metrics` and `duplex_stream_*`
+fields. TTFT/Audio TTFP/RTF follow the same per-response definitions as
+OmniInteract; stream metrics include concurrent real-time input. TPOT/ITL require
+engine token timings and are unavailable when those timings are absent. E2EL
+includes the whole session, including input streaming and drain, so it is not a
+model-only generation latency.
+
+`--duplex-eval-response-root` is a **parent directory** and may already exist.
+Each invocation creates an exclusive `run-*` subdirectory, so repeated runs and
+concurrency/QPS sweeps do not overwrite or reuse earlier responses. The actual
+run path is logged and returned in `omni_duplex_eval.response_root` in the saved
+benchmark result. Only successful measured sessions publish `<split>/<id>.json`
+and `<id>.meta.json`, using the existing judge format. Publication occurs after benchmark timing, alongside
+`duplex_metrics.json`; artifact errors are recorded in the saved result's
+`omni_duplex_eval` summary without discarding service measurements.
+
+Accuracy scoring is optional. To score immediately after the performance run,
+add these flags to the `vllm bench serve` command above:
+
+```bash
+  --duplex-eval-evaluate \
+  --duplex-eval-judge-base-url http://127.0.0.1:8001/v1 \
+  --duplex-eval-judge-model your-judge-model
+```
+
+The judge must already be running; the benchmark does not launch it. Proactive
+reminder (PR) tasks use a text judge, while real-time description (RTD) tasks
+require a vision-capable judge. The default `--duplex-eval-judge-video-mode video_url`
+requires the judge to support video inputs and access the same local video paths.
+Use `--duplex-eval-judge-video-mode frame-sample` for a remote image-capable judge;
+this changes content evaluation to the existing sampled-frame variant, not full-video judging.
+
+Scoring reuses the standalone evaluator and runs **after performance timing**.
+The terminal and saved benchmark result (`omni_duplex_eval.accuracy`) report scores
+and coverage: total measured sessions, evaluated sessions, skipped failed/unpublished
+sessions, and judge errors. Partial coverage is marked `partial`; no evaluated
+sessions is `failed`, not a zero-error accuracy result. Scores are conditional on
+the evaluated subset, not an accuracy score for all attempted sessions. Warmups
+are never scored. Judge failures do not discard completed performance measurements.
+Per-sample scores and `evaluation_summary.json` are saved under the run's
+`evaluation/` directory. `--duplex-eval-eval-workers` controls scoring concurrency
+(default 1), and `--duplex-eval-judge-timeout-s` bounds each judge request (default 600).
+
+The independent scoring commands remain available to retry scoring or change
+judges without repeating inference. After all three samples above succeed and
+their artifacts are published, evaluate the same ordered
+selection with `--limit 3`. Replace `run-XXXXXXXX` below with the reported run
+directory:
+
+```bash
+vllm bench omni-duplex-eval --omni evaluate \
+  --dataset Hothan/Omni-DuplexEval --split PR_correction --limit 3 \
+  --response-root ./duplex-eval-runs/run-XXXXXXXX --score-root ./duplex-eval-scores-1 \
+  --judge-base-url http://127.0.0.1:8001/v1 --judge-model your-judge-model
+vllm bench omni-duplex-eval --omni summarize --score-root ./duplex-eval-scores-1
+```
+
+The standalone `generate` command remains available, including its existing
+skip-existing/overwrite behavior. This integration does not change scoring rules
+or enable new nightly jobs.
+
+For shuffled runs, use `evaluate --ids` with the successful selected sample IDs
+instead of `--limit`. Failed sessions have no judge input; do not silently drop
+them when reporting coverage or accuracy.
+
+This adapter retains the standalone runner's completion policy: it waits for a
+`response.done`, not an independently correlated final-input acknowledgment.
+A successful transport/session result is therefore not proof that every final
+input produced a response, nor an accuracy score. Final-input lifecycle
+hardening is separate from this entrypoint integration.
+
 ### OmniInteract Realtime Benchmark
 
 OmniInteract runs each video as one native-duplex WebSocket sample in the standard serving-benchmark lifecycle:
