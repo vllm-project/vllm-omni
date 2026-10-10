@@ -169,6 +169,13 @@ model-native lane the audio is already streaming into the model before the
 commit, so the model may start answering — or emit a listen decision —
 without any commit at all.
 
+For explicit reply control in a turn-based session, use `auto_response=False`
+and `commit(create_response=False)`, then send `response.create` when ready.
+An explicit `commit(create_response=True)` already requests a reply, even with
+`auto_response=False`. If that request is deferred behind completed playback,
+clearing that playback starts the requested reply after the cancellation fence
+succeeds; do not send another `response.create` for the same input.
+
 ### Consume responses
 
 `responses()` demultiplexes the event stream into one `ResponseHandle` per
@@ -597,7 +604,7 @@ formats (`pcm16`, `pcm_s16le`, `s16le`, `pcm_f32le`, `g711_ulaw`,
 | `conversation.item.truncate` | 1 | Truncate an assistant item's audio/transcript at `audio_end_ms`. |
 | `response.create` | 1 | Explicitly request a response with per-response overrides. Requires committed audio input; otherwise `response_create_without_input`. |
 | `response.cancel` | 1 | Cancel the active (or named) response; advances `epoch`. |
-| `output_audio_buffer.clear` | 1 | Discard queued output audio; advances `epoch` (OpenAI: WebRTC-only, here also WebSocket). |
+| `output_audio_buffer.clear` | 1 | Discard queued output audio; advances `epoch`. For the latest completed response with unacknowledged playback and no newer active response, hard-cap assistant history at the acknowledged committed position and resume retained input whose commit already requested a reply. Do not send a second `response.create` for that input. OpenAI: WebRTC-only; here also WebSocket. |
 | `barge_in` | 3 | Explicit hard interrupt; requires `capabilities.supports_barge_in`. |
 | `turn.signal` | 3 | External turn-taking signal (e.g. `event:"barge_in"`); same capability gate. |
 | `playback.ack` | 3 | Report cumulative playback progress (`played_ms`, `committed_ms`, optional `truncate`). |
@@ -1209,13 +1216,41 @@ the requested position and audio duration; this is not exact word alignment.
 
 `C→S output_audio_buffer.clear` / `S→C output_audio_buffer.cleared`
 
+Clearing the latest completed response while it still has unacknowledged
+playback, with no newer response active, hard-caps its assistant history at
+the acknowledged committed position. A late `playback.ack` cannot restore the
+discarded remainder.
+
+For example, `resp_01` has completed but playback remains unacknowledged. The
+client has appended new audio and commits it while the old playback is pending:
+
 ```json
-{"type": "output_audio_buffer.clear"}
+{"type": "input_audio_buffer.commit", "response_create": true}
+```
+
+If that commit reports `event.response_create_deferred: true`, the client can
+clear the old playback:
+
+```json
+{"type": "output_audio_buffer.clear", "response_id": "resp_01"}
 ```
 
 ```json
 {"type": "output_audio_buffer.cleared", "response_id": "resp_01"}
 ```
+
+After the cancellation fence succeeds, the already-requested reply starts
+without another client command. Its lifecycle begins with `response.created`
+(essential fields shown):
+
+```json
+{"type": "response.created", "response_id": "resp_02", "response": {"id": "resp_02", "object": "realtime.response", "status": "in_progress"}}
+```
+
+Do not send a second `response.create` for this input; it can be rejected with
+`response_already_active`. With `auto_response=False` and a commit that set
+`response_create: false`, clearing the old playback does not request a reply:
+send `response.create` explicitly when ready.
 
 `C→S barge_in` / `turn.signal`
 
