@@ -13,7 +13,7 @@ from torch.nn import functional as F
 from vllm.logger import init_logger
 
 from vllm_omni.model_executor.models.cosyvoice3.runtime import cosyvoice3_batch_flow_profile
-from vllm_omni.model_executor.models.cosyvoice3.utils import make_pad_mask
+from vllm_omni.model_executor.models.cosyvoice3.utils import build_dit_attention_mask, make_pad_mask
 
 logger = init_logger(__name__)
 
@@ -94,7 +94,7 @@ class ConditionalCFM(BASECFM):
         with cosyvoice3_batch_flow_profile(f"cosyvoice3_cfm_euler_{max(1, int(n_timesteps))}_steps"):
             return self.solve_euler(z, t_span=t_span, mu=mu, mask=mask, spks=spks, cond=cond), cache
 
-    def solve_euler(self, x, t_span, mu, mask, spks, cond):
+    def solve_euler(self, x, t_span, mu, mask, spks, cond, streaming: bool = False):
         """
         Fixed euler solver for ODEs.
         Args:
@@ -108,6 +108,7 @@ class ConditionalCFM(BASECFM):
             spks (torch.Tensor, optional): speaker ids. Defaults to None.
                 shape: (batch_size, spk_emb_dim)
             cond (Optional[Any], optional): Not used but kept for future purposes
+            streaming: forwarded to the PyTorch DiT estimator (chunk attention).
         """
         t, _, dt = t_span[0], t_span[-1], t_span[1] - t_span[0]
         t = t.unsqueeze(dim=0)
@@ -138,12 +139,21 @@ class ConditionalCFM(BASECFM):
                 spks_in[:batch_size] = spks
             if cond is not None:
                 cond_in[:batch_size] = cond
+            # The TensorRT attention map follows mask_in, so it is also the
+            # same on every Euler step: build it once per solve rather than
+            # rebuilding (and host-syncing to compare) on each one.
+            attn_mask = None
+            if not isinstance(self.estimator, torch.nn.Module):
+                attn_mask = self._trt_attention_mask(mask_in, streaming)
 
         estimator_session = nullcontext(None)
         if not isinstance(self.estimator, torch.nn.Module):
             session_factory = getattr(self.estimator, "estimation_session", None)
             if session_factory is not None:
-                estimator_session = session_factory(x_in, mask_in, mu_in, t_in, spks_in, cond_in)
+                session_inputs = (x_in, mask_in, mu_in, t_in, spks_in, cond_in)
+                if attn_mask is not None:
+                    session_inputs += (attn_mask,)
+                estimator_session = session_factory(*session_inputs)
 
         with estimator_session as trt_session:
             for step in range(1, len(t_span)):
@@ -161,6 +171,8 @@ class ConditionalCFM(BASECFM):
                         spks_in,
                         cond_in,
                         estimator_session=trt_session,
+                        streaming=streaming,
+                        attn_mask=attn_mask,
                     )
                 with cosyvoice3_batch_flow_profile("cosyvoice3_cfm_cfg_combine"):
                     dphi_dt, cfg_dphi_dt = torch.split(dphi_dt, [batch_size, batch_size], dim=0)
@@ -174,8 +186,17 @@ class ConditionalCFM(BASECFM):
 
         return sol[-1].float()
 
-    def forward_estimator(self, x, mask, mu, t, spks, cond, estimator_session=None):
+    def forward_estimator(
+        self, x, mask, mu, t, spks, cond, estimator_session=None, streaming: bool = False, attn_mask=None
+    ):
+        """One estimator call. ``attn_mask`` is the TensorRT engine's query-key
+        map; ``solve_euler`` builds it once per solve, and it is built here only
+        when a caller passes none."""
         if isinstance(self.estimator, torch.nn.Module):
+            # The DiT builds its own chunk map from ``streaming``; the flag is
+            # only passed when set, so the default call stays the plain one.
+            if streaming:
+                return self.estimator(x, mask, mu, t, spks, cond, streaming=True)
             return self.estimator(x, mask, mu, t, spks, cond)
         elif estimator_session is not None:
             return estimator_session.run(x, mask, mu, t, spks, cond)
@@ -186,52 +207,147 @@ class ConditionalCFM(BASECFM):
             # references to the cast buffers alive until execute completes (a bare
             # ``.contiguous().data_ptr()`` could free the temp -> dangling ptr).
             io_dtype = getattr(self.estimator, "io_dtype", x.dtype)
+            if attn_mask is None:
+                attn_mask = self._trt_attention_mask(mask, streaming)
             [estimator, stream], trt_engine = self.estimator.acquire_estimator()
-            caller_stream = torch.cuda.current_stream(x.device)
-            stream.wait_stream(caller_stream)
-            with torch.cuda.stream(stream):
-                x_e = x.to(io_dtype).contiguous()
-                mask_e = mask.to(io_dtype).contiguous()
-                mu_e = mu.to(io_dtype).contiguous()
-                t_e = t.to(io_dtype).contiguous()
-                spks_e = spks.to(io_dtype).contiguous()
-                cond_e = cond.to(io_dtype).contiguous()
-                out_e = torch.empty_like(x_e)
-                estimator.set_input_shape("x", tuple(x_e.shape))
-                estimator.set_input_shape("mask", tuple(mask_e.shape))
-                estimator.set_input_shape("mu", tuple(mu_e.shape))
-                estimator.set_input_shape("t", tuple(t_e.shape))
-                estimator.set_input_shape("spks", tuple(spks_e.shape))
-                estimator.set_input_shape("cond", tuple(cond_e.shape))
-                data_ptrs = [
-                    x_e.data_ptr(),
-                    mask_e.data_ptr(),
-                    mu_e.data_ptr(),
-                    t_e.data_ptr(),
-                    spks_e.data_ptr(),
-                    cond_e.data_ptr(),
-                    out_e.data_ptr(),
-                ]
-                for i, j in enumerate(data_ptrs):
-                    estimator.set_tensor_address(trt_engine.get_tensor_name(i), j)
-                # run trt engine
-                assert estimator.execute_async_v3(stream.cuda_stream) is True
-                for tensor in (x_e, mask_e, mu_e, t_e, spks_e, cond_e, out_e):
-                    if tensor.is_cuda:
-                        tensor.record_stream(stream)
-            caller_stream.wait_stream(stream)
-            if out_e.is_cuda:
-                out_e.record_stream(caller_stream)
-            self.estimator.release_estimator(estimator, stream)
+            # The context comes out of a bounded pool; anything that raises
+            # below (an out-of-profile shape, a failed enqueue) must still
+            # hand it back, or the next request blocks on ``acquire`` forever.
+            try:
+                caller_stream = torch.cuda.current_stream(x.device)
+                stream.wait_stream(caller_stream)
+                with torch.cuda.stream(stream):
+                    x_e = x.to(io_dtype).contiguous()
+                    mask_e = mask.to(io_dtype).contiguous()
+                    mu_e = mu.to(io_dtype).contiguous()
+                    t_e = t.to(io_dtype).contiguous()
+                    spks_e = spks.to(io_dtype).contiguous()
+                    cond_e = cond.to(io_dtype).contiguous()
+                    out_e = torch.empty_like(x_e, dtype=self.estimator.out_dtype)
+                    inputs = {
+                        "x": x_e,
+                        "mask": mask_e,
+                        "mu": mu_e,
+                        "t": t_e,
+                        "spks": spks_e,
+                        "cond": cond_e,
+                    }
+                    if attn_mask is not None:
+                        inputs["attn_mask"] = attn_mask
+                    # Bind only what the engine declares: an exporter prunes
+                    # inputs the graph never reads.
+                    declared = self.estimator.input_names
+                    inputs = {name: tensor for name, tensor in inputs.items() if name in declared}
+                    for name, tensor in inputs.items():
+                        if not estimator.set_input_shape(name, tuple(tensor.shape)):
+                            raise RuntimeError(
+                                f"TensorRT flow estimator rejected shape {tuple(tensor.shape)} for input "
+                                f"'{name}' (outside the engine's optimization profile)"
+                            )
+                        estimator.set_tensor_address(name, tensor.data_ptr())
+                    estimator.set_tensor_address("estimator_out", out_e.data_ptr())
+                    # ``assert`` would vanish under ``python -O`` and leave a
+                    # zero-filled output; check explicitly.
+                    if not estimator.execute_async_v3(stream.cuda_stream):
+                        raise RuntimeError(
+                            "TensorRT flow estimator failed to enqueue (execute_async_v3 returned False)"
+                        )
+                    for tensor in (*inputs.values(), out_e):
+                        if tensor.is_cuda:
+                            tensor.record_stream(stream)
+                caller_stream.wait_stream(stream)
+                if out_e.is_cuda:
+                    out_e.record_stream(caller_stream)
+            finally:
+                self.estimator.release_estimator(estimator, stream)
             return out_e.to(x.dtype)
+
+    def _trt_attention_mask(self, mask: torch.Tensor, streaming: bool) -> torch.Tensor | None:
+        """The query-key map for a chunk-mask TensorRT engine, or None.
+
+        A legacy engine (no ``attn_mask`` input) was traced with full
+        attention and cannot honour ``streaming``; say so once rather than
+        silently diverging from upstream's streaming semantics. The map is
+        step-invariant within a solve, so ``solve_euler`` calls this once;
+        there is no cache, whose content check would sync the host per step.
+        """
+        estimator = self.estimator
+        if not estimator.supports_attn_mask:
+            if streaming:
+                logger.warning_once(
+                    "The TensorRT flow estimator has no attn_mask input, so streaming chunks run with full "
+                    "attention instead of upstream's chunk-causal mask. Rebuild it with "
+                    "build_chunk_mask_flow_estimator_trt to align with upstream."
+                )
+            return None
+        return build_dit_attention_mask(
+            mask.bool(), streaming=streaming, static_chunk_size=estimator.static_chunk_size
+        ).contiguous()
+
+
+# Upstream CosyVoice draws the flow's initial noise from one fixed buffer,
+# ``torch.randn([1, 80, 50 * 300])`` under seed 0, and slices it by mel
+# position, so the noise at a given position is the same on every call. A
+# streaming decode regenerates its left context each chunk; with fixed noise
+# that context comes out the same as when it was emitted, which is what keeps
+# chunk boundaries consistent, and the same seed reproduces the same audio.
+_FIXED_NOISE_SEED = 0
+_FIXED_NOISE_CHANNELS = 80
+_FIXED_NOISE_FRAMES = 50 * 300
 
 
 class CausalConditionalCFM(ConditionalCFM):
     def __init__(self, in_channels, cfm_params, n_spks=1, spk_emb_dim=64, estimator: torch.nn.Module = None):
         super().__init__(in_channels, cfm_params, n_spks, spk_emb_dim, estimator)
+        # Upstream's seeded draw without touching the global RNG. On the CPU so
+        # the values match whatever device the model is built under.
+        generator = torch.Generator(device="cpu").manual_seed(_FIXED_NOISE_SEED)
+        noise = torch.randn([1, _FIXED_NOISE_CHANNELS, _FIXED_NOISE_FRAMES], generator=generator, device="cpu")
+        self.register_buffer("rand_noise", noise, persistent=False)
+
+    def fixed_noise(self, mu, prompt_len: int = 0, noise_offset=None, temperature: float = 1.0):
+        """Initial noise indexed by absolute mel position.
+
+        Positions ``[0, prompt_len)`` are the prompt and always map to the
+        start of the buffer. Positions after the prompt map to
+        ``prompt_len + noise_offset + j``, where ``noise_offset`` (one int, or
+        one per batch row) is the absolute mel index of the first post-prompt
+        frame in the stream. A bounded left context therefore reuses exactly
+        the noise its frames were first generated with. Positions past the
+        buffer wrap around.
+        """
+        batch, channels, length = mu.shape
+        if self.rand_noise.device != mu.device:
+            self.rand_noise = self.rand_noise.to(mu.device)
+        noise = self.rand_noise[0]
+        if channels != noise.shape[0]:
+            raise ValueError(f"fixed noise has {noise.shape[0]} channels, mu has {channels}")
+        if noise_offset is None:
+            noise_offset = torch.zeros(batch, dtype=torch.long, device=mu.device)
+        else:
+            noise_offset = torch.as_tensor(noise_offset, dtype=torch.long, device=mu.device).reshape(-1)
+            if noise_offset.numel() == 1:
+                noise_offset = noise_offset.expand(batch)
+        prompt_len = max(0, min(int(prompt_len), length))
+        positions = torch.arange(length, device=mu.device).unsqueeze(0).expand(batch, length)
+        shifted = positions + noise_offset.clamp(min=0).unsqueeze(1)
+        index = torch.where(positions < prompt_len, positions, shifted) % noise.shape[1]
+        # Gather first so only the used frames are cast, not the whole buffer.
+        return noise[:, index].permute(1, 0, 2).to(mu.dtype) * temperature
 
     @torch.inference_mode()
-    def forward(self, mu, mask, n_timesteps, temperature=1.0, spks=None, cond=None, streaming: bool = False):
+    def forward(
+        self,
+        mu,
+        mask,
+        n_timesteps,
+        temperature=1.0,
+        spks=None,
+        cond=None,
+        streaming: bool = False,
+        prompt_len: int = 0,
+        noise_offset=None,
+    ):
         """Forward diffusion
 
         Args:
@@ -244,6 +360,7 @@ class CausalConditionalCFM(ConditionalCFM):
             spks (torch.Tensor, optional): speaker ids. Defaults to None.
                 shape: (batch_size, spk_emb_dim)
             cond (Optional[Any], optional): Not used but kept for future purposes
+            streaming: forwarded to the DiT estimator for chunk attention.
 
         Returns:
             sample (torch.Tensor): generated mel-spectrogram
@@ -251,16 +368,8 @@ class CausalConditionalCFM(ConditionalCFM):
         """
 
         with cosyvoice3_batch_flow_profile("cosyvoice3_cfm_noise_cache"):
-            z = (
-                torch.randn(
-                    (mu.size(0), mu.size(1), mu.size(2)),
-                    device=mu.device,
-                    dtype=mu.dtype,
-                )
-                * temperature
-            )
+            z = self.fixed_noise(mu, prompt_len=prompt_len, noise_offset=noise_offset, temperature=temperature)
 
-        # fix prompt and overlap part mu and z
         with cosyvoice3_batch_flow_profile("cosyvoice3_cfm_t_span"):
             t_span = torch.linspace(0, 1, n_timesteps + 1, device=mu.device, dtype=mu.dtype)
 
@@ -268,7 +377,7 @@ class CausalConditionalCFM(ConditionalCFM):
                 t_span = 1 - torch.cos(t_span * 0.5 * torch.pi)
 
         with cosyvoice3_batch_flow_profile(f"cosyvoice3_cfm_euler_{max(1, int(n_timesteps))}_steps"):
-            return self.solve_euler(z, t_span=t_span, mu=mu, mask=mask, spks=spks, cond=cond), None
+            return self.solve_euler(z, t_span=t_span, mu=mu, mask=mask, spks=spks, cond=cond, streaming=streaming), None
 
 
 class CausalMaskedDiffWithDiT(torch.nn.Module):
@@ -340,7 +449,11 @@ class CausalMaskedDiffWithDiT(torch.nn.Module):
         streaming: bool = True,
         finalize: bool = False,
         n_timesteps: int = 10,
+        noise_offset=None,
     ):
+        """``noise_offset``: absolute mel index (int, or one per row) of the first
+        frame after the prompt, so a bounded left context keeps the noise it
+        was first generated with. Defaults to 0, the unbounded stream start."""
         with cosyvoice3_batch_flow_profile("cosyvoice3_cfm_speaker_embedding"):
             embedding = F.normalize(embedding, dim=1)
             embedding = self.spk_embed_affine_layer(embedding)
@@ -383,6 +496,8 @@ class CausalMaskedDiffWithDiT(torch.nn.Module):
             cond=conds,
             n_timesteps=max(1, int(n_timesteps)),
             streaming=streaming,
+            prompt_len=int(mel_len1),
+            noise_offset=noise_offset,
         )
 
         with cosyvoice3_batch_flow_profile("cosyvoice3_cfm_crop_prompt_mel"):
