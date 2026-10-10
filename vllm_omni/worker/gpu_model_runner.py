@@ -166,6 +166,14 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
         self._report_model_local_kv()
         self._warn_unexposed_stage_hooks(model)
 
+    def _maybe_init_encoder_cudagraph_manager(self) -> None:
+        super()._maybe_init_encoder_cudagraph_manager()
+        manager = self.encoder_cudagraph_manager
+        if manager is not None:
+            setter = getattr(self.get_model(), "set_input_local_transformer_cudagraph_manager", None)
+            if callable(setter):
+                setter(manager)
+
     # Read on the model this runner holds. A multi-stage wrapper that builds its
     # stage module as a child must re-export them, or the runner silently takes
     # the per-row, host-synchronizing default paths.

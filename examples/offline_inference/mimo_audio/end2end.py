@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
 This example shows how to use vLLM for running offline inference
 with the correct prompt format on MiMo-Audio-Omni.
@@ -183,6 +183,7 @@ def main(args):
     omni = Omni(
         model=model_name,
         deploy_config=args.deploy_config,
+        stage_overrides=args.stage_overrides,
         log_stats=args.enable_stats,
         log_file=("omni_pipeline.log" if args.enable_stats else None),
         init_sleep_seconds=args.init_sleep_seconds,
@@ -435,6 +436,15 @@ def parse_args():
         default=None,
         help="Override the deploy config path. If unset, auto-loads "
         "vllm_omni/deploy/mimo_audio.yaml based on the HF model_type.",
+    )
+    parser.add_argument(
+        "--stage-overrides",
+        type=str,
+        default=None,
+        help=(
+            "Optional JSON of per-stage overrides applied on top of the default "
+            "deploy config without writing a custom YAML."
+        ),
     )
 
     return parser.parse_args()
