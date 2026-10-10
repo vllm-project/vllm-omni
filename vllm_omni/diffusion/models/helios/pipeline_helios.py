@@ -67,6 +67,94 @@ def optimized_scale(positive_flat, negative_flat):
     return st_star
 
 
+def cfg_zero_star_alpha(noise_pred: torch.Tensor, noise_uncond: torch.Tensor) -> torch.Tensor:
+    """Adaptive scale ``alpha`` for CFG-Zero* blending.
+
+    Measures how strongly the conditional prediction aligns with the
+    unconditional one (via :func:`optimized_scale`), then reshapes ``alpha``
+    to broadcast over ``noise_pred`` and casts it back to its dtype. Shared
+    by all four denoise paths (stepwise stage1/stage2, request-mode
+    stage1/stage2).
+    """
+    batch_size = noise_pred.shape[0]
+    positive_flat = noise_pred.view(batch_size, -1)
+    negative_flat = noise_uncond.view(batch_size, -1)
+    alpha_cfg = optimized_scale(positive_flat, negative_flat)
+    alpha_cfg = alpha_cfg.view(batch_size, *([1] * (len(noise_pred.shape) - 1)))
+    return alpha_cfg.to(noise_pred.dtype)
+
+
+def cfg_zero_star_blend(
+    noise_pred: torch.Tensor,
+    noise_uncond: torch.Tensor,
+    alpha_cfg: torch.Tensor,
+    guidance_scale: float,
+) -> torch.Tensor:
+    """CFG-Zero* blend: ``uncond * alpha + scale * (cond - alpha * uncond)``.
+
+    Shared by all four denoise paths; centralising it keeps the adaptive
+    blend formula from drifting between the stepwise and request-mode paths.
+    """
+    return noise_uncond * alpha_cfg + guidance_scale * (noise_pred - noise_uncond * alpha_cfg)
+
+
+def build_transformer_kwargs(
+    *,
+    latents: torch.Tensor,
+    timestep: torch.Tensor,
+    indices_hidden_states: torch.Tensor,
+    indices_latents_history_short: torch.Tensor,
+    indices_latents_history_mid: torch.Tensor,
+    indices_latents_history_long: torch.Tensor,
+    latents_history_short: torch.Tensor,
+    latents_history_mid: torch.Tensor,
+    latents_history_long: torch.Tensor,
+    attention_kwargs: dict,
+    dtype: torch.dtype,
+) -> dict:
+    """Assemble the kwargs dict forwarded to ``self.transformer(...)``.
+
+    All four denoise paths build this identical dict; centralising it keeps
+    the transformer call signature in sync across the stepwise and
+    request-mode paths. ``latents`` and the history tensors are cast to
+    ``dtype`` here so callers pass raw tensors.
+    """
+    return {
+        "hidden_states": latents.to(dtype),
+        "timestep": timestep,
+        "indices_hidden_states": indices_hidden_states,
+        "indices_latents_history_short": indices_latents_history_short,
+        "indices_latents_history_mid": indices_latents_history_mid,
+        "indices_latents_history_long": indices_latents_history_long,
+        "latents_history_short": latents_history_short.to(dtype),
+        "latents_history_mid": latents_history_mid.to(dtype),
+        "latents_history_long": latents_history_long.to(dtype),
+        "attention_kwargs": attention_kwargs,
+        "return_dict": False,
+    }
+
+
+def stepwise_transformer_kwargs(extra: dict, latents: torch.Tensor, timestep: torch.Tensor) -> dict:
+    """Build transformer kwargs for the stepwise paths from ``state.extra``.
+
+    Thin resolver over :func:`build_transformer_kwargs` so the stepwise
+    stage1/stage2 paths do not repeat the nine ``extra`` key lookups.
+    """
+    return build_transformer_kwargs(
+        latents=latents,
+        timestep=timestep,
+        indices_hidden_states=extra["indices_hidden_states"],
+        indices_latents_history_short=extra["indices_latents_history_short"],
+        indices_latents_history_mid=extra["indices_latents_history_mid"],
+        indices_latents_history_long=extra["indices_latents_history_long"],
+        latents_history_short=extra["latents_history_short"],
+        latents_history_mid=extra["latents_history_mid"],
+        latents_history_long=extra["latents_history_long"],
+        attention_kwargs=extra["attention_kwargs"],
+        dtype=extra["dtype"],
+    )
+
+
 def load_json_config(model_path: str, subfolder: str, filename: str, local_files_only: bool = True) -> dict:
     """Load a JSON config file from a local path or HuggingFace Hub repo."""
     if local_files_only:
@@ -701,19 +789,7 @@ class HeliosPipeline(
         t = timesteps
         self._current_timestep = t
         timestep = t.expand(batch_size)
-        transformer_kwargs = {
-            "hidden_states": latents.to(extra["dtype"]),
-            "timestep": timestep,
-            "indices_hidden_states": extra["indices_hidden_states"],
-            "indices_latents_history_short": extra["indices_latents_history_short"],
-            "indices_latents_history_mid": extra["indices_latents_history_mid"],
-            "indices_latents_history_long": extra["indices_latents_history_long"],
-            "latents_history_short": extra["latents_history_short"].to(extra["dtype"]),
-            "latents_history_mid": extra["latents_history_mid"].to(extra["dtype"]),
-            "latents_history_long": extra["latents_history_long"].to(extra["dtype"]),
-            "attention_kwargs": extra["attention_kwargs"],
-            "return_dict": False,
-        }
+        transformer_kwargs = stepwise_transformer_kwargs(extra, latents, timestep)
         if extra["use_cfg_zero_star"] and state.do_true_cfg:
             noise_pred = self.transformer(
                 encoder_hidden_states=state.prompt_embeds,
@@ -723,13 +799,10 @@ class HeliosPipeline(
                 encoder_hidden_states=state.negative_prompt_embeds,
                 **transformer_kwargs,
             )[0]
-            positive_flat = noise_pred.view(batch_size, -1)
-            negative_flat = noise_uncond.view(batch_size, -1)
-            alpha_cfg = optimized_scale(positive_flat, negative_flat)
-            alpha_cfg = alpha_cfg.view(batch_size, *([1] * (len(noise_pred.shape) - 1))).to(noise_pred.dtype)
+            alpha_cfg = cfg_zero_star_alpha(noise_pred, noise_uncond)
             if (state.step_in_chunk <= extra["zero_steps"]) and extra["use_zero_init"]:
                 return noise_pred * 0.0
-            return noise_uncond * alpha_cfg + extra["guidance_scale"] * (noise_pred - noise_uncond * alpha_cfg)
+            return cfg_zero_star_blend(noise_pred, noise_uncond, alpha_cfg, extra["guidance_scale"])
 
         positive_kwargs = {
             "encoder_hidden_states": state.prompt_embeds,
@@ -760,27 +833,12 @@ class HeliosPipeline(
         assert t is not None
         self._current_timestep = t
         timestep = t.expand(batch_size).to(torch.int64)
-        transformer_kwargs = {
-            "hidden_states": latents.to(extra["dtype"]),
-            "timestep": timestep,
-            "indices_hidden_states": extra["indices_hidden_states"],
-            "indices_latents_history_short": extra["indices_latents_history_short"],
-            "indices_latents_history_mid": extra["indices_latents_history_mid"],
-            "indices_latents_history_long": extra["indices_latents_history_long"],
-            "latents_history_short": extra["latents_history_short"].to(extra["dtype"]),
-            "latents_history_mid": extra["latents_history_mid"].to(extra["dtype"]),
-            "latents_history_long": extra["latents_history_long"].to(extra["dtype"]),
-            "attention_kwargs": extra["attention_kwargs"],
-            "return_dict": False,
-        }
+        transformer_kwargs = stepwise_transformer_kwargs(extra, latents, timestep)
         noise_pred = self.transformer(encoder_hidden_states=state.prompt_embeds, **transformer_kwargs)[0]
         if state.do_true_cfg:
             noise_uncond = self.transformer(encoder_hidden_states=state.negative_prompt_embeds, **transformer_kwargs)[0]
             if extra["use_cfg_zero_star"]:
-                positive_flat = noise_pred.view(batch_size, -1)
-                negative_flat = noise_uncond.view(batch_size, -1)
-                alpha_cfg = optimized_scale(positive_flat, negative_flat)
-                alpha_cfg = alpha_cfg.view(batch_size, *([1] * (len(noise_pred.shape) - 1))).to(noise_pred.dtype)
+                alpha_cfg = cfg_zero_star_alpha(noise_pred, noise_uncond)
                 if (
                     extra["stage_index"] == 0
                     and extra["stage_step_index"] <= extra["zero_steps"]
@@ -788,9 +846,7 @@ class HeliosPipeline(
                 ):
                     noise_pred = noise_pred * 0.0
                 else:
-                    noise_pred = noise_uncond * alpha_cfg + extra["guidance_scale"] * (
-                        noise_pred - noise_uncond * alpha_cfg
-                    )
+                    noise_pred = cfg_zero_star_blend(noise_pred, noise_uncond, alpha_cfg, extra["guidance_scale"])
             else:
                 noise_pred = noise_uncond + extra["guidance_scale"] * (noise_pred - noise_uncond)
         return noise_pred
@@ -1370,19 +1426,19 @@ class HeliosPipeline(
                 self._current_timestep = t
                 timestep = t.expand(batch_size)
 
-                transformer_kwargs = {
-                    "hidden_states": latents.to(transformer_dtype),
-                    "timestep": timestep,
-                    "indices_hidden_states": indices_hidden_states,
-                    "indices_latents_history_short": indices_latents_history_short,
-                    "indices_latents_history_mid": indices_latents_history_mid,
-                    "indices_latents_history_long": indices_latents_history_long,
-                    "latents_history_short": latents_history_short.to(transformer_dtype),
-                    "latents_history_mid": latents_history_mid.to(transformer_dtype),
-                    "latents_history_long": latents_history_long.to(transformer_dtype),
-                    "attention_kwargs": attention_kwargs,
-                    "return_dict": False,
-                }
+                transformer_kwargs = build_transformer_kwargs(
+                    latents=latents,
+                    timestep=timestep,
+                    indices_hidden_states=indices_hidden_states,
+                    indices_latents_history_short=indices_latents_history_short,
+                    indices_latents_history_mid=indices_latents_history_mid,
+                    indices_latents_history_long=indices_latents_history_long,
+                    latents_history_short=latents_history_short,
+                    latents_history_mid=latents_history_mid,
+                    latents_history_long=latents_history_long,
+                    attention_kwargs=attention_kwargs,
+                    dtype=transformer_dtype,
+                )
 
                 if use_cfg_zero_star and do_true_cfg:
                     noise_pred = self.transformer(
@@ -1395,16 +1451,12 @@ class HeliosPipeline(
                         **transformer_kwargs,
                     )[0]
 
-                    positive_flat = noise_pred.view(batch_size, -1)
-                    negative_flat = noise_uncond.view(batch_size, -1)
-                    alpha_cfg = optimized_scale(positive_flat, negative_flat)
-                    alpha_cfg = alpha_cfg.view(batch_size, *([1] * (len(noise_pred.shape) - 1)))
-                    alpha_cfg = alpha_cfg.to(noise_pred.dtype)
+                    alpha_cfg = cfg_zero_star_alpha(noise_pred, noise_uncond)
 
                     if (i <= zero_steps) and use_zero_init:
                         noise_pred = noise_pred * 0.0
                     else:
-                        noise_pred = noise_uncond * alpha_cfg + guidance_scale * (noise_pred - noise_uncond * alpha_cfg)
+                        noise_pred = cfg_zero_star_blend(noise_pred, noise_uncond, alpha_cfg, guidance_scale)
                 else:
                     positive_kwargs = {
                         "encoder_hidden_states": prompt_embeds,
@@ -1534,19 +1586,19 @@ class HeliosPipeline(
                     self._current_timestep = t
                     timestep = t.expand(latents.shape[0]).to(torch.int64)
 
-                    transformer_kwargs = {
-                        "hidden_states": latents.to(transformer_dtype),
-                        "timestep": timestep,
-                        "indices_hidden_states": indices_hidden_states,
-                        "indices_latents_history_short": indices_latents_history_short,
-                        "indices_latents_history_mid": indices_latents_history_mid,
-                        "indices_latents_history_long": indices_latents_history_long,
-                        "latents_history_short": latents_history_short.to(transformer_dtype),
-                        "latents_history_mid": latents_history_mid.to(transformer_dtype),
-                        "latents_history_long": latents_history_long.to(transformer_dtype),
-                        "attention_kwargs": attention_kwargs,
-                        "return_dict": False,
-                    }
+                    transformer_kwargs = build_transformer_kwargs(
+                        latents=latents,
+                        timestep=timestep,
+                        indices_hidden_states=indices_hidden_states,
+                        indices_latents_history_short=indices_latents_history_short,
+                        indices_latents_history_mid=indices_latents_history_mid,
+                        indices_latents_history_long=indices_latents_history_long,
+                        latents_history_short=latents_history_short,
+                        latents_history_mid=latents_history_mid,
+                        latents_history_long=latents_history_long,
+                        attention_kwargs=attention_kwargs,
+                        dtype=transformer_dtype,
+                    )
 
                     noise_pred = self.transformer(
                         encoder_hidden_states=prompt_embeds,
@@ -1560,18 +1612,12 @@ class HeliosPipeline(
                         )[0]
 
                         if use_cfg_zero_star:
-                            positive_flat = noise_pred.view(batch_size, -1)
-                            negative_flat = noise_uncond.view(batch_size, -1)
-                            alpha_cfg = optimized_scale(positive_flat, negative_flat)
-                            alpha_cfg = alpha_cfg.view(batch_size, *([1] * (len(noise_pred.shape) - 1)))
-                            alpha_cfg = alpha_cfg.to(noise_pred.dtype)
+                            alpha_cfg = cfg_zero_star_alpha(noise_pred, noise_uncond)
 
                             if (i_s == 0 and idx <= zero_steps) and use_zero_init:
                                 noise_pred = noise_pred * 0.0
                             else:
-                                noise_pred = noise_uncond * alpha_cfg + guidance_scale * (
-                                    noise_pred - noise_uncond * alpha_cfg
-                                )
+                                noise_pred = cfg_zero_star_blend(noise_pred, noise_uncond, alpha_cfg, guidance_scale)
                         else:
                             noise_pred = noise_uncond + guidance_scale * (noise_pred - noise_uncond)
 
