@@ -24,6 +24,8 @@ names the thing it owns rather than a layer:
 * ``overlap_policy`` / ``commit_policy`` / ``playback_ledger`` -- the decisions
   a session makes about speech that arrives while the model is speaking, what a
   commit should do, and what the client has actually played.
+* ``tools`` -- the session-owned function-call ledger. It does not execute
+  tools and does not gate audio append.
 * ``lease`` -- the idle/activity lease that decides when a session expires.
 
 Imports here are the package's public surface; a module of this package is fair

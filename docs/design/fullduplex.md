@@ -436,7 +436,9 @@ policy that used to be two separately configured objects:
 | Half | Members |
 | --- | --- |
 | engine policy | `configure_sampling_params(runtime_config, defaults)`, `plan_append(...) -> DuplexAppendPlan` (the resumable Stage0 prompt for one unit), `decide_output(...) -> DuplexOutputDecision \| None` (e.g. the listen decision on a finished Stage0 segment) |
-| session policy | `capabilities(max_sessions)`, `validate_client_extra_body`, `prepare_runtime_config(config, model_config)` (server-owned runtime keys, reference audio resolution), `runtime_config_for_update`, `runtime_config_for_function_output`, `runtime_config_after_model_output` (consumption acknowledgement), `create_session_state() -> DuplexModelSessionState`, `data_plane: DuplexDataPlane` (projects raw stage outputs into internal events), `data_plane_context(...)` |
+| session policy | `capabilities(max_sessions)`, `validate_client_extra_body`, `prepare_runtime_config(config, model_config)` (server-owned runtime keys, reference audio resolution), `runtime_config_for_update`, `parse_function_call` (recognize one call; the session ledger owns its lifecycle), `runtime_config_for_function_output`, `runtime_config_after_model_output` (consumption acknowledgement), `create_session_state() -> DuplexModelSessionState`, `data_plane: DuplexDataPlane` (projects raw stage outputs into internal events), `data_plane_context(...)` |
+
+Function-call identity, duplicates, cancel, and stale epochs live on the session. See [Duplex session tool contract](duplex_session_tools.md).
 
 `DuplexOmniEngine._validate_deployment` loads the plugin before any stage
 starts; `DuplexSessionManager.__init__` validates it against the stage

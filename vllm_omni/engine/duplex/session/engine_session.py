@@ -43,6 +43,7 @@ from vllm_omni.engine.duplex.session.lease import (
     DuplexLeaseConfig,
     DuplexLeaseState,
 )
+from vllm_omni.engine.duplex.session.tools import DuplexToolLedger
 from vllm_omni.metrics.stats import (
     DUPLEX_STAGE_TABLE_EXCLUDE,
     OrchestratorAggregator,
@@ -218,6 +219,7 @@ class DuplexEngineSession:
     _pending_stage_metrics: list[dict[str, dict[str, object]]] = field(default_factory=list, repr=False)
     _playback: PlaybackLedger = field(default_factory=PlaybackLedger, repr=False)
     _conversation: ConversationHistory = field(default_factory=ConversationHistory, repr=False)
+    tool_ledger: DuplexToolLedger = field(default_factory=DuplexToolLedger, repr=False)
     model_state: DuplexModelSessionState | None = field(default=None, repr=False)
     projector: RealtimeProjectionState | None = field(default=None, repr=False)
     created_monotonic: float = field(default_factory=time.monotonic)
@@ -1677,6 +1679,7 @@ class DuplexEngineSession:
     def barge_in(self) -> int:
         self._log_response_aggregator()
         self.epoch += 1
+        self.tool_ledger.retire_before(self.epoch)
         self.sync_fence()
         self._response.assistant_text_buffer.clear()
         self._response.assistant_audio_text_marks.clear()

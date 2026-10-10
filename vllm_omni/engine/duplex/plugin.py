@@ -510,6 +510,16 @@ class DuplexModelPlugin(ABC):
             modalities=modalities,
         )
 
+    def parse_function_call(self, model_result: Mapping[str, object]) -> dict[str, str] | None:
+        """Recognize one function call in this model's output, or None.
+
+        The session ledger owns call identity, duplicates, cancel, and stale
+        epochs. A plugin that does not emit tool calls keeps this default.
+        A recognized call is ``{"call_id", "name", "arguments"}``.
+        """
+        del model_result
+        return None
+
     # Optional hook: build the runtime config patch for a function-call output
     # item. Plugins without tools keep the default (no change).
     def runtime_config_for_function_output(

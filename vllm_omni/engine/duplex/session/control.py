@@ -30,6 +30,7 @@ from vllm_omni.engine.duplex.session.context import DuplexSessionContext
 from vllm_omni.engine.duplex.session.emitter import SessionEmitter
 from vllm_omni.engine.duplex.session.lease import DuplexLeaseActivity
 from vllm_omni.engine.duplex.session.model_channel import ModelChannel
+from vllm_omni.engine.duplex.session.tools import DuplexToolLedgerError
 from vllm_omni.engine.duplex.turn_detection import (
     PendingTurnDetectionUpdate,
     ServerTurnDetector,
@@ -296,6 +297,12 @@ class SessionControl:
         if item_type == "function_call_output" and isinstance(item, dict):
             if not await self._wait_for_append_tail():
                 return
+            call_id = item.get("call_id")
+            try:
+                session.tool_ledger.accept_result(call_id if isinstance(call_id, str) else "", epoch=session.epoch)
+            except DuplexToolLedgerError as exc:
+                self._out.emit_error(exc.code, str(exc))
+                return
             try:
                 candidate_runtime_config = self._ctx.plugin.runtime_config_for_function_output(
                     session.config,
@@ -307,6 +314,11 @@ class SessionControl:
                 return
             if candidate_runtime_config is not None:
                 session.replace_runtime_config(candidate_runtime_config)
+                if (
+                    candidate_runtime_config.get("tool_followup_ready") is True
+                    and session.capabilities.supports_text_only_turn
+                ):
+                    session.notify_new_user_item()
             self._out.emit(
                 {
                     "type": "conversation.item.created",

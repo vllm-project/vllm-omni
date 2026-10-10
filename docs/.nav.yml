@@ -137,6 +137,7 @@ nav:
         - Prefill/Decode Phase Contract: design/feature/preprocess_phase_contract.md
         - Automatic Prefix Caching: design/feature/prefix_caching.md
         - Realtime AR-Diffusion: design/feature/realtime_ar_diffusion.md
+        - Duplex Session Tool Contract: design/duplex_session_tools.md
       - Communication:
         - OmniConnector Implementations:
           - Mooncake Store Connector: design/feature/omni_connectors/mooncake_store_connector.md

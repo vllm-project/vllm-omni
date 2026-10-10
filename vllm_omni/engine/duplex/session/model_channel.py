@@ -52,6 +52,7 @@ from vllm_omni.engine.duplex.session.context import DuplexSessionContext, StageO
 from vllm_omni.engine.duplex.session.emitter import SessionEmitter
 from vllm_omni.engine.duplex.session.engine_session import DuplexEngineSession, DuplexFenceMismatchError
 from vllm_omni.engine.duplex.session.lease import DuplexLeaseActivity
+from vllm_omni.engine.duplex.session.tools import DuplexToolLedgerError
 from vllm_omni.metrics.stats import OrchestratorAggregator, StageRequestStats
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.outputs.duplex import attach_duplex_output_decision
@@ -60,6 +61,43 @@ if TYPE_CHECKING:
     from vllm.outputs import RequestOutput
 
 logger = init_logger(__name__)
+
+_INVALID_FUNCTION_CALL = object()
+
+
+def _coerce_function_call(raw: object) -> dict[str, str] | None:
+    if not isinstance(raw, Mapping):
+        return None
+    call_id = raw.get("call_id")
+    name = raw.get("name")
+    arguments = raw.get("arguments", "")
+    if not isinstance(call_id, str) or not call_id or not isinstance(name, str) or not name:
+        return None
+    if not isinstance(arguments, str):
+        arguments = str(arguments)
+    return {"call_id": call_id, "name": name, "arguments": arguments}
+
+
+def _recognized_function_call(plugin: object, model_result: Mapping[str, object]) -> dict[str, str] | object | None:
+    """Plugin parse first; otherwise the legacy ``function_call`` flag.
+
+    A plugin dict that is not a call is ``_INVALID_FUNCTION_CALL``. A missing
+    legacy ``call_id``/``name`` returns None so the caller can still project
+    the raw event without opening a ledger row.
+    """
+    parsed = plugin.parse_function_call(model_result)  # type: ignore[attr-defined]
+    if parsed is not None:
+        call = _coerce_function_call(parsed)
+        return call if call is not None else _INVALID_FUNCTION_CALL
+    if model_result.get("function_call") is not True:
+        return None
+    return _coerce_function_call(
+        {
+            "call_id": model_result.get("call_id"),
+            "name": model_result.get("name"),
+            "arguments": model_result.get("arguments", ""),
+        }
+    )
 
 
 class SilenceContinuationScheduler(Protocol):
@@ -847,7 +885,37 @@ class ModelChannel:
         if isinstance(model_result.get("error_code"), str):
             self._fail_response_from_model_error(model_result)
             return close_reason, True
+        function_call = _recognized_function_call(self._ctx.plugin, model_result)
+        if function_call is _INVALID_FUNCTION_CALL:
+            self._out.emit_error(
+                "invalid_function_call",
+                "A recognized function call requires call_id and name",
+            )
+            return close_reason, True
+        if isinstance(function_call, dict):
+            try:
+                session.tool_ledger.open_call(
+                    call_id=function_call["call_id"],
+                    name=function_call["name"],
+                    arguments=function_call["arguments"],
+                    epoch=session.epoch,
+                )
+            except DuplexToolLedgerError as exc:
+                self._out.emit_error(exc.code, str(exc))
+                return close_reason, True
+            self._out.emit(
+                {
+                    "type": "function_call.done",
+                    "session_id": session.session_id,
+                    "epoch": session.epoch,
+                    "call_id": function_call["call_id"],
+                    "name": function_call["name"],
+                    "arguments": function_call["arguments"],
+                }
+            )
+            return close_reason, True
         if model_result.get("function_call") is True:
+            # Malformed legacy flag: still project, without opening a ledger row.
             self._out.emit(
                 {
                     "type": "function_call.done",
