@@ -52,6 +52,7 @@ Load a PEFT-format LoRA adapter at initialization. The adapter is pre-loaded int
 
 ```python
 from vllm_omni import Omni
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.lora.request import LoRARequest
 
 lora_path = "/path/to/lora_adapter"
@@ -69,9 +70,50 @@ lora_request = LoRARequest(
 )
 
 outputs = omni.generate(
-    prompt="A piece of cheesecake",
-    lora_request=lora_request,
-    lora_scale=2.0, # optional arg, default 1.0
+    "A piece of cheesecake",
+    OmniDiffusionSamplingParams(
+        lora_request=lora_request,
+        lora_scale=2.0,  # optional, default 1.0
+    ),
+)
+```
+
+A diffusion stage takes its adapter from `OmniDiffusionSamplingParams.lora_request`,
+not from the `lora_request` argument of `Omni.generate` (see below).
+
+#### LoRA for the LLM/AR stage of a multi-stage model
+
+`Omni.generate(..., lora_request=...)` applies an adapter to the stage-0 LLM/AR
+stage, with the same semantics as vLLM's `LLM.generate`:
+
+- A single `LoRARequest` applies to every prompt.
+- A sequence must have one entry per prompt (otherwise `ValueError`); the i-th
+  entry is used for the i-th prompt, and `None` means no adapter for that prompt.
+
+Stage 0 must be started with LoRA enabled, using stage-scoped keys (see
+[Stage Configs](../../configuration/stage_configs.md)). Otherwise
+`Omni.generate` raises `ValueError` before submitting anything.
+
+This argument is not forwarded to later stages or to CFG companion requests.
+Each diffusion stage uses the `lora_request` in its own
+`OmniDiffusionSamplingParams`, so `Omni.generate` raises `ValueError` if a
+`lora_request` is given when stage 0 is a diffusion stage, or when prefill-decode
+disaggregation is enabled (the decode stage would run without the adapter).
+
+```python
+from vllm_omni import Omni
+from vllm_omni.lora.request import LoRARequest
+
+omni = Omni(
+    model="<model>",
+    stage_overrides={"0": {"enable_lora": True, "max_lora_rank": 16, "max_loras": 2}},
+)
+lora_a = LoRARequest(lora_name="adapter_a", lora_int_id=1, lora_path="/path/to/adapter_a")
+lora_b = LoRARequest(lora_name="adapter_b", lora_int_id=2, lora_path="/path/to/adapter_b")
+
+outputs = omni.generate(
+    ["prompt with adapter A", "prompt without adapter", "prompt with adapter B"],
+    lora_request=[lora_a, None, lora_b],
 )
 ```
 
@@ -102,7 +144,7 @@ omni = Omni(
     lora_backend="distill",
 )
 
-outputs = omni.generate(prompt="A piece of cheesecake")
+outputs = omni.generate("A piece of cheesecake")
 ```
 
 Multi-file example (Wan2.2 MoE, high + low noise):
