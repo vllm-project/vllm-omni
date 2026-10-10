@@ -33,7 +33,7 @@ from vllm.v1.engine.utils import (
 )
 from vllm.v1.executor.uniproc_executor import UniProcExecutor
 
-from vllm_omni.distributed.omni_coordinator import create_stage_coord_client
+from vllm_omni.distributed.omni_coordinator import create_stage_coord_client, detect_topology_domain
 from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.engine.stage_init_utils import (
     maybe_apply_cfg_scheduler_patches,
@@ -274,6 +274,7 @@ class StageEngineCoreProc(EngineCoreProc):
                     output_addr=addresses.outputs[0],
                     stage_id=int(omni_stage_id),
                     queue_length_getter=scheduler.get_num_unfinished_requests,
+                    topology_domain=detect_topology_domain(),
                 )
 
             def wakeup_engine() -> None:

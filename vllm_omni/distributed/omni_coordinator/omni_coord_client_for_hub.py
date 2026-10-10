@@ -55,6 +55,7 @@ class OmniCoordClientForHub:
                     queue_length=int(rep["queue_length"]),
                     last_heartbeat=float(rep["last_heartbeat"]),
                     registered_at=float(rep["registered_at"]),
+                    topology_domain=rep.get("topology_domain"),
                 )
             )
 

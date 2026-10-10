@@ -12,6 +12,8 @@ from vllm.v1.utils import get_engine_client_zmq_addr
 from vllm_omni.distributed.omni_coordinator import (
     OmniCoordClientForStage,
     OmniCoordinator,
+    ReplicaEvent,
+    ReplicaInfo,
     ReplicaStatus,
 )
 
@@ -187,6 +189,36 @@ def test_omni_coordinator_registration_broadcast():
     coordinator.close()
     sub.close(0)
     sub_ctx.term()
+
+
+def test_replica_update_refreshes_topology_domain() -> None:
+    """A replica reusing its input address must not retain stale locality."""
+    coordinator = OmniCoordinator.__new__(OmniCoordinator)
+    coordinator._replicas = {
+        "tcp://stage:topology": ReplicaInfo(
+            input_addr="tcp://stage:topology",
+            output_addr="tcp://stage:topology-out",
+            stage_id=0,
+            status=ReplicaStatus.UP,
+            queue_length=0,
+            last_heartbeat=time.time(),
+            registered_at=time.time(),
+            topology_domain="node-a/numa:0",
+        )
+    }
+    event = ReplicaEvent(
+        input_addr="tcp://stage:topology",
+        output_addr="tcp://stage:topology-out",
+        stage_id=0,
+        event_type="update",
+        status=ReplicaStatus.UP,
+        queue_length=0,
+        topology_domain="node-a/numa:1",
+    )
+
+    coordinator._update_replica_info_locked(event)
+
+    assert coordinator._replicas[event.input_addr].topology_domain == "node-a/numa:1"
 
 
 def test_omni_coordinator_heartbeat_timeout_handling():
