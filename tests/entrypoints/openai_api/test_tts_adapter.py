@@ -44,7 +44,9 @@ from vllm_omni.entrypoints.openai.tts_adapters.indextts2 import (
 )
 from vllm_omni.entrypoints.openai.tts_adapters.ming_flash_omni_tts import MingFlashOmniTTSAdapter
 from vllm_omni.entrypoints.openai.tts_adapters.moss_tts import (
+    MOSS_TTS_EFFECTIVE_MAX_TOKENS_KEY,
     MossTTSAdapter,
+    MossTTSCodecLimitError,
     MossTTSNanoAdapter,
 )
 from vllm_omni.entrypoints.openai.tts_adapters.qwen3_tts import (
@@ -862,6 +864,136 @@ def test_qwen3_tts_rejects_only_length_finished_base_audio(mocker):
     # engine terminal reason still makes this an unambiguous limit failure.
     with pytest.raises(Qwen3TTSCodecLimitError, match="191/192"):
         adapter.validate_generation(params, stage0_finish_reason="length", output_tokens=191)
+
+
+@pytest.mark.parametrize(
+    ("text_tokens", "request_cap", "expected_cap"),
+    [
+        (0, None, 4096),
+        (10, None, 192),
+        (23, None, 276),
+        (23, 128, 128),
+        (23, 512, 512),
+        (400, None, 4096),
+    ],
+)
+def test_moss_tts_applies_text_scaled_codec_safety_limit(text_tokens, request_cap, expected_cap, mocker):
+    server = mocker.Mock()
+    server._count_usage_text_tokens.return_value = text_tokens
+    adapter = MossTTSAdapter(SpeechServingContext(server=server))
+    stage_defaults = [SamplingParams(max_tokens=4096, min_tokens=2)]
+    request = OpenAICreateSpeechRequest(
+        input="test text",
+        max_new_tokens=request_cap,
+    )
+    prompt: dict[str, Any] = {"additional_information": {}}
+
+    overridden = adapter.apply_sampling_overrides(stage_defaults, request, prompt)
+
+    assert overridden[0].max_tokens == expected_cap
+    assert prompt["additional_information"][MOSS_TTS_EFFECTIVE_MAX_TOKENS_KEY] == [expected_cap]
+    assert stage_defaults[0].max_tokens == 4096
+
+
+def test_moss_tts_rejects_length_finished_generation(mocker):
+    adapter = MossTTSAdapter(SpeechServingContext(server=mocker.Mock()))
+    params = {
+        MOSS_TTS_EFFECTIVE_MAX_TOKENS_KEY: [192],
+    }
+
+    # Normal finish (EOS / stop) is valid.
+    adapter.validate_generation(params, stage0_finish_reason="stop", output_tokens=192)
+    adapter.validate_generation(params, stage0_finish_reason=None, output_tokens=192)
+
+    # Length-finished means the budget was exhausted without EOS.
+    with pytest.raises(MossTTSCodecLimitError, match="191/192"):
+        adapter.validate_generation(params, stage0_finish_reason="length", output_tokens=191)
+
+
+def test_moss_tts_validate_generation_skips_without_cap_key(mocker):
+    adapter = MossTTSAdapter(SpeechServingContext(server=mocker.Mock()))
+    params: dict[str, Any] = {}
+    adapter.validate_generation(params, stage0_finish_reason="length", output_tokens=999)
+
+
+def test_moss_tts_sound_effect_duration_preserves_requested_frames(mocker):
+    """P1: SoundEffect duration_seconds must not be truncated by the dynamic cap.
+
+    duration_seconds=30 → 375 frames (30×12.5). With 10 text tokens the
+    text-scaled cap would be 192, but the duration request must win.
+    """
+    server = mocker.Mock()
+    server._count_usage_text_tokens.return_value = 10
+    adapter = MossTTSAdapter(SpeechServingContext(server=server))
+    adapter._moss_variant = "sound_effect"
+    stage_defaults = [SamplingParams(max_tokens=4096, min_tokens=2)]
+    request = OpenAICreateSpeechRequest(
+        input="boom",
+        duration_seconds=30,
+    )
+    prompt: dict[str, Any] = {"additional_information": {}}
+
+    overridden = adapter.apply_sampling_overrides(stage_defaults, request, prompt)
+
+    # 375 = max(192, 10*12=120) → max(192, 375) = 375
+    assert overridden[0].max_tokens == 375
+    assert prompt["additional_information"][MOSS_TTS_EFFECTIVE_MAX_TOKENS_KEY] == [375]
+
+
+def test_moss_tts_sound_effect_no_duration_uses_text_cap(mocker):
+    """SoundEffect without duration_seconds falls back to the text-scaled cap."""
+    server = mocker.Mock()
+    server._count_usage_text_tokens.return_value = 10
+    adapter = MossTTSAdapter(SpeechServingContext(server=server))
+    adapter._moss_variant = "sound_effect"
+    stage_defaults = [SamplingParams(max_tokens=4096, min_tokens=2)]
+    request = OpenAICreateSpeechRequest(input="boom")
+    prompt: dict[str, Any] = {"additional_information": {}}
+
+    overridden = adapter.apply_sampling_overrides(stage_defaults, request, prompt)
+
+    # No duration → text-scaled: max(192, 10*12=120) = 192
+    assert overridden[0].max_tokens == 192
+
+
+def test_moss_tts_nano_excluded_from_dynamic_cap(mocker):
+    """P2: Nano must not get a max_tokens cap — its frame count is controlled
+    via additional_information['max_new_frames'], not SamplingParams.max_tokens.
+    """
+    server = mocker.Mock()
+    server._count_usage_text_tokens.return_value = 10
+    adapter = MossTTSNanoAdapter(SpeechServingContext(server=server))
+    # Nano variant is None
+    assert adapter._moss_variant is None
+    stage_defaults = [SamplingParams(max_tokens=4096, min_tokens=2)]
+    request = OpenAICreateSpeechRequest(input="hello")
+    prompt: dict[str, Any] = {"additional_information": {}}
+
+    overridden = adapter.apply_sampling_overrides(stage_defaults, request, prompt)
+
+    # max_tokens unchanged — Nano's generator ignores it
+    assert overridden[0].max_tokens == 4096
+    # No cap key written — validate_generation must not fire for Nano
+    assert MOSS_TTS_EFFECTIVE_MAX_TOKENS_KEY not in prompt["additional_information"]
+
+
+def test_moss_tts_seed_does_not_mutate_shared_defaults(mocker):
+    """Shallow-copy must not leak tts_local_seed into the shared defaults dict."""
+    shared_extra_args = {"custom_arg": 1}
+    server = mocker.Mock()
+    server._count_usage_text_tokens.return_value = 10
+    adapter = MossTTSAdapter(SpeechServingContext(server=server))
+    adapter._moss_variant = "tts"
+    stage_defaults = [SamplingParams(max_tokens=4096, min_tokens=2, seed=42, extra_args=shared_extra_args)]
+    request = OpenAICreateSpeechRequest(input="hello")
+    prompt: dict[str, Any] = {"additional_information": {}}
+
+    overridden = adapter.apply_sampling_overrides(stage_defaults, request, prompt)
+
+    assert overridden[0].extra_args["tts_local_seed"] == 42
+    # The shared defaults dict must not be mutated
+    assert "tts_local_seed" not in shared_extra_args
+    assert shared_extra_args == {"custom_arg": 1}
 
 
 def test_indextts_adapters_are_versioned():

@@ -32,6 +32,36 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+MOSS_TTS_EFFECTIVE_MAX_TOKENS_KEY = "_moss_tts_effective_max_tokens"
+_MIN_CODEC_FRAMES = 192
+_MAX_CODEC_FRAMES_PER_TEXT_TOKEN = 12
+
+
+class MossTTSCodecLimitError(TTSGenerationError):
+    """MOSS-TTS exhausted its codec budget without emitting EOS."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message, retryable=True)
+
+
+def _propagate_seed(stage0_params: Any) -> None:
+    """Propagate the deploy/YAML stage seed to tts_local_seed.
+
+    Deep-copies ``extra_args`` so the shared defaults dict is not mutated.
+    The generic serving layer applies an explicit request.seed afterwards,
+    so the request value still has higher precedence.
+    """
+    import copy
+
+    default_seed = getattr(stage0_params, "seed", None)
+    if default_seed is None:
+        return
+    if stage0_params.extra_args is None:
+        stage0_params.extra_args = {}
+    else:
+        stage0_params.extra_args = copy.copy(stage0_params.extra_args)
+    stage0_params.extra_args.setdefault("tts_local_seed", int(default_seed))
+
 
 def _local_continuation_prompt(proc: Any, user_kwargs: dict[str, Any], reference: Any) -> tuple[list[int], Any] | None:
     """Build the Local-v1.5 continuation prompt without the generic processor call.
@@ -88,6 +118,7 @@ def _local_continuation_prompt(proc: Any, user_kwargs: dict[str, Any], reference
 
 class _MossTTSAdapterBase(ARTTSAdapter):
     accumulate_nonstreaming: bool = False
+    validates_generation: bool = True
 
     def __init__(self, ctx) -> None:
         super().__init__(ctx)
@@ -647,7 +678,123 @@ class _MossTTSAdapterBase(ARTTSAdapter):
         prompt: dict | None = None,
         request_id: str | None = None,
     ) -> list:
-        return apply_max_new_tokens(sampling_params_list, request)
+        """Apply a text-scaled dynamic codec token budget.
+
+        MOSS-TTS can rarely enter a repetitive sampling state in which codec
+        EOS is never reached. A fixed ceiling (default 4096 frames ≈ 5.5 min)
+        turns that into minutes of unusable audio occupying a GPU decode slot.
+        Bound the default budget by text length, while preserving an explicit
+        caller ``max_new_tokens`` override.
+
+        Mirrors the Qwen3-TTS pattern: ``dynamic_cap = max(192, text_tokens × 12)``,
+        clamped to the configured ``max_tokens``.
+
+        Nano (``_moss_variant is None``) is excluded: its outer scheduler
+        steps represent audio chunks, not codec frames, and the frame count
+        is controlled via ``additional_information["max_new_frames"]``
+        (default 375), not ``SamplingParams.max_tokens``.
+        """
+        del request_id
+
+        sampling_params_list = apply_max_new_tokens(sampling_params_list, request)
+
+        # Shallow-copy stage 0 so the shared defaults stay immutable.
+        import copy
+
+        sampling_params_list = [copy.copy(params) for params in sampling_params_list]
+        stage0_params = sampling_params_list[0]
+
+        # Nano's generation contract is frame-count based
+        # (additional_information["max_new_frames"]), not max_tokens. Applying
+        # a max_tokens cap there has no effect on the actual generator and
+        # causes validate_generation to misreport a length finish.
+        if self._moss_variant is None:
+            _propagate_seed(stage0_params)
+            return sampling_params_list
+
+        configured_cap = getattr(stage0_params, "max_tokens", None)
+        effective_cap: int | None
+
+        if request.max_new_tokens is not None:
+            # An explicit request budget is an opt-out from the dynamic ceiling.
+            effective_cap = int(request.max_new_tokens)
+        else:
+            text_tokens = self.ctx.server._count_usage_text_tokens(request.input)
+            if text_tokens > 0:
+                dynamic_cap = max(_MIN_CODEC_FRAMES, text_tokens * _MAX_CODEC_FRAMES_PER_TEXT_TOKEN)
+
+                # SoundEffect: an explicit duration_seconds requests a specific
+                # number of frames (12.5 frames/sec). The dynamic cap must not
+                # truncate that — otherwise the generation ends with "length"
+                # and retries with the same cap, burning a decode slot.
+                if self._moss_variant == "sound_effect" and getattr(request, "duration_seconds", None) is not None:
+                    duration_tokens = max(1, int(float(request.duration_seconds) * 12.5))
+                    dynamic_cap = max(dynamic_cap, duration_tokens)
+
+                effective_cap = min(dynamic_cap, int(configured_cap)) if configured_cap is not None else dynamic_cap
+            else:
+                # Token counting is best-effort. If the tokenizer is missing or
+                # rejects the input, preserve the configured budget instead of
+                # truncating an otherwise valid request at the minimum ceiling.
+                effective_cap = int(configured_cap) if configured_cap is not None else None
+
+        if effective_cap is not None:
+            effective_cap = max(1, effective_cap)
+            stage0_params.max_tokens = effective_cap
+            stage0_params.min_tokens = min(
+                int(getattr(stage0_params, "min_tokens", 0) or 0),
+                effective_cap,
+            )
+
+        if isinstance(prompt, dict):
+            additional_information = prompt.get("additional_information")
+            if isinstance(additional_information, dict) and effective_cap is not None:
+                additional_information[MOSS_TTS_EFFECTIVE_MAX_TOKENS_KEY] = [effective_cap]
+
+        _propagate_seed(stage0_params)
+
+        logger.debug(
+            "MOSS-TTS codec budget: configured_cap=%s request_cap=%s effective_cap=%s",
+            configured_cap,
+            request.max_new_tokens,
+            effective_cap,
+        )
+        return sampling_params_list
+
+    def validate_generation(
+        self,
+        tts_params: Any,
+        *,
+        stage0_finish_reason: str | None,
+        output_tokens: int,
+    ) -> None:
+        """Reject a generation that hit the token budget without emitting EOS.
+
+        A ``length`` finish reason means the talker exhausted ``max_tokens``
+        without producing codec EOS — the audio is incomplete and likely
+        degenerate (repetitive sampling). Surface it as a retryable error so
+        the client can retry with a fresh sampling seed.
+        """
+        from collections.abc import Mapping
+
+        if not isinstance(tts_params, Mapping):
+            return
+        if MOSS_TTS_EFFECTIVE_MAX_TOKENS_KEY not in tts_params:
+            return
+        if stage0_finish_reason != "length":
+            return
+
+        raw_limit = tts_params.get(MOSS_TTS_EFFECTIVE_MAX_TOKENS_KEY)
+        if isinstance(raw_limit, (list, tuple)):
+            raw_limit = raw_limit[0] if raw_limit else None
+        try:
+            limit = int(raw_limit) if isinstance(raw_limit, (str, bytes, bytearray, int, float)) else 0
+        except (TypeError, ValueError):
+            limit = 0
+        raise MossTTSCodecLimitError(
+            "MOSS-TTS did not emit codec EOS before its token budget "
+            f"({output_tokens}/{limit} codec tokens); the generated audio is incomplete."
+        )
 
 
 @register_tts_adapter
