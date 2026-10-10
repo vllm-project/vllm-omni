@@ -71,7 +71,7 @@ FLASH_T_GRID = [0.0, 0.07612049579620361, 0.2928932309150696, 0.6173166036605835
 CKPT_DIR = os.environ.get("AUK_OMNI_CKPT_DIR") or os.environ.get("AUK_CKPT_DIR")
 PARITY_REF = os.environ.get("AUK_PARITY_REF")
 # An assembled directory is the only thing this pipeline can load.
-IS_ASSEMBLED = bool(CKPT_DIR) and (Path(CKPT_DIR).expanduser() / "config.json").is_file()
+IS_ASSEMBLED = CKPT_DIR is not None and (Path(CKPT_DIR).expanduser() / "config.json").is_file()
 
 # Measured on the released base checkpoint: mean frame cosine 0.961 to 0.968,
 # relative latent MSE 0.051 to 0.063, log-mel distance 0.34. That spread is
@@ -155,7 +155,7 @@ class _StubVAE(nn.Module):
 
     def decode(self, latents: torch.Tensor) -> torch.Tensor:
         self.decode_calls += 1
-        return torch.zeros(1, latents.shape[1] * HOP, device=latents.device)
+        return torch.zeros(latents.shape[0], latents.shape[1] * HOP, device=latents.device)
 
     def decode_context_frames(self) -> tuple[int, int]:
         # A stateless stub: no context, so any tile size is valid.
@@ -167,8 +167,17 @@ def _stub_sampler(calls: list[dict[str, Any]]):
 
     def sample_latents(dit: nn.Module, **kwargs: Any) -> torch.Tensor:
         calls.append(kwargs)
-        shape = (1, kwargs["gen_frames"], kwargs["latent_dim"])
+        shape = (kwargs["text"].shape[0], kwargs["gen_frames"], kwargs["latent_dim"])
         generator = kwargs.get("generator")
+        if isinstance(generator, list):
+            return torch.stack(
+                [
+                    torch.randn(*shape[1:], generator=g, device=kwargs["device"], dtype=kwargs["dtype"])
+                    if g is not None
+                    else torch.zeros(*shape[1:], device=kwargs["device"], dtype=kwargs["dtype"])
+                    for g in generator
+                ]
+            )
         if generator is None:
             return torch.zeros(*shape, device=kwargs["device"], dtype=kwargs["dtype"])
         return torch.randn(*shape, generator=generator, device=kwargs["device"], dtype=kwargs["dtype"])
@@ -396,7 +405,7 @@ class TestRequestParsing:
 
         assert pipeline.support_audio_output is True
         assert pipeline.audio_sample_rate == SAMPLE_RATE
-        assert pipeline.supports_request_batch is False
+        assert pipeline.supports_request_batch is True
         # The warmup request cannot carry an encoder-stage text condition.
         assert pipeline.dummy_run_num_frames == 0
 
@@ -529,7 +538,7 @@ class TestRequestParsing:
 
         pipeline.setup_compile()
 
-        warmup.assert_called_once_with(pipeline.device)
+        warmup.assert_called_once_with(pipeline.device, batch_sizes=pipeline._vae_warmup_batches)
         # Regional is the default: the DiT's repeated blocks are compiled.
         regional.assert_called_once_with(pipeline.dit, dynamic=pipeline.od_config.diffusion_compile_dynamic)
 
@@ -550,7 +559,7 @@ class TestRequestParsing:
 
     @pytest.mark.parametrize("variant, cfg", [("base", 2.0), ("flash", 0.0)])
     def test_setup_compile_warms_the_dit_graph_buckets(self, build_pipeline, mocker, variant, cfg):
-        pipeline, _ = build_pipeline(variant)
+        pipeline, _ = build_pipeline(variant, model_config={"auk_dit_warmup_nfe": 4})
         mocker.patch.object(pipeline.vae_decode, "warmup")
         mocker.patch.object(pipeline_auk, "regionally_compile")
         wrapper = mocker.Mock(enabled=True)
@@ -558,12 +567,37 @@ class TestRequestParsing:
 
         pipeline.setup_compile()
 
-        shapes = [(call.kwargs["x"].shape[1], call.kwargs["ref"].shape[1]) for call in wrapper.call_args_list]
-        assert shapes == [(150, 0), (300, 0), (600, 0), (150, 150), (300, 150), (600, 150)]
-        for call in wrapper.call_args_list:
+        calls = wrapper.sample_loop.call_args_list
+        if variant == "base":
+            default = [call for call in calls if call.kwargs["timesteps"].numel() == 33]
+            serving = [call for call in calls if call.kwargs["timesteps"].numel() == 5]
+            assert [(call.kwargs["x"].shape[1], call.kwargs["ref"].shape[1]) for call in default] == [
+                (150, 0),
+                (300, 0),
+                (600, 0),
+                (150, 150),
+                (300, 150),
+                (600, 150),
+            ]
+            assert [(call.kwargs["x"].shape[1], call.kwargs["ref"].shape[1]) for call in serving] == [
+                (150, 0),
+                (300, 0),
+                (600, 0),
+            ]
+            assert all(call.kwargs["x"].shape[0] == 1 for call in calls)
+        else:
+            assert [(call.kwargs["x"].shape[1], call.kwargs["ref"].shape[1]) for call in calls] == [
+                (150, 0),
+                (300, 0),
+                (600, 0),
+                (150, 150),
+                (300, 150),
+                (600, 150),
+            ]
+            assert all(call.kwargs["timesteps"].numel() == 5 for call in calls)
+        for call in calls:
             assert call.kwargs["cfg_strength"] == cfg
-            assert call.kwargs["new_request"] is True
-            assert call.kwargs["text"].shape == (1, 96, TEXT_HIDDEN_DIM)
+            assert call.kwargs["text"].shape[-2:] == (96, TEXT_HIDDEN_DIM)
 
     @pytest.mark.parametrize("model_config, enabled", [({"auk_dit_warmup_frames": []}, True), ({}, False)])
     def test_dit_warmup_can_be_skipped(self, build_pipeline, mocker, model_config, enabled):
@@ -574,6 +608,22 @@ class TestRequestParsing:
         pipeline._warmup_dit()
 
         wrapper.assert_not_called()
+        wrapper.sample_loop.assert_not_called()
+
+    def test_dit_warmup_captures_serving_batch(self, build_pipeline, mocker):
+        pipeline, _ = build_pipeline(model_config={"auk_dit_warmup_nfe": 4})
+        pipeline._vae_warmup_batches = (1, 8)
+        wrapper = mocker.Mock(enabled=True)
+        pipeline.cudagraph_wrapper = wrapper
+
+        pipeline._warmup_dit()
+
+        big = [call for call in wrapper.sample_loop.call_args_list if call.kwargs["x"].shape[0] == 8]
+        assert len(big) == 1
+        assert big[0].kwargs["x"].shape[1] == 150
+        assert big[0].kwargs["ref"].shape[1] == 0
+        assert big[0].kwargs["timesteps"].numel() == 5
+        assert big[0].kwargs["text"].shape == (8, 96, TEXT_HIDDEN_DIM)
 
     def test_latent_output_type_skips_the_decoder(self, build_pipeline):
         pipeline, _ = build_pipeline()
@@ -626,13 +676,54 @@ class TestRequestParsing:
             pipeline.forward(_batch(_prompt(audio=clip, knobs={"gen_seconds": 1.0}), seed=1))
         assert len(pipeline._ref_cache) == 2
 
-    def test_one_request_per_forward(self, build_pipeline):
+    def test_multiple_requests_per_forward(self, build_pipeline):
         pipeline, _ = build_pipeline()
         batch = _batch(_prompt(knobs={"gen_seconds": 1.0}), seed=1)
-        batch.requests.append(batch.requests[0])
+        req2 = OmniDiffusionRequest(
+            prompt=_prompt(knobs={"gen_seconds": 1.0}),
+            sampling_params=OmniDiffusionSamplingParams(seed=2),
+            request_id="auk-test-1",
+        )
+        batch.requests.append(req2)
 
-        with pytest.raises(AssertionError, match="one request per forward"):
-            pipeline.forward(batch)
+        outputs = pipeline.forward(batch)
+        assert len(outputs) == 2
+
+    def test_batch_groups_schedules_and_preserves_output_order(self, build_pipeline):
+        pipeline, calls = build_pipeline()
+        requests = [
+            _batch(
+                _prompt(audio=_silence(ref_seconds) if ref_seconds else None, knobs={"gen_seconds": seconds}),
+                seed=seed,
+                output_type="latent",
+            ).requests[0]
+            for seconds, ref_seconds, seed in [(1.0, 0.0, 7), (2.0, 0.5, 11), (1.0, 1.0, 17)]
+        ]
+        requests[2].prompt["prompt_embeds"] = torch.ones(5, TEXT_HIDDEN_DIM)
+        outputs = pipeline.forward(DiffusionRequestBatch(requests))
+        assert len(calls) == 2
+        assert [call["text"].shape[0] for call in calls] == [2, 1]
+        assert calls[0]["c_mask"].sum(dim=1).tolist() == [8, 5]
+        assert calls[0]["ref_mask"].sum(dim=1).tolist() == [0, 50]
+        for output, (seconds, seed) in zip(outputs, [(1.0, 7), (2.0, 11), (1.0, 17)]):
+            expected = torch.randn(
+                1, int(seconds * SAMPLE_RATE / HOP), LATENT_DIM, generator=torch.Generator().manual_seed(seed)
+            )
+            torch.testing.assert_close(output.output, expected, atol=0, rtol=0)
+        assert pipeline.vae.decode_calls == 0
+
+    def test_reference_encoding_runs_under_inference_mode(self, build_pipeline, mocker):
+        pipeline, _ = build_pipeline()
+        encode = pipeline.vae.encode
+        states = []
+
+        def record_mode(*args, **kwargs):
+            states.append(torch.is_inference_mode_enabled())
+            return encode(*args, **kwargs)
+
+        mocker.patch.object(pipeline.vae, "encode", side_effect=record_mode)
+        pipeline.forward(_batch(_prompt(audio=_silence(1.0), knobs={"gen_seconds": 1.0}), seed=1))
+        assert states == [True]
 
 
 def _reference_audio_path(messages: list[dict[str, Any]]) -> str:
@@ -663,6 +754,7 @@ def _log_mel_distance(left: torch.Tensor, right: torch.Tensor, sample_rate: int)
 def test_zero_shot_tts_tracks_the_upstream_reference():
     """Replay the saved zero-shot TTS case and report the distances."""
 
+    assert PARITY_REF is not None
     parity_dir = Path(PARITY_REF)
     fusion_dir = Path(os.environ.get("AUK_FUSION_REF") or parity_dir.parent.parent / "fusion_ref")
     reference = torch.load(parity_dir / "zs_tts_en.pt", map_location="cpu", weights_only=False)
