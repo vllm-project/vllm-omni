@@ -107,7 +107,7 @@ def _inputs(tokens, spread=1.0, seed=0, device="cpu"):
 
 
 def _matrices(tokens, seed=0):
-    """Normalized exponentials plus rows whose sums depend on the addition order."""
+    """``tokens`` normalized exponentials, the first replaced by matrices whose sums depend on the addition order."""
     generator = torch.Generator().manual_seed(seed)
     logits = torch.randn(tokens, STREAMS, STREAMS, generator=generator) * 4
     matrix = torch.exp(logits - logits.amax(dim=(-2, -1), keepdim=True))
@@ -119,7 +119,9 @@ def _matrices(tokens, seed=0):
             [[1.0, 1e-40, 3e-39, 0.5], [1e-45, 1.0, 0.25, 1e-30], [0.75, 1e-38, 1.0, 1e-20], [1.0, 1.0, 1.0, 1.0]],
         ]
     )
-    return torch.cat((special, matrix))
+    count = min(tokens, special.shape[0])
+    matrix[:count] = special[:count]
+    return matrix
 
 
 @contextlib.contextmanager
