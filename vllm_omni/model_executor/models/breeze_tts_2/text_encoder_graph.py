@@ -76,14 +76,18 @@ class BreezeTextEncoderGraph:
         self.local_mask_base = torch.zeros_like(self.full_mask).masked_fill_(~allowed[:, None], torch.finfo(dtype).min)
         self.local_mask = self.local_mask_base.clone()
         self.masks = {"full_attention": self.full_mask, "sliding_attention": self.local_mask}
+        self._encoder = encoder
+        self._projection = projection
         for _ in range(3):
             self._encode(encoder, projection)
         current_omni_platform.synchronize()
-        self.graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(
-            self.graph, pool=current_platform.get_global_graph_pool(), capture_error_mode="thread_local"
-        ):
-            self.output = self._encode(encoder, projection)
+        self.graph = None
+        if current_omni_platform.is_cuda():
+            self.graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(
+                self.graph, pool=current_platform.get_global_graph_pool(), capture_error_mode="thread_local"
+            ):
+                self.output = self._encode(encoder, projection)
 
     def _encode(self, encoder: T5Gemma2TextEncoder, projection: nn.Linear) -> torch.Tensor:
         embedding = encoder.embed_tokens
@@ -116,7 +120,10 @@ class BreezeTextEncoderGraph:
         self.full_mask.masked_fill_(invalid, torch.finfo(self.full_mask.dtype).min)
         self.local_mask.copy_(self.local_mask_base)
         self.local_mask.masked_fill_(invalid, torch.finfo(self.local_mask.dtype).min)
-        self.graph.replay()
+        if self.graph is None:
+            self.output = self._encode(self._encoder, self._projection)
+        else:
+            self.graph.replay()
         # Subsequent prefills and backbone/depth graphs reuse graph storage.
         # The runner must receive independently owned prompt embeddings.
         return [self.output[row, :length].clone() for row, length in enumerate(lengths)]
