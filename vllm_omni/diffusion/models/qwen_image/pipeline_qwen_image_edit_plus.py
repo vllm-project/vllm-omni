@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import json
 import logging
@@ -31,6 +31,7 @@ from vllm_omni.diffusion.models.interface import SupportImageInput, SupportsComp
 from vllm_omni.diffusion.models.qwen_image.cfg_parallel import (
     QwenImageCFGParallelMixin,
 )
+from vllm_omni.diffusion.models.qwen_image.lora import QwenImageLoRAMixin
 from vllm_omni.diffusion.models.qwen_image.pipeline_qwen_image import calculate_shift
 from vllm_omni.diffusion.models.qwen_image.pipeline_qwen_image_edit import (
     calculate_dimensions,
@@ -185,7 +186,12 @@ def get_qwen_image_edit_plus_post_process_func(
 
 
 class QwenImageEditPlusPipeline(
-    nn.Module, SupportImageInput, QwenImageCFGParallelMixin, DiffusionPipelineProfilerMixin, SupportsComponentDiscovery
+    nn.Module,
+    QwenImageLoRAMixin,
+    SupportImageInput,
+    QwenImageCFGParallelMixin,
+    DiffusionPipelineProfilerMixin,
+    SupportsComponentDiscovery,
 ):
     _dit_modules: ClassVar[list[str]] = ["transformer"]
     _encoder_modules: ClassVar[list[str]] = ["text_encoder"]
