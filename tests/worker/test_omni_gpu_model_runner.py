@@ -18,6 +18,7 @@ from vllm_omni.worker.gpu_model_runner import (
     OmniGPUModelRunner,
     _filter_mrope_kwargs_for_model,
 )
+from vllm_omni.worker.lmcache_model_runner_mixin import LMCacheHiddenStateMixin
 from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -867,8 +868,8 @@ def test_full_payload_output_accumulation_hook_matrix():
 
 def _make_request_end_payload_runner(*, enabled=True, prefix_cache=None):
     runner = object.__new__(GPUARModelRunner)
-    runner.model = SimpleNamespace(omni_payload_at_request_end=enabled)
     runner.omni_prefix_cache = prefix_cache
+    runner.model = SimpleNamespace(omni_payload_at_request_end=enabled)
     runner.model_config = SimpleNamespace(
         model_arch="IndexTTS25TalkerForConditionalGeneration",
         model_stage="indextts2_5_talker",
@@ -1282,3 +1283,521 @@ def test_multimodal_embeddings_receive_opt_in_host_request_boundaries(supports_b
         assert received["query_start_loc"] == [0, 6, 7, 11]
     else:
         assert "query_start_loc" not in received
+
+
+# ---------------------------------------------------------------------------
+# LMCache HS chunk-boundary buffering tests
+# ---------------------------------------------------------------------------
+
+
+class _FakeHSStore:
+    """Records every store_hidden_states call so tests can assert behavior."""
+
+    def __init__(self):
+        self.calls = []
+
+    def store_hidden_states(self, token_ids, hidden_states, *, layer_idx=0, token_offset=0):
+        self.calls.append(
+            SimpleNamespace(
+                token_ids=list(token_ids),
+                hidden_states=hidden_states.clone(),
+                layer_idx=layer_idx,
+                token_offset=token_offset,
+            )
+        )
+
+
+def _make_lmcache_runner(chunk_size=4, hidden_size=2, req_id="r1", token_capacity=64):
+    """Build a runner stub wired with the LMCache HS path but no real engine."""
+    runner = object.__new__(LMCacheHiddenStateMixin)
+    runner._has_lmcache = True
+    runner._lmcache_hs_mm_keys = ()
+    runner._hs_pending_buffer = {}
+    runner._hs_saved_boundary = {}
+    runner._hs_buffer_origin = {}
+    runner._hs_mm_features = {}
+
+    hs_store = _FakeHSStore()
+    engine = SimpleNamespace(
+        hidden_state_store=hs_store,
+        config=SimpleNamespace(chunk_size=chunk_size),
+    )
+    adapter = SimpleNamespace(lmcache_engine=engine)
+    runner._get_lmcache_adapter = lambda: adapter
+
+    runner.input_batch = SimpleNamespace(
+        req_ids=[req_id],
+        req_id_to_index={req_id: 0},
+        num_computed_tokens_cpu=torch.tensor([0]),
+        token_ids_cpu=torch.arange(token_capacity).reshape(1, token_capacity),
+    )
+    runner.query_start_loc = SimpleNamespace(cpu=torch.tensor([0]))
+    return runner, hs_store
+
+
+def _drive_step(runner, sched, num_computed, hs_rows, hidden_size=2):
+    """Simulate one forward: update num_computed_tokens_cpu and feed HS."""
+    runner.input_batch.num_computed_tokens_cpu = torch.tensor([num_computed])
+    hidden_states = torch.arange(hs_rows * hidden_size, dtype=torch.float32).reshape(hs_rows, hidden_size) + (
+        num_computed * 100.0
+    )
+    sched_out = SimpleNamespace(num_scheduled_tokens={"r1": sched})
+    LMCacheHiddenStateMixin._maybe_store_hs_to_lmcache(
+        runner,
+        hidden_states,
+        None,
+        num_tokens_unpadded=hs_rows,
+        scheduler_output=sched_out,
+    )
+
+
+def test_hs_lmcache_prefill_stores_full_chunks_only():
+    runner, hs_store = _make_lmcache_runner(chunk_size=4, hidden_size=2)
+
+    # Prefill 10 tokens, chunk_size 4 → new_boundary = 8 (chunks [0:4],[4:8]).
+    _drive_step(runner, sched=10, num_computed=0, hs_rows=10)
+
+    assert len(hs_store.calls) == 1
+    call = hs_store.calls[0]
+    assert call.token_offset == 0
+    assert call.token_ids == list(range(8))
+    assert call.hidden_states.shape == (8, 2)
+    assert runner._hs_saved_boundary["r1"] == 8
+    # The trailing 2 rows stay in the buffer for the next boundary crossing.
+    assert sum(t.shape[0] for t in runner._hs_pending_buffer["r1"]["hidden"]) == 2
+
+
+def _drive_positioned_step(runner, sched, num_computed, hidden_size=2):
+    """One forward whose every HS row is stamped with its absolute position."""
+    runner.input_batch.num_computed_tokens_cpu = torch.tensor([num_computed])
+    positions = torch.arange(num_computed, num_computed + sched, dtype=torch.float32)
+    hidden_states = positions.unsqueeze(1).repeat(1, hidden_size)
+    LMCacheHiddenStateMixin._maybe_store_hs_to_lmcache(
+        runner,
+        hidden_states,
+        None,
+        num_tokens_unpadded=sched,
+        scheduler_output=SimpleNamespace(num_scheduled_tokens={"r1": sched}),
+    )
+
+
+def _stored_positions(call):
+    return [int(v) for v in call.hidden_states[:, 0].tolist()]
+
+
+def test_hs_store_keeps_absolute_positions_after_an_unaligned_hit():
+    """A full-prompt hit leaves num_computed one short of the chunk boundary.
+
+    The buffer then starts mid-chunk. Storing its first rows at the rounded-down
+    boundary would file them under earlier token positions than they hold.
+    """
+    runner, hs_store = _make_lmcache_runner(chunk_size=4, hidden_size=2)
+
+    # LMCache covered 8 tokens; vLLM must recompute the last one, so the
+    # request arrives with num_computed=7.
+    for step, num_computed in enumerate(range(7, 12)):
+        _drive_positioned_step(runner, sched=1, num_computed=num_computed)
+
+    assert len(hs_store.calls) == 1
+    call = hs_store.calls[0]
+    assert call.token_offset == 8
+    assert _stored_positions(call) == [8, 9, 10, 11]
+    assert call.token_ids == list(range(12))
+    assert runner._hs_saved_boundary["r1"] == 12
+
+
+def test_hs_store_positions_stay_aligned_across_two_chunks():
+    """The second flush must continue where the first stopped, not re-skip."""
+    runner, hs_store = _make_lmcache_runner(chunk_size=4, hidden_size=2)
+
+    for num_computed in range(7, 20):
+        _drive_positioned_step(runner, sched=1, num_computed=num_computed)
+
+    assert [c.token_offset for c in hs_store.calls] == [8, 12, 16]
+    assert [_stored_positions(c) for c in hs_store.calls] == [
+        [8, 9, 10, 11],
+        [12, 13, 14, 15],
+        [16, 17, 18, 19],
+    ]
+
+
+def test_hs_store_from_a_cold_request_starts_at_zero():
+    """Rounding up must not shift a request that had no hit at all."""
+    runner, hs_store = _make_lmcache_runner(chunk_size=4, hidden_size=2)
+
+    _drive_positioned_step(runner, sched=10, num_computed=0)
+
+    assert len(hs_store.calls) == 1
+    assert hs_store.calls[0].token_offset == 0
+    assert _stored_positions(hs_store.calls[0]) == list(range(8))
+
+
+def test_hs_lmcache_decode_buffers_until_boundary():
+    runner, hs_store = _make_lmcache_runner(chunk_size=4, hidden_size=2)
+
+    # Step 1: prefill exactly 2 full chunks (8 tokens, no remainder).
+    _drive_step(runner, sched=8, num_computed=0, hs_rows=8)
+    assert len(hs_store.calls) == 1
+    assert runner._hs_saved_boundary["r1"] == 8
+    assert sum(t.shape[0] for t in runner._hs_pending_buffer["r1"]["hidden"]) == 0
+    hs_store.calls.clear()
+
+    # Decode tokens 9, 10, 11 — chunk [8:12] not yet full, must not flush.
+    for nc in (8, 9, 10):
+        _drive_step(runner, sched=1, num_computed=nc, hs_rows=1)
+    assert hs_store.calls == []
+    assert runner._hs_saved_boundary["r1"] == 8
+    assert sum(t.shape[0] for t in runner._hs_pending_buffer["r1"]["hidden"]) == 3
+
+    # Decode token 12 completes the chunk [8:12]; one flush expected.
+    _drive_step(runner, sched=1, num_computed=11, hs_rows=1)
+    assert len(hs_store.calls) == 1
+    call = hs_store.calls[0]
+    assert call.token_offset == 8
+    assert call.token_ids == list(range(12))
+    assert call.hidden_states.shape == (4, 2)
+    assert runner._hs_saved_boundary["r1"] == 12
+    assert sum(t.shape[0] for t in runner._hs_pending_buffer["r1"]["hidden"]) == 0
+
+
+def test_hs_lmcache_drop_pending_state():
+    runner, _ = _make_lmcache_runner()
+    runner._hs_pending_buffer["r1"] = {"hidden": [torch.zeros((2, 2))]}
+    runner._hs_saved_boundary["r1"] = 4
+
+    runner._drop_hs_pending_state("r1")
+
+    assert "r1" not in runner._hs_pending_buffer
+    assert "r1" not in runner._hs_saved_boundary
+    # Dropping an unknown req_id must be a no-op (idempotent).
+    runner._drop_hs_pending_state("unknown")
+
+
+class _RaisingHSStore(_FakeHSStore):
+    def store_hidden_states(self, token_ids, hidden_states, *, layer_idx=0, token_offset=0):
+        raise RuntimeError("store failed")
+
+
+def test_hs_lmcache_store_failure_keeps_boundary_and_buffer():
+    """#6b: a failed store must not advance the boundary or trim the buffer."""
+    runner, _ = _make_lmcache_runner(chunk_size=4, hidden_size=2)
+    runner._get_lmcache_adapter().lmcache_engine.hidden_state_store = _RaisingHSStore()
+
+    _drive_step(runner, sched=8, num_computed=0, hs_rows=8)
+
+    assert runner._hs_saved_boundary.get("r1", 0) == 0
+    assert sum(t.shape[0] for t in runner._hs_pending_buffer["r1"]["hidden"]) == 8
+
+
+def test_hs_lmcache_regression_resets_state():
+    """#3: num_computed regressing below the saved boundary (preempt) resets state."""
+    runner, hs_store = _make_lmcache_runner(chunk_size=4, hidden_size=2)
+    _drive_step(runner, sched=8, num_computed=0, hs_rows=8)
+    assert runner._hs_saved_boundary["r1"] == 8
+    hs_store.calls.clear()
+
+    # Request comes back with fewer computed tokens than we had flushed.
+    _drive_positioned_step(runner, sched=4, num_computed=2)
+
+    # Without the reset, new_boundary (4) <= stale 8 would skip flushing forever.
+    # The buffer now starts at token 2, so the first storable chunk is [4:8) and
+    # nothing is written until it fills -- storing these four rows at offset 0
+    # would file tokens 2..5 as 0..3.
+    assert runner._hs_saved_boundary["r1"] == 4
+    assert hs_store.calls == []
+
+    _drive_positioned_step(runner, sched=2, num_computed=6)
+
+    assert len(hs_store.calls) == 1
+    assert hs_store.calls[0].token_offset == 4
+    assert _stored_positions(hs_store.calls[0]) == [4, 5, 6, 7]
+
+
+class _FakeRetrieveStore:
+    """retrieve_hidden_states returns a configurable per-layer prefix (or None)."""
+
+    def __init__(self, rows_by_layer):
+        self._rows_by_layer = rows_by_layer
+
+    def retrieve_hidden_states(self, token_ids, *, layer_idx=0):
+        rows = self._rows_by_layer.get(layer_idx)
+        if rows is None:
+            return None
+        return torch.arange(rows * 2, dtype=torch.float32).reshape(rows, 2)
+
+
+def _make_restore_runner(rows_by_layer, num_computed=8, chunk_size=4, mm_keys=()):
+    runner = object.__new__(LMCacheHiddenStateMixin)
+    runner._has_lmcache = True
+    runner._lmcache_hs_mm_keys = mm_keys
+    runner._hs_mm_features = {}
+    engine = SimpleNamespace(
+        hidden_state_store=_FakeRetrieveStore(rows_by_layer),
+        config=SimpleNamespace(chunk_size=chunk_size),
+    )
+    runner._get_lmcache_adapter = lambda: SimpleNamespace(lmcache_engine=engine)
+    runner.input_batch = SimpleNamespace(
+        req_id_to_index={"r1": 0},
+        num_prompt_tokens=torch.tensor([64]),
+        token_ids_cpu=torch.arange(64).reshape(1, 64),
+    )
+    sched_out = SimpleNamespace(scheduled_new_reqs=[SimpleNamespace(req_id="r1", num_computed_tokens=num_computed)])
+    return runner, sched_out
+
+
+def test_restore_incomplete_hs_sets_no_payload():
+    """#2: a missing required layer must not produce a partial payload."""
+    pytest.importorskip("lmcache", reason="the restore path keys through lmcache helpers")
+
+    runner, sched_out = _make_restore_runner(rows_by_layer={-1: None})  # "hidden" (idx -1) misses
+
+    LMCacheHiddenStateMixin._maybe_restore_hs_from_lmcache(runner, sched_out)
+
+    assert runner._restored_mm.get("r1") is None
+
+
+def test_restore_full_hs_sets_payload():
+    """#2: all required layers present -> payload is set."""
+    pytest.importorskip("lmcache", reason="the restore path keys through lmcache helpers")
+
+    runner, sched_out = _make_restore_runner(rows_by_layer={-1: 8})  # "hidden" (idx -1) full-length
+
+    LMCacheHiddenStateMixin._maybe_restore_hs_from_lmcache(runner, sched_out)
+
+    assert "hidden" in runner._restored_mm["r1"]
+    assert runner._restored_mm["r1"]["hidden"].shape[0] == 8
+
+
+def test_restore_remaps_mm_layers_to_flattened_payload_keys():
+    """Qwen3-Omni-style captures must land under the flattened payload keys.
+
+    Only models exposing talker_config.accept_hidden_layer populate
+    _lmcache_hs_mm_keys, so this path never runs on Qwen2.5-Omni.
+    """
+    pytest.importorskip("lmcache", reason="the restore path keys through lmcache helpers")
+
+    runner, sched_out = _make_restore_runner(
+        rows_by_layer={-1: 8, 0: 8, 24: 8},  # "hidden" (-1) plus captures 0 and 24
+        mm_keys=("0", "24"),
+    )
+
+    LMCacheHiddenStateMixin._maybe_restore_hs_from_lmcache(runner, sched_out)
+
+    assert set(runner._restored_mm["r1"]) == {"hidden", "hidden_states.layer_0", "hidden_states.layer_24"}
+
+
+def test_pooler_payload_casts_restored_prefix_to_batch_dtype(monkeypatch):
+    """#5: LMCache returns CPU float32; prepending onto bf16 activations must not raise."""
+    import vllm_omni.worker.gpu_ar_model_runner as ar_mod
+
+    monkeypatch.setattr(
+        ar_mod, "build_omni_mm_payload", lambda **kwargs: {"mm0": torch.ones(2, 2, dtype=torch.bfloat16)}
+    )
+
+    runner = object.__new__(GPUARModelRunner)
+    restored_mm = {
+        "r1": {
+            "hidden": torch.zeros(3, 2, dtype=torch.float32),
+            "mm0": torch.zeros(3, 2, dtype=torch.float32),
+        }
+    }
+
+    payload = GPUARModelRunner._build_omni_pooler_payload(
+        runner,
+        restored_mm=restored_mm,
+        rid="r1",
+        idx=0,
+        start=0,
+        end=2,
+        hidden_states_cpu=None,
+        req_hidden_states_cpu={"r1": torch.ones(2, 2, dtype=torch.bfloat16)},
+        combined_hidden_states=None,
+        combined_multimodal_outputs=None,
+        mm_cpu=None,
+        audio_sparse_output=False,
+        sparse_mm_index={},
+        hidden_seq_len=2,
+        scheduled_seq_len=2,
+    )
+
+    # Both the "hidden" tap and the mm layer are prepended in the batch's dtype.
+    assert payload["hidden"].dtype == torch.bfloat16
+    assert payload["hidden"].shape[0] == 5
+    assert payload["mm0"].dtype == torch.bfloat16
+    assert payload["mm0"].shape[0] == 5
+
+
+def test_hs_lmcache_store_slices_per_request_in_multi_request_batch():
+    """#11: each request must buffer only its own rows of the flattened batch HS."""
+    runner = object.__new__(LMCacheHiddenStateMixin)
+    runner._has_lmcache = True
+    runner._lmcache_hs_mm_keys = ()
+    runner._hs_pending_buffer = {}
+    runner._hs_saved_boundary = {}
+    runner._hs_buffer_origin = {}
+    runner._hs_mm_features = {}
+
+    hs_store = _FakeHSStore()
+    engine = SimpleNamespace(hidden_state_store=hs_store, config=SimpleNamespace(chunk_size=4))
+    runner._get_lmcache_adapter = lambda: SimpleNamespace(lmcache_engine=engine)
+
+    # r0 occupies rows 0..3, r1 rows 4..7 of the flattened batch.
+    runner.input_batch = SimpleNamespace(
+        req_ids=["r0", "r1"],
+        req_id_to_index={"r0": 0, "r1": 1},
+        num_computed_tokens_cpu=torch.tensor([0, 0]),
+        token_ids_cpu=torch.arange(128).reshape(2, 64),
+    )
+    runner.query_start_loc = SimpleNamespace(cpu=torch.tensor([0, 4]))
+
+    # Row i is filled with value i so provenance is checkable.
+    hidden_states = torch.arange(8, dtype=torch.float32).reshape(8, 1).repeat(1, 2)
+    sched_out = SimpleNamespace(num_scheduled_tokens={"r0": 4, "r1": 4})
+
+    LMCacheHiddenStateMixin._maybe_store_hs_to_lmcache(
+        runner, hidden_states, None, num_tokens_unpadded=8, scheduler_output=sched_out
+    )
+
+    assert len(hs_store.calls) == 2
+    by_offset = {tuple(c.token_ids[:1]): c.hidden_states for c in hs_store.calls}
+    # r0 stored rows 0..3, r1 stored rows 4..7 -- not the batch's first 4 twice.
+    assert torch.equal(hs_store.calls[0].hidden_states[:, 0], torch.tensor([0.0, 1.0, 2.0, 3.0]))
+    assert torch.equal(hs_store.calls[1].hidden_states[:, 0], torch.tensor([4.0, 5.0, 6.0, 7.0]))
+    assert len(by_offset) == 2
+
+
+# ---------------------------------------------------------------------------
+# LMCache HS restore: one consumer, and a short store is a failure
+# ---------------------------------------------------------------------------
+
+
+class _StubHSStore:
+    """Returns a fixed-length prefix for every layer."""
+
+    def __init__(self, rows: int, hidden_size: int = 2):
+        self.rows = rows
+        self.hidden_size = hidden_size
+
+    def retrieve_hidden_states(self, token_ids, *, layer_idx=0):
+        if self.rows <= 0:
+            return None
+        return torch.ones(self.rows, self.hidden_size)
+
+
+def _make_stub_restore_runner(*, stored_rows, num_computed=8, prompt_tokens=16):
+    runner = object.__new__(LMCacheHiddenStateMixin)
+    runner._has_lmcache = True
+    runner._lmcache_hs_mm_keys = ()
+    runner._hs_mm_features = {}
+    engine = SimpleNamespace(
+        hidden_state_store=_StubHSStore(stored_rows),
+        config=SimpleNamespace(chunk_size=4),
+    )
+    runner._get_lmcache_adapter = lambda: SimpleNamespace(lmcache_engine=engine)
+    runner.input_batch = SimpleNamespace(
+        req_id_to_index={"r1": 0},
+        num_prompt_tokens=[prompt_tokens],
+        token_ids_cpu=torch.arange(64).reshape(1, 64),
+    )
+    sched_out = SimpleNamespace(scheduled_new_reqs=[SimpleNamespace(req_id="r1", num_computed_tokens=num_computed)])
+    return runner, sched_out
+
+
+def test_hs_restore_stashes_the_prefix_for_the_pooler_payload():
+    pytest.importorskip("lmcache", reason="the restore path keys through lmcache helpers")
+
+    runner, sched_out = _make_stub_restore_runner(stored_rows=8)
+
+    LMCacheHiddenStateMixin._maybe_restore_hs_from_lmcache(runner, sched_out)
+
+    assert set(runner._restored_mm) == {"r1"}
+    assert runner._restored_mm["r1"]["hidden"].shape[0] == 8
+
+
+def test_hs_restore_skips_everything_when_the_store_is_short():
+    pytest.importorskip("lmcache", reason="the restore path keys through lmcache helpers")
+
+    runner, sched_out = _make_stub_restore_runner(stored_rows=5)
+
+    LMCacheHiddenStateMixin._maybe_restore_hs_from_lmcache(runner, sched_out)
+
+    assert runner._restored_mm == {}
+
+
+def test_hs_store_short_write_does_not_advance_the_boundary():
+    """A full pool stops the store early and returns normally, not by raising."""
+    runner, hs_store = _make_lmcache_runner(chunk_size=4, hidden_size=2)
+    hs_store.store_hidden_states = lambda *a, **k: 0
+
+    _drive_step(runner, sched=8, num_computed=0, hs_rows=8)
+
+    assert runner._hs_saved_boundary.get("r1", 0) == 0
+    assert sum(t.shape[0] for t in runner._hs_pending_buffer["r1"]["hidden"]) == 8
+
+
+def test_hs_store_after_a_restore_still_flushes():
+    """A restored prefix was never buffered, so the boundary must start past it."""
+    runner, hs_store = _make_lmcache_runner(chunk_size=4, hidden_size=2)
+
+    # Request arrives with 4 tokens already restored and 4 scheduled.
+    _drive_step(runner, sched=4, num_computed=4, hs_rows=4)
+
+    assert runner._hs_saved_boundary["r1"] == 8
+    assert len(hs_store.calls) == 1
+    call = hs_store.calls[0]
+    assert call.token_offset == 4
+    assert call.hidden_states.shape == (4, 2)
+
+
+def test_keyed_token_ids_hash_multimodal_spans():
+    """Hidden states share the KV chunk keys, which have mm spans hashed.
+
+    Asserts that the span is rewritten and that the rewrite is stable, not what
+    the values are. The keys only have to match whatever LMCache derives for the
+    KV they ride with, and we get that by calling the same helper it does --
+    LMCache has changed both the helper's name and its per-position output
+    before, and pinning either breaks this test without telling us anything
+    about our own contract.
+    """
+    pytest.importorskip("lmcache", reason="lmcache not installed")
+
+    runner = object.__new__(LMCacheHiddenStateMixin)
+    runner.input_batch = SimpleNamespace(token_ids_cpu=torch.arange(16).reshape(1, 16))
+    placeholder = SimpleNamespace(offset=4, length=3)
+    runner._hs_mm_features = {"r1": (["ab" * 16], [placeholder])}
+
+    keyed = runner._keyed_token_ids(0, "r1", 10)
+    again = runner._keyed_token_ids(0, "r1", 10)
+
+    # Only the span is touched, and the same request keys the same way twice.
+    assert keyed[:4] == [0, 1, 2, 3]
+    assert keyed[7:] == [7, 8, 9]
+    assert keyed[4:7] != [4, 5, 6]
+    assert keyed == again
+
+
+def test_keyed_token_ids_pass_through_without_multimodal_spans():
+    runner = object.__new__(LMCacheHiddenStateMixin)
+    runner.input_batch = SimpleNamespace(token_ids_cpu=torch.arange(16).reshape(1, 16))
+    runner._hs_mm_features = {}
+
+    assert runner._keyed_token_ids(0, "r1", 5) == [0, 1, 2, 3, 4]
+
+
+def test_take_restored_mm_removes_only_the_requested_ids():
+    """The payload builder can run late, so it consumes a snapshot, not live state."""
+    runner = object.__new__(LMCacheHiddenStateMixin)
+    runner._restored_mm = {
+        "r1": {"hidden": torch.ones(2, 2)},
+        "r2": {"hidden": torch.ones(3, 2)},
+    }
+
+    taken = runner._take_restored_mm(["r1"])
+
+    assert set(taken) == {"r1"}
+    assert set(runner._restored_mm) == {"r2"}
+
+
+def test_take_restored_mm_is_empty_without_lmcache():
+    runner = object.__new__(LMCacheHiddenStateMixin)
+    assert runner._take_restored_mm(["r1"]) == {}

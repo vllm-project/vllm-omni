@@ -98,6 +98,7 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
         # Output-payload constant snapshotted once in load_model; the cache
         # policy counterpart lives on PrefixCacheRunnerMixin.
         self._pooler_payload_include_hidden_flag = True
+        self._has_lmcache = False
 
     def _to_list(self, sampled_token_ids: torch.Tensor) -> list[list[int]]:
         override_fn = self._sampled_token_ids_cpu_override
@@ -146,6 +147,15 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
         )
         if cfg is not None:
             self._omni_prefix_cache_cfg = cfg
+
+        self._setup_lmcache_hidden_state_offload()
+
+    def _setup_lmcache_hidden_state_offload(self) -> None:
+        """No-op hook; overridden by LMCacheHiddenStateMixin on the AR runner."""
+        self._has_lmcache = False
+
+    def _drop_hs_pending_state(self, req_id: str) -> None:
+        """No-op hook; overridden by LMCacheHiddenStateMixin on the AR runner."""
 
     @instrument(span_name="Loading (GPU)")
     def load_model(self, *args, **kwargs) -> None:
@@ -549,6 +559,7 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
                 self._talker_mtp_generators.pop(req_id, None)
             if cleanup_finished_request is not None:
                 cleanup_finished_request(req_id)
+            self._drop_hs_pending_state(req_id)
 
         self.late_interaction_runner.on_requests_finished(scheduler_output.finished_req_ids)
         # Remove the finished requests from the persistent batch.
