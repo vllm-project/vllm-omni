@@ -20,11 +20,15 @@ were reverted or broken. Check:
   tolerances are deterministic or explicitly controlled;
 - normal, invalid, boundary, feature-off, failure/cancellation, and regression
   paths are covered where the diff changes them;
-- run-level and domain markers place hardware/model tests in the intended CI
-  lane without silently skipping the contract.
+- read the target's pytest configuration, collection hooks, hardware helpers,
+  and CI together: run-level/domain/backend/SKU/card-count selectors must place
+  tests in the intended lane. `core_model` alone is not CPU-only; use explicit
+  hardware selection such as `core_model and cpu` only when supported by the
+  target. Zero selected or skipped accelerator tests are not validation.
 
-Map source symbols to tests with bounded `rg` searches; do not assume the test
-tree mirrors production paths.
+Map source symbols to tests with bounded `rg` searches and inspect the target's
+test-writing guide. Components may mirror source while model E2E and feature
+suites live elsewhere; imports, fixtures, and assertions establish coverage.
 
 ## Runtime check
 

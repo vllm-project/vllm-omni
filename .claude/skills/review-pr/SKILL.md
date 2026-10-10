@@ -9,6 +9,15 @@ Review like a maintainer: direct, selective, and focused on issues that CI does
 not prove. Prefer a few high-confidence findings over exhaustive commentary.
 Zero findings is a valid result.
 
+## Target-version evidence
+
+Resolve Python/dependency compatibility, pytest selectors and hardware needs
+from the frozen head's metadata, requirements, CI, and fixtures. Run levels such
+as `core_model` do not imply CPU-only execution. Read the target's accepted
+module contracts; draft or deferred architecture is not a merge requirement.
+Recheck only affected assumptions when reviewing another release. Historical
+coverage does not establish compatibility with a new snapshot.
+
 ## Quality contract
 
 Make every finding:
@@ -103,12 +112,27 @@ If docs and live code disagree, verify the code/tests and report the drift.
 | [examples-policy.md](../precheck-pr/references/examples-policy.md) | The PR adds, copies, or renames Python under `examples/`; apply the canonical policy shared with `precheck-pr`. |
 | [find-simplifications](../find-simplifications/SKILL.md) | Every review; run a diff-scoped subtraction and simplification pass after correctness blockers. |
 
+### Batch sessions and review helpers
+
+For a requested batch session, unanswered review replies, or inline-coordinate
+validation, read [batch-review.md](references/process/batch-review.md). The
+repository owns the helper scripts and their offline regression tests.
+
 ### Delivery and reviewer coordination
 
 | Reference | Read when |
 | --- | --- |
 | [maintainer-style-study.md](references/delivery/maintainer-style-study.md) | Findings are ready for concise maintainer-style delivery. |
 | [review-requests.md](references/delivery/review-requests.md) | The user asks to identify, suggest, request, or ping code-owner reviewers. |
+
+## Optional review workers
+
+For independent defect discovery on a large diff, or when the user selects
+`auto`, `codex`, `claude`, or `none`, read
+[reviewer-backends.md](references/process/reviewer-backends.md). Pass immutable
+base/head SHAs and a bounded read-only scope. The parent owns domain routing,
+verification, deduplication, severity, and any separately authorized posting.
+Missing optional tooling falls back to direct review without blocking it.
 
 ## Workflow
 
