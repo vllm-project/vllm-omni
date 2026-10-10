@@ -24,6 +24,8 @@ import base64
 import io
 import json
 import logging
+import secrets
+import time
 
 try:
     import gradio as gr
@@ -51,13 +53,21 @@ class TTSPlaybackProcessor extends AudioWorkletProcessor {
         this.pos = 0;
         this.playing = false;
         this.played = 0;
+        this.token = 0;
+        this.ended = false;
         this.port.onmessage = (e) => {
             if (e.data && e.data.type === 'clear') {
+                this.token = e.data.token;
+                this.ended = false;
                 this.queue = []; this.buf = null; this.pos = 0; this.played = 0;
-                if (this.playing) { this.playing = false; this.port.postMessage({type:'stopped'}); }
+                if (this.playing) { this.playing = false; this.port.postMessage({type:'stopped', token:this.token}); }
                 return;
             }
-            this.queue.push(e.data);
+            if (e.data && e.data.type === 'pcm' && e.data.token === this.token) {
+                this.queue.push(e.data.data);
+            } else if (e.data && e.data.type === 'end' && e.data.token === this.token) {
+                this.ended = true;
+            }
         };
     }
     process(inputs, outputs) {
@@ -68,14 +78,18 @@ class TTSPlaybackProcessor extends AudioWorkletProcessor {
                     this.buf = this.queue.shift(); this.pos = 0;
                 } else {
                     for (let j = i; j < out.length; j++) out[j] = 0;
-                    if (this.playing) { this.playing = false; this.port.postMessage({type:'stopped', played:this.played}); }
+                    if (this.playing) { this.playing = false; this.port.postMessage({type:'stopped', played:this.played, token:this.token}); }
+                    if (this.ended) {
+                        this.ended = false;
+                        this.port.postMessage({type:'ended', token:this.token});
+                    }
                     return true;
                 }
             }
             out[i] = this.buf[this.pos++] / 32768;
             this.played++;
         }
-        if (!this.playing) { this.playing = true; this.port.postMessage({type:'started'}); }
+        if (!this.playing) { this.playing = true; this.port.postMessage({type:'started', token:this.token}); }
         return true;
     }
 }
@@ -126,7 +140,7 @@ def _build_player_js(sample_rate: int) -> str:
     <script>
     const SR = {sample_rate};
     const WC = {json.dumps(WORKLET_JS)};
-    let ctx = null, node = null, abort = null, gen = false, st = {{}};
+    let ctx = null, node = null, abort = null, gen = false, generation = 0, st = {{}};
 
     async function init() {{
         if (ctx) return;
@@ -138,8 +152,8 @@ def _build_player_js(sample_rate: int) -> str:
         node = new AudioWorkletNode(ctx, 'tts-playback-processor');
         node.connect(ctx.destination);
         node.port.onmessage = (e) => {{
-            if (e.data.type === 'started') setStatus('Playing...', '#64dd17');
-            else if (e.data.type === 'stopped' && !gen) {{
+            if (e.data.type === 'started' && e.data.token === generation && gen) setStatus('Playing...', '#64dd17');
+            else if (e.data.type === 'ended' && e.data.token === generation && !gen) {{
                 setStatus('Done', '#64dd17'); showStats(true);
                 const btn = document.getElementById('tts-stop-btn');
                 if (btn) btn.style.display = 'none';
@@ -194,8 +208,9 @@ def _build_player_js(sample_rate: int) -> str:
     }}
 
     window.ttsStop = function() {{
+        const stoppedGeneration = ++generation;
         if (abort) abort.abort();
-        if (node) node.port.postMessage({{ type: 'clear' }});
+        if (node) node.port.postMessage({{ type: 'clear', token: stoppedGeneration }});
         gen = false;
         setStatus('Stopped', '#999');
         const btn = document.getElementById('tts-stop-btn');
@@ -203,17 +218,37 @@ def _build_player_js(sample_rate: int) -> str:
     }};
 
     window.ttsGenerate = async function(payload) {{
-        try {{ await init(); if (ctx.state === 'suspended') await ctx.resume(); }}
-        catch (e) {{ const s = document.getElementById('tts-status'); if (s) s.textContent = 'Audio init error: ' + e.message; return; }}
-
-        // Abort previous request and clear worklet buffer
+        const myGeneration = ++generation;
         if (abort) abort.abort();
-        node.port.postMessage({{ type: 'clear' }});
-        // Wait for worklet to process clear before sending new data
-        await new Promise(r => setTimeout(r, 50));
-        node.port.postMessage({{ type: 'clear' }});
-
+        abort = new AbortController();
         gen = true;
+        if (window._ttsFinalUrl) URL.revokeObjectURL(window._ttsFinalUrl);
+        window._ttsFinalUrl = null;
+        window._ttsChunks = [];
+        const finalEl = document.getElementById('tts-final');
+        if (finalEl) {{ finalEl.innerHTML = ''; finalEl.style.display = 'none'; }}
+        let terminal = 'ok';
+
+        try {{
+            await init();
+            if (myGeneration !== generation) return;
+            if (ctx.state === 'suspended') await ctx.resume();
+            if (myGeneration !== generation) return;
+        }} catch (e) {{
+            if (myGeneration === generation) {{
+                terminal = 'error';
+                gen = false;
+                setStatus('Audio init error: ' + e.message, '#EF5552');
+            }}
+            return;
+        }}
+
+        // Clear the previous generation before sending new data.
+        node.port.postMessage({{ type: 'clear', token: myGeneration }});
+        await new Promise(r => setTimeout(r, 50));
+        if (myGeneration !== generation) return;
+        node.port.postMessage({{ type: 'clear', token: myGeneration }});
+
         st = {{ t0: null, chunks: 0, samples: 0, ttfp: null }};
         window._ttsChunks = [];
         setStatus('Connecting...', '#4A90D9');
@@ -229,7 +264,6 @@ def _build_player_js(sample_rate: int) -> str:
         if (bl) bl.textContent = '';
         const ee = document.getElementById('tts-elapsed');
         if (ee) {{ ee.style.display = 'none'; ee.textContent = ''; }}
-        abort = new AbortController();
 
         try {{
             st.t0 = performance.now();
@@ -240,12 +274,14 @@ def _build_player_js(sample_rate: int) -> str:
                 signal: abort.signal,
             }});
             if (!r.ok) {{ const t = await r.text(); throw new Error('Server ' + r.status + ': ' + t.slice(0, 200)); }}
+            if (myGeneration !== generation) return;
             setStatus('Streaming...', '#4A90D9');
 
             const reader = r.body.getReader();
             let left = new Uint8Array(0);
             while (true) {{
                 const {{ done, value }} = await reader.read();
+                if (myGeneration !== generation) return;
                 if (done) break;
                 let raw;
                 if (left.length > 0) {{
@@ -258,7 +294,7 @@ def _build_player_js(sample_rate: int) -> str:
                     const ab = new ArrayBuffer(usable);
                     new Uint8Array(ab).set(raw.subarray(0, usable));
                     const pcm = new Int16Array(ab);
-                    node.port.postMessage(pcm);
+                    node.port.postMessage({{ type: 'pcm', token: myGeneration, data: pcm }});
                     window._ttsChunks.push(pcm);
                     st.chunks++;
                     st.samples += pcm.length;
@@ -266,21 +302,30 @@ def _build_player_js(sample_rate: int) -> str:
                     showStats(false);
                 }}
             }}
+            if (left.length) throw new Error('Upstream returned an incomplete PCM sample');
         }} catch (e) {{
-            if (e.name !== 'AbortError') {{
+            if (myGeneration !== generation) return;
+            terminal = e.name === 'AbortError' ? 'abort' : 'error';
+            if (terminal === 'error') {{
                 setStatus('Error: ' + e.message, '#EF5552');
                 console.error('TTS error:', e);
+                node.port.postMessage({{ type: 'clear', token: myGeneration }});
+                if (bEl) bEl.style.display = 'none';
             }}
         }} finally {{
-            // Freeze RTF at stream-end time (before playback finishes)
+            if (myGeneration !== generation) return;
             st.streamEnd = performance.now();
-            showStats(true);
+            showStats(terminal === 'ok');
             gen = false;
-            if (st.samples > 0) {{
+            if (terminal === 'ok' && st.samples > 0) {{
                 setStatus('Finishing playback...', '#64dd17');
                 showFinalAudio();
-            }} else {{
+                node.port.postMessage({{ type: 'end', token: myGeneration }});
+            }} else if (terminal === 'ok') {{
                 setStatus('No audio received', '#999');
+                if (bEl) bEl.style.display = 'none';
+            }} else if (terminal === 'abort') {{
+                setStatus('Stopped', '#999');
                 if (bEl) bEl.style.display = 'none';
             }}
         }}
@@ -430,15 +475,33 @@ def create_app(api_base: str):
     # too large to route through the Gradio textbox -> JS -> fetch pipeline, so
     # we build them in Python, stash them here, and hand the browser only a
     # short request id to fetch by.
-    _pending_payloads: dict[str, dict] = {}
+    _pending_payloads: dict[str, tuple[float, dict]] = {}
+    payload_ttl = 300.0
+    payload_cap = 128
+
+    def store_payload(payload: dict) -> str:
+        now = time.monotonic()
+        for key, (expires, _) in list(_pending_payloads.items()):
+            if expires <= now:
+                _pending_payloads.pop(key, None)
+        while len(_pending_payloads) >= payload_cap:
+            oldest = min(_pending_payloads, key=lambda key: _pending_payloads[key][0])
+            _pending_payloads.pop(oldest, None)
+        req_id = secrets.token_urlsafe(32)
+        _pending_payloads[req_id] = (now + payload_ttl, payload)
+        return req_id
 
     # ── Streaming proxy (same-origin, no CORS issues) ────────────
     @fastapi_app.post("/proxy/v1/audio/speech")
     async def proxy_speech(request: Request):
         body = await request.json()
         req_id = body.get("_req_id")
-        if req_id and req_id in _pending_payloads:
-            body = _pending_payloads.pop(req_id)
+        if not req_id:
+            return Response(content="Missing request id", status_code=400)
+        pending = _pending_payloads.pop(req_id, None)
+        if pending is None or pending[0] <= time.monotonic():
+            return Response(content="Unknown or expired request id", status_code=404)
+        body = pending[1]
         body.pop("_nonce", None)
         try:
             client = httpx.AsyncClient(timeout=300)
@@ -471,6 +534,7 @@ def create_app(api_base: str):
                     yield chunk
             except Exception:
                 logger.exception("Proxy relay error after %d bytes", total)
+                raise
             finally:
                 logger.info("Proxy relay done: %d bytes", total)
                 await resp.aclose()
@@ -581,13 +645,10 @@ def create_app(api_base: str):
             # browser a short request id. The .then() JS calls window.ttsGenerate
             # which fetches /proxy and feeds PCM into the AudioWorklet player.
             if stream_enabled:
-                import time as _time
-
                 text, ref_a, ref_url, ref_t, _fmt = args
                 payload = build_payload(text, ref_a, ref_url, ref_t, "pcm", stream=True)
-                req_id = f"req-{int(_time.time() * 1000)}"
-                _pending_payloads[req_id] = payload
-                browser_payload = {"_req_id": req_id, "_nonce": int(_time.time() * 1000)}
+                req_id = store_payload(payload)
+                browser_payload = {"_req_id": req_id}
                 return json.dumps(browser_payload), gr.update()
             # Non-streaming path: return the full clip via gr.Audio.
             audio = generate_speech(api_base, *args)
