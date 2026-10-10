@@ -383,7 +383,8 @@ def _build_component_config(spec: dict[str, Any]) -> ComponentQuantizationConfig
     default_config: QuantizationConfig | None = None
 
     for prefix, value in spec.items():
-        if value is None:
+        if value is None or (isinstance(value, str) and value.lower() == "none"):
+            # Mirror build_quant_config("none"): leave this component unquantized.
             config = None
         elif isinstance(value, str):
             config = _build_single(value)

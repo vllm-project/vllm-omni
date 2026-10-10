@@ -453,12 +453,21 @@ class TestComponentResolve:
         assert result is None
 
     def test_min_capability(self):
+        """The strictest component requirement gates the whole config."""
         a = _MockQuantConfig("a")
         a.get_min_capability = lambda: 80
         b = _MockQuantConfig("b")
         b.get_min_capability = lambda: 70
         cqc = ComponentQuantizationConfig(component_configs={"x": a, "y": b})
-        assert cqc.get_min_capability() == 70
+        assert cqc.get_min_capability() == 80
+
+    def test_min_capability_includes_default(self):
+        a = _MockQuantConfig("a")
+        a.get_min_capability = lambda: 75
+        default = _MockQuantConfig("default")
+        default.get_min_capability = lambda: 89
+        cqc = ComponentQuantizationConfig(component_configs={"x": a, "vae": None}, default_config=default)
+        assert cqc.get_min_capability() == 89
 
     def test_min_capability_empty(self):
         cqc = ComponentQuantizationConfig(component_configs={})

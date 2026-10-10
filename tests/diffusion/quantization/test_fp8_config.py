@@ -163,6 +163,17 @@ def test_build_quant_config_per_component_string():
     assert config.component_configs["transformer"].get_name() == "fp8"
 
 
+@pytest.mark.parametrize("none_value", ["none", "None", "NONE"])
+def test_build_quant_config_per_component_none_string(none_value):
+    """A "none" string component means unquantized, like build_quant_config("none")."""
+    from vllm_omni.quantization import ComponentQuantizationConfig, build_quant_config
+
+    config = build_quant_config({"transformer": {"method": "fp8"}, "vae": none_value})
+    assert isinstance(config, ComponentQuantizationConfig)
+    assert config.component_configs["transformer"].get_name() == "fp8"
+    assert config.component_configs["vae"] is None
+
+
 def test_build_quant_config_per_component_inner_dict_not_mutated():
     """Inner component dicts should not be mutated by build_quant_config."""
     from vllm_omni.quantization import build_quant_config
