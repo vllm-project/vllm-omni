@@ -180,6 +180,9 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
             device: The device to run on.
         """
         self.vllm_config = vllm_config
+        from vllm_omni.diffusion.attention.strategy import validate_strategy_runtime
+
+        validate_strategy_runtime(od_config)
         self.od_config = od_config
         self.device = device
         self.pipeline: Any | None = None
@@ -263,6 +266,17 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
             logger.info("Model runner: %s combines CUDA graph decode with torch.compile.", attr_name)
 
         compile_granularity = self.od_config.diffusion_compile_granularity
+        compile_dynamic = self.od_config.diffusion_compile_dynamic
+        strategy_runner = getattr(model, "_attention_strategy_runner", None)
+        if strategy_runner is not None:
+            strategy_runner.compile(dynamic=compile_dynamic, granularity=compile_granularity)
+            logger.info(
+                "Configured %s compilation for %d attention layouts on %s",
+                compile_granularity,
+                len(strategy_runner.plan.layout_names),
+                attr_name,
+            )
+            return
         try:
             if compile_granularity == "full":
                 model.compile(**compile_kwargs)
@@ -384,6 +398,13 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                 f"{self.od_config.model_class_name} does not support that contract."
             )
 
+        from vllm_omni.diffusion.attention.strategy import (
+            iter_attention_strategy_runners,
+            validate_pipeline_attention_strategy,
+        )
+
+        validate_pipeline_attention_strategy(self.pipeline, self.od_config)
+
         # The offloader owns loader-plan handoff and startup recovery. The
         # runner only receives the pipeline/backend pair that is ready to use.
         self.pipeline, self.offload_backend = enable_offload_backend(
@@ -391,6 +412,15 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
             self.pipeline,
             device=self.device,
         )
+
+        # A strategy may not silently fall back to eager or a pipeline-specific
+        # compilation path that bypasses its immutable forward bank.
+        active_strategy = (
+            getattr(getattr(self.od_config, "diffusion_attention_config", None), "strategy", None) is not None
+        )
+        if active_strategy and not self.od_config.enforce_eager:
+            if not current_omni_platform.supports_torch_inductor() or hasattr(self.pipeline, "setup_compile"):
+                raise ValueError("Attention strategies require the shared transformer compiler")
 
         # Apply torch.compile if not in eager mode
         if not self.od_config.enforce_eager:
@@ -404,7 +434,11 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                             exc,
                         )
                 else:
-                    transformer_attrs = getattr(self.pipeline, "_dit_modules", None)
+                    transformer_attrs = (
+                        self.pipeline.attention_strategy_components
+                        if active_strategy
+                        else getattr(self.pipeline, "_dit_modules", None)
+                    )
                     if not transformer_attrs:
                         transformer_attrs = ("transformer", "transformer_2")
                     for attr_name in transformer_attrs:
@@ -414,6 +448,11 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                     "Model runner: Platform %s does not support torch inductor, skipping torch.compile.",
                     current_omni_platform.get_torch_device(),
                 )
+
+        if active_strategy and not self.od_config.enforce_eager:
+            runners = [runner for _, runner in iter_attention_strategy_runners(self.pipeline)]
+            if not runners or any(runner is None or not runner.compiled for runner in runners):
+                raise ValueError("Every strategy transformer must activate its configured compilation mode")
 
         # Setup cache backend
         self.cache_backend = get_cache_backend(self.od_config.cache_backend, self.od_config.cache_config)

@@ -59,12 +59,13 @@ def test_transformer_declares_cache_sp_layerwise_offload_and_hsdp():
     assert matched == ["blocks.0", "blocks.1"]
 
 
-def test_packed_attention_is_a_regional_compile_boundary():
+def test_legacy_packed_attention_keeps_its_compile_boundary():
     from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import (
         MiniMaxH3Attention,
     )
 
-    assert getattr(MiniMaxH3Attention._run_packed_attention, "_torchdynamo_disable", False)
+    assert getattr(MiniMaxH3Attention._run_packed_attention_eager, "_torchdynamo_disable", False)
+    assert not getattr(MiniMaxH3Attention._run_packed_attention, "_torchdynamo_disable", False)
 
 
 def test_denoise_branch_keeps_fast_h3_prefix_geometry_model_local():

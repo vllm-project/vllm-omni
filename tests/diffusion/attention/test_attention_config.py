@@ -939,6 +939,7 @@ class TestAttentionInitUsesCurrentDiffusionConfig:
             return sentinel
 
         fake_attention = SimpleNamespace(
+            attention_execution=layer_mod.LEGACY_EXECUTION,
             allow_fp32_fallback=False,
             attention=SimpleNamespace(
                 forward=_selected_forward,
@@ -1015,6 +1016,9 @@ class TestOptInFloat32Fallback:
                 return _SelectedImpl
 
         class _Strategy:
+            name = "none"
+            enabled = False
+
             def pre_attention(self, query, key, value, metadata):
                 events.append("pre")
                 state["prepared"] = (

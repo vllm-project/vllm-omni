@@ -135,8 +135,9 @@ class _FinalOnlyStepPipeline:
         return DiffusionOutput(output=state.latents.clone())
 
 
-class _CompileTrackingModel:
+class _CompileTrackingModel(torch.nn.Module):
     def __init__(self):
+        super().__init__()
         self.compile_calls = []
 
     def compile(self, *args, **kwargs):
@@ -359,8 +360,9 @@ def test_refresh_cache_prefers_request_steps_then_schedule_then_pipeline_default
 
 @pytest.mark.core_model
 @pytest.mark.cpu
-def test_refresh_cache_without_request_or_pipeline_default_warns(caplog, monkeypatch):
-    monkeypatch.setattr(model_runner_module.logger, "handlers", [*model_runner_module.logger.handlers, caplog.handler])
+def test_refresh_cache_without_request_or_pipeline_default_warns(monkeypatch):
+    warning = Mock()
+    monkeypatch.setattr(model_runner_module.logger, "warning", warning)
     cache_backend = _EnabledCacheBackend()
     runner = _make_runner(cache_backend=cache_backend, cache_backend_name="cache_dit")
     req = _make_request()
@@ -369,7 +371,9 @@ def test_refresh_cache_without_request_or_pipeline_default_warns(caplog, monkeyp
     DiffusionModelRunner._refresh_cache_for_requests(runner, [req], od_config=runner.od_config)
 
     assert cache_backend.refresh_calls == []
-    assert "requires num_inference_steps to be passed explicitly" in caplog.text
+    warning.assert_called_once()
+    assert "requires num_inference_steps to be passed explicitly" in warning.call_args.args[0]
+    assert warning.call_args.args[1] == "cache_dit"
 
 
 @pytest.mark.core_model
@@ -589,6 +593,48 @@ def test_compile_transformer_uses_full_granularity(monkeypatch):
     assert model.compile_calls == [((), {"dynamic": False})]
     assert regional_calls == []
     assert runner.pipeline.transformer is model
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+@pytest.mark.parametrize("granularity", ["full", "regional"])
+def test_compile_strategy_respects_granularity(monkeypatch, granularity):
+    from vllm_omni.diffusion.attention.strategy import AttentionStrategyRunner, ForwardStrategyPlan
+
+    class StrategyTrackingModel(_CompileTrackingModel):
+        _repeated_blocks = ["Linear"]
+
+        def __init__(self):
+            super().__init__()
+            self.block = torch.nn.Linear(2, 2)
+            self._attention_strategy_runner = AttentionStrategyRunner(
+                self, ForwardStrategyPlan(("dense", "sparse"), None, ())
+            )
+
+        def forward_with_attention_layout(self, *args, **kwargs):
+            return None
+
+    model = StrategyTrackingModel()
+    runner = _make_compile_runner(model, compile_granularity=granularity, compile_dynamic=False)
+    compile_calls = []
+
+    def compile_forward(forward, **options):
+        compile_calls.append(options)
+        return forward
+
+    monkeypatch.setattr(torch, "compile", compile_forward)
+    DiffusionModelRunner._compile_transformer(runner, "transformer")
+    assert model._attention_strategy_runner.compiled
+    assert compile_calls == [
+        {
+            "backend": "inductor",
+            "dynamic": False,
+            "fullgraph": False,
+            "recompile_limit": 8,
+            "isolate_recompiles": True,
+        }
+    ] * (2 if granularity == "full" else 1)
+    assert model.compile_calls == []
 
 
 @pytest.mark.core_model

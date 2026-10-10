@@ -639,6 +639,8 @@ class MiniMaxH3Pipeline(
     load_vae_decoder: bool = True
     supports_request_cancellation: ClassVar[bool] = True
 
+    attention_strategy_components = ("transformer", "transformers_ref")
+
     _dit_modules: ClassVar[list[str]] = ["transformer", "transformers_ref"]
     _encoder_modules: ClassVar[list[str]] = ["text_encoder"]
     _vae_modules: ClassVar[list[str]] = ["video_vae", "audio_vae"]
@@ -1008,6 +1010,7 @@ class MiniMaxH3Pipeline(
                 od_config,
                 quant_config=transformer_quant_config,
                 diffusers_weights=modular,
+                attention_component="transformers_ref",
             )
 
         self._vdn = VDNCheckpoint.from_od_config(od_config, self.transformer)
@@ -2934,6 +2937,12 @@ class MiniMaxH3Pipeline(
             num_inference_steps=num_steps,
             extra_args=extra,
         )
+        attention_config = getattr(self.od_config, "diffusion_attention_config", None)
+        if quality_plan.cache_dit is not None and getattr(attention_config, "strategy", None) is not None:
+            raise OmniClientError(
+                "MiniMax H3 attention strategies do not support request cache acceleration; "
+                "use quality=lossless or omit quality with cache_backend=none"
+            )
         if continuation is not None and quality_plan.cache_dit is not None:
             raise OmniClientError("MiniMax H3 continuation requires uncached denoising; set quality=lossless")
         self._cache_dit_runtime.prepare(quality_plan.cache_dit)
