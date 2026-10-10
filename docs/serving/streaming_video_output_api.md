@@ -115,6 +115,12 @@ be combined in one interaction event.
 This feature is pipeline-dependent. An enabled endpoint does not imply that
 the loaded model supports midway prompt or camera updates.
 
+`session.interaction.queued` confirms only that the server accepted the
+message. If the model rejects the interaction later, for example because the
+modality is unsupported or the payload is invalid, the server sends an `error`
+with `"code": "interaction_failed"` and the same `event_id`. Generation keeps
+streaming, and the `event_id` may be reused.
+
 The default start timeout is 10 seconds and the server reports a stall after
 about 60 seconds without generation progress or a `session.ping`. See the
 [streaming video generation example](https://github.com/vllm-project/vllm-omni/tree/main/examples/online_serving/streaming_video_generation)

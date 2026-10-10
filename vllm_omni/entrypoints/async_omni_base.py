@@ -15,7 +15,7 @@ import asyncio
 import os
 import time
 from collections.abc import AsyncGenerator, Iterable
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from vllm.logger import init_logger
 from vllm.outputs import CompletionOutput
@@ -31,6 +31,9 @@ from vllm_omni.entrypoints.omni_base import (
 )
 from vllm_omni.metrics.stats import OrchestratorAggregator as OrchestratorMetrics
 from vllm_omni.outputs import OmniRequestOutput
+
+if TYPE_CHECKING:
+    from vllm_omni.entrypoints.client_request_state import ClientRequestState
 
 logger = init_logger(__name__)
 _FINAL_OUTPUT_IDLE_SLEEP_S = 0.001
@@ -66,7 +69,7 @@ class AsyncEventResolver:
         }
         return fut
 
-    async def resolve(self, ack: OmniACK):
+    async def resolve(self, ack: OmniACK | dict[str, Any]):
         tid = getattr(ack, "task_id", None)
 
         if tid is None and isinstance(ack, dict):
@@ -101,6 +104,11 @@ class AsyncEventResolver:
                     elapsed = time.time() - task_info["start_time"]
                     logger.info(f"[Resolver] Task {tid} completed successfully in {elapsed:.2f}s.")
                     fut.set_result(task_info["received"])
+
+
+def _log_interaction_error_handler_failure(task: asyncio.Future) -> None:
+    if not task.cancelled() and task.exception() is not None:
+        logger.error("Interaction error callback failed", exc_info=task.exception())
 
 
 class AsyncOmniBase(OmniBase):
@@ -141,6 +149,30 @@ class AsyncOmniBase(OmniBase):
         already failed through their per-request queues.
         """
         del error
+
+    def _dispatch_interaction_error(self, req_state: ClientRequestState, msg: ErrorMessage) -> None:
+        """Report a rejected mid-stream interaction without failing its request.
+
+        The orchestrator reports a rejected interaction as a non-fatal error
+        tagged with the event_id. The generation keeps running, so the error
+        goes to the request's ``on_error`` callback instead of its output
+        queue, where ``generate()`` would raise on it.
+        """
+        assert msg.event_id is not None
+        handler = req_state.interaction_error_handler
+        if handler is None:
+            logger.warning(
+                "[%s] Interaction %s rejected for req %s: %s",
+                self._name,
+                msg.event_id,
+                msg.request_id,
+                msg.error,
+            )
+            return
+        task = asyncio.ensure_future(handler(msg.event_id, msg.error))
+        req_state.interaction_error_tasks.add(task)
+        task.add_done_callback(req_state.interaction_error_tasks.discard)
+        task.add_done_callback(_log_interaction_error_handler_failure)
 
     def _resolve_transfer_replica(self, stage_id: int, request_id: str) -> int | None:
         """Look up the sticky-routed replica for (stage_id, request_id).
@@ -369,7 +401,11 @@ class AsyncOmniBase(OmniBase):
                         # death and falls through to the except handler below.
                         if msg.request_id is not None:
                             req_state = self.request_states.get(msg.request_id)
-                            if req_state is not None:
+                            if req_state is not None and not msg.fatal and msg.event_id is not None:
+                                # A rejected mid-stream interaction is scoped to
+                                # its event: report it, keep the generation running.
+                                self._dispatch_interaction_error(req_state, msg)
+                            elif req_state is not None:
                                 await req_state.queue.put(msg)
                             else:
                                 logger.warning(

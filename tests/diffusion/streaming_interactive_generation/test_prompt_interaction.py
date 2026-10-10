@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import queue
 import time
+from collections.abc import Callable
 from contextlib import contextmanager
 from types import SimpleNamespace
 from typing import Any, cast
@@ -668,6 +669,69 @@ class TestPromptUpdateIntegration:
                 await asyncio.gather(generate_task, return_exceptions=True)
             await self._shutdown_pipeline_omni_harness(omni, fixture, inline_client)
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("with_callback", [True, False])
+    async def test_rejected_interaction_keeps_async_omni_stream_running(
+        self, pipeline: HeliosPipeline, monkeypatch: pytest.MonkeyPatch, with_callback: bool
+    ) -> None:
+        """A worker-side rejection after queueing is event-scoped and must not end ``generate()``."""
+        pipeline.encode_prompt = MagicMock(  # pyright: ignore[reportAttributeAccessIssue]
+            side_effect=ValueError("prompt embeds are not ready")
+        )
+        runner = _make_diffusion_model_runner(pipeline=pipeline)
+        rejections: list[tuple[str, str]] = []
+        dispatched: list[str | None] = []
+
+        async def on_error(event_id: str, reason: str) -> None:
+            rejections.append((event_id, reason))
+
+        # Emit the next chunk only after AsyncOmni has handled the rejection, so
+        # the rejection reaches the request while its stream is still open.
+        prompt_update_engine = self._PromptUpdateEngine(
+            self._IncrementalStreamingPipeline(),
+            runner,
+            ready_for_next_chunk=lambda _state: bool(rejections if with_callback else dispatched),
+        )
+        inline_client = self._make_inline_pipeline_client(prompt_update_engine)
+        fixture = _build_harness([inline_client])
+        omni = self._make_async_omni(self._OrchestratorBridgeEngine(fixture))
+        dispatch = omni._dispatch_interaction_error
+
+        def recording_dispatch(req_state, msg):
+            dispatched.append(msg.event_id)
+            dispatch(req_state, msg)
+
+        monkeypatch.setattr(omni, "_dispatch_interaction_error", recording_dispatch)
+
+        generate_task: asyncio.Task[list[OmniRequestOutput]] | None = None
+        try:
+            generate_task = asyncio.create_task(self._collect_generate_outputs(omni))
+            await _wait_for(
+                lambda: (
+                    len(runner.state_cache) > 0
+                    and any(state.external_request_id == "req-omni" for state in omni.request_states.values())
+                )
+            )
+
+            await omni.submit_interaction_async(
+                "req-omni",
+                interaction=_prompt_interaction("new scene", event_id="ui-update-1"),
+                on_error=on_error if with_callback else None,
+            )
+            outputs = await generate_task
+
+            assert [output.custom_output["chunk"] for output in outputs] == [0, 1]
+            assert dispatched == ["ui-update-1"]
+            if with_callback:
+                assert len(rejections) == 1
+                assert rejections[0][0] == "ui-update-1"
+                assert "prompt embeds are not ready" in rejections[0][1]
+        finally:
+            if generate_task is not None and not generate_task.done():
+                generate_task.cancel()
+                await asyncio.gather(generate_task, return_exceptions=True)
+            await self._shutdown_pipeline_omni_harness(omni, fixture, inline_client)
+
     @staticmethod
     async def _collect_generate_outputs(omni: AsyncOmni) -> list[OmniRequestOutput]:
         outputs: list[OmniRequestOutput] = []
@@ -836,9 +900,15 @@ class TestPromptUpdateIntegration:
             self,
             streaming_pipeline: TestPromptUpdateIntegration._IncrementalStreamingPipeline,
             runner: DiffusionModelRunner,
+            ready_for_next_chunk: Callable[[StepRequestState], bool] | None = None,
         ) -> None:
             self.streaming_pipeline = streaming_pipeline
             self._runner = runner
+            # Default: the next chunk waits for a queued prompt update.
+            self._ready_for_next_chunk = ready_for_next_chunk or (
+                lambda state: isinstance(state.interaction_sessions.get("prompt"), PromptSession)
+                and state.interaction_sessions["prompt"].pending_event is not None
+            )
             self.executor = SimpleNamespace(
                 register_failure_callback=MagicMock(),
                 check_health=MagicMock(),
@@ -864,10 +934,7 @@ class TestPromptUpdateIntegration:
             ]
 
             deadline = time.monotonic() + 5.0
-            while (
-                not isinstance(state.interaction_sessions.get("prompt"), PromptSession)
-                or state.interaction_sessions["prompt"].pending_event is None
-            ):
+            while not self._ready_for_next_chunk(state):
                 if time.monotonic() >= deadline:
                     raise TimeoutError("timed out waiting for prompt update during streaming")
                 await asyncio.sleep(0.01)

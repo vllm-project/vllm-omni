@@ -458,10 +458,25 @@ class OmniStreamingVideoOutputHandler:
 
         interaction_payloads_by_id[event_id] = normalized
 
+        async def _on_rejected(rejected_event_id: str, reason: str) -> None:
+            # A rejection that arrives after the queued ack is reported as a
+            # correlated error; the generation keeps streaming.
+            logger.info("Interaction %s rejected for request %s: %s", rejected_event_id, request_id, reason)
+            interaction_payloads_by_id.pop(rejected_event_id, None)
+            await self._send_error(
+                websocket,
+                "Failed to apply interaction",
+                code="interaction_failed",
+                request_id=request_id,
+                event_id=rejected_event_id,
+                send_lock=send_lock,
+            )
+
         try:
             await self._engine_client.submit_interaction_async(
                 request_id,
                 interaction=normalized,
+                on_error=_on_rejected,
             )
         except Exception:
             logger.exception("Failed to apply interaction for request %s", request_id, exc_info=True)
