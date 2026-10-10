@@ -201,6 +201,8 @@ When `profiler_config.profiler` is set for a diffusion model, the server exposes
 - `POST /start_profile`
 - `POST /stop_profile`
 
+> **Note:** `VLLM_TORCH_PROFILER_DIR` was removed in vLLM v0.16.0 when profiling moved to `ProfilerConfig`, and nothing reads it any more. A stale value does not enable these endpoints; the server logs a migration warning at startup and leaves `/start_profile` unregistered. Use `--profiler-config` as shown below, or a `profiler_config` block in the stage YAML. `--profiler-config` is a nested config flag, so it is listed under `vllm serve --help=all` or `vllm serve --help=VllmConfig` rather than in the default `--help` output.
+
 ### Start the server
 
 Single-stage diffusion serving with torch profiler:
