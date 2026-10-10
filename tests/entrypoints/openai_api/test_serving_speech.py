@@ -858,6 +858,26 @@ class TestSpeechAPI:
         assert response.status_code == 400
         assert "finite" in response.json()["detail"]
 
+    @pytest.mark.parametrize(
+        ("consent", "expected_message"),
+        [
+            ("", "consent cannot be empty or whitespace"),
+            ("   ", "consent cannot be empty or whitespace"),
+            ("consent/id", "consent must not contain path separators or NUL"),
+            ("c" * 1025, "consent too long"),
+        ],
+    )
+    def test_upload_voice_embedding_invalid_consent_rejected(self, client, consent, expected_message):
+        """Embedding uploads apply the same consent safeguards as audio uploads."""
+        data = {
+            "speaker_embedding": json.dumps([0.1] * 1024),
+            "consent": consent,
+            "name": "invalid_consent_embedding",
+        }
+        response = client.post("/v1/audio/voices", data=data)
+        assert response.status_code == 400
+        assert expected_message in response.json()["detail"]
+
     @pytest.mark.asyncio
     async def test_diffusion_create_speech_with_unknown_voice(self, mocker: MockerFixture):
         engine_client = mocker.MagicMock()
@@ -4019,6 +4039,28 @@ class TestSpeechBatchAPI:
         body = response.json()
         assert body["id"].startswith("speech-batch-")
 
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            {
+                "task_type": "CustomVoice",
+                "voice": "default",
+                "items": [{"input": "Hello"}],
+            },
+            {
+                "task_type": "CustomVoice",
+                "items": [{"input": "Hello", "voice": "default"}],
+            },
+        ],
+    )
+    def test_batch_default_voice_is_treated_as_placeholder(self, client, payload):
+        """The API placeholder voice should follow single-request normalization in batches."""
+        response = client.post("/v1/audio/speech/batch", json=payload)
+        assert response.status_code == 200
+        assert response.json()["succeeded"] == 1
+        handler = client.app.state.openai_serving_speech
+        assert handler._validate_tts_request.call_args.args[0].voice is None
+
 
 class TestMergeBatchItem:
     """Tests for the _merge_batch_item static method."""
@@ -4575,7 +4617,7 @@ def test_api_server_create_speech_batch_omits_null_fields(mocker: MockerFixture)
                         input_token_details=SpeechInputTokenDetails(text_tokens=18, audio_tokens=101),
                     ),
                 ),
-                SpeechBatchItemResult(index=1, status="error", error="Input text cannot be empty"),
+                SpeechBatchItemResult(index=1, status="error", error="Simulated item failure"),
             ],
             total=2,
             succeeded=1,
@@ -4583,7 +4625,9 @@ def test_api_server_create_speech_batch_omits_null_fields(mocker: MockerFixture)
         )
     )
     raw_request = _make_api_server_request(handler, path="/v1/audio/speech/batch")
-    request = BatchSpeechRequest(items=[SpeechBatchItem(input="hi"), SpeechBatchItem(input="")])
+    # Both requests must be valid: this test pins the mocked response shape,
+    # not request validation behavior.
+    request = BatchSpeechRequest(items=[SpeechBatchItem(input="hi"), SpeechBatchItem(input="bye")])
 
     response = asyncio.run(api_server_module.create_speech_batch(request, raw_request))
 
@@ -4599,7 +4643,7 @@ def test_api_server_create_speech_batch_omits_null_fields(mocker: MockerFixture)
     assert "usage" not in errored
     assert "audio_data" not in errored
     assert "media_type" not in errored
-    assert errored["error"] == "Input text cannot be empty"
+    assert errored["error"] == "Simulated item failure"
 
 
 def test_api_server_create_audio_generate_without_handler_returns_404():
