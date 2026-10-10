@@ -254,9 +254,12 @@ class DiffusionParallelConfig:
     """Number of tensor parallel groups."""
 
     enable_expert_parallel: bool = False
-    # Head-sharded models may partition each SP group into smaller EP groups.
-    expert_parallel_size: int | None = Field(default=None, gt=0, strict=True)
     """Enable expert parallelism for MoE layers (TP is still used for non-MoE layers)."""
+
+    expert_parallel_size: int | None = Field(default=None, gt=0, strict=True)
+    """Expert-parallel degree for models with head-sharded experts; defaults to the
+    sequence-parallel degree. Must divide the sequence-parallel degree and requires
+    enable_expert_parallel."""
 
     sequence_parallel_size: int | None = None
     """Number of sequence parallel groups.
