@@ -2213,6 +2213,8 @@ async def generate_images(
         _update_if_not_none(gen_params, "num_inference_steps", request.num_inference_steps)
         _update_if_not_none(gen_params, "guidance_scale", request.guidance_scale)
         _update_if_not_none(gen_params, "true_cfg_scale", request.true_cfg_scale)
+        # Whitelisted per-request sampling grid (e.g. QwenImage21Pipeline's sigmas).
+        _update_if_not_none(gen_params, "sigmas", (request.model_extra or {}).get("sigmas"))
         # If seed is not provided, generate a random one to ensure
         # a proper generator is initialized in the backend.
         # This fixes issues where using the default global generator

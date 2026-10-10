@@ -156,13 +156,13 @@ def _make_pre_process_func(tmp_path, extras: dict):
     return get_qwen_image_21_pre_process_func(od_config)
 
 
-def _make_request(sigmas: list[float] | None = None):
+def _make_request(sigmas: list[float] | None = None, extra_args: dict | None = None):
     from vllm_omni.diffusion.request import OmniDiffusionRequest
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
 
     return OmniDiffusionRequest(
         prompt=OmniTextPrompt(prompt="a cat"),
-        sampling_params=OmniDiffusionSamplingParams(sigmas=sigmas),
+        sampling_params=OmniDiffusionSamplingParams(sigmas=sigmas, extra_args=extra_args or {}),
         request_id="req-0",
     )
 
@@ -189,3 +189,34 @@ def test_pre_process_leaves_sigmas_none_without_sample_sigmas(tmp_path):
     request = pre_process(_make_request())
 
     assert request.sampling_params.sigmas is None
+
+
+# ---------------------------------------------------------------------------
+# serving extra_body path: whitelisted sigmas arrive in ``extra_args``
+# ---------------------------------------------------------------------------
+
+
+def test_pre_process_hoists_sigmas_from_extra_args_over_sample_sigmas(tmp_path):
+    """extra-body sigmas (serving layer puts them in extra_args) win over the grid."""
+    pre_process = _make_pre_process_func(tmp_path, {"sample_sigmas": SAMPLE_SIGMAS})
+
+    request = pre_process(_make_request(extra_args={"sigmas": [1.0, 0.75, 0.5]}))
+
+    assert request.sampling_params.sigmas == [1.0, 0.75, 0.5]
+
+
+def test_pre_process_typed_sigmas_win_over_extra_args(tmp_path):
+    pre_process = _make_pre_process_func(tmp_path, {"sample_sigmas": SAMPLE_SIGMAS})
+
+    request = pre_process(_make_request(sigmas=[1.0, 0.5], extra_args={"sigmas": [0.9, 0.1]}))
+
+    assert request.sampling_params.sigmas == [1.0, 0.5]
+
+
+def test_pre_process_extra_args_sigmas_coerced_to_float(tmp_path):
+    pre_process = _make_pre_process_func(tmp_path, {})
+
+    request = pre_process(_make_request(extra_args={"sigmas": [1, 0.5]}))
+
+    assert request.sampling_params.sigmas == [1.0, 0.5]
+    assert all(isinstance(s, float) for s in request.sampling_params.sigmas)
