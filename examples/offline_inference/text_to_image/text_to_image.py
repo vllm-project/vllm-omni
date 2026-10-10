@@ -91,11 +91,23 @@ def build_parallel_knob_kwargs(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def _normalize_images_for_save(images: list[Any]) -> list[Any]:
-    """Convert NumPy diffusion outputs to PIL images before saving."""
+    """Convert NumPy and tensor diffusion outputs to PIL images before saving."""
     normalized = []
     for image in images:
         if isinstance(image, np.ndarray):
             normalized.extend(numpy_to_pil(image))
+        elif isinstance(image, torch.Tensor):
+            tensor = image.detach().to(device="cpu", dtype=torch.float32)
+            if tensor.ndim == 3:
+                tensor = tensor.unsqueeze(0)
+            if tensor.ndim == 4 and tensor.shape[1] in (1, 3, 4):
+                tensor = tensor.permute(0, 2, 3, 1)
+            if tensor.ndim != 4:
+                normalized.append(image)
+                continue
+            if tensor.min().item() < 0.0:
+                tensor = tensor / 2 + 0.5
+            normalized.extend(numpy_to_pil(tensor.clamp(0, 1).numpy()))
         else:
             normalized.append(image)
     return normalized
@@ -370,7 +382,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--profiler-config",
         type=parse_profiler_config,
         default=None,
-        help='JSON profiler config for torch/cuda profiling, e.g. \'{"profiler":"torch","torch_profiler_dir":"./perf"}\'.',
+        help=(
+            "JSON profiler config for torch/cuda profiling, e.g. "
+            '\'{"profiler":"torch","torch_profiler_dir":"./perf"}\'.'
+        ),
     )
     parser.add_argument(
         "--log-stats",
