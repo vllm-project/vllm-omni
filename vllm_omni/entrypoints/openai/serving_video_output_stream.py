@@ -581,6 +581,8 @@ class OmniStreamingVideoOutputHandler:
             gen_params.true_cfg_scale = request.true_cfg_scale
         if "seed" in provided_fields and request.seed is not None:
             gen_params.seed = request.seed
+        if "generator_device" in provided_fields and request.generator_device is not None:
+            gen_params.generator_device = request.generator_device
         if "boundary_ratio" in provided_fields and request.boundary_ratio is not None:
             gen_params.boundary_ratio = request.boundary_ratio
         if "flow_shift" in provided_fields and request.flow_shift is not None:

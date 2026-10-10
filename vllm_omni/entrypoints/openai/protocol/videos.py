@@ -240,6 +240,21 @@ class VideoGenerationRequest(BaseModel):
         description="True CFG scale (model-specific parameter, may be ignored if not supported)",
     )
     seed: int | None = Field(default=None, ge=_INT64_MIN, le=_INT64_MAX, description="Random seed for reproducibility")
+    generator_device: str | None = Field(
+        default=None,
+        description=(
+            "Device for the seeded torch.Generator. Only 'cpu' is accepted; "
+            "any other value falls back to the runner's default device."
+        ),
+    )
+
+    @field_validator("generator_device")
+    @classmethod
+    def validate_generator_device(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return value.strip().lower() if value.strip().lower() == "cpu" else None
+
     generate_sound: bool = Field(
         default=False,
         description="Request model-generated audio for video models that support sound generation.",
