@@ -1623,14 +1623,17 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
     def _runner_model_omni_flag(self, name: str, default: bool = False) -> bool:
         return self._model_omni_flag(getattr(self, "model", None), name, default)
 
-    def _client_multimodal_output_keys(self) -> tuple[str, ...]:
+    def _client_multimodal_output_keys(self) -> tuple[str, ...] | None:
+        """None uses default routing; () suppresses client payloads; other tuples select keys."""
         raw = getattr(
             getattr(self, "model", None),
             "omni_client_multimodal_output_keys",
-            (),
+            None,
         )
+        if raw is None:
+            return None
         if not isinstance(raw, tuple) or any(not isinstance(key, str) or not key for key in raw):
-            raise TypeError("omni_client_multimodal_output_keys must be a tuple of non-empty strings")
+            raise TypeError("omni_client_multimodal_output_keys must be None or a tuple of non-empty strings")
         if len(raw) != len(set(raw)):
             raise ValueError("omni_client_multimodal_output_keys must not contain duplicates")
         return raw
@@ -1958,7 +1961,9 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             # orchestrator bridge; non-async stages preserve legacy behavior.
             pooler_inter, pooler_client = pooler_output, pooler_output
         client_output_keys = self._client_multimodal_output_keys()
-        if client_output_keys:
+        if client_output_keys == ():
+            pooler_client = None
+        elif client_output_keys:
             allowed = frozenset(client_output_keys)
             pooler_client = [
                 {key: value for key, value in payload.items() if key in allowed} for payload in pooler_output

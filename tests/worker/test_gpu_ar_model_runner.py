@@ -26,6 +26,9 @@ from vllm_omni.core.prefix_cache import ModelCachePolicy, StageCacheOutputs
 from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
 from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
 from vllm_omni.entrypoints.openai.tts_adapters.base import PreparedRequest
+from vllm_omni.model_executor.models.nemotron_voicechat.nemotron_voicechat_talker import (
+    NemotronVoiceChatTalkerForConditionalGeneration,
+)
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.worker import gpu_ar_model_runner, sparse_audio
 from vllm_omni.worker.gpu_ar_model_runner import (
@@ -1194,6 +1197,79 @@ def test_build_omni_output_splits_client_mm_from_inter_stage_keys(monkeypatch):
     assert output.inter_stage_outputs is not None
     assert "hidden" in output.inter_stage_outputs[0]
     assert "audio" not in output.inter_stage_outputs[0]
+
+
+@pytest.mark.parametrize("async_chunk,role", [(True, "receiver"), (True, "sender"), (True, None), (False, None)])
+@pytest.mark.parametrize("client_keys", [None, (), ("meta.nvc_tts_step",)])
+def test_codec_client_output_policy_preserves_inter_stage_payload(monkeypatch, mocker, async_chunk, role, client_keys):
+    runner = _make_async_output_runner(engine_output_type="latent")
+    runner._async_chunk = runner.model_config.async_chunk = async_chunk
+    runner.model_config.stage_id = 1
+    runner.model_config.stage_connector_config = {"extra": {"role": role}} if role else {}
+    runner.model.omni_client_multimodal_output_keys = client_keys
+    runner._pooler_payload_include_hidden_flag = False
+    accumulated = {}
+
+    monkeypatch.setattr(GPUARModelRunner, "_resolve_pooler_payload_req_ids", lambda self, req_ids: ("latent", req_ids))
+    monkeypatch.setattr(GPUARModelRunner, "_should_accumulate_full_payload_output", lambda self: True)
+    monkeypatch.setattr(
+        GPUARModelRunner,
+        "accumulate_full_payload_output",
+        lambda self, rid, payload, request: accumulated.update({rid: payload}),
+    )
+    monkeypatch.setattr(GPUARModelRunner, "_process_additional_information_updates", lambda *args, **kwargs: None)
+
+    # The rows have different cumulative histories, not newly sampled frames.
+    prefixes = [torch.arange(3 * 31).reshape(3, 31), torch.arange(5 * 31).reshape(5, 31)]
+    output = runner._build_omni_model_runner_output_from_snapshot(
+        scheduler_output=mocker.Mock(
+            spec=SchedulerOutput, total_num_scheduled_tokens=2, num_scheduled_tokens={"r1": 1, "r2": 1}
+        ),
+        hidden_states=torch.zeros(2, 1),
+        staged_hidden_states_cpu=None,
+        multimodal_outputs={"codes": {"audio": prefixes}, "meta": {"nvc_tts_step": torch.tensor([3, 5])}},
+        req_ids_output_copy=["r1", "r2"],
+        req_id_to_index_output_copy={"r1": 0, "r2": 1},
+        valid_sampled_token_ids=[[101], [102]],
+        logprobs_lists=None,
+        prompt_logprobs_dict={},
+        num_nans_in_logits=None,
+        kv_connector_output=None,
+        ec_connector_output=None,
+        cudagraph_stats=None,
+        kv_extracted_req_ids=["r2"],
+        num_scheduled_tokens_np=np.array([1, 1], dtype=np.int32),
+        query_start_loc_cpu=torch.tensor([0, 1], dtype=torch.long),
+    )
+
+    for index, rid in enumerate(("r1", "r2")):
+        torch.testing.assert_close(output.inter_stage_outputs[index]["codes.audio"], prefixes[index])
+        torch.testing.assert_close(accumulated[rid]["codes.audio"], prefixes[index])
+    assert output.sampled_token_ids == [[101], [102]]
+    assert output.kv_extracted_req_ids == ["r2"]
+    assert output.pooler_output is None
+    if client_keys == ():
+        assert output.multimodal_outputs is None
+    elif client_keys:
+        assert all(set(payload) == {"meta.nvc_tts_step"} for payload in output.multimodal_outputs)
+    elif not async_chunk or role == "receiver":
+        for index, payload in enumerate(output.multimodal_outputs):
+            torch.testing.assert_close(payload["codes.audio"], prefixes[index])
+    else:
+        assert output.multimodal_outputs is None
+
+
+@pytest.mark.parametrize(
+    "async_chunk,session_mode,expected",
+    [(True, "duplex", ()), (False, "duplex", None), (True, "turn", None), (False, "turn", None)],
+)
+def test_voicechat_talker_client_output_policy(async_chunk, session_mode, expected):
+    talker = object.__new__(NemotronVoiceChatTalkerForConditionalGeneration)
+    torch.nn.Module.__init__(talker)
+    talker.vllm_config = _make_async_output_runner().vllm_config
+    talker.vllm_config.model_config.async_chunk = async_chunk
+    talker.vllm_config.model_config.session_mode = session_mode
+    assert getattr(talker, "omni_client_multimodal_output_keys", None) == expected
 
 
 def test_build_omni_output_filters_multimodal_by_partial_downstream_batch(monkeypatch):

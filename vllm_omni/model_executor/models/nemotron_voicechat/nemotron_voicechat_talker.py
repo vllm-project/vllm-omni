@@ -97,6 +97,15 @@ def sanitize_tts_model_cfg(tts_model_cfg: dict[str, Any]) -> dict[str, Any]:
 class NemotronVoiceChatTalkerForConditionalGeneration(nn.Module):
     """vLLM AR stage wrapping the vendored NeMo EAR-TTS per-frame step."""
 
+    @property
+    def omni_client_multimodal_output_keys(self) -> tuple[str, ...] | None:
+        model_config = self.vllm_config.model_config
+        if getattr(model_config, "async_chunk", False) and getattr(model_config, "session_mode", "turn") == "duplex":
+            # Code2Wav consumes cumulative histories; the frontend appends deltas.
+            # Keep the histories on the inter-stage path only.
+            return ()
+        return None
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
         self.vllm_config = vllm_config
