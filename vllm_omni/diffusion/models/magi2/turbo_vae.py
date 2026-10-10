@@ -11,6 +11,7 @@ modules and MagiCompiler integration are intentionally omitted.
 from __future__ import annotations
 
 import json
+from collections import deque
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -566,11 +567,58 @@ class Magi2TurboVAEDecoder(nn.Module, DistributedVaeMixin):
             )
             return output.cpu() if output_offload and output.numel() else output
 
+        if output_offload and z.is_cuda and len(tasks) > 1:
+            return self._decode_offloaded(tasks, grid_spec, z.device)
+
         chunks = []
         for task in tasks:
             tensor = self._decode_chunk(task)
             chunks.append((task.grid_coord, tensor.cpu() if output_offload else tensor))
         return self._merge_chunks(dict(chunks), grid_spec)
+
+    def _decode_offloaded(self, tasks: list[TileTask], grid_spec: GridSpec, device: torch.device) -> torch.Tensor:
+        """Overlap chunk D2H with decoding, with at most two copies in flight."""
+        compute_stream = torch.cuda.current_stream(device)
+        copy_stream = torch.cuda.Stream(device=device)
+        pending: deque[tuple[tuple[int, ...], torch.Tensor, torch.Tensor, torch.cuda.Event]] = deque()
+        chunks: dict[tuple[int, ...], torch.Tensor] = {}
+        free_buffers: list[torch.Tensor] = []
+
+        def retire() -> None:
+            coord, _source, host, ready = pending.popleft()
+            ready.synchronize()
+            # Keep completed output in pageable memory so pinning is bounded
+            # by the two in-flight chunks, rather than the full video length.
+            completed = torch.empty(host.shape, dtype=host.dtype, device="cpu")
+            completed.copy_(host)
+            chunks[coord] = completed
+            free_buffers.append(host)
+
+        try:
+            for task in tasks:
+                if len(pending) == 2:
+                    retire()
+                tensor = self._decode_chunk(task)
+                host = free_buffers.pop() if free_buffers else None
+                if host is not None and (host.shape != tensor.shape or host.dtype != tensor.dtype):
+                    host = None
+                if host is None:
+                    host = torch.empty(tensor.shape, dtype=tensor.dtype, device="cpu", pin_memory=True)
+                with torch.cuda.stream(copy_stream):
+                    copy_stream.wait_stream(compute_stream)
+                    host.copy_(tensor, non_blocking=True)
+                    ready = torch.cuda.Event()
+                    ready.record(copy_stream)
+                # _decode_chunk returns fresh decoder storage, possibly a
+                # cropped view. Retain it until its D2H event has completed.
+                pending.append((task.grid_coord, tensor, host, ready))
+            while pending:
+                retire()
+        finally:
+            # An exception in a later decode must not release buffers while
+            # the copy stream is still accessing them.
+            copy_stream.synchronize()
+        return self._merge_chunks(chunks, grid_spec)
 
     forward = decode
 
