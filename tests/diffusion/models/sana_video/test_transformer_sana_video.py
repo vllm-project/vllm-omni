@@ -599,6 +599,53 @@ def test_native_transformer_config_filters_diffusers_metadata():
         SanaVideoTransformerConfig.from_dict(_TINY_CONFIG | {"unsupported_field": True})
 
 
+@pytest.mark.parametrize("with_hooks", [False, True])
+def test_regional_compile_targets_glumb_with_precision_option(monkeypatch, with_hooks):
+    import torch.nn as nn
+
+    import vllm_omni.diffusion.compile as compile_module
+    import vllm_omni.diffusion.models.sana_video.transformer_sana_video as sana_module
+    from vllm_omni.diffusion.compile import regionally_compile
+    from vllm_omni.diffusion.hooks import HookRegistry, ModelHook
+
+    class _StubOmniAttention(nn.Module):
+        def __init__(self, *args, **kwargs):
+            super().__init__()
+
+    monkeypatch.setattr(sana_module, "OmniAttention", _StubOmniAttention)
+    model = sana_module.SanaVideoTransformer3DModel(**(_TINY_CONFIG | {"num_layers": 2}))
+    hooks = []
+    if with_hooks:
+        for block in model.transformer_blocks:
+            hook = ModelHook()
+            HookRegistry.get_or_create(block).register_hook("test", hook)
+            hooks.append(hook)
+    block_forwards = [block.forward for block in model.transformer_blocks]
+    hook_forwards = [hook.fn_ref.original_forward for hook in hooks]
+    compile_calls = []
+
+    def _compile(fn, *args, **kwargs):
+        compile_calls.append((fn, args, kwargs))
+        return lambda *fn_args, **fn_kwargs: fn(*fn_args, **fn_kwargs)
+
+    monkeypatch.setattr(compile_module.torch, "compile", _compile)
+
+    regionally_compile(model, dynamic=True)
+
+    assert sana_module.SanaVideoTransformer3DModel._repeated_blocks == ["GLUMBTempConv"]
+    assert sana_module.SanaVideoTransformer3DModel._regional_compile_inductor_options == {
+        "emulate_precision_casts": True
+    }
+    assert [fn.__self__ for fn, _, _ in compile_calls] == [block.ff for block in model.transformer_blocks]
+    assert [block.forward for block in model.transformer_blocks] == block_forwards
+    assert [hook.fn_ref.original_forward for hook in hooks] == hook_forwards
+    assert model._layerwise_offload_blocks_attrs == ["transformer_blocks"]
+    assert model._regional_compile_blocks_attrs == []
+    assert all(
+        kwargs == {"dynamic": True, "options": {"emulate_precision_casts": True}} for _, _, kwargs in compile_calls
+    )
+
+
 def test_dual_vae_variant_resolution():
     from diffusers.pipelines.pipeline_utils import DiffusionPipeline
 
