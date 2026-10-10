@@ -344,3 +344,49 @@ def test_precapture_covers_final_chunk_without_displacing_steady_graphs(monkeypa
     if max_graphs == 32:
         assert (1, 100, 350) in captured
         assert captured[15:] == [(b, 100, o) for b in [16, 8, 4, 2, 1] for o in [400, 350, 300]]
+
+
+@pytest.mark.parametrize("width,valid", [(0, 0), (3, 2), (8, 8)])
+def test_uniform_capture_mask_cache_reuses_only_key_storage(width, valid):
+    cache = {}
+    args = dict(
+        attn_mask=None,
+        query_cap=8,
+        offset=2,
+        mel_width=width,
+        mel_frames=valid,
+        device=torch.device("cpu"),
+        offset_cap=4,
+        key_masks=cache,
+    )
+    first = _build_capture_mask(batch_size=1, **args)
+    larger = _build_capture_mask(batch_size=4, **args)
+    expected = torch.zeros(8, 8, 12, dtype=torch.bool)
+    expected[:, :width, :valid] = True
+    expected[:, :width, 8:10] = True
+    if width < 8:
+        expected[:, width:] = expected[:, :1]
+    torch.testing.assert_close(larger, expected)
+    assert first.data_ptr() == larger.data_ptr()
+    assert larger.untyped_storage().nbytes() == 12
+    # The CFG split used when filling graph inputs must preserve broadcasting.
+    target = torch.empty_like(larger)
+    target.unflatten(0, (2, 4)).copy_(larger.unflatten(0, (2, 4)))
+    torch.testing.assert_close(target, expected)
+
+
+def test_capture_key_mask_cache_is_bounded_and_excludes_dynamic_masks():
+    cache = {}
+    args = dict(batch_size=1, query_cap=4, mel_width=3, mel_frames=2, device=torch.device("cpu"), key_masks=cache)
+    first = _build_capture_mask(attn_mask=None, offset=0, **args)
+    retained = first.clone()
+    for offset in range(70):
+        _build_capture_mask(attn_mask=None, offset=offset, **args)
+    assert len(cache) == 64
+    torch.testing.assert_close(first, retained)
+    caller = torch.ones(2, 3, 3, dtype=torch.bool)
+    a = _build_capture_mask(attn_mask=caller, offset=0, **args)
+    caller[0, :, 1] = False
+    b = _build_capture_mask(attn_mask=caller, offset=0, **args)
+    assert a[0, :, 1].all() and not b[0, :, 1].any()
+    assert len(cache) == 64

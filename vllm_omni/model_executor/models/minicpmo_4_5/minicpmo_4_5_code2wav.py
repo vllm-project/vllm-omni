@@ -1537,14 +1537,20 @@ class MiniCPMO45Code2Wav(nn.Module):
                 # first user request with a restart-required error.
                 if any(
                     getattr(getattr(backend, attr, None), "_failed", False)
-                    for attr in ("_encoder_graphs", "_chunk_encoder_graph")
+                    for attr in (
+                        "_encoder_graphs",
+                        "_chunk_encoder_graph",
+                        "hift_graph_wrapper",
+                        "_cfm_graph_wrapper",
+                        "_whole_euler_graph_wrapper",
+                    )
                 ):
                     raise
                 logger.warning("MiniCPM-o Code2Wav: %s precapture failed; graphs capture lazily", name, exc_info=True)
                 return False
             if captured:
                 elapsed = time.perf_counter() - started
-                logger.info("MiniCPM-o Code2Wav: precaptured %d %s CUDA Graphs in %.1f s", captured, name, elapsed)
+                logger.info("MiniCPM-o Code2Wav: precaptured %d %s device graphs in %.1f s", captured, name, elapsed)
             return True
 
         precapture("HiFT", backend.precapture_hift)

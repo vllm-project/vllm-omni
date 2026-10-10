@@ -134,6 +134,7 @@ class _FakeGraph:
 def _fake_wrapper(monkeypatch: pytest.MonkeyPatch) -> HiFTGraphWrapper:
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     wrapper = object.__new__(HiFTGraphWrapper)
+    wrapper.device = torch.device("cpu")
     wrapper.capture_batch_sizes = [1]
     wrapper._legit_shapes = {(7, 0), (9, 0)}
     wrapper.graph = {}

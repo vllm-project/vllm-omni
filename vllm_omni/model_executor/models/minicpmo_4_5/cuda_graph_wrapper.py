@@ -7,6 +7,7 @@ import time
 import weakref
 from collections import Counter
 from collections.abc import Callable, Iterable
+from contextlib import nullcontext
 from typing import NamedTuple
 
 import numpy as np
@@ -19,6 +20,36 @@ from vllm.platforms import current_platform
 from vllm_omni.utils.device_copy import index_to_device, to_device_nonblocking
 
 logger = init_logger(__name__)
+
+
+def _graph_api(device: torch.device):
+    """Keep capture mechanics device-specific and graph layouts shared."""
+    return torch.npu if device.type == "npu" else torch.cuda
+
+
+def _new_graph(device: torch.device):
+    return torch.npu.NPUGraph() if device.type == "npu" else CUDAGraph()
+
+
+def _graph_execution_context(device: torch.device):
+    if device.type != "npu":
+        return nullcontext()
+    from vllm_omni.platforms.npu.models.step_audio2_token2wav import npu_token2wav_sdpa_context
+
+    return npu_token2wav_sdpa_context(require_math=True)
+
+
+def _check_graph_failure(wrapper) -> None:
+    if getattr(wrapper, "_failed", False):
+        raise RuntimeError("Code2Wav NPUGraph capture failed; restart the stage before retrying")
+
+
+def _raise_npu_capture_failure(wrapper) -> None:
+    # A failed NPU capture can poison allocator/RNG state. Do not flush graph
+    # pools or promise an eager fallback in this process.
+    if wrapper.device.type == "npu":
+        wrapper._failed = True
+        raise RuntimeError("Code2Wav NPUGraph capture failed; restart the stage before retrying")
 
 
 def codec_frame_range(value, *, name: str) -> range:
@@ -141,6 +172,8 @@ class HiFTGraphWrapper:
         parameter = next(token2wav.hift.parameters())
         self.device = parameter.device
         self.dtype = parameter.dtype
+        if self.device.type == "npu":
+            token2wav.hift.enable_npu_graph_stft()
         self.max_lazy_graphs = int(connector_config.get("hift_max_lazy_graphs", 8))
         if self.max_lazy_graphs < 0:
             raise ValueError("MiniCPM-o hift_max_lazy_graphs must be >= 0")
@@ -190,7 +223,7 @@ class HiFTGraphWrapper:
             self._capture(*key)
         if self._exact_keys:
             logger.info(
-                "Captured %d exact-shape HiFT CUDA Graphs in %.1f s%s",
+                "Captured %d exact-shape HiFT device graphs in %.1f s%s",
                 len(self.graph) - before,
                 time.perf_counter() - started,
                 _format_memory_delta(memory_before, _memory_snapshot(self.device)),
@@ -203,7 +236,8 @@ class HiFTGraphWrapper:
         mel_frames: int,
         source_cache_len: int,
     ):
-        if torch.cuda.is_current_stream_capturing():
+        _check_graph_failure(self)
+        if _graph_api(self.device).is_current_stream_capturing():
             raise RuntimeError("Cannot capture HiFT graph during an active stream capture")
 
         key = (batch_size, mel_frames, source_cache_len)
@@ -213,21 +247,29 @@ class HiFTGraphWrapper:
 
         static_mel = torch.zeros(batch_size, self.mel_frames, mel_frames, device=self.device, dtype=self.dtype)
         static_source_cache = torch.zeros(batch_size, 1, source_cache_len, device=self.device, dtype=self.dtype)
-        current_stream = torch.cuda.current_stream(self.device)
-        warmup_stream = torch.cuda.Stream(device=self.device)
-        warmup_stream.wait_stream(current_stream)
-        with torch.cuda.stream(warmup_stream), torch.no_grad():
-            for _ in range(3):
-                warmup_outputs = self.graph_fn(static_mel, static_source_cache)
-        current_stream.wait_stream(warmup_stream)
-        del warmup_outputs
+        try:
+            current_stream = _graph_api(self.device).current_stream(self.device)
+            warmup_stream = _graph_api(self.device).Stream(device=self.device)
+            warmup_stream.wait_stream(current_stream)
+            with _graph_api(self.device).stream(warmup_stream), torch.no_grad(), _graph_execution_context(self.device):
+                for _ in range(3):
+                    warmup_outputs = self.graph_fn(static_mel, static_source_cache)
+            current_stream.wait_stream(warmup_stream)
+            del warmup_outputs
 
-        graph = CUDAGraph()
-        with torch.cuda.graph(graph, pool=current_platform.get_global_graph_pool()):
-            static_magnitude_output, static_phase_output, static_cache_source_output = self.graph_fn(
-                static_mel,
-                static_source_cache,
-            )
+            graph = _new_graph(self.device)
+            with (
+                torch.no_grad(),
+                _graph_execution_context(self.device),
+                _graph_api(self.device).graph(graph, pool=current_platform.get_global_graph_pool()),
+            ):
+                static_magnitude_output, static_phase_output, static_cache_source_output = self.graph_fn(
+                    static_mel,
+                    static_source_cache,
+                )
+        except Exception:
+            _raise_npu_capture_failure(self)
+            raise
 
         self.graph[key] = graph
         self.static_speech_inputs[key] = static_mel
@@ -247,12 +289,13 @@ class HiFTGraphWrapper:
         graph.replay()
         for rows in range(1, batch_size + 1):
             self.finalize_fn(static_magnitude_output[:rows], static_phase_output[:rows])
-        logger.info("Captured HiFT CUDA Graph for shape %s", key)
+        logger.info("Captured HiFT device graph for shape %s", key)
 
     def replay(self, speech_feat, cache_source):
+        _check_graph_failure(self)
         if int(speech_feat.shape[2]) == 0:
             return empty_hift_outputs(speech_feat)
-        if torch.cuda.is_current_stream_capturing():
+        if _graph_api(self.device).is_current_stream_capturing():
             logger.info("Falling back to eager HiFT inference during an active stream capture")
             return self.decode_fn(speech_feat, cache_source)
 
@@ -290,7 +333,7 @@ class HiFTGraphWrapper:
             if self.lazy_graph_count >= self.max_lazy_graphs:
                 logger.info("Falling back to eager HiFT inference after reaching the lazy Graph limit")
                 return self.decode_fn(speech_feat, cache_source)
-            logger.info("Lazily capturing HiFT CUDA Graph for shape %s", key)
+            logger.info("Lazily capturing HiFT device graph for shape %s", key)
             self._capture(*key)
             self.lazy_graph_count += 1
 
@@ -417,6 +460,7 @@ def _build_capture_mask(
     mel_frames: int,
     device: torch.device,
     offset_cap: int | None = None,
+    key_masks: dict[tuple, torch.Tensor] | None = None,
 ) -> torch.Tensor:
     """Always-on attention mask in the capture layout, so presence-of-mask is not a graph key.
 
@@ -437,6 +481,23 @@ def _build_capture_mask(
     # ``offset_cap`` columns of cache follow the query block; the ones past the
     # request's own ``offset`` are ``_capture_offset`` padding and stay False.
     offset_cap = offset if offset_cap is None else int(offset_cap)
+    if attn_mask is None:
+        # Uniform rows and capture-padding queries all attend to the same
+        # keys. Cache only that vector; expand is a view and graph input
+        # copies materialize it in the arena. Ragged caller masks stay dynamic.
+        key = (query_cap, offset_cap, offset, mel_width, mel_frames, device)
+        mask = None if key_masks is None else key_masks.get(key)
+        if mask is None:
+            mask = torch.zeros(1, 1, query_cap + offset_cap, dtype=torch.bool, device=device)
+            if mel_width > 0:
+                mask[..., : int(mel_frames)] = True
+                if offset > 0:
+                    mask[..., query_cap : query_cap + offset] = True
+            if key_masks is not None:
+                if len(key_masks) >= 64:
+                    key_masks.pop(next(iter(key_masks)))
+                key_masks[key] = mask
+        return mask.expand(2 * int(batch_size), query_cap, -1)
     mask = torch.zeros(
         2 * int(batch_size),
         query_cap,
@@ -444,16 +505,9 @@ def _build_capture_mask(
         dtype=torch.bool,
         device=device,
     )
-    if attn_mask is not None:
-        mask[:, :mel_width, :mel_width] = attn_mask[:, :mel_width, :mel_width]
-        if offset > 0:
-            mask[:, :mel_width, query_cap : query_cap + offset] = attn_mask[
-                :, :mel_width, mel_width : mel_width + offset
-            ]
-    else:
-        mask[:, :mel_width, : int(mel_frames)] = True
-        if offset > 0:
-            mask[:, :mel_width, query_cap : query_cap + offset] = True
+    mask[:, :mel_width, :mel_width] = attn_mask[:, :mel_width, :mel_width]
+    if offset > 0:
+        mask[:, :mel_width, query_cap : query_cap + offset] = attn_mask[:, :mel_width, mel_width : mel_width + offset]
     if query_cap > mel_width:
         mask[:, mel_width:] = mask[:, :1]
     return mask
@@ -671,29 +725,34 @@ class CFMGraphWrapper:
             # Warmup runs the same kernels as the capture, so a fault here
             # leaves the same dirty capture-stream and pool state, and must be
             # handled the same way.
-            current_stream = torch.cuda.current_stream(self.device)
-            warmup_stream = torch.cuda.Stream(device=self.device)
+            current_stream = _graph_api(self.device).current_stream(self.device)
+            warmup_stream = _graph_api(self.device).Stream(device=self.device)
             warmup_stream.wait_stream(current_stream)
-            with torch.cuda.stream(warmup_stream), torch.no_grad():
+            with _graph_api(self.device).stream(warmup_stream), torch.no_grad(), _graph_execution_context(self.device):
                 for _ in range(3):
                     warmup_output = self._call_graph_fn(static_inputs)
             current_stream.wait_stream(warmup_stream)
             del warmup_output
 
-            graph = CUDAGraph()
-            with torch.no_grad(), torch.cuda.graph(graph, pool=current_platform.get_global_graph_pool()):
+            graph = _new_graph(self.device)
+            with (
+                torch.no_grad(),
+                _graph_execution_context(self.device),
+                _graph_api(self.device).graph(graph, pool=current_platform.get_global_graph_pool()),
+            ):
                 static_output = self._call_graph_fn(static_inputs)
         except Exception:
             # A failed capture can leave the capture stream current and the
             # allocator still routing into the graph pool, so there is no safe
             # way to keep capturing afterwards.
+            _raise_npu_capture_failure(self)
             self._disable("capture failed", key)
             return None
 
         self._stats["captures"] += 1
         self._record_peak()
         logger.info(
-            "Captured CFM CUDA Graph for shape %s (cache=%d/%d, stats=%s)%s",
+            "Captured CFM device graph for shape %s (cache=%d/%d, stats=%s)%s",
             key,
             len(self._cache) + 1,
             self.max_graphs,
@@ -712,10 +771,15 @@ class CFMGraphWrapper:
         att_out: torch.Tensor,
         attn_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        _check_graph_failure(self)
         inputs = (estimator_input, time_emb, cnn_cache, att_cache, cnn_out, att_out, attn_mask)
         self._stats["calls"] += 1
 
-        if not self.enabled or torch.cuda.is_current_stream_capturing() or estimator_input.device.type != "cuda":
+        if (
+            not self.enabled
+            or estimator_input.device.type not in {"cuda", "npu"}
+            or _graph_api(self.device).is_current_stream_capturing()
+        ):
             return self._eager(inputs)
 
         key = ("estimator_step",) + tuple(_tensor_signature(v) for v in inputs)
@@ -1139,8 +1203,9 @@ class WholeEulerCFMGraphWrapper:
             self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
             self.dtype = torch.float32
 
-        self.enabled = self.max_graphs > 0 and self.device.type == "cuda"
+        self.enabled = self.max_graphs > 0 and self.device.type in {"cuda", "npu"}
         self._cache: dict[tuple, tuple] = {}
+        self._capture_key_masks: dict[tuple, torch.Tensor] = {}
         self._unsupported: set[tuple] = set()
         self._stats = {
             "calls": 0,
@@ -1470,29 +1535,34 @@ class WholeEulerCFMGraphWrapper:
         memory_before = _memory_snapshot(self.device)
         warmup_started = time.perf_counter()
         try:
-            current_stream = torch.cuda.current_stream(self.device)
-            warmup_stream = torch.cuda.Stream(device=self.device)
+            current_stream = _graph_api(self.device).current_stream(self.device)
+            warmup_stream = _graph_api(self.device).Stream(device=self.device)
             warmup_stream.wait_stream(current_stream)
-            with torch.cuda.stream(warmup_stream), torch.no_grad():
+            with _graph_api(self.device).stream(warmup_stream), torch.no_grad(), _graph_execution_context(self.device):
                 for _ in range(3):
                     static_x.copy_(initial_x)
                     self._run_euler_loop(*loop_args, batch_size=graph_batch)
             current_stream.wait_stream(warmup_stream)
             warmup_host_s = time.perf_counter() - warmup_started
             static_x.copy_(initial_x)
-            graph = CUDAGraph()
+            graph = _new_graph(self.device)
             capture_started = time.perf_counter()
-            with torch.no_grad(), torch.cuda.graph(graph, pool=current_platform.get_global_graph_pool()):
+            with (
+                torch.no_grad(),
+                _graph_execution_context(self.device),
+                _graph_api(self.device).graph(graph, pool=current_platform.get_global_graph_pool()),
+            ):
                 static_final_x = self._run_euler_loop(*loop_args, batch_size=graph_batch)
             capture_host_s = time.perf_counter() - capture_started
         except Exception:
+            _raise_npu_capture_failure(self)
             self._disable("capture failed", key)
             return None
 
         self._stats["captures"] += 1
         self._record_peak()
         logger.info(
-            "Captured Whole-Euler CFM CUDA Graph for shape %s "
+            "Captured Whole-Euler CFM device graph for shape %s "
             "(cache=%d/%d, %s, stats=%s, warmup_host_s=%.3f, capture_host_s=%.3f)%s",
             key,
             len(self._cache) + len(self._slot_graphs) + 1,
@@ -1901,9 +1971,14 @@ class WholeEulerCFMGraphWrapper:
         row's padding. The new cache then always comes back per request, each
         row keeping only its own current frames.
         """
+        _check_graph_failure(self)
         self._stats["calls"] += 1
 
-        if not self.enabled or torch.cuda.is_current_stream_capturing() or x.device.type != "cuda":
+        if (
+            not self.enabled
+            or x.device.type not in {"cuda", "npu"}
+            or _graph_api(self.device).is_current_stream_capturing()
+        ):
             return None
 
         batch_size = int(x.shape[0])
@@ -1939,7 +2014,7 @@ class WholeEulerCFMGraphWrapper:
         if self.ragged_body is not None:
             lengths = mel_width
             if valid_lengths is not None:
-                lengths = torch.tensor((*row_lengths, *row_lengths), dtype=torch.long, device=x.device)
+                lengths = index_to_device((*row_lengths, *row_lengths), x.device)
         if self.att_slots and att_rows is not None and pad_frames == 0 and att_keep is not None:
             slotted = self._replay_slots(
                 x_cap=x_cap,
@@ -1973,6 +2048,7 @@ class WholeEulerCFMGraphWrapper:
             mel_frames=mel_frames,
             device=x.device,
             offset_cap=offset_cap,
+            key_masks=self._capture_key_masks,
         )
         if isinstance(lengths, torch.Tensor):
             # Queries past a row's length take its first query's mask, as

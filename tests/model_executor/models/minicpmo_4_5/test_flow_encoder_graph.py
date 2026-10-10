@@ -206,7 +206,7 @@ def test_startup_precapture_uses_shared_arena_and_freezes_admission(fake_capture
     backend = SimpleNamespace(
         _chunk_encoder_graph=graphs,
         _chunk_encoder_token_widths=(6,),
-        _flow_on_cuda=lambda: True,
+        _flow_supports_graphs=lambda: True,
         _pre_lookahead_len=lambda: _LOOKAHEAD,
         _upsample_stride=lambda: 2,
         _encoder_position_tables=lambda: (),
@@ -232,7 +232,7 @@ def test_legacy_graph_options_share_one_owner():
     encoder = SimpleNamespace(embed=SimpleNamespace(pos_enc=SimpleNamespace(pe=torch.zeros(1))), up_layer=object())
     backend = SimpleNamespace(
         _chunk_encoder_graph=graph,
-        _flow_on_cuda=lambda: True,
+        _flow_supports_graphs=lambda: True,
         _pre_lookahead_len=lambda: 1,
         _upsample_stride=lambda: 2,
         flow=SimpleNamespace(encoder=encoder),
@@ -353,7 +353,7 @@ def test_rocm_cuda_devices_fall_back_before_nvidia_stream_creation(monkeypatch):
     assert wrapper(token, last_chunk=False, cnn_cache=None, att_cache=None) == (token, token, token)
     assert wrapper.stats["ineligible"] == 1
     assert not wrapper.exact_graphs
-    backend = SimpleNamespace(_chunk_encoder_graph=wrapper, _flow_on_cuda=lambda: True)
+    backend = SimpleNamespace(_chunk_encoder_graph=wrapper, _flow_supports_graphs=lambda: True)
     assert BatchedToken2Wav.precapture_chunk_encoder(backend, object()) == 0
     assert not wrapper.graphs
 
@@ -373,7 +373,7 @@ def test_rocm_eager_chunks_preserve_outputs_and_cache(monkeypatch):
     weight = torch.randn(_HIDDEN, _HIDDEN, device="cuda")
     encode = functools.partial(_encode, weight=weight)
     wrapper = FlowEncoderGraphs(lambda tokens, last_chunk, **kwargs: encode(tokens, **kwargs))
-    backend = SimpleNamespace(_chunk_encoder_graph=wrapper, _flow_on_cuda=lambda: True)
+    backend = SimpleNamespace(_chunk_encoder_graph=wrapper, _flow_supports_graphs=lambda: True)
     assert BatchedToken2Wav.precapture_chunk_encoder(backend, object()) == 0
     tokens, cnn, att = _inputs(1, 6, 8, "cuda")
     cnn, att = cnn[0], att[0]
