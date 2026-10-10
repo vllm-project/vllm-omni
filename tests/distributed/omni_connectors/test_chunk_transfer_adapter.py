@@ -17,6 +17,7 @@ from vllm.v1.metrics.stats import PrefillStats, PromptTokenStats
 from vllm.v1.request import Request, RequestStatus
 
 from tests.helpers.omni_scheduler import bind_omits_transfer_helpers
+from vllm_omni.core.prefix_cache.adapter import PrefixCacheRequestOwner
 from vllm_omni.core.sched.omni_ar_scheduler import OmniARScheduler
 from vllm_omni.core.sched.omni_generation_scheduler import OmniGenerationScheduler
 from vllm_omni.data_entry_keys import CodesStruct, MetaStruct, OmniPayload, OmniPayloadStruct
@@ -191,45 +192,37 @@ class DummyWaitingQueue(list):
 
 
 def _req(req_id: str, status: RequestStatus, external_req_id: str | None = None):
-    request = Mock(
+    request = Request(
         client_index=0,
         request_id=req_id,
-        external_req_id=external_req_id or req_id,
-        status=status,
         prompt_token_ids=[],
-        num_prompt_tokens=0,
-        num_computed_tokens=0,
-        num_output_placeholders=0,
-        prefill_stats=None,
-        additional_information=None,
+        sampling_params=SamplingParams(max_tokens=8),
+        pooling_params=None,
         resumable=False,
     )
-    request.is_finished = lambda: RequestStatus.is_finished(request.status)
+    request.external_req_id = external_req_id or req_id
+    request.status = status
+    request.prefill_stats = None
+    request.additional_information = None
     return request
 
 
-def _streaming_request(mocker: MockerFixture, num_computed_tokens: int) -> SimpleNamespace:
+def _streaming_request(mocker: MockerFixture, num_computed_tokens: int) -> Request:
     prompt_token_ids = [0] * num_computed_tokens
-    return SimpleNamespace(
-        _all_token_ids=prompt_token_ids.copy(),
-        _output_token_ids=[],
+    request = Request(
+        request_id="streaming",
         prompt_token_ids=prompt_token_ids,
-        num_computed_tokens=num_computed_tokens,
-        num_prompt_tokens=num_computed_tokens,
-        num_output_placeholders=0,
-        update_block_hashes=mocker.Mock(),
+        sampling_params=SamplingParams(max_tokens=32),
+        pooling_params=None,
     )
+    request.num_computed_tokens = num_computed_tokens
+    return request
 
 
 def test_streaming_payload_can_replace_placeholder_prompt(mocker: MockerFixture) -> None:
-    request = SimpleNamespace(
-        _all_token_ids=[0, 0, 7, 8],
-        _output_token_ids=[7, 8],
-        prompt_token_ids=[0, 0],
-        num_computed_tokens=4,
-        num_prompt_tokens=2,
-        update_block_hashes=mocker.Mock(),
-    )
+    request = _streaming_request(mocker, 2)
+    request.append_output_token_ids([7, 8])
+    request.num_computed_tokens = 4
     payload = {
         "ids": {"prompt": [1, 2, 3]},
         "meta": {
@@ -245,7 +238,6 @@ def test_streaming_payload_can_replace_placeholder_prompt(mocker: MockerFixture)
     assert request._output_token_ids == []
     assert request.num_computed_tokens == 0
     assert request.num_prompt_tokens == 7
-    request.update_block_hashes.assert_called_once_with()
 
 
 def test_turn_start_replacement_ignores_accumulated_prompt_capacity(mocker: MockerFixture) -> None:
@@ -273,6 +265,39 @@ def test_turn_start_replacement_ignores_accumulated_prompt_capacity(mocker: Mock
     assert request.prompt_token_ids == [0] * 10
     assert payload["meta"]["streaming_prompt_recompute"] is False
     assert "streaming_prompt_previous_codes" not in payload["ids"]
+
+
+def test_chunk_replacement_rebuilds_hashes_without_mutating_dispatched_tokens():
+    from vllm.utils.hashing import sha256
+    from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
+
+    init_none_hash(sha256)
+    hasher = get_request_block_hasher(4, sha256)
+    request = Request(
+        request_id="chunk-replacement",
+        prompt_token_ids=list(range(8)),
+        sampling_params=SamplingParams(max_tokens=8),
+        pooling_params=None,
+        block_hasher=hasher,
+        cache_salt="caller",
+    )
+    old_tokens = request.all_token_ids
+    payload = {"meta": {"replace_streaming_prompt": True, "next_stage_prompt_len": 4}}
+
+    assert construct_next_stage_streaming_input_prompt(payload, request)
+
+    fresh = Request(
+        request_id="fresh",
+        prompt_token_ids=[0] * 4,
+        sampling_params=request.sampling_params,
+        pooling_params=None,
+        block_hasher=hasher,
+        cache_salt="caller",
+    )
+    assert request.block_hashes == fresh.block_hashes
+    assert list(old_tokens) == list(range(8))
+    assert request.num_prompt_tokens == 4
+    assert request.num_computed_tokens == 0
 
 
 @pytest.mark.parametrize("reserve", [True, 0, -1, 1.5, "26", None])
@@ -347,21 +372,15 @@ def test_capacity_managed_streaming_prompt_appends_from_declared_length_without_
     assert request.num_computed_tokens == 20
     assert request.num_prompt_tokens == 24
     assert request.prompt_token_ids == [0] * 24
-    request.update_block_hashes.assert_called_once_with()
 
 
 def test_streaming_window_builds_one_chunk_recompute_recipe(mocker: MockerFixture) -> None:
     previous_condition_len = 10
     previous_codes = list(range(25))
-    request = SimpleNamespace(
-        _all_token_ids=[0] * 4039 + previous_codes + [999],
-        _output_token_ids=previous_codes + [999],
-        prompt_token_ids=[0] * 4039,
-        num_computed_tokens=4065,
-        num_prompt_tokens=4039,
-        num_output_placeholders=1,
-        update_block_hashes=mocker.Mock(),
-    )
+    request = _streaming_request(mocker, 4039)
+    request.append_output_token_ids(previous_codes + [999])
+    request.num_computed_tokens = 4065
+    request.num_output_placeholders = 1
     payload: dict = {
         "ids": {"prompt": [1]},
         "meta": {
@@ -391,7 +410,6 @@ def test_streaming_window_builds_one_chunk_recompute_recipe(mocker: MockerFixtur
         "streaming_prompt_recompute": True,
         "streaming_condition_seq": 8,
     }
-    request.update_block_hashes.assert_called_once_with()
 
 
 def test_capacity_policy_turn_start_replacement_does_not_require_generation_reserve(
@@ -423,15 +441,9 @@ def test_capacity_policy_turn_start_replacement_does_not_require_generation_rese
 
 
 def test_streaming_window_appends_until_capacity_then_recomputes(mocker: MockerFixture) -> None:
-    request = SimpleNamespace(
-        _all_token_ids=[0] * 4000 + [101, 102],
-        _output_token_ids=[101, 102],
-        prompt_token_ids=[0] * 4000,
-        num_computed_tokens=4002,
-        num_prompt_tokens=4000,
-        num_output_placeholders=0,
-        update_block_hashes=mocker.Mock(),
-    )
+    request = _streaming_request(mocker, 4000)
+    request.append_output_token_ids([101, 102])
+    request.num_computed_tokens = 4002
     second: dict = {
         "ids": {"prompt": [1]},
         "meta": {
@@ -998,6 +1010,127 @@ def test_load_poll_ar_keeps_generic_prompt_extension_for_non_tts_stage(build_ada
     assert request.prompt_token_ids == [1, 2, 3, 7, 0, 0]
     assert request._all_token_ids == [1, 2, 3, 7, 0, 0]
     assert request.num_prompt_tokens == 6
+
+
+@pytest.mark.parametrize("reused_id", [False, True])
+def test_pending_ar_payload_cannot_update_a_retired_owner(build_adapter, reused_id):
+    adapter, connector = build_adapter(stage_id=1, model_mode="ar")
+    request = _req("retired-input", RequestStatus.RUNNING)
+    request.resumable = True
+    request._omni_prefix_cache_owner = PrefixCacheRequestOwner(1)
+    connector.get.return_value = (
+        {
+            "ids": {"prompt": [1]},
+            "meta": {
+                "replace_streaming_prompt": True,
+                "next_stage_prompt_len": 4,
+                "finished": True,
+                "is_segment_finished": True,
+            },
+        },
+        1,
+    )
+    assert adapter._poll_single_request(_dequeue_load_entry(adapter, request))
+    current = _req(request.request_id, RequestStatus.RUNNING) if reused_id else request
+    current.resumable = True
+    current.additional_information = {"current": True}
+    current._omni_prefix_cache_owner = PrefixCacheRequestOwner(2) if reused_id else PrefixCacheRequestOwner(1, 1)
+    adapter.requests_with_ready_chunks.add(request.request_id)
+    adapter._apply_pending_ar_prompt_updates({request.request_id: current})
+    assert current.additional_information == {"current": True}
+    assert current.prompt_token_ids == []
+    assert current.resumable
+    assert request.request_id not in adapter.requests_with_ready_chunks
+    assert request.request_id not in adapter.upstream_exhausted_requests
+    assert request.request_id not in adapter.segment_finished_requests
+    assert not adapter.collect_failed_receive_request_ids()
+
+
+@pytest.mark.parametrize("invalid_length", [-1, True])
+def test_invalid_ar_payload_preserves_request_input_and_terminal_state(build_adapter, invalid_length):
+    adapter, connector = build_adapter(stage_id=1, model_mode="ar")
+    request = _req("invalid-input", RequestStatus.RUNNING)
+    request.resumable = True
+    previous = {"current": True}
+    request.additional_information = previous
+    connector.get.return_value = (
+        {
+            "ids": {"prompt": [1]},
+            "meta": {
+                "replace_streaming_prompt": True,
+                "next_stage_prompt_len": invalid_length,
+                "finished": True,
+                "is_segment_finished": True,
+            },
+        },
+        1,
+    )
+    assert adapter._poll_single_request(_dequeue_load_entry(adapter, request))
+    assert request.resumable
+    adapter.requests_with_ready_chunks.add(request.request_id)
+    adapter._apply_pending_ar_prompt_updates({request.request_id: request})
+    assert request.additional_information is previous
+    assert request.prompt_token_ids == []
+    assert request.resumable
+    assert request.request_id not in adapter.upstream_exhausted_requests
+    assert request.request_id not in adapter.segment_finished_requests
+    assert "positive integer" in adapter.collect_failed_receive_request_ids()[request.request_id]
+
+
+@pytest.mark.parametrize("active_window", [0, 1])
+def test_retired_ready_chunk_cannot_release_request_for_scheduling(build_adapter, active_window):
+    adapter, connector = build_adapter(stage_id=1, model_mode="ar", active_stream_window=active_window)
+    request = _req("retired-ready", RequestStatus.WAITING_FOR_CHUNK)
+    request.resumable = True
+    request._omni_prefix_cache_owner = PrefixCacheRequestOwner(1)
+    connector.get.return_value = (
+        {"ids": {"prompt": [1]}, "meta": {"next_stage_prompt_len": 4, "replace_streaming_prompt": True}},
+        1,
+    )
+    assert adapter._poll_single_request(_dequeue_load_entry(adapter, request))
+    request._omni_prefix_cache_owner = PrefixCacheRequestOwner(1, 1)
+    running = [request]
+    adapter.process_pending_chunks(DummyWaitingQueue(), running, scheduler_requests={request.request_id: request})
+    assert not running
+    assert request.status == RequestStatus.WAITING_FOR_CHUNK
+    assert list(adapter.waiting_for_chunk_running_requests) == [request]
+    assert request.request_id not in adapter.requests_with_ready_chunks
+    assert request.additional_information is None
+
+
+def test_replacement_during_connector_get_discards_old_payload_before_commit(build_adapter):
+    adapter, connector = build_adapter(stage_id=1, model_mode="ar")
+    request = _req("retired-poll", RequestStatus.WAITING_FOR_CHUNK)
+    request.resumable = True
+    request._omni_prefix_cache_owner = PrefixCacheRequestOwner(1)
+    entry = _dequeue_load_entry(adapter, request)
+    started, release = threading.Event(), threading.Event()
+
+    def delayed_get(*args):
+        started.set()
+        assert release.wait(5)
+        return {"meta": {"finished": True}, "ids": {"prompt": [1]}}, 1
+
+    connector.get.side_effect = delayed_get
+    results = []
+    poller = threading.Thread(target=lambda: results.append(adapter._poll_single_request(entry)))
+    poller.start()
+    try:
+        assert started.wait(5)
+        request._omni_prefix_cache_owner = PrefixCacheRequestOwner(1, 1)
+    finally:
+        release.set()
+        poller.join(5)
+    assert not poller.is_alive()
+    assert results == [True]
+    assert not adapter._registered_load_entries
+    assert not adapter._pending_ar_prompt_updates
+    assert not adapter._finished_load_reqs
+    assert not adapter.upstream_exhausted_requests
+    assert adapter.get_req_chunk[request.request_id] == 0
+    assert request.resumable
+    fresh = _dequeue_load_entry(adapter, request)
+    assert fresh is not entry and fresh.matches(request)
 
 
 def test_window_condition_sequence_ignores_control_only_chunks(build_adapter) -> None:
@@ -2348,6 +2481,9 @@ def test_cleanup_after_poll_flow(build_adapter):
     connector.get.return_value = (payload, 8)
     adapter._poll_single_request(_dequeue_load_entry(adapter, request))
 
+    assert "req-flow" not in adapter.upstream_exhausted_requests
+    adapter.requests_with_ready_chunks.add(request.request_id)
+    adapter._apply_pending_ar_prompt_updates({request.request_id: request})
     assert "req-flow" in adapter.upstream_exhausted_requests
     assert adapter.get_req_chunk["req-flow"] == 1
     assert "req-flow" in adapter.request_ids_mapping

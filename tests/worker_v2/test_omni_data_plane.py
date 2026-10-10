@@ -583,6 +583,7 @@ def test_abort_before_first_chunk_cleans_receiver_state():
         "_kv_pending_transfers",
         "_get_req_chunk",
         "_pending_load_reqs",
+        "_recv_request_owners",
         "_local_stage_payload_cache",
         "_local_request_metadata",
     ):

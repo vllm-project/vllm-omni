@@ -6,11 +6,13 @@ Naming aligns with vLLM's v1/core KV-cache design.
 """
 
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, NamedTuple, TypeAlias
+from typing import Any, TypeAlias
 
 import torch
+
+from .adapter import PrefixCacheRequestOwner
 
 # Four identities (still str/int at runtime, not interchangeable):
 #   TensorName  which cached tensor (hidden / mm), not a prefix hash
@@ -110,13 +112,31 @@ class PrefixCacheConfig:
         )
 
 
-class StageCacheOutputs(NamedTuple):
-    """Plain value object: per-request merged stage outputs."""
+@dataclass
+class PrefixCacheRequestProgress:
+    """Request-local positions; saved counts registered writes, not CPU commits."""
 
-    # req -> full-prompt hidden states (None when policy skips them)
+    computed_upto: int = 0
+    saved_upto: int = 0
+    delivered_upto: dict[str, int] = field(default_factory=dict)
+    owner: PrefixCacheRequestOwner | None = None
+    # None is pending; (0, ...) records an actual zero-hit lookup.
+    lookup: tuple[int, tuple[tuple[int, ...], ...]] | None = None
+    retired: bool = False
+
+
+@dataclass
+class StageCacheOutputs:
+    """Materialized rows and their save-time request positions."""
+
     hidden_states: dict[ReqId, torch.Tensor] | None
-    # tensor name -> req -> payload element
     mm_outputs: dict[TensorName, dict[ReqId, Any]]
+    token_ranges: dict[ReqId, tuple[int, int]] = field(default_factory=dict)
+    scheduled_token_ranges: dict[ReqId, tuple[int, int]] = field(default_factory=dict)
+    cached_mm_keys: frozenset[TensorName] = frozenset()
+    token_mm_keys: frozenset[TensorName] = frozenset()
+    _progress: dict[ReqId, PrefixCacheRequestProgress] = field(default_factory=dict, repr=False)
+    _consumer: str | None = field(default=None, repr=False)
 
 
 class OmniPrefixCacheUnmatchError(RuntimeError):

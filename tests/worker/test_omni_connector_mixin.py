@@ -8,6 +8,7 @@ GPU or vLLM runtime.
 
 from __future__ import annotations
 
+import threading
 import time
 import unittest
 from copy import deepcopy
@@ -18,6 +19,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
+from vllm_omni.core.prefix_cache.adapter import PrefixCacheEventKind, PrefixCacheRequestEvent, PrefixCacheRequestOwner
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import (
     OmniKVTransferManager,
 )
@@ -100,6 +102,202 @@ class MixinHost(OmniConnectorModelRunnerMixin):
     """Minimal class that mixes in the mixin for testing."""
 
     pass
+
+
+@pytest.mark.parametrize("async_chunk", [False, True])
+def test_late_recv_cannot_recreate_cleaned_input_or_overwrite_new_registration(async_chunk):
+    host = MixinHost()
+    host.init_omni_connectors(_make_model_config(async_chunk=async_chunk))
+    host._stage_id = 1
+    host._omni_connector = MockConnector(stage_id=1)
+    first = _make_request("reused", "old-external")
+    first.input_owner = PrefixCacheRequestOwner(1)
+    second = _make_request("reused", "new-external")
+    second.input_owner = PrefixCacheRequestOwner(2)
+    started, release = threading.Event(), threading.Event()
+
+    def delayed_get(*args, **kwargs):
+        started.set()
+        assert release.wait(5)
+        return {"ids": {"output": [99]}, "meta": {"finished": True, "next_stage_prompt_len": 99}}, 1
+
+    with patch.object(host._omni_connector, "get", side_effect=delayed_get):
+        host.register_chunk_recv(first)
+        results = []
+        poller = threading.Thread(target=lambda: results.append(host._poll_single_request(first.request_id)))
+        poller.start()
+        try:
+            assert started.wait(5)
+            host.cleanup_finished_request(first.request_id)
+            host.register_chunk_recv(second)
+        finally:
+            release.set()
+            poller.join(5)
+    try:
+        assert not poller.is_alive()
+        assert host._pending_load_reqs[second.request_id] is second
+        assert not host._local_stage_payload_cache
+        assert not host._local_request_metadata
+        assert not host._finished_load_reqs
+        assert not host._chunk_finished_req_ids
+        assert not host._full_payload_pending_broadcast_req_ids
+        assert host._get_req_chunk.get(second.request_id, 0) == 0
+    finally:
+        host.shutdown_omni_connectors()
+
+
+def test_full_payload_broadcast_cannot_publish_a_replaced_owner():
+    host = MixinHost()
+    host.init_omni_connectors(_make_model_config())
+    host._stage_id = 1
+    host._omni_connector = MockConnector(stage_id=1)
+    first = _make_request("reused")
+    first.input_owner = PrefixCacheRequestOwner(1)
+    second = _make_request("reused")
+    second.input_owner = PrefixCacheRequestOwner(2)
+    host.register_chunk_recv(first)
+    host._omni_connector.put("0", "1", "reused_0_0", {"meta": {"next_stage_prompt_len": 99}})
+    assert host._poll_single_request("reused")
+
+    def delayed_broadcast(packet):
+        host.cleanup_finished_request("reused")
+        host.register_chunk_recv(second)
+        return packet
+
+    try:
+        with patch.object(host, "_broadcast_tp_payload_packet", side_effect=delayed_broadcast):
+            assert not host.recv_full_payload_inputs(None)
+        assert host._pending_load_reqs["reused"] is second
+        assert not host._local_stage_payload_cache
+        assert not host._stage_recv_req_ids
+        assert not host.get_omni_connector_output().request_metadata
+    finally:
+        host.shutdown_omni_connectors()
+
+
+@pytest.mark.parametrize("async_chunk", [False, True])
+def test_received_notice_keeps_registered_owner_across_serialization_and_cleanup(async_chunk):
+    from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
+
+    host = MixinHost()
+    host.init_omni_connectors(_make_model_config(async_chunk=async_chunk))
+    host._stage_id = 1
+    host._omni_connector = MockConnector(stage_id=1)
+    request = _make_request("owned")
+    owner = PrefixCacheRequestOwner(1, 3)
+    request.input_owner = owner
+    host.register_chunk_recv(request)
+    payload = {
+        "embed": {"decode": [[1]]},
+        "meta": {
+            "next_stage_prompt_len": 4,
+            "next_stage_prompt_ids": [151644, 872, 198, 11],
+            "next_stage_conditioning_digest": "ab" * 32,
+            "finished": True,
+            "input_owner": "untrusted-producer-value",
+        },
+    }
+    host._omni_connector.put("0", "1", "owned_0_0", payload)
+    try:
+        assert host._poll_single_request("owned")
+        if not async_chunk:
+            assert host.recv_full_payload_inputs(None) == {"owned": payload}
+        output = host.get_omni_connector_output()
+        restored = MsgpackDecoder(OmniConnectorOutput).decode(MsgpackEncoder().encode(output))
+        assert restored.input_owners == {"owned": owner}
+        assert restored.request_metadata == {
+            "owned": {
+                "next_stage_prompt_len": 4,
+                "next_stage_prompt_ids": [151644, 872, 198, 11],
+                "next_stage_conditioning_digest": "ab" * 32,
+                "input_terminal": True,
+            }
+        }
+        assert (restored.chunk_ready_req_ids if async_chunk else restored.stage_recv_req_ids) == {"owned"}
+        host.cleanup_finished_request("owned")
+        assert not host._recv_request_owners
+        request.input_owner = PrefixCacheRequestOwner(2)
+        host.register_chunk_recv(request)
+        assert restored.input_owners == {"owned": owner}
+        host.cleanup_finished_request("owned")
+        assert not host._recv_request_owners
+    finally:
+        host.shutdown_omni_connectors()
+
+
+@pytest.mark.parametrize("async_chunk", [False, True])
+@pytest.mark.parametrize("retired", [False, True])
+def test_tp_follower_binds_payload_readiness_and_terminal_to_registration(async_chunk, retired):
+    host = MixinHost()
+    host.init_omni_connectors(_make_model_config(async_chunk=async_chunk))
+    host._stage_id = 1
+    request = _make_request("owned")
+    owner = PrefixCacheRequestOwner(1)
+    request.input_owner = PrefixCacheRequestOwner(2) if retired else owner
+    host.register_chunk_recv(request)
+    payload = {"embed": {"decode": [[1]]}, "meta": {"finished": True}}
+    packet: dict[str, Any] = {"staged_payloads": {"owned": payload}, "input_owners": {"owned": owner}}
+    if async_chunk:
+        packet.update(
+            request_metadata={"owned": {"input_terminal": True}}, newly_finished={"owned"}, chunk_finished={"owned"}
+        )
+    group = _FakeTPGroup(world_size=2, rank_in_group=1, follower_result=packet)
+    try:
+        with patch.object(host, "_get_local_tp_group", return_value=group):
+            if not async_chunk:
+                host.recv_full_payload_inputs(None)
+            output = host.get_omni_connector_output()
+        if retired:
+            assert host._pending_load_reqs["owned"] is request
+            assert not host._local_stage_payload_cache
+            assert not output.request_metadata
+            assert not output.stage_recv_req_ids
+            assert not output.chunk_finished_req_ids
+            assert not output.chunk_ready_req_ids
+        else:
+            assert host.get_local_stage_payload("owned") == payload
+            assert output.input_owners == {"owned": owner}
+            assert output.request_metadata == {"owned": {"input_terminal": True}}
+            assert "owned" not in host._pending_load_reqs
+    finally:
+        host.shutdown_omni_connectors()
+
+
+def test_control_only_replacement_fences_staged_input_and_stale_registrations():
+    host = MixinHost()
+    host.init_omni_connectors(_make_model_config(async_chunk=True))
+    host._stage_id = 1
+    host._omni_connector = MockConnector(stage_id=1)
+    old = _make_request("owned")
+    old.input_owner = PrefixCacheRequestOwner(1)
+    current = _make_request("owned")
+    current.input_owner = PrefixCacheRequestOwner(1, 1)
+    host.register_chunk_recv(old)
+    host._omni_connector.put("0", "1", "owned_0_0", {"embed": {"decode": [[99]]}})
+    try:
+        assert host._poll_single_request("owned")
+        assert host._local_stage_payload_cache
+        controls = SimpleNamespace(
+            prefix_cache_replacements=(
+                PrefixCacheRequestEvent("owned", PrefixCacheEventKind.REPLACED, owner=current.input_owner),
+            )
+        )
+        assert host.recv_full_payload_inputs(controls) is None
+        assert not host._local_stage_payload_cache
+        assert not host._send_side_request_payload
+        assert not host.get_omni_connector_output().request_metadata
+        host.register_chunk_recv(current)
+        host.register_chunk_recv(old)
+        assert host._pending_load_reqs["owned"] is current
+        assert host._get_req_chunk["owned"] == 1
+        host._omni_connector.put("0", "1", "owned_0_1", {"embed": {"decode": [[7]]}})
+        assert host._poll_single_request("owned")
+        assert host.get_local_stage_payload("owned")["embed"]["decode"] == [[7]]
+        assert host.get_omni_connector_output().input_owners == {"owned": current.input_owner}
+        host.cleanup_finished_request("owned")
+        assert not host._recv_request_owners
+    finally:
+        host.shutdown_omni_connectors()
 
 
 def test_stage_payload_recv_spec_preserves_external_id_edge_and_handle():
@@ -1087,6 +1285,7 @@ class TestLocalPayloadCacheLifecycle(unittest.TestCase):
         host._stage_id = 2
         host._local_rank = 0
         host._request_ids_mapping["r1"] = "ext-r1"
+        host.register_chunk_recv(_make_request("r1", "ext-r1"))
         host._get_req_chunk["r1"] = 0
         payload = {"tok": [10], "finished": torch.tensor(True)}
         connector_result = (payload, 123)
@@ -1130,7 +1329,11 @@ class TestLocalPayloadCacheLifecycle(unittest.TestCase):
         host._local_rank = 1
         host._pending_load_reqs["r1"] = object()
         payload = {"tok": [10], "finished": torch.tensor(True)}
-        tp_group = _FakeTPGroup(world_size=2, rank_in_group=1, follower_result={"r1": payload})
+        tp_group = _FakeTPGroup(
+            world_size=2,
+            rank_in_group=1,
+            follower_result={"staged_payloads": {"r1": payload}, "input_owners": {}},
+        )
 
         with patch.object(host, "_get_local_tp_group", return_value=tp_group):
             results = host.recv_full_payload_inputs(scheduler_output=None)
@@ -1161,6 +1364,7 @@ class TestTPAsyncChunkFanout(unittest.TestCase):
 
     def test_rank0_only_polls_connector_for_tp_async_chunk(self):
         host = self._make_host(rank=0)
+        host.register_chunk_recv(_make_request("r1", "ext-r1"))
         payload = {
             "codes": {"audio": [10, 11]},
             "meta": {"left_context_size": 0, "finished": torch.tensor(False)},
@@ -1388,6 +1592,8 @@ class TestAsyncPayloadLifecycle(unittest.TestCase):
         host._request_ids_mapping["r1"] = "ext-r1"
         host._get_req_chunk["r1"] = 0
 
+        host.register_chunk_recv(_make_request("r1", "ext-r1"))
+
         host._omni_connector.get.side_effect = [
             (
                 {
@@ -1456,6 +1662,8 @@ class TestAsyncPayloadLifecycle(unittest.TestCase):
             "left_context_size": 0,
         }
         host._finished_load_reqs.add("r1")
+
+        host.register_chunk_recv(_make_request("r1", "ext-r1"))
 
         made_progress = host._poll_single_request("r1")
 

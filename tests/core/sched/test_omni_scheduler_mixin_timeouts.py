@@ -309,7 +309,13 @@ class _FakeReceiveFailureScheduler(OmniSchedulerMixin):
 def test_process_chunk_receive_failures_delegates_to_finish_requests():
     request_id = "invalid-chunk"
     adapter = _FakeReceiveFailureAdapter({request_id: "prompt exceeds limit"})
-    scheduler = _FakeReceiveFailureScheduler({request_id: SimpleNamespace(request_id=request_id)}, adapter)
+    request = Request(
+        request_id=request_id,
+        prompt_token_ids=[1],
+        sampling_params=SamplingParams(max_tokens=1),
+        pooling_params=None,
+    )
+    scheduler = _FakeReceiveFailureScheduler({request_id: request}, adapter)
 
     scheduler._process_chunk_receive_failures()
 

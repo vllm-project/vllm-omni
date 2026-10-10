@@ -54,10 +54,11 @@ class _SenderGeneration:
 class _LoadEntry:
     """Identify one receiver registration across queue and I/O boundaries."""
 
-    __slots__ = ("request", "source_metadata")
+    __slots__ = ("request", "owner", "source_metadata")
 
     def __init__(self, request: Request) -> None:
         self.request = request
+        self.owner = getattr(request, "_omni_prefix_cache_owner", None)
         sender_info = getattr(request, "payload_sender_info", None)
         self.source_metadata = None
         if isinstance(sender_info, dict):
@@ -76,6 +77,9 @@ class _LoadEntry:
     @property
     def external_req_id(self) -> str:
         return self.request.external_req_id
+
+    def matches(self, request: Request | None) -> bool:
+        return request is self.request and self.owner == getattr(request, "_omni_prefix_cache_owner", None)
 
 
 def _resolve_talker_streaming_prompt_config(model_config: Any) -> tuple[int, int, bool]:
@@ -224,7 +228,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         # token counters form a consistent snapshot.
         self._pending_ar_prompt_updates: dict[
             str,
-            tuple[Request, dict[str, Any], bool, int | None, bool],
+            tuple[_LoadEntry, dict[str, Any], bool, int | None, bool],
         ] = {}
         self._streaming_condition_lengths: dict[str, int] = {}
         self._streaming_condition_seqs: dict[str, int] = {}
@@ -336,7 +340,8 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             request.additional_information = None
         with self._receiver_state_lock:
             request_id = request.request_id
-            if request_id in self._registered_load_entries:
+            existing = self._registered_load_entries.get(request_id)
+            if existing is not None and existing.matches(request):
                 return
             entry = _LoadEntry(request)
             self._registered_load_entries[request_id] = entry
@@ -503,6 +508,9 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         with self._receiver_state_lock:
             if self._registered_load_entries.get(req_id) is not entry:
                 return True
+            if not entry.matches(request):
+                self._registered_load_entries.pop(req_id)
+                return True
             external_req_id = entry.external_req_id
             self.request_ids_mapping[req_id] = external_req_id
             chunk_id = self.get_req_chunk[req_id]
@@ -535,8 +543,11 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             # prompt/window state for the removed request.
             if self._registered_load_entries.get(req_id) is not entry:
                 return True
+            if not entry.matches(request):
+                self._registered_load_entries.pop(req_id)
+                return True
             is_success = self._commit_received_chunk(
-                request,
+                entry,
                 result,
                 stage_id=stage_id,
                 req_id=req_id,
@@ -549,7 +560,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
     def _commit_received_chunk(
         self,
-        request: Request,
+        entry: _LoadEntry,
         result: tuple[dict[str, Any], int],
         *,
         stage_id: int,
@@ -558,6 +569,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         connector_get_key: str,
     ) -> bool:
         """Commit a received connector chunk while receiver state is locked."""
+        request = entry.request
         payload_data, size = result
 
         if payload_data:
@@ -591,18 +603,15 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 )
                 update_prompt = bool(was_resumable and has_prompt_payload and (chunk_id > 0 or replace_prompt))
                 self._pending_ar_prompt_updates[req_id] = (
-                    request,
+                    entry,
                     payload_data,
                     update_prompt,
                     window_condition_len,
                     was_resumable,
                 )
 
-                if payload_finished:
-                    self.upstream_exhausted_requests.add(req_id)
-                    request.resumable = False
-                if payload_segment_finished:
-                    self.segment_finished_requests.add(req_id)
+                # AR terminal state is committed on the scheduler thread with
+                # the validated prompt, not while its metadata is still pending.
             else:
                 if payload_finished:
                     self.upstream_exhausted_requests.add(req_id)
@@ -1147,6 +1156,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             self._purge_untracked_chunk_requests(self.waiting_for_chunk_waiting_requests, scheduler_requests)
             self._purge_untracked_chunk_requests(self.waiting_for_chunk_running_requests, scheduler_requests)
 
+        self._apply_pending_ar_prompt_updates(scheduler_requests)
         if self._active_window <= 0:
             self._process_chunk_queue_legacy(
                 waiting_queue, self.waiting_for_chunk_waiting_requests, RequestStatus.WAITING, self._finished_load_reqs
@@ -1271,25 +1281,29 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self._streaming_condition_seqs[request_id] = condition_seq
         return replaced
 
-    def _apply_pending_ar_prompt_updates(self, scheduler_requests: dict[str, Request] | None) -> None:
+    def _apply_pending_ar_prompt_updates(
+        self, scheduler_requests: dict[str, Request] | None, *, request_ids: Iterable[str] | None = None
+    ) -> None:
         """Finalize ready AR prompt updates on the scheduler thread."""
-        for request_id in tuple(self.requests_with_ready_chunks):
+        for request_id in tuple(self.requests_with_ready_chunks) if request_ids is None else request_ids:
             with self._receiver_state_lock:
                 pending = self._pending_ar_prompt_updates.pop(request_id, None)
                 if pending is None:
                     continue
                 (
-                    fallback_request,
+                    entry,
                     payload_data,
                     update_prompt,
                     window_condition_len,
                     was_resumable,
                 ) = pending
-                request = scheduler_requests.get(request_id) if scheduler_requests is not None else fallback_request
-                if request is None:
+                request = scheduler_requests.get(request_id) if scheduler_requests is not None else entry.request
+                if not entry.matches(request):
+                    self.requests_with_ready_chunks.discard(request_id)
+                    self._finished_load_reqs.discard(request_id)
                     continue
+                assert request is not None
 
-                request.additional_information = payload_data
                 is_window_condition = window_condition_len is not None
                 if is_window_condition:
                     previous_condition_seq = self._streaming_condition_seqs.get(request_id)
@@ -1300,6 +1314,10 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                         and (previous_condition_seq is not None or meta.get("replace_streaming_prompt") is True)
                     )
                 try:
+                    meta = payload_data.get("meta", {})
+                    prompt_len = meta.get("next_stage_prompt_len")
+                    if prompt_len is not None and (type(prompt_len) is not int or prompt_len <= 0):
+                        raise ValueError("next_stage_prompt_len must be a positive integer")
                     replaced = self.update_streaming_prompt_for_condition(
                         payload_data,
                         request,
@@ -1320,7 +1338,15 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                     # this transition and desynchronize Talker. Let the
                     # scheduler fail it.
                     self.record_receive_failure(request_id, str(exc))
+                    self.requests_with_ready_chunks.discard(request_id)
+                    self._finished_load_reqs.discard(request_id)
                     continue
+                request.additional_information = payload_data
+                if self._is_truthy_scalar(meta.get("finished")):
+                    self.upstream_exhausted_requests.add(request_id)
+                    request.resumable = False
+                if self._is_truthy_scalar(meta.get("is_segment_finished")):
+                    self.segment_finished_requests.add(request_id)
 
     def _requeue_replaced_prompts(self, waiting_queue: Any, running_queue: list[Request]) -> None:
         """Move a replaced running prompt back through scheduler admission."""
@@ -1443,6 +1469,12 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 request.status = RequestStatus.WAITING_FOR_CHUNK
                 self._waiting_since.setdefault(request.request_id, time.monotonic())
             else:
+                # Validate the captured owner and metadata before readiness
+                # can move this request back onto a schedulable queue.
+                if request.request_id in finished_load_reqs:
+                    self._apply_pending_ar_prompt_updates(
+                        {request.request_id: request}, request_ids=(request.request_id,)
+                    )
                 if request.request_id in finished_load_reqs:
                     request.status = target_status
                     finished_load_reqs.remove(request.request_id)
@@ -1590,6 +1622,11 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 request.status = RequestStatus.WAITING_FOR_CHUNK
                 self._waiting_since.setdefault(request.request_id, time.monotonic())
             else:
+                # Match the legacy queue's validate-before-readiness boundary.
+                if request.request_id in finished_load_reqs:
+                    self._apply_pending_ar_prompt_updates(
+                        {request.request_id: request}, request_ids=(request.request_id,)
+                    )
                 if request.request_id in finished_load_reqs:
                     request.status = target_status
                     finished_load_reqs.remove(request.request_id)

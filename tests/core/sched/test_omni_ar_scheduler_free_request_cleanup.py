@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Regression tests for vllm-project/vllm-omni#5349 (P1): normal completion
 goes through _free_request(), not finish_requests() (the external
 abort/cancel entry point). Without a cleanup_receiver() call there,
@@ -28,6 +31,8 @@ def _make_scheduler(*, chunk_transfer_adapter=None) -> OmniARScheduler:
     """Minimal OmniARScheduler exercising _free_request()'s no-KV-transfer
     happy path."""
     sched = OmniARScheduler.__new__(OmniARScheduler)
+    sched._prefix_cache_next_admission = 0
+    sched._prefix_cache_pending_terminal_owners = {}
     sched._omits_kv_transfer_cache = {}
     sched._connector_finished = lambda request: (False, None)
     sched.encoder_cache_manager = MagicMock()

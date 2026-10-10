@@ -54,6 +54,10 @@ class FakeAdapter:
 
 def _make_generation_scheduler(waiting_request, *, use_v2_model_runner=False):
     scheduler = OmniGenerationScheduler.__new__(OmniGenerationScheduler)
+    scheduler._prefix_cache_next_admission = 0
+    scheduler._prefix_cache_step_sequence = 0
+    scheduler._prefix_cache_pending_replacements = []
+    scheduler._prefix_cache_pending_terminal_owners = {}
     scheduler.max_num_scheduled_tokens = 8
     scheduler.max_num_active_reqs = 1
     scheduler.max_num_running_reqs = 1

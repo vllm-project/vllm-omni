@@ -705,6 +705,9 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
 
         return self._wrap_omni_scheduler_output(scheduler_output)
 
+    def has_requests(self) -> bool:
+        return self._has_pending_prefix_cache_work() or super().has_requests()
+
     def _continuations_have_slack(self) -> bool:
         """Whether every started stream with a chunk ready to decode can wait one express step."""
         now = time.monotonic()
@@ -748,6 +751,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
     def _free_request(
         self, request: Request, delay_free_blocks: bool = False
     ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+        self._record_prefix_cache_finished(request)
         if getattr(self, "_first_chunk_express", False):
             self._chunk_started.discard(request.request_id)
             getattr(self, "_stream_audio", {}).pop(request.request_id, None)
@@ -821,9 +825,19 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         # to avoid expensive operations inside the loop.
         stopped_running_reqs: set[Request] = set()
         stopped_preempted_reqs: set[Request] = set()
+        scheduled_owners = getattr(scheduler_output, "prefix_cache_owners", {})
         for req_id, num_tokens_scheduled in num_scheduled_tokens.items():
             assert num_tokens_scheduled > 0
             request = self.requests.get(req_id)
+            scheduled_owner = scheduled_owners.get(req_id)
+            current_owner = getattr(request, "_omni_prefix_cache_owner", None)
+            output_is_stale = False
+            if scheduled_owner is not None and current_owner is not None:
+                if scheduled_owner.admission_id != current_owner.admission_id:
+                    # This ID has been admitted again. Neither its output nor
+                    # its in-flight accounting belongs to the new request.
+                    continue
+                output_is_stale = scheduled_owner != current_owner
             if request is not None:
                 # Settle the in-flight tokens counted in schedule().
                 # Must happen before the skips below — failed-KV-load and
@@ -839,7 +853,6 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             # in-flight share here; the delayed outputs are dropped below
             # instead of decrementing num_output_placeholders (which the
             # discard zeroed) and underflowing the upstream assert.
-            output_is_stale = False
             if request is not None and request.num_stale_output_tokens > 0:
                 output_is_stale = True
                 request.num_stale_output_tokens -= num_tokens_scheduled

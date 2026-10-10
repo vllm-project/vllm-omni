@@ -7,6 +7,7 @@ from typing import Any
 from vllm.v1.core.sched.output import CachedRequestData, NewRequestData, SchedulerOutput
 from vllm.v1.request import Request
 
+from vllm_omni.core.prefix_cache.adapter import PrefixCacheRequestEvent, PrefixCacheRequestOwner
 from vllm_omni.engine import AdditionalInformationPayload
 
 
@@ -99,17 +100,17 @@ class OmniChunkRecvHandle:
     """Minimal identifier carried from scheduler to runner for input-receive
     registration.
 
-    The runner's ``register_chunk_recv`` only consumes ``request_id`` and
-    ``external_req_id`` from each pending request, so we ship just those
-    two fields instead of the full Request object.  Concrete typing
-    keeps msgspec serialization deterministic across IPC (default,
-    PD-disagg, multi-node executor variants) and avoids the
-    ``list[Any]`` fallback path.
+    Carries routing fields and the receiving scheduler's immutable content
+    owner, not the full Request. Concrete typing keeps msgspec serialization
+    deterministic across IPC (default, PD-disagg, multi-node executor variants)
+    and avoids the ``list[Any]`` fallback path. The owner is echoed in receive
+    notifications; it is not supplied by the remote producer's payload.
     """
 
     request_id: str
     external_req_id: str | None = None
     payload_sender_info: dict[str, object] | None = None
+    input_owner: PrefixCacheRequestOwner | None = None
 
 
 @dataclass
@@ -135,4 +136,8 @@ class OmniSchedulerOutput(SchedulerOutput):
     pending_input_registrations: list[OmniChunkRecvHandle] = field(default_factory=list)
     data_plane_terminal_req_ids: set[str] = field(default_factory=set)
     input_terminal_req_ids: set[str] = field(default_factory=set)
+    prefix_cache_replacements: tuple[PrefixCacheRequestEvent, ...] = ()
+    prefix_cache_owners: dict[str, PrefixCacheRequestOwner] = field(default_factory=dict)
+    prefix_cache_terminal_owners: dict[str, PrefixCacheRequestOwner] = field(default_factory=dict)
+    prefix_cache_step_sequence: int | None = None
     pending_request_prewarms: list[OmniRequestPrewarm] = field(default_factory=list)

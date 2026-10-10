@@ -80,6 +80,7 @@ class Ids(TypedDict, total=False):
 
 
 class OmniPayloadMeta(TypedDict, total=False):
+    next_stage_conditioning_digest: str
     finished: torch.Tensor
     is_segment_finished: torch.Tensor
     stream_finished: torch.Tensor
