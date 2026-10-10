@@ -1543,14 +1543,9 @@ class WorkerProc:
                     if self.result_mq is not None:
                         if rpc_id is not None:
                             # Async RPC: must complete the executor's pending
-                            # future so collective_rpc() doesn't hang.
-                            self._enqueue_result(
-                                AsyncDiffusionOutput(
-                                    kind=AsyncOutputKind.RPC_RESULT,
-                                    rpc_id=rpc_id,
-                                    error=error,
-                                )
-                            )
+                            # future so collective_rpc() doesn't hang. Keep
+                            # client-error status so the API can answer 4xx.
+                            self._enqueue_result(AsyncDiffusionOutput.rpc_error(rpc_id, e))
                         elif output_rank is None and exec_all_ranks:
                             # DP multi-concurrency: primary ranks reply, tagged
                             from vllm.distributed.parallel_state import (

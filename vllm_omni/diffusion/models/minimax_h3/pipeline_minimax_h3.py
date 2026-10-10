@@ -2673,7 +2673,7 @@ class MiniMaxH3Pipeline(
         """Prepare media once and encode either shared text or each window's text.
 
         Returns initial conditioning and optional request-owned window embeddings.
-        Invalid continuation prompts are broadcast before any encoder collective.
+        Invalid continuation options and prompts are broadcast before any encoder collective.
         """
         group, rank, world_size = _dit_rank_world()
         prompts = (sampling.extra_args or {}).get("continuation_prompts")
@@ -2710,19 +2710,17 @@ class MiniMaxH3Pipeline(
                     raise OmniClientError(
                         "MiniMax H3 diffusion stage requires text encoder conditioning when text_encoder is not loaded"
                     )
+                continuation = resolve_continuation(
+                    sampling.extra_args or {},
+                    task=task,
+                    step_execution=bool(getattr(self.od_config, "step_execution", False)),
+                )
                 prepared = prepare_encoder_inputs(
                     raw_prompt,
                     sampling,
                     task=task,
                     prepared_reference_videos=self._extract_prepared_reference_videos(raw_prompt),
                 )
-                continuation = None
-                if prompts is not None or (request_context is not None and task == "ref2va"):
-                    continuation = resolve_continuation(
-                        sampling.extra_args or {},
-                        task=task,
-                        step_execution=bool(getattr(self.od_config, "step_execution", False)),
-                    )
                 if prompts is not None:
                     if continuation is None or not self.load_text_encoder:
                         raise OmniClientError(

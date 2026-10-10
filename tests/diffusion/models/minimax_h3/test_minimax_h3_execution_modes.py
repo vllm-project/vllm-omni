@@ -9,6 +9,7 @@ import pytest
 import torch
 from PIL import Image
 
+from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
 from vllm_omni.errors import OmniClientError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
@@ -55,6 +56,79 @@ def _request(task, *, payload=None):
         height=32, width=32, num_frames=96, num_inference_steps=2, extra_args={"task": task, "aspect_ratio": "1:1"}
     )
     return SimpleNamespace(prompts=[prompt], sampling_params=sampling)
+
+
+@pytest.mark.parametrize("with_prompts", [False, True])
+@pytest.mark.parametrize(
+    "overrides,step_execution,message",
+    [
+        ({"continuation_overlap_frames": 23}, False, "overlap must be an integer"),
+        ({"continuation_window_frames": 999}, False, "window must be an integer"),
+        ({}, True, "not step execution"),
+    ],
+    ids=["invalid-overlap", "invalid-window", "step-execution"],
+)
+def test_continuation_validation_precedes_reference_and_encoder_work(
+    pipeline, mocker, with_prompts, overrides, step_execution, message
+):
+    pipeline.od_config = OmniDiffusionConfig(step_execution=step_execution)
+    request = _request("ref2va")
+    request.sampling_params.extra_args.update({"long_video": True, **overrides})
+    if with_prompts:
+        request.sampling_params.extra_args["continuation_prompts"] = ["window prompt"]
+    prepare = mocker.patch(
+        "vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3.prepare_encoder_inputs",
+        side_effect=AssertionError("invalid continuation must be rejected before reference preparation"),
+    )
+    encode_media = mocker.patch.object(pipeline, "_encode_local_media")
+    with pytest.raises(OmniClientError, match=message):
+        pipeline._prepare_request_inputs(request.prompts[0], request.sampling_params)
+    prepare.assert_not_called()
+    pipeline.encode_prompt.assert_not_called()
+    encode_media.assert_not_called()
+    pipeline.diffuse.assert_not_called()
+
+
+@pytest.mark.parametrize("step_execution", [False, True], ids=["invalid-overlap", "step-execution"])
+def test_continuation_validation_error_reaches_all_ranks_before_encoder_collectives(
+    pipeline, monkeypatch, mocker, step_execution
+):
+    from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as module
+
+    pipeline.od_config = OmniDiffusionConfig(step_execution=step_execution)
+    request = _request("ref2va")
+    request.sampling_params.extra_args.update({"long_video": True, "continuation_overlap_frames": 23})
+    prepare = mocker.patch.object(
+        module,
+        "prepare_encoder_inputs",
+        side_effect=AssertionError("rank 0 must validate before preparing references"),
+    )
+    encode_media = mocker.patch.object(pipeline, "_encode_local_media")
+    broadcast_tensor = mocker.patch.object(module, "_broadcast_tensor")
+    wire: list[dict[str, object]] = []
+    rank_group = object()
+
+    def broadcast_error(payload, *, src, group):
+        assert src == 0
+        assert group is rank_group
+        if not wire:
+            assert payload[0]["type"] == "OmniClientError"
+            wire.extend(payload)
+        else:
+            payload[:] = wire
+
+    broadcast = mocker.patch.object(module.dist, "broadcast_object_list", side_effect=broadcast_error)
+    message = "not step execution" if step_execution else "overlap must be an integer"
+    for rank in (0, 1):
+        monkeypatch.setattr(module, "_dit_rank_world", lambda rank=rank: (rank_group, rank, 2))
+        with pytest.raises(OmniClientError, match=message) as error:
+            pipeline._prepare_local_conditioning(request.prompts[0], request.sampling_params)
+        assert error.value.status_code == 400
+    assert broadcast.call_count == 2
+    prepare.assert_not_called()
+    pipeline.encode_prompt.assert_not_called()
+    encode_media.assert_not_called()
+    broadcast_tensor.assert_not_called()
 
 
 @pytest.mark.parametrize("task", ["t2va", "fl2va", "ref2va"])

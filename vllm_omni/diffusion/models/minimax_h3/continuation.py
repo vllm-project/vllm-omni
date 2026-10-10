@@ -16,7 +16,7 @@ import torch
 from vllm.logger import init_logger
 
 from vllm_omni.errors import OmniClientError
-from vllm_omni.model_executor.models.minimax_h3.long_video import resolve_long_video_mode
+from vllm_omni.model_executor.models.minimax_h3.long_video import resolve_continuation as _resolve_continuation
 
 from .packed_tokens import minimax_h3_pack_audio_latent, minimax_h3_patchify_video_latent
 
@@ -51,19 +51,7 @@ class ContinuationWindow:
 
 
 def resolve_continuation(extra: Mapping[str, Any], *, task: str, step_execution: bool) -> tuple[int, int] | None:
-    mode = resolve_long_video_mode(extra, task)
-    if mode == "full":
-        return None
-    if task != "ref2va" or step_execution:
-        raise OmniClientError("MiniMax H3 continuation requires Ref2VA request execution (not step execution)")
-    window = extra.get("continuation_window_frames", 277)
-    overlap = extra.get("continuation_overlap_frames", 22)
-    for name, value in (("window", window), ("overlap", overlap)):
-        if isinstance(value, bool) or not isinstance(value, int) or value < 5 or value % 17 != 5:
-            raise OmniClientError(f"MiniMax H3 continuation {name} must be an integer on the 17n+5 frame grid")
-    if not 107 <= window <= 345 or overlap >= window:
-        raise OmniClientError("MiniMax H3 continuation window must be 107..345 frames and exceed its overlap")
-    return window, overlap
+    return _resolve_continuation(extra, task=task, step_execution=step_execution)
 
 
 def plan_continuation_windows(total_frames: int, window_frames: int, overlap_frames: int) -> list[ContinuationWindow]:

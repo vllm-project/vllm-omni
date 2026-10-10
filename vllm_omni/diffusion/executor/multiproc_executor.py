@@ -35,6 +35,7 @@ from vllm_omni.diffusion.offloader.config import (
 from vllm_omni.diffusion.sched.request_scheduler import build_request_batch_sampling_params_key
 from vllm_omni.diffusion.utils.future_utils import try_set_exception, try_set_result
 from vllm_omni.diffusion.worker import WorkerProc
+from vllm_omni.errors import client_error_or
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.sched.interface import DiffusionSchedulerOutput
@@ -65,6 +66,20 @@ def _dropped_output_error(async_output_id: str) -> RuntimeError:
     return RuntimeError(
         f"async output {async_output_id} was dropped: the request was aborted "
         "before its output was claimed; retry with a new request."
+    )
+
+
+def _async_output_error(msg: AsyncDiffusionOutput) -> BaseException:
+    """Rebuild the worker-side exception carried by an async error envelope.
+
+    A 4xx status restores ``OmniClientError`` so the engine and API keep the
+    client-error classification; anything else stays a generic ``RuntimeError``.
+    """
+    return client_error_or(
+        msg.error or "Worker error",
+        status_code=msg.error_status_code,
+        error_type=msg.error_type,
+        fallback=RuntimeError,
     )
 
 
@@ -614,7 +629,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                             request_id=new_req.request_id,
                             step_index=None,
                             finished=True,
-                            result=DiffusionOutput(error=str(exc)),
+                            result=DiffusionOutput.from_exception(exc),
                         )
                     )
             return BatchRunnerOutput.from_list(runner_outputs)
@@ -662,7 +677,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                         request_id=new_req.request_id,
                         step_index=None,
                         finished=True,
-                        result=DiffusionOutput(error=str(exc)),
+                        result=DiffusionOutput.from_exception(exc),
                     )
                 )
 
@@ -969,7 +984,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                     fut = self._rpc_futures.pop(msg.rpc_id, None) if msg.rpc_id else None
                 if fut is not None and not fut.done():
                     if msg.error:
-                        try_set_exception(fut, RuntimeError(msg.error))
+                        try_set_exception(fut, _async_output_error(msg))
                     else:
                         try_set_result(fut, msg)
             elif msg.kind == AsyncOutputKind.OUTPUT_READY:
@@ -986,9 +1001,9 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                 else:
                     # Single-request result: unpack SHM first, then resolve or cache atomically.
                     output_result: DiffusionOutput | None = None
-                    exc: Exception | None = None
+                    exc: BaseException | None = None
                     if msg.error:
-                        exc = RuntimeError(msg.error)
+                        exc = _async_output_error(msg)
                     else:
                         try:
                             unpack_diffusion_output_shm(msg.output)
