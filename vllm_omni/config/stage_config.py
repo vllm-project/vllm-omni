@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Literal, NamedTuple
 
 from transformers import PretrainedConfig
+from vllm.config import KernelConfig
 from vllm.logger import init_logger
 from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
 
@@ -28,6 +29,30 @@ logger = init_logger(__name__)
 _DEPLOY_DIR = Path(__file__).resolve().parent.parent / "deploy"
 
 _STAGE_OVERRIDE_PATTERN = re.compile(r"^stage_(\d+)_(.+)$")
+
+
+def _normalize_stage_backend_fields(stage: StageDeployConfig) -> None:
+    """Normalize promoted backends and enforce their precedence over extras."""
+    kernels = {
+        name: getattr(stage, name) for name in ("moe_backend", "linear_backend") if getattr(stage, name) is not None
+    }
+    normalized = KernelConfig(**kernels)
+    for name in kernels:
+        setattr(stage, name, getattr(normalized, name))
+
+    # Only backend selections gain this precedence rule; unrelated extras keep
+    # their existing merge behavior. Never retain a duplicate legacy key.
+    stage.engine_extras = dict(stage.engine_extras)
+    for name in ("attention_backend", "moe_backend", "linear_backend"):
+        value = getattr(stage, name)
+        if value is not None and name in stage.engine_extras:
+            extra = stage.engine_extras.pop(name)
+            if value != extra:
+                warnings.warn(
+                    f"stage {stage.stage_id}: {name}={value!r} overrides engine_extras[{name!r}]={extra!r}.",
+                    UserWarning,
+                    stacklevel=3,
+                )
 
 
 def pipeline_cfg_resolver(config_type: type[PretrainedConfig]):
@@ -434,6 +459,12 @@ class StageDeployConfig:
     max_num_batched_tokens: int | None = None
     max_model_len: int | None = None
 
+    # Upstream AR attention and shared AR/diffusion kernel selection.
+    # None means omitted, so model/platform defaults remain authoritative.
+    attention_backend: str | None = None
+    moe_backend: str | None = None
+    linear_backend: str | None = None
+
     # Generic execution, scheduling, and KV/cache behavior.
     enforce_eager: bool | None = None
     async_scheduling: bool | None = None
@@ -532,6 +563,9 @@ class StageDeployConfig:
     # === Pass-through stage engine fields ===
     # Pass-through stage engine args that are not represented above.
     engine_extras: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        _normalize_stage_backend_fields(self)
 
 
 @dataclass(frozen=True)
@@ -959,6 +993,11 @@ def _apply_platform_overrides(
                     type(po.env).__name__,
                 )
                 base.env = po.env
+        # Remove base legacy values before merging the entire overlay. Nested
+        # extras in the overlay must still be checked regardless of key order.
+        for key in ("attention_backend", "moe_backend", "linear_backend"):
+            if key in po.overrides:
+                base.engine_extras.pop(key, None)
         for key, val in po.overrides.items():
             if hasattr(base, key):
                 # Deep-merge dict-valued fields listed in _DEEP_MERGE_KEYS so
@@ -973,6 +1012,9 @@ def _apply_platform_overrides(
                 setattr(base, key, val)
             else:
                 base.engine_extras[key] = val
+        # Platform overlays run after construction and can reintroduce nested
+        # backend extras. Reapply normalization and first-class precedence.
+        _normalize_stage_backend_fields(base)
 
     # Validate the final values, including stage entries from the platform
     # overlay. A global V2 default may still apply to omitted pipeline stages.
