@@ -4,6 +4,7 @@
 
 import math
 from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -30,12 +31,106 @@ logger = init_logger(__name__)
 _REF_AUDIO_CACHE_KEY = "_qwen3_tts_ref_audio_cache_key"
 
 QWEN3_TTS_EFFECTIVE_MAX_TOKENS_KEY = "_qwen3_tts_effective_max_tokens"
-_MIN_CODEC_FRAMES = 192
-_MAX_CODEC_FRAMES_PER_TEXT_TOKEN = 12
+# Set when the effective budget was derived from the input text rather than
+# requested by the caller, so a length finish is a runaway for every task.
+QWEN3_TTS_AUTO_BUDGET_KEY = "_qwen3_tts_auto_codec_budget"
+
+# Talker-stage ``additional_config`` keys that tune the text-scaled budget.
+# Each takes a number (applies to every task) or a ``{task_type: number}``
+# mapping (tasks left out keep their defaults).
+CODEC_BUDGET_FRAMES_PER_TEXT_TOKEN_KEY = "codec_budget_frames_per_text_token"
+CODEC_BUDGET_MIN_FRAMES_KEY = "codec_budget_min_frames"
+_QWEN3_TTS_TASKS = ("Base", "CustomVoice", "VoiceDesign")
+
+
+@dataclass(frozen=True)
+class Qwen3TTSCodecBudget:
+    """Text-scaled ceiling ``max(min_frames, ceil(frames_per_text_token * n))``.
+
+    ``frames_per_text_token == 0`` disables the ceiling and keeps the
+    configured stage ``max_tokens``.
+    """
+
+    frames_per_text_token: float
+    min_frames: int
+
+    @property
+    def enabled(self) -> bool:
+        return self.frames_per_text_token > 0
+
+    def frames_for(self, text_tokens: int) -> int:
+        return max(self.min_frames, math.ceil(self.frames_per_text_token * text_tokens))
+
+
+# Defaults in 12.5 Hz codec frames per input text token (model tokenizer).
+# On uncapped 1.7B generations (Seed-TTS EN/ZH, ZH hard cases and long
+# paragraphs for Base and all nine CustomVoice speakers; VoiceDesign with
+# slow-speech instructions), every EOS-terminated output that ASR confirms
+# as valid stays at least 1.57x (Base), 1.61x (CustomVoice) and 2.3x
+# (VoiceDesign) below these bounds. Built-in and designed voices need more
+# room than Base: non-native speakers, repeated-word text that the tokenizer
+# compresses, and slow-speech instructions reach 15-25 frames per token,
+# while cloned references stay below 14.
+DEFAULT_CODEC_BUDGETS: Mapping[str, Qwen3TTSCodecBudget] = {
+    "Base": Qwen3TTSCodecBudget(frames_per_text_token=12.0, min_frames=192),
+    "CustomVoice": Qwen3TTSCodecBudget(frames_per_text_token=40.0, min_frames=400),
+    "VoiceDesign": Qwen3TTSCodecBudget(frames_per_text_token=40.0, min_frames=400),
+}
+
+
+def _budget_value(config: Mapping[str, Any], key: str, task_type: str, default: float) -> object:
+    value = config.get(key, default)
+    if isinstance(value, Mapping):
+        unknown = set(value) - set(_QWEN3_TTS_TASKS)
+        if unknown:
+            raise ValueError(f"{key} has unknown Qwen3-TTS task types {sorted(unknown)}; use {list(_QWEN3_TTS_TASKS)}")
+        return value.get(task_type, default)
+    return value
+
+
+def load_codec_budgets(config: Mapping[str, Any] | None) -> dict[str, Qwen3TTSCodecBudget]:
+    """Resolve per-task budgets from the Talker stage ``additional_config``."""
+    budgets: dict[str, Qwen3TTSCodecBudget] = {}
+    for task_type, default in DEFAULT_CODEC_BUDGETS.items():
+        if not config:
+            budgets[task_type] = default
+            continue
+        rate = _budget_value(config, CODEC_BUDGET_FRAMES_PER_TEXT_TOKEN_KEY, task_type, default.frames_per_text_token)
+        floor = _budget_value(config, CODEC_BUDGET_MIN_FRAMES_KEY, task_type, default.min_frames)
+        try:
+            rate_value = float(rate)  # type: ignore[arg-type]
+            floor_float = float(floor)  # type: ignore[arg-type]
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Invalid Qwen3-TTS {task_type} codec budget config: "
+                f"{CODEC_BUDGET_FRAMES_PER_TEXT_TOKEN_KEY}={rate!r}, {CODEC_BUDGET_MIN_FRAMES_KEY}={floor!r}"
+            ) from exc
+        if isinstance(rate, bool) or not math.isfinite(rate_value) or rate_value < 0:
+            raise ValueError(f"{CODEC_BUDGET_FRAMES_PER_TEXT_TOKEN_KEY} must be >= 0 (0 disables), got {rate!r}")
+        if isinstance(floor, bool) or not floor_float.is_integer() or floor_float < 1:
+            raise ValueError(f"{CODEC_BUDGET_MIN_FRAMES_KEY} must be a positive integer, got {floor!r}")
+        budgets[task_type] = Qwen3TTSCodecBudget(frames_per_text_token=rate_value, min_frames=int(floor_float))
+    return budgets
+
+
+def _first_value(value: object) -> object:
+    """Unwrap the list-wrapped ``additional_information`` value convention."""
+    if isinstance(value, (list, tuple)):
+        return value[0] if value else None
+    return value
+
+
+def _stage_additional_config(stage: Any) -> Mapping[str, Any] | None:
+    """Return the Talker stage ``additional_config`` from typed or legacy stage configs."""
+    for owner in (getattr(stage, "runtime_config", None), getattr(stage, "engine_args", None)):
+        config = getattr(owner, "additional_config", None)
+        if isinstance(config, Mapping):
+            return config
+    return None
 
 
 class Qwen3TTSCodecLimitError(TTSGenerationError):
-    """Qwen3-TTS Base exhausted its codec budget without emitting EOS."""
+    """Qwen3-TTS exhausted its codec budget without emitting EOS."""
 
     def __init__(self, message: str) -> None:
         super().__init__(message, retryable=True)
@@ -54,6 +149,14 @@ class Qwen3TTSAdapter(ARTTSAdapter):
         super().__init__(ctx)
         self._estimate_prompt_len_async = make_async(
             self._estimate_prompt_len, executor=getattr(ctx.server, "_tts_executor", None)
+        )
+        self.codec_budgets = load_codec_budgets(_stage_additional_config(getattr(ctx.server, "_tts_stage", None)))
+        logger.info(
+            "Qwen3-TTS default codec budgets (frames): %s",
+            ", ".join(
+                f"{task}=max({b.min_frames}, {b.frames_per_text_token:g} * text_tokens)" if b.enabled else f"{task}=off"
+                for task, b in self.codec_budgets.items()
+            ),
         )
 
     def _estimate_ref_code_len(self, ref_audio: object) -> int | None:
@@ -566,13 +669,14 @@ class Qwen3TTSAdapter(ARTTSAdapter):
         prompt: dict[str, Any] | None = None,
         request_id: str | None = None,
     ) -> list:
-        """Apply a text-scaled safety ceiling to Base codec generation.
+        """Apply a text-scaled safety ceiling to codec generation.
 
         Qwen3-TTS can rarely enter a repetitive state in which codec EOS is no
         longer reachable through top-k sampling. A fixed 4096-frame ceiling
         turns that into several minutes of unusable audio. Bound the default
-        Base-task budget by text length, while preserving an explicit caller
-        ``max_new_tokens`` override and the configured budget for other tasks.
+        budget of every task by text length (``self.codec_budgets``, tunable
+        per task through the Talker stage ``additional_config``), while
+        preserving an explicit caller ``max_new_tokens`` override.
         """
         import copy
 
@@ -583,21 +687,27 @@ class Qwen3TTSAdapter(ARTTSAdapter):
         # complete sampling configuration on every request.
         sampling_params_list = [copy.copy(params) for params in sampling_params_list]
         configured_cap = getattr(sampling_params_list[0], "max_tokens", None)
-        task_type = request.task_type or "CustomVoice"
+        additional_information = prompt.get("additional_information") if isinstance(prompt, dict) else None
+        if not isinstance(additional_information, dict):
+            additional_information = None
+        # The built prompt carries the effective task (stored voices dispatch
+        # as Base); fall back to the request for prompt-less callers.
+        task_type = _first_value((additional_information or {}).get("task_type")) or request.task_type or "CustomVoice"
+        budget = self.codec_budgets.get(str(task_type))
         text_tokens = None
         dynamic_cap = None
         effective_cap: int | None
 
         if request.max_new_tokens is not None:
             # An explicit request budget is an opt-out from the automatic
-            # ceiling. It remains an upper bound, and a length finish is still
-            # surfaced as an incomplete generation rather than valid audio.
+            # ceiling. It remains an upper bound; for Base a length finish is
+            # still surfaced as an incomplete generation rather than valid audio.
             effective_cap = int(request.max_new_tokens)
-        elif task_type == "Base":
+        elif budget is not None and budget.enabled:
             counted_text_tokens = server._count_usage_text_tokens(request.input)
             if counted_text_tokens > 0:
                 text_tokens = counted_text_tokens
-                dynamic_cap = max(_MIN_CODEC_FRAMES, text_tokens * _MAX_CODEC_FRAMES_PER_TEXT_TOKEN)
+                dynamic_cap = budget.frames_for(text_tokens)
                 effective_cap = min(dynamic_cap, int(configured_cap)) if configured_cap is not None else dynamic_cap
             else:
                 # Token counting is best-effort. If the tokenizer is missing or
@@ -615,10 +725,10 @@ class Qwen3TTSAdapter(ARTTSAdapter):
                 effective_cap,
             )
 
-        if isinstance(prompt, dict):
-            additional_information = prompt.get("additional_information")
-            if isinstance(additional_information, dict) and effective_cap is not None:
-                additional_information[QWEN3_TTS_EFFECTIVE_MAX_TOKENS_KEY] = [effective_cap]
+        if additional_information is not None and effective_cap is not None:
+            additional_information[QWEN3_TTS_EFFECTIVE_MAX_TOKENS_KEY] = [effective_cap]
+            if dynamic_cap is not None:
+                additional_information[QWEN3_TTS_AUTO_BUDGET_KEY] = [True]
 
         # Propagate the deploy/YAML stage seed to residual MTP sampling. The
         # generic serving layer applies an explicit request.seed afterwards,
@@ -651,20 +761,22 @@ class Qwen3TTSAdapter(ARTTSAdapter):
     ) -> None:
         if QWEN3_TTS_EFFECTIVE_MAX_TOKENS_KEY not in tts_params:
             return
-        task_type = tts_params.get("task_type")
-        if isinstance(task_type, (list, tuple)):
-            task_type = task_type[0] if task_type else None
-        if task_type != "Base" or stage0_finish_reason != "length":
+        if stage0_finish_reason != "length":
+            return
+        task_type = _first_value(tts_params.get("task_type"))
+        # Base rejects every length finish (#6728). Other tasks reject it only
+        # under the server-derived text budget, including when that budget is
+        # clamped to the configured stage limit; an explicit caller budget
+        # keeps returning the audio as before.
+        if task_type != "Base" and not _first_value(tts_params.get(QWEN3_TTS_AUTO_BUDGET_KEY)):
             return
 
-        raw_limit = tts_params.get(QWEN3_TTS_EFFECTIVE_MAX_TOKENS_KEY)
-        if isinstance(raw_limit, (list, tuple)):
-            raw_limit = raw_limit[0] if raw_limit else None
+        raw_limit = _first_value(tts_params.get(QWEN3_TTS_EFFECTIVE_MAX_TOKENS_KEY))
         try:
             limit = int(raw_limit) if isinstance(raw_limit, (str, bytes, bytearray, int, float)) else 0
         except (TypeError, ValueError):
             limit = 0
         raise Qwen3TTSCodecLimitError(
-            "Qwen3-TTS Base did not emit codec EOS before its token budget "
+            f"Qwen3-TTS {task_type} did not emit codec EOS before its token budget "
             f"({output_tokens}/{limit} codec tokens); the generated audio is incomplete."
         )

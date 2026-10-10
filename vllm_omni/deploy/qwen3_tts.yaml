@@ -86,6 +86,14 @@ stages:
     devices: "0"
     output_connectors:
       to_stage_1: connector_of_shared_memory
+    # Serving-side runaway ceiling for requests without max_new_tokens:
+    # max(codec_budget_min_frames, codec_budget_frames_per_text_token *
+    # input text tokens) codec frames, capped by max_tokens below. Each key
+    # takes a number (all tasks) or a per-task mapping; a rate of 0 disables
+    # the ceiling. Defaults shown:
+    # additional_config:
+    #   codec_budget_frames_per_text_token: {Base: 12, CustomVoice: 40, VoiceDesign: 40}
+    #   codec_budget_min_frames: {Base: 192, CustomVoice: 400, VoiceDesign: 400}
     default_sampling_params:
       temperature: 0.9
       top_k: 50

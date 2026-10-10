@@ -169,15 +169,24 @@ python examples/offline_inference/text_to_speech/qwen3_tts/end2end.py --query-ty
 - Async chunking: Enabled by default in `qwen3_tts.yaml` for streaming-friendly first-audio latency. Raw audio streaming requires `stream=true`, `stream_format="audio"`, and `response_format="pcm"`.
 - Task/model matching: Each task type requires its matching model checkpoint. Using a CustomVoice model for a Base (voice clone) request will fail.
 - Stored voices: Uploaded and precomputed voices use the Base task and require a Base checkpoint. Built-in preset speakers remain CustomVoice voices.
-- Base codec termination: Base requests without an explicit `max_new_tokens`
-  use a text-scaled safety ceiling (at least 192 codec frames and no more than
-  the configured model limit). If the Talker reaches that ceiling without
-  codec EOS, non-streaming serving discards the incomplete audio and retries
-  once with a fresh seed; an explicit `seed` or `max_new_tokens` disables the
-  retry. SSE and WebSocket clients receive structured errors and must discard
-  previously emitted audio when the error contains `"action":"discard"`;
-  raw PCM streams terminate with a connection error after any partial bytes
-  already sent.
+- Codec termination: requests of every task (Base, CustomVoice, VoiceDesign)
+  without an explicit `max_new_tokens` use a text-scaled safety ceiling of
+  `max(codec_budget_min_frames, codec_budget_frames_per_text_token * text_tokens)`
+  codec frames at 12.5 Hz, counted over the `input` text only and capped by the
+  configured stage `max_tokens`. Defaults are `max(192, 12 * text_tokens)` for
+  Base and `max(400, 40 * text_tokens)` for CustomVoice and VoiceDesign, whose
+  built-in or designed voices can speak much slower per token than a cloned
+  reference. Tune them under the Talker stage's `additional_config` in the
+  deploy YAML (a number for all tasks, or a `{Base: ..., CustomVoice: ...}`
+  mapping); a rate of `0` disables the ceiling. If the Talker
+  reaches that ceiling without codec EOS, non-streaming serving discards the
+  incomplete audio and retries once with a fresh seed; an explicit `seed` or
+  `max_new_tokens` disables the retry. SSE and WebSocket clients receive
+  structured errors and must discard previously emitted audio when the error
+  contains `"action":"discard"`; raw PCM streams terminate with a connection
+  error after any partial bytes already sent. An explicit `max_new_tokens`
+  always wins; Base rejects audio that exhausts it, while CustomVoice and
+  VoiceDesign return it as before.
 - Known limitations: The server serves one model variant at a time. To switch task types (e.g., CustomVoice to Base), restart the server with the corresponding model.
 
 ## Hardware Support
