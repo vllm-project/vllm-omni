@@ -3,8 +3,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
-from functools import lru_cache
+from collections.abc import Callable, Iterable
 from math import prod
 from typing import TYPE_CHECKING, Any
 
@@ -129,6 +128,23 @@ def _resolve_qwen_image_lookup_name(
             continue
         return lookup_name.replace(weight_name, param_name), shard_id
     return lookup_name, None
+
+
+_ROPE_FREQS_CACHE_SIZE = 16
+
+
+def _cached_rope_freqs(cache: dict, key: tuple, compute: Callable[[], torch.Tensor]) -> torch.Tensor:
+    """Bounded per-module cache for rope frequency tables.
+
+    A method-level ``functools.lru_cache`` keys on ``self`` and keeps the module
+    and its device tensors alive after the engine shuts down (#8016).
+    """
+    freqs = cache.get(key)
+    if freqs is None:
+        if len(cache) >= _ROPE_FREQS_CACHE_SIZE:
+            cache.pop(next(iter(cache)))
+        freqs = cache[key] = compute()
+    return freqs
 
 
 class ImageRopePrepare(nn.Module):
@@ -314,6 +330,7 @@ class QwenEmbedLayer3DRope(nn.Module):
         )
 
         self.scale_rope = scale_rope
+        self._freqs_cache: dict[tuple, torch.Tensor] = {}
 
     def rope_params(self, index, dim, theta=10000):
         """
@@ -364,8 +381,14 @@ class QwenEmbedLayer3DRope(nn.Module):
 
         return vid_freqs, txt_freqs
 
-    @lru_cache(maxsize=16)
     def _compute_video_freqs(self, frame, height, width, idx=0):
+        return _cached_rope_freqs(
+            self._freqs_cache,
+            ("video", frame, height, width, idx),
+            lambda: self._build_video_freqs(frame, height, width, idx),
+        )
+
+    def _build_video_freqs(self, frame, height, width, idx=0):
         seq_lens = frame * height * width
         freqs_pos = self.pos_freqs.split([x // 2 for x in self.axes_dim], dim=1)
         freqs_neg = self.neg_freqs.split([x // 2 for x in self.axes_dim], dim=1)
@@ -383,8 +406,14 @@ class QwenEmbedLayer3DRope(nn.Module):
         freqs = torch.cat([freqs_frame, freqs_height, freqs_width], dim=-1).reshape(seq_lens, -1)
         return freqs.clone().contiguous()
 
-    @lru_cache(maxsize=16)
     def _compute_condition_freqs(self, frame, height, width):
+        return _cached_rope_freqs(
+            self._freqs_cache,
+            ("condition", frame, height, width),
+            lambda: self._build_condition_freqs(frame, height, width),
+        )
+
+    def _build_condition_freqs(self, frame, height, width):
         seq_lens = frame * height * width
         freqs_pos = self.pos_freqs.split([x // 2 for x in self.axes_dim], dim=1)
         freqs_neg = self.neg_freqs.split([x // 2 for x in self.axes_dim], dim=1)
@@ -429,6 +458,7 @@ class QwenEmbedRope(nn.Module):
 
         # DO NOT USING REGISTER BUFFER HERE, IT WILL CAUSE COMPLEX NUMBERS LOSE ITS IMAGINARY PART
         self.scale_rope = scale_rope
+        self._freqs_cache: dict[tuple, torch.Tensor] = {}
 
     def rope_params(self, index: torch.Tensor, dim: int, theta: int = 10000):
         """
@@ -478,8 +508,14 @@ class QwenEmbedRope(nn.Module):
 
         return vid_freqs, txt_freqs
 
-    @lru_cache(maxsize=16)
     def _compute_video_freqs(self, frame, height, width, idx=0):
+        return _cached_rope_freqs(
+            self._freqs_cache,
+            (frame, height, width, idx),
+            lambda: self._build_video_freqs(frame, height, width, idx),
+        )
+
+    def _build_video_freqs(self, frame, height, width, idx=0):
         seq_lens = frame * height * width
         freqs_pos = self.pos_freqs.split([x // 2 for x in self.axes_dim], dim=1)
         freqs_neg = self.neg_freqs.split([x // 2 for x in self.axes_dim], dim=1)

@@ -587,67 +587,82 @@ _patch_inductor_factorable_divisibility()
 
 
 # =============================================================================
-# Patch CuMemAllocator._python_free_callback to fix CUDA double-free on shutdown
+# Patch CuMemAllocator free path so releasing a MemPool frees all its memory
 # =============================================================================
-# WHY: CuMemAllocator._python_free_callback guards the asleep-entry double-free
-# skip with ``if data.is_asleep and current_platform.is_rocm():`` — only ROCm
-# gets the safe empty-handle return.  On CUDA, the callback falls through and
-# returns the original handle, causing cuMemRelease on already-freed memory
-# (CUDA_ERROR_INVALID_VALUE) during EngineCore subprocess atexit cleanup.
+# WHY: Inline diffusion engines release their CuMem ``MemPool`` in-process at
+# shutdown, and torch then raw-frees every cached block through the C
+# extension's ``my_free``, which calls ``_python_free_callback`` for a handle
+# to unmap. Two kinds of block have no usable handle there (#8016):
 #
-# This happens because ``sleep()`` calls ``unmap_and_release()`` on ALL
-# platforms, then sets ``is_asleep = True``.  When the atexit handler
-# (``_shutdown_singleton`` -> ``release_pools()`` -> GC) triggers the free
-# callback, the asleep entries must return an empty chunk list so the C
-# extension skips ``cuMemRelease`` — exactly the same logic already used by
-# the ROCm guard.
+# * Blocks swept by ``use_memory_pool()`` on exit: it pops idle segments from
+#   ``pointer_to_data`` and unmaps them, but torch's MemPool still caches them
+#   and frees them again later, so the upstream callback raises ``KeyError``.
+# * Asleep blocks: ``sleep()`` already unmapped them. Upstream only guards
+#   ROCm, whose ``my_free`` accepts an empty chunk list; on CUDA ``my_free``
+#   parses the handle as ``KKKK`` and always unmaps.
 #
-# The fix removes the ``current_platform.is_rocm()`` condition so the guard
-# applies to CUDA (and any future platform that implements cumem).
+# On CUDA any failure in ``my_free`` returns without unmapping and leaves a
+# Python exception and a sticky CUDA error behind, so every later free in the
+# same ``emptyCache`` pops its entry but never releases the physical memory.
+# One stale block thus leaked the whole transformer (~4 GiB) on shutdown.
 #
-# FRAGILITY: Relies on ``_python_free_callback`` being a regular method
-# (not a slot or C extension).  If CuMemAllocator is rewritten in C/Cython,
-# this monkey-patch will silently become a no-op.
+# FIX: remember handles swept by ``use_memory_pool()``; when torch frees a
+# swept or asleep block, re-back it with fresh physical memory on CUDA so
+# ``my_free`` can unmap, release, and free the address normally (ROCm keeps
+# its empty-chunk-list path).
+#
+# FRAGILITY: Relies on ``_python_free_callback`` being a regular method and on
+# ``use_memory_pool()`` resolving ``unmap_and_release`` from the module globals.
 def _patch_cumem_free_callback_cuda() -> None:
     try:
+        from vllm.device_allocator import cumem as cumem_module
         from vllm.device_allocator.cumem import CuMemAllocator
+        from vllm.platforms import current_platform
     except ImportError:
         _PATCH_LOGGER.debug("[cumem-cuda] CuMemAllocator not available; skipping patch")
         return
 
-    _original_free_callback = CuMemAllocator._python_free_callback
-
-    if getattr(_original_free_callback, "_omni_cumem_cuda_patched", False):
+    if getattr(CuMemAllocator._python_free_callback, "_omni_cumem_cuda_patched", False):
         return
 
-    # The upstream bug: `_python_free_callback` only skips the double-free
-    # for ROCm (line ~206).  We wrap the method to extend the guard to all
-    # platforms.
+    is_rocm = current_platform.is_rocm()
+    original_unmap_and_release = cumem_module.unmap_and_release
+
+    def _tracking_unmap_and_release(allocation_handle) -> None:
+        original_unmap_and_release(allocation_handle)
+        allocator = CuMemAllocator.instance
+        # sleep()/discard() keep their entries; only the use_memory_pool()
+        # sweep unmaps a block that is no longer tracked.
+        if allocator is not None and allocation_handle[2] not in allocator.pointer_to_data:
+            allocator.__dict__.setdefault("_omni_swept_handles", {})[allocation_handle[2]] = allocation_handle
+
+    def _releasable_handle(allocation_handle) -> tuple:
+        """Return a handle for a block whose physical memory is already released."""
+        if is_rocm:
+            device, size, d_mem, _ = allocation_handle
+            return (device, size, d_mem, [])
+        cumem_module.create_and_map(allocation_handle)
+        return allocation_handle
+
     def _patched_free_callback(self, ptr: int) -> tuple:
-        data = self.pointer_to_data.pop(ptr)
+        data = self.pointer_to_data.pop(ptr, None)
+        if data is None:
+            swept = self.__dict__.get("_omni_swept_handles", {}).pop(ptr, None)
+            if swept is None:
+                raise KeyError(ptr)
+            return _releasable_handle(swept)
         if data.cpu_backup_tensor is not None:
             data.cpu_backup_tensor = None
         if data.is_asleep:
-            # sleep() already called unmap_and_release() on this allocation.
-            # Return an empty chunk list so the C extension skips
-            # cuMemRelease, avoiding a double-free.  Same logic as the
-            # existing ROCm guard, but applied to all platforms.
-            device, size, d_mem, _ = data.handle
-            result = (device, size, d_mem, [])
-            _PATCH_LOGGER.debug(
-                "[cumem-cuda] Free callback: asleep entry %s -> empty handle",
-                ptr,
-            )
-            return result
+            return _releasable_handle(data.handle)
         # Drain pending kernels before the C extension's cuMemUnmap.
         torch.accelerator.synchronize(data.handle[0])
         return data.handle
 
     _patched_free_callback._omni_cumem_cuda_patched = True
     CuMemAllocator._python_free_callback = _patched_free_callback
-    _PATCH_LOGGER.info(
-        "[cumem-cuda] CuMemAllocator._python_free_callback patched: asleep guard extended to all platforms."
-    )
+    cumem_module.unmap_and_release = _tracking_unmap_and_release
+    _PATCH_LOGGER.info("[cumem-cuda] CuMemAllocator free path patched: swept and asleep blocks are released safely.")
 
 
 _patch_cumem_free_callback_cuda()

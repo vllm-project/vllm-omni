@@ -159,6 +159,15 @@ class HeliosFeedForward(nn.Module):
         return hidden_states
 
 
+@torch.no_grad()
+@lru_cache(maxsize=32)
+def _get_spatial_meshgrid(height, width, device_str):
+    device = torch.device(device_str)
+    grid_y_coords = torch.arange(height, device=device, dtype=torch.float32)
+    grid_x_coords = torch.arange(width, device=device, dtype=torch.float32)
+    return torch.meshgrid(grid_y_coords, grid_x_coords, indexing="ij")
+
+
 class HeliosRotaryPosEmbed(nn.Module):
     """Helios-style 3D rotary position embeddings using explicit frame indices."""
 
@@ -180,21 +189,12 @@ class HeliosRotaryPosEmbed(nn.Module):
         return freqs.cos(), freqs.sin()
 
     @torch.no_grad()
-    @lru_cache(maxsize=32)
-    def _get_spatial_meshgrid(self, height, width, device_str):
-        device = torch.device(device_str)
-        grid_y_coords = torch.arange(height, device=device, dtype=torch.float32)
-        grid_x_coords = torch.arange(width, device=device, dtype=torch.float32)
-        grid_y, grid_x = torch.meshgrid(grid_y_coords, grid_x_coords, indexing="ij")
-        return grid_y, grid_x
-
-    @torch.no_grad()
     def forward(self, frame_indices, height, width, device):
         batch_size = frame_indices.shape[0]
         num_frames = frame_indices.shape[1]
 
         frame_indices = frame_indices.to(device=device, dtype=torch.float32)
-        grid_y, grid_x = self._get_spatial_meshgrid(height, width, str(device))
+        grid_y, grid_x = _get_spatial_meshgrid(height, width, str(device))
 
         grid_t = frame_indices[:, :, None, None].expand(batch_size, num_frames, height, width)
         grid_y_batch = grid_y[None, None, :, :].expand(batch_size, num_frames, -1, -1)
