@@ -26,6 +26,7 @@ from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
+from vllm_omni.platforms import current_omni_platform
 from vllm_omni.diffusion.models.interface import SupportImageInput, SupportsComponentDiscovery
 from vllm_omni.diffusion.models.ltx2.ltx2_latents import (
     denormalize_latents,
@@ -45,6 +46,7 @@ from vllm_omni.diffusion.models.sana_wm.config import (
     SanaWmConfig,
 )
 from vllm_omni.diffusion.models.sana_wm.request import normalize_sana_wm_payload
+from vllm_omni.diffusion.models.sana_wm.ucpe import _inductor_options_available
 from vllm_omni.diffusion.models.sana_wm.sana_wm_transformer import (
     SANA_WM_STAGE1_PROMPT_CHANNELS,
     SanaWmTransformer3DModel,
@@ -214,6 +216,24 @@ def build_sana_wm_output_envelope(
     return {"payload": {payload_key: output}, "metadata": {"sana_wm": metadata}}
 
 
+def _camprep_compile_requested(od_config: OmniDiffusionConfig | None) -> bool:
+    """Standalone compile of the camera-prep helper is explicitly opted in via
+    env, and skipped under enforce_eager so eager mode keeps its all-native
+    contract. Requires a platform with inductor support and the pinned
+    inductor options; anything else keeps the native path."""
+    if od_config is None or od_config.enforce_eager:
+        return False
+    if os.environ.get("VLLM_OMNI_SANA_WM_CAMPREP_COMPILE", "0") != "1":
+        return False
+    if not current_omni_platform.is_available() or not current_omni_platform.supports_torch_inductor():
+        logger.warning("Sana-WM camera prep compile: platform does not support inductor; keeping native.")
+        return False
+    if not _inductor_options_available():
+        logger.warning("Sana-WM camera prep compile: pinned inductor options unavailable; keeping native.")
+        return False
+    return True
+
+
 def get_sana_wm_pre_process_func(od_config: OmniDiffusionConfig):
     del od_config
 
@@ -318,6 +338,11 @@ class SanaWmPipeline(
             prefix=f"{prefix}.transformer" if prefix else "transformer",
         )
         self.device = get_local_device()
+        if _camprep_compile_requested(od_config):
+            # Instance-bound dispatch: the shared compiled callable is created
+            # lazily on first use; only this pipeline's transformer opts in.
+            self.transformer.set_cam_prep_use_compiled(True)
+            logger.info("Sana-WM camera prep: standalone compiled helper enabled.")
         if od_config is not None and od_config.model is not None:
             self._build_aux_components()
 

@@ -41,6 +41,7 @@ from vllm_omni.diffusion.models.sana_wm.config import SanaWmConfig
 from vllm_omni.diffusion.models.sana_wm.ucpe import (
     SanaWmCamGeometry,
     cam_prep_func,
+    get_compiled_cam_prep,
     prepare_cam_geometry,
 )
 
@@ -658,6 +659,10 @@ class SanaWmSelfAttention(nn.Module):
             prefix=f"{prefix}.qkv" if prefix else "qkv",
         )
         self.num_heads = self.qkv.num_heads
+        # Instance-bound opt-in for the standalone compiled camera-prep helper.
+        # The compiled callable itself is a shared lazily-created singleton;
+        # whether THIS attention instance uses it is decided only by this flag.
+        self._cam_prep_use_compiled = False
         self.num_kv_heads = self.qkv.num_kv_heads
         self.proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
@@ -1190,6 +1195,70 @@ class SanaWmSelfAttention(nn.Module):
         out = cam_geometry.apply_output(out.transpose(1, 2))
         return out.transpose(1, 2).reshape(batch_size, token_count, self.cam_dim)
 
+    def set_cam_prep_use_compiled(self, value: bool) -> None:
+        """Bind this attention instance's camera-prep dispatch to a fixed choice."""
+        self._cam_prep_use_compiled = bool(value)
+
+    @staticmethod
+    def _cam_prep_supported(q_normed: torch.Tensor, k_normed: torch.Tensor, v_raw: torch.Tensor,
+                            *, require_cuda: bool = True) -> bool:
+        """Cheap metadata gate for the compiled leaves (no data scans).
+
+        ``require_cuda=False`` lifts only the device check so tests can exercise
+        the remaining dtype/shape/layout conditions on CPU; production dispatch
+        keeps the default.
+        """
+        tensors = (q_normed, k_normed, v_raw)
+        if require_cuda and not all(t.is_cuda for t in tensors):
+            return False
+        if any(t.dtype is not torch.bfloat16 for t in tensors):
+            return False
+        if any(t.ndim != 4 for t in tensors):
+            return False
+        if q_normed.shape != k_normed.shape or q_normed.shape != v_raw.shape:
+            return False
+        head_dim = q_normed.shape[-1]
+        if head_dim % 2 != 0 or (head_dim // 2) % 4 != 0:
+            return False
+        return all(t.is_contiguous() for t in tensors)
+
+    def _cam_prep_compiled_dispatch(self, q_normed, k_normed, v_raw, *, proj_q, proj_kv, rope_cos, rope_sin, k_scale):
+        """Route to the double-leaf compiled path when supported, else native.
+
+        Falls back to the native function whenever gradients are required
+        (grad enabled with any of the seven tensor inputs marked
+        requires_grad) or the metadata gate rejects the call.
+        """
+        needs_grad = torch.is_grad_enabled() and (
+            q_normed.requires_grad
+            or k_normed.requires_grad
+            or v_raw.requires_grad
+            or proj_q.requires_grad
+            or proj_kv.requires_grad
+            or rope_cos.requires_grad
+            or rope_sin.requires_grad
+        )
+        if not needs_grad and self._cam_prep_supported(q_normed, k_normed, v_raw):
+            return get_compiled_cam_prep()(
+                q_normed, k_normed, v_raw,
+                proj_q=proj_q, proj_kv=proj_kv, rope_cos=rope_cos, rope_sin=rope_sin,
+                k_scale=float(k_scale),
+            )
+        return cam_prep_func(q_normed, k_normed, v_raw,
+                             proj_q=proj_q, proj_kv=proj_kv, rope_cos=rope_cos, rope_sin=rope_sin,
+                             k_scale=k_scale)
+
+    def _cam_prep_callable(self):
+        """Return this instance's camera-prep callable.
+
+        The compiled singleton is shared, but dispatch is instance-bound: an
+        instance that never opted in keeps calling the native function even if
+        another pipeline created the compiled helper.
+        """
+        if self._cam_prep_use_compiled:
+            return self._cam_prep_compiled_dispatch
+        return cam_prep_func
+
     def _forward_cam_branch(
         self,
         hidden_states: torch.Tensor,
@@ -1242,7 +1311,7 @@ class SanaWmSelfAttention(nn.Module):
         # so nothing needs permuting before the recurrence below.
         v_raw = v_cam.reshape(batch_size, token_count, self.cam_heads, self.cam_head_dim).contiguous()
         k_scale = (self.cam_head_dim**-0.5) * (spatial_tokens**-0.5)
-        q_rot_bhdn, k_rot_bhdn, v_bhdn, inflation_sq = cam_prep_func(
+        q_rot_bhdn, k_rot_bhdn, v_bhdn, inflation_sq = self._cam_prep_callable()(
             q_normed.contiguous(),
             k_normed.contiguous(),
             v_raw,
@@ -1820,6 +1889,14 @@ class SanaWmTransformer3DModel(nn.Module):
         self.attention_y_norm = RMSNorm(self.config.hidden_size)
         if device is not None or dtype is not None:
             self.to(device=device, dtype=dtype)
+
+    def set_cam_prep_use_compiled(self, value: bool) -> None:
+        """Propagate the instance-bound camera-prep dispatch choice to every
+        attention module. Turning it off never touches the shared compiled
+        singleton in :mod:`vllm_omni.diffusion.models.sana_wm.ucpe`."""
+        for module in self.modules():
+            if isinstance(module, SanaWmSelfAttention):
+                module.set_cam_prep_use_compiled(value)
 
     def _positional_embedding(self, token_count: int, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
         pos_embed = self.pos_embed.to(device=device, dtype=dtype)

@@ -529,8 +529,109 @@ def cam_prep_func(
     return q_out, k_out, v_out, inflation_sq
 
 
+_compiled_cam_prep: Callable | None = None
+
+# Strict-lossless double-leaf compiled implementation. Only two elementwise
+# leaves are compiled: input prepare (float cast, ReLU, K scale) and
+# rope+output (RoPE, concat, single-step layout/dtype cast, FP32 k_post for the
+# eager inflation). The three ray projections (BMM) and every reduction stay
+# outside the compiled regions. The option set pins IEEE-style elementwise
+# semantics; bitwise parity with the native function was verified on
+# CUDA/BF16 with torch 2.13 + Triton 3.7 (see review package).
+_INDUCTOR_OPTS = {
+    "emulate_precision_casts": True,
+    "eager_numerics.disable_ftz": True,
+    "use_fast_math": False,
+}
+
+
+def _leaf_prepare(q_normed: torch.Tensor, k_normed: torch.Tensor, v_raw: torch.Tensor, k_scale: float):
+    # where(x<=0, 0, x): -0.0 normalizes to +0.0 like ATen relu, and NaN
+    # compares false so it propagates (a where(x>0, x, 0) form would zero NaN).
+    qf = q_normed.float()
+    kf = k_normed.float()
+    q_norm = torch.where(qf <= 0, torch.zeros_like(qf), qf)
+    k_norm = torch.where(kf <= 0, torch.zeros_like(kf), kf) * k_scale
+    return q_norm, k_norm, v_raw.float()
+
+
+def _leaf_rope_out(
+    q_norm: torch.Tensor,
+    k_norm: torch.Tensor,
+    value: torch.Tensor,
+    *,
+    q_half: torch.Tensor,
+    k_half: torch.Tensor,
+    v_half: torch.Tensor,
+    rope_cos: torch.Tensor,
+    rope_sin: torch.Tensor,
+    half_dim: int,
+    dtype: torch.dtype,
+):
+    cos = rope_cos.float()
+    sin = rope_sin.float()
+    q_rope = _apply_interleaved_rope(q_norm[..., half_dim:], cos, sin)
+    k_rope = _apply_interleaved_rope(k_norm[..., half_dim:], cos, sin)
+    v_rope = _apply_interleaved_rope(value[..., half_dim:], cos, sin)
+    k_post = torch.cat((k_half, k_rope), dim=-1)
+
+    def cast_to_bhdn(t: torch.Tensor) -> torch.Tensor:
+        return t.permute(0, 2, 3, 1).to(dtype=dtype, memory_format=torch.contiguous_format, copy=True)
+
+    q_out = cast_to_bhdn(torch.cat((q_half, q_rope), dim=-1))
+    k_out = cast_to_bhdn(k_post)
+    v_out = cast_to_bhdn(torch.cat((v_half, v_rope), dim=-1))
+    return q_out, k_out, v_out, k_post
+
+
+def _inductor_options_available() -> bool:
+    """Cheap capability check: the three pinned option keys must exist."""
+    try:
+        available = set(torch._inductor.list_options())
+    except Exception:
+        return False
+    return {"emulate_precision_casts", "eager_numerics.disable_ftz", "use_fast_math"} <= available
+
+
+def get_compiled_cam_prep() -> Callable:
+    """Return the lazily created double-leaf compiled camera-prep dispatch.
+
+    The returned callable is an eager coordinator around the two compiled
+    leaves; it keeps the input validation, the three ray projections and the
+    inflation chain outside compilation. The singleton is shared and never
+    invalidated; whether any pipeline or attention instance actually uses it is
+    decided by that instance's own flag, never by this global cache alone.
+    """
+    global _compiled_cam_prep
+    if _compiled_cam_prep is None:
+        prepare = torch.compile(_leaf_prepare, dynamic=False, options=dict(_INDUCTOR_OPTS))
+        rope_out = torch.compile(_leaf_rope_out, dynamic=False, options=dict(_INDUCTOR_OPTS))
+
+        def _compiled_cam_prep_impl(q_normed, k_normed, v_raw, *, proj_q, proj_kv, rope_cos, rope_sin, k_scale):
+            half_dim = _validate_cam_prep_inputs(
+                q_normed, k_normed, v_raw, proj_q, proj_kv, rope_cos, rope_sin
+            )
+            q_norm, k_norm, value = prepare(q_normed, k_normed, v_raw, float(k_scale))
+            q_half = _apply_ray_projection(q_norm[..., :half_dim], proj_q)
+            k_half = _apply_ray_projection(k_norm[..., :half_dim], proj_kv)
+            v_half = _apply_ray_projection(value[..., :half_dim], proj_kv)
+            k_pre_sq = k_norm.square().sum(dim=-1).permute(0, 2, 1).contiguous()
+            q_out, k_out, v_out, k_post = rope_out(
+                q_norm, k_norm, value,
+                q_half=q_half, k_half=k_half, v_half=v_half,
+                rope_cos=rope_cos, rope_sin=rope_sin, half_dim=half_dim, dtype=v_raw.dtype,
+            )
+            k_post_sq = k_post.square().sum(dim=-1).permute(0, 2, 1).contiguous()
+            inflation_sq = k_post_sq.clamp_min(1e-12) / k_pre_sq.clamp_min(1e-12)
+            return q_out, k_out, v_out, inflation_sq
+
+        _compiled_cam_prep = _compiled_cam_prep_impl
+    return _compiled_cam_prep
+
+
 __all__ = [
     "SanaWmCamGeometry",
     "cam_prep_func",
+    "get_compiled_cam_prep",
     "prepare_cam_geometry",
 ]
