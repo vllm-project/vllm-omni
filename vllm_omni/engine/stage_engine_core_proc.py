@@ -18,6 +18,7 @@ from typing import Any
 import vllm.v1.engine.core as _vllm_engine_core_module
 from vllm.config import VllmConfig
 from vllm.logger import configure_logging, init_logger
+from vllm.sampling_params import SamplingParams
 from vllm.transformers_utils.config import (
     maybe_register_config_serialize_by_value,
 )
@@ -118,6 +119,10 @@ def _bind_native_data_plane_ready_sink(model_executor: Any, scheduler: Any) -> b
     return True
 
 
+class _CoalescedAdds(list):
+    """Preprocessed ``(request, wave)`` pairs of one coalesced ADD message."""
+
+
 class StageEngineCoreProc(EngineCoreProc):
     """Stage-specific engine core process for vLLM-Omni.
 
@@ -125,6 +130,10 @@ class StageEngineCoreProc(EngineCoreProc):
     entry point for launching in a subprocess.  Does **not** delegate to
     ``EngineCoreProc.run_engine_core()``.
     """
+
+    # Request id -> (reference, params) held for resumable updates
+    # (``OmniEngineCoreRequest.sampling_params_ref``); input thread only.
+    _held_sampling_params: dict[str, tuple[int, SamplingParams]] | None = None
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
@@ -148,12 +157,67 @@ class StageEngineCoreProc(EngineCoreProc):
                 logger.debug("omni_release_request_resources(%s) failed: %s", request_id, e)
 
     def preprocess_add_request(self, request: OmniEngineCoreRequest) -> tuple[Any, int]:
-        """Preserve omni payloads when vLLM builds its scheduler request."""
+        """Preserve omni payloads when vLLM builds its scheduler request.
+
+        A coalesced ADD carrier is unpacked here: each carried request is
+        preprocessed, or reported and skipped, exactly as a lone ADD would be.
+        """
+        coalesced = getattr(request, "coalesced_requests", None)
+        if coalesced is not None:
+            released = request.released_sampling_params_ids
+            if released and self._held_sampling_params:
+                for request_id in released:
+                    self._held_sampling_params.pop(request_id, None)
+            preprocessed = _CoalescedAdds()
+            for item in coalesced:
+                try:
+                    preprocessed.append(self._preprocess_one_add_request(item))
+                except Exception:
+                    self._handle_request_preproc_error(item)
+            return preprocessed, request.current_wave
+        return self._preprocess_one_add_request(request)
+
+    def _preprocess_one_add_request(self, request: OmniEngineCoreRequest) -> tuple[Any, int]:
+        self._resolve_held_sampling_params(request)
         scheduler_request, current_wave = super().preprocess_add_request(request)
         scheduler_request.additional_information = request.additional_information
         scheduler_request.external_req_id = getattr(request, "external_req_id", request.request_id)
         scheduler_request.payload_sender_info = getattr(request, "payload_sender_info", None)
         return scheduler_request, current_wave
+
+    def _resolve_held_sampling_params(self, request: OmniEngineCoreRequest) -> None:
+        """Hold the sampling params an update brings, or restore the ones it refers to.
+
+        A reference to params this core does not hold fails the update's preprocessing.
+        """
+        ref = getattr(request, "sampling_params_ref", None)
+        held_by_id = self._held_sampling_params
+        if ref is None:
+            if held_by_id and not request.resumable:
+                # The request's stream ends; so do the params held for it.
+                held_by_id.pop(request.request_id, None)
+            return
+        if request.sampling_params is not None:
+            if held_by_id is None:
+                held_by_id = self._held_sampling_params = {}
+            held_by_id[request.request_id] = (ref, request.sampling_params)
+            return
+        held = held_by_id.get(request.request_id) if held_by_id else None
+        if held is None or held[0] != ref:
+            holding = "none" if held is None else f"reference {held[0]}"
+            raise RuntimeError(
+                f"request {request.request_id} refers to sampling params {ref}, "
+                f"but this engine core holds {holding} for it"
+            )
+        request.sampling_params = held[1]
+
+    def _handle_client_request(self, request_type: EngineCoreRequestType, request: Any) -> None:
+        if request_type == EngineCoreRequestType.ADD and isinstance(request[0], _CoalescedAdds):
+            # Same order and per-request handling as separate ADD messages.
+            for item in request[0]:
+                super()._handle_client_request(request_type, item)
+            return
+        super()._handle_client_request(request_type, request)
 
     @staticmethod
     def run_stage_core(

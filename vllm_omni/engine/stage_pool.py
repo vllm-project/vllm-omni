@@ -1064,8 +1064,13 @@ class StagePool:
         *,
         prompt_text: Any = None,
         submit_kwargs: dict[str, Any] | None = None,
+        coalesce: bool = False,
     ) -> int:
-        """Submit a streaming update to an already admitted request."""
+        """Submit a streaming update to an already admitted request.
+
+        With *coalesce*, a client that supports it queues the update for this
+        loop turn's coalesced ADD (``StageEngineCoreClient.add_request_coalesced``).
+        """
         submit_kwargs = submit_kwargs or {}
         params = req_state.sampling_params_list[self.stage_id]
         if self.stage_type == "diffusion":
@@ -1097,7 +1102,13 @@ class StagePool:
                     request_index=0,
                     queue=None,
                 )
-                await self._llm_client(replica_id).add_request_async(request, **submit_kwargs)
+                llm_client = self._llm_client(replica_id)
+                add_coalesced = getattr(llm_client, "add_request_coalesced", None)
+                coalescable = not submit_kwargs and not getattr(request, "mm_features", None)
+                if coalesce and coalescable and callable(add_coalesced):
+                    add_coalesced(request)
+                else:
+                    await llm_client.add_request_async(request, **submit_kwargs)
             except Exception:
                 rollback = getattr(self.output_processor, "remove_request", None)
                 if callable(rollback):

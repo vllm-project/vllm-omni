@@ -19,7 +19,7 @@ from vllm.v1.request import Request, RequestStatus
 from tests.helpers.omni_scheduler import bind_omits_transfer_helpers
 from vllm_omni.core.sched.omni_ar_scheduler import OmniARScheduler
 from vllm_omni.core.sched.omni_generation_scheduler import OmniGenerationScheduler
-from vllm_omni.data_entry_keys import CodesStruct, MetaStruct, OmniPayload, OmniPayloadStruct
+from vllm_omni.data_entry_keys import SKIP_TRANSFER, CodesStruct, MetaStruct, OmniPayload, OmniPayloadStruct, to_dict
 from vllm_omni.distributed.omni_connectors.adapter import construct_next_stage_streaming_input_prompt
 from vllm_omni.distributed.omni_connectors.connectors.shm_connector import SharedMemoryConnector
 from vllm_omni.distributed.omni_connectors.transfer_adapter.base import OmniTransferAdapterBase
@@ -1331,7 +1331,8 @@ def test_send_single_request_struct_without_meta_does_not_crash(build_adapter, m
 def test_send_single_request_empty_struct_goes_on_wire(build_adapter, monkeypatch):
     """Pin the contract: an explicitly empty ``OmniPayloadStruct()`` passes
     the ``payload_data is None`` check and gets sent. To skip a chunk, the
-    producer must return ``None``, not an empty struct. (Filtering empty
+    producer must return ``None`` (or ``SKIP_TRANSFER``, which also withholds
+    a resumable segment marker), not an empty struct. (Filtering empty
     structs at the adapter would require introspecting all struct fields on
     every send and was rejected for cost vs. value.)
     """
@@ -1385,7 +1386,52 @@ def test_send_single_request_respects_processor_receiver_boundary(build_adapter,
     assert sent_payload.meta.is_segment_finished.item() is False
 
 
-def test_send_single_request_personaplex_pending_frame_is_not_segment_boundary(
+@pytest.mark.parametrize("is_segment_finished", [False, True])
+def test_send_single_request_skip_transfer_does_not_put(build_adapter, is_segment_finished):
+    adapter, connector = build_adapter(stage_id=0)
+    request = _req("req-skip", RequestStatus.RUNNING, external_req_id="ext-skip")
+    request.resumable = True
+    adapter.custom_process_next_stage_input_func = lambda **kwargs: SKIP_TRANSFER
+    adapter.put_req_chunk["ext-skip"] = 3
+    adapter.ramp_chunk_count["ext-skip"] = 2
+    adapter.code_prompt_token_ids["ext-skip"].append(torch.tensor([1]))
+
+    adapter.save_async(None, request, is_segment_finished=is_segment_finished)
+    task = adapter._pending_save_reqs.popleft()
+    sender_token = task["sender_token"]
+    adapter._send_single_request(task)
+
+    connector.put.assert_not_called()
+    assert adapter.put_req_chunk["ext-skip"] == 3
+    assert sender_token.num_puts == 0
+    assert not sender_token.in_flight
+    assert adapter._sender_tokens["ext-skip"] is sender_token
+    # A segment boundary still drops the sender's segment-local state, as it
+    # does after a put.
+    assert ("ext-skip" in adapter.ramp_chunk_count) is not is_segment_finished
+    assert ("ext-skip" in adapter.code_prompt_token_ids) is not is_segment_finished
+    assert not adapter._send_failures
+
+
+def test_send_single_request_never_skips_the_request_terminal(build_adapter, monkeypatch):
+    adapter, connector = build_adapter(stage_id=0)
+    request = _req("req-skip-terminal", RequestStatus.FINISHED_STOPPED, external_req_id="ext-skip-terminal")
+    adapter.custom_process_next_stage_input_func = lambda **kwargs: SKIP_TRANSFER
+    monkeypatch.setattr(adapter, "cleanup", lambda *a, **kw: None)
+
+    adapter.save_async(None, request)
+    task = adapter._pending_save_reqs.popleft()
+    assert task["is_finished"] is True
+    adapter._send_single_request(task)
+
+    connector.put.assert_called_once()
+    assert connector.put.call_args.kwargs["put_key"] == "ext-skip-terminal_0_0"
+    sent_payload = connector.put.call_args.kwargs["data"]
+    assert sent_payload.meta.finished.item() is True
+    assert not adapter._sender_tokens["ext-skip-terminal"].terminal_pending
+
+
+def test_send_single_request_personaplex_pending_frame_sends_nothing(
     build_adapter,
 ):
     from vllm_omni.model_executor.stage_input_processors.personaplex import (
@@ -1421,10 +1467,84 @@ def test_send_single_request_personaplex_pending_frame_is_not_segment_boundary(
         }
     )
 
-    sent_payload = connector.put.call_args.kwargs["data"]
-    assert sent_payload.codes is None
-    assert sent_payload.meta.finished.item() is False
-    assert sent_payload.meta.is_segment_finished.item() is False
+    # The frame only buffers the de-delay tail: no put and no segment marker,
+    # and the chunk key stays free for the first real chunk.
+    connector.put.assert_not_called()
+    assert adapter.put_req_chunk["ext-personaplex"] == 0
+    assert adapter.request_payload["ext-personaplex"]["personaplex_frames"][0].equal(torch.arange(8))
+
+
+class _InMemoryConnector:
+    """Connector pair sharing one key space; ``get`` consumes like SHM."""
+
+    def __init__(self, stage_id: int, store: dict, extra: dict | None = None) -> None:
+        self.stage_id = stage_id
+        self.config = {"extra": extra or {}}
+        self.store = store
+        self.put_keys: list[str] = []
+
+    def put(self, from_stage, to_stage, put_key, data):
+        assert put_key not in self.store
+        self.store[put_key] = to_dict(data)
+        self.put_keys.append(put_key)
+        return True, 1, {}
+
+    def get(self, from_stage, to_stage, get_key, metadata=None):
+        if get_key not in self.store:
+            return None
+        return self.store.pop(get_key), 1
+
+
+def test_personaplex_resumable_stream_puts_only_data_chunks_in_order(build_adapter, monkeypatch):
+    from vllm_omni.model_executor.stage_input_processors.personaplex import (
+        talker2code2wav_async_chunk,
+    )
+
+    extra = {"initial_codec_chunk_frames": 1, "codec_chunk_frames": 5}
+    store: dict = {}
+    sender, _ = build_adapter(stage_id=0, connector_extra=extra)
+    sender.connector = _InMemoryConnector(0, store, extra)
+    sender.custom_process_next_stage_input_func = talker2code2wav_async_chunk
+    monkeypatch.setattr(sender, "cleanup", lambda *a, **kw: None)
+    receiver, _ = build_adapter(stage_id=1, model_mode="generation")
+    receiver.connector = _InMemoryConnector(1, store)
+
+    request = _req("req-stream", RequestStatus.WAITING, external_req_id="ext-stream")
+    request.resumable = True
+    downstream = _req("req-code2wav", RequestStatus.WAITING, external_req_id="ext-stream")
+    frames = [torch.arange(8, dtype=torch.long).reshape(1, 8) + 100 * i for i in range(13)]
+    received: list[list[int]] = []
+    entry = _dequeue_load_entry(receiver, downstream)
+    for index, frame in enumerate(frames):
+        terminal = index == len(frames) - 1
+        if terminal:
+            request.resumable = False
+            request.status = RequestStatus.FINISHED_STOPPED
+        request.additional_information = {"codes": {"audio": frame}}
+        # Every duplex frame ends a resumable stage 0 segment.
+        sender._send_single_request(
+            {
+                "multimodal_output": None,
+                "request": request,
+                "is_finished": terminal,
+                "is_segment_finished": not terminal,
+            }
+        )
+        while receiver._poll_single_request(entry):
+            received.append(list(downstream.prompt_token_ids))
+            entry = _dequeue_load_entry(receiver, downstream)
+
+    # Initial chunk after frame 1, then every 5 frames, then the terminal tail.
+    assert sender.connector.put_keys == [f"ext-stream_0_{i}" for i in range(4)]
+    assert not store
+    raw = torch.cat(frames, dim=0)
+    dedelayed = torch.cat([raw[:-1, :1], raw[1:, 1:]], dim=1)  # [12, 8]
+    sizes = [1, 5, 5, 1]
+    offsets = [0, 1, 6, 11]
+    for codes, start, size in zip(received, offsets, sizes, strict=True):
+        assert codes == dedelayed[start : start + size].transpose(0, 1).reshape(-1).tolist()
+    assert receiver.get_req_chunk[downstream.request_id] == 4
+    assert downstream.request_id in receiver.upstream_exhausted_requests
 
 
 def test_personaplex_sender_cleanup_drops_delayed_frame_state(build_adapter):
@@ -1457,8 +1577,7 @@ def test_personaplex_sender_cleanup_drops_delayed_frame_state(build_adapter):
         request=request,
         is_finished=True,
     )
-    assert first is not None
-    assert first.codes is None
+    assert first is SKIP_TRANSFER
 
     adapter.cleanup_sender(request.external_req_id)
 
@@ -1480,8 +1599,7 @@ def test_personaplex_sender_cleanup_drops_delayed_frame_state(build_adapter):
         is_finished=True,
     )
 
-    assert second is not None
-    assert second.codes is None
+    assert second is SKIP_TRANSFER
 
 
 def test_save_async_skips_stale_resumable_chunk_within_segment(build_adapter):
