@@ -3580,3 +3580,185 @@ def test_request_cancellation_at_prepare_and_decode_boundaries(preencode, cancel
         pipeline.decode_to_mp4.assert_not_called()
     finally:
         registry.close()
+
+
+@torch.inference_mode()
+def test_unpadded_sage_token_refiner_preserves_legacy_dispatch(monkeypatch):
+    from vllm_omni.diffusion.attention import layer as layer_mod
+    from vllm_omni.diffusion.attention import selector as selector_mod
+    from vllm_omni.diffusion.attention.backends import sage_attn
+    from vllm_omni.diffusion.attention.parallel.base import NoParallelAttention
+    from vllm_omni.diffusion.config import set_current_diffusion_config
+    from vllm_omni.diffusion.data import AttentionConfig
+    from vllm_omni.diffusion.models.minimax_h3 import minimax_h3_transformer as transformer
+
+    config = AttentionConfig(
+        default={"backend": "TORCH_SDPA"},
+        per_role={"minimax_h3.token_refiner": {"backend": "SAGE_ATTN"}},
+    )
+    arch = transformer.MiniMaxH3DiTArchConfig(
+        num_layers=1, token_refiner_num_layers=1, hidden_size=64, num_attention_heads=2, attention_head_dim=32
+    )
+    # No distributed process group or optional Sage kernel is needed to check
+    # model-owned metadata and dispatch through the real Sage implementation.
+    monkeypatch.setattr(transformer, "QKVParallelLinear", lambda **kwargs: SimpleNamespace(num_heads=2, num_kv_heads=2))
+    monkeypatch.setattr(transformer, "RowParallelLinear", lambda *args, **kwargs: nn.Identity())
+    monkeypatch.setattr(layer_mod, "build_parallel_attention_strategy", lambda **kwargs: NoParallelAttention())
+
+    # The kernel is mocked, so backend lookup must not depend on the host GPU
+    # or optional package availability. Keep role resolution and Sage dispatch real.
+    def resolve_backend(backend_name, head_size):
+        assert backend_name == "SAGE_ATTN" and head_size == 32
+        return sage_attn.SageAttentionBackend
+
+    monkeypatch.setattr(selector_mod, "_cached_get_backend_cls", resolve_backend)
+    calls = []
+
+    def sage_kernel(q, k, v, **kwargs):
+        calls.append(kwargs)
+        return torch.nn.functional.scaled_dot_product_attention(
+            q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), scale=kwargs["sm_scale"]
+        ).transpose(1, 2)
+
+    monkeypatch.setattr(sage_attn, "sageattn", sage_kernel)
+    # The custom-op boundary imports the optional package at execution time.
+    # Replace that package too, so this CPU dispatch test needs no Sage install.
+    monkeypatch.setitem(sys.modules, "sageattention", SimpleNamespace(sageattn=sage_kernel))
+    cfg = SimpleNamespace(
+        diffusion_attention_config=config,
+        parallel_config=SimpleNamespace(ring_degree=1),
+        diffusion_kv_cache_dtype=None,
+        diffusion_kv_cache_skip_step_indices=None,
+        diffusion_kv_cache_skip_layer_indices=None,
+    )
+    with set_current_diffusion_config(cfg):
+        attn = transformer.MiniMaxH3Attention(
+            arch,
+            None,
+            prefix="token_refiner.blocks.0.attn",
+            role="minimax_h3.token_refiner",
+            role_category="self",
+            skip_sequence_parallel=True,
+        )
+    assert attn.attention.attn_backend is sage_attn.SageAttentionBackend
+    # Call CUDA dispatch on CPU tensors with only the external kernel replaced.
+    monkeypatch.setattr(attn.attention.attention, "forward", attn.attention.attention.forward_cuda)
+    q, k, v = (torch.randn(7, 2, 32) for _ in range(3))
+    cu = torch.tensor([0, 7], dtype=torch.int32)
+    output = attn._run_packed_attention(q, k, v, cu_seqlens=cu, max_seqlen=7, packed_total=7)
+    assert output.shape == q.shape and len(calls) == 1
+    # Padded and multi-request layouts still receive their existing runtime rejection.
+    with pytest.raises(ValueError, match="does not support attn_mask"):
+        attn._run_packed_attention(q, k, v, cu_seqlens=cu, max_seqlen=6, packed_total=7)
+    with pytest.raises(ValueError, match="does not isolate multi-document"):
+        attn._run_packed_attention(q, k, v, cu_seqlens=cu, max_seqlen=7, packed_total=7, num_requests=2)
+    assert len(calls) == 1
+
+
+@pytest.mark.cuda
+@torch.inference_mode()
+def test_minimax_sparse_recipe_constructs_model_and_dispatches(monkeypatch):
+    from pathlib import Path
+
+    from vllm.model_executor import parameter
+    from vllm.model_executor.layers import linear
+
+    from tests.helpers.block_sparse import selected_attention_reference
+    from vllm_omni.diffusion.attention import layer as layer_mod
+    from vllm_omni.diffusion.attention.block_sparse import BlockSparseAttention, BlockSparseBackend
+    from vllm_omni.diffusion.attention.parallel.base import NoParallelAttention
+    from vllm_omni.diffusion.config import set_current_diffusion_config
+    from vllm_omni.diffusion.data import AttentionConfig
+    from vllm_omni.diffusion.models.minimax_h3 import minimax_h3_transformer as transformer
+
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (9, 0):
+        pytest.skip("Requires Hopper SM90 and FA4")
+    pytest.importorskip("flash_attn.cute")
+    monkeypatch.setattr(linear, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(linear, "get_tensor_model_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(parameter, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(parameter, "get_tensor_model_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(transformer, "get_tensor_model_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(layer_mod, "build_parallel_attention_strategy", lambda **kwargs: NoParallelAttention())
+    recipe = json.loads(
+        (Path(__file__).resolve().parents[4] / "recipes/attention/minimax-h3-fa4-subblock.json").read_text()
+    )
+    cfg = SimpleNamespace(
+        tf_model_config={
+            "num_layers": 1,
+            "token_refiner_num_layers": 1,
+            "hidden_size": 256,
+            "num_attention_heads": 2,
+            "attention_head_dim": 128,
+            "ffn_hidden_size": 512,
+            "latents_dim": 2,
+            "audio_latents_dim": 2,
+            "patch_size": (1, 1, 1),
+            "text_dim": 256,
+            "timestep_input_dim": 32,
+            "time_embed_hidden_size": 64,
+            "time_embed_dim": 128,
+            "adaln_out_features": 18 * 256,
+            "final_adaln_out_features": 2 * 256,
+            "rope_inv_freq_len": 16,
+        },
+        diffusion_attention_config=AttentionConfig(**recipe),
+        parallel_config=SimpleNamespace(ring_degree=1, ulysses_degree=1),
+        dtype=torch.bfloat16,
+        diffusion_kv_cache_dtype=None,
+        diffusion_kv_cache_skip_step_indices=None,
+        diffusion_kv_cache_skip_layer_indices=None,
+    )
+    with set_current_diffusion_config(cfg):
+        model = transformer.MiniMaxH3DiTModel(cfg).to(device="cuda")
+    # Real model construction and projections, with initialized tiny weights;
+    # no checkpoint, kernel substitute or hand-assigned attention role.
+    for weight in model.parameters():
+        weight.fill_(1) if weight.ndim == 1 else weight.normal_(std=0.02)
+    dit = model.blocks[0].attn
+    refiner = model.token_refiner.blocks[0].attn
+    assert dit.attention.role == "minimax_h3.dit" and dit.attention.role_category == "self"
+    assert refiner.attention.role == "minimax_h3.token_refiner" and refiner.attention.role_category == "self"
+    assert isinstance(dit.attention.attention, BlockSparseAttention)
+    assert dit.attention.attn_backend is BlockSparseBackend
+    assert not isinstance(refiner.attention.attention, BlockSparseAttention)
+    assert refiner.attention.attn_backend.get_name() == "FLASH_ATTN"
+    assert not transformer._attention_isolates_packed_requests(dit.attention)
+    calls = []
+    real_length = 1089
+
+    def check_sparse_dispatch(layer, args, output):
+        q, k, v, metadata = args
+        calls.append(layer.role)
+        assert metadata.attn_mask is None
+        assert metadata.packed_padding.q_length == metadata.packed_padding.kv_length == real_length
+        assert metadata.extra["cu_seqlens_q"].shape == (3,)
+        assert metadata.extra["protected_kv_prefix"] == 0
+        impl = layer.attention
+        real = (q[:, :real_length], k[:, :real_length], v[:, :real_length])
+        selection = impl.selector.select(real[0], real[1], impl.scale, 0)
+        assert selection.indices.shape[-1] < (real_length + 63) // 64
+        reference = selected_attention_reference(*real, selection, impl.scale, impl.block_size)
+        torch.testing.assert_close(output[:, :real_length].float(), reference, atol=0.004, rtol=0.02)
+        assert torch.count_nonzero(output[:, real_length:]) == 0 and output.is_contiguous()
+
+    dit.attention.register_forward_hook(check_sparse_dispatch)
+    refiner.attention.register_forward_hook(lambda layer, args, output: calls.append(layer.role))
+    text = torch.randn(97, 256, device="cuda", dtype=cfg.dtype)
+    refined = model.token_refiner(
+        text,
+        cu_seqlens=torch.tensor([0, 97], device=text.device, dtype=torch.int32),
+        max_seqlen=97,
+    )
+    assert refined.shape == text.shape and calls == ["minimax_h3.token_refiner"]
+    hidden = torch.randn(1152, 256, device="cuda", dtype=cfg.dtype)
+    hidden[real_length:] = float("nan")
+    cu = torch.tensor([0, real_length, hidden.shape[0]], device=hidden.device, dtype=torch.int32)
+    calls.clear()
+    actual = dit(hidden, rope_table=None, cu_seqlens=cu, max_seqlen=real_length)
+    assert calls == ["minimax_h3.dit"] and actual.shape == hidden.shape
+    hidden[real_length:] = 10000
+    repeated = dit(hidden, rope_table=None, cu_seqlens=cu, max_seqlen=real_length)
+    torch.testing.assert_close(repeated[:real_length], actual[:real_length], atol=0, rtol=0)
+    with pytest.raises(ValueError, match="does not isolate multi-document"):
+        dit(hidden, rope_table=None, cu_seqlens=cu, max_seqlen=real_length, num_requests=2)

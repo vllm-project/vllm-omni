@@ -1030,7 +1030,8 @@ class TestDimensionValidation:
         # Since expected_dims=3 but tensor has 4 dims, should return original
         assert result.shape == tensor_4d.shape
 
-    def test_auto_pad_calls_attention_mask_capability(self, monkeypatch):
+    @pytest.mark.parametrize("mask_free_padding", [False, True])
+    def test_auto_pad_calls_attention_mask_capability(self, monkeypatch, mask_free_padding):
         from vllm_omni.diffusion.attention import selector
         from vllm_omni.diffusion.distributed import parallel_state
         from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelConfig
@@ -1057,8 +1058,12 @@ class TestDimensionValidation:
         )
         tensor = torch.randn(1, 3, 8)
 
-        with pytest.raises(ValueError, match="does not support attention_mask"):
-            hook._shard_with_auto_pad(tensor, dim=1, shard_group=None)
+        if mask_free_padding:
+            result = hook._shard_with_auto_pad(tensor, dim=1, shard_group=None, mask_free_padding=True)
+            torch.testing.assert_close(result, tensor[:, :2])
+        else:
+            with pytest.raises(ValueError, match="does not support attention_mask"):
+                hook._shard_with_auto_pad(tensor, dim=1, shard_group=None)
 
     def test_auto_pad_allows_explicit_cudnn(self, monkeypatch):
         from vllm_omni.diffusion.data import AttentionConfig, AttentionSpec, OmniDiffusionConfig

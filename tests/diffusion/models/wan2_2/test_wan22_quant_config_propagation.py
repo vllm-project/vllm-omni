@@ -11,13 +11,14 @@ Tests cover:
 """
 
 import sys
-from types import SimpleNamespace
+from types import ModuleType
 
 import pytest
 from pytest_mock import MockerFixture
 
 import vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 as wan22_module
 import vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2_vace as wan22_vace_module
+from vllm_omni.diffusion.data import TransformerConfig
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import (
     create_transformer_from_config,
 )
@@ -148,18 +149,15 @@ class TestSetTfModelConfig:
     """Test that set_tf_model_config propagates quant_config correctly."""
 
     def _make_od_config(self):
-        """Create a minimal OmniDiffusionConfig-like object for testing."""
+        """Initialize the config before testing late transformer metadata."""
         from vllm_omni.diffusion.data import OmniDiffusionConfig
 
-        cfg = object.__new__(OmniDiffusionConfig)
-        cfg.quantization_config = None
-        cfg.tf_model_config = None
-        return cfg
+        return OmniDiffusionConfig(model="unused")
 
     def test_propagates_quant_config_when_none(self, mocker: MockerFixture):
         cfg = self._make_od_config()
         fake_qc = mocker.MagicMock()
-        tf_config = SimpleNamespace(quant_config=fake_qc, quant_method="auto-round")
+        tf_config = TransformerConfig(quant_config=fake_qc, quant_method="auto-round")
 
         cfg.set_tf_model_config(tf_config)
 
@@ -170,7 +168,7 @@ class TestSetTfModelConfig:
         cfg = self._make_od_config()
         existing_qc = mocker.MagicMock()
         cfg.quantization_config = existing_qc
-        tf_config = SimpleNamespace(quant_config=mocker.MagicMock())
+        tf_config = TransformerConfig(quant_config=mocker.MagicMock())
 
         cfg.set_tf_model_config(tf_config)
 
@@ -179,7 +177,7 @@ class TestSetTfModelConfig:
 
     def test_no_propagation_when_tf_quant_config_is_none(self, mocker: MockerFixture):
         cfg = self._make_od_config()
-        tf_config = SimpleNamespace(quant_config=None)
+        tf_config = TransformerConfig(quant_config=None)
 
         cfg.set_tf_model_config(tf_config)
 
@@ -211,12 +209,13 @@ class TestPatchWanRmsNorm:
         from vllm_omni.diffusion.models.wan2_2.patch_diffusers import patch_wan_rms_norm
 
         # Create a fake module that has WanRMS_norm
-        fake_module = SimpleNamespace(WanRMS_norm=lambda x: x)
+        fake_module = ModuleType("_test_fake_wan_module")
+        fake_module.__dict__["WanRMS_norm"] = lambda x: x
         sys.modules["_test_fake_wan_module"] = fake_module
 
         try:
             patch_wan_rms_norm()
-            assert fake_module.WanRMS_norm is RMSNormVAE
+            assert getattr(fake_module, "WanRMS_norm") is RMSNormVAE
         finally:
             del sys.modules["_test_fake_wan_module"]
 
@@ -231,7 +230,7 @@ class TestPatchWanRmsNorm:
             # This would cause RuntimeError without list() snapshot
             result = list(original_items())
             # Add a new module to simulate concurrent modification
-            sys.modules["_test_dynamic_module"] = SimpleNamespace()
+            sys.modules["_test_dynamic_module"] = ModuleType("_test_dynamic_module")
             return result
 
         try:

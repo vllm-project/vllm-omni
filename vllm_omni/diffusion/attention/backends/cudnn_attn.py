@@ -11,9 +11,12 @@ from vllm_omni.diffusion.attention.backends.abstract import (
 )
 from vllm_omni.diffusion.attention.backends.sdpa import _maybe_reshape_attn_mask
 from vllm_omni.diffusion.attention.backends.utils.piecewise_attn import piecewise_attn
+from vllm_omni.diffusion.attention.contracts import MethodCapabilities
 
 
 class CuDNNAttentionBackend(AttentionBackend):
+    strategy_capabilities = MethodCapabilities(local_execution=True)
+
     accept_output_buffer: bool = True
     supports_prefix_kv_slicing: bool = True
     supports_piecewise_spans: bool = True

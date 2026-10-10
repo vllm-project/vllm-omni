@@ -1410,6 +1410,23 @@ class DiffusionEngine:
             profile_requests.append(profile_request)
         return profile_requests
 
+    def warmup_attention_strategy(self, requests):
+        """Warm every layout using representative requests before admitting traffic.
+
+        Warmup covers the supplied request shapes and every reachable layout.
+        Call while no other generation requests are being submitted.
+        """
+        self.collective_rpc(method="attention_strategy_warmup", args=(True,))
+        try:
+            for request in requests:
+                output = self.add_req_and_wait_for_response(request)
+                if output.error:
+                    raise RuntimeError(f"Attention strategy warmup failed: {output.error}")
+        finally:
+            status = self.collective_rpc(method="attention_strategy_warmup", args=(False,))
+        logger.info("Attention strategy warmup evidence: %s", status)
+        return status
+
     def _dummy_run(self):
         """A dummy run to warm up the model."""
         req = self._make_dummy_request(
@@ -1426,9 +1443,12 @@ class DiffusionEngine:
             logger.info("Skipping dummy warmup run (num_frames=0)")
             return
         logger.info("dummy run to warm up the model")
-        output = self.add_req_and_wait_for_response(req)
-        if output.error:
-            raise RuntimeError(f"Dummy run failed: {output.error}")
+        if getattr(getattr(self.od_config, "diffusion_attention_config", None), "strategy", None) is not None:
+            self.warmup_attention_strategy([req])
+        else:
+            output = self.add_req_and_wait_for_response(req)
+            if output.error:
+                raise RuntimeError(f"Dummy run failed: {output.error}")
 
     def _submit_rpc(
         self,
