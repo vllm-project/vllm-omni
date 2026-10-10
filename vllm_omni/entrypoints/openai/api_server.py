@@ -866,6 +866,15 @@ async def omni_init_app_state(
     state.stage_configs = engine_client.stage_configs if hasattr(engine_client, "stage_configs") else None
     model_name = served_model_names[0] if served_model_names else args.model
 
+    # Upstream's init_app_state registers the parser counters whenever a
+    # tool-call parser is configured; until that happens
+    # record_tool_parser_invocation() is a silent no-op. omni wires the same
+    # parsers through its own init paths, so register them here too.
+    if getattr(args, "tool_call_parser", None) is not None:
+        from vllm.parser.metrics import init_parser_metrics
+
+        init_parser_metrics(model_name=model_name)
+
     # Initialize the API surface for the selected engine, not just the model.
     if isinstance(engine_client, DuplexOmni):
         await _init_duplex_app_state(engine_client, state, args, base_model_paths, vllm_config, request_logger)

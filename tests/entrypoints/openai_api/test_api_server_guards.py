@@ -559,6 +559,89 @@ async def test_api_server_assembly_replaces_upstream_routes_and_mounts_omni_rout
     assert "/health" in openapi_paths
 
 
+@pytest.mark.parametrize(
+    "overrides,expected_registration",
+    [
+        ({}, []),
+        ({"tool_call_parser": None}, []),
+        ({"tool_call_parser": "hermes_tool_parser"}, [{"model_name": "demo-model"}]),
+        (
+            {"served_model_name": ["served-alias"], "tool_call_parser": "hermes_tool_parser"},
+            [{"model_name": "served-alias"}],
+        ),
+    ],
+)
+async def test_parser_metrics_registered_exactly_when_a_tool_parser_is_set(
+    monkeypatch, overrides: dict[str, Any], expected_registration: list[dict[str, str]]
+) -> None:
+    """omni's init paths must register the parser metrics upstream registers.
+
+    Upstream ``init_app_state`` calls ``init_parser_metrics()`` when
+    ``--tool-call-parser`` is set, and ``record_tool_parser_invocation()``
+    returns early until that has happened; a mode that hands the parser to its
+    handlers without registering drops every invocation from ``/metrics``.
+    """
+    registered: list[dict[str, str]] = []
+    monkeypatch.setattr(
+        "vllm.parser.metrics.init_parser_metrics",
+        lambda **kwargs: registered.append(kwargs),
+    )
+
+    engine = _FakeEngineClient(
+        stage_configs=[object(), object()],
+        vllm_config=SimpleNamespace(
+            lora_config=None,
+            model_config=SimpleNamespace(),
+            parallel_config=SimpleNamespace(_api_process_rank=0),
+        ),
+    )
+
+    class _FakeModels:
+        def __init__(self, *args, **kwargs):
+            self.base_model_paths = kwargs.get("base_model_paths") or []
+
+        async def init_static_loras(self):
+            return None
+
+    class _FakeCtor:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def warmup(self):
+            return None
+
+    class _FakeSpeech(_FakeCtor):
+        async def warmup(self):
+            return None
+
+    monkeypatch.setattr(api_server, "load_chat_template", lambda *_a, **_k: None)
+    monkeypatch.setattr(api_server, "process_lora_modules", lambda modules, _defaults: modules or [])
+    monkeypatch.setattr(api_server, "OpenAIServingModels", _FakeModels)
+    monkeypatch.setattr(api_server, "OnlineRenderer", _FakeCtor)
+    monkeypatch.setattr(api_server, "OpenAIServingResponses", _FakeCtor)
+    monkeypatch.setattr(api_server, "OmniOpenAIServingChat", _FakeCtor)
+    monkeypatch.setattr(api_server, "OmniOpenAIServingChatBatch", _FakeCtor)
+    monkeypatch.setattr(api_server, "OpenAIServingCompletion", _FakeCtor)
+    monkeypatch.setattr(api_server, "ServingPooling", _FakeCtor)
+    monkeypatch.setattr(api_server, "OpenAIServingEmbedding", _FakeCtor)
+    monkeypatch.setattr(api_server, "ServingClassification", _FakeCtor)
+    monkeypatch.setattr(api_server, "ServingScores", _FakeCtor)
+    monkeypatch.setattr(api_server, "ServingTokenization", _FakeCtor)
+    monkeypatch.setattr(api_server, "OpenAIServingTranscription", _FakeCtor)
+    monkeypatch.setattr(api_server, "OpenAIServingTranslation", _FakeCtor)
+    monkeypatch.setattr(api_server, "AnthropicServingMessages", _FakeCtor)
+    monkeypatch.setattr(api_server, "ServingTokens", _FakeCtor)
+    monkeypatch.setattr(api_server, "OmniOpenAIServingSpeech", _FakeSpeech)
+    monkeypatch.setattr(api_server, "OmniOpenAIServingAudioGenerate", _FakeCtor)
+    monkeypatch.setattr(api_server, "OmniStreamingSpeechHandler", _FakeCtor)
+    monkeypatch.setattr(api_server, "create_streaming_video_handler", lambda **_k: _marker("streaming_video"))
+    monkeypatch.setattr(api_server, "OmniOpenAIServingVideo", _FakeCtor)
+
+    await api_server.omni_init_app_state(engine, State(), _minimal_args(**overrides))
+
+    assert registered == expected_registration
+
+
 @pytest.mark.asyncio
 async def test_timestamp_middleware_stamps_http_and_passes_websocket(monkeypatch) -> None:
     """Lock outermost timestamp middleware behavior.
