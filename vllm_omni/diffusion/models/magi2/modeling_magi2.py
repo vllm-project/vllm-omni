@@ -296,28 +296,17 @@ class Magi2MultiHeadMoELayer(nn.Module):
             dtype=config.params_dtype,
             parallel_mode="row",
         )
-        tp_size = self.split_linear.tp_group.world_size
-        self.local_shared_expert_intermediate_size = moe.shared_expert_intermediate_size // tp_size
-        self.local_modality_shared_expert_intermediate_size = moe.modality_shared_expert_intermediate_size // tp_size
 
     def _shared_experts(
         self,
         normalized: torch.Tensor,
         dispatcher: ModalityDispatcher,
     ) -> torch.Tensor:
-        shared = self.shared_expert_fc1(normalized)
-        modality = self.modality_specific_shared_expert_fc1(normalized, dispatcher)
-        activated = swiglu7(torch.cat((shared, modality), dim=-1))
-        shared, modality = activated.split(
-            (
-                self.local_shared_expert_intermediate_size,
-                self.local_modality_shared_expert_intermediate_size,
-            ),
-            dim=-1,
-        )
-        return self.shared_expert_fc2(shared) + self.modality_specific_shared_expert_fc2(
-            modality.contiguous(), dispatcher
-        )
+        # SwiGLU7 acts on adjacent column pairs, so activating each projection
+        # separately keeps both GEMM outputs and the down-projection inputs dense.
+        shared = swiglu7(self.shared_expert_fc1(normalized))
+        modality = swiglu7(self.modality_specific_shared_expert_fc1(normalized, dispatcher))
+        return self.shared_expert_fc2(shared) + self.modality_specific_shared_expert_fc2(modality, dispatcher)
 
     def route_input(
         self,
