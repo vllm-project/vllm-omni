@@ -366,12 +366,22 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             self._enqueue_waiting_request(request)
         self.running = in_flight
 
+    def _reject_oversized_payload(self, request: Request, required_tokens: int) -> bool:
+        if required_tokens <= self.max_num_scheduled_tokens:
+            return False
+        reason = (
+            f"One-shot generation requires {required_tokens} tokens in one step, "
+            f"exceeding max_num_batched_tokens={self.max_num_scheduled_tokens}."
+        )
+        self._finish_requests_with_error({request.request_id}, reason)
+        return True
+
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         """One-shot generation fast path:
         - Feed all input tokens of the request at once
           (if 0, allocate 1 placeholder token).
-        - If the token budget cannot be satisfied at once, fall back to the
-          default vLLM scheduling.
+        - Defer full payloads that do not fit the remaining token budget.
+        - Reject full payloads larger than the entire per-step budget.
         """
 
         token_budget = self.max_num_scheduled_tokens
@@ -459,6 +469,8 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
 
             num_computed_tokens = request.num_computed_tokens
             required_tokens = len(request.prompt_token_ids) - num_computed_tokens
+            if not async_chunk_transport and self._reject_oversized_payload(request, required_tokens):
+                continue
             if not self.scheduler_config.enable_chunked_prefill and required_tokens > token_budget:
                 # If chunked_prefill is disabled,
                 # we can stop the scheduling here.
@@ -475,6 +487,8 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                 else:
                     req_index += 1
                     continue
+            if not async_chunk_transport and required_tokens > token_budget:
+                break
             num_new_tokens = min(required_tokens, token_budget)
             new_blocks = self.kv_cache_manager.allocate_slots(
                 request,
@@ -482,10 +496,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                 num_lookahead_tokens=self.num_lookahead_tokens,
             )
             if new_blocks is None:
-                # Allocation failed (e.g., VRAM pressure); stop fast path and
-                # fall back to default scheduling
-                # Put the current request back to the head of the waiting queue
-                # Note: the original queue order is preserved
+                # Keep the request queued until its complete input fits.
                 break
             if self.log_stats:
                 request.record_event(EngineCoreEventType.SCHEDULED, scheduled_timestamp)
@@ -578,6 +589,11 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                             self.deferred_waiting.add(request)
                             skipped_requests.add_request(request)
                         continue
+            if not async_chunk_transport:
+                if self._reject_oversized_payload(request, required_tokens):
+                    continue
+                if required_tokens > token_budget:
+                    break
             num_new_tokens = min(required_tokens, token_budget)
             new_blocks = self.kv_cache_manager.allocate_slots(
                 request,
@@ -585,10 +601,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                 num_lookahead_tokens=self.num_lookahead_tokens,
             )
             if new_blocks is None:
-                # Allocation failed (e.g., VRAM pressure); stop fast path and
-                # fall back to default scheduling
-                # Put the current request back to the head of the waiting queue
-                # Note: the original queue order is preserved
+                # Keep the request queued until its complete input fits.
                 break
 
             # Officially schedule this request
@@ -614,17 +627,11 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         if skipped_waiting_requests:
             self.waiting.prepend_requests(skipped_waiting_requests)
 
-        # If fast path scheduled none, fall back to the original scheduling
-        if not num_scheduled_tokens:
-            if async_chunk_transport:
-                # Don't fall back: base scheduler doesn't handle async_chunk
-                # requests with empty prompt_token_ids.
-                self._restore_omni_wait_queues()
-            else:
-                res = super().schedule(throttle_prefills)
-                self._restore_omni_wait_queues()
-                self._postprocess_omni_schedule_output(res)
-                return self._wrap_omni_scheduler_output(res)
+        if not num_scheduled_tokens and async_chunk_transport:
+            self._restore_omni_wait_queues()
+
+        # Return an empty step when no complete payload fits. The base
+        # scheduler can split inputs, so it is not a safe fallback here.
 
         # Compute common prefix blocks (aligned with v1)
         num_common_prefix_blocks = [0] * len(self.kv_cache_config.kv_cache_groups)
@@ -688,8 +695,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         # write KV and have their output processed later in
         # update_from_output). Must precede _update_after_schedule, which
         # stamps request.last_sched_seq from the advanced value; the other
-        # half drains in update_from_output. The fallback path above gets
-        # both halves from super().schedule(). getattr: __new__-constructed
+        # half drains in update_from_output. getattr: __new__-constructed
         # test schedulers carry no defer_block_free attribute.
         if getattr(self, "defer_block_free", False) and total_num_scheduled_tokens > 0:
             self.sched_step_seq += 1
