@@ -41,11 +41,13 @@ class FinalLayoutTensorRestorePlan(WeightRestorePlan):
         self,
         lease: HostWeightLease,
         replacements: tuple[_Replacement, ...],
+        post_commit: Callable[[], None] | None,
         validators: tuple[Callable[[], None], ...],
         source_guard: Callable[[], None],
     ) -> None:
         self._lease = lease
         self._replacements = replacements
+        self._post_commit = post_commit
         self._validators = validators
         self._source_guard = source_guard
         self._committed = False
@@ -83,6 +85,8 @@ class FinalLayoutTensorRestorePlan(WeightRestorePlan):
                     replacement.parent._buffers[replacement.leaf_name] = replacement.source
             else:
                 replacement.target.data = replacement.source
+        if self._post_commit is not None:
+            self._post_commit()
         for validator in self._validators:
             validator()
 
@@ -90,10 +94,16 @@ class FinalLayoutTensorRestorePlan(WeightRestorePlan):
 class FinalLayoutTensorRestorer:
     """Validate and plan restoration for one exact policy-defined lease."""
 
-    def __init__(self, context: FinalLayoutIdentityContext) -> None:
+    def __init__(
+        self,
+        context: FinalLayoutIdentityContext,
+        *,
+        post_commit: Callable[[], None] | None = None,
+    ) -> None:
         if not context.dit_names or any(not name for name in context.dit_names):
             raise ValueError("final-layout restorer requires DiT component names")
         self._context = context
+        self._post_commit = post_commit
 
     @property
     def schema(self) -> str:
@@ -185,6 +195,7 @@ class FinalLayoutTensorRestorer:
         return FinalLayoutTensorRestorePlan(
             lease,
             tuple(replacements),
+            self._post_commit,
             tuple(binding.validator for binding in bindings),
             self._context.ensure_sources_unchanged,
         )
