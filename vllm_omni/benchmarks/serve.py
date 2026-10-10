@@ -56,6 +56,35 @@ def _use_endpoint_backend_when_implicit(args: argparse.Namespace) -> None:
         args.backend = endpoint
 
 
+_DIFFUSION_ENDPOINTS = frozenset(
+    {
+        "/v1/images/generations",
+        "/v1/images/edits",
+        "/v1/videos",
+    }
+)
+
+_DIFFUSION_BACKENDS = frozenset(
+    {
+        "openai-image-gen-omni",
+        "openai-image-edits-omni",
+        "openai-video-omni",
+    }
+)
+
+
+def is_diffusion_benchmark(args) -> bool:
+    """Return True when the benchmark targets a diffusion/image/video endpoint."""
+    endpoint = getattr(args, "endpoint", None) or ""
+    backend = getattr(args, "backend", None) or ""
+    return endpoint in _DIFFUSION_ENDPOINTS or backend in _DIFFUSION_BACKENDS
+
+
+def _prepare_diffusion_args(args: argparse.Namespace) -> None:
+    """Set defaults so upstream ``main_async`` skips tokenizer init for diffusion."""
+    args.skip_tokenizer_init = True
+
+
 def main(args: argparse.Namespace) -> dict[str, Any]:
     if getattr(args, "seed_tts_wer_eval", False):
         os.environ["SEED_TTS_WER_EVAL"] = "1"
@@ -74,6 +103,10 @@ def main(args: argparse.Namespace) -> dict[str, Any]:
         getattr(args, "extra_body", None),
         enabled=should_request_stage_metrics(args),
     )
+
+    if is_diffusion_benchmark(args):
+        _prepare_diffusion_args(args)
+
     lock = (
         omniinteract_output_lock(Path(args.omniinteract_output_dir))
         if getattr(args, "dataset_name", None) == "omniinteract"
