@@ -211,7 +211,7 @@ from vllm_omni.entrypoints.serve.utils.routes import (
 )
 from vllm_omni.entrypoints.utils import PureDiffusionLauncherAdapter
 from vllm_omni.errors import OmniClientError
-from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt, absorb_attention_schedule_extra_args
 from vllm_omni.utils.forced_aligner import build_forced_aligner_config
 from vllm_omni.utils.tracking_parser import TrackingArgumentParser, TrackingNamespace
 
@@ -2181,6 +2181,12 @@ async def generate_images(
             extra_args["flow_shift"] = request.flow_shift
         if extra_args:
             gen_params.extra_args = extra_args
+        try:
+            # The params were built before extra_args was set, and the inline stage client's clone()
+            # does not re-run __post_init__, so move the schedule onto the typed field here.
+            absorb_attention_schedule_extra_args(gen_params, override=True)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=HTTPStatus.BAD_REQUEST.value, detail=str(exc)) from exc
         # Parse per-request LoRA (compatible with chat's extra_body.lora shape).
         lora_request, lora_scale = _parse_lora_request(request.lora) if request.lora is not None else (None, None)
         _update_if_not_none(gen_params, "lora_request", lora_request)

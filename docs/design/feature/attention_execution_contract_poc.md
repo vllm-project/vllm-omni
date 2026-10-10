@@ -15,7 +15,7 @@ active parallel, paged-KV, and HSDP context; the backend combines it with the
 selected kernel and normalized metadata.
 
 Resolution runs outside compiled execution. FA4 reports `SUPPORTED` and
-`CUSTOM_OP` for dense, noncausal BF16 without parallel or HSDP boundaries when
+`CUSTOM_OP` for dense, noncausal BF16 without parallel, HSDP, or attention schedule boundaries when
 its kernel accepts the head dimensions. Dimension validation delegates to FA4's
 architecture-specific rules through `backends/utils/fa.py`. Kernel rejections
 report `UNSUPPORTED` with an actionable reason. Missing private validators and

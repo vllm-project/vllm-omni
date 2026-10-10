@@ -13,6 +13,7 @@ from contextlib import contextmanager, nullcontext
 from dataclasses import fields, replace
 from itertools import groupby
 from pathlib import Path
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, ClassVar
 
 import numpy as np
@@ -25,6 +26,10 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
 from vllm_omni.diffusion import envs
+from vllm_omni.diffusion.attention.schedule import (
+    InvalidAttentionScheduleError,
+    require_request_attention_schedule_fits,
+)
 from vllm_omni.diffusion.cache.cachedit import (
     CacheDiTBackend,
     RequestScopedCacheDiTRuntime,
@@ -34,7 +39,12 @@ from vllm_omni.diffusion.cancellation import check_request_cancellation
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.parallel_state import get_world_group, init_world_group
 from vllm_omni.diffusion.distributed.utils import get_local_device
-from vllm_omni.diffusion.forward_context import DenoiseProgressMixin
+from vllm_omni.diffusion.forward_context import (
+    DenoiseProgressMixin,
+    get_forward_context,
+    is_forward_context_available,
+    request_denoise_progress,
+)
 from vllm_omni.diffusion.model_loader.diffusers_loader import (
     DiffusersPipelineLoader,
 )
@@ -2997,6 +3007,15 @@ class MiniMaxH3Pipeline(
                 "MiniMax H3 res_multistep sampling with a fixed distilled sigma schedule has not been validated; "
                 "use sampler='euler' for this schedule."
             )
+        # num_steps is the length of the sequence this request denoises; FastH3 and pinned distilled
+        # schedules can differ from num_inference_steps. A latent_refine pass has its own step count, which
+        # this check does not cover, so a schedule together with latent_refine is rejected below. Both
+        # execution modes reach this point before any denoise forward. Step mode runs it outside the forward
+        # context, so the request's own schedule is resolved against the service default; in request mode
+        # that is the schedule the runner bound.
+        attention_schedule = require_request_attention_schedule_fits(
+            SimpleNamespace(sampling_params=sampling), self.od_config, num_steps
+        )
         transformer = getattr(
             self, "transformers_ref" if task == "ref2va" and hasattr(self, "transformers_ref") else "transformer", None
         )
@@ -3023,6 +3042,25 @@ class MiniMaxH3Pipeline(
         )
         if continuation is not None and quality_plan.cache_dit is not None:
             raise OmniClientError("MiniMax H3 continuation requires uncached denoising; set quality=lossless")
+        if attention_schedule and quality_plan.cache_dit is not None:
+            # Cache-DiT reuses transformer outputs across steps, so a cached residual can come from a step
+            # that ran a different attention profile. Reject before its hooks are installed.
+            raise InvalidAttentionScheduleError(
+                "attention_schedule cannot be combined with MiniMax H3 Cache-DiT (quality=high, or an omitted "
+                "quality on a server started with Cache-DiT); send quality=lossless or attention_schedule=[]"
+            )
+        if attention_schedule and self._resolve_latent_refine(extra) is not None:
+            # latent_refine runs a second denoise sequence over the tail of the sigma list. It publishes step
+            # indexes from 0 and its own step count, and the schedule was checked against num_steps only. A
+            # range could select a profile at another sigma position there, or fall outside the refine
+            # sequence and fail in the attention layer after the first pass has run. An invalid latent_refine
+            # value raises its own client error from the resolver.
+            raise InvalidAttentionScheduleError(
+                "attention_schedule cannot be combined with MiniMax H3 latent_refine (a latent_refine in the "
+                "request, or an omitted latent_refine on a server that sets one in --additional-config): the "
+                "refine pass is a second denoise sequence with its own step count; send attention_schedule=[] "
+                "or latent_refine=false"
+            )
         self._cache_dit_runtime.prepare(quality_plan.cache_dit)
         upscale_target = self._resolve_latent_upscale(
             extra, latent_h=conditioning.height // 16, latent_w=conditioning.width // 16
@@ -3374,7 +3412,9 @@ class MiniMaxH3Pipeline(
         Requests are concatenated into a single packed sequence that keeps one
         attention document each, so the whole batch costs one DiT forward.
         Backends that ignore ``cu_seqlens`` cannot express that isolation, so
-        they fall back to one forward per request.
+        they fall back to one forward per request. A batch under a bound
+        attention schedule also runs one forward per request, each under that
+        request's own step, sigma and total.
         """
         del kwargs
         batch_states = list(states if states is not None else input_batch.states)
@@ -3418,17 +3458,29 @@ class MiniMaxH3Pipeline(
         # attention features. Requests can differ in both step index and sigma
         # schedule, so a batch that is not at one single point has nothing to
         # publish and those gates stay dense -- which is their safe default.
-        progress = {
+        # A batch under a bound attention schedule also publishes each request's
+        # own progress around its forward below.
+        request_progress = [
             (state.step_index, schedule["sigma_video"], len(state.extra[_STEP_SIGMAS_VIDEO]) - 1)
             for state, schedule in zip(batch_states, schedules)
-        }
+        ]
+        progress = set(request_progress)
         minimax_h3_publish_denoise_progress(*(progress.pop() if len(progress) == 1 else (None, None, None)))
+        scheduled = is_forward_context_available() and bool(getattr(get_forward_context(), "attention_schedule", None))
 
-        if len(batch_states) > 1 and (mixed_transformers or not self._packed_batch_supported(transformers[0])):
+        if len(batch_states) > 1 and (
+            scheduled or mixed_transformers or not self._packed_batch_supported(transformers[0])
+        ):
             if mixed_transformers:
                 logger.warning_once(
                     "MiniMax H3 step batch contains requests for different task-specific DiTs; "
                     "running %d requests one forward at a time.",
+                    len(batch_states),
+                )
+            elif scheduled:
+                logger.info_once(
+                    "MiniMax H3 runs a step batch under an attention schedule one request per forward, "
+                    "so each request selects attention at its own step; running %d requests one forward at a time.",
                     len(batch_states),
                 )
             elif any(
@@ -3462,7 +3514,13 @@ class MiniMaxH3Pipeline(
                     video_target_timesteps=video_target_timesteps[index],
                     audio_target_timesteps=audio_target_timesteps[index],
                 )
-                request_video, request_audio = transformers[index](**forward_kwargs)
+                # Scheduled requests are evaluated one at a time even when they share a
+                # profile name, because the name alone does not show that the selected
+                # backend isolates packed requests. The batch-level progress published
+                # above is restored after each forward, including when it raises.
+                step, sigma_video, total_steps = request_progress[index]
+                with request_denoise_progress(step, total_steps, sigma_video) if scheduled else nullcontext():
+                    request_video, request_audio = transformers[index](**forward_kwargs)
                 video_parts.append(request_video)
                 audio_parts.append(request_audio)
             video_velocity = torch.cat(video_parts)

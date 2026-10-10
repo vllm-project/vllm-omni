@@ -9,6 +9,14 @@ import pytest
 import torch
 from torch import nn
 
+import vllm_omni.diffusion.attention.layer as layer_mod
+from tests.diffusion.attention.test_attention_schedule_candidates import _fake_resolve, _FakeImpl, _make_config
+from vllm_omni.diffusion.attention.layer import Attention
+from vllm_omni.diffusion.attention.parallel.base import NoParallelAttention
+from vllm_omni.diffusion.attention.schedule import AttentionScheduleRange, InvalidAttentionScheduleError
+from vllm_omni.diffusion.config import set_current_diffusion_config
+from vllm_omni.diffusion.data import AttentionConfig, AttentionScheduleConfig, AttentionSpec
+from vllm_omni.diffusion.forward_context import bind_attention_schedule, get_forward_context, set_forward_context
 from vllm_omni.diffusion.media import VideoTensorEncoding, VideoTensorLayout, VideoValueRange
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import Wan22Pipeline, build_wan_scheduler
 from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import WanSelfAttention
@@ -573,6 +581,153 @@ def test_runner_publishes_wan_step_context_across_requests(fail_first_request, m
     assert events == expected
 
 
+@pytest.fixture
+def fake_attention_backends(monkeypatch):
+    # Attention layers resolve fake backends from the supplied config, as in tests/diffusion/attention.
+    monkeypatch.setattr(layer_mod.SDPABackend, "get_impl_cls", staticmethod(lambda: _FakeImpl))
+    monkeypatch.setattr(layer_mod, "build_parallel_attention_strategy", lambda **kwargs: NoParallelAttention())
+    monkeypatch.setattr(layer_mod, "get_attn_backend_for_role", lambda **kwargs: _fake_resolve(**kwargs))
+
+
+def _candidate_from_step_2() -> AttentionScheduleConfig:
+    return AttentionScheduleConfig(
+        profiles={"candidate": AttentionConfig(default=AttentionSpec(backend="SDPA"))},
+        default=[{"start": 2, "end": None, "profile": "candidate"}],
+    )
+
+
+def _make_scheduled_runner(pipeline, monkeypatch, schedule_config):
+    from vllm_omni.diffusion.data import OmniDiffusionConfig
+    from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
+
+    runner = object.__new__(DiffusionModelRunner)
+    runner.pipeline = pipeline
+    runner.od_config = OmniDiffusionConfig(model="", dtype=torch.float32)
+    # Set after construction so the config does not look up calibration for a model.
+    runner.od_config.diffusion_attention_schedule = schedule_config
+    runner.vllm_config = None
+    runner.cache_backend = None
+    monkeypatch.setattr(runner, "_prepare_request_for_forward", lambda *args, **kwargs: None)
+    return runner
+
+
+def _execute_wan_request(runner, request):
+    return runner._execute_request_list(
+        [request],
+        od_config=runner.od_config,
+        allow_single_output=True,
+        require_request_batch_support=False,
+        record_name="test_wan_attention_schedule",
+        record_output_peak_memory=False,
+    )
+
+
+@pytest.mark.parametrize("scheduled", [True, False], ids=["inherited-default", "disabled"])
+def test_runner_selects_wan_attention_by_actual_denoise_step(scheduled, monkeypatch, fake_attention_backends):
+    from vllm_omni.diffusion.forward_context import override_forward_context
+
+    schedule_config = _candidate_from_step_2()
+    with set_current_diffusion_config(_make_config(schedule=schedule_config)):
+        layer = Attention(num_heads=4, head_size=64, causal=False, softmax_scale=1.0)
+    names = {id(layer.attention): "base", id(layer._schedule_candidates["candidate"].impl): "candidate"}
+
+    def selection():
+        context = get_forward_context()
+        return context.denoise_step_idx, context.total_denoise_steps, names[id(layer.effective_attention()[0])]
+
+    events = []
+
+    class RecordingTransformer(_StubTransformer):
+        def __init__(self, expert):
+            super().__init__()
+            self.expert = expert
+
+        def forward(self, hidden_states, encoder_hidden_states, **kwargs):
+            positive = bool(encoder_hidden_states[0, 0, 0] > 0)
+            events.append((*selection(), self.expert, positive))
+            return (torch.zeros_like(hidden_states),)
+
+    def encode_prompt(**kwargs):
+        embeds = torch.ones(1, 8, 8)
+        return embeds, -embeds
+
+    pipeline = _make_pipeline()
+    pipeline.transformer = RecordingTransformer("high")
+    pipeline.transformer_2 = RecordingTransformer("low")
+    # The request asks for 4 steps, but the scheduler builds 3; the schedule must follow the 3.
+    pipeline.scheduler = _StubScheduler([900, 500, 100])
+    monkeypatch.setattr(pipeline, "encode_prompt", encode_prompt)
+    monkeypatch.setattr(pipeline, "scheduler_step_maybe_with_cfg", lambda pred, t, latents, cfg: latents)
+    after_loop = []
+    diffuse = pipeline.diffuse
+
+    def diffuse_then_record(**kwargs):
+        latents = diffuse(**kwargs)
+        after_loop.append(selection())
+        return latents
+
+    monkeypatch.setattr(pipeline, "diffuse", diffuse_then_record)
+    runner = _make_scheduled_runner(pipeline, monkeypatch, schedule_config)
+    request = OmniDiffusionRequest(
+        prompt="a fox walks",
+        request_id="request-0",
+        sampling_params=OmniDiffusionSamplingParams(
+            num_frames=1,
+            num_inference_steps=4,
+            guidance_scale=2.0,
+            output_type="latent",
+            attention_schedule=None if scheduled else [],
+        ),
+    )
+
+    with override_forward_context(None):
+        _execute_wan_request(runner, request)
+
+    total = 3 if scheduled else None
+    last = "candidate" if scheduled else "base"
+    # Both CFG passes of a step see the same step and selection. The expert changes at the numeric
+    # boundary (875) between steps 0 and 1; the step index does not, so step 1 still uses the baseline.
+    assert events == [
+        (0, total, "base", "high", True),
+        (0, total, "base", "high", False),
+        (1, total, "base", "low", True),
+        (1, total, "base", "low", False),
+        (2, total, last, "low", True),
+        (2, total, last, "low", False),
+    ]
+    # A scheduled run clears the step after the loop, so VAE decode uses the baseline. An unscheduled
+    # run leaves the last step in place.
+    assert after_loop == [(None, None, "base") if scheduled else (2, None, "base")]
+
+
+def test_runner_rejects_wan_schedule_past_actual_total_before_denoise(monkeypatch):
+    from vllm_omni.diffusion.forward_context import is_forward_context_available, override_forward_context
+
+    calls = []
+    pipeline = _make_pipeline()
+    pipeline.scheduler = _StubScheduler([900, 500, 100])
+    monkeypatch.setattr(pipeline, "predict_noise_maybe_with_cfg", lambda **kwargs: calls.append(kwargs))
+    runner = _make_scheduled_runner(pipeline, monkeypatch, _candidate_from_step_2())
+    # Steps 3 to 4 fit the 4 requested steps but not the 3 the scheduler builds.
+    request = OmniDiffusionRequest(
+        prompt="a fox walks",
+        request_id="request-0",
+        sampling_params=OmniDiffusionSamplingParams(
+            num_frames=1,
+            num_inference_steps=4,
+            output_type="latent",
+            attention_schedule=[{"start": 3, "end": 4, "profile": "candidate"}],
+        ),
+    )
+
+    with override_forward_context(None):
+        with pytest.raises(InvalidAttentionScheduleError, match="exceeds total_steps=3"):
+            _execute_wan_request(runner, request)
+        assert not is_forward_context_available()
+
+    assert calls == []
+
+
 class _StubDMDScheduler:
     def __init__(self) -> None:
         self.predict_clean_calls: list[tuple[float, float, float]] = []
@@ -623,6 +778,57 @@ def test_diffuse_dmd_predicts_clean_and_renoises_between_steps(monkeypatch) -> N
         (8.0, 2.0, 522.0),
     ]
     torch.testing.assert_close(result, torch.tensor([[[[[17.0]]]]]))
+
+
+def _denoise_progress():
+    context = get_forward_context()
+    return context.denoise_step_idx, context.total_denoise_steps, context.attention_schedule_denoise_active
+
+
+@pytest.mark.parametrize(
+    ("schedule", "fits"),
+    [
+        ((AttentionScheduleRange(start=2, end=3, profile="candidate"),), True),
+        ((AttentionScheduleRange(start=3, end=4, profile="candidate"),), False),
+    ],
+    ids=["fits-three-steps", "past-three-steps"],
+)
+def test_dmd_forward_checks_and_publishes_the_fixed_three_step_total(schedule, fits, monkeypatch) -> None:
+    pipeline = _make_pipeline()
+    pipeline.is_dmd = True
+    pipeline.scheduler = _StubDMDScheduler()
+    # forward reads num_train_timesteps for the expert boundary.
+    monkeypatch.setattr(pipeline.scheduler, "config", SimpleNamespace(num_train_timesteps=1000), raising=False)
+    calls: list[tuple[int | None, int | None, bool]] = []
+
+    def fake_predict_noise_maybe_with_cfg(**kwargs):
+        calls.append(_denoise_progress())
+        return torch.zeros_like(kwargs["positive_kwargs"]["hidden_states"])
+
+    monkeypatch.setattr(pipeline, "predict_noise_maybe_with_cfg", fake_predict_noise_maybe_with_cfg)
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2.randn_tensor",
+        lambda *args, **kwargs: torch.zeros(args[0], dtype=kwargs["dtype"]),
+    )
+    # DMD ignores the 40 requested steps and runs its 3 fixed timesteps.
+    request = OmniDiffusionRequest(
+        prompt="prompt",
+        request_id="dmd",
+        sampling_params=OmniDiffusionSamplingParams(
+            num_frames=1, num_inference_steps=40, max_sequence_length=32, output_type="latent"
+        ),
+    )
+
+    with set_forward_context(), bind_attention_schedule(schedule):
+        if fits:
+            pipeline.forward(DiffusionRequestBatch(requests=[request]))
+        else:
+            with pytest.raises(InvalidAttentionScheduleError, match="exceeds total_steps=3"):
+                pipeline.forward(DiffusionRequestBatch(requests=[request]))
+        after = _denoise_progress()
+
+    assert calls == ([(0, 3, True), (1, 3, True), (2, 3, True)] if fits else [])
+    assert after == (None, None, False)
 
 
 def _make_gate_loading_pipeline():
@@ -693,3 +899,53 @@ def test_load_weights_keeps_trained_vsa_gate(monkeypatch) -> None:
 
     assert pipeline.has_gate_compress_weights is True
     assert gate.to_gate_compress is original_gate
+
+
+class _StubParallelLinear(nn.Module):
+    """Stands in for vLLM parallel linear layers, which need a tensor-parallel group."""
+
+    def __init__(self, *args, total_num_heads=None, **kwargs):
+        del args, kwargs
+        super().__init__()
+        self.num_heads = total_num_heads
+        self.num_kv_heads = total_num_heads
+        self.weight = nn.Parameter(torch.zeros(1))
+        self.bias = nn.Parameter(torch.zeros(1))
+
+
+@pytest.mark.parametrize(
+    ("baseline", "candidate", "has_gate", "rejected"),
+    [
+        (None, "FASTVIDEO_VSA", False, True),
+        (None, "SDPA", False, False),
+        ("FASTVIDEO_VSA", "SDPA", True, False),
+        ("FASTVIDEO_VSA", "FASTVIDEO_VSA", True, False),
+    ],
+    ids=["default-baseline-vsa", "default-baseline-sdpa", "vsa-baseline-sdpa", "vsa-baseline-vsa"],
+)
+def test_startup_validation_rejects_vsa_candidate_on_self_attention_without_gate(
+    baseline, candidate, has_gate, rejected, monkeypatch, fake_attention_backends
+) -> None:
+    module = importlib.import_module("vllm_omni.diffusion.models.wan2_2.wan2_2_transformer")
+    for name in ("QKVParallelLinear", "ColumnParallelLinear", "RowParallelLinear"):
+        monkeypatch.setattr(module, name, _StubParallelLinear)
+    monkeypatch.setattr(module, "RMSNorm", nn.Identity)
+    monkeypatch.setattr(module, "RotaryEmbeddingWan", nn.Identity)
+    monkeypatch.setattr(module, "get_tensor_model_parallel_world_size", lambda: 1)
+    schedule = AttentionScheduleConfig(
+        profiles={"candidate": AttentionConfig(default=AttentionSpec(backend=candidate))},
+        default=[{"start": 0, "end": None, "profile": "candidate"}],
+    )
+    baseline_config = None if baseline is None else AttentionConfig(default=AttentionSpec(backend=baseline))
+    config = _make_config(baseline=baseline_config, schedule=schedule)
+    with set_current_diffusion_config(config):
+        attention = WanSelfAttention(dim=256, num_heads=4, head_dim=64, prefix="blocks.0.attn1")
+
+    # The gate is built from the baseline backend only, so a FASTVIDEO_VSA candidate on a layer without
+    # it is rejected at startup. A candidate on a layer with the gate, or a dense candidate, is accepted.
+    assert (attention.to_gate_compress is not None) is has_gate
+    if rejected:
+        with pytest.raises(ValueError, match="profile 'candidate' selects backend FASTVIDEO_VSA.*to_gate_compress"):
+            layer_mod.validate_attention_schedule_candidates(attention, config)
+    else:
+        assert layer_mod.validate_attention_schedule_candidates(attention, config) == 1

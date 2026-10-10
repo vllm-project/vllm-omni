@@ -14,7 +14,15 @@ from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCache
 from vllm.v1.outputs import KVConnectorOutput
 
 from tests.helpers.kv_layout import build_kv_cache_tensor
-from vllm_omni.diffusion.data import DiffusionOutput, DiffusionRequestAbortedError
+from vllm_omni.diffusion.attention.schedule import AttentionScheduleRange
+from vllm_omni.diffusion.data import (
+    AttentionConfig,
+    AttentionScheduleConfig,
+    AttentionSpec,
+    DiffusionOutput,
+    DiffusionRequestAbortedError,
+    OmniDiffusionConfig,
+)
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine, DiffusionExecutionMode
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.diffusion_kv.request import DiffusionKVRequest
@@ -283,6 +291,40 @@ class _ConcreteScheduler(BaseScheduler):
         return set()
 
 
+def _attention_schedule_service() -> AttentionScheduleConfig:
+    return AttentionScheduleConfig(
+        profiles={"sparse": AttentionConfig(default=AttentionSpec(backend="SDPA"))},
+        default=[{"start": 0, "end": 1, "profile": "sparse"}],
+    )
+
+
+def _make_scheduled_request(req_id: str, schedule: object) -> OmniDiffusionRequest:
+    """Assign after construction, so the key builder has to normalize the raw value itself."""
+    sp = OmniDiffusionSamplingParams(num_inference_steps=2)
+    sp.attention_schedule = schedule
+    return OmniDiffusionRequest(prompt="prompt", sampling_params=sp, request_id=req_id)
+
+
+# Two request schedules, and whether their requests may share a batch. None
+# inherits the service default and [] disables it, so those two stay apart.
+_ATTENTION_SCHEDULE_KEY_CASES = [
+    pytest.param(
+        [{"start": 0, "end": 2, "profile": "sparse"}],
+        [{"start": 2, "end": 4, "profile": "sparse"}],
+        False,
+        id="different-ranges",
+    ),
+    pytest.param(
+        [{"start": 0, "end": 2, "profile": "sparse"}],
+        (AttentionScheduleRange(start=0, end=2, profile="sparse"),),
+        True,
+        id="list-and-typed",
+    ),
+    pytest.param(None, [], False, id="inherit-and-disable"),
+    pytest.param(None, None, True, id="both-inherit"),
+]
+
+
 class TestGetStepBatchSamplingParamsKey:
     """Tests for the step-batch compatibility key builder on BaseScheduler."""
 
@@ -336,6 +378,14 @@ class TestGetStepBatchSamplingParamsKey:
         b.batch_compatibility_key = ("bagel_cfg", 4.0)
 
         assert scheduler._build_sampling_params_key(a) != scheduler._build_sampling_params_key(b)
+
+    @pytest.mark.parametrize(("first", "second", "same_batch"), _ATTENTION_SCHEDULE_KEY_CASES)
+    def test_attention_schedule_identity(self, first, second, same_batch) -> None:
+        scheduler = _ConcreteScheduler()
+        first_key = scheduler._build_sampling_params_key(_make_scheduled_request("a", first))
+        second_key = scheduler._build_sampling_params_key(_make_scheduled_request("b", second))
+
+        assert (first_key == second_key) is same_batch
 
 
 class TestGetRequestBatchSamplingParamsKey:
@@ -447,6 +497,14 @@ class TestGetRequestBatchSamplingParamsKey:
         assert omitted.sampling_params.guidance_scale_2 == explicit.sampling_params.guidance_scale_2
         assert omitted.sampling_params.guidance_scale_2_provided != explicit.sampling_params.guidance_scale_2_provided
         assert scheduler._build_sampling_params_key(omitted) != scheduler._build_sampling_params_key(explicit)
+
+    @pytest.mark.parametrize(("first", "second", "same_batch"), _ATTENTION_SCHEDULE_KEY_CASES)
+    def test_attention_schedule_identity(self, first, second, same_batch) -> None:
+        scheduler = RequestScheduler()
+        first_key = scheduler._build_sampling_params_key(_make_scheduled_request("a", first))
+        second_key = scheduler._build_sampling_params_key(_make_scheduled_request("b", second))
+
+        assert (first_key == second_key) is same_batch
 
 
 class TestRequestScheduler:
@@ -672,8 +730,9 @@ class TestRequestScheduler:
         mocker.patch.object(
             self.scheduler,
             "_can_schedule_waiting",
-            side_effect=lambda state: can_schedule(state)
-            and not (state.request_id == "deferred" and manager.has_request("deferred")),
+            side_effect=lambda state: (
+                can_schedule(state) and not (state.request_id == "deferred" and manager.has_request("deferred"))
+            ),
         )
         for request_id in ("admitted", "deferred"):
             request = _make_request(request_id)
@@ -2177,6 +2236,56 @@ class TestStepScheduler:
         third = scheduler.schedule()
         assert _new_ids(third) == [req_a2]
         assert third.num_waiting_reqs == 0
+
+    def test_step_add_request_rejects_unknown_attention_profile(self) -> None:
+        scheduler = StepScheduler()
+        scheduler.initialize(OmniDiffusionConfig(diffusion_attention_schedule=_attention_schedule_service()))
+        request = _make_step_request(
+            "bad",
+            sampling_params=OmniDiffusionSamplingParams(
+                num_inference_steps=4,
+                attention_schedule=[{"start": 0, "end": 1, "profile": "missing"}],
+            ),
+        )
+
+        with pytest.raises(ValueError, match="unknown profile"):
+            scheduler.add_request(request)
+        assert scheduler.has_requests() is False
+
+    def test_step_batch_separates_requests_with_different_attention_schedules(self) -> None:
+        """Equal schedules co-batch; a different schedule waits for the next batch in FIFO order."""
+        scheduler = StepScheduler()
+        scheduler.initialize(
+            OmniDiffusionConfig(max_num_seqs=3, diffusion_attention_schedule=_attention_schedule_service())
+        )
+
+        def _build(req_id: str, start: int) -> OmniDiffusionRequest:
+            sp = OmniDiffusionSamplingParams(
+                num_inference_steps=2,
+                attention_schedule=[{"start": start, "end": start + 1, "profile": "sparse"}],
+            )
+            return _make_step_request(req_id, sampling_params=sp)
+
+        req_a1 = scheduler.add_request(_build("a1", 0))
+        req_a2 = scheduler.add_request(_build("a2", 0))
+        req_b1 = scheduler.add_request(_build("b1", 1))
+
+        first = scheduler.schedule()
+        assert _new_ids(first) == [req_a1, req_a2]
+        assert first.num_waiting_reqs == 1
+
+        scheduler.update_from_output(
+            first,
+            BatchRunnerOutput.from_list(
+                [
+                    _make_step_output(req_a1, step_index=2, finished=True),
+                    _make_step_output(req_a2, step_index=2, finished=True),
+                ]
+            ),
+        )
+        second = scheduler.schedule()
+        assert _new_ids(second) == [req_b1]
+        assert second.num_waiting_reqs == 0
 
     def test_step_batch_separates_requests_with_different_lora_scale(self) -> None:
         """Same adapter id but different scales → still separate batches."""

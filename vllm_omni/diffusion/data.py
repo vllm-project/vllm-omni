@@ -25,6 +25,12 @@ from vllm.model_executor.layers.quantization.base_config import (
 )
 from vllm.transformers_utils.repo_utils import get_model_path
 
+from vllm_omni.diffusion.attention.schedule import (
+    AttentionSchedule,
+    parse_attention_schedule,
+    validate_attention_profile_name,
+    validate_attention_schedule,
+)
 from vllm_omni.diffusion.diffusion_kv.config import (
     DiffusionKVCacheMode,
     parse_diffusion_kv_cache_mode,
@@ -845,6 +851,7 @@ class OmniDiffusionConfig:
 
     # Attention
     diffusion_attention_config: "AttentionConfig" = field(default_factory=lambda: AttentionConfig())
+    diffusion_attention_schedule: "AttentionScheduleConfig | None" = None
     fa_deterministic: bool = False
 
     # Running mode
@@ -1422,6 +1429,15 @@ class OmniDiffusionConfig:
         # Match vLLM's config flow: parse entrypoint shorthands before the
         # config object is built, and keep a single runtime truth source.
         self.diffusion_attention_config = build_attention_config(self.diffusion_attention_config)
+        self.diffusion_attention_schedule = parse_attention_schedule_config(self.diffusion_attention_schedule)
+        if self.diffusion_attention_schedule is not None and self.diffusion_compile_granularity == "full":
+            # Scheduled attention layers call an eager boundary while compiling. Its compile tests
+            # use regional compilation, where each block is its own frame; with 'full' the boundary's graph
+            # break falls inside the block loop of the transformer's frame, which they do not cover.
+            raise ValueError(
+                "diffusion_compile_granularity='full' is incompatible with diffusion_attention_schedule "
+                "profiles; use 'regional' compilation instead"
+            )
         self.diffusion_kv_cache_skip_step_indices = parse_kv_cache_skip_selector(self.diffusion_kv_cache_skip_steps)
         self.diffusion_kv_cache_skip_layer_indices = parse_kv_cache_skip_selector(self.diffusion_kv_cache_skip_layers)
 
@@ -1524,14 +1540,21 @@ class OmniDiffusionConfig:
         self._propagate_skip_softmax_calibration(tf_config)
 
     def _propagate_skip_softmax_calibration(self, tf_config: "TransformerConfig") -> None:
-        cfg = getattr(self, "diffusion_attention_config", None)
-        if not isinstance(cfg, AttentionConfig):
-            return
-        specs = [s for s in (cfg.default, *cfg.per_role.values()) if s is not None]
-
         from vllm_omni.diffusion.attention.backends.trtllm_calibration import (
+            collect_calibration_specs,
             propagate_skip_softmax_calibration,
         )
+
+        cfg = getattr(self, "diffusion_attention_config", None)
+        schedule = getattr(self, "diffusion_attention_schedule", None)
+        # One shared rule for which specs can carry calibration - the baseline plus every
+        # schedule profile - so a profile the service default never references cannot keep an
+        # undetected target_sparsity-without-calibration gap. The loader's calibration discovery
+        # calls the same helper. No schedule -> specs are exactly the baseline specs.
+        baseline = cfg if isinstance(cfg, AttentionConfig) else None
+        specs: list[AttentionSpec] = collect_calibration_specs(baseline, schedule)
+        if not specs:
+            return
 
         propagate_skip_softmax_calibration(specs, self.model, tf_config)
 
@@ -2279,6 +2302,58 @@ class AttentionConfig:
         if self.default is not None:
             return self.default, "attention_config.default"
         return None, None
+
+
+@dataclass
+class AttentionScheduleConfig:
+    """Startup-owned attention profiles and the default integer-step schedule.
+
+    Profiles resolve their own roles, without merging the baseline or its
+    environment fallback. Candidate construction and hardware validation happen
+    later, with the actual model layers available.
+    """
+
+    profiles: dict[str, AttentionConfig] = field(default_factory=dict)
+    default: AttentionSchedule = ()
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.profiles, Mapping):
+            raise TypeError("diffusion_attention_schedule.profiles must be a mapping")
+        normalized = {}
+        for name, profile in self.profiles.items():
+            validate_attention_profile_name(name)
+            if not isinstance(profile, (AttentionConfig, Mapping)):
+                raise TypeError(f"attention profile {name!r} must be an AttentionConfig or mapping")
+            normalized[name] = parse_attention_config(copy.deepcopy(profile))
+        self.profiles = normalized
+        default = parse_attention_schedule(self.default)
+        if default is None:
+            raise TypeError("diffusion_attention_schedule.default must be a list of ranges, not None")
+        validate_attention_schedule(default, profiles=self.profiles)
+        self.default = default
+
+
+def parse_attention_schedule_config(
+    value: AttentionScheduleConfig | Mapping[str, Any] | str | None,
+) -> AttentionScheduleConfig | None:
+    """Normalize service config without initializing backends or reading env vars.
+
+    A config without profiles can never select a candidate (its default must then be empty), so it
+    is returned as None: no schedule, and no compile boundary on the attention layers.
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        value = json.loads(value)
+    if isinstance(value, AttentionScheduleConfig):
+        config = AttentionScheduleConfig(profiles=value.profiles, default=value.default)
+    elif isinstance(value, Mapping):
+        config = AttentionScheduleConfig(**dict(value))
+    else:
+        raise TypeError(
+            "diffusion_attention_schedule must be an AttentionScheduleConfig, mapping, JSON object, or None"
+        )
+    return config if config.profiles else None
 
 
 def parse_attention_config(
