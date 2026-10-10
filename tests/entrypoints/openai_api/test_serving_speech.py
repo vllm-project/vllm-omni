@@ -994,13 +994,30 @@ class TestSpeechAPI:
         ("extra_params", "expected_message"),
         [
             ({"num_inference_steps": "invalid"}, "num_inference_steps must be an integer"),
+            ({"num_inference_steps": 0}, "num_inference_steps must be a positive integer"),
+            ({"num_inference_steps": -1}, "num_inference_steps must be a positive integer"),
+            ({"num_inference_steps": 0.5}, "num_inference_steps must be a positive integer"),
+            ({"num_inference_steps": 12.5}, "num_inference_steps must be a positive integer"),
+            ({"num_inference_steps": True}, "num_inference_steps must be a positive integer"),
+            ({"num_inference_steps": False}, "num_inference_steps must be a positive integer"),
+            ({"num_inference_steps": float("nan")}, "num_inference_steps must be an integer"),
+            ({"num_inference_steps": float("inf")}, "num_inference_steps must be an integer"),
+            ({"num_inference_steps": float("-inf")}, "num_inference_steps must be an integer"),
             ({"guidance_scale": "invalid"}, "guidance_scale must be a number"),
+            ({"guidance_scale": float("nan")}, "guidance_scale must be a finite number"),
+            ({"guidance_scale": float("inf")}, "guidance_scale must be a finite number"),
+            ({"guidance_scale": float("-inf")}, "guidance_scale must be a finite number"),
+            ({"guidance_scale": "NaN"}, "guidance_scale must be a finite number"),
+            ({"guidance_scale": "Infinity"}, "guidance_scale must be a finite number"),
+            ({"guidance_scale": True}, "guidance_scale must be a finite number"),
+            ({"guidance_scale": False}, "guidance_scale must be a finite number"),
+            ({"guidance_scale": 10**400}, "guidance_scale must be a number"),
         ],
     )
     async def test_create_diffusion_speech_rejects_invalid_scheduler_params(
         self,
         mocker: MockerFixture,
-        extra_params: dict[str, str],
+        extra_params: dict[str, object],
         expected_message: str,
     ) -> None:
         mock_engine = mocker.MagicMock()
@@ -1012,6 +1029,46 @@ class TestSpeechAPI:
         assert response.status_code == 400
         assert expected_message in response.body.decode()
         mock_engine.generate.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("extra_params", "expected_steps", "expected_guidance"),
+        [
+            ({}, 32, 2.0),
+            ({"num_inference_steps": 1, "guidance_scale": 0.0}, 1, 0.0),
+            ({"num_inference_steps": "12", "guidance_scale": "7.0"}, 12, 7.0),
+            ({"num_inference_steps": 12.0, "guidance_scale": -1.0}, 12, -1.0),
+        ],
+    )
+    async def test_create_diffusion_speech_accepts_valid_scheduler_params(
+        self,
+        mocker: MockerFixture,
+        extra_params: dict[str, object],
+        expected_steps: int,
+        expected_guidance: float,
+    ) -> None:
+        defaults = OmniDiffusionSamplingParams(num_inference_steps=32, guidance_scale=2.0)
+        mock_engine = mocker.MagicMock()
+        mock_engine.default_sampling_params_list = [defaults]
+
+        async def mock_generate(*args, **kwargs):
+            yield create_mock_audio_output_for_test()
+
+        mock_engine.generate = mocker.MagicMock(side_effect=mock_generate)
+        server = OmniOpenAIServingSpeech.for_diffusion(diffusion_engine=mock_engine, model_name="test-model")
+        mocker.patch.object(
+            server, "create_audio", return_value=mocker.MagicMock(audio_data=b"dummy", media_type="audio/wav")
+        )
+
+        response = await server.create_speech(OpenAICreateSpeechRequest(input="Hello", extra_params=extra_params))
+
+        assert response.status_code == 200
+        mock_engine.generate.assert_called_once()
+        sampling = mock_engine.generate.call_args.kwargs["sampling_params_list"][0]
+        assert sampling.num_inference_steps == expected_steps
+        assert sampling.guidance_scale == expected_guidance
+        assert defaults.num_inference_steps == 32
+        assert defaults.guidance_scale == 2.0
 
 
 class TestTTSMethods:
