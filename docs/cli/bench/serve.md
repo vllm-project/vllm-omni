@@ -4,7 +4,7 @@ The vllm bench command launches the vLLM-Omni benchmark to evaluate the performa
 
 ## Notes
 
-vLLM-Omni registers the `openai-chat-omni`, `openai-audio-speech`, `openai-image-edits-omni`, `daily-omni`, and `openai-realtime-duplex` serving benchmark backends. It also adds the `omniinteract` dataset.
+vLLM-Omni registers the `openai-chat-omni`, `openai-audio-speech`, `openai-image-edits-omni`, `daily-omni`, `openai-realtime-duplex`, `openai-realtime-tts`, and `openai-realtime-chat` serving benchmark backends. It also adds the `omniinteract` dataset.
 
 ## Basic Parameter Description
 
@@ -14,7 +14,16 @@ You can use `vllm bench serve --omni --help=all` to get descriptions of all para
   Enable Omni (multimodal) mode, supporting multimodal inputs and outputs such as images, videos, and audio.
 
 - `--backend`
-  Specify the backend adapter. vLLM-Omni adds `openai-chat-omni`, `openai-audio-speech`, `openai-image-edits-omni`, `daily-omni`, and `openai-realtime-duplex` to the upstream vLLM backend choices.
+  Specify the backend adapter. vLLM-Omni adds `openai-chat-omni`, `openai-audio-speech`, `openai-image-edits-omni`, `daily-omni`, `openai-realtime-duplex`, `openai-realtime-tts`, and `openai-realtime-chat` to the upstream vLLM backend choices.
+
+  The three WebSocket backends all talk to `/v1/realtime`, but they drive different turn shapes:
+
+  | Backend | Turn shape |
+  | --- | --- |
+  | `openai-realtime-duplex` / `openai-realtime-tts` | One session per utterance; the target text rides the session context (`duplex_initial_user_text`) and the client streams silence so a model-native duplex session has audio units to speak on. Reports server-side `ttft_ms`/`ttfp_ms` when the server returns them, and Stage-0 engine TPOT. |
+  | `openai-realtime-chat` | One session per utterance; the target text is a `conversation.item.create` message and real reference speech is streamed as an ordinary audio turn. Reports client-observed timings measured from the end of that speech. Requires `--seed-tts-reference-as-input`. |
+
+  Because those two report from different origins, their TTFT/TTFP/RTF numbers are not comparable with each other.
 
 - `--model`
   The model identifier to load, filled according to the models supported by vLLM-Omni.
@@ -408,6 +417,108 @@ chunks. Official-manifest eligibility is reported separately because clipped or 
 signal, not a transport failure. Accuracy must finish with `status=ok` on every subset. After all three subsets finish,
 All Global IA-QTF1 is recomputed from pooled `Global_TP` / `Global_FP` / `Global_FN` and must be at or above
 `omniinteract_aggregate_min_ia_qtf1` (checked in as `0.2`).
+
+### Seed-TTS reference speech as real audio input
+
+By default the Seed-TTS dataset sends its reference clip as voice-cloning metadata: `ref_audio` / `ref_text` ride the
+request body and the model is asked to synthesize the target text in that voice.
+
+`--seed-tts-reference-as-input` changes the request shape instead of the request contents. The reference clip becomes an
+ordinary **user audio turn**, `ref_audio` / `ref_text` are dropped entirely, and the system prompt asks the model to read
+the accompanying text rather than transcribe or answer the audio. This is what makes the workload exercise a real duplex
+conversation turn rather than a TTS call. It requires `--backend openai-realtime-chat`.
+
+For Qwen3-Omni, use a server running the
+[`qwen3_omni_duplex.yaml` deployment](gh-file:vllm_omni/deploy/qwen3_omni_duplex.yaml) with async chunking enabled.
+Each dataset entry uses an independent WebSocket session at `/v1/realtime?duplex=1` with one audio turn and one response.
+
+```bash
+vllm bench serve --omni \
+  --backend openai-realtime-chat \
+  --endpoint /v1/realtime \
+  --dataset-name seed-tts \
+  --dataset-path zhaochenyang20/seed-tts-eval \
+  --seed-tts-reference-as-input \
+  --seed-tts-locale en \
+  --model Qwen/Qwen3-Omni-30B-A3B-Instruct \
+  --base-url http://127.0.0.1:8000 \
+  --num-prompts 4 --max-concurrency 1 --output-len 256 \
+  --percentile-metrics ttft,e2el,audio_ttfp,audio_rtf,audio_duration \
+  --extra-body '{"realtime_trigger": "vad"}'
+```
+
+Each clip is normalized once to mono 24 kHz PCM16 and a one-second silent tail is appended. Both cases send the same
+speech samples in chunks of at most 200 ms. A chunk is sent at the end of its simulated capture interval, using absolute
+deadlines to avoid accumulated pacing drift. A partial chunk is split at the speech/silence boundary so the speech-end
+timestamp stays exact even when the clip length is not a multiple of 200 ms. `realtime_trigger` selects how the turn ends:
+
+- `explicit` — the client streams the speech at real-time speed and then sends `input_audio_buffer.commit` plus
+  `response.create`. The silent tail is **not** sent: an explicit client ends the turn when the speaker stops, so
+  streaming silence first would charge it for latency no real caller pays.
+- `vad` — the client streams the speech *and* the tail, and server VAD ends the turn on its own, without a client commit
+  or `response.create`. Its 800 ms silence threshold must stay shorter than the one-second tail or the turn never ends.
+
+#### Run the matched nightly workload
+
+The [performance configuration](gh-file:tests/dfx/perf/tests/test_qwen3_omni_seed_tts.json) runs both triggers using the
+first four English Seed-TTS entries in fixed order, concurrency 1, temperature 0, and a 256-token output limit. It asks
+the model to read the target text rather than answer or transcribe the accompanying audio. Benchmark warmup runs
+separately from the four measured requests. The CUDA nightly job runs this configuration on two H100/B200 GPUs.
+
+Run from the repository environment after reserving two GPUs according to your host's scheduling rules:
+
+```bash
+uv run --no-sync pytest -s -v tests/dfx/perf/scripts/run_benchmark.py \
+  --test-config-file tests/dfx/perf/tests/test_qwen3_omni_seed_tts.json \
+  --run-level full_model
+```
+
+`BENCHMARK_DIR` selects the result directory (default `tests/dfx/perf/results`). For cached local weights or data, copy the
+JSON and replace `server_params.model` and each `benchmark_params[].dataset_path` with local paths. Preserve sample
+count, order, system prompt, and generation settings across the two cases.
+
+#### Read the reported metrics
+
+TTFT, audio TTFP, E2EL, and audio RTF share one client-side origin: the end of reference-speech capture, immediately before
+the last speech chunk is sent. They exclude session setup and the capture/upload intervals preceding that boundary.
+Timing from session start would fold the client's real-time input upload into the reported wait.
+
+- **TTFT / audio TTFP:** origin to the first non-empty text delta / first audio packet received. They include transport
+  and response processing after the speech-end boundary and, for VAD, endpoint detection during the silent tail.
+- **E2EL:** origin to `response.done` reception.
+- **Audio RTF:** origin to the last audio packet divided by generated audio duration. It includes post-speech waiting
+  and endpoint detection; it is not model-only compute RTF.
+- **Audio duration:** generated audio length, received as PCM16.
+
+The per-request rows in `duplex_request_metrics` retain `measurement_origin`, utterance identity, trigger, and these
+diagnostic fields:
+
+- `input_audio_ms`: prepared clip duration, including the silent tail.
+- `input_content_ms`: reference-speech duration, excluding the tail.
+- `input_uploaded_ms`: audio duration actually sent; only VAD includes the tail.
+- `input_upload_ms` / `session_setup_ms`: client wall-clock upload / setup time.
+- `session_start_to_first_audio_ms` / `session_start_to_response_done_ms`: timings from before text submission and audio
+  upload, retained for diagnosis.
+- `explicit_commit_to_first_audio_ms` (explicit only): sending the explicit trigger to receiving the first audio packet.
+- `vad_stop_received_ms` (VAD only): speech-end origin to the client's receipt of `speech_stopped`.
+- `vad_stop_to_first_audio_ms` (VAD only): that event's receipt to the first audio packet. Both VAD fields use client
+  event timestamps, not server GPU timestamps.
+
+The MiniCPM-o Seed-TTS Realtime backend prefers server-provided request timings from a different origin. Its
+TTFT/TTFP/RTF values are not directly comparable with this Qwen3-Omni workload. This Qwen3 path provides no Stage-0 engine
+token timing, so TPOT/ITL are unavailable. The backend explicitly disables derived TPOT even if a tokenizer counts
+transcript tokens; `num_tpot_samples` remains zero and a configured TPOT baseline rejects the missing measurement.
+
+#### Scope and limits
+
+The test requires every request to complete with exactly one response containing text and audio. VAD cases must emit
+speech-start and speech-stop events; a response before the reference speech ends is rejected. Although the server-VAD
+contract requires interruption flags, this workload sends no overlapping speech. It does not measure interruptions,
+multi-turn context, or concurrency scaling.
+
+Four requests are a small smoke test rather than a stable latency study, and no performance regression baseline is set.
+The earlier L20X numbers in [the original PR](gh-pr:8060) predate the capture-pacing fix and could understate VAD latency
+by up to one 200 ms chunk. Rerun both triggers before using those historical numbers as a performance reference.
 
 ### Video-MME Benchmark
 

@@ -1,0 +1,78 @@
+[
+  {
+    "test_name": "test_qwen3_omni_seed_tts_realtime",
+    "mark": [
+      {
+        "hardware_marks": {
+          "res": {
+            "cuda": [
+              "H100",
+              "B200"
+            ]
+          },
+          "num_cards": 2
+        }
+      },
+      "full_model",
+      "omni"
+    ],
+    "server_params": {
+      "model": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
+      "extra_cli_args": [
+        "--deploy-config",
+        "vllm_omni/deploy/qwen3_omni_duplex.yaml",
+        "--async-chunk"
+      ]
+    },
+    "benchmark_params": [
+      {
+        "dataset_name": "seed-tts",
+        "dataset_path": "zhaochenyang20/seed-tts-eval",
+        "num_prompts": [
+          4
+        ],
+        "max_concurrency": [
+          1
+        ],
+        "no_oversample": true,
+        "disable_shuffle": true,
+        "seed_tts_locale": "en",
+        "seed_tts_reference_as_input": true,
+        "seed_tts_system_prompt": "Read the user text aloud exactly as written. Do not answer or transcribe the accompanying audio. Output only the supplied text and its spoken audio.",
+        "output_len": 256,
+        "percentile-metrics": "ttft,e2el,audio_ttfp,audio_rtf,audio_duration",
+        "name": "explicit",
+        "backend": "openai-realtime-chat",
+        "endpoint": "/v1/realtime",
+        "expected_duplex_audio_turns_per_session": 1,
+        "extra_body": {
+          "realtime_trigger": "explicit"
+        }
+      },
+      {
+        "dataset_name": "seed-tts",
+        "dataset_path": "zhaochenyang20/seed-tts-eval",
+        "num_prompts": [
+          4
+        ],
+        "max_concurrency": [
+          1
+        ],
+        "no_oversample": true,
+        "disable_shuffle": true,
+        "seed_tts_locale": "en",
+        "seed_tts_reference_as_input": true,
+        "seed_tts_system_prompt": "Read the user text aloud exactly as written. Do not answer or transcribe the accompanying audio. Output only the supplied text and its spoken audio.",
+        "output_len": 256,
+        "percentile-metrics": "ttft,e2el,audio_ttfp,audio_rtf,audio_duration",
+        "name": "vad",
+        "backend": "openai-realtime-chat",
+        "endpoint": "/v1/realtime",
+        "expected_duplex_audio_turns_per_session": 1,
+        "extra_body": {
+          "realtime_trigger": "vad"
+        }
+      }
+    ]
+  }
+]
