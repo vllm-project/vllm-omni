@@ -1529,7 +1529,7 @@ class OmniDiffusionConfig:
         cfg = getattr(self, "diffusion_attention_config", None)
         if not isinstance(cfg, AttentionConfig):
             return
-        specs = [s for s in (cfg.default, *cfg.per_role.values()) if s is not None]
+        specs = [s for s in (cfg.default, *cfg.per_role.values()) if isinstance(s, AttentionSpec)]
 
         from vllm_omni.diffusion.attention.backends.trtllm_calibration import (
             propagate_skip_softmax_calibration,
@@ -2169,6 +2169,80 @@ class AttentionSpec:
 
 
 @dataclass
+class BlockSparseAttentionSpec:
+    """Configuration for block selection and sparse attention execution."""
+
+    name: str
+    config: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        self._validate_fields()
+        from vllm_omni.diffusion.attention.block_selection.registry import normalize_selection
+
+        self.config = {
+            "block_size": self._normalize_block_size(),
+            "selection": normalize_selection(copy.deepcopy(self.config.get("selection"))),
+            "backend": self._normalize_backend(),
+        }
+
+    def _validate_fields(self) -> None:
+        if self.name != "block_sparse":
+            raise ValueError("BlockSparseAttentionSpec requires name='block_sparse'")
+        if not isinstance(self.config, Mapping):
+            raise TypeError("Block-sparse attention config must be a mapping")
+        unknown = self.config.keys() - {"block_size", "selection", "backend"}
+        if unknown:
+            raise ValueError(f"Unknown block_sparse config fields: {sorted(unknown)}")
+
+    def _normalize_block_size(self) -> list[int]:
+        block_size = self.config.get("block_size", [64, 64])
+        if (
+            not isinstance(block_size, (list, tuple))
+            or len(block_size) != 2
+            or any(isinstance(size, bool) or not isinstance(size, int) or size <= 0 for size in block_size)
+        ):
+            raise ValueError("block_size must contain two positive integers [Bq, Bkv]")
+        return list(block_size)
+
+    def _normalize_backend(self) -> dict[str, Any]:
+        backend = self.config.get("backend", {"require": "FLASH_ATTN"})
+        if not isinstance(backend, Mapping) or backend.keys() - {"require", "prefer", "implementation"}:
+            raise ValueError("Invalid block_sparse backend fields")
+        if "prefer" in backend:
+            raise ValueError(
+                "block_sparse backend.prefer is not supported; use backend.require to pin one provider "
+                "until request-time provider selection is implemented"
+            )
+        provider = backend.get("require")
+        if not isinstance(provider, str) or not provider:
+            raise ValueError("block_sparse backend.require must be a provider name")
+        from vllm_omni.diffusion.attention.backends.registry import DiffusionAttentionBackendEnum
+
+        if provider not in DiffusionAttentionBackendEnum.__members__:
+            raise ValueError(f"Unknown attention provider: {provider}")
+        implementation = backend.get("implementation", "auto")
+        if not isinstance(implementation, str) or not implementation:
+            raise ValueError("implementation must be a nonempty backend-provided ID or 'auto'")
+        return copy.deepcopy(dict(backend))
+
+    @property
+    def backend(self) -> str:
+        return self.config["backend"]["require"]
+
+    @property
+    def implementation(self) -> str:
+        return self.config["backend"].get("implementation", "auto")
+
+    @property
+    def block_size(self) -> tuple[int, int]:
+        return tuple(self.config["block_size"])
+
+    @property
+    def selection(self) -> dict[str, Any]:
+        return copy.deepcopy(self.config["selection"])
+
+
+@dataclass
 class AttentionConfig:
     """Per-role attention backend configuration.
 
@@ -2179,14 +2253,14 @@ class AttentionConfig:
       4. platform default       — unchanged platform logic
     """
 
-    default: AttentionSpec | None = None
-    per_role: dict[str, AttentionSpec] = field(default_factory=dict)
+    default: AttentionSpec | BlockSparseAttentionSpec | None = None
+    per_role: dict[str, AttentionSpec | BlockSparseAttentionSpec] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.default is not None:
             self.default = self._coerce_spec_or_none(self.default, "default")
 
-        normalized_per_role: dict[str, AttentionSpec] = {}
+        normalized_per_role: dict[str, AttentionSpec | BlockSparseAttentionSpec] = {}
         for role_key, spec_data in self._normalize_per_role_mapping(self.per_role).items():
             spec = self._coerce_spec_or_none(spec_data, f"per_role[{role_key!r}]")
             if spec is not None:
@@ -2194,17 +2268,21 @@ class AttentionConfig:
         self.per_role = normalized_per_role
 
     @staticmethod
-    def _coerce_spec(spec_data: Any, field_name: str) -> AttentionSpec:
-        if isinstance(spec_data, AttentionSpec):
+    def _coerce_spec(spec_data: Any, field_name: str) -> AttentionSpec | BlockSparseAttentionSpec:
+        if isinstance(spec_data, (AttentionSpec, BlockSparseAttentionSpec)):
             return spec_data
         if isinstance(spec_data, str):
             return AttentionSpec(backend=spec_data)
         if isinstance(spec_data, Mapping):
+            if "name" in spec_data or "config" in spec_data:
+                if spec_data.keys() - {"name", "config"}:
+                    raise ValueError("Cannot mix backend-specific fields with name/config")
+                return BlockSparseAttentionSpec(**dict(spec_data))
             return AttentionSpec(**dict(spec_data))
         raise TypeError(f"Expected str, dict, or AttentionSpec for {field_name}, got {type(spec_data)!r}")
 
     @classmethod
-    def _coerce_spec_or_none(cls, spec_data: Any, field_name: str) -> AttentionSpec | None:
+    def _coerce_spec_or_none(cls, spec_data: Any, field_name: str) -> AttentionSpec | BlockSparseAttentionSpec | None:
         spec = cls._coerce_spec(spec_data, field_name)
         if spec.backend.lower() == "auto":
             return None
@@ -2242,6 +2320,8 @@ class AttentionConfig:
             "fastvideo_vsa_provider",
             "fastvideo_vsa_precision",
             "block_sparse",
+            "name",
+            "config",
         }
         node_dict = dict(node)
         node_keys = set(node_dict)
@@ -2263,7 +2343,7 @@ class AttentionConfig:
         self,
         role: str = "self",
         role_category: str | None = None,
-    ) -> tuple[AttentionSpec | None, str | None]:
+    ) -> tuple[AttentionSpec | BlockSparseAttentionSpec | None, str | None]:
         """Resolve the AttentionSpec and report which config entry matched."""
         spec = self.per_role.get(role)
         if spec is not None:
@@ -2312,7 +2392,7 @@ def parse_attention_config(
     if fastvideo_vsa_topk is not None:
         if normalized.default is None:
             raise ValueError("--fastvideo-vsa-topk requires --diffusion-attention-backend FASTVIDEO_VSA.")
-        if normalized.default.backend.upper() != "FASTVIDEO_VSA":
+        if not isinstance(normalized.default, AttentionSpec) or normalized.default.backend.upper() != "FASTVIDEO_VSA":
             raise ValueError("--fastvideo-vsa-topk is only valid with the FASTVIDEO_VSA backend.")
         normalized.default.fastvideo_vsa_topk = fastvideo_vsa_topk
         normalized.default.__post_init__()
