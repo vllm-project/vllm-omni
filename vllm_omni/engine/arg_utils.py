@@ -24,6 +24,7 @@ logger = init_logger(__name__)
 # Used when auto-injecting hf_overrides for models with missing config.json.
 _ARCH_TO_MODEL_TYPE: dict[str, str] = {
     "CosyVoice3Model": "cosyvoice3",
+    "FunAudioChatForConditionalGeneration": "funaudiochat",
     "GLMTTSForConditionalGeneration": "glm_tts",
     "IndexTTS2S2MelDecoder": "indextts2",
     "IndexTTS2TalkerForConditionalGeneration": "indextts2",
@@ -77,6 +78,7 @@ def _register_omni_hf_configs() -> None:
             Qwen3TTSConfig,
         )
         from vllm_omni.transformers_utils.configs.cosyvoice3 import CosyVoice3Config
+        from vllm_omni.transformers_utils.configs.funaudiochat import FunAudioChatConfig
         from vllm_omni.transformers_utils.configs.glm_tts import GLMTTSConfig
         from vllm_omni.transformers_utils.configs.omnivoice import OmniVoiceConfig
         from vllm_omni.transformers_utils.configs.voxcpm2 import VoxCPM2Config
@@ -104,6 +106,7 @@ def _register_omni_hf_configs() -> None:
         ("personaplex", PersonaPlexConfig),
         ("nemotron_voicechat", NemotronVoiceChatConfig),
         ("cosyvoice3", CosyVoice3Config),
+        ("funaudiochat", FunAudioChatConfig),
         ("glm_tts", GLMTTSConfig),
         ("omnivoice", OmniVoiceConfig),
         ("voxcpm2", VoxCPM2Config),

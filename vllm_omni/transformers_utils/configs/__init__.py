@@ -25,6 +25,8 @@ _CLASS_TO_MODULE: dict[str, str] = {
     "VoxCPM2Config": "vllm_omni.transformers_utils.configs.voxcpm2",
     "VoxtralTTSConfig": "vllm_omni.transformers_utils.configs.voxtral_tts",
     "CosyVoice3Config": "vllm_omni.transformers_utils.configs.cosyvoice3",
+    "FunAudioChatConfig": "vllm_omni.transformers_utils.configs.funaudiochat",
+    "FunAudioChatAudioEncoderConfig": "vllm_omni.transformers_utils.configs.funaudiochat",
     "MiniMaxMusic3Config": "vllm_omni.transformers_utils.configs.minimax_music3",
     "Yue2Config": "vllm_omni.transformers_utils.configs.yue2",
     "OmniVoiceConfig": "vllm_omni.transformers_utils.configs.omnivoice",
@@ -56,6 +58,8 @@ __all__ = [
     "VoxCPM2Config",
     "VoxtralTTSConfig",
     "CosyVoice3Config",
+    "FunAudioChatConfig",
+    "FunAudioChatAudioEncoderConfig",
     "MiniMaxMusic3Config",
     "Yue2Config",
     "OmniVoiceConfig",
@@ -89,6 +93,7 @@ from vllm_omni.transformers_utils.configs import audio8_tts as _audio8_tts  # no
 from vllm_omni.transformers_utils.configs import auk as _auk  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import cosyvoice3 as _cosyvoice3  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import fish_speech as _fish_speech  # noqa: F401, E402
+from vllm_omni.transformers_utils.configs import funaudiochat as _funaudiochat  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import glm_tts as _glm_tts  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import higgs_audio_v3 as _higgs_audio_v3  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import mammoth_moda2 as _mammoth_moda2  # noqa: F401, E402
