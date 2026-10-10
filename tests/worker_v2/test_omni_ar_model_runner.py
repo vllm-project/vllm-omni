@@ -630,7 +630,9 @@ def test_stream_reference_priming_groups_lengths_without_padding_or_slot_aliasin
         calls.append((codes.clone(), slots.clone(), pos.clone()))
 
     decoder = mocker.Mock(side_effect=stream, device=torch.device("cpu"))
-    model = mocker.Mock(stream_decoder=decoder, stream_prime_graphs=None, stream_chunk_frames=25)
+    model = mocker.Mock(
+        stream_decoder=decoder, stream_prime_graphs=None, stream_prime_pieces={}, stream_chunk_frames=25
+    )
     Qwen3TTSTalkerForConditionalGeneration.prime_stream_decoder(model, primes)
     assert len(calls) == 3
     for (codes, slots, pos), frames, indices, position in zip(
@@ -703,16 +705,20 @@ def test_stream_audio_history_replays_exact_inputs_after_batch_reordering(mocker
 
     owner = mocker.Mock()
     owner.vllm_config.model_config.max_model_len = 12
+    owner._eager_embeds = torch.zeros(2, 3)
     eager = EagerMTPState(owner)
     first = torch.arange(9, dtype=torch.float32).reshape(3, 3)
     second = torch.arange(9, 18, dtype=torch.float32).reshape(3, 3)
     expected = {"a": torch.cat((first[:2], second[2:])), "b": torch.cat((first[2:], second[:2]))}
     batch = InputBatch.__new__(InputBatch)
+    batch.num_reqs = 2
     batch.req_ids = ["a", "b"]
+    batch.idx_mapping_np = np.array([0, 1])
     batch.query_start_loc_np = np.array([0, 2, 3])
     batch.num_computed_tokens_np = np.array([0, 0])
     eager.record_inputs(batch, first)
     batch.req_ids = ["b", "a"]
+    batch.idx_mapping_np = np.array([1, 0])
     batch.num_computed_tokens_np = np.array([1, 2])
     eager.record_inputs(batch, second)
     # Later input-buffer reuse must not change the conditioned replay history.

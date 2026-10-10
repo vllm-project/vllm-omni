@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import copy
 from collections.abc import Iterable, Iterator, Mapping, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from typing import Any
 
 import numpy as np
@@ -27,7 +27,8 @@ from vllm.sequence import IntermediateTensors
 
 from vllm_omni.data_entry_keys import OmniPayload
 from vllm_omni.model_executor.models.output_templates import OmniOutput, OwnedBatchTensor
-from vllm_omni.utils.device_copy import index_to_device, to_device_nonblocking
+from vllm_omni.platforms import current_omni_platform
+from vllm_omni.utils.device_copy import DeviceStager, index_to_device, to_device_nonblocking
 from vllm_omni.utils.speaker_cache import (
     get_speaker_cache,
     iter_custom_voice_profiles,
@@ -38,7 +39,12 @@ from vllm_omni.worker.sampling_utils import get_tts_local_seed
 
 from .configuration_qwen3_tts import Qwen3TTSConfig, Qwen3TTSSpeakerEncoderConfig, Qwen3TTSTalkerConfig
 from .first_audio import talker_first_audio_enabled
-from .prompt_embeds_builder import PRECOMPUTED_TEXT_IDS_KEY, Qwen3TTSPromptEmbedsBuilder, resolve_x_vector_only
+from .prompt_embeds_builder import (
+    PRECOMPUTED_TEXT_IDS_KEY,
+    Qwen3TTSPromptEmbedsBuilder,
+    exact_fp32_reference_encode,
+    resolve_x_vector_only,
+)
 from .qwen3_tts_code_predictor_vllm import Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM
 from .stream_decode import stream_ref_context_frames, talker_stream_decode_enabled
 from .tokenizer_12hz.configuration_qwen3_tts_tokenizer_v2 import Qwen3TTSTokenizerV2Config
@@ -367,6 +373,17 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
     # Set by the MRV2 model state once eager frames are enabled.
     eager_frames_active = False
 
+    # Set when the MRv2 Talker sampler applies the codec mask in its kernel.
+    _codec_mask_in_sampler = False
+
+    # Set when a prefill stores ref codes the async-chunk output must publish.
+    # Starts True so a buffer restored with unpublished ref codes is still found.
+    _ref_codes_pending = True
+
+    # Prefill preprocess returns freshly built tensors (or read-only constants)
+    # that it never writes again, so the runner stores them without copying.
+    preprocess_prefill_updates_owned = True
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         self.vllm_config = vllm_config
@@ -426,6 +443,8 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         self.stream_decoder = None
         self.stream_graphs = None
         self.stream_prime_graphs = None
+        # Power-of-two frame counts below the priming chunk: see prime_stream_decoder.
+        self.stream_prime_pieces: dict[int, Any] = {}
         self.stream_sample_rate = 0
         self.stream_chunk_frames = 25
         # The runners bypass only the outer whole-MTP graph when explicit
@@ -571,7 +590,9 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             tokenizer_config.encoder_config,
         )
         self.encoder.eval()
-        self.encoder.to(dtype=torch.bfloat16)
+        # CUDA encodes references in FP32 under exact_fp32_reference_encode.
+        self._ref_encoder_dtype = torch.float32 if current_omni_platform.is_cuda() else torch.bfloat16
+        self.encoder.to(dtype=self._ref_encoder_dtype)
         self._encoder_valid_num_quantizers = int(tokenizer_config.encoder_valid_num_quantizers)
         self._encoder_downsample_rate = int(tokenizer_config.encode_downsample_rate)
 
@@ -681,8 +702,10 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         if logits is None:
             return None
 
-        # Mask out invalid codec ids using the pre-built constant buffer.
-        logits = logits.masked_fill(self._codec_disallowed_mask, float("-inf"))
+        # Mask out invalid codec ids using the pre-built constant buffer (in
+        # the MRv2 Talker sampler's kernel when that sampler is installed).
+        if not self._codec_mask_in_sampler:
+            logits = logits.masked_fill(self._codec_disallowed_mask, float("-inf"))
 
         # Suppress silence-region tokens for the first N decode frames (#4966). The
         # per-request decode step is the length of its generated-token history.
@@ -923,14 +946,21 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             mm["model_outputs"] = torch.zeros((num_tokens, spf), dtype=torch.float32, device=hidden.device)
             sr = torch.tensor(self.stream_sample_rate, dtype=torch.int32)
             mm["sr"] = [sr] * len(info_dicts)
-        ref_rows = [
-            index
-            for index, info in enumerate(info_dicts)
-            if isinstance(info, dict)
-            and isinstance(ref := info.get("codes", {}).get("ref"), torch.Tensor)
-            and ref.numel() > 0
-            and _should_publish_async_ref_codes(info)
-        ]
+        # Ref codes are stored by a first prefill and published by the output
+        # of that same step; without a pending one there is nothing to scan.
+        ref_rows = (
+            [
+                index
+                for index, info in enumerate(info_dicts)
+                if isinstance(info, dict)
+                and isinstance(ref := info.get("codes", {}).get("ref"), torch.Tensor)
+                and ref.numel() > 0
+                and _should_publish_async_ref_codes(info)
+            ]
+            if self._ref_codes_pending
+            else []
+        )
+        self._ref_codes_pending = False
         if ref_rows:
             empty = torch.empty(0, dtype=torch.long)
             ref_code_list = [empty] * len(info_dicts)
@@ -977,15 +1007,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             raise ValueError("Missing Qwen3-TTS text conditioning: provide `text` or precomputed text token ids.")
 
         task_type = (info_dict.get("task_type") or ["CustomVoice"])[0]
-        codec_streaming_val = meta.get("codec_streaming")
-        if isinstance(codec_streaming_val, list):
-            codec_streaming_raw = codec_streaming_val[0] if codec_streaming_val else None
-        else:
-            codec_streaming_raw = codec_streaming_val
-        if isinstance(codec_streaming_raw, bool):
-            codec_streaming = codec_streaming_raw
-        else:
-            codec_streaming = task_type == "Base"
+        codec_streaming = self._codec_streaming_flag(meta, task_type)
 
         # ``tts_pad_embed`` is a request-independent constant — see
         # :meth:`_init_runtime_buffers`. Materialize once on the right
@@ -1014,7 +1036,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                     "meta": {
                         "talker_text_offset": 0,
                         "codec_streaming": codec_streaming,
-                        "codec_frame_valid": torch.zeros((), dtype=torch.bool, device=input_ids.device),
+                        "codec_frame_valid": self._false_scalar(input_ids.device),
                     },
                 }
                 if isinstance(ref_code, torch.Tensor) and ref_code.numel() > 0:
@@ -1022,6 +1044,8 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                     if not bool(getattr(self, "_use_v2_model_runner", False)):
                         ref_code_buffer = ref_code_buffer.to("cpu")
                     info_update.setdefault("codes", {})["ref"] = ref_code_buffer.contiguous()
+                    # The eager output scans for unpublished ref codes only while some are pending.
+                    self._ref_codes_pending = True
                 if ref_code_len is not None:
                     info_update["meta"]["ref_code_len"] = int(ref_code_len)
                 # First prefill: source the slice offset from `_omni_num_computed_tokens`
@@ -1035,7 +1059,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                 info_update = {
                     "meta": {
                         "codec_streaming": codec_streaming,
-                        "codec_frame_valid": torch.zeros((), dtype=torch.bool, device=input_ids.device),
+                        "codec_frame_valid": self._false_scalar(input_ids.device),
                     }
                 }
 
@@ -1052,15 +1076,13 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             info_update["meta"]["talker_prefill_offset"] = int(offset + span_len)
 
             # When inputs_embeds is set, token ids are ignored by the model but must stay in-vocab for vLLM bookkeeping.
-            input_ids_out = input_ids.clone()
-            input_ids_out[:] = int(self.talker_config.codec_pad_id)
+            if getattr(self, "_use_v2_model_runner", False):
+                # The MRv2 runner passes its own input-id rows: fill them in place, no copy back.
+                input_ids_out = input_ids.fill_(int(self.talker_config.codec_pad_id))
+            else:
+                input_ids_out = torch.full_like(input_ids, int(self.talker_config.codec_pad_id))
 
-            zeros = torch.zeros(
-                (prompt_embeds.shape[0], int(self.talker_config.num_code_groups)),
-                device=input_ids.device,
-                dtype=torch.long,
-            )
-            info_update.setdefault("codes", {})["audio"] = zeros
+            info_update.setdefault("codes", {})["audio"] = self._zero_codes(prompt_embeds.shape[0], input_ids.device)
             return input_ids_out, prompt_embeds, info_update
 
         if span_len > 1:
@@ -1279,6 +1301,34 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         """Expose the existing TTS decode batcher through the MRv2 contract."""
         return self.preprocess_decode_batch(input_ids=input_ids, req_infos=req_infos, input_embeds=input_embeds)
 
+    def _false_scalar(self, device: torch.device) -> torch.Tensor:
+        """A shared read-only ``False`` for prefill frame validity (stored, never written in place)."""
+        cache = self.__dict__.setdefault("_false_scalars", {})
+        value = cache.get(device)
+        if value is None:
+            value = cache[device] = torch.zeros((), dtype=torch.bool, device=device)
+        return value
+
+    def _zero_codes(self, rows: int, device: torch.device) -> torch.Tensor:
+        """Shared read-only zero codec rows for prefill placeholders (stored, never written in place)."""
+        cache = self.__dict__.setdefault("_zero_codes_cache", {})
+        buf = cache.get(device)
+        if buf is None or buf.shape[0] < rows:
+            size = max(rows, 1024 if buf is None else 2 * buf.shape[0])
+            # Earlier views keep the previous buffer alive.
+            buf = cache[device] = torch.zeros(
+                (size, int(self.talker_config.num_code_groups)), dtype=torch.long, device=device
+            )
+        return buf[:rows]
+
+    def mrv2_custom_sampler(self, sampler: Any) -> tuple[Any, None]:
+        """Sample the Talker's codec row in one kernel (see :mod:`talker_sampler`)."""
+        from vllm_omni.model_executor.models.qwen3_tts.talker_sampler import Qwen3TTSTalkerSampler
+
+        wrapped = Qwen3TTSTalkerSampler(sampler, self)
+        self._codec_mask_in_sampler = wrapped.fused_disallowed_mask
+        return wrapped, None
+
     def postprocess(self, hidden_states: torch.Tensor, **_: Any) -> dict[str, Any]:
         # Keep the last token hidden for the next decode step's code predictor.
         # Stays on GPU - gpu_resident_buffer_keys avoids the CPU round-trip.
@@ -1340,6 +1390,108 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             device=device,
         )
 
+    def preprocess_prefill_rows_mrv2(
+        self,
+        *,
+        entries: Sequence[tuple[int, int, dict[str, Any]]],
+        input_ids: torch.Tensor,
+        input_embeds: torch.Tensor,
+    ) -> list[dict[str, Any] | None]:
+        """:meth:`preprocess` for many prefill rows in one launch (MRv2).
+
+        ``entries`` are ``(start, num_tokens, info)`` of prefill rows. A first
+        chunk whose prompt is a cached CustomVoice prompt (see
+        :meth:`Qwen3TTSPromptEmbedsBuilder.custom_voice_prompt_rows`) and any
+        later chunk of a stored prompt is written straight into
+        ``input_embeds`` / ``input_ids``; its buffer updates are returned, as
+        :meth:`preprocess` would. Other rows get ``None`` and take
+        :meth:`preprocess`.
+        """
+        from .prefill_rows import PrefillRows, launch_prefill_rows
+
+        results: list[dict[str, Any] | None] = [None] * len(entries)
+        builder = self._prompt_builder
+        table = builder._projected_text_table
+        dtype = self._embedding_dtype
+        device = input_embeds.device
+        if (
+            table is None
+            or table.device != device
+            or table.dtype != dtype
+            or input_embeds.dtype != dtype
+            or input_embeds.stride(-1) != 1
+            or not input_ids.is_contiguous()
+        ):
+            return results
+        rows = PrefillRows()
+        planned: list[tuple[int, int, int, dict[str, Any], int | None, int]] = []
+        for k, (start, span, info) in enumerate(entries):
+            if span <= 0 or isinstance(info.get("additional_information"), dict):
+                continue
+            if not _has_tts_text_conditioning(info, info.get("hidden_states")):
+                continue
+            stored = (info.get("embed") or {}).get("prefill")
+            if isinstance(stored, torch.Tensor) and stored.ndim == 2:
+                if stored.dtype == dtype and stored.device == device and stored.is_contiguous():
+                    offset = max(0, int((info.get("meta") or {}).get("talker_prefill_offset", 0) or 0))
+                    rows.add_stored_prompt(stored.data_ptr(), int(stored.shape[0]), offset, span, start)
+                    planned.append((k, span, offset, info, None, 0))
+                continue
+            # A new speaker's prompt pieces extend the constant table, which is read after this loop.
+            resolved = builder.custom_voice_prompt_rows(info)
+            if resolved is None:
+                continue
+            offset = max(0, int(info.get("_omni_num_computed_tokens", 0) or 0))
+            first, n = rows.add_new_prompt(resolved[0], resolved[1], offset, span, start)
+            planned.append((k, span, offset, info, first, n))
+        if not planned:
+            return results
+        packed = torch.empty(rows.num_packed, input_embeds.shape[-1], dtype=dtype, device=device)
+        stager = self.__dict__.get("_prefill_rows_stager")
+        if stager is None:
+            stager = self._prefill_rows_stager = DeviceStager()
+        launch_prefill_rows(
+            rows,
+            stager(rows.array(), device),
+            builder.prompt_row_table(),
+            table,
+            packed,
+            input_embeds,
+            input_ids,
+            int(self.talker_config.codec_pad_id),
+        )
+        false_scalar = self._false_scalar(device)
+        trailing = None
+        for k, span, offset, info, first, n in planned:
+            meta = info.get("meta") or {}
+            task_type = (info.get("task_type") or ["CustomVoice"])[0]
+            update: dict[str, Any] = {
+                "meta": {
+                    "codec_streaming": self._codec_streaming_flag(meta, task_type),
+                    "codec_frame_valid": false_scalar,
+                    "talker_prefill_offset": offset + span,
+                },
+                "codes": {"audio": self._zero_codes(span, device)},
+            }
+            if first is not None:
+                if trailing is None:
+                    trailing = builder._pad_embed(device, dtype).squeeze(0)
+                update["embed"] = {"prefill": packed[first : first + n]}
+                update["hidden_states"] = {"trailing_text": trailing}
+                update["meta"]["talker_text_offset"] = 0
+            if self._silence_ban_frames > 0:
+                # As preprocess_batch_mrv2 does for the prefill rows it is given.
+                self._req_x_vector_only[info["req_id"]] = resolve_x_vector_only(info)
+            results[k] = update
+        return results
+
+    @staticmethod
+    def _codec_streaming_flag(meta: dict[str, Any], task_type: str) -> bool:
+        value = meta.get("codec_streaming")
+        if isinstance(value, list):
+            value = value[0] if value else None
+        return value if isinstance(value, bool) else task_type == "Base"
+
     @contextmanager
     def mrv2_sampling_context(self, *, req_ids: list[str], num_output_tokens: torch.Tensor) -> Iterator[None]:
         """Scope the silence gate to sampling, never prompt-logprob computation."""
@@ -1382,13 +1534,19 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             sampling_rate=target_sr,
             return_tensors="pt",
         )
-        input_values = inputs["input_values"].squeeze(1).to(device=device, dtype=torch.bfloat16)
+        input_values = inputs["input_values"].squeeze(1).to(device=device, dtype=self._ref_encoder_dtype)
         downsample = self._encoder_downsample_rate
         valid_code_lengths = [(int(wav.size) + downsample - 1) // downsample for wav in wavs]
 
-        with torch.inference_mode():
+        exact_fp32 = self._ref_encoder_dtype == torch.float32 and torch.device(device).type == "cuda"
+        # Not compiled: the codec encoder's padding arithmetic recompiles per
+        # reference length.
+        with torch.inference_mode(), exact_fp32_reference_encode() if exact_fp32 else nullcontext():
+            # Residual quantization levels past the used ones do not change the
+            # earlier levels' codes, so they are not computed.
             encoded = self.encoder.encode(
                 input_values=input_values.unsqueeze(1),
+                num_quantizers=self._encoder_valid_num_quantizers,
                 return_dict=True,
             )
 
@@ -1457,13 +1615,15 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                 loaded.add(name)
 
         device = self.vllm_config.device_config.device
-        self.encoder.to(device=device, dtype=torch.bfloat16)
+        self.encoder.to(device=device, dtype=self._ref_encoder_dtype)
 
         self._init_runtime_buffers()
         self._init_silence_mask()
+        self._warm_reference_encoders()
 
         logger.info("Loaded %d weights for Qwen3TTSTalkerForConditionalGeneration", len(loaded))
         self._build_stacked_codec_embed()
+        self._prompt_builder.build_projected_text_table()
         if talker_first_audio_enabled(self.vllm_config):
             from .first_frame_decoder import Qwen3TTSFirstFrameDecoder
 
@@ -1496,15 +1656,31 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             if self.config.tts_model_type == "base" and frames > 1:
                 # Bound the multi-frame graph workspace by the configured
                 # token budget; larger priming groups keep the eager path.
-                budget = max(1, self.vllm_config.scheduler_config.max_num_batched_tokens // frames)
-                prime_sizes = sorted({1, *(size for size in batch_sizes if size <= budget)})
-                self.stream_prime_graphs = StreamingDecodeGraphs(self.stream_decoder, prime_sizes, frames=frames)
+                tokens = self.vllm_config.scheduler_config.max_num_batched_tokens
+
+                def prime_sizes(f: int) -> list[int]:
+                    return sorted({1, *(size for size in batch_sizes if size <= max(1, tokens // f))})
+
+                self.stream_prime_graphs = StreamingDecodeGraphs(
+                    self.stream_decoder, prime_sizes(frames), frames=frames
+                )
+                # A reference's last chunk (or a short reference) is decoded as
+                # power-of-two pieces instead of one eager call of a few
+                # hundred launches. The pieces replay one at a time on the
+                # decode stream, so they share the priming graphs' pool.
+                piece = 1 << ((frames - 1).bit_length() - 1)
+                while piece > 1:
+                    self.stream_prime_pieces[piece] = StreamingDecodeGraphs(
+                        self.stream_decoder, prime_sizes(piece), frames=piece, pool=self.stream_prime_graphs.pool
+                    )
+                    piece //= 2
         logger.info("Captured Talker stream decode graphs for batch sizes %s", self.stream_graphs.sizes)
         if self.stream_prime_graphs is not None:
             logger.info(
-                "Captured Talker reference priming graphs for %d frames and batch sizes %s",
+                "Captured Talker reference priming graphs for %d frames and batch sizes %s (pieces of %s frames)",
                 self.stream_prime_graphs.frames,
                 self.stream_prime_graphs.sizes,
+                sorted(self.stream_prime_pieces),
             )
 
     def get_stream_ref_context(self, info: OmniPayload) -> torch.Tensor | None:
@@ -1529,12 +1705,28 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             codes = to_device_nonblocking(torch.stack([ref for _idx, ref in items]), stream.device).to(torch.int32)
             n = len(items)
             slots = index_to_device([idx for idx, _ref in items], stream.device, dtype=torch.int32)
+            graphs = self.stream_prime_graphs
+            pieces = self.stream_prime_pieces
+            # Graph pieces only help when every piece size covers this group.
+            if any(max(piece.sizes) < n for piece in pieces.values()):
+                pieces = {}
             for t0 in range(0, int(codes.shape[1]), self.stream_chunk_frames):
-                pos = index_to_device([t0] * n, stream.device, dtype=torch.int32)
-                chunk = codes[:, t0 : t0 + self.stream_chunk_frames].contiguous()
-                graphs = self.stream_prime_graphs
-                decode = graphs if graphs is not None and chunk.shape[1] == graphs.frames else stream
-                decode(chunk, slots, pos)
+                chunk = codes[:, t0 : t0 + self.stream_chunk_frames]
+                if graphs is not None and chunk.shape[1] == graphs.frames:
+                    splits = [(0, chunk.shape[1], graphs)]
+                elif pieces:
+                    # Largest power-of-two pieces first; single frames use the per-step graphs.
+                    splits, done = [], 0
+                    while done < chunk.shape[1]:
+                        size = 1 << ((chunk.shape[1] - done).bit_length() - 1)
+                        piece = pieces.get(size) or (self.stream_graphs if size == 1 else None)
+                        splits.append((done, size, piece or stream))
+                        done += size
+                else:
+                    splits = [(0, chunk.shape[1], stream)]
+                for start, size, decode in splits:
+                    pos = index_to_device([t0 + start] * n, stream.device, dtype=torch.int32)
+                    decode(chunk[:, start : start + size].contiguous(), slots, pos)
 
     def _build_stacked_codec_embed(self) -> None:
         embeds = self.code_predictor.get_input_embeddings()
@@ -1544,6 +1736,33 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         self._stacked_codec_embed = torch.stack([e.weight.detach() for e in embeds], dim=0).to(
             device=w.device, dtype=w.dtype
         )
+
+    @torch.no_grad()
+    def _warm_reference_encoders(self) -> None:
+        """Run the voice-clone reference encoders once at load instead of on the first request.
+
+        Compiles the speaker encoder's dynamic-length graph; two lengths make the
+        length dimension dynamic before serving.
+        """
+        if self.config.tts_model_type != "base" or self._ref_encoder_dtype != torch.float32:
+            return
+        device = next(self.parameters()).device
+        if device.type != "cuda":
+            return
+        rng = np.random.default_rng(0)
+        wavs = [(0.01 * rng.standard_normal(n)).astype(np.float32) for n in (36000, 52800)]
+        # Model loading runs under the model's default dtype; requests run under
+        # torch's FP32 default, which the compiled graphs must match.
+        default_dtype = torch.get_default_dtype()
+        torch.set_default_dtype(torch.float32)
+        try:
+            self._encode_ref_audio_batch(wavs, 24000, device=device)
+            for wav in wavs:
+                self._prompt_builder.extract_speaker_embedding(wav, 24000)
+        except Exception as exc:
+            logger.warning("Qwen3-TTS reference encoder warmup failed: %s", exc)
+        finally:
+            torch.set_default_dtype(default_dtype)
 
     @torch.no_grad()
     def _init_silence_mask(self) -> None:

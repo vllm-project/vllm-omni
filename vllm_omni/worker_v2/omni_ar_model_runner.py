@@ -950,12 +950,19 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
                 )
             if self._streaming_audio is not None:
                 pooler_inter, pooler_client = None, self._streaming_audio.get_output()
+                # PCM chunks are host tensors this output owns (fresh, or views of its
+                # own D2H copy) and the sample rate is a shared read-only scalar:
+                # publish them without a per-request host copy.
+                copy_payload = _ensure_tensor_values
+            else:
+
+                def copy_payload(payload: dict[str, Any]) -> dict[str, torch.Tensor]:
+                    return _ensure_tensor_values(_async_copy_mm_value(payload))
+
             self.model_runner_output.pooler_output = None if self._async_chunk else pooler_inter
             self.model_runner_output.inter_stage_outputs = pooler_inter
             self.model_runner_output.multimodal_outputs = (
-                [_ensure_tensor_values(_async_copy_mm_value(p)) if p else {} for p in pooler_client]
-                if pooler_client
-                else None
+                [copy_payload(p) if p else {} for p in pooler_client] if pooler_client else None
             )
         elif self._need_pooler and self._hidden_cpu is not None:
             pooler_output = OmniARModelRunner._build_pooler_output_from_cpu(

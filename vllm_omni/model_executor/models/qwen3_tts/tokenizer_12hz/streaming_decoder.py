@@ -162,6 +162,52 @@ def _im2col_kernel(
 
 
 @triton.jit
+def _dilated_conv_snake_kernel(
+    ext_ptr,  # [B, H + T, C] transformed rows: history then this call's
+    w_ptr,  # [K * C, N] tap-major
+    out_ptr,  # [B * T, N] SnakeBeta(conv + bias)
+    bias_ptr,
+    alpha_ptr,
+    ibeta_ptr,
+    T,
+    rows,
+    C: tl.constexpr,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    D: tl.constexpr,
+    BM: tl.constexpr,
+    BN: tl.constexpr,
+    BC: tl.constexpr,
+):
+    """Implicit-GEMM dilated causal conv, then the unit's second bias + SnakeBeta.
+
+    Reads each tap's rows from the ``[history | new]`` rows in place instead of
+    a ``K``-times patch matrix. The epilogue rounds the conv to the GEMM output
+    dtype before the bias, as the separate SnakeBeta pass does.
+    """
+    H: tl.constexpr = (K - 1) * D
+    NC: tl.constexpr = C // BC
+    r = tl.program_id(0) * BM + tl.arange(0, BM)
+    rm = r < rows
+    src = ((r // T) * (H + T) + r % T).to(tl.int64)  # tap 0 row of each output row
+    cols = tl.program_id(1) * BN + tl.arange(0, BN)
+    cm = cols < N
+    cc = tl.arange(0, BC)
+    acc = tl.zeros([BM, BN], dtype=tl.float32)
+    for kidx in range(K * NC):
+        j = kidx // NC
+        c0 = (kidx % NC) * BC
+        a = tl.load(ext_ptr + (src + j * D)[:, None] * C + (c0 + cc)[None, :], mask=rm[:, None], other=0.0)
+        w = tl.load(w_ptr + (j * C + c0 + cc)[:, None] * N + cols[None, :], mask=cm[None, :], other=0.0)
+        acc = tl.dot(a, w, acc)
+    dt = out_ptr.dtype.element_ty
+    y = acc.to(dt).to(tl.float32) + tl.load(bias_ptr + cols, mask=cm, other=0.0).to(tl.float32)[None, :]
+    a2 = tl.load(alpha_ptr + cols, mask=cm, other=0.0)[None, :]
+    y = _snake(y, a2, tl.load(ibeta_ptr + cols, mask=cm, other=0.0)[None, :])
+    tl.store(out_ptr + r.to(tl.int64)[:, None] * N + cols[None, :], y.to(dt), mask=rm[:, None] & cm[None, :])
+
+
+@triton.jit
 def _rms_norm_kernel(x_ptr, w_ptr, out_ptr, eps, N: tl.constexpr):
     row = tl.program_id(0).to(tl.int64)
     offs = tl.arange(0, N)
@@ -348,30 +394,35 @@ def _col2im_kernel(
     out_ptr,  # [B * T * R, C]
     T,
     S,
+    ROWS,
     R: tl.constexpr,
     C: tl.constexpr,
+    BR: tl.constexpr,
     BC: tl.constexpr,
 ):
-    row = tl.program_id(0)  # b * T + t
+    row = tl.program_id(0) * BR + tl.arange(0, BR)  # b * T + t
     j = tl.program_id(1)  # 0 .. R - 1
     c = tl.program_id(2) * BC + tl.arange(0, BC)
+    rm = row < ROWS
     cm = c < C
+    m = rm[:, None] & cm[None, :]
     b = row // T
     t = row % T
-    slot = tl.load(slots_ptr + b).to(tl.int64)
-    live = tl.load(pos_ptr + b) != 0
-    par = tl.load(par_ptr + slot).to(tl.int64)
-    zr = z_ptr + row.to(tl.int64) * 2 * R * C
-    cur = tl.load(zr + j * C + c, mask=cm).to(tl.float32)
-    prev_in = tl.load(zr - 2 * R * C + (R + j) * C + c, mask=cm & (t > 0), other=0.0).to(tl.float32)
-    prev_st = tl.load(prev_ptr + ((par * S + slot) * R + j) * C + c, mask=cm & (t == 0) & live, other=0.0).to(
-        tl.float32
-    )
-    y = cur + tl.where(t > 0, prev_in, prev_st) + tl.load(bias_ptr + c, mask=cm).to(tl.float32)
+    slot = tl.load(slots_ptr + b, mask=rm, other=0).to(tl.int64)
+    live = tl.load(pos_ptr + b, mask=rm, other=0) != 0
+    par = tl.load(par_ptr + slot, mask=rm, other=0).to(tl.int64)
+    zr = z_ptr + row.to(tl.int64)[:, None] * 2 * R * C + c[None, :]
+    cur = tl.load(zr + j * C, mask=m).to(tl.float32)
+    prev_in = tl.load(zr - 2 * R * C + (R + j) * C, mask=m & (t > 0)[:, None], other=0.0).to(tl.float32)
+    st = ((par * S + slot) * R + j)[:, None] * C + c[None, :]
+    prev_st = tl.load(prev_ptr + st, mask=m & ((t == 0) & live)[:, None], other=0.0).to(tl.float32)
+    y = cur + tl.where((t > 0)[:, None], prev_in, prev_st) + tl.load(bias_ptr + c, mask=cm).to(tl.float32)[None, :]
     dt = out_ptr.dtype.element_ty
-    tl.store(out_ptr + (row.to(tl.int64) * R + j) * C + c, y.to(dt), mask=cm)
-    last = tl.load(zr + (R + j) * C + c, mask=cm & (t == T - 1))
-    tl.store(prev_ptr + (((1 - par) * S + slot) * R + j) * C + c, last, mask=cm & (t == T - 1))
+    tl.store(out_ptr + (row.to(tl.int64) * R + j)[:, None] * C + c[None, :], y.to(dt), mask=m)
+    lm = m & (t == T - 1)[:, None]
+    last = tl.load(zr + (R + j) * C, mask=lm)
+    nst = (((1 - par) * S + slot) * R + j)[:, None] * C + c[None, :]
+    tl.store(prev_ptr + nst, last, mask=lm)
 
 
 @triton.jit
@@ -397,6 +448,30 @@ def _conv_out_kernel(
         v = tl.load(base + (t + j)[:, None] * C + c[None, :], mask=tm[:, None] & cm[None, :], other=0.0).to(tl.float32)
         acc += tl.sum(v * tl.load(w_ptr + j * C + c, mask=cm, other=0.0).to(tl.float32)[None, :], axis=1)
     dt = ext_ptr.dtype.element_ty
+    y = acc.to(dt).to(tl.float32) + wb
+    y = tl.minimum(tl.maximum(y.to(dt).to(tl.float32), -1.0), 1.0)
+    tl.store(out_ptr + b.to(tl.int64) * T + t, y, mask=tm)
+
+
+@triton.jit
+def _conv_out_taps_kernel(
+    taps_ptr,  # [B * (T + K - 1), KP] float32: each row's dot with every tap's weights
+    wb,  # conv bias (float)
+    out_ptr,  # [B, T] float32 waveform
+    T,
+    K: tl.constexpr,
+    KP: tl.constexpr,
+    BT: tl.constexpr,
+):
+    """Sample t sums tap j of row t + j, in tap order, then the output conv's rounding and clamp."""
+    b = tl.program_id(0)
+    t = tl.program_id(1) * BT + tl.arange(0, BT)
+    tm = t < T
+    base = taps_ptr + (b.to(tl.int64) * (T + K - 1) + t) * KP
+    acc = tl.zeros([BT], dtype=tl.float32)
+    for j in tl.static_range(K):
+        acc += tl.load(base + j * KP + j, mask=tm, other=0.0)
+    dt = tl.bfloat16  # decoder dtype: this path runs for BF16 decoders only
     y = acc.to(dt).to(tl.float32) + wb
     y = tl.minimum(tl.maximum(y.to(dt).to(tl.float32), -1.0), 1.0)
     tl.store(out_ptr + b.to(tl.int64) * T + t, y, mask=tm)
@@ -431,6 +506,12 @@ def _snake_params(module) -> tuple[torch.Tensor, torch.Tensor]:
     alpha = module.alpha.detach().float()
     beta = module.beta.detach().float()
     return torch.exp(alpha).contiguous(), (1.0 / (torch.exp(beta) + 1e-9)).contiguous()
+
+
+# Dilated unit convs of these widths run as one implicit GEMM (BM, BN, BC, warps)
+# instead of a K-times patch matrix plus cuBLAS: the patch traffic dominates for
+# the long, narrow late blocks. The widest block is faster as patch + GEMM.
+_DILATED_IGEMM = {384: (128, 128, 64, 8), 192: (128, 64, 64, 4), 96: (128, 128, 32, 4)}
 
 
 class StreamingCodecDecoder(nn.Module):
@@ -598,8 +679,14 @@ class StreamingCodecDecoder(nn.Module):
         self.conv_out_w = cast(f32(co.weight)[0].t())  # [K, C]
         self.conv_out_b = float(f32(co.bias)[0])
         self.conv_out = _ConvSpec(self.conv_out_w, self.out_c, _KERNEL, 1, hist(_KERNEL - 1, self.out_c))
+        # [C, 8]: column j holds tap j, so one GEMM gives every row's per-tap partial sums.
+        taps = torch.zeros(self.out_c, 8, device=dev, dtype=dtype)
+        taps[:, :_KERNEL] = self.conv_out_w.t()
+        self.conv_out_taps = taps
+        self.conv_out_gemm = _CUDA_SIN and dtype == torch.bfloat16
         self.parity = torch.zeros(S, device=dev, dtype=torch.int32)
         self._dummy = torch.zeros(1, device=dev, dtype=dtype)
+        self.dilated_igemm = _CUDA_SIN and dtype == torch.bfloat16
 
     def _slot_state(self, slot: int) -> list[torch.Tensor]:
         state = [self.parity[slot : slot + 1]]
@@ -660,6 +747,20 @@ class StreamingCodecDecoder(nn.Module):
         x4 = ext.view(b, -1, c).permute(0, 2, 1).unsqueeze(2)  # [B, C, 1, H + T], channels-last memory
         y = torch.nn.functional.conv2d(x4, u["conv1_w4"])  # [B, N, 1, T], channels-last memory
         return y.permute(0, 2, 3, 1).reshape(b * T, -1)
+
+    def _dilated_conv_snake(self, x, u, T, slots, pos):
+        """Unit conv1 (dilated) + bias + act2 SnakeBeta without materializing the patch matrix."""
+        spec = u["conv1"]
+        ext = self._im2col(x, spec, T, slots, pos, bias=u["pb"], snake=u["act1"], ext=True)
+        rows, c = x.shape
+        bm, bn, bc, warps = _DILATED_IGEMM[c]
+        out = torch.empty(rows, spec.weight.shape[1], device=x.device, dtype=self.dtype)
+        alpha, ibeta = u["act2"]
+        _dilated_conv_snake_kernel[(triton.cdiv(rows, bm), triton.cdiv(out.shape[1], bn))](
+            ext, spec.weight, out, u["b1"], alpha, ibeta, T, rows,
+            C=c, N=out.shape[1], K=spec.k, D=spec.d, BM=bm, BN=bn, BC=bc, num_warps=warps, num_stages=3,
+        )  # fmt: skip
+        return out
 
     def _snake(self, x, snake, bias):
         n, c = x.shape
@@ -741,38 +842,66 @@ class StreamingCodecDecoder(nn.Module):
             r, c_out = blk["rate"], blk["c_out"]
             x = torch.empty(rows * r, c_out, device=dev, dtype=dt)
             bc = min(128, triton.next_power_of_2(c_out))
-            _col2im_kernel[(rows, r, triton.cdiv(c_out, bc))](
-                zt, blk["b"], blk["prev"], slots, pos, self.parity, x, t_rows, self.num_slots,
-                R=r, C=c_out, BC=bc,
+            br = max(1, 2048 // bc)
+            _col2im_kernel[(triton.cdiv(rows, br), r, triton.cdiv(c_out, bc))](
+                zt, blk["b"], blk["prev"], slots, pos, self.parity, x, t_rows, self.num_slots, rows,
+                R=r, C=c_out, BR=br, BC=bc,
             )  # fmt: skip
             rows, t_rows = rows * r, t_rows * r
             for u in blk["units"]:
                 if u.get("conv1_w4") is not None:
-                    c1 = self._conv_cudnn(x, u, t_rows, slots, pos)
+                    s2 = self._snake(self._conv_cudnn(x, u, t_rows, slots, pos), u["act2"], u["b1"])
+                # Below ~16 frames per call the implicit GEMM has too few row tiles to win.
+                elif self.dilated_igemm and c_out in _DILATED_IGEMM and B * T >= 16:
+                    s2 = self._dilated_conv_snake(x, u, t_rows, slots, pos)
                 else:
                     col = self._im2col(x, u["conv1"], t_rows, slots, pos, bias=u["pb"], snake=u["act1"])
-                    c1 = torch.mm(col, u["conv1"].weight)
-                s2 = self._snake(c1, u["act2"], u["b1"])
+                    s2 = self._snake(torch.mm(col, u["conv1"].weight), u["act2"], u["b1"])
                 x.addmm_(s2, u["w2"])
 
         ext = self._im2col(x, self.conv_out, t_rows, slots, pos, bias=self.out_pb, snake=self.out_snake, ext=True)
         wav = torch.empty(B, t_rows, device=dev, dtype=torch.float32)
-        _conv_out_kernel[(B, triton.cdiv(t_rows, 256))](
-            ext, self.conv_out_w, self.conv_out_b, wav, t_rows,
-            C=self.out_c, K=_KERNEL, BT=256, CP=triton.next_power_of_2(self.out_c),
-        )  # fmt: skip
+        if self.conv_out_gemm:
+            taps = torch.mm(ext, self.conv_out_taps, out_dtype=torch.float32)
+            _conv_out_taps_kernel[(B, triton.cdiv(t_rows, 1024))](
+                taps, self.conv_out_b, wav, t_rows, K=_KERNEL, KP=taps.shape[1], BT=1024,
+            )  # fmt: skip
+        else:
+            _conv_out_kernel[(B, triton.cdiv(t_rows, 256))](
+                ext, self.conv_out_w, self.conv_out_b, wav, t_rows,
+                C=self.out_c, K=_KERNEL, BT=256, CP=triton.next_power_of_2(self.out_c),
+            )  # fmt: skip
         _flip_kernel[(B,)](self.parity, slots)
         return wav
+
+
+@triton.jit
+def _graph_inputs_kernel(
+    codes_ptr, slots_ptr, pos_ptr, s_codes_ptr, s_slots_ptr, s_pos_ptr, n, scratch, W: tl.constexpr, WP: tl.constexpr
+):
+    """Static graph inputs: rows below ``n`` take the call's codes/slot/pos, padding rows the scratch slot."""
+    b = tl.program_id(0)
+    if b < n:
+        w = tl.arange(0, WP)
+        c = tl.load(codes_ptr + b * W + w, mask=w < W)
+        tl.store(s_codes_ptr + b * W + w, c.to(s_codes_ptr.dtype.element_ty), mask=w < W)
+        tl.store(s_slots_ptr + b, tl.load(slots_ptr + b).to(tl.int32))
+        tl.store(s_pos_ptr + b, tl.load(pos_ptr + b).to(tl.int32))
+    else:
+        tl.store(s_slots_ptr + b, scratch.to(tl.int32))
+        tl.store(s_pos_ptr + b, tl.full([], 0, tl.int32))
 
 
 class StreamingDecodeGraphs:
     """CUDA graphs of ``StreamingCodecDecoder`` for a fixed frame count per batch bucket."""
 
-    def __init__(self, sd: StreamingCodecDecoder, batch_sizes: list[int], frames: int = 1) -> None:
+    def __init__(self, sd: StreamingCodecDecoder, batch_sizes: list[int], frames: int = 1, pool=None) -> None:
+        """``pool`` may be shared with other instances whose replays never overlap with these."""
         self.sd, self.frames = sd, frames
         self.graphs: dict[int, tuple] = {}
         dev = sd.device
-        pool = torch.cuda.graph_pool_handle()
+        pool = torch.cuda.graph_pool_handle() if pool is None else pool
+        self.pool = pool
         for bsz in sorted(set(batch_sizes)):
             codes = torch.zeros(bsz, frames, sd.nq, dtype=torch.int32, device=dev)
             slots = torch.full((bsz,), sd.scratch_slot, dtype=torch.int32, device=dev)
@@ -792,11 +921,19 @@ class StreamingDecodeGraphs:
         if size is None:
             return self.sd(codes, slots.to(torch.int32), pos.to(torch.int32))
         graph, s_codes, s_slots, s_pos, out = self.graphs[size]
-        s_codes[:n].copy_(codes)
-        s_slots[:n].copy_(slots)
-        s_pos[:n].copy_(pos)
-        if n < size:
-            s_slots[n:].fill_(self.sd.scratch_slot)
-            s_pos[n:].zero_()
+        if codes.is_contiguous() and slots.stride(0) == 1 and pos.stride(0) == 1:
+            # One launch instead of three copies and two padding fills.
+            width = self.frames * self.sd.nq
+            _graph_inputs_kernel[(size,)](
+                codes, slots, pos, s_codes, s_slots, s_pos, n, self.sd.scratch_slot,
+                W=width, WP=triton.next_power_of_2(width),
+            )  # fmt: skip
+        else:
+            s_codes[:n].copy_(codes)
+            s_slots[:n].copy_(slots)
+            s_pos[:n].copy_(pos)
+            if n < size:
+                s_slots[n:].fill_(self.sd.scratch_slot)
+                s_pos[n:].zero_()
         graph.replay()
         return out[:n]

@@ -28,7 +28,8 @@ import base64
 import hashlib
 import io
 from collections import OrderedDict
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager, nullcontext
 from functools import lru_cache
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
@@ -41,6 +42,7 @@ from transformers import AutoTokenizer
 from vllm.logger import init_logger
 from vllm.multimodal.audio import AudioResampler
 
+from vllm_omni.platforms import current_omni_platform
 from vllm_omni.utils.audio import mel_filter_bank
 from vllm_omni.utils.device_copy import index_to_device, to_device_nonblocking
 
@@ -171,18 +173,65 @@ def coerce_token_ids(value: object, *, device: torch.device) -> torch.Tensor | N
 # ---------------------------------------------------------------------------
 
 
+@contextmanager
+def exact_fp32_reference_encode() -> Iterator[None]:
+    """FP32 convolutions and GEMMs for variable-length reference audio on CUDA.
+
+    Every reference has a new length, and cuDNN builds an execution plan per
+    input shape (tens of milliseconds of blocking host time per reference in
+    the codec encoder and speaker encoder). The native kernels need no plan
+    and, in FP32 without TF32, give the same codes and embedding as the FP32
+    cuDNN path. Model loading calls this under the model's default dtype, so
+    the FP32 default is restored for the encoders' own temporaries too.
+    """
+    matmul_tf32 = torch.backends.cuda.matmul.allow_tf32
+    default_dtype = torch.get_default_dtype()
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.set_default_dtype(torch.float32)
+    try:
+        with torch.backends.cudnn.flags(enabled=False):
+            yield
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = matmul_tf32
+        torch.set_default_dtype(default_dtype)
+
+
+class CompiledReferenceEncoder:
+    """``torch.compile(dynamic=True)`` of a reference-audio encoder call, with an eager fallback.
+
+    References have arbitrary lengths, so one dynamic-shape graph serves them
+    all; fusing the many small per-layer ops removes most of the per-call
+    launch overhead that bounds these encoders.
+    """
+
+    def __init__(self, fn: Callable[..., Any], name: str) -> None:
+        self._eager = fn
+        self._compiled: Callable[..., Any] | None = torch.compile(fn, dynamic=True)
+        self._name = name
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        if self._compiled is not None:
+            try:
+                return self._compiled(*args, **kwargs)
+            except Exception as exc:
+                logger.warning("Compiled Qwen3-TTS %s failed; using eager: %s", self._name, exc)
+                self._compiled = None
+        return self._eager(*args, **kwargs)
+
+
 def _dynamic_range_compression(x: torch.Tensor, c: float = 1, clip_val: float = 1e-5) -> torch.Tensor:
     return torch.log(torch.clamp(x, min=clip_val) * c)
 
 
 @lru_cache(maxsize=8)
 def _cached_mel_filter_bank(sampling_rate: int, n_fft: int, n_mels: int, fmin: int, fmax: int | None) -> torch.Tensor:
-    return mel_filter_bank(sr=sampling_rate, n_fft=n_fft, n_mels=n_mels, fmin=fmin, fmax=fmax)
+    # Explicit FP32: a first call under a non-default torch dtype must not cache that dtype.
+    return mel_filter_bank(sr=sampling_rate, n_fft=n_fft, n_mels=n_mels, fmin=fmin, fmax=fmax).float()
 
 
 @lru_cache(maxsize=8)
 def _cached_hann_window(win_size: int) -> torch.Tensor:
-    return torch.hann_window(win_size)
+    return torch.hann_window(win_size, dtype=torch.float32)
 
 
 def mel_spectrogram(
@@ -333,6 +382,9 @@ class Qwen3TTSPromptEmbedsBuilder:
             artifacts. ``0`` disables the cache.
     """
 
+    # text_projection(text_embedding(v)) for every text token v (see build_projected_text_table).
+    _projected_text_table: torch.Tensor | None = None
+
     def __init__(
         self,
         *,
@@ -357,6 +409,7 @@ class Qwen3TTSPromptEmbedsBuilder:
         self._codec_embed = codec_embed
         self._residual_code_embeddings = residual_code_embeddings
         self._speaker_encoder = speaker_encoder
+        self._speaker_encoder_call: CompiledReferenceEncoder | None = None
         self._tts_pad_embed_buffer = tts_pad_embed
         self._encode_ref_audio_batch_fn = encode_ref_audio_batch
         self._speaker_cache = speaker_cache
@@ -369,7 +422,7 @@ class Qwen3TTSPromptEmbedsBuilder:
         self._projected_token_cache: dict[tuple[str, tuple[int, ...]], torch.Tensor] = {}
         # CustomVoice prompt pieces that do not depend on the text, per
         # (device, speaker, language): bounded by the model's voices.
-        self._custom_voice_prompt_cache: dict[tuple, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
+        self._custom_voice_prompt_cache: dict[tuple, tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = {}
         # Speaker codec id and embedding per (device, speaker).
         self._speaker_embed_cache: dict[tuple[str, str], tuple[int, torch.Tensor]] = {}
         # Text-conditioning embeddings projected by ``preprocess_infos_batch``
@@ -408,14 +461,176 @@ class Qwen3TTSPromptEmbedsBuilder:
             cache[key] = cached
         return cached
 
+    @staticmethod
+    def _speaker_field(info_dict: dict[str, Any]) -> Any:
+        raw = info_dict.get("speaker") or [""]
+        return raw[0] if isinstance(raw, (list, tuple)) else raw
+
+    def _cached_custom_voice_entry(
+        self, info_dict: dict[str, Any], text: Any, language: Any
+    ) -> tuple[tuple, tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] | None:
+        """``(cache key, cached prompt pieces)`` when an earlier request resolved this speaker/language.
+
+        Only for plain text with no instruct, where the prompt is the cached
+        pieces around the projected text.
+        """
+        if not isinstance(text, str) or text[:1].isspace():
+            return None
+        instruct = (info_dict.get("instruct") or [""])[0]
+        if isinstance(instruct, str) and instruct.strip():
+            return None
+        fast_keys = self.__dict__.get("_cv_fast_keys")
+        if not fast_keys:
+            return None
+        try:
+            cache_key = fast_keys.get((self._speaker_field(info_dict), language))
+        except TypeError:  # unhashable request fields
+            return None
+        cached = self._custom_voice_prompt_cache.get(cache_key) if cache_key is not None else None
+        return None if cached is None else (cache_key, cached)
+
+    def _cached_custom_voice_prompt(
+        self, info_dict: dict[str, Any], text: Any, language: Any
+    ) -> tuple[torch.Tensor, torch.Tensor, None, None] | None:
+        """The non-streaming CustomVoice prompt from cached rows, or ``None`` for the full path.
+
+        Applies when an earlier request resolved this speaker/language to a
+        cached prefix and the batched preprocess already projected this
+        request's text: the prompt is then prefix + (text + pad row) + eos row
+        + tail, exactly what the full path assembles from the same rows.
+        """
+        entry = self._cached_custom_voice_entry(info_dict, text, language)
+        req_id = str(info_dict.get("req_id"))
+        if entry is None or req_id not in self._batched_text_embeds:
+            return None
+        cached = entry[1]
+        text_all = self._batched_text_embeds.pop(req_id)
+        info_dict.pop(PRECOMPUTED_TEXT_IDS_KEY, None)
+        prefix, pad_row, tail, eos_row = cached
+        talker_prompt = torch.cat([prefix, text_all + pad_row, eos_row, tail], dim=1)
+        trailing = self._pad_embed(prefix.device, prefix.dtype)
+        return talker_prompt.squeeze(0), trailing.squeeze(0), None, None
+
+    def custom_voice_prompt_rows(
+        self, info_dict: dict[str, Any]
+    ) -> tuple[tuple[int, int, int, int, int], np.ndarray] | None:
+        """Where the rows of a cached non-streaming CustomVoice prompt come from, or ``None`` for the full path.
+
+        For the requests :meth:`_cached_custom_voice_prompt` serves, the prompt
+        is ``prefix + (table[ids[3:-5]] + pad_row) + eos_row + tail``. Returns
+        the rows of those constant pieces in :meth:`prompt_row_table`
+        (``prefix_start, prefix_len, pad_row, eos_row, tail``) and the request's
+        full template ids, so a batch of prompts can be assembled by row
+        lookups (see ``prefill_rows``).
+        """
+        table = self._projected_text_table
+        if table is None or not self._needs_initial_prompt_preprocess(info_dict):
+            return None
+        task_type = (info_dict.get("task_type") or ["CustomVoice"])[0]
+        if task_type != "CustomVoice" or not self._non_streaming_mode(info_dict, task_type):
+            return None
+        text = (info_dict.get("text") or [""])[0]
+        language = (info_dict.get("language") or ["Auto"])[0]
+        entry = self._cached_custom_voice_entry(info_dict, text, language)
+        if entry is None or entry[0][0] != str(table.device):
+            return None
+        cache_key, cached = entry
+        ids = first_value(info_dict.get(PRECOMPUTED_TEXT_IDS_KEY))
+        if isinstance(ids, torch.Tensor):
+            if ids.device.type != "cpu":
+                return None
+            ids = ids.reshape(-1).numpy()
+        try:
+            ids = np.asarray(ids)
+        except (TypeError, ValueError):
+            return None
+        # The assistant template wraps the text in 3 leading and 5 trailing tokens.
+        if ids.ndim != 1 or ids.size <= 8 or ids.dtype.kind not in "iu":
+            return None
+        rows = self._prompt_row_index(cache_key, cached)
+        if rows is None:
+            return None
+        return rows, ids.astype(np.int64, copy=False)
+
+    def _prompt_row_index(
+        self, cache_key: tuple, cached: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+    ) -> tuple[int, int, int, int, int] | None:
+        index = self.__dict__.setdefault("_prompt_rows_index", {})
+        rows = index.get(cache_key)
+        if rows is not None:
+            return rows
+        table = self._projected_text_table
+        prefix, pad_row, tail, eos_row = cached
+        hidden = table.shape[-1]
+        pieces = [
+            prefix.reshape(-1, hidden),
+            pad_row.reshape(1, hidden),
+            eos_row.reshape(1, hidden),
+            tail.reshape(1, hidden),
+        ]
+        if any(p.dtype != table.dtype or p.device != table.device for p in pieces):
+            return None
+        const = self.prompt_row_table()
+        base = const.shape[0]
+        self._prompt_rows = torch.cat([const, *pieces])
+        n = pieces[0].shape[0]
+        rows = index[cache_key] = (base, n, base + n, base + n + 1, base + n + 2)
+        return rows
+
+    def prompt_row_table(self) -> torch.Tensor:
+        """Constant prompt rows, ``[R, H]``: row 0 is the tts pad embedding, then the pieces of each cached prompt."""
+        const = self.__dict__.get("_prompt_rows")
+        if const is None:
+            table = self._projected_text_table
+            const = self._prompt_rows = self._pad_embed(table.device, table.dtype).reshape(1, -1).clone()
+        return const
+
+    def _codec_embeds(self, values: Sequence[int], device: torch.device) -> torch.Tensor:
+        """Codec embeddings of constant ids, ``[1, len(values), H]`` (the table is fixed after load)."""
+        device = torch.device(device)
+        key = (str(device), tuple(int(v) for v in values))
+        cache = self.__dict__.setdefault("_codec_embed_cache", {})
+        cached = cache.get(key)
+        if cached is None:
+            cached = cache[key] = self._codec_embed(self._long_tensor(values, device))
+        return cached
+
     def _projected_tokens(self, values: Sequence[int], device: torch.device) -> torch.Tensor:
         device = torch.device(device)
         key = (str(device), tuple(int(v) for v in values))
         cached = self._projected_token_cache.get(key)
         if cached is None:
-            cached = self._text_projection(self._text_embedding(self._long_tensor(values, device)))
+            cached = self._project_text_ids(self._long_tensor(values, device))
             self._projected_token_cache[key] = cached
         return cached
+
+    def build_projected_text_table(self, chunk_rows: int = 16384) -> None:
+        """Project the whole text vocabulary once, so projecting a prompt's text is one row lookup.
+
+        The embedding + projection MLP acts on each token independently, so a
+        prompt's projected text is exactly its tokens' rows of this table:
+        ``[text_vocab, hidden]`` in the projection dtype (about 0.6 GB for the
+        1.7B checkpoints). Built at load, before the KV cache is sized.
+        """
+        weight = getattr(self._text_embedding, "weight", None)
+        if not isinstance(weight, torch.Tensor) or weight.device.type != "cuda":
+            return
+        with torch.inference_mode():
+            table = None
+            for start in range(0, weight.shape[0], chunk_rows):
+                rows = self._text_projection(weight[start : start + chunk_rows].unsqueeze(0)).squeeze(0)
+                if table is None:
+                    table = torch.empty(weight.shape[0], rows.shape[-1], device=rows.device, dtype=rows.dtype)
+                table[start : start + rows.shape[0]] = rows
+        self._projected_text_table = table
+        self._projected_token_cache.clear()
+
+    def _project_text_ids(self, ids: torch.Tensor) -> torch.Tensor:
+        """``text_projection(text_embedding(ids))``, from the projected table when it is built."""
+        table = self._projected_text_table
+        if table is None or table.device != ids.device:
+            return self._text_projection(self._text_embedding(ids))
+        return torch.nn.functional.embedding(ids, table)
 
     def _get_resampler(self, orig_sr: int, target_sr: int) -> AudioResampler:
         key = (int(orig_sr), int(target_sr))
@@ -686,10 +901,13 @@ class Qwen3TTSPromptEmbedsBuilder:
         # main model before running it.
         dev = self._device()
         dtype = self._embedding_dtype
+        # CUDA runs the speaker encoder in FP32 under exact_fp32_reference_encode.
+        exact_fp32 = dev.type == "cuda" and current_omni_platform.is_cuda()
+        enc_dtype = torch.float32 if exact_fp32 else dtype
         try:
             spk_param = next(self._speaker_encoder.parameters())
-            if spk_param.device != dev or spk_param.dtype != dtype:
-                self._speaker_encoder.to(device=dev, dtype=dtype)
+            if spk_param.device != dev or spk_param.dtype != enc_dtype:
+                self._speaker_encoder.to(device=dev, dtype=enc_dtype)
         except StopIteration:
             pass
         # Resample to 24kHz for speaker encoder.
@@ -715,7 +933,13 @@ class Qwen3TTSPromptEmbedsBuilder:
             fmin=0,
             fmax=12000,
         ).transpose(1, 2)
-        spk = self._speaker_encoder(mels.to(device=dev, dtype=dtype))[0]
+        encoder = self._speaker_encoder
+        if exact_fp32:
+            if self._speaker_encoder_call is None:
+                self._speaker_encoder_call = CompiledReferenceEncoder(self._speaker_encoder, "speaker encoder")
+            encoder = self._speaker_encoder_call
+        with exact_fp32_reference_encode() if exact_fp32 else nullcontext():
+            spk = encoder(mels.to(device=dev, dtype=enc_dtype))[0]
         return spk.to(dtype=dtype)
 
     def encode_ref_audio_batch(
@@ -973,9 +1197,9 @@ class Qwen3TTSPromptEmbedsBuilder:
             return {}
         full_ids = [ids for _info, _req_id, ids in items]
         text_ids = [ids[3:-5] for ids in full_ids]
-        packed = to_device_nonblocking(torch.from_numpy(np.concatenate(full_ids + text_ids)), self._device())
         num_full = sum(ids.size for ids in full_ids)
-        projected = self._text_projection(self._text_embedding(packed[num_full:].view(1, -1)))
+        packed = to_device_nonblocking(torch.from_numpy(np.concatenate(full_ids + text_ids)), self._device())
+        projected = self._project_text_ids(packed[num_full:].view(1, -1))
         embeds: dict[str, torch.Tensor] = {}
         full_offset = text_offset = 0
         for (info_dict, req_id, ids), text in zip(items, text_ids, strict=True):
@@ -998,7 +1222,7 @@ class Qwen3TTSPromptEmbedsBuilder:
         non_streaming_mode: bool,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Port of the official ``Qwen3TTSForConditionalGeneration.generate_icl_prompt``."""
-        text_embed = self._text_projection(self._text_embedding(torch.cat([ref_id, text_id], dim=-1)))
+        text_embed = self._project_text_ids(torch.cat([ref_id, text_id], dim=-1))
         text_embed = torch.cat([text_embed, tts_eos_embed], dim=1)
 
         # codec embed (codec bos + codec) 1 T2 D
@@ -1077,6 +1301,10 @@ class Qwen3TTSPromptEmbedsBuilder:
         text = (info_dict.get("text") or [""])[0]
         language = (info_dict.get("language") or ["Auto"])[0]
         non_streaming_mode = self._non_streaming_mode(info_dict, task_type)
+        if task_type == "CustomVoice" and non_streaming_mode:
+            fast = self._cached_custom_voice_prompt(info_dict, text, language)
+            if fast is not None:
+                return fast
 
         # Text ids for assistant template (always).
         tok = self.get_text_tokenizer()
@@ -1137,10 +1365,8 @@ class Qwen3TTSPromptEmbedsBuilder:
                 ]
             ]
 
-        codec_input_0 = codec_embed(self._long_tensor(codec_prefill_list[0], input_ids.device))
-        codec_input_1 = codec_embed(
-            self._long_tensor([talker_config.codec_pad_id, talker_config.codec_bos_id], input_ids.device)
-        )
+        codec_input_0 = self._codec_embeds(codec_prefill_list[0], input_ids.device)
+        codec_input_1 = self._codec_embeds([talker_config.codec_pad_id, talker_config.codec_bos_id], input_ids.device)
 
         # Speaker embedding/token (task-dependent)
         speaker_embed: torch.Tensor | None = None
@@ -1502,20 +1728,24 @@ class Qwen3TTSPromptEmbedsBuilder:
                 codec_prefix = torch.cat((tts_pad_embed.expand(-1, codec_input.shape[1] - 2, -1), tts_bos_embed), dim=1)
                 codec_prefix = codec_prefix + codec_input[:, :-1]
                 prefix = torch.cat((role_embed, codec_prefix), dim=1)
-                pad_row = codec_embed(self._long_tensor([talker_config.codec_pad_id], input_ids.device)).view(1, 1, -1)
-                tail = tts_pad_embed + codec_embed(self._long_tensor([talker_config.codec_bos_id], input_ids.device))
+                pad_row = self._codec_embeds([talker_config.codec_pad_id], input_ids.device).view(1, 1, -1)
+                tail = tts_pad_embed + self._codec_embeds([talker_config.codec_bos_id], input_ids.device)
+                eos_row = tts_eos_embed + pad_row
                 if cache_key is not None:
-                    cv_cache[cache_key] = (prefix, pad_row, tail)
+                    cv_cache[cache_key] = (prefix, pad_row, tail, eos_row)
             else:
-                prefix, pad_row, tail = cached
+                prefix, pad_row, tail, eos_row = cached
+            if cache_key is not None:
+                # Later requests of this speaker/language resolve straight to the cached rows.
+                self.__dict__.setdefault("_cv_fast_keys", {})[(self._speaker_field(info_dict), language)] = cache_key
             talker_prompt = prefix
 
             if non_streaming_mode:
                 text_all = self._batched_text_embeds.pop(str(info_dict.get("req_id")), None)
                 if text_all is None:
                     text_all = text_projection(text_embedding(input_ids[:, 3:-5]))
-                text_all = torch.cat([text_all, tts_eos_embed], dim=1)
-                talker_prompt = torch.cat([talker_prompt, text_all + pad_row, tail], dim=1)
+                # (text + eos) + pad row, with the constant eos row added once per speaker.
+                talker_prompt = torch.cat([talker_prompt, text_all + pad_row, eos_row, tail], dim=1)
                 trailing_text_hidden = tts_pad_embed
             else:
                 first_text = text_projection(text_embedding(input_ids[:, 3:4])) + codec_input[:, -1:]

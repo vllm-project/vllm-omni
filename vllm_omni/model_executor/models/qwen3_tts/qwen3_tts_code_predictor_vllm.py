@@ -108,7 +108,7 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(CodePredictorWrapp
             self._fused = FusedCodePredictor(self, max_batch)
             # Compile every kernel variant outside any graph capture.
             hidden = int(self.talker_config.hidden_size)
-            for batch in range(1, min(2, max_batch) + 1):
+            for batch in self._fused.warmup_batches():
                 zeros = torch.zeros(batch, 1, hidden, device=weight.device, dtype=weight.dtype)
                 uniforms = torch.full(
                     (batch, self._num_groups - 1, int(self.config.vocab_size)), 0.5, device=weight.device

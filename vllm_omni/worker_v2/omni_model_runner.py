@@ -35,6 +35,7 @@ from vllm_omni.core.sched.omni_scheduling_coordinator import (
 )
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.worker.sampling_utils import sanitize_sampling_params_min_tokens_stop_ids
+from vllm_omni.worker_v2 import staged_writes
 from vllm_omni.worker_v2.model_states import init_omni_model_state
 from vllm_omni.worker_v2.model_states.intermediate_buffer import (
     _resolve_additional_information,
@@ -187,6 +188,8 @@ class OmniGPUModelRunner(GPUModelRunner):
         return input_ids, inputs_embeds, ec_connector_output
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
+        # Before the runner builds its staged-write state tensors.
+        staged_writes.install()
         super().__init__(*args, **kwargs)
         self._validate_parallel_support()
         self._omni_data_plane = (
@@ -234,7 +237,10 @@ class OmniGPUModelRunner(GPUModelRunner):
                         sampling_params,
                         logits_vocab,
                     )
-        super().add_requests(scheduler_output)
+        # The request, model and sampler states each apply their staged
+        # writes here; land them with one launch instead of one per tensor.
+        with staged_writes.deferred_writes():
+            super().add_requests(scheduler_output)
 
     def shutdown(self) -> None:
         sender = getattr(getattr(self, "model_state", None), "_first_audio_sender", None)

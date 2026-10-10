@@ -27,15 +27,16 @@ def test_stream_priming_graph_workspace_respects_token_budget(monkeypatch, capac
 
     captures = []
 
-    def capture(stream, sizes, frames=1):
+    def capture(stream, sizes, frames=1, pool=None):
         captures.append((sizes, frames))
-        return SimpleNamespace(sizes=sizes, frames=frames)
+        return SimpleNamespace(sizes=sizes, frames=frames, pool=pool)
 
     monkeypatch.setattr(streaming_decoder, "StreamingDecodeGraphs", capture)
     model = SimpleNamespace(
         stream_decoder=SimpleNamespace(max_frames=33),
         stream_graphs=None,
         stream_prime_graphs=None,
+        stream_prime_pieces={},
         stream_ref_context_frames=25,
         stream_chunk_frames=25,
         config=SimpleNamespace(tts_model_type=model_type),
@@ -45,7 +46,9 @@ def test_stream_priming_graph_workspace_respects_token_budget(monkeypatch, capac
     Qwen3TTSTalkerForConditionalGeneration.capture_stream_decode_graphs(model, sizes)
     expected = [(sizes, 1)]
     if model_type == "base":
-        expected.append(([size for size in sizes if size * 25 <= 512], 25))
+        # The priming chunk plus the power-of-two pieces of a shorter tail.
+        for frames in (25, 16, 8, 4, 2):
+            expected.append((sorted({1, *(size for size in sizes if size * frames <= 512)}), frames))
     assert captures == expected
     Qwen3TTSTalkerForConditionalGeneration.capture_stream_decode_graphs(model, sizes)
     assert captures == expected
@@ -201,7 +204,7 @@ def test_stream_decoder_preemption_restores_all_state_into_a_different_slot():
 
 
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
-@pytest.mark.parametrize("use_graph", [False, True])
+@pytest.mark.parametrize("use_graph", [False, True, "pieces"])
 @torch.inference_mode()
 def test_batched_reference_priming_matches_serial_decoder_continuation(use_graph):
     from tests.model_executor.models.qwen3_tts.test_time_major_decoder import _make_decoder
@@ -223,6 +226,13 @@ def test_batched_reference_priming_matches_serial_decoder_continuation(use_graph
     model.stream_decoder = stream
     model.stream_prime_graphs = graphs
     model.stream_chunk_frames = 25
+    model.stream_prime_pieces = {}
+    if use_graph == "pieces":
+        # Tails of 3 and 51 frames replay 2 + 1 and 25 + 25 + 1 frame graphs.
+        model.stream_prime_pieces = {
+            f: StreamingDecodeGraphs(stream, [2], frames=f, pool=graphs.pool) for f in (16, 8, 4, 2)
+        }
+        model.stream_graphs = StreamingDecodeGraphs(stream, [2])
     refs = [torch.randint(0, 32, (length, 2), device=DEVICE) for length in [25, 3, 51, 25]]
     slots = [2, 0, 3, 4]
     frame = torch.randint(0, 32, (4, 1, 2), device=DEVICE)

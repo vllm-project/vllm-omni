@@ -38,7 +38,8 @@ def test_col2im_partial_tiles_and_reordered_slot_state(batch: int, frames: int, 
     actual = torch.empty_like(expected, device="cuda")
     width = min(128, triton.next_power_of_2(channels))
     rows = batch * frames
-    _col2im_kernel[(rows, rate, triton.cdiv(channels, width))](
+    block_rows = 2  # several rows per program, crossing request boundaries
+    _col2im_kernel[(triton.cdiv(rows, block_rows), rate, triton.cdiv(channels, width))](
         z_gpu,
         bias_gpu,
         state_gpu,
@@ -48,8 +49,10 @@ def test_col2im_partial_tiles_and_reordered_slot_state(batch: int, frames: int, 
         actual,
         frames,
         capacity,
+        rows,
         R=rate,
         C=channels,
+        BR=block_rows,
         BC=width,
         num_warps=4,
     )

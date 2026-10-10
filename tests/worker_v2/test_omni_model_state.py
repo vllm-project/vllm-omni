@@ -3,6 +3,7 @@
 """OmniModelState: mixed-batch reorder, state isolation/slot reuse, MTP
 graph/eager paths with per-request seed independence, async snapshot ownership."""
 
+from collections import namedtuple
 from contextlib import nullcontext
 from dataclasses import replace
 from types import SimpleNamespace
@@ -11,12 +12,14 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pytest
 import torch
+from vllm.config.compilation import CUDAGraphMode
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.mm.encoder_runner import EncoderRunner
 from vllm.v1.worker.gpu.model_states.default import DefaultModelState
 from vllm.v1.worker.gpu.states import RequestState
 
 from vllm_omni.model_executor.models.output_templates import OmniOutput, OwnedBatchTensor
+from vllm_omni.utils.device_copy import DeviceStager
 from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState, _make_safe_get_rope
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -64,6 +67,8 @@ def _make_state(max_num_reqs=4, has_preprocess=False, has_postprocess=False, hav
     model.mtp_sampling_params = {}
     model.get_mtp_seed = lambda params: (getattr(params, "extra_args", None) or {}).get("test_seed")
     model.preprocess_batch_mrv2 = None
+    model.preprocess_prefill_rows_mrv2 = None
+    model.preprocess_prefill_updates_owned = False
     model.preprocess_decode_batch_mrv2 = None
     model.preprocess_decode_batch = None
     model.postprocess_batch_mrv2 = None
@@ -83,6 +88,9 @@ def _make_state(max_num_reqs=4, has_preprocess=False, has_postprocess=False, hav
     state._eager_state = EagerMTPState(state)
     state._stream_pos = {}
     state._mtp_generators = {}
+    state._mtp_seeded = set()
+    state._mtp_replays = {}
+    state._stage_offsets = DeviceStager()
     state._mtp_runner = None
     for name in ("_mtp_input_ids", "_mtp_input_embeds", "_mtp_hidden", "_mtp_text_step", "_mtp_offsets"):
         setattr(state, name, None)
@@ -422,6 +430,56 @@ def test_run_batched_mtp_uses_dispatched_graph_descriptor():
     assert torch.equal(state.intermediate_buffer.buffers[1]["codes"]["audio"], torch.tensor([[3, 4, 5]]))
 
 
+def test_steady_unseeded_mtp_replays_the_resolved_graph_entry():
+    state = _make_state(max_num_reqs=4)
+    _init_static(state, 4)
+    _fill_buffers(state, "r0", "r1")
+    state._mtp_sample_uniforms = torch.zeros(4, 2, 5)
+    state._mtp_generators = {"r0": None, "r1": None, "r2": torch.Generator().manual_seed(3)}
+    state._mtp_seeded = {"r2"}
+    descriptor = namedtuple("descriptor", "cg_mode num_tokens")
+    graph_desc = descriptor(CUDAGraphMode.FULL, 4)  # hashable, as vLLM's
+    output = (torch.ones(4, 3), torch.arange(8).reshape(4, 2))
+    entry = SimpleNamespace(cudagraph=MagicMock(), output=output)
+
+    class _FakeGraphRunner:
+        is_debugging_mode = False
+
+        def __init__(self):
+            self.concrete_cudagraph_entries = {graph_desc: entry}
+            self.calls = 0
+
+        def __call__(self, *args, **kwargs):
+            self.calls += 1
+            entry.cudagraph.replay()
+            return entry.output
+
+    runner = state._mtp_runner = _FakeGraphRunner()
+    inputs = (state._mtp_input_ids[:2], state._mtp_input_embeds[:2], state._mtp_hidden[:2], state._mtp_text_step[:2])
+    with patch(
+        "vllm_omni.worker_v2.model_states.omni_model_state.current_omni_platform.get_graph_wrapper_cls",
+        return_value=_FakeGraphRunner,
+    ):
+        emb, codes = state._mtp_forward([0, 1], *inputs, lambda bsz: graph_desc, req_ids=["r0", "r1"])
+        assert emb is output[0] and codes is output[1]
+        assert runner.calls == 1 and state._mtp_replays == {2: (4, entry)}
+        state._mtp_sample_uniforms.zero_()
+        # Same size, unseeded rows: the entry replays without the wrapper; the
+        # padded rows draw fresh noise as the wrapper path does.
+        assert state._mtp_forward([0, 1], *inputs, lambda bsz: graph_desc, req_ids=["r0", "r1"]) is output
+        assert runner.calls == 1 and entry.cudagraph.replay.call_count == 2
+        assert (state._mtp_sample_uniforms > 0).all()
+        # A row new this step resolves its generator in place and keeps the replay.
+        _fill_buffers(state, "r0", "r3")
+        state._mtp_forward([0, 1], *inputs, lambda bsz: graph_desc, req_ids=["r0", "r3"])
+        assert runner.calls == 1 and state._mtp_generators["r3"] is None
+        # A seeded row takes the wrapper path again.
+        _fill_buffers(state, "r0", "r2")
+        state._mtp_sample_uniforms = torch.zeros(4, 2, 5)
+        state._mtp_forward([0, 1], *inputs, lambda bsz: graph_desc, req_ids=["r0", "r2"])
+        assert runner.calls == 2
+
+
 def test_rope_shim_propagates_type_error():
     # vLLM rope API drift (TypeError) must not be swallowed by the shim.
     def broken_get_rope(*_args, **_kwargs):
@@ -455,7 +513,7 @@ def test_rope_shim_constructs_sequential_mrope_state():
     assert isinstance(rope, RopeState)
     assert rope.get_positions(4).shape == (3, 4)
     positions, delta = model.get_mrope_input_positions([11, 22, 33, 44], [])
-    torch.testing.assert_close(positions, torch.arange(4).expand(3, -1))
+    torch.testing.assert_close(torch.as_tensor(np.asarray(positions)).long(), torch.arange(4).expand(3, -1))
     assert delta == 0
     rope.init_prefill_positions(1, model, [11, 22, 33, 44], [])
     assert rope.prefill_delta.np[1] == 0
@@ -634,6 +692,44 @@ def test_run_preprocess_records_rows_that_keep_a_sample(has_stream_decoder):
     assert entries == [(1, 1, "final", True), (2, 2, "decode", False)]
     assert model_inputs["inputs_embeds"][6].tolist() == [5.0] * _EAGER_DIM
     assert state.model.mtp_calls == []
+
+
+def test_prefill_rows_written_for_the_batch_skip_per_request_preprocess():
+    state = _make_eager_state()
+    _fill_buffers(state, "batched", "serial", "decode")
+    state._eager_ready = {2: "decode"}
+    state._eager_embeds[2] = 4.0
+    seen_rows: list[list[tuple[int, int, str]]] = []
+    preprocessed: list[str] = []
+
+    def preprocess_prefill_rows_mrv2(*, entries, input_ids, input_embeds):
+        seen_rows.append([(start, n_tok, info["req_id"]) for start, n_tok, info in entries])
+        start, n_tok, _info = entries[0]
+        input_embeds[start : start + n_tok] = 9.0
+        return [{"meta": {"talker_prefill_offset": n_tok}}, None]
+
+    state.model.preprocess_prefill_rows_mrv2 = preprocess_prefill_rows_mrv2
+
+    def preprocess(input_ids, input_embeds, **info):
+        preprocessed.append(info["req_id"])
+        updates = {"mtp_inputs": (torch.zeros(_EAGER_DIM), torch.ones(_EAGER_DIM))} if input_ids.shape[0] == 1 else {}
+        return input_ids, input_embeds, updates
+
+    state.model.preprocess = preprocess
+    batch = _EagerBatch([3, 2, 1])
+    model_inputs = {"input_ids": torch.zeros(6, dtype=torch.long), "inputs_embeds": torch.zeros((6, _EAGER_DIM))}
+    req_states = SimpleNamespace(
+        prompt_len=np.array([3, 4, 10], dtype=np.int32),
+        num_computed_tokens=np.array([0, 0, 10], dtype=np.int32),
+    )
+    state.run_preprocess(batch, model_inputs, req_states)
+
+    assert seen_rows == [[(0, 3, "batched"), (3, 2, "serial")]]
+    assert preprocessed == ["serial", "decode"]
+    assert model_inputs["inputs_embeds"][:3].eq(9.0).all()
+    assert state.intermediate_buffer.buffers[0]["meta"] == {"talker_prefill_offset": 3}
+    # The batch-written row still keeps its sample (its prompt ends in this chunk).
+    assert [entry[2] for entry in state._eager_rows[1]] == ["batched", "decode"]
 
 
 @pytest.mark.parametrize("first_was_valid", [False, True])

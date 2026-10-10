@@ -65,6 +65,7 @@ def _post_kernel(
     valid_ptr,  # [n] bool out
     fa_ptr,  # [T] first_audio output or dummy
     fa_valid_ptr,  # [R] bool or dummy
+    codes32_ptr,  # [n, Q] int32 copy of the codes for the codec, or dummy
     vocab,
     H: tl.constexpr,
     Q: tl.constexpr,
@@ -72,6 +73,7 @@ def _post_kernel(
     BH: tl.constexpr,
     WRITE_FA: tl.constexpr,
     HAS_FA_VALID: tl.constexpr,
+    CODES32: tl.constexpr,
 ):
     b = tl.program_id(0)
     req = tl.load(meta_ptr + n + b)
@@ -87,6 +89,8 @@ def _post_kernel(
     qm = q < Q
     cv = tl.load(codes_ptr + b * Q + q, mask=qm)
     tl.store(codes_out_ptr + last * Q + q, cv.to(codes_out_ptr.dtype.element_ty), mask=qm)
+    if CODES32:
+        tl.store(codes32_ptr + b * Q + q, cv.to(tl.int32), mask=qm)
     inp = tl.load(input_ids_ptr + last).to(tl.int64)
     in_valid = ((inp >= 0) & (inp < vocab)) | prefill
     valid = (l0 >= 0) & (l0 < vocab) & in_valid
@@ -112,15 +116,73 @@ def eager_pre(meta, n, qsl, sampled, hidden, emb_w, ids, emb, mtp_hidden, step):
     return last, layer0
 
 
-def eager_post(meta, n, last, layer0, frames, eager, codes, codes_out, input_ids, valid_out, fa, fa_valid, vocab):
+def eager_post(
+    meta, n, last, layer0, frames, eager, codes, codes_out, input_ids, valid_out, fa, fa_valid, vocab, codes32=None
+):
     valid = torch.empty(n, dtype=torch.bool, device=last.device)
     H = eager.shape[-1]
     Q = codes_out.shape[-1]
     dummy = valid
     _post_kernel[(n,)](
         meta, n, last, layer0, frames, eager, codes, codes_out, input_ids, valid_out, valid,
-        fa if fa is not None else dummy, fa_valid if fa_valid is not None else dummy, int(vocab),
+        fa if fa is not None else dummy, fa_valid if fa_valid is not None else dummy,
+        codes32 if codes32 is not None else dummy, int(vocab),
         H=H, Q=Q, QP=triton.next_power_of_2(Q), BH=min(1024, triton.next_power_of_2(H)),
-        WRITE_FA=fa is not None, HAS_FA_VALID=fa_valid is not None,
+        WRITE_FA=fa is not None, HAS_FA_VALID=fa_valid is not None, CODES32=codes32 is not None,
     )  # fmt: skip
     return valid
+
+
+@triton.jit
+def _settled_kernel(
+    meta_ptr,  # int64 [2, n]: request slot, token row
+    n,
+    eager_ptr,  # [R, H] eager-frame embeddings
+    step_ptr,  # [H] constant text step
+    embeds_ptr,  # [T, H]
+    H: tl.constexpr,
+    BH: tl.constexpr,
+):
+    b = tl.program_id(0)
+    slot = tl.load(meta_ptr + b)
+    row = tl.load(meta_ptr + n + b)
+    for h0 in tl.static_range(0, H, BH):
+        c = h0 + tl.arange(0, BH)
+        m = c < H
+        frame = tl.load(eager_ptr + slot * H + c, mask=m).to(tl.float32)
+        step = tl.load(step_ptr + c, mask=m).to(eager_ptr.dtype.element_ty).to(tl.float32)
+        value = (frame + step).to(eager_ptr.dtype.element_ty)
+        tl.store(embeds_ptr + row * H + c, value.to(embeds_ptr.dtype.element_ty), mask=m)
+
+
+@triton.jit
+def _record_kernel(
+    index_ptr,  # int64 [3, n]: request slot, position, token row
+    n,
+    embeds_ptr,  # [T, H]
+    slab_ptr,  # [R, L, H]
+    slab_stride,
+    H: tl.constexpr,
+    BH: tl.constexpr,
+):
+    b = tl.program_id(0)
+    slot = tl.load(index_ptr + b)
+    pos = tl.load(index_ptr + n + b)
+    row = tl.load(index_ptr + 2 * n + b)
+    for h0 in tl.static_range(0, H, BH):
+        c = h0 + tl.arange(0, BH)
+        m = c < H
+        value = tl.load(embeds_ptr + row * H + c, mask=m)
+        tl.store(slab_ptr + slot * slab_stride + pos * H + c, value.to(slab_ptr.dtype.element_ty), mask=m)
+
+
+def settled_frames(meta: torch.Tensor, n: int, eager: torch.Tensor, step: torch.Tensor, embeds: torch.Tensor) -> None:
+    """``embeds[row] = eager[slot] + step`` for each (slot, row) column of ``meta``, rounded like the torch ops."""
+    H = eager.shape[-1]
+    _settled_kernel[(n,)](meta, n, eager, step, embeds, H=H, BH=min(1024, triton.next_power_of_2(H)))
+
+
+def record_rows(index: torch.Tensor, n: int, embeds: torch.Tensor, slab: torch.Tensor) -> None:
+    """``slab[slot, pos] = embeds[row]`` for each (slot, pos, row) column of ``index``."""
+    H = embeds.shape[-1]
+    _record_kernel[(n,)](index, n, embeds, slab, slab.stride(0), H=H, BH=min(1024, triton.next_power_of_2(H)))

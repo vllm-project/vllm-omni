@@ -30,9 +30,13 @@ stages:
       code_predictor_kv_cache: true
       code_predictor_fused_sampling: true
       code_predictor_fused: true
-    # Talker decode contexts are short (~100-700 tokens): FA3 split-KV plus
-    # its combine kernel costs more than one pass per head.
+    # Talker decode contexts are short (~100-700 tokens). The Triton
+    # unified-attention kernel reads them near memory bandwidth (~20 us per
+    # layer at 128 requests on H200, about half of FA3's). If FA3 is selected
+    # instead, keep one split: split-KV plus its combine kernel costs more than
+    # one pass per head at these lengths.
     attention_config:
+      backend: TRITON_ATTN
       flash_attn_max_num_splits_for_cuda_graph: 1
     async_scheduling: true
     max_num_batched_tokens: 512
