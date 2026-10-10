@@ -3,11 +3,14 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Mapping
 from dataclasses import dataclass, fields, is_dataclass
 from pathlib import Path
 from typing import Any
 
+import huggingface_hub
+from huggingface_hub.errors import HFValidationError, LocalEntryNotFoundError
 from vllm.logger import init_logger
 
 from vllm_omni.config.composable_parallel.strategy_loader import load_strategy_specs
@@ -17,9 +20,12 @@ from vllm_omni.config.omni_config import VllmOmniConfig
 from vllm_omni.config.stage_config import PipelineConfig
 from vllm_omni.diffusion.data import resolve_model_class_name
 from vllm_omni.diffusion.registry import DiffusionModelRegistry, resolve_native_single_file
-from vllm_omni.diffusion.utils.hf_utils import is_diffusion_model
+from vllm_omni.diffusion.utils.hf_utils import DIFFUSION_MODEL_INDEX_FILES, is_diffusion_model
 
 logger = init_logger(__name__)
+
+# Files that model-type resolution reads from a Hub model ID.
+_HF_CACHE_PROBE_FILES = (*DIFFUSION_MODEL_INDEX_FILES, "config.json")
 
 
 @dataclass(frozen=True)
@@ -193,6 +199,51 @@ def _resolve_generic_diffusion_model_class(
     return supported, str(model_class_name) if model_class_name else None
 
 
+def _is_partial_download(snapshot: Path) -> bool:
+    """Return True if a cached snapshot shows signs of an interrupted download."""
+    # A Diffusers pipeline ships model_index.json next to its component folders, and an
+    # interrupted transfer leaves a ``<etag>.incomplete`` blob behind.
+    return (snapshot / "scheduler" / "scheduler_config.json").is_file() or any(
+        (snapshot.parent.parent / "blobs").glob("*.incomplete")
+    )
+
+
+def _offline_cache_miss_hint(model: str, revision: str | None) -> str | None:
+    """Explain an unresolved Hub model ID whose config files are not cached in offline mode.
+
+    With ``HF_HUB_OFFLINE`` set, resolution can only read the local cache, so a model that
+    was never downloaded, or only partly downloaded, would otherwise look unsupported.
+    """
+    if not huggingface_hub.constants.HF_HUB_OFFLINE or os.path.exists(model):
+        return None
+    try:
+        if any(
+            isinstance(huggingface_hub.try_to_load_from_cache(model, name, revision=revision), str)
+            for name in _HF_CACHE_PROBE_FILES
+        ):
+            return None
+        # Cache lookup only: local_files_only never touches the network.
+        snapshot = Path(huggingface_hub.snapshot_download(model, revision=revision, local_files_only=True))
+    except HFValidationError:
+        # Not a Hub model ID (e.g. a mistyped local path): nothing cache-related to explain.
+        return None
+    except LocalEntryNotFoundError:
+        snapshot = None
+
+    offline = "Hugging Face offline mode (HF_HUB_OFFLINE) is enabled and"
+    fix = f"download it with network access (e.g. `hf download {model}`) or unset HF_HUB_OFFLINE"
+    missing = f"none of {', '.join(_HF_CACHE_PROBE_FILES)}"
+    if snapshot is None:
+        return f"{offline} this model is not in the local cache ({huggingface_hub.constants.HF_HUB_CACHE}); {fix}."
+    if _is_partial_download(snapshot):
+        return f"{offline} the cached copy of this model ({snapshot}) is incomplete: it has {missing}; {fix}."
+    # A complete download of a repository that ships none of these files looks the same.
+    return (
+        f"{offline} the cached copy of this model ({snapshot}) has {missing}. If its download was "
+        f"interrupted, {fix}; otherwise the repository has no pipeline or model config that vLLM-Omni can resolve."
+    )
+
+
 def resolve_omni_config(
     model: str,
     *,
@@ -229,9 +280,9 @@ def resolve_omni_config(
     _apply_generic_stage_overrides(normalized_overrides, stage_overrides)
     supported, model_class_name = _resolve_generic_diffusion_model_class(model, normalized_overrides)
     if not supported:
-        raise ValueError(
-            f"Model {model!r} did not resolve to a registered Omni pipeline or a supported diffusion model."
-        )
+        message = f"Model {model!r} did not resolve to a registered Omni pipeline or a supported diffusion model."
+        hint = _offline_cache_miss_hint(model, normalized_overrides.get("revision"))
+        raise ValueError(f"{message} {hint}" if hint else message)
     if model_class_name is not None:
         normalized_overrides.setdefault("model_class_name", model_class_name)
     default_config = StageConfigFactory.create_typed_default_diffusion(model, normalized_overrides)
