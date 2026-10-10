@@ -7,6 +7,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+import numpy as np
 import regex as re
 from vllm.inputs import tokens_input
 from vllm.logger import init_logger
@@ -32,6 +33,17 @@ _REF_AUDIO_CACHE_KEY = "_qwen3_tts_ref_audio_cache_key"
 QWEN3_TTS_EFFECTIVE_MAX_TOKENS_KEY = "_qwen3_tts_effective_max_tokens"
 _MIN_CODEC_FRAMES = 192
 _MAX_CODEC_FRAMES_PER_TEXT_TOKEN = 12
+
+
+def _ref_audio_wire_waveform(waveform: np.ndarray) -> dict[str, Any]:
+    """Encode a float32 waveform as raw bytes for the engine request.
+
+    A Python float list costs one msgpack value and one decoded object per
+    sample; ``Qwen3TTSPromptEmbedsBuilder.normalize_ref_audio`` reads this
+    ``__ndarray__`` form directly.
+    """
+    wav = np.ascontiguousarray(waveform, dtype=np.float32).reshape(-1)
+    return {"__ndarray__": True, "data": wav.tobytes(), "dtype": "float32", "shape": [int(wav.size)]}
 
 
 class Qwen3TTSCodecLimitError(TTSGenerationError):
@@ -455,22 +467,10 @@ class Qwen3TTSAdapter(ARTTSAdapter):
             logger.warning("Failed to estimate TTS prompt length, using fallback 2048: %s", e)
             return 2048
 
-    def _qwen3_tts_can_use_ref_audio_artifact_only(self, tts_params: dict[str, Any], artifact_key: str | None) -> bool:
-        server = self.ctx.server
-        x_vector_only = server._tts_x_vector_only(tts_params)
-        if not artifact_key or (artifact_key, x_vector_only) not in server._ref_audio_model_artifact_ready:
-            return False
-        return (tts_params.get("task_type") or ["CustomVoice"])[0] == "Base"
-
     async def build(
         self, request: "OpenAICreateSpeechRequest", sampling_params_list: list, has_inline_ref_audio: bool
     ) -> PreparedRequest:
-        """Build prompt + tts_params for Qwen3-TTS.
-
-        Called from ``Qwen3TTSAdapter.build``. Returns
-        ``(prompt, tts_params, warmup_artifact_key)`` where the warmup key is the
-        Qwen3-TTS ref-audio artifact tracked after ``generate()``.
-        """
+        """Build prompt + tts_params for Qwen3-TTS."""
         server = self.ctx.server
         # Inline Base cloning derives its voice from ref_audio, not the
         # OpenAI-compatible voice label.
@@ -480,28 +480,28 @@ class Qwen3TTSAdapter(ARTTSAdapter):
                 request.voice,
             )
             request = request.model_copy(update={"voice": None})
-        qwen3_ref_audio_warmup_artifact_key: str | None = None
         tts_params = self._build_tts_params(request)
-        # Resolve ref_audio (explicit or auto-set for uploaded voices)
-        # to [[wav_list, sr]] so the model doesn't re-decode base64.
+        # Resolve ref_audio (explicit or auto-set for uploaded voices) to the
+        # decoded waveform so the model doesn't re-decode base64.
         ref_audio_source = request.ref_audio
         if ref_audio_source is None and isinstance(tts_params.get("ref_audio"), list):
             # Uploaded voice: ref_audio was auto-set as [base64_data_url]
             ref_audio_source = tts_params["ref_audio"][0]
         if ref_audio_source is not None and isinstance(ref_audio_source, str):
-            wav_list, sr, cache_key = await server._resolve_ref_audio(ref_audio_source)
+            waveform, sr, cache_key = await server._resolve_ref_audio_array(ref_audio_source)
             tts_params["ref_audio_cache_key"] = cache_key
             artifact_key = server._get_resolved_ref_audio_artifact_key(cache_key)
             if artifact_key:
                 tts_params[_REF_AUDIO_CACHE_KEY] = [artifact_key]
-            ref_code_length = self._estimate_ref_code_len([wav_list, sr])
+            ref_code_length = self._estimate_ref_code_len([waveform, sr])
             if ref_code_length is not None:
                 tts_params["ref_code_length"] = [int(ref_code_length)]
-            if self._qwen3_tts_can_use_ref_audio_artifact_only(tts_params, artifact_key):
-                logger.debug("Using Qwen3-TTS ref_audio artifact-only path: %s", artifact_key)
-            else:
-                tts_params["ref_audio"] = [[wav_list, sr]]
-                qwen3_ref_audio_warmup_artifact_key = artifact_key
+            # Always ship the waveform. The engine's per-ref-audio artifact
+            # cache is a bounded LRU per replica that evicts on its own, so
+            # this process cannot know whether the artifact is still resident.
+            # The artifact key lets a cache hit skip ref_code / speaker
+            # encoding; a miss recomputes from this payload instead of failing.
+            tts_params["ref_audio"] = [[_ref_audio_wire_waveform(waveform), sr]]
 
         ph_len = await self._estimate_prompt_len_async(tts_params)
         prompt = tokens_input(prompt_token_ids=[1] * ph_len)
@@ -511,7 +511,6 @@ class Qwen3TTSAdapter(ARTTSAdapter):
             prompt=prompt,
             tts_params=tts_params,
             model_type=tts_params.get("task_type", ["unknown"])[0],
-            warmup_artifact_key=qwen3_ref_audio_warmup_artifact_key,
         )
 
     def _get_expected_speaker_embedding_dim(self) -> int:
