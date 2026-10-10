@@ -11,7 +11,25 @@ from transformers import GPT2Config
 
 from vllm_omni.model_executor.models.moss_tts.modeling_moss_tts_local_depth import MossTTSLocalDepthTransformer
 
-pytestmark = [pytest.mark.core_model, pytest.mark.tts]
+pytestmark = [pytest.mark.core_model, pytest.mark.tts, pytest.mark.npu]
+
+
+def _npu_available() -> bool:
+    if not torch.npu.is_available():
+        return False
+    try:
+        import torch_npu  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+npu_only = pytest.mark.skipif(not _npu_available(), reason="NPU device or torch_npu not available.")
+
+
+@pytest.fixture(params=[torch.device("cpu"), pytest.param("npu", marks=npu_only)], ids=["cpu", "npu"])
+def device(request):
+    return torch.device(request.param)
 
 
 def _models(n_vq, device="cpu", dtype=torch.float32):
@@ -24,27 +42,27 @@ def _models(n_vq, device="cpu", dtype=torch.float32):
     return model, embeddings, heads, stop_head
 
 
-@pytest.mark.cpu
 @pytest.mark.parametrize("batch_size", [1, 4])
 @pytest.mark.parametrize("n_vq", [1, 12])
 @torch.inference_mode()
-def test_lookup_matches_every_prefix(batch_size, n_vq):
-    model, embeddings, heads, _ = _models(n_vq)
+def test_lookup_matches_every_prefix(device, batch_size, n_vq):
+    dtype = torch.bfloat16 if device.type != "cpu" else torch.float32
+    model, embeddings, heads, _ = _models(n_vq, device=device, dtype=dtype)
     original_keys = set(model.state_dict())
     model.prepare_qkv_lookup(embeddings, n_vq)
     assert set(model.state_dict()) == original_keys
     table_ptr = model._qkv_lookup.data_ptr()
     attn = model.h[0].attn
-    key = torch.full((batch_size, attn.n_head, n_vq, attn.head_dim), float("nan"))
+    key = torch.full((batch_size, attn.n_head, n_vq, attn.head_dim), float("nan"), device=device, dtype=dtype)
     value = torch.full_like(key, float("nan"))
     # Deliberately reuse dirty storage across frames. Future slots contain
     # old-frame values and must be excluded; position zero must be overwritten.
     for _ in range(3):
-        prefix = torch.randn(batch_size, n_vq, model.hidden_size)
+        prefix = torch.randn(batch_size, n_vq, model.hidden_size, device=device, dtype=dtype)
         qkv = attn.c_attn(model.h[0].ln_1(prefix[:, 0]))
         for position in range(n_vq):
             if position:
-                token = torch.randint(19, (batch_size,))
+                token = torch.randint(19, (batch_size,), device=device)
                 prefix[:, position] = embeddings[position - 1](token)
                 qkv = model._qkv_lookup[position - 1][token]
             actual = model._run_lookup_step(prefix[:, position], qkv, key, value, position)
@@ -54,17 +72,17 @@ def test_lookup_matches_every_prefix(batch_size, n_vq):
     assert model._qkv_lookup.data_ptr() == table_ptr
 
 
-@pytest.mark.cpu
 @torch.inference_mode()
-def test_generate_lookup_matches_reference_and_only_projects_backbone():
-    model, embeddings, heads, stop_head = _models(12)
+def test_generate_lookup_matches_reference_and_only_projects_backbone(device):
+    dtype = torch.bfloat16 if device.type != "cpu" else torch.float32
+    model, embeddings, heads, stop_head = _models(12, device=device, dtype=dtype)
     reference = copy.deepcopy(model)
     model.prepare_qkv_lookup(embeddings, 12)
     calls = []
     hook = model.h[0].attn.c_attn.register_forward_hook(lambda *args: calls.append(1))
     try:
         for batch_size in (4, 1, 3):
-            hidden = torch.randn(batch_size, 32)
+            hidden = torch.randn(batch_size, 32, device=device, dtype=dtype)
             kwargs = dict(n_vq=12, do_sample=False)
             actual = model.generate_frame(hidden, heads, embeddings, stop_head, **kwargs)
             expected = reference.generate_frame(hidden, heads, embeddings, stop_head, **kwargs)

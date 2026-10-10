@@ -183,6 +183,18 @@ steps:
             EXIT=$$?
             buildkite-agent artifact upload "tests/dfx/perf/results/*.json"
             exit $$EXIT
+
+      - label: ":full_moon: MOSS-TTS-Local-v1.5 · NPU E2E Test"
+        key: nightly-moss-tts-local-v15-e2e
+        timeout_in_minutes: 90
+        mirror_hardwares: a3_npu_2
+        env:
+          VLLM_WORKER_MULTIPROC_METHOD: spawn
+          VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
+          HF_TOKEN: "${HF_TOKEN}"
+        commands:
+          - pytest -s -v tests/e2e/offline_inference/test_moss_tts_v1_5_local.py -m 'full_model and npu and A3 and tts' --run-level 'full_model'
+
   - group: ":card_index_dividers: Diffusion X2I(&A&T) Model Test"
     key: nightly-diffusion-x2iat-group
     depends_on: upload-nightly-pipeline

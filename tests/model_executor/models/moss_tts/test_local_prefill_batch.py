@@ -12,7 +12,27 @@ from tests.model_executor.models.moss_tts.test_local_model_state import _batch, 
 from vllm_omni.model_executor.models.moss_tts.local_model_state import MossLocalModelState
 from vllm_omni.model_executor.models.moss_tts.modeling_moss_tts_talker import MossTTSLocalTalkerForGeneration
 
-pytestmark = pytest.mark.core_model
+pytestmark = [pytest.mark.core_model, pytest.mark.npu]
+
+
+def _npu_available() -> bool:
+    try:
+        import torch_npu  # noqa: F401
+    except ImportError:
+        return False
+    return bool(hasattr(torch, "npu") and torch.npu.is_available())
+
+
+npu_only = pytest.mark.skipif(not _npu_available(), reason="NPU device or torch_npu not available.")
+npu_device = pytest.param("npu", marks=npu_only)
+
+
+@pytest.fixture(
+    params=[pytest.param("cpu", marks=pytest.mark.cpu), npu_device],
+    ids=["cpu", "npu"],
+)
+def device(request):
+    return torch.device(request.param)
 
 
 @dataclass
@@ -21,19 +41,18 @@ class _PrefillPositions:
     num_computed_tokens: np.ndarray
 
 
-@pytest.mark.cpu
 @pytest.mark.parametrize("flat", [False, True])
-def test_prefill_reuses_text_embeddings_and_noncontiguous_reference_offsets(mocker, flat):
-    state = _state(MossLocalModelState, torch.device("cpu"))
+def test_prefill_reuses_text_embeddings_and_noncontiguous_reference_offsets(mocker, device, flat):
+    state = _state(MossLocalModelState, device)
     state._batch_prefill = True
-    codes = torch.tensor([[1, 2], [3, 4], [5, 6], [2, 3]])
+    codes = torch.tensor([[1, 2], [3, 4], [5, 6], [2, 3]], device=device)
     for slot, offset in [(3, 1), (0, 2)]:
         state.intermediate_buffer.buffers[slot] = {
             "req_id": str(slot),
             "codes": {"ref": codes.flatten() if flat else codes},
             "ref_offset": offset,
         }
-    batch = _batch(torch.device("cpu"), [3, 0], [2, 1])
+    batch = _batch(device, [3, 0], [2, 1])
     req = _PrefillPositions(prompt_len=np.full(5, 8), num_computed_tokens=np.zeros(5))
     req.num_computed_tokens[[3, 0]] = [1, 2]
     embeds = state._static_inputs_embeds[:3]
@@ -42,20 +61,23 @@ def test_prefill_reuses_text_embeddings_and_noncontiguous_reference_offsets(mock
     with torch.inference_mode():
         state.run_preprocess(batch, {"input_ids": batch.input_ids, "inputs_embeds": embeds}, req)
     torch.testing.assert_close(embeds, expected, rtol=0, atol=0)
-    assert embed.call_count == 1
+    if device.type == "cpu":
+        # The CPU/host-staging path embeds the whole text span in one call
+        # (``_apply_reference_batch``). Device-side references (NPU) take the
+        # canonical per-request prefill instead, which re-embeds each request.
+        assert embed.call_count == 1
     assert state.intermediate_buffer.buffers[3]["ref_offset"] == 3
     assert state.intermediate_buffer.buffers[0]["ref_offset"] == 3
 
 
-@pytest.mark.cpu
 @pytest.mark.parametrize("batch_prefill", [False, True])
 @pytest.mark.parametrize("cached,count", [(2, 1), (1, 2)])
-def test_cached_prefix_prefill_uses_absolute_reference_position(batch_prefill, cached, count):
-    state = _state(MossLocalModelState, torch.device("cpu"))
+def test_cached_prefix_prefill_uses_absolute_reference_position(device, batch_prefill, cached, count):
+    state = _state(MossLocalModelState, device)
     state._batch_prefill = batch_prefill
-    codes = torch.tensor([[1, 2], [3, 4], [5, 6], [2, 3]])
+    codes = torch.tensor([[1, 2], [3, 4], [5, 6], [2, 3]], device=device)
     state.intermediate_buffer.buffers[0] = {"req_id": "prefix-hit", "codes": {"ref": codes}}
-    batch = _batch(torch.device("cpu"), [0], [count])
+    batch = _batch(device, [0], [count])
     req = _PrefillPositions(prompt_len=np.full(5, 4), num_computed_tokens=np.full(5, cached))
     embeds = state._static_inputs_embeds[:count]
     expected = state.model.embed_input_ids(batch.input_ids) + state.model._audio_embed(codes[cached : cached + count])
@@ -65,11 +87,10 @@ def test_cached_prefix_prefill_uses_absolute_reference_position(batch_prefill, c
     assert state.intermediate_buffer.buffers[0]["ref_offset"] == cached + count
 
 
-@pytest.mark.cpu
-def test_scalar_prefill_uses_cached_prompt_position():
-    state = _state(MossLocalModelState, torch.device("cpu"))
-    codes = torch.tensor([[1, 2], [3, 4], [5, 6], [2, 3]])
-    ids = torch.tensor([2])
+def test_scalar_prefill_uses_cached_prompt_position(device):
+    state = _state(MossLocalModelState, device)
+    codes = torch.tensor([[1, 2], [3, 4], [5, 6], [2, 3]], device=device)
+    ids = torch.tensor([2], device=device)
     expected = state.model.embed_input_ids(ids) + state.model._audio_embed(codes[2:3])
     with torch.inference_mode():
         _, actual, updates = state.model.preprocess(
@@ -79,14 +100,13 @@ def test_scalar_prefill_uses_cached_prompt_position():
     assert updates["ref_offset"] == 3
 
 
-@pytest.mark.cpu
 @pytest.mark.parametrize("batch_prefill", [False, True])
 @pytest.mark.parametrize("omit_trailing_pad", [False, True])
-def test_prefill_chunk_crosses_reference_end(batch_prefill, omit_trailing_pad):
-    state = _state(MossLocalModelState, torch.device("cpu"))
+def test_prefill_chunk_crosses_reference_end(device, batch_prefill, omit_trailing_pad):
+    state = _state(MossLocalModelState, device)
     state._batch_prefill = batch_prefill
     # codes.ref uses prompt coordinates, including PAD rows for text tokens.
-    codes = torch.tensor([[8, 8], [1, 2], [3, 4], [5, 6], [8, 8], [8, 8]])
+    codes = torch.tensor([[8, 8], [1, 2], [3, 4], [5, 6], [8, 8], [8, 8]], device=device)
     if omit_trailing_pad:
         codes = codes[:4]
     state.model._audio_embed = lambda rows: rows[:, :1].masked_fill(rows[:, :1] == 8, 0).expand(-1, 4) / 8
@@ -96,12 +116,12 @@ def test_prefill_chunk_crosses_reference_end(batch_prefill, omit_trailing_pad):
     with torch.inference_mode():
         for start, count in [(0, 2), (2, 4)]:
             req.num_computed_tokens[0] = start
-            batch = _batch(torch.device("cpu"), [0], [count])
+            batch = _batch(device, [0], [count])
             embeds = state._static_inputs_embeds[:count]
             state.run_preprocess(batch, {"input_ids": batch.input_ids, "inputs_embeds": embeds}, req)
             outputs.append(embeds.clone())
-    expected = state.model.embed_input_ids(torch.full((6,), 2))
-    expected[1:4] += torch.tensor([1, 3, 5]).reshape(-1, 1) / 8
+    expected = state.model.embed_input_ids(torch.full((6,), 2, device=device))
+    expected[1:4] += torch.tensor([1, 3, 5], device=device).reshape(-1, 1) / 8
     torch.testing.assert_close(torch.cat(outputs), expected, rtol=0, atol=0)
     assert state.intermediate_buffer.buffers[0]["ref_offset"] == 6
 

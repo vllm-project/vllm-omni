@@ -13,10 +13,25 @@ from tests.model_executor.models.moss_tts.test_local_model_state import _admit, 
 from vllm_omni.model_executor.models.moss_tts.first_audio_state import MossEarlyFirstAudioState
 from vllm_omni.model_executor.models.moss_tts.local_model_state import MossLocalModelState
 
-pytestmark = pytest.mark.core_model
+pytestmark = [pytest.mark.core_model, pytest.mark.npu]
 
 
-@pytest.fixture(params=[pytest.param("cpu", marks=pytest.mark.cpu), pytest.param("cuda", marks=pytest.mark.cuda)])
+def _npu_available() -> bool:
+    try:
+        import torch_npu  # noqa: F401
+    except ImportError:
+        return False
+    return bool(hasattr(torch, "npu") and torch.npu.is_available())
+
+
+npu_only = pytest.mark.skipif(not _npu_available(), reason="NPU device or torch_npu not available.")
+npu_device = pytest.param("npu", marks=npu_only)
+
+
+@pytest.fixture(
+    params=[pytest.param("cpu", marks=pytest.mark.cpu), pytest.param("cuda", marks=pytest.mark.cuda), npu_device],
+    ids=["cpu", "cuda", "npu"],
+)
 def device(request):
     if request.param == "cuda" and not torch.cuda.is_available():
         pytest.skip("CUDA required")

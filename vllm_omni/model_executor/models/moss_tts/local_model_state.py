@@ -185,14 +185,15 @@ class MossLocalModelState(OmniModelState):
             return
         count = sum(codes.shape[0] for _, codes in references)
         capacity = max(count, self._static_inputs_embeds.shape[0])
+        is_accel = embeds.is_cuda or embeds.device.type == "npu"
         staging = None
         for item in self._prefill_staging:
             if item[0].shape[0] >= count and (item[2] is None or item[2].query()):
                 staging = item
                 break
         if staging is None:
-            host = torch.empty((capacity, self.model.n_vq + 1), dtype=torch.long, pin_memory=embeds.is_cuda)
-            device = torch.empty_like(host, device=embeds.device) if embeds.is_cuda else host
+            host = torch.empty((capacity, self.model.n_vq + 1), dtype=torch.long, pin_memory=is_accel)
+            device = torch.empty_like(host, device=embeds.device) if is_accel else host
             staging = [host, device, torch.cuda.Event() if embeds.is_cuda else None]
             if len(self._prefill_staging) < 3:
                 self._prefill_staging.append(staging)
@@ -203,9 +204,10 @@ class MossLocalModelState(OmniModelState):
             host[offset:end, 0].numpy()[:] = np.arange(start, start + codes.shape[0])
             host[offset:end, 1:].copy_(codes)
             offset = end
-        if embeds.is_cuda:
-            device[:count].copy_(host[:count], non_blocking=True)
-            event.record(torch.cuda.current_stream(embeds.device))
+        if is_accel:
+            device[:count].copy_(host[:count], non_blocking=embeds.is_cuda)
+            if embeds.is_cuda:
+                event.record(torch.cuda.current_stream(embeds.device))
         packed = device[:count]
         positions = packed[:, 0]
         audio = self.model._audio_embed(packed[:, 1:])

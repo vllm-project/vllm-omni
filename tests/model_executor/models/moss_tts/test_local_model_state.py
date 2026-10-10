@@ -18,10 +18,25 @@ from vllm_omni.worker_v2.model_states.eager_mtp import EagerMTPState
 from vllm_omni.worker_v2.model_states.intermediate_buffer import OmniIntermediateBuffer
 from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState
 
-pytestmark = pytest.mark.core_model
+pytestmark = [pytest.mark.core_model, pytest.mark.npu]
 
 
-@pytest.fixture(params=[pytest.param("cpu", marks=pytest.mark.cpu), pytest.param("cuda", marks=pytest.mark.cuda)])
+def _npu_available() -> bool:
+    try:
+        import torch_npu  # noqa: F401
+    except ImportError:
+        return False
+    return bool(hasattr(torch, "npu") and torch.npu.is_available())
+
+
+npu_only = pytest.mark.skipif(not _npu_available(), reason="NPU device or torch_npu not available.")
+npu_device = pytest.param("npu", marks=npu_only)
+
+
+@pytest.fixture(
+    params=[pytest.param("cpu", marks=pytest.mark.cpu), pytest.param("cuda", marks=pytest.mark.cuda), npu_device],
+    ids=["cpu", "cuda", "npu"],
+)
 def device(request):
     if request.param == "cuda" and not torch.cuda.is_available():
         pytest.skip("CUDA required")
@@ -31,7 +46,7 @@ def device(request):
 def _model(device):
     model = MossTTSLocalTalkerForGeneration.__new__(MossTTSLocalTalkerForGeneration)
     torch.nn.Module.__init__(model)
-    dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
+    dtype = torch.bfloat16 if device.type in ("cuda", "npu") else torch.float32
     model.model = torch.nn.Module()
     weight = torch.arange(32, dtype=dtype, device=device).reshape(8, 4) / 16
     model.model.embed_tokens = torch.nn.Embedding(8, 4, _weight=weight)
