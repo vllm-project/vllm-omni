@@ -20,10 +20,12 @@ from vllm_omni.config.omni_config import (
     normalize_and_validate_diffusion_engine_ingress_kwargs,
 )
 from vllm_omni.config.resolver import OmniConfigResolution
+from vllm_omni.engine.arg_utils import FRONTEND_ONLY_ID_FILTER
 from vllm_omni.engine.stage_engine_startup import StageReplicaResources
 from vllm_omni.engine.stage_runtime import StageEngineLaunch
 from vllm_omni.entrypoints.cli.serve import (
     OmniServeCommand,
+    _parse_stage_id,
     _parse_stage_overrides,
     run_headless,
 )
@@ -105,6 +107,46 @@ def _parse_serve_args(argv: list[str]) -> TrackingNamespace:
     subparsers = parser.add_subparsers(dest="subcommand")
     OmniServeCommand().subparser_init(subparsers)
     return parser.parse_args(argv)
+
+
+@pytest.mark.parametrize("value, expected", [("0", 0), ("none", FRONTEND_ONLY_ID_FILTER)])
+def test_parse_stage_id_valid_values(value: str, expected: int) -> None:
+    """Ensure --stage-id takes a non-negative int or an explicit 'none'."""
+    assert _parse_stage_id(value) == expected
+
+
+@pytest.mark.parametrize("value", ["-1", "abc"])
+def test_parse_stage_id_invalid_values(value: str) -> None:
+    """Ensure --stage-id rejects negatives and non-integers."""
+    with pytest.raises(argparse.ArgumentTypeError, match="non-negative integer or 'none'"):
+        _parse_stage_id(value)
+
+
+@pytest.mark.parametrize(
+    "extra_argv, match",
+    [
+        (["--headless"], "--stage-id none cannot be used with --headless"),
+        (["--omni-dp-size-local", "2"], "requires a numeric --stage-id"),
+    ],
+)
+def test_serve_validate_rejects_stage_id_none_combinations(extra_argv: list[str], match: str) -> None:
+    """Ensure --stage-id none is rejected where a local stage is required."""
+    args = _parse_serve_args(
+        [
+            "serve",
+            "fake-model",
+            "--omni",
+            "--stage-id",
+            "none",
+            "--omni-master-address",
+            "127.0.0.1",
+            "--omni-master-port",
+            "20000",
+            *extra_argv,
+        ]
+    )
+    with pytest.raises(ValueError, match=match):
+        OmniServeCommand().validate(args)
 
 
 def test_no_guardrails_is_only_forwarded_as_model_config(mocker: MockerFixture) -> None:

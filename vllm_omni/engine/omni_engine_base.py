@@ -13,7 +13,7 @@ import threading
 import time
 import uuid
 import weakref
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, cast
@@ -25,6 +25,7 @@ from vllm.logger import init_logger
 from vllm.v1.engine.input_processor import InputProcessor
 
 from vllm_omni.config.config_factory import StageConfigFactory, with_trust_remote_code_override
+from vllm_omni.config.omni_config import StageConfigType
 from vllm_omni.config.resolver import OmniConfigResolution, resolve_omni_config
 from vllm_omni.config.stage_config import (
     _DEPLOY_DIR,
@@ -37,6 +38,7 @@ from vllm_omni.diffusion.data import (
     parse_attention_config,
 )
 from vllm_omni.diffusion.io_support import get_diffusion_output_type
+from vllm_omni.engine.arg_utils import is_frontend_only
 from vllm_omni.engine.async_engine_utils import (
     SHUTDOWN_ENQUEUE_TIMEOUT_S,
     SHUTDOWN_JOIN_TIMEOUT_S,
@@ -160,23 +162,20 @@ class OmniEngineBase:
         self._enable_orch_monitor = bool(kwargs.pop("enable_orch_monitor", False))
         self._client_config = client_config
 
-        logger.info(f"[OmniEngine] Initializing with model {model}")
+        self._single_stage_id_filter: int | None = kwargs.get("stage_id")
 
+        logger.info(f"[OmniEngine] Initializing with model {model}")
         # ------------------------------------------------------------------ #
         # Single-stage mode detection                                        #
         # ------------------------------------------------------------------ #
         # Single-stage mode is enabled when the caller explicitly passes      #
         # single_stage_mode=True, or when a stage_id is provided in the args. #
-        _stage_id_kwarg = kwargs.get("stage_id")
-        if isinstance(_stage_id_kwarg, int) and not single_stage_mode:
+        if self._single_stage_id_filter is not None and not single_stage_mode:
             single_stage_mode = True
         if client_config is not None and int(client_config.get("client_count", 1)) > 1 and single_stage_mode:
             raise ValueError("Multiple API servers cannot be combined with single-stage distributed mode")
-
         self.single_stage_mode: bool = single_stage_mode
-        self._single_stage_id_filter: int | None = (
-            int(_stage_id_kwarg) if single_stage_mode and isinstance(_stage_id_kwarg, int) else None
-        )
+
         self._omni_master_address: str | None = kwargs.get("omni_master_address")
         self._omni_master_port: int | None = kwargs.get("omni_master_port")
 
@@ -266,6 +265,10 @@ class OmniEngineBase:
             kwargs,
             trust_remote_code=trust_remote_code,
         )
+
+        if self._single_stage_id_filter is not None:
+            self._validate_single_stage_choice(self._single_stage_id_filter, self.stage_configs)
+
         if self._config_resolution is None:
             # Same model, trust_remote_code and deploy path as the resolution
             # above, so reuse it rather than paying for the HF config again.
@@ -367,6 +370,17 @@ class OmniEngineBase:
                 supports_mixed_reference_inputs=metadata.supports_mixed_reference_inputs,
             )
         return self._diffusion_od_config_view
+
+    def _validate_single_stage_choice(self, stage_id: int, stage_configs: Sequence[StageConfigType]) -> None:
+        """Reject a `stage_id` that is not a stage of the resolved pipeline."""
+        if is_frontend_only(stage_id):
+            return
+        available = [stage_cfg.stage_id for stage_cfg in stage_configs]
+        if stage_id not in available:
+            raise ValueError(
+                f"No stage config found for stage_id={stage_id!r}. Available stage ids: {available}. "
+                "Use --stage-id none to launch no local stage."
+            )
 
     def _initialize_stages(self, stage_init_timeout: int) -> None:
         """Initialize stage clients/processors via StageRuntime and assign to self."""

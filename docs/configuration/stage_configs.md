@@ -274,6 +274,8 @@ The stage-based CLI paradigm facilitates the execution of discrete pipeline stag
 - **Worker Stages** operate without a distinct API server (i.e., using `--headless`), are assigned sequential `--stage-id` identifiers, and must reference the corresponding
   `--omni-master-address` and `--omni-master-port` parameters to successfully register with Stage 0.
 
+You may also explicitly pass `--stage-id none` to run only the API server and orchestrator if you want to run every stage as headless.
+
 For migrated architectures, the system automatically resolves and loads the bundled deployment YAML. Consequently, the primary execution path
 does **not** necessitate the explicit definition of `--deploy-config`:
 the example below uses `CUDA_VISIBLE_DEVICES=0` for Stage 0 and

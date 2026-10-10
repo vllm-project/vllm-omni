@@ -26,6 +26,7 @@ from vllm.entrypoints.serve.utils.api_utils import VLLM_SUBCMD_PARSER_EPILOG
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.registry import resolve_native_single_file
+from vllm_omni.engine.arg_utils import FRONTEND_ONLY_ID_FILTER, is_frontend_only
 from vllm_omni.entrypoints.cli.logo import log_logo
 from vllm_omni.entrypoints.openai.api_server import (
     omni_run_server,
@@ -70,6 +71,15 @@ def _parse_stage_overrides(value: str) -> dict[str, dict[str, Any]]:
     if parsed is None:
         raise argparse.ArgumentTypeError("--stage-overrides requires a JSON object")
     return parsed
+
+
+def _parse_stage_id(value: str) -> int:
+    """Parse `--stage-id` as a non-negative int, or `none` (no local stage) as `FRONTEND_ONLY_ID_FILTER`."""
+    if value == "none":
+        return FRONTEND_ONLY_ID_FILTER
+    if not (value.isascii() and value.isdigit()):
+        raise argparse.ArgumentTypeError(f"--stage-id must be a non-negative integer or 'none', got {value!r}")
+    return int(value)
 
 
 def _nonneg_finite_float(value: str) -> float:
@@ -162,6 +172,8 @@ class OmniServeCommand(CLISubcommand):
     def validate(self, args: argparse.Namespace) -> None:
         if args.stage_id is not None and (args.omni_master_address is None or args.omni_master_port is None):
             raise ValueError("--stage-id requires both --omni-master-address and --omni-master-port to be set")
+        if args.headless and is_frontend_only(args.stage_id):
+            raise ValueError("--stage-id none cannot be used with --headless")
 
         # Require an explicit model under --omni. ``args.model`` always carries
         # vLLM's ModelConfig default (``Qwen/Qwen3-0.6B``), so an omit is silent:
@@ -252,8 +264,8 @@ class OmniServeCommand(CLISubcommand):
         if omni_dp_size_local is not None:
             if omni_dp_size_local < 1:
                 raise ValueError(f"--omni-dp-size-local must be >= 1, got {omni_dp_size_local}")
-            if omni_dp_size_local != 1 and args.stage_id is None:
-                raise ValueError("--omni-dp-size-local != 1 requires --stage-id to be set")
+            if omni_dp_size_local != 1 and (args.stage_id is None or is_frontend_only(args.stage_id)):
+                raise ValueError("--omni-dp-size-local != 1 requires a numeric --stage-id")
 
         # vLLM CLI args that omni does not honor: parallelism comes from the
         # per-stage YAML (parallel_config:, enable_expert_parallel:) and the
@@ -416,9 +428,12 @@ class OmniServeCommand(CLISubcommand):
         )
         omni_config_group.add_argument(
             "--stage-id",
-            type=int,
+            type=_parse_stage_id,
             default=None,
-            help="Select and launch a single stage by stage_id.",
+            help=(
+                "Select and launch a single stage by stage_id. Pass 'none' on the "
+                "head to launch no local stage (API server + orchestrator only)."
+            ),
         )
         omni_config_group.add_argument(
             "--replica-id",

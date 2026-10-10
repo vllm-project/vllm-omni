@@ -23,6 +23,7 @@ from vllm_omni.config.stage_config import (
     StageExecutionType,
     StagePipelineConfig,
 )
+from vllm_omni.engine.arg_utils import FRONTEND_ONLY_ID_FILTER
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
 from vllm_omni.engine.stage_engine_core_client import StageEngineCoreClientBase
 from vllm_omni.engine.stage_engine_startup import (
@@ -472,14 +473,44 @@ class TestSingleStageModeDetection:
         )
         assert engine.single_stage_mode is True
 
-    def test_stage_id_kwarg_sets_filter(self, mocker: MockerFixture):
+    @pytest.mark.parametrize("stage_id", [1, FRONTEND_ONLY_ID_FILTER])
+    def test_stage_id_kwarg_sets_filter(self, mocker: MockerFixture, stage_id):
         engine = self._make_engine_no_thread(
             mocker,
-            stage_id=1,
-            omni_master_address="127.0.0.1",
-            omni_master_port=20002,
+            stage_cfgs=[_make_stage_cfg(0), _make_stage_cfg(1)],
+            stage_id=stage_id,
         )
-        assert engine._single_stage_id_filter == 1
+        assert engine._single_stage_id_filter == stage_id
+
+    def test_stage_id_not_in_resolved_stages_raises(self, mocker: MockerFixture):
+        """Ensure a stage_id outside the resolved stages fails before launch."""
+        with pytest.raises(ValueError, match=r"Available stage ids: \[0, 1\]"):
+            self._make_engine_no_thread(
+                mocker,
+                stage_cfgs=[_make_stage_cfg(0), _make_stage_cfg(1)],
+                stage_id=999,
+            )
+
+    def test_frontend_only_head_plans_every_replica_remote(self, mocker: MockerFixture):
+        """Ensure that launching with the frontend placeholder makes every replica run as remote."""
+        stage_plans = []
+
+        def capture_plans_and_stop(runtime, plans):
+            stage_plans.extend(plans)
+            raise RuntimeError("stage plans captured")
+
+        mocker.patch.object(
+            DistStageRuntime, "_start_omni_master_server", autospec=True, side_effect=capture_plans_and_stop
+        )
+        with pytest.raises(RuntimeError, match="stage plans captured"):
+            AsyncOmniEngine(
+                model="Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice",
+                stage_id=FRONTEND_ONLY_ID_FILTER,
+                omni_master_address="127.0.0.1",
+                omni_master_port=26000,
+            )
+
+        assert {replica.launch_mode for plan in stage_plans for replica in plan.replicas} == {"remote"}
 
     def test_no_stage_id_no_single_stage_mode(self, mocker: MockerFixture):
         engine = self._make_engine_no_thread(mocker)
@@ -666,6 +697,11 @@ class TestSingleStageInitialization:
             omni_master_address="127.0.0.1",
             omni_master_port=26000,
         )
+
+    def test_frontend_only_filter_launches_every_stage_remotely(self):
+        """Ensure the frontend-only filter launches no stage locally."""
+        runtime = self._build_runtime([_make_stage_cfg(0), _make_stage_cfg(1)], stage_id_filter=FRONTEND_ONLY_ID_FILTER)
+        assert [runtime._get_launch_mode(stage_id) for stage_id in (0, 1)] == ["remote", "remote"]
 
     def test_build_logical_stage_init_plans_marks_non_matching_stage_remote(self, mocker: MockerFixture):
         import vllm_omni.engine.stage_runtime as runtime_mod

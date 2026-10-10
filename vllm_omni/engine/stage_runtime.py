@@ -30,6 +30,7 @@ from vllm_omni.distributed.omni_coordinator import (
     RandomBalancer,
     RoundRobinBalancer,
 )
+from vllm_omni.engine.arg_utils import is_frontend_only
 from vllm_omni.engine.cuda_mps import CudaMPSServer, physical_gpu_uuid
 from vllm_omni.engine.messages import (
     EngineQueueMessage,
@@ -1404,12 +1405,15 @@ class DistStageRuntime(StageRuntime):
 
     def _prepare_stage_plans(self) -> list[LogicalStageInitPlan]:
         self._validate_single_stage_mode_replica_constraints()
-        return super()._prepare_stage_plans()
+        stage_plans = super()._prepare_stage_plans()
+        if all(replica.launch_mode == "remote" for plan in stage_plans for replica in plan.replicas):
+            logger.info("No local stage replicas found in stage plans (server + orchestrator only)")
+        return stage_plans
 
     def _validate_single_stage_mode_replica_constraints(self) -> None:
         """Apply --omni-dp-size-local to the local stage's runtime.num_replicas."""
         target_stage_id = self._single_stage_id_filter
-        if target_stage_id is None:
+        if target_stage_id is None or is_frontend_only(target_stage_id):
             return
 
         for idx, stage_cfg in enumerate(self._stage_configs):
@@ -1459,7 +1463,8 @@ class DistStageRuntime(StageRuntime):
     # ---- Distributed overrides ----
 
     def _get_launch_mode(self, stage_id: int) -> str:
-        if self._single_stage_id_filter is not None and stage_id != self._single_stage_id_filter:
+        stage_id_filter = self._single_stage_id_filter
+        if is_frontend_only(stage_id_filter) or (stage_id_filter is not None and stage_id != stage_id_filter):
             return "remote"
         return "local"
 
