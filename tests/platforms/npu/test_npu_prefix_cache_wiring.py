@@ -3,8 +3,8 @@
 """NPU prefix-cache wiring: save_outputs -> sid -> materialize on CPU.
 
 The NPU runner consumes the prefix cache in eager mode (no CUDA streams) and
-hands the step id across execute_model()/sample_tokens() as the LAST field of
-its positionally-packed ``ExecuteModelState``. Neither path runs in CUDA CI,
+hands the step id across execute_model()/sample_tokens() in the
+``prefix_cache_step_id`` field of its positionally-packed ``ExecuteModelState``. Neither path runs in CUDA CI,
 so a hit-read change can silently break them (`vllm_ascend` imports keep the
 runner modules out of reach of a plain unit test).
 
@@ -45,15 +45,20 @@ def _named_tuple_fields(path: Path, class_name: str) -> list[str]:
     tree = ast.parse(path.read_text())
     for node in ast.walk(tree):
         if isinstance(node, ast.ClassDef) and node.name == class_name:
-            return [stmt.target.id for stmt in node.body if isinstance(stmt, ast.AnnAssign)]
+            return [
+                stmt.target.id
+                for stmt in node.body
+                if isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name)
+            ]
     raise AssertionError(f"{class_name} not found in {path}")
 
 
-def test_execute_model_state_keeps_prefix_cache_sid_last():
-    """Both runners pack ExecuteModelState positionally: the sid must stay
-    the LAST field, and the NPU field order is pinned exactly — a reorder
-    passes import and every CUDA test, then ships the wrong value as the
-    sid on hardware."""
+def test_execute_model_state_keeps_prefix_cache_sid_position():
+    """Keep the prefix-cache sid's positional slot stable when adding fields.
+
+    NPU AR output staging appends a hidden-state slice after the sid; existing
+    positional constructors must still put the sid into the same slot.
+    """
     npu_fields = _named_tuple_fields(_NPU_RUNNER, "ExecuteModelState")
     assert npu_fields == [
         "scheduler_output",
@@ -70,6 +75,7 @@ def test_execute_model_state_keeps_prefix_cache_sid_last():
         "batch_desc",
         "multimodal_outputs",
         "prefix_cache_step_id",
+        "staged_hidden_states",
     ]
     gpu_fields = _named_tuple_fields(_GPU_RUNNER, "ExecuteModelState")
     assert gpu_fields[-1] == "prefix_cache_step_id"

@@ -226,6 +226,11 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
 
         self._language_model_names = ["model"]
         self.prefer_model_sampler = self.model_stage in {"llm", "tts"}
+        # The Talker scores its own codec window and hands vLLM's Sampler the
+        # input batch's metadata, whose history vLLM already repairs in place;
+        # copying every request's full codec history each step buys nothing.
+        # The Thinker's duplex sampler does read that rebuilt history.
+        self.skips_model_sampler_output_token_history = self.model_stage == "tts"
         # Both AR stages require model-specific embeddings.  The Thinker uses
         # preprocess for duplex audio, while the Talker converts the
         # tts_token_ids/tts_hidden_states handoff into its conditioning
@@ -234,9 +239,6 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         # MRv2. Marking it as a custom-preprocess model disables that encoder
         # path in the runner. Duplex still uses the V1 preprocess hook.
         self.has_preprocess = self.model_stage == "tts" or not self._use_v2_model_runner
-        # Neither AR stage has a postprocess, so step outputs can use the
-        # runner's async snapshot instead of a blocking per-step D2H.
-        self.use_async_omni_output = self.model_stage in {"llm", "tts"}
 
         if self.model_stage == "llm" and getattr(vllm_config.model_config, "session_mode", "turn") == "duplex":
             # Build the Stage-0 duplex runtime (remote-code processor and
@@ -247,6 +249,20 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             # processor is CPU preprocessing, so keep its tensors on the CPU.
             with torch.device("cpu"):
                 self._duplex_data_plane_helper()
+
+        self.model_sampler_wants_penalty_flags = self.model_stage == "tts"
+        self._publish_omni_output_contracts()
+
+    def _publish_omni_output_contracts(self) -> None:
+        """Expose inner-stage output flags to the model runner."""
+        self.use_async_omni_output = getattr(self.model, "use_async_omni_output", True)
+        self.omni_pooler_payload_include_hidden = getattr(self.model, "omni_pooler_payload_include_hidden", True)
+        self.omni_preprocess_uses_prev_sampled_token_id = getattr(
+            self.model, "omni_preprocess_uses_prev_sampled_token_id", False
+        )
+        inner_gpu_resident_keys = getattr(self.model, "gpu_resident_buffer_keys", None)
+        if inner_gpu_resident_keys is not None:
+            self.gpu_resident_buffer_keys: set[tuple[str, str]] = set(inner_gpu_resident_keys)
 
     @cached_property
     def sampler(self):
@@ -877,12 +893,42 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         if hasattr(self.model, "on_requests_finished"):
             self.model.on_requests_finished(finished_req_ids)
 
+    def can_defer_async_token_history(self, logits, sampling_metadata, input_batch) -> bool:
+        """Whether this step can submit sampling before repairing CPU history.
+
+        The codec sampler uses its own device history for repetition. Other
+        history consumers must still see the previous token before sampling.
+        Keep this in sync with the Talker's codec-penalty eligibility checks.
+        """
+        if self.model_stage != "tts":
+            return False
+        if getattr(sampling_metadata, "bad_words_token_ids", None):
+            return False
+        if getattr(input_batch, "logitsprocs_need_output_token_ids", True):
+            return False
+        holder = getattr(sampling_metadata, "thinking_budget_state_holder", None)
+        if holder is not None and holder.has_tracked_requests():
+            return False
+        if getattr(sampling_metadata, "no_penalties", False):
+            return True
+        presence = getattr(input_batch, "presence_penalties_reqs", None)
+        frequency = getattr(input_batch, "frequency_penalties_reqs", None)
+        if not (isinstance(presence, set) and isinstance(frequency, set) and not presence and not frequency):
+            return False
+        histories = getattr(self.model, "_penalty_histories", None)
+        return (
+            histories is not None
+            and len(histories) == logits.shape[0]
+            and isinstance(getattr(sampling_metadata, "repetition_penalties", None), torch.Tensor)
+        )
+
     def sample(
         self,
         logits: torch.Tensor,
         sampling_metadata: SamplingMetadata,
         *,
         per_req_sampling_params: list[SamplingParams | None] | None = None,
+        skip_standard_penalties: bool = False,
     ) -> SamplerOutput | None:
         native_duplex = self._sample_minicpmo45_native_duplex_stage0(
             logits,
@@ -892,7 +938,12 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         if native_duplex is not None:
             return native_duplex
         if self.model_stage == "tts":
-            return self.model.sample(logits, sampling_metadata, per_req_sampling_params=per_req_sampling_params)
+            return self.model.sample(
+                logits,
+                sampling_metadata,
+                per_req_sampling_params=per_req_sampling_params,
+                skip_standard_penalties=skip_standard_penalties,
+            )
         return None
 
     def _sample_minicpmo45_native_duplex_stage0(

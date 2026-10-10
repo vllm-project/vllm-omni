@@ -226,7 +226,7 @@ def test_fused_gpu_window_penalty_matches_reference(device, batch):
 @pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_v1_gpu_output_uses_async_snapshot_and_reuses_finished_slot():
-    from vllm_omni.worker.gpu_ar_model_runner import _snapshot_tensor_payload_to_cpu_async
+    from vllm_omni.worker.async_omni_output import _snapshot_tensor_payload_to_cpu_async
 
     talker = _make_talker()
     talker.emb_code = torch.nn.ModuleList([torch.nn.Embedding(8, 2, device="cuda")])

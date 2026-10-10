@@ -370,6 +370,24 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
 
         return output_token_ids
 
+    def _host_prev_sampled_token_id(self, req_id: str) -> int | None:
+        """Previous step's sampled id for ``req_id`` from the async D2H copy.
+
+        Waits only on that copy's event rather than on the kernels already
+        queued for this step. None when async scheduling kept no host copy.
+        """
+        sampled_token_ids_cpu = getattr(self.input_batch, "sampled_token_ids_cpu", None)
+        async_copy_ready_event = getattr(self.input_batch, "async_copy_ready_event", None)
+        prev_req_id_to_index = getattr(self.input_batch, "prev_req_id_to_index", None)
+        if sampled_token_ids_cpu is None or async_copy_ready_event is None or not prev_req_id_to_index:
+            return None
+        prev_index = prev_req_id_to_index.get(req_id)
+        if prev_index is None:
+            return None
+        async_copy_ready_event.synchronize()
+        token_id = int(sampled_token_ids_cpu[prev_index, 0])
+        return token_id if token_id >= 0 else None
+
     def _sampling_metadata_for_model_sampler(self, sampling_metadata):
         output_token_ids = self._build_model_sampler_output_token_ids()
         if output_token_ids == sampling_metadata.output_token_ids:
@@ -1770,6 +1788,11 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
             decode_start_offsets: list[int] = []
             decode_batch_items: list[tuple[str, int, dict[str, Any]]] = []
             batch_decode_preprocess = getattr(self.model, "preprocess_decode_batch", None)
+            # Batched decode owns the previous ids on device; only the scalar
+            # preprocess fallback needs the sampled-token host copy.
+            wants_prev_sampled = bool(
+                getattr(self.model, "omni_preprocess_uses_prev_sampled_token_id", False)
+            ) and not callable(batch_decode_preprocess)
 
             def flush_decode_batch() -> None:
                 nonlocal inputs_embeds
@@ -1877,6 +1900,11 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
                 req_infos["_omni_prompt_len"] = prompt_len
                 req_infos["_omni_num_computed_tokens"] = num_computed_tokens
                 req_infos["_omni_is_prefill"] = is_prefill
+                if wants_prev_sampled:
+                    # Always overwrite: req_infos persists across steps.
+                    req_infos["_omni_prev_sampled_token_id"] = (
+                        self._host_prev_sampled_token_id(req_id) if span_len == 1 and not is_prefill else None
+                    )
                 # Output-token cap, so a model that must ship a payload on the
                 # request's final step can tell which step that is. A finished
                 # request drops out of req_ids_output_copy, and downstream

@@ -90,7 +90,7 @@ def test_talker_condition_upload_does_not_synchronize_cuda() -> None:
 
 @torch.inference_mode()
 def test_v1_batched_decode_and_async_snapshot_match_scalar(mocker):
-    from vllm_omni.worker.gpu_ar_model_runner import _snapshot_tensor_payload_to_cpu_async
+    from vllm_omni.worker.async_omni_output import _snapshot_tensor_payload_to_cpu_async
 
     ids = torch.tensor([3, _EOS, _EOS, 6], dtype=torch.int32, device="cuda")
     hidden = torch.arange(16, dtype=torch.float32, device="cuda").reshape(4, 4)
