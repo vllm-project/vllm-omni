@@ -34,6 +34,7 @@ from .parallel import (
     Magi2ParallelGroup,
     get_magi2_ulysses_group,
     scatter_heads_gather_seqlen,
+    scatter_seqlen_gather_head_shards,
     scatter_seqlen_gather_heads,
 )
 
@@ -279,8 +280,14 @@ def ulysses_packed_attention_with_sink(
     softcap: float = -1.0,
     sink: torch.Tensor | None = None,
     group: Magi2ParallelGroup | None = None,
+    head_shard_output: bool = False,
 ) -> torch.Tensor:
-    """MAGI-2 attention with overlapping Ulysses CP/head exchange."""
+    """MAGI-2 attention with overlapping Ulysses CP/head exchange.
+
+    With ``head_shard_output`` a multi-rank exchange returns the
+    ``[S_rank, world, H, D]`` head-shard view of its receive buffer instead of
+    copying it to ``[S_rank, world*H, D]``.
+    """
 
     group = group or get_magi2_ulysses_group()
     if isinstance(split_sizes, torch.Tensor):
@@ -293,7 +300,8 @@ def ulysses_packed_attention_with_sink(
             sink = torch.chunk(sink, group.world_size, dim=-1)[group.rank].contiguous()
     output = packed_attention_with_sink(q, k, v, varlen, softcap=softcap, sink=sink)
     if group.world_size > 1:
-        output = scatter_seqlen_gather_heads(output.contiguous(), split_sizes, group)
+        gather = scatter_seqlen_gather_head_shards if head_shard_output else scatter_seqlen_gather_heads
+        output = gather(output.contiguous(), split_sizes, group)
         assert isinstance(output, torch.Tensor)
     return output
 
@@ -301,9 +309,10 @@ def ulysses_packed_attention_with_sink(
 class Magi2PackedAttentionKernel(nn.Module):
     """Model kernel plugged into the shared diffusion Attention contract."""
 
-    def __init__(self, softcap: float) -> None:
+    def __init__(self, softcap: float, *, head_shard_output: bool = False) -> None:
         super().__init__()
         self.softcap = softcap
+        self.head_shard_output = head_shard_output
 
     def forward(
         self,
@@ -331,6 +340,7 @@ class Magi2PackedAttentionKernel(nn.Module):
             split_sizes,
             softcap=self.softcap,
             sink=sink,
+            head_shard_output=self.head_shard_output,
         )
 
 
