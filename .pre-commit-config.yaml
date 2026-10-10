@@ -159,6 +159,17 @@ repos:
       files: ^\.buildkite/.*\.ya?ml$
       additional_dependencies: [pyyaml, check-jsonschema==0.38.0]
 
+    # Keeps docs/user_guide/examples/ in sync with examples/ at commit time.
+    # generate_examples.py imports regex and yaml at module level; its other
+    # dependencies are only needed for the mkdocs build, not for generation.
+    - id: sync-example-docs
+      name: Sync example docs from examples/
+      entry: python tools/pre_commit/sync_example_docs.py
+      language: python
+      pass_filenames: false
+      files: (^examples/|^docs/user_guide/examples/|^docs/\.nav\.yml$)
+      additional_dependencies: [regex, pyyaml]
+
     # Keep `suggestion` as the final hook. Run after autofix hooks so the
     # bypass/SKIP tip is not displaced.
     - id: suggestion
