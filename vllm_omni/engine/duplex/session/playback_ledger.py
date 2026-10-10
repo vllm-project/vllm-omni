@@ -30,10 +30,11 @@ def apply_playback_ack(session: DuplexEngineSession, event: dict[str, object]) -
     except Exception:
         pass
     committed_cursor = int(committed_ms) if isinstance(committed_ms, int | float) else int(played_ms)
-    item_id = event.get("item_id")
+    raw_item_id = event.get("item_id")
+    item_id: str | None = raw_item_id if isinstance(raw_item_id, str) and raw_item_id else None
     response_id = event.get("response_id")
     response_id = response_id if isinstance(response_id, str) and response_id else None
-    if not isinstance(item_id, str) or not item_id:
+    if item_id is None:
         item_id = f"item_{response_id}" if response_id is not None else None
     elif response_id is None and item_id.startswith("item_"):
         response_id = item_id.removeprefix("item_")
@@ -45,10 +46,10 @@ def apply_playback_ack(session: DuplexEngineSession, event: dict[str, object]) -
         response_id = session.active_response_id
         item_id = f"item_{response_id}"
     if response_id is not None:
-        expected_item_id = f"item_{response_id}"
+        response_item_id = f"item_{response_id}"
         if item_id is None:
-            item_id = expected_item_id
-        elif item_id != expected_item_id:
+            item_id = response_item_id
+        elif item_id != response_item_id:
             return [error_event("playback_item_mismatch", "playback.ack item_id must match item_<response_id>.")]
         if not session.has_assistant_response_item(response_id, item_id):
             return [
@@ -131,7 +132,15 @@ def apply_playback_ack(session: DuplexEngineSession, event: dict[str, object]) -
             }
         )
     ]
-    if committed_history and committed_cursor >= max(playback.sent_ms, playback.generated_ms):
+    # ACKing all audio generated so far does not complete a cancelled reply.
+    # A late full ACK also cannot retire evidence for a permanently truncated
+    # reply: a stricter truncate still needs its snapshot and playback cursor.
+    if (
+        committed_history
+        and response_id is not None
+        and playback.audio_complete
+        and session.history_audio_cutoff(response_id) >= max(playback.sent_ms, playback.generated_ms)
+    ):
         session.release_response_playback(response_id)
         session.release_response_history_snapshot(response_id)
     return events

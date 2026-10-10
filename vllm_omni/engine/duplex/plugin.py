@@ -32,6 +32,9 @@ from vllm_omni.engine.duplex.contracts import (
 if TYPE_CHECKING:
     from vllm.config import ModelConfig
 
+    from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
+    from vllm_omni.engine.duplex.session.history_calibration import HistoryCalibrationPolicy
+
 
 class DuplexRuntimeConfigError(ValueError):
     """A model plugin rejected client-visible runtime configuration."""
@@ -288,6 +291,14 @@ class DuplexModelPlugin(ABC):
     data-plane projection) live on the same object so a mismatch between the
     two halves is impossible by construction.
     """
+
+    def history_calibrator(self, runtime_config: DuplexSessionRuntimeConfig) -> HistoryCalibrationPolicy | None:
+        """Optional original-text offset policy, shared per plugin.
+
+        The framework retains requested audio, enforces deadlines and owns history writes.
+        The default preserves existing playback marks for all other models.
+        """
+        return None
 
     projects_intermediate_outputs: bool = False
     plugin_id: str = ""

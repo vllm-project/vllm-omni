@@ -295,6 +295,10 @@ class ModelChannel:
                 raise RuntimeError("duplex_data_plane_has_no_stage")
             if request_context.request_id != request_id:
                 request_id = request_context.request_id
+            if self._ctx.history_calibration is not None:
+                await self._ctx.history_calibration.before_prompt()
+                if session.epoch != fence.epoch or session.state != DuplexSessionState.OPEN:
+                    raise DuplexFenceMismatchError(session.fence, fence)
             prompt_payload: dict[str, object] = (
                 {str(key): value for key, value in payload.items()} if isinstance(payload, Mapping) else {}
             )
@@ -1032,6 +1036,8 @@ class ModelChannel:
             audio_complete=model_result.get("audio_complete") is True,
             response_id=target_id,
         )
+        if self._ctx.history_calibration is not None and response_id is not None:
+            self._ctx.history_calibration.record(target_id or response_id, model_result)
         payload = {
             "type": "response.output_audio.delta",
             "session_id": session.session_id,

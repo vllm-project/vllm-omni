@@ -97,6 +97,7 @@ from vllm_omni.engine.duplex.session.context import (
 from vllm_omni.engine.duplex.session.control import SessionControl
 from vllm_omni.engine.duplex.session.emitter import SessionEmitter
 from vllm_omni.engine.duplex.session.engine_session import DuplexEngineSession
+from vllm_omni.engine.duplex.session.history_calibration import HistoryCalibration
 from vllm_omni.engine.duplex.session.lease import DuplexLeaseActivity
 from vllm_omni.engine.duplex.session.model_channel import ModelChannel
 from vllm_omni.engine.duplex.turn_detection import (
@@ -198,6 +199,15 @@ class DuplexSessionRunner:
             services=self,
         )
         self.out = SessionEmitter(self.ctx, promote_deferred_overlap=self._promote_deferred_overlap_later)
+        calibration = plugin.history_calibrator(manager.runtime_config)
+        if calibration is not None:
+            self.ctx.history_calibration = HistoryCalibration(
+                session,
+                calibration.calibrate,
+                max_bytes=manager.runtime_config.history_audio_max_bytes_per_session,
+                timeout_s=manager.runtime_config.history_calibration_timeout_ms / 1000,
+                requires_audio=calibration.requires_audio,
+            )
         self.model = ModelChannel(
             self.ctx,
             self.out,
@@ -463,6 +473,8 @@ class DuplexSessionRunner:
                 self._emit_error("internal_error", str(exc))
 
     async def _stop_worker(self) -> None:
+        if self.ctx.history_calibration is not None:
+            self.ctx.history_calibration.close()
         worker = self._worker
         self._worker = None
         # Set even when the worker itself is stopping (a wire ``session.close``
@@ -642,6 +654,17 @@ class DuplexSessionRunner:
             await self._on_close_command(command.reason)
         else:
             self._emit_error("unknown_event", f"Unknown duplex command: {type(command).__name__}")
+        if self.ctx.history_calibration is not None:
+            if isinstance(command, AckPlayback):
+                self.ctx.history_calibration.release_confirmed()
+                # A final ACK may arrive after cancel/clear. Start while the
+                # user speaks, without running ASR on periodic playback ACKs.
+                if not helpers.assistant_playback_active(self.session):
+                    self.ctx.history_calibration.request_ready()
+            elif isinstance(command, DeleteItem):
+                self.ctx.history_calibration.discard(command.item_id.removeprefix("item_"))
+            elif isinstance(command, TruncateItem | CancelResponse | ClearOutputAudio | CancelInput | BargeIn):
+                self.ctx.history_calibration.request_ready()
 
     async def _on_close_command(self, reason: str) -> None:
         # A close requested through the ordered command stream (the client's
@@ -719,6 +742,8 @@ class DuplexSessionRunner:
     # ------------------------------------------------------------------ #
 
     def _begin_close(self, reason: str) -> None:
+        if self.ctx.history_calibration is not None:
+            self.ctx.history_calibration.close()
         self.run.closing = True
         self.run.close_reason = self.run.close_reason or reason
         self.session.mark_closing()
@@ -1428,6 +1453,8 @@ class DuplexSessionRunner:
         if not await self.model.signal_cancel_fence(cancelled_fence):
             return
         self.tasks.active_response_task = None
+        if self.ctx.history_calibration is not None:
+            self.ctx.history_calibration.request_ready()
 
     async def _cancel_active_response(
         self,

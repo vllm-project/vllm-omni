@@ -30,6 +30,7 @@ from vllm_omni.engine.duplex.config import DuplexSessionConfig
 from vllm_omni.engine.duplex.delivery import DuplexOutputBuffer
 from vllm_omni.engine.duplex.messages import OpenDuplexSessionMessage
 from vllm_omni.engine.duplex.plugin import DuplexRuntimeConfigError
+from vllm_omni.engine.duplex.session.history_calibration import HistoryCalibrationPolicy
 from vllm_omni.engine.duplex.session.manager import DuplexSessionManager
 from vllm_omni.model_executor.models.qwen3_omni.duplex.input import QwenPcmBuffer
 from vllm_omni.model_executor.models.qwen3_omni.duplex.plugin import MAX_PROMPT_IMAGES, Qwen3OmniDuplexPlugin
@@ -72,8 +73,13 @@ def test_buffer_refuses_video_frames_and_points_at_the_openai_interface():
     committed.commit()
 
 
-async def open_qwen():
+async def open_qwen(
+    *, calibrate=None, calibration_timeout_ms=1000, history_max_bytes=8 * 1024 * 1024, requires_audio=True
+):
     plugin = Qwen3OmniDuplexPlugin(lambda audio, *args: "AAAA")
+    if calibrate is not None:
+        plugin.history_calibrator = lambda config: HistoryCalibrationPolicy(calibrate, requires_audio=requires_audio)
+        plugin.data_plane.retain_history_audio = requires_audio
     plugin.processor = SimpleNamespace(apply_chat_template=lambda messages, **kw: repr(messages))
     port = RecordingStagePort(stage_count=3)
     output: asyncio.Queue[Any] = asyncio.Queue()
@@ -84,7 +90,10 @@ async def open_qwen():
         stage_port=port,
         output_sink=output,
         result_sink=results,
-        runtime_config=DuplexSessionRuntimeConfig(),
+        runtime_config=DuplexSessionRuntimeConfig(
+            history_calibration_timeout_ms=calibration_timeout_ms,
+            history_audio_max_bytes_per_session=history_max_bytes,
+        ),
         model_config=None,
     )
     config = DuplexSessionConfig(model="qwen", modalities=["text", "audio"], overlap_policy="barge_in_on_speech")

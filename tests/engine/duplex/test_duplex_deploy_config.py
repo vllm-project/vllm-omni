@@ -107,3 +107,27 @@ def test_deploy_duplex_max_sessions_tracks_the_deploy_config(deploy_yaml: str, e
     # or an overlay inheriting one from its base must surface here rather than
     # as another nightly duplex admission timeout.
     assert get_deploy_duplex_max_sessions(deploy_yaml) == expected
+
+
+@pytest.mark.parametrize(
+    "patch",
+    [
+        {"history_asr_url": "file:///tmp/model", "history_asr_model": "asr"},
+        {"history_asr_url": "http://localhost/transcribe"},
+        {"history_calibration_timeout_ms": 0},
+        {"history_calibration_timeout_ms": float("nan")},
+        {"history_audio_max_bytes_per_session": True},
+        {"history_asr_max_concurrency": 0},
+        {"history_asr_max_concurrency": True},
+        {"history_asr_max_concurrency": 1.5},
+        {"history_ms_per_token": 0},
+        {"history_ms_per_token": True},
+        {"history_ms_per_token": "260"},
+        {"history_ms_per_token": float("nan")},
+        {"history_ms_per_token": float("inf")},
+        {"history_ms_per_token": 260, "history_asr_url": "http://localhost/transcribe", "history_asr_model": "asr"},
+    ],
+)
+def test_history_calibration_requires_bounded_server_configuration(patch):
+    with pytest.raises(ValueError):
+        DuplexSessionRuntimeConfig(**patch)

@@ -41,6 +41,193 @@ Grouping and pruning affect only the model-input view. They do not merge or
 delete the source conversation items exposed to clients, and do not change
 playback acknowledgement or interruption handling.
 
+### Optional history calibration for interrupted Qwen3-Omni replies
+
+By default, Qwen3-Omni audio replies under `ack_only` retain their full text
+only after playback is completely acknowledged; an interrupted reply leaves an
+empty assistant turn. History calibration can retain a prefix of the original
+reply before the next prompt is prepared. Choose one of two experimental
+strategies in a server-side deployment overlay:
+
+- **Fixed token rate:** estimate the prefix from playback time and a configured
+  speech duration per text token. Requires no ASR service or output-audio cache.
+- **ASR prefix matching:** transcribe the played audio and match it against the
+  original reply. Requires a separately deployed transcription service.
+
+Both strategies are disabled by default and are mutually exclusive. They apply
+to Qwen3-Omni in `session_mode: duplex`, with `playback_commit_policy: ack_only`
+and playback speed 1. Other playback policies and speeds retain their existing
+behavior. These deployment settings cannot be changed by `session.update`.
+
+#### Configure a fixed token rate
+
+Save this as `qwen3_history.yaml`, replacing `base_config` with the absolute path
+to the repository's Qwen3-Omni duplex deployment:
+
+```yaml
+base_config: /path/to/vllm-omni/vllm_omni/deploy/qwen3_omni_duplex.yaml
+duplex_session:
+  history_ms_per_token: 383
+  history_calibration_timeout_ms: 1000
+```
+
+The example 383 ms/token was selected through WebUI playback testing for one
+deployment. It is audio duration per text token, not model generation time per
+token, and is not a model-wide default. Check it for the language, voice and
+speaking style of your deployment.
+
+The plugin uses the existing processor's fast tokenizer without special tokens
+and estimates `floor(max(0, played_ms - 160) / history_ms_per_token)` tokens.
+It rounds down to whole English words or Chinese characters using original text
+offsets, accounts for overlapping byte tokens, and withholds the final unit of
+the reply during partial playback. Text longer than 8192 characters or 2048
+matching units is refused before tokenization.
+
+A fixed rate can retain unheard text when a phrase is slower than the configured
+rate. The time margin and downward rounding do not eliminate this error. This
+strategy is an explicit alternative to ASR, not an automatic fallback after an
+ASR timeout.
+
+#### Configure ASR prefix matching
+
+Deploy a transcription service before starting the duplex server. It must
+accept multipart `file`, `model`, and `response_format=json` fields and return
+`{"text": "..."}`. The duplex plugin uses HTTP; it does not load an ASR model
+inside each session.
+
+For a vLLM installation with native Qwen3-ASR support, an example is:
+
+```bash
+uv run --no-sync vllm serve Qwen/Qwen3-ASR-1.7B \
+    --served-model-name history-asr \
+    --host 127.0.0.1 --port 18942 \
+    --max-model-len 8192 --max-num-seqs 16 \
+    --kv-cache-memory-bytes 1073741824 \
+    --attention-backend FLASH_ATTN \
+    --no-enable-prefix-caching --mm-processor-cache-gb 0 \
+    --generation-config vllm \
+    --override-generation-config '{"max_new_tokens":256}'
+```
+
+Allocate resources for this additional service and size its memory budget for
+your workload. The 1 GiB KV cache example was exercised with four concurrent
+calibration calls; `--max-num-seqs 16` does not guarantee that sixteen
+maximum-length requests fit. Warm up the ASR service before using it with a
+short calibration deadline.
+
+Use this overlay as `qwen3_history.yaml` instead of the fixed-rate overlay:
+
+```yaml
+base_config: /path/to/vllm-omni/vllm_omni/deploy/qwen3_omni_duplex.yaml
+duplex_session:
+  history_asr_url: http://127.0.0.1:18942/v1/audio/transcriptions
+  history_asr_model: history-asr
+  history_asr_max_concurrency: 4
+  history_calibration_timeout_ms: 1000
+  history_audio_max_bytes_per_session: 8388608
+```
+
+`history_asr_model` must match a model name served by that endpoint. The URL
+is server-owned and accepts HTTP(S) without embedded credentials. The current
+client does not attach authentication headers.
+
+The callback subtracts a 160 ms margin from the reported playback position and
+sends only that audio prefix to ASR, without supplying the original text as a
+recognition hint. Audio shorter than 500 ms after the margin is refused. The
+transcript is matched to an anchored original-text prefix, with ambiguous or
+sensitive edits rejected and the last recognized unit withheld. ASR text is
+never inserted into conversation history. Chinese matching currently uses
+characters rather than lexical words; successful matching does not prove exact
+acoustic alignment.
+
+The HTTP concurrency limit is shared across sessions and should match the
+backend's measured capacity. Timeout or cancellation closes the HTTP request.
+Stopping remote inference also requires the backend to propagate disconnects
+to engine abort. This was verified with native vLLM transcription in vLLM 0.31.0;
+verify it for other backends or proxies. Cancelling a request can stop queued
+work and subsequent decode steps, but cannot preempt an already launched CUDA
+kernel.
+
+#### Start the duplex server
+
+From the repository environment, start Qwen3-Omni with the chosen overlay:
+
+```bash
+uv run --no-sync vllm-omni serve Qwen/Qwen3-Omni-30B-A3B-Instruct \
+    --omni --deploy-config qwen3_history.yaml \
+    --trust-remote-code --host 127.0.0.1 --port 8099
+```
+
+Connect the client to `ws://127.0.0.1:8099/v1/realtime?duplex=1`. The overlay
+inherits the default Qwen3-Omni stages; it only changes session settings.
+Restart the server when changing the calibration strategy or its configuration.
+
+#### Report playback and interruptions
+
+Clients must report cumulative audio actually played, measured in milliseconds
+from the start of the assistant reply. Audio received or queued for playback
+is not a playback confirmation. Continue sending `playback.ack` during playback.
+
+For an interruption, stop local playback and capture its final position.
+Cancel the response if generation is still running, send
+`conversation.item.truncate` using the assistant item's actual ID, and clear
+queued server output with `output_audio_buffer.clear`. For example:
+
+```json
+{"type": "conversation.item.truncate", "item_id": "item_resp_01", "content_index": 0, "audio_end_ms": 1850}
+```
+
+The truncate event supplies a permanent playback limit; an additional ACK is
+not required for that limit. Its acknowledgement confirms the truncation was
+accepted, not that ASR has finished. Once generation has ended, calibration
+can run while the user speaks. A final ACK after playback stops can also start
+eligible work. Periodic ACKs while playback continues do not start ASR.
+
+Before copying history into the next prompt, the framework waits within the
+configured budget for any pending calibration, then updates the assistant item
+in its original position. Already submitted prompts are not changed.
+
+#### Limits, fallback and disabling
+
+| Setting | Default | Effect |
+| --- | --- | --- |
+| `history_ms_per_token` | unset | Enables fixed-rate estimation when positive and finite. |
+| `history_asr_url` | unset | Enables ASR calibration; requires `history_asr_model`. |
+| `history_asr_max_concurrency` | 4 | Maximum simultaneous calibration HTTP requests per plugin instance. |
+| `history_calibration_timeout_ms` | 1000 | Bounds each callback, including queueing, HTTP and matching; also bounds total prompt wait across replacement tasks. |
+| `history_audio_max_bytes_per_session` | 8388608 | Retained output PCM budget for ASR; separate from input audio history. |
+
+ASR retains at most four recordings per session within the byte budget.
+Oversized or evicted recordings are unusable for calibration; subsequent chunks
+cannot restart them with a suffix presented as a complete recording. Temporary
+snapshot, WAV and HTTP buffers are additional to the retained-PCM budget.
+
+Missing playback evidence, missing audio, matching refusal, exceptions and
+timeouts preserve the existing conservative history policy. Without an already
+confirmed prefix, partial playback leaves an empty assistant item. A permanent
+truncate can only tighten: late ACKs and calibration results cannot restore text
+beyond it. Fully acknowledged recordings are released; deleting an item or
+closing a session releases its cache and invalidates pending work.
+
+Logs report calibration status and preprocessing, queueing, HTTP and matching
+durations, without audio or transcript content. Prompt preparation reports its
+actual extra wait separately. HTTP duration includes remote queueing and
+transport and is not pure inference time.
+
+To disable calibration, remove both strategy settings from an overlay whose
+base does not enable them, or explicitly override inherited settings with null:
+
+```yaml
+duplex_session:
+  history_asr_url: null
+  history_ms_per_token: null
+```
+
+Restarting with calibration disabled restores the original history policy and
+stops retaining output PCM for calibration. Broader language, boundary and
+sustained-load validation is still needed before enabling either strategy by
+default.
+
 ## Quick Start
 
 ### Start the Server

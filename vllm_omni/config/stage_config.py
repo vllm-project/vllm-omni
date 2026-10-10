@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import functools
+import math
 import re
 import warnings
 from collections.abc import Callable, Mapping
@@ -556,6 +557,15 @@ class DuplexSessionRuntimeConfig:
     # parse, and goes away with the PR that ports the last of them.
     completed_append_cache_size: int = 256
     server_vad_model_path: str | None = None
+    # Experimental Qwen heard-text calibration. Server-owned URL; never accept
+    # a transcription endpoint from a client session.update.
+    history_asr_url: str | None = None
+    history_asr_model: str | None = None
+    history_asr_max_concurrency: int = 4
+    # Alternative opt-in estimate using speech duration per Thinker text token.
+    history_ms_per_token: float | None = None
+    history_calibration_timeout_ms: int = 1000
+    history_audio_max_bytes_per_session: int = 8 * 1024 * 1024
     # Startup warmup, before real ``/v1/realtime`` clients are admitted.
     # Audio-primary models run this many silent frames; 0 disables that path.
     # Video-required models (AURA) still run one short non-silent audio chunk
@@ -576,9 +586,36 @@ class DuplexSessionRuntimeConfig:
             "max_pending_output_events_per_session": self.max_pending_output_events_per_session,
             "max_sessions": self.max_sessions,
             "completed_append_cache_size": self.completed_append_cache_size,
+            "history_calibration_timeout_ms": self.history_calibration_timeout_ms,
+            "history_audio_max_bytes_per_session": self.history_audio_max_bytes_per_session,
+            "history_asr_max_concurrency": self.history_asr_max_concurrency,
         }
         if self.idle_ttl_s is not None and self.idle_ttl_s <= 0:
             raise ValueError("duplex_session.idle_ttl_s must be positive or null")
+        if self.history_asr_url is not None:
+            from urllib.parse import urlsplit
+
+            if not isinstance(self.history_asr_url, str):
+                raise ValueError("duplex_session.history_asr_url must be a string")
+            parsed = urlsplit(self.history_asr_url)
+            if parsed.scheme not in {"http", "https"} or not parsed.netloc or parsed.username or parsed.password:
+                raise ValueError("duplex_session.history_asr_url requires an HTTP(S) URL without credentials")
+            if not isinstance(self.history_asr_model, str) or not self.history_asr_model.strip():
+                raise ValueError("duplex_session.history_asr_model is required with history_asr_url")
+        if self.history_ms_per_token is not None:
+            rate = self.history_ms_per_token
+            if isinstance(rate, bool) or not isinstance(rate, (int, float)) or not math.isfinite(rate) or rate <= 0:
+                raise ValueError("duplex_session.history_ms_per_token must be finite and positive")
+            if self.history_asr_url is not None:
+                raise ValueError("Choose history_asr_url or history_ms_per_token, not both")
+        for name in (
+            "history_calibration_timeout_ms",
+            "history_audio_max_bytes_per_session",
+            "history_asr_max_concurrency",
+        ):
+            value = getattr(self, name)
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise ValueError(f"duplex_session.{name} must be a positive integer")
         if self.server_vad_model_path is not None and (
             not isinstance(self.server_vad_model_path, str) or not self.server_vad_model_path.strip()
         ):

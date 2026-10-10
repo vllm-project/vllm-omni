@@ -143,6 +143,8 @@ class ConversationHistory:
     pending_item_input_commit_seqs: dict[str, int] = field(default_factory=dict)
     pending_truncations_ms: dict[str, int] = field(default_factory=dict)
     hard_truncations_ms: dict[str, int] = field(default_factory=dict)
+    # Original text, conservative character offset, evidence audio cutoff.
+    heard_prefixes: dict[str, tuple[str, int, int]] = field(default_factory=dict)
     last_assistant_full_message: dict[str, object] | None = None
     last_assistant_audio_text_marks: list[DuplexAssistantAudioTextMark] = field(default_factory=list)
     assistant_response_snapshots: dict[str, tuple[dict[str, object], tuple[DuplexAssistantAudioTextMark, ...], int]] = (
@@ -576,6 +578,7 @@ class DuplexEngineSession:
         if response_id is None or response_id == self.active_response_id:
             return
         self._conversation.assistant_response_snapshots.pop(response_id, None)
+        self._conversation.heard_prefixes.pop(f"item_{response_id}", None)
         self._conversation.hard_truncations_ms.pop(f"item_{response_id}", None)
 
     @property
@@ -1418,6 +1421,7 @@ class DuplexEngineSession:
         self._conversation.pending_item_input_commit_seqs.pop(item_id, None)
         self._conversation.pending_truncations_ms.pop(item_id, None)
         self._conversation.hard_truncations_ms.pop(item_id, None)
+        self._conversation.heard_prefixes.pop(item_id, None)
         removed_placeholder = self._discard_history_item_placeholder(item_id)
         if response_id is not None:
             self._conversation.assistant_response_snapshots.pop(response_id, None)
@@ -1428,6 +1432,29 @@ class DuplexEngineSession:
             candidate for candidate in self._conversation.messages if candidate is not message
         ]
         return True
+
+    def history_audio_cutoff(self, response_id: str) -> int:
+        playback = self.playback_for_response(response_id)
+        cutoff = min(playback.committed_ms, max(playback.generated_ms, playback.sent_ms))
+        return max(0, min(cutoff, self._conversation.hard_truncations_ms.get(f"item_{response_id}", cutoff)))
+
+    def apply_heard_text(self, response_id: str, *, text: str, audio_end_ms: int, char_end: int) -> bool:
+        """Validate an async result against the current reply and permanent cutoff."""
+        item_id = f"item_{response_id}"
+        if (
+            self.state != DuplexSessionState.OPEN
+            or self.config.playback_commit_policy != DuplexPlaybackCommitPolicy.ACK_ONLY.value
+            or response_id == self.active_response_id
+            or response_id not in self._conversation.assistant_response_snapshots
+            or item_id not in self._conversation.item_ids
+            or self.assistant_transcript(response_id) != text
+            or not 0 <= char_end <= len(text)
+            or audio_end_ms <= 0
+            or audio_end_ms > self.history_audio_cutoff(response_id)
+        ):
+            return False
+        self._conversation.heard_prefixes[item_id] = (text, char_end, audio_end_ms)
+        return self.truncate_history_item(item_id, audio_end_ms=self.history_audio_cutoff(response_id))
 
     def truncate_history_item(
         self,
@@ -1454,13 +1481,34 @@ class DuplexEngineSession:
         if response_snapshot is not None:
             full_message, full_marks, _ = response_snapshot
             message = copy.deepcopy(full_message)
-            changed = self._truncate_message_to_audio_ms(
-                message,
-                audio_end_ms=audio_end_ms,
-                marks=list(full_marks),
-                playback=playback,
+            prefix = self._conversation.heard_prefixes.get(item_id)
+            if prefix is not None and playback is not None and not hard:
+                # Ordinary ACKs are cumulative: an older ACK must not erase
+                # already confirmed text. A hard truncate still only tightens.
+                audio_end_ms = max(audio_end_ms, playback.committed_ms)
+                if hard_cap_ms is not None:
+                    audio_end_ms = min(audio_end_ms, hard_cap_ms)
+            fully_played = (
+                playback is not None
+                and playback.audio_complete
+                and audio_end_ms >= max(playback.generated_ms, playback.sent_ms)
             )
+            if prefix is not None and message.get("content") == prefix[0] and not fully_played:
+                keep_chars = prefix[1] if audio_end_ms >= prefix[2] else 0
+                message["content"] = prefix[0][:keep_chars].rstrip()
+                changed = True
+            else:
+                changed = self._truncate_message_to_audio_ms(
+                    message,
+                    audio_end_ms=audio_end_ms,
+                    marks=list(full_marks),
+                    playback=playback,
+                )
             if not changed or self._message_text_len(message) <= 0:
+                # A stricter permanent truncate must also clear a previously
+                # calibrated prefix. Keep the original turn boundary in place.
+                if prefix is not None and changed and item_id in self._conversation.item_ids:
+                    self._store_history_item_message(item_id, message)
                 self._conversation.pending_truncations_ms[item_id] = max(0, int(audio_end_ms))
                 return False
             self._store_history_item_message(item_id, message)
