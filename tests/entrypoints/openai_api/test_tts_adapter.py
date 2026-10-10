@@ -68,6 +68,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 # uniform ``self._adapter.build(...)`` dispatch covers it.
 EXPECTED_MODEL_TYPES = {
     "chatterbox",
+    "chatterbox_original",
     "qwen3_tts",
     "voxcpm2",
     "voxtral_tts",

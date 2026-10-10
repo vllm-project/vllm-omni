@@ -17,6 +17,7 @@ import torch
 from vllm_omni.data_entry_keys import CodesStruct, EmbeddingsStruct, MetaStruct, OmniPayloadStruct
 from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.inputs.data import OmniTokensPrompt
+from vllm_omni.model_executor.stage_input_processors.bagel import ExpandedPrompt
 from vllm_omni.transformers_utils.configs.chatterbox import ChatterboxConfig
 
 # S3Gen's constants, the same for every checkpoint that decodes with it.
@@ -25,6 +26,21 @@ SPEECH_TOKEN_LIMIT = ChatterboxConfig().speech_token_limit
 # not play their frames, so a chunk must be sent with exactly this many
 # tokens beyond its own: the decoder's number, not a setting.
 PRE_LOOKAHEAD = ChatterboxConfig().pre_lookahead_len
+
+
+def expand_original_cfg_prompts(prompt: dict, sampling_params: Any) -> list[ExpandedPrompt]:
+    """Add an unconditional twin; the atomic CFG scheduler admits both together."""
+    info = prompt["additional_information"]
+    if info["chatterbox"]["cfg_weight"] == 0:
+        return []
+    companion = {
+        **prompt,
+        "additional_information": {
+            **info,
+            "cfg_group": {"role": "uncond", "uncond_suffix": "__cfg_uncond"},
+        },
+    }
+    return [ExpandedPrompt(prompt=companion, role="uncond", request_id_suffix="__cfg_uncond")]
 
 
 def t3_to_s3gen_async_chunk(
@@ -78,6 +94,8 @@ def t3_to_s3gen_async_chunk(
             them with no other symptom.
     """
     request_id = request.external_req_id
+    if request_id.endswith("__cfg_uncond"):
+        return None
     # A connector's config is its ``extra`` section of the deploy file.
     settings = transfer_manager.connector.config
     chunk, largest = settings["codec_chunk_frames"], settings["codec_max_chunk_frames"]

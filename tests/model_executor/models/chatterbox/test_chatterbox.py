@@ -112,7 +112,7 @@ def test_unknown_stage_is_refused_by_name_001() -> None:
 
 
 def test_all_three_classes_are_registered_and_importable_001() -> None:
-    assert set(STAGES) == {"chatterbox_t3", "chatterbox_s3gen"}
+    assert set(STAGES) == {"chatterbox_t3", "chatterbox_original_t3", "chatterbox_s3gen"}
     for name in ("ChatterboxForConditionalGeneration", "ChatterboxT3ForConditionalGeneration", "ChatterboxS3Gen"):
         package, module, class_name = _OMNI_MODELS[name]
         loaded = importlib.import_module(f"vllm_omni.model_executor.models.{package}.{module}")

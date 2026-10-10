@@ -25,12 +25,14 @@ from vllm.model_executor.models.interfaces import SupportsPP
 from vllm.model_executor.models.utils import maybe_prefix
 from vllm.sequence import IntermediateTensors
 
+from vllm_omni.model_executor.models.chatterbox.chatterbox_original_t3 import ChatterboxOriginalT3
 from vllm_omni.model_executor.models.chatterbox.chatterbox_s3gen import ChatterboxS3Gen
 from vllm_omni.model_executor.models.chatterbox.chatterbox_t3 import ChatterboxT3ForConditionalGeneration
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 
 # Deploy ``model_stage`` to the class that runs it.
 STAGES: dict[str, type[nn.Module]] = {
+    "chatterbox_original_t3": ChatterboxOriginalT3,
     "chatterbox_t3": ChatterboxT3ForConditionalGeneration,
     "chatterbox_s3gen": ChatterboxS3Gen,
 }

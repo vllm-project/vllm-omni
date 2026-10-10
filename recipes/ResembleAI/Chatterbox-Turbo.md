@@ -53,7 +53,34 @@ for S3Gen, with loudness normalization to -27 LUFS.
 Each request carries its own voice tensors. Requests without `ref_audio` use
 `conds.pt` from the selected model directory or Hub snapshot. CPU reference
 encoding runs outside the API event loop; the encoder is initialized on its
-first reference request.
+first reference request. Four preprocessing workers can encode references
+concurrently; the initialization lock is released before encoding begins.
+
+## Chatterbox Original
+
+Serve `ResembleAI/chatterbox` with the same command to select the Original
+deployment (`vllm_omni/deploy/chatterbox.yaml`). It uses a Llama backbone,
+classifier-free guidance, and ten-step S3Gen instead of Turbo's GPT-2 and
+meanflow decoder. Both deployments expose the same speech and streaming API.
+Original uses six seconds of reference audio for T3, ten seconds for S3Gen,
+and does not apply Turbo's loudness normalization or five-second minimum.
+
+Original accepts `extra_params` with `exaggeration` and `cfg_weight`, both
+defaulting to 0.5. Values must be finite and nonnegative. Setting `cfg_weight`
+to zero disables the unconditional companion. Otherwise each request occupies
+two autoregressive sequence slots; the atomic scheduler keeps both branches
+together, and only the conditional branch produces audio. Keep prefix caching,
+chunked prefill, and asynchronous scheduling disabled for this deployment.
+
+```json
+{
+  "model": "ResembleAI/chatterbox",
+  "input": "Hello, welcome to the speech synthesis demonstration.",
+  "voice": "default",
+  "extra_params": {"exaggeration": 0.7, "cfg_weight": 0.5},
+  "response_format": "wav"
+}
+```
 
 Turbo supports English and checkpoint vocal-event tags such as `[laugh]`.
 It does not support VoiceDesign, free-form `instructions`, speaker embeddings

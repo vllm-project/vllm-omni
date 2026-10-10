@@ -67,12 +67,12 @@ def test_a_local_chatterbox_directory_with_a_config_is_left_alone_001(monkeypatc
     assert args.hf_config_path is None
 
 
-def test_an_unlisted_model_type_is_left_alone_001(monkeypatch) -> None:
+def test_an_unlisted_model_type_is_left_alone_001(monkeypatch, tmp_path) -> None:
     def no_config(*args, **kwargs):
         raise OSError("no config.json")
 
     monkeypatch.setattr(PretrainedConfig, "get_config_dict", no_config)
-    args = OmniEngineArgs(model="some/other-model", model_arch="CosyVoice3Model")
+    args = OmniEngineArgs(model=str(tmp_path), model_arch="CosyVoice3Model")
     args.hf_config_path = None
 
     args._patch_empty_hf_config("cosyvoice3")

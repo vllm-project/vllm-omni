@@ -49,13 +49,16 @@ SENTENCE_ENDERS = (".", "!", "?", "-", ",")
 TOKENIZER_BUFFERS = ("tokenizer._mel_filters", "tokenizer.window")
 
 
-def punc_norm(text: str) -> str:
+def punc_norm(text: str, variant: str = "turbo") -> str:
     """Port of ``chatterbox.tts_turbo.punc_norm``."""
     if len(text) == 0:
         return "You need to add some text for me to talk."
     if text[0].islower():
         text = text[0].upper() + text[1:]
     text = " ".join(text.split())
+    if variant == "original":
+        for old, new in (("...", ", "), (" - ", ", "), (";", ", ")):
+            text = text.replace(old, new)
     for old, new in PUNCTUATION_REPLACEMENTS:
         text = text.replace(old, new)
     text = text.rstrip(" ")
@@ -265,7 +268,8 @@ class VoiceConditioner:
             raise ValueError(
                 f"Chatterbox needs a reference clip longer than {config.min_ref_seconds:g} s, got {seconds:.2f} s"
             )
-        wav24 = normalize_loudness(wav24, config.sample_rate, config.loudness_target_lufs)
+        if config.loudness_target_lufs is not None:
+            wav24 = normalize_loudness(wav24, config.sample_rate, config.loudness_target_lufs)
         wav16 = self.to_16k.resample(wav24, orig_sr=config.sample_rate).astype(np.float32)
         return self.from_resampled(wav24, wav16)
 
@@ -324,7 +328,14 @@ class VoiceConditioner:
         return codes[:, : int(code_lens[0])].long()
 
 
-def build_prompt(text_ids: list[int], conditioning: VoiceConditioning, config: ChatterboxConfig) -> dict:
+def build_prompt(
+    text_ids: list[int],
+    conditioning: VoiceConditioning,
+    config: ChatterboxConfig,
+    *,
+    exaggeration: float = 0.5,
+    cfg_weight: float = 0.5,
+) -> dict:
     """The engine prompt for one utterance.
 
     Every prompt id is the start-of-speech token, whose logit is always
@@ -340,7 +351,19 @@ def build_prompt(text_ids: list[int], conditioning: VoiceConditioning, config: C
     Returns:
         A token prompt carrying the conditioning in ``additional_information``.
     """
-    length = 1 + conditioning.cond_tokens.shape[1] + len(text_ids) + 1
+    if config.variant == "original":
+        for name, value in (("exaggeration", exaggeration), ("cfg_weight", cfg_weight)):
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f"{name} must be a finite nonnegative number")
+    length = (
+        len(text_ids) + 38
+        if config.variant == "original"
+        else 1 + conditioning.cond_tokens.shape[1] + len(text_ids) + 1
+    )
     prompt = tokens_input(prompt_token_ids=[config.start_speech_token] * length)
     prompt["additional_information"] = conditioning.additional_information(text_ids)
+    if config.variant == "original":
+        prompt["additional_information"]["chatterbox"] = {"exaggeration": exaggeration, "cfg_weight": cfg_weight}
+        if cfg_weight > 0:
+            prompt["additional_information"]["cfg_group"] = {"role": "cond", "uncond_suffix": "__cfg_uncond"}
     return prompt

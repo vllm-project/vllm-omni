@@ -17,6 +17,8 @@ class ChatterboxConfig(PretrainedConfig):
     model_type = "chatterbox"
 
     def __init__(self, variant: str = "turbo", **kwargs):
+        if variant not in {"turbo", "original"}:
+            raise ValueError("Chatterbox variant must be 'turbo' or 'original'")
         kwargs.setdefault("eos_token_id", 6562)
         super().__init__(**kwargs)
         self.variant = variant
@@ -50,7 +52,7 @@ class ChatterboxConfig(PretrainedConfig):
         self.enc_cond_seconds = 15
         self.dec_cond_seconds = 10
         self.min_ref_seconds = 5.0
-        self.loudness_target_lufs = -27.0
+        self.loudness_target_lufs: float | None = -27.0
         self.s3_tokenizer_name = "speech_tokenizer_v2_25hz"
 
         # Speech tokens and audio.
@@ -78,3 +80,18 @@ class ChatterboxConfig(PretrainedConfig):
         self.t3_weights = "t3_turbo_v1.safetensors"
         self.s3gen_weights = "s3gen_meanflow.safetensors"
         self.ve_weights = "ve.safetensors"
+        if variant == "original":
+            self.vocab_size = self.speech_vocab_size = 8194
+            self.text_vocab_size = 704
+            self.num_hidden_layers = 30
+            self.max_position_embeddings = 131072
+            self.activation_function = "silu"
+            self.cond_prompt_len = 150
+            self.enc_cond_seconds = 6
+            self.min_ref_seconds = 0.0
+            self.loudness_target_lufs = None
+            self.n_silence_tokens = 0
+            self.meanflow = False
+            self.n_cfm_timesteps = 10
+            self.t3_weights = "t3_cfg.safetensors"
+            self.s3gen_weights = "s3gen.safetensors"

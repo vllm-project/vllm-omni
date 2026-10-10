@@ -15,7 +15,7 @@ from vllm_omni.config.stage_config import (
     load_deploy_config,
     merge_pipeline_deploy,
 )
-from vllm_omni.model_executor.models.chatterbox.pipeline import CHATTERBOX_TURBO_PIPELINE
+from vllm_omni.model_executor.models.chatterbox.pipeline import CHATTERBOX_ORIGINAL_PIPELINE, CHATTERBOX_TURBO_PIPELINE
 from vllm_omni.transformers_utils.configs.chatterbox import ChatterboxConfig
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -26,11 +26,9 @@ def deploy() -> dict:
     return yaml.safe_load(Path(get_deploy_config_path("chatterbox_turbo.yaml")).read_text())
 
 
-def test_pipeline_is_registered_under_the_turbo_key_only_001() -> None:
+def test_each_variant_has_its_own_pipeline() -> None:
     assert OMNI_PIPELINES["chatterbox_turbo"] is CHATTERBOX_TURBO_PIPELINE
-    # A bare "chatterbox" key would also claim ResembleAI/chatterbox, the
-    # Original model, through the basename fallback.
-    assert "chatterbox" not in OMNI_PIPELINES
+    assert OMNI_PIPELINES["chatterbox"] is CHATTERBOX_ORIGINAL_PIPELINE
 
 
 def test_a_config_less_checkout_is_matched_by_its_directory_name_001(tmp_path: Path) -> None:
@@ -39,7 +37,7 @@ def test_a_config_less_checkout_is_matched_by_its_directory_name_001(tmp_path: P
     original.mkdir()
     try:
         assert StageConfigFactory.try_infer_model_type(str(turbo), trust_remote_code=False) == "chatterbox_turbo"
-        assert StageConfigFactory.try_infer_model_type(str(original), trust_remote_code=False) is None
+        assert StageConfigFactory.try_infer_model_type(str(original), trust_remote_code=False) == "chatterbox"
     finally:
         StageConfigFactory.get_hf_config.cache_clear()
         StageConfigFactory.try_infer_model_type.cache_clear()

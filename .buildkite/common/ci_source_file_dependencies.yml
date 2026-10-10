@@ -320,6 +320,7 @@ source_file_dependencies:
     - vllm_omni/transformers_utils/configs/chatterbox.py
     - vllm_omni/entrypoints/openai/tts_adapters/chatterbox.py
     - vllm_omni/deploy/chatterbox_turbo.yaml
+    - vllm_omni/deploy/chatterbox.yaml
     - vllm_omni/worker_v2/omni_data_plane.py
     - tests/e2e/offline_inference/test_chatterbox.py
     - tests/e2e/online_serving/test_chatterbox.py

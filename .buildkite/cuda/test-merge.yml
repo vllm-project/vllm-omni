@@ -102,7 +102,7 @@ steps:
   - group: ":card_index_dividers: E2E Test"
     depends_on: upload-merge-pipeline
     steps:
-      - label: "TTS · Chatterbox Turbo Test"
+      - label: "TTS · Chatterbox Turbo and Original Test"
         source_file_dependencies: tts_chatterbox_function
         timeout_in_minutes: 60
         commands:
