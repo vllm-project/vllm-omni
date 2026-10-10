@@ -61,6 +61,13 @@ MISSING_LEVEL_MARKER = "Level"
 MISSING_HARDWARE_MARKER = "Hardware"
 DIRECT_SKU_MARKER = "Direct SKU"
 BARE_PLATFORM_MARKER = "Bare platform"
+_DISALLOWED_MARKERS = frozenset({DIRECT_SKU_MARKER, BARE_PLATFORM_MARKER})
+_PROBLEM_TEXT = {
+    DIRECT_SKU_MARKER: "disallowed SKU mark",
+    BARE_PLATFORM_MARKER: "disallowed platform mark",
+    MISSING_LEVEL_MARKER: "missing level mark",
+    MISSING_HARDWARE_MARKER: "missing hardware mark",
+}
 
 # Check if a file is located under tests/ and matches test_<something>.py
 # or <something>_test.py, since pytest technically collects on both.
@@ -203,22 +210,49 @@ def get_files_missing_markers(
     return results
 
 
+def _format_problem_list(problems: list[str]) -> str:
+    return " and ".join(_PROBLEM_TEXT.get(problem, problem) for problem in problems)
+
+
+def _failure_summary(findings: dict[str, list[str]]) -> tuple[str, str]:
+    """Return the opening sentence and the file-list heading."""
+    kinds = {problem for problems in findings.values() for problem in problems}
+    disallowed = bool(kinds & _DISALLOWED_MARKERS)
+    absent = bool(kinds - _DISALLOWED_MARKERS)
+    if disallowed and absent:
+        return (
+            "test files failed the mark check: some apply marks that are not allowed, "
+            "and some are missing the marks CI uses to collect them.",
+            "The following files failed the mark check:",
+        )
+    if disallowed:
+        return (
+            "test files apply pytest marks that are not allowed. "
+            "Write them with hardware_test(...) / hardware_marks(...).",
+            "The following files apply disallowed marks:",
+        )
+    return (
+        "test files are missing pytest marks required for Buildkite CI collection.",
+        "The following files are missing marks:",
+    )
+
+
 if __name__ == "__main__":
     missing = get_files_missing_markers(sys.argv[1:])
 
     if missing:
-        file_lines = "\n".join(f"  - {path} [{' and '.join(problems)}]" for path, problems in missing.items())
+        file_lines = "\n".join(f"  - {path} [{_format_problem_list(problems)}]" for path, problems in missing.items())
+        summary, heading = _failure_summary(missing)
         sku = ", ".join(sku_markers())
         platforms = ", ".join(bare_platform_markers())
         print(
-            "\033[91merror:\033[0m test files are missing pytest marks "
-            "required for Buildkite CI collection, or apply hardware marks directly.\n\n"
+            f"\033[91merror:\033[0m {summary}\n\n"
             f"Level marks, e.g.: {', '.join(level_markers()[:4])}\n"
             f"Hardware: pytest.mark.cpu, or helpers: {', '.join(HARDWARE_HELPERS)}\n"
             f"Do not write pytest.mark.<platform> ({platforms}) or pytest.mark.<SKU> ({sku}). "
             "Use hardware_test(...) / hardware_marks(...) so the platform, a SKU, and cards_* are attached. "
             "pytest.mark.cpu stays direct because CPU has no SKU.\n\n"
-            "The following files are missing marks:\n"
+            f"{heading}\n"
             f"{file_lines}\n\n"
             "To skip: SKIP=check-mark git commit ..."
         )
