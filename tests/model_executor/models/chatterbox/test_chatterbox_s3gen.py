@@ -34,8 +34,8 @@ HOPS = [20, 30, 60]
 def chunk_plan(total: int) -> list[tuple[int, int, bool]]:
     """(cumulative prefix length, token offset, finalize) per chunk.
 
-    What CosyVoice3's async-chunk processor emits for ``total`` tokens with
-    the deploy file's chunk sizes and a 250-token reference (first hop 20).
+    What the chunk processor emits for ``total`` tokens with the deploy
+    file's chunk sizes and a 250-token reference (first hop 20).
     """
     plan = []
     emitted = 0
@@ -59,18 +59,29 @@ def reference(prompt_tokens: int) -> Reference:
     )
 
 
-def stream_payload(ref: Reference, finished: bool, offset: int) -> dict:
-    """One request's merged payload as the runner hands it to stage 1."""
-    return {
+def stream_payload(ref: Reference | None, finished: bool, offset: int) -> dict:
+    """One request's payload as the runner hands it to stage 1, with or without the voice.
+
+    The runner's own per-request keys share the dict, as on Model Runner V2.
+    """
+    payload: dict = {
         "meta": {
             "finished": torch.tensor(finished),
             "stream_finished": torch.tensor(finished),
-            "req_id": ["external-id"],
             "left_context_size": offset,
         },
-        "embed": {"speech_token": ref.prompt_token, "speech_feat": ref.prompt_feat, "embedding": ref.embedding},
         "generated_len": 0,
+        "req_id": "scheduler-id",
+        "global_request_id": ["external-id"],
+        "sampling_params": SimpleNamespace(max_tokens=16),
     }
+    if ref is not None:
+        payload["embed"] = {
+            "speech_token": ref.prompt_token,
+            "speech_feat": ref.prompt_feat,
+            "embedding": ref.embedding,
+        }
+    return payload
 
 
 @pytest.fixture(scope="module")
@@ -182,6 +193,77 @@ def test_decode_step_keeps_state_until_the_stream_finishes_001(
 
     (last,) = decoder.decode_step(tokens, [60], [stream_payload(references[0], True, 20)], ["scheduler-id"])
     assert first.numel() + last.numel() == 2 * (60 + 3) * SAMPLES_PER_FRAME
+    assert decoder.streams == {}
+
+
+def decode_stream(
+    decoder: S3GenDecoder, tokens: torch.Tensor, request_id: str, ref: Reference, voice_in_every_chunk: bool
+) -> list[torch.Tensor]:
+    """One request's chunks through ``decode_step``, one step each.
+
+    The vocoder's own draw is pinned per chunk, so two decodes of the same
+    stream can be compared sample for sample.
+    """
+    pieces = []
+    for step, (prefix, offset, finalize) in enumerate(chunk_plan(tokens.numel())):
+        torch.manual_seed(step)
+        voice = ref if offset == 0 or voice_in_every_chunk else None
+        (piece,) = decoder.decode_step(
+            tokens[:prefix], [prefix], [stream_payload(voice, finalize, offset)], [request_id]
+        )
+        pieces.append(piece)
+    return pieces
+
+
+def test_the_voice_arrives_once_and_is_kept_for_the_stream_001(
+    decoder: S3GenDecoder, references: list[Reference]
+) -> None:
+    """The runner-side transport hands stage 1 each chunk's own payload, and only the first has the voice."""
+    tokens = torch.randint(0, 6561, (70,))
+    assert [offset for _, offset, _ in chunk_plan(70)] == [0, 20, 50]
+
+    once = decode_stream(decoder, tokens, "once", references[0], voice_in_every_chunk=False)
+    every = decode_stream(decoder, tokens, "every", references[0], voice_in_every_chunk=True)
+
+    assert sum(piece.numel() for piece in once) == 2 * (70 + 3) * SAMPLES_PER_FRAME
+    assert all(torch.equal(a, b) for a, b in zip(once, every, strict=True))
+    assert decoder.streams == {}
+    # Not vacuous: another voice gives other audio from the second chunk on too.
+    other = decode_stream(decoder, tokens, "other", references[1], voice_in_every_chunk=False)
+    assert not torch.allclose(other[1], once[1], atol=1e-3)
+
+
+def test_interleaved_streams_keep_their_own_voices_001(decoder: S3GenDecoder, references: list[Reference]) -> None:
+    """Two live streams, a step each in turn; neither later chunk carries a voice."""
+    tokens = [torch.randint(0, 6561, (70,)) for _ in range(2)]
+    alone = [decode_stream(decoder, row, "alone", ref, False) for row, ref in zip(tokens, references, strict=True)]
+
+    interleaved: list[list[torch.Tensor]] = [[], []]
+    for step, (prefix, offset, finalize) in enumerate(chunk_plan(70)):
+        for stream in (0, 1):
+            torch.manual_seed(step)
+            voice = references[stream] if offset == 0 else None
+            (piece,) = decoder.decode_step(
+                tokens[stream][:prefix], [prefix], [stream_payload(voice, finalize, offset)], [f"stream-{stream}"]
+            )
+            interleaved[stream].append(piece)
+        assert set(decoder.streams) == ({"stream-0", "stream-1"} if not finalize else set())
+
+    for stream in (0, 1):
+        assert all(torch.equal(a, b) for a, b in zip(interleaved[stream], alone[stream], strict=True))
+
+
+def test_a_first_chunk_without_a_voice_is_refused_001(decoder: S3GenDecoder, references: list[Reference]) -> None:
+    """Nothing stands in for it: no other request's voice, no default."""
+    tokens = torch.randint(0, 6561, (23,))
+    decoder.decode_step(tokens, [23], [stream_payload(references[0], False, 0)], ["someone-else"])
+    with pytest.raises(RuntimeError, match="first chunk of request x without a voice"):
+        decoder.decode_step(tokens, [23], [stream_payload(None, False, 0)], ["x"])
+    partial = stream_payload(references[0], False, 0)
+    del partial["embed"]["speech_feat"]
+    with pytest.raises(RuntimeError, match="first chunk of request x without a voice"):
+        decoder.decode_step(tokens, [23], [partial], ["x"])
+    decoder.on_requests_finished({"someone-else"})
     assert decoder.streams == {}
 
 
@@ -443,13 +525,13 @@ def test_a_live_stream_and_a_first_chunk_in_one_step_001(decoder: S3GenDecoder, 
 
 def test_tokens_with_an_empty_payload_are_refused_001(decoder: S3GenDecoder) -> None:
     """What the runner passes for a request it holds no payload for."""
-    with pytest.raises(RuntimeError, match="23 tokens for request x without a reference or stream metadata"):
+    with pytest.raises(RuntimeError, match="23 tokens for request x without stream metadata"):
         decoder.decode_step(torch.randint(0, 6561, (23,)), [23], [{}], ["x"])
 
 
 def test_tokens_without_a_payload_list_are_refused_001(decoder: S3GenDecoder) -> None:
     """Only the profiling run, which has no request ids, comes without payloads."""
-    with pytest.raises(RuntimeError, match="23 tokens for request x without a reference or stream metadata"):
+    with pytest.raises(RuntimeError, match="23 tokens for request x without stream metadata"):
         decoder.decode_step(torch.randint(0, 6561, (23,)), [23], None, ["x"])
 
 
@@ -458,6 +540,9 @@ def test_token_offset_and_stream_state_must_agree_001(decoder: S3GenDecoder, ref
     tokens = torch.randint(0, 6561, (53,))
     with pytest.raises(RuntimeError, match="token offset 20 for request lost, which has no earlier chunk"):
         decoder.decode_step(tokens, [53], [stream_payload(references[0], False, 20)], ["lost"])
+    # The same without a voice in the payload, as a later chunk arrives.
+    with pytest.raises(RuntimeError, match="token offset 20 for request lost, which has no earlier chunk"):
+        decoder.decode_step(tokens, [53], [stream_payload(None, False, 20)], ["lost"])
 
     decoder.decode_step(tokens[:23], [23], [stream_payload(references[0], False, 0)], ["restarted"])
     with pytest.raises(RuntimeError, match="token offset 0 for request restarted, which already has an earlier chunk"):

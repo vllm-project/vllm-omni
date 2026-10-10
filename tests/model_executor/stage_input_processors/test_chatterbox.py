@@ -214,14 +214,17 @@ def chunk_sequence(payloads: list[OmniPayloadStruct]) -> list[tuple]:
     ]
 
 
-def decoded_samples(decoder: S3GenDecoder, payloads: list[OmniPayloadStruct]) -> int:
-    """How many samples stage 1 returns for one request's payloads."""
+def decoded_samples(side: str, decoder: S3GenDecoder, payloads: list[OmniPayloadStruct]) -> int:
+    """How many samples stage 1 returns for one request's payloads.
+
+    The scheduler-side transport merges each chunk into the request's
+    payload, so stage 1 sees the first chunk's voice again on every later
+    one. The runner-side transport hands over each chunk's payload alone.
+    """
     merged: dict = {}
     samples = 0
     for payload in payloads:
-        # The runner merges each update into the request's payload; the
-        # reference arrives once, on the first chunk.
-        merged.update(to_dict(payload))
+        merged = {**merged, **to_dict(payload)} if side == "scheduler-side" else to_dict(payload)
         codes = payload.codes.audio
         (audio,) = decoder.decode_step(codes, [codes.numel()], [merged], ["scheduler-id"])
         samples += audio.numel()
@@ -243,7 +246,7 @@ def test_streamed_chunks_decode_to_the_whole_utterance_001(
         (payload.codes.audio.numel(), payload.meta.left_context_size, bool(payload.meta.stream_finished))
         for payload in payloads
     ] == [(23, 0, False), (53, 20, False), (60, 50, True)]
-    assert decoded_samples(decoder, payloads) == 2 * (60 + 3) * SAMPLES_PER_FRAME
+    assert decoded_samples(side, decoder, payloads) == 2 * (60 + 3) * SAMPLES_PER_FRAME
     assert decoder.streams == {}
 
 
@@ -333,7 +336,7 @@ def test_an_utterance_ending_on_a_chunk_boundary_decodes_to_its_own_length_001(
     payloads = streamed_payloads(side, plane, connector_extra, request_prompt(prompt_tokens), tokens)
 
     assert payloads[-1].codes.audio.tolist() == payloads[-2].codes.audio.tolist() == tokens
-    assert decoded_samples(decoder, payloads) == 2 * (length + 3) * SAMPLES_PER_FRAME
+    assert decoded_samples(side, decoder, payloads) == 2 * (length + 3) * SAMPLES_PER_FRAME
     assert decoder.streams == {}
 
 

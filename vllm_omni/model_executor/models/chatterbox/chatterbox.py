@@ -6,12 +6,14 @@ The pipeline names this class for every stage; ``model_stage`` picks the
 stage class it wraps. What vLLM inspects on the registered class itself
 (``embed_input_ids``, ``compute_logits``, ``forward``, ``load_weights``,
 ``make_empty_intermediate_tensors``) is defined here and delegates. Every
-other attribute the runner probes for (``has_preprocess``, ``preprocess``,
-``preprocess_decode_batch``, ``omni_pooler_payload_include_hidden``,
-``have_multimodal_outputs``, ``enable_update_additional_information``,
-``requires_request_ids``, ``allow_patterns_overrides``,
-``on_requests_finished``) resolves on the stage through ``__getattr__``, so
-a flag set on a stage cannot be forgotten here.
+other attribute either model runner probes for (``has_preprocess``,
+``preprocess``, ``preprocess_decode_batch``,
+``preprocess_decode_batch_mrv2``, ``make_omni_output``,
+``omni_pooler_payload_include_hidden``, ``have_multimodal_outputs``,
+``enable_update_additional_information``, ``requires_request_ids``,
+``allow_patterns_overrides``, ``on_requests_finished``) resolves on the
+stage through ``__getattr__``, so a flag or hook a stage defines cannot be
+forgotten here, and one it does not define stays undefined.
 """
 
 from collections.abc import Iterable
@@ -75,8 +77,8 @@ class ChatterboxForConditionalGeneration(nn.Module, SupportsPP):
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
         **runner_kwargs: object,
-    ) -> OmniOutput | IntermediateTensors:
-        """Run the stage."""
+    ) -> torch.Tensor | OmniOutput | IntermediateTensors:
+        """Run the stage: stage 0's hidden states, or stage 1's audio."""
         return self.model(input_ids, positions, intermediate_tensors, inputs_embeds, **runner_kwargs)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:

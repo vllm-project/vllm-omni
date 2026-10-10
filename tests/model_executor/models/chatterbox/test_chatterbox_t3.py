@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 
@@ -15,6 +16,9 @@ from vllm_omni.model_executor.models.chatterbox.chatterbox_t3 import (
 )
 from vllm_omni.model_executor.models.chatterbox.conditioning import VoiceConditioning, build_prompt
 from vllm_omni.transformers_utils.configs.chatterbox import ChatterboxConfig
+from vllm_omni.worker_v2.model_states.intermediate_buffer import OmniIntermediateBuffer
+from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState
+from vllm_omni.worker_v2.omni_ar_model_runner import OmniARModelRunner
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -177,6 +181,115 @@ def test_batched_decode_embedding_matches_per_request_preprocess_001(
     assert embeds.shape == (3, config.hidden_size)
     assert torch.equal(embeds, torch.cat([row_embeds for _, row_embeds, _ in each]))
     assert updates == [update for _, _, update in each] == [{}, {}, {}]
+
+
+def test_forward_returns_the_backbones_tensor_unwrapped_001(
+    talker: ChatterboxT3ForConditionalGeneration, config: ChatterboxConfig
+) -> None:
+    """Model Runner V2 sizes its CUDA graph's output from what ``forward`` returns."""
+    hidden = torch.randn(3, config.hidden_size)
+    seen: list[tuple] = []
+
+    def backbone(*inputs: torch.Tensor | None) -> torch.Tensor:
+        seen.append(inputs)
+        return hidden
+
+    talker.tfmr = backbone
+    input_ids, positions, embeds = torch.tensor([1, 2, 3]), torch.arange(3), torch.randn(3, config.hidden_size)
+
+    assert talker.forward(input_ids, positions, None, embeds, seq_token_counts=[3]) is hidden
+    assert seen == [(input_ids, positions, None, embeds)]
+
+
+@pytest.mark.parametrize("padded_rows", [7, 16], ids=["as scheduled", "padded by the graph"])
+def test_every_request_of_a_step_gets_a_payload_from_the_runner_001(
+    talker: ChatterboxT3ForConditionalGeneration, config: ChatterboxConfig, padded_rows: int
+) -> None:
+    """The runner-side transport calls the chunk processor only for a request the step has a payload for.
+
+    Two decode rows and a five-token prefill, cut per request by the
+    runner's own slicing, each end up with one key that is not a client
+    output. It holds one false flag per token row and nothing else.
+    """
+    hidden = torch.randn(padded_rows, config.hidden_size)
+
+    output = talker.make_omni_output(hidden, model_intermediate_buffer=[{}, {}, {}])
+
+    assert output.text_hidden_states is hidden
+    inter_stage, client = OmniARModelRunner._build_async_chunk_outputs_from_mm(
+        output.multimodal_outputs, np.array([0, 1, 2]), np.array([1, 1, 5]), 3, 7, padded_rows
+    )
+    assert client is None
+    assert [list(payload) for payload in inter_stage] == [["meta.codec_frame_valid"]] * 3
+    assert [payload["meta.codec_frame_valid"].tolist() for payload in inter_stage] == [[False], [False], [False] * 5]
+
+
+def model_state(talker: ChatterboxT3ForConditionalGeneration, payloads: list[dict]) -> OmniModelState:
+    """Model Runner V2's per-model state around the talker, short of the engine.
+
+    Only what ``run_preprocess`` reads is set; the state resolves the
+    model's decode hook itself, as it does at load.
+    """
+    state = object.__new__(OmniModelState)
+    state.model = talker
+    state.has_preprocess = True
+    state._static_inputs_embeds = None
+    state._decode_preprocess_is_identity = False
+    state.intermediate_buffer = OmniIntermediateBuffer(len(payloads))
+    for slot, payload in enumerate(payloads):
+        state.intermediate_buffer.buffers[slot] = {"req_id": f"request-{slot}", **payload}
+    return state
+
+
+def test_model_runner_v2_embeds_a_mixed_step_through_the_hooks_001(
+    talker: ChatterboxT3ForConditionalGeneration, heads: T3Heads, config: ChatterboxConfig
+) -> None:
+    """V2 orders decode rows first, embeds every row itself, then calls the hooks.
+
+    Rows: two decode rows; a one-token row of a request being recomputed
+    after preemption, which is past its prompt and so goes to the decode
+    hook too; a prefill that runs two generated tokens past its prompt; and
+    a whole prompt. The state unpacks five values from the decode hook.
+    """
+    text_ids = [5, 6, 7]
+    cond_tokens = torch.randint(0, 6561, (150,))
+    speaker = torch.randn(1, 256)
+    prompt = prefill_embeds(heads, torch.tensor(text_ids), cond_tokens, speaker, config.start_speech_token)
+    total = prompt.shape[0]
+    payload = {"ids": {"prompt": text_ids, "speech_token": cond_tokens.tolist()}, "embed": {"voice": speaker}}
+    state = model_state(talker, [payload] * 5)
+    placeholder = torch.full((total,), config.start_speech_token)
+    spans = [
+        torch.tensor([11]),
+        torch.tensor([6560]),
+        torch.tensor([12]),
+        torch.cat([placeholder, torch.tensor([13, 14])]),
+        placeholder,
+    ]
+    input_ids = torch.cat(spans)
+    lengths = [span.numel() for span in spans]
+    batch = SimpleNamespace(
+        idx_mapping_np=np.arange(5),
+        num_reqs=5,
+        num_scheduled_tokens=lengths,
+        query_start_loc_np=np.cumsum([0, *lengths]),
+        num_tokens=input_ids.numel(),
+        num_computed_tokens_np=np.array([total + 4, total + 9, total + 1, 0, 0]),
+    )
+    model_inputs = {"input_ids": input_ids.clone(), "inputs_embeds": talker.embed_input_ids(input_ids)}
+
+    assert OmniModelState._resolve_decode_preprocess(talker) == talker.preprocess_decode_batch_mrv2
+    state.run_preprocess(batch, model_inputs, SimpleNamespace(prompt_len=np.full(5, total)))
+
+    assert torch.equal(model_inputs["input_ids"], input_ids)
+    assert torch.equal(
+        model_inputs["inputs_embeds"],
+        torch.cat(
+            [heads.speech_emb(torch.tensor([11, 6560, 12])), prompt, heads.speech_emb(torch.tensor([13, 14])), prompt]
+        ),
+    )
+    # No hook wrote anything back into a request's payload.
+    assert [set(buffer) for buffer in state.intermediate_buffer.buffers] == [{"req_id", "ids", "embed"}] * 5
 
 
 def test_logits_are_the_speech_heads_with_the_start_token_masked_001(heads: T3Heads, config: ChatterboxConfig) -> None:

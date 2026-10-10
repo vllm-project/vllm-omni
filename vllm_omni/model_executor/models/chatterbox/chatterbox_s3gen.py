@@ -44,7 +44,6 @@ from torch import nn
 from vllm.config import VllmConfig
 from vllm.sequence import IntermediateTensors
 
-from vllm_omni.data_entry_keys import to_struct
 from vllm_omni.model_executor.models.chatterbox.s3gen_core.configs import CFM_PARAMS
 from vllm_omni.model_executor.models.chatterbox.s3gen_core.decoder import ConditionalDecoder
 from vllm_omni.model_executor.models.chatterbox.s3gen_core.flow import CausalMaskedDiffWithXvec
@@ -90,11 +89,14 @@ class StreamState:
     """What one request carries from one chunk to the next.
 
     Attributes:
+        reference: The request's voice, which arrives with its first chunk
+            and with no later one.
         mel: Shape (1, 80, 8), the last frames decoded, vocoded again next time.
         source: Shape (1, 1, 3840), HiFT's source signal for those frames.
         speech: Shape (1, 3840), the samples held back for the cross-fade.
     """
 
+    reference: Reference
     mel: torch.Tensor
     source: torch.Tensor
     speech: torch.Tensor
@@ -497,6 +499,7 @@ class S3GenDecoder(nn.Module):
                     (
                         speech[i][:, :-SOURCE_CACHE_SAMPLES],
                         StreamState(
+                            reference=chunk.reference,
                             mel=mels[i][:, :, -MEL_CACHE_FRAMES:],
                             source=source[i][:, :, -SOURCE_CACHE_SAMPLES:],
                             speech=speech[i][:, -SOURCE_CACHE_SAMPLES:],
@@ -518,8 +521,9 @@ class S3GenDecoder(nn.Module):
             input_ids: The step's flat token ids; per request, every valid
                 speech token of the utterance so far.
             counts: Tokens per request, in batch order.
-            payloads: Per request, the merged inter-stage payload; empty for
-                a request the runner holds none for.
+            payloads: Per request, the inter-stage payload of its chunk;
+                empty for a request the runner holds none for. Only a
+                request's first chunk has to carry its voice.
             request_ids: Per request, the scheduler's id. None on the
                 engine's profiling run, and only then.
 
@@ -528,13 +532,14 @@ class S3GenDecoder(nn.Module):
             step, empty when the request had nothing to decode.
 
         Raises:
-            RuntimeError: If a request has tokens but no payload, reference
-                or stream metadata: decoding such a chunk as a whole
-                utterance would play wrong audio with no error. Also if its
-                token offset and its stored stream state disagree, where a
-                first chunk would be cross-faded or a later one faded in.
+            RuntimeError: If a request has tokens but no stream metadata:
+                decoding such a chunk as a whole utterance would play wrong
+                audio with no error. If its token offset and its stored
+                stream state disagree, where a first chunk would be
+                cross-faded or a later one faded in. If its first chunk
+                carries no voice.
         """
-        device = self.trim_fade.device
+        device, dtype = self.trim_fade.device, self.trim_fade.dtype
         audios = [torch.zeros(0, device=input_ids.device)] * len(counts)
         if request_ids is None:
             return audios
@@ -551,38 +556,39 @@ class S3GenDecoder(nn.Module):
             # The async processor's terminal payload carries no tokens.
             if count == 0:
                 continue
-            payload = to_struct(raw)
-            meta, embed = payload.meta, payload.embed
-            if (
-                embed is None
-                or embed.speech_token is None
-                or embed.speech_feat is None
-                or embed.embedding is None
-                or meta is None
-                or meta.stream_finished is None
-                or meta.left_context_size is None
-            ):
+            # Read by section: beside the chunk's payload the runner keeps
+            # keys of its own in the same dict (the request id, the sampling
+            # parameters), which are not payload fields.
+            meta, embed = raw.get("meta") or {}, raw.get("embed") or {}
+            offset, final = meta.get("left_context_size"), meta.get("stream_finished")
+            if offset is None or final is None:
                 raise RuntimeError(
-                    f"chatterbox_s3gen got {count} tokens for request {request_id} "
-                    "without a reference or stream metadata"
+                    f"chatterbox_s3gen got {count} tokens for request {request_id} without stream metadata"
                 )
             state = self.streams.get(request_id)
-            if (state is None) != (meta.left_context_size == 0):
+            if (state is None) != (offset == 0):
                 raise RuntimeError(
-                    f"chatterbox_s3gen got token offset {meta.left_context_size} for request {request_id}, "
+                    f"chatterbox_s3gen got token offset {offset} for request {request_id}, "
                     f"which {'has no' if state is None else 'already has an'} earlier chunk"
+                )
+            if state is not None:
+                # The voice the stream began with, whatever this payload holds.
+                reference = state.reference
+            elif any(embed.get(name) is None for name in ("speech_token", "speech_feat", "embedding")):
+                raise RuntimeError(f"chatterbox_s3gen got the first chunk of request {request_id} without a voice")
+            else:
+                reference = Reference(
+                    prompt_token=embed["speech_token"].to(device),
+                    prompt_feat=embed["speech_feat"].to(device=device, dtype=dtype),
+                    embedding=embed["embedding"].to(device=device, dtype=dtype),
                 )
             chunks.append(
                 Chunk(
                     tokens=tokens.to(device),
-                    token_offset=meta.left_context_size,
-                    reference=Reference(
-                        prompt_token=embed.speech_token.to(device),
-                        prompt_feat=embed.speech_feat.to(device=device, dtype=self.trim_fade.dtype),
-                        embedding=embed.embedding.to(device=device, dtype=self.trim_fade.dtype),
-                    ),
+                    token_offset=offset,
+                    reference=reference,
                     state=state,
-                    finalize=bool(meta.stream_finished),
+                    finalize=bool(final),
                 )
             )
             owners.append((idx, request_id))
@@ -626,7 +632,8 @@ class ChatterboxS3Gen(S3GenDecoder):
 
     # Without this the runner discards OmniOutput.multimodal_outputs.
     have_multimodal_outputs = True
-    # Has the runner keep and merge each request's inter-stage payload.
+    # Has the default runner keep and merge each request's inter-stage
+    # payload. Model Runner V2 always does and does not read this.
     enable_update_additional_information = True
     # Has the runner pass the scheduler's request ids, the ids that
     # on_requests_finished is later given. The payload's own id is the
@@ -676,8 +683,8 @@ class ChatterboxS3Gen(S3GenDecoder):
             intermediate_tensors: Unused; the stage is not pipeline-parallel.
             inputs_embeds: Unused; the tokens are decoded as ids.
             seq_token_counts: Tokens per request, in batch order.
-            model_intermediate_buffer: Per request, the merged inter-stage
-                payload.
+            model_intermediate_buffer: Per request, the inter-stage payload
+                of its chunk.
             request_ids: Per request, the scheduler's id. Absent only on the
                 runner's profiling run.
             **runner_kwargs: Whatever else the runner passes to every model.

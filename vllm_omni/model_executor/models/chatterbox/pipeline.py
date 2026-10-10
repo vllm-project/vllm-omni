@@ -10,6 +10,9 @@ the shared-memory connector (``t3_to_s3gen_async_chunk``). With
 ``async_chunk: false`` stage 1 receives the finished utterance from
 ``t3_to_s3gen``.
 
+Both stages run on either model runner. On Model Runner V2 they use its
+native data plane, where each stage's runner owns the connector.
+
 The key is ``chatterbox_turbo``, not ``chatterbox``: the checkpoint has no
 config.json, so the serving factory matches the repo name against the
 registered keys, and a bare ``chatterbox`` key would also claim
@@ -34,6 +37,7 @@ CHATTERBOX_TURBO_PIPELINE = PipelineConfig(
             owns_tokenizer=True,
             engine_output_type="latent",
             async_chunk_process_next_stage_input_func=f"{_PROC}.chatterbox.t3_to_s3gen_async_chunk",
+            supports_native_mrv2_data_plane=True,
             sampling_constraints={
                 "stop_token_ids": [ChatterboxConfig().stop_speech_token],
                 # Speech ids mean nothing to the text tokenizer.
@@ -49,6 +53,7 @@ CHATTERBOX_TURBO_PIPELINE = PipelineConfig(
             final_output_type="audio",
             engine_output_type="audio",
             sync_process_input_func=f"{_PROC}.chatterbox.t3_to_s3gen",
+            supports_native_mrv2_data_plane=True,
         ),
     ),
 )

@@ -48,6 +48,9 @@ def test_stage_topology_001() -> None:
     assert (decoder.model_stage, decoder.execution_type) == ("chatterbox_s3gen", StageExecutionType.LLM_GENERATION)
     assert talker.sampling_constraints == {"stop_token_ids": [config.stop_speech_token], "detokenize": False}
     assert decoder.final_output and decoder.final_output_type == "audio"
+    # On Model Runner V2 both stages use its native data plane; without the
+    # declaration a stage falls back to the scheduler-side transport.
+    assert talker.supports_native_mrv2_data_plane and decoder.supports_native_mrv2_data_plane
     for path in (talker.async_chunk_process_next_stage_input_func, decoder.sync_process_input_func):
         module, _, function = path.rpartition(".")
         assert callable(getattr(importlib.import_module(module), function))

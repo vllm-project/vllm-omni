@@ -172,10 +172,11 @@ class ChatterboxT3ForConditionalGeneration(nn.Module, SupportsPP):
 
     # The runner replaces the placeholder prompt's embeddings through preprocess.
     has_preprocess = True
-    # Without this the runner discards OmniOutput.multimodal_outputs.
+    # Has the runner call make_omni_output and keep what it returns.
     have_multimodal_outputs = True
-    # Stage 1 reads the sampled ids, never the hidden states. The chunk
-    # processor is still called every step: it sets ``requires_token_updates``.
+    # Stage 1 reads the sampled ids, never the hidden states. Read by the
+    # default runner only; Model Runner V2 copies no hidden state when
+    # streaming and always copies it otherwise.
     omni_pooler_payload_include_hidden = False
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
@@ -267,8 +268,8 @@ class ChatterboxT3ForConditionalGeneration(nn.Module, SupportsPP):
     ) -> tuple[torch.Tensor, torch.Tensor, list[dict]]:
         """Embed a step's decode rows in one lookup.
 
-        The runner calls this in place of ``preprocess`` for the rows that
-        are one decode token each.
+        The default runner calls this in place of ``preprocess`` for the
+        rows that are one decode token each.
 
         Args:
             input_ids: Shape (N,), one sampled speech id per request.
@@ -279,6 +280,29 @@ class ChatterboxT3ForConditionalGeneration(nn.Module, SupportsPP):
             for any request.
         """
         return input_ids, self.embed_input_ids(input_ids), [{} for _ in req_infos]
+
+    def preprocess_decode_batch_mrv2(
+        self, *, input_ids: torch.Tensor, input_embeds: torch.Tensor, req_infos: list[dict]
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, list[dict]]:
+        """A step's decode rows on Model Runner V2, which has already embedded them.
+
+        V2 fills ``input_embeds`` with ``embed_input_ids`` of every row
+        before any hook, and that is all a decode row needs. It also unpacks
+        five values from this hook: the two in the middle feed a
+        residual-codebook predictor, which this model does not have, so they
+        are empty.
+
+        Args:
+            input_ids: Shape (N,), one sampled speech id per request.
+            input_embeds: Shape (N, H), their embeddings.
+            req_infos: Per request, the fields ``preprocess`` is given.
+
+        Returns:
+            The ids and embeddings as given, two tensors of shape (N, 0), and
+            no payload update for any request.
+        """
+        empty = input_embeds.new_empty((len(req_infos), 0))
+        return input_ids, input_embeds, empty, empty, [{} for _ in req_infos]
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Speech logits with the start token masked."""
@@ -291,12 +315,40 @@ class ChatterboxT3ForConditionalGeneration(nn.Module, SupportsPP):
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
         **runner_kwargs: object,
-    ) -> OmniOutput | IntermediateTensors:
-        """Run the backbone. Emits no audio; stage 1 gets the sampled ids."""
-        hidden = self.tfmr(input_ids, positions, intermediate_tensors, inputs_embeds)
-        if isinstance(hidden, IntermediateTensors):
-            return hidden
-        return OmniOutput(text_hidden_states=hidden, multimodal_outputs={})
+    ) -> torch.Tensor | IntermediateTensors:
+        """Run the backbone.
+
+        Returns:
+            The hidden states, shape (N, H). A tensor and nothing wrapped
+            around it: Model Runner V2 captures this call in a CUDA graph and
+            sizes the graph's output from it.
+        """
+        return self.tfmr(input_ids, positions, intermediate_tensors, inputs_embeds)
+
+    def make_omni_output(self, model_outputs: torch.Tensor, **runner_kwargs: object) -> OmniOutput:
+        """Wrap a step's hidden states for the runner. Emits no audio and no tokens.
+
+        Stage 1 gets the sampled ids, which the chunk processor reads from
+        the request itself. The one entry here exists because the
+        runner-side transport calls the chunk processor for a request only
+        on a step that has a payload for it, and the processor must see
+        every sampled token. It is one flag per token row, which the runner
+        slices to each request's rows, and every flag is false: the payload
+        holds no codec frame.
+
+        Args:
+            model_outputs: ``forward``'s hidden states, shape (N, H).
+            **runner_kwargs: Whatever else the runner passes.
+
+        Returns:
+            The hidden states and the per-row flags.
+        """
+        return OmniOutput(
+            text_hidden_states=model_outputs,
+            multimodal_outputs={
+                "meta": {"codec_frame_valid": torch.zeros(model_outputs.shape[0], dtype=torch.bool, device="cpu")}
+            },
+        )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load ``t3_turbo_v1.safetensors``.
