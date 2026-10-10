@@ -44,6 +44,10 @@ from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.cache.cachedit import CacheDiTAdapterConfig
 from vllm_omni.diffusion.data import DiffusionParallelConfig, OmniDiffusionConfig
+from vllm_omni.diffusion.distributed.parallel_state import (
+    get_sequence_parallel_world_size,
+    model_parallel_is_initialized,
+)
 from vllm_omni.diffusion.distributed.sp_plan import (
     SequenceParallelInput,
     SequenceParallelOutput,
@@ -54,6 +58,15 @@ from vllm_omni.diffusion.models.host_weight_contract import FinalLayoutModelCont
 from vllm_omni.diffusion.offloader.config import offload_enabled
 
 logger = init_logger(__name__)
+
+
+def _get_sequence_parallel_size(parallel_config: DiffusionParallelConfig) -> int:
+    if model_parallel_is_initialized():
+        return get_sequence_parallel_world_size()
+    configured_size = parallel_config.sequence_parallel_size
+    return configured_size if configured_size is not None else 1
+
+
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
@@ -258,9 +271,8 @@ class Flux2Attention(nn.Module):
             encoder_query = self.norm_added_q(encoder_query)
             encoder_key = self.norm_added_k(encoder_key)
 
-            sp_size = self.parallel_config.sequence_parallel_size
-            forward_ctx = get_forward_context()
-            use_sp_joint_attention = sp_size is not None and sp_size > 1 and not forward_ctx.split_text_embed_in_sp
+            sp_size = _get_sequence_parallel_size(self.parallel_config)
+            use_sp_joint_attention = sp_size > 1
 
             if use_sp_joint_attention and image_rotary_emb is not None:
                 cos, sin = image_rotary_emb
@@ -463,12 +475,9 @@ class Flux2ParallelSelfAttention(nn.Module):
         query = self.norm_q(query)
         key = self.norm_k(key)
 
-        sp_size = self.parallel_config.sequence_parallel_size
-        forward_ctx = get_forward_context()
+        sp_size = _get_sequence_parallel_size(self.parallel_config)
         text_seq_len = kwargs.get("text_seq_len", None)
-        use_sp_single_stream = (
-            sp_size is not None and sp_size > 1 and not forward_ctx.split_text_embed_in_sp and text_seq_len is not None
-        )
+        use_sp_single_stream = sp_size > 1 and text_seq_len is not None
 
         if use_sp_single_stream and image_rotary_emb is not None:
             cos, sin = image_rotary_emb
@@ -591,6 +600,7 @@ class Flux2SingleTransformerBlock(nn.Module):
         attn_output = self.attn(
             hidden_states=norm_hidden_states,
             image_rotary_emb=image_rotary_emb,
+            text_seq_len=text_seq_len,
             **joint_attention_kwargs,
         )
 
@@ -1004,8 +1014,8 @@ class Flux2Transformer2DModel(nn.Module):
 
         num_txt_tokens = encoder_hidden_states.shape[1]
 
-        sp_size = self.parallel_config.sequence_parallel_size
-        if sp_size is not None and sp_size > 1:
+        sp_size = _get_sequence_parallel_size(self.parallel_config)
+        if sp_size > 1:
             get_forward_context().split_text_embed_in_sp = False
 
         timestep = timestep.to(hidden_states.dtype) * 1000
