@@ -216,12 +216,14 @@ def print_summary_table(results: list[dict[str, Any]]) -> None:
         rtf = r.get("mean_audio_rtf", float("nan"))
         ttfp = r.get("mean_audio_ttfp_ms", float("nan"))
         throughput = r.get("audio_throughput", float("nan"))
-        wer = r.get("seed_tts_mean_wer", float("nan"))
-        sim = r.get("seed_tts_mean_sim", float("nan"))
-        utmos = r.get("seed_tts_mean_utmos", float("nan"))
+        # Keys written by vllm_omni/benchmarks/data_modules/seed_tts_eval.py;
+        # a metric with no evaluated samples is saved as null.
+        wer = r.get("seed_tts_content_error_mean")
+        sim = r.get("seed_tts_sim_mean")
+        utmos = r.get("seed_tts_utmos_mean")
 
-        def fmt(v: float, digits: int = 3) -> str:
-            return f"{v:.{digits}f}" if not math.isnan(v) else "  n/a"
+        def fmt(v: float | None, digits: int = 3) -> str:
+            return f"{v:.{digits}f}" if v is not None and not math.isnan(v) else "  n/a"
 
         print(
             f"{task:<16} {task_type:<12} {str(conc):>11} {fmt(rtf):>10} {fmt(ttfp, 0):>10} "
