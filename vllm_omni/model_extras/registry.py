@@ -24,6 +24,10 @@ from vllm_omni.model_extras.cosmos3 import (
     COSMOS3_EXTRA_BODY_PARAMS,
     COSMOS3_EXTRA_OUTPUT_PARAMS,
 )
+from vllm_omni.model_extras.dreamx_world import (
+    DREAMX_WORLD_EXTRA_BODY_PARAMS,
+    DREAMX_WORLD_EXTRA_OUTPUT_PARAMS,
+)
 from vllm_omni.model_extras.helios import (
     HELIOS_EXTRA_BODY_PARAMS,
     HELIOS_EXTRA_OUTPUT_PARAMS,
@@ -241,6 +245,10 @@ _EXTRA_SPECS: dict[str, dict[str, Any]] = {
     "Cosmos3OmniPipeline": {
         "extra_body_params": COSMOS3_EXTRA_BODY_PARAMS,
         "extra_output_params": COSMOS3_EXTRA_OUTPUT_PARAMS,
+    },
+    "WanCameraPipeline": {
+        "extra_body_params": DREAMX_WORLD_EXTRA_BODY_PARAMS,
+        "extra_output_params": DREAMX_WORLD_EXTRA_OUTPUT_PARAMS,
     },
     "Magi2Pipeline": {
         "extra_body_params": MAGI2_EXTRA_BODY_PARAMS,

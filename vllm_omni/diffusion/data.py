@@ -794,6 +794,10 @@ def resolve_model_class_name(
         from vllm_omni.diffusion.utils.hf_utils import _looks_like_dreamzero
 
         return "DreamZeroPipeline" if _looks_like_dreamzero(model) else None
+    from vllm_omni.diffusion.utils.hf_utils import _looks_like_dreamx_cam
+
+    if _looks_like_dreamx_cam(model, cfg):
+        return "WanCameraPipeline"
     if len(architectures) == 1:
         return architectures[0]
     return None
@@ -1659,6 +1663,8 @@ class OmniDiffusionConfig:
                     "that require additional inputs."
                 )
             else:
+                from vllm_omni.diffusion.utils.hf_utils import _looks_like_dreamx_cam
+
                 cfg = get_hf_file_to_dict("config.json", self.model, revision=self.revision)
                 if cfg is None:
                     native_model_class = resolve_native_diffusion_model_class(self.model)
@@ -1776,6 +1782,10 @@ class OmniDiffusionConfig:
                     if self.model_class_name is None:
                         self.model_class_name = "Pi05Pipeline"
                     self.set_tf_model_config(TransformerConfig())
+                    self.update_multimodal_support()
+                elif self.model_class_name == "WanCameraPipeline" or _looks_like_dreamx_cam(self.model, cfg):
+                    if self.model_class_name is None:
+                        self.model_class_name = "WanCameraPipeline"
                     self.update_multimodal_support()
                 elif architectures and len(architectures) == 1:
                     architecture = architectures[0]

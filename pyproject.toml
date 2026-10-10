@@ -237,6 +237,9 @@ ignore = [
 "vllm_omni/diffusion/models/kandinsky6/kandinsky6_transformer.py" = ["N803", "E741"]
 "vllm_omni/diffusion/models/kandinsky6/pipeline_kandinsky6.py" = ["N803"]
 "vllm_omni/diffusion/models/kandinsky6/modeling_kandinsky6_audio.py" = ["E501", "E741", "N803", "UP008"]
+# PRoPE attention math vendored from the MIT-licensed reference (via DreamX-World).
+# Keeps upstream math-symbol argument names (e.g. ``Ks``) for easy diffing.
+"vllm_omni/diffusion/models/wan2_2/prope_utils.py" = ["N803"]
 
 [tool.ruff.lint.flake8-tidy-imports.banned-api]
 "librosa".msg = "The librosa module is banned, use vllm.multimodal helpers instead"
