@@ -23,6 +23,8 @@ def _positive_int(name: str, default: int | None) -> int | None:
 
 environment_variables: dict[str, Callable[[], Any]] = {
     # ================== SeedVR2 Restoration Env Vars ==================
+    # Exact request-local DiT metadata/trigonometric reuse; 0 restores reference work.
+    "VLLM_OMNI_SEEDVR2_DIT_CACHE": lambda: os.environ.get("VLLM_OMNI_SEEDVR2_DIT_CACHE", "1") != "0",
     # Admission budgets for the sharded serving profile. The defaults are
     # calibrated for the smallest qualified device, so larger accelerators raise
     # them here; setting them beyond what the device holds surfaces as a CUDA

@@ -627,6 +627,9 @@ class SeedVR2Pipeline(nn.Module):
         missing = targets.keys() - loaded
         if missing:
             raise ValueError(f"Missing SeedVR2 checkpoint keys: {sorted(missing)}")
+        # Also covers checkpoint copies into inference tensors without version counters.
+        for block in self.transformer.blocks:
+            block.attn.rope.clear_frequency_cache()
         return loaded
 
     @torch.inference_mode()

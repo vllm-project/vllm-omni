@@ -8,7 +8,7 @@ import hashlib
 import math
 from collections import OrderedDict
 from collections.abc import Callable, Iterable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from math import ceil, sqrt
 
 import torch
@@ -21,6 +21,7 @@ from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.data import DiffusionParallelConfig
 from vllm_omni.diffusion.distributed.parallel_state import get_sp_group
+from vllm_omni.diffusion.models.seedvr2 import config as seedvr2_envs
 
 
 def validate_seedvr2_parallel_config(parallel: DiffusionParallelConfig) -> None:
@@ -290,9 +291,37 @@ class NaMMRotaryEmbedding3d(nn.Module):
         # must already match the port's parameter layout.
         self.register_buffer("freqs", lang_freqs(self.axis_dim, theta), persistent=True)
         self._axis_cache: dict[tuple, torch.Tensor] = {}
+        self._frequency_token: tuple | None = None
+        self._frequency_values: tuple[float, ...] | None = None
+        self.register_load_state_dict_post_hook(self._clear_loaded_frequency_cache)
+
+    def clear_frequency_cache(self) -> None:
+        self._axis_cache.clear()
+        self._frequency_token = None
+        self._frequency_values = None
+
+    def _clear_loaded_frequency_cache(self, module: nn.Module, incompatible_keys: object) -> None:
+        self.clear_frequency_cache()
+
+    def _check_frequency_generation(self) -> None:
+        try:
+            version = self.freqs._version
+        except RuntimeError:  # Inference tensors: the checkpoint loader explicitly invalidates.
+            version = None
+        token = (id(self.freqs), version, str(self.freqs.device), self.freqs.dtype)
+        if token != self._frequency_token:
+            self.clear_frequency_cache()
+            self._frequency_token = token
+
+    def frequency_signature(self) -> tuple[int, int, tuple[float, ...]]:
+        self._check_frequency_generation()
+        if self._frequency_values is None:
+            self._frequency_values = tuple(self.freqs.detach().cpu().float().tolist())
+        return self.rot_dim, self.num_axes, self._frequency_values
 
     # -- frequency construction -------------------------------------------
     def _axis_angles(self, positions: torch.Tensor, *, device, dtype) -> torch.Tensor:
+        self._check_frequency_generation()
         key = (positions.numel(), int(positions[0]), float(positions[-1]), str(device), str(dtype))
         cached = self._axis_cache.get(key)
         if cached is None:
@@ -362,6 +391,67 @@ class NaMMRotaryEmbedding3d(nn.Module):
         txt_q = apply_rotary_emb(txt_freqs, txt_q.transpose(0, 1)).transpose(0, 1)
         txt_k = apply_rotary_emb(txt_freqs, txt_k.transpose(0, 1)).transpose(0, 1)
         return vid_q, vid_k, txt_q, txt_k
+
+
+@dataclass(frozen=True)
+class SeedVR2RotaryTables:
+    video_freqs: torch.Tensor
+    text_freqs: torch.Tensor
+    video_cos: torch.Tensor
+    video_sin: torch.Tensor
+    text_cos: torch.Tensor
+    text_sin: torch.Tensor
+
+
+class SeedVR2RotaryCache:
+    """Bounded, request-owned tables; only equal frequency values share storage."""
+
+    def __init__(self, capacity: int = 8) -> None:
+        if capacity < 1:
+            raise ValueError("Rotary cache capacity must be positive")
+        self.capacity = capacity
+        self.entries: OrderedDict[tuple, SeedVR2RotaryTables] = OrderedDict()
+        self.hits = 0
+        self.builds = 0
+
+    def get(
+        self,
+        rope: NaMMRotaryEmbedding3d,
+        shapes: Sequence[tuple[int, int, int]],
+        text_len: int,
+        *,
+        device: torch.device | str,
+        dtype: torch.dtype,
+    ) -> SeedVR2RotaryTables:
+        shapes = tuple(tuple(int(v) for v in row) for row in shapes)
+        key = (rope.frequency_signature(), shapes, int(text_len), str(device), dtype)
+        tables = self.entries.get(key)
+        if tables is not None:
+            self.entries.move_to_end(key)
+            self.hits += 1
+            return tables
+        video = rope.window_freqs_batch(list(shapes), text_len, device=device, dtype=dtype)
+        text = rope.text_freqs(text_len, device=device, dtype=dtype)
+        tables = SeedVR2RotaryTables(
+            video, text, video.float().cos(), video.float().sin(), text.float().cos(), text.float().sin()
+        )
+        self.entries[key] = tables
+        self.builds += 1
+        if len(self.entries) > self.capacity:
+            self.entries.popitem(last=False)
+        return tables
+
+
+def apply_rotary_emb_cached(cos: torch.Tensor, sin: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+    """Same fp32 rotation and cast order as apply_rotary_emb, with cached trig."""
+    rot_dim = cos.shape[-1]
+    if rot_dim > t.shape[-1] or cos.shape[0] < t.shape[-2]:
+        raise ValueError("Cached rotary table does not cover the input")
+    middle = t[..., :rot_dim].float()
+    rotated = middle * cos[-t.shape[-2] :] + rotate_half(middle) * sin[-t.shape[-2] :]
+    if rot_dim == t.shape[-1]:
+        return rotated.to(t.dtype)
+    return torch.cat((rotated, t[..., rot_dim:]), dim=-1).to(t.dtype)
 
 
 #: Bumped whenever assignment or routing semantics change.
@@ -1151,6 +1241,11 @@ class LocalWindowContext:
     text_len: int
     local_windows: int
     global_windows: int
+    cache_enabled: bool = True
+    cpu_window_shapes: tuple[tuple[int, int, int], ...] | None = None
+    cpu_joint_offsets: tuple[int, ...] | None = None
+    sdpa_groups: tuple[tuple[int, int, torch.Tensor], ...] | None = None
+    rotary_cache: SeedVR2RotaryCache = field(default_factory=SeedVR2RotaryCache, repr=False)
 
     @property
     def num_video_tokens(self) -> int:
@@ -1225,6 +1320,8 @@ def build_local_window_context(
         text_len=int(text_len),
         local_windows=num_windows,
         global_windows=int(global_windows),
+        cpu_window_shapes=tuple(tuple(int(v) for v in row) for row in rank_plan.window_shapes.tolist()),
+        cpu_joint_offsets=tuple(int(v) + i * text_len for i, v in enumerate(rank_plan.video_cu_seqlens.tolist())),
     )
 
 
@@ -1302,6 +1399,7 @@ class SeedVR2WindowRuntime:
                 global_windows=layout.num_windows,
                 device=device,
             )
+            ctx.cache_enabled = seedvr2_envs.VLLM_OMNI_SEEDVR2_DIT_CACHE
             self._contexts[layout.key] = ctx
         return ctx
 
@@ -1615,6 +1713,29 @@ def grouped_window_sdpa(
     """
     if ctx.local_windows == 0:
         return torch.empty_like(q)
+    if ctx.cache_enabled:
+        if ctx.sdpa_groups is None:
+            # Normal runtime uses CPU planner metadata, avoiding device-to-host reads.
+            offsets = ctx.cpu_joint_offsets
+            if offsets is None:
+                offsets = tuple(ctx.joint_cu_seqlens.cpu().tolist())
+            lengths = [end - start for start, end in zip(offsets, offsets[1:])]
+            groups = []
+            for length in sorted(set(lengths)):
+                ids = [i for i, size in enumerate(lengths) if size == length]
+                rows = torch.cat([torch.arange(offsets[i], offsets[i] + length, dtype=torch.int64) for i in ids]).to(
+                    device=q.device
+                )
+                groups.append((length, len(ids), rows))
+            ctx.sdpa_groups = tuple(groups)
+        out = torch.empty_like(q)
+        for length, num, rows in ctx.sdpa_groups:
+            qq = q.index_select(0, rows).view(num, length, q.shape[1], q.shape[2]).transpose(1, 2)
+            kk = k.index_select(0, rows).view(num, length, k.shape[1], k.shape[2]).transpose(1, 2)
+            vv = v.index_select(0, rows).view(num, length, v.shape[1], v.shape[2]).transpose(1, 2)
+            attended = F.scaled_dot_product_attention(qq, kk, vv, scale=softmax_scale)
+            out.index_copy_(0, rows, attended.transpose(1, 2).reshape(-1, q.shape[1], q.shape[2]))
+        return out
     lengths = ctx.joint_lengths
     offsets = ctx.joint_cu_seqlens.to(torch.int64)
     out = torch.empty_like(q)
@@ -1707,6 +1828,20 @@ class NaSwinAttention(nn.Module):
 
     def _apply_rope(self, vid_q, vid_k, txt_q, txt_k, ctx: LocalWindowContext):
         device = vid_q.device
+        if ctx.cache_enabled:
+            if ctx.cpu_window_shapes is None:
+                ctx.cpu_window_shapes = tuple(tuple(int(v) for v in row) for row in ctx.window_shapes.cpu().tolist())
+            tables = ctx.rotary_cache.get(
+                self.rope, ctx.cpu_window_shapes, ctx.text_len, device=device, dtype=torch.float32
+            )
+            if tables.video_freqs.shape[0] != vid_q.shape[0]:
+                raise ValueError("Cached window RoPE does not cover video rows")
+            return (
+                apply_rotary_emb_cached(tables.video_cos, tables.video_sin, vid_q.transpose(0, 1)).transpose(0, 1),
+                apply_rotary_emb_cached(tables.video_cos, tables.video_sin, vid_k.transpose(0, 1)).transpose(0, 1),
+                apply_rotary_emb_cached(tables.text_cos, tables.text_sin, txt_q.transpose(0, 1)).transpose(0, 1),
+                apply_rotary_emb_cached(tables.text_cos, tables.text_sin, txt_k.transpose(0, 1)).transpose(0, 1),
+            )
         vid_freqs = self.rope.window_freqs_batch(ctx.window_shapes, ctx.text_len, device=device, dtype=torch.float32)
         txt_freqs = self.rope.text_freqs(ctx.text_len, device=device, dtype=torch.float32)
         if vid_freqs.shape[0] != vid_q.shape[0]:
