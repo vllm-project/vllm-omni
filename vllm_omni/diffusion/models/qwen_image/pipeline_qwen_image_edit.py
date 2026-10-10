@@ -634,8 +634,6 @@ class QwenImageEditPipeline(
 
     def forward(self, req: DiffusionRequestBatch) -> DiffusionOutput:
         """Forward pass for image editing."""
-        # TODO: In online mode, sometimes it receives [{"negative_prompt": None}, {...}], so cannot use .get("...", "")
-        # TODO: May be some data formatting operations on the API side. Hack for now.
         if len(req.prompts) > 1:
             logger.warning(
                 """This model only supports a single prompt, not a batched request.""",

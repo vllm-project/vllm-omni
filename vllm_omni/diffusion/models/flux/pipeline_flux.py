@@ -504,8 +504,6 @@ class FluxPipeline(
 
     def forward(self, req: DiffusionRequestBatch) -> list[DiffusionOutput]:
         """Forward pass for flux."""
-        # TODO: In online mode, sometimes it receives [{"negative_prompt": None}, {...}], so cannot use .get("...", "")
-        # TODO: May be some data formatting operations on the API side. Hack for now.
         sampling_params_list = req.sampling_params_list
         common_sampling_params = sampling_params_list[0]
         prompt = [p if isinstance(p, str) else (p.get("prompt") or "") for p in req.prompts]
