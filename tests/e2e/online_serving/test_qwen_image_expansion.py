@@ -27,6 +27,40 @@ PARALLEL_FEATURE_MARKS = hardware_marks(res={"cuda": ["H100", "B200"]}, num_card
 MODEL_IMAGE = "Qwen/Qwen-Image"
 MODEL_2512 = "Qwen/Qwen-Image-2512"
 
+
+def _is_cuda_fp8_supported() -> bool:
+    """Return True if the active platform is CUDA and supports native FP8 (Compute Capability >= 8.9).
+
+    Calls the platforms interface to determine whether the device has compute
+    capability >= 8.9 (Ada Lovelace, Hopper, Blackwell). Lower architectures like
+    Ampere (SM80 / A100) lack native FP8 tensor core lowering under torch.compile.
+    """
+    try:
+        from vllm_omni.platforms import current_omni_platform
+
+        return current_omni_platform.is_cuda() and current_omni_platform.has_device_capability(89)
+    except Exception:
+        return False
+
+
+_vae_patch_parallel_server_args = [
+    "--cache-backend",
+    "cache_dit",
+    "--tensor-parallel-size",
+    "2",
+    "--vae-patch-parallel-size",
+    "2",
+    "--vae-use-tiling",
+]
+if _is_cuda_fp8_supported():
+    _vae_patch_parallel_server_args.extend(
+        [
+            "--diffusion-quantization-config",
+            '{"method":"fp8"}',
+        ]
+    )
+
+
 # One server per feature. Alternate models; keep feature pytest ids unchanged.
 FEATURE_CASES = [
     pytest.param(
@@ -101,17 +135,7 @@ FEATURE_CASES = [
     pytest.param(
         OmniServerParams(
             model=MODEL_2512,
-            server_args=[
-                "--cache-backend",
-                "cache_dit",
-                "--tensor-parallel-size",
-                "2",
-                "--vae-patch-parallel-size",
-                "2",
-                "--vae-use-tiling",
-                "--diffusion-quantization-config",
-                '{"method":"fp8"}',
-            ],
+            server_args=_vae_patch_parallel_server_args,
         ),
         id="vae_patch_parallel_2",
         marks=PARALLEL_FEATURE_MARKS,
