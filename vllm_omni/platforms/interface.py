@@ -128,6 +128,47 @@ class OmniPlatform(Platform):
         raise NotImplementedError
 
     @classmethod
+    def resolve_diffusion_attn_backend(
+        cls,
+        selected_backend: str | None,
+        head_size: int,
+        allow_trtllm_default: bool = True,
+        *,
+        method: str = "dense",
+        implementation: str = "auto",
+    ) -> str:
+        """Resolve a provider for the requested execution method.
+
+        Dense requests retain each platform's existing selection policy. Sparse
+        requests use the adapter's selection checks, never dense-kernel support
+        checks. Actual sparse tensor support remains request-preparation work.
+        Platforms may override this entry point for method-specific policy.
+        """
+        if method == "dense":
+            return cls.get_diffusion_attn_backend_cls(
+                selected_backend=selected_backend,
+                head_size=head_size,
+                allow_trtllm_default=allow_trtllm_default,
+            )
+        if method != "block_sparse":
+            raise ValueError(f"Unknown diffusion attention method: {method}")
+        if selected_backend is None:
+            raise ValueError("block_sparse requires an explicit backend")
+        # The current shared selector/orchestration requires CUDA, independently
+        # of which provider executes its selected blocks.
+        if cls._omni_enum != OmniPlatformEnum.CUDA:
+            raise ValueError(f"block_sparse requires CUDA; current platform is {cls._omni_enum.value}")
+
+        from vllm_omni.diffusion.attention.backends.registry import DiffusionAttentionBackendEnum
+
+        backend = DiffusionAttentionBackendEnum[selected_backend.upper()]
+        adapter_cls = backend.get_class().get_block_sparse_adapter()
+        if adapter_cls is None:
+            raise ValueError(f"{backend.name}: no adapter for the shared block selection")
+        adapter_cls.validate_selection(implementation, head_size)
+        return backend.get_path()
+
+    @classmethod
     def validate_diffusion_attn_backend(cls, selected_backend: str) -> None:
         """Reject an explicitly selected backend this platform cannot run.
 

@@ -14,7 +14,8 @@ separate from vLLM's autoregressive attention selector.
 
 The selection path has four responsibilities:
 
-1. normalize user configuration into `AttentionConfig` and `AttentionSpec`;
+1. normalize user configuration into `AttentionConfig` and a complete-backend
+   `AttentionSpec` or selected-block `BlockSparseAttentionSpec`;
 2. resolve a spec for an attention role;
 3. ask the active platform to validate an explicit backend or choose a
    hardware default; and
@@ -29,8 +30,8 @@ The selection path has four responsibilities:
 3. `default`;
 4. platform default.
 
-An explicit resolution returns both the backend class and its
-`AttentionSpec`. A platform-default resolution returns the class and `None`.
+An explicit resolution returns both the backend class and its typed spec.
+A platform-default resolution returns the class and `None`.
 Layers must therefore treat the spec as optional and must not infer that a
 missing spec means SDPA.
 
@@ -45,7 +46,8 @@ qualified class paths. `register_diffusion_backend()` may replace a path at
 runtime without changing the public enum value.
 
 The active `OmniPlatform` owns compatibility policy through
-`get_diffusion_attn_backend_cls()`. It must:
+`resolve_diffusion_attn_backend()`. Dense requests delegate to each platform’s
+existing `get_diffusion_attn_backend_cls()` implementation. It must:
 
 - validate explicit selections and fail with an actionable error when the
   requested kernel cannot run;
@@ -55,6 +57,22 @@ The active `OmniPlatform` owns compatibility policy through
 
 The selector must not duplicate device capability or package-availability
 policy that belongs to the platform.
+
+For `method="block_sparse"`, the platform requires an explicit provider and
+checks the shared method's CUDA requirement before loading it. It resolves the
+registered backend and calls its adapter's `validate_selection()` with the
+unchanged implementation ID and head size (`-1` for capability queries).
+Dense availability and head-size checks do not establish sparse support and
+are not applied to this path. Missing adapters and provider errors propagate;
+there is no fallback. Platforms may override the method-aware entry point.
+Actual tensor compatibility is established during sparse request preparation,
+not by selection or capability queries.
+
+For model-facing capability queries, the selected-block method exposes
+`BlockSparseBackend` rather than the provider's dense capability surface. The
+execution adapter and any strict Ulysses wrapper establish the actual prepared
+execution path. Scheduling must preserve that distinction; see the
+[proposed composition with RFC #8382](fa4_subblock_poc.md#composition-with-scheduling-and-sparse-plugins).
 
 ## Typed backend options
 

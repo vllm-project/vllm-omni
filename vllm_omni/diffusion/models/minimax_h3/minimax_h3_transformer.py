@@ -620,6 +620,10 @@ class MiniMaxH3Attention(nn.Module):
                 "max_seqlen_q": max_seqlen,
                 "max_seqlen_k": max_seqlen,
                 "valid_kv_length": used,
+                # Initial sparse experiment: conditioning may be sparsified too.
+                # Neither valid_kv_length nor the video prefix is a conditioning
+                # boundary (the latter also includes generated target audio).
+                "protected_kv_prefix": 0,
                 # Opt the NPU flash backend into the packed varlen path so the
                 # quadratic full_qk mask is never materialized. Ring attention
                 # is excluded: it keeps the aligned padding rows for its
@@ -1007,6 +1011,8 @@ class MiniMaxH3DiTBlock(nn.Module):
             arch,
             quant_config,
             prefix=f"{prefix}.attn",
+            role="minimax_h3.dit",
+            role_category="self",
         )
         self.mlp = MiniMaxH3MLP(
             arch,

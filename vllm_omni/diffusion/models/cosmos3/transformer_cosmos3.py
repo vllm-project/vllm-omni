@@ -14,6 +14,7 @@ from __future__ import annotations
 import math
 from collections.abc import Iterator
 from contextlib import AbstractContextManager, contextmanager, nullcontext
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any, NamedTuple
 
 import torch
@@ -34,7 +35,7 @@ from vllm.model_executor.layers.quantization.base_config import (
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention as FrameworkAttention
 from vllm_omni.diffusion.cache.cachedit import CacheDiTAdapterConfig
-from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.data import BlockSparseAttentionSpec, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelInput, SequenceParallelOutput
 from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
 from vllm_omni.diffusion.layers.norm import RMSNorm as _VllmRMSNorm
@@ -622,6 +623,8 @@ class Cosmos3CausalAttention(nn.Module):
             num_heads=self.num_heads,
             head_size=self.head_dim,
             causal=True,
+            role="cosmos3.und",
+            role_category="self",
             softmax_scale=1.0 / (self.head_dim**0.5),
             num_kv_heads=self.num_kv_heads,
             skip_sequence_parallel=True,
@@ -726,23 +729,29 @@ class Cosmos3CrossAttention(nn.Module):
             self.norm_q = RMSNorm(self.head_dim, eps=rms_norm_eps)
             self.norm_k = RMSNorm(self.head_dim, eps=rms_norm_eps)
 
+        # Attention consumes the rank-local heads produced by the TP projections.
         self.attn = FrameworkAttention(
-            num_heads=self.num_heads,
+            num_heads=self.num_heads_local,
             head_size=self.head_dim,
             causal=False,
+            # Keep legacy per_role.self routing; exact roles opt into overrides.
+            role="cosmos3.gen",
+            role_category="self",
             softmax_scale=1.0 / (self.head_dim**0.5),
-            num_kv_heads=self.num_kv_heads,
+            num_kv_heads=self.num_kv_heads_local,
         )
         # Multi-control attention operates on one full [control_i, target]
         # sequence at a time. Keep those sequences replicated when Ulysses is
         # active; sharding the concatenated [control_1, ..., control_N, target]
         # layout would split the per-control ranges across ranks.
         self.multi_control_attn = FrameworkAttention(
-            num_heads=self.num_heads,
+            num_heads=self.num_heads_local,
             head_size=self.head_dim,
             causal=False,
+            role="cosmos3.gen_multi_control",
+            role_category="self",
             softmax_scale=1.0 / (self.head_dim**0.5),
-            num_kv_heads=self.num_kv_heads,
+            num_kv_heads=self.num_kv_heads_local,
             prefix=f"{prefix}.multi_control_attn",
             skip_sequence_parallel=True,
         )
@@ -766,7 +775,8 @@ class Cosmos3CrossAttention(nn.Module):
         k_all = torch.cat([k_und, k], dim=1)
         v_all = torch.cat([v_und, v], dim=1)
 
-        out = self.attn(q, k_all, v_all)
+        metadata = AttentionMetadata(extra={"protected_kv_prefix": k_und.shape[1]})
+        out = self.attn(q, k_all, v_all, metadata)
         return out.reshape(B, S_gen, -1)
 
     # -- SP path: framework Attention with joint_key/value -------------------
@@ -789,9 +799,12 @@ class Cosmos3CrossAttention(nn.Module):
 
         gen_mask = None
         joint_mask = None
+        sparse_sp_padding = 0
         if is_forward_context_available():
             ctx = get_forward_context()
-            if ctx.sp_original_seq_len is not None and ctx.sp_padding_size > 0:
+            if isinstance(getattr(self.attn, "attn_spec", None), BlockSparseAttentionSpec):
+                sparse_sp_padding = ctx.sp_padding_size
+            elif ctx.sp_original_seq_len is not None and ctx.sp_padding_size > 0:
                 padded_seq_len = ctx.sp_original_seq_len + ctx.sp_padding_size
                 gen_mask = torch.ones(B, padded_seq_len, dtype=torch.bool, device=q.device)
                 gen_mask[:, ctx.sp_original_seq_len :] = False
@@ -806,6 +819,7 @@ class Cosmos3CrossAttention(nn.Module):
             joint_key=k_und,
             joint_value=v_und,
             joint_strategy="front",
+            extra={"protected_kv_prefix": k_und.shape[1], "ulysses_sp_padding": sparse_sp_padding},
         )
         out = self.attn(q, k, v, attn_metadata)
         return out.reshape(B, S_gen, -1)
@@ -843,6 +857,7 @@ class Cosmos3CrossAttention(nn.Module):
         v_target = v[:, control_tokens:]
         control_outputs: list[torch.Tensor] = []
         target_output: torch.Tensor | None = None
+        metadata = AttentionMetadata(extra={"protected_kv_prefix": k_und.shape[1]})
         start = 0
         for size, weight in zip(control_token_sizes, control_weights, strict=True):
             if size <= 0:
@@ -854,7 +869,7 @@ class Cosmos3CrossAttention(nn.Module):
             q_pair = torch.cat([q_control, q_target], dim=1)
             k_pair = torch.cat([k_und, k_control, k_target], dim=1)
             v_pair = torch.cat([v_und, v_control, v_target], dim=1)
-            pair_output = self.multi_control_attn(q_pair, k_pair, v_pair)
+            pair_output = self.multi_control_attn(q_pair, k_pair, v_pair, metadata)
             control_outputs.append(pair_output[:, :size])
             weighted_target = pair_output[:, size:] * weight
             target_output = weighted_target if target_output is None else target_output + weighted_target
@@ -1437,6 +1452,21 @@ class Cosmos3VFMTransformer(nn.Module):
             if release_completed_blocks_to_meta:
                 release_module_parameters_to_meta(layer)
             self.gen_layers.append(layer)
+
+        gen_attentions = [
+            module
+            for module in self.gen_layers.modules()
+            if isinstance(module, FrameworkAttention) and getattr(module, "role", None) == "cosmos3.gen"
+        ]
+        if gen_attentions and all(isinstance(attn.attn_spec, BlockSparseAttentionSpec) for attn in gen_attentions):
+            # Sparse attention removes the synthetic suffix after all-to-all.
+            self._sp_plan = {
+                **self._sp_plan,
+                "gen_sp_prepare": {
+                    index: replace(spec, mask_free_padding=True)
+                    for index, spec in self._sp_plan["gen_sp_prepare"].items()
+                },
+            }
 
         self.mixed_precision_runtime: Cosmos3MixedPrecisionRuntime | None = None
         if mixed_precision_config is not None:
