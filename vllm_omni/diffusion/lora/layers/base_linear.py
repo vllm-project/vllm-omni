@@ -121,6 +121,10 @@ class DiffusionBaseLinearLayerWithLoRA(BaseLinearLayerWithLoRA):
         apply LoRA per-slice using `output_slices`.
         """
         output = self.base_layer.quant_method.apply(self.base_layer, x, bias)
+        return self.apply_lora(x, output)
+
+    def apply_lora(self, x: torch.Tensor, output: torch.Tensor) -> torch.Tensor:
+        """Add the active adapter to an already computed base projection."""
 
         if not hasattr(self, "lora_a_stacked") or not hasattr(self, "lora_b_stacked"):
             return output
