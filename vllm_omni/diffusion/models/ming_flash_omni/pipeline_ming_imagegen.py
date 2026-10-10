@@ -47,6 +47,7 @@ from vllm_omni.diffusion.models.ming_flash_omni.condition_encoder import (
 from vllm_omni.diffusion.models.ming_flash_omni.ming_zimage_transformer import (
     MingZImageTransformer2DModel,
 )
+from vllm_omni.diffusion.models.utils import load_vae_scale_factor
 from vllm_omni.diffusion.models.z_image.pipeline_z_image import ZImagePipeline
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
@@ -483,17 +484,8 @@ def get_ming_image_post_process_func(od_config: OmniDiffusionConfig):
     Registered via ``_DIFFUSION_POST_PROCESS_FUNCS["MingImagePipeline"]``
     in vllm_omni/diffusion/registry.py.
     """
-    import json
-
     model_path = od_config.model
-    vae_config_path = os.path.join(model_path, "vae", "config.json")
-    try:
-        with open(vae_config_path) as f:
-            vae_cfg = json.load(f)
-        block_out_channels = vae_cfg.get("block_out_channels", [128, 256, 512, 512])
-        vae_scale_factor = 2 ** (len(block_out_channels) - 1)
-    except Exception:
-        vae_scale_factor = 8  # Ming's Flux-format VAE default
+    vae_scale_factor = load_vae_scale_factor(model_path)
 
     image_processor = VaeImageProcessor(vae_scale_factor=vae_scale_factor * 2, do_convert_rgb=True)
 

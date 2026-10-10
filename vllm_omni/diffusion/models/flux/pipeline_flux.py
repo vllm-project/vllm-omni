@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import json
 import logging
 import os
 from collections.abc import Iterable
@@ -30,6 +29,7 @@ from vllm_omni.diffusion.models.flux import FluxTransformer2DModel
 from vllm_omni.diffusion.models.flux.flux_pipeline_mixin import FluxPipelineMixin
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.models.t5_encoder import T5EncoderModel
+from vllm_omni.diffusion.models.utils import load_vae_scale_factor
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
@@ -49,15 +49,7 @@ def get_flux_post_process_func(
     else:
         model_path = download_weights_from_hf_specific(model_name, None, ["*"])
 
-    vae_config_path = os.path.join(model_path, "vae/config.json")
-    if not os.path.exists(vae_config_path):
-        raise FileNotFoundError(
-            f"VAE config not found at {vae_config_path}. "
-            "Please ensure the model path contains a valid VAE configuration."
-        )
-    with open(vae_config_path) as f:
-        vae_config = json.load(f)
-        vae_scale_factor = 2 ** (len(vae_config["block_out_channels"]) - 1) if "block_out_channels" in vae_config else 8
+    vae_scale_factor = load_vae_scale_factor(model_path)
 
     image_processor = VaeImageProcessor(vae_scale_factor=vae_scale_factor * 2)
 
