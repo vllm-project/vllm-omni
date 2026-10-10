@@ -3452,11 +3452,13 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             width=width,
             num_outputs_per_prompt=num_outputs_per_prompt,
             seed=seed,
+            # __post_init__ rejects unsupported values here, before any stage runs;
+            # _set_if_supported would skip that check.
+            quality=extra_body.get("quality"),
         )
         self._set_if_supported(
             gen_params,
             generator_device=generator_device,
-            quality=extra_body.get("quality"),
             num_inference_steps=extra_body.get("num_inference_steps"),
             guidance_scale=extra_body.get("guidance_scale"),
             true_cfg_scale=extra_body.get("true_cfg_scale") or extra_body.get("cfg_scale"),
