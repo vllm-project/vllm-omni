@@ -713,6 +713,7 @@ def _initialize_model_parallel(
     fully_shard_degree: int = 1,
     enable_expert_parallel: bool = False,
     use_hsdp: bool = False,
+    hsdp_data_parallel: bool = False,
     backend: str | None = None,
 ) -> None:
     global _FS, _HSDP_REPLICATE
@@ -793,18 +794,33 @@ def _initialize_model_parallel(
     non_dp_size = cfg_parallel_size * sequence_parallel_size * pipeline_parallel_size * tensor_parallel_size
     if world_size % non_dp_size != 0:
         raise ValueError(f"WORLD size ({world_size}) must be divisible by non-DP parallel size ({non_dp_size})")
+    if hsdp_data_parallel and not use_hsdp:
+        raise ValueError("hsdp_data_parallel requires use_hsdp=True")
     if use_hsdp:
-        if data_parallel_size not in (None, 1):
-            raise ValueError("HSDP (FSDP2) requires data_parallel_size to be 1")
-        if non_dp_size not in (1, world_size):
-            raise ValueError(f"HSDP non-DP parallel size must be 1 or WORLD size ({world_size}), but got {non_dp_size}")
+        if hsdp_data_parallel:
+            if non_dp_size != 1:
+                raise ValueError(
+                    "HSDP data-parallel requests require tensor, sequence, pipeline, and CFG parallel sizes to all be 1"
+                )
+            if data_parallel_size not in (None, 1, world_size):
+                raise ValueError(
+                    f"HSDP data-parallel request size must be WORLD size ({world_size}), but got {data_parallel_size}"
+                )
+            data_parallel_size = world_size
+        else:
+            if data_parallel_size not in (None, 1):
+                raise ValueError("HSDP (FSDP2) requires data_parallel_size to be 1")
+            if non_dp_size not in (1, world_size):
+                raise ValueError(
+                    f"HSDP non-DP parallel size must be 1 or WORLD size ({world_size}), but got {non_dp_size}"
+                )
+            data_parallel_size = 1
         if fully_shard_degree <= 0:
             raise ValueError(f"fully_shard_degree must be positive, got {fully_shard_degree}")
         if world_size % fully_shard_degree != 0:
             raise ValueError(
                 f"WORLD size ({world_size}) must be divisible by fully_shard_degree ({fully_shard_degree})"
             )
-        data_parallel_size = 1
     else:
         inferred_data_parallel_size = world_size // non_dp_size
         if data_parallel_size is not None and data_parallel_size != inferred_data_parallel_size:
@@ -824,7 +840,7 @@ def _initialize_model_parallel(
     )
 
     def get_rank_groups(token: str) -> list[list[int]]:
-        if use_hsdp and non_dp_size == 1:
+        if use_hsdp and not hsdp_data_parallel and non_dp_size == 1:
             return [[rank] for rank in range(world_size)]
         return rank_generator.get_ranks(token)
 
@@ -844,7 +860,23 @@ def _initialize_model_parallel(
         backend=backend,
         parallel_mode="data",
     )
-    vllm_parallel_state._DP = _DP
+    if hsdp_data_parallel:
+        # Omni uses the all-rank DP group above to select a different request
+        # on each HSDP rank. vLLM model layers must see singleton DP groups so
+        # they construct full, unpartitioned parameters for HSDP to shard.
+        vllm_parallel_state._DP = init_model_parallel_group(
+            group_ranks=[[rank] for rank in range(world_size)],
+            local_rank=get_world_group().local_rank,
+            backend=backend,
+            parallel_mode="data",
+        )
+        if get_world_group().rank_in_group == 0:
+            logger.info(
+                "HSDP rank-local requests: Omni request DP size=%d, vLLM model-layout DP size=1",
+                world_size,
+            )
+    else:
+        vllm_parallel_state._DP = _DP
 
     global _CFG
     assert _CFG is None, "classifier_free_guidance group is already initialized"
@@ -972,6 +1004,7 @@ def initialize_model_parallel(
     fully_shard_degree: int = 1,
     enable_expert_parallel: bool = False,
     use_hsdp: bool = False,
+    hsdp_data_parallel: bool = False,
     backend: str | None = None,
 ) -> None:
     """Atomically initialize diffusion parallel groups.
@@ -1010,6 +1043,7 @@ def initialize_model_parallel(
             fully_shard_degree=fully_shard_degree,
             enable_expert_parallel=enable_expert_parallel,
             use_hsdp=use_hsdp,
+            hsdp_data_parallel=hsdp_data_parallel,
             backend=backend,
         )
     except BaseException:

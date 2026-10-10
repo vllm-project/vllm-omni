@@ -55,7 +55,8 @@ vllm serve Qwen/Qwen-Image --omni \
   --request-batch-max-wait-ms 20
 ```
 
-`--request-batch-max-wait-ms 0` is the default. A nonzero value can improve
+`--request-batch-max-wait-ms 0` is the default, except with
+`--hsdp-data-parallel`, where it defaults to 500. A nonzero value can improve
 batch formation but adds up to that much latency before a new scheduler wave.
 It has no effect in step mode.
 
@@ -251,7 +252,7 @@ For step execution, set `step_execution: true` and remove
 | --- | ---: | --- |
 | `--step-execution` | disabled | Select step-wise scheduling |
 | `--max-num-seqs` | `1` for diffusion stages | Set request- or step-scheduler capacity |
-| `--request-batch-max-wait-ms` | `0` | Wait for burst coalescing in request mode |
+| `--request-batch-max-wait-ms` | `0` (`500` with `--hsdp-data-parallel`) | Wait for burst coalescing in request mode |
 | `--diffusion-streaming-output` | disabled | Expose supported intermediate diffusion outputs and require step execution |
 
 ## Limitations and Troubleshooting

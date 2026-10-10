@@ -320,6 +320,25 @@ class TestRequestModeDispatch:
         executor.execute_request.assert_called_once_with(scheduler_output)
         executor.collective_rpc.assert_not_called()
 
+    def test_hsdp_dp_routes_multiple_requests_without_pipeline_batching(self):
+        executor, _, _ = _make_executor(num_gpus=8)
+        executor.od_config = SimpleNamespace(
+            step_execution=False,
+            parallel_config=SimpleNamespace(
+                data_parallel_size=8,
+                hsdp_data_parallel=True,
+            ),
+        )
+        executor.execute_request = Mock(return_value="hsdp-dp")
+        executor.collective_rpc = Mock()
+        scheduler_output = _make_sched_output("A", "B")
+
+        result = executor.execute_batch(scheduler_output)
+
+        assert result == "hsdp-dp"
+        executor.execute_request.assert_called_once_with(scheduler_output)
+        executor.collective_rpc.assert_not_called()
+
     def test_dlo_dp_multi_rank_reply_uses_synchronous_rpc_collection(self):
         executor, req_q, res_q = _make_executor(num_gpus=2)
         executor.od_config = SimpleNamespace(

@@ -209,7 +209,13 @@ def configure_diffusion_vllm_config(vllm_config: VllmConfig, od_config: OmniDiff
     parallel_config = od_config.parallel_config
     assert parallel_config.data_parallel_size is not None
     vllm_config.parallel_config.tensor_parallel_size = parallel_config.tensor_parallel_size
-    vllm_config.parallel_config.data_parallel_size = parallel_config.data_parallel_size
+    # HSDP rank-local requests use Omni's DP group only for request routing.
+    # They must remain non-DP from vLLM's model-layout perspective; otherwise
+    # FusedMoE folds the request lanes into TP and partitions expert tensors a
+    # second time before HSDP is applied.
+    vllm_config.parallel_config.data_parallel_size = (
+        1 if getattr(parallel_config, "hsdp_data_parallel", False) else parallel_config.data_parallel_size
+    )
     if parallel_config.enable_expert_parallel and od_config.is_moe:
         vllm_config.parallel_config.data_parallel_size = (
             parallel_config.data_parallel_size * parallel_config.cfg_parallel_size

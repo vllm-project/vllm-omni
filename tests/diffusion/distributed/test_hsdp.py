@@ -263,6 +263,38 @@ class TestDiffusionParallelConfigHSDP:
         # Standalone HSDP: world_size is determined by HSDP
         assert config_hsdp.world_size == 8
 
+    def test_hsdp_data_parallel_exposes_one_request_lane_per_rank(self):
+        config = DiffusionParallelConfig(
+            use_hsdp=True,
+            hsdp_data_parallel=True,
+            hsdp_shard_size=8,
+        )
+
+        assert config.world_size == 8
+        assert config.data_parallel_size == 8
+
+    def test_hsdp_data_parallel_requires_hsdp(self):
+        with pytest.raises(ValueError, match="requires use_hsdp=True"):
+            DiffusionParallelConfig(hsdp_data_parallel=True)
+
+    def test_hsdp_data_parallel_rejects_other_model_parallelism(self):
+        with pytest.raises(ValueError, match="parallel sizes to all be 1"):
+            DiffusionParallelConfig(
+                use_hsdp=True,
+                hsdp_data_parallel=True,
+                hsdp_shard_size=2,
+                cfg_parallel_size=2,
+            )
+
+    def test_hsdp_data_parallel_rejects_vae_patch_parallel(self):
+        with pytest.raises(ValueError, match="vae_patch_parallel_size to be 1"):
+            DiffusionParallelConfig(
+                use_hsdp=True,
+                hsdp_data_parallel=True,
+                hsdp_shard_size=8,
+                vae_patch_parallel_size=8,
+            )
+
     def test_hsdp_cannot_use_with_tp(self):
         """Test that HSDP and Tensor Parallelism cannot be used together."""
         with pytest.raises(ValueError, match="not compatible with TP"):

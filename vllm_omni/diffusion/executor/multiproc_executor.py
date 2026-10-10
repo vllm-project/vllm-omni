@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import concurrent.futures
-import json
 import multiprocessing as mp
 import multiprocessing.connection
 import os
@@ -24,15 +23,22 @@ from vllm.logger import init_logger
 from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.executor.multiproc_executor import set_multiprocessing_worker_envs
 
-from vllm_omni.diffusion.data import SHUTDOWN_MESSAGE, AsyncDiffusionOutput, AsyncOutputKind, DiffusionOutput
+from vllm_omni.diffusion.data import (
+    SHUTDOWN_MESSAGE,
+    AsyncDiffusionOutput,
+    AsyncOutputKind,
+    DiffusionOutput,
+    uses_rank_local_dp_concurrency,
+)
 from vllm_omni.diffusion.executor.abstract import DiffusionExecutor
 from vllm_omni.diffusion.ipc import DIFFUSION_RPC_RESULT_ENVELOPE, unpack_diffusion_output_shm
-from vllm_omni.diffusion.offloader.config import (
-    TEXT_ENCODER_COMPONENT,
-    any_selected_component_uses_allgather,
-    resolve_offload,
+from vllm_omni.diffusion.sched.request_scheduler import (
+    build_rank_local_dp_extra_args_signature,
+    build_request_batch_sampling_params_key,
+    is_empty_dp_prompt,
+    text_encoder_input_signature,
+    uses_text_encoder_allgather,
 )
-from vllm_omni.diffusion.sched.request_scheduler import build_request_batch_sampling_params_key
 from vllm_omni.diffusion.utils.future_utils import try_set_exception, try_set_result
 from vllm_omni.diffusion.worker import WorkerProc
 
@@ -66,34 +72,6 @@ def _dropped_output_error(async_output_id: str) -> RuntimeError:
         f"async output {async_output_id} was dropped: the request was aborted "
         "before its output was claimed; retry with a new request."
     )
-
-
-def _is_empty_dp_prompt(prompt: object) -> bool:
-    """Return whether a DP request has no usable text prompt."""
-    if prompt is None:
-        return True
-    if isinstance(prompt, (str, list, tuple)):
-        return not prompt
-    if isinstance(prompt, dict):
-        return (
-            not prompt.get("prompt")
-            and not prompt.get("prompt_token_ids")
-            and not prompt.get("prompt_ids")
-            and prompt.get("prompt_embeds") is None
-        )
-    return False
-
-
-def _text_encoder_input_signature(prompt: object) -> tuple[bool, bool]:
-    """Describe precomputed embeddings that change encoder forward counts."""
-    if not isinstance(prompt, dict):
-        return False, False
-    return prompt.get("prompt_embeds") is not None, prompt.get("negative_prompt_embeds") is not None
-
-
-def _uses_text_encoder_allgather(config: object) -> bool:
-    resolved = resolve_offload(config)
-    return resolved.offloads(TEXT_ENCODER_COMPONENT) and resolved.uses_allgather(TEXT_ENCODER_COMPONENT)
 
 
 @dataclass
@@ -541,42 +519,40 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         for new_req in new_reqs:
             validate_new_request_data_identity(new_req)
 
-        # DP multi-concurrency: when DLO+AllGather is active and multiple
-        # requests are scheduled, send every complete NewRequestData envelope
-        # in one broadcast RPC. Each rank picks one envelope, keeping its
-        # request and Diffusion KV metadata inseparable.
+        # Rank-local DP concurrency: when a supported sharded-weight mode is
+        # active and multiple requests are scheduled, send every complete
+        # NewRequestData envelope in one broadcast RPC. Each rank picks one
+        # envelope, keeping its request and Diffusion KV metadata inseparable.
         # All ranks reply (unique_reply_rank=None) so we collect dp_size
         # responses and match by dp_rank.
-        if len(new_reqs) > 1 and any_selected_component_uses_allgather(self.od_config):
-            # Reuse the request scheduler's complete compatibility key. DLO
-            # AllGather requires every DP rank to execute the same collective
-            # schedule, including shape, CFG, denoise steps, output count,
-            # and LoRA settings.
+        if len(new_reqs) > 1 and uses_rank_local_dp_concurrency(self.od_config):
+            # Reuse the request scheduler's complete compatibility key.
+            # Sharded-weight collectives require every DP rank to execute the
+            # same collective schedule, including shape, CFG, denoise steps,
+            # output count, and LoRA settings. Two default (None) step counts
+            # are valid and resolve identically inside the same pipeline.
             compatibility_keys = [build_request_batch_sampling_params_key(nr.req) for nr in new_reqs]
             if any(key != compatibility_keys[0] for key in compatibility_keys[1:]):
                 raise ValueError(
-                    "DLO DP multi-concurrency requires compatible shape, CFG, "
+                    "Rank-local DP concurrency requires compatible shape, CFG, "
                     "denoise schedule, output count, and LoRA settings for all "
                     "requests in one collective wave."
                 )
-            extra_args_signatures: set = set()
-            for nr in new_reqs:
-                ea = getattr(nr.req.sampling_params, "extra_args", None)
-                extra_args_signatures.add(json.dumps(ea, sort_keys=True, default=repr) if ea is not None else None)
+            extra_args_signatures = {build_rank_local_dp_extra_args_signature(nr.req) for nr in new_reqs}
             if len(extra_args_signatures) > 1:
                 raise ValueError(
                     "DP multi-concurrency requires all concurrent requests to "
                     "share identical extra_args. Different extra_args can change "
                     "the forward schedule and cause AllGather deadlock."
                 )
-            if _uses_text_encoder_allgather(self.od_config):
-                encoder_signatures = {_text_encoder_input_signature(nr.req.prompt) for nr in new_reqs}
+            if uses_text_encoder_allgather(self.od_config):
+                encoder_signatures = {text_encoder_input_signature(nr.req.prompt) for nr in new_reqs}
                 if len(encoder_signatures) > 1:
                     raise ValueError(
                         "DLO text_encoder AllGather requires every concurrent request "
                         "to provide the same positive/negative prompt embedding fields."
                     )
-            empty_prompt_ids = [nr.request_id for nr in new_reqs if _is_empty_dp_prompt(nr.req.prompt)]
+            empty_prompt_ids = [nr.request_id for nr in new_reqs if is_empty_dp_prompt(nr.req.prompt)]
             if empty_prompt_ids:
                 raise ValueError(
                     "DP multi-concurrency requires a non-empty prompt for every request; "
@@ -687,10 +663,8 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
 
         parallel_config = getattr(self.od_config, "parallel_config", None)
         dp_size = getattr(parallel_config, "data_parallel_size", 1)
-        if dp_size > 1 and any_selected_component_uses_allgather(self.od_config):
-            # DLO DP uses one independent request per DP replica.  It is not a
-            # fused pipeline request batch, so models such as MiniMax-H3 do not
-            # need to advertise supports_request_batch=True.
+        if dp_size > 1 and uses_rank_local_dp_concurrency(self.od_config):
+            # Each rank runs one request; fused pipeline batching is unnecessary.
             return self.execute_request(scheduler_output)
 
         try:

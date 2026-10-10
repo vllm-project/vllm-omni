@@ -149,6 +149,12 @@ class RequestBatchSamplingParamsKey:
     sample_solver: str | None = None
     flow_shift: float | None = None
 
+    # Names of non-None ``negative_*`` prompt fields. Negative text,
+    # embeddings, masks, and pooled embeddings can select a pipeline's CFG
+    # branches independently of do_classifier_free_guidance. Compare their
+    # presence conservatively alongside guidance fields to align forward counts.
+    negative_conditioning: frozenset[str] = frozenset()
+
     # Pipeline-specific condition structure populated during preprocessing.
     # It prevents independently valid requests with incompatible conditions
     # from being admitted to the same request batch.
@@ -157,6 +163,15 @@ class RequestBatchSamplingParamsKey:
     # LoRA identity.
     lora_int_id: int | None = None
     lora_scale: float = 1.0
+
+    # Rank-local DP shares weight collectives across requests and requires
+    # identical full extra_args. The scheduler caches this at request addition;
+    # ordinary request batching leaves it unset to allow request-local values.
+    rank_local_dp_extra_args_signature: str | None = None
+
+    # Text-encoder AllGather requires matching encoder forward counts across
+    # DP ranks. Cached only when that mode is active.
+    text_encoder_input_signature: tuple[bool, bool] | None = None
 
 
 @dataclass
@@ -170,6 +185,8 @@ class SchedulerRequestState:
     status: DiffusionRequestStatus = DiffusionRequestStatus.WAITING
     error: str | None = None
     queued_at: float = 0.0
+    # Request-mode admission must leave this request alone in its wave.
+    requires_single_request: bool = False
 
     def is_finished(self) -> bool:
         return DiffusionRequestStatus.is_finished(self.status)

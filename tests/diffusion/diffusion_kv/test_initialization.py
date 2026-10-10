@@ -216,6 +216,24 @@ def test_dense_config_keeps_new_paged_sizing_inputs_inactive() -> None:
     assert vllm_config.scheduler_config.max_num_batched_tokens == original_token_budget
 
 
+def test_hsdp_request_lanes_do_not_change_vllm_model_layout_dp() -> None:
+    od_config = _od_config(
+        diffusion_kv_mode=DiffusionKVCacheMode.DENSE_LEGACY,
+        parallel_config=SimpleNamespace(
+            tensor_parallel_size=1,
+            pipeline_parallel_size=1,
+            data_parallel_size=4,
+            enable_expert_parallel=False,
+            hsdp_data_parallel=True,
+        ),
+    )
+    vllm_config = diffusion_vllm_config.create_base_diffusion_vllm_config(torch.device("cpu"), od_config)
+
+    diffusion_vllm_config.configure_diffusion_vllm_config(vllm_config, od_config)
+
+    assert vllm_config.parallel_config.data_parallel_size == 1
+
+
 def test_paged_config_forwards_gpu_memory_utilization_to_native_cache_config() -> None:
     vllm_config = diffusion_vllm_config.create_diffusion_vllm_config(
         torch.device("cpu"),

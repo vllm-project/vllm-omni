@@ -237,7 +237,7 @@ Optional admission coalescing can fill a `dp_size` wave: when
 `request_batch_max_wait_ms > 0`, `RequestScheduler` may wait briefly before
 the first schedule of a wave (under `dp_concurrent`, the stable window is
 `min(0.3s, wait/2)`). With the default `request_batch_max_wait_ms == 0`,
-there is no wait.
+there is no wait. `hsdp_data_parallel` defaults it to 500 ms instead.
 
 Before dispatch, both backends reject waves
 whose requests differ in sampling-parameter compatibility or `extra_args`

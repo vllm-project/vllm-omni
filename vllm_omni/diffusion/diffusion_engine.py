@@ -33,6 +33,7 @@ from vllm_omni.diffusion.data import (
     DiffusionRequestAbortedError,
     OmniDiffusionConfig,
     uses_diffusers_adapter,
+    uses_rank_local_dp_concurrency,
 )
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode, is_scheduler_paged_kv_mode
 from vllm_omni.diffusion.diffusion_kv.initialization import initialize_diffusion_kv_control_plane
@@ -46,7 +47,6 @@ from vllm_omni.diffusion.io_support import (
 )
 from vllm_omni.diffusion.offloader.config import (
     OffloadStrategy,
-    any_selected_component_uses_allgather,
     resolve_offload_strategy,
 )
 from vllm_omni.diffusion.output_formatter import (
@@ -198,12 +198,6 @@ def supports_request_cancellation(od_config: OmniDiffusionConfig) -> bool:
     return getattr(model_cls, "supports_request_cancellation", False) is True
 
 
-def _uses_dlo_dp_concurrency(od_config: OmniDiffusionConfig) -> bool:
-    parallel_config = getattr(od_config, "parallel_config", None)
-    dp_size = getattr(parallel_config, "data_parallel_size", 1)
-    return dp_size > 1 and any_selected_component_uses_allgather(od_config)
-
-
 def _move_tensor_tree_to_cpu(value: object) -> object:
     if isinstance(value, torch.Tensor):
         return value.cpu() if value.device.type != "cpu" else value
@@ -330,6 +324,14 @@ class DiffusionEngine:
         self._post_process_accepts_sampling_params = _func_accepts_parameter(self.post_process_func, "sampling_params")
 
     def _resolve_execution_mode(self, od_config: OmniDiffusionConfig) -> DiffusionExecutionMode:
+        if getattr(getattr(od_config, "parallel_config", None), "hsdp_data_parallel", False) and getattr(
+            od_config, "model_class_name", None
+        ) in {"MiniMaxH3Pipeline", "MiniMaxH3ModularPipeline"}:
+            # H3 shares conditioning across WORLD and assumes one output owner.
+            raise ValueError(
+                "hsdp_data_parallel is unsupported for MiniMax-H3: "
+                "conditioning and output ownership are not request-local."
+            )
         self.step_execution = bool(getattr(od_config, "step_execution", False))
         if od_config.streaming_output and not self.step_execution:
             logger.warning("streaming_output=True requires step_execution=True; enabling step execution.")
@@ -337,11 +339,17 @@ class DiffusionEngine:
             self.step_execution = True
 
         if self.step_execution:
+            if getattr(getattr(od_config, "parallel_config", None), "hsdp_data_parallel", False):
+                raise ValueError("hsdp_data_parallel currently supports request execution only, not step execution")
             self.supports_request_batch = False
             return DiffusionExecutionMode.STEP_BATCH
 
         self.supports_request_batch = supports_request_batch(od_config)
-        if not self.supports_request_batch and _max_num_seqs(od_config) > 1 and not _uses_dlo_dp_concurrency(od_config):
+        if (
+            not self.supports_request_batch
+            and _max_num_seqs(od_config) > 1
+            and not uses_rank_local_dp_concurrency(od_config)
+        ):
             raise ValueError(
                 f"{getattr(od_config, 'model_class_name', None)!r} does not support request-level batching. "
                 "Use max_num_seqs=1 for serial request execution, or choose a pipeline with "
@@ -381,17 +389,21 @@ class DiffusionEngine:
             )
 
     def _init_runtime_state(self) -> None:
-        # DP multi-concurrency: allow batching dp_size requests so each
-        # worker processes a different request in parallel.  Only enabled
-        # for distributed layerwise offload (which shards weights and
-        # needs all ranks active simultaneously).  Ordinary DP with a
-        # non-batch pipeline should not schedule multiple requests.
+        # Rank-local DP concurrency: allow batching dp_size compatible
+        # requests so each worker processes a different request while all
+        # ranks follow the same sharded-weight collective schedule.
         dp_size = getattr(getattr(self.od_config, "parallel_config", None), "data_parallel_size", 1)
-        if _uses_dlo_dp_concurrency(self.od_config):
+        if uses_rank_local_dp_concurrency(self.od_config):
             self.scheduler.max_num_running_reqs = dp_size
             self.dp_concurrent = True
+            mode = (
+                "HSDP rank-local requests"
+                if getattr(getattr(self.od_config, "parallel_config", None), "hsdp_data_parallel", False)
+                else "distributed layerwise offload"
+            )
             logger.info(
-                "dp_concurrent: max_num_running_reqs=%d, batch_wait=%sms",
+                "Rank-local DP concurrency enabled (%s): max_num_running_reqs=%d, batch_wait=%sms",
+                mode,
                 dp_size,
                 self.od_config.request_batch_max_wait_ms,
             )
@@ -1393,10 +1405,11 @@ class DiffusionEngine:
             max(kv_request.seq_len for kv_request in kv_requests),
             max(kv_request.target_len for kv_request in kv_requests),
         )
-        dlo_dp_request_mode = self.execution_mode is DiffusionExecutionMode.REQUEST_BATCH and _uses_dlo_dp_concurrency(
-            self.od_config
+        rank_local_dp_request_mode = (
+            self.execution_mode is DiffusionExecutionMode.REQUEST_BATCH
+            and uses_rank_local_dp_concurrency(self.od_config)
         )
-        profile_batch_size = 1 if dlo_dp_request_mode else _max_num_seqs(self.od_config)
+        profile_batch_size = 1 if rank_local_dp_request_mode else _max_num_seqs(self.od_config)
         profile_requests: list[OmniDiffusionRequest] = []
         for index in range(profile_batch_size):
             profile_request = copy.copy(request)

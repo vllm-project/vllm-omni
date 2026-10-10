@@ -505,6 +505,97 @@ class TestRequestBatchCapability:
         assert od_config.request_batch_max_wait_ms == 0
         fake_executor_cls.assert_called_once_with(od_config)
 
+    def test_engine_allows_independent_hsdp_rank_requests_for_single_request_pipeline(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        mocker: MockerFixture,
+    ) -> None:
+        od_config = SimpleNamespace(
+            model_class_name="SinglePipeline",
+            custom_pipeline_args=None,
+            streaming_output=False,
+            max_num_seqs=1,
+            request_batch_max_wait_ms=0,
+            parallel_config=SimpleNamespace(
+                data_parallel_size=8,
+                use_hsdp=True,
+                hsdp_data_parallel=True,
+            ),
+        )
+        fake_executor = SimpleNamespace(
+            execute_request=mocker.Mock(return_value="per-request"),
+            execute_batch=mocker.Mock(return_value="batch"),
+            execute_step=mocker.Mock(return_value="step"),
+        )
+        fake_executor_cls = mocker.Mock(return_value=fake_executor)
+
+        monkeypatch.setattr(
+            "vllm_omni.diffusion.diffusion_engine.get_diffusion_post_process_func",
+            lambda *args, **kwargs: None,
+        )
+        monkeypatch.setattr(
+            "vllm_omni.diffusion.diffusion_engine.get_diffusion_pre_process_func",
+            lambda *args, **kwargs: None,
+        )
+        monkeypatch.setattr(
+            "vllm_omni.diffusion.diffusion_engine.DiffusionExecutor.get_class",
+            lambda *args, **kwargs: fake_executor_cls,
+        )
+        monkeypatch.setattr(
+            diffusion_engine_module.DiffusionModelRegistry,
+            "_try_load_model_cls",
+            lambda model_class_name: _SingleRequestPipeline,
+        )
+
+        engine = DiffusionEngine(od_config)
+
+        assert engine.dp_concurrent is True
+        assert engine.scheduler.max_num_running_reqs == 8
+        fake_executor_cls.assert_called_once_with(od_config)
+
+    @pytest.mark.parametrize("model_class_name", ["MiniMaxH3Pipeline", "MiniMaxH3ModularPipeline"])
+    @pytest.mark.parametrize("max_num_seqs", [1, 2])
+    def test_engine_rejects_h3_hsdp_rank_requests_before_starting_workers(
+        self, model_class_name, max_num_seqs, monkeypatch, mocker
+    ):
+        od_config = SimpleNamespace(
+            model_class_name=model_class_name,
+            streaming_output=False,
+            max_num_seqs=max_num_seqs,
+            parallel_config=SimpleNamespace(data_parallel_size=2, use_hsdp=True, hsdp_data_parallel=True),
+        )
+        monkeypatch.setattr(DiffusionEngine, "_init_process_hooks", lambda *args: None)
+        init_executor = mocker.patch.object(DiffusionEngine, "_init_executor")
+
+        with pytest.raises(ValueError, match="hsdp_data_parallel is unsupported for MiniMax-H3"):
+            DiffusionEngine(od_config)
+
+        init_executor.assert_not_called()
+
+    @pytest.mark.parametrize("model_class_name", ["MiniMaxH3Pipeline", "MiniMaxH3ModularPipeline"])
+    def test_engine_allows_h3_serial_hsdp(self, model_class_name, monkeypatch):
+        engine = DiffusionEngine.__new__(DiffusionEngine)
+        od_config = SimpleNamespace(
+            model_class_name=model_class_name,
+            streaming_output=False,
+            max_num_seqs=1,
+            parallel_config=SimpleNamespace(data_parallel_size=1, use_hsdp=True, hsdp_data_parallel=False),
+        )
+        monkeypatch.setattr(diffusion_engine_module, "supports_request_batch", lambda _: False)
+
+        assert engine._resolve_execution_mode(od_config) == DiffusionExecutionMode.REQUEST_BATCH
+
+    def test_engine_rejects_hsdp_rank_requests_with_step_execution(self):
+        engine = DiffusionEngine.__new__(DiffusionEngine)
+        od_config = SimpleNamespace(
+            streaming_output=False,
+            step_execution=True,
+            parallel_config=SimpleNamespace(hsdp_data_parallel=True),
+        )
+
+        with pytest.raises(ValueError, match="request execution only"):
+            engine._resolve_execution_mode(od_config)
+
     @pytest.mark.parametrize("request_ids", [("req-a",), ("req-a", "req-b")])
     def test_engine_enables_batch_dispatch_for_request_batch_pipeline(
         self,

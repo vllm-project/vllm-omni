@@ -1129,6 +1129,7 @@ def test_sub_config_fields_match_structured_scopes():
         "vae_parallel_mode",
         "text_encoder_tp_size",
         "use_hsdp",
+        "hsdp_data_parallel",
         "mask_sp_padding",
         "hsdp_shard_size",
         "hsdp_replicate_size",
@@ -1273,6 +1274,27 @@ def test_diffusion_parallel_config_supports_diffusion_hsdp_auto_sharding():
 
     assert cfg.hsdp_shard_size == 2
     assert cfg.world_size == 4
+
+
+def test_diffusion_parallel_config_supports_hsdp_rank_local_requests():
+    cfg = OmniStageDiffusionParallelConfig(
+        use_hsdp=True,
+        hsdp_data_parallel=True,
+        hsdp_shard_size=8,
+    )
+
+    assert cfg.world_size == 8
+    assert cfg.data_parallel_size == 8
+
+
+def test_diffusion_parallel_config_rejects_hsdp_rank_local_requests_with_vae_patch_parallel():
+    with pytest.raises(ValueError, match="vae_patch_parallel_size to be 1"):
+        OmniStageDiffusionParallelConfig(
+            use_hsdp=True,
+            hsdp_data_parallel=True,
+            hsdp_shard_size=8,
+            vae_patch_parallel_size=8,
+        )
 
 
 def test_diffusion_parallel_config_rejects_hsdp_with_tp_or_dp():

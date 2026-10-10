@@ -48,6 +48,28 @@ logger = init_logger(__name__)
 VAE_FAST_PATH_LEVELS: tuple[str, ...] = ("off", "lossless", "channels_last")
 
 
+# Cache backends that synchronize their skip decision across the FSDP shard
+# group, so ranks serving different requests still issue identical collectives.
+HSDP_DATA_PARALLEL_CACHE_BACKENDS: frozenset[str] = frozenset({"sea_cache"})
+
+# Default admission wait for hsdp_data_parallel. Without it, the first request
+# of a burst is dispatched alone and the rest wait a full generation for the
+# next wave.
+HSDP_DATA_PARALLEL_DEFAULT_BATCH_WAIT_MS = 500.0
+
+
+def uses_rank_local_dp_concurrency(od_config: object) -> bool:
+    """Whether sharded weights serve different requests on each rank."""
+    from vllm_omni.diffusion.offloader.config import any_selected_component_uses_allgather
+
+    parallel_config = getattr(od_config, "parallel_config", None)
+    if (getattr(parallel_config, "data_parallel_size", 1) or 1) <= 1:
+        return False
+    return bool(
+        getattr(parallel_config, "hsdp_data_parallel", False) or any_selected_component_uses_allgather(od_config)
+    )
+
+
 def _move_diffusion_alias(
     normalized: dict[str, Any],
     legacy_name: str,
@@ -332,6 +354,14 @@ class DiffusionParallelConfig:
     use_hsdp: bool = False
     """Enable Hybrid Sharded Data Parallel (HSDP) for model weight sharding."""
 
+    hsdp_data_parallel: bool = False
+    """Run one independent request per HSDP rank.
+
+    HSDP still gathers sharded parameters collectively, but each rank computes
+    different activations. This requires all other model-parallel dimensions
+    to be one and compatible requests to execute in lockstep.
+    """
+
     mask_sp_padding: bool = False
     """If True, generate a boolean attention mask for zero-padded SP tokens
     when sequence length is not divisible by the SP world size. The mask
@@ -398,9 +428,10 @@ class DiffusionParallelConfig:
         # Until the runtime WORLD size is known, an omitted DP dimension means
         # one replica. OmniDiffusionConfig resolves it against num_gpus below.
         data_parallel_size = self.data_parallel_size or 1
+        world_size_dp_factor = 1 if self.use_hsdp and self.hsdp_data_parallel else data_parallel_size
         other_parallel_world_size = (
             self.pipeline_parallel_size
-            * data_parallel_size
+            * world_size_dp_factor
             * self.tensor_parallel_size
             * self.sequence_parallel_size
             * self.cfg_parallel_size
@@ -414,7 +445,7 @@ class DiffusionParallelConfig:
             incompatible = []
             if self.tensor_parallel_size > 1:
                 incompatible.append("TP")
-            if data_parallel_size > 1:
+            if data_parallel_size > 1 and not self.hsdp_data_parallel:
                 incompatible.append("DP")
             if self.pipeline_parallel_size > 1:
                 incompatible.append("PP")
@@ -422,6 +453,20 @@ class DiffusionParallelConfig:
                 incompatible.append("EP")
             if incompatible:
                 raise ValueError("HSDP (FSDP2) is not compatible with " + ", ".join(incompatible))
+            if self.hsdp_data_parallel and (
+                self.tensor_parallel_size
+                * self.sequence_parallel_size
+                * self.pipeline_parallel_size
+                * self.cfg_parallel_size
+                != 1
+            ):
+                raise ValueError(
+                    "hsdp_data_parallel requires tensor, sequence, pipeline, and CFG parallel sizes to all be 1"
+                )
+            if self.hsdp_data_parallel and self.vae_patch_parallel_size > 1:
+                # Patch-parallel VAE decode splits and stitches tiles across WORLD,
+                # which would mix latents from the different requests on each rank.
+                raise ValueError("hsdp_data_parallel requires vae_patch_parallel_size to be 1")
             if self.hsdp_shard_size == -1:
                 # Auto-calculate: use other_parallel_world_size as shard_size
                 if self.hsdp_replicate_size <= 0:
@@ -453,7 +498,16 @@ class DiffusionParallelConfig:
                             f"must equal world_size from other parallelism ({other_parallel_world_size})"
                         )
                     self.world_size = other_parallel_world_size
+            if self.hsdp_data_parallel:
+                if data_parallel_size not in (1, self.world_size):
+                    raise ValueError(
+                        f"hsdp_data_parallel data_parallel_size must be 1 or HSDP world size "
+                        f"({self.world_size}), but got {data_parallel_size}"
+                    )
+                self.data_parallel_size = self.world_size
         else:
+            if self.hsdp_data_parallel:
+                raise ValueError("hsdp_data_parallel requires use_hsdp=True")
             self.world_size = other_parallel_world_size
 
     def resolve_data_parallel_size(self, world_size: int) -> int:
@@ -462,17 +516,22 @@ class DiffusionParallelConfig:
             raise ValueError(f"WORLD size must be > 0, but got {world_size}")
 
         if self.use_hsdp:
-            if self.data_parallel_size not in (None, 1):
-                raise ValueError("HSDP (FSDP2) requires data_parallel_size to be 1")
+            allowed_dp_sizes = (None, 1, world_size) if self.hsdp_data_parallel else (None, 1)
+            if self.data_parallel_size not in allowed_dp_sizes:
+                expected = f"1 or WORLD size ({world_size})" if self.hsdp_data_parallel else "1"
+                raise ValueError(f"HSDP (FSDP2) requires data_parallel_size to be {expected}")
             expected_world_size = self.hsdp_replicate_size * self.hsdp_shard_size
             if world_size != expected_world_size:
                 raise ValueError(
                     f"WORLD size ({world_size}) must equal HSDP size "
                     f"({self.hsdp_replicate_size} x {self.hsdp_shard_size} = {expected_world_size})"
                 )
-            self.data_parallel_size = 1
+            inferred_data_parallel_size = world_size if self.hsdp_data_parallel else 1
+            if self.vae_parallel_mode == "batch" and inferred_data_parallel_size != 1:
+                raise ValueError("VAE batch parallel decode requires DP, PP, and CFG parallel sizes to be 1")
+            self.data_parallel_size = inferred_data_parallel_size
             self.world_size = world_size
-            return 1
+            return self.data_parallel_size
 
         assert self.sequence_parallel_size is not None
         non_dp_size = (
@@ -1149,8 +1208,9 @@ class OmniDiffusionConfig:
     # Request-mode batch admission: wait briefly for compatible requests to
     # accumulate in the scheduler waiting queue before the first schedule() of
     # a wave.  Improves fused forward batch sizes under bursty HTTP ingress.
-    # 0 disables admission (default; no added latency).
-    request_batch_max_wait_ms: float = 0.0
+    # 0 disables admission. None resolves to
+    # HSDP_DATA_PARALLEL_DEFAULT_BATCH_WAIT_MS with hsdp_data_parallel, else 0.
+    request_batch_max_wait_ms: float | None = None
 
     # Supplementary model specific parameters
     extras: dict[str, Any] = field(default_factory=dict)
@@ -1309,11 +1369,13 @@ class OmniDiffusionConfig:
                 raise ValueError("Native KV transfer does not support sleep mode: registered pages must remain mapped")
 
         self.master_port = self._resolve_master_port()
-        self.request_batch_max_wait_ms = float(self.request_batch_max_wait_ms or 0.0)
-        if not math.isfinite(self.request_batch_max_wait_ms) or self.request_batch_max_wait_ms < 0:
-            raise ValueError(
-                f"request_batch_max_wait_ms must be a finite non-negative number, got {self.request_batch_max_wait_ms}."
-            )
+        if self.request_batch_max_wait_ms is not None:
+            self.request_batch_max_wait_ms = float(self.request_batch_max_wait_ms)
+            if not math.isfinite(self.request_batch_max_wait_ms) or self.request_batch_max_wait_ms < 0:
+                raise ValueError(
+                    "request_batch_max_wait_ms must be a finite non-negative number, "
+                    f"got {self.request_batch_max_wait_ms}."
+                )
 
         if isinstance(self.profiler_config, dict):
             from vllm.config import ProfilerConfig
@@ -1341,6 +1403,20 @@ class OmniDiffusionConfig:
                 self.num_gpus = 1
 
         self.parallel_config.resolve_data_parallel_size(self.num_gpus)
+        if (
+            self.parallel_config.hsdp_data_parallel
+            and self.cache_backend not in (None, "none")
+            and self.cache_backend not in HSDP_DATA_PARALLEL_CACHE_BACKENDS
+        ):
+            raise ValueError(
+                f"cache_backend={self.cache_backend!r} cannot be combined with hsdp_data_parallel: "
+                "rank-local cache decisions can skip different FSDP weight collectives. "
+                f"Use one of {sorted(HSDP_DATA_PARALLEL_CACHE_BACKENDS)} or disable cache_backend."
+            )
+        if self.request_batch_max_wait_ms is None:
+            self.request_batch_max_wait_ms = (
+                HSDP_DATA_PARALLEL_DEFAULT_BATCH_WAIT_MS if self.parallel_config.hsdp_data_parallel else 0.0
+            )
         # Resolve offload only after DP/SP normalization so cached policy
         # validation observes the actual execution topology.
         offload_strategy = materialize_legacy_offload_flags(self)
