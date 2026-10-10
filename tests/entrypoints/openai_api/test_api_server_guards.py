@@ -58,6 +58,7 @@ from starlette.requests import Request
 from starlette.websockets import WebSocketDisconnect
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 
+from vllm_omni.config.endpoint_policy import OmniServingCapability
 from vllm_omni.entrypoints.openai import api_server
 from vllm_omni.entrypoints.serve.utils import errors as serve_errors
 
@@ -818,6 +819,141 @@ def test_speech_without_handler_preserves_not_found_http_error() -> None:
 
     assert exc_info.value.status_code == 404
     assert exc_info.value.detail == "The model does not support Speech API"
+
+
+# Routes upstream mounts for every serving mode, the app.state attribute their
+# handler reads, and a request path that reaches them. ``_UNSET_ATTRIBUTE``
+# marks the pure-diffusion shape, where the attribute is absent entirely.
+_UNSET_ATTRIBUTE = object()
+
+_UNWIRED_ROUTE_CASES = [
+    ("POST", "/tokenize", "/tokenize", "serving_tokenization", None, "tokenization is unavailable"),
+    ("POST", "/detokenize", "/detokenize", "serving_tokenization", None, "detokenization is unavailable"),
+    (
+        "POST",
+        "/v1/completions",
+        "/v1/completions",
+        "openai_serving_completion",
+        _UNSET_ATTRIBUTE,
+        "the completions api is unavailable",
+    ),
+    (
+        "POST",
+        "/v1/responses",
+        "/v1/responses",
+        "openai_serving_responses",
+        _UNSET_ATTRIBUTE,
+        "the responses api is unavailable",
+    ),
+    (
+        "GET",
+        "/v1/responses/{response_id}",
+        "/v1/responses/abc",
+        "openai_serving_responses",
+        _UNSET_ATTRIBUTE,
+        "the responses api is unavailable",
+    ),
+    (
+        "POST",
+        "/v1/responses/{response_id}/cancel",
+        "/v1/responses/abc/cancel",
+        "openai_serving_responses",
+        _UNSET_ATTRIBUTE,
+        "the responses api is unavailable",
+    ),
+    (
+        "POST",
+        "/v1/messages",
+        "/v1/messages",
+        "anthropic_serving_messages",
+        _UNSET_ATTRIBUTE,
+        "the messages api is unavailable",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("method", "route_path", "request_path", "attribute", "value", "expected_detail"),
+    _UNWIRED_ROUTE_CASES,
+)
+def test_unwired_routes_are_rejected_instead_of_crashing(
+    method: str,
+    route_path: str,
+    request_path: str,
+    attribute: str,
+    value: object,
+    expected_detail: str,
+) -> None:
+    """Regression (#8139): a missing handler must not turn a mounted route into HTTP 500.
+
+    Upstream ``build_app`` mounts /tokenize, /detokenize and the generate-family
+    surface for every serving mode, while pure diffusion and duplex only wire
+    the handlers they can serve. The upstream handler then read a missing (or
+    ``None``) ``app.state`` handler and raised AttributeError. Both shapes are
+    covered here: an absent attribute and one explicitly set to None.
+    """
+    app = FastAPI()
+
+    app.add_api_route(route_path, lambda: {"owner": "upstream"}, methods=[method])
+    if value is not _UNSET_ATTRIBUTE:
+        setattr(app.state, attribute, value)
+
+    api_server._shutdown_routes_without_handlers(app)
+
+    resp = TestClient(app).request(method, request_path, json={})
+    assert resp.status_code == 400
+    assert resp.json()["error"]["type"] == "BadRequestError"
+    assert resp.json()["error"]["message"].lower().startswith(expected_detail)
+
+
+def test_wired_routes_are_left_alone() -> None:
+    """Modes that do wire a handler must keep serving the upstream routes."""
+    app = FastAPI()
+
+    @app.post("/tokenize")
+    async def tokenize():
+        return {"owner": "serving"}
+
+    app.state.serving_tokenization = _marker("tokenization")
+    api_server._shutdown_routes_without_handlers(app)
+
+    resp = TestClient(app).post("/tokenize", json={})
+    assert resp.status_code == 200
+    assert resp.json() == {"owner": "serving"}
+
+
+def test_unwired_routes_that_are_not_mounted_are_not_added() -> None:
+    """A server that never mounted a route must not grow a rejection handler for it.
+
+    ``shutdown_unsupported_routes`` registers the path it is handed, so the
+    teardown has to check the route table first: render-only and TTS-only
+    servers do not mount the generate-family surface at all.
+    """
+    app = FastAPI()
+    app.state.serving_tokenization = None
+
+    api_server._shutdown_routes_without_handlers(app)
+
+    assert TestClient(app).post("/tokenize", json={}).status_code == 404
+
+
+def test_model_declared_restriction_keeps_its_own_reason() -> None:
+    """A capability the pipeline already restricted keeps the pipeline's reason."""
+    app = FastAPI()
+
+    @app.post("/v1/completions")
+    async def completions():
+        return {"owner": "upstream"}
+
+    app.state.openai_serving_completion = None
+    api_server._shutdown_routes_without_handlers(
+        app,
+        already_restricted=(OmniServingCapability.COMPLETIONS,),
+    )
+
+    resp = TestClient(app).post("/v1/completions", json={})
+    assert resp.status_code == 200
+    assert resp.json() == {"owner": "upstream"}
 
 
 @pytest.mark.parametrize(

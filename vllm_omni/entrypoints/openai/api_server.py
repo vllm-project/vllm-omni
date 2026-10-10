@@ -27,7 +27,7 @@ from typing import Annotated, Any, Literal
 
 import uvloop
 import vllm.envs as envs
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile, WebSocket
+from fastapi import APIRouter, Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile, WebSocket
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from PIL import Image
 from starlette.datastructures import State
@@ -88,7 +88,9 @@ from vllm.utils.system_utils import decorate_logs, set_process_title
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 
 from vllm_omni.config.endpoint_policy import (
+    OmniServingCapability,
     shutdown_unsupported_routes,
+    unwired_endpoint_restrictions,
 )
 from vllm_omni.config.speech_cache import SpeechCacheConfig
 from vllm_omni.config.stage_config import load_deploy_config
@@ -208,6 +210,7 @@ from vllm_omni.entrypoints.serve.utils.errors import (
 from vllm_omni.entrypoints.serve.utils.routes import (
     _remove_route_from_router,
     remove_route_from_app,
+    route_is_mounted,
 )
 from vllm_omni.entrypoints.utils import PureDiffusionLauncherAdapter
 from vllm_omni.errors import OmniClientError
@@ -221,6 +224,37 @@ router = APIRouter()
 VIDEO_ABORT_TIMEOUT_S = ABORT_TIMEOUT_S
 
 profiler_router = APIRouter()
+
+
+def _shutdown_routes_without_handlers(
+    app: FastAPI,
+    *,
+    already_restricted: tuple[OmniServingCapability, ...] = (),
+) -> None:
+    """Reject mounted routes whose handler this deployment never wires.
+
+    Upstream ``build_app`` mounts ``/tokenize``, ``/detokenize`` and the whole
+    generate-family surface for every serving mode, while a mode only
+    initializes the handlers it can serve: pure diffusion and duplex wire no
+    text-generation handler, and only the multi-stage state wires a
+    tokenization handler. Reading the missing ``app.state`` attribute raised
+    AttributeError inside the upstream handler, so those routes answered HTTP
+    500 instead of reporting the capability gap.
+
+    ``shutdown_unsupported_routes`` registers the path it is handed, so only
+    routes that are actually mounted are passed on: a render-only or TTS-only
+    server must not grow endpoints it never had.
+    """
+    restrictions = tuple(
+        restriction
+        for restriction in unwired_endpoint_restrictions(
+            app.state,
+            already_restricted=already_restricted,
+        )
+        if route_is_mounted(app, restriction.capability.path, restriction.capability.methods)
+    )
+    if restrictions:
+        shutdown_unsupported_routes(app, restrictions)
 
 
 # Server entry points
@@ -391,6 +425,14 @@ async def omni_run_server_worker(
             shutdown_unsupported_routes(app, engine_client.endpoint_restrictions)
         else:
             logger.warning("engine client has no endpoint restrictions attribute")
+
+        # OMNI: upstream routes stay mounted in modes that never wire a handler
+        _shutdown_routes_without_handlers(
+            app,
+            already_restricted=tuple(
+                restriction.capability for restriction in getattr(engine_client, "endpoint_restrictions", ())
+            ),
+        )
 
         # Start background processes
         await STORAGE_MANAGER.start()
