@@ -320,8 +320,9 @@ def _make_compile_runner(
 
 
 class _EnabledCacheBackend:
-    def __init__(self):
+    def __init__(self, requires_request_refresh=True):
         self.refresh_calls = []
+        self.requires_request_refresh = requires_request_refresh
 
     def is_enabled(self):
         return True
@@ -370,6 +371,21 @@ def test_refresh_cache_without_request_or_pipeline_default_warns(caplog, monkeyp
 
     assert cache_backend.refresh_calls == []
     assert "requires num_inference_steps to be passed explicitly" in caplog.text
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_refresh_cache_skips_backend_that_refreshes_itself(caplog):
+    """A delegation that rebuilds its context in the pipeline call must not warn about step counts."""
+    cache_backend = _EnabledCacheBackend(requires_request_refresh=False)
+    runner = _make_runner(cache_backend=cache_backend, cache_backend_name="cache_dit")
+    req = _make_request()
+    req.sampling_params.num_inference_steps = None
+
+    DiffusionModelRunner._refresh_cache_for_requests(runner, [req], od_config=runner.od_config)
+
+    assert cache_backend.refresh_calls == []
+    assert "Failed to refresh" not in caplog.text
 
 
 @pytest.mark.core_model

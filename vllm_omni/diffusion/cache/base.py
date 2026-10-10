@@ -100,6 +100,18 @@ class CacheBackend(ABC):
         """
         return self.enabled
 
+    @property
+    def requires_request_refresh(self) -> bool:
+        """
+        Whether the runner must call ``refresh`` before each request batch.
+
+        A backend that rebuilds its own request state inside the pipeline call has
+        nothing for the runner to refresh and no step count to resolve, so it
+        overrides this to ``False``. The runner then skips the refresh instead of
+        reporting a step count it never needed.
+        """
+        return True
+
     def __repr__(self) -> str:
         return f"{self.__class__.__name__}(config={self.config})"
 

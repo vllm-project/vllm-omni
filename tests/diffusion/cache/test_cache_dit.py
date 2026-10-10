@@ -51,6 +51,7 @@ def _force_torch_sdpa():
 
 def test_custom_cache_dit_enablers_are_registered_explicitly():
     expected_enablers = {
+        "DiffusersAdapterPipeline": cd_model_specific.enable_cache_for_diffusers,
         "Wan22Pipeline": cd_model_specific.enable_cache_for_wan22,
         "Wan22I2VPipeline": cd_model_specific.enable_cache_for_wan22,
         "Wan22TI2VPipeline": cd_model_specific.enable_cache_for_wan22,
