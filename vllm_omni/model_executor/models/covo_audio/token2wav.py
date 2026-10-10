@@ -5,6 +5,7 @@
 # token2wav: audio token codes -> waveform (inference only)
 # Pipeline: Token -> Latent (flow matching) -> Waveform (BigVGAN)
 
+import contextlib
 import math
 from collections import namedtuple
 
@@ -17,6 +18,7 @@ from torch.nn.utils import weight_norm
 
 from vllm_omni.model_executor.models.common.alias_free_activation import AliasFreeActivation1d
 from vllm_omni.model_executor.models.common.snake_activation import SnakeBeta
+from vllm_omni.platforms import current_omni_platform
 
 # --------------- Utilities ---------------
 
@@ -92,9 +94,9 @@ def rotate_half(x):
     return torch.cat((-x2, x1), dim=-1)
 
 
-@torch.autocast(enabled=False, device_type="cuda")
 def apply_rotary_pos_emb(pos, t):
-    return t * pos.cos() + rotate_half(t) * pos.sin()
+    with torch.autocast(device_type=t.device.type, enabled=False):
+        return t * pos.cos() + rotate_half(t) * pos.sin()
 
 
 # sinc, kaiser_sinc_filter1d removed — now in common.alias_free_activation
@@ -315,14 +317,14 @@ class RotaryEmbedding(nn.Module):
     def device(self):
         return self.inv_freq.device
 
-    @torch.autocast(enabled=False, device_type="cuda")
     def forward(self, t):
         if not torch.is_tensor(t):
             t = torch.arange(t, device=self.device)
-        t = t.type_as(self.inv_freq)
-        freqs = torch.einsum("i , j -> i j", t, self.inv_freq)
-        freqs = torch.cat((freqs, freqs), dim=-1)
-        return freqs
+        with torch.autocast(device_type=t.device.type, enabled=False):
+            t = t.type_as(self.inv_freq)
+            freqs = torch.einsum("i , j -> i j", t, self.inv_freq)
+            freqs = torch.cat((freqs, freqs), dim=-1)
+            return freqs
 
 
 class MultiHeadAttention(nn.Module):
@@ -358,11 +360,11 @@ class MultiHeadAttention(nn.Module):
         self.o_dropout = Dropout(dropout)
 
         self.cpu_config = AttentionConfig(True, True, True)
-        device_properties = torch.cuda.get_device_properties(torch.device("cuda"))
-        if device_properties.major == 8 and device_properties.minor == 0:
-            self.cuda_config = AttentionConfig(True, True, True)
-        else:
-            self.cuda_config = AttentionConfig(False, True, True)
+        self.cuda_config = AttentionConfig(False, True, True)
+        if current_omni_platform.is_cuda():
+            device_properties = torch.cuda.get_device_properties(torch.accelerator.current_device_index())
+            if device_properties.major == 8 and device_properties.minor == 0:
+                self.cuda_config = AttentionConfig(True, True, True)
 
         if self.rotary_bias:
             self.rotary = RotaryEmbedding(self.head_dim)
@@ -403,7 +405,8 @@ class MultiHeadAttention(nn.Module):
         if mask is not None:
             attn_bias.masked_fill_(mask.logical_not(), float("-inf"))
 
-        with torch.backends.cuda.sdp_kernel(**config._asdict()):
+        sdp_ctx = torch.backends.cuda.sdp_kernel(**config._asdict()) if q.is_cuda else contextlib.nullcontext()
+        with sdp_ctx:
             out = F.scaled_dot_product_attention(
                 q, k, v, attn_mask=attn_bias, dropout_p=self.attn_drop.p if self.training else 0.0
             )
