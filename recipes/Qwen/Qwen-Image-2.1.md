@@ -101,8 +101,8 @@ Native unquantized blocks without LoRA or offload validate pointwise tensor
 contracts once per step. Compilation and other configurations retain the
 guarded paths.
 
-On Blackwell, strict Ulysses with Ring1/AllGather1 automatically selects
-symmetric-memory exchange. Equal, eligible BF16 Q/K/V tensors share one
+On B300 with PyTorch 2.13, strict Ulysses with Ring1/AllGather1 automatically
+selects symmetric-memory exchange. Equal, eligible BF16 Q/K/V tensors share one
 exchange; other layouts retain the separate exchanges. The automatic
 selection can be disabled with `extras.qwen21_auto_symmem_ulysses: false`
 in a diffusion stage configuration. Explicit `ulysses_a2a_permute` selection

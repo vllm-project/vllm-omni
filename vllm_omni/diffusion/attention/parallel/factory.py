@@ -57,6 +57,7 @@ def build_parallel_attention_strategy(
         getattr(cfg, "model_class_name", None) == "QwenImage21Pipeline"
         and getattr(cfg, "enforce_eager", False)
         and getattr(cfg, "dtype", None) == torch.bfloat16
+        and str(torch.__version__).startswith("2.13.")
         and ulysses_degree > 1
         and ring_degree == 1
         and allgather_degree == 1
@@ -66,7 +67,7 @@ def build_parallel_attention_strategy(
         and current_omni_platform.is_available()
     ):
         capability = current_omni_platform.get_device_capability()
-        if capability is not None and capability.major >= 10:
+        if capability is not None and capability.major >= 10 and "B300" in current_omni_platform.get_device_name():
             # Byte-preserving NVLink exchange avoids the repeated permutation
             # and NCCL launch overhead of the stock Q/K/V/O path.
             ulysses_a2a_permute = True

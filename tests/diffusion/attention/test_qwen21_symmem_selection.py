@@ -54,6 +54,8 @@ def test_auto_symmem_stays_within_qualified_configuration(
     platform.is_cuda.return_value = True
     platform.is_available.return_value = True
     platform.get_device_capability.return_value = Mock(major=major)
+    platform.get_device_name.return_value = "NVIDIA B300 SXM6 AC"
+    monkeypatch.setattr(factory.torch, "__version__", "2.13.0+cu130")
     monkeypatch.setattr(factory, "current_omni_platform", platform)
     strategy = Mock()
     name = "UlyssesAllGatherKVParallelAttention" if allgather > 1 else "UlyssesParallelAttention"
@@ -62,3 +64,40 @@ def test_auto_symmem_stays_within_qualified_configuration(
     factory.build_parallel_attention_strategy(scatter_idx=2, gather_idx=1, use_sync=False)
 
     assert strategy.call_args.kwargs["ulysses_a2a_permute"] is expected
+
+
+@pytest.mark.parametrize("device_name,version", [("NVIDIA RTX 5090", "2.13.0"), ("NVIDIA B300", "2.12.0")])
+def test_auto_symmem_does_not_expand_to_unqualified_hardware_or_stack(monkeypatch, device_name, version):
+    parallel = Mock(
+        spec=DiffusionParallelConfig,
+        ulysses_degree=4,
+        ring_degree=1,
+        allgather_degree=1,
+        ulysses_mode="strict",
+        ulysses_a2a_permute=False,
+    )
+    config = Mock(
+        spec=OmniDiffusionConfig,
+        parallel_config=parallel,
+        model_class_name="QwenImage21Pipeline",
+        enforce_eager=True,
+        dtype=torch.bfloat16,
+        extras={},
+    )
+    monkeypatch.setattr(factory, "is_forward_context_available", lambda: True)
+    monkeypatch.setattr(factory, "get_forward_context", lambda: Mock(omni_diffusion_config=config))
+    monkeypatch.setattr(factory, "get_sp_group", Mock())
+    monkeypatch.setattr(factory, "get_sequence_parallel_world_size", lambda: 4)
+    platform = Mock()
+    platform.is_cuda.return_value = True
+    platform.is_available.return_value = True
+    platform.get_device_capability.return_value = Mock(major=10)
+    platform.get_device_name.return_value = device_name
+    monkeypatch.setattr(factory, "current_omni_platform", platform)
+    monkeypatch.setattr(factory.torch, "__version__", version)
+    strategy = Mock()
+    monkeypatch.setattr(factory, "UlyssesParallelAttention", strategy)
+
+    factory.build_parallel_attention_strategy(scatter_idx=2, gather_idx=1, use_sync=False)
+
+    assert strategy.call_args.kwargs["ulysses_a2a_permute"] is False
