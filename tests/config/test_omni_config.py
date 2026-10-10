@@ -747,6 +747,7 @@ def test_from_pipeline_config_maps_orchestrator_cli_overrides():
             "omni_lb_policy": "round_robin",
             "omni_heartbeat_timeout": 9.5,
             "batch_timeout": 3,
+            "cfg_companion_timeout": 45.0,
         },
     )
 
@@ -761,6 +762,13 @@ def test_from_pipeline_config_maps_orchestrator_cli_overrides():
     assert orchestrator_config.omni_lb_policy == "round_robin"
     assert orchestrator_config.omni_heartbeat_timeout == 9.5
     assert orchestrator_config.batch_timeout == 3
+    assert orchestrator_config.cfg_companion_timeout == 45.0
+
+
+@pytest.mark.parametrize("timeout", [0.0, float("nan"), float("inf")])
+def test_from_pipeline_config_rejects_invalid_cfg_companion_timeout(timeout: float):
+    with pytest.raises(ValidationError, match="cfg_companion_timeout"):
+        _from_pipeline_key("qwen3_tts", cli_overrides={"cfg_companion_timeout": timeout})
 
 
 def test_from_pipeline_config_records_loaded_deploy_path_on_orchestrator_config():

@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import json
+import math
 import queue
 import threading
 import time
@@ -123,6 +124,7 @@ class OmniEngineBase:
     _transfer_emitter: Any = None
     _prom_metrics: Any = None
     _enable_orch_monitor: bool = False
+    _cfg_companion_timeout_s: float = 600.0
     _client_config: OmniClientConfig | None = None
     # Lazily created by get_output_blocking_async().
     _output_drain_executor: concurrent.futures.ThreadPoolExecutor | None = None
@@ -139,6 +141,7 @@ class OmniEngineBase:
         tokenizer: str | None = None,
         trust_remote_code: bool | None = None,
         client_config: OmniClientConfig | None = None,
+        cfg_companion_timeout: float = 600.0,
         **kwargs: Any,
     ) -> None:
         self.model = model
@@ -190,6 +193,9 @@ class OmniEngineBase:
         self._omni_heartbeat_timeout: float = float(kwargs.get("omni_heartbeat_timeout") or 30.0)
         if self._omni_heartbeat_timeout <= 0:
             raise ValueError(f"--omni-heartbeat-timeout must be > 0, got {self._omni_heartbeat_timeout}")
+        self._cfg_companion_timeout_s = float(cfg_companion_timeout)
+        if not math.isfinite(self._cfg_companion_timeout_s) or self._cfg_companion_timeout_s <= 0:
+            raise ValueError(f"--cfg-companion-timeout must be finite and > 0, got {self._cfg_companion_timeout_s}")
         # Concurrent same-device stage init (admission + SH/EX phase locks).
         # Sourced from the parallel_stage_init orchestrator/CLI arg (config,
         # not an env var); default False preserves serial init.
@@ -463,6 +469,7 @@ class OmniEngineBase:
                 log_stats=self._log_stats,
                 enable_orch_monitor=self._enable_orch_monitor,
                 event_driven_orch_default=self._event_driven_orch_default,
+                cfg_companion_timeout=self._cfg_companion_timeout_s,
             )
             if not startup_future.done():
                 startup_future.set_result(asyncio.get_running_loop())
