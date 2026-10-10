@@ -228,6 +228,60 @@ class OmniEngineArgs(EngineArgs):
     # for library callers (#7564); registered pipelines may consume it through
     # their own stage_cli_aliases or deploy YAML.
     text_encoder_tp_size: int | None = None
+    # The rest of the diffusion block is owned by ``OrchestratorArgs`` for
+    # top-level CLI parsing and deploy redistribution, but stage engines
+    # consume the same keys. Declared here for the same reason as
+    # ``text_encoder_tp_size`` above: ``from_cli_args`` keeps only dataclass
+    # fields, so an undeclared knob is silently dropped before it reaches the
+    # diffusion stage (#8503). The parallel knobs of #8037 are covered by
+    # #8041; ``enable_ar_profiler``/``log_file``/``replica_id``/
+    # ``omni_replica_address`` stay orchestrator-only. Mirrored in
+    # ``SHARED_FIELDS`` since both classes now declare them.
+    num_gpus: int | None = None
+    model_class_name: str | None = None
+    hsdp_weight_load_strategy: str | None = None
+    diffusion_load_format: str | None = None
+    lora_path: list[str] | None = None
+    lora_backend: str | None = None
+    lora_scale: float | None = None
+    diffusers_load_kwargs: str | None = None
+    diffusers_call_kwargs: str | None = None
+    diffusion_quantization_config: str | None = None
+    diffusion_attention_backend: str | None = None
+    fastvideo_vsa_topk: int | None = None
+    diffusion_attention_config: str | None = None
+    diffusion_compile_granularity: str | None = None
+    diffusion_compile_dynamic: bool | None = None
+    cache_backend: str | None = None
+    cache_config: str | None = None
+    video_output_transport: dict[str, object] | None = None
+    enable_cache_dit_summary: bool | None = None
+    step_execution: bool | None = None
+    vae_use_slicing: bool | None = None
+    vae_use_tiling: bool | None = None
+    vae_fast_path: str | None = None
+    enable_multithread_weight_load: bool | None = None
+    enable_broadcast_weight_load: bool | None = None
+    num_weight_load_threads: int | None = None
+    diffusion_offload_config: dict[str, Any] | None = None
+    enable_cpu_offload: bool | None = None
+    enable_layerwise_offload: bool | None = None
+    enable_distributed_layerwise_offload: bool | None = None
+    dlo_use_allgather: bool | None = None
+    dlo_resident_layers: int | None = None
+    host_weight_runtime_mode: str | None = None
+    host_weight_runtime_root: str | None = None
+    dlo_host_registration_limit_gib: float | None = None
+    boundary_ratio: float | None = None
+    flow_shift: float | None = None
+    diffusion_kv_cache_dtype: str | None = None
+    diffusion_kv_cache_skip_steps: str | None = None
+    diffusion_kv_cache_skip_layers: str | None = None
+    default_sampling_params: str | None = None
+    max_generated_image_size: int | None = None
+    tts_max_instructions_length: int | None = None
+    enable_diffusion_pipeline_profiler: bool | None = None
+    auxiliary_text_encoder: str | None = None
 
     @classmethod
     def _add_omni_specific_args(cls, parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
@@ -645,6 +699,55 @@ SHARED_FIELDS: frozenset[str] = frozenset(
         "log_stats",  # both want the flag
         "async_chunk",  # orch: read from CLI, redistribute; engine: per-stage flag
         "tokenizer",  # orch: detect model type; engine: tokenization
+        # Diffusion engine args (#8503): the orchestrator owns them for
+        # top-level CLI parsing and deploy redistribution, and the stage
+        # engine forwards them to OmniDiffusionConfig. The parallel knobs of
+        # #8037 join this set via #8041.
+        "num_gpus",
+        "model_class_name",
+        "hsdp_weight_load_strategy",
+        "diffusion_load_format",
+        "lora_path",
+        "lora_backend",
+        "lora_scale",
+        "diffusers_load_kwargs",
+        "diffusers_call_kwargs",
+        "diffusion_quantization_config",
+        "diffusion_attention_backend",
+        "fastvideo_vsa_topk",
+        "diffusion_attention_config",
+        "diffusion_compile_granularity",
+        "diffusion_compile_dynamic",
+        "cache_backend",
+        "cache_config",
+        "video_output_transport",
+        "enable_cache_dit_summary",
+        "step_execution",
+        "vae_use_slicing",
+        "vae_use_tiling",
+        "vae_fast_path",
+        "enable_multithread_weight_load",
+        "enable_broadcast_weight_load",
+        "num_weight_load_threads",
+        "diffusion_offload_config",
+        "enable_cpu_offload",
+        "enable_layerwise_offload",
+        "enable_distributed_layerwise_offload",
+        "dlo_use_allgather",
+        "dlo_resident_layers",
+        "host_weight_runtime_mode",
+        "host_weight_runtime_root",
+        "dlo_host_registration_limit_gib",
+        "boundary_ratio",
+        "flow_shift",
+        "diffusion_kv_cache_dtype",
+        "diffusion_kv_cache_skip_steps",
+        "diffusion_kv_cache_skip_layers",
+        "default_sampling_params",
+        "max_generated_image_size",
+        "tts_max_instructions_length",
+        "enable_diffusion_pipeline_profiler",
+        "auxiliary_text_encoder",
     }
 )
 
