@@ -174,7 +174,10 @@ shows `TeaCache applied with rel_l1_thresh=0.1` at start-up.
 - Memory usage: peak 20.0 GiB reserved with CFG, the same with and without TeaCache.
 - SD3.5 defaults to `rel_l1_thresh=0.1` instead of the global 0.2. Higher values
   change the image content on this model rather than just its details (mean
-  SSIM 0.62 at 0.15 and 28 steps), so prefer more steps over a higher threshold.
+  SSIM 0.62 at 0.15 and 28 steps), so do not raise the threshold to gain speed.
+- More steps give a larger speed-up, but quality does not keep improving with
+  them: of the three step counts measured, 40 has the best SSIM (mean 0.91,
+  min 0.77); 50 is faster (1.96×) with a lower mean SSIM (0.86).
 - The coefficients were calibrated on the medium checkpoint only; the large
   checkpoint was not measured.
 
