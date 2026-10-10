@@ -836,6 +836,19 @@ class OmniDiffusionConfig:
 
     model_class_name: str | None = None
 
+    # Multi-stage diffusion role. ``None``/"dit"/"diffusion" run the full
+    # pipeline (text-encode + denoise + decode) in one stage. "text_encode"
+    # runs only the text encoder and emits prompt embeddings for a downstream
+    # diffusion stage (Encode/Generation (EG) disaggregation).
+    model_stage: str | None = None
+
+    # Structured diffusion stage role (encode / denoise / decode / full).
+    # This supersedes the free-form ``model_stage`` string: it is the
+    # model-agnostic axis that drives role-based component loading and stage
+    # dispatch so any DiT model can be disaggregated via config. When ``None``
+    # it is derived from ``model_stage`` (see ``resolve_diffusion_stage_role``).
+    stage_role: str | None = None
+
     # Optional model-defined startup task. Pipelines may use this to select
     # task-specific components or weights before serving requests.
     task_type: str | None = None
@@ -1100,6 +1113,7 @@ class OmniDiffusionConfig:
     # rather than carried inline through the orchestrator. Empty disables the
     # worker-side connector receive path.
     stage_input_payload_keys: tuple[str, ...] = ()
+    stage_input_optional_payload_keys: tuple[str, ...] = ()
 
     # Keys handed to the next stage over the omni connector. Empty disables the
     # worker-side connector send path.
@@ -1233,6 +1247,7 @@ class OmniDiffusionConfig:
         )
 
         self.stage_input_payload_keys = tuple(self.stage_input_payload_keys)
+        self.stage_input_optional_payload_keys = tuple(self.stage_input_optional_payload_keys)
         self.stage_output_payload_keys = tuple(self.stage_output_payload_keys)
         if self.vae_fast_path not in VAE_FAST_PATH_LEVELS:
             raise ValueError(f"vae_fast_path must be one of {list(VAE_FAST_PATH_LEVELS)}, got {self.vae_fast_path!r}")
@@ -1826,6 +1841,8 @@ class DiffusionOutput:
     trajectory_latents: torch.Tensor | dict[str, Any] | None = None
     trajectory_log_probs: torch.Tensor | dict[str, Any] | None = None
     trajectory_decoded: list[Image.Image] | None = None
+    # Internal non-final-stage payload consumed by StagePool.
+    custom_output: dict[str, Any] = field(default_factory=dict)
     async_output_id: str | None = None
     error: str | None = None
     error_status_code: int | None = None
@@ -1902,6 +1919,7 @@ class DiffusionOutput:
         self.trajectory_timesteps = _maybe_to_cpu(self.trajectory_timesteps)
         self.trajectory_latents = _maybe_to_cpu(self.trajectory_latents)
         self.trajectory_log_probs = _maybe_to_cpu(self.trajectory_log_probs)
+        self.custom_output = _maybe_to_cpu(self.custom_output)
 
     @classmethod
     def from_exception(cls, exc: BaseException) -> "DiffusionOutput":

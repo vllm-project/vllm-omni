@@ -1445,7 +1445,11 @@ def test_vllm_set_forward_context_implementation(monkeypatch):
 @pytest.mark.core_model
 @pytest.mark.cpu
 @pytest.mark.parametrize("cancel_all", [False, True])
-def test_execute_model_batch_cancellation_preserves_live_peer(monkeypatch, cancel_all):
+@pytest.mark.parametrize("stage_dispatch", [False, True])
+@pytest.mark.parametrize("cancel_during_execution", [False, True])
+def test_execute_model_batch_cancellation_preserves_live_peer(
+    monkeypatch, cancel_all, stage_dispatch, cancel_during_execution
+):
     from vllm_omni.diffusion.cancellation import (
         RequestCancellationRegistry,
         check_request_cancellation,
@@ -1458,20 +1462,31 @@ def test_execute_model_batch_cancellation_preserves_live_peer(monkeypatch, cance
         supports_request_cancellation = True
 
         def forward(self, batch):
+            if cancel_during_execution:
+                registry.cancel(["req-0", "req-1"] if cancel_all else ["req-0"])
             check_request_cancellation()
             return super().forward(batch)
 
     monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
     monkeypatch.setattr(model_runner_module, "current_omni_platform", _fake_platform_for_peak_memory())
     pipeline = CancellableBatchPipeline(outputs=[DiffusionOutput(output="a"), DiffusionOutput(output="b")])
+    if stage_dispatch:
+        stage_call = Mock(side_effect=pipeline.forward)
+        forward_call = Mock(side_effect=AssertionError("Stage dispatch must not call forward"))
+        monkeypatch.setattr(pipeline, "run_stage", stage_call, raising=False)
+        monkeypatch.setattr(pipeline, "forward", forward_call)
     runner = _make_batch_runner(pipeline)
     sched = _make_scheduler_output(num_reqs=2)
     registry = RequestCancellationRegistry()
     try:
         for entry in sched.scheduled_new_reqs:
             entry.req.cancellation_signal = registry.create(entry.request_id)
-        registry.cancel(["req-0", "req-1"] if cancel_all else ["req-0"])
+        if not cancel_during_execution:
+            registry.cancel(["req-0", "req-1"] if cancel_all else ["req-0"])
         result = runner.execute_model_batch(sched, runner.od_config)
+        if stage_dispatch:
+            assert stage_call.call_count == int(cancel_during_execution or not cancel_all)
+            forward_call.assert_not_called()
         assert len(result.runner_outputs) == 2
         assert [output.result.aborted for output in result.runner_outputs] == [cancel_all, cancel_all]
         if not cancel_all:

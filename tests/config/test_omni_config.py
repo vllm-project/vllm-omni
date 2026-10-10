@@ -1893,10 +1893,12 @@ def test_diffusion_stage_payload_keys_roundtrip(source, key_container, tmp_path)
 
     topology_keys = {
         "stage_input_payload_keys": ("conditioning", "metadata"),
+        "stage_input_optional_payload_keys": ("metadata",),
         "stage_output_payload_keys": ("latents",),
     }
     override_keys = {
         "stage_input_payload_keys": (),
+        "stage_input_optional_payload_keys": (),
         "stage_output_payload_keys": ("audio", "video"),
     }
     pipeline = _resolve_pipeline_or_skip("dreamzero")
@@ -1935,6 +1937,25 @@ def test_diffusion_stage_payload_keys_roundtrip(source, key_container, tmp_path)
         assert getattr(od_config, name) == keys
     for name in topology_keys:
         assert getattr(topology, name) == (() if source == "default" else topology_keys[name])
+
+
+@pytest.mark.parametrize("pipeline_key", ["wan2_2_eg", "wan2_2_egd"])
+def test_wan_stage_roles_survive_structured_runtime_projection(pipeline_key, tmp_path):
+    from vllm_omni.diffusion.data import OmniDiffusionConfig
+    from vllm_omni.engine.stage_init_utils import build_engine_args_dict_from_omni_stage_config
+
+    pipeline = _resolve_pipeline_or_skip(pipeline_key)
+    config = VllmOmniConfig.from_pipeline_config(pipeline, user_deploy_config=_load_default_deploy(pipeline))
+    for topology in pipeline.stages:
+        stage = ForkingPickler.loads(ForkingPickler.dumps(config.stage_by_id(topology.stage_id)))
+        assert stage.diffusion_config.stage_role == topology.stage_role.value
+        engine_args = build_engine_args_dict_from_omni_stage_config(stage, model=str(tmp_path))
+        kwargs = omni_config_module.extract_diffusion_stage_config_kwargs(
+            engine_args, stage_id=stage.stage_id, include_engine_adapter_metadata=True
+        )
+        runtime = OmniDiffusionConfig.from_kwargs(**kwargs)
+        assert runtime.stage_role == topology.stage_role.value
+        assert runtime.stage_input_optional_payload_keys == topology.stage_input_optional_payload_keys
 
 
 def test_diffusion_config_field_classification_covers_current_fields():
