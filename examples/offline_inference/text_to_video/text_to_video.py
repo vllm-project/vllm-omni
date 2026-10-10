@@ -302,8 +302,12 @@ def parse_args() -> argparse.Namespace:
         "--cache-backend",
         type=str,
         default=None,
-        choices=["cache_dit"],
-        help="Cache backend for supported diffusion pipelines. Default: None.",
+        choices=["cache_dit", "tea_cache"],
+        help=(
+            "Cache backend for supported diffusion pipelines. "
+            "Options: 'cache_dit' (DBCache + SCM + TaylorSeer), 'tea_cache' (TeaCache). "
+            "Default: None (no cache acceleration)."
+        ),
     )
     parser.add_argument(
         "--enable-cache-dit-summary",

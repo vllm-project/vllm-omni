@@ -77,6 +77,15 @@ _MODEL_COEFFICIENTS = {
         -3.76790311e00,
         2.27176809e-01,
     ],
+    # Default WanTransformer3DModel coefficients for 480x832 resolution
+    # the other resolution could need to be tuned specifically
+    "WanTransformer3DModel": [
+        -4.95575015e01,
+        2.82816062e01,
+        -8.15628974e00,
+        2.12991172e00,
+        -1.01454960e-01,
+    ],
     # Estimated TeaCache polynomial coefficients for StableAudioDiTModel.
     "StableAudioDiTModel": [
         121.77490545701518,
