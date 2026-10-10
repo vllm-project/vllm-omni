@@ -466,10 +466,9 @@ vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice \
 This mode supports local EngineCore stages with one local process group per
 replica, including stages configured with multiple `num_replicas`. Headless,
 remote, intra-replica data-parallel, and Ray stage deployments are not
-supported. Runtime voice upload and deletion are disabled with multiple
-API frontends because their registries are process-local. Built-in voices,
-inline `ref_audio`, and voices restored from `custom_voice_dir` at startup are
-supported.
+supported. Built-in voices, inline `ref_audio`, voices restored from
+`custom_voice_dir` at startup, and runtime voice upload and deletion are
+supported: all API frontends share the uploaded-voice directory.
 
 ### Executor backend
 
@@ -536,9 +535,9 @@ checkpoint. When a request names an uploaded voice, the server infers
 `task_type="Base"`. Built-in presets such as `vivian` and `ryan` remain
 CustomVoice speakers and require a CustomVoice checkpoint.
 
-The runtime upload and delete routes require a single API frontend; with
-`--api-server-count > 1`, use inline `ref_audio` or restore precomputed voices
-from `custom_voice_dir` at startup.
+Uploaded voices live in `SPEAKER_SAMPLES_DIR`; with `--api-server-count > 1`
+every API process shares that directory, so a voice uploaded or deleted through
+one process is used or rejected consistently by all of them.
 
 ### Precomputed custom voices
 

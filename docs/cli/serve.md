@@ -19,10 +19,15 @@ process group per replica. A stage may still use multiple `num_replicas`.
 It cannot be combined with diffusion, headless or
 remote stages, intra-stage data parallelism, Ray, fault tolerance, elastic
 expert parallelism, sleep mode, or runtime LoRA updating. Runtime voice upload
-and deletion are also disabled because those mutations are process-local;
-built-in voices, inline reference audio, and voices restored at startup remain
-available. The `/v1/omni/sleep` and `/v1/omni/wakeup` control routes return HTTP
-409 for the same reason: their bookkeeping is process-local while stage engines
+and deletion work with any number of API processes: the speaker directory
+(`SPEAKER_SAMPLES_DIR`) is the registry they share, mutations hold a file lock
+on it, and every process picks up the other processes' changes before it
+resolves a voice. Keep that directory on a local filesystem: client-side
+attribute caching on network filesystems delays when other processes see a
+change. It defaults to `~/.cache/vllm-omni/speakers`, which every server run by
+the same user shares; set `SPEAKER_SAMPLES_DIR` per deployment to keep their
+voices apart. The `/v1/omni/sleep` and `/v1/omni/wakeup` control routes
+return HTTP 409 because their bookkeeping is process-local while stage engines
 are shared.
 
 A single-stage model pipeline is supported through the normal launch command;
