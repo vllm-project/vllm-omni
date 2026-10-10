@@ -36,6 +36,7 @@ from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.anthropic.serving import AnthropicServingMessages
 from vllm.entrypoints.chat_utils import ChatTemplateConfig, load_chat_template
 from vllm.entrypoints.generate.base.protocol import RequestResponseMetadata
+from vllm.entrypoints.generate.generative_scoring.serving import ServingGenerativeScoring
 from vllm.entrypoints.launchers.cli_args import make_arg_parser
 from vllm.entrypoints.launchers.launcher import serve_http
 from vllm.entrypoints.launchers.utils.server_utils import get_uvicorn_log_config
@@ -862,6 +863,14 @@ async def omni_init_app_state(
     state.args = args
     state.sleeping_stages = set()
 
+    # ``build_app`` mounts /generative_scoring for every server, and the route
+    # resolves it with a bare ``request.app.state.serving_generative_scoring``
+    # (no ``getattr`` fallback). So the key must exist on every init path below,
+    # including the ones that return early; only the generate path overwrites it
+    # with a real handler, and elsewhere the route reaches its own
+    # ``handler is None`` -> ``NotImplementedError`` branch instead of raising.
+    state.serving_generative_scoring = None
+
     # For omni models
     state.stage_configs = engine_client.stage_configs if hasattr(engine_client, "stage_configs") else None
     model_name = served_model_names[0] if served_model_names else args.model
@@ -1173,6 +1182,18 @@ async def omni_init_app_state(
         if "generate" in supported_tasks
         else None
     )
+
+    # Upstream's init_generate_state wires the generative-scoring handler with
+    # no `else None` branch, and build_app mounts /generative_scoring for every
+    # server; the route resolves this key with a bare attribute access, so omni
+    # has to wire it here too or the route answers 500 instead of the serving
+    # object's own "does not support" answer.
+    if "generate" in supported_tasks:
+        state.serving_generative_scoring = ServingGenerativeScoring(
+            engine_client,
+            state.openai_serving_models,
+            request_logger=request_logger,
+        )
 
     state.openai_serving_speech = OmniOpenAIServingSpeech(
         engine_client,
