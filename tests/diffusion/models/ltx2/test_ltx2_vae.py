@@ -37,6 +37,25 @@ def test_ltx_vocoder_deterministic_context(monkeypatch, initial_deterministic, f
     assert {name: getattr(torch.backends.cudnn, name) for name in settings} == settings
 
 
+@pytest.mark.parametrize("initial_enabled", [False, True])
+@pytest.mark.parametrize("fail", [False, True])
+def test_ltx_vocoder_disables_cudnn_context(monkeypatch, initial_enabled, fail):
+    from vllm_omni.diffusion.models.ltx2.ltx2_runtime import _deterministic_ltx_vocoder
+
+    monkeypatch.setattr(torch.backends.cudnn, "enabled", initial_enabled)
+    initial_deterministic = torch.backends.cudnn.deterministic
+    try:
+        with _deterministic_ltx_vocoder(disable_cudnn=True):
+            assert not torch.backends.cudnn.enabled
+            assert torch.backends.cudnn.deterministic == initial_deterministic
+            if fail:
+                raise RuntimeError("injected failure")
+    except RuntimeError as exc:
+        assert fail and str(exc) == "injected failure"
+    assert torch.backends.cudnn.enabled == initial_enabled
+    assert torch.backends.cudnn.deterministic == initial_deterministic
+
+
 @dataclass(frozen=True)
 class _OperatorSetProbe:
     fna: Callable[..., torch.Tensor] | None
@@ -75,6 +94,53 @@ def test_ltx_base_vocoder_keeps_native_dtype(monkeypatch):
     output = ltx_runtime._run_ltx_vocoder(vocoder, torch.ones(1, dtype=torch.bfloat16))
 
     assert vocoder.input_dtype == torch.bfloat16
+    assert output.dtype == torch.bfloat16
+
+
+def test_ltx_base_vocoder_uses_fp32_on_rocm(monkeypatch):
+    import vllm_omni.diffusion.models.ltx2.ltx2_runtime as ltx_runtime
+
+    class FakeBaseVocoder(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.ones(1, dtype=torch.bfloat16))
+            self.input_dtype = None
+            self.weight_dtype = None
+
+        def forward(self, value):
+            self.input_dtype = value.dtype
+            self.weight_dtype = self.weight.dtype
+            return value
+
+    monkeypatch.setattr(ltx_runtime, "_is_rocm_device", lambda _device_type: True)
+    vocoder = FakeBaseVocoder()
+
+    output = ltx_runtime._run_ltx_vocoder(vocoder, torch.ones(1, dtype=torch.bfloat16))
+
+    assert vocoder.input_dtype == torch.float32
+    assert vocoder.weight_dtype == torch.float32
+    assert vocoder.weight.dtype == torch.bfloat16
+    assert output.dtype == torch.bfloat16
+
+
+def test_ltx_parameterless_base_vocoder_uses_fp32_on_rocm(monkeypatch):
+    import vllm_omni.diffusion.models.ltx2.ltx2_runtime as ltx_runtime
+
+    class FakeBaseVocoder(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.input_dtype = None
+
+        def forward(self, value):
+            self.input_dtype = value.dtype
+            return value
+
+    monkeypatch.setattr(ltx_runtime, "_is_rocm_device", lambda _device_type: True)
+    vocoder = FakeBaseVocoder()
+
+    output = ltx_runtime._run_ltx_vocoder(vocoder, torch.ones(1, dtype=torch.bfloat16))
+
+    assert vocoder.input_dtype == torch.float32
     assert output.dtype == torch.bfloat16
 
 

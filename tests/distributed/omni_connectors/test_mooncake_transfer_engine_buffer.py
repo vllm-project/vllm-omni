@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """
 Unit tests for BufferAllocator and ManagedBuffer.
@@ -11,6 +11,7 @@ import threading
 import pytest
 import torch
 
+from tests.helpers.mark import hardware_test
 from vllm_omni.distributed.omni_connectors.connectors.mooncake_transfer_engine_connector import (
     BufferAllocator,
     ManagedBuffer,
@@ -239,7 +240,11 @@ class TestManagedBuffer:
         finally:
             buf.release()
 
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for GPU pool smoke test")
+    # PyTorch exposes ROCm devices through the cuda namespace. Keep this in the
+    # same one-GPU L4 marker scope used by the CUDA ready distributed job so the
+    # identical selection also executes a real GPU path on ROCm.
+    @hardware_test(res={"cuda": "L4"}, num_cards=1)
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU is required for GPU pool smoke test")
     def test_to_bytes_cuda_pool(self):
         """Smoke-test Mooncake's existing CUDA pool D2H byte path."""
         expected = bytes(range(64))
@@ -279,7 +284,8 @@ class TestMooncakePackedPayloadSmoke:
         assert header["rid"] == "moon-smoke"
         assert data_start == 4 + int.from_bytes(raw[:4], "big")
 
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for packed CUDA smoke test")
+    @hardware_test(res={"cuda": "L4"}, num_cards=1)
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU is required for packed device smoke test")
     def test_from_bytes_device_cuda_round_trip(self):
         payload, key_tensor, value_tensor = _make_kv_payload(device="cuda:0")
         packed = payload.to_gpu_tensor()
