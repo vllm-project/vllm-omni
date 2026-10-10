@@ -968,12 +968,7 @@ class _DiffusionConfigProjection:
         elif not isinstance(self.cache_config, DiffusionCacheConfig):
             self.cache_config = DiffusionCacheConfig()
 
-        if self.video_output_transport is None:
-            self.video_output_transport = VideoOutputTransportConfig()
-        elif isinstance(self.video_output_transport, Mapping):
-            self.video_output_transport = VideoOutputTransportConfig(**dict(self.video_output_transport))
-        elif not isinstance(self.video_output_transport, VideoOutputTransportConfig):
-            raise TypeError("video_output_transport must be a VideoOutputTransportConfig or mapping")
+        self.video_output_transport = VideoOutputTransportConfig.from_value(self.video_output_transport)
 
         self._propagate_quantization_from_tf_config(self.tf_model_config)
         if self.quantization_config is not None:

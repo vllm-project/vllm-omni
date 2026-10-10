@@ -10,13 +10,16 @@ from PIL import Image
 from torch import nn
 
 from tests.diffusion.models.wan2_2.conftest import StubScheduler, StubTransformer, StubVAE, noop_progress_bar
+from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import _WAN_TEXT_ENCODER_OFFLOAD_PLAN, build_wan_scheduler
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2_i2v import (
     Wan22I2VPipeline,
     get_wan22_i2v_post_process_func,
     get_wan22_i2v_pre_process_func,
 )
+from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
@@ -274,6 +277,55 @@ def test_i2v_prepare_latents_preserves_batched_image_conditions() -> None:
     assert latents.shape == (2, 4, 2, 2, 2)
     assert condition.shape == (2, 4, 1, 2, 2)
     assert first_frame_mask.shape == (2, 1, 2, 2, 2)
+
+
+@pytest.mark.parametrize("codec", ["libx264", "libx265"])
+def test_i2v_forward_passes_codec_policy_to_chunked_decode(monkeypatch, codec) -> None:
+    from vllm_omni.diffusion.models.wan2_2 import pipeline_wan2_2_i2v as module
+
+    monkeypatch.setattr(module.current_omni_platform, "is_available", lambda: False)
+    pipeline = _make_i2v_pipeline(expand_timesteps=True)
+    pipeline.scheduler = StubScheduler([9])
+    pipeline.od_config = OmniDiffusionConfig(model=None, flow_shift=5.0)
+    pipeline._sample_solver = "unipc"
+    pipeline._flow_shift = 5.0
+    pipeline.boundary_ratio = 0.875
+    pipeline.has_image_encoder = False
+    pipeline.check_inputs = lambda **kwargs: None
+    pipeline.encode_prompt = lambda **kwargs: (torch.zeros(1, 2, 3), None)
+    pipeline.prepare_latents = lambda **kwargs: (
+        torch.zeros(1, 4, 2, 2, 2),
+        torch.zeros(1, 4, 2, 2, 2),
+        torch.ones(1, 1, 2, 2, 2),
+    )
+    pipeline.diffuse = lambda **kwargs: kwargs["latents"]
+    options = {"crf": "0"}
+    captured = {}
+
+    def decode(vae, latents, **kwargs):
+        captured.update(kwargs)
+        return [b"mp4"]
+
+    monkeypatch.setattr(module, "decode_to_mp4", decode)
+    sampling = OmniDiffusionSamplingParams(
+        output_type="np",
+        height=16,
+        width=16,
+        num_frames=5,
+        num_inference_steps=1,
+        guidance_scale=1.0,
+        extra_args={"preencode_mp4": True, "video_codec": codec, "video_codec_options": options},
+    )
+    request = OmniDiffusionRequest(
+        prompt={"prompt": "prompt", "multi_modal_data": {"image": torch.zeros(1, 3, 16, 16)}},
+        sampling_params=sampling,
+        request_id="codec",
+    )
+    outputs = pipeline.forward(DiffusionRequestBatch([request]))
+
+    assert outputs[0].output == [b"mp4"]
+    assert captured["video_codec"] == codec
+    assert captured["video_codec_options"] == options
 
 
 @pytest.mark.parametrize("solver", ["unipc", "euler"])

@@ -169,7 +169,15 @@ async def test_decode_input_reference_preserves_image_pixel_limit_error(monkeypa
 
 
 def _install_fake_video_mux(monkeypatch, mux_calls):
-    def _fake_mux_video_audio_bytes(frames, audio, fps, audio_sample_rate, video_codec_options=None):
+    def _fake_mux_video_audio_bytes(
+        frames,
+        audio,
+        fps,
+        audio_sample_rate,
+        video_codec_options=None,
+        video_codec=None,
+        output_format=None,
+    ):
         mux_calls.append(
             {
                 "frames": frames,
@@ -177,6 +185,8 @@ def _install_fake_video_mux(monkeypatch, mux_calls):
                 "fps": fps,
                 "audio_sample_rate": audio_sample_rate,
                 "video_codec_options": video_codec_options,
+                "video_codec": video_codec,
+                "output_format": output_format,
             }
         )
         return b"fake-video"
@@ -953,7 +963,7 @@ def test_fragmented_mp4_video_encoder_reuses_single_muxer(monkeypatch):
     muxers = []
 
     class FakeFragmentedMP4Muxer:
-        def __init__(self, *, width, height, fps, video_codec_options=None):
+        def __init__(self, *, width, height, fps, video_codec_options=None, video_codec=None):
             self.calls = []
             muxers.append(
                 {

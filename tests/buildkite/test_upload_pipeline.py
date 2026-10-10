@@ -734,6 +734,27 @@ def test_source_filter_selects_composed_doc_job_by_example_or_model() -> None:
     assert "Doc Test" not in _surviving_labels(_SOURCE_FILTER_DOC, ["tests/e2e/online_serving/test_magi2.py"])
 
 
+@pytest.mark.parametrize(
+    "changed_file, expected",
+    [
+        ("tests/e2e/online_serving/test_video_output_transport_startup.py", True),
+        ("vllm_omni/diffusion/data.py", True),
+        ("vllm_omni/diffusion/models/wan2_2/pipeline_wan2_2.py", True),
+        ("vllm_omni/model_executor/models/qwen3_tts/model.py", False),
+    ],
+)
+def test_video_transport_startup_job_uses_diff_filter(monkeypatch, changed_file, expected) -> None:
+    monkeypatch.setattr("upload_pipeline._get_mirror_hw_selector", lambda: "")
+    doc = yaml.safe_load(NIGHTLY_YAML.read_text())
+    # Locate the job by its executed test, not its mutable display label.
+    startup_steps = [
+        step for step in _iter_steps(doc) if "test_video_output_transport_startup.py" in str(step.get("commands", ""))
+    ]
+    assert len(startup_steps) == 1
+    rendered = _render_test_pipeline({"steps": startup_steps}, changed_files=[changed_file])
+    assert bool(rendered["steps"]) is expected
+
+
 def test_source_filter_strips_deps_and_expands_hardware(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("upload_pipeline._get_mirror_hw_selector", lambda: "")
     rendered = _render_test_pipeline(

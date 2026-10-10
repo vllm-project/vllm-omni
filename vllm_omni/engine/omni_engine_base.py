@@ -25,6 +25,7 @@ from vllm.logger import init_logger
 from vllm.v1.engine.input_processor import InputProcessor
 
 from vllm_omni.config.config_factory import StageConfigFactory, with_trust_remote_code_override
+from vllm_omni.config.omni_config import VllmOmniDiffusionStageConfig
 from vllm_omni.config.resolver import OmniConfigResolution, resolve_omni_config
 from vllm_omni.config.stage_config import (
     _DEPLOY_DIR,
@@ -344,15 +345,16 @@ class OmniEngineBase:
         logger.info(f"[OmniEngine] Orchestrator ready with {self.num_stages} stages")
 
     def get_diffusion_od_config(self) -> Any:
-        """Expose the diffusion ``model_class_name`` to client-side model-extras.
+        """Expose the client-side view of the output diffusion stage.
 
-        The worker holds the full config; here we just resolve the pipeline class
-        name from the model config (cached). ``model_class_name`` may be ``None``.
+        The worker holds the full config. This cached view carries model
+        capabilities plus API-owned video output policy from the resolved stage.
+        ``model_class_name`` may be ``None``.
         """
         if self._diffusion_od_config_view is None:
             from types import SimpleNamespace
 
-            from vllm_omni.diffusion.data import resolve_model_class_name
+            from vllm_omni.diffusion.data import VideoOutputTransportConfig, resolve_model_class_name
             from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
 
             model_class_name = resolve_model_class_name(self.model)
@@ -360,11 +362,29 @@ class OmniEngineBase:
                 # use registered diffusers cls name as fallback
                 model_class_name = getattr(self.pipeline_config, "diffusers_class_name", None)
             metadata = get_diffusion_model_metadata(model_class_name)
+            diffusion_stages = [
+                stage for stage in self.stage_configs if getattr(stage, "stage_type", None) == "diffusion"
+            ]
+            output_stage = next(
+                (stage for stage in diffusion_stages if getattr(stage, "final_output", False)),
+                diffusion_stages[0] if diffusion_stages else None,
+            )
+            if isinstance(output_stage, VllmOmniDiffusionStageConfig):
+                raw_transport = output_stage.diffusion_config.video_output_transport
+            else:
+                engine_args = getattr(output_stage, "engine_args", None)
+                raw_transport = (
+                    engine_args.get("video_output_transport")
+                    if isinstance(engine_args, Mapping)
+                    else getattr(engine_args, "video_output_transport", None)
+                )
+            video_output_transport = VideoOutputTransportConfig.from_value(raw_transport)
             self._diffusion_od_config_view = SimpleNamespace(
                 model_class_name=model_class_name,
                 supports_multimodal_inputs=metadata.supports_multimodal_inputs,
                 max_multimodal_image_inputs=metadata.max_multimodal_image_inputs,
                 supports_mixed_reference_inputs=metadata.supports_mixed_reference_inputs,
+                video_output_transport=video_output_transport,
             )
         return self._diffusion_od_config_view
 

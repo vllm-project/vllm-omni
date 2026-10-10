@@ -737,15 +737,30 @@ def _decode_mp4(data: bytes):
 
 
 @pytest.mark.parametrize("batch_frames", [1, 1000])
-def test_s2v_preencode_returns_playable_mp4_bytes_per_request(monkeypatch, batch_frames) -> None:
-    """The clip loop hands finished clips to the encoder instead of concatenating."""
+@pytest.mark.parametrize(("codec", "expected_codec"), [("libx264", "h264"), ("libx265", "hevc")])
+def test_s2v_preencode_returns_playable_mp4_bytes_per_request(monkeypatch, batch_frames, codec, expected_codec) -> None:
+    """The clip loop preserves the codec policy and each request's waveform."""
+    import io
+
+    import av
+
     pipeline = _make_s2v_preencode_pipeline()
     # Two clips, so the autoregressive motion feedback runs between pushes.
     pipeline.encode_audio = MagicMock(return_value=(torch.zeros(1, 1, 2, 8), 2, 16))
     audio_a = np.zeros(16000, dtype=np.float32)
     audio_b = np.full(16000, 0.5, dtype=np.float32)
+    options = {"preset": "ultrafast", "threads": "1", "crf": "0"}
+    if codec == "libx265":
+        options["x265-params"] = "pools=none:frame-threads=1:bframes=0:log-level=error"
     batch = _make_s2v_preencode_batch(
-        audio_a, audio_b, extra_args={"preencode_mp4": True, "preencode_batch_frames": batch_frames}
+        audio_a,
+        audio_b,
+        extra_args={
+            "preencode_mp4": True,
+            "preencode_batch_frames": batch_frames,
+            "video_codec": codec,
+            "video_codec_options": options,
+        },
     )
     from vllm_omni.diffusion.utils import chunked_video
 
@@ -773,6 +788,8 @@ def test_s2v_preencode_returns_playable_mp4_bytes_per_request(monkeypatch, batch
         assert len(request_output.output) == 2
         for data in request_output.output:
             assert isinstance(data, bytes)
+            with av.open(io.BytesIO(data)) as container:
+                assert container.streams.video[0].codec_context.name == expected_codec
             frames, samples = _decode_mp4(data)
             assert frames > 0
             decoded.append(samples)
