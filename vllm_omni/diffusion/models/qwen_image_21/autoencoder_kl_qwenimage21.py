@@ -1287,15 +1287,10 @@ class AutoencoderKLQwenImage21(ModelMixin, AutoencoderMixin, ConfigMixin, FromOr
 
             iter_ = 1 + (num_frame - 1) // 4
             for i in range(iter_):
-                self._enc_conv_idx = [0]
                 if i == 0:
-                    out = self.encoder(x[:, :, :1, :, :], feat_cache=self._enc_feat_map, feat_idx=self._enc_conv_idx)
+                    out = self.encoder(x[:, :, :1, :, :])
                 else:
-                    out_ = self.encoder(
-                        x[:, :, 1 + 4 * (i - 1) : 1 + 4 * i, :, :],
-                        feat_cache=self._enc_feat_map,
-                        feat_idx=self._enc_conv_idx,
-                    )
+                    out_ = self.encoder(x[:, :, 1 + 4 * (i - 1) : 1 + 4 * i, :, :])
                     out = torch.cat([out, out_], 2)
 
             return self.quant_conv(out)
@@ -1342,14 +1337,12 @@ class AutoencoderKLQwenImage21(ModelMixin, AutoencoderMixin, ConfigMixin, FromOr
         self.clear_cache()
         try:
             x = self.post_quant_conv(z)
+            # No feature cache: the 2D causal convs never read it, it would only pin a clone of each conv input.
             for i in range(num_frame):
-                self._conv_idx = [0]
                 if i == 0:
-                    out = self.decoder(
-                        x[:, :, i : i + 1, :, :], feat_cache=self._feat_map, feat_idx=self._conv_idx, first_chunk=True
-                    )
+                    out = self.decoder(x[:, :, i : i + 1, :, :], first_chunk=True)
                 else:
-                    out_ = self.decoder(x[:, :, i : i + 1, :, :], feat_cache=self._feat_map, feat_idx=self._conv_idx)
+                    out_ = self.decoder(x[:, :, i : i + 1, :, :])
                     out = torch.cat([out, out_], 2)
 
             if self.config.patch_size is not None:
@@ -1444,7 +1437,6 @@ class AutoencoderKLQwenImage21(ModelMixin, AutoencoderMixin, ConfigMixin, FromOr
                 time = []
                 frame_range = 1 + (num_frames - 1) // 4
                 for k in range(frame_range):
-                    self._enc_conv_idx = [0]
                     if k == 0:
                         tile = x[:, :, :1, i : i + self.tile_sample_min_height, j : j + self.tile_sample_min_width]
                     else:
@@ -1455,7 +1447,7 @@ class AutoencoderKLQwenImage21(ModelMixin, AutoencoderMixin, ConfigMixin, FromOr
                             i : i + self.tile_sample_min_height,
                             j : j + self.tile_sample_min_width,
                         ]
-                    tile = self.encoder(tile, feat_cache=self._enc_feat_map, feat_idx=self._enc_conv_idx)
+                    tile = self.encoder(tile)
                     tile = self.quant_conv(tile)
                     time.append(tile)
                 row.append(torch.cat(time, dim=2))
@@ -1570,12 +1562,9 @@ class AutoencoderKLQwenImage21(ModelMixin, AutoencoderMixin, ConfigMixin, FromOr
                 self.clear_cache()
                 time = []
                 for k in range(num_frames):
-                    self._conv_idx = [0]
                     tile = z[:, :, k : k + 1, i : i + tile_latent_min_height, j : j + tile_latent_min_width]
                     tile = self.post_quant_conv(tile)
-                    decoded = self.decoder(
-                        tile, feat_cache=self._feat_map, feat_idx=self._conv_idx, first_chunk=(k == 0)
-                    )
+                    decoded = self.decoder(tile, first_chunk=(k == 0))
                     time.append(decoded)
                 row.append(torch.cat(time, dim=2))
             rows.append(row)

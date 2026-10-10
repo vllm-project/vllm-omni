@@ -264,3 +264,92 @@ def test_tiled_encode_oom_clears_enc_feat_map(monkeypatch):
 
     assert all(slot is None for slot in vae._enc_feat_map)
     assert all(slot is None for slot in vae._feat_map)
+
+
+# Single-frame paths -> expected output shape. The toy VAE below has one temporal
+# stage so the downsample3d/upsample3d and first_chunk branches are exercised.
+_SINGLE_FRAME_PATHS = {
+    "decode": (1, 4, 1, 64, 64),
+    "tiled_decode": (1, 4, 1, 64, 64),
+    "tile_exec": (1, 4, 1, 64, 64),
+    "encode": (1, 8, 1, 16, 16),
+    "tiled_encode": (1, 8, 1, 16, 16),
+}
+
+
+def _make_single_frame_vae(path):
+    cls = DistributedAutoencoderKLQwenImage21 if path == "tile_exec" else AutoencoderKLQwenImage21
+    torch.manual_seed(0)
+    vae = _make_vae(cls, temperal_downsample=[False, True])
+    if path in ("tiled_decode", "tile_exec", "tiled_encode"):
+        vae.enable_tiling(
+            tile_sample_min_height=32,
+            tile_sample_min_width=32,
+            tile_sample_stride_height=24,
+            tile_sample_stride_width=24,
+        )
+    return vae
+
+
+def _run_single_frame_path(vae, path):
+    generator = torch.Generator().manual_seed(1)
+    with torch.no_grad():
+        if path in ("encode", "tiled_encode"):
+            return vae._encode(torch.randn(1, 4, 1, 64, 64, generator=generator))
+        z = torch.randn(1, 4, 1, 16, 16, generator=generator)
+        if path == "tile_exec":
+            tasks, grid_spec = vae.tile_split(z)
+            return vae.tile_merge({task.grid_coord: vae.tile_exec(task) for task in tasks}, grid_spec)
+        return vae.decode(z, return_dict=False)[0]
+
+
+def _wrap_coder_forwards(monkeypatch, vae, inject_cache):
+    """Wrap encoder/decoder forward; return the feature caches they ran with."""
+    caches = []
+    for name in ("encoder", "decoder"):
+        module = getattr(vae, name)
+        num_convs = vae._cached_conv_counts[name]
+
+        def forward(x, feat_cache=None, feat_idx=None, _forward=module.forward, _num_convs=num_convs, **kwargs):
+            if inject_cache:
+                # Fresh per-call cache, as the cached single-frame path used.
+                feat_cache, feat_idx = [None] * _num_convs, [0]
+            caches.append(feat_cache)
+            return _forward(x, feat_cache=feat_cache, feat_idx=feat_idx, **kwargs)
+
+        monkeypatch.setattr(module, "forward", forward)
+    return caches
+
+
+def _num_cached_tensors(feat_cache):
+    return sum(isinstance(entry, torch.Tensor) for entry in feat_cache or [])
+
+
+@pytest.mark.parametrize("path", list(_SINGLE_FRAME_PATHS))
+def test_single_frame_paths_hold_no_feature_cache(monkeypatch, path):
+    """The 2D convs never read the temporal cache, so no conv input is cloned into it."""
+    vae = _make_single_frame_vae(path)
+    caches = _wrap_coder_forwards(monkeypatch, vae, inject_cache=False)
+
+    out = _run_single_frame_path(vae, path)
+
+    assert out.shape == _SINGLE_FRAME_PATHS[path]
+    assert caches, "encoder/decoder was not called"
+    assert all(cache is None for cache in caches)
+    assert _num_cached_tensors(getattr(vae, "_feat_map", None)) == 0
+    assert _num_cached_tensors(getattr(vae, "_enc_feat_map", None)) == 0
+
+
+@pytest.mark.parametrize("path", list(_SINGLE_FRAME_PATHS))
+def test_single_frame_paths_match_cached_reference(monkeypatch, path):
+    vae = _make_single_frame_vae(path)
+    out = _run_single_frame_path(vae, path)
+    assert torch.equal(out, _run_single_frame_path(vae, path))
+
+    caches = _wrap_coder_forwards(monkeypatch, vae, inject_cache=True)
+    ref = _run_single_frame_path(vae, path)
+
+    # The reference really took the cached branches, and dropping them is bit-identical.
+    assert caches and all(_num_cached_tensors(cache) > 0 for cache in caches)
+    assert ref.shape == out.shape
+    assert torch.equal(out, ref)
