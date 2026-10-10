@@ -34,6 +34,7 @@ from vllm_omni.diffusion.distributed.sp_plan import (
 )
 from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
 from vllm_omni.diffusion.models.qwen_image_21.decode_graph import QwenImage21DecodeGraphManager
+from vllm_omni.diffusion.models.qwen_image_21.pointwise import eligible as pointwise_eligible
 from vllm_omni.diffusion.models.qwen_image_21.pointwise import residual, rotary, silu_mul
 from vllm_omni.diffusion.models.qwen_image_21.qk_norm import qk_rotary
 from vllm_omni.diffusion.offloader.config import OffloadStrategy, resolve_offload_strategy
@@ -294,8 +295,10 @@ class QwenImage21SwiGLUFeedForward(nn.Module):
         )
         self.activation_fn = nn.SiLU()
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return self.out(silu_mul(self.gate_layer(hidden_states), self.proj(hidden_states)))
+    def forward(self, hidden_states: torch.Tensor, *, _pointwise_validated: bool = False) -> torch.Tensor:
+        return self.out(
+            silu_mul(self.gate_layer(hidden_states), self.proj(hidden_states), _validated=_pointwise_validated)
+        )
 
 
 class QwenImage21AdaLayerNormContinuous(nn.Module):
@@ -673,6 +676,7 @@ class QwenImage21TransformerBlock(nn.Module):
         cache_branch: str = "cond",
         cache_write_len: int | None = None,
         prepared_modulation: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+        _pointwise_validated: bool = False,
     ) -> torch.Tensor:
         if prepared_modulation is None:
             mod1, mod2 = modulation.chunk(2, dim=-1)
@@ -691,14 +695,19 @@ class QwenImage21TransformerBlock(nn.Module):
             cache_branch=cache_branch,
             cache_write_len=cache_write_len,
         )
-        hidden_states = residual(hidden_states, attn_output, img_gate1)
+        hidden_states = residual(hidden_states, attn_output, img_gate1, _validated=_pointwise_validated)
 
         if prepared_modulation is None:
             img_modulated2, img_gate2 = self._modulate(self.img_norm2(hidden_states), mod2, target_token_mask)
             img_gate2 = img_gate2.tanh()
         else:
             img_modulated2 = self.img_norm2(hidden_states) * scale2
-        hidden_states = residual(hidden_states, self.img_mlp(img_modulated2), img_gate2)
+        mlp_output = (
+            self.img_mlp(img_modulated2, _pointwise_validated=True)
+            if _pointwise_validated
+            else self.img_mlp(img_modulated2)
+        )
+        hidden_states = residual(hidden_states, mlp_output, img_gate2, _validated=_pointwise_validated)
 
         if hidden_states.dtype == torch.float16:
             hidden_states = hidden_states.clip(-65504, 65504)
@@ -865,6 +874,11 @@ class QwenImage21Transformer2DModel(CachedTransformer):
         self.causal_block = causal_block
         self.quant_config = _enable_pattern_ignored_layers(quant_config)
         quant_config = self.quant_config
+        self._pointwise_contract_allowed = (
+            quant_config is None
+            and getattr(od_config, "lora_config", None) is None
+            and resolve_offload_strategy(od_config) == OffloadStrategy.NONE
+        )
 
         # Storage dtype for the cross-step prefix KV cache, from the supplementary
         # model-specific config entry `extras["prefix_kv_cache_dtype"]` (None = bf16/fp32
@@ -1275,7 +1289,7 @@ class QwenImage21Transformer2DModel(CachedTransformer):
             elif joint_key_valid is not None:
                 attn_metadata = AttentionMetadata(attn_mask=joint_key_valid)
 
-        block_extras = {}
+        block_extras: dict[str, Any] = {}
         if (
             joint_hidden_states.device.type == "cuda"
             and not torch.is_grad_enabled()
@@ -1291,6 +1305,12 @@ class QwenImage21Transformer2DModel(CachedTransformer):
                 1 + _select_modulation_rows(scale2, local_mask),
                 _select_modulation_rows(gate2, local_mask).tanh(),
             )
+            if getattr(self, "_pointwise_contract_allowed", False):
+                # Native unquantized linear/norm operations preserve dtype,
+                # device and dense row layout. Validate the shared gates once
+                # per step, instead of repeating it at every pointwise call.
+                prepared = block_extras["prepared_modulation"]
+                block_extras["_pointwise_validated"] = pointwise_eligible(joint_hidden_states, prepared[1], prepared[3])
         for index_block, block in enumerate(self.transformer_blocks):
             block_kv_cache = kv_cache[index_block] if kv_cache is not None else None
             joint_hidden_states = block(

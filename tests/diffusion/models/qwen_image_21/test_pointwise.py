@@ -32,9 +32,11 @@ def test_production_shapes_preserve_rounding(sequence):
     x = torch.randn(1, sequence, 4096, device="cuda", dtype=torch.bfloat16)
     y, gate = torch.randn_like(x), torch.randn_like(x)
     torch.testing.assert_close(residual(x, y, gate), x + gate * y, rtol=0, atol=0)
+    torch.testing.assert_close(residual(x, y, gate, _validated=True), x + gate * y, rtol=0, atol=0)
     gate = torch.randn(1, sequence, 12288, device="cuda", dtype=torch.bfloat16)
     up = torch.randn_like(gate)
     torch.testing.assert_close(silu_mul(gate, up), torch.nn.functional.silu(gate) * up, rtol=0, atol=0)
+    torch.testing.assert_close(silu_mul(gate, up, _validated=True), torch.nn.functional.silu(gate) * up, rtol=0, atol=0)
     projection = torch.randn(2, sequence, 3, 32, 128, device="cuda", dtype=torch.bfloat16)
     query = projection[:, :, 0]
     freqs = torch.polar(torch.ones(sequence, 64, device="cuda"), torch.randn(sequence, 64, device="cuda"))
