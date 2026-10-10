@@ -223,9 +223,12 @@ def test_client(mock_async_diffusion):
 
     from vllm_omni.entrypoints.openai.models.serving import _DiffusionServingModels
 
+    # Assign model capable of generating images and set supported tasks as x2i
     app.state.openai_serving_models = _DiffusionServingModels(
         [BaseModelPath(name="Qwen/Qwen-Image", model_path="Qwen/Qwen-Image")]
     )
+    app.state.supported_tasks = "x2i"
+
     app.state.args = Namespace(
         default_sampling_params='{"0": {"num_inference_steps":4, "guidance_scale":7.5, "generator_device":"cpu"}}',
         max_generated_image_size=1024 * 1792,
@@ -301,6 +304,7 @@ def async_omni_test_client():
     chat_handler.engine_client = engine
     chat_handler._diffusion_engine = None
     app.state.openai_serving_chat = chat_handler
+    app.state.supported_tasks = "x2i"
     app.state.engine_client = engine
     app.state.stage_configs = [
         SimpleNamespace(stage_type="llm"),
@@ -365,6 +369,7 @@ def async_omni_rgba_test_client():
     chat_handler.engine_client = engine
     chat_handler._diffusion_engine = None
     app.state.openai_serving_chat = chat_handler
+    app.state.supported_tasks = "x2i"
     app.state.engine_client = engine
     app.state.stage_configs = [
         SimpleNamespace(stage_type="llm"),
@@ -431,6 +436,7 @@ def async_omni_stage_configs_only_client():
     chat_handler.engine_client = engine
     chat_handler._diffusion_engine = None
     app.state.openai_serving_chat = chat_handler
+    app.state.supported_tasks = "x2i"
     app.state.args = Namespace(
         default_sampling_params='{"1": {"num_inference_steps":4, "guidance_scale":7.5, "generator_device":"cpu"}}',
         max_generated_image_size=1024 * 1792,
@@ -515,10 +521,77 @@ def mammoth_moda2_test_client():
     app.state.openai_serving_models = _DiffusionServingModels(
         [BaseModelPath(name="Mammoth/MammothModa2-Preview", model_path="Mammoth/MammothModa2-Preview")]
     )
+    app.state.supported_tasks = "x2i"
     app.state.args = Namespace(
         default_sampling_params='{"1": {"num_inference_steps":50, "generator_device":"cpu"}}',
         max_generated_image_size=1024 * 1024,
     )
+    return TestClient(app)
+
+
+@pytest.fixture
+def glm_multistage_test_client():
+    """GLM-Image multistage: stage-0 gets target_h/w from requested size.
+
+    max_tokens comes from the deploy YAML default (upper-bound ceiling),
+    NOT computed dynamically from height/width.
+    """
+
+    class FakeAsyncOmniClass(AsyncOmni):
+        def __init__(self):
+            stage_configs = [
+                SimpleNamespace(stage_type="llm", is_comprehension=True, model_arch="GlmImageForConditionalGeneration"),
+                SimpleNamespace(stage_type="diffusion", is_comprehension=False, model_arch="GlmImagePipeline"),
+            ]
+            # YAML default max_tokens for GLM-Image AR stage (upper bound for 2048x2048 t2i)
+            default_sampling_params_list = [
+                SamplingParams(temperature=0.1, seed=42, max_tokens=4353),
+                OmniDiffusionSamplingParams(height=1024, width=1024),
+            ]
+            self.engine = SimpleNamespace(
+                stage_configs=stage_configs,
+                default_sampling_params_list=default_sampling_params_list,
+            )
+            self.default_sampling_params_list = default_sampling_params_list
+            self.captured_sampling_params_list = None
+            self.captured_prompt = None
+            self._images = [Image.new("RGB", (64, 64), color="green")]
+            self.od_config = SimpleNamespace(supports_multimodal_inputs=True)
+
+        async def generate(self, prompt, request_id, sampling_params=None, sampling_params_list=None, **kwargs):
+            self.captured_sampling_params_list = (
+                sampling_params_list if sampling_params_list is not None else [sampling_params]
+            )
+            self.captured_prompt = prompt
+            yield MockGenerationResult([img.copy() for img in self._images])
+
+        def __class_getitem__(cls, item):
+            return cls
+
+        def get_diffusion_od_config(self):
+            return self.od_config
+
+    app = FastAPI()
+    app.include_router(router)
+    engine = FakeAsyncOmniClass()
+    chat_handler = object.__new__(OmniOpenAIServingChat)
+    chat_handler.engine_client = engine
+    chat_handler._diffusion_engine = None
+    app.state.openai_serving_chat = chat_handler
+    app.state.engine_client = engine
+    app.state.stage_configs = [
+        SimpleNamespace(stage_type="llm", model_arch="GlmImageForConditionalGeneration"),
+        SimpleNamespace(stage_type="diffusion", model_arch="GlmImagePipeline"),
+    ]
+    app.state.openai_serving_models = _DiffusionServingModels(
+        [BaseModelPath(name="THUDM/GLM-4.5V", model_path="THUDM/GLM-4.5V")]
+    )
+    app.state.supported_tasks = "x2i"
+    app.state.args = Namespace(
+        default_sampling_params='{"1": {"num_inference_steps":4, "guidance_scale":7.5, "generator_device":"cpu"}}',
+        max_generated_image_size=1048576,
+    )
+
     return TestClient(app)
 
 
@@ -576,6 +649,7 @@ def streaming_image_edit_client():
     chat_handler.engine_client = engine
     chat_handler._diffusion_engine = None
     app.state.openai_serving_chat = chat_handler
+    app.state.supported_tasks = "x2i"
     app.state.engine_client = engine
     app.state.stage_configs = [
         SimpleNamespace(stage_type="llm"),
@@ -794,69 +868,8 @@ def test_multistage_images_async_omni_construction(async_omni_test_client):
     assert captured[1].guidance_scale == 6.5
 
 
-def test_generate_images_async_omni_glm_image_sets_stage0_max_tokens():
-    """GLM-Image multistage: stage-0 gets target_h/w from requested size.
-
-    max_tokens comes from the deploy YAML default (upper-bound ceiling),
-    NOT computed dynamically from height/width.
-    """
-
-    class FakeAsyncOmniClass(AsyncOmni):
-        def __init__(self):
-            stage_configs = [
-                SimpleNamespace(stage_type="llm", is_comprehension=True, model_arch="GlmImageForConditionalGeneration"),
-                SimpleNamespace(stage_type="diffusion", is_comprehension=False, model_arch="GlmImagePipeline"),
-            ]
-            # YAML default max_tokens for GLM-Image AR stage (upper bound for 2048x2048 t2i)
-            default_sampling_params_list = [
-                SamplingParams(temperature=0.1, seed=42, max_tokens=4353),
-                OmniDiffusionSamplingParams(height=1024, width=1024),
-            ]
-            self.engine = SimpleNamespace(
-                stage_configs=stage_configs,
-                default_sampling_params_list=default_sampling_params_list,
-            )
-            self.default_sampling_params_list = default_sampling_params_list
-            self.captured_sampling_params_list = None
-            self.captured_prompt = None
-            self._images = [Image.new("RGB", (64, 64), color="green")]
-            self.od_config = SimpleNamespace(supports_multimodal_inputs=True)
-
-        async def generate(self, prompt, request_id, sampling_params=None, sampling_params_list=None, **kwargs):
-            self.captured_sampling_params_list = (
-                sampling_params_list if sampling_params_list is not None else [sampling_params]
-            )
-            self.captured_prompt = prompt
-            yield MockGenerationResult([img.copy() for img in self._images])
-
-        def __class_getitem__(cls, item):
-            return cls
-
-        def get_diffusion_od_config(self):
-            return self.od_config
-
-    app = FastAPI()
-    app.include_router(router)
-    engine = FakeAsyncOmniClass()
-    chat_handler = object.__new__(OmniOpenAIServingChat)
-    chat_handler.engine_client = engine
-    chat_handler._diffusion_engine = None
-    app.state.openai_serving_chat = chat_handler
-    app.state.engine_client = engine
-    app.state.stage_configs = [
-        SimpleNamespace(stage_type="llm", model_arch="GlmImageForConditionalGeneration"),
-        SimpleNamespace(stage_type="diffusion", model_arch="GlmImagePipeline"),
-    ]
-    app.state.openai_serving_models = _DiffusionServingModels(
-        [BaseModelPath(name="THUDM/GLM-4.5V", model_path="THUDM/GLM-4.5V")]
-    )
-    app.state.args = Namespace(
-        default_sampling_params='{"1": {"num_inference_steps":4, "guidance_scale":7.5, "generator_device":"cpu"}}',
-        max_generated_image_size=1048576,
-    )
-    client = TestClient(app)
-
-    response = client.post(
+def test_generate_images_async_omni_glm_image_sets_stage0_max_tokens(glm_multistage_test_client):
+    response = glm_multistage_test_client.post(
         "/v1/images/generations",
         json={
             "prompt": "a coral reef",
@@ -867,7 +880,7 @@ def test_generate_images_async_omni_glm_image_sets_stage0_max_tokens():
     )
     assert response.status_code == 200
 
-    captured = engine.captured_sampling_params_list
+    captured = glm_multistage_test_client.app.state.engine_client.captured_sampling_params_list
     assert captured is not None
     assert len(captured) == 2
     # max_tokens comes from YAML default, not computed dynamically
@@ -1341,6 +1354,7 @@ def test_model_not_loaded():
     app.include_router(router)
     # Don't set diffusion_engine to simulate uninitialized state
     app.state.diffusion_engine = None
+    app.state.supported_tasks = "x2i"
 
     client = TestClient(app)
     response = client.post(
