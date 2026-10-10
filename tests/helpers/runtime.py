@@ -1211,6 +1211,7 @@ def pi0_openpi_run_policy_session(
     session_id: str | None = None,
     num_steps: int = 2,
     num_inference_steps: int | None = None,
+    seed: int | None = None,
 ) -> dict[str, Any]:
     """Connect, read handshake metadata, send ``num_steps`` observations."""
     import uuid
@@ -1229,6 +1230,8 @@ def pi0_openpi_run_policy_session(
         actions = []
         for _ in range(num_steps):
             payload = pi0_make_dummy_obs(prompt=prompt, session_id=session_id)
+            if seed is not None:
+                payload["seed"] = seed
             if num_inference_steps is not None:
                 payload["sampling_params"] = {"num_inference_steps": num_inference_steps}
             payload["endpoint"] = "infer"
