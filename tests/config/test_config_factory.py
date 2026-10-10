@@ -2008,6 +2008,46 @@ stages:
         )
         assert async_stages[1].custom_process_input_func is None
 
+    def test_longcat_next_thinker_only_merges_single_stage_deploy(self):
+        deploy_path = Path(get_deploy_config_path("longcat_next_thinker_only.yaml"))
+        if not deploy_path.exists():
+            pytest.skip("Deploy config not found")
+
+        pipeline = resolve_pipeline_config("longcat_next_thinker_only")
+        assert isinstance(pipeline, PipelineConfig)
+
+        deploy = load_deploy_config(deploy_path)
+        assert deploy.pipeline == "longcat_next_thinker_only"
+        stages = merge_pipeline_deploy(pipeline, deploy)
+
+        assert len(stages) == 1
+        s0 = stages[0]
+        assert s0.model_stage == "thinker"
+        assert s0.yaml_engine_args["model_arch"] == "LongcatNextForCausalLM"
+        assert s0.yaml_engine_args["engine_output_type"] == "latent"
+        # visual-CFG twin expansion must survive the deploy merge
+        assert s0.yaml_extras["prompt_expand_func"].endswith("expand_longcat_cfg_prompts")
+        assert s0.yaml_extras["default_sampling_params"]["detokenize"] is True
+
+    def test_longcat_next_multi_decoder_deploy_merges_two_stages(self):
+        deploy_path = Path(get_deploy_config_path("longcat_next_4gpu_80gb_multi_decoder.yaml"))
+        if not deploy_path.exists():
+            pytest.skip("Deploy config not found")
+
+        pipeline = resolve_pipeline_config("longcat_next_thinker_multi_decoder")
+        assert isinstance(pipeline, PipelineConfig)
+
+        deploy = load_deploy_config(deploy_path)
+        assert deploy.pipeline == "longcat_next_thinker_multi_decoder"
+        stages = merge_pipeline_deploy(pipeline, deploy)
+
+        assert len(stages) == 2
+        assert stages[0].model_stage == "thinker"
+        assert stages[1].model_stage == "multi_decoder"
+        assert stages[1].yaml_engine_args["model_arch"] == "LongcatNextMultiDecoder"
+        # token-only handoff: codes.visual/codes.audio + inferred grid
+        assert stages[1].custom_process_input_func.endswith("thinker2multi_decoder_token_only")
+
     def test_no_bundled_legacy_stage_config_yamls(self):
         repo_root = Path(__file__).resolve().parents[2]
         stage_config_dir = repo_root / "vllm_omni" / "model_executor" / "stage_configs"

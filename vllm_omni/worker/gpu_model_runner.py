@@ -1360,6 +1360,7 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
             info = self.model_intermediate_buffer.get(req_id, {})
             if info:
                 info["generated_len"] = generated_len
+                info["req_id"] = req_id
                 per_req_runtime_info.append(info)
                 if "thinker_reply_part_per_request" in info:
                     q = info["thinker_reply_part_per_request"]
@@ -1907,15 +1908,26 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
                     )
                     input_ids = preprocess_input_ids
 
+                # LongCat-Next emits "mtp_inputs" only while in audio-generation
+                # mode (it shares one backbone for text and audio); a text-only
+                # step must not raise on the pop. It opts into that leniency via
+                # omits_talker_mtp_inputs_when_idle. Pure-codec talkers
+                # (Qwen3-TTS/MOSS-TTS/Qwen3-Omni talker) must always emit it on
+                # span_len==1 decode, so a missing key stays a loud KeyError.
                 if self.has_talker_mtp and span_len == 1 and not is_prefill:
-                    last_talker_hidden, text_step = update_dict.pop("mtp_inputs")
-                    decode_slice = slice(len(decode_req_ids), len(decode_req_ids) + 1)
-                    self.talker_mtp_input_ids.gpu[decode_slice].copy_(req_input_ids)
-                    self.talker_mtp_inputs_embeds.gpu[decode_slice].copy_(req_embeds)
-                    self.last_talker_hidden.gpu[decode_slice].copy_(last_talker_hidden)
-                    self.text_step.gpu[decode_slice].copy_(text_step)
-                    decode_req_ids.append(req_id)
-                    decode_start_offsets.append(s)
+                    if "mtp_inputs" in update_dict:
+                        last_talker_hidden, text_step = update_dict.pop("mtp_inputs")
+                        decode_slice = slice(len(decode_req_ids), len(decode_req_ids) + 1)
+                        self.talker_mtp_input_ids.gpu[decode_slice].copy_(req_input_ids)
+                        self.talker_mtp_inputs_embeds.gpu[decode_slice].copy_(req_embeds)
+                        self.last_talker_hidden.gpu[decode_slice].copy_(last_talker_hidden)
+                        self.text_step.gpu[decode_slice].copy_(text_step)
+                        decode_req_ids.append(req_id)
+                        decode_start_offsets.append(s)
+                    elif not getattr(self.model, "omits_talker_mtp_inputs_when_idle", False):
+                        raise KeyError(
+                            "mtp_inputs missing for talker_mtp model that must emit it on every span_len==1 decode step"
+                        )
 
                 # TODO(Peiqi): the merge stage could move out from the critical path
                 self._update_intermediate_buffer(req_id, update_dict)
@@ -2046,6 +2058,7 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
             "temperature": subtalker_params.get("temperature"),
             "top_k": subtalker_params.get("top_k"),
             "top_p": subtalker_params.get("top_p"),
+            "repetition_penalty": subtalker_params.get("repetition_penalty"),
         }
         if decode_batch_size == 1:
             if row_generators[0] is not None:
@@ -2118,6 +2131,14 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
     ):
         """Inject omni-specific kwargs into forward and cache model output"""
         model_kwargs_extra = self._build_model_kwargs_extra()
+        if getattr(self.model, "accepts_logits_row_req_ids", False):
+            # compute_logits receives one hidden-state row per scheduled
+            # request, in persistent-batch order (unscheduled requests are
+            # removed from the batch before execution). Models whose
+            # per-request gen state must force specific rows (e.g.
+            # LongCat-Next audio/visual gen) read this stash to map rows to
+            # requests even when gen and plain-text requests share a step.
+            self.model._logits_row_req_ids = list(self.input_batch.req_ids)
         update_decode_metadata = getattr(self.model, "update_decode_step_metadata", None)
         if getattr(self.model, "supports_omni_decode_step_metadata", False) and callable(update_decode_metadata):
             cpu_input_tail_ids = None

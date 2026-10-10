@@ -79,6 +79,10 @@ from vllm_omni.model_executor.models.joyai_vl_interaction.pipeline import (
 )
 from vllm_omni.model_executor.models.lance.pipeline import LANCE_PIPELINE
 from vllm_omni.model_executor.models.lingbot_world.pipeline import LINGBOT_WORLD_PIPELINE
+from vllm_omni.model_executor.models.longcat_next.pipeline import (
+    LONGCAT_NEXT_THINKER_MULTI_DECODER_PIPELINE,
+    LONGCAT_NEXT_THINKER_ONLY_PIPELINE,
+)
 from vllm_omni.model_executor.models.mammoth_moda2.pipeline import (
     MAMMOTH_MODA2_AR_PIPELINE,
     MAMMOTH_MODA2_PIPELINE,
@@ -169,6 +173,8 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "joyai_vl_interaction": JOYAI_VL_INTERACTION_PIPELINE,
     "lance": LANCE_PIPELINE,
     "lingbot_world": LINGBOT_WORLD_PIPELINE,
+    "longcat_next_thinker_multi_decoder": LONGCAT_NEXT_THINKER_MULTI_DECODER_PIPELINE,
+    "longcat_next_thinker_only": LONGCAT_NEXT_THINKER_ONLY_PIPELINE,
     "mammoth_moda2": MAMMOTH_MODA2_PIPELINE,
     "mammoth_moda2_ar": MAMMOTH_MODA2_AR_PIPELINE,
     "mimo_audio": MIMO_AUDIO_PIPELINE,

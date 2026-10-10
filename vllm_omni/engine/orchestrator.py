@@ -135,6 +135,26 @@ def _build_terminal_empty_output(
     )
 
 
+def _remaining_max_tokens(model_config: ModelConfig, prompt_token_ids: list[int], request_id: str) -> int:
+    """max_model_len minus the prompt length, clamped to >= 1.
+
+    SamplingParams rejects max_tokens < 1, so an unclamped value here would
+    surface as an opaque ValueError deep in request construction instead of
+    a diagnosable warning at the point the prompt overruns max_model_len.
+    """
+    remaining = model_config.max_model_len - len(prompt_token_ids)
+    if remaining < 1:
+        logger.warning(
+            "[Orchestrator] req=%s prompt_token_ids length %d already meets/exceeds "
+            "max_model_len %d; clamping max_tokens to 1",
+            request_id,
+            len(prompt_token_ids),
+            model_config.max_model_len,
+        )
+        return 1
+    return remaining
+
+
 def build_engine_core_request_from_tokens(
     request_id: str,
     prompt: dict[str, Any],
@@ -152,10 +172,17 @@ def build_engine_core_request_from_tokens(
 
     sampling_params = None
     pooling_params = None
-    if isinstance(params, SamplingParams):
+    if params is None:
+        if model_config is not None:
+            sampling_params = SamplingParams(
+                max_tokens=_remaining_max_tokens(model_config, prompt_token_ids, request_id)
+            )
+        else:
+            sampling_params = SamplingParams()
+    elif isinstance(params, SamplingParams):
         sampling_params = params.clone()
         if model_config is not None:
-            remaining = model_config.max_model_len - len(prompt_token_ids)
+            remaining = _remaining_max_tokens(model_config, prompt_token_ids, request_id)
             if sampling_params.max_tokens is None:
                 sampling_params.max_tokens = remaining
             # ``check_stop`` returns early while ``min_tokens`` is unmet, so a

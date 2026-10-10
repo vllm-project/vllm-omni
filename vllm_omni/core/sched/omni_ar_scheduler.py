@@ -1494,6 +1494,14 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             ec_delay_free, ec_xfer_params = self.ec_connector.request_finished(request)
             connector_delay_free_blocks |= ec_delay_free
 
+        # EC Connector: mirror upstream Scheduler._free_request. Fired before
+        # the encoder cache is freed so the connector can inspect per-request
+        # state and emit ec_transfer_params for the response body.
+        ec_xfer_params: dict[str, Any] | None = None
+        if getattr(self, "ec_connector", None) is not None:
+            ec_delay_free, ec_xfer_params = self.ec_connector.request_finished(request)
+            connector_delay_free_blocks |= ec_delay_free
+
         self.encoder_cache_manager.free(request)
         request_id = request.request_id
         self.finished_req_ids.add(request_id)

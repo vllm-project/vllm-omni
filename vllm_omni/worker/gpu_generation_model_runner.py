@@ -591,8 +591,14 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
                     else:
                         logger.warning(f"Unsupported multimodal output type for key '{key}': {type(out)}")
                 per_req_payloads.append(_ensure_tensor_values(mm_payload))
+        elif multimodal_outputs_raw is None:
+            # Model produced no multimodal output (e.g. multi_decoder given a
+            # request with no visual/audio codes to decode) -- no-op per
+            # request rather than treating this as an error.
+            for _ in range(self.input_batch.num_reqs):
+                per_req_payloads.append({})
         else:
-            raise RuntimeError("Unsupported diffusion output type")
+            raise RuntimeError(f"Unsupported diffusion output type: {type(multimodal_outputs_raw)}")
         snapshot = None
         if use_async_output:
             # Models may opt in only when all CUDA payload storage is immutable

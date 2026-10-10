@@ -555,9 +555,14 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         engine_output_type = (self.vllm_config.model_config.engine_output_type or "").lower()
         if self._client_multimodal_output_keys():
             downstream_req_ids = req_ids_output_copy
-        # Single-stage AR TTS models (e.g. VoxCPM2) finish on this stage but still
-        # need multimodal payloads for final audio postprocess/output.
-        elif engine_output_type == "audio" and not downstream_req_ids:
+        # Single-stage AR TTS models (e.g. VoxCPM2) finish on this stage but
+        # still need multimodal payloads for final audio postprocess/output.
+        # The same holds for a thinker whose side-channel codes reach the
+        # client directly with no downstream decoder stage (tagged "latent"):
+        # _request_needs_downstream_stage_payload alone returns False for
+        # them, since final_stage_id == 0 for a single-stage pipeline has no
+        # later stage number to be > 0.
+        elif engine_output_type in ("audio", "latent") and not downstream_req_ids:
             downstream_req_ids = req_ids_output_copy
         return engine_output_type, downstream_req_ids
 

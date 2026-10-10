@@ -489,6 +489,27 @@ _OMNI_MODELS = {
         "yue2",
         "Yue2ForCausalLM",
     ),
+    ## LongCat-Next (meituan-longcat/LongCat-Next; thinker + combined multi-decoder)
+    "LongcatNextForCausalLM": (
+        "longcat_next",
+        "modeling_longcat_next",
+        "LongcatNextForCausalLM",
+    ),
+    "LongcatNextImageDecoder": (
+        "longcat_next",
+        "modeling_longcat_next_image_decoder",
+        "LongcatNextImageDecoder",
+    ),
+    "LongcatNextAudioDecoder": (
+        "longcat_next",
+        "modeling_longcat_next_audio_decoder",
+        "LongcatNextAudioDecoder",
+    ),
+    "LongcatNextMultiDecoder": (
+        "longcat_next",
+        "modeling_longcat_next_multi_decoder",
+        "LongcatNextMultiDecoder",
+    ),
 }
 
 
