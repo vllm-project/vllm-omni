@@ -5,6 +5,7 @@ This guide explains how to calculate GPU memory requirements and properly config
 ## Overview
 
 `gpu_memory_utilization` is a critical parameter that controls how much GPU memory each stage can use. It's specified as a fraction between 0.0 and 1.0, where:
+
 - `0.8` means 80% of the GPU's total memory
 - `1.0` means 100% of the GPU's total memory (not recommended, leaves no buffer)
 
@@ -14,16 +15,22 @@ This guide explains how to calculate GPU memory requirements and properly config
 
 For each stage, vLLM-Omni calculates the requested memory as:
 
-```
+```text
 requested_memory = total_gpu_memory × gpu_memory_utilization
 ```
 
 The system checks that:
-```
+
+```text
 free_memory ≥ requested_memory
 ```
 
-If this condition is not met, the stage will fail to initialize with an error message showing the memory requirements.
+On discrete GPUs, autoregressive and generation workers cap the stage budget to
+the available free memory and log a warning when this condition is not met.
+On integrated GPUs, such as Jetson and DGX Spark, GPU memory is shared with the
+host. These workers instead fail to initialize with an error showing the memory
+requirements, rather than assigning all free system RAM to the stage. Reduce
+each stage's `gpu_memory_utilization` and leave room for the OS and other stages.
 
 ### Memory Components
 
@@ -38,6 +45,7 @@ The total memory used by a stage includes:
 ### Example Calculation
 
 For a GPU with 80GB total memory:
+
 - `gpu_memory_utilization: 0.8` → 64GB available for the stage
 - `gpu_memory_utilization: 0.6` → 48GB available for the stage
 - `gpu_memory_utilization: 0.15` → 12GB available for the stage
@@ -61,6 +69,7 @@ python -c "import torch; print(f'{torch.cuda.get_device_properties(0).total_memo
 #### For Autoregressive (AR) Stages
 
 AR stages typically need more memory due to:
+
 - Large model weights
 - KV cache for attention
 - Activation buffers
@@ -68,17 +77,20 @@ AR stages typically need more memory due to:
 #### For Diffusion/Generation Stages
 
 Diffusion stages (like code2wav) typically need less memory:
+
 - Smaller model components
 - Different memory access patterns
 
 **Typical values:**
+
 - `0.1 - 0.3` for most diffusion stages
 
 ### Step 3: Consider Multi-Stage Scenarios
 
 When multiple stages share the same GPU, you must ensure the sum of their `gpu_memory_utilization` values doesn't exceed 1.0.
 
-**Example: Two stages on GPU 0**
+#### Example: Two stages on GPU 0
+
 ```yaml
 stages:
   - stage_id: 0
@@ -97,7 +109,8 @@ stages:
 
 When using `tensor_parallel_size > 1`, the model is split across multiple GPUs, so each GPU needs less memory.
 
-**Example: 2-way tensor parallelism**
+#### Example: 2-way tensor parallelism
+
 ```yaml
 stages:
   - stage_id: 0
@@ -128,6 +141,7 @@ stages:
     devices: "0"
     gpu_memory_utilization: 0.1  # 8GB on GPU 0
 ```
+
 **Note:** Stage 0 uses GPUs 0 and 1, so the combined utilization is `0.7` on
 GPU 0 and `0.9` on GPU 1. Keep the sum of all resident stages below `1.0` on
 each device.
@@ -139,6 +153,7 @@ each device.
 This means the GPU doesn't have enough free memory when the stage starts.
 
 **Solutions:**
+
 1. Free up memory by closing other processes
 2. Reduce `gpu_memory_utilization` for this stage
 3. Use a GPU with more memory
@@ -149,6 +164,7 @@ This means the GPU doesn't have enough free memory when the stage starts.
 The stage initialized but ran out of memory during processing.
 
 **Solutions:**
+
 1. Reduce `max_num_batched_tokens`
 2. Reduce `max_num_seqs` in engine_args
 3. Lower `gpu_memory_utilization` slightly
@@ -157,6 +173,7 @@ The stage initialized but ran out of memory during processing.
 ### Memory Not Fully Utilized
 
 If you see low memory usage, you can:
+
 1. Increase `gpu_memory_utilization` to allow larger KV cache
 2. Increase `max_num_batched_tokens` for better batching
 3. Check if other stages are limiting throughput
@@ -166,6 +183,7 @@ If you see low memory usage, you can:
 ### KV Cache Memory
 
 The KV cache size depends on:
+
 - Number of sequences in batch
 - Sequence length (prompt + generation)
 - Model hidden size
@@ -173,18 +191,21 @@ The KV cache size depends on:
 - Number of layers
 
 approximate Formula:
-```
+
+```text
 kv_cache_memory ≈ batch_size × seq_len × hidden_size × num_layers × 2 × dtype_size
 ```
+
 2 for k & v
 
 ### Model Weight Memory
 
-```
+```text
 model_memory ≈ num_parameters × dtype_size
 ```
 
 For example:
+
 - 7B parameters in FP16: ~14GB
 - 7B parameters in FP32: ~28GB
 - 7B parameters in INT8: ~7GB
@@ -192,6 +213,7 @@ For example:
 ### Activation Memory
 
 Activation memory is typically smaller but varies with:
+
 - Batch size
 - Sequence length
 - Model architecture

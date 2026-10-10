@@ -1,17 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Characterization tests for ``vllm_omni.worker.memory_utils``.
-
-``request_memory_tolerant`` is still live in both workers
-(``gpu_ar_worker.py`` / ``gpu_generation_worker.py``); a later change makes its cap loud
-but must not change the numeric contract. These tests pin that contract with a
-mocked ``MemorySnapshot`` — pure CPU, no GPU / NVML.
-"""
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+"""Memory budgeting for discrete and integrated GPUs, without GPU / NVML."""
 
 import math
-from types import SimpleNamespace
 
 import pytest
+from pytest_mock import MockerFixture
+from vllm.config import CacheConfig
+from vllm.utils.mem_utils import MemorySnapshot
 
 from vllm_omni.worker.memory_utils import request_memory_tolerant
 
@@ -20,13 +16,17 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 GIB = 1024**3
 
 
-def _snapshot(total: int, free: int) -> SimpleNamespace:
-    # Only the fields request_memory_tolerant reads (incl. device_ for the log).
-    return SimpleNamespace(total_memory=total, free_memory=free, device_="cuda:0")
+@pytest.fixture(autouse=True)
+def discrete_gpu(mocker: MockerFixture):
+    mocker.patch("vllm.platforms.current_platform.is_integrated_gpu", return_value=False)
 
 
-def _cache_config(util: float) -> SimpleNamespace:
-    return SimpleNamespace(gpu_memory_utilization=util)
+def _snapshot(total: int, free: int, device: str = "cuda:0") -> MemorySnapshot:
+    return MemorySnapshot(total_memory=total, free_memory=free, device=device, auto_measure=False)
+
+
+def _cache_config(util: float) -> CacheConfig:
+    return CacheConfig(gpu_memory_utilization=util)
 
 
 def test_passes_through_requested_when_free_suffices():
@@ -69,3 +69,20 @@ def test_requested_uses_ceil_of_total_times_util():
     out = request_memory_tolerant(snap, _cache_config(util))
 
     assert out == math.ceil(total * util)
+
+
+@pytest.mark.parametrize("free_memory", [0, 10 * GIB])
+def test_integrated_gpu_rejects_insufficient_shared_memory(mocker: MockerFixture, free_memory: int):
+    mocker.patch("vllm.platforms.current_platform.is_integrated_gpu", side_effect=lambda device_id: device_id == 3)
+    snap = _snapshot(total=40 * GIB, free=free_memory, device="cuda:3")
+
+    with pytest.raises(ValueError, match="Decrease GPU memory utilization"):
+        request_memory_tolerant(snap, _cache_config(0.9))
+
+
+@pytest.mark.parametrize("free_memory", [20 * GIB, 40 * GIB])
+def test_integrated_gpu_preserves_requested_budget_when_free_suffices(mocker: MockerFixture, free_memory: int):
+    mocker.patch("vllm.platforms.current_platform.is_integrated_gpu", return_value=True)
+    snap = _snapshot(total=40 * GIB, free=free_memory)
+
+    assert request_memory_tolerant(snap, _cache_config(0.5)) == 20 * GIB
