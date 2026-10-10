@@ -242,6 +242,28 @@ class TestRotaryEmbeddingNativeShapeRegression:
         assert output.shape == x.shape
         assert not torch.isnan(output).any()
 
+    # ── RotaryEmbeddingWan 2D kernel-facing cos/sin ───────────────────
+
+    def test_wan_forward_native_2d_cos_sin_layout(self) -> None:
+        """Wan's _rotary_embedding and its SP hook hand forward_native 2D
+        (seq_len, rope_dim) cos/sin — the layout the CUDA and MindIE kernels
+        face. The native path must broadcast it over (B, S, H, D) instead of
+        aligning it with the wrong axis (SP shards the sequence, not the
+        heads), matching the manually expanded 4D form bit for bit."""
+        rope = RotaryEmbeddingWan(is_neox_style=False, half_head_dim=True)
+        B, S, H, D = 2, 16, 8, 64
+        x = torch.randn(B, S, H, D)
+        cos = torch.randn(S, D // 2)
+        sin = torch.randn(S, D // 2)
+
+        output_2d = rope.forward_native(x, cos, sin)
+        assert output_2d.shape == x.shape
+        assert not torch.isnan(output_2d).any()
+
+        expanded = (cos.unsqueeze(0).unsqueeze(2), sin.unsqueeze(0).unsqueeze(2))
+        output_expanded = rope.forward_native(x, *expanded)
+        assert torch.equal(output_2d, output_expanded)
+
 
 def test_cuda_paths_fall_back_without_vendored_rotary_kernel() -> None:
     """Source/CPU installs need not contain the wheel-vendored CUDA kernel."""
