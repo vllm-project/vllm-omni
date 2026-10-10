@@ -107,6 +107,8 @@ After (async D2H):
    - `OUTPUT_READY` → resolves `_output_futures[async_output_id]` (with batch split via `_batch_split_map`)
    - Non-async messages → `_sync_result_buffer` for other RPCs
 
+   Because this thread is the queue's only reader, dispatch is fault contained: each message is routed inside a `try`, so a failure costs that message rather than every later result. An `OUTPUT_READY` without an `async_output_id` cannot be routed to anyone, so it is logged and dropped instead of disappearing silently, and batch splitting resolves each request separately so one corrupt per-request result does not leave its siblings hanging until their own timeout.
+
 4. **collective_rpc() two-path dispatch** (`multiproc_executor.py`):
    - **Path 1**: `execute_model` / `execute_model_batch` → generates `rpc_id`, registers Future, waits for pump to deliver `compute_done`
    - **Path 2**: All other RPCs → `_sync_result_buffer` (pump-fed) or `_result_mq` (step-mode, no pump)

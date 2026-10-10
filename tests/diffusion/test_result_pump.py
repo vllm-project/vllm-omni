@@ -938,3 +938,101 @@ class TestShutdownClearsCompletedOutputs:
         executor.shutdown()
 
         assert executor._completed_outputs == {}
+
+
+def _feed_msgs_to_pump(executor, msgs):
+    """Run _result_pump in a daemon thread, feed *msgs* in order, then stop."""
+    pending = list(msgs)
+
+    def mock_dequeue(timeout=None):
+        if pending:
+            return pending.pop(0)
+        executor._pump_stop.set()
+        time.sleep(0.05)
+        raise TimeoutError
+
+    executor._result_mq.dequeue = mock_dequeue
+    t = threading.Thread(target=executor._result_pump, daemon=True)
+    t.start()
+    t.join(timeout=2.0)
+    return t
+
+
+class _ExplodingBatchOutput:
+    """Batch output whose extraction fails for one request id."""
+
+    def __init__(self, results, failing_req_id):
+        self._results = results
+        self._failing_req_id = failing_req_id
+
+    def get_request_output(self, req_id):
+        if req_id == self._failing_req_id:
+            raise RuntimeError("corrupt per-request result")
+        result = self._results.get(req_id)
+        if result is None:
+            return None
+        return SimpleNamespace(result=result)
+
+
+class TestResultPumpFaultContainment:
+    """One bad message must not cost the queue its only reader."""
+
+    def test_dispatch_failure_does_not_stop_the_pump(self, mocker):
+        executor = _make_executor()
+        mocker.patch.object(
+            executor._sync_result_buffer,
+            "put",
+            side_effect=RuntimeError("sync buffer is gone"),
+        )
+        fut = concurrent.futures.Future()
+        with executor._futures_lock:
+            executor._rpc_futures["1"] = fut
+        good = AsyncDiffusionOutput(kind=AsyncOutputKind.RPC_RESULT, rpc_id="1")
+
+        thread = _feed_msgs_to_pump(executor, [object(), good])
+
+        # The message after the failure was still delivered, so the pump lived.
+        assert fut.done()
+        assert fut.result(timeout=1.0) is good
+        assert not thread.is_alive()
+
+    def test_output_ready_without_id_is_logged_not_silent(self, mocker):
+        from vllm_omni.diffusion.executor import multiproc_executor
+
+        executor = _make_executor()
+        log_error = mocker.patch.object(multiproc_executor.logger, "error")
+        orphan = AsyncDiffusionOutput(
+            kind=AsyncOutputKind.OUTPUT_READY,
+            async_output_id=None,
+            output=DiffusionOutput(output="img"),
+        )
+
+        _feed_msgs_to_pump(executor, [orphan])
+
+        assert executor._completed_outputs == {}
+        assert executor._output_futures == {}
+        assert log_error.call_count == 1
+        assert "async_output_id" in log_error.call_args.args[0]
+
+    def test_one_corrupt_request_does_not_drop_its_siblings(self):
+        executor = _make_executor()
+        req_ids = ["r0", "r1", "r2"]
+        batch_id = "batch-fault"
+        outputs = {rid: DiffusionOutput(output=f"img-{rid}") for rid in req_ids}
+        with executor._futures_lock:
+            executor._batch_split_map[batch_id] = {f"{batch_id}/{rid}": rid for rid in req_ids}
+        ready = AsyncDiffusionOutput(
+            kind=AsyncOutputKind.OUTPUT_READY,
+            async_output_id=batch_id,
+            output=_ExplodingBatchOutput(outputs, failing_req_id="r1"),
+        )
+
+        _feed_msgs_to_pump(executor, [ready])
+
+        for rid in ("r0", "r2"):
+            fut = executor.wait_output_ready(f"{batch_id}/{rid}")
+            assert fut.done(), f"request {rid} never resolved"
+            assert fut.result(timeout=1.0) is outputs[rid]
+        failed = executor.wait_output_ready(f"{batch_id}/r1")
+        assert failed.done()
+        assert "corrupt per-request result" in failed.result(timeout=1.0).error
