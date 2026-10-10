@@ -29,6 +29,9 @@ from tests.helpers.stage_config import get_deploy_config_path
 pytestmark = [pytest.mark.full_model, pytest.mark.example, pytest.mark.omni]
 
 models = ["Qwen/Qwen3-Omni-30B-A3B-Instruct"]
+# Match the function and accuracy fixtures: cold ROCm weight loading alone
+# can exceed the default 900-second orchestrator initialization deadline.
+QWEN3_OMNI_INIT_TIMEOUT_S = 1200
 
 
 stage_configs = [get_deploy_config_path("ci/qwen3_omni_moe.yaml")]
@@ -37,7 +40,13 @@ stage_configs = [get_deploy_config_path("ci/qwen3_omni_moe.yaml")]
 example_dir = str(Path(__file__).parent.parent.parent.parent / "examples" / "online_serving")
 # Create parameter combinations for model and stage config
 test_params = [
-    OmniServerParams(model=model, port=8091, stage_config_path=stage_config)
+    OmniServerParams(
+        model=model,
+        port=8091,
+        stage_config_path=stage_config,
+        init_timeout=QWEN3_OMNI_INIT_TIMEOUT_S,
+        startup_timeout=QWEN3_OMNI_INIT_TIMEOUT_S + 300,
+    )
     for model in models
     for stage_config in stage_configs
 ]
