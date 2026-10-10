@@ -28,7 +28,7 @@ For Design-Layer, the first returned image is the reconstructed composite and th
 - CUDA: 13.0
 - vLLM version: 0.29.0
 - vLLM-Omni version or commit: 6daf5b30f
-- 2x H100 80GB (1xH100 to be validated)
+- 2x H100 80GB, or 1x H100 80GB co-located (see [Single-GPU co-location](#single-gpu-co-location-1x-h100))
 
 ### Commands
 
@@ -38,6 +38,42 @@ vllm serve "$MODEL" --omni --deploy-config vllm_omni/deploy/ming_image.yaml --po
 ```
 
 For layer decomposition, set `MODEL` to `inclusionAI/Ming-Image-0.1-Design-Layer`.
+
+## Single-GPU co-location (1x H100)
+
+Both stages also fit on one 80 GB GPU. Copy `vllm_omni/deploy/ming_image.yaml`
+and change three fields (keep `max_num_seqs: 1` on both stages):
+
+```yaml
+stages:
+  - stage_id: 0
+    devices: "0"
+    gpu_memory_utilization: 0.60   # up from 0.55
+  - stage_id: 1
+    devices: "0"                   # was "1"
+    gpu_memory_utilization: 0.33   # new
+```
+
+Validated end to end on one H100 80GB with the text-to-image smoke prompt
+(1024², 12 steps, cfg 1.0, seed 42; vLLM 0.31.0, vLLM-Omni 099f9b553,
+first request after server start, so stage-1 numbers include its
+compilation warmup):
+
+| Metric (single request) | 1x H100 co-located | 2x H100 (stock yaml) |
+|---|---|---|
+| E2E latency | 2.39 s | 3.73 s |
+| Stage 0 (VLM) | 0.22 s | 1.23 s |
+| Stage 1 (DiT) | 2.09 s | 2.41 s |
+| Stage 0→1 transfer | 0 ms | 0 ms |
+| Peak VRAM | 69.9 GiB | 44.2 GiB + 21.8 GiB |
+
+The seed-42 output is byte-identical (SHA-256) to the two-GPU reference
+run; the shared-memory connector keeps the inter-stage hop free in both
+layouts. Reproduced on a second independent server start (2.74 s e2e,
+0.24 s / 2.40 s per stage, 69.9 GiB peak, identical output hash).
+0.60 + 0.33 leaves roughly 10 GB of headroom for the stage-1
+compile workspace and KV growth; raising the two fractions much further
+risks OOM during shape warmup.
 
 ## Text-to-image
 
