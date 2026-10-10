@@ -30,6 +30,7 @@ except ModuleNotFoundError:
     sys.modules["vllm"] = _vllm
     sys.modules["vllm.logger"] = _vllm_logger
 
+from vllm_omni.core.prefix_cache.adapter import PrefixCacheStep, PrefixCacheWriteLayout
 from vllm_omni.core.prefix_cache.interface import PrefixCacheConfig, StageCacheOutputs
 from vllm_omni.core.prefix_cache.runner_mixin import PrefixCacheRunnerMixin
 
@@ -104,8 +105,8 @@ class _CacheStub:
         self.materialize_calls = []
         self.outs = StageCacheOutputs(hidden_states=None, mm_outputs={})
 
-    def save_outputs(self, hidden, mm, *, num_tokens_unpadded, num_tokens_padded):
-        self.save_calls.append((hidden, mm, num_tokens_unpadded, num_tokens_padded))
+    def save_outputs(self, hidden, mm, *, num_tokens_unpadded, num_tokens_padded, write_layout):
+        self.save_calls.append((hidden, mm, num_tokens_unpadded, num_tokens_padded, write_layout))
         return 7
 
     def materialize(self, step_id, req_ids):
@@ -160,6 +161,11 @@ def test_save_step_gates_and_passthrough(monkeypatch):
     _patch_pp(monkeypatch, is_last=True)
     assert save() is None  # cache off
     r.omni_prefix_cache = stub
+    r._prefix_cache_adapter = SimpleNamespace(
+        build_write_layout=lambda view, *, num_scheduled_tokens: PrefixCacheWriteLayout((), 0)
+    )
+    r._prefix_cache_group_view = SimpleNamespace()
+    r._prefix_cache_step = PrefixCacheStep((), ())
     r.is_pooling_model = True
     assert save() is None  # pooling stage never writes
     r.is_pooling_model = False
@@ -167,7 +173,7 @@ def test_save_step_gates_and_passthrough(monkeypatch):
     assert save() is None  # not the last PP rank
     _patch_pp(monkeypatch, is_last=True)
     assert save() == 7
-    assert stub.save_calls == [(hidden, {}, 2, 2)]  # empty mm stays {}
+    assert stub.save_calls == [(hidden, {}, 2, 2, PrefixCacheWriteLayout((), 0))]  # empty mm stays {}
 
 
 def test_materialize_requires_explicit_step_and_snapshot_req_ids():
@@ -180,3 +186,38 @@ def test_materialize_requires_explicit_step_and_snapshot_req_ids():
     stub.outs = StageCacheOutputs(hidden_states=hidden, mm_outputs={})
     assert r._prefix_cache_materialize(7, ["a"]) == (hidden, None)  # empty mm -> None
     assert stub.materialize_calls == [(7, ["a"])]
+
+
+def test_step_begin_and_save_keep_the_translated_snapshot(monkeypatch):
+    _patch_pp(monkeypatch, is_last=True)
+    runner = _Runner()
+    stub = _CacheStub()
+    steps = []
+    stub.new_step_starts = steps.append
+    runner.omni_prefix_cache = stub
+    runner._prefix_cache_group_view = SimpleNamespace(
+        batch_req_ids=lambda: ["r"],
+        step_slots_cpu=lambda req_ids, counts: torch.arange(counts["r"], dtype=torch.long),
+    )
+    arrival = SimpleNamespace(
+        scheduled_new_reqs=[SimpleNamespace(req_id="r", num_computed_tokens=0)],
+        finished_req_ids=set(),
+        num_scheduled_tokens={"r": 2},
+    )
+    runner._prefix_cache_step_begin(arrival)
+    arrival.num_scheduled_tokens["r"] = 99
+    assert runner._prefix_cache_step is steps[0]
+    assert steps[0].scheduled_tokens == (("r", 2),)
+    runner._prefix_cache_save_step(torch.zeros(2, 2), None, num_tokens_unpadded=2, num_tokens_padded=2)
+    layout = stub.save_calls[-1][-1]
+    assert layout.total_rows == 2 and layout.slots_cpu.tolist() == [0, 1]
+
+    continuation = SimpleNamespace(
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=SimpleNamespace(req_ids=["r"], resumed_req_ids=set()),
+        finished_req_ids=set(),
+        num_scheduled_tokens={"r": 1},
+    )
+    runner._prefix_cache_step_begin(continuation)
+    assert steps[-1].events == ()
+    assert steps[-1].extended_req_ids == ("r",)

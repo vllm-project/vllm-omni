@@ -265,7 +265,7 @@ Which stages may set `enable_prefix_caching: true`:
 | Codec decoder / Code2Wav stages (Qwen3-Omni stage 2, Qwen3-TTS stage 1) | keep `false` | Nothing downstream consumes their hidden states; the cache would only add device→host copies. Not validated. |
 | Diffusion stages | n/a | No vLLM KV cache to mirror. |
 
-Hit spans come from `scheduled_new_reqs` only, as in the pre-refactor cache:
+Hit spans come from adapter-classified `STARTED` events for new requests:
 
 - A new request with a (partial) prefix hit is the normal path: the hit
   blocks are read from the pool, the rest is this step's rows, and the
@@ -286,22 +286,36 @@ Hit spans come from `scheduled_new_reqs` only, as in the pre-refactor cache:
   stay opt-in until preempt/resume hit spans are reconstructed.
 - `async_chunk` continuation: when the next upstream chunk arrives, the same
   request id re-enters `scheduled_new_reqs` with `num_computed_tokens` equal
-  to what it already computed itself. Ids already in `live_reqs` are skipped
-  for hit marking: those rows were delivered in earlier steps and re-emitting
-  them would duplicate output. A `delivered_upto` span for this case is
-  Phase 2.
+  to what it already computed itself. The adapter classifies an observed ID as
+  `EXTENDED`, so the manager does not mark a hit: those rows were delivered in
+  earlier steps and re-emitting them would duplicate output. A
+  `delivered_upto` span for this case is Phase 2.
 - Preemption + reschedule: vLLM resets `num_computed_tokens` to 0 on
   preemption and re-runs prefix matching on resume, so the resumed request
   can come back with a fresh hit. With the V1 model runner it arrives
   through `scheduled_cached_reqs` (id in `resumed_req_ids`, `new_block_ids`
   replaces the table); with the V2 runner it re-enters `scheduled_new_reqs`
-  while still in `live_reqs`. Neither path marks an omni hit span: the
+  as an already-observed ID. Neither path marks an omni hit span: the
   resumed request gets only the rows it recomputes, and its still-open
   deferred write keeps appending (a slot written twice keeps the later
   chunk). Cache integrity holds either way — the hit blocks already have
   rows, from this request or the one it hit. Stages that need full prompt
   hidden states should be sized so preemption does not occur while prefix
   caching is on. Same as before this refactor; tracked for Phase 2.
+
+The adapter is the sole owner of started-request observations. Its single
+`translate_step` entry point captures an immutable `PrefixCacheStep`.
+`EXTENDED` is represented by `step.extended_req_ids`, with token counts in
+`step.scheduled_tokens`, avoiding per-request event allocation on every step.
+It covers ordinary decode, chunked prefill and IDs re-entering
+`scheduled_new_reqs`. `RESUMED` payloads follow the scheduler's cached-request
+order. Terminal events precede arrivals, so same-step ID reuse finishes the old request
+before `STARTED` classifies the new one. The manager keeps write/resource
+bookkeeping only, with no second `live_reqs` lifecycle classifier.
+`ABORTED` requires an explicit `aborted_req_ids` producer; without that
+side channel aborts remain `FINISHED`. `REPLACED` belongs to item 5.
+Hit payloads describe prefixes `[0, hit_end)`; arbitrary read ranges and
+resume delivery watermarks are follow-up contracts, not inferred here.
 
 Two write paths, split by `ModelCachePolicy.deferred_keys`:
 
@@ -340,11 +354,24 @@ does not write the pool or carry abort/preempt occupancy.
 
 ```python
 cache.register_policy(ModelCachePolicy.from_model(model))   # load_model
-cache.new_step_starts(scheduler_output)   # before _update_states
+adapter = PrefixCacheSchedulerAdapter()
+step = adapter.translate_step(scheduler_output)
+cache.new_step_starts(step)   # before _update_states
+layout = adapter.build_write_layout(
+    prefix_cache_group_view,
+    num_scheduled_tokens=dict(step.scheduled_tokens),
+)
 sid = cache.save_outputs(hidden, mm_outputs, num_tokens_unpadded=n,
-                         num_tokens_padded=n_pad)
+                         num_tokens_padded=n_pad, write_layout=layout)
 outs = cache.materialize(sid, req_ids)    # or discard_step(sid)
 ```
+
+`new_step_starts` accepts only `PrefixCacheStep`; there is no bare-event or
+per-event count fallback. The runner builds the write layout from that step's
+captured counts. Before saving any rows, the manager cross-checks layout
+counts against the captured step for each prefix hit under `_state_lock`.
+A disagreement (including an omitted hit request) raises
+`OmniPrefixCacheUnmatchError` instead of merging into a wrongly sized buffer.
 
 Each step id is consumed exactly once. `req_ids` must be a subset of the save
 snapshot. At most `staging_depth` unused step ids may exist at once: every
