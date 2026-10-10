@@ -199,9 +199,9 @@ vllm_omni/
 │       ├── __init__.py              re-exports the Tier 1 helper functions (audio, formats,
 │       │                            items, session, capabilities) so the engine never
 │       │                            imports protocol/realtime directly
-│       ├── events.py                the whole 42-event vocabulary: 22 Tier-1 re-exports,
-│       │                            8 Tier-2 subclasses (session.created + resume_token, ...),
-│       │                            12 Tier-3 events (listen/speak, playback, resume, ...);
+│       ├── events.py                the whole 43-event vocabulary: 21 Tier-1 re-exports,
+│       │                            9 Tier-2 subclasses (session.created + resume_token, ...),
+│       │                            13 Tier-3 events (listen/speak, playback, resume, ...);
 │       │                            DuplexEvent = RealtimeEvent
 │       ├── commands.py              the whole 17-command vocabulary: 8 Tier-1 re-exports,
 │       │                            2 Tier-2 subclasses (append + hints, commit + final),
@@ -238,6 +238,7 @@ vllm_omni/
 │           ├── model_channel.py     ModelChannel: submit an append, project stage output, continue a turn
 │           ├── control.py           SessionControl: server VAD and the events that reconfigure it
 │           ├── append_task.py       AppendAttempt: one append in flight and the rollback its failure owes
+│           ├── input_clock.py       InputClock: model units and input acknowledgements of input-clocked sessions
 │           ├── helpers.py           pure reads and payload builders over a session
 │           ├── lease.py             DuplexLeaseState (idle TTL, disconnect grace, resume generation)
 │           └── overlap_policy.py / commit_policy.py / playback_ledger.py
@@ -443,6 +444,115 @@ starts; `DuplexSessionManager.__init__` validates it against the stage
 sampling defaults once the stage pools exist. Plugin hooks that may block
 (`prepare_runtime_config` fetching `ref_audio`) are awaited in `open()` and
 offloaded from the loop.
+
+Input-clocked sessions (`extra_body.clock == "input"`, see the
+[API reference](../serving/realtime_duplex_api.md#input-clocked-sessions))
+track every model unit (one Stage0 submission) until all of its output has
+been emitted. The clock lives in `session/input_clock.py` and exists only for
+sessions created with the option; the runner calls it at explicit points: a
+client input is admitted (indexed in wire order when the runner takes it on
+its mailbox; an input the manager refuses at admission is indexed by an
+explicit `runner.input_refused` call in each refusal branch, which only queues
+a payload-free marker acknowledged as `rejected`, like an append the runner
+refuses before any of its audio reaches the model, `_refuse_append`), begins
+and ends, a Stage0 submission is created / accepted / finishes, a committed turn is deferred or
+its deferred audio is dropped, a cancel advances the epoch, and teardown. Each
+stage output puts a `StageProgress` item on the session mailbox *after* the
+events of that output, and an append's outcome and the timeout checks are
+settled from the mailbox too, so an acknowledgement never overtakes the output
+it covers. A command that waits on the mailbox for an append (a commit or
+`session.update`) watches the timeouts of the appends still running and gives
+up once one of their units is due or timed out, so a stalled submission
+cannot keep the timeout check queued behind it from running. A unit takes its
+ordinal among its epoch's Stage0 submissions when Stage0 accepts it, and the
+n-th Stage0 segment end of the epoch decides that unit (also after the unit
+was settled, so late output is never credited to the next unit; a unit
+settled before Stage0 accepted it stays matchable until its submission
+resolves, and a deferred turn submitted after its reserved slot was settled
+takes that settled unit's place unless a client input submitted it); a
+non-final stage only ends a unit through a decision, and only
+the final stage completes a speaking unit. Two optional hooks carry what only
+the model knows. `unit_decision(stage_id, decision, output, context,
+runtime_config) -> DuplexUnitDecision | None` labels a decision of a stage
+before the final one and says whether it ends the unit's pipeline (default:
+any decision does, labelled `listen` when its metadata sets `model_listen`;
+a plugin overrides this when some decisions do not end the unit); it is also
+asked about every segment end of such a stage that carries no decision
+(default: no classification), so a plugin can end a unit whose segment hands
+the next stage nothing. It is called when the output arrives and reads the
+live output at that moment. Decisions taken on the final stage are not
+consulted. `unit_output_complete(unit, final_stage_id, new_output, new_context,
+state, runtime_config) -> bool` says when the oldest speaking unit's
+final-stage output is complete; `unit` carries only its session-wide index,
+its epoch and its ordinal in that epoch, and two flags (the stage before the
+final one ended its segment; a final-stage output credited to it marked a
+segment end), and the engine keeps no output history (default: the final
+stage marks one segment end per unit; a final stage that streams across unit
+boundaries keeps its own markers or coverage in `state`, which the engine
+replaces with an empty dict whenever a cancel starts a new epoch, so frame
+coverage is counted per epoch against the ordinal). Later-stage progress
+that overtakes the Stage0 segment end of its unit (no unit is speaking yet,
+or none still needs that stage's segment end) is held by the clock and
+replayed in arrival order when the next unit of the epoch starts speaking.
+It is held only while the epoch has a Stage0 submission without a segment
+end yet (the unit it can belong to); otherwise, and once the epoch has no
+such submission left, it is dropped with a warning, so it never ends a unit
+submitted after it arrived. If more than 256 events are held, the clock
+drops all of them and holds nothing more for that epoch (logged as an
+error): the epoch's later units are left to the timeouts until a cancel.
+Progress that arrives while a later unit of its epoch is pending is
+attributed to that unit, so a plugin's later stages must not emit progress
+(e.g. a repeated segment end) for a unit after it is complete.
+A hook that raises is logged once per session and counts as "no decision" /
+"not complete", which leaves the unit to the timeouts. A settled speaking
+unit keeps its place for its final-stage output, so attribution stays
+correct after a stall. Each acknowledgement reports only units created up
+to its input. A plugin whose input buffer can cut several units from one
+append implements `PcmAppendBuffer.prepare_backlog`; the runner then submits
+all of them for that append. The timeouts' defaults are the same for every
+model (a per-plugin default is a possible follow-up). A plugin enables the mode with
+`supports_input_clock = True` once those hooks match its real unit
+boundaries; sessions of other models that ask for it are refused
+(`input_clock_unsupported`). No model opts in yet.
+
+What a plugin must guarantee before it opts in:
+
+- Stage0 ends every accepted submission with exactly one segment end, in
+  submission order, and the unit's decision (if any) is taken on that
+  segment-ending output. An extra or missing segment end (e.g. a
+  prefill-only append that produces none) shifts the epoch's later units onto
+  the wrong segment ends: an acknowledgement may then arrive before its
+  unit's output, or wait for the timeouts, until the next cancel starts a new
+  epoch; the timeouts keep acknowledgements coming but do not resynchronise.
+- The stage just before the final one (`final_stage_id - 1`) is the only
+  one whose segment end sets a unit's `upstream_segment_finished`, and it
+  ends exactly one segment per unit; an extra one is held for, or credited
+  to, the next unit.
+- With `final_stage_id == 0` (e.g. a text-only request), a unit completes at
+  its Stage0 segment end whatever the hooks say.
+- The default `unit_output_complete` assumes final-stage outputs of
+  different units do not interleave (each unit's audio ends with its own
+  segment end before the next unit's begins). A model whose final stage
+  streams across unit boundaries must override it. Turns never overlap in
+  an input-clocked session: the runner does not open the concurrent-turn
+  gate (`supports_concurrent_turn_requests`) for it, so a commit during a
+  response waits for that response (the deferred-turn path), because the
+  clock credits outputs to the speaking units in order. Crediting by
+  request, which would let turns overlap, is future work.
+- A unit is complete when everything the model emits for it has been
+  emitted. A final stage that synthesises the end of a unit's output only
+  together with later units' input (e.g. a vocoder lookahead, or a codec
+  that emits several units per chunk) may complete the unit before that
+  output, as real-time operation emits it; the lag is model-specific and
+  each model documents its own in its model entry. The
+  acknowledgement waits for a response continuation the output handler
+  spawned (e.g. the `response.done` a non-resumable model sends from it).
+
+Every cancel that calls off appends of an input-clocked session advances the
+epoch (an overlap barge-in does so too, where a session without the clock
+keeps its epoch when nothing else was running), so a called-off submission
+that already reached Stage0 has its output dropped instead of shifting the
+count.
 
 Frame-based plugins use `engine/duplex/intermediate.py::build_duplex_append_prompt`
 for the shared request identity, sequencing and config snapshots. Token budgets,
