@@ -13,7 +13,7 @@ from __future__ import annotations
 import copy
 import gc
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import AbstractContextManager, nullcontext
 from typing import TYPE_CHECKING, Any, cast
 
@@ -458,6 +458,25 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
             self.pipeline._interaction_coordinator = self._interaction_coordinator
 
         logger.info("Model runner: Initialization complete.")
+
+    def run_helios_vae_warmup(self) -> None:
+        """Run configured Helios VAE profiles after engine startup dummy work."""
+        additional_config = getattr(self.od_config, "additional_config", None) or {}
+        if not isinstance(additional_config, Mapping):
+            raise TypeError("additional_config must be a mapping to configure Helios VAE warmup")
+        if "helios_vae_warmup_profiles" not in additional_config:
+            return
+
+        profiles = additional_config["helios_vae_warmup_profiles"]
+        if profiles is None or (
+            isinstance(profiles, Sequence) and not isinstance(profiles, (str, bytes, Mapping)) and not profiles
+        ):
+            return
+
+        warmup = getattr(self.pipeline, "warmup_vae_profiles", None)
+        if not callable(warmup):
+            raise ValueError("additional_config.helios_vae_warmup_profiles is only supported by HeliosPipeline")
+        warmup(profiles)
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         """Collect native specs from cache-enabled loaded attention modules."""
