@@ -224,10 +224,19 @@ def test_captured_graphs_match_eager_and_keep_previous_outputs(encoder):
         # A small image; two images that exactly fill the smallest budget; one
         # 256-patch sequence, longer than one attention tile, filling a budget
         # alone; two images the manager packs into one replay in reverse order.
-        cases = [[[1, 4, 4]], [[1, 2, 8], [1, 4, 4]], [[1, 16, 16]], [[1, 8, 8], [1, 4, 8]]]
+        cases = [
+            [[1, 4, 4]],
+            [[1, 2, 8], [1, 4, 4]],
+            [[1, 16, 16]],
+            [[1, 8, 8], [1, 4, 8]],
+            [[2, 4, 4]],
+            [[3, 4, 4], [2, 4, 4]],
+        ]
         retained = []
         for seed, grids in enumerate(cases):
             inputs = _images(grids, seed)
+            if any(t > 1 for t, _, _ in grids):
+                inputs = {"video_grid_thw": inputs["image_grid_thw"], "pixel_values_videos": inputs["pixel_values"]}
             expected = _eager(encoder, inputs)
             with torch.inference_mode():
                 actual = manager.execute(inputs)
@@ -237,7 +246,7 @@ def test_captured_graphs_match_eager_and_keep_previous_outputs(encoder):
                 retained.append((output, output.clone()))
         stats = manager.get_cumulative_stats()
         # Hits and misses count images, not replays.
-        assert stats["graph_hits"] == 6 and stats["graph_misses"] == 0, stats
+        assert stats["graph_hits"] == 9 and stats["graph_misses"] == 0, stats
         for output, saved in retained:
             torch.testing.assert_close(output, saved, rtol=0, atol=0)
 

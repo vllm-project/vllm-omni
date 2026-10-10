@@ -261,3 +261,20 @@ def test_cuda_profiler_is_wired_for_omni_worker(monkeypatch):
 
     assert isinstance(worker.profiler, FakeCudaProfiler)
     assert worker.profiler.profiler_config.profiler == "cuda"
+
+
+@pytest.mark.parametrize("enabled,expected_kv_gib,expected_calls", [(True, 13, 1), (False, 17, 0)])
+def test_encoder_graph_memory_is_reserved_before_kv_allocation(monkeypatch, enabled, expected_kv_gib, expected_calls):
+    worker = _make_worker(requested_memory=30 * GIB, model_memory_usage=10 * GIB)
+    worker.vllm_config = SimpleNamespace(compilation_config=SimpleNamespace(cudagraph_mm_encoder=enabled))
+    calls = []
+
+    def profile_encoder_graphs():
+        calls.append(True)
+        return 4 * GIB
+
+    worker.model_runner.profile_encoder_cudagraph_memory = profile_encoder_graphs
+    monkeypatch.setattr(base, "current_omni_platform", SimpleNamespace(is_cuda=lambda: True))
+    monkeypatch.setattr(base, "memory_profiling", _fake_memory_profiling(non_torch=1 * GIB, torch_peak=2 * GIB))
+    assert OmniGPUWorkerBase.determine_available_memory(worker) == expected_kv_gib * GIB
+    assert len(calls) == expected_calls

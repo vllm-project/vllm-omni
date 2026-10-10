@@ -153,10 +153,26 @@ class OmniGPUWorkerBase(GPUWorker):
         # true here). Mirror upstream so the omni override keeps it populated.
         self.total_consumed = profile_result.total_consumed
 
+        # Encoder graphs can retain sizeable convolution/vision workspaces.
+        # Reserve their measured footprint before KV allocation, rather than
+        # spending the entire budget on KV and capturing the towers afterward.
+        self.encoder_cudagraph_memory_estimate = 0
+        vllm_config = getattr(self, "vllm_config", None)
+        compilation_config = getattr(vllm_config, "compilation_config", None)
+        profile_encoder_graphs = getattr(self.model_runner, "profile_encoder_cudagraph_memory", None)
+        if (
+            getattr(compilation_config, "cudagraph_mm_encoder", False)
+            and current_omni_platform.is_cuda()
+            and profile_encoder_graphs is not None
+        ):
+            self.encoder_cudagraph_memory_estimate = int(profile_encoder_graphs())
+            logger.info("Reserved %s GiB for encoder CUDA graphs", format_gib(self.encoder_cudagraph_memory_estimate))
+
         profiled_usage = (
             int(self.model_runner.model_memory_usage)
             + profile_result.torch_peak_increase
             + profile_result.non_torch_increase
+            + self.encoder_cudagraph_memory_estimate
         )
         self.available_kv_cache_memory_bytes = max(0, self.requested_memory - profiled_usage)
         logger.debug(

@@ -156,7 +156,7 @@ def test_real_wrapper_construction_controls_runner_protocol(monkeypatch, stage, 
         assert manager.model is model
         assert manager.config.out_hidden_size == 12
         assert manager.supports_modality("image")
-        assert not manager.supports_modality("video")
+        assert manager.supports_modality("video")
         assert not manager.supports_modality("audio")
 
 
@@ -197,7 +197,7 @@ def test_image_graph_gate(monkeypatch, change):
     del model.supports_encoder_cudagraph
     mm = model.multimodal_config
     if change == "no_image_limit":
-        mm.get_limit_per_prompt = lambda modality: 0 if modality == "image" else 4
+        mm.get_limit_per_prompt = lambda modality: 0 if modality in {"image", "video"} else 4
     elif change == "sdpa_backend":
         model.visual.attn_backend = AttentionBackendEnum.TORCH_SDPA
     elif change == "fp8_attention":
@@ -301,7 +301,7 @@ def test_budget_range_follows_scheduler_and_model_limits():
     # The shipped deploy's 32768-token batch stops at the replay-profitable cap.
     cfg.scheduler_config.max_num_batched_tokens = 32768
     cfg.model_config.max_model_len = 65536
-    assert model.get_encoder_cudagraph_budget_range(cfg) == (64, 256)
+    assert model.get_encoder_cudagraph_budget_range(cfg) == (64, 16384)
 
 
 @pytest.mark.parametrize("grid", [[2, 2, 2], [1, 3, 2], [1, 2, 0]])
@@ -356,7 +356,7 @@ def _run_encoder_step(monkeypatch, model, manager, batches):
     return [cached[key] for key in keys]
 
 
-def test_actual_runner_dispatch_keeps_video_and_audio_eager(monkeypatch):
+def test_actual_runner_dispatch_replays_video_and_keeps_audio_on_tower_path(monkeypatch):
     model = _thinker()
     manager = _cpu_manager(model)
     eager_modalities = []
@@ -368,12 +368,16 @@ def test_actual_runner_dispatch_keeps_video_and_audio_eager(monkeypatch):
     model.embed_multimodal = embed_multimodal
     image = _images([[1, 2, 2]])
     expected = model.encoder_eager_forward(image)
-    batches = [("image", 1, image), ("video", 1, {"kind": "video"}), ("audio", 1, {"kind": "audio"})]
+    batches = [
+        ("image", 1, image),
+        ("video", 1, {"video_grid_thw": torch.tensor([[2, 2, 2]]), "pixel_values_videos": torch.ones(8, 4)}),
+        ("audio", 1, {"kind": "audio"}),
+    ]
     cached = _run_encoder_step(monkeypatch, model, manager, batches)
-    assert eager_modalities == ["video", "audio"]
+    assert eager_modalities == ["audio"]
     assert len(cached) == 3
     torch.testing.assert_close(cached[0], expected)
-    assert manager.graph_hits == 1
+    assert manager.graph_hits == 2
 
 
 def test_runner_encodes_a_group_beyond_one_replay_in_one_eager_call(monkeypatch):
@@ -392,3 +396,49 @@ def test_runner_encodes_a_group_beyond_one_replay_in_one_eager_call(monkeypatch)
     for output, reference in zip(cached, model.encoder_eager_forward(images).split([2, 3])):
         torch.testing.assert_close(output, reference)
     assert manager.graph_hits == 0 and manager.graph_misses == 2
+
+
+def test_video_frame_capacity_falls_back_before_copying_buffers():
+    model = _thinker()
+    model.vllm_config.compilation_config.encoder_cudagraph_max_frames_per_batch = 2
+    manager = _cpu_manager(model)
+    video = {"video_grid_thw": torch.tensor([[3, 2, 2]]), "pixel_values_videos": torch.ones(12, 4)}
+    assert manager.execute(video) is None
+    assert manager.graph_misses == 1
+
+
+def test_audio_only_runner_captures_and_clears_audio_graphs():
+    from vllm_omni.worker.encoder_cudagraph import AudioOnlyEncoderCudaGraphManager
+
+    model = _thinker()
+    del model.supports_encoder_cudagraph
+    graphs = SimpleNamespace(capture_shapes=((1, 13), (2, 26)), graphs={})
+    model._audio_encoder_graphs = graphs
+    pools = []
+
+    def capture(pool):
+        pools.append(pool)
+        graphs.graphs.update({1: "captured"})
+
+    graphs.capture = capture
+    manager = _runner_factory(model, model.vllm_config)
+    assert isinstance(manager, AudioOnlyEncoderCudaGraphManager)
+    assert manager.get_num_graphs_to_capture() == 2
+    assert not manager.supports_modality("audio")
+    manager.capture("pool")
+    assert pools == ["pool"] and graphs.graphs
+    manager.clear()
+    assert not graphs.graphs
+    model.vllm_config.compilation_config.cudagraph_mm_encoder = False
+    assert _runner_factory(model, model.vllm_config) is None
+
+
+def test_large_video_capture_uses_spatial_attention_bound():
+    values = (
+        _thinker().prepare_encoder_cudagraph_capture_inputs(8192, 16, 128, torch.device("cpu"), torch.float32).values
+    )
+    assert values["max_seqlen"].item() == 4096
+    assert values["cu_seqlens"].shape == (129,)
+    lengths = values["cu_seqlens"][1:] - values["cu_seqlens"][:-1]
+    assert lengths.max().item() <= 4096
+    assert values["cu_seqlens"][-1].item() == 8192 * 4

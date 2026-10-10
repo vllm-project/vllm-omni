@@ -74,18 +74,32 @@ vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 \
     "2": {"max_num_seqs": 4}
   }'
 
-# Replay the thinker's image encoder from CUDA graphs (images only)
+# Disable the default CUDA encoder graphs for an eager comparison
 vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 \
-  --stage-overrides '{"0": {"compilation_config": {"cudagraph_mm_encoder": true}}}'
+  --stage-overrides '{"0": {"compilation_config": {"cudagraph_mm_encoder": false}}}'
 ```
 
-With the encoder graphs on, the thinker captures one graph per token budget
-(64 to 256 image tokens and up to 4 images per replay by default). A step's
-images replay together when one captured graph holds them all; otherwise they
-run through the eager encoder in one call. Set `encoder_cudagraph_token_budgets`
-and `encoder_cudagraph_max_vision_items_per_batch` in the same
-`compilation_config` to change them; each captured budget adds graph memory on
-the thinker's GPU.
+On CUDA, the default Instruct deployment enables Thinker encoder CUDA graphs
+for images, video frames (including DeepStack outputs), and audio. Vision
+captures token budgets of 256, 512, 1024, 2048, 4096, 8192, and 16384, with up to 16
+items and 128 temporal grids per replay. A group that exceeds these limits
+runs in one eager call. Override `encoder_cudagraph_token_budgets`,
+`encoder_cudagraph_max_vision_items_per_batch`, and
+`encoder_cudagraph_max_frames_per_batch` in stage 0's `compilation_config`
+to adjust vision coverage and graph memory. Automatic KV cache sizing reserves
+measured encoder graph memory before allocating KV; disabling encoder graphs
+also removes this reservation.
+
+Audio captures the full CNN and transformer at exact chunk/output-token
+shapes, including common 30/60-second clips and batches of those clips.
+It preserves the eager matrix dimensions: padding them can amplify BF16
+rounding at sensitive audio tokens. Clip boundaries and tail gather indices
+remain replay inputs. Shapes outside the capture set and shorter CNN widths
+retain the eager path. Encoder graph outputs own their storage so later
+replays cannot overwrite embeddings cached for an earlier request.
+Audio-only deployments also capture the audio tower. Explicitly setting
+`cudagraph_mm_encoder: false` disables both audio and vision graphs. Eager
+model configurations and unsupported attention backends retain eager encoders.
 
 ### Stage-based launch (one stage per process)
 
