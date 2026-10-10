@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Unit tests for the NPU diffusion attention backend selector.
 
 Regression coverage for the eager ``mindiesd`` import in
@@ -19,6 +19,7 @@ import importlib.util
 import sys
 import types
 from enum import Enum
+from importlib.metadata import PackageNotFoundError
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -215,3 +216,22 @@ def test_default_backend_falls_back_to_sdpa_without_mindiesd(
     path = platform_cls.get_diffusion_attn_backend_cls(None, head_size=64)
 
     assert path == "fake.backends.torch_sdpa.Backend"
+
+
+@pytest.mark.parametrize(
+    ("runtime_version", "supported"),
+    [("2.9.0.post4", False), ("2.10.0", True), ("2.10.0.post2", True), ("2.11.0", True), ("unknown", False)],
+)
+def test_native_sdpa_gqa_capability_tracks_torch_npu_version(monkeypatch, runtime_version, supported):
+    monkeypatch.setattr("importlib.metadata.version", lambda name: runtime_version)
+    platform = _load_platform_module(monkeypatch)
+    assert platform.supports_sdpa_native_gqa() is supported
+
+
+def test_native_sdpa_gqa_capability_requires_torch_npu(monkeypatch):
+    def missing_version(name):
+        raise PackageNotFoundError(name)
+
+    monkeypatch.setattr("importlib.metadata.version", missing_version)
+    platform = _load_platform_module(monkeypatch)
+    assert not platform.supports_sdpa_native_gqa()
