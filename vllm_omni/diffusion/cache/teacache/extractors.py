@@ -1310,6 +1310,8 @@ def extract_sensenova_u1_context(
     use_cache: bool | None = None,
     embed_only: bool = False,
     compute_logits: bool = True,
+    exist_und: bool | None = None,
+    exist_gen: bool | None = None,
     **kwargs: Any,
 ) -> CacheContext:
     """Extract cache context for SenseNovaU1ForCausalLM denoising forwards."""
@@ -1320,8 +1322,9 @@ def extract_sensenova_u1_context(
     layer_kwargs = dict(kwargs)
     layer_kwargs.pop("cache_dit_skip", None)
     image_gen_indicators = layer_kwargs.pop("image_gen_indicators", None)
-    exist_und = (~image_gen_indicators).any().item()
-    exist_gen = image_gen_indicators.any().item()
+    if exist_und is None or exist_gen is None:
+        exist_und = (~image_gen_indicators).any().item()
+        exist_gen = image_gen_indicators.any().item()
     causal_mask_mapping = attention_mask
 
     first_layer = module.model.layers[0]
