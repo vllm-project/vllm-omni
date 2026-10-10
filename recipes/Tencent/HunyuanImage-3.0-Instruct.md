@@ -70,6 +70,38 @@ python examples/offline_inference/x_to_text/x_to_text.py \
 The AR-only default uses four GPUs. Pass `--deploy-config` to override the
 layout.
 
+### AR image encoder CUDA graphs
+
+Encoder graphs are off by default. To enable them, copy
+`vllm_omni/deploy/hunyuan_image3_ar.yaml` and add the following settings to
+stage 0:
+
+```yaml
+enforce_eager: false
+compilation_config:
+  cudagraph_mm_encoder: true
+  encoder_cudagraph_token_budgets: [1024, 2048, 4096, 8192]
+  encoder_cudagraph_max_vision_items_per_batch: 2
+```
+
+Pass the copied file with `--deploy-config`. Use the same settings with
+`cudagraph_mm_encoder: false` for an encoder-only performance comparison.
+
+SigLIP2 and the VAE encoder use separate graph sets. SigLIP2 positional
+interpolation runs before replay; VAE graphs return distribution parameters,
+with sampling performed afterward using the original request generator and
+image order. VAE graphs cover the processor's resolution buckets. Inputs
+outside those buckets or above the largest token budget run eagerly.
+The token budgets apply to each encoder independently: a square 1024-pixel
+image has 1024 SigLIP2 tokens and 4096 VAE latent positions. Larger budgets
+and more images per graph increase capture time and memory use.
+
+Torch SDPA vision attention stays eager because its variable-length path is
+not graph-safe. The startup log reports encoder manager initialization and captured graph
+counts. The switch does not change the DiT encoder or the default deploy
+configuration. CUDA graph memory must also be accounted for when sizing the
+AR stage's KV cache; see [#7632](https://github.com/vllm-project/vllm-omni/pull/7632).
+
 ### Shared T2I/IT2I offline examples
 
 Text-to-image and image-editing route through the shared task examples, with
@@ -139,7 +171,7 @@ the same checkpoint, parallelism, and image settings.
 Start the DiT-only server with one of the following CLI-only configurations.
 These commands use explicit CLI flags for all parallelism and runtime settings.
 
-**TP=4 + FP8**
+##### TP=4 + FP8
 
 ```bash
 vllm serve tencent/HunyuanImage-3.0-Instruct \
@@ -152,7 +184,7 @@ vllm serve tencent/HunyuanImage-3.0-Instruct \
   --enable-diffusion-pipeline-profiler
 ```
 
-**TP=2 + FP8 + SP=2**
+##### TP=2 + FP8 + SP=2
 
 ```bash
 vllm serve tencent/HunyuanImage-3.0-Instruct \
@@ -166,7 +198,7 @@ vllm serve tencent/HunyuanImage-3.0-Instruct \
   --enable-diffusion-pipeline-profiler
 ```
 
-**TP=2 + FP8 + CFG=2**
+##### TP=2 + FP8 + CFG=2
 
 ```bash
 vllm serve tencent/HunyuanImage-3.0-Instruct \

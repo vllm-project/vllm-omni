@@ -99,6 +99,15 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
         # policy counterpart lives on PrefixCacheRunnerMixin.
         self._pooler_payload_include_hidden_flag = True
 
+    def _create_encoder_cudagraph_manager(self):
+        if self.compilation_config.cudagraph_mm_encoder and self.supports_mm_inputs:
+            factory = getattr(self.get_model(), "create_encoder_cudagraph_manager", None)
+            if factory is not None:
+                if not current_omni_platform.is_cuda():
+                    return None
+                return factory(self.vllm_config, self.device, self.dtype)
+        return super()._create_encoder_cudagraph_manager()
+
     def _to_list(self, sampled_token_ids: torch.Tensor) -> list[list[int]]:
         override_fn = self._sampled_token_ids_cpu_override
         if callable(override_fn):

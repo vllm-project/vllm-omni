@@ -92,7 +92,10 @@ from vllm_omni.model_executor.models.hunyuan_image3._hunyuan_v1_vendored import 
     _get_cla_factor,
     _is_moe,
 )
-from vllm_omni.model_executor.models.hunyuan_image3.autoencoder_kl_3d import AutoencoderKLConv3D
+from vllm_omni.model_executor.models.hunyuan_image3.autoencoder_kl_3d import (
+    AutoencoderKLConv3D,
+    DiagonalGaussianDistribution,
+)
 from vllm_omni.model_executor.models.hunyuan_image3.siglip2 import LightProjector, Siglip2VisionTransformer
 
 logger = init_logger(__name__)
@@ -1736,6 +1739,19 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
                 "will be incorrect. Check that model.layers[*].self_attn.rotary_emb exists."
             )
 
+    def create_encoder_cudagraph_manager(self, vllm_config, device, dtype):
+        from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+        if self.vision_model.encoder.layers[0].self_attn.attn.attn_backend == AttentionBackendEnum.TORCH_SDPA:
+            logger.warning(
+                "HunyuanImage3 encoder CUDA graphs require graph-safe vision attention; using eager encoding."
+            )
+            return None
+
+        from .encoder_cudagraph import HunyuanImage3EncoderCudaGraphManager
+
+        return HunyuanImage3EncoderCudaGraphManager(vllm_config, device, dtype, self)
+
     def _parse_and_validate_image_input(
         self,
         **kwargs: dict[str, Any],
@@ -1804,8 +1820,6 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
         """
         Encode images through VAE encoder.
         """
-        config = self.vae.config
-
         # Cast pixel input to model dtype here (at the encoder boundary)
         # rather than inside HunyuanImage3Processor.process_image. This
         # matches HF's path which keeps fp32 pixels in build_cond_images and
@@ -1818,8 +1832,16 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
         if images.dtype != self.vae.dtype:
             images = images.to(dtype=self.vae.dtype)
 
-        vae_encode_result = self.vae.encode(images)
-        latents = vae_encode_result.latent_dist.sample(generator)
+        return self._sample_vae_latents(self.vae.encode(images).latent_dist, cfg_factor, generator)
+
+    def _sample_vae_latents(
+        self,
+        latent_dist: DiagonalGaussianDistribution,
+        cfg_factor: int = 1,
+        generator: torch.Generator | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        config = self.vae.config
+        latents = latent_dist.sample(generator)
 
         # Apply shift and scaling factors if present
         if hasattr(config, "shift_factor") and config.shift_factor:
@@ -1970,6 +1992,11 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
             vae_tokens, _, _ = self.patch_embed(latents_i, t_emb)
             vae_token_embeddings.append(vae_tokens)
 
+        return self._combine_image_embeddings(vit_embeddings, vae_token_embeddings)
+
+    def _combine_image_embeddings(
+        self, vit_embeddings: torch.Tensor, vae_token_embeddings: list[torch.Tensor]
+    ) -> list[torch.Tensor]:
         assert vit_embeddings is not None and vit_embeddings.shape[0] == len(vae_token_embeddings), (
             f"Number of ViT embeddings ({vit_embeddings.shape[0]}) does not match "
             f"number of VAE token embeddings ({len(vae_token_embeddings)}). "
